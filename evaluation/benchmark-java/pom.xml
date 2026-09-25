@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.CoreryBlack</groupId>
+        <artifactId>AstralLight</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>AstralBenchmark</artifactId>
+    <packaging>jar</packaging>
+    <name>AstralBenchmark - Comparative Benchmark Suite</name>
+
+    <properties>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <jmh.version>1.37</jmh.version>
+        <casbin.version>1.99.0</casbin.version>
+        <cedar.version>4.10.0</cedar.version>
+        <authzed.version>1.6.0</authzed.version>
+        <grpc.version>1.62.2</grpc.version>
+        <benchmark.mainClass>com.coreryblack.benchmark.runner.BenchmarkRunner</benchmark.mainClass>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralCommonApi</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralBootSupport</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralGeneralCore</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralIdentityPersistence</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralPermissionContract</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralPermissionRuntime</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralMessagingContract</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralPlatformPersistence</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralPermissionInfrastructure</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralAuditPersistence</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralAuditRuntime</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralGeneral</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralMessagingRuntime</artifactId>
+        </dependency>
+
+        <!-- 权限治理中心（权限基础设施迁移至 TrustGraph 后，业务模块需要依赖权限服务） -->
+        <dependency>
+            <groupId>com.CoreryBlack</groupId>
+            <artifactId>AstralPermissionClient</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-core</artifactId>
+            <version>${jmh.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-generator-annprocess</artifactId>
+            <version>${jmh.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.casbin</groupId>
+            <artifactId>jcasbin</artifactId>
+            <version>${casbin.version}</version>
+        </dependency>
+
+        <!-- Cedar official Java SDK (includes Rust engine via JNI) -->
+        <dependency>
+            <groupId>com.cedarpolicy</groupId>
+            <artifactId>cedar-java</artifactId>
+            <version>${cedar.version}</version>
+            <classifier>uber</classifier>
+        </dependency>
+
+        <!-- SpiceDB official Java gRPC client -->
+        <dependency>
+            <groupId>com.authzed.api</groupId>
+            <artifactId>authzed</artifactId>
+            <version>${authzed.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-protobuf</artifactId>
+            <version>${grpc.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-stub</artifactId>
+            <version>${grpc.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-netty-shaded</artifactId>
+            <version>${grpc.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <mainClass>${benchmark.mainClass}</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <profile>
+            <id>legacy-benchmark</id>
+            <properties>
+                <benchmark.mainClass>com.coreryblack.benchmark.runner.BenchmarkRunner</benchmark.mainClass>
+            </properties>
+        </profile>
+        <profile>
+            <id>default</id>
+            <activation>
+                <activeByDefault>true</activeByDefault>
+            </activation>
+            <properties>
+                <benchmark.mainClass>com.coreryblack.benchmark.nativebenchmark.NativeAstralBenchmark</benchmark.mainClass>
+            </properties>
+        </profile>
+    </profiles>
+</project>

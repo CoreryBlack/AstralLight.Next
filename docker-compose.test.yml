@@ -1,0 +1,56 @@
+# AstralLight Rust 集成测试环境
+# 启动：docker compose -f docker-compose.test.yml up -d
+# 停止：docker compose -f docker-compose.test.yml down -v
+# Run with explicitly supplied isolated test credentials, for example:
+# MYSQL_ROOT_PASSWORD=... RABBITMQ_USER=... RABBITMQ_PASSWORD=... \
+# DATABASE_URL=... REDIS_URL=... RABBITMQ_URL=... \
+# docker compose -f docker-compose.test.yml up -d --wait
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-astral_test}
+    ports:
+      - "3308:3306"
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # The platform-v4 schema is the integration-test baseline. Rust-owned
+    # incremental DDL is applied explicitly by `cargo run -p astral-db --bin
+    # astral-migrate`, never by an application process or MySQL init hook.
+    volumes:
+      - ./Docs/sql/full_schema_v4.sql:/docker-entrypoint-initdb.d/00-platform-v4.sql:ro
+
+  redis:
+    image: redis:7
+    ports:
+      - "6380:6379"
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?RABBITMQ_USER is required}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD is required}
+    ports:
+      - "5673:5672"
+      - "15673:15672"
+    tmpfs:
+      - /var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 10s
+      retries: 10

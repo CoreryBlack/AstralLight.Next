@@ -1,0 +1,38 @@
+[package]
+name = "astral-monitor"
+version = "0.1.0"
+edition = "2021"
+description = "AstralLight 监控与告警服务"
+license.workspace = true
+
+[[bin]]
+name = "astral-monitor"
+path = "src/main.rs"
+
+[dependencies]
+astral-common = { path = "../astral-common" }
+astral-types = { path = "../astral-types" }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+tower-http = { workspace = true }
+sqlx = { workspace = true }
+reqwest = { workspace = true }
+redis = { workspace = true }
+sysinfo = { workspace = true }
+async-trait = "0.1"
+astral-db = { path = "../astral-db" }
+policy-engine = { path = "../policy-engine" }
+
+[dev-dependencies]
+sqlx = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+time = { workspace = true }

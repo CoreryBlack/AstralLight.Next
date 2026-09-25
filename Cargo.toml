@@ -1,0 +1,112 @@
+[workspace]
+# Learn/Chat 源码暂存但冻结：默认 workspace 不纳入这两个服务，待新规范建立后再恢复。
+members = [
+    "policy-engine",
+    "astral-types",
+    "astral-common",
+    "astral-db",
+    "astral-cache",
+    "astral-mq",
+    "astral-gateway",
+    "astral-identity",
+    "astral-trustgraph",
+    "astral-monitor",
+    "e2e-bootstrap",
+]
+exclude = ["astral-learn", "astral-chat"]
+resolver = "2"
+
+[workspace.package]
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+
+[workspace.dependencies]
+# 框架与运行时
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["cors", "trace"] }
+reqwest = { version = "0.13", features = ["json", "rustls"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 数据库
+sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "time", "migrate"] }
+
+# 缓存
+redis = { version = "1", features = ["tokio-comp", "connection-manager", "json"] }
+# 进程内 evidence 缓存（astral-db evidence_cache：TTL/容量/并发驱逐内建）
+moka = { version = "0.12", features = ["future"] }
+
+# 消息队列
+lapin = { version = "4", features = ["tokio"] }
+
+# 安全
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+argon2 = "0.5"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+# 跨城市节点证据签名验证（Ed25519，纯验证、default-off，无 runtime 调用方）
+ed25519-dalek = "2"
+
+# 系统指标采集（Monitor collector）
+sysinfo = "0.33"
+
+# 配置
+config = { version = "0.15", features = ["yaml"] }
+
+# 可观测性
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-opentelemetry = "0.33"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+
+# 弹性
+governor = "0.10"
+
+# 工具
+# 持久化数据结构（policy-engine authorization_compiler HotState：O(1) 结构共享 clone）
+im = "15"
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+typed-builder = "0.23"
+thiserror = "2"
+anyhow = "1"
+garde = { version = "0.23", features = ["derive"] }
+arc-swap = "1"
+
+# 测试
+tokio-test = "0.4"
+mockall = "0.13"
+criterion = "0.5"
+# 分配 norms 微基准（policy-engine benches：factored 共享层内存证据）
+divan = "0.1"
+testcontainers = "0.27"
+
+# ═══════════════════════════════════════════════════════════════
+# 编译 Profile 配置（缩小 target/ 体积）
+# ═══════════════════════════════════════════════════════════════
+
+[profile.dev]
+# 调试信息级别：full(2) → line-tables-only(1)，体积缩小 ~60%
+# line-tables-only 仍支持行号级别的 panic backtrace 和调试
+debug = "line-tables-only"
+# 增量编译（保留，加快迭代速度）
+incremental = true
+
+[profile.release]
+# 剥离所有调试符号
+debug = "none"
+# LTO（链接时优化）：fat 可大幅缩小二进制，但编译慢；thin 是折中
+lto = "thin"
+# 代码生成单元 = 1 可更好地跨函数内联和优化
+# 代价是编译更慢；如 CI 编译时间敏感可改为 16
+codegen-units = 1
+# 优化级别保持默认 s（体积优先）
+opt-level = "s"
+# 剥离符号表
+strip = "symbols"

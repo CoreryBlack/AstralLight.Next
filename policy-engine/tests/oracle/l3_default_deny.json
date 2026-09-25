@@ -1,0 +1,21 @@
+{
+  "name": "L3 DEFAULT_DENY — empty rule sets and no fallback rules",
+  "input": {
+    "card_id": 1,
+    "action": "read",
+    "resource": "learn_subject",
+    "user_id": 42
+  },
+  "snapshots": [],
+  "rules": [],
+  "expected": {
+    "allowed": false,
+    "reason": "DEFAULT_DENY",
+    "evaluation_path": [
+      { "phase": "AUTHN", "result": "PASS" },
+      { "phase": "CARD_CONTEXT", "result": "PASS" },
+      { "phase": "PERMISSION_RULE", "result": "EVALUATING" },
+      { "phase": "DEFAULT", "result": "DENY" }
+    ]
+  }
+}

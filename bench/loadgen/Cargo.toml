@@ -1,0 +1,21 @@
+[package]
+name = "loadgen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
+
+# 独立压测工具：自带 [workspace]，不加入 AstralLight-Rust members，
+# 不参与 cargo check/clippy/test --workspace 门禁（验证时单列说明）。
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+hmac = "0.12"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

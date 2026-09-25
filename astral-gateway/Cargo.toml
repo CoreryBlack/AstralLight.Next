@@ -1,0 +1,36 @@
+[package]
+name = "astral-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "AstralLight API Gateway — JWT 认证 + 路由转发 + 限流"
+license.workspace = true
+
+[[bin]]
+name = "astral-gateway"
+path = "src/main.rs"
+
+[dependencies]
+astral-common = { path = "../astral-common" }
+astral-types = { path = "../astral-types" }
+
+axum = { workspace = true, features = ["ws"] }
+tokio = { workspace = true }
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
+tower = { workspace = true }
+tower-http = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+redis = { workspace = true }
+config = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+once_cell = "1"
+bytes = "1"
+uuid = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }

@@ -1,0 +1,64 @@
+# =============================================================================
+# AstralLight Benchmark — Docker Compose for 5× Comparison Runs
+# =============================================================================
+# Container names: astral_bench_mysql, astral_bench_redis, astral_bench_opa
+# Ports: MySQL 3308, Redis 6381, OPA 8181
+# =============================================================================
+
+services:
+  benchmark-mysql:
+    image: mysql:8.0
+    container_name: astral_bench_mysql
+    restart: unless-stopped
+    ports:
+      - "3308:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${BENCHMARK_MYSQL_ROOT_PASSWORD:?}
+      MYSQL_DATABASE: ${BENCHMARK_DB_NAME:-astrallight}
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-authentication-plugin=mysql_native_password
+      --max-connections=500
+      --innodb-buffer-pool-size=1024M
+      --innodb-log-file-size=256M
+      --innodb-flush-log-at-trx-commit=2
+      --sql-mode=""
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 15
+
+  benchmark-redis:
+    image: redis:7
+    container_name: astral_bench_redis
+    restart: unless-stopped
+    ports:
+      - "6381:6379"
+    command: >
+      redis-server
+      --maxmemory 800mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 10
+
+  benchmark-opa:
+    image: openpolicyagent/opa:latest
+    container_name: astral_bench_opa
+    restart: unless-stopped
+    ports:
+      - "8181:8181"
+    command: >
+      run --server
+      --addr :8181
+      --log-level error
+      --set decision_logs.console=false
+    # OPA distroless 镜像无 curl/wget，跳过容器健康检查，由脚本轮询 HTTP 端口

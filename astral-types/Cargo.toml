@@ -1,0 +1,17 @@
+[package]
+name = "astral-types"
+version = "0.1.0"
+edition = "2021"
+description = "AstralLight 共享类型定义"
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+typed-builder = { workspace = true }
+garde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

@@ -1,0 +1,29 @@
+{
+  "name": "L1 BASE DENY — single deny rule matches",
+  "input": {
+    "card_id": 1,
+    "action": "delete",
+    "resource": "audit",
+    "user_id": 42
+  },
+  "snapshots": [
+    {
+      "rule_set_id": 1,
+      "ref_type": "BASE",
+      "entries": [
+        { "effect": "Deny", "resource": "audit", "action": "delete" }
+      ]
+    }
+  ],
+  "rules": [],
+  "expected": {
+    "allowed": false,
+    "reason": "RULE_SET_DENY",
+    "evaluation_path": [
+      { "phase": "AUTHN", "result": "PASS" },
+      { "phase": "CARD_CONTEXT", "result": "PASS" },
+      { "phase": "RULESET", "result": "EVALUATING" },
+      { "phase": "RULESET", "result": "DENY", "source": "BASE" }
+    ]
+  }
+}

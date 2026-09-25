@@ -1,0 +1,32 @@
+{
+  "profile": "technical-diagram",
+  "operation": "generate",
+  "deliverable": "Clean four-layer authorization chain architecture diagram, 16:9 landscape",
+  "subject": "AstralLight physical dual-card permission chain: four stacked layers",
+  "composition": "Four horizontal layers stacked top to bottom, each a rounded rectangle with a short label and one-line note, connected by a single downward flow arrow on the left and a return arrow on the right",
+  "style": "Clean technical architecture illustration, white background, thin vector lines, flat low-saturation fills, generous spacing, no 3D effects",
+  "palette": "Muted indigo, lavender, teal, sand, and charcoal on white",
+  "text": {
+    "exact": [
+      "L0 Identity Issuance",
+      "L1 API Gateway",
+      "L2 Service Middleware",
+      "L3 Policy Engine",
+      "dual-card scope validation",
+      "claims + Redis session checks",
+      "no identity-card fallback",
+      "rule-set evaluation, default deny"
+    ],
+    "placement": "Layer name centered inside each rounded rectangle; one-line note beneath each name",
+    "hierarchy": "Short semibold layer names, smaller regular note text",
+    "language": "English"
+  },
+  "constraints": [
+    "No decorative 3D effects",
+    "No gradients",
+    "No numbered stage badges",
+    "All arrows must have a clear direction",
+    "No additional text or labels beyond the listed exact strings",
+    "No watermark or logo"
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "name": "L2 PermissionRule fallback — no rule sets, CARD_ONLY allow exists",
+  "input": {
+    "card_id": 1,
+    "action": "export",
+    "resource": "report",
+    "user_id": 42
+  },
+  "snapshots": [],
+  "rules": [
+    {
+      "id": 1,
+      "effect": "Allow",
+      "resource": "report",
+      "action": "export"
+    }
+  ],
+  "expected": {
+    "allowed": true,
+    "reason": "RULE_ALLOW",
+    "audit_required": true,
+    "evaluation_path": [
+      { "phase": "AUTHN", "result": "PASS" },
+      { "phase": "CARD_CONTEXT", "result": "PASS" },
+      { "phase": "PERMISSION_RULE", "result": "EVALUATING" },
+      { "phase": "PERMISSION_RULE", "result": "ALLOW" }
+    ]
+  }
+}

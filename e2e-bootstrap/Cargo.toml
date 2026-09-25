@@ -1,0 +1,12 @@
+[package]
+name = "e2e-bootstrap"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+astral-db = { path = "../astral-db" }
+astral-types = { path = "../astral-types" }
+sqlx = { workspace = true }
+tokio = { workspace = true }

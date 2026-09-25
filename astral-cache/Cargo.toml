@@ -1,0 +1,23 @@
+[package]
+name = "astral-cache"
+version = "0.1.0"
+edition = "2021"
+description = "AstralLight 缓存层 — Redis 快照缓存 + 消息幂等"
+license.workspace = true
+
+[dependencies]
+policy-engine = { path = "../policy-engine" }
+astral-types = { path = "../astral-types" }
+
+redis = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true }
+async-trait = "0.1"
+policy-engine = { path = "../policy-engine" }
+astral-types = { path = "../astral-types" }

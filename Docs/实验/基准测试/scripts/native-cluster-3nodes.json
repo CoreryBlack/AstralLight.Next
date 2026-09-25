@@ -1,0 +1,34 @@
+{
+  "formatVersion": 1,
+  "campaignProtocol": "rq4-cluster-3nodes",
+  "hardwareLabels": [
+    "xeon-platinum-8000",
+    "xeon-e5-2690-v3",
+    "ryzen-7-7735hs"
+  ],
+  "roles": ["WRITER", "READER_A", "READER_B"],
+  "rolePermutations": [
+    {"xeon-platinum-8000": "WRITER", "xeon-e5-2690-v3": "READER_A", "ryzen-7-7735hs": "READER_B"},
+    {"xeon-platinum-8000": "READER_A", "xeon-e5-2690-v3": "WRITER", "ryzen-7-7735hs": "READER_B"},
+    {"xeon-platinum-8000": "READER_A", "xeon-e5-2690-v3": "READER_B", "ryzen-7-7735hs": "WRITER"},
+    {"xeon-platinum-8000": "WRITER", "xeon-e5-2690-v3": "READER_B", "ryzen-7-7735hs": "READER_A"},
+    {"xeon-platinum-8000": "READER_B", "xeon-e5-2690-v3": "WRITER", "ryzen-7-7735hs": "READER_A"},
+    {"xeon-platinum-8000": "READER_B", "xeon-e5-2690-v3": "READER_A", "ryzen-7-7735hs": "WRITER"}
+  ],
+  "coordinatorRole": "WRITER",
+  "phases": [
+    "PREFLIGHT", "PREPARE", "FINGERPRINT_VERIFY", "COLD_CACHE",
+    "WARM_READONLY", "NO_FAULT_CONTROL", "MUTATION", "VISIBILITY",
+    "FAULT_INJECTION", "FAULT_STEADY", "HEAL", "RECOVERY", "POSTCONDITION_AUDIT"
+  ],
+  "jvmBaseArgs": [
+    "-Xms4G", "-Xmx8G", "-XX:+UseZGC", "-XX:+ZGenerational",
+    "-XX:+AlwaysPreTouch"
+  ],
+  "notes": [
+    "Node endpoints, SSH hosts and all credentials are supplied at runtime via environment variables; this file only declares stable node ids, hardware labels, roles and phases.",
+    "Every node must run the same JAR SHA-256 and verify the same dataset/request-trace fingerprint.",
+    "P99 values are never averaged across heterogeneous hardware; results are reported per node/phase/replicate.",
+    "ZeroTier addresses, MySQL/Redis/Rabbit endpoints, passwords, tokens and JWT secrets must never be written into manifests or logs."
+  ]
+}

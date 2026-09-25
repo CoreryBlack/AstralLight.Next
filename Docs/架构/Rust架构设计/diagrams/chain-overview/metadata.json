@@ -1,0 +1,39 @@
+{
+  "operation": "generate",
+  "model": "gpt-image-2",
+  "image_count": 1,
+  "images": [
+    {
+      "filename": "image.png",
+      "format": "png",
+      "width": 1536,
+      "height": 1024,
+      "mode": "RGB",
+      "bytes": 1156981,
+      "sha256": "760bdec20878753ff315f2e218d1bfe95096d7b0f0d38b6964a2934135c3f279",
+      "has_alpha": false
+    }
+  ],
+  "prompt_review": {
+    "profile": "technical-diagram",
+    "operation": "generate",
+    "status": "pass",
+    "issues": [],
+    "features": {
+      "characters": 1323,
+      "has_labeled_sections": true,
+      "requests_text": true,
+      "mentions_text": true,
+      "has_exact_copy": true,
+      "declares_no_text": false,
+      "image_count": 0,
+      "has_mask": false,
+      "quality": "high",
+      "size": "1536x1024",
+      "background": "auto",
+      "model": "gpt-image-2",
+      "model_family": "gpt-image-2"
+    }
+  },
+  "warnings": []
+}

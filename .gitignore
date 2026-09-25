@@ -1,0 +1,65 @@
+# Rust repository ignores
+
+/target/
+**/target/
+
+# Local runtime configuration and credentials
+.env
+.env.*
+application.yml
+application-*.yml
+application-*.yaml
+*.pem
+*.key
+*.p12
+*.jks
+secrets.json
+
+# IDE and OS state
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Logs and local results
+*.log
+*.stderr
+*.stdout
+*.err
+*.tmp
+*.temp
+logs/
+**/logs/
+# These audited historical reports are part of the published test record.
+!integration_test_result_20260707_174605.txt
+!integration_test_result_20260707_192539.txt
+!integration_test_result_20260707_193124.txt
+test_results*.txt
+test_results*.log
+
+# Local databases and generated output
+*.db
+*.sqlite
+coverage/
+report/
+
+# Validation and benchmark generated campaign output
+Docs/authorization-validation/evidence/
+Docs/authorization-validation/artifact/
+Docs/实验/复现运行/
+evaluation/benchmark-results/
+evaluation/benchmark-java/target/
+benchmark-results/
+benchmark-*.log
+comparison-*.log
+comparison_5x_*.log
+
+# Python test caches
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Keep the checked-in Rust workspace lockfile and test compose file.
+!Cargo.lock
+!docker-compose.test.yml

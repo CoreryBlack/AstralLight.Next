@@ -1,0 +1,49 @@
+-- Phase 4: 通讯与监控表
+-- 聊天消息、会话、告警规则、通知渠道
+
+CREATE TABLE IF NOT EXISTS chat_session (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    session_type VARCHAR(32) NOT NULL DEFAULT 'GROUP',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS chat_message (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    sender_id BIGINT NOT NULL,
+    session_id BIGINT NOT NULL,
+    content TEXT NOT NULL,
+    msg_type VARCHAR(32) NOT NULL DEFAULT 'TEXT',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_cm_session (session_id),
+    INDEX idx_cm_sender (sender_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS chat_session_member (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    session_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    last_read_message_id BIGINT DEFAULT 0,
+    UNIQUE KEY uk_csm (session_id, user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS alert_rule (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    metric VARCHAR(128) NOT NULL,
+    condition_op VARCHAR(16) NOT NULL DEFAULT '>=',
+    threshold DOUBLE NOT NULL,
+    duration_seconds INT NOT NULL DEFAULT 60,
+    severity VARCHAR(32) NOT NULL DEFAULT 'WARNING',
+    enabled TINYINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS notification_channel (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    channel_type VARCHAR(32) NOT NULL DEFAULT 'EMAIL',
+    config JSON,
+    enabled TINYINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

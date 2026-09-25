@@ -1,0 +1,46 @@
+{
+  "responses": [
+    {
+      "status_code": 200,
+      "request_id": "bbd06b10-0665-4f4c-b896-0333e8e988de, 7e95c6c6-6c77-4cf3-ba50-eacb358a266f",
+      "attempts": 1,
+      "payload": {
+        "data": [
+          {
+            "url": "<url omitted>",
+            "b64_json": "<base64 omitted: 1542644 chars>",
+            "revised_prompt": "Create the following asset: Clean four-layer authorization chain architecture diagram, 16:9 landscape.\n\nMain subject:\nAstralLight physical dual-card permission chain: four stacked layers.\n\nComposition and hierarchy:\nFour horizontal layers stacked top to bottom, each a rounded rectangle with a short label and one-line note, connected by a single downward flow arrow on the left and a return arrow on the right.\n\nVisual treatment:\nClean technical architecture illustration, white background, thin vector lines, flat low-saturation fills, generous spacing, no 3D effects.\n\nLighting and color:\nMuted indigo, lavender, teal, sand, and charcoal on white.\n\nOn-image text:\nRender only this copy, exactly and verbatim: \"L0 Identity Issuance\"; \"L1 API Gateway\"; \"L2 Service Middleware\"; \"L3 Policy Engine\"; \"dual-card scope validation\"; \"claims + Redis session checks\"; \"no identity-card fallback\"; \"rule-set evaluation, default deny\". Language: English. Placement: Layer name centered inside each rounded rectangle; one-line note beneath each name. Hierarchy: Short semibold layer names, smaller regular note text.\n\nRequirements:\n- No decorative 3D effects.\n- No gradients.\n- No numbered stage badges.\n- All arrows must have a clear direction.\n- No additional text or labels beyond the listed exact strings.\n- No watermark or logo."
+          }
+        ],
+        "created": 1786354661,
+        "usage": {
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 6517,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "text_tokens": 0,
+            "audio_tokens": 0,
+            "image_tokens": 0
+          },
+          "completion_tokens_details": {
+            "text_tokens": 0,
+            "audio_tokens": 0,
+            "image_tokens": 0,
+            "reasoning_tokens": 0
+          },
+          "input_tokens": 277,
+          "output_tokens": 6240,
+          "input_tokens_details": {
+            "cached_tokens": 0,
+            "text_tokens": 277,
+            "audio_tokens": 0,
+            "image_tokens": 0
+          },
+          "claude_cache_creation_5_m_tokens": 0,
+          "claude_cache_creation_1_h_tokens": 0
+        }
+      }
+    }
+  ]
+}

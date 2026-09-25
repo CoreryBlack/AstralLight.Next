@@ -1,0 +1,33 @@
+{
+  "profile": "technical-diagram",
+  "operation": "generate",
+  "deliverable": "Clean policy engine evaluation flow diagram, 16:9 landscape",
+  "subject": "AstralLight PolicyEngine decision flow: linear decision chain with fail-closed branches",
+  "composition": "One vertical decision chain from top to bottom: entry node, a wide dual-card check box, a projection gate diamond, then three stacked rule-source boxes, ending in a default-deny node; one short side note each for fail-closed and pending outcomes",
+  "style": "Clean technical architecture illustration, white background, thin vector lines, flat low-saturation fills, clear arrow direction, generous spacing",
+  "palette": "Muted indigo, lavender, teal, sand, and charcoal on white",
+  "text": {
+    "exact": [
+      "PolicyEngine evaluate",
+      "dual-card active check",
+      "projection READY?",
+      "rule-set snapshots",
+      "permission rules",
+      "delegated rules",
+      "DEFAULT DENY",
+      "PENDING",
+      "DENY"
+    ],
+    "placement": "Node labels centered in their boxes or diamonds; side notes in smaller regular text",
+    "hierarchy": "Short semibold node labels, smaller note text",
+    "language": "English"
+  },
+  "constraints": [
+    "No decorative 3D effects",
+    "No gradients",
+    "No numbered stage badges",
+    "All arrows must have a clear direction",
+    "No additional text or labels beyond the listed exact strings",
+    "No watermark or logo"
+  ]
+}

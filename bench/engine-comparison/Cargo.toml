@@ -1,0 +1,25 @@
+[package]
+name = "engine-comparison"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
+
+# 独立对比测试 crate（自带 [workspace]，不在 members 内）：对齐
+# Java AstralBenchmark 的引擎对比语义（Casbin/OPA/Cedar/AstralLight），
+# 用 Rust canonical 实现产出可重复的对比基准结果。
+[workspace]
+
+[dependencies]
+policy-engine = { path = "../../policy-engine" }
+astral-types = { path = "../../astral-types" }
+casbin = { version = "2", default-features = false, features = ["runtime-tokio"] }
+cedar-policy = "4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

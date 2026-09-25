@@ -1,0 +1,24 @@
+-- Delta claim sibling-ordering gate support index (campaign finding 10.D-2).
+--
+-- The delta claim candidate statements gained a correlated NOT EXISTS gate:
+-- a delta event whose same-grant chain predecessor is still non-terminal
+-- (PENDING / LEASED) must not be claimed. Claiming such an event burns the
+-- attempt budget (`attempts = attempts + 1` at install) with zero progress —
+-- the partitioner would deterministically answer
+-- `claimed_behind_unpublished_siblings` — and a budget-exhausted sibling then
+-- parks under the maximal backoff, which made high-churn card drainage depend
+-- on the 900s backoff cycle. Deferring the claim keeps `attempts` at zero and
+-- the event becomes claimable the moment its predecessor reaches a terminal
+-- state. QUARANTINED predecessors deliberately do NOT gate the claim: the
+-- event stays claimable so the decision path surfaces the unorderable chain
+-- through its observable Blocked/budget path instead of a silent stall.
+--
+-- This index serves that gate's seek: (tenant_id, grant_id) equality, status
+-- IN ('PENDING','LEASED') as two tight dives, target_version range. Without
+-- it every gate evaluation would residual-scan the tenant's append-only
+-- delta history on the claim hot path.
+--
+-- Additive, non-unique secondary index; online DDL; no data rewrite beyond
+-- index maintenance. Nothing else in the schema changes.
+ALTER TABLE authorization_delta_event
+  ADD KEY idx_ade_grant_chain (tenant_id, grant_id, status, target_version);

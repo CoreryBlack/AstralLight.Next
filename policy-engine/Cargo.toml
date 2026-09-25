@@ -1,0 +1,60 @@
+[package]
+name = "policy-engine"
+version = "0.1.0"
+edition = "2021"
+description = "AstralLight 权限策略评估引擎核心"
+license.workspace = true
+
+[dependencies]
+astral-types = { path = "../astral-types" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+tokio = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+arc-swap = { workspace = true }
+im = { workspace = true }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-test = { workspace = true }
+mockall = { workspace = true }
+serde = { workspace = true }
+criterion = { workspace = true }
+divan = { workspace = true }
+
+# iai-callgrind 运行时需要 valgrind（仅 Linux/CI），但 bench 源码无条件
+# import 该 crate，Windows 上 `--features iai` 编译检查同样依赖它，因此
+# 保持无条件 dev-dependency；bench 目标经 required-features = ["iai"] 门控。
+iai-callgrind = "0.14"
+
+[features]
+iai = []
+e1-observability = ["dep:tokio", "dep:uuid"]
+
+[[bench]]
+name = "policy_bench"
+harness = false
+
+[[bench]]
+name = "tenant_isolation_bench"
+harness = false
+
+[[bench]]
+name = "authorization_compiler_bench"
+harness = false
+
+[[bench]]
+name = "authorization_compiler_alloc"
+harness = false
+
+[[bench]]
+name = "authorization_compiler_iai"
+harness = false
+required-features = ["iai"]

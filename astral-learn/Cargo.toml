@@ -1,0 +1,36 @@
+[package]
+name = "astral-learn"
+version = "0.1.0"
+edition = "2021"
+description = "AstralLight 教育域业务 — 学科/题目/考试"
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "astral-learn"
+path = "src/main.rs"
+
+[dependencies]
+astral-common = { path = "../astral-common" }
+astral-types = { path = "../astral-types" }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+garde = { workspace = true }
+tower-http = { workspace = true }
+astral-db = { path = "../astral-db" }
+policy-engine = { path = "../policy-engine" }
+astral-mq = { path = "../astral-mq" }
+lapin = { workspace = true }
+sqlx = { workspace = true }
+reqwest = { workspace = true }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

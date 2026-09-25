@@ -1,0 +1,54 @@
+﻿PASS | Register new user | POST /api/v1/auth/register | 200
+PASS | Login get token | POST /api/v1/auth/login | 200
+PASS | GET /me | GET /api/v1/auth/me | 200
+FAIL | GET /me/permissions | GET /api/v1/auth/me/permissions | err:500 远程服务器返回错误: (500) 内部服务器错误。
+PASS | GET /me/cards | GET /api/v1/auth/me/cards | 200
+PASS | POST /token/refresh | POST /api/v1/auth/token/refresh | 200
+FAIL | GET /admin/users | GET /v1/admin/users | err:404 远程服务器返回错误: (404) 未找到。
+PASS | GET /admin/users/1 | GET /v1/admin/users/1 | 404 (expected error)
+FAIL | GET /app/users/me | GET /v1/app/users/me | err:400 远程服务器返回错误: (400) 错误的请求。
+FAIL | GET /app/users/identity | GET /v1/app/users/identity | err:404 远程服务器返回错误: (404) 未找到。
+FAIL | GET /app/users/learning-profile | GET /v1/app/users/learning-profile | err:404 远程服务器返回错误: (404) 未找到。
+PASS | GET /auth/providers | GET /api/v1/auth/providers | 200
+PASS | GET /permission-rules | GET /main/api/v1/permission-rules | 403 (expected error)
+PASS | GET /permission-rules/registry | GET /main/api/v1/permission-rules/registry | 403 (expected error)
+PASS | GET /domains | GET /main/api/v1/domains | 403 (expected error)
+PASS | GET /domains/1/resource-types | GET /main/api/v1/domains/1/resource-types | 404 (expected error)
+PASS | GET /domains/1/actions | GET /main/api/v1/domains/1/actions | 404 (expected error)
+PASS | GET /domains/1/level-templates | GET /main/api/v1/domains/1/level-templates | 404 (expected error)
+PASS | GET /rule-sets | GET /main/api/v1/rule-sets | 403 (expected error)
+PASS | GET /user-cards | GET /main/api/v1/user-cards | 403 (expected error)
+PASS | GET /card-templates | GET /main/api/v1/card-templates | 403 (expected error)
+PASS | GET /audit-logs | GET /main/api/v1/audit-logs | 403 (expected error)
+PASS | GET /sod/policies | GET /main/api/v1/sod/policies | 403 (expected error)
+PASS | GET /sod/check | GET /main/api/v1/sod/check | 403 (expected error)
+PASS | GET /permission-requests | GET /main/api/v1/permission-requests | 403 (expected error)
+PASS | GET /delegations | GET /main/api/v1/delegations | 403 (expected error)
+PASS | GET /simulator | GET /main/api/v1/simulator | 403 (expected error)
+PASS | GET /hit-stats | GET /main/api/v1/hit-stats | 403 (expected error)
+PASS | GET /tenants | GET /main/api/v1/tenants | 403 (expected error)
+PASS | GET /platform-packages | GET /main/api/v1/platform-packages | 403 (expected error)
+PASS | GET /departments | GET /main/api/v1/departments | 403 (expected error)
+PASS | POST /rebuild-snapshot | POST /main/api/v1/permission-rules/rebuild-snapshot?cardId=1 | 403 (expected error)
+PASS | GET /consistency-check | GET /v1/monitor/consistency-check | 403 (expected error)
+PASS | GET /admin/learn/subjects | GET /v1/admin/learn/subjects | 403 (expected error)
+PASS | GET /admin/learn/courses | GET /v1/admin/learn/courses | 403 (expected error)
+PASS | GET /admin/learn/chapters | GET /v1/admin/learn/chapters | 403 (expected error)
+PASS | GET /admin/learn/questions | GET /v1/admin/learn/questions | 403 (expected error)
+PASS | GET /admin/learn/exam-papers | GET /v1/admin/learn/exam-papers | 403 (expected error)
+PASS | GET /admin/learn/schools | GET /v1/admin/learn/schools | 403 (expected error)
+PASS | GET /admin/learn/checkins | GET /v1/admin/learn/checkins | 403 (expected error)
+PASS | GET /admin/learn/wrong-questions | GET /v1/admin/learn/wrong-questions | 403 (expected error)
+PASS | GET /admin/learn/solutions | GET /v1/admin/learn/solutions | 403 (expected error)
+PASS | GET /app/learn/subjects | GET /v1/app/learn/subjects | 200
+PASS | GET /app/learn/courses | GET /v1/app/learn/courses | 200
+PASS | GET /chat/conversations | GET /v1/app/chat/conversations | 403 (expected error)
+PASS | GET /chat/conversations/1/messages | GET /v1/app/chat/conversations/1/messages | 404 (expected error)
+PASS | GET /api/health | GET /api/health | 200
+PASS | GET /api/health/metrics | GET /api/health/metrics | 200
+PASS | GET /monitor/alerts/rules | GET /v1/monitor/alerts/rules | 403 (expected error)
+PASS | GET /monitor/activities | GET /v1/monitor/activities | 403 (expected error)
+PASS | No token -> 401 | GET /main/api/v1/permission-rules | 401 (expected error)
+PASS | Invalid token -> 401 | GET /main/api/v1/permission-rules | 401 (expected error)
+FAIL | Non-existent path -> 404 | GET /nonexistent/path | err:401 远程服务器返回错误: (401) 未经授权。
+PASS | Public health check | GET /api/health | 200

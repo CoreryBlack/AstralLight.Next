@@ -1,0 +1,50 @@
+{
+  "operation": "generate",
+  "config": {
+    "api_key_configured": true,
+    "base_url": "https://api.quya.org/v1",
+    "model": "gpt-image-2",
+    "model_family": "gpt-image-2",
+    "generation_endpoint": "https://api.quya.org/v1/images/generations",
+    "edit_endpoint": "https://api.quya.org/v1/images/edits",
+    "timeout": 180.0,
+    "max_retries": 3,
+    "verify_ssl": true,
+    "extra_header_names": []
+  },
+  "batch_mode": "single",
+  "requests": [
+    {
+      "model": "gpt-image-2",
+      "prompt": "Create the following asset: Clean four-layer authorization chain architecture diagram, 16:9 landscape.\n\nMain subject:\nAstralLight physical dual-card permission chain: four stacked layers.\n\nComposition and hierarchy:\nFour horizontal layers stacked top to bottom, each a rounded rectangle with a short label and one-line note, connected by a single downward flow arrow on the left and a return arrow on the right.\n\nVisual treatment:\nClean technical architecture illustration, white background, thin vector lines, flat low-saturation fills, generous spacing, no 3D effects.\n\nLighting and color:\nMuted indigo, lavender, teal, sand, and charcoal on white.\n\nOn-image text:\nRender only this copy, exactly and verbatim: \"L0 Identity Issuance\"; \"L1 API Gateway\"; \"L2 Service Middleware\"; \"L3 Policy Engine\"; \"dual-card scope validation\"; \"claims + Redis session checks\"; \"no identity-card fallback\"; \"rule-set evaluation, default deny\". Language: English. Placement: Layer name centered inside each rounded rectangle; one-line note beneath each name. Hierarchy: Short semibold layer names, smaller regular note text.\n\nRequirements:\n- No decorative 3D effects.\n- No gradients.\n- No numbered stage badges.\n- All arrows must have a clear direction.\n- No additional text or labels beyond the listed exact strings.\n- No watermark or logo.",
+      "n": 1,
+      "size": "1536x1024",
+      "quality": "high",
+      "background": "auto",
+      "output_format": "png",
+      "moderation": "auto"
+    }
+  ],
+  "prompt_review": {
+    "profile": "technical-diagram",
+    "operation": "generate",
+    "status": "pass",
+    "issues": [],
+    "features": {
+      "characters": 1323,
+      "has_labeled_sections": true,
+      "requests_text": true,
+      "mentions_text": true,
+      "has_exact_copy": true,
+      "declares_no_text": false,
+      "image_count": 0,
+      "has_mask": false,
+      "quality": "high",
+      "size": "1536x1024",
+      "background": "auto",
+      "model": "gpt-image-2",
+      "model_family": "gpt-image-2"
+    }
+  },
+  "warnings": []
+}

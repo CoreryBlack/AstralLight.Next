@@ -1,0 +1,37 @@
+[package]
+name = "astral-db"
+version = "0.1.0"
+edition = "2021"
+description = "AstralLight 数据库访问层 — RuleRepository sqlx 实现"
+license.workspace = true
+
+[features]
+test-support = []
+e1-observability = ["policy-engine/e1-observability"]
+e3-observability = ["astral-common/e3-observability"]
+e4-observability = ["astral-common/e4-observability"]
+
+[dependencies]
+policy-engine = { path = "../policy-engine" }
+astral-types = { path = "../astral-types" }
+astral-common = { path = "../astral-common" }
+
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+tokio = { workspace = true }
+moka = { workspace = true }
+async-trait = "0.1"
+redis = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+astral-common = { path = "../astral-common" }

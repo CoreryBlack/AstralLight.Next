@@ -1,0 +1,46 @@
+{
+  "responses": [
+    {
+      "status_code": 200,
+      "request_id": "aeb00813-d655-4fb0-98b3-cbe3f1fee65f, 91900a07-c5cc-4b63-9fa8-bc15b282c87d",
+      "attempts": 1,
+      "payload": {
+        "data": [
+          {
+            "url": "<url omitted>",
+            "b64_json": "<base64 omitted: 1319360 chars>",
+            "revised_prompt": "Create the following asset: Clean policy engine evaluation flow diagram, 16:9 landscape.\n\nMain subject:\nAstralLight PolicyEngine decision flow: linear decision chain with fail-closed branches.\n\nComposition and hierarchy:\nOne vertical decision chain from top to bottom: entry node, a wide dual-card check box, a projection gate diamond, then three stacked rule-source boxes, ending in a default-deny node; one short side note each for fail-closed and pending outcomes.\n\nVisual treatment:\nClean technical architecture illustration, white background, thin vector lines, flat low-saturation fills, clear arrow direction, generous spacing.\n\nLighting and color:\nMuted indigo, lavender, teal, sand, and charcoal on white.\n\nOn-image text:\nRender only this copy, exactly and verbatim: \"PolicyEngine evaluate\"; \"dual-card active check\"; \"projection READY?\"; \"rule-set snapshots\"; \"permission rules\"; \"delegated rules\"; \"DEFAULT DENY\"; \"PENDING\"; \"DENY\". Language: English. Placement: Node labels centered in their boxes or diamonds; side notes in smaller regular text. Hierarchy: Short semibold node labels, smaller note text.\n\nRequirements:\n- No decorative 3D effects.\n- No gradients.\n- No numbered stage badges.\n- All arrows must have a clear direction.\n- No additional text or labels beyond the listed exact strings.\n- No watermark or logo."
+          }
+        ],
+        "created": 1786354721,
+        "usage": {
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 6520,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "text_tokens": 0,
+            "audio_tokens": 0,
+            "image_tokens": 0
+          },
+          "completion_tokens_details": {
+            "text_tokens": 0,
+            "audio_tokens": 0,
+            "image_tokens": 0,
+            "reasoning_tokens": 0
+          },
+          "input_tokens": 280,
+          "output_tokens": 6240,
+          "input_tokens_details": {
+            "cached_tokens": 0,
+            "text_tokens": 280,
+            "audio_tokens": 0,
+            "image_tokens": 0
+          },
+          "claude_cache_creation_5_m_tokens": 0,
+          "claude_cache_creation_1_h_tokens": 0
+        }
+      }
+    }
+  ]
+}

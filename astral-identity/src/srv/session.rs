@@ -18,6 +18,7 @@ use astral_common::error::AppError;
 use astral_common::middleware::decode_v2_token;
 use astral_common::token_contract::{PrincipalKind, TokenUse};
 use astral_types::AstralError;
+use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 
 use super::session_repository::{self as session_repo, DeviceSessionRow};
@@ -471,7 +472,7 @@ async fn revoke_session(
         TokenUse::Access => {
             delete_access_projections(&state, &claims.jti).await?;
             mark_jti_revoked_at(
-                &state.config.redis_url,
+                &state.redis,
                 &claims.jti,
                 state.config.jwt.access.expiry_seconds,
             )
@@ -503,7 +504,7 @@ async fn logout(
         TokenUse::Access => {
             delete_access_projections(&state, &claims.jti).await?;
             mark_jti_revoked_at(
-                &state.config.redis_url,
+                &state.redis,
                 &claims.jti,
                 state.config.jwt.access.expiry_seconds,
             )
@@ -561,7 +562,7 @@ async fn revoke_logout_refresh(
         .await
         .map_err(AppError::from)?;
     mark_jti_revoked_at(
-        &state.config.redis_url,
+        &state.redis,
         refresh_jti,
         state.config.jwt.refresh.expiry_seconds * 2,
     )
@@ -803,12 +804,7 @@ pub(crate) async fn store_session_grant_in_redis(
     let ttl = token.expires_in.max(60) as u64;
     let grant_json = serde_json::to_string(&grant)
         .map_err(|e| AstralError::Cache(format!("Serialize session grant failed: {e}")))?;
-    let client = redis::Client::open(state.config.redis_url.as_str())
-        .map_err(|e| AstralError::Cache(format!("Open Redis client failed: {e}")))?;
-    let mut conn = client
-        .get_connection_manager()
-        .await
-        .map_err(|e| AstralError::Cache(format!("Connect to Redis failed: {e}")))?;
+    let mut conn = state.redis.clone();
 
     let scalar_key = format!("access:jti:{}", token.jti);
     let grant_key = format!("access:grant:{}", token.jti);
@@ -873,12 +869,7 @@ async fn delete_indexed_session_projections(
     if indexed_jtis.is_empty() {
         return Ok(());
     }
-    let client = redis::Client::open(state.config.redis_url.as_str())
-        .map_err(|e| AstralError::Cache(format!("Open Redis client failed: {e}")))?;
-    let mut conn = client
-        .get_connection_manager()
-        .await
-        .map_err(|e| AstralError::Cache(format!("Connect to Redis failed: {e}")))?;
+    let mut conn = state.redis.clone();
     for (jti,) in indexed_jtis {
         let _: () = conn
             .del((format!("access:jti:{jti}"), format!("access:grant:{jti}")))
@@ -918,12 +909,7 @@ async fn delete_session_projections(state: &AppState, session_id: i64) -> Result
 }
 
 async fn delete_access_projections(state: &AppState, jti: &str) -> Result<(), AstralError> {
-    let client = redis::Client::open(state.config.redis_url.as_str())
-        .map_err(|e| AstralError::Cache(format!("Open Redis client failed: {e}")))?;
-    let mut conn = client
-        .get_connection_manager()
-        .await
-        .map_err(|e| AstralError::Cache(format!("Connect to Redis failed: {e}")))?;
+    let mut conn = state.redis.clone();
     let _: () = conn
         .del((format!("access:jti:{jti}"), format!("access:grant:{jti}")))
         .await
@@ -946,7 +932,7 @@ async fn delete_access_projections(state: &AppState, jti: &str) -> Result<(), As
 
 /// Mark an access JTI as revoked in the shared Redis projection.
 async fn mark_jti_revoked_at(
-    redis_url: &str,
+    redis: &ConnectionManager,
     jti: &str,
     ttl_seconds: i64,
 ) -> Result<(), AstralError> {
@@ -954,12 +940,7 @@ async fn mark_jti_revoked_at(
         return Err(AstralError::Auth("TOKEN_ID_REQUIRED".into()));
     }
     let key = format!("jwt:revoked:{jti}");
-    let client = redis::Client::open(redis_url)
-        .map_err(|e| AstralError::Cache(format!("Open Redis client failed: {e}")))?;
-    let mut conn = client
-        .get_connection_manager()
-        .await
-        .map_err(|e| AstralError::Cache(format!("Connect to Redis failed: {e}")))?;
+    let mut conn = redis.clone();
     let ttl = ttl_seconds.max(60) as u64;
     conn.set_ex::<_, _, ()>(&key, "1", ttl)
         .await
@@ -1985,12 +1966,7 @@ async fn restore_session_grant_in_redis(
     let grant_json = serde_json::to_string(&grant).map_err(|error| {
         AstralError::Cache(format!("Serialize switch replay grant failed: {error}"))
     })?;
-    let client = redis::Client::open(state.config.redis_url.as_str())
-        .map_err(|error| AstralError::Cache(format!("Open Redis client failed: {error}")))?;
-    let mut conn = client
-        .get_connection_manager()
-        .await
-        .map_err(|error| AstralError::Cache(format!("Connect to Redis failed: {error}")))?;
+    let mut conn = state.redis.clone();
     let scalar_key = format!("access:jti:{}", token.jti);
     let grant_key = format!("access:grant:{}", token.jti);
     conn.set_ex::<_, _, ()>(&scalar_key, grant.user_id.to_string(), ttl)
@@ -2151,7 +2127,13 @@ mod tests {
 
     #[tokio::test]
     async fn redis_revoke_failure_is_returned() {
-        let result = mark_jti_revoked_at("redis://localhost:1", "refresh-jti", 1).await;
+        let client = redis::Client::open("redis://127.0.0.1:1/").unwrap();
+        let redis = redis::aio::ConnectionManager::new_lazy_with_config(
+            client,
+            redis::aio::ConnectionManagerConfig::new(),
+        )
+        .unwrap();
+        let result = mark_jti_revoked_at(&redis, "refresh-jti", 1).await;
         assert!(matches!(result, Err(AstralError::Cache(_))));
     }
     #[test]

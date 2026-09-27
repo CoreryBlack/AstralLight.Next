@@ -192,6 +192,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = AppConfig::from_files_for("application", JwtValidationRole::Gateway)?;
+    middleware::init_gateway_redis(&config.redis_url)
+        .await
+        .map_err(anyhow::Error::msg)?;
 
     tracing::info!(
         learn = %config.learn_service_uri,

@@ -6,8 +6,11 @@
 
 use std::time::Duration;
 
+use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use serde_json::Value;
 use sqlx::MySqlPool;
+use time::PrimitiveDateTime;
 use uuid::Uuid;
 
 use astral_types::AstralError;
@@ -21,18 +24,20 @@ const MAX_BACKOFF_SECONDS: i64 = 300;
 struct OutboxRow {
     outbox_id: i64,
     operation_id: String,
+    event_type: String,
     projection_key: String,
     payload_json: Option<String>,
+    created_at: PrimitiveDateTime,
     attempts: i32,
 }
 
-pub fn spawn(pool: MySqlPool, redis_url: String) {
+pub fn spawn(pool: MySqlPool, redis: ConnectionManager) {
     let worker_id = format!("identity-{}", Uuid::new_v4());
     tokio::spawn(async move {
         loop {
             match claim_one(&pool, &worker_id).await {
                 Ok(Some(row)) => {
-                    if let Err(error) = process_one(&pool, &redis_url, &worker_id, row).await {
+                    if let Err(error) = process_one(&pool, &redis, &worker_id, row).await {
                         tracing::warn!(worker_id = %worker_id, %error, "auth session outbox item will retry");
                     }
                 }
@@ -52,7 +57,7 @@ async fn claim_one(pool: &MySqlPool, worker_id: &str) -> Result<Option<OutboxRow
         .await
         .map_err(|error| AstralError::Database(format!("Begin outbox claim failed: {error}")))?;
     let row = sqlx::query_as::<_, OutboxRow>(
-        "SELECT outbox_id, operation_id, projection_key, payload_json, attempts \
+        "SELECT outbox_id, operation_id, event_type, projection_key, payload_json, created_at, attempts \
          FROM auth_session_outbox \
          WHERE (status = 'PENDING' OR (status = 'PROCESSING' AND lease_expires_at < UTC_TIMESTAMP())) \
            AND (next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP()) \
@@ -91,14 +96,14 @@ async fn claim_one(pool: &MySqlPool, worker_id: &str) -> Result<Option<OutboxRow
 
 async fn process_one(
     pool: &MySqlPool,
-    redis_url: &str,
+    redis: &ConnectionManager,
     worker_id: &str,
     row: OutboxRow,
 ) -> Result<(), AstralError> {
-    let redis_result = apply_redis_projection(pool, redis_url, &row.projection_key).await;
+    let redis_result = apply_redis_projection(pool, redis, &row).await;
     match redis_result {
         Ok(()) => {
-            sqlx::query(
+            let result = sqlx::query(
                 "UPDATE auth_session_outbox SET status = 'PROCESSED', processed_at = UTC_TIMESTAMP(), \
                  processed_by = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = UTC_TIMESTAMP() \
                  WHERE outbox_id = ? AND status = 'PROCESSING' AND lease_owner = ?",
@@ -108,7 +113,14 @@ async fn process_one(
             .bind(worker_id)
             .execute(pool)
             .await
-            .map_err(|error| AstralError::Database(format!("Complete outbox item failed: {error}")))?;
+            .map_err(|error| {
+                AstralError::Database(format!("Complete outbox item failed: {error}"))
+            })?;
+            if result.rows_affected() != 1 {
+                return Err(AstralError::Internal(
+                    "outbox completion lease was lost".into(),
+                ));
+            }
             Ok(())
         }
         Err(error) => {
@@ -132,19 +144,25 @@ async fn process_one(
 
 async fn apply_redis_projection(
     pool: &MySqlPool,
-    redis_url: &str,
-    projection_key: &str,
+    redis: &ConnectionManager,
+    row: &OutboxRow,
 ) -> Result<(), AstralError> {
-    let indexed_jtis = load_projection_jtis(pool, projection_key).await?;
+    let indexed_jtis = load_projection_jtis(pool, row).await?;
     if indexed_jtis.is_empty() {
+        if !(row.event_type == "REVOKE"
+            && row
+                .payload_json
+                .as_deref()
+                .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+                .is_some_and(|payload| payload.get("v").and_then(Value::as_i64) == Some(2)))
+        {
+            return Err(AstralError::Internal(
+                "auth revocation projection has no proven JTI snapshot".into(),
+            ));
+        }
         return Ok(());
     }
-    let client = redis::Client::open(redis_url)
-        .map_err(|error| AstralError::Cache(format!("Open Redis client failed: {error}")))?;
-    let mut conn = client
-        .get_connection_manager()
-        .await
-        .map_err(|error| AstralError::Cache(format!("Connect Redis failed: {error}")))?;
+    let mut conn = redis.clone();
     for jti in indexed_jtis {
         let _: () = conn
             .del((format!("access:jti:{jti}"), format!("access:grant:{jti}")))
@@ -162,9 +180,65 @@ async fn apply_redis_projection(
 
 async fn load_projection_jtis(
     pool: &MySqlPool,
-    projection_key: &str,
+    row: &OutboxRow,
 ) -> Result<Vec<String>, AstralError> {
-    let (kind, value) = projection_key
+    if row.event_type != "REVOKE" {
+        return Err(AstralError::Validation(format!(
+            "Unsupported auth projection event type: {}",
+            row.event_type
+        )));
+    }
+    if let Some(payload) = row.payload_json.as_deref() {
+        let value: Value = serde_json::from_str(payload).map_err(|_| {
+            AstralError::Validation("Auth revocation outbox payload is malformed".into())
+        })?;
+        match value.get("v") {
+            Some(Value::Number(version)) if version.as_i64() == Some(2) => {
+                let expected_user = row
+                    .projection_key
+                    .strip_prefix("user:")
+                    .and_then(|id| id.parse::<i64>().ok())
+                    .filter(|id| *id > 0)
+                    .ok_or_else(|| {
+                        AstralError::Validation("Auth revocation snapshot has invalid scope".into())
+                    })?;
+                if value.get("userId").and_then(Value::as_i64) != Some(expected_user) {
+                    return Err(AstralError::Validation(
+                        "Auth revocation snapshot user does not match projection key".into(),
+                    ));
+                }
+                let jtis = value
+                    .get("jtis")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        AstralError::Validation("Auth revocation snapshot is missing jtis".into())
+                    })?
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .filter(|jti| !jti.trim().is_empty())
+                            .map(ToOwned::to_owned)
+                            .ok_or_else(|| {
+                                AstralError::Validation(
+                                    "Auth revocation snapshot contains invalid jti".into(),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(jtis);
+            }
+            Some(_) => {
+                return Err(AstralError::Validation(
+                    "Unsupported auth revocation outbox version".into(),
+                ));
+            }
+            None => {}
+        }
+    }
+
+    let (kind, value) = row
+        .projection_key
         .split_once(':')
         .ok_or_else(|| AstralError::Validation("Invalid auth projection key".into()))?;
     let id = value
@@ -173,27 +247,45 @@ async fn load_projection_jtis(
         .filter(|value| *value > 0)
         .ok_or_else(|| AstralError::Validation("Invalid auth projection id".into()))?;
     let rows = match kind {
-        "session" => sqlx::query_scalar::<_, String>(
-            "SELECT jti FROM auth_session_jti_index WHERE session_id = ? AND status = 'ACTIVE'",
-        )
-        .bind(id)
-        .fetch_all(pool)
-        .await,
-        "family" => sqlx::query_scalar::<_, String>(
-            "SELECT i.jti FROM auth_session_jti_index i \
+        "session" => {
+            sqlx::query_scalar::<_, String>(
+                "SELECT jti FROM auth_session_jti_index \
+             WHERE session_id = ? AND issued_at <= ? \
+               AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP())",
+            )
+            .bind(id)
+            .bind(row.created_at)
+            .fetch_all(pool)
+            .await
+        }
+        "family" => {
+            sqlx::query_scalar::<_, String>(
+                "SELECT i.jti FROM auth_session_jti_index i \
              INNER JOIN auth_device_session s ON s.session_id = i.session_id \
-             WHERE s.family_id = ? AND i.status = 'ACTIVE'",
-        )
-        .bind(id)
-        .fetch_all(pool)
-        .await,
-        "user" => sqlx::query_scalar::<_, String>(
-            "SELECT i.jti FROM auth_session_jti_index i WHERE i.user_id = ? AND i.status = 'ACTIVE'",
-        )
-        .bind(id)
-        .fetch_all(pool)
-        .await,
-        _ => return Err(AstralError::Validation("Unknown auth projection key".into())),
+             WHERE s.family_id = ? AND i.issued_at <= ? \
+               AND (i.expires_at IS NULL OR i.expires_at > UTC_TIMESTAMP())",
+            )
+            .bind(id)
+            .bind(row.created_at)
+            .fetch_all(pool)
+            .await
+        }
+        "user" => {
+            sqlx::query_scalar::<_, String>(
+                "SELECT i.jti FROM auth_session_jti_index i \
+             WHERE i.user_id = ? AND i.issued_at <= ? \
+               AND (i.expires_at IS NULL OR i.expires_at > UTC_TIMESTAMP())",
+            )
+            .bind(id)
+            .bind(row.created_at)
+            .fetch_all(pool)
+            .await
+        }
+        _ => {
+            return Err(AstralError::Validation(
+                "Unknown auth projection key".into(),
+            ))
+        }
     };
     rows.map_err(|error| {
         AstralError::Database(format!("Load auth projection JTIs failed: {error}"))
@@ -202,12 +294,27 @@ async fn load_projection_jtis(
 
 #[cfg(test)]
 mod tests {
-    use super::load_projection_jtis;
+    use super::{load_projection_jtis, OutboxRow};
+    use time::{Date, Month, PrimitiveDateTime, Time};
 
     #[tokio::test]
     async fn projection_key_validation_fails_before_database_access() {
         let pool = sqlx::MySqlPool::connect_lazy("mysql://localhost:1/identity").unwrap();
-        assert!(load_projection_jtis(&pool, "session:0").await.is_err());
-        assert!(load_projection_jtis(&pool, "card:1").await.is_err());
+        let row = OutboxRow {
+            outbox_id: 1,
+            operation_id: "op".into(),
+            event_type: "REVOKE".into(),
+            projection_key: "session:0".into(),
+            payload_json: None,
+            created_at: PrimitiveDateTime::new(
+                Date::from_calendar_date(2026, Month::January, 1).unwrap(),
+                Time::MIDNIGHT,
+            ),
+            attempts: 0,
+        };
+        assert!(load_projection_jtis(&pool, &row).await.is_err());
+        let mut invalid = row;
+        invalid.projection_key = "card:1".into();
+        assert!(load_projection_jtis(&pool, &invalid).await.is_err());
     }
 }

@@ -559,9 +559,16 @@ mod tests {
 
     fn state() -> AppState {
         let db = sqlx::MySqlPool::connect_lazy("mysql://localhost:1/identity").unwrap();
+        let redis_client = redis::Client::open("redis://127.0.0.1:1/").unwrap();
+        let redis = redis::aio::ConnectionManager::new_lazy_with_config(
+            redis_client,
+            redis::aio::ConnectionManagerConfig::new(),
+        )
+        .unwrap();
         AppState {
             config: Arc::new(astral_common::config::AppConfig::default()),
             db,
+            redis,
             engine: Arc::new(policy_engine::PolicyEngine::new()),
             me_service: Arc::new(crate::srv::me_service::MeService::new(Arc::new(
                 SqlxMeRepositoryLazy,

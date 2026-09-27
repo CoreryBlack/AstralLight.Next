@@ -769,7 +769,8 @@ async fn rebuild_redis_conn_pool() -> Option<Arc<RedisConnPool>> {
     }
     let redis_url = std::env::var("REDIS_URL")
         .or_else(|_| std::env::var("ASTRAL_REDIS_URL"))
-        .unwrap_or_else(|_| "redis://localhost:6379".into());
+        .ok()
+        .filter(|url| !url.trim().is_empty())?;
     let client = redis::Client::open(redis_url.as_str()).ok()?;
     // 并行建连（JoinSet）：单条失败即整体失败（不缓存半成品），总时长受
     // REDIS_CONN_CONNECT_TIMEOUT 约束。

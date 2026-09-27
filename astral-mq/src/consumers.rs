@@ -10,13 +10,15 @@ use std::time::{Duration, Instant};
 use astral_db::{insert_or_increment_terminal, AuditQuarantineInput, AuditQuarantineStatus};
 use futures_util::StreamExt;
 use lapin::message::Delivery;
-use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions};
+use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions};
 use lapin::types::{FieldTable, ShortString};
 use lapin::{Channel, Confirmation};
 use redis::AsyncCommands;
+use serde_json::Value;
 use sqlx::MySqlPool;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+use uuid::Uuid;
 
 use crate::config::{
     QueueDef, EXCHANGE_DLX, MAX_RETRY, QUEUES, QUEUE_AUDIT_LOG, QUEUE_AUTH_SESSION_REVOCATION,
@@ -25,7 +27,8 @@ use crate::config::{
 use crate::consumer::{
     canonical_legacy_message_id, claim_message, complete_message, decode_delivery,
     delivery_message_id, message_type_for_queue, release_message, retry_count_from_delivery,
-    terminal_canonical_message_id, validate_delivery_envelope, Consumer, IdempotencyClaim,
+    terminal_canonical_message_id, validate_delivery_envelope, CompletionPolicy, Consumer,
+    IdempotencyClaim,
 };
 use crate::error::MqError;
 use crate::producer::{AuditLogPayload, AuthSessionRevocationPayload, LoginEventPayload};
@@ -91,7 +94,9 @@ impl DlqOwner {
     fn quarantine_queue(self, queue_name: &str) -> bool {
         matches!(
             (self, queue_name),
-            (Self::Identity, QUEUE_LOGIN_EVENT) | (Self::TrustGraph, QUEUE_AUDIT_LOG)
+            (Self::Identity, QUEUE_LOGIN_EVENT)
+                | (Self::Identity, QUEUE_AUTH_SESSION_REVOCATION)
+                | (Self::TrustGraph, QUEUE_AUDIT_LOG)
         )
     }
 }
@@ -145,6 +150,20 @@ pub async fn start_dlq_consumers(
     for def in queue_defs {
         let dlq = crate::config::dlx_routing_key(def.name);
         let consumer_tag = dlq_consumer_tag(owner, def.name);
+        channel
+            .basic_qos(
+                crate::consumer::DEFAULT_PREFETCH,
+                BasicQosOptions { global: false },
+            )
+            .await
+            .map_err(|error| {
+                DlqStartupError::Consume(format!(
+                    "owner={} queue={} consumer_tag={} qos: {error}",
+                    owner.as_str(),
+                    dlq,
+                    consumer_tag
+                ))
+            })?;
         let consumer = channel
             .basic_consume(
                 ShortString::from(dlq.as_str()),
@@ -265,7 +284,10 @@ enum TerminalCaptureAction {
 }
 
 fn quarantine_owner_queue(queue_name: &str) -> bool {
-    matches!(queue_name, QUEUE_AUDIT_LOG | QUEUE_LOGIN_EVENT)
+    matches!(
+        queue_name,
+        QUEUE_AUDIT_LOG | QUEUE_LOGIN_EVENT | QUEUE_AUTH_SESSION_REVOCATION
+    )
 }
 
 fn terminal_capture_selected(context: &DlqConsumerContext) -> bool {
@@ -1108,15 +1130,30 @@ async fn run_audit_log_batch_consumer(
     ready: Option<oneshot::Sender<Result<(), String>>>,
 ) -> Result<(), MqError> {
     let mut consumer = match channel
-        .basic_consume(
-            ShortString::from(audit_q.as_str()),
-            ShortString::from(format!("consumer_{audit_q}")),
-            BasicConsumeOptions::default(),
-            FieldTable::default(),
+        .basic_qos(
+            crate::consumer::DEFAULT_PREFETCH.max(AUDIT_BATCH_MAX_MESSAGES as u16),
+            BasicQosOptions { global: false },
         )
         .await
+        .map(|_| ())
     {
-        Ok(consumer) => consumer,
+        Ok(()) => match channel
+            .basic_consume(
+                ShortString::from(audit_q.as_str()),
+                ShortString::from(format!("consumer_{audit_q}")),
+                BasicConsumeOptions::default(),
+                FieldTable::default(),
+            )
+            .await
+        {
+            Ok(consumer) => consumer,
+            Err(error) => {
+                if let Some(ready) = ready {
+                    let _ = ready.send(Err(error.to_string()));
+                }
+                return Err(error.into());
+            }
+        },
         Err(error) => {
             if let Some(ready) = ready {
                 let _ = ready.send(Err(error.to_string()));
@@ -1269,7 +1306,7 @@ async fn flush_claimed_audit_batch(
                 // complete（Redis 幂等标记 '1'）→ ack；complete 失败与逐条路径
                 // 一致：不 ack（redelivery 后由 DB 幂等 claim 去重兜底）。
                 match complete_message(&item.message_id, message_type, &item.owner).await {
-                    Ok(true) => {
+                    Ok(true) | Ok(false) | Err(_) => {
                         if let Err(error) = ack_delivery(channel, &item.delivery).await {
                             tracing::error!(
                                 queue = %audit_q,
@@ -1278,21 +1315,6 @@ async fn flush_claimed_audit_batch(
                                 "audit batch ack failed"
                             );
                         }
-                    }
-                    Ok(false) => {
-                        tracing::error!(
-                            queue = %audit_q,
-                            message_id = %item.message_id,
-                            "message completion lease was lost"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            queue = %audit_q,
-                            message_id = %item.message_id,
-                            error = %error,
-                            "failed to complete message lease"
-                        );
                     }
                 }
             }
@@ -1310,7 +1332,7 @@ async fn flush_claimed_audit_batch(
                 match handle_audit_log(&item.message_id, &item.payload).await {
                     Ok(()) => {
                         match complete_message(&item.message_id, message_type, &item.owner).await {
-                            Ok(true) => {
+                            Ok(true) | Ok(false) | Err(_) => {
                                 if let Err(error) = ack_delivery(channel, &item.delivery).await {
                                     tracing::error!(
                                         queue = %audit_q,
@@ -1319,21 +1341,6 @@ async fn flush_claimed_audit_batch(
                                         "audit fallback ack failed"
                                     );
                                 }
-                            }
-                            Ok(false) => {
-                                tracing::error!(
-                                    queue = %audit_q,
-                                    message_id = %item.message_id,
-                                    "message completion lease was lost"
-                                );
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    queue = %audit_q,
-                                    message_id = %item.message_id,
-                                    error = %error,
-                                    "failed to complete message lease"
-                                );
                             }
                         }
                     }
@@ -1757,13 +1764,27 @@ pub async fn start_login_event_consumer(channel: &Channel) -> Result<(), MqError
             async move { handle_login_event(&message_id, &msg).await }
         },
         login_q,
-    );
+    )
+    .with_completion_policy(CompletionPolicy::DurableHandler);
     let q = login_q.to_string();
+    let (ready_tx, ready_rx) = oneshot::channel();
     tokio::spawn(async move {
-        if let Err(e) = consumer.start().await {
+        if let Err(e) = consumer.start_with_readiness(Some(ready_tx)).await {
             tracing::error!(queue = %q, error = %e, "consumer failed");
         }
     });
+    ready_rx
+        .await
+        .map_err(|_| {
+            MqError::Consume(format!(
+                "login event consumer startup task ended: queue={login_q}"
+            ))
+        })?
+        .map_err(|error| {
+            MqError::Consume(format!(
+                "login event consumer registration failed: queue={login_q}: {error}"
+            ))
+        })?;
     tracing::info!(queue = %login_q, "LoginEventConsumer started");
     Ok(())
 }
@@ -1842,20 +1863,35 @@ pub async fn start_auth_session_revocation_consumer(channel: &Channel) -> Result
     if revocation_q.is_empty() {
         return Ok(());
     }
-    let consumer = Consumer::new(
+    let consumer = Consumer::new_with_message_id(
         channel.clone(),
-        |msg: &AuthSessionRevocationPayload| {
+        |message_id: &str, msg: &AuthSessionRevocationPayload| {
             let msg = msg.clone();
-            async move { handle_auth_session_revocation(&msg).await }
+            let message_id = message_id.to_owned();
+            async move { handle_auth_session_revocation(&message_id, &msg).await }
         },
         revocation_q,
-    );
+    )
+    .with_completion_policy(CompletionPolicy::DurableHandler);
     let q = revocation_q.to_string();
+    let (ready_tx, ready_rx) = oneshot::channel();
     tokio::spawn(async move {
-        if let Err(e) = consumer.start().await {
+        if let Err(e) = consumer.start_with_readiness(Some(ready_tx)).await {
             tracing::error!(queue = %q, error = %e, "consumer failed");
         }
     });
+    ready_rx
+        .await
+        .map_err(|_| {
+            MqError::Consume(format!(
+                "auth session revocation consumer startup task ended: queue={revocation_q}"
+            ))
+        })?
+        .map_err(|error| {
+            MqError::Consume(format!(
+                "auth session revocation consumer registration failed: queue={revocation_q}: {error}"
+            ))
+        })?;
     tracing::info!(queue = %revocation_q, "AuthSessionRevocationConsumer started");
     Ok(())
 }
@@ -1877,6 +1913,7 @@ fn queue_name(suffix: &str) -> &'static str {
 /// 对齐 Java `AuthDeviceSessionService.revokeAllForUser`：DB 撤销 + session outbox +
 /// Redis projection delete。失败返回 Err → Consumer 框架 nack/DLX 重试（不吞失败）。
 async fn handle_auth_session_revocation(
+    envelope_message_id: &str,
     msg: &AuthSessionRevocationPayload,
 ) -> Result<(), Box<dyn std::error::Error + Send>> {
     let Some(pool) = SESSION_REVOCATION_DB.get() else {
@@ -1885,10 +1922,7 @@ async fn handle_auth_session_revocation(
             "auth session revocation consumer DB not initialized",
         )));
     };
-    let operation_id = msg
-        .operation_id
-        .clone()
-        .unwrap_or_else(|| format!("legacy-revoke-{}", msg.user_id));
+    let operation_id = revocation_operation_id(envelope_message_id, msg)?;
     let reason = msg.reason.trim();
     if reason.is_empty() {
         return Err(box_err(std::io::Error::new(
@@ -1898,69 +1932,105 @@ async fn handle_auth_session_revocation(
     }
     let mut tx = pool.begin().await.map_err(box_err)?;
 
-    // Keep session state, version and epoch in lockstep with the local revoke
-    // path. The predicates make retries idempotent after a committed attempt.
-    sqlx::query(
-        "UPDATE auth_device_session SET status = 'REVOKED', session_state = 'REVOKED', \
-         session_version = session_version + 1, session_epoch = session_epoch + 1, \
-         revoked_at = UTC_TIMESTAMP(), revoked_reason = ?, updated_at = UTC_TIMESTAMP() \
-         WHERE user_id = ? AND status IN ('ACTIVE', 'PENDING') \
-           AND session_state IN ('ACTIVE', 'PENDING')",
-    )
-    .bind(reason)
-    .bind(msg.user_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(box_err)?;
-    sqlx::query(
-        "UPDATE auth_token_family SET status = 'REVOKED', revoked_at = UTC_TIMESTAMP(), \
-         revoked_reason = ?, updated_at = UTC_TIMESTAMP() \
-         WHERE user_id = ? AND status = 'ACTIVE'",
-    )
-    .bind(reason)
-    .bind(msg.user_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(box_err)?;
-    sqlx::query(
-        "UPDATE auth_session_jti_index SET status = 'DELETED', updated_at = UTC_TIMESTAMP() \
-         WHERE user_id = ? AND status = 'ACTIVE'",
-    )
-    .bind(msg.user_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(box_err)?;
-
-    // The operation id is the durable idempotency boundary. Legacy messages
-    // receive a deterministic fallback id so retries cannot create new rows.
-    sqlx::query(
-        "INSERT IGNORE INTO auth_session_outbox \
-         (operation_id, session_id, event_type, sequence_number, projection_key, payload_json, status, created_at) \
-         VALUES (?, NULL, 'REVOKE', 1, ?, ?, 'PENDING', NOW())",
+    // The outbox row is the idempotent boundary for the command. A retry after
+    // the first commit reuses its immutable JTI snapshot instead of querying
+    // the mutable ACTIVE index again.
+    let existing: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT projection_key, payload_json FROM auth_session_outbox \
+         WHERE operation_id = ? AND sequence_number = 1 FOR UPDATE",
     )
     .bind(&operation_id)
-    .bind(format!("user:{}", msg.user_id))
-    .bind(serde_json::json!({ "reason": reason, "userId": msg.user_id }).to_string())
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(box_err)?;
+    let expected_projection_key = format!("user:{}", msg.user_id);
+    let (jti_keys, is_new_operation) = if let Some((projection_key, payload_json)) = existing {
+        if projection_key != expected_projection_key {
+            return Err(box_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "auth session revocation operation id is bound to another user",
+            )));
+        }
+        let payload = payload_json.ok_or_else(|| {
+            box_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "auth session revocation outbox payload is missing",
+            ))
+        })?;
+        (revocation_jtis_from_payload(&payload, msg.user_id)?, false)
+    } else {
+        let jti_keys: Vec<(String,)> = sqlx::query_as(
+            "SELECT jti FROM auth_session_jti_index \
+             WHERE user_id = ? AND status = 'ACTIVE' FOR UPDATE",
+        )
+        .bind(msg.user_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(box_err)?;
+        (jti_keys.into_iter().map(|(jti,)| jti).collect(), true)
+    };
 
-    let jti_keys: Vec<(String,)> =
-        sqlx::query_as("SELECT jti FROM auth_session_jti_index WHERE user_id = ?")
-            .bind(msg.user_id)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(box_err)?;
+    if is_new_operation {
+        // Keep session state, version and epoch in lockstep with the local
+        // revoke path. The predicates make retries idempotent after commit.
+        sqlx::query(
+            "UPDATE auth_device_session SET status = 'REVOKED', session_state = 'REVOKED', \
+             session_version = session_version + 1, session_epoch = session_epoch + 1, \
+             revoked_at = UTC_TIMESTAMP(), revoked_reason = ?, updated_at = UTC_TIMESTAMP() \
+             WHERE user_id = ? AND status IN ('ACTIVE', 'PENDING') \
+               AND session_state IN ('ACTIVE', 'PENDING')",
+        )
+        .bind(reason)
+        .bind(msg.user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(box_err)?;
+        sqlx::query(
+            "UPDATE auth_token_family SET status = 'REVOKED', revoked_at = UTC_TIMESTAMP(), \
+             revoked_reason = ?, updated_at = UTC_TIMESTAMP() \
+             WHERE user_id = ? AND status = 'ACTIVE'",
+        )
+        .bind(reason)
+        .bind(msg.user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(box_err)?;
+        sqlx::query(
+            "UPDATE auth_session_jti_index SET status = 'DELETED', updated_at = UTC_TIMESTAMP() \
+             WHERE user_id = ? AND status = 'ACTIVE'",
+        )
+        .bind(msg.user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(box_err)?;
+
+        let payload = serde_json::json!({
+            "v": 2,
+            "reason": reason,
+            "userId": msg.user_id,
+            "jtis": jti_keys,
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO auth_session_outbox \
+             (operation_id, session_id, event_type, sequence_number, projection_key, payload_json, status, created_at) \
+             VALUES (?, NULL, 'REVOKE', 1, ?, ?, 'PENDING', NOW())",
+        )
+        .bind(&operation_id)
+        .bind(&expected_projection_key)
+        .bind(payload)
+        .execute(&mut *tx)
+        .await
+        .map_err(box_err)?;
+    }
+
     tx.commit().await.map_err(box_err)?;
 
     // Redis is part of the access-session contract. Any failure must escape so
     // the MQ consumer nacks and retries instead of acknowledging a live token.
-    let redis_url = std::env::var("REDIS_URL")
-        .or_else(|_| std::env::var("ASTRAL_REDIS_URL"))
-        .unwrap_or_else(|_| "redis://localhost:6379".into());
-    let client = redis::Client::open(redis_url.as_str()).map_err(box_err)?;
-    let mut conn = client.get_connection_manager().await.map_err(box_err)?;
-    for (jti,) in jti_keys {
+    use crate::consumer::shared_idempotency_redis;
+    let mut conn = shared_idempotency_redis().map_err(box_err)?;
+    for jti in jti_keys {
         conn.del::<_, ()>((format!("access:jti:{jti}"), format!("access:grant:{jti}")))
             .await
             .map_err(box_err)?;
@@ -1976,6 +2046,67 @@ async fn handle_auth_session_revocation(
         "auth session revocation command processed"
     );
     Ok(())
+}
+
+fn revocation_operation_id(
+    envelope_message_id: &str,
+    msg: &AuthSessionRevocationPayload,
+) -> Result<String, Box<dyn std::error::Error + Send>> {
+    let candidate = msg
+        .operation_id
+        .as_deref()
+        .or_else(|| (!envelope_message_id.trim().is_empty()).then_some(envelope_message_id))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            let seed = format!("{}\n{}\n{}", msg.user_id, msg.reason.trim(), msg.timestamp);
+            format!(
+                "legacy-revoke-{}",
+                Uuid::new_v5(&Uuid::NAMESPACE_URL, seed.as_bytes())
+            )
+        });
+    if candidate.len() > 64 || candidate.contains('\0') {
+        return Err(box_err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "auth session revocation operation id is invalid",
+        )));
+    }
+    Ok(candidate)
+}
+
+fn revocation_jtis_from_payload(
+    payload: &str,
+    user_id: i64,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send>> {
+    let value: Value = serde_json::from_str(payload).map_err(box_err)?;
+    if value.get("v").and_then(Value::as_i64) != Some(2)
+        || value.get("userId").and_then(Value::as_i64) != Some(user_id)
+    {
+        return Err(box_err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth session revocation outbox payload is incompatible",
+        )));
+    }
+    let Some(jtis) = value.get("jtis").and_then(Value::as_array) else {
+        return Err(box_err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth session revocation JTI snapshot is missing",
+        )));
+    };
+    jtis.iter()
+        .map(|jti| {
+            jti.as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    box_err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "auth session revocation JTI snapshot is invalid",
+                    ))
+                })
+        })
+        .collect()
 }
 
 /// 将 sqlx/IO 错误装箱为 `Box<dyn std::error::Error + Send>`（Consumer handler 签名要求）

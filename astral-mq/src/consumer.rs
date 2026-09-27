@@ -11,12 +11,14 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
 
 use futures_util::StreamExt;
 use lapin::message::Delivery;
-use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions};
+use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions};
 use lapin::types::ShortString;
 use lapin::Channel;
+use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -28,6 +30,43 @@ use crate::producer::MqMessage;
 
 const IDEMPOTENCY_TTL_SECONDS: i64 = 86_400;
 const PROCESSING_LEASE_SECONDS: i64 = 300;
+pub(crate) const DEFAULT_PREFETCH: u16 = 32;
+pub(crate) const REDIS_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+static IDEMPOTENCY_REDIS: OnceLock<ConnectionManager> = OnceLock::new();
+
+pub async fn init_idempotency_redis(redis_url: &str) -> Result<(), MqError> {
+    if IDEMPOTENCY_REDIS.get().is_some() {
+        return Ok(());
+    }
+    let client = redis::Client::open(redis_url)
+        .map_err(|error| MqError::Idempotent(format!("open Redis client failed: {error}")))?;
+    let config = redis::aio::ConnectionManagerConfig::new()
+        .set_connection_timeout(Some(std::time::Duration::from_secs(1)))
+        .set_response_timeout(Some(std::time::Duration::from_millis(500)))
+        .set_number_of_retries(0);
+    let manager = tokio::time::timeout(
+        REDIS_OPERATION_TIMEOUT,
+        ConnectionManager::new_with_config(client, config),
+    )
+    .await
+    .map_err(|_| MqError::Idempotent("Redis connection timed out".into()))?
+    .map_err(|error| MqError::Idempotent(format!("connect to Redis failed: {error}")))?;
+    IDEMPOTENCY_REDIS
+        .set(manager)
+        .map_err(|_| MqError::Idempotent("Redis idempotency manager already initialized".into()))
+}
+
+pub(crate) fn idempotency_redis() -> Result<ConnectionManager, MqError> {
+    IDEMPOTENCY_REDIS
+        .get()
+        .cloned()
+        .ok_or_else(|| MqError::Idempotent("Redis idempotency manager is not initialized".into()))
+}
+
+pub fn shared_idempotency_redis() -> Result<ConnectionManager, MqError> {
+    idempotency_redis()
+}
 
 pub(crate) fn message_type_for_queue(queue_name: &str) -> &'static str {
     match queue_name {
@@ -372,39 +411,32 @@ pub(crate) async fn claim_message(
     message_id: &str,
     msg_type: &str,
 ) -> Result<IdempotencyClaim, MqError> {
-    let redis_url = std::env::var("REDIS_URL")
-        .or_else(|_| std::env::var("ASTRAL_REDIS_URL"))
-        .unwrap_or_else(|_| "redis://localhost:6379".into());
-    let client = redis::Client::open(redis_url.as_str())
-        .map_err(|e| MqError::Idempotent(format!("open Redis client failed: {e}")))?;
-    let mut conn = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        client.get_connection_manager(),
-    )
-    .await
-    .map_err(|_| MqError::Idempotent("Redis connection timed out".into()))?
-    .map_err(|e| MqError::Idempotent(format!("connect to Redis failed: {e}")))?;
+    let mut conn = idempotency_redis()?;
 
     let key = idempotency_key(message_id, msg_type);
     let owner = uuid::Uuid::new_v4().to_string();
     let marker = processing_marker(&owner);
-    let result: Option<String> = redis::cmd("SET")
-        .arg(&key)
-        .arg(&marker)
-        .arg("NX")
-        .arg("EX")
-        .arg(PROCESSING_LEASE_SECONDS)
-        .query_async(&mut conn)
-        .await
-        .map_err(|e| MqError::Idempotent(format!("claim message failed: {e}")))?;
+    let result: Option<String> = tokio::time::timeout(
+        REDIS_OPERATION_TIMEOUT,
+        redis::cmd("SET")
+            .arg(&key)
+            .arg(&marker)
+            .arg("NX")
+            .arg("EX")
+            .arg(PROCESSING_LEASE_SECONDS)
+            .query_async(&mut conn),
+    )
+    .await
+    .map_err(|_| MqError::Idempotent("claim message timed out".into()))?
+    .map_err(|e| MqError::Idempotent(format!("claim message failed: {e}")))?;
 
     if result.is_some() {
         return Ok(IdempotencyClaim::Claimed(owner));
     }
 
-    let current: Option<String> = conn
-        .get(&key)
+    let current: Option<String> = tokio::time::timeout(REDIS_OPERATION_TIMEOUT, conn.get(&key))
         .await
+        .map_err(|_| MqError::Idempotent("read message state timed out".into()))?
         .map_err(|e| MqError::Idempotent(format!("read message state failed: {e}")))?;
     match current.as_deref() {
         Some("1") => Ok(IdempotencyClaim::Completed),
@@ -422,27 +454,91 @@ pub(crate) async fn complete_message(
     msg_type: &str,
     owner: &str,
 ) -> Result<bool, MqError> {
-    let redis_url = std::env::var("REDIS_URL")
-        .or_else(|_| std::env::var("ASTRAL_REDIS_URL"))
-        .unwrap_or_else(|_| "redis://localhost:6379".into());
-    let client = redis::Client::open(redis_url.as_str())
-        .map_err(|e| MqError::Idempotent(format!("open Redis client failed: {e}")))?;
-    let mut conn = client
-        .get_connection_manager()
-        .await
-        .map_err(|e| MqError::Idempotent(format!("connect to Redis failed: {e}")))?;
+    let mut conn = idempotency_redis()?;
     let key = idempotency_key(message_id, msg_type);
     let marker = processing_marker(owner);
-    let result: i32 = redis::Script::new(
-        "if redis.call('get', KEYS[1]) == ARGV[1] then redis.call('set', KEYS[1], '1', 'EX', ARGV[2]); return 1 else return 0 end",
+    let result: i32 = tokio::time::timeout(
+        REDIS_OPERATION_TIMEOUT,
+        redis::Script::new(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then redis.call('set', KEYS[1], '1', 'EX', ARGV[2]); return 1 else return 0 end",
+        )
+        .key(key)
+        .arg(marker)
+        .arg(IDEMPOTENCY_TTL_SECONDS)
+        .invoke_async(&mut conn),
     )
-    .key(key)
-    .arg(marker)
-    .arg(IDEMPOTENCY_TTL_SECONDS)
-    .invoke_async(&mut conn)
     .await
+    .map_err(|_| MqError::Idempotent("complete message timed out".into()))?
     .map_err(|e| MqError::Idempotent(format!("complete message failed: {e}")))?;
     Ok(result == 1)
+}
+
+/// Extend an owned processing lease without allowing a stale worker to renew
+/// another delivery's lease.
+pub(crate) async fn renew_message(
+    message_id: &str,
+    msg_type: &str,
+    owner: &str,
+) -> Result<bool, MqError> {
+    let mut conn = idempotency_redis()?;
+    let key = idempotency_key(message_id, msg_type);
+    let marker = processing_marker(owner);
+    let result: i32 = tokio::time::timeout(
+        REDIS_OPERATION_TIMEOUT,
+        redis::Script::new(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+        )
+        .key(key)
+        .arg(marker)
+        .arg(PROCESSING_LEASE_SECONDS)
+        .invoke_async(&mut conn),
+    )
+    .await
+    .map_err(|_| MqError::Idempotent("renew message timed out".into()))?
+    .map_err(|e| MqError::Idempotent(format!("renew message failed: {e}")))?;
+    Ok(result == 1)
+}
+
+async fn processing_ttl(message_id: &str, msg_type: &str) -> Result<i64, MqError> {
+    let mut conn = idempotency_redis()?;
+    let key = idempotency_key(message_id, msg_type);
+    tokio::time::timeout(REDIS_OPERATION_TIMEOUT, conn.pttl(key))
+        .await
+        .map_err(|_| MqError::Idempotent("read processing lease TTL timed out".into()))?
+        .map_err(|e| MqError::Idempotent(format!("read processing lease TTL failed: {e}")))
+}
+
+fn start_lease_heartbeat(
+    message_id: &str,
+    msg_type: &'static str,
+    owner: &str,
+    queue_name: &str,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (stop_tx, mut stop_rx) = oneshot::channel();
+    let message_id = message_id.to_owned();
+    let owner = owner.to_owned();
+    let queue_name = queue_name.to_owned();
+    let interval = std::time::Duration::from_secs((PROCESSING_LEASE_SECONDS as u64 / 3).max(1));
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {
+                    match renew_message(&message_id, msg_type, &owner).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(queue = %queue_name, message_id = %message_id, "processing lease was lost during heartbeat");
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::warn!(queue = %queue_name, message_id = %message_id, error = %error, "processing lease heartbeat failed");
+                        }
+                    }
+                }
+                _ = &mut stop_rx => break,
+            }
+        }
+    });
+    (stop_tx, task)
 }
 
 /// Release a processing lease after handler failure.
@@ -451,24 +547,20 @@ pub(crate) async fn release_message(
     msg_type: &str,
     owner: &str,
 ) -> Result<(), MqError> {
-    let redis_url = std::env::var("REDIS_URL")
-        .or_else(|_| std::env::var("ASTRAL_REDIS_URL"))
-        .unwrap_or_else(|_| "redis://localhost:6379".into());
-    let client = redis::Client::open(redis_url.as_str())
-        .map_err(|e| MqError::Idempotent(format!("open Redis client failed: {e}")))?;
-    let mut conn = client
-        .get_connection_manager()
-        .await
-        .map_err(|e| MqError::Idempotent(format!("connect to Redis failed: {e}")))?;
+    let mut conn = idempotency_redis()?;
     let key = idempotency_key(message_id, msg_type);
     let marker = processing_marker(owner);
-    let _: i32 = redis::Script::new(
-        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+    let _: i32 = tokio::time::timeout(
+        REDIS_OPERATION_TIMEOUT,
+        redis::Script::new(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+        )
+        .key(key)
+        .arg(marker)
+        .invoke_async(&mut conn),
     )
-    .key(key)
-    .arg(marker)
-    .invoke_async(&mut conn)
     .await
+    .map_err(|_| MqError::Idempotent("release message timed out".into()))?
     .map_err(|e| MqError::Idempotent(format!("release message failed: {e}")))?;
     Ok(())
 }
@@ -500,11 +592,18 @@ enum MessageHandler<T> {
     WithMessageId(MessageHandlerWithIdFn<T>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionPolicy {
+    RequireMarker,
+    DurableHandler,
+}
+
 /// 通用消费者：反序列化 + 调用处理器 + ack/nack/DLX
 pub struct Consumer<T: DeserializeOwned + Send + 'static> {
     channel: Channel,
     handler: MessageHandler<T>,
     queue_name: String,
+    completion_policy: CompletionPolicy,
 }
 
 impl<T: DeserializeOwned + Send + 'static> Consumer<T> {
@@ -518,6 +617,7 @@ impl<T: DeserializeOwned + Send + 'static> Consumer<T> {
             channel,
             handler: MessageHandler::Payload(Box::new(move |payload| Box::pin(handler(payload)))),
             queue_name: queue_name.into(),
+            completion_policy: CompletionPolicy::RequireMarker,
         }
     }
 
@@ -541,7 +641,16 @@ impl<T: DeserializeOwned + Send + 'static> Consumer<T> {
                 Box::pin(handler(message_id, payload))
             })),
             queue_name: queue_name.into(),
+            completion_policy: CompletionPolicy::RequireMarker,
         }
+    }
+
+    /// Mark this consumer's handler as durable and idempotent. If the business
+    /// side effect succeeds but the Redis completion marker is unavailable, the
+    /// delivery is ACKed because the handler owns the durable deduplication.
+    pub fn with_completion_policy(mut self, policy: CompletionPolicy) -> Self {
+        self.completion_policy = policy;
+        self
     }
 
     /// Start consuming messages and report broker registration before processing.
@@ -556,6 +665,16 @@ impl<T: DeserializeOwned + Send + 'static> Consumer<T> {
         &self,
         ready: Option<oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), MqError> {
+        if let Err(error) = self
+            .channel
+            .basic_qos(DEFAULT_PREFETCH, BasicQosOptions { global: false })
+            .await
+        {
+            if let Some(ready) = ready {
+                let _ = ready.send(Err(error.to_string()));
+            }
+            return Err(error.into());
+        }
         let mut consumer = match self
             .channel
             .basic_consume(
@@ -583,7 +702,8 @@ impl<T: DeserializeOwned + Send + 'static> Consumer<T> {
         while let Some(delivery) = consumer.next().await {
             let delivery = delivery.map_err(|e| MqError::Consume(e.to_string()))?;
             if let Err(e) = self.process_delivery(&delivery).await {
-                tracing::error!(queue = %self.queue_name, error = %e, "delivery failed");
+                tracing::error!(queue = %self.queue_name, error = %e, "delivery settlement failed");
+                return Err(e);
             }
         }
 
@@ -646,31 +766,66 @@ impl<T: DeserializeOwned + Send + 'static> Consumer<T> {
                 return self.ack(delivery).await;
             }
             IdempotencyClaim::InFlight => {
-                // Another consumer currently owns the lease. Requeue through
-                // the existing retry path instead of acknowledging work away.
                 tracing::debug!(
                     queue = %self.queue_name,
                     message_id = %msg.message_id,
-                    "message processing lease is active, requeueing without consuming retry budget"
+                    "message processing lease is active, waiting before requeue"
                 );
-                return self.requeue(delivery).await;
+                match processing_ttl(&msg.message_id, message_type).await {
+                    Ok(ttl_ms) if ttl_ms > 0 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            (ttl_ms as u64).min(2_000),
+                        ))
+                        .await;
+                        self.requeue(delivery).await
+                    }
+                    Ok(_) => self.requeue(delivery).await,
+                    Err(error) => {
+                        tracing::error!(
+                            queue = %self.queue_name,
+                            message_id = %msg.message_id,
+                            error = %error,
+                            "processing lease TTL unavailable; sending delivery to DLX"
+                        );
+                        self.nack(delivery).await
+                    }
+                }
             }
             IdempotencyClaim::Claimed(owner) => {
+                let (heartbeat_stop, heartbeat) =
+                    start_lease_heartbeat(&msg.message_id, message_type, &owner, &self.queue_name);
                 let result = match &self.handler {
                     MessageHandler::Payload(handler) => handler(&msg.payload).await,
                     MessageHandler::WithMessageId(handler) => {
                         handler(&msg.message_id, &msg.payload).await
                     }
                 };
+                let _ = heartbeat_stop.send(());
+                let _ = heartbeat.await;
                 match result {
-                    Ok(_) => {
-                        if !complete_message(&msg.message_id, message_type, &owner).await? {
-                            return Err(MqError::Idempotent(
-                                "message completion lease was lost".into(),
-                            ));
+                    Ok(_) => match complete_message(&msg.message_id, message_type, &owner).await {
+                        Ok(true) => self.ack(delivery).await,
+                        Ok(false) | Err(_)
+                            if self.completion_policy == CompletionPolicy::DurableHandler =>
+                        {
+                            tracing::error!(
+                                queue = %self.queue_name,
+                                message_id = %msg.message_id,
+                                "durable handler succeeded but Redis completion marker was not confirmed"
+                            );
+                            self.ack(delivery).await
                         }
-                        self.ack(delivery).await
-                    }
+                        Ok(false) => self.nack(delivery).await,
+                        Err(error) => {
+                            tracing::error!(
+                                queue = %self.queue_name,
+                                message_id = %msg.message_id,
+                                error = %error,
+                                "message completion marker failed; sending delivery to DLX"
+                            );
+                            self.nack(delivery).await
+                        }
+                    },
                     Err(e) => {
                         if let Err(release_error) =
                             release_message(&msg.message_id, message_type, &owner).await

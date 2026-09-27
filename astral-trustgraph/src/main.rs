@@ -362,6 +362,7 @@ async fn main() -> anyhow::Result<()> {
     astral_trustgraph::api::tenants::register_trustgraph_data_scope_rules();
 
     let rabbitmq_url = config.rabbitmq_url.clone();
+    let redis_url = config.redis_url.clone();
 
     // 第二批：规则/规则集/委托 repository + service 装配（副作用执行器共享连接池）
     let side_effects = Arc::new(SqlxPermissionSideEffects::new(db.clone()));
@@ -727,6 +728,7 @@ async fn main() -> anyhow::Result<()> {
             // may contain a credential-bearing endpoint, so it is never formatted.
             let started = init_mq_consumers(
                 &rabbitmq_url,
+                &redis_url,
                 &dlq_quarantine_db,
                 audit_replay_producer.clone(),
             )
@@ -1096,9 +1098,11 @@ async fn rollback_started_workers_after_org_scope_failure(
 /// 初始化 MQ 消费者（连接到 RabbitMQ、声明队列、启动消费者）
 async fn init_mq_consumers(
     rabbitmq_url: &str,
+    redis_url: &str,
     quarantine_db: &sqlx::MySqlPool,
     audit_replay_producer: AuditReplayProducerSlot,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    astral_mq::consumer::init_idempotency_redis(redis_url).await?;
     // 1. 连接 RabbitMQ
     let conn = Connection::connect(
         rabbitmq_url,

@@ -186,19 +186,15 @@ pub async fn evict_eligibility_gate_cache(card_id: i64) {
     delete_redis_keys(&keys, card_id, "evict_eligibility_gate_cache").await;
 }
 
-/// 本地默认 Redis 地址（与 astral-mq 消费侧 `handle_auth_session_revocation`
-/// 的回退默认保持一致）。
-const DEFAULT_REDIS_URL: &str = "redis://localhost:6379";
-
-/// Redis 连接地址选择（纯函数）：`REDIS_URL` 优先，其次 `ASTRAL_REDIS_URL`，
-/// 均未设置时回退本地默认。
-///
-/// 入参是已读取的环境变量值（`None` = 未设置），函数内部不读进程全局 env，
-/// 便于纯测试；`delete_redis_keys` 共用该选择逻辑。
-fn redis_url_from_env(redis_url: Option<String>, astral_redis_url: Option<String>) -> String {
+/// Redis 连接地址选择（纯函数）：`REDIS_URL` 优先，其次 `ASTRAL_REDIS_URL`；
+/// 两者均未设置时返回 `None`，调用方保留 fail-closed 观测而不尝试 localhost。
+fn redis_url_from_env(
+    redis_url: Option<String>,
+    astral_redis_url: Option<String>,
+) -> Option<String> {
     redis_url
         .or(astral_redis_url)
-        .unwrap_or_else(|| DEFAULT_REDIS_URL.to_owned())
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// 共享 Redis DEL 执行器（fire-and-forget）：打不开客户端/连接失败仅记 warning，
@@ -207,10 +203,17 @@ async fn delete_redis_keys(keys: &[String], aggregate_id: i64, op: &str) {
     if keys.is_empty() {
         return;
     }
-    let redis_url = redis_url_from_env(
+    let Some(redis_url) = redis_url_from_env(
         std::env::var("REDIS_URL").ok(),
         std::env::var("ASTRAL_REDIS_URL").ok(),
-    );
+    ) else {
+        tracing::warn!(
+            aggregate_id,
+            op,
+            "Redis URL is not configured; cache eviction skipped"
+        );
+        return;
+    };
     let Ok(client) = redis::Client::open(redis_url.as_str()) else {
         tracing::warn!(aggregate_id, op, "failed to open Redis client");
         return;
@@ -599,22 +602,22 @@ mod tests {
     }
 
     #[test]
-    fn redis_url_selection_prefers_redis_url_then_astral_then_default() {
+    fn redis_url_selection_prefers_redis_url_then_astral_then_none() {
         // REDIS_URL 优先于 ASTRAL_REDIS_URL
         assert_eq!(
             redis_url_from_env(
                 Some("redis://primary:6379".into()),
                 Some("redis://secondary:6379".into())
             ),
-            "redis://primary:6379"
+            Some("redis://primary:6379".into())
         );
         // REDIS_URL 未设置时回退 ASTRAL_REDIS_URL
         assert_eq!(
             redis_url_from_env(None, Some("redis://secondary:6379".into())),
-            "redis://secondary:6379"
+            Some("redis://secondary:6379".into())
         );
-        // 两者均未设置时回退本地默认（与 astral-mq 消费侧一致）
-        assert_eq!(redis_url_from_env(None, None), "redis://localhost:6379");
+        // 两者均未设置时不尝试 localhost，返回 None。
+        assert_eq!(redis_url_from_env(None, None), None);
     }
 
     /// 【读链切换批次 3 结构锁定】快照重建家族退役后，本模块不得再出现任何

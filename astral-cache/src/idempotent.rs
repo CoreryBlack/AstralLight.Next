@@ -1,7 +1,7 @@
 //! 消息幂等服务
 //!
-//! 使用 Redis SETNX 实现 MQ 消息去重。每条消息处理前检查是否已处理，
-//! 已处理则跳过，未处理则标记后正常消费。
+//! 使用 Redis 的原子 `SET NX EX` 实现消息幂等去重。该兼容服务只负责
+//! "首次观察"语义；MQ consumer 的 owner-fenced lease 协议仍由 `astral-mq` 维护。
 
 use std::time::Duration;
 
@@ -36,18 +36,15 @@ impl MessageIdempotentService {
         let key = format!("mq:idempotent:{message_type}:{message_id}");
         let mut conn = self.redis.clone();
 
-        let result: bool = conn.set_nx(&key, "1").await?;
-
-        if result {
-            // 首次设置成功 → 消息未处理过，设置 TTL
-            let _: Result<(), _> = conn
-                .expire::<_, ()>(&key, self.default_ttl.as_secs() as i64)
-                .await;
-            Ok(false)
-        } else {
-            // key 已存在 → 消息已处理
-            Ok(true)
-        }
+        let result: Option<String> = redis::cmd("SET")
+            .arg(&key)
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(self.default_ttl.as_secs())
+            .query_async(&mut conn)
+            .await?;
+        Ok(result.is_none())
     }
 
     /// 显式标记消息为已处理（覆盖现有标记）

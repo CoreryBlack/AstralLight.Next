@@ -12,8 +12,10 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde::Deserialize;
+use std::sync::OnceLock;
 
 use astral_common::config::AppConfig;
 use astral_common::middleware::internal_signature::INTERNAL_SESSION_PATH;
@@ -116,18 +118,38 @@ pub(crate) fn is_proxy_forbidden_header(name: &str) -> bool {
 /// Redis 连接超时（秒）
 const REDIS_TIMEOUT_SECS: u64 = 3;
 
+static GATEWAY_REDIS: OnceLock<ConnectionManager> = OnceLock::new();
+
+pub async fn init_gateway_redis(redis_url: &str) -> Result<(), String> {
+    if GATEWAY_REDIS.get().is_some() {
+        return Ok(());
+    }
+    let client = redis::Client::open(redis_url).map_err(|error| error.to_string())?;
+    let config = redis::aio::ConnectionManagerConfig::new()
+        .set_connection_timeout(Some(std::time::Duration::from_secs(1)))
+        .set_response_timeout(Some(std::time::Duration::from_millis(500)))
+        .set_number_of_retries(0);
+    let manager = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        ConnectionManager::new_with_config(client, config),
+    )
+    .await
+    .map_err(|_| "Redis connection timed out".to_owned())?
+    .map_err(|error| error.to_string())?;
+    GATEWAY_REDIS
+        .set(manager)
+        .map_err(|_| "Gateway Redis manager already initialized".to_owned())
+}
+
+fn gateway_redis() -> RedisCheckResult<ConnectionManager> {
+    GATEWAY_REDIS.get().cloned().ok_or(())
+}
+
 /// Protected-request Redis checks fail closed; tests can exercise the decision helpers without Redis.
 type RedisCheckResult<T> = Result<T, ()>;
 
-async fn redis_conn_with_url(redis_url: &str) -> RedisCheckResult<redis::aio::ConnectionManager> {
-    let client = redis::Client::open(redis_url).map_err(|_| ())?;
-    tokio::time::timeout(
-        std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
-        client.get_connection_manager(),
-    )
-    .await
-    .map_err(|_| ())?
-    .map_err(|_| ())
+async fn redis_conn_with_url(_redis_url: &str) -> RedisCheckResult<redis::aio::ConnectionManager> {
+    gateway_redis()
 }
 
 /// 从 Redis 获取缓存的租户状态。

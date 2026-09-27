@@ -3,6 +3,9 @@
 /target/
 **/target/
 
+# Local agent/session state
+.zcode/
+
 # Local runtime configuration and credentials
 .env
 .env.*

@@ -14,6 +14,7 @@ use axum::extract::FromRef;
 use axum::Router;
 use lapin::Connection;
 use policy_engine::PolicyEngine;
+use redis::aio::ConnectionManager;
 use sqlx::MySqlPool;
 
 use astral_common::audit::{register_audit_db_writer, AuditDbWriter, AuditEntry};
@@ -38,6 +39,7 @@ use srv::user_service::UserService;
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub db: MySqlPool,
+    pub redis: ConnectionManager,
     pub engine: Arc<PolicyEngine>,
     pub me_service: Arc<MeService>,
     pub auth_service: Arc<AuthService>,
@@ -145,6 +147,17 @@ async fn main() -> anyhow::Result<()> {
     )?);
     config.validate_identity_session_grant_compatibility()?;
     let db = connect_and_validate_schema(&config.database_url).await?;
+    let redis_client = redis::Client::open(config.redis_url.as_str())?;
+    let redis_config = redis::aio::ConnectionManagerConfig::new()
+        .set_connection_timeout(Some(std::time::Duration::from_secs(1)))
+        .set_response_timeout(Some(std::time::Duration::from_millis(500)))
+        .set_number_of_retries(0);
+    let redis = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        ConnectionManager::new_with_config(redis_client, redis_config),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Redis connection timed out"))??;
     let engine = Arc::new(PolicyEngine::new());
     register_audit_db_writer(Arc::new(IdentityAuditDbWriter { pool: db.clone() }));
     let me_service = Arc::new(MeService::new(Arc::new(SqlxMeRepository::new(db.clone()))));
@@ -165,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         config,
         db: db.clone(),
+        redis: redis.clone(),
         engine,
         me_service,
         auth_service,
@@ -176,11 +190,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Every Identity replica runs the same leased recovery loop. MySQL owns
     // coordination; Redis remains an idempotent projection store.
-    srv::session_projection_worker::spawn(db.clone(), state.config.redis_url.clone());
+    srv::session_projection_worker::spawn(db.clone(), redis.clone());
 
     // MQ 初始化：连接 RabbitMQ、注册 Producer、启动消费者（后台退避重试，避免
     // 启动时 RabbitMQ 暂不可用导致 producer 永久缺失；审计双写失败走 DB fallback 兜底）
     let mq_url = state.config.rabbitmq_url.clone();
+    let redis_url = state.config.redis_url.clone();
     let dlq_quarantine_db = db.clone();
     // 注入 auth.session.revocation consumer 的 DB pool（TrustGraph GlobalAdmin
     // 生命周期等跨服务撤销命令由 identity 消费执行）
@@ -190,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let mut attempt: u32 = 0;
         loop {
-            let producer = init_mq(&mq_url, &dlq_quarantine_db).await.ok();
+            let producer = init_mq(&mq_url, &redis_url, &dlq_quarantine_db).await.ok();
             if let Some(producer) = producer {
                 register_mq_producer(Arc::new(producer));
                 tracing::info!(service = "identity", "MQ producer registered");
@@ -259,8 +274,10 @@ async fn main() -> anyhow::Result<()> {
 /// 返回 `IdentityMqProducer` 供全局注册使用。
 async fn init_mq(
     rabbitmq_url: &str,
+    redis_url: &str,
     quarantine_db: &MySqlPool,
 ) -> Result<IdentityMqProducer, Box<dyn std::error::Error>> {
+    astral_mq::consumer::init_idempotency_redis(redis_url).await?;
     let conn = Connection::connect(
         rabbitmq_url,
         lapin::ConnectionProperties::default().enable_auto_recover(),

@@ -135,9 +135,10 @@ async fn main() -> anyhow::Result<()> {
     let engine = Arc::new(PolicyEngine::new());
     register_audit_db_writer(Arc::new(LearnAuditDbWriter { pool: db.clone() }));
     let rabbitmq_url = config.rabbitmq_url.clone();
+    let redis_url = config.redis_url.clone();
 
     // 初始化 MQ Producer
-    let mq_producer = init_mq_producer(&rabbitmq_url).await;
+    let mq_producer = init_mq_producer(&rabbitmq_url, &redis_url).await;
 
     // 数据访问层（对齐 Java Learn*Mapper 边界）
     let subject_repository: Arc<
@@ -265,12 +266,18 @@ async fn main() -> anyhow::Result<()> {
     // RabbitMQ 暂不可用时按指数退避重试，避免消费者永久缺失。
     let pool = state.db.clone();
     let mq_url = state.config.rabbitmq_url.clone();
+    let redis_url = state.config.redis_url.clone();
     let subject_service_for_consumer = state.subject_service.clone();
     tokio::spawn(async move {
         let mut attempt: u32 = 0;
         loop {
             let started =
-                init_mq_consumers(&mq_url, pool.clone(), subject_service_for_consumer.clone())
+                init_mq_consumers(
+                    &mq_url,
+                    &redis_url,
+                    pool.clone(),
+                    subject_service_for_consumer.clone(),
+                )
                     .await
                     .ok();
             if let Some(started) = started {
@@ -380,7 +387,17 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// 初始化 MQ Producer
-async fn init_mq_producer(rabbitmq_url: &str) -> Option<astral_mq::producer::Producer> {
+async fn init_mq_producer(
+    rabbitmq_url: &str,
+    redis_url: &str,
+) -> Option<astral_mq::producer::Producer> {
+    if astral_mq::consumer::init_idempotency_redis(redis_url)
+        .await
+        .is_err()
+    {
+        tracing::warn!(service = "learn", "MQ Redis idempotency initialization failed");
+        return None;
+    }
     match Connection::connect(
         rabbitmq_url,
         lapin::ConnectionProperties::default().enable_auto_recover(),
@@ -418,9 +435,11 @@ async fn init_mq_producer(rabbitmq_url: &str) -> Option<astral_mq::producer::Pro
 /// 初始化 MQ 消费者
 async fn init_mq_consumers(
     rabbitmq_url: &str,
+    redis_url: &str,
     _pool: MySqlPool,
     subject_service: Arc<SubjectService>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    astral_mq::consumer::init_idempotency_redis(redis_url).await?;
     let conn = Connection::connect(
         rabbitmq_url,
         lapin::ConnectionProperties::default().enable_auto_recover(),

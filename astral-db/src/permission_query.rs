@@ -994,17 +994,7 @@ pub async fn find_effective_permissions_cached(
         return Ok(Vec::new());
     };
 
-    let redis_url = std::env::var("REDIS_URL")
-        .or_else(|_| std::env::var("ASTRAL_REDIS_URL"))
-        .unwrap_or_else(|_| "redis://localhost:6379".into());
-    let Ok(client) = redis::Client::open(redis_url.as_str()) else {
-        return Ok(
-            find_effective_permissions_for_tenant(pool, tenant_id, card_id)
-                .await?
-                .grants,
-        );
-    };
-    let Ok(mut conn) = client.get_connection_manager().await else {
+    let Some(mut conn) = crate::eligibility::redis_conn().await else {
         return Ok(
             find_effective_permissions_for_tenant(pool, tenant_id, card_id)
                 .await?

@@ -1,7 +1,15 @@
-//! 权限投影 durable worker — ProjectionWorker（ELIGIBILITY-only）
+//! 权限投影 durable worker — ProjectionWorker（ELIGIBILITY-only，纯恢复角色）
 //!
-//! 周期轮询 `authorization_projection_outbox`（对齐 Java
-//! `AuthorizationProjectionJob` @Scheduled fixedDelay 5s 的 claim/lease 形态），
+//! 【读写分离降级】ELIGIBILITY 资格缓存失效的主路径是各写点在 source
+//! mutation 提交后的同步资格缓存 evict 家族（覆盖全部同进程变更点，符号见
+//! side_effects 模块）；CARD/RULE_SET 投影的权威消费者是新链
+//! authorization_projector delta 队列。本循环因此降级为纯恢复/对账角色：
+//! 兜底同步失效遗漏的 ELIGIBILITY 事件、终结已退役通道的 outbox 行、并按轮
+//! 驱动补偿重试——热路径零参与，轮询周期相应放宽。
+//!
+//! 周期轮询 `authorization_projection_outbox`（claim/lease 形态；周期从对齐
+//! Java @Scheduled 5s 放宽至 15s，属记录在案的刻意偏离：主路径同步化后本
+//! 循环只承担恢复职责，放宽只增加兜底延迟、不影响任何 fail-closed 语义），
 //! 对每条 PENDING 事件执行：
 //!
 //! ```text
@@ -48,8 +56,9 @@ use crate::repository::projection_repository::{
     is_projection_lease_lost, OutboxEventRecord, ProjectionRepository,
 };
 
-/// 轮询周期（对齐 Java @Scheduled fixedDelay = 5000ms）
-const POLL_INTERVAL_SECS: u64 = 5;
+/// 轮询周期（纯恢复角色，见模块文档；从对齐 Java 的 5s 放宽至 15s——
+/// 主路径已同步化，本循环只兜底恢复与对账）。
+const POLL_INTERVAL_SECS: u64 = 15;
 /// 单批认领上限（对齐 Java batchSize = 100）
 const CLAIM_BATCH: i64 = 100;
 /// 认领租约时长（秒，对齐 Java claimLeaseSeconds = 30）
@@ -295,6 +304,14 @@ async fn project_eligibility_with_eviction<E, F>(
 
     // 1. 仅失效 `perm:card:active:{card_id}` 资格缓存（fire-and-forget）
     evict_cache(card_id).await;
+
+    // 1b.【P3 拆线接缝】进程内失效绑定 astral-db 失效事件语义：直接调用
+    // `astral_db::evict_l1_card_active_cache`（同进程 L1 卡正缓存 + L1
+    // ELIGIBILITY head 条目删除 + per-card 失效纪元推进），使 L1 资格头随
+    // 失效事件失效（R3），且独立于 api::side_effects 的 Redis compat 失效
+    // 路径（default 无 Redis 时本调用即完整进程内失效）。幂等、无网络、
+    // 锁中毒静默（条目由 TTL 兜底），重复调用无害。
+    astral_db::evict_l1_card_active_cache(card_id);
 
     // 2. 标记 PROCESSED（仅持有租约的 worker 生效）。旧"head READY 推进"已随
     //    迁移 20260831000001 退役：读侧安全由 (source_generation, revoke_fence)
@@ -754,6 +771,21 @@ mod tests {
         assert!(
             worker_src.contains("fn project_eligibility("),
             "ELIGIBILITY 通道函数不得随批次 3 下线误删（决策见 §3.4）"
+        );
+    }
+
+    /// 【P3 拆线接缝锁定】project_eligibility 的 ELIGIBILITY 通道必须直接绑定
+    /// `astral_db::evict_l1_card_active_cache`：失效事件在进程内驱动 L1 卡正
+    /// 缓存 + L1 ELIGIBILITY head 条目删除 + per-card 失效纪元推进（R3"资格头
+    /// 随失效事件"），且独立于 api::side_effects 的 Redis compat 失效路径
+    /// （默认 Redis-free 路径下这就是完整的进程内失效面）。
+    #[test]
+    fn eligibility_channel_binds_the_in_process_invalidation_seam() {
+        let worker_src = include_str!("projection_worker.rs");
+        assert!(
+            worker_src.contains("astral_db::evict_l1_card_active_cache(card_id);"),
+            "ELIGIBILITY channel must bind astral_db::evict_l1_card_active_cache \
+             (in-process L1 card-active + head + per-card epoch invalidation)"
         );
     }
 }

@@ -4277,4 +4277,162 @@ mod tests {
             CompileOutcome::Conflict(CompilerConflict::TenantMismatch { .. })
         ));
     }
+
+    fn base_for(tenant_id: i64, grants: Vec<CanonicalGrant>) -> HotState {
+        HotState::from_grants(
+            TenantScope::new(tenant_id, None).unwrap(),
+            CURRENT_VERSION,
+            grants,
+            dependencies(),
+        )
+        .unwrap()
+    }
+
+    /// 租户构造边界穷举：状态租户与每条授权租户的全部组合（授权数 1..=3）。
+    /// 任何含跨租户授权的组合必须被 `from_grants` fail-closed 拒收，且错误
+    /// 指明租户边界；全同租户组合必须接受，且组装出的每条 canonical grant
+    /// 的租户恒等于状态租户（构造期边界 ⇔ 组装期身份一致）。
+    #[test]
+    fn hot_state_tenant_boundary_holds_for_every_mix_exhaustively() {
+        const OTHER_TENANT: i64 = TENANT_ID + 1;
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for &state_tenant in &[TENANT_ID, OTHER_TENANT] {
+            for grant_count in 1..=3usize {
+                for mask in 0..(1u32 << grant_count) {
+                    let grants: Vec<CanonicalGrant> = (0..grant_count)
+                        .map(|index| {
+                            let mut value = card_rule_set_grant(
+                                index as u64 + 1,
+                                601 + index as i64,
+                                6001 + index as i64,
+                                &format!("rs-{index}"),
+                                &format!("e-{index}"),
+                                "learn_subject:1",
+                            );
+                            let grant_tenant = if mask >> index & 1 == 1 {
+                                OTHER_TENANT
+                            } else {
+                                TENANT_ID
+                            };
+                            value.tenant = TenantScope::new(grant_tenant, None).unwrap();
+                            value
+                        })
+                        .collect();
+                    let any_cross = grants
+                        .iter()
+                        .any(|value| value.tenant.tenant_id != state_tenant);
+                    let outcome = HotState::from_grants(
+                        TenantScope::new(state_tenant, None).unwrap(),
+                        CURRENT_VERSION,
+                        grants,
+                        dependencies(),
+                    );
+                    match outcome {
+                        Err(CompilerError::InvalidState(message)) => {
+                            assert!(any_cross, "same-tenant mix must not be rejected");
+                            assert!(
+                                message.contains("tenant does not match"),
+                                "rejection must name the tenant boundary: {message}"
+                            );
+                            rejected += 1;
+                        }
+                        Ok(state) => {
+                            assert!(!any_cross, "cross-tenant mix must be rejected");
+                            assert_eq!(state.tenant.tenant_id, state_tenant);
+                            for assembled in state.all_grants() {
+                                assert_eq!(assembled.tenant.tenant_id, state_tenant);
+                            }
+                            accepted += 1;
+                        }
+                        Err(other) => panic!("unexpected compiler error: {other:?}"),
+                    }
+                }
+            }
+        }
+        assert!(accepted > 0 && rejected > 0);
+    }
+
+    /// 增量路径穷举：base（TENANT_ID）之上追加 1..=2 条 delta，每条 delta 的
+    /// 租户独立取 {TENANT_ID, OTHER_TENANT}。任何含跨租户 delta 的组合必须以
+    /// TenantMismatch 冲突显式拒绝；全同租户组合必须成功，且结果状态的全部
+    /// 授权租户恒等于 base 租户。
+    #[test]
+    fn incremental_delta_tenant_boundary_holds_for_every_mix_exhaustively() {
+        const OTHER_TENANT: i64 = TENANT_ID + 1;
+        let base_state = base(vec![card_rule_set_grant(
+            1,
+            601,
+            6001,
+            "rs-1",
+            "e1",
+            "learn_subject:1",
+        )]);
+        let mut conflicted = 0usize;
+        let mut applied_count = 0usize;
+        for delta_count in 1..=2usize {
+            for mask in 0..(1u32 << delta_count) {
+                let mut any_cross = false;
+                let deltas: Vec<GrantDelta> = (0..delta_count)
+                    .map(|index| {
+                        let mut value = card_rule_set_grant(
+                            index as u64 + 2,
+                            701 + index as i64,
+                            7001 + index as i64,
+                            &format!("rs-x-{index}"),
+                            &format!("e-x-{index}"),
+                            "learn_exam:2",
+                        );
+                        let delta_tenant = if mask >> index & 1 == 1 {
+                            any_cross = true;
+                            OTHER_TENANT
+                        } else {
+                            TENANT_ID
+                        };
+                        // base 的租户来自 tenant()（domain Some(11)）；TenantScope
+                        // 相等性含 domain，delta 必须构造同一 domain。
+                        value.tenant = TenantScope::new(delta_tenant, Some(11)).unwrap();
+                        GrantDelta::add(value)
+                    })
+                    .collect();
+                let outcome = AuthorizationCompiler::new()
+                    .compile_incremental(&base_state, TARGET_VERSION, dependencies(), deltas)
+                    .unwrap();
+                if any_cross {
+                    assert!(matches!(
+                        outcome,
+                        CompileOutcome::Conflict(CompilerConflict::TenantMismatch { .. })
+                    ));
+                    conflicted += 1;
+                } else {
+                    let candidate = applied(outcome);
+                    assert_eq!(candidate.state.tenant.tenant_id, TENANT_ID);
+                    for assembled in candidate.state.all_grants() {
+                        assert_eq!(assembled.tenant.tenant_id, TENANT_ID);
+                    }
+                    applied_count += 1;
+                }
+            }
+        }
+        assert!(applied_count > 0 && conflicted > 0);
+    }
+
+    /// 共享层只承载内容事实（resource/action/validity/provenance），不承载
+    /// 租户身份：两个不同租户的状态编译同一内容条目时，各自组装出的授权
+    /// 租户恒为各自状态租户（内容共享，身份不共享）。
+    #[test]
+    fn shared_rule_set_entry_never_leaks_tenant_identity() {
+        for tenant_id in [TENANT_ID, TENANT_ID + 1] {
+            let mut value =
+                card_rule_set_grant(1, 601, 6001, "rs-shared", "e-shared", "learn_subject:1");
+            value.tenant = TenantScope::new(tenant_id, None).unwrap();
+            let state = base_for(tenant_id, vec![value]);
+            assert_eq!(state.tenant.tenant_id, tenant_id);
+            assert_eq!(state.shared_entry_count(), 1);
+            let assembled = state.all_grants();
+            assert_eq!(assembled.len(), 1);
+            assert_eq!(assembled[0].tenant.tenant_id, tenant_id);
+            assert_eq!(assembled[0].resource, "learn_subject:1");
+        }
+    }
 }

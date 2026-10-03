@@ -90,6 +90,58 @@ impl fmt::Display for ProjectionAggregate {
     }
 }
 
+/// Aggregate identities accepted by the published-card evidence reader.
+///
+/// These are deliberately distinct from [`ProjectionAggregate`], which names
+/// the head/outbox worker channels (`CARD`, `ELIGIBILITY`, `RULE_SET`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PublishedEvidenceAggregate {
+    UserCard,
+    RuleSet,
+    Approval,
+    Delegation,
+}
+
+impl PublishedEvidenceAggregate {
+    pub const USER_CARD: &'static str = "USER_CARD";
+    pub const RULE_SET: &'static str = "RULE_SET";
+    pub const APPROVAL: &'static str = "APPROVAL";
+    pub const DELEGATION: &'static str = "DELEGATION";
+
+    pub const ALL: &'static [Self] = &[
+        Self::UserCard,
+        Self::RuleSet,
+        Self::Approval,
+        Self::Delegation,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UserCard => Self::USER_CARD,
+            Self::RuleSet => Self::RULE_SET,
+            Self::Approval => Self::APPROVAL,
+            Self::Delegation => Self::DELEGATION,
+        }
+    }
+
+    pub fn parse_static(value: &str) -> Option<Self> {
+        match value {
+            Self::USER_CARD => Some(Self::UserCard),
+            Self::RULE_SET => Some(Self::RuleSet),
+            Self::APPROVAL => Some(Self::Approval),
+            Self::DELEGATION => Some(Self::Delegation),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for PublishedEvidenceAggregate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// 投影事件类型常量（对齐 Java `PermissionRefreshEventType`）。
 ///
 /// 事件类型的语义在各聚合通道一致：
@@ -151,6 +203,29 @@ mod tests {
         assert_eq!(parsed, ProjectionAggregate::Eligibility);
         let parsed: ProjectionAggregate = serde_json::from_str("\"RULE_SET\"").unwrap();
         assert_eq!(parsed, ProjectionAggregate::RuleSet);
+    }
+
+    #[test]
+    fn published_evidence_aggregate_contract_is_closed_and_wire_stable() {
+        let expected = [
+            (PublishedEvidenceAggregate::UserCard, "USER_CARD"),
+            (PublishedEvidenceAggregate::RuleSet, "RULE_SET"),
+            (PublishedEvidenceAggregate::Approval, "APPROVAL"),
+            (PublishedEvidenceAggregate::Delegation, "DELEGATION"),
+        ];
+        for (aggregate, wire) in expected {
+            assert_eq!(aggregate.as_str(), wire);
+            assert_eq!(
+                PublishedEvidenceAggregate::parse_static(wire),
+                Some(aggregate)
+            );
+            assert_eq!(
+                serde_json::to_string(&aggregate).unwrap(),
+                format!("\"{wire}\"")
+            );
+        }
+        assert_eq!(PublishedEvidenceAggregate::parse_static("CARD"), None);
+        assert_eq!(PublishedEvidenceAggregate::parse_static("WIDGET"), None);
     }
 
     #[test]

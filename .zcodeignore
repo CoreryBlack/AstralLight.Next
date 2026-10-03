@@ -1,0 +1,98 @@
+# Rust repository ignores
+
+/target/
+**/target/
+
+# Local agent/session state
+.zcode/
+
+# Local runtime configuration and credentials
+.env
+.env.*
+application.yml
+application-*.yml
+application-*.yaml
+*.pem
+*.key
+*.p12
+*.jks
+secrets.json
+
+# IDE and OS state
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Logs and local results
+*.log
+*.stderr
+*.stdout
+*.err
+*.tmp
+*.temp
+logs/
+**/logs/
+# These audited historical reports are part of the published test record.
+!integration_test_result_20260707_174605.txt
+!integration_test_result_20260707_192539.txt
+!integration_test_result_20260707_193124.txt
+test_results*.txt
+test_results*.log
+
+# Local databases and generated output
+*.db
+*.sqlite
+coverage/
+report/
+
+# Validation and benchmark generated campaign output
+Docs/authorization-validation/evidence/
+Docs/authorization-validation/artifact/
+Docs/实验/复现运行/
+evaluation/benchmark-results/
+evaluation/benchmark-java/target/
+benchmark-results/
+benchmark-*.log
+comparison-*.log
+comparison_5x_*.log
+
+# Python test caches
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Keep the checked-in Rust workspace lockfile and test compose file.
+!Cargo.lock
+!docker-compose.test.yml
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+node_modules/
+bower_components/
+jspm_packages/
+site-packages/
+venv/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.egg-info/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）

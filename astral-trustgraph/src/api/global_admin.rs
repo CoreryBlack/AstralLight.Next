@@ -188,24 +188,26 @@ async fn grant_or_enable(
     } else {
         "GLOBAL_ADMIN_GRANTED"
     };
-    let revocation_status = match crate::api::side_effects::publish_auth_session_revocation(
-        &state.db,
-        user_id,
-        revocation_reason,
-    )
-    .await
-    {
-        Ok(()) => "READY",
-        Err(AstralError::Internal(message)) if message.contains("pending") => {
-            tracing::warn!(
-                user_id,
-                reason = revocation_reason,
-                "global admin session revocation pending"
-            );
-            "PENDING"
-        }
-        Err(error) => return Err(AppError(error)),
-    };
+    let revocation_status =
+        match crate::api::side_effects::publish_auth_session_revocation_with_operation(
+            &state.db,
+            user_id,
+            revocation_reason,
+            &outcome.revocation_operation_id,
+        )
+        .await
+        {
+            Ok(()) => "PENDING",
+            Err(AstralError::Internal(message)) if message.contains("pending") => {
+                tracing::warn!(
+                    user_id,
+                    reason = revocation_reason,
+                    "global admin session revocation pending"
+                );
+                "PENDING"
+            }
+            Err(error) => return Err(AppError(error)),
+        };
 
     let mut dto = state
         .global_admin_repository
@@ -251,7 +253,7 @@ async fn disable(
 
     if existing.status.eq_ignore_ascii_case(STATUS_DISABLED) {
         let mut dto = GlobalAdminDto::from(existing);
-        dto.revocation_status = Some("NOT_REQUIRED".into());
+        dto.revocation_status = Some("PENDING".into());
         return Ok(Json(ApiResponse::success(dto)));
     }
 
@@ -260,8 +262,31 @@ async fn disable(
         .global_admin_repository
         .disable_protected(existing.id, user_id, caller_id, reason.as_deref())
         .await?;
-    match outcome {
-        DisableOutcome::Disabled => {}
+    let revocation_status = match outcome {
+        DisableOutcome::DisabledWithIntent { operation_id } => {
+            let revocation_status =
+                match crate::api::side_effects::publish_auth_session_revocation_with_operation(
+                    &state.db,
+                    user_id,
+                    reason.as_deref().unwrap_or("GLOBAL_ADMIN_DISABLED"),
+                    &operation_id,
+                )
+                .await
+                {
+                    Ok(()) => "PENDING",
+                    Err(AstralError::Internal(message)) if message.contains("pending") => {
+                        tracing::warn!(user_id, "global admin disable session revocation pending");
+                        "PENDING"
+                    }
+                    Err(error) => return Err(AppError(error)),
+                };
+            revocation_status
+        }
+        DisableOutcome::Disabled => {
+            return Err(AppError(AstralError::Internal(
+                "global admin disable committed without revocation intent".into(),
+            )));
+        }
         DisableOutcome::LastAdminProtected => {
             return Err(AppError(AstralError::Validation(
                 "LAST_GLOBAL_ADMIN_PROTECTED".into(),
@@ -270,21 +295,6 @@ async fn disable(
         DisableOutcome::UpdateFailed => {
             return Err(AppError(AstralError::Internal("update_failed".into())));
         }
-    }
-
-    let revocation_status = match crate::api::side_effects::publish_auth_session_revocation(
-        &state.db,
-        user_id,
-        reason.as_deref().unwrap_or("GLOBAL_ADMIN_DISABLED"),
-    )
-    .await
-    {
-        Ok(()) => "READY",
-        Err(AstralError::Internal(message)) if message.contains("pending") => {
-            tracing::warn!(user_id, "global admin disable session revocation pending");
-            "PENDING"
-        }
-        Err(error) => return Err(AppError(error)),
     };
 
     let mut dto = state

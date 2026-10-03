@@ -3136,6 +3136,490 @@ pub async fn transition_gate_in_tx(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Commit-confirmed activation mint primitives (the ONLY proof producers)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Domain-separated header of the canonical commit-confirmation digest.
+///
+/// The digest is derived EXCLUSIVELY from the durable two-city commit
+/// receipts plus the pinned operation identity — never from a confirm
+/// message, a cache entry, a boolean, or caller-supplied text.
+const COMMIT_CONFIRM_DIGEST_HEADER: &[u8] = b"ASTRAL_CROSS_CITY_COMMIT_CONFIRM_V1\0";
+
+/// Insert the durable activation-mint record of one operation (idempotency +
+/// audit witness; the guarded proof constructors above are the only other
+/// writers of activation state).
+const MINT_RECORD_INSERT_SQL: &str = "INSERT INTO authorization_cross_city_operation_activation \
+     (operation_id, agreement_digest, commit_digest, scope_digest, target_generation, \
+      revoke_fence, coordinator_epoch) VALUES (?, ?, ?, ?, ?, ?, ?)";
+const MINT_RECORD_SELECT_SQL: &str = "SELECT operation_id, agreement_digest, commit_digest, \
+     scope_digest, target_generation, revoke_fence, coordinator_epoch \
+     FROM authorization_cross_city_operation_activation WHERE operation_id = ?";
+
+/// Load the per-city phase rows of one operation for the atomic terminal
+/// write (fixed lock order: the parent operation row is already locked).
+const CITY_STATE_SELECT_FOR_OPERATION_SQL: &str = "SELECT state_id, city_id, phase \
+     FROM authorization_cross_city_city_state WHERE operation_id = ? FOR UPDATE";
+const CITY_STATE_TERMINAL_UPDATE_SQL: &str =
+    "UPDATE authorization_cross_city_city_state SET phase = ? \
+     WHERE state_id = ? AND operation_id = ?";
+
+/// Read-only identity listing of the gate scopes pinned to one operation
+/// (gate-activation mint inputs; the mint itself re-locks the parent and the
+/// gate row in the sanctioned operation -> gate order).
+const GATE_SELECT_FOR_OPERATION_SQL: &str = "SELECT gate_id, tenant_id, aggregate_type, \
+     aggregate_id, operation_id FROM authorization_cross_city_gate WHERE operation_id = ? \
+     ORDER BY gate_id";
+
+#[derive(Debug, sqlx::FromRow)]
+struct MintRecordRow {
+    // Decoded for row-completeness (the query pins the operation identity);
+    // the binding itself is re-checked against the locked parent operation.
+    #[allow(dead_code)]
+    operation_id: String,
+    agreement_digest: Vec<u8>,
+    commit_digest: Vec<u8>,
+    scope_digest: Vec<u8>,
+    target_generation: i64,
+    revoke_fence: i64,
+    coordinator_epoch: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct CityStatePhaseRow {
+    state_id: i64,
+    city_id: String,
+    phase: String,
+}
+
+/// The durable outcome of one commit-confirmed operation activation mint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossCityOperationActivationMintOutcome {
+    pub proof: CrossCityOperationActivationProof,
+    pub commit_digest: String,
+    pub final_state: CrossCityOperationState,
+}
+
+/// Mint the operation activation proof from DURABLE two-city commit receipts
+/// and move the operation to `ACTIVE` — all inside the caller's short
+/// transaction.
+///
+/// This is the ONLY production producer of
+/// [`CrossCityOperationActivationProof`]. Every input is derived from durable
+/// rows, never from caller claims:
+///
+/// 1. the locked operation must sit in a commit-unknown state
+///    (`ACTIVATING`/`IN_DOUBT`) at the caller's coordinator epoch;
+/// 2. every stored vote must carry its durable replay-reservation row (the
+///    storage-level witness of cryptographic verification, owned by
+///    [`crate::cross_city_runtime_repository`]) — a stored vote without one
+///    is poisoned storage and fails the mint closed;
+/// 3. the agreement certificate is re-derived from those verified votes and
+///    must equal the stored agreement digest;
+/// 4. the durable commit receipts must cover EXACTLY
+///    [`CROSS_CITY_CITY_COUNT`] cities with EXACTLY
+///    [`CROSS_CITY_EVIDENCE_COUNT`] ALLOW receipts each, every one bound to
+///    the operation's proposal digest, target generation, revoke fence, and
+///    coordinator epoch;
+/// 5. the commit digest is canonically derived from those receipts; a
+///    previously minted record for the same operation must match it exactly
+///    (idempotent re-mint) or the mint refuses (immutable conflict);
+/// 6. the mint record row is written, the proof is minted, the operation is
+///    CAS-transitioned to `ACTIVE` through the guarded transition (which
+///    re-verifies the proof field-by-field), and every non-terminal city
+///    phase row moves to the terminal `ACTIVE` phase in the SAME transaction.
+///
+/// Unknown/absent receipts can never mint: without both cities' durable
+/// source-apply evidence the caller must stay `ACTIVATING`/`IN_DOUBT` (or
+/// collapse per the closed state machine) — no confirm, cache, or boolean can
+/// substitute for the missing durable receipt.
+pub async fn mint_cross_city_operation_activation_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    operation_id: &str,
+    coordinator_epoch: u64,
+    now_seconds: i64,
+) -> Result<CrossCityOperationActivationMintOutcome, CrossCityRepositoryError> {
+    use crate::cross_city_runtime_repository::{
+        load_cross_city_commit_receipts_in_tx, require_votes_have_durable_reservations_in_tx,
+    };
+
+    let id = validated_operation_id(operation_id)?;
+    if coordinator_epoch == 0 {
+        return Err(scope_violation("mint_non_positive_coordinator_epoch"));
+    }
+    let record = load_operation_for_update_in_tx(tx, &id).await?;
+    if record.coordinator_epoch != coordinator_epoch {
+        return Err(conflict(&format!(
+            "stale_coordinator_epoch;expected={coordinator_epoch};actual={}",
+            record.coordinator_epoch
+        )));
+    }
+    // Only commit-unknown states may mint: PREPARING/PREPARED have not even
+    // entered ACTIVATING (that advance belongs to the coordinator), and
+    // ACTIVE is already terminal.
+    if !matches!(
+        record.state,
+        CrossCityOperationState::Activating | CrossCityOperationState::InDoubt
+    ) {
+        return Err(scope_violation(&format!(
+            "mint_requires_commit_unknown_state;state={}",
+            record.state.as_str()
+        )));
+    }
+
+    // 1. Verification witness: every stored vote must have its durable
+    //    replay reservation (cryptographic-verification evidence).
+    let votes = load_bound_votes_in_tx(tx, &record).await?;
+    require_votes_have_durable_reservations_in_tx(tx, &id, &votes)
+        .await
+        .map_err(|error| {
+            scope_violation(&format!(
+                "mint_vote_reservation_proof_refused;detail={error}"
+            ))
+        })?;
+
+    // 2. The agreement must still re-derive from the verified votes and equal
+    //    the stored digest (a drifted stored digest is poisoned storage).
+    let certificate = assemble_agreement_certificate(&record.proposal, &votes, now_seconds)?;
+    let Some(stored_agreement) = &record.agreement_digest else {
+        return Err(mapping("poisoned_operation_agreement_presence"));
+    };
+    if stored_agreement.as_str() != certificate.agreement_digest {
+        return Err(scope_violation(
+            "mint_agreement_digest_mismatch_with_derived_certificate",
+        ));
+    }
+
+    // 3. Durable two-city commit receipts (the ONLY activation-mint input).
+    let receipts = load_cross_city_commit_receipts_in_tx(tx, &id)
+        .await
+        .map_err(|error| mapping(&format!("mint_commit_receipt_load_refused;detail={error}")))?;
+    let mut by_city: std::collections::BTreeMap<
+        &str,
+        Vec<&crate::cross_city_runtime_repository::CrossCityCommitReceiptRecord>,
+    > = std::collections::BTreeMap::new();
+    for receipt in &receipts {
+        by_city
+            .entry(receipt.city_id.as_str())
+            .or_default()
+            .push(receipt);
+    }
+    if by_city.len() != CROSS_CITY_CITY_COUNT {
+        return Err(scope_violation(&format!(
+            "mint_commit_receipt_city_count;actual={};expected={CROSS_CITY_CITY_COUNT}",
+            by_city.len()
+        )));
+    }
+    let mut receipt_fields: Vec<String> = Vec::with_capacity(receipts.len() * 4);
+    for (city_id, city_receipts) in &by_city {
+        if city_receipts.len() != CROSS_CITY_EVIDENCE_COUNT {
+            return Err(scope_violation(&format!(
+                "mint_commit_receipt_node_count;city={city_id};actual={};expected={CROSS_CITY_EVIDENCE_COUNT}",
+                city_receipts.len()
+            )));
+        }
+        for receipt in city_receipts {
+            // Receipt identity + binding against the locked operation.
+            if receipt.operation_id != id
+                || receipt.proposal_digest_hex != record.proposal_digest
+                || receipt.target_generation != record.target_generation
+                || receipt.revoke_fence != record.target_revoke_fence
+                || receipt.coordinator_epoch != record.coordinator_epoch
+                || receipt.node_epoch == 0
+            {
+                return Err(scope_violation(&format!(
+                    "mint_commit_receipt_binding_mismatch;city={city_id};node={}",
+                    receipt.node_id
+                )));
+            }
+        }
+    }
+    // Canonical receipt fields (cities ascending via the BTreeMap; nodes
+    // ascending per city) feed the commit digest.
+    for (city_id, city_receipts) in &by_city {
+        let mut city_nodes: Vec<
+            &crate::cross_city_runtime_repository::CrossCityCommitReceiptRecord,
+        > = city_receipts.to_vec();
+        city_nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        for receipt in city_nodes {
+            receipt_fields.push((*city_id).to_owned());
+            receipt_fields.push(receipt.node_id.clone());
+            receipt_fields.push(receipt.node_epoch.to_string());
+            receipt_fields.push(receipt.evidence_digest_hex.clone());
+        }
+    }
+
+    // 4. Canonical commit-confirmation digest over the durable receipt set.
+    let commit_digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(COMMIT_CONFIRM_DIGEST_HEADER);
+        hasher.update(id.as_bytes());
+        hasher.update(certificate.agreement_digest.as_bytes());
+        hasher.update(record.target_generation.to_string().as_bytes());
+        hasher.update(record.target_revoke_fence.to_string().as_bytes());
+        hasher.update(record.coordinator_epoch.to_string().as_bytes());
+        for field in &receipt_fields {
+            hasher.update(field.as_bytes());
+        }
+        hex::encode(hasher.finalize())
+    };
+
+    // 5. Durable mint record (idempotency witness). A second mint for the
+    //    same operation must re-produce the EXACT same record.
+    let scope_digest = digest_from_hex(&record.scope_digest)?;
+    let agreement_bytes = digest_from_hex(&certificate.agreement_digest)?;
+    let commit_bytes = digest_from_hex(&commit_digest)?;
+    let generation = bind_i64(record.target_generation, "target_generation")?;
+    let fence = bind_i64(record.target_revoke_fence, "target_revoke_fence")?;
+    let epoch = bind_i64(record.coordinator_epoch, "coordinator_epoch")?;
+    let insert = sqlx::query(MINT_RECORD_INSERT_SQL)
+        .bind(&id)
+        .bind(agreement_bytes.as_bytes().to_vec())
+        .bind(commit_bytes.as_bytes().to_vec())
+        .bind(scope_digest.as_bytes().to_vec())
+        .bind(generation)
+        .bind(fence)
+        .bind(epoch)
+        .execute(&mut **tx)
+        .await;
+    if let Err(error) = insert {
+        if !db_unique_violation(&error) {
+            return Err(error.into());
+        }
+        // Duplicate: the existing mint record must match field-by-field.
+        let existing: Option<MintRecordRow> = sqlx::query_as(MINT_RECORD_SELECT_SQL)
+            .bind(&id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        let Some(existing) = existing else {
+            return Err(conflict("mint_record_duplicate_vanished"));
+        };
+        let existing_commit = digest_from_bytes(existing.commit_digest)?;
+        let existing_agreement = digest_from_bytes(existing.agreement_digest)?;
+        let existing_scope = digest_from_bytes(existing.scope_digest)?;
+        let same = existing_commit.as_hex() == commit_digest
+            && existing_agreement.as_hex() == certificate.agreement_digest
+            && existing_scope.as_hex() == record.scope_digest
+            && existing.target_generation == generation
+            && existing.revoke_fence == fence
+            && existing.coordinator_epoch == epoch;
+        if !same {
+            return Err(CrossCityRepositoryError::ImmutableConflict(
+                "code=cross_city_repository.mint_record_immutable".to_owned(),
+            ));
+        }
+    }
+
+    // 6. Mint the proof (the single sanctioned production constructor call)
+    //    and run the guarded ACTIVE transition, which re-verifies every
+    //    proof field against the locked record.
+    let proof = CrossCityOperationActivationProof::new(
+        id.clone(),
+        certificate.agreement_digest.clone(),
+        record.target_generation,
+        record.target_revoke_fence,
+        commit_digest.clone(),
+    )?;
+    let final_state = transition_operation_in_tx(
+        tx,
+        &CrossCityOperationTransitionRequest {
+            operation_id: id.clone(),
+            expected_state: record.state,
+            target_state: CrossCityOperationState::Active,
+            coordinator_epoch,
+            agreement_digest: None,
+            activation_proof: Some(proof.clone()),
+        },
+        now_seconds,
+    )
+    .await?;
+
+    // 7. Terminal city phases — atomically with the parent (never written by
+    //    ordinary workers; this mint is the sanctioned writer).
+    let city_rows: Vec<CityStatePhaseRow> = sqlx::query_as(CITY_STATE_SELECT_FOR_OPERATION_SQL)
+        .bind(&id)
+        .fetch_all(&mut **tx)
+        .await?;
+    if city_rows.len() != CROSS_CITY_CITY_COUNT {
+        return Err(scope_violation(&format!(
+            "mint_city_state_count;actual={};expected={CROSS_CITY_CITY_COUNT}",
+            city_rows.len()
+        )));
+    }
+    for row in city_rows {
+        let phase = parse_cross_city_operation_state(&row.phase)?;
+        match phase {
+            CrossCityOperationState::Active => continue, // idempotent re-mint
+            CrossCityOperationState::Rejected
+            | CrossCityOperationState::Expired
+            | CrossCityOperationState::Quarantined => {
+                return Err(scope_violation(&format!(
+                    "mint_city_state_terminal_divergence;city={};phase={}",
+                    row.city_id,
+                    phase.as_str()
+                )));
+            }
+            _ => {}
+        }
+        let update = sqlx::query(CITY_STATE_TERMINAL_UPDATE_SQL)
+            .bind(CrossCityOperationState::Active.as_str())
+            .bind(row.state_id)
+            .bind(&id)
+            .execute(&mut **tx)
+            .await?;
+        if update.rows_affected() != 1 {
+            return Err(conflict("mint_city_state_cas_unexpected"));
+        }
+    }
+
+    Ok(CrossCityOperationActivationMintOutcome {
+        proof,
+        commit_digest,
+        final_state,
+    })
+}
+
+/// Mint request for one gate activation: identity inputs ONLY. Every version
+/// and digest pin is derived from durable rows inside the mint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossCityGateActivationMintRequest {
+    pub tenant_id: i64,
+    pub aggregate_type: String,
+    pub aggregate_id: i64,
+    pub operation_id: String,
+}
+
+/// Mint the gate activation proof from the DURABLE activation record of a
+/// commit-confirmed operation and move the gate to `ACTIVE` — all inside the
+/// caller's short transaction.
+///
+/// This is the ONLY production producer of [`CrossCityGateActivationProof`].
+/// The proof's agreement digest, target generation, revoke fence, and content
+/// hash are all derived from durable rows (the locked parent operation and
+/// the operation's durable activation-mint record); the request contributes
+/// identity only. The gate transition re-verifies the minted proof
+/// field-by-field against the locked parent, the locked gate row, and the
+/// transition request. No durable activation record (no confirmed commit)
+/// means NO gate activation — the gate stays `BLOCKED`/`SYNCING`.
+pub async fn mint_cross_city_gate_activation_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    request: &CrossCityGateActivationMintRequest,
+    _now_seconds: i64,
+) -> Result<CrossCityGateState, CrossCityRepositoryError> {
+    positive_i64(request.tenant_id, "mint_tenant_id")?;
+    positive_i64(request.aggregate_id, "mint_aggregate_id")?;
+    validated_aggregate_type(&request.aggregate_type)?;
+    let operation_id = validated_operation_id(&request.operation_id)?;
+
+    // Fixed lock order: operation -> gate (mirrors transition_gate_in_tx).
+    let parent = load_operation_for_update_in_tx(tx, &operation_id).await?;
+    if parent.state != CrossCityOperationState::Active {
+        return Err(scope_violation(&format!(
+            "gate_mint_parent_not_commit_confirmed;state={}",
+            parent.state.as_str()
+        )));
+    }
+    let record = load_gate_for_update_in_tx(
+        tx,
+        request.tenant_id,
+        &request.aggregate_type,
+        request.aggregate_id,
+    )
+    .await?;
+    if record.operation_id != operation_id {
+        return Err(scope_violation("gate_mint_operation_identity_mismatch"));
+    }
+
+    // The content hash is the operation's DURABLE commit digest (the mint
+    // record row); a missing record means the commit was never confirmed.
+    let mint_record: Option<MintRecordRow> = sqlx::query_as(MINT_RECORD_SELECT_SQL)
+        .bind(&operation_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(mint_record) = mint_record else {
+        return Err(scope_violation(
+            "gate_mint_requires_durable_operation_activation",
+        ));
+    };
+    let commit_digest = digest_from_bytes(mint_record.commit_digest)?.as_hex();
+    let Some(parent_agreement) = &parent.agreement_digest else {
+        return Err(mapping("poisoned_operation_agreement_presence"));
+    };
+    if read_u64(mint_record.coordinator_epoch, "coordinator_epoch")? != parent.coordinator_epoch
+        || read_u64(mint_record.target_generation, "target_generation")? != parent.target_generation
+        || read_u64(mint_record.revoke_fence, "revoke_fence")? != parent.target_revoke_fence
+    {
+        return Err(scope_violation("gate_mint_record_parent_binding_mismatch"));
+    }
+
+    let proof = CrossCityGateActivationProof::new(
+        request.tenant_id,
+        request.aggregate_type.clone(),
+        request.aggregate_id,
+        operation_id.clone(),
+        parent_agreement.clone(),
+        parent.target_generation,
+        parent.target_revoke_fence,
+        commit_digest.clone(),
+    )?;
+    transition_gate_in_tx(
+        tx,
+        &CrossCityGateTransitionRequest {
+            tenant_id: request.tenant_id,
+            aggregate_type: request.aggregate_type.clone(),
+            aggregate_id: request.aggregate_id,
+            operation_id,
+            target_state: CrossCityGateState::Active,
+            certificate_digest: parent_agreement.clone(),
+            target_generation: parent.target_generation,
+            revoke_fence: parent.target_revoke_fence,
+            content_hash: commit_digest,
+            activation_proof: Some(proof),
+        },
+    )
+    .await
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct GateMintScopeRow {
+    #[allow(dead_code)]
+    gate_id: i64,
+    tenant_id: i64,
+    aggregate_type: String,
+    aggregate_id: i64,
+    operation_id: String,
+}
+
+/// Load the identity-only gate-activation mint requests for every gate scope
+/// pinned to one operation (deterministic `gate_id` order). Rows are decoded
+/// strictly; the returned requests feed
+/// [`mint_cross_city_gate_activation_in_tx`], which re-locks everything it
+/// depends on inside its own transaction.
+pub async fn load_gate_activation_mint_requests_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    operation_id: &str,
+) -> Result<Vec<CrossCityGateActivationMintRequest>, CrossCityRepositoryError> {
+    let operation_id = validated_operation_id(operation_id)?;
+    let rows: Vec<GateMintScopeRow> = sqlx::query_as(GATE_SELECT_FOR_OPERATION_SQL)
+        .bind(&operation_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    let mut requests = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.gate_id <= 0 || row.operation_id != operation_id {
+            return Err(mapping("poisoned_gate_mint_scope_row"));
+        }
+        requests.push(CrossCityGateActivationMintRequest {
+            tenant_id: row.tenant_id,
+            aggregate_type: row.aggregate_type,
+            aggregate_id: row.aggregate_id,
+            operation_id: operation_id.clone(),
+        });
+    }
+    Ok(requests)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests (pure: no DB, no network, no external system)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -4578,7 +5062,7 @@ mod tests {
     /// and the value is referenced as the real constant, so name and value can
     /// never drift apart; the source-shape guard below proves the production
     /// `sqlx::query*` call sites match this registry exactly.
-    const ALL_STATEMENTS: [(&str, &str); 20] = [
+    const ALL_STATEMENTS: [(&str, &str); 26] = [
         ("OPERATION_INSERT_SQL", OPERATION_INSERT_SQL),
         (
             "OPERATION_SELECT_FOR_UPDATE_SQL",
@@ -4617,6 +5101,25 @@ mod tests {
         ("GATE_INSERT_SQL", GATE_INSERT_SQL),
         ("GATE_SELECT_FOR_UPDATE_SQL", GATE_SELECT_FOR_UPDATE_SQL),
         ("GATE_TRANSITION_SQL", GATE_TRANSITION_SQL),
+        // Gate-activation mint inputs (identity-only scope listing).
+        (
+            "GATE_SELECT_FOR_OPERATION_SQL",
+            GATE_SELECT_FOR_OPERATION_SQL,
+        ),
+        // Activation-mint statements (runtime-proof slice; the mint record is
+        // read from both mint primitives, hence its name is registered for
+        // its two production call sites).
+        ("MINT_RECORD_INSERT_SQL", MINT_RECORD_INSERT_SQL),
+        ("MINT_RECORD_SELECT_SQL", MINT_RECORD_SELECT_SQL),
+        ("MINT_RECORD_SELECT_SQL", MINT_RECORD_SELECT_SQL),
+        (
+            "CITY_STATE_SELECT_FOR_OPERATION_SQL",
+            CITY_STATE_SELECT_FOR_OPERATION_SQL,
+        ),
+        (
+            "CITY_STATE_TERMINAL_UPDATE_SQL",
+            CITY_STATE_TERMINAL_UPDATE_SQL,
+        ),
     ];
 
     fn placeholder_count(statement: &str) -> usize {
@@ -4871,18 +5374,28 @@ mod tests {
     }
 
     #[test]
-    fn activation_proofs_are_module_private_and_never_minted_in_production() {
+    fn activation_proofs_are_module_private_and_minted_only_by_the_two_mint_primitives() {
         let production = production_source();
         let source = full_source();
-        // No production code path mints either proof: the constructors are
-        // `fn new` definitions, and a mint would have to appear as a
-        // `...ActivationProof::new(` call, of which the production slice has
-        // none.
+        // The constructors are `fn new` definitions; every mint must appear as
+        // a `...ActivationProof::new(` call, of which the production slice has
+        // EXACTLY the two sanctioned ones (one per mint primitive below).
         assert_eq!(
             production.matches("ActivationProof::new(").count(),
-            0,
-            "production code must never mint an activation proof"
+            2,
+            "production may mint activation proofs ONLY inside the two \
+             commit-confirmed mint primitives"
         );
+        // Each sanctioned call lives inside exactly one named mint primitive;
+        // no other production function may mint.
+        let operation_mint =
+            production_function_body("pub async fn mint_cross_city_operation_activation_in_tx");
+        let gate_mint =
+            production_function_body("pub async fn mint_cross_city_gate_activation_in_tx");
+        assert!(operation_mint.contains("CrossCityOperationActivationProof::new("));
+        assert!(!gate_mint.contains("CrossCityOperationActivationProof::new("));
+        assert!(gate_mint.contains("CrossCityGateActivationProof::new("));
+        assert!(!operation_mint.contains("CrossCityGateActivationProof::new("));
         // The constructors are module-private (no pub/pub(crate) mint entry
         // point), so nothing outside this file can mint either proof.
         assert!(
@@ -4931,7 +5444,7 @@ mod tests {
 
     #[test]
     fn statements_bind_exactly_the_expected_parameter_counts() {
-        let expected: [(&str, usize); 20] = [
+        let expected: [(&str, usize); 26] = [
             (OPERATION_INSERT_SQL, 16),
             (OPERATION_SELECT_FOR_UPDATE_SQL, 1),
             (OPERATION_TRANSITION_SQL, 4),
@@ -4952,6 +5465,13 @@ mod tests {
             (GATE_INSERT_SQL, 9),
             (GATE_SELECT_FOR_UPDATE_SQL, 3),
             (GATE_TRANSITION_SQL, 9),
+            // Activation-mint statements (runtime-proof slice).
+            (MINT_RECORD_INSERT_SQL, 7),
+            (MINT_RECORD_SELECT_SQL, 1),
+            (MINT_RECORD_SELECT_SQL, 1),
+            (CITY_STATE_SELECT_FOR_OPERATION_SQL, 1),
+            (CITY_STATE_TERMINAL_UPDATE_SQL, 3),
+            (GATE_SELECT_FOR_OPERATION_SQL, 1),
         ];
         for (statement, count) in expected {
             assert_eq!(
@@ -4971,6 +5491,7 @@ mod tests {
             CITY_STATE_CLAIM_CANDIDATE_SQL,
             CITY_STATE_LOCK_SQL,
             GATE_SELECT_FOR_UPDATE_SQL,
+            CITY_STATE_SELECT_FOR_OPERATION_SQL,
         ];
         for statement in locking {
             assert!(statement.contains("FOR UPDATE"));

@@ -1,13 +1,13 @@
 # Rust 后端编码规范 V1.0
 
-> 版本：1.2.0
-> 日期：2026-09-09
-> 状态：当前实现同步版（正式授权链与 workspace 边界已按 2026-09-09 源码核对）
+> 版本：1.3.0
+> 日期：2026-10-01
+> 状态：当前实现同步版（正式授权链与 workspace 边界已按 2026-10-01 源码核对）
 > 适用范围：`` 工作区所有 Rust crate
 >
 > 本版同步当前授权投影边界：canonical grant revision/delta/manifest/segment/current 链、`AuthorizationCompiler`、`AuthorizationProjector`、`AuthorizationArchiveWorker` 与生产 `SqlxRuleRepository` 的 published-evidence strict gate；旧 `authorization_projection_head/outbox`、`permission_rule_snapshot`、`rule_set_snapshot` 和旧 CARD/RULE_SET worker 仅作为兼容、迁移、对账或测试材料。本文是工程规范；架构解释和证据索引见 [Rust访问控制总览与调整路线](../架构/Rust架构设计/Rust访问控制总览与调整路线_V1.0.md) 与 [Rust权限投影快照与版本栅栏](../架构/Rust架构设计/Rust权限投影快照与版本栅栏_V1.0.md)。
 >
-> 2026-09-09 实现同步：workspace 当前成员为 `policy-engine`、`astral-types`、`astral-common`、`astral-db`、`astral-cache`、`astral-mq`、`astral-gateway`、`astral-identity`、`astral-trustgraph`、`astral-monitor`；`astral-learn` 与 `astral-chat` 源码仍在仓库但由 `Cargo.toml` 的 `exclude` 明确冻结，不属于默认 workspace 编译/测试边界。正式生产授权由 `SqlxRuleRepository` 的 published-evidence strict gate 驱动；`AuthorizationCompiler`/`AuthorizationProjector` 是当前新链实现，旧 `snapshot.rs`、旧快照表读写和旧 CARD/RULE_SET 重建通道属于退役/兼容材料。迁移 `20260830000001`、`20260831000001`、`20260831000002`、`20260903000001` 已存在于源码，但目标数据库是否应用仍须由显式 migration 与部署验收证明。
+> 2026-10-01 实现同步：workspace 当前成员为 `policy-engine`、`astral-types`、`astral-common`、`astral-db`、`astral-mq`、`astral-gateway`、`astral-identity`、`astral-trustgraph`、`astral-monitor`、`astral-single-node`、`e2e-bootstrap`；`astral-learn` 与 `astral-chat` 源码仍在仓库但由 `Cargo.toml` 的 `exclude` 明确冻结，`astral-cache` 随 Redis 编译层退役（`redis-layer-retirement-20261002`，BREAKING CHANGE 登记与兼容窗见 15.3）以同样的 `exclude` 方式退出 workspace，三者均不属于默认 workspace 编译/测试边界（`astral-cache` 源码零删除，manifest 已改为自包含 archive crate）。默认构建（不带 `redis-compat`）零 Redis 编译与链接；Redis 兼容路径收敛到各 runtime 显式 `redis-compat` feature 与 `ASTRAL_REDIS_PROJECTION_COMPAT` 运行时门。正式生产授权由 `SqlxRuleRepository` 的 published-evidence strict gate 驱动；`AuthorizationCompiler`/`AuthorizationProjector` 是当前新链实现，旧 `snapshot.rs`、旧快照表读写和旧 CARD/RULE_SET 重建通道属于退役/兼容材料。迁移 `20260830000001`、`20260831000001`、`20260831000002`、`20260903000001` 已存在于源码，但目标数据库是否应用仍须由显式 migration 与部署验收证明。
 
 ---
 
@@ -34,7 +34,7 @@
 | `policy-engine` | 库 | 权限评估引擎核心。不直接依赖 MySQL/Redis/RabbitMQ，通过 trait 注入 |
 | `astral-common` | 库 | 公共基础设施：配置、错误处理、API 契约、日志、中间件、公共服务 |
 | `astral-db` | 库 | 数据库访问层：sqlx Repository 实现、迁移管理 |
-| `astral-cache` | 库 | Redis 缓存层：缓存装饰器、消息幂等 |
+| `astral-cache` | 库（workspace exclude，自包含 archive） | Redis 缓存层：缓存装饰器、消息幂等；随 Redis 编译层退役退出 workspace（源码零删除，不参加默认编译/测试，恢复方式见 15.3） |
 | `astral-mq` | 库 | 消息队列层：RabbitMQ 队列声明、Producer/Consumer |
 | `astral-gateway` | 二进制 | API 网关：JWT 验证、路由转发、限流、断路器 |
 | `astral-identity` | 二进制 | 身份认证服务：登录/注册/JWT 签发/用户管理/卡片管理/MFA |
@@ -42,6 +42,8 @@
 | `astral-trustgraph` | 库+二进制 | 权限治理中心：规则管理/规则集/审批/审计/新授权投影 |
 | `astral-chat` | 库+二进制（源码冻结，workspace exclude） | 即时通讯服务源码；不参加默认 workspace 编译/测试，解冻前不得宣称默认 gate 覆盖 |
 | `astral-monitor` | 库+二进制 | 监控与告警服务：健康检查/指标/告警规则 |
+| `astral-single-node` | 二进制 | 单机组合进程运行时：同进程装配 Gateway/Identity/MQ/TrustGraph（单机降级形态） |
+| `e2e-bootstrap` | 二进制 | e2e 实验隔离启动入口 |
 
 
 ### 2.2 依赖方向
@@ -54,7 +56,7 @@ policy-engine → astral-types
 astral-common → astral-types
     ↑
 astral-db → policy-engine + astral-common
-astral-cache → policy-engine + astral-common
+astral-cache → policy-engine + astral-common      # workspace exclude（自包含 archive，默认不编译）
 astral-mq → astral-common
     ↑
 astral-gateway → astral-common
@@ -63,6 +65,8 @@ astral-learn → astral-common + astral-db
 astral-trustgraph → astral-common + astral-db + policy-engine
 astral-chat → astral-common + astral-db
 astral-monitor → astral-common + astral-db
+astral-single-node → astral-common + astral-db + astral-gateway + astral-identity + astral-mq + astral-trustgraph
+e2e-bootstrap → astral-types + astral-db
 ```
 
 **禁止事项**：
@@ -492,6 +496,7 @@ let config = AppConfig::from_files("app.yml")?;  // YAML + 环境变量覆盖
 ```rust
 LEARN_SERVICE_URI=http://localhost:9002
 DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
+# REDIS_URL 仅被显式启用 redis-compat 的部署消费（须同时 ASTRAL_REDIS_PROJECTION_COMPAT=true，见 15.3）；默认构建零 Redis 依赖。
 REDIS_URL=redis://localhost:6379
 RABBITMQ_URL=${RABBITMQ_URL:?RABBITMQ_URL is required}
 JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
@@ -536,7 +541,8 @@ mod tests {
 
 - 在 `tests/` 目录下创建集成测试文件
 - 使用 `testcontainers` crate 管理 MySQL/Redis/RabbitMQ 容器
-- 标记需要 Docker 的测试为 `#[ignore = "Requires Docker"]`
+- Redis 集成示例/测试仅在显式 `redis-compat` feature 下编译（`required-features = ["redis-compat"]`）；feature 关闭时 cargo 将其整体 SKIP 且不计入通过数——SKIP 与 `#[ignore]` 统计必须与退出码分开记录，`exit 0` 不得折算为集成 PASS
+- 标记需要 Docker 的测试为 `#[ignore = "Requires Docker"]`；外部依赖（MySQL/Redis/RabbitMQ）集成必须用显式 ignored 命令在真实依赖上执行，未执行不得宣称 PASS
 
 
 ### 10.3 基准测试
@@ -1067,13 +1073,13 @@ Rust-owned `20260827000001_authorization_projection_lineage_fence.sql` 为授权
 
 #### 14.8.5 L2 evidence 缓存 v3 认证契约（2026-08-29 同步）
 
-published card evidence 的 L2 Redis 分发层（[`astral-db/src/evidence_cache.rs`](../../astral-db/src/evidence_cache.rs)，键族 `astral:auth:l2ev:*`/`astral:auth:l2sh:*`）是可认证缓存而非默认可信存储，v3 契约如下：
+published card evidence 的 L2 Redis 分发层（[`astral-db/src/evidence_cache.rs`](../../astral-db/src/evidence_cache.rs)，键族 `astral:auth:l2ev:*`/`astral:auth:l2sh:*`；`RedisL2EvidenceStore` 仅在显式 `redis-compat` feature 下编译，default-off，见 15.3）是可认证缓存而非默认可信存储，v3 契约如下：
 
 - **专用密钥强制，fail-closed 旁路**：L2 读、写与发布后推送一律要求专用环境变量 `ASTRAL_L2_EVIDENCE_HMAC_SECRET`（仅接受非占位符且 ≥32 字节/字符的值；绝不复用网关/内部签名密钥，绝不硬编码）。未设置或无效时 L2 读/写/推送整体旁路，直接回源严格 reader `load_published_card_grant_evidence`（fail-closed）——绝不在未认证缓存字节上授权，进程内 warn 一次。
 - **HMAC-SHA256 绑定**：每张卡证据条目携带 `mac = HMAC-SHA256(专用密钥, 规范 cover)`，cover 绑定域分隔符 `astral:l2-evidence:v3:hmac-sha256`、精确 Redis 键（防键间重放）、schema 版本、manifest 版本组与重建后完整 payload 的 content_hash；读侧常数时间重验，缺失/失配/污染 → purge 回源，绝无"部分条目被接受"的路径。
 - **共享单元 storage-only**：跨卡共享仅限 RULE_SET 内容寻址存储单元（`astral:auth:l2sh:{cache_epoch}:{tenant_id}:{digest}`，tenant+时代限定）——只是存储字节，永远不是授权来源；身份字段全部来自逐卡 envelope，单元缺失/摘要失配 = miss 回源，绝不降级放行。
 - **单密钥语义与轮换**：每进程只解析一次密钥，不接受双密钥并存。轮换 = 更换 `ASTRAL_L2_EVIDENCE_HMAC_SECRET` 并轮换共享时代键 `astral:auth:cache_epoch`（Exec-L3 运维动作）；旧密钥条目在新密钥下 MAC 失配自然 purge 自愈。密钥泄露等同获得缓存伪造能力，轮换完成前属于 TCB 风险，须按敏感事件处置（撤销/轮换优先）。
-- **范围与验收现状**：本契约只覆盖 `astral:auth:l2ev:*`/`astral:auth:l2sh:*` 两个 Rust 专属键族；Java 缓存家族（`perm:card:status` 等）与 permission_query v4 envelope 不在范围内。当前以 typed 单元测试与 `#[ignore]` 真实 Redis 集成测试（`REDIS_URL`/`DATABASE_URL` 环境门禁，未设置时显式 `[SKIP]`）覆盖；真实 Redis/MySQL 集成验收与生产切流仍是待办门禁，不得据此宣称生产验收。
+- **范围与验收现状**：本契约只覆盖 `astral:auth:l2ev:*`/`astral:auth:l2sh:*` 两个 Rust 专属键族；Java 缓存家族（`perm:card:status` 等）与 permission_query v4 envelope 不在范围内。当前以 typed 单元测试与 `#[ignore]` 真实 Redis 集成测试（`required-features = ["redis-compat"]` 编译门 + `REDIS_URL`/`DATABASE_URL` 环境门禁；feature 关闭时整组 SKIP，环境未设置时显式 `[SKIP]`，二者均不得计为 PASS）覆盖；真实 Redis/MySQL 集成验收与生产切流仍是待办门禁，不得据此宣称生产验收。
 
 
 ### 14.9 文档注释
@@ -1132,6 +1138,49 @@ path = "src/main.rs"
 ```
 
 > 注：`astral-learn` 当前位于默认 workspace 之外（根 `Cargo.toml` 的 `exclude`），解冻前不计入默认 `cargo --workspace` 检查/测试边界；此处仅作 crate 元信息示例。
+
+
+### 15.3 Redis 编译层退役与 `redis-compat` 兼容窗（2026-10-01 同步）
+
+> 变更登记：`redis-layer-retirement-20261002`。本节按根 `Cargo.toml`、各 crate manifest 与 `astral-common` 启动校验源码核对；**BREAKING CHANGE 自本次变更部署起生效**（本文描述的是源码/manifest 当前状态，不代表任何环境已完成安装）。
+
+**Workspace 边界（BREAKING CHANGE）**：
+
+- `astral-cache` 从 workspace `members` 移入 `exclude`，源码保留，manifest 使用自包含依赖声明。归档验证从其 manifest 单独执行；恢复 workspace 成员前核对依赖版本和兼容调用方。
+- 默认构建（不带 `redis-compat`）的编译/链接树为零 Redis；`Cargo.lock` 仍保留 optional `redis` 条目，但它不属于默认编译树。
+
+**Feature 模型**：`astral-db`、`astral-mq`、Gateway、Identity、TrustGraph、Monitor 显式声明 default-off 的 `redis-compat`，Redis 依赖为 optional。`astral-common/redis-compat` 是零依赖 marker，不能证明某个宿主编译了 adapter；每个宿主必须在 DB/worker 启动前以自身 `cfg!(feature = "redis-compat")` 调用 `validate_redis_adapter_support`。组合 `astral-single-node` 不提供 Redis adapter。
+
+**BREAKING CHANGE 清单与替代路径**（默认路径均已切换；下列兼容 API 未删除，仅收敛到 feature 门内）：
+
+| 受影响消费方 | 默认替代路径 | 保留的兼容入口（未删除） |
+|--------------|--------------|--------------------------|
+| `astral-mq` consumer 消息幂等 | durable DB 幂等 `init_idempotency_db` 为默认要求 | `init_idempotency_redis`、`shared_idempotency_redis` |
+| `astral-mq` consumers 会话撤销投影 | 进程内 LocalBus 撤销 handler + durable outbox | `set_session_revocation_redis` |
+| `astral-gateway` 网关 Redis 初始化 | redis-free 默认路径 | `init_gateway_redis` |
+| `astral-identity` 会话加速面 | MySQL durable proof 与进程内撤销面；默认构建没有 Redis 字段 | `AppState.redis` 字段仅 feature 开启时存在，类型仍为 `Option` |
+| Identity 会话投影 worker | `spawn_without_redis_owned` 为默认装配入口，持有死亡信号和有界关闭句柄 | `spawn_without_redis` 与 feature 门内 `spawn(pool, redis)` 保留 detached 兼容合同，`spawn_owned` 提供兼容 adapter 的 owned 入口 |
+| `astral-trustgraph` 缓存逐出 | 默认路径不触达 Redis | `delete_redis_keys` eviction compat 路径 |
+| `astral-db` evidence L2 与缓存适配 | 进程内 TTL/容量 evidence 缓存 + strict DB 回源 | `RedisL2EvidenceStore`、perm/资格缓存、连接池、共享 cache epoch 适配 |
+
+**迁移与运行时门**：需要 Redis 兼容路径的部署必须在构建期启用 `--features redis-compat`（含 feature 传播），并在运行期显式设置 `ASTRAL_REDIS_PROJECTION_COMPAT=true`（严格 bool，default-off，`astral-common::config` 唯一共享实现；开启时启动校验强制 `redis_url` 非空，`RedisCompatRequiresUrl`）。**未编译 redis-compat 的二进制在 env 置 true 时必须在启动期 fail-closed 拒绝**（`RedisCompatRequiresFeatureBuild`），不得静默 Redis-free 化或回退 raw/source 读取。
+
+**回滚**：回滚 = 重新构建并部署兼容变体（`--features redis-compat` + `ASTRAL_REDIS_PROJECTION_COMPAT=true`）沿原链路恢复服务；**不得以删除 durable 事实（outbox/幂等行/投影/审计）作为回滚手段**。
+
+**兼容窗到期**：显式 adapter 的当前登记期限为 **2026-12-31**。到期前核对剩余调用方、真实验收和切换批准；到期日不会自动删除 API 或改变部署配置。未完成验收前不得宣称生产迁移完成。
+
+### 15.4 单机内存读写生命周期（2026-10-01 实现登记）
+
+本节登记 R1–R4 的代码语义与兼容边界；架构、容量和恢复入口见[内存权威读面与失效通道方案](../架构/Rust架构设计/Rust内存权威读面与失效通道架构方案_V0.1.md)。真实环境未据此完成验收。
+
+- **R1 失效传播**：单机使用有界 LocalBus/LocalProjectionBus 直发，低频 DB worker 仅恢复已提交意图。健康本地 supervisor 不执行周期全量 DB scan。多机保留 Rabbit durable 节点队列、exact inbox、application proof、confirm/ACK、DLX、水位和粘性 suspect；跨节点 δ 未实测，不宣称异常回退等于已证明的跨节点零窗口。
+- **R2 正式 evidence 内存化**：只复用完整严格校验的 published 状态；卡片全部 aggregate、generation/dependency/fence/read-gate、source/health token 与有效期均须满足。source guard 在 begin 前取得，COMMIT/autocommit await 前 arm，仅已证明成功 disarm；取消或未知结果关闭 authority 读取，不用普通投影对账替代 writer 结果证明。宿主在 ownership/authority 读取前捕获 opaque fence，在 SoD 后最终复检；hub 已安装但 token 不可得即拒绝。容量、GC 或版本耗尽不得把缺失状态变成完整证据。
+- **R3 资格及辅助镜像**：只缓存严格来源、完整物理绑定和期限的事实；每卡纪元 GC 不复用旧身份。组织 TenantUnmanaged 可缓存严格的“表存在且无 node”事实，SchemaUnmanaged 不缓存。资源归属仅支持已登记并覆盖 source writer 的类型，Chat 冻结表排除。SoD 仍为 deny-only 复核，策略收紧、provenance/context 或 read token 失配必须拒绝。
+- **R4 Redis 退役**：保留 §15.3 的编译兼容 API；宿主和 legacy 环境回落共用同一冻结值，同值幂等、异值拒绝。`session_grant_mirror_enabled` 默认 true，显式 false 和 positive-disabled 保留；只有组合进程强门下安装 VerifiedPositive，独立 Gateway 保持严格 DB/DenyOnly。
+- **SoD 持有语义（BREAKING CHANGE，随本次代码部署生效）**：context-aware 宿主路径以已经发布且当前有效的 `effective_grants` 与经过 provenance 对牌的组织贡献判断持有权限，冷/热同一合同；它不再把未经发布的 raw `permission_rule` 行当作额外拒绝依据。旧公开 `check_sod_conflict` 诊断入口保留 raw deny-biased 扫描。该变更可能使只有 raw 行、没有对应 published 授权的历史请求从拒绝变为放行，不能称为逐字节等同优化。替代入口为 `check_sod_conflict_with_context` 与 additive `check_sod_conflict_with_context_and_org`，旧 `check_sod_conflict_with_org` 保留诊断合同，影响 TrustGraph/Identity 的 SoD 宿主；部署前须对账依赖 raw 拒绝的历史规则并核验已发布贡献，回滚可恢复原诊断读取模式，不能删除 source、published 或审计事实。
+- **生命周期与恢复**：运行期监督单写者锁身份与必需 owner。owner 失败设置独立粘性故障门，心跳或 pointer 对账不清除此门；不以虚构 source writer 表达任务死亡，不自动重放未知副作用。快照仅作 warm hint，当前 pointer/manifest/reference/segment 重验失败从账本恢复，不能作为授权证明。
+- **source metadata**：卡/level template metadata 属于发行或治理事实，不制造无效果的授权 delta；保留 source fence 和同事务治理审计，实际管理员操作传播验证后的 actor/operation。受影响卡审计/资格扇出采用 SQL cap+1 和变更前拒绝，不能截断后报告成功。
+- **兼容与验收**：既有公开 strict/诊断接口及消息 wire 保留，新增 context-aware/有界/owned 接口以 additive 方式装配。默认 workspace 编译、lint、非 ignored 测试和范围格式须从最终冻结快照执行；真实 DB/MQ/兼容 Redis、migration、crash、跨节点和跨城验收单独记录，未执行不得报 PASS。
 
 ---
 

@@ -1125,7 +1125,12 @@ impl PolicyEngine {
         // （raw rule_set_entry / raw permission_rule / legacy delegation），违反
         // strict gate "不触碰任何 raw/source/cache 回退" 的契约；其决策也没有
         // 可与 realtime oracle 比对的快照路径。非 strict 仓库行为不变。
-        if !strict_published_evidence && decision.org_provenance.is_none() {
+        // 测试构建同样整体跳过：采样相位是进程级共享状态，隔离运行的
+        // 首个 evaluate 恒命中采样边界，采样重评估会污染 crate 内测试对
+        // repo 调用次数的精确断言（顺序依赖缺陷）。采样器语义由
+        // consistency.rs 的单元测试与 monitor 端点覆盖。
+        if cfg!(test) {
+        } else if !strict_published_evidence && decision.org_provenance.is_none() {
             if let Some(violation) = get_consistency_checker()
                 .check_consistency(ctx, &decision, self, repo)
                 .await

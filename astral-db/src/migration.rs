@@ -1013,12 +1013,34 @@ const REQUIRED_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
             "enabled",
         ],
     ),
-    // permission_rule_snapshot, rule_set_snapshot and rule_set_snapshot_manifest
-    // are deliberately absent: they are decommissionable via 20260827000002 and
-    // must not be required after that migration has dropped them. While a table
-    // is still present its special columns keep their exact contracts through
-    // validate_decommissionable_snapshot_column_contracts and the preflight
-    // strict-column path; ordinary legacy columns are no longer re-enforced.
+    // AL-native local message outbox. It is a transport queue for events that
+    // do not already have an aggregate-specific durable outbox.
+    (
+        "al_message_outbox",
+        &[
+            "message_id",
+            "operation_id",
+            "message_type",
+            "queue_name",
+            "ordering_key",
+            "tenant_id",
+            "origin_region",
+            "target_region",
+            "schema_version",
+            "payload_json",
+            "headers_json",
+            "payload_sha256",
+            "status",
+            "attempts",
+            "next_attempt_at",
+            "lease_owner",
+            "lease_expires_at",
+            "processed_at",
+            "last_error",
+            "created_at",
+            "updated_at",
+        ],
+    ),
     (
         "permission_rule_template",
         &[
@@ -1335,6 +1357,43 @@ const REQUIRED_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
 ];
 
 const REQUIRED_SCHEMA_INDEXES: &[(&str, &str, &[&str], bool)] = &[
+    ("al_message_outbox", "PRIMARY", &["message_id"], true),
+    (
+        "al_message_outbox",
+        "uk_al_message_queue_message",
+        &["queue_name", "message_id"],
+        true,
+    ),
+    (
+        "al_message_outbox",
+        "idx_al_message_pending",
+        &["status", "next_attempt_at", "created_at"],
+        false,
+    ),
+    (
+        "al_message_outbox",
+        "idx_al_message_lease",
+        &["status", "lease_expires_at", "message_id"],
+        false,
+    ),
+    (
+        "al_message_outbox",
+        "idx_al_message_ordering",
+        &["queue_name", "ordering_key", "status", "created_at"],
+        false,
+    ),
+    (
+        "al_message_outbox",
+        "idx_al_message_operation",
+        &["operation_id", "message_type"],
+        false,
+    ),
+    (
+        "al_message_outbox",
+        "idx_al_message_tenant",
+        &["tenant_id", "queue_name", "created_at"],
+        false,
+    ),
     ("audit_log", "PRIMARY", &["id"], true),
     ("audit_log", "idx_al_user", &["user_id"], false),
     ("audit_log", "idx_al_action", &["action"], false),
@@ -10042,6 +10101,12 @@ pub async fn validate_schema_contract(pool: &MySqlPool) -> Result<(), MigrationE
     }
     validate_incremental_projection_archive_schema_contract(pool).await?;
     validate_cross_city_schema_contract(pool).await?;
+    // auth_internal_request_guard 是 Redis-free 网关/Identity 重放与幂等路径的
+    // durable 互斥表（迁移 20261001000001）：缺表/缺列/唯一键漂移必须在启动期
+    // fail-early，由 session_state_repository 的契约检查统一裁决。
+    crate::session_state_repository::validate_auth_internal_request_guard_schema(pool)
+        .await
+        .map_err(MigrationError::Failed)?;
     validate_indexes(pool, REQUIRED_SCHEMA_INDEXES).await?;
     validate_indexes(pool, CROSS_CITY_SCHEMA_INDEXES).await?;
     // Archive tables validate over the RESOLVED index contract: post-creator
@@ -10951,6 +11016,38 @@ mod tests {
     /// creator migration of the separately versioned org-scope authority
     /// chain (20260922000001).
     const ORG_SCOPE_AUTHORITY_VERSION: i64 = 20260922000001;
+    const AL_MESSAGE_OUTBOX_VERSION: i64 = 20260929000001;
+    /// Cross-city runtime-proof slice (P4, default-off): durable node key
+    /// registry, replay-reservation ledger, commit receipts, activation mint
+    /// records, and authoritative city-scope registry. The current embedded
+    /// migration chain tail.
+    const CROSS_CITY_RUNTIME_PROOF_VERSION: i64 = 20261001000002;
+    const CROSS_CITY_RUNTIME_PROOF_MIGRATION_SQL: &str =
+        include_str!("../migrations/20261001000002_cross_city_runtime_proof.sql");
+
+    /// Redis-free 运行路径新增的 Rust-owned additive 尾部（均在 cross-city
+    /// runtime-proof 之后、必须保持 embedded、绝不被 Java baseline 吸收）：
+    /// 000003 MQ consumer durable lease（幂等 MySQL 化）、000004 invalidation
+    /// inbox、000005 invalidation scope sequence（当前链尾）。
+    const RUNTIME_REDIS_FREE_TAIL_VERSION: i64 = 20261001000005;
+    const RUNTIME_REDIS_FREE_TAIL_MIGRATION_SQL: &str =
+        include_str!("../migrations/20261001000005_invalidation_scope_sequence.sql");
+    const MQ_IDEMPOTENCY_LEASE_MIGRATION_SQL: &str =
+        include_str!("../migrations/20261001000003_mq_idempotency_lease.sql");
+    /// 20261001000001 Redis-free Gateway 内部请求护栏（durable SET NX EX 等价，
+    /// `auth_internal_request_guard` 表）。
+    const AUTH_INTERNAL_REQUEST_GUARD_VERSION: i64 = 20261001000001;
+    const AUTH_INTERNAL_REQUEST_GUARD_MIGRATION_SQL: &str =
+        include_str!("../migrations/20261001000001_auth_internal_request_guard.sql");
+    /// 20261001000003 MQ consumer durable lease（幂等 MySQL 化）：由
+    /// `astral_db::mq_idempotency_repository` 独占读写 `mq_consumer_lease`，
+    /// 必须保持 embedded 且绝不被 Java baseline 吸收。
+    const MQ_IDEMPOTENCY_LEASE_VERSION: i64 = 20261001000003;
+    /// 20261001000004 per-node durable invalidation inbox（Rabbit 失效广播的
+    /// durable per-node receipt；owner 为 `astral_db::InvalidationInboxRepository`）。
+    const INVALIDATION_INBOX_VERSION: i64 = 20261001000004;
+    const INVALIDATION_INBOX_MIGRATION_SQL: &str =
+        include_str!("../migrations/20261001000004_invalidation_inbox.sql");
 
     const RUNTIME_MIGRATION_SQL: &str =
         include_str!("../migrations/20260818000001_rust_runtime_schema.sql");
@@ -10984,6 +11081,8 @@ mod tests {
         include_str!("../migrations/20260830000001_identity_card_dual_card_separation.sql");
     const CROSS_CITY_SCHEMA_MIGRATION_SQL: &str =
         include_str!("../migrations/20260831000002_cross_city_schema.sql");
+    const AL_MESSAGE_OUTBOX_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260929000001_al_message_outbox.sql");
 
     fn historical_auth_migration() -> &'static Migration {
         MIGRATOR
@@ -12551,14 +12650,117 @@ mod tests {
         );
         // 20260922000001 is the current chain tail: the org-scope authority
         // tables must not be silently omitted from the embedded migrator.
+        // 20260929000001 is the AL-native local transport tail. It must remain
+        // embedded and must never be adopted as part of the Java baseline.
+        // 20261001000002 is the cross-city runtime-proof tail (node keys,
+        // durable replay reservations, commit receipts, activation mint
+        // records, authority scopes). It must remain embedded and must never
+        // be adopted as part of the Java baseline either; the outbox pin
+        // below therefore becomes a containment pin, and the exact tail pin
+        // moves to the runtime-proof migration.
+        // 20261001000005 is the current chain tail (invalidation scope
+        // sequence, after the MQ consumer durable lease 000003 and the
+        // invalidation inbox 000004 — the Redis-free runtime path's additive
+        // tail). The exact tail pin therefore moves to the scope-sequence
+        // migration; the runtime-proof pin below becomes a containment pin.
+        assert!(
+            MIGRATOR
+                .migrations
+                .iter()
+                .map(|migration| migration.version)
+                .max()
+                .is_some_and(|tail| tail >= AL_MESSAGE_OUTBOX_VERSION),
+            "the AL message outbox migration must remain embedded in the migrator"
+        );
+        assert!(!is_java_baseline_era(AL_MESSAGE_OUTBOX_VERSION));
+        assert!(AL_MESSAGE_OUTBOX_MIGRATION_SQL
+            .contains("CREATE TABLE IF NOT EXISTS al_message_outbox"));
+        assert!(AL_MESSAGE_OUTBOX_MIGRATION_SQL.contains("uk_al_message_queue_message"));
         assert_eq!(
             MIGRATOR
                 .migrations
                 .iter()
                 .map(|migration| migration.version)
                 .max(),
-            Some(ORG_SCOPE_AUTHORITY_VERSION)
+            Some(RUNTIME_REDIS_FREE_TAIL_VERSION),
+            "the invalidation scope sequence migration is the current chain tail"
         );
+        assert!(!is_java_baseline_era(CROSS_CITY_RUNTIME_PROOF_VERSION));
+        assert!(!is_java_baseline_era(RUNTIME_REDIS_FREE_TAIL_VERSION));
+        assert!(
+            MIGRATOR
+                .migrations
+                .iter()
+                .map(|migration| migration.version)
+                .max()
+                .is_some_and(|tail| tail >= CROSS_CITY_RUNTIME_PROOF_VERSION),
+            "the cross-city runtime-proof migration must remain embedded in the migrator"
+        );
+        assert!(MQ_IDEMPOTENCY_LEASE_MIGRATION_SQL.contains("mq_consumer_lease"));
+        assert!(!RUNTIME_REDIS_FREE_TAIL_MIGRATION_SQL.is_empty());
+        // 20261001000001..00005（Redis-free 运行路径 additive 切片）：除聚合尾
+        // 钉之外，每个版本都必须单独保持 embedded 且绝不被 Java baseline 采纳
+        // （防止聚合断言掩盖单个迁移被遗漏/静默吸收的回归）。
+        for version in [
+            AUTH_INTERNAL_REQUEST_GUARD_VERSION,
+            CROSS_CITY_RUNTIME_PROOF_VERSION,
+            MQ_IDEMPOTENCY_LEASE_VERSION,
+            INVALIDATION_INBOX_VERSION,
+            RUNTIME_REDIS_FREE_TAIL_VERSION,
+        ] {
+            assert!(
+                MIGRATOR
+                    .migrations
+                    .iter()
+                    .any(|migration| migration.version == version),
+                "migration {version} must remain embedded in the migrator"
+            );
+            assert!(
+                !is_java_baseline_era(version),
+                "migration {version} must never be adopted as part of the Java baseline"
+            );
+        }
+        // 切片完整性：20261001000001..00005 必须全部存在、各出现一次
+        // （sqlx::migrate! 按文件名嵌入，重复版本号会在编译期就失败，
+        // 这里锚定五版本齐全且无漂移）。
+        let mut embedded_20261001_slice: Vec<i64> = MIGRATOR
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .filter(|version| (20261001000001..=20261001000005).contains(version))
+            .collect();
+        embedded_20261001_slice.sort_unstable();
+        assert_eq!(
+            embedded_20261001_slice,
+            vec![
+                20261001000001,
+                20261001000002,
+                20261001000003,
+                20261001000004,
+                20261001000005,
+            ],
+            "the 20261001 Redis-free additive slice must be complete and unique"
+        );
+        assert!(AUTH_INTERNAL_REQUEST_GUARD_MIGRATION_SQL
+            .contains("CREATE TABLE IF NOT EXISTS auth_internal_request_guard"));
+        assert!(INVALIDATION_INBOX_MIGRATION_SQL
+            .contains("CREATE TABLE IF NOT EXISTS authorization_invalidation_inbox"));
+        assert!(RUNTIME_REDIS_FREE_TAIL_MIGRATION_SQL
+            .contains("CREATE TABLE IF NOT EXISTS al_message_scope_counter"));
+        assert!(CROSS_CITY_RUNTIME_PROOF_MIGRATION_SQL
+            .contains("CREATE TABLE IF NOT EXISTS authorization_cross_city_node_key"));
+        assert!(CROSS_CITY_RUNTIME_PROOF_MIGRATION_SQL
+            .contains("CREATE TABLE IF NOT EXISTS authorization_cross_city_vote_reservation"));
+        assert!(CROSS_CITY_RUNTIME_PROOF_MIGRATION_SQL
+            .contains("CREATE TABLE IF NOT EXISTS authorization_cross_city_commit_receipt"));
+        assert!(CROSS_CITY_RUNTIME_PROOF_MIGRATION_SQL
+            .contains("CREATE TABLE IF NOT EXISTS authorization_cross_city_operation_activation"));
+        assert!(CROSS_CITY_RUNTIME_PROOF_MIGRATION_SQL
+            .contains("CREATE TABLE IF NOT EXISTS authorization_cross_city_authority_scope"));
+        assert!(MIGRATOR
+            .migrations
+            .iter()
+            .any(|migration| migration.version == CROSS_CITY_RUNTIME_PROOF_VERSION));
         assert!(MIGRATOR
             .migrations
             .iter()
@@ -12874,6 +13076,45 @@ mod tests {
             assert!(!migration_defines_existing_index(
                 migration, table, index, columns, *unique
             ));
+        }
+    }
+
+    /// Cross-city runtime-proof slice (P4, default-off): the migration must
+    /// stay a set of five additive idempotent table creators — no destructive
+    /// statements, no foreign keys (repositories own consistency), no CHECK
+    /// constraints (state machines live in astral-types + repositories), and
+    /// it must remain embedded with its declared version.
+    #[test]
+    fn cross_city_runtime_proof_migration_is_additive_creators_only() {
+        let migration = MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == CROSS_CITY_RUNTIME_PROOF_VERSION)
+            .expect("cross-city runtime-proof migration must remain embedded");
+        assert_eq!(
+            migration.sql, CROSS_CITY_RUNTIME_PROOF_MIGRATION_SQL,
+            "embedded migrator SQL must match the include_str! reference"
+        );
+        let statements = sql_statements(CROSS_CITY_RUNTIME_PROOF_MIGRATION_SQL)
+            .expect("runtime-proof migration must lex cleanly");
+        assert_eq!(statements.len(), 5, "exactly five table creators");
+        for statement in &statements {
+            assert!(
+                normalized_sql_fragment(statement).starts_with("CREATE TABLE "),
+                "runtime-proof migration must only create tables, found: {statement}"
+            );
+        }
+        assert!(!CROSS_CITY_RUNTIME_PROOF_MIGRATION_SQL.contains("FOREIGN KEY"));
+        assert!(!CROSS_CITY_RUNTIME_PROOF_MIGRATION_SQL.contains("CHECK ("));
+        assert!(!CROSS_CITY_RUNTIME_PROOF_MIGRATION_SQL.contains("ON DELETE"));
+        for table in [
+            "authorization_cross_city_node_key",
+            "authorization_cross_city_vote_reservation",
+            "authorization_cross_city_commit_receipt",
+            "authorization_cross_city_operation_activation",
+            "authorization_cross_city_authority_scope",
+        ] {
+            assert!(migration_defines_table(migration, table));
         }
     }
 

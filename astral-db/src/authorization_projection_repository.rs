@@ -253,7 +253,9 @@
 //! composed of `event_id`/`operation_id`/`cas_version`/`last_error`.
 
 use std::fmt;
+use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Executor, MySql, MySqlPool, Transaction};
 use time::{OffsetDateTime, PrimitiveDateTime};
@@ -597,7 +599,7 @@ impl fmt::Display for AuthorizationManifestStatus {
 /// Every statement binds all three fields together with the optional card
 /// scope, so cross-tenant/cross-aggregate rows can never be mistaken for each
 /// other even when digest keys collide.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProjectionAggregateIdentity {
     pub tenant_id: i64,
     pub aggregate_type: String,
@@ -1416,7 +1418,7 @@ pub fn validate_manifest_publish(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Decoded `authorization_projection_current` row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationCurrentPointerRecord {
     pub pointer_id: i64,
     pub identity: ProjectionAggregateIdentity,
@@ -1448,7 +1450,7 @@ impl AuthorizationCurrentPointerRecord {
 }
 
 /// Decoded `authorization_projection_manifest_segment` reference row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationSegmentReferenceRecord {
     pub reference_id: i64,
     pub manifest_id: i64,
@@ -1474,7 +1476,7 @@ impl AuthorizationSegmentReferenceRecord {
 }
 
 /// Decoded `authorization_projection_segment` content row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationSegmentSnapshot {
     pub segment_id: i64,
     pub identity: ProjectionAggregateIdentity,
@@ -1492,7 +1494,13 @@ pub struct AuthorizationSegmentSnapshot {
 /// One fully verified published projection: pointer + manifest + ordered
 /// segments. Returned only after every invariant held; partial failures abort
 /// the whole read with an explicit error, never a degraded result.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// The typed serde form is consumed by the durable local-snapshot warm hint
+/// ([`crate::authorization_snapshot`]); it is a wire form only, never an
+/// alternative constructor path — every deserialized instance must pass
+/// [`crate::authorization_snapshot::validate_published_state_snapshot`]
+/// (full payload re-encoding + the one assembly contract below) before use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationPublishedState {
     pub pointer: AuthorizationCurrentPointerRecord,
     pub manifest_id: i64,
@@ -1513,6 +1521,15 @@ pub struct AuthorizationPublishedState {
     /// Verified ordered reference rows behind [`Self::segments`] (same order).
     pub references: Vec<AuthorizationSegmentReferenceRecord>,
     pub total_grant_count: u64,
+}
+
+// Reflexive AsRef lets the pure evidence assembler take both the tx reader's
+// owned `&[State]` and the memory mirror's `&[&State]` (std blankets then
+// cover the `&State` element) — one assembly implementation, one semantics.
+impl AsRef<AuthorizationPublishedState> for AuthorizationPublishedState {
+    fn as_ref(&self) -> &Self {
+        self
+    }
 }
 
 /// Diagnostic snapshot of a non-published (`BUILDING`/`READY`) manifest for
@@ -1595,7 +1612,7 @@ const POINTER_BY_IDENTITY_TAIL: &str = " FROM authorization_projection_current \
     WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ?";
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct ManifestRawSqlRow {
+pub(crate) struct ManifestRawSqlRow {
     manifest_id: i64,
     tenant_id: i64,
     card_id: Option<i64>,
@@ -1620,6 +1637,46 @@ struct ManifestRawSqlRow {
 }
 
 impl ManifestRawSqlRow {
+    /// Rebuild the raw manifest row shape from a verified published state so
+    /// the snapshot validator can re-run the ONE assembly contract
+    /// ([`assemble_verified_published_state`]) over deserialized typed data.
+    ///
+    /// The rebuild is faithful by construction: every field is copied from the
+    /// state itself (whose equality the caller re-proves against the assembly
+    /// output). `COMMITTED` is pinned because a published state can only ever
+    /// describe a committed manifest; lease columns are read-side opaque and
+    /// never enter the assembly contract.
+    pub(crate) fn from_published_state(
+        state: &AuthorizationPublishedState,
+    ) -> Result<Self, AuthorizationProjectionError> {
+        Ok(Self {
+            manifest_id: state.manifest_id,
+            tenant_id: state.pointer.identity.tenant_id,
+            card_id: state.pointer.card_id,
+            aggregate_type: state.pointer.identity.aggregate_type.clone(),
+            aggregate_id: state.pointer.identity.aggregate_id,
+            generation: bind_u64(state.generation, "manifest.generation")?,
+            source_generation: bind_u64(state.source_generation, "manifest.source_generation")?,
+            projected_generation: bind_u64(
+                state.projected_generation,
+                "manifest.projected_generation",
+            )?,
+            event_id: state.event_id.clone(),
+            operation_id: state.operation_id.clone(),
+            semantic_hash: state.semantic_hash.as_bytes().to_vec(),
+            dependency_hash: state.dependency_hash.as_bytes().to_vec(),
+            compiler_version: state.compiler_version.clone(),
+            manifest_digest: state.manifest_digest.as_bytes().to_vec(),
+            status: MANIFEST_STATUS_COMMITTED.to_owned(),
+            cas_version: state.pointer.cas_version,
+            lease_owner: None,
+            lease_token_hash: None,
+            lease_expires_at: None,
+            parent_manifest_id: state.parent_manifest_id,
+            revoke_fence: bind_u64(state.revoke_fence, "manifest.revoke_fence")?,
+        })
+    }
+
     fn decode_identity(&self) -> Result<ProjectionAggregateIdentity, AuthorizationProjectionError> {
         ProjectionAggregateIdentity::new(
             self.tenant_id,
@@ -1887,6 +1944,92 @@ impl PointerRawSqlRow {
             cas_version: self.cas_version,
         })
     }
+}
+
+/// Enumerate EVERY current pointer row under one deterministic locked read
+/// (`tenant_id, aggregate_type, aggregate_id` order) for the durable snapshot
+/// capture.
+///
+/// Lock-order note: this is the same per-scope discipline the card reader
+/// uses (pointers first, ordered, then each aggregate's manifest chain), taken
+/// globally in one statement so a capture can never interleave with itself or
+/// deadlock against per-card readers that only ever lock one tenant's rows in
+/// the matching `(aggregate_type, aggregate_id)` sub-order. Nothing here
+/// writes; callers own the transaction and its commit proof.
+///
+/// Retained unbounded contract variant: the snapshot capture and hint load
+/// paths use the SQL-bounded variants
+/// ([`lock_all_current_pointer_records_in_tx_bounded`] /
+/// [`read_all_current_pointer_records_in_tx_bounded`]) and are pinned to them
+/// by source-anchor tests; new callers must prefer the bounded pair.
+#[allow(dead_code)]
+pub(crate) async fn lock_all_current_pointer_records_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+) -> Result<Vec<AuthorizationCurrentPointerRecord>, AuthorizationProjectionError> {
+    let statement = format!("{SELECT_PREFIX}{POINTER_ROW_COLUMNS}{POINTER_ROWS_ALL_LOCKED_TAIL}");
+    let raw_rows: Vec<PointerRawSqlRow> = sqlx::query_as(statement.as_str())
+        .fetch_all(&mut **tx)
+        .await?;
+    raw_rows.iter().map(|raw| raw.decode()).collect()
+}
+
+/// Non-locking counterpart of [`lock_all_current_pointer_records_in_tx`] for
+/// the snapshot hint load: the full durable pointer token set as one
+/// consistent read, never used alone as freshness proof.
+///
+/// Retained unbounded contract variant: the hint load uses the SQL-bounded
+/// [`read_all_current_pointer_records_in_tx_bounded`]; new callers must
+/// prefer the bounded variant.
+#[allow(dead_code)]
+pub(crate) async fn read_all_current_pointer_records_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+) -> Result<Vec<AuthorizationCurrentPointerRecord>, AuthorizationProjectionError> {
+    let statement = format!("{SELECT_PREFIX}{POINTER_ROW_COLUMNS}{POINTER_ROWS_ALL_ORDERED_TAIL}");
+    let raw_rows: Vec<PointerRawSqlRow> = sqlx::query_as(statement.as_str())
+        .fetch_all(&mut **tx)
+        .await?;
+    raw_rows.iter().map(|raw| raw.decode()).collect()
+}
+
+/// SQL-bounded variant of [`lock_all_current_pointer_records_in_tx`] for the
+/// durable snapshot capture: identical column list, deterministic
+/// `tenant_id, aggregate_type, aggregate_id` order and `FOR UPDATE` lock
+/// discipline, with the read set itself cut off by the SQL at `limit` rows.
+/// Callers pass `cap + 1`: seeing all `limit` rows means the scope exceeded
+/// the cap, and the caller must refuse the whole capture (`TooLarge`)
+/// instead of assembling a partial frontier. `positive_i64` guards the bind.
+pub(crate) async fn lock_all_current_pointer_records_in_tx_bounded(
+    tx: &mut Transaction<'_, MySql>,
+    limit: i64,
+) -> Result<Vec<AuthorizationCurrentPointerRecord>, AuthorizationProjectionError> {
+    positive_i64(limit, "pointer_scan_limit")?;
+    let statement =
+        format!("{SELECT_PREFIX}{POINTER_ROW_COLUMNS}{POINTER_ROWS_ALL_LOCKED_BOUNDED_TAIL}");
+    let raw_rows: Vec<PointerRawSqlRow> = sqlx::query_as(statement.as_str())
+        .bind(limit)
+        .fetch_all(&mut **tx)
+        .await?;
+    raw_rows.iter().map(|raw| raw.decode()).collect()
+}
+
+/// Non-locking SQL-bounded counterpart of
+/// [`lock_all_current_pointer_records_in_tx_bounded`] for the snapshot hint
+/// load: the durable pointer token set as one consistent read cut off by the
+/// SQL at `limit` rows, never used alone as freshness proof. Same contract as
+/// the locked variant: `limit` = `cap + 1`, over-cap fails closed at the
+/// caller.
+pub(crate) async fn read_all_current_pointer_records_in_tx_bounded(
+    tx: &mut Transaction<'_, MySql>,
+    limit: i64,
+) -> Result<Vec<AuthorizationCurrentPointerRecord>, AuthorizationProjectionError> {
+    positive_i64(limit, "pointer_scan_limit")?;
+    let statement =
+        format!("{SELECT_PREFIX}{POINTER_ROW_COLUMNS}{POINTER_ROWS_ALL_ORDERED_BOUNDED_TAIL}");
+    let raw_rows: Vec<PointerRawSqlRow> = sqlx::query_as(statement.as_str())
+        .bind(limit)
+        .fetch_all(&mut **tx)
+        .await?;
+    raw_rows.iter().map(|raw| raw.decode()).collect()
 }
 
 async fn fetch_manifest_for_update(
@@ -3210,6 +3353,9 @@ pub struct AuthorizationPublishRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationPublishOutcome {
     pub pointer: AuthorizationCurrentPointerRecord,
+    /// Fully verified transaction state. It is not durable until the caller's
+    /// commit succeeds; consumers must never install it before that proof.
+    pub published_state: Arc<AuthorizationPublishedState>,
     pub published_manifest_id: i64,
     pub previous_superseded_manifest_id: Option<i64>,
     /// True when this was the first-ever pointer row for the aggregate.
@@ -3357,8 +3503,10 @@ pub async fn publish_current_pointer_in_tx(
     )
     .await?;
     let (target_semantic_stored, target_dependency_stored, _) = target.decode_hashes()?;
+    let mut verified_segments = Vec::with_capacity(reference_records.len());
     for reference in &reference_records {
-        fetch_and_verify_segment_row(tx, reference, &request.identity).await?;
+        verified_segments
+            .push(fetch_and_verify_segment_row(tx, reference, &request.identity).await?);
     }
 
     let target_view = TargetManifestView {
@@ -3580,8 +3728,17 @@ pub async fn publish_current_pointer_in_tx(
         ));
     }
 
+    let mut committed_target = target;
+    committed_target.status = MANIFEST_STATUS_COMMITTED.to_owned();
+    let published_state = Arc::new(assemble_verified_published_state(
+        pointer_record.clone(),
+        &committed_target,
+        reference_records,
+        verified_segments,
+    )?);
     Ok(AuthorizationPublishOutcome {
         pointer: pointer_record,
+        published_state,
         published_manifest_id: request.target_manifest_id,
         previous_superseded_manifest_id: previous_manifest_id,
         initialized_first_pointer,
@@ -3792,8 +3949,26 @@ pub async fn read_published_authorization_state_in_tx(
                 "code=authorization_projection.published_manifest_missing".to_owned(),
             )
         })?;
+    let (references, segments) =
+        load_verified_chain_with_references(tx, identity, &manifest).await?;
+    assemble_verified_published_state(pointer, &manifest, references, segments)
+}
+
+/// One assembly contract for the strict reader and the guarded publisher.
+/// Segment payloads have already passed decoding and local-seal verification.
+///
+/// `pub(crate)` so the snapshot validator
+/// ([`crate::authorization_snapshot::validate_published_state_snapshot`])
+/// reuses the SAME contract instead of a second, drifting check chain.
+pub(crate) fn assemble_verified_published_state(
+    pointer: AuthorizationCurrentPointerRecord,
+    manifest: &ManifestRawSqlRow,
+    references: Vec<AuthorizationSegmentReferenceRecord>,
+    segments: Vec<AuthorizationSegmentSnapshot>,
+) -> Result<AuthorizationPublishedState, AuthorizationProjectionError> {
+    validate_pointer_proof_state(pointer.revoke_fence, pointer.revoke_fence_proven)?;
     let (generation, source_generation, projected_generation) = manifest.decode_generations()?;
-    if generation != pointer.current_generation {
+    if generation != pointer.current_generation || manifest.manifest_id != pointer.manifest_id {
         return Err(AuthorizationProjectionError::Corrupt(
             "code=authorization_projection.pointer_manifest_generation_split".to_owned(),
         ));
@@ -3828,14 +4003,42 @@ pub async fn read_published_authorization_state_in_tx(
     if semantic_hash != pointer.semantic_hash
         || dependency_hash != pointer.dependency_hash
         || manifest.compiler_version != pointer.compiler_version
+        || manifest.event_id != pointer.event_id
+        || manifest.operation_id != pointer.operation_id
     {
         return Err(AuthorizationProjectionError::Corrupt(
             "code=authorization_projection.pointer_hash_chain_break".to_owned(),
         ));
     }
 
-    let (references, segments) =
-        load_verified_chain_with_references(tx, identity, &manifest).await?;
+    enforce_segment_reference_cap(references.len())?;
+    if references.len() != segments.len() {
+        return Err(AuthorizationProjectionError::Corrupt(
+            "code=authorization_projection.published_chain_length_mismatch".to_owned(),
+        ));
+    }
+    let mut seen_segment_ids = std::collections::BTreeSet::new();
+    for (ordinal, (reference, segment)) in references.iter().zip(&segments).enumerate() {
+        if reference.manifest_id != manifest.manifest_id
+            || reference.identity != pointer.identity
+            || reference.card_id != manifest.card_id
+            || reference.generation != generation
+            || reference.ordinal != ordinal as u64
+            || reference.event_id != manifest.event_id
+            || reference.operation_id != manifest.operation_id
+            || !seen_segment_ids.insert(reference.segment_id)
+        {
+            return Err(AuthorizationProjectionError::Corrupt(
+                "code=authorization_projection.published_reference_mismatch".to_owned(),
+            ));
+        }
+        if segment.segment_id != reference.segment_id || segment.card_id != manifest.card_id {
+            return Err(AuthorizationProjectionError::Corrupt(
+                "code=authorization_projection.published_segment_scope_mismatch".to_owned(),
+            ));
+        }
+        verify_reference_content_pair(reference, segment, &pointer.identity)?;
+    }
     let recomputed = manifest.recomputed_digest(
         segments
             .iter()
@@ -4538,8 +4741,12 @@ pub async fn rehearse_legacy_fence_proof_in_tx(
 /// `authorization_projection_current`. RuleSet / DIRECT (USER_CARD) /
 /// APPROVAL / DELEGATION contributions may all legitimately publish under a
 /// card scope; ANY other stored type fails closed instead of being skipped.
-pub const PUBLISHED_CARD_AGGREGATE_TYPES: [&str; 4] =
-    ["USER_CARD", "RULE_SET", "APPROVAL", "DELEGATION"];
+pub const PUBLISHED_CARD_AGGREGATE_TYPES: [&str; 4] = [
+    astral_types::PublishedEvidenceAggregate::USER_CARD,
+    astral_types::PublishedEvidenceAggregate::RULE_SET,
+    astral_types::PublishedEvidenceAggregate::APPROVAL,
+    astral_types::PublishedEvidenceAggregate::DELEGATION,
+];
 
 /// Single deterministic lock/read of all card-scoped current pointers.
 ///
@@ -4550,6 +4757,38 @@ pub const PUBLISHED_CARD_AGGREGATE_TYPES: [&str; 4] =
 const POINTER_ROWS_FOR_TENANT_CARD_LOCKED_TAIL: &str = " FROM authorization_projection_current \
     WHERE tenant_id = ? AND card_id = ? \
     ORDER BY aggregate_type ASC, aggregate_id ASC FOR UPDATE";
+
+/// Whole-table deterministic pointer enumeration for the durable local
+/// snapshot capture (one locked consistent read; see
+/// [`lock_all_current_pointer_records_in_tx`]).
+pub(crate) const POINTER_ROWS_ALL_LOCKED_TAIL: &str = " FROM authorization_projection_current \
+    ORDER BY tenant_id ASC, aggregate_type ASC, aggregate_id ASC FOR UPDATE";
+
+/// Whole-table deterministic pointer enumeration WITHOUT row locks — the
+/// snapshot hint load reads the durable pointer tokens with a non-locking
+/// consistent read: a hint never blocks publishers, and every offered state is
+/// re-proven against the exact durable token before it may warm anything.
+pub(crate) const POINTER_ROWS_ALL_ORDERED_TAIL: &str = " FROM authorization_projection_current \
+    ORDER BY tenant_id ASC, aggregate_type ASC, aggregate_id ASC";
+
+/// SQL-bounded whole-table deterministic pointer enumeration for the durable
+/// local snapshot capture (one locked consistent read; see
+/// [`lock_all_current_pointer_records_in_tx_bounded`]). `LIMIT ?` (= cap + 1)
+/// precedes `FOR UPDATE`, so the locked set and the read set are the same
+/// bounded prefix of the global order — no unbounded lock or memory tail.
+pub(crate) const POINTER_ROWS_ALL_LOCKED_BOUNDED_TAIL: &str =
+    " FROM authorization_projection_current \
+    ORDER BY tenant_id ASC, aggregate_type ASC, aggregate_id ASC LIMIT ? FOR UPDATE";
+
+/// SQL-bounded whole-table deterministic pointer enumeration WITHOUT row
+/// locks — the snapshot hint load reads the durable pointer tokens with a
+/// non-locking consistent read cut off by the SQL at `LIMIT ?` (= cap + 1):
+/// a hint never blocks publishers, an over-cap durable scope fails closed at
+/// the caller, and every offered state is re-proven against the exact durable
+/// token before it may warm anything.
+pub(crate) const POINTER_ROWS_ALL_ORDERED_BOUNDED_TAIL: &str =
+    " FROM authorization_projection_current \
+    ORDER BY tenant_id ASC, aggregate_type ASC, aggregate_id ASC LIMIT ?";
 
 /// Defensive fan-out cap: how many published aggregates one card read may
 /// compose before refusing with an explicit `NotReady`. Purely operational;
@@ -4814,10 +5053,15 @@ fn deduplicate_verified_records(
 /// and appear in the locked pointer SELECT order; this function adds the
 /// card-scope algebra the single-aggregate loader cannot know about (scope
 /// equality between pointer/reference/segment/grant across the merged view).
-fn assemble_published_card_evidence(
+/// Pure evidence assembly shared by the strict DB reader and the single-node
+/// in-memory mirror (`memory_projection_hub`): one implementation, one
+/// semantics. Generic over the state borrowing so the mirror can serve `Arc`
+/// snapshots (`&[&State]`) without deep-cloning segments per read, while the
+/// tx reader keeps passing `&[State]`.
+pub(crate) fn assemble_published_card_evidence<S: AsRef<AuthorizationPublishedState>>(
     scope: &PublishedCardEvidenceScope,
     now_unix_seconds: i64,
-    states: &[AuthorizationPublishedState],
+    states: &[S],
 ) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
     scope.validate().map_err(|contract| {
         AuthorizationEvidenceError::InvalidRequest(format!(
@@ -4836,6 +5080,7 @@ fn assemble_published_card_evidence(
     let mut records: Vec<VerifiedPublishedGrantRecord> = Vec::new();
 
     for state in states {
+        let state = state.as_ref();
         let pointer = &state.pointer;
         let identity = &pointer.identity;
         if !PUBLISHED_CARD_AGGREGATE_TYPES.contains(&identity.aggregate_type.as_str()) {
@@ -5093,6 +5338,93 @@ pub async fn load_published_card_grant_evidence_in_tx(
     tx: &mut Transaction<'_, MySql>,
     scope: &PublishedCardEvidenceScope,
 ) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
+    let bundle = load_published_card_state_bundle_in_tx(tx, scope).await?;
+    // Unified clock for the whole read: all validity judgments share one UTC
+    // instant so no grant can straddle a boundary mid-read. Sampled inside the
+    // same short transaction that proved the durable state (unchanged contract
+    // with the pre-refactor reader, which sampled its single clock mid-read).
+    let now_unix_seconds = OffsetDateTime::now_utc().unix_timestamp();
+    bundle.evidence_at(now_unix_seconds)
+}
+
+/// Opaque, commit-proven bundle of EVERY card-scoped published projection
+/// state for one [`PublishedCardEvidenceScope`], loaded through the strict
+/// evidence reader (freshness probe + locked deterministic pointers + full
+/// chain verification, no partial success).
+///
+/// The struct is deliberately opaque: its fields are private and there is no
+/// public constructor, so the only way to obtain a bundle is
+/// [`load_published_card_state_bundle`] / [`load_published_card_state_bundle_in_tx`]
+/// — a caller can never fabricate or extend one from unverified data. The
+/// bundle carries no freshness of its own after the transaction ends; it is a
+/// durable-proven snapshot as of that commit, and every authorization verdict
+/// must still be derived through [`Self::evidence_at`] (or downstream strict
+/// gates), never by inspecting the raw states as "current" fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedCardStateBundle {
+    scope: PublishedCardEvidenceScope,
+    states: Vec<AuthorizationPublishedState>,
+}
+
+impl PublishedCardStateBundle {
+    /// Crate-internal constructor: only the strict in-transaction loader (and
+    /// pure tests driving the same invariants) may assemble a bundle.
+    pub(crate) fn from_verified_parts(
+        scope: PublishedCardEvidenceScope,
+        states: Vec<AuthorizationPublishedState>,
+    ) -> Self {
+        Self { scope, states }
+    }
+
+    /// Every verified published state behind the card's current pointers, in
+    /// the deterministic `(aggregate_type, aggregate_id)` read order.
+    pub fn states(&self) -> &[AuthorizationPublishedState] {
+        &self.states
+    }
+
+    /// Consume the bundle into its verified states (same order as
+    /// [`Self::states`]); the scope is dropped with it.
+    pub fn into_states(self) -> Vec<AuthorizationPublishedState> {
+        self.states
+    }
+
+    /// The scope this bundle was loaded (and proven) for.
+    pub fn scope(&self) -> &PublishedCardEvidenceScope {
+        &self.scope
+    }
+
+    /// Assemble the typed evidence verdict at one explicit UTC instant using
+    /// the already-proven states — no database access, no cache, no fallback.
+    ///
+    /// Pure re-assembly over verified data: the same
+    /// [`assemble_published_card_evidence`] contract the transaction reader
+    /// uses, so absent state stays an explicit `NotReady` and any structural
+    /// inconsistency stays `Corrupt`. Validity (`Expired`/`NotYetValid`) and
+    /// scope lensing are re-evaluated at `now_unix_seconds`, which is the
+    /// caller's single unified clock for the derived verdict.
+    pub fn evidence_at(
+        &self,
+        now_unix_seconds: i64,
+    ) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
+        assemble_published_card_evidence(&self.scope, now_unix_seconds, &self.states)
+    }
+}
+
+/// Shared transaction-scoped strict loader behind BOTH the evidence reader
+/// ([`load_published_card_grant_evidence_in_tx`]) and the durable-refill
+/// bundle ([`load_published_card_state_bundle`]): exactly one code path —
+/// scope validation, the source-freshness gate, the deterministic locked
+/// pointer enumeration and every strict aggregate chain load, with no partial
+/// success (any aggregate error fails the WHOLE read) and no caching.
+///
+/// Returns the verified states instead of a verdict so the evidence assembly
+/// (with its unified `now`) and the state-bundle consumers stay on one load
+/// contract. Nothing here commits, writes or publishes; callers own the
+/// transaction and its commit proof.
+pub(crate) async fn load_published_card_state_bundle_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    scope: &PublishedCardEvidenceScope,
+) -> Result<PublishedCardStateBundle, AuthorizationEvidenceError> {
     scope.validate().map_err(|contract| {
         AuthorizationEvidenceError::InvalidRequest(format!(
             "code=published_card_evidence.invalid_scope;detail={contract}"
@@ -5140,10 +5472,6 @@ pub async fn load_published_card_grant_evidence_in_tx(
         pointers.push(raw.decode()?);
     }
 
-    // Unified clock for the whole read: all validity judgments share one UTC
-    // instant so no grant can straddle a boundary mid-read.
-    let now_unix_seconds = OffsetDateTime::now_utc().unix_timestamp();
-
     let mut states = Vec::with_capacity(pointers.len());
     for pointer in &pointers {
         let state = read_published_authorization_state_in_tx(tx, &pointer.identity)
@@ -5158,7 +5486,30 @@ pub async fn load_published_card_grant_evidence_in_tx(
         states.push(state);
     }
 
-    assemble_published_card_evidence(scope, now_unix_seconds, &states)
+    Ok(PublishedCardStateBundle::from_verified_parts(
+        scope.clone(),
+        states,
+    ))
+}
+
+/// Pool-level strict state-bundle loader for the durable-refill seam.
+///
+/// Runs the whole shared verification inside ONE SHORT transaction and commits
+/// it explicitly while returning, releasing every `FOR UPDATE` row lock
+/// promptly (locks are never held past this call). The commit is part of the
+/// contract — the returned bundle is only handed out after the commit proved
+/// the read transaction completed durably; commit failure maps to `Query`
+/// (`Pending`), never to a bundle. Consumers (memory mirror warm-up) must
+/// still treat the bundle as a snapshot as-of that commit and re-prove
+/// currency against the durable frontier before serving.
+pub async fn load_published_card_state_bundle(
+    pool: &MySqlPool,
+    scope: &PublishedCardEvidenceScope,
+) -> Result<PublishedCardStateBundle, AuthorizationEvidenceError> {
+    let mut tx = pool.begin().await?;
+    let bundle = load_published_card_state_bundle_in_tx(&mut tx, scope).await?;
+    tx.commit().await?;
+    Ok(bundle)
 }
 
 /// Pool-level wrapper for [`load_published_card_grant_evidence_in_tx`].
@@ -13853,6 +14204,37 @@ mod tests {
     }
 
     #[test]
+    fn whole_scope_pointer_scans_are_sql_bounded_cap_plus_one() {
+        // Locked capture variant: same deterministic global order, with the
+        // SQL itself cutting the read (and lock) set at `LIMIT ?` = cap + 1,
+        // before `FOR UPDATE`.
+        let locked =
+            format!("{SELECT_PREFIX}{POINTER_ROW_COLUMNS}{POINTER_ROWS_ALL_LOCKED_BOUNDED_TAIL}");
+        assert!(locked.contains("FROM authorization_projection_current"));
+        assert!(locked.contains("ORDER BY tenant_id ASC, aggregate_type ASC, aggregate_id ASC"));
+        let limit = locked
+            .find("LIMIT ?")
+            .expect("bounded lock tail must carry LIMIT ?");
+        assert!(
+            locked[limit..].contains("FOR UPDATE"),
+            "locked bounded tail must keep FOR UPDATE after LIMIT: {locked}"
+        );
+        assert!(locked.ends_with("FOR UPDATE"), "{locked}");
+        // Exactly the one over-limit probe binding; no hidden second
+        // placeholder.
+        assert_eq!(sql_placeholder_count(&locked), 1);
+
+        // Non-locking hint variant: same bounded cut, no row locks.
+        let ordered =
+            format!("{SELECT_PREFIX}{POINTER_ROW_COLUMNS}{POINTER_ROWS_ALL_ORDERED_BOUNDED_TAIL}");
+        assert!(ordered.contains("FROM authorization_projection_current"));
+        assert!(ordered.contains("ORDER BY tenant_id ASC, aggregate_type ASC, aggregate_id ASC"));
+        assert!(ordered.ends_with("LIMIT ?"), "{ordered}");
+        assert!(!ordered.contains("FOR UPDATE"));
+        assert_eq!(sql_placeholder_count(&ordered), 1);
+    }
+
+    #[test]
     fn card_evidence_reader_path_has_no_legacy_snapshot_or_cache_fallback() {
         let forbidden = [
             "permission_rule_snapshot",
@@ -13946,7 +14328,9 @@ mod tests {
 
     #[test]
     fn empty_state_set_is_not_ready_instead_of_ok_empty() {
-        let error = assemble_published_card_evidence(&unconstrained_scope(), 7, &[]).unwrap_err();
+        let empty: Vec<AuthorizationPublishedState> = Vec::new();
+        let error =
+            assemble_published_card_evidence(&unconstrained_scope(), 7, &empty).unwrap_err();
         assert!(matches!(error, AuthorizationEvidenceError::NotReady(_)));
         assert_eq!(error.as_gate_status(), PublishedEvidenceGateStatus::Pending);
     }
@@ -15334,6 +15718,113 @@ mod tests {
                     &target_dependency,
                 ),
                 "operation_id disagreement must fail the post-publish readback"
+            );
+        }
+    }
+
+    fn verified_publication_fixture() -> (
+        AuthorizationCurrentPointerRecord,
+        ManifestRawSqlRow,
+        Vec<AuthorizationSegmentReferenceRecord>,
+        Vec<AuthorizationSegmentSnapshot>,
+    ) {
+        let mut manifest = rehearsal_manifest_row(MANIFEST_STATUS_COMMITTED);
+        manifest.card_id = Some(17);
+        let identity = manifest.decode_identity().unwrap();
+        let snapshot = sealed_snapshot(
+            &identity,
+            manifest.card_id,
+            &manifest.compiler_version,
+            &[grant(1)],
+            91,
+        );
+        manifest.manifest_digest = manifest
+            .recomputed_digest(vec![snapshot.content_digest.as_hex()])
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let pointer = AuthorizationCurrentPointerRecord {
+            pointer_id: 1,
+            identity: identity.clone(),
+            card_id: manifest.card_id,
+            current_generation: manifest.generation as u64,
+            manifest_id: manifest.manifest_id,
+            event_id: manifest.event_id.clone(),
+            operation_id: manifest.operation_id.clone(),
+            semantic_hash: Sha256Digest::from_bytes(manifest.semantic_hash.clone()).unwrap(),
+            dependency_hash: Sha256Digest::from_bytes(manifest.dependency_hash.clone()).unwrap(),
+            compiler_version: manifest.compiler_version.clone(),
+            revoke_fence: manifest.revoke_fence as u64,
+            revoke_fence_proven: true,
+            cas_version: 1,
+        };
+        let reference = AuthorizationSegmentReferenceRecord {
+            reference_id: 1,
+            manifest_id: manifest.manifest_id,
+            identity,
+            card_id: manifest.card_id,
+            generation: manifest.generation as u64,
+            ordinal: 0,
+            segment_id: snapshot.segment_id,
+            content_digest: snapshot.content_digest,
+            event_id: manifest.event_id.clone(),
+            operation_id: manifest.operation_id.clone(),
+        };
+        (pointer, manifest, vec![reference], vec![snapshot])
+    }
+
+    #[test]
+    fn strict_reader_and_publisher_share_complete_state_assembly() {
+        let (pointer, manifest, references, segments) = verified_publication_fixture();
+        let state = assemble_verified_published_state(
+            pointer.clone(),
+            &manifest,
+            references.clone(),
+            segments.clone(),
+        )
+        .unwrap();
+        assert_eq!(state.pointer, pointer);
+        assert_eq!(state.segments, segments);
+        assert_eq!(state.references, references);
+        assert_eq!(state.source_generation, 9);
+        assert_eq!(state.generation, 1);
+        assert_eq!(state.total_grant_count, 1);
+    }
+
+    #[test]
+    fn shared_published_state_assembly_rejects_pointer_chain_and_seal_drift() {
+        for dimension in [
+            "proof",
+            "pointer-generation",
+            "pointer-manifest",
+            "pointer-operation",
+            "status",
+            "reference",
+            "segment",
+            "length",
+            "seal",
+        ] {
+            let (mut pointer, mut manifest, mut references, mut segments) =
+                verified_publication_fixture();
+            match dimension {
+                "proof" => pointer.revoke_fence_proven = false,
+                "pointer-generation" => pointer.current_generation += 1,
+                "pointer-manifest" => pointer.manifest_id += 1,
+                "pointer-operation" => pointer.operation_id.push_str("-other"),
+                "status" => manifest.status = MANIFEST_STATUS_READY.to_owned(),
+                "reference" => references[0].event_id.push_str("-other"),
+                "segment" => segments[0].content_digest = Sha256Digest::from_hex(HASH_A).unwrap(),
+                "length" => segments.clear(),
+                "seal" => {
+                    manifest.manifest_digest =
+                        Sha256Digest::from_hex(HASH_A).unwrap().as_bytes().to_vec()
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                assemble_verified_published_state(pointer, &manifest, references, segments)
+                    .is_err(),
+                "{dimension}"
             );
         }
     }

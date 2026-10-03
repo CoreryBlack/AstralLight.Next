@@ -13,6 +13,7 @@ use astral_types::{
     SYSTEM_ACTOR_ID,
 };
 
+use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
 use crate::repository::grant_ledger_adapter::{
     append_delegation_grant_delta_in_tx, build_delegation_add_draft, build_delegation_revoke_draft,
     build_delegation_update_draft, delegation_update_authorization_content_changed,
@@ -1233,7 +1234,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         new: &NewDelegation,
         context: &DelegationMutationContext,
     ) -> Result<DelegationCreateResult, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let now_ts = db_now_in_tx(&mut tx).await?;
         require_future_expiry(now_ts, new.effective_until_ts)?;
         // 同卡自委显式拒绝：先于任何锁/durable 写入的纯判定。
@@ -1297,7 +1298,7 @@ impl DelegationRepository for SqlxDelegationRepository {
             .bind(new.delegate_card_id)
             .bind(&new.resource_type)
             .bind(&new.action_code)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(db_error)?;
 
@@ -1394,7 +1395,7 @@ impl DelegationRepository for SqlxDelegationRepository {
                 },
             )
             .await?;
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(DelegationCreateResult {
                 delegation_id: record.delegation_id,
                 created: false,
@@ -1414,7 +1415,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         .bind(&new.action_code)
         .bind(now_ts)
         .bind(new.effective_until_ts)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         if result.rows_affected() != 1 {
@@ -1443,7 +1444,7 @@ impl DelegationRepository for SqlxDelegationRepository {
             .bind(delegation_id)
             .bind(now_ts)
             .bind(new.effective_until_ts)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         if rule_result.rows_affected() != 1 || rule_result.last_insert_id() == 0 {
@@ -1529,7 +1530,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         )
         .await?;
 
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(DelegationCreateResult {
             delegation_id,
             created: true,
@@ -1541,11 +1542,11 @@ impl DelegationRepository for SqlxDelegationRepository {
         delegation_id: i64,
         context: &DelegationMutationContext,
     ) -> Result<DelegationMutationResult, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         // 无锁预读：仅为在卡锁之前发现 delegator/delegate 端点；最终事实以
         // FOR UPDATE 复读为准，端点漂移整体 fail-closed。
         let Some(probe) = probe_delegation_in_tx(&mut tx, delegation_id).await? else {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(DelegationMutationResult {
                 changed: false,
                 delegate_card_id: None,
@@ -1566,14 +1567,14 @@ impl DelegationRepository for SqlxDelegationRepository {
         // 锁序第 2 步：delegation 行。缺失或非 ACTIVE 一律显式 no-op（重复撤销
         // 不生成新身份、不追加第二条 tombstone）。
         let Some(record) = lock_delegation_in_tx(&mut tx, delegation_id).await? else {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(DelegationMutationResult {
                 changed: false,
                 delegate_card_id: None,
             });
         };
         if record.status != "ACTIVE" {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(DelegationMutationResult {
                 changed: false,
                 delegate_card_id: None,
@@ -1685,7 +1686,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         // Tombstone 落库后按锁定集精确删除旧规则并置 REVOKED。
         let delete_result = sqlx::query("DELETE FROM permission_rule WHERE rule_id = ?")
             .bind(old_rule.rule_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         if delete_result.rows_affected() != 1 {
@@ -1699,7 +1700,7 @@ impl DelegationRepository for SqlxDelegationRepository {
              WHERE delegation_id = ? AND status = 'ACTIVE'",
         )
         .bind(delegation_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         if revoke_result.rows_affected() != 1 {
@@ -1730,7 +1731,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         )
         .await?;
 
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(DelegationMutationResult {
             changed: true,
             delegate_card_id: Some(record.delegate_card_id),
@@ -1745,7 +1746,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         effective_until_ts: i64,
         context: &DelegationMutationContext,
     ) -> Result<DelegationMutationResult, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let now_ts = db_now_in_tx(&mut tx).await?;
         require_future_expiry(now_ts, effective_until_ts)?;
 
@@ -1765,7 +1766,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         // 无锁预读：仅为在卡锁之前发现 delegator/delegate 端点；事实以 FOR UPDATE
         // 复读为准，端点漂移整体 fail-closed。
         let Some(probe) = probe_delegation_in_tx(&mut tx, delegation_id).await? else {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(DelegationMutationResult {
                 changed: false,
                 delegate_card_id: None,
@@ -1784,14 +1785,14 @@ impl DelegationRepository for SqlxDelegationRepository {
         }
         // 锁序第 2 步：delegation 行；缺失或非 ACTIVE 显式 no-op。
         let Some(record) = lock_delegation_in_tx(&mut tx, delegation_id).await? else {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(DelegationMutationResult {
                 changed: false,
                 delegate_card_id: None,
             });
         };
         if record.status != "ACTIVE" {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(DelegationMutationResult {
                 changed: false,
                 delegate_card_id: None,
@@ -1878,7 +1879,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         .bind(action)
         .bind(effective_until_ts)
         .bind(delegation_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         if update_result.rows_affected() > 1 {
@@ -1891,7 +1892,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         // 派生，rule_id churn 不影响账本身份；新规则下界沿用旧 effective_from。
         let delete_result = sqlx::query("DELETE FROM permission_rule WHERE rule_id = ?")
             .bind(old_rule.rule_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         if delete_result.rows_affected() != 1 {
@@ -1913,7 +1914,7 @@ impl DelegationRepository for SqlxDelegationRepository {
             .bind(delegation_id)
             .bind(new_valid_from)
             .bind(effective_until_ts)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         if rule_result.rows_affected() != 1 || rule_result.last_insert_id() == 0 {
@@ -2016,7 +2017,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         )
         .await?;
 
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(DelegationMutationResult {
             changed: true,
             delegate_card_id: Some(record.delegate_card_id),
@@ -2080,12 +2081,12 @@ impl DelegationRepository for SqlxDelegationRepository {
                 "delegation expiry reconciliation requires a positive delegation id, got {delegation_id}"
             )));
         }
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         // 无锁预读：仅为在卡锁之前发现 delegator/delegate 端点（全局锁序要求
         // user_card 先于 permission_delegation 锁）；事实以 FOR UPDATE 复读为准，
         // 端点漂移整体 fail-closed。
         let Some(probe) = probe_delegation_in_tx(&mut tx, delegation_id).await? else {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(DelegationExpiryOutcome::AlreadyTerminal);
         };
         // 锁序第 1 步：本事务涉及的全部 user_card 行按 card_id 升序 FOR UPDATE
@@ -2100,7 +2101,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         // 锁序第 2 步：delegation 行 FOR UPDATE；缺失或已非 ACTIVE 一律显式幂等
         // no-op（重复对账不生成新身份、不追加第二条 tombstone）。
         let Some(record) = lock_delegation_in_tx(&mut tx, delegation_id).await? else {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(DelegationExpiryOutcome::AlreadyTerminal);
         };
         // 锁序第 3 步：端点一致性收敛断言 + 事务内 DB 时钟的到期资格纯判定。
@@ -2109,11 +2110,11 @@ impl DelegationRepository for SqlxDelegationRepository {
         let now_ts = db_now_in_tx(&mut tx).await?;
         match classify_expiry_reconciliation(&record.status, now_ts, record.effective_until_ts) {
             ExpiryReconciliationEligibility::AlreadyTerminal => {
-                tx.commit().await.map_err(db_error)?;
+                tx.commit_consuming().await?;
                 return Ok(DelegationExpiryOutcome::AlreadyTerminal);
             }
             ExpiryReconciliationEligibility::NotYetDue => {
-                tx.commit().await.map_err(db_error)?;
+                tx.commit_consuming().await?;
                 return Ok(DelegationExpiryOutcome::NotYetDue);
             }
             ExpiryReconciliationEligibility::RepairRequired => {
@@ -2220,7 +2221,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         // REVOKE 的审计语义；revoked_at 复用为终态时间戳列）。
         let delete_result = sqlx::query("DELETE FROM permission_rule WHERE rule_id = ?")
             .bind(old_rule.rule_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         if delete_result.rows_affected() != 1 {
@@ -2234,7 +2235,7 @@ impl DelegationRepository for SqlxDelegationRepository {
              WHERE delegation_id = ? AND status = 'ACTIVE'",
         )
         .bind(delegation_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         if expire_result.rows_affected() != 1 {
@@ -2268,7 +2269,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         )
         .await?;
 
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(DelegationExpiryOutcome::Reconciled {
             delegate_card_id: record.delegate_card_id,
         })

@@ -90,6 +90,9 @@ pub use mutations::{
     OrgGrantRevokeCommand, OrgMaskApplyCommand, OrgMaskRemoveCommand, OrgMembershipCreateCommand,
     OrgMembershipRevokeCommand,
 };
+/// 准入证据严格 reader 的 crate 内直通出口（辅助授权镜像回填复用同一读取，
+/// 不复制第二套装配逻辑）。
+pub(crate) use reader::load_admission_evidence_in_pool;
 pub use requests::{
     OrgApproveCommand, OrgCancelCommand, OrgCreateRequestCommand, OrgGovernanceProof,
     OrgRejectCommand, OrgRequestOutcome, OrgRequestView,
@@ -975,6 +978,74 @@ pub(crate) async fn begin_tx(pool: &MySqlPool) -> Result<Transaction<'static, My
     pool.begin().await.map_err(db_err)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// org authority 事实写点 RAII（hub 活动栅栏 + unknown fail-closed）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// org authority 事实写点的 hub 活动栅栏别名。
+///
+/// 合同（fail-closed，对齐 trustgraph `AuthorizationSourceTransaction`）：
+/// - **hub 活动栅栏先于 DB 事务获取**：[`begin_authority_tx`] 在 `pool.begin()`
+///   之前取得 [`crate::memory_projection_hub::OrgSourceTransactionGuard`]
+///   （writers++、mutation_revision++、org 纪元++），返回 `(tx, guard)` 由调用
+///   点同时持有；hub 未安装（纯测试/离线工具/Rabbit 模式）时 guard 为 `None`，
+///   行为与既有裸事务完全一致。
+/// - **commit Err = unknown**：SQL commit 失败无法证明回滚 → 先
+///   [`OrgSourceTransactionGuard::mark_uncertain`]（sticky suspect）再释放
+///   栅栏；绝不重放 source mutation，也绝不伪装回滚。
+/// - **commit Ok = 证明成功**：整体清空辅助 org 镜像条目（纪元推进由栅栏
+///   Drop 完成），旧条目立即不可命中。
+/// - **预提交失败/drop**：释放栅栏并推进纪元；SQLx Drop 只启动回滚，
+///   不能单独证明 durable 回滚完成。已开始 commit 的取消保持 UNKNOWN。
+///
+/// guard 与 tx 以元组成对返回而非包装 struct，是因为 9 个事实写点内部大量
+/// `&mut *tx` executor 用法依赖 `Transaction: DerefMut<Target = MySqlConnection>`
+/// 的单层解引；包装 struct 会使解引层数翻倍并迫使全量改写 executor 位置。
+pub(crate) type OrgAuthorityGuard = crate::memory_projection_hub::OrgSourceTransactionGuard;
+
+/// 事实写点入口：与 [`begin_tx`] 同形状，但成对返回 hub 活动栅栏。
+pub(crate) async fn begin_authority_tx(
+    pool: &MySqlPool,
+) -> Result<(Transaction<'static, MySql>, Option<OrgAuthorityGuard>), AstralError> {
+    let guard = match crate::memory_projection_hub() {
+        Some(hub) => Some(hub.begin_org_source_transaction().ok_or_else(|| {
+            AstralError::Internal("org source writer guard unavailable".to_owned())
+        })?),
+        None => None,
+    };
+    let tx = pool.begin().await.map_err(db_err)?;
+    Ok((tx, guard))
+}
+
+/// 提交 org authority source transaction；仅在 commit 被证明成功后清空 org
+/// 镜像条目，commit 未知先 `mark_uncertain`。guard 恰好在此消费一次。
+pub(crate) async fn commit_authority_tx(
+    tx: Transaction<'static, MySql>,
+    guard: Option<OrgAuthorityGuard>,
+) -> Result<(), sqlx::Error> {
+    if let Some(guard) = guard.as_ref() {
+        guard.mark_commit_started();
+    }
+    let commit_result = tx.commit().await;
+    match &commit_result {
+        Ok(()) => {
+            if let Some(guard) = guard.as_ref() {
+                guard.mark_commit_proven();
+            }
+            if let Some(mirror) = crate::auxiliary_authorization_mirror() {
+                mirror.evict_all_org();
+            }
+        }
+        Err(_) => {
+            if let Some(guard) = guard.as_ref() {
+                guard.mark_uncertain();
+            }
+        }
+    }
+    drop(guard);
+    commit_result
+}
+
 /// 事务内确认受影响行数恰为 1，否则失败（CAS 语义兜底）。
 pub(crate) fn require_affected_one(
     result: &sqlx::mysql::MySqlQueryResult,
@@ -1165,5 +1236,91 @@ mod tests {
                     .contains("org_scope.outbox_complete_kind_forbidden"));
             }
         }
+    }
+
+    // ── org authority 事实写点 RAII：形状锚定 + begin 失败无悬空写者 ──────
+
+    /// 9 个事实写点（mutations×5、approve_request、complete_publish、
+    /// propagate_subtree_root、propagate_dependency_change）必须经
+    /// `begin_authority_tx`/`commit_authority_tx` 携带 hub 栅栏；簿记/只读
+    /// 事务（create/reject/cancel、claim/renew/fail/compile_input、
+    /// complete_outbox_event）必须保持裸 `begin_tx` —— worker 轮询若持栅栏
+    /// 会持续推进辅助纪元使镜像永 miss，请求簿记则不打穿准入事实。
+    #[test]
+    fn authority_fact_writers_are_guarded_and_bookkeeping_stays_plain() {
+        let mutations = include_str!("mutations.rs");
+        assert_eq!(
+            mutations.matches("begin_authority_tx(self.pool())").count(),
+            5
+        );
+        assert_eq!(
+            mutations
+                .matches("commit_authority_tx(tx, authority_guard)")
+                .count(),
+            10
+        );
+        assert!(!mutations.contains("let mut tx = begin_tx("));
+
+        let requests = include_str!("requests.rs");
+        assert_eq!(
+            requests.matches("begin_authority_tx(store.pool())").count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .matches("commit_authority_tx(tx, authority_guard)")
+                .count(),
+            2
+        );
+        assert_eq!(
+            requests
+                .matches("let mut tx = begin_tx(store.pool())")
+                .count(),
+            3
+        );
+
+        let worker = include_str!("worker.rs");
+        assert_eq!(
+            worker.matches("begin_authority_tx(store.pool())").count(),
+            3
+        );
+        assert_eq!(
+            worker
+                .matches("commit_authority_tx(tx, authority_guard)")
+                .count(),
+            6
+        );
+        assert_eq!(
+            worker
+                .matches("let mut tx = begin_tx(store.pool())")
+                .count(),
+            4
+        );
+
+        let hub_module = include_str!("../memory_projection_hub.rs");
+        for required in [
+            "pub fn begin_org_source_transaction",
+            "pub struct OrgSourceTransactionGuard",
+            "fn mark_uncertain",
+            "org source commit outcome unknown",
+        ] {
+            assert!(
+                hub_module.contains(required),
+                "hub must expose the org writer guard contract: {required}"
+            );
+        }
+    }
+
+    /// 栅栏先于 DB 事务：begin 失败（不可达 DB）时 Err 直接上抛，guard（若
+    /// hub 已安装）随 Drop 释放，绝不留下悬空的 writer-active 计数；hub 未
+    /// 安装时行为与既有裸事务完全一致。
+    #[tokio::test]
+    async fn authority_begin_failure_on_unreachable_db_returns_err() {
+        let pool = MySqlPool::connect_lazy("mysql://user:pass@127.0.0.1:1/none").unwrap();
+        let result = begin_authority_tx(&pool).await;
+        assert!(
+            result.is_err(),
+            "unreachable db must fail the authority begin"
+        );
     }
 }

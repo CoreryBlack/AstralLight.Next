@@ -24,8 +24,9 @@ use astral_common::middleware::permission_check_shared::{
     BoxedResponse,
 };
 use astral_db::{
-    check_sod_conflict, check_sod_conflict_with_org, load_org_sod_admission,
-    resolve_resource_ownership, CachedPublishedEvidenceRuleRepository, SqlxRuleRepository,
+    check_sod_conflict_with_context, check_sod_conflict_with_context_and_org,
+    load_org_sod_admission_mirrored, resolve_resource_ownership,
+    CachedPublishedEvidenceRuleRepository, SqlxRuleRepository,
 };
 use astral_types::AstralError;
 
@@ -229,6 +230,31 @@ async fn permission_check_middleware_scoped(
         }
     };
 
+    // Capture once before authority reads; installed-but-unavailable is a refusal.
+    let admission_fence = match astral_db::memory_projection_hub() {
+        None => None,
+        Some(hub) => match hub.capture_authority_fence() {
+            Some(fence) => Some(fence),
+            None => {
+                record_authorization_request(
+                    AuthorizationAdmissionOutcome::RejectedContext,
+                    authorization_started.elapsed(),
+                );
+                tracing::error!(
+                    path = path,
+                    "admission fence unavailable: source writer active or outcome unknown; denying"
+                );
+                return Err(BoxedResponse::new(
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "admission fence unavailable; request denied".to_string(),
+                    )
+                        .into_response(),
+                ));
+            }
+        },
+    };
+
     let query_target_id = request_target_id(&req);
     let mut ctx = match physical_policy_context(req.headers(), resource, action, query_target_id) {
         Ok(ctx) => ctx,
@@ -281,11 +307,28 @@ async fn permission_check_middleware_scoped(
     // engine 的 ALLOW 前复读由此退化为同一缓存条目的恒等克隆，其有效强度由
     // 包装层的读前/读后双读对牌承担。policy-engine 与 astral-db 严格 reader
     // 零改动。见 astral_db::evidence_cache 模块文档。
-    let repo = CachedPublishedEvidenceRuleRepository::new(
-        SqlxRuleRepository::new(state.db.clone()).with_org_scope_enabled(state.org_scope_enabled),
-        state.db.clone(),
-    );
-    let decision = state.engine.evaluate(&ctx, &repo).await;
+    //
+    // 单机内存镜像读面（default-off）：组合进程安装
+    // astral_db::memory_projection_hub 后，命中镜像的直接返回与 durable 同源
+    // 的已验证证据（同一纯装配函数），pending/未预热一律回退既有链路。
+    let decision = if astral_db::memory_mirror_is_installed() {
+        let repo = astral_db::MemoryMirroredRuleRepository::new(
+            CachedPublishedEvidenceRuleRepository::new(
+                SqlxRuleRepository::new(state.db.clone())
+                    .with_org_scope_enabled(state.org_scope_enabled),
+                state.db.clone(),
+            ),
+        )
+        .with_durable_refill(state.db.clone());
+        state.engine.evaluate(&ctx, &repo).await
+    } else {
+        let repo = CachedPublishedEvidenceRuleRepository::new(
+            SqlxRuleRepository::new(state.db.clone())
+                .with_org_scope_enabled(state.org_scope_enabled),
+            state.db.clone(),
+        );
+        state.engine.evaluate(&ctx, &repo).await
+    };
     record_authorization_decision(classify_policy_decision(&decision));
     #[cfg(feature = "e1-observability")]
     {
@@ -385,26 +428,25 @@ async fn permission_check_middleware_scoped(
     }
 
     // SoD 冲突检查（对齐 Java PermissionAspect → SodService.checkDynamicSoD）。
-    // 对组织 ALLOW，先把 PolicyEngine 返回的 provenance 与 fresh organization
-    // publication/member evidence 对牌；读取、钉栅或匹配失败统一进入 unavailable
-    // 分支，绝不把组织持有权限折算为空集。
+    // 对组织 ALLOW，先把 PolicyEngine 返回的 provenance 经 context-aware
+    // mirrored 装配入口与组织准入证据对牌（复合进程 warm 命中走辅助镜像的
+    // strict read contract，零 DB；镜像 miss/pending 回落既有 fresh DB 严格
+    // 读），再进入 deny-only 复核；读取、钉栅或匹配失败统一进入 unavailable
+    // 分支，绝不把组织持有权限折算为空集。非 ORG 判定走 context-aware 纯
+    // deny-only 入口（warm 态同样零 DB；durable 回退与旧路径同语义）。
     if let Some(so_card_id) = card_id {
         let sod_started = Instant::now();
-        let sod_result = match load_org_sod_admission(&state.db, &ctx, &decision).await {
+        let sod_result = match load_org_sod_admission_mirrored(&state.db, &ctx, &decision).await {
             Ok(Some(admission)) => {
-                check_sod_conflict_with_org(&state.db, &ctx, &admission, resource_owner_id).await
-            }
-            Ok(None) => {
-                check_sod_conflict(
+                check_sod_conflict_with_context_and_org(
                     &state.db,
-                    so_card_id,
-                    user_id,
-                    resource,
-                    action,
+                    &ctx,
+                    &admission,
                     resource_owner_id,
                 )
                 .await
             }
+            Ok(None) => check_sod_conflict_with_context(&state.db, &ctx, resource_owner_id).await,
             Err(error) => Err(error),
         };
         match sod_result {
@@ -452,6 +494,34 @@ async fn permission_check_middleware_scoped(
                         .into_response(),
                 ));
             }
+        }
+    }
+
+    // Compare the original fence after all authority reads. A cold installation
+    // can invalidate it; the next request must evaluate from the new baseline.
+    if let Some(fence) = admission_fence {
+        let fence_holds = astral_db::memory_projection_hub()
+            .is_some_and(|hub| hub.authority_fence_matches(fence));
+        if !fence_holds {
+            record_authorization_request(
+                AuthorizationAdmissionOutcome::RejectedContext,
+                authorization_started.elapsed(),
+            );
+            tracing::error!(
+                user_id = ?user_id,
+                card_id = ?card_id,
+                resource = resource,
+                action = action,
+                path = path,
+                "admission fence mismatch: source state changed under an allowed request; denying"
+            );
+            return Err(BoxedResponse::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "admission fence mismatch; request denied".to_string(),
+                )
+                    .into_response(),
+            ));
         }
     }
 
@@ -760,27 +830,56 @@ mod tests {
         assert!(registry.validate("monitor", "arbitrate").is_ok());
     }
 
-    /// 宿主 SoD 分发形状守卫（对齐 sod_check 的源文本守卫惯例）：ORG provenance
-    /// 判定必须先经 shared fresh 准入装配（`load_org_sod_admission`），再进入
-    /// `check_sod_conflict_with_org` deny-only 复核；无 provenance 时回落纯
-    /// `check_sod_conflict`；审计 detail 必须经 shared 有界 provenance helper
-    /// 并通过显式 detail 审计入口传播。本地不再保留任何重复 helper 定义。
+    /// 宿主 SoD 分发与准入栅栏形状守卫（对齐 sod_check 的源文本守卫惯例）：
+    /// ORG provenance 判定必须先经 context-aware mirrored 装配
+    /// （`load_org_sod_admission_mirrored`），再进入
+    /// `check_sod_conflict_with_org` deny-only 复核；无 provenance 时走
+    /// context-aware 纯 deny-only 入口（`check_sod_conflict_with_context`）。
+    /// 准入栅栏必须在**一切权威读取之前**捕获（先于
+    /// `resolve_resource_ownership` 与引擎评估），hub 已安装而栅栏不可得
+    /// （capture None）必须立即 503 拒绝（绝不无栅栏放行），并在 SoD 之后、
+    /// admit 之前最终复核（`authority_fence_matches`）——覆盖
+    /// evaluate/ownership/SoD 全窗口。审计 detail 必须经 shared 有界
+    /// provenance helper 并通过显式 detail 审计入口传播。本地不再保留任何
+    /// 重复 helper 定义。
     #[test]
     fn sod_dispatch_wires_org_provenance_to_fresh_admission_recheck() {
         let source = include_str!("permission_check.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let fence_capture = production
+            .find("capture_authority_fence")
+            .expect("host must capture the opaque admission fence before authorization");
+        let ownership = production
+            .find("resolve_resource_ownership(")
+            .expect("ownership resolution must exist after the fence capture");
         let loader = production
-            .find("load_org_sod_admission(&state.db, &ctx, &decision)")
-            .expect("org dispatch must load fresh admission via the shared helper");
+            .find("load_org_sod_admission_mirrored(&state.db, &ctx, &decision)")
+            .expect("org dispatch must assemble admission via the mirrored context-aware helper");
         let with_org = production
-            .find("check_sod_conflict_with_org(&state.db, &ctx, &admission, resource_owner_id)")
-            .expect("org admission must recheck via check_sod_conflict_with_org");
+            .find("check_sod_conflict_with_context_and_org(")
+            .expect("org admission must recheck via the canonical context-aware and_org entry");
         let plain = production
-            .find("check_sod_conflict(")
-            .expect("non-org decisions must keep the plain deny-only SoD check");
+            .find("check_sod_conflict_with_context(&state.db, &ctx, resource_owner_id)")
+            .expect("non-org decisions must keep the context-aware deny-only SoD check");
+        let fence_recheck = production
+            .find("authority_fence_matches")
+            .expect("host must recheck the admission fence before admitting");
         assert!(
-            loader < with_org && with_org < plain,
-            "dispatch order must be loader -> with_org -> plain fallback"
+            fence_capture < ownership,
+            "the fence must be captured before ANY authority read (ownership resolution included)"
+        );
+        assert!(
+            ownership < loader && loader < with_org && with_org < plain,
+            "dispatch order must be ownership -> mirrored loader -> with_org -> context-aware plain"
+        );
+        assert!(
+            plain < fence_recheck,
+            "the fence recheck must run after the whole SoD window, before admission"
+        );
+        // hub 已安装而栅栏不可得（capture None）→ 立即 503 fail-closed。
+        assert!(
+            production.contains("admission fence unavailable"),
+            "a missing fence on an installed hub must be rejected immediately"
         );
         assert!(
             !production.contains("fn org_provenance_audit_detail"),
@@ -788,9 +887,35 @@ mod tests {
         );
         assert!(
             !production.contains("fn org_sod_admission"),
-            "the fresh admission loader must come from astral_db"
+            "the admission loader must come from astral_db"
         );
         assert!(production.contains("org_provenance_audit_detail(path, provenance)"));
         assert!(production.contains("record_permission_audit_with_request_detail("));
+        // 不允许把可伪造的 u64 计数器当栅栏：复核必须走 opaque AuthorityReadFence。
+        assert!(
+            !production.contains("admission_epoch") && !production.contains("fence_counter"),
+            "admission fence must stay opaque (AuthorityReadFence), not a raw counter"
+        );
+        // 栅栏 token 只允许在一切权威读取之前**捕获一次**；末尾复核只比较已
+        // 捕获栅栏——不存在"重新采样 token 覆盖旧读"的放行路径。
+        assert_eq!(
+            production.matches("capture_authority_fence").count(),
+            1,
+            "the admission fence must be captured exactly once, before authority reads"
+        );
+        // 漂移分支是安全 Pending（503 可重试），绝不折算成放行（栅栏块内
+        // 不出现 Admitted；真正的 Admitted 记录在栅栏复核通过之后）。
+        let fence_block_end = production[fence_recheck..]
+            .find("host_admission")
+            .map_or(production.len(), |index| fence_recheck + index);
+        let mismatch_branch = &production[fence_recheck..fence_block_end];
+        assert!(
+            mismatch_branch.contains("SERVICE_UNAVAILABLE"),
+            "a fence mismatch must be a retryable 503 safe-pending, not an admission"
+        );
+        assert!(
+            !mismatch_branch.contains("AuthorizationAdmissionOutcome::Admitted"),
+            "no admission may be recorded inside or after a failed fence recheck"
+        );
     }
 }

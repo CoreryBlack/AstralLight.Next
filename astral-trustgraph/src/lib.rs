@@ -46,6 +46,10 @@ use service::template_service::TemplateService;
 use service::tenant_service::TenantService;
 use service::user_card_service::UserCardService;
 
+pub use runtime::{run, run_with_listen_addr};
+
+pub mod runtime;
+
 /// 共享应用状态
 #[derive(Clone)]
 pub struct AppState {

@@ -5,15 +5,17 @@ members = [
     "astral-types",
     "astral-common",
     "astral-db",
-    "astral-cache",
     "astral-mq",
     "astral-gateway",
     "astral-identity",
     "astral-trustgraph",
     "astral-monitor",
+    "astral-single-node",
     "e2e-bootstrap",
 ]
-exclude = ["astral-learn", "astral-chat"]
+# Redis 缓存归档库保留源码，使用自包含 manifest；不参与默认 workspace。
+# 需要归档验证时从 astral-cache/Cargo.toml 单独执行。
+exclude = ["astral-learn", "astral-chat", "astral-cache"]
 resolver = "2"
 
 [workspace.package]
@@ -36,6 +38,9 @@ serde_json = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "time", "migrate"] }
 
 # 缓存
+# Redis 仅服务于各 crate 显式 `redis-compat` feature（compat 路径）与 exclude 的
+# 冻结/归档 crate（astral-chat/learn/astral-cache）。默认 workspace 构建（不带
+# redis-compat）零 redis 编译与链接（redis-layer-retirement-20261002）。
 redis = { version = "1", features = ["tokio-comp", "connection-manager", "json"] }
 # 进程内 evidence 缓存（astral-db evidence_cache：TTL/容量/并发驱逐内建）
 moka = { version = "0.12", features = ["future"] }
@@ -49,7 +54,7 @@ argon2 = "0.5"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
-# 跨城市节点证据签名验证（Ed25519，纯验证、default-off，无 runtime 调用方）
+# 跨城市证据签名；启用跨城市 runtime 时用于验证来源与完整性。
 ed25519-dalek = "2"
 
 # 系统指标采集（Monitor collector）

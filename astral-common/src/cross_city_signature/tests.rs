@@ -12,8 +12,9 @@ use std::rc::Rc;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 use super::{
-    cross_city_signature_message, verify_zero_decision_evidence, CrossCityEvidenceReplayKey,
-    CrossCityNodeIdentity, CrossCityNodeKeyRecord, CrossCityNodeKeyResolver, CrossCityReplayGuard,
+    authenticate_zero_decision_evidence, cross_city_signature_message,
+    verify_zero_decision_evidence, CrossCityEvidenceReplayKey, CrossCityNodeIdentity,
+    CrossCityNodeKeyRecord, CrossCityNodeKeyResolver, CrossCityReplayGuard,
     CrossCitySignatureError, CROSS_CITY_NODE_SIGNATURE_DOMAIN_PREFIX,
     CROSS_CITY_SIGNATURE_MESSAGE_LEN,
 };
@@ -1167,10 +1168,13 @@ fn source_shape_no_runtime_caller_inside_astral_common() {
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_default();
             // lib.rs holds the re-export; the module file and the module test
-            // directory are the boundary itself. Any OTHER reference would be
-            // a runtime caller, which is forbidden in this batch.
+            // directory are the boundary itself. The P4 cross-city runtime
+            // module (cross_city_runtime.rs) is the one sanctioned caller of
+            // this boundary; every OTHER reference is still a forbidden
+            // runtime caller in this batch.
             if file_name == "lib.rs"
                 || file_name == "cross_city_signature.rs"
+                || file_name == "cross_city_runtime.rs"
                 || path == module_directory
             {
                 continue;
@@ -1219,4 +1223,161 @@ fn source_shape_lib_rs_only_declares_and_reexports_module() {
     const LIB_SOURCE: &str = include_str!("../lib.rs");
     assert!(LIB_SOURCE.contains("pub mod cross_city_signature;"));
     assert!(LIB_SOURCE.contains("pub use cross_city_signature::"));
+}
+
+// ---------------------------------------------------------------------------
+// Production authentication seam (pure, reservation-free)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn authenticate_succeeds_without_touching_any_replay_guard() {
+    // The production seam: authenticate FIRST, purely; the durable
+    // reservation is the repository's later, separate half.
+    let evidence = golden_signed_evidence(NodeDecision::Allow, "nonce-auth-1", GOLDEN_EXPIRES_AT);
+    let events = event_log();
+    let resolver = golden_resolver(events.clone());
+    let guard = InMemoryReplayGuard::new(events.clone());
+
+    let authenticated =
+        authenticate_zero_decision_evidence(&evidence, GOLDEN_EXPIRES_AT - 1, &resolver)
+            .expect("golden evidence authenticates");
+
+    assert_eq!(
+        authenticated.evidence().evidence_digest,
+        evidence.evidence_digest
+    );
+    assert_eq!(authenticated.evidence().decision, NodeDecision::Allow);
+    assert_eq!(authenticated.signer_identity(), &golden_identity());
+    assert_eq!(authenticated.replay_key().city_id(), GOLDEN_CITY_ID);
+    assert_eq!(authenticated.replay_key().node_id(), GOLDEN_NODE_ID);
+    assert_eq!(authenticated.replay_key().node_epoch(), GOLDEN_NODE_EPOCH);
+    assert_eq!(authenticated.replay_key().nonce(), "nonce-auth-1");
+    assert_eq!(
+        authenticated.replay_key().evidence_digest(),
+        evidence.evidence_digest
+    );
+    assert_eq!(
+        authenticated.authenticated_at_seconds(),
+        GOLDEN_EXPIRES_AT - 1
+    );
+    // PURE: the replay guard is never consulted and nothing is reserved.
+    assert_eq!(events.borrow().as_slice(), &["resolver"]);
+    assert_eq!(guard.reserved_count(), 0);
+}
+
+#[test]
+fn authenticate_and_verify_derive_the_identical_replay_key() {
+    let evidence = golden_signed_evidence(NodeDecision::Allow, "nonce-bind-1", GOLDEN_EXPIRES_AT);
+    let events = event_log();
+    let resolver = golden_resolver(events.clone());
+    let guard = InMemoryReplayGuard::new(events.clone());
+    let now = GOLDEN_EXPIRES_AT - 1;
+
+    let authenticated =
+        authenticate_zero_decision_evidence(&evidence, now, &resolver).expect("authenticates");
+    let verified = verify_zero_decision_evidence(&evidence, now, &resolver, &guard)
+        .expect("the same evidence still verifies end-to-end");
+
+    assert_eq!(
+        authenticated.replay_key(),
+        verified.replay_key(),
+        "the pure seam and the composed verifier must agree on the replay identity"
+    );
+    assert_eq!(guard.reserved_count(), 1);
+    assert!(guard.contains(verified.replay_key()));
+}
+
+#[test]
+fn authenticate_fail_closed_paths_never_reserve_anything() {
+    let now = GOLDEN_EXPIRES_AT - 1;
+    // Expired evidence.
+    let expired = golden_signed_evidence(NodeDecision::Allow, "nonce-exp-1", GOLDEN_EXPIRES_AT);
+    // Tampered signed payload (digest mismatch).
+    let mut tampered =
+        golden_signed_evidence(NodeDecision::Allow, "nonce-tamper-1", GOLDEN_EXPIRES_AT);
+    tampered.nonce = "nonce-tamper-2".to_owned();
+    // Unknown key identity.
+    let unknown_key =
+        golden_signed_evidence(NodeDecision::Allow, "nonce-unknown-1", GOLDEN_EXPIRES_AT);
+    // Forged signature: signed by a DIFFERENT key than the registered one.
+    let forged = signed_evidence_with(
+        &SECOND_SEED,
+        GOLDEN_NODE_ID,
+        NodeDecision::Allow,
+        &golden_proposal_digest(),
+        "nonce-forged-1",
+        GOLDEN_EXPIRES_AT,
+    );
+
+    for (name, evidence, expected) in [
+        (
+            "expired",
+            &expired,
+            CrossCitySignatureError::ExpiredEvidence {
+                now_seconds: now + 1,
+                expires_at: GOLDEN_EXPIRES_AT,
+            },
+        ),
+        (
+            "tampered",
+            &tampered,
+            CrossCitySignatureError::ContractRejected,
+        ),
+        ("forged", &forged, CrossCitySignatureError::InvalidSignature),
+    ] {
+        let events = event_log();
+        let resolver = golden_resolver(events.clone());
+        let guard = InMemoryReplayGuard::new(events.clone());
+        let evaluation_now = if name == "expired" { now + 1 } else { now };
+        let error = authenticate_zero_decision_evidence(evidence, evaluation_now, &resolver)
+            .err()
+            .unwrap_or_else(|| panic!("{name} evidence must be refused"));
+        assert_eq!(error, expected, "{name} must map to its typed failure");
+        assert_eq!(guard.reserved_count(), 0, "{name}: nothing reserved");
+    }
+
+    // Unknown key: an empty registry.
+    let events = event_log();
+    let guard = InMemoryReplayGuard::new(events.clone());
+    let error = authenticate_zero_decision_evidence(
+        &unknown_key,
+        now,
+        &FixedKeyResolver::new(events.clone()),
+    )
+    .expect_err("unknown key must be refused");
+    assert_eq!(error, CrossCitySignatureError::UnknownNodeKey);
+    assert_eq!(guard.reserved_count(), 0);
+}
+
+#[test]
+fn authenticated_evidence_debug_leaks_no_signature_material() {
+    let evidence = golden_signed_evidence(NodeDecision::Allow, "nonce-debug-1", GOLDEN_EXPIRES_AT);
+    let resolver = golden_resolver(event_log());
+    let authenticated =
+        authenticate_zero_decision_evidence(&evidence, GOLDEN_EXPIRES_AT - 1, &resolver)
+            .expect("golden evidence authenticates");
+
+    let rendered = format!("{authenticated:?}");
+    assert!(rendered.contains("CrossCityAuthenticatedEvidence"));
+    assert!(rendered.contains(GOLDEN_NODE_ID));
+    assert!(rendered.contains(&evidence.evidence_digest));
+    assert!(!rendered.contains(&evidence.signature));
+    assert!(!rendered.contains("nonce-debug-1"));
+}
+
+#[test]
+fn source_shape_authentication_seam_is_documented_as_pure_and_reservation_free() {
+    // The seam must be documented as the production durable path's pure half,
+    // and the durable reservation must stay the repository's job.
+    assert!(MODULE_SOURCE.contains("authenticate_zero_decision_evidence"));
+    assert!(MODULE_SOURCE.contains("CrossCityAuthenticatedEvidence"));
+    let auth_position = MODULE_SOURCE
+        .find("pub fn authenticate_zero_decision_evidence")
+        .expect("authentication seam exists");
+    let reserve_position = MODULE_SOURCE
+        .find(".reserve(")
+        .expect("reservation call exists");
+    // The reservation lives in the composed verifier, strictly after the
+    // authentication half in source order.
+    assert!(auth_position < reserve_position);
 }

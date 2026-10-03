@@ -112,7 +112,7 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 ├── policy-engine/             # 权限评估、编译内核、strict evidence gate
 ├── astral-common/             # 配置、错误、API 契约、中间件、审计与可观测性
 ├── astral-db/                 # SQLx repository、迁移、投影与证据持久化
-├── astral-cache/              # Redis 缓存与消息幂等
+├── astral-cache/              # Redis 缓存与消息幂等；已退出 workspace（exclude 自包含 archive，源码零删除，见规范 15.3）
 ├── astral-mq/                 # RabbitMQ 消息契约与传输
 ├── astral-gateway/            # Gateway 身份校验与请求转发
 ├── astral-identity/           # 身份、会话、JWT 与卡片管理

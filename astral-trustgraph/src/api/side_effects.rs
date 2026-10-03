@@ -11,6 +11,7 @@
 use std::sync::OnceLock;
 
 use lapin::Channel;
+#[cfg(feature = "redis-compat")]
 use redis::AsyncCommands;
 use sqlx::MySqlPool;
 
@@ -18,6 +19,7 @@ use astral_db::permission_cache_key;
 use astral_mq::producer::{AuthSessionRevocationPayload, Producer};
 use astral_types::{ProjectionAggregate, EVENT_TYPE_RULE_SET_UPDATE};
 
+use crate::repository::global_admin_repository::revocation_intent_type;
 use crate::repository::projection_repository::{ProjectionRepository, SqlxProjectionRepository};
 
 /// 全局 MQ producer（由 main.rs 在初始化时设置）
@@ -29,8 +31,14 @@ pub fn init_mq_producer(channel: Channel) {
     let _ = MQ_PRODUCER.set(producer);
 }
 
-/// 卡片授权变更落 durable 投影事件（对齐 Java `PermissionRefreshService.requestCardProjection`）。
-///
+pub fn init_local_mq_producer(
+    bus: astral_mq::local_bus::LocalBus,
+    origin_region: impl Into<String>,
+) {
+    let producer = Producer::new_local(bus, origin_region);
+    let _ = MQ_PRODUCER.set(producer);
+}
+
 /// 由写 service 的副作用适配层调用；失败记补偿记录，由 worker 或补偿任务兜底。
 pub(crate) async fn request_card_projection(
     pool: &MySqlPool,
@@ -64,60 +72,81 @@ pub(crate) async fn request_card_projection(
     }
 }
 
-/// 发布会话撤销命令。MQ 不可用时写入 durable compensation，调用方可据此
-/// 将管理员禁用响应标记为 pending，而不是把未发送的撤销当作成功。
-pub(crate) async fn publish_auth_session_revocation(
+/// 发布会话撤销命令。调用方必须先在 source transaction 内写入同一 operation
+/// 的 durable compensation intent；入队或 Rabbit confirm 本身不代表业务完成。
+pub(crate) async fn publish_auth_session_revocation_with_operation(
     pool: &MySqlPool,
     user_id: i64,
     reason: &str,
+    operation_id: &str,
 ) -> Result<(), astral_types::AstralError> {
-    let operation_id = uuid::Uuid::new_v4().to_string();
+    let operation_type = revocation_intent_type(operation_id)?;
+    let intent: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM pending_compensation WHERE entity_id = ? AND op_type = ? ORDER BY id LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(&operation_type)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| {
+        astral_types::AstralError::Database(format!(
+            "auth session revocation intent lookup failed: {error}"
+        ))
+    })?;
+    if intent.is_none() {
+        return Err(astral_types::AstralError::Internal(
+            "auth session revocation has no durable intent".into(),
+        ));
+    }
+    if revocation_outbox_processed(pool, operation_id).await? {
+        return Ok(());
+    }
     let Some(producer) = MQ_PRODUCER.get() else {
-        record_compensation(
-            pool,
-            user_id,
-            &format!("AUTH_SESSION_REVOCATION:{operation_id}:{reason}"),
-            "MQ producer not initialized",
+        return Err(astral_types::AstralError::Internal(
+            "auth session revocation pending: MQ producer not initialized".into(),
+        ));
+    };
+    producer
+        .publish_auth_session_revocation_and_wait(
+            AuthSessionRevocationPayload {
+                message_id: Some(operation_id.to_owned()),
+                operation_id: Some(operation_id.to_owned()),
+                user_id,
+                reason: reason.to_string(),
+                timestamp: astral_mq::producer::now_timestamp(),
+            },
+            std::time::Duration::from_secs(5),
         )
         .await
         .map_err(|error| {
-            astral_types::AstralError::Database(format!(
-                "auth session revocation compensation failed: {error}"
-            ))
+            tracing::warn!(user_id, operation_id, error = %error, "auth session revocation publish pending");
+            astral_types::AstralError::Internal("auth session revocation pending".into())
         })?;
-        return Err(astral_types::AstralError::Internal(
+    if revocation_outbox_processed(pool, operation_id).await? {
+        Ok(())
+    } else {
+        Err(astral_types::AstralError::Internal(
             "auth session revocation pending".into(),
-        ));
-    };
-    match producer
-        .publish_auth_session_revocation(AuthSessionRevocationPayload {
-            message_id: Some(operation_id.clone()),
-            operation_id: Some(operation_id.clone()),
-            user_id,
-            reason: reason.to_string(),
-            timestamp: astral_mq::producer::now_timestamp(),
-        })
-        .await
-    {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            record_compensation(
-                pool,
-                user_id,
-                &format!("AUTH_SESSION_REVOCATION:{operation_id}:{reason}"),
-                &error.to_string(),
-            )
-            .await
-            .map_err(|compensation_error| {
-                astral_types::AstralError::Database(format!(
-                    "auth session revocation failed: {error}; compensation recording failed: {compensation_error}"
-                ))
-            })?;
-            Err(astral_types::AstralError::Internal(
-                "auth session revocation pending".into(),
-            ))
-        }
+        ))
     }
+}
+
+async fn revocation_outbox_processed(
+    pool: &MySqlPool,
+    operation_id: &str,
+) -> Result<bool, astral_types::AstralError> {
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM auth_session_outbox WHERE operation_id = ? AND sequence_number = 1",
+    )
+    .bind(operation_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| {
+        astral_types::AstralError::Database(format!(
+            "auth session revocation proof lookup failed: {error}"
+        ))
+    })?;
+    Ok(status.as_deref() == Some("PROCESSED"))
 }
 
 /// 构造 CARD 维度需要失效的 Redis keys。
@@ -161,7 +190,9 @@ pub async fn evict_card_cache(card_id: i64) {
 ///
 /// projection outbox 的 `tenant_id` 来源于 `user_card` source row；租户存在时
 /// 只删除该租户的精确 `perm:card:{tenant_id}:{card_id}`，同时删除 unscoped
-/// 兼容键。Redis 失败仍仅记录 warning，读侧 generation gate 保持 fail-closed。
+/// 兼容键。Redis 仅在 `ASTRAL_REDIS_PROJECTION_COMPAT` 显式开启时尝试
+/// （default-off 时 Redis-free，见 `delete_redis_keys`）；失败仍仅记录
+/// warning，读侧 generation gate 保持 fail-closed。
 pub async fn evict_card_cache_for_tenant(card_id: i64, tenant_id: Option<i64>) {
     // 同进程 L1 资格缓存即时 evict（性能优化卡点 1）：card_cache_keys 含
     // `perm:card:active:{card_id}`，user_card 状态变更/删除路径经此失效；
@@ -188,6 +219,12 @@ pub async fn evict_eligibility_gate_cache(card_id: i64) {
 
 /// Redis 连接地址选择（纯函数）：`REDIS_URL` 优先，其次 `ASTRAL_REDIS_URL`；
 /// 两者均未设置时返回 `None`，调用方保留 fail-closed 观测而不尝试 localhost。
+/// 仅 `ASTRAL_REDIS_PROJECTION_COMPAT` 显式开启后的路径才会到达本函数
+/// （compat 关闭时 URL 是否存在均不产生 Redis 网络尝试）。
+// 生产调用面在 redis-compat feature 的 eviction 尾段内；纯函数与单测保留在
+// default 构建运行（URL 选择契约不随编译面漂移），故 feature-off 时显式豁免
+// dead_code（非全局 allow）。
+#[cfg_attr(not(feature = "redis-compat"), allow(dead_code))]
 fn redis_url_from_env(
     redis_url: Option<String>,
     astral_redis_url: Option<String>,
@@ -197,35 +234,76 @@ fn redis_url_from_env(
         .filter(|value| !value.trim().is_empty())
 }
 
-/// 共享 Redis DEL 执行器（fire-and-forget）：打不开客户端/连接失败仅记 warning，
-/// 单 key 删除失败不阻断其余 key（side-effect-only 语义）。
+// ─────────────────────────────────────────────────────────────────────────────
+// Redis eviction 兼容门（default-off，严格对齐 astral-common / astral-db 共享契约）
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+fn resolve_redis_projection_compat(raw: Option<&str>) -> bool {
+    astral_common::config::parse_redis_projection_compat(raw).unwrap_or(false)
+}
+
+fn redis_projection_compat_enabled() -> bool {
+    astral_common::config::redis_projection_compat_frozen()
+}
+
+/// 共享 Redis DEL 执行器（fire-and-forget）：compat 门 default-off 时不读
+/// Redis URL、不建连、不发起任何 Redis 网络尝试（Redis-free 默认路径）；
+/// compat 开启后打不开客户端/连接失败仅记 warning，单 key 删除失败不阻断
+/// 其余 key（side-effect-only 语义）。
 async fn delete_redis_keys(keys: &[String], aggregate_id: i64, op: &str) {
     if keys.is_empty() {
         return;
     }
-    let Some(redis_url) = redis_url_from_env(
-        std::env::var("REDIS_URL").ok(),
-        std::env::var("ASTRAL_REDIS_URL").ok(),
-    ) else {
+    // compat 门（default-off）：同一 `ASTRAL_REDIS_PROJECTION_COMPAT` 严格
+    // default-off 门（astral-common 启动校验 / astral-db eligibility 共享契约）。
+    // 必须先于 URL 选择与任何 redis::Client 触碰：仅凭 REDIS_URL 存在绝不
+    // 启用 eviction，默认部署零 Redis 网络尝试。
+    if !redis_projection_compat_enabled() {
         tracing::warn!(
             aggregate_id,
             op,
-            "Redis URL is not configured; cache eviction skipped"
+            "redis projection compat disabled (default-off); Redis cache eviction skipped without connection attempt"
         );
         return;
-    };
-    let Ok(client) = redis::Client::open(redis_url.as_str()) else {
-        tracing::warn!(aggregate_id, op, "failed to open Redis client");
-        return;
-    };
-    let Ok(mut conn) = client.get_connection_manager().await else {
-        tracing::warn!(aggregate_id, op, "failed to connect Redis");
-        return;
-    };
-    for key in keys {
-        if let Err(e) = conn.del::<_, ()>(key).await {
-            tracing::warn!(aggregate_id, op, key = %key, error = %e, "Redis DEL failed");
+    }
+    // redis-compat feature 未编译：compat 门为真的配置已被启动期集中校验拒绝
+    // （astral-common validate_runtime_safety）；此处兜底零网络路径，仅保留
+    // 可观测日志（side-effect-only 语义不变）。
+    #[cfg(feature = "redis-compat")]
+    {
+        let Some(redis_url) = redis_url_from_env(
+            std::env::var("REDIS_URL").ok(),
+            std::env::var("ASTRAL_REDIS_URL").ok(),
+        ) else {
+            tracing::warn!(
+                aggregate_id,
+                op,
+                "Redis URL is not configured; cache eviction skipped"
+            );
+            return;
+        };
+        let Ok(client) = redis::Client::open(redis_url.as_str()) else {
+            tracing::warn!(aggregate_id, op, "failed to open Redis client");
+            return;
+        };
+        let Ok(mut conn) = client.get_connection_manager().await else {
+            tracing::warn!(aggregate_id, op, "failed to connect Redis");
+            return;
+        };
+        for key in keys {
+            if let Err(e) = conn.del::<_, ()>(key).await {
+                tracing::warn!(aggregate_id, op, key = %key, error = %e, "Redis DEL failed");
+            }
         }
+    }
+    #[cfg(not(feature = "redis-compat"))]
+    {
+        tracing::warn!(
+            aggregate_id,
+            op,
+            "redis projection compat flag enabled but redis-compat feature not compiled; Redis eviction skipped"
+        );
     }
 }
 
@@ -302,7 +380,7 @@ pub(crate) async fn record_compensation(
 }
 
 async fn retry_auth_session_revocation(
-    _pool: &MySqlPool,
+    pool: &MySqlPool,
     user_id: i64,
     operation_id: &str,
     reason: &str,
@@ -312,21 +390,45 @@ async fn retry_auth_session_revocation(
             "auth session revocation operation id is empty".into(),
         ));
     }
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM auth_session_outbox WHERE operation_id = ? AND sequence_number = 1",
+    )
+    .bind(operation_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| {
+        astral_types::AstralError::Database(format!(
+            "auth session outbox proof lookup failed: {error}"
+        ))
+    })?;
+    if status.as_deref() == Some("PROCESSED") {
+        return Ok(());
+    }
     let Some(producer) = MQ_PRODUCER.get() else {
         return Err(astral_types::AstralError::Internal(
             "MQ producer not initialized".into(),
         ));
     };
     producer
-        .publish_auth_session_revocation(AuthSessionRevocationPayload {
-            message_id: Some(operation_id.to_string()),
-            operation_id: Some(operation_id.to_string()),
-            user_id,
-            reason: reason.to_string(),
-            timestamp: astral_mq::producer::now_timestamp(),
-        })
+        .publish_auth_session_revocation_and_wait(
+            AuthSessionRevocationPayload {
+                message_id: Some(operation_id.to_string()),
+                operation_id: Some(operation_id.to_string()),
+                user_id,
+                reason: reason.to_string(),
+                timestamp: astral_mq::producer::now_timestamp(),
+            },
+            std::time::Duration::from_secs(5),
+        )
         .await
-        .map_err(|error| astral_types::AstralError::Internal(error.to_string()))
+        .map_err(|error| astral_types::AstralError::Internal(error.to_string()))?;
+    if revocation_outbox_processed(pool, operation_id).await? {
+        Ok(())
+    } else {
+        Err(astral_types::AstralError::Internal(
+            "auth session revocation pending".into(),
+        ))
+    }
 }
 
 async fn retry_find_bound_cards(pool: &MySqlPool, rule_set_id: i64) -> Result<(), String> {
@@ -397,17 +499,9 @@ pub async fn retry_pending_compensations(
         }
 
         let result: Result<(), String> = {
-            let mut parts = op_type.splitn(4, ':');
+            let mut parts = op_type.splitn(3, ':');
             let base_type = parts.next().unwrap_or_default();
             let detail = parts.next().unwrap_or_default();
-            let reason = if base_type == "AUTH_SESSION_REVOCATION" {
-                parts
-                    .next()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("GLOBAL_ADMIN_DISABLED")
-            } else {
-                "GLOBAL_ADMIN_DISABLED"
-            };
             let event_type = if base_type == "REQUEST_PROJECTION" {
                 detail
             } else {
@@ -478,11 +572,16 @@ pub async fn retry_pending_compensations(
                     );
                     Ok(())
                 }
-                "AUTH_SESSION_REVOCATION" => {
-                    retry_auth_session_revocation(pool, entity_id, detail, reason)
-                        .await
-                        .map_err(|e| e.to_string())
-                }
+                "AUTH_SESSION_REVOCATION" => retry_auth_session_revocation(
+                    pool,
+                    entity_id,
+                    detail
+                        .strip_prefix("AUTH_SESSION_REVOCATION:")
+                        .unwrap_or(detail),
+                    "GLOBAL_ADMIN_REVOCATION_RECOVERY",
+                )
+                .await
+                .map_err(|e| e.to_string()),
                 "FIND_BOUND_CARDS" => retry_find_bound_cards(pool, entity_id).await,
                 _ => {
                     // 未知操作：结构化告警 + 明确终态，不再滞留 PROCESSING
@@ -618,6 +717,56 @@ mod tests {
         );
         // 两者均未设置时不尝试 localhost，返回 None。
         assert_eq!(redis_url_from_env(None, None), None);
+    }
+
+    /// compat 门解析矩阵：与 `astral_db::eligibility` 的严格 bool 契约一致
+    /// （trim + ASCII 大小写不敏感；缺失/空白/false/未知值一律 fail-closed
+    /// 关闭，绝不让 REDIS_URL 的存在替代显式 compat 开启）。
+    #[test]
+    fn redis_projection_compat_resolves_strict_bool_default_off() {
+        // 缺失 / 空白 / false：default-off。
+        assert!(!resolve_redis_projection_compat(None));
+        assert!(!resolve_redis_projection_compat(Some("")));
+        assert!(!resolve_redis_projection_compat(Some("  ")));
+        assert!(!resolve_redis_projection_compat(Some("false")));
+        assert!(!resolve_redis_projection_compat(Some("False")));
+        // 显式 true（trim + ASCII 大小写不敏感）才开启。
+        assert!(resolve_redis_projection_compat(Some("true")));
+        assert!(resolve_redis_projection_compat(Some("TRUE")));
+        assert!(resolve_redis_projection_compat(Some(" true ")));
+        // 未知值绝不启用（宁可少一次 eviction，不可误开 Redis 路径）。
+        for rejected in ["1", "0", "yes", "on", "enabled", "garbage"] {
+            assert!(
+                !resolve_redis_projection_compat(Some(rejected)),
+                "value {rejected:?} must stay fail-closed"
+            );
+        }
+    }
+
+    /// 【Redis eviction 兼容门结构锁定】`delete_redis_keys` 必须先过
+    /// `ASTRAL_REDIS_PROJECTION_COMPAT` 严格 default-off 门，再读 Redis URL、
+    /// 再触碰 `redis::Client`：默认（compat-off / Redis-free）即使 `REDIS_URL`
+    /// 存在也绝不发起任何 Redis 网络尝试（半开路径封堵）。
+    #[test]
+    fn delete_redis_keys_gates_on_compat_flag_before_url_and_client() {
+        let source = include_str!("side_effects.rs");
+        let body_start = source
+            .find("async fn delete_redis_keys")
+            .expect("delete_redis_keys executor must remain");
+        let body = &source[body_start..];
+        let gate = body
+            .find("redis_projection_compat_enabled()")
+            .expect("delete_redis_keys must consult the compat gate");
+        let url = body
+            .find("redis_url_from_env(")
+            .expect("URL selection must remain for the compat-enabled path");
+        let client_open = body
+            .find("redis::Client::open")
+            .expect("DEL executor must remain");
+        assert!(
+            gate < url && url < client_open,
+            "compat gate must precede URL selection and redis::Client::open in delete_redis_keys"
+        );
     }
 
     /// 【读链切换批次 3 结构锁定】快照重建家族退役后，本模块不得再出现任何

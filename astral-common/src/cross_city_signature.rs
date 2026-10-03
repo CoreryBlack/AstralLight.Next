@@ -65,18 +65,40 @@
 //!
 //! This module is NOT an authorization decision and cannot replace
 //! `PolicyEngine.evaluate()`. Signature verification is only a mandatory
-//! precondition for the future durable writer: evidence DB insertion, city
-//! vote certificate derivation, and activation minting must consume only
-//! [`CrossCityVerifiedEvidence`]. Those callers do not exist in this batch.
+//! precondition for the durable writer: evidence DB insertion, city vote
+//! certificate derivation, and activation minting must consume only
+//! cryptographically authenticated evidence.
+//!
+//! # Production admission seam (authenticate first, then durable reservation)
+//!
+//! The replay-reservation half of this boundary is deliberately split in two
+//! so production can be durable:
+//!
+//! 1. [`authenticate_zero_decision_evidence`] performs every purely
+//!    cryptographic step (steps 1-6 above) WITHOUT reserving anything and
+//!    returns the opaque [`CrossCityAuthenticatedEvidence`] capability;
+//! 2. the production repository (astral-db) then durably reserves the
+//!    [`CrossCityEvidenceReplayKey`] and inserts the verified vote inside ONE
+//!    short source transaction.
+//!
+//! The synchronous [`verify_zero_decision_evidence`] +
+//! [`CrossCityReplayGuard`] composition stays public for in-process
+//! composition and tests. An in-memory guard is NOT durable proof: process
+//! restart loses it and concurrent replicas never share it, so it must never
+//! be presented as production replay protection.
 //!
 //! # Replay-guard durability caveat
 //!
-//! The repository layer cannot authenticate evidence or durably reserve nonces
-//! yet. The [`CrossCityReplayGuard`] trait is the contract the future writer
-//! must implement *in the same durable transaction as the evidence/vote
-//! insert*. An in-memory `HashSet` (as used by the tests below) proves nothing
-//! about production durability and must never be presented as replay proof:
-//! process restart loses it, and concurrent replicas do not share it.
+//! Authentication ([`authenticate_zero_decision_evidence`]) and verification
+//! ([`verify_zero_decision_evidence`]) are pure: neither one is durable proof.
+//! The [`CrossCityReplayGuard`] trait is the contract the production writer
+//! implements *in the same durable transaction as the evidence/vote insert*.
+//! An in-memory `HashSet` (as used by the tests below) proves nothing about
+//! production durability and must never be presented as replay proof: process
+//! restart loses it, and concurrent replicas do not share it. The production
+//! durable reservation seam lives in the astral-db cross-city runtime
+//! repository, which durably reserves the nonce and inserts the verified vote
+//! in one transaction.
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use thiserror::Error;
@@ -507,6 +529,197 @@ pub trait CrossCityReplayGuard {
 }
 
 // ---------------------------------------------------------------------------
+// Authentication seam (pure, reservation-free)
+// ---------------------------------------------------------------------------
+
+/// Opaque capability proving that one [`ZeroDecisionEvidence`] passed the full
+/// cryptographic authentication boundary (strict contract + canonical form +
+/// exact key identity + strict Ed25519 verification) WITHOUT any replay
+/// reservation.
+///
+/// This is the pure first half of the production admission flow. The original
+/// synchronous [`CrossCityReplayGuard`] trait cannot express a DURABLE
+/// reservation (its `reserve` is sync and an in-process guard proves nothing
+/// about production durability), so the production path is deliberately split:
+///
+/// 1. `authenticate_zero_decision_evidence` (THIS seam) performs every purely
+///    cryptographic step - no I/O, no reservation, no capability minted for
+///    the replay half;
+/// 2. the production repository (astral-db) then performs the DURABLE replay
+///    reservation and the verified-vote INSERT inside ONE short source
+///    transaction, so either both commit or neither does. An in-memory guard
+///    must never be presented as that durable reservation.
+///
+/// The constructor and all fields are private: the only way to obtain an
+/// instance is `authenticate_zero_decision_evidence`, so no raw or unsigned
+/// evidence can be smuggled into the durable writer behind this type.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CrossCityAuthenticatedEvidence {
+    evidence: ZeroDecisionEvidence,
+    signer: CrossCityNodeIdentity,
+    replay_key: CrossCityEvidenceReplayKey,
+    authenticated_at_seconds: i64,
+}
+
+impl CrossCityAuthenticatedEvidence {
+    /// Private constructor - the only producer is
+    /// `authenticate_zero_decision_evidence`.
+    fn new(
+        evidence: ZeroDecisionEvidence,
+        signer: CrossCityNodeIdentity,
+        replay_key: CrossCityEvidenceReplayKey,
+        authenticated_at_seconds: i64,
+    ) -> Self {
+        Self {
+            evidence,
+            signer,
+            replay_key,
+            authenticated_at_seconds,
+        }
+    }
+
+    /// Read access to the authenticated evidence (signature cryptographically
+    /// verified; nonce not yet durably reserved).
+    pub fn evidence(&self) -> &ZeroDecisionEvidence {
+        &self.evidence
+    }
+
+    /// Consume the capability into the authenticated evidence.
+    pub fn into_evidence(self) -> ZeroDecisionEvidence {
+        self.evidence
+    }
+
+    /// The exact signer identity the signature was verified against.
+    pub const fn signer_identity(&self) -> &CrossCityNodeIdentity {
+        &self.signer
+    }
+
+    /// The replay key the production repository must durably reserve (in the
+    /// same transaction as the verified-vote insert) before the vote counts.
+    pub const fn replay_key(&self) -> &CrossCityEvidenceReplayKey {
+        &self.replay_key
+    }
+
+    /// The `now_seconds` the authentication was performed at.
+    pub const fn authenticated_at_seconds(&self) -> i64 {
+        self.authenticated_at_seconds
+    }
+}
+
+impl std::fmt::Debug for CrossCityAuthenticatedEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Bounded, secret-free debug: identity, decision, public digest, and
+        // authentication metadata only. The signature bytes and every other
+        // evidence field are deliberately omitted (`..`).
+        formatter
+            .debug_struct("CrossCityAuthenticatedEvidence")
+            .field("signer", &self.signer)
+            .field("decision", &self.evidence.decision)
+            .field("evidence_digest", &self.evidence.evidence_digest)
+            .field("authenticated_at_seconds", &self.authenticated_at_seconds)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Authenticate one [`ZeroDecisionEvidence`] against every purely
+/// cryptographic rule of the cross-city boundary, WITHOUT reserving the
+/// replay nonce.
+///
+/// This is steps 1-6 of `verify_zero_decision_evidence` with the reservation
+/// step deliberately removed:
+///
+/// 1. strict contract validation including the exclusive expiry bound;
+/// 2. strict canonical-form equality (no padded/normalizable input);
+/// 3. exact signer identity derivation;
+/// 4. strict signature decoding (exactly 128 lowercase hex characters);
+/// 5. exact key-identity resolution plus mismatch re-check;
+/// 6. strict Ed25519 verification over the pinned, domain-separated message.
+///
+/// The replay reservation is NOT performed here: it is the production
+/// repository's job, executed DURABLY (one SQL transaction together with the
+/// verified-vote insert). The synchronous
+/// [`verify_zero_decision_evidence`] + [`CrossCityReplayGuard`] composition
+/// stays available for in-process composition and tests; it must never be
+/// presented as production replay proof (process restart loses an in-memory
+/// guard, and concurrent replicas never share one).
+///
+/// Every failure is fail-closed and typed ([`CrossCitySignatureError`]); no
+/// error variant of this function implies anything about the nonce - the
+/// reservation simply never happens on any failure path.
+pub fn authenticate_zero_decision_evidence<R>(
+    evidence: &ZeroDecisionEvidence,
+    now_seconds: i64,
+    resolver: &R,
+) -> Result<CrossCityAuthenticatedEvidence, CrossCitySignatureError>
+where
+    R: CrossCityNodeKeyResolver,
+{
+    // Step 1: strict contract validation including the exclusive expiry bound.
+    match evidence.validate_at(now_seconds) {
+        Ok(()) => {}
+        Err(CrossCityContractError::Expired {
+            now_seconds,
+            expires_at,
+            ..
+        }) => {
+            return Err(CrossCitySignatureError::ExpiredEvidence {
+                now_seconds,
+                expires_at,
+            });
+        }
+        Err(_) => return Err(CrossCitySignatureError::ContractRejected),
+    }
+
+    // Step 2: strict canonical-form equality. `validate_at` tolerates padded
+    // inputs in a few places (it normalizes before checking); byte equality
+    // with the canonical re-derivation rejects every non-canonical encoding
+    // (padded identifiers, padded signature) before any resolver call.
+    match evidence.canonicalized() {
+        Ok(canonical) if canonical == *evidence => {}
+        _ => return Err(CrossCitySignatureError::ContractRejected),
+    }
+
+    // Step 3: exact signer identity derived from the validated fields.
+    let signer = CrossCityNodeIdentity::from_evidence(evidence)?;
+
+    // Step 4: strict signature decoding - exactly 128 lowercase hex characters.
+    let signature = decode_signature(&evidence.signature)?;
+
+    // Step 5: exact key-identity resolution plus mismatch re-check.
+    let record = resolver.resolve_node_key(&signer)?;
+    if record.identity() != &signer {
+        return Err(CrossCitySignatureError::NodeKeyMismatch);
+    }
+
+    // Step 6: strict Ed25519 verification over the pinned, domain-separated
+    // message. `verify_strict` rejects weak keys and malleable encodings.
+    let verifying_key = VerifyingKey::from_bytes(record.public_key())
+        .map_err(|_| CrossCitySignatureError::MalformedPublicKey)?;
+    let message = cross_city_signature_message(&evidence.evidence_digest)?;
+    verifying_key
+        .verify_strict(&message, &signature)
+        .map_err(|_| CrossCitySignatureError::InvalidSignature)?;
+
+    // The replay key is derived but NOT reserved: the durable reservation is
+    // the production repository's responsibility, in the same transaction as
+    // the verified-vote insert.
+    let replay_key = CrossCityEvidenceReplayKey::new(
+        signer.city_id(),
+        signer.node_id(),
+        signer.node_epoch(),
+        &evidence.nonce,
+        &evidence.evidence_digest,
+    )?;
+
+    Ok(CrossCityAuthenticatedEvidence::new(
+        evidence.clone(),
+        signer,
+        replay_key,
+        now_seconds,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Verified-evidence capability
 // ---------------------------------------------------------------------------
 
@@ -639,62 +852,16 @@ where
     R: CrossCityNodeKeyResolver,
     G: CrossCityReplayGuard,
 {
-    // Step 1: strict contract validation including the exclusive expiry bound.
-    match evidence.validate_at(now_seconds) {
-        Ok(()) => {}
-        Err(CrossCityContractError::Expired {
-            now_seconds,
-            expires_at,
-            ..
-        }) => {
-            return Err(CrossCitySignatureError::ExpiredEvidence {
-                now_seconds,
-                expires_at,
-            });
-        }
-        Err(_) => return Err(CrossCitySignatureError::ContractRejected),
-    }
-
-    // Step 2: strict canonical-form equality. `validate_at` tolerates padded
-    // inputs in a few places (it normalizes before checking); byte equality
-    // with the canonical re-derivation rejects every non-canonical encoding
-    // (padded identifiers, padded signature) before any resolver or guard call.
-    match evidence.canonicalized() {
-        Ok(canonical) if canonical == *evidence => {}
-        _ => return Err(CrossCitySignatureError::ContractRejected),
-    }
-
-    // Step 3: exact signer identity derived from the validated fields.
-    let signer = CrossCityNodeIdentity::from_evidence(evidence)?;
-
-    // Step 4: strict signature decoding - exactly 128 lowercase hex characters.
-    let signature = decode_signature(&evidence.signature)?;
-
-    // Step 5: exact key-identity resolution plus mismatch re-check.
-    let record = resolver.resolve_node_key(&signer)?;
-    if record.identity() != &signer {
-        return Err(CrossCitySignatureError::NodeKeyMismatch);
-    }
-
-    // Step 6: strict Ed25519 verification over the pinned, domain-separated
-    // message. `verify_strict` rejects weak keys and malleable encodings.
-    let verifying_key = VerifyingKey::from_bytes(record.public_key())
-        .map_err(|_| CrossCitySignatureError::MalformedPublicKey)?;
-    let message = cross_city_signature_message(&evidence.evidence_digest)?;
-    verifying_key
-        .verify_strict(&message, &signature)
-        .map_err(|_| CrossCitySignatureError::InvalidSignature)?;
+    // Steps 1-6 (contract, canonical form, identity, signature decoding, key
+    // resolution, strict verification) are delegated to the pure
+    // authentication seam; the reservation step below stays AFTER them, so
+    // unverifiable input never reaches the guard.
+    let authenticated = authenticate_zero_decision_evidence(evidence, now_seconds, resolver)?;
 
     // Step 7: atomic replay reservation - only AFTER cryptographic success.
     // A duplicate nonce is a typed replay; every other guard outcome fails
     // closed without ever producing the capability.
-    let replay_key = CrossCityEvidenceReplayKey::new(
-        signer.city_id(),
-        signer.node_id(),
-        signer.node_epoch(),
-        &evidence.nonce,
-        &evidence.evidence_digest,
-    )?;
+    let replay_key = authenticated.replay_key.clone();
     match replay_guard.reserve(&replay_key) {
         Ok(()) => {}
         Err(CrossCitySignatureError::NonceReplay) => {
@@ -703,11 +870,18 @@ where
         Err(_) => return Err(CrossCitySignatureError::ReplayGuardUnavailable),
     }
 
-    Ok(CrossCityVerifiedEvidence::new(
-        evidence.clone(),
+    let CrossCityAuthenticatedEvidence {
+        evidence,
         signer,
         replay_key,
-        now_seconds,
+        authenticated_at_seconds: verified_at_seconds,
+    } = authenticated;
+
+    Ok(CrossCityVerifiedEvidence::new(
+        evidence,
+        signer,
+        replay_key,
+        verified_at_seconds,
     ))
 }
 

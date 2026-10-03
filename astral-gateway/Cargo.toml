@@ -5,6 +5,14 @@ edition = "2021"
 description = "AstralLight API Gateway — JWT 认证 + 路由转发 + 限流"
 license.workspace = true
 
+# Redis 编译层退役（redis-layer-retirement-20261002）：默认构建零 redis 编译
+# 链接；strict MySQL durable facts 是唯一默认会话判定面。历史 Redis 会话判定/
+# 租户状态缓存 compat 路径收敛到本显式 feature（default-off），并同步传播
+# astral-common 的同名 marker feature（启动期集中校验依赖它判定 feature-off
+# + compat 旗标开启的拒绝语义）。
+[features]
+redis-compat = ["dep:redis", "astral-common/redis-compat"]
+
 [[bin]]
 name = "astral-gateway"
 path = "src/main.rs"
@@ -12,6 +20,13 @@ path = "src/main.rs"
 [dependencies]
 astral-common = { path = "../astral-common" }
 astral-types = { path = "../astral-types" }
+# Redis-free 会话判定（strict MySQL durable facts）：Gateway 复用 astral-db 的
+# 会话状态仓储与连接池构建（astral-common::session_projection_store 组合层）。
+astral-db = { path = "../astral-db" }
+sqlx = { workspace = true }
+# 组合进程单写者判定（global LocalBus 安装检测）：镜像 positive allow 仅在
+# 单写者组合 runtime 下允许；独立多写者 Gateway 强制 strict DB。
+astral-mq = { path = "../astral-mq" }
 
 axum = { workspace = true, features = ["ws"] }
 tokio = { workspace = true }
@@ -22,7 +37,7 @@ tower-http = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-redis = { workspace = true }
+redis = { workspace = true, optional = true }
 config = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

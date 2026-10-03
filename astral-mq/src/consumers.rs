@@ -4,25 +4,29 @@
 //! 每个消费者在独立的 tokio 任务中运行，互不阻塞。
 
 use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use astral_db::{insert_or_increment_terminal, AuditQuarantineInput, AuditQuarantineStatus};
+use astral_db::{
+    insert_or_increment_terminal, AuditQuarantineInput, AuditQuarantineStatus, LocalMessageError,
+    LocalMessageRepository, LOCAL_MESSAGE_MAX_ATTEMPTS,
+};
 use futures_util::StreamExt;
 use lapin::message::Delivery;
 use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions};
 use lapin::types::{FieldTable, ShortString};
 use lapin::{Channel, Confirmation};
+#[cfg(feature = "redis-compat")]
 use redis::AsyncCommands;
 use serde_json::Value;
 use sqlx::MySqlPool;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::config::{
-    QueueDef, EXCHANGE_DLX, MAX_RETRY, QUEUES, QUEUE_AUDIT_LOG, QUEUE_AUTH_SESSION_REVOCATION,
-    QUEUE_LOGIN_EVENT,
+    QueueDef, EXCHANGE_DLX, MAX_RETRY, QUEUES, QUEUE_AUDIT_LOG, QUEUE_AUTHORIZATION_INVALIDATION,
+    QUEUE_AUTH_SESSION_REVOCATION, QUEUE_LOGIN_EVENT,
 };
 use crate::consumer::{
     canonical_legacy_message_id, claim_message, complete_message, decode_delivery,
@@ -31,10 +35,21 @@ use crate::consumer::{
     IdempotencyClaim,
 };
 use crate::error::MqError;
+use crate::local_bus::{LocalBus, LocalBusError};
 use crate::producer::{AuditLogPayload, AuthSessionRevocationPayload, LoginEventPayload};
+
+/// Hard bound for a single recovery-loop database call. A hung statement must
+/// never stall the fallback loop, and a timed-out call is an unproven outcome
+/// (suspect + backoff), never a success.
+const LOCAL_INVALIDATION_DB_CALL_BOUND: Duration = Duration::from_secs(3);
 
 /// 会话撤销消费所需 DB（由 identity main.rs 注入）
 static SESSION_REVOCATION_DB: OnceLock<MySqlPool> = OnceLock::new();
+
+/// 会话撤销消费所需 Redis projection manager（由 identity runtime 注入；仅
+/// redis-compat feature 编译——feature-off 构建中 compat 投影面不存在）。
+#[cfg(feature = "redis-compat")]
+static SESSION_REVOCATION_REDIS: OnceLock<redis::aio::ConnectionManager> = OnceLock::new();
 
 /// 登录事件消费所需 DB（由 identity main.rs 注入）
 static LOGIN_EVENT_DB: OnceLock<MySqlPool> = OnceLock::new();
@@ -47,6 +62,14 @@ pub fn set_session_revocation_db(pool: MySqlPool) {
     let _ = SESSION_REVOCATION_DB.set(pool);
 }
 
+/// 注入会话撤销 consumer 使用的 Redis projection manager（仅 identity runtime
+/// 调用一次）。仅 redis-compat feature 编译；feature-off 构建中本 API 不存在
+/// ——redis 编译层退役的显式 BREAKING 收敛点，登记于架构文档。
+#[cfg(feature = "redis-compat")]
+pub fn set_session_revocation_redis(redis: redis::aio::ConnectionManager) {
+    let _ = SESSION_REVOCATION_REDIS.set(redis);
+}
+
 /// 注入登录事件 consumer 使用的 DB pool（仅 identity main.rs 调用一次）
 pub fn set_login_event_db(pool: MySqlPool) {
     let _ = LOGIN_EVENT_DB.set(pool);
@@ -57,7 +80,811 @@ pub fn set_audit_log_db(pool: MySqlPool) {
     let _ = AUDIT_LOG_DB.set(pool);
 }
 
-/// Generic envelope retained for compatibility with callers that only need to
+/// Dispatch one delivery from the composite process bus. The bus admission is
+/// transient; the handlers retain their existing durable/idempotent boundaries.
+pub async fn dispatch_local_delivery(
+    delivery: &crate::local_bus::LocalDelivery,
+) -> Result<(), String> {
+    match delivery.queue_name {
+        QUEUE_AUDIT_LOG => {
+            let payload: AuditLogPayload =
+                serde_json::from_value(delivery.envelope.payload.clone())
+                    .map_err(|error| error.to_string())?;
+            handle_audit_log(&delivery.envelope.message_id, &payload)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        QUEUE_LOGIN_EVENT => {
+            let payload: LoginEventPayload =
+                serde_json::from_value(delivery.envelope.payload.clone())
+                    .map_err(|error| error.to_string())?;
+            handle_login_event(&delivery.envelope.message_id, &payload)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        QUEUE_AUTH_SESSION_REVOCATION => {
+            let payload: AuthSessionRevocationPayload =
+                serde_json::from_value(delivery.envelope.payload.clone())
+                    .map_err(|error| error.to_string())?;
+            handle_auth_session_revocation(&delivery.envelope.message_id, &payload)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        QUEUE_AUTHORIZATION_INVALIDATION => dispatch_invalidation_event(&delivery.envelope).await,
+        _ => Err("local queue has no owner".into()),
+    }
+}
+
+/// Apply one delivery from the composite process bus on the in-process side of
+/// a typed invalidation notification.
+///
+/// Public for the fanout runtime adapter: the Rabbit fanout inbox worker reuses
+/// this exact entrypoint, so the local bus and the cross-node transport share
+/// one invalidation contract and one ownership boundary.
+///
+/// The envelope is revalidated before any mutation. Evidence notifications
+/// create a pending freshness fence; eligibility notifications invalidate the
+/// node's source-derived auxiliary/session mirrors (hub-installed runtimes bump
+/// the auxiliary epochs and clear positive read caches) and evict the L1
+/// card-activity cache; session notifications update the local acceleration
+/// registry. None of these operations is a durable completion proof, and
+/// applying an invalidation is never an authorization READY signal — the read
+/// gate stays PENDING/DENY until the authorization projection path itself
+/// proves READY. Every branch is idempotent, so a recovery replay of the same
+/// committed event is safe.
+pub async fn dispatch_invalidation_event(
+    envelope: &crate::envelope::MessageEnvelope,
+) -> Result<(), String> {
+    let event = crate::invalidation::InvalidationEvent::from_envelope(envelope)
+        .map_err(|error| error.to_string())?;
+    dispatch_typed_invalidation(event, &envelope.message_id, &envelope.operation_id)
+}
+
+/// Typed invalidation dispatch shared by the local bus and the fanout adapter.
+///
+/// `event_id` / `operation_id` are the stable provenance ids committed with the
+/// event (envelope message/operation ids); the evidence fence dedupes on them,
+/// so a recovery replay of the same committed event is idempotent.
+pub fn dispatch_typed_invalidation(
+    event: crate::invalidation::InvalidationEvent,
+    event_id: &str,
+    operation_id: &str,
+) -> Result<(), String> {
+    match event {
+        crate::invalidation::InvalidationEvent::EvidenceInvalidated(value) => {
+            let hub = astral_db::memory_projection_hub()
+                .ok_or_else(|| "memory projection hub is not installed".to_owned())?;
+            hub.apply_evidence_invalidation(astral_db::EvidenceInvalidationRequest {
+                tenant_id: value.tenant_id,
+                card_id: value.card_id,
+                aggregate_type: value.aggregate_type,
+                aggregate_id: value.aggregate_id,
+                event_id: event_id.to_owned(),
+                operation_id: operation_id.to_owned(),
+                source_generation: value.source_generation,
+                revoke_fence: value.revoke_fence,
+                published_generation: value.published_generation,
+            })
+        }
+        crate::invalidation::InvalidationEvent::EligibilityInvalidated(value) => {
+            // 多节点通知镜像失效：hub 已装时先推进辅助纪元/失效本节点的正向读
+            // 缓存（org/GlobalAdmin 辅助镜像与会话正向快照同步失效；幂等，重放
+            // 安全），再对目标卡做幂等 L1 evict；hub 未装（无镜像可失效的独立
+            // 部署）保持原 evict 行为不变。
+            if let Some(hub) = astral_db::memory_projection_hub() {
+                hub.apply_auxiliary_invalidation()?;
+            }
+            astral_db::evict_l1_card_active_cache(value.card_id);
+            Ok(())
+        }
+        crate::invalidation::InvalidationEvent::SessionRevoked(value) => {
+            dispatch_session_revocation(value.revoked_jtis)
+        }
+    }
+}
+
+/// In-process TTL shared by every session-revocation acceleration surface
+/// (7 days, aligned with the legacy `jwt:revoked:{jti}` coverage window).
+const SESSION_REVOCATION_MARKER_TTL_SECS: i64 = 7 * 24 * 3600;
+/// `u64` view for the surfaces that count seconds as `u64` (projection store
+/// note and Redis `set_ex`); the 7-day value is a positive constant.
+const SESSION_REVOCATION_MARKER_TTL_SECS_U64: u64 = 7 * 24 * 3600;
+
+/// Session-revocation acceleration dispatch, strict about registry misses.
+///
+/// A missing registry is never an implicit Allow: the registry-less composite
+/// runtime mirrors the revocation into the global session projection store,
+/// and when neither acceleration surface is installed the dispatch fails
+/// closed. The durable authority is the strict DB path
+/// (`astral_db::apply_revocation_projection_mysql`); these surfaces only
+/// accelerate proven revocations.
+fn dispatch_session_revocation(revoked_jtis: Vec<String>) -> Result<(), String> {
+    if let Some(registry) =
+        astral_common::session_revocation_registry::global_session_revocation_registry()
+    {
+        for jti in &revoked_jtis {
+            registry.mark_revoked(jti, SESSION_REVOCATION_MARKER_TTL_SECS);
+        }
+        return Ok(());
+    }
+    if astral_common::session_projection_store::global_session_projection_store().is_some() {
+        astral_db::note_revocations_in_process(
+            &revoked_jtis,
+            SESSION_REVOCATION_MARKER_TTL_SECS_U64,
+        );
+        return Ok(());
+    }
+    Err(
+        "no session revocation acceleration surface is installed; refusing to acknowledge \
+         SESSION_REVOKED"
+            .into(),
+    )
+}
+
+/// Recovery-fallback settings for the local invalidation relay.
+///
+/// The relay is ONLY the recovery leg for `al_message_outbox` invalidation
+/// rows whose normal post-commit direct `LocalBus` delivery never completed.
+/// It must never become a hot-path mechanism: idle polling and error backoff
+/// stay inside the low-frequency 5–30s window, each claim takes a single row,
+/// and the handler deadline (default 5s) stays far below the durable lease
+/// (30s) so no heartbeat task is required and a row is always settled by its
+/// owner. Every repository call is bounded (3s) so a hung statement can never
+/// stall the loop.
+#[derive(Debug, Clone)]
+pub struct LocalInvalidationRelaySettings {
+    /// Idle poll interval; bounded to the low-frequency 5–30s window.
+    pub idle_poll_interval: Duration,
+    /// Backoff after unproven claims; same low-frequency window.
+    pub error_backoff: Duration,
+    /// Handler deadline; must stay below `LOCAL_MESSAGE_LEASE_SECONDS`.
+    pub handler_deadline: Duration,
+    /// Hard bound for one repository call; at most 3s.
+    pub db_call_deadline: Duration,
+    /// Bounded join deadline used by [`LocalInvalidationRelayHandle::join`].
+    pub shutdown_join_deadline: Duration,
+}
+
+impl Default for LocalInvalidationRelaySettings {
+    fn default() -> Self {
+        Self {
+            idle_poll_interval: Duration::from_secs(15),
+            error_backoff: Duration::from_secs(15),
+            handler_deadline: Duration::from_secs(5),
+            db_call_deadline: LOCAL_INVALIDATION_DB_CALL_BOUND,
+            shutdown_join_deadline: Duration::from_secs(5),
+        }
+    }
+}
+
+impl LocalInvalidationRelaySettings {
+    pub fn validate(&self) -> Result<(), String> {
+        let idle = self.idle_poll_interval.as_secs();
+        if !(5..=30).contains(&idle) {
+            return Err(format!(
+                "relay idle_poll_interval must stay within the 5-30s low-frequency window, got {idle}s"
+            ));
+        }
+        let backoff = self.error_backoff.as_secs();
+        if !(5..=30).contains(&backoff) {
+            return Err(format!(
+                "relay error_backoff must stay within the 5-30s low-frequency window, got {backoff}s"
+            ));
+        }
+        if self.handler_deadline.is_zero() {
+            return Err("relay handler_deadline must be positive".into());
+        }
+        if self.handler_deadline >= Duration::from_secs(astral_db::LOCAL_MESSAGE_LEASE_SECONDS) {
+            return Err(format!(
+                "relay handler_deadline ({:?}) must stay below the durable lease ({}s) so no heartbeat task is needed",
+                self.handler_deadline, astral_db::LOCAL_MESSAGE_LEASE_SECONDS
+            ));
+        }
+        if self.db_call_deadline.is_zero()
+            || self.db_call_deadline > LOCAL_INVALIDATION_DB_CALL_BOUND
+        {
+            return Err(format!(
+                "relay db_call_deadline must be within (0, {LOCAL_INVALIDATION_DB_CALL_BOUND:?}]"
+            ));
+        }
+        if self.shutdown_join_deadline.is_zero() {
+            return Err("relay shutdown_join_deadline must be positive".into());
+        }
+        Ok(())
+    }
+}
+
+/// RAII handle for one recovery-only invalidation relay.
+///
+/// `cancel` marks the hub suspect and requests a cooperative stop (the loop
+/// finishes its current row before exiting); `join` waits a bounded deadline
+/// for the loop to exit and aborts on deadline; `Drop` marks the hub suspect
+/// and aborts immediately. A relay that disappears without settling its rows
+/// can therefore never leave the read gate trusting an unmonitored fallback —
+/// the sticky suspect state forces `reconcile_from_durable` before any exact
+/// envelope can be settled from memory.
+#[must_use]
+pub struct LocalInvalidationRelayHandle {
+    shutdown: watch::Sender<bool>,
+    join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    join_deadline: Duration,
+}
+
+impl LocalInvalidationRelayHandle {
+    /// Cooperative stop: mark the hub suspect, then signal the loop.
+    pub fn cancel(&self) {
+        mark_relay_suspect("local invalidation relay cancelled");
+        let _ = self.shutdown.send(true);
+    }
+
+    /// Bounded join: `Ok` once the loop exited cooperatively; `Err` (after
+    /// aborting the task) when the join deadline elapsed or the task panicked.
+    pub async fn join(self) -> Result<(), String> {
+        let mut join = self
+            .join
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| "relay join handle already taken".to_owned())?;
+        match timeout(self.join_deadline, &mut join).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(join_error)) => Err(format!("relay task ended abnormally: {join_error}")),
+            Err(_elapsed) => {
+                join.abort();
+                Err(format!(
+                    "relay join deadline ({:?}) elapsed; task aborted",
+                    self.join_deadline
+                ))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn for_tests(join: tokio::task::JoinHandle<()>, join_deadline: Duration) -> Self {
+        let (shutdown, _shutdown_rx) = watch::channel(false);
+        Self {
+            shutdown,
+            join: Mutex::new(Some(join)),
+            join_deadline,
+        }
+    }
+}
+
+impl Drop for LocalInvalidationRelayHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+        if let Some(join) = self.join.lock().unwrap().take() {
+            mark_relay_suspect("local invalidation relay handle dropped without join");
+            join.abort();
+        }
+    }
+}
+
+/// Sticky-suspect propagation for the recovery relay. Cancellation, unproven
+/// claims, unknown handler outcomes and lease failures all land here; the hub
+/// only clears suspect through a full durable reconciliation.
+fn mark_relay_suspect(reason: impl Into<String>) {
+    if let Some(hub) = astral_db::memory_projection_hub() {
+        hub.mark_channel_suspect(reason);
+    }
+}
+
+/// Spawn the recovery-only local invalidation relay.
+///
+/// Source transactions append typed invalidations to `al_message_outbox` and
+/// the normal path is the direct post-commit `LocalBus` delivery; this worker
+/// is the fallback that advances only committed rows the direct leg never
+/// settled. It claims one row at a time at a low-frequency idle poll, delivers
+/// the exact committed envelope through the bounded LocalBus, and advances the
+/// row only on a proven lease transition. Cancellation, unproven claims,
+/// unknown handler outcomes and lease failures mark the memory projection hub
+/// suspect instead of replaying anything blindly; malformed envelopes are
+/// quarantined immediately; IN_DOUBT rows leave the state machine only through
+/// the explicit reconciliation interface.
+pub fn spawn_local_invalidation_relay(
+    pool: MySqlPool,
+    bus: LocalBus,
+    worker_id: impl Into<String>,
+) -> LocalInvalidationRelayHandle {
+    spawn_local_invalidation_relay_with_settings(
+        pool,
+        bus,
+        worker_id,
+        LocalInvalidationRelaySettings::default(),
+    )
+    .expect("default local invalidation relay settings are valid")
+}
+
+/// [`spawn_local_invalidation_relay`] with explicit, validated settings.
+pub fn spawn_local_invalidation_relay_with_settings(
+    pool: MySqlPool,
+    bus: LocalBus,
+    worker_id: impl Into<String>,
+    settings: LocalInvalidationRelaySettings,
+) -> Result<LocalInvalidationRelayHandle, String> {
+    settings.validate()?;
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let join = tokio::spawn(run_local_invalidation_relay(
+        pool,
+        bus,
+        worker_id.into(),
+        settings.clone(),
+        shutdown_rx,
+    ));
+    Ok(LocalInvalidationRelayHandle {
+        shutdown,
+        join: Mutex::new(Some(join)),
+        join_deadline: settings.shutdown_join_deadline,
+    })
+}
+
+async fn run_local_invalidation_relay(
+    pool: MySqlPool,
+    bus: LocalBus,
+    worker_id: String,
+    settings: LocalInvalidationRelaySettings,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let repository = LocalMessageRepository::new(pool);
+    loop {
+        if *shutdown.borrow() {
+            tracing::info!(
+                worker_id = %worker_id,
+                "local invalidation recovery relay stopped cooperatively"
+            );
+            return;
+        }
+        // Claim-one: the handler deadline stays far below the durable lease, so
+        // no heartbeat task exists and every settlement is owner-proven.
+        let claimed = match bounded_db(
+            settings.db_call_deadline,
+            repository.claim_batch(&worker_id, QUEUE_AUTHORIZATION_INVALIDATION, 1),
+            "claim",
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                // The claim is unproven: mark suspect and back off instead of
+                // replaying anything blindly.
+                mark_relay_suspect("local invalidation relay claim is unproven");
+                tracing::error!(
+                    worker_id = %worker_id,
+                    queue = QUEUE_AUTHORIZATION_INVALIDATION,
+                    error = %error,
+                    "local invalidation recovery relay claim failed"
+                );
+                if shutdown_or_sleep(&mut shutdown, settings.error_backoff).await {
+                    tracing::info!(
+                        worker_id = %worker_id,
+                        "local invalidation recovery relay stopped cooperatively"
+                    );
+                    return;
+                }
+                continue;
+            }
+        };
+        if claimed.is_empty() {
+            if shutdown_or_sleep(&mut shutdown, settings.idle_poll_interval).await {
+                tracing::info!(
+                    worker_id = %worker_id,
+                    "local invalidation recovery relay stopped cooperatively"
+                );
+                return;
+            }
+            continue;
+        }
+        for row in claimed {
+            process_local_invalidation_row(&repository, &bus, row, &settings).await;
+        }
+    }
+}
+
+/// True when the relay should stop: either a shutdown was signalled (or the
+/// handle dropped, closing the channel) or the sleep completed with no signal.
+async fn shutdown_or_sleep(shutdown: &mut watch::Receiver<bool>, duration: Duration) -> bool {
+    tokio::select! {
+        changed = shutdown.changed() => match changed {
+            Ok(()) => *shutdown.borrow(),
+            Err(_) => true,
+        },
+        _ = tokio::time::sleep(duration) => false,
+    }
+}
+
+/// Bound one repository call. A timed-out call is an unproven outcome, not a
+/// success; the caller marks the hub suspect for every error.
+async fn bounded_db<T>(
+    deadline: Duration,
+    future: impl std::future::Future<Output = Result<T, LocalMessageError>>,
+    label: &'static str,
+) -> Result<T, String> {
+    match timeout(deadline, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_elapsed) => Err(format!(
+            "{label} exceeded the {deadline:?} database call bound; outcome unknown"
+        )),
+    }
+}
+
+/// Classified result of one recovery delivery attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalInvalidationRelayOutcome {
+    /// The typed handler completed; the row may be settled by its owner.
+    Delivered,
+    /// Malformed or tampered envelope: quarantine immediately, never retry.
+    Malformed(String),
+    /// Deterministic failure that provably applied no local side effect
+    /// (admission refusal, handler rejection before mutation, duplicate
+    /// in-flight): bounded retry, quarantine at the attempt ceiling.
+    KnownFailure(String),
+    /// The outcome cannot be proven (deadline, disappearing consumer,
+    /// unproven settle): IN_DOUBT plus hub suspect; reconcile before re-run.
+    Unknown(String),
+}
+
+/// Durable state transition selected for one classified outcome. Pure so the
+/// classification contract stays unit-testable without a database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalInvalidationRowTransition {
+    Complete,
+    MarkInDoubt(String),
+    Quarantine(String),
+    Retry(String),
+}
+
+fn local_invalidation_transition(
+    attempts: i32,
+    outcome: LocalInvalidationRelayOutcome,
+) -> LocalInvalidationRowTransition {
+    match outcome {
+        LocalInvalidationRelayOutcome::Delivered => LocalInvalidationRowTransition::Complete,
+        LocalInvalidationRelayOutcome::Unknown(reason) => {
+            LocalInvalidationRowTransition::MarkInDoubt(reason)
+        }
+        // Malformed rows quarantine immediately regardless of the attempt
+        // budget: retrying tampered bytes can never succeed.
+        LocalInvalidationRelayOutcome::Malformed(reason) => {
+            LocalInvalidationRowTransition::Quarantine(reason)
+        }
+        LocalInvalidationRelayOutcome::KnownFailure(reason)
+            if attempts >= LOCAL_MESSAGE_MAX_ATTEMPTS =>
+        {
+            LocalInvalidationRowTransition::Quarantine(format!("attempt ceiling reached: {reason}"))
+        }
+        LocalInvalidationRelayOutcome::KnownFailure(reason) => {
+            LocalInvalidationRowTransition::Retry(reason)
+        }
+    }
+}
+
+async fn process_local_invalidation_row(
+    repository: &LocalMessageRepository,
+    bus: &LocalBus,
+    row: astral_db::LocalMessageRow,
+    settings: &LocalInvalidationRelaySettings,
+) {
+    let Some(lease_token) = row.lease_owner.clone() else {
+        tracing::error!(
+            message_id = %row.message_id,
+            "claimed local invalidation row has no lease owner"
+        );
+        mark_relay_suspect("claimed local invalidation row has no lease owner");
+        return;
+    };
+    let outcome = match relay_local_invalidation_row(bus, &row, settings.handler_deadline).await {
+        Ok(()) => LocalInvalidationRelayOutcome::Delivered,
+        Err(outcome) => outcome,
+    };
+    match local_invalidation_transition(row.attempts, outcome) {
+        LocalInvalidationRowTransition::Complete => {
+            if let Err(error) = bounded_db(
+                settings.db_call_deadline,
+                repository.complete(&row.message_id, &lease_token),
+                "complete",
+            )
+            .await
+            {
+                // Completion is unproven: never declare success after a lost
+                // owner. Best-effort IN_DOUBT, suspect either way.
+                mark_relay_suspect("local invalidation completion is unproven");
+                tracing::error!(
+                    message_id = %row.message_id,
+                    error = %error,
+                    "local invalidation completion is unknown after handler success"
+                );
+                let _ = bounded_db(
+                    settings.db_call_deadline,
+                    repository.mark_in_doubt(&row.message_id, &lease_token, "completion unproven"),
+                    "mark_in_doubt",
+                )
+                .await;
+            }
+        }
+        LocalInvalidationRowTransition::MarkInDoubt(reason) => {
+            mark_relay_suspect("local invalidation handler outcome is unknown");
+            if let Err(error) = bounded_db(
+                settings.db_call_deadline,
+                repository.mark_in_doubt(&row.message_id, &lease_token, &reason),
+                "mark_in_doubt",
+            )
+            .await
+            {
+                mark_relay_suspect("local invalidation IN_DOUBT transition failed");
+                tracing::error!(
+                    message_id = %row.message_id,
+                    error = %error,
+                    "local invalidation unknown outcome could not be recorded"
+                );
+            }
+        }
+        LocalInvalidationRowTransition::Quarantine(reason) => {
+            if let Err(error) = bounded_db(
+                settings.db_call_deadline,
+                repository.quarantine(&row.message_id, &lease_token, &reason),
+                "quarantine",
+            )
+            .await
+            {
+                mark_relay_suspect("local invalidation quarantine transition failed");
+                tracing::error!(
+                    message_id = %row.message_id,
+                    error = %error,
+                    "local invalidation quarantine transition failed"
+                );
+            } else {
+                tracing::warn!(
+                    message_id = %row.message_id,
+                    reason = %reason,
+                    "malformed local invalidation envelope quarantined immediately"
+                );
+            }
+        }
+        LocalInvalidationRowTransition::Retry(reason) => {
+            if let Err(error) = bounded_db(
+                settings.db_call_deadline,
+                repository.schedule_retry(&row.message_id, &lease_token, &reason),
+                "schedule_retry",
+            )
+            .await
+            {
+                mark_relay_suspect("local invalidation retry transition failed");
+                tracing::error!(
+                    message_id = %row.message_id,
+                    error = %error,
+                    "local invalidation retry transition failed"
+                );
+            }
+        }
+    }
+}
+
+async fn relay_local_invalidation_row(
+    bus: &LocalBus,
+    row: &astral_db::LocalMessageRow,
+    handler_deadline: Duration,
+) -> Result<(), LocalInvalidationRelayOutcome> {
+    let envelope = bind_relay_envelope(row).map_err(LocalInvalidationRelayOutcome::Malformed)?;
+    match bus
+        .publish_and_wait(
+            QUEUE_AUTHORIZATION_INVALIDATION,
+            crate::config::ROUTING_KEY_AUTHORIZATION_INVALIDATION,
+            envelope,
+            handler_deadline,
+        )
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(LocalBusError::UnknownOutcome(reason)) => {
+            Err(LocalInvalidationRelayOutcome::Unknown(reason.to_string()))
+        }
+        Err(error) => Err(classify_relay_bus_failure(error)),
+    }
+}
+
+/// Bind the durable row to its exact committed envelope before any delivery.
+///
+/// Binding covers the full envelope contract: queue domain, transport headers,
+/// envelope parse + validation, canonical committed bytes, every identity and
+/// scope field (stable ids, type, schema version, tenant, regions, ordering
+/// key, payload digest) and the typed invalidation contract. Any divergence is
+/// `Err` and the caller quarantines immediately — the relay never delivers
+/// bytes it cannot prove.
+fn bind_relay_envelope(
+    row: &astral_db::LocalMessageRow,
+) -> Result<crate::envelope::MessageEnvelope, String> {
+    // Domain separation: this relay only advances typed invalidation rows.
+    if row.queue_name != QUEUE_AUTHORIZATION_INVALIDATION {
+        return Err(format!(
+            "row queue {} is not the typed invalidation queue",
+            row.queue_name
+        ));
+    }
+    // The source append writes headers_json = NULL; transport headers on a
+    // committed invalidation row are tampering.
+    if row.headers_json.is_some() {
+        return Err("local invalidation row carries unexpected transport headers".into());
+    }
+    let envelope: crate::envelope::MessageEnvelope =
+        serde_json::from_str(&row.payload_json).map_err(|error| error.to_string())?;
+    envelope.validate()?;
+    // Canonical bytes: the durable payload must be exactly the canonical
+    // envelope JSON the source transaction committed.
+    if envelope.envelope_json()? != row.payload_json {
+        return Err(
+            "local invalidation payload is not the canonical committed envelope bytes".into(),
+        );
+    }
+    if envelope.message_id != row.message_id
+        || envelope.operation_id != row.operation_id
+        || envelope.message_type != row.message_type
+        || envelope.tenant_id != row.tenant_id
+        || envelope.origin_region != row.origin_region
+        || envelope.target_region.as_deref() != row.target_region.as_deref()
+        || envelope.schema_version != row.schema_version
+        || envelope.ordering_key.as_deref() != row.ordering_key.as_deref()
+        || envelope.payload_sha256 != row.payload_sha256
+    {
+        return Err("local invalidation envelope does not match durable row".into());
+    }
+    // Typed contract: unknown types, scope tampering and malformed payloads
+    // fail closed here instead of reaching any handler.
+    crate::invalidation::InvalidationEvent::from_envelope(&envelope)
+        .map_err(|error| error.to_string())?;
+    Ok(envelope)
+}
+
+/// Bus failures that provably applied no local side effect are bounded-retry
+/// known failures — re-applying an invalidation is idempotent by contract, so
+/// these never need the IN_DOUBT path. Anything that could have mutated stays
+/// unknown, and contract-invalid bytes are quarantined, not retried.
+fn classify_relay_bus_failure(error: LocalBusError) -> LocalInvalidationRelayOutcome {
+    match error {
+        // Admission refusals: the envelope never reached a handler.
+        LocalBusError::InvalidLimits
+        | LocalBusError::InvalidOwner(_)
+        | LocalBusError::InvalidRoute(_)
+        | LocalBusError::NoOwner(_)
+        | LocalBusError::Closed(_)
+        | LocalBusError::Full(_)
+        | LocalBusError::TooLarge { .. } => {
+            LocalInvalidationRelayOutcome::KnownFailure(error.to_string())
+        }
+        // The same message id is already in flight on the direct-delivery leg;
+        // this attempt applied nothing and a later recovery pass settles it.
+        LocalBusError::Duplicate(_) => {
+            LocalInvalidationRelayOutcome::KnownFailure(error.to_string())
+        }
+        // The handler rejected the envelope before any mutation (validation
+        // and missing acceleration surfaces are pre-mutation by contract).
+        LocalBusError::Handler(_) => LocalInvalidationRelayOutcome::KnownFailure(error.to_string()),
+        // The bus re-validated the typed contract and refused: contract-invalid
+        // bytes are quarantined immediately, not retried.
+        LocalBusError::InvalidMessage(_) => {
+            LocalInvalidationRelayOutcome::Malformed(error.to_string())
+        }
+        // Deadlines and disappearing consumers leave the outcome unprovable.
+        LocalBusError::UnknownOutcome(_) => {
+            LocalInvalidationRelayOutcome::Unknown(error.to_string())
+        }
+    }
+}
+
+/// Legacy database-polling worker retained only for migration/reconciliation
+/// tooling. Production `local` transport must use `LocalBus` in the composite
+/// runtime; this function is intentionally not called by service entrypoints.
+#[deprecated(note = "use LocalBus owner consumers in the composite runtime")]
+pub fn spawn_local_message_worker(
+    pool: MySqlPool,
+    queue_name: &'static str,
+    worker_id: impl Into<String>,
+) {
+    let worker_id = worker_id.into();
+    tokio::spawn(async move {
+        let repository = LocalMessageRepository::new(pool.clone());
+        loop {
+            match repository.claim_batch(&worker_id, queue_name, 16).await {
+                Ok(rows) if rows.is_empty() => tokio::time::sleep(Duration::from_millis(250)).await,
+                Ok(rows) => {
+                    for row in rows {
+                        let lease_token = row.lease_owner.clone().unwrap_or_default();
+                        let heartbeat_repository = repository.clone();
+                        let heartbeat_message_id = row.message_id.clone();
+                        let heartbeat_token = lease_token.clone();
+                        let heartbeat = tokio::spawn(async move {
+                            let interval = Duration::from_secs(
+                                astral_db::LOCAL_MESSAGE_LEASE_SECONDS
+                                    .saturating_div(3)
+                                    .max(1),
+                            );
+                            loop {
+                                tokio::time::sleep(interval).await;
+                                if heartbeat_repository
+                                    .heartbeat(&heartbeat_message_id, &heartbeat_token)
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                        let result = dispatch_local_message(&pool, &row).await;
+                        heartbeat.abort();
+                        match result {
+                            Ok(()) => {
+                                if let Err(error) =
+                                    repository.complete(&row.message_id, &lease_token).await
+                                {
+                                    tracing::error!(queue = queue_name, message_id = %row.message_id, error = %error, "local message completion failed; durable result is unknown");
+                                }
+                            }
+                            Err(error) if row.attempts >= LOCAL_MESSAGE_MAX_ATTEMPTS => {
+                                if let Err(transition_error) = repository
+                                    .quarantine(&row.message_id, &lease_token, &error)
+                                    .await
+                                {
+                                    tracing::error!(queue = queue_name, message_id = %row.message_id, error = %transition_error, "local message quarantine transition failed");
+                                }
+                            }
+                            Err(error) => {
+                                if let Err(transition_error) = repository
+                                    .schedule_retry(&row.message_id, &lease_token, &error)
+                                    .await
+                                {
+                                    tracing::error!(queue = queue_name, message_id = %row.message_id, error = %transition_error, "local message retry transition failed");
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(queue = queue_name, error = %error, "local message claim failed");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    });
+}
+
+async fn dispatch_local_message(
+    _pool: &MySqlPool,
+    row: &astral_db::LocalMessageRow,
+) -> Result<(), String> {
+    let envelope: crate::envelope::MessageEnvelope =
+        serde_json::from_str(&row.payload_json).map_err(|error| error.to_string())?;
+    envelope.validate().map_err(|error| error.to_string())?;
+    if envelope.message_id != row.message_id || envelope.payload_sha256 != row.payload_sha256 {
+        return Err("local message envelope identity mismatch".into());
+    }
+    match row.queue_name.as_str() {
+        QUEUE_AUDIT_LOG => {
+            let payload: AuditLogPayload = serde_json::from_value(envelope.payload.clone())
+                .map_err(|error| error.to_string())?;
+            handle_audit_log(&envelope.message_id, &payload)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        QUEUE_LOGIN_EVENT => {
+            let payload: LoginEventPayload = serde_json::from_value(envelope.payload.clone())
+                .map_err(|error| error.to_string())?;
+            handle_login_event(&envelope.message_id, &payload)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        QUEUE_AUTH_SESSION_REVOCATION => {
+            let payload: AuthSessionRevocationPayload =
+                serde_json::from_value(envelope.payload.clone())
+                    .map_err(|error| error.to_string())?;
+            handle_auth_session_revocation(&envelope.message_id, &payload)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        QUEUE_AUTHORIZATION_INVALIDATION => dispatch_invalidation_event(&envelope).await,
+        _ => Err("local queue has no owner".into()),
+    }
+}
+
 /// inspect an untyped message. Business consumers must use a typed payload.
 #[allow(dead_code)]
 #[derive(serde::Deserialize)]
@@ -1907,11 +2734,13 @@ fn queue_name(suffix: &str) -> &'static str {
 
 // ===== AuthSessionRevocationConsumer（对齐 Java AuthSessionRevocationConsumer）=====
 
-/// 处理 auth.session.revocation 命令：撤销用户全部 durable session 与 token family，
-/// 并删除 Redis access:jti / access:grant 投影。
+/// 处理 auth.session.revocation 命令：在同一 source 事务中保存 session/family/
+/// JTI/outbox，提交后走 strict DB 撤销投影（Redis-free 权威路径），可选 Redis
+/// compat 投影仅在运行时显式注入 manager 时调用。未安装 Redis 时 strict DB
+/// 路径必须照常完成，命令不会因缺 Redis 而失败。
 ///
-/// 对齐 Java `AuthDeviceSessionService.revokeAllForUser`：DB 撤销 + session outbox +
-/// Redis projection delete。失败返回 Err → Consumer 框架 nack/DLX 重试（不吞失败）。
+/// 对齐 Java `AuthDeviceSessionService.revokeAllForUser`：DB 撤销 + session outbox
+/// +（可选）Redis projection delete。失败返回 Err → Consumer 框架 nack/DLX 重试（不吞失败）。
 async fn handle_auth_session_revocation(
     envelope_message_id: &str,
     msg: &AuthSessionRevocationPayload,
@@ -1922,6 +2751,10 @@ async fn handle_auth_session_revocation(
             "auth session revocation consumer DB not initialized",
         )));
     };
+    // Redis is an optional compat projection, never a hard requirement: the
+    // strict DB path below is the authority and must complete without it.
+    #[cfg(feature = "redis-compat")]
+    let redis_compat = SESSION_REVOCATION_REDIS.get().cloned();
     let operation_id = revocation_operation_id(envelope_message_id, msg)?;
     let reason = msg.reason.trim();
     if reason.is_empty() {
@@ -1930,7 +2763,16 @@ async fn handle_auth_session_revocation(
             "auth session revocation reason is empty",
         )));
     }
+    // Revocation source transaction hub writer fence: acquired before begin
+    // (fail-closed and refuses to process when the fence is unavailable; no hub installed means
+    // no-op), writer-active keeps the auxiliary read side fail-closed for the entire
+    // transaction; pre-commit errors (known rollback) are released cleanly along with Drop.
+    let source_guard = astral_db::memory_projection_hub::acquire_source_guard().map_err(box_err)?;
     let mut tx = pool.begin().await.map_err(box_err)?;
+    // Typed SESSION_REVOKED shard envelopes appended inside this source
+    // transaction. They are dispatched ONLY after a proven commit below; an
+    // unknown/failed commit keeps zero dispatch and never replays source.
+    let mut committed_shards: Vec<crate::envelope::MessageEnvelope> = Vec::new();
 
     // The outbox row is the idempotent boundary for the command. A retry after
     // the first commit reuses its immutable JTI snapshot instead of querying
@@ -1959,15 +2801,33 @@ async fn handle_auth_session_revocation(
         })?;
         (revocation_jtis_from_payload(&payload, msg.user_id)?, false)
     } else {
-        let jti_keys: Vec<(String,)> = sqlx::query_as(
+        // Finite fact boundary: one operation's notification snapshot is
+        // bounded. Beyond the capacity the command fails closed BEFORE any
+        // source mutation (this transaction rolls back, so nothing can commit
+        // without a fully representable, sharded notification intent). The
+        // system does not promise an unbounded single-operation snapshot;
+        // larger populations need upstream chunked operations.
+        let snapshot: Vec<(String,)> = sqlx::query_as(
             "SELECT jti FROM auth_session_jti_index \
-             WHERE user_id = ? AND status = 'ACTIVE' FOR UPDATE",
+             WHERE user_id = ? AND status = 'ACTIVE' \
+             ORDER BY jti LIMIT ? FOR UPDATE",
         )
         .bind(msg.user_id)
+        .bind(i64::try_from(MAX_REVOCATION_SNAPSHOT_JTIS + 1).unwrap_or(i64::MAX))
         .fetch_all(&mut *tx)
         .await
         .map_err(box_err)?;
-        (jti_keys.into_iter().map(|(jti,)| jti).collect(), true)
+        if snapshot.len() > MAX_REVOCATION_SNAPSHOT_JTIS {
+            return Err(box_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "auth session revocation snapshot exceeds the bounded capacity \
+                     {MAX_REVOCATION_SNAPSHOT_JTIS}; nothing was mutated and the \
+                     command is not acknowledged"
+                ),
+            )));
+        }
+        (snapshot.into_iter().map(|(jti,)| jti).collect(), true)
     };
 
     if is_new_operation {
@@ -2022,22 +2882,82 @@ async fn handle_auth_session_revocation(
         .execute(&mut *tx)
         .await
         .map_err(box_err)?;
+
+        // Typed invalidation durable intent: bounded stable shards derived
+        // from the same in-transaction JTI snapshot, appended in THIS source
+        // transaction (no MQ/network inside the boundary). Delivery is owned
+        // by the post-commit direct dispatch below plus the relay/fanout
+        // recovery leg; a retry of this command reuses the committed
+        // operation snapshot and never re-appends (is_new_operation=false).
+        committed_shards = crate::invalidation::append_session_revocation_shards_in_tx(
+            &mut tx,
+            msg.user_id,
+            &jti_keys,
+            &operation_id,
+        )
+        .await
+        .map_err(box_err)?;
     }
 
+    // Arm the cancellation fence: a task cancellation/connection drop within the COMMIT await window is witnessed by Drop
+    // with atomic=true → sticky uncertain_source (unknown commit result, zero dispatch,
+    // zero source replay, can only be cleared by independent durable reconciliation).
+    if let Some(guard) = &source_guard {
+        guard.mark_commit_started();
+    }
     tx.commit().await.map_err(box_err)?;
 
-    // Redis is part of the access-session contract. Any failure must escape so
-    // the MQ consumer nacks and retries instead of acknowledging a live token.
-    use crate::consumer::shared_idempotency_redis;
-    let mut conn = shared_idempotency_redis().map_err(box_err)?;
-    for jti in jti_keys {
-        conn.del::<_, ()>((format!("access:jti:{jti}"), format!("access:grant:{jti}")))
-            .await
-            .map_err(box_err)?;
-        conn.set_ex::<_, _, ()>(format!("jwt:revoked:{jti}"), "1", 7 * 24 * 3600)
-            .await
-            .map_err(box_err)?;
+    // Proven commit: first disarm and release the writer gate, then proceed with any
+    // direct dispatch/projection—zero dispatch on unknown/failed commit, this point is only reachable
+    // when the commit has been proven.
+    if let Some(guard) = &source_guard {
+        guard.mark_commit_proven();
     }
+    drop(source_guard);
+
+    // Proven commit: source mutations, auth_session_outbox and the sharded
+    // typed invalidation rows are now durable together. The normal single-node
+    // path delivers the committed SESSION_REVOKED envelopes directly on the
+    // LocalBus (acceleration only — admission is not a durable proof); any
+    // refusal is covered by the committed outbox rows for the recovery relay.
+    // An unknown/failed commit never reaches this point: zero dispatch, no
+    // source replay.
+    deliver_committed_session_shards(&committed_shards).await;
+
+    // Strict durable revocation projection (Redis-free authority): close each
+    // JTI proof and mirror the revocation into the in-process acceleration
+    // store. Errors escape so the command is retried, never acknowledged
+    // half-applied. This runs before any optional compat surface.
+    astral_db::apply_revocation_projection_mysql(pool, &jti_keys)
+        .await
+        .map_err(box_err)?;
+
+    // Optional Redis compat projection: only invoked when the runtime
+    // explicitly installed a compat manager. Its failure still fails the
+    // command (nack + retry) — a deployment that declares the Redis
+    // access-session contract must not acknowledge while its projections stay
+    // live. Without the compat manager this block is skipped entirely.
+    #[cfg(feature = "redis-compat")]
+    if let Some(mut conn) = redis_compat {
+        for jti in &jti_keys {
+            conn.del::<_, ()>((format!("access:jti:{jti}"), format!("access:grant:{jti}")))
+                .await
+                .map_err(box_err)?;
+            conn.set_ex::<_, _, ()>(
+                format!("jwt:revoked:{jti}"),
+                "1",
+                SESSION_REVOCATION_MARKER_TTL_SECS_U64,
+            )
+            .await
+            .map_err(box_err)?;
+        }
+    }
+
+    // Redis projection and the in-process registry are now complete. Close the
+    // durable outbox in the same operation identity so the caller can distinguish
+    // business completion from LocalBus/Rabbit admission. A lost CAS is unknown;
+    // do not acknowledge it as success until the status is reconciled.
+    mark_revocation_outbox_processed(pool, &operation_id).await?;
 
     tracing::warn!(
         user_id = msg.user_id,
@@ -2045,6 +2965,95 @@ async fn handle_auth_session_revocation(
         reason,
         "auth session revocation command processed"
     );
+    Ok(())
+}
+
+/// Finite per-operation notification snapshot capacity (JTI entries).
+///
+/// Fact boundary, not an aspiration: one revocation operation captures at most
+/// this many JTIs for its `auth_session_outbox` snapshot and its sharded typed
+/// invalidation intent (at most `ceil(cap / 1024)` shards of <=1024 JTIs).
+/// Exceeding it fails the command closed BEFORE any source mutation instead of
+/// growing a single transaction without bound. 32768 entries map to at most 32
+/// shard rows (~140KB payload each) — comfortably inside one short source
+/// transaction and the MEDIUMTEXT outbox columns.
+const MAX_REVOCATION_SNAPSHOT_JTIS: usize = 32_768;
+
+/// Post-commit direct delivery of the committed typed SESSION_REVOKED shards.
+///
+/// Best-effort acceleration only — LocalBus admission is not a durable proof.
+/// A missing bus, admission refusal, or queue overflow is logged and left to
+/// the committed `al_message_outbox` rows, whose recovery relay owns durable
+/// completion (per-scope FIFO, idempotent re-application). This function runs
+/// strictly after `tx.commit()` returned Ok, so an unknown commit outcome can
+/// never reach it: zero dispatch, no source replay.
+async fn deliver_committed_session_shards(envelopes: &[crate::envelope::MessageEnvelope]) {
+    if envelopes.is_empty() {
+        return;
+    }
+    let Some(bus) = crate::local_bus::global_local_bus() else {
+        tracing::warn!(
+            count = envelopes.len(),
+            "global local bus is not installed; committed session revocation shards rely on the recovery relay"
+        );
+        return;
+    };
+    for envelope in envelopes {
+        if let Err(error) = bus.try_publish(
+            crate::config::QUEUE_AUTHORIZATION_INVALIDATION,
+            crate::config::ROUTING_KEY_AUTHORIZATION_INVALIDATION,
+            envelope.clone(),
+        ) {
+            tracing::warn!(
+                message_id = %envelope.message_id,
+                error = %error,
+                "direct session shard delivery refused; the recovery relay remains authoritative"
+            );
+        }
+    }
+}
+
+const REVOCATION_OUTBOX_COMPLETE_SQL: &str =
+    "UPDATE auth_session_outbox SET status = 'PROCESSED', \
+    processed_at = UTC_TIMESTAMP(), processed_by = 'revocation-handler', \
+    lease_owner = NULL, lease_expires_at = NULL, updated_at = UTC_TIMESTAMP() \
+    WHERE operation_id = ? AND sequence_number = 1 AND status = 'PENDING'";
+
+fn revocation_completion_is_proven(affected: u64, status: Option<&str>) -> bool {
+    affected == 1 || (affected == 0 && status == Some("PROCESSED"))
+}
+
+async fn mark_revocation_outbox_processed(
+    pool: &MySqlPool,
+    operation_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send>> {
+    let result = sqlx::query(REVOCATION_OUTBOX_COMPLETE_SQL)
+        .bind(operation_id)
+        .execute(pool)
+        .await
+        .map_err(box_err)?;
+    if result.rows_affected() > 1 {
+        return Err(box_err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth session revocation outbox matched multiple rows",
+        )));
+    }
+    if result.rows_affected() == 0 {
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM auth_session_outbox \
+             WHERE operation_id = ? AND sequence_number = 1",
+        )
+        .bind(operation_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(box_err)?;
+        if !revocation_completion_is_proven(result.rows_affected(), status.as_deref()) {
+            return Err(box_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "auth session revocation outbox completion is unknown",
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2117,6 +3126,475 @@ fn box_err(e: impl std::error::Error + Send + 'static) -> Box<dyn std::error::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_bus::{LocalBusLimits, LocalOwner};
+
+    // ===== recovery-only relay contracts =====
+
+    fn evidence_event() -> crate::invalidation::InvalidationEvent {
+        crate::invalidation::InvalidationEvent::EvidenceInvalidated(
+            crate::invalidation::EvidenceInvalidated {
+                tenant_id: 7,
+                card_id: Some(42),
+                aggregate_type: astral_types::PublishedEvidenceAggregate::UserCard,
+                aggregate_id: 42,
+                published_generation: 10,
+                source_generation: 10,
+                revoke_fence: 0,
+            },
+        )
+    }
+
+    /// A durable row whose payload bytes are the canonical committed envelope.
+    fn relay_test_row(envelope: &crate::envelope::MessageEnvelope) -> astral_db::LocalMessageRow {
+        astral_db::LocalMessageRow {
+            message_id: envelope.message_id.clone(),
+            operation_id: envelope.operation_id.clone(),
+            message_type: envelope.message_type.clone(),
+            queue_name: QUEUE_AUTHORIZATION_INVALIDATION.to_owned(),
+            ordering_key: envelope.ordering_key.clone(),
+            tenant_id: envelope.tenant_id,
+            origin_region: envelope.origin_region.clone(),
+            target_region: envelope.target_region.clone(),
+            schema_version: envelope.schema_version,
+            payload_json: envelope.envelope_json().unwrap(),
+            headers_json: None,
+            payload_sha256: envelope.payload_sha256.clone(),
+            status: "PROCESSING".into(),
+            attempts: 1,
+            next_attempt_at: None,
+            lease_owner: Some("relay-test:lease".into()),
+            lease_expires_at: None,
+            processed_at: None,
+            last_error: None,
+            created_at: time::PrimitiveDateTime::MIN,
+            updated_at: time::PrimitiveDateTime::MIN,
+        }
+    }
+
+    #[test]
+    fn relay_binding_rejects_rows_outside_the_invalidation_domain() {
+        // Domain separation: rows from any other queue never enter this state
+        // machine, even when their bytes parse as a valid envelope.
+        let envelope = evidence_event()
+            .to_envelope("relay-domain-1", "relay-op", "local")
+            .unwrap();
+        let mut row = relay_test_row(&envelope);
+        row.queue_name = QUEUE_AUDIT_LOG.to_owned();
+        let error = bind_relay_envelope(&row).unwrap_err();
+        assert!(
+            error.contains("not the typed invalidation queue"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn relay_binding_rejects_unexpected_transport_headers() {
+        let envelope = evidence_event()
+            .to_envelope("relay-headers-1", "relay-op", "local")
+            .unwrap();
+        let mut row = relay_test_row(&envelope);
+        row.headers_json = Some("{\"x-custom\":\"1\"}".into());
+        let error = bind_relay_envelope(&row).unwrap_err();
+        assert!(error.contains("unexpected transport headers"), "{error}");
+    }
+
+    #[test]
+    fn relay_binding_rejects_every_metadata_divergence() {
+        let envelope = evidence_event()
+            .to_envelope("relay-meta-1", "relay-op", "local")
+            .unwrap();
+        let other_digest = crate::envelope::payload_digest(&serde_json::json!({"x": 1})).unwrap();
+
+        let mut row = relay_test_row(&envelope);
+        row.message_id = "other".into();
+        assert!(bind_relay_envelope(&row)
+            .unwrap_err()
+            .contains("does not match durable row"));
+
+        let mut row = relay_test_row(&envelope);
+        row.operation_id = "other".into();
+        assert!(bind_relay_envelope(&row)
+            .unwrap_err()
+            .contains("does not match durable row"));
+
+        let mut row = relay_test_row(&envelope);
+        row.message_type = "ELIGIBILITY_INVALIDATED".into();
+        assert!(bind_relay_envelope(&row)
+            .unwrap_err()
+            .contains("does not match durable row"));
+
+        let mut row = relay_test_row(&envelope);
+        row.tenant_id = Some(8);
+        assert!(bind_relay_envelope(&row)
+            .unwrap_err()
+            .contains("does not match durable row"));
+
+        let mut row = relay_test_row(&envelope);
+        row.origin_region = "city-b".into();
+        assert!(bind_relay_envelope(&row)
+            .unwrap_err()
+            .contains("does not match durable row"));
+
+        let mut row = relay_test_row(&envelope);
+        row.target_region = Some("city-b".into());
+        assert!(bind_relay_envelope(&row)
+            .unwrap_err()
+            .contains("does not match durable row"));
+
+        let mut row = relay_test_row(&envelope);
+        row.schema_version = 2;
+        assert!(bind_relay_envelope(&row)
+            .unwrap_err()
+            .contains("does not match durable row"));
+
+        let mut row = relay_test_row(&envelope);
+        row.ordering_key = Some("authorization:eligibility/card/1".into());
+        assert!(bind_relay_envelope(&row)
+            .unwrap_err()
+            .contains("does not match durable row"));
+
+        let mut row = relay_test_row(&envelope);
+        row.payload_sha256 = other_digest;
+        assert!(bind_relay_envelope(&row)
+            .unwrap_err()
+            .contains("does not match durable row"));
+    }
+
+    #[test]
+    fn relay_binding_rejects_non_canonical_committed_bytes() {
+        let envelope = evidence_event()
+            .to_envelope("relay-bytes-1", "relay-op", "local")
+            .unwrap();
+        let mut row = relay_test_row(&envelope);
+        // Parses and validates fine, but is not the exact committed bytes.
+        row.payload_json = serde_json::to_string_pretty(&envelope).unwrap();
+        let error = bind_relay_envelope(&row).unwrap_err();
+        assert!(
+            error.contains("canonical committed envelope bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn relay_binding_rejects_typed_payload_corruption() {
+        let mut envelope = evidence_event()
+            .to_envelope("relay-corrupt-1", "relay-op", "local")
+            .unwrap();
+        envelope.payload["unexpected"] = serde_json::json!(true);
+        envelope.payload_sha256 = crate::envelope::payload_digest(&envelope.payload).unwrap();
+        let mut row = relay_test_row(&envelope);
+        row.payload_json = envelope.envelope_json().unwrap();
+        row.payload_sha256 = envelope.payload_sha256.clone();
+        let error = bind_relay_envelope(&row).unwrap_err();
+        assert!(error.contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn relay_binding_rejects_unsupported_message_type() {
+        let mut envelope = evidence_event()
+            .to_envelope("relay-type-1", "relay-op", "local")
+            .unwrap();
+        envelope.message_type = "LOGIN_EVENT".into();
+        let mut row = relay_test_row(&envelope);
+        row.message_type = "LOGIN_EVENT".into();
+        row.payload_json = envelope.envelope_json().unwrap();
+        let error = bind_relay_envelope(&row).unwrap_err();
+        assert!(
+            error.contains("unsupported invalidation message type"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn relay_binding_accepts_the_exact_committed_envelope() {
+        let envelope = evidence_event()
+            .to_envelope("relay-ok-1", "relay-op-1", "local")
+            .unwrap();
+        let row = relay_test_row(&envelope);
+        assert_eq!(bind_relay_envelope(&row).unwrap(), envelope);
+    }
+
+    #[test]
+    fn bus_failures_classify_side_effect_free_from_unknown() {
+        for error in [
+            LocalBusError::InvalidLimits,
+            LocalBusError::InvalidOwner("q".into()),
+            LocalBusError::InvalidRoute("q".into()),
+            LocalBusError::NoOwner("q".into()),
+            LocalBusError::Closed("q".into()),
+            LocalBusError::Full("q".into()),
+            LocalBusError::TooLarge {
+                actual: 2,
+                limit: 1,
+            },
+            LocalBusError::Duplicate("m".into()),
+            LocalBusError::Handler("handler rejected before mutation".into()),
+        ] {
+            assert!(
+                matches!(
+                    classify_relay_bus_failure(error),
+                    LocalInvalidationRelayOutcome::KnownFailure(_)
+                ),
+                "side-effect-free bus failure must be a bounded retry"
+            );
+        }
+        assert!(matches!(
+            classify_relay_bus_failure(LocalBusError::InvalidMessage(
+                "typed contract refused".into()
+            )),
+            LocalInvalidationRelayOutcome::Malformed(_)
+        ));
+        assert!(matches!(
+            classify_relay_bus_failure(LocalBusError::UnknownOutcome("m".into())),
+            LocalInvalidationRelayOutcome::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn transition_contract_quarantines_malformed_immediately_and_unknown_always() {
+        assert_eq!(
+            local_invalidation_transition(
+                0,
+                LocalInvalidationRelayOutcome::Malformed("tampered".into())
+            ),
+            LocalInvalidationRowTransition::Quarantine("tampered".into())
+        );
+        assert_eq!(
+            local_invalidation_transition(
+                1,
+                LocalInvalidationRelayOutcome::Unknown("deadline".into())
+            ),
+            LocalInvalidationRowTransition::MarkInDoubt("deadline".into())
+        );
+        assert_eq!(
+            local_invalidation_transition(
+                i32::MAX,
+                LocalInvalidationRelayOutcome::Unknown("deadline".into())
+            ),
+            LocalInvalidationRowTransition::MarkInDoubt("deadline".into())
+        );
+        assert_eq!(
+            local_invalidation_transition(1, LocalInvalidationRelayOutcome::Delivered),
+            LocalInvalidationRowTransition::Complete
+        );
+    }
+
+    #[test]
+    fn transition_contract_bounds_known_failures_by_the_attempt_ceiling() {
+        assert_eq!(
+            local_invalidation_transition(
+                1,
+                LocalInvalidationRelayOutcome::KnownFailure("full".into())
+            ),
+            LocalInvalidationRowTransition::Retry("full".into())
+        );
+        assert!(matches!(
+            local_invalidation_transition(
+                LOCAL_MESSAGE_MAX_ATTEMPTS,
+                LocalInvalidationRelayOutcome::KnownFailure("full".into())
+            ),
+            LocalInvalidationRowTransition::Quarantine(reason) if reason.contains("attempt ceiling")
+        ));
+    }
+
+    #[test]
+    fn relay_settings_enforce_low_frequency_and_lease_safe_deadlines() {
+        LocalInvalidationRelaySettings::default()
+            .validate()
+            .expect("default settings are valid");
+
+        let mut settings = LocalInvalidationRelaySettings {
+            idle_poll_interval: Duration::from_secs(4),
+            ..Default::default()
+        };
+        assert!(settings.validate().unwrap_err().contains("5-30s"));
+        settings.idle_poll_interval = Duration::from_secs(31);
+        assert!(settings.validate().unwrap_err().contains("5-30s"));
+
+        let settings = LocalInvalidationRelaySettings {
+            error_backoff: Duration::from_secs(2),
+            ..Default::default()
+        };
+        assert!(settings.validate().unwrap_err().contains("5-30s"));
+
+        let settings = LocalInvalidationRelaySettings {
+            handler_deadline: Duration::from_secs(astral_db::LOCAL_MESSAGE_LEASE_SECONDS),
+            ..Default::default()
+        };
+        assert!(settings.validate().unwrap_err().contains("lease"));
+
+        let mut settings = LocalInvalidationRelaySettings {
+            db_call_deadline: Duration::from_secs(4),
+            ..Default::default()
+        };
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("db_call_deadline"));
+        settings.db_call_deadline = Duration::ZERO;
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("db_call_deadline"));
+
+        let settings = LocalInvalidationRelaySettings {
+            shutdown_join_deadline: Duration::ZERO,
+            ..Default::default()
+        };
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("shutdown_join_deadline"));
+    }
+
+    #[tokio::test]
+    async fn relay_delivery_classifies_handler_duplicate_and_unknown_outcomes() {
+        let bus = LocalBus::new(LocalBusLimits::default()).unwrap();
+        // LocalReceiver is not Clone, so the receiver stays in this test task
+        // and each delivery is driven inline while the relay runs spawned.
+        let mut receiver = bus
+            .register(
+                QUEUE_AUTHORIZATION_INVALIDATION,
+                LocalOwner::AuthorizationInvalidation,
+            )
+            .unwrap();
+
+        // Handler success -> Delivered.
+        let envelope = evidence_event()
+            .to_envelope("relay-bus-ok", "relay-bus-op-1", "local")
+            .unwrap();
+        let row = relay_test_row(&envelope);
+        let relay_task = tokio::spawn({
+            let bus = bus.clone();
+            async move { relay_local_invalidation_row(&bus, &row, Duration::from_millis(500)).await }
+        });
+        let delivery = receiver.recv().await.unwrap();
+        assert_eq!(delivery.envelope.message_id, "relay-bus-ok");
+        delivery.complete(Ok(()));
+        assert_eq!(relay_task.await.unwrap(), Ok(()));
+
+        // In-flight duplicate on the direct leg -> KnownFailure (no side
+        // effect here; a later recovery pass re-applies idempotently).
+        let envelope = evidence_event()
+            .to_envelope("relay-bus-dup", "relay-bus-op-2", "local")
+            .unwrap();
+        let row = relay_test_row(&envelope);
+        bus.try_publish(
+            QUEUE_AUTHORIZATION_INVALIDATION,
+            crate::config::ROUTING_KEY_AUTHORIZATION_INVALIDATION,
+            envelope,
+        )
+        .unwrap();
+        let relay_task = tokio::spawn({
+            let bus = bus.clone();
+            async move { relay_local_invalidation_row(&bus, &row, Duration::from_millis(500)).await }
+        });
+        match relay_task.await.unwrap() {
+            Err(LocalInvalidationRelayOutcome::KnownFailure(reason)) => {
+                assert!(reason.contains("already in flight"), "{reason}");
+            }
+            other => panic!("expected duplicate-known failure, got {other:?}"),
+        }
+        let delivery = receiver.recv().await.unwrap();
+        assert_eq!(delivery.envelope.message_id, "relay-bus-dup");
+        delivery.complete(Ok(()));
+
+        // Handler rejection before mutation -> KnownFailure.
+        let envelope = evidence_event()
+            .to_envelope("relay-bus-err", "relay-bus-op-3", "local")
+            .unwrap();
+        let row = relay_test_row(&envelope);
+        let relay_task = tokio::spawn({
+            let bus = bus.clone();
+            async move { relay_local_invalidation_row(&bus, &row, Duration::from_millis(500)).await }
+        });
+        let delivery = receiver.recv().await.unwrap();
+        assert_eq!(delivery.envelope.message_id, "relay-bus-err");
+        delivery.complete(Err("handler rejected before mutation".into()));
+        match relay_task.await.unwrap() {
+            Err(LocalInvalidationRelayOutcome::KnownFailure(reason)) => {
+                assert!(
+                    reason.contains("handler rejected before mutation"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected handler-known failure, got {other:?}"),
+        }
+
+        // Disappearing consumer -> UnknownOutcome -> Unknown.
+        let envelope = evidence_event()
+            .to_envelope("relay-bus-unknown", "relay-bus-op-4", "local")
+            .unwrap();
+        let row = relay_test_row(&envelope);
+        let relay_task = tokio::spawn({
+            let bus = bus.clone();
+            async move { relay_local_invalidation_row(&bus, &row, Duration::from_millis(200)).await }
+        });
+        let delivery = receiver.recv().await.unwrap();
+        assert_eq!(delivery.envelope.message_id, "relay-bus-unknown");
+        drop(delivery);
+        match relay_task.await.unwrap() {
+            Err(LocalInvalidationRelayOutcome::Unknown(_)) => {}
+            other => panic!("expected unknown outcome, got {other:?}"),
+        }
+    }
+
+    /// Drop of the parked task's probe future proves the handle aborted it.
+    struct RelayAbortProbe {
+        tx: Option<oneshot::Sender<&'static str>>,
+    }
+
+    impl Drop for RelayAbortProbe {
+        fn drop(&mut self) {
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send("aborted");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_handle_drop_aborts_the_parked_task() {
+        let (probe_tx, probe_rx) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _probe = RelayAbortProbe { tx: Some(probe_tx) };
+            futures_util::future::pending::<()>().await;
+        });
+        let handle = LocalInvalidationRelayHandle::for_tests(join, Duration::from_secs(1));
+        drop(handle);
+        let outcome = timeout(Duration::from_secs(1), probe_rx)
+            .await
+            .expect("abort probe resolves within the timeout window");
+        // Either the parked future was dropped mid-flight ("aborted") or the
+        // task was cancelled before its first poll (the captured sender is
+        // dropped without sending). Both outcomes prove Drop aborted the task;
+        // with no abort this receive would hang into the timeout.
+        assert!(matches!(outcome, Ok("aborted") | Err(_)));
+    }
+
+    #[tokio::test]
+    async fn relay_handle_cancel_then_bounded_join_aborts_on_deadline() {
+        let (probe_tx, probe_rx) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _probe = RelayAbortProbe { tx: Some(probe_tx) };
+            futures_util::future::pending::<()>().await;
+        });
+        let handle = LocalInvalidationRelayHandle::for_tests(join, Duration::from_millis(50));
+        handle.cancel();
+        let error = handle
+            .join()
+            .await
+            .expect_err("parked task must hit the join deadline");
+        assert!(error.contains("deadline"), "{error}");
+        let outcome = probe_rx.await.expect("probe sender alive until abort");
+        assert_eq!(outcome, "aborted");
+    }
+
+    #[tokio::test]
+    async fn relay_handle_joins_a_cooperative_exit() {
+        let join = tokio::spawn(async {});
+        let handle = LocalInvalidationRelayHandle::for_tests(join, Duration::from_secs(1));
+        handle.join().await.expect("cooperative exit joins");
+    }
 
     #[test]
     fn republish_failure_attempts_progress_to_explicit_terminal() {
@@ -2237,6 +3715,66 @@ mod tests {
         assert_ne!(AUDIT_MESSAGE_TYPE, LOGIN_EVENT_MESSAGE_TYPE);
         let schema = include_str!("../../astral-db/migrations/20240630000001_baseline.sql");
         assert!(schema.contains("UNIQUE KEY uk_mq_msg (message_type, message_id)"));
+    }
+
+    #[test]
+    fn inline_revocation_completion_never_steals_worker_owned_rows() {
+        assert!(REVOCATION_OUTBOX_COMPLETE_SQL.contains("operation_id = ? AND sequence_number = 1"));
+        assert!(REVOCATION_OUTBOX_COMPLETE_SQL.contains("AND status = 'PENDING'"));
+        assert!(!REVOCATION_OUTBOX_COMPLETE_SQL.contains("PROCESSING"));
+        assert!(revocation_completion_is_proven(1, None));
+        assert!(revocation_completion_is_proven(0, Some("PROCESSED")));
+        for status in [None, Some("PENDING"), Some("PROCESSING"), Some("FAILED")] {
+            assert!(!revocation_completion_is_proven(0, status));
+        }
+        assert!(!revocation_completion_is_proven(2, Some("PROCESSED")));
+    }
+
+    #[test]
+    fn revocation_completion_follows_source_commit_strict_db_then_optional_redis() {
+        let source = include_str!("consumers.rs");
+        let body = source
+            .split("async fn handle_auth_session_revocation(")
+            .nth(1)
+            .unwrap()
+            .split("const REVOCATION_OUTBOX_COMPLETE_SQL")
+            .next()
+            .unwrap();
+        let commit = body.find("tx.commit()").unwrap();
+        let strict_db = body.find("apply_revocation_projection_mysql(pool").unwrap();
+        let redis = body.find("conn.set_ex").unwrap();
+        let complete = body.find("mark_revocation_outbox_processed(pool").unwrap();
+        // Source tx commit → strict DB projection → optional Redis compat →
+        // outbox completion proof. The outbox stays the only completion proof.
+        assert!(commit < strict_db && strict_db < redis && redis < complete);
+        // Redis compat is optional: a missing projection manager must not fail
+        // the handler, and the strict DB path must be unconditional.
+        assert!(!body.contains("Redis projection manager not initialized"));
+        assert!(body.contains("if let Some(mut conn) = redis_compat"));
+        assert!(body.contains("astral_db::apply_revocation_projection_mysql(pool, &jti_keys)"));
+    }
+
+    #[test]
+    fn typed_session_revocation_dispatch_fails_closed_without_acceleration_surface() {
+        // Neither the revocation registry nor the projection store is installed
+        // in this unit-test process; the typed dispatch must refuse (a registry
+        // miss is never an implicit Allow). The guard keeps the test stable if
+        // a future test process installs a surface.
+        if astral_common::session_revocation_registry::global_session_revocation_registry()
+            .is_some()
+            || astral_common::session_projection_store::global_session_projection_store().is_some()
+        {
+            return;
+        }
+        let event = crate::invalidation::InvalidationEvent::SessionRevoked(
+            crate::invalidation::SessionRevoked {
+                user_id: 9,
+                revoked_jtis: vec!["jti-1".into()],
+            },
+        );
+        let error = dispatch_typed_invalidation(event, "event-1", "operation-1")
+            .expect_err("missing acceleration surface must fail closed");
+        assert!(error.contains("no session revocation acceleration surface"));
     }
 
     #[test]
@@ -2415,5 +3953,137 @@ mod tests {
                 .map(|q| q.routing_key),
             Some("auth.session.revocation")
         );
+    }
+
+    /// 【撤销事务 source writer 栅栏】栅栏在事务 begin 之前取得；COMMIT await
+    /// 前武装取消栅栏；commit 证明成功后先 proven 释放栅栏，再进行任何直投/
+    /// 投影——unknown/取消路径以已武装 Drop 保持 sticky uncertain（零投递）。
+    #[test]
+    fn revocation_tx_guard_is_acquired_before_begin_and_released_before_dispatch() {
+        let source = include_str!("consumers.rs");
+        let handler = source
+            .split("async fn handle_auth_session_revocation(")
+            .nth(1)
+            .expect("revocation handler must remain")
+            .split("const MAX_REVOCATION_SNAPSHOT_JTIS: usize")
+            .next()
+            .expect("handler body must stay bounded");
+
+        let guard = handler
+            .find("memory_projection_hub::acquire_source_guard()")
+            .expect("the revocation tx must acquire the hub source writer guard");
+        let begin = handler
+            .find("pool.begin()")
+            .expect("the revocation tx must open with pool.begin()");
+        let arm = handler
+            .find("guard.mark_commit_started()")
+            .expect("the commit await must be armed");
+        let commit = handler
+            .find("tx.commit()")
+            .expect("the source tx must commit");
+        let proven = handler
+            .find("guard.mark_commit_proven()")
+            .expect("a proven commit must disarm the fence");
+        let drop = handler
+            .find("drop(source_guard);")
+            .expect("the writer gate must be released explicitly");
+        let dispatch = handler
+            .find("deliver_committed_session_shards(&committed_shards).await;")
+            .expect("post-commit direct dispatch must remain");
+
+        assert!(
+            guard < begin,
+            "the hub source writer guard must be acquired before the transaction opens"
+        );
+        assert!(
+            arm < commit,
+            "the cancellation fence must arm before awaiting COMMIT"
+        );
+        assert!(
+            proven < drop && drop < dispatch,
+            "the gate is released (proven, then dropped) strictly before any dispatch"
+        );
+    }
+
+    /// 【分片 durable intent 结构锁定】撤销 handler 的 source 事务只允许
+    /// durable source/outbox 写入（含同事务追加的 typed SESSION_REVOKED 分片
+    /// intent，事务内零 MQ/网络）；typed 直投只允许出现在 commit 证明成功
+    /// 之后；快照读取必须有有限容量边界；重试路径（is_new_operation=false）
+    /// 不得重复追加。
+    #[test]
+    fn session_revocation_shard_intent_is_in_tx_and_direct_delivery_only_after_commit() {
+        let source = include_str!("consumers.rs");
+        let handler_start = source
+            .find("async fn handle_auth_session_revocation(")
+            .expect("revocation handler must remain");
+        let helper_start = source
+            .find("const MAX_REVOCATION_SNAPSHOT_JTIS: usize")
+            .expect("snapshot capacity constant must remain");
+        let handler = &source[handler_start..helper_start];
+
+        let snapshot_read = handler
+            .find("ORDER BY jti LIMIT ? FOR UPDATE")
+            .expect("bounded snapshot read must remain");
+        let snapshot_over = handler
+            .find("snapshot.len() > MAX_REVOCATION_SNAPSHOT_JTIS")
+            .expect("over-capacity must fail closed before any mutation");
+        let append = handler
+            .find("append_session_revocation_shards_in_tx(")
+            .expect("same-transaction typed shard append must remain");
+        let commit = handler
+            .find("tx.commit().await.map_err(box_err)?;")
+            .expect("commit proof must remain");
+        let dispatch = handler
+            .find("deliver_committed_session_shards(&committed_shards).await;")
+            .expect("post-commit direct dispatch must remain");
+
+        assert!(
+            snapshot_read < snapshot_over,
+            "the capacity check must guard the bounded snapshot read"
+        );
+        assert!(
+            snapshot_over < append,
+            "over-capacity fails closed before the shard append"
+        );
+        assert!(
+            append < commit,
+            "typed shard intent is appended inside the source transaction, before commit"
+        );
+        assert!(
+            commit < dispatch,
+            "direct delivery happens strictly after a proven commit"
+        );
+
+        // The retry path must not re-append: the only append call site sits
+        // after the is_new_operation outbox insert inside the same branch.
+        let is_new_operation_block = handler
+            .find("if is_new_operation {")
+            .expect("is_new_operation branch must remain");
+        assert!(
+            is_new_operation_block < append,
+            "shard append only happens for a fresh operation, never on replay"
+        );
+
+        // The dispatcher refuses to act without envelopes and never fails the
+        // command on refusal; keep it admission-only by contract.
+        let dispatcher = source
+            .find("async fn deliver_committed_session_shards(")
+            .expect("post-commit dispatcher must remain");
+        assert!(
+            dispatcher > helper_start,
+            "dispatcher stays a separate post-commit helper, not an in-transaction step"
+        );
+    }
+
+    /// 【有限事实边界】单 operation 通知快照容量必须有限且换算成分片数后
+    /// 仍落在短事务/单行 payload 的舒适区间内。
+    #[test]
+    fn revocation_snapshot_capacity_is_finite_and_shard_friendly() {
+        assert_eq!(MAX_REVOCATION_SNAPSHOT_JTIS, 32_768);
+        assert_eq!(
+            MAX_REVOCATION_SNAPSHOT_JTIS.div_ceil(crate::invalidation::MAX_REVOKED_JTIS),
+            32
+        );
+        assert!(MAX_REVOCATION_SNAPSHOT_JTIS.is_multiple_of(crate::invalidation::MAX_REVOKED_JTIS));
     }
 }

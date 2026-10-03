@@ -85,16 +85,17 @@ use sqlx::MySqlPool;
 use tokio::task::JoinHandle;
 
 use astral_db::{
-    claim_next_delta_event_in_partition_tx, claim_next_delta_event_in_tx,
-    decode_delta_event_payload, decode_ledger_row, extend_delta_event_lease, fail_delta_event,
-    hot_state_from_entries, impact_plan_request_from_compiler_plan,
-    load_claimed_delta_event_for_update_in_tx, load_grant_ledger_rows,
-    load_published_aggregate_frontier_in_tx, load_published_parent_reference_views_in_tx,
-    mark_delta_event_quarantined, partition_ledger_at_published_frontier,
-    project_authorization_delta_in_tx, release_delta_event_lease, AuthorizationImpactItemInput,
-    AuthorizationImpactItemType, AuthorizationImpactPlanAppendRequest,
-    AuthorizationProjectionError, AuthorizationStageRequest, ClaimedDeltaEvent,
-    CompileModeEvidence, DeltaEventClaim, DeltaEventClaimScope, DeltaEventType, DeltaLeaseIdentity,
+    claim_delta_event_by_stable_event_in_tx, claim_next_delta_event_in_partition_tx,
+    claim_next_delta_event_in_tx, decode_delta_event_payload, decode_ledger_row,
+    extend_delta_event_lease, fail_delta_event, hot_state_from_entries,
+    impact_plan_request_from_compiler_plan, load_claimed_delta_event_for_update_in_tx,
+    load_grant_ledger_rows, load_published_aggregate_frontier_in_tx,
+    load_published_parent_reference_views_in_tx, mark_delta_event_quarantined,
+    partition_ledger_at_published_frontier, project_authorization_delta_in_tx,
+    release_delta_event_lease, AuthorizationImpactItemInput, AuthorizationImpactItemType,
+    AuthorizationImpactPlanAppendRequest, AuthorizationProjectionError, AuthorizationStageRequest,
+    ClaimedDeltaEvent, ClaimedStableEventOutcome, CompileModeEvidence, DeltaEventAppendRequest,
+    DeltaEventClaim, DeltaEventClaimScope, DeltaEventType, DeltaLeaseIdentity,
     DeltaProjectorExpectation, DeltaProjectorPublishCommand, DeltaProjectorPublishOutcome,
     GrantLedgerEntry, ParentReferenceView, PartitionLeaseHandle, PartitionedGrantLedgerAtFrontier,
     ProjectionAggregateIdentity, PublishRevokeFenceEvidence, PublishedAggregateFrontier,
@@ -305,14 +306,14 @@ impl ProjectorCancellationToken {
         self.notify.notify_one();
     }
 
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         if self.cancelled.load(Ordering::Acquire) {
             return;
         }
         self.notify.notified().await;
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
 }
@@ -328,6 +329,12 @@ pub struct WorkerRunSummary {
     pub events_quarantined: u64,
     pub events_blocked: u64,
     pub events_lease_lost: u64,
+    /// Commit outcome could not be proven; no ordinary retry is permitted.
+    #[serde(default)]
+    pub events_publication_unknown: u64,
+    /// Commit succeeded, but local reads remain on the strict durable fallback.
+    #[serde(default)]
+    pub events_committed_mirror_unavailable: u64,
     /// Number of publish races replanned in-place while retaining the live
     /// lease. This is distinct from claim attempts and ordinary retries.
     pub events_pointer_moved_replanned: u64,
@@ -405,7 +412,7 @@ pub struct ProjectorProgress {
 }
 
 impl ProjectorProgress {
-    fn touch(&self) {
+    pub(crate) fn touch(&self) {
         self.last_progress_ms
             .store(unix_millis(), Ordering::Release);
     }
@@ -429,6 +436,8 @@ impl WorkerRunSummary {
         self.events_quarantined += other.events_quarantined;
         self.events_blocked += other.events_blocked;
         self.events_lease_lost += other.events_lease_lost;
+        self.events_publication_unknown += other.events_publication_unknown;
+        self.events_committed_mirror_unavailable += other.events_committed_mirror_unavailable;
         self.events_pointer_moved_replanned += other.events_pointer_moved_replanned;
         self.events_budget_exhausted += other.events_budget_exhausted;
         self.events_quarantine_unknown += other.events_quarantine_unknown;
@@ -448,7 +457,7 @@ pub struct ProjectorHealthShared {
 }
 
 impl ProjectorHealthShared {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             started_at_ms: unix_millis(),
             generation: AtomicU64::new(0),
@@ -462,9 +471,16 @@ impl ProjectorHealthShared {
         self.generation.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    fn swap_progress(&self, progress: Arc<ProjectorProgress>) {
+    pub(crate) fn swap_progress(&self, progress: Arc<ProjectorProgress>) {
         if let Ok(mut guard) = self.progress.lock() {
             *guard = progress;
+        }
+    }
+
+    /// Mark progress on the current generation's baseline (worker loop use).
+    pub(crate) fn note_progress(&self) {
+        if let Ok(guard) = self.progress.lock() {
+            guard.touch();
         }
     }
 
@@ -480,7 +496,7 @@ impl ProjectorHealthShared {
         }
     }
 
-    fn take_summary(&self) -> WorkerRunSummary {
+    pub(crate) fn take_summary(&self) -> WorkerRunSummary {
         self.summary
             .lock()
             .map(|mut guard| std::mem::take(&mut *guard))
@@ -536,10 +552,29 @@ pub struct AuthorizationProjectorHandle {
 }
 
 impl AuthorizationProjectorHandle {
+    pub(crate) fn ownership_guard(&self) -> ProjectorOwnershipGuard {
+        ProjectorOwnershipGuard {
+            cancellation: self.cancellation.clone(),
+            task: self.join.abort_handle(),
+        }
+    }
+
     /// 只读健康快照：代数/重启数/uptime/停滞年龄/跨代聚合计数。仅含聚合
     /// 计数与时间戳——无租户/卡/grant 语义，无 lease token，不是授权身份。
     pub fn health_snapshot(&self) -> ProjectorHealthSnapshot {
         self.health.snapshot()
+    }
+}
+
+pub(crate) struct ProjectorOwnershipGuard {
+    cancellation: ProjectorCancellationToken,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for ProjectorOwnershipGuard {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.task.abort();
     }
 }
 
@@ -556,19 +591,21 @@ pub async fn shutdown_authorization_projector(
     handle: AuthorizationProjectorHandle,
     timeout: Duration,
 ) -> ShutdownReport {
+    let _ownership = handle.ownership_guard();
     handle.cancellation.cancel();
     let started = Instant::now();
-    // 层结构：JoinHandle<T> 作为 Future 的 Output 是 `Result<T, JoinError>`；
-    // 监督任务返回 `Result<WorkerRunSummary, String>`，timeout 再包一层
-    // Elapsed —— 共四层。
-    let summary = match tokio::time::timeout(timeout, handle.join).await {
+    let mut join = handle.join;
+    let summary = match tokio::time::timeout(timeout, &mut join).await {
         Ok(Ok(Ok(summary))) => Ok(summary),
         Ok(Ok(Err(failure))) => Err(failure),
         Ok(Err(join_error)) => Err(format!("supervisor task failed: {join_error}")),
-        Err(_) => Err(format!(
-            "projector did not stop within {:?}; possibly stuck in a publish transaction",
-            timeout
-        )),
+        Err(_) => {
+            join.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(1), &mut join).await;
+            Err(format!(
+                "projector did not stop within {timeout:?}; aborted; final durable outcome unknown"
+            ))
+        }
     };
     tracing::info!(
         run_id = %handle.run_id,
@@ -732,10 +769,67 @@ impl Default for AuthorizationProjectorConfig {
 
 /// Start one owned projector task backed by the sqlx runtime. The caller MUST
 /// keep the handle and invoke [`shutdown_authorization_projector`].
+///
+/// Single-node selection: when the process-global local projection bus AND the
+/// memory mirror are installed (single-node composition order), projection is
+/// owned EXCLUSIVELY by the in-process worker ([`super::local_projection_worker`])
+/// which consumes commit-proven dispatches directly — the 5s DB-poll loop does
+/// NOT run on that path (documented single-node discipline: normal local
+/// operation never DB-polls). A start failure of the in-process worker is a
+/// TERMINAL start failure: the returned handle resolves `Err` immediately and
+/// health records it; there is deliberately NO silent fallback to DB polling
+/// (a second projector owner racing the composition is strictly worse than a
+/// loud, restartable startup failure).
 pub fn start_authorization_projector(
     db: MySqlPool,
     config: AuthorizationProjectorConfig,
 ) -> AuthorizationProjectorHandle {
+    if super::local_projection_worker::local_projection_direct_path_ready() {
+        return match super::local_projection_worker::start_local_projection_worker(
+            db,
+            super::local_projection_worker::LocalProjectionWorkerConfig {
+                projector: config,
+                ..Default::default()
+            },
+        ) {
+            Ok(handle) => {
+                tracing::info!(
+                    run_id = %handle.run_id,
+                    "authorization projector started on the in-process local bus path \
+                     (DB-poll loop disabled; low-frequency proven recovery only)"
+                );
+                handle
+            }
+            Err(error) => {
+                // Terminal: no DB-poll fallback. The join resolves Err at once
+                // so the caller's shutdown/join path observes the failure and
+                // the process can exit/restart loudly. Additionally record the
+                // required-owner failure NOW (global liveness Dead + hub
+                // sticky runtime_owner_failed) so a rejected start — e.g. the
+                // empty-tenant-scope contract — is a loud composite-level
+                // startup failure instead of a process serving strict-DB
+                // reads with no projection owner.
+                super::local_projection_worker::record_local_worker_start_failure(
+                    &error.to_string(),
+                );
+                tracing::error!(
+                    error = %error,
+                    "in-process projector start failed terminally; NO DB-poll fallback \
+                     (single-node discipline), restart required"
+                );
+                AuthorizationProjectorHandle {
+                    cancellation: ProjectorCancellationToken::default(),
+                    join: tokio::spawn(async move {
+                        Err(format!(
+                            "code=auth_projector.local_start_failed_terminally;error={error}"
+                        ))
+                    }),
+                    run_id: uuid::Uuid::new_v4().to_string(),
+                    health: Arc::new(ProjectorHealthShared::new()),
+                }
+            }
+        };
+    }
     let runtime: Arc<dyn AuthorizationProjectorRuntime> =
         Arc::new(SqlxAuthorizationProjectorRuntime::new(db));
     start_authorization_projector_with_runtime(runtime, config)
@@ -1362,6 +1456,14 @@ async fn run_worker(
 pub enum RuntimeAccessError {
     #[error("database access failed: {0}")]
     Database(String),
+    /// The publication may already be committed. No lease mutation or replay
+    /// is permitted until durable state has been reconciled.
+    #[error("publication outcome requires reconciliation: {0}")]
+    PublicationUnknown(String),
+    /// Durable commit succeeded, but the local read mirror is unavailable.
+    /// Reads defer to the strict repository; this event must not be replayed.
+    #[error("publication committed with unavailable local mirror: {0}")]
+    CommittedMirrorUnavailable(String),
     #[error("repository rejected the operation: {0}")]
     Repository(RepositoryRejection),
 }
@@ -1428,6 +1530,24 @@ pub trait AuthorizationProjectorRuntime: Send + Sync + 'static {
         lease_seconds: i64,
     ) -> Result<Option<DeltaEventClaim>, RuntimeAccessError>;
 
+    /// Direct-dispatch claim port (local in-process projector path): claim
+    /// ONE event by its stable event identity inside ONE transaction,
+    /// re-binding the commit-proven [`DeltaEventAppendRequest`] payload
+    /// field-by-field against the durable row. The transaction commits inside
+    /// (both for `Claimed` and for the no-mutation outcomes). Default fails
+    /// closed: runtimes that have not opted into the direct-dispatch path
+    /// never claim by dispatch.
+    async fn claim_event_by_dispatch(
+        &self,
+        _request: &DeltaEventAppendRequest,
+        _lease_owner: &str,
+        _lease_seconds: i64,
+    ) -> Result<ClaimedStableEventOutcome, RuntimeAccessError> {
+        Err(RuntimeAccessError::Repository(RepositoryRejection::Other(
+            "code=auth_projector.claim_by_dispatch_unsupported".to_owned(),
+        )))
+    }
+
     /// Strict re-read of the leased row (lease proof re-verified inside SQL).
     async fn read_claimed_event(
         &self,
@@ -1460,8 +1580,9 @@ pub trait AuthorizationProjectorRuntime: Send + Sync + 'static {
         card_id: Option<i64>,
     ) -> Result<Vec<RawLedgerRow>, RuntimeAccessError>;
 
-    /// Execute the fixed single-transaction publish sequence and commit.
-    /// Failure rolls everything back atomically.
+    /// Execute the fixed publish sequence and commit. A statement failure rolls
+    /// back; commit errors require reconciliation, and local-mirror failure may
+    /// occur after durable commit without permitting any event replay.
     async fn execute_projection_publish(
         &self,
         command: &DeltaProjectorPublishCommand,
@@ -1631,6 +1752,22 @@ impl SqlxAuthorizationProjectorRuntime {
 
 #[async_trait]
 impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
+    async fn claim_event_by_dispatch(
+        &self,
+        request: &DeltaEventAppendRequest,
+        lease_owner: &str,
+        lease_seconds: i64,
+    ) -> Result<ClaimedStableEventOutcome, RuntimeAccessError> {
+        let mut tx = self.pool.begin().await?;
+        let outcome =
+            claim_delta_event_by_stable_event_in_tx(&mut tx, request, lease_owner, lease_seconds)
+                .await?;
+        // Commit every arm: Claimed installs the lease; AlreadyProcessed /
+        // Busy / InDoubt made no mutation (read-only lock released by commit).
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
     async fn claim_next_event(
         &self,
         scope: &DeltaEventClaimScope,
@@ -1807,7 +1944,12 @@ impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
         // writes (the transaction holds no locks yet — nothing to roll back).
         extend_delta_event_lease(&mut *tx, &command.delta_lease_identity, CLAIM_LEASE_SECS).await?;
         let outcome = project_authorization_delta_in_tx(&mut tx, command).await?;
-        tx.commit().await?;
+        tx.commit().await.map_err(|error| {
+            RuntimeAccessError::PublicationUnknown(format!(
+                "code=auth_projector.publish_commit_unknown;event={};error={error}",
+                command.expectation.event_id
+            ))
+        })?;
         #[cfg(feature = "e3-observability")]
         log_e3_identity_event(
             "publish_committed",
@@ -1816,9 +1958,16 @@ impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
             true,
             None,
         );
-        // 发布已 durable commit（commit 证明之后）：把本次发布涉及的卡聚合
-        // evidence 推入 L2 Redis 分发层（跨实例共享、进程重启不冷）。推送
-        // 失败静默 —— L2 miss 的自然回源保证正确性，推送只是共享优化。
+        if let Some(hub) = astral_db::memory_projection_hub::memory_projection_hub() {
+            hub.install_committed_publication(&outcome)
+                .map_err(|error| {
+                    RuntimeAccessError::CommittedMirrorUnavailable(format!(
+                        "code=auth_projector.memory_install_after_commit_failed;{error}"
+                    ))
+                })?;
+        }
+        // L2 is optional distribution; it cannot delay installation of the
+        // committed local state or act as its completion proof.
         push_published_evidence_to_l2_after_commit(&self.pool, command).await;
         Ok(outcome)
     }
@@ -2679,6 +2828,10 @@ enum PublishFailureHandling {
     PointerMoved { reason: String },
     /// Our lease died mid-flight; NOTHING may be mutated for this event.
     LeaseLost { reason: String },
+    /// Commit is unknown; no further writes are allowed.
+    PublicationUnknown { reason: String },
+    /// Commit is proven, but local installation requires recovery.
+    CommittedMirrorUnavailable { reason: String },
     /// Immutable divergence needing operator review.
     ImmutableDivergence { reason: String },
     /// Byte-identical segment content already exists but was stamped by a
@@ -2716,8 +2869,13 @@ fn projection_machine_code(message: &str) -> Option<&str> {
 fn classify_publish_failure(error: &RuntimeAccessError) -> PublishFailureHandling {
     let rendered = error.to_string();
     match error {
-        // Query/connection trouble inside the rolled-back transaction is the
-        // textbook transient fault.
+        RuntimeAccessError::PublicationUnknown(_) => {
+            PublishFailureHandling::PublicationUnknown { reason: rendered }
+        }
+        RuntimeAccessError::CommittedMirrorUnavailable(_) => {
+            PublishFailureHandling::CommittedMirrorUnavailable { reason: rendered }
+        }
+        // Query/connection trouble before commit stays under the attempt budget.
         RuntimeAccessError::Database(_) => {
             PublishFailureHandling::GenericRetry { reason: rendered }
         }
@@ -3221,6 +3379,52 @@ pub(crate) async fn process_one_event(
         return;
     }
 
+    process_verified_claim(
+        runtime,
+        config,
+        lease_owner,
+        cancellation,
+        claimed,
+        &claimed_row,
+        identity,
+        readback_us,
+        summary,
+    )
+    .await;
+}
+
+/// Phases 2-5 of the projector pipeline for a claim whose payload and lease
+/// are ALREADY verified in hand.
+///
+/// `claimed_row` is the strict [`ClaimedDeltaEvent`] for `claimed`: either the
+/// queue path's post-claim readback, or the direct-dispatch path's
+/// same-transaction claim payload (`claim_delta_event_by_stable_event_in_tx`
+/// returns claim + payload from ONE committed transaction, so the direct path
+/// never reloads the payload by id). `readback_us` carries the queue path's
+/// readback timing (`0` on the direct path) for the phase log.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn process_verified_claim(
+    runtime: &Arc<dyn AuthorizationProjectorRuntime>,
+    config: &AuthorizationProjectorConfig,
+    lease_owner: &str,
+    cancellation: &ProjectorCancellationToken,
+    claimed: &DeltaEventClaim,
+    claimed_row: &ClaimedDeltaEvent,
+    identity: ProjectionAggregateIdentity,
+    readback_us: u64,
+    summary: &mut WorkerRunSummary,
+) {
+    let total_started = Instant::now();
+    let _total_timer = ProjectorPhaseTimer::new(ProjectorPhase::Total);
+    // Lease identity is derivable purely from the claim and needed by EVERY
+    // failure funnel below, so it is built once up-front.
+    let delta_lease_identity = DeltaLeaseIdentity {
+        delta_event_id: claimed.delta_event_id,
+        event_id: claimed.event_id.clone(),
+        lease_owner: claimed.lease_owner.clone(),
+        lease_token: claimed.lease_token.clone(),
+    };
+
     // Phase 2-5 run as one bounded fresh-world loop. A publish transaction may
     // legitimately discover that another publisher advanced the same pointer
     // after our planning read. That is not a failed event attempt: retain the
@@ -3304,7 +3508,7 @@ pub(crate) async fn process_one_event(
         // Phase 4: pure decision (verify, partition, compile, assemble).
         let decide_started = Instant::now();
         let input = EventDecisionInput {
-            claimed: &claimed_row,
+            claimed: claimed_row,
             publication: publication.as_ref(),
             ledger_rows: &ledger_rows,
             identity: identity.clone(),
@@ -3521,7 +3725,11 @@ async fn quarantine_event_terminal(
                  reconciliation required before any further mutation"
             );
         }
-        Err(RuntimeAccessError::Database(query_failure)) => {
+        Err(
+            RuntimeAccessError::Database(query_failure)
+            | RuntimeAccessError::PublicationUnknown(query_failure)
+            | RuntimeAccessError::CommittedMirrorUnavailable(query_failure),
+        ) => {
             summary.events_quarantine_unknown += 1;
             record_projector_event(ProjectorEventOutcome::QuarantineUnknown);
             tracing::warn!(
@@ -3695,6 +3903,37 @@ async fn act_on_disposition(
                 Err(error) => {
                     record_projector_phase(ProjectorPhase::Publish, publish_started.elapsed());
                     match classify_publish_failure(&error) {
+                        PublishFailureHandling::CommittedMirrorUnavailable { reason } => {
+                            summary.events_committed_mirror_unavailable += 1;
+                            record_projector_event(
+                                ProjectorEventOutcome::CommittedMirrorUnavailable,
+                            );
+                            tracing::error!(
+                                event_id = %claimed.event_id,
+                                operation_id = %claimed.operation_id,
+                                reason = %reason,
+                                durable_committed = true,
+                                "local mirror unavailable after commit; strict reads continue, restart rebuild required"
+                            );
+                        }
+                        PublishFailureHandling::PublicationUnknown { reason } => {
+                            summary.events_publication_unknown += 1;
+                            record_projector_event(ProjectorEventOutcome::PublicationUnknown);
+                            #[cfg(feature = "e3-observability")]
+                            log_e3_attempt_event(
+                                "terminal_unknown",
+                                claimed,
+                                "publication_unknown",
+                                false,
+                                None,
+                            );
+                            tracing::warn!(
+                                event_id = %claimed.event_id,
+                                operation_id = %claimed.operation_id,
+                                reason = %reason,
+                                "publication requires reconciliation; no retry or lease mutation"
+                            );
+                        }
                         PublishFailureHandling::LeaseLost { reason } => {
                             summary.record(DispositionKind::LeaseLost);
                             #[cfg(feature = "e3-observability")]
@@ -7093,6 +7332,8 @@ mod tests {
         PointerMoved,
         GenericRetry,
         LeaseLost,
+        CommitUnknown,
+        InstallAfterCommitFailed,
         Success,
     }
 
@@ -7118,6 +7359,39 @@ mod tests {
 
     fn replan_success() -> DeltaProjectorPublishOutcome {
         let identity = ProjectionAggregateIdentity::new(7, "CARD", 17).unwrap();
+        let pointer = AuthorizationCurrentPointerRecord {
+            pointer_id: 1,
+            identity,
+            card_id: Some(17),
+            current_generation: 1,
+            manifest_id: 1,
+            event_id: "evt-q".to_owned(),
+            operation_id: "op-q".to_owned(),
+            semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap(),
+            dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap(),
+            compiler_version: policy_engine::COMPILER_VERSION.to_owned(),
+            revoke_fence: 0,
+            revoke_fence_proven: true,
+            cas_version: 1,
+        };
+        let published_state = Arc::new(astral_db::AuthorizationPublishedState {
+            pointer: pointer.clone(),
+            manifest_id: pointer.manifest_id,
+            generation: pointer.current_generation,
+            source_generation: 5,
+            projected_generation: 5,
+            event_id: pointer.event_id.clone(),
+            operation_id: pointer.operation_id.clone(),
+            semantic_hash: pointer.semantic_hash,
+            dependency_hash: pointer.dependency_hash,
+            compiler_version: pointer.compiler_version.clone(),
+            manifest_digest: Sha256Digest::from_hex(HASH_A).unwrap(),
+            parent_manifest_id: None,
+            revoke_fence: pointer.revoke_fence,
+            segments: Vec::new(),
+            references: Vec::new(),
+            total_grant_count: 1,
+        });
         DeltaProjectorPublishOutcome {
             impact_plan: astral_db::AuthorizationImpactPlanOutcome {
                 plan_id: 1,
@@ -7136,21 +7410,8 @@ mod tests {
             },
             archive_intent: None,
             publish: astral_db::AuthorizationPublishOutcome {
-                pointer: AuthorizationCurrentPointerRecord {
-                    pointer_id: 1,
-                    identity,
-                    card_id: Some(17),
-                    current_generation: 1,
-                    manifest_id: 1,
-                    event_id: "evt-q".to_owned(),
-                    operation_id: "op-q".to_owned(),
-                    semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap(),
-                    dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap(),
-                    compiler_version: policy_engine::COMPILER_VERSION.to_owned(),
-                    revoke_fence: 0,
-                    revoke_fence_proven: true,
-                    cas_version: 1,
-                },
+                pointer,
+                published_state,
                 published_manifest_id: 1,
                 previous_superseded_manifest_id: None,
                 initialized_first_pointer: true,
@@ -7222,6 +7483,12 @@ mod tests {
                     AuthorizationProjectionError::LeaseCasFailed(
                         "code=grant_repository.complete_lost_lease;event=evt-q".to_owned(),
                     ),
+                )),
+                ReplanPublishStep::CommitUnknown => Err(RuntimeAccessError::PublicationUnknown(
+                    "code=auth_projector.publish_commit_unknown;event=evt-q".to_owned(),
+                )),
+                ReplanPublishStep::InstallAfterCommitFailed => Err(RuntimeAccessError::CommittedMirrorUnavailable(
+                    "code=auth_projector.memory_install_after_commit_failed;event=evt-q".to_owned(),
                 )),
                 ReplanPublishStep::Success => Ok(replan_success()),
             }
@@ -7378,6 +7645,53 @@ mod tests {
         assert!(!harness.calls().contains(&"fail"));
         assert!(!harness.calls().contains(&"release"));
         assert!(!harness.calls().contains(&"mark"));
+    }
+
+    #[tokio::test]
+    async fn unknown_commit_or_post_commit_install_never_replays_or_mutates_lease() {
+        for (step, commit_unknown) in [
+            (ReplanPublishStep::CommitUnknown, true),
+            (ReplanPublishStep::InstallAfterCommitFailed, false),
+        ] {
+            let harness = Arc::new(ReplanHarness::new([step]));
+            let claimed = harness_claim();
+            let mut summary = WorkerRunSummary::default();
+            run_replan_test(&harness, &mut summary, &claimed).await;
+            assert_eq!(summary.events_published, 0);
+            assert_eq!(
+                summary.events_publication_unknown,
+                u64::from(commit_unknown)
+            );
+            assert_eq!(
+                summary.events_committed_mirror_unavailable,
+                u64::from(!commit_unknown)
+            );
+            assert_eq!(summary.events_lease_lost, 0);
+            assert_eq!(summary.events_released_retry, 0);
+            assert_eq!(
+                harness.calls(),
+                vec!["read", "observe", "ledger", "publish"]
+            );
+        }
+    }
+
+    #[test]
+    fn local_mirror_install_follows_commit_and_precedes_optional_l2() {
+        let source = include_str!("authorization_projector.rs");
+        let body = source
+            .split("let outcome = project_authorization_delta_in_tx")
+            .nth(1)
+            .unwrap()
+            .split("async fn fail_event")
+            .next()
+            .unwrap();
+        let commit = body.find("tx.commit()").unwrap();
+        let install = body.find("install_committed_publication").unwrap();
+        let l2 = body
+            .find("push_published_evidence_to_l2_after_commit")
+            .unwrap();
+        assert!(commit < install && install < l2);
+        assert!(!body.contains("refresh_from_durable"));
     }
 
     #[test]

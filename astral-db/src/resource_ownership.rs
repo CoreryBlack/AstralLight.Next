@@ -6,8 +6,12 @@
 //! explicit fail-closed outcome; it is never interpreted as the caller owning
 //! the target.
 
+use std::future::Future;
+
 use astral_types::{GlobalAccessRequirement, PolicyContext, ResourceOwnershipScope};
 use sqlx::MySqlPool;
+
+mod memory;
 
 /// Result of resolving a protected route's target resource.
 ///
@@ -93,7 +97,68 @@ impl ResourceOwnershipResolution {
 /// resolver re-reads the card from `user_card` and verifies its owner against the
 /// signed actor before deriving any target facts; it never copies signed
 /// tenant/domain headers into the target scope.
+///
+/// Public signature is frozen. The strict DB resolver below is the only
+/// authority; a process-local memory read face (see [`memory`]) may serve
+/// previously strict-verified positive `TenantScoped` outcomes for normal
+/// protected routes when the composite single-node gate is open (healthy hub +
+/// installed auxiliary authorization mirror). Chat-table lookups and all
+/// negative outcomes always take the strict path.
 pub async fn resolve_resource_ownership(
+    pool: &MySqlPool,
+    resource: &str,
+    path: &str,
+    method: &str,
+    query_target_id: Option<i64>,
+    actor_card_id: Option<i64>,
+    actor_user_id: Option<i64>,
+) -> ResourceOwnershipResolution {
+    match resolve_plan(
+        resource,
+        path,
+        method,
+        query_target_id,
+        actor_card_id,
+        actor_user_id,
+    ) {
+        ResolvePlan::Pure(outcome) => outcome,
+        ResolvePlan::LegacyStrictOnly => {
+            resolve_resource_ownership_strict(
+                pool,
+                resource,
+                path,
+                method,
+                query_target_id,
+                actor_card_id,
+                actor_user_id,
+            )
+            .await
+        }
+        ResolvePlan::MemoryEligible(key) => {
+            resolve_memory_backed(
+                crate::memory_projection_hub().cloned(),
+                crate::auxiliary_authorization_mirror().is_some(),
+                key,
+                || {
+                    resolve_resource_ownership_strict(
+                        pool,
+                        resource,
+                        path,
+                        method,
+                        query_target_id,
+                        actor_card_id,
+                        actor_user_id,
+                    )
+                },
+            )
+            .await
+        }
+    }
+}
+
+/// Strict DB resolver: the frozen authoritative implementation. Every memory
+/// path is a bounded cache over this function; nothing else may produce facts.
+async fn resolve_resource_ownership_strict(
     pool: &MySqlPool,
     resource: &str,
     path: &str,
@@ -134,6 +199,170 @@ pub async fn resolve_resource_ownership(
         RouteOwnershipContract::Unresolved { code } => {
             ResourceOwnershipResolution::Unresolved { code }
         }
+    }
+}
+
+/// 记忆读面的复合激活门：hub 已安装**且**单机辅助授权镜像已全局安装才
+/// 激活（复合标记 —— 独立 Rabbit hub、独立服务进程、纯测试一律回落既有
+/// 严格 DB 读）。协议：
+///
+/// - `strict_read_token()` 为 `None`（writer-active / uncertain）：fail-closed
+///   `Unavailable`，零 DB 查询，绝不回源旧状态放行；
+/// - 通道不健康（StrictRequired）：绕过缓存，有界严格读 + 返回前最终 token
+///   复验（健康不确定允许 —— source writer 证明必须当前）；
+/// - 健康 Ready：[`memory::OwnershipMemory::serve_or_refill`]（token 先于
+///   await 捕获、install/return 前复验、只缓存正向已验证 TenantScoped）。
+///
+/// `hub` 与 `strict` 均为注入缝：生产入口传进程级 hub 与既有严格 resolver，
+/// 同 crate 测试注入本地 hub 与受控 fake（仅私有可见）。
+async fn resolve_memory_backed<S, Fut>(
+    hub: Option<crate::memory_projection_hub::MemoryProjectionHub>,
+    auxiliary_mirror_installed: bool,
+    key: memory::OwnershipMemoryKey,
+    strict: S,
+) -> ResourceOwnershipResolution
+where
+    S: FnOnce() -> Fut,
+    Fut: Future<Output = ResourceOwnershipResolution>,
+{
+    let (Some(hub), true) = (hub, auxiliary_mirror_installed) else {
+        return strict().await;
+    };
+    let Some(token) = hub.strict_read_token() else {
+        return memory::unavailable(memory::CODE_WRITER_REFUSED);
+    };
+    if !hub.channel_is_healthy() {
+        return match tokio::time::timeout(memory::REFILL_QUERY_DEADLINE, strict()).await {
+            Ok(outcome) if hub.strict_read_matches(token) => outcome,
+            Ok(_) => memory::unavailable(memory::CODE_RACED_RETURN),
+            Err(_) => memory::unavailable(memory::CODE_STRICT_TIMEOUT),
+        };
+    }
+    memory::global_ownership_memory()
+        .serve_or_refill(&hub, token, key, strict)
+        .await
+}
+
+/// 单次解析的执行计划。Global 与路由级 Unresolved 本来就是纯路由派生
+/// （0 SQL），直接返回，不触碰 gate 与缓存。
+#[derive(Debug)]
+enum ResolvePlan {
+    Pure(ResourceOwnershipResolution),
+    /// 完全不走记忆路径：chat 冻结表 lookup（写者不受 hub 栅栏保护）与
+    /// 超界键，保持既有严格 DB 显式限制。
+    LegacyStrictOnly,
+    /// 正常受保护目标：允许在复合激活门下走记忆读面。
+    MemoryEligible(memory::OwnershipMemoryKey),
+}
+
+fn resolve_plan(
+    resource: &str,
+    path: &str,
+    method: &str,
+    query_target_id: Option<i64>,
+    actor_card_id: Option<i64>,
+    actor_user_id: Option<i64>,
+) -> ResolvePlan {
+    match route_ownership_contract(resource, path, method, query_target_id) {
+        RouteOwnershipContract::Global {
+            target_id,
+            access_requirement,
+        } => ResolvePlan::Pure(ResourceOwnershipResolution::Global {
+            target_id,
+            access_requirement,
+        }),
+        RouteOwnershipContract::Unresolved { code } => {
+            ResolvePlan::Pure(ResourceOwnershipResolution::Unresolved { code })
+        }
+        RouteOwnershipContract::ActorUnit => match (actor_card_id, actor_user_id) {
+            (Some(_), Some(_)) => memory_plan(
+                resource,
+                path,
+                method,
+                query_target_id,
+                actor_card_id,
+                actor_user_id,
+            ),
+            (None, _) => ResolvePlan::Pure(ResourceOwnershipResolution::Unresolved {
+                code: "resource_ownership.actor_card_missing",
+            }),
+            (_, None) => ResolvePlan::Pure(ResourceOwnershipResolution::Unresolved {
+                code: "resource_ownership.actor_user_missing",
+            }),
+        },
+        RouteOwnershipContract::OrgMembership { .. } => memory_plan(
+            resource,
+            path,
+            method,
+            query_target_id,
+            actor_card_id,
+            actor_user_id,
+        ),
+        RouteOwnershipContract::TenantTarget { lookup, .. } => {
+            if memory_supported_kind(lookup) {
+                memory_plan(
+                    resource,
+                    path,
+                    method,
+                    query_target_id,
+                    actor_card_id,
+                    actor_user_id,
+                )
+            } else {
+                ResolvePlan::LegacyStrictOnly
+            }
+        }
+    }
+}
+
+/// 记忆路径支持的 lookup kind **闭合清单**（穷尽 match、无通配臂）：新增
+/// lookup kind 必须先在此分类 —— 默认落入 `false`（LegacyStrictOnly，闭合
+/// 门），只有其事实面全部写点完成 hub 栅栏覆盖并更新
+/// `memory_writer_coverage_inventory` 后才允许开启 `true`。
+///
+/// chat 三变体（`ChatConversation` / `ChatConversationWithoutOwner` /
+/// `ChatMessage`）读冻结仓 astral-chat 的表，写者不受 hub 栅栏保护：永久
+/// 闭合 —— 绝不缓存无失效语义的授权事实。
+fn memory_supported_kind(kind: TargetLookupKind) -> bool {
+    match kind {
+        TargetLookupKind::Tenant
+        | TargetLookupKind::EnterpriseOrganization
+        | TargetLookupKind::UserCard
+        | TargetLookupKind::User
+        | TargetLookupKind::Delegation
+        | TargetLookupKind::LevelTemplate
+        | TargetLookupKind::RuleSet
+        | TargetLookupKind::PermissionRule
+        | TargetLookupKind::OrgScopeRequest
+        | TargetLookupKind::PermissionRequest
+        | TargetLookupKind::AuditRecord
+        | TargetLookupKind::CardTemplate
+        | TargetLookupKind::UserLevel
+        | TargetLookupKind::UserGrading => true,
+        TargetLookupKind::ChatConversation
+        | TargetLookupKind::ChatConversationWithoutOwner
+        | TargetLookupKind::ChatMessage => false,
+    }
+}
+
+fn memory_plan(
+    resource: &str,
+    path: &str,
+    method: &str,
+    query_target_id: Option<i64>,
+    actor_card_id: Option<i64>,
+    actor_user_id: Option<i64>,
+) -> ResolvePlan {
+    match memory::OwnershipMemoryKey::new(
+        resource,
+        path,
+        method,
+        query_target_id,
+        actor_card_id,
+        actor_user_id,
+    ) {
+        Some(key) => ResolvePlan::MemoryEligible(key),
+        None => ResolvePlan::LegacyStrictOnly,
     }
 }
 
@@ -2235,8 +2464,7 @@ mod tests {
                             &route.path,
                             route.method,
                             code,
-                        ) || (principal_kind_bypass
-                            && code == "resource_ownership.target_missing"),
+                        ) || (principal_kind_bypass && code == "resource_ownership.target_missing"),
                         "protected route has an unreviewed fail-closed resolver outcome: {service}:{}:{} resource={resource} code={code}",
                         route.method,
                         route.path,
@@ -2661,6 +2889,418 @@ mod tests {
                 !production.contains("PolicyContext::builder("),
                 "{service} production HTTP middleware must not bypass the resolver with a hand-built context"
             );
+        }
+    }
+
+    // ── memory ownership 读面：计划、复合激活门与写面覆盖清单 ──────────────
+    //
+    // 纯缝测试：全部使用本地 hub 实例与注入的 fake 严格 resolver，绝不安装
+    // 进程级 global hub / 辅助镜像（跨测试无 reset），也绝不触达
+    // global_ownership_memory（健康记忆分支由 memory.rs 用本地实例覆盖）。
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use crate::memory_projection_hub::MemoryProjectionHub;
+
+    fn gate_key(path: &str) -> memory::OwnershipMemoryKey {
+        memory::OwnershipMemoryKey::new("identity_users", path, "GET", None, Some(1), Some(2))
+            .expect("bounded gate key")
+    }
+
+    fn gate_tenant_scoped(tenant_id: i64) -> ResourceOwnershipResolution {
+        ResourceOwnershipResolution::TenantScoped {
+            target_id: Some(7),
+            tenant_id,
+            domain_id: Some(8),
+            owner_id: Some(9),
+        }
+    }
+
+    #[test]
+    fn chat_lookup_variants_never_enter_the_memory_plan() {
+        for (resource, path, method) in [
+            ("chat_conversation", "/sessions/7", "GET"),
+            ("chat_conversation", "/groups/7", "PUT"),
+            ("chat_message", "/messages/7", "GET"),
+            ("chat_message", "/messages/session/7", "GET"),
+            ("chat_message", "/receipts/7", "POST"),
+        ] {
+            assert!(
+                matches!(
+                    resolve_plan(resource, path, method, None, Some(1), Some(2)),
+                    ResolvePlan::LegacyStrictOnly
+                ),
+                "frozen chat table lookups must stay strictly DB: {resource} {path} {method}"
+            );
+        }
+        // chat 的 /ws/ 路由读的是 user_card（受栅栏写者），不是 chat 表。
+        assert!(matches!(
+            resolve_plan("chat_conversation", "/ws/7", "GET", None, Some(1), Some(2)),
+            ResolvePlan::MemoryEligible(_)
+        ));
+    }
+
+    #[test]
+    fn global_and_route_unresolved_plans_stay_pure_without_memory_interaction() {
+        assert!(matches!(
+            resolve_plan("identity_users", "/users", "GET", None, None, None),
+            ResolvePlan::Pure(ResourceOwnershipResolution::Global { .. })
+        ));
+        assert!(matches!(
+            resolve_plan("platform_dept", "/departments/7", "PUT", None, None, None),
+            ResolvePlan::Pure(ResourceOwnershipResolution::Unresolved { .. })
+        ));
+        match resolve_plan("permission_rule", "/delegations", "POST", None, None, None) {
+            ResolvePlan::Pure(ResourceOwnershipResolution::Unresolved { code }) => {
+                assert_eq!(code, "resource_ownership.actor_card_missing");
+            }
+            other => panic!("expected a pure actor_card_missing plan, got {other:?}"),
+        }
+        match resolve_plan(
+            "permission_rule",
+            "/delegations",
+            "POST",
+            None,
+            Some(1),
+            None,
+        ) {
+            ResolvePlan::Pure(ResourceOwnershipResolution::Unresolved { code }) => {
+                assert_eq!(code, "resource_ownership.actor_user_missing");
+            }
+            other => panic!("expected a pure actor_user_missing plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_plans_bind_the_full_route_derived_identity() {
+        let ResolvePlan::MemoryEligible(key) =
+            resolve_plan("identity_users", "/users/7", "GET", None, Some(1), Some(2))
+        else {
+            panic!("a normal user target must be memory eligible");
+        };
+        assert_eq!(
+            key,
+            memory::OwnershipMemoryKey::new(
+                "identity_users",
+                "/users/7",
+                "GET",
+                None,
+                Some(1),
+                Some(2)
+            )
+            .expect("bounded key")
+        );
+        for drifted in [
+            memory::OwnershipMemoryKey::new(
+                "identity_users",
+                "/users/8",
+                "GET",
+                None,
+                Some(1),
+                Some(2),
+            )
+            .expect("bounded key"),
+            memory::OwnershipMemoryKey::new(
+                "identity_users",
+                "/users/7",
+                "POST",
+                None,
+                Some(1),
+                Some(2),
+            )
+            .expect("bounded key"),
+            memory::OwnershipMemoryKey::new(
+                "identity_users",
+                "/users/7",
+                "GET",
+                Some(7),
+                Some(1),
+                Some(2),
+            )
+            .expect("bounded key"),
+            memory::OwnershipMemoryKey::new(
+                "identity_users",
+                "/users/7",
+                "GET",
+                None,
+                Some(3),
+                Some(2),
+            )
+            .expect("bounded key"),
+            memory::OwnershipMemoryKey::new(
+                "identity_users",
+                "/users/7",
+                "GET",
+                None,
+                Some(1),
+                Some(4),
+            )
+            .expect("bounded key"),
+            memory::OwnershipMemoryKey::new(
+                "platform_tenant",
+                "/users/7",
+                "GET",
+                None,
+                Some(1),
+                Some(2),
+            )
+            .expect("bounded key"),
+        ] {
+            assert_ne!(key, drifted, "every route-derived input must be in the key");
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_gate_requires_the_full_composite_marker() {
+        // hub 与辅助镜像全局安装二者缺一（独立 Rabbit hub / 独立服务进程 /
+        // 纯测试）：直接走既有严格 resolver（factory 被调用），绝不激活
+        // 记忆路径。
+        let hub = MemoryProjectionHub::default();
+        hub.record_channel_heartbeat();
+        for (hub, mirror_installed) in [(None, true), (Some(hub.clone()), false), (None, false)] {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let counter_for_factory = counter.clone();
+            let factory = move || {
+                let counter = counter_for_factory.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    gate_tenant_scoped(100)
+                }
+            };
+            let outcome =
+                resolve_memory_backed(hub, mirror_installed, gate_key("/users/7"), factory).await;
+            assert_eq!(outcome, gate_tenant_scoped(100));
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    // 仅测试：guard Drop/mark_uncertain 会清全局 L1 eligibility 缓存（跨测试
+    // 互斥），与 hub 测试共享 test_global_state_lock；std 锁跨 await 为测试
+    // 局部取舍（current_thread runtime 内自持）。
+    #[allow(clippy::await_holding_lock)]
+    async fn writer_active_and_uncertain_refuse_with_zero_queries() {
+        let _test_guard = crate::eligibility::test_global_state_lock();
+        let hub = MemoryProjectionHub::default();
+        hub.record_channel_heartbeat();
+        let writer = hub.begin_source_transaction().expect("writer guard");
+        let outcome =
+            resolve_memory_backed(Some(hub.clone()), true, gate_key("/users/7"), || async {
+                panic!("writer-active refusal must not query")
+            })
+            .await;
+        assert_eq!(
+            outcome,
+            ResourceOwnershipResolution::Unavailable {
+                code: memory::CODE_WRITER_REFUSED
+            }
+        );
+        // 已判定失败 → sticky uncertain：栅栏释放后同样拒绝、零查询。
+        writer.mark_uncertain();
+        drop(writer);
+        let outcome = resolve_memory_backed(Some(hub), true, gate_key("/users/7"), || async {
+            panic!("uncertain refusal must not query")
+        })
+        .await;
+        assert_eq!(
+            outcome,
+            ResourceOwnershipResolution::Unavailable {
+                code: memory::CODE_WRITER_REFUSED
+            }
+        );
+    }
+
+    #[tokio::test]
+    // 仅测试：factory 内 guard Drop 触发全局缓存失效 hook，同上共享串行锁。
+    #[allow(clippy::await_holding_lock)]
+    async fn strict_required_bypasses_cache_and_reads_strictly_with_final_token() {
+        let _test_guard = crate::eligibility::test_global_state_lock();
+        // 无心跳 → StrictRequired：绕过缓存，严格读被调用并直接返回。
+        let hub = MemoryProjectionHub::default();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_factory = counter.clone();
+        let factory = move || {
+            let counter = counter_for_factory.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                gate_tenant_scoped(100)
+            }
+        };
+        let outcome =
+            resolve_memory_backed(Some(hub.clone()), true, gate_key("/users/7"), factory).await;
+        assert_eq!(outcome, gate_tenant_scoped(100));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "strict-required must read strictly instead of any cache"
+        );
+
+        // 严格读窗口内被 source writer race：最终 token 复验拒绝返回。
+        let hub = MemoryProjectionHub::default();
+        let hub_for_factory = hub.clone();
+        let factory = move || async move {
+            let writer = hub_for_factory
+                .begin_source_transaction()
+                .expect("writer guard");
+            drop(writer);
+            gate_tenant_scoped(100)
+        };
+        let outcome = resolve_memory_backed(Some(hub), true, gate_key("/users/7"), factory).await;
+        assert_eq!(
+            outcome,
+            ResourceOwnershipResolution::Unavailable {
+                code: memory::CODE_RACED_RETURN
+            }
+        );
+    }
+
+    /// 复合激活门的结构钉死：公共入口保持既有签名，唯一严格实现，门必须
+    /// 同时检查两个全局安装标记与 hub token/健康状态。
+    #[test]
+    fn the_public_resolver_delegates_to_one_strict_source_behind_the_composite_gate() {
+        let source = include_str!("resource_ownership.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert_eq!(
+            production
+                .matches("async fn resolve_resource_ownership_strict(")
+                .count(),
+            1,
+            "exactly one strict resolver implementation must exist"
+        );
+        let wrapper = production
+            .split("pub async fn resolve_resource_ownership(")
+            .nth(1)
+            .expect("the public resolver must exist")
+            .split("\n}")
+            .next()
+            .expect("the public resolver must close");
+        assert!(
+            wrapper.contains("crate::memory_projection_hub()")
+                && wrapper.contains("crate::auxiliary_authorization_mirror().is_some()"),
+            "the public resolver must consult both composite activation globals"
+        );
+        assert!(wrapper.contains("resolve_resource_ownership_strict("));
+        assert!(wrapper.contains("resolve_memory_backed("));
+        let gate = production
+            .split("async fn resolve_memory_backed<")
+            .nth(1)
+            .expect("the composite gate must exist")
+            .split("\n}")
+            .next()
+            .expect("the gate function must close");
+        assert!(gate.contains("hub.strict_read_token()"));
+        assert!(gate.contains("hub.strict_read_matches(token)"));
+        assert!(gate.contains("hub.channel_is_healthy()"));
+        assert!(gate.contains("memory::global_ownership_memory()"));
+    }
+
+    /// 写面覆盖闭合清单：记忆路径支持的每个 lookup kind 的事实面表与唯一
+    /// 受栅栏写点。清单必须与 `memory_supported_kind`（穷尽 match）保持
+    /// 一致；chat 变体不在清单内且被计划永久闭合。
+    #[test]
+    fn memory_writer_coverage_inventory_covers_every_supported_kind() {
+        let inventory: [(TargetLookupKind, &str, &str); 14] = [
+            (
+                TargetLookupKind::Tenant,
+                "tenant, tenant_domain_map",
+                "astral-trustgraph tenant_repository (AuthorizationSourceTransaction)",
+            ),
+            (
+                TargetLookupKind::EnterpriseOrganization,
+                "tenant, tenant_domain_map",
+                "astral-trustgraph tenant_repository (AuthorizationSourceTransaction)",
+            ),
+            (
+                TargetLookupKind::UserCard,
+                "user_card",
+                "astral-identity card_repository (begin_card_source_transaction)",
+            ),
+            (
+                TargetLookupKind::User,
+                "user_card",
+                "astral-identity card_repository (begin_card_source_transaction)",
+            ),
+            (
+                TargetLookupKind::Delegation,
+                "permission_delegation, user_card",
+                "astral-trustgraph delegation_repository (AuthorizationSourceTransaction)",
+            ),
+            (
+                TargetLookupKind::LevelTemplate,
+                "identity_level_template",
+                "astral-trustgraph level_template_repository (AuthorizationSourceTransaction)",
+            ),
+            (
+                TargetLookupKind::RuleSet,
+                "rule_set",
+                "astral-trustgraph rule_set_repository (AuthorizationSourceTransaction)",
+            ),
+            (
+                TargetLookupKind::PermissionRule,
+                "permission_rule, user_card",
+                "astral-trustgraph rule_repository (AuthorizationSourceTransaction)",
+            ),
+            (
+                TargetLookupKind::OrgScopeRequest,
+                "org_scope_request, tenant",
+                "astral-db org_scope begin_authority_tx + fenced tenant writer",
+            ),
+            (
+                TargetLookupKind::PermissionRequest,
+                "permission_request, user_card",
+                "astral-trustgraph permission_request_repository (AuthorizationSourceTransaction)",
+            ),
+            (
+                TargetLookupKind::AuditRecord,
+                "audit_log",
+                "append-only: production INSERT-only, no UPDATE/DELETE mutation path",
+            ),
+            (
+                TargetLookupKind::CardTemplate,
+                "user_card_template",
+                "astral-trustgraph card_template_repository (AuthorizationSourceTransaction)",
+            ),
+            (
+                TargetLookupKind::UserLevel,
+                "user_card_level_definition, tenant_domain_map",
+                "astral-trustgraph level_repository (hub source writer guard) + fenced tenant writer",
+            ),
+            (
+                TargetLookupKind::UserGrading,
+                "identity_user_grading, tenant_domain_map",
+                "astral-trustgraph grading_repository (hub source writer guard) + fenced tenant writer",
+            ),
+        ];
+        for (kind, tables, writer) in inventory {
+            assert!(
+                memory_supported_kind(kind),
+                "inventory kind must be memory supported: {kind:?}"
+            );
+            assert!(!tables.is_empty() && !writer.is_empty(), "{kind:?}");
+        }
+        // chat 三变体：写者不受栅栏（frozen writers unguarded）→ 永久闭合。
+        for (kind, resource, path) in [
+            (
+                TargetLookupKind::ChatConversation,
+                "chat_conversation",
+                "/sessions/7",
+            ),
+            (
+                TargetLookupKind::ChatConversationWithoutOwner,
+                "chat_message",
+                "/receipts/7",
+            ),
+            (TargetLookupKind::ChatMessage, "chat_message", "/messages/7"),
+        ] {
+            assert!(
+                !memory_supported_kind(kind),
+                "chat kinds must never be memory supported: {kind:?}"
+            );
+            assert!(matches!(
+                resolve_plan(resource, path, "GET", None, Some(1), Some(2)),
+                ResolvePlan::LegacyStrictOnly
+            ));
         }
     }
 }

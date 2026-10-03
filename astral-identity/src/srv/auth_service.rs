@@ -19,7 +19,7 @@ use crate::auth::{
 };
 use crate::srv::auth_repository::AuthRepository;
 use crate::srv::session::{
-    create_token_family_with_expiry, revoke_all_sessions_for_user, store_session_grant_in_redis,
+    create_token_family_with_expiry, revoke_all_sessions_for_user, store_session_grant_projection,
 };
 use crate::AppState;
 
@@ -395,7 +395,7 @@ impl AuthService {
             return Err(AppError::from(error));
         }
 
-        let projection_result = store_session_grant_in_redis(
+        let projection_result = store_session_grant_projection(
             state,
             &access_token_result,
             SessionGrant::active(
@@ -417,15 +417,15 @@ impl AuthService {
             ),
         )
         .await;
-        if let Err(redis_error) = projection_result {
+        if let Err(projection_error) = projection_result {
             if let Err(cleanup_error) = self
                 .repository
                 .delete_active_family(family_id, agg.user_id)
                 .await
             {
-                tracing::error!(family_id = %family_id, %redis_error, %cleanup_error, "login token tracking failed and family cleanup failed");
+                tracing::error!(family_id = %family_id, %projection_error, %cleanup_error, "login token tracking failed and family cleanup failed");
             }
-            return Err(AppError::from(redis_error));
+            return Err(AppError::from(projection_error));
         }
 
         let crate::auth::TokenResult {

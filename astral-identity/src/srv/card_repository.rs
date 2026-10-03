@@ -184,6 +184,8 @@ impl CardRepository for SqlxCardRepository {
         &self,
         user_id: i64,
     ) -> Result<(IdentityCardRow, bool), AstralError> {
+        // hub 已装时先登记卡事实写者（writer-active 期间辅助读面 fail-closed）。
+        let source_guard = begin_card_source_transaction()?;
         let mut tx = self.db.begin().await.map_err(|e| {
             AstralError::Database(format!("Begin identity card ensure tx failed: {e}"))
         })?;
@@ -222,7 +224,10 @@ impl CardRepository for SqlxCardRepository {
         .await
         .map_err(|e| AstralError::Database(format!("Query identity_card failed: {e}")))?;
         if let Some(card) = existing {
-            tx.commit().await.map_err(|e| {
+            arm_card_commit_fence(&source_guard);
+            let commit_result = tx.commit().await;
+            settle_card_commit_fence(&source_guard, &commit_result);
+            commit_result.map_err(|e| {
                 AstralError::Database(format!("Commit identity card ensure failed: {e}"))
             })?;
             return Ok((card, false));
@@ -243,7 +248,10 @@ impl CardRepository for SqlxCardRepository {
             token_version: Some(1),
             expires_at: None,
         };
-        tx.commit().await.map_err(|e| {
+        arm_card_commit_fence(&source_guard);
+        let commit_result = tx.commit().await;
+        settle_card_commit_fence(&source_guard, &commit_result);
+        commit_result.map_err(|e| {
             AstralError::Database(format!("Commit identity card ensure failed: {e}"))
         })?;
         Ok((card, true))
@@ -254,14 +262,25 @@ impl CardRepository for SqlxCardRepository {
         user_id: i64,
         card_id: i64,
     ) -> Result<(), AstralError> {
-        sqlx::query(
+        // autocommit 写点同样必须持栅栏（不能因无 pool.begin 省略）：hub 已装
+        // 则取不到 guard 直接拒绝；单语句 autocommit 的 Err 视为未知结果
+        // （连接中断后语句可能已提交）→ 先 mark_uncertain 再上抛。
+        let source_guard = begin_card_source_transaction()?;
+        // autocommit 语句同样先武装取消栅栏（execute await 窗口内取消/掉线 →
+        // Drop → sticky uncertain），结果判定后统一 settle。
+        arm_card_commit_fence(&source_guard);
+        let result: Result<(), sqlx::Error> = sqlx::query(
             "DELETE FROM identity_card WHERE card_id = ? AND user_id = ? AND status = 'ACTIVE'",
         )
         .bind(card_id)
         .bind(user_id)
         .execute(&self.db)
         .await
-        .map_err(|e| AstralError::Database(format!("Delete created identity_card failed: {e}")))?;
+        .map(|_| ());
+        settle_card_commit_fence(&source_guard, &result);
+        result.map_err(|e| {
+            AstralError::Database(format!("Delete created identity_card failed: {e}"))
+        })?;
         Ok(())
     }
 
@@ -283,6 +302,8 @@ impl CardRepository for SqlxCardRepository {
         validate_template_card_ledger_scope(user_id, tenant_id, domain_id, template_id)?;
         let request_operation_id = validated_request_operation_id(request_operation_id)?;
 
+        // hub 已装时先登记卡事实写者（writer-active 期间辅助读面 fail-closed）。
+        let source_guard = begin_card_source_transaction()?;
         let mut tx = self
             .db
             .begin()
@@ -304,6 +325,33 @@ impl CardRepository for SqlxCardRepository {
             return Err(AstralError::Permission(
                 "User card scope requires an active identity card".into(),
             ));
+        }
+        // 发卡与 delete_tenant/delete_org 的并发边界闭合（统一锁序 tenant →
+        // user_card，与删除路径的 tenant 行锁 → user_card 引用守卫同序）：
+        // 本事务在写 user_card 之前先锁定**已存在**的 tenant 行。两个交错方向
+        // 都被堵死 —— 删除事务已提交：此处锁不到行，fail-closed 拒绝发卡；
+        // 删除事务在途：其引用守卫与本 INSERT 必然串行化在租户行锁上，不可能
+        // 产生引用已删除租户的孤儿卡。本事务的 identity_card → tenant 取锁方向
+        // 与既有路径（tenant → user_card、user_card → rule_set）无反向环，
+        // 不引入死锁。不加级联、不改 schema。
+        let issue_tenant_id = tenant_id.filter(|id| *id > 0).ok_or_else(|| {
+            AstralError::Validation(format!(
+                "user card requires a positive tenant scope, got {tenant_id:?}"
+            ))
+        })?;
+        let locked_tenant: Option<(i64,)> =
+            sqlx::query_as("SELECT tenant_id FROM tenant WHERE tenant_id = ? FOR UPDATE")
+                .bind(issue_tenant_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| {
+                    AstralError::Database(format!("Lock tenant for card issue failed: {e}"))
+                })?;
+        if locked_tenant.is_none() {
+            return Err(AstralError::Validation(format!(
+                "tenant {issue_tenant_id} does not exist; refusing to issue a user_card \
+                 against a missing tenant (fail-closed)"
+            )));
         }
         let result = sqlx::query(
             "INSERT INTO user_card \
@@ -466,8 +514,10 @@ impl CardRepository for SqlxCardRepository {
             EVENT_TYPE_ELIGIBILITY_UPDATE,
         )
         .await?;
-        tx.commit()
-            .await
+        arm_card_commit_fence(&source_guard);
+        let commit_result = tx.commit().await;
+        settle_card_commit_fence(&source_guard, &commit_result);
+        commit_result
             .map_err(|e| AstralError::Database(format!("Commit card create tx failed: {e}")))?;
 
         Ok(UserCard {
@@ -537,6 +587,8 @@ impl CardRepository for SqlxCardRepository {
         // 状态变更是授权 source mutation：必须携带 Gateway 已验证的正数 actor。
         require_positive_actor(actor_id, "user card status mutation")?;
 
+        // hub 已装时先登记卡事实写者（writer-active 期间辅助读面 fail-closed）。
+        let source_guard = begin_card_source_transaction()?;
         let mut tx = self
             .db
             .begin()
@@ -632,8 +684,10 @@ impl CardRepository for SqlxCardRepository {
             )
             .await?;
         }
-        tx.commit()
-            .await
+        arm_card_commit_fence(&source_guard);
+        let commit_result = tx.commit().await;
+        settle_card_commit_fence(&source_guard, &commit_result);
+        commit_result
             .map_err(|e| AstralError::Database(format!("Commit card status tx failed: {e}")))?;
         Ok(())
     }
@@ -656,6 +710,8 @@ impl CardRepository for SqlxCardRepository {
         }
         let request_operation_id = validated_request_operation_id(request_operation_id)?;
 
+        // hub 已装时先登记卡事实写者（writer-active 期间辅助读面 fail-closed）。
+        let source_guard = begin_card_source_transaction()?;
         let mut tx = self
             .db
             .begin()
@@ -734,8 +790,10 @@ impl CardRepository for SqlxCardRepository {
                 &detail.to_string(),
             )
             .await?;
-            tx.commit()
-                .await
+            arm_card_commit_fence(&source_guard);
+            let commit_result = tx.commit().await;
+            settle_card_commit_fence(&source_guard, &commit_result);
+            commit_result
                 .map_err(|e| AstralError::Database(format!("Commit card update tx failed: {e}")))?;
             return Ok(());
         }
@@ -1059,8 +1117,10 @@ impl CardRepository for SqlxCardRepository {
             &detail.to_string(),
         )
         .await?;
-        tx.commit()
-            .await
+        arm_card_commit_fence(&source_guard);
+        let commit_result = tx.commit().await;
+        settle_card_commit_fence(&source_guard, &commit_result);
+        commit_result
             .map_err(|e| AstralError::Database(format!("Commit card update tx failed: {e}")))?;
         Ok(())
     }
@@ -2195,5 +2255,248 @@ impl UserCardRow {
             updated_at: self.updated_at,
             tenant_id: self.tenant_id,
         }
+    }
+}
+
+/// 辅助镜像激活的卡事实写者栅栏获取：**hub 已装则栅栏必须可得**（取不到即
+/// `Err`，由写点 `?` 拒绝写入——绝不静默 no-op）；hub 未安装（独立 Identity
+/// 部署）→ `Ok(None)`，行为不变。返回 `Ok(Some(guard))` 时必须在裸
+/// `pool.begin()` / autocommit 执行**之前**：writer-active 期间 hub 辅助读面
+/// fail-closed，镜像激活/对账不会与本写者的未决事务交错。
+fn begin_card_source_transaction(
+) -> Result<Option<astral_db::memory_projection_hub::SourceTransactionGuard>, AstralError> {
+    match astral_db::memory_projection_hub() {
+        None => Ok(None),
+        Some(hub) => hub.begin_source_transaction().map(Some).ok_or_else(|| {
+            AstralError::Internal(
+                "memory projection hub is installed but the source writer guard is unavailable"
+                    .to_owned(),
+            )
+        }),
+    }
+}
+
+/// commit/autocommit await 前武装取消栅栏：guard 私有 `commit_unproven=true`。
+/// await 窗口内任务被取消/连接掉线时 Drop 见 atomic=true → sticky uncertain
+/// ——覆盖"结果后标记"无法覆盖的取消窗口。hub 未装（None）为 no-op。
+fn arm_card_commit_fence(
+    source_guard: &Option<astral_db::memory_projection_hub::SourceTransactionGuard>,
+) {
+    if let Some(guard) = source_guard {
+        guard.mark_commit_started();
+    }
+}
+
+/// 写结果已判定后的栅栏收尾：Ok → `mark_commit_proven` 清私有 atomic（Drop
+/// 正常释放）；Err → 保持显式 `mark_uncertain`（uncertain_source sticky，既有
+/// 语义；Drop 的 atomic 分支同向，双写幂等）。
+fn settle_card_commit_fence(
+    source_guard: &Option<astral_db::memory_projection_hub::SourceTransactionGuard>,
+    result: &Result<(), sqlx::Error>,
+) {
+    match result {
+        Ok(()) => {
+            if let Some(guard) = source_guard {
+                guard.mark_commit_proven();
+            }
+        }
+        Err(_) => {
+            if let Some(guard) = source_guard {
+                guard.mark_uncertain();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn card_issue_locks_existing_tenant_before_user_card_insert() {
+        // 发卡与 delete_tenant/delete_org 的并发边界回归（源形状，无 IO）：
+        // create_user_card 必须在写 user_card 之前以事务内 FOR UPDATE 锁定
+        // 已存在的 tenant 行（统一锁序 tenant → user_card），且锁定失败路径
+        // fail-closed（租户不存在拒绝发卡）。
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/srv/card_repository.rs"
+        ));
+        // 先切到 impl 块：trait 里也有同名方法声明，find 必须跳过 trait。
+        let source = &source[source
+            .find("impl CardRepository for SqlxCardRepository")
+            .expect("CardRepository impl must stay in card_repository.rs")..];
+        let body_start = source
+            .find("async fn create_user_card(")
+            .expect("create_user_card implementation must stay in card_repository.rs");
+        let body = &source[body_start..];
+        let body_end = body
+            .find("async fn list_user_cards(")
+            .expect("list_user_cards must follow create_user_card in this file");
+        let body = &body[..body_end];
+        let tenant_lock = body
+            .find("SELECT tenant_id FROM tenant WHERE tenant_id = ? FOR UPDATE")
+            .expect("card issue must lock the existing tenant row inside the tx");
+        let insert = body
+            .find("INSERT INTO user_card")
+            .expect("card issue must insert user_card in this file");
+        assert!(
+            tenant_lock < insert,
+            "tenant row lock must be taken before the user_card INSERT"
+        );
+        assert!(
+            body.contains("refusing to issue a user_card"),
+            "a missing tenant must fail the issuance closed"
+        );
+    }
+
+    #[test]
+    fn card_fact_writers_hold_hub_guard_across_the_whole_transaction() {
+        // 辅助镜像激活前置条件回归（源形状，无 IO）：四个卡事实写事务都必须
+        // 先于 pool.begin 获取 hub 写者栅栏，每个 commit await 前武装取消栅栏
+        //（mark_commit_started），结果判定后统一 settle（Ok → proven 清私有
+        // atomic；Err → mark_uncertain 保持既有语义）。
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/srv/card_repository.rs"
+        ));
+        // 先切到 impl 块：trait 里也有同名方法声明，find 必须跳过 trait。
+        let impl_source = &source[source
+            .find("impl CardRepository for SqlxCardRepository")
+            .expect("CardRepository impl must stay in card_repository.rs")..];
+        for (anchor, next_anchor, label) in [
+            (
+                "async fn ensure_active_identity_card(",
+                "async fn delete_created_identity_card(",
+                "ensure_active_identity_card",
+            ),
+            (
+                "async fn create_user_card(",
+                "async fn list_user_cards(",
+                "create_user_card",
+            ),
+            (
+                "async fn update_user_card_status(",
+                "async fn update_user_card(",
+                "update_user_card_status",
+            ),
+            (
+                "async fn update_user_card(",
+                "impl UserCardRow",
+                "update_user_card",
+            ),
+        ] {
+            let start = impl_source
+                .find(anchor)
+                .unwrap_or_else(|| panic!("{label} must stay in card_repository.rs"));
+            let end = impl_source[start..]
+                .find(next_anchor)
+                .unwrap_or_else(|| panic!("{label} body bound must stay stable"));
+            let body = &impl_source[start..start + end];
+            let guard = body
+                .find("begin_card_source_transaction()")
+                .unwrap_or_else(|| panic!("{label} must acquire the hub writer guard"));
+            let first_commit = body
+                .find("tx.commit()")
+                .unwrap_or_else(|| panic!("{label} must commit in this file"));
+            assert!(
+                guard < first_commit,
+                "{label}: hub writer guard must be acquired before pool.begin/tx"
+            );
+            let commits = body.matches("tx.commit()").count();
+            let arms = body
+                .matches("arm_card_commit_fence(&source_guard);")
+                .count();
+            let settles = body
+                .matches("settle_card_commit_fence(&source_guard")
+                .count();
+            assert_eq!(
+                commits, arms,
+                "{label}: every commit await must be preceded by the cancellation fence"
+            );
+            assert_eq!(
+                commits, settles,
+                "{label}: every commit result must be settled (proven on Ok / uncertain on Err)"
+            );
+        }
+    }
+
+    #[test]
+    fn autocommit_identity_card_delete_holds_guard_and_marks_unknown() {
+        // 第 5 个写点（无 pool.begin 的 autocommit DELETE）同样必须先取栅栏、
+        // execute await 前武装取消栅栏，且 Err 视为未知结果 settle 为
+        // mark_uncertain——不能因无事务省略。
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/srv/card_repository.rs"
+        ));
+        let impl_source = &source[source
+            .find("impl CardRepository for SqlxCardRepository")
+            .expect("CardRepository impl must stay in card_repository.rs")..];
+        let start = impl_source
+            .find("async fn delete_created_identity_card(")
+            .expect("delete_created_identity_card implementation must stay in this file");
+        let end = impl_source[start..]
+            .find("async fn create_user_card(")
+            .expect("create_user_card must follow delete_created_identity_card");
+        let body = &impl_source[start..start + end];
+        let guard = body
+            .find("let source_guard = begin_card_source_transaction()?;")
+            .expect("autocommit write point must acquire the guard with ? (fail-closed)");
+        let arm = body
+            .find("arm_card_commit_fence(&source_guard);")
+            .expect("autocommit await must be armed before execute");
+        let settle = body
+            .find("settle_card_commit_fence(&source_guard, &result)")
+            .expect("autocommit result must be settled (proven on Ok / uncertain on Err)");
+        let execute = body
+            .find(".execute(&self.db)")
+            .expect("the DELETE must execute in this file");
+        assert!(
+            guard < execute,
+            "guard must be held before the autocommit write"
+        );
+        assert!(
+            arm < execute,
+            "the cancellation fence must be armed before the autocommit await"
+        );
+        assert!(
+            settle > execute,
+            "fence settlement must follow the write result"
+        );
+    }
+
+    #[test]
+    fn guard_acquisition_fails_closed_when_hub_is_installed() {
+        // begin_card_source_transaction 语义钉（源形状）：hub 已装 + 栅栏不可得
+        // 必须返回 Err（写点 `?` 拒绝），只有 hub 未安装才 Ok(None)——
+        // 不允许"已装但失败"被吞成 no-op。全部 5 个写点都带 `?`。
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/srv/card_repository.rs"
+        ));
+        assert!(
+            source
+                .contains("-> Result<Option<astral_db::memory_projection_hub::SourceTransactionGuard>, AstralError>"),
+            "the acquisition helper must return Result, not Option"
+        );
+        assert!(source.contains("None => Ok(None),"));
+        assert!(
+            source.contains(".ok_or_else(") && source.contains("AstralError::Internal("),
+            "an installed hub must refuse a missing guard"
+        );
+        // 计数限定在 CardRepository impl 内（到 impl UserCardRow 为止），
+        // 排除本测试模块自身的字符串字面量。
+        let impl_source = &source[source
+            .find("impl CardRepository for SqlxCardRepository")
+            .expect("CardRepository impl must stay in card_repository.rs")
+            ..source
+                .find("impl UserCardRow")
+                .expect("UserCardRow impl must follow the trait impl")];
+        assert_eq!(
+            impl_source
+                .matches("let source_guard = begin_card_source_transaction()?;")
+                .count(),
+            5,
+            "exactly the five card-fact write points acquire the guard fail-closed"
+        );
     }
 }

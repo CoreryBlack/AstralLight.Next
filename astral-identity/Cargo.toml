@@ -9,6 +9,17 @@ license.workspace = true
 name = "astral-identity"
 path = "src/main.rs"
 
+# Redis 编译层退役（redis-layer-retirement-20261002）：默认构建零 redis 编译
+# 链接；strict MySQL durable proof 是唯一默认会话判定面。compat 装配（adapter
+# 连接、AppState.redis、会话投影/撤销 compat 写入）收敛到本显式 feature
+# （default-off），并传播 astral-mq / astral-common 的同名 feature。
+[features]
+redis-compat = [
+    "dep:redis",
+    "astral-mq/redis-compat",
+    "astral-common/redis-compat",
+]
+
 [dependencies]
 astral-common = { path = "../astral-common" }
 astral-types = { path = "../astral-types" }
@@ -41,7 +52,7 @@ bcrypt = "0.16"
 md-5 = "0.10"
 sha2 = { workspace = true }
 hex = { workspace = true }
-redis = { workspace = true }
+redis = { workspace = true, optional = true }
 once_cell = "1"
 totp-rs = "5"
 aes-gcm = "0.10"

@@ -15,6 +15,7 @@ use astral_types::{
 use crate::repository::audit_log_repository::{
     insert_rule_set_projection_audit_in_tx, RuleSetMutationContext, RuleSetProjectionAuditEntry,
 };
+use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
 use crate::repository::grant_ledger_adapter::{
     append_ruleset_grant_delta_in_tx, build_ruleset_add_draft, build_ruleset_remove_draft,
     build_ruleset_update_draft, derive_ruleset_contribution_event_id, derive_ruleset_identity,
@@ -975,7 +976,7 @@ fn ruleset_entry_facts<'a>(
 /// （败者 source 事务整体回滚，重试幂等收敛），无需额外版本锁读。
 #[allow(clippy::too_many_arguments)]
 async fn append_ruleset_entry_add_fanout_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     entries: &[&LockedRuleSetEntryRow],
     only_ref_id: Option<i64>,
@@ -1021,7 +1022,7 @@ async fn append_ruleset_entry_add_fanout_in_tx(
 /// `uk_ade_target_version` 唯一键串行化（败者整体回滚，重试幂等收敛）——本站点
 /// grant 身份含新鲜 ref/entry，跨请求同 grant 并发首发结构性不可能。
 async fn materialize_ruleset_adds_for_bound_card_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     bound: &ProvableBoundCard,
     card_projection: &astral_db::ProjectionEventIdentity,
@@ -1068,7 +1069,7 @@ async fn materialize_ruleset_adds_for_bound_card_in_tx(
 /// 自饥饿——P3 风暴实测教训）。
 #[allow(clippy::too_many_arguments)]
 async fn append_ruleset_entry_update_fanout_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     entries: &[&LockedRuleSetEntryRow],
     card_event_type: &str,
@@ -1165,7 +1166,7 @@ async fn append_ruleset_entry_update_fanout_in_tx(
 /// 返回同步发布事件面（读链规模化 Batch E）。
 #[allow(clippy::too_many_arguments)]
 async fn append_ruleset_entry_remove_fanout_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     entries: &[&LockedRuleSetEntryRow],
     context: &RuleSetMutationContext,
@@ -1517,7 +1518,7 @@ fn batch_replacement_is_fully_equal(
 /// 为每个可证明条目链式追加 REMOVE tombstone。head 缺失/stale/gap 或唯一冲突
 /// 一律错误上抛、整个事务回滚；不吞错、不降级为只写旧链。
 async fn materialize_ruleset_removals_for_card_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     bound: &ProvableBoundCard,
     card_projection_identity: &astral_db::ProjectionEventIdentity,
@@ -1584,7 +1585,7 @@ async fn materialize_ruleset_removals_for_card_in_tx(
 /// 因此贡献写入绝不重新扫描（此时可能已被删除的）ref 表。单卡恰一张带元数据的
 /// CARD REVOKE 投影事件作为该卡全部贡献的 generation/fence。
 async fn append_unbind_ruleset_removal_deltas_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     bound: &ProvableBoundCard,
     allow_entries: &[&LockedRuleSetEntryRow],
@@ -1646,7 +1647,7 @@ pub(crate) struct CardCascadeRulesetEntry {
 /// 仍捕获并返回绑定引用主键供审计与清理计数，不伪造任何 delta。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_card_cascade_ruleset_removals_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     card_id: i64,
     card_user_id: i64,
     card_tenant_id: i64,
@@ -1664,7 +1665,7 @@ pub(crate) async fn append_card_cascade_ruleset_removals_in_tx(
     let rule_set: Option<(Option<i64>,)> =
         sqlx::query_as("SELECT tenant_id FROM rule_set WHERE rule_set_id = ? FOR UPDATE")
             .bind(rule_set_id)
-            .fetch_optional(&mut **tx)
+            .fetch_optional(&mut ***tx)
             .await
             .map_err(db_error)?;
     let rule_set_tenant_id = rule_set.map(|(tenant_id,)| tenant_id);
@@ -1676,7 +1677,7 @@ pub(crate) async fn append_card_cascade_ruleset_removals_in_tx(
     )
     .bind(card_id)
     .bind(rule_set_id)
-    .fetch_all(&mut **tx)
+    .fetch_all(&mut ***tx)
     .await
     .map_err(db_error)?;
     if refs.is_empty() {
@@ -1777,7 +1778,7 @@ pub(crate) struct CardCreateRulesetEntryAddition {
 /// 方向一致，不引入反向锁序。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_card_create_ruleset_entry_adds_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     parent_projection: &astral_db::ProjectionEventIdentity,
     context: &RuleSetMutationContext,
@@ -1842,7 +1843,7 @@ pub(crate) async fn append_card_create_ruleset_entry_adds_in_tx(
 /// 每个 DISTINCT 卡首见时追加一张带元数据的 CARD REVOKE 投影事件，其余引用
 /// 复用同一张卡的身份锚点（原 DISTINCT-card 语义不变，证据面更完整）。
 async fn append_ruleset_deletion_removal_deltas_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     proven_refs: &[ProvableBoundCard],
     allow_entries: &[&LockedRuleSetEntryRow],
@@ -2033,7 +2034,7 @@ pub(crate) struct LedgerChurnAuditContext<'a> {
 /// 绝不改派新身份绕过。缺 header 的确定性派生属于各自入口的前置步骤（例如
 /// 模板同步用 template/rule_set/projection generation 派生后再进入本核心）。
 pub(crate) async fn replace_rule_set_entries_churn_with_ledger_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     rows: &[NewRuleSetEntry],
     forced_event_type: Option<&str>,
@@ -2087,7 +2088,7 @@ pub(crate) async fn replace_rule_set_entries_churn_with_ledger_in_tx(
 
     sqlx::query("DELETE FROM rule_set_entry WHERE rule_set_id = ?")
         .bind(rule_set_id)
-        .execute(&mut **tx)
+        .execute(&mut ***tx)
         .await
         .map_err(db_error)?;
     // ── Source 插入：在同一未提交事务内逐条捕获真实新 entry_id ──
@@ -2106,7 +2107,7 @@ pub(crate) async fn replace_rule_set_entries_churn_with_ledger_in_tx(
         .bind(&entry.action)
         .bind(&entry.condition_json)
         .bind(entry.priority)
-        .execute(&mut **tx)
+        .execute(&mut ***tx)
         .await
         .map_err(db_error)?;
         if result.rows_affected() != 1 {
@@ -2318,7 +2319,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         validate_generic_rule_set_source_type(&new.ref_type)?;
         // 对齐 platform_v4：code (UNIQUE NOT NULL) 用 name 作为默认值，source_type 存储 ref_type。
         // source mutation 与 RULE_SET durable projection 在同一事务内提交。
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let result = sqlx::query(
             "INSERT INTO rule_set (name, code, source_type, description, enabled) VALUES (?, ?, ?, ?, 1)",
         )
@@ -2326,7 +2327,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         .bind(&new.name)
         .bind(&new.ref_type)
         .bind(&new.description)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         let rule_set_id = result.last_insert_id() as i64;
@@ -2374,7 +2375,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             },
         )
         .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(rule_set_id)
     }
 
@@ -2384,14 +2385,14 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         patch: &RuleSetPatch,
         context: &RuleSetMutationContext,
     ) -> Result<(), AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         lock_rule_set_in_tx(&mut tx, rule_set_id).await?;
         // 锁定读回当前行，按实际写入值检测可变字段变更。source_type 是所有权
         // 判别器，generic update 不可变：UPDATE 不写 source_type，patch 也不携带。
         let current: (String, Option<String>) =
             sqlx::query_as("SELECT name, description FROM rule_set WHERE rule_set_id = ?")
                 .bind(rule_set_id)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await
                 .map_err(db_error)?;
         let changes = generic_rule_set_update_changes(
@@ -2403,7 +2404,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         if !changes.any() {
             // 幂等更新：没有任何可变字段实际变化 ⇒ 无 source mutation、无投影、
             // 无审计（审计只记录实际变更的字段；空变更集没有可审计内容）。
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(());
         }
         // Operation identity 前置：source UPDATE 与任何 projection/audit durable
@@ -2420,7 +2421,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             .bind(&patch.name)
             .bind(&patch.description)
             .bind(rule_set_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         let projection = append_rule_set_projection_in_tx(
@@ -2467,7 +2468,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         .await?;
         append_bound_card_projections_in_tx(&mut tx, rule_set_id, EVENT_TYPE_RULE_SET_UPDATE)
             .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(())
     }
 
@@ -2476,16 +2477,16 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         rule_set_id: i64,
         context: &RuleSetMutationContext,
     ) -> Result<bool, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let source: Option<(i64, Option<i64>)> = sqlx::query_as(
             "SELECT rule_set_id, tenant_id FROM rule_set WHERE rule_set_id = ? FOR UPDATE",
         )
         .bind(rule_set_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let Some((_, source_tenant_id)) = source else {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(false);
         };
         // Operation identity 前置：capture-before-delete 与任何 durable 写入之前
@@ -2558,7 +2559,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         // above from locked captures.
         let result = sqlx::query("DELETE FROM rule_set WHERE rule_set_id=?")
             .bind(rule_set_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         if result.rows_affected() == 0 {
@@ -2566,13 +2567,13 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             // 持久层不变式破坏。此时版本化 REMOVE delta、RULE_SET REVOKE 投影与
             // 审计 correlation 已写入但 source 行未删除 —— 提交会留下与授权读链
             // 冲突的部分删除状态；必须整体回滚并失败，而不是提交半删除快照。
-            tx.rollback().await.map_err(db_error)?;
+            tx.rollback_consuming().await?;
             return Err(AstralError::Internal(format!(
                 "rule set {rule_set_id} delete matched zero rows inside its own locked \
                  transaction; rolled back to avoid committing partial projection/ledger state"
             )));
         }
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         // 读链规模化 Batch E：规则集删除的全部 REMOVE 贡献事件面（卡 → 租户映射
         // 来自提交前锁定的 proven cards）；影响面超阈值或任何失败由 sync_publish
         // 降级为 worker 消化，绝不阻塞本次写请求。
@@ -2620,7 +2621,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             new.condition_json.as_deref(),
         )?;
         // source entry、RULE_SET projection 与受影响卡 projection 在同一事务内提交。
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         lock_rule_set_in_tx(&mut tx, rule_set_id).await?;
         // Operation identity 前置：任何 durable 写入之前把上下文升级为可证明
         // 稳定身份；缺失 x-request-id 时以锁定的 RULE_SET 投影代次确定性派生，
@@ -2643,7 +2644,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         .bind(&new.action)
         .bind(&new.condition_json)
         .bind(new.priority)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         let entry_id = result.last_insert_id() as i64;
@@ -2713,7 +2714,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             event_id: contribution.event_id,
         })
         .collect();
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         commit_sync_publish(&self.db, sync_surfaces).await;
         Ok(entry_id)
     }
@@ -2731,7 +2732,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             patch.action.as_deref(),
             patch.condition_json.as_deref(),
         )?;
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         lock_rule_set_in_tx(&mut tx, rule_set_id).await?;
         // Operation identity 前置：before-image 锁定与任何 durable 写入之前把
         // 上下文升级为可证明稳定身份（缺失 header 时锁定 head 代次确定性派生）。
@@ -2759,7 +2760,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         .bind(patch.priority)
         .bind(entry_id)
         .bind(rule_set_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         // legacy DB 值仅用于判断既有 REVOKE 语义；新写入值恒为 ALLOW
@@ -2842,7 +2843,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 "e1 authorization observation"
             );
         }
-        let commit_result = tx.commit().await;
+        let commit_result = tx.commit_consuming().await;
         #[cfg(feature = "e1-observability")]
         {
             let stamp = policy_engine::e1_observation::stamp();
@@ -2861,7 +2862,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 "e1 authorization observation"
             );
         }
-        commit_result.map_err(db_error)?;
+        commit_result?;
         commit_sync_publish(&self.db, sync_surfaces).await;
         Ok(())
     }
@@ -2872,7 +2873,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         entry_id: i64,
         context: &RuleSetMutationContext,
     ) -> Result<bool, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         lock_rule_set_in_tx(&mut tx, rule_set_id).await?;
         // Operation identity 前置：任何 durable 写入之前把上下文升级为可证明
         // 稳定身份；缺失 header 时锁定 head 代次确定性派生。
@@ -2901,7 +2902,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         sqlx::query("DELETE FROM rule_set_entry WHERE entry_id=? AND rule_set_id=?")
             .bind(entry_id)
             .bind(rule_set_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         let projection = append_rule_set_projection_in_tx(
@@ -2955,7 +2956,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 "e1 authorization observation"
             );
         }
-        let commit_result = tx.commit().await;
+        let commit_result = tx.commit_consuming().await;
         #[cfg(feature = "e1-observability")]
         {
             let stamp = policy_engine::e1_observation::stamp();
@@ -2974,7 +2975,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 "e1 authorization observation"
             );
         }
-        commit_result.map_err(db_error)?;
+        commit_result?;
         commit_sync_publish(&self.db, sync_surfaces).await;
         Ok(true)
     }
@@ -3005,7 +3006,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 })
             })
             .collect::<Result<Vec<_>, AstralError>>()?;
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         lock_rule_set_in_tx(&mut tx, rule_set_id).await?;
         // capture → REMOVE → source churn → ADD → parent projection/audit 的完整
         // 编排由共享授权账本 churn 核心承担；模板同步与启动物化复用同一实现。
@@ -3022,7 +3023,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             context,
         )
         .await?;
-        tx.commit().await.map_err(db_error)
+        tx.commit_consuming().await
     }
 
     async fn list_card_bindings(
@@ -3053,7 +3054,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 "ref_type must be BASE or OVERLAY".into(),
             ));
         }
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let card_tenant_id = validate_card_binding_in_tx(&mut tx, card_id, rule_set_id).await?;
         // Operation identity 前置：绑定引用写入与任何投影/账本事件之前把上下文
         // 升级为可证明稳定身份（缺失 header 时锁定 RULE_SET head 代次派生）。
@@ -3072,7 +3073,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         .bind(rule_set_id)
         .bind(ref_type)
         .bind(card_tenant_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         // 新建绑定的稳定主键即本卡 RuleSet binding 身份的一等来源。
@@ -3135,7 +3136,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             event_id: contribution.event_id,
         })
         .collect();
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         commit_sync_publish(&self.db, sync_surfaces).await;
         Ok(())
     }
@@ -3146,7 +3147,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         rule_set_id: i64,
         context: &RuleSetMutationContext,
     ) -> Result<bool, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
 
         // Lock order is deterministic across the binding and RuleSet delete
         // paths: card -> RuleSet source (when present) -> binding reference ->
@@ -3158,7 +3159,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             "SELECT card_status, tenant_id, user_id, domain_id FROM user_card WHERE card_id = ? FOR UPDATE",
         )
         .bind(card_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let Some((card_status, card_tenant_id, card_user_id, card_domain_id)) = card else {
@@ -3177,7 +3178,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         let rule_set: Option<RuleSetUnbindSourceRow> =
             sqlx::query_as("SELECT tenant_id FROM rule_set WHERE rule_set_id = ? FOR UPDATE")
                 .bind(rule_set_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await
                 .map_err(db_error)?;
         let rule_set_source = rule_set.map_or(RuleSetUnbindSource::Missing, |row| {
@@ -3192,13 +3193,13 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         )
         .bind(card_id)
         .bind(rule_set_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let Some((ref_id, ref_type, binding_tenant_id)) = binding else {
             // No source mutation and no projection/audit events for a missing
             // binding, including when the RuleSet source is already gone.
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(false);
         };
 
@@ -3303,13 +3304,13 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         .bind(card_id)
         .bind(rule_set_id)
         .bind(binding_tenant_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         if result.rows_affected() == 0 {
             return Ok(false);
         }
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         // 读链规模化 Batch E：解绑属单卡影响面；贡献事件面由 REMOVE 物化捕获。
         let sync_surfaces = contributions
             .iter()
@@ -3359,7 +3360,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         // 和授权账本 REMOVE+ADD 贡献放进同一事务；快照由 durable worker 在提交后
         // 重建。churn 编排（capture-before-delete / 严格插入 / 双相物化）与批量替换
         // 共享同一实现，模板 source 绝不当作 DIRECT，也不会留下旧 active ghost。
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         if code.trim().is_empty() {
             return Err(AstralError::Validation(
                 "template RuleSet code must not be empty".into(),
@@ -3370,7 +3371,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
              WHERE template_id = ? AND status = 'ACTIVE' FOR UPDATE",
         )
         .bind(template_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let Some((template_code, template_name, template_tenant_id)) = template else {
@@ -3389,7 +3390,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
              WHERE source_type = 'TEMPLATE' AND source_id = ? FOR UPDATE",
         )
         .bind(template_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let rule_set_id = match existing_by_source {
@@ -3402,7 +3403,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 let existing_tenant_id: Option<i64> =
                     sqlx::query_scalar("SELECT tenant_id FROM rule_set WHERE rule_set_id = ?")
                         .bind(id)
-                        .fetch_one(&mut *tx)
+                        .fetch_one(&mut **tx)
                         .await
                         .map_err(db_error)?;
                 if existing_tenant_id != template_tenant_id {
@@ -3417,7 +3418,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                     "SELECT rule_set_id, source_type FROM rule_set WHERE code = ? FOR UPDATE",
                 )
                 .bind(code)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await
                 .map_err(db_error)?;
                 if let Some((conflicting_id, source_type)) = conflicting_code {
@@ -3433,7 +3434,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 .bind(code)
                 .bind(template_id)
                 .bind(template_tenant_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .map_err(db_error)?;
                 result.last_insert_id() as i64
@@ -3449,7 +3450,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
              ORDER BY priority DESC, template_rule_id FOR UPDATE",
             )
             .bind(template_id)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut **tx)
             .await
             .map_err(db_error)?;
         let rows = fetched_template_rules
@@ -3492,7 +3493,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         )
         .await?;
 
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         tracing::info!(
             rule_set_id,
             template_id,

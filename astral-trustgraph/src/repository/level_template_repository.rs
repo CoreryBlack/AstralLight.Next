@@ -3,20 +3,29 @@
 //! 对齐 Java `IdentityLevelTemplateMapper` 边界（identity_level_template +
 //! identity_level_template_resource_map + identity_level_template_action_map）。
 //!
-//! `update_template` / `delete_with_cascade` 是授权语义 mutation：同一 source
-//! 事务内锁定受影响 ACTIVE 卡、写入带可信 actor/operation metadata 的 CARD
-//! REVOKE head/outbox，并落一条覆盖整个 mutation/fanout 的 durable `audit_log`
-//! 关联记录（沿用 `insert_approval_audit_in_tx` / `insert_user_card_cascade_audit_in_tx`
-//! 的同事务机制）。等级模板不产生授权账本 delta（模板本身不是 CanonicalGrant）。
+//! **范围结论（governance row，2026-10-02 核验）**：identity_level_template 没有
+//! 任何 PolicyEngine 数据面消费者（仅 API DTO、`resource_ownership` 的 domain
+//! 归属解析与 card_template 的删除引用检查）；等级模板不是 CanonicalGrant 源，
+//! 卡片规范授权在发卡/绑定时按其 RULE_SET 绑定物化，之后不从等级模板重导出。
+//! 因此 create/update/delete **不产生授权账本 delta，也不再向 retired 旧 CARD
+//! 链追加 REVOKE head/outbox**——该扇出在 retired 链路上对生产授权零效果，只
+//! 会在 CARD head 上留下无重建来源的"伪撤销"。
+//!
+//! 但等级模板（尤其 domain_id 绑定）是 owning-binding 存在性 source：
+//! resource_ownership 组合内存 resolver 缓存严格 server facts，依赖源活动栅栏
+//! 保证 binding 更新的 epoch complete。create/update/delete 因此一律以
+//! `AuthorizationSourceTransaction` 为宿主（栅栏先于 DB begin 取得，hub 拒绝
+//! 发证即 fail-closed；COMMIT await 前 arm、Ok 证明才 disarm），并落一条覆盖
+//! 整个 mutation 的 durable `audit_log` 关联记录（沿用既有同事务机制；不扩面、
+//! 不新增审计维度）。
 
 use async_trait::async_trait;
 use sqlx::{MySqlPool, QueryBuilder, Transaction};
 
-use astral_db::ProjectionEventMetadata;
 use astral_types::AstralError;
 
 use crate::repository::audit_log_repository::validated_request_operation_id;
-use crate::repository::projection_repository::append_card_projection_with_metadata_in_tx;
+use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
 
 /// 等级模板记录（identity_level_template）
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -135,36 +144,39 @@ impl LevelTemplateMutationContext {
     }
 }
 
-/// 审计 action：等级模板部分更新（授权语义字段变更触发卡片 REVOKE 扇出）。
+/// 审计 action：等级模板部分更新（governance mutation，同事务审计关联）。
 const LEVEL_TEMPLATE_AUDIT_ACTION_UPDATE: &str = "level_template_update";
 /// 审计 action：等级模板级联删除。
 const LEVEL_TEMPLATE_AUDIT_ACTION_DELETE: &str = "level_template_delete";
-/// event_type（audit_log.event_type VARCHAR(32)）：等级模板授权 mutation 家族。
+/// `audit_log.decision` 固定值：模板 mutation 语义（非 CARD 撤销语义——本路径
+/// 不追加任何 legacy 投影事件，见模块头范围结论）。
+const LEVEL_TEMPLATE_AUDIT_DECISION_UPDATE: &str = "LEVEL_TEMPLATE_UPDATED";
+const LEVEL_TEMPLATE_AUDIT_DECISION_DELETE: &str = "LEVEL_TEMPLATE_DELETED";
+/// event_type（audit_log.event_type VARCHAR(32)）：等级模板 mutation 家族。
 const LEVEL_TEMPLATE_AUDIT_EVENT_TYPE: &str = "LEVEL_TEMPLATE_MUTATION";
 /// resource：模板聚合名（单表，无租户列可证明，明细中携带模板身份）。
 const LEVEL_TEMPLATE_AUDIT_RESOURCE: &str = "level_template";
 
-/// 审计关联 INSERT（仅绑定参数 + 固定 decision 常量；所有可变输入走 `?` 绑定，
-/// 绝不拼接请求输入）。`decision` 与扇出的父 CARD REVOKE 投影事件语义对齐
-/// （沿用 insert_user_card_cascade_audit_in_tx 的固定 decision 先例）。
+/// 审计关联 INSERT（仅绑定参数 + 固定常量；所有可变输入走 `?` 绑定，
+/// 绝不拼接请求输入）。decision 按动作以固定常量绑定。
 const LEVEL_TEMPLATE_AUDIT_INSERT_SQL: &str = "INSERT INTO audit_log \
      (user_id, card_id, action, resource, decision, reason, event_type, request_id, detail) \
-     VALUES (?, NULL, ?, ?, 'CARD_REVOKED', NULL, ?, ?, ?)";
+     VALUES (?, NULL, ?, ?, ?, NULL, ?, ?, ?)";
 
-/// 等级模板 mutation/fanout 的单条 durable 审计关联输入。
+/// 等级模板 mutation 的单条 durable 审计关联输入。
 ///
-/// 一条记录覆盖整个 mutation 与全部卡片 REVOKE 扇出（不是逐卡一条）；
-/// `projection_event_ids` 与 `affected_card_ids` 必须一一对应（每张锁定卡恰好
-/// 一个 REVOKE 事件），缺失或错位一律拒绝落库。
+/// 一条记录覆盖整个 mutation 与其引用卡范围观测（不是逐卡一条）；
+/// `affected_card_ids` 是 mutation 前捕获的引用 ACTIVE 卡集合（仅审计明细
+/// 观测——governance mutation 不改卡片授权，见模块头范围结论）。
 struct LevelTemplateAuditEntry<'a> {
     action: &'a str,
+    decision: &'a str,
     template_id: i64,
     /// 删除路径在锁定读中捕获的模板身份（删除后 source 行不存在，审计是唯一
     /// 可查的 code/name 出处）；update 路径为 None。
     template_code: Option<&'a str>,
     template_name: Option<&'a str>,
     affected_card_ids: &'a [i64],
-    projection_event_ids: &'a [String],
     /// update 路径实际应用的补丁字段（仅 Some 字段，确定性键序）；delete 为空对象。
     applied_fields: serde_json::Value,
     context: &'a LevelTemplateMutationContext,
@@ -180,7 +192,6 @@ impl LevelTemplateAuditEntry<'_> {
             "operationId": self.context.operation_id(),
             "actorId": self.context.actor_id(),
             "affectedCardIds": self.affected_card_ids,
-            "projectionEventIds": self.projection_event_ids,
             "appliedFields": self.applied_fields,
         }))
         .map_err(|error| {
@@ -190,12 +201,17 @@ impl LevelTemplateAuditEntry<'_> {
         })
     }
 
-    /// 纯校验：正数模板 id、非空 action、正数 actor、非空 operation id、
-    /// 正数卡片 id 且与投影事件号一一对应。缺失或错位拒绝落库（fail-closed）。
+    /// 纯校验：非空 action/decision、正数模板 id、正数 actor、非空 operation id、
+    /// 非负卡片 id。缺失或非法拒绝落库（fail-closed）。
     fn validate(&self) -> Result<(), AstralError> {
         if self.action.trim().is_empty() {
             return Err(AstralError::Validation(
                 "level template audit requires a non-empty action".into(),
+            ));
+        }
+        if self.decision.trim().is_empty() {
+            return Err(AstralError::Validation(
+                "level template audit requires a non-empty decision".into(),
             ));
         }
         if self.template_id <= 0 {
@@ -213,23 +229,10 @@ impl LevelTemplateAuditEntry<'_> {
                 "level template audit requires a non-empty operation id".into(),
             ));
         }
-        if self.affected_card_ids.len() != self.projection_event_ids.len() {
-            return Err(AstralError::Validation(
-                "level template audit requires one REVOKE projection event id per affected card \
-                 (card ids and event ids must align)"
-                    .into(),
-            ));
-        }
-        for (card_id, event_id) in self
-            .affected_card_ids
-            .iter()
-            .zip(self.projection_event_ids.iter())
-        {
-            if *card_id <= 0 || event_id.trim().is_empty() {
+        for card_id in self.affected_card_ids {
+            if *card_id <= 0 {
                 return Err(AstralError::Validation(
-                    "level template audit fanout entries must carry positive card ids \
-                     and non-empty projection event ids"
-                        .into(),
+                    "level template audit scope entries must carry positive card ids".into(),
                 ));
             }
         }
@@ -237,13 +240,12 @@ impl LevelTemplateAuditEntry<'_> {
     }
 }
 
-/// 把等级模板 mutation/fanout 的审计关联写入调用方 source 事务。
+/// 把等级模板 mutation 的审计关联写入调用方 source 事务。
 ///
-/// 沿用 `insert_approval_audit_in_tx` / `insert_user_card_cascade_audit_in_tx` 的
-/// 既有机制：与 source mutation、CARD head/outbox 同事务落 `audit_log`，任何失败
-/// 回滚整个 mutation。不能复用 MQ-first AuditDualWrite：它可能在事务提交后异步落库。
-/// `decision` 与扇出的父 CARD REVOKE 投影事件语义对齐（mutation 类语义；实际扇出
-/// 范围见 detail.affectedCardIds，可能为空）。`user_id` 记录执行变更的管理员 actor。
+/// 沿用既有机制：与 source mutation 同事务落 `audit_log`，任何失败回滚整个
+/// mutation。不能复用 MQ-first AuditDualWrite：它可能在事务提交后异步落库。
+/// `decision` 为按动作固定的 mutation 语义常量（governance mutation，不追加
+/// 任何投影事件）。`user_id` 记录执行变更的管理员 actor。
 async fn insert_level_template_audit_in_tx(
     tx: &mut Transaction<'_, sqlx::MySql>,
     entry: &LevelTemplateAuditEntry<'_>,
@@ -254,6 +256,7 @@ async fn insert_level_template_audit_in_tx(
         .bind(entry.context.actor_id())
         .bind(entry.action)
         .bind(LEVEL_TEMPLATE_AUDIT_RESOURCE)
+        .bind(entry.decision)
         .bind(LEVEL_TEMPLATE_AUDIT_EVENT_TYPE)
         .bind(entry.context.operation_id())
         .bind(&detail)
@@ -301,27 +304,6 @@ fn applied_patch_fields(patch: &LevelTemplatePatch) -> serde_json::Value {
     serde_json::Value::Object(object)
 }
 
-/// 对受影响 ACTIVE 卡逐张追加带 metadata 的 CARD REVOKE head/outbox，
-/// 返回与卡序一一对应的 durable 事件号（供同事务审计关联）。调用方持有事务；
-/// 本函数不 commit、不触碰 Redis/MQ。
-async fn append_card_revokes_with_metadata_in_tx(
-    tx: &mut Transaction<'_, sqlx::MySql>,
-    affected_card_ids: &[i64],
-    context: &LevelTemplateMutationContext,
-) -> Result<Vec<String>, AstralError> {
-    let metadata = ProjectionEventMetadata {
-        actor_id: context.actor_id(),
-        operation_id: context.operation_id(),
-    };
-    let mut projection_event_ids = Vec::with_capacity(affected_card_ids.len());
-    for card_id in affected_card_ids {
-        let identity =
-            append_card_projection_with_metadata_in_tx(tx, *card_id, "REVOKE", metadata).await?;
-        projection_event_ids.push(identity.event_id);
-    }
-    Ok(projection_event_ids)
-}
-
 #[async_trait]
 pub trait LevelTemplateRepository: Send + Sync {
     /// 列表总数（按过滤条件）
@@ -337,25 +319,26 @@ pub trait LevelTemplateRepository: Send + Sync {
     async fn create_template(&self, new: &NewLevelTemplate) -> Result<i64, AstralError>;
     /// 部分更新（空补丁 no-op）。
     ///
-    /// 非空补丁是授权 mutation：同一事务内锁定受影响 ACTIVE 卡、写入带
-    /// `context` actor/operation metadata 的 CARD REVOKE head/outbox，并落一条
-    /// audit_log 关联记录。身份缺失或非法时整个 mutation fail-closed。
+    /// governance mutation（不产生账本 delta、不追加 legacy 投影事件，见模块头
+    /// 范围结论）：以授权源事务为宿主（owning-binding 存在性 source 栅栏合同），
+    /// 同事务落一条 `context` actor/operation 的 audit_log 关联记录。身份缺失或
+    /// 非法时整个 mutation fail-closed。
     async fn update_template(
         &self,
         id: i64,
         patch: &LevelTemplatePatch,
         context: &LevelTemplateMutationContext,
     ) -> Result<(), AstralError>;
-    /// 删除：级联清理两表 + 删除模板，返回是否命中与受影响卡。
+    /// 删除：级联清理两表 + 删除模板，返回是否命中与引用卡集合。
     ///
-    /// 授权 mutation 语义同 `update_template`（metadata REVOKE + 同事务审计关联）；
-    /// 审计详情携带删除前锁定读取的模板 code/name（删除后 source 行不存在）。
+    /// 事务宿主与审计关联语义同 `update_template`；审计详情携带删除前锁定
+    /// 读取的模板 code/name（删除后 source 行不存在）。
     async fn delete_with_cascade(
         &self,
         id: i64,
         context: &LevelTemplateMutationContext,
     ) -> Result<DeleteOutcome, AstralError>;
-    /// 是否由删除聚合在同一事务内追加卡片 projection。
+    /// 兼容哨兵（trait 默认 false；本 repository 覆写为 true，见 impl）。
     fn writes_projection_in_transaction(&self) -> bool {
         false
     }
@@ -384,14 +367,60 @@ fn push_filter<'args>(
     }
 }
 
-/// 锁定受影响 ACTIVE 卡（卡片 id 升序，扇出与审计详情确定性）。
-const LOCK_AFFECTED_CARDS_SQL: &str = "SELECT DISTINCT uc.card_id FROM user_card uc \
+/// 引用 ACTIVE 卡集合（audit 明细 scope 捕获，卡片 id 升序确定性）。
+/// governance mutation 不改卡片授权（模块头范围结论），此读取**不加锁**、
+/// 不驱动任何扇出——仅为审计明细提供引用卡集合观测。行数以 `LIMIT ?` 约束
+/// （绑定值 = cap + 1，多取一行仅用于判定超限），绝不产生无界内存响应。
+const AFFECTED_CARDS_SCOPE_SQL: &str = "SELECT DISTINCT uc.card_id FROM user_card uc \
      WHERE uc.template_id IN ( \
        SELECT user_card_template_id FROM identity_level_template WHERE template_id = ? \
-     ) AND uc.card_status = 'ACTIVE' ORDER BY uc.card_id FOR UPDATE";
+     ) AND uc.card_status = 'ACTIVE' ORDER BY uc.card_id LIMIT ?";
+
+/// 引用卡 scope 捕获的每事务上限：候选数超过上限即 Validation fail-closed、
+/// 在**任何 source mutation 之前**整体拒绝（事务随 Err 回滚），绝不部分审计、
+/// 绝不让 audit/响应 Vec 变成无界内存。与租户 ELIGIBILITY fanout 同一形状。
+const LEVEL_TEMPLATE_AFFECTED_CARDS_CAP: usize = 512;
+
+/// scope 捕获读取的行数上界（cap + 1：多取一行仅用于在单次读内判定超限）。
+fn affected_card_scope_bound() -> i64 {
+    LEVEL_TEMPLATE_AFFECTED_CARDS_CAP as i64 + 1
+}
+
+/// scope 捕获的容量守卫（纯函数，便于单测）：捕获行数超过 cap 即 fail-closed。
+fn guard_affected_card_scope(captured: usize, template_id: i64) -> Result<(), AstralError> {
+    if captured > LEVEL_TEMPLATE_AFFECTED_CARDS_CAP {
+        return Err(AstralError::Validation(format!(
+            "level template {template_id} referencing-card scope captured {captured} rows, \
+             exceeding the per-transaction cap ({LEVEL_TEMPLATE_AFFECTED_CARDS_CAP}); \
+             failing closed before any source mutation instead of an unbounded audit vector"
+        )));
+    }
+    Ok(())
+}
+
+/// 引用卡 scope 捕获（update/delete 共用）：行数受限读取 + 容量守卫。
+/// 必须在调用方的任何 source mutation 之前调用——超限 Err 即整体回滚，
+/// 绝不先写后审。governance mutation 不加卡锁（模块头范围结论）。
+async fn capture_affected_card_scope_in_tx(
+    tx: &mut AuthorizationSourceTransaction,
+    template_id: i64,
+) -> Result<Vec<i64>, AstralError> {
+    let affected_card_ids: Vec<i64> = sqlx::query_scalar(AFFECTED_CARDS_SCOPE_SQL)
+        .bind(template_id)
+        .bind(affected_card_scope_bound())
+        .fetch_all(&mut ***tx)
+        .await
+        .map_err(db_error)?;
+    guard_affected_card_scope(affected_card_ids.len(), template_id)?;
+    Ok(affected_card_ids)
+}
 
 #[async_trait]
 impl LevelTemplateRepository for SqlxLevelTemplateRepository {
+    /// 覆写哨兵：本 repository 在自身事务内闭环处理全部副作用（无 post-commit
+    /// 补偿）。retired 旧 CARD REVOKE 链路已随范围结论移除；保持 `true` 防止
+    /// service 旧补偿路径（`request_card_projection("REVOKE")`，同为 retired
+    /// 无效果链路）被重新激活。
     fn writes_projection_in_transaction(&self) -> bool {
         true
     }
@@ -441,6 +470,10 @@ impl LevelTemplateRepository for SqlxLevelTemplateRepository {
     }
 
     async fn create_template(&self, new: &NewLevelTemplate) -> Result<i64, AstralError> {
+        // 授权源事务宿主：等级模板（domain 绑定）是 owning-binding 存在性
+        // source，resource_ownership resolver 缓存严格 server facts，源活动
+        // 栅栏保证 binding 更新的 epoch complete（见模块头范围结论）。
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let result = sqlx::query(
             "INSERT INTO identity_level_template \
              (template_code, template_name, domain_id, principal_type, grant_type, level_no, \
@@ -457,10 +490,12 @@ impl LevelTemplateRepository for SqlxLevelTemplateRepository {
         .bind(new.version_no)
         .bind(new.force_cover)
         .bind(&new.description)
-        .execute(&self.db)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
-        Ok(result.last_insert_id() as i64)
+        let new_id = result.last_insert_id() as i64;
+        tx.commit_consuming().await?;
+        Ok(new_id)
     }
 
     async fn update_template(
@@ -543,44 +578,37 @@ impl LevelTemplateRepository for SqlxLevelTemplateRepository {
         }
         builder.push(" WHERE template_id = ").push_bind(id);
 
-        // 等级模板的授权语义字段（status/user_card_template_id/grant_type/level_no）
-        // 变更会影响引用卡的授权快照：必须在同一事务内对受影响 ACTIVE 卡追加
-        // 带 metadata 的 REVOKE projection 并落一条审计关联记录（对齐
-        // delete_with_cascade 的锁定+投影模式），否则引用卡保持旧授权直到
-        // 下次变更才收敛。
-        let mut tx = self.db.begin().await.map_err(db_error)?;
-        let affected_card_ids: Vec<i64> = sqlx::query_scalar(LOCK_AFFECTED_CARDS_SQL)
-            .bind(id)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db_error)?;
+        // governance mutation（模块头范围结论）：不改任何卡片授权、不产生账本
+        // delta、不追加 legacy 投影事件。事务宿主为授权源事务（owning-binding
+        // 存在性 source 的栅栏合同）；mutation 前捕获引用 ACTIVE 卡集合仅作
+        // 审计明细 scope 观测（行数受限 + 容量守卫，超限在任何写入前拒绝）。
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let affected_card_ids = capture_affected_card_scope_in_tx(&mut tx, id).await?;
 
-        let result = builder.build().execute(&mut *tx).await.map_err(db_error)?;
+        let result = builder.build().execute(&mut **tx).await.map_err(db_error)?;
         if result.rows_affected() == 0 {
-            // 模板不存在或补丁值与现值完全一致（MySQL 计变更行）：未发生授权
-            // mutation，无扇出、无可审计变更；保持既有 no-op 语义，由 handler
-            // 的 get_template 决定 404。
-            tx.commit().await.map_err(db_error)?;
+            // 模板不存在或补丁值与现值完全一致（MySQL 计变更行）：未发生
+            // mutation，无审计变更；保持既有 no-op 语义，由 handler 的
+            // get_template 决定 404。
+            tx.commit_consuming().await?;
             return Ok(());
         }
 
-        let projection_event_ids =
-            append_card_revokes_with_metadata_in_tx(&mut tx, &affected_card_ids, context).await?;
         insert_level_template_audit_in_tx(
             &mut tx,
             &LevelTemplateAuditEntry {
                 action: LEVEL_TEMPLATE_AUDIT_ACTION_UPDATE,
+                decision: LEVEL_TEMPLATE_AUDIT_DECISION_UPDATE,
                 template_id: id,
                 template_code: None,
                 template_name: None,
                 affected_card_ids: &affected_card_ids,
-                projection_event_ids: &projection_event_ids,
                 applied_fields: applied_patch_fields(patch),
                 context,
             },
         )
         .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(())
     }
 
@@ -589,28 +617,26 @@ impl LevelTemplateRepository for SqlxLevelTemplateRepository {
         id: i64,
         context: &LevelTemplateMutationContext,
     ) -> Result<DeleteOutcome, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
-        // Lock affected cards before deleting the template so source and projection
-        // head/outbox commit atomically.
-        let affected_card_ids: Vec<i64> = sqlx::query_scalar(LOCK_AFFECTED_CARDS_SQL)
-            .bind(id)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db_error)?;
+        // 授权源事务宿主（owning-binding 存在性 source，见模块头范围结论）。
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        // 引用 ACTIVE 卡集合（audit 明细 scope 观测）：删除前捕获，删除后
+        // 模板行不存在无法重算；行数受限 + 容量守卫（超限在任何级联删除前
+        // 拒绝回滚），不加锁、不驱动扇出。
+        let affected_card_ids = capture_affected_card_scope_in_tx(&mut tx, id).await?;
 
-        // 锁定读取模板身份用于删除后仍可追溯的审计 provenance；锁序保持
-        // cards → template（与 update 的隐式锁序一致，避免交叉死锁）。
+        // 锁定读取模板身份用于删除后仍可追溯的审计 provenance。
         let template: Option<(String, String)> = sqlx::query_as(
             "SELECT template_code, template_name FROM identity_level_template \
              WHERE template_id = ? FOR UPDATE",
         )
         .bind(id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let Some((template_code, template_name)) = template else {
             // 模板不存在：保持既有 not-deleted 语义（事务内无 mutation，
-            // 不产生投影/审计记录）。
+            // 不产生审计记录）。
+            tx.commit_consuming().await?;
             return Ok(DeleteOutcome {
                 deleted: false,
                 affected_card_ids: Vec::new(),
@@ -619,19 +645,19 @@ impl LevelTemplateRepository for SqlxLevelTemplateRepository {
 
         sqlx::query("DELETE FROM identity_level_template_resource_map WHERE template_id = ?")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
 
         sqlx::query("DELETE FROM identity_level_template_action_map WHERE template_id = ?")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
 
         let result = sqlx::query("DELETE FROM identity_level_template WHERE template_id = ?")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         if result.rows_affected() == 0 {
@@ -642,23 +668,21 @@ impl LevelTemplateRepository for SqlxLevelTemplateRepository {
             ));
         }
 
-        let projection_event_ids =
-            append_card_revokes_with_metadata_in_tx(&mut tx, &affected_card_ids, context).await?;
         insert_level_template_audit_in_tx(
             &mut tx,
             &LevelTemplateAuditEntry {
                 action: LEVEL_TEMPLATE_AUDIT_ACTION_DELETE,
+                decision: LEVEL_TEMPLATE_AUDIT_DECISION_DELETE,
                 template_id: id,
                 template_code: Some(&template_code),
                 template_name: Some(&template_name),
                 affected_card_ids: &affected_card_ids,
-                projection_event_ids: &projection_event_ids,
                 applied_fields: serde_json::Value::Object(serde_json::Map::new()),
                 context,
             },
         )
         .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
 
         Ok(DeleteOutcome {
             deleted: true,
@@ -714,19 +738,18 @@ mod tests {
         assert_eq!(context.operation_id(), "req-abc_123:45/6.7");
     }
 
-    /// 审计详情：确定性 JSON，携带模板身份、operation/actor、扇出卡与事件号、
+    /// 审计详情：确定性 JSON，携带模板身份、operation/actor、引用卡范围与
     /// 应用的补丁字段；删除路径携带删除前捕获的 code/name。
     #[test]
     fn audit_entry_detail_is_deterministic_and_complete() {
         let context = LevelTemplateMutationContext::new(9, "op-1").unwrap();
-        let event_ids = vec!["evt-b".to_string(), "evt-a".to_string()];
         let update_entry = LevelTemplateAuditEntry {
             action: LEVEL_TEMPLATE_AUDIT_ACTION_UPDATE,
+            decision: LEVEL_TEMPLATE_AUDIT_DECISION_UPDATE,
             template_id: 3,
             template_code: None,
             template_name: None,
             affected_card_ids: &[11, 7],
-            projection_event_ids: &event_ids,
             applied_fields: applied_patch_fields(&LevelTemplatePatch {
                 status: Some("INACTIVE".into()),
                 level_no: Some(4),
@@ -739,12 +762,9 @@ mod tests {
         assert_eq!(parsed["templateId"], 3);
         assert_eq!(parsed["operationId"], "op-1");
         assert_eq!(parsed["actorId"], 9);
-        // 卡与事件号按调用方顺序原样保留（一一对应由 validate 保证）
+        // 引用卡集合按调用方顺序原样保留（scope 观测，无事件配对）
         assert_eq!(parsed["affectedCardIds"], serde_json::json!([11, 7]));
-        assert_eq!(
-            parsed["projectionEventIds"],
-            serde_json::json!(["evt-b", "evt-a"])
-        );
+        assert!(parsed.get("projectionEventIds").is_none());
         assert_eq!(parsed["appliedFields"]["status"], "INACTIVE");
         assert_eq!(parsed["appliedFields"]["levelNo"], 4);
         assert!(parsed["appliedFields"].get("templateName").is_none());
@@ -756,11 +776,11 @@ mod tests {
 
         let delete_entry = LevelTemplateAuditEntry {
             action: LEVEL_TEMPLATE_AUDIT_ACTION_DELETE,
+            decision: LEVEL_TEMPLATE_AUDIT_DECISION_DELETE,
             template_id: 3,
             template_code: Some("LT_CODE"),
             template_name: Some("LT_NAME"),
             affected_card_ids: &[],
-            projection_event_ids: &[],
             applied_fields: serde_json::Value::Object(serde_json::Map::new()),
             context: &context,
         };
@@ -771,91 +791,81 @@ mod tests {
         assert_eq!(parsed["affectedCardIds"], serde_json::json!([]));
     }
 
-    /// 审计校验 fail-closed：空 action / 非正模板 id / 卡与事件号错位 /
-    /// 非正卡 id / 空事件号一律拒绝。
+    /// 审计校验 fail-closed：空 action/decision / 非正模板 id / 非正卡 id /
+    /// 非正 actor / 空 operation id 一律拒绝。
     #[test]
     fn audit_entry_validation_is_fail_closed() {
         // 统一构造 helper：生命周期与调用方局部值绑定，避免泄漏/静态提升。
         fn entry<'a>(
             action: &'a str,
+            decision: &'a str,
             template_id: i64,
             affected: &'a [i64],
-            events: &'a [String],
             context: &'a LevelTemplateMutationContext,
         ) -> LevelTemplateAuditEntry<'a> {
             LevelTemplateAuditEntry {
                 action,
+                decision,
                 template_id,
                 template_code: None,
                 template_name: None,
                 affected_card_ids: affected,
-                projection_event_ids: events,
                 applied_fields: serde_json::Value::Object(serde_json::Map::new()),
                 context,
             }
         }
 
         let context = LevelTemplateMutationContext::new(9, "op-1").unwrap();
-        let ok_events = vec!["evt-1".to_string()];
         let ok_cards = [7i64];
         assert!(entry(
-            LEVEL_TEMPLATE_AUDIT_ACTION_DELETE,
+            LEVEL_TEMPLATE_AUDIT_ACTION_UPDATE,
+            LEVEL_TEMPLATE_AUDIT_DECISION_UPDATE,
             3,
             &ok_cards,
-            &ok_events,
+            &context
+        )
+        .validate()
+        .is_ok());
+        assert!(entry(
+            LEVEL_TEMPLATE_AUDIT_ACTION_DELETE,
+            LEVEL_TEMPLATE_AUDIT_DECISION_DELETE,
+            3,
+            &[],
             &context
         )
         .validate()
         .is_ok());
 
-        let empty_action = entry(" ", 3, &[], &[], &context);
+        let empty_action = entry(" ", LEVEL_TEMPLATE_AUDIT_DECISION_UPDATE, 3, &[], &context);
         assert!(empty_action.validate().is_err());
 
-        let zero_template = entry(LEVEL_TEMPLATE_AUDIT_ACTION_DELETE, 0, &[], &[], &context);
+        let empty_decision = entry(LEVEL_TEMPLATE_AUDIT_ACTION_UPDATE, "  ", 3, &[], &context);
+        assert!(empty_decision.validate().is_err());
+
+        let zero_template = entry(
+            LEVEL_TEMPLATE_AUDIT_ACTION_DELETE,
+            LEVEL_TEMPLATE_AUDIT_DECISION_DELETE,
+            0,
+            &[],
+            &context,
+        );
         assert!(zero_template.validate().is_err());
 
-        // 卡与事件号数量不一致 → 拒绝（每张锁定卡必须恰好一个 REVOKE 事件）
-        let misaligned_events = vec!["evt-1".to_string()];
-        let misaligned_cards = [7i64, 8];
-        assert!(entry(
+        let zero_card = entry(
             LEVEL_TEMPLATE_AUDIT_ACTION_DELETE,
+            LEVEL_TEMPLATE_AUDIT_DECISION_DELETE,
             3,
-            &misaligned_cards,
-            &misaligned_events,
-            &context
-        )
-        .validate()
-        .is_err());
-
-        let zero_card_events = vec!["evt-1".to_string()];
-        let zero_card_ids = [0i64];
-        assert!(entry(
-            LEVEL_TEMPLATE_AUDIT_ACTION_DELETE,
-            3,
-            &zero_card_ids,
-            &zero_card_events,
-            &context
-        )
-        .validate()
-        .is_err());
-
-        let blank_event_ids = vec!["  ".to_string()];
-        let blank_event_cards = [7i64];
-        assert!(entry(
-            LEVEL_TEMPLATE_AUDIT_ACTION_DELETE,
-            3,
-            &blank_event_cards,
-            &blank_event_ids,
-            &context
-        )
-        .validate()
-        .is_err());
+            &[0i64],
+            &context,
+        );
+        assert!(zero_card.validate().is_err());
     }
 
-    /// 源序守卫：update 事务内必须先锁定受影响卡，再执行 UPDATE，然后才是
-    /// metadata REVOKE 扇出、审计关联与提交；禁止退回无 metadata 的旧入口。
+    /// 源序守卫：update 事务内必须以授权源事务 begin 开场（owning-binding
+    /// 存在性 source 栅栏合同），捕获引用卡 scope，执行 UPDATE，随后同事务
+    /// 审计关联与 commit_consuming；绝不退回 legacy CARD REVOKE 扇出。
     #[test]
-    fn update_tx_orders_locks_projection_audit_and_commit() {
+    fn update_tx_orders_wrapper_scope_audit_and_commit() {
         let source = include_str!("level_template_repository.rs");
         let update_body = source
             .split("async fn update_template")
@@ -868,54 +878,66 @@ mod tests {
             // next() 截到它之前 = 纯 update 实现体。
             .next()
             .expect("update_template body must be delimited");
-        let lock = update_body
-            .find("LOCK_AFFECTED_CARDS_SQL")
-            .expect("update must lock affected ACTIVE cards");
+        let wrapper_begin = update_body
+            // 自引用防呆：拼接构造 joined token，避免本测试字面量污染
+            // governance_row 测试的整文件出现次数统计。
+            .find(concat!(
+                "AuthorizationSourceTransaction::",
+                "begin(&self.db)"
+            ))
+            .expect("update must host the governance mutation in the source wrapper");
+        let scope = update_body
+            .find("capture_affected_card_scope_in_tx")
+            .expect("update must capture the referencing-card scope (bounded) for audit detail");
         let source_update = update_body
             // 锚定执行点而非 QueryBuilder 构造文本：UPDATE 语句字符串在事务
-            // 开始前就由 QueryBuilder 持有，"先锁卡后执行"的顺序只能以
+            // 开始前就由 QueryBuilder 持有，"先捕获后执行"的顺序只能以
             // build().execute() 的位置为准。
-            .find("builder.build().execute(&mut *tx)")
-            .expect("update must mutate the template row");
-        let projection = update_body
-            .find("append_card_revokes_with_metadata_in_tx")
-            .expect("update must append metadata CARD REVOKE projections");
+            .find("builder.build().execute(&mut **tx)")
+            .expect("update must mutate the template row on the wrapper connection");
         let audit = update_body
             .find("insert_level_template_audit_in_tx")
             .expect("update must write one audit correlation record");
         // update 存在 no-op 分支的提前 commit；最终 commit 必须在审计之后。
         let commit = update_body
-            .rfind("tx.commit()")
-            .expect("update must commit the source transaction");
+            .rfind("tx.commit_consuming()")
+            .expect("update must commit through the wrapper consuming commit");
         assert!(
-            lock < source_update && source_update < projection && projection < audit && audit < commit,
-            "update must order: card locks -> source UPDATE -> metadata REVOKE fanout -> audit -> commit"
+            wrapper_begin < scope && scope < source_update && source_update < audit && audit < commit,
+            "update must order: wrapper begin -> card scope read -> source UPDATE -> audit -> commit_consuming"
         );
-        // 同事务无 metadata 旧入口不得再用于该授权 mutation。
         assert!(
-            !update_body.contains("append_card_projection_in_tx"),
-            "level template mutations must not use the identity-less projection entry"
+            !update_body.contains("tx.commit()"),
+            "update must not bypass the wrapper's proven-commit gate with a raw commit"
         );
     }
 
-    /// 源序守卫：delete 事务内必须先锁卡，再锁定读取模板 provenance，随后
-    /// 级联删除，最后 metadata REVOKE 扇出、审计关联与提交。
+    /// 源序守卫：delete 事务内必须以授权源事务 begin 开场，捕获引用卡 scope，
+    /// 锁定读取模板 provenance，随后级联删除、审计关联与 commit_consuming；
+    /// 绝不退回 legacy CARD REVOKE 扇出。
     #[test]
-    fn delete_tx_orders_locks_provenance_deletes_projection_audit_and_commit() {
+    fn delete_tx_orders_wrapper_scope_provenance_deletes_audit_and_commit() {
         let source = include_str!("level_template_repository.rs");
         let delete_body = source
             .split("async fn delete_with_cascade")
-            // 该字符串出现 4 次（trait 声明 / impl 实现 / update 测试与本测试
-            // 的字面量）；nth(2) 才是 impl 实现体段（到 update 测试字面量前）。
+            // 该字符串出现 4 次（trait 声明 / impl 实现 / 两个测试的字面量）；
+            // nth(2) 才是 impl 实现体段（到下一个测试字面量前）。
             .nth(2)
             .expect("delete_with_cascade implementation must exist")
             // 在 db_error 前截断，排除本测试模块的源码字面量干扰。
             .split("fn db_error")
             .next()
             .expect("delete_with_cascade body must be delimited");
-        let lock = delete_body
-            .find("LOCK_AFFECTED_CARDS_SQL")
-            .expect("delete must lock affected ACTIVE cards before deleting the template");
+        let wrapper_begin = delete_body
+            // 自引用防呆：拼接构造 joined token（同 update 测试注释）。
+            .find(concat!(
+                "AuthorizationSourceTransaction::",
+                "begin(&self.db)"
+            ))
+            .expect("delete must host the governance mutation in the source wrapper");
+        let scope = delete_body
+            .find("capture_affected_card_scope_in_tx")
+            .expect("delete must capture the referencing-card scope (bounded) for audit detail");
         let provenance = delete_body
             .find("SELECT template_code, template_name FROM identity_level_template")
             .expect("delete must capture template provenance under lock");
@@ -925,49 +947,68 @@ mod tests {
         let row_delete = delete_body
             .find("DELETE FROM identity_level_template WHERE template_id = ?")
             .expect("delete must remove the template row");
-        let projection = delete_body
-            .find("append_card_revokes_with_metadata_in_tx")
-            .expect("delete must append metadata CARD REVOKE projections");
         let audit = delete_body
             .find("insert_level_template_audit_in_tx")
             .expect("delete must write one audit correlation record");
         let commit = delete_body
-            .find("tx.commit()")
-            .expect("delete must commit the source transaction");
+            // rfind：delete 实现内有两个 commit_consuming（not-found 短路分支 +
+            // 最终提交）；序守卫必须锚定最终提交。
+            .rfind("tx.commit_consuming()")
+            .expect("delete must commit through the wrapper consuming commit");
         assert!(
-            lock < provenance
+            wrapper_begin < scope
+                && scope < provenance
                 && provenance < map_delete
                 && map_delete < row_delete
-                && row_delete < projection
-                && projection < audit
+                && row_delete < audit
                 && audit < commit,
-            "delete must order: card locks -> provenance read -> cascades -> metadata REVOKE fanout -> audit -> commit"
+            "delete must order: wrapper begin -> card scope read -> provenance -> cascades -> audit -> commit_consuming"
         );
         assert!(
-            !delete_body.contains("append_card_projection_in_tx"),
-            "level template mutations must not use the identity-less projection entry"
+            !delete_body.contains("tx.commit()"),
+            "delete must not bypass the wrapper's proven-commit gate with a raw commit"
         );
     }
 
-    /// 模板 mutation 不产生授权账本 delta（模板不是 CanonicalGrant 源），
-    /// 审计 INSERT 只用绑定参数 + 固定常量，不拼接任何请求输入。
+    /// governance-row 范围结论（2026-10-02）：等级模板 mutation 不产生授权账本
+    /// delta/revision（模板不是 CanonicalGrant 源，无 PolicyEngine 数据面消费者），
+    /// 也不追加任何 legacy 投影事件（retired 旧 CARD REVOKE 链路对生产授权
+    /// 零效果）；create/update/delete 全部以授权源事务为宿主。
     #[test]
-    fn no_ledger_deltas_and_parameterized_audit_sql() {
+    fn governance_row_has_no_ledger_delta_and_no_legacy_projection() {
         let source = include_str!("level_template_repository.rs");
         // 自引用防呆：token 必须拼接构造。include_str! 会把本测试模块自身的
         // 源码包含进 source，直接书写完整字面量会让 contains 恒真、守卫失效。
         let revision_token = concat!("authorization_grant_", "revision");
         let delta_token = concat!("authorization_delta_", "event");
         let adapter_token = concat!("grant_", "ledger");
+        let card_projection_token = concat!("append_card_", "projection");
+        let card_revoke_token = concat!("append_card_revokes_", "with_metadata_in_tx");
+        let event_type_revoke_token = concat!("EVENT_TYPE_", "REVOKE");
         assert!(
             !source.contains(revision_token)
                 && !source.contains(delta_token)
                 && !source.contains(adapter_token),
             "level template mutations must not invent ledger deltas"
         );
-        // 全部可变输入走绑定参数；decision/resource/event_type 为固定常量。
-        assert!(LEVEL_TEMPLATE_AUDIT_INSERT_SQL
-            .contains("VALUES (?, NULL, ?, ?, 'CARD_REVOKED', NULL, ?, ?, ?)"));
+        assert!(
+            !source.contains(card_projection_token)
+                && !source.contains(card_revoke_token)
+                && !source.contains(event_type_revoke_token),
+            "level template mutations must not emit legacy CARD projection/REVOKE events"
+        );
+        // create/update/delete 全部以授权源事务为宿主（owning-binding 存在性
+        // source 的栅栏合同）。
+        let begin_token = concat!("AuthorizationSourceTransaction::", "begin(&self.db)");
+        assert_eq!(
+            source.matches(begin_token).count(),
+            3,
+            "create/update/delete must each host their mutation in the source wrapper"
+        );
+        // 全部可变输入走绑定参数；decision/resource/event_type 为固定常量按动作绑定。
+        assert!(
+            LEVEL_TEMPLATE_AUDIT_INSERT_SQL.contains("VALUES (?, NULL, ?, ?, ?, NULL, ?, ?, ?)")
+        );
         assert!(
             LEVEL_TEMPLATE_AUDIT_INSERT_SQL.contains("event_type")
                 && LEVEL_TEMPLATE_AUDIT_INSERT_SQL.contains("request_id"),
@@ -977,5 +1018,47 @@ mod tests {
         assert_eq!(LEVEL_TEMPLATE_AUDIT_EVENT_TYPE, "LEVEL_TEMPLATE_MUTATION");
         assert_eq!(LEVEL_TEMPLATE_AUDIT_ACTION_UPDATE, "level_template_update");
         assert_eq!(LEVEL_TEMPLATE_AUDIT_ACTION_DELETE, "level_template_delete");
+        assert_eq!(
+            LEVEL_TEMPLATE_AUDIT_DECISION_UPDATE,
+            "LEVEL_TEMPLATE_UPDATED"
+        );
+        assert_eq!(
+            LEVEL_TEMPLATE_AUDIT_DECISION_DELETE,
+            "LEVEL_TEMPLATE_DELETED"
+        );
+        // scope 捕获读取必须行数受限（LIMIT ?，cap+1）且不加锁：audit 观测
+        // 不产生无界内存，也不构成锁 fanout（governance mutation 不改卡授权）。
+        assert!(
+            AFFECTED_CARDS_SCOPE_SQL.contains("LIMIT ?"),
+            "card scope capture must be row-bounded for a finite audit vector"
+        );
+        assert!(
+            !AFFECTED_CARDS_SCOPE_SQL.contains("FOR UPDATE"),
+            "card scope capture is an audit-observability read, not a lock fanout"
+        );
+    }
+
+    /// 引用卡 scope 容量守卫：bound = cap + 1（单次读内判定超限）；捕获数
+    /// 超 cap 即 Validation fail-closed（在任何 source mutation 之前拒绝），
+    /// cap 内放行；错误消息携带模板身份与超限事实。
+    #[test]
+    fn affected_card_scope_is_bounded_with_pre_mutation_reject() {
+        const { assert!(LEVEL_TEMPLATE_AFFECTED_CARDS_CAP > 0) };
+        assert_eq!(
+            affected_card_scope_bound(),
+            LEVEL_TEMPLATE_AFFECTED_CARDS_CAP as i64 + 1,
+            "scope read bound must be cap + 1 so exceeding the cap is detectable in one read"
+        );
+        assert!(guard_affected_card_scope(0, 9).is_ok());
+        assert!(guard_affected_card_scope(LEVEL_TEMPLATE_AFFECTED_CARDS_CAP, 9).is_ok());
+        let err = guard_affected_card_scope(LEVEL_TEMPLATE_AFFECTED_CARDS_CAP + 1, 9)
+            .expect_err("over-cap capture must fail closed");
+        assert!(matches!(err, AstralError::Validation(_)));
+        let message = err.to_string();
+        assert!(message.contains('9'), "message must name the template");
+        assert!(
+            message.contains("before any source mutation"),
+            "message must state the pre-mutation rejection contract"
+        );
     }
 }

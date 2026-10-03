@@ -211,6 +211,37 @@ class CampaignEntrySafetyTest(unittest.TestCase):
         )
         self.assertEqual(status, "FAIL")
 
+    def test_upgraded_verification_gates_are_registered(self) -> None:
+        """The E5 layer pins both models and the universal hypotheses."""
+        import run_single_node_campaign as module
+        specs = {spec["id"]: spec for spec in module.COMMANDS}
+        self.assertIn("e5-bounded-model-two-mutations", specs)
+        self.assertIn("e5-universal-hypotheses", specs)
+        self.assertTrue(specs["e5-bounded-model-two-mutations"]["assertTwoMutationModel"])
+        self.assertTrue(specs["e5-universal-hypotheses"]["assertUniversalHypotheses"])
+        # The heavy enumerations carry their own timeouts, never the
+        # 1800 s default silently applied to them.
+        self.assertGreater(
+            specs["e5-universal-hypotheses"]["timeoutSeconds"], 1800
+        )
+        # The upgraded verification layer is hash-inventoried.
+        for source in (
+            "Docs/authorization-validation/tools/e5_model_check_two_mutations.py",
+            "Docs/authorization-validation/tools/universal_hypotheses_check.py",
+            "Docs/authorization-validation/tools/experiment_register.py",
+            "Docs/authorization-validation/tools/test_classify_e1_properties.py",
+        ):
+            self.assertIn(source, module.HASHED_SOURCES)
+        import experiment_register
+        self.assertEqual(experiment_register.validate_register()["status"], "PASS")
+
+    def test_experiment_register_and_multi_classifier_importable(self) -> None:
+        import experiment_register
+        import experiment_common
+
+        self.assertEqual(experiment_register.validate_register()["status"], "PASS")
+        self.assertTrue(hasattr(experiment_common, "classify_e1_allow_multi"))
+
     def test_zero_python_tests_cannot_pass(self) -> None:
         module = load_runner()
         with tempfile.TemporaryDirectory(prefix="us27_readiness_test_") as directory:

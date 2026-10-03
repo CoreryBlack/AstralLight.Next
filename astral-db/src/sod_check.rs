@@ -47,6 +47,52 @@
 //! 策略写入为低频管理操作，30s 失效窗口为显式接受的取舍（策略表撤销/
 //! 变更无 pointer 对牌兜底——它是独立于授权账本的输入表，evict 钩子只覆盖
 //! 本进程写路径，跨实例依赖 TTL）。
+//!
+//! ## 复合进程（单机内存镜像）宿主读面（additive，default-off）
+//!
+//! 组合进程安装 `memory_projection_hub` + 辅助授权镜像后，宿主 SoD 走
+//! context-aware 入口（[`check_sod_conflict_with_context`] /
+//! [`load_org_sod_admission_mirrored`]），warm 态（镜像已预热、hub 健康、
+//! 无活跃 source writer、策略快照 token 绑定未变）实现**零 DB**：
+//! - 卡级 published evidence：`hub.try_memory_evidence`（与 durable 同源的
+//!   纯装配函数 + 读前/读后 token 对牌）；scope 只用服务端 ctx（tenant 由
+//!   PolicyEngine 已鉴权，card-tenant 绑定由 hub durable card index 命中
+//!   再证明；miss 一律回退既有 durable 链，绝不放大读面）；
+//! - org 准入证据：复用辅助镜像 `load_org_authorization`（与引擎 evaluate
+//!   同一 strict read contract / single-flight / 纪元栅栏），`Ready` 证据
+//!   进入与 fresh DB 读完全相同的 provenance 对牌解析器；
+//! - sod_policy 快照：进程缓存条目绑定 hub 严格读 token（单一写者下精确
+//!   失效——任何 source mutation 推进 token，下一次读取即回填），warm 态
+//!   零 DB；writer-active/unknown 一律 fail-closed，绝不以并发/未知 source
+//!   状态放行；非 composite 保留既有 TTL 30s 语义不变。
+//!
+//! ### canonical 宿主路径的持有语义（冷/热一致；BREAKING CHANGE 登记）
+//!
+//! canonical 宿主 SoD 路径（[`check_sod_conflict_with_context`] /
+//! [`check_sod_conflict_with_context_and_org`]，cold durable 回退与 warm 记忆路径**同一
+//! 合同**）对"持有授权"的定义只认**已发布 evidence** 的 `effective_grants`
+//! （与 `sod_repository::card_permissions` 同一 effective-grant contract）：
+//! raw `permission_rule` 行是 legacy 直写事实、未经发布链验证，**不构成持有
+//! 授权**，canonical 路径冷/热均不执行 [`SOD_RAW_RULE_CONFLICT_SQL`] 扫描。
+//! 旧公开诊断入口 [`check_sod_conflict`] 与 [`check_sod_conflict_with_org`]
+//! 保留 raw deny-biased 扫描。两类入口因此**不是**逐字节等同：canonical
+//! 移除了 raw 扫描（raw 行命中只会把 has_conflict 变 true，即移除后同请求
+//! 可能从拒绝变为放行）——该差异由主域规范登记为 BREAKING CHANGE/语义修正，
+//! 冷/热合同一致性由此保证（warm 相对 cold 不再有任何放行面扩大）。
+//!
+//! 策略快照回填（两种模式共用）全部有界：`LIMIT cap+1` 探针（超限
+//! fail-closed）、快照字节预算、3s 查询 deadline、进程级 single-flight
+//! 有界锁等待；composite 回填前后经 hub 严格 token 对牌（读前取 token、
+//! 读后复核，竞争即报错，绝不缓存竞争产物）。
+//!
+//! ### 冷启动首轮安全 Pending（可重试）
+//!
+//! 镜像 warm 回填/发布安装会推进 hub mutation token：安装后**首个**请求的
+//! 策略缓存必然 miss → 走有界回填（或回填窗口内 fail-closed）。这是一次
+//! **安全 Pending**，不是故障：客户端重试即可——重试请求会以安装后的 token
+//! 重新捕获基线并以安装后事实重新评估授权；已放弃的首轮请求绝不以安装前
+//! 事实放行（栅栏复核比较的是 evaluate 前捕获的旧 token，**不存在任何
+//! "末尾重采样 token 覆盖旧读"的路径**），也不折算成放行。
 
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -58,12 +104,17 @@ use astral_types::org_scope::{
 };
 use astral_types::{
     build_resource_key, DomainScopeRequirement, PolicyContext, PolicyDecision,
-    PublishedCardEvidenceScope, ResourceOwnershipScope,
+    PublishedCardAuthorization, PublishedCardEvidenceScope, ResourceOwnershipScope,
 };
+use policy_engine::org_admission::OrgAuthorityRead;
 use sqlx::MySqlPool;
 
 use crate::authorization_projection_repository::AuthorizationEvidenceError;
+use crate::auxiliary_authorization_mirror::auxiliary_authorization_mirror;
 use crate::evidence_cache::cached_load_published_card_grant_evidence;
+use crate::memory_projection_hub::{
+    memory_projection_hub, AuxiliaryReadToken, MemoryEvidenceOutcome,
+};
 use crate::org_scope_repository::{OrgAdmissionQuery, OrgScopeRepository, SqlxOrgScopeRepository};
 
 /// SoD 冲突检查结果
@@ -177,9 +228,28 @@ pub fn sod_evidence_contract_message(
 // sod_policy 进程级缓存（读链规模化：每请求 2 次 sod_policy 全量读收敛）
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// SoD 策略进程缓存 TTL（30s）：失效窗口与方向性取舍见模块文档
-/// "sod_policy 进程缓存"节（本进程写路径 evict 立即生效；跨实例 ≤TTL）。
+/// Both modes expire after 30s; composite entries also require their source
+/// token to match. Cross-instance legacy invalidation still relies on TTL.
 const SOD_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// ACTIVE 策略快照单类行数上限：回填 SQL 取 `cap+1` 探针行，读满 cap+1 即
+/// 判定超容量并 fail-closed（绝不把 LIMIT 截断的部分快照冒充全量读面）。
+/// sod_policy 为管理端低频输入表，4096 远超现实规模；超限属异常态，拒绝
+/// 服务优于截断漏报（新收紧策略被截断 = 放行方向）。
+const SOD_POLICY_SNAPSHOT_ROW_CAP: usize = 4096;
+
+/// 快照字节预算（近似**内容**字节：仅统计字符串字段长度，不含 allocator/
+/// 对象头等内存开销，也**不是** RSS 上界——进程内存影响另有镜像容量合同
+/// 约束）：超预算 fail-closed，防止异常膨胀行把进程内存拖成无界。
+const SOD_POLICY_SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// 回填查询硬 deadline：超时取消查询并 fail-closed（错误绝不入缓存）。
+/// 与镜像 strict refill 的 `REFILL_QUERY_DEADLINE` 同域（3s）。
+const SOD_POLICY_QUERY_DEADLINE: Duration = Duration::from_secs(3);
+
+/// single-flight 锁等待上限：并发 miss 只放一个回源，其余有界等待后
+/// fail-closed（不无限排队、不并发重复回源）。
+const SOD_POLICY_REFILL_LOCK_WAIT: Duration = Duration::from_secs(3);
 
 /// SoD 策略快照（单条目全量缓存）：全量 ACTIVE STATIC 策略 + 全量 ACTIVE
 /// DYNAMIC 策略。DYNAMIC 的 resource_type/action_code 过滤在读取侧内存执行
@@ -191,10 +261,26 @@ struct SodPolicySnapshot {
     dynamic_policies: Vec<DynamicPolicy>,
 }
 
-static SOD_POLICY_CACHE: OnceLock<RwLock<Option<(SodPolicySnapshot, Instant)>>> = OnceLock::new();
+/// A composite snapshot requires both a matching source token and a fresh
+/// TTL. A legacy snapshot carries no token and uses the same TTL.
+#[derive(Debug, Clone)]
+struct SodPolicyCacheEntry {
+    snapshot: SodPolicySnapshot,
+    cached_at: Instant,
+    source: Option<AuxiliaryReadToken>,
+}
 
-fn sod_policy_cache() -> &'static RwLock<Option<(SodPolicySnapshot, Instant)>> {
+static SOD_POLICY_CACHE: OnceLock<RwLock<Option<SodPolicyCacheEntry>>> = OnceLock::new();
+
+fn sod_policy_cache() -> &'static RwLock<Option<SodPolicyCacheEntry>> {
     SOD_POLICY_CACHE.get_or_init(|| RwLock::new(None))
+}
+
+/// 进程级 single-flight 回源锁（全快照单条目，无需按 key 分桶）。
+static SOD_POLICY_REFILL_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn sod_policy_refill_lock() -> &'static tokio::sync::Mutex<()> {
+    SOD_POLICY_REFILL_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// 缓存条目新鲜度（纯逻辑；`duration_since` 对未来时刻饱和为 0，恰好到达
@@ -203,55 +289,235 @@ fn sod_policy_cache_is_fresh(cached_at: Instant, now: Instant) -> bool {
     now.duration_since(cached_at) < SOD_POLICY_CACHE_TTL
 }
 
-/// TTL 内的进程缓存快照（未命中/过期/锁中毒 → `None`，调用方回源直查）。
-fn fresh_sod_policy_snapshot() -> Option<SodPolicySnapshot> {
-    let cached = sod_policy_cache().read().ok()?;
-    let (snapshot, cached_at) = cached.as_ref()?;
-    if sod_policy_cache_is_fresh(*cached_at, Instant::now()) {
-        return Some(snapshot.clone());
+/// 服务判定（纯逻辑，可单测钉死矩阵）：hub 安装时只认 token 绑定条目，
+/// 且**同时要求 TTL 新鲜**（TTL 是既有缓存/_gc 合同的条目寿命上界——过期
+/// 一律触发回填，绝不因 token 未变就信任过期条目）；hub 未安装时沿用既有
+/// TTL 语义。模式/条目不匹配（如 composite 读到未绑定条目）一律 miss 回填。
+fn sod_policy_entry_serves(
+    hub_installed: bool,
+    entry_bound: bool,
+    token_matches: bool,
+    ttl_fresh: bool,
+) -> bool {
+    match (hub_installed, entry_bound) {
+        (true, true) => token_matches && ttl_fresh,
+        // composite 读到未绑定条目 / 非 composite 读到绑定条目：模式错位，
+        // 不服务（回填会以当前模式重新绑定）。
+        (true, false) | (false, true) => false,
+        (false, false) => ttl_fresh,
     }
-    None
 }
 
-/// 写入进程缓存（全量查询成功后调用；错误结果绝不缓存）。锁中毒时静默跳过
-/// （缓存侧任何异常只意味着下一次读回源直查，绝不影响 fail-closed 语义）。
+/// 回源判定（纯逻辑）：composite 模式要求 hub 严格读 token **当前可读**；
+/// writer-active/unknown（token 不可读）→ `Blocked`（fail-closed，绝不以
+/// 并发/未知 source 状态回源或放行）。非 composite → `Legacy`（既有行为）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SodPolicyRefillOutcome {
+    Bound,
+    Legacy,
+    Blocked,
+}
+
+fn sod_policy_refill_outcome(
+    hub_installed: bool,
+    strict_token_readable: bool,
+) -> SodPolicyRefillOutcome {
+    match (hub_installed, strict_token_readable) {
+        (true, true) => SodPolicyRefillOutcome::Bound,
+        (true, false) => SodPolicyRefillOutcome::Blocked,
+        (false, _) => SodPolicyRefillOutcome::Legacy,
+    }
+}
+
+/// 生产读取入口：composite（hub 安装）只服务 token 绑定且未漂移的条目；
+/// 非 composite 走既有 TTL 语义。miss/模式错位一律回源（回源侧负责
+/// writer-active/unknown 的 fail-closed）。
+///
+/// hub 严格读 token 在此**只采样一次**，条目匹配是对该采样值的纯比较
+/// （绝不多次采样后再判定，避免采样间隙 writer 进出的竞争）。
+fn serve_sod_policy_snapshot() -> Option<SodPolicySnapshot> {
+    let hub = memory_projection_hub();
+    let current = hub.and_then(|hub| hub.strict_read_token());
+    let cached = sod_policy_cache().read().ok()?;
+    let entry = cached.as_ref()?;
+    let token_matches = match (entry.source, current) {
+        (Some(bound), Some(current)) => bound == current,
+        _ => false,
+    };
+    let serves = sod_policy_entry_serves(
+        hub.is_some(),
+        entry.source.is_some(),
+        token_matches,
+        sod_policy_cache_is_fresh(entry.cached_at, Instant::now()),
+    );
+    serves.then(|| entry.snapshot.clone())
+}
+
+/// 写入进程缓存（非 composite 回填 + 单测使用；错误结果绝不缓存）。锁中毒
+/// 时静默跳过（缓存侧任何异常只意味着下一次读回源直查，绝不影响
+/// fail-closed 语义）。
 fn store_sod_policy_snapshot(snapshot: SodPolicySnapshot) {
     if let Ok(mut cached) = sod_policy_cache().write() {
-        *cached = Some((snapshot, Instant::now()));
+        *cached = Some(SodPolicyCacheEntry {
+            snapshot,
+            cached_at: Instant::now(),
+            source: None,
+        });
+    }
+}
+
+/// 写入 token 绑定条目（composite 回填专用；调用方必须已完成回填后的
+/// strict token 复核）。
+fn store_sod_policy_snapshot_bound(snapshot: SodPolicySnapshot, token: AuxiliaryReadToken) {
+    if let Ok(mut cached) = sod_policy_cache().write() {
+        *cached = Some(SodPolicyCacheEntry {
+            snapshot,
+            cached_at: Instant::now(),
+            source: Some(token),
+        });
     }
 }
 
 /// 主动失效 SoD 策略进程缓存（sod_policy 写路径 evict 钩子：本进程内立即
-/// 生效；其它实例由 TTL 兜底，见模块文档失效窗口记录）。
+/// 生效；composite 模式另有 source writer 栅栏推进 token 的精确失效，此
+/// 钩子保留为双保险；其它实例由 TTL 兜底，见模块文档失效窗口记录）。
 pub fn evict_sod_policy_cache() {
     if let Ok(mut cached) = sod_policy_cache().write() {
         *cached = None;
     }
 }
 
-/// 读取 SoD 策略全量快照（进程缓存优先，miss 回源直查；DB 错误原样上抛，
-/// 绝不折算成"无冲突"，错误结果绝不入缓存）。
-async fn load_sod_policy_snapshot(pool: &MySqlPool) -> Result<SodPolicySnapshot, sqlx::Error> {
-    if let Some(snapshot) = fresh_sod_policy_snapshot() {
-        return Ok(snapshot);
+/// 快照字节预算（纯逻辑）：字符串字段总长近似值（饱和累加，行内容虽来自
+/// 有界 VARCHAR 列，仍不允许任何加法 panic/回绕），用于有界回填判定。
+fn sod_policy_snapshot_bytes(snapshot: &SodPolicySnapshot) -> usize {
+    snapshot
+        .static_policies
+        .iter()
+        .map(|policy| {
+            policy
+                .policy_name
+                .len()
+                .saturating_add(policy.permission_a.as_deref().map_or(0, str::len))
+                .saturating_add(policy.permission_b.as_deref().map_or(0, str::len))
+        })
+        .chain(snapshot.dynamic_policies.iter().map(|policy| {
+            policy
+                .policy_name
+                .len()
+                .saturating_add(policy.condition_script.as_deref().map_or(0, str::len))
+                .saturating_add(policy.resource_type.as_deref().map_or(0, str::len))
+                .saturating_add(policy.action_code.as_deref().map_or(0, str::len))
+        }))
+        .fold(0usize, usize::saturating_add)
+}
+
+/// 有界快照装配（纯逻辑）：cap+1 探针超限或字节预算超限 → fail-closed，
+/// 绝不把截断/膨胀快照当作全量 ACTIVE 输入（截断新收紧策略 = 放行方向）。
+fn bounded_sod_policy_snapshot(
+    static_policies: Vec<StaticPolicy>,
+    dynamic_policies: Vec<DynamicPolicy>,
+) -> Result<SodPolicySnapshot, sqlx::Error> {
+    if static_policies.len() > SOD_POLICY_SNAPSHOT_ROW_CAP
+        || dynamic_policies.len() > SOD_POLICY_SNAPSHOT_ROW_CAP
+    {
+        return Err(sod_gate_error(&format!(
+            "sod_policy_snapshot_capacity_exceeded;cap={SOD_POLICY_SNAPSHOT_ROW_CAP}"
+        )));
     }
-    let static_policies = sqlx::query_as::<_, StaticPolicy>(
-        "SELECT policy_name, permission_a, permission_b \
-         FROM sod_policy WHERE conflict_type='STATIC' AND status='ACTIVE'",
-    )
-    .fetch_all(pool)
-    .await?;
-    let dynamic_policies = sqlx::query_as::<_, DynamicPolicy>(
-        "SELECT policy_name, condition_script, resource_type, action_code \
-         FROM sod_policy WHERE conflict_type='DYNAMIC' AND status='ACTIVE'",
-    )
-    .fetch_all(pool)
-    .await?;
     let snapshot = SodPolicySnapshot {
         static_policies,
         dynamic_policies,
     };
-    store_sod_policy_snapshot(snapshot.clone());
+    let bytes = sod_policy_snapshot_bytes(&snapshot);
+    if bytes > SOD_POLICY_SNAPSHOT_MAX_BYTES {
+        return Err(sod_gate_error(&format!(
+            "sod_policy_snapshot_byte_budget_exceeded;bytes={bytes};max={SOD_POLICY_SNAPSHOT_MAX_BYTES}"
+        )));
+    }
+    Ok(snapshot)
+}
+
+/// 读取 SoD 策略全量快照（缓存服务优先，miss 回源；DB 错误原样上抛，
+/// 绝不折算成"无冲突"，错误结果绝不入缓存）。
+async fn load_sod_policy_snapshot(pool: &MySqlPool) -> Result<SodPolicySnapshot, sqlx::Error> {
+    if let Some(snapshot) = serve_sod_policy_snapshot() {
+        return Ok(snapshot);
+    }
+    refill_sod_policy_snapshot(pool).await
+}
+
+/// 有界 single-flight 回源（composite 与非 composite 共用）：
+/// - composite：回源前 hub 严格读 token 必须可读（writer-active/unknown →
+///   fail-closed，绝不回源或放行）；取 token → 有界查询 → 复核 token 未漂移
+///   → 绑定安装；漂移即报错，竞争产物绝不入缓存。
+/// - 非 composite：既有 TTL 语义（条目不绑定 token）。
+/// - 查询 `LIMIT cap+1` 有界 + 3s deadline + 快照字节预算；single-flight
+///   全局锁有界等待（超时 fail-closed，不无限排队）。
+async fn refill_sod_policy_snapshot(pool: &MySqlPool) -> Result<SodPolicySnapshot, sqlx::Error> {
+    let hub = memory_projection_hub();
+    // hub 严格读 token 在回源前**只采样一次**（绝不允许先 `is_some` 判定再
+    // 二次采样——两次采样之间存在 writer 进出，二次 expect 会 panic/竞争）；
+    // 之后一切判定都是对该捕获值的纯比较。
+    let captured = hub.and_then(|hub| hub.strict_read_token());
+    let bound_token = match sod_policy_refill_outcome(hub.is_some(), captured.is_some()) {
+        SodPolicyRefillOutcome::Blocked => {
+            return Err(sod_gate_error(
+                "sod_policy_source_state_unavailable;writer_active_or_unknown",
+            ));
+        }
+        SodPolicyRefillOutcome::Bound => captured,
+        SodPolicyRefillOutcome::Legacy => None,
+    };
+
+    let _guard = tokio::time::timeout(SOD_POLICY_REFILL_LOCK_WAIT, sod_policy_refill_lock().lock())
+        .await
+        .map_err(|_| sod_gate_error("sod_policy_refill_lock_wait_timeout"))?;
+    // 等锁期间其它请求可能已完成回源；重新服务判定（composite 下 token 绑定
+    // 未漂移的条目仍然有效）。
+    if let Some(snapshot) = serve_sod_policy_snapshot() {
+        return Ok(snapshot);
+    }
+
+    let read: Result<(Vec<StaticPolicy>, Vec<DynamicPolicy>), sqlx::Error> =
+        tokio::time::timeout(SOD_POLICY_QUERY_DEADLINE, async {
+            let static_policies = sqlx::query_as::<_, StaticPolicy>(&format!(
+                "SELECT policy_name, permission_a, permission_b \
+             FROM sod_policy WHERE conflict_type='STATIC' AND status='ACTIVE' LIMIT {}",
+                SOD_POLICY_SNAPSHOT_ROW_CAP + 1
+            ))
+            .fetch_all(pool)
+            .await?;
+            let dynamic_policies = sqlx::query_as::<_, DynamicPolicy>(&format!(
+                "SELECT policy_name, condition_script, resource_type, action_code \
+             FROM sod_policy WHERE conflict_type='DYNAMIC' AND status='ACTIVE' LIMIT {}",
+                SOD_POLICY_SNAPSHOT_ROW_CAP + 1
+            ))
+            .fetch_all(pool)
+            .await?;
+            Ok((static_policies, dynamic_policies))
+        })
+        .await
+        .map_err(|_| sod_gate_error("sod_policy_query_deadline_exceeded"))?;
+    let (static_policies, dynamic_policies) = read?;
+    let snapshot = bounded_sod_policy_snapshot(static_policies, dynamic_policies)?;
+
+    match (hub, bound_token) {
+        (Some(hub), Some(token)) => {
+            // 回填后复核（after-read）：查询窗口内 source 零 mutation 才允许
+            // 绑定安装；漂移即报错，竞争产物绝不入缓存。
+            if !hub.strict_read_matches(token) {
+                return Err(sod_gate_error("sod_policy_source_mutation_raced_read"));
+            }
+            store_sod_policy_snapshot_bound(snapshot.clone(), token);
+            // 安装后终检（after-install/final）：只比较已绑定 token，绝不重采
+            // 新 token 覆盖旧读；install 后又发生 mutation → 本次返回仍
+            // fail-closed，条目随 token 漂移在下次 serve 一并 miss 回源。
+            if !hub.strict_read_matches(token) {
+                return Err(sod_gate_error("sod_policy_source_mutation_raced_install"));
+            }
+        }
+        _ => store_sod_policy_snapshot(snapshot.clone()),
+    }
     Ok(snapshot)
 }
 
@@ -453,17 +719,25 @@ pub async fn check_sod_conflict(
         action_code,
         resource_owner_id,
         None,
+        // 旧公开诊断入口：保留 raw `permission_rule` deny-biased 扫描
+        // （历史行为不变；canonical 宿主路径的差异见模块文档 BREAKING
+        // CHANGE 登记）。
+        SodReadPath::DurableRawDiagnostic,
     )
     .await
 }
 
-/// Run the normal deny-only SoD check after a successful ORG_SCOPE decision.
+/// Run the deny-only SoD recheck after a successful ORG_SCOPE decision
+/// （旧公开诊断入口，行为保持不变：SQL strict scope + raw `permission_rule`
+/// deny-biased 扫描）。
 ///
-/// The caller supplies a fresh organization read plus the `PolicyDecision`
-/// provenance that was returned by `PolicyEngine`. The function requires both
-/// to describe the same winner before it lets any organization contribution
-/// participate in conflict detection. It never grants access and never bypasses
-/// the card-level published-evidence gate.
+/// The caller supplies the organization admission (fresh durable read via
+/// [`load_org_sod_admission`] or mirror-served strict evidence via
+/// [`load_org_sod_admission_mirrored`]) plus the `PolicyDecision` provenance
+/// that was returned by `PolicyEngine`. The recheck requires both to describe
+/// the same winner before it lets any organization contribution participate
+/// in conflict detection. It never grants access and never bypasses the
+/// card-level published-evidence gate.
 ///
 /// Target-resource facts on `ctx` (`resource_tenant_id`/`resource_domain_id`)
 /// are authoritative — resolved by the resource-owner loader, never accepted
@@ -472,6 +746,10 @@ pub async fn check_sod_conflict(
 /// validation evaluates each contribution under its own published resource
 /// tenant. Missing tenant facts and provenance/publication mismatches stay
 /// fail-closed (Err → the caller must reject the request).
+///
+/// 注意：本入口是 legacy 诊断合同（保留 raw 扫描，无 composite 记忆读面/
+/// 栅栏）；宿主 canonical 入口（冷/热 published-only + 栅栏）请使用
+/// [`check_sod_conflict_with_context_and_org`]。
 pub async fn check_sod_conflict_with_org(
     pool: &MySqlPool,
     ctx: &PolicyContext,
@@ -494,8 +772,224 @@ pub async fn check_sod_conflict_with_org(
             context: ctx,
             admission,
         }),
+        // 旧公开诊断合同：保留 raw `permission_rule` deny-biased 扫描。
+        SodReadPath::DurableRawDiagnostic,
     )
     .await
+}
+
+/// ADDITIVE canonical 宿主 ORG 复核入口（冷/热同一 published-only 持有合同，
+/// 含 composite 栅栏）：org provenance 判定的 deny-only 复核走
+/// [`check_sod_conflict_with_context_inner`]——复合进程 warm 态（内存镜像 +
+/// token 绑定策略快照）零 DB，cold durable 回退与 warm 同一持有语义
+/// （raw `permission_rule` 扫描冷/热均不执行，见模块文档 BREAKING CHANGE
+/// 登记）；TG/Identity 宿主应使用本入口而非旧 [`check_sod_conflict_with_org`]
+/// （后者为 legacy 诊断合同，保留 raw 扫描）。
+pub async fn check_sod_conflict_with_context_and_org(
+    pool: &MySqlPool,
+    ctx: &PolicyContext,
+    admission: &OrgSodAdmission,
+    resource_owner_id: Option<i64>,
+) -> Result<SodCheckResult, sqlx::Error> {
+    let (Some(_card_id), Some(_user_id), Some(_resource_type)) =
+        (ctx.card_id, ctx.user_id, ctx.resource.as_deref())
+    else {
+        return Err(sod_gate_error("org_scope_sod_context_missing"));
+    };
+    check_sod_conflict_with_context_inner(pool, ctx, Some(admission), resource_owner_id).await
+}
+
+/// ADDITIVE context-aware 宿主 SoD 入口（纯 deny-only，无 ORG provenance）。
+///
+/// 供宿主在 `PolicyEngine` ALLOW 之后、以**已验证的完整 `PolicyContext`**
+/// （resource/owner fact 由 resource-owner loader 解析，绝不来自客户端头）
+/// 调用：复合进程 warm 态（内存镜像 + token 绑定策略快照）零 DB；镜像
+/// miss/pending/未安装一律回落既有 durable 严格链（[`check_sod_conflict_inner`]，
+/// 读取协议与旧路径一致）。错误沿 [`sod_gate_error`]
+/// fail-closed，调用方必须拒绝请求。
+///
+/// 与旧 [`check_sod_conflict`]（SQL strict scope + raw 扫描，保留为公开
+/// 诊断/兼容入口）**不是逐字节等同**：本入口为 canonical 宿主合同——
+/// evidence scope 直接取服务端 ctx 事实（tenant 已被 PolicyEngine 鉴权；
+/// card-tenant 绑定由 hub durable card index 命中再证明），冲突判定共用
+/// 同一纯评估函数；raw `permission_rule` 扫描冷/热均不执行（持有授权 =
+/// 已发布 evidence effective-grant 合同），该语义差异由主域规范登记为
+/// BREAKING CHANGE，见模块文档。
+pub async fn check_sod_conflict_with_context(
+    pool: &MySqlPool,
+    ctx: &PolicyContext,
+    resource_owner_id: Option<i64>,
+) -> Result<SodCheckResult, sqlx::Error> {
+    check_sod_conflict_with_context_inner(pool, ctx, None, resource_owner_id).await
+}
+
+async fn check_sod_conflict_with_context_inner(
+    pool: &MySqlPool,
+    ctx: &PolicyContext,
+    admission: Option<&OrgSodAdmission>,
+    resource_owner_id: Option<i64>,
+) -> Result<SodCheckResult, sqlx::Error> {
+    let Some(card_id) = ctx.card_id else {
+        return Err(sod_gate_error("sod_context_missing"));
+    };
+    let Some(resource_type) = ctx.resource.as_deref() else {
+        return Err(sod_gate_error("sod_context_missing"));
+    };
+    let org_input = admission.map(|admission| OrgSodInput {
+        context: ctx,
+        admission,
+    });
+    // 宿主 context 入口自带准入栅栏（pub 入口可能不经宿主中间件调用）：
+    // hub 严格读 token 在此**只采样一次**，warm 记忆路径与 cold durable 回退
+    // 的整个读取/评估窗口都由同一个捕获栅栏终检（只比较，绝不重采新 token
+    // 覆盖旧读）。
+    // hub 已安装而栅栏不可得（writer-active / source outcome unknown /
+    // worker 失效旗标）→ 直接 Err fail-closed：**不回落** durable 严格链，
+    // 绝不以"无栅栏"状态消费任何授权读取（含 cold 回退）。
+    if let Some(hub) = memory_projection_hub() {
+        let Some(fence) = hub.strict_read_token() else {
+            return Err(sod_gate_error(
+                "sod_context_source_state_unavailable;writer_active_or_unknown",
+            ));
+        };
+        if let Some(result) = try_check_sod_conflict_from_memory(
+            pool,
+            hub,
+            fence,
+            ctx,
+            org_input.as_ref(),
+            resource_type,
+            resource_owner_id,
+        )
+        .await?
+        {
+            return Ok(result);
+        }
+        // cold durable 回退（canonical 合同：PublishedEvidenceOnly，与 warm
+        // 同一持有语义）；读取窗口之后同一栅栏终检——漂移 fail-closed。
+        let result = tokio::time::timeout(
+            SOD_POLICY_QUERY_DEADLINE,
+            check_sod_conflict_inner(
+                pool,
+                card_id,
+                ctx.user_id,
+                resource_type,
+                &ctx.action,
+                resource_owner_id,
+                org_input,
+                SodReadPath::PublishedEvidenceOnly,
+            ),
+        )
+        .await
+        .map_err(|_| sod_gate_error("sod_context_query_deadline_exceeded"))??;
+        if !hub.strict_read_matches(fence) {
+            return Err(sod_gate_error("sod_context_source_mutation_raced_read"));
+        }
+        return Ok(result);
+    }
+    // 非 composite（hub 未安装）：既有 durable 严格链，行为不变。
+    check_sod_conflict_inner(
+        pool,
+        card_id,
+        ctx.user_id,
+        resource_type,
+        &ctx.action,
+        resource_owner_id,
+        org_input,
+        // canonical 宿主路径：cold durable 回退与 warm 记忆路径同一合同
+        // （持有授权只认已发布 evidence，raw 扫描冷/热均不执行）。
+        SodReadPath::PublishedEvidenceOnly,
+    )
+    .await
+}
+
+/// 复合进程 warm 记忆读取路径（ADDITIVE）：hub 安装 + 记忆证据命中时零 DB
+/// 完成冲突判定。任何 defer（未预热/pending 命中/通道不健康/scope 未命中）
+/// 返回 `Ok(None)`，调用方回落 durable 严格链——绝不以记忆 miss 折算
+/// "无冲突"。栅栏由调用方（context 入口）捕获一次并传入；本函数不做任何
+/// token 采样，只在返回前比较传入栅栏。
+///
+/// - evidence scope 只用服务端 ctx 事实（tenant 由 PolicyEngine 鉴权；
+///   card-tenant 绑定由 hub durable card index 命中再证明，miss 即回退）；
+/// - `Serve` 产物再过一次合同校验（与 durable 路径同纵深防御）；
+/// - 策略快照经 token 绑定缓存服务（warm 零 DB；writer-active/unknown
+///   fail-closed）；
+/// - raw `permission_rule` 扫描不执行（canonical 冷/热同一持有合同，见
+///   模块文档 BREAKING CHANGE 登记）。
+async fn try_check_sod_conflict_from_memory(
+    pool: &MySqlPool,
+    hub: &crate::memory_projection_hub::MemoryProjectionHub,
+    fence: AuxiliaryReadToken,
+    ctx: &PolicyContext,
+    org_input: Option<&OrgSodInput<'_>>,
+    resource_type: &str,
+    resource_owner_id: Option<i64>,
+) -> Result<Option<SodCheckResult>, sqlx::Error> {
+    let (Some(tenant_id), Some(card_id)) = (ctx.tenant_id, ctx.card_id) else {
+        return Ok(None);
+    };
+    let scope = PublishedCardEvidenceScope {
+        tenant_id,
+        card_id,
+        user_filter: None,
+        domain: DomainScopeRequirement::Unconstrained,
+    };
+    let evidence = match hub.try_memory_evidence(&scope) {
+        MemoryEvidenceOutcome::Serve(evidence) => evidence,
+        MemoryEvidenceOutcome::DeferToDurable => return Ok(None),
+    };
+    if let Err(contract_error) = evidence.validate() {
+        tracing::warn!(
+            card_id,
+            error = %contract_error,
+            "sod memory path denied: mirrored evidence failed contract validation"
+        );
+        return Err(sod_gate_error(&sod_evidence_contract_message(
+            card_id,
+            &contract_error,
+        )));
+    }
+    let snapshot = load_sod_policy_snapshot(pool).await?;
+    let org_contributions = match org_input {
+        Some(input) => {
+            let user_id = ctx
+                .user_id
+                .ok_or_else(|| sod_gate_error("org_scope_sod_context_missing"))?;
+            Some(org_sod_contributions(
+                tenant_id,
+                card_id,
+                user_id,
+                resource_type,
+                &ctx.action,
+                input,
+            )?)
+        }
+        None => None,
+    };
+    let perm_key = format!("{resource_type}:{}", ctx.action);
+    let result = evaluate_sod_conflicts(
+        pool,
+        card_id,
+        &perm_key,
+        &evidence,
+        &snapshot,
+        org_contributions.as_deref(),
+        resource_type,
+        &ctx.action,
+        ctx.user_id,
+        resource_owner_id,
+        // canonical 宿主路径（warm）：raw permission_rule 扫描冷/热均不执行
+        // （持有授权 = 已发布 evidence 合同；见模块文档 BREAKING CHANGE 登记）。
+        SodReadPath::PublishedEvidenceOnly,
+    )
+    .await?;
+    // after-eval 终检：记忆读面 + 策略快照 + 评估窗口内 source 零 mutation
+    // 才允许返回记忆路径结果（只比较已捕获栅栏，绝不重采新 token 覆盖旧读）；
+    // 漂移 → fail-closed，宿主必须拒绝请求。
+    if !hub.auxiliary_read_matches(fence) {
+        return Err(sod_gate_error("sod_memory_source_mutation_raced_read"));
+    }
+    Ok(Some(result))
 }
 
 /// 从已确认的 `PolicyDecision` 装配宿主 SoD 复核输入（shared，供
@@ -541,6 +1035,99 @@ pub async fn load_org_sod_admission(
     org_sod_admission_outcome(repository.load_admission_evidence(&query).await, provenance)
 }
 
+/// [`load_org_sod_admission`] 的 additive context-aware 宿主入口（复合进程
+/// 内存镜像读面）：ORG 判定的准入证据优先复用辅助镜像
+/// `load_org_authorization`——与 `PolicyEngine.evaluate()` 完全同一 strict
+/// read contract（hub 健康门、single-flight、3s deadline、纪元栅栏、有界
+/// 回填），warm 命中零 DB；`Ready` 证据进入与 fresh DB 读**完全相同**的
+/// [`check_sod_conflict_with_org`] provenance 对牌解析器，不产生任何新授权
+/// 事实。
+///
+/// 映射（fail-closed，与 [`org_sod_admission_outcome`] 同向）：
+/// - 镜像 `Ready(evidence)` → 与 fresh DB 读同源的 `OrgSodAdmission`；
+/// - 镜像 `Pending { code }` → `org_scope_sod_evidence_pending;`（fail-closed）；
+/// - 镜像 `Unavailable { code }` → `org_scope_sod_evidence_unavailable;`
+///   （fail-closed，基础设施失败不洗白成业务 pending）；
+/// - 镜像 `None`（hub `StrictRequired`：未 warm/通道不健康/心跳过期）及
+///   `Disabled`/`Unmanaged`（与 ORG provenance 判定相悖的罕见状态）→ 回落
+///   既有 fresh DB 严格读，由权威路径裁决（同一次 fresh 严格读，与旧入口
+///   一致）。
+/// - hub 或辅助镜像未安装（非 composite）→ 直接走 fresh DB 读（不变）。
+pub async fn load_org_sod_admission_mirrored(
+    pool: &MySqlPool,
+    ctx: &PolicyContext,
+    decision: &PolicyDecision,
+) -> Result<Option<OrgSodAdmission>, sqlx::Error> {
+    let Some(provenance) = decision.org_provenance.clone() else {
+        return Ok(None);
+    };
+    let (Some(tenant_id), Some(user_id), Some(card_id), Some(identity_card_id)) = (
+        ctx.tenant_id,
+        ctx.user_id,
+        ctx.card_id,
+        ctx.identity_card_id,
+    ) else {
+        return Err(sod_gate_error("org_scope_sod_context_missing"));
+    };
+    let hub = memory_projection_hub();
+    let fence = match hub {
+        Some(hub) => Some(hub.strict_read_token().ok_or_else(|| {
+            sod_gate_error("org_scope_sod_source_state_unavailable;writer_active_or_unknown")
+        })?),
+        None => None,
+    };
+    if let Some(hub) = hub {
+        if let Some(mirror) = auxiliary_authorization_mirror() {
+            match mirror.load_org_authorization(hub, ctx).await {
+                Some(OrgAuthorityRead::Ready(evidence)) => match fence {
+                    Some(token) if hub.strict_read_matches(token) => {
+                        return Ok(Some(OrgSodAdmission {
+                            evidence: *evidence,
+                            provenance,
+                        }));
+                    }
+                    _ => {
+                        return Err(sod_gate_error("org_scope_sod_source_mutation_raced_read"));
+                    }
+                },
+                Some(OrgAuthorityRead::Pending { code }) => {
+                    return Err(sod_gate_error(&format!(
+                        "org_scope_sod_evidence_pending;code={code}"
+                    )));
+                }
+                Some(OrgAuthorityRead::Unavailable { code }) => {
+                    return Err(sod_gate_error(&format!(
+                        "org_scope_sod_evidence_unavailable;code={code}"
+                    )));
+                }
+                // None = StrictRequired；Disabled/Unmanaged 与 ORG provenance
+                // 相悖 → 一律回落权威 fresh DB 读（下方原路径）。
+                Some(OrgAuthorityRead::Disabled | OrgAuthorityRead::Unmanaged) | None => {}
+            }
+        }
+    }
+    let repository = SqlxOrgScopeRepository::new(pool.clone());
+    let query = OrgAdmissionQuery {
+        tenant_id,
+        user_id,
+        card_id,
+        identity_card_id: Some(identity_card_id),
+        now_unix_seconds: time::OffsetDateTime::now_utc().unix_timestamp(),
+    };
+    let result = tokio::time::timeout(
+        SOD_POLICY_QUERY_DEADLINE,
+        repository.load_admission_evidence(&query),
+    )
+    .await
+    .map_err(|_| sod_gate_error("org_scope_sod_query_deadline_exceeded"))?;
+    if let (Some(hub), Some(token)) = (hub, fence) {
+        if !hub.strict_read_matches(token) {
+            return Err(sod_gate_error("org_scope_sod_source_mutation_raced_read"));
+        }
+    }
+    org_sod_admission_outcome(result, provenance)
+}
+
 /// fresh 准入证据读取结果的 SoD 门禁映射（纯逻辑，稳定错误码可在无 DB 的
 /// 单测中钉死）：EVIDENCE → 装配 `OrgSodAdmission`；业务 Pending →
 /// `org_scope_sod_evidence_pending;`（携带 machine code）；基础设施错误 →
@@ -565,6 +1152,7 @@ fn org_sod_admission_outcome(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn check_sod_conflict_inner(
     pool: &MySqlPool,
     card_id: i64,
@@ -573,6 +1161,7 @@ async fn check_sod_conflict_inner(
     action_code: &str,
     resource_owner_id: Option<i64>,
     org_input: Option<OrgSodInput<'_>>,
+    read_path: SodReadPath,
 ) -> Result<SodCheckResult, sqlx::Error> {
     let perm_key = format!("{resource_type}:{action_code}");
 
@@ -650,19 +1239,75 @@ async fn check_sod_conflict_inner(
     //   `type:id`），旧实现把 partner 的 plain type（parts[0]）直接绑定到
     //   scoped key 比较，形状错位导致永不命中；现在经
     //   [`sod_partner_matches_grant`] 先归一为 plain type 再比较。
-    // - raw `permission_rule` 分支原样保留（deny-biased 诊断，见
-    //   [`SOD_RAW_RULE_CONFLICT_SQL`] 注释）：命中只会把 has_conflict 变为
-    //   true（→ 拒绝），永不参与放行语义。
-    // 全量 ACTIVE 策略快照（进程级缓存，TTL 30s，失效窗口取舍见
-    // SOD_POLICY_CACHE_TTL/模块文档；miss/DB 错误回源直查，fail-closed
+    // - raw `permission_rule` 分支由 `read_path` 决定（legacy 诊断入口保留；
+    //   canonical 宿主路径冷/热均不执行，见模块文档 BREAKING CHANGE 登记）。
+    // 全量 ACTIVE 策略快照（composite：hub 严格读 token 绑定缓存，warm 零 DB；
+    // 非 composite：TTL 30s；miss/DB 错误回源有界 single-flight 直查，fail-closed
     // 不变，错误绝不入缓存）。STATIC 与 DYNAMIC 两个检查段共用同一快照。
     let snapshot = load_sod_policy_snapshot(pool).await?;
 
+    // 冲突评估（shared 纯评估段：durable 回退与 warm 记忆路径按 `read_path`
+    // 复用同一函数，冷/热合同一致）。
+    evaluate_sod_conflicts(
+        pool,
+        card_id,
+        &perm_key,
+        &evidence,
+        &snapshot,
+        org_contributions.as_deref(),
+        resource_type,
+        action_code,
+        user_id,
+        resource_owner_id,
+        read_path,
+    )
+    .await
+}
+
+/// 冲突评估读路径（canonical 冷/热一致性合同的核心）：
+/// - `PublishedEvidenceOnly` = canonical 宿主路径（cold durable 回退与 warm
+///   记忆路径共用）：持有授权只认已发布 evidence（与
+///   `sod_repository::card_permissions` 同一 effective-grant contract），
+///   raw `permission_rule` 不构成持有授权，冷/热均不执行其扫描；
+/// - `DurableRawDiagnostic` = 旧公开诊断入口（[`check_sod_conflict`]）：
+///   保留 raw deny-biased 扫描的历史行为。
+///
+/// 两入口的差异（canonical 移除 raw 扫描）由主域规范登记为 BREAKING
+/// CHANGE/语义修正，见模块文档。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SodReadPath {
+    PublishedEvidenceOnly,
+    DurableRawDiagnostic,
+}
+
+/// STATIC + DYNAMIC 冲突评估（shared：canonical 冷/热路径与旧诊断入口共用
+/// 同一纯判定，消除重复实现；I/O 只有 `DurableRawDiagnostic` 路径的 raw
+/// `permission_rule` deny-biased 诊断查询——canonical 宿主路径零 SQL）。
+///
+/// - STATIC: 全量 ACTIVE 策略快照；持有判定来自已发布 evidence 的
+///   `effective_grants`（resource_key 归一化后匹配）与 org contributions
+///   （deny-only 复核产物）；
+/// - DYNAMIC: 请求侧内存过滤 + 条件脚本求值（不读授权证据；入口 evidence
+///   门禁已保证该卡的已发布授权证据可读）。
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_sod_conflicts(
+    pool: &MySqlPool,
+    card_id: i64,
+    perm_key: &str,
+    evidence: &PublishedCardAuthorization,
+    snapshot: &SodPolicySnapshot,
+    org_contributions: Option<&[OrgContribution]>,
+    resource_type: &str,
+    action_code: &str,
+    user_id: Option<i64>,
+    resource_owner_id: Option<i64>,
+    read_path: SodReadPath,
+) -> Result<SodCheckResult, sqlx::Error> {
     let mut conflict: Option<SodCheckResult> = None;
     {
         for policy in &snapshot.static_policies {
-            let is_a = policy.permission_a.as_deref() == Some(&perm_key);
-            let is_b = policy.permission_b.as_deref() == Some(&perm_key);
+            let is_a = policy.permission_a.as_deref() == Some(perm_key);
+            let is_b = policy.permission_b.as_deref() == Some(perm_key);
             if !is_a && !is_b {
                 continue;
             }
@@ -687,14 +1332,15 @@ async fn check_sod_conflict_inner(
                 sod_partner_matches_grant(&grant.resource, &grant.action, parts[0], parts[1])
             });
             if !has_conflict {
-                has_conflict = org_contributions.as_ref().is_some_and(|contributions| {
+                has_conflict = org_contributions.is_some_and(|contributions| {
                     contributions.iter().any(|contribution| {
                         org_sod_contribution_matches_partner(contribution, parts[0], parts[1])
                     })
                 });
             }
-            if !has_conflict {
+            if !has_conflict && read_path == SodReadPath::DurableRawDiagnostic {
                 // raw 分支：deny-biased 诊断，命中同样只增冲突（→ 拒绝）。
+                // warm 记忆路径不进入本分支（零 SQL，见模块文档残余风险记录）。
                 has_conflict = sqlx::query_scalar(SOD_RAW_RULE_CONFLICT_SQL)
                     .bind(card_id)
                     .bind(parts[0])
@@ -716,12 +1362,6 @@ async fn check_sod_conflict_inner(
     }
 
     // === DYNAMIC 策略检查（对齐 Java SodService.checkDynamicSoD） ===
-    // 不读授权证据；但入口 evidence 门禁已保证该卡的已发布授权证据可读，
-    // "无冲突"不会被不可读投影伪装成放行。
-    // 全量 ACTIVE DYNAMIC 策略来自同一进程缓存快照；resource_type/action_code
-    // 过滤在内存执行（谓词与原 SQL `(resource_type IS NULL OR resource_type
-    // = ?) AND (action_code IS NULL OR action_code = ?)` 对齐，见
-    // `dynamic_policy_matches_request`）。
     if conflict.is_none() {
         for policy in snapshot
             .dynamic_policies
@@ -1226,6 +1866,412 @@ mod tests {
         assert!(
             fresh_sod_policy_snapshot().is_none(),
             "evict must invalidate the process cache immediately"
+        );
+    }
+
+    /// 既有 TTL 语义读取（测试专用等价路径；生产走 `serve_sod_policy_snapshot`
+    /// 的矩阵判定，本 helper 直接钉 TTL 行为，不触碰任何 hub 全局态）。
+    fn fresh_sod_policy_snapshot() -> Option<SodPolicySnapshot> {
+        let cached = sod_policy_cache().read().ok()?;
+        let entry = cached.as_ref()?;
+        if sod_policy_cache_is_fresh(entry.cached_at, Instant::now()) {
+            return Some(entry.snapshot.clone());
+        }
+        None
+    }
+
+    /// 源文本守卫助手：取 `start_marker` 之后到下一个函数声明（任意
+    /// pub/async 组合）之间的函数体片段，保证形状断言不越界。
+    fn fn_body_after<'a>(source: &'a str, start_marker: &str) -> &'a str {
+        let after = source
+            .split(start_marker)
+            .nth(1)
+            .expect("marker must exist");
+        let end = ["\nfn ", "\nasync fn ", "\npub fn ", "\npub async fn "]
+            .iter()
+            .filter_map(|marker| after.find(marker))
+            .min()
+            .unwrap_or(after.len());
+        &after[..end]
+    }
+
+    // ===== composite 模式切换：服务/回源判定矩阵（纯逻辑） =====
+
+    /// 服务矩阵：composite 只认 token 绑定 + TTL 新鲜的条目（TTL 是既有
+    /// 缓存/失效合同的条目寿命上界，过期即回填，绝不因 token 未变信任过期
+    /// 条目）；模式错位一律 miss；非 composite 沿用 TTL。
+    #[test]
+    fn sod_policy_serve_matrix_pins_mode_binding() {
+        // composite + 绑定条目：token 一致 **且** TTL 新鲜才服务。
+        assert!(sod_policy_entry_serves(true, true, true, true));
+        // token 未变但 TTL 过期 → miss（过期触发回填，不信任过期条目）。
+        assert!(!sod_policy_entry_serves(true, true, true, false));
+        // token 漂移（哪怕 TTL 新鲜）→ miss。
+        assert!(!sod_policy_entry_serves(true, true, false, true));
+        // composite + 未绑定条目（模式错位）：绝不服务（TTL 新鲜也不行）。
+        assert!(!sod_policy_entry_serves(true, false, false, true));
+        // 非 composite + 绑定条目（模式错位）：绝不服务。
+        assert!(!sod_policy_entry_serves(false, true, true, true));
+        // 非 composite + 未绑定条目：既有 TTL 语义。
+        assert!(sod_policy_entry_serves(false, false, false, true));
+        assert!(!sod_policy_entry_serves(false, false, false, false));
+    }
+
+    /// 回源矩阵：composite 回源前 hub 严格读 token 必须可读；writer-active/
+    /// unknown → `Blocked`（fail-closed，绝不以并发/未知 source 状态回源或
+    /// 放行）；非 composite → `Legacy`（既有行为，不触碰 token）。
+    #[test]
+    fn sod_policy_refill_outcome_blocks_writer_active_and_unknown() {
+        assert_eq!(
+            sod_policy_refill_outcome(true, true),
+            SodPolicyRefillOutcome::Bound
+        );
+        assert_eq!(
+            sod_policy_refill_outcome(true, false),
+            SodPolicyRefillOutcome::Blocked
+        );
+        assert_eq!(
+            sod_policy_refill_outcome(false, false),
+            SodPolicyRefillOutcome::Legacy
+        );
+    }
+
+    // ===== 有界回填：cap+1 探针 + 字节预算（纯逻辑） =====
+
+    fn sod_policy_row(name: &str) -> StaticPolicy {
+        StaticPolicy {
+            policy_name: name.to_owned(),
+            permission_a: Some("approval:submit".to_owned()),
+            permission_b: Some("approval:approve".to_owned()),
+        }
+    }
+
+    #[test]
+    fn bounded_sod_policy_snapshot_rejects_over_cap_and_over_budget() {
+        // cap+1 探针：读满 cap+1 行即超限 fail-closed（截断快照 = 放行方向）。
+        let over_cap = vec![sod_policy_row("p"); SOD_POLICY_SNAPSHOT_ROW_CAP + 1];
+        let error = bounded_sod_policy_snapshot(over_cap, Vec::new())
+            .expect_err("over-cap static rows must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("sod_policy_snapshot_capacity_exceeded"),
+            "unexpected error: {error}"
+        );
+
+        let over_cap_dynamic = vec![
+            DynamicPolicy {
+                policy_name: "p".into(),
+                condition_script: Some("resourceOwnerId == currentUserId".into()),
+                resource_type: None,
+                action_code: None,
+            };
+            SOD_POLICY_SNAPSHOT_ROW_CAP + 1
+        ];
+        let error = bounded_sod_policy_snapshot(Vec::new(), over_cap_dynamic)
+            .expect_err("over-cap dynamic rows must fail closed");
+        assert!(error
+            .to_string()
+            .contains("sod_policy_snapshot_capacity_exceeded"));
+
+        // 字节预算：异常膨胀行超预算 fail-closed。
+        let bloated = vec![sod_policy_row(&"x".repeat(SOD_POLICY_SNAPSHOT_MAX_BYTES / 2 + 1)); 2];
+        let error = bounded_sod_policy_snapshot(bloated, Vec::new())
+            .expect_err("over-budget snapshot must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("sod_policy_snapshot_byte_budget_exceeded"),
+            "unexpected error: {error}"
+        );
+
+        // 正常规模照常装配。
+        let ok = bounded_sod_policy_snapshot(vec![sod_policy_row("p")], Vec::new())
+            .expect("bounded snapshot must assemble");
+        assert_eq!(ok.static_policies.len(), 1);
+    }
+
+    #[test]
+    fn sod_policy_snapshot_bytes_counts_string_fields() {
+        let snapshot = SodPolicySnapshot {
+            static_policies: vec![StaticPolicy {
+                policy_name: "ab".into(),
+                permission_a: Some("cd".into()),
+                permission_b: None,
+            }],
+            dynamic_policies: vec![DynamicPolicy {
+                policy_name: "e".into(),
+                condition_script: Some("fgh".into()),
+                resource_type: Some("ij".into()),
+                action_code: None,
+            }],
+        };
+        assert_eq!(sod_policy_snapshot_bytes(&snapshot), 2 + 2 + 1 + 3 + 2);
+    }
+
+    // ===== 形状守卫：composite warm 零 SQL + 有界 single-flight 回源 =====
+
+    /// 形状守卫：warm 记忆路径（`try_check_sod_conflict_from_memory`）必须是
+    /// 零 SQL 读面——只允许 hub 记忆证据 + token 绑定策略缓存 + 纯评估；
+    /// 任何 defer 必须返回 `Ok(None)` 回落 durable 链，绝不折算"无冲突"。
+    #[test]
+    fn memory_warm_path_is_zero_sql_and_defers_to_durable() {
+        let source = include_str!("sod_check.rs");
+        let body = fn_body_after(source, "async fn try_check_sod_conflict_from_memory");
+
+        assert!(
+            body.contains("hub: &crate::memory_projection_hub::MemoryProjectionHub"),
+            "the memory path receives the hub from the context entry (composite-only)"
+        );
+        assert!(body.contains("MemoryEvidenceOutcome::Serve"));
+        assert!(
+            body.contains("MemoryEvidenceOutcome::DeferToDurable => return Ok(None)"),
+            "defer must fall back to the durable path, never to a no-conflict result"
+        );
+        assert!(body.contains("load_sod_policy_snapshot(pool)"));
+        assert!(
+            body.contains("SodReadPath::PublishedEvidenceOnly"),
+            "memory path must select the canonical published-evidence-only read path"
+        );
+        // 栅栏由 context 入口捕获一次并传入（本函数零采样）；返回前只比较
+        // 传入栅栏（绝不重采 token 覆盖旧读）。
+        assert!(
+            body.contains("fence: AuxiliaryReadToken"),
+            "the memory path must receive the single-captured fence from the context entry"
+        );
+        assert!(
+            !body.contains("strict_read_token()"),
+            "the memory path must not sample tokens itself"
+        );
+        assert!(
+            body.contains("sod_memory_source_mutation_raced_read"),
+            "post-eval drift must fail closed"
+        );
+        for sql_marker in [
+            "query_scalar",
+            "query_as",
+            "fetch_one",
+            "fetch_all",
+            "FROM ",
+        ] {
+            assert!(
+                !body.contains(sql_marker),
+                "warm memory path must stay zero-SQL, found {sql_marker}"
+            );
+        }
+    }
+
+    /// 形状守卫：raw `permission_rule` 扫描只允许在旧公开诊断入口
+    /// （`check_sod_conflict`）执行；canonical 宿主路径（cold durable 回退与
+    /// warm 记忆路径）冷/热一致地不执行——持有授权 = 已发布 evidence
+    /// effective-grant 合同，未发布 raw 行不构成持有授权。冲突评估共享同一
+    /// 纯判定段（无重复实现）。
+    #[test]
+    fn raw_diagnostic_is_legacy_entry_only_and_canonical_contract_is_cold_warm_consistent() {
+        let source = include_str!("sod_check.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let eval = fn_body_after(production, "async fn evaluate_sod_conflicts");
+        assert!(eval.contains("SodReadPath::DurableRawDiagnostic"));
+        assert!(eval.contains("SOD_RAW_RULE_CONFLICT_SQL"));
+        assert!(eval.contains("sod_partner_matches_grant"));
+
+        // 旧诊断入口调用点（plain + with_org）携带 raw 扫描；canonical 两个
+        // 调用点（cold durable 回退 + warm 记忆路径）冷/热一致地选择
+        // PublishedEvidenceOnly。
+        let legacy = fn_body_after(production, "pub async fn check_sod_conflict(");
+        assert!(
+            legacy.contains("SodReadPath::DurableRawDiagnostic"),
+            "the legacy public diagnostic entry must keep the raw deny-biased scan"
+        );
+        let legacy_org = fn_body_after(production, "pub async fn check_sod_conflict_with_org(");
+        assert!(
+            legacy_org.contains("SodReadPath::DurableRawDiagnostic"),
+            "the legacy with_org diagnostic entry must keep the raw deny-biased scan"
+        );
+        let canonical_inner =
+            fn_body_after(production, "async fn check_sod_conflict_with_context_inner");
+        assert!(
+            canonical_inner.contains("SodReadPath::PublishedEvidenceOnly"),
+            "the canonical durable fallback must share the warm path contract"
+        );
+        assert_eq!(
+            production
+                .matches("SodReadPath::DurableRawDiagnostic")
+                .count(),
+            3,
+            "raw scan must be reachable only from the two legacy entry call sites and the gate"
+        );
+        assert_eq!(
+            production
+                .matches("SodReadPath::PublishedEvidenceOnly")
+                .count(),
+            3,
+            "every canonical call site (warm memory + composite cold fallback + non-composite tail) must be published-evidence-only"
+        );
+        assert!(
+            !production.contains("SodReadPath::MemoryZeroSql"),
+            "the warm-only raw-skip variant must not survive: cold and warm share one contract"
+        );
+    }
+
+    /// 形状守卫：策略快照回源必须有界——`LIMIT cap+1` 探针、3s 查询
+    /// deadline、single-flight 有界锁等待、composite 回填前后 strict token
+    /// 对牌且绑定安装（竞争产物绝不入缓存）。
+    #[test]
+    fn sod_policy_refill_is_bounded_single_flight_and_token_fenced() {
+        let source = include_str!("sod_check.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let refill = fn_body_after(production, "async fn refill_sod_policy_snapshot");
+
+        assert!(
+            refill.contains("sod_policy_refill_outcome("),
+            "refill must decide composite blocking via the pure outcome matrix"
+        );
+        assert!(
+            refill.contains("sod_policy_source_state_unavailable"),
+            "writer-active/unknown must fail closed before any query"
+        );
+        assert!(
+            refill.contains("SOD_POLICY_REFILL_LOCK_WAIT, sod_policy_refill_lock().lock()"),
+            "refill must single-flight on a bounded lock wait"
+        );
+        assert!(refill.contains("SOD_POLICY_QUERY_DEADLINE"));
+        assert!(
+            refill.contains("SOD_POLICY_SNAPSHOT_ROW_CAP + 1"),
+            "both ACTIVE queries must use the cap+1 probe"
+        );
+        assert_eq!(refill.matches("LIMIT {}").count(), 2, "no unlimited list");
+        assert!(refill.contains("bounded_sod_policy_snapshot("));
+        // composite：回填后复核 token 未漂移才允许绑定安装；安装后终检
+        // 同样只比较（绝不重采新 token 覆盖旧读）；全程无二次采样 expect。
+        let verify = refill
+            .find("strict_read_matches(token)")
+            .expect("post-read token recheck must exist");
+        let store = refill
+            .find("store_sod_policy_snapshot_bound(")
+            .expect("composite refill must bind the cache entry to the hub token");
+        let final_check = refill[store..]
+            .find("strict_read_matches(token)")
+            .map(|index| store + index)
+            .expect("a post-install final token comparison must exist");
+        assert!(
+            verify < store && store < final_check,
+            "order must be after-read recheck -> bound install -> after-install final check"
+        );
+        assert!(
+            refill.contains("sod_policy_source_mutation_raced_install"),
+            "post-install drift must fail closed (safe-pending, retryable)"
+        );
+        assert!(
+            !refill.contains(".expect("),
+            "the token must be captured exactly once; no second-sample expect may exist"
+        );
+        // deadline/锁等待常量钉死（与镜像 strict refill 同域 3s）。
+        assert_eq!(SOD_POLICY_QUERY_DEADLINE, Duration::from_secs(3));
+        assert_eq!(SOD_POLICY_REFILL_LOCK_WAIT, Duration::from_secs(3));
+        // 容量上界钉死（const 块消除恒真断言告警）。
+        const {
+            assert!(SOD_POLICY_SNAPSHOT_ROW_CAP >= 1);
+            assert!(SOD_POLICY_SNAPSHOT_MAX_BYTES <= 16 * 1024 * 1024);
+        }
+    }
+
+    /// 形状守卫：mirrored org 准入装配必须复用辅助镜像的
+    /// `load_org_authorization`（与引擎 evaluate 同一 strict read contract），
+    /// Ready 走同一 provenance 解析器；Pending/Unavailable fail-closed；
+    /// StrictRequired/Disabled/Unmanaged 回落既有 fresh DB 读。
+    #[test]
+    fn mirrored_org_admission_reuses_aux_mirror_and_maps_fail_closed() {
+        let source = include_str!("sod_check.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let body = fn_body_after(production, "pub async fn load_org_sod_admission_mirrored");
+
+        let mirror = body
+            .find("auxiliary_authorization_mirror()")
+            .expect("must reuse the global auxiliary mirror");
+        let read = body
+            .find("load_org_authorization(hub, ctx)")
+            .expect("must reuse the aux mirror org port (same strict read contract)");
+        assert!(mirror < read);
+        assert!(body.contains("OrgAuthorityRead::Ready(evidence)"));
+        assert!(body.contains("org_scope_sod_evidence_pending;"));
+        assert!(body.contains("org_scope_sod_evidence_unavailable;"));
+        // Ready 读面必须 fenced：before-await 单次采样 + after-await 比较；
+        // 采样缺失或漂移一律 fail-closed。
+        assert!(
+            body.contains("Some(hub) => Some(hub.strict_read_token().ok_or_else(||"),
+            "the mirrored org read must sample the strict token once before the await"
+        );
+        assert!(
+            body.contains("org_scope_sod_source_mutation_raced_read"),
+            "a fenced Ready read that drifted must fail closed"
+        );
+        // 回落 fresh DB 读在镜像 match 之后（权威路径裁决罕见状态）。
+        let fallback = body
+            .find("SqlxOrgScopeRepository::new(pool.clone())")
+            .expect("fallback must keep the fresh durable read");
+        assert!(
+            read < fallback,
+            "the durable fallback must follow the mirror attempt"
+        );
+        let deadline = body[fallback..]
+            .find("tokio::time::timeout(")
+            .expect("the fresh fallback must have a query deadline");
+        let final_recheck = body[fallback..]
+            .find("hub.strict_read_matches(token)")
+            .expect("the fresh fallback must compare the original fence");
+        assert!(deadline < final_recheck);
+        assert_eq!(body.matches("strict_read_token()").count(), 1);
+        assert!(body.contains("org_scope_sod_source_state_unavailable"));
+    }
+
+    /// 形状守卫：context-aware 宿主入口顺序与栅栏——hub 已装时单次采样
+    /// （不可读 → 直接 Err，不回落 durable），记忆路径先行、cold durable
+    /// 回退在同一栅栏终检之内；legacy `check_sod_conflict` 保持 SQL strict
+    /// scope（无记忆路径、无栅栏）。
+    #[test]
+    fn context_entry_tries_memory_then_durable_and_legacy_stays_sql_strict() {
+        let source = include_str!("sod_check.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let entry = fn_body_after(production, "async fn check_sod_conflict_with_context_inner");
+        let capture = entry
+            .find("let Some(fence) = hub.strict_read_token()")
+            .expect("the context entry must capture the fence exactly once");
+        let blocked = entry
+            .find("sod_context_source_state_unavailable")
+            .expect("an installed hub with an unreadable token must fail closed, not fall back");
+        let memory = entry
+            .find("try_check_sod_conflict_from_memory(")
+            .expect("context entry must try the warm memory path first");
+        let durable = entry
+            .find("check_sod_conflict_inner(")
+            .expect("context entry must keep the durable strict fallback");
+        let cold_guard = entry
+            .find("sod_context_source_mutation_raced_read")
+            .expect("the cold durable fallback must end inside the same fence");
+        assert!(
+            capture < blocked && blocked < memory && memory < durable && durable < cold_guard,
+            "order must be capture -> unreadable-token reject -> memory -> durable fallback -> fence recheck"
+        );
+        assert_eq!(
+            entry.matches("strict_read_token").count(),
+            1,
+            "exactly one token sample; all checks are comparisons of the captured fence"
+        );
+
+        // legacy 入口（check_sod_conflict）不得接入记忆路径/栅栏。
+        let legacy = production
+            .split("pub async fn check_sod_conflict(")
+            .nth(1)
+            .expect("legacy entry must exist");
+        let legacy = legacy.split("\npub async fn ").next().unwrap();
+        assert!(
+            !legacy.contains("try_check_sod_conflict_from_memory"),
+            "the legacy SQL-strict scope entry must stay durable-only"
+        );
+        assert!(
+            !legacy.contains("strict_read_token"),
+            "the legacy diagnostic entry must stay outside the composite fence contract"
         );
     }
 

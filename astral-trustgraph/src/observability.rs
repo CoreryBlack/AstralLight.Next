@@ -135,6 +135,8 @@ pub(crate) enum ProjectorEventOutcome {
     Quarantined,
     Blocked,
     LeaseLost,
+    PublicationUnknown,
+    CommittedMirrorUnavailable,
     Superseded,
     PointerMovedReplanned,
     BudgetExhausted,
@@ -151,6 +153,8 @@ impl ProjectorEventOutcome {
             Self::Quarantined => "quarantined",
             Self::Blocked => "blocked",
             Self::LeaseLost => "lease_lost",
+            Self::PublicationUnknown => "publication_unknown",
+            Self::CommittedMirrorUnavailable => "committed_mirror_unavailable",
             Self::Superseded => "superseded",
             Self::PointerMovedReplanned => "pointer_moved_replanned",
             Self::BudgetExhausted => "budget_exhausted",
@@ -400,6 +404,8 @@ mod tests {
             ProjectorEventOutcome::Quarantined,
             ProjectorEventOutcome::Blocked,
             ProjectorEventOutcome::LeaseLost,
+            ProjectorEventOutcome::PublicationUnknown,
+            ProjectorEventOutcome::CommittedMirrorUnavailable,
             ProjectorEventOutcome::Superseded,
             ProjectorEventOutcome::PointerMovedReplanned,
             ProjectorEventOutcome::BudgetExhausted,
@@ -407,7 +413,7 @@ mod tests {
             ProjectorEventOutcome::DeadlineExceeded,
         ];
         assert_closed_vocabulary(&projector.map(ProjectorEventOutcome::label));
-        assert_eq!(projector.len(), 11);
+        assert_eq!(projector.len(), 13);
 
         let phases = [
             ProjectorPhase::Readback,

@@ -1,36 +1,31 @@
 //! 卡片模板数据访问 — CardTemplateRepository
 //!
 //! 对齐 Java `UserCardTemplateMapper` 边界（user_card_template 表）。
-//! 写路径安全门禁：
-//! 1. SYSTEM scope 标记清理（同 card_type 仅允许一个 SYSTEM 默认模板）与本次
-//!    INSERT/UPDATE 在同一事务、同一连接上完成；后续写入失败即整体回滚，
-//!    不留下"旧 SYSTEM 默认模板已被降级而新写入未生效"的半清理 source 状态。
-//! 2. status 白名单：写路径仅接受 ACTIVE/INACTIVE，其余值 fail-closed 拒绝。
-//! 3. 规范 `__SUPERADMIN__` 模板在仍有 ACTIVE SUPER_ADMIN 卡引用时禁止脱离
-//!    ACTIVE，否则 GlobalAdmin disable 的撤销身份证明（模板必须 ACTIVE）会被
-//!    堵死；守卫在持有模板行锁的事务内执行，与 grant 路径串行化。
-//! 4. 任意模板状态收紧（脱离 ACTIVE）在仍有 ACTIVE 卡绑定时 fail-closed 拒绝
-//!    （`guard_no_active_cards`），绝不静默下线——活跃卡的授权载体定义不得在
-//!    无拒绝证据的情况下被抽走。
-//! 5. update 是授权语义 mutation：同事务内锁定 TEMPLATE RuleSet（该模板的
-//!    授权投影 owner）、按实际变更追加带 actor/operation metadata 的
-//!    RULE_SET_UPDATE head/outbox 事件，并落一条
-//!    `rule_set_projection_audit`（operation_id/event_id/source_generation/
-//!    tenant 关联）或 `audit_log`（模板尚无 TEMPLATE RuleSet 时的兜底关联）
-//!    审计行；无实际变更时空提交、不写投影/审计（对齐
-//!    `rule_set_repository::update_rule_set` 的幂等分支与
-//!    `level_template_repository::update_template` 的同事务 correlation 模式）。
+//! 写路径约束：
+//! 1. status 白名单：仅 ACTIVE/INACTIVE，未知值 fail-closed。
+//! 2. `__SUPERADMIN__` 模板与任意模板在仍有 ACTIVE 卡绑定时禁止脱离 ACTIVE
+//!    （两个守卫持模板/卡行锁执行，拒绝性校验优先于变更检测）。
+//! 3. 同 card_type 仅允许一个 SYSTEM 默认模板；SYSTEM 标记清理与本次写入
+//!    同事务同连接。
+//! 4. create/update/delete 以 `AuthorizationSourceTransaction` 为宿主（模板行
+//!    是 owning-binding 存在性 source；源活动栅栏先于 begin、commit 证明后才
+//!    返回），守卫、变更检测与审计同生共死。
+//! 5. update 不追加 legacy 投影事件、不产生授权账本 delta（模板字段为
+//!    issuance-only，无授权读侧消费者；TEMPLATE RuleSet 授权内容归
+//!    `permission_rule_template` 同步路径）；审计关联为同事务 `audit_log`
+//!    （actor/operation/实际变更字段 old/new）。
+//! 6. `update_template_with_context` 要求已验证正数 actor（审计落 exact HTTP
+//!    身份）；未证明 operation id 在事务内以锁定 durable 事实确定性派生一次，
+//!    绝不随机 fallback。`update_template` 为显式兼容路径（派生 system 身份，
+//!    行为不变）。
 
 use async_trait::async_trait;
 use sqlx::{MySqlPool, QueryBuilder, Transaction};
 
-use astral_db::ProjectionEventMetadata;
-use astral_types::{AstralError, ProjectionAggregate, EVENT_TYPE_RULE_SET_UPDATE};
+use astral_types::AstralError;
 
-use crate::repository::audit_log_repository::{
-    insert_rule_set_projection_audit_in_tx, RuleSetMutationContext, RuleSetProjectionAuditEntry,
-};
-use crate::repository::projection_repository::append_rule_set_projection_in_tx;
+use crate::repository::audit_log_repository::RuleSetMutationContext;
+use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
 
 /// 卡片模板记录（user_card_template）。
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -112,19 +107,16 @@ const SUPERADMIN_TEMPLATE_CODE: &str = "__SUPERADMIN__";
 const SUPER_ADMIN_CARD_TYPE: &str = "SUPER_ADMIN";
 const CARD_STATUS_ACTIVE: &str = "ACTIVE";
 
-/// 审计 action：卡片模板部分更新（实际变更触发投影/审计 correlation）。
+/// 审计 action：卡片模板部分更新（实际变更触发同事务审计 correlation）。
 const CARD_TEMPLATE_AUDIT_ACTION_UPDATE: &str = "card_template_update";
-/// event_type（audit_log.event_type VARCHAR(32)）：卡片模板 mutation 家族
-/// （仅当模板尚无 TEMPLATE RuleSet 投影 owner 时作为 `audit_log` 兜底关联）。
+/// event_type（audit_log.event_type VARCHAR(32)）：卡片模板 mutation 家族。
+/// update 的唯一 durable 审计关联通道（与 source mutation 同生共死）。
 const CARD_TEMPLATE_AUDIT_EVENT_TYPE: &str = "CARD_TEMPLATE_MUTATION";
 /// resource：模板聚合名（单表，无租户列可证明，明细中携带模板身份）。
 const CARD_TEMPLATE_AUDIT_RESOURCE: &str = "card_template";
-/// `audit_log.decision` 固定值：与扇出的 RULE_SET_UPDATE 投影事件语义对齐
-/// （沿用 insert_user_card_cascade_audit_in_tx 的固定 decision 先例）。
+/// `audit_log.decision` 固定值：模板 mutation 语义（非授权投影事件语义——
+/// 本路径不追加任何 legacy 投影事件，见模块头范围结论）。
 const CARD_TEMPLATE_AUDIT_DECISION: &str = "TEMPLATE_UPDATED";
-/// rule_set_projection_audit.change_type：卡片模板 source mutation 的变更类型
-/// （对齐 template_repository 路径的 "TEMPLATE_SYNC" 命名风格）。
-const CARD_TEMPLATE_AUDIT_CHANGE_TYPE: &str = "TEMPLATE_UPDATE";
 
 /// `audit_log` 兜底关联 INSERT（仅绑定参数 + 固定 decision 常量；所有可变输入
 /// 走 `?` 绑定，绝不拼接请求输入）。仅当模板尚无 TEMPLATE RuleSet 投影 owner
@@ -217,14 +209,22 @@ fn generic_card_template_update_changes(
     }
 }
 
-/// 卡片模板 update 的确定性 operation id（纯逻辑）：本路径的 HTTP 上下文
-/// （Gateway 验证 actor 与 x-request-id）目前止步于 api 层、未传入 repository，
-/// 因此对齐 `template_repository::stabilize_template_operation_context` 的
-/// "request id 缺失 → 事务内以锁定 durable 事实确定性派生" 契约：以模板主键
-/// 与锁定的 RULE_SET 投影代次派生，同一 durable 状态重放得到同一 id —— 禁止
-/// 随机 fallback 进入授权投影/审计 correlation。
+/// 卡片模板 update 的确定性 operation id（纯逻辑）：以模板主键与锁定的
+/// RULE_SET 投影代次派生，同一 durable 状态重放得到同一 id —— 禁止随机
+/// fallback 进入审计 correlation。
 fn derive_card_template_update_operation_id(template_id: i64, source_generation: i64) -> String {
     format!("card-template-update:{template_id}:gen:{source_generation}")
+}
+
+/// 带上下文 update 的调用方 actor 守卫（纯函数）：审计必须落已验证正数
+/// actor（exact HTTP 身份）；system/零/负值上下文一律 Auth 拒绝。
+fn guard_card_template_update_actor(actor_id: i64) -> Result<(), AstralError> {
+    if actor_id <= 0 {
+        return Err(AstralError::Auth(
+            "card template update requires a verified positive actor id".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// 把实际变更字段映射为审计 old/new JSON（纯逻辑；只包含实际变更的字段，
@@ -303,8 +303,8 @@ fn changed_field_values(
     )
 }
 
-/// 卡片模板 mutation 的 `audit_log` 兜底关联输入（仅用于尚无 TEMPLATE RuleSet
-/// 投影 owner 的模板）：一条记录覆盖一次 update 的全部实际变更字段。
+/// 卡片模板 mutation 的同事务审计关联输入：一条记录覆盖一次 update 的全部
+/// 实际变更字段（对有无 TEMPLATE RuleSet owner 的模板同一语义）。
 struct CardTemplateAuditEntry<'a> {
     template_id: i64,
     old_value: &'a serde_json::Value,
@@ -347,7 +347,7 @@ impl CardTemplateAuditEntry<'_> {
     }
 }
 
-/// 把卡片模板 mutation 的审计关联写入调用方 source 事务（`audit_log` 兜底）。
+/// 把卡片模板 mutation 的审计关联写入调用方 source 事务（`audit_log`）。
 /// 沿用 `insert_level_template_audit_in_tx` 的既有机制：与 source mutation 同
 /// 事务落库，任何失败回滚整个 mutation。不能复用 MQ-first AuditDualWrite：
 /// 它可能在事务提交后异步落库，无法保证与 source 原子一致。
@@ -386,11 +386,33 @@ pub trait CardTemplateRepository: Send + Sync {
     async fn get_template(&self, id: i64) -> Result<Option<CardTemplateRecord>, AstralError>;
     /// 新建模板；若 scope=SYSTEM 先在同一事务内清除同类型其他 SYSTEM 标记
     async fn create_template(&self, new: &NewCardTemplate) -> Result<i64, AstralError>;
-    /// 部分更新；单事务完成：行锁 + status 白名单 + `__SUPERADMIN__` ACTIVE
-    /// 下线守卫 + 活跃卡绑定下线守卫 + SYSTEM 标记清理（按生效 card_type）+
-    /// 变更检测（无实际变更空提交）+ TEMPLATE RuleSet 投影事件与审计
-    /// correlation，任一失败整体回滚
+    /// 部分更新（显式兼容路径）：守卫/变更检测/同事务 audit_log 语义与
+    /// `update_template_with_context` 一致；审计落派生 system 身份（行为不变）。
+    /// 不追加 legacy 投影事件，不产生账本 delta（模块头约束 5）。
     async fn update_template(&self, id: i64, patch: &CardTemplatePatch) -> Result<(), AstralError>;
+    /// 带可信调用方身份的部分更新（additive；source 语义与 `update_template`
+    /// 完全一致，审计关联改用 exact 调用方身份）。
+    ///
+    /// `context.actor_id()` 必须为已验证正数（非正数 Auth fail-closed）；
+    /// `context` 为已证明 operation id 时原样复用，未证明（request id 缺失）
+    /// 时在事务内以锁定 durable 事实确定性派生一次——同一 durable 状态重放
+    /// 得到同一 id，绝不随机 fallback。
+    ///
+    /// 默认实现 fail-closed：测试替身按需覆写；任何实现都不得静默降级为
+    /// 派生 system 身份（生产 exact actor 合同）。
+    async fn update_template_with_context(
+        &self,
+        id: i64,
+        patch: &CardTemplatePatch,
+        context: &RuleSetMutationContext,
+    ) -> Result<(), AstralError> {
+        let _ = (id, patch, context);
+        Err(AstralError::Internal(
+            "update_template_with_context requires an implementation carrying the \
+             verified caller identity"
+                .into(),
+        ))
+    }
     /// Transactionally delete only when no observable schema reference exists.
     async fn delete_template_if_unreferenced(&self, id: i64) -> Result<bool, AstralError>;
 }
@@ -452,16 +474,11 @@ impl SqlxCardTemplateRepository {
         Ok((total_active, super_admin_active))
     }
 
-    /// Operation identity 前置（对齐 `template_repository::stabilize_template_
-    /// operation_context`）：以事务内锁定的 RULE_SET 投影 head 代次确定性派生
-    /// system 上下文。head 缺失 ⇒ 代次 0（首次投影前更新），异常代次 fail-closed。
-    /// 对 head 的 FOR UPDATE 读与既有 parent-event 追加同锁序（head 最后锁定），
-    /// 不引入新的锁序倒置。
-    async fn stabilize_card_template_operation_context(
+    /// 事务内锁定读取 RULE_SET 投影 head 代次（owner 缺失 ⇒ 0；负值 fail-closed）。
+    async fn locked_rule_set_head_generation(
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        template_id: i64,
         rule_set_id: Option<i64>,
-    ) -> Result<RuleSetMutationContext, AstralError> {
+    ) -> Result<i64, AstralError> {
         let source_generation = match rule_set_id {
             Some(rule_set_id) => sqlx::query_scalar::<_, Option<i64>>(
                 "SELECT source_generation FROM authorization_projection_head \
@@ -473,8 +490,6 @@ impl SqlxCardTemplateRepository {
             .map_err(db_error)?
             .flatten()
             .unwrap_or(0),
-            // 模板尚无 TEMPLATE RuleSet 投影 owner：没有可锁定的 head，
-            // 派生输入退化为模板主键 + 代次 0（仍为 durable 主键派生，非随机）。
             None => 0,
         };
         if source_generation < 0 {
@@ -483,81 +498,32 @@ impl SqlxCardTemplateRepository {
                     .into(),
             ));
         }
+        Ok(source_generation)
+    }
+
+    /// 兼容路径身份（`update_template` 显式保留）：system 上下文，operation id
+    /// 以事务内锁定的 RULE_SET head 代次确定性派生（对 head 的 FOR UPDATE 读
+    /// 与既有锁序一致，不引入新的锁序倒置）。
+    async fn stabilize_card_template_operation_context(
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        template_id: i64,
+        rule_set_id: Option<i64>,
+    ) -> Result<RuleSetMutationContext, AstralError> {
+        let source_generation = Self::locked_rule_set_head_generation(tx, rule_set_id).await?;
         RuleSetMutationContext::system(&derive_card_template_update_operation_id(
             template_id,
             source_generation,
         ))
     }
-}
 
-#[async_trait]
-impl CardTemplateRepository for SqlxCardTemplateRepository {
-    async fn count_templates(&self) -> Result<i64, AstralError> {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM user_card_template WHERE status = 'ACTIVE'",
-        )
-        .fetch_one(&self.db)
-        .await
-        .map_err(db_error)
-    }
-
-    async fn list_templates(
+    /// update 共同实现：`caller` 为 `None` 时走兼容派生 system 路径；
+    /// `Some(ctx)` 时审计关联使用 exact 调用方身份。
+    async fn apply_template_update(
         &self,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<CardTemplateRecord>, AstralError> {
-        sqlx::query_as::<_, CardTemplateRecord>(&format!(
-            "SELECT {TEMPLATE_SELECT_COLUMNS} FROM user_card_template \
-             WHERE status = 'ACTIVE' ORDER BY template_id LIMIT ? OFFSET ?"
-        ))
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.db)
-        .await
-        .map_err(db_error)
-    }
-
-    async fn get_template(&self, id: i64) -> Result<Option<CardTemplateRecord>, AstralError> {
-        sqlx::query_as::<_, CardTemplateRecord>(&format!(
-            "SELECT {TEMPLATE_SELECT_COLUMNS} FROM user_card_template WHERE template_id = ?"
-        ))
-        .bind(id)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(db_error)
-    }
-
-    async fn create_template(&self, new: &NewCardTemplate) -> Result<i64, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
-
-        // 如果设为 SYSTEM，先在同一事务/连接上清除同类型其他默认标记：
-        // 后续 INSERT 失败即整体回滚，不会留下已降级的旧 SYSTEM 默认模板。
-        if new.template_scope == TEMPLATE_SCOPE_SYSTEM {
-            Self::clear_system_scope_in_tx(&mut tx, &new.card_type).await?;
-        }
-
-        let result = sqlx::query(
-            "INSERT INTO user_card_template (template_name, template_code, card_type, domain_id, \
-             template_scope, default_priority, default_roles_json, resource_scope_json, status) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')",
-        )
-        .bind(&new.template_name)
-        .bind(&new.template_code)
-        .bind(&new.card_type)
-        .bind(new.domain_id)
-        .bind(&new.template_scope)
-        .bind(new.default_priority)
-        .bind(&new.default_roles_json)
-        .bind(&new.resource_scope_json)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_error)?;
-        let new_id = result.last_insert_id() as i64;
-        tx.commit().await.map_err(db_error)?;
-        Ok(new_id)
-    }
-
-    async fn update_template(&self, id: i64, patch: &CardTemplatePatch) -> Result<(), AstralError> {
+        id: i64,
+        patch: &CardTemplatePatch,
+        caller: Option<&RuleSetMutationContext>,
+    ) -> Result<(), AstralError> {
         // 空补丁：无字段更新（对齐原语义，不产生 SQL 与事务）
         if patch.is_empty() {
             return Ok(());
@@ -568,17 +534,18 @@ impl CardTemplateRepository for SqlxCardTemplateRepository {
             guard_card_template_status(status)?;
         }
 
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        // 授权源事务宿主：栅栏先于 DB begin 取得（hub 拒绝发证即 fail-closed）。
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
 
         // TEMPLATE RuleSet 投影 owner（若存在）先于模板行锁定：与规则模板同步
-        // 路径（ensure_template_rule_set_in_tx 的 rule_set → user_card_template
-        // 锁序）保持一致，避免跨路径 AB-BA 死锁。
+        // 路径锁序一致，避免 AB-BA 死锁；该锁同时串行化本 update 与模板规则
+        // 同步。本 update 自身不写任何 RULE_SET 投影/账本状态。
         let rule_set_id: Option<i64> = sqlx::query_as::<_, (i64,)>(
             "SELECT rule_set_id FROM rule_set \
              WHERE source_type = 'TEMPLATE' AND source_id = ? FOR UPDATE",
         )
         .bind(id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?
         .map(|(rule_set_id,)| rule_set_id);
@@ -592,7 +559,7 @@ impl CardTemplateRepository for SqlxCardTemplateRepository {
              FROM user_card_template WHERE template_id = ? FOR UPDATE",
         )
         .bind(id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
 
@@ -602,10 +569,8 @@ impl CardTemplateRepository for SqlxCardTemplateRepository {
             return Ok(());
         };
 
-        // 规范 __SUPERADMIN__ 模板守卫 + 活跃卡绑定守卫：只要补丁携带 status
-        // （无论是否产生实际变更）都执行——守卫是拒绝性校验，不产生写入，且
-        // 优先于变更检测（下线意图即便与现值相同也不得绕过守卫）。计数行已在
-        // 本事务内锁定。
+        // 守卫是拒绝性校验，不产生写入，且优先于变更检测（下线意图即便与
+        // 现值相同也不得绕过守卫）。计数行已在本事务内锁定。
         if let Some(target_status) = &patch.status {
             let (active_cards, active_super_admin_cards) =
                 Self::lock_and_count_active_cards(&mut tx, id).await?;
@@ -615,25 +580,18 @@ impl CardTemplateRepository for SqlxCardTemplateRepository {
                 target_status,
                 id,
             )?;
-            // 通用 fail-closed：任意模板脱离 ACTIVE 时若仍有 ACTIVE 卡绑定则
-            // 拒绝，绝不静默下线（SUPER_ADMIN 卡是卡的全集子集，两个守卫叠加
-            // 不冲突；本守卫的消息更通用，放在更具体的 __SUPERADMIN__ 守卫之后）。
             guard_no_active_cards(active_cards, target_status, id)?;
         }
 
-        // 变更检测（generic_rule_set_update_changes 风格，按实际写入值逐字段
-        // 比较）：没有任何可变字段实际变化 ⇒ 无 source mutation、无投影、
-        // 无审计（审计只记录实际变更的字段；空变更集没有可审计内容）。
+        // 变更检测：无可变字段实际变化 ⇒ 无 source mutation、无审计。
         let changes = generic_card_template_update_changes(&current, patch);
         if !changes.any() {
             // 幂等更新：空提交，保持原"0 行也返回 Ok"的调用方语义。
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(());
         }
 
-        // 生效值：以补丁覆盖后的 card_type/template_scope 判定守卫与清理目标，
-        // 使"同 card_type 仅允许一个 SYSTEM 默认模板"在类型迁移时依然成立。
-        // clone 而非 move：current 之后还要供审计 old/new 值读取。
+        // 生效值：以补丁覆盖后的 card_type/template_scope 判定守卫与清理目标。
         let effective_card_type: Option<String> =
             patch.card_type.clone().or(current.card_type.clone());
         let effective_scope: Option<String> = patch
@@ -641,20 +599,34 @@ impl CardTemplateRepository for SqlxCardTemplateRepository {
             .clone()
             .or(current.template_scope.clone());
 
-        // SYSTEM 清理与本次 UPDATE 同事务/同一连接：UPDATE 失败即整体回滚，
-        // 不留下半清理状态。
+        // SYSTEM 清理与本次 UPDATE 同事务/同一连接：UPDATE 失败即整体回滚。
         if effective_scope.as_deref() == Some(TEMPLATE_SCOPE_SYSTEM) {
             if let Some(card_type) = &effective_card_type {
                 Self::clear_system_scope_in_tx(&mut tx, card_type).await?;
             }
         }
 
-        // Operation identity 前置：任何 projection/audit durable 写入之前把
-        // 上下文升级为可证明稳定身份。HTTP actor/request id 目前止步于 api 层
-        // 未传入 repository（见报告中的 api 层配合改动项），本路径按模板同步
-        // 路径同一契约以锁定的 durable 投影代次确定性派生，绝不随机 fallback。
-        let context =
-            Self::stabilize_card_template_operation_context(&mut tx, id, rule_set_id).await?;
+        // Operation identity 前置：任何 audit durable 写入之前确定可证明身份。
+        // None → 兼容路径：system 身份由锁定的 RULE_SET head 代次确定性派生。
+        // Some(ctx) → 已验证 actor；已证明 operation id 原样复用，未证明
+        // （request id 缺失）以同一锁定事实确定性派生一次，绝不随机 fallback。
+        let context = match caller {
+            None => {
+                Self::stabilize_card_template_operation_context(&mut tx, id, rule_set_id).await?
+            }
+            Some(ctx) => {
+                guard_card_template_update_actor(ctx.actor_id())?;
+                if ctx.has_proven_operation_identity() {
+                    ctx.clone()
+                } else {
+                    let source_generation =
+                        Self::locked_rule_set_head_generation(&mut tx, rule_set_id).await?;
+                    ctx.clone().with_derived_operation_id(
+                        derive_card_template_update_operation_id(id, source_generation),
+                    )?
+                }
+            }
+        };
 
         let mut builder = QueryBuilder::<sqlx::MySql>::new("UPDATE user_card_template SET ");
         let mut first = true;
@@ -719,80 +691,132 @@ impl CardTemplateRepository for SqlxCardTemplateRepository {
             builder.push("status = ").push_bind(status.clone());
         }
         builder.push(" WHERE template_id = ").push_bind(id);
-        builder.build().execute(&mut *tx).await.map_err(db_error)?;
+        builder.build().execute(&mut **tx).await.map_err(db_error)?;
 
-        // 投影 + 审计 correlation（同一 source 事务）：有 TEMPLATE RuleSet 投影
-        // owner 的模板走版本化 RULE_SET_UPDATE head/outbox + rule_set_projection_
-        // audit（operation_id/event_id/source_generation/tenant 关联）；尚无
-        // owner 的模板没有 RULE_SET 通道可写（projector 不得自行创造新授权
-        // 聚合），以 audit_log 兜底记录实际变更字段。两条路径都与 source
-        // mutation 同生共死，任何失败回滚整个 update。
+        // 审计 correlation（同一 source 事务）：update 不追加 legacy 投影事件、
+        // 不产生授权账本 delta（模块头约束 5），全部实际变更字段以同事务
+        // `audit_log` 行关联（actor/operation/old/new）。任何失败回滚整个 update。
         let (old_value, new_value) = changed_field_values(&changes, &current, patch);
-        match rule_set_id {
-            Some(rule_set_id) => {
-                let projection = append_rule_set_projection_in_tx(
-                    &mut tx,
-                    rule_set_id,
-                    EVENT_TYPE_RULE_SET_UPDATE,
-                    ProjectionEventMetadata {
-                        actor_id: context.actor_id(),
-                        operation_id: context.operation_id(),
-                    },
-                )
-                .await?;
-                insert_rule_set_projection_audit_in_tx(
-                    &mut tx,
-                    &RuleSetProjectionAuditEntry {
-                        rule_set_id,
-                        entry_id: None,
-                        aggregate_type: ProjectionAggregate::RuleSet.as_str(),
-                        aggregate_id: rule_set_id,
-                        event_id: &projection.event_id,
-                        source_generation: projection.source_generation,
-                        operation_id: context.operation_id(),
-                        actor_id: context.actor_id(),
-                        change_type: CARD_TEMPLATE_AUDIT_CHANGE_TYPE,
-                        old_value_json: Some(&old_value.to_string()),
-                        new_value_json: Some(&new_value.to_string()),
-                        tenant_id: projection.tenant_id,
-                    },
-                )
-                .await?;
-            }
-            None => {
-                insert_card_template_audit_in_tx(
-                    &mut tx,
-                    &CardTemplateAuditEntry {
-                        template_id: id,
-                        old_value: &old_value,
-                        new_value: &new_value,
-                        context: &context,
-                    },
-                )
-                .await?;
-            }
-        }
-        tx.commit().await.map_err(db_error)?;
+        insert_card_template_audit_in_tx(
+            &mut tx,
+            &CardTemplateAuditEntry {
+                template_id: id,
+                old_value: &old_value,
+                new_value: &new_value,
+                context: &context,
+            },
+        )
+        .await?;
+        tx.commit_consuming().await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl CardTemplateRepository for SqlxCardTemplateRepository {
+    async fn count_templates(&self) -> Result<i64, AstralError> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM user_card_template WHERE status = 'ACTIVE'",
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(db_error)
+    }
+
+    async fn list_templates(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<CardTemplateRecord>, AstralError> {
+        sqlx::query_as::<_, CardTemplateRecord>(&format!(
+            "SELECT {TEMPLATE_SELECT_COLUMNS} FROM user_card_template \
+             WHERE status = 'ACTIVE' ORDER BY template_id LIMIT ? OFFSET ?"
+        ))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await
+        .map_err(db_error)
+    }
+
+    async fn get_template(&self, id: i64) -> Result<Option<CardTemplateRecord>, AstralError> {
+        sqlx::query_as::<_, CardTemplateRecord>(&format!(
+            "SELECT {TEMPLATE_SELECT_COLUMNS} FROM user_card_template WHERE template_id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(db_error)
+    }
+
+    async fn create_template(&self, new: &NewCardTemplate) -> Result<i64, AstralError> {
+        // 授权源事务宿主：模板行是 owning-binding 存在性 source（组合内存
+        // resolver 缓存严格 server facts，依赖源活动栅栏保证 binding 更新的
+        // epoch complete）；栅栏先于 DB begin 取得，拒绝发证即 fail-closed。
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+
+        // 如果设为 SYSTEM，先在同一事务/连接上清除同类型其他默认标记：
+        // 后续 INSERT 失败即整体回滚，不会留下已降级的旧 SYSTEM 默认模板。
+        if new.template_scope == TEMPLATE_SCOPE_SYSTEM {
+            Self::clear_system_scope_in_tx(&mut tx, &new.card_type).await?;
+        }
+
+        let result = sqlx::query(
+            "INSERT INTO user_card_template (template_name, template_code, card_type, domain_id, \
+             template_scope, default_priority, default_roles_json, resource_scope_json, status) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')",
+        )
+        .bind(&new.template_name)
+        .bind(&new.template_code)
+        .bind(&new.card_type)
+        .bind(new.domain_id)
+        .bind(&new.template_scope)
+        .bind(new.default_priority)
+        .bind(&new.default_roles_json)
+        .bind(&new.resource_scope_json)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+        let new_id = result.last_insert_id() as i64;
+        tx.commit_consuming().await?;
+        Ok(new_id)
+    }
+
+    async fn update_template(&self, id: i64, patch: &CardTemplatePatch) -> Result<(), AstralError> {
+        // 显式兼容路径：无调用方身份，审计落派生 system 身份（行为不变）。
+        self.apply_template_update(id, patch, None).await
+    }
+
+    async fn update_template_with_context(
+        &self,
+        id: i64,
+        patch: &CardTemplatePatch,
+        context: &RuleSetMutationContext,
+    ) -> Result<(), AstralError> {
+        guard_card_template_update_actor(context.actor_id())?;
+        self.apply_template_update(id, patch, Some(context)).await
     }
 
     async fn delete_template_if_unreferenced(&self, id: i64) -> Result<bool, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        // 授权源事务宿主：栅栏先于 DB begin 取得（hub 拒绝发证即 fail-closed），
+        // 关闭"零引用守卫语义与在线 repair"之间的竞态；commit 证明后才返回。
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let exists: Option<(i64,)> = sqlx::query_as(
             "SELECT template_id FROM user_card_template WHERE template_id = ? FOR UPDATE",
         )
         .bind(id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         if exists.is_none() {
+            tx.commit_consuming().await?;
             return Ok(false);
         }
 
         let user_card_refs: Vec<(i64,)> =
             sqlx::query_as("SELECT card_id FROM user_card WHERE template_id = ? FOR UPDATE")
                 .bind(id)
-                .fetch_all(&mut *tx)
+                .fetch_all(&mut **tx)
                 .await
                 .map_err(db_error)?;
         let level_template_refs: Vec<(i64,)> = sqlx::query_as(
@@ -800,7 +824,7 @@ impl CardTemplateRepository for SqlxCardTemplateRepository {
              WHERE user_card_template_id = ? FOR UPDATE",
         )
         .bind(id)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await
         .map_err(db_error)?;
         let rule_set_refs: Vec<(i64,)> = sqlx::query_as(
@@ -808,7 +832,7 @@ impl CardTemplateRepository for SqlxCardTemplateRepository {
              WHERE source_type = 'TEMPLATE' AND source_id = ? FOR UPDATE",
         )
         .bind(id)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await
         .map_err(db_error)?;
         let reference_count =
@@ -817,10 +841,10 @@ impl CardTemplateRepository for SqlxCardTemplateRepository {
 
         let result = sqlx::query("DELETE FROM user_card_template WHERE template_id = ?")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -1146,23 +1170,26 @@ mod tests {
         assert!(matches!(blank_context, AstralError::Validation(_)));
     }
 
-    /// 源序守卫：update 事务内必须按序完成 TEMPLATE RuleSet 锁定 → 模板行
-    /// 锁定 → 状态守卫 → 变更检测（空变更提前提交）→ identity 稳定化 →
-    /// UPDATE → 投影 → 审计 correlation → 提交；且不得引入随机 identity。
+    /// 源序守卫：update 共同实现必须按序完成 授权源事务 begin → TEMPLATE
+    /// RuleSet owner 锁定 → 模板行锁定 → 状态守卫 → 变更检测（空变更提前提交）
+    /// → identity 稳定化 → UPDATE → 同事务 audit_log correlation →
+    /// commit_consuming；且不得引入随机 identity。
     #[test]
-    fn update_tx_orders_locks_guards_changes_projection_audit_and_commit() {
+    fn update_tx_orders_locks_guards_changes_audit_and_commit() {
         let source = include_str!("card_template_repository.rs");
         let update_body = source
-            .split("async fn update_template")
-            // "async fn update_template" 在本文件出现 4 次（trait 声明、impl
-            // 实现、以及两个守卫测试自身的 split 字面量）；nth(2) 才是 impl
-            // 实现体段（从 impl 声明之后到第一个守卫测试字面量之前）。
-            .nth(2)
+            .split("async fn apply_template_update")
+            // 该字面量在实现中唯一（两个 delegate 调用点不带 "async fn" 前缀）；
+            // nth(1) 从实现体起，再以 impl delete 声明截断。
+            .nth(1)
             .and_then(|body| {
                 body.split("async fn delete_template_if_unreferenced")
                     .next()
             })
-            .expect("update_template implementation must be delimited");
+            .expect("apply_template_update implementation must be delimited");
+        let wrapper_begin = update_body
+            .find("AuthorizationSourceTransaction::begin(&self.db)")
+            .expect("update must host the source mutation in the authorization source wrapper");
         let rule_set_lock = update_body
             .find("SELECT rule_set_id FROM rule_set")
             .expect("update must lock the TEMPLATE RuleSet projection owner first");
@@ -1181,34 +1208,32 @@ mod tests {
         let stabilize = update_body
             .find("stabilize_card_template_operation_context")
             .expect("update must stabilize operation identity before durable writes");
-        let projection = update_body
-            .find("append_rule_set_projection_in_tx")
-            .expect("update must append the RULE_SET_UPDATE projection with metadata");
+        let source_update = update_body
+            .find("builder.build().execute(&mut **tx)")
+            .expect("update must mutate the template row on the wrapper connection");
         let audit = update_body
-            .find("insert_rule_set_projection_audit_in_tx")
-            .expect("update must write the versioned audit correlation");
-        let fallback_audit = update_body
             .find("insert_card_template_audit_in_tx")
-            .expect("update must keep the audit_log fallback for ownerless templates");
+            .expect("update must write the same-transaction audit_log correlation");
         let commit = update_body
-            .rfind("tx.commit()")
-            .expect("update must commit the source transaction");
+            .rfind("tx.commit_consuming()")
+            .expect("update must commit through the wrapper consuming commit");
         assert!(
-            rule_set_lock < row_lock
+            wrapper_begin < rule_set_lock
+                && rule_set_lock < row_lock
                 && row_lock < guard
                 && guard < changes
                 && changes < no_change
                 && no_change < stabilize
-                && stabilize < projection
-                && projection < audit
+                && stabilize < source_update
+                && source_update < audit
                 && audit < commit,
-            "update must order: rule_set lock -> template lock -> status guards -> \
-             change detection -> no-change short-circuit -> identity -> UPDATE -> \
-             projection -> audit -> commit"
+            "update must order: wrapper begin -> rule_set owner lock -> template lock -> \
+             status guards -> change detection -> no-change short-circuit -> identity -> \
+             UPDATE -> audit_log -> commit_consuming"
         );
         assert!(
-            fallback_audit < commit,
-            "audit_log fallback must land inside the same transaction"
+            !update_body.contains("tx.commit()"),
+            "update must not bypass the wrapper's proven-commit gate with a raw commit"
         );
         assert!(
             !update_body.contains("uuid::Uuid"),
@@ -1216,41 +1241,166 @@ mod tests {
         );
     }
 
-    /// 投影审计 correlation 必须绑定 operation_id/event_id/source_generation/
-    /// tenant_id 与 actor metadata（mutation → 投影 → 审计三链可相互关联）。
+    /// issuance-only 约束：update 不追加 legacy 投影事件、不产生授权账本
+    /// delta/revision、不做 ELIGIBILITY 失效扇出——模板字段无授权读侧消费者，
+    /// 已发卡授权在发卡/绑定时物化，之后不重导出。
     #[test]
-    fn rule_set_audit_entry_binds_full_correlation_identity() {
+    fn update_produces_no_legacy_projection_ledger_or_invalidation_writes() {
         let source = include_str!("card_template_repository.rs");
         let update_body = source
-            .split("async fn update_template")
-            // "async fn update_template" 在本文件出现 4 次（trait 声明、impl
-            // 实现、以及两个守卫测试自身的 split 字面量）；nth(2) 才是 impl
-            // 实现体段（从 impl 声明之后到第一个守卫测试字面量之前）。
-            .nth(2)
+            .split("async fn apply_template_update")
+            .nth(1)
             .and_then(|body| {
                 body.split("async fn delete_template_if_unreferenced")
                     .next()
             })
-            .expect("update_template implementation must be delimited");
-        for binding in [
-            "actor_id: context.actor_id()",
-            "operation_id: context.operation_id()",
-            "event_id: &projection.event_id",
-            "source_generation: projection.source_generation",
-            "tenant_id: projection.tenant_id",
-            "change_type: CARD_TEMPLATE_AUDIT_CHANGE_TYPE",
+            .expect("apply_template_update implementation must be delimited");
+        for forbidden in [
+            // legacy RULE_SET head/outbox 伪刷新（retired 链路，无生产效果）
+            concat!("append_rule_set_", "projection_in_tx"),
+            concat!("EVENT_TYPE_RULE_SET_", "UPDATE"),
+            concat!("insert_rule_set_", "projection_audit_in_tx"),
+            // 授权账本 delta/revision（issuance-only 字段不重导出授权）
+            concat!("authorization_grant_", "revision"),
+            concat!("authorization_delta_", "event"),
+            concat!("grant_", "ledger"),
+            // ELIGIBILITY 失效扇出（模板字段不触碰资格缓存）
+            concat!("append_eligibility_", "projection_with_invalidation_in_tx"),
         ] {
             assert!(
-                update_body.contains(binding),
-                "audit correlation must bind {binding}"
+                !update_body.contains(forbidden),
+                "issuance-only template update must not emit {forbidden}"
             );
         }
     }
 
-    /// 兜底审计 SQL 只用绑定参数 + 固定常量，绝不拼接请求输入；event_type/
+    /// 审计 correlation 统一走同事务 `audit_log`：绑定 actor/operation（进入
+    /// detail JSON 与 request_id 列）与实际变更字段 old/new；不再存在
+    /// rule_set_projection_audit 分支。
+    #[test]
+    fn audit_correlation_is_same_transaction_audit_log_for_every_template() {
+        let source = include_str!("card_template_repository.rs");
+        let update_body = source
+            .split("async fn apply_template_update")
+            .nth(1)
+            .and_then(|body| {
+                body.split("async fn delete_template_if_unreferenced")
+                    .next()
+            })
+            .expect("apply_template_update implementation must be delimited");
+        for binding in [
+            "template_id: id",
+            "old_value: &old_value",
+            "new_value: &new_value",
+            "context: &context",
+        ] {
+            assert!(
+                update_body.contains(binding),
+                "audit_log correlation must bind {binding}"
+            );
+        }
+        // operation identity 进入审计关联（request_id 列 + detail JSON）。
+        assert!(
+            CARD_TEMPLATE_AUDIT_INSERT_SQL.contains("request_id"),
+            "audit correlation must land in the request_id column"
+        );
+        assert!(
+            !update_body.contains("rule_set_projection_audit"),
+            "the retired rule_set_projection_audit branch must stay removed"
+        );
+    }
+
+    /// 身份合同：`update_template_with_context` 要求已验证正数 actor（审计落
+    /// exact HTTP 身份，system/负值 Auth 拒绝）；已证明 operation id 原样复用，
+    /// 未证明以锁定 durable 事实确定性派生一次（绝不随机 fallback，也绝不
+    /// 逐重试漂移）；兼容路径 `update_template` 显式保留并委托 None。
+    #[test]
+    fn context_update_identity_contract_and_legacy_compat() {
+        // actor 守卫（纯函数）：非正一律 Auth 拒绝，正数放行。
+        assert!(matches!(
+            guard_card_template_update_actor(0),
+            Err(AstralError::Auth(_))
+        ));
+        assert!(matches!(
+            guard_card_template_update_actor(-3),
+            Err(AstralError::Auth(_))
+        ));
+        assert!(guard_card_template_update_actor(42).is_ok());
+
+        let source = include_str!("card_template_repository.rs");
+        // additive trait 入口存在（trait 声明与 impl 均为多行签名，只锚定名）。
+        assert!(
+            source.contains(concat!("async fn update_template_", "with_context")),
+            "the additive with-context entry must exist"
+        );
+        // 两个入口的委托关系：legacy → None，with_context → Some(context)。
+        // token 以 concat 构造，避免本测试字面量混入 matches 计数。
+        let legacy_token = concat!("self.apply_template_update(id, patch, ", "None).await");
+        let context_token = concat!(
+            "self.apply_template_update(id, patch, ",
+            "Some(context)).await"
+        );
+        assert!(
+            source.matches(legacy_token).count() == 1,
+            "exactly the legacy path must delegate with None"
+        );
+        assert!(
+            source.matches(context_token).count() == 1,
+            "exactly the with-context path must delegate with Some(context)"
+        );
+        let with_context_body = source
+            .split("async fn update_template_with_context")
+            .nth(2)
+            .and_then(|body| body.split("async fn apply_template_update").next())
+            .expect("with_context implementation must be delimited");
+        assert!(
+            with_context_body.contains("guard_card_template_update_actor(context.actor_id())"),
+            "with_context must fail closed on unverified actors before any transaction"
+        );
+
+        // 共同实现内的身份分派：已证明原样复用；未证明确定性派生一次；
+        // 兼容 arm 保持派生 system 身份。随机 fallback 任何位置都不得出现。
+        let update_body = source
+            .split("async fn apply_template_update")
+            .nth(1)
+            .and_then(|body| {
+                body.split("async fn delete_template_if_unreferenced")
+                    .next()
+            })
+            .expect("apply_template_update implementation must be delimited");
+        assert!(
+            update_body.contains("ctx.has_proven_operation_identity()"),
+            "a proven operation identity must be reused verbatim"
+        );
+        let derivation = update_body
+            .find("ctx.clone().with_derived_operation_id(")
+            .expect("an unproven context must derive once from locked durable facts");
+        let derived_id = update_body
+            .find("derive_card_template_update_operation_id(id, source_generation)")
+            .expect("the derivation must reuse the existing deterministic helper");
+        assert!(
+            derivation < derived_id,
+            "the derived id must feed with_derived_operation_id (derive once, before SQL)"
+        );
+        // 兼容 arm：update_template 无上下文时仍派生 system 身份（stabilize fn）。
+        let system_token = concat!(
+            "RuleSetMutationContext::",
+            "system(&derive_card_template_update_operation_id("
+        );
+        assert!(
+            source.contains(system_token),
+            "the legacy arm must keep the derived system identity"
+        );
+        assert!(
+            !update_body.contains("uuid::Uuid") && !update_body.contains("ruleset:"),
+            "no random fallback (uuid or ruleset: prefix) may reach the audit correlation"
+        );
+    }
+
+    /// 审计 SQL 只用绑定参数 + 固定常量，绝不拼接请求输入；event_type/
     /// request_id 落在 correlation 列上（对齐 level_template 的既有契约）。
     #[test]
-    fn fallback_audit_sql_is_parameterized_and_constants_stable() {
+    fn audit_sql_is_parameterized_and_constants_stable() {
         assert!(CARD_TEMPLATE_AUDIT_INSERT_SQL.contains("VALUES (?, NULL, ?, ?, ?, NULL, ?, ?, ?)"));
         assert!(
             CARD_TEMPLATE_AUDIT_INSERT_SQL.contains("event_type")
@@ -1261,6 +1411,5 @@ mod tests {
         assert_eq!(CARD_TEMPLATE_AUDIT_EVENT_TYPE, "CARD_TEMPLATE_MUTATION");
         assert_eq!(CARD_TEMPLATE_AUDIT_ACTION_UPDATE, "card_template_update");
         assert_eq!(CARD_TEMPLATE_AUDIT_DECISION, "TEMPLATE_UPDATED");
-        assert_eq!(CARD_TEMPLATE_AUDIT_CHANGE_TYPE, "TEMPLATE_UPDATE");
     }
 }

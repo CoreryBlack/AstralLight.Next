@@ -1,0 +1,33 @@
+[package]
+name = "astral-single-node"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license.workspace = true
+
+description = "AstralLight single-node composite runtime"
+
+# Redis 编译层退役收口（redis-layer-retirement-20261002）：组合进程**有意不提供**
+# `redis-compat` feature（恒 Redis-free）。本节显式登记该缺席契约：
+# - 组合进程内的成员宿主（gateway / identity / trustgraph / monitor）各自以
+#   **自身 crate** 的 `cfg!(feature = "redis-compat")` 在启动期断言 adapter
+#   编译能力；组合构建中各成员均未启用该 feature，断言恒为 false。
+# - 因此 `ASTRAL_REDIS_PROJECTION_COMPAT=true` 会在第一个成员宿主的能力门
+#   （AppConfig::validate_redis_adapter_support）处**显式拒绝启动**（fail-closed，
+#   非 log-only），组合进程绝不静默 Redis-free 化降级。
+# - 经本 crate 无法启用任何成员的 redis-compat（Cargo 特性缺席即不可经
+#   `-p astral-single-node` 打开）；workspace 级统一 feature 强行点亮某个成员
+#   时，其余成员的能力门仍会拒绝，组合启动保持 fail-closed。
+[features]
+
+[dependencies]
+astral-common = { path = "../astral-common" }
+astral-db = { path = "../astral-db" }
+astral-gateway = { path = "../astral-gateway" }
+astral-identity = { path = "../astral-identity" }
+astral-mq = { path = "../astral-mq" }
+astral-trustgraph = { path = "../astral-trustgraph" }
+anyhow = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

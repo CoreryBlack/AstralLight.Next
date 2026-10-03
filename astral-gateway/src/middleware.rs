@@ -12,7 +12,9 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+#[cfg(feature = "redis-compat")]
 use redis::aio::ConnectionManager;
+#[cfg(feature = "redis-compat")]
 use redis::AsyncCommands;
 use serde::Deserialize;
 use std::sync::OnceLock;
@@ -20,6 +22,7 @@ use std::sync::OnceLock;
 use astral_common::config::AppConfig;
 use astral_common::middleware::internal_signature::INTERNAL_SESSION_PATH;
 use astral_common::middleware::{decode_v2_token, JwtClaims};
+use astral_common::session_projection_store::SessionProjectionDecision;
 use astral_common::token_contract::{
     PrincipalKind, TokenUse, CHAT_WS_BEARER_SUBPROTOCOL_PREFIX, CHAT_WS_SUBPROTOCOL,
     CLAIMS_VERSION_HEADER, IDENTITY_CARD_ID_HEADER, PRINCIPAL_KIND_HEADER, TOKEN_USE_HEADER,
@@ -116,10 +119,27 @@ pub(crate) fn is_proxy_forbidden_header(name: &str) -> bool {
 }
 
 /// Redis 连接超时（秒）
+#[cfg(feature = "redis-compat")]
 const REDIS_TIMEOUT_SECS: u64 = 3;
 
+#[cfg(feature = "redis-compat")]
 static GATEWAY_REDIS: OnceLock<ConnectionManager> = OnceLock::new();
 
+/// redis-compat feature 未编译：compat adapter 不存在，判定面恒为 strict
+/// MySQL durable facts（与今天 adapter 未装配时的默认路径一致）。
+#[cfg(not(feature = "redis-compat"))]
+fn gateway_redis_adapter_installed() -> bool {
+    false
+}
+
+#[cfg(feature = "redis-compat")]
+fn gateway_redis_adapter_installed() -> bool {
+    GATEWAY_REDIS.get().is_some()
+}
+
+/// compat 装配入口（仅 redis-compat feature 编译；feature-off 构建中本 API
+/// 不存在——redis 编译层退役的显式 BREAKING 收敛点，登记于架构文档）。
+#[cfg(feature = "redis-compat")]
 pub async fn init_gateway_redis(redis_url: &str) -> Result<(), String> {
     if GATEWAY_REDIS.get().is_some() {
         return Ok(());
@@ -141,18 +161,70 @@ pub async fn init_gateway_redis(redis_url: &str) -> Result<(), String> {
         .map_err(|_| "Gateway Redis manager already initialized".to_owned())
 }
 
+#[cfg(feature = "redis-compat")]
 fn gateway_redis() -> RedisCheckResult<ConnectionManager> {
     GATEWAY_REDIS.get().cloned().ok_or(())
 }
 
 /// Protected-request Redis checks fail closed; tests can exercise the decision helpers without Redis.
+#[cfg(feature = "redis-compat")]
 type RedisCheckResult<T> = Result<T, ()>;
 
+#[cfg(feature = "redis-compat")]
 async fn redis_conn_with_url(_redis_url: &str) -> RedisCheckResult<redis::aio::ConnectionManager> {
     gateway_redis()
 }
 
-/// 从 Redis 获取缓存的租户状态。
+// ===== Redis-free 会话判定（strict MySQL durable facts + 可选镜像） =====
+
+/// strict 会话判定数据面：MySQL 连接池（启动期由 runtime 装配一次）。
+static GATEWAY_SESSION_DB: OnceLock<sqlx::MySqlPool> = OnceLock::new();
+
+/// 安装 strict 会话判定面（Gateway 启动期调用一次）。
+///
+/// - `pool`：strict MySQL source 的连接池（`auth_session_jti_index` ×
+///   `auth_device_session` × `auth_token_family` × `user_card` ×
+///   `identity_card` 单条 JOIN）。
+/// - `mirror`：可选的有界镜像加速器。**positive allow 只在单写者组合进程
+///   且显式配置下启用**（`policy`）；独立多写者 Gateway 必须传
+///   [`MirrorPolicy::DenyOnly`]——撤销 marker 仍可加速 deny，ALLOW 每请求
+///   strict DB，直到自身拥有完整 channel proof/watermark。
+/// - `disable_mirror_positive`：显式配置开关——置 true 时对镜像调用
+///   `mark_suspect_permanent()`，positive cache 全部旁路（deny marker 加速
+///   保留）。
+pub fn install_gateway_session_auth(
+    pool: sqlx::MySqlPool,
+    mirror: Option<astral_common::session_projection_store::SessionProjectionMirror>,
+    policy: astral_common::session_projection_store::MirrorPolicy,
+    disable_mirror_positive: bool,
+) -> Result<(), String> {
+    if astral_common::session_projection_store::global_session_projection_store().is_some() {
+        return Err("gateway session auth already initialized".into());
+    }
+    if disable_mirror_positive {
+        if let Some(mirror) = &mirror {
+            mirror.mark_suspect_permanent();
+            tracing::warn!(
+                "session grant mirror positive cache permanently disabled by configuration; allows are strict-DB only"
+            );
+        }
+    }
+    if astral_db::install_global_mysql_session_projection_store(pool.clone(), mirror, policy) {
+        GATEWAY_SESSION_DB
+            .set(pool)
+            .map_err(|_| "gateway session db already initialized".to_owned())
+    } else {
+        Err("gateway session auth already initialized".into())
+    }
+}
+
+/// strict 判定面的连接池句柄；未安装（无 DB 的测试/组合）返回 `None`。
+fn gateway_session_db() -> Option<&'static sqlx::MySqlPool> {
+    GATEWAY_SESSION_DB.get()
+}
+
+/// 从 Redis 获取缓存的租户状态（仅 redis-compat feature 编译）。
+#[cfg(feature = "redis-compat")]
 async fn fetch_cached_tenant_status(
     tenant_id: &str,
     redis_url: &str,
@@ -184,6 +256,152 @@ fn optional_tenant_id(claims: &JwtClaims) -> Result<Option<i64>, &'static str> {
         Some(_) => Err("INVALID_TENANT_CONTEXT"),
         None => Ok(None),
     }
+}
+
+/// 把 JWT claims 换算成 strict 会话判定的绑定上下文（与 durable 事实逐项
+/// 比对）。principal_kind 无法解析时留空：任何 durable 评估都不会匹配空
+/// principal，天然 fail-closed。
+fn session_bind_context(
+    claims: &JwtClaims,
+) -> astral_common::session_projection_store::SessionBindContext {
+    astral_common::session_projection_store::SessionBindContext {
+        user_id: claims.sub.parse::<i64>().unwrap_or(0),
+        session_id: claims.sid.unwrap_or(0),
+        session_version: claims.session_version.unwrap_or(0),
+        session_epoch: claims.sev.unwrap_or(0),
+        token_family_id: claims.family_id.unwrap_or(0),
+        principal_kind: PrincipalKind::parse(&claims.principal_kind)
+            .map(|kind| kind.as_str())
+            .unwrap_or(""),
+        identity_card_id: claims.identity_card_id,
+        user_card_id: claims.user_card_id,
+        user_card_tenant_id: claims.user_card_tenant_id,
+        user_card_domain_id: claims.user_card_domain_id,
+        expires_at_epoch_second: claims.exp as i64,
+    }
+}
+
+// ===== 组合进程 positive 判定面强门 + JWT admission 栅栏（gateway-read-final） =====
+
+/// strict 租户状态 DB 读取的硬 deadline：超时按依赖不可用 503 fail-closed，
+/// 绝不无限等待（对齐签发侧复核 3s 预算）。
+const TENANT_STATUS_DEADLINE_SECS: u64 = 3;
+
+/// 组合进程 positive 判定面强条件（**观测事实，绝非 invented bool**；
+/// 安装门与逐请求复验共用同一实现，条件缺一不可）：
+///
+/// 1. `LocalBus` 已安装且 `owners_ready()`——四个必需队列（含
+///    auth.session.revocation / authorization.invalidation）的进程内 owner
+///    全部注册且通道存活，撤销/失效 fanout 有真实消费者；
+/// 2. **同一进程已安装**的 `memory_projection_hub` 通道健康（非 warming/
+///    suspect/健康面失效）。hub 健康**不是**启动自然保证——warm 完成仍可能
+///    suspect、本地 supervisor 初始 reconcile 异步；组合 main 的 readiness
+///    等待持有租约要求 hub healthy + projection owner alive 后才 spawn
+///    gateway，故组合内安装时刻本条件确定成立；
+/// 3. aux marker：`auxiliary_authorization_mirror` 已安装——它只是**装配
+///    资格**标记（其生产装配方要求启动期租约+warm-up 完成），绝不等于
+///    运行期租约存活证明。
+///
+/// 运行期租约/健康存活不由本函数担保，而由 canonical verifier 的实时门
+/// 承担：hub 辅助/strict 读取令牌（含 `runtime_owner_failed` 与健康推进；
+/// 租约失联由组合 main 以 `mark_runtime_owner_failed` 关闭全部写/strict 读，
+/// 先于 abort，而非普通 suspect）——即 admission 栅栏捕获与 `next.run` 前
+/// 同栅栏复验。为假只降级（DenyOnly/strict DB + deadline），绝不 fail
+/// startup，也绝不自造"我是组合进程"布尔。
+pub(crate) fn composite_positive_ready() -> bool {
+    match (
+        astral_mq::local_bus::global_local_bus(),
+        astral_db::memory_projection_hub(),
+    ) {
+        (Some(bus), Some(hub)) => {
+            bus.owners_ready()
+                && hub.channel_is_healthy()
+                && astral_db::auxiliary_authorization_mirror().is_some()
+        }
+        _ => false,
+    }
+}
+
+/// JWT 全链路 admission 栅栏：token 解码后、任何会话事实 await 之前捕获
+/// 一次，`next.run` 之前**同栅栏复验**。栅栏失配一律 503 fail-closed；
+/// 绝不重采样 token、绝不按 claims/flag 重新推导放行。
+enum AuthorityFence {
+    /// 组合进程：hub 权威读栅栏。捕获值是 hub 在"无活跃 source writer、
+    /// 源未处于 unknown、健康/纪元未失效"时刻的 opaque 戳；复验通过才允许
+    /// 携带捕获期证明的 admission 进入下游。
+    Hub(astral_db::memory_projection_hub::AuthorityReadFence),
+    /// 独立进程（hub 未安装）：判定面只有全局会话 store（positive 镜像
+    /// 策略未安装 → Allow 只能来自 strict DB）。复验确认 hub 未在中途出现。
+    Standalone,
+}
+
+impl AuthorityFence {
+    /// 捕获点：session 判定之前调用恰好一次。hub 在位但栅栏不可用（活跃
+    /// writer / unknown 源 / 健康面失效）返回 `None`——此时 canonical
+    /// verifier 同样只会 `Unavailable`，语义一致。
+    fn capture() -> Option<Self> {
+        match astral_db::memory_projection_hub() {
+            Some(hub) => hub.capture_authority_fence().map(Self::Hub),
+            None => Some(Self::Standalone),
+        }
+    }
+
+    /// `next.run` 前的同栅栏复验：hub 戳必须仍然匹配（期间任何 source
+    /// writer begin/drop、纪元/健康推进都使旧戳失配）；独立进程必须仍是
+    /// 无 hub 形态。失配 = 捕获期权威事实不再可信 → 503，绝不续用。
+    fn still_valid(&self) -> bool {
+        match self {
+            Self::Hub(fence) => astral_db::memory_projection_hub()
+                .is_some_and(|hub| hub.authority_fence_matches(*fence)),
+            Self::Standalone => astral_db::memory_projection_hub().is_none(),
+        }
+    }
+}
+
+/// Step 6 租户状态检查模式（纯函数，fail-closed）。
+///
+/// `Warmed` = strict 会话判定 canonical verifier **实际返回 Allow**、claims
+/// 租户上下文与卡绑定一致、组合 positive 强条件在请求时刻复观测为真、且
+/// admission 栅栏为 hub 栅栏——此时 strict 会话 JOIN（tenant ×
+/// tenant_domain_map 均 ACTIVE，绑定完整）或其 verified-only 镜像命中已经
+/// 覆盖租户状态，跳过逐请求 duplicate tenant SQL。任一条件缺失即
+/// `StrictDeadline`（保留 strict DB 读取 + 硬 deadline）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TenantStatusMode {
+    Warmed,
+    StrictDeadline,
+}
+
+fn tenant_status_mode(
+    canonical_allow: bool,
+    claims_tenant_bound: bool,
+    composite_positive_ready: bool,
+    fence_is_hub: bool,
+) -> TenantStatusMode {
+    if canonical_allow && claims_tenant_bound && composite_positive_ready && fence_is_hub {
+        TenantStatusMode::Warmed
+    } else {
+        TenantStatusMode::StrictDeadline
+    }
+}
+
+/// claims 租户与**本次判定所用的 bind** 的卡/租户绑定一致性（纯函数）。
+///
+/// 跳过 duplicate tenant SQL 的绑定前提：claims 租户（tid）必须等于 bind
+/// 携带的租户，且 bind 真实携带 user_card（平台用户卡绑定）。两者不同——
+/// 即使仅在未来 bind 构造与 claims 解耦时才可能出现——一律拒绝快路径回落
+/// strict DB。durable 事实侧的 tenant 一致性由 canonical verifier 的
+/// 逐项绑定评估（Allow 即证明 fact tenant == bind tenant）承担，本检查
+/// 只钉住 claims ↔ bind 这一段。APP_USER（无卡绑定，tid None）不进本检查
+/// 所在分支，天然保留 DB 路径。
+fn claims_tenant_matches_bind(
+    tenant_id: Option<i64>,
+    bind: &astral_common::session_projection_store::SessionBindContext,
+) -> bool {
+    matches!(
+        (tenant_id, bind.user_card_id, bind.user_card_tenant_id),
+        (Some(tid), Some(card), Some(bound)) if bound == tid && card > 0
+    )
 }
 
 /// Versioned session grant stored at `access:grant:{jti}`.
@@ -589,111 +807,112 @@ fn internal_error(req: &Request, status: u16, message: &str, reason: &str) -> Re
     )
 }
 
+/// durable replay 声明：`auth_internal_request_guard` 上的 "purge 过期 +
+/// UNIQUE INSERT"（多节点安全；UNIQUE 约束即分布式互斥，TTL 由 expires_at
+/// 承载）。DB 不可用时返回 `Err` → 调用方 503 fail-closed，绝不本地放行。
 async fn claim_internal_replay(
     config: &AppConfig,
     input: &astral_common::middleware::internal_signature::InternalSignatureInput<'_>,
 ) -> Result<bool, ()> {
-    let mut conn = redis_conn_with_url(&config.redis_url).await?;
+    let Some(pool) = gateway_session_db() else {
+        return Err(());
+    };
     let key = astral_common::middleware::internal_signature::replay_key("gateway", input);
-    let result: Option<String> = tokio::time::timeout(
-        std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
-        redis::cmd("SET")
-            .arg(key)
-            .arg("1")
-            .arg("NX")
-            .arg("EX")
-            .arg(config.gateway.timestamp_tolerance_secs.max(60))
-            .query_async(&mut conn),
-    )
-    .await
-    .map_err(|_| ())?
-    .map_err(|_| ())?;
-    Ok(result.is_some())
+    let ttl = config.gateway.timestamp_tolerance_secs.max(60);
+    match astral_db::claim_replay_guard(pool, astral_db::GUARD_SCOPE_GATEWAY_REPLAY, &key, ttl)
+        .await
+    {
+        Ok(astral_db::GuardClaim::Claimed) => Ok(true),
+        Ok(astral_db::GuardClaim::Duplicate) => Ok(false),
+        Err(_) => Err(()),
+    }
 }
 
 async fn claim_internal_idempotency(
-    config: &AppConfig,
+    _config: &AppConfig,
     caller: &str,
     route: &str,
     key: &str,
     body_hash: &str,
 ) -> Result<InternalIdempotencyClaim, ()> {
-    let mut conn = redis_conn_with_url(&config.redis_url).await?;
-    let redis_key = astral_common::middleware::internal_signature::idempotency_key(
+    let Some(pool) = gateway_session_db() else {
+        return Err(());
+    };
+    let guard_key = astral_common::middleware::internal_signature::idempotency_key(
         "gateway", caller, route, key,
     );
-    let marker = format!("processing:{body_hash}");
-    let result: Option<String> = tokio::time::timeout(
-        std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
-        redis::cmd("SET")
-            .arg(&redis_key)
-            .arg(marker)
-            .arg("NX")
-            .arg("EX")
-            .arg(300)
-            .query_async(&mut conn),
+    // processing 标记 TTL 与历史 Redis 语义一致（300s in-flight 窗口）。
+    match astral_db::claim_idempotency_guard(
+        pool,
+        astral_db::GUARD_SCOPE_GATEWAY_IDEMPOTENCY,
+        &guard_key,
+        body_hash,
+        300,
     )
     .await
-    .map_err(|_| ())?
-    .map_err(|_| ())?;
-    if result.is_some() {
-        return Ok(InternalIdempotencyClaim::Claimed);
-    }
-    let existing: Option<String> = tokio::time::timeout(
-        std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
-        conn.get(&redis_key),
-    )
-    .await
-    .map_err(|_| ())?
-    .map_err(|_| ())?;
-    match existing.as_deref() {
-        Some(value) if value.ends_with(body_hash) => Ok(InternalIdempotencyClaim::Duplicate),
-        Some(_) => Err(()),
-        None => Err(()),
+    {
+        Ok(astral_db::GuardClaim::Claimed) => Ok(InternalIdempotencyClaim::Claimed),
+        Ok(astral_db::GuardClaim::Duplicate) => {
+            let marker = astral_db::load_guard_marker(
+                pool,
+                astral_db::GUARD_SCOPE_GATEWAY_IDEMPOTENCY,
+                &guard_key,
+            )
+            .await
+            .map_err(|_| ())?;
+            match astral_db::idempotency_marker_decision(marker.as_deref(), body_hash) {
+                Ok(astral_db::GuardClaim::Duplicate) => Ok(InternalIdempotencyClaim::Duplicate),
+                // 同 key 绑定不同请求体 / 行消失（并发 purge 竞态）→ 冲突拒绝。
+                // marker 判定不会产生 Claimed（仅声明路径返回），穷尽匹配兜底拒绝。
+                Ok(astral_db::GuardClaim::Claimed) | Err(_) => Err(()),
+            }
+        }
+        Err(_) => Err(()),
     }
 }
 
 pub(crate) async fn complete_internal_idempotency(
-    config: &AppConfig,
+    _config: &AppConfig,
     caller: &str,
     route: &str,
     key: &str,
     body_hash: &str,
 ) -> Result<(), ()> {
-    let mut conn = redis_conn_with_url(&config.redis_url).await?;
-    let redis_key = astral_common::middleware::internal_signature::idempotency_key(
+    let Some(pool) = gateway_session_db() else {
+        return Err(());
+    };
+    let guard_key = astral_common::middleware::internal_signature::idempotency_key(
         "gateway", caller, route, key,
     );
-    tokio::time::timeout(
-        std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
-        redis::cmd("SET")
-            .arg(redis_key)
-            .arg(format!("completed:{body_hash}"))
-            .arg("EX")
-            .arg(300)
-            .query_async::<()>(&mut conn),
+    astral_db::complete_idempotency_guard(
+        pool,
+        astral_db::GUARD_SCOPE_GATEWAY_IDEMPOTENCY,
+        &guard_key,
+        body_hash,
+        300,
     )
     .await
-    .map_err(|_| ())?
     .map_err(|_| ())
 }
 
 pub(crate) async fn release_internal_idempotency(
-    config: &AppConfig,
+    _config: &AppConfig,
     caller: &str,
     route: &str,
     key: &str,
 ) -> Result<(), ()> {
-    let mut conn = redis_conn_with_url(&config.redis_url).await?;
-    let redis_key = astral_common::middleware::internal_signature::idempotency_key(
+    let Some(pool) = gateway_session_db() else {
+        return Err(());
+    };
+    let guard_key = astral_common::middleware::internal_signature::idempotency_key(
         "gateway", caller, route, key,
     );
-    tokio::time::timeout(
-        std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
-        conn.del::<_, ()>(redis_key),
+    astral_db::release_idempotency_guard(
+        pool,
+        astral_db::GUARD_SCOPE_GATEWAY_IDEMPOTENCY,
+        &guard_key,
     )
     .await
-    .map_err(|_| ())?
     .map_err(|_| ())
 }
 
@@ -1085,89 +1304,35 @@ pub async fn jwt_auth_middleware(
         }
     };
 
+    // JWT 全链路 admission 栅栏捕获点：在任何会话事实 await 之前捕获一次。
+    // hub 在位但栅栏不可用（活跃 writer / unknown 源）时 canonical verifier
+    // 同样只会 Unavailable，此处提前 503 语义一致（fail-closed）。
+    let bind = session_bind_context(&claims);
+    let authority_fence = match AuthorityFence::capture() {
+        Some(fence) => fence,
+        None => {
+            return dependency_unavailable(req.method().as_str(), &path, request_trace_id(&req))
+        }
+    };
+    let fence_is_hub = matches!(authority_fence, AuthorityFence::Hub(_));
+
     // Any Bearer credential, including one on a public path, must represent a
     // live access session. Public paths only bypass authentication when no
     // credentials were supplied at all.
+    //
+    // canonical store verifier 的 Allow 是全 middleware 唯一可复用的会话/
+    // 租户复合证明源（strict JOIN 已含 tenant × tenant_domain_map ACTIVE +
+    // 完整绑定；镜像命中 verified-only + hub fanout 失效）；Redis 兼容
+    // adapter（显式 opt-in）分支不产生该证明，tenant 检查保持原路径。
+    let mut canonical_session_allow = false;
     {
-        let mut conn = match redis_conn_with_url(&config.redis_url).await {
-            Ok(conn) => conn,
-            Err(_) => {
-                return dependency_unavailable(req.method().as_str(), &path, request_trace_id(&req))
-            }
-        };
-        let revoked: bool = match tokio::time::timeout(
-            std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
-            conn.exists::<String, bool>(format!("jwt:revoked:{}", claims.jti)),
-        )
-        .await
+        // 单机组合进程加速器：进程内注册表命中即撤销（写入方是同进程
+        // Identity 的已证明撤销事实）。未命中/未安装一律继续下方权威检查，
+        // 不以注册表未命中推导 ACTIVE，fail-closed 语义不变。
+        if let Some(registry) =
+            astral_common::session_revocation_registry::global_session_revocation_registry()
         {
-            Ok(Ok(value)) => value,
-            _ => {
-                return dependency_unavailable(req.method().as_str(), &path, request_trace_id(&req))
-            }
-        };
-        if revoked {
-            return json_error(
-                req.method().as_str(),
-                &path,
-                request_trace_id(&req),
-                401,
-                "Token has been revoked",
-                "UNAUTHORIZED",
-                "TOKEN_REVOKED",
-            );
-        }
-
-        // 对齐 Java `JwtGlobalFilter`：
-        // 1) `access:jti:{jti}` 必须存在，且其标量值必须等于 JWT subject（OFF 模式同样强制值比对，
-        //    防止"投影残留/改写后仅剩 key"绕过撤销语义）；
-        // 2) 非 OFF 模式下读取 `access:grant:{jti}` 并校验版本化会话字段；
-        //    REQUIRE 模式下校验必须通过（fail-closed），EMIT 模式读取失败 fail-closed 但校验结果不阻塞。
-        let scalar: Option<String> = match tokio::time::timeout(
-            std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
-            conn.get::<_, Option<String>>(format!("access:jti:{}", claims.jti)),
-        )
-        .await
-        {
-            Ok(Ok(value)) => value,
-            _ => {
-                return dependency_unavailable(req.method().as_str(), &path, request_trace_id(&req))
-            }
-        };
-        let scalar_live = scalar
-            .as_deref()
-            .is_some_and(|value| value == claims.sub.as_str());
-        if !scalar_live {
-            return json_error(
-                req.method().as_str(),
-                &path,
-                request_trace_id(&req),
-                401,
-                "Access session not found",
-                "UNAUTHORIZED",
-                "SESSION_NOT_FOUND",
-            );
-        }
-
-        let mode = config.session_grant_claims_mode.to_uppercase();
-        if mode == "EMIT" || mode == "REQUIRE" {
-            let grant_json: Option<String> = match tokio::time::timeout(
-                std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
-                conn.get::<_, Option<String>>(format!("access:grant:{}", claims.jti)),
-            )
-            .await
-            {
-                Ok(Ok(value)) => value,
-                _ => {
-                    return dependency_unavailable(
-                        req.method().as_str(),
-                        &path,
-                        request_trace_id(&req),
-                    )
-                }
-            };
-            let outcome = verify_session_grant(&claims, grant_json.as_deref());
-            if mode == "REQUIRE" && !matches!(outcome, GrantOutcome::Match) {
+            if registry.is_revoked(&claims.jti) {
                 return json_error(
                     req.method().as_str(),
                     &path,
@@ -1178,7 +1343,160 @@ pub async fn jwt_auth_middleware(
                     "TOKEN_REVOKED",
                 );
             }
-            // EMIT：grant 读取失败已在上面 fail-closed；校验结果不阻塞（对齐 Java）。
+        }
+        if astral_common::session_projection_store::global_session_projection_store().is_some() {
+            // Redis-free 默认路径：strict MySQL durable facts（可选已证明镜像
+            // 加速）。Allow 仅来自逐项绑定的 durable/已证明事实；Deny/未命中/
+            // suspect/DB 错误分别映射 401/503，绝不降级放行。
+            match astral_db::verify_access_via_global_store(&claims.jti, &bind).await {
+                SessionProjectionDecision::Allow => {
+                    canonical_session_allow = true;
+                }
+                SessionProjectionDecision::Deny(reason) => {
+                    let message = match reason {
+                        "TOKEN_REVOKED" => "Token has been revoked",
+                        "SESSION_NOT_FOUND" => "Access session not found",
+                        _ => "Access session state rejected",
+                    };
+                    return json_error(
+                        req.method().as_str(),
+                        &path,
+                        request_trace_id(&req),
+                        401,
+                        message,
+                        "UNAUTHORIZED",
+                        reason,
+                    );
+                }
+                SessionProjectionDecision::Unavailable => {
+                    return dependency_unavailable(
+                        req.method().as_str(),
+                        &path,
+                        request_trace_id(&req),
+                    )
+                }
+            }
+        } else if gateway_redis_adapter_installed() {
+            // Redis 兼容 adapter（default-off，显式配置时才装配；feature-off
+            // 构建中本分支整体不存在，`gateway_redis_adapter_installed()` 恒
+            // false，与 adapter 未装配时的默认路径一致）。
+            // 1) `jwt:revoked:{jti}` 黑名单命中即拒；
+            // 2) `access:jti:{jti}` 必须存在，且其标量值必须等于 JWT subject
+            //    （强制值比对，防止"投影残留/改写后仅剩 key"绕过撤销语义）；
+            // 3) 非 OFF 模式下读取 `access:grant:{jti}` 并校验版本化会话字段；
+            //    REQUIRE 模式下校验必须通过（fail-closed），EMIT 模式读取失败
+            //    fail-closed 但校验结果不阻塞。
+            #[cfg(feature = "redis-compat")]
+            {
+                let mut conn = match redis_conn_with_url(&config.redis_url).await {
+                    Ok(conn) => conn,
+                    Err(_) => {
+                        return dependency_unavailable(
+                            req.method().as_str(),
+                            &path,
+                            request_trace_id(&req),
+                        )
+                    }
+                };
+                let revoked: bool = match tokio::time::timeout(
+                    std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
+                    conn.exists::<String, bool>(format!("jwt:revoked:{}", claims.jti)),
+                )
+                .await
+                {
+                    Ok(Ok(value)) => value,
+                    _ => {
+                        return dependency_unavailable(
+                            req.method().as_str(),
+                            &path,
+                            request_trace_id(&req),
+                        )
+                    }
+                };
+                if revoked {
+                    return json_error(
+                        req.method().as_str(),
+                        &path,
+                        request_trace_id(&req),
+                        401,
+                        "Token has been revoked",
+                        "UNAUTHORIZED",
+                        "TOKEN_REVOKED",
+                    );
+                }
+
+                let scalar: Option<String> = match tokio::time::timeout(
+                    std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
+                    conn.get::<_, Option<String>>(format!("access:jti:{}", claims.jti)),
+                )
+                .await
+                {
+                    Ok(Ok(value)) => value,
+                    _ => {
+                        return dependency_unavailable(
+                            req.method().as_str(),
+                            &path,
+                            request_trace_id(&req),
+                        )
+                    }
+                };
+                let scalar_live = scalar
+                    .as_deref()
+                    .is_some_and(|value| value == claims.sub.as_str());
+                if !scalar_live {
+                    return json_error(
+                        req.method().as_str(),
+                        &path,
+                        request_trace_id(&req),
+                        401,
+                        "Access session not found",
+                        "UNAUTHORIZED",
+                        "SESSION_NOT_FOUND",
+                    );
+                }
+
+                let mode = config.session_grant_claims_mode.to_uppercase();
+                if mode == "EMIT" || mode == "REQUIRE" {
+                    let grant_json: Option<String> = match tokio::time::timeout(
+                        std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
+                        conn.get::<_, Option<String>>(format!("access:grant:{}", claims.jti)),
+                    )
+                    .await
+                    {
+                        Ok(Ok(value)) => value,
+                        _ => {
+                            return dependency_unavailable(
+                                req.method().as_str(),
+                                &path,
+                                request_trace_id(&req),
+                            )
+                        }
+                    };
+                    let outcome = verify_session_grant(&claims, grant_json.as_deref());
+                    if mode == "REQUIRE" && !matches!(outcome, GrantOutcome::Match) {
+                        return json_error(
+                            req.method().as_str(),
+                            &path,
+                            request_trace_id(&req),
+                            401,
+                            "Token has been revoked",
+                            "UNAUTHORIZED",
+                            "TOKEN_REVOKED",
+                        );
+                    }
+                    // EMIT：grant 读取失败已在上面 fail-closed；校验结果不阻塞（对齐 Java）。
+                }
+            }
+            #[cfg(not(feature = "redis-compat"))]
+            {
+                tracing::debug!(
+                    "redis projection adapter branch requires the redis-compat feature; adapter is never installed without it"
+                );
+            }
+        } else {
+            // 未装配任何会话判定面（strict MySQL 与兼容 adapter 均缺）：无
+            // 权威事实可用，fail-closed 拒绝（503，对齐依赖不可用语义）。
+            return dependency_unavailable(req.method().as_str(), &path, request_trace_id(&req));
         }
     }
 
@@ -1287,9 +1605,7 @@ pub async fn jwt_auth_middleware(
 
     // Step 4.7: X-Request-Id / X-Trace-Id 透传
     if !req.headers().contains_key("x-request-id") {
-        if let Ok(v) =
-            HeaderValue::from_str(&format!("req-{}", &claims.jti[..8.min(claims.jti.len())]))
-        {
+        if let Ok(v) = HeaderValue::from_str(&format!("req-{}", uuid::Uuid::new_v4())) {
             req.headers_mut()
                 .insert(HeaderName::from_static("x-request-id"), v);
         }
@@ -1319,36 +1635,98 @@ pub async fn jwt_auth_middleware(
         }
     }
 
-    // Step 6: 受保护请求必须成功获取最新租户状态；Redis 故障时拒绝访问。
+    // Step 6: 租户状态检查（SUSPENDED / TERMINATED → 拒绝）。
+    // Warmed 快路径：strict 会话判定 canonical verifier **实际 Allow**（strict
+    // JOIN 已含 tenant × tenant_domain_map ACTIVE 与完整卡/租户绑定；镜像命中
+    // 为 verified-only + hub fanout 失效面）、claims 卡/租户绑定一致、组合
+    // positive 强条件逐请求复观测为真——此时租户状态已被会话复合 ALLOW 事实
+    // 覆盖，跳过逐请求 duplicate tenant SQL（warmed 会话检查零 DB）。APP_USER
+    // 无卡绑定（tenant_id None）天然进不了本快路径。任一条件缺失即保留
+    // strict DB 读取并加硬 deadline（超时 503）；仅按 claims/flag 跳过是被
+    // 禁止的。兼容 adapter（显式 opt-in）保留历史 Redis 缓存路径。
     if let Some(tid) = tenant_id {
-        let tid_str = tid.to_string();
-        let cached_status = match fetch_cached_tenant_status(&tid_str, &config.redis_url).await {
-            Ok(Some(status)) => status,
-            Ok(None) => {
-                tracing::warn!(tenant_id = %tid_str, "tenant status cache missing");
-                return dependency_unavailable(
-                    req.method().as_str(),
-                    &path,
-                    request_trace_id(&req),
-                );
+        let claims_tenant_bound = claims_tenant_matches_bind(Some(tid), &bind);
+        match tenant_status_mode(
+            canonical_session_allow,
+            claims_tenant_bound,
+            composite_positive_ready(),
+            fence_is_hub,
+        ) {
+            TenantStatusMode::Warmed => {}
+            TenantStatusMode::StrictDeadline => {
+                let tid_str = tid.to_string();
+                let cached_status: Option<String> = if let Some(pool) = gateway_session_db() {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(TENANT_STATUS_DEADLINE_SECS),
+                        astral_db::load_tenant_status_strict(pool, tid),
+                    )
+                    .await
+                    {
+                        Ok(Ok(status)) => status,
+                        Ok(Err(_)) | Err(_) => {
+                            return dependency_unavailable(
+                                req.method().as_str(),
+                                &path,
+                                request_trace_id(&req),
+                            )
+                        }
+                    }
+                } else if gateway_redis_adapter_installed() {
+                    #[cfg(feature = "redis-compat")]
+                    {
+                        match fetch_cached_tenant_status(&tid_str, &config.redis_url).await {
+                            Ok(status) => status,
+                            Err(_) => {
+                                return dependency_unavailable(
+                                    req.method().as_str(),
+                                    &path,
+                                    request_trace_id(&req),
+                                )
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "redis-compat"))]
+                    {
+                        unreachable!("redis adapter branch requires the redis-compat feature")
+                    }
+                } else {
+                    return dependency_unavailable(
+                        req.method().as_str(),
+                        &path,
+                        request_trace_id(&req),
+                    );
+                };
+                let Some(status) = cached_status else {
+                    tracing::warn!(tenant_id = %tid_str, "tenant status unavailable");
+                    return dependency_unavailable(
+                        req.method().as_str(),
+                        &path,
+                        request_trace_id(&req),
+                    );
+                };
+                let upper = status.to_uppercase();
+                if upper == "SUSPENDED" || upper == "TERMINATED" {
+                    tracing::warn!(tenant_id = %tid_str, tenant_status = %upper, "tenant status check: rejected");
+                    return json_error(
+                        req.method().as_str(),
+                        &path,
+                        request_trace_id(&req),
+                        401,
+                        &format!("Tenant is {upper}"),
+                        "UNAUTHORIZED",
+                        "TENANT_NOT_ACTIVE",
+                    );
+                }
             }
-            Err(_) => {
-                return dependency_unavailable(req.method().as_str(), &path, request_trace_id(&req))
-            }
-        };
-        let upper = cached_status.to_uppercase();
-        if upper == "SUSPENDED" || upper == "TERMINATED" {
-            tracing::warn!(tenant_id = %tid_str, tenant_status = %upper, "tenant status check (redis): rejected");
-            return json_error(
-                req.method().as_str(),
-                &path,
-                request_trace_id(&req),
-                401,
-                &format!("Tenant is {upper}"),
-                "UNAUTHORIZED",
-                "TENANT_NOT_ACTIVE",
-            );
         }
+    }
+
+    // 同栅栏复验（final）：捕获期的 hub 权威戳必须仍然匹配（期间任何 source
+    // writer begin/drop、纪元/健康推进都使旧戳失配）；独立进程必须仍无 hub。
+    // 失配 = 捕获期权威事实不再可信 → 503 fail-closed。绝不重采样 token、
+    // 绝不按 claims/flag 重新推导放行。
+    if !authority_fence.still_valid() {
+        return dependency_unavailable(req.method().as_str(), &path, request_trace_id(&req));
     }
 
     next.run(req).await
@@ -1449,6 +1827,26 @@ fn dependency_unavailable(method: &str, path: &str, trace_id: Option<&str>) -> R
 mod tests {
     use super::*;
     use astral_common::token_contract::CLAIMS_VERSION;
+
+    /// Redis-free strict 判定的绑定上下文必须与 JWT claims 逐项对应；
+    /// principal_kind 不可解析时映射为空串（durable 评估 fail-closed 拒绝）。
+    #[test]
+    fn session_bind_context_maps_claims_verbatim() {
+        let mapped = session_bind_context(&claims("42"));
+        assert_eq!(mapped.user_id, 42);
+        assert_eq!(mapped.session_id, 1);
+        assert_eq!(mapped.session_epoch, 1);
+        assert_eq!(mapped.token_family_id, 1);
+        assert_eq!(mapped.principal_kind, "PLATFORM_USER");
+        assert_eq!(mapped.identity_card_id, Some(10));
+        assert_eq!(mapped.user_card_id, Some(40));
+        assert_eq!(mapped.user_card_tenant_id, Some(20));
+        assert_eq!(mapped.user_card_domain_id, Some(30));
+
+        let mut unknown = claims("42");
+        unknown.principal_kind = "SOMETHING_ELSE".into();
+        assert_eq!(session_bind_context(&unknown).principal_kind, "");
+    }
 
     fn claims(sub: &str) -> JwtClaims {
         JwtClaims {
@@ -1632,6 +2030,7 @@ mod tests {
         assert_eq!(response.headers().get("Retry-After").unwrap(), "3");
     }
 
+    #[cfg(feature = "redis-compat")]
     #[tokio::test]
     async fn redis_failures_are_visible_to_protected_check_seam() {
         assert!(redis_conn_with_url("redis://localhost:1").await.is_err());
@@ -1977,5 +2376,121 @@ mod tests {
         assert!(RouteCredentialPolicy::PublicOnly.accepts(None));
         assert!(RouteCredentialPolicy::PublicOnly.accepts(Some(TokenUse::Access)));
         assert!(!RouteCredentialPolicy::PublicOnly.accepts(Some(TokenUse::Refresh)));
+    }
+
+    // ---- gateway-read-final：租户检查模式与 admission 栅栏契约 -------------
+
+    /// 源形状断言只检查生产代码（截去本测试模块，防止锚点命中测试自身）。
+    fn source_without_tests() -> &'static str {
+        include_str!("middleware.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("test module marker must exist")
+    }
+
+    /// 跳过 duplicate tenant SQL 的资格是**全有或全无**的证明束：canonical
+    /// Allow、claims 卡/租户绑定、组合强条件复观测、hub 栅栏缺一即回落
+    /// strict DB + deadline。仅按 claims/flag 跳过被本钉子拒绝。
+    #[test]
+    fn tenant_status_mode_requires_the_full_proof_bundle() {
+        let warmed = tenant_status_mode(true, true, true, true);
+        assert_eq!(warmed, TenantStatusMode::Warmed);
+        for (allow, bound, composite, hub) in [
+            (false, true, true, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, false),
+            (false, false, false, false),
+        ] {
+            assert_eq!(
+                tenant_status_mode(allow, bound, composite, hub),
+                TenantStatusMode::StrictDeadline,
+                "any missing proof must keep strict DB tenant checks"
+            );
+        }
+    }
+
+    /// 非组合进程（测试进程未安装 LocalBus/hub）恒为 false：强条件是观测
+    /// 事实，绝不是恒真布尔；standalone 因此永远走 strict DB + deadline。
+    #[test]
+    fn composite_positive_ready_is_false_without_observed_composite_state() {
+        assert!(astral_mq::local_bus::global_local_bus().is_none());
+        assert!(astral_db::memory_projection_hub().is_none());
+        assert!(!composite_positive_ready());
+    }
+
+    /// 卡/租户绑定一致性：claims 租户必须等于本次判定 bind 携带的租户，且
+    /// bind 真实携带正 user_card。claims 租户与 bind 租户漂移（bind 构造
+    /// 与 claims 解耦时的形态）、卡缺失/非正、租户缺失一律拒绝快路径，
+    /// 保留 strict DB + deadline。
+    #[test]
+    fn tenant_skip_binding_requires_claims_tenant_to_match_bind_tenant() {
+        let bind = session_bind_context(&claims("42"));
+        let tenant_id = optional_tenant_id(&claims("42"))
+            .expect("platform claims carry tenant context")
+            .expect("platform tenant id present");
+        assert!(claims_tenant_matches_bind(Some(tenant_id), &bind));
+
+        let mut drifted = bind.clone();
+        drifted.user_card_tenant_id = Some(tenant_id + 10);
+        assert!(!claims_tenant_matches_bind(Some(tenant_id), &drifted));
+
+        let mut cardless = bind.clone();
+        cardless.user_card_id = None;
+        assert!(!claims_tenant_matches_bind(Some(tenant_id), &cardless));
+
+        let mut bad_card = bind.clone();
+        bad_card.user_card_id = Some(0);
+        assert!(!claims_tenant_matches_bind(Some(tenant_id), &bad_card));
+
+        assert!(!claims_tenant_matches_bind(None, &bind));
+    }
+
+    /// 无 hub 进程的栅栏形态：捕获成功（Standalone）且在无 hub 状态下复验
+    /// 通过；进程内出现 hub 后同一栅栏立即失配（fail-closed，不续用）。
+    #[test]
+    fn standalone_fence_captures_and_reverifies_without_hub() {
+        assert!(astral_db::memory_projection_hub().is_none());
+        let fence = AuthorityFence::capture().expect("standalone capture must succeed");
+        assert!(matches!(fence, AuthorityFence::Standalone));
+        assert!(fence.still_valid());
+    }
+
+    /// JWT admission 栅栏的源形状钉子：捕获点先于 canonical 会话判定，判定
+    /// 先于 Step 6 租户模式决策，`next.run` 前必须同栅栏复验；栅栏捕获之后
+    /// 不允许再出现 token 重采样（decode 只发生在捕获之前）。strict tenant
+    /// 路径必须带硬 deadline。
+    #[test]
+    fn jwt_admission_fences_order_capture_verify_reverify_before_next_run() {
+        let source = source_without_tests();
+        let capture = source
+            .find("let authority_fence = match AuthorityFence::capture()")
+            .expect("admission fence capture must exist before session facts");
+        let session_verify = source
+            .find("verify_access_via_global_store(")
+            .expect("canonical session verifier must remain");
+        let tenant_mode = source
+            .find("match tenant_status_mode(")
+            .expect("tenant status mode decision must remain");
+        let reverify = source
+            .find("authority_fence.still_valid()")
+            .expect("same-fence reverify must exist");
+        let final_next = source
+            .rfind("next.run(req).await")
+            .expect("a final next.run must exist");
+        assert!(capture < session_verify);
+        assert!(session_verify < tenant_mode);
+        assert!(tenant_mode < reverify && reverify < final_next);
+        // 栅栏捕获之后绝不再解码 token（无重采样）。
+        let last_decode = source
+            .rfind("decode_v2_token(")
+            .expect("token decode must exist exactly on the admission path");
+        assert!(
+            last_decode < capture,
+            "token must be decoded once, before the fence capture"
+        );
+        // strict tenant 路径保留且带硬 deadline。
+        assert!(source.contains("load_tenant_status_strict("));
+        assert!(source.contains("TENANT_STATUS_DEADLINE_SECS"));
     }
 }

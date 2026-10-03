@@ -1483,7 +1483,7 @@ pub(crate) async fn complete_publish(
     // 失败发生在任何 durable 写之前。
     cmd.publication.validate().map_err(org_err)?;
 
-    let mut tx = begin_tx(store.pool()).await?;
+    let (mut tx, authority_guard) = begin_authority_tx(store.pool()).await?;
     let event = sqlx::query(OUTBOX_LOCK_LEASED_SQL)
         .bind(cmd.org_event_id)
         .bind(&cmd.worker_owner)
@@ -1614,7 +1614,9 @@ pub(crate) async fn complete_publish(
             // already sealed evidence is byte-identical at this generation.
             complete_event_terminal(&mut tx, cmd, &token_hash, &row_event_kind).await?;
             let cas_version: i64 = existing.try_get("cas_version").map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
+            commit_authority_tx(tx, authority_guard)
+                .await
+                .map_err(db_err)?;
             return Ok(OrgPublishOutcome {
                 publication_id: existing.try_get("publication_id").map_err(db_err)?,
                 generation: cmd.publication.generation,
@@ -1692,7 +1694,9 @@ pub(crate) async fn complete_publish(
         .await
         .map_err(db_err)?;
     let cas_version: i64 = pointer.try_get("cas_version").map_err(db_err)?;
-    tx.commit().await.map_err(db_err)?;
+    commit_authority_tx(tx, authority_guard)
+        .await
+        .map_err(db_err)?;
     Ok(OrgPublishOutcome {
         publication_id,
         generation: cmd.publication.generation,
@@ -1834,7 +1838,7 @@ pub(crate) async fn propagate_subtree_root(
             "code=org_scope.propagate_batch_invalid".into(),
         ));
     }
-    let mut tx = begin_tx(store.pool()).await?;
+    let (mut tx, authority_guard) = begin_authority_tx(store.pool()).await?;
     // 1) 先锁并校验 leased 事件（status/owner/token 摘要/未过期 + 精确 kind），
     //    先于锚点/子节点任何锁定与写入。
     let event = sqlx::query(OUTBOX_LOCK_LEASED_FOR_PROPAGATE_SQL)
@@ -1894,7 +1898,9 @@ pub(crate) async fn propagate_subtree_root(
                 ORG_PROPAGATE_SUPERSESSION_UNPROVEN_CODE.into(),
             ));
         }
-        tx.commit().await.map_err(db_err)?;
+        commit_authority_tx(tx, authority_guard)
+            .await
+            .map_err(db_err)?;
         return Ok(OrgSubtreePropagateOutcome {
             updated_tenant_ids: Vec::new(),
             next_frontier: Vec::new(),
@@ -1970,7 +1976,9 @@ pub(crate) async fn propagate_subtree_root(
         )
         .await?;
     }
-    tx.commit().await.map_err(db_err)?;
+    commit_authority_tx(tx, authority_guard)
+        .await
+        .map_err(db_err)?;
     // 选中数 == batch_limit 时绝不定 done：同锚点可能仍有未 drain 的兄弟，必须
     // 以同一事件重入；空轮（0 < limit）或部分轮给出完成证明。
     let done = (selected.len() as i64) < cmd.batch_limit;
@@ -2001,7 +2009,7 @@ pub(crate) async fn propagate_dependency_change(
         ));
     }
     let token_hash = worker_token_hash(&decode_worker_token(&cmd.worker_token_hex)?);
-    let mut tx = begin_tx(store.pool()).await?;
+    let (mut tx, authority_guard) = begin_authority_tx(store.pool()).await?;
     let event = sqlx::query(OUTBOX_LOCK_LEASED_FOR_DEPENDENCY_SQL)
         .bind(cmd.org_event_id)
         .bind(&cmd.worker_owner)
@@ -2075,7 +2083,9 @@ pub(crate) async fn propagate_dependency_change(
                 ORG_DEPENDENCY_PROPAGATE_SUPERSESSION_UNPROVEN_CODE.into(),
             ));
         }
-        tx.commit().await.map_err(db_err)?;
+        commit_authority_tx(tx, authority_guard)
+            .await
+            .map_err(db_err)?;
         return Ok(OrgDependencyPropagateOutcome {
             updated_tenant_ids: Vec::new(),
             done: true,
@@ -2175,7 +2185,9 @@ pub(crate) async fn propagate_dependency_change(
         )
         .await?;
     }
-    tx.commit().await.map_err(db_err)?;
+    commit_authority_tx(tx, authority_guard)
+        .await
+        .map_err(db_err)?;
     Ok(OrgDependencyPropagateOutcome {
         done: (updated_tenant_ids.len() as i64) < cmd.batch_limit,
         updated_tenant_ids,

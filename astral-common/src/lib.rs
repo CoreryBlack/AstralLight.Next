@@ -5,6 +5,7 @@
 pub mod audit;
 pub mod config;
 pub mod contract;
+pub mod cross_city_runtime;
 pub mod cross_city_signature;
 pub mod error;
 #[cfg(any(feature = "e3-observability", feature = "e4-observability", test))]
@@ -12,11 +13,18 @@ pub mod experiment_observation;
 pub mod metrics_runtime;
 pub mod middleware;
 pub mod service;
+pub mod session_projection_store;
+pub mod session_revocation_registry;
 pub mod token_contract;
 pub mod tracing;
 
 pub use astral_types::ResourceRegistry;
+pub use cross_city_runtime::{
+    CrossCityActivationAdmission, CrossCityRuntimeGate, InMemoryCrossCityNodeKeyResolver,
+    InMemoryCrossCityReplayGuard, UnavailableCrossCityReplayGuard,
+};
 pub use cross_city_signature::{
+    authenticate_zero_decision_evidence, CrossCityAuthenticatedEvidence,
     CrossCityEvidenceReplayKey, CrossCityNodeIdentity, CrossCitySignatureError,
     CrossCityVerifiedEvidence,
 };

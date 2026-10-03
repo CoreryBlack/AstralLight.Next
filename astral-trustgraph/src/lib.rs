@@ -46,7 +46,10 @@ use service::template_service::TemplateService;
 use service::tenant_service::TenantService;
 use service::user_card_service::UserCardService;
 
-pub use runtime::{run, run_with_listen_addr};
+pub use runtime::{
+    run, run_with_listen_addr, run_with_listen_addr_and_shutdown,
+    run_with_listen_addr_and_shutdown_and_drain,
+};
 
 pub mod runtime;
 

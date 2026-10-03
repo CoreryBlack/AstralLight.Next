@@ -3,14 +3,42 @@
 //! 编排与 record→DTO 映射在 `OrgService`，HTTP 层仅解析路径参数并包装响应。
 
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 
 use astral_common::contract::{ApiResponse, EmptyResponse};
 use astral_common::error::AppError;
+use astral_types::AstralError;
 
+use crate::srv::org_repository::OrgMutationContext;
 use crate::srv::org_service::{Domain, Organization, Tenant};
 use crate::AppState;
+
+fn org_mutation_context(headers: &HeaderMap) -> Result<OrgMutationContext, AppError> {
+    let parse = |name: &'static str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                AppError(AstralError::Auth(format!(
+                    "Gateway-verified {name} is required for org mutation"
+                )))
+            })
+    };
+    OrgMutationContext::new(
+        parse("x-user-id")?,
+        parse("x-user-card-id")?,
+        parse("x-user-card-tenant-id")?,
+        parse("x-user-card-domain-id")?,
+        headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+    )
+    .map_err(AppError)
+}
 
 pub fn org_routes() -> Router<AppState> {
     Router::new()
@@ -51,10 +79,15 @@ async fn list_orgs(
 
 async fn create_org(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<Organization>,
 ) -> Result<Json<ApiResponse<Organization>>, AppError> {
+    let context = org_mutation_context(&headers)?;
     Ok(Json(ApiResponse::success(
-        state.org_service.create_org(&req).await?,
+        state
+            .org_service
+            .create_org_with_context(&req, &context)
+            .await?,
     )))
 }
 
@@ -69,18 +102,28 @@ async fn get_org(
 
 async fn update_org(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Json(req): Json<Organization>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.org_service.update_org(id, &req).await?;
+    let context = org_mutation_context(&headers)?;
+    state
+        .org_service
+        .update_org_with_context(id, &req, &context)
+        .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 
 async fn delete_org(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.org_service.delete_org(id).await?;
+    let context = org_mutation_context(&headers)?;
+    state
+        .org_service
+        .delete_org_with_context(id, &context)
+        .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 
@@ -103,10 +146,15 @@ async fn list_all_domains(
 
 async fn create_domain(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<Domain>,
 ) -> Result<Json<ApiResponse<Domain>>, AppError> {
+    let context = org_mutation_context(&headers)?;
     Ok(Json(ApiResponse::success(
-        state.org_service.create_domain(&req).await?,
+        state
+            .org_service
+            .create_domain_with_context(&req, &context)
+            .await?,
     )))
 }
 
@@ -121,18 +169,28 @@ async fn get_domain(
 
 async fn update_domain(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Json(req): Json<Domain>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.org_service.update_domain(id, &req).await?;
+    let context = org_mutation_context(&headers)?;
+    state
+        .org_service
+        .update_domain_with_context(id, &req, &context)
+        .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 
 async fn delete_domain(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.org_service.delete_domain(id).await?;
+    let context = org_mutation_context(&headers)?;
+    state
+        .org_service
+        .delete_domain_with_context(id, &context)
+        .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 
@@ -155,10 +213,15 @@ async fn list_all_tenants(
 
 async fn create_tenant(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<Tenant>,
 ) -> Result<Json<ApiResponse<Tenant>>, AppError> {
+    let context = org_mutation_context(&headers)?;
     Ok(Json(ApiResponse::success(
-        state.org_service.create_tenant(&req).await?,
+        state
+            .org_service
+            .create_tenant_with_context(&req, &context)
+            .await?,
     )))
 }
 
@@ -173,17 +236,27 @@ async fn get_tenant(
 
 async fn update_tenant(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Json(req): Json<Tenant>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.org_service.update_tenant(id, &req).await?;
+    let context = org_mutation_context(&headers)?;
+    state
+        .org_service
+        .update_tenant_with_context(id, &req, &context)
+        .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 
 async fn delete_tenant(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.org_service.delete_tenant(id).await?;
+    let context = org_mutation_context(&headers)?;
+    state
+        .org_service
+        .delete_tenant_with_context(id, &context)
+        .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }

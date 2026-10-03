@@ -822,7 +822,20 @@ fn apply_flat_env_overrides(cfg: &mut AppConfig) -> Result<(), config::ConfigErr
         Ok(entries)
     }
 
-    // 连接串（trim；scheme/主机策略由 validate_runtime_safety 统一校验）。
+    // Upstream URIs and connection strings (trim; scheme/host policy is checked
+    // by the relevant runtime owner). Empty overrides preserve YAML/defaults.
+    if let Some(value) = optional_env("LEARN_SERVICE_URI") {
+        cfg.learn_service_uri = value.trim().to_string();
+    }
+    if let Some(value) = optional_env("IDENTITY_SERVICE_URI") {
+        cfg.identity_service_uri = value.trim().to_string();
+    }
+    if let Some(value) = optional_env("TRUST_GRAPH_URI") {
+        cfg.trust_graph_uri = value.trim().to_string();
+    }
+    if let Some(value) = optional_env("MONITOR_SERVICE_URI") {
+        cfg.monitor_service_uri = value.trim().to_string();
+    }
     if let Some(value) = optional_env("DATABASE_URL") {
         cfg.database_url = value.trim().to_string();
     }
@@ -1400,6 +1413,10 @@ mod tests {
         "RUST_ENV",
         "ENVIRONMENT",
         // apply_flat_env_overrides 契约名。
+        "LEARN_SERVICE_URI",
+        "IDENTITY_SERVICE_URI",
+        "TRUST_GRAPH_URI",
+        "MONITOR_SERVICE_URI",
         "DATABASE_URL",
         "REDIS_URL",
         "RABBITMQ_URL",
@@ -2556,6 +2573,19 @@ cors:
     #[test]
     fn flat_env_config_overrides_reach_fields_and_fileless_learn_validation_passes() {
         let guard = FlatEnvGuard::acquire();
+        guard.set("LEARN_SERVICE_URI", " http://learn.example.invalid:9002 ");
+        guard.set(
+            "IDENTITY_SERVICE_URI",
+            " http://identity.example.invalid:9004 ",
+        );
+        guard.set(
+            "TRUST_GRAPH_URI",
+            " http://trustgraph.example.invalid:9005 ",
+        );
+        guard.set(
+            "MONITOR_SERVICE_URI",
+            " http://monitor.example.invalid:9006 ",
+        );
         guard.set(
             "DATABASE_URL",
             "mysql://db.example.invalid:3306/astral_test",
@@ -2605,6 +2635,22 @@ cors:
         );
         assert_eq!(config.redis_url, "redis://cache.example.invalid:6379/0");
         assert_eq!(config.rabbitmq_url, "amqps://mq.example.invalid:5671/%2f");
+        assert_eq!(
+            config.learn_service_uri,
+            "http://learn.example.invalid:9002"
+        );
+        assert_eq!(
+            config.identity_service_uri,
+            "http://identity.example.invalid:9004"
+        );
+        assert_eq!(
+            config.trust_graph_uri,
+            "http://trustgraph.example.invalid:9005"
+        );
+        assert_eq!(
+            config.monitor_service_uri,
+            "http://monitor.example.invalid:9006"
+        );
         assert_eq!(
             config.jwt.access.secret,
             "dist-access-override-secret-0123456789abcdef"
@@ -2686,6 +2732,10 @@ cors:
         fs::write(
             &yaml_path,
             r#"redis_url: "redis://yaml-fallback.example.invalid:6379/0"
+learn_service_uri: "http://yaml-learn.example.invalid:9002"
+identity_service_uri: "http://yaml-identity.example.invalid:9004"
+trust_graph_uri: "http://yaml-trustgraph.example.invalid:9005"
+monitor_service_uri: "http://yaml-monitor.example.invalid:9006"
 jwt:
   access:
     issuer: "yaml-access-issuer"
@@ -2738,6 +2788,22 @@ cors:
             vec!["https://yaml-origin.example.invalid".to_string()]
         );
         assert!(config.cors.allow_credentials);
+        assert_eq!(
+            config.learn_service_uri,
+            "http://yaml-learn.example.invalid:9002"
+        );
+        assert_eq!(
+            config.identity_service_uri,
+            "http://yaml-identity.example.invalid:9004"
+        );
+        assert_eq!(
+            config.trust_graph_uri,
+            "http://yaml-trustgraph.example.invalid:9005"
+        );
+        assert_eq!(
+            config.monitor_service_uri,
+            "http://yaml-monitor.example.invalid:9006"
+        );
         // env 覆盖的字段优先于 YAML。
         assert_eq!(
             config.database_url,
@@ -2765,6 +2831,19 @@ cors:
             "mysql://db.example.invalid:3306/astral_test",
         );
         guard.set("REDIS_URL", "redis://cache.example.invalid:6379/0");
+        guard.set("LEARN_SERVICE_URI", "http://env-learn.example.invalid:9002");
+        guard.set(
+            "IDENTITY_SERVICE_URI",
+            "http://env-identity.example.invalid:9004",
+        );
+        guard.set(
+            "TRUST_GRAPH_URI",
+            "http://env-trustgraph.example.invalid:9005",
+        );
+        guard.set(
+            "MONITOR_SERVICE_URI",
+            "http://env-monitor.example.invalid:9006",
+        );
         guard.set("RABBITMQ_URL", "amqps://mq.example.invalid:5671/%2f");
         guard.set(
             "JWT_ACCESS_SECRET",
@@ -2796,6 +2875,22 @@ cors:
         let config = AppConfig::from_env_for(JwtValidationRole::Gateway)
             .expect("gateway role with the explicit flat env contract must pass validation");
 
+        assert_eq!(
+            config.learn_service_uri,
+            "http://env-learn.example.invalid:9002"
+        );
+        assert_eq!(
+            config.identity_service_uri,
+            "http://env-identity.example.invalid:9004"
+        );
+        assert_eq!(
+            config.trust_graph_uri,
+            "http://env-trustgraph.example.invalid:9005"
+        );
+        assert_eq!(
+            config.monitor_service_uri,
+            "http://env-monitor.example.invalid:9006"
+        );
         assert_eq!(
             config.gateway.hmac_secret,
             "gateway-hmac-override-secret-0123456789"

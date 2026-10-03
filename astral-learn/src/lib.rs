@@ -1,6 +1,7 @@
 //! AstralLight 教育域业务服务
 
 pub mod access;
+pub mod ownership;
 pub mod repository;
 pub mod service;
 pub mod srv;

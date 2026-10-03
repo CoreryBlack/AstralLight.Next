@@ -13,7 +13,7 @@ use axum::body::Body;
 use axum::extract::{Path, Request, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
@@ -45,6 +45,9 @@ static CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::n
 });
 
 const UPSTREAM_WS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Bounded collection cap for JSON/HTTP upstream responses. Large media and
+/// streaming endpoints need an explicit streaming proxy contract before widening.
+const MAX_UPSTREAM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Client Bearer credentials are needed by Identity's session handlers, but
 /// must not become a general-purpose downstream credential forwarding path.
@@ -59,10 +62,81 @@ fn is_canonical_session_bearer_route(method: &axum::http::Method, path: &str) ->
         )
 }
 
+fn is_public_identity_empty_bootstrap(method: &axum::http::Method, path: &str) -> bool {
+    *method == axum::http::Method::POST
+        && (matches!(
+            path,
+            "/api/v1/auth/sessions"
+                | "/api/v1/auth/register"
+                | "/api/v1/auth/password/forgot"
+                | "/api/v1/auth/password/reset/token"
+                | "/api/v1/auth/verification/send"
+                | "/api/v1/auth/verification/verify"
+                | "/v1/app/users/login"
+        ) || path
+            .strip_prefix("/api/v1/auth/password/reset/")
+            .is_some_and(|token| !token.is_empty() && !token.contains('/')))
+}
+
 fn is_non_empty_bearer(value: &str) -> bool {
     value
         .strip_prefix("Bearer ")
         .is_some_and(|token| !token.trim().is_empty())
+}
+
+fn configured_service_uri_from_values(env_value: Option<&str>, configured: &str) -> String {
+    env_value
+        .filter(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or_else(|| configured.trim())
+        .to_string()
+}
+
+fn configured_service_uri(env_name: &str, configured: &str) -> String {
+    let env_value = std::env::var(env_name).ok();
+    configured_service_uri_from_values(env_value.as_deref(), configured)
+}
+
+async fn collect_bounded_response_body<S, E>(
+    chunks: S,
+    declared_length: Option<u64>,
+    limit: usize,
+) -> Result<bytes::Bytes, BoundedBodyError>
+where
+    S: Stream<Item = Result<bytes::Bytes, E>>,
+{
+    if declared_length.is_some_and(|length| length > limit as u64) {
+        return Err(BoundedBodyError::TooLarge);
+    }
+
+    let mut body = bytes::BytesMut::new();
+    let mut chunks = Box::pin(chunks);
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|_| BoundedBodyError::Read)?;
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(BoundedBodyError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedBodyError {
+    TooLarge,
+    Read,
+}
+
+async fn collect_upstream_response_body(
+    response: reqwest::Response,
+) -> Result<bytes::Bytes, BoundedBodyError> {
+    let declared_length = response.content_length();
+    collect_bounded_response_body(
+        response.bytes_stream(),
+        declared_length,
+        MAX_UPSTREAM_RESPONSE_BYTES,
+    )
+    .await
 }
 
 fn should_forward_client_header(
@@ -74,6 +148,37 @@ fn should_forward_client_header(
     if key.eq_ignore_ascii_case("authorization") {
         return is_canonical_session_bearer_route(method, path)
             && value.to_str().is_ok_and(is_non_empty_bearer);
+    }
+    if is_public_identity_empty_bootstrap(method, path)
+        && crate::middleware::is_sensitive_auth_header(key)
+    {
+        return false;
+    }
+    if is_canonical_session_bearer_route(method, path)
+        && matches!(
+            key.to_ascii_lowercase().as_str(),
+            "x-gateway-auth"
+                | "x-gateway-ts"
+                | "x-gateway-signature"
+                | "x-original-path"
+                | "x-user-id"
+                | "x-principal-kind"
+                | "x-token-id"
+                | "x-identity-card-id"
+                | "x-user-card-id"
+                | "x-user-card-domain-id"
+                | "x-user-card-tenant-id"
+                | "x-token-use"
+                | "x-claims-version"
+                | "x-action-codes"
+                | "x-user-roles"
+                | "x-template-id"
+                | "x-tenant-status"
+                | "x-perms-ref"
+                | "x-permissions-truncated"
+        )
+    {
+        return false;
     }
     !crate::middleware::is_proxy_forbidden_header(key)
 }
@@ -173,7 +278,8 @@ pub async fn forward_to_learn_admin(
         );
     }
     let full_path = format!("/v1/admin/learn/{path}");
-    let response = forward(&config, &config.learn_service_uri, &full_path, req).await;
+    let learn_uri = config.learn_service_uri.as_str();
+    let response = forward(&config, learn_uri, &full_path, req).await;
     if dependency_failure(response.status()) {
         CB_LEARN.record_failure();
     } else {
@@ -200,7 +306,8 @@ pub async fn forward_to_learn_app(
         );
     }
     let full_path = format!("/v1/app/learn/{path}");
-    let response = forward(&config, &config.learn_service_uri, &full_path, req).await;
+    let learn_uri = config.learn_service_uri.as_str();
+    let response = forward(&config, learn_uri, &full_path, req).await;
     if dependency_failure(response.status()) {
         CB_LEARN.record_failure();
     } else {
@@ -245,7 +352,8 @@ async fn forward_identity_path(config: AppConfig, full_path: String, req: Reques
             "SERVICE_UNAVAILABLE",
         );
     }
-    let response = forward(&config, &config.identity_service_uri, &full_path, req).await;
+    let identity_uri = config.identity_service_uri.as_str();
+    let response = forward(&config, identity_uri, &full_path, req).await;
     if dependency_failure(response.status()) {
         CB_IDENTITY.record_failure();
     } else {
@@ -349,14 +457,13 @@ pub async fn forward_internal_session(State(config): State<AppConfig>, req: Requ
         route: ROUTE_GATEWAY_TO_IDENTITY,
     };
     let signature = compute_internal_signature(&config.gateway.internal_service_secret, &input);
+    let identity_service_uri = config.identity_service_uri.as_str();
     let uri = format!(
         "{}{}",
-        config.identity_service_uri.trim_end_matches('/'),
+        identity_service_uri.trim_end_matches('/'),
         INTERNAL_SESSION_PATH
     );
-    if config.identity_service_uri.trim().is_empty()
-        || config.gateway.internal_service_secret.len() < 32
-    {
+    if identity_service_uri.trim().is_empty() || config.gateway.internal_service_secret.len() < 32 {
         return json_error(
             "POST",
             &external_path,
@@ -386,15 +493,10 @@ pub async fn forward_internal_session(State(config): State<AppConfig>, req: Requ
     let response = match response {
         Ok(response) => response,
         Err(error) => {
-            let _ = release_internal_idempotency(
-                &config,
-                INTERNAL_CALLER_LEARN,
-                "learn-to-gateway",
-                &idempotency_key,
-            )
-            .await;
+            // Delivery outcome is unknown once the request is sent. Leave the
+            // in-flight guard in place so a caller cannot duplicate a session.
             CB_IDENTITY.record_failure();
-            tracing::warn!(%error, "internal Identity request failed");
+            tracing::warn!(error_kind = %error.without_url(), "internal Identity request failed");
             return json_error(
                 "POST",
                 &external_path,
@@ -407,20 +509,23 @@ pub async fn forward_internal_session(State(config): State<AppConfig>, req: Requ
     };
     let status = response.status();
     let headers = response.headers().clone();
-    let response_body = match response.bytes().await {
+    let response_body = match collect_upstream_response_body(response).await {
         Ok(body) => body,
         Err(_) => {
             CB_IDENTITY.record_failure();
+            // A truncated/oversized response does not prove that Identity
+            // failed before creating a session. Preserve the in-flight guard.
             return json_error(
                 "POST",
                 &external_path,
                 Some(&request_id),
                 502,
-                "Identity response read failed",
+                "Identity response read failed or exceeded the configured size limit",
                 "BAD_GATEWAY",
             );
         }
     };
+
     if status.is_server_error() {
         CB_IDENTITY.record_failure();
         let _ = release_internal_idempotency(
@@ -470,7 +575,8 @@ pub async fn forward_to_trustgraph(
         );
     }
     let full_path = format!("/main/api/v1/{path}");
-    let response = forward(&config, &config.trust_graph_uri, &full_path, req).await;
+    let trustgraph_uri = config.trust_graph_uri.as_str();
+    let response = forward(&config, trustgraph_uri, &full_path, req).await;
     if dependency_failure(response.status()) {
         CB_TRUSTGRAPH.record_failure();
     } else {
@@ -497,7 +603,8 @@ pub async fn forward_to_monitor(
         );
     }
     let full_path = format!("/api/v1/monitor/{path}");
-    let response = forward(&config, &config.monitor_service_uri, &full_path, req).await;
+    let monitor_uri = config.monitor_service_uri.as_str();
+    let response = forward(&config, monitor_uri, &full_path, req).await;
     if dependency_failure(response.status()) {
         CB_MONITOR.record_failure();
     } else {
@@ -524,11 +631,7 @@ pub async fn forward_to_chat(
         );
     }
     let full_path = format!("/v1/chat/{path}");
-    // 与 WS 隧道共用同一解析入口：env 优先、config 兜底，避免 HTTP/WS 打到不同实例。
-    let chat_uri = std::env::var("CHAT_SERVICE_URI")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| config.chat_service_uri.clone());
+    let chat_uri = configured_service_uri("CHAT_SERVICE_URI", &config.chat_service_uri);
     if chat_uri.trim().is_empty() {
         return json_error(
             req.method().as_str(),
@@ -565,7 +668,8 @@ pub async fn forward_to_learn_app_users(
         );
     }
     let full_path = format!("/v1/app/users/{path}");
-    let response = forward(&config, &config.learn_service_uri, &full_path, req).await;
+    let learn_uri = config.learn_service_uri.as_str();
+    let response = forward(&config, learn_uri, &full_path, req).await;
     if dependency_failure(response.status()) {
         CB_LEARN.record_failure();
     } else {
@@ -589,7 +693,8 @@ pub async fn forward_to_learn_app_users_root(
             "SERVICE_UNAVAILABLE",
         );
     }
-    let response = forward(&config, &config.learn_service_uri, "/v1/app/users", req).await;
+    let learn_uri = config.learn_service_uri.as_str();
+    let response = forward(&config, learn_uri, "/v1/app/users", req).await;
     if dependency_failure(response.status()) {
         CB_LEARN.record_failure();
     } else {
@@ -629,10 +734,7 @@ pub async fn forward_chat_ws(
     let target_path = format!("/v1/chat/ws/{path}");
     // 外部 canonical path 必须使用客户端请求路径；上游 URL 使用 rewrite 后的内部路径。
     let external_path = original_uri.path().to_string();
-    let chat_uri = std::env::var("CHAT_SERVICE_URI")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| config.chat_service_uri.clone());
+    let chat_uri = configured_service_uri("CHAT_SERVICE_URI", &config.chat_service_uri);
     let upstream_url = match websocket_upstream_url(&chat_uri, &target_path) {
         Ok(url) => url,
         Err(message) => {
@@ -867,6 +969,7 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
     let (parts, body) = req.into_parts();
     let external_path = parts.uri.path().to_string();
     let method = parts.method.clone();
+    let identity_empty_bootstrap = is_public_identity_empty_bootstrap(&method, &external_path);
     // 保留原始请求的查询字符串
     let query = parts
         .uri
@@ -894,8 +997,13 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
         }
     };
 
-    // 提取身份头（由 JWT 中间件注入）
+    // Bootstrap endpoints validate credentials in their own handlers. Even a
+    // valid optional ACCESS Bearer must not turn the login/body identity into a
+    // gateway-authenticated principal or act as proof for another login actor.
     let extract_header = |name: &str| -> String {
+        if identity_empty_bootstrap {
+            return String::new();
+        }
         parts
             .headers
             .get(name)
@@ -1001,10 +1109,14 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
         Ok(response) => {
             let status = response.status();
             let resp_headers = response.headers().clone();
-            let resp_body = match response.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to read upstream response body");
+            let resp_body = match collect_upstream_response_body(response).await {
+                Ok(body) => body,
+                Err(_) => {
+                    tracing::warn!(
+                        method = %method,
+                        path = %external_path,
+                        "upstream response read failed or exceeded the configured size limit"
+                    );
                     return json_error(
                         method.as_str(),
                         &external_path,
@@ -1013,7 +1125,7 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
                             .get("x-request-id")
                             .and_then(|v| v.to_str().ok()),
                         502,
-                        &format!("Upstream read failed: {e}"),
+                        "Upstream response read failed or exceeded the configured size limit",
                         "BAD_GATEWAY",
                     );
                 }
@@ -1034,11 +1146,11 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
                 .body(Body::from(resp_body))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
-        Err(e) => {
-            tracing::error!(
+        Err(error) => {
+            tracing::warn!(
                 method = %method,
-                uri = %uri,
-                error = %e,
+                path = %external_path,
+                error_kind = %error.without_url(),
                 "upstream request failed"
             );
             json_error(
@@ -1049,7 +1161,7 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
                     .get("x-request-id")
                     .and_then(|v| v.to_str().ok()),
                 502,
-                &format!("Upstream error: {e}"),
+                "Upstream request failed",
                 "BAD_GATEWAY",
             )
         }
@@ -1138,6 +1250,177 @@ mod circuit_breaker_tests {
 mod client_header_policy_tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    #[tokio::test]
+    async fn gateway_proxy_and_identity_v3_verifier_share_empty_refresh_contract() {
+        use axum::body::to_bytes;
+        use axum::routing::post;
+        use axum::{middleware, Json, Router};
+        use serde_json::json;
+
+        let config = AppConfig {
+            gateway: astral_common::config::GatewayCfg {
+                hmac_secret: "gateway-proxy-contract-test-secret-0123456789".into(),
+                timestamp_tolerance_secs: 30,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route(
+                "/api/v1/auth/sessions",
+                post(|headers: HeaderMap| async move {
+                    Json(json!({
+                        "authorization": headers.get("authorization").and_then(|v| v.to_str().ok()),
+                        "userId": headers.get("x-user-id").and_then(|v| v.to_str().ok()),
+                        "gatewayAuth": headers.get("x-gateway-auth").and_then(|v| v.to_str().ok()),
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/auth/sessions/refresh",
+                post(|headers: HeaderMap| async move {
+                    Json(json!({
+                        "authorization": headers.get("authorization").and_then(|v| v.to_str().ok()),
+                        "userId": headers.get("x-user-id").and_then(|v| v.to_str().ok()),
+                        "principalKind": headers.get("x-principal-kind").and_then(|v| v.to_str().ok()),
+                        "gatewayAuth": headers.get("x-gateway-auth").and_then(|v| v.to_str().ok()),
+                    }))
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                config.clone(),
+                astral_common::middleware::gateway_signature::gateway_signature_middleware,
+            ))
+            .with_state(config.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock Identity server");
+        });
+        let base_uri = format!("http://{addr}");
+
+        let bootstrap = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/v1/auth/sessions")
+            .header("authorization", "Bearer optional-access-token")
+            .header("x-user-id", "forged-user")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = forward(&config, &base_uri, "/api/v1/auth/sessions", bootstrap).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(to_bytes(response.into_body(), 1024).await.unwrap().as_ref())
+                .unwrap();
+        assert!(body["authorization"].is_null());
+        assert!(body["userId"].is_null());
+        assert_eq!(body["gatewayAuth"], "verified");
+
+        let refresh = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/v1/auth/sessions/refresh")
+            .header("authorization", "Bearer refresh-token")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = forward(&config, &base_uri, "/api/v1/auth/sessions/refresh", refresh).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(to_bytes(response.into_body(), 1024).await.unwrap().as_ref())
+                .unwrap();
+        assert_eq!(body["authorization"], "Bearer refresh-token");
+        assert!(body["userId"].is_null());
+        assert!(body["principalKind"].is_null());
+        assert_eq!(body["gatewayAuth"], "verified");
+        server.abort();
+    }
+
+    #[test]
+    fn public_bootstrap_transport_drops_client_supplied_identity_and_gateway_headers() {
+        let method = axum::http::Method::POST;
+        let path = "/api/v1/auth/sessions";
+        for name in [
+            "x-user-id",
+            "x-principal-kind",
+            "x-token-id",
+            "x-identity-card-id",
+            "x-user-card-id",
+            "x-gateway-auth",
+            "x-gateway-signature",
+            "authorization",
+        ] {
+            let value = if name == "authorization" {
+                HeaderValue::from_static("Bearer refresh-token")
+            } else {
+                HeaderValue::from_static("forged")
+            };
+            assert!(
+                !should_forward_client_header(&method, path, name, &value),
+                "bootstrap transport must not forward {name}"
+            );
+        }
+        assert!(should_forward_client_header(
+            &method,
+            path,
+            "content-type",
+            &HeaderValue::from_static("application/json"),
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_response_collector_rejects_content_length_chunked_and_read_errors() {
+        use futures_util::stream;
+
+        let declared_too_large = stream::empty::<Result<bytes::Bytes, &'static str>>();
+        assert_eq!(
+            collect_bounded_response_body(declared_too_large, Some(5), 4).await,
+            Err(BoundedBodyError::TooLarge)
+        );
+
+        let chunked = stream::iter([
+            Ok::<_, &'static str>(bytes::Bytes::from_static(b"abc")),
+            Ok(bytes::Bytes::from_static(b"de")),
+        ]);
+        assert_eq!(
+            collect_bounded_response_body(chunked, None, 4).await,
+            Err(BoundedBodyError::TooLarge)
+        );
+
+        let malformed = stream::iter([
+            Ok::<_, &'static str>(bytes::Bytes::from_static(b"a")),
+            Err("truncated upstream body"),
+        ]);
+        assert_eq!(
+            collect_bounded_response_body(malformed, Some(2), 4).await,
+            Err(BoundedBodyError::Read)
+        );
+
+        let exact_boundary =
+            stream::iter([Ok::<_, &'static str>(bytes::Bytes::from_static(b"abcd"))]);
+        assert_eq!(
+            collect_bounded_response_body(exact_boundary, None, 4)
+                .await
+                .unwrap(),
+            bytes::Bytes::from_static(b"abcd")
+        );
+    }
+
+    #[test]
+    fn chat_service_uri_keeps_env_precedence_and_ignores_blank_env() {
+        assert_eq!(
+            configured_service_uri_from_values(Some(" http://env.invalid "), "http://yaml.invalid"),
+            "http://env.invalid"
+        );
+        assert_eq!(
+            configured_service_uri_from_values(Some("  "), " http://yaml.invalid "),
+            "http://yaml.invalid"
+        );
+        assert_eq!(
+            configured_service_uri_from_values(None, " http://yaml.invalid "),
+            "http://yaml.invalid"
+        );
+    }
 
     #[test]
     fn canonical_session_routes_retain_bearer_only_for_post() {

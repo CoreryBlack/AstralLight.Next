@@ -143,6 +143,14 @@ MAX_EVENT_IDS = 512
 MAX_CROSSCHECK_REQUEST_IDS = 256
 
 MARKER_NAMES: Tuple[str, ...] = ("injection_start", "injection_end", "drain_start", "drain_end")
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$")
+_REQUEST_CONTEXT_FIELDS = ("user_id", "tenant_id", "card_id", "resource", "action")
+_MARKER_EFFECT_STATES = {
+    "injection_start": "ACTIVE",
+    "injection_end": "INACTIVE",
+    "drain_start": "DRAINING",
+    "drain_end": "DRAINED",
+}
 
 #: The four protocol E3 output categories; a full claim requires ALL of them.
 CATEGORY_REQUEST_SIDE = "request_side_denial_pending"
@@ -459,10 +467,38 @@ def _scrub_ack(ack: Any) -> Dict[str, Any]:
     return {"present": True, "repr": e3_e4._stored(str(ack))}
 
 
+def _controller_effect_proven(ack: Any, operation_id: str, expected_state: str) -> bool:
+    """Require the hook ACK to bind this effect identity to its resulting state."""
+    if not isinstance(ack, Mapping):
+        return False
+    returned_id = ack.get("operation_id")
+    state = ack.get("state", ack.get("effect_state", ack.get("effectState")))
+    return (
+        ack.get("applied") is True
+        and returned_id == operation_id
+        and isinstance(state, str)
+        and state.strip().upper() == expected_state
+    )
+
+
+def _require_controller_effect(
+    ok: bool, ack: Any, operation_id: str, expected_state: str, phase: str
+) -> Tuple[bool, Optional[str]]:
+    if not ok:
+        return False, None
+    if not _controller_effect_proven(ack, operation_id, expected_state):
+        return False, "effect_ack_unproven:%s" % phase
+    return True, None
+
+
 def validate_markers(
     markers: Sequence[PhaseMarker], operation_ids: Mapping[str, str]
 ) -> Dict[str, Any]:
-    """Validate presence, uniqueness, ordering, and operation-id pairing.
+    """Validate marker order, operation-id pairing, and controller effect proof.
+
+    Each controller ACK must echo its stable operation id and the resulting
+    effect state (ACTIVE/INACTIVE/DRAINING/DRAINED). ACK presence alone is not
+    evidence that the intended effect occurred.
 
     Ordering contract: strictly increasing ``monotonic_ns`` across the four
     markers in MARKER_NAMES order, non-decreasing ``wall_unix_ns``, and
@@ -486,15 +522,29 @@ def validate_markers(
         if second.wall_unix_ns < first.wall_unix_ns:
             problems.append("marker_wall_order_violation")
             break
+    effect_problems: List[str] = []
     for name in ("injection_start", "injection_end"):
-        if name in by_name and by_name[name].operation_id != operation_ids["injection"]:
-            problems.append("marker_operation_id_mismatch:injection")
+        if name in by_name:
+            marker = by_name[name]
+            if marker.operation_id != operation_ids["injection"]:
+                problems.append("marker_operation_id_mismatch:injection")
+            if not _controller_effect_proven(
+                marker.ack, operation_ids["injection"], _MARKER_EFFECT_STATES[name]
+            ):
+                effect_problems.append("marker_effect_unproven:%s" % name)
     for name in ("drain_start", "drain_end"):
-        if name in by_name and by_name[name].operation_id != operation_ids["drain"]:
-            problems.append("marker_operation_id_mismatch:drain")
+        if name in by_name:
+            marker = by_name[name]
+            if marker.operation_id != operation_ids["drain"]:
+                problems.append("marker_operation_id_mismatch:drain")
+            if not _controller_effect_proven(
+                marker.ack, operation_ids["drain"], _MARKER_EFFECT_STATES[name]
+            ):
+                effect_problems.append("marker_effect_unproven:%s" % name)
     if not missing:
         if by_name["drain_start"].monotonic_ns < by_name["injection_end"].monotonic_ns:
             problems.append("marker_interval_overlap_violation")
+    problems.extend(effect_problems)
     return {
         "complete": not missing,
         "valid": not missing and not problems,
@@ -538,11 +588,34 @@ def _call_bounded(label: str, fn: Callable[[], Any], timeout_s: float) -> Tuple[
 # ---------------------------------------------------------------------------
 
 
-def _publication_pass(sample: Mapping[str, Any]) -> bool:
+def _publication_read_success(sample: Mapping[str, Any]) -> bool:
+    """Whether this snapshot contains any healthy read indicator."""
     return any(
         sample.get(section, {}).get("status") == "PASS"
         for section in ("queue_counts", "row_counts", "pointers")
     )
+
+
+def _publication_drain_proven(sample: Mapping[str, Any]) -> bool:
+    """Require explicit zero queue depth and worker readiness in this sample."""
+    queues = sample.get("queue_counts", {})
+    entries = queues.get("entries", {}) if isinstance(queues, Mapping) else {}
+    queue_zero = bool(entries) and queues.get("status") == "PASS" and all(
+        isinstance(entry, Mapping)
+        and entry.get("status") == "PASS"
+        and isinstance(entry.get("value"), int)
+        and not isinstance(entry.get("value"), bool)
+        and entry.get("value") == 0
+        for entry in entries.values()
+    )
+    health = sample.get("worker_health", {})
+    readiness = health.get("health_endpoint", {}) if isinstance(health, Mapping) else {}
+    ready = (
+        isinstance(readiness, Mapping)
+        and readiness.get("status") == "PASS"
+        and readiness.get("healthy") is True
+    )
+    return queue_zero and ready
 
 
 def _section_statuses(sample: Mapping[str, Any]) -> Dict[str, Any]:
@@ -566,6 +639,8 @@ class _WindowStream:
         self.phase = phase
         self.samples: List[Dict[str, Any]] = []
         self.request_ids: List[Dict[str, Any]] = []
+        self.request_id_counts: Dict[str, int] = {}
+        self.invalid_request_id_samples = 0
         self.truncated = False
 
     def __call__(self, sample: Mapping[str, Any]) -> None:
@@ -592,7 +667,11 @@ class _WindowStream:
                 }
             )
             request_id = entry.get("request_id")
-            if request_id and len(self.request_ids) < 3 * MAX_SAMPLES_PER_WINDOW:
+            if isinstance(request_id, str) and _REQUEST_ID_RE.fullmatch(request_id):
+                self.request_id_counts[request_id] = self.request_id_counts.get(request_id, 0) + 1
+            else:
+                self.invalid_request_id_samples += 1
+            if isinstance(request_id, str) and _REQUEST_ID_RE.fullmatch(request_id) and len(self.request_ids) < 3 * MAX_SAMPLES_PER_WINDOW:
                 self.request_ids.append(
                     {
                         "phase": self.phase,
@@ -607,7 +686,8 @@ class _WindowStream:
                 "seq": sample.get("seq"),
                 "taken_at": sample.get("taken_at"),
                 "probe_clock_epoch_s": sample.get("probe_clock_epoch_s"),
-                "publication_indicators_pass": _publication_pass(sample),
+                "publication_read_success": _publication_read_success(sample),
+                "publication_drain_proven": _publication_drain_proven(sample),
                 "section_statuses": _section_statuses(sample),
                 "decisions": decisions,
             }
@@ -768,37 +848,55 @@ def crosscheck_host_admissions(
     decisions_by_request: Mapping[str, str],
     problems: List[str],
     limitations: List[Dict[str, Any]],
+    *,
+    invalid_request_id_samples: int = 0,
+    duplicate_request_ids: Sequence[str] = (),
+    sample_stream_truncated: bool = False,
 ) -> Dict[str, Any]:
     """Cross-check sampled request ids against request-side event logs.
 
-    Probe-level ALLOW requires a ``host_admission`` event to be confirmed; a
-    host admission on a probe-level PENDING/DENY id, or an explicit host
-    denial under a probe-level ALLOW id, is a contradiction (FAIL).
-    Absent request logs are recorded as unverified (never fabricated).
+    Every sampled decision must have a present, unique request id and exactly
+    one matching ``decision_return``. ALLOW additionally requires exactly one
+    matching ``host_admission``; non-ALLOW must have none. Malformed, duplicate,
+    missing, truncated, or unpaired ids cannot PASS. Explicit contradictions
+    are FAIL; incomplete evidence is UNKNOWN or BLOCKED, never inferred away.
     """
     if request_log_collector is None:
         limitations.append(
             {
                 "item": "host_admission_crosscheck",
                 "status": "SKIP",
-                "note": "no request-log collector injected; probe-level ALLOW stays unconfirmed",
+                "note": "no request-log collector injected; host-admission evidence is unavailable",
             }
         )
         return {
             "status": "SKIP",
             "checked": 0,
             "confirmed": 0,
+            "verifiedNonAllow": 0,
             "unverified": 0,
             "contradictions": [],
         }
     ids = list(decisions_by_request.keys())
-    if len(ids) > MAX_CROSSCHECK_REQUEST_IDS:
+    truncated = len(ids) > MAX_CROSSCHECK_REQUEST_IDS
+    if truncated:
         ids = ids[:MAX_CROSSCHECK_REQUEST_IDS]
         limitations.append(
             {
                 "item": "crosscheck_request_id_cap",
                 "status": "SKIP",
                 "note": "request id list truncated at the crosscheck bound",
+            }
+        )
+    invalid_count = max(0, int(invalid_request_id_samples))
+    duplicate_ids = sorted(set(str(item) for item in duplicate_request_ids))
+    truncated = truncated or bool(sample_stream_truncated)
+    if duplicate_ids:
+        limitations.append(
+            {
+                "item": "duplicate_sampled_request_ids",
+                "status": "SKIP",
+                "note": "sampled request ids are not unique across probe calls",
             }
         )
     by_id: Dict[str, Dict[str, Any]] = {}
@@ -821,56 +919,122 @@ def crosscheck_host_admissions(
             continue
         for event in request_events:
             info = by_id.setdefault(
-                event.request_id, {"events": 0, "host_admission": 0, "decision_allowed": []}
+                event.request_id,
+                {"events": 0, "host_admissions": [], "decision_returns": []},
             )
             info["events"] += 1
             if event.event == "host_admission":
-                info["host_admission"] += 1
+                info["host_admissions"].append(event)
             elif event.event == "decision_return":
-                info["decision_allowed"].append(event.fields.get("allowed"))
+                info["decision_returns"].append(event)
 
     contradictions: List[Dict[str, Any]] = []
     confirmed = 0
-    unverified = 0
+    unverified_ids = 0
+    verified_non_allow = 0
     if parse_ok:
         for request_id in ids:
             expected = decisions_by_request[request_id]
             info = by_id.get(request_id)
-            if info is None or info["events"] == 0:
-                unverified += 1
+            if info is None:
+                unverified_ids += 1
+                continue
+            decision_returns = info["decision_returns"]
+            admissions = info["host_admissions"]
+            if len(decision_returns) != 1:
+                if len(decision_returns) > 1:
+                    contradictions.append(
+                        {"request_id": request_id, "kind": "duplicate_decision_return"}
+                    )
+                else:
+                    unverified_ids += 1
+                continue
+            decision = decision_returns[0]
+            returned_allowed = decision.fields.get("allowed")
+            reason = str(decision.fields.get("reason") or "").upper()
+            missing_decision_context = [
+                field for field in _REQUEST_CONTEXT_FIELDS
+                if decision.fields.get(field) is None or not str(decision.fields.get(field)).strip()
+            ]
+            if expected == "UNKNOWN" or missing_decision_context:
+                unverified_ids += 1
                 continue
             if expected == "ALLOW":
-                if info["decision_allowed"] and all(
-                    allowed is not True for allowed in info["decision_allowed"]
-                ):
+                if returned_allowed is not True:
                     contradictions.append(
                         {"request_id": request_id, "kind": "probe_allow_host_denial"}
                     )
-                elif info["host_admission"]:
-                    confirmed += 1
+                elif len(admissions) > 1:
+                    contradictions.append(
+                        {"request_id": request_id, "kind": "duplicate_host_admission"}
+                    )
+                elif len(admissions) == 1:
+                    admission = admissions[0]
+                    admission_missing_context = [
+                        field for field in _REQUEST_CONTEXT_FIELDS
+                        if admission.fields.get(field) is None
+                        or not str(admission.fields.get(field)).strip()
+                    ]
+                    context_mismatches = [
+                        field for field in _REQUEST_CONTEXT_FIELDS
+                        if admission.fields.get(field) != decision.fields.get(field)
+                    ]
+                    if (
+                        admission.node != decision.node
+                        or admission.process_observation_id != decision.process_observation_id
+                        or admission.sequence <= decision.sequence
+                        or admission_missing_context
+                        or context_mismatches
+                    ):
+                        contradictions.append(
+                            {
+                                "request_id": request_id,
+                                "kind": "host_admission_identity_order_or_context_mismatch",
+                                "missing_context": admission_missing_context,
+                                "context_mismatches": context_mismatches,
+                            }
+                        )
+                    else:
+                        confirmed += 1
                 else:
-                    unverified += 1
+                    unverified_ids += 1
             else:
-                if info["host_admission"]:
+                pending_reason = "AUTHORIZATION_PENDING" in reason
+                if returned_allowed is True or admissions:
                     contradictions.append(
                         {"request_id": request_id, "kind": "probe_non_admission_with_host_admission"}
                     )
+                elif not isinstance(returned_allowed, bool):
+                    unverified_ids += 1
+                elif not reason:
+                    unverified_ids += 1
+                elif (expected == "PENDING") != pending_reason:
+                    contradictions.append(
+                        {"request_id": request_id, "kind": "probe_host_decision_reason_mismatch"}
+                    )
+                else:
+                    verified_non_allow += 1
         if contradictions:
             problems.append("probe_host_decision_contradiction")
-    if unverified:
+    incomplete = bool(invalid_count or duplicate_ids or truncated or unverified_ids or not ids)
+    if incomplete:
         limitations.append(
             {
-                "item": "crosscheck_unverified_request_ids",
+                "item": "crosscheck_incomplete_request_ids",
                 "status": "SKIP",
-                "note": "%d sampled request ids had no matching request-side log lines" % unverified,
+                "note": (
+                    "host admission is not a full PASS with invalid=%d duplicate=%d unverified=%d truncated=%s"
+                    % (invalid_count, len(duplicate_ids), unverified_ids, truncated)
+                ),
             }
         )
-    allow_ids = [request_id for request_id in ids if decisions_by_request.get(request_id) == "ALLOW"]
     if contradictions:
         status = "FAIL"
     elif not parse_ok:
         status = "UNKNOWN"
-    elif allow_ids and confirmed == 0:
+    elif incomplete:
+        status = "UNKNOWN" if ids or invalid_count or duplicate_ids or truncated else "BLOCKED"
+    elif confirmed + verified_non_allow != len(ids):
         status = "UNKNOWN"
     else:
         status = "PASS"
@@ -878,7 +1042,11 @@ def crosscheck_host_admissions(
         "status": status,
         "checked": len(ids),
         "confirmed": confirmed,
-        "unverified": unverified,
+        "verifiedNonAllow": verified_non_allow,
+        "unverified": unverified_ids,
+        "invalidRequestIdSamples": invalid_count,
+        "duplicateRequestIds": duplicate_ids,
+        "truncated": truncated,
         "contradictions": contradictions,
         "decision_basis": "host_admission_from_request_side_event_logs",
     }
@@ -905,6 +1073,8 @@ def build_output_categories(
     stream_injection: Optional[_WindowStream],
     stream_drain: Optional[_WindowStream],
     per_event: Mapping[str, Any],
+    *,
+    host_crosscheck: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Compute the four E3 output categories from sampling + per-event state."""
     streams = (stream_injection, stream_drain)
@@ -913,7 +1083,22 @@ def build_output_categories(
     cold = _decisions_for_role(streams, "cold")
     drain_samples = list(stream_drain.samples) if stream_drain is not None else []
     injection_samples = list(stream_injection.samples) if stream_injection is not None else []
+    per_status = str(per_event.get("status") or "BLOCKED")
+    publication_drain_proven = bool(
+        drain_samples
+        and per_status == "PASS"
+        and all(digest.get("publication_drain_proven") is True for digest in drain_samples)
+    )
 
+    host_status = str((host_crosscheck or {}).get("status") or "BLOCKED")
+    target_identities = {
+        (decision.get("phase"), decision.get("seq"))
+        for stream in streams if stream is not None
+        for digest in stream.samples
+        for decision in digest["decisions"]
+        if decision.get("role") == "target"
+    }
+    target_crosschecked = bool(target_identities) and host_status == "PASS"
     if not target:
         request_side = {"status": "SKIP", "note": "no target-card decision samples collected"}
     elif all(decision.get("decision_status") == "BLOCKED" for decision in target):
@@ -923,9 +1108,13 @@ def build_output_categories(
         }
     elif any(decision.get("classification") in {"PENDING", "DENY"} for decision in target):
         request_side = {
-            "status": "PASS",
-            "note": "probe-level target-card pending/denial observed during the recovery tail",
-            "decision_basis": "probe_level",
+            "status": "PASS" if target_crosschecked else "UNKNOWN",
+            "note": (
+                "probe-level target pending/denial observed and every request id reconciled"
+                if target_crosschecked else
+                "probe-level target pending/denial observed, but host-admission request evidence is incomplete"
+            ),
+            "decision_basis": "probe_level_plus_request_side_crosscheck" if target_crosschecked else "probe_level_unconfirmed",
         }
     else:
         request_side = {
@@ -969,10 +1158,19 @@ def build_output_categories(
             "status": "SKIP",
             "note": "drain window produced no samples; publication drain not observed",
         }
-    elif any(digest["publication_indicators_pass"] for digest in drain_samples):
+    elif publication_drain_proven:
         publication = {
             "status": "PASS",
-            "note": "publication drain indicators observed through the drain window",
+            "note": "every drain sample proves zero queue depth and ready worker; matching per-event history is terminal and reconciled",
+        }
+    elif any(digest["publication_read_success"] for digest in drain_samples):
+        publication = {
+            "status": "UNKNOWN",
+            "note": (
+                "successful snapshot reads prove observability only; unless every drain sample "
+                "proves zero queue depth plus worker readiness and matching durable terminal "
+                "history, publication drain remains unproven"
+            ),
         }
     elif any(
         status in {"UNKNOWN", "BLOCKED"}
@@ -989,7 +1187,6 @@ def build_output_categories(
             "note": "publication indicators not configured or not observed",
         }
 
-    per_status = str(per_event.get("status") or "BLOCKED")
     per_event_category: Dict[str, Any] = {
         "status": per_status,
         "events": per_event.get("events"),
@@ -1199,6 +1396,10 @@ def execute_campaign(
         lambda: controller.begin_injection(operation_ids["injection"]),
         settings.controller_timeout_s,
     )
+    ok, effect_problem = _require_controller_effect(
+        ok, ack, operation_ids["injection"], "ACTIVE", "begin_injection"
+    )
+    problem = effect_problem or problem
     if ok:
         markers.append(
             PhaseMarker(
@@ -1216,9 +1417,11 @@ def execute_campaign(
                 "phase": "begin_injection",
                 "problem": problem,
                 "controller_state_unknown": True,
+                "injection_may_be_active": True,
             }
         )
         problems.append("controller_phase_failure:begin_injection")
+        injection_may_be_active = (effect_problem is not None)
         abort_reason = "begin_injection"
 
     summary_injection: Optional[Dict[str, Any]] = None
@@ -1245,6 +1448,10 @@ def execute_campaign(
             lambda: controller.end_injection(operation_ids["injection"]),
             settings.controller_timeout_s,
         )
+        ok, effect_problem = _require_controller_effect(
+            ok, ack, operation_ids["injection"], "INACTIVE", "end_injection"
+        )
+        problem = effect_problem or problem
         if ok:
             markers.append(
                 PhaseMarker(
@@ -1275,6 +1482,10 @@ def execute_campaign(
             lambda: controller.begin_drain(operation_ids["drain"]),
             settings.controller_timeout_s,
         )
+        ok, effect_problem = _require_controller_effect(
+            ok, ack, operation_ids["drain"], "DRAINING", "begin_drain"
+        )
+        problem = effect_problem or problem
         if ok:
             markers.append(
                 PhaseMarker(
@@ -1300,6 +1511,10 @@ def execute_campaign(
                 lambda: controller.end_drain(operation_ids["drain"]),
                 settings.controller_timeout_s,
             )
+            ok, effect_problem = _require_controller_effect(
+                ok, ack, operation_ids["drain"], "DRAINED", "end_drain"
+            )
+            problem = effect_problem or problem
             if ok:
                 markers.append(
                     PhaseMarker(
@@ -1419,14 +1634,37 @@ def execute_campaign(
             for decision in digest["decisions"]:
                 request_id = decision.get("request_id")
                 classification = decision.get("classification")
-                if request_id and classification in {"ALLOW", "PENDING", "DENY"}:
+                if request_id and classification in {"ALLOW", "PENDING", "DENY", "UNKNOWN"}:
                     decisions_by_request.setdefault(str(request_id), str(classification))
+
+    request_id_counts: Dict[str, int] = {}
+    invalid_request_id_samples = 0
+    sample_stream_truncated = False
+    for stream in (stream_injection, stream_drain):
+        if stream is None:
+            continue
+        invalid_request_id_samples += stream.invalid_request_id_samples
+        sample_stream_truncated = sample_stream_truncated or stream.truncated
+        for request_id, count in stream.request_id_counts.items():
+            request_id_counts[request_id] = request_id_counts.get(request_id, 0) + count
+    duplicate_request_ids = sorted(
+        request_id for request_id, count in request_id_counts.items() if count > 1
+    )
     crosscheck = crosscheck_host_admissions(
-        request_log_collector, settings, decisions_by_request, problems, limitations
+        request_log_collector,
+        settings,
+        decisions_by_request,
+        problems,
+        limitations,
+        invalid_request_id_samples=invalid_request_id_samples,
+        duplicate_request_ids=duplicate_request_ids,
+        sample_stream_truncated=sample_stream_truncated,
     )
     manifest["hostAdmissionCrosscheck"] = crosscheck
 
-    categories = build_output_categories(stream_injection, stream_drain, per_event)
+    categories = build_output_categories(
+        stream_injection, stream_drain, per_event, host_crosscheck=crosscheck
+    )
     manifest["outputCategories"] = categories
 
     # -- Sampling artifacts (bounded digests with retained request ids).
@@ -1456,6 +1694,8 @@ def execute_campaign(
     for outcome, summary in ((outcome_injection, summary_injection), (outcome_drain, summary_drain)):
         if outcome == "ran" and summary is not None:
             pool.append(str(summary.get("overall")))
+        elif outcome == "skipped" and abort_reason is not None:
+            pool.append("UNKNOWN")
         elif outcome == "skipped":
             pool.append("SKIP")
         else:
@@ -1468,6 +1708,9 @@ def execute_campaign(
     if phase_failures:
         pool.append("UNKNOWN")
     if problems:
+        pool.append("UNKNOWN")
+    if request_log_collector is None and categories[CATEGORY_REQUEST_SIDE]["status"] == "SKIP":
+        pool.remove("SKIP")
         pool.append("UNKNOWN")
     overall = worst_status(pool)
     manifest["status"] = overall

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use astral_db::{
     insert_or_increment_terminal, AuditQuarantineInput, AuditQuarantineStatus, LocalMessageError,
-    LocalMessageRepository, LOCAL_MESSAGE_MAX_ATTEMPTS,
+    LocalMessageExactClaim, LocalMessageRepository, LOCAL_MESSAGE_MAX_ATTEMPTS,
 };
 use futures_util::StreamExt;
 use lapin::message::Delivery;
@@ -257,6 +257,20 @@ impl Default for LocalInvalidationRelaySettings {
     }
 }
 
+fn local_invalidation_lease_budget_fits(
+    handler_deadline: Duration,
+    db_call_deadline: Duration,
+    lease: Duration,
+) -> bool {
+    // Reserve one bounded claim plus the largest bounded post-handler path:
+    // settlement followed by the best-effort IN_DOUBT write.
+    let database_budget = db_call_deadline.saturating_mul(3);
+    let Some(total_budget) = handler_deadline.checked_add(database_budget) else {
+        return false;
+    };
+    total_budget < lease
+}
+
 impl LocalInvalidationRelaySettings {
     pub fn validate(&self) -> Result<(), String> {
         let idle = self.idle_poll_interval.as_secs();
@@ -274,17 +288,23 @@ impl LocalInvalidationRelaySettings {
         if self.handler_deadline.is_zero() {
             return Err("relay handler_deadline must be positive".into());
         }
-        if self.handler_deadline >= Duration::from_secs(astral_db::LOCAL_MESSAGE_LEASE_SECONDS) {
-            return Err(format!(
-                "relay handler_deadline ({:?}) must stay below the durable lease ({}s) so no heartbeat task is needed",
-                self.handler_deadline, astral_db::LOCAL_MESSAGE_LEASE_SECONDS
-            ));
-        }
         if self.db_call_deadline.is_zero()
             || self.db_call_deadline > LOCAL_INVALIDATION_DB_CALL_BOUND
         {
             return Err(format!(
                 "relay db_call_deadline must be within (0, {LOCAL_INVALIDATION_DB_CALL_BOUND:?}]"
+            ));
+        }
+        if !local_invalidation_lease_budget_fits(
+            self.handler_deadline,
+            self.db_call_deadline,
+            Duration::from_secs(astral_db::LOCAL_MESSAGE_LEASE_SECONDS),
+        ) {
+            return Err(format!(
+                "relay claim + handler + settlement + IN_DOUBT budget ({:?} + 3 x {:?}) must stay below the durable lease ({}s)",
+                self.handler_deadline,
+                self.db_call_deadline,
+                astral_db::LOCAL_MESSAGE_LEASE_SECONDS
             ));
         }
         if self.shutdown_join_deadline.is_zero() {
@@ -310,6 +330,28 @@ pub struct LocalInvalidationRelayHandle {
     join_deadline: Duration,
 }
 
+struct LocalRelayJoinGuard {
+    join: Option<tokio::task::JoinHandle<()>>,
+    shutdown: watch::Sender<bool>,
+}
+
+impl Drop for LocalRelayJoinGuard {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            self.shutdown.send_replace(true);
+            mark_relay_suspect("local invalidation relay join interrupted; outcome unknown");
+            join.abort();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    if timeout(Duration::from_secs(1), join).await.is_err() {
+                        tracing::error!("local invalidation relay abort remains unproven");
+                    }
+                });
+            }
+        }
+    }
+}
+
 impl LocalInvalidationRelayHandle {
     /// Cooperative stop: mark the hub suspect, then signal the loop.
     pub fn cancel(&self) {
@@ -320,19 +362,41 @@ impl LocalInvalidationRelayHandle {
     /// Bounded join: `Ok` once the loop exited cooperatively; `Err` (after
     /// aborting the task) when the join deadline elapsed or the task panicked.
     pub async fn join(self) -> Result<(), String> {
-        let mut join = self
+        let join = self
             .join
             .lock()
             .unwrap()
             .take()
             .ok_or_else(|| "relay join handle already taken".to_owned())?;
-        match timeout(self.join_deadline, &mut join).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(join_error)) => Err(format!("relay task ended abnormally: {join_error}")),
+        let mut guard = LocalRelayJoinGuard {
+            join: Some(join),
+            shutdown: self.shutdown.clone(),
+        };
+        match timeout(self.join_deadline, guard.join.as_mut().unwrap()).await {
+            Ok(Ok(())) => {
+                guard.join.take();
+                Ok(())
+            }
+            Ok(Err(join_error)) => {
+                // The JoinHandle has completed (and been consumed by JoinError),
+                // so the guard no longer owns a task to abort or observe. A panic
+                // may have interrupted a row after its local effect but before
+                // durable settlement; keep the read gate suspect for reconciliation.
+                guard.join.take();
+                mark_relay_suspect("local invalidation relay join failed; outcome unknown");
+                Err(format!("relay task ended abnormally: {join_error}"))
+            }
             Err(_elapsed) => {
-                join.abort();
+                guard.join.as_ref().unwrap().abort();
+                if timeout(Duration::from_secs(1), guard.join.as_mut().unwrap())
+                    .await
+                    .is_ok()
+                {
+                    guard.join.take();
+                }
+                mark_relay_suspect("local invalidation relay join timed out; outcome unknown");
                 Err(format!(
-                    "relay join deadline ({:?}) elapsed; task aborted",
+                    "relay join deadline ({:?}) elapsed; task aborted; outcome unknown",
                     self.join_deadline
                 ))
             }
@@ -475,7 +539,15 @@ async fn run_local_invalidation_relay(
             continue;
         }
         for row in claimed {
-            process_local_invalidation_row(&repository, &bus, row, &settings).await;
+            if let Err(error) =
+                process_local_invalidation_row(&repository, &bus, row, &settings).await
+            {
+                tracing::warn!(
+                    worker_id = %worker_id,
+                    error = %error,
+                    "local invalidation recovery row did not reach a proven successful settlement"
+                );
+            }
         }
     }
 }
@@ -559,19 +631,133 @@ fn local_invalidation_transition(
     }
 }
 
+const LOCAL_INVALIDATION_OWNER: &str = "local-invalidation-direct";
+// Keep claim (3s) + handler (5s) + an owner settlement (3s) and a
+// best-effort IN_DOUBT write (3s) below the source dispatcher's 15s outer
+// deadline and the 30s durable lease.
+const LOCAL_INVALIDATION_DISPATCH_DEADLINE: Duration = Duration::from_secs(5);
+const LOCAL_INVALIDATION_CLAIM_DEADLINE: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalInvalidationDispatchOutcome {
+    Completed,
+    AlreadyProcessed,
+    NotClaimed { status: String, reason: String },
+    NotFound,
+}
+
+/// Direct post-commit dispatcher and durable relay share the same exact-row
+/// lease, handler, and completion contract. The caller supplies only the stable
+/// message identity; the envelope always comes from the committed outbox row.
+pub async fn dispatch_committed_local_invalidation(
+    pool: MySqlPool,
+    bus: LocalBus,
+    envelope: &crate::envelope::MessageEnvelope,
+) -> Result<LocalInvalidationDispatchOutcome, String> {
+    let repository = LocalMessageRepository::new(pool);
+    let claim = match timeout(
+        LOCAL_INVALIDATION_CLAIM_DEADLINE,
+        repository.claim_exact(
+            LOCAL_INVALIDATION_OWNER,
+            QUEUE_AUTHORIZATION_INVALIDATION,
+            &envelope.message_id,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(claim)) => claim,
+        Ok(Err(error)) => {
+            mark_relay_suspect("direct invalidation exact claim failed");
+            return Err(format!("direct invalidation claim failed: {error}"));
+        }
+        Err(_) => {
+            mark_relay_suspect("direct invalidation exact claim timed out; outcome unknown");
+            return Err("direct invalidation claim timed out; outcome unknown".into());
+        }
+    };
+    let expected_bytes = match envelope.envelope_json() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            mark_relay_suspect("direct invalidation receipt serialization failed");
+            return Err(format!(
+                "direct invalidation receipt serialization failed: {error}"
+            ));
+        }
+    };
+    let (row, already_processed) = match claim {
+        LocalMessageExactClaim::Claimed(row) => (row, false),
+        LocalMessageExactClaim::AlreadyProcessed(row) => (row, true),
+        LocalMessageExactClaim::NotClaimable { status, reason } => {
+            mark_relay_suspect(format!(
+                "direct invalidation not claimable ({status}): {reason}"
+            ));
+            return Ok(LocalInvalidationDispatchOutcome::NotClaimed { status, reason });
+        }
+        LocalMessageExactClaim::NotFound => {
+            mark_relay_suspect("direct invalidation exact outbox row missing after commit");
+            return Ok(LocalInvalidationDispatchOutcome::NotFound);
+        }
+    };
+    match bind_relay_envelope(&row) {
+        Ok(committed) if row.payload_json == expected_bytes && committed == *envelope => {}
+        Ok(_) => {
+            let reason = "direct invalidation receipt differs from exact committed outbox bytes";
+            mark_relay_suspect(reason);
+            if !already_processed {
+                let token = row.lease_owner.as_deref().ok_or_else(|| {
+                    "direct invalidation mismatch row has no lease owner".to_owned()
+                })?;
+                bounded_db(
+                    LOCAL_INVALIDATION_CLAIM_DEADLINE,
+                    repository.quarantine(&row.message_id, token, reason),
+                    "quarantine_mismatched_receipt",
+                )
+                .await?;
+            }
+            return Err(reason.into());
+        }
+        Err(reason) => {
+            mark_relay_suspect("direct invalidation durable envelope failed validation");
+            if !already_processed {
+                let token = row.lease_owner.as_deref().ok_or_else(|| {
+                    "direct invalidation malformed row has no lease owner".to_owned()
+                })?;
+                bounded_db(
+                    LOCAL_INVALIDATION_CLAIM_DEADLINE,
+                    repository.quarantine(&row.message_id, token, &reason),
+                    "quarantine_malformed_row",
+                )
+                .await?;
+            }
+            return Err(format!(
+                "direct invalidation durable row rejected: {reason}"
+            ));
+        }
+    };
+    if already_processed {
+        return Ok(LocalInvalidationDispatchOutcome::AlreadyProcessed);
+    }
+    let settings = LocalInvalidationRelaySettings {
+        handler_deadline: LOCAL_INVALIDATION_DISPATCH_DEADLINE,
+        ..Default::default()
+    };
+    process_local_invalidation_row(&repository, &bus, row, &settings).await?;
+    Ok(LocalInvalidationDispatchOutcome::Completed)
+}
+
 async fn process_local_invalidation_row(
     repository: &LocalMessageRepository,
     bus: &LocalBus,
     row: astral_db::LocalMessageRow,
     settings: &LocalInvalidationRelaySettings,
-) {
+) -> Result<(), String> {
     let Some(lease_token) = row.lease_owner.clone() else {
         tracing::error!(
             message_id = %row.message_id,
             "claimed local invalidation row has no lease owner"
         );
         mark_relay_suspect("claimed local invalidation row has no lease owner");
-        return;
+        return Err("claimed local invalidation row has no lease owner".into());
     };
     let outcome = match relay_local_invalidation_row(bus, &row, settings.handler_deadline).await {
         Ok(()) => LocalInvalidationRelayOutcome::Delivered,
@@ -579,82 +765,116 @@ async fn process_local_invalidation_row(
     };
     match local_invalidation_transition(row.attempts, outcome) {
         LocalInvalidationRowTransition::Complete => {
-            if let Err(error) = bounded_db(
+            match bounded_db(
                 settings.db_call_deadline,
                 repository.complete(&row.message_id, &lease_token),
                 "complete",
             )
             .await
             {
-                // Completion is unproven: never declare success after a lost
-                // owner. Best-effort IN_DOUBT, suspect either way.
-                mark_relay_suspect("local invalidation completion is unproven");
-                tracing::error!(
-                    message_id = %row.message_id,
-                    error = %error,
-                    "local invalidation completion is unknown after handler success"
-                );
-                let _ = bounded_db(
-                    settings.db_call_deadline,
-                    repository.mark_in_doubt(&row.message_id, &lease_token, "completion unproven"),
-                    "mark_in_doubt",
-                )
-                .await;
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // Completion is unproven: never declare success after a lost
+                    // owner. Best-effort IN_DOUBT, suspect either way.
+                    mark_relay_suspect("local invalidation completion is unproven");
+                    tracing::error!(
+                        message_id = %row.message_id,
+                        error = %error,
+                        "local invalidation completion is unknown after handler success"
+                    );
+                    let _ = bounded_db(
+                        settings.db_call_deadline,
+                        repository.mark_in_doubt(
+                            &row.message_id,
+                            &lease_token,
+                            "completion unproven",
+                        ),
+                        "mark_in_doubt",
+                    )
+                    .await;
+                    Err(format!("local invalidation completion unproven: {error}"))
+                }
             }
         }
         LocalInvalidationRowTransition::MarkInDoubt(reason) => {
             mark_relay_suspect("local invalidation handler outcome is unknown");
-            if let Err(error) = bounded_db(
+            match bounded_db(
                 settings.db_call_deadline,
                 repository.mark_in_doubt(&row.message_id, &lease_token, &reason),
                 "mark_in_doubt",
             )
             .await
             {
-                mark_relay_suspect("local invalidation IN_DOUBT transition failed");
-                tracing::error!(
-                    message_id = %row.message_id,
-                    error = %error,
-                    "local invalidation unknown outcome could not be recorded"
-                );
+                Ok(()) => Err(format!("local invalidation outcome unknown: {reason}")),
+                Err(error) => {
+                    mark_relay_suspect("local invalidation IN_DOUBT transition failed");
+                    tracing::error!(
+                        message_id = %row.message_id,
+                        error = %error,
+                        "local invalidation unknown outcome could not be recorded"
+                    );
+                    Err(format!(
+                        "local invalidation IN_DOUBT transition unproven: {error}"
+                    ))
+                }
             }
         }
         LocalInvalidationRowTransition::Quarantine(reason) => {
-            if let Err(error) = bounded_db(
+            // A quarantined committed invalidation did not reach a proven
+            // freshness apply, so the mirror stays fail-closed until durable
+            // reconciliation establishes a safe frontier.
+            mark_relay_suspect("local invalidation was quarantined before apply");
+            match bounded_db(
                 settings.db_call_deadline,
                 repository.quarantine(&row.message_id, &lease_token, &reason),
                 "quarantine",
             )
             .await
             {
-                mark_relay_suspect("local invalidation quarantine transition failed");
-                tracing::error!(
-                    message_id = %row.message_id,
-                    error = %error,
-                    "local invalidation quarantine transition failed"
-                );
-            } else {
-                tracing::warn!(
-                    message_id = %row.message_id,
-                    reason = %reason,
-                    "malformed local invalidation envelope quarantined immediately"
-                );
+                Ok(()) => {
+                    tracing::warn!(
+                        message_id = %row.message_id,
+                        reason = %reason,
+                        "malformed local invalidation envelope quarantined immediately"
+                    );
+                    Err(format!("local invalidation quarantined: {reason}"))
+                }
+                Err(error) => {
+                    mark_relay_suspect("local invalidation quarantine transition failed");
+                    tracing::error!(
+                        message_id = %row.message_id,
+                        error = %error,
+                        "local invalidation quarantine transition failed"
+                    );
+                    Err(format!("local invalidation quarantine unproven: {error}"))
+                }
             }
         }
         LocalInvalidationRowTransition::Retry(reason) => {
-            if let Err(error) = bounded_db(
+            // Keep the strict read gate closed while the durable retry is
+            // pending; LocalBus admission failure cannot imply freshness apply.
+            mark_relay_suspect("local invalidation retry scheduled before apply");
+            match bounded_db(
                 settings.db_call_deadline,
                 repository.schedule_retry(&row.message_id, &lease_token, &reason),
                 "schedule_retry",
             )
             .await
             {
-                mark_relay_suspect("local invalidation retry transition failed");
-                tracing::error!(
-                    message_id = %row.message_id,
-                    error = %error,
-                    "local invalidation retry transition failed"
-                );
+                Ok(()) => Err(format!(
+                    "local invalidation will retry after known failure: {reason}"
+                )),
+                Err(error) => {
+                    mark_relay_suspect("local invalidation retry transition failed");
+                    tracing::error!(
+                        message_id = %row.message_id,
+                        error = %error,
+                        "local invalidation retry transition failed"
+                    );
+                    Err(format!(
+                        "local invalidation retry transition unproven: {error}"
+                    ))
+                }
             }
         }
     }
@@ -756,9 +976,10 @@ fn classify_relay_bus_failure(error: LocalBusError) -> LocalInvalidationRelayOut
         LocalBusError::Duplicate(_) => {
             LocalInvalidationRelayOutcome::KnownFailure(error.to_string())
         }
-        // The handler rejected the envelope before any mutation (validation
-        // and missing acceleration surfaces are pre-mutation by contract).
-        LocalBusError::Handler(_) => LocalInvalidationRelayOutcome::KnownFailure(error.to_string()),
+        // A handler error can be returned after a freshness fence or another
+        // idempotent local mutation was applied. Its side-effect position is
+        // therefore unproven; quarantine/reconcile before any replay.
+        LocalBusError::Handler(_) => LocalInvalidationRelayOutcome::Unknown(error.to_string()),
         // The bus re-validated the typed contract and refused: contract-invalid
         // bytes are quarantined immediately, not retried.
         LocalBusError::InvalidMessage(_) => {
@@ -2998,17 +3219,45 @@ async fn deliver_committed_session_shards(envelopes: &[crate::envelope::MessageE
         );
         return;
     };
-    for envelope in envelopes {
-        if let Err(error) = bus.try_publish(
-            crate::config::QUEUE_AUTHORIZATION_INVALIDATION,
-            crate::config::ROUTING_KEY_AUTHORIZATION_INVALIDATION,
-            envelope.clone(),
-        ) {
-            tracing::warn!(
-                message_id = %envelope.message_id,
-                error = %error,
-                "direct session shard delivery refused; the recovery relay remains authoritative"
+    let Some(pool) = SESSION_REVOCATION_DB.get() else {
+        if let Some(hub) = astral_db::memory_projection_hub() {
+            hub.mark_channel_suspect(
+                "committed session invalidations lack the identity outbox dispatch pool",
             );
+        }
+        tracing::error!("identity session invalidation direct claim has no database pool");
+        return;
+    };
+    for envelope in envelopes {
+        match dispatch_committed_local_invalidation(pool.clone(), bus.clone(), envelope).await {
+            Ok(LocalInvalidationDispatchOutcome::Completed)
+            | Ok(LocalInvalidationDispatchOutcome::AlreadyProcessed) => {}
+            Ok(LocalInvalidationDispatchOutcome::NotClaimed { status, reason }) => {
+                tracing::warn!(
+                    message_id = %envelope.message_id,
+                    status = %status,
+                    reason = %reason,
+                    "session invalidation stays recovery-owned"
+                );
+            }
+            Ok(LocalInvalidationDispatchOutcome::NotFound) => {
+                if let Some(hub) = astral_db::memory_projection_hub() {
+                    hub.mark_channel_suspect(
+                        "committed session invalidation missing its exact outbox row",
+                    );
+                }
+                tracing::error!(
+                    message_id = %envelope.message_id,
+                    "committed session invalidation has no exact outbox row"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    message_id = %envelope.message_id,
+                    error = %error,
+                    "session invalidation direct claim/dispatch/completion is unproven; durable recovery required"
+                );
+            }
         }
     }
 }
@@ -3315,7 +3564,7 @@ mod tests {
     }
 
     #[test]
-    fn bus_failures_classify_side_effect_free_from_unknown() {
+    fn bus_failures_classify_admission_refusal_separately_from_unknown() {
         for error in [
             LocalBusError::InvalidLimits,
             LocalBusError::InvalidOwner("q".into()),
@@ -3328,16 +3577,21 @@ mod tests {
                 limit: 1,
             },
             LocalBusError::Duplicate("m".into()),
-            LocalBusError::Handler("handler rejected before mutation".into()),
         ] {
             assert!(
                 matches!(
                     classify_relay_bus_failure(error),
                     LocalInvalidationRelayOutcome::KnownFailure(_)
                 ),
-                "side-effect-free bus failure must be a bounded retry"
+                "admission failure without a handler remains a bounded retry"
             );
         }
+        assert!(matches!(
+            classify_relay_bus_failure(LocalBusError::Handler(
+                "handler failed after possible mutation".into()
+            )),
+            LocalInvalidationRelayOutcome::Unknown(_)
+        ));
         assert!(matches!(
             classify_relay_bus_failure(LocalBusError::InvalidMessage(
                 "typed contract refused".into()
@@ -3421,7 +3675,36 @@ mod tests {
             handler_deadline: Duration::from_secs(astral_db::LOCAL_MESSAGE_LEASE_SECONDS),
             ..Default::default()
         };
-        assert!(settings.validate().unwrap_err().contains("lease"));
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("must stay below the durable lease"));
+
+        let settings = LocalInvalidationRelaySettings {
+            handler_deadline: Duration::from_secs(25),
+            db_call_deadline: Duration::from_secs(2),
+            ..Default::default()
+        };
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("handler + settlement + IN_DOUBT budget"));
+
+        assert!(local_invalidation_lease_budget_fits(
+            Duration::from_secs(5),
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+        ));
+        assert!(!local_invalidation_lease_budget_fits(
+            Duration::from_secs(24),
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+        ));
+        assert!(!local_invalidation_lease_budget_fits(
+            Duration::from_secs(u64::MAX),
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        ));
 
         let mut settings = LocalInvalidationRelaySettings {
             db_call_deadline: Duration::from_secs(4),
@@ -3499,7 +3782,8 @@ mod tests {
         assert_eq!(delivery.envelope.message_id, "relay-bus-dup");
         delivery.complete(Ok(()));
 
-        // Handler rejection before mutation -> KnownFailure.
+        // Handler rejection can occur after an idempotent pending fence was
+        // applied, so it is unknown and must be reconciled before any retry.
         let envelope = evidence_event()
             .to_envelope("relay-bus-err", "relay-bus-op-3", "local")
             .unwrap();
@@ -3510,15 +3794,15 @@ mod tests {
         });
         let delivery = receiver.recv().await.unwrap();
         assert_eq!(delivery.envelope.message_id, "relay-bus-err");
-        delivery.complete(Err("handler rejected before mutation".into()));
+        delivery.complete(Err("handler failed after possible local apply".into()));
         match relay_task.await.unwrap() {
-            Err(LocalInvalidationRelayOutcome::KnownFailure(reason)) => {
+            Err(LocalInvalidationRelayOutcome::Unknown(reason)) => {
                 assert!(
-                    reason.contains("handler rejected before mutation"),
+                    reason.contains("handler failed after possible local apply"),
                     "{reason}"
                 );
             }
-            other => panic!("expected handler-known failure, got {other:?}"),
+            other => panic!("expected handler-unknown outcome, got {other:?}"),
         }
 
         // Disappearing consumer -> UnknownOutcome -> Unknown.
@@ -3590,10 +3874,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_local_relay_join_aborts_the_owned_task() {
+        let (probe_tx, probe_rx) = oneshot::channel();
+        let (started_tx, started_rx) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _probe = RelayAbortProbe { tx: Some(probe_tx) };
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        let handle = LocalInvalidationRelayHandle::for_tests(join, Duration::from_secs(5));
+        {
+            let mut joining = std::pin::pin!(handle.join());
+            assert!(timeout(Duration::from_millis(1), &mut joining)
+                .await
+                .is_err());
+        }
+        assert_eq!(
+            timeout(Duration::from_secs(1), probe_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            "aborted"
+        );
+    }
+
+    #[tokio::test]
     async fn relay_handle_joins_a_cooperative_exit() {
         let join = tokio::spawn(async {});
         let handle = LocalInvalidationRelayHandle::for_tests(join, Duration::from_secs(1));
         handle.join().await.expect("cooperative exit joins");
+    }
+
+    #[tokio::test]
+    async fn relay_handle_join_error_returns_failure_and_drops_the_owned_task() {
+        let join = tokio::spawn(async { panic!("injected relay panic") });
+        let handle = LocalInvalidationRelayHandle::for_tests(join, Duration::from_secs(1));
+        let error = handle
+            .join()
+            .await
+            .expect_err("a panicked relay must never be reported as cooperative success");
+        assert!(error.contains("ended abnormally"), "{error}");
+    }
+
+    #[test]
+    fn relay_join_error_path_marks_unknown_outcome_suspect() {
+        let source = include_str!("consumers.rs");
+        let start = source
+            .find("pub async fn join(self) -> Result<(), String>")
+            .expect("owned relay join must exist");
+        let end = source[start..]
+            .find("#[cfg(test)]")
+            .expect("test helper follows relay join");
+        let body = &source[start..start + end];
+        let error_branch = body
+            .split("Ok(Err(join_error)) =>")
+            .nth(1)
+            .expect("JoinError branch must be handled explicitly");
+        let error_branch = error_branch
+            .split("Err(_elapsed) =>")
+            .next()
+            .expect("JoinError branch must end before timeout handling");
+        assert!(error_branch.contains("guard.join.take()"));
+        assert!(error_branch.contains("mark_relay_suspect("));
+        assert!(error_branch.contains("outcome unknown"));
     }
 
     #[test]

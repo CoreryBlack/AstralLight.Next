@@ -41,8 +41,10 @@ pub trait InheritanceConfigRepository: Send + Sync {
     ) -> Result<InheritanceConfigRecord, AstralError>;
     /// 按 id 更新，返回是否命中
     async fn update_by_id(&self, id: i64, inheritance_mode: &str) -> Result<bool, AstralError>;
-    /// 按 id 删除，返回是否命中
+    /// 按 id 删除，返回是否命中（legacy/internal compatibility）
     async fn delete_by_id(&self, id: i64) -> Result<bool, AstralError>;
+    /// 按 registered resource type 删除，返回是否命中。
+    async fn delete_by_resource_type(&self, resource_type: &str) -> Result<bool, AstralError>;
 }
 
 pub struct SqlxInheritanceConfigRepository {
@@ -129,6 +131,16 @@ impl InheritanceConfigRepository for SqlxInheritanceConfigRepository {
             .execute(&self.db)
             .await
             .map_err(db_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn delete_by_resource_type(&self, resource_type: &str) -> Result<bool, AstralError> {
+        let result =
+            sqlx::query("DELETE FROM permission_inheritance_config WHERE resource_type = ?")
+                .bind(resource_type)
+                .execute(&self.db)
+                .await
+                .map_err(db_error)?;
         Ok(result.rows_affected() > 0)
     }
 }

@@ -68,7 +68,7 @@ pub const TRUSTGRAPH_PATH_RESOURCE_MAP: &[(&str, &str)] = &[
     ("/inheritance", "permission_inheritance"),
     ("/cross-org-grants", "cross_org_grant"),
     ("/compliance", "audit"),
-    ("/operations", "audit"),
+    ("/operations", "domain"),
     ("/domains", "domain"),
     ("/resource-types", "domain_resource_type"),
     ("/actions", "permission_action"),
@@ -97,6 +97,9 @@ fn resolve_trustgraph_permission_action(
     path: &str,
     method: &str,
 ) -> Option<&'static str> {
+    if resource == "domain" && method == "GET" && path_matches_prefix(path, "/operations") {
+        return Some("update");
+    }
     if resource == "org_authority_edge"
         && method == "POST"
         && (path.ends_with("/move") || path.ends_with("/detach"))
@@ -112,15 +115,100 @@ fn resolve_trustgraph_permission_action(
     if resource == "audit_quarantine" && method == "POST" && path.ends_with("/replay") {
         return Some("replay");
     }
-    // 执剑人仲裁端点（POST /arbiter/arbitrate）映射到 monitor 资源一等注册的
-    // `arbitrate` 动作（registry-first，与 audit_quarantine/replay 同型）。
-    // HTTP 默认映射给 POST 推导 `create`，而 monitor 从未注册 create —— 无规则
-    // 可授予它，端点被 DEFAULT_DENY 结构性锁死（三节点战役 S12/S13 发现的远程
-    // 面阻塞）。GET /arbiter/stats 走默认 read，无需特例。
-    if resource == "monitor" && method == "POST" && path.contains("/arbiter") {
+    // Arbitration has a distinct registered action; ordinary monitor mutations
+    // must not acquire arbitration permission from the generic POST mapping.
+    if resource == "monitor" && method == "POST" && path == "/arbiter/arbitrate" {
         return Some("arbitrate");
     }
     resolve_permission_action(resource, path, method)
+}
+
+fn operation_poll_scope_matches(
+    ctx: &astral_types::PolicyContext,
+    scope: &crate::api::async_tracker::OperationScope,
+) -> bool {
+    scope.task_type == crate::api::async_tracker::BATCH_BIND_TASK_TYPE
+        && scope.requester_user_id > 0
+        && scope.requester_card_id > 0
+        && scope.requester_tenant_id > 0
+        && scope.requester_domain_id > 0
+        && ctx.user_id == Some(scope.requester_user_id)
+        && ctx.card_id == Some(scope.requester_card_id)
+        && ctx.tenant_id == Some(scope.requester_tenant_id)
+        && ctx.domain_id == Some(scope.requester_domain_id)
+        && scope.authorization_target_card_id > 0
+        && scope.authorization_target_tenant_id > 0
+        && scope.authorization_target_domain_id > 0
+        && scope.items.iter().any(|item| {
+            item.card_id == scope.authorization_target_card_id
+                && item.tenant_id == scope.authorization_target_tenant_id
+                && item.domain_id == scope.authorization_target_domain_id
+        })
+}
+
+async fn resolve_operation_poll_ownership(
+    pool: &sqlx::MySqlPool,
+    path: &str,
+    ctx: &astral_types::PolicyContext,
+) -> astral_db::ResourceOwnershipResolution {
+    use astral_db::ResourceOwnershipResolution;
+    let unresolved = ResourceOwnershipResolution::Unresolved {
+        code: "resource_ownership.operation_scope_unproven",
+    };
+    let Some(task_id) = path.strip_prefix("/operations/") else {
+        return unresolved;
+    };
+    if task_id.is_empty()
+        || task_id.len() > 64
+        || !task_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return unresolved;
+    }
+    let scope = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        crate::api::async_tracker::load_operation_scope(pool, task_id),
+    )
+    .await
+    {
+        Ok(Ok(Some(scope))) => scope,
+        Ok(Ok(None)) => return unresolved,
+        Ok(Err(_)) | Err(_) => {
+            return ResourceOwnershipResolution::Unavailable {
+                code: "resource_ownership.operation_lookup_unavailable",
+            };
+        }
+    };
+    if !operation_poll_scope_matches(ctx, &scope) {
+        return unresolved;
+    }
+    let anchor = scope
+        .items
+        .iter()
+        .find(|item| item.card_id == scope.authorization_target_card_id);
+    let anchor_path = format!("/user-cards/{}", scope.authorization_target_card_id);
+    let resolution = resolve_resource_ownership(
+        pool,
+        "domain",
+        &anchor_path,
+        "POST",
+        None,
+        ctx.card_id,
+        ctx.user_id,
+    )
+    .await;
+    match (&resolution, anchor) {
+        (
+            ResourceOwnershipResolution::TenantScoped {
+                tenant_id,
+                domain_id,
+                ..
+            },
+            Some(item),
+        ) if *tenant_id == item.tenant_id && *domain_id == Some(item.domain_id) => resolution,
+        _ => unresolved,
+    }
 }
 
 fn audit_request_id(headers: &HeaderMap) -> Option<String> {
@@ -266,16 +354,20 @@ async fn permission_check_middleware_scoped(
             return Err(BoxedResponse::new(status.into_response()));
         }
     };
-    let resolution = resolve_resource_ownership(
-        &state.db,
-        resource,
-        path,
-        method.as_str(),
-        query_target_id,
-        ctx.card_id,
-        ctx.user_id,
-    )
-    .await;
+    let resolution = if path_matches_prefix(path, "/operations") && method == "GET" {
+        resolve_operation_poll_ownership(&state.db, path, &ctx).await
+    } else {
+        resolve_resource_ownership(
+            &state.db,
+            resource,
+            path,
+            method.as_str(),
+            query_target_id,
+            ctx.card_id,
+            ctx.user_id,
+        )
+        .await
+    };
     resolution.apply_to(&mut ctx);
     #[cfg(feature = "e1-observability")]
     {
@@ -370,7 +462,7 @@ async fn permission_check_middleware_scoped(
         let hit_phase =
             policy_engine::PolicyEngine::allow_source_phase(&decision).map(String::from);
         let pool = state.db.clone();
-        tokio::spawn(async move {
+        if let Err(reason) = astral_common::audit::spawn_owned_audit(async move {
             astral_common::audit::record_permission_audit_with_request_detail(
                 user_id,
                 card_id,
@@ -397,7 +489,9 @@ async fn permission_check_middleware_scoped(
                     .await;
                 }
             }
-        });
+        }) {
+            tracing::error!(reason, "policy audit task was not admitted");
+        }
     }
 
     if !decision.allowed {
@@ -571,6 +665,77 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
+    fn operation_poll_requires_original_requester_and_exact_authorization_anchor() {
+        use crate::api::async_tracker::{OperationItemScope, OperationScope, TaskStatus};
+        let context = astral_types::PolicyContext::builder()
+            .action("update".into())
+            .user_id(Some(1))
+            .card_id(Some(2))
+            .tenant_id(Some(3))
+            .domain_id(Some(4))
+            .build();
+        let scope = OperationScope {
+            task_id: "uc_bind:task".into(),
+            task_type: "CARD_BIND".into(),
+            status: TaskStatus::InDoubt,
+            requester_user_id: 1,
+            requester_card_id: 2,
+            requester_tenant_id: 3,
+            requester_domain_id: 4,
+            authorization_target_card_id: 5,
+            authorization_target_tenant_id: 6,
+            authorization_target_domain_id: 7,
+            target_user_id: 8,
+            items: vec![OperationItemScope {
+                card_id: 5,
+                tenant_id: 6,
+                domain_id: 7,
+                status: "IN_DOUBT".into(),
+                operation_id: "batch-bind:item".into(),
+                error_message: None,
+            }],
+            total_items: 1,
+            completed_items: 0,
+            error_message: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        assert!(super::operation_poll_scope_matches(&context, &scope));
+        for changed in [
+            astral_types::PolicyContext {
+                user_id: Some(9),
+                ..context.clone()
+            },
+            astral_types::PolicyContext {
+                card_id: Some(9),
+                ..context.clone()
+            },
+            astral_types::PolicyContext {
+                tenant_id: Some(9),
+                ..context.clone()
+            },
+            astral_types::PolicyContext {
+                domain_id: Some(9),
+                ..context.clone()
+            },
+        ] {
+            assert!(!super::operation_poll_scope_matches(&changed, &scope));
+        }
+        let mut changed = scope.clone();
+        changed.items[0].tenant_id += 1;
+        assert!(!super::operation_poll_scope_matches(&context, &changed));
+        changed = scope.clone();
+        changed.items[0].domain_id += 1;
+        assert!(!super::operation_poll_scope_matches(&context, &changed));
+        changed = scope.clone();
+        changed.authorization_target_card_id += 1;
+        assert!(!super::operation_poll_scope_matches(&context, &changed));
+        changed = scope;
+        changed.task_type = "OTHER".into();
+        assert!(!super::operation_poll_scope_matches(&context, &changed));
+    }
+
+    #[test]
     fn canonical_domain_paths_resolve_resource_and_action() {
         let cases = [
             ("/audit-quarantine", "audit_quarantine", "GET", "read"),
@@ -602,6 +767,7 @@ mod tests {
                 "read",
             ),
             ("/user-cards/7/bind", "domain", "POST", "update"),
+            ("/operations/uc_bind_1", "domain", "GET", "update"),
             ("/card-templates/5/rules/batch", "domain", "POST", "create"),
         ];
 
@@ -845,7 +1011,13 @@ mod tests {
     #[test]
     fn sod_dispatch_wires_org_provenance_to_fresh_admission_recheck() {
         let source = include_str!("permission_check.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let production = source
+            .split("async fn permission_check_middleware_scoped(")
+            .nth(1)
+            .expect("scoped middleware must remain")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production middleware body");
         let fence_capture = production
             .find("capture_authority_fence")
             .expect("host must capture the opaque admission fence before authorization");

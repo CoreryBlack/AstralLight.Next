@@ -310,8 +310,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_grade_degrades_to_zero_when_missing() {
-        // 无成绩记录 → 零分降级（非 404）
+    async fn get_grade_degrades_to_zero_when_no_marked_gradebook_submission_exists() {
+        // Only exact DEFAULT_GRADE marker submissions are queried; unmarked legacy rows remain unclassified.
         let repo = Arc::new(FakeAssignmentRepository::new());
         let svc = GradeService::new(repo.clone());
         let grade = svc.get_grade(10, 7).await.unwrap();

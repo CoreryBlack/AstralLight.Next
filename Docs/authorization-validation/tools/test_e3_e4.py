@@ -207,13 +207,16 @@ def e3_config(**overrides: Any) -> e3_e4.E3SampleConfig:
         "pointer_keys": (E4_KEY,),
         "redis_queue_keys": ("astral.test.queue",),
         "decision_path": DECISION_PATH,
-        "worker_health_path": None,
+        "worker_health_path": "/health",
     }
+
     defaults.update(overrides)
     return e3_e4.E3SampleConfig(**defaults)
 
 
 def decision_responses(node: str, path: str) -> Tuple[int, Dict[str, Any]]:
+    if path == "/health":
+        return 200, {"healthy": True}
     if "cardId=card-target" in path:
         return 403, {"allowed": False, "reason": "AUTHORIZATION_PENDING"}
     if "cardId=card-unrelated" in path:
@@ -482,22 +485,45 @@ class SampleE3Test(unittest.TestCase):
                 self.assertIsInstance(decision["latency_ms"], float)
             self.assertEqual(sample["worker_health"]["redis_ping"]["status"], "PASS")
             self.assertTrue(sample["worker_health"]["redis_ping"]["healthy"])
-            self.assertEqual(sample["worker_health"]["health_endpoint"]["status"], "SKIP")
+            self.assertEqual(sample["worker_health"]["health_endpoint"]["status"], "PASS")
 
         for query in probe.sql_queries:
             self.assertTrue(query.strip().upper().startswith("SELECT"), query)
         self.assertTrue({argv[0] for argv in probe.redis_commands} <= {"LLEN", "GET", "PING"})
-        # decisions go through the actor-aware surface only; the legacy
-        # signed_get is reserved for worker health and stays untouched here
-        self.assertEqual(probe.http_requests, [])
+        # Worker readiness uses the legacy signed_get path; decisions remain on the actor-aware surface.
+        self.assertEqual(
+            probe.http_requests,
+            [("gateway", "/health")] * summary["samples_collected"],
+        )
         for _role, _card, _node, path in probe.role_requests:
             self.assertTrue(path.startswith(DECISION_PATH), path)
 
         categories = summary["output_categories"]
         self.assertEqual(categories["request_side_denial_pending"]["status"], "PASS")
         self.assertEqual(categories["unrelated_card_availability"]["status"], "PASS")
-        self.assertEqual(categories["publication_drain"]["status"], "PASS")
+        self.assertEqual(categories["publication_drain"]["status"], "UNKNOWN")
+        self.assertIn("queues", categories["publication_drain"]["note"])
         self.assertEqual(categories["per_event_retry_history"]["status"], "SKIP")
+
+    def test_publication_drain_requires_zero_queues_and_ready_endpoint(self) -> None:
+        config = e3_config()
+        sample = {
+            "queue_counts": {
+                "status": "PASS",
+                "entries": {"astral.test.queue": {"status": "PASS", "value": 0}},
+            },
+            "row_counts": {"status": "PASS", "entries": {"rows": {"status": "PASS", "value": 0}}},
+            "pointers": {"status": "PASS", "entries": {E4_KEY: {"status": "PASS", "value": "g1"}}},
+            "worker_health": {"health_endpoint": {"status": "PASS", "healthy": True}},
+            "decisions": [],
+        }
+        summary = e3_e4.sample_e3(
+            FakeProbe(redis_values=happy_redis(), responses=decision_responses),
+            "t", "u", "c", interval=0.02, duration=0.03,
+            config=config,
+        )
+        self.assertEqual(summary["output_categories"]["publication_drain"]["status"], "UNKNOWN")
+        self.assertIn("queues", summary["output_categories"]["publication_drain"]["note"])
 
     def test_snapshot_only_limitations_always_present(self) -> None:
         probe = FakeProbe(sql_rows={}, redis_values={}, responses=decision_responses)
@@ -589,7 +615,7 @@ class SampleE3Test(unittest.TestCase):
         for decision in sample["decisions"]:
             self.assertEqual(decision["decision_status"], "BLOCKED")
             self.assertEqual(decision["note"], "actor_aware_probe_required")
-        self.assertEqual(probe.http_requests, [])
+        self.assertEqual(probe.http_requests, [("gateway", "/health")] * summary["samples_collected"])
         self.assertEqual(summary["overall"], "BLOCKED")
 
     def test_signed_get_error_is_unknown_and_does_not_abort(self) -> None:
@@ -782,7 +808,10 @@ class SampleE3Test(unittest.TestCase):
                 return 200, {"data": {"effect": "NO_MATCH", "reason": "NO_RULE"}}
             return 403, {"data": {"effect": "DENY", "reason": "PERMISSION_DENIED"}}
 
-        probe2 = FakeProbe(responses=responses2, redis_values={"PING": "PONG"})
+        probe2 = FakeProbe(
+            responses=lambda node, path: (200, {"healthy": True}) if path == "/health" else responses2(node, path),
+            redis_values={"PING": "PONG"},
+        )
         summary2 = e3_e4.sample_e3(
             probe2,
             "card-pending",
@@ -886,7 +915,7 @@ class SampleE3Test(unittest.TestCase):
         def responses(node: str, path: str) -> Tuple[int, Dict[str, Any]]:
             calls.append(path)
             if path == "/health":
-                return 200, {}
+                return 200, {"healthy": True}
             return 404, {}
 
         probe = FakeProbe(responses=responses)
@@ -908,8 +937,8 @@ class SampleE3Test(unittest.TestCase):
         config = e3_config(
             redis_queue_keys=(), pointer_keys=(), row_queries=(), worker_health_path="/health"
         )
-        # legacy 2-tuple (status, body) stays accepted
-        probe = FakeProbe(responses=lambda node, path: (200, {}))
+        # A healthy readiness response explicitly attests worker readiness.
+        probe = FakeProbe(responses=lambda node, path: (200, {"healthy": True}))
         summary = e3_e4.sample_e3(
             probe, "t", "u", "c", interval=0.02, duration=0.03, config=config
         )
@@ -919,7 +948,7 @@ class SampleE3Test(unittest.TestCase):
         self.assertEqual(health["http_status"], 200)
 
         # actor-aware-style 3-tuple (status, body, request id) is accepted too
-        probe3 = FakeProbe(responses=lambda node, path: (204, {}, "req-health-1"))
+        probe3 = FakeProbe(responses=lambda node, path: (204, {"healthy": True}, "req-health-1"))
         summary3 = e3_e4.sample_e3(
             probe3, "t", "u", "c", interval=0.02, duration=0.03, config=config
         )
@@ -932,7 +961,7 @@ class SampleE3Test(unittest.TestCase):
         config = e3_config(
             redis_queue_keys=(), pointer_keys=(), row_queries=(), worker_health_path="/health"
         )
-        for bad_result in ((200,), (200, {}, "req", "extra")):
+        for bad_result in ((200,), (200, {"healthy": True}, "req", "extra")):
             probe = FakeProbe(responses=lambda node, path, _r=bad_result: _r)
             summary = e3_e4.sample_e3(
                 probe, "t", "u", "c", interval=0.02, duration=0.03, config=config

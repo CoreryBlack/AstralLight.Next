@@ -101,6 +101,11 @@ pub struct ByCardQuery {
     pub limit: Option<i32>,
 }
 
+/// Parse the card id using the same explicit query-key contract as middleware.
+fn query_target_id_for_card_stats(query: &ByCardQuery) -> Option<i64> {
+    (query.card_id > 0).then_some(query.card_id)
+}
+
 /// GET /main/api/v1/hit-stats/summary
 async fn hit_stat_summary(
     State(state): State<AppState>,
@@ -163,7 +168,6 @@ async fn hit_stat_zero_hit(
     )))
 }
 
-/// GET /main/api/v1/hit-stats/by-card?cardId=X&limit=10
 async fn hit_stat_by_card(
     State(state): State<AppState>,
     Query(q): Query<ByCardQuery>,
@@ -171,7 +175,14 @@ async fn hit_stat_by_card(
     let limit = q.limit.unwrap_or(10).clamp(1, 100);
     let rows = state
         .hit_stat_repository
-        .by_card(q.card_id, limit as i64)
+        .by_card(
+            query_target_id_for_card_stats(&q).ok_or_else(|| {
+                AppError(astral_types::AstralError::Validation(
+                    "cardId must be a positive integer".into(),
+                ))
+            })?,
+            limit as i64,
+        )
         .await?;
     Ok(Json(ApiResponse::success(
         rows.into_iter()
@@ -183,4 +194,22 @@ async fn hit_stat_by_card(
             })
             .collect(),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{query_target_id_for_card_stats, ByCardQuery};
+
+    #[test]
+    fn by_card_query_uses_a_positive_card_target() {
+        for (card_id, expected) in [(42, Some(42)), (0, None), (-1, None)] {
+            assert_eq!(
+                query_target_id_for_card_stats(&ByCardQuery {
+                    card_id,
+                    limit: Some(10)
+                }),
+                expected
+            );
+        }
+    }
 }

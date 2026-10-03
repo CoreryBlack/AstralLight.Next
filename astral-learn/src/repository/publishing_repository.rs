@@ -29,18 +29,14 @@ pub struct CourseStatsRecord {
 
 #[async_trait]
 pub trait PublishingRepository: Send + Sync {
-    /// DRAFT 或 APPROVED → PUBLISHED（守卫式），返回是否命中
+    /// DRAFT 或 APPROVED → PUBLISHED 并更新 published_at，单事务完成，返回是否命中
     async fn publish_course(&self, course_id: i64) -> Result<bool, AstralError>;
     /// 任意状态 → ARCHIVED（无守卫），返回是否命中
     async fn archive_course(&self, course_id: i64) -> Result<bool, AstralError>;
     /// DRAFT → REVIEW（守卫式），返回是否命中
     async fn submit_for_review(&self, course_id: i64) -> Result<bool, AstralError>;
-    /// REVIEW → APPROVED（守卫式），返回是否命中
-    async fn approve_course(&self, course_id: i64) -> Result<bool, AstralError>;
-    /// upsert 发布记录（published_at = NOW()）
-    async fn upsert_published_at(&self, course_id: i64) -> Result<(), AstralError>;
-    /// upsert 审批记录（reviewer_id=1, review_comment='Ready for publishing'）
-    async fn upsert_approval(&self, course_id: i64) -> Result<(), AstralError>;
+    /// REVIEW → APPROVED and record the authenticated reviewer in one transaction.
+    async fn approve_course(&self, course_id: i64, reviewer_id: i64) -> Result<bool, AstralError>;
     /// 查询工作流（无关联行 → None）
     async fn get_workflow(&self, course_id: i64) -> Result<Option<WorkflowRecord>, AstralError>;
     /// 课程统计（4 表聚合）
@@ -74,70 +70,121 @@ impl SqlxPublishingRepository {
 #[async_trait]
 impl PublishingRepository for SqlxPublishingRepository {
     async fn publish_course(&self, course_id: i64) -> Result<bool, AstralError> {
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT course_id FROM learn_course WHERE course_id = ? FOR UPDATE")
+                .bind(course_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        if exists.is_none() {
+            return Err(AstralError::NotFound(format!(
+                "Course {course_id} not found"
+            )));
+        }
         let result = sqlx::query(
             "UPDATE learn_course SET status = 'PUBLISHED' WHERE course_id = ? AND status IN ('DRAFT','APPROVED')",
         )
         .bind(course_id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
-        Ok(result.rows_affected() > 0)
+        let hit = result.rows_affected() > 0;
+        if hit {
+            sqlx::query(
+                "INSERT INTO course_workflow (course_id, published_at) \
+                 VALUES (?, NOW()) ON DUPLICATE KEY UPDATE published_at = NOW()",
+            )
+            .bind(course_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        }
+        tx.commit().await.map_err(db_error)?;
+        Ok(hit)
     }
 
     async fn archive_course(&self, course_id: i64) -> Result<bool, AstralError> {
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT course_id FROM learn_course WHERE course_id = ? FOR UPDATE")
+                .bind(course_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        if exists.is_none() {
+            return Err(AstralError::NotFound(format!(
+                "Course {course_id} not found"
+            )));
+        }
         let result = sqlx::query("UPDATE learn_course SET status = 'ARCHIVED' WHERE course_id = ?")
             .bind(course_id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await
             .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         Ok(result.rows_affected() > 0)
     }
 
     async fn submit_for_review(&self, course_id: i64) -> Result<bool, AstralError> {
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT course_id FROM learn_course WHERE course_id = ? FOR UPDATE")
+                .bind(course_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        if exists.is_none() {
+            return Err(AstralError::NotFound(format!(
+                "Course {course_id} not found"
+            )));
+        }
         let result = sqlx::query(
             "UPDATE learn_course SET status = 'REVIEW' WHERE course_id = ? AND status = 'DRAFT'",
         )
         .bind(course_id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         Ok(result.rows_affected() > 0)
     }
 
-    async fn approve_course(&self, course_id: i64) -> Result<bool, AstralError> {
+    async fn approve_course(&self, course_id: i64, reviewer_id: i64) -> Result<bool, AstralError> {
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT course_id FROM learn_course WHERE course_id = ? FOR UPDATE")
+                .bind(course_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        if exists.is_none() {
+            return Err(AstralError::NotFound(format!(
+                "Course {course_id} not found"
+            )));
+        }
         let result = sqlx::query(
             "UPDATE learn_course SET status = 'APPROVED' WHERE course_id = ? AND status = 'REVIEW'",
         )
         .bind(course_id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    async fn upsert_published_at(&self, course_id: i64) -> Result<(), AstralError> {
-        sqlx::query(
-            "INSERT INTO course_workflow (course_id, published_at) \
-             VALUES (?, NOW()) ON DUPLICATE KEY UPDATE published_at = NOW()",
-        )
-        .bind(course_id)
-        .execute(&self.db)
-        .await
-        .map_err(db_error)?;
-        Ok(())
-    }
-
-    async fn upsert_approval(&self, course_id: i64) -> Result<(), AstralError> {
-        sqlx::query(
-            "INSERT INTO course_workflow (course_id, reviewer_id, review_comment) \
-             VALUES (?, 1, 'Ready for publishing') \
-             ON DUPLICATE KEY UPDATE reviewer_id = 1, review_comment = 'Ready for publishing'",
-        )
-        .bind(course_id)
-        .execute(&self.db)
-        .await
-        .map_err(db_error)?;
-        Ok(())
+        let hit = result.rows_affected() > 0;
+        if hit {
+            sqlx::query(
+                "INSERT INTO course_workflow (course_id, reviewer_id, review_comment) \
+                 VALUES (?, ?, 'Ready for publishing') \
+                 ON DUPLICATE KEY UPDATE reviewer_id = VALUES(reviewer_id), review_comment = VALUES(review_comment)",
+            )
+            .bind(course_id)
+            .bind(reviewer_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        }
+        tx.commit().await.map_err(db_error)?;
+        Ok(hit)
     }
 
     async fn get_workflow(&self, course_id: i64) -> Result<Option<WorkflowRecord>, AstralError> {
@@ -161,6 +208,17 @@ impl PublishingRepository for SqlxPublishingRepository {
     }
 
     async fn course_stats(&self, course_id: i64) -> Result<CourseStatsRecord, AstralError> {
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT course_id FROM learn_course WHERE course_id = ?")
+                .bind(course_id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(db_error)?;
+        if exists.is_none() {
+            return Err(AstralError::NotFound(format!(
+                "Course {course_id} not found"
+            )));
+        }
         let (total_students, avg_progress, completion_rate, avg_score): (i64, f64, f64, f64) =
             sqlx::query_as(
                 "SELECT COUNT(*) as total_students, \
@@ -191,7 +249,7 @@ impl PublishingRepository for SqlxPublishingRepository {
 
     async fn count_lessons(&self, course_id: i64) -> Result<i32, AstralError> {
         sqlx::query_scalar::<_, i32>(
-            "SELECT COUNT(*) FROM learn_lesson l \
+            "SELECT CAST(COUNT(*) AS SIGNED) FROM learn_lesson l \
              JOIN learn_chapter ch ON ch.chapter_id = l.chapter_id \
              WHERE ch.subject_id = ?",
         )
@@ -203,20 +261,13 @@ impl PublishingRepository for SqlxPublishingRepository {
 
     async fn count_answered_lessons(
         &self,
-        course_id: i64,
-        user_id: i64,
+        _course_id: i64,
+        _user_id: i64,
     ) -> Result<i32, AstralError> {
-        sqlx::query_scalar::<_, i32>(
-            "SELECT COUNT(DISTINCT l.id) FROM learn_lesson l \
-             JOIN learn_chapter ch ON ch.chapter_id = l.chapter_id \
-             JOIN learn_question_first_attempt qfa ON qfa.subject_id = ch.subject_id \
-             WHERE ch.subject_id = ? AND qfa.user_id = ?",
-        )
-        .bind(course_id)
-        .bind(user_id)
-        .fetch_one(&self.db)
-        .await
-        .map_err(db_error)
+        Err(AstralError::NotImplemented(
+            "Per-course completed lesson count requires an authoritative lesson-attempt relation"
+                .into(),
+        ))
     }
 
     async fn get_enrollment_progress(

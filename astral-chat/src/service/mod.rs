@@ -6,5 +6,6 @@
 pub mod group_service;
 pub mod message_service;
 pub mod receipt_service;
+pub mod send_intent_relay;
 pub mod session_service;
 pub mod side_effect;

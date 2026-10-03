@@ -64,27 +64,14 @@ pub fn user_answer_routes() -> Router<AppState> {
 
 async fn submit_answer(
     headers: HeaderMap,
-    State(state): State<AppState>,
-    Json(req): Json<SubmitAnswerReq>,
+    State(_state): State<AppState>,
+    Json(_req): Json<SubmitAnswerReq>,
 ) -> Result<Json<ApiResponse<UserAnswer>>, AppError> {
-    require_same_user(authenticated_user_id(&headers)?, req.user_id)?;
-    let id = state
-        .user_answer_repository
-        .create(
-            req.user_id,
-            req.question_id,
-            req.answer.as_deref(),
-            req.is_correct,
-        )
-        .await?;
-    Ok(Json(ApiResponse::success(UserAnswer {
-        id,
-        user_id: req.user_id,
-        question_id: req.question_id,
-        answer: req.answer,
-        is_correct: req.is_correct as i32,
-        created_at: None,
-    })))
+    require_same_user(authenticated_user_id(&headers)?, _req.user_id)?;
+    Err(astral_types::AstralError::NotImplemented(
+        "Answer submission requires server-side scoring; client correctness is not accepted".into(),
+    )
+    .into())
 }
 
 async fn list_user_answers(

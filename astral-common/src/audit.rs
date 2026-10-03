@@ -11,9 +11,107 @@
 //! - 事件类型: AuditService.java:19-24 (6 种 + category 分类)
 //! - MQ 双写: AuditService.java:124-137 sendViaMQ() — MQ 主路径 + DB fallbackInsert()
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::service::AUDIT_DETAIL_MAX_BYTES;
+
+const MAX_OWNED_AUDIT_TASKS: usize = 1_024;
+
+#[derive(Default)]
+struct AuditTaskState {
+    closed: bool,
+    draining: bool,
+    failed: bool,
+    tasks: tokio::task::JoinSet<()>,
+}
+
+#[derive(Default)]
+struct AuditTaskOwner {
+    state: Mutex<AuditTaskState>,
+    drain: tokio::sync::Mutex<()>,
+}
+
+impl AuditTaskOwner {
+    fn spawn<F>(&self, task: F) -> Result<(), &'static str>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut state = self.state.lock().map_err(|_| "audit task owner poisoned")?;
+        while let Some(result) = state.tasks.try_join_next() {
+            if result.is_err() {
+                state.failed = true;
+                tracing::error!("owned policy audit task failed");
+            }
+        }
+        if state.closed {
+            return Err("audit task admission closed");
+        }
+        if state.tasks.len() >= MAX_OWNED_AUDIT_TASKS {
+            return Err("audit task capacity exceeded");
+        }
+        state.tasks.spawn(task);
+        Ok(())
+    }
+
+    async fn shutdown(&self, deadline: Duration) -> Result<(), String> {
+        let _drain = self.drain.lock().await;
+        let (mut tasks, failed) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "audit task owner poisoned".to_owned())?;
+            if state.draining {
+                return Err("previous audit drain was interrupted; outcome unknown".to_owned());
+            }
+            state.closed = true;
+            state.draining = true;
+            (std::mem::take(&mut state.tasks), state.failed)
+        };
+        let mut failed = failed;
+        let completed = tokio::time::timeout(deadline, async {
+            while let Some(result) = tasks.join_next().await {
+                failed |= result.is_err();
+            }
+        })
+        .await
+        .is_ok();
+        if !completed {
+            tasks.abort_all();
+            failed = true;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "audit task owner poisoned".to_owned())?;
+        state.draining = false;
+        state.failed |= failed;
+        if !completed {
+            Err("policy audit drain timed out; pending outcomes unknown".to_owned())
+        } else if state.failed {
+            Err("policy audit task failure was observed during runtime".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn audit_task_owner() -> &'static AuditTaskOwner {
+    static OWNER: OnceLock<AuditTaskOwner> = OnceLock::new();
+    OWNER.get_or_init(AuditTaskOwner::default)
+}
+
+pub fn spawn_owned_audit<F>(task: F) -> Result<(), &'static str>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    audit_task_owner().spawn(task)
+}
+
+/// Call only after every producer has stopped; task drain is not durable audit proof.
+pub async fn drain_owned_audit_tasks(deadline: Duration) -> Result<(), String> {
+    audit_task_owner().shutdown(deadline).await
+}
 
 /// 审计事件类型（对齐 Java AuditService.java:19-24）
 ///
@@ -432,11 +530,15 @@ pub fn spawn_internal_session_audit(
         record_audit(entry);
         return;
     };
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(async move {
-            writer.write(entry).await;
-        });
-    } else {
+    if tokio::runtime::Handle::try_current().is_err() {
+        record_audit(entry);
+        return;
+    }
+    let queued_entry = entry.clone();
+    if let Err(reason) = spawn_owned_audit(async move {
+        writer.write(queued_entry).await;
+    }) {
+        tracing::warn!(reason, "internal session audit admission refused");
         record_audit(entry);
     }
 }
@@ -563,6 +665,81 @@ mod tests {
     };
     use crate::service::AUDIT_DETAIL_MAX_BYTES;
     use astral_types::org_scope::{OrgBranchKind, OrgBranchProvenance, OrgGrantRef};
+
+    #[tokio::test]
+    async fn owned_audit_tasks_drain_before_admission_closes() {
+        let owner = super::AuditTaskOwner::default();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        owner
+            .spawn(async {
+                tokio::task::yield_now().await;
+                done_tx.send(()).unwrap();
+            })
+            .unwrap();
+        owner
+            .shutdown(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        done_rx.await.unwrap();
+        assert!(owner.spawn(async {}).is_err());
+        owner
+            .shutdown(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_audit_drain_cannot_report_success() {
+        let owner = super::AuditTaskOwner::default();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        owner
+            .spawn(async {
+                ready_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+        ready_rx.await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            owner.shutdown(std::time::Duration::from_secs(1)),
+        )
+        .await
+        .is_err());
+        assert!(owner
+            .shutdown(std::time::Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .contains("unknown"));
+    }
+
+    #[tokio::test]
+    async fn audit_drain_timeout_is_sticky_failure() {
+        let owner = super::AuditTaskOwner::default();
+        owner.spawn(std::future::pending()).unwrap();
+        assert!(owner
+            .shutdown(std::time::Duration::from_millis(1))
+            .await
+            .is_err());
+        assert!(owner
+            .shutdown(std::time::Duration::from_secs(1))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn internal_session_audit_uses_owned_admission_with_tracing_fallback() {
+        let source = include_str!("audit.rs");
+        let body = source
+            .split("pub fn spawn_internal_session_audit(")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn record_permission_audit(")
+            .next()
+            .unwrap();
+        assert!(body.contains("spawn_owned_audit(async move"));
+        assert!(body.contains("record_audit(entry)"));
+        assert!(!body.contains("handle.spawn("));
+    }
 
     #[test]
     fn permission_event_uses_authz_check_wire_contract() {

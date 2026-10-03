@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 
 use astral_common::contract::{ApiResponse, EmptyResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
+use astral_db::validate_dynamic_sod_condition_script;
 use astral_types::AstralError;
 
 use crate::repository::sod_repository::{SodPolicyRecord, SodViolationRecord};
@@ -145,6 +146,44 @@ pub fn sod_routes() -> Router<AppState> {
 
 // ===== 策略 CRUD =====
 
+fn validate_sod_policy(policy: &SodPolicy) -> Result<(), AppError> {
+    if policy.policy_name.trim().is_empty() {
+        return Err(AppError(AstralError::Validation(
+            "policy_name is required".into(),
+        )));
+    }
+    match policy.conflict_type.as_str() {
+        "STATIC" => {
+            if policy.permission_a.as_deref().is_none_or(str::is_empty)
+                || policy.permission_b.as_deref().is_none_or(str::is_empty)
+            {
+                return Err(AppError(AstralError::Validation(
+                    "STATIC SoD policies require permission_a and permission_b".into(),
+                )));
+            }
+        }
+        "DYNAMIC" => {
+            let script = policy.condition_script.as_deref().ok_or_else(|| {
+                AppError(AstralError::Validation(
+                    "DYNAMIC SoD policies require condition_script".into(),
+                ))
+            })?;
+            if script.len() > astral_db::MAX_DYNAMIC_CONDITION_SCRIPT_BYTES {
+                return Err(AppError(AstralError::Validation(
+                    "condition_script exceeds configured size limit".into(),
+                )));
+            }
+            validate_dynamic_sod_condition_script(script).map_err(AppError)?;
+        }
+        _ => {
+            return Err(AppError(AstralError::Validation(
+                "conflict_type must be STATIC or DYNAMIC".into(),
+            )))
+        }
+    }
+    Ok(())
+}
+
 async fn list_policies(
     State(state): State<AppState>,
     Query(page): Query<PaginationParams>,
@@ -180,6 +219,7 @@ async fn create_policy(
             "conflict_type must be STATIC or DYNAMIC".into(),
         )));
     }
+    validate_sod_policy(&req)?;
 
     let record = SodPolicyRecord::from(&req);
     let id = state.sod_repository.create_policy(&record).await?;
@@ -209,6 +249,7 @@ async fn update_policy(
     Path(id): Path<i64>,
     Json(req): Json<SodPolicy>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
+    validate_sod_policy(&req)?;
     let record = SodPolicyRecord::from(&req);
     state.sod_repository.update_policy(id, &record).await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
@@ -376,6 +417,45 @@ async fn validate_grant(
         conflict_policy: None,
         conflict_permission: None,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_sod_policy, SodPolicy};
+
+    fn dynamic_policy(script: Option<&str>) -> SodPolicy {
+        SodPolicy {
+            policy_id: None,
+            policy_name: "owner-self-approval".into(),
+            description: None,
+            conflict_type: "DYNAMIC".into(),
+            resource_type: Some("approval".into()),
+            action_code: Some("approve".into()),
+            permission_a: None,
+            permission_b: None,
+            condition_script: script.map(str::to_owned),
+            status: "ACTIVE".into(),
+            limit_count: None,
+            limit_window: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn dynamic_sod_write_rejects_unknown_operator_or_script() {
+        assert!(
+            validate_sod_policy(&dynamic_policy(Some("resourceOwnerId == currentUserId"))).is_ok()
+        );
+        for script in [
+            None,
+            Some("resourceOwnerId != currentUserId"),
+            Some("resourceOwnerId == currentUserId || true"),
+            Some("resourceOwnerId == unknown"),
+        ] {
+            assert!(validate_sod_policy(&dynamic_policy(script)).is_err());
+        }
+    }
 }
 
 /// 授权校验结果

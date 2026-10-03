@@ -476,10 +476,9 @@ mod tests {
 
     #[test]
     fn rejects_alias_action_with_unregistered_expansion() {
-        // monitor 未注册 create/update/delete（write 的展开集），别名载荷必须
-        // 整体拒绝，绝不产生部分授予。
+        // learn_device only registers read; a write alias cannot partially grant.
         let error =
-            validate_entry_fields("ALLOW", Some("monitor"), Some("write"), None).unwrap_err();
+            validate_entry_fields("ALLOW", Some("learn_device"), Some("write"), None).unwrap_err();
         assert!(matches!(error, AstralError::Validation(_)));
     }
 

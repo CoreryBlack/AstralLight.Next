@@ -235,11 +235,25 @@ async fn build_service_health(
         .monitor_service
         .latest_metric(service_name, "latency")
         .await?;
+    let probe_unknown = state
+        .monitor_service
+        .latest_metric(service_name, "probe_status_unknown")
+        .await?;
     let reachable = state
         .monitor_service
         .latest_metric(service_name, "reachable")
         .await?;
 
+    if probe_unknown.is_some_and(|unknown| unknown > 0.0) {
+        return Ok(ServiceHealth {
+            name: capitalize(service_name),
+            domain: domain.into(),
+            status: "unknown".into(),
+            latency: "未知".into(),
+            throughput: "未知".into(),
+            note: "探活契约不可用".into(),
+        });
+    }
     let Some(reachable) = reachable else {
         return Ok(ServiceHealth {
             name: capitalize(service_name),

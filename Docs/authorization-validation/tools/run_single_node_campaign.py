@@ -457,6 +457,8 @@ def main(argv: list[str] | None = None) -> int:
     e2_status = (
         "PASS" if len(e2_ids) == 5 and all(command_status[name] == "PASS" for name in e2_ids)
         else "FAIL" if any(command_status[name] == "FAIL" for name in e2_ids)
+        else "UNKNOWN" if any(command_status[name] == "UNKNOWN" for name in e2_ids)
+        else "BLOCKED" if any(command_status[name] == "BLOCKED" for name in e2_ids)
         else "SKIP"
     )
     scenarios = {
@@ -521,9 +523,19 @@ def main(argv: list[str] | None = None) -> int:
         "skippedCommands": skipped_commands,
         "runtimePreflight": preflight,
         "statisticsUnit": {
-            "E2": "one in-memory paired scenario per omission control",
+            "E2": "one in-memory paired scenario per omission control; five one-shot controls, no repeated-run distribution",
             "E5": "finite abstract-model schedules (single- and two-mutation models, universal hypotheses), not production implementation proof",
             "E1/E3/E4": "not run",
+        },
+        "coverage": {
+            "E2": {
+                "scope": "five exact Rust unit-test omission controls",
+                "runsPerControl": 1,
+                "repeatedRunProof": False,
+                "productionBinaryProof": False,
+                "hostMediationProof": False,
+                "status": e2_status,
+            }
         },
         "secretHandling": "No private node configuration, credentials, or remote targets were read or written.",
     }

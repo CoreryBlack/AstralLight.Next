@@ -27,6 +27,8 @@ pub struct Message {
     pub conversation_id: i64,
     pub content: String,
     pub message_type: String,
+    pub client_msg_id: String,
+    pub status: String,
     pub created_at: Option<i64>, // Unix timestamp
 }
 
@@ -37,6 +39,7 @@ pub struct SendMessageRequest {
     pub conversation_id: i64,
     pub content: String,
     pub message_type: Option<String>,
+    pub client_msg_id: String,
 }
 
 /// 消息路由
@@ -45,7 +48,10 @@ pub fn message_routes() -> Router<AppState> {
         .route("/messages", post(send_message))
         .route("/messages/{id}", get(get_message))
         .route("/messages/{id}", delete(delete_message))
-        .route("/messages/session/{conversation_id}", get(list_session_messages))
+        .route(
+            "/messages/session/{conversation_id}",
+            get(list_session_messages),
+        )
 }
 
 /// POST /v1/chat/messages — 发送消息（8步链路，编排在 MessageService）
@@ -63,6 +69,7 @@ async fn send_message(
             conversation_id: req.conversation_id,
             content: req.content,
             message_type,
+            client_msg_id: req.client_msg_id,
         })
         .await?;
     Ok(Json(ApiResponse::success(message)))

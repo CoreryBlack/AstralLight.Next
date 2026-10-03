@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use sqlx::{MySql, MySqlPool, Transaction};
 
+use astral_db::grant_ledger::validated_request_operation_id;
 use astral_db::memory_projection_hub::SourceTransactionGuard;
 use astral_db::{
     append_in_tx, append_projection_event_with_metadata_and_tenant_in_tx,
@@ -34,6 +35,157 @@ use astral_mq::invalidation::{
 };
 use astral_mq::{local_bus, MessageEnvelope};
 use astral_types::{AstralError, ProjectionAggregate, EVENT_TYPE_ELIGIBILITY_UPDATE};
+
+/// Gateway-verified identity and scope captured for one Identity org mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgMutationContext {
+    actor_id: i64,
+    actor_card_id: i64,
+    actor_tenant_id: i64,
+    actor_domain_id: i64,
+    request_id: String,
+}
+
+impl OrgMutationContext {
+    pub(crate) fn new(
+        actor_id: i64,
+        actor_card_id: i64,
+        actor_tenant_id: i64,
+        actor_domain_id: i64,
+        request_id: Option<&str>,
+    ) -> Result<Self, AstralError> {
+        if actor_id <= 0 || actor_card_id <= 0 || actor_tenant_id <= 0 || actor_domain_id <= 0 {
+            return Err(AstralError::Auth(
+                "org mutation requires positive Gateway-verified user-card context".into(),
+            ));
+        }
+        let request_id = validated_request_operation_id(request_id)?.ok_or_else(|| {
+            AstralError::Auth("org mutation requires a canonical request id".into())
+        })?;
+        Ok(Self {
+            actor_id,
+            actor_card_id,
+            actor_tenant_id,
+            actor_domain_id,
+            request_id,
+        })
+    }
+
+    fn audit_request_id(&self) -> Result<String, AstralError> {
+        validated_request_operation_id(Some(&self.request_id))?.ok_or_else(|| {
+            AstralError::Validation("org mutation audit requires a stable request id".into())
+        })
+    }
+}
+
+fn unsafe_org_mutation_context() -> AstralError {
+    AstralError::Auth(
+        "org/domain/tenant mutation requires Gateway-verified user-card context".into(),
+    )
+}
+
+type OrgActorCardRow = (Option<i64>, Option<i64>, Option<i64>, String);
+
+async fn verify_org_mutation_actor_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    context: &OrgMutationContext,
+) -> Result<(), AstralError> {
+    let actor: Option<OrgActorCardRow> = sqlx::query_as(ORG_MUTATION_ACTOR_LOCK_SQL)
+        .bind(context.actor_card_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db_error)?;
+    match actor {
+        Some((Some(user_id), Some(tenant_id), Some(domain_id), status))
+            if user_id == context.actor_id
+                && tenant_id == context.actor_tenant_id
+                && domain_id == context.actor_domain_id
+                && status == "ACTIVE" =>
+        {
+            Ok(())
+        }
+        _ => Err(AstralError::Auth(
+            "Gateway org mutation card context no longer matches an active user_card".into(),
+        )),
+    }
+}
+
+async fn insert_org_mutation_audit_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    context: &OrgMutationContext,
+    action: &str,
+    resource: &str,
+    target_id: i64,
+    operation_id: &str,
+    detail: serde_json::Value,
+) -> Result<String, AstralError> {
+    if context.actor_id <= 0
+        || context.actor_card_id <= 0
+        || context.actor_tenant_id <= 0
+        || context.actor_domain_id <= 0
+        || target_id <= 0
+        || action.is_empty()
+        || resource.is_empty()
+    {
+        return Err(AstralError::Validation(
+            "org mutation audit requires positive actor scope and target".into(),
+        ));
+    }
+    if operation_id.trim().is_empty() || operation_id.trim() != operation_id {
+        return Err(AstralError::Validation(
+            "org mutation audit requires a canonical operation id".into(),
+        ));
+    }
+    let operation_id = operation_id.to_owned();
+    let request_id = context.audit_request_id()?;
+    let detail = serde_json::to_string(&serde_json::json!({
+        "actorId": context.actor_id,
+        "actorCardId": context.actor_card_id,
+        "actorTenantId": context.actor_tenant_id,
+        "actorDomainId": context.actor_domain_id,
+        "targetType": resource,
+        "targetId": target_id,
+        "action": action,
+        "operationId": operation_id,
+        "mutation": detail,
+    }))
+    .map_err(|error| {
+        AstralError::Validation(format!(
+            "org mutation audit detail serialization failed: {error}"
+        ))
+    })?;
+    sqlx::query(ORG_MUTATION_AUDIT_INSERT_SQL)
+        .bind(context.actor_id)
+        .bind(context.actor_card_id)
+        .bind(action)
+        .bind(resource)
+        .bind(request_id)
+        .bind(context.actor_domain_id)
+        .bind(context.actor_tenant_id)
+        .bind(detail)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| {
+            AstralError::Database(format!("org mutation audit insert failed: {error}"))
+        })?;
+    Ok(operation_id)
+}
+
+async fn commit_org_mutation_tx(
+    tx: Transaction<'_, MySql>,
+    source_guard: &Option<SourceTransactionGuard>,
+) -> Result<(), AstralError> {
+    arm_org_commit_fence(source_guard);
+    let commit_result = tx.commit().await;
+    settle_org_commit_fence_on_proven(source_guard, &commit_result);
+    match commit_result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            close_memory_authority_on_unknown_commit(source_guard, &error.to_string());
+            Err(db_error(error))
+        }
+    }
+}
 
 /// 组织行（tenant_type='ENTERPRISE' 的租户）。
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -77,6 +229,15 @@ const TENANT_ROW_SQL: &str =
     "SELECT tenant_id as id, tenant_name as name, tenant_code as code, status, \
      DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%sZ') as created_at \
      FROM tenant";
+const ORG_MUTATION_ACTOR_LOCK_SQL: &str =
+    "SELECT user_id, tenant_id, domain_id, card_status FROM user_card WHERE card_id = ? FOR UPDATE";
+const ORG_MUTATION_AUDIT_INSERT_SQL: &str = "INSERT INTO audit_log (user_id, card_id, action, resource, decision, reason, event_type, request_id, domain_id, tenant_id, detail) VALUES (?, ?, ?, ?, 'SUCCESS', NULL, 'IDENTITY_ORG_MUTATION', ?, ?, ?, ?)";
+/// Domain deletion would cascade this relation, which is part of live card eligibility.
+/// Lock even inactive rows and reject the destructive operation rather than silently
+/// dropping the mapping or trying to fan out beyond the bounded tenant-child contract.
+const DOMAIN_MAPPING_REFERENCE_LOCK_SQL: &str = "SELECT tenant_id FROM tenant_domain_map WHERE domain_id = ? ORDER BY tenant_id LIMIT 1 FOR UPDATE";
+const DOMAIN_USER_CARD_REFERENCE_LOCK_SQL: &str =
+    "SELECT card_id FROM user_card WHERE domain_id = ? ORDER BY card_id LIMIT 1 FOR UPDATE";
 const TENANT_STATUS_LOCK_SQL: &str = "SELECT status FROM tenant WHERE tenant_id = ? FOR UPDATE";
 const TENANT_ID_LOCK_SQL: &str = "SELECT tenant_id FROM tenant WHERE tenant_id = ? FOR UPDATE";
 const ENTERPRISE_STATUS_LOCK_SQL: &str =
@@ -201,9 +362,8 @@ fn origin_region() -> Result<String, AstralError> {
 /// `ByTenantId` 选择器一致：ACTIVE 卡、`card_id` 升序、事务内 `FOR UPDATE`、
 /// 同条查询捕获 tenant（无逐卡二次 source 读）；`LIMIT ?` 绑定 cap+1，超限
 /// 在任何 mutation 之前拒绝。
-const ELIGIBILITY_CARDS_BY_TENANT_SQL: &str = "SELECT card_id, tenant_id FROM user_card \
-     WHERE tenant_id = ? AND card_status = 'ACTIVE' \
-     ORDER BY card_id LIMIT ? FOR UPDATE";
+const ELIGIBILITY_CARDS_BY_TENANT_SQL: &str = "SELECT card_id, tenant_id FROM user_card WHERE tenant_id = ? AND card_status = 'ACTIVE' ORDER BY card_id LIMIT ? FOR UPDATE";
+const ELIGIBILITY_CARDS_BY_DOMAIN_SQL: &str = "SELECT card_id, tenant_id FROM user_card WHERE domain_id = ? AND card_status = 'ACTIVE' ORDER BY card_id LIMIT ? FOR UPDATE";
 
 /// 事务内 ELIGIBILITY 扇出扫描（仅锁读，零 mutation）：取 cap+1 窗口，超过
 /// cap 即拒绝——调用方在任何写入之前拿到裁决，绝不落半途 mutation。
@@ -457,7 +617,19 @@ fn close_memory_authority_on_unknown_commit(
 #[async_trait]
 pub trait OrgRepository: Send + Sync {
     async fn list_orgs(&self) -> Result<Vec<OrganizationRecord>, AstralError>;
-    async fn create_org(&self, name: &str, status: &str) -> Result<i64, AstralError>;
+    /// Compatibility API retained for non-HTTP callers; production adapters fail closed.
+    async fn create_org(&self, _name: &str, _status: &str) -> Result<i64, AstralError> {
+        Err(unsafe_org_mutation_context())
+    }
+    async fn create_org_with_context(
+        &self,
+        name: &str,
+        status: &str,
+        context: &OrgMutationContext,
+    ) -> Result<i64, AstralError> {
+        let _ = (name, status, context);
+        Err(unsafe_org_mutation_context())
+    }
     async fn get_org(&self, id: i64) -> Result<Option<OrganizationRecord>, AstralError>;
     async fn update_org(
         &self,
@@ -465,10 +637,32 @@ pub trait OrgRepository: Send + Sync {
         name: &str,
         code: &str,
         status: &str,
-    ) -> Result<(), AstralError>;
+    ) -> Result<(), AstralError> {
+        let _ = (id, name, code, status);
+        Err(unsafe_org_mutation_context())
+    }
+    async fn update_org_with_context(
+        &self,
+        id: i64,
+        name: &str,
+        code: &str,
+        status: &str,
+        context: &OrgMutationContext,
+    ) -> Result<(), AstralError> {
+        let _ = (id, name, code, status, context);
+        Err(unsafe_org_mutation_context())
+    }
     /// 删除企业组织（tenant_type='ENTERPRISE' 租户行）；任何 `user_card` 仍
     /// 引用该租户时 fail-closed 拒绝（与 `delete_tenant` 同一守卫，不级联吊销）。
-    async fn delete_org(&self, id: i64) -> Result<(), AstralError>;
+    async fn delete_org(&self, id: i64) -> Result<(), AstralError> {
+        let _ = id;
+        Err(unsafe_org_mutation_context())
+    }
+    async fn delete_org_with_context(
+        &self,
+        id: i64,
+        context: &OrgMutationContext,
+    ) -> Result<(), AstralError>;
 
     async fn list_org_domains(&self, org_id: i64) -> Result<Vec<DomainRecord>, AstralError>;
 
@@ -478,6 +672,16 @@ pub trait OrgRepository: Send + Sync {
         name: &str,
         code: Option<&str>,
         status: &str,
+    ) -> Result<i64, AstralError> {
+        let _ = (name, code, status);
+        Err(unsafe_org_mutation_context())
+    }
+    async fn create_domain_with_context(
+        &self,
+        name: &str,
+        code: Option<&str>,
+        status: &str,
+        context: &OrgMutationContext,
     ) -> Result<i64, AstralError>;
     async fn get_domain(&self, id: i64) -> Result<Option<DomainRecord>, AstralError>;
     async fn update_domain(
@@ -486,13 +690,50 @@ pub trait OrgRepository: Send + Sync {
         name: &str,
         code: Option<&str>,
         status: &str,
-    ) -> Result<(), AstralError>;
-    async fn delete_domain(&self, id: i64) -> Result<(), AstralError>;
+    ) -> Result<(), AstralError> {
+        let _ = (id, name, code, status);
+        Err(unsafe_org_mutation_context())
+    }
+    async fn update_domain_with_context(
+        &self,
+        id: i64,
+        name: &str,
+        code: Option<&str>,
+        status: &str,
+        context: &OrgMutationContext,
+    ) -> Result<(), AstralError> {
+        let _ = (id, name, code, status, context);
+        Err(unsafe_org_mutation_context())
+    }
+    async fn delete_domain(&self, id: i64) -> Result<(), AstralError> {
+        let _ = id;
+        Err(unsafe_org_mutation_context())
+    }
+    async fn delete_domain_with_context(
+        &self,
+        id: i64,
+        context: &OrgMutationContext,
+    ) -> Result<(), AstralError> {
+        let _ = (id, context);
+        Err(unsafe_org_mutation_context())
+    }
 
     async fn list_domain_tenants(&self, domain_id: i64) -> Result<Vec<TenantRecord>, AstralError>;
 
     async fn list_all_tenants(&self) -> Result<Vec<TenantRecord>, AstralError>;
-    async fn create_tenant(&self, name: &str, status: &str) -> Result<i64, AstralError>;
+    async fn create_tenant(&self, name: &str, status: &str) -> Result<i64, AstralError> {
+        let _ = (name, status);
+        Err(unsafe_org_mutation_context())
+    }
+    async fn create_tenant_with_context(
+        &self,
+        name: &str,
+        status: &str,
+        context: &OrgMutationContext,
+    ) -> Result<i64, AstralError> {
+        let _ = (name, status, context);
+        Err(unsafe_org_mutation_context())
+    }
     async fn get_tenant(&self, id: i64) -> Result<Option<TenantRecord>, AstralError>;
     async fn update_tenant(
         &self,
@@ -500,9 +741,34 @@ pub trait OrgRepository: Send + Sync {
         name: &str,
         code: &str,
         status: &str,
-    ) -> Result<(), AstralError>;
+    ) -> Result<(), AstralError> {
+        let _ = (id, name, code, status);
+        Err(unsafe_org_mutation_context())
+    }
+    async fn update_tenant_with_context(
+        &self,
+        id: i64,
+        name: &str,
+        code: &str,
+        status: &str,
+        context: &OrgMutationContext,
+    ) -> Result<(), AstralError> {
+        let _ = (id, name, code, status, context);
+        Err(unsafe_org_mutation_context())
+    }
     /// 删除租户；任何 `user_card` 仍引用该租户时 fail-closed 拒绝（不级联吊销）。
-    async fn delete_tenant(&self, id: i64) -> Result<(), AstralError>;
+    async fn delete_tenant(&self, id: i64) -> Result<(), AstralError> {
+        let _ = id;
+        Err(unsafe_org_mutation_context())
+    }
+    async fn delete_tenant_with_context(
+        &self,
+        id: i64,
+        context: &OrgMutationContext,
+    ) -> Result<(), AstralError> {
+        let _ = (id, context);
+        Err(unsafe_org_mutation_context())
+    }
 }
 
 pub struct SqlxOrgRepository {
@@ -524,17 +790,43 @@ impl OrgRepository for SqlxOrgRepository {
             .map_err(db_error)
     }
 
-    async fn create_org(&self, name: &str, status: &str) -> Result<i64, AstralError> {
+    async fn create_org(&self, _name: &str, _status: &str) -> Result<i64, AstralError> {
+        Err(unsafe_org_mutation_context())
+    }
+
+    async fn create_org_with_context(
+        &self,
+        name: &str,
+        status: &str,
+        context: &OrgMutationContext,
+    ) -> Result<i64, AstralError> {
+        let source_guard = begin_org_source_writer_guard()?;
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        verify_org_mutation_actor_in_tx(&mut tx, context).await?;
         let result = sqlx::query(
             "INSERT INTO tenant (tenant_code, tenant_name, tenant_type, status) \
              VALUES (CONCAT('T', UNIX_TIMESTAMP()), ?, 'ENTERPRISE', ?)",
         )
         .bind(name)
         .bind(status)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
-        Ok(result.last_insert_id() as i64)
+        let id = i64::try_from(result.last_insert_id())
+            .map_err(|_| AstralError::Database("created org id exceeds i64".into()))?;
+        let audit_operation_id = context.request_id.clone();
+        insert_org_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            "create",
+            "organization",
+            id,
+            &audit_operation_id,
+            serde_json::json!({ "name": name, "status": status }),
+        )
+        .await?;
+        commit_org_mutation_tx(tx, &source_guard).await?;
+        Ok(id)
     }
 
     async fn get_org(&self, id: i64) -> Result<Option<OrganizationRecord>, AstralError> {
@@ -547,10 +839,21 @@ impl OrgRepository for SqlxOrgRepository {
 
     async fn update_org(
         &self,
+        _id: i64,
+        _name: &str,
+        _code: &str,
+        _status: &str,
+    ) -> Result<(), AstralError> {
+        Err(unsafe_org_mutation_context())
+    }
+
+    async fn update_org_with_context(
+        &self,
         id: i64,
         name: &str,
         code: &str,
         status: &str,
+        context: &OrgMutationContext,
     ) -> Result<(), AstralError> {
         // generic hub 写者栅栏：begin 前取得，持有到 commit+dispatch。
         let source_guard = begin_org_source_writer_guard()?;
@@ -565,15 +868,11 @@ impl OrgRepository for SqlxOrgRepository {
             .await
             .map_err(db_error)?;
         let Some((current_status,)) = current else {
-            // 无写早退提交：仅锁读零写，不 arm 取消栅栏（无 durable mutation
-            // 可被取消中断）。
-            tx.commit().await.map_err(db_error)?;
-            return Ok(());
+            return Err(AstralError::NotFound(format!("organization {id}")));
         };
-
+        verify_org_mutation_actor_in_tx(&mut tx, context).await?;
         let mut invalidation_receipts = Vec::new();
         let fanout = if status_changed(&current_status, status) {
-            // cap 扫描先于任何 mutation：超限即拒绝（此时仅锁读，零写入）。
             Some(scan_tenant_eligibility_cards_in_tx(&mut tx, id).await?)
         } else {
             None
@@ -590,8 +889,12 @@ impl OrgRepository for SqlxOrgRepository {
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        let operation_id = if status_changed(&current_status, status) {
+            tenant_status_operation_id(id, &current_status, status)
+        } else {
+            format!("org:tenant-update:{id}")
+        };
         if let Some(cards) = fanout {
-            let operation_id = tenant_status_operation_id(id, &current_status, status);
             append_tenant_eligibility_with_invalidation_in_tx(
                 &mut tx,
                 id,
@@ -601,6 +904,21 @@ impl OrgRepository for SqlxOrgRepository {
             )
             .await?;
         }
+        insert_org_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            "update",
+            "organization",
+            id,
+            &operation_id,
+            serde_json::json!({
+                "name": name,
+                "code": code,
+                "fromStatus": current_status,
+                "toStatus": status,
+            }),
+        )
+        .await?;
         arm_org_commit_fence(&source_guard);
         let commit_result = tx.commit().await;
         let proven_receipts =
@@ -621,6 +939,15 @@ impl OrgRepository for SqlxOrgRepository {
     }
 
     async fn delete_org(&self, id: i64) -> Result<(), AstralError> {
+        let _ = id;
+        Err(unsafe_org_mutation_context())
+    }
+
+    async fn delete_org_with_context(
+        &self,
+        id: i64,
+        context: &OrgMutationContext,
+    ) -> Result<(), AstralError> {
         // generic hub 写者栅栏：begin 前取得，持有到 commit+dispatch。
         let source_guard = begin_org_source_writer_guard()?;
         let mut tx = self
@@ -634,11 +961,10 @@ impl OrgRepository for SqlxOrgRepository {
             .await
             .map_err(db_error)?;
         if existing.is_none() {
-            // 无写早退提交：仅锁读零写，不 arm 取消栅栏（无 durable mutation
-            // 可被取消中断）。
-            tx.commit().await.map_err(db_error)?;
-            return Ok(());
+            tx.rollback().await.map_err(db_error)?;
+            return Err(AstralError::NotFound(format!("organization {id}")));
         }
+        verify_org_mutation_actor_in_tx(&mut tx, context).await?;
 
         // 与 delete_tenant 同一引用守卫（共用 SQL 与纯 helper）：企业租户行同属
         // `tenant`，user_card 引用未守卫会留下第二条旁路。守卫先于 eligibility
@@ -659,10 +985,11 @@ impl OrgRepository for SqlxOrgRepository {
         // 超限在零写入时拒绝）。receipt 事务内先注册。
         let mut invalidation_receipts = Vec::new();
         let cards = scan_tenant_eligibility_cards_in_tx(&mut tx, id).await?;
+        let operation_id = tenant_delete_operation_id(id);
         append_tenant_eligibility_with_invalidation_in_tx(
             &mut tx,
             id,
-            &tenant_delete_operation_id(id),
+            &operation_id,
             cards,
             &mut invalidation_receipts,
         )
@@ -680,6 +1007,16 @@ impl OrgRepository for SqlxOrgRepository {
                 "enterprise tenant {id} disappeared during locked delete"
             )));
         }
+        insert_org_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            "delete",
+            "organization",
+            id,
+            &operation_id,
+            serde_json::json!({ "status": "deleted" }),
+        )
+        .await?;
         arm_org_commit_fence(&source_guard);
         let commit_result = tx.commit().await;
         let proven_receipts =
@@ -720,20 +1057,46 @@ impl OrgRepository for SqlxOrgRepository {
 
     async fn create_domain(
         &self,
+        _name: &str,
+        _code: Option<&str>,
+        _status: &str,
+    ) -> Result<i64, AstralError> {
+        Err(unsafe_org_mutation_context())
+    }
+
+    async fn create_domain_with_context(
+        &self,
         name: &str,
         code: Option<&str>,
         status: &str,
+        context: &OrgMutationContext,
     ) -> Result<i64, AstralError> {
+        let source_guard = begin_org_source_writer_guard()?;
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        verify_org_mutation_actor_in_tx(&mut tx, context).await?;
         let result = sqlx::query(
             "INSERT INTO platform_domain (domain_name, domain_code, status) VALUES (?, ?, ?)",
         )
         .bind(name)
         .bind(code)
         .bind(status)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
-        Ok(result.last_insert_id() as i64)
+        let id = i64::try_from(result.last_insert_id())
+            .map_err(|_| AstralError::Database("created domain id exceeds i64".into()))?;
+        insert_org_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            "create",
+            "domain",
+            id,
+            &context.request_id,
+            serde_json::json!({ "name": name, "code": code, "status": status }),
+        )
+        .await?;
+        commit_org_mutation_tx(tx, &source_guard).await?;
+        Ok(id)
     }
 
     async fn get_domain(&self, id: i64) -> Result<Option<DomainRecord>, AstralError> {
@@ -746,11 +1109,58 @@ impl OrgRepository for SqlxOrgRepository {
 
     async fn update_domain(
         &self,
+        _id: i64,
+        _name: &str,
+        _code: Option<&str>,
+        _status: &str,
+    ) -> Result<(), AstralError> {
+        Err(unsafe_org_mutation_context())
+    }
+
+    async fn update_domain_with_context(
+        &self,
         id: i64,
         name: &str,
         code: Option<&str>,
         status: &str,
+        context: &OrgMutationContext,
     ) -> Result<(), AstralError> {
+        let source_guard = begin_org_source_writer_guard()?;
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let current: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM platform_domain WHERE domain_id = ? FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        let Some((current_status,)) = current else {
+            tx.rollback().await.map_err(db_error)?;
+            return Err(AstralError::NotFound(format!("domain {id}")));
+        };
+        verify_org_mutation_actor_in_tx(&mut tx, context).await?;
+        if status_changed(&current_status, status) {
+            let mapped_tenant: Option<(i64,)> = sqlx::query_as(DOMAIN_MAPPING_REFERENCE_LOCK_SQL)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+            let referenced_card: Option<(i64,)> =
+                sqlx::query_as(DOMAIN_USER_CARD_REFERENCE_LOCK_SQL)
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_error)?;
+            if let Some((tenant_id,)) = mapped_tenant {
+                return Err(AstralError::Validation(format!(
+                    "domain {id} status change blocked by tenant_domain_map reference (tenant_id={tenant_id}); use a bounded tenant mapping mutation"
+                )));
+            }
+            if let Some((card_id,)) = referenced_card {
+                return Err(AstralError::Validation(format!(
+                    "domain {id} status change blocked by user_card reference (card_id={card_id})"
+                )));
+            }
+        }
         sqlx::query(
             "UPDATE platform_domain SET domain_name = ?, domain_code = ?, status = ? \
              WHERE domain_id = ?",
@@ -759,19 +1169,82 @@ impl OrgRepository for SqlxOrgRepository {
         .bind(code)
         .bind(status)
         .bind(id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
-        Ok(())
+        insert_org_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            "update",
+            "domain",
+            id,
+            &context.request_id,
+            serde_json::json!({ "name": name, "code": code, "status": status }),
+        )
+        .await?;
+        commit_org_mutation_tx(tx, &source_guard).await
     }
 
-    async fn delete_domain(&self, id: i64) -> Result<(), AstralError> {
-        sqlx::query("DELETE FROM platform_domain WHERE domain_id = ?")
+    async fn delete_domain(&self, _id: i64) -> Result<(), AstralError> {
+        Err(unsafe_org_mutation_context())
+    }
+
+    async fn delete_domain_with_context(
+        &self,
+        id: i64,
+        context: &OrgMutationContext,
+    ) -> Result<(), AstralError> {
+        let source_guard = begin_org_source_writer_guard()?;
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let existing: Option<(i64,)> =
+            sqlx::query_as("SELECT domain_id FROM platform_domain WHERE domain_id = ? FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        if existing.is_none() {
+            tx.rollback().await.map_err(db_error)?;
+            return Err(AstralError::NotFound(format!("domain {id}")));
+        }
+        verify_org_mutation_actor_in_tx(&mut tx, context).await?;
+        let tenant_mapping: Option<(i64,)> = sqlx::query_as(DOMAIN_MAPPING_REFERENCE_LOCK_SQL)
             .bind(id)
-            .execute(&self.db)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(db_error)?;
-        Ok(())
+        let card_reference: Option<(i64,)> = sqlx::query_as(DOMAIN_USER_CARD_REFERENCE_LOCK_SQL)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        if let Some((tenant_id,)) = tenant_mapping {
+            tx.rollback().await.map_err(db_error)?;
+            return Err(AstralError::Validation(format!(
+                "domain {id} deletion blocked by tenant_domain_map reference (tenant_id={tenant_id}); disable it through a bounded tenant mutation first"
+            )));
+        }
+        if let Some((card_id,)) = card_reference {
+            tx.rollback().await.map_err(db_error)?;
+            return Err(AstralError::Validation(format!(
+                "domain {id} deletion blocked by user_card reference (card_id={card_id}); reassign cards first"
+            )));
+        }
+        insert_org_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            "delete",
+            "domain",
+            id,
+            &context.request_id,
+            serde_json::json!({}),
+        )
+        .await?;
+        sqlx::query("DELETE FROM platform_domain WHERE domain_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        commit_org_mutation_tx(tx, &source_guard).await
     }
 
     async fn list_domain_tenants(&self, domain_id: i64) -> Result<Vec<TenantRecord>, AstralError> {
@@ -795,17 +1268,42 @@ impl OrgRepository for SqlxOrgRepository {
             .map_err(db_error)
     }
 
-    async fn create_tenant(&self, name: &str, status: &str) -> Result<i64, AstralError> {
+    async fn create_tenant(&self, _name: &str, _status: &str) -> Result<i64, AstralError> {
+        Err(unsafe_org_mutation_context())
+    }
+
+    async fn create_tenant_with_context(
+        &self,
+        name: &str,
+        status: &str,
+        context: &OrgMutationContext,
+    ) -> Result<i64, AstralError> {
+        let source_guard = begin_org_source_writer_guard()?;
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        verify_org_mutation_actor_in_tx(&mut tx, context).await?;
         let result = sqlx::query(
             "INSERT INTO tenant (tenant_code, tenant_name, tenant_type, status) \
              VALUES (CONCAT('T', UNIX_TIMESTAMP()), ?, 'ENTERPRISE', ?)",
         )
         .bind(name)
         .bind(status)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
-        Ok(result.last_insert_id() as i64)
+        let id = i64::try_from(result.last_insert_id())
+            .map_err(|_| AstralError::Database("created tenant id exceeds i64".into()))?;
+        insert_org_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            "create",
+            "tenant",
+            id,
+            &context.request_id,
+            serde_json::json!({ "name": name, "status": status }),
+        )
+        .await?;
+        commit_org_mutation_tx(tx, &source_guard).await?;
+        Ok(id)
     }
 
     async fn get_tenant(&self, id: i64) -> Result<Option<TenantRecord>, AstralError> {
@@ -818,10 +1316,21 @@ impl OrgRepository for SqlxOrgRepository {
 
     async fn update_tenant(
         &self,
+        _id: i64,
+        _name: &str,
+        _code: &str,
+        _status: &str,
+    ) -> Result<(), AstralError> {
+        Err(unsafe_org_mutation_context())
+    }
+
+    async fn update_tenant_with_context(
+        &self,
         id: i64,
         name: &str,
         code: &str,
         status: &str,
+        context: &OrgMutationContext,
     ) -> Result<(), AstralError> {
         // generic hub 写者栅栏：begin 前取得，持有到 commit+dispatch。
         let source_guard = begin_org_source_writer_guard()?;
@@ -835,12 +1344,9 @@ impl OrgRepository for SqlxOrgRepository {
             .await
             .map_err(db_error)?;
         let Some((current_status,)) = current else {
-            // 无写早退提交：仅锁读零写，不 arm 取消栅栏（无 durable mutation
-            // 可被取消中断）。
-            tx.commit().await.map_err(db_error)?;
-            return Ok(());
+            return Err(AstralError::NotFound(format!("tenant {id}")));
         };
-
+        verify_org_mutation_actor_in_tx(&mut tx, context).await?;
         let mut invalidation_receipts = Vec::new();
         let fanout = if status_changed(&current_status, status) {
             // cap 扫描先于任何 mutation：超限即拒绝（此时仅锁读，零写入）。
@@ -859,8 +1365,12 @@ impl OrgRepository for SqlxOrgRepository {
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        let operation_id = if status_changed(&current_status, status) {
+            tenant_status_operation_id(id, &current_status, status)
+        } else {
+            format!("org:tenant-update:{id}")
+        };
         if let Some(cards) = fanout {
-            let operation_id = tenant_status_operation_id(id, &current_status, status);
             append_tenant_eligibility_with_invalidation_in_tx(
                 &mut tx,
                 id,
@@ -870,6 +1380,21 @@ impl OrgRepository for SqlxOrgRepository {
             )
             .await?;
         }
+        insert_org_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            "update",
+            "tenant",
+            id,
+            &operation_id,
+            serde_json::json!({
+                "name": name,
+                "code": code,
+                "fromStatus": current_status,
+                "toStatus": status,
+            }),
+        )
+        .await?;
         arm_org_commit_fence(&source_guard);
         let commit_result = tx.commit().await;
         let proven_receipts =
@@ -889,7 +1414,15 @@ impl OrgRepository for SqlxOrgRepository {
         }
     }
 
-    async fn delete_tenant(&self, id: i64) -> Result<(), AstralError> {
+    async fn delete_tenant(&self, _id: i64) -> Result<(), AstralError> {
+        Err(unsafe_org_mutation_context())
+    }
+
+    async fn delete_tenant_with_context(
+        &self,
+        id: i64,
+        context: &OrgMutationContext,
+    ) -> Result<(), AstralError> {
         // generic hub 写者栅栏：begin 前取得，持有到 commit+dispatch。
         let source_guard = begin_org_source_writer_guard()?;
         let mut tx =
@@ -905,8 +1438,9 @@ impl OrgRepository for SqlxOrgRepository {
             // 无写早退提交：仅锁读零写，不 arm 取消栅栏（无 durable mutation
             // 可被取消中断）。
             tx.commit().await.map_err(db_error)?;
-            return Ok(());
+            return Err(AstralError::NotFound(format!("tenant {id}")));
         }
+        verify_org_mutation_actor_in_tx(&mut tx, context).await?;
 
         // 引用守卫先于 eligibility 捕获与 DELETE：任何 user_card（不限
         // card_status）仍引用该租户时，在持有租户行锁的同一事务内锁定引用行
@@ -927,12 +1461,23 @@ impl OrgRepository for SqlxOrgRepository {
         // 超限在零写入时拒绝）。receipt 事务内先注册。
         let mut invalidation_receipts = Vec::new();
         let cards = scan_tenant_eligibility_cards_in_tx(&mut tx, id).await?;
+        let operation_id = tenant_delete_operation_id(id);
         append_tenant_eligibility_with_invalidation_in_tx(
             &mut tx,
             id,
-            &tenant_delete_operation_id(id),
+            &operation_id,
             cards,
             &mut invalidation_receipts,
+        )
+        .await?;
+        insert_org_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            "delete",
+            "tenant",
+            id,
+            &operation_id,
+            serde_json::json!({ "status": "deleted" }),
         )
         .await?;
         let result = sqlx::query("DELETE FROM tenant WHERE tenant_id = ?")
@@ -992,6 +1537,44 @@ fn db_error(error: sqlx::Error) -> AstralError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Execute;
+
+    #[test]
+    fn emitted_identity_org_sql_has_no_backslashes() {
+        for statement in [
+            ORG_MUTATION_ACTOR_LOCK_SQL,
+            ORG_MUTATION_AUDIT_INSERT_SQL,
+            DOMAIN_MAPPING_REFERENCE_LOCK_SQL,
+            DOMAIN_USER_CARD_REFERENCE_LOCK_SQL,
+            TENANT_STATUS_LOCK_SQL,
+            TENANT_ID_LOCK_SQL,
+            ENTERPRISE_STATUS_LOCK_SQL,
+            ENTERPRISE_ID_LOCK_SQL,
+            TENANT_CARD_REFERENCE_LOCK_SQL,
+        ] {
+            assert!(
+                !statement.as_bytes().contains(&0x5c),
+                "emitted Identity SQL must not contain a backslash: {statement}"
+            );
+        }
+        let emitted_actor_lock_sql = sqlx::query::<MySql>(ORG_MUTATION_ACTOR_LOCK_SQL).sql();
+        let emitted_audit_sql = sqlx::query::<MySql>(ORG_MUTATION_AUDIT_INSERT_SQL).sql();
+        let emitted_multiline_mutation_sql = sqlx::query::<MySql>(
+            "UPDATE tenant SET tenant_name = ?, tenant_code = ?, status = ? \
+             WHERE tenant_id = ?",
+        )
+        .sql();
+        for emitted_sql in [
+            emitted_actor_lock_sql,
+            emitted_audit_sql,
+            emitted_multiline_mutation_sql,
+        ] {
+            assert!(
+                !emitted_sql.as_bytes().contains(&0x5c),
+                "sqlx-emitted mutation SQL must not contain a backslash: {emitted_sql}"
+            );
+        }
+    }
 
     #[test]
     fn tenant_mutations_lock_source_rows_before_fanout() {
@@ -1041,29 +1624,20 @@ mod tests {
     fn tenant_delete_guard_runs_before_delete_statement() {
         // Impl 签名以 ` {` 结尾（trait 声明以 `;` 结尾），锚定实现函数体，
         // 避免把同文件内另一条 DELETE FROM tenant 误计入窗口。
-        guard_precedes_delete_in_impl_body(
-            "async fn delete_tenant(&self, id: i64) -> Result<(), AstralError> {",
-            "delete_tenant",
-        );
+        guard_precedes_delete_in_impl_body("async fn delete_tenant_with_context(", "delete_tenant");
     }
 
     #[test]
     fn org_delete_guard_runs_before_delete_statement() {
         // delete_org 删除同一 `tenant` 表（ENTERPRISE 行），必须接入同一守卫，
         // 不得留下第二条无守卫删除旁路。
-        guard_precedes_delete_in_impl_body(
-            "async fn delete_org(&self, id: i64) -> Result<(), AstralError> {",
-            "delete_org",
-        );
+        guard_precedes_delete_in_impl_body("async fn delete_org_with_context(", "delete_org");
     }
 
     /// 源形状守卫：在指定实现函数体内，user_card 引用守卫必须先于
     /// `DELETE FROM tenant` 出现（编译期嵌入源码，纯测试无 IO）。
     fn guard_precedes_delete_in_impl_body(impl_anchor: &str, label: &str) {
-        let source = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/srv/org_repository.rs"
-        ));
+        let source = org_impl_source();
         let body_start = source
             .find(impl_anchor)
             .unwrap_or_else(|| panic!("{label} implementation must stay in org_repository.rs"));
@@ -1104,10 +1678,10 @@ mod tests {
         // 都必须以同事务成对 helper 发出资格事件，且投递决策走
         // receipts_for_proven_commit（未知/失败 commit 绝不投递）。
         for (impl_anchor, label) in [
-            ("async fn update_tenant(", "update_tenant"),
-            ("async fn update_org(", "update_org"),
-            ("async fn delete_tenant(", "delete_tenant"),
-            ("async fn delete_org(", "delete_org"),
+            ("async fn update_tenant_with_context(", "update_tenant"),
+            ("async fn update_org_with_context(", "update_org"),
+            ("async fn delete_tenant_with_context(", "delete_tenant"),
+            ("async fn delete_org_with_context(", "delete_org"),
         ] {
             let impl_source = org_impl_source();
             let body_start = impl_source
@@ -1189,12 +1763,28 @@ mod tests {
         // 四条 source 事务都必须 begin 前取得 generic hub 写者栅栏（Result+?，
         // hub 已装即强制），并把栅栏交给 commit-unknown 关闭路径（mark_uncertain
         // 设置 uncertain_source，在线 reconcile 不得清除）。匹配在去除空白后的
-        // 源文本上进行，避免 rustfmt 换行影响锚点。
-        for (impl_anchor, label) in [
-            ("async fn update_tenant(", "update_tenant"),
-            ("async fn update_org(", "update_org"),
-            ("async fn delete_tenant(", "delete_tenant"),
-            ("async fn delete_org(", "delete_org"),
+        // 源文本上进行，避免 rustfmt 换行影响锚点。两种事务初始化格式均检查。
+        for (impl_anchor, label, begin_anchor) in [
+            (
+                "async fn update_tenant_with_context(",
+                "update_tenant",
+                "self.db.begin()",
+            ),
+            (
+                "async fn update_org_with_context(",
+                "update_org",
+                "self\n            .db\n            .begin()",
+            ),
+            (
+                "async fn delete_tenant_with_context(",
+                "delete_tenant",
+                "self.db.begin()",
+            ),
+            (
+                "async fn delete_org_with_context(",
+                "delete_org",
+                "self\n            .db\n            .begin()",
+            ),
         ] {
             let impl_source = org_impl_source();
             let body_start = impl_source
@@ -1211,8 +1801,12 @@ mod tests {
             let guard = compact
                 .find("letsource_guard=begin_org_source_writer_guard()?;")
                 .unwrap_or_else(|| panic!("{label} must acquire the generic writer guard with ?"));
+            let normalized_begin_anchor: String = begin_anchor
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
             let begin = compact
-                .find("self.db.begin()")
+                .find(&normalized_begin_anchor)
                 .unwrap_or_else(|| panic!("{label} must begin its tx in this file"));
             let close = compact
                 .find("close_memory_authority_on_unknown_commit(&source_guard")
@@ -1236,17 +1830,25 @@ mod tests {
         // delete 路径先扫描（且在引用守卫之后）后 DELETE。
         for (impl_anchor, mutation_sql, label) in [
             (
-                "async fn update_tenant(",
+                "async fn update_tenant_with_context(",
                 "UPDATE tenant SET",
                 "update_tenant",
             ),
-            ("async fn update_org(", "UPDATE tenant SET", "update_org"),
             (
-                "async fn delete_tenant(",
+                "async fn update_org_with_context(",
+                "UPDATE tenant SET",
+                "update_org",
+            ),
+            (
+                "async fn delete_tenant_with_context(",
                 "DELETE FROM tenant",
                 "delete_tenant",
             ),
-            ("async fn delete_org(", "DELETE FROM tenant", "delete_org"),
+            (
+                "async fn delete_org_with_context(",
+                "DELETE FROM tenant",
+                "delete_org",
+            ),
         ] {
             let impl_source = org_impl_source();
             let body_start = impl_source
@@ -1289,14 +1891,37 @@ mod tests {
         );
         assert_eq!(
             impl_source.matches("不 arm 取消栅栏").count(),
-            4,
-            "the four no-write early commits must carry the explicit unarmed exemption"
+            1,
+            "only delete_tenant has a no-write early commit; the other source paths either \
+             roll back on missing rows or write before commit"
+        );
+        let delete_tenant_body = impl_source
+            .split("async fn delete_tenant_with_context(")
+            .nth(1)
+            .expect("delete_tenant source mutation must exist");
+        let delete_tenant_body_end = delete_tenant_body
+            .find("\n    async fn ")
+            .unwrap_or(delete_tenant_body.len());
+        let delete_tenant_body = &delete_tenant_body[..delete_tenant_body_end];
+        let early_commit = delete_tenant_body
+            .find("tx.commit().await")
+            .expect("missing-tenant path must settle its read-only transaction");
+        let first_write = delete_tenant_body
+            .find("append_tenant_eligibility_with_invalidation_in_tx")
+            .expect("tenant delete write path must append eligibility");
+        assert!(
+            early_commit < first_write,
+            "the missing-tenant early commit must precede every durable write"
+        );
+        assert!(
+            !delete_tenant_body[..early_commit].contains("arm_org_commit_fence"),
+            "read-only early commit must not arm the commit cancellation fence"
         );
         for (impl_anchor, label) in [
-            ("async fn update_tenant(", "update_tenant"),
-            ("async fn update_org(", "update_org"),
-            ("async fn delete_tenant(", "delete_tenant"),
-            ("async fn delete_org(", "delete_org"),
+            ("async fn update_tenant_with_context(", "update_tenant"),
+            ("async fn update_org_with_context(", "update_org"),
+            ("async fn delete_tenant_with_context(", "delete_tenant"),
+            ("async fn delete_org_with_context(", "delete_org"),
         ] {
             let body_start = impl_source
                 .find(impl_anchor)

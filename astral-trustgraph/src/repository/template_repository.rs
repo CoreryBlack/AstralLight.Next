@@ -826,12 +826,14 @@ impl TemplateRepository for SqlxTemplateRepository {
         .await
         .map_err(db_error)?;
 
-        let recent_rows = sqlx::query(
+        let mutation_audit_predicate =
+            crate::repository::audit_log_repository::audit_mutation_source_predicate_sql();
+        let recent_rows = sqlx::query(&format!(
             "SELECT id, resource, action, user_id, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%sZ') as changed_at \
-             FROM audit_log WHERE event_type = 'RULE_CHANGE' \
-             ORDER BY created_at DESC LIMIT 10",
-        )
+             FROM audit_log WHERE {mutation_audit_predicate} \
+             ORDER BY created_at DESC, id DESC LIMIT 10"
+        ))
         .fetch_all(&self.db)
         .await
         .map_err(db_error)?;

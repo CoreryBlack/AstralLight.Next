@@ -139,7 +139,7 @@ fn assert_mix_invariants(queries: &[Query]) {
         "default-deny 臂必须为 total/3（下取整；2:1 ALLOW:default-DENY 拆分）"
     );
     assert!(allow > deny, "default-deny 必须恒为少数臂（allow > deny）");
-    if queries.len() % 3 == 0 {
+    if queries.len().is_multiple_of(3) {
         assert_eq!(
             allow,
             2 * deny,
@@ -361,7 +361,7 @@ fn casbin_write(rt: &tokio::runtime::Runtime) -> (f64, f64) {
         let t0 = Instant::now();
         for index in 0..WRITE_CYCLES {
             let line = vec![
-                format!("card999"),
+                "card999".to_owned(),
                 format!("learn_subject:{}", 9000 + index),
                 ACTION.to_owned(),
             ];
@@ -407,7 +407,7 @@ fn run_cedar(cards: i64, entries: usize, queries: &[Query]) -> (ReadMetrics, Vec
     }
     entity_list.push(
         Entity::new(
-            EntityUid::from_type_name_and_id(action_type, EntityId::new(ACTION.to_owned())),
+            EntityUid::from_type_name_and_id(action_type, EntityId::new(ACTION)),
             HashMap::new(),
             HashSet::new(),
         )
@@ -438,10 +438,7 @@ fn run_cedar(cards: i64, entries: usize, queries: &[Query]) -> (ReadMetrics, Vec
     let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let authorizer = Authorizer::default();
-    let action = EntityUid::from_type_name_and_id(
-        "Action".parse().unwrap(),
-        EntityId::new(ACTION.to_owned()),
-    );
+    let action = EntityUid::from_type_name_and_id("Action".parse().unwrap(), EntityId::new(ACTION));
     let mut lat = Vec::with_capacity(queries.len());
     let t1 = Instant::now();
     for q in queries {
@@ -584,13 +581,24 @@ fn run_opa(
                 .send()
                 .await
                 .map_err(|e| format!("OPA 查询请求失败 card={} r={}：{e}", q.card, q.resource))?;
+            let resp = resp.error_for_status().map_err(|e| {
+                format!(
+                    "OPA 查询 HTTP 状态错误 card={} r={}：{e}",
+                    q.card, q.resource
+                )
+            })?;
             let body = resp.json::<serde_json::Value>().await.map_err(|e| {
                 format!("OPA 查询响应解析失败 card={} r={}：{e}", q.card, q.resource)
             })?;
             let allowed = body
                 .get("result")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    format!(
+                        "OPA 查询 result 缺失或非布尔值 card={} r={}",
+                        q.card, q.resource
+                    )
+                })?;
             lat.push(t.elapsed().as_nanos() as u64);
             if allowed != q.allow {
                 return Err(format!(
@@ -665,7 +673,7 @@ mod sha256 {
             msg.push(0);
         }
         msg.extend_from_slice(&bitlen.to_be_bytes());
-        for block in msg.chunks_exact(64) {
+        for block in msg.as_chunks::<64>().0 {
             let mut w = [0u32; 64];
             for i in 0..16 {
                 w[i] = u32::from_be_bytes([
@@ -832,6 +840,30 @@ mod mix_tests {
 #[cfg(test)]
 mod io_tests {
     use super::*;
+
+    #[test]
+    fn opa_result_requires_a_boolean() {
+        for value in [
+            serde_json::json!({"result": true}),
+            serde_json::json!({"result": false}),
+        ] {
+            assert!(value
+                .get("result")
+                .and_then(serde_json::Value::as_bool)
+                .is_some());
+        }
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"result": null}),
+            serde_json::json!({"result": "false"}),
+            serde_json::json!({"result": 0}),
+        ] {
+            assert_eq!(
+                value.get("result").and_then(serde_json::Value::as_bool),
+                None
+            );
+        }
+    }
 
     #[test]
     fn sanitize_slug_rules() {
@@ -1095,8 +1127,8 @@ fn summary_csv(rows: &[String]) -> String {
     )
 }
 
-/// 原子写：同目录临时文件（run-scoped：仅本 run 目录内 `<name>.tmp`）+ write_all
-/// + fsync + rename 覆盖。Unix rename 与 Windows MoveFileEx(REPLACE_EXISTING)
+/// 原子写：同目录临时文件（run-scoped：仅本 run 目录内 `<name>.tmp`），写入、
+/// fsync 后 rename 覆盖。Unix rename 与 Windows MoveFileEx(REPLACE_EXISTING)
 /// 均为同卷原子替换；失败时清理临时文件。目录 fsync 无可移植 std 接口，崩溃
 /// 极端情况可能丢最后一次 rename——对本地 benchmark 证据足够。
 fn atomic_write(path: &str, contents: &str) -> std::io::Result<()> {
@@ -1323,7 +1355,7 @@ fn main() {
             "allow": mix_allow,
             "default_deny": mix_deny,
             "ratio": "2:1 ALLOW:default-DENY",
-            "exact_2_1": mix_probe.len() % 3 == 0,
+            "exact_2_1": mix_probe.len().is_multiple_of(3),
             "rule": "deny = total/3（下取整），allow = total - deny；total%3==0 时严格 2:1，任意总数下 default-deny 恒为少数臂",
             "note": "deny 臂=越界资源（entries 起偏移），走 default-deny 路径",
         },

@@ -246,12 +246,18 @@ impl UserService {
         }
         let password_hash = hash_password(&req.password)
             .map_err(|e| AppError(AstralError::Internal(e.to_string())))?;
-        // Java `PlatformUserLifecycleService.setPassword` 在更新凭据前撤销全部会话。
-        revoke_all_sessions_for_user(state, user_id, "PASSWORD_CHANGED")
+        // Password hash, credential revision, sessions/families/JTIs, and the
+        // durable v2 projection outbox commit together before external projection.
+        let revoked_jtis = self
+            .auth
+            .update_password_hash_with_revocation(user_id, &password_hash, "PASSWORD_CHANGED", None)
             .await
             .map_err(AppError)?;
-        self.auth
-            .update_password_hash(user_id, &password_hash)
+        #[cfg(feature = "redis-compat")]
+        let redis = state.redis.as_ref();
+        #[cfg(not(feature = "redis-compat"))]
+        let redis: Option<&()> = None;
+        crate::srv::session::project_password_revocation(state, &revoked_jtis, redis)
             .await
             .map_err(AppError)?;
         tracing::info!(user_id, "password set");
@@ -382,6 +388,33 @@ mod tests {
             _new_hash: &str,
         ) -> Result<(), AstralError> {
             Ok(())
+        }
+
+        async fn update_password_hash_with_revocation(
+            &self,
+            _user_id: i64,
+            _new_hash: &str,
+            _reason: &str,
+            _reset_token: Option<i64>,
+        ) -> Result<Vec<String>, AstralError> {
+            Ok(vec![])
+        }
+
+        async fn update_password_hash_if_current(
+            &self,
+            _user_id: i64,
+            _expected_hash: &str,
+            _expected_version: i64,
+            _new_hash: &str,
+        ) -> Result<Vec<String>, AstralError> {
+            Ok(vec![])
+        }
+
+        async fn create_login_family_and_session(
+            &self,
+            _session: crate::srv::auth_repository::AtomicLoginSession,
+        ) -> Result<(i64, i64), AstralError> {
+            Ok((1, 1))
         }
 
         async fn update_last_login_at(&self, _user_id: i64) -> Result<(), AstralError> {

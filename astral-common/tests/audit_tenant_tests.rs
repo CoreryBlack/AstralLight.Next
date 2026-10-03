@@ -226,7 +226,7 @@ fn test_tenant_context_to_sql_filter_tenant_and_domain() {
 #[test]
 fn test_tenant_context_to_sql_filter_empty() {
     let ctx = TenantContext::default();
-    assert_eq!(ctx.to_sql_filter(), "");
+    assert_eq!(ctx.to_sql_filter(), "AND 1 = 0");
 }
 
 #[test]
@@ -237,6 +237,18 @@ fn test_build_tenant_where_with_alias() {
 }
 
 #[test]
+fn test_build_tenant_where_invalid_alias_and_scope_fail_closed() {
+    assert_eq!(
+        build_tenant_where("t; DROP TABLE x", Some(42), None),
+        ("AND 1 = 0".into(), vec![])
+    );
+    assert_eq!(
+        build_tenant_where("t", Some(0), Some(10)),
+        ("AND 1 = 0".into(), vec![])
+    );
+}
+
+#[test]
 fn test_build_tenant_where_no_alias() {
     let (clause, params) = build_tenant_where("", Some(42), None);
     assert_eq!(clause, "AND tenant_id = ?");
@@ -244,9 +256,9 @@ fn test_build_tenant_where_no_alias() {
 }
 
 #[test]
-fn test_build_tenant_where_empty() {
+fn test_build_tenant_where_missing_tenant_fails_closed() {
     let (clause, params) = build_tenant_where("", None, None);
-    assert_eq!(clause, "");
+    assert_eq!(clause, "AND 1 = 0");
     assert!(params.is_empty());
 }
 
@@ -266,8 +278,8 @@ fn test_build_tenant_where_different_tenants_produce_different_params() {
 #[test]
 fn test_scoped_query_tenant_only() {
     let q = TenantScopedQuery::new("SELECT * FROM resources").with_tenant(42);
-    let (sql, params) = q.build();
-    assert!(sql.contains("AND tenant_id = ?"));
+    let (sql, params) = q.try_build().unwrap();
+    assert!(sql.contains("WHERE resources.tenant_id = ?"));
     assert_eq!(params, vec!["42".to_string()]);
 }
 
@@ -277,17 +289,21 @@ fn test_scoped_query_with_alias() {
         .with_alias("r")
         .with_tenant(42)
         .with_domain(10);
-    let (sql, params) = q.build();
+    let (sql, params) = q.try_build().unwrap();
     assert!(sql.contains("r.tenant_id = ?"));
     assert!(sql.contains("r.domain_id = ?"));
     assert_eq!(params, vec!["42".to_string(), "10".to_string()]);
 }
 
 #[test]
-fn test_scoped_query_no_filter() {
+fn test_scoped_query_missing_tenant_fails_closed() {
     let q = TenantScopedQuery::new("SELECT * FROM resources");
+    assert_eq!(
+        q.try_build(),
+        Err(astral_common::middleware::tenant_filter::TenantScopeQueryError::ScopeRequired)
+    );
     let (sql, params) = q.build();
-    assert_eq!(sql, "SELECT * FROM resources");
+    assert_eq!(sql, "SELECT NULL WHERE 1 = 0");
     assert!(params.is_empty());
 }
 
@@ -297,7 +313,7 @@ fn test_scoped_query_all_filters() {
         .with_tenant(1)
         .with_domain(2)
         .with_user(3);
-    let (sql, params) = q.build();
+    let (sql, params) = q.try_build().unwrap();
     assert!(sql.contains("tenant_id = ?"));
     assert!(sql.contains("domain_id = ?"));
     assert!(sql.contains("user_id = ?"));
@@ -311,12 +327,12 @@ fn test_scoped_query_all_filters() {
 fn test_scoped_query_different_tenants_produce_different_sql() {
     let q1 = TenantScopedQuery::new("SELECT * FROM data").with_tenant(1);
     let q2 = TenantScopedQuery::new("SELECT * FROM data").with_tenant(2);
-    let (sql1, _) = q1.build();
-    let (sql2, _) = q2.build();
+    let (sql1, _) = q1.try_build().unwrap();
+    let (sql2, _) = q2.try_build().unwrap();
     // SQL 模板相同但参数不同 — 不同租户的查询必须参数化隔离
     assert_eq!(sql1, sql2, "SQL 模板应相同（参数化查询）");
-    let (_, params1) = q1.build();
-    let (_, params2) = q2.build();
+    let (_, params1) = q1.try_build().unwrap();
+    let (_, params2) = q2.try_build().unwrap();
     assert_ne!(params1, params2, "参数值必须不同");
 }
 
@@ -353,7 +369,7 @@ fn test_scoped_query_with_filter_tenant() {
         ..Default::default()
     };
     let q = TenantScopedQuery::new("SELECT * FROM data").with_filter(&filter);
-    let (sql, params) = q.build();
+    let (sql, params) = q.try_build().unwrap();
     assert!(sql.contains("tenant_id = ?"));
     assert_eq!(params, vec!["42".to_string()]);
 }
@@ -367,7 +383,7 @@ fn test_scoped_query_with_filter_all_fields() {
         org_id: Some(4),
     };
     let q = TenantScopedQuery::new("SELECT * FROM data").with_filter(&filter);
-    let (sql, params) = q.build();
+    let (sql, params) = q.try_build().unwrap();
     assert!(sql.contains("tenant_id = ?"));
     assert!(sql.contains("domain_id = ?"));
     assert!(sql.contains("user_id = ?"));
@@ -379,11 +395,15 @@ fn test_scoped_query_with_filter_all_fields() {
 }
 
 #[test]
-fn test_scoped_query_with_filter_empty() {
+fn test_scoped_query_with_filter_empty_fails_closed() {
     let filter = MockScopeFilter::default();
     let q = TenantScopedQuery::new("SELECT * FROM data").with_filter(&filter);
+    assert_eq!(
+        q.try_build(),
+        Err(astral_common::middleware::tenant_filter::TenantScopeQueryError::ScopeRequired)
+    );
     let (sql, params) = q.build();
-    assert_eq!(sql, "SELECT * FROM data");
+    assert_eq!(sql, "SELECT NULL WHERE 1 = 0");
     assert!(params.is_empty());
 }
 
@@ -397,7 +417,7 @@ fn test_cross_tenant_sql_isolation_invariant() {
 
     for &tid in &tenants {
         let q = TenantScopedQuery::new("SELECT * FROM sensitive_data").with_tenant(tid);
-        let (sql, params) = q.build();
+        let (sql, params) = q.try_build().unwrap();
 
         // 1. SQL 必须包含 tenant_id 过滤条件
         assert!(
@@ -425,10 +445,7 @@ fn test_cross_tenant_where_clause_isolation() {
 }
 
 #[test]
-fn test_tenant_context_no_tenant_id_no_filter() {
-    // 没有租户 ID 时不应生成过滤条件 — 但这也意味着没有隔离
-    // 生产环境中必须有上游中间件确保 tenant_id 存在
+fn test_tenant_context_no_tenant_id_fails_closed() {
     let ctx = TenantContext::default();
-    let filter = ctx.to_sql_filter();
-    assert_eq!(filter, "", "无 tenant_id 时不应生成 SQL 过滤");
+    assert_eq!(ctx.to_sql_filter(), "AND 1 = 0");
 }

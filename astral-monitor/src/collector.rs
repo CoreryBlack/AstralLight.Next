@@ -1,13 +1,17 @@
 //! 定时采集后台任务 — 对应 Java `MetricCollectTask` + `AlertEvaluationTask`。
 //!
-//! 两个 tokio 循环：
-//! - 30s：服务探活（`GET {uri}/api/health`）+ 告警评估
-//! - 60s：系统指标（sysinfo）+ Redis 指标 + 每日清理（UTC 3 时）
+//! Service probes only use an explicitly registered endpoint/authentication
+//! contract. Existing Learn health is Gateway-signature protected and Chat has no
+//! registered `/api/health` route, so neither is fetched with an unsigned request;
+//! an unavailable probe contract is recorded as UNKNOWN rather than DOWN.
 //!
-//! 单次周期失败只记录 warning，不中断后续周期。
+//! Shutdown is cooperative and bounded. The collector owns its JoinSet of alert
+//! dispatches and never detaches one task per alert.
 
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::interval;
 
 use astral_common::config::AppConfig;
@@ -15,52 +19,251 @@ use astral_common::config::AppConfig;
 use crate::dispatch;
 use crate::AppState;
 
-/// 启动采集后台任务。调用方需持有返回的 JoinHandle 以避免被 drop 取消。
-pub fn spawn_collector(state: AppState) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let fast = interval(Duration::from_secs(30));
-        let slow = interval(Duration::from_secs(60));
-        let (mut fast, mut slow) = (fast, slow);
+const MAX_ALERT_DISPATCH_CONCURRENCY: usize = 4;
+const ALERT_DISPATCH_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const COLLECTOR_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-        loop {
-            tokio::select! {
-                _ = fast.tick() => {
-                    run_probe_and_evaluate(&state).await;
-                }
-                _ = slow.tick() => {
-                    run_system_and_redis(&state).await;
-                    maybe_cleanup(&state).await;
+/// Registered service health endpoint/authentication contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeContract {
+    /// A real path exists, but requires Gateway v3 identity signing. The monitor
+    /// currently has no service-principal identity and must not synthesize one.
+    GatewaySigned { path: &'static str },
+    /// No registered endpoint contract exists for this service.
+    Unavailable { reason: &'static str },
+}
+
+#[derive(Debug, Clone)]
+struct ProbeTarget {
+    service_name: &'static str,
+    contract: ProbeContract,
+}
+
+/// Owned collector task and cooperative stop channel.
+pub struct CollectorHandle {
+    stop: watch::Sender<bool>,
+    join: Option<JoinHandle<Result<(), String>>>,
+    terminal_result: Option<Result<(), String>>,
+}
+
+impl CollectorHandle {
+    /// Request cooperative shutdown. The owner must still call `shutdown` to
+    /// observe the task's terminal result.
+    pub fn request_shutdown(&self) {
+        self.stop.send_replace(true);
+    }
+
+    /// Wait for the owned collector task to exit unexpectedly, including panic.
+    /// The task's completion is cached so `shutdown` does not poll the completed
+    /// JoinHandle a second time.
+    pub async fn wait_for_death(&mut self) -> String {
+        let Some(join) = self.join.as_mut() else {
+            return "monitor collector task handle unavailable".into();
+        };
+        let result = match (&mut *join).await {
+            Ok(result) => result,
+            Err(error) => Err(format!("monitor collector task failed: {error}")),
+        };
+        let reason = result
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or_else(|| "monitor collector stopped unexpectedly".into());
+        self.terminal_result = Some(result);
+        self.join.take();
+        reason
+    }
+
+    /// Stop and join the collector within `deadline`, aborting and observing it
+    /// if a cycle or bounded dispatch drain fails to finish in time.
+    pub async fn shutdown(mut self, deadline: Duration) -> Result<(), String> {
+        self.request_shutdown();
+        if let Some(result) = self.terminal_result.take() {
+            return result;
+        }
+        let Some(join) = self.join.as_mut() else {
+            return Ok(());
+        };
+        match tokio::time::timeout(deadline, &mut *join).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(format!("monitor collector task failed: {error}")),
+            Err(_) => {
+                join.abort();
+                match tokio::time::timeout(COLLECTOR_SHUTDOWN_JOIN_TIMEOUT, &mut *join).await {
+                    Ok(Err(error)) if error.is_cancelled() => Err(
+                        "monitor collector shutdown timed out; pending dispatch outcomes unknown"
+                            .into(),
+                    ),
+                    Ok(Ok(Err(error))) => Err(format!(
+                        "monitor collector shutdown timed out; dispatch drain failed: {error}"
+                    )),
+                    Ok(Ok(Ok(()))) => Err(
+                        "monitor collector shutdown timed out before its owned tasks drained"
+                            .into(),
+                    ),
+                    Ok(Err(error)) => Err(format!(
+                        "monitor collector shutdown timed out and join failed: {error}"
+                    )),
+                    Err(_) => {
+                        Err("monitor collector abort did not join; task outcome unknown".into())
+                    }
                 }
             }
         }
-    })
+    }
 }
 
-async fn run_probe_and_evaluate(state: &AppState) {
+impl Drop for CollectorHandle {
+    fn drop(&mut self) {
+        self.request_shutdown();
+        if let Some(join) = self.join.take() {
+            // Do not let dropping the owner turn its worker into a detached task.
+            join.abort();
+        }
+    }
+}
+
+/// Start the collector under an explicit owner. Keep the handle alive and call
+/// `shutdown` after HTTP admission closes.
+pub fn spawn_collector(state: AppState) -> CollectorHandle {
+    let (stop, stop_rx) = watch::channel(false);
+    let join = tokio::spawn(async move { run_collector(state, stop_rx).await });
+    CollectorHandle {
+        stop,
+        join: Some(join),
+        terminal_result: None,
+    }
+}
+
+async fn run_collector(state: AppState, mut stop: watch::Receiver<bool>) -> Result<(), String> {
+    let mut dispatch_failed = false;
+    let mut fast = interval(Duration::from_secs(30));
+    let mut slow = interval(Duration::from_secs(60));
+    fast.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    slow.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut dispatch_tasks = JoinSet::new();
+
+    loop {
+        dispatch_failed |= reap_finished_dispatches(&mut dispatch_tasks);
+        tokio::select! {
+            _ = wait_for_shutdown(&mut stop) => break,
+            _ = fast.tick() => {
+                run_probe_and_evaluate(&state, &mut dispatch_tasks, &mut dispatch_failed).await;
+            }
+            _ = slow.tick() => {
+                run_system_and_redis(&state).await;
+                maybe_cleanup(&state).await;
+            }
+        }
+    }
+
+    dispatch_failed |= drain_dispatches(&mut dispatch_tasks).await;
+    if dispatch_failed {
+        Err("one or more owned alert dispatch tasks failed".into())
+    } else {
+        Ok(())
+    }
+}
+
+async fn wait_for_shutdown(stop: &mut watch::Receiver<bool>) {
+    loop {
+        if *stop.borrow_and_update() {
+            return;
+        }
+        if stop.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn reap_finished_dispatches(dispatch_tasks: &mut JoinSet<()>) -> bool {
+    let mut failed = false;
+    while let Some(result) = dispatch_tasks.try_join_next() {
+        failed |= log_dispatch_result(result);
+    }
+    failed
+}
+
+fn log_dispatch_result(result: Result<(), JoinError>) -> bool {
+    if let Err(error) = result {
+        tracing::error!(error = %error, "owned alert dispatch task failed");
+        true
+    } else {
+        false
+    }
+}
+
+async fn drain_dispatches(dispatch_tasks: &mut JoinSet<()>) -> bool {
+    let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failed_in_drain = failed.clone();
+    let tasks = &mut *dispatch_tasks;
+    let drained = tokio::time::timeout(ALERT_DISPATCH_DRAIN_TIMEOUT, async {
+        while let Some(result) = tasks.join_next().await {
+            if log_dispatch_result(result) {
+                failed_in_drain.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    })
+    .await
+    .is_ok();
+    if !drained {
+        dispatch_tasks.abort_all();
+        let joined_after_abort = tokio::time::timeout(Duration::from_secs(1), async {
+            while dispatch_tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_ok();
+        tracing::error!(
+            joined_after_abort,
+            "owned alert dispatch drain timed out; pending delivery outcomes are unknown"
+        );
+        return true;
+    }
+    failed.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+async fn run_probe_and_evaluate(
+    state: &AppState,
+    dispatch_tasks: &mut JoinSet<()>,
+    dispatch_failed: &mut bool,
+) {
     let cycle_start = Instant::now();
-    let services = probe_targets(&state.config);
-    for (service_name, uri) in services {
-        probe_service(state, &service_name, &uri).await;
+    for target in probe_targets(&state.config) {
+        probe_service(state, &target).await;
     }
     metrics::histogram!("astral_monitor_collect_cycle_seconds", "kind" => "probe")
         .record(cycle_start.elapsed().as_secs_f64());
 
-    // 告警评估与通知派发解耦：评估持久化告警，派发在后台任务执行，
-    // webhook 超时不得阻塞 30s 探活循环。
     let eval_start = Instant::now();
     match state.monitor_service.evaluate_alert_rules(60).await {
         Ok(alerts) => {
             for alert in alerts {
                 let monitor_service = state.monitor_service.clone();
-                tokio::spawn(async move {
+                spawn_bounded_dispatch(dispatch_tasks, dispatch_failed, async move {
                     dispatch::dispatch_alert(monitor_service.as_ref(), &alert).await;
-                });
+                })
+                .await;
             }
         }
         Err(error) => tracing::warn!(error = %error, "alert rule evaluation failed"),
     }
     metrics::histogram!("astral_monitor_alert_evaluation_seconds")
         .record(eval_start.elapsed().as_secs_f64());
+}
+
+async fn spawn_bounded_dispatch<F>(
+    dispatch_tasks: &mut JoinSet<()>,
+    dispatch_failed: &mut bool,
+    future: F,
+) where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if dispatch_tasks.len() >= MAX_ALERT_DISPATCH_CONCURRENCY {
+        if let Some(result) = dispatch_tasks.join_next().await {
+            *dispatch_failed |= log_dispatch_result(result);
+        }
+    }
+    dispatch_tasks.spawn(future);
 }
 
 async fn run_system_and_redis(state: &AppState) {
@@ -81,51 +284,67 @@ async fn maybe_cleanup(state: &AppState) {
     }
 }
 
-/// 探活目标：从配置 URI 推导（非空才探）。
-fn probe_targets(config: &AppConfig) -> Vec<(String, String)> {
-    let mut targets = Vec::new();
-    if !config.identity_service_uri.is_empty() {
-        targets.push(("identity".into(), config.identity_service_uri.clone()));
-    }
-    if !config.learn_service_uri.is_empty() {
-        targets.push(("learn".into(), config.learn_service_uri.clone()));
-    }
-    if !config.chat_service_uri.is_empty() {
-        targets.push(("chat".into(), config.chat_service_uri.clone()));
-    }
-    if !config.gateway_service_uri.is_empty() {
-        targets.push(("gateway".into(), config.gateway_service_uri.clone()));
-    }
-    if !config.trust_graph_uri.is_empty() {
-        targets.push(("trustgraph".into(), config.trust_graph_uri.clone()));
-    }
-    targets
+/// Configured targets retain their service identity even when no safe probe
+/// contract exists; each such result is persisted as UNKNOWN, never DOWN.
+fn probe_targets(config: &AppConfig) -> Vec<ProbeTarget> {
+    [
+        ("identity", config.identity_service_uri.as_str()),
+        ("learn", config.learn_service_uri.as_str()),
+        ("chat", config.chat_service_uri.as_str()),
+        ("gateway", config.gateway_service_uri.as_str()),
+        ("trustgraph", config.trust_graph_uri.as_str()),
+    ]
+    .into_iter()
+    .filter(|(_, uri)| !uri.trim().is_empty())
+    .map(|(service_name, _uri)| ProbeTarget {
+        service_name,
+        contract: probe_contract(service_name),
+    })
+    .collect()
 }
 
-/// 探活单个服务：GET {uri}/api/health，2s 超时，写 latency + reachable。
-async fn probe_service(state: &AppState, service_name: &str, uri: &str) {
-    let health_url = format!("{}/api/health", uri.trim_end_matches('/'));
-    let start = std::time::Instant::now();
-    let reachable = reqwest::Client::new()
-        .get(&health_url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .map(|response| response.status().is_success())
-        .unwrap_or(false);
-    let latency_ms = start.elapsed().as_millis() as i64;
+fn probe_contract(service_name: &str) -> ProbeContract {
+    match service_name {
+        "learn" => ProbeContract::GatewaySigned {
+            path: "/api/health",
+        },
+        "chat" => ProbeContract::Unavailable {
+            reason: "Chat has no registered /api/health route",
+        },
+        "identity" | "gateway" | "trustgraph" => ProbeContract::Unavailable {
+            reason: "service has no registered health route",
+        },
+        _ => ProbeContract::Unavailable {
+            reason: "service has no registered health route",
+        },
+    }
+}
 
-    metrics::gauge!("astral_monitor_service_reachable", "service" => service_name.to_string())
-        .set(if reachable { 1.0 } else { 0.0 });
-    metrics::histogram!("astral_monitor_service_probe_latency_seconds", "service" => service_name.to_string())
-        .record(latency_ms as f64 / 1000.0);
-
+/// No protected/absent health endpoint is contacted without its declared
+/// authentication contract. New public probes must add a concrete contract here.
+async fn probe_service(state: &AppState, target: &ProbeTarget) {
+    let reason = match target.contract {
+        ProbeContract::GatewaySigned { path } => format!(
+            "health endpoint {path} requires Gateway v3 identity signing; monitor service identity is unavailable"
+        ),
+        ProbeContract::Unavailable { reason } => reason.to_owned(),
+    };
+    tracing::debug!(
+        service = target.service_name,
+        reason,
+        "configured health probe unavailable; recording UNKNOWN"
+    );
+    metrics::gauge!("astral_monitor_service_reachable", "service" => target.service_name).set(-1.0);
     if let Err(error) = state
         .monitor_service
-        .collect_service_metrics(service_name, latency_ms, reachable)
+        .collect_unknown_service_probe(target.service_name)
         .await
     {
-        tracing::warn!(service = service_name, error = %error, "service probe persistence failed");
+        tracing::warn!(
+            service = target.service_name,
+            error = %error,
+            "unknown service probe persistence failed"
+        );
     }
 }
 
@@ -268,4 +487,52 @@ fn parse_info_field(info: &str, key: &str) -> Option<i64> {
         .find_map(|line| line.strip_prefix(&format!("{key}:")))
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value >= 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn collector_death_result_is_consumed_once_and_preserved_for_shutdown() {
+        let (stop, _) = watch::channel(false);
+        let mut handle = CollectorHandle {
+            stop,
+            join: Some(tokio::spawn(async { Err("collector failed".into()) })),
+            terminal_result: None,
+        };
+        assert_eq!(handle.wait_for_death().await, "collector failed");
+        assert!(handle.join.is_none());
+        assert_eq!(
+            handle.shutdown(Duration::from_secs(1)).await,
+            Err("collector failed".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn collector_shutdown_timeout_never_reports_success() {
+        let (stop, _) = watch::channel(false);
+        let handle = CollectorHandle {
+            stop,
+            join: Some(tokio::spawn(std::future::pending::<Result<(), String>>())),
+            terminal_result: None,
+        };
+        let result = handle.shutdown(Duration::from_millis(1)).await;
+        assert!(result.unwrap_err().contains("outcomes unknown"));
+    }
+
+    #[tokio::test]
+    async fn owned_dispatch_admission_never_exceeds_its_capacity() {
+        let mut tasks = JoinSet::new();
+        let mut failed = false;
+        for _ in 0..(MAX_ALERT_DISPATCH_CONCURRENCY * 3) {
+            spawn_bounded_dispatch(&mut tasks, &mut failed, async {
+                tokio::task::yield_now().await;
+            })
+            .await;
+            assert!(tasks.len() <= MAX_ALERT_DISPATCH_CONCURRENCY);
+        }
+        assert!(!drain_dispatches(&mut tasks).await);
+        assert!(!failed);
+    }
 }

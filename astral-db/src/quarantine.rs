@@ -31,6 +31,8 @@ pub const MAX_SOURCE_ROUTING_KEY_LENGTH: usize = 255;
 pub const MAX_FAILURE_REASON_LENGTH: usize = 255;
 pub const MAX_LEASE_OWNER_LENGTH: usize = 128;
 pub const MAX_OPERATION_ID_LENGTH: usize = 128;
+/// Shared `audit_log.request_id VARCHAR(64)` correlation limit.
+pub const MAX_CANONICAL_REQUEST_ID_LENGTH: usize = 64;
 pub const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_LIST_LIMIT: u32 = 500;
 pub const MAX_LIST_OFFSET: u32 = 1_000_000;
@@ -90,6 +92,21 @@ const REQUEST_REPLAY_SQL: &str = "UPDATE audit_quarantine \
       AND status = 'QUARANTINED' \
       AND replay_attempts < ?";
 
+const REPLAY_REQUEST_AUDIT_SQL: &str = "INSERT INTO audit_log \
+    (user_id, card_id, action, resource, decision, reason, event_type, request_id, domain_id, tenant_id, detail) \
+    VALUES (?, ?, 'request_replay', 'audit_quarantine', 'REQUESTED', \
+            'audit quarantine replay requested', 'AUDIT_REPLAY_REQUEST', ?, ?, ?, ?)";
+
+const REPLAY_AUDIT_PROOF_SQL: &str = "SELECT COUNT(*) FROM audit_log \
+    WHERE event_type = 'AUDIT_REPLAY_REQUEST' AND action = 'request_replay' \
+      AND resource = 'audit_quarantine' AND decision = 'REQUESTED' \
+      AND user_id = ? AND request_id = ? \
+      AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.actorCardId')), 'null') = COALESCE(CAST(? AS CHAR), 'null') \
+      AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.actorTenantId')), 'null') = COALESCE(CAST(? AS CHAR), 'null') \
+      AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.actorDomainId')), 'null') = COALESCE(CAST(? AS CHAR), 'null') \
+      AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.quarantineId')) = ? \
+      AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.operationHash')) = ?";
+
 const BEGIN_REPLAY_SQL: &str = "UPDATE audit_quarantine \
     SET status = 'REPLAYING', \
         replay_attempts = replay_attempts + 1, \
@@ -106,7 +123,19 @@ const BEGIN_REPLAY_SQL: &str = "UPDATE audit_quarantine \
            OR (status = 'REPLAYING' \
                AND replay_operation_id_hash = ? \
                AND replay_lease_expires_at IS NOT NULL \
-               AND replay_lease_expires_at <= UTC_TIMESTAMP()))";
+               AND replay_lease_expires_at <= UTC_TIMESTAMP())) \
+      AND EXISTS ( \
+          SELECT 1 FROM audit_log a \
+          WHERE a.event_type = 'AUDIT_REPLAY_REQUEST' \
+            AND a.action = 'request_replay' AND a.resource = 'audit_quarantine' \
+            AND a.decision = 'REQUESTED' \
+            AND a.user_id = CAST(audit_quarantine.replay_requested_by AS UNSIGNED) \
+            AND a.card_id <=> CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.actorCardId')), 'null') AS UNSIGNED) \
+            AND a.tenant_id <=> CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.actorTenantId')), 'null') AS UNSIGNED) \
+            AND a.domain_id <=> CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.actorDomainId')), 'null') AS UNSIGNED) \
+            AND JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.quarantineId')) = CAST(audit_quarantine.id AS CHAR) \
+            AND JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.operationHash')) = LOWER(HEX(audit_quarantine.replay_operation_id_hash)) \
+      )";
 
 const BEGIN_REQUESTED_REPLAY_SQL: &str = "UPDATE audit_quarantine \
     SET status = 'REPLAYING', \
@@ -122,35 +151,59 @@ const BEGIN_REQUESTED_REPLAY_SQL: &str = "UPDATE audit_quarantine \
       AND replay_lease_generation < 18446744073709551615 \
       AND replay_operation_id_hash = ?";
 
-const NEXT_REQUESTED_REPLAY_SQL: &str = "SELECT id, replay_operation_id_hash \
-    FROM audit_quarantine \
-    WHERE status = 'REPLAY_REQUESTED' \
-      AND replay_attempts < ? \
-      AND source_queue = ? \
-      AND source_exchange = ? \
-      AND source_routing_key = ? \
-      AND message_type = ? \
-      AND replay_operation_id_hash IS NOT NULL \
-    ORDER BY replay_requested_at ASC, id ASC \
+const NEXT_REQUESTED_REPLAY_SQL: &str = "SELECT q.id, q.replay_operation_id_hash \
+    FROM audit_quarantine q \
+    WHERE q.status = 'REPLAY_REQUESTED' \
+      AND q.replay_attempts < ? \
+      AND q.source_queue = ? \
+      AND q.source_exchange = ? \
+      AND q.source_routing_key = ? \
+      AND q.message_type = ? \
+      AND q.replay_operation_id_hash IS NOT NULL \
+      AND EXISTS ( \
+          SELECT 1 FROM audit_log a \
+          WHERE a.event_type = 'AUDIT_REPLAY_REQUEST' \
+            AND a.action = 'request_replay' AND a.resource = 'audit_quarantine' \
+            AND a.decision = 'REQUESTED' \
+            AND a.user_id = CAST(q.replay_requested_by AS UNSIGNED) \
+            AND a.card_id <=> CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.actorCardId')), 'null') AS UNSIGNED) \
+            AND a.tenant_id <=> CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.actorTenantId')), 'null') AS UNSIGNED) \
+            AND a.domain_id <=> CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.actorDomainId')), 'null') AS UNSIGNED) \
+            AND JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.quarantineId')) = CAST(q.id AS CHAR) \
+            AND JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.operationHash')) = LOWER(HEX(q.replay_operation_id_hash)) \
+      ) \
+    ORDER BY q.replay_requested_at ASC, q.id ASC \
     LIMIT 1 \
     FOR UPDATE";
 
-const NEXT_EXPIRED_REPLAYING_REPLAY_SQL: &str = "SELECT id, replay_operation_id_hash, \
-        replay_lease_generation, replay_lease_owner, replay_lease_token_hash \
-    FROM audit_quarantine \
-    WHERE status = 'REPLAYING' \
-      AND replay_attempts < ? \
-      AND source_queue = ? \
-      AND source_exchange = ? \
-      AND source_routing_key = ? \
-      AND message_type = ? \
-      AND replay_operation_id_hash IS NOT NULL \
-      AND replay_lease_generation > 0 \
-      AND replay_lease_owner IS NOT NULL \
-      AND replay_lease_token_hash IS NOT NULL \
-      AND replay_lease_expires_at IS NOT NULL \
-      AND replay_lease_expires_at <= UTC_TIMESTAMP() \
-    ORDER BY replay_lease_expires_at ASC, id ASC \
+const NEXT_EXPIRED_REPLAYING_REPLAY_SQL: &str = "SELECT q.id, q.replay_operation_id_hash, \
+        q.replay_lease_generation, q.replay_lease_owner, q.replay_lease_token_hash \
+    FROM audit_quarantine q \
+    WHERE q.status = 'REPLAYING' \
+      AND q.replay_attempts < ? \
+      AND q.source_queue = ? \
+      AND q.source_exchange = ? \
+      AND q.source_routing_key = ? \
+      AND q.message_type = ? \
+      AND q.replay_operation_id_hash IS NOT NULL \
+      AND q.replay_lease_generation > 0 \
+      AND q.replay_lease_owner IS NOT NULL \
+      AND q.replay_lease_token_hash IS NOT NULL \
+      AND q.replay_lease_expires_at IS NOT NULL \
+      AND q.replay_lease_expires_at <= UTC_TIMESTAMP() \
+      AND EXISTS ( \
+          SELECT 1 FROM audit_log a \
+          WHERE a.event_type = 'AUDIT_REPLAY_REQUEST' \
+            AND a.action = 'request_replay' AND a.resource = 'audit_quarantine' \
+            AND a.decision = 'REQUESTED' \
+            AND a.user_id = CAST(q.replay_requested_by AS UNSIGNED) \
+            AND a.card_id <=> CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.actorCardId')), 'null') AS UNSIGNED) \
+            AND a.tenant_id <=> CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.actorTenantId')), 'null') AS UNSIGNED) \
+            AND a.domain_id <=> CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.actorDomainId')), 'null') AS UNSIGNED) \
+            AND JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.quarantineId')) = CAST(q.id AS CHAR) \
+            AND JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.operationHash')) = LOWER(HEX(q.replay_operation_id_hash)) \
+      ) \
+    ORDER BY q.replay_lease_expires_at ASC, q.id ASC \
     LIMIT 1 \
     FOR UPDATE";
 
@@ -347,6 +400,18 @@ fn validate_operation_id(operation_id: &str) -> Result<(), DbError> {
         "invalid_operation_id",
         MAX_OPERATION_ID_LENGTH,
     )
+}
+
+fn validate_canonical_request_id(request_id: &str) -> Result<(), DbError> {
+    if request_id.is_empty()
+        || request_id.len() > MAX_CANONICAL_REQUEST_ID_LENGTH
+        || !request_id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
+    {
+        return Err(validation_error("invalid_canonical_request_id"));
+    }
+    Ok(())
 }
 
 fn validate_lease_seconds(lease_seconds: i64) -> Result<(), DbError> {
@@ -714,6 +779,19 @@ async fn fetch_raw_by_id(
     Ok(row)
 }
 
+async fn fetch_raw_by_id_for_update(
+    connection: &mut MySqlConnection,
+    id: i64,
+) -> Result<Option<AuditQuarantineDbRow>, DbError> {
+    let row = sqlx::query_as::<_, AuditQuarantineDbRow>(&format!(
+        "SELECT {RAW_SELECT_COLUMNS} FROM audit_quarantine WHERE id = ? FOR UPDATE"
+    ))
+    .bind(id)
+    .fetch_optional(connection)
+    .await?;
+    Ok(row)
+}
+
 async fn fetch_metadata_by_id(
     connection: &mut MySqlConnection,
     id: i64,
@@ -866,28 +944,87 @@ pub async fn list_quarantine_metadata_by_status<S: AsRef<str>>(
     list_quarantine_by_status(pool, status, limit, offset).await
 }
 
-/// Mark an operator-approved replay request. Worker claim is intentionally a
-/// separate operation and cannot claim a plain `QUARANTINED` row.
+/// Mark an operator-approved replay request and its operator audit in one short
+/// transaction. Worker claim is intentionally separate and cannot claim a plain
+/// `QUARANTINED` row. Repeating the same operation by the same actor is an
+/// idempotent success because the original transition and audit committed atomically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayAuditContext {
+    pub actor_card_id: Option<i64>,
+    pub tenant_id: Option<i64>,
+    pub domain_id: Option<i64>,
+}
+
+impl ReplayAuditContext {
+    fn validate(self) -> Result<Self, DbError> {
+        match (self.actor_card_id, self.tenant_id, self.domain_id) {
+            (None, None, None) => Ok(self),
+            (Some(card_id), Some(tenant_id), Some(domain_id))
+                if card_id > 0 && tenant_id > 0 && domain_id > 0 =>
+            {
+                Ok(self)
+            }
+            _ => Err(validation_error("invalid_replay_actor_context")),
+        }
+    }
+}
+
+/// Compatibility wrapper for repository callers that do not have a signed card
+/// tuple. The HTTP boundary uses `request_replay_with_context` instead.
 pub async fn request_replay(
     pool: &MySqlPool,
     id: i64,
     operation_id: &str,
     requested_by: &str,
 ) -> Result<bool, DbError> {
+    request_replay_with_context(
+        pool,
+        id,
+        operation_id,
+        requested_by,
+        ReplayAuditContext {
+            actor_card_id: None,
+            tenant_id: None,
+            domain_id: None,
+        },
+    )
+    .await
+}
+
+pub async fn request_replay_with_context(
+    pool: &MySqlPool,
+    id: i64,
+    operation_id: &str,
+    requested_by: &str,
+    context: ReplayAuditContext,
+) -> Result<bool, DbError> {
     validate_id(id)?;
     validate_operation_id(operation_id)?;
     validate_lease_owner(requested_by)?;
+    let actor_id = requested_by
+        .parse::<i64>()
+        .ok()
+        .filter(|actor_id| *actor_id > 0)
+        .ok_or_else(|| validation_error("invalid_replay_actor"))?;
     let operation_hash = sha256_bytes(operation_id);
+    let context = context.validate()?;
 
+    validate_canonical_request_id(&replay_audit_request_id(operation_id))?;
     let mut transaction = pool.begin().await?;
-    let Some(row) = fetch_raw_by_id(&mut transaction, id).await? else {
+    let Some(row) = fetch_raw_by_id_for_update(&mut transaction, id).await? else {
         transaction.commit().await?;
         return Ok(false);
     };
     let existing_operation_matches = row
         .replay_operation_id_hash
         .as_deref()
-        .is_some_and(|hash| hash == operation_hash);
+        .is_some_and(|hash| hash == operation_hash)
+        && row.replay_requested_by.as_deref() == Some(requested_by);
+    let audit_request_id = replay_audit_request_id(operation_id);
+    let operation_hash_hex = hex_encode(&operation_hash);
+    let actor_card_id = context.actor_card_id;
+    let audit_tenant_id = context.tenant_id;
+    let audit_domain_id = context.domain_id;
     let metadata = row.into_raw_record()?.metadata;
 
     let requested = match metadata.status {
@@ -895,7 +1032,7 @@ pub async fn request_replay(
             if metadata.replay_attempts >= MAX_REPLAY_ATTEMPTS {
                 false
             } else {
-                sqlx::query(REQUEST_REPLAY_SQL)
+                let updated = sqlx::query(REQUEST_REPLAY_SQL)
                     .bind(operation_hash.as_slice())
                     .bind(requested_by)
                     .bind(id)
@@ -903,14 +1040,71 @@ pub async fn request_replay(
                     .execute(&mut *transaction)
                     .await?
                     .rows_affected()
-                    == 1
+                    == 1;
+                if updated {
+                    let detail = serde_json::to_string(&serde_json::json!({
+                        "actorId": actor_id,
+                        "actorCardId": actor_card_id,
+                        "actorTenantId": audit_tenant_id,
+                        "actorDomainId": audit_domain_id,
+                        "quarantineId": id,
+                        "operationId": operation_id,
+                        "operationHash": operation_hash_hex,
+                        "action": "request_replay",
+                    }))
+                    .map_err(|_| validation_error("replay_audit_detail_serialization"))?;
+                    validate_canonical_request_id(&audit_request_id)?;
+                    sqlx::query(REPLAY_REQUEST_AUDIT_SQL)
+                        .bind(actor_id)
+                        .bind(actor_card_id)
+                        .bind(&audit_request_id)
+                        .bind(audit_domain_id)
+                        .bind(audit_tenant_id)
+                        .bind(detail)
+                        .execute(&mut *transaction)
+                        .await?;
+                    true
+                } else {
+                    false
+                }
             }
         }
-        AuditQuarantineStatus::ReplayRequested => existing_operation_matches,
+        AuditQuarantineStatus::ReplayRequested => {
+            if !existing_operation_matches {
+                false
+            } else {
+                let proof: i64 = sqlx::query_scalar(REPLAY_AUDIT_PROOF_SQL)
+                    .bind(actor_id)
+                    .bind(&audit_request_id)
+                    .bind(actor_card_id)
+                    .bind(audit_tenant_id)
+                    .bind(audit_domain_id)
+                    .bind(id.to_string())
+                    .bind(&operation_hash_hex)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                proof == 1
+            }
+        }
         AuditQuarantineStatus::Replaying | AuditQuarantineStatus::ReplayConfirmed => false,
     };
     transaction.commit().await?;
     Ok(requested)
+}
+
+fn replay_audit_request_id(operation_id: &str) -> String {
+    let canonical = !operation_id.is_empty()
+        && operation_id.len() <= MAX_CANONICAL_REQUEST_ID_LENGTH
+        && operation_id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        });
+    if canonical {
+        return operation_id.to_owned();
+    }
+    // Long internal operation identities stay intact in the audit detail while
+    // the fixed-width request_id gets a safe, collision-resistant canonical id.
+    let digest = Sha256::digest(operation_id.as_bytes());
+    format!("replay-{}", hex_encode(&digest[..28]))
 }
 
 /// Claim an operator-requested row with a server-generated fencing secret.

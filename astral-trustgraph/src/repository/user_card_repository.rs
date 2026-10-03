@@ -1183,6 +1183,22 @@ pub trait UserCardRepository: Send + Sync {
     /// 与 [`Self::bind_card`] 共享同一受守卫核心；异步批量入口没有任何绕过
     /// 归属/贡献守卫的旁路。
     async fn bind_card_async_one(&self, card_id: i64, user_id: i64) -> Result<bool, AstralError>;
+    /// Bind one batch item and atomically commit source, projections, audit, and
+    /// its durable item completion under the existing source transaction fence.
+    #[allow(clippy::too_many_arguments)]
+    async fn bind_card_async_batch_item(
+        &self,
+        card_id: i64,
+        user_id: i64,
+        actor_id: i64,
+        actor_card_id: i64,
+        actor_tenant_id: i64,
+        actor_domain_id: i64,
+        task_id: &str,
+        operation_id: &str,
+        expected_tenant_id: i64,
+        expected_domain_id: i64,
+    ) -> Result<bool, AstralError>;
     /// 冲突检测：同一用户下同 card_type 不同 template_id 的 ACTIVE 卡（限定管理范围）
     async fn find_conflicts(
         &self,
@@ -2661,6 +2677,36 @@ impl UserCardRepository for SqlxUserCardRepository {
         bind_card_with_reassignment_guard(&self.db, card_id, user_id).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn bind_card_async_batch_item(
+        &self,
+        card_id: i64,
+        user_id: i64,
+        actor_id: i64,
+        actor_card_id: i64,
+        actor_tenant_id: i64,
+        actor_domain_id: i64,
+        task_id: &str,
+        operation_id: &str,
+        expected_tenant_id: i64,
+        expected_domain_id: i64,
+    ) -> Result<bool, AstralError> {
+        bind_card_batch_item_with_audit(
+            &self.db,
+            card_id,
+            user_id,
+            actor_id,
+            actor_card_id,
+            actor_tenant_id,
+            actor_domain_id,
+            task_id,
+            operation_id,
+            expected_tenant_id,
+            expected_domain_id,
+        )
+        .await
+    }
+
     async fn find_conflicts(
         &self,
         filter: &UserCardFilter,
@@ -2695,6 +2741,205 @@ impl UserCardRepository for SqlxUserCardRepository {
         .await
         .map_err(db_error)
     }
+}
+
+/// Bind one async batch item with the task/card correlation committed atomically
+/// beside the card source mutation and the existing CARD/ELIGIBILITY side effects.
+#[allow(clippy::too_many_arguments)]
+async fn bind_card_batch_item_with_audit(
+    db: &MySqlPool,
+    card_id: i64,
+    user_id: i64,
+    actor_id: i64,
+    actor_card_id: i64,
+    actor_tenant_id: i64,
+    actor_domain_id: i64,
+    task_id: &str,
+    operation_id: &str,
+    expected_tenant_id: i64,
+    expected_domain_id: i64,
+) -> Result<bool, AstralError> {
+    if card_id <= 0
+        || user_id <= 0
+        || actor_id <= 0
+        || actor_card_id <= 0
+        || actor_tenant_id <= 0
+        || actor_domain_id <= 0
+        || expected_tenant_id <= 0
+        || expected_domain_id <= 0
+        || task_id.trim().is_empty()
+        || operation_id.trim().is_empty()
+        || operation_id.len() > 64
+    {
+        return Err(AstralError::Validation(
+            "card bind batch audit requires verified positive ids and bounded correlation".into(),
+        ));
+    }
+    let mut tx = AuthorizationSourceTransaction::begin(db).await?;
+    let locked: Option<LockedUpdateCardRow> = sqlx::query_as(
+        "SELECT card_status, user_id, tenant_id, domain_id \
+         FROM user_card WHERE card_id = ? FOR UPDATE",
+    )
+    .bind(card_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    let Some(LockedUpdateCardRow {
+        card_status,
+        user_id: current_owner,
+        tenant_id,
+        domain_id,
+    }) = locked
+    else {
+        return Ok(false);
+    };
+    if tenant_id != Some(expected_tenant_id) || domain_id != Some(expected_domain_id) {
+        return Err(AstralError::Validation(
+            "card bind batch target scope changed after request precheck".into(),
+        ));
+    }
+    let target_membership: Vec<i64> = sqlx::query_scalar(
+        "SELECT u.user_id FROM platform_user u \
+         INNER JOIN identity_card ic ON ic.user_id = u.user_id \
+            AND ic.status = 'ACTIVE' \
+            AND (ic.expires_at IS NULL OR ic.expires_at >= UTC_TIMESTAMP()) \
+         INNER JOIN tenant t ON t.tenant_id = ? AND t.status = 'ACTIVE' \
+         INNER JOIN tenant_domain_map tdm ON tdm.tenant_id = t.tenant_id \
+            AND tdm.domain_id = ? AND tdm.status = 'ACTIVE' \
+         INNER JOIN tenant_user_map tum ON tum.tenant_id = t.tenant_id \
+            AND tum.user_id = u.user_id AND tum.status = 'ACTIVE' \
+         WHERE u.user_id = ? AND u.status = 'ACTIVE' AND u.deleted_at IS NULL \
+         FOR UPDATE",
+    )
+    .bind(expected_tenant_id)
+    .bind(expected_domain_id)
+    .bind(user_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    if target_membership.as_slice() != [user_id] {
+        return Err(AstralError::Validation(
+            "batch bind target user is no longer active in the requested tenant/domain".into(),
+        ));
+    }
+    if card_status != "PENDING" && card_status != "INACTIVE" {
+        return Ok(false);
+    }
+    ensure_bind_card_no_stale_user_evidence_in_tx(&mut tx, card_id, user_id, current_owner).await?;
+    let result = sqlx::query(
+        "UPDATE user_card SET user_id = ?, card_status = 'ACTIVE' \
+         WHERE card_id = ? AND card_status IN ('PENDING', 'INACTIVE') \
+           AND tenant_id = ? AND domain_id = ?",
+    )
+    .bind(user_id)
+    .bind(card_id)
+    .bind(expected_tenant_id)
+    .bind(expected_domain_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    if result.rows_affected() != 1 {
+        return Ok(false);
+    }
+
+    let operation_id = operation_id.to_owned();
+    let task_id = task_id.to_owned();
+    let parent = append_card_projection_with_metadata_in_tx(
+        &mut tx,
+        card_id,
+        "CARD_BOUND",
+        astral_db::ProjectionEventMetadata {
+            actor_id,
+            operation_id: &operation_id,
+        },
+    )
+    .await?;
+    append_eligibility_projection_with_invalidation_in_tx(&mut tx, card_id, &operation_id).await?;
+
+    let requester_scope_proven: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_card \
+         WHERE card_id = ? AND user_id = ? AND tenant_id = ? AND domain_id = ? AND card_status = 'ACTIVE' FOR UPDATE",
+    )
+    .bind(actor_card_id)
+    .bind(actor_id)
+    .bind(actor_tenant_id)
+    .bind(actor_domain_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    if requester_scope_proven != 1 {
+        return Err(AstralError::Validation(
+            "batch bind requester card tuple no longer matches its signed context".into(),
+        ));
+    }
+    let detail = serde_json::to_string(&serde_json::json!({
+        "actorId": actor_id,
+        "actorCardId": actor_card_id,
+        "actorTenantId": actor_tenant_id,
+        "actorDomainId": actor_domain_id,
+        "requesterUserId": actor_id,
+        "targetUserId": user_id,
+        "targetCardId": card_id,
+        "tenantId": expected_tenant_id,
+        "domainId": expected_domain_id,
+        "taskId": task_id,
+        "operationId": operation_id,
+        "parentEventId": parent.event_id,
+        "fromStatus": card_status,
+        "toStatus": "ACTIVE",
+        "action": "batch_bind",
+    }))
+    .map_err(|error| {
+        AstralError::Validation(format!("batch bind audit serialization failed: {error}"))
+    })?;
+    sqlx::query(
+        "INSERT INTO audit_log \
+         (user_id, card_id, action, resource, decision, event_type, request_id, domain_id, tenant_id, detail) \
+         VALUES (?, ?, 'batch_bind', 'user_card', 'CARD_BOUND', 'USER_CARD_MUTATION', ?, ?, ?, ?)",
+    )
+    .bind(actor_id)
+    .bind(card_id)
+    .bind(&operation_id)
+    .bind(expected_domain_id)
+    .bind(expected_tenant_id)
+    .bind(detail)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_error)?;
+
+    let item = sqlx::query(
+        "UPDATE async_operation_item SET status = 'COMPLETED', error_message = NULL, \
+                updated_at = UNIX_TIMESTAMP() WHERE task_id = ? AND card_id = ? \
+                  AND operation_id = ? AND status = 'RUNNING' AND tenant_id = ? AND domain_id = ?",
+    )
+    .bind(&task_id)
+    .bind(card_id)
+    .bind(&operation_id)
+    .bind(expected_tenant_id)
+    .bind(expected_domain_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    if item.rows_affected() != 1 {
+        return Err(AstralError::Database(
+            "durable card bind item completion could not be proven".into(),
+        ));
+    }
+    let task = sqlx::query(
+        "UPDATE async_operation SET completed_items = completed_items + 1, updated_at = UNIX_TIMESTAMP() \
+         WHERE task_id = ? AND task_type = 'CARD_BIND' AND status = 'RUNNING'",
+    )
+    .bind(&task_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    if task.rows_affected() != 1 {
+        return Err(AstralError::Database(
+            "durable card bind task completion could not be proven".into(),
+        ));
+    }
+    tx.commit_consuming().await?;
+    Ok(true)
 }
 
 /// bind 换主归属守卫（fail-closed）：拒绝任何会随卡易主却仍归属旧用户（或归属

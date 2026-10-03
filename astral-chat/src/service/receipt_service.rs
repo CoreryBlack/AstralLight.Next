@@ -32,16 +32,20 @@ impl ReceiptService {
     ) -> Result<ReadReceipt, AstralError> {
         self.require_member(conversation_id, scope).await?;
         self.members
-            .mark_read(conversation_id, scope.user_id, last_read_message_id)
+            .mark_read_scoped(conversation_id, scope, last_read_message_id)
+            .await?;
+        let effective_last_read = self
+            .members
+            .last_read_message_id_scoped(conversation_id, scope, scope.user_id)
             .await?;
         let unread = self
             .messages
-            .count_unread_scoped(scope, conversation_id, last_read_message_id)
+            .count_unread_scoped(scope, conversation_id, effective_last_read)
             .await?;
         Ok(ReadReceipt {
             user_id: scope.user_id,
             conversation_id,
-            last_read_message_id,
+            last_read_message_id: effective_last_read,
             unread_count: unread,
         })
     }
@@ -54,11 +58,19 @@ impl ReceiptService {
         target_user_id: i64,
     ) -> Result<ReadReceipt, AstralError> {
         self.require_member(conversation_id, scope).await?;
+        if !self
+            .members
+            .is_member_target_scoped(conversation_id, scope, target_user_id)
+            .await?
+        {
+            return Err(AstralError::Permission(
+                "receipt target is not a member in this scoped conversation".into(),
+            ));
+        }
         let last_read = self
             .members
-            .last_read_message_id(conversation_id, target_user_id)
-            .await?
-            .unwrap_or(0);
+            .last_read_message_id_scoped(conversation_id, scope, target_user_id)
+            .await?;
         let unread = self
             .messages
             .count_unread_scoped(scope, conversation_id, last_read)
@@ -72,8 +84,16 @@ impl ReceiptService {
     }
 
     /// 成员资格校验（对齐 util::require_session_member 语义）
-    async fn require_member(&self, conversation_id: i64, scope: &ChatScope) -> Result<(), AstralError> {
-        if !self.members.is_member_scoped(conversation_id, scope).await? {
+    async fn require_member(
+        &self,
+        conversation_id: i64,
+        scope: &ChatScope,
+    ) -> Result<(), AstralError> {
+        if !self
+            .members
+            .is_member_scoped(conversation_id, scope)
+            .await?
+        {
             tracing::warn!(
                 conversation_id,
                 user_id = scope.user_id,
@@ -98,6 +118,7 @@ mod tests {
         member: bool,
         mark_read_args: Mutex<Vec<(i64, i64, i64)>>,
         last_read: Mutex<Option<i64>>,
+        target_member: bool,
     }
 
     impl FakeMemberRepository {
@@ -106,6 +127,7 @@ mod tests {
                 member,
                 mark_read_args: Mutex::new(Vec::new()),
                 last_read: Mutex::new(None),
+                target_member: true,
             }
         }
     }
@@ -118,6 +140,15 @@ mod tests {
             _scope: &ChatScope,
         ) -> Result<bool, AstralError> {
             Ok(self.member)
+        }
+
+        async fn is_member_target_scoped(
+            &self,
+            _conversation_id: i64,
+            _scope: &ChatScope,
+            _user_id: i64,
+        ) -> Result<bool, AstralError> {
+            Ok(self.target_member)
         }
 
         async fn is_member(
@@ -204,6 +235,41 @@ mod tests {
             Ok(*self.last_read.lock().unwrap())
         }
 
+        async fn last_read_message_id_scoped(
+            &self,
+            _conversation_id: i64,
+            scope: &ChatScope,
+            target_user_id: i64,
+        ) -> Result<i64, AstralError> {
+            if !self.member || (target_user_id != scope.user_id && !self.target_member) {
+                return Err(AstralError::Permission(
+                    "scoped receipt read required".into(),
+                ));
+            }
+            Ok((*self.last_read.lock().unwrap()).unwrap_or(0))
+        }
+
+        async fn mark_read_scoped(
+            &self,
+            conversation_id: i64,
+            scope: &ChatScope,
+            last_read_message_id: i64,
+        ) -> Result<(), AstralError> {
+            if !self.member || last_read_message_id < 0 {
+                return Err(AstralError::Permission(
+                    "scoped receipt write required".into(),
+                ));
+            }
+            self.mark_read_args.lock().unwrap().push((
+                conversation_id,
+                scope.user_id,
+                last_read_message_id,
+            ));
+            let mut current = self.last_read.lock().unwrap();
+            *current = Some((*current).unwrap_or(0).max(last_read_message_id));
+            Ok(())
+        }
+
         async fn mark_read(
             &self,
             conversation_id: i64,
@@ -238,11 +304,28 @@ mod tests {
         }
     }
 
-    /// Fake MessageRepository：未读数固定返回
-    struct FakeMessageRepository;
+    /// Fake MessageRepository：未读数固定返回并记录采用的已读水位。
+    #[derive(Default)]
+    struct FakeMessageRepository {
+        counted_watermarks: Mutex<Vec<i64>>,
+    }
 
     #[async_trait]
     impl MessageRepository for FakeMessageRepository {
+        async fn persist_send_intent_scoped(
+            &self,
+            _scope: &ChatScope,
+            _conversation_id: i64,
+            _message_type: &str,
+            _content: &str,
+            _client_msg_id: &str,
+        ) -> Result<crate::repository::message_repository::PersistedSendIntent, AstralError>
+        {
+            Err(AstralError::NotImplemented(
+                "send not used in receipt test".into(),
+            ))
+        }
+
         async fn insert_message(
             &self,
             _conversation_id: i64,
@@ -282,8 +365,12 @@ mod tests {
             &self,
             _scope: &ChatScope,
             _conversation_id: i64,
-            _last_read_message_id: i64,
+            last_read_message_id: i64,
         ) -> Result<i64, AstralError> {
+            self.counted_watermarks
+                .lock()
+                .unwrap()
+                .push(last_read_message_id);
             Ok(7)
         }
         async fn count_unread(
@@ -317,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn mark_read_non_member_denied() {
         let members = Arc::new(FakeMemberRepository::new(false));
-        let svc = ReceiptService::new(members.clone(), Arc::new(FakeMessageRepository));
+        let svc = ReceiptService::new(members.clone(), Arc::new(FakeMessageRepository::default()));
         let err = svc.mark_read(&scope(1), 10, 5).await.unwrap_err();
         assert!(matches!(err, AstralError::Permission(_)));
         assert!(members.mark_read_args.lock().unwrap().is_empty());
@@ -327,7 +414,8 @@ mod tests {
     async fn mark_read_writes_monotonic_watermark() {
         // mark_read 透传 last_read_message_id 到 repository（SQL 层 GREATEST(COALESCE) 保证不回退）
         let members = Arc::new(FakeMemberRepository::new(true));
-        let svc = ReceiptService::new(members.clone(), Arc::new(FakeMessageRepository));
+        let messages = Arc::new(FakeMessageRepository::default());
+        let svc = ReceiptService::new(members.clone(), messages.clone());
 
         let receipt = svc.mark_read(&scope(1), 10, 100).await.unwrap();
         assert_eq!(receipt.last_read_message_id, 100);
@@ -337,17 +425,65 @@ mod tests {
             members.mark_read_args.lock().unwrap().clone(),
             vec![(10, 1, 100)]
         );
+        assert_eq!(
+            messages.counted_watermarks.lock().unwrap().as_slice(),
+            &[100]
+        );
+    }
+
+    #[test]
+    fn scoped_receipt_update_sql_has_no_literal_backslash_continuations() {
+        let repository = include_str!("../repository/member_repository.rs");
+        let scoped_methods = repository
+            .split("impl MemberRepository for SqlxMemberRepository {")
+            .nth(1)
+            .unwrap()
+            .split("async fn update_group_scoped(")
+            .next()
+            .unwrap();
+        assert!(!scoped_methods.contains('\\'));
+    }
+
+    #[tokio::test]
+    async fn mark_read_lower_retry_returns_effective_watermark_and_counts_from_it() {
+        let members = Arc::new(FakeMemberRepository::new(true));
+        *members.last_read.lock().unwrap() = Some(100);
+        let messages = Arc::new(FakeMessageRepository::default());
+        let svc = ReceiptService::new(members.clone(), messages.clone());
+
+        let receipt = svc.mark_read(&scope(1), 10, 40).await.unwrap();
+
+        assert_eq!(receipt.last_read_message_id, 100);
+        assert_eq!(receipt.unread_count, 7);
+        assert_eq!(
+            members.mark_read_args.lock().unwrap().as_slice(),
+            &[(10, 1, 40)]
+        );
+        assert_eq!(
+            messages.counted_watermarks.lock().unwrap().as_slice(),
+            &[100]
+        );
     }
 
     #[tokio::test]
     async fn get_receipt_defaults_to_zero_when_no_row() {
         // 无已读记录 → last_read 默认 0，未读数从 0 起算
         let members = Arc::new(FakeMemberRepository::new(true));
-        let svc = ReceiptService::new(members.clone(), Arc::new(FakeMessageRepository));
+        let svc = ReceiptService::new(members.clone(), Arc::new(FakeMessageRepository::default()));
 
         let receipt = svc.get_receipt(&scope(1), 10, 2).await.unwrap();
         assert_eq!(receipt.user_id, 2);
         assert_eq!(receipt.last_read_message_id, 0);
         assert_eq!(receipt.unread_count, 7);
+    }
+
+    #[tokio::test]
+    async fn get_receipt_rejects_target_outside_exact_conversation() {
+        let mut members = FakeMemberRepository::new(true);
+        members.target_member = false;
+        let members = Arc::new(members);
+        let svc = ReceiptService::new(members, Arc::new(FakeMessageRepository::default()));
+        let err = svc.get_receipt(&scope(1), 10, 99).await.unwrap_err();
+        assert!(matches!(err, AstralError::Permission(_)));
     }
 }

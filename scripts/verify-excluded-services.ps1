@@ -26,6 +26,19 @@ $exitCode = 1
 $locationPushed = $false
 $hadCargoTargetDirectory = Test-Path Env:CARGO_TARGET_DIR
 $originalCargoTargetDirectory = $env:CARGO_TARGET_DIR
+$integrationEnvironmentNames = @(
+    'DATABASE_URL',
+    'REDIS_URL',
+    'RABBITMQ_URL',
+    'RUST_INTEGRATION_REQUIRED'
+)
+$originalIntegrationEnvironment = @{}
+foreach ($name in $integrationEnvironmentNames) {
+    $originalIntegrationEnvironment[$name] = @{
+        Exists = Test-Path "Env:$name"
+        Value = [System.Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+}
 
 function Copy-SourceTree {
     param(
@@ -69,11 +82,36 @@ function Add-ExcludedServiceMembers {
         }
     }
 
-    return $Manifest.Substring(0, $membersMatch.Index) +
+    $modified = $Manifest.Substring(0, $membersMatch.Index) +
         $membersMatch.Groups['prefix'].Value +
         $body +
         $membersMatch.Groups['closing'].Value +
         $Manifest.Substring($membersMatch.Index + $membersMatch.Length)
+
+    $excludeMatch = [regex]::Match(
+        $modified,
+        '(?ms)^(?<prefix>exclude\s*=\s*\[)(?<body>.*?)(?<closing>\])'
+    )
+    if (-not $excludeMatch.Success) {
+        throw 'The temporary Cargo.toml has no recognizable workspace exclude array.'
+    }
+
+    $excludeBody = $excludeMatch.Groups['body'].Value
+    foreach ($member in @('astral-chat', 'astral-learn')) {
+        $quotedMember = '"' + [regex]::Escape($member) + '"'
+        $excludeBody = [regex]::Replace($excludeBody, $quotedMember + '\s*,?\s*', '')
+    }
+    foreach ($member in @('astral-chat', 'astral-learn')) {
+        if ($excludeBody -match ('"' + [regex]::Escape($member) + '"')) {
+            throw "The temporary Cargo.toml still excludes workspace member '$member'."
+        }
+    }
+
+    return $modified.Substring(0, $excludeMatch.Index) +
+        $excludeMatch.Groups['prefix'].Value +
+        $excludeBody +
+        $excludeMatch.Groups['closing'].Value +
+        $modified.Substring($excludeMatch.Index + $excludeMatch.Length)
 }
 
 try {
@@ -90,6 +128,9 @@ try {
     )
 
     $env:CARGO_TARGET_DIR = Join-Path $tempRoot 'target'
+    foreach ($name in $integrationEnvironmentNames) {
+        Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+    }
     $cargoArguments = @()
     if ($Offline) {
         $cargoArguments += '--offline'
@@ -116,7 +157,7 @@ try {
         throw "cargo test failed with exit code $exitCode."
     }
 
-    Write-Host '[done] Excluded service verification passed.'
+    Write-Host '[done] Excluded-service check and non-ignored tests passed; ignored tests remain skipped (no integration gate was run).'
 } catch {
     Write-Error $_
 } finally {
@@ -128,6 +169,17 @@ try {
         $env:CARGO_TARGET_DIR = $originalCargoTargetDirectory
     } else {
         Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+    }
+    foreach ($name in $integrationEnvironmentNames) {
+        if ($originalIntegrationEnvironment[$name].Exists) {
+            [System.Environment]::SetEnvironmentVariable(
+                $name,
+                $originalIntegrationEnvironment[$name].Value,
+                'Process'
+            )
+        } else {
+            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+        }
     }
 
     if (Test-Path -LiteralPath $tempRoot) {

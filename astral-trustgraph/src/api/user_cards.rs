@@ -256,25 +256,25 @@ async fn require_target_user(
     tenant_id: i64,
     domain_id: i64,
 ) -> Result<(), AppError> {
-    let valid = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM platform_user u \\
-         INNER JOIN identity_card ic ON ic.user_id = u.user_id \\
-            AND ic.status = 'ACTIVE' \\
-            AND (ic.expires_at IS NULL OR ic.expires_at >= UTC_TIMESTAMP()) \\
-         INNER JOIN tenant t ON t.tenant_id = ? AND t.status = 'ACTIVE' \\
-         INNER JOIN tenant_domain_map tdm ON tdm.tenant_id = t.tenant_id \\
-            AND tdm.domain_id = ? AND tdm.status = 'ACTIVE' \\
-         INNER JOIN tenant_user_map tum ON tum.tenant_id = t.tenant_id \\
-            AND tum.user_id = u.user_id AND tum.status = 'ACTIVE' \\
+    let valid: Vec<i64> = sqlx::query_scalar(
+        "SELECT u.user_id FROM platform_user u \
+         INNER JOIN identity_card ic ON ic.user_id = u.user_id \
+            AND ic.status = 'ACTIVE' \
+            AND (ic.expires_at IS NULL OR ic.expires_at >= UTC_TIMESTAMP()) \
+         INNER JOIN tenant t ON t.tenant_id = ? AND t.status = 'ACTIVE' \
+         INNER JOIN tenant_domain_map tdm ON tdm.tenant_id = t.tenant_id \
+            AND tdm.domain_id = ? AND tdm.status = 'ACTIVE' \
+         INNER JOIN tenant_user_map tum ON tum.tenant_id = t.tenant_id \
+            AND tum.user_id = u.user_id AND tum.status = 'ACTIVE' \
          WHERE u.user_id = ? AND u.status = 'ACTIVE' AND u.deleted_at IS NULL",
     )
     .bind(tenant_id)
     .bind(domain_id)
     .bind(user_id)
-    .fetch_one(&state.db)
+    .fetch_all(&state.db)
     .await
     .map_err(|_| scope_denied())?;
-    if valid != 1 {
+    if valid.as_slice() != [user_id] {
         return Err(scope_denied());
     }
     Ok(())
@@ -528,9 +528,15 @@ async fn bind_card_async(
             "path id must be included in card_ids".into(),
         )));
     }
+    if req.card_ids.is_empty() || req.card_ids.len() > async_tracker::MAX_CARD_BIND_ITEMS {
+        return Err(AppError(AstralError::Validation(format!(
+            "card bind batch must contain between 1 and {} cards",
+            async_tracker::MAX_CARD_BIND_ITEMS,
+        ))));
+    }
     // 绑定是异步执行：在注册任务前先同步校验所有目标卡的管理范围，
     // 避免把无权操作排入后台队列（对齐 Java 在 service 层强制 scope）。
-    let scope = require_management_context(&headers)?;
+    require_management_context(&headers)?;
     let mut prechecked = Vec::with_capacity(req.card_ids.len());
     for card_id in &req.card_ids {
         let card = state
@@ -542,45 +548,166 @@ async fn bind_card_async(
         let target_tenant_id = card.tenant_id.ok_or_else(scope_denied)?;
         let target_domain_id = card.domain_id.ok_or_else(scope_denied)?;
         require_target_user(&state, req.user_id, target_tenant_id, target_domain_id).await?;
-        prechecked.push(*card_id);
+        prechecked.push(async_tracker::CardBindItemInput {
+            card_id: *card_id,
+            tenant_id: target_tenant_id,
+            domain_id: target_domain_id,
+        });
     }
-    // 供异步任务使用的已验证范围：GlobalAdmin 可能管理非本租户卡，异步循环仍按卡校验，
-    // 因此这里仅需要操作者上下文存在；批量任务使用与同步绑定相同的 scope 语义。
-    let _scope = scope;
+    // The caller's signed card tuple is persisted separately from the target
+    // cards. An active GlobalAdmin may legitimately submit a cross-tenant batch.
+    let requester_user_id = parse_header_id(&headers, "x-user-id").ok_or_else(scope_denied)?;
+    let requester_card_id = parse_header_id(&headers, "x-user-card-id").ok_or_else(scope_denied)?;
+    let requester_tenant_id =
+        parse_header_id(&headers, "x-user-card-tenant-id").ok_or_else(scope_denied)?;
+    let requester_domain_id =
+        parse_header_id(&headers, "x-user-card-domain-id").ok_or_else(scope_denied)?;
+    let anchor = state
+        .user_card_repository
+        .get_card(id)
+        .await?
+        .ok_or_else(|| AppError(AstralError::NotFound(format!("user_card {id}"))))?;
+    require_card_scope(&state, &headers, &anchor).await?;
+    let authorization_target_tenant_id = anchor.tenant_id.ok_or_else(scope_denied)?;
+    let authorization_target_domain_id = anchor.domain_id.ok_or_else(scope_denied)?;
 
+    let admission = async_tracker::tracker()
+        .reserve_admission()
+        .await
+        .map_err(AppError::from)?;
     let task_id = async_tracker::generate_task_id("uc_bind");
-    let total = req.card_ids.len();
-    let task = async_tracker::tracker()
-        .register(&task_id, "CARD_BIND", Some(total))
-        .await;
-
+    let items = prechecked;
+    let total = items.len();
+    let registration = async_tracker::CardBindRegistration {
+        task_id: task_id.clone(),
+        requester_user_id,
+        requester_card_id,
+        requester_tenant_id,
+        requester_domain_id,
+        authorization_target_card_id: id,
+        authorization_target_tenant_id,
+        authorization_target_domain_id,
+        target_user_id: req.user_id,
+        items,
+    };
     let service = state.user_card_service.clone();
+    let db = state.db.clone();
     let tid = task_id.clone();
+    let actor_id = requester_user_id;
+    let actor_card_id = requester_card_id;
+    let actor_tenant_id = requester_tenant_id;
+    let actor_domain_id = requester_domain_id;
     let user_id = req.user_id;
-    tokio::spawn(async move {
-        async_tracker::tracker().start(&tid).await;
-        let mut completed = 0usize;
-        for card_id in prechecked {
-            match service.bind_card_async_one(card_id, user_id).await {
-                Ok(_) => {
-                    completed += 1;
+    let stop_requested = async_tracker::tracker().stop_requested().await;
+    let task = async_tracker::tracker()
+        .register_card_bind_and_spawn(&state.db, admission, registration, async move {
+            let work_result: Result<(), String> = async {
+                async_tracker::start_card_bind(&db, &tid)
+                    .await
+                    .map_err(|error| format!("could not start durable card-bind task: {error}"))?;
+                let pending = async_tracker::list_pending_card_bind_items(&db, &tid)
+                    .await
+                    .map_err(|error| format!("could not load durable card-bind items: {error}"))?;
+                for candidate in pending {
+                    if stop_requested.load(std::sync::atomic::Ordering::Acquire) {
+                        async_tracker::mark_card_bind_remaining_in_doubt(
+                            &db,
+                            &tid,
+                            "worker shutdown requested before remaining items started",
+                        )
+                        .await
+                        .map_err(|error| format!("could not persist shutdown IN_DOUBT: {error}"))?;
+                        break;
+                    }
+                    let Some(item) = async_tracker::mark_card_bind_item_running(&db, &tid, candidate.card_id)
+                        .await
+                        .map_err(|error| format!("could not mark item RUNNING: {error}"))?
+                    else {
+                        continue;
+                    };
+                    match service
+                        .bind_card_async_batch_item(
+                            item.card_id,
+                            user_id,
+                            actor_id,
+                            actor_card_id,
+                            actor_tenant_id,
+                            actor_domain_id,
+                            &tid,
+                            &item.operation_id,
+                            item.tenant_id,
+                            item.domain_id,
+                        )
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(error) => {
+                            let message = error.to_string();
+                            tracing::warn!(task_id = %tid, card_id = item.card_id, error = %message, "failed to bind card");
+                            let outcome = if matches!(
+                                error,
+                                AstralError::Validation(_)
+                                    | AstralError::Auth(_)
+                                    | AstralError::Permission(_)
+                                    | AstralError::NotFound(_)
+                            ) {
+                                "FAILED"
+                            } else {
+                                "IN_DOUBT"
+                            };
+                            let mut completion_proven = false;
+                            if let Err(persist) = async_tracker::fail_card_bind_item(
+                                &db,
+                                &tid,
+                                item.card_id,
+                                outcome,
+                                &message,
+                            )
+                            .await
+                            {
+                                let item_state = async_tracker::get_task(&db, &tid)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|task| task.items.into_iter().find(|child| child.card_id == item.card_id));
+                                completion_proven = item_state
+                                    .is_some_and(|child| child.status == "COMPLETED");
+                                if !completion_proven {
+                                    return Err(format!("{message}; could not prove child outcome: {persist}"));
+                                }
+                            }
+                            if outcome == "IN_DOUBT" && !completion_proven {
+                                return Err(format!("batch child outcome is unknown: {message}"));
+                            }
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(card_id, error = %e, "failed to bind card");
+                Ok(())
+            }
+            .await;
+
+            if let Err(error) = &work_result {
+                if let Err(persist) = async_tracker::mark_card_bind_remaining_in_doubt(&db, &tid, error).await {
+                    tracing::error!(task_id = %tid, error = %persist, "failed to persist unknown batch outcomes");
                 }
             }
-            async_tracker::tracker()
-                .update_progress(&tid, completed)
-                .await;
-        }
-        if completed == total {
-            async_tracker::tracker().complete(&tid).await;
-        } else {
-            async_tracker::tracker()
-                .fail(&tid, &format!("{}/{} bound", completed, total))
-                .await;
-        }
-    });
+            let finish_result = async_tracker::finish_card_bind(
+                &db,
+                &tid,
+                stop_requested.load(std::sync::atomic::Ordering::Acquire) || work_result.is_err(),
+            )
+            .await;
+            if let Err(error) = finish_result {
+                let message = format!("could not finalize durable card-bind state: {error}");
+                if let Err(persist) = async_tracker::mark_card_bind_remaining_in_doubt(&db, &tid, &message).await {
+                    return Err(format!("{message}; could not persist IN_DOUBT: {persist}"));
+                }
+                return Err(message);
+            }
+            work_result
+        })
+        .await
+        .map_err(AppError::from)?;
 
     tracing::info!(task_id = %task_id, total, user_id, "async batch bind started");
     Ok(Json(ApiResponse::success(task)))

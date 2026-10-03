@@ -9,6 +9,10 @@ license = "AGPL-3.0-or-later"
 name = "astral-learn"
 path = "src/main.rs"
 
+[features]
+default = []
+redis-compat = ["astral-common/redis-compat", "astral-db/redis-compat", "astral-mq/redis-compat"]
+
 [dependencies]
 astral-common = { path = "../astral-common" }
 astral-types = { path = "../astral-types" }

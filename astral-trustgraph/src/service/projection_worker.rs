@@ -118,6 +118,43 @@ pub struct ProjectionWorkerShutdownReport {
     pub join_elapsed: Duration,
 }
 
+/// Retains the worker join if the shutdown future itself is dropped. Drop
+/// requests cancellation/abort and transfers the join to a Tokio reaper task.
+struct ProjectionWorkerShutdownGuard {
+    cancellation: ProjectionWorkerCancellationToken,
+    join: Option<tokio::task::JoinHandle<()>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl ProjectionWorkerShutdownGuard {
+    fn join_mut(&mut self) -> &mut tokio::task::JoinHandle<()> {
+        self.join
+            .as_mut()
+            .expect("shutdown guard retains the join until completion")
+    }
+
+    fn release_join(&mut self) {
+        self.join.take();
+    }
+}
+
+impl Drop for ProjectionWorkerShutdownGuard {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(join) = self.join.take() {
+            join.abort();
+            self.runtime.spawn(async move {
+                if tokio::time::timeout(Duration::from_secs(1), join)
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("projection worker abort remains unproven");
+                }
+            });
+        }
+    }
+}
+
 /// Cancel the legacy projection worker and await termination within a bounded
 /// timeout.
 ///
@@ -128,17 +165,35 @@ pub async fn shutdown_projection_worker(
     handle: ProjectionWorkerHandle,
     timeout: Duration,
 ) -> ProjectionWorkerShutdownReport {
+    let mut ownership = ProjectionWorkerShutdownGuard {
+        cancellation: handle.cancellation.clone(),
+        join: Some(handle.join),
+        runtime: tokio::runtime::Handle::current(),
+    };
     handle.cancellation.cancel();
     let started = Instant::now();
-    let summary = match tokio::time::timeout(timeout, handle.join).await {
-        Ok(joined) => match joined {
-            Ok(()) => Ok(()),
-            Err(join_error) => Err(format!("worker task failed: {join_error}")),
-        },
-        Err(_) => Err(format!(
-            "legacy projection worker did not stop within {timeout:?}; possibly \
-             wedged inside a projection/compensation cycle"
-        )),
+    let summary = match tokio::time::timeout(timeout, ownership.join_mut()).await {
+        Ok(Ok(())) => {
+            ownership.release_join();
+            Ok(())
+        }
+        Ok(Err(join_error)) => {
+            ownership.release_join();
+            Err(format!("worker task failed: {join_error}"))
+        }
+        Err(_) => {
+            ownership.join_mut().abort();
+            if tokio::time::timeout(Duration::from_secs(1), ownership.join_mut())
+                .await
+                .is_ok()
+            {
+                ownership.release_join();
+            }
+            Err(format!(
+                "legacy projection worker did not stop within {timeout:?}; aborted; possibly \
+                 wedged inside a projection/compensation cycle"
+            ))
+        }
     };
     tracing::info!(
         join_elapsed_ms = started.elapsed().as_millis() as u64,
@@ -422,7 +477,11 @@ async fn fail_event(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
 
     use astral_types::AstralError;
     use async_trait::async_trait;
@@ -537,6 +596,108 @@ mod tests {
                 .push((outbox_id, error_msg.to_string()));
             Ok(())
         }
+    }
+
+    struct DropObservedFuture {
+        entered: Option<Arc<AtomicBool>>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Future for DropObservedFuture {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            if let Some(entered) = &self.entered {
+                entered.store(true, Ordering::Release);
+            }
+            Poll::Pending
+        }
+    }
+
+    impl Drop for DropObservedFuture {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_shutdown_future_aborts_and_reaps_worker() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let worker_dropped = Arc::clone(&dropped);
+        let entered = Arc::new(AtomicBool::new(false));
+        let worker_entered = Arc::clone(&entered);
+        let handle = ProjectionWorkerHandle {
+            cancellation: ProjectionWorkerCancellationToken::default(),
+            join: tokio::spawn(async move {
+                DropObservedFuture {
+                    entered: Some(worker_entered),
+                    dropped: worker_dropped,
+                }
+                .await;
+            }),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "worker did not start");
+            tokio::task::yield_now().await;
+        }
+
+        let shutdown_cancellation = handle.cancellation.clone();
+        let shutdown = tokio::spawn(shutdown_projection_worker(handle, Duration::from_secs(30)));
+        while !shutdown_cancellation.is_cancelled() {
+            assert!(
+                Instant::now() < deadline,
+                "shutdown did not acquire ownership"
+            );
+            tokio::task::yield_now().await;
+        }
+        shutdown.abort();
+        let _ = shutdown.await;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !dropped.load(Ordering::Acquire) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "worker must be aborted on drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_aborts_and_reaps_worker() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let handle = ProjectionWorkerHandle {
+            cancellation: ProjectionWorkerCancellationToken::default(),
+            join: tokio::spawn({
+                let entered = Arc::clone(&entered);
+                let dropped = Arc::clone(&dropped);
+                async move {
+                    DropObservedFuture {
+                        entered: Some(entered),
+                        dropped,
+                    }
+                    .await;
+                }
+            }),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "worker did not start");
+            tokio::task::yield_now().await;
+        }
+
+        let report = shutdown_projection_worker(handle, Duration::from_millis(20)).await;
+        assert!(
+            report.summary.is_err(),
+            "timed-out worker must fail shutdown"
+        );
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "timed-out worker must be reaped"
+        );
+        assert!(report.join_elapsed < Duration::from_secs(2));
     }
 
     #[test]

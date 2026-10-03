@@ -9,13 +9,15 @@ use astral_common::middleware::permission_check_shared::{
     path_matches_prefix, physical_policy_context, request_target_id, resolve_permission_action,
     PathResourceMap,
 };
-use astral_db::{check_sod_conflict, resolve_resource_ownership, SqlxRuleRepository};
+use astral_db::{check_sod_conflict_with_context, resolve_resource_ownership, SqlxRuleRepository};
 
 use crate::AppState;
 
 /// 注意：此中间件在 nest("/v1/chat", ...) 内部运行，
 /// 路径前缀已被 axum 剥离，所以使用剥离后的路径
 pub const CHAT_PATH_MAP: PathResourceMap = &[
+    // WebSocket frames carry the actual conversation target; a URI user id is
+    // only a connection principal and must not be used as a fake ownership target.
     ("/messages", "chat_message"),
     ("/sessions", "chat_conversation"),
     ("/groups", "chat_conversation"),
@@ -30,9 +32,10 @@ fn chat_resource_for_path(path: &str) -> Option<&'static str> {
         .map(|(_, resource)| *resource)
 }
 
+#[allow(clippy::result_large_err)]
 pub async fn chat_permission_middleware(
     State(state): State<AppState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, Response> {
     let path = req.uri().path();
@@ -55,20 +58,34 @@ pub async fn chat_permission_middleware(
         None => return Ok(next.run(req).await),
     };
 
+    let hub = astral_db::memory_projection_hub();
+    let authority_fence = if let Some(hub) = hub {
+        Some(hub.capture_authority_fence().ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Chat authority state is changing",
+            )
+                .into_response()
+        })?)
+    } else {
+        None
+    };
     let query_target_id = request_target_id(&req);
     let mut ctx = physical_policy_context(req.headers(), resource, action, query_target_id)
         .map_err(|status| status.into_response())?;
-    let resolution = resolve_resource_ownership(
-        &state.db,
-        resource,
-        path,
-        method.as_str(),
-        query_target_id,
-        ctx.card_id,
-        ctx.user_id,
-    )
-    .await;
-    resolution.apply_to(&mut ctx);
+    if !path_matches_prefix(path, "/ws") {
+        let resolution = resolve_resource_ownership(
+            &state.db,
+            resource,
+            path,
+            method.as_str(),
+            query_target_id,
+            ctx.card_id,
+            ctx.user_id,
+        )
+        .await;
+        resolution.apply_to(&mut ctx);
+    }
     let user_id = ctx.user_id;
     let card_id = ctx.card_id;
     let tenant_id = ctx.tenant_id;
@@ -89,7 +106,7 @@ pub async fn chat_permission_middleware(
         let pool = state.db.clone();
         let hit_phase =
             policy_engine::PolicyEngine::allow_source_phase(&decision).map(String::from);
-        tokio::spawn(async move {
+        if let Err(reason) = astral_common::audit::spawn_owned_audit(async move {
             astral_common::audit::record_permission_audit(
                 user_id,
                 card_id,
@@ -114,7 +131,9 @@ pub async fn chat_permission_middleware(
                     .await;
                 }
             }
-        });
+        }) {
+            tracing::error!(reason, "owned Chat permission audit admission refused");
+        }
     }
 
     if !decision.allowed {
@@ -129,16 +148,7 @@ pub async fn chat_permission_middleware(
     }
 
     if let Some(so_card_id) = card_id {
-        match check_sod_conflict(
-            &state.db,
-            so_card_id,
-            user_id,
-            resource,
-            action,
-            resource_owner_id,
-        )
-        .await
-        {
+        match check_sod_conflict_with_context(&state.db, &ctx, resource_owner_id).await {
             Ok(result) if result.has_conflict => {
                 return Err((
                     StatusCode::FORBIDDEN,
@@ -163,6 +173,18 @@ pub async fn chat_permission_middleware(
         }
     }
 
+    if let Some((hub, fence)) = hub.zip(authority_fence) {
+        if !hub.authority_fence_matches(fence) {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Chat authority changed during authorization",
+            )
+                .into_response());
+        }
+        if path_matches_prefix(req.uri().path(), "/ws") {
+            req.extensions_mut().insert(fence);
+        }
+    }
     Ok(next.run(req).await)
 }
 
@@ -174,7 +196,10 @@ mod tests {
     fn chat_ws_permission_mapping_is_segment_bounded() {
         assert_eq!(chat_resource_for_path("/ws"), Some("chat_conversation"));
         assert_eq!(chat_resource_for_path("/ws/42"), Some("chat_conversation"));
-        assert_eq!(chat_resource_for_path("/ws/42/extra"), Some("chat_conversation"));
+        assert_eq!(
+            chat_resource_for_path("/ws/42/extra"),
+            Some("chat_conversation")
+        );
         assert_eq!(chat_resource_for_path("/wsfoo"), None);
     }
 }

@@ -151,6 +151,7 @@ _HARNESS_FILES = (
     "run_cs_evidence.py",
     "s15_coordinator.py",
     "s15_perf.py",
+    "s15_validation.py",
     "seed_f4rust.sql",
     "README.md",
 )
@@ -710,16 +711,22 @@ def postcondition(name, path, args=None, entry=None):
         return False, "artifact root must be an object, got %s" % type(data).__name__
     if name == "s15_coordinator":
         s = data.get("summary") or {}
-        complete = data.get("complete") is True
+        coverage = data.get("coverage") or {}
+        complete = data.get("complete") is True and coverage.get("complete") is True
         rounds_ok = bool(
             args is not None and args.rounds >= 3
-            and data.get("rounds_done") == args.rounds
-            and s.get("rounds") == args.rounds)
+                and data.get("rounds_done") == args.rounds
+                and s.get("rounds") == args.rounds
+                and s.get("only") is None)
+
         pass_count = s.get("pass")
-        return (complete and rounds_ok and isinstance(pass_count, int)
+        return (complete and rounds_ok and coverage.get("scope") == "full"
+                and coverage.get("requiredCasePasses") is True
+                and isinstance(pass_count, int)
                 and pass_count > 0 and s.get("fail") == 0), \
-            "complete=%s rounds=%s/%s pass=%s fail=%s na=%s fail_items=%s blocked_reason=%s" % (
-                complete, data.get("rounds_done"), args.rounds if args else None,
+            "complete=%s coverage=%s scope=%s rounds=%s/%s pass=%s fail=%s na=%s fail_items=%s blocked_reason=%s" % (
+                complete, coverage.get("complete"), coverage.get("scope"),
+                data.get("rounds_done"), args.rounds if args else None,
                 pass_count, s.get("fail"), s.get("na"), s.get("fail_items"),
                 data.get("blocked_reason"))
     if name == "f7_recheck":

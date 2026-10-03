@@ -92,14 +92,12 @@ async fn test_audit_quarantine_repository_lifecycle() {
     assert_eq!(second.attempts, first.attempts + 1);
     assert_eq!(second.retry_count, input.retry_count);
 
-    assert!(request_replay(&pool, first.id, "operation-1", "operator-1")
+    assert!(request_replay(&pool, first.id, "operation-1", "1")
         .await
         .expect("replay request must succeed"));
-    assert!(
-        !request_replay(&pool, first.id, "operation-2", "operator-1")
-            .await
-            .expect("second operation cannot replace request")
-    );
+    assert!(!request_replay(&pool, first.id, "operation-2", "1")
+        .await
+        .expect("second operation cannot replace request"));
 
     let claimed = begin_replay(&pool, first.id, "worker-1", "operation-1", 60)
         .await
@@ -167,7 +165,7 @@ async fn test_audit_quarantine_repository_lifecycle() {
         .expect("terminal retry after confirmation must upsert");
     assert_eq!(third.status, AuditQuarantineStatus::Quarantined);
 
-    assert!(request_replay(&pool, third.id, "operation-2", "operator-2")
+    assert!(request_replay(&pool, third.id, "operation-2", "2")
         .await
         .expect("second replay request must succeed"));
     let reclaimed = begin_replay(&pool, third.id, "worker-2", "operation-2", 1)
@@ -233,11 +231,9 @@ async fn test_concurrent_claim_fencing_and_expired_reclaim() {
     let row = insert_or_increment_terminal(&pool, &input("concurrent-claim"))
         .await
         .expect("insert must succeed");
-    assert!(
-        request_replay(&pool, row.id, "operation-concurrent", "operator")
-            .await
-            .expect("request must succeed")
-    );
+    assert!(request_replay(&pool, row.id, "operation-concurrent", "1")
+        .await
+        .expect("request must succeed"));
 
     let pool_a = pool.clone();
     let first_task = tokio::spawn(async move {
@@ -333,7 +329,7 @@ async fn test_requested_replay_precedes_expired_recovery() {
         .await
         .expect("expired row insert must succeed");
     assert!(
-        request_replay(&pool, expired.id, "ordering-expired-operation", "operator",)
+        request_replay(&pool, expired.id, "ordering-expired-operation", "1",)
             .await
             .expect("expired replay request must succeed")
     );
@@ -352,14 +348,11 @@ async fn test_requested_replay_precedes_expired_recovery() {
     let requested = insert_or_increment_terminal(&pool, &input("ordering-requested"))
         .await
         .expect("requested row insert must succeed");
-    assert!(request_replay(
-        &pool,
-        requested.id,
-        "ordering-requested-operation",
-        "operator",
-    )
-    .await
-    .expect("requested replay request must succeed"));
+    assert!(
+        request_replay(&pool, requested.id, "ordering-requested-operation", "1",)
+            .await
+            .expect("requested replay request must succeed")
+    );
 
     let selected = begin_next_requested_replay(
         &pool,
@@ -433,7 +426,7 @@ async fn test_max_replay_attempts_are_observable_without_confirmation() {
         .await
         .expect("max-attempts row insert must succeed");
     assert!(
-        request_replay(&pool, row.id, "max-attempts-operation", "operator",)
+        request_replay(&pool, row.id, "max-attempts-operation", "1",)
             .await
             .expect("replay request must succeed")
     );
@@ -573,7 +566,7 @@ async fn test_requested_claim_requires_exact_route_status_and_attempt_ceiling() 
         let row = insert_or_increment_terminal(&pool, &wrong_input)
             .await
             .expect("wrong-route row insert must succeed");
-        assert!(request_replay(&pool, row.id, operation_id, "operator")
+        assert!(request_replay(&pool, row.id, operation_id, "1")
             .await
             .expect("wrong-route replay request must succeed"));
         wrong_rows.push(row);
@@ -583,7 +576,7 @@ async fn test_requested_claim_requires_exact_route_status_and_attempt_ceiling() 
         .await
         .expect("max-attempts row insert must succeed");
     assert!(
-        request_replay(&pool, exhausted.id, "requested-max-operation", "operator",)
+        request_replay(&pool, exhausted.id, "requested-max-operation", "1",)
             .await
             .expect("max-attempts replay request must succeed")
     );
@@ -600,7 +593,7 @@ async fn test_requested_claim_requires_exact_route_status_and_attempt_ceiling() 
         .await
         .expect("exact-route row insert must succeed");
     assert!(
-        request_replay(&pool, requested.id, "requested-exact-operation", "operator",)
+        request_replay(&pool, requested.id, "requested-exact-operation", "1",)
             .await
             .expect("exact-route replay request must succeed")
     );
@@ -696,7 +689,7 @@ async fn test_typed_claim_confirm_and_fail_fencing() {
         .await
         .expect("confirm row insert must succeed");
     assert!(
-        request_replay(&pool, confirm_row.id, "typed-confirm-operation", "operator",)
+        request_replay(&pool, confirm_row.id, "typed-confirm-operation", "1",)
             .await
             .expect("confirm request must succeed")
     );
@@ -729,7 +722,7 @@ async fn test_typed_claim_confirm_and_fail_fencing() {
         .await
         .expect("fail row insert must succeed");
     assert!(
-        request_replay(&pool, fail_row.id, "typed-fail-operation", "operator",)
+        request_replay(&pool, fail_row.id, "typed-fail-operation", "1",)
             .await
             .expect("fail request must succeed")
     );
@@ -819,7 +812,7 @@ async fn test_expired_reclaim_fences_old_typed_claim() {
         .await
         .expect("expired reclaim row insert must succeed");
     assert!(
-        request_replay(&pool, row.id, "typed-expired-operation", "operator",)
+        request_replay(&pool, row.id, "typed-expired-operation", "1",)
             .await
             .expect("expired reclaim request must succeed")
     );

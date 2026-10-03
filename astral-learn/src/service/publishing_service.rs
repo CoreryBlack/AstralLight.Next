@@ -25,17 +25,18 @@ impl PublishingService {
     pub async fn publish_course(&self, course_id: i64) -> Result<PublishWorkflow, AstralError> {
         let hit = self.repo.publish_course(course_id).await?;
         if hit {
-            self.repo.upsert_published_at(course_id).await?;
+            tracing::info!(course_id, "course published");
         }
-        tracing::info!(course_id, "course published");
-        self.build_workflow(course_id, "PUBLISHED").await
+        self.build_workflow(course_id).await
     }
 
     /// 归档课程（任意状态 → ARCHIVED，无守卫）
     pub async fn archive_course(&self, course_id: i64) -> Result<PublishWorkflow, AstralError> {
-        self.repo.archive_course(course_id).await?;
-        tracing::info!(course_id, "course archived");
-        self.build_workflow(course_id, "ARCHIVED").await
+        let hit = self.repo.archive_course(course_id).await?;
+        if hit {
+            tracing::info!(course_id, "course archived");
+        }
+        self.build_workflow(course_id).await
     }
 
     /// 提交审核（DRAFT → REVIEW）
@@ -44,17 +45,20 @@ impl PublishingService {
         if hit {
             tracing::info!(course_id, "course submitted for review");
         }
-        self.build_workflow(course_id, "REVIEW").await
+        self.build_workflow(course_id).await
     }
 
     /// 审批通过（REVIEW → APPROVED；side effect: workflow reviewer/comment）
-    pub async fn approve_course(&self, course_id: i64) -> Result<PublishWorkflow, AstralError> {
-        let hit = self.repo.approve_course(course_id).await?;
+    pub async fn approve_course(
+        &self,
+        course_id: i64,
+        reviewer_id: i64,
+    ) -> Result<PublishWorkflow, AstralError> {
+        let hit = self.repo.approve_course(course_id, reviewer_id).await?;
         if hit {
-            self.repo.upsert_approval(course_id).await?;
+            tracing::info!(course_id, reviewer_id, "course approved");
         }
-        tracing::info!(course_id, "course approved");
-        self.build_workflow(course_id, "APPROVED").await
+        self.build_workflow(course_id).await
     }
 
     /// 课程统计
@@ -69,51 +73,25 @@ impl PublishingService {
         })
     }
 
-    /// 学生进度（选课进度优先；否则按已作答章节占比推算）
+    /// Detailed course progress remains fail-closed until Learn has an
+    /// authoritative per-course lesson/completion projection.
     pub async fn student_progress(
         &self,
-        course_id: i64,
-        user_id: i64,
+        _course_id: i64,
+        _user_id: i64,
     ) -> Result<StudentProgress, AstralError> {
-        let total_lessons = self.repo.count_lessons(course_id).await?;
-        let answered_lessons = self.repo.count_answered_lessons(course_id, user_id).await?;
-        let progress_pct = match self
-            .repo
-            .get_enrollment_progress(course_id, user_id)
-            .await?
-        {
-            Some(p) => p,
-            None => {
-                if total_lessons > 0 {
-                    (answered_lessons as f64 / total_lessons as f64) * 100.0
-                } else {
-                    0.0
-                }
-            }
-        };
-        Ok(StudentProgress {
-            user_id,
-            course_id,
-            completed_lessons: answered_lessons,
-            total_lessons,
-            progress_pct,
-            last_activity: time::OffsetDateTime::now_utc().to_string(),
-        })
+        Err(AstralError::NotImplemented(
+            "Course lesson progress requires an authoritative server-side projection".into(),
+        ))
     }
 
-    /// 组装工作流响应（无关联行 → 默认状态占位，对齐 build_workflow 语义）
-    async fn build_workflow(
-        &self,
-        course_id: i64,
-        default_status: &str,
-    ) -> Result<PublishWorkflow, AstralError> {
-        let row = self.repo.get_workflow(course_id).await?;
-        let wf: WorkflowRecord = row.unwrap_or_else(|| WorkflowRecord {
-            current_status: default_status.to_string(),
-            reviewer_id: None,
-            review_comment: None,
-            published_at: None,
-        });
+    /// 组装工作流响应。Missing course/workflow never becomes a default success.
+    async fn build_workflow(&self, course_id: i64) -> Result<PublishWorkflow, AstralError> {
+        let wf: WorkflowRecord = self
+            .repo
+            .get_workflow(course_id)
+            .await?
+            .ok_or_else(|| AstralError::NotFound(format!("Course {course_id} not found")))?;
         Ok(PublishWorkflow {
             course_id,
             current_status: wf.current_status,
@@ -131,7 +109,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
 
-    /// Fake PublishingRepository（记录守卫式 UPDATE 命中与 workflow 副作用）
+    /// Fake PublishingRepository（记录守卫式 UPDATE 命中）
     struct FakePublishingRepository {
         calls: Mutex<Vec<String>>,
         publish_hit: bool,
@@ -183,28 +161,16 @@ mod tests {
             Ok(self.review_hit)
         }
 
-        async fn approve_course(&self, course_id: i64) -> Result<bool, AstralError> {
+        async fn approve_course(
+            &self,
+            course_id: i64,
+            reviewer_id: i64,
+        ) -> Result<bool, AstralError> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("approve:{course_id}"));
+                .push(format!("approve:{course_id}:{reviewer_id}"));
             Ok(self.approve_hit)
-        }
-
-        async fn upsert_published_at(&self, course_id: i64) -> Result<(), AstralError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("upsert_published:{course_id}"));
-            Ok(())
-        }
-
-        async fn upsert_approval(&self, course_id: i64) -> Result<(), AstralError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("upsert_approval:{course_id}"));
-            Ok(())
         }
 
         async fn get_workflow(
@@ -258,8 +224,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_hits_upsert_published_at() {
-        // DRAFT/APPROVED → PUBLISHED 命中时写 workflow.published_at
+    async fn publish_hit_returns_atomic_repository_workflow() {
+        // Repository owns status and published_at in one transaction; service reads the committed result.
         let repo = Arc::new(FakePublishingRepository::new(
             true,
             false,
@@ -271,13 +237,13 @@ mod tests {
         assert_eq!(wf.current_status, "PUBLISHED");
         assert_eq!(
             repo.calls.lock().unwrap().clone(),
-            vec!["publish:10", "upsert_published:10", "get_workflow:10"]
+            vec!["publish:10", "get_workflow:10"]
         );
     }
 
     #[tokio::test]
-    async fn publish_miss_skips_workflow_upsert() {
-        // 非法流转（如 REVIEW 直接 publish）未命中：不写 workflow，静默返回当前状态
+    async fn publish_miss_returns_current_workflow() {
+        // Illegal transition does not change workflow metadata; return current status.
         let repo = Arc::new(FakePublishingRepository::new(
             false,
             false,
@@ -294,8 +260,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_hits_upsert_approval() {
-        // REVIEW → APPROVED 命中时写 reviewer/comment
+    async fn approve_hit_returns_atomic_repository_workflow() {
+        // Repository owns approval and reviewer/comment in one transaction.
         let repo = Arc::new(FakePublishingRepository::new(
             false,
             false,
@@ -303,26 +269,37 @@ mod tests {
             Some(workflow("APPROVED")),
         ));
         let svc = PublishingService::new(repo.clone());
-        let wf = svc.approve_course(10).await.unwrap();
+        let wf = svc.approve_course(10, 7).await.unwrap();
         assert_eq!(wf.current_status, "APPROVED");
         assert_eq!(
             repo.calls.lock().unwrap().clone(),
-            vec!["approve:10", "upsert_approval:10", "get_workflow:10"]
+            vec!["approve:10:7", "get_workflow:10"]
         );
     }
 
     #[tokio::test]
-    async fn submit_review_miss_is_silent() {
-        // 非 DRAFT 提交审核未命中：静默忽略（对齐原 handler 语义）
+    async fn missing_course_after_guarded_miss_is_not_reported_as_success() {
+        let repo = Arc::new(FakePublishingRepository::new(false, false, false, None));
+        let svc = PublishingService::new(repo.clone());
+        assert!(matches!(
+            svc.submit_for_review(10).await,
+            Err(AstralError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn course_progress_requires_authoritative_repository_support() {
         let repo = Arc::new(FakePublishingRepository::new(
             false,
             false,
             false,
-            Some(workflow("APPROVED")),
+            Some(workflow("PUBLISHED")),
         ));
-        let svc = PublishingService::new(repo.clone());
-        let wf = svc.submit_for_review(10).await.unwrap();
-        assert_eq!(wf.current_status, "APPROVED");
+        let svc = PublishingService::new(repo);
+        assert!(matches!(
+            svc.student_progress(10, 7).await,
+            Err(AstralError::NotImplemented(_))
+        ));
     }
 
     #[tokio::test]

@@ -507,6 +507,7 @@ fn target_lookup_kind(resource: &str, path: &str) -> Option<TargetLookupKind> {
         "permission_request" if path.starts_with("/permission-requests/") => {
             Some(TargetLookupKind::PermissionRequest)
         }
+        "audit" if path == "/hit-stats/by-card" => Some(TargetLookupKind::UserCard),
         "audit" => Some(TargetLookupKind::AuditRecord),
         "chat_conversation" if path.starts_with("/ws/") => Some(TargetLookupKind::User),
         "chat_conversation" => Some(TargetLookupKind::ChatConversation),
@@ -723,7 +724,7 @@ fn global_access_requirement(
         return Some(ActiveGlobalAdmin);
     }
 
-    if resource == "audit" && target_id.is_none() {
+    if resource == "audit" && target_id.is_none() && path != "/hit-stats/by-card" {
         return Some(ActiveGlobalAdmin);
     }
 
@@ -918,6 +919,7 @@ fn query_target_is_declared(resource: &str, path: &str, method: &str) -> bool {
     matches!(
         (resource, path, method),
         ("permission_rule", "/permission-rules/check", "GET")
+            | ("audit", "/hit-stats/by-card", "GET")
     )
 }
 
@@ -1538,6 +1540,34 @@ mod tests {
         assert_eq!(
             resolved_target_id("permission_rule", "/permission-rules/7", "GET", Some(8)),
             Err("resource_ownership.path_query_target_mismatch")
+        );
+    }
+
+    #[test]
+    fn hit_stats_by_card_query_resolves_to_server_owned_user_card() {
+        assert!(query_target_is_declared(
+            "audit",
+            "/hit-stats/by-card",
+            "GET"
+        ));
+        assert_eq!(
+            resolved_target_id("audit", "/hit-stats/by-card", "GET", Some(17)),
+            Ok(Some(17))
+        );
+        assert_eq!(
+            route_ownership_contract("audit", "/hit-stats/by-card", "GET", Some(17)),
+            RouteOwnershipContract::TenantTarget {
+                target_id: 17,
+                lookup: TargetLookupKind::UserCard,
+            }
+        );
+        assert_eq!(
+            resolved_target_id("audit", "/hit-stats/by-card", "GET", None),
+            Ok(None)
+        );
+        assert_eq!(
+            resolved_target_id("audit", "/hit-stats/by-card", "POST", Some(17)),
+            Err("resource_ownership.query_target_not_declared")
         );
     }
 
@@ -2399,6 +2429,12 @@ mod tests {
                 "resource_ownership.department_tenant_contract_unmapped"
             ) | (
                 "trustgraph",
+                "audit",
+                "/hit-stats/by-card",
+                "GET",
+                "resource_ownership.target_missing"
+            ) | (
+                "trustgraph",
                 "domain",
                 "/user-cards",
                 "GET",
@@ -2456,6 +2492,16 @@ mod tests {
                     route.method,
                 );
                 let concrete_path = concrete_path(&route.path);
+                if service == "trustgraph"
+                    && route.path == "/operations/{task_id}"
+                    && route.method == "GET"
+                {
+                    let poll = include_str!("../../astral-trustgraph/src/api/permission_check.rs");
+                    assert!(poll.contains("load_operation_scope("));
+                    assert!(poll.contains("operation_poll_scope_matches("));
+                    assert!(poll.contains("authorization_target_card_id"));
+                    continue;
+                }
                 match route_ownership_contract(resource, &concrete_path, route.method, None) {
                     RouteOwnershipContract::Unresolved { code } => assert!(
                         intentionally_fail_closed(
@@ -2477,6 +2523,51 @@ mod tests {
             }
         }
         count
+    }
+
+    #[test]
+    fn reviewed_trustgraph_routes_have_registered_resolved_actions() {
+        let permission_map = include_str!("../../astral-trustgraph/src/api/permission_check.rs");
+        let map = path_map_entries(permission_map, "pub const TRUSTGRAPH_PATH_RESOURCE_MAP:");
+        let route_sources = [
+            include_str!("../../astral-trustgraph/src/api/global_admin.rs"),
+            include_str!("../../astral-trustgraph/src/api/inheritance.rs"),
+            include_str!("../../astral-trustgraph/src/api/resource_types.rs"),
+            include_str!("../../astral-trustgraph/src/api/stats.rs"),
+            include_str!("../../astral-trustgraph/src/api/sod.rs"),
+        ];
+        let registry = astral_types::ResourceRegistry::global();
+        let mut routes_checked = 0usize;
+        for source in route_sources {
+            for route in literal_route_methods(source) {
+                let resource = mapped_resource(&map, &route.path).unwrap_or_else(|| {
+                    panic!("reviewed route has no permission resource: {}", route.path)
+                });
+                let action =
+                    astral_common::middleware::permission_check_shared::resolve_permission_action(
+                        resource,
+                        &route.path,
+                        route.method,
+                    )
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "reviewed route action missing: {} {}",
+                            route.method, route.path
+                        )
+                    });
+                registry.validate(resource, action).unwrap_or_else(|error| {
+                    panic!(
+                        "{} {} maps to unavailable {resource}:{action}: {error}",
+                        route.method, route.path
+                    )
+                });
+                routes_checked += 1;
+            }
+        }
+        assert!(
+            routes_checked >= 30,
+            "target route inventory unexpectedly incomplete"
+        );
     }
 
     #[test]
@@ -2873,8 +2964,13 @@ mod tests {
                 production.contains("physical_policy_context("),
                 "{service} HTTP middleware must start from verified physical actor facts"
             );
+            let ownership_entry = if service == "learn" {
+                "resolve_learn_resource_ownership("
+            } else {
+                "resolve_resource_ownership("
+            };
             assert!(
-                production.contains("resolve_resource_ownership("),
+                production.contains(ownership_entry),
                 "{service} HTTP middleware must resolve server-side target ownership"
             );
             assert!(

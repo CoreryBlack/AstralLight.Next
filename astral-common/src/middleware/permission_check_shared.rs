@@ -202,6 +202,52 @@ pub fn resolve_permission_action(resource: &str, path: &str, method: &str) -> Op
         return Some("play");
     }
 
+    if resource == "authorization"
+        && method == "POST"
+        && [
+            "/global-admins/grant",
+            "/global-admins/enable",
+            "/global-admins/disable",
+        ]
+        .contains(&path)
+    {
+        return Some("update");
+    }
+
+    if resource == "permission_inheritance"
+        && ((method == "POST" && path == "/inheritance/config")
+            || (method == "DELETE" && path.starts_with("/inheritance/config/")))
+    {
+        return Some("update");
+    }
+
+    if resource == "monitor" {
+        match (path, method) {
+            ("/stats/reset", "POST") => return Some("reset"),
+            ("/consistency/check", "GET") | ("/consistency-check", "GET") => return Some("scan"),
+            ("/consistency/check/violations", "DELETE") => return Some("delete"),
+            ("/arbiter/arbitrate", "POST") => return Some("arbitrate"),
+            _ => {}
+        }
+        if method == "POST" && path.starts_with("/alerts/") && path.ends_with("/toggle") {
+            return Some("update");
+        }
+    }
+    if resource == "notification"
+        && method == "POST"
+        && path.starts_with("/notifications/")
+        && path.ends_with("/test")
+    {
+        return Some("test");
+    }
+
+    if resource == "permission_rule"
+        && method == "POST"
+        && (path == "/sod-policies/detect" || path == "/sod-policies/validate-grant")
+    {
+        return Some("read");
+    }
+
     if resource == "permission_request" && method == "POST" {
         if path.ends_with("/approve") || path.ends_with("/reject") {
             return Some("approve");
@@ -429,6 +475,58 @@ mod tests {
             resolve_permission_action("learn_level_play", "/level-play/start", "POST"),
             Some("play")
         );
+    }
+
+    #[test]
+    fn maps_special_registered_mutations_and_resource_type_routes() {
+        let cases = [
+            ("authorization", "/global-admins/grant", "POST", "update"),
+            ("authorization", "/global-admins/enable", "POST", "update"),
+            ("authorization", "/global-admins/disable", "POST", "update"),
+            (
+                "permission_inheritance",
+                "/inheritance/config",
+                "POST",
+                "update",
+            ),
+            (
+                "permission_inheritance",
+                "/inheritance/config/approval",
+                "DELETE",
+                "update",
+            ),
+            ("monitor", "/stats/reset", "POST", "reset"),
+            ("monitor", "/consistency/check", "GET", "scan"),
+            (
+                "monitor",
+                "/consistency/check/violations",
+                "DELETE",
+                "delete",
+            ),
+            ("monitor", "/consistency-check", "GET", "scan"),
+            ("monitor", "/arbiter/arbitrate", "POST", "arbitrate"),
+            ("monitor", "/alerts/3/toggle", "POST", "update"),
+            ("notification", "/notifications/3/test", "POST", "test"),
+            ("permission_rule", "/sod-policies/detect", "POST", "read"),
+            (
+                "permission_rule",
+                "/sod-policies/validate-grant",
+                "POST",
+                "read",
+            ),
+        ];
+        let registry = astral_types::ResourceRegistry::global();
+        for (resource, path, method, expected) in cases {
+            assert_eq!(
+                resolve_permission_action(resource, path, method),
+                Some(expected),
+                "action for {method} {path}"
+            );
+            assert!(
+                registry.validate(resource, expected).is_ok(),
+                "route {method} {path} maps to an unregistered permission {resource}:{expected}"
+            );
+        }
     }
 
     #[test]

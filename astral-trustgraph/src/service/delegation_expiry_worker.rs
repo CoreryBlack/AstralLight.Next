@@ -243,6 +243,45 @@ pub struct DelegationExpiryShutdownReport {
     pub join_elapsed: Duration,
 }
 
+/// Retains the join if shutdown is cancelled while waiting. Drop cancels and
+/// aborts the worker, then transfers the join to a Tokio reaper task.
+struct DelegationExpiryShutdownGuard {
+    cancellation: DelegationExpiryCancellationToken,
+    join: Option<JoinHandle<Result<DelegationExpiryRunSummary, tokio::task::JoinError>>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl DelegationExpiryShutdownGuard {
+    fn join_mut(
+        &mut self,
+    ) -> &mut JoinHandle<Result<DelegationExpiryRunSummary, tokio::task::JoinError>> {
+        self.join
+            .as_mut()
+            .expect("shutdown guard retains the join until completion")
+    }
+
+    fn release_join(&mut self) {
+        self.join.take();
+    }
+}
+
+impl Drop for DelegationExpiryShutdownGuard {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(join) = self.join.take() {
+            join.abort();
+            self.runtime.spawn(async move {
+                if tokio::time::timeout(Duration::from_secs(1), join)
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("delegation expiry worker abort remains unproven");
+                }
+            });
+        }
+    }
+}
+
 /// Cancel the worker and await termination within a bounded timeout.
 ///
 /// `Err(summary)` forms cover: worker panic/join failure, propagated worker
@@ -252,18 +291,39 @@ pub async fn shutdown_delegation_expiry_worker(
     handle: DelegationExpiryWorkerHandle,
     timeout: Duration,
 ) -> DelegationExpiryShutdownReport {
+    let mut ownership = DelegationExpiryShutdownGuard {
+        cancellation: handle.cancellation.clone(),
+        join: Some(handle.join),
+        runtime: tokio::runtime::Handle::current(),
+    };
     handle.cancellation.cancel();
     let started = Instant::now();
-    let summary = match tokio::time::timeout(timeout, handle.join).await {
-        Ok(joined) => match joined {
-            Ok(Ok(summary)) => Ok(summary),
-            Ok(Err(join_error)) => Err(format!("worker task failed: {join_error}")),
-            Err(_) => Err("shutdown summary unavailable".to_owned()),
-        },
-        Err(_) => Err(format!(
-            "delegation expiry worker did not stop within {timeout:?}; possibly \
-             wedged inside a reconciliation transaction"
-        )),
+    let summary = match tokio::time::timeout(timeout, ownership.join_mut()).await {
+        Ok(Ok(Ok(summary))) => {
+            ownership.release_join();
+            Ok(summary)
+        }
+        Ok(Ok(Err(join_error))) => {
+            ownership.release_join();
+            Err(format!("worker task failed: {join_error}"))
+        }
+        Ok(Err(_)) => {
+            ownership.release_join();
+            Err("shutdown summary unavailable".to_owned())
+        }
+        Err(_) => {
+            ownership.join_mut().abort();
+            if tokio::time::timeout(Duration::from_secs(1), ownership.join_mut())
+                .await
+                .is_ok()
+            {
+                ownership.release_join();
+            }
+            Err(format!(
+                "delegation expiry worker did not stop within {timeout:?}; aborted; possibly \
+                 wedged inside a reconciliation transaction"
+            ))
+        }
     };
     tracing::info!(
         run_id = %handle.run_id,
@@ -513,6 +573,8 @@ mod tests {
     /// 记录一次调用后永不返回：用于证明有界 join 的超时分支。
     struct HangingReconciler {
         calls: Mutex<Vec<i64>>,
+        entered: Option<Arc<AtomicBool>>,
+        dropped: Option<Arc<AtomicBool>>,
     }
 
     impl HangingReconciler {
@@ -528,6 +590,18 @@ mod tests {
             batch_limit: i64,
         ) -> Result<DelegationExpiryBatchReport, AstralError> {
             self.calls.lock().unwrap().push(batch_limit);
+            if let Some(entered) = &self.entered {
+                entered.store(true, Ordering::Release);
+            }
+            struct DroppedSignal(Option<Arc<AtomicBool>>);
+            impl Drop for DroppedSignal {
+                fn drop(&mut self) {
+                    if let Some(dropped) = &self.0 {
+                        dropped.store(true, Ordering::Release);
+                    }
+                }
+            }
+            let _dropped = DroppedSignal(self.dropped.clone());
             std::future::pending::<()>().await;
             unreachable!("pending future never resolves");
         }
@@ -790,8 +864,11 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_is_bounded_when_the_reconciler_never_returns() {
+        let dropped = Arc::new(AtomicBool::new(false));
         let reconciler = Arc::new(HangingReconciler {
             calls: Mutex::new(Vec::new()),
+            entered: None,
+            dropped: Some(Arc::clone(&dropped)),
         });
         let handle = start_delegation_expiry_worker_with_reconciler(
             reconciler.clone(),
@@ -807,6 +884,55 @@ mod tests {
             .summary
             .expect_err("wedged worker must fail shutdown");
         assert!(failure.contains("did not stop within"));
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "timed-out worker must be reaped"
+        );
+        assert!(report.join_elapsed < Duration::from_secs(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_shutdown_future_aborts_and_reaps_worker() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let reconciler = Arc::new(HangingReconciler {
+            calls: Mutex::new(Vec::new()),
+            entered: Some(Arc::clone(&entered)),
+            dropped: Some(Arc::clone(&dropped)),
+        });
+        let handle = start_delegation_expiry_worker_with_reconciler(
+            reconciler.clone(),
+            DelegationExpiryWorkerConfig::default(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "worker never entered reconcile");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let shutdown_cancellation = handle.cancellation.clone();
+        let shutdown = tokio::spawn(shutdown_delegation_expiry_worker(
+            handle,
+            Duration::from_secs(30),
+        ));
+        while !shutdown_cancellation.is_cancelled() {
+            assert!(
+                Instant::now() < deadline,
+                "shutdown did not acquire ownership"
+            );
+            tokio::task::yield_now().await;
+        }
+        shutdown.abort();
+        let _ = shutdown.await;
+
+        while !dropped.load(Ordering::Acquire) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "worker must be aborted on drop"
+        );
     }
 
     #[tokio::test]

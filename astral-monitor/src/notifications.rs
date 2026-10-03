@@ -30,9 +30,13 @@ pub struct CreateChannelReq {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TestResult {
+    /// True only when the configured transport returned a real successful delivery.
     pub success: bool,
     pub message: String,
     pub channel_type: String,
+    /// Explicit delivery truth: DELIVERED, FAILED, NOT_ATTEMPTED, UNSUPPORTED,
+    /// or SIMULATED_NOT_DELIVERED.
+    pub delivery_status: &'static str,
 }
 
 pub fn notification_routes() -> Router<AppState> {
@@ -88,6 +92,7 @@ async fn test_channel(
             success: false,
             message: "通知渠道已禁用，请先启用".into(),
             channel_type: channel.channel_type,
+            delivery_status: "NOT_ATTEMPTED",
         })));
     }
 
@@ -101,6 +106,7 @@ async fn test_channel(
             success: false,
             message: format!("不支持的渠道类型: {}", channel.channel_type),
             channel_type: channel.channel_type.clone(),
+            delivery_status: "UNSUPPORTED",
         },
     };
 
@@ -108,6 +114,7 @@ async fn test_channel(
         "channel_id": channel.id,
         "channel_type": channel.channel_type,
         "success": result.success,
+        "delivery_status": result.delivery_status,
         "message": result.message,
     })
     .to_string();
@@ -125,29 +132,21 @@ async fn test_channel(
     Ok(Json(ApiResponse::success(result)))
 }
 
-async fn send_test_email(channel: &NotificationChannel) -> TestResult {
-    let config: serde_json::Value = channel
-        .config
-        .as_deref()
-        .and_then(|value| serde_json::from_str(value).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let to = config
-        .get("to")
-        .and_then(|value| value.as_str())
-        .unwrap_or("test@example.com");
-    tracing::info!(channel = %channel.name, to, "sending test email notification (simulated)");
+async fn send_test_email(_channel: &NotificationChannel) -> TestResult {
     TestResult {
-        success: true,
-        message: format!("测试邮件已发送至 {to}"),
+        success: false,
+        message: "SMTP 传输未实现；未发送邮件".into(),
         channel_type: "EMAIL".into(),
+        delivery_status: "SIMULATED_NOT_DELIVERED",
     }
 }
 
 async fn send_test_sms(_channel: &NotificationChannel) -> TestResult {
     TestResult {
-        success: true,
-        message: "测试短信已发送（模拟）".into(),
+        success: false,
+        message: "短信传输未实现；未发送短信".into(),
         channel_type: "SMS".into(),
+        delivery_status: "SIMULATED_NOT_DELIVERED",
     }
 }
 
@@ -166,6 +165,7 @@ async fn send_test_webhook(channel: &NotificationChannel) -> TestResult {
             success: false,
             message: "Webhook URL 未配置".into(),
             channel_type: "WEBHOOK".into(),
+            delivery_status: "NOT_ATTEMPTED",
         };
     }
 
@@ -184,31 +184,70 @@ async fn send_test_webhook(channel: &NotificationChannel) -> TestResult {
         .send()
         .await
     {
-        Ok(response) => TestResult {
-            success: response.status().is_success(),
-            message: format!("Webhook 响应状态: {}", response.status()),
-            channel_type: "WEBHOOK".into(),
-        },
+        Ok(response) => {
+            let success = response.status().is_success();
+            TestResult {
+                success,
+                message: format!("Webhook 响应状态: {}", response.status()),
+                channel_type: "WEBHOOK".into(),
+                delivery_status: if success { "DELIVERED" } else { "FAILED" },
+            }
+        }
         Err(error) => TestResult {
             success: false,
             message: format!("Webhook 发送失败: {error}"),
             channel_type: "WEBHOOK".into(),
+            delivery_status: "FAILED",
         },
     }
 }
 
 async fn send_test_dingtalk(_channel: &NotificationChannel) -> TestResult {
     TestResult {
-        success: true,
-        message: "测试钉钉通知已发送（模拟）".into(),
+        success: false,
+        message: "钉钉传输未实现；未发送通知".into(),
         channel_type: "DINGTALK".into(),
+        delivery_status: "SIMULATED_NOT_DELIVERED",
     }
 }
 
 async fn send_test_wechat(_channel: &NotificationChannel) -> TestResult {
     TestResult {
-        success: true,
-        message: "测试企业微信通知已发送（模拟）".into(),
+        success: false,
+        message: "企业微信传输未实现；未发送通知".into(),
         channel_type: "WECHAT".into(),
+        delivery_status: "SIMULATED_NOT_DELIVERED",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel(channel_type: &str) -> NotificationChannel {
+        NotificationChannel {
+            id: 1,
+            name: "test-channel".into(),
+            channel_type: channel_type.into(),
+            config: None,
+            enabled: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn simulated_transports_never_report_delivery_success() {
+        let email = send_test_email(&channel("EMAIL")).await;
+        let sms = send_test_sms(&channel("SMS")).await;
+        let dingtalk = send_test_dingtalk(&channel("DINGTALK")).await;
+        let wechat = send_test_wechat(&channel("WECHAT")).await;
+
+        for result in [email, sms, dingtalk, wechat] {
+            assert!(
+                !result.success,
+                "{} must not report successful delivery",
+                result.channel_type
+            );
+            assert_eq!(result.delivery_status, "SIMULATED_NOT_DELIVERED");
+        }
     }
 }

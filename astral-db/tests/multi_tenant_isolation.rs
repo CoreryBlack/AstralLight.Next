@@ -1470,8 +1470,8 @@ async fn test_tenant_scoped_query_with_real_db() {
     ))
     .with_tenant(tenant_a.tenant_id);
 
-    let (sql, params) = scoped.build();
-    assert!(sql.contains("AND tenant_id = ?"));
+    let (sql, params) = scoped.try_build().expect("restricted scoped SELECT");
+    assert!(sql.contains("AND audit_log.tenant_id = ?"));
     assert_eq!(params, vec![tenant_a.tenant_id.to_string()]);
 
     let mut query = sqlx::query_as::<_, (i64, String)>(&sql);
@@ -1494,7 +1494,7 @@ async fn test_tenant_scoped_query_with_real_db() {
         tenant_a.audit_seed_id
     ))
     .with_tenant(tenant_b.tenant_id);
-    let (wrong_sql, wrong_params) = wrong_scope.build();
+    let (wrong_sql, wrong_params) = wrong_scope.try_build().expect("restricted scoped SELECT");
     let mut wrong_query = sqlx::query_as::<_, (i64, String)>(&wrong_sql);
     for param in &wrong_params {
         wrong_query = wrong_query.bind(param);

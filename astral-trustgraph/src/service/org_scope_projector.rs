@@ -934,6 +934,45 @@ pub struct OrgScopeProjectorShutdownReport {
     pub join_elapsed: Duration,
 }
 
+/// Retains the join if shutdown is cancelled while waiting. Drop cancels and
+/// aborts the worker, then transfers the join to a Tokio reaper task.
+struct OrgScopeProjectorShutdownGuard {
+    cancellation: OrgScopeProjectorCancellationToken,
+    join: Option<JoinHandle<Result<OrgScopeProjectorRunSummary, tokio::task::JoinError>>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl OrgScopeProjectorShutdownGuard {
+    fn join_mut(
+        &mut self,
+    ) -> &mut JoinHandle<Result<OrgScopeProjectorRunSummary, tokio::task::JoinError>> {
+        self.join
+            .as_mut()
+            .expect("shutdown guard retains the join until completion")
+    }
+
+    fn release_join(&mut self) {
+        self.join.take();
+    }
+}
+
+impl Drop for OrgScopeProjectorShutdownGuard {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(join) = self.join.take() {
+            join.abort();
+            self.runtime.spawn(async move {
+                if tokio::time::timeout(Duration::from_secs(1), join)
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("org scope projector abort remains unproven");
+                }
+            });
+        }
+    }
+}
+
 /// Cancel the worker and await termination within a bounded timeout.
 ///
 /// `Err(summary)` forms cover: worker panic/join failure, propagated worker
@@ -943,18 +982,39 @@ pub async fn shutdown_org_scope_projector(
     handle: OrgScopeProjectorHandle,
     timeout: Duration,
 ) -> OrgScopeProjectorShutdownReport {
+    let mut ownership = OrgScopeProjectorShutdownGuard {
+        cancellation: handle.cancellation.clone(),
+        join: Some(handle.join),
+        runtime: tokio::runtime::Handle::current(),
+    };
     handle.cancellation.cancel();
     let started = Instant::now();
-    let summary = match tokio::time::timeout(timeout, handle.join).await {
-        Ok(joined) => match joined {
-            Ok(Ok(summary)) => Ok(summary),
-            Ok(Err(join_error)) => Err(format!("worker task failed: {join_error}")),
-            Err(_) => Err("shutdown summary unavailable".to_owned()),
-        },
-        Err(_) => Err(format!(
-            "org scope projector worker did not stop within {timeout:?}; possibly \
-             wedged inside a repository transaction"
-        )),
+    let summary = match tokio::time::timeout(timeout, ownership.join_mut()).await {
+        Ok(Ok(Ok(summary))) => {
+            ownership.release_join();
+            Ok(summary)
+        }
+        Ok(Ok(Err(join_error))) => {
+            ownership.release_join();
+            Err(format!("worker task failed: {join_error}"))
+        }
+        Ok(Err(_)) => {
+            ownership.release_join();
+            Err("shutdown summary unavailable".to_owned())
+        }
+        Err(_) => {
+            ownership.join_mut().abort();
+            if tokio::time::timeout(Duration::from_secs(1), ownership.join_mut())
+                .await
+                .is_ok()
+            {
+                ownership.release_join();
+            }
+            Err(format!(
+                "org scope projector worker did not stop within {timeout:?}; aborted; possibly \
+                 wedged inside a repository transaction"
+            ))
+        }
     };
     tracing::info!(
         run_id = %handle.run_id,
@@ -3092,8 +3152,18 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_is_bounded_when_the_store_never_returns() {
+        struct DroppedSignal(Option<Arc<AtomicBool>>);
+        impl Drop for DroppedSignal {
+            fn drop(&mut self) {
+                if let Some(dropped) = &self.0 {
+                    dropped.store(true, Ordering::Release);
+                }
+            }
+        }
+
         struct HangingStore {
             entered_claim: Arc<AtomicBool>,
+            dropped: Option<Arc<AtomicBool>>,
         }
         #[async_trait]
         impl OrgProjectorStore for HangingStore {
@@ -3102,6 +3172,7 @@ mod tests {
                 _cmd: &OrgOutboxClaimCommand,
             ) -> Result<Option<OrgOutboxLease>, AstralError> {
                 // 先证明 worker 真正进入了 claim 调用，再挂死（消除取消竞态）。
+                let _dropped = DroppedSignal(self.dropped.clone());
                 self.entered_claim.store(true, Ordering::Release);
                 std::future::pending::<()>().await;
                 unreachable!("pending future never resolves");
@@ -3147,8 +3218,10 @@ mod tests {
             }
         }
         let entered_claim = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
         let store_dyn: Arc<dyn OrgProjectorStore> = Arc::new(HangingStore {
             entered_claim: Arc::clone(&entered_claim),
+            dropped: Some(Arc::clone(&dropped)),
         });
         let compiler_dyn: Arc<dyn OrgProjectorCompiler> = ScriptedCompiler::new(vec![]);
         let handle =
@@ -3168,6 +3241,119 @@ mod tests {
             .summary
             .expect_err("wedged worker must fail shutdown");
         assert!(failure.contains("did not stop within"));
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "timed-out worker must be reaped"
+        );
+        assert!(report.join_elapsed < Duration::from_secs(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_shutdown_future_aborts_and_reaps_worker() {
+        struct DroppedSignal(Arc<AtomicBool>);
+        impl Drop for DroppedSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        struct HangingStore {
+            entered: Arc<AtomicBool>,
+            dropped: Option<Arc<AtomicBool>>,
+        }
+        #[async_trait]
+        impl OrgProjectorStore for HangingStore {
+            async fn claim(
+                &self,
+                _cmd: &OrgOutboxClaimCommand,
+            ) -> Result<Option<OrgOutboxLease>, AstralError> {
+                let _dropped = self
+                    .dropped
+                    .as_ref()
+                    .map(|dropped| DroppedSignal(Arc::clone(dropped)));
+                self.entered.store(true, Ordering::Release);
+                std::future::pending::<()>().await;
+                unreachable!("pending future never resolves");
+            }
+            async fn renew(&self, _cmd: &OrgOutboxRenewCommand) -> Result<bool, AstralError> {
+                unreachable!();
+            }
+            async fn load_input(
+                &self,
+                _cmd: &OrgCompileInputCommand,
+            ) -> Result<OrgCompileInput, AstralError> {
+                unreachable!();
+            }
+            async fn fail(
+                &self,
+                _cmd: &OrgOutboxFailCommand,
+            ) -> Result<OrgOutboxFailOutcome, AstralError> {
+                unreachable!();
+            }
+            async fn publish(
+                &self,
+                _cmd: &OrgPublishCommand,
+            ) -> Result<OrgPublishOutcome, AstralError> {
+                unreachable!();
+            }
+            async fn complete(
+                &self,
+                _cmd: &OrgOutboxCompleteCommand,
+            ) -> Result<OrgOutboxCompleteOutcome, AstralError> {
+                unreachable!();
+            }
+            async fn propagate(
+                &self,
+                _cmd: &OrgSubtreePropagateCommand,
+            ) -> Result<OrgSubtreePropagateOutcome, AstralError> {
+                unreachable!();
+            }
+            async fn propagate_dependency(
+                &self,
+                _cmd: &OrgDependencyPropagateCommand,
+            ) -> Result<OrgDependencyPropagateOutcome, AstralError> {
+                unreachable!();
+            }
+        }
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let store_dyn: Arc<dyn OrgProjectorStore> = Arc::new(HangingStore {
+            entered: Arc::clone(&entered),
+            dropped: Some(Arc::clone(&dropped)),
+        });
+        let compiler_dyn: Arc<dyn OrgProjectorCompiler> = ScriptedCompiler::new(vec![]);
+        let handle =
+            start_org_scope_projector_with_runtime(store_dyn, compiler_dyn, small_config(vec![7]))
+                .expect("valid config spawns");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "worker never reached claim");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let shutdown_cancellation = handle.cancellation.clone();
+        let shutdown = tokio::spawn(shutdown_org_scope_projector(
+            handle,
+            Duration::from_secs(30),
+        ));
+        while !shutdown_cancellation.is_cancelled() {
+            assert!(
+                Instant::now() < deadline,
+                "shutdown did not acquire ownership"
+            );
+            tokio::task::yield_now().await;
+        }
+        shutdown.abort();
+        let _ = shutdown.await;
+
+        while !dropped.load(Ordering::Acquire) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "worker must be aborted on drop"
+        );
     }
 
     #[tokio::test]

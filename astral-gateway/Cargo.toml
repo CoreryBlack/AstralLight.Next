@@ -34,7 +34,7 @@ tokio-tungstenite = "0.29"
 futures-util = "0.3"
 tower = { workspace = true }
 tower-http = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 redis = { workspace = true, optional = true }

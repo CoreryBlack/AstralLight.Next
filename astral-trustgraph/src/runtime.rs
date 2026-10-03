@@ -44,7 +44,9 @@ use crate::repository::permission_action_repository::SqlxPermissionActionReposit
 use crate::repository::permission_request_repository::SqlxPermissionRequestRepository;
 use crate::repository::platform_package_repository::SqlxPlatformPackageRepository;
 use crate::repository::projection_repository::SqlxProjectionRepository;
-use crate::repository::resource_type_repository::SqlxResourceTypeRepository;
+use crate::repository::resource_type_repository::{
+    load_registry_rows, ResourceTypeRepository, SqlxResourceTypeRepository,
+};
 use crate::repository::rule_repository::SqlxRuleRepository;
 use crate::repository::rule_set_repository::{RuleSetRepository, SqlxRuleSetRepository};
 use crate::repository::sod_repository::SqlxSodRepository;
@@ -107,6 +109,35 @@ impl Drop for RuntimeWorkerOwnership {
         for task in &self.0 {
             task.abort();
         }
+    }
+}
+
+async fn consume_local_until_stopped(
+    mut receiver: astral_mq::local_bus::LocalReceiver,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        if *stop.borrow() {
+            receiver.close();
+            break;
+        }
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    receiver.close();
+                    break;
+                }
+            }
+            delivery = receiver.recv() => {
+                let Some(delivery) = delivery else { return; };
+                let result = astral_mq::consumers::dispatch_local_delivery(&delivery).await;
+                delivery.complete(result);
+            }
+        }
+    }
+    while let Some(delivery) = receiver.recv().await {
+        let result = astral_mq::consumers::dispatch_local_delivery(&delivery).await;
+        delivery.complete(result);
     }
 }
 
@@ -186,6 +217,27 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
+    let (signal_failure_tx, signal_failure_rx) = tokio::sync::oneshot::channel();
+    let result = run_with_listen_addr_and_shutdown(addr, shutdown_signal(signal_failure_tx)).await;
+    finish_after_signal_failure(result, signal_failure_rx.await)
+}
+
+pub async fn run_with_listen_addr_and_shutdown<F>(addr: &str, shutdown: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    run_with_listen_addr_and_shutdown_and_drain(addr, shutdown, std::future::ready(())).await
+}
+
+pub async fn run_with_listen_addr_and_shutdown_and_drain<F, D>(
+    addr: &str,
+    shutdown: F,
+    producers_drained: D,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+    D: std::future::Future<Output = ()> + Send + 'static,
+{
     // Prometheus 指标独立绑定 loopback，避免进入 Gateway 签名与授权 Router。
     // recorder 或监听失败只禁用观测，绝不改变 TrustGraph 的启动或 fail-closed 语义。
     if let Some(metrics_addr) =
@@ -367,6 +419,10 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
             .map_err(anyhow::Error::msg)?,
     )
     .await?;
+    let registry_rows = SqlxResourceTypeRepository::new(db.clone())
+        .list_registry()
+        .await?;
+    load_registry_rows(&registry_rows)?;
     register_audit_db_writer(Arc::new(TrustGraphAuditDbWriter { pool: db.clone() }));
 
     // ORG_SCOPE enabled 模式的运行期 schema + allowlist coverage 门（只读）：
@@ -597,20 +653,10 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
         "trustgraph",
     );
 
-    // 权限投影 durable worker（对齐 Java AuthorizationProjectionJob @Scheduled 5s 的
-    // claim/lease 形态）。读链切换批次 3 起收敛为 ELIGIBILITY-only：CARD/RULE_SET
-    // outbox 事件仅终态 mark_processed（快照重建职责已由下方新链 authorization_projector
-    // delta 队列接管），ELIGIBILITY 资格缓存失效为本 worker 存续职责（决策见
-    // Rust增量重建与实时授权边界_V1.0.md §3.4）。
-    // 启动顺序第一位；关闭序列按严格逆序在最后（新投影 worker 之后）cancel→bounded join。
-    let mut worker_ownership = RuntimeWorkerOwnership::default();
-    let projection_worker: ProjectionWorkerHandle = {
-        let projection_repo = Arc::new(SqlxProjectionRepository::new(db.clone()));
-        spawn_worker(db.clone(), projection_repo)
-    };
-    worker_ownership
-        .0
-        .push(projection_worker.join.abort_handle());
+    // Pure config gates must run before the first background worker starts, so
+    // an invalid tenant/topology/budget value cannot return with work still live.
+    // The old eligibility projection worker remains first in startup order after
+    // these gates, and therefore last in the reverse shutdown sequence.
 
     // 新 Rust-owned 版本化授权投影 worker（authorization_delta_event 队列的唯一
     // 消费者；写 20260825000002/20260827000001 新表，不触碰旧 head/outbox 职责）。
@@ -675,6 +721,33 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
             return Err(anyhow::anyhow!(error));
         }
     }
+    let delegation_expiry_worker_config = {
+        let poll_raw = std::env::var("ASTRAL_DELEGATION_EXPIRY_POLL_SECS").ok();
+        let batch_raw = std::env::var("ASTRAL_DELEGATION_EXPIRY_BATCH").ok();
+        match parse_delegation_expiry_config(poll_raw.as_deref(), batch_raw.as_deref()) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    error_code = "DELEGATION_EXPIRY_WORKER_CONFIG_INVALID",
+                    "invalid delegation expiry worker configuration; refusing startup before any worker spawn"
+                );
+                return Err(anyhow::anyhow!(error));
+            }
+        }
+    };
+    // 权限投影 durable worker (legacy ELIGIBILITY outbox) starts only after
+    // every pure projector configuration gate above has passed. It remains the
+    // first worker in this startup sequence and shuts down last.
+    let mut worker_ownership = RuntimeWorkerOwnership::default();
+    let projection_worker: ProjectionWorkerHandle = {
+        let projection_repo = Arc::new(SqlxProjectionRepository::new(db.clone()));
+        spawn_worker(db.clone(), projection_repo)
+    };
+    worker_ownership
+        .0
+        .push(projection_worker.join.abort_handle());
+
     let authorization_projector: AuthorizationProjectorHandle = start_authorization_projector(
         db.clone(),
         AuthorizationProjectorConfig {
@@ -739,59 +812,11 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
     // tenant_id 列，不改 schema/索引）；每条候选的收敛在各自事务内以锁定端点
     // 卡重新证明 tenant/domain 归属，缺失即 fail-closed。默认 60s 轮询 / 批次
     // 64（硬上限 500）；env 覆盖值非法时在 spawn 前启动失败。
-    let delegation_expiry_worker: DelegationExpiryWorkerHandle = {
-        let poll_raw = std::env::var("ASTRAL_DELEGATION_EXPIRY_POLL_SECS").ok();
-        let batch_raw = std::env::var("ASTRAL_DELEGATION_EXPIRY_BATCH").ok();
-        let started = parse_delegation_expiry_config(poll_raw.as_deref(), batch_raw.as_deref())
-            .and_then(|config| {
-                start_delegation_expiry_worker(state.delegation_service.clone(), config)
-            });
-        match started {
-            Ok(handle) => handle,
-            Err(error) => {
-                tracing::error!(
-                    error = %error,
-                    error_code = "DELEGATION_EXPIRY_WORKER_CONFIG_INVALID",
-                    "invalid delegation expiry worker configuration; refusing startup"
-                );
-                // 本 worker 从未启动：按启动逆序先 cancel→join 已启动的归档
-                // worker 与新投影 worker，再以显式配置错误拒绝进程启动。
-                let archive_report = shutdown_authorization_archive_worker(
-                    authorization_archive_worker,
-                    std::time::Duration::from_secs(SHUTDOWN_JOIN_TIMEOUT_SECS),
-                )
-                .await;
-                if let Err(failure) = &archive_report.summary {
-                    tracing::error!(
-                        reason = %failure,
-                        "authorization archive worker did not stop cleanly after \
-                         delegation expiry worker config rejection"
-                    );
-                    return Err(anyhow::anyhow!(
-                        "authorization archive worker shutdown failed after \
-                         delegation expiry worker config rejection: {failure}"
-                    ));
-                }
-                let projector_report = shutdown_authorization_projector(
-                    authorization_projector,
-                    std::time::Duration::from_secs(SHUTDOWN_JOIN_TIMEOUT_SECS),
-                )
-                .await;
-                if let Err(failure) = &projector_report.summary {
-                    tracing::error!(
-                        reason = %failure,
-                        "authorization projector did not stop cleanly after \
-                         delegation expiry worker config rejection"
-                    );
-                    return Err(anyhow::anyhow!(
-                        "authorization projector shutdown failed after \
-                         delegation expiry worker config rejection: {failure}"
-                    ));
-                }
-                return Err(anyhow::anyhow!(error));
-            }
-        }
-    };
+    let delegation_expiry_worker: DelegationExpiryWorkerHandle = start_delegation_expiry_worker(
+        state.delegation_service.clone(),
+        delegation_expiry_worker_config,
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
 
     worker_ownership
         .0
@@ -869,11 +894,12 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
     //  runtime 不选择加入）。Audit/DLQ 消费语义保持不变。
     // - 失效 fanout runtime（旗标开启时）在两个分支各自装配恰好一次；启动
     //  失败按启动逆序回滚已启动 worker 后拒绝启动。
+    let (local_stop_tx, local_stop_rx) = tokio::sync::watch::channel(false);
     let (
-        _rabbit_runtime,
+        rabbit_runtime,
         mut invalidation_fanout_runtime,
         mut local_invalidation_relay,
-        _local_owner_tasks,
+        local_owner_tasks,
     ): (
         Option<RabbitMqRuntime>,
         Option<InvalidationFanoutRuntime>,
@@ -886,32 +912,26 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
         let bus = astral_mq::local_bus::global_local_bus().ok_or_else(|| {
             anyhow::anyhow!("local transport requires a composite runtime-installed LocalBus")
         })?;
-        let mut audit_receiver = bus
+        let audit_receiver = bus
             .register(
                 astral_mq::config::QUEUE_AUDIT_LOG,
                 astral_mq::local_bus::LocalOwner::TrustGraph,
             )
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let local_audit_consumer =
-            RuntimeTaskHandle::spawn("trustgraph-local-audit-consumer", async move {
-                while let Some(delivery) = audit_receiver.recv().await {
-                    let result = astral_mq::consumers::dispatch_local_delivery(&delivery).await;
-                    delivery.complete(result);
-                }
-            });
-        let mut invalidation_receiver = bus
+        let local_audit_consumer = RuntimeTaskHandle::spawn(
+            "trustgraph-local-audit-consumer",
+            consume_local_until_stopped(audit_receiver, local_stop_rx.clone()),
+        );
+        let invalidation_receiver = bus
             .register(
                 astral_mq::config::QUEUE_AUTHORIZATION_INVALIDATION,
                 astral_mq::local_bus::LocalOwner::AuthorizationInvalidation,
             )
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let local_invalidation_consumer =
-            RuntimeTaskHandle::spawn("trustgraph-local-invalidation-consumer", async move {
-                while let Some(delivery) = invalidation_receiver.recv().await {
-                    let result = astral_mq::consumers::dispatch_local_delivery(&delivery).await;
-                    delivery.complete(result);
-                }
-            });
+        let local_invalidation_consumer = RuntimeTaskHandle::spawn(
+            "trustgraph-local-invalidation-consumer",
+            consume_local_until_stopped(invalidation_receiver, local_stop_rx),
+        );
         // 本地恢复 relay（source commit 直发路径）：句柄持有到函数作用域，
         // 正常关闭 cancel→有界 join；Drop 即信号+abort（agent921 新签名落地）。
         let relay_handle = astral_mq::consumers::spawn_local_invalidation_relay(
@@ -1287,17 +1307,28 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
             }
         };
     let (serve_stop_tx, serve_stop_rx) = tokio::sync::oneshot::channel();
+    let (drain_started_tx, mut drain_started_rx) = tokio::sync::oneshot::channel();
     let server_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             tokio::select! {
-                _ = shutdown_signal() => {}
+                _ = shutdown => {}
                 _ = serve_stop_rx => {}
             }
+            if let Some(hub) = astral_db::memory_projection_hub() {
+                hub.mark_runtime_owner_failed("trustgraph runtime shutting down");
+            }
+            let _ = drain_started_tx.send(());
         })
         .into_future();
     tokio::pin!(server_result);
     let server_result: anyhow::Result<()> = tokio::select! {
         result = &mut server_result => result.map_err(Into::into),
+        _ = &mut drain_started_rx => {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), &mut server_result).await {
+                Ok(result) => result.map_err(Into::into),
+                Err(_) => Err(anyhow::anyhow!("TrustGraph HTTP drain timed out; handler outcomes unknown")),
+            }
+        }
         failure = async {
             match cross_city_runtime.as_mut() {
                 Some(handle) => handle.wait_for_failure().await,
@@ -1305,7 +1336,7 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
             }
         } => {
             if let Some(hub) = astral_db::memory_projection_hub() {
-                hub.mark_channel_suspect("cross-city required worker stopped");
+                hub.mark_runtime_owner_failed("cross-city required worker stopped");
             }
             let _ = serve_stop_tx.send(());
             match tokio::time::timeout(
@@ -1319,6 +1350,9 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
             Err(anyhow::anyhow!("cross-city runtime worker failed: {failure}"))
         }
     };
+    let batch_shutdown_result = api::async_tracker::tracker()
+        .shutdown_tasks(std::time::Duration::from_secs(30))
+        .await;
     // 关闭严格逆序：跨城 runtime 最后启动 → 最先关闭（有界 join；worker Err/
     // join 超时与既有 worker 一样转为进程错误，绝不静默吞掉断流状态）。dormant
     // 句柄零任务，报告恒为完成+空。随后才是 fanout、本地 relay 与既有 worker。
@@ -1350,11 +1384,8 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
         }
         None => server_result,
     };
-    // 关闭严格逆序：失效 fanout runtime 与 MQ bootstrap 是最后启动的组件，
-    // 最先关闭——fanout supervisor/relay/inbox 有界 join（outbox 发布与 inbox
-    // 消费必须在既有 worker join 前静止）；Rabbit 连接由 _rabbit_runtime 在
-    // 函数作用域结束 RAII 关闭，无独立 keepalive 任务。bind 失败与启动失败
-    // 回滚路径由 RAII Drop 覆盖（relay/inbox 协作关闭信号 + supervisor abort）。
+    // Fanout and recovery producers drain before Local receivers or Rabbit close.
+    // Early-return rollback retains the runtime's abort-on-drop ownership.
     let fanout_shutdown_report = match invalidation_fanout_runtime.take() {
         Some(fanout) => Some(
             fanout
@@ -1432,6 +1463,45 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
         std::time::Duration::from_secs(SHUTDOWN_JOIN_TIMEOUT_SECS),
     )
     .await;
+    tokio::time::timeout(std::time::Duration::from_secs(4_200), producers_drained)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("TrustGraph producer drain barrier timed out; outcome unknown")
+        })?;
+    let audit_result = astral_common::audit::drain_owned_audit_tasks(
+        std::time::Duration::from_secs(SHUTDOWN_JOIN_TIMEOUT_SECS),
+    )
+    .await;
+    let _ = local_stop_tx.send(true);
+    let mut local_consumer_failures = Vec::new();
+    if let Err(failure) = batch_shutdown_result {
+        local_consumer_failures.push(failure.to_string());
+    }
+    if let Err(failure) = audit_result {
+        local_consumer_failures.push(failure);
+    }
+    for task in local_owner_tasks {
+        if let Err(failure) = task
+            .shutdown_join(std::time::Duration::from_secs(SHUTDOWN_JOIN_TIMEOUT_SECS))
+            .await
+        {
+            local_consumer_failures.push(failure);
+        }
+    }
+    if let Some(runtime) = rabbit_runtime {
+        if let Err(failure) = runtime
+            .shutdown(std::time::Duration::from_secs(SHUTDOWN_JOIN_TIMEOUT_SECS))
+            .await
+        {
+            local_consumer_failures.push(failure);
+        }
+    }
+    if !local_consumer_failures.is_empty() {
+        return Err(anyhow::anyhow!(
+            "local consumer drain failed: {}",
+            local_consumer_failures.join("; ")
+        ));
+    }
     // fanout runtime：最后启动 → 关闭失败最先转为进程错误（严格逆序）。
     if let Some(Err(failure)) = &fanout_shutdown_report {
         return Err(anyhow::anyhow!(
@@ -1497,18 +1567,22 @@ async fn shutdown_audit_replay_worker(
         )),
         Err(_) => {
             join.abort();
-            let _ = join.await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut join).await;
             Err(format!(
-                "audit replay worker shutdown timed out during {phase}"
+                "audit replay worker shutdown timed out during {phase}; durable outcome unknown"
             ))
         }
     }
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(signal_failure: tokio::sync::oneshot::Sender<String>) {
     let ctrl_c = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!(%error, "failed to install Ctrl-C handler");
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::warn!(%error, "failed to install Ctrl-C handler");
+                Err(error.to_string())
+            }
         }
     };
 
@@ -1517,17 +1591,41 @@ async fn shutdown_signal() {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(mut signal) => {
                 signal.recv().await;
+                Ok(())
             }
-            Err(error) => tracing::warn!(%error, "failed to install terminate handler"),
+            Err(error) => {
+                tracing::warn!(%error, "failed to install terminate handler");
+                Err(error.to_string())
+            }
         }
     };
 
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let terminate = std::future::pending::<Result<(), String>>();
 
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
+    let result = tokio::select! {
+        result = ctrl_c => result,
+        result = terminate => result,
+    };
+    if let Err(reason) = result {
+        let _ = signal_failure.send(reason);
+    }
+}
+
+fn finish_after_signal_failure(
+    result: anyhow::Result<()>,
+    signal_failure: Result<String, tokio::sync::oneshot::error::RecvError>,
+) -> anyhow::Result<()> {
+    match signal_failure {
+        Ok(reason) => match result {
+            Ok(()) => Err(anyhow::anyhow!(
+                "TrustGraph shutdown signal failed: {reason}"
+            )),
+            Err(error) => {
+                Err(error.context(format!("TrustGraph shutdown signal also failed: {reason}")))
+            }
+        },
+        Err(_) => result,
     }
 }
 
@@ -1682,12 +1780,16 @@ impl MqConnectionAttempt for RabbitMqBootstrapAttempt {
     async fn open(&mut self) -> Result<RabbitMqRuntime, String> {
         // 上一次尝试的残留（若有）已由 close_owned 清空；防御性再置空。
         self.owned_connection = None;
-        let conn = Connection::connect(
-            &self.rabbitmq_url,
-            lapin::ConnectionProperties::default().enable_auto_recover(),
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Connection::connect(
+                &self.rabbitmq_url,
+                lapin::ConnectionProperties::default().enable_auto_recover(),
+            ),
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "TrustGraph Rabbit connect timed out".to_owned())?
+        .map_err(|_| "TrustGraph Rabbit connect failed".to_owned())?;
         // lapin 4 的 Connection 不可 Clone：Arc 共享（fanout wiring / inbox
         // 重连闭包经由 Arc 克隆使用同一连接），所有权仍归本尝试。
         self.owned_connection = Some(Arc::new(conn));
@@ -1696,13 +1798,17 @@ impl MqConnectionAttempt for RabbitMqBootstrapAttempt {
                 .owned_connection
                 .as_ref()
                 .expect("owned connection registered above");
-            init_mq_consumers(
-                conn,
-                &self.quarantine_db,
-                self.audit_replay_producer.clone(),
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                init_mq_consumers(
+                    conn,
+                    &self.quarantine_db,
+                    self.audit_replay_producer.clone(),
+                ),
             )
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|_| "TrustGraph Rabbit consumer setup timed out".to_owned())?
+            .map_err(|_| "TrustGraph Rabbit consumer setup failed".to_owned())?
         };
         let owned = self
             .owned_connection
@@ -1945,6 +2051,28 @@ async fn init_superadmin_template(
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn local_consumer_cooperative_shutdown_closes_admission() {
+        let bus = astral_mq::local_bus::LocalBus::new(Default::default()).unwrap();
+        let receiver = bus
+            .register(
+                astral_mq::config::QUEUE_AUDIT_LOG,
+                astral_mq::local_bus::LocalOwner::TrustGraph,
+            )
+            .unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let handle = super::RuntimeTaskHandle::spawn(
+            "local-stop-test",
+            super::consume_local_until_stopped(receiver, stop_rx),
+        );
+        stop_tx.send(true).unwrap();
+        handle
+            .shutdown_join(std::time::Duration::from_secs(1))
+            .await
+            .expect("closed local receiver must stop cooperatively");
+        assert!(!bus.owners_ready());
+    }
+
+    #[tokio::test]
     async fn runtime_cancellation_aborts_all_registered_recovery_tasks() {
         struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
         impl Drop for DropSignal {
@@ -1990,6 +2118,39 @@ mod tests {
         assert!(source.contains("if let Some(handle) = &org_scope_projector"));
         assert!(source.contains("if let Some(handle) = &audit_replay_worker"));
         assert!(source.contains("authorization_projector.ownership_guard()"));
+    }
+
+    #[test]
+    fn projector_pure_config_gates_precede_first_worker_spawn() {
+        let source = production_source();
+        let first_worker = source
+            .find("let projection_worker: ProjectionWorkerHandle")
+            .expect("legacy worker must remain in startup");
+        for gate in [
+            "let projector_tenants = {",
+            "let projector_scheduling_mode = {",
+            "let projector_worker_count = {",
+            "validate_partition_worker_budget(projector_worker_count, pool_max_connections)",
+        ] {
+            let position = source
+                .find(gate)
+                .expect("projector config gate must remain");
+            assert!(position < first_worker, "{gate} must precede worker spawn");
+        }
+        let archive_config_rejection = source
+            .find("AUTH_ARCHIVE_WORKER_CONFIG_INVALID")
+            .expect("archive config rejection must remain");
+        let archive_shutdown = source[archive_config_rejection..]
+            .find("shutdown_authorization_projector(")
+            .map(|offset| archive_config_rejection + offset)
+            .expect("archive rejection must stop the authorization projector");
+        assert!(first_worker < archive_config_rejection);
+        let projection_shutdown = source[archive_shutdown..]
+            .find("shutdown_projection_worker(")
+            .map(|offset| archive_shutdown + offset)
+            .expect("archive rejection must also stop the legacy worker");
+        assert!(archive_shutdown < projection_shutdown);
+        assert!(source.contains("rollback_started_workers_after_org_scope_failure"));
     }
 
     fn production_source() -> &'static str {
@@ -2184,7 +2345,7 @@ mod tests {
     fn org_scope_config_gate_and_schema_guard_precede_any_worker_spawn() {
         let source = production_source();
         // 唯一配置门禁：冻结的共享 org_scope_enabled 旗标。env 快照必须在门内
-        // 读取，且配置解析必须发生在 DB 连接与任何 worker spawn 之前（非法配置
+        // 读取，且配置解析必须发生在 DB 连接与 any worker spawn 之前（非法配置
         // 在零 worker 状态下拒绝启动，无需回滚）。
         let config_gate = source
             .find("let org_scope_projector_config = if org_scope_enabled {")
@@ -2355,6 +2516,16 @@ mod tests {
                 && rollback_archive < rollback_projector
                 && rollback_projector < rollback_projection_worker
         );
+    }
+
+    #[test]
+    fn signal_registration_failure_is_retained_as_runtime_error() {
+        let result =
+            super::finish_after_signal_failure(Ok(()), Ok("ctrl-c registration failed".into()));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("ctrl-c registration failed"));
     }
 
     #[test]

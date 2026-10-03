@@ -15,7 +15,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true }
 uuid = { workspace = true, optional = true }
 arc-swap = { workspace = true }
 im = { workspace = true }
@@ -36,7 +36,7 @@ iai-callgrind = "0.14"
 
 [features]
 iai = []
-e1-observability = ["dep:tokio", "dep:uuid"]
+e1-observability = ["dep:uuid"]
 
 [[bench]]
 name = "policy_bench"

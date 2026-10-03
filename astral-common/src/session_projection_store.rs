@@ -392,11 +392,18 @@ impl SessionProjectionMirror {
             return;
         };
         *guard = Some(deadline);
-        let _ = self
-            .suspect_state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                (state != SUSPECT_PERMANENT).then_some(SUSPECT_TIMED)
-            });
+        let mut state = self.suspect_state.load(Ordering::Acquire);
+        while state != SUSPECT_PERMANENT {
+            match self.suspect_state.compare_exchange_weak(
+                state,
+                SUSPECT_TIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => state = current,
+            }
+        }
     }
 
     /// 永久 suspect：positive cache 全部旁路（显式配置开关；撤销 marker 的

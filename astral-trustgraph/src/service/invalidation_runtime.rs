@@ -245,73 +245,85 @@ pub fn spawn_reconcile_supervisor(
     probe: LivenessProbe,
     worker_id: String,
 ) -> RuntimeTaskHandle {
-    RuntimeTaskHandle::spawn("invalidation-fanout-reconcile-supervisor", async move {
-        let mut ticker = tokio::time::interval(RECONCILE_SUPERVISOR_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            let now_ms = monotonic_millis();
-            let suspect = hub.channel_is_suspect();
-            let alive = probe.is_alive(now_ms);
-            match supervisor_tick_for_transport(
-                alive,
-                suspect,
-                matches!(probe, LivenessProbe::LocalBus(_)),
-            ) {
-                SupervisorAction::Observe => hub.record_channel_heartbeat(),
-                SupervisorAction::HoldSuspect => {}
-                SupervisorAction::MarkSuspect => {
-                    hub.mark_channel_suspect(
+    let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    RuntimeTaskHandle::spawn_with_shutdown(
+        "invalidation-fanout-reconcile-supervisor",
+        shutdown,
+        async move {
+            let mut ticker = tokio::time::interval(RECONCILE_SUPERVISOR_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                    _ = ticker.tick() => {}
+                }
+                let now_ms = monotonic_millis();
+                let suspect = hub.channel_is_suspect();
+                let alive = probe.is_alive(now_ms);
+                match supervisor_tick_for_transport(
+                    alive,
+                    suspect,
+                    matches!(probe, LivenessProbe::LocalBus(_)),
+                ) {
+                    SupervisorAction::Observe => hub.record_channel_heartbeat(),
+                    SupervisorAction::HoldSuspect => {}
+                    SupervisorAction::MarkSuspect => {
+                        hub.mark_channel_suspect(
                         "fanout channel liveness lost (connection closed or heartbeat stale); strict fail-closed read path engaged",
                     );
-                }
-                SupervisorAction::Reconcile => {
-                    hub.record_channel_heartbeat();
-                    match tokio::time::timeout(
-                        RECONCILE_DEADLINE,
-                        hub.reconcile_from_durable(&pool),
-                    )
-                    .await
-                    {
-                        Ok(Ok(report)) => tracing::info!(
-                            worker_id = %worker_id,
-                            identities = report.identities,
-                            pending_restored = report.pending_restored,
-                            "invalidation fanout hub proved against durable reconcile; suspect gate cleared"
-                        ),
-                        Ok(Err(error)) => {
-                            if is_reconcile_deferral(&error) {
-                                tracing::debug!(
-                                    worker_id = %worker_id,
-                                    reason = %error,
-                                    "durable reconcile deferred; retrying next tick"
-                                );
-                            } else {
-                                hub.mark_channel_suspect(
+                    }
+                    SupervisorAction::Reconcile => {
+                        hub.record_channel_heartbeat();
+                        match tokio::time::timeout(
+                            RECONCILE_DEADLINE,
+                            hub.reconcile_from_durable(&pool),
+                        )
+                        .await
+                        {
+                            Ok(Ok(report)) => tracing::info!(
+                                worker_id = %worker_id,
+                                identities = report.identities,
+                                pending_restored = report.pending_restored,
+                                "invalidation fanout hub proved against durable reconcile; suspect gate cleared"
+                            ),
+                            Ok(Err(error)) => {
+                                if is_reconcile_deferral(&error) {
+                                    tracing::debug!(
+                                        worker_id = %worker_id,
+                                        reason = %error,
+                                        "durable reconcile deferred; retrying next tick"
+                                    );
+                                } else {
+                                    hub.mark_channel_suspect(
                                 "durable reconcile failed; strict fail-closed read path engaged",
                             );
-                                tracing::warn!(
-                                    worker_id = %worker_id,
-                                    reason = %error,
-                                    "durable reconcile did not prove the memory mirror; suspect gate stays closed"
-                                );
+                                    tracing::warn!(
+                                        worker_id = %worker_id,
+                                        reason = %error,
+                                        "durable reconcile did not prove the memory mirror; suspect gate stays closed"
+                                    );
+                                }
                             }
-                        }
-                        Err(_) => {
-                            hub.mark_channel_suspect(
+                            Err(_) => {
+                                hub.mark_channel_suspect(
                             "durable reconcile exceeded its bounded deadline; strict fail-closed read path engaged",
                         );
-                            tracing::warn!(
-                                worker_id = %worker_id,
-                                deadline_ms = RECONCILE_DEADLINE.as_millis() as u64,
-                                "durable reconcile timed out; no replay attempted"
-                            );
+                                tracing::warn!(
+                                    worker_id = %worker_id,
+                                    deadline_ms = RECONCILE_DEADLINE.as_millis() as u64,
+                                    "durable reconcile timed out; no replay attempted"
+                                );
+                            }
                         }
                     }
                 }
             }
-        }
-    })
+        },
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -462,25 +474,118 @@ where
     }
 }
 
-/// 关闭一次 bootstrap 尝试持有的 owned 连接（未知/失败结果绝不留活连接）。
-/// lapin 4 的 `Connection` 不可 Clone：连接以 `Arc` 共享（RabbitMqRuntime /
-/// fanout wiring），回收与关闭都经由同一 Arc 所有权。
-pub async fn close_owned_connection(connection: Arc<lapin::Connection>, reason: &str) {
-    if let Err(error) = connection.close(200, reason.into()).await {
-        tracing::warn!(
-            %error,
-            "owned mq connection close during bootstrap cleanup failed; dropping anyway"
+/// Close seam keeps ownership tests independent of an actual broker.
+#[async_trait::async_trait]
+trait RabbitConnectionCloser: Send + Sync + 'static {
+    async fn close(&self, reason: &str) -> Result<(), String>;
+}
+
+struct LapinRabbitConnectionCloser(Arc<lapin::Connection>);
+
+#[async_trait::async_trait]
+impl RabbitConnectionCloser for LapinRabbitConnectionCloser {
+    async fn close(&self, reason: &str) -> Result<(), String> {
+        self.0
+            .close(200, reason.to_owned().into())
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Owns a connection close capability even when producer/consumer channels
+/// retain other `Arc`s. A dropped/failed close transfers that capability into
+/// a bounded reaper; it never claims a successful close from Drop.
+struct RabbitConnectionCloseOwner {
+    closer: Option<Arc<dyn RabbitConnectionCloser>>,
+    liveness: Option<ChannelLiveness>,
+}
+
+impl RabbitConnectionCloseOwner {
+    fn new(closer: Arc<dyn RabbitConnectionCloser>, liveness: Option<ChannelLiveness>) -> Self {
+        Self {
+            closer: Some(closer),
+            liveness,
+        }
+    }
+
+    async fn shutdown(mut self, timeout: Duration, reason: &str) -> Result<(), String> {
+        if let Some(liveness) = &self.liveness {
+            liveness.mark_dead();
+        }
+        let closer = Arc::clone(
+            self.closer
+                .as_ref()
+                .expect("close owner retains its connection until close is proven"),
         );
+        match tokio::time::timeout(timeout, closer.close(reason)).await {
+            Ok(Ok(())) => {
+                self.closer.take();
+                Ok(())
+            }
+            Ok(Err(error)) => Err(format!("Rabbit connection close failed: {error}")),
+            Err(_) => Err(format!(
+                "Rabbit connection close timed out after {timeout:?}; outcome unknown"
+            )),
+        }
+    }
+}
+
+impl Drop for RabbitConnectionCloseOwner {
+    fn drop(&mut self) {
+        let Some(closer) = self.closer.take() else {
+            return;
+        };
+        if let Some(liveness) = &self.liveness {
+            liveness.mark_dead();
+        }
+        spawn_connection_close_reaper(closer, "trustgraph early shutdown".to_owned());
+    }
+}
+
+const CONNECTION_CLOSE_REAPER_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn spawn_connection_close_reaper(closer: Arc<dyn RabbitConnectionCloser>, reason: String) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::error!("Rabbit connection close reaper could not be scheduled; outcome unknown");
+        return;
+    };
+    runtime.spawn(async move {
+        match tokio::time::timeout(CONNECTION_CLOSE_REAPER_TIMEOUT, closer.close(&reason)).await {
+            Ok(Ok(())) => tracing::debug!("Rabbit connection closed by shutdown reaper"),
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!("Rabbit close reaper could not prove connection close")
+            }
+        }
+    });
+}
+
+/// 关闭一次 bootstrap 尝试持有的 owned 连接（未知/失败结果绝不留活连接）。
+/// lapin 4 的 `Connection` 不可 Clone：连接以 `Arc` 共享，关闭 owner 独立于
+/// producer/consumer 的 channel 克隆，避免 Drop 把 Arc strong count 当成网络关闭。
+pub async fn close_owned_connection(connection: Arc<lapin::Connection>, reason: &str) {
+    let reason = if reason.trim().is_empty() {
+        "mq bootstrap close".to_owned()
+    } else {
+        reason.to_owned()
+    };
+    let closer: Arc<dyn RabbitConnectionCloser> = Arc::new(LapinRabbitConnectionCloser(connection));
+    if let Err(error) = RabbitConnectionCloseOwner::new(closer, None)
+        .shutdown(CONNECTION_CLOSE_REAPER_TIMEOUT, &reason)
+        .await
+    {
+        tracing::warn!(reason = %error, "owned mq bootstrap connection close is unproven");
     }
 }
 
 /// 成功 bootstrap 后的 Rabbit MQ runtime：连接与确认通道由本结构持有到
-/// `run_with_listen_addr` 作用域结束——bind 失败、启动失败回滚、正常关闭、
-/// 错误路径全部 RAII 覆盖（Drop 即关闭连接与通道，consumer 循环随通道终止），
-/// 因此不需要任何 keepalive 任务。连接以 `Arc` 持有（lapin 4 无 Clone），
-/// fanout wiring 与 inbox 重连闭包通过 `Arc` 克隆共享同一连接所有权。
+/// `run_with_listen_addr` 作用域结束。正常 drain 显式有界 close；提前返回或
+/// shutdown future 被取消时，Drop 拉低 liveness 并提交有界 close reaper。
+/// 全局 producer/consumer 可能仍持有 channel Arc，但显式关闭 connection 才是
+/// 网络侧收口；Drop 本身不作为关闭证明。连接以 `Arc` 持有（lapin 4 无 Clone），
+/// fanout wiring 与 inbox 重连闭包通过 `Arc` 克隆共享该连接所有权。
 pub struct RabbitMqRuntime {
     connection: Arc<lapin::Connection>,
+    close_owner: RabbitConnectionCloseOwner,
     channel: lapin::Channel,
     liveness: ChannelLiveness,
 }
@@ -492,8 +597,12 @@ impl RabbitMqRuntime {
         channel: lapin::Channel,
         liveness: ChannelLiveness,
     ) -> Self {
+        let closer: Arc<dyn RabbitConnectionCloser> =
+            Arc::new(LapinRabbitConnectionCloser(connection.clone()));
+        let close_owner = RabbitConnectionCloseOwner::new(closer, Some(liveness.clone()));
         Self {
             connection,
+            close_owner,
             channel,
             liveness,
         }
@@ -510,6 +619,15 @@ impl RabbitMqRuntime {
     pub fn liveness(&self) -> ChannelLiveness {
         self.liveness.clone()
     }
+
+    /// Explicit bounded close for a normally drained TrustGraph runtime. Global
+    /// producer/consumer handles may retain channels, so dropping this owner is
+    /// not itself proof that the Rabbit connection closed.
+    pub async fn shutdown(self, timeout: Duration) -> Result<(), String> {
+        self.close_owner
+            .shutdown(timeout, "trustgraph runtime shutdown")
+            .await
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -520,6 +638,7 @@ impl RabbitMqRuntime {
 /// Aborting a consumer leaves unproved durable effects unknown.
 pub struct RuntimeTaskHandle {
     name: &'static str,
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
     join: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -530,22 +649,49 @@ impl RuntimeTaskHandle {
     ) -> Self {
         Self {
             name,
+            shutdown: None,
+            join: Some(tokio::spawn(task)),
+        }
+    }
+
+    fn spawn_with_shutdown(
+        name: &'static str,
+        shutdown: tokio::sync::watch::Sender<bool>,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        Self {
+            name,
+            shutdown: Some(shutdown),
             join: Some(tokio::spawn(task)),
         }
     }
 
     /// The task remains owned if this shutdown future is cancelled.
     pub async fn shutdown_join(mut self, timeout: Duration) -> Result<(), String> {
+        if let Some(shutdown) = &self.shutdown {
+            let _ = shutdown.send(true);
+        }
         let name = self.name;
         let Some(join) = self.join.as_mut() else {
             return Ok(());
         };
         match tokio::time::timeout(timeout, &mut *join).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(format!("runtime task {name} join failed: {error}")),
+            Ok(Ok(())) => {
+                self.join.take();
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                self.join.take();
+                Err(format!("runtime task {name} join failed: {error}"))
+            }
             Err(_) => {
                 join.abort();
-                let _ = tokio::time::timeout(Duration::from_secs(1), &mut *join).await;
+                let reaped = tokio::time::timeout(Duration::from_secs(1), &mut *join)
+                    .await
+                    .is_ok();
+                if reaped {
+                    self.join.take();
+                }
                 Err(format!(
                     "runtime task {name} shutdown timed out; final outcome unknown"
                 ))
@@ -556,10 +702,35 @@ impl RuntimeTaskHandle {
 
 impl Drop for RuntimeTaskHandle {
     fn drop(&mut self) {
+        if let Some(shutdown) = &self.shutdown {
+            let _ = shutdown.send(true);
+        }
         if let Some(join) = self.join.take() {
-            join.abort();
+            abort_and_reap_runtime_join(join, self.name);
         }
     }
+}
+
+fn abort_and_reap_runtime_join(mut join: tokio::task::JoinHandle<()>, name: &'static str) {
+    join.abort();
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::error!(
+            task = name,
+            "runtime task join could not be scheduled for bounded reaping"
+        );
+        return;
+    };
+    runtime.spawn(async move {
+        if tokio::time::timeout(Duration::from_secs(1), &mut join)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                task = name,
+                "runtime task abort join remained unknown after bounded reaping"
+            );
+        }
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -598,13 +769,27 @@ struct InvalidationFanoutMembers {
     liveness: ChannelLiveness,
     relay: Option<astral_mq::invalidation_fanout_worker::InvalidationFanoutRelayHandle>,
     inbox: Option<astral_mq::invalidation_fanout_worker::InvalidationInboxWorkerHandle>,
-    supervisor: RuntimeTaskHandle,
+    supervisor: Option<RuntimeTaskHandle>,
+}
+
+impl Drop for InvalidationFanoutMembers {
+    fn drop(&mut self) {
+        if let Some(relay) = &self.relay {
+            relay.signal_shutdown();
+        }
+        if let Some(inbox) = &self.inbox {
+            inbox.signal_shutdown();
+        }
+        if let Some(supervisor) = self.supervisor.take() {
+            drop(supervisor);
+        }
+    }
 }
 
 /// 失效 fanout runtime 句柄：持有 relay/inbox/supervisor 直到 runtime
 /// shutdown。正常路径 [`InvalidationFanoutRuntime::shutdown`]（有界逆序
-/// join）；启动失败与外层提前返回由 [`Drop`] RAII 覆盖（relay/inbox 收到协作
-/// 关闭信号后在一个 poll tick 内退出，supervisor 直接 abort）。
+/// join）；启动失败、shutdown future cancellation 与外层提前返回由 [`Drop`]
+/// RAII 覆盖（所有残留任务 signal + abort 并 bounded-reap）。
 ///
 /// 单写者 ownership 是部署预条件（TrustGraph 是唯一授权 owner），**不**以
 /// `acquire_single_writer_lease` 之类的单节点锁强制：Rabbit 多节点 fanout
@@ -616,46 +801,113 @@ pub struct InvalidationFanoutRuntime {
 
 impl Drop for InvalidationFanoutRuntime {
     fn drop(&mut self) {
-        if let Some(members) = &self.members {
-            if let Some(relay) = &members.relay {
-                relay.signal_shutdown();
-            }
-            if let Some(inbox) = &members.inbox {
-                inbox.signal_shutdown();
-            }
-            // supervisor：RuntimeTaskHandle::Drop abort。
+        self.members.take();
+    }
+}
+
+struct FanoutShutdownGuard {
+    members: Option<InvalidationFanoutMembers>,
+}
+
+impl FanoutShutdownGuard {
+    fn new(members: InvalidationFanoutMembers) -> Self {
+        Self {
+            members: Some(members),
+        }
+    }
+
+    fn members_mut(&mut self) -> &mut InvalidationFanoutMembers {
+        self.members
+            .as_mut()
+            .expect("fanout shutdown guard retains remaining members")
+    }
+
+    fn take_supervisor(&mut self) -> Option<RuntimeTaskHandle> {
+        self.members_mut().supervisor.take()
+    }
+
+    fn take_inbox(
+        &mut self,
+    ) -> Option<astral_mq::invalidation_fanout_worker::InvalidationInboxWorkerHandle> {
+        self.members_mut().inbox.take()
+    }
+
+    fn take_relay(
+        &mut self,
+    ) -> Option<astral_mq::invalidation_fanout_worker::InvalidationFanoutRelayHandle> {
+        self.members_mut().relay.take()
+    }
+
+    fn finish(&mut self) {
+        if let Some(members) = self.members.take() {
+            drop(members);
         }
     }
 }
 
+impl Drop for FanoutShutdownGuard {
+    fn drop(&mut self) {
+        self.members.take();
+    }
+}
+
 impl InvalidationFanoutRuntime {
-    /// 有界关闭（启动严格逆序：supervisor → inbox → relay；单写者租约在
-    /// members 丢弃时最后释放）。任一组件未在时限内静止即返回 `Err`。
+    /// Bounded reverse-order shutdown. Each owned handle retains its join while
+    /// awaiting; timeout/cancellation drops that owner, which signals, aborts,
+    /// and schedules a bounded reaper without losing the task handle.
     pub async fn shutdown(mut self, timeout: Duration) -> Result<(), String> {
         let Some(members) = self.members.take() else {
             return Err("invalidation fanout runtime already shut down".to_owned());
         };
+        let mut shutdown = FanoutShutdownGuard::new(members);
         let mut failures: Vec<String> = Vec::new();
-        if let Err(error) = members.supervisor.shutdown_join(timeout).await {
-            failures.push(error);
-        }
-        if let Some(inbox) = members.inbox {
-            if tokio::time::timeout(timeout, inbox.shutdown_and_join())
-                .await
-                .is_err()
-            {
-                failures.push("invalidation fanout inbox worker did not stop in time".to_owned());
+
+        if let Some(supervisor) = shutdown.take_supervisor() {
+            if let Err(error) = supervisor.shutdown_join(timeout).await {
+                failures.push(error);
             }
         }
-        if let Some(relay) = members.relay {
-            if tokio::time::timeout(timeout, relay.shutdown_and_join())
-                .await
-                .is_err()
-            {
-                failures.push("invalidation fanout relay did not stop in time".to_owned());
+
+        if let Some(inbox) = shutdown.take_inbox() {
+            let mut inbox = Some(inbox);
+            let result = tokio::time::timeout(timeout, async {
+                inbox
+                    .take()
+                    .expect("inbox owner retained until join completes")
+                    .shutdown_and_join()
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(error),
+                Err(_) => failures.push(
+                    "invalidation fanout inbox worker did not stop in time; outcome unknown"
+                        .to_owned(),
+                ),
             }
         }
-        // members 在此 drop：任务已静止后结束。
+
+        if let Some(relay) = shutdown.take_relay() {
+            let mut relay = Some(relay);
+            let result = tokio::time::timeout(timeout, async {
+                relay
+                    .take()
+                    .expect("relay owner retained until join completes")
+                    .shutdown_and_join()
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(error),
+                Err(_) => failures.push(
+                    "invalidation fanout relay did not stop in time; outcome unknown".to_owned(),
+                ),
+            }
+        }
+
+        shutdown.finish();
         if failures.is_empty() {
             Ok(())
         } else {
@@ -748,7 +1000,7 @@ pub fn start_local_projection_supervisor(
             liveness: ChannelLiveness::new(),
             relay: None,
             inbox: None,
-            supervisor,
+            supervisor: Some(supervisor),
         }),
     })
 }
@@ -864,8 +1116,18 @@ pub async fn start_invalidation_fanout_runtime(
                 Ok(handle) => handle,
                 Err(error) => {
                     // 启动失败：有界回收已启动的 relay 后拒绝。
-                    let _ =
-                        tokio::time::timeout(FANOUT_STOP_JOIN_CAP, relay.shutdown_and_join()).await;
+                    match tokio::time::timeout(FANOUT_STOP_JOIN_CAP, relay.shutdown_and_join())
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(join_error)) => tracing::error!(
+                            reason = %join_error,
+                            "fanout relay join failed during inbox startup rollback"
+                        ),
+                        Err(_) => {
+                            tracing::error!("fanout relay did not stop within rollback deadline")
+                        }
+                    }
                     return Err(format!("fanout inbox worker failed to start: {error}"));
                 }
             };
@@ -903,7 +1165,7 @@ pub async fn start_invalidation_fanout_runtime(
             liveness,
             relay,
             inbox,
-            supervisor,
+            supervisor: Some(supervisor),
         }),
     })
 }
@@ -915,6 +1177,147 @@ pub async fn start_invalidation_fanout_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rabbit_runtime_close_owner_attempts_close_on_early_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FakeCloser(AtomicUsize, tokio::sync::Notify);
+        #[async_trait::async_trait]
+        impl RabbitConnectionCloser for FakeCloser {
+            async fn close(&self, _reason: &str) -> Result<(), String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                self.1.notify_one();
+                Ok(())
+            }
+        }
+
+        let closer = Arc::new(FakeCloser(AtomicUsize::new(0), tokio::sync::Notify::new()));
+        let liveness = ChannelLiveness::new();
+        liveness.mark_alive();
+        let owner = RabbitConnectionCloseOwner::new(closer.clone(), Some(liveness.clone()));
+        drop(owner);
+        tokio::time::timeout(Duration::from_secs(1), closer.1.notified())
+            .await
+            .expect("early-drop Rabbit owner must schedule the bounded close reaper");
+        assert_eq!(closer.0.load(Ordering::SeqCst), 1);
+        assert!(
+            !liveness.conn_alive(),
+            "drop must mark connection liveness dead immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_rabbit_connection_shutdown_keeps_close_owned() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct HangingCloser(AtomicUsize);
+        #[async_trait::async_trait]
+        impl RabbitConnectionCloser for HangingCloser {
+            async fn close(&self, _reason: &str) -> Result<(), String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+
+        let closer = Arc::new(HangingCloser(AtomicUsize::new(0)));
+        let owner = RabbitConnectionCloseOwner::new(closer.clone(), None);
+        let shutdown = tokio::spawn(owner.shutdown(Duration::from_secs(5), "test"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while closer.0.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close should start");
+        shutdown.abort();
+        let _ = shutdown.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while closer.0.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling explicit shutdown must transfer owner to reaper");
+    }
+
+    #[tokio::test]
+    async fn cancelling_local_invalidation_fanout_shutdown_aborts_supervisor() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(signal) = self.0.take() {
+                    let _ = signal.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let (supervisor_stop, mut supervisor_stop_rx) = tokio::sync::watch::channel(false);
+        let supervisor = RuntimeTaskHandle::spawn_with_shutdown(
+            "fanout-supervisor-test",
+            supervisor_stop,
+            async move {
+                let _drop = DropSignal(Some(dropped_tx));
+                let _ = started_tx.send(());
+                let _ = supervisor_stop_rx.changed().await;
+                std::future::pending::<()>().await;
+            },
+        );
+        started_rx.await.unwrap();
+        let runtime = super::InvalidationFanoutRuntime {
+            members: Some(super::InvalidationFanoutMembers {
+                transport: "local",
+                identity: astral_mq::NodeIdentity::try_from_parts("r", "n").unwrap(),
+                liveness: ChannelLiveness::new(),
+                relay: None,
+                inbox: None,
+                supervisor: Some(supervisor),
+            }),
+        };
+        {
+            let mut shutdown = std::pin::pin!(runtime.shutdown(Duration::from_secs(5)));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut shutdown)
+                    .await
+                    .is_err()
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("cancelled shutdown must abort/reap the supervisor")
+            .expect("supervisor task drop must be observed");
+    }
+
+    #[tokio::test]
+    async fn runtime_task_shutdown_timeout_keeps_unknown_join_for_drop_reaper() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(signal) = self.0.take() {
+                    let _ = signal.send(());
+                }
+            }
+        }
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let handle = RuntimeTaskHandle::spawn("bounded-reaper-test", async move {
+            let _drop = DropSignal(Some(dropped_tx));
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.unwrap();
+        let error = handle
+            .shutdown_join(Duration::from_millis(10))
+            .await
+            .expect_err("timeout must remain unknown");
+        assert!(error.contains("outcome unknown"));
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("unresolved join must be reaped after timeout")
+            .expect("task Drop must be observed");
+    }
 
     #[tokio::test]
     async fn cancelling_runtime_task_shutdown_aborts_its_owned_consumer() {

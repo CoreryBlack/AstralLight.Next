@@ -503,6 +503,8 @@ pub struct LoginAggregateRow {
     pub must_change_password: Option<bool>,
     /// user_local_credential.credential_id
     pub credential_id: i64,
+    /// Monotone local credential revision; incremented on every password change.
+    pub credential_version: i64,
     /// identity_card.card_id
     pub card_id: Option<i64>,
     /// identity_card.status
@@ -525,7 +527,7 @@ pub async fn find_login_aggregate(
     let row = sqlx::query_as::<_, LoginAggregateRow>(
         "SELECT u.user_id, u.display_name, u.email, u.phone, u.status AS user_status, \
                 c.login_name, c.password_hash, c.password_algo, c.must_change_password, \
-                c.credential_id, ic.card_id, ic.status AS card_status, ic.token_version, \
+                c.credential_id, c.credential_version, ic.card_id, ic.status AS card_status, ic.token_version, \
                 DATE_FORMAT(ic.expires_at, '%Y-%m-%dT%H:%i:%sZ') AS identity_expires_at \
          FROM user_local_credential c \
          INNER JOIN platform_user u ON u.user_id = c.user_id AND u.deleted_at IS NULL \
@@ -552,7 +554,7 @@ async fn find_login_aggregate_by_login_name(
         "SELECT \
                 u.user_id, u.display_name, u.email, u.phone, u.status AS user_status, \
                 c.login_name, c.password_hash, c.password_algo, c.must_change_password, \
-                c.credential_id, ic.card_id, ic.status AS card_status, ic.token_version, \
+                c.credential_id, c.credential_version, ic.card_id, ic.status AS card_status, ic.token_version, \
                 DATE_FORMAT(ic.expires_at, '%Y-%m-%dT%H:%i:%sZ') AS identity_expires_at \
              FROM user_local_credential c \
              INNER JOIN platform_user u ON u.user_id = c.user_id AND u.deleted_at IS NULL \
@@ -577,7 +579,7 @@ async fn find_login_aggregate_by_user_phone(
         "SELECT \
             u.user_id, u.display_name, u.email, u.phone, u.status AS user_status, \
             c.login_name, c.password_hash, c.password_algo, c.must_change_password, \
-            c.credential_id, ic.card_id, ic.status AS card_status, \
+            c.credential_id, c.credential_version, ic.card_id, ic.status AS card_status, \
             ic.token_version, \
             DATE_FORMAT(ic.expires_at, '%Y-%m-%dT%H:%i:%sZ') AS identity_expires_at \
          FROM platform_user u \
@@ -603,7 +605,7 @@ async fn find_login_aggregate_by_user_email(
         "SELECT \
             u.user_id, u.display_name, u.email, u.phone, u.status AS user_status, \
             c.login_name, c.password_hash, c.password_algo, c.must_change_password, \
-            c.credential_id, ic.card_id, ic.status AS card_status, \
+            c.credential_id, c.credential_version, ic.card_id, ic.status AS card_status, \
             ic.token_version, \
             DATE_FORMAT(ic.expires_at, '%Y-%m-%dT%H:%i:%sZ') AS identity_expires_at \
          FROM platform_user u \
@@ -692,6 +694,7 @@ pub struct PasswordCredential {
     pub user_id: i64,
     pub password_hash: String,
     pub status: String,
+    pub credential_version: i64,
 }
 
 /// 查询用户当前启用的本地凭证。
@@ -700,7 +703,7 @@ pub async fn load_password_credential(
     user_id: i64,
 ) -> Result<Option<PasswordCredential>, AstralError> {
     sqlx::query_as::<_, PasswordCredential>(
-        "SELECT user_id, password_hash, status \
+        "SELECT user_id, password_hash, status, credential_version \
          FROM user_local_credential \
          WHERE user_id = ? AND status = 'ACTIVE' LIMIT 1",
     )
@@ -710,54 +713,63 @@ pub async fn load_password_credential(
     .map_err(|e| AstralError::Database(format!("Load password credential failed: {e}")))
 }
 
-/// 更新密码 hash（操作 user_local_credential 表）
+/// Update a password and close every credential-derived session atomically.
 ///
-/// 凭证事实 autocommit 写：source writer 栅栏（hub 已装则 fail-closed 取得，
-/// 不可得即拒绝写入；await 窗口前武装取消栅栏，Ok → proven；Err/取消 →
-/// sticky uncertain）。事务内变体 [`update_password_hash_tx`] 不自围——它是
-/// 调用方 source 事务的成员（如 password.rs 重置事务），由事务栅栏统一持有，
-/// 绝不双重围栏。
+/// The source writer guard is acquired before the transaction begins, armed before
+/// commit, and settled only after commit is proven. The in-process JTI mirror is
+/// updated only after that proven commit.
 pub async fn update_password_hash(
     db: &sqlx::MySqlPool,
     user_id: i64,
     new_hash: &str,
 ) -> Result<(), AstralError> {
     let source_guard = source_writer_guard::begin_source_write()?;
-    source_writer_guard::fenced_source_write(
-        source_guard,
-        sqlx::query(
-            "UPDATE user_local_credential \
-             SET password_hash = ?, password_algo = 'ARGON2ID', password_updated_at = CURRENT_TIMESTAMP, \
-                 must_change_password = 0, updated_at = CURRENT_TIMESTAMP \
-             WHERE user_id = ? AND status = 'ACTIVE'",
-        )
-        .bind(new_hash)
-        .bind(user_id)
-        .execute(db),
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| AstralError::Database(format!("Begin password update tx failed: {e}")))?;
+    let revoked_jtis = crate::srv::auth_repository::update_password_transaction_in_tx(
+        &mut tx,
+        user_id,
+        None,
+        None,
+        new_hash,
+        "PASSWORD_CHANGED",
+        None,
     )
-    .await
-    .map_err(|e| AstralError::Database(format!("Update password hash failed: {e}")))?;
+    .await?;
+
+    source_writer_guard::arm_commit_fence(&source_guard);
+    tx.commit()
+        .await
+        .map_err(|e| AstralError::Database(format!("Commit password update tx failed: {e}")))?;
+    source_writer_guard::settle_commit_fence(&source_guard, true);
+    drop(source_guard);
+    astral_db::note_revocations_in_process(&revoked_jtis, astral_db::REVOCATION_MIRROR_TTL_SECS);
     Ok(())
 }
 
-/// 事务内更新密码 hash（与 password reset token 原子消费同一事务，
-/// 保证凭据变更与 token 消费要么同时生效要么同时回滚）
+/// Update a password inside a caller-owned transaction using the same atomic
+/// password/session/JTI/outbox closure as [`update_password_hash`]. The caller
+/// must acquire the source writer guard before opening the transaction, arm its
+/// commit fence before commit, and settle the guard only after a proven commit.
+/// This function neither manages that guard nor performs post-commit I/O. The
+/// caller must roll back on error and commit only after all transaction work succeeds.
 pub async fn update_password_hash_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     user_id: i64,
     new_hash: &str,
 ) -> Result<(), AstralError> {
-    sqlx::query(
-        "UPDATE user_local_credential \
-         SET password_hash = ?, password_algo = 'ARGON2ID', password_updated_at = CURRENT_TIMESTAMP, \
-             must_change_password = 0, updated_at = CURRENT_TIMESTAMP \
-         WHERE user_id = ? AND status = 'ACTIVE'"
+    crate::srv::auth_repository::update_password_transaction_in_tx(
+        tx,
+        user_id,
+        None,
+        None,
+        new_hash,
+        "PASSWORD_CHANGED",
+        None,
     )
-    .bind(new_hash)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| AstralError::Database(format!("Update password hash failed: {e}")))?;
+    .await?;
     Ok(())
 }
 
@@ -1074,12 +1086,11 @@ mod tests {
         assert!(matches!(unexpected, AstralError::Internal(_)));
     }
 
-    /// 公共凭据写点 source 栅栏形状回归（源形状，无 IO）：published
-    /// `update_password_hash`（autocommit）自围；事务内变体
-    /// `update_password_hash_tx` 保持裸 SQL——由调用方事务栅栏统一持有，
-    /// 绝不双重围栏。
+    /// 公共凭据写点 source 栅栏形状回归（源形状，无 IO）：数据库入口在 begin
+    /// 前自围、commit 前 arm、已证明 commit 后 settle 和更新进程内 JTI 镜像；
+    /// tx 入口只调用共享事务内 helper，由调用方负责 guard/commit 且不做提交后 IO。
     #[test]
-    fn published_password_writer_is_fenced_and_tx_variant_stays_outer_fenced() {
+    fn published_password_writer_and_tx_variant_share_atomic_password_closure() {
         let source = include_str!("auth.rs");
         let impl_source = &source[..source
             .find("#[cfg(test)]")
@@ -1092,10 +1103,34 @@ mod tests {
             .split("pub async fn update_password_hash_tx(")
             .next()
             .expect("tx variant must follow the free fn");
+        let guard = free_body
+            .find("source_writer_guard::begin_source_write()")
+            .expect("the DB helper must acquire the source writer guard");
+        let begin = free_body
+            .find(".begin()")
+            .expect("the DB helper must open its transaction");
+        let shared = free_body
+            .find("update_password_transaction_in_tx(")
+            .expect("the DB helper must run the shared atomic transaction body");
+        let arm = free_body
+            .find("source_writer_guard::arm_commit_fence(&source_guard)")
+            .expect("the DB helper must arm its commit fence");
+        let commit = free_body
+            .find("tx.commit()")
+            .expect("the DB helper must commit its transaction");
+        let settle = free_body
+            .find("source_writer_guard::settle_commit_fence(&source_guard, true)")
+            .expect("the DB helper must settle only a proven commit");
+        let mirror = free_body
+            .find("note_revocations_in_process")
+            .expect("the DB helper must refresh the JTI mirror after commit");
         assert!(
-            free_body.contains("source_writer_guard::begin_source_write()")
-                && free_body.contains("source_writer_guard::fenced_source_write("),
-            "the published autocommit password writer must be self-fenced"
+            guard < begin
+                && begin < shared
+                && shared < arm
+                && arm < commit
+                && commit < settle
+                && settle < mirror
         );
 
         let tx_body = impl_source
@@ -1106,8 +1141,12 @@ mod tests {
             .next()
             .expect("update_last_login_at must follow the tx variant");
         assert!(
-            !tx_body.contains("fenced_source_write"),
-            "the tx member must stay bare SQL: the caller transaction's fence owns it"
+            tx_body.contains("update_password_transaction_in_tx(")
+                && !tx_body.contains("begin_source_write")
+                && !tx_body.contains("arm_commit_fence")
+                && !tx_body.contains("tx.commit()")
+                && !tx_body.contains("note_revocations_in_process"),
+            "the tx member must use shared atomic SQL only; its caller owns guard, commit, and post-commit work"
         );
     }
 }

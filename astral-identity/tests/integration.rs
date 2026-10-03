@@ -27,6 +27,7 @@ struct LoginAggregateRow {
     password_algo: Option<String>,
     must_change_password: Option<bool>,
     credential_id: i64,
+    credential_version: i64,
     card_id: Option<i64>,
     card_status: Option<String>,
     token_version: Option<i64>,
@@ -721,6 +722,7 @@ async fn test_login_aggregate_join() {
             c.password_algo, \
             c.must_change_password, \
             c.credential_id, \
+            c.credential_version, \
             ic.card_id, \
             ic.status AS card_status, \
             ic.token_version, \
@@ -797,6 +799,7 @@ async fn test_login_aggregate_join() {
             c.password_algo, \
             c.must_change_password, \
             c.credential_id, \
+            c.credential_version, \
             ic.card_id, \
             ic.status AS card_status, \
             ic.token_version, \

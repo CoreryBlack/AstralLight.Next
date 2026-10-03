@@ -46,6 +46,7 @@ import traceback
 import uuid
 
 import requests
+import s15_validation
 
 PREFIX = "astral-gateway-v3"
 A = {"user_id": "9031", "icard": "9041", "card": "9061", "domain": "9011", "tenant": "9001"}
@@ -2053,6 +2054,7 @@ def rq_settle(timeout_s=1500):
 
 
 def run_round(round_no, only=None):
+    RESULTS.clear()
     print("=" * 100)
     print("ROUND %d" % round_no)
     print("=" * 100)
@@ -2104,8 +2106,13 @@ def main():
     ap.add_argument("--only", type=str, default=None)
     ap.add_argument("--out", type=str, default="s15_result.json")
     args = ap.parse_args()
-    only = set(args.only.split(",")) if args.only else None
+    only = [item.strip() for item in args.only.split(",")] if args.only is not None else None
+    selection_errors = s15_validation.validate_run_selection(args.rounds, only)
+    if selection_errors:
+        ap.error("invalid S15 selection: %s" % ";".join(selection_errors))
+    only = set(only) if only is not None else None
     started = time.time()
+    coverage_rounds = []
 
     def snapshot(complete, rounds_done):
         """原始汇总：PASS/FAIL/N/A 直接由 RESULTS 计数，不做任何静默重分类；
@@ -2113,8 +2120,28 @@ def main():
         npass = sum(1 for x in RESULTS if x["verdict"] == "PASS")
         nfail = sum(1 for x in RESULTS if x["verdict"] == "FAIL")
         nna = sum(1 for x in RESULTS if x["verdict"] == "N/A")
+        selected = sorted(only) if only is not None else list(s15_validation.SCENARIO_NAMES)
+        round_verdicts = {
+            item["name"]: item["verdict"] for item in RESULTS
+        }
+        missing = s15_validation.missing_required_cases(selected, round_verdicts)
+        nonpass = s15_validation.missing_nonpass_cases(selected, round_verdicts)
+        round_results = list(coverage_rounds)
+        if rounds_done > len(round_results):
+            round_results.append({"missing": missing, "nonpass": nonpass, "verdicts": round_verdicts})
+        coverage = s15_validation.campaign_coverage(
+            rounds=args.rounds,
+            rounds_done=rounds_done,
+            only=sorted(only) if only is not None else None,
+            round_missing_cases=[entry["missing"] for entry in round_results],
+            round_case_verdicts=[entry["verdicts"] for entry in round_results],
+        )
+        coverage["scope"] = "partial" if only is not None or coverage["scope"] == "partial" else "full"
+        coverage["nonpassCasesByRound"] = [entry["nonpass"] for entry in round_results]
+        coverage["complete"] = bool(coverage["complete"] and complete)
         return {
-            "complete": complete,
+            "complete": bool(complete and coverage["complete"]),
+            "coverage": coverage,
             "rounds_done": rounds_done,
             "summary": {
                 "pass": npass, "fail": nfail, "na": nna,
@@ -2146,6 +2173,14 @@ def main():
                     and not restart_cluster():
                 raise RuntimeError("round %d cluster restart failed" % i)
             run_round(i, only)
+            selected = sorted(only) if only is not None else list(s15_validation.SCENARIO_NAMES)
+            round_verdicts = {item["name"]: item["verdict"] for item in RESULTS}
+            round_missing = s15_validation.missing_required_cases(selected, round_verdicts)
+            coverage_rounds.append({
+                "missing": round_missing,
+                "nonpass": s15_validation.missing_nonpass_cases(selected, round_verdicts),
+                "verdicts": round_verdicts,
+            })
             # Each completed round is checkpointed atomically. An interrupted
             # run remains complete=false and cannot be consumed as final data.
             atomic_json(args.out, snapshot(False, i))

@@ -14,6 +14,7 @@ pub mod srv;
 
 use std::future::IntoFuture;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::FromRef;
 use axum::Router;
@@ -97,6 +98,131 @@ impl Drop for IdentityRuntimeTaskHandle {
         if let Some(join) = self.join.take() {
             join.abort();
         }
+    }
+}
+
+#[async_trait::async_trait]
+trait IdentityRabbitConnectionClose: Send + Sync {
+    async fn close(&self, reason: &str) -> Result<(), String>;
+}
+
+struct LapinIdentityRabbitConnection(Arc<Connection>);
+
+#[async_trait::async_trait]
+impl IdentityRabbitConnectionClose for LapinIdentityRabbitConnection {
+    async fn close(&self, reason: &str) -> Result<(), String> {
+        self.0
+            .close(200, reason.to_owned().into())
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Owns a successfully bootstrapped Rabbit connection independently of the
+/// global producer's channel clones. Drop requests a bounded best-effort close;
+/// only `shutdown` can return an explicit close result to its caller.
+struct IdentityRabbitConnectionGuard {
+    connection: Option<Arc<dyn IdentityRabbitConnectionClose>>,
+}
+
+impl IdentityRabbitConnectionGuard {
+    fn new(connection: Arc<Connection>) -> Self {
+        Self::from_owner(Arc::new(LapinIdentityRabbitConnection(connection)))
+    }
+
+    fn from_owner(connection: Arc<dyn IdentityRabbitConnectionClose>) -> Self {
+        Self {
+            connection: Some(connection),
+        }
+    }
+
+    async fn shutdown(mut self, reason: &str) -> Result<(), String> {
+        let connection = Arc::clone(
+            self.connection
+                .as_ref()
+                .expect("Rabbit connection guard owns the connection until close succeeds"),
+        );
+        match tokio::time::timeout(Duration::from_secs(5), connection.close(reason)).await {
+            Ok(Ok(())) => {
+                self.connection.take();
+                Ok(())
+            }
+            Ok(Err(error)) => Err(format!("Identity Rabbit connection close failed: {error}")),
+            Err(_) => Err("Identity Rabbit connection close timed out; outcome unknown".to_owned()),
+        }
+    }
+}
+
+impl Drop for IdentityRabbitConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            spawn_identity_connection_close_reaper(
+                connection,
+                "identity early shutdown".to_owned(),
+            );
+        }
+    }
+}
+
+fn spawn_identity_connection_close_reaper(
+    connection: Arc<dyn IdentityRabbitConnectionClose>,
+    reason: String,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::error!("Identity Rabbit connection close could not be scheduled; outcome unknown");
+        return;
+    };
+    runtime.spawn(async move {
+        match tokio::time::timeout(Duration::from_secs(5), connection.close(&reason)).await {
+            Ok(Ok(())) => tracing::debug!("Identity Rabbit connection closed by shutdown reaper"),
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!("Identity Rabbit close reaper could not prove connection close")
+            }
+        }
+    });
+}
+
+fn finish_after_signal_failure(
+    result: anyhow::Result<()>,
+    signal_failure: Result<String, tokio::sync::oneshot::error::RecvError>,
+) -> anyhow::Result<()> {
+    match signal_failure {
+        Ok(reason) => match result {
+            Ok(()) => Err(anyhow::anyhow!("Identity shutdown signal failed: {reason}")),
+            Err(error) => {
+                Err(error.context(format!("Identity shutdown signal also failed: {reason}")))
+            }
+        },
+        Err(_) => result,
+    }
+}
+
+async fn consume_local_until_stopped(
+    mut receiver: astral_mq::local_bus::LocalReceiver,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        if *stop.borrow() {
+            receiver.close();
+            break;
+        }
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    receiver.close();
+                    break;
+                }
+            }
+            delivery = receiver.recv() => {
+                let Some(delivery) = delivery else { return; };
+                let result = astral_mq::consumers::dispatch_local_delivery(&delivery).await;
+                delivery.complete(result);
+            }
+        }
+    }
+    while let Some(delivery) = receiver.recv().await {
+        let result = astral_mq::consumers::dispatch_local_delivery(&delivery).await;
+        delivery.complete(result);
     }
 }
 
@@ -212,6 +338,33 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
+    let (signal_failure_tx, signal_failure_rx) = tokio::sync::oneshot::channel();
+    let result = run_with_listen_addr_and_shutdown(addr, async move {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "failed to install Ctrl-C handler");
+            let _ = signal_failure_tx.send(error.to_string());
+        }
+    })
+    .await;
+    finish_after_signal_failure(result, signal_failure_rx.await)
+}
+
+pub async fn run_with_listen_addr_and_shutdown<F>(addr: &str, shutdown: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    run_with_listen_addr_and_shutdown_and_drain(addr, shutdown, std::future::ready(())).await
+}
+
+pub async fn run_with_listen_addr_and_shutdown_and_drain<F, D>(
+    addr: &str,
+    shutdown: F,
+    producers_drained: D,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+    D: std::future::Future<Output = ()> + Send + 'static,
+{
     let config = Arc::new(AppConfig::from_files_for(
         "application",
         JwtValidationRole::Identity,
@@ -311,22 +464,6 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
     #[cfg(not(feature = "redis-compat"))]
     let session_projection_worker =
         srv::session_projection_worker::spawn_without_redis_owned(db.clone());
-    {
-        // Death observability: a terminal state of the required recovery leg
-        // (panic / unexpected exit / cooperative stop) is surfaced loudly.
-        let mut death = session_projection_worker.death_signal();
-        tokio::spawn(async move {
-            while death.changed().await.is_ok() {
-                if let Some(reason) = death.borrow().clone() {
-                    tracing::error!(
-                        reason = %reason,
-                        "auth session recovery worker reached a terminal state \
-                         (required recovery leg)"
-                    );
-                }
-            }
-        });
-    }
 
     // Inject Identity-owned durable handlers before either transport starts.
     astral_mq::consumers::set_session_revocation_db(db.clone());
@@ -339,6 +476,8 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
     // loops; declared at function scope so they live until the serve tail and
     // receive a bounded shutdown on every exit path.
     let mut local_owner_tasks: Vec<IdentityRuntimeTaskHandle> = Vec::new();
+    let mut rabbit_connection: Option<IdentityRabbitConnectionGuard> = None;
+    let (local_stop_tx, local_stop_rx) = tokio::sync::watch::channel(false);
     if matches!(
         state
             .config
@@ -352,32 +491,26 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
         // worker-supervision-20261002: the local owner consumer loops are
         // RAII-owned (Drop abort; bounded shutdown at serve end) instead of
         // detached fire-and-forget — identical dispatch/complete semantics.
-        let mut revocation_receiver = bus
+        let revocation_receiver = bus
             .register(
                 astral_mq::config::QUEUE_AUTH_SESSION_REVOCATION,
                 astral_mq::local_bus::LocalOwner::Identity,
             )
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let mut login_receiver = bus
+        let login_receiver = bus
             .register(
                 astral_mq::config::QUEUE_LOGIN_EVENT,
                 astral_mq::local_bus::LocalOwner::Identity,
             )
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let revocation_consumer =
-            IdentityRuntimeTaskHandle::spawn("identity-local-revocation-consumer", async move {
-                while let Some(delivery) = revocation_receiver.recv().await {
-                    let result = astral_mq::consumers::dispatch_local_delivery(&delivery).await;
-                    delivery.complete(result);
-                }
-            });
-        let login_consumer =
-            IdentityRuntimeTaskHandle::spawn("identity-local-login-consumer", async move {
-                while let Some(delivery) = login_receiver.recv().await {
-                    let result = astral_mq::consumers::dispatch_local_delivery(&delivery).await;
-                    delivery.complete(result);
-                }
-            });
+        let revocation_consumer = IdentityRuntimeTaskHandle::spawn(
+            "identity-local-revocation-consumer",
+            consume_local_until_stopped(revocation_receiver, local_stop_rx.clone()),
+        );
+        let login_consumer = IdentityRuntimeTaskHandle::spawn(
+            "identity-local-login-consumer",
+            consume_local_until_stopped(login_receiver, local_stop_rx),
+        );
         local_owner_tasks.push(revocation_consumer);
         local_owner_tasks.push(login_consumer);
         let producer =
@@ -385,22 +518,23 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
         register_mq_producer(Arc::new(IdentityMqProducer { inner: producer }));
     } else {
         let mq_url = state.config.rabbitmq_url.clone();
-        let dlq_quarantine_db = db.clone();
-        tokio::spawn(async move {
-            let mut attempt: u32 = 0;
-            loop {
-                let producer = init_mq(&mq_url, &dlq_quarantine_db).await.ok();
-                if let Some(producer) = producer {
-                    register_mq_producer(Arc::new(producer));
-                    tracing::info!(
-                        service = "identity",
-                        transport = "rabbit",
-                        "MQ producer registered"
-                    );
-                    break;
-                }
-                attempt = attempt.saturating_add(1);
-                let backoff_secs = 2u64.pow(attempt.min(5));
+        let mut connected = false;
+        for attempt in 1..=5_u32 {
+            if let Ok((producer, connection)) = init_mq(&mq_url, &db).await {
+                // Retain a shutdown owner before registering the global producer:
+                // channel clones outlive this function's local bindings.
+                rabbit_connection = Some(IdentityRabbitConnectionGuard::new(connection));
+                register_mq_producer(Arc::new(producer));
+                tracing::info!(
+                    service = "identity",
+                    transport = "rabbit",
+                    "MQ producer registered"
+                );
+                connected = true;
+                break;
+            }
+            if attempt < 5 {
+                let backoff_secs = 2u64.pow(attempt.min(3));
                 tracing::warn!(
                     service = "identity",
                     attempt,
@@ -409,7 +543,12 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
             }
-        });
+        }
+        if !connected {
+            return Err(anyhow::anyhow!(
+                "Identity MQ bootstrap exhausted its retry budget"
+            ));
+        }
     }
 
     // 启动期注册校验（对齐 Java @PostConstruct 校验）
@@ -452,38 +591,78 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
 
     tracing::info!(addr = %addr, "identity service starting");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    // Required recovery-worker death stops serving before owned tasks close.
+    // Required recovery-worker death closes admission before draining HTTP tasks.
     let mut session_death = session_projection_worker.death_signal();
-    let mut serve = std::pin::pin!(axum::serve(listener, app).into_future());
+    let (serve_stop_tx, serve_stop_rx) = tokio::sync::oneshot::channel();
+    let (drain_started_tx, mut drain_started_rx) = tokio::sync::oneshot::channel();
+    let mut serve = std::pin::pin!(axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = shutdown => {}
+                _ = serve_stop_rx => {}
+            }
+            if let Some(hub) = astral_db::memory_projection_hub() {
+                hub.mark_runtime_owner_failed("identity runtime shutting down");
+            }
+            let _ = drain_started_tx.send(());
+        })
+        .into_future());
     let serve_result = tokio::select! {
         result = &mut serve => result
             .map_err(|error| anyhow::anyhow!("identity service serve failed: {error}")),
+        _ = &mut drain_started_rx => {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), &mut serve).await {
+                Ok(result) => result.map_err(Into::into),
+                Err(_) => Err(anyhow::anyhow!("Identity HTTP drain timed out; handler outcomes unknown")),
+            }
+        }
         reason = wait_required_worker_death(&mut session_death) => {
-            tracing::error!(
-                reason = %reason,
-                "required session recovery worker reached a terminal state; failing the \
-                 identity runtime (sticky required-owner failure, no half-served state)"
-            );
             if let Some(hub) = astral_db::memory_projection_hub() {
                 hub.mark_runtime_owner_failed(format!(
                     "code=identity.required_worker_death;reason={reason}"
                 ));
             }
+            let _ = serve_stop_tx.send(());
+            let drain = tokio::time::timeout(std::time::Duration::from_secs(30), &mut serve).await;
             Err(anyhow::anyhow!(
-                "required session recovery worker death stopped the identity runtime: {reason}"
+                "required session recovery worker died: {reason}; HTTP drain outcome: {drain:?}"
             ))
         }
     };
+    let worker_result = session_projection_worker.shutdown_join().await;
+    // ORG events may have a frozen deadline of almost one hour on the peer.
+    let barrier_result =
+        tokio::time::timeout(std::time::Duration::from_secs(4_200), producers_drained).await;
+    if barrier_result.is_err() {
+        return Err(anyhow::anyhow!(
+            "Identity producer drain barrier timed out; outcome unknown"
+        ));
+    }
+    let audit_result =
+        astral_common::audit::drain_owned_audit_tasks(std::time::Duration::from_secs(5)).await;
+    let _ = local_stop_tx.send(true);
+    let mut failures = Vec::new();
+    if let Err(failure) = audit_result {
+        failures.push(failure);
+    }
     for task in local_owner_tasks {
         if let Err(failure) = task.shutdown_join(std::time::Duration::from_secs(5)).await {
-            tracing::warn!(failure = %failure, "identity runtime task did not stop cleanly");
+            failures.push(failure);
         }
     }
-    if let Err(failure) = session_projection_worker.shutdown_join().await {
-        tracing::warn!(
-            failure = %failure,
-            "auth session recovery worker did not stop cleanly"
-        );
+    if let Err(failure) = worker_result {
+        failures.push(failure);
+    }
+    if let Some(connection) = rabbit_connection {
+        if let Err(failure) = connection.shutdown("identity runtime shutdown").await {
+            failures.push(failure);
+        }
+    }
+    if !failures.is_empty() {
+        return Err(anyhow::anyhow!(
+            "identity shutdown failed: {}",
+            failures.join("; ")
+        ));
     }
     serve_result?;
     Ok(())
@@ -495,47 +674,170 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
 async fn init_mq(
     rabbitmq_url: &str,
     quarantine_db: &MySqlPool,
-) -> Result<IdentityMqProducer, Box<dyn std::error::Error>> {
-    // MQ 消费者幂等走 durable MySQL lease（mq_consumer_lease，缺表启动即
-    // 失败 fail-closed）；Redis 仅为显式兼容 adapter，不承载幂等。
-    astral_mq::consumer::init_idempotency_db(quarantine_db.clone()).await?;
-    let conn = Connection::connect(
-        rabbitmq_url,
-        lapin::ConnectionProperties::default().enable_auto_recover(),
+) -> Result<(IdentityMqProducer, Arc<Connection>), String> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        astral_mq::consumer::init_idempotency_db(quarantine_db.clone()),
     )
-    .await?;
-    let channel = conn.create_channel().await?;
-    astral_mq::producer::Producer::enable_confirms(&channel).await?;
-    astral_mq::config::declare_all(&channel).await?;
-
-    // 创建 Producer
-    let producer = astral_mq::producer::Producer::new(channel.clone());
-
-    // 启动消费者：Identity 独占会话撤销与登录事件，不消费 audit.log。
-    // DLQ 消费者先于业务消费者启动，保证死信消息可被重投/告警闭环。
-    astral_mq::consumers::start_dlq_consumers(
-        &channel,
-        astral_mq::consumers::DlqOwner::Identity,
-        Some(quarantine_db.clone()),
-    )
-    .await?;
-    astral_mq::consumers::start_auth_session_revocation_consumer(&channel).await?;
-    astral_mq::consumers::start_login_event_consumer(&channel).await?;
-    let started = Vec::<String>::new();
-    tracing::info!(service = "identity", "MQ consumers started: {:?}", started);
-
-    // 保持连接存活
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    .await
+    .map_err(|_| "Identity durable consumer backend timed out".to_owned())?
+    .map_err(|_| "Identity durable consumer backend unavailable".to_owned())?;
+    let conn = Arc::new(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Connection::connect(
+                rabbitmq_url,
+                lapin::ConnectionProperties::default().enable_auto_recover(),
+            ),
+        )
+        .await
+        .map_err(|_| "Identity Rabbit connection timed out".to_owned())?
+        .map_err(|_| "Identity Rabbit connection failed".to_owned())?,
+    );
+    let setup = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let channel = conn
+            .create_channel()
+            .await
+            .map_err(|_| "Identity Rabbit channel failed".to_owned())?;
+        astral_mq::producer::Producer::enable_confirms(&channel)
+            .await
+            .map_err(|_| "Identity publisher confirms unavailable".to_owned())?;
+        astral_mq::config::declare_all(&channel)
+            .await
+            .map_err(|_| "Identity Rabbit topology failed".to_owned())?;
+        astral_mq::consumers::start_dlq_consumers(
+            &channel,
+            astral_mq::consumers::DlqOwner::Identity,
+            Some(quarantine_db.clone()),
+        )
+        .await
+        .map_err(|_| "Identity dead-letter consumer unavailable".to_owned())?;
+        astral_mq::consumers::start_auth_session_revocation_consumer(&channel)
+            .await
+            .map_err(|_| "Identity revocation consumer unavailable".to_owned())?;
+        astral_mq::consumers::start_login_event_consumer(&channel)
+            .await
+            .map_err(|_| "Identity login consumer unavailable".to_owned())?;
+        tracing::info!(service = "identity", "MQ consumers started");
+        Ok::<_, String>(IdentityMqProducer {
+            inner: astral_mq::producer::Producer::new(channel),
+        })
+    })
+    .await;
+    match setup {
+        Ok(Ok(producer)) => Ok((producer, conn)),
+        outcome => {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                conn.close(200, "identity bootstrap rejected".into()),
+            )
+            .await;
+            match outcome {
+                Ok(Err(error)) => Err(error),
+                _ => Err("Identity Rabbit consumer setup timed out".into()),
+            }
         }
-    });
-
-    Ok(IdentityMqProducer { inner: producer })
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn dropping_rabbit_guard_schedules_bounded_close_reaper() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FakeClose(AtomicUsize, tokio::sync::Notify);
+        #[async_trait::async_trait]
+        impl super::IdentityRabbitConnectionClose for FakeClose {
+            async fn close(&self, _reason: &str) -> Result<(), String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                self.1.notify_one();
+                Ok(())
+            }
+        }
+
+        let close = Arc::new(FakeClose(AtomicUsize::new(0), tokio::sync::Notify::new()));
+        let guard = super::IdentityRabbitConnectionGuard::from_owner(close.clone());
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), close.1.notified())
+            .await
+            .expect("early-drop close reaper must attempt close");
+        assert_eq!(close.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn identity_rabbit_guard_reports_explicit_close_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FakeClose(AtomicUsize);
+        #[async_trait::async_trait]
+        impl super::IdentityRabbitConnectionClose for FakeClose {
+            async fn close(&self, _reason: &str) -> Result<(), String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let close = Arc::new(FakeClose(AtomicUsize::new(0)));
+        super::IdentityRabbitConnectionGuard::from_owner(close.clone())
+            .shutdown("test shutdown")
+            .await
+            .expect("explicit Rabbit close must succeed");
+        assert_eq!(close.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn identity_signal_failure_cannot_be_reported_as_clean_shutdown() {
+        let result =
+            super::finish_after_signal_failure(Ok(()), Ok("signal registration failed".into()));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("signal registration failed"));
+    }
+
+    #[test]
+    fn identity_rabbit_guard_precedes_global_producer_and_bind_error_paths() {
+        let source = include_str!("runtime.rs");
+        let guard = source
+            .find("rabbit_connection = Some(IdentityRabbitConnectionGuard::new(connection))")
+            .expect("successful bootstrap must immediately install its close owner");
+        let producer = source[guard..]
+            .find("register_mq_producer(Arc::new(producer))")
+            .map(|offset| guard + offset)
+            .expect("global producer registration must remain");
+        let bind = source[producer..]
+            .find("TcpListener::bind(addr).await?")
+            .map(|offset| producer + offset)
+            .expect("HTTP bind error path must remain");
+        assert!(guard < producer && producer < bind);
+        assert!(source.contains("spawn_identity_connection_close_reaper"));
+    }
+
+    #[tokio::test]
+    async fn local_consumer_cooperative_shutdown_closes_admission() {
+        let bus = astral_mq::local_bus::LocalBus::new(Default::default()).unwrap();
+        let receiver = bus
+            .register(
+                astral_mq::config::QUEUE_LOGIN_EVENT,
+                astral_mq::local_bus::LocalOwner::Identity,
+            )
+            .unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let handle = super::IdentityRuntimeTaskHandle::spawn(
+            "local-stop-test",
+            super::consume_local_until_stopped(receiver, stop_rx),
+        );
+        stop_tx.send(true).unwrap();
+        handle
+            .shutdown_join(std::time::Duration::from_secs(1))
+            .await
+            .expect("closed local receiver must stop cooperatively");
+        assert!(!bus.owners_ready());
+    }
+
     #[tokio::test]
     async fn cancelling_consumer_shutdown_keeps_task_ownership() {
         struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);

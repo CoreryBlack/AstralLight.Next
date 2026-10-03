@@ -119,13 +119,19 @@ fn parse_args() -> Result<Args, String> {
             "--path" => path = next()?,
             "--method" => method = next()?.to_uppercase(),
             "--body" => body = Some(next()?),
-            "-c" | "--concurrency" => concurrency = next()?.parse().map_err(|e| format!("--concurrency: {e}"))?,
-            "-d" | "--duration" => duration = next()?.parse().map_err(|e| format!("--duration: {e}"))?,
+            "-c" | "--concurrency" => {
+                concurrency = next()?.parse().map_err(|e| format!("--concurrency: {e}"))?
+            }
+            "-d" | "--duration" => {
+                duration = next()?.parse().map_err(|e| format!("--duration: {e}"))?
+            }
             "-n" | "--count" => count = next()?.parse().map_err(|e| format!("--count: {e}"))?,
             "--warmup" => warmup = next()?.parse().map_err(|e| format!("--warmup: {e}"))?,
             "--rate" => rate = next()?.parse().map_err(|e| format!("--rate: {e}"))?,
             "--threads" => threads = next()?.parse().map_err(|e| format!("--threads: {e}"))?,
-            "--timeout-ms" => timeout_ms = next()?.parse().map_err(|e| format!("--timeout-ms: {e}"))?,
+            "--timeout-ms" => {
+                timeout_ms = next()?.parse().map_err(|e| format!("--timeout-ms: {e}"))?
+            }
             "--hmac-secret" => secret = next()?,
             "--prefix" => prefix = next()?,
             "--user-id" => user = next()?,
@@ -162,13 +168,22 @@ fn parse_args() -> Result<Args, String> {
         timeout_ms,
         secret,
         prefix,
-        ids: Ids { user, icard, card, domain, tenant },
+        ids: Ids {
+            user,
+            icard,
+            card,
+            domain,
+            tenant,
+        },
         json,
     })
 }
 
 fn now_millis() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_millis()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -231,7 +246,8 @@ impl Png {
 
 struct Stats {
     ok: AtomicU64,
-    err: AtomicU64,
+    http_fail: AtomicU64,
+    transport_err: AtomicU64,
     codes: [AtomicU64; 600],
     lat_us: Mutex<Vec<u64>>,
 }
@@ -240,21 +256,26 @@ impl Stats {
     fn new() -> Self {
         Self {
             ok: AtomicU64::new(0),
-            err: AtomicU64::new(0),
+            http_fail: AtomicU64::new(0),
+            transport_err: AtomicU64::new(0),
             codes: std::array::from_fn(|_| AtomicU64::new(0)),
             lat_us: Mutex::new(Vec::new()),
         }
     }
 
-    fn record_ok(&self, code: u16, us: u64) {
+    fn record_http(&self, code: u16, us: u64) {
         self.lat_us.lock().unwrap().push(us);
         self.codes[(code as usize).min(599)].fetch_add(1, Ordering::Relaxed);
-        self.ok.fetch_add(1, Ordering::Relaxed);
+        if (200..300).contains(&code) {
+            self.ok.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.http_fail.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    fn record_err(&self, us: u64) {
+    fn record_transport_err(&self, us: u64) {
         self.lat_us.lock().unwrap().push(us);
-        self.err.fetch_add(1, Ordering::Relaxed);
+        self.transport_err.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -274,7 +295,14 @@ async fn one_request(ctx: &Ctx, stats: &Stats) {
     let t0 = Instant::now();
     let path_no_q = ctx.path.split('?').next().unwrap_or(ctx.path.as_str());
     let ts = now_millis().to_string();
-    let sig = sign(&ctx.secret, &ctx.prefix, &ctx.method, path_no_q, &ctx.ids, &ts);
+    let sig = sign(
+        &ctx.secret,
+        &ctx.prefix,
+        &ctx.method,
+        path_no_q,
+        &ctx.ids,
+        &ts,
+    );
     let req_id = {
         let mut p = ctx.png.lock().unwrap();
         p.uuid_v4_like()
@@ -305,11 +333,11 @@ async fn one_request(ctx: &Ctx, stats: &Stats) {
         Ok(resp) => {
             let code = resp.status().as_u16();
             match resp.bytes().await {
-                Ok(_) => stats.record_ok(code, t0.elapsed().as_micros() as u64),
-                Err(_) => stats.record_err(t0.elapsed().as_micros() as u64),
+                Ok(_) => stats.record_http(code, t0.elapsed().as_micros() as u64),
+                Err(_) => stats.record_transport_err(t0.elapsed().as_micros() as u64),
             }
         }
-        Err(_) => stats.record_err(t0.elapsed().as_micros() as u64),
+        Err(_) => stats.record_transport_err(t0.elapsed().as_micros() as u64),
     }
 }
 
@@ -356,12 +384,7 @@ async fn run_count(ctx: Arc<Ctx>, stats: Arc<Stats>, concurrency: usize, total: 
 }
 
 /// open-loop：固定速率 pacing，每 tick 派发一个请求，in-flight 不反压闭环。
-async fn run_open_loop(
-    ctx: Arc<Ctx>,
-    stats: Arc<Stats>,
-    rate: f64,
-    deadline: Instant,
-) {
+async fn run_open_loop(ctx: Arc<Ctx>, stats: Arc<Stats>, rate: f64, deadline: Instant) {
     let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / rate));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut handles = Vec::new();
@@ -388,9 +411,15 @@ fn report(args: &Args, wall: Duration, stats: &Stats) {
     let mut lat = stats.lat_us.lock().unwrap().clone();
     lat.sort_unstable();
     let ok = stats.ok.load(Ordering::Relaxed);
-    let err = stats.err.load(Ordering::Relaxed);
+    let http_fail = stats.http_fail.load(Ordering::Relaxed);
+    let transport_err = stats.transport_err.load(Ordering::Relaxed);
+    let failures = http_fail + transport_err;
     let qps = ok as f64 / wall.as_secs_f64().max(1e-9);
-    let mean = if lat.is_empty() { 0 } else { lat.iter().sum::<u64>() / lat.len() as u64 };
+    let mean = if lat.is_empty() {
+        0
+    } else {
+        lat.iter().sum::<u64>() / lat.len() as u64
+    };
     let p50 = percentile(&lat, 50.0);
     let p90 = percentile(&lat, 90.0);
     let p99 = percentile(&lat, 99.0);
@@ -409,15 +438,15 @@ fn report(args: &Args, wall: Duration, stats: &Stats) {
 
     if args.json {
         println!(
-            "{{\"concurrency\":{},\"rate\":{},\"duration_s\":{:.3},\"ok\":{},\"err\":{},\"qps\":{:.1},\
+            "{{\"concurrency\":{},\"rate\":{},\"duration_s\":{:.3},\"ok\":{},\"http_fail\":{},\"transport_err\":{},\"failures\":{},\"qps\":{:.1},\
              \"mean_us\":{},\"p50_us\":{},\"p90_us\":{},\"p99_us\":{},\"p999_us\":{},\"max_us\":{},\"codes\":{{{}}}}}",
-            args.concurrency, args.rate, wall.as_secs_f64(), ok, err, qps,
+            args.concurrency, args.rate, wall.as_secs_f64(), ok, http_fail, transport_err, failures, qps,
             mean, p50, p90, p99, p999, max, codes
         );
     } else {
         println!(
-            "并发={} rate={} 墙钟={:.2}s | ok={} err={} QPS={:.1}\n延迟(µs): mean={} p50={} p90={} p99={} p999={} max={}\n状态码: {}",
-            args.concurrency, args.rate, wall.as_secs_f64(), ok, err, qps,
+            "并发={} rate={} 墙钟={:.2}s | ok={} http_fail={} transport_err={} failures={} QPS={:.1}\n延迟(µs): mean={} p50={} p90={} p99={} p999={} max={}\n状态码: {}",
+            args.concurrency, args.rate, wall.as_secs_f64(), ok, http_fail, transport_err, failures, qps,
             mean, p50, p90, p99, p999, max,
             if codes.is_empty() { "-" } else { &codes }
         );
@@ -433,7 +462,9 @@ fn main() {
         }
     };
     let threads = if args.threads == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
     } else {
         args.threads
     };
@@ -462,16 +493,26 @@ async fn run(args: Args) {
         secret: args.secret.clone(),
         prefix: args.prefix.clone(),
         ids: args.ids.clone(),
-        png: Mutex::new(Png(
-            (now_millis() as u64) ^ 0x9E3779B97F4A7C15 ^ (args.concurrency << 1 | 1),
-        )),
+        png: Mutex::new(Png((now_millis() as u64)
+            ^ 0x9E3779B97F4A7C15
+            ^ (args.concurrency << 1 | 1))),
     });
 
     if args.warmup > 0 {
         let t0 = Instant::now();
         let stats = Arc::new(Stats::new());
-        run_count(ctx.clone(), stats, (args.concurrency as usize).min(64), args.warmup).await;
-        eprintln!("预热 {} 请求完成，用时 {:.2}s", args.warmup, t0.elapsed().as_secs_f64());
+        run_count(
+            ctx.clone(),
+            stats,
+            (args.concurrency as usize).min(64),
+            args.warmup,
+        )
+        .await;
+        eprintln!(
+            "预热 {} 请求完成，用时 {:.2}s",
+            args.warmup,
+            t0.elapsed().as_secs_f64()
+        );
     }
 
     let stats = Arc::new(Stats::new());
@@ -503,4 +544,25 @@ async fn run(args: Args) {
     }
     let wall = t0.elapsed();
     report(&args, wall, &stats);
+    let failed = stats.http_fail.load(Ordering::Relaxed) > 0
+        || stats.transport_err.load(Ordering::Relaxed) > 0;
+    if failed {
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn counts_transport_http_and_2xx_separately() {
+        let stats = Stats::new();
+        stats.record_http(200, 100);
+        stats.record_http(503, 200);
+        stats.record_transport_err(300);
+        assert_eq!(stats.ok.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.http_fail.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.transport_err.load(Ordering::Relaxed), 1);
+    }
 }

@@ -145,17 +145,12 @@ async fn delete_exam(
 }
 
 async fn submit_exam(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Json(req): Json<serde_json::Value>,
+    State(_state): State<AppState>,
+    Path(_id): Path<i64>,
+    Json(_req): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    let score: i32 = req.get("score").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let user_id: i64 = req.get("user_id").and_then(|v| v.as_i64()).unwrap_or(0);
-    let outcome = state.exam_service.submit_exam(id, user_id, score).await?;
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "examId": outcome.exam_id,
-        "userId": outcome.user_id,
-        "score": outcome.score,
-        "passed": outcome.passed,
-    }))))
+    Err(astral_types::AstralError::NotImplemented(
+        "Exam submissions require a durable server-scored result model".into(),
+    )
+    .into())
 }

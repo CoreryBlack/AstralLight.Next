@@ -18,9 +18,7 @@ use crate::auth::{
     LoginResponse, PasswordVerifyResult, SessionContext, SessionGrant, TokenClaimsExtra,
 };
 use crate::srv::auth_repository::AuthRepository;
-use crate::srv::session::{
-    create_token_family_with_expiry, revoke_all_sessions_for_user, store_session_grant_projection,
-};
+use crate::srv::session::{project_password_revocation, store_session_grant_projection};
 use crate::AppState;
 
 // ===== 请求 DTO（对应 Java LoginRequest/RegisterRequest） =====
@@ -47,6 +45,10 @@ pub struct LoginRequest {
     pub channel_code: Option<String>,
     pub access_token: Option<String>,
     pub email_verified: Option<bool>,
+
+    /// Optional second factor for accounts with MFA enabled; accepted values are a TOTP or one recovery code.
+    pub mfa_code: Option<String>,
+    pub mfa_method: Option<String>,
 
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
@@ -185,22 +187,10 @@ impl AuthService {
             .password
             .as_deref()
             .ok_or_else(|| AstralError::Validation("password required for local login".into()))?;
-        match verify_password(password, agg.password_hash.as_str())? {
-            PasswordVerifyResult::Match => {}
-            PasswordVerifyResult::Migrated(new_hash) => {
-                if let Err(e) = self
-                    .repository
-                    .update_password_hash(agg.user_id, &new_hash)
-                    .await
-                {
-                    tracing::warn!(error = %e, "password migration failed");
-                }
-            }
-        }
-
-        if let Err(e) = self.repository.update_last_login_at(agg.user_id).await {
-            tracing::warn!(error = %e, "update last_login_at failed, non-blocking");
-        }
+        let migrated_password_hash = match verify_password(password, agg.password_hash.as_str())? {
+            PasswordVerifyResult::Match => None,
+            PasswordVerifyResult::Migrated(new_hash) => Some(new_hash),
+        };
 
         let cards = self.repository.find_login_cards(agg.user_id).await?;
         let cards_json: Vec<serde_json::Value> = cards.iter().map(login_card_to_json).collect();
@@ -292,17 +282,39 @@ impl AuthService {
         let refresh_lifetime = state.config.jwt.refresh.expiry_seconds;
         let refresh_expiry = utc_db_datetime_after(refresh_lifetime);
         let family_key = uuid::Uuid::new_v4().to_string();
-        let family_id =
-            create_token_family_with_expiry(&state.db, &family_key, agg.user_id, refresh_expiry)
-                .await?;
 
         let session_card_id = jwt_card_id;
         let placeholder_hash = sha256_hash(&format!("pending:{}", uuid::Uuid::new_v4()));
-        let session_id = self
+        // Reserve evidence even for a missing/unsupported factor response, so
+        // password-only attempts cannot probe whether MFA is required for free.
+        let mfa_attempt_code = Some(uuid::Uuid::new_v4().to_string());
+        let method = req.mfa_method.as_deref().unwrap_or("UNKNOWN");
+        astral_db::reserve_mfa_attempt(
+            &state.db,
+            agg.user_id,
+            mfa_attempt_code
+                .as_deref()
+                .expect("attempt code was just created"),
+            method,
+            req.client_ip.as_deref(),
+            req.user_agent.as_deref(),
+        )
+        .await
+        .map_err(|error| {
+            AstralError::Database(format!("Reserve MFA login attempt failed: {error}"))
+        })?;
+        let created_session = self
             .repository
-            .insert_login_session(crate::srv::auth_repository::NewLoginSession {
-                family_id,
+            .create_login_family_and_session(crate::srv::auth_repository::AtomicLoginSession {
+                family_key,
                 user_id: agg.user_id,
+                expected_password_hash: agg.password_hash.clone(),
+                credential_version: agg.credential_version,
+                migrated_password_hash,
+                identity_card_id,
+                mfa_attempt_code: mfa_attempt_code.clone(),
+                mfa_method: Some(method.to_string()),
+                mfa_code: req.mfa_code.clone(),
                 device_id: req.device_id.clone().unwrap_or_else(|| "unknown".into()),
                 device_type: Some("UNKNOWN".into()),
                 client_app_id: req.client_app_id.clone().or_else(|| req.client_id.clone()),
@@ -311,7 +323,11 @@ impl AuthService {
                 refresh_hash: placeholder_hash.clone(),
                 refresh_expiry,
             })
-            .await?;
+            .await;
+        let (family_id, session_id) = created_session.map_err(AppError::from)?;
+        if let Err(error) = self.repository.update_last_login_at(agg.user_id).await {
+            tracing::warn!(user_id = %agg.user_id, error = %error, "update last_login_at failed, non-blocking");
+        }
 
         // 权限/角色/租户状态（对齐 Java TokenServiceImpl 签发时刻实时求值）：
         // - permissions 来自投影快照（find_effective_permissions_cached，投影未 READY
@@ -713,11 +729,21 @@ impl AuthService {
         verify_password(&req.old_password, &credential.password_hash).map_err(AppError::from)?;
 
         let new_hash = hash_password(&req.new_password).map_err(AppError::from)?;
-        revoke_all_sessions_for_user(state, user_id, "PASSWORD_CHANGED")
+        let revoked_jtis = self
+            .repository
+            .update_password_hash_if_current(
+                user_id,
+                &credential.password_hash,
+                credential.credential_version,
+                &new_hash,
+            )
             .await
             .map_err(AppError::from)?;
-        self.repository
-            .update_password_hash(user_id, &new_hash)
+        #[cfg(feature = "redis-compat")]
+        let redis = state.redis.as_ref();
+        #[cfg(not(feature = "redis-compat"))]
+        let redis: Option<&()> = None;
+        project_password_revocation(state, &revoked_jtis, redis)
             .await
             .map_err(AppError::from)?;
 

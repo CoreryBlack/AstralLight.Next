@@ -171,9 +171,15 @@ async fn verify_code(
     }
 
     // 验证成功后标记为已验证（一次性消费）
-    mark_verification_code_verified(&state.db, row.id)
-        .await
-        .map_err(db_err)?;
+    let consumed =
+        mark_verification_code_verified(&state.db, row.id, &req.target, &req.purpose, &req.code)
+            .await
+            .map_err(db_err)?;
+    if !consumed {
+        return Err(AppError::from(AstralError::Auth(
+            "Verification code was already consumed or expired".into(),
+        )));
+    }
 
     tracing::info!(
         target = %req.target,

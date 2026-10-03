@@ -790,6 +790,11 @@ pub async fn start_cross_city_runtime(
     };
 
     // ── One-shot durable startup admission (fail-closed, no side effects) ──
+    astral_db::validate_cross_city_runtime_schema(&pool)
+        .await
+        .map_err(|_| {
+            CrossCityRuntimeStartError::ConfigRefused("runtime_schema_contract_invalid")
+        })?;
     let node_keys = load_cross_city_node_key_snapshot(&pool).await?;
     if node_keys.usable_count() == 0 {
         return Err(CrossCityRuntimeStartError::ConfigRefused(

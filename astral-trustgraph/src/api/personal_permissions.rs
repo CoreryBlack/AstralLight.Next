@@ -574,6 +574,26 @@ mod tests {
             Ok(false)
         }
 
+        async fn bind_card_async_batch_item(
+            &self,
+            _card_id: i64,
+            _user_id: i64,
+            _actor_id: i64,
+            _actor_card_id: i64,
+            _actor_tenant_id: i64,
+            _actor_domain_id: i64,
+            _task_id: &str,
+            _operation_id: &str,
+            _expected_tenant_id: i64,
+            _expected_domain_id: i64,
+        ) -> Result<bool, AstralError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("bind_card_async_batch_item".into());
+            Ok(false)
+        }
+
         async fn find_conflicts(
             &self,
             _filter: &UserCardFilter,

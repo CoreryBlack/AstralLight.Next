@@ -426,6 +426,43 @@ pub struct ArchiveShutdownReport {
     pub join_elapsed: Duration,
 }
 
+/// Retains the join if shutdown is cancelled while waiting. Drop cancels and
+/// aborts the worker, then keeps ownership while a reaper awaits task completion.
+struct ArchiveWorkerShutdownGuard {
+    cancellation: ArchiveCancellationToken,
+    join: Option<JoinHandle<Result<ArchiveRunSummary, tokio::task::JoinError>>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl ArchiveWorkerShutdownGuard {
+    fn join_mut(&mut self) -> &mut JoinHandle<Result<ArchiveRunSummary, tokio::task::JoinError>> {
+        self.join
+            .as_mut()
+            .expect("shutdown guard retains the join until completion")
+    }
+
+    fn release_join(&mut self) {
+        self.join.take();
+    }
+}
+
+impl Drop for ArchiveWorkerShutdownGuard {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(join) = self.join.take() {
+            join.abort();
+            self.runtime.spawn(async move {
+                if tokio::time::timeout(Duration::from_secs(1), join)
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("authorization archive worker abort remains unproven");
+                }
+            });
+        }
+    }
+}
+
 /// Cancel the worker and await termination within a bounded timeout.
 ///
 /// `Err(summary)` forms cover: worker panic/join failure, propagated worker
@@ -435,18 +472,39 @@ pub async fn shutdown_authorization_archive_worker(
     handle: AuthorizationArchiveWorkerHandle,
     timeout: Duration,
 ) -> ArchiveShutdownReport {
+    let mut ownership = ArchiveWorkerShutdownGuard {
+        cancellation: handle.cancellation.clone(),
+        join: Some(handle.join),
+        runtime: tokio::runtime::Handle::current(),
+    };
     handle.cancellation.cancel();
     let started = Instant::now();
-    let summary = match tokio::time::timeout(timeout, handle.join).await {
-        Ok(joined) => match joined {
-            Ok(Ok(summary)) => Ok(summary),
-            Ok(Err(join_error)) => Err(format!("worker task failed: {join_error}")),
-            Err(_) => Err("shutdown summary unavailable".to_owned()),
-        },
-        Err(_) => Err(format!(
-            "archive worker did not stop within {timeout:?}; possibly wedged \
-             inside an archive transaction"
-        )),
+    let summary = match tokio::time::timeout(timeout, ownership.join_mut()).await {
+        Ok(Ok(Ok(summary))) => {
+            ownership.release_join();
+            Ok(summary)
+        }
+        Ok(Ok(Err(join_error))) => {
+            ownership.release_join();
+            Err(format!("worker task failed: {join_error}"))
+        }
+        Ok(Err(_)) => {
+            ownership.release_join();
+            Err("shutdown summary unavailable".to_owned())
+        }
+        Err(_) => {
+            ownership.join_mut().abort();
+            if tokio::time::timeout(Duration::from_secs(1), ownership.join_mut())
+                .await
+                .is_ok()
+            {
+                ownership.release_join();
+            }
+            Err(format!(
+                "archive worker did not stop within {timeout:?}; aborted; possibly wedged \
+                 inside an archive transaction"
+            ))
+        }
     };
     tracing::info!(
         run_id = %handle.run_id,
@@ -2471,6 +2529,93 @@ mod tests {
             shutdown_authorization_archive_worker(handle, Duration::from_millis(120)).await;
         assert!(report.summary.is_err(), "stuck worker must surface as Err");
         assert!(report.join_elapsed < Duration::from_secs(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_shutdown_future_aborts_and_reaps_worker() {
+        struct DroppedSignal(Arc<AtomicBool>);
+        impl Drop for DroppedSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        struct StickyRuntime {
+            entered: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl AuthorizationArchiveRuntime for StickyRuntime {
+            async fn claim_next_intent(
+                &self,
+                _tenant_id: i64,
+                _owner: &str,
+                _lease_seconds: i64,
+            ) -> Result<Option<AuthorizationArchiveIntentClaim>, ArchiveAccessError> {
+                let _dropped = DroppedSignal(Arc::clone(&self.dropped));
+                self.entered.store(true, Ordering::Release);
+                std::future::pending::<()>().await;
+                unreachable!("pending future never resolves")
+            }
+            async fn archive_claimed_intent(
+                &self,
+                _: &AuthorizationArchiveIntentClaim,
+            ) -> Result<ArchiveOutcome, ArchiveAttemptFailure> {
+                unreachable!()
+            }
+            async fn fail_intent(&self, _: &ArchiveLeaseProof, _: i64, _: &str) {}
+            async fn quarantine_intent(
+                &self,
+                _: &ArchiveLeaseProof,
+                _: &str,
+                _: &str,
+            ) -> Result<(), ArchiveAccessError> {
+                unreachable!()
+            }
+        }
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let handle = start_authorization_archive_worker_with_runtime(
+            Arc::new(StickyRuntime {
+                entered: Arc::clone(&entered),
+                dropped: Arc::clone(&dropped),
+            }),
+            AuthorizationArchiveConfig {
+                tenants: vec![1],
+                poll_interval_secs: 60,
+                ..Default::default()
+            },
+        )
+        .expect("valid config must start");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "worker never reached claim");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let shutdown_cancellation = handle.cancellation.clone();
+        let shutdown = tokio::spawn(shutdown_authorization_archive_worker(
+            handle,
+            Duration::from_secs(30),
+        ));
+        while !shutdown_cancellation.is_cancelled() {
+            assert!(
+                Instant::now() < deadline,
+                "shutdown did not acquire ownership"
+            );
+            tokio::task::yield_now().await;
+        }
+        shutdown.abort();
+        let _ = shutdown.await;
+
+        while !dropped.load(Ordering::Acquire) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "worker must be aborted on drop"
+        );
     }
 
     #[tokio::test]

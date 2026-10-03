@@ -65,9 +65,24 @@ pub trait ConversationRepository: Send + Sync {
             "physical chat scope required".into(),
         ))
     }
+    /// Atomically creates a conversation and its first member.
+    async fn create_conversation_with_creator_scoped(
+        &self,
+        scope: &ChatScope,
+        name: &str,
+        conversation_type: &str,
+    ) -> Result<i64, AstralError> {
+        let _ = (scope, name, conversation_type);
+        Err(AstralError::Permission(
+            "scoped atomic creation required".into(),
+        ))
+    }
     /// 创建会话（会话无 owner/avatar/max_members），返回新 id
-    async fn create_conversation(&self, name: &str, conversation_type: &str)
-        -> Result<i64, AstralError>;
+    async fn create_conversation(
+        &self,
+        name: &str,
+        conversation_type: &str,
+    ) -> Result<i64, AstralError>;
     /// 创建群组（GROUP 类型 + owner + avatar + max_members），返回新 id
     async fn create_group(
         &self,
@@ -235,7 +250,8 @@ impl SqlxConversationRepository {
     }
 }
 
-const CONVERSATION_SELECT: &str = "SELECT id, name, conversation_type AS conversation_type, owner_id, \
+const CONVERSATION_SELECT: &str =
+    "SELECT id, name, conversation_type AS conversation_type, owner_id, \
      avatar AS avatar, max_members, status, created_at FROM chat_conversation";
 
 #[async_trait]
@@ -258,6 +274,35 @@ impl ConversationRepository for SqlxConversationRepository {
         Ok(result.last_insert_id() as i64)
     }
 
+    async fn create_conversation_with_creator_scoped(
+        &self,
+        scope: &ChatScope,
+        name: &str,
+        conversation_type: &str,
+    ) -> Result<i64, AstralError> {
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let result = sqlx::query(
+            "INSERT INTO chat_conversation (name, conversation_type, domain_id) VALUES (?, ?, ?)",
+        )
+        .bind(name)
+        .bind(conversation_type)
+        .bind(scope.user_card_domain_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let conversation_id = result.last_insert_id() as i64;
+        sqlx::query(
+            "INSERT INTO chat_conversation_member (conversation_id, user_id, role) VALUES (?, ?, 'MEMBER')",
+        )
+        .bind(conversation_id)
+        .bind(scope.user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(conversation_id)
+    }
+
     async fn create_group_scoped(
         &self,
         scope: &ChatScope,
@@ -266,6 +311,7 @@ impl ConversationRepository for SqlxConversationRepository {
         avatar: Option<&str>,
         max_members: i64,
     ) -> Result<i64, AstralError> {
+        let mut tx = self.db.begin().await.map_err(db_error)?;
         let result = sqlx::query(
             "INSERT INTO chat_conversation (name, conversation_type, owner_id, avatar, max_members, status, domain_id) \
              VALUES (?, 'GROUP', ?, ?, ?, 'ACTIVE', ?)",
@@ -275,10 +321,20 @@ impl ConversationRepository for SqlxConversationRepository {
         .bind(avatar)
         .bind(max_members)
         .bind(scope.user_card_domain_id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
-        Ok(result.last_insert_id() as i64)
+        let conversation_id = result.last_insert_id() as i64;
+        sqlx::query(
+            "INSERT INTO chat_conversation_member (conversation_id, user_id, role) VALUES (?, ?, 'OWNER')",
+        )
+        .bind(conversation_id)
+        .bind(owner_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(conversation_id)
     }
 
     async fn get_conversation_scoped(

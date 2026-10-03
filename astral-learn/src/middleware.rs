@@ -8,7 +8,9 @@ use axum::response::{IntoResponse, Response};
 use astral_common::middleware::permission_check_shared::{
     physical_policy_context, resolve_permission_action, PathResourceMap,
 };
-use astral_db::{check_sod_conflict, resolve_resource_ownership, SqlxRuleRepository};
+use astral_db::{check_sod_conflict_with_context, SqlxRuleRepository};
+
+use crate::ownership::resolve_learn_resource_ownership;
 
 use crate::AppState;
 
@@ -104,6 +106,7 @@ fn parse_target_id(query: Option<&str>) -> Option<i64> {
     })
 }
 
+#[allow(clippy::result_large_err)]
 async fn check_learn_permission(
     state: &AppState,
     uri: &axum::http::Uri,
@@ -113,12 +116,6 @@ async fn check_learn_permission(
     service: &'static str,
 ) -> Result<(), Response> {
     let path = uri.path();
-    let principal_kind = headers
-        .get("x-principal-kind")
-        .and_then(|value| value.to_str().ok());
-    if service == "learn-app-users" && principal_kind == Some("APP_USER") {
-        return Ok(());
-    }
     let Some((resource, action)) =
         resource_action(path, method, path_map).map_err(IntoResponse::into_response)?
     else {
@@ -127,17 +124,71 @@ async fn check_learn_permission(
     let target_id = parse_target_id(uri.query());
     let mut ctx = physical_policy_context(headers, resource, action, target_id)
         .map_err(|status| status.into_response())?;
-    let resolution = resolve_resource_ownership(
-        &state.db,
+    // Capture the original shared authority fence before the row read. The
+    // Learn row locks below protect the inspected metadata; the unchanged fence
+    // check after PolicyEngine and SoD rejects concurrent registered source writes.
+    let hub = astral_db::memory_projection_hub();
+    let authority_fence = if let Some(hub) = hub {
+        let fence = hub.capture_authority_fence().ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Learn source state is changing",
+            )
+                .into_response()
+        })?;
+        Some((hub, fence))
+    } else {
+        None
+    };
+    // The ownership query runs in this transaction and its FOR SHARE locks stay
+    // held through PolicyEngine and SoD. The captured source fence is checked
+    // before releasing the locks, rejecting registered source-writer races.
+    let mut ownership_tx = state.db.begin().await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Learn ownership read unavailable",
+        )
+            .into_response()
+    })?;
+    let resolution = resolve_learn_resource_ownership(
+        &mut ownership_tx,
         resource,
         path,
         method,
         target_id,
-        ctx.card_id,
         ctx.user_id,
     )
     .await;
     resolution.apply_to(&mut ctx);
+    if matches!(
+        &resolution,
+        astral_db::ResourceOwnershipResolution::Unresolved { .. }
+            | astral_db::ResourceOwnershipResolution::Unavailable { .. }
+    ) {
+        tracing::warn!(
+            service,
+            resource,
+            path,
+            ownership = resolution.code(),
+            "Learn target ownership unresolved; denying before policy evaluation"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Learn resource ownership is unresolved",
+        )
+            .into_response());
+    }
+    if !matches!(
+        &resolution,
+        astral_db::ResourceOwnershipResolution::TenantScoped { .. }
+            | astral_db::ResourceOwnershipResolution::Global { .. }
+    ) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Learn ownership contract unavailable",
+        )
+            .into_response());
+    }
     let user_id = ctx.user_id;
     let card_id = ctx.card_id;
     let tenant_id = ctx.tenant_id;
@@ -157,7 +208,7 @@ async fn check_learn_permission(
         let pool = state.db.clone();
         let hit_phase =
             policy_engine::PolicyEngine::allow_source_phase(&decision).map(String::from);
-        tokio::spawn(async move {
+        if let Err(reason) = astral_common::audit::spawn_owned_audit(async move {
             astral_common::audit::record_permission_audit(
                 user_id,
                 card_id,
@@ -182,7 +233,9 @@ async fn check_learn_permission(
                     .await;
                 }
             }
-        });
+        }) {
+            tracing::error!(reason, "owned Learn permission audit admission refused");
+        }
     }
 
     if !decision.allowed {
@@ -197,16 +250,7 @@ async fn check_learn_permission(
             .into_response());
     }
     if let Some(so_card_id) = card_id {
-        match check_sod_conflict(
-            &state.db,
-            so_card_id,
-            user_id,
-            resource,
-            action,
-            resource_owner_id,
-        )
-        .await
-        {
+        match check_sod_conflict_with_context(&state.db, &ctx, resource_owner_id).await {
             Ok(result) if result.has_conflict => {
                 return Err((
                     StatusCode::FORBIDDEN,
@@ -230,9 +274,26 @@ async fn check_learn_permission(
             }
         }
     }
+    ownership_tx.commit().await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Learn ownership read transaction failed",
+        )
+            .into_response()
+    })?;
+    if let Some((hub, fence)) = authority_fence {
+        if !hub.authority_fence_matches(fence) {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Learn source state changed during authorization",
+            )
+                .into_response());
+        }
+    }
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 pub async fn learn_permission_middleware(
     State(state): State<AppState>,
     req: Request,
@@ -250,6 +311,7 @@ pub async fn learn_permission_middleware(
     Ok(next.run(req).await)
 }
 
+#[allow(clippy::result_large_err)]
 pub async fn learn_app_permission_middleware(
     State(state): State<AppState>,
     req: Request,
@@ -267,6 +329,7 @@ pub async fn learn_app_permission_middleware(
     Ok(next.run(req).await)
 }
 
+#[allow(clippy::result_large_err)]
 pub async fn learn_app_user_permission_middleware(
     State(state): State<AppState>,
     req: Request,

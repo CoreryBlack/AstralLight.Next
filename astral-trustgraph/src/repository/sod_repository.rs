@@ -30,6 +30,7 @@ use astral_db::{
     cached_load_published_card_grant_evidence, sod_load_card_tenant, sod_partner_matches_grant,
     sod_resource_type_from_scoped_key, AuthorizationEvidenceError,
 };
+use astral_db::{validate_dynamic_sod_condition_script, MAX_DYNAMIC_CONDITION_SCRIPT_BYTES};
 use astral_types::{
     AstralError, DomainScopeRequirement, PublishedCardAuthorization, PublishedCardEvidenceScope,
 };
@@ -142,6 +143,42 @@ pub struct SqlxSodRepository {
 /// 并发 source 状态放行；Drop 统一失效正向读缓存并再次推进 revision。
 fn begin_sod_policy_source_write() -> Result<Option<SourceTransactionGuard>, AstralError> {
     astral_db::memory_projection_hub::acquire_source_guard()
+}
+
+/// Validate persisted SoD source rows at the repository boundary as well as the
+/// HTTP adapter. No raw writer may bypass the exact dynamic expression grammar.
+fn validate_sod_policy_source(policy: &SodPolicyRecord) -> Result<(), AstralError> {
+    if policy.policy_name.trim().is_empty() {
+        return Err(AstralError::Validation("policy_name is required".into()));
+    }
+    match policy.conflict_type.as_str() {
+        "STATIC" => {
+            if policy.permission_a.as_deref().is_none_or(str::is_empty)
+                || policy.permission_b.as_deref().is_none_or(str::is_empty)
+            {
+                return Err(AstralError::Validation(
+                    "STATIC SoD policies require permission_a and permission_b".into(),
+                ));
+            }
+        }
+        "DYNAMIC" => {
+            let script = policy.condition_script.as_deref().ok_or_else(|| {
+                AstralError::Validation("DYNAMIC SoD policies require condition_script".into())
+            })?;
+            if script.len() > MAX_DYNAMIC_CONDITION_SCRIPT_BYTES {
+                return Err(AstralError::Validation(
+                    "condition_script exceeds configured size limit".into(),
+                ));
+            }
+            validate_dynamic_sod_condition_script(script)?;
+        }
+        _ => {
+            return Err(AstralError::Validation(
+                "conflict_type must be STATIC or DYNAMIC".into(),
+            ))
+        }
+    }
+    Ok(())
 }
 
 /// 单条 autocommit source 语句的围栏执行（与 Identity/card 写点同一合同）：
@@ -259,6 +296,7 @@ impl SodRepository for SqlxSodRepository {
     }
 
     async fn create_policy(&self, policy: &SodPolicyRecord) -> Result<i64, AstralError> {
+        validate_sod_policy_source(policy)?;
         // source writer 栅栏在 autocommit 语句之前取得（见
         // begin_sod_policy_source_write：writer-active 期间读面 fail-closed）。
         let guard = begin_sod_policy_source_write()?;
@@ -297,6 +335,7 @@ impl SodRepository for SqlxSodRepository {
         policy_id: i64,
         policy: &SodPolicyRecord,
     ) -> Result<(), AstralError> {
+        validate_sod_policy_source(policy)?;
         // source writer 栅栏（同 create_policy）。
         let guard = begin_sod_policy_source_write()?;
         fenced_sod_policy_write(
@@ -685,6 +724,27 @@ mod tests {
     /// 拒写），再进入 fenced write（await 前武装，Ok → proven；Err → sticky
     /// uncertain；取消 Drop → unknown），最后 evict 进程缓存。写点不得以
     /// "无栅栏 no-op"静默降级。
+    #[test]
+    fn dynamic_policy_source_write_rejects_unrecognized_operator() {
+        let policy = SodPolicyRecord {
+            policy_id: None,
+            policy_name: "owner self approve".into(),
+            description: None,
+            conflict_type: "DYNAMIC".into(),
+            resource_type: Some("approval".into()),
+            action_code: Some("approve".into()),
+            permission_a: None,
+            permission_b: None,
+            condition_script: Some("resourceOwnerId != currentUserId".into()),
+            status: "ACTIVE".into(),
+            limit_count: None,
+            limit_window: None,
+            created_at: None,
+            updated_at: None,
+        };
+        assert!(validate_sod_policy_source(&policy).is_err());
+    }
+
     #[test]
     fn sod_policy_mutations_hold_the_source_writer_fence() {
         let source = include_str!("sod_repository.rs");

@@ -18,7 +18,8 @@
 use async_trait::async_trait;
 use sqlx::{MySqlPool, QueryBuilder};
 
-use astral_types::AstralError;
+use astral_db::grant_ledger::validated_request_operation_id;
+use astral_types::{AstralError, PolicyContext};
 
 use crate::repository::authorization_source_transaction::{
     append_eligibility_projection_with_invalidation_in_tx, AuthorizationSourceTransaction,
@@ -136,6 +137,150 @@ pub struct NewTenant {
     pub depth: i32,
 }
 
+/// Gateway-verified identity and scope carried into one TrustGraph tenant mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantMutationContext {
+    actor_id: i64,
+    actor_card_id: i64,
+    actor_tenant_id: i64,
+    actor_domain_id: i64,
+    request_id: String,
+}
+
+impl TenantMutationContext {
+    /// Create only from the verified PolicyContext installed by TrustGraph permission middleware.
+    /// Gateway headers alone are not an authority source and must match this signed context.
+    pub(crate) fn from_policy_context(
+        context: &PolicyContext,
+        request_id: Option<&str>,
+    ) -> Result<Self, AstralError> {
+        if context.principal_kind.as_deref() != Some("PLATFORM_USER") {
+            return Err(AstralError::Auth(
+                "tenant mutation requires a Gateway-verified platform user context".into(),
+            ));
+        }
+        let actor_id = positive_context_id(context.user_id, "user_id")?;
+        let actor_card_id = positive_context_id(context.card_id, "card_id")?;
+        let actor_tenant_id = positive_context_id(context.tenant_id, "tenant_id")?;
+        let actor_domain_id = positive_context_id(context.domain_id, "domain_id")?;
+        let request_id = validated_request_operation_id(request_id)?.ok_or_else(|| {
+            AstralError::Auth("tenant mutation requires a canonical request id".into())
+        })?;
+        Ok(Self {
+            actor_id,
+            actor_card_id,
+            actor_tenant_id,
+            actor_domain_id,
+            request_id,
+        })
+    }
+
+    fn request_id(&self) -> &str {
+        &self.request_id
+    }
+}
+
+fn positive_context_id(value: Option<i64>, name: &str) -> Result<i64, AstralError> {
+    value
+        .filter(|value| *value > 0)
+        .ok_or_else(|| AstralError::Auth(format!("tenant mutation requires a positive {name}")))
+}
+
+fn tenant_context_required() -> AstralError {
+    AstralError::Auth("tenant business mutation requires Gateway-verified user-card context".into())
+}
+
+type TenantActorCardRow = (Option<i64>, Option<i64>, Option<i64>, String);
+
+async fn verify_tenant_mutation_actor_in_tx(
+    tx: &mut AuthorizationSourceTransaction,
+    context: &TenantMutationContext,
+) -> Result<(), AstralError> {
+    let actor: Option<TenantActorCardRow> = sqlx::query_as(TENANT_MUTATION_ACTOR_LOCK_SQL)
+        .bind(context.actor_card_id)
+        .fetch_optional(&mut ***tx)
+        .await
+        .map_err(db_error)?;
+    match actor {
+        Some((Some(user_id), Some(tenant_id), Some(domain_id), status))
+            if user_id == context.actor_id
+                && tenant_id == context.actor_tenant_id
+                && domain_id == context.actor_domain_id
+                && status == "ACTIVE" =>
+        {
+            Ok(())
+        }
+        _ => Err(AstralError::Auth(
+            "Gateway tenant mutation card context no longer matches an active user_card".into(),
+        )),
+    }
+}
+
+async fn insert_tenant_mutation_audit_in_tx(
+    tx: &mut AuthorizationSourceTransaction,
+    context: &TenantMutationContext,
+    tenant_id: i64,
+    action: &str,
+    target_type: &str,
+    target_id: i64,
+    details: serde_json::Value,
+) -> Result<(), AstralError> {
+    if tenant_id <= 0 || target_id <= 0 || action.trim().is_empty() || target_type.trim().is_empty()
+    {
+        return Err(AstralError::Validation(
+            "tenant mutation audit requires positive tenant/target and non-empty action/type"
+                .into(),
+        ));
+    }
+    let detail_json = serde_json::to_value(serde_json::json!({
+        "requestId": context.request_id(),
+        "actorCardId": context.actor_card_id,
+        "actorTenantId": context.actor_tenant_id,
+        "actorDomainId": context.actor_domain_id,
+        "targetType": target_type,
+        "targetId": target_id,
+        "operationId": context.request_id(),
+        "mutation": details,
+    }))
+    .map_err(|error| {
+        AstralError::Validation(format!("tenant audit serialization failed: {error}"))
+    })?;
+    let detail = serde_json::to_string(&detail_json).map_err(|error| {
+        AstralError::Validation(format!("tenant audit serialization failed: {error}"))
+    })?;
+    sqlx::query(TENANT_MUTATION_AUDIT_INSERT_SQL)
+        .bind(context.actor_id)
+        .bind(context.actor_card_id)
+        .bind(action)
+        .bind(target_type)
+        .bind(context.request_id())
+        .bind(context.actor_domain_id)
+        .bind(tenant_id)
+        .bind(detail)
+        .execute(&mut ***tx)
+        .await
+        .map_err(|error| {
+            AstralError::Database(format!("tenant mutation audit insert failed: {error}"))
+        })?;
+    Ok(())
+}
+
+async fn lock_existing_tenant_scope_in_tx(
+    tx: &mut AuthorizationSourceTransaction,
+    context: &TenantMutationContext,
+    tenant_id: i64,
+) -> Result<bool, AstralError> {
+    let row: Option<(i64,)> = sqlx::query_as(TENANT_ID_LOCK_SQL)
+        .bind(tenant_id)
+        .fetch_optional(&mut ***tx)
+        .await
+        .map_err(db_error)?;
+    if row.is_some() {
+        verify_tenant_mutation_actor_in_tx(tx, context).await?;
+    }
+    Ok(row.is_some())
+}
+
 /// 新建购买参数（service 完成到期推算）
 #[derive(Debug, Clone)]
 pub struct NewPurchase {
@@ -172,8 +317,13 @@ const AUDIT_LOG_SELECT: &str = "log_id as id, tenant_id, operator_id as actor_id
 
 const TENANT_STATUS_LOCK_SQL: &str = "SELECT status FROM tenant WHERE tenant_id = ? FOR UPDATE";
 const TENANT_ID_LOCK_SQL: &str = "SELECT tenant_id FROM tenant WHERE tenant_id = ? FOR UPDATE";
-const TENANT_DOMAIN_STATUS_LOCK_SQL: &str = "SELECT status FROM tenant_domain_map \
-     WHERE tenant_id = ? AND domain_id = ? FOR UPDATE";
+const DOMAIN_ID_LOCK_SQL: &str =
+    "SELECT domain_id FROM platform_domain WHERE domain_id = ? FOR UPDATE";
+const TENANT_DOMAIN_STATUS_LOCK_SQL: &str =
+    "SELECT status FROM tenant_domain_map WHERE tenant_id = ? AND domain_id = ? FOR UPDATE";
+const TENANT_MUTATION_ACTOR_LOCK_SQL: &str =
+    "SELECT user_id, tenant_id, domain_id, card_status FROM user_card WHERE card_id = ? FOR UPDATE";
+const TENANT_MUTATION_AUDIT_INSERT_SQL: &str = "INSERT INTO audit_log (user_id, card_id, action, resource, decision, reason, event_type, request_id, domain_id, tenant_id, detail) VALUES (?, ?, ?, ?, 'SUCCESS', NULL, 'TRUSTGRAPH_TENANT_MUTATION', ?, ?, ?, ?)";
 /// 硬删除前置守卫：统计仍引用该租户的 user_card 行数（锁定读，参数化 SQL）。
 /// 锁定读在守卫通过后阻止并发为该租户新增 user_card 行，直到事务结束。
 /// 不按 card_status 过滤：任何状态（含 DISABLED/PENDING/INACTIVE）的引用行
@@ -223,21 +373,85 @@ pub trait TenantRepository: Send + Sync {
         tenant_id: i64,
     ) -> Result<Option<(String, i32)>, AstralError>;
     /// 新建租户（INSERT + path 更新在单事务内，修复崩溃中间态）
-    async fn create_tenant(&self, new: &NewTenant) -> Result<i64, AstralError>;
-    async fn update_tenant_name(&self, tenant_id: i64, name: &str) -> Result<(), AstralError>;
-    async fn update_tenant_status(&self, tenant_id: i64, status: &str) -> Result<(), AstralError>;
+    async fn create_tenant(&self, new: &NewTenant) -> Result<i64, AstralError> {
+        let _ = new;
+        Err(tenant_context_required())
+    }
+    async fn create_tenant_with_context(
+        &self,
+        new: &NewTenant,
+        context: &TenantMutationContext,
+    ) -> Result<i64, AstralError> {
+        let _ = (new, context);
+        Err(tenant_context_required())
+    }
+
+    async fn update_tenant_name(&self, tenant_id: i64, name: &str) -> Result<(), AstralError> {
+        let _ = (tenant_id, name);
+        Err(tenant_context_required())
+    }
+    async fn update_tenant_name_with_context(
+        &self,
+        tenant_id: i64,
+        name: &str,
+        context: &TenantMutationContext,
+    ) -> Result<(), AstralError> {
+        let _ = (tenant_id, name, context);
+        Err(tenant_context_required())
+    }
+
+    async fn update_tenant_status(&self, tenant_id: i64, status: &str) -> Result<(), AstralError> {
+        let _ = (tenant_id, status);
+        Err(tenant_context_required())
+    }
+    async fn update_tenant_status_with_context(
+        &self,
+        tenant_id: i64,
+        status: &str,
+        context: &TenantMutationContext,
+    ) -> Result<(), AstralError> {
+        let _ = (tenant_id, status, context);
+        Err(tenant_context_required())
+    }
+
     /// 硬删除租户，返回是否命中。fail-closed：事务内先锁租户行证明存在，
     /// 再以锁定读守卫统计仍引用该租户的 user_card 行；存在引用行时返回
     /// Validation 冲突错误并整体回滚（无部分删除）。完整级联（捕获并持久
     /// 吊销所有受影响的规范授权贡献）不在本仓库范围，须先回收/迁移全部卡片。
-    async fn delete_tenant(&self, tenant_id: i64) -> Result<bool, AstralError>;
+    async fn delete_tenant(&self, tenant_id: i64) -> Result<bool, AstralError> {
+        let _ = tenant_id;
+        Err(tenant_context_required())
+    }
+    async fn delete_tenant_with_context(
+        &self,
+        tenant_id: i64,
+        context: &TenantMutationContext,
+    ) -> Result<bool, AstralError> {
+        let _ = (tenant_id, context);
+        Err(tenant_context_required())
+    }
+
     /// 状态迁移（ACTIVE→SUSPENDED / SUSPENDED→ACTIVE），返回是否命中
     async fn transition_tenant_status(
         &self,
         tenant_id: i64,
         from: &str,
         to: &str,
-    ) -> Result<bool, AstralError>;
+    ) -> Result<bool, AstralError> {
+        let _ = (tenant_id, from, to);
+        Err(tenant_context_required())
+    }
+    async fn transition_tenant_status_with_context(
+        &self,
+        tenant_id: i64,
+        from: &str,
+        to: &str,
+        context: &TenantMutationContext,
+    ) -> Result<bool, AstralError> {
+        let _ = (tenant_id, from, to, context);
+        Err(tenant_context_required())
+    }
+
     async fn list_my_tenants(&self, user_id: i64) -> Result<Vec<TenantRecord>, AstralError>;
     async fn list_sub_tenants(&self, tenant_id: i64) -> Result<Vec<TenantRecord>, AstralError>;
     async fn list_tenant_tree(&self, tenant_id: i64) -> Result<Vec<TenantRecord>, AstralError>;
@@ -320,8 +534,24 @@ pub trait TenantRepository: Send + Sync {
         tenant_id: i64,
     ) -> Result<Vec<TenantDomainMapRecord>, AstralError>;
     /// upsert 域映射（ON DUPLICATE KEY UPDATE）
-    async fn upsert_tenant_domain(&self, tenant_id: i64, domain_id: i64)
-        -> Result<(), AstralError>;
+    async fn upsert_tenant_domain(
+        &self,
+        tenant_id: i64,
+        domain_id: i64,
+    ) -> Result<(), AstralError> {
+        let _ = (tenant_id, domain_id);
+        Err(tenant_context_required())
+    }
+    async fn upsert_tenant_domain_with_context(
+        &self,
+        tenant_id: i64,
+        domain_id: i64,
+        context: &TenantMutationContext,
+    ) -> Result<(), AstralError> {
+        let _ = (tenant_id, domain_id, context);
+        Err(tenant_context_required())
+    }
+
     async fn get_tenant_domain(
         &self,
         tenant_id: i64,
@@ -331,7 +561,19 @@ pub trait TenantRepository: Send + Sync {
         &self,
         tenant_id: i64,
         domain_id: i64,
-    ) -> Result<bool, AstralError>;
+    ) -> Result<bool, AstralError> {
+        let _ = (tenant_id, domain_id);
+        Err(tenant_context_required())
+    }
+    async fn remove_tenant_domain_with_context(
+        &self,
+        tenant_id: i64,
+        domain_id: i64,
+        context: &TenantMutationContext,
+    ) -> Result<bool, AstralError> {
+        let _ = (tenant_id, domain_id, context);
+        Err(tenant_context_required())
+    }
 
     // ---- Audit log ----
     async fn list_audit_log(
@@ -589,15 +831,37 @@ impl TenantRepository for SqlxTenantRepository {
             .map_err(db_error)
     }
 
-    async fn create_tenant(&self, new: &NewTenant) -> Result<i64, AstralError> {
-        // 授权源事务宿主：tenant 行是 owning-binding 存在性 source（user_card
-        // 等授权载体按 tenant_id 绑定，resource/资格 resolver 缓存严格 server
-        // facts，依赖源活动栅栏保证 binding 更新的 epoch complete）。
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+    async fn create_tenant(&self, _new: &NewTenant) -> Result<i64, AstralError> {
+        Err(tenant_context_required())
+    }
 
+    async fn create_tenant_with_context(
+        &self,
+        new: &NewTenant,
+        context: &TenantMutationContext,
+    ) -> Result<i64, AstralError> {
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let actor_tenant_exists: Option<(i64,)> = sqlx::query_as(TENANT_ID_LOCK_SQL)
+            .bind(context.actor_tenant_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(db_error)?;
+        if actor_tenant_exists.is_none() {
+            return Err(tenant_context_required());
+        }
+        verify_tenant_mutation_actor_in_tx(&mut tx, context).await?;
+        if let Some(parent_id) = new.parent_tenant_id {
+            let parent: Option<(i64,)> = sqlx::query_as(TENANT_ID_LOCK_SQL)
+                .bind(parent_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(db_error)?;
+            if parent.is_none() {
+                return Err(AstralError::NotFound(format!("parent tenant {parent_id}")));
+            }
+        }
         let result = sqlx::query(
-            "INSERT INTO tenant (tenant_code, tenant_name, tenant_type, status, parent_tenant_id, path, depth) \
-             VALUES (CONCAT('T', UNIX_TIMESTAMP()), ?, 'ENTERPRISE', 'ACTIVE', ?, ?, ?)",
+            "INSERT INTO tenant (tenant_code, tenant_name, tenant_type, status, parent_tenant_id, path, depth) VALUES (CONCAT('T', UNIX_TIMESTAMP()), ?, 'ENTERPRISE', 'ACTIVE', ?, ?, ?)",
         )
         .bind(&new.name)
         .bind(new.parent_tenant_id)
@@ -606,49 +870,95 @@ impl TenantRepository for SqlxTenantRepository {
         .execute(&mut **tx)
         .await
         .map_err(db_error)?;
-        let inserted_id = result.last_insert_id() as i64;
-
-        // 更新新建租户的 path（自引用于 path）——同事务，修复 INSERT 后崩溃的中间态
+        let tenant_id = i64::try_from(result.last_insert_id())
+            .map_err(|_| AstralError::Database("created tenant id exceeds i64".into()))?;
         let tenant_path = if new.depth == 0 {
-            format!("/{inserted_id}")
+            format!("/{tenant_id}")
         } else {
-            format!("{}/{}", new.path, inserted_id)
+            format!("{}/{tenant_id}", new.path)
         };
         sqlx::query("UPDATE tenant SET path = ? WHERE tenant_id = ?")
             .bind(&tenant_path)
-            .bind(inserted_id)
+            .bind(tenant_id)
             .execute(&mut **tx)
             .await
             .map_err(db_error)?;
-
+        insert_tenant_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            tenant_id,
+            "tenant_create",
+            "tenant",
+            tenant_id,
+            serde_json::json!({ "name": new.name, "parentTenantId": new.parent_tenant_id, "path": tenant_path, "depth": new.depth }),
+        )
+        .await?;
         tx.commit_consuming().await?;
-        Ok(inserted_id)
+        Ok(tenant_id)
     }
 
-    async fn update_tenant_name(&self, tenant_id: i64, name: &str) -> Result<(), AstralError> {
-        // 保守同栅栏：租户名是 metadata-only 字段（非授权/归属事实），仍统一
-        // 走授权源事务宿主，与租户聚合其余 mutation 同一栅栏/提交合同。
+    async fn update_tenant_name(&self, _tenant_id: i64, _name: &str) -> Result<(), AstralError> {
+        Err(tenant_context_required())
+    }
+
+    async fn update_tenant_name_with_context(
+        &self,
+        tenant_id: i64,
+        name: &str,
+        context: &TenantMutationContext,
+    ) -> Result<(), AstralError> {
         let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        if !lock_existing_tenant_scope_in_tx(&mut tx, context, tenant_id).await? {
+            return Err(AstralError::NotFound(format!("tenant {tenant_id}")));
+        }
         sqlx::query("UPDATE tenant SET tenant_name = ? WHERE tenant_id = ?")
             .bind(name)
             .bind(tenant_id)
             .execute(&mut **tx)
             .await
             .map_err(db_error)?;
-        tx.commit_consuming().await?;
-        Ok(())
+        insert_tenant_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            tenant_id,
+            "tenant_name_update",
+            "tenant",
+            tenant_id,
+            serde_json::json!({ "name": name }),
+        )
+        .await?;
+        tx.commit_consuming().await
     }
 
-    async fn update_tenant_status(&self, tenant_id: i64, status: &str) -> Result<(), AstralError> {
+    async fn update_tenant_status(
+        &self,
+        _tenant_id: i64,
+        _status: &str,
+    ) -> Result<(), AstralError> {
+        Err(tenant_context_required())
+    }
+
+    async fn update_tenant_status_with_context(
+        &self,
+        tenant_id: i64,
+        status: &str,
+        context: &TenantMutationContext,
+    ) -> Result<(), AstralError> {
+        if !TENANT_STATUS_ALPHABET.contains(&status) {
+            return Err(AstralError::Validation("invalid tenant status".into()));
+        }
         let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        if !lock_existing_tenant_scope_in_tx(&mut tx, context, tenant_id).await? {
+            return Err(AstralError::NotFound(format!("tenant {tenant_id}")));
+        }
+
         let current: Option<(String,)> = sqlx::query_as(TENANT_STATUS_LOCK_SQL)
             .bind(tenant_id)
             .fetch_optional(&mut **tx)
             .await
             .map_err(db_error)?;
         let Some((current_status,)) = current else {
-            tx.commit_consuming().await?;
-            return Ok(());
+            return Err(AstralError::NotFound(format!("tenant {tenant_id}")));
         };
 
         sqlx::query("UPDATE tenant SET status = ? WHERE tenant_id = ?")
@@ -668,11 +978,29 @@ impl TenantRepository for SqlxTenantRepository {
             )
             .await?;
         }
+        insert_tenant_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            tenant_id,
+            "tenant_status_update",
+            "tenant",
+            tenant_id,
+            serde_json::json!({ "fromStatus": current_status, "toStatus": status }),
+        )
+        .await?;
         tx.commit_consuming().await?;
         Ok(())
     }
 
-    async fn delete_tenant(&self, tenant_id: i64) -> Result<bool, AstralError> {
+    async fn delete_tenant(&self, _tenant_id: i64) -> Result<bool, AstralError> {
+        Err(tenant_context_required())
+    }
+
+    async fn delete_tenant_with_context(
+        &self,
+        tenant_id: i64,
+        context: &TenantMutationContext,
+    ) -> Result<bool, AstralError> {
         // 授权源事务宿主：栅栏先于 DB begin 取得（hub 拒绝发证即 fail-closed，
         // 绝不留下无栅栏 writer），commit await 前 arm、Ok 证明才 disarm ——
         // 与在线 repair 的竞态由此关闭；commit 未知时 receipts 绝不投递。
@@ -686,9 +1014,9 @@ impl TenantRepository for SqlxTenantRepository {
             .await
             .map_err(db_error)?;
         if tenant.is_none() {
-            tx.commit_consuming().await?;
-            return Ok(false);
+            return Err(AstralError::NotFound(format!("tenant {tenant_id}")));
         }
+        verify_tenant_mutation_actor_in_tx(&mut tx, context).await?;
 
         // 锁定读前置守卫：仍被 user_card 引用的租户禁止硬删除（fail-closed）。
         // 完整级联（捕获并持久吊销所有受影响的规范授权贡献）不在本仓库范围内；
@@ -726,25 +1054,53 @@ impl TenantRepository for SqlxTenantRepository {
                 "tenant {tenant_id} disappeared during locked delete"
             )));
         }
+        // audit_log has no FK back to tenant, so it remains durable after DELETE.
+        insert_tenant_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            tenant_id,
+            "tenant_delete",
+            "tenant",
+            tenant_id,
+            serde_json::json!({ "status": "deleted" }),
+        )
+        .await?;
         tx.commit_consuming().await?;
         Ok(true)
     }
 
     async fn transition_tenant_status(
         &self,
+        _tenant_id: i64,
+        _from: &str,
+        _to: &str,
+    ) -> Result<bool, AstralError> {
+        Err(tenant_context_required())
+    }
+
+    async fn transition_tenant_status_with_context(
+        &self,
         tenant_id: i64,
         from: &str,
         to: &str,
+        context: &TenantMutationContext,
     ) -> Result<bool, AstralError> {
+        if !TENANT_STATUS_ALPHABET.contains(&from) || !TENANT_STATUS_ALPHABET.contains(&to) {
+            return Err(AstralError::Validation(
+                "invalid tenant status transition".into(),
+            ));
+        }
         let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        if !lock_existing_tenant_scope_in_tx(&mut tx, context, tenant_id).await? {
+            return Err(AstralError::NotFound(format!("tenant {tenant_id}")));
+        }
         let current: Option<(String,)> = sqlx::query_as(TENANT_STATUS_LOCK_SQL)
             .bind(tenant_id)
             .fetch_optional(&mut **tx)
             .await
             .map_err(db_error)?;
         let Some((current_status,)) = current else {
-            tx.commit_consuming().await?;
-            return Ok(false);
+            return Err(AstralError::NotFound(format!("tenant {tenant_id}")));
         };
         if !status_transition_changes(&current_status, from, to) {
             tx.commit_consuming().await?;
@@ -769,6 +1125,16 @@ impl TenantRepository for SqlxTenantRepository {
             &mut tx,
             TenantEligibilityScope::ByTenantId { tenant_id },
             &operation_base,
+        )
+        .await?;
+        insert_tenant_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            tenant_id,
+            "tenant_status_transition",
+            "tenant",
+            tenant_id,
+            serde_json::json!({ "fromStatus": current_status, "toStatus": to }),
         )
         .await?;
         tx.commit_consuming().await?;
@@ -1069,18 +1435,34 @@ impl TenantRepository for SqlxTenantRepository {
 
     async fn upsert_tenant_domain(
         &self,
+        _tenant_id: i64,
+        _domain_id: i64,
+    ) -> Result<(), AstralError> {
+        Err(tenant_context_required())
+    }
+
+    async fn upsert_tenant_domain_with_context(
+        &self,
         tenant_id: i64,
         domain_id: i64,
+        context: &TenantMutationContext,
     ) -> Result<(), AstralError> {
+        if tenant_id <= 0 || domain_id <= 0 {
+            return Err(AstralError::Validation(
+                "tenant-domain mutation requires positive tenant and domain ids".into(),
+            ));
+        }
         let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
-        let tenant: Option<(i64,)> = sqlx::query_as(TENANT_ID_LOCK_SQL)
-            .bind(tenant_id)
+        if !lock_existing_tenant_scope_in_tx(&mut tx, context, tenant_id).await? {
+            return Err(AstralError::NotFound(format!("tenant {tenant_id}")));
+        }
+        let domain_exists: Option<(i64,)> = sqlx::query_as(DOMAIN_ID_LOCK_SQL)
+            .bind(domain_id)
             .fetch_optional(&mut **tx)
             .await
             .map_err(db_error)?;
-        if tenant.is_none() {
-            tx.commit_consuming().await?;
-            return Ok(());
+        if domain_exists.is_none() {
+            return Err(AstralError::NotFound(format!("domain {domain_id}")));
         }
 
         let current: Option<(String,)> = sqlx::query_as(TENANT_DOMAIN_STATUS_LOCK_SQL)
@@ -1108,11 +1490,12 @@ impl TenantRepository for SqlxTenantRepository {
                 // The unique key serializes a concurrent insert after the absent-row lock.
                 let result = sqlx::query(
                     "INSERT INTO tenant_domain_map (tenant_id, domain_id, granted_by, status) \
-                     VALUES (?, ?, 1, 'ACTIVE') \
+                     VALUES (?, ?, ?, 'ACTIVE') \
                      ON DUPLICATE KEY UPDATE status = 'ACTIVE'",
                 )
                 .bind(tenant_id)
                 .bind(domain_id)
+                .bind(context.actor_id)
                 .execute(&mut **tx)
                 .await
                 .map_err(db_error)?;
@@ -1136,6 +1519,16 @@ impl TenantRepository for SqlxTenantRepository {
             )
             .await?;
         }
+        insert_tenant_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            tenant_id,
+            "tenant_domain_grant",
+            "tenant_domain_map",
+            domain_id,
+            serde_json::json!({ "tenantId": tenant_id, "domainId": domain_id, "changed": changed }),
+        )
+        .await?;
         tx.commit_consuming().await?;
         Ok(())
     }
@@ -1157,16 +1550,34 @@ impl TenantRepository for SqlxTenantRepository {
 
     async fn remove_tenant_domain(
         &self,
+        _tenant_id: i64,
+        _domain_id: i64,
+    ) -> Result<bool, AstralError> {
+        Err(tenant_context_required())
+    }
+
+    async fn remove_tenant_domain_with_context(
+        &self,
         tenant_id: i64,
         domain_id: i64,
+        context: &TenantMutationContext,
     ) -> Result<bool, AstralError> {
+        if tenant_id <= 0 || domain_id <= 0 {
+            return Err(AstralError::Validation(
+                "tenant-domain mutation requires positive tenant and domain ids".into(),
+            ));
+        }
         let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
-        let tenant: Option<(i64,)> = sqlx::query_as(TENANT_ID_LOCK_SQL)
-            .bind(tenant_id)
+        if !lock_existing_tenant_scope_in_tx(&mut tx, context, tenant_id).await? {
+            tx.commit_consuming().await?;
+            return Ok(false);
+        }
+        let domain_exists: Option<(i64,)> = sqlx::query_as(DOMAIN_ID_LOCK_SQL)
+            .bind(domain_id)
             .fetch_optional(&mut **tx)
             .await
             .map_err(db_error)?;
-        if tenant.is_none() {
+        if domain_exists.is_none() {
             tx.commit_consuming().await?;
             return Ok(false);
         }
@@ -1206,6 +1617,16 @@ impl TenantRepository for SqlxTenantRepository {
                 domain_id,
             },
             &operation_base,
+        )
+        .await?;
+        insert_tenant_mutation_audit_in_tx(
+            &mut tx,
+            context,
+            tenant_id,
+            "tenant_domain_revoke",
+            "tenant_domain_map",
+            domain_id,
+            serde_json::json!({ "tenantId": tenant_id, "domainId": domain_id, "status": "deleted" }),
         )
         .await?;
         tx.commit_consuming().await?;
@@ -1254,31 +1675,150 @@ fn guard_tenant_delete(referencing_cards: i64, tenant_id: i64) -> Result<(), Ast
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Execute;
+
+    #[test]
+    fn tenant_context_requires_verified_platform_identity_and_bounded_request_id() {
+        let policy_context = PolicyContext::builder()
+            .user_id(Some(10))
+            .principal_kind(Some("PLATFORM_USER".into()))
+            .card_id(Some(20))
+            .tenant_id(Some(30))
+            .domain_id(Some(40))
+            .action("manage".into())
+            .build();
+        let context = TenantMutationContext::from_policy_context(&policy_context, Some("req-7"))
+            .expect("verified context and canonical request id must be accepted");
+        assert_eq!(context.actor_id, 10);
+        assert_eq!(context.actor_card_id, 20);
+        assert_eq!(context.actor_tenant_id, 30);
+        assert_eq!(context.actor_domain_id, 40);
+        assert_eq!(context.request_id(), "req-7");
+
+        assert!(TenantMutationContext::from_policy_context(&policy_context, None).is_err());
+        let overlong_request_id = "x".repeat(65);
+        for unsafe_request_id in ["has space", "line\nbreak", overlong_request_id.as_str()] {
+            assert!(matches!(
+                TenantMutationContext::from_policy_context(
+                    &policy_context,
+                    Some(unsafe_request_id)
+                ),
+                Err(AstralError::Validation(_))
+            ));
+        }
+
+        let non_platform_context = PolicyContext::builder()
+            .user_id(Some(10))
+            .principal_kind(Some("END_USER".into()))
+            .card_id(Some(20))
+            .tenant_id(Some(30))
+            .domain_id(Some(40))
+            .action("manage".into())
+            .build();
+        assert!(matches!(
+            TenantMutationContext::from_policy_context(&non_platform_context, Some("req-7")),
+            Err(AstralError::Auth(_))
+        ));
+        for invalid_ids in [
+            (Some(0), Some(20), Some(30), Some(40)),
+            (Some(10), Some(-1), Some(30), Some(40)),
+            (Some(10), Some(20), None, Some(40)),
+            (Some(10), Some(20), Some(30), Some(0)),
+        ] {
+            let invalid_context = PolicyContext::builder()
+                .user_id(invalid_ids.0)
+                .principal_kind(Some("PLATFORM_USER".into()))
+                .card_id(invalid_ids.1)
+                .tenant_id(invalid_ids.2)
+                .domain_id(invalid_ids.3)
+                .action("manage".into())
+                .build();
+            assert!(matches!(
+                TenantMutationContext::from_policy_context(&invalid_context, Some("req-7")),
+                Err(AstralError::Auth(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn emitted_tenant_mutation_sql_has_no_backslashes() {
+        for statement in [
+            TENANT_ID_LOCK_SQL,
+            TENANT_STATUS_LOCK_SQL,
+            TENANT_DOMAIN_STATUS_LOCK_SQL,
+            TENANT_MUTATION_ACTOR_LOCK_SQL,
+            TENANT_MUTATION_AUDIT_INSERT_SQL,
+            DOMAIN_ID_LOCK_SQL,
+            TENANT_CARD_REFERENCES_LOCK_SQL,
+            TENANT_CARDS_ELIGIBILITY_LOCK_SQL,
+            TENANT_DOMAIN_CARDS_ELIGIBILITY_LOCK_SQL,
+        ] {
+            assert!(
+                !statement.as_bytes().contains(&0x5c),
+                "emitted TrustGraph SQL must not contain a backslash: {statement}"
+            );
+        }
+        let emitted_actor_lock_sql =
+            sqlx::query::<sqlx::MySql>(TENANT_MUTATION_ACTOR_LOCK_SQL).sql();
+        let emitted_audit_sql = sqlx::query::<sqlx::MySql>(TENANT_MUTATION_AUDIT_INSERT_SQL).sql();
+        let emitted_multiline_mutation_sql = sqlx::query::<sqlx::MySql>(
+            "INSERT INTO tenant_domain_map (tenant_id, domain_id, granted_by, status) \
+             VALUES (?, ?, ?, 'ACTIVE')",
+        )
+        .sql();
+        for emitted_sql in [
+            emitted_actor_lock_sql,
+            emitted_audit_sql,
+            emitted_multiline_mutation_sql,
+        ] {
+            assert!(
+                !emitted_sql.as_bytes().contains(&0x5c),
+                "sqlx-emitted mutation SQL must not contain a backslash: {emitted_sql}"
+            );
+        }
+    }
 
     #[test]
     fn tenant_mutations_lock_source_rows_before_card_fanout() {
         assert!(TENANT_STATUS_LOCK_SQL.ends_with("FOR UPDATE"));
         assert!(TENANT_ID_LOCK_SQL.ends_with("FOR UPDATE"));
         assert!(TENANT_DOMAIN_STATUS_LOCK_SQL.ends_with("FOR UPDATE"));
+        assert!(DOMAIN_ID_LOCK_SQL.ends_with("FOR UPDATE"));
         assert!(TENANT_STATUS_LOCK_SQL.contains("tenant_id = ?"));
         assert!(TENANT_DOMAIN_STATUS_LOCK_SQL.contains("tenant_id = ? AND domain_id = ?"));
     }
 
     #[test]
-    fn domain_mutations_use_tenant_then_mapping_then_cards_order() {
-        let source_lock = TENANT_ID_LOCK_SQL;
+    fn domain_mutations_use_tenant_domain_mapping_then_cards_order() {
+        let tenant_lock = TENANT_ID_LOCK_SQL;
+        let domain_lock = DOMAIN_ID_LOCK_SQL;
         let mapping_lock = TENANT_DOMAIN_STATUS_LOCK_SQL;
-        assert!(source_lock.contains("FROM tenant"));
+        assert!(tenant_lock.contains("FROM tenant"));
+        assert!(domain_lock.contains("FROM platform_domain"));
         assert!(mapping_lock.contains("FROM tenant_domain_map"));
-        assert!(source_lock.ends_with("FOR UPDATE"));
+        assert!(tenant_lock.ends_with("FOR UPDATE"));
+        assert!(domain_lock.ends_with("FOR UPDATE"));
         assert!(mapping_lock.ends_with("FOR UPDATE"));
-        assert!(
-            source_lock.find("tenant").unwrap() < mapping_lock.find("tenant_domain_map").unwrap()
-        );
-        assert!(
-            mapping_lock.find("tenant_domain_map").unwrap()
-                < mapping_lock.find("FOR UPDATE").unwrap()
-        );
+        let source = include_str!("tenant_repository.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for method in [
+            "async fn upsert_tenant_domain_with_context(",
+            "async fn remove_tenant_domain_with_context(",
+        ] {
+            let start = source.rfind(method).unwrap();
+            let body = source[start..].split("\n    async fn ").next().unwrap();
+            let tenant = body.find("lock_existing_tenant_scope_in_tx(").unwrap();
+            let domain = body.find("sqlx::query_as(DOMAIN_ID_LOCK_SQL)").unwrap();
+            let mapping = body
+                .find("sqlx::query_as(TENANT_DOMAIN_STATUS_LOCK_SQL)")
+                .unwrap();
+            let cards = body
+                .find("append_tenant_eligibility_invalidation_in_tx(")
+                .unwrap();
+            assert!(tenant < domain && domain < mapping && mapping < cards);
+        }
     }
 
     #[test]
@@ -1350,13 +1890,18 @@ mod tests {
         assert!(
             TENANT_DOMAIN_CARDS_ELIGIBILITY_LOCK_SQL.contains("tenant_id = ? AND domain_id = ?")
         );
-        // 锁序哨兵：按语句锁定的表给秩，tenant(0) -> mapping(1) -> user_card(2)。
-        // 跨语句的真实加锁顺序由调用方的 await 序列保证（先租户行、再 mapping 行、
-        // 最后本批量捕获），此处静态断言各常量的表归属构成同一偏序。
+        // 锁序哨兵：按语句锁定的表给秩，tenant(0) -> platform_domain(1) ->
+        // tenant_domain_map(2) -> user_card(3)。跨语句的真实加锁顺序由调用方的
+        // await 序列保证；此处静态断言各常量的表归属构成同一偏序。
         assert!(
             tenant_mutation_lock_rank(TENANT_ID_LOCK_SQL)
+                < tenant_mutation_lock_rank(DOMAIN_ID_LOCK_SQL),
+            "tenant source row lock must rank below the domain source row lock"
+        );
+        assert!(
+            tenant_mutation_lock_rank(DOMAIN_ID_LOCK_SQL)
                 < tenant_mutation_lock_rank(TENANT_DOMAIN_STATUS_LOCK_SQL),
-            "tenant source row lock must rank below the mapping row lock"
+            "domain source row lock must rank below the mapping row lock"
         );
         assert!(
             tenant_mutation_lock_rank(TENANT_DOMAIN_STATUS_LOCK_SQL)
@@ -1373,10 +1918,12 @@ mod tests {
     /// 测试哨兵：把租户 mutation 相关锁定语句映射到锁序秩。
     /// `FROM tenant_domain_map` 含前缀 `FROM tenant`，必须先判 domain_map。
     fn tenant_mutation_lock_rank(sql: &str) -> u8 {
-        if sql.contains("FROM tenant_domain_map") {
-            1
-        } else if sql.contains("FROM user_card") {
+        if sql.contains("FROM user_card") {
+            3
+        } else if sql.contains("FROM tenant_domain_map") {
             2
+        } else if sql.contains("FROM platform_domain") {
+            1
         } else if sql.contains("FROM tenant") {
             0
         } else {
@@ -1472,13 +2019,15 @@ mod tests {
     #[test]
     fn delete_tx_uses_source_wrapper_locked_guard_and_paired_invalidation() {
         let source = include_str!("tenant_repository.rs");
-        let delete_body = source
-            .split("async fn delete_tenant")
-            // 该字面量出现 3 次（trait 声明 / impl 实现 / 本测试字面量）；
-            // nth(2) 才是 impl 实现体段。
-            .nth(2)
-            .and_then(|body| body.split("async fn transition_tenant_status").next())
-            .expect("delete_tenant implementation must be delimited");
+        let impl_source = source
+            .split("impl TenantRepository for SqlxTenantRepository")
+            .nth(1)
+            .expect("SqlxTenantRepository implementation must exist");
+        let delete_body = impl_source
+            .split("async fn delete_tenant_with_context(")
+            .nth(1)
+            .and_then(|body| body.split("async fn transition_tenant_status(").next())
+            .expect("audited delete_tenant implementation must be delimited");
         let wrapper_begin = delete_body
             .find("AuthorizationSourceTransaction::begin(&self.db)")
             .expect("delete must host the source mutation in the authorization source wrapper");
@@ -1494,6 +2043,9 @@ mod tests {
         let delete = delete_body
             .find("DELETE FROM tenant WHERE tenant_id = ?")
             .expect("delete must remove the tenant row");
+        let audit = delete_body
+            .find("insert_tenant_mutation_audit_in_tx")
+            .expect("delete must write its business audit in the source transaction");
         let commit = delete_body
             .rfind("tx.commit_consuming()")
             .expect("delete must commit through the wrapper consuming commit");
@@ -1502,9 +2054,10 @@ mod tests {
                 && tenant_lock < guard
                 && guard < invalidation
                 && invalidation < delete
-                && delete < commit,
+                && delete < audit
+                && audit < commit,
             "delete must order: wrapper begin -> tenant lock -> reference guard -> \
-             paired eligibility invalidation -> DELETE -> commit_consuming"
+             paired eligibility invalidation -> DELETE -> audit -> commit_consuming"
         );
         assert!(
             !delete_body.contains("tx.commit()"),

@@ -3,8 +3,9 @@
 //! 影响有效授权的 source mutation 必须在同一短事务内把 typed invalidation
 //! envelope 追加进 durable `al_message_outbox`。本包装器在事务内收集与 durable
 //! outbox **逐字节相同**的 envelope（receipts），并在 `tx.commit()` 取得成功证明
-//! 之后，把这些 envelope 直接投递到进程内 LocalBus —— commit 之后不做任何数据库
-//! 查询、不重建 envelope，MySQL 轮询从此只承担恢复路径而不是通知热路径。
+//! 之后，通过 exact outbox claim、LocalBus handler 和 lease-CAS completion
+//! 证明本地完成。提交后只做有界 claim/settlement，不重建 envelope；低频
+//! MySQL relay 承担未直发、失败或崩溃后的恢复。
 //!
 //! 合同（fail-closed，Exec-L2 语义）：
 //! - **只有 commit 被证明成功才发送**。`commit()` 返回 `Err`（包括连接中断导致的
@@ -18,8 +19,8 @@
 //!   与否不由本层证明（本层不断言其完成）。此时栅栏未 arm，Drop 不制造
 //!   hub uncertain。
 //! - **身份冻结在事务内**：receipts 的 event/operation id 与 origin region 在
-//!   envelope 构造时（事务内）即已固化，post-commit dispatch 不读取任何配置或
-//!   数据库。
+//!   envelope 构造时（事务内）即已固化；post-commit 只读取 exact durable row
+//!   取得 ownership 和验证内容，不重新读取配置或改写事务事实。
 //! - **hub 活动栅栏先于 DB 事务获取**：`begin` 在 `pool.begin()` 之前取得
 //!   source-activity fence 并持有到 commit/rollback（含 commit 后 dispatch）完成，
 //!   阻止在线 repair 在活跃 source writer 期间替换 pending 状态。hub 已安装但
@@ -37,11 +38,10 @@ use astral_mq::{EligibilityInvalidated, InvalidationEvent};
 use astral_types::{AstralError, ProjectionAggregate, EVENT_TYPE_ELIGIBILITY_UPDATE};
 use sqlx::{MySql, Transaction};
 
-/// 单条 invalidation receipt 的 LocalBus 投递等待上限。
-///
-/// 与 durable relay 的 handler 超时预算对齐（astral-mq
-/// `LOCAL_INVALIDATION_HANDLER_TIMEOUT_SECS`）：有界等待，绝不无限挂起调用方。
-pub(crate) const INVALIDATION_DISPATCH_DEADLINE: Duration = Duration::from_secs(5);
+/// One direct invalidation dispatch budget, including exact DB claim, the shared
+/// LocalBus handler deadline, and owned completion CAS. The underlying calls
+/// each have a stricter bound; this outer deadline makes the receipt path finite.
+pub(crate) const INVALIDATION_DISPATCH_DEADLINE: Duration = Duration::from_secs(15);
 
 /// 单事务 projection delta receipts 的容量上限。
 ///
@@ -62,14 +62,28 @@ pub(crate) struct InvalidationReceipt {
     pub envelope: MessageEnvelope,
 }
 
-/// Post-commit invalidation 投递器。
+/// Post-commit invalidation dispatch result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InvalidationDispatchOutcome {
+    /// Exact Local outbox row was already processed or handler + token-owned CAS
+    /// completion were proven.
+    CompletedLocally,
+    /// The row remains durable and is owned by the configured recovery relay.
+    DeferredToRecovery,
+}
+
+/// Post-commit invalidation dispatcher.
 ///
-/// 实现必须有界：单次尝试 + deadline；重试/隔离/IN_DOUBT 属于 durable relay。
+/// In Local mode this includes an exact-row durable claim after commit, one
+/// bounded LocalBus handler delivery, and a token-owned completion CAS. It never
+/// edits source state, retries a dispatch, or turns LocalBus admission into proof;
+/// any unknown/failed transition stays fail-closed for the recovery reconciler.
+/// Non-Local mode explicitly reports that the row remains for its durable relay.
 pub(crate) trait InvalidationDispatcher: Send + Sync {
     fn dispatch(
         &self,
         receipt: InvalidationReceipt,
-    ) -> impl Future<Output = Result<(), String>> + Send;
+    ) -> impl Future<Output = Result<InvalidationDispatchOutcome, String>> + Send;
 }
 
 /// Post-commit projection delta 投递器。
@@ -89,29 +103,58 @@ impl ProjectionDeltaDispatcher for AstralDbProjectionDeltaDispatcher {
     }
 }
 
-/// 生产投递器：把 receipt envelope 直接发布到进程内 LocalBus 的授权失效队列。
-pub(crate) struct LocalBusInvalidationDispatcher;
+/// 生产投递器：先对事务内已提交的 outbox exact row 获取 durable CAS lease，
+/// 再经 LocalBus 调用同一 invalidation handler 并用拥有者 token 完成。没有
+/// LocalBus 时保持 Rabbit/relay 恢复腿为该 outbox 行的唯一 owner。
+pub(crate) struct LocalBusInvalidationDispatcher {
+    pool: sqlx::MySqlPool,
+}
 
 impl InvalidationDispatcher for LocalBusInvalidationDispatcher {
-    async fn dispatch(&self, receipt: InvalidationReceipt) -> Result<(), String> {
+    async fn dispatch(
+        &self,
+        receipt: InvalidationReceipt,
+    ) -> Result<InvalidationDispatchOutcome, String> {
         let Some(bus) = astral_mq::local_bus::global_local_bus() else {
-            // 进程内未安装 LocalBus（Rabbit 传输或启动时序未就绪）：durable
-            // outbox 行仍是投递事实来源，交给对应 transport 的 relay 恢复腿。
+            // 进程内未安装 LocalBus（Rabbit transport）：不能 claim 或误报
+            // 完成；保留 PENDING 行交给该 transport 的 durable recovery leg。
             tracing::debug!(
                 event_id = %receipt.event_id,
                 operation_id = %receipt.operation_id,
                 "no in-process LocalBus installed; invalidation stays on the durable outbox relay"
             );
-            return Ok(());
+            return Ok(InvalidationDispatchOutcome::DeferredToRecovery);
         };
-        bus.publish_and_wait(
-            astral_mq::config::QUEUE_AUTHORIZATION_INVALIDATION,
-            astral_mq::config::ROUTING_KEY_AUTHORIZATION_INVALIDATION,
-            receipt.envelope,
+        let outcome = tokio::time::timeout(
             INVALIDATION_DISPATCH_DEADLINE,
+            astral_mq::consumers::dispatch_committed_local_invalidation(
+                self.pool.clone(),
+                bus,
+                &receipt.envelope,
+            ),
         )
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|_| {
+            format!(
+                "direct invalidation dispatch timed out after {:?}; outcome unknown",
+                INVALIDATION_DISPATCH_DEADLINE
+            )
+        })??;
+        match outcome {
+            astral_mq::consumers::LocalInvalidationDispatchOutcome::Completed
+            | astral_mq::consumers::LocalInvalidationDispatchOutcome::AlreadyProcessed => {
+                Ok(InvalidationDispatchOutcome::CompletedLocally)
+            }
+            astral_mq::consumers::LocalInvalidationDispatchOutcome::NotClaimed {
+                status,
+                reason,
+            } => Err(format!(
+                "direct invalidation remains recovery-owned ({status}): {reason}"
+            )),
+            astral_mq::consumers::LocalInvalidationDispatchOutcome::NotFound => {
+                Err("committed direct invalidation has no matching durable outbox row".into())
+            }
+        }
     }
 }
 
@@ -132,9 +175,10 @@ pub(crate) fn receipts_for_proven_commit<T>(
 
 /// 逐条投递已证明 commit 的 receipts。
 ///
-/// 单次有界尝试：任何失败（admission 拒绝、handler 报错、deadline 到期、消费者
-/// 消失）只记录日志，不向上传播，不重试 —— durable outbox 行（事务内已 append）
-/// 保持为恢复路径；绝不伪装源回滚，也绝不触发 source replay。
+/// Single bounded, non-replaying attempt after a proven source commit. Any failure
+/// (claim unavailable, FIFO conflict, handler error, timeout, or missing owner) is
+/// logged and the durable outbox remains the recovery/reconciliation path; it
+/// never fabricates source rollback or triggers source replay.
 pub(crate) async fn dispatch_proven_receipts<D: InvalidationDispatcher>(
     receipts: Vec<InvalidationReceipt>,
     dispatcher: &D,
@@ -144,12 +188,20 @@ pub(crate) async fn dispatch_proven_receipts<D: InvalidationDispatcher>(
         let operation_id = receipt.operation_id.clone();
         let dispatch_started = Instant::now();
         match dispatcher.dispatch(receipt).await {
-            Ok(()) => {
+            Ok(InvalidationDispatchOutcome::CompletedLocally) => {
                 tracing::debug!(
                     event_id = %event_id,
                     operation_id = %operation_id,
                     dispatch_elapsed_ms = dispatch_started.elapsed().as_millis() as u64,
-                    "authorization invalidation receipt dispatched on the local bus"
+                    "authorization invalidation applied locally and durable outbox completion proven"
+                );
+            }
+            Ok(InvalidationDispatchOutcome::DeferredToRecovery) => {
+                tracing::debug!(
+                    event_id = %event_id,
+                    operation_id = %operation_id,
+                    dispatch_elapsed_ms = dispatch_started.elapsed().as_millis() as u64,
+                    "authorization invalidation remains pending for durable recovery relay"
                 );
             }
             Err(reason) => {
@@ -295,6 +347,8 @@ pub(crate) fn acquire_source_transaction_activity_fence(
 /// 移出字段，编译期即被拒绝。
 pub(crate) struct AuthorizationSourceTransaction {
     tx: Transaction<'static, MySql>,
+    /// Pool retained only for the post-commit exact-row claim, after tx is consumed.
+    pool: sqlx::MySqlPool,
     /// typed invalidation envelopes appended to the durable outbox in-tx.
     receipts: Vec<InvalidationReceipt>,
     /// 完整 projection delta requests 已在事务内 append 成 durable 行，
@@ -332,6 +386,7 @@ impl AuthorizationSourceTransaction {
             .map_err(|error| AstralError::Database(error.to_string()))?;
         Ok(Self {
             tx,
+            pool: pool.clone(),
             receipts: Vec::new(),
             projection_receipts: Vec::new(),
             _activity_fence,
@@ -360,9 +415,12 @@ impl AuthorizationSourceTransaction {
 
     /// 提交源事务；仅在 commit 被证明成功后按序投递 receipts。
     pub(crate) async fn commit_consuming(self) -> Result<(), AstralError> {
+        let invalidation_dispatcher = LocalBusInvalidationDispatcher {
+            pool: self.pool.clone(),
+        };
         self.commit_consuming_with_dispatchers(
             &AstralDbProjectionDeltaDispatcher,
-            &LocalBusInvalidationDispatcher,
+            &invalidation_dispatcher,
         )
         .await
     }
@@ -577,7 +635,7 @@ mod tests {
     #[derive(Default)]
     struct MockDispatcher {
         calls: Mutex<Vec<(String, String)>>,
-        results: Mutex<VecDeque<Result<(), String>>>,
+        results: Mutex<VecDeque<Result<InvalidationDispatchOutcome, String>>>,
     }
 
     impl MockDispatcher {
@@ -585,20 +643,30 @@ mod tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 results: Mutex::new(
-                    std::iter::repeat_n(Err::<(), String>("handler refused".into()), times)
-                        .collect(),
+                    std::iter::repeat_n(
+                        Err::<InvalidationDispatchOutcome, String>("handler refused".into()),
+                        times,
+                    )
+                    .collect(),
                 ),
             }
         }
     }
 
     impl InvalidationDispatcher for MockDispatcher {
-        async fn dispatch(&self, receipt: InvalidationReceipt) -> Result<(), String> {
+        async fn dispatch(
+            &self,
+            receipt: InvalidationReceipt,
+        ) -> Result<InvalidationDispatchOutcome, String> {
             self.calls
                 .lock()
                 .unwrap()
                 .push((receipt.event_id.clone(), receipt.operation_id.clone()));
-            self.results.lock().unwrap().pop_front().unwrap_or(Ok(()))
+            self.results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(InvalidationDispatchOutcome::CompletedLocally))
         }
     }
 

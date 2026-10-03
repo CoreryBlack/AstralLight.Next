@@ -32,23 +32,34 @@ use astral_types::AstralError;
 /// `jwt:revoked:{jti}` 7 天语义，覆盖 access token 最大生命周期）。
 pub const REVOCATION_MIRROR_TTL_SECS: u64 = 7 * 24 * 3600;
 
-/// 严格的会话 durable 事实读取（单条 JOIN；见模块文档的 None/Err 语义）。
-///
-/// `identity_card_id` 作为 JOIN 条件绑定：身份卡不存在/不属于该用户/非
-/// ACTIVE/已过期时整行不命中 → `Ok(None)`。组织绑定（tenant/domain）随
-/// user_card JOIN 返回，由 [`evaluate_access_fact`] 与 claims 逐项比对。
+/// Strict durable session fact lookup using the historical card-anchored reader contract.
 pub async fn load_active_access_session_fact(
     pool: &MySqlPool,
     jti: &str,
     identity_card_id: i64,
 ) -> Result<Option<AccessSessionDurableFact>, sqlx::Error> {
     Ok(
-        load_verified_access_session_fact(pool, jti, identity_card_id)
+        load_verified_platform_access_session_fact(pool, jti, identity_card_id)
             .await?
             .map(|verified| verified.fact),
     )
 }
 
+/// Strict PlatformUser session facts; historical rows with NULL/mismatched
+/// credential revisions are not backfilled or accepted as proof.
+pub async fn load_active_platform_access_session_fact(
+    pool: &MySqlPool,
+    jti: &str,
+    identity_card_id: i64,
+) -> Result<Option<AccessSessionDurableFact>, sqlx::Error> {
+    Ok(
+        load_verified_platform_access_session_fact(pool, jti, identity_card_id)
+            .await?
+            .map(|verified| verified.fact),
+    )
+}
+
+#[allow(dead_code)]
 async fn load_verified_access_session_fact(
     pool: &MySqlPool,
     jti: &str,
@@ -68,13 +79,109 @@ async fn load_verified_access_session_fact(
                 s.refresh_expires_at AS session_expires_at \
          FROM auth_session_jti_index i \
          INNER JOIN auth_device_session s ON s.session_id = i.session_id AND s.user_id = i.user_id \
+           AND s.session_epoch = i.session_epoch \
          INNER JOIN platform_user pu ON pu.user_id = s.user_id \
            AND pu.status = 'ACTIVE' AND pu.deleted_at IS NULL \
+         LEFT JOIN auth_token_family f ON f.family_id = s.family_id AND f.user_id = s.user_id \
+           AND (f.expires_at IS NULL OR f.expires_at > UTC_TIMESTAMP()) \
          INNER JOIN identity_card ic ON ic.card_id = ? AND ic.user_id = s.user_id \
            AND ic.status = 'ACTIVE' \
            AND (ic.expires_at IS NULL OR ic.expires_at >= UTC_TIMESTAMP()) \
+         LEFT JOIN user_card uc ON uc.card_id = s.current_user_card_id AND uc.user_id = s.user_id \
+           AND uc.card_type != 'LEVEL_TEMPLATE_CARD' \
+           AND (uc.valid_from IS NULL OR uc.valid_from <= UTC_TIMESTAMP()) \
+           AND (uc.valid_until IS NULL OR uc.valid_until >= UTC_TIMESTAMP()) \
+         LEFT JOIN tenant t ON t.tenant_id = uc.tenant_id \
+         LEFT JOIN tenant_domain_map tdm ON tdm.tenant_id = uc.tenant_id AND tdm.domain_id = uc.domain_id \
+         WHERE i.jti = ? \
+           AND (s.refresh_expires_at IS NULL OR s.refresh_expires_at > UTC_TIMESTAMP()) \
+           AND (s.current_user_card_id IS NULL OR (uc.card_id IS NOT NULL AND t.status = 'ACTIVE' AND tdm.status = 'ACTIVE')) \
+         LIMIT 1",
+    )
+    .bind(identity_card_id)
+    .bind(jti)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| {
+        let cache_valid_until_epoch_second = row.cache_valid_until_epoch_second();
+        VerifiedAccessSessionFact {
+            fact: row.into_durable_fact(),
+            cache_valid_until_epoch_second,
+        }
+    }))
+}
+
+async fn load_verified_app_access_session_fact(
+    pool: &MySqlPool,
+    jti: &str,
+) -> Result<Option<VerifiedAccessSessionFact>, sqlx::Error> {
+    if jti.trim().is_empty() || jti.len() > 255 {
+        return Ok(None);
+    }
+    let row = sqlx::query_as::<_, AccessSessionFactRow>(
+        "SELECT i.session_id, i.user_id, i.session_epoch, i.status AS jti_status, \
+                i.expires_at, s.family_id, s.status AS session_status, s.session_state, \
+                s.session_version, s.current_user_card_id, NULL AS session_credential_version, \
+                NULL AS user_card_tenant_id, NULL AS user_card_domain_id, NULL AS user_card_status, \
+                f.status AS family_status, ic.expires_at AS identity_expires_at, \
+                NULL AS card_valid_until, f.expires_at AS family_expires_at, \
+                s.refresh_expires_at AS session_expires_at \
+         FROM auth_session_jti_index i \
+         INNER JOIN auth_device_session s ON s.session_id = i.session_id AND s.user_id = i.user_id \
+           AND s.session_epoch = i.session_epoch \
+         INNER JOIN platform_user pu ON pu.user_id = s.user_id \
+           AND pu.status = 'ACTIVE' AND pu.deleted_at IS NULL \
+         INNER JOIN identity_card ic ON ic.user_id = s.user_id AND ic.status = 'ACTIVE' \
+           AND (ic.expires_at IS NULL OR ic.expires_at >= UTC_TIMESTAMP()) \
          LEFT JOIN auth_token_family f ON f.family_id = s.family_id AND f.user_id = s.user_id \
            AND (f.expires_at IS NULL OR f.expires_at > UTC_TIMESTAMP()) \
+         WHERE i.jti = ? AND s.current_user_card_id IS NULL \
+           AND s.credential_version IS NULL \
+           AND (s.refresh_expires_at IS NULL OR s.refresh_expires_at > UTC_TIMESTAMP()) \
+         LIMIT 1",
+    )
+    .bind(jti)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| {
+        let cache_valid_until_epoch_second = row.cache_valid_until_epoch_second();
+        VerifiedAccessSessionFact {
+            fact: row.into_durable_fact(),
+            cache_valid_until_epoch_second,
+        }
+    }))
+}
+
+async fn load_verified_platform_access_session_fact(
+    pool: &MySqlPool,
+    jti: &str,
+    identity_card_id: i64,
+) -> Result<Option<VerifiedAccessSessionFact>, sqlx::Error> {
+    if jti.trim().is_empty() || jti.len() > 255 || identity_card_id <= 0 {
+        return Ok(None);
+    }
+    let row = sqlx::query_as::<_, AccessSessionFactRow>(
+        "SELECT i.session_id, i.user_id, i.session_epoch, i.status AS jti_status, \
+                i.expires_at, s.family_id, s.status AS session_status, s.session_state, \
+                s.session_version, s.current_user_card_id, s.credential_version AS session_credential_version, \
+                uc.tenant_id AS user_card_tenant_id, \
+                uc.domain_id AS user_card_domain_id, uc.card_status AS user_card_status, \
+                f.status AS family_status, ic.expires_at AS identity_expires_at, \
+                uc.valid_until AS card_valid_until, f.expires_at AS family_expires_at, \
+                s.refresh_expires_at AS session_expires_at \
+         FROM auth_session_jti_index i \
+         INNER JOIN auth_device_session s ON s.session_id = i.session_id AND s.user_id = i.user_id \
+           AND s.session_epoch = i.session_epoch \
+         INNER JOIN platform_user pu ON pu.user_id = s.user_id \
+           AND pu.status = 'ACTIVE' AND pu.deleted_at IS NULL \
+         INNER JOIN user_local_credential lc ON lc.user_id = s.user_id AND lc.status = 'ACTIVE' \
+           AND s.credential_version IS NOT NULL AND s.credential_version > 0 \
+           AND lc.credential_version = s.credential_version \
+         LEFT JOIN auth_token_family f ON f.family_id = s.family_id AND f.user_id = s.user_id \
+           AND (f.expires_at IS NULL OR f.expires_at > UTC_TIMESTAMP()) \
+         INNER JOIN identity_card ic ON ic.card_id = ? AND ic.user_id = s.user_id \
+           AND ic.status = 'ACTIVE' \
+           AND (ic.expires_at IS NULL OR ic.expires_at >= UTC_TIMESTAMP()) \
          LEFT JOIN user_card uc ON uc.card_id = s.current_user_card_id AND uc.user_id = s.user_id \
            AND uc.card_type != 'LEVEL_TEMPLATE_CARD' \
            AND (uc.valid_from IS NULL OR uc.valid_from <= UTC_TIMESTAMP()) \
@@ -107,6 +214,8 @@ struct AccessSessionFactRow {
     session_epoch: i64,
     jti_status: String,
     session_version: i64,
+    #[allow(dead_code)]
+    session_credential_version: Option<i64>,
     expires_at: Option<PrimitiveDateTime>,
     family_id: i64,
     session_status: String,
@@ -182,9 +291,21 @@ impl AccessSessionSource for MySqlAccessSessionSource {
         jti: &str,
         bind: &SessionBindContext,
     ) -> Result<Option<VerifiedAccessSessionFact>, String> {
-        load_verified_access_session_fact(&self.pool, jti, bind.identity_card_id.unwrap_or(0))
-            .await
-            .map_err(|error| format!("load access session fact failed: {error}"))
+        let fact = match astral_common::token_contract::PrincipalKind::parse(bind.principal_kind) {
+            Some(astral_common::token_contract::PrincipalKind::PlatformUser) => {
+                load_verified_platform_access_session_fact(
+                    &self.pool,
+                    jti,
+                    bind.identity_card_id.unwrap_or(0),
+                )
+                .await
+            }
+            Some(astral_common::token_contract::PrincipalKind::AppUser) => {
+                load_verified_app_access_session_fact(&self.pool, jti).await
+            }
+            None => Ok(None),
+        };
+        fact.map_err(|error| format!("load access session fact failed: {error}"))
     }
 
     async fn load_access_fact(
@@ -194,10 +315,23 @@ impl AccessSessionSource for MySqlAccessSessionSource {
     ) -> Result<Option<AccessSessionDurableFact>, String> {
         // identity_card 绑定取自 claims；缺失/非法直接按"事实不存在"处理
         // （Gateway 侧已有 validated_subject / principal 校验，这里双保险）。
-        let identity_card_id = bind.identity_card_id.unwrap_or(0);
-        load_active_access_session_fact(&self.pool, jti, identity_card_id)
-            .await
-            .map_err(|error| format!("load access session fact failed: {error}"))
+        match astral_common::token_contract::PrincipalKind::parse(bind.principal_kind) {
+            Some(astral_common::token_contract::PrincipalKind::PlatformUser) => {
+                load_active_platform_access_session_fact(
+                    &self.pool,
+                    jti,
+                    bind.identity_card_id.unwrap_or(0),
+                )
+                .await
+            }
+            Some(astral_common::token_contract::PrincipalKind::AppUser) => {
+                load_verified_app_access_session_fact(&self.pool, jti)
+                    .await
+                    .map(|verified| verified.map(|verified| verified.fact))
+            }
+            None => Ok(None),
+        }
+        .map_err(|error| format!("load access session fact failed: {error}"))
     }
 }
 
@@ -257,6 +391,67 @@ pub async fn record_session_jti_proof(
     if result.rows_affected() != 1 {
         return Err(AstralError::Auth(
             "Session is no longer active for access projection".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Strict PlatformUser proof: fence the current local credential revision and
+/// verify the pinned identity/user-card pair, status windows, tenant and domain.
+pub async fn record_platform_session_jti_proof(
+    pool: &MySqlPool,
+    session_id: i64,
+    jti: &str,
+    user_id: i64,
+    session_epoch: i64,
+    expires_at_epoch_second: i64,
+    identity_card_id: i64,
+) -> Result<(), AstralError> {
+    let guard = crate::memory_projection_hub::acquire_source_guard()?;
+    if let Some(guard) = guard.as_ref() {
+        guard.mark_commit_started();
+    }
+    let result = sqlx::query(
+        "INSERT INTO auth_session_jti_index \
+         (session_id, jti, user_id, session_epoch, status, issued_at, expires_at) \
+         SELECT ?, ?, ?, ?, 'ACTIVE', UTC_TIMESTAMP(), FROM_UNIXTIME(?) \
+         FROM auth_device_session s \
+         INNER JOIN user_local_credential lc ON lc.user_id = s.user_id \
+           AND lc.status = 'ACTIVE' AND lc.credential_version = s.credential_version \
+         INNER JOIN platform_user pu ON pu.user_id = s.user_id \
+           AND pu.status = 'ACTIVE' AND pu.deleted_at IS NULL \
+         INNER JOIN identity_card ic ON ic.user_id = s.user_id AND ic.card_id = ? \
+           AND ic.status = 'ACTIVE' AND (ic.expires_at IS NULL OR ic.expires_at >= UTC_TIMESTAMP()) \
+         INNER JOIN user_card uc ON uc.card_id = s.current_user_card_id AND uc.user_id = s.user_id \
+           AND uc.card_status = 'ACTIVE' AND uc.card_type != 'LEVEL_TEMPLATE_CARD' \
+           AND (uc.valid_from IS NULL OR uc.valid_from <= UTC_TIMESTAMP()) \
+           AND (uc.valid_until IS NULL OR uc.valid_until >= UTC_TIMESTAMP()) \
+         INNER JOIN tenant t ON t.tenant_id = uc.tenant_id AND t.status = 'ACTIVE' \
+         INNER JOIN tenant_domain_map tdm ON tdm.tenant_id = uc.tenant_id \
+           AND tdm.domain_id = uc.domain_id AND tdm.status = 'ACTIVE' \
+         WHERE s.session_id = ? AND s.user_id = ? AND s.status = 'ACTIVE' \
+           AND s.session_state = 'ACTIVE' AND s.session_epoch = ? \
+           AND s.credential_version IS NOT NULL AND s.credential_version > 0 \
+           AND uc.tenant_id > 0 AND uc.domain_id > 0",
+    )
+    .bind(session_id)
+    .bind(jti)
+    .bind(user_id)
+    .bind(session_epoch)
+    .bind(expires_at_epoch_second)
+    .bind(identity_card_id)
+    .bind(session_id)
+    .bind(user_id)
+    .bind(session_epoch)
+    .execute(pool)
+    .await
+    .map_err(|e| AstralError::Database(format!("Record PlatformUser session JTI proof failed: {e}")))?;
+    if let Some(guard) = guard.as_ref() {
+        guard.mark_commit_proven();
+    }
+    if result.rows_affected() != 1 {
+        return Err(AstralError::Auth(
+            "PlatformUser session is not eligible for access proof".into(),
         ));
     }
     Ok(())
@@ -868,14 +1063,28 @@ pub async fn install_verified_access_grant(
     if !grant.matches_bind(bind) {
         return Ok(false);
     }
-    let identity_card_id = bind.identity_card_id.unwrap_or(0);
-    let verified = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        load_verified_access_session_fact(pool, grant.jti.trim(), identity_card_id),
-    )
-    .await
-    .map_err(|_| AstralError::Database("verify access grant proof timed out".to_owned()))?
-    .map_err(|error| AstralError::Database(format!("Verify access grant proof failed: {error}")))?;
+    let verification = async {
+        match astral_common::token_contract::PrincipalKind::parse(bind.principal_kind) {
+            Some(astral_common::token_contract::PrincipalKind::PlatformUser) => {
+                load_verified_platform_access_session_fact(
+                    pool,
+                    grant.jti.trim(),
+                    bind.identity_card_id.unwrap_or(0),
+                )
+                .await
+            }
+            Some(astral_common::token_contract::PrincipalKind::AppUser) => {
+                load_verified_app_access_session_fact(pool, grant.jti.trim()).await
+            }
+            None => Ok(None),
+        }
+    };
+    let verified = tokio::time::timeout(std::time::Duration::from_secs(3), verification)
+        .await
+        .map_err(|_| AstralError::Database("verify access grant proof timed out".to_owned()))?
+        .map_err(|error| {
+            AstralError::Database(format!("Verify access grant proof failed: {error}"))
+        })?;
     let Some(verified) = verified else {
         return Ok(false);
     };
@@ -910,6 +1119,94 @@ pub fn note_session_invalidated_in_process(session_id: i64) {
     {
         store.note_session_invalidated(session_id);
     }
+}
+
+// ===== Identity credential/MFA schema contract (migration 20261003000001) =====
+
+const IDENTITY_FENCE_REQUIRED_COLUMNS: &[(&str, &str)] = &[
+    ("user_local_credential", "credential_version"),
+    ("auth_device_session", "credential_version"),
+    ("user_mfa", "last_totp_counter"),
+    ("mfa_attempt_log", "attempt_code"),
+    ("mfa_attempt_log", "status"),
+    ("mfa_attempt_log", "user_agent"),
+];
+
+/// Startup contract for MFA attempt reservation, one-time factor consumption, and
+/// credential-version fencing. The owning schema validator calls this before serving requests.
+pub async fn validate_identity_credential_fence_schema(pool: &MySqlPool) -> Result<(), String> {
+    for (table, column) in IDENTITY_FENCE_REQUIRED_COLUMNS {
+        let count = guard_metadata_count(
+            pool,
+            GUARD_COLUMN_EXISTS_SQL,
+            &[(*table).to_owned(), (*column).to_owned()],
+        )
+        .await?;
+        if count != 1 {
+            return Err(format!(
+                "Identity credential/MFA schema missing {table}.{column}; apply migration 20261003000001_identity_credential_fence before starting Identity"
+            ));
+        }
+    }
+    for (table, index, columns) in [
+        (
+            "mfa_attempt_log",
+            "uk_mal_attempt_code",
+            &["attempt_code"][..],
+        ),
+        (
+            "auth_device_session",
+            "idx_ads_user_credential_version",
+            &["user_id", "credential_version", "status"][..],
+        ),
+    ] {
+        let (count_raw, min_raw, max_raw): (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>) =
+            sqlx::query_as(GUARD_KEY_COLUMN_STATS_SQL)
+                .bind(table)
+                .bind(index)
+                .fetch_one(pool)
+                .await
+                .map_err(|error| {
+                    format!("Inspect Identity index {table}.{index} failed: {error}")
+                })?;
+        let count = guard_metadata_count_value(&count_raw)?;
+        let unique = count > 0
+            && matches!(
+                (
+                    min_raw.as_deref().map(guard_metadata_count_value),
+                    max_raw.as_deref().map(guard_metadata_count_value)
+                ),
+                (Some(Ok(0)), Some(Ok(0)))
+            );
+        let expected_count = columns.len() as u64;
+        let mut matches = count == expected_count;
+        if matches {
+            for (offset, column) in columns.iter().enumerate() {
+                if guard_metadata_count(
+                    pool,
+                    GUARD_KEY_COLUMN_AT_SQL,
+                    &[
+                        table.to_owned(),
+                        index.to_owned(),
+                        (offset + 1).to_string(),
+                        (*column).to_owned(),
+                    ],
+                )
+                .await?
+                    != 1
+                {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+        if !matches || (index == "uk_mal_attempt_code" && !unique) {
+            return Err(format!(
+                "Identity index {table}.{index} has incompatible columns/uniqueness; apply migration 20261003000001_identity_credential_fence"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Gateway strict 判定入口：全局 store 缺失 → `Unavailable`（fail-closed）。
@@ -953,6 +1250,36 @@ mod tests {
     use super::*;
     use time::{Date, Month, Time};
 
+    #[test]
+    fn strict_platform_session_sql_requires_current_credential_and_epoch() {
+        let source = include_str!("session_state_repository.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let platform = source
+            .split("async fn load_verified_platform_access_session_fact(")
+            .nth(1)
+            .unwrap()
+            .split("struct AccessSessionFactRow")
+            .next()
+            .unwrap();
+        assert!(platform.contains("lc.credential_version = s.credential_version"));
+        assert!(platform.contains("s.credential_version IS NOT NULL AND s.credential_version > 0"));
+        assert!(platform.contains("s.session_epoch = i.session_epoch"));
+        let app = source
+            .split("async fn load_verified_app_access_session_fact(")
+            .nth(1)
+            .unwrap()
+            .split("async fn load_verified_platform_access_session_fact(")
+            .next()
+            .unwrap();
+        assert!(app.contains("NULL AS session_credential_version"));
+        assert!(app.contains("s.session_epoch = i.session_epoch"));
+        assert!(!app.contains("JOIN user_local_credential"));
+        assert!(!app.contains("JOIN user_card"));
+        assert!(!source.contains("\\\\\n"));
+    }
+
     fn utc(y: i32, m: Month, d: u8, h: u8) -> PrimitiveDateTime {
         PrimitiveDateTime::new(
             Date::from_calendar_date(y, m, d).unwrap(),
@@ -968,6 +1295,7 @@ mod tests {
             session_epoch: 3,
             jti_status: "ACTIVE".into(),
             session_version: 2,
+            session_credential_version: Some(1),
             expires_at: Some(utc(2026, Month::October, 1, 20)),
             family_id: 11,
             session_status: "ACTIVE".into(),

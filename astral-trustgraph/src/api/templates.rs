@@ -512,14 +512,58 @@ async fn delete_template_rule(
 
 /// GET /main/api/v1/operations/{task_id} — 查询异步操作状态
 async fn get_operation_status(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(task_id): Path<String>,
 ) -> Result<Json<ApiResponse<AsyncTask>>, AppError> {
-    match async_tracker::tracker().get(&task_id).await {
-        Some(task) => Ok(Json(ApiResponse::success(task))),
-        None => Err(AppError(AstralError::NotFound(format!(
-            "operation {task_id}"
-        )))),
-    }
+    let requester_user_id = headers
+        .get("x-user-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| AppError(AstralError::Auth("verified requester required".into())))?;
+    let requester_card_id = headers
+        .get("x-user-card-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            AppError(AstralError::Permission(
+                "requester card context required".into(),
+            ))
+        })?;
+    let requester_tenant_id = headers
+        .get("x-user-card-tenant-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            AppError(AstralError::Permission(
+                "requester tenant context required".into(),
+            ))
+        })?;
+    let requester_domain_id = headers
+        .get("x-user-card-domain-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            AppError(AstralError::Permission(
+                "requester domain context required".into(),
+            ))
+        })?;
+    let task = async_tracker::load_operation_for_requester(
+        &state.db,
+        &task_id,
+        requester_user_id,
+        requester_card_id,
+        requester_tenant_id,
+        requester_domain_id,
+    )
+    .await
+    .map_err(AppError::from)?
+    .ok_or_else(|| AppError(AstralError::NotFound(format!("operation {task_id}"))))?;
+    Ok(Json(ApiResponse::success(task)))
 }
 
 // ===== Template Rule DTOs =====

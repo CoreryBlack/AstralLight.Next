@@ -208,11 +208,18 @@ class FakeE3Probe:
         verb = argv[0] if argv else ""
         if verb == "PING":
             return "PONG"
+        if verb == "LLEN":
+            return "0"
         if verb == "GET" and len(argv) > 1 and argv[1] == CACHE_EPOCH_KEY:
             return "epoch-token-1"
         return ""
 
     def signed_get(self, node: str, path: str) -> Tuple[int, Dict[str, Any]]:
+        return 200, {"allowed": True}
+
+    def signed_get(self, node: str, path: str) -> Tuple[int, Dict[str, Any]]:
+        if path == "/health":
+            return 200, {"healthy": True}
         return 200, {"allowed": True}
 
     def signed_get_for_role(
@@ -227,7 +234,11 @@ class FakeE3Probe:
         if status == 200 and body.get("allowed") is True:
             self.decision_by_request[request_id] = "ALLOW"
         elif status in (401, 403, 503) or body.get("allowed") is False:
-            self.decision_by_request[request_id] = "PENDING" if status == 503 else "DENY"
+            self.decision_by_request[request_id] = (
+                "PENDING"
+                if "AUTHORIZATION_PENDING" in str(body.get("reason", "")).upper()
+                else "DENY"
+            )
         else:
             self.decision_by_request[request_id] = "UNKNOWN"
         return status, body, request_id
@@ -266,19 +277,19 @@ class FakeController:
 
     def begin_injection(self, operation_id: str) -> Mapping[str, Any]:
         self._record("begin_injection", operation_id)
-        return {"ack": "injection-active"}
+        return {"operation_id": operation_id, "state": "ACTIVE", "applied": True}
 
     def end_injection(self, operation_id: str) -> Mapping[str, Any]:
         self._record("end_injection", operation_id)
-        return {"ack": "injection-stopped"}
+        return {"operation_id": operation_id, "state": "INACTIVE", "applied": True}
 
     def begin_drain(self, operation_id: str) -> Mapping[str, Any]:
         self._record("begin_drain", operation_id)
-        return {"ack": "drain-started"}
+        return {"operation_id": operation_id, "state": "DRAINING", "applied": True}
 
     def end_drain(self, operation_id: str) -> Mapping[str, Any]:
         self._record("end_drain", operation_id)
-        return {"ack": "drain-finished"}
+        return {"operation_id": operation_id, "state": "DRAINED", "applied": True}
 
 
 class HangingController(FakeController):
@@ -344,20 +355,40 @@ class DynamicRequestLogCollector:
             )
             sequence = next(self._sequence)
             if self.mode == "admit_all" or (self.mode == "consistent" and classification == "ALLOW"):
-                lines.append(
-                    json.dumps(
-                        {
-                            "message": "e1 authorization observation",
-                            "event": "decision_return",
-                            "request_id": request_id,
-                            "process_observation_id": "request-worker-1",
-                            "event_sequence": sequence,
-                            "wall_unix_ns": UTC_EPOCH_NS + sequence,
-                            "allowed": True,
-                            "reason": "",
-                        }
-                    )
+                allowed = True
+                reason = ""
+            elif self.mode == "deny_all":
+                allowed = False
+                reason = "NO_MATCH"
+            else:
+                allowed = False
+                reason = "AUTHORIZATION_PENDING" if classification == "PENDING" else "DEFAULT_DENY"
+            context = {
+                "user_id": 9031,
+                "tenant_id": 9001,
+                "card_id": 9061,
+                "resource": "monitor",
+                "action": "read",
+            }
+            lines.append(
+                json.dumps(
+                    {
+                        "message": "e1 authorization observation",
+                        "event": "decision_return",
+                        "request_id": request_id,
+                        "process_observation_id": "request-worker-1",
+                        "event_sequence": sequence,
+                        "wall_unix_ns": UTC_EPOCH_NS + sequence,
+                        "allowed": allowed,
+                        "reason": reason,
+                        **context,
+                    }
                 )
+            )
+            if self.mode == "admit_all" or (
+                self.mode == "consistent" and classification == "ALLOW"
+            ):
+                admission_sequence = next(self._sequence)
                 lines.append(
                     json.dumps(
                         {
@@ -365,25 +396,9 @@ class DynamicRequestLogCollector:
                             "event": "host_admission",
                             "request_id": request_id,
                             "process_observation_id": "request-worker-1",
-                            "event_sequence": next(self._sequence),
-                            "wall_unix_ns": UTC_EPOCH_NS + sequence,
-                            "allowed": True,
-                        }
-                    )
-                )
-            else:
-                allowed = False if self.mode == "deny_all" else None
-                lines.append(
-                    json.dumps(
-                        {
-                            "message": "e1 authorization observation",
-                            "event": "decision_return",
-                            "request_id": request_id,
-                            "process_observation_id": "request-worker-1",
-                            "event_sequence": sequence,
-                            "wall_unix_ns": UTC_EPOCH_NS + sequence,
-                            "allowed": allowed,
-                            "reason": "" if allowed is False else "AUTHORIZATION_PENDING",
+                            "event_sequence": admission_sequence,
+                            "wall_unix_ns": UTC_EPOCH_NS + admission_sequence,
+                            **context,
                         }
                     )
                 )
@@ -444,6 +459,10 @@ class E3RunnerTestCase(unittest.TestCase):
             if approval_validator is unset
             else approval_validator
         )
+        resolved_sample_config = sample_config if sample_config is not None else E3SampleConfig(
+            redis_queue_keys=("astral.test.queue",),
+            worker_health_path="/health",
+        )
         result = e3_runner.execute_campaign(
             config or BASE_CONFIG,
             tmp / "out",
@@ -452,7 +471,7 @@ class E3RunnerTestCase(unittest.TestCase):
             collector=collector,
             row_reader=row_reader,
             request_log_collector=request_log_collector,
-            sample_config=sample_config,
+            sample_config=resolved_sample_config,
             allow_live_execution=allow_live_execution,
             approval_ref=approval_ref,
             approval_record=approval_record if approval_record is not None else approval_record_default(),
@@ -745,6 +764,10 @@ class TestGoldenPath(E3RunnerTestCase):
                 collector=FakeE3Collector({"node-a": PUBLISH_HISTORY}),
                 row_reader=FakeRowReader(PUBLISH_ROWS),
                 request_log_collector=DynamicRequestLogCollector(probe),
+                sample_config=E3SampleConfig(
+                    redis_queue_keys=("astral.test.queue",),
+                    worker_health_path="/health",
+                ),
                 wall_clock=counter_clock(UTC_EPOCH_NS, 1_000_000),
                 mono_clock=counter_clock(1_000, 10),
             )
@@ -971,7 +994,7 @@ class TestPerEventDurable(E3RunnerTestCase):
                 request_log_collector=DynamicRequestLogCollector(probe),
             )
             self.assertEqual(result["perEventRetryHistory"]["status"], "PENDING")
-            self.assertEqual(result["status"], "PENDING")
+            self.assertEqual(result["status"], "UNKNOWN")
             self.assertNoPass(result)
 
     def test_missing_durable_row_is_unknown(self) -> None:
@@ -1243,7 +1266,7 @@ class TestOutputCategories(E3RunnerTestCase):
             )
             self.assertEqual(result["sampling"]["injection_window"]["outcome"], "skipped")
             self.assertEqual(result["sampling"]["drain_window"]["outcome"], "skipped")
-            self.assertEqual(result["status"], "SKIP")
+            self.assertEqual(result["status"], "BLOCKED")
             self.assertNoPass(result)
 
 
@@ -1297,7 +1320,7 @@ class TestHostAdmissionCrosscheck(E3RunnerTestCase):
             self.assertEqual(result["status"], "FAIL")
             self.assertNoPass(result)
 
-    def test_no_request_log_collector_is_skip(self) -> None:
+    def test_no_request_log_collector_is_unknown_not_pass(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             result = self.run_campaign(
                 Path(raw_tmp),
@@ -1306,7 +1329,7 @@ class TestHostAdmissionCrosscheck(E3RunnerTestCase):
                 request_log_collector=None,
             )
             self.assertEqual(result["hostAdmissionCrosscheck"]["status"], "SKIP")
-            self.assertEqual(result["status"], "SKIP")
+            self.assertEqual(result["status"], "UNKNOWN")
             self.assertNoPass(result)
 
 
@@ -1446,7 +1469,7 @@ class TestApprovalAndPairingGuards(E3RunnerTestCase):
                 sequence=1,
                 wall_unix_ns=100,
                 monotonic_ns=100,
-                ack={"present": True},
+                ack={"present": True, "operation_id": ops["injection"], "state": "ACTIVE", "applied": True},
             ),
             e3_runner.PhaseMarker(
                 marker="injection_end",
@@ -1454,7 +1477,7 @@ class TestApprovalAndPairingGuards(E3RunnerTestCase):
                 sequence=2,
                 wall_unix_ns=200,
                 monotonic_ns=200,
-                ack={"present": True},
+                ack={"present": True, "operation_id": ops["injection"], "state": "INACTIVE", "applied": True},
             ),
             e3_runner.PhaseMarker(
                 marker="drain_start",
@@ -1462,7 +1485,7 @@ class TestApprovalAndPairingGuards(E3RunnerTestCase):
                 sequence=3,
                 wall_unix_ns=300,
                 monotonic_ns=300,
-                ack={"present": True},
+                ack={"present": True, "operation_id": ops["drain"], "state": "DRAINING", "applied": True},
             ),
             e3_runner.PhaseMarker(
                 marker="drain_end",
@@ -1470,7 +1493,7 @@ class TestApprovalAndPairingGuards(E3RunnerTestCase):
                 sequence=4,
                 wall_unix_ns=400,
                 monotonic_ns=400,
-                ack={"present": True},
+                ack={"present": True, "operation_id": ops["drain"], "state": "DRAINED", "applied": True},
             ),
         ]
         report = e3_runner.validate_markers(markers, ops)
@@ -1543,6 +1566,135 @@ class TestApprovalAndPairingGuards(E3RunnerTestCase):
         self.assertEqual(report["status"], "UNKNOWN", "a failed log parse must stay UNKNOWN")
         self.assertIn("crosscheck_parse_error:%s" % target_node, problems)
         self.assertEqual(report["contradictions"], [])
+
+
+class StaticRequestLogCollector:
+    def __init__(self, lines_by_node: Mapping[str, Sequence[str]]) -> None:
+        self.lines_by_node = dict(lines_by_node)
+
+    def collect_request_lines(self, node: str, request_ids: Sequence[str]) -> List[str]:
+        wanted = set(request_ids)
+        return [
+            line for line in self.lines_by_node.get(node, [])
+            if json.loads(line).get("request_id") in wanted
+        ]
+
+
+def authz_event_line(
+    event: str,
+    request_id: str,
+    sequence: int,
+    *,
+    process: str = "request-worker-1",
+    allowed: bool = True,
+    reason: str = "",
+    context: Optional[Mapping[str, Any]] = None,
+) -> str:
+    record: Dict[str, Any] = {
+        "message": "e1 authorization observation",
+        "event": event,
+        "request_id": request_id,
+        "process_observation_id": process,
+        "event_sequence": sequence,
+        "wall_unix_ns": UTC_EPOCH_NS + sequence,
+        "user_id": 9031,
+        "tenant_id": 9001,
+        "card_id": 9061,
+        "resource": "monitor",
+        "action": "read",
+        "allowed": allowed,
+        "reason": reason,
+    }
+    if context:
+        record.update(context)
+    return json.dumps(record)
+
+
+class TestFiveReviewedE3Predicates(unittest.TestCase):
+    def setUp(self) -> None:
+        self.settings = e3_runner.load_e3_config(BASE_CONFIG)
+
+    def check(self, collector: Any, decisions: Mapping[str, str], **kwargs: Any) -> Dict[str, Any]:
+        return e3_runner.crosscheck_host_admissions(
+            collector, self.settings, decisions, [], [], **kwargs
+        )
+
+    def test_missing_unique_decision_return_cannot_pass(self) -> None:
+        collector = StaticRequestLogCollector({"node-a": [
+            authz_event_line("host_admission", "req-1", 2),
+        ]})
+        result = self.check(collector, {"req-1": "ALLOW"})
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertEqual(result["unverified"], 1)
+
+    def test_missing_invalid_duplicate_and_truncated_sample_ids_cannot_pass(self) -> None:
+        complete = StaticRequestLogCollector({"node-a": [
+            authz_event_line("decision_return", "req-1", 1),
+            authz_event_line("host_admission", "req-1", 2),
+        ]})
+        cases = (
+            {"invalid_request_id_samples": 1},
+            {"duplicate_request_ids": ["req-1"]},
+            {"sample_stream_truncated": True},
+        )
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                self.assertEqual(
+                    self.check(complete, {"req-1": "ALLOW"}, **kwargs)["status"],
+                    "UNKNOWN",
+                )
+        self.assertEqual(self.check(complete, {}, invalid_request_id_samples=1)["status"], "UNKNOWN")
+
+    def test_duplicate_decision_return_is_a_contradiction(self) -> None:
+        lines = [
+            authz_event_line("decision_return", "req-1", 1),
+            authz_event_line("decision_return", "req-1", 2),
+            authz_event_line("host_admission", "req-1", 3),
+        ]
+        result = self.check(StaticRequestLogCollector({"node-a": lines}), {"req-1": "ALLOW"})
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("duplicate_decision_return", {item["kind"] for item in result["contradictions"]})
+
+    def test_allow_requires_later_admission_same_context_process(self) -> None:
+        lines = [
+            authz_event_line("decision_return", "req-1", 5),
+            authz_event_line("host_admission", "req-1", 6, context={"card_id": 99}),
+        ]
+        result = self.check(StaticRequestLogCollector({"node-a": lines}), {"req-1": "ALLOW"})
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn(
+            "host_admission_identity_order_or_context_mismatch",
+            {item["kind"] for item in result["contradictions"]},
+        )
+
+    def test_effect_marker_requires_applied_identity_and_state(self) -> None:
+        op = "op-1"
+        self.assertFalse(e3_runner._controller_effect_proven({"ack": True}, op, "ACTIVE"))
+        self.assertFalse(e3_runner._controller_effect_proven(
+            {"operation_id": "other", "applied": True, "state": "ACTIVE"}, op, "ACTIVE"
+        ))
+        self.assertFalse(e3_runner._controller_effect_proven(
+            {"operation_id": op, "applied": False, "state": "ACTIVE"}, op, "ACTIVE"
+        ))
+        self.assertTrue(e3_runner._controller_effect_proven(
+            {"operation_id": op, "applied": True, "state": "ACTIVE"}, op, "ACTIVE"
+        ))
+
+    def test_reads_alone_do_not_prove_publication_drain(self) -> None:
+        stream = e3_runner._WindowStream("drain")
+        stream({
+            "seq": 1,
+            "queue_counts": {"status": "PASS", "entries": {"q": {"status": "PASS", "value": 3}}},
+            "row_counts": {"status": "PASS", "entries": {"rows": {"status": "PASS", "value": 0}}},
+            "pointers": {"status": "PASS", "entries": {"p": {"status": "PASS", "value": "g1"}}},
+            "worker_health": {"health_endpoint": {"status": "PASS", "healthy": True}},
+            "decisions": [],
+        })
+        categories = e3_runner.build_output_categories(
+            None, stream, {"status": "PASS"}, host_crosscheck={"status": "PASS"}
+        )
+        self.assertEqual(categories[e3_runner.CATEGORY_PUBLICATION]["status"], "UNKNOWN")
+        self.assertEqual(categories[e3_runner.CATEGORY_PER_EVENT]["status"], "PASS")
 
 
 if __name__ == "__main__":

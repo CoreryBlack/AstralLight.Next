@@ -45,19 +45,18 @@ impl ProgressService {
         })
     }
 
-    /// 更新进度：INSERT IGNORE 幂等记录首次作答 → 重算进度（对齐原 handler 编排）
+    /// Client-provided correctness is not a scoring proof. The current Learn
+    /// schema has no authoritative server-side answer evaluation transaction.
     pub async fn update_progress(
         &self,
-        user_id: i64,
-        subject_id: i64,
-        question_id: i64,
-        correct: bool,
+        _user_id: i64,
+        _subject_id: i64,
+        _question_id: i64,
+        _correct: bool,
     ) -> Result<LearningProgress, AstralError> {
-        self.repo
-            .insert_ignore_first_attempt(user_id, question_id, subject_id, correct)
-            .await?;
-        tracing::info!(user_id, question_id, correct, "learning progress updated");
-        self.get_progress(user_id, subject_id).await
+        Err(AstralError::NotImplemented(
+            "Progress updates require server-scored persisted answers; client correctness is not accepted".into(),
+        ))
     }
 }
 
@@ -172,20 +171,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_progress_inserts_then_recomputes() {
-        // INSERT IGNORE → 重算（对齐原 handler update → get 重新编排）
-        let repo = Arc::new(FakeProgressRepository::new(100, 50, 40, 3));
+    async fn update_progress_rejects_client_supplied_correctness() {
+        let repo = Arc::new(FakeProgressRepository::new(100, 0, 0, 0));
         let svc = ProgressService::new(repo.clone());
-        let p = svc.update_progress(7, 1, 5, true).await.unwrap();
-        assert_eq!(p.accuracy, 0.8);
-        assert_eq!(
-            repo.calls.lock().unwrap().clone(),
-            vec![
-                "insert:7:5:1:true".to_string(),
-                "count_questions:1".to_string(),
-                "attempt_stats:7:1".to_string(),
-                "streak:7:1".to_string(),
-            ]
-        );
+        let error = svc.update_progress(7, 1, 5, true).await.unwrap_err();
+        assert!(matches!(error, AstralError::NotImplemented(_)));
+        assert!(repo.calls.lock().unwrap().is_empty());
     }
 }

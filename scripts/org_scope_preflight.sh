@@ -112,6 +112,10 @@ parse_mysql_uri() {
   password=$(decode_uri_component "${password_encoded}") || return 1
   database=$(decode_uri_component "${database_encoded}") || return 1
   [[ -n "${user}" && -n "${database}" && "${database}" != */* ]] || return 1
+  case "${database}" in
+    astral_test|astral_rehearsal) ;;
+    *) return 1 ;;
+  esac
 
   if [[ "${hostport}" == \[* ]]; then
     host="${hostport#\[}"
@@ -136,6 +140,10 @@ parse_mysql_uri() {
     [[ -n "${host}" && "${host}" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
   fi
 
+  case "${host}" in
+    localhost|LOCALHOST|Localhost|127.0.0.1|::1) ;;
+    *) return 1 ;;
+  esac
   [[ "${port}" =~ ^[0-9]{1,5}$ ]] || return 1
   port_number=$((10#${port}))
   (( port_number >= 1 && port_number <= 65535 )) || return 1
@@ -167,6 +175,8 @@ self_test_connection_parser() {
 
   for invalid in \
     'mysql://user:pass@localhost/db?ssl-mode=REQUIRED' \
+    'mysql://user:pass@db.example:3308/astral_test' \
+    'mysql://user:pass@localhost:3308/production' \
     'mysql://user:bad%0apass@localhost/db' \
     'mysql://user:pass@localhost/db/child' \
     'mysql://user:pass:word@localhost/db' \

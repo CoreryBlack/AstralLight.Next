@@ -79,6 +79,8 @@ async fn refresh_token(
         .parse::<i64>()
         .map_err(|_| AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into())))?;
     let refresh_hash = sha256_hash(raw_refresh);
+    // The signed REFRESH claim, not missing card data, owns the session kind.
+    // Reject mismatched principal/session shapes before any rotation can occur.
     let principal_kind = PrincipalKind::parse(&claims.principal_kind)
         .ok_or_else(|| AppError::from(AstralError::Auth("PRINCIPAL_KIND_INVALID".into())))?;
     let session = session_repo::load_active_refresh_session(&state.db, &refresh_hash)
@@ -91,6 +93,23 @@ async fn refresh_token(
                 && row.session_epoch == claims.sev.unwrap_or_default()
         })
         .ok_or_else(|| AstralError::Auth("Invalid refresh session".into()))?;
+    match principal_kind {
+        PrincipalKind::PlatformUser
+            if session
+                .credential_version
+                .is_none_or(|version| version <= 0) =>
+        {
+            return Err(AppError::from(AstralError::Auth(
+                "CREDENTIAL_REVISION_REQUIRED".into(),
+            )));
+        }
+        PrincipalKind::AppUser if session.current_user_card_id.is_some() => {
+            return Err(AppError::from(AstralError::Auth(
+                "APP_USER_CARD_CONTEXT_FORBIDDEN".into(),
+            )));
+        }
+        _ => {}
+    }
     refresh_token_from_session(&state, session, raw_refresh, principal_kind).await
 }
 
@@ -308,6 +327,23 @@ async fn refresh_token_from_session(
         .session_epoch
         .checked_add(1)
         .ok_or_else(|| AstralError::Auth("Session epoch exhausted. Please login again.".into()))?;
+    if principal_kind == PrincipalKind::PlatformUser {
+        let current_credential_version: Option<i64> = sqlx::query_scalar(
+            "SELECT credential_version FROM user_local_credential WHERE user_id = ? AND status = 'ACTIVE' LIMIT 1",
+        )
+        .bind(session.user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|error| AstralError::Database(format!("Verify refresh credential revision failed: {error}")))?;
+        if current_credential_version
+            .is_none_or(|version| version <= 0 || session.credential_version != Some(version))
+        {
+            return Err(AppError::from(AstralError::Auth(
+                "CREDENTIAL_REVISION_MISMATCH".into(),
+            )));
+        }
+    }
+
     let new_expiry = now + Duration::seconds(state.config.jwt.refresh.expiry_seconds);
     let session_context = SessionContext {
         session_id: session.session_id,
@@ -830,14 +866,31 @@ pub(crate) async fn store_session_grant_projection(
 ) -> Result<(), AstralError> {
     #[cfg(feature = "redis-compat")]
     let ttl = token.expires_in.max(60) as u64;
-    record_session_jti_proof(
-        state,
-        token,
-        grant.user_id,
-        grant.session_id,
-        grant.session_epoch,
-    )
-    .await?;
+    let principal_kind = PrincipalKind::parse(&grant.principal_kind)
+        .ok_or_else(|| AstralError::Auth("PRINCIPAL_KIND_INVALID".into()))?;
+    if principal_kind == PrincipalKind::PlatformUser {
+        record_platform_session_jti_proof(
+            state,
+            token,
+            grant.user_id,
+            grant.session_id,
+            grant.session_epoch,
+            grant
+                .identity_card_id
+                .ok_or_else(|| AstralError::Auth("IDENTITY_CARD_CONTEXT_REQUIRED".into()))?,
+        )
+        .await?;
+    } else {
+        astral_db::record_session_jti_proof(
+            &state.db,
+            grant.session_id,
+            &token.jti,
+            grant.user_id,
+            grant.session_epoch,
+            token.expires_at_epoch_second,
+        )
+        .await?;
+    }
 
     // 兼容 adapter：仅当显式配置（redis_projection_compat_enabled → runtime
     // 装配 redis）时写入历史 Redis 投影，失败即签发失败。
@@ -918,23 +971,62 @@ fn install_verified_session_grant_mirror(
     });
 }
 
-/// Record the durable jti proof for an issued access credential.
-async fn record_session_jti_proof(
+/// Record a strict PlatformUser JTI proof, including card and credential fences.
+async fn record_platform_session_jti_proof(
     state: &AppState,
     token: &TokenResult,
     user_id: i64,
     session_id: i64,
     session_epoch: i64,
+    identity_card_id: i64,
 ) -> Result<(), AstralError> {
-    astral_db::record_session_jti_proof(
+    astral_db::record_platform_session_jti_proof(
         &state.db,
         session_id,
         &token.jti,
         user_id,
         session_epoch,
         token.expires_at_epoch_second,
+        identity_card_id,
     )
     .await
+}
+
+/// Record a session JTI proof using the authenticated refresh principal kind.
+async fn record_session_jti_proof(
+    state: &AppState,
+    token: &TokenResult,
+    user_id: i64,
+    session_id: i64,
+    session_epoch: i64,
+    principal_kind: PrincipalKind,
+    identity_card_id: Option<i64>,
+) -> Result<(), AstralError> {
+    match principal_kind {
+        PrincipalKind::PlatformUser => {
+            record_platform_session_jti_proof(
+                state,
+                token,
+                user_id,
+                session_id,
+                session_epoch,
+                identity_card_id
+                    .ok_or_else(|| AstralError::Auth("IDENTITY_CARD_CONTEXT_REQUIRED".into()))?,
+            )
+            .await
+        }
+        PrincipalKind::AppUser => {
+            astral_db::record_session_jti_proof(
+                &state.db,
+                session_id,
+                &token.jti,
+                user_id,
+                session_epoch,
+                token.expires_at_epoch_second,
+            )
+            .await
+        }
+    }
 }
 
 async fn delete_session_projections_before_epoch(
@@ -1013,6 +1105,32 @@ async fn delete_indexed_session_projections(
         compat_delete_and_revoke(redis, &jtis).await?;
     }
     for jti in &jtis {
+        mark_registry_revoked(jti, REVOKED_TTL_SECS);
+    }
+    Ok(())
+}
+
+/// Post-commit password revocation projection. Source JTIs/session/family were
+/// already committed atomically; this function never reloads a broader snapshot.
+pub(crate) async fn project_password_revocation(
+    _state: &AppState,
+    revoked_jtis: &[String],
+    #[cfg(feature = "redis-compat")] redis: Option<&ConnectionManager>,
+    #[cfg(not(feature = "redis-compat"))] _redis: Option<&()>,
+) -> Result<(), AstralError> {
+    for jti in revoked_jtis {
+        if jti.trim().is_empty() {
+            return Err(AstralError::Validation(
+                "Password revocation snapshot contains an empty JTI".into(),
+            ));
+        }
+    }
+    #[cfg(feature = "redis-compat")]
+    if let Some(redis) = redis {
+        compat_delete_and_revoke(redis, revoked_jtis).await?;
+    }
+    astral_db::note_revocations_in_process(revoked_jtis, astral_db::REVOCATION_MIRROR_TTL_SECS);
+    for jti in revoked_jtis {
         mark_registry_revoked(jti, REVOKED_TTL_SECS);
     }
     Ok(())
@@ -1164,6 +1282,13 @@ pub(crate) async fn switch_card_session(
         .parse::<i64>()
         .map_err(|_| AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into())))?;
     let refresh_hash = sha256_hash(refresh_token);
+    let principal_kind = PrincipalKind::parse(&claims.principal_kind)
+        .ok_or_else(|| AppError::from(AstralError::Auth("PRINCIPAL_KIND_INVALID".into())))?;
+    if principal_kind != PrincipalKind::PlatformUser {
+        return Err(AppError::from(AstralError::Auth(
+            "SWITCH_CARD_PLATFORM_USER_REQUIRED".into(),
+        )));
+    }
     let session = session_repo::load_active_refresh_session(&state.db, &refresh_hash)
         .await?
         .filter(|row| {
@@ -1171,6 +1296,7 @@ pub(crate) async fn switch_card_session(
                 && row.family_id == family_id
                 && row.user_id == user_id
                 && row.current_user_card_id.is_some()
+                && row.credential_version.is_some_and(|version| version > 0)
                 && row.session_version == claims.session_version.unwrap_or_default()
                 && row.session_epoch == claims.sev.unwrap_or_default()
         })
@@ -1269,6 +1395,8 @@ pub(crate) async fn switch_card_session(
                 user_id,
                 session.session_id,
                 session.session_epoch,
+                PrincipalKind::PlatformUser,
+                claims.identity_card_id,
             )
             .await
             {

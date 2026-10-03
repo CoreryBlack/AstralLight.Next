@@ -331,7 +331,7 @@ impl MonitorService {
         Ok(())
     }
 
-    /// 写入单个服务的 latency 与 reachable 指标。
+    /// Write a completed probe's latency and reachability (UP=1, DOWN=0).
     pub async fn collect_service_metrics(
         &self,
         service_name: &str,
@@ -345,6 +345,18 @@ impl MonitorService {
             .insert_metric(service_name, "reachable", if reachable { 1.0 } else { 0.0 })
             .await?;
         Ok(())
+    }
+
+    /// Record an unavailable probe contract without fabricating latency or
+    /// converting it into a failed reachability sample. The distinct status
+    /// marker takes precedence over older reachable metrics.
+    pub async fn collect_unknown_service_probe(
+        &self,
+        service_name: &str,
+    ) -> Result<(), AstralError> {
+        self.repository
+            .insert_metric(service_name, "probe_status_unknown", 1.0)
+            .await
     }
 
     /// 写入 redis 服务的 6 个指标。

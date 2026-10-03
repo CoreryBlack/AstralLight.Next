@@ -3,7 +3,8 @@
 //! 对齐 Java `AuditLogMapper` 边界（audit_log 表）。
 
 use async_trait::async_trait;
-use sqlx::{MySqlPool, Transaction};
+use sqlx::{MySql, MySqlPool, QueryBuilder, Transaction};
+use time::{format_description, Date, OffsetDateTime, PrimitiveDateTime, Time};
 
 use astral_db::USER_VISIBLE_AUDIT_PREDICATE;
 use astral_types::{AstralError, SYSTEM_ACTOR_ID};
@@ -750,6 +751,66 @@ pub struct AuditLogRecord {
     pub card_id: Option<i64>,
 }
 
+/// 审计日志查询过滤。日期只接受固定 ISO 日期或 RFC3339，全部通过绑定参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditLogFilter {
+    pub user_id: Option<i64>,
+    pub action: Option<String>,
+    pub from: Option<PrimitiveDateTime>,
+    pub to_exclusive: Option<PrimitiveDateTime>,
+}
+
+impl AuditLogFilter {
+    pub fn new(
+        user_id: Option<i64>,
+        action: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Self, AstralError> {
+        if user_id.is_some_and(|id| id <= 0) {
+            return Err(AstralError::Validation(
+                "audit userId must be positive".into(),
+            ));
+        }
+        let action = action
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        if action
+            .as_ref()
+            .is_some_and(|value| value.len() > 64 || value.contains('\0'))
+        {
+            return Err(AstralError::Validation(
+                "audit action filter is invalid".into(),
+            ));
+        }
+        let from = from.map(parse_audit_filter_time).transpose()?;
+        let to = to.map(parse_audit_filter_time).transpose()?;
+        if from.zip(to).is_some_and(|(from, to)| from > to) {
+            return Err(AstralError::Validation(
+                "audit from must not be after to".into(),
+            ));
+        }
+        let to_exclusive = to.map(|value| value + time::Duration::seconds(1));
+        Ok(Self {
+            user_id,
+            action,
+            from,
+            to_exclusive,
+        })
+    }
+}
+
+fn parse_audit_filter_time(value: &str) -> Result<PrimitiveDateTime, AstralError> {
+    let raw = value.trim();
+    if let Ok(date) = Date::parse(raw, &format_description::well_known::Iso8601::DEFAULT) {
+        return Ok(PrimitiveDateTime::new(date, Time::MIDNIGHT));
+    }
+    let timestamp = OffsetDateTime::parse(raw, &format_description::well_known::Rfc3339)
+        .map_err(|_| AstralError::Validation("audit dates must be ISO date or RFC3339".into()))?;
+    Ok(PrimitiveDateTime::new(timestamp.date(), timestamp.time()))
+}
+
 /// 审计统计
 #[derive(Debug, Clone, Default)]
 pub struct AuditStatsRecord {
@@ -757,15 +818,18 @@ pub struct AuditStatsRecord {
     pub allowed: i64,
     pub denied: i64,
     pub unique_users: i64,
+    pub top_resources: Vec<(String, i64)>,
 }
 
 #[async_trait]
 pub trait AuditLogRepository: Send + Sync {
-    /// 用户可见审计总数（排除 INTERNAL 系统生命周期记录）。
-    async fn count_logs(&self) -> Result<i64, AstralError>;
-    /// 用户可见审计分页列表（排除 INTERNAL，ORDER BY created_at DESC）。
-    async fn list_logs(&self, limit: i64, offset: i64) -> Result<Vec<AuditLogRecord>, AstralError>;
-    /// 用户可见审计统计（total / allowed / denied / unique users）。
+    async fn count_logs(&self, filter: &AuditLogFilter) -> Result<i64, AstralError>;
+    async fn list_logs(
+        &self,
+        filter: &AuditLogFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditLogRecord>, AstralError>;
     async fn stats(&self) -> Result<AuditStatsRecord, AstralError>;
 }
 
@@ -773,20 +837,79 @@ pub struct SqlxAuditLogRepository {
     db: MySqlPool,
 }
 
-fn user_visible_audit_count_sql() -> String {
-    format!("SELECT COUNT(*) FROM audit_log WHERE {USER_VISIBLE_AUDIT_PREDICATE}")
+fn push_audit_filter<'args>(builder: &mut QueryBuilder<'args, MySql>, filter: &AuditLogFilter) {
+    builder.push(" WHERE ").push(USER_VISIBLE_AUDIT_PREDICATE);
+    if let Some(user_id) = filter.user_id {
+        builder.push(" AND user_id = ").push_bind(user_id);
+    }
+    if let Some(action) = &filter.action {
+        builder.push(" AND action = ").push_bind(action.clone());
+    }
+    if let Some(from) = filter.from {
+        builder.push(" AND created_at >= ").push_bind(from);
+    }
+    if let Some(to) = filter.to_exclusive {
+        builder.push(" AND created_at < ").push_bind(to);
+    }
 }
 
-fn user_visible_audit_list_sql() -> String {
+fn user_visible_audit_count_sql(filter: &AuditLogFilter) -> QueryBuilder<'static, MySql> {
+    let mut builder = QueryBuilder::<MySql>::new("SELECT COUNT(*) FROM audit_log");
+    push_audit_filter(&mut builder, filter);
+    builder
+}
+
+fn user_visible_audit_list_sql(
+    filter: &AuditLogFilter,
+    limit: i64,
+    offset: i64,
+) -> QueryBuilder<'static, MySql> {
+    let mut builder = QueryBuilder::<MySql>::new(
+        "SELECT id, created_at, user_id, action, resource, decision, reason, card_id FROM audit_log",
+    );
+    push_audit_filter(&mut builder, filter);
+    builder
+        .push(" ORDER BY created_at DESC, id DESC LIMIT ")
+        .push_bind(limit)
+        .push(" OFFSET ")
+        .push_bind(offset);
+    builder
+}
+
+fn audit_authorization_source_predicate_sql() -> &'static str {
+    "event_type = 'AUTHZ_CHECK' AND decision IN ('ALLOW', 'DENY')"
+}
+
+pub(crate) fn audit_mutation_source_predicate_sql() -> &'static str {
+    "decision <> 'INTERNAL' AND \
+     (event_type IN ('USER_CARD_MUTATION', 'PERMISSION_RULE_MUTATION', 'RULE_CHANGE', \
+                     'APPROVAL_DECISION', 'CARD_TEMPLATE_MUTATION', 'LEVEL_TEMPLATE_MUTATION', \
+                     'DELEGATION_CREATED', 'DELEGATION_UPDATED', 'DELEGATION_REVOKED') \
+      OR (resource IN ('user_card', 'permission_rule', 'permission_request', \
+                       'card_template', 'level_template', 'permission_delegation') \
+          AND event_type IS NOT NULL AND event_type <> 'AUTHZ_CHECK'))"
+}
+
+fn audit_stats_counts_sql() -> String {
     format!(
-        "SELECT id, created_at, user_id, action, resource, decision, reason, card_id \
-         FROM audit_log WHERE {USER_VISIBLE_AUDIT_PREDICATE} \
-         ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        "SELECT COUNT(*), COALESCE(SUM(decision = 'ALLOW'), 0), \
+         COALESCE(SUM(decision = 'DENY'), 0) FROM audit_log WHERE {USER_VISIBLE_AUDIT_PREDICATE} AND {}",
+        audit_authorization_source_predicate_sql()
     )
 }
 
-fn user_visible_audit_unique_users_sql() -> String {
-    format!("SELECT COUNT(DISTINCT user_id) FROM audit_log WHERE {USER_VISIBLE_AUDIT_PREDICATE}")
+fn audit_top_resources_sql() -> String {
+    format!(
+        "SELECT resource, COUNT(*) AS total FROM audit_log WHERE {USER_VISIBLE_AUDIT_PREDICATE} AND {} GROUP BY resource ORDER BY total DESC, resource ASC LIMIT 10",
+        audit_authorization_source_predicate_sql()
+    )
+}
+
+fn audit_unique_users_sql() -> String {
+    format!(
+        "SELECT COUNT(DISTINCT user_id) FROM audit_log WHERE {USER_VISIBLE_AUDIT_PREDICATE} AND {}",
+        audit_authorization_source_predicate_sql()
+    )
 }
 
 impl SqlxAuditLogRepository {
@@ -797,54 +920,48 @@ impl SqlxAuditLogRepository {
 
 #[async_trait]
 impl AuditLogRepository for SqlxAuditLogRepository {
-    async fn count_logs(&self) -> Result<i64, AstralError> {
-        let sql = user_visible_audit_count_sql();
-        sqlx::query_scalar::<_, i64>(&sql)
+    async fn count_logs(&self, filter: &AuditLogFilter) -> Result<i64, AstralError> {
+        user_visible_audit_count_sql(filter)
+            .build_query_scalar::<i64>()
             .fetch_one(&self.db)
             .await
             .map_err(db_error)
     }
 
-    async fn list_logs(&self, limit: i64, offset: i64) -> Result<Vec<AuditLogRecord>, AstralError> {
-        let sql = user_visible_audit_list_sql();
-        sqlx::query_as::<_, AuditLogRecord>(&sql)
-            .bind(limit)
-            .bind(offset)
+    async fn list_logs(
+        &self,
+        filter: &AuditLogFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditLogRecord>, AstralError> {
+        let limit = limit.clamp(1, 1000);
+        let offset = offset.max(0);
+        user_visible_audit_list_sql(filter, limit, offset)
+            .build_query_as::<AuditLogRecord>()
             .fetch_all(&self.db)
             .await
             .map_err(db_error)
     }
 
     async fn stats(&self) -> Result<AuditStatsRecord, AstralError> {
-        let total: i64 = {
-            let sql = user_visible_audit_count_sql();
-            sqlx::query_scalar(&sql)
-                .fetch_one(&self.db)
-                .await
-                .map_err(db_error)?
-        };
-        let allowed: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE decision='ALLOW'")
-                .fetch_one(&self.db)
-                .await
-                .map_err(db_error)?;
-        let denied: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE decision='DENY'")
-                .fetch_one(&self.db)
-                .await
-                .map_err(db_error)?;
-        let unique_users: i64 = {
-            let sql = user_visible_audit_unique_users_sql();
-            sqlx::query_scalar(&sql)
-                .fetch_one(&self.db)
-                .await
-                .map_err(db_error)?
-        };
+        let (total, allowed, denied): (i64, i64, i64) = sqlx::query_as(&audit_stats_counts_sql())
+            .fetch_one(&self.db)
+            .await
+            .map_err(db_error)?;
+        let unique_users: i64 = sqlx::query_scalar(&audit_unique_users_sql())
+            .fetch_one(&self.db)
+            .await
+            .map_err(db_error)?;
+        let top_resources: Vec<(String, i64)> = sqlx::query_as(&audit_top_resources_sql())
+            .fetch_all(&self.db)
+            .await
+            .map_err(db_error)?;
         Ok(AuditStatsRecord {
             total,
             allowed,
             denied,
             unique_users,
+            top_resources,
         })
     }
 }
@@ -858,15 +975,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn user_visible_audit_queries_exclude_internal_scheduler_rows() {
+    fn audit_filters_are_validated_and_applied_to_count_and_list() {
         assert_eq!(
             USER_VISIBLE_AUDIT_PREDICATE,
             astral_db::USER_VISIBLE_AUDIT_PREDICATE
         );
-        assert!(user_visible_audit_count_sql().contains("decision <> 'INTERNAL'"));
-        assert!(user_visible_audit_list_sql().contains("decision <> 'INTERNAL'"));
-        assert!(user_visible_audit_list_sql().contains("ORDER BY created_at DESC"));
-        assert!(user_visible_audit_unique_users_sql().contains("decision <> 'INTERNAL'"));
+        let filter = AuditLogFilter::new(
+            Some(17),
+            Some(" update "),
+            Some("2026-01-01"),
+            Some("2026-01-02"),
+        )
+        .expect("canonical filters");
+        let count_sql = user_visible_audit_count_sql(&filter).sql().to_owned();
+        let list_sql = user_visible_audit_list_sql(&filter, 10, 0).sql().to_owned();
+        for predicate in [
+            "decision <> 'INTERNAL'",
+            "user_id = ?",
+            "action = ?",
+            "created_at >= ?",
+            "created_at < ?",
+        ] {
+            assert!(
+                count_sql.contains(predicate),
+                "count is missing {predicate}"
+            );
+            assert!(list_sql.contains(predicate), "list is missing {predicate}");
+        }
+        assert!(list_sql.contains("ORDER BY created_at DESC, id DESC"));
+        assert!(audit_stats_counts_sql().contains("event_type = 'AUTHZ_CHECK'"));
+        assert!(!audit_stats_counts_sql().contains('\\'));
+        assert!(audit_unique_users_sql().contains("event_type = 'AUTHZ_CHECK'"));
+        assert!(audit_top_resources_sql().contains("event_type = 'AUTHZ_CHECK'"));
+        assert!(audit_top_resources_sql().contains("LIMIT 10"));
+        assert!(
+            audit_authorization_source_predicate_sql().contains("decision IN ('ALLOW', 'DENY')")
+        );
+        assert!(AuditLogFilter::new(Some(0), None, None, None).is_err());
+        assert!(AuditLogFilter::new(None, None, Some("yesterday"), None).is_err());
+        assert!(AuditLogFilter::new(None, None, Some("2026-01-03"), Some("2026-01-02")).is_err());
+    }
+
+    #[test]
+    fn stats_and_compliance_feed_are_explicit_policy_and_mutation_scopes() {
+        assert!(audit_authorization_source_predicate_sql().contains("AUTHZ_CHECK"));
+        assert!(audit_mutation_source_predicate_sql().contains("USER_CARD_MUTATION"));
+        assert!(audit_mutation_source_predicate_sql().contains("PERMISSION_RULE_MUTATION"));
+        assert!(audit_mutation_source_predicate_sql().contains("APPROVAL_DECISION"));
+        assert!(audit_mutation_source_predicate_sql().contains("DELEGATION_UPDATED"));
+        assert!(audit_mutation_source_predicate_sql().contains("event_type <> 'AUTHZ_CHECK'"));
     }
     #[test]
     fn approval_audit_detail_preserves_actor_target_decision_and_request_context() {

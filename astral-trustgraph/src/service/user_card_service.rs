@@ -113,4 +113,41 @@ impl UserCardService {
         }
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bind_card_async_batch_item(
+        &self,
+        card_id: i64,
+        user_id: i64,
+        actor_id: i64,
+        actor_card_id: i64,
+        actor_tenant_id: i64,
+        actor_domain_id: i64,
+        task_id: &str,
+        operation_id: &str,
+        expected_tenant_id: i64,
+        expected_domain_id: i64,
+    ) -> Result<(), AstralError> {
+        let bound = self
+            .repo
+            .bind_card_async_batch_item(
+                card_id,
+                user_id,
+                actor_id,
+                actor_card_id,
+                actor_tenant_id,
+                actor_domain_id,
+                task_id,
+                operation_id,
+                expected_tenant_id,
+                expected_domain_id,
+            )
+            .await?;
+        if !bound {
+            return Err(AstralError::NotFound(format!(
+                "user card {card_id} is not in a bindable state (PENDING/INACTIVE)"
+            )));
+        }
+        Ok(())
+    }
 }

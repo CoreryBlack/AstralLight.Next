@@ -237,6 +237,8 @@ const SOD_POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
 /// sod_policy 为管理端低频输入表，4096 远超现实规模；超限属异常态，拒绝
 /// 服务优于截断漏报（新收紧策略被截断 = 放行方向）。
 const SOD_POLICY_SNAPSHOT_ROW_CAP: usize = 4096;
+/// Maximum size of a stored dynamic condition script in bytes.
+pub const MAX_DYNAMIC_CONDITION_SCRIPT_BYTES: usize = 512;
 
 /// 快照字节预算（近似**内容**字节：仅统计字符串字段长度，不含 allocator/
 /// 对象头等内存开销，也**不是** RSS 上界——进程内存影响另有镜像容量合同
@@ -1371,8 +1373,13 @@ async fn evaluate_sod_conflicts(
             let script = policy.condition_script.as_deref().ok_or_else(|| {
                 sod_condition_error("active dynamic SoD policy has no condition script")
             })?;
+            if script.len() > MAX_DYNAMIC_CONDITION_SCRIPT_BYTES {
+                return Err(sod_condition_error(
+                    "active dynamic SoD condition exceeds the configured script limit",
+                ));
+            }
 
-            // 评估条件脚本（支持 resourceOwnerId == currentUserId 模式）。
+            // 评估条件脚本（仅支持 exact resourceOwnerId == currentUserId 语法）。
             let triggered = evaluate_dynamic_condition(script, user_id, resource_owner_id)?;
 
             if triggered {
@@ -1467,47 +1474,55 @@ fn sod_condition_error(message: &str) -> sqlx::Error {
     )))
 }
 
-/// 评估 DYNAMIC SoD 条件脚本
+/// Validate the only supported DYNAMIC SoD expression before persisting a policy.
 ///
-/// 当前支持的脚本模式：
-/// - `resourceOwnerId == currentUserId` — 操作者即资源所有者时触发
-/// - 不支持的脚本或缺失 owner fact → 返回错误
+/// The grammar is exactly `resourceOwnerId == currentUserId`, with optional
+/// whitespace between tokens. Unknown operators or trailing tokens are rejected.
+pub fn validate_dynamic_sod_condition_script(
+    script: &str,
+) -> Result<(), astral_types::AstralError> {
+    if parse_dynamic_condition(script).is_some() {
+        Ok(())
+    } else {
+        Err(astral_types::AstralError::Validation(
+            "condition_script must match resourceOwnerId == currentUserId".into(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicCondition {
+    ResourceOwnerEqualsCurrentUser,
+}
+
+fn parse_dynamic_condition(script: &str) -> Option<DynamicCondition> {
+    let remainder = script.trim().strip_prefix("resourceOwnerId")?.trim_start();
+    let remainder = remainder.strip_prefix("==")?.trim_start();
+    let remainder = remainder.strip_prefix("currentUserId")?.trim();
+    remainder
+        .is_empty()
+        .then_some(DynamicCondition::ResourceOwnerEqualsCurrentUser)
+}
+
+/// Evaluate the exact DYNAMIC SoD expression grammar. Unknown expressions and
+/// missing authenticated/authoritative facts fail closed.
 fn evaluate_dynamic_condition(
     script: &str,
     user_id: Option<i64>,
     resource_owner_id: Option<i64>,
 ) -> Result<bool, sqlx::Error> {
-    let script_trimmed = script.trim();
-    if script_trimmed.is_empty() {
-        return Err(sod_condition_error("active dynamic SoD condition is empty"));
-    }
-
-    // 模式: resourceOwnerId == currentUserId
-    if script_trimmed.contains("resourceOwnerId") && script_trimmed.contains("currentUserId") {
-        let (Some(uid), Some(oid)) = (user_id, resource_owner_id) else {
-            return Err(sod_condition_error(
-                "dynamic SoD owner condition requires authoritative owner fact",
-            ));
-        };
-        if uid == oid {
-            tracing::info!(
-                user_id = uid,
-                resource_owner_id = oid,
-                condition = script_trimmed,
-                "dynamic SoD triggered: resourceOwnerId == currentUserId"
-            );
-            return Ok(true);
+    let condition = parse_dynamic_condition(script)
+        .ok_or_else(|| sod_condition_error("unrecognized active dynamic SoD condition script"))?;
+    match condition {
+        DynamicCondition::ResourceOwnerEqualsCurrentUser => {
+            let (Some(uid), Some(oid)) = (user_id, resource_owner_id) else {
+                return Err(sod_condition_error(
+                    "dynamic SoD owner condition requires authoritative owner fact",
+                ));
+            };
+            Ok(uid == oid)
         }
-        return Ok(false);
     }
-
-    tracing::error!(
-        script = script_trimmed,
-        "unrecognized active dynamic SoD condition script"
-    );
-    Err(sod_condition_error(
-        "unrecognized active dynamic SoD condition script",
-    ))
 }
 
 #[cfg(test)]
@@ -1742,6 +1757,33 @@ mod tests {
     /// `(resource_type IS NULL OR resource_type = ?) AND (action_code IS NULL
     /// OR action_code = ?)` 的内存等价谓词：NULL 维度恒匹配；非 NULL 维度按
     /// ASCII 大小写不敏感精确比较（规范小写标识符下与 ci collation 一致）。
+    #[test]
+    fn dynamic_condition_requires_exact_grammar_and_known_operator() {
+        assert!(
+            validate_dynamic_sod_condition_script(" resourceOwnerId   == currentUserId ").is_ok()
+        );
+        for rejected in [
+            "resourceOwnerId != currentUserId",
+            "resourceOwnerId === currentUserId",
+            "resourceOwnerId == currentUserId || true",
+            "resourceOwnerId == currentUserId == 1",
+            "other == currentUserId",
+            "resourceOwnerId == unknown",
+            "resourceOwnerId currentUserId",
+            "resourceOwnerId == currentUserId trailing",
+            "",
+        ] {
+            assert!(
+                validate_dynamic_sod_condition_script(rejected).is_err(),
+                "expression must be rejected: {rejected:?}"
+            );
+            assert!(
+                evaluate_dynamic_condition(rejected, Some(7), Some(7)).is_err(),
+                "unsupported runtime expression must fail closed: {rejected:?}"
+            );
+        }
+    }
+
     #[test]
     fn dynamic_policy_filter_matches_sql_predicate() {
         let policy = |resource_type: Option<&str>, action_code: Option<&str>| DynamicPolicy {

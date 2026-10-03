@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use astral_common::contract::{ApiResponse, EmptyResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
 use astral_types::AstralError;
+use astral_types::ResourceRegistry;
 
 use crate::repository::inheritance_config_repository::InheritanceConfigRecord;
 use crate::AppState;
@@ -72,6 +73,22 @@ pub fn inheritance_routes() -> Router<AppState> {
 
 const VALID_MODES: [&str; 3] = ["NONE", "PARENT_ONLY", "CUMULATIVE"];
 
+fn validate_registered_resource_type(resource_type: &str) -> Result<(), AppError> {
+    let actions = ResourceRegistry::global()
+        .list_actions(resource_type)
+        .ok_or_else(|| {
+            AppError(AstralError::Validation(format!(
+                "resource_type '{resource_type}' is not registered"
+            )))
+        })?;
+    if actions.is_empty() {
+        return Err(AppError(AstralError::Validation(format!(
+            "resource_type '{resource_type}' has no registered actions"
+        ))));
+    }
+    Ok(())
+}
+
 // ===== Handlers =====
 
 /// GET /main/api/v1/inheritance/config — 列出所有继承配置（分页）
@@ -101,6 +118,7 @@ async fn update_inheritance_config(
     Path(resource_type): Path<String>,
     Json(req): Json<UpdateInheritanceRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
+    validate_registered_resource_type(&resource_type)?;
     // 校验继承模式合法性
     if !VALID_MODES.contains(&req.inheritance_mode.as_str()) {
         return Err(AppError(AstralError::Validation(
@@ -127,6 +145,7 @@ async fn create_inheritance_config(
     State(state): State<AppState>,
     Json(req): Json<CreateInheritanceRequest>,
 ) -> Result<Json<ApiResponse<InheritanceConfig>>, AppError> {
+    validate_registered_resource_type(&req.resource_type)?;
     if !VALID_MODES.contains(&req.inheritance_mode.as_str()) {
         return Err(AppError(AstralError::Validation(
             "inheritance_mode must be NONE, PARENT_ONLY, or CUMULATIVE".into(),
@@ -148,18 +167,22 @@ async fn create_inheritance_config(
     Ok(Json(ApiResponse::success(created)))
 }
 
-/// DELETE /inheritance/config/{id} — 删除继承配置
+/// DELETE /inheritance/config/{resource_type} — 删除继承配置
 async fn delete_inheritance_config(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(resource_type): Path<String>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    let deleted = state.inheritance_config_repository.delete_by_id(id).await?;
+    validate_registered_resource_type(&resource_type)?;
+    let deleted = state
+        .inheritance_config_repository
+        .delete_by_resource_type(&resource_type)
+        .await?;
     if !deleted {
         return Err(AppError(AstralError::NotFound(format!(
-            "inheritance config {id} not found"
+            "inheritance config for resource_type '{resource_type}' not found"
         ))));
     }
 
-    tracing::info!(id, "inheritance config deleted");
+    tracing::info!(resource_type = %resource_type, "inheritance config deleted");
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }

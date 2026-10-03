@@ -812,6 +812,7 @@ def _read_worker_health(probe: Any, config: E3SampleConfig, decision_node: str) 
             if not isinstance(response, tuple) or len(response) not in (2, 3):
                 raise ValueError("worker health response shape invalid")
             http_status = response[0]
+            health_body = response[1]
         except Exception as error:  # noqa: BLE001
             health["health_endpoint"] = {
                 "status": "UNKNOWN",
@@ -819,7 +820,12 @@ def _read_worker_health(probe: Any, config: E3SampleConfig, decision_node: str) 
                 "error_class": type(error).__name__,
             }
         else:
-            healthy = isinstance(http_status, int) and 200 <= http_status < 300
+            healthy = (
+                isinstance(http_status, int)
+                and 200 <= http_status < 300
+                and isinstance(health_body, Mapping)
+                and health_body.get("healthy") is True
+            )
             health["health_endpoint"] = {
                 "status": "PASS" if healthy else "UNKNOWN",
                 "healthy": healthy,
@@ -1005,9 +1011,18 @@ def sample_e3(
                     saw_target_decision = True
                 elif decision["role"] == "unrelated" and decision.get("classification") == "ALLOW":
                     saw_unrelated_decision = True
-        saw_publication_pass = saw_publication_pass or any(
-            sample[section]["status"] == "PASS"
-            for section in ("queue_counts", "row_counts", "pointers")
+        saw_publication_pass = saw_publication_pass or (
+            sample["queue_counts"].get("status") == "PASS"
+            and bool(sample["queue_counts"].get("entries"))
+            and all(
+                entry.get("status") == "PASS"
+                and isinstance(entry.get("value"), int)
+                and not isinstance(entry.get("value"), bool)
+                and entry.get("value") == 0
+                for entry in sample["queue_counts"].get("entries", {}).values()
+            )
+            and sample["worker_health"].get("health_endpoint", {}).get("status") == "PASS"
+            and sample["worker_health"].get("health_endpoint", {}).get("healthy") is True
         )
         if sink is None:
             retained.append(sample)
@@ -1054,8 +1069,12 @@ def sample_e3(
             "note": "unrelated-card signed decision samples",
         },
         "publication_drain": {
-            "status": "PASS" if saw_publication_pass else "SKIP",
-            "note": "queue depth / row count / pointer watermark drain indicators",
+            "status": "PASS" if saw_publication_pass else "UNKNOWN" if collected else "SKIP",
+            "note": (
+                "explicit zero queue depth plus healthy readiness observed"
+                if saw_publication_pass else
+                "snapshot reads do not prove drain; require zero queues and ready worker"
+            ),
         },
         "per_event_retry_history": {
             "status": "SKIP",

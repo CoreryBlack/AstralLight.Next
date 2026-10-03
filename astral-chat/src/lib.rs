@@ -22,6 +22,7 @@ use crate::repository::message_repository::MessageRepository;
 use crate::service::group_service::GroupService;
 use crate::service::message_service::MessageService;
 use crate::service::receipt_service::ReceiptService;
+use crate::service::send_intent_relay::SendIntentRelayHandle;
 use crate::service::session_service::SessionService;
 use crate::srv::realtime::ConnectionPool;
 
@@ -48,6 +49,8 @@ pub struct AppState {
     pub message_service: Arc<MessageService>,
     /// 已读回执编排
     pub receipt_service: Arc<ReceiptService>,
+    /// Required owned durable send-intent relay worker.
+    pub send_intent_relay: Arc<SendIntentRelayHandle>,
 }
 
 impl FromRef<AppState> for MySqlPool {

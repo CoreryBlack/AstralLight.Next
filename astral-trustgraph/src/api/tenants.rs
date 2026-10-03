@@ -3,7 +3,7 @@
 //! 数据访问在 `repository::tenant_repository`，path/depth 计算、邀请 token、
 //! 到期推算等内嵌逻辑在 `service::tenant_service`。HTTP 层仅解析参数、组装 DTO。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -12,14 +12,53 @@ use serde::Deserialize;
 use astral_common::contract::{ApiResponse, PageResponse};
 use astral_common::error::AppError;
 use astral_types::{
-    Tenant, TenantAuditLog, TenantDomainMap, TenantInvitation, TenantMember, TenantPurchase,
+    AstralError, PolicyContext, Tenant, TenantAuditLog, TenantDomainMap, TenantInvitation,
+    TenantMember, TenantPurchase,
 };
 
 use crate::repository::tenant_repository::{
     TenantAuditLogRecord, TenantDomainMapRecord, TenantFilter, TenantInvitationRecord,
-    TenantMemberRecord, TenantPurchaseRecord, TenantRecord,
+    TenantMemberRecord, TenantMutationContext, TenantPurchaseRecord, TenantRecord,
 };
 use crate::AppState;
+
+/// Build a tenant mutation context from the policy middleware's verified extension.
+/// The Gateway headers are only accepted when they exactly agree with that extension.
+fn tenant_mutation_context(
+    headers: &HeaderMap,
+    policy_context: &PolicyContext,
+) -> Result<TenantMutationContext, AppError> {
+    let parse = |name: &'static str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                AppError(AstralError::Auth(format!(
+                    "Gateway-verified {name} is required"
+                )))
+            })
+    };
+    let user_id = parse("x-user-id")?;
+    let card_id = parse("x-user-card-id")?;
+    let tenant_id = parse("x-user-card-tenant-id")?;
+    let domain_id = parse("x-user-card-domain-id")?;
+    if policy_context.principal_kind.as_deref() != Some("PLATFORM_USER")
+        || policy_context.user_id != Some(user_id)
+        || policy_context.card_id != Some(card_id)
+        || policy_context.tenant_id != Some(tenant_id)
+        || policy_context.domain_id != Some(domain_id)
+    {
+        return Err(AppError(AstralError::Auth(
+            "tenant mutation Gateway headers do not match the verified PolicyContext".into(),
+        )));
+    }
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok());
+    TenantMutationContext::from_policy_context(policy_context, request_id).map_err(AppError::from)
+}
 
 // ===== Record → DTO =====
 
@@ -321,11 +360,14 @@ async fn get_tenant(
 /// 创建租户（含层级计算）
 async fn create_tenant(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
     Json(req): Json<CreateTenantRequest>,
 ) -> Result<Json<ApiResponse<Tenant>>, AppError> {
+    let context = tenant_mutation_context(&headers, &policy_context)?;
     let outcome = state
         .tenant_service
-        .create_tenant(&req.name, req.parent_tenant_id)
+        .create_tenant_with_context(&req.name, req.parent_tenant_id, &context)
         .await?;
     let row = state
         .tenant_repository
@@ -344,11 +386,17 @@ async fn create_tenant(
 /// 更新租户（名称/状态）
 async fn update_tenant(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateTenantRequest>,
 ) -> Result<Json<ApiResponse<Tenant>>, AppError> {
+    let context = tenant_mutation_context(&headers, &policy_context)?;
     if let Some(ref name) = req.name {
-        state.tenant_repository.update_tenant_name(id, name).await?;
+        state
+            .tenant_repository
+            .update_tenant_name_with_context(id, name, &context)
+            .await?;
     }
     if let Some(ref status) = req.status {
         let upper = status.to_uppercase();
@@ -359,7 +407,7 @@ async fn update_tenant(
         }
         state
             .tenant_repository
-            .update_tenant_status(id, &upper)
+            .update_tenant_status_with_context(id, &upper, &context)
             .await?;
     }
 
@@ -375,9 +423,15 @@ async fn update_tenant(
 /// 删除租户
 async fn delete_tenant(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    let deleted = state.tenant_repository.delete_tenant(id).await?;
+    let context = tenant_mutation_context(&headers, &policy_context)?;
+    let deleted = state
+        .tenant_repository
+        .delete_tenant_with_context(id, &context)
+        .await?;
     if !deleted {
         return Err(AppError(astral_types::AstralError::NotFound(format!(
             "tenant {id} not found"
@@ -390,11 +444,14 @@ async fn delete_tenant(
 /// PUT /{id}/suspend — 暂停租户
 async fn suspend_tenant(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<Tenant>>, AppError> {
+    let context = tenant_mutation_context(&headers, &policy_context)?;
     let transitioned = state
         .tenant_repository
-        .transition_tenant_status(id, "ACTIVE", "SUSPENDED")
+        .transition_tenant_status_with_context(id, "ACTIVE", "SUSPENDED", &context)
         .await?;
     if !transitioned {
         return Err(AppError(astral_types::AstralError::NotFound(format!(
@@ -414,11 +471,14 @@ async fn suspend_tenant(
 /// PUT /{id}/activate — 激活租户
 async fn activate_tenant(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<Tenant>>, AppError> {
+    let context = tenant_mutation_context(&headers, &policy_context)?;
     let transitioned = state
         .tenant_repository
-        .transition_tenant_status(id, "SUSPENDED", "ACTIVE")
+        .transition_tenant_status_with_context(id, "SUSPENDED", "ACTIVE", &context)
         .await?;
     if !transitioned {
         return Err(AppError(astral_types::AstralError::NotFound(format!(
@@ -453,12 +513,15 @@ async fn list_sub_tenants(
 /// POST /{id}/sub-tenants — 创建子租户
 async fn create_sub_tenant(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
     Path(id): Path<i64>,
     Json(req): Json<CreateTenantRequest>,
 ) -> Result<Json<ApiResponse<Tenant>>, AppError> {
+    let context = tenant_mutation_context(&headers, &policy_context)?;
     let outcome = state
         .tenant_service
-        .create_sub_tenant(id, &req.name)
+        .create_sub_tenant_with_context(id, &req.name, &context)
         .await?;
     let row = state
         .tenant_repository
@@ -780,9 +843,12 @@ async fn list_tenant_domains(
 /// POST /{id}/domains — 添加域映射
 async fn add_tenant_domain(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
     Path(tenant_id): Path<i64>,
     Json(req): Json<AddDomainRequest>,
 ) -> Result<Json<ApiResponse<TenantDomainMap>>, AppError> {
+    let context = tenant_mutation_context(&headers, &policy_context)?;
     let mapping_type = req.mapping_type.unwrap_or_else(|| "OWNED".into());
     let valid_types = ["OWNED", "SHARED", "ISOLATED"];
     if !valid_types.contains(&mapping_type.as_str()) {
@@ -793,7 +859,7 @@ async fn add_tenant_domain(
 
     state
         .tenant_repository
-        .upsert_tenant_domain(tenant_id, req.domain_id)
+        .upsert_tenant_domain_with_context(tenant_id, req.domain_id, &context)
         .await?;
     let row = state
         .tenant_repository
@@ -807,11 +873,14 @@ async fn add_tenant_domain(
 /// DELETE /{id}/domains/{domain_id} — 删除域映射
 async fn remove_tenant_domain(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
     Path((tenant_id, domain_id)): Path<(i64, i64)>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    let context = tenant_mutation_context(&headers, &policy_context)?;
     let removed = state
         .tenant_repository
-        .remove_tenant_domain(tenant_id, domain_id)
+        .remove_tenant_domain_with_context(tenant_id, domain_id, &context)
         .await?;
     if !removed {
         return Err(AppError(astral_types::AstralError::NotFound(format!(

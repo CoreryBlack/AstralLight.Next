@@ -1,13 +1,11 @@
 //! MySQL-backed AL-native message outbox — the durable recovery journal.
 //!
-//! `al_message_outbox` is NOT the local transport authority. On the composite
-//! runtime the normal transport is the direct `LocalBus` envelope path
-//! (`publish_and_wait` after the source transaction commits); a notification
-//! channel may only reduce recovery latency. This table owns the durable
-//! recovery state machine (PENDING / PROCESSING / IN_DOUBT / PROCESSED /
-//! QUARANTINED) that the recovery-only relay and the explicit reconciliation
-//! interface advance. Nothing here may turn a broker/notification ACK or a
-//! watermark into a durable completion proof.
+//! LocalBus carries the direct in-process envelope after source commit. This
+//! table owns the exact delivery claim and durable completion proof for both
+//! direct and recovery paths; notification admission is never that proof.
+//! It preserves the PENDING / PROCESSING / IN_DOUBT / PROCESSED / QUARANTINED
+//! state machine. A broker ACK or watermark cannot complete a row without the
+//! exact owner's successful application and lease-CAS settlement.
 //!
 //! Per-scope FIFO: `scope_sequence` is allocated inside the same transaction
 //! that appends the row (the scope-counter row is locked until commit), so the
@@ -44,6 +42,22 @@ pub enum LocalMessageAppend {
     Inserted,
     Existing,
 }
+
+/// Result of one post-commit exact-message claim. `NotClaimable` is deliberately
+/// non-terminal: another live lease, a prior FIFO row, backoff, quarantine, or
+/// an unresolved state must leave this row to the recovery/reconciliation path.
+#[derive(Debug, Clone)]
+pub enum LocalMessageExactClaim {
+    Claimed(LocalMessageRow),
+    AlreadyProcessed(LocalMessageRow),
+    NotClaimable { status: String, reason: String },
+    NotFound,
+}
+
+const LOCAL_MESSAGE_LEASE_TOKEN_SUFFIX_LEN: usize = 37;
+const LOCAL_MESSAGE_LEASE_OWNER_MAX_LEN: usize = 128;
+const MAX_LOCAL_MESSAGE_OWNER_PREFIX_LEN: usize =
+    LOCAL_MESSAGE_LEASE_OWNER_MAX_LEN - LOCAL_MESSAGE_LEASE_TOKEN_SUFFIX_LEN;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LocalMessageError {
@@ -154,12 +168,12 @@ pub(crate) const SCOPE_SEQUENCE_ATTACH_SQL: &str =
     "UPDATE al_message_outbox SET scope_sequence = ? \
      WHERE message_id = ? AND scope_sequence IS NULL";
 
-/// Claimable candidates: only PENDING rows and PROCESSING rows whose lease has
-/// expired are reclaimable. IN_DOUBT rows are intentionally never claimable and
-/// never reset by time — they leave the state only through
-/// [`LocalMessageRepository::reconcile_in_doubt`]. Per-scope FIFO: a row is
-/// blocked while a prior unprocessed row exists in the same
-/// (queue_name, ordering_key) scope; the "prior" comparison uses the
+/// Claimable candidates are only PENDING rows. PROCESSING rows with an expired
+/// or missing lease are moved to IN_DOUBT before this query; lease expiry alone
+/// never proves that re-applying an unknown handler outcome is safe. IN_DOUBT
+/// rows leave that state only through [`LocalMessageRepository::reconcile_in_doubt`].
+/// Per-scope FIFO: a row is blocked while a prior unprocessed row exists in the
+/// same (queue_name, ordering_key) scope; the "prior" comparison uses the
 /// commit-ordered scope_sequence when both rows carry one and falls back to the
 /// legacy (created_at, message_id) comparison whenever either side is NULL.
 pub(crate) const CLAIM_CANDIDATES_SQL: &str =
@@ -169,7 +183,7 @@ pub(crate) const CLAIM_CANDIDATES_SQL: &str =
             lease_expires_at, processed_at, last_error, created_at, updated_at \
      FROM al_message_outbox AS current_message \
      WHERE current_message.queue_name = ? \
-       AND (current_message.status = 'PENDING' OR (current_message.status = 'PROCESSING' AND current_message.lease_expires_at < UTC_TIMESTAMP(6))) \
+       AND current_message.status = 'PENDING' \
        AND (current_message.next_attempt_at IS NULL OR current_message.next_attempt_at <= UTC_TIMESTAMP(6)) \
        AND NOT EXISTS ( \
            SELECT 1 FROM al_message_outbox AS prior_message \
@@ -189,6 +203,24 @@ pub(crate) const CLAIM_CANDIDATES_SQL: &str =
                  ) \
        ) \
      ORDER BY current_message.created_at ASC, current_message.message_id ASC LIMIT ? FOR UPDATE SKIP LOCKED";
+
+/// Bounded stale-owner scan. Expiry (or a missing expiry) is not replay proof;
+/// each selected row is instead CAS-transitioned to IN_DOUBT within the same
+/// claim transaction. SKIP LOCKED avoids waiting behind another live claimant.
+pub(crate) const UNOWNED_PROCESSING_CANDIDATES_SQL: &str =
+    "SELECT message_id FROM al_message_outbox \
+     WHERE queue_name = ? AND status = 'PROCESSING' \
+       AND (lease_expires_at IS NULL OR lease_expires_at < UTC_TIMESTAMP(6)) \
+     ORDER BY created_at ASC, message_id ASC LIMIT ? FOR UPDATE SKIP LOCKED";
+
+/// Lease-expired PROCESSING rows require explicit reconciliation before replay.
+pub(crate) const MARK_UNOWNED_PROCESSING_IN_DOUBT_SQL: &str =
+    "UPDATE al_message_outbox SET status = 'IN_DOUBT', lease_owner = NULL, \
+        lease_expires_at = NULL, next_attempt_at = NULL, \
+        last_error = LEFT('processing lease expired or missing; explicit reconciliation required', 512), \
+        updated_at = UTC_TIMESTAMP(6) \
+     WHERE message_id = ? AND queue_name = ? AND status = 'PROCESSING' \
+       AND (lease_expires_at IS NULL OR lease_expires_at < UTC_TIMESTAMP(6))";
 
 /// Exact IN_DOUBT row load (read-only inspection before a decision).
 pub(crate) const IN_DOUBT_LOAD_SQL: &str =
@@ -223,6 +255,178 @@ impl LocalMessageRepository {
         Ok(outcome)
     }
 
+    /// Claim one exact committed outbox row after a source transaction has
+    /// proven commit. This is the direct LocalBus path's durable ownership
+    /// boundary; it shares the same server-clock lease/CAS and per-scope FIFO
+    /// rules as [`Self::claim_batch`], so it cannot jump ahead of an earlier
+    /// PENDING, PROCESSING, or IN_DOUBT row.
+    pub async fn claim_exact(
+        &self,
+        owner: &str,
+        queue_name: &str,
+        message_id: &str,
+    ) -> Result<LocalMessageExactClaim, LocalMessageError> {
+        if owner.trim().is_empty() || queue_name.trim().is_empty() || message_id.trim().is_empty() {
+            return Err(LocalMessageError::Validation(
+                "owner, queue_name and message_id are required".into(),
+            ));
+        }
+        if owner.len() > MAX_LOCAL_MESSAGE_OWNER_PREFIX_LEN {
+            return Err(LocalMessageError::Validation(format!(
+                "owner prefix exceeds {MAX_LOCAL_MESSAGE_OWNER_PREFIX_LEN} bytes"
+            )));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let candidate = sqlx::query_as::<_, LocalMessageRow>(
+            "SELECT message_id, operation_id, message_type, queue_name, ordering_key, tenant_id, \
+                    origin_region, target_region, schema_version, payload_json, headers_json, \
+                    payload_sha256, status, attempts, next_attempt_at, lease_owner, \
+                    lease_expires_at, processed_at, last_error, created_at, updated_at \
+             FROM al_message_outbox WHERE message_id = ? AND queue_name = ? FOR UPDATE",
+        )
+        .bind(message_id)
+        .bind(queue_name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(mut candidate) = candidate else {
+            tx.rollback().await?;
+            return Ok(LocalMessageExactClaim::NotFound);
+        };
+        if candidate.status == "PROCESSED" {
+            tx.rollback().await?;
+            return Ok(LocalMessageExactClaim::AlreadyProcessed(candidate));
+        }
+        if !matches!(candidate.status.as_str(), PENDING_STATUS | "PROCESSING") {
+            let status = candidate.status.clone();
+            tx.rollback().await?;
+            return Ok(LocalMessageExactClaim::NotClaimable {
+                status,
+                reason: "row is terminal or requires explicit reconciliation".into(),
+            });
+        }
+
+        if candidate.status == "PROCESSING" {
+            let lease_expired_or_missing: bool = sqlx::query_scalar(
+                "SELECT lease_expires_at IS NULL OR lease_expires_at < UTC_TIMESTAMP(6) \
+                 FROM al_message_outbox WHERE message_id = ? AND queue_name = ?",
+            )
+            .bind(message_id)
+            .bind(queue_name)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !lease_expired_or_missing {
+                tx.rollback().await?;
+                return Ok(LocalMessageExactClaim::NotClaimable {
+                    status: candidate.status,
+                    reason: "processing lease is still live".into(),
+                });
+            }
+            let result = sqlx::query(MARK_UNOWNED_PROCESSING_IN_DOUBT_SQL)
+                .bind(message_id)
+                .bind(queue_name)
+                .execute(&mut *tx)
+                .await?;
+            if result.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Ok(LocalMessageExactClaim::NotClaimable {
+                    status: candidate.status,
+                    reason: "expired processing lease transition lost its compare-and-set".into(),
+                });
+            }
+            tx.commit().await?;
+            return Ok(LocalMessageExactClaim::NotClaimable {
+                status: IN_DOUBT_STATUS.into(),
+                reason: "processing lease expired or missing; explicit reconciliation required"
+                    .into(),
+            });
+        }
+
+        let retry_due: bool = sqlx::query_scalar(
+            "SELECT next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP(6) \
+             FROM al_message_outbox WHERE message_id = ? AND queue_name = ?",
+        )
+        .bind(message_id)
+        .bind(queue_name)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !retry_due {
+            tx.rollback().await?;
+            return Ok(LocalMessageExactClaim::NotClaimable {
+                status: candidate.status,
+                reason: "retry backoff has not elapsed".into(),
+            });
+        }
+
+        if let Some(ordering_key) = candidate.ordering_key.as_deref() {
+            let scope_sequence: Option<i64> = sqlx::query_scalar(
+                "SELECT scope_sequence FROM al_message_outbox \
+                 WHERE message_id = ? AND queue_name = ? FOR UPDATE",
+            )
+            .bind(message_id)
+            .bind(queue_name)
+            .fetch_one(&mut *tx)
+            .await?;
+            let prior: Option<String> = sqlx::query_scalar(
+                "SELECT prior_message.message_id FROM al_message_outbox AS prior_message \
+                 WHERE prior_message.queue_name = ? AND prior_message.ordering_key = ? \
+                   AND prior_message.status NOT IN ('PROCESSED', 'QUARANTINED') \
+                   AND ((prior_message.scope_sequence IS NOT NULL AND ? IS NOT NULL \
+                         AND prior_message.scope_sequence < ?) \
+                     OR ((prior_message.scope_sequence IS NULL OR ? IS NULL) \
+                         AND (prior_message.created_at < ? OR \
+                              (prior_message.created_at = ? AND prior_message.message_id < ?)))) \
+                 ORDER BY prior_message.scope_sequence, prior_message.created_at, \
+                          prior_message.message_id LIMIT 1 FOR UPDATE",
+            )
+            .bind(queue_name)
+            .bind(ordering_key)
+            .bind(scope_sequence)
+            .bind(scope_sequence)
+            .bind(scope_sequence)
+            .bind(candidate.created_at)
+            .bind(candidate.created_at)
+            .bind(message_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(prior_message_id) = prior {
+                tx.rollback().await?;
+                return Ok(LocalMessageExactClaim::NotClaimable {
+                    status: candidate.status,
+                    reason: format!("FIFO blocked by earlier message {prior_message_id}"),
+                });
+            }
+        }
+
+        let lease_owner = format!("{owner}:{}", Uuid::new_v4());
+        debug_assert!(lease_owner.len() <= LOCAL_MESSAGE_LEASE_OWNER_MAX_LEN);
+        let result = sqlx::query(
+            "UPDATE al_message_outbox SET status = 'PROCESSING', lease_owner = ?, \
+                lease_expires_at = DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ? SECOND), \
+                attempts = attempts + 1, updated_at = UTC_TIMESTAMP(6) \
+             WHERE message_id = ? AND queue_name = ? AND status = 'PENDING' \
+               AND (next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP(6))",
+        )
+        .bind(&lease_owner)
+        .bind(LEASE_SECONDS)
+        .bind(message_id)
+        .bind(queue_name)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(LocalMessageExactClaim::NotClaimable {
+                status: candidate.status,
+                reason: "exact claim compare-and-set lost".into(),
+            });
+        }
+        tx.commit().await?;
+        candidate.status = "PROCESSING".into();
+        candidate.lease_owner = Some(lease_owner);
+        candidate.attempts = candidate.attempts.saturating_add(1);
+        Ok(LocalMessageExactClaim::Claimed(candidate))
+    }
+
     pub async fn claim_batch(
         &self,
         owner: &str,
@@ -235,6 +439,31 @@ impl LocalMessageRepository {
             ));
         }
         let mut tx = self.pool.begin().await?;
+        // Expiry cannot establish that the previous handler had no effect.
+        // Bounded stale PROCESSING rows move to IN_DOUBT under their row locks;
+        // only explicit provenance reconciliation can make them claimable again.
+        let stale_processing_ids: Vec<String> =
+            sqlx::query_scalar(UNOWNED_PROCESSING_CANDIDATES_SQL)
+                .bind(queue_name)
+                .bind(i64::from(limit))
+                .fetch_all(&mut *tx)
+                .await?;
+        for message_id in &stale_processing_ids {
+            let result = sqlx::query(MARK_UNOWNED_PROCESSING_IN_DOUBT_SQL)
+                .bind(message_id)
+                .bind(queue_name)
+                .execute(&mut *tx)
+                .await?;
+            require_one(result.rows_affected())?;
+        }
+        if !stale_processing_ids.is_empty() {
+            // Commit the fail-closed transition, but do not claim any fresh row
+            // in the same call. LeaseLost is already part of the public error
+            // contract and prompts recovery callers to mark the channel suspect.
+            tx.commit().await?;
+            return Err(LocalMessageError::LeaseLost);
+        }
+
         let candidates = sqlx::query_as::<_, LocalMessageRow>(CLAIM_CANDIDATES_SQL)
             .bind(queue_name)
             .bind(i64::from(limit))
@@ -248,8 +477,8 @@ impl LocalMessageRepository {
                 "UPDATE al_message_outbox SET status = 'PROCESSING', lease_owner = ?, \
                     lease_expires_at = DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ? SECOND), \
                     attempts = attempts + 1, updated_at = UTC_TIMESTAMP(6) \
-                 WHERE message_id = ? AND queue_name = ? \
-                   AND (status = 'PENDING' OR (status = 'PROCESSING' AND lease_expires_at < UTC_TIMESTAMP(6)))",
+                 WHERE message_id = ? AND queue_name = ? AND status = 'PENDING' \
+                   AND (next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP(6))",
             )
             .bind(&lease_owner)
             .bind(LEASE_SECONDS)
@@ -815,14 +1044,68 @@ mod tests {
         }
     }
 
+    /// Exact-claim SQL must be exact-id scoped, server-TTL CAS fenced, and
+    /// must block on every earlier non-terminal row in its exact FIFO scope.
+    #[test]
+    fn exact_claim_guard_preserves_fifo_and_cas_lease_invariants() {
+        let source = include_str!("local_message_repository.rs");
+        let start = source
+            .find("pub async fn claim_exact(")
+            .expect("exact claim API must exist");
+        let end = source[start..]
+            .find("pub async fn claim_batch(")
+            .expect("batch claim API must follow exact claim");
+        let body = &source[start..start + end];
+        assert!(body.contains("WHERE message_id = ? AND queue_name = ? FOR UPDATE"));
+        assert!(body.contains("WHERE message_id = ? AND queue_name = ? AND status = 'PENDING'"));
+        assert!(body.contains("status NOT IN ('PROCESSED', 'QUARANTINED')"));
+        assert!(body.contains("prior_message.scope_sequence < ?"));
+        assert!(body.contains("prior_message.created_at < ?"));
+        assert!(body.contains("lease_expires_at IS NULL OR lease_expires_at < UTC_TIMESTAMP(6)"));
+        assert!(body.contains("MARK_UNOWNED_PROCESSING_IN_DOUBT_SQL"));
+        assert!(body.contains("status: IN_DOUBT_STATUS.into()"));
+        assert!(body.contains("DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ? SECOND)"));
+        assert!(body.contains("next_attempt_at <= UTC_TIMESTAMP(6)"));
+        assert!(!body.contains("status = 'PROCESSED'"));
+    }
+
     /// Claim SQL contract: scope-sequence FIFO with conservative legacy
     /// fallback, IN_DOUBT never claimable, no time-based IN_DOUBT reset.
     #[test]
     fn claim_guard_is_scope_ordered_and_never_claims_in_doubt() {
-        assert!(CLAIM_CANDIDATES_SQL.contains(
-            "current_message.status = 'PENDING' OR (current_message.status = 'PROCESSING' AND current_message.lease_expires_at < UTC_TIMESTAMP(6))"
-        ));
+        assert!(CLAIM_CANDIDATES_SQL.contains("current_message.status = 'PENDING'"));
+        assert!(!CLAIM_CANDIDATES_SQL.contains("status = 'PROCESSING'"));
         assert!(!CLAIM_CANDIDATES_SQL.contains("IN_DOUBT"));
+        assert!(UNOWNED_PROCESSING_CANDIDATES_SQL.contains("status = 'PROCESSING'"));
+        assert!(UNOWNED_PROCESSING_CANDIDATES_SQL
+            .contains("lease_expires_at IS NULL OR lease_expires_at < UTC_TIMESTAMP(6)"));
+        assert!(UNOWNED_PROCESSING_CANDIDATES_SQL.contains("FOR UPDATE SKIP LOCKED"));
+        assert!(UNOWNED_PROCESSING_CANDIDATES_SQL.contains("LIMIT ?"));
+        assert!(MARK_UNOWNED_PROCESSING_IN_DOUBT_SQL.contains("SET status = 'IN_DOUBT'"));
+        assert!(MARK_UNOWNED_PROCESSING_IN_DOUBT_SQL.contains("AND status = 'PROCESSING'"));
+        assert!(
+            MARK_UNOWNED_PROCESSING_IN_DOUBT_SQL.contains("lease_expires_at < UTC_TIMESTAMP(6)")
+        );
+        let source = include_str!("local_message_repository.rs");
+        let batch_start = source
+            .find("pub async fn claim_batch(")
+            .expect("batch claim API must exist");
+        let batch_end = source[batch_start..]
+            .find("pub async fn heartbeat(")
+            .expect("heartbeat API must follow batch claim");
+        let batch = &source[batch_start..batch_start + batch_end];
+        assert!(batch.contains("UNOWNED_PROCESSING_CANDIDATES_SQL"));
+        assert!(batch.contains("MARK_UNOWNED_PROCESSING_IN_DOUBT_SQL"));
+        assert!(batch.contains("require_one(result.rows_affected())?"));
+        assert!(batch.contains("if !stale_processing_ids.is_empty()"));
+        assert!(batch.contains("tx.commit().await?"));
+        assert!(batch.contains("return Err(LocalMessageError::LeaseLost)"));
+        assert!(!batch.contains("status = 'PROCESSING' AND lease_expires_at < UTC_TIMESTAMP(6)"));
+        assert!(!CLAIM_CANDIDATES_SQL.contains("IN_DOUBT"));
+        assert!(!MARK_UNOWNED_PROCESSING_IN_DOUBT_SQL.contains("status = 'PENDING'"));
+        assert!(IN_DOUBT_SETTLE_SQL.contains("AND status = 'IN_DOUBT'"));
+        assert!(IN_DOUBT_LOAD_SQL.contains("status = 'IN_DOUBT'"));
+        assert!(SCOPE_SEQUENCE_ATTACH_SQL.contains("AND scope_sequence IS NULL"));
         assert!(
             CLAIM_CANDIDATES_SQL
                 .contains("prior_message.scope_sequence < current_message.scope_sequence"),

@@ -42,10 +42,7 @@ impl SessionService {
         let user_id = scope.user_id;
         let conversation_id = self
             .conversations
-            .create_conversation_scoped(scope, &name, &conversation_type)
-            .await?;
-        self.members
-            .add_member_scoped(conversation_id, scope, user_id, "MEMBER", None)
+            .create_conversation_with_creator_scoped(scope, &name, &conversation_type)
             .await?;
 
         tracing::info!(conversation_id, creator = %user_id, "session created");
@@ -196,6 +193,16 @@ mod tests {
 
     #[async_trait]
     impl ConversationRepository for FakeConversationRepository {
+        async fn create_conversation_with_creator_scoped(
+            &self,
+            scope: &ChatScope,
+            name: &str,
+            conversation_type: &str,
+        ) -> Result<i64, AstralError> {
+            self.create_conversation_scoped(scope, name, conversation_type)
+                .await
+        }
+
         async fn create_conversation_scoped(
             &self,
             _scope: &ChatScope,

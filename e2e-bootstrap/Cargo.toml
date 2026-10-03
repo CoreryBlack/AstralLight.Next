@@ -10,3 +10,4 @@ astral-db = { path = "../astral-db" }
 astral-types = { path = "../astral-types" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
+uuid = { workspace = true }

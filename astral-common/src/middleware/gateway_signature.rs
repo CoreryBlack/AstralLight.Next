@@ -62,6 +62,71 @@ pub fn compute_hmac_signature_v3(
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// Exact Gateway-signed transports that intentionally carry no business identity.
+///
+/// This is not an unsigned bypass: callers still need a valid v3 signature,
+/// timestamp and `x-gateway-auth` marker. The allowlist only admits the
+/// identity-empty wire shape for public credential-bootstrap handlers and
+/// Identity session operations that must validate their own refresh token.
+fn is_identity_empty_signed_transport(method: &str, path: &str) -> bool {
+    if method != "POST" {
+        return false;
+    }
+
+    matches!(
+        path,
+        "/api/v1/auth/sessions"
+            | "/api/v1/auth/register"
+            | "/api/v1/auth/password/forgot"
+            | "/api/v1/auth/password/reset/token"
+            | "/api/v1/auth/verification/send"
+            | "/api/v1/auth/verification/verify"
+            | "/v1/app/users/login"
+            | "/api/v1/auth/sessions/refresh"
+            | "/api/v1/auth/sessions/switch-card"
+            | "/api/v1/auth/sessions/logout"
+            | "/api/v1/auth/sessions/revoke"
+    ) || path
+        .strip_prefix("/api/v1/auth/password/reset/")
+        .is_some_and(|token| !token.is_empty() && !token.contains('/'))
+}
+
+/// Identity-empty means every signed identity field and every additional
+/// gateway-injected identity/permission context field is absent or blank. A
+/// partial principal/card context never falls through to the transport exception.
+fn has_empty_identity_context(headers: &axum::http::HeaderMap) -> bool {
+    const IDENTITY_HEADERS: &[&str] = &[
+        "x-user-id",
+        "x-principal-kind",
+        "x-token-id",
+        "x-identity-card-id",
+        "x-user-card-id",
+        "x-user-card-domain-id",
+        "x-user-card-tenant-id",
+        "x-token-use",
+        "x-claims-version",
+        "x-action-codes",
+        "x-user-roles",
+        "x-template-id",
+        "x-tenant-status",
+        "x-perms-ref",
+        "x-permissions-truncated",
+        "x-has-required",
+        "x-required-permission",
+        "x-resource-owner-id",
+    ];
+
+    IDENTITY_HEADERS.iter().all(|name| {
+        headers
+            .get(*name)
+            .is_none_or(|value| value.to_str().is_ok_and(|text| text.trim().is_empty()))
+    })
+}
+
+fn timestamp_within_tolerance(now_ms: i64, timestamp_ms: i64, tolerance_ms: i64) -> bool {
+    tolerance_ms > 0 && now_ms.abs_diff(timestamp_ms) <= tolerance_ms as u64
+}
+
 /// Gateway 签名验证中间件
 ///
 /// 验证步骤（对齐 Java `GatewayIdentityHeaders.isVerified()`）：
@@ -149,7 +214,8 @@ pub async fn gateway_signature_middleware(
         }
     };
 
-    if (now_ms - ts_ms).abs() > tolerance_ms {
+    // Compare as an unsigned distance so extreme signed timestamps cannot overflow.
+    if !timestamp_within_tolerance(now_ms, ts_ms, tolerance_ms) {
         return gateway_error(
             &req,
             403,
@@ -212,16 +278,25 @@ pub async fn gateway_signature_middleware(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let principal_kind = match PrincipalKind::parse(principal_kind) {
-        Some(kind) => kind,
-        None => {
-            return gateway_error(
-                &req,
-                403,
-                "Invalid principal kind",
-                "FORBIDDEN",
-                "PRINCIPAL_KIND_INVALID",
-            )
+    // Bootstrap and Refresh transports carry an empty identity payload. The
+    // branch stays behind the same v3 verification, and is exact on method/path;
+    // any partial or spoofed identity context is rejected rather than ignored.
+    let identity_empty_transport =
+        is_identity_empty_signed_transport(method, path) && has_empty_identity_context(headers);
+    let principal_kind = if identity_empty_transport {
+        None
+    } else {
+        match PrincipalKind::parse(principal_kind) {
+            Some(kind) => Some(kind),
+            None => {
+                return gateway_error(
+                    &req,
+                    403,
+                    "Invalid principal kind",
+                    "FORBIDDEN",
+                    "PRINCIPAL_KIND_INVALID",
+                )
+            }
         }
     };
     let identity_present = !identity_card_id.trim().is_empty();
@@ -231,11 +306,16 @@ pub async fn gateway_signature_middleware(
     let user_card_fields_absent = [user_card_id, user_card_domain_id, user_card_tenant_id]
         .iter()
         .all(|value| value.trim().is_empty());
-    let context_valid = identity_present
-        && match principal_kind {
-            PrincipalKind::PlatformUser => user_card_fields_present,
-            PrincipalKind::AppUser => user_card_fields_absent,
-        };
+    let context_valid = if identity_empty_transport {
+        has_empty_identity_context(headers)
+    } else {
+        identity_present
+            && match principal_kind {
+                Some(PrincipalKind::PlatformUser) => user_card_fields_present,
+                Some(PrincipalKind::AppUser) => user_card_fields_absent,
+                None => false,
+            }
+    };
     if !context_valid {
         return gateway_error(
             &req,
@@ -253,7 +333,7 @@ pub async fn gateway_signature_middleware(
         method,
         path,
         user_id,
-        principal_kind.as_str(),
+        principal_kind.map(|kind| kind.as_str()).unwrap_or(""),
         token_id,
         identity_card_id,
         user_card_id,
@@ -356,6 +436,322 @@ mod tests {
             "USER",
             "1700000000000",
         )
+    }
+
+    fn empty_signed_request(method: &str, path: &str) -> axum::http::Request<axum::body::Body> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string();
+        let signature = compute_hmac_signature_v3(
+            SECRET, method, path, "", // user_id
+            "", // principal_kind
+            "", // token_id
+            "", // identity_card_id
+            "", // user_card_id
+            "", // user_card_domain_id
+            "", // user_card_tenant_id
+            "", // token_use
+            "", // claims_version
+            "", // action_codes
+            "", // user_roles
+            &timestamp,
+        );
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("x-gateway-auth", "verified")
+            .header("x-gateway-ts", timestamp)
+            .header("x-gateway-signature", signature)
+            .header("x-original-path", path)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    fn request_header_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> &'a str {
+        headers
+            .get(name)
+            .and_then(|header| header.to_str().ok())
+            .unwrap_or("")
+    }
+
+    fn resign_request(request: &mut axum::http::Request<axum::body::Body>) {
+        let path = request_header_value(request.headers(), "x-original-path");
+        let signature = compute_hmac_signature_v3(
+            SECRET,
+            request.method().as_str(),
+            path,
+            request_header_value(request.headers(), "x-user-id"),
+            request_header_value(request.headers(), "x-principal-kind"),
+            request_header_value(request.headers(), "x-token-id"),
+            request_header_value(request.headers(), "x-identity-card-id"),
+            request_header_value(request.headers(), "x-user-card-id"),
+            request_header_value(request.headers(), "x-user-card-domain-id"),
+            request_header_value(request.headers(), "x-user-card-tenant-id"),
+            request_header_value(request.headers(), "x-token-use"),
+            request_header_value(request.headers(), "x-claims-version"),
+            request_header_value(request.headers(), "x-action-codes"),
+            request_header_value(request.headers(), "x-user-roles"),
+            request_header_value(request.headers(), "x-gateway-ts"),
+        );
+        request
+            .headers_mut()
+            .insert("x-gateway-signature", signature.parse().unwrap());
+    }
+
+    fn config() -> AppConfig {
+        AppConfig {
+            gateway: crate::config::GatewayCfg {
+                hmac_secret: SECRET.to_string(),
+                timestamp_tolerance_secs: 30,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn identity_empty_route_app(
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> axum::Router {
+        use axum::routing::any;
+        use axum::Router;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/auth/sessions",
+                any({
+                    let counter = counter.clone();
+                    move || {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            "identity-empty-marker"
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/auth/sessions/refresh",
+                any({
+                    let counter = counter.clone();
+                    move || {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            "identity-empty-marker"
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/auth/sessions/refresh-extra",
+                any({
+                    let counter = counter.clone();
+                    move || {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            "must-not-reach"
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/auth/profile",
+                any({
+                    let counter = counter.clone();
+                    move || {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            "protected-marker"
+                        }
+                    }
+                }),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                config(),
+                gateway_signature_middleware,
+            ));
+        app.with_state(config())
+    }
+
+    #[tokio::test]
+    async fn exact_identity_empty_bootstrap_and_refresh_requests_require_valid_v3_signature() {
+        use axum::body::to_bytes;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tower::ServiceExt;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = identity_empty_route_app(Arc::clone(&counter));
+        for path in ["/api/v1/auth/sessions", "/api/v1/auth/sessions/refresh"] {
+            let response = app
+                .clone()
+                .oneshot(empty_signed_request("POST", path))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        for (label, mut request) in [
+            (
+                "missing auth marker",
+                empty_signed_request("POST", "/api/v1/auth/sessions/refresh"),
+            ),
+            (
+                "missing signature",
+                empty_signed_request("POST", "/api/v1/auth/sessions/refresh"),
+            ),
+            (
+                "wrong method",
+                empty_signed_request("GET", "/api/v1/auth/sessions/refresh"),
+            ),
+        ] {
+            if label == "missing auth marker" {
+                request.headers_mut().remove("x-gateway-auth");
+            } else if label == "missing signature" {
+                request.headers_mut().remove("x-gateway-signature");
+            } else {
+                // The signed path is unchanged, so changing this method invalidates v3.
+                *request.method_mut() = axum::http::Method::GET;
+            }
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{label}");
+        }
+        let mut wrong_path = empty_signed_request("POST", "/api/v1/auth/sessions/refresh");
+        wrong_path.headers_mut().insert(
+            "x-original-path",
+            "/api/v1/auth/sessions/refresh-extra".parse().unwrap(),
+        );
+        resign_request(&mut wrong_path);
+        *wrong_path.uri_mut() = "/api/v1/auth/sessions/refresh-extra".parse().unwrap();
+        let response = app.clone().oneshot(wrong_path).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "wrong path");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        let mut wrong_original_path = empty_signed_request("POST", "/api/v1/auth/sessions/refresh");
+        wrong_original_path.headers_mut().insert(
+            "x-original-path",
+            "/api/v1/auth/sessions/refresh-extra".parse().unwrap(),
+        );
+        resign_request(&mut wrong_original_path);
+        let response = app.clone().oneshot(wrong_original_path).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "wrong signed path"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        for extreme_timestamp in [i64::MIN, i64::MAX] {
+            let mut extreme = empty_signed_request("POST", "/api/v1/auth/sessions/refresh");
+            extreme.headers_mut().insert(
+                "x-gateway-ts",
+                extreme_timestamp.to_string().parse().unwrap(),
+            );
+            resign_request(&mut extreme);
+            let response = app.clone().oneshot(extreme).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "extreme timestamp {extreme_timestamp}"
+            );
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        let mut partial_identity = empty_signed_request("POST", "/api/v1/auth/sessions/refresh");
+        partial_identity
+            .headers_mut()
+            .insert("x-principal-kind", "APP_USER".parse().unwrap());
+        resign_request(&mut partial_identity);
+        let response = app.clone().oneshot(partial_identity).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        let mut refresh_partial_user =
+            empty_signed_request("POST", "/api/v1/auth/sessions/refresh");
+        refresh_partial_user
+            .headers_mut()
+            .insert("x-user-id", "42".parse().unwrap());
+        resign_request(&mut refresh_partial_user);
+        let response = app.clone().oneshot(refresh_partial_user).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "partial user");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        let mut protected_route = empty_signed_request("POST", "/api/v1/auth/profile");
+        *protected_route.method_mut() = axum::http::Method::GET;
+        *protected_route.uri_mut() = "/api/v1/auth/profile".parse().unwrap();
+        protected_route
+            .headers_mut()
+            .insert("x-original-path", "/api/v1/auth/profile".parse().unwrap());
+        resign_request(&mut protected_route);
+        let response = app.clone().oneshot(protected_route).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let mut valid_platform = empty_signed_request("GET", "/api/v1/auth/profile");
+        *valid_platform.uri_mut() = "/api/v1/auth/profile".parse().unwrap();
+        *valid_platform.method_mut() = axum::http::Method::GET;
+        valid_platform
+            .headers_mut()
+            .insert("x-original-path", "/api/v1/auth/profile".parse().unwrap());
+        for (name, value) in [
+            ("x-user-id", "42"),
+            ("x-principal-kind", "PLATFORM_USER"),
+            ("x-token-id", "access-jti"),
+            ("x-identity-card-id", "10"),
+            ("x-user-card-id", "40"),
+            ("x-user-card-domain-id", "30"),
+            ("x-user-card-tenant-id", "20"),
+            ("x-token-use", "ACCESS"),
+            ("x-claims-version", "2"),
+        ] {
+            valid_platform
+                .headers_mut()
+                .insert(name, value.parse().unwrap());
+        }
+        resign_request(&mut valid_platform);
+        let response = app.clone().oneshot(valid_platform).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), b"protected-marker");
+    }
+
+    #[test]
+    fn identity_empty_transport_allowlist_is_exact_and_method_bound() {
+        for path in [
+            "/api/v1/auth/sessions",
+            "/api/v1/auth/register",
+            "/api/v1/auth/password/forgot",
+            "/api/v1/auth/password/reset/token",
+            "/api/v1/auth/verification/send",
+            "/api/v1/auth/verification/verify",
+            "/v1/app/users/login",
+            "/api/v1/auth/sessions/refresh",
+            "/api/v1/auth/sessions/switch-card",
+            "/api/v1/auth/sessions/logout",
+            "/api/v1/auth/sessions/revoke",
+        ] {
+            assert!(is_identity_empty_signed_transport("POST", path), "{path}");
+            assert!(!is_identity_empty_signed_transport("GET", path), "{path}");
+        }
+        for path in [
+            "/api/v1/auth/register/extra",
+            "/api/v1/auth/password/reset",
+            "/api/v1/auth/password/reset/token/extra",
+            "/api/v1/auth/password/reset/token/extra",
+            "/api/v1/auth/sessions/refresh-extra",
+            "/api/v1/auth/profile",
+            "/api/v1/auth/mfa/verify",
+        ] {
+            assert!(!is_identity_empty_signed_transport("POST", path), "{path}");
+        }
     }
 
     #[test]
@@ -506,6 +902,18 @@ mod tests {
             "1700000000000",
         );
         assert_ne!(baseline, altered);
+    }
+
+    #[test]
+    fn timestamp_skew_check_rejects_extreme_values_without_overflow() {
+        for timestamp_ms in [i64::MIN, i64::MAX] {
+            assert!(!timestamp_within_tolerance(0, timestamp_ms, 30_000));
+        }
+        assert!(!timestamp_within_tolerance(i64::MIN, i64::MAX, 30_000));
+        assert!(!timestamp_within_tolerance(i64::MAX, i64::MIN, 30_000));
+        assert!(!timestamp_within_tolerance(100_000, 100_001, 0));
+        assert!(timestamp_within_tolerance(100_000, 100_030, 30));
+        assert!(!timestamp_within_tolerance(100_000, 100_031, 30));
     }
 
     #[test]

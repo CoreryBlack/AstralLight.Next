@@ -109,6 +109,12 @@ impl LocalReceiver {
     pub async fn recv(&mut self) -> Option<LocalDelivery> {
         self.receiver.recv().await
     }
+
+    /// Close admission to this receiver while preserving already-buffered work.
+    /// `recv` continues draining queued deliveries and then returns `None`.
+    pub fn close(&mut self) {
+        self.receiver.close();
+    }
 }
 
 struct InFlight {
@@ -408,6 +414,41 @@ mod tests {
             bus.try_publish(QUEUE_AUDIT_LOG, "audit.log", envelope("three")),
             Err(LocalBusError::Closed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn receiver_close_rejects_new_admission_and_drains_buffered_messages() {
+        let bus = bus(4);
+        let mut receiver = bus
+            .register(QUEUE_AUTH_SESSION_REVOCATION, LocalOwner::Identity)
+            .unwrap();
+        bus.try_publish(
+            QUEUE_AUTH_SESSION_REVOCATION,
+            "auth.session.revocation",
+            envelope("already-admitted"),
+        )
+        .unwrap();
+
+        receiver.close();
+        assert!(matches!(
+            bus.try_publish(
+                QUEUE_AUTH_SESSION_REVOCATION,
+                "auth.session.revocation",
+                envelope("after-close"),
+            ),
+            Err(LocalBusError::Closed(_))
+        ));
+
+        let delivery = receiver
+            .recv()
+            .await
+            .expect("close must preserve already-admitted deliveries");
+        assert_eq!(delivery.envelope.message_id, "already-admitted");
+        delivery.complete(Ok(()));
+        assert!(
+            receiver.recv().await.is_none(),
+            "closed receiver drains then ends"
+        );
     }
 
     #[tokio::test]

@@ -85,10 +85,15 @@ async fn submit_for_review(
 }
 
 async fn approve_course(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<PublishWorkflow>>, AppError> {
-    let workflow = state.publishing_service.approve_course(id).await?;
+    let reviewer_id = authenticated_user_id(&headers)?;
+    let workflow = state
+        .publishing_service
+        .approve_course(id, reviewer_id)
+        .await?;
     Ok(Json(ApiResponse::success(workflow)))
 }
 
@@ -106,6 +111,18 @@ async fn get_student_progress(
     Path((course_id, user_id)): Path<(i64, i64)>,
 ) -> Result<Json<ApiResponse<StudentProgress>>, AppError> {
     require_same_user(authenticated_user_id(&headers)?, user_id)?;
+    let resolution =
+        crate::ownership::resolve_course_progress_read_ownership(&state.db, course_id, user_id)
+            .await;
+    if !matches!(
+        resolution,
+        astral_db::ResourceOwnershipResolution::TenantScoped { .. }
+    ) {
+        return Err(astral_types::AstralError::Permission(
+            "Course progress source ownership is unresolved".into(),
+        )
+        .into());
+    }
     let progress = state
         .publishing_service
         .student_progress(course_id, user_id)

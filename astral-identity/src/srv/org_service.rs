@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use astral_common::error::AppError;
 use astral_types::AstralError;
 
-use crate::srv::org_repository::OrgRepository;
+use crate::srv::org_repository::{OrgMutationContext, OrgRepository};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +79,22 @@ impl OrgService {
         })
     }
 
+    pub async fn create_org_with_context(
+        &self,
+        req: &Organization,
+        context: &OrgMutationContext,
+    ) -> Result<Organization, AppError> {
+        let id = self
+            .repository
+            .create_org_with_context(&req.name, &req.status, context)
+            .await?;
+        Ok(Organization {
+            id: Some(id),
+            created_at: Some(now_rfc3339()),
+            ..req.clone()
+        })
+    }
+
     pub async fn get_org(&self, id: i64) -> Result<Organization, AppError> {
         self.repository
             .get_org(id)
@@ -94,8 +110,29 @@ impl OrgService {
         Ok(())
     }
 
+    pub async fn update_org_with_context(
+        &self,
+        id: i64,
+        req: &Organization,
+        context: &OrgMutationContext,
+    ) -> Result<(), AppError> {
+        self.repository
+            .update_org_with_context(id, &req.name, &req.code, &req.status, context)
+            .await?;
+        Ok(())
+    }
+
     pub async fn delete_org(&self, id: i64) -> Result<(), AppError> {
         self.repository.delete_org(id).await.map_err(AppError::from)
+    }
+
+    pub async fn delete_org_with_context(
+        &self,
+        id: i64,
+        context: &OrgMutationContext,
+    ) -> Result<(), AppError> {
+        self.repository.delete_org_with_context(id, context).await?;
+        Ok(())
     }
 
     pub async fn list_org_domains(&self, org_id: i64) -> Result<Vec<Domain>, AppError> {
@@ -131,6 +168,23 @@ impl OrgService {
         })
     }
 
+    pub async fn create_domain_with_context(
+        &self,
+        req: &Domain,
+        context: &OrgMutationContext,
+    ) -> Result<Domain, AppError> {
+        let id = self
+            .repository
+            .create_domain_with_context(&req.name, req.code.as_deref(), &req.status, context)
+            .await?;
+        Ok(Domain {
+            id: Some(id),
+            org_id: None,
+            created_at: Some(now_rfc3339()),
+            ..req.clone()
+        })
+    }
+
     pub async fn get_domain(&self, id: i64) -> Result<Domain, AppError> {
         self.repository
             .get_domain(id)
@@ -146,11 +200,34 @@ impl OrgService {
         Ok(())
     }
 
+    pub async fn update_domain_with_context(
+        &self,
+        id: i64,
+        req: &Domain,
+        context: &OrgMutationContext,
+    ) -> Result<(), AppError> {
+        self.repository
+            .update_domain_with_context(id, &req.name, req.code.as_deref(), &req.status, context)
+            .await?;
+        Ok(())
+    }
+
     pub async fn delete_domain(&self, id: i64) -> Result<(), AppError> {
         self.repository
             .delete_domain(id)
             .await
             .map_err(AppError::from)
+    }
+
+    pub async fn delete_domain_with_context(
+        &self,
+        id: i64,
+        context: &OrgMutationContext,
+    ) -> Result<(), AppError> {
+        self.repository
+            .delete_domain_with_context(id, context)
+            .await?;
+        Ok(())
     }
 
     pub async fn list_domain_tenants(&self, domain_id: i64) -> Result<Vec<Tenant>, AppError> {
@@ -185,6 +262,22 @@ impl OrgService {
         })
     }
 
+    pub async fn create_tenant_with_context(
+        &self,
+        req: &Tenant,
+        context: &OrgMutationContext,
+    ) -> Result<Tenant, AppError> {
+        let id = self
+            .repository
+            .create_tenant_with_context(&req.name, &req.status, context)
+            .await?;
+        Ok(Tenant {
+            id: Some(id),
+            created_at: Some(now_rfc3339()),
+            ..req.clone()
+        })
+    }
+
     pub async fn get_tenant(&self, id: i64) -> Result<Tenant, AppError> {
         self.repository
             .get_tenant(id)
@@ -200,11 +293,34 @@ impl OrgService {
         Ok(())
     }
 
+    pub async fn update_tenant_with_context(
+        &self,
+        id: i64,
+        req: &Tenant,
+        context: &OrgMutationContext,
+    ) -> Result<(), AppError> {
+        self.repository
+            .update_tenant_with_context(id, &req.name, &req.code, &req.status, context)
+            .await?;
+        Ok(())
+    }
+
     pub async fn delete_tenant(&self, id: i64) -> Result<(), AppError> {
         self.repository
             .delete_tenant(id)
             .await
             .map_err(AppError::from)
+    }
+
+    pub async fn delete_tenant_with_context(
+        &self,
+        id: i64,
+        context: &OrgMutationContext,
+    ) -> Result<(), AppError> {
+        self.repository
+            .delete_tenant_with_context(id, context)
+            .await?;
+        Ok(())
     }
 }
 

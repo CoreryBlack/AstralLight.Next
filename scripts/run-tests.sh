@@ -26,6 +26,13 @@ fail() {
     exit 1
 }
 
+RUN_ID="${RUN_ID:-astral-test-$(date +%Y%m%d%H%M%S)-$$}"
+case "$RUN_ID" in
+    *[!a-zA-Z0-9_-]*|"") fail "RUN_ID must contain only letters, digits, '_' or '-'" ;;
+esac
+COMPOSE_PROJECT_NAME="astral-test-${RUN_ID}"
+COMPOSE=(docker compose -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE")
+
 require_command() {
     command -v "$1" >/dev/null 2>&1 || fail "required command is unavailable: $1"
 }
@@ -85,11 +92,11 @@ start_docker() {
     fi
     require_docker
     printf '[docker] 启动隔离集成测试环境...\n'
-    docker compose -f "$COMPOSE_FILE" config --quiet
+    "${COMPOSE[@]}" config --quiet
     # Mark the stack for cleanup before `up`; a partial startup must not be left
     # behind when Docker exits non-zero.
     DOCKER_STARTED=1
-    docker compose -f "$COMPOSE_FILE" up -d --wait
+    "${COMPOSE[@]}" up -d --wait
     printf '[docker] 环境就绪: MySQL(3308) Redis(6380) RabbitMQ(5673)\n'
 }
 
@@ -103,40 +110,56 @@ stop_docker() {
         return
     fi
     printf '[docker] 停止隔离集成测试环境...\n'
-    docker compose -f "$COMPOSE_FILE" down -v --remove-orphans || true
+    "${COMPOSE[@]}" down --remove-orphans || true
 }
 
 run_integration_gate() {
     require_integration_environment
     start_docker
     start_rust_migrations
-    printf '[cargo] 单元测试\n'
+    printf '[cargo] 默认特性单元测试\n'
     cargo test --workspace --lib
+    printf '[cargo] redis-compat 特性单元测试\n'
+    cargo test --workspace --lib --features astral-db/redis-compat,astral-gateway/redis-compat,astral-identity/redis-compat,astral-trustgraph/redis-compat,astral-monitor/redis-compat,astral-mq/redis-compat,astral-learn/redis-compat
     printf '[cargo] 真实集成测试（ignored；缺依赖或连接失败必须失败）\n'
     cargo test --workspace --test '*' -- --ignored --nocapture --test-threads=1
+    printf '[cargo] redis-compat ignored integration tests\n'
+    cargo test --workspace --test '*' --features astral-db/redis-compat,astral-gateway/redis-compat,astral-identity/redis-compat,astral-trustgraph/redis-compat,astral-monitor/redis-compat,astral-mq/redis-compat,astral-learn/redis-compat -- --ignored --nocapture --test-threads=1
 }
 
 trap stop_docker EXIT
 
 case "$MODE" in
     --check)
-        printf '[cargo] check + clippy\n'
+        printf '[cargo] default-feature check + clippy\n'
         cargo check --workspace --all-targets
         cargo clippy --workspace --all-targets -- -D warnings
+        printf '[cargo] redis-compat feature check + clippy\n'
+        cargo check --workspace --all-targets --features astral-db/redis-compat,astral-gateway/redis-compat,astral-identity/redis-compat,astral-trustgraph/redis-compat,astral-monitor/redis-compat,astral-mq/redis-compat,astral-learn/redis-compat
+        cargo clippy --workspace --all-targets --features astral-db/redis-compat,astral-gateway/redis-compat,astral-identity/redis-compat,astral-trustgraph/redis-compat,astral-monitor/redis-compat,astral-mq/redis-compat,astral-learn/redis-compat -- -D warnings
         ;;
     --integration|--full)
         run_integration_gate
         ;;
     --bench)
-        printf '[cargo] benchmark\n'
+        printf '[cargo] default-feature benchmark\n'
         cargo bench --workspace
+        printf '[cargo] redis-compat feature benchmark\n'
+        cargo bench --workspace --features astral-db/redis-compat,astral-gateway/redis-compat,astral-identity/redis-compat,astral-trustgraph/redis-compat,astral-monitor/redis-compat,astral-mq/redis-compat,astral-learn/redis-compat
         ;;
     unit|--unit|"")
         require_test_environment
-        start_docker
+    start_docker
+    if [ "${SKIP_DOCKER:-0}" = "1" ]; then
+        printf '[skip] isolated migrations and service-backed unit setup were not run under SKIP_DOCKER=1\n'
+    else
         start_rust_migrations
-        printf '[cargo] 单元测试\n'
-        cargo test --workspace --lib
+    fi
+    printf '[cargo] 默认特性单元测试\n'
+    cargo test --workspace --lib
+    printf '[cargo] redis-compat 特性单元测试\n'
+    cargo test --workspace --lib --features astral-db/redis-compat,astral-gateway/redis-compat,astral-identity/redis-compat,astral-trustgraph/redis-compat,astral-monitor/redis-compat,astral-mq/redis-compat,astral-learn/redis-compat
+
         ;;
     *)
         printf '用法: %s [--integration|--full|--check|--bench|unit]\n' "$0" >&2

@@ -76,6 +76,43 @@ impl Default for BackoffConfig {
     }
 }
 
+const FANOUT_DB_CLAIM_BUDGET: Duration = Duration::from_secs(5);
+const FANOUT_DB_SETTLEMENT_BUDGET: Duration = Duration::from_secs(5);
+const FANOUT_DB_HEARTBEAT_BUDGET: Duration = Duration::from_secs(5);
+const FANOUT_RELAY_CLAIM_ROWS: u32 = 1;
+
+async fn bounded_fanout_db_call<T, F, E>(
+    operation: &'static str,
+    budget: Duration,
+    future: F,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(budget, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(format!(
+            "{operation} failed; durable result may be unknown: {error}"
+        )),
+        Err(_) => Err(format!(
+            "{operation} timed out after {budget:?}; durable result is unknown"
+        )),
+    }
+}
+
+fn fanout_publish_timeout_ceiling() -> Duration {
+    // The heartbeat resets the lease to its full duration. Keep enough room
+    // after confirmation for one bounded settlement and a clock/transport
+    // margin so settlement still runs before the renewed lease expires.
+    Duration::from_secs(
+        astral_db::LOCAL_MESSAGE_LEASE_SECONDS
+            .saturating_sub(FANOUT_DB_HEARTBEAT_BUDGET.as_secs())
+            .saturating_sub(FANOUT_DB_SETTLEMENT_BUDGET.as_secs())
+            .saturating_sub(2),
+    )
+}
+
 #[derive(Debug)]
 pub struct Backoff {
     config: BackoffConfig,
@@ -111,9 +148,10 @@ pub trait InvalidationFanoutSource: Send + Sync {
         limit: u32,
     ) -> Result<Vec<astral_db::LocalMessageRow>, String>;
     async fn complete(&self, message_id: &str, lease_token: &str) -> Result<(), String>;
-    /// Renew the claim lease while one row is being processed. The relay
-    /// heartbeats every row so a long sequential batch never lets a later
-    /// row's lease expire mid-batch.
+    /// Renew the claim lease with a token-checked CAS. The relay requires a
+    /// bounded successful renewal immediately before publication; its bounded
+    /// confirm wait is shorter than the renewed lease and needs no background
+    /// renewal task.
     async fn heartbeat(&self, message_id: &str, lease_token: &str) -> Result<(), String>;
     async fn schedule_retry(
         &self,
@@ -223,14 +261,16 @@ impl InvalidationFanoutSource for LocalMessageOutboxSource {
 /// starts implicitly, and no assembly may enable it before a node identity,
 /// the declared topology, and full adapters exist.
 ///
-/// Batch safety: the relay processes one claim strictly sequentially and
-/// heartbeats each claimed row's lease (`LOCAL_MESSAGE_LEASE_SECONDS / 3`),
-/// so even a worst-case batch (every publish hitting
-/// `publish_confirm_timeout`) never lets a later row's lease expire
-/// mid-batch. `batch_size` bounds claim granularity, not lease risk.
+/// Batch safety: `batch_size` remains a compatible setting, but the relay
+/// claims one row at a time because later rows in a multi-row claim cannot be
+/// kept live while they wait behind earlier publishes. Before each publish it
+/// proves a token-fenced lease renewal within a finite DB budget; unknown claim
+/// or transition results are never replayed in this run.
 #[derive(Debug, Clone)]
 pub struct InvalidationFanoutRelaySettings {
     pub enabled: bool,
+    /// Retained and validated for settings compatibility; claims are capped to
+    /// one row so unprocessed claims never age while waiting behind a publish.
     pub batch_size: u32,
     pub idle_poll: Duration,
     pub error_backoff: BackoffConfig,
@@ -282,12 +322,37 @@ fn validate_relay_settings(settings: &InvalidationFanoutRelaySettings) -> Result
     Ok(())
 }
 
+const FANOUT_TASK_REAPER_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn abort_and_reap_fanout_task(mut join: tokio::task::JoinHandle<()>, name: &'static str) {
+    join.abort();
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::error!(
+            task = name,
+            "fanout task join could not be scheduled for bounded reaping"
+        );
+        return;
+    };
+    runtime.spawn(async move {
+        if tokio::time::timeout(FANOUT_TASK_REAPER_TIMEOUT, &mut join)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                task = name,
+                "fanout task abort join remained unknown after bounded reaping"
+            );
+        }
+    });
+}
+
 /// Handle for one relay worker. Shutdown is cooperative; `join` resolves when
-/// the relay loop and its heartbeat task have both finished.
+/// the relay loop and its heartbeat task have both finished. Dropping/cancelling
+/// its join path signals shutdown, aborts remaining work, then reaps it boundedly.
 #[derive(Debug)]
 pub struct InvalidationFanoutRelayHandle {
     shutdown: watch::Sender<bool>,
-    relay_join: tokio::task::JoinHandle<()>,
+    relay_join: Option<tokio::task::JoinHandle<()>>,
     heartbeat_join: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -296,19 +361,45 @@ impl InvalidationFanoutRelayHandle {
         let _ = self.shutdown.send(true);
     }
 
-    pub async fn shutdown_and_join(self) {
+    pub async fn shutdown_and_join(mut self) -> Result<(), String> {
         self.signal_shutdown();
-        if let Some(join) = self.heartbeat_join {
-            let _ = join.await;
+        let mut failures = Vec::new();
+        if let Some(join) = self.heartbeat_join.as_mut() {
+            if let Err(error) = join.await {
+                failures.push(format!("fanout heartbeat join failed: {error}"));
+            }
+            self.heartbeat_join.take();
         }
-        let _ = self.relay_join.await;
+        if let Some(join) = self.relay_join.as_mut() {
+            if let Err(error) = join.await {
+                failures.push(format!("fanout relay join failed: {error}"));
+            }
+            self.relay_join.take();
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+}
+
+impl Drop for InvalidationFanoutRelayHandle {
+    fn drop(&mut self) {
+        self.signal_shutdown();
+        if let Some(join) = self.heartbeat_join.take() {
+            abort_and_reap_fanout_task(join, "fanout-heartbeat");
+        }
+        if let Some(join) = self.relay_join.take() {
+            abort_and_reap_fanout_task(join, "fanout-relay");
+        }
     }
 }
 
 /// Spawn the fanout relay for one node. Requires `settings.enabled == true`
 /// and a validated node identity. The source and transport are held as
-/// owned `Arc`s: the per-row lease heartbeat runs as a detached task on an
-/// `Arc` clone of the source, so no borrow needs to outlive a task.
+/// owned `Arc`s; each row's lease renewal is driven alongside its publish so
+/// an unproven lease stops further publication.
 pub fn spawn_invalidation_fanout_relay<S, T>(
     source: S,
     transport: T,
@@ -343,7 +434,7 @@ where
     });
     Ok(InvalidationFanoutRelayHandle {
         shutdown,
-        relay_join,
+        relay_join: Some(relay_join),
         heartbeat_join,
     })
 }
@@ -374,7 +465,13 @@ async fn run_relay_loop<S, T>(
         if *shutdown.borrow_and_update() {
             return;
         }
-        match source.claim_batch(&worker_id, settings.batch_size).await {
+        let claim = bounded_fanout_db_call(
+            "fanout outbox claim",
+            FANOUT_DB_CLAIM_BUDGET,
+            source.claim_batch(&worker_id, FANOUT_RELAY_CLAIM_ROWS),
+        )
+        .await;
+        match claim {
             Ok(rows) if rows.is_empty() => {
                 if !shutdown_or_sleep(&mut shutdown, settings.idle_poll).await {
                     return;
@@ -386,7 +483,11 @@ async fn run_relay_loop<S, T>(
                     if *shutdown.borrow_and_update() {
                         return;
                     }
-                    process_relay_row(&source, &transport, &identity, &settings, row).await;
+                    if process_relay_row(&source, &transport, &identity, &settings, row).await
+                        == RelayRowDisposition::Stop
+                    {
+                        return;
+                    }
                 }
             }
             Err(error) => {
@@ -405,23 +506,29 @@ async fn run_relay_loop<S, T>(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayRowDisposition {
+    Continue,
+    Stop,
+}
+
 /// Process one claimed row. The publish returns broker admission only:
 /// `Admitted` completes the outbox row (relayed), while per-node apply
 /// completion is proven separately by each node's durable inbox receipt.
-///
-/// Completion semantics: if the broker confirmed the payload but the
-/// `complete` transition itself fails, the row is left exactly as-is (never
-/// reset, never re-published inside this run) and the unknown is logged; the
-/// durable lease state machine owns any later reconciliation. A replayed
-/// delivery is still safe end to end because every node deduplicates on its
-/// durable inbox receipt.
+/// A bounded token-CAS heartbeat must succeed immediately before publish;
+/// failure/timeout leaves the lease result unknown and suppresses publication.
+/// Every durable transition has a finite budget. If a transition after publish
+/// is unknown, this run never republishes the source row; the durable lease
+/// state machine owns later reconciliation and the inbox receipt is the
+/// per-node deduplication proof.
 async fn process_relay_row<S, T>(
     source: &Arc<S>,
     transport: &Arc<T>,
     identity: &NodeIdentity,
     settings: &InvalidationFanoutRelaySettings,
     row: astral_db::LocalMessageRow,
-) where
+) -> RelayRowDisposition
+where
     S: InvalidationFanoutSource + 'static,
     T: InvalidationFanoutTransport,
 {
@@ -430,25 +537,7 @@ async fn process_relay_row<S, T>(
             message_id = %row.message_id,
             "claimed fanout relay row has no lease owner"
         );
-        return;
-    };
-
-    // Keep the claim alive while this row is processed: a sequential batch
-    // must never let a later row's lease expire mid-batch. The task holds an
-    // owned Arc clone of the source, so nothing borrows across the spawn.
-    let lease_heartbeat = {
-        let source = Arc::clone(source);
-        let message_id = row.message_id.clone();
-        let token = lease_token.clone();
-        let interval = Duration::from_secs((astral_db::LOCAL_MESSAGE_LEASE_SECONDS / 3).max(1));
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                if source.heartbeat(&message_id, &token).await.is_err() {
-                    break;
-                }
-            }
-        })
+        return RelayRowDisposition::Stop;
     };
 
     // Canonical bytes seam: rejects anything that is not a committed,
@@ -461,23 +550,50 @@ async fn process_relay_row<S, T>(
                 error = %error,
                 "invalidation fanout row violates the canonical contract; quarantining"
             );
-            if let Err(transition_error) = source
-                .quarantine(&row.message_id, &lease_token, &error.to_string())
-                .await
+            if let Err(transition_error) = bounded_fanout_db_call(
+                "fanout quarantine",
+                FANOUT_DB_SETTLEMENT_BUDGET,
+                source.quarantine(&row.message_id, &lease_token, &error.to_string()),
+            )
+            .await
             {
                 tracing::error!(
                     message_id = %row.message_id,
                     error = %transition_error,
-                    "invalidation fanout quarantine transition failed"
+                    "invalidation fanout quarantine transition failed or is unknown"
                 );
+                return RelayRowDisposition::Stop;
             }
-            lease_heartbeat.abort();
-            return;
+            return RelayRowDisposition::Continue;
         }
     };
 
+    // The broker must not see this row until a bounded, token-fenced database
+    // renewal proves we still own a live lease. A timeout/error is unknown:
+    // do not publish and let durable reconciliation decide the row's fate.
+    if let Err(error) = bounded_fanout_db_call(
+        "fanout prepublish lease renewal",
+        FANOUT_DB_HEARTBEAT_BUDGET,
+        source.heartbeat(&row.message_id, &lease_token),
+    )
+    .await
+    {
+        tracing::error!(
+            message_id = %row.message_id,
+            error = %error,
+            "invalidation fanout lease is not proven; suppressing publication"
+        );
+        return RelayRowDisposition::Stop;
+    }
+
+    // Leave room in the DB lease for the worst-case bounded renewal and
+    // settlement round trips. Public timeout settings remain accepted, but
+    // cannot keep a row in flight beyond its proven lease window.
+    let safe_publish_timeout = settings
+        .publish_confirm_timeout
+        .min(fanout_publish_timeout_ceiling());
     let outcome = match tokio::time::timeout(
-        settings.publish_confirm_timeout,
+        safe_publish_timeout,
         transport.publish_committed_invalidation(&request),
     )
     .await
@@ -485,15 +601,21 @@ async fn process_relay_row<S, T>(
         Ok(outcome) => outcome,
         Err(_) => InvalidationFanoutPublishOutcome::Unknown {
             reason: format!(
-                "publish confirm did not settle within {:?}",
-                settings.publish_confirm_timeout
+                "publish confirm did not settle within {:?} (configured {:?})",
+                safe_publish_timeout, settings.publish_confirm_timeout
             ),
         },
     };
 
     match outcome {
         InvalidationFanoutPublishOutcome::Admitted => {
-            match source.complete(&row.message_id, &lease_token).await {
+            match bounded_fanout_db_call(
+                "fanout completion",
+                FANOUT_DB_SETTLEMENT_BUDGET,
+                source.complete(&row.message_id, &lease_token),
+            )
+            .await
+            {
                 Ok(()) => tracing::debug!(
                     message_id = %row.message_id,
                     region = identity.region(),
@@ -510,8 +632,10 @@ async fn process_relay_row<S, T>(
                         error = %error,
                         "invalidation fanout completion is unknown after broker admission"
                     );
+                    return RelayRowDisposition::Stop;
                 }
             }
+            RelayRowDisposition::Continue
         }
         InvalidationFanoutPublishOutcome::Unknown { reason } => {
             tracing::error!(
@@ -519,15 +643,22 @@ async fn process_relay_row<S, T>(
                 reason = %reason,
                 "invalidation fanout publish outcome unknown; marking IN_DOUBT for reconciliation"
             );
-            if let Err(transition_error) = source
-                .mark_in_doubt(&row.message_id, &lease_token, &reason)
-                .await
+            match bounded_fanout_db_call(
+                "fanout IN_DOUBT transition",
+                FANOUT_DB_SETTLEMENT_BUDGET,
+                source.mark_in_doubt(&row.message_id, &lease_token, &reason),
+            )
+            .await
             {
-                tracing::error!(
-                    message_id = %row.message_id,
-                    error = %transition_error,
-                    "invalidation fanout IN_DOUBT transition failed"
-                );
+                Ok(()) => RelayRowDisposition::Continue,
+                Err(transition_error) => {
+                    tracing::error!(
+                        message_id = %row.message_id,
+                        error = %transition_error,
+                        "invalidation fanout IN_DOUBT transition failed or is unknown"
+                    );
+                    RelayRowDisposition::Stop
+                }
             }
         }
         known_failure @ (InvalidationFanoutPublishOutcome::ReturnedUnroutable { .. }
@@ -535,24 +666,32 @@ async fn process_relay_row<S, T>(
         | InvalidationFanoutPublishOutcome::ConfirmsNotEnabled) => {
             let error = known_failure.to_string();
             let transition = if row.attempts >= astral_db::LOCAL_MESSAGE_MAX_ATTEMPTS {
-                source
-                    .quarantine(&row.message_id, &lease_token, &error)
-                    .await
+                bounded_fanout_db_call(
+                    "fanout quarantine",
+                    FANOUT_DB_SETTLEMENT_BUDGET,
+                    source.quarantine(&row.message_id, &lease_token, &error),
+                )
+                .await
             } else {
-                source
-                    .schedule_retry(&row.message_id, &lease_token, &error)
-                    .await
+                bounded_fanout_db_call(
+                    "fanout retry scheduling",
+                    FANOUT_DB_SETTLEMENT_BUDGET,
+                    source.schedule_retry(&row.message_id, &lease_token, &error),
+                )
+                .await
             };
             if let Err(transition_error) = transition {
                 tracing::error!(
                     message_id = %row.message_id,
                     error = %transition_error,
-                    "invalidation fanout retry/quarantine transition failed"
+                    "invalidation fanout retry/quarantine transition failed or is unknown"
                 );
+                RelayRowDisposition::Stop
+            } else {
+                RelayRowDisposition::Continue
             }
         }
     }
-    lease_heartbeat.abort();
 }
 
 async fn run_heartbeat_task<T>(
@@ -660,7 +799,7 @@ fn validate_inbox_settings(settings: &InvalidationInboxWorkerSettings) -> Result
 #[derive(Debug)]
 pub struct InvalidationInboxWorkerHandle {
     shutdown: watch::Sender<bool>,
-    join: tokio::task::JoinHandle<()>,
+    join: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl InvalidationInboxWorkerHandle {
@@ -668,9 +807,25 @@ impl InvalidationInboxWorkerHandle {
         let _ = self.shutdown.send(true);
     }
 
-    pub async fn shutdown_and_join(self) {
+    pub async fn shutdown_and_join(mut self) -> Result<(), String> {
         self.signal_shutdown();
-        let _ = self.join.await;
+        let Some(join) = self.join.as_mut() else {
+            return Ok(());
+        };
+        let result = join
+            .await
+            .map_err(|error| format!("fanout inbox worker join failed: {error}"));
+        self.join.take();
+        result
+    }
+}
+
+impl Drop for InvalidationInboxWorkerHandle {
+    fn drop(&mut self) {
+        self.signal_shutdown();
+        if let Some(join) = self.join.take() {
+            abort_and_reap_fanout_task(join, "fanout-inbox");
+        }
     }
 }
 
@@ -706,7 +861,10 @@ where
         settings,
         shutdown_rx,
     ));
-    Ok(InvalidationInboxWorkerHandle { shutdown, join })
+    Ok(InvalidationInboxWorkerHandle {
+        shutdown,
+        join: Some(join),
+    })
 }
 
 async fn run_inbox_loop<F, Fut, S, I, A, L>(
@@ -733,7 +891,16 @@ async fn run_inbox_loop<F, Fut, S, I, A, L>(
         if *shutdown.borrow_and_update() {
             return;
         }
-        match connect().await {
+        let connected = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+                continue;
+            }
+            connected = connect() => connected,
+        };
+        match connected {
             Ok(mut session) => {
                 connect_backoff.reset();
                 loop {
@@ -1171,6 +1338,7 @@ mod tests {
     struct MockSource {
         pending: Arc<Mutex<Vec<astral_db::LocalMessageRow>>>,
         actions: Arc<Mutex<Vec<String>>>,
+        claim_limits: Arc<Mutex<Vec<u32>>>,
     }
 
     impl MockSource {
@@ -1178,6 +1346,7 @@ mod tests {
             Self {
                 pending: Arc::new(Mutex::new(rows)),
                 actions: Arc::new(Mutex::new(Vec::new())),
+                claim_limits: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1193,6 +1362,7 @@ mod tests {
             _owner: &str,
             limit: u32,
         ) -> Result<Vec<astral_db::LocalMessageRow>, String> {
+            self.claim_limits.lock().unwrap().push(limit);
             let mut pending = self.pending.lock().unwrap();
             let take = pending.len().min(limit as usize);
             Ok(pending.drain(..take).collect())
@@ -1597,7 +1767,13 @@ mod tests {
 
         process_relay_row(&source, &transport, &identity, &settings, row).await;
 
-        assert_eq!(source.actions(), vec!["complete:event-1".to_owned()]);
+        assert_eq!(
+            source.actions(),
+            vec![
+                "heartbeat:event-1".to_owned(),
+                "complete:event-1".to_owned()
+            ]
+        );
         let published = transport.published();
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].1, "event-1");
@@ -1632,7 +1808,13 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(source.actions(), vec!["retry:event-retry".to_owned()]);
+        assert_eq!(
+            source.actions(),
+            vec![
+                "heartbeat:event-retry".to_owned(),
+                "retry:event-retry".to_owned()
+            ]
+        );
 
         // At the attempt cap: quarantine.
         let envelope = evidence_envelope("event-quarantine", "2026-10-01T00:00:03Z", 42);
@@ -1653,7 +1835,10 @@ mod tests {
         .await;
         assert_eq!(
             source.actions(),
-            vec!["quarantine:event-quarantine".to_owned()]
+            vec![
+                "heartbeat:event-quarantine".to_owned(),
+                "quarantine:event-quarantine".to_owned()
+            ]
         );
     }
 
@@ -1676,7 +1861,13 @@ mod tests {
         )
         .await;
 
-        assert_eq!(source.actions(), vec!["in_doubt:event-unknown".to_owned()]);
+        assert_eq!(
+            source.actions(),
+            vec![
+                "heartbeat:event-unknown".to_owned(),
+                "in_doubt:event-unknown".to_owned()
+            ]
+        );
         let actions = source.actions();
         assert!(
             !actions.iter().any(|action| action.starts_with("retry:")),
@@ -1754,18 +1945,28 @@ mod tests {
             "sequential publish order",
         )
         .await;
-        handle.shutdown_and_join().await;
-        wait_for(
-            || {
-                source.actions().len() == 3
-                    && source
-                        .actions()
-                        .iter()
-                        .all(|action| action.starts_with("complete:"))
-            },
-            "all rows completed",
-        )
-        .await;
+        handle
+            .shutdown_and_join()
+            .await
+            .expect("relay and heartbeat tasks join cleanly");
+        assert_eq!(
+            source.actions(),
+            expected_order
+                .iter()
+                .flat_map(|message_id| {
+                    [
+                        format!("heartbeat:{message_id}"),
+                        format!("complete:{message_id}"),
+                    ]
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(source
+            .claim_limits
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|limit| *limit == 1));
     }
 
     #[tokio::test]
@@ -1798,6 +1999,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_fanout_handle_shutdown_aborts_and_reaps_owned_tasks() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let (shutdown, _shutdown_rx) = watch::channel(false);
+        let handle = InvalidationFanoutRelayHandle {
+            shutdown,
+            relay_join: Some(tokio::spawn(async move {
+                struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+                impl Drop for DropSignal {
+                    fn drop(&mut self) {
+                        if let Some(signal) = self.0.take() {
+                            let _ = signal.send(());
+                        }
+                    }
+                }
+                let _drop = DropSignal(Some(dropped_tx));
+                std::future::pending::<()>().await;
+            })),
+            heartbeat_join: None,
+        };
+        {
+            let mut shutdown = std::pin::pin!(handle.shutdown_and_join());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+                    .await
+                    .is_err()
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("cancelled shutdown must abort and reap the owned relay")
+            .expect("relay task drop must be observed");
+    }
+
+    #[tokio::test]
     async fn relay_shutdown_joins_and_heartbeat_publishes_scope_metadata() {
         let transport = MockTransport::default();
         let handle = spawn_invalidation_fanout_relay(
@@ -1812,7 +2047,10 @@ mod tests {
         )
         .unwrap();
         wait_for(|| !transport.published().is_empty(), "heartbeat published").await;
-        handle.shutdown_and_join().await;
+        handle
+            .shutdown_and_join()
+            .await
+            .expect("relay and heartbeat tasks join cleanly");
         assert!(!transport.published().is_empty());
         let (_, message_id) = &transport.published()[0];
         assert!(message_id.starts_with("heartbeat-"));
@@ -2189,7 +2427,10 @@ mod tests {
             "delivery acked",
         )
         .await;
-        handle.shutdown_and_join().await;
+        handle
+            .shutdown_and_join()
+            .await
+            .expect("inbox worker joins cleanly");
         // The mock session ends once its deliveries drain, so the worker must
         // have raised the suspect callback before shutdown (stream-end
         // contract); it must never silently keep consuming a dead stream.
@@ -2248,7 +2489,10 @@ mod tests {
             "receipt applied after reconnect",
         )
         .await;
-        handle.shutdown_and_join().await;
+        handle
+            .shutdown_and_join()
+            .await
+            .expect("inbox worker joins cleanly");
 
         let suspects = listener.suspects();
         assert!(
@@ -2333,8 +2577,14 @@ mod tests {
         )
         .await;
 
-        handle_a.shutdown_and_join().await;
-        handle_b.shutdown_and_join().await;
+        handle_a
+            .shutdown_and_join()
+            .await
+            .expect("first inbox worker joins cleanly");
+        handle_b
+            .shutdown_and_join()
+            .await
+            .expect("second inbox worker joins cleanly");
 
         assert_eq!(
             apply.applied(),

@@ -32,6 +32,7 @@ pub struct ServiceStatus {
     pub gateway: String,
     pub identity: String,
     pub learn: String,
+    pub chat: String,
     pub trustgraph: String,
     pub database: String,
     pub redis: String,
@@ -188,11 +189,10 @@ fn rabbitmq_host_port(url: &str) -> Option<(String, u16)> {
     }
 }
 
-/// 网关状态：配置 URI 缺失时明确 UNKNOWN（不伪造 UP）。
+/// Gateway has no registered standalone public health route in the current runtime.
+/// Until a signed service-probe contract exists, use only persisted evidence and
+/// return UNKNOWN when none is present.
 async fn gateway_status(state: &AppState) -> String {
-    if state.config.gateway_service_uri.is_empty() {
-        return "UNKNOWN".into();
-    }
     query_service_status(state, "gateway").await
 }
 
@@ -238,25 +238,34 @@ async fn health_check(State(state): State<AppState>) -> Json<HealthStatus> {
 async fn query_service_status(state: &AppState, service_name: &str) -> String {
     match state
         .monitor_service
+        .latest_metric(service_name, "probe_status_unknown")
+        .await
+    {
+        Ok(Some(value)) if value > 0.0 => return "UNKNOWN".into(),
+        Ok(Some(_)) | Ok(None) => {}
+        Err(_) => return "UNKNOWN".into(),
+    }
+    match state
+        .monitor_service
         .latest_metric(service_name, "reachable")
         .await
     {
         Ok(Some(value)) if value > 0.0 => "UP".into(),
-        Ok(Some(_)) => "DOWN".into(),
-        Ok(None) => "UNKNOWN".into(),
-        Err(_) => "DOWN".into(),
+        Ok(Some(0.0)) => "DOWN".into(),
+        Ok(Some(_)) | Ok(None) | Err(_) => "UNKNOWN".into(),
     }
 }
 
 async fn detailed_health(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<ServiceStatus>>, AppError> {
-    let (db_status, gateway, identity, learn, trustgraph, redis, rabbitmq) = tokio::join!(
+    let (db_status, gateway, identity, learn, chat, trustgraph, redis, rabbitmq) = tokio::join!(
         check_db_health(&state),
         gateway_status(&state),
         query_service_status(&state, "identity"),
         query_service_status(&state, "learn"),
         query_service_status(&state, "chat"),
+        query_service_status(&state, "trustgraph"),
         check_redis_health(&state.config),
         check_rabbitmq_health(&state.config),
     );
@@ -265,6 +274,7 @@ async fn detailed_health(
         gateway,
         identity,
         learn,
+        chat,
         trustgraph,
         database: db_status,
         redis,
@@ -362,12 +372,13 @@ pub async fn frontend_metrics(
 async fn service_status(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<ServiceStatus>>, AppError> {
-    let (db_status, gateway, identity, learn, trustgraph, redis, rabbitmq) = tokio::join!(
+    let (db_status, gateway, identity, learn, chat, trustgraph, redis, rabbitmq) = tokio::join!(
         check_db_health(&state),
         gateway_status(&state),
         query_service_status(&state, "identity"),
         query_service_status(&state, "learn"),
         query_service_status(&state, "chat"),
+        query_service_status(&state, "trustgraph"),
         check_redis_health(&state.config),
         check_rabbitmq_health(&state.config),
     );
@@ -376,6 +387,7 @@ async fn service_status(
         gateway,
         identity,
         learn,
+        chat,
         trustgraph,
         database: db_status,
         redis,

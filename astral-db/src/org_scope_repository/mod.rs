@@ -259,10 +259,25 @@ const ORG_SCOPE_SCHEMA_TABLES_SQL: &str = "SELECT CAST(TABLE_NAME AS CHAR) AS ta
      FROM information_schema.TABLES \
      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (?,?,?,?,?,?,?,?,?,?,?,?,?)";
 const ORG_SCOPE_SCHEMA_INDEX_SQL: &str = "SELECT CAST(COLUMN_NAME AS CHAR) AS column_name, \
-     CAST(NON_UNIQUE AS SIGNED) AS non_unique \
+     CAST(NON_UNIQUE AS SIGNED) AS non_unique, CAST(SEQ_IN_INDEX AS SIGNED) AS seq_in_index, \
+     CAST(SUB_PART AS SIGNED) AS sub_part, CAST(EXPRESSION AS CHAR) AS expression \
      FROM information_schema.STATISTICS \
      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? \
      ORDER BY SEQ_IN_INDEX";
+const ORG_SCOPE_SCHEMA_ENGINE_SQL: &str = "SELECT CAST(COUNT(*) AS SIGNED) \
+     FROM information_schema.TABLES \
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? \
+       AND TABLE_TYPE = 'BASE TABLE' AND ENGINE = 'InnoDB'";
+const ORG_SCOPE_SCHEMA_DUPLICATE_OPERATION_SQL: &str = "SELECT operation_id \
+     FROM org_scope_operation \
+     GROUP BY operation_id HAVING COUNT(*) > 1 LIMIT 1";
+const ORG_SCOPE_OPERATION_INDEX_SQL: &str = "SELECT CAST(INDEX_NAME AS CHAR) AS index_name, \
+     CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(NON_UNIQUE AS SIGNED) AS non_unique, \
+     CAST(SEQ_IN_INDEX AS SIGNED) AS seq_in_index, CAST(SUB_PART AS SIGNED) AS sub_part, \
+     CAST(EXPRESSION AS CHAR) AS expression \
+     FROM information_schema.STATISTICS \
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'org_scope_operation' \
+     ORDER BY INDEX_NAME, SEQ_IN_INDEX";
 const ORG_SCOPE_REQUIRED_INDEXES: &[(&str, &str, &[&str], bool)] = &[
     (
         "org_scope_membership",
@@ -278,6 +293,31 @@ const ORG_SCOPE_REQUIRED_INDEXES: &[(&str, &str, &[&str], bool)] = &[
     ),
     ("identity_card", "uk_ic_user", &["user_id"], true),
 ];
+
+type OrgScopeOperationIndex = (String, String, i64, i64, Option<i64>, Option<String>);
+
+fn org_scope_operation_indexes_match(actual: &[OrgScopeOperationIndex]) -> bool {
+    let expected = [
+        ("PRIMARY", "operation_id", 0, 1),
+        ("idx_osop_tenant", "tenant_id", 1, 1),
+        ("idx_osop_tenant", "created_at", 1, 2),
+    ];
+    actual.len() == expected.len()
+        && expected.iter().all(|expected| {
+            actual
+                .iter()
+                .filter(|actual| {
+                    actual.0 == expected.0
+                        && actual.1 == expected.1
+                        && actual.2 == expected.2
+                        && actual.3 == expected.3
+                        && actual.4.is_none()
+                        && actual.5.as_deref().is_none_or(str::is_empty)
+                })
+                .count()
+                == 1
+        })
+}
 
 /// Enabled-only startup prerequisite for the ORG_SCOPE source and membership-cap
 /// contracts. This is read-only and intentionally separate from the unconditional
@@ -305,6 +345,48 @@ pub async fn validate_org_scope_schema_prerequisites(pool: &MySqlPool) -> Result
         ));
     }
 
+    let operation_engine = sqlx::query_scalar::<_, i64>(ORG_SCOPE_SCHEMA_ENGINE_SQL)
+        .bind("org_scope_operation")
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)?;
+    if operation_engine != 1 {
+        return Err(AstralError::Database(
+            "code=org_scope.schema_prerequisite_operation_engine_mismatch".into(),
+        ));
+    }
+    let operation_indexes = sqlx::query(ORG_SCOPE_OPERATION_INDEX_SQL)
+        .fetch_all(pool)
+        .await
+        .map_err(db_err)?;
+    let actual_operation_indexes: Vec<OrgScopeOperationIndex> = operation_indexes
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get("index_name").map_err(db_err)?,
+                row.try_get("column_name").map_err(db_err)?,
+                row.try_get("non_unique").map_err(db_err)?,
+                row.try_get("seq_in_index").map_err(db_err)?,
+                row.try_get("sub_part").map_err(db_err)?,
+                row.try_get("expression").map_err(db_err)?,
+            ))
+        })
+        .collect::<Result<_, AstralError>>()?;
+    if !org_scope_operation_indexes_match(&actual_operation_indexes) {
+        return Err(AstralError::Database(
+            "code=org_scope.schema_prerequisite_operation_index_shape_mismatch".into(),
+        ));
+    }
+    let operation_duplicates = sqlx::query(ORG_SCOPE_SCHEMA_DUPLICATE_OPERATION_SQL)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?;
+    if operation_duplicates.is_some() {
+        return Err(AstralError::Database(
+            "code=org_scope.schema_prerequisite_operation_duplicate_identity".into(),
+        ));
+    }
+
     for (table, index, columns, unique) in ORG_SCOPE_REQUIRED_INDEXES.iter().copied() {
         let rows = sqlx::query(ORG_SCOPE_SCHEMA_INDEX_SQL)
             .bind(table)
@@ -316,8 +398,17 @@ pub async fn validate_org_scope_schema_prerequisites(pool: &MySqlPool) -> Result
             || rows.iter().enumerate().any(|(position, row)| {
                 let column = row.try_get::<String, _>("column_name").ok();
                 let non_unique = row.try_get::<i64, _>("non_unique").ok();
+                let sequence = row.try_get::<i64, _>("seq_in_index").ok();
+                let sub_part = row.try_get::<Option<i64>, _>("sub_part").ok().flatten();
+                let expression = row
+                    .try_get::<Option<String>, _>("expression")
+                    .ok()
+                    .flatten();
                 column.as_deref() != Some(columns[position])
                     || non_unique != Some(i64::from(!unique))
+                    || sequence != Some(position as i64 + 1)
+                    || sub_part.is_some()
+                    || expression.is_some()
             })
         {
             return Err(AstralError::Database(format!(
@@ -1114,6 +1205,38 @@ mod tests {
 
     #[test]
     fn org_scope_enabled_schema_prerequisites_are_frozen() {
+        let source = include_str!("mod.rs");
+        let validator = source
+            .split("pub async fn validate_org_scope_schema_prerequisites")
+            .nth(1)
+            .and_then(|body| body.split("/// 读取全部当前受治理租户").next())
+            .expect("enabled ORG_SCOPE schema validator body");
+        let complete_tables = validator
+            .find("present.len() != ORG_SCOPE_REQUIRED_TABLES.len()")
+            .expect("all required tables must be verified first");
+        let operation_indexes = validator
+            .find("org_scope_operation_indexes_match(&actual_operation_indexes)")
+            .expect("operation index contract must be verified");
+        let duplicate_check = validator
+            .find("ORG_SCOPE_SCHEMA_DUPLICATE_OPERATION_SQL")
+            .expect("operation identity duplicates must be checked");
+        let membership_indexes = validator
+            .find("ORG_SCOPE_REQUIRED_INDEXES.iter().copied()")
+            .expect("membership indexes must be checked");
+        assert!(complete_tables < operation_indexes);
+        assert!(operation_indexes < duplicate_check && duplicate_check < membership_indexes);
+        for forbidden in [
+            "ALTER TABLE",
+            "CREATE TABLE",
+            "DROP TABLE",
+            "UPDATE ",
+            "INSERT ",
+        ] {
+            assert!(
+                !validator.contains(forbidden),
+                "schema prerequisite must be read-only: {forbidden}"
+            );
+        }
         assert_eq!(ORG_SCOPE_REQUIRED_TABLES.len(), 13);
         assert!(ORG_SCOPE_REQUIRED_TABLES.contains(&"org_scope_membership"));
         assert!(ORG_SCOPE_REQUIRED_TABLES.contains(&"org_scope_outbox"));
@@ -1121,6 +1244,48 @@ mod tests {
         assert!(ORG_SCOPE_SCHEMA_TABLES_SQL.contains("information_schema.TABLES"));
         assert!(ORG_SCOPE_SCHEMA_INDEX_SQL.contains("information_schema.STATISTICS"));
         assert!(ORG_SCOPE_SCHEMA_INDEX_SQL.contains("ORDER BY SEQ_IN_INDEX"));
+        assert!(ORG_SCOPE_OPERATION_INDEX_SQL.contains("TABLE_NAME = 'org_scope_operation'"));
+        assert!(ORG_SCOPE_OPERATION_INDEX_SQL.contains("ORDER BY INDEX_NAME, SEQ_IN_INDEX"));
+        assert!(ORG_SCOPE_OPERATION_INDEX_SQL.contains("CAST(SUB_PART AS SIGNED)"));
+        assert!(ORG_SCOPE_OPERATION_INDEX_SQL.contains("CAST(EXPRESSION AS CHAR)"));
+        assert!(ORG_SCOPE_SCHEMA_ENGINE_SQL.contains("ENGINE = 'InnoDB'"));
+        assert!(ORG_SCOPE_SCHEMA_DUPLICATE_OPERATION_SQL
+            .contains("GROUP BY operation_id HAVING COUNT(*) > 1"));
+        let operation_indexes = vec![
+            ("PRIMARY".into(), "operation_id".into(), 0, 1, None, None),
+            (
+                "idx_osop_tenant".into(),
+                "tenant_id".into(),
+                1,
+                1,
+                None,
+                None,
+            ),
+            (
+                "idx_osop_tenant".into(),
+                "created_at".into(),
+                1,
+                2,
+                None,
+                None,
+            ),
+        ];
+        assert!(org_scope_operation_indexes_match(&operation_indexes));
+        let mut wrong_primary = operation_indexes.clone();
+        wrong_primary[0].2 = 1;
+        assert!(!org_scope_operation_indexes_match(&wrong_primary));
+        let mut wrong_order = operation_indexes.clone();
+        wrong_order[2].3 = 1;
+        assert!(!org_scope_operation_indexes_match(&wrong_order));
+        let mut prefix_key = operation_indexes.clone();
+        prefix_key[1].4 = Some(8);
+        assert!(!org_scope_operation_indexes_match(&prefix_key));
+        let mut expression_key = operation_indexes.clone();
+        expression_key[1].5 = Some("lower(tenant_id)".into());
+        assert!(!org_scope_operation_indexes_match(&expression_key));
+        let mut unexpected_key = operation_indexes.clone();
+        unexpected_key.push(("idx_extra".into(), "tenant_id".into(), 1, 1, None, None));
+        assert!(!org_scope_operation_indexes_match(&unexpected_key));
         assert_eq!(
             ORG_SCOPE_REQUIRED_INDEXES,
             [

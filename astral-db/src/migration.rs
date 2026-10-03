@@ -91,6 +91,8 @@ const IDENTITY_CARD_DUAL_CARD_SEPARATION_SQL_SHA384: &str =
 // Cross-city durable schema (default-off subsystem): the creator migration only
 // builds the six Rust-owned tables; no runtime path reads or writes them yet.
 const CROSS_CITY_SCHEMA_VERSION: i64 = 20260831000002;
+const LOCAL_SCOPE_SEQUENCE_VERSION: i64 = 20261001000005;
+const LEGACY_SNAPSHOT_REQUIRED_DRAIN_TABLES: &[&str] = &["authorization_projection_outbox"];
 /// Delta claim sibling-ordering gate support index (campaign finding 10.D-2):
 /// introduces `idx_ade_grant_chain` on authorization_delta_event via
 /// 20260903000001_delta_claim_grant_chain_index.sql.
@@ -153,8 +155,557 @@ async fn incremental_projection_resolved_index_contract(
 }
 const CROSS_CITY_SCHEMA_SQL_SHA384: &str =
     "9d6b15dae4cf03ed45bfd2d342ef2a7238ff78a1bbc56e788c4f1cca8639a1659af3e12db6dc9b64e203a9996ef24f22";
+const CROSS_CITY_RUNTIME_PROOF_VERSION: i64 = 20261001000002;
+const REVIEW_SCHEMA_REPAIR_VERSION: i64 = 20261003000003;
+const CROSS_CITY_RUNTIME_PROOF_SQL_SHA384: &str =
+    "9f3a75003c2f7b0578ab4666e454bda5e842afc571736bf2e915ff85cf08b740c6f0c74421a1afe52f3af130e5abb02d";
+const REVIEW_SCHEMA_REPAIR_SQL_SHA384: &str =
+    "ef67f67303bc20bb9a82677550272d92892f43c0303629600d14b45aae054210546c196dcd818e54095c0a6e854420bd";
+const IDENTITY_CREDENTIAL_FENCE_VERSION: i64 = 20261003000001;
+const ASYNC_OPERATION_CORRELATION_VERSION: i64 = 20261003000002;
+const CHAT_DELIVERY_INTENT_VERSION: i64 = 20261003000004;
+const LEARN_SYSTEM_ASSIGNMENT_VERSION: i64 = 20261003000005;
+const IDENTITY_CREDENTIAL_FENCE_COLUMNS: &[HistoricalColumnSpec] = &[
+    HistoricalColumnSpec {
+        table: "user_local_credential",
+        name: "credential_version",
+        column_type: "BIGINT",
+        not_null: true,
+        default: Some("1"),
+        charset: None,
+        collation: None,
+        after: "password_hash",
+    },
+    HistoricalColumnSpec {
+        table: "user_mfa",
+        name: "last_totp_counter",
+        column_type: "BIGINT",
+        not_null: false,
+        default: None,
+        charset: None,
+        collation: None,
+        after: "last_used_at",
+    },
+    HistoricalColumnSpec {
+        table: "mfa_attempt_log",
+        name: "attempt_code",
+        column_type: "VARCHAR(64)",
+        not_null: false,
+        default: None,
+        charset: Some(MYSQL_SCHEMA_CHARSET),
+        collation: Some(MYSQL_MIGRATION_COLLATION),
+        after: "mfa_type",
+    },
+    HistoricalColumnSpec {
+        table: "mfa_attempt_log",
+        name: "status",
+        column_type: "VARCHAR(32)",
+        not_null: true,
+        default: Some("UNKNOWN"),
+        charset: Some(MYSQL_SCHEMA_CHARSET),
+        collation: Some(MYSQL_MIGRATION_COLLATION),
+        after: "attempt_code",
+    },
+    HistoricalColumnSpec {
+        table: "mfa_attempt_log",
+        name: "user_agent",
+        column_type: "VARCHAR(512)",
+        not_null: false,
+        default: None,
+        charset: Some(MYSQL_SCHEMA_CHARSET),
+        collation: Some(MYSQL_MIGRATION_COLLATION),
+        after: "ip",
+    },
+    HistoricalColumnSpec {
+        table: "auth_device_session",
+        name: "credential_version",
+        column_type: "BIGINT",
+        not_null: false,
+        default: None,
+        charset: None,
+        collation: None,
+        after: "session_epoch",
+    },
+];
+const IDENTITY_CREDENTIAL_FENCE_COLUMNS_ARTIFACTS: &[(&str, &str)] = &[
+    ("user_local_credential", "credential_version"),
+    ("user_mfa", "last_totp_counter"),
+    ("mfa_attempt_log", "attempt_code"),
+    ("mfa_attempt_log", "status"),
+    ("mfa_attempt_log", "user_agent"),
+    ("auth_device_session", "credential_version"),
+];
+const IDENTITY_CREDENTIAL_FENCE_INDEXES: &[(&str, &str, &[&str], bool)] = &[
+    (
+        "mfa_attempt_log",
+        "uk_mal_attempt_code",
+        &["attempt_code"],
+        true,
+    ),
+    (
+        "mfa_attempt_log",
+        "idx_mal_user_attempt_status",
+        &["user_id", "attempted_at", "success", "status"],
+        false,
+    ),
+    (
+        "auth_device_session",
+        "idx_ads_user_credential_version",
+        &["user_id", "credential_version", "status"],
+        false,
+    ),
+];
+const ASYNC_OPERATION_TABLES: &[&str] = &["async_operation", "async_operation_item"];
+const ASYNC_OPERATION_COLUMNS_ARTIFACTS: &[(&str, &str)] = &[
+    ("async_operation", "task_id"),
+    ("async_operation", "task_type"),
+    ("async_operation", "status"),
+    ("async_operation", "requester_user_id"),
+    ("async_operation", "requester_card_id"),
+    ("async_operation", "requester_tenant_id"),
+    ("async_operation", "requester_domain_id"),
+    ("async_operation", "authorization_target_card_id"),
+    ("async_operation", "authorization_target_tenant_id"),
+    ("async_operation", "authorization_target_domain_id"),
+    ("async_operation", "target_user_id"),
+    ("async_operation", "total_items"),
+    ("async_operation", "completed_items"),
+    ("async_operation", "owner_instance_id"),
+    ("async_operation", "error_message"),
+    ("async_operation", "created_at"),
+    ("async_operation", "updated_at"),
+    ("async_operation_item", "task_id"),
+    ("async_operation_item", "card_id"),
+    ("async_operation_item", "tenant_id"),
+    ("async_operation_item", "domain_id"),
+    ("async_operation_item", "operation_id"),
+    ("async_operation_item", "status"),
+    ("async_operation_item", "error_message"),
+    ("async_operation_item", "created_at"),
+    ("async_operation_item", "updated_at"),
+];
+const CHAT_DELIVERY_INTENT_TABLES: &[&str] =
+    &["chat_delivery_intent", "chat_delivery_intent_recipient"];
+const ASYNC_OPERATION_COLUMNS: &[SchemaColumnContract] = &[
+    incremental_text_column("async_operation", "task_id", "VARCHAR(64)", true, None),
+    incremental_text_column("async_operation", "task_type", "VARCHAR(32)", true, None),
+    incremental_text_column(
+        "async_operation",
+        "status",
+        "VARCHAR(16)",
+        true,
+        Some("PENDING"),
+    ),
+    incremental_scalar_column("async_operation", "requester_user_id", "BIGINT", true, None),
+    incremental_scalar_column("async_operation", "requester_card_id", "BIGINT", true, None),
+    incremental_scalar_column(
+        "async_operation",
+        "requester_tenant_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "async_operation",
+        "requester_domain_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "async_operation",
+        "authorization_target_card_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "async_operation",
+        "authorization_target_tenant_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "async_operation",
+        "authorization_target_domain_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column("async_operation", "target_user_id", "BIGINT", true, None),
+    incremental_scalar_column("async_operation", "total_items", "INT UNSIGNED", true, None),
+    incremental_scalar_column(
+        "async_operation",
+        "completed_items",
+        "INT UNSIGNED",
+        true,
+        Some("0"),
+    ),
+    incremental_text_column(
+        "async_operation",
+        "owner_instance_id",
+        "VARCHAR(64)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "async_operation",
+        "error_message",
+        "VARCHAR(255)",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "async_operation",
+        "created_at",
+        "BIGINT",
+        true,
+        Some("UNIX_TIMESTAMP()"),
+    ),
+    incremental_scalar_column(
+        "async_operation",
+        "updated_at",
+        "BIGINT",
+        true,
+        Some("UNIX_TIMESTAMP()"),
+    ),
+    incremental_text_column("async_operation_item", "task_id", "VARCHAR(64)", true, None),
+    incremental_scalar_column("async_operation_item", "card_id", "BIGINT", true, None),
+    incremental_scalar_column("async_operation_item", "tenant_id", "BIGINT", true, None),
+    incremental_scalar_column("async_operation_item", "domain_id", "BIGINT", true, None),
+    incremental_text_column(
+        "async_operation_item",
+        "operation_id",
+        "VARCHAR(64)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "async_operation_item",
+        "status",
+        "VARCHAR(16)",
+        true,
+        Some("PENDING"),
+    ),
+    incremental_text_column(
+        "async_operation_item",
+        "error_message",
+        "VARCHAR(255)",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "async_operation_item",
+        "created_at",
+        "BIGINT",
+        true,
+        Some("UNIX_TIMESTAMP()"),
+    ),
+    incremental_scalar_column(
+        "async_operation_item",
+        "updated_at",
+        "BIGINT",
+        true,
+        Some("UNIX_TIMESTAMP()"),
+    ),
+];
+const CHAT_DELIVERY_INTENT_COLUMNS: &[SchemaColumnContract] = &[
+    incremental_text_column("chat_delivery_intent", "intent_id", "CHAR(36)", true, None),
+    incremental_text_column(
+        "chat_delivery_intent",
+        "scope_key_sha256",
+        "CHAR(64)",
+        true,
+        None,
+    ),
+    SchemaColumnContract {
+        table: "chat_delivery_intent",
+        name: "client_msg_id",
+        column_type: "VARCHAR(64)",
+        not_null: true,
+        default: None,
+        charset: Some("ascii"),
+        collation: Some("ascii_bin"),
+    },
+    incremental_text_column(
+        "chat_delivery_intent",
+        "request_sha256",
+        "CHAR(64)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "chat_delivery_intent",
+        "message_uuid",
+        "CHAR(36)",
+        true,
+        None,
+    ),
+    incremental_scalar_column("chat_delivery_intent", "message_id", "BIGINT", false, None),
+    incremental_scalar_column(
+        "chat_delivery_intent",
+        "conversation_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column("chat_delivery_intent", "sender_id", "BIGINT", true, None),
+    incremental_scalar_column(
+        "chat_delivery_intent",
+        "identity_card_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column("chat_delivery_intent", "user_card_id", "BIGINT", true, None),
+    incremental_scalar_column("chat_delivery_intent", "tenant_id", "BIGINT", true, None),
+    incremental_scalar_column("chat_delivery_intent", "domain_id", "BIGINT", true, None),
+    incremental_text_column(
+        "chat_delivery_intent",
+        "payload_json",
+        "MEDIUMTEXT",
+        false,
+        None,
+    ),
+    incremental_text_column(
+        "chat_delivery_intent",
+        "status",
+        "VARCHAR(32)",
+        true,
+        Some("PENDING"),
+    ),
+    incremental_scalar_column("chat_delivery_intent", "attempts", "INT", true, Some("0")),
+    incremental_scalar_column(
+        "chat_delivery_intent",
+        "next_attempt_at",
+        "DATETIME(6)",
+        false,
+        None,
+    ),
+    incremental_text_column(
+        "chat_delivery_intent",
+        "lease_owner",
+        "VARCHAR(128)",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "chat_delivery_intent",
+        "lease_generation",
+        "BIGINT",
+        true,
+        Some("0"),
+    ),
+    incremental_scalar_column(
+        "chat_delivery_intent",
+        "lease_expires_at",
+        "DATETIME(6)",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "chat_delivery_intent",
+        "published_at",
+        "DATETIME(6)",
+        false,
+        None,
+    ),
+    incremental_text_column(
+        "chat_delivery_intent",
+        "last_error",
+        "VARCHAR(512)",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "chat_delivery_intent",
+        "created_at",
+        "DATETIME(6)",
+        true,
+        Some("CURRENT_TIMESTAMP(6)"),
+    ),
+    incremental_scalar_column(
+        "chat_delivery_intent",
+        "updated_at",
+        "DATETIME(6)",
+        true,
+        Some("CURRENT_TIMESTAMP(6)"),
+    ),
+    incremental_text_column(
+        "chat_delivery_intent_recipient",
+        "intent_id",
+        "CHAR(36)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "chat_delivery_intent_recipient",
+        "recipient_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "chat_delivery_intent_recipient",
+        "identity_card_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "chat_delivery_intent_recipient",
+        "user_card_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "chat_delivery_intent_recipient",
+        "tenant_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "chat_delivery_intent_recipient",
+        "domain_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "chat_delivery_intent_recipient",
+        "created_at",
+        "DATETIME(6)",
+        true,
+        Some("CURRENT_TIMESTAMP(6)"),
+    ),
+];
+const CHAT_DELIVERY_INTENT_COLUMNS_ARTIFACTS: &[(&str, &str)] = &[
+    ("chat_delivery_intent", "intent_id"),
+    ("chat_delivery_intent", "scope_key_sha256"),
+    ("chat_delivery_intent", "client_msg_id"),
+    ("chat_delivery_intent", "request_sha256"),
+    ("chat_delivery_intent", "message_uuid"),
+    ("chat_delivery_intent", "message_id"),
+    ("chat_delivery_intent", "conversation_id"),
+    ("chat_delivery_intent", "sender_id"),
+    ("chat_delivery_intent", "identity_card_id"),
+    ("chat_delivery_intent", "user_card_id"),
+    ("chat_delivery_intent", "tenant_id"),
+    ("chat_delivery_intent", "domain_id"),
+    ("chat_delivery_intent", "payload_json"),
+    ("chat_delivery_intent", "status"),
+    ("chat_delivery_intent", "attempts"),
+    ("chat_delivery_intent", "next_attempt_at"),
+    ("chat_delivery_intent", "lease_owner"),
+    ("chat_delivery_intent", "lease_generation"),
+    ("chat_delivery_intent", "lease_expires_at"),
+    ("chat_delivery_intent", "published_at"),
+    ("chat_delivery_intent", "last_error"),
+    ("chat_delivery_intent", "created_at"),
+    ("chat_delivery_intent", "updated_at"),
+    ("chat_delivery_intent_recipient", "intent_id"),
+    ("chat_delivery_intent_recipient", "recipient_id"),
+    ("chat_delivery_intent_recipient", "identity_card_id"),
+    ("chat_delivery_intent_recipient", "user_card_id"),
+    ("chat_delivery_intent_recipient", "tenant_id"),
+    ("chat_delivery_intent_recipient", "domain_id"),
+    ("chat_delivery_intent_recipient", "created_at"),
+];
+const CHAT_DELIVERY_INTENT_INDEXES: &[(&str, &str, &[&str], bool)] = &[
+    ("chat_delivery_intent", "PRIMARY", &["intent_id"], true),
+    (
+        "chat_delivery_intent",
+        "uk_chat_delivery_intent_scope_client",
+        &["scope_key_sha256", "client_msg_id"],
+        true,
+    ),
+    (
+        "chat_delivery_intent",
+        "uk_chat_delivery_intent_message_uuid",
+        &["message_uuid"],
+        true,
+    ),
+    (
+        "chat_delivery_intent",
+        "uk_chat_delivery_intent_message_id",
+        &["message_id"],
+        true,
+    ),
+    (
+        "chat_delivery_intent",
+        "idx_chat_delivery_intent_claim",
+        &["status", "lease_expires_at", "created_at", "intent_id"],
+        false,
+    ),
+    (
+        "chat_delivery_intent",
+        "idx_chat_delivery_intent_conversation",
+        &["conversation_id", "created_at"],
+        false,
+    ),
+    (
+        "chat_delivery_intent_recipient",
+        "PRIMARY",
+        &[
+            "intent_id",
+            "recipient_id",
+            "identity_card_id",
+            "user_card_id",
+        ],
+        true,
+    ),
+    (
+        "chat_delivery_intent_recipient",
+        "idx_chat_delivery_intent_recipient_user",
+        &["recipient_id", "created_at"],
+        false,
+    ),
+];
+const LEARN_SYSTEM_ASSIGNMENT_COLUMNS: &[SchemaColumnContract] = &[SchemaColumnContract {
+    table: "learn_assignment",
+    name: "system_role",
+    column_type: "VARCHAR(32)",
+    not_null: false,
+    default: None,
+    charset: Some("utf8mb4"),
+    collation: Some("utf8mb4_bin"),
+}];
+const LEARN_SYSTEM_ASSIGNMENT_COLUMNS_ARTIFACTS: &[(&str, &str)] =
+    &[("learn_assignment", "system_role")];
+const LEARN_SYSTEM_ASSIGNMENT_INDEXES: &[(&str, &str, &[&str], bool)] = &[(
+    "learn_assignment",
+    "uk_learn_assignment_course_system_role",
+    &["course_id", "system_role"],
+    true,
+)];
+const IDENTITY_CREDENTIAL_FENCE_SQL_SHA384: &str =
+    "67b0e206506af2e724d08951bcdeb8b297ca8a83f75c540c1ace98bfc18375b0167e40fbe10ea27ef6e0a7f3b71fdfda";
+const ASYNC_OPERATION_CORRELATION_SQL_SHA384: &str =
+    "9f923f7efe47307ca895eba96674384967e1e29317abd2661d07ca2f8be4fa92b543220d44e58354fc2fa5eeccef3089";
+const CHAT_DELIVERY_INTENT_SQL_SHA384: &str =
+    "9e54275dbd398508eb4daac9dcbb4c5f1a75902b66757e9110410d9e85e9abce82bbbb372a25c6591d0be2464f7620c7";
+const LEARN_SYSTEM_ASSIGNMENT_SQL_SHA384: &str =
+    "102705f5df0183e0bcd4fc4d39fe1c8e8ff994c66d198d0c7d738a992a3469cc9b453d9b52c7721d4bd48591ca2905de";
+const REVIEW_SLICE_MIGRATION_VERSIONS: &[i64] = &[
+    IDENTITY_CREDENTIAL_FENCE_VERSION,
+    ASYNC_OPERATION_CORRELATION_VERSION,
+    REVIEW_SCHEMA_REPAIR_VERSION,
+    CHAT_DELIVERY_INTENT_VERSION,
+    LEARN_SYSTEM_ASSIGNMENT_VERSION,
+];
+const LOCAL_SCOPE_SEQUENCE_MIGRATION_SQL: &str =
+    include_str!("../migrations/20261001000005_invalidation_scope_sequence.sql");
 
 const ISOLATED_MIGRATION_ENV: &str = "isolated";
+const DESTRUCTIVE_MIGRATION_ALLOWLIST_ENV: &str = "ASTRAL_DESTRUCTIVE_MIGRATION_ALLOWLIST";
+const DESTRUCTIVE_MIGRATION_BACKUP_PROOF_ENV: &str = "ASTRAL_DESTRUCTIVE_MIGRATION_BACKUP_PROOF_ID";
+const DESTRUCTIVE_MIGRATION_DRAIN_PROOF_ENV: &str = "ASTRAL_DESTRUCTIVE_MIGRATION_DRAIN_PROOF_ID";
+const DESTRUCTIVE_MIGRATION_CUTOVER_PROOF_ENV: &str =
+    "ASTRAL_DESTRUCTIVE_MIGRATION_CUTOVER_PROOF_ID";
+const DESTRUCTIVE_MIGRATION_DRAIN_SQL: &str = "SELECT 1 FROM authorization_projection_outbox WHERE status = 'PENDING' AND aggregate_type IN ('CARD', 'RULE_SET') LIMIT 1";
 const ISOLATED_MIGRATION_DATABASES: &[&str] = &["astral_test", "astral_rehearsal"];
 const ISOLATED_MIGRATION_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 const ISOLATED_MIGRATION_PORT: u16 = 3308;
@@ -513,6 +1064,46 @@ fn mysql_migration_connection_options(
         .map_err(|e| MigrationError::Failed(format!("parse migration database URL: {e}")))
 }
 
+fn destructive_migration_authorization(
+    allowlist: Option<&str>,
+    backup_proof: Option<&str>,
+    drain_proof: Option<&str>,
+    cutover_proof: Option<&str>,
+) -> Result<(), MigrationError> {
+    let authorized = allowlist.is_some_and(|allowlist| {
+        allowlist
+            .split(',')
+            .map(str::trim)
+            .any(|entry| entry.parse::<i64>().ok() == Some(LEGACY_SNAPSHOT_DECOMMISSION_VERSION))
+    });
+    if !authorized {
+        return Err(MigrationError::Failed(format!(
+            "pending standby migration {LEGACY_SNAPSHOT_DECOMMISSION_VERSION} is destructive and refused by default; set {DESTRUCTIVE_MIGRATION_ALLOWLIST_ENV} to its exact version with approved backup/drain/cutover proof references"
+        )));
+    }
+    for (field, value) in [
+        (DESTRUCTIVE_MIGRATION_BACKUP_PROOF_ENV, backup_proof),
+        (DESTRUCTIVE_MIGRATION_DRAIN_PROOF_ENV, drain_proof),
+        (DESTRUCTIVE_MIGRATION_CUTOVER_PROOF_ENV, cutover_proof),
+    ] {
+        if value.is_none_or(|value| !is_valid_destructive_proof_reference(value)) {
+            return Err(MigrationError::Failed(format!(
+                "pending standby migration {LEGACY_SNAPSHOT_DECOMMISSION_VERSION} requires a non-empty approved evidence reference in {field}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_destructive_proof_reference(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 256
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
+}
+
 fn ensure_isolated_migration_target(database_url: &str) -> Result<(), MigrationError> {
     if std::env::var("ASTRAL_MIGRATION_ENV").as_deref() != Ok(ISOLATED_MIGRATION_ENV) {
         return Err(MigrationError::Failed(
@@ -653,6 +1244,7 @@ const SCHEMA_INDEX_COLUMN_EXISTS_SQL: &str =
        AND CAST(TABLE_NAME AS BINARY) = CAST(? AS BINARY) \
        AND CAST(INDEX_NAME AS BINARY) = CAST(? AS BINARY) \
        AND SEQ_IN_INDEX = ? \
+       AND SUB_PART IS NULL \
        AND CAST(COLUMN_NAME AS BINARY) = CAST(? AS BINARY)";
 const SCHEMA_TABLE_CONTRACT_SQL: &str = "SELECT CAST(COUNT(*) AS BINARY) FROM information_schema.TABLES AS t JOIN information_schema.COLLATION_CHARACTER_SET_APPLICABILITY AS c ON CAST(c.COLLATION_NAME AS BINARY) = CAST(t.TABLE_COLLATION AS BINARY) WHERE CAST(t.TABLE_SCHEMA AS BINARY) = CAST(DATABASE() AS BINARY) AND CAST(t.TABLE_NAME AS BINARY) = CAST(? AS BINARY) AND CAST(t.TABLE_TYPE AS BINARY) = CAST('BASE TABLE' AS BINARY) AND CAST(c.CHARACTER_SET_NAME AS BINARY) = CAST(? AS BINARY) AND CAST(t.TABLE_COLLATION AS BINARY) = CAST(? AS BINARY)";
 const SCHEMA_TABLE_ENGINE_CONTRACT_SQL: &str = "SELECT CAST(COUNT(*) AS BINARY) FROM information_schema.TABLES AS t WHERE CAST(t.TABLE_SCHEMA AS BINARY) = CAST(DATABASE() AS BINARY) AND CAST(t.TABLE_NAME AS BINARY) = CAST(? AS BINARY) AND CAST(t.TABLE_TYPE AS BINARY) = CAST('BASE TABLE' AS BINARY) AND CAST(t.ENGINE AS BINARY) = CAST(? AS BINARY)";
@@ -687,7 +1279,7 @@ const SCHEMA_COLUMN_ORDER_SQL: &str =
      WHERE CAST(TABLE_SCHEMA AS BINARY) = CAST(DATABASE() AS BINARY) \
        AND CAST(TABLE_NAME AS BINARY) = CAST(? AS BINARY) \
      ORDER BY ORDINAL_POSITION";
-const SCHEMA_INDEX_METADATA_SQL: &str = "SELECT CAST(INDEX_NAME AS BINARY), CAST(NON_UNIQUE AS BINARY), CAST(SEQ_IN_INDEX AS BINARY), CAST(COLUMN_NAME AS BINARY) \
+const SCHEMA_INDEX_METADATA_SQL: &str = "SELECT CAST(INDEX_NAME AS BINARY), CAST(NON_UNIQUE AS BINARY), CAST(SEQ_IN_INDEX AS BINARY), CAST(COLUMN_NAME AS BINARY), CAST(SUB_PART AS BINARY), CAST(EXPRESSION AS BINARY) \
      FROM information_schema.STATISTICS \
      WHERE CAST(TABLE_SCHEMA AS BINARY) = CAST(DATABASE() AS BINARY) \
        AND CAST(TABLE_NAME AS BINARY) = CAST(? AS BINARY) \
@@ -1037,6 +1629,43 @@ const REQUIRED_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
             "lease_expires_at",
             "processed_at",
             "last_error",
+            "created_at",
+            "updated_at",
+            "scope_sequence",
+        ],
+    ),
+    (
+        "async_operation",
+        &[
+            "task_id",
+            "task_type",
+            "status",
+            "requester_user_id",
+            "requester_card_id",
+            "requester_tenant_id",
+            "requester_domain_id",
+            "authorization_target_card_id",
+            "authorization_target_tenant_id",
+            "authorization_target_domain_id",
+            "target_user_id",
+            "total_items",
+            "completed_items",
+            "owner_instance_id",
+            "error_message",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "async_operation_item",
+        &[
+            "task_id",
+            "card_id",
+            "tenant_id",
+            "domain_id",
+            "operation_id",
+            "status",
+            "error_message",
             "created_at",
             "updated_at",
         ],
@@ -3100,6 +3729,12 @@ pub async fn apply_migrations(database_url: &str) -> Result<MySqlPool, Migration
     acquire_migration_lock(&mut lock_connection).await?;
 
     let migration_result = async {
+        // Inspect pinned standby source and destructive-operation authorization
+        // before creating or normalizing migration history, baseline adoption,
+        // or handing any pending statement to SQLx. Absence of history means no
+        // successful migration has been durably recorded yet.
+        preflight_standby_migration_gate(&pool, &HashSet::new(), MIGRATOR.migrations.as_ref()).await?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
                 version BIGINT PRIMARY KEY,
@@ -3128,6 +3763,7 @@ pub async fn apply_migrations(database_url: &str) -> Result<MySqlPool, Migration
         }
 
         let recorded_versions = recorded_successful_versions(&pool).await?;
+        preflight_standby_migration_gate(&pool, &recorded_versions, MIGRATOR.migrations.as_ref()).await?;
         let history_state = classify_migration_history(&recorded_versions);
         let baseline_is_verified = verified_baseline(&pool).await?;
 
@@ -3214,7 +3850,76 @@ pub async fn apply_migrations(database_url: &str) -> Result<MySqlPool, Migration
     }
 }
 
+async fn preflight_standby_migration_gate(
+    pool: &MySqlPool,
+    applied_versions: &HashSet<i64>,
+    migrations: &[Migration],
+) -> Result<(), MigrationError> {
+    let migration = migrations
+        .iter()
+        .find(|migration| migration.version == LEGACY_SNAPSHOT_DECOMMISSION_VERSION)
+        .ok_or_else(|| {
+            MigrationError::Failed(format!(
+                "standby migration {LEGACY_SNAPSHOT_DECOMMISSION_VERSION} is missing from the embedded migrator"
+            ))
+        })?;
+    if !migration_matches_known_source(migration) {
+        return Err(MigrationError::Failed(format!(
+            "standby migration {} is not the checksum-pinned canonical source",
+            LEGACY_SNAPSHOT_DECOMMISSION_VERSION
+        )));
+    }
+    if applied_versions.contains(&LEGACY_SNAPSHOT_DECOMMISSION_VERSION) {
+        return Ok(());
+    }
+
+    let is_pending = MIGRATOR
+        .migrations
+        .iter()
+        .find(|embedded| embedded.version == LEGACY_SNAPSHOT_DECOMMISSION_VERSION)
+        .is_some_and(|embedded| !applied_versions.contains(&embedded.version));
+    if !is_pending {
+        return Ok(());
+    }
+
+    let authorization = destructive_migration_authorization(
+        std::env::var(DESTRUCTIVE_MIGRATION_ALLOWLIST_ENV)
+            .ok()
+            .as_deref(),
+        std::env::var(DESTRUCTIVE_MIGRATION_BACKUP_PROOF_ENV)
+            .ok()
+            .as_deref(),
+        std::env::var(DESTRUCTIVE_MIGRATION_DRAIN_PROOF_ENV)
+            .ok()
+            .as_deref(),
+        std::env::var(DESTRUCTIVE_MIGRATION_CUTOVER_PROOF_ENV)
+            .ok()
+            .as_deref(),
+    );
+    authorization?;
+
+    let table_present = schema_table_exists(pool, LEGACY_SNAPSHOT_REQUIRED_DRAIN_TABLES[0]).await?;
+    if table_present {
+        let pending_legacy_work: Option<(i64,)> = sqlx::query_as(DESTRUCTIVE_MIGRATION_DRAIN_SQL)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| {
+                MigrationError::Failed(format!(
+                    "read-only standby migration drain preflight failed: {error}"
+                ))
+            })?;
+        if pending_legacy_work.is_some() {
+            return Err(MigrationError::Failed(format!(
+                "standby migration {} refused while CARD/RULE_SET projection outbox work remains PENDING",
+                LEGACY_SNAPSHOT_DECOMMISSION_VERSION
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn preflight_before_baseline_adoption(pool: &MySqlPool) -> Result<(), MigrationError> {
+    preflight_standby_migration_gate(pool, &HashSet::new(), MIGRATOR.migrations.as_ref()).await?;
     for contract in HISTORICAL_MIGRATION_COMPATIBILITY {
         if !is_java_baseline_era(contract.version)
             && contract.version != TRUSTGRAPH_RUNTIME_TABLES_VERSION
@@ -4334,6 +5039,148 @@ async fn validate_cross_city_schema_contract(pool: &MySqlPool) -> Result<(), Mig
     Ok(())
 }
 
+/// Validate the opt-in Chat runtime's pinned durable send-intent tables.
+/// This is a read-only gate and never creates or repairs missing proof tables.
+pub async fn validate_chat_delivery_intent_schema(pool: &MySqlPool) -> Result<(), MigrationError> {
+    for table in CHAT_DELIVERY_INTENT_TABLES {
+        validate_chat_delivery_intent_table_contract(pool, table).await?;
+    }
+    Ok(())
+}
+
+async fn validate_chat_delivery_intent_table_contract(
+    pool: &MySqlPool,
+    table: &str,
+) -> Result<(), MigrationError> {
+    let columns: Vec<SchemaColumnContract> = CHAT_DELIVERY_INTENT_COLUMNS
+        .iter()
+        .filter(|expected| expected.table == table)
+        .copied()
+        .collect();
+    let indexes: Vec<(&str, &str, &[&str], bool)> = CHAT_DELIVERY_INTENT_INDEXES
+        .iter()
+        .filter(|(index_table, _, _, _)| *index_table == table)
+        .copied()
+        .collect();
+    if columns.is_empty() || indexes.is_empty() {
+        return Err(MigrationError::Failed(format!(
+            "Chat delivery-intent contract has no complete definition for table {table}"
+        )));
+    }
+    validate_table_contract(
+        pool,
+        table,
+        MYSQL_SCHEMA_CHARSET,
+        MYSQL_SCHEMA_COLLATION,
+        Some("InnoDB"),
+    )
+    .await?;
+    validate_schema_columns(pool, &columns).await?;
+    validate_indexes(pool, &indexes).await?;
+    if !schema_columns_match(pool, &columns).await? || !schema_indexes_match(pool, &indexes).await?
+    {
+        return Err(MigrationError::Failed(format!(
+            "Chat delivery-intent table {table} has incompatible extra or reordered metadata; refusing automatic ALTER/DROP"
+        )));
+    }
+    Ok(())
+}
+
+async fn validate_cross_city_runtime_proof_table_contract(
+    pool: &MySqlPool,
+    table: &str,
+) -> Result<(), MigrationError> {
+    let columns: Vec<SchemaColumnContract> = CROSS_CITY_RUNTIME_PROOF_COLUMNS
+        .iter()
+        .filter(|expected| expected.table == table)
+        .copied()
+        .collect();
+    let indexes: Vec<(&str, &str, &[&str], bool)> = CROSS_CITY_RUNTIME_PROOF_INDEXES
+        .iter()
+        .filter(|(index_table, _, _, _)| *index_table == table)
+        .copied()
+        .collect();
+    if columns.is_empty() || indexes.is_empty() {
+        return Err(MigrationError::Failed(format!(
+            "cross-city runtime proof contract has no complete definition for table {table}"
+        )));
+    }
+    validate_table_contract(
+        pool,
+        table,
+        MYSQL_SCHEMA_CHARSET,
+        MYSQL_SCHEMA_COLLATION,
+        Some("InnoDB"),
+    )
+    .await?;
+    validate_schema_columns(pool, &columns).await?;
+    validate_indexes(pool, &indexes).await?;
+    if !schema_columns_match(pool, &columns).await? {
+        return Err(MigrationError::Failed(format!(
+            "cross-city runtime proof table {table} has incompatible or extra column drift; refusing automatic ALTER/DROP"
+        )));
+    }
+    if !schema_indexes_match(pool, &indexes).await? {
+        return Err(MigrationError::Failed(format!(
+            "cross-city runtime proof table {table} has incompatible or extra index drift; refusing automatic ALTER/DROP"
+        )));
+    }
+    Ok(())
+}
+
+/// Enabled-only cross-city schema and durable authority preflight. Default-off
+/// deployments remain unaffected; an enabled runtime calls this before it loads
+/// keys, scopes, or starts workers. A flag outside {0,1}, an empty authority
+/// registry, or missing proof evidence is a startup refusal.
+pub async fn validate_cross_city_runtime_schema(pool: &MySqlPool) -> Result<(), MigrationError> {
+    // This public validator is called only after the default-off runtime gate
+    // has resolved to Enabled. Keep both durable creator slices together here;
+    // ordinary service schema validation must not touch either optional slice.
+    validate_cross_city_schema_contract(pool).await?;
+    for table in CROSS_CITY_RUNTIME_PROOF_TABLES {
+        validate_cross_city_runtime_proof_table_contract(pool, table).await?;
+    }
+
+    validate_cross_city_authority_scope_rows(pool).await?;
+    Ok(())
+}
+
+async fn validate_cross_city_authority_scope_rows(pool: &MySqlPool) -> Result<(), MigrationError> {
+    let invalid_flag = sqlx::query(
+        "SELECT 1 FROM authorization_cross_city_authority_scope \
+         WHERE authoritative NOT IN (0, 1) OR authoritative IS NULL LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| {
+        MigrationError::Failed(format!(
+            "validate cross-city authority-scope row flags: {error}"
+        ))
+    })?;
+    if invalid_flag.is_some() {
+        return Err(MigrationError::Failed(
+            "cross-city authority scope contains an authoritative flag outside {0,1}".into(),
+        ));
+    }
+    let authoritative_row = sqlx::query(
+        "SELECT 1 FROM authorization_cross_city_authority_scope \
+         WHERE authoritative = 1 LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| {
+        MigrationError::Failed(format!(
+            "inspect cross-city authoritative scope registry: {error}"
+        ))
+    })?;
+    if authoritative_row.is_none() {
+        return Err(MigrationError::Failed(
+            "cross-city runtime has no explicitly authoritative scope rows".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Cross-city creator preflight (fail-closed, same shape as the incremental
 /// projection archive preflight): while 20260831000002 is pending, every
 /// missing table must be defined by the pending migration (table, columns,
@@ -4408,6 +5255,9 @@ async fn preflight_schema_contract_before_sqlx(
     applied_versions: &HashSet<i64>,
     migrations: &[Migration],
 ) -> Result<(), MigrationError> {
+    preflight_standby_migration_gate(pool, applied_versions, migrations).await?;
+    let review_schema_complete =
+        preflight_review_schema_contracts(pool, applied_versions, migrations).await?;
     preflight_monitor_schema_contract(pool, applied_versions, migrations).await?;
     let incremental_archive_complete = preflight_incremental_projection_archive_schema_contract(
         pool,
@@ -4423,7 +5273,7 @@ async fn preflight_schema_contract_before_sqlx(
         .collect();
 
     let mut all_required_artifacts_present =
-        incremental_archive_complete && cross_city_schema_complete;
+        incremental_archive_complete && cross_city_schema_complete && review_schema_complete;
     let mut absent_tables = HashSet::new();
     for (table, columns) in REQUIRED_SCHEMA_COLUMNS {
         let table_exists = schema_table_exists(pool, table).await?;
@@ -4532,12 +5382,29 @@ fn migration_matches_known_source(migration: &Migration) -> bool {
     };
 
     // Artifact ownership is only accepted for the exact embedded migration
-    // body and SQLx checksum. Historical MySQL-8 rewrites are the sole
-    // exception; they are derived from the checksum-pinned source contract.
+    // body and SQLx checksum. Historical MySQL-8 rewrites are derived from the
+    // checksum-pinned source contract. Newly registered 20261003 review-slice
+    // sources are also pinned to canonical LF SHA-384 so the helper remains
+    // closed even while sibling files arrive on the branch.
     if migration.checksum.as_ref() != known.checksum.as_ref() {
         return false;
     }
     if migration.sql.as_ref() == known.sql.as_ref() {
+        if REVIEW_SLICE_MIGRATION_VERSIONS.contains(&migration.version) {
+            return EXACT_MIGRATION_ARTIFACT_CONTRACTS
+                .iter()
+                .find(|contract| contract.version == migration.version)
+                .is_some_and(|contract| {
+                    canonical_sha384_hex(migration.sql.as_bytes()) == contract.source_sha384
+                });
+        }
+        if migration.version == CROSS_CITY_RUNTIME_PROOF_VERSION {
+            return canonical_sha384_hex(migration.sql.as_bytes())
+                == CROSS_CITY_RUNTIME_PROOF_SQL_SHA384;
+        }
+        if migration.version == LOCAL_SCOPE_SEQUENCE_VERSION {
+            return migration.sql.as_ref() == LOCAL_SCOPE_SEQUENCE_MIGRATION_SQL;
+        }
         return true;
     }
 
@@ -7809,6 +8676,641 @@ const CROSS_CITY_SCHEMA_INDEXES: &[(&str, &str, &[&str], bool)] = &[
 /// closed operation-state / decision / gate vocabularies, the two-city
 /// agreement rule, and all signature verification stay in astral-types; these
 /// contracts pin only the durable column shapes the repository relies on.
+const CROSS_CITY_RUNTIME_PROOF_TABLES: &[&str] = &[
+    "authorization_cross_city_node_key",
+    "authorization_cross_city_vote_reservation",
+    "authorization_cross_city_commit_receipt",
+    "authorization_cross_city_operation_activation",
+    "authorization_cross_city_authority_scope",
+];
+
+const CROSS_CITY_RUNTIME_PROOF_INDEXES: &[(&str, &str, &[&str], bool)] = &[
+    (
+        "authorization_cross_city_node_key",
+        "PRIMARY",
+        &["node_key_id"],
+        true,
+    ),
+    (
+        "authorization_cross_city_node_key",
+        "uk_accnk_identity",
+        &["city_id", "node_id", "node_epoch"],
+        true,
+    ),
+    (
+        "authorization_cross_city_node_key",
+        "idx_accnk_revoked",
+        &["revoked", "node_key_id"],
+        false,
+    ),
+    (
+        "authorization_cross_city_vote_reservation",
+        "PRIMARY",
+        &["reservation_id"],
+        true,
+    ),
+    (
+        "authorization_cross_city_vote_reservation",
+        "uk_accvr_replay_key",
+        &[
+            "city_id",
+            "node_id",
+            "node_epoch",
+            "nonce",
+            "evidence_digest",
+        ],
+        true,
+    ),
+    (
+        "authorization_cross_city_vote_reservation",
+        "idx_accvr_operation",
+        &["operation_id"],
+        false,
+    ),
+    (
+        "authorization_cross_city_commit_receipt",
+        "PRIMARY",
+        &["receipt_id"],
+        true,
+    ),
+    (
+        "authorization_cross_city_commit_receipt",
+        "uk_acccr_node",
+        &["operation_id", "city_id", "node_id"],
+        true,
+    ),
+    (
+        "authorization_cross_city_commit_receipt",
+        "uk_acccr_nonce",
+        &["operation_id", "nonce"],
+        true,
+    ),
+    (
+        "authorization_cross_city_commit_receipt",
+        "idx_acccr_operation_city",
+        &["operation_id", "city_id", "decision"],
+        false,
+    ),
+    (
+        "authorization_cross_city_operation_activation",
+        "PRIMARY",
+        &["operation_id"],
+        true,
+    ),
+    (
+        "authorization_cross_city_authority_scope",
+        "PRIMARY",
+        &["scope_id"],
+        true,
+    ),
+    (
+        "authorization_cross_city_authority_scope",
+        "uk_accas_city_scope",
+        &["city_id", "scope_digest"],
+        true,
+    ),
+    (
+        "authorization_cross_city_authority_scope",
+        "idx_accas_scope",
+        &["scope_digest", "authoritative"],
+        false,
+    ),
+];
+
+const CROSS_CITY_RUNTIME_PROOF_COLUMNS: &[SchemaColumnContract] = &[
+    incremental_scalar_column(
+        "authorization_cross_city_node_key",
+        "node_key_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_node_key",
+        "city_id",
+        "VARCHAR(191)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_node_key",
+        "node_id",
+        "VARCHAR(191)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_node_key",
+        "node_epoch",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_node_key",
+        "public_key",
+        "BINARY(32)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_node_key",
+        "revoked",
+        "TINYINT(1)",
+        true,
+        Some("0"),
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_node_key",
+        "registered_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_node_key",
+        "revoked_at",
+        "DATETIME",
+        false,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_node_key",
+        "revoked_reason",
+        "VARCHAR(512)",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_vote_reservation",
+        "reservation_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_vote_reservation",
+        "operation_id",
+        "CHAR(36)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_vote_reservation",
+        "city_id",
+        "VARCHAR(191)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_vote_reservation",
+        "node_id",
+        "VARCHAR(191)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_vote_reservation",
+        "node_epoch",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_vote_reservation",
+        "nonce",
+        "VARCHAR(191)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_vote_reservation",
+        "evidence_digest",
+        "BINARY(32)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_vote_reservation",
+        "reserved_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_commit_receipt",
+        "receipt_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_commit_receipt",
+        "operation_id",
+        "CHAR(36)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_commit_receipt",
+        "city_id",
+        "VARCHAR(191)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_commit_receipt",
+        "node_id",
+        "VARCHAR(191)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_commit_receipt",
+        "node_epoch",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_commit_receipt",
+        "decision",
+        "VARCHAR(16)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_commit_receipt",
+        "proposal_digest",
+        "BINARY(32)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_commit_receipt",
+        "evidence_digest",
+        "BINARY(32)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_commit_receipt",
+        "target_generation",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_commit_receipt",
+        "revoke_fence",
+        "BIGINT",
+        true,
+        Some("0"),
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_commit_receipt",
+        "coordinator_epoch",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_commit_receipt",
+        "nonce",
+        "VARCHAR(191)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_commit_receipt",
+        "signature",
+        "VARCHAR(4096)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_commit_receipt",
+        "observed_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+    ),
+    incremental_text_column(
+        "authorization_cross_city_operation_activation",
+        "operation_id",
+        "CHAR(36)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_operation_activation",
+        "agreement_digest",
+        "BINARY(32)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_operation_activation",
+        "commit_digest",
+        "BINARY(32)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_operation_activation",
+        "scope_digest",
+        "BINARY(32)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_operation_activation",
+        "target_generation",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_operation_activation",
+        "revoke_fence",
+        "BIGINT",
+        true,
+        Some("0"),
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_operation_activation",
+        "coordinator_epoch",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_operation_activation",
+        "minted_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_authority_scope",
+        "scope_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_cross_city_authority_scope",
+        "city_id",
+        "VARCHAR(191)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_authority_scope",
+        "scope_digest",
+        "BINARY(32)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_authority_scope",
+        "authoritative",
+        "TINYINT(1)",
+        true,
+        Some("0"),
+    ),
+    incremental_scalar_column(
+        "authorization_cross_city_authority_scope",
+        "registered_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+    ),
+];
+
+const ASYNC_OPERATION_INDEXES: &[(&str, &str, &[&str], bool)] = &[
+    ("async_operation", "PRIMARY", &["task_id"], true),
+    (
+        "async_operation",
+        "idx_async_operation_owner_status",
+        &["requester_user_id", "status", "updated_at"],
+        false,
+    ),
+    (
+        "async_operation",
+        "idx_async_operation_anchor",
+        &["authorization_target_card_id", "task_id"],
+        false,
+    ),
+    (
+        "async_operation_item",
+        "PRIMARY",
+        &["task_id", "card_id"],
+        true,
+    ),
+    (
+        "async_operation_item",
+        "uk_async_operation_item_operation",
+        &["operation_id"],
+        true,
+    ),
+    (
+        "async_operation_item",
+        "idx_async_operation_item_status",
+        &["task_id", "status", "card_id"],
+        false,
+    ),
+];
+
+const LOCAL_SCOPE_SEQUENCE_COLUMN_CONTRACT: SchemaColumnContract =
+    incremental_scalar_column("al_message_outbox", "scope_sequence", "BIGINT", false, None);
+
+const LOCAL_SCOPE_COUNTER_COLUMNS: &[SchemaColumnContract] = &[
+    incremental_text_column(
+        "al_message_scope_counter",
+        "scope_key",
+        "VARCHAR(400)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "al_message_scope_counter",
+        "last_sequence",
+        "BIGINT",
+        true,
+        Some("0"),
+    ),
+    incremental_scalar_column(
+        "al_message_scope_counter",
+        "updated_at",
+        "DATETIME(6)",
+        true,
+        Some("CURRENT_TIMESTAMP(6)"),
+    ),
+];
+
+const LOCAL_SCOPE_COUNTER_INDEXES: &[(&str, &str, &[&str], bool)] =
+    &[("al_message_scope_counter", "PRIMARY", &["scope_key"], true)];
+
+const ORG_SCOPE_OPERATION_COLUMNS: &[SchemaColumnContract] = &[
+    incremental_text_column(
+        "org_scope_operation",
+        "operation_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "org_scope_operation",
+        "operation_kind",
+        "VARCHAR(32)",
+        true,
+        None,
+    ),
+    incremental_scalar_column("org_scope_operation", "tenant_id", "BIGINT", true, None),
+    incremental_scalar_column(
+        "org_scope_operation",
+        "input_digest",
+        "BINARY(32)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "org_scope_operation",
+        "outcome_json",
+        "MEDIUMTEXT",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "org_scope_operation",
+        "created_at",
+        "DATETIME(6)",
+        true,
+        Some("CURRENT_TIMESTAMP(6)"),
+    ),
+];
+
+const ORG_SCOPE_OPERATION_INDEXES: &[(&str, &str, &[&str], bool)] = &[
+    ("org_scope_operation", "PRIMARY", &["operation_id"], true),
+    (
+        "org_scope_operation",
+        "idx_osop_tenant",
+        &["tenant_id", "created_at"],
+        false,
+    ),
+];
+
+const REVIEW_SCHEMA_REPAIR_COLUMNS: &[(&str, &str)] = &[
+    ("al_message_outbox", "scope_sequence"),
+    ("al_message_scope_counter", "scope_key"),
+    ("al_message_scope_counter", "last_sequence"),
+    ("al_message_scope_counter", "updated_at"),
+];
+
+const REVIEW_SCHEMA_REPAIR_INDEXES: &[(&str, &str, &[&str], bool)] = &[
+    (
+        "al_message_outbox",
+        "idx_al_message_scope_order",
+        &["queue_name", "ordering_key", "scope_sequence"],
+        false,
+    ),
+    ("al_message_scope_counter", "PRIMARY", &["scope_key"], true),
+    ("org_scope_operation", "PRIMARY", &["operation_id"], true),
+    // Existing indexes are reasserted here because 20261003000003 may repair a
+    // same-name missing index after its creator has already been recorded.
+    (
+        "authorization_cross_city_node_key",
+        "PRIMARY",
+        &["node_key_id"],
+        true,
+    ),
+    (
+        "authorization_cross_city_node_key",
+        "uk_accnk_identity",
+        &["city_id", "node_id", "node_epoch"],
+        true,
+    ),
+    (
+        "authorization_cross_city_node_key",
+        "idx_accnk_revoked",
+        &["revoked", "node_key_id"],
+        false,
+    ),
+    (
+        "authorization_cross_city_vote_reservation",
+        "PRIMARY",
+        &["reservation_id"],
+        true,
+    ),
+    (
+        "authorization_cross_city_vote_reservation",
+        "uk_accvr_replay_key",
+        &[
+            "city_id",
+            "node_id",
+            "node_epoch",
+            "nonce",
+            "evidence_digest",
+        ],
+        true,
+    ),
+    (
+        "authorization_cross_city_vote_reservation",
+        "idx_accvr_operation",
+        &["operation_id"],
+        false,
+    ),
+    (
+        "authorization_cross_city_commit_receipt",
+        "PRIMARY",
+        &["receipt_id"],
+        true,
+    ),
+    (
+        "authorization_cross_city_commit_receipt",
+        "uk_acccr_node",
+        &["operation_id", "city_id", "node_id"],
+        true,
+    ),
+    (
+        "authorization_cross_city_commit_receipt",
+        "uk_acccr_nonce",
+        &["operation_id", "nonce"],
+        true,
+    ),
+    (
+        "authorization_cross_city_commit_receipt",
+        "idx_acccr_operation_city",
+        &["operation_id", "city_id", "decision"],
+        false,
+    ),
+    (
+        "authorization_cross_city_operation_activation",
+        "PRIMARY",
+        &["operation_id"],
+        true,
+    ),
+    (
+        "authorization_cross_city_authority_scope",
+        "PRIMARY",
+        &["scope_id"],
+        true,
+    ),
+    (
+        "authorization_cross_city_authority_scope",
+        "uk_accas_city_scope",
+        &["city_id", "scope_digest"],
+        true,
+    ),
+    (
+        "authorization_cross_city_authority_scope",
+        "idx_accas_scope",
+        &["scope_digest", "authoritative"],
+        false,
+    ),
+];
+
 const CROSS_CITY_SCHEMA_COLUMN_CONTRACTS: &[SchemaColumnContract] = &[
     // authorization_cross_city_operation
     incremental_text_column(
@@ -8650,6 +10152,141 @@ const EXACT_MIGRATION_ARTIFACT_CONTRACTS: &[ExactMigrationArtifactContract] = &[
         columns: CROSS_CITY_SCHEMA_COLUMNS,
         indexes: CROSS_CITY_SCHEMA_INDEXES,
     },
+    ExactMigrationArtifactContract {
+        version: CROSS_CITY_RUNTIME_PROOF_VERSION,
+        source_sha384: CROSS_CITY_RUNTIME_PROOF_SQL_SHA384,
+        supports_existing_artifacts: false,
+        tables: CROSS_CITY_RUNTIME_PROOF_TABLES,
+        columns: &[
+            ("authorization_cross_city_node_key", "node_key_id"),
+            ("authorization_cross_city_node_key", "city_id"),
+            ("authorization_cross_city_node_key", "node_id"),
+            ("authorization_cross_city_node_key", "node_epoch"),
+            ("authorization_cross_city_node_key", "public_key"),
+            ("authorization_cross_city_node_key", "revoked"),
+            ("authorization_cross_city_node_key", "registered_at"),
+            ("authorization_cross_city_node_key", "revoked_at"),
+            ("authorization_cross_city_node_key", "revoked_reason"),
+            (
+                "authorization_cross_city_vote_reservation",
+                "reservation_id",
+            ),
+            ("authorization_cross_city_vote_reservation", "operation_id"),
+            ("authorization_cross_city_vote_reservation", "city_id"),
+            ("authorization_cross_city_vote_reservation", "node_id"),
+            ("authorization_cross_city_vote_reservation", "node_epoch"),
+            ("authorization_cross_city_vote_reservation", "nonce"),
+            (
+                "authorization_cross_city_vote_reservation",
+                "evidence_digest",
+            ),
+            ("authorization_cross_city_vote_reservation", "reserved_at"),
+            ("authorization_cross_city_commit_receipt", "receipt_id"),
+            ("authorization_cross_city_commit_receipt", "operation_id"),
+            ("authorization_cross_city_commit_receipt", "city_id"),
+            ("authorization_cross_city_commit_receipt", "node_id"),
+            ("authorization_cross_city_commit_receipt", "node_epoch"),
+            ("authorization_cross_city_commit_receipt", "decision"),
+            ("authorization_cross_city_commit_receipt", "proposal_digest"),
+            ("authorization_cross_city_commit_receipt", "evidence_digest"),
+            (
+                "authorization_cross_city_commit_receipt",
+                "target_generation",
+            ),
+            ("authorization_cross_city_commit_receipt", "revoke_fence"),
+            (
+                "authorization_cross_city_commit_receipt",
+                "coordinator_epoch",
+            ),
+            ("authorization_cross_city_commit_receipt", "nonce"),
+            ("authorization_cross_city_commit_receipt", "signature"),
+            ("authorization_cross_city_commit_receipt", "observed_at"),
+            (
+                "authorization_cross_city_operation_activation",
+                "operation_id",
+            ),
+            (
+                "authorization_cross_city_operation_activation",
+                "agreement_digest",
+            ),
+            (
+                "authorization_cross_city_operation_activation",
+                "commit_digest",
+            ),
+            (
+                "authorization_cross_city_operation_activation",
+                "scope_digest",
+            ),
+            (
+                "authorization_cross_city_operation_activation",
+                "target_generation",
+            ),
+            (
+                "authorization_cross_city_operation_activation",
+                "revoke_fence",
+            ),
+            (
+                "authorization_cross_city_operation_activation",
+                "coordinator_epoch",
+            ),
+            ("authorization_cross_city_operation_activation", "minted_at"),
+            ("authorization_cross_city_authority_scope", "scope_id"),
+            ("authorization_cross_city_authority_scope", "city_id"),
+            ("authorization_cross_city_authority_scope", "scope_digest"),
+            ("authorization_cross_city_authority_scope", "authoritative"),
+            ("authorization_cross_city_authority_scope", "registered_at"),
+        ],
+        indexes: CROSS_CITY_RUNTIME_PROOF_INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: REVIEW_SCHEMA_REPAIR_VERSION,
+        source_sha384: REVIEW_SCHEMA_REPAIR_SQL_SHA384,
+        supports_existing_artifacts: true,
+        tables: &["al_message_scope_counter"],
+        columns: REVIEW_SCHEMA_REPAIR_COLUMNS,
+        indexes: REVIEW_SCHEMA_REPAIR_INDEXES,
+    },
+    // Identity's 00001 migration only alters established Identity tables; it
+    // cannot create missing base tables. Its source owner is verified by the
+    // checked-in LF pin before artifact ownership can be used.
+    ExactMigrationArtifactContract {
+        version: IDENTITY_CREDENTIAL_FENCE_VERSION,
+        source_sha384: IDENTITY_CREDENTIAL_FENCE_SQL_SHA384,
+        supports_existing_artifacts: true,
+        tables: &[],
+        columns: IDENTITY_CREDENTIAL_FENCE_COLUMNS_ARTIFACTS,
+        indexes: IDENTITY_CREDENTIAL_FENCE_INDEXES,
+    },
+    // Async-operation creator. Requester scope and item operation identity are
+    // both written by the service in the same source transaction.
+    ExactMigrationArtifactContract {
+        version: ASYNC_OPERATION_CORRELATION_VERSION,
+        source_sha384: ASYNC_OPERATION_CORRELATION_SQL_SHA384,
+        supports_existing_artifacts: false,
+        tables: ASYNC_OPERATION_TABLES,
+        columns: ASYNC_OPERATION_COLUMNS_ARTIFACTS,
+        indexes: ASYNC_OPERATION_INDEXES,
+    },
+    // Chat send-intent creator; exact physical validation is repeated by Chat's
+    // private startup gate when the subsystem is enabled.
+    ExactMigrationArtifactContract {
+        version: CHAT_DELIVERY_INTENT_VERSION,
+        source_sha384: CHAT_DELIVERY_INTENT_SQL_SHA384,
+        supports_existing_artifacts: false,
+        tables: CHAT_DELIVERY_INTENT_TABLES,
+        columns: CHAT_DELIVERY_INTENT_COLUMNS_ARTIFACTS,
+        indexes: CHAT_DELIVERY_INTENT_INDEXES,
+    },
+    // Learn adds one exact nullable marker + course-scoped uniqueness to the
+    // existing learn_assignment creator; the history is intentionally untouched.
+    ExactMigrationArtifactContract {
+        version: LEARN_SYSTEM_ASSIGNMENT_VERSION,
+        source_sha384: LEARN_SYSTEM_ASSIGNMENT_SQL_SHA384,
+        supports_existing_artifacts: true,
+        tables: &[],
+        columns: LEARN_SYSTEM_ASSIGNMENT_COLUMNS_ARTIFACTS,
+        indexes: LEARN_SYSTEM_ASSIGNMENT_INDEXES,
+    },
 ];
 
 fn character_indices(value: &str, character_index: usize) -> usize {
@@ -8821,17 +10458,27 @@ fn parse_alter_table(statement: &str) -> Option<Vec<MigrationArtifact>> {
         }
 
         let index_action = action
-            .strip_prefix("ADD UNIQUE KEY ")
-            .or_else(|| action.strip_prefix("ADD UNIQUE INDEX "))
-            .map(|value| (value, true))
-            .or_else(|| action.strip_prefix("ADD KEY ").map(|value| (value, false)))
+            .strip_prefix("ADD PRIMARY KEY ")
+            .map(|value| ("PRIMARY", value, true))
             .or_else(|| {
                 action
-                    .strip_prefix("ADD INDEX ")
-                    .map(|value| (value, false))
+                    .strip_prefix("ADD UNIQUE KEY ")
+                    .or_else(|| action.strip_prefix("ADD UNIQUE INDEX "))
+                    .and_then(|value| {
+                        let (name, _) = first_sql_word(value)?;
+                        Some((name, value, true))
+                    })
+            })
+            .or_else(|| {
+                action
+                    .strip_prefix("ADD KEY ")
+                    .or_else(|| action.strip_prefix("ADD INDEX "))
+                    .and_then(|value| {
+                        let (name, _) = first_sql_word(value)?;
+                        Some((name, value, false))
+                    })
             });
-        if let Some((index, unique)) = index_action {
-            let (name, _) = first_sql_word(index)?;
+        if let Some((name, index, unique)) = index_action {
             artifacts.push(MigrationArtifact {
                 kind: MigrationArtifactKind::AddIndex,
                 table: table.clone(),
@@ -8898,7 +10545,76 @@ fn exact_migration_artifact_contract(
     {
         return None;
     }
+    if REVIEW_SLICE_MIGRATION_VERSIONS.contains(&migration.version) {
+        let artifacts = parsed_migration_artifacts(migration)?;
+        if !exact_contract_artifacts_match_source(contract, &artifacts) {
+            return None;
+        }
+    }
     Some(contract)
+}
+
+fn exact_contract_artifacts_match_source(
+    contract: &ExactMigrationArtifactContract,
+    artifacts: &[MigrationArtifact],
+) -> bool {
+    let source_has_table = |table: &str| {
+        artifacts.iter().any(|artifact| {
+            artifact.kind == MigrationArtifactKind::Table
+                && artifact.name.eq_ignore_ascii_case(table)
+        })
+    };
+    let source_has_column = |table: &str, column: &str| {
+        artifacts.iter().any(|artifact| {
+            matches!(
+                artifact.kind,
+                MigrationArtifactKind::CreateColumn | MigrationArtifactKind::AddColumn
+            ) && artifact.table.eq_ignore_ascii_case(table)
+                && artifact.name.eq_ignore_ascii_case(column)
+        })
+    };
+    let source_has_index = |table: &str, index: &str, columns: &[&str], unique: bool| {
+        artifacts.iter().any(|artifact| {
+            matches!(
+                artifact.kind,
+                MigrationArtifactKind::CreateIndex | MigrationArtifactKind::AddIndex
+            ) && artifact.table.eq_ignore_ascii_case(table)
+                && artifact.name.eq_ignore_ascii_case(index)
+                && artifact.unique == unique
+                && artifact.columns.len() == columns.len()
+                && artifact
+                    .columns
+                    .iter()
+                    .zip(columns)
+                    .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+        })
+    };
+    let artifact_is_declared = |artifact: &MigrationArtifact| match artifact.kind {
+        MigrationArtifactKind::Table => exact_contract_defines_table(contract, &artifact.name),
+        MigrationArtifactKind::CreateColumn | MigrationArtifactKind::AddColumn => {
+            exact_contract_defines_column(contract, &artifact.table, &artifact.name)
+        }
+        MigrationArtifactKind::CreateIndex | MigrationArtifactKind::AddIndex => {
+            let columns: Vec<&str> = artifact.columns.iter().map(String::as_str).collect();
+            exact_contract_defines_index(
+                contract,
+                &artifact.table,
+                &artifact.name,
+                &columns,
+                artifact.unique,
+            )
+        }
+    };
+    artifacts.iter().all(artifact_is_declared)
+        && contract.tables.iter().all(|table| source_has_table(table))
+        && contract
+            .columns
+            .iter()
+            .all(|(table, column)| source_has_column(table, column))
+        && contract
+            .indexes
+            .iter()
+            .all(|(table, index, columns, unique)| source_has_index(table, index, columns, *unique))
 }
 
 fn exact_contract_defines_table(contract: &ExactMigrationArtifactContract, table: &str) -> bool {
@@ -9074,24 +10790,22 @@ fn pending_index_satisfies_preflight(
 }
 
 fn migration_defines_existing_column(migration: &Migration, table: &str, column: &str) -> bool {
-    if EXACT_MIGRATION_ARTIFACT_CONTRACTS
-        .iter()
-        .any(|contract| contract.version == migration.version)
-    {
-        return exact_migration_artifact_contract(migration).is_some_and(|contract| {
-            contract.supports_existing_artifacts
-                && exact_contract_defines_column(contract, table, column)
-        });
-    }
-
     let table = normalized_identifier(table);
     let column = normalized_identifier(column);
     parsed_migration_artifacts(migration).is_some_and(|artifacts| {
-        artifacts.iter().any(|artifact| {
-            artifact.kind == MigrationArtifactKind::AddColumn
-                && artifact.table == table
-                && artifact.name == column
-        })
+        let declared = EXACT_MIGRATION_ARTIFACT_CONTRACTS
+            .iter()
+            .find(|contract| contract.version == migration.version)
+            .is_none_or(|contract| {
+                contract.supports_existing_artifacts
+                    && exact_contract_defines_column(contract, &table, &column)
+            });
+        declared
+            && artifacts.iter().any(|artifact| {
+                artifact.kind == MigrationArtifactKind::AddColumn
+                    && artifact.table == table
+                    && artifact.name == column
+            })
     })
 }
 
@@ -9102,16 +10816,6 @@ fn migration_defines_existing_index(
     columns: &[&str],
     unique: bool,
 ) -> bool {
-    if EXACT_MIGRATION_ARTIFACT_CONTRACTS
-        .iter()
-        .any(|contract| contract.version == migration.version)
-    {
-        return exact_migration_artifact_contract(migration).is_some_and(|contract| {
-            contract.supports_existing_artifacts
-                && exact_contract_defines_index(contract, table, index, columns, unique)
-        });
-    }
-
     let table = normalized_identifier(table);
     let index = normalized_identifier(index);
     let columns: Vec<String> = columns
@@ -9119,13 +10823,27 @@ fn migration_defines_existing_index(
         .map(|column| normalized_identifier(column))
         .collect();
     parsed_migration_artifacts(migration).is_some_and(|artifacts| {
-        artifacts.iter().any(|artifact| {
-            artifact.kind == MigrationArtifactKind::AddIndex
-                && artifact.table == table
-                && artifact.name == index
-                && artifact.columns == columns
-                && artifact.unique == unique
-        })
+        let declared = EXACT_MIGRATION_ARTIFACT_CONTRACTS
+            .iter()
+            .find(|contract| contract.version == migration.version)
+            .is_none_or(|contract| {
+                contract.supports_existing_artifacts
+                    && exact_contract_defines_index(
+                        contract,
+                        &table,
+                        &index,
+                        &columns.iter().map(String::as_str).collect::<Vec<_>>(),
+                        unique,
+                    )
+            });
+        declared
+            && artifacts.iter().any(|artifact| {
+                artifact.kind == MigrationArtifactKind::AddIndex
+                    && artifact.table == table
+                    && artifact.name == index
+                    && artifact.columns == columns
+                    && artifact.unique == unique
+            })
     })
 }
 
@@ -9567,7 +11285,7 @@ impl HistoricalColumnMetadata {
         let nullable_matches =
             self.nullable
                 .eq_ignore_ascii_case(if expected.not_null { "NO" } else { "YES" });
-        let default_matches = self.default.as_deref() == expected.default;
+        let default_matches = column_default_matches(self.default.as_deref(), expected.default);
         let character_metadata_matches = validate_character_metadata(
             &self.column_type,
             self.charset.as_deref(),
@@ -10070,6 +11788,393 @@ async fn verified_baseline(pool: &MySqlPool) -> Result<bool, MigrationError> {
     Ok(true)
 }
 
+fn identity_fence_column_contracts() -> Vec<SchemaColumnContract> {
+    IDENTITY_CREDENTIAL_FENCE_COLUMNS
+        .iter()
+        .map(|column| SchemaColumnContract {
+            table: column.table,
+            name: column.name,
+            column_type: column.column_type,
+            not_null: column.not_null,
+            default: column.default,
+            charset: column.charset,
+            collation: column.collation,
+        })
+        .collect()
+}
+
+async fn validate_review_table_engine(pool: &MySqlPool, table: &str) -> Result<(), MigrationError> {
+    let count = metadata_count(
+        sqlx::query_scalar::<_, Vec<u8>>(SCHEMA_TABLE_ENGINE_CONTRACT_SQL)
+            .bind(table)
+            .bind("InnoDB")
+            .fetch_one(pool)
+            .await
+            .map_err(|error| MigrationError::Failed(format!("inspect {table} engine: {error}")))?,
+        "inspect review table engine",
+    )?;
+    if count != 1 {
+        return Err(MigrationError::Failed(format!(
+            "missing or non-InnoDB review table {table}; explicit migration/recovery required"
+        )));
+    }
+    Ok(())
+}
+
+async fn validate_review_runtime_schema(pool: &MySqlPool) -> Result<(), MigrationError> {
+    for table in [
+        "user_local_credential",
+        "auth_device_session",
+        "user_mfa",
+        "mfa_attempt_log",
+        "al_message_outbox",
+        "al_message_scope_counter",
+    ]
+    .into_iter()
+    .chain(ASYNC_OPERATION_TABLES.iter().copied())
+    {
+        validate_review_table_engine(pool, table).await?;
+    }
+    validate_schema_columns(pool, &identity_fence_column_contracts()).await?;
+    validate_indexes(pool, IDENTITY_CREDENTIAL_FENCE_INDEXES).await?;
+    crate::session_state_repository::validate_identity_credential_fence_schema(pool)
+        .await
+        .map_err(MigrationError::Failed)?;
+    validate_schema_column_exact(pool, &LOCAL_SCOPE_SEQUENCE_COLUMN_CONTRACT).await?;
+    validate_schema_columns(pool, LOCAL_SCOPE_COUNTER_COLUMNS).await?;
+    validate_indexes(pool, LOCAL_SCOPE_COUNTER_INDEXES).await?;
+    validate_indexes(pool, &REVIEW_SCHEMA_REPAIR_INDEXES[..1]).await?;
+    validate_schema_columns(pool, ASYNC_OPERATION_COLUMNS).await?;
+    validate_indexes(pool, ASYNC_OPERATION_INDEXES).await?;
+    let invalid: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM user_local_credential WHERE credential_version <= 0 LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| {
+                MigrationError::Failed(format!("inspect credential revision domain: {error}"))
+            })?;
+    if invalid.is_some() {
+        return Err(MigrationError::Failed(
+            "invalid credential revision requires explicit recovery".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn review_migration_pending(
+    applied: &HashSet<i64>,
+    migrations: &[Migration],
+    version: i64,
+) -> bool {
+    !applied.contains(&version)
+        && migrations.iter().any(|migration| {
+            migration.version == version && migration_matches_known_source(migration)
+        })
+}
+
+fn pending_migration_can_create_table(
+    applied: &HashSet<i64>,
+    migrations: &[Migration],
+    table: &str,
+) -> bool {
+    migrations.iter().any(|migration| {
+        !applied.contains(&migration.version)
+            && migration_matches_known_source(migration)
+            && migration_defines_table(migration, table)
+    })
+}
+
+fn pending_migration_can_own_column(
+    applied: &HashSet<i64>,
+    migrations: &[Migration],
+    table: &str,
+    column: &str,
+    table_absent: bool,
+) -> bool {
+    migrations.iter().any(|migration| {
+        !applied.contains(&migration.version)
+            && migration_matches_known_source(migration)
+            && (migration_defines_existing_column(migration, table, column)
+                || (table_absent && migration_defines_column(migration, table, column)))
+    })
+}
+
+fn pending_migration_can_own_index(
+    applied: &HashSet<i64>,
+    migrations: &[Migration],
+    table: &str,
+    index: &str,
+    columns: &[&str],
+    unique: bool,
+    table_absent: bool,
+) -> bool {
+    migrations.iter().any(|migration| {
+        !applied.contains(&migration.version)
+            && migration_matches_known_source(migration)
+            && (migration_defines_existing_index(migration, table, index, columns, unique)
+                || (table_absent
+                    && migration_defines_index(migration, table, index, columns, unique)))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn preflight_review_table(
+    pool: &MySqlPool,
+    applied: &HashSet<i64>,
+    migrations: &[Migration],
+    table: &str,
+    columns: &[SchemaColumnContract],
+    indexes: &[(&str, &str, &[&str], bool)],
+) -> Result<bool, MigrationError> {
+    let table_absent = !schema_table_exists(pool, table).await?;
+    if table_absent && !pending_migration_can_create_table(applied, migrations, table) {
+        return Err(MigrationError::Failed(format!(
+            "recorded or unsupported durable table {table} is missing; restore history before migration"
+        )));
+    }
+    if !table_absent {
+        validate_review_table_engine(pool, table).await?;
+    }
+    let mut complete = !table_absent;
+    for column in columns.iter().filter(|column| column.table == table) {
+        if !table_absent && schema_column_exists(pool, table, column.name).await? {
+            validate_schema_column_exact(pool, column).await?;
+        } else if pending_migration_can_own_column(
+            applied,
+            migrations,
+            table,
+            column.name,
+            table_absent,
+        ) {
+            complete = false;
+        } else {
+            return Err(MigrationError::Failed(format!(
+                "review column {table}.{} missing without a source-pinned additive owner",
+                column.name
+            )));
+        }
+    }
+    for (index_table, index, index_columns, unique) in
+        indexes.iter().filter(|entry| entry.0 == table)
+    {
+        if !table_absent && schema_index_exists(pool, table, index).await? {
+            validate_indexes(pool, &[(*index_table, *index, *index_columns, *unique)]).await?;
+        } else if pending_migration_can_own_index(
+            applied,
+            migrations,
+            index_table,
+            index,
+            index_columns,
+            *unique,
+            table_absent,
+        ) {
+            complete = false;
+            if *unique && !table_absent {
+                // All identifiers come from closed, source-pinned contracts.
+                // MySQL permits repeated NULLs in UNIQUE keys, so only complete
+                // non-NULL key tuples conflict with the candidate index.
+                let keys = index_columns
+                    .iter()
+                    .map(|column| format!("`{column}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let nonnull = index_columns
+                    .iter()
+                    .map(|column| format!("`{column}` IS NOT NULL"))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let statement = format!(
+                    "SELECT 1 FROM `{table}` WHERE {nonnull} GROUP BY {keys} HAVING COUNT(*) > 1 LIMIT 1"
+                );
+                let duplicate: Option<(i32,)> = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    sqlx::query_as(&statement).fetch_optional(pool),
+                )
+                .await
+                .map_err(|_| {
+                    MigrationError::Failed(format!(
+                        "duplicate preflight timed out for {table}.{index}"
+                    ))
+                })?
+                .map_err(|error| {
+                    MigrationError::Failed(format!(
+                        "duplicate preflight for {table}.{index}: {error}"
+                    ))
+                })?;
+                if duplicate.is_some() {
+                    return Err(MigrationError::Failed(format!(
+                        "duplicate history prevents additive key {table}.{index}; no automatic rewrite"
+                    )));
+                }
+            }
+        } else {
+            return Err(MigrationError::Failed(format!(
+                "review index {table}.{index} missing without a source-pinned additive owner"
+            )));
+        }
+    }
+    Ok(complete)
+}
+
+async fn preflight_review_schema_contracts(
+    pool: &MySqlPool,
+    applied: &HashSet<i64>,
+    migrations: &[Migration],
+) -> Result<bool, MigrationError> {
+    let mut complete = true;
+    let identity = identity_fence_column_contracts();
+    for table in [
+        "user_local_credential",
+        "auth_device_session",
+        "user_mfa",
+        "mfa_attempt_log",
+    ] {
+        complete &= preflight_review_table(
+            pool,
+            applied,
+            migrations,
+            table,
+            &identity,
+            IDENTITY_CREDENTIAL_FENCE_INDEXES,
+        )
+        .await?;
+    }
+    for table in ASYNC_OPERATION_TABLES {
+        complete &= preflight_review_table(
+            pool,
+            applied,
+            migrations,
+            table,
+            ASYNC_OPERATION_COLUMNS,
+            ASYNC_OPERATION_INDEXES,
+        )
+        .await?;
+    }
+    for table in CHAT_DELIVERY_INTENT_TABLES {
+        complete &= preflight_review_table(
+            pool,
+            applied,
+            migrations,
+            table,
+            CHAT_DELIVERY_INTENT_COLUMNS,
+            CHAT_DELIVERY_INTENT_INDEXES,
+        )
+        .await?;
+    }
+    complete &= preflight_review_table(
+        pool,
+        applied,
+        migrations,
+        "learn_assignment",
+        LEARN_SYSTEM_ASSIGNMENT_COLUMNS,
+        LEARN_SYSTEM_ASSIGNMENT_INDEXES,
+    )
+    .await?;
+    complete &= preflight_review_table(
+        pool,
+        applied,
+        migrations,
+        "al_message_outbox",
+        &[LOCAL_SCOPE_SEQUENCE_COLUMN_CONTRACT],
+        &REVIEW_SCHEMA_REPAIR_INDEXES[..1],
+    )
+    .await?;
+    complete &= preflight_review_table(
+        pool,
+        applied,
+        migrations,
+        "al_message_scope_counter",
+        LOCAL_SCOPE_COUNTER_COLUMNS,
+        LOCAL_SCOPE_COUNTER_INDEXES,
+    )
+    .await?;
+    complete &= preflight_review_table(
+        pool,
+        applied,
+        migrations,
+        "org_scope_operation",
+        ORG_SCOPE_OPERATION_COLUMNS,
+        ORG_SCOPE_OPERATION_INDEXES,
+    )
+    .await?;
+    for table in CROSS_CITY_RUNTIME_PROOF_TABLES {
+        complete &= preflight_review_table(
+            pool,
+            applied,
+            migrations,
+            table,
+            CROSS_CITY_RUNTIME_PROOF_COLUMNS,
+            CROSS_CITY_RUNTIME_PROOF_INDEXES,
+        )
+        .await?;
+    }
+    let chat_creator_pending =
+        review_migration_pending(applied, migrations, CHAT_DELIVERY_INTENT_VERSION);
+    let mut chat_tables_present = 0;
+    for table in CHAT_DELIVERY_INTENT_TABLES {
+        if schema_table_exists(pool, table).await? {
+            chat_tables_present += 1;
+            validate_chat_delivery_intent_table_contract(pool, table).await?;
+        }
+    }
+    if chat_tables_present != CHAT_DELIVERY_INTENT_TABLES.len() {
+        if !chat_creator_pending {
+            return Err(MigrationError::Failed(
+                "recorded Chat delivery-intent schema is incomplete; restore durable proof instead of recreating it".into(),
+            ));
+        }
+        let chat_migration = migrations
+            .iter()
+            .find(|migration| migration.version == CHAT_DELIVERY_INTENT_VERSION)
+            .ok_or_else(|| {
+                MigrationError::Failed("Chat delivery-intent creator is missing".into())
+            })?;
+        if !migration_matches_known_source(chat_migration) {
+            return Err(MigrationError::Failed(
+                "Chat delivery-intent creator is not source-pinned".into(),
+            ));
+        }
+        for table in CHAT_DELIVERY_INTENT_TABLES {
+            if !schema_table_exists(pool, table).await? {
+                if !migration_defines_table(chat_migration, table) {
+                    return Err(MigrationError::Failed(format!(
+                        "pending Chat migration does not create {table}"
+                    )));
+                }
+                for column in CHAT_DELIVERY_INTENT_COLUMNS
+                    .iter()
+                    .filter(|column| column.table == *table)
+                {
+                    if !migration_defines_column(chat_migration, table, column.name) {
+                        return Err(MigrationError::Failed(format!(
+                            "pending Chat migration does not define {table}.{}",
+                            column.name
+                        )));
+                    }
+                }
+                for (index_table, index, columns, unique) in CHAT_DELIVERY_INTENT_INDEXES
+                    .iter()
+                    .filter(|entry| entry.0 == *table)
+                {
+                    if !migration_defines_index(
+                        chat_migration,
+                        index_table,
+                        index,
+                        columns,
+                        *unique,
+                    ) {
+                        return Err(MigrationError::Failed(format!(
+                            "pending Chat migration does not define {table}.{index}"
+                        )));
+                    }
+                }
+            }
+        }
+        complete = false;
+    }
+    Ok(complete)
+}
+
 pub async fn validate_schema_contract(pool: &MySqlPool) -> Result<(), MigrationError> {
     match inspect_monitor_schema_state(pool).await? {
         MonitorSchemaState::Missing => {
@@ -10100,15 +12205,17 @@ pub async fn validate_schema_contract(pool: &MySqlPool) -> Result<(), MigrationE
         validate_indexes(pool, RULE_SET_SNAPSHOT_MANIFEST_INDEXES).await?;
     }
     validate_incremental_projection_archive_schema_contract(pool).await?;
-    validate_cross_city_schema_contract(pool).await?;
+    // Cross-city schema is optional and default-off. Its enabled-only runtime
+    // admission validates creator and proof tables in
+    // `validate_cross_city_runtime_schema`; ordinary service startup never probes it.
     // auth_internal_request_guard 是 Redis-free 网关/Identity 重放与幂等路径的
     // durable 互斥表（迁移 20261001000001）：缺表/缺列/唯一键漂移必须在启动期
     // fail-early，由 session_state_repository 的契约检查统一裁决。
     crate::session_state_repository::validate_auth_internal_request_guard_schema(pool)
         .await
         .map_err(MigrationError::Failed)?;
+    validate_review_runtime_schema(pool).await?;
     validate_indexes(pool, REQUIRED_SCHEMA_INDEXES).await?;
-    validate_indexes(pool, CROSS_CITY_SCHEMA_INDEXES).await?;
     // Archive tables validate over the RESOLVED index contract: post-creator
     // additions (10.D-2 claim-gate support index) are required once recorded
     // and tolerated while their migration is still pending.
@@ -10525,7 +12632,7 @@ async fn schema_columns_match(
             && normalize_column_definition(&column_type)
                 == normalize_column_definition(column.column_type)
             && nullable.eq_ignore_ascii_case(if column.not_null { "NO" } else { "YES" })
-            && default.as_deref() == column.default
+            && column_default_matches(default.as_deref(), column.default)
             && validate_character_metadata(
                 &column_type,
                 charset.as_deref(),
@@ -10593,13 +12700,24 @@ async fn schema_indexes_match(
             })?;
         let actual: Vec<(String, bool, u64, String)> = rows
             .into_iter()
-            .map(|(name, non_unique, position, column)| {
+            .map(|(name, non_unique, position, column, sub_part, expression)| {
                 let non_unique = metadata_count(non_unique, "TrustGraph index uniqueness")? != 0;
+                if sub_part.is_some() || expression.is_some() {
+                    return Err(MigrationError::Failed(format!(
+                        "inspect TrustGraph index {table}: prefix or expression key parts are unsupported"
+                    )));
+                }
                 Ok((
                     metadata_text("INDEX_NAME", &name, table, "<index>")?,
                     non_unique,
                     metadata_count(position, "TrustGraph index position")?,
-                    metadata_text("COLUMN_NAME", &column, table, "<index>")?,
+                    column
+                        .as_deref()
+                        .map(|column| metadata_text("COLUMN_NAME", column, table, "<index>"))
+                        .transpose()?
+                        .ok_or_else(|| MigrationError::Failed(format!(
+                            "inspect TrustGraph index {table}: expression key part has no column"
+                        )))?,
                 ))
             })
             .collect::<Result<_, MigrationError>>()?;
@@ -10689,8 +12807,38 @@ type SchemaColumnMetadataRow = (
     Option<Vec<u8>>,
 );
 type SchemaColumnOrderRow = (Vec<u8>, Vec<u8>);
-type SchemaIndexMetadataRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+type SchemaIndexMetadataRow = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
 type SchemaForeignKeyMetadataRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
+fn normalize_column_default(value: &str) -> String {
+    let mut normalized = normalize_column_definition(value);
+    loop {
+        let wraps_whole_value = normalized.starts_with('(')
+            && normalized.ends_with(')')
+            && matching_parenthesis(&normalized, 0) == Some(normalized.len() - 1);
+        if !wraps_whole_value {
+            return normalized;
+        }
+        normalized = normalized[1..normalized.len() - 1].trim().to_owned();
+    }
+}
+
+fn column_default_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
+    match (actual, expected) {
+        (None, None) => true,
+        (Some(actual), Some(expected)) => {
+            normalize_column_default(actual) == normalize_column_default(expected)
+        }
+        _ => false,
+    }
+}
 
 fn schema_column_contract_matches(
     name: &str,
@@ -10705,7 +12853,7 @@ fn schema_column_contract_matches(
         && normalize_column_definition(column_type)
             == normalize_column_definition(expected.column_type)
         && nullable.eq_ignore_ascii_case(if expected.not_null { "NO" } else { "YES" })
-        && default == expected.default
+        && column_default_matches(default, expected.default)
         && if is_character_type(column_type) {
             charset == expected.charset && collation == expected.collation
         } else {
@@ -10818,7 +12966,7 @@ async fn validate_schema_columns(
             && normalize_column_definition(&column_type)
                 == normalize_column_definition(expected.column_type)
             && nullable.eq_ignore_ascii_case(if expected.not_null { "NO" } else { "YES" })
-            && default.as_deref() == expected.default
+            && column_default_matches(default.as_deref(), expected.default)
             && if is_character_type(&column_type) {
                 charset.as_deref() == expected.charset && collation.as_deref() == expected.collation
             } else {
@@ -11006,6 +13154,17 @@ async fn count(pool: &MySqlPool, statement: &str) -> Result<i64, MigrationError>
 mod tests {
     use super::*;
 
+    fn normalize_schema_source_default_contracts() -> bool {
+        [
+            (Some("unix_timestamp()"), Some("(UNIX_TIMESTAMP())")),
+            (Some("(current_timestamp(6))"), Some("CURRENT_TIMESTAMP(6)")),
+            (Some("CURRENT_TIMESTAMP(6)"), Some("CURRENT_TIMESTAMP(6)")),
+            (None, None),
+        ]
+        .into_iter()
+        .all(|(actual, expected)| column_default_matches(actual, expected))
+    }
+
     /// Partition lease table (multi-tenant redesign Phase 1, default-off): the
     /// additive scheduling-only table consumed exclusively by the partitioned
     /// projector scheduler (20260921000001).
@@ -11024,6 +13183,19 @@ mod tests {
     const CROSS_CITY_RUNTIME_PROOF_VERSION: i64 = 20261001000002;
     const CROSS_CITY_RUNTIME_PROOF_MIGRATION_SQL: &str =
         include_str!("../migrations/20261001000002_cross_city_runtime_proof.sql");
+    const IDENTITY_CREDENTIAL_FENCE_MIGRATION_SQL: &str =
+        include_str!("../migrations/20261003000001_identity_credential_fence.sql");
+    const ASYNC_OPERATION_CORRELATION_MIGRATION_SQL: &str =
+        include_str!("../migrations/20261003000002_operation_audit_correlation.sql");
+    const REVIEW_SCHEMA_REPAIR_MIGRATION_SQL: &str =
+        include_str!("../migrations/20261003000003_review_schema_contract_repair.sql");
+    const LEARN_ASSIGNMENT_CREATOR_VERSION: i64 = 20260705000001;
+    const LEARN_ASSIGNMENT_CREATOR_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260705000001_learn_missing_tables.sql");
+    const CHAT_DELIVERY_INTENT_MIGRATION_SQL: &str =
+        include_str!("../migrations/20261003000004_chat_delivery_intent.sql");
+    const LEARN_SYSTEM_ASSIGNMENT_MIGRATION_SQL: &str =
+        include_str!("../migrations/20261003000005_learn_atomic_intents.sql");
 
     /// Redis-free 运行路径新增的 Rust-owned additive 尾部（均在 cross-city
     /// runtime-proof 之后、必须保持 embedded、绝不被 Java baseline 吸收）：
@@ -12524,6 +14696,378 @@ mod tests {
     }
 
     #[test]
+    fn five_chain_migrations_are_pinned_and_own_only_declared_artifacts() {
+        let expected: [(i64, &str, &str); 5] = [
+            (
+                IDENTITY_CREDENTIAL_FENCE_VERSION,
+                IDENTITY_CREDENTIAL_FENCE_SQL_SHA384,
+                IDENTITY_CREDENTIAL_FENCE_MIGRATION_SQL,
+            ),
+            (
+                ASYNC_OPERATION_CORRELATION_VERSION,
+                ASYNC_OPERATION_CORRELATION_SQL_SHA384,
+                ASYNC_OPERATION_CORRELATION_MIGRATION_SQL,
+            ),
+            (
+                REVIEW_SCHEMA_REPAIR_VERSION,
+                REVIEW_SCHEMA_REPAIR_SQL_SHA384,
+                REVIEW_SCHEMA_REPAIR_MIGRATION_SQL,
+            ),
+            (
+                CHAT_DELIVERY_INTENT_VERSION,
+                CHAT_DELIVERY_INTENT_SQL_SHA384,
+                CHAT_DELIVERY_INTENT_MIGRATION_SQL,
+            ),
+            (
+                LEARN_SYSTEM_ASSIGNMENT_VERSION,
+                LEARN_SYSTEM_ASSIGNMENT_SQL_SHA384,
+                LEARN_SYSTEM_ASSIGNMENT_MIGRATION_SQL,
+            ),
+        ];
+        assert_eq!(REVIEW_SLICE_MIGRATION_VERSIONS.len(), expected.len());
+        for (version, sha384, source) in expected {
+            let migration = MIGRATOR
+                .migrations
+                .iter()
+                .find(|migration| migration.version == version)
+                .unwrap_or_else(|| panic!("migration {version} must remain embedded"));
+            let contract = EXACT_MIGRATION_ARTIFACT_CONTRACTS
+                .iter()
+                .find(|contract| contract.version == version)
+                .unwrap_or_else(|| panic!("migration {version} needs exact artifact contract"));
+            assert_eq!(canonical_sha384_hex(source.as_bytes()), sha384);
+            assert_eq!(canonical_sha384_hex(migration.sql.as_bytes()), sha384);
+            assert_eq!(contract.source_sha384, sha384);
+            assert!(migration_matches_known_source(migration));
+            assert!(exact_migration_artifact_contract(migration).is_some());
+            assert!(!is_java_baseline_era(version));
+            for table in contract.tables {
+                assert!(
+                    migration_defines_table(migration, table),
+                    "{version} must own declared table {table}"
+                );
+            }
+            for (table, column) in contract.columns {
+                assert!(
+                    migration_defines_column(migration, table, column),
+                    "{version} must own declared column {table}.{column}"
+                );
+            }
+            for (table, index, columns, unique) in contract.indexes {
+                assert!(
+                    migration_defines_index(migration, table, index, columns, *unique),
+                    "{version} must own declared index {table}.{index}"
+                );
+            }
+        }
+
+        let identity = MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == IDENTITY_CREDENTIAL_FENCE_VERSION)
+            .unwrap();
+        assert!(EXACT_MIGRATION_ARTIFACT_CONTRACTS
+            .iter()
+            .find(|contract| contract.version == IDENTITY_CREDENTIAL_FENCE_VERSION)
+            .unwrap()
+            .tables
+            .is_empty());
+        assert!(!pending_migration_can_create_table(
+            &HashSet::new(),
+            std::slice::from_ref(identity),
+            "user_local_credential"
+        ));
+        assert!(pending_migration_can_own_column(
+            &HashSet::new(),
+            std::slice::from_ref(identity),
+            "user_local_credential",
+            "credential_version",
+            false
+        ));
+        assert!(!pending_migration_can_own_column(
+            &HashSet::new(),
+            std::slice::from_ref(identity),
+            "user_local_credential",
+            "password_hash",
+            false
+        ));
+
+        let repair = MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == REVIEW_SCHEMA_REPAIR_VERSION)
+            .unwrap();
+        assert!(pending_migration_can_own_index(
+            &HashSet::new(),
+            std::slice::from_ref(repair),
+            "org_scope_operation",
+            "PRIMARY",
+            &["operation_id"],
+            true,
+            false
+        ));
+        assert!(!pending_migration_can_own_index(
+            &HashSet::new(),
+            std::slice::from_ref(repair),
+            "org_scope_operation",
+            "idx_osop_tenant",
+            &["tenant_id", "created_at"],
+            false,
+            false
+        ));
+        assert!(!pending_migration_can_create_table(
+            &HashSet::new(),
+            std::slice::from_ref(repair),
+            "org_scope_operation"
+        ));
+        assert!(REVIEW_SCHEMA_REPAIR_MIGRATION_SQL.contains("INSERT INTO al_message_scope_counter"));
+        assert!(REVIEW_SCHEMA_REPAIR_MIGRATION_SQL
+            .contains("GREATEST(last_sequence, VALUES(last_sequence))"));
+        assert!(
+            !REVIEW_SCHEMA_REPAIR_MIGRATION_SQL.contains("DELETE FROM al_message_scope_counter")
+        );
+
+        let chat = MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == CHAT_DELIVERY_INTENT_VERSION)
+            .unwrap();
+        for table in CHAT_DELIVERY_INTENT_TABLES {
+            assert!(pending_migration_can_create_table(
+                &HashSet::new(),
+                std::slice::from_ref(chat),
+                table
+            ));
+        }
+        let mut chat_recorded = HashSet::new();
+        chat_recorded.insert(CHAT_DELIVERY_INTENT_VERSION);
+        assert!(!pending_migration_can_create_table(
+            &chat_recorded,
+            std::slice::from_ref(chat),
+            CHAT_DELIVERY_INTENT_TABLES[0]
+        ));
+        assert!(!pending_migration_can_own_index(
+            &chat_recorded,
+            std::slice::from_ref(chat),
+            "chat_delivery_intent",
+            "uk_chat_delivery_intent_scope_client",
+            &["scope_key_sha256", "client_msg_id"],
+            true,
+            false
+        ));
+
+        let proof_creator = MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == CROSS_CITY_RUNTIME_PROOF_VERSION)
+            .unwrap();
+        let proof_table = CROSS_CITY_RUNTIME_PROOF_TABLES[0];
+        assert!(pending_migration_can_create_table(
+            &HashSet::new(),
+            std::slice::from_ref(proof_creator),
+            proof_table
+        ));
+        let mut proof_recorded = HashSet::new();
+        proof_recorded.insert(CROSS_CITY_RUNTIME_PROOF_VERSION);
+        assert!(!pending_migration_can_create_table(
+            &proof_recorded,
+            std::slice::from_ref(proof_creator),
+            proof_table
+        ));
+    }
+
+    #[test]
+    fn review_runtime_and_preflight_keep_optional_owners_separate() {
+        let source = include_str!("migration.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source must precede tests");
+        let runtime = production
+            .split("async fn validate_review_runtime_schema")
+            .nth(1)
+            .and_then(|body| body.split("fn review_migration_pending").next())
+            .expect("review runtime validator");
+        assert!(!runtime.contains("LEARN_SYSTEM_ASSIGNMENT"));
+        assert!(!runtime.contains("CHAT_DELIVERY_INTENT"));
+        assert!(!runtime.contains("ORG_SCOPE_OPERATION"));
+        assert!(!runtime.contains("CROSS_CITY"));
+
+        let schema = production
+            .split("pub async fn validate_schema_contract")
+            .nth(1)
+            .and_then(|body| {
+                body.split("async fn validate_decommissionable_snapshot_column_contracts")
+                    .next()
+            })
+            .expect("global schema validator");
+        assert!(!schema.contains("CROSS_CITY_SCHEMA_INDEXES"));
+        assert!(!schema.contains("LEARN_SYSTEM_ASSIGNMENT"));
+        assert!(!schema.contains("CHAT_DELIVERY_INTENT"));
+        assert!(schema.contains("validate_review_runtime_schema(pool).await?"));
+
+        let cross_city = production
+            .split("pub async fn validate_cross_city_runtime_schema")
+            .nth(1)
+            .and_then(|body| {
+                body.split("async fn validate_cross_city_authority_scope_rows")
+                    .next()
+            })
+            .expect("cross-city enabled runtime validator");
+        assert!(cross_city.contains("validate_cross_city_schema_contract(pool).await?"));
+        assert!(cross_city.contains("validate_cross_city_runtime_proof_table_contract"));
+
+        let preflight = production
+            .split("async fn preflight_review_schema_contracts")
+            .nth(1)
+            .and_then(|body| body.split("pub async fn validate_schema_contract").next())
+            .expect("review preflight validator");
+        assert!(preflight.contains("LEARN_SYSTEM_ASSIGNMENT_COLUMNS"));
+        assert!(preflight.contains("CHAT_DELIVERY_INTENT_TABLES"));
+        assert!(preflight.contains("CROSS_CITY_RUNTIME_PROOF_TABLES"));
+        assert!(preflight.contains("preflight_review_table"));
+    }
+
+    #[test]
+    fn learn_system_role_schema_contract_is_explicit_and_non_inferential() {
+        let creator = LEARN_ASSIGNMENT_CREATOR_MIGRATION_SQL;
+        assert!(creator.contains("CREATE TABLE IF NOT EXISTS learn_assignment"));
+        assert!(!creator.contains("system_role"));
+
+        let migration = MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == LEARN_SYSTEM_ASSIGNMENT_VERSION)
+            .expect("Learn marker migration must remain embedded");
+        assert_eq!(
+            canonical_sha384_hex(migration.sql.as_bytes()),
+            LEARN_SYSTEM_ASSIGNMENT_SQL_SHA384
+        );
+        assert!(LEARN_SYSTEM_ASSIGNMENT_MIGRATION_SQL.contains(
+            "system_role VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL DEFAULT NULL"
+        ));
+        assert!(LEARN_SYSTEM_ASSIGNMENT_MIGRATION_SQL.contains(
+            "ADD UNIQUE KEY uk_learn_assignment_course_system_role (course_id, system_role)"
+        ));
+        assert!(!LEARN_SYSTEM_ASSIGNMENT_MIGRATION_SQL.contains("UPDATE learn_assignment"));
+        assert!(!LEARN_SYSTEM_ASSIGNMENT_MIGRATION_SQL.contains("DELETE FROM learn_assignment"));
+        let creator = MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == LEARN_ASSIGNMENT_CREATOR_VERSION)
+            .expect("Learn assignment creator must remain embedded");
+        assert!(pending_migration_can_create_table(
+            &HashSet::new(),
+            std::slice::from_ref(creator),
+            "learn_assignment"
+        ));
+        let mut creator_recorded = HashSet::new();
+        creator_recorded.insert(LEARN_ASSIGNMENT_CREATOR_VERSION);
+        assert!(!pending_migration_can_create_table(
+            &creator_recorded,
+            std::slice::from_ref(creator),
+            "learn_assignment"
+        ));
+        let marker = LEARN_SYSTEM_ASSIGNMENT_COLUMNS[0];
+        assert_eq!(marker.table, "learn_assignment");
+        assert_eq!(marker.name, "system_role");
+        assert_eq!(marker.column_type, "VARCHAR(32)");
+        assert!(!marker.not_null);
+        assert_eq!(marker.default, None);
+        assert_eq!(marker.collation, Some("utf8mb4_bin"));
+        assert_eq!(
+            LEARN_SYSTEM_ASSIGNMENT_INDEXES[0].2,
+            &["course_id", "system_role"]
+        );
+        assert!(LEARN_SYSTEM_ASSIGNMENT_INDEXES[0].3);
+        assert!(column_default_matches(None, None));
+        const { assert!(LEARN_ASSIGNMENT_CREATOR_VERSION < LEARN_SYSTEM_ASSIGNMENT_VERSION) };
+    }
+
+    #[test]
+    fn column_default_normalization_accepts_mysql_expression_parentheses_only() {
+        assert!(column_default_matches(
+            Some("UNIX_TIMESTAMP()"),
+            Some("(UNIX_TIMESTAMP())")
+        ));
+        assert!(column_default_matches(
+            Some("(UNIX_TIMESTAMP())"),
+            Some("UNIX_TIMESTAMP()")
+        ));
+        assert!(column_default_matches(
+            Some("CURRENT_TIMESTAMP(6)"),
+            Some("(CURRENT_TIMESTAMP(6))")
+        ));
+        assert!(column_default_matches(
+            Some("(CURRENT_TIMESTAMP(6))"),
+            Some("CURRENT_TIMESTAMP(6)")
+        ));
+        assert!(column_default_matches(
+            Some("CURRENT_TIMESTAMP(6)"),
+            Some("CURRENT_TIMESTAMP(6)")
+        ));
+        assert!(!column_default_matches(
+            Some("CURRENT_TIMESTAMP(3)"),
+            Some("CURRENT_TIMESTAMP(6)")
+        ));
+        assert!(!column_default_matches(Some("0"), Some("UNIX_TIMESTAMP()")));
+        assert!(normalize_schema_source_default_contracts());
+    }
+
+    #[test]
+    fn review_preflight_and_destructive_gate_precede_history_writes_and_sqlx() {
+        let source = include_str!("migration.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source must precede tests");
+        let apply = production
+            .split("pub async fn apply_migrations(database_url")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub async fn connect_and_validate_schema")
+                    .next()
+            })
+            .expect("migration apply body");
+        let standby = apply
+            .find("preflight_standby_migration_gate(&pool, &HashSet::new()")
+            .expect("initial standby source/auth gate must run");
+        let history_ddl = apply
+            .find("CREATE TABLE IF NOT EXISTS _sqlx_migrations")
+            .expect("migration history DDL");
+        assert!(standby < history_ddl);
+        let baseline_adoption = apply
+            .find("preflight_before_baseline_adoption(&pool).await?")
+            .expect("baseline preflight");
+        let record_baseline = apply
+            .find("record_verified_baseline(&pool, &recorded_versions).await?")
+            .expect("baseline adoption");
+        let sqlx_run = apply
+            .find("apply_migrations_with_mysql8_compat(&pool).await?")
+            .expect("SQLx migration run");
+        assert!(history_ddl < baseline_adoption && baseline_adoption < record_baseline);
+        assert!(record_baseline < sqlx_run);
+        assert_eq!(
+            DESTRUCTIVE_MIGRATION_ALLOWLIST_ENV,
+            "ASTRAL_DESTRUCTIVE_MIGRATION_ALLOWLIST"
+        );
+        assert_eq!(
+            DESTRUCTIVE_MIGRATION_BACKUP_PROOF_ENV,
+            "ASTRAL_DESTRUCTIVE_MIGRATION_BACKUP_PROOF_ID"
+        );
+        assert_eq!(
+            DESTRUCTIVE_MIGRATION_DRAIN_PROOF_ENV,
+            "ASTRAL_DESTRUCTIVE_MIGRATION_DRAIN_PROOF_ID"
+        );
+        assert_eq!(
+            DESTRUCTIVE_MIGRATION_CUTOVER_PROOF_ENV,
+            "ASTRAL_DESTRUCTIVE_MIGRATION_CUTOVER_PROOF_ID"
+        );
+        assert!(DESTRUCTIVE_MIGRATION_DRAIN_SQL.contains("status = 'PENDING'"));
+        assert!(DESTRUCTIVE_MIGRATION_DRAIN_SQL.contains("aggregate_type IN ('CARD', 'RULE_SET')"));
+    }
+
+    #[test]
     fn empty_history_adopts_only_with_verified_baseline() {
         let empty = HashSet::new();
 
@@ -12593,6 +15137,9 @@ mod tests {
             !recorded.contains(&latest),
             "post-baseline migration {latest} must not be adopted"
         );
+        for version in REVIEW_SLICE_MIGRATION_VERSIONS {
+            assert!(!recorded.contains(version));
+        }
 
         assert_eq!(
             classify_migration_history(&recorded),
@@ -12682,8 +15229,8 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .max(),
-            Some(RUNTIME_REDIS_FREE_TAIL_VERSION),
-            "the invalidation scope sequence migration is the current chain tail"
+            Some(LEARN_SYSTEM_ASSIGNMENT_VERSION),
+            "the Learn system-assignment migration is the current chain tail"
         );
         assert!(!is_java_baseline_era(CROSS_CITY_RUNTIME_PROOF_VERSION));
         assert!(!is_java_baseline_era(RUNTIME_REDIS_FREE_TAIL_VERSION));

@@ -53,6 +53,20 @@ pub struct AuditQuery {
     pub size: Option<i64>,
 }
 
+impl AuditQuery {
+    fn normalize(
+        &self,
+    ) -> Result<crate::repository::audit_log_repository::AuditLogFilter, AppError> {
+        crate::repository::audit_log_repository::AuditLogFilter::new(
+            self.user_id,
+            self.action.as_deref(),
+            self.from.as_deref(),
+            self.to.as_deref(),
+        )
+        .map_err(AppError::from)
+    }
+}
+
 pub fn audit_routes() -> Router<AppState> {
     Router::new()
         .route("/audit/logs", get(list_audit_logs))
@@ -64,19 +78,24 @@ async fn list_audit_logs(
     Query(query): Query<AuditQuery>,
     Query(page): Query<PaginationParams>,
 ) -> Result<Json<ApiResponse<PageResponse<AuditEntry>>>, AppError> {
-    let size = query.size.unwrap_or(page.effective_size()).min(1000);
-    let offset = (query.page.unwrap_or(page.page).max(1) - 1) * size;
+    let size = query.size.unwrap_or(page.effective_size()).clamp(1, 1000);
+    let current_page = query.page.unwrap_or(page.page).max(1);
+    let offset = current_page.saturating_sub(1).saturating_mul(size);
+    let filter = query.normalize()?;
 
-    let total = state.audit_log_repository.count_logs().await?;
+    let total = state.audit_log_repository.count_logs(&filter).await?;
     let rows = state
         .audit_log_repository
-        .list_logs(size, offset)
+        .list_logs(&filter, size, offset)
         .await?
         .into_iter()
         .map(AuditEntry::from)
         .collect();
     Ok(Json(ApiResponse::success(PageResponse::new(
-        rows, total, page.page, size,
+        rows,
+        total,
+        current_page,
+        size,
     ))))
 }
 
@@ -99,6 +118,6 @@ async fn audit_stats(
         allowed: s.allowed,
         denied: s.denied,
         unique_users: s.unique_users,
-        top_resources: vec![],
+        top_resources: s.top_resources,
     })))
 }

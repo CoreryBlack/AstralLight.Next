@@ -10,15 +10,16 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use astral_common::config::MessageTransport;
 use astral_common::contract::ApiResponse;
 use astral_common::error::AppError;
-use astral_db::{request_replay, AuditQuarantineMetadata, AuditQuarantineStatus, MAX_LIST_LIMIT};
+use astral_db::{
+    request_replay_with_context, AuditQuarantineMetadata, AuditQuarantineStatus,
+    ReplayAuditContext, MAX_CANONICAL_REQUEST_ID_LENGTH, MAX_LIST_LIMIT,
+};
 use astral_types::AstralError;
 
 use crate::api::require_platform_admin;
-use crate::repository::audit_log_repository::{
-    insert_approval_audit_in_tx, ApprovalAuditContext, ApprovalAuditEntry,
-};
 use crate::AppState;
 
 const SOURCE_QUEUE: &str = "astral.audit.log";
@@ -26,7 +27,7 @@ const SOURCE_EXCHANGE: &str = "astral.direct";
 const SOURCE_ROUTING_KEY: &str = "audit.log";
 const MESSAGE_TYPE: &str = "AUDIT_LOG";
 const DEFAULT_LIMIT: u32 = 20;
-const MAX_OPERATION_ID_LENGTH: usize = 128;
+const MAX_OPERATION_ID_LENGTH: usize = astral_db::MAX_OPERATION_ID_LENGTH;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -169,6 +170,15 @@ async fn request_quarantine_replay(
     if id <= 0 {
         return Err(validation_error("quarantine id must be positive"));
     }
+    let transport = state
+        .config
+        .message_transport()
+        .map_err(|error| AppError(AstralError::Config(error.to_string())))?;
+    if !replay_transport_supported(transport) {
+        return Err(AppError(AstralError::NotImplemented(
+            "audit quarantine replay is unsupported with local message transport; no replay worker can drain requests".into(),
+        )));
+    }
 
     let metadata = astral_db::get_quarantine_metadata_by_id(&state.db, id)
         .await
@@ -181,21 +191,45 @@ async fn request_quarantine_replay(
     validate_replay_route(&metadata)?;
 
     let operation_id = resolve_operation_id(&headers)?;
-    let was_already_requested = metadata.status == AuditQuarantineStatus::ReplayRequested;
-    let accepted = request_replay(&state.db, id, &operation_id, &operator_id.to_string())
-        .await
-        .map_err(database_error)?;
+    let actor_card_id = headers
+        .get("x-user-card-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            AppError(AstralError::Auth(
+                "verified user-card context required".into(),
+            ))
+        })?;
+    let tenant_id = headers
+        .get("x-user-card-tenant-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| AppError(AstralError::Auth("verified tenant context required".into())))?;
+    let domain_id = headers
+        .get("x-user-card-domain-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| AppError(AstralError::Auth("verified domain context required".into())))?;
+    let accepted = request_replay_with_context(
+        &state.db,
+        id,
+        &operation_id,
+        &operator_id.to_string(),
+        ReplayAuditContext {
+            actor_card_id: Some(actor_card_id),
+            tenant_id: Some(tenant_id),
+            domain_id: Some(domain_id),
+        },
+    )
+    .await
+    .map_err(database_error)?;
     if !accepted {
         return Err(AppError(AstralError::Validation(
-            "audit quarantine replay is not requestable in its current state".into(),
+            "audit quarantine replay is not requestable in its current state or its request identity conflicts".into(),
         )));
-    }
-
-    // The existing approval audit helper is the durable operator-audit path. It
-    // is intentionally called only for the first transition; an idempotent
-    // retry must not create a second audit record.
-    if !was_already_requested {
-        record_operator_audit(&state, id, operator_id, &operation_id).await?;
     }
 
     let item = astral_db::get_quarantine_metadata_by_id(&state.db, id)
@@ -214,37 +248,8 @@ async fn request_quarantine_replay(
     })))
 }
 
-async fn record_operator_audit(
-    state: &AppState,
-    quarantine_id: i64,
-    operator_id: i64,
-    operation_id: &str,
-) -> Result<(), AppError> {
-    let mut transaction = state
-        .db
-        .begin()
-        .await
-        .map_err(|error| database_error(astral_db::DbError::from(error)))?;
-    let context = ApprovalAuditContext::new(Some(operation_id), quarantine_id);
-    let entry = ApprovalAuditEntry {
-        actor_id: operator_id,
-        reviewer_id: Some(operator_id),
-        target_user_id: operator_id,
-        target_card_id: None,
-        action: "request_replay",
-        decision: "REQUESTED",
-        request_reason: Some("audit quarantine replay requested"),
-        reviewer_comment: None,
-        context: &context,
-    };
-    insert_approval_audit_in_tx(&mut transaction, &entry)
-        .await
-        .map_err(AppError::from)?;
-    transaction
-        .commit()
-        .await
-        .map_err(|error| database_error(astral_db::DbError::from(error)))?;
-    Ok(())
+fn replay_transport_supported(transport: MessageTransport) -> bool {
+    matches!(transport, MessageTransport::Rabbit)
 }
 
 fn normalize_status(value: Option<&str>) -> Result<&'static str, AppError> {
@@ -287,7 +292,8 @@ fn resolve_operation_id(headers: &HeaderMap) -> Result<String, AppError> {
         .map(str::to_owned)
         .unwrap_or_else(|| format!("audit-replay-{}", uuid::Uuid::new_v4()));
 
-    if candidate.len() > MAX_OPERATION_ID_LENGTH
+    if request_id.is_some_and(|value| value.len() > MAX_CANONICAL_REQUEST_ID_LENGTH)
+        || candidate.len() > MAX_OPERATION_ID_LENGTH
         || candidate.contains('\0')
         || !candidate
             .bytes()
@@ -351,6 +357,31 @@ mod tests {
         assert!(validate_paging(1, 0).is_ok());
         assert!(validate_paging(0, 0).is_err());
         assert!(validate_paging(MAX_LIST_LIMIT + 1, 0).is_err());
+    }
+
+    #[test]
+    fn request_ids_fit_the_canonical_audit_column() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-request-id",
+            "a".repeat(MAX_CANONICAL_REQUEST_ID_LENGTH).parse().unwrap(),
+        );
+        assert!(resolve_operation_id(&headers).is_ok());
+        headers.insert(
+            "x-request-id",
+            "a".repeat(MAX_CANONICAL_REQUEST_ID_LENGTH + 1)
+                .parse()
+                .unwrap(),
+        );
+        assert!(resolve_operation_id(&headers).is_err());
+        headers.insert("x-request-id", "unsafe request".parse().unwrap());
+        assert!(resolve_operation_id(&headers).is_err());
+    }
+
+    #[test]
+    fn local_transport_replay_refusal_has_no_durable_request() {
+        assert!(!replay_transport_supported(MessageTransport::Local));
+        assert!(replay_transport_supported(MessageTransport::Rabbit));
     }
 
     #[test]

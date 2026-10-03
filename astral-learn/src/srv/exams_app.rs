@@ -19,6 +19,7 @@ use astral_common::error::AppError;
 #[serde(rename_all = "camelCase")]
 pub struct SubmitExamReq {
     pub user_id: i64,
+    #[serde(default)]
     pub answers: Option<serde_json::Value>,
 }
 
@@ -30,29 +31,16 @@ pub fn exam_app_routes() -> Router<AppState> {
 
 async fn submit_exam_app(
     headers: HeaderMap,
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
+    State(_state): State<AppState>,
+    Path(_id): Path<i64>,
     Json(req): Json<SubmitExamReq>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_same_user(authenticated_user_id(&headers)?, req.user_id)?;
-
-    if !state.exam_service.exists(id).await? {
-        return Err(astral_types::AstralError::Validation("Exam not found".into()).into());
-    }
-
-    let score = req
-        .answers
-        .as_ref()
-        .and_then(|a| a.get("score"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0) as i32;
-
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "examId": id,
-        "userId": req.user_id,
-        "score": score,
-        "status": "SUBMITTED",
-    }))))
+    let _answers = req.answers;
+    Err(astral_types::AstralError::NotImplemented(
+        "Exam submissions require a durable server-scored result model".into(),
+    )
+    .into())
 }
 
 async fn get_exam_result(

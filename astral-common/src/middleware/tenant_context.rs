@@ -1,7 +1,8 @@
 //! 租户上下文中间件
 //!
-//! 自动将 `x-identity-tenant-id` / `x-identity-domain-id` 请求头注入 SQLx 查询上下文。
-//! 配合 `DataScopeRuleProvider` 使用，实现自动化的租户数据隔离。
+//! 将签名 Gateway 注入的 user-card tenant/domain 事实注入请求扩展，供显式
+//! query builders 使用。此中间件本身不修改 SQL，也不代表 `DataScopeRuleProvider`
+//! 会自动施加数据范围规则；任何缺失 tenant 的 SQL 过滤构造都返回零行谓词。
 //!
 //! # 使用方式
 //!
@@ -9,13 +10,10 @@
 //! 应用层在构建查询时调用 `build_tenant_where()` 自动拼接参数化 WHERE 条件。
 //!
 //! ```
-//! use astral_common::middleware::tenant_context::{
-//!     build_tenant_where, TenantContext,
-//! };
+//! use astral_common::middleware::tenant_context::{build_tenant_where, TenantContext};
 //! use axum::body::Body;
 //! use axum::http::Request;
 //!
-//! // 从请求中提取租户上下文
 //! let mut req = Request::new(Body::empty());
 //! req.headers_mut().insert(
 //!     "x-user-card-tenant-id",
@@ -26,13 +24,9 @@
 //!     "10".parse().expect("valid header value"),
 //! );
 //! let ctx = TenantContext::from_headers(req.headers());
-//!
-//! // 注入到请求 extension，供下游处理器读取
 //! req.extensions_mut().insert(ctx.clone());
-//!
-//! // 在查询时自动追加参数化过滤
-//! let (filter, params) = build_tenant_where("", ctx.tenant_id, ctx.domain_id);
-//! assert_eq!(filter, "AND tenant_id = ? AND domain_id = ?");
+//! let (filter, params) = build_tenant_where("t", ctx.tenant_id, ctx.domain_id);
+//! assert_eq!(filter, "AND t.tenant_id = ? AND t.domain_id = ?");
 //! assert_eq!(params, vec![42, 10]);
 //! ```
 
@@ -94,23 +88,24 @@ impl TenantContext {
             .unwrap_or(true)
     }
 
-    /// 将租户上下文转换为 SQL WHERE 子句片段
+    /// 将租户上下文转换为 fail-closed SQL WHERE 子句片段。
     ///
-    /// 返回形如 `"AND tenant_id = 42 AND domain_id = 10"` 的 SQL 片段。
-    /// 如果没有任何过滤条件，返回空字符串。
+    /// 返回形如 `AND tenant_id = 42 AND domain_id = 10` 的 SQL 片段。缺失租户时
+    /// 总是返回 `AND 1 = 0`，即使存在 domain/user 字段也不允许扩大到跨租户
+    /// 查询。此片段不是通用 SQL 重写器；若基础谓词含 `OR`，调用方必须显式
+    /// 括起它，或改用受限 [`TenantScopedQuery`](crate::middleware::tenant_filter::TenantScopedQuery)。
     pub fn to_sql_filter(&self) -> String {
-        let mut clauses: Vec<String> = Vec::new();
-        if let Some(tid) = self.tenant_id {
-            clauses.push(format!("tenant_id = {tid}"));
+        let Some(tenant_id) = self.tenant_id.filter(|value| *value > 0) else {
+            return "AND 1 = 0".into();
+        };
+        let mut clauses = vec![format!("tenant_id = {tenant_id}")];
+        if let Some(domain_id) = self.domain_id {
+            if domain_id <= 0 {
+                return "AND 1 = 0".into();
+            }
+            clauses.push(format!("domain_id = {domain_id}"));
         }
-        if let Some(did) = self.domain_id {
-            clauses.push(format!("domain_id = {did}"));
-        }
-        if clauses.is_empty() {
-            String::new()
-        } else {
-            format!("AND {}", clauses.join(" AND "))
-        }
+        format!("AND {}", clauses.join(" AND "))
     }
 }
 
@@ -124,13 +119,11 @@ pub async fn tenant_context_middleware(mut req: Request, next: Next) -> Response
     next.run(req).await
 }
 
-/// 从请求扩展中读取租户上下文
+/// Extract tenant context from request extensions.
 ///
-/// # 参数
-/// * `req` - axum 请求引用
-///
-/// # 返回
-/// 如果扩展中不存在 TenantContext，返回默认空上下文
+/// This returns an empty context if middleware did not install one. Query builders
+/// must treat that absence as unscoped and fail closed; this helper does not
+/// establish or apply SQL scope by itself.
 pub fn extract_tenant_context(req: &Request) -> TenantContext {
     req.extensions()
         .get::<TenantContext>()
@@ -141,13 +134,14 @@ pub fn extract_tenant_context(req: &Request) -> TenantContext {
 /// 根据租户上下文和表别名，生成参数化 SQL WHERE 片段
 ///
 /// # 参数
-/// * `table_alias` - 表别名（如 `"t"`、`"m"`），空字符串表示无别名
-/// * `tenant_id` - 可选的租户 ID，None 时不生成 tenant 过滤
-/// * `domain_id` - 可选的域 ID，None 时不生成 domain 过滤
+/// * `table_alias` - simple identifier for a table alias; empty means unqualified
+/// * `tenant_id` - positive tenant ID; missing or invalid values fail closed
+/// * `domain_id` - optional positive domain ID
 ///
-/// # 返回
-/// `(where_clause, params)` 元组，where_clause 形如 `"AND t.tenant_id = ? AND t.domain_id = ?"`
-/// params 为对应的参数值列表
+/// # Return
+/// `(where_clause, params)`. Missing tenant, invalid ID, or invalid alias returns
+/// `AND 1 = 0` with no parameters. This helper is not an arbitrary SQL parser; if
+/// you append it to a base query containing `OR`, parenthesize that query first.
 pub fn build_tenant_where(
     table_alias: &str,
     tenant_id: Option<i64>,
@@ -161,21 +155,29 @@ pub fn build_tenant_where(
 
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<i64> = Vec::new();
+    let alias_valid = table_alias.is_empty()
+        || (table_alias
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && table_alias
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'));
 
-    if let Some(tid) = tenant_id {
-        clauses.push(format!("{prefix}tenant_id = ?"));
-        params.push(tid);
+    let Some(tenant_id) = tenant_id.filter(|value| *value > 0) else {
+        return ("AND 1 = 0".into(), params);
+    };
+    if domain_id.is_some_and(|value| value <= 0) || !alias_valid {
+        return ("AND 1 = 0".into(), params);
     }
-    if let Some(did) = domain_id {
+    clauses.push(format!("{prefix}tenant_id = ?"));
+    params.push(tenant_id);
+    if let Some(domain_id) = domain_id {
         clauses.push(format!("{prefix}domain_id = ?"));
-        params.push(did);
+        params.push(domain_id);
     }
 
-    if clauses.is_empty() {
-        (String::new(), params)
-    } else {
-        (format!("AND {}", clauses.join(" AND ")), params)
-    }
+    (format!("AND {}", clauses.join(" AND ")), params)
 }
 
 #[cfg(test)]
@@ -228,9 +230,9 @@ mod tests {
     }
 
     #[test]
-    fn test_to_sql_filter_empty() {
+    fn test_to_sql_filter_missing_tenant_fails_closed() {
         let ctx = TenantContext::default();
-        assert_eq!(ctx.to_sql_filter(), "");
+        assert_eq!(ctx.to_sql_filter(), "AND 1 = 0");
     }
 
     #[test]
@@ -263,9 +265,21 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tenant_where_empty() {
+    fn test_build_tenant_where_missing_tenant_fails_closed() {
         let (clause, params) = build_tenant_where("", None, None);
-        assert_eq!(clause, "");
+        assert_eq!(clause, "AND 1 = 0");
         assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_build_tenant_where_rejects_invalid_alias_and_scope() {
+        assert_eq!(
+            build_tenant_where("t; DROP", Some(42), None),
+            ("AND 1 = 0".into(), vec![])
+        );
+        assert_eq!(
+            build_tenant_where("t", Some(42), Some(0)),
+            ("AND 1 = 0".into(), vec![])
+        );
     }
 }

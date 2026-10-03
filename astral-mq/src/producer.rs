@@ -710,6 +710,61 @@ impl Producer {
             .await
     }
 
+    /// Publish with an explicit transport identity. This convenience method
+    /// generates a new timestamp; durable retries must use `publish_committed_chat_message`.
+    pub async fn publish_chat_message_with_message_id(
+        &self,
+        payload: ChatMessagePayload,
+        message_id: &str,
+    ) -> Result<(), MqError> {
+        if message_id.is_empty()
+            || message_id.len() > u8::MAX as usize
+            || message_id.trim() != message_id
+            || message_id.chars().any(char::is_control)
+        {
+            return Err(MqError::Publish("invalid stable Chat message id".into()));
+        }
+        self.publish_to_queue_with_message_id(
+            crate::config::QUEUE_CHAT_MESSAGE,
+            "chat.message",
+            Some(message_id.to_owned()),
+            Some(message_id.to_owned()),
+            payload,
+        )
+        .await
+    }
+
+    /// Publish the exact persisted Chat message, including its original timestamp.
+    /// Confirmation proves broker admission, not recipient delivery.
+    pub async fn publish_committed_chat_message(
+        &self,
+        message: &MqMessage<ChatMessagePayload>,
+    ) -> Result<(), MqError> {
+        if message.message_id.is_empty()
+            || message.message_id.len() > u8::MAX as usize
+            || message.message_id.trim() != message.message_id
+            || message.message_id.chars().any(char::is_control)
+            || message.timestamp.len() > 64
+            || time::OffsetDateTime::parse(
+                &message.timestamp,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .is_err()
+        {
+            return Err(MqError::Publish(
+                "invalid committed Chat message identity".into(),
+            ));
+        }
+        self.publish_with_queue_name(
+            crate::config::QUEUE_CHAT_MESSAGE,
+            crate::config::EXCHANGE_DIRECT,
+            "chat.message",
+            message,
+            &message.message_id,
+        )
+        .await
+    }
+
     /// 发布学习进度更新
     pub async fn publish_learning_progress(
         &self,
@@ -1121,6 +1176,100 @@ mod tests {
         let decoded: MqMessage<ChatMessagePayload> = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.message_id, "msg-chat-42");
         assert_eq!(decoded.payload, chat_payload());
+    }
+
+    #[tokio::test]
+    async fn stable_chat_message_id_rejects_invalid_ids_before_transport() {
+        let bus = LocalBus::new(LocalBusLimits::default()).unwrap();
+        let producer = Producer::new_local(bus, "local");
+        for message_id in [
+            "".to_owned(),
+            " ".into(),
+            " id".into(),
+            "id ".into(),
+            "id\n".into(),
+            "x".repeat(256),
+        ] {
+            let error = producer
+                .publish_chat_message_with_message_id(chat_payload(), &message_id)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, MqError::Publish(reason) if reason == "invalid stable Chat message id")
+            );
+        }
+    }
+
+    #[test]
+    fn stable_chat_publisher_preserves_envelope_and_amqp_message_id() {
+        let source = include_str!("producer.rs");
+        let stable = source
+            .split("pub async fn publish_chat_message_with_message_id(")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn publish_learning_progress(")
+            .next()
+            .unwrap();
+        assert!(stable.contains("Some(message_id.to_owned())"));
+        assert!(!stable.contains("Uuid::new_v4"));
+        assert!(stable.contains("crate::config::QUEUE_CHAT_MESSAGE"));
+        assert!(stable.contains("\"chat.message\""));
+        let rabbit = source
+            .split("let properties = BasicProperties::default()")
+            .nth(1)
+            .unwrap()
+            .split("// ===== 类型化便捷方法 =====")
+            .next()
+            .unwrap();
+        assert!(rabbit.contains(".with_message_id(message.message_id.as_str().into())"));
+        assert!(rabbit.contains("Confirmation::Ack(None)"));
+        assert!(rabbit.contains("mandatory: true"));
+    }
+
+    #[test]
+    fn committed_chat_wire_digest_is_stable_across_durable_round_trips() {
+        let message = MqMessage {
+            message_id: "committed-chat-message".into(),
+            timestamp: "2026-10-03T00:00:00Z".into(),
+            payload: chat_payload(),
+        };
+        let bytes = serde_json::to_vec(&message).unwrap();
+        let reloaded: MqMessage<ChatMessagePayload> = serde_json::from_slice(&bytes).unwrap();
+        let replayed = serde_json::to_vec(&reloaded).unwrap();
+        assert_eq!(bytes, replayed);
+        assert_eq!(Sha256::digest(&bytes), Sha256::digest(&replayed));
+        let source = include_str!("producer.rs");
+        let committed = source
+            .split("pub async fn publish_committed_chat_message(")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn publish_learning_progress(")
+            .next()
+            .unwrap();
+        assert!(!committed.contains("now_timestamp"));
+        assert!(!committed.contains("Uuid::new_v4"));
+        assert!(committed.contains("message,"));
+        assert!(committed.contains("&message.message_id"));
+    }
+
+    #[tokio::test]
+    async fn committed_chat_message_refuses_unproven_timestamp_before_transport() {
+        let producer =
+            Producer::new_local(LocalBus::new(LocalBusLimits::default()).unwrap(), "local");
+        for timestamp in ["", "not-a-time"] {
+            let message = MqMessage {
+                message_id: "committed-chat-message".into(),
+                timestamp: timestamp.into(),
+                payload: chat_payload(),
+            };
+            let error = producer
+                .publish_committed_chat_message(&message)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, MqError::Publish(reason) if reason == "invalid committed Chat message identity")
+            );
+        }
     }
 
     #[test]

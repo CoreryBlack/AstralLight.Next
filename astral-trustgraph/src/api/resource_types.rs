@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use astral_common::contract::{ApiResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
-use astral_types::{AstralError, ResourceRegistry};
+use astral_types::{AstralError, CustomResourceRegistration, ResourceRegistry};
 
 use crate::api::async_tracker::AsyncTask;
 use crate::api::require_platform_admin;
@@ -138,7 +138,12 @@ async fn register_resource_type(
     }
 
     let reg = ResourceRegistry::global();
-    // 已存在则幂等返回
+    reg.validate_custom_resources([CustomResourceRegistration {
+        resource_type: req.resource_type.clone(),
+        actions: req.actions.clone(),
+    }])
+    .map_err(|error| AppError(AstralError::Validation(error.to_string())))?;
+    // 已存在则拒绝覆盖（包括任何 built-in resource）。
     if reg.list_actions(&req.resource_type).is_some() {
         return Err(AppError(AstralError::Validation(format!(
             "resource_type '{}' already registered",
@@ -146,21 +151,29 @@ async fn register_resource_type(
         ))));
     }
 
-    // 持久化（INSERT IGNORE 幂等）
+    // Persist first; only publish the validated action set after durable success.
     let actions_json = serde_json::to_string(&req.actions)
         .map_err(|e| AppError(AstralError::Internal(format!("serialize actions: {e}"))))?;
     state
         .resource_type_repository
-        .insert_ignore_registry(
+        .insert_registry(
             &req.resource_type,
             &actions_json,
             req.description.as_deref(),
         )
         .await?;
+    reg.register_custom_resources([CustomResourceRegistration {
+        resource_type: req.resource_type.clone(),
+        actions: req.actions.clone(),
+    }])
+    .map_err(|error| {
+        tracing::error!(resource_type = %req.resource_type, %error, "persisted resource registry update requires restart to reconcile");
+        AppError(AstralError::Internal(
+            "resource registry changed durably but runtime registration failed; restart required".into(),
+        ))
+    })?;
 
-    // 注意：ResourceRegistry 当前未暴露运行时 register API，仅启动期注册。
-    // 此处记录持久化，重启后由启动期同步逻辑加载（对齐 Java ResourceRegistry.reload）。
-    tracing::info!(resource_type = %req.resource_type, "resource type registered (persisted)");
+    tracing::info!(resource_type = %req.resource_type, "resource type registered");
 
     let mut sorted_actions = req.actions.clone();
     sorted_actions.sort();
@@ -179,6 +192,14 @@ async fn update_resource_type(
     Json(req): Json<UpdateResourceTypeRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_platform_admin(&state, &headers).await?;
+    let registry = ResourceRegistry::global();
+    let registrations = CustomResourceRegistration {
+        resource_type: resource_type.clone(),
+        actions: req.actions.clone(),
+    };
+    registry
+        .validate_custom_resource_update(registrations)
+        .map_err(|error| AppError(AstralError::Validation(error.to_string())))?;
     let actions_json = serde_json::to_string(&req.actions)
         .map_err(|e| AppError(AstralError::Internal(format!("serialize actions: {e}"))))?;
 
@@ -191,6 +212,17 @@ async fn update_resource_type(
             "resource_type '{resource_type}'"
         ))));
     }
+    registry
+        .replace_custom_resource_actions(astral_types::CustomResourceRegistration {
+            resource_type: resource_type.clone(),
+            actions: req.actions.clone(),
+        })
+        .map_err(|error| {
+            tracing::error!(resource_type = %resource_type, %error, "persisted resource registry update requires restart to reconcile");
+            AppError(AstralError::Internal(
+                "resource registry changed durably but runtime registration failed; restart required".into(),
+            ))
+        })?;
 
     tracing::info!(resource_type = %resource_type, "resource type updated");
     Ok(Json(ApiResponse::success(serde_json::json!({
@@ -206,6 +238,12 @@ async fn unregister_resource_type(
     Path(resource_type): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_platform_admin(&state, &headers).await?;
+    let current_registry = ResourceRegistry::global();
+    if current_registry.is_builtin_resource(&resource_type) {
+        return Err(AppError(AstralError::Validation(
+            "built-in resource types cannot be unregistered".into(),
+        )));
+    }
     let deleted = state
         .resource_type_repository
         .delete_registry(&resource_type)
@@ -215,6 +253,14 @@ async fn unregister_resource_type(
             "resource_type '{resource_type}'"
         ))));
     }
+    current_registry
+        .unregister_custom_resource(&resource_type)
+        .map_err(|error| {
+            tracing::error!(resource_type = %resource_type, %error, "persisted resource registry delete requires restart to reconcile");
+            AppError(AstralError::Internal(
+                "resource registry changed durably but runtime unregistration failed; restart required".into(),
+            ))
+        })?;
 
     tracing::warn!(resource_type = %resource_type, "resource type unregistered");
     Ok(Json(ApiResponse::success(serde_json::json!({

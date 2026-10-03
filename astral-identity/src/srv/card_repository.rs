@@ -605,6 +605,8 @@ impl CardRepository for SqlxCardRepository {
         .await
         .map_err(|e| AstralError::Database(format!("Lock user_card failed: {e}")))?;
         let locked = locked.ok_or_else(|| AstralError::NotFound("user card not found".into()))?;
+        let _owner_user_id =
+            require_actor_owned_active_card(&locked, actor_id, card_id, "status mutation")?;
 
         let exits_active =
             classify_card_status_exits_active(&locked.card_status, &requested_status);
@@ -728,6 +730,8 @@ impl CardRepository for SqlxCardRepository {
         .await
         .map_err(|e| AstralError::Database(format!("Lock user_card failed: {e}")))?;
         let locked = locked.ok_or_else(|| AstralError::NotFound("user card not found".into()))?;
+        let owner_user_id =
+            require_actor_owned_active_card(&locked, actor_id, card_id, "template mutation")?;
         if locked.tenant_id != tenant_id || locked.domain_id != domain_id {
             return Err(AstralError::Permission(
                 "Card scope changes are not allowed from self-service".into(),
@@ -738,11 +742,6 @@ impl CardRepository for SqlxCardRepository {
                 "self-service card template changes require an ACTIVE card".into(),
             ));
         }
-        let owner_user_id = locked.user_id.filter(|id| *id > 0).ok_or_else(|| {
-            AstralError::Validation(format!(
-                "user card {card_id} has no usable owner user id; refusing to mutate template bindings without a provable owner"
-            ))
-        })?;
         let card_tenant_id = locked.tenant_id.filter(|id| *id > 0).ok_or_else(|| {
             AstralError::Validation(format!(
                 "user card {card_id} has a NULL/non-positive tenant_id; refusing to mutate template bindings without a tenant scope"
@@ -1124,6 +1123,32 @@ impl CardRepository for SqlxCardRepository {
             .map_err(|e| AstralError::Database(format!("Commit card update tx failed: {e}")))?;
         Ok(())
     }
+}
+
+/// Require a locked card row to remain owned by the authenticated actor and ACTIVE.
+/// All mutation paths call this only after selecting the row `FOR UPDATE`.
+fn require_actor_owned_active_card(
+    locked: &LockedCardRow,
+    actor_id: i64,
+    card_id: i64,
+    operation: &str,
+) -> Result<i64, AstralError> {
+    if locked.card_status != "ACTIVE" {
+        return Err(AstralError::Permission(format!(
+            "{operation} requires an ACTIVE user card"
+        )));
+    }
+    let owner_user_id = locked.user_id.filter(|id| *id > 0).ok_or_else(|| {
+        AstralError::Validation(format!(
+            "user card {card_id} has no usable owner user id; refusing mutation without a provable owner"
+        ))
+    })?;
+    if owner_user_id != actor_id {
+        return Err(AstralError::Permission(format!(
+            "Card ownership denied for {operation}"
+        )));
+    }
+    Ok(owner_user_id)
 }
 
 /// 事务内锁定的用户卡身份事实（全部字段来自锁定行，不信任请求旧读）。
@@ -2310,6 +2335,67 @@ fn settle_card_commit_fence(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn self_service_mutations_require_locked_active_owner() {
+        let active = super::LockedCardRow {
+            card_status: "ACTIVE".into(),
+            user_id: Some(7),
+            tenant_id: Some(3),
+            domain_id: Some(4),
+            template_id: Some(2),
+        };
+        assert_eq!(
+            super::require_actor_owned_active_card(&active, 7, 11, "template mutation")
+                .expect("matching actor must retain access"),
+            7
+        );
+        assert!(
+            super::require_actor_owned_active_card(&active, 8, 11, "template mutation").is_err()
+        );
+
+        let inactive = super::LockedCardRow {
+            card_status: "SUSPENDED".into(),
+            ..active.clone()
+        };
+        assert!(
+            super::require_actor_owned_active_card(&inactive, 7, 11, "template mutation").is_err()
+        );
+    }
+
+    #[test]
+    fn owner_guard_follows_the_locked_row_in_each_self_service_mutation() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/srv/card_repository.rs"
+        ));
+        let implementation = &source[source
+            .find("impl CardRepository for SqlxCardRepository")
+            .expect("card repository implementation must exist")..];
+        for (method, next) in [
+            (
+                "async fn update_user_card_status(",
+                "async fn update_user_card(",
+            ),
+            ("async fn update_user_card(", "impl UserCardRow"),
+        ] {
+            let body_start = implementation
+                .find(method)
+                .expect("mutation method must exist");
+            let body = &implementation[body_start..];
+            let body_end = body.find(next).expect("next method boundary must exist");
+            let body = &body[..body_end];
+            let locked = body.find("FOR UPDATE").expect("card row must be locked");
+            let owner_check = body
+                .find("require_actor_owned_active_card")
+                .or_else(|| body.find("locked.user_id != Some(actor_id)"))
+                .expect("owner must be checked in mutation transaction");
+            assert!(
+                locked < owner_check,
+                "locked owner fact must be checked after FOR UPDATE"
+            );
+        }
+    }
+
     #[test]
     fn card_issue_locks_existing_tenant_before_user_card_insert() {
         // 发卡与 delete_tenant/delete_org 的并发边界回归（源形状，无 IO）：

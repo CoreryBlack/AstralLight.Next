@@ -30,6 +30,7 @@ pub(crate) struct DeviceSessionRow {
     pub client_app_id: Option<String>,
     pub channel_code: Option<String>,
     pub current_user_card_id: Option<i64>,
+    pub credential_version: Option<i64>,
     pub session_state: String,
     pub session_version: i64,
     pub session_epoch: i64,
@@ -61,7 +62,7 @@ pub(crate) struct TokenFamilyRow {
 }
 
 pub(crate) const DEVICE_SESSION_COLUMNS: &str = "session_id, family_id, user_id, device_id, device_type, \
-     client_app_id, channel_code, current_user_card_id, session_state, session_version, session_epoch, \
+     client_app_id, channel_code, current_user_card_id, credential_version, session_state, session_version, session_epoch, \
      refresh_token_hash, refresh_expires_at, status, ip_address, user_agent, last_seen_at, \
      revoked_at, revoked_reason, created_at, updated_at";
 

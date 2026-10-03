@@ -807,6 +807,7 @@ pub struct UserMfaRow {
     pub backup_codes_used: i32,
     pub verified_at: Option<time::PrimitiveDateTime>,
     pub last_used_at: Option<time::PrimitiveDateTime>,
+    pub last_totp_counter: Option<i64>,
 }
 
 /// 查询用户 MFA 配置
@@ -817,7 +818,7 @@ pub async fn find_user_mfa(
 ) -> Result<Option<UserMfaRow>, DbError> {
     let row = sqlx::query_as::<_, UserMfaRow>(
         "SELECT id, user_id, mfa_type, secret_enc, phone, email, is_enabled, is_primary, \
-         backup_codes_hash, backup_codes_used, verified_at, last_used_at \
+         backup_codes_hash, backup_codes_used, verified_at, last_used_at, last_totp_counter \
          FROM user_mfa WHERE user_id = ? AND mfa_type = ?",
     )
     .bind(user_id)
@@ -834,7 +835,7 @@ pub async fn find_enabled_mfa_for_user(
 ) -> Result<Vec<UserMfaRow>, DbError> {
     let rows = sqlx::query_as::<_, UserMfaRow>(
         "SELECT id, user_id, mfa_type, secret_enc, phone, email, is_enabled, is_primary, \
-         backup_codes_hash, backup_codes_used, verified_at, last_used_at \
+         backup_codes_hash, backup_codes_used, verified_at, last_used_at, last_totp_counter \
          FROM user_mfa WHERE user_id = ? AND is_enabled = 1",
     )
     .bind(user_id)
@@ -866,7 +867,53 @@ pub async fn upsert_user_mfa(
     Ok(())
 }
 
-/// 禁用用户 MFA
+/// Stage a factor disabled; possession must be proven through the authenticated
+/// verification route before it becomes an MFA login requirement.
+pub async fn stage_user_mfa(
+    pool: &MySqlPool,
+    user_id: i64,
+    mfa_type: &str,
+    secret_enc: Option<&[u8]>,
+    backup_codes_hash: Option<&str>,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO user_mfa (user_id, mfa_type, secret_enc, backup_codes_hash, is_enabled, is_primary, backup_codes_used, last_totp_counter) \
+         VALUES (?, ?, ?, ?, 0, 0, 0, NULL) \
+         ON DUPLICATE KEY UPDATE secret_enc = VALUES(secret_enc), \
+         backup_codes_hash = VALUES(backup_codes_hash), is_enabled = 0, \
+         backup_codes_used = 0, verified_at = NULL, last_totp_counter = NULL, \
+         updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(user_id)
+    .bind(mfa_type)
+    .bind(secret_enc)
+    .bind(backup_codes_hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Activate a staged TOTP factor only after its first, unused counter is proven.
+pub async fn activate_pending_totp(
+    pool: &MySqlPool,
+    user_id: i64,
+    counter: i64,
+) -> Result<bool, DbError> {
+    let result = sqlx::query(
+        "UPDATE user_mfa SET is_enabled = 1, is_primary = 1, verified_at = CURRENT_TIMESTAMP, \
+         last_totp_counter = ?, last_used_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+         WHERE user_id = ? AND mfa_type = 'TOTP' AND is_enabled = 0 \
+           AND secret_enc IS NOT NULL AND (last_totp_counter IS NULL OR last_totp_counter < ?)",
+    )
+    .bind(counter)
+    .bind(user_id)
+    .bind(counter)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Disable user MFA
 pub async fn disable_user_mfa(
     pool: &MySqlPool,
     user_id: i64,
@@ -926,7 +973,8 @@ pub async fn count_recent_mfa_failures(
 ) -> Result<i32, DbError> {
     let row: (i32,) = sqlx::query_as(
         "SELECT COUNT(*) FROM mfa_attempt_log \
-         WHERE user_id = ? AND success = 0 AND attempted_at > DATE_SUB(NOW(), INTERVAL ? MINUTE)",
+         WHERE user_id = ? AND success = 0 AND status IN ('FAILED', 'PENDING') \
+           AND attempted_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? MINUTE)",
     )
     .bind(user_id)
     .bind(window_minutes)
@@ -1249,12 +1297,253 @@ pub async fn find_valid_verification_code(
     Ok(row)
 }
 
-/// 标记验证码为已验证（一次性消费）
-pub async fn mark_verification_code_verified(pool: &MySqlPool, id: i64) -> Result<(), DbError> {
-    sqlx::query("UPDATE verification_code SET verified_at = NOW() WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await?;
+/// 原子消费验证码：verified_at 仍为 NULL、未过期且身份字段完全匹配时只有一个并发校验成功。
+pub async fn mark_verification_code_verified(
+    pool: &MySqlPool,
+    id: i64,
+    target: &str,
+    purpose: &str,
+    code: &str,
+) -> Result<bool, DbError> {
+    let result = sqlx::query(
+        "UPDATE verification_code SET verified_at = NOW() \
+         WHERE id = ? AND target = ? AND purpose = ? AND code = ? \
+           AND verified_at IS NULL AND expires_at > NOW()",
+    )
+    .bind(id)
+    .bind(target)
+    .bind(purpose)
+    .bind(code)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Consume a verified MFA recovery code from the locked method row.
+/// Hash array parsing and exact member removal happen inside the same short transaction.
+pub async fn consume_mfa_recovery_code(
+    pool: &MySqlPool,
+    user_id: i64,
+    code_hash: &str,
+) -> Result<bool, DbError> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(String, i32)> = sqlx::query_as(
+        "SELECT backup_codes_hash, backup_codes_used FROM user_mfa \
+         WHERE user_id = ? AND mfa_type = 'RECOVERY_CODES' AND is_enabled = 1 FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((serialized, used)) = row else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    if used < 0 || used as usize >= 10 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let mut hashes: Vec<String> = serde_json::from_str(&serialized)
+        .map_err(|error| DbError::Mapping(format!("MFA recovery hash list is invalid: {error}")))?;
+    let Some(index) = hashes.iter().position(|hash| hash == code_hash) else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    hashes.remove(index);
+    let updated = sqlx::query(
+        "UPDATE user_mfa SET backup_codes_hash = ?, backup_codes_used = backup_codes_used + 1, \
+         last_used_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+         WHERE user_id = ? AND mfa_type = 'RECOVERY_CODES' AND is_enabled = 1 \
+           AND backup_codes_used = ? AND backup_codes_hash = ?",
+    )
+    .bind(serde_json::to_string(&hashes).map_err(|error| {
+        DbError::Mapping(format!("Serialize MFA recovery hashes failed: {error}"))
+    })?)
+    .bind(user_id)
+    .bind(used)
+    .bind(&serialized)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Confirm a staged recovery factor by consuming the presented code in the same transaction that enables it.
+pub async fn activate_pending_recovery_code(
+    pool: &MySqlPool,
+    user_id: i64,
+    code_hash: &str,
+) -> Result<bool, DbError> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(String, i32)> = sqlx::query_as(
+        "SELECT backup_codes_hash, backup_codes_used FROM user_mfa \
+         WHERE user_id = ? AND mfa_type = 'RECOVERY_CODES' AND is_enabled = 0 FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((serialized, used)) = row else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    let mut hashes: Vec<String> = serde_json::from_str(&serialized)
+        .map_err(|error| DbError::Mapping(format!("MFA recovery hash list is invalid: {error}")))?;
+    let Some(index) = hashes.iter().position(|hash| hash == code_hash) else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    hashes.remove(index);
+    let changed = sqlx::query(
+        "UPDATE user_mfa SET backup_codes_hash = ?, backup_codes_used = ?, is_enabled = 1, \
+         is_primary = 1, verified_at = CURRENT_TIMESTAMP, last_used_at = CURRENT_TIMESTAMP, \
+         updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND mfa_type = 'RECOVERY_CODES' \
+           AND is_enabled = 0 AND backup_codes_used = ? AND backup_codes_hash = ?",
+    )
+    .bind(serde_json::to_string(&hashes).map_err(|error| DbError::Mapping(error.to_string()))?)
+    .bind(used + 1)
+    .bind(user_id)
+    .bind(used)
+    .bind(&serialized)
+    .execute(&mut *tx)
+    .await?;
+    if changed.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Atomically record a TOTP step as consumed. Concurrent requests using the same
+/// time-step cannot both mint a grant or verify a code.
+pub async fn consume_mfa_totp_counter(
+    pool: &MySqlPool,
+    user_id: i64,
+    counter: i64,
+) -> Result<bool, DbError> {
+    let result = sqlx::query(
+        "UPDATE user_mfa SET last_totp_counter = ?, last_used_at = CURRENT_TIMESTAMP, \
+         updated_at = CURRENT_TIMESTAMP \
+         WHERE user_id = ? AND mfa_type = 'TOTP' AND is_enabled = 1 \
+           AND (last_totp_counter IS NULL OR last_totp_counter < ?)",
+    )
+    .bind(counter)
+    .bind(user_id)
+    .bind(counter)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Durable attempt reservation. PENDING rows count as failures until resolved;
+/// abandoning a request can never reopen the brute-force budget.
+pub async fn reserve_mfa_attempt(
+    pool: &MySqlPool,
+    user_id: i64,
+    attempt_code: &str,
+    mfa_type: &str,
+    ip: Option<&str>,
+    user_agent: Option<&str>,
+) -> Result<(), DbError> {
+    let mut tx = pool.begin().await?;
+    // Serialize attempts on the account credential row so concurrent nodes cannot
+    // all observe spare budget and reserve more than the configured maximum.
+    let credential: Option<(i64,)> = sqlx::query_as(
+        "SELECT credential_id FROM user_local_credential WHERE user_id = ? AND status = 'ACTIVE' FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if credential.is_none() {
+        tx.rollback().await?;
+        return Err(DbError::Mapping(
+            "MFA attempt actor has no active local credential".into(),
+        ));
+    }
+    let failures: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM mfa_attempt_log WHERE user_id = ? AND success = 0 \
+         AND status IN ('FAILED', 'PENDING') AND attempted_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL 15 MINUTE)",
+    )
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if failures.0 >= 5 {
+        tx.rollback().await?;
+        return Err(DbError::Mapping("MFA attempt limit exceeded".into()));
+    }
+    sqlx::query(
+        "INSERT INTO mfa_attempt_log \
+         (user_id, mfa_type, attempt_code, status, success, ip, user_agent, failure_reason) \
+         VALUES (?, ?, ?, 'PENDING', 0, ?, ?, 'verification in progress')",
+    )
+    .bind(user_id)
+    .bind(mfa_type)
+    .bind(attempt_code)
+    .bind(ip)
+    .bind(user_agent)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Resolve an attempt reservation. DB failure is returned to the caller (fail-closed).
+pub async fn resolve_mfa_attempt(
+    pool: &MySqlPool,
+    attempt_code: &str,
+    success: bool,
+    failure_reason: Option<&str>,
+) -> Result<(), DbError> {
+    let result = sqlx::query(
+        "UPDATE mfa_attempt_log SET success = ?, status = ?, failure_reason = ?, \
+         attempted_at = CURRENT_TIMESTAMP \
+         WHERE attempt_code = ? AND status = 'PENDING' AND success = 0",
+    )
+    .bind(success as i32)
+    .bind(if success { "SUCCEEDED" } else { "FAILED" })
+    .bind(failure_reason)
+    .bind(attempt_code)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(DbError::Mapping(
+            "MFA attempt reservation could not be resolved exactly once".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a management verification attempt only for the reserved actor and factor method.
+pub async fn resolve_mfa_attempt_for_actor(
+    pool: &MySqlPool,
+    attempt_code: &str,
+    user_id: i64,
+    mfa_type: &str,
+    success: bool,
+    failure_reason: Option<&str>,
+) -> Result<(), DbError> {
+    let result = sqlx::query(
+        "UPDATE mfa_attempt_log SET success = ?, status = ?, failure_reason = ?, \
+         attempted_at = CURRENT_TIMESTAMP \
+         WHERE attempt_code = ? AND user_id = ? AND mfa_type = ? \
+           AND status = 'PENDING' AND success = 0",
+    )
+    .bind(success as i32)
+    .bind(if success { "SUCCEEDED" } else { "FAILED" })
+    .bind(failure_reason)
+    .bind(attempt_code)
+    .bind(user_id)
+    .bind(mfa_type)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(DbError::Mapping(
+            "MFA attempt actor/method reservation was not pending".into(),
+        ));
+    }
     Ok(())
 }
 

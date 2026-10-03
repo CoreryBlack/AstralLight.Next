@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use astral_types::AstralError;
 
-use crate::repository::tenant_repository::{NewPurchase, NewTenant, TenantRepository};
+use crate::repository::tenant_repository::{
+    NewPurchase, NewTenant, TenantMutationContext, TenantRepository,
+};
 
 /// 新建租户结果
 #[derive(Debug, Clone)]
@@ -43,6 +45,18 @@ impl TenantService {
         name: &str,
         parent_tenant_id: Option<i64>,
     ) -> Result<CreateTenantOutcome, AstralError> {
+        let _ = (name, parent_tenant_id);
+        Err(AstralError::Auth(
+            "tenant creation requires Gateway-verified mutation context".into(),
+        ))
+    }
+
+    pub async fn create_tenant_with_context(
+        &self,
+        name: &str,
+        parent_tenant_id: Option<i64>,
+        context: &TenantMutationContext,
+    ) -> Result<CreateTenantOutcome, AstralError> {
         let (parent_path, parent_depth) = if let Some(parent_id) = parent_tenant_id {
             let (path, depth) = self
                 .repo
@@ -58,12 +72,15 @@ impl TenantService {
 
         let tenant_id = self
             .repo
-            .create_tenant(&NewTenant {
-                name: name.to_string(),
-                parent_tenant_id,
-                path: parent_path,
-                depth: parent_depth,
-            })
+            .create_tenant_with_context(
+                &NewTenant {
+                    name: name.to_string(),
+                    parent_tenant_id,
+                    path: parent_path,
+                    depth: parent_depth,
+                },
+                context,
+            )
             .await?;
 
         tracing::info!(id = tenant_id, name, "tenant created");
@@ -76,6 +93,18 @@ impl TenantService {
         parent_id: i64,
         name: &str,
     ) -> Result<CreateTenantOutcome, AstralError> {
+        let _ = (parent_id, name);
+        Err(AstralError::Auth(
+            "sub-tenant creation requires Gateway-verified mutation context".into(),
+        ))
+    }
+
+    pub async fn create_sub_tenant_with_context(
+        &self,
+        parent_id: i64,
+        name: &str,
+        context: &TenantMutationContext,
+    ) -> Result<CreateTenantOutcome, AstralError> {
         let parent = self
             .repo
             .get_tenant(parent_id)
@@ -84,12 +113,15 @@ impl TenantService {
 
         let tenant_id = self
             .repo
-            .create_tenant(&NewTenant {
-                name: name.to_string(),
-                parent_tenant_id: Some(parent_id),
-                path: parent.path,
-                depth: parent.depth + 1,
-            })
+            .create_tenant_with_context(
+                &NewTenant {
+                    name: name.to_string(),
+                    parent_tenant_id: Some(parent_id),
+                    path: parent.path,
+                    depth: parent.depth + 1,
+                },
+                context,
+            )
             .await?;
 
         tracing::info!(parent_id, new_id = tenant_id, "sub-tenant created");

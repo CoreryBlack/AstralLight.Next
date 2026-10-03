@@ -47,9 +47,6 @@ impl GroupService {
             .conversations
             .create_group_scoped(scope, &name, user_id, avatar.as_deref(), max_members)
             .await?;
-        self.members
-            .add_member_scoped(conversation_id, scope, user_id, "OWNER", None)
-            .await?;
 
         tracing::info!(group_id = conversation_id, owner = %user_id, "group created");
         Ok(GroupResponse {
@@ -112,12 +109,7 @@ impl GroupService {
         id: i64,
         patch: GroupPatch,
     ) -> Result<GroupResponse, AstralError> {
-        self.require_member(id, scope).await?;
-        let role = self.require_member_role(id, scope).await?;
-        require_admin(&role)?;
-        self.conversations
-            .update_group_scoped(scope, id, &patch)
-            .await?;
+        self.members.update_group_scoped(id, scope, &patch).await?;
 
         tracing::info!(group_id = %id, "group updated");
         let group = self.require_group(scope, id).await?;
@@ -132,10 +124,7 @@ impl GroupService {
         id: i64,
     ) -> Result<GroupResponse, AstralError> {
         let group = self.require_group(scope, id).await?;
-        self.require_member(id, scope).await?;
-        let role = self.require_member_role(id, scope).await?;
-        require_owner(&role)?;
-        self.conversations.disband_group_scoped(scope, id).await?;
+        self.members.disband_group_scoped(id, scope).await?;
 
         tracing::info!(group_id = %id, owner = %scope.user_id, "group disbanded");
         let count = self.members.count_members_scoped(id, scope).await?;
@@ -170,27 +159,8 @@ impl GroupService {
         id: i64,
         new_member_id: i64,
     ) -> Result<GroupMemberResponse, AstralError> {
-        let group = self.require_group(scope, id).await?;
-        let role = self.require_member_role(id, scope).await?;
-        require_admin(&role)?;
-
-        let existing = self
-            .members
-            .member_count_scoped(id, scope, new_member_id)
-            .await?;
-        if existing > 0 {
-            return Err(AstralError::Validation("该用户已是群组成员".into()));
-        }
-        let current_count = self.members.count_members_scoped(id, scope).await?;
-        if current_count >= group.max_members {
-            return Err(AstralError::Validation(format!(
-                "群组成员数已达上限 ({})",
-                group.max_members
-            )));
-        }
-
         self.members
-            .add_member_scoped(id, scope, new_member_id, "MEMBER", Some(scope.user_id))
+            .add_group_member_scoped(id, scope, new_member_id)
             .await?;
         tracing::info!(group_id = %id, new_member = new_member_id, invited_by = %scope.user_id, "member added");
 
@@ -211,27 +181,8 @@ impl GroupService {
         id: i64,
         target_user_id: i64,
     ) -> Result<(), AstralError> {
-        let group = self.require_group(scope, id).await?;
-        if Some(target_user_id) == group.owner_id {
-            return Err(AstralError::Validation("不能移除群主，请先转让群主".into()));
-        }
-
-        if target_user_id == scope.user_id {
-            self.require_member(id, scope).await?;
-        } else {
-            self.require_member(id, scope).await?;
-            let role = self.require_member_role(id, scope).await?;
-            require_admin(&role)?;
-            let target_role = self
-                .require_member_role_for_target(id, scope, target_user_id)
-                .await?;
-            if target_role == "ADMIN" {
-                require_owner(&role)?;
-            }
-        }
-
         self.members
-            .remove_member_scoped(id, scope, target_user_id)
+            .remove_group_member_scoped(id, scope, target_user_id)
             .await?;
         tracing::info!(group_id = %id, removed_user = %target_user_id, operator = %scope.user_id, "member removed");
         Ok(())
@@ -244,20 +195,11 @@ impl GroupService {
         id: i64,
         new_owner_id: i64,
     ) -> Result<GroupResponse, AstralError> {
-        self.require_member(id, scope).await?;
-        let role = self.require_member_role(id, scope).await?;
-        require_owner(&role)?;
-
         if new_owner_id == scope.user_id {
             return Err(AstralError::Validation("不能转让给自己".into()));
         }
-        if !self
-            .members
-            .is_member_target_scoped(id, scope, new_owner_id)
-            .await?
-        {
-            return Err(AstralError::Permission("您不是该群组成员".into()));
-        }
+        // OWNER, current conversation type/status, member scope and target eligibility
+        // are rechecked under one repository conversation-row lock.
 
         // 单事务：owner_id + 旧主降 ADMIN + 新主升 OWNER
         self.members
@@ -279,33 +221,6 @@ impl GroupService {
             .get_group_scoped(scope, id)
             .await?
             .ok_or_else(|| AstralError::Validation(format!("Group {id} not found or not active")))
-    }
-
-    /// 验证当前物理作用域的成员角色。
-    async fn require_member_role(&self, id: i64, scope: &ChatScope) -> Result<String, AstralError> {
-        self.members
-            .member_role_scoped(id, scope)
-            .await?
-            .ok_or_else(|| AstralError::Permission("您不是该群组成员".into()))
-    }
-
-    async fn require_member_role_for_target(
-        &self,
-        id: i64,
-        scope: &ChatScope,
-        target_user_id: i64,
-    ) -> Result<String, AstralError> {
-        if !self
-            .members
-            .is_member_target_scoped(id, scope, target_user_id)
-            .await?
-        {
-            return Err(AstralError::Permission("您不是该群组成员".into()));
-        }
-        self.members
-            .member_role(id, target_user_id)
-            .await?
-            .ok_or_else(|| AstralError::Permission("您不是该群组成员".into()))
     }
 
     /// 验证用户是会话成员
@@ -675,12 +590,23 @@ mod tests {
 
         async fn transfer_group_owner_scoped(
             &self,
-            _conversation_id: i64,
-            _scope: &ChatScope,
+            conversation_id: i64,
+            scope: &ChatScope,
             old_owner_id: i64,
             new_owner_id: i64,
         ) -> Result<(), AstralError> {
-            *self.transfer_args.lock().unwrap() = Some((1, old_owner_id, new_owner_id));
+            if self.role.lock().unwrap().as_deref() != Some("OWNER")
+                || scope.user_id != old_owner_id
+            {
+                return Err(AstralError::Permission("group owner required".into()));
+            }
+            if !self.members.lock().unwrap().contains(&new_owner_id) {
+                return Err(AstralError::Permission(
+                    "target group member required".into(),
+                ));
+            }
+            *self.transfer_args.lock().unwrap() =
+                Some((conversation_id, old_owner_id, new_owner_id));
             Ok(())
         }
         async fn transfer_group_owner(

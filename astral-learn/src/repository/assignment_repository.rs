@@ -141,7 +141,9 @@ pub trait AssignmentRepository: Send + Sync {
     ) -> Result<(), AstralError>;
 
     // ===== Grades（grades 模块）=====
-    /// 查找或创建默认作业（"默认评分"/PUBLISHED），返回 assignment_id
+    /// 查找或创建唯一的合成成绩簿作业，返回 assignment_id。
+    /// The row is identified only by the schema-owned DEFAULT_GRADE discriminator;
+    /// legacy assignments without that marker are never guessed or adopted.
     async fn get_or_create_assignment(&self, course_id: i64) -> Result<i64, AstralError>;
     /// 成绩 upsert（ON DUPLICATE KEY UPDATE 幂等）
     async fn upsert_submission(
@@ -180,6 +182,12 @@ impl SqlxAssignmentRepository {
 
 const ASSIGNMENT_SELECT: &str =
     "SELECT id, course_id, title, description, max_score, status FROM learn_assignment";
+const DEFAULT_GRADE_COUNT_SQL: &str = "SELECT COUNT(*) FROM learn_assignment \
+     WHERE course_id = ? AND system_role = 'DEFAULT_GRADE'";
+
+#[cfg(test)]
+const SQL_CONTINUATION_TESTS: &[(&str, &str)] =
+    &[("default grade assignment count", DEFAULT_GRADE_COUNT_SQL)];
 
 #[async_trait]
 impl AssignmentRepository for SqlxAssignmentRepository {
@@ -429,24 +437,67 @@ impl AssignmentRepository for SqlxAssignmentRepository {
 
     // ===== Grades（grades 模块）=====
     async fn get_or_create_assignment(&self, course_id: i64) -> Result<i64, AstralError> {
-        let existing: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM learn_assignment WHERE course_id = ? LIMIT 1")
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let course: Option<(i64,)> =
+            sqlx::query_as("SELECT course_id FROM learn_course WHERE course_id = ? FOR UPDATE")
                 .bind(course_id)
-                .fetch_optional(&self.db)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(db_error)?;
-        if let Some((id,)) = existing {
-            return Ok(id);
+        if course.is_none() {
+            return Err(AstralError::NotFound(format!(
+                "Course {course_id} not found"
+            )));
         }
+
+        // The course lock serializes writers for this course. Only the explicit
+        // schema-owned marker establishes the synthetic gradebook assignment;
+        // title, status, id order, and existing submissions carry no such proof.
+        let matching: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM learn_assignment \
+             WHERE course_id = ? AND system_role = 'DEFAULT_GRADE' FOR UPDATE",
+        )
+        .bind(course_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        match matching.as_slice() {
+            [(id,)] => {
+                let id = *id;
+                let duplicate_count: i64 = sqlx::query_scalar(DEFAULT_GRADE_COUNT_SQL)
+                    .bind(course_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db_error)?;
+                if duplicate_count != 1 {
+                    return Err(AstralError::Database(
+                        "DEFAULT_GRADE discriminator uniqueness proof is violated".into(),
+                    ));
+                }
+                tx.commit().await.map_err(db_error)?;
+                return Ok(id);
+            }
+            [] => {}
+            _ => {
+                return Err(AstralError::Database(
+                    "Course has duplicate DEFAULT_GRADE assignments; refusing ambiguous grading"
+                        .into(),
+                ));
+            }
+        }
+
         let result = sqlx::query(
-            "INSERT INTO learn_assignment (course_id, title, status) VALUES (?, ?, 'PUBLISHED')",
+            "INSERT INTO learn_assignment (course_id, title, status, system_role) \
+             VALUES (?, ?, 'PUBLISHED', 'DEFAULT_GRADE')",
         )
         .bind(course_id)
         .bind("默认评分")
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
-        Ok(result.last_insert_id() as i64)
+        let assignment_id = result.last_insert_id() as i64;
+        tx.commit().await.map_err(db_error)?;
+        Ok(assignment_id)
     }
 
     async fn upsert_submission(
@@ -495,7 +546,7 @@ impl AssignmentRepository for SqlxAssignmentRepository {
         sqlx::query_as::<_, GradeRecord>(
             "SELECT s.id, s.user_id, COALESCE(s.score,0) as score, s.content as comment \
              FROM learn_submission s JOIN learn_assignment a ON a.id=s.assignment_id \
-             WHERE a.course_id=? AND s.user_id=? LIMIT 1",
+             WHERE a.course_id=? AND a.system_role='DEFAULT_GRADE' AND s.user_id=?",
         )
         .bind(course_id)
         .bind(user_id)
@@ -508,7 +559,7 @@ impl AssignmentRepository for SqlxAssignmentRepository {
         sqlx::query_as::<_, GradeRecord>(
             "SELECT s.id, s.user_id, COALESCE(s.score,0) as score, s.content as comment \
              FROM learn_submission s JOIN learn_assignment a ON a.id=s.assignment_id \
-             WHERE a.course_id=? ORDER BY s.user_id",
+             WHERE a.course_id=? AND a.system_role='DEFAULT_GRADE' ORDER BY s.user_id",
         )
         .bind(course_id)
         .fetch_all(&self.db)
@@ -541,4 +592,32 @@ impl AssignmentRepository for SqlxAssignmentRepository {
 
 fn db_error(error: sqlx::Error) -> AstralError {
     AstralError::Database(format!("Assignment repository query failed: {error}"))
+}
+
+#[cfg(test)]
+mod sql_tests {
+    use super::*;
+
+    #[test]
+    fn important_sql_continuations_emit_single_spaces_without_backslashes() {
+        use sqlx::Execute;
+
+        for (name, sql) in SQL_CONTINUATION_TESTS {
+            let query = sqlx::query::<sqlx::MySql>(sql);
+            let emitted = query.sql();
+            assert!(
+                !emitted.contains('\\'),
+                "{name} SQL contains a literal backslash"
+            );
+            assert!(
+                !emitted.contains('\n'),
+                "{name} SQL contains an unintended newline"
+            );
+            assert!(
+                !emitted.contains("  "),
+                "{name} SQL contains duplicate spaces"
+            );
+        }
+        assert!(DEFAULT_GRADE_COUNT_SQL.contains("system_role = 'DEFAULT_GRADE'"));
+    }
 }

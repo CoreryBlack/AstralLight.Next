@@ -11,6 +11,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::access::{authenticated_user_id, require_same_user};
+use crate::ownership::resolve_progress_read_ownership;
 use crate::AppState;
 use astral_common::contract::ApiResponse;
 use astral_common::error::AppError;
@@ -45,7 +46,24 @@ async fn get_progress(
     State(state): State<AppState>,
     Path((user_id, subject_id)): Path<(i64, i64)>,
 ) -> Result<Json<ApiResponse<LearningProgress>>, AppError> {
-    require_same_user(authenticated_user_id(&headers)?, user_id)?;
+    let authenticated = authenticated_user_id(&headers)?;
+    require_same_user(authenticated, user_id)?;
+    let resolution = resolve_progress_read_ownership(&state.db, subject_id, user_id).await;
+    if !matches!(
+        resolution,
+        astral_db::ResourceOwnershipResolution::TenantScoped { .. }
+    ) {
+        tracing::warn!(
+            subject_id,
+            user_id,
+            ownership = resolution.code(),
+            "Learn progress source ownership unresolved; refusing read"
+        );
+        return Err(astral_types::AstralError::Permission(
+            "Progress source ownership is unresolved".into(),
+        )
+        .into());
+    }
     let progress = state
         .progress_service
         .get_progress(user_id, subject_id)
@@ -55,15 +73,14 @@ async fn get_progress(
 
 async fn update_progress(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(user_id): Path<i64>,
     Json(req): Json<ProgressUpdate>,
 ) -> Result<Json<ApiResponse<LearningProgress>>, AppError> {
     require_same_user(authenticated_user_id(&headers)?, user_id)?;
-    // INSERT IGNORE 幂等记录首次作答 → 重算进度（编排在 ProgressService）
-    let progress = state
-        .progress_service
-        .update_progress(user_id, req.subject_id, req.question_id, req.correct)
-        .await?;
-    Ok(Json(ApiResponse::success(progress)))
+    let _ = req;
+    Err(astral_types::AstralError::NotImplemented(
+        "Progress updates require server-scored persisted answers; client correctness is not accepted".into(),
+    )
+    .into())
 }

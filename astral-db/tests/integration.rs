@@ -502,6 +502,138 @@ async fn publish_card_manifest(pool: &MySqlPool, namespace: &TestNamespace) {
     assert_eq!(outcome.pointer.manifest_id, stage_outcome.manifest_id);
 }
 
+/// Real-MySQL concurrency test for exact Local outbox claims, the completion
+/// token CAS, and per-scope FIFO. Requires the outbox plus scope-sequence
+/// migrations; never creates schema or runs a migration itself.
+#[ignore]
+#[tokio::test]
+async fn local_message_exact_claim_is_concurrent_fifo_and_token_fenced() {
+    let Some(pool) = connect().await else {
+        return;
+    };
+    let suffix = Uuid::new_v4().to_string();
+    let queue_name = "astral.authorization.invalidation";
+    let ordering_key = format!("integration:local-claim:{suffix}");
+    let message_ids = [
+        format!("local-claim-a-{suffix}"),
+        format!("local-claim-b-{suffix}"),
+    ];
+    let payload = serde_json::json!({"event": "claim-test", "key": suffix});
+    let payload_sha256 = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload).unwrap())
+    );
+    let envelope_json = |message_id: &str, operation_id: &str| {
+        serde_json::to_string(&serde_json::json!({
+            "messageId": message_id,
+            "operationId": operation_id,
+            "messageType": "EVIDENCE_INVALIDATED",
+            "schemaVersion": 1,
+            "tenantId": null,
+            "originRegion": "integration",
+            "targetRegion": null,
+            "orderingKey": ordering_key,
+            "traceId": null,
+            "createdAt": "2026-10-03T00:00:00Z",
+            "expiresAt": null,
+            "payloadSha256": payload_sha256,
+            "payload": payload,
+        }))
+        .unwrap()
+    };
+    let operation_ids = [format!("op-{suffix}"), format!("op-{suffix}-2")];
+    let payload_jsons = [
+        envelope_json(&message_ids[0], &operation_ids[0]),
+        envelope_json(&message_ids[1], &operation_ids[1]),
+    ];
+    let repo = astral_db::LocalMessageRepository::new(pool.clone());
+    let input_for = |index: usize| astral_db::LocalMessageInput {
+        message_id: &message_ids[index],
+        operation_id: &operation_ids[index],
+        message_type: "EVIDENCE_INVALIDATED",
+        queue_name,
+        ordering_key: Some(&ordering_key),
+        tenant_id: None,
+        origin_region: "integration",
+        target_region: None,
+        schema_version: 1,
+        payload_json: &payload_jsons[index],
+        headers_json: None,
+        payload_sha256: &payload_sha256,
+    };
+    for index in 0..message_ids.len() {
+        repo.append(&input_for(index))
+            .await
+            .expect("append exact-claim test row");
+    }
+
+    let first_id = &message_ids[0];
+    let second_id = &message_ids[1];
+    let first_claims = tokio::join!(
+        repo.claim_exact("integration-claim-a", queue_name, first_id),
+        repo.claim_exact("integration-claim-b", queue_name, first_id),
+    );
+    let (row, stale_token) = match first_claims {
+        (Ok(astral_db::LocalMessageExactClaim::Claimed(row)), Ok(other))
+        | (Ok(other), Ok(astral_db::LocalMessageExactClaim::Claimed(row))) => {
+            assert!(matches!(
+                other,
+                astral_db::LocalMessageExactClaim::NotClaimable { .. }
+            ));
+            let token = row.lease_owner.clone().unwrap();
+            (row, token)
+        }
+        pair => panic!("exact row must have one CAS owner only: {pair:?}"),
+    };
+    assert_eq!(row.message_id, *first_id);
+
+    let later = repo
+        .claim_exact("integration-claim-later", queue_name, second_id)
+        .await
+        .expect("second row FIFO check");
+    assert!(
+        matches!(&later, astral_db::LocalMessageExactClaim::NotClaimable { reason, .. } if reason.contains("FIFO blocked")),
+        "later row must stay behind the first unprocessed row: {later:?}"
+    );
+
+    // The first row's lease owner is token-fenced. A stale token cannot complete.
+    let stale = repo.complete(first_id, "not-the-claim-token").await;
+    assert!(matches!(
+        stale,
+        Err(astral_db::LocalMessageError::LeaseLost)
+    ));
+    repo.complete(first_id, &stale_token)
+        .await
+        .expect("owned completion CAS");
+    let later = repo
+        .claim_exact("integration-claim-later", queue_name, second_id)
+        .await
+        .expect("second row after FIFO head completed");
+    let later_row = match later {
+        astral_db::LocalMessageExactClaim::Claimed(row) => row,
+        other => panic!("second row should become claimable after FIFO head: {other:?}"),
+    };
+    let later_token = later_row.lease_owner.unwrap();
+    repo.complete(second_id, &later_token)
+        .await
+        .expect("complete FIFO successor");
+    let claimed = repo
+        .claim_exact("integration-claim-complete", queue_name, first_id)
+        .await
+        .expect("completed exact row lookup");
+    assert!(matches!(
+        claimed,
+        astral_db::LocalMessageExactClaim::AlreadyProcessed(_)
+    ));
+
+    sqlx::query("DELETE FROM al_message_outbox WHERE queue_name = ? AND ordering_key = ?")
+        .bind(queue_name)
+        .bind(&ordering_key)
+        .execute(&pool)
+        .await
+        .expect("cleanup local claim rows");
+}
+
 /// 需要 MySQL，标记为 ignored 默认不执行。
 #[ignore]
 #[tokio::test]

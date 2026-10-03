@@ -12,6 +12,26 @@ use astral_types::AstralError;
 
 use crate::scope::ChatScope;
 
+const LIST_MEMBER_SCOPES_SQL: &str =
+    "SELECT DISTINCT m.user_id, ic.card_id, uc.card_id \
+     FROM chat_conversation c \
+     INNER JOIN chat_conversation_member m ON m.conversation_id = c.id \
+     INNER JOIN platform_user pu ON pu.user_id = m.user_id AND pu.status = 'ACTIVE' AND pu.deleted_at IS NULL \
+     INNER JOIN identity_card ic ON ic.user_id = pu.user_id AND ic.status = 'ACTIVE' \
+       AND (ic.expires_at IS NULL OR ic.expires_at >= UTC_TIMESTAMP()) \
+     INNER JOIN user_card uc ON uc.user_id = pu.user_id AND uc.card_status = 'ACTIVE' \
+       AND uc.tenant_id = ? AND uc.domain_id = c.domain_id \
+       AND (uc.valid_from IS NULL OR uc.valid_from <= UTC_TIMESTAMP()) \
+       AND (uc.valid_until IS NULL OR uc.valid_until >= UTC_TIMESTAMP()) \
+     INNER JOIN tenant t ON t.tenant_id = uc.tenant_id AND t.status = 'ACTIVE' \
+     INNER JOIN tenant_domain_map tdm ON tdm.tenant_id = uc.tenant_id AND tdm.domain_id = uc.domain_id AND tdm.status = 'ACTIVE' \
+     WHERE c.id = ? AND c.domain_id = ? AND c.status = 'ACTIVE' AND c.is_deleted = 0 \
+       AND m.left_at IS NULL \
+       AND (SELECT COUNT(DISTINCT active_ic.card_id) FROM identity_card active_ic \
+            WHERE active_ic.user_id = pu.user_id AND active_ic.status = 'ACTIVE' \
+              AND (active_ic.expires_at IS NULL OR active_ic.expires_at >= UTC_TIMESTAMP())) = 1 \
+     ORDER BY m.user_id, ic.card_id, uc.card_id";
+
 /// 群组成员行（muted/pinned 为 TINYINT → i64，DTO 转换在 handler 层）
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct GroupMemberRecord {
@@ -106,7 +126,30 @@ pub trait MemberRepository: Send + Sync {
         Ok(false)
     }
 
-    /// 验证目标用户是当前物理作用域下的会话成员。
+    /// Atomically authorizes and updates group metadata under the conversation row lock.
+    async fn update_group_scoped(
+        &self,
+        _conversation_id: i64,
+        _scope: &ChatScope,
+        _patch: &crate::repository::conversation_repository::GroupPatch,
+    ) -> Result<(), AstralError> {
+        Err(AstralError::Permission(
+            "scoped group mutation required".into(),
+        ))
+    }
+
+    /// Atomically authorizes and disbands a group under the conversation row lock.
+    async fn disband_group_scoped(
+        &self,
+        _conversation_id: i64,
+        _scope: &ChatScope,
+    ) -> Result<(), AstralError> {
+        Err(AstralError::Permission(
+            "scoped group mutation required".into(),
+        ))
+    }
+
+    /// Validate the target user is a member in the exact scoped conversation.
     async fn is_member_target_scoped(
         &self,
         conversation_id: i64,
@@ -140,6 +183,45 @@ pub trait MemberRepository: Send + Sync {
         invite_by: Option<i64>,
     ) -> Result<(), AstralError> {
         let _ = (conversation_id, scope, user_id, role, invite_by);
+        Err(AstralError::Permission(
+            "physical chat scope required".into(),
+        ))
+    }
+
+    /// Atomically verifies OWNER/ADMIN, group type, scope, active target, and
+    /// member cap while holding the conversation row lock.
+    async fn add_group_member_scoped(
+        &self,
+        conversation_id: i64,
+        scope: &ChatScope,
+        user_id: i64,
+    ) -> Result<(), AstralError> {
+        let _ = (conversation_id, scope, user_id);
+        Err(AstralError::Permission(
+            "scoped group mutation required".into(),
+        ))
+    }
+
+    /// Atomically applies leave/kick policy and membership removal.
+    async fn remove_group_member_scoped(
+        &self,
+        conversation_id: i64,
+        scope: &ChatScope,
+        user_id: i64,
+    ) -> Result<u64, AstralError> {
+        let _ = (conversation_id, scope, user_id);
+        Err(AstralError::Permission(
+            "scoped group mutation required".into(),
+        ))
+    }
+
+    async fn member_role_target_scoped(
+        &self,
+        conversation_id: i64,
+        scope: &ChatScope,
+        user_id: i64,
+    ) -> Result<Option<String>, AstralError> {
+        let _ = (conversation_id, scope, user_id);
         Err(AstralError::Permission(
             "physical chat scope required".into(),
         ))
@@ -233,6 +315,19 @@ pub trait MemberRepository: Send + Sync {
         conversation_id: i64,
         user_id: i64,
     ) -> Result<Option<i64>, AstralError>;
+    /// Read a watermark only while the requester and target remain eligible members
+    /// in the exact active conversation and physical tenant/domain scope.
+    async fn last_read_message_id_scoped(
+        &self,
+        conversation_id: i64,
+        scope: &ChatScope,
+        target_user_id: i64,
+    ) -> Result<i64, AstralError> {
+        let _ = (conversation_id, scope, target_user_id);
+        Err(AstralError::Permission(
+            "scoped receipt read required".into(),
+        ))
+    }
     /// UPSERT 已读水位（receipts.mark_read；GREATEST(COALESCE) 防 NULL 回归）
     async fn mark_read(
         &self,
@@ -240,6 +335,18 @@ pub trait MemberRepository: Send + Sync {
         user_id: i64,
         last_read_message_id: i64,
     ) -> Result<(), AstralError>;
+    /// Scoped monotonic receipt watermark; target membership is revalidated in this transaction.
+    async fn mark_read_scoped(
+        &self,
+        conversation_id: i64,
+        scope: &ChatScope,
+        last_read_message_id: i64,
+    ) -> Result<(), AstralError> {
+        let _ = (conversation_id, scope, last_read_message_id);
+        Err(AstralError::Permission(
+            "scoped receipt write required".into(),
+        ))
+    }
     /// 更新已读水位（realtime READ_RECEIPT；GREATEST(COALESCE) 单调不回退）
     async fn update_last_read(
         &self,
@@ -266,8 +373,517 @@ impl SqlxMemberRepository {
     }
 }
 
+const MAX_SCOPED_GROUP_MEMBERS: i64 = 500;
+
+async fn verify_scope_pair(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    scope: &ChatScope,
+) -> Result<bool, AstralError> {
+    let eligible: Vec<(i64,)> = sqlx::query_as(
+        "SELECT pu.user_id FROM platform_user pu \
+         INNER JOIN identity_card ic ON ic.user_id = pu.user_id AND ic.card_id = ? AND ic.status = 'ACTIVE' \
+           AND (ic.expires_at IS NULL OR ic.expires_at >= UTC_TIMESTAMP()) \
+         INNER JOIN user_card uc ON uc.user_id = pu.user_id AND uc.card_id = ? AND uc.card_status = 'ACTIVE' \
+           AND uc.card_type != 'LEVEL_TEMPLATE_CARD' AND uc.tenant_id = ? AND uc.domain_id = ? \
+           AND (uc.valid_from IS NULL OR uc.valid_from <= UTC_TIMESTAMP()) \
+           AND (uc.valid_until IS NULL OR uc.valid_until >= UTC_TIMESTAMP()) \
+         INNER JOIN tenant t ON t.tenant_id = uc.tenant_id AND t.status = 'ACTIVE' \
+         INNER JOIN tenant_domain_map tdm ON tdm.tenant_id = uc.tenant_id AND tdm.domain_id = uc.domain_id AND tdm.status = 'ACTIVE' \
+         WHERE pu.user_id = ? AND pu.status = 'ACTIVE' AND pu.deleted_at IS NULL \
+         LIMIT 2 FOR UPDATE",
+    )
+    .bind(scope.identity_card_id)
+    .bind(scope.user_card_id)
+    .bind(scope.user_card_tenant_id)
+    .bind(scope.user_card_domain_id)
+    .bind(scope.user_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    Ok(eligible.len() == 1)
+}
+
+async fn target_has_unique_eligible_pair(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: i64,
+    tenant_id: i64,
+    domain_id: i64,
+) -> Result<bool, AstralError> {
+    let pairs: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT ic.card_id, uc.card_id FROM platform_user pu \
+         INNER JOIN identity_card ic ON ic.user_id = pu.user_id AND ic.status = 'ACTIVE' \
+           AND (ic.expires_at IS NULL OR ic.expires_at >= UTC_TIMESTAMP()) \
+         INNER JOIN user_card uc ON uc.user_id = pu.user_id AND uc.card_status = 'ACTIVE' \
+           AND uc.card_type != 'LEVEL_TEMPLATE_CARD' AND uc.tenant_id = ? AND uc.domain_id = ? \
+           AND (uc.valid_from IS NULL OR uc.valid_from <= UTC_TIMESTAMP()) \
+           AND (uc.valid_until IS NULL OR uc.valid_until >= UTC_TIMESTAMP()) \
+         INNER JOIN tenant t ON t.tenant_id = uc.tenant_id AND t.status = 'ACTIVE' \
+         INNER JOIN tenant_domain_map tdm ON tdm.tenant_id = uc.tenant_id AND tdm.domain_id = uc.domain_id AND tdm.status = 'ACTIVE' \
+         WHERE pu.user_id = ? AND pu.status = 'ACTIVE' AND pu.deleted_at IS NULL \
+         LIMIT 2 FOR UPDATE",
+    )
+    .bind(tenant_id)
+    .bind(domain_id)
+    .bind(user_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    Ok(pairs.len() == 1)
+}
+
+const LOCK_ACTIVE_CONVERSATION_SQL: &str = concat!(
+    "SELECT conversation_type, owner_id, max_members FROM chat_conversation ",
+    "WHERE id = ? AND domain_id = ? AND status = 'ACTIVE' AND is_deleted = 0 FOR UPDATE",
+);
+
+async fn locked_active_conversation(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    conversation_id: i64,
+    scope: &ChatScope,
+) -> Result<Option<(String, Option<i64>, Option<i64>)>, AstralError> {
+    sqlx::query_as(LOCK_ACTIVE_CONVERSATION_SQL)
+        .bind(conversation_id)
+        .bind(scope.user_card_domain_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db_error)
+}
+
+async fn locked_group_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    conversation_id: i64,
+    scope: &ChatScope,
+) -> Result<Option<(Option<i64>, Option<i64>)>, AstralError> {
+    sqlx::query_as(
+        "SELECT c.owner_id, c.max_members FROM chat_conversation c \
+         WHERE c.id = ? AND c.domain_id = ? AND c.conversation_type = 'GROUP' \
+           AND c.status = 'ACTIVE' AND c.is_deleted = 0 FOR UPDATE",
+    )
+    .bind(conversation_id)
+    .bind(scope.user_card_domain_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_error)
+}
+
+async fn locked_member_count(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    conversation_id: i64,
+) -> Result<i64, AstralError> {
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "SELECT user_id FROM chat_conversation_member \
+         WHERE conversation_id = ? AND left_at IS NULL ORDER BY user_id \
+         LIMIT ? FOR UPDATE",
+    )
+    .bind(conversation_id)
+    .bind(MAX_SCOPED_GROUP_MEMBERS + 1)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    Ok(rows.len() as i64)
+}
+
+fn authorize_group_admin(
+    owner_id: Option<i64>,
+    actor_id: i64,
+    role: &str,
+) -> Result<(), AstralError> {
+    match role {
+        "OWNER" if owner_id == Some(actor_id) => Ok(()),
+        "OWNER" => Err(AstralError::Permission(
+            "group owner/member state mismatch".into(),
+        )),
+        "ADMIN" if owner_id == Some(actor_id) => Err(AstralError::Permission(
+            "group owner/member state mismatch".into(),
+        )),
+        "ADMIN" => Ok(()),
+        _ => Err(AstralError::Permission(
+            "group owner or admin required".into(),
+        )),
+    }
+}
+
+async fn locked_member_role(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    conversation_id: i64,
+    user_id: i64,
+) -> Result<Option<String>, AstralError> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT role FROM chat_conversation_member WHERE conversation_id = ? AND user_id = ? AND left_at IS NULL FOR UPDATE",
+    )
+    .bind(conversation_id)
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    Ok(row.map(|value| value.0))
+}
+
+fn scoped_group_member_limit(configured: i64) -> Result<i64, AstralError> {
+    if configured <= 0 || configured > MAX_SCOPED_GROUP_MEMBERS {
+        return Err(AstralError::Validation(
+            "group member limit is outside Chat bounds".into(),
+        ));
+    }
+    Ok(configured)
+}
+
 #[async_trait]
 impl MemberRepository for SqlxMemberRepository {
+    async fn mark_read_scoped(
+        &self,
+        conversation_id: i64,
+        scope: &ChatScope,
+        last_read_message_id: i64,
+    ) -> Result<(), AstralError> {
+        if last_read_message_id < 0 {
+            return Err(AstralError::Validation(
+                "read watermark must be non-negative".into(),
+            ));
+        }
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        if !verify_scope_pair(&mut tx, scope).await? {
+            return Err(AstralError::Permission(
+                "physical chat scope required".into(),
+            ));
+        }
+        let Some((conversation_type, _, _)) =
+            locked_active_conversation(&mut tx, conversation_id, scope).await?
+        else {
+            return Err(AstralError::Permission(
+                "active scoped conversation required".into(),
+            ));
+        };
+        if locked_member_role(&mut tx, conversation_id, scope.user_id)
+            .await?
+            .is_none()
+        {
+            return Err(AstralError::Permission(
+                "scoped conversation member required".into(),
+            ));
+        }
+        if conversation_type == "GROUP"
+            && locked_group_row(&mut tx, conversation_id, scope)
+                .await?
+                .is_none()
+        {
+            return Err(AstralError::Permission("active group required".into()));
+        }
+        if last_read_message_id > 0 {
+            let message: Option<(i64,)> = sqlx::query_as(
+                "SELECT id FROM chat_message WHERE id = ? AND conversation_id = ? AND domain_id = ? FOR UPDATE",
+            )
+            .bind(last_read_message_id)
+            .bind(conversation_id)
+            .bind(scope.user_card_domain_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_error)?;
+            if message.is_none() {
+                return Err(AstralError::Permission(
+                    "read watermark message is outside the scoped conversation".into(),
+                ));
+            }
+        }
+        // `locked_member_role` above already locked and proved this exact member
+        // row. Do not interpret rows_affected == 0 as a missing member: MySQL
+        // reports zero for a valid idempotent lower-watermark retry.
+        sqlx::query(concat!(
+            "UPDATE chat_conversation_member SET last_read_message_id = ",
+            "GREATEST(COALESCE(last_read_message_id, 0), ?) ",
+            "WHERE conversation_id = ? AND user_id = ? AND left_at IS NULL",
+        ))
+        .bind(last_read_message_id)
+        .bind(conversation_id)
+        .bind(scope.user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)
+    }
+
+    async fn last_read_message_id_scoped(
+        &self,
+        conversation_id: i64,
+        scope: &ChatScope,
+        target_user_id: i64,
+    ) -> Result<i64, AstralError> {
+        if conversation_id <= 0 || target_user_id <= 0 {
+            return Err(AstralError::Permission(
+                "scoped receipt target required".into(),
+            ));
+        }
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        if !verify_scope_pair(&mut tx, scope).await? {
+            return Err(AstralError::Permission(
+                "physical chat scope required".into(),
+            ));
+        }
+        let Some((conversation_type, _, _)) =
+            locked_active_conversation(&mut tx, conversation_id, scope).await?
+        else {
+            return Err(AstralError::Permission(
+                "active scoped conversation required".into(),
+            ));
+        };
+        if locked_member_role(&mut tx, conversation_id, scope.user_id)
+            .await?
+            .is_none()
+            || locked_member_role(&mut tx, conversation_id, target_user_id)
+                .await?
+                .is_none()
+        {
+            return Err(AstralError::Permission(
+                "scoped conversation member required".into(),
+            ));
+        }
+        if conversation_type == "GROUP"
+            && locked_group_row(&mut tx, conversation_id, scope)
+                .await?
+                .is_none()
+        {
+            return Err(AstralError::Permission("active group required".into()));
+        }
+        if !target_has_unique_eligible_pair(
+            &mut tx,
+            target_user_id,
+            scope.user_card_tenant_id,
+            scope.user_card_domain_id,
+        )
+        .await?
+        {
+            return Err(AstralError::Permission(
+                "receipt target lacks a unique eligible physical card pair".into(),
+            ));
+        }
+        let watermark: Option<(Option<i64>,)> = sqlx::query_as(concat!(
+            "SELECT m.last_read_message_id FROM chat_conversation_member m ",
+            "WHERE m.conversation_id = ? AND m.user_id = ? AND m.left_at IS NULL FOR UPDATE",
+        ))
+        .bind(conversation_id)
+        .bind(target_user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let Some((watermark,)) = watermark else {
+            return Err(AstralError::Permission(
+                "scoped conversation member required".into(),
+            ));
+        };
+        tx.commit().await.map_err(db_error)?;
+        Ok(watermark.unwrap_or(0))
+    }
+
+    async fn update_group_scoped(
+        &self,
+        conversation_id: i64,
+        scope: &ChatScope,
+        patch: &crate::repository::conversation_repository::GroupPatch,
+    ) -> Result<(), AstralError> {
+        if patch
+            .max_members
+            .is_some_and(|value| value <= 0 || value > MAX_SCOPED_GROUP_MEMBERS)
+        {
+            return Err(AstralError::Validation(
+                "group max_members is outside Chat bounds".into(),
+            ));
+        }
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        if !verify_scope_pair(&mut tx, scope).await? {
+            return Err(AstralError::Permission(
+                "physical chat scope required".into(),
+            ));
+        }
+        let Some((owner_id, configured_max)) =
+            locked_group_row(&mut tx, conversation_id, scope).await?
+        else {
+            return Err(AstralError::Permission(
+                "active scoped group required".into(),
+            ));
+        };
+        let current_count = locked_member_count(&mut tx, conversation_id).await?;
+        let role = locked_member_role(&mut tx, conversation_id, scope.user_id)
+            .await?
+            .ok_or_else(|| AstralError::Permission("group member required".into()))?;
+        authorize_group_admin(owner_id, scope.user_id, &role)?;
+        let old_limit =
+            scoped_group_member_limit(configured_max.unwrap_or(MAX_SCOPED_GROUP_MEMBERS))?;
+        if patch.max_members.is_some_and(|new_limit| {
+            new_limit < current_count
+                || new_limit > old_limit && new_limit > MAX_SCOPED_GROUP_MEMBERS
+        }) {
+            return Err(AstralError::Validation(
+                "max_members cannot be below current membership or exceed Chat bounds".into(),
+            ));
+        }
+        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE chat_conversation SET ");
+        let mut first = true;
+        if let Some(name) = &patch.name {
+            builder.push("name = ").push_bind(name.clone());
+            first = false;
+        }
+        if let Some(avatar) = &patch.avatar {
+            if !first {
+                builder.push(", ");
+            }
+            builder.push("avatar = ").push_bind(avatar.clone());
+            first = false;
+        }
+        if let Some(limit) = patch.max_members {
+            if !first {
+                builder.push(", ");
+            }
+            builder.push("max_members = ").push_bind(limit);
+            first = false;
+        }
+        if !first {
+            builder
+                .push(" WHERE id = ")
+                .push_bind(conversation_id)
+                .push(" AND domain_id = ")
+                .push_bind(scope.user_card_domain_id)
+                .push(" AND conversation_type = 'GROUP' AND status = 'ACTIVE' AND is_deleted = 0");
+            let result = builder.build().execute(&mut *tx).await.map_err(db_error)?;
+            if result.rows_affected() != 1 {
+                return Err(AstralError::Permission(
+                    "active scoped group required".into(),
+                ));
+            }
+        }
+        tx.commit().await.map_err(db_error)
+    }
+
+    async fn disband_group_scoped(
+        &self,
+        conversation_id: i64,
+        scope: &ChatScope,
+    ) -> Result<(), AstralError> {
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        if !verify_scope_pair(&mut tx, scope).await? {
+            return Err(AstralError::Permission(
+                "physical chat scope required".into(),
+            ));
+        }
+        let Some((owner_id, _)) = locked_group_row(&mut tx, conversation_id, scope).await? else {
+            return Err(AstralError::Permission(
+                "active scoped group required".into(),
+            ));
+        };
+        let role = locked_member_role(&mut tx, conversation_id, scope.user_id)
+            .await?
+            .ok_or_else(|| AstralError::Permission("group member required".into()))?;
+        if role != "OWNER" || owner_id != Some(scope.user_id) {
+            return Err(AstralError::Permission("group owner required".into()));
+        }
+        let result = sqlx::query(
+            "UPDATE chat_conversation SET status = 'DISBANDED' \
+             WHERE id = ? AND domain_id = ? AND conversation_type = 'GROUP' AND status = 'ACTIVE' AND is_deleted = 0",
+        )
+        .bind(conversation_id).bind(scope.user_card_domain_id).execute(&mut *tx).await.map_err(db_error)?;
+        if result.rows_affected() != 1 {
+            return Err(AstralError::Permission(
+                "active scoped group required".into(),
+            ));
+        }
+        tx.commit().await.map_err(db_error)
+    }
+
+    async fn add_group_member_scoped(
+        &self,
+        conversation_id: i64,
+        scope: &ChatScope,
+        user_id: i64,
+    ) -> Result<(), AstralError> {
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        if !verify_scope_pair(&mut tx, scope).await? {
+            return Err(AstralError::Permission(
+                "physical chat scope required".into(),
+            ));
+        }
+        let Some((owner_id, configured_max)) =
+            locked_group_row(&mut tx, conversation_id, scope).await?
+        else {
+            return Err(AstralError::Permission(
+                "active scoped group required".into(),
+            ));
+        };
+        let member_count = locked_member_count(&mut tx, conversation_id).await?;
+        let actor_role = locked_member_role(&mut tx, conversation_id, scope.user_id)
+            .await?
+            .ok_or_else(|| AstralError::Permission("group member required".into()))?;
+        authorize_group_admin(owner_id, scope.user_id, &actor_role)?;
+        if member_count
+            >= scoped_group_member_limit(configured_max.unwrap_or(MAX_SCOPED_GROUP_MEMBERS))?
+        {
+            return Err(AstralError::Validation("group member limit reached".into()));
+        }
+        if locked_member_role(&mut tx, conversation_id, user_id)
+            .await?
+            .is_some()
+        {
+            return Err(AstralError::Validation(
+                "target is already a group member".into(),
+            ));
+        }
+        if !target_has_unique_eligible_pair(
+            &mut tx,
+            user_id,
+            scope.user_card_tenant_id,
+            scope.user_card_domain_id,
+        )
+        .await?
+        {
+            return Err(AstralError::Permission(
+                "target user must have one eligible physical card pair in the same tenant/domain"
+                    .into(),
+            ));
+        }
+        sqlx::query("INSERT INTO chat_conversation_member (conversation_id, user_id, role, invite_by) VALUES (?, ?, 'MEMBER', ?)")
+            .bind(conversation_id).bind(user_id).bind(scope.user_id).execute(&mut *tx).await.map_err(db_error)?;
+        tx.commit().await.map_err(db_error)
+    }
+
+    async fn remove_group_member_scoped(
+        &self,
+        conversation_id: i64,
+        scope: &ChatScope,
+        user_id: i64,
+    ) -> Result<u64, AstralError> {
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        if !verify_scope_pair(&mut tx, scope).await? {
+            return Err(AstralError::Permission(
+                "physical chat scope required".into(),
+            ));
+        }
+        let Some((owner_id, _)) = locked_group_row(&mut tx, conversation_id, scope).await? else {
+            return Err(AstralError::Permission(
+                "active scoped group required".into(),
+            ));
+        };
+        let actor_role = locked_member_role(&mut tx, conversation_id, scope.user_id)
+            .await?
+            .ok_or_else(|| AstralError::Permission("group member required".into()))?;
+        let target_role = locked_member_role(&mut tx, conversation_id, user_id)
+            .await?
+            .ok_or_else(|| AstralError::Validation("target is not a group member".into()))?;
+        if owner_id == Some(user_id) || target_role == "OWNER" {
+            return Err(AstralError::Validation("cannot remove group owner".into()));
+        }
+        if user_id != scope.user_id {
+            authorize_group_admin(owner_id, scope.user_id, &actor_role)?;
+            if target_role == "ADMIN" && (actor_role != "OWNER" || owner_id != Some(scope.user_id))
+            {
+                return Err(AstralError::Permission(
+                    "only owner may remove an admin".into(),
+                ));
+            }
+        }
+        let result = sqlx::query("UPDATE chat_conversation_member SET left_at = UTC_TIMESTAMP() WHERE conversation_id = ? AND user_id = ? AND left_at IS NULL")
+            .bind(conversation_id).bind(user_id).execute(&mut *tx).await.map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(result.rows_affected())
+    }
+
     async fn is_member_scoped(
         &self,
         conversation_id: i64,
@@ -309,25 +925,13 @@ impl MemberRepository for SqlxMemberRepository {
         conversation_id: i64,
         scope: &ChatScope,
     ) -> Result<Vec<ChatScope>, AstralError> {
-        let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
-            "SELECT DISTINCT m.user_id, ic.card_id, uc.card_id \\
-             FROM chat_conversation c \\
-             INNER JOIN chat_conversation_member m ON m.conversation_id = c.id \\
-             INNER JOIN identity_card ic ON ic.user_id = m.user_id \\
-             INNER JOIN user_card uc ON uc.user_id = m.user_id \\
-             WHERE c.id = ? AND c.domain_id = ? AND c.status = 'ACTIVE' AND c.is_deleted = 0 \\
-               AND m.left_at IS NULL AND ic.status = 'ACTIVE' \\
-               AND uc.card_status = 'ACTIVE' AND uc.tenant_id = ? AND uc.domain_id = c.domain_id \\
-               AND (uc.valid_from IS NULL OR uc.valid_from <= UTC_TIMESTAMP()) \\
-               AND (uc.valid_until IS NULL OR uc.valid_until >= UTC_TIMESTAMP()) \\
-             ORDER BY m.user_id, ic.card_id, uc.card_id",
-        )
-        .bind(conversation_id)
-        .bind(scope.user_card_domain_id)
-        .bind(scope.user_card_tenant_id)
-        .fetch_all(&self.db)
-        .await
-        .map_err(db_error)?;
+        let rows: Vec<(i64, i64, i64)> = sqlx::query_as(LIST_MEMBER_SCOPES_SQL)
+            .bind(conversation_id)
+            .bind(scope.user_card_domain_id)
+            .bind(scope.user_card_tenant_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(db_error)?;
         Ok(rows
             .into_iter()
             .map(|(user_id, identity_card_id, user_card_id)| {
@@ -461,24 +1065,36 @@ impl MemberRepository for SqlxMemberRepository {
         scope: &ChatScope,
         user_id: i64,
     ) -> Result<bool, AstralError> {
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM chat_conversation_member m INNER JOIN chat_conversation c ON c.id = m.conversation_id \
+        if scope.user_id <= 0 || scope.identity_card_id <= 0 || scope.user_card_id <= 0 {
+            return Ok(false);
+        }
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT m.user_id FROM chat_conversation_member m \
+             INNER JOIN chat_conversation c ON c.id = m.conversation_id \
+             INNER JOIN platform_user pu ON pu.user_id = m.user_id AND pu.status = 'ACTIVE' AND pu.deleted_at IS NULL \
+             INNER JOIN identity_card ic ON ic.user_id = pu.user_id AND ic.status = 'ACTIVE' \
+               AND (ic.expires_at IS NULL OR ic.expires_at >= UTC_TIMESTAMP()) \
+             INNER JOIN user_card uc ON uc.user_id = pu.user_id AND uc.card_status = 'ACTIVE' \
+               AND uc.tenant_id = ? AND uc.domain_id = c.domain_id \
+               AND (uc.valid_from IS NULL OR uc.valid_from <= UTC_TIMESTAMP()) \
+               AND (uc.valid_until IS NULL OR uc.valid_until >= UTC_TIMESTAMP()) \
+             INNER JOIN tenant t ON t.tenant_id = uc.tenant_id AND t.status = 'ACTIVE' \
+             INNER JOIN tenant_domain_map tdm ON tdm.tenant_id = uc.tenant_id AND tdm.domain_id = uc.domain_id AND tdm.status = 'ACTIVE' \
              WHERE m.conversation_id = ? AND m.user_id = ? AND m.left_at IS NULL \
                AND c.domain_id = ? AND c.status = 'ACTIVE' AND c.is_deleted = 0 \
-               AND EXISTS (SELECT 1 FROM user_card uc INNER JOIN tenant t ON t.tenant_id = uc.tenant_id AND t.status = 'ACTIVE' \
-                           INNER JOIN tenant_domain_map tdm ON tdm.tenant_id = uc.tenant_id AND tdm.domain_id = uc.domain_id AND tdm.status = 'ACTIVE' \
-                           WHERE uc.user_id = m.user_id AND uc.card_status = 'ACTIVE' AND uc.tenant_id = ? AND uc.domain_id = c.domain_id \
-                             AND (uc.valid_from IS NULL OR uc.valid_from <= UTC_TIMESTAMP()) \
-                             AND (uc.valid_until IS NULL OR uc.valid_until >= UTC_TIMESTAMP()))",
+               AND (SELECT COUNT(DISTINCT active_ic.card_id) FROM identity_card active_ic \
+                    WHERE active_ic.user_id = pu.user_id AND active_ic.status = 'ACTIVE' \
+                      AND (active_ic.expires_at IS NULL OR active_ic.expires_at >= UTC_TIMESTAMP())) = 1 \
+             LIMIT 2",
         )
+        .bind(scope.user_card_tenant_id)
         .bind(conversation_id)
         .bind(user_id)
         .bind(scope.user_card_domain_id)
-        .bind(scope.user_card_tenant_id)
-        .fetch_one(&self.db)
+        .fetch_all(&self.db)
         .await
         .map_err(db_error)?;
-        Ok(count.0 > 0)
+        Ok(rows.len() == 1)
     }
 
     async fn member_count_scoped(
@@ -545,17 +1161,42 @@ impl MemberRepository for SqlxMemberRepository {
         scope: &ChatScope,
         user_id: i64,
     ) -> Result<u64, AstralError> {
-        sqlx::query(
-            "DELETE m FROM chat_conversation_member m INNER JOIN chat_conversation c ON c.id = m.conversation_id \
-             WHERE m.conversation_id = ? AND m.user_id = ? AND c.domain_id = ? AND c.is_deleted = 0",
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        if !verify_scope_pair(&mut tx, scope).await? {
+            return Err(AstralError::Permission(
+                "physical chat scope required".into(),
+            ));
+        }
+        let eligible_target = target_has_unique_eligible_pair(
+            &mut tx,
+            user_id,
+            scope.user_card_tenant_id,
+            scope.user_card_domain_id,
+        )
+        .await?;
+        if !eligible_target
+            || locked_member_role(&mut tx, conversation_id, user_id)
+                .await?
+                .is_none()
+        {
+            return Err(AstralError::Permission(
+                "target is not an eligible member in this scoped conversation".into(),
+            ));
+        }
+        let result = sqlx::query(
+            "UPDATE chat_conversation_member m INNER JOIN chat_conversation c ON c.id = m.conversation_id \
+             SET m.left_at = UTC_TIMESTAMP() WHERE m.conversation_id = ? AND m.user_id = ? \
+               AND m.left_at IS NULL AND c.domain_id = ? AND c.status = 'ACTIVE' \
+               AND c.conversation_type <> 'GROUP' AND c.is_deleted = 0",
         )
         .bind(conversation_id)
         .bind(user_id)
         .bind(scope.user_card_domain_id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
-        .map(|result| result.rows_affected())
-        .map_err(db_error)
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(result.rows_affected())
     }
 
     async fn transfer_group_owner_scoped(
@@ -565,17 +1206,65 @@ impl MemberRepository for SqlxMemberRepository {
         old_owner_id: i64,
         new_owner_id: i64,
     ) -> Result<(), AstralError> {
-        if !self.is_user_in_scope(scope, new_owner_id).await?
-            || !self
-                .is_member_target_scoped(conversation_id, scope, new_owner_id)
-                .await?
-        {
+        if old_owner_id != scope.user_id || old_owner_id == new_owner_id {
             return Err(AstralError::Permission(
-                "new owner is outside card scope".into(),
+                "invalid group owner transfer".into(),
             ));
         }
-        self.transfer_group_owner(conversation_id, old_owner_id, new_owner_id)
-            .await
+        let mut tx = self.db.begin().await.map_err(db_error)?;
+        if !verify_scope_pair(&mut tx, scope).await? {
+            return Err(AstralError::Permission(
+                "physical chat scope required".into(),
+            ));
+        }
+        let Some((owner_id, _)) = locked_group_row(&mut tx, conversation_id, scope).await? else {
+            return Err(AstralError::Permission(
+                "active scoped group required".into(),
+            ));
+        };
+        if owner_id != Some(old_owner_id)
+            || locked_member_role(&mut tx, conversation_id, old_owner_id)
+                .await?
+                .as_deref()
+                != Some("OWNER")
+        {
+            return Err(AstralError::Permission(
+                "current group owner required".into(),
+            ));
+        }
+        if locked_member_role(&mut tx, conversation_id, new_owner_id)
+            .await?
+            .is_none()
+            || !target_has_unique_eligible_pair(
+                &mut tx,
+                new_owner_id,
+                scope.user_card_tenant_id,
+                scope.user_card_domain_id,
+            )
+            .await?
+        {
+            return Err(AstralError::Permission(
+                "new owner must be an eligible member in this tenant/domain".into(),
+            ));
+        }
+        let result = sqlx::query("UPDATE chat_conversation SET owner_id = ? WHERE id = ? AND owner_id = ? AND domain_id = ? AND conversation_type = 'GROUP' AND status = 'ACTIVE' AND is_deleted = 0")
+            .bind(new_owner_id).bind(conversation_id).bind(old_owner_id).bind(scope.user_card_domain_id)
+            .execute(&mut *tx).await.map_err(db_error)?;
+        if result.rows_affected() != 1 {
+            return Err(AstralError::Permission(
+                "group owner transfer lost conversation fence".into(),
+            ));
+        }
+        let old = sqlx::query("UPDATE chat_conversation_member SET role = 'ADMIN' WHERE conversation_id = ? AND user_id = ? AND role = 'OWNER' AND left_at IS NULL")
+            .bind(conversation_id).bind(old_owner_id).execute(&mut *tx).await.map_err(db_error)?;
+        let new = sqlx::query("UPDATE chat_conversation_member SET role = 'OWNER' WHERE conversation_id = ? AND user_id = ? AND left_at IS NULL")
+            .bind(conversation_id).bind(new_owner_id).execute(&mut *tx).await.map_err(db_error)?;
+        if old.rows_affected() != 1 || new.rows_affected() != 1 {
+            return Err(AstralError::Database(
+                "group ownership transfer member rows changed concurrently".into(),
+            ));
+        }
+        tx.commit().await.map_err(db_error)
     }
     async fn is_member(&self, conversation_id: i64, user_id: i64) -> Result<bool, AstralError> {
         let count: (i64,) = sqlx::query_as(
@@ -819,4 +1508,19 @@ impl MemberRepository for SqlxMemberRepository {
 
 fn db_error(error: sqlx::Error) -> AstralError {
     AstralError::Database(format!("Member repository query failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Execute;
+
+    #[test]
+    fn conversation_lock_sql_is_parameterized_and_has_no_literal_backslash() {
+        let query = sqlx::query::<sqlx::MySql>(LOCK_ACTIVE_CONVERSATION_SQL);
+        let emitted = query.sql();
+        assert!(!emitted.contains('\\'));
+        assert!(emitted.contains("id = ? AND domain_id = ?"));
+        assert!(emitted.ends_with("FOR UPDATE"));
+    }
 }

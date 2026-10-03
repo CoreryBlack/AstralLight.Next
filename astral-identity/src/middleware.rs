@@ -190,7 +190,7 @@ pub async fn identity_permission_middleware(
         let pool = state.db.clone();
         let hit_phase =
             policy_engine::PolicyEngine::allow_source_phase(&decision).map(String::from);
-        tokio::spawn(async move {
+        if let Err(reason) = astral_common::audit::spawn_owned_audit(async move {
             astral_common::audit::record_permission_audit_with_request_detail(
                 user_id,
                 card_id,
@@ -217,7 +217,9 @@ pub async fn identity_permission_middleware(
                     .await;
                 }
             }
-        });
+        }) {
+            tracing::error!(reason, "policy audit task was not admitted");
+        }
     }
 
     if !decision.allowed {

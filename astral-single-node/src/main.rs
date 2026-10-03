@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
@@ -13,8 +15,19 @@ const DEFAULT_GATEWAY_ADDR: &str = "0.0.0.0:9001";
 const DEFAULT_IDENTITY_ADDR: &str = "0.0.0.0:9004";
 const DEFAULT_TRUSTGRAPH_ADDR: &str = "0.0.0.0:9005";
 
-/// 有界关停窗口：`abort()` 之后的 join 必须在预算内完成，绝不无限等待。
+/// Bounded join budget for cancellation cleanup paths.
 const SERVICE_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// HTTP, producer barrier, worker joins, audit drain, and Local consumer joins all
+/// have independent bounds. TrustGraph runs several of these phases sequentially;
+/// allow their cumulative budget plus margin instead of cancelling a proven drain
+/// while a bounded inner phase is still progressing.
+// TrustGraph owns an ORG_SCOPE event deadline configurable up to 3,599s, plus
+// sequential bounded workers before the shared producer barrier. Keep an outer
+// cap above the maximum legal phase sum; a lower cap would misreport a healthy,
+// bounded producer drain as unknown and risk dropping drain proofs.
+const GRACEFUL_SERVICE_DRAIN_TIMEOUT: Duration = Duration::from_secs(4_500);
+/// Gateway only owns the bounded HTTP drain.
+const GRACEFUL_GATEWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(35);
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_owned())
@@ -142,6 +155,7 @@ async fn wait_for_bus_owners(
     bus: &LocalBus,
     identity: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
     trustgraph: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    joined: &mut HashSet<&'static str>,
 ) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -175,8 +189,14 @@ async fn wait_for_bus_owners(
         let retry = tokio::time::sleep(Duration::from_millis(100));
         tokio::pin!(retry);
         tokio::select! {
-            result = &mut *identity => return task_failed("identity", result),
-            result = &mut *trustgraph => return task_failed("trustgraph", result),
+            result = &mut *identity => {
+                joined.insert("identity");
+                return task_failed("identity", result);
+            },
+            result = &mut *trustgraph => {
+                joined.insert("trustgraph");
+                return task_failed("trustgraph", result);
+            },
             _ = &mut retry => {}
         }
     }
@@ -184,8 +204,9 @@ async fn wait_for_bus_owners(
 
 async fn wait_for_listener_or_task(
     addr: &str,
-    service: &str,
+    service: &'static str,
     task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    joined: &mut HashSet<&'static str>,
 ) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -196,7 +217,10 @@ async fn wait_for_listener_or_task(
                 let retry = tokio::time::sleep(Duration::from_millis(100));
                 tokio::pin!(retry);
                 tokio::select! {
-                    result = &mut *task => return task_failed(service, result),
+                    result = &mut *task => {
+                        joined.insert(service);
+                        return task_failed(service, result);
+                    },
                     _ = &mut retry => {}
                 }
             }
@@ -220,65 +244,317 @@ fn task_failed(
     }
 }
 
-async fn abort_task(task: &mut tokio::task::JoinHandle<anyhow::Result<()>>, service: &str) -> bool {
+async fn abort_task(
+    task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    service: &str,
+) -> (anyhow::Result<()>, bool) {
     abort_task_within(task, service, SERVICE_SHUTDOWN_JOIN_TIMEOUT).await
 }
 
-/// abort 之后限时 join：预算内拿到结果按原语义记录；超时说明任务没有在
-/// 取消点退出，记录后脱离（进程即将退出，runtime drop 兜底回收），绝不
-/// 让一个拒绝退出的任务把整个关停流程无限期卡死。
+/// Abort then join under a fixed bound. Completed task outcomes are always
+/// observed; the boolean records whether this call consumed a terminal JoinHandle
+/// result. A timeout is unknown and leaves the handle eligible for one later join.
 async fn abort_task_within(
     task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
     service: &str,
     join_budget: Duration,
-) -> bool {
-    if task.is_finished() {
-        tracing::debug!(
-            service,
-            "composite service task already completed before bounded abort"
-        );
-        return true;
+) -> (anyhow::Result<()>, bool) {
+    if !task.is_finished() {
+        task.abort();
     }
-    task.abort();
-    match tokio::time::timeout(join_budget, &mut *task).await {
-        Ok(join_result) => {
-            match join_result {
-                Ok(Ok(())) => tracing::info!(service, "composite service stopped"),
-                Ok(Err(error)) => {
-                    tracing::warn!(service, error = %error, "composite service stopped with error")
-                }
-                Err(join_error) if join_error.is_cancelled() => {
-                    tracing::info!(service, "composite service aborted")
-                }
-                Err(join_error) => {
-                    tracing::warn!(service, error = %join_error, "composite service join failed")
-                }
-            }
-            true
-        }
-        Err(_elapsed) => {
-            tracing::error!(
-                service,
-                budget_ms = join_budget.as_millis() as u64,
-                "composite service did not stop within the bounded shutdown window; detaching task"
+    let joined = match tokio::time::timeout(join_budget, &mut *task).await {
+        Ok(joined) => joined,
+        Err(_) => {
+            let reason = format!(
+                "{service} did not stop within {join_budget:?}; abort/join outcome unknown"
             );
-            false
+            tracing::error!(service, budget_ms = join_budget.as_millis() as u64, %reason);
+            return (Err(anyhow!(reason)), false);
         }
+    };
+    let result = match joined {
+        Ok(Ok(())) => {
+            tracing::info!(service, "composite service stopped cleanly");
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            let reason = format!("{service} stopped with service error: {error}");
+            tracing::warn!(service, error = %error, "composite service stopped with error");
+            Err(anyhow!(reason))
+        }
+        Err(join_error) if join_error.is_cancelled() => {
+            tracing::info!(service, "composite service abort completed");
+            Ok(())
+        }
+        Err(join_error) => {
+            let reason = format!("{service} task join failed: {join_error}");
+            tracing::warn!(service, error = %join_error, "composite service join failed");
+            Err(anyhow!(reason))
+        }
+    };
+    (result, true)
+}
+
+async fn abort_if_not_joined(
+    joined: &HashSet<&'static str>,
+    task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    service: &'static str,
+) -> (anyhow::Result<()>, bool) {
+    if joined.contains(service) {
+        (Ok(()), true)
+    } else {
+        abort_task(task, service).await
     }
 }
 
 /// 组合进程全部服务的有界关停：任何退出路径（任务失败、owner 丢失、
 /// 租约丢失、信号错误、正常信号）都必须逐一有界 abort，保证没有服务
-/// 被遗漏或无限等待。
+/// 被遗漏或无限等待。已消费的 JoinHandle 结果由 `joined` 跳过，绝不再次 poll。
 async fn abort_all_services(
+    joined: &mut HashSet<&'static str>,
     identity: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
     trustgraph: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
     gateway: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
-) -> bool {
-    let identity_stopped = abort_task(identity, "identity").await;
-    let trustgraph_stopped = abort_task(trustgraph, "trustgraph").await;
-    let gateway_stopped = abort_task(gateway, "gateway").await;
-    identity_stopped && trustgraph_stopped && gateway_stopped
+) -> anyhow::Result<()> {
+    let (identity_outcome, trustgraph_outcome, gateway_outcome) = tokio::join!(
+        abort_if_not_joined(joined, identity, "identity"),
+        abort_if_not_joined(joined, trustgraph, "trustgraph"),
+        abort_if_not_joined(joined, gateway, "gateway"),
+    );
+    let outcomes = [
+        ("identity", identity_outcome),
+        ("trustgraph", trustgraph_outcome),
+        ("gateway", gateway_outcome),
+    ];
+    let mut failures = Vec::new();
+    for (service, outcome) in outcomes {
+        if let Err(error) = remember_join_result(joined, service, outcome) {
+            failures.push(error.to_string());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(failures.join("; ")))
+    }
+}
+
+async fn join_service_within(
+    task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    service: &'static str,
+    budget: Duration,
+) -> (anyhow::Result<()>, bool) {
+    match tokio::time::timeout(budget, &mut *task).await {
+        Ok(Ok(Ok(()))) => {
+            tracing::info!(service, "composite service drained gracefully");
+            (Ok(()), true)
+        }
+        Ok(Ok(Err(error))) => (
+            Err(error).with_context(|| format!("{service} shutdown failed")),
+            true,
+        ),
+        Ok(Err(error)) => (
+            Err(anyhow!(error)).with_context(|| format!("{service} join failed")),
+            true,
+        ),
+        Err(_) => {
+            task.abort();
+            (
+                Err(anyhow!(
+                    "{service} did not drain within {budget:?}; outcome unknown"
+                )),
+                false,
+            )
+        }
+    }
+}
+
+/// Record a terminal JoinHandle result before returning its success or failure.
+/// JoinHandle futures must never be polled again after either terminal outcome.
+fn remember_join_result(
+    joined: &mut HashSet<&'static str>,
+    service: &'static str,
+    outcome: (anyhow::Result<()>, bool),
+) -> anyhow::Result<()> {
+    let (result, completed) = outcome;
+    if completed {
+        joined.insert(service);
+    }
+    result
+}
+
+/// Graceful stop order: sticky admission closure is performed by the caller;
+/// Gateway HTTP drains first, then Identity/TrustGraph HTTP+producer workers
+/// reach their shared barrier, close Local receivers and join owned consumers.
+async fn graceful_stop_services(
+    gateway_shutdown: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    identity_shutdown: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    trustgraph_shutdown: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    joined: &mut HashSet<&'static str>,
+    identity: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    trustgraph: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    gateway: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    if let Some(shutdown) = gateway_shutdown.take() {
+        let _ = shutdown.send(());
+    }
+    let mut failures = Vec::new();
+    if !joined.contains("gateway") {
+        let outcome = join_service_within(gateway, "gateway", GRACEFUL_GATEWAY_DRAIN_TIMEOUT).await;
+        if let Err(error) = remember_join_result(joined, "gateway", outcome) {
+            failures.push(error.to_string());
+        }
+    }
+
+    if let Some(shutdown) = identity_shutdown.take() {
+        let _ = shutdown.send(());
+    }
+    if let Some(shutdown) = trustgraph_shutdown.take() {
+        let _ = shutdown.send(());
+    }
+    if joined.contains("identity") || joined.contains("trustgraph") {
+        return Err(anyhow!(
+            "Identity/TrustGraph exited before the producer barrier; peer drain outcome unknown"
+        ));
+    }
+    let (identity_outcome, trustgraph_outcome) = tokio::join!(
+        join_service_within(identity, "identity", GRACEFUL_SERVICE_DRAIN_TIMEOUT),
+        join_service_within(trustgraph, "trustgraph", GRACEFUL_SERVICE_DRAIN_TIMEOUT),
+    );
+    let identity_result = remember_join_result(joined, "identity", identity_outcome);
+    let trustgraph_result = remember_join_result(joined, "trustgraph", trustgraph_outcome);
+    if let Err(error) = identity_result {
+        failures.push(error.to_string());
+    }
+    if let Err(error) = trustgraph_result {
+        failures.push(error.to_string());
+    }
+    if joined.contains("identity") && joined.contains("trustgraph") && failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Identity/TrustGraph drain incomplete or unknown: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+/// Startup can fail after Identity and TrustGraph have bound their listeners but
+/// before Gateway starts. Close the sticky gate first (caller), then stop both
+/// producers so their shared barrier can complete before their tasks are joined.
+async fn graceful_stop_producers(
+    identity_shutdown: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    trustgraph_shutdown: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    joined: &mut HashSet<&'static str>,
+    identity: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    trustgraph: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    if let Some(shutdown) = identity_shutdown.take() {
+        let _ = shutdown.send(());
+    }
+    if let Some(shutdown) = trustgraph_shutdown.take() {
+        let _ = shutdown.send(());
+    }
+    if joined.contains("identity") || joined.contains("trustgraph") {
+        return Err(anyhow!(
+            "service exited before producer barrier; peer drain outcome unknown"
+        ));
+    }
+    let (identity_outcome, trustgraph_outcome) = tokio::join!(
+        join_service_within(identity, "identity", GRACEFUL_SERVICE_DRAIN_TIMEOUT),
+        join_service_within(trustgraph, "trustgraph", GRACEFUL_SERVICE_DRAIN_TIMEOUT),
+    );
+    let identity_result = remember_join_result(joined, "identity", identity_outcome);
+    let trustgraph_result = remember_join_result(joined, "trustgraph", trustgraph_outcome);
+    match (identity_result, trustgraph_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (identity, trustgraph) => {
+            let failures = [identity.err(), trustgraph.err()]
+                .into_iter()
+                .flatten()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>();
+            Err(anyhow!(
+                "producer drain incomplete/unknown: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+}
+
+/// Run the ordered graceful drain after a known fatal condition. If any drain
+/// phase is unproven, make one bounded abort attempt for every owned service and
+/// retain both the original failure and the drain failure in the final result.
+#[allow(clippy::too_many_arguments)]
+async fn graceful_stop_or_abort(
+    gateway_shutdown: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    identity_shutdown: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    trustgraph_shutdown: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    joined: &mut HashSet<&'static str>,
+    identity: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    trustgraph: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    gateway: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    primary: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let drain = graceful_stop_services(
+        gateway_shutdown,
+        identity_shutdown,
+        trustgraph_shutdown,
+        joined,
+        identity,
+        trustgraph,
+        gateway,
+    )
+    .await;
+    if let Err(drain_error) = drain {
+        let abort_result = abort_all_services(joined, identity, trustgraph, gateway).await;
+        let drain_error = match abort_result {
+            Ok(()) => {
+                format!("graceful service drain failed: {drain_error}; bounded abort completed")
+            }
+            Err(abort_error) => format!(
+                "graceful service drain failed: {drain_error}; abort outcome: {abort_error}"
+            ),
+        };
+        return match primary {
+            Err(primary_error) => Err(primary_error.context(drain_error)),
+            Ok(()) => Err(anyhow!(drain_error)),
+        };
+    }
+    if ![
+        joined.contains("identity"),
+        joined.contains("trustgraph"),
+        joined.contains("gateway"),
+    ]
+    .into_iter()
+    .all(|completed| completed)
+    {
+        return match primary {
+            Err(primary_error) => Err(primary_error
+                .context("coordinated service drain did not consume every service result")),
+            Ok(()) => Err(anyhow!(
+                "coordinated service drain did not consume every service result"
+            )),
+        };
+    }
+    primary
+}
+
+async fn wait_for_source_writers_quiet(timeout: Duration) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let hub = astral_db::memory_projection_hub::memory_projection_hub()
+            .ok_or_else(|| anyhow!("memory projection hub unavailable during shutdown"))?;
+        if !hub.has_active_source_writer() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "source writers remained active at shutdown; snapshot suppressed"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// Closes authority admission before the remaining services are aborted.
@@ -360,23 +636,60 @@ async fn main() -> anyhow::Result<()> {
         "memory mirror warm-up complete; composite readiness gate passed"
     );
 
+    let (identity_shutdown_tx, identity_shutdown_rx) = tokio::sync::oneshot::channel();
+    let mut identity_shutdown_tx = Some(identity_shutdown_tx);
+    let (trustgraph_shutdown_tx, trustgraph_shutdown_rx) = tokio::sync::oneshot::channel();
+    let mut trustgraph_shutdown_tx = Some(trustgraph_shutdown_tx);
+    let producer_drain_barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let identity_barrier = Arc::clone(&producer_drain_barrier);
+    let trustgraph_barrier = Arc::clone(&producer_drain_barrier);
     let identity_task_addr = identity_addr.clone();
+    let mut identity = tokio::spawn(async move {
+        astral_identity::run_with_listen_addr_and_shutdown_and_drain(
+            &identity_task_addr,
+            async move {
+                let _ = identity_shutdown_rx.await;
+            },
+            async move {
+                identity_barrier.wait().await;
+            },
+        )
+        .await
+    });
     let trustgraph_task_addr = trustgraph_addr.clone();
-    let mut identity =
-        tokio::spawn(
-            async move { astral_identity::run_with_listen_addr(&identity_task_addr).await },
-        );
     let mut trustgraph = tokio::spawn(async move {
-        astral_trustgraph::run_with_listen_addr(&trustgraph_task_addr).await
+        astral_trustgraph::run_with_listen_addr_and_shutdown_and_drain(
+            &trustgraph_task_addr,
+            async move {
+                let _ = trustgraph_shutdown_rx.await;
+            },
+            async move {
+                trustgraph_barrier.wait().await;
+            },
+        )
+        .await
     });
 
     // readiness 期间租约监督持续生效：任一 listener 未就绪时租约丢失同样
     // 立即终止，绝不放任丢失、绝不误声明 READINESS。
+    let mut joined = HashSet::new();
     let readiness = tokio::select! {
         result = async {
-            wait_for_listener_or_task(&identity_addr, "identity", &mut identity).await?;
-            wait_for_listener_or_task(&trustgraph_addr, "trustgraph", &mut trustgraph).await?;
-            wait_for_bus_owners(&bus, &mut identity, &mut trustgraph).await
+            wait_for_listener_or_task(
+                &identity_addr,
+                "identity",
+                &mut identity,
+                &mut joined,
+            )
+            .await?;
+            wait_for_listener_or_task(
+                &trustgraph_addr,
+                "trustgraph",
+                &mut trustgraph,
+                &mut joined,
+            )
+            .await?;
+            wait_for_bus_owners(&bus, &mut identity, &mut trustgraph, &mut joined).await
         } => result,
         loss = lease_supervisor.wait_for_loss() => {
             tracing::error!(reason = %loss, "writer lease lost before composite readiness; aborting startup");
@@ -385,62 +698,153 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     if let Err(error) = readiness {
-        abort_task(&mut identity, "identity").await;
-        abort_task(&mut trustgraph, "trustgraph").await;
+        // Startup never reached the full composite readiness gate. Close the
+        // sticky authority gate before signaling producers, and drain both
+        // services through the shared producer barrier; an unknown drain stays
+        // an error and can never authorize snapshot persistence.
+        mark_hub_suspect("single-node startup readiness failed");
+        let producer_stop = graceful_stop_producers(
+            &mut identity_shutdown_tx,
+            &mut trustgraph_shutdown_tx,
+            &mut joined,
+            &mut identity,
+            &mut trustgraph,
+        )
+        .await;
+        if let Err(drain_error) = producer_stop {
+            let aborts = tokio::join!(
+                abort_if_not_joined(&joined, &mut identity, "identity"),
+                abort_if_not_joined(&joined, &mut trustgraph, "trustgraph"),
+            );
+            let identity_abort = remember_join_result(&mut joined, "identity", aborts.0);
+            let trustgraph_abort = remember_join_result(&mut joined, "trustgraph", aborts.1);
+            let abort_report = match (identity_abort, trustgraph_abort) {
+                (Ok(()), Ok(())) => "bounded aborts completed".to_owned(),
+                (identity, trustgraph) => format!(
+                    "bounded abort outcomes identity={identity:?}, trustgraph={trustgraph:?}"
+                ),
+            };
+            return Err(error.context(format!(
+                "producer startup drain failed: {drain_error}; {abort_report}"
+            )));
+        }
         return Err(error);
     }
     tracing::info!("single-node service listeners and message owners ready; starting gateway");
-    let mut gateway =
-        tokio::spawn(async move { astral_gateway::run_with_listen_addr(&gateway_addr).await });
+    let (gateway_shutdown_tx, gateway_shutdown_rx) = tokio::sync::oneshot::channel();
+    let mut gateway = tokio::spawn(async move {
+        astral_gateway::run_with_listen_addr_and_shutdown(&gateway_addr, async move {
+            let _ = gateway_shutdown_rx.await;
+        })
+        .await
+    });
+    let mut gateway_shutdown_tx = Some(gateway_shutdown_tx);
     let mut owner_watch = tokio::time::interval(Duration::from_millis(250));
     owner_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let runtime_result = 'runtime: loop {
         tokio::select! {
             result = &mut identity => {
+                let failure = task_failed("identity", result);
                 mark_hub_suspect("required identity service exited");
-                abort_task(&mut trustgraph, "trustgraph").await;
-                abort_task(&mut gateway, "gateway").await;
-                break 'runtime task_failed("identity", result);
+                let mut joined = HashSet::from(["identity"]);
+                let failure = graceful_stop_or_abort(
+                    &mut gateway_shutdown_tx,
+                    &mut identity_shutdown_tx,
+                    &mut trustgraph_shutdown_tx,
+                    &mut joined,
+                    &mut identity,
+                    &mut trustgraph,
+                    &mut gateway,
+                    failure,
+                ).await;
+                break 'runtime failure;
             },
             result = &mut trustgraph => {
+                let failure = task_failed("trustgraph", result);
                 mark_hub_suspect("required trustgraph service exited");
-                abort_task(&mut identity, "identity").await;
-                abort_task(&mut gateway, "gateway").await;
-                break 'runtime task_failed("trustgraph", result);
+                let mut joined = HashSet::from(["trustgraph"]);
+                let failure = graceful_stop_or_abort(
+                    &mut gateway_shutdown_tx,
+                    &mut identity_shutdown_tx,
+                    &mut trustgraph_shutdown_tx,
+                    &mut joined,
+                    &mut identity,
+                    &mut trustgraph,
+                    &mut gateway,
+                    failure,
+                ).await;
+                break 'runtime failure;
             },
             result = &mut gateway => {
+                let failure = task_failed("gateway", result);
                 mark_hub_suspect("required gateway service exited");
-                abort_task(&mut identity, "identity").await;
-                abort_task(&mut trustgraph, "trustgraph").await;
-                break 'runtime task_failed("gateway", result);
+                let mut joined = HashSet::from(["gateway"]);
+                let failure = graceful_stop_or_abort(
+                    &mut gateway_shutdown_tx,
+                    &mut identity_shutdown_tx,
+                    &mut trustgraph_shutdown_tx,
+                    &mut joined,
+                    &mut identity,
+                    &mut trustgraph,
+                    &mut gateway,
+                    failure,
+                ).await;
+                break 'runtime failure;
             },
             _ = owner_watch.tick() => {
                 if let Some(reason) = projection_worker_dead_reason() {
-                    // Required projection owner died at runtime: sticky
-                    // fail-closed (hub mark_runtime_owner_failed already
-                    // raised by the worker supervisor). Stop every service
-                    // with a loud error; recovery is a process restart.
                     mark_hub_suspect(&reason);
-                    abort_all_services(&mut identity, &mut trustgraph, &mut gateway).await;
-                    break 'runtime Err(anyhow!(
-                        "local projection worker died after readiness; sticky fail-closed: {reason}"
-                    ));
+                    let mut joined = HashSet::new();
+                    let failure = graceful_stop_or_abort(
+                        &mut gateway_shutdown_tx,
+                        &mut identity_shutdown_tx,
+                        &mut trustgraph_shutdown_tx,
+                        &mut joined,
+                        &mut identity,
+                        &mut trustgraph,
+                        &mut gateway,
+                        Err(anyhow!(
+                            "local projection worker died after readiness; sticky fail-closed: {reason}"
+                        )),
+                    ).await;
+                    break 'runtime failure;
                 }
                 if !bus.owners_ready() {
                     mark_hub_suspect("required local bus owner channel closed");
-                    abort_all_services(&mut identity, &mut trustgraph, &mut gateway).await;
-                    break 'runtime Err(anyhow!("local bus owner channel closed after readiness"));
+                    let mut joined = HashSet::new();
+                    let failure = graceful_stop_or_abort(
+                        &mut gateway_shutdown_tx,
+                        &mut identity_shutdown_tx,
+                        &mut trustgraph_shutdown_tx,
+                        &mut joined,
+                        &mut identity,
+                        &mut trustgraph,
+                        &mut gateway,
+                        Err(anyhow!("local bus owner channel closed after readiness")),
+                    ).await;
+                    break 'runtime failure;
                 }
             },
             loss = lease_supervisor.wait_for_loss() => {
                 tracing::error!(reason = %loss, "writer lease lost after readiness; stopping all composite services");
                 mark_hub_suspect(&loss);
-                abort_all_services(&mut identity, &mut trustgraph, &mut gateway).await;
-                break 'runtime Err(anyhow!("single-node writer lease lost after readiness: {loss}"));
+                let mut joined = HashSet::new();
+                let failure = graceful_stop_or_abort(
+                    &mut gateway_shutdown_tx,
+                    &mut identity_shutdown_tx,
+                    &mut trustgraph_shutdown_tx,
+                    &mut joined,
+                    &mut identity,
+                    &mut trustgraph,
+                    &mut gateway,
+                    Err(anyhow!("single-node writer lease lost after readiness: {loss}")),
+                ).await;
+                break 'runtime failure;
             },
             signal = tokio::signal::ctrl_c() => {
-                let outcome = match signal {
+                mark_hub_suspect("single-node shutdown admission closed");
+                let signal_result = match signal {
                     Ok(()) => {
                         tracing::info!("single-node shutdown requested");
                         Ok(())
@@ -450,17 +854,32 @@ async fn main() -> anyhow::Result<()> {
                         Err(anyhow::Error::new(error).context("wait for shutdown signal"))
                     }
                 };
-                let stopped = abort_all_services(&mut identity, &mut trustgraph, &mut gateway).await;
-                if !stopped && outcome.is_ok() {
-                    break 'runtime Err(anyhow!("composite services did not all stop within the shutdown budget"));
-                }
+                let mut joined = HashSet::new();
+                let outcome = graceful_stop_or_abort(
+                    &mut gateway_shutdown_tx,
+                    &mut identity_shutdown_tx,
+                    &mut trustgraph_shutdown_tx,
+                    &mut joined,
+                    &mut identity,
+                    &mut trustgraph,
+                    &mut gateway,
+                    signal_result,
+                ).await;
                 break 'runtime outcome;
             }
         }
     };
     if runtime_result.is_ok() {
-        if let Some(path) = local_snapshot_path.as_deref() {
-            save_shutdown_snapshot(&db, path).await;
+        match wait_for_source_writers_quiet(SERVICE_SHUTDOWN_JOIN_TIMEOUT).await {
+            Ok(()) => {
+                if let Some(path) = local_snapshot_path.as_deref() {
+                    save_shutdown_snapshot(&db, path).await;
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "source writers were not proven quiet; skipping hint snapshot");
+                return Err(error);
+            }
         }
     }
     runtime_result
@@ -494,12 +913,12 @@ mod tests {
             let close = body
                 .find("mark_hub_suspect(")
                 .expect("loss must close the sticky authority gate");
-            let abort = body
-                .find("abort_")
-                .expect("loss must stop the other services");
+            let stop = body
+                .find("graceful_stop_or_abort(")
+                .expect("loss must stop the other services through the owned drain");
             assert!(
-                close < abort,
-                "authority must close before aborting services in {branch}"
+                close < stop,
+                "authority must close before draining services in {branch}"
             );
         }
     }
@@ -590,7 +1009,7 @@ mod tests {
         );
         assert!(
             run_loop_window.contains("mark_hub_suspect(&reason)")
-                && run_loop_window.contains("abort_all_services"),
+                && run_loop_window.contains("graceful_stop_or_abort"),
             "a Dead owner must stop all services fail-closed"
         );
         assert!(
@@ -652,9 +1071,33 @@ mod tests {
             "run loop must wait for lease loss"
         );
         assert!(
-            run_loop_window.contains("abort_all_services"),
-            "run loop exit paths must bounded-abort all services"
+            run_loop_window.contains("graceful_stop_or_abort"),
+            "run loop exit paths must attempt ordered graceful drain then bounded abort"
         );
+    }
+
+    /// A terminal service Err is still a consumed JoinHandle result. The
+    /// fallback-abort helper must consult the recorded set rather than polling
+    /// that handle a second time.
+    #[tokio::test]
+    async fn terminal_service_error_is_recorded_and_not_polled_again() {
+        let mut task: tokio::task::JoinHandle<anyhow::Result<()>> =
+            tokio::spawn(async { Err(anyhow!("service failed")) });
+        let outcome = join_service_within(&mut task, "identity", Duration::from_secs(1)).await;
+        let mut joined = HashSet::new();
+        let drain_result = remember_join_result(&mut joined, "identity", outcome);
+        assert!(
+            drain_result.is_err(),
+            "the terminal service Err stays a failure"
+        );
+        assert!(
+            joined.contains("identity"),
+            "the terminal result must be recorded"
+        );
+
+        let (abort_result, completed) = abort_if_not_joined(&joined, &mut task, "identity").await;
+        assert!(abort_result.is_ok());
+        assert!(completed);
     }
 
     /// 有界关停行为：可取消任务在 abort 后必须立即被限时 join 回收，
@@ -666,8 +1109,9 @@ mod tests {
             Ok(())
         });
         let started = Instant::now();
-        let stopped = abort_task(&mut task, "identity").await;
-        assert!(stopped);
+        let (stopped, completed) = abort_task(&mut task, "identity").await;
+        assert!(stopped.is_ok());
+        assert!(completed);
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "abort must reclaim the task immediately instead of waiting for its natural end"
@@ -689,8 +1133,10 @@ mod tests {
         });
         let _ = started_rx.await;
         let started = Instant::now();
-        let stopped = abort_task_within(&mut task, "identity", Duration::from_millis(50)).await;
-        assert!(!stopped);
+        let (stopped, completed) =
+            abort_task_within(&mut task, "identity", Duration::from_millis(50)).await;
+        assert!(stopped.is_err());
+        assert!(!completed);
         let elapsed = started.elapsed();
         assert!(
             elapsed >= Duration::from_millis(50),
@@ -700,7 +1146,8 @@ mod tests {
             elapsed < Duration::from_secs(4),
             "must detach after the budget instead of joining forever"
         );
-        // 回收后台任务，避免测试运行时残留阻塞 worker。
+        // Timed out means the aborted task still runs a synchronous section;
+        // test-only blocking work must be allowed to finish before runtime drop.
         let _ = task.await;
     }
 }

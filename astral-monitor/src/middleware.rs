@@ -116,7 +116,7 @@ pub async fn monitor_permission_middleware(
         let pool = state.db.clone();
         let hit_phase =
             policy_engine::PolicyEngine::allow_source_phase(&decision).map(String::from);
-        tokio::spawn(async move {
+        if let Err(reason) = astral_common::audit::spawn_owned_audit(async move {
             astral_common::audit::record_permission_audit_with_request_detail(
                 user_id,
                 card_id,
@@ -143,7 +143,9 @@ pub async fn monitor_permission_middleware(
                     .await;
                 }
             }
-        });
+        }) {
+            tracing::error!(reason, "monitor permission audit task rejected");
+        }
     }
 
     if !decision.allowed {
@@ -215,6 +217,60 @@ pub async fn monitor_permission_middleware(
 
 #[cfg(test)]
 mod tests {
+    use astral_common::middleware::permission_check_shared::resolve_permission_action;
+    use astral_types::ResourceRegistry;
+
+    #[test]
+    fn monitor_write_routes_use_registered_actions() {
+        let registry = ResourceRegistry::global();
+        for action in [
+            "read",
+            "create",
+            "update",
+            "delete",
+            "scan",
+            "reset",
+            "arbitrate",
+        ] {
+            assert!(
+                registry.validate("monitor", action).is_ok(),
+                "monitor:{action}"
+            );
+        }
+
+        for (path, method, action) in [
+            ("/alerts", "POST", "create"),
+            ("/alert-rules", "POST", "create"),
+            ("/alerts/3", "PUT", "update"),
+            ("/alert-rules/3", "DELETE", "delete"),
+            ("/alerts/3/toggle", "POST", "update"),
+            ("/alert-rules/3/toggle", "PUT", "update"),
+            ("/alert-history/7/ack", "PUT", "update"),
+        ] {
+            assert_eq!(
+                resolve_permission_action("monitor", path, method),
+                Some(action),
+                "{method} {path}"
+            );
+            assert!(registry.validate("monitor", action).is_ok(), "{action}");
+        }
+        for (path, method, action) in [
+            ("/notifications", "POST", "create"),
+            ("/notifications/3", "PUT", "update"),
+            ("/notifications/3/test", "POST", "test"),
+        ] {
+            assert_eq!(
+                resolve_permission_action("notification", path, method),
+                Some(action),
+                "{method} {path}"
+            );
+            assert!(
+                registry.validate("notification", action).is_ok(),
+                "notification:{action}"
+            );
+        }
+    }
+
     /// 宿主 SoD 分发形状守卫（对齐 TrustGraph/identity 的源文本守卫惯例）：
     /// ORG provenance 判定必须先经 shared fresh 准入装配
     /// （`load_org_sod_admission`）再进入 `check_sod_conflict_with_org`

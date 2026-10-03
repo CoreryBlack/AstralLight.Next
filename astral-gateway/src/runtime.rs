@@ -22,8 +22,10 @@ use axum::routing::{any, post};
 use axum::{middleware as axum_middleware, Router};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
+use anyhow::Context;
 use astral_common::config::{AppConfig, JwtValidationRole};
 use astral_common::error::global_exception_handler;
+use std::future::Future;
 
 #[path = "middleware.rs"]
 pub mod middleware;
@@ -181,6 +183,35 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
+    let signal_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal_failed_in_shutdown = signal_failed.clone();
+    run_with_listen_addr_and_shutdown(addr, async move {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            signal_failed_in_shutdown.store(true, std::sync::atomic::Ordering::Release);
+            tracing::error!(error = %error, "gateway ctrl-c handler failed; initiating graceful shutdown");
+        }
+    })
+    .await?;
+    anyhow::ensure!(
+        !signal_failed.load(std::sync::atomic::Ordering::Acquire),
+        "gateway Ctrl-C handler failed during shutdown"
+    );
+    Ok(())
+}
+
+/// Run Gateway with a caller-owned shutdown signal and wait for Axum's HTTP
+/// connections to drain before returning. Callers own the shutdown deadline.
+pub async fn run_with_listen_addr_and_shutdown<F>(addr: &str, shutdown: F) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    run_with_listen_addr_and_shutdown_inner(addr, shutdown).await
+}
+
+async fn run_with_listen_addr_and_shutdown_inner<F>(addr: &str, shutdown: F) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     // Prometheus 指标暴露：默认 loopback 抓取端口；
     // METRICS_LISTEN_ADDR 覆盖，置空显式禁用。观测失败不影响主服务。
     if let Some(metrics_addr) =
@@ -263,12 +294,7 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
         "redis projection adapter not compiled (redis-compat feature disabled); strict MySQL durable facts in use"
     );
 
-    tracing::info!(
-        learn = %config.learn_service_uri,
-        identity = %config.identity_service_uri,
-        monitor = %config.monitor_service_uri,
-        "gateway starting"
-    );
+    tracing::info!("gateway starting");
 
     // 配置 CORS。AppConfig 已在启动前拒绝 wildcard、缺失和不安全 origin，
     // 这里仅构造显式 allow-list，避免运行时镜像任意请求 Origin。
@@ -396,7 +422,9 @@ pub async fn run_with_listen_addr(addr: &str) -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await?;
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("Gateway HTTP server failed before graceful shutdown completed")?;
 
     Ok(())
 }
@@ -411,6 +439,23 @@ mod tests {
 
     use super::axum_middleware;
     use astral_common::config::AppConfig;
+
+    #[test]
+    fn os_signal_failure_is_retained_after_runtime_cleanup() {
+        let source = include_str!("runtime.rs");
+        let wrapper = source
+            .split("pub async fn run_with_listen_addr(addr: &str)")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn run_with_listen_addr_and_shutdown<F>")
+            .next()
+            .unwrap();
+        assert!(wrapper.contains("signal_failed_in_shutdown.store(true"));
+        let cleanup = wrapper.find(".await?;").unwrap();
+        let check = wrapper.find("anyhow::ensure!(").unwrap();
+        assert!(cleanup < check);
+        assert!(wrapper.contains("gateway Ctrl-C handler failed during shutdown"));
+    }
 
     #[tokio::test]
     async fn canonical_identity_user_routes_are_registered_without_bare_alias() {

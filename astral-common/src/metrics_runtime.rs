@@ -135,6 +135,7 @@ mod tests {
             .as_ref()
             .expect("first install in test process must succeed")
             .clone();
+        metrics::counter!("astral_common_metrics_runtime_endpoint_test_total").increment(1);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(serve_metrics_on(listener, handle));
@@ -154,7 +155,7 @@ mod tests {
         );
         let body = response.text().await.unwrap();
         assert!(
-            body.contains("astral_common_metrics_runtime_test_total"),
+            body.contains("astral_common_metrics_runtime_endpoint_test_total 1"),
             "exposed metrics must render: {body}"
         );
         server.abort();

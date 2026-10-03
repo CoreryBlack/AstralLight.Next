@@ -48,8 +48,39 @@ From the repository root:
 ```bash
 python -m unittest discover -s Docs/authorization-validation/tools \
   -t Docs/authorization-validation/tools -p 'test_*.py' -v
-python Docs/authorization-validation/tools/e5_model_check.py --self-test
+python Docs/authorization-validation/tools/e5_model_check.py --json
+python Docs/authorization-validation/tools/e5_model_check_two_mutations.py
+python Docs/authorization-validation/tools/universal_hypotheses_check.py --model both
+python Docs/authorization-validation/tools/tenant_isolation_model.py
+python Docs/authorization-validation/tools/unbounded_confirmation.py
 ```
+
+`e5_model_check.py` enumerates the bounded observation-protocol model (one
+candidate grant, one revocation-class mutation) and checks the full contract
+plus the six single-premise omissions. `e5_model_check_two_mutations.py`
+tightens the model's main structural abstraction to TWO concurrent
+revocation-class mutations: the safety property becomes the conjunction over
+both mutations (a committed-before-t_f mutation must be published AND
+represented in the admitted evidence; an evidence set that no longer carries
+the candidate at its own revision is a separate identity-substitution
+violation). `universal_hypotheses_check.py` runs the stronger universal
+hypotheses over the exhaustive enumerations of both models (theorem-domain
+safety in both modes, domain accounting conservation, latch/window
+universality, torn-read integrity, post-`t_f` accounting, the premise
+necessity lattice -- all 62 subsets for the single model, the six
+single-premise subsets for the heavier two-mutation model --, omission
+sharpness, bound discipline, mode independence, report conservation) and can
+freeze a digest-bound run manifest with `--manifest-out`. All of this remains
+abstract bounded-model evidence: none of it proves the implementation, a
+deployment, or any runtime behavior, and none of it upgrades a live
+E1/E3/E4 status. `unbounded_confirmation.py` additionally verifies what the
+step bound does and does not hide: event-space closure (every modeled chain
+carries unique events, so the enumerated merge space is the entire schedule
+space) and bound invariance at MAX_BOUND, while recording the levels that
+stay outside mechanical reach today -- parameter unboundedness (the
+reduction lemma to at most two mutations, empirically supported, mechanically
+unconfirmed) and abstraction unboundedness (deductive proof via TLAPS/Coq,
+BLOCKED until a pinned tool exists).
 
 The runners default to local planning and validation. Remote reads, migrations,
 service startup, fault injection, and durable source mutations require their own

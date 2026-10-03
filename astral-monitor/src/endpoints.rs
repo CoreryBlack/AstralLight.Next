@@ -36,6 +36,7 @@ pub struct ServiceStatus {
     pub database: String,
     pub redis: String,
     pub rabbitmq: String,
+    pub local_message_store: String,
 }
 
 pub fn monitor_routes() -> Router<AppState> {
@@ -64,31 +65,84 @@ async fn check_db_health(state: &AppState) -> String {
 }
 
 /// 实时 Redis probe：PING（2s 超时）。
+///
+/// 状态语义（redis 编译层退役后，redis-layer-retirement-20261002）：
+/// - `NOT_CONFIGURED`：**Redis 依赖未启用**——`redis_url` 未配置、compat 旗标
+///   未开启、或本二进制未编译 `redis-compat` feature。这是**中性事实**：聚合
+///   仅由 DB 决定，绝不因"未启用"而降级健康（默认 Redis-free 部署零 Redis，
+///   默认 Redis 绝不成为健康 gate）；
+/// - `UP`/`DOWN`：compat 已启用（feature 编译 + 旗标开启 + URL 非空）时的实际
+///   PING 结果（DOWN = 确定性失败，保留 compat 模式故障可观测性）；
+/// - `UNKNOWN`：**仅保留**"已启用但探测无法确定"（PING 超时）。聚合仍保守
+///   降级（不当中性），不得当作健康放行。
 async fn check_redis_health(config: &astral_common::config::AppConfig) -> String {
-    if config.redis_url.is_empty() {
-        return "UNKNOWN".into();
-    }
-    let result = tokio::time::timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS), async {
-        let client = redis::Client::open(config.redis_url.as_str())?;
-        let mut conn = client.get_connection_manager().await?;
-        redis::cmd("PING").query_async::<String>(&mut conn).await
-    })
-    .await;
-    match result {
-        Ok(Ok(_)) => "UP".into(),
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "redis health probe failed");
-            "DOWN".into()
+    let compat_demanded =
+        config.redis_projection_compat_enabled && !config.redis_url.trim().is_empty();
+    #[cfg(feature = "redis-compat")]
+    {
+        if !compat_demanded {
+            return "NOT_CONFIGURED".into();
         }
-        Err(_) => "DOWN".into(),
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS), async {
+                let client = redis::Client::open(config.redis_url.as_str())?;
+                let mut conn = client.get_connection_manager().await?;
+                redis::cmd("PING").query_async::<String>(&mut conn).await
+            })
+            .await;
+        match result {
+            Ok(Ok(_)) => "UP".into(),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "redis health probe failed");
+                "DOWN".into()
+            }
+            // 已启用但探测无法确定（超时）→ 保守 UNKNOWN，聚合按依赖故障降级。
+            Err(_) => "UNKNOWN".into(),
+        }
+    }
+    #[cfg(not(feature = "redis-compat"))]
+    {
+        if compat_demanded {
+            // 集中启动校验（astral-common validate_runtime_safety）应已拒绝该
+            // 配置；探测面兜底告警，保持不静默。
+            tracing::warn!(
+                "redis_projection_compat_enabled requires a `redis-compat` feature build; probe reports NOT_CONFIGURED"
+            );
+        }
+        "NOT_CONFIGURED".into()
     }
 }
 
-/// 实时 RabbitMQ probe：对 amqp URL 的 host:port 做 TCP 连接（2s 超时）。
-/// URL 为空 → UNKNOWN（未配置），不伪造 UP。
+/// The in-process bus is the local transport readiness boundary. A database
+/// probe is deliberately not used as a message-queue health signal.
+fn local_message_store_status(
+    config: &astral_common::config::AppConfig,
+    local_bus_ready: bool,
+) -> String {
+    if !matches!(
+        config.message_transport(),
+        Ok(astral_common::config::MessageTransport::Local)
+    ) {
+        return "NOT_CONFIGURED".into();
+    }
+    if local_bus_ready {
+        "UP".into()
+    } else {
+        "DOWN".into()
+    }
+}
+
+/// RabbitMQ is a remote dependency only in explicit Rabbit transport mode.
+/// Local mode reports NOT_CONFIGURED and never opens a socket.
 async fn check_rabbitmq_health(config: &astral_common::config::AppConfig) -> String {
+    if !matches!(
+        config.message_transport(),
+        Ok(astral_common::config::MessageTransport::Rabbit)
+    ) {
+        return "NOT_CONFIGURED".into();
+    }
     if config.rabbitmq_url.is_empty() {
-        return "UNKNOWN".into();
+        return "NOT_CONFIGURED".into();
     }
     let Some((host, port)) = rabbitmq_host_port(&config.rabbitmq_url) else {
         tracing::warn!("rabbitmq health probe failed: unparseable url");
@@ -142,18 +196,40 @@ async fn gateway_status(state: &AppState) -> String {
     query_service_status(state, "gateway").await
 }
 
+/// 聚合 DB 与 Redis 探针结果（纯函数）。
+///
+/// 区分三种 Redis 状态：
+/// - `NOT_CONFIGURED`：Redis 未配置（Redis-free 部署），属中性事实，
+///   不参与降级判定；聚合状态仅由 DB 决定（DB UP → `UP`，否则 `DOWN`）。
+/// - `UNKNOWN`：已启用但探测结果无法确定（如 PING 超时），一律保守处理：
+///   DB UP → `DEGRADED`，DB DOWN → `DOWN`；不得当作健康放行，避免掩盖已启用
+///   依赖的未知故障。（"compat 未启用/未编译"不再是 UNKNOWN——归入
+///   `NOT_CONFIGURED` 中性事实，默认部署绝不因 Redis 未启用而降级。）
+/// - `UP`/`DOWN`：实际探测结果，沿用原语义：双 `UP` → `UP`，双 `DOWN` → `DOWN`，
+///   其余组合 → `DEGRADED`（保留 compat 模式 Redis 故障可观测性）。
+fn aggregate_health_status(db: &str, redis: &str) -> String {
+    if redis == "NOT_CONFIGURED" {
+        return if db == "UP" {
+            "UP".into()
+        } else {
+            "DOWN".into()
+        };
+    }
+    match (db == "UP", redis == "UP") {
+        (true, true) => "UP".into(),
+        (false, false) => "DOWN".into(),
+        // (true, false)：DB UP + Redis DOWN/UNKNOWN → DEGRADED（保守）；
+        // (false, true)：DB DOWN + Redis UP → DEGRADED。
+        _ => "DEGRADED".into(),
+    }
+}
+
 async fn health_check(State(state): State<AppState>) -> Json<HealthStatus> {
     let (db, redis) = tokio::join!(check_db_health(&state), check_redis_health(&state.config));
-    let status = if db == "UP" && redis == "UP" {
-        "UP"
-    } else if db == "UP" || redis == "UP" {
-        "DEGRADED"
-    } else {
-        "DOWN"
-    };
+    let status = aggregate_health_status(&db, &redis);
     Json(HealthStatus {
         service: "astral-monitor".into(),
-        status: status.into(),
+        status,
         uptime_seconds: 0,
         version: env!("CARGO_PKG_VERSION").into(),
     })
@@ -184,6 +260,7 @@ async fn detailed_health(
         check_redis_health(&state.config),
         check_rabbitmq_health(&state.config),
     );
+    let local_message_store = local_message_store_status(&state.config, false);
     Ok(Json(ApiResponse::success(ServiceStatus {
         gateway,
         identity,
@@ -192,6 +269,7 @@ async fn detailed_health(
         database: db_status,
         redis,
         rabbitmq,
+        local_message_store,
     })))
 }
 
@@ -252,13 +330,7 @@ pub async fn frontend_health_check(
                 "permissionChecksTotal": permission_checks,
                 "metricsAvailable": metrics_available,
             },
-            "status": if db_status == "UP" && redis_status == "UP" {
-                "UP"
-            } else if db_status == "UP" || redis_status == "UP" {
-                "DEGRADED"
-            } else {
-                "DOWN"
-            },
+            "status": aggregate_health_status(&db_status, &redis_status),
         },
     })))
 }
@@ -299,6 +371,7 @@ async fn service_status(
         check_redis_health(&state.config),
         check_rabbitmq_health(&state.config),
     );
+    let local_message_store = local_message_store_status(&state.config, false);
     Ok(Json(ApiResponse::success(ServiceStatus {
         gateway,
         identity,
@@ -307,5 +380,101 @@ async fn service_status(
         database: db_status,
         redis,
         rabbitmq,
+        local_message_store,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_is_up_when_db_up_and_redis_not_configured() {
+        // Redis-free 部署：仅 NOT_CONFIGURED 中性，DB 健康即整体 UP。
+        assert_eq!(aggregate_health_status("UP", "NOT_CONFIGURED"), "UP");
+    }
+
+    #[test]
+    fn aggregate_follows_db_alone_when_redis_not_configured() {
+        assert_eq!(aggregate_health_status("DOWN", "NOT_CONFIGURED"), "DOWN");
+    }
+
+    #[test]
+    fn configured_unknown_is_conservative_unlike_not_configured() {
+        // 已配置但探针 UNKNOWN（如 compat 关闭未探测、未来探针内部未知态）
+        // 不得当作健康放行：与未配置（中性）明确区分，DB UP 保守降级为 DEGRADED。
+        assert_eq!(aggregate_health_status("UP", "UNKNOWN"), "DEGRADED");
+        // DB DOWN 时 UNKNOWN 与 DOWN 同为 DOWN（DB 故障主导，同样不放行）。
+        assert_eq!(aggregate_health_status("DOWN", "UNKNOWN"), "DOWN");
+    }
+
+    #[test]
+    fn configured_redis_fault_keeps_degraded_observability() {
+        // compat 模式：Redis 已配置但故障必须可见。
+        assert_eq!(aggregate_health_status("UP", "DOWN"), "DEGRADED");
+        assert_eq!(aggregate_health_status("DOWN", "UP"), "DEGRADED");
+    }
+
+    #[test]
+    fn configured_redis_both_up_is_up_and_both_down_is_down() {
+        assert_eq!(aggregate_health_status("UP", "UP"), "UP");
+        assert_eq!(aggregate_health_status("DOWN", "DOWN"), "DOWN");
+    }
+
+    /// 空 redis_url 走未配置早退分支，不打开任何 socket。
+    #[tokio::test]
+    async fn redis_probe_reports_not_configured_when_url_empty() {
+        let config = astral_common::config::AppConfig::default();
+        assert!(config.redis_url.is_empty());
+        assert_eq!(check_redis_health(&config).await, "NOT_CONFIGURED");
+    }
+
+    /// 已配置 redis_url 但 compat 关闭：按契约不连接 Redis，返回 UNKNOWN
+    /// （聚合侧保守降级），同样不打开任何 socket。
+    #[tokio::test]
+    async fn redis_probe_skips_connection_when_compat_disabled() {
+        let config = astral_common::config::AppConfig {
+            redis_url: "redis://127.0.0.1:1/".into(),
+            redis_projection_compat_enabled: false,
+            ..Default::default()
+        };
+        // redis 编译层退役后语义：compat 未启用 = 依赖未启用 = 中性事实
+        // NOT_CONFIGURED（不再报告 UNKNOWN，默认部署绝不因 Redis 未启用降级）。
+        assert_eq!(check_redis_health(&config).await, "NOT_CONFIGURED");
+    }
+
+    /// compat 开启但 URL 无法解析：Client::open 同步解析失败即 DOWN，
+    /// 不发起任何连接。（仅 redis-compat feature 编译可探测；feature-off
+    /// 构建恒 NOT_CONFIGURED，见 `check_redis_health` 语义注释。）
+    #[cfg(feature = "redis-compat")]
+    #[tokio::test]
+    async fn redis_probe_reports_down_on_unparseable_url() {
+        let config = astral_common::config::AppConfig {
+            redis_url: "::not a redis url".into(),
+            redis_projection_compat_enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(check_redis_health(&config).await, "DOWN");
+    }
+
+    #[test]
+    fn local_message_store_reports_not_configured_outside_local_mode() {
+        let config = astral_common::config::AppConfig::default();
+        assert_eq!(
+            config.message_transport(),
+            Ok(astral_common::config::MessageTransport::Rabbit)
+        );
+        assert_eq!(local_message_store_status(&config, false), "NOT_CONFIGURED");
+        assert_eq!(local_message_store_status(&config, true), "NOT_CONFIGURED");
+    }
+
+    #[test]
+    fn local_message_store_reports_bus_readiness_in_local_mode() {
+        let config = astral_common::config::AppConfig {
+            message_transport: "local".into(),
+            ..Default::default()
+        };
+        assert_eq!(local_message_store_status(&config, false), "DOWN");
+        assert_eq!(local_message_store_status(&config, true), "UP");
+    }
 }

@@ -34,36 +34,79 @@ use sha2::{Digest, Sha256};
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions};
 
 mod authorization_projection_repository;
+mod authorization_snapshot;
+mod auxiliary_authorization_mirror;
 mod cache_epoch;
 mod cross_city_repository;
+mod cross_city_runtime_repository;
 mod cross_city_transport_repository;
 mod eligibility;
 pub mod evidence_cache;
 pub mod grant_ledger;
 mod grant_repository;
+pub mod invalidation_inbox_repository;
+pub mod local_message_repository;
+pub mod local_projection_bus;
+pub mod local_projection_snapshot;
+pub mod memory_projection_hub;
 mod migration;
+mod mq_idempotency_repository;
 pub mod org_scope_repository;
 mod permission_query;
 mod projection;
 mod quarantine;
 mod repository;
 mod resource_ownership;
+mod session_state_repository;
 mod sod_check;
 
 pub use authorization_projection_repository::*;
+pub use authorization_snapshot::{
+    authorization_aggregate_key, capture_projection_snapshot, check_projection_snapshot_freshness,
+    decode_projection_snapshot_payload, load_projection_snapshot_hint, save_projection_snapshot,
+    validate_published_state_snapshot, PendingDeltaSnapshot, ProjectionSnapshotCapture,
+    ProjectionSnapshotDocument, ProjectionSnapshotError, ProjectionSnapshotHint,
+    SnapshotAggregateDivergence, SnapshotHintDivergenceKind, MAX_CAPTURE_PUBLISHED_STATES,
+    MAX_PENDING_DELTA_ROWS, MAX_PROJECTION_SNAPSHOT_HINT_AGE_SECONDS, SNAPSHOT_PAYLOAD_VERSION_V1,
+};
+pub use auxiliary_authorization_mirror::{
+    auxiliary_authorization_mirror, install_auxiliary_authorization_mirror,
+    AuxiliaryAuthorizationMirror,
+};
 pub use cache_epoch::*;
 pub use cross_city_repository::*;
+pub use cross_city_runtime_repository::*;
 pub use cross_city_transport_repository::*;
 pub use eligibility::*;
 pub use evidence_cache::*;
 pub use grant_repository::*;
+pub use invalidation_inbox_repository::*;
+pub use local_message_repository::*;
+pub use local_projection_bus::{
+    close_local_projection_bus, dispatch_committed_projection_delta, install_local_projection_bus,
+    local_projection_bus, local_projection_bus_installed, take_global_local_projection_receiver,
+    CommitDeltaAggregateKey, CommitDeltaDelivery, CommitDeltaEnvelope, LocalProjectionBus,
+    LocalProjectionBusConfig, LocalProjectionDispatchError, LocalProjectionInstallError,
+    LocalProjectionOwnerTaken, LOCAL_PROJECTION_BUS_DEFAULT_CAPACITY,
+    LOCAL_PROJECTION_BUS_MAX_CAPACITY, LOCAL_PROJECTION_BUS_MAX_PAYLOAD_BYTES,
+    LOCAL_PROJECTION_BUS_MAX_QUEUED_PER_AGGREGATE, LOCAL_PROJECTION_BUS_MAX_TOTAL_BYTES,
+};
+pub use local_projection_snapshot::*;
+pub use memory_projection_hub::*;
 pub use migration::*;
+pub use mq_idempotency_repository::{
+    complete_lease_in_tx, MqConsumerLeaseStore, MqLeaseClaim, MqLeaseClaimOutcome, MqLeaseComplete,
+    MqLeaseError, MqLeaseKey, MqLeaseRelease, MqLeaseRenew, SqlxMqConsumerLeaseStore,
+    MQ_LEASE_MAX_MESSAGE_ID_LEN, MQ_LEASE_MAX_MESSAGE_TYPE_LEN, MQ_LEASE_MAX_OWNER_LEN,
+    MQ_LEASE_MAX_TTL_SECONDS,
+};
 pub use org_scope_repository::*;
 pub use permission_query::*;
 pub use projection::*;
 pub use quarantine::*;
 pub use repository::*;
 pub use resource_ownership::*;
+pub use session_state_repository::*;
 pub use sod_check::*;
 
 // ─────────────────────────────────────────────────────────────────────────────

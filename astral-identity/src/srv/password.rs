@@ -20,6 +20,7 @@ use astral_types::AstralError;
 
 use crate::auth::{hash_password, sha256_hash, update_password_hash_tx};
 use crate::srv::session::revoke_all_sessions_for_user;
+use crate::srv::source_writer_guard;
 use crate::AppState;
 
 /// 请求密码重置
@@ -148,8 +149,15 @@ async fn reset_password(
     // 先哈希新密码，避免事务内执行 Argon2 阻塞连接
     let new_hash = hash_password(&req.new_password).map_err(AppError::from)?;
 
-    // 同一事务原子完成：token 消费（replay 边界）+ 密码哈希更新。
-    // 任一步失败整体回滚，避免"token 已消费但密码未改"的锁死窗口。
+    // 撤销使用独立 source 写入；凭据事务失败不会恢复已撤销会话。
+    // Redis/MQ 投递必须在凭据事务开启之前完成。
+    revoke_all_sessions_for_user(&state, row.user_id, "PASSWORD_RESET")
+        .await
+        .map_err(AppError::from)?;
+
+    // 重置令牌消费和密码更新必须在同一事务内提交。
+    // COMMIT await 被取消时，source guard 保留未知结果并关闭读门。
+    let source_guard = source_writer_guard::begin_source_write()?;
     let mut tx = state
         .db
         .begin()
@@ -167,19 +175,64 @@ async fn reset_password(
         .await
         .map_err(AppError::from)?;
 
-    // 撤销该用户全部会话/family/JTI/Redis 投影，**在提交之前执行**：
-    // 撤销失败则直接返回错误、不提交密码变更（fail-closed），消除
-    // "密码已改但旧会话仍存活"的 fail-open 窗口。与 change_password 的
-    // 先撤后改顺序一致（Java setPassword 同一事务内撤销失败整体回滚）。
-    revoke_all_sessions_for_user(&state, row.user_id, "PASSWORD_RESET")
-        .await
-        .map_err(AppError::from)?;
-
+    source_writer_guard::arm_commit_fence(&source_guard);
     tx.commit()
         .await
         .map_err(|e| AppError::from(AstralError::Database(format!("{e}"))))?;
+    source_writer_guard::settle_commit_fence(&source_guard, true);
+    drop(source_guard);
 
     tracing::info!(user_id = row.user_id, "password reset completed via token");
 
     Ok(Json(ApiResponse::success(EmptyResponse)))
+}
+
+#[cfg(test)]
+mod tests {
+    /// 撤销/凭据事务顺序 + source 栅栏形状回归（源形状，无 IO）：
+    /// 1. revoke_all 先于凭据事务（撤销网络不再处于事务开启窗口内）；
+    /// 2. 事务 begin 前取得 source writer 栅栏；
+    /// 3. COMMIT await 前武装取消栅栏。
+    #[test]
+    fn reset_revokes_before_the_credential_tx_and_arms_the_commit_fence() {
+        let source = include_str!("password.rs");
+        let body = source
+            .split("async fn reset_password(")
+            .nth(1)
+            .expect("reset_password must stay in password.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("tests module must follow the handler");
+        let revoke = body
+            .find("revoke_all_sessions_for_user(&state, row.user_id")
+            .expect("the reset must revoke all sessions for the user");
+        let guard = body
+            .find("source_writer_guard::begin_source_write()")
+            .expect("the credential tx must acquire the source writer guard");
+        let begin = body
+            // 多行方法链：state\n .db\n .begin()
+            .find(".begin()")
+            .expect("the credential tx must stay");
+        let arm = body
+            .find("arm_commit_fence(&source_guard)")
+            .expect("the commit await must be armed");
+        let commit = body
+            .find("tx.commit()")
+            .expect("the credential tx must commit");
+        assert!(
+            revoke < guard && guard < begin,
+            "revocation must run before the guarded credential transaction opens"
+        );
+        assert!(
+            arm < commit,
+            "the cancellation fence must arm before awaiting COMMIT"
+        );
+        // 历史注释不再声称撤销随事务整体回滚（撤销是 autocommit、非事务成员）。
+        // needle 由片段拼出，避免本测试源码自匹配。
+        let false_atomicity_claim = format!("撤销失败则直接返回错误、不提交密码变{}", "更");
+        assert!(
+            !body.contains(&false_atomicity_claim),
+            "the false-atomicity claim must not return"
+        );
+    }
 }

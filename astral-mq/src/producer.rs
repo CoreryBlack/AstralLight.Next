@@ -375,15 +375,70 @@ impl<T: Serialize> MqMessage<T> {
     }
 }
 
-/// 消息生产者
+fn local_message_type(queue_name: &str) -> &'static str {
+    match queue_name {
+        QUEUE_AUDIT_LOG => "AUDIT_LOG",
+        QUEUE_LOGIN_EVENT => "LOGIN_EVENT",
+        crate::config::QUEUE_AUTH_SESSION_REVOCATION => "AUTH_SESSION_REVOCATION",
+        crate::config::QUEUE_CHAT_MESSAGE => "CHAT_MESSAGE",
+        crate::config::QUEUE_LEARNING_PROGRESS => "LEARNING_PROGRESS",
+        crate::config::QUEUE_SUBJECT_DELETE => "SUBJECT_DELETE",
+        _ => "BUSINESS_MESSAGE",
+    }
+}
+
+/// Build the transport-neutral envelope shared by both local-bus publish paths
+/// (`try_publish` admission and `publish_and_wait` completion tracking).
+fn local_bus_envelope<T: Serialize>(
+    queue_name: &str,
+    message: &MqMessage<T>,
+    operation_id: &str,
+    origin_region: &str,
+) -> Result<crate::envelope::MessageEnvelope, MqError> {
+    crate::envelope::MessageEnvelope::new(
+        &message.message_id,
+        operation_id,
+        local_message_type(queue_name),
+        1,
+        origin_region,
+        serde_json::to_value(&message.payload)?,
+    )
+    .map_err(MqError::Publish)
+}
+
+#[derive(Clone)]
+enum ProducerTransport {
+    Rabbit(Channel),
+    Local {
+        bus: crate::local_bus::LocalBus,
+        origin_region: String,
+    },
+}
+
+/// 消息生产者。
+///
+/// Rabbit transport is retained for cross-host/region delivery. Local mode
+/// admits the message to a bounded in-process bus and never opens a broker or
+/// database connection.
 #[derive(Clone)]
 pub struct Producer {
-    channel: Channel,
+    transport: ProducerTransport,
 }
 impl Producer {
-    /// 创建 Producer
+    /// 创建 RabbitMQ Producer（兼容既有调用方）。
     pub fn new(channel: Channel) -> Self {
-        Self { channel }
+        Self {
+            transport: ProducerTransport::Rabbit(channel),
+        }
+    }
+
+    pub fn new_local(bus: crate::local_bus::LocalBus, origin_region: impl Into<String>) -> Self {
+        Self {
+            transport: ProducerTransport::Local {
+                bus,
+                origin_region: origin_region.into(),
+            },
+        }
     }
 
     pub async fn enable_confirms(channel: &Channel) -> Result<(), MqError> {
@@ -423,8 +478,14 @@ impl Producer {
         )?;
         let (destination_exchange, destination_routing_key) = route.destination();
         let properties = sanitize_replay_properties(&request.properties, &request.message_id);
-        let confirmation = self
-            .channel
+        let ProducerTransport::Rabbit(channel) = &self.transport else {
+            return Err(RawReplayError::Publish {
+                code: "local_transport_replay_unsupported",
+                text: "raw replay requires the remote Rabbit transport".into(),
+                returned: None,
+            });
+        };
+        let confirmation = channel
             .basic_publish(
                 ShortString::from(destination_exchange),
                 ShortString::from(destination_routing_key),
@@ -484,15 +545,95 @@ impl Producer {
         routing_key: &str,
         message: &MqMessage<T>,
     ) -> Result<(), MqError> {
-        let payload = serde_json::to_vec(message)?;
+        let queue_name = crate::config::queue_for_routing_key(routing_key)
+            .map(|queue| queue.name)
+            .ok_or_else(|| {
+                MqError::Publish(format!("routing key is not declared: {routing_key}"))
+            })?;
+        self.publish_with_queue_name(
+            queue_name,
+            exchange_name,
+            routing_key,
+            message,
+            &message.message_id,
+        )
+        .await
+    }
 
+    /// 便捷方法：直接发送到队列绑定的交换机
+    pub async fn publish_to_queue<T: Serialize>(
+        &self,
+        queue_name: &str,
+        routing_key: &str,
+        payload: T,
+    ) -> Result<(), MqError> {
+        self.publish_to_queue_with_message_id(queue_name, routing_key, None, None, payload)
+            .await
+    }
+
+    async fn publish_to_queue_with_message_id<T: Serialize>(
+        &self,
+        queue_name: &str,
+        routing_key: &str,
+        message_id: Option<String>,
+        operation_id: Option<String>,
+        payload: T,
+    ) -> Result<(), MqError> {
+        let msg = MqMessage {
+            message_id: message_id
+                .filter(|message_id| !message_id.trim().is_empty())
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            timestamp: now_timestamp(),
+            payload,
+        };
+        let exchange = match queue_name {
+            crate::config::QUEUE_NOTIFICATION | crate::config::QUEUE_BUSINESS_CHAT => {
+                crate::config::EXCHANGE_TOPIC
+            }
+            _ => crate::config::EXCHANGE_DIRECT,
+        };
+        if crate::config::route_for(queue_name, routing_key).is_none() {
+            return Err(MqError::Publish(format!(
+                "queue/routing key is not declared: {queue_name}/{routing_key}"
+            )));
+        }
+        let operation_id = operation_id
+            .filter(|operation_id| !operation_id.trim().is_empty())
+            .unwrap_or_else(|| msg.message_id.clone());
+        self.publish_with_queue_name(queue_name, exchange, routing_key, &msg, &operation_id)
+            .await
+    }
+
+    async fn publish_with_queue_name<T: Serialize>(
+        &self,
+        queue_name: &str,
+        exchange_name: &str,
+        routing_key: &str,
+        message: &MqMessage<T>,
+        operation_id: &str,
+    ) -> Result<(), MqError> {
+        let payload = serde_json::to_vec(message)?;
+        if let ProducerTransport::Local { bus, origin_region } = &self.transport {
+            let envelope = local_bus_envelope(queue_name, message, operation_id, origin_region)?;
+            bus.try_publish(queue_name, routing_key, envelope)
+                .map_err(|error| MqError::Publish(error.to_string()))?;
+            tracing::debug!(
+                queue = %queue_name,
+                routing_key = %routing_key,
+                message_id = %message.message_id,
+                "message admitted to local in-process bus"
+            );
+            return Ok(());
+        }
+
+        let ProducerTransport::Rabbit(channel) = &self.transport else {
+            return Err(MqError::Publish("unsupported producer transport".into()));
+        };
         let properties = BasicProperties::default()
-            .with_delivery_mode(2) // persistent
+            .with_delivery_mode(2)
             .with_content_type("application/json".into())
             .with_message_id(message.message_id.as_str().into());
-
-        let confirmation = self
-            .channel
+        let confirmation = channel
             .basic_publish(
                 ShortString::from(exchange_name),
                 ShortString::from(routing_key),
@@ -506,7 +647,13 @@ impl Producer {
             .await?
             .await?;
         match confirmation {
-            Confirmation::Ack(None) | Confirmation::Ack(Some(_)) => {}
+            Confirmation::Ack(None) => {}
+            Confirmation::Ack(Some(returned)) => {
+                return Err(MqError::Publish(format!(
+                    "RabbitMQ returned unroutable message: code={}, text={}",
+                    returned.reply_code, returned.reply_text
+                )));
+            }
             Confirmation::Nack(_) => {
                 return Err(MqError::Publish("RabbitMQ publisher NACK".into()));
             }
@@ -516,51 +663,42 @@ impl Producer {
                 ));
             }
         }
-
         tracing::debug!(
             exchange = %exchange_name,
             routing_key = %routing_key,
+            queue = %queue_name,
             message_id = %message.message_id,
             "message published"
         );
-
         Ok(())
-    }
-
-    /// 便捷方法：直接发送到队列绑定的交换机
-    ///
-    /// 交换机推导规则（对齐 Java MQConfig / MQConstants）：
-    /// - `astral.notification` / `astral.business.chat` → `astral.topic`（主题交换机）
-    /// - 其他所有队列 → `astral.direct`（直连交换机）
-    pub async fn publish_to_queue<T: Serialize>(
-        &self,
-        queue_name: &str,
-        routing_key: &str,
-        payload: T,
-    ) -> Result<(), MqError> {
-        let msg = MqMessage::new(payload);
-        let exchange = match queue_name {
-            crate::config::QUEUE_NOTIFICATION | crate::config::QUEUE_BUSINESS_CHAT => {
-                crate::config::EXCHANGE_TOPIC
-            }
-            _ => crate::config::EXCHANGE_DIRECT,
-        };
-
-        self.publish(exchange, routing_key, &msg).await
     }
 
     // ===== 类型化便捷方法 =====
 
     /// 发布审计日志消息
     pub async fn publish_audit_log(&self, payload: AuditLogPayload) -> Result<(), MqError> {
-        self.publish_to_queue("astral.audit.log", "audit.log", payload)
-            .await
+        let message_id = payload.message_id.clone();
+        self.publish_to_queue_with_message_id(
+            crate::config::QUEUE_AUDIT_LOG,
+            "audit.log",
+            message_id,
+            None,
+            payload,
+        )
+        .await
     }
 
     /// 发布登录事件消息
     pub async fn publish_login_event(&self, payload: LoginEventPayload) -> Result<(), MqError> {
-        self.publish_to_queue("astral.login.event", "login.event", payload)
-            .await
+        let message_id = payload.message_id.clone();
+        self.publish_to_queue_with_message_id(
+            crate::config::QUEUE_LOGIN_EVENT,
+            "login.event",
+            message_id,
+            None,
+            payload,
+        )
+        .await
     }
 
     /// 发布聊天消息通知。
@@ -590,18 +728,128 @@ impl Producer {
             .await
     }
 
+    /// Publish a typed authorization invalidation after its source transaction
+    /// has committed. The local path only admits the validated envelope to the
+    /// bounded LocalBus; it does not prove durable fanout. The Rabbit path
+    /// stays rejected here on purpose: cross-node delivery must go through the
+    /// durable outbox relay ([`crate::invalidation_fanout_worker`] +
+    /// `committed_invalidation_fanout_request`), never a direct publish that
+    /// could bypass the canonical committed envelope.
+    pub async fn publish_invalidation(
+        &self,
+        event: crate::invalidation::InvalidationEvent,
+        message_id: impl Into<String>,
+        operation_id: impl Into<String>,
+        origin_region: impl Into<String>,
+    ) -> Result<(), MqError> {
+        let envelope = event
+            .to_envelope(message_id, operation_id, origin_region)
+            .map_err(|error| MqError::Publish(error.to_string()))?;
+        match &self.transport {
+            ProducerTransport::Local { bus, .. } => bus
+                .try_publish(
+                    crate::config::QUEUE_AUTHORIZATION_INVALIDATION,
+                    crate::config::ROUTING_KEY_AUTHORIZATION_INVALIDATION,
+                    envelope,
+                )
+                .map_err(|error| MqError::Publish(error.to_string())),
+            ProducerTransport::Rabbit(_) => Err(MqError::Publish(
+                "authorization invalidation Rabbit fanout is not implemented; durable append and reconciliation are required"
+                    .into(),
+            )),
+        }
+    }
+
     /// 发布会话撤销命令（对齐 Java AuthSessionRevocationCommandService）
     pub async fn publish_auth_session_revocation(
         &self,
         payload: AuthSessionRevocationPayload,
     ) -> Result<(), MqError> {
-        self.publish_to_queue(
+        let message_id = payload.message_id.clone();
+        self.publish_to_queue_with_message_id(
             crate::config::QUEUE_AUTH_SESSION_REVOCATION,
             "auth.session.revocation",
+            message_id,
+            payload.operation_id.clone(),
             payload,
         )
         .await
     }
+
+    /// 发布撤销命令并在本地组合进程中等待 handler 完成证明。
+    ///
+    /// LocalBus 的入队成功只代表 admission；本方法在 local transport 下等待
+    /// consumer 返回 durable 业务结果，超时/consumer 消失保持 UnknownOutcome。
+    /// Rabbit transport 没有远端业务完成语义，因此只等待 publisher confirm，
+    /// 调用方仍必须查询 durable outbox 才能决定 READY/PENDING。
+    pub async fn publish_auth_session_revocation_and_wait(
+        &self,
+        payload: AuthSessionRevocationPayload,
+        deadline: std::time::Duration,
+    ) -> Result<(), MqError> {
+        let message_id = payload
+            .message_id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let operation_id = payload
+            .operation_id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| message_id.clone());
+        let msg = MqMessage {
+            message_id,
+            timestamp: now_timestamp(),
+            payload,
+        };
+        if let ProducerTransport::Local { bus, origin_region } = &self.transport {
+            let envelope = local_bus_envelope(
+                crate::config::QUEUE_AUTH_SESSION_REVOCATION,
+                &msg,
+                &operation_id,
+                origin_region,
+            )?;
+            bus.publish_and_wait(
+                crate::config::QUEUE_AUTH_SESSION_REVOCATION,
+                "auth.session.revocation",
+                envelope,
+                deadline,
+            )
+            .await
+            .map_err(|error| MqError::Publish(error.to_string()))?;
+            return Ok(());
+        }
+        // Rabbit publisher confirms establish broker admission only. The remote
+        // business handler has no request/response channel here, so preserve the
+        // normal confirm semantics and let the durable outbox decide completion.
+        self.publish_with_queue_name(
+            crate::config::QUEUE_AUTH_SESSION_REVOCATION,
+            crate::config::EXCHANGE_DIRECT,
+            "auth.session.revocation",
+            &msg,
+            &operation_id,
+        )
+        .await
+    }
+}
+
+// ===== invalidation fanout typed seam =====
+
+/// Typed seam between the durable invalidation outbox and the Rabbit fanout
+/// transport: derives the publish request from a **preexisting durable row**
+/// (as claimed by the relay worker).
+///
+/// The returned request keeps the row's `payload_json` as the exact wire
+/// bytes — `createdAt` and every envelope identity field are the ones the
+/// source transaction committed. Nothing here rebuilds or re-stamps the
+/// envelope; rows that no longer parse as a contract-valid invalidation
+/// envelope are rejected so the relay can quarantine them instead of
+/// publishing divergent bytes.
+pub fn committed_invalidation_fanout_request(
+    row: &astral_db::LocalMessageRow,
+) -> Result<crate::invalidation_fanout::CommittedInvalidationEnvelope, MqError> {
+    crate::invalidation_fanout::CommittedInvalidationEnvelope::from_durable_row(row)
+        .map_err(|error| MqError::Publish(error.to_string()))
 }
 
 #[cfg(test)]
@@ -609,8 +857,11 @@ mod tests {
     use super::*;
     use lapin::types::LongString;
     use serde_json::json;
+    use std::time::Duration;
 
     use crate::config::EXCHANGE_TOPIC;
+    use crate::config::QUEUE_AUTH_SESSION_REVOCATION;
+    use crate::local_bus::{LocalBus, LocalBusLimits, LocalOwner, LocalReceiver};
 
     fn replay_request() -> RawReplayRequest {
         let mut headers = FieldTable::default();
@@ -880,5 +1131,306 @@ mod tests {
             .unwrap();
         assert_eq!(queue.exchange_name, crate::config::EXCHANGE_DIRECT);
         assert_eq!(queue.routing_key, "chat.message");
+    }
+
+    #[tokio::test]
+    async fn typed_invalidation_publish_preserves_stable_identity_and_scope() {
+        let bus = LocalBus::new(LocalBusLimits::default()).unwrap();
+        let mut receiver = bus
+            .register(
+                crate::config::QUEUE_AUTHORIZATION_INVALIDATION,
+                LocalOwner::AuthorizationInvalidation,
+            )
+            .unwrap();
+        let producer = Producer::new_local(bus, "local");
+        let event = crate::invalidation::InvalidationEvent::EvidenceInvalidated(
+            crate::invalidation::EvidenceInvalidated {
+                tenant_id: 7,
+                card_id: Some(42),
+                aggregate_type: astral_types::PublishedEvidenceAggregate::UserCard,
+                aggregate_id: 42,
+                published_generation: 10,
+                source_generation: 10,
+                revoke_fence: 0,
+            },
+        );
+        producer
+            .publish_invalidation(event, "event-1", "operation-1", "city-a")
+            .await
+            .unwrap();
+        let delivery = receiver.recv().await.unwrap();
+        assert_eq!(delivery.envelope.message_id, "event-1");
+        assert_eq!(delivery.envelope.operation_id, "operation-1");
+        assert_eq!(
+            delivery.envelope.message_type,
+            crate::invalidation::EVIDENCE_INVALIDATED
+        );
+        assert_eq!(delivery.envelope.tenant_id, Some(7));
+        assert_eq!(
+            delivery.envelope.ordering_key.as_deref(),
+            Some("authorization:evidence:tenant/7/aggregate/USER_CARD/42/card/42")
+        );
+        delivery.complete(Ok(()));
+    }
+
+    #[tokio::test]
+    async fn generic_publish_cannot_route_to_local_invalidation_queue() {
+        let bus = LocalBus::new(LocalBusLimits::default()).unwrap();
+        let mut receiver = bus
+            .register(
+                crate::config::QUEUE_AUTHORIZATION_INVALIDATION,
+                LocalOwner::AuthorizationInvalidation,
+            )
+            .unwrap();
+        let producer = Producer::new_local(bus, "local");
+        assert!(producer
+            .publish_to_queue(
+                crate::config::QUEUE_AUTHORIZATION_INVALIDATION,
+                crate::config::ROUTING_KEY_AUTHORIZATION_INVALIDATION,
+                json!({"message": "untyped"}),
+            )
+            .await
+            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), receiver.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    // ===== 本地撤销等待路径（publish_auth_session_revocation_and_wait）=====
+
+    fn revocation_payload(
+        message_id: Option<&str>,
+        operation_id: Option<&str>,
+    ) -> AuthSessionRevocationPayload {
+        AuthSessionRevocationPayload {
+            message_id: message_id.map(ToOwned::to_owned),
+            operation_id: operation_id.map(ToOwned::to_owned),
+            user_id: 7,
+            reason: "admin-reset".into(),
+            timestamp: now_timestamp(),
+        }
+    }
+
+    /// 本地 transport fixture：默认容量 + 已注册的 Identity owner receiver。
+    fn local_revocation_fixture(queue_capacity: usize) -> (Producer, LocalReceiver, LocalBus) {
+        let bus = LocalBus::new(LocalBusLimits {
+            queue_capacity,
+            ..LocalBusLimits::default()
+        })
+        .unwrap();
+        let receiver = bus
+            .register(QUEUE_AUTH_SESSION_REVOCATION, LocalOwner::Identity)
+            .unwrap();
+        (Producer::new_local(bus.clone(), "local"), receiver, bus)
+    }
+
+    /// 等待语义：producer 必须阻塞到 handler 调用 `delivery.complete` 并以
+    /// 该结果收束 —— handler 失败必须作为错误返回（若 admission 即返回，
+    /// 这里会错误地得到 `Ok`）。recv → complete 由任务调度点串行，无 sleep。
+    #[tokio::test]
+    async fn local_revocation_wait_blocks_until_delivery_complete_and_maps_failure() {
+        let (producer, mut receiver, _bus) = local_revocation_fixture(4);
+        let waiter = tokio::spawn({
+            let producer = producer.clone();
+            async move {
+                producer
+                    .publish_auth_session_revocation_and_wait(
+                        revocation_payload(Some("rev-wait"), Some("rev-op")),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            }
+        });
+        let delivery = receiver.recv().await.unwrap();
+        delivery.complete(Err("identity revocation failed".into()));
+        match waiter.await.unwrap() {
+            Err(MqError::Publish(text)) => {
+                assert!(text.contains("local handler failed"), "unexpected: {text}");
+                assert!(
+                    text.contains("identity revocation failed"),
+                    "unexpected: {text}"
+                );
+            }
+            other => panic!("expected handler failure error, got {other:?}"),
+        }
+    }
+
+    /// 成功路径 + 稳定 id：显式 message_id/operation_id 原样进入 envelope 与
+    /// 业务 payload（consumer 的 durable outbox 幂等键依赖 operationId）。
+    #[tokio::test]
+    async fn local_revocation_wait_returns_ok_and_preserves_stable_ids() {
+        let (producer, mut receiver, _bus) = local_revocation_fixture(4);
+        let waiter = tokio::spawn({
+            let producer = producer.clone();
+            async move {
+                producer
+                    .publish_auth_session_revocation_and_wait(
+                        revocation_payload(Some("rev-msg-1"), Some("rev-op-1")),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            }
+        });
+        let delivery = receiver.recv().await.unwrap();
+        assert_eq!(delivery.envelope.message_id, "rev-msg-1");
+        assert_eq!(delivery.envelope.operation_id, "rev-op-1");
+        assert_eq!(delivery.envelope.message_type, "AUTH_SESSION_REVOCATION");
+        assert_eq!(delivery.envelope.origin_region, "local");
+        assert_eq!(delivery.envelope.payload["operationId"], "rev-op-1");
+        delivery.complete(Ok(()));
+        waiter.await.unwrap().unwrap();
+    }
+
+    /// id 回退：operation_id 缺省回退到 message_id 且不写入业务 payload；
+    /// message_id 也缺省时生成 UUID 并保持 message_id == operation_id。
+    #[tokio::test]
+    async fn local_revocation_wait_falls_back_operation_id_to_message_id() {
+        let (producer, mut receiver, _bus) = local_revocation_fixture(4);
+        let waiter = tokio::spawn({
+            let producer = producer.clone();
+            async move {
+                producer
+                    .publish_auth_session_revocation_and_wait(
+                        revocation_payload(Some("rev-msg-2"), None),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            }
+        });
+        let delivery = receiver.recv().await.unwrap();
+        assert_eq!(delivery.envelope.message_id, "rev-msg-2");
+        assert_eq!(delivery.envelope.operation_id, "rev-msg-2");
+        assert_eq!(
+            delivery.envelope.payload["operationId"],
+            serde_json::Value::Null
+        );
+        delivery.complete(Ok(()));
+        waiter.await.unwrap().unwrap();
+
+        let waiter = tokio::spawn({
+            let producer = producer.clone();
+            async move {
+                producer
+                    .publish_auth_session_revocation_and_wait(
+                        revocation_payload(None, None),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            }
+        });
+        let delivery = receiver.recv().await.unwrap();
+        assert!(!delivery.envelope.message_id.is_empty());
+        assert_eq!(delivery.envelope.operation_id, delivery.envelope.message_id);
+        delivery.complete(Ok(()));
+        waiter.await.unwrap().unwrap();
+    }
+
+    /// 未知结果必须 fail closed：deadline 到期（delivery 未完成）与 consumer
+    /// 消失（delivery 被 drop）都只能得到 UnknownOutcome，携带稳定 message_id
+    /// 供对账，绝不返回成功。`Duration::ZERO` 保证超时分支确定性。
+    #[tokio::test]
+    async fn local_revocation_wait_deadline_and_dropped_consumer_stay_unknown() {
+        let (producer, mut receiver, _bus) = local_revocation_fixture(4);
+
+        let waiter = tokio::spawn({
+            let producer = producer.clone();
+            async move {
+                producer
+                    .publish_auth_session_revocation_and_wait(
+                        revocation_payload(Some("rev-deadline"), None),
+                        Duration::ZERO,
+                    )
+                    .await
+            }
+        });
+        let delivery = receiver.recv().await.unwrap();
+        assert_eq!(delivery.envelope.message_id, "rev-deadline");
+        match waiter.await.unwrap() {
+            Err(MqError::Publish(text)) => {
+                assert!(text.contains("unknown"), "unexpected: {text}");
+                assert!(text.contains("rev-deadline"), "unexpected: {text}");
+            }
+            other => panic!("expected unknown outcome, got {other:?}"),
+        }
+        drop(delivery);
+
+        let waiter = tokio::spawn({
+            let producer = producer.clone();
+            async move {
+                producer
+                    .publish_auth_session_revocation_and_wait(
+                        revocation_payload(Some("rev-dropped"), None),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            }
+        });
+        let delivery = receiver.recv().await.unwrap();
+        drop(delivery);
+        match waiter.await.unwrap() {
+            Err(MqError::Publish(text)) => {
+                assert!(text.contains("unknown"), "unexpected: {text}");
+                assert!(text.contains("rev-dropped"), "unexpected: {text}");
+            }
+            other => panic!("expected unknown outcome, got {other:?}"),
+        }
+    }
+
+    /// 显式拒绝：owner 未注册（NoOwner）与队列打满（Full）都必须在入队前
+    /// 得到显式错误，不产生"看似成功"的 admission。
+    #[tokio::test]
+    async fn local_revocation_wait_reports_missing_owner_and_full_queue_explicitly() {
+        let bus = LocalBus::new(LocalBusLimits::default()).unwrap();
+        let producer = Producer::new_local(bus, "local");
+        match producer
+            .publish_auth_session_revocation_and_wait(
+                revocation_payload(Some("rev-no-owner"), None),
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Err(MqError::Publish(text)) => {
+                assert!(text.contains("no registered owner"), "unexpected: {text}");
+                assert!(
+                    text.contains(QUEUE_AUTH_SESSION_REVOCATION),
+                    "unexpected: {text}"
+                );
+            }
+            other => panic!("expected missing-owner error, got {other:?}"),
+        }
+
+        let (producer, mut receiver, bus) = local_revocation_fixture(1);
+        let filler = crate::envelope::MessageEnvelope::new(
+            "rev-filler",
+            "rev-filler",
+            "AUTH_SESSION_REVOCATION",
+            1,
+            "local",
+            json!({"filler": true}),
+        )
+        .unwrap();
+        bus.try_publish(
+            QUEUE_AUTH_SESSION_REVOCATION,
+            "auth.session.revocation",
+            filler,
+        )
+        .unwrap();
+        match producer
+            .publish_auth_session_revocation_and_wait(
+                revocation_payload(Some("rev-full"), None),
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Err(MqError::Publish(text)) => {
+                assert!(text.contains("full"), "unexpected: {text}");
+            }
+            other => panic!("expected queue-full error, got {other:?}"),
+        }
+        let filler = receiver.recv().await.unwrap();
+        assert_eq!(filler.envelope.message_id, "rev-filler");
+        drop(filler);
     }
 }

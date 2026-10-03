@@ -676,7 +676,7 @@ pub(crate) async fn approve_request(
         .map_err(|error| AstralError::Internal(format!("org_scope cmd serialize: {error}")))?;
     let digest = canonical_input_digest("REQUEST_APPROVE", &canonical);
 
-    let mut tx = begin_tx(store.pool()).await?;
+    let (mut tx, authority_guard) = begin_authority_tx(store.pool()).await?;
     let locked = sqlx::query(REQUEST_LOCK_SQL)
         .bind(cmd.request_id)
         .fetch_optional(&mut *tx)
@@ -699,7 +699,9 @@ pub(crate) async fn approve_request(
     .await?
     {
         OperationClaim::Replayed(mut value) => {
-            tx.commit().await.map_err(db_err)?;
+            commit_authority_tx(tx, authority_guard)
+                .await
+                .map_err(db_err)?;
             // 幂等合同：回放返回首次 outcome，但必须向调用方标明 replayed=true。
             value["replayed"] = serde_json::Value::Bool(true);
             serde_json::from_value(value).map_err(|error| {
@@ -773,7 +775,9 @@ pub(crate) async fn approve_request(
                 records,
             };
             record_operation_outcome_in_tx(&mut tx, &cmd.operation_id, &outcome).await?;
-            tx.commit().await.map_err(db_err)?;
+            commit_authority_tx(tx, authority_guard)
+                .await
+                .map_err(db_err)?;
             Ok(outcome)
         }
     }

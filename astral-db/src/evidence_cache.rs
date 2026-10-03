@@ -177,6 +177,7 @@ use policy_engine::{
     PermissionRule, ProjectionGate, RuleRepository, RuleSetDependencyStatus, RuleSetSnapshot,
     SnapshotWinner,
 };
+#[cfg(feature = "redis-compat")]
 use redis::AsyncCommands;
 use sqlx::MySqlPool;
 use time::OffsetDateTime;
@@ -185,6 +186,8 @@ use crate::authorization_projection_repository::{
     load_published_card_grant_evidence, AuthorizationEvidenceError,
 };
 use crate::cache_epoch::cache_epoch_is_current;
+use crate::eligibility::redis_projection_compat_enabled;
+use crate::memory_projection_hub::{memory_projection_hub, MemoryProjectionHub};
 use crate::permission_query::{
     evidence_fence_baseline, evidence_manifest_versions, load_card_scope_fence_snapshot,
     CardScopeFenceSnapshot, PermissionCacheManifestVersion,
@@ -501,8 +504,12 @@ pub trait L2EvidenceStore: Send + Sync {
 /// 生产 L2 存取：经 `crate::eligibility::redis_conn` 的进程级连接池获取
 /// `ConnectionManager`（池化复用 + runtime 边界语义见该函数文档；连接管理器
 /// 自带自动重连）。Redis 不可用 → `Err` → 调用方降级为 L1+DB。
+/// 生产 L2 存取（仅 redis-compat feature 编译；feature-off 构建由
+/// [`NoopL2EvidenceStore`] 承担同签名语义）。
+#[cfg(feature = "redis-compat")]
 pub struct RedisL2EvidenceStore;
 
+#[cfg(feature = "redis-compat")]
 #[async_trait::async_trait]
 impl L2EvidenceStore for RedisL2EvidenceStore {
     async fn get(&self, key: &str) -> Result<Option<String>, String> {
@@ -538,9 +545,42 @@ impl L2EvidenceStore for RedisL2EvidenceStore {
 /// 进程级全局 L2 存取句柄（生产装配默认值；测试可整体旁路或注入内存实现）。
 static SHARED_L2_EVIDENCE_STORE: OnceLock<Arc<dyn L2EvidenceStore>> = OnceLock::new();
 
-/// 生产 L2 存取句柄（`RedisL2EvidenceStore`）。
+/// 生产 L2 存取句柄：redis-compat feature 编译时为 `RedisL2EvidenceStore`；
+/// feature-off 构建为 [`NoopL2EvidenceStore`]（等价"Redis 永久不可用"的既有
+/// 降级语义：读恒 miss、写静默丢弃，L1 + strict DB 兜底，fail-closed 不变）。
 pub fn shared_l2_evidence_store() -> &'static Arc<dyn L2EvidenceStore> {
-    SHARED_L2_EVIDENCE_STORE.get_or_init(|| Arc::new(RedisL2EvidenceStore))
+    SHARED_L2_EVIDENCE_STORE.get_or_init(|| Arc::new(shared_l2_evidence_store_impl()))
+}
+
+#[cfg(feature = "redis-compat")]
+fn shared_l2_evidence_store_impl() -> impl L2EvidenceStore {
+    RedisL2EvidenceStore
+}
+
+/// redis-compat feature 未编译时的 L2 空实现（no-op；语义见
+/// [`shared_l2_evidence_store`]）。
+#[cfg(not(feature = "redis-compat"))]
+struct NoopL2EvidenceStore;
+
+#[cfg(not(feature = "redis-compat"))]
+#[async_trait::async_trait]
+impl L2EvidenceStore for NoopL2EvidenceStore {
+    async fn get(&self, _key: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    async fn set_ex(&self, _key: &str, _value: String, _ttl_seconds: u64) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn del(&self, _key: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "redis-compat"))]
+fn shared_l2_evidence_store_impl() -> impl L2EvidenceStore {
+    NoopL2EvidenceStore
 }
 
 /// L2 evidence 完整键（epoch 内嵌：换时代后旧键自然失配）。`pub` 仅为真实
@@ -1226,6 +1266,12 @@ pub fn publish_affected_card_scope(
 /// 未知、严格读失败、Redis 失败）一律静默 warn，绝不阻塞/回报失败——发布
 /// 本身已 durable commit，推送只是跨实例共享优化。
 pub async fn push_published_card_evidence_to_l2(pool: &MySqlPool, tenant_id: i64, card_id: i64) {
+    // L2 default-off（P3 拆线）：compat adapter 显式关闭时整体旁路——不发起
+    // 严格读、不建连（推送是跨实例共享优化，不构成 durable 义务；调用方
+    // authorization_projector 的发布事务语义不受影响）。
+    if !redis_projection_compat_enabled() {
+        return;
+    }
     let deps = MySqlEvidenceReadDeps::new(pool.clone());
     // HMAC 密钥不可用 → L2 整体旁路（fail-closed）：连严格读都不做，因为
     // 读出的证据也无法以认证形态推入 L2（自然回源保证正确性）。
@@ -1301,6 +1347,8 @@ pub(crate) async fn push_evidence_to_l2_with<D: EvidenceReadDeps>(
 /// 5. 时钟新鲜度：当前时钟下窗口状态与填充时刻一致（任一翻转 → miss）。
 ///
 /// miss 协议（L2 Redis 优先 → L3 DB 兜底，见模块文档 L2 节）：
+/// 0. **存疑门**：失效通道 sticky suspect / 心跳缺失 → L1 命中与 L2 查找
+///    整体跳过，直接严格 reader（存疑禁止旧 evidence，fail-closed）；
 /// 1. **HMAC 密钥门槛**：`mac_secret` 为 `None`（密钥未设置/无效）→ L2 读/写
 ///    整体旁路（fail-closed），直接回源严格 reader；
 /// 2. **读前对牌**取得 DB 指针组（栅栏读失败 → L2 整体旁路，直接回源）；
@@ -1361,8 +1409,15 @@ pub async fn load_evidence_through_cache_with_mac<D: EvidenceReadDeps>(
 
     let key = (scope.tenant_id, scope.card_id);
     let current_epoch = deps.current_epoch().await;
+    // 存疑读取门（Redis 退役接缝）：失效通道 sticky suspect / 心跳缺失 →
+    // 禁止旧 evidence：L1 命中与 L2 查找整体跳过，直接严格 reader
+    // （fail-closed；hub 缺失时保持既有 fence-anchored 语义，见
+    // [`l1_evidence_cache_permitted`]）。
+    let l1_permitted = l1_evidence_cache_permitted(memory_projection_hub());
 
-    if let Some(entry) = cache.get(&key).await {
+    if !l1_permitted {
+        record_evidence_cache_lookup("l1", "suspect_bypass");
+    } else if let Some(entry) = cache.get(&key).await {
         let epoch_ok =
             cache_epoch_is_current(current_epoch.as_deref(), Some(entry.cache_epoch.as_str()));
         if epoch_ok {
@@ -1404,12 +1459,14 @@ pub async fn load_evidence_through_cache_with_mac<D: EvidenceReadDeps>(
         record_evidence_cache_lookup("l1", "miss");
     }
 
-    // miss：L2 优先。仅当 L2 可用、HMAC 密钥可用（密钥缺失/无效 → L2 读/写
-    // 整体旁路，fail-closed）且当前时代已知（epoch 内嵌键，换时代后旧键自然
-    // 失配；时代未知 = Redis 降级 → L2 整体旁路）才读"读前对牌"栅栏，L2 旁路
+    // miss：L2 优先。仅当存疑门放行、L2 可用、HMAC 密钥可用（密钥缺失/无效 →
+    // L2 读/写整体旁路，fail-closed）且当前时代已知（epoch 内嵌键，换时代后旧键
+    // 自然失配；时代未知 = Redis 降级 → L2 整体旁路）才读"读前对牌"栅栏，L2 旁路
     // （未注入/降级）保持冷 miss 零栅栏 I/O 的原协议。栅栏读失败 → L2 旁路，
-    // 直接回源严格 reader 保持错误语义。
-    if let (Some(l2), Some(cache_epoch), Some(mac_secret)) =
+    // 直接回源严格 reader 保持错误语义。存疑态（suspect）下 L2 查找同样跳过。
+    if !l1_permitted {
+        record_evidence_cache_lookup("l2", "suspect_bypass");
+    } else if let (Some(l2), Some(cache_epoch), Some(mac_secret)) =
         (l2, current_epoch.as_deref(), mac_secret)
     {
         if let Ok(pre_fence) = deps
@@ -1627,6 +1684,24 @@ fn cached_published_evidence_error_to_policy_error(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Redis 退役（P3 拆线）读取门
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// L1 evidence 缓存读取门（纯逻辑，`hub` 生产传
+/// [`memory_projection_hub()`]）：
+///
+/// - **hub 在场且存疑**（sticky suspect / 心跳缺失 / 锁中毒，
+///   `channel_is_suspect()`）→ `false`：存疑态禁止旧 evidence——L1 命中与
+///   L2 查找整体跳过，直接严格 reader（R1/R2 存疑回退的安全形态）；
+/// - **hub 缺失** → `true`：L1 命中协议本身是逐请求 DB 指针双读对牌
+///   （fence-anchored，见模块文档"正确性论证"），不依赖通道健康；缺 hub 是
+///   当前生产形态，保持既有语义（失效语义已由指针对牌 + `card_source_pending`
+///   位承担：任何失效/发布推进/撤权类未发布 delta 都会使对牌失配 → miss 回源）。
+fn l1_evidence_cache_permitted(hub: Option<&MemoryProjectionHub>) -> bool {
+    hub.is_none_or(|hub| !hub.channel_is_suspect())
+}
+
 /// 卡级 published card evidence 的缓存感知读取（进程级全局缓存 + L2 Redis
 /// 分发层）。
 ///
@@ -1649,13 +1724,15 @@ pub async fn cached_load_published_card_grant_evidence(
     })?;
     ensure_card_level_lens(scope)?;
     let deps = MySqlEvidenceReadDeps::new(pool.clone());
-    load_evidence_through_cache(
-        &deps,
-        shared_evidence_cache(),
-        Some(shared_l2_evidence_store().as_ref()),
-        scope,
-    )
-    .await
+    // L2 Redis 分发层 default-off（P3 拆线）：仅 compat adapter 显式开启时
+    // 注入生产 L2 存取；默认路径整体旁路——不解析 HMAC 密钥、不发起任何
+    // Redis 尝试，miss 一律严格 reader（`None` 注入与测试旁路同形）。
+    let l2_store: Option<&dyn L2EvidenceStore> = if redis_projection_compat_enabled() {
+        Some(shared_l2_evidence_store().as_ref())
+    } else {
+        None
+    };
+    load_evidence_through_cache(&deps, shared_evidence_cache(), l2_store, scope).await
 }
 
 /// 缓存感知的 [`policy_engine::RuleRepository`] 包装（engine strict 路径装配
@@ -1692,12 +1769,15 @@ pub struct CachedPublishedEvidenceRuleRepository<R, D = MySqlEvidenceReadDeps> {
 impl<R: RuleRepository> CachedPublishedEvidenceRuleRepository<R, MySqlEvidenceReadDeps> {
     /// 生产装配：inner 通常是 `astral_db::SqlxRuleRepository`（严格 reader
     /// 生产实现）；`pool` 为指针对牌与回源读取使用的同一 MySQL 池。
+    ///
+    /// L2 Redis 分发层 default-off（P3 拆线）：仅 compat adapter 显式开启时
+    /// 注入生产 L2 存取（读写仅 explicit enabled）；默认路径 `None` 整体旁路。
     pub fn new(inner: R, pool: MySqlPool) -> Self {
         Self {
             inner,
             deps: MySqlEvidenceReadDeps::new(pool),
             cache: shared_evidence_cache().clone(),
-            l2: Some(shared_l2_evidence_store().clone()),
+            l2: redis_projection_compat_enabled().then(|| shared_l2_evidence_store().clone()),
         }
     }
 }
@@ -1884,6 +1964,99 @@ mod tests {
         assert!(completed);
         assert_eq!(super::l2_push_dropped_count(), before + 1);
     }
+
+    // ===== Redis 退役（P3 拆线）读取门：suspect fail-closed + 失效禁旧 evidence =====
+
+    #[test]
+    fn l1_evidence_cache_is_blocked_only_by_a_suspect_channel() {
+        // hub 缺失（当前生产形态）：L1 命中协议为逐请求 DB 双读对牌
+        // （fence-anchored），不依赖通道健康 → 保持既有语义。
+        assert!(l1_evidence_cache_permitted(None));
+
+        // hub 在场且健康 → 参与。
+        let healthy = MemoryProjectionHub::default();
+        healthy.record_channel_heartbeat();
+        assert!(!healthy.channel_is_suspect());
+        assert!(l1_evidence_cache_permitted(Some(&healthy)));
+
+        // sticky suspect（心跳无法清除）/ 锁中毒（channel_is_suspect 毒锁返回
+        // true）→ 存疑禁止旧 evidence：L1 命中与 L2 查找整体跳过。
+        let suspect = MemoryProjectionHub::default();
+        suspect.record_channel_heartbeat();
+        suspect.mark_channel_suspect("channel lost");
+        suspect.record_channel_heartbeat();
+        assert!(suspect.channel_is_suspect());
+        assert!(!l1_evidence_cache_permitted(Some(&suspect)));
+
+        // Unmonitored（hub 在场但 supervisor 尚未心跳）按 hub 自身契约不算
+        // suspect → 保持 fence-anchored 既有语义（L1 命中本就逐请求对牌 DB，
+        // Unmonitored 不构成存疑证据）。
+        let silent = MemoryProjectionHub::default();
+        assert!(!silent.channel_is_suspect());
+        assert!(l1_evidence_cache_permitted(Some(&silent)));
+    }
+
+    #[test]
+    fn pending_invalidation_snapshot_never_matches_the_cache_baseline() {
+        // "invalidation 禁止旧 evidence" 的进程内形态：严格 reader 门禁通过后
+        // 填充的基准 pending 恒为 false；此后本卡作用域出现撤权类未发布 delta
+        // （现场读翻为 true）→ 与基准失配 → L1/L2 全部 miss 回源，绝不在
+        // source 提交与发布收敛之间的越权窗口内放行旧证据。
+        let evidence = fixture_evidence(
+            1_700_000_000,
+            vec![fixture_record(
+                "USER_CARD",
+                1,
+                1,
+                fixture_grant(1, ValidityWindow::perpetual()),
+                true,
+                None,
+            )],
+        );
+        let baseline = evidence_fence_baseline(&evidence);
+        assert!(!baseline.card_source_pending);
+        let invalidated = CardScopeFenceSnapshot {
+            manifest_versions: baseline.manifest_versions.clone(),
+            card_source_pending: true,
+        };
+        assert_ne!(baseline, invalidated);
+        // 任意聚合版本组推进（发布落库）同样失配：TTL 不是失效依据，
+        // 对牌才是（"不以 ttl alone proof 跨节点"）。
+        let mut published_ahead = baseline.clone();
+        published_ahead.manifest_versions[0].generation += 1;
+        assert_ne!(baseline, published_ahead);
+    }
+
+    /// 源码形状守卫：生产 L2 注入点必须被 compat 门（default-off）包住——
+    /// 防止后续重构把 `Some(shared_l2_evidence_store())` 重新无条件装配
+    /// （Redis 拆线的回归防线）。
+    #[test]
+    fn production_l2_injection_is_gated_by_the_compat_flag() {
+        let source = include_str!("evidence_cache.rs");
+        let gated =
+            ["redis_projection_compat_enabled().then(|| shared_l2_evidence_store().clone())"];
+        for marker in gated {
+            assert!(
+                source.contains(marker),
+                "CachedPublishedEvidenceRuleRepository::new must gate L2 behind the compat flag"
+            );
+        }
+        // cached_load 生产入口同样必须走 compat 门后再注入 L2，且默认分支
+        // 不注入任何 store（`None`）。
+        let entry = source
+            .split("pub async fn cached_load_published_card_grant_evidence")
+            .nth(1)
+            .expect("cached_load entry point must exist");
+        assert!(
+            entry.contains("redis_projection_compat_enabled()"),
+            "cached_load_published_card_grant_evidence must gate L2 behind the compat flag"
+        );
+        assert!(
+            entry.contains("} else {\n        None\n    };"),
+            "default path must inject no L2 store"
+        );
+    }
+
     use std::collections::VecDeque;
     use std::sync::Mutex;
 

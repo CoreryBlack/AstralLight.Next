@@ -49,6 +49,7 @@ report/
 
 # Validation and benchmark generated campaign output
 Docs/authorization-validation/evidence/
+Docs/authorization-validation/tools/evidence/
 Docs/authorization-validation/artifact/
 Docs/实验/复现运行/
 evaluation/benchmark-results/

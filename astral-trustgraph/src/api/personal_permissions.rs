@@ -670,6 +670,7 @@ mod tests {
                 admin_id: 0,
                 card_id: 0,
                 projection_ready: false,
+                revocation_operation_id: "test-revocation".into(),
             })
         }
 

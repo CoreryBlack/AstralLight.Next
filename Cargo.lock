@@ -193,21 +193,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "astral-cache"
-version = "0.1.0"
-dependencies = [
- "astral-types",
- "async-trait",
- "policy-engine",
- "redis",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "astral-common"
 version = "0.1.0"
 dependencies = [
@@ -270,6 +255,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "astral-common",
+ "astral-db",
+ "astral-mq",
  "astral-types",
  "axum",
  "bytes",
@@ -282,6 +269,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror",
  "time",
  "tokio",
@@ -368,6 +356,7 @@ dependencies = [
 name = "astral-mq"
 version = "0.1.0"
 dependencies = [
+ "astral-common",
  "astral-db",
  "astral-types",
  "async-trait",
@@ -383,6 +372,22 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "astral-single-node"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "astral-common",
+ "astral-db",
+ "astral-gateway",
+ "astral-identity",
+ "astral-mq",
+ "astral-trustgraph",
+ "sqlx",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

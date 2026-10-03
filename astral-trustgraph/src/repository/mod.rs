@@ -9,6 +9,7 @@
 
 pub mod admin_group_repository;
 pub mod audit_log_repository;
+pub mod authorization_source_transaction;
 pub mod card_template_repository;
 pub mod cross_org_grant_repository;
 pub mod delegation_repository;
@@ -19,6 +20,7 @@ pub mod grading_repository;
 pub mod grant_ledger_adapter;
 pub mod hit_stat_repository;
 pub mod inheritance_config_repository;
+pub mod invalidation_repository;
 pub mod level_repository;
 pub mod level_template_repository;
 pub mod permission_action_repository;

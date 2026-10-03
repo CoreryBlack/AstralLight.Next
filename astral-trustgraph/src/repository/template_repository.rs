@@ -9,6 +9,7 @@ use sqlx::MySqlPool;
 use astral_types::{AstralError, EVENT_TYPE_REVOKE, EVENT_TYPE_RULE_SET_UPDATE};
 
 use crate::repository::audit_log_repository::RuleSetMutationContext;
+use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
 use crate::repository::rule_set_repository::{
     replace_rule_set_entries_churn_with_ledger_in_tx, LedgerChurnAuditContext, NewRuleSetEntry,
 };
@@ -377,7 +378,7 @@ fn template_rows_to_entry_requests(
 }
 
 async fn sync_template_rule_set_projection_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     template_id: &str,
     forced_event_type: Option<&str>,
     context: Option<&RuleSetMutationContext>,
@@ -402,7 +403,7 @@ async fn sync_template_rule_set_projection_in_tx(
          ORDER BY priority DESC, template_rule_id FOR UPDATE",
         )
         .bind(template_id)
-        .fetch_all(&mut **tx)
+        .fetch_all(&mut ***tx)
         .await
         .map_err(db_error)?;
     let rows = template_rows_to_entry_requests(fetched_template_rules)?;
@@ -505,7 +506,7 @@ impl TemplateRepository for SqlxTemplateRepository {
             .iter()
             .map(validate_template_rule)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         ensure_template_rule_set_in_tx(&mut tx, template_id).await?;
         for (rule, effect) in rules.iter().zip(effects) {
             sqlx::query(
@@ -515,7 +516,7 @@ impl TemplateRepository for SqlxTemplateRepository {
             .bind(effect)
             .bind(&rule.resource)
             .bind(&rule.action)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         }
@@ -534,7 +535,7 @@ impl TemplateRepository for SqlxTemplateRepository {
             Some(context),
         )
         .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(())
     }
 
@@ -548,21 +549,21 @@ impl TemplateRepository for SqlxTemplateRepository {
             .iter()
             .map(validate_template_rule)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         ensure_template_rule_set_in_tx(&mut tx, template_id).await?;
         let had_deny = !sqlx::query_scalar::<_, String>(
             "SELECT effect FROM permission_rule_template \
              WHERE template_id = ? AND effect = 'DENY' FOR UPDATE",
         )
         .bind(template_id)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await
         .map_err(db_error)?
         .is_empty();
 
         sqlx::query("DELETE FROM permission_rule_template WHERE template_id = ?")
             .bind(template_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
 
@@ -575,7 +576,7 @@ impl TemplateRepository for SqlxTemplateRepository {
             .bind(effect)
             .bind(&rule.resource)
             .bind(&rule.action)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
             inserted += 1;
@@ -597,7 +598,7 @@ impl TemplateRepository for SqlxTemplateRepository {
             Some(context),
         )
         .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(inserted)
     }
 
@@ -620,11 +621,11 @@ impl TemplateRepository for SqlxTemplateRepository {
         template_id: &str,
         context: &RuleSetMutationContext,
     ) -> Result<usize, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let synced =
             sync_template_rule_set_projection_in_tx(&mut tx, template_id, None, Some(context))
                 .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(synced)
     }
 
@@ -635,7 +636,7 @@ impl TemplateRepository for SqlxTemplateRepository {
         context: &RuleSetMutationContext,
     ) -> Result<i64, AstralError> {
         let effect = validate_template_rule(rule)?;
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         ensure_template_rule_set_in_tx(&mut tx, template_id).await?;
         let result = sqlx::query(
             "INSERT INTO permission_rule_template (template_id, effect, resource_type, action_code) VALUES (?, ?, ?, ?)",
@@ -644,7 +645,7 @@ impl TemplateRepository for SqlxTemplateRepository {
         .bind(effect)
         .bind(&rule.resource)
         .bind(&rule.action)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         let rule_id = result.last_insert_id() as i64;
@@ -655,7 +656,7 @@ impl TemplateRepository for SqlxTemplateRepository {
             Some(context),
         )
         .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(rule_id)
     }
 
@@ -667,13 +668,13 @@ impl TemplateRepository for SqlxTemplateRepository {
         action: Option<&str>,
         context: &RuleSetMutationContext,
     ) -> Result<(), AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let current: Option<(String, String, String, String)> = sqlx::query_as(
             "SELECT template_id, effect, resource_type, action_code \
              FROM permission_rule_template WHERE template_rule_id = ? FOR UPDATE",
         )
         .bind(rule_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let Some((template_id, current_effect, current_resource, current_action)) = current else {
@@ -704,19 +705,19 @@ impl TemplateRepository for SqlxTemplateRepository {
             separated.push("action_code = ").push_bind(action);
         }
         if effect.is_none() && resource.is_none() && action.is_none() {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(());
         }
         builder
             .push(" WHERE template_rule_id = ")
             .push_bind(rule_id);
-        builder.build().execute(&mut *tx).await.map_err(db_error)?;
+        builder.build().execute(&mut **tx).await.map_err(db_error)?;
 
         let resulting_effect: String = sqlx::query_scalar(
             "SELECT effect FROM permission_rule_template WHERE template_rule_id = ?",
         )
         .bind(rule_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
         .map_err(db_error)?;
         let event_type = if event_type_for_effect(&resulting_effect) == EVENT_TYPE_REVOKE
@@ -733,7 +734,7 @@ impl TemplateRepository for SqlxTemplateRepository {
             Some(context),
         )
         .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(())
     }
 
@@ -756,12 +757,12 @@ impl TemplateRepository for SqlxTemplateRepository {
         rule_id: i64,
         context: &RuleSetMutationContext,
     ) -> Result<bool, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let template_id: Option<String> = sqlx::query_scalar(
             "SELECT template_id FROM permission_rule_template WHERE template_rule_id = ? FOR UPDATE",
         )
         .bind(rule_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let Some(template_id) = template_id else {
@@ -769,7 +770,7 @@ impl TemplateRepository for SqlxTemplateRepository {
         };
         sqlx::query("DELETE FROM permission_rule_template WHERE template_rule_id = ?")
             .bind(rule_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         sync_template_rule_set_projection_in_tx(
@@ -779,7 +780,7 @@ impl TemplateRepository for SqlxTemplateRepository {
             Some(context),
         )
         .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(true)
     }
 

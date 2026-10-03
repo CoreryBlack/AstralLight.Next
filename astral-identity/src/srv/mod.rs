@@ -20,6 +20,7 @@ pub mod password;
 pub mod session;
 pub(crate) mod session_projection_worker;
 pub(crate) mod session_repository;
+pub(crate) mod source_writer_guard;
 pub(crate) mod user_repository;
 pub(crate) mod user_service;
 pub mod users;

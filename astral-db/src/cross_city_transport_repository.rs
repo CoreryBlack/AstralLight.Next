@@ -18,18 +18,22 @@
 //! source-anchored test pins this boundary. There are no foreign keys between
 //! the transport tables and the operation root: parent operation liveness is
 //! deliberately NOT checked here (no cross-table access); admission of a
-//! message into an operation's flow is owned by the future transport layer.
+//! message into an operation's flow is owned by the transport runtime.
 //!
 //! # Execution boundary (default-off subsystem)
 //!
-//! Nothing in this module is wired into any writer, MQ client, HTTP handler,
-//! coordinator, or Redis path, and nothing here produces an authorization
-//! decision. Recording or delivering a message is NOT an ALLOW: transport
-//! success never implies authorization, and the only authorization entry point
-//! remains `PolicyEngine.evaluate()`. Every function below is an explicit
-//! primitive for a FUTURE transport layer; there is no runtime caller today.
-//! No network, Redis, MQ, retry loop, or sleep runs inside these transactions;
-//! callers own commit/rollback and every post-commit effect.
+//! Nothing in this module produces an authorization decision. Recording or
+//! delivering a message is NOT an ALLOW: transport success never implies
+//! authorization, and the only authorization entry point remains
+//! `PolicyEngine.evaluate()`. Every function below is an explicit primitive
+//! of the transport layer; WIRING is the transport runtime's responsibility —
+//! the sanctioned runtime caller (the cross-city runtime wiring in
+//! `astral-trustgraph`, DEFAULT-OFF behind its explicit environment decision)
+//! drives these primitives inside ITS OWN transactions, and this module holds
+//! NO direct runtime dependency (the dependency points one way only:
+//! runtime -> repository). No network, Redis, MQ, retry loop, or sleep runs
+//! inside these transactions; callers own commit/rollback and every
+//! post-commit effect.
 //!
 //! # Durable-before-ACK boundary (the core contract of this slice)
 //!
@@ -186,6 +190,16 @@
 //! and a row carrying PARTIAL lease material matches neither branch: it is
 //! poison, refused on the locked row — never repaired by an overwrite.
 //!
+//! The inbox additionally admits a TARGETED claim
+//! ([`claim_inbox_message_in_tx`]): the same two-branch disjunction is
+//! evaluated server-side (`UTC_TIMESTAMP()`, `FOR UPDATE`) for ONE requested
+//! `message_id` instead of scanning the table, so the runtime can drive a
+//! single message it already holds a payload for without letting a different
+//! (e.g. payload-less) delivery fail or block others. Every not-claimable
+//! state — absent id, pending backoff fence, live lease, closed status,
+//! partial lease material — returns `Ok(None)` before any mutation exists in
+//! the flow, leaving the attempt counter untouched.
+//!
 //! # Actor-specific status transitions
 //!
 //! Status movement strictly follows the [`CrossCityDeliveryStatus`] guarded
@@ -239,7 +253,7 @@
 //! # Residual trust boundary
 //!
 //! The repository cannot itself prove external facts: the reconcile outcome is
-//! an assertion by the future transport layer that the named fact was
+//! an assertion by the transport runtime that the named fact was
 //! independently proven (e.g. the destination city's own durable record); this
 //! module records it durably and nothing more. Signature verification of
 //! message content likewise stays outside this slice, exactly as in the first
@@ -1195,6 +1209,29 @@ const INBOX_CLAIM_CANDIDATE_SQL: &str = "SELECT message_id, operation_id, source
        AND lease_expires_at IS NOT NULL AND lease_expires_at <= UTC_TIMESTAMP())) \
     ORDER BY lease_expires_at ASC, received_at ASC, message_id ASC \
     LIMIT 1 FOR UPDATE";
+
+/// Targeted claim candidate for ONE requested `message_id` (see
+/// [`claim_inbox_message_in_tx`]). The column shape is IDENTICAL to the scan
+/// candidate so the locked row is FULLY poison-decoded by the same record
+/// codec; the predicate is the SAME exact server-side two-branch disjunction
+/// (server UTC time only), keyed by primary-key equality instead of a table
+/// scan — no other delivery is ever addressed, locked for mutation, or
+/// observed. A row that is not claimable right now (backoff fence pending,
+/// live lease, closed status, partial lease material) or an absent id matches
+/// NEITHER branch: no row is returned, no mutation runs, and the attempt
+/// counter is untouched. Like the scan candidate it deliberately does NOT
+/// pre-filter on the attempt bound, so an exhausted or out-of-range ACTIVE
+/// row still SURFACES (and fails closed) instead of being silently skipped.
+const INBOX_CLAIM_MESSAGE_CANDIDATE_SQL: &str = "SELECT message_id, operation_id, source_city_id, \
+    phase, payload_digest, status, attempts, lease_owner, lease_token_hash, lease_expires_at, \
+    received_at, processed_at, last_error \
+    FROM authorization_cross_city_inbox \
+    WHERE message_id = ? AND ( \
+      (status = 'PENDING' AND lease_owner IS NULL AND lease_token_hash IS NULL \
+       AND (lease_expires_at IS NULL OR lease_expires_at <= UTC_TIMESTAMP())) \
+   OR (status = 'LEASED' AND lease_owner IS NOT NULL AND lease_token_hash IS NOT NULL \
+       AND lease_expires_at IS NOT NULL AND lease_expires_at <= UTC_TIMESTAMP())) \
+    FOR UPDATE";
 
 /// Lease install: atomically flips the observed state to `LEASED` (WITHOUT
 /// this flip every worker mutation would refuse the claimed row) and installs
@@ -2665,6 +2702,153 @@ pub async fn claim_inbox_in_tx(
     }))
 }
 
+/// Claim ONE specific inbox message by its `message_id` under a fresh
+/// run-scoped lease token, flipping that row to `LEASED` atomically in the
+/// SAME install CAS as [`claim_inbox_in_tx`]. Unlike the scan claim this
+/// primitive never touches any OTHER delivery: the candidate keys on
+/// primary-key equality, so a runtime that already holds one message's
+/// payload can drive exactly that message without a broad scan — a different
+/// (e.g. payload-less) message can neither fail nor block it.
+///
+/// Claimability is decided ENTIRELY server-side, by the SAME exact two-branch
+/// disjunction as the scan claim, evaluated against `UTC_TIMESTAMP()` on the
+/// `FOR UPDATE`-locked row and re-checked by the install CAS: a `PENDING` row
+/// with its lease fully cleared and the `lease_expires_at` backoff fence
+/// passed (or absent), or a `LEASED` row whose complete lease (owner + token
+/// hash + expiry) has EXPIRED. The reclaim still applies the two guarded
+/// worker edges (`LEASED -> PENDING`, then `PENDING -> LEASED`) before the
+/// install, and a LIVE lease is never stolen.
+///
+/// Returns `Ok(None)` — no statement that could mutate the row has run, so
+/// the attempt counter is untouched — when the requested id has no claimable
+/// row right now: the row is absent, its backoff fence has not passed, its
+/// lease is still live, its status is closed (`SUCCEEDED` / `QUARANTINED` /
+/// `IN_DOUBT`), or it carries partial lease material (which matches neither
+/// branch and is never repaired by an overwriting claim). A row that IS
+/// selected is fully poison-decoded (identical validation to every
+/// record-returning path) and must be EXACTLY the requested message id; an
+/// exhausted or out-of-range ACTIVE row still surfaces the same fail-closed
+/// errors as the scan claim (never silently skipped, never leased — the
+/// install retains `attempts < MAX`). A lost install race remains an explicit
+/// conflict; the readback proves the installed row is `LEASED`.
+pub async fn claim_inbox_message_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    message_id: &str,
+    lease_owner: &str,
+    lease_seconds: i64,
+) -> Result<Option<CrossCityInboxLeaseGrant>, CrossCityTransportRepositoryError> {
+    // The caller-supplied id is validated BEFORE any SQL: it must carry the
+    // canonical 64-hex identity-digest shape, never a padded, oversized, or
+    // differently-spelled value that could silently miss the row.
+    validated_message_id_shape(message_id)?;
+    validate_transport_lease_material(lease_owner, lease_seconds)?;
+    // Lock and eligibility in ONE server-side statement: only the requested
+    // row is addressed, and only when it matches the exact claimable
+    // disjunction at `UTC_TIMESTAMP()`. No row here means not claimable now
+    // (or absent) — `Ok(None)` is returned BEFORE any mutation exists in
+    // this flow.
+    let row: Option<InboxRow> = sqlx::query_as(INBOX_CLAIM_MESSAGE_CANDIDATE_SQL)
+        .bind(message_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    // FULL poison decode of the LOCKED row — identical validation to
+    // [`claim_inbox_in_tx`] and every record-returning path (message-id
+    // digest shape, canonical operation/source, phase parse, token-hash
+    // BINARY(32), owner canonicality, attempt bounds including the
+    // only-QUARANTINED-may-sit-AT-the-bound invariant, the one-time
+    // processed_at invariant, last_error length, and status/lease
+    // consistency). A poisoned row fails closed here and is NEVER
+    // overwritten by a claim; there is no presence-boolean shortcut.
+    let record = decode_inbox_row(row)?;
+    // Defense-in-depth: the locked row must be EXACTLY the requested message.
+    // The candidate equality already keyed on it, so any drift here is
+    // engine-level misbehavior and fails closed — never a wrong-row claim.
+    if record.message_id != message_id {
+        return Err(mapping("inbox_claim_message_identity_drift"));
+    }
+    let CrossCityInboxRecord {
+        message_id,
+        operation_id,
+        phase,
+        source_city_id,
+        payload_digest,
+        status: claimed_status,
+        attempts,
+        ..
+    } = record;
+    // Fail-closed budget gate (defense-in-depth; the decode above already
+    // refuses a non-quarantined row AT the bound and any out-of-range
+    // counter): the install below retains `attempts < MAX`, so an exhausted
+    // row is refused HERE with a stable code — surfaced, never silently
+    // skipped, never leased.
+    if attempts >= MAX_CROSS_CITY_TRANSPORT_ATTEMPTS {
+        return Err(mapping("inbox_claim_attempts_exhausted"));
+    }
+    // Actor-specific, in-lock takeover proof: exactly the guarded worker
+    // edges, applied in order AFTER the full decode. Server-side expiry of
+    // the observed lease was enforced by the candidate predicate and is
+    // re-checked by the install CAS under the same row lock.
+    match claimed_status {
+        CrossCityDeliveryStatus::Pending => {
+            claimed_status.transition_by_worker(CrossCityDeliveryStatus::Leased)?;
+        }
+        CrossCityDeliveryStatus::Leased => {
+            claimed_status.transition_by_worker(CrossCityDeliveryStatus::Pending)?;
+            CrossCityDeliveryStatus::Pending
+                .transition_by_worker(CrossCityDeliveryStatus::Leased)?;
+        }
+        _ => return Err(mapping("inbox_claim_unclaimable_status")),
+    }
+
+    let token = CrossCityTransportLeaseToken::new_run_scoped();
+    let install = sqlx::query(INBOX_CLAIM_INSTALL_SQL)
+        .bind(lease_owner)
+        .bind(token.token_hash().as_bytes().to_vec())
+        .bind(lease_seconds)
+        .bind(&message_id)
+        .bind(MAX_CROSS_CITY_TRANSPORT_ATTEMPTS)
+        .execute(&mut **tx)
+        .await?;
+    if install.rows_affected() != 1 {
+        return Err(conflict("inbox_claim_message_race"));
+    }
+
+    let readback: InboxClaimReadbackRow = sqlx::query_as(INBOX_CLAIM_READBACK_SQL)
+        .bind(&message_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if readback.message_id != message_id
+        || readback.operation_id != operation_id
+        || readback.source_city_id != source_city_id
+        || CrossCityMessagePhase::parse_str(&readback.phase)? != phase
+    {
+        return Err(mapping("inbox_claim_identity_drift"));
+    }
+    // The install must have flipped the row to LEASED: every worker mutation
+    // below requires that status, so a missed flip is a hard drift.
+    if CrossCityDeliveryStatus::parse_str(&readback.status)? != CrossCityDeliveryStatus::Leased {
+        return Err(mapping("inbox_claim_status_drift"));
+    }
+    let Some(lease_expires_at) = readback.lease_expires_at else {
+        return Err(mapping("inbox_claim_expiry_missing"));
+    };
+
+    Ok(Some(CrossCityInboxLeaseGrant {
+        message_id,
+        operation_id,
+        phase,
+        source_city_id,
+        payload_digest,
+        attempts,
+        lease_owner: lease_owner.to_owned(),
+        lease_token: token,
+        lease_expires_at_seconds: datetime_to_unix_seconds(lease_expires_at),
+    }))
+}
+
 /// Extend a live inbox lease with a strict owner + token-hash + server-side
 /// liveness CAS. A lost or expired lease is an explicit error — never a silent
 /// success.
@@ -3781,7 +3965,7 @@ mod tests {
     /// and the value is referenced as the real constant, so name and value can
     /// never drift apart; the source-shape guard below proves the production
     /// `sqlx::query*` call sites match this registry exactly.
-    const ALL_STATEMENTS: [(&str, &str); 28] = [
+    const ALL_STATEMENTS: [(&str, &str); 29] = [
         ("OUTBOX_INSERT_SQL", OUTBOX_INSERT_SQL),
         ("OUTBOX_SELECT_FOR_UPDATE_SQL", OUTBOX_SELECT_FOR_UPDATE_SQL),
         ("OUTBOX_CLAIM_CANDIDATE_SQL", OUTBOX_CLAIM_CANDIDATE_SQL),
@@ -3799,6 +3983,10 @@ mod tests {
         ("INBOX_RECORD_INSERT_SQL", INBOX_RECORD_INSERT_SQL),
         ("INBOX_SELECT_FOR_UPDATE_SQL", INBOX_SELECT_FOR_UPDATE_SQL),
         ("INBOX_CLAIM_CANDIDATE_SQL", INBOX_CLAIM_CANDIDATE_SQL),
+        (
+            "INBOX_CLAIM_MESSAGE_CANDIDATE_SQL",
+            INBOX_CLAIM_MESSAGE_CANDIDATE_SQL,
+        ),
         ("INBOX_CLAIM_INSTALL_SQL", INBOX_CLAIM_INSTALL_SQL),
         ("INBOX_CLAIM_READBACK_SQL", INBOX_CLAIM_READBACK_SQL),
         ("INBOX_HEARTBEAT_SQL", INBOX_HEARTBEAT_SQL),
@@ -3917,7 +4105,7 @@ mod tests {
 
     #[test]
     fn statements_bind_exactly_the_expected_parameter_counts() {
-        let expected: [(&str, usize); 28] = [
+        let expected: [(&str, usize); 29] = [
             (OUTBOX_INSERT_SQL, 9),
             (OUTBOX_SELECT_FOR_UPDATE_SQL, 1),
             // The claim candidate scans no longer bind an attempt bound: the
@@ -3938,6 +4126,10 @@ mod tests {
             (INBOX_RECORD_INSERT_SQL, 7),
             (INBOX_SELECT_FOR_UPDATE_SQL, 1),
             (INBOX_CLAIM_CANDIDATE_SQL, 0),
+            // The targeted claim candidate binds EXACTLY the requested
+            // message id — no caller-supplied bound, no caller-supplied
+            // clock.
+            (INBOX_CLAIM_MESSAGE_CANDIDATE_SQL, 1),
             (INBOX_CLAIM_INSTALL_SQL, 5),
             (INBOX_CLAIM_READBACK_SQL, 1),
             (INBOX_HEARTBEAT_SQL, 4),
@@ -3967,6 +4159,7 @@ mod tests {
             OUTBOX_CLAIM_CANDIDATE_SQL,
             INBOX_SELECT_FOR_UPDATE_SQL,
             INBOX_CLAIM_CANDIDATE_SQL,
+            INBOX_CLAIM_MESSAGE_CANDIDATE_SQL,
         ];
         for statement in locking {
             assert!(statement.contains("FOR UPDATE"));
@@ -3979,10 +4172,13 @@ mod tests {
         assert_eq!(total, locking.len());
         // Exactly one row is ever locked per locking statement: the full row
         // selects key on the message_id primary key; the claim candidates key
-        // on their eligibility predicate and stop at the first row.
+        // on their eligibility predicate and stop at the first row (the
+        // targeted claim candidate keys on BOTH the primary-key equality and
+        // its eligibility disjunction).
         for statement in [OUTBOX_SELECT_FOR_UPDATE_SQL, INBOX_SELECT_FOR_UPDATE_SQL] {
             assert!(statement.contains("WHERE message_id = ? FOR UPDATE"));
         }
+        assert!(INBOX_CLAIM_MESSAGE_CANDIDATE_SQL.contains("WHERE message_id = ? AND ("));
         for statement in [OUTBOX_CLAIM_CANDIDATE_SQL, INBOX_CLAIM_CANDIDATE_SQL] {
             assert!(statement.contains("LIMIT 1 FOR UPDATE"));
             assert!(!statement.contains("JOIN"));
@@ -4121,6 +4317,7 @@ mod tests {
             OUTBOX_CLAIM_CANDIDATE_SQL,
             OUTBOX_CLAIM_INSTALL_SQL,
             INBOX_CLAIM_CANDIDATE_SQL,
+            INBOX_CLAIM_MESSAGE_CANDIDATE_SQL,
             INBOX_CLAIM_INSTALL_SQL,
         ] {
             assert!(statement.contains(
@@ -4157,6 +4354,11 @@ mod tests {
             ),
             (
                 "pub async fn claim_inbox_in_tx",
+                "decode_inbox_row(row)",
+                "inbox_claim_status_drift",
+            ),
+            (
+                "pub async fn claim_inbox_message_in_tx",
                 "decode_inbox_row(row)",
                 "inbox_claim_status_drift",
             ),
@@ -4208,19 +4410,20 @@ mod tests {
         ] {
             assert!(outbox.contains(column), "outbox candidate missing {column}");
         }
-        let inbox = INBOX_CLAIM_CANDIDATE_SQL;
-        for column in [
-            "payload_digest",
-            "status",
-            "attempts",
-            "lease_owner",
-            "lease_token_hash",
-            "lease_expires_at",
-            "received_at",
-            "processed_at",
-            "last_error",
-        ] {
-            assert!(inbox.contains(column), "inbox candidate missing {column}");
+        for inbox in [INBOX_CLAIM_CANDIDATE_SQL, INBOX_CLAIM_MESSAGE_CANDIDATE_SQL] {
+            for column in [
+                "payload_digest",
+                "status",
+                "attempts",
+                "lease_owner",
+                "lease_token_hash",
+                "lease_expires_at",
+                "received_at",
+                "processed_at",
+                "last_error",
+            ] {
+                assert!(inbox.contains(column), "inbox candidate missing {column}");
+            }
         }
     }
 
@@ -4450,6 +4653,13 @@ mod tests {
         assert!(claim_body.contains("MAX_CROSS_CITY_TRANSPORT_ATTEMPTS"));
         let inbox_claim_body = production_function_body("pub async fn claim_inbox_in_tx");
         assert!(inbox_claim_body.contains("MAX_CROSS_CITY_TRANSPORT_ATTEMPTS"));
+        // The targeted inbox claim binds the same fixed attempt bound and
+        // validates the caller-supplied message id shape before any SQL.
+        let message_claim_body = production_function_body("pub async fn claim_inbox_message_in_tx");
+        assert!(message_claim_body.contains("MAX_CROSS_CITY_TRANSPORT_ATTEMPTS"));
+        assert!(message_claim_body.contains("validated_message_id_shape(message_id)"));
+        assert!(message_claim_body
+            .contains("validate_transport_lease_material(lease_owner, lease_seconds)"));
         // The outbox message id is always derived, never caller-supplied.
         let insert_body = production_function_body("pub async fn insert_outbox_in_tx");
         assert!(insert_body.contains("CrossCityMessageIdentity::new"));
@@ -4884,8 +5094,13 @@ mod tests {
     fn claim_candidates_do_not_prefilter_attempts_and_claims_fail_closed_on_exhaustion() {
         // The candidate scans no longer pre-filter on the attempt bound: an
         // exhausted or out-of-range ACTIVE row must SURFACE (and fail closed),
-        // never be silently skipped forever.
-        for candidate in [OUTBOX_CLAIM_CANDIDATE_SQL, INBOX_CLAIM_CANDIDATE_SQL] {
+        // never be silently skipped forever. The targeted by-id candidate
+        // keeps the same deliberate no-prefilter shape.
+        for candidate in [
+            OUTBOX_CLAIM_CANDIDATE_SQL,
+            INBOX_CLAIM_CANDIDATE_SQL,
+            INBOX_CLAIM_MESSAGE_CANDIDATE_SQL,
+        ] {
             assert!(!candidate.contains("attempts <"));
             assert!(candidate.contains("attempts"));
         }
@@ -4922,6 +5137,142 @@ mod tests {
                 .find("fetch_optional")
                 .expect("candidate fetch missing");
             assert!(!body[candidate_query..fetch].contains(".bind("));
+        }
+    }
+
+    // ── targeted inbox claim (one message id, server-side eligibility) ─────
+
+    #[test]
+    fn inbox_claim_message_targets_exactly_one_claimable_row_server_side() {
+        // The by-id claim must address EXACTLY the requested message row:
+        // primary-key equality plus the SAME server-side two-branch
+        // disjunction as the scan claim (server UTC time only), locked with
+        // FOR UPDATE — never a broad scan, never a client-side clock.
+        let candidate = INBOX_CLAIM_MESSAGE_CANDIDATE_SQL;
+        assert!(candidate.contains("WHERE message_id = ? AND ("));
+        assert!(candidate.ends_with("FOR UPDATE"));
+        assert!(!candidate.contains("ORDER BY"));
+        assert!(!candidate.contains("LIMIT"));
+        assert!(!candidate.contains("JOIN"));
+        // Fresh PENDING branch: lease FULLY cleared and the inbox backoff
+        // fence passed (or absent) — a pending backoff that has NOT passed
+        // (`lease_expires_at > UTC_TIMESTAMP()`) matches nothing.
+        assert!(candidate.contains(
+            "(status = 'PENDING' AND lease_owner IS NULL AND lease_token_hash IS NULL \
+             AND (lease_expires_at IS NULL OR lease_expires_at <= UTC_TIMESTAMP()))"
+        ));
+        // Expired-LEASED reclaim branch: material COMPLETE and expired — a
+        // LIVE lease matches nothing and is never stolen.
+        assert!(candidate.contains(
+            "OR (status = 'LEASED' AND lease_owner IS NOT NULL \
+             AND lease_token_hash IS NOT NULL \
+             AND lease_expires_at IS NOT NULL AND lease_expires_at <= UTC_TIMESTAMP()))"
+        ));
+        // The rejected loose form (partial-lease repair) is banned.
+        assert!(!candidate.contains("lease_owner IS NULL OR lease_token_hash IS NULL"));
+        // No live-lease admission condition exists anywhere in the candidate.
+        assert!(!candidate.contains("lease_expires_at > UTC_TIMESTAMP()"));
+        // No attempt prefilter (surfaces, never skips); no phantom schedule
+        // column on the inbox table.
+        assert!(!candidate.contains("attempts <"));
+        assert!(!candidate.contains("next_attempt_at"));
+    }
+
+    #[test]
+    fn inbox_claim_message_state_matrix_is_decided_server_side() {
+        // The Ok(None)/install matrix of the targeted claim is decided
+        // ENTIRELY by the server-side candidate disjunction — no client
+        // clock, no Rust-side eligibility guess. Pin every state:
+        //
+        // - PENDING, lease fully cleared, fence ABSENT        -> install
+        // - PENDING, lease fully cleared, fence PASSED        -> install
+        // - PENDING, backoff fence NOT passed (fence future)  -> Ok(None)
+        // - PENDING with ANY (partial) lease material         -> Ok(None)
+        // - LEASED, material complete, lease EXPIRED          -> install
+        // - LEASED, material complete, lease LIVE             -> Ok(None)
+        // - LEASED with PARTIAL material                      -> Ok(None)
+        // - SUCCEEDED / QUARANTINED / IN_DOUBT (closed)       -> Ok(None)
+        // - absent id                                         -> Ok(None)
+        //
+        // The first two install rows are proven by the candidate's two
+        // branches (tested above) and by the worker-edge matrix
+        // (`delivery_status_actor_transition_matrix_fails_closed`): the only
+        // edges the function body uses are PENDING -> LEASED and the
+        // LEASED -> PENDING -> LEASED reclaim pair. The None rows are
+        // structural: their states match NEITHER branch, so nothing is
+        // returned, no mutation runs, and the attempt counter is untouched.
+        let candidate = INBOX_CLAIM_MESSAGE_CANDIDATE_SQL;
+        // Closed statuses are simply absent from the disjunction: no branch
+        // can match them, so they can only produce Ok(None) — never an
+        // overwrite of a terminal or operator-held row.
+        assert!(!candidate.contains("SUCCEEDED"));
+        assert!(!candidate.contains("QUARANTINED"));
+        assert!(!candidate.contains("IN_DOUBT"));
+        // The branch material requirements leave no partially-leased state
+        // admitted: PENDING requires owner AND token NULL, LEASED requires
+        // owner AND token AND expiry present and expired.
+        assert!(!candidate.contains("lease_owner IS NULL OR"));
+        assert!(!candidate.contains("lease_token_hash IS NULL OR"));
+        // The None path precedes every mutation in the function flow: when
+        // the server-side predicate admits nothing, the function returns
+        // BEFORE the install statement is even reached.
+        let body = production_function_body("pub async fn claim_inbox_message_in_tx");
+        let none_return = body.find("return Ok(None)").expect("None path missing");
+        let install = body
+            .find("INBOX_CLAIM_INSTALL_SQL")
+            .expect("install missing");
+        assert!(none_return < install);
+        // The only attempt mutation in the whole path is the shared install's
+        // retained bound (`attempts < ?` in its WHERE): the install never
+        // WRITES attempts, and the None path never reaches it.
+        assert!(!INBOX_CLAIM_INSTALL_SQL.contains("attempts ="));
+        assert!(INBOX_CLAIM_INSTALL_SQL.contains("attempts < ?"));
+        // The locked row is fully decoded and must be EXACTLY the requested
+        // message id before the state machine advances (fail-closed budget
+        // gate AFTER the decode, mirroring the scan claims).
+        let decode = body.find("decode_inbox_row(row)").expect("decode missing");
+        let identity = body
+            .find("inbox_claim_message_identity_drift")
+            .expect("identity pin missing");
+        let gate = body
+            .find("attempts >= MAX_CROSS_CITY_TRANSPORT_ATTEMPTS")
+            .expect("fail-closed budget gate missing");
+        let exhausted = body
+            .find("inbox_claim_attempts_exhausted")
+            .expect("exhausted code missing");
+        assert!(decode < identity && identity < gate);
+        assert!(gate < exhausted);
+    }
+
+    #[test]
+    fn inbox_claim_message_binds_only_the_requested_id_and_fixed_constants() {
+        let body = production_function_body("pub async fn claim_inbox_message_in_tx");
+        // The caller-supplied id is shape-validated BEFORE any SQL, and the
+        // lease material is validated exactly as in the scan claims.
+        assert!(body.contains("validated_message_id_shape(message_id)"));
+        assert!(body.contains("validate_transport_lease_material(lease_owner, lease_seconds)"));
+        // The candidate fetch binds EXACTLY the message id — no
+        // caller-supplied attempt bound, no caller-supplied clock, no scan.
+        let candidate = body
+            .find("INBOX_CLAIM_MESSAGE_CANDIDATE_SQL")
+            .expect("candidate missing");
+        let fetch = body[candidate..]
+            .find("fetch_optional")
+            .expect("candidate fetch missing")
+            + candidate;
+        assert_eq!(body[candidate..fetch].matches(".bind(").count(), 1);
+        assert!(body[candidate..fetch].contains(".bind(message_id)"));
+        // Install and readback are the SHARED reviewed statements of the scan
+        // claim — no second install SQL exists to drift apart.
+        assert!(body.contains("INBOX_CLAIM_INSTALL_SQL"));
+        assert!(body.contains("INBOX_CLAIM_READBACK_SQL"));
+        // The readback proves the installed status and the exact identity.
+        for pinned in [
+            "inbox_claim_identity_drift",
+            "inbox_claim_status_drift",
+            "inbox_claim_expiry_missing",
+        ] {
+            assert!(body.contains(pinned), "readback pin missing: {pinned}");
         }
     }
 }

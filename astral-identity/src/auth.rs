@@ -21,6 +21,8 @@ use astral_common::middleware::JwtClaims;
 use astral_common::token_contract::{PrincipalKind, ACCESS_TYP, CLAIMS_VERSION, REFRESH_TYP};
 use astral_types::{AstralError, IdentityCard, PolicyError, UserCard};
 
+use crate::srv::source_writer_guard;
+
 /// 密码验证（含自动迁移：Argon2 → BCrypt → MD5）
 ///
 /// 对齐 Java `PasswordValidationServiceImpl.verifyAndMigrate()`。
@@ -709,20 +711,30 @@ pub async fn load_password_credential(
 }
 
 /// 更新密码 hash（操作 user_local_credential 表）
+///
+/// 凭证事实 autocommit 写：source writer 栅栏（hub 已装则 fail-closed 取得，
+/// 不可得即拒绝写入；await 窗口前武装取消栅栏，Ok → proven；Err/取消 →
+/// sticky uncertain）。事务内变体 [`update_password_hash_tx`] 不自围——它是
+/// 调用方 source 事务的成员（如 password.rs 重置事务），由事务栅栏统一持有，
+/// 绝不双重围栏。
 pub async fn update_password_hash(
     db: &sqlx::MySqlPool,
     user_id: i64,
     new_hash: &str,
 ) -> Result<(), AstralError> {
-    sqlx::query(
-        "UPDATE user_local_credential \
-         SET password_hash = ?, password_algo = 'ARGON2ID', password_updated_at = CURRENT_TIMESTAMP, \
-             must_change_password = 0, updated_at = CURRENT_TIMESTAMP \
-         WHERE user_id = ? AND status = 'ACTIVE'"
+    let source_guard = source_writer_guard::begin_source_write()?;
+    source_writer_guard::fenced_source_write(
+        source_guard,
+        sqlx::query(
+            "UPDATE user_local_credential \
+             SET password_hash = ?, password_algo = 'ARGON2ID', password_updated_at = CURRENT_TIMESTAMP, \
+                 must_change_password = 0, updated_at = CURRENT_TIMESTAMP \
+             WHERE user_id = ? AND status = 'ACTIVE'",
+        )
+        .bind(new_hash)
+        .bind(user_id)
+        .execute(db),
     )
-    .bind(new_hash)
-    .bind(user_id)
-    .execute(db)
     .await
     .map_err(|e| AstralError::Database(format!("Update password hash failed: {e}")))?;
     Ok(())
@@ -1060,5 +1072,42 @@ mod tests {
             AstralError::Permission("USER_CARD_SCOPE_REQUIRED".into())
         });
         assert!(matches!(unexpected, AstralError::Internal(_)));
+    }
+
+    /// 公共凭据写点 source 栅栏形状回归（源形状，无 IO）：published
+    /// `update_password_hash`（autocommit）自围；事务内变体
+    /// `update_password_hash_tx` 保持裸 SQL——由调用方事务栅栏统一持有，
+    /// 绝不双重围栏。
+    #[test]
+    fn published_password_writer_is_fenced_and_tx_variant_stays_outer_fenced() {
+        let source = include_str!("auth.rs");
+        let impl_source = &source[..source
+            .find("#[cfg(test)]")
+            .expect("tests module must stay at the end of auth.rs")];
+
+        let free_body = impl_source
+            .split("pub async fn update_password_hash(")
+            .nth(1)
+            .expect("published update_password_hash must stay in auth.rs")
+            .split("pub async fn update_password_hash_tx(")
+            .next()
+            .expect("tx variant must follow the free fn");
+        assert!(
+            free_body.contains("source_writer_guard::begin_source_write()")
+                && free_body.contains("source_writer_guard::fenced_source_write("),
+            "the published autocommit password writer must be self-fenced"
+        );
+
+        let tx_body = impl_source
+            .split("pub async fn update_password_hash_tx(")
+            .nth(1)
+            .expect("tx variant must stay in auth.rs")
+            .split("pub async fn update_last_login_at(")
+            .next()
+            .expect("update_last_login_at must follow the tx variant");
+        assert!(
+            !tx_body.contains("fenced_source_write"),
+            "the tx member must stay bare SQL: the caller transaction's fence owns it"
+        );
     }
 }

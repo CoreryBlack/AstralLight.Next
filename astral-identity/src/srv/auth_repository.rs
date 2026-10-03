@@ -11,6 +11,7 @@ use time::PrimitiveDateTime;
 use astral_types::AstralError;
 
 use crate::auth::{LoginAggregateRow, PasswordCredential};
+use crate::srv::source_writer_guard;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PlatformUserRecord {
@@ -259,6 +260,12 @@ impl AuthRepository for SqlxAuthRepository {
         email: Option<&str>,
         phone: Option<&str>,
     ) -> Result<(i64, i64), AstralError> {
+        // 注册 source 事务（platform_user / user_local_credential / identity_card）
+        // 的 hub writer 栅栏：begin 前取得（hub 已装则必须可得，不可得即拒绝
+        // 注册），COMMIT await 前武装取消栅栏，commit 证明成功后 proven 释放；
+        // pre-commit 错误（已知回滚，含 tenantful starter 模板 fail-closed）随
+        // Drop 干净释放，绝不误报 uncertain。
+        let source_guard = source_writer_guard::begin_source_write()?;
         let mut tx = self
             .db
             .begin()
@@ -334,9 +341,12 @@ impl AuthRepository for SqlxAuthRepository {
             }
         }
 
+        source_writer_guard::arm_commit_fence(&source_guard);
         tx.commit()
             .await
             .map_err(|e| AstralError::Database(format!("Commit tx failed: {e}")))?;
+        source_writer_guard::settle_commit_fence(&source_guard, true);
+        drop(source_guard);
 
         Ok((user_id, card_id))
     }
@@ -357,15 +367,21 @@ impl AuthRepository for SqlxAuthRepository {
     }
 
     async fn update_password_hash(&self, user_id: i64, new_hash: &str) -> Result<(), AstralError> {
-        sqlx::query(
-            "UPDATE user_local_credential \
-             SET password_hash = ?, password_algo = 'ARGON2ID', password_updated_at = CURRENT_TIMESTAMP, \
-                 must_change_password = 0, updated_at = CURRENT_TIMESTAMP \
-             WHERE user_id = ? AND status = 'ACTIVE'"
+        // 凭证事实 autocommit 写：source 栅栏（hub 未装 no-op；await 窗口武装
+        // 取消栅栏，结果判定后 settle）。
+        let source_guard = source_writer_guard::begin_source_write()?;
+        source_writer_guard::fenced_source_write(
+            source_guard,
+            sqlx::query(
+                "UPDATE user_local_credential \
+                 SET password_hash = ?, password_algo = 'ARGON2ID', password_updated_at = CURRENT_TIMESTAMP, \
+                     must_change_password = 0, updated_at = CURRENT_TIMESTAMP \
+                 WHERE user_id = ? AND status = 'ACTIVE'",
+            )
+            .bind(new_hash)
+            .bind(user_id)
+            .execute(&self.db),
         )
-        .bind(new_hash)
-        .bind(user_id)
-        .execute(&self.db)
         .await
         .map_err(|e| AstralError::Database(format!("Update password hash failed: {e}")))?;
         Ok(())
@@ -414,16 +430,21 @@ impl AuthRepository for SqlxAuthRepository {
         account_key: &str,
         subject_key: &str,
     ) -> Result<(), AstralError> {
-        sqlx::query(
-            "INSERT IGNORE INTO user_identity \
-             (user_id, provider, account_key, subject_key, verified) VALUES (?, ?, ?, ?, ?)",
+        // 第三方身份绑定 autocommit 写：source 栅栏（hub 未装 no-op）。
+        let source_guard = source_writer_guard::begin_source_write()?;
+        source_writer_guard::fenced_source_write(
+            source_guard,
+            sqlx::query(
+                "INSERT IGNORE INTO user_identity \
+                 (user_id, provider, account_key, subject_key, verified) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(user_id)
+            .bind(provider)
+            .bind(account_key)
+            .bind(subject_key)
+            .bind(true)
+            .execute(&self.db),
         )
-        .bind(user_id)
-        .bind(provider)
-        .bind(account_key)
-        .bind(subject_key)
-        .bind(true)
-        .execute(&self.db)
         .await
         .map_err(|e| AstralError::Database(format!("Insert user_identity failed: {e}")))?;
         Ok(())
@@ -597,23 +618,29 @@ impl AuthRepository for SqlxAuthRepository {
     }
 
     async fn insert_login_session(&self, session: NewLoginSession) -> Result<i64, AstralError> {
-        let result = sqlx::query(
-            "INSERT INTO auth_device_session \
-             (family_id, user_id, device_id, device_type, client_app_id, channel_code, \
-              current_user_card_id, session_state, session_version, session_epoch, \
-              refresh_token_hash, refresh_expires_at, status) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 1, 1, ?, ?, 'ACTIVE')",
+        // 会话创建 autocommit 写：source 栅栏（hub 已装则 fail-closed；await
+        // 窗口武装取消栅栏，结果判定后 settle）。
+        let source_guard = source_writer_guard::begin_source_write()?;
+        let result = source_writer_guard::fenced_source_write(
+            source_guard,
+            sqlx::query(
+                "INSERT INTO auth_device_session \
+                 (family_id, user_id, device_id, device_type, client_app_id, channel_code, \
+                  current_user_card_id, session_state, session_version, session_epoch, \
+                  refresh_token_hash, refresh_expires_at, status) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 1, 1, ?, ?, 'ACTIVE')",
+            )
+            .bind(session.family_id)
+            .bind(session.user_id)
+            .bind(session.device_id)
+            .bind(session.device_type)
+            .bind(session.client_app_id)
+            .bind(session.channel_code)
+            .bind(session.current_user_card_id)
+            .bind(session.refresh_hash)
+            .bind(session.refresh_expiry)
+            .execute(&self.db),
         )
-        .bind(session.family_id)
-        .bind(session.user_id)
-        .bind(session.device_id)
-        .bind(session.device_type)
-        .bind(session.client_app_id)
-        .bind(session.channel_code)
-        .bind(session.current_user_card_id)
-        .bind(session.refresh_hash)
-        .bind(session.refresh_expiry)
-        .execute(&self.db)
         .await
         .map_err(|e| AstralError::Database(format!("Save session failed: {e}")))?;
         if result.rows_affected() != 1 || result.last_insert_id() == 0 {
@@ -631,16 +658,22 @@ impl AuthRepository for SqlxAuthRepository {
         refresh_hash: &str,
         refresh_expiry: PrimitiveDateTime,
     ) -> Result<(), AstralError> {
-        let result = sqlx::query(
-            "UPDATE auth_device_session SET refresh_token_hash = ?, refresh_expires_at = ?, \
-             updated_at = UTC_TIMESTAMP() WHERE session_id = ? AND refresh_token_hash = ? \
-             AND status = 'ACTIVE' AND session_state = 'ACTIVE' AND session_version = 1 AND session_epoch = 1",
+        // 初始 refresh 绑定事实 autocommit 写：source 栅栏（hub 未装 no-op；
+        // CAS 未命中未发生 mutation，同样 proven 释放）。
+        let source_guard = source_writer_guard::begin_source_write()?;
+        let result = source_writer_guard::fenced_source_write(
+            source_guard,
+            sqlx::query(
+                "UPDATE auth_device_session SET refresh_token_hash = ?, refresh_expires_at = ?, \
+                 updated_at = UTC_TIMESTAMP() WHERE session_id = ? AND refresh_token_hash = ? \
+                 AND status = 'ACTIVE' AND session_state = 'ACTIVE' AND session_version = 1 AND session_epoch = 1",
+            )
+            .bind(refresh_hash)
+            .bind(refresh_expiry)
+            .bind(session_id)
+            .bind(expected_hash)
+            .execute(&self.db),
         )
-        .bind(refresh_hash)
-        .bind(refresh_expiry)
-        .bind(session_id)
-        .bind(expected_hash)
-        .execute(&self.db)
         .await
         .map_err(|e| AstralError::Database(format!("Bind initial refresh token failed: {e}")))?;
         if result.rows_affected() != 1 {
@@ -652,12 +685,18 @@ impl AuthRepository for SqlxAuthRepository {
     }
 
     async fn delete_active_family(&self, family_id: i64, user_id: i64) -> Result<(), AstralError> {
-        sqlx::query(
-            "DELETE FROM auth_token_family WHERE family_id = ? AND user_id = ? AND status = 'ACTIVE'",
+        // family 清理（补偿路径）autocommit 写：source 栅栏（FK 级联删除会话，
+        // 属会话事实 mutation；hub 未装 no-op）。
+        let source_guard = source_writer_guard::begin_source_write()?;
+        source_writer_guard::fenced_source_write(
+            source_guard,
+            sqlx::query(
+                "DELETE FROM auth_token_family WHERE family_id = ? AND user_id = ? AND status = 'ACTIVE'",
+            )
+            .bind(family_id)
+            .bind(user_id)
+            .execute(&self.db),
         )
-        .bind(family_id)
-        .bind(user_id)
-        .execute(&self.db)
         .await
         .map_err(|e| AstralError::Database(format!("Cleanup token family failed: {e}")))?;
         Ok(())
@@ -667,6 +706,93 @@ impl AuthRepository for SqlxAuthRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 会话/凭证写点 source 栅栏形状回归（源形状，无 IO）：注册事务在 begin 前
+    /// 取得栅栏、COMMIT await 前武装、commit 后 settle；五个单语句写点
+    /// （insert_login_session / update_initial_refresh_token / update_password_hash
+    /// / insert_identity / delete_active_family）均经 fenced_source_write 围栏。
+    #[test]
+    fn register_transaction_and_credential_writers_hold_the_source_writer_fence() {
+        let source = include_str!("auth_repository.rs");
+        // 先切到 impl 块：trait 里也有同名方法声明，find 必须跳过 trait。
+        let impl_source = &source[source
+            .find("impl AuthRepository for SqlxAuthRepository")
+            .expect("AuthRepository impl must stay in auth_repository.rs")..];
+        let body_between = |start: &str, end: &str| -> &str {
+            impl_source
+                .split(start)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{start} must stay in the impl"))
+                .split(end)
+                .next()
+                .unwrap_or_else(|| panic!("{end} must follow {start}"))
+        };
+
+        let register_body = body_between(
+            "async fn insert_register_user(",
+            "async fn load_password_credential(",
+        );
+        assert!(
+            register_body
+                .find("let source_guard = source_writer_guard::begin_source_write()")
+                .expect("register tx must acquire the hub source writer guard")
+                < register_body
+                    // 多行方法链：self\n .db\n .begin()
+                    .find(".begin()")
+                    .expect("register tx must open its transaction"),
+            "the register guard must be acquired before the transaction"
+        );
+        assert!(
+            register_body
+                .find("arm_commit_fence(&source_guard)")
+                .unwrap()
+                < register_body.find("tx.commit()").unwrap(),
+            "the commit await must be armed by the cancellation fence"
+        );
+        assert!(
+            register_body
+                .find("settle_commit_fence(&source_guard, true)")
+                .unwrap()
+                > register_body.find("tx.commit()").unwrap(),
+            "the fence is settled only after the commit outcome is proven"
+        );
+
+        for (method, end) in [
+            (
+                "async fn insert_login_session(",
+                "async fn update_initial_refresh_token(",
+            ),
+            (
+                "async fn update_initial_refresh_token(",
+                "async fn delete_active_family(",
+            ),
+            ("async fn delete_active_family(", "#[cfg(test)]"), // trailing anchor: last impl method before tests
+        ] {
+            let body = body_between(method, end);
+            assert!(
+                body.contains("source_writer_guard::begin_source_write()")
+                    && body.contains("source_writer_guard::fenced_source_write("),
+                "{method} must run under the fenced source writer"
+            );
+        }
+
+        let password_body = body_between(
+            "async fn update_password_hash(",
+            "async fn update_last_login_at(",
+        );
+        assert!(
+            password_body.contains("source_writer_guard::begin_source_write()")
+                && password_body.contains("source_writer_guard::fenced_source_write("),
+            "update_password_hash must run under the fenced source writer"
+        );
+        let identity_body =
+            body_between("async fn insert_identity(", "async fn find_platform_user(");
+        assert!(
+            identity_body.contains("source_writer_guard::begin_source_write()")
+                && identity_body.contains("source_writer_guard::fenced_source_write("),
+            "insert_identity must run under the fenced source writer"
+        );
+    }
 
     /// 形状测试：tenantless starter 模板的唯一出口是 `DeferTenantlessTemplate`
     /// （跳过/延迟授权载体）。穷尽匹配证明 `StarterGrantDecision` 不存在任何可插入

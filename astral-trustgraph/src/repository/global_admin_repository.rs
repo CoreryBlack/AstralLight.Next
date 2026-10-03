@@ -52,13 +52,16 @@ use sqlx::MySqlPool;
 
 use astral_types::{
     AstralError, DependencyVector, DependencyVersion, GrantContractError, GrantDelta,
-    GrantEvidence, GrantState, ProjectionAggregate, EVENT_TYPE_ELIGIBILITY_UPDATE,
-    EVENT_TYPE_REVOKE, EVENT_TYPE_RULE_SET_UPDATE, SYSTEM_ACTOR_ID,
+    GrantEvidence, GrantState, ProjectionAggregate, EVENT_TYPE_REVOKE, EVENT_TYPE_RULE_SET_UPDATE,
+    SYSTEM_ACTOR_ID,
 };
 use policy_engine::COMPILER_VERSION;
 
 use crate::repository::audit_log_repository::{
     insert_rule_set_projection_audit_in_tx, RuleSetProjectionAuditEntry,
+};
+use crate::repository::authorization_source_transaction::{
+    append_eligibility_projection_with_invalidation_in_tx, AuthorizationSourceTransaction,
 };
 use crate::repository::grant_ledger_adapter::{
     append_ruleset_grant_delta_in_tx, build_ruleset_add_draft, build_ruleset_remove_draft,
@@ -66,28 +69,8 @@ use crate::repository::grant_ledger_adapter::{
     RuleSetEntryLedgerFacts, RuleSetMutationKind, RULE_SET_AGGREGATE_TYPE,
 };
 use crate::repository::projection_repository::{
-    append_aggregate_projection_in_tx, append_card_projection_with_metadata_in_tx,
-    append_rule_set_projection_in_tx,
+    append_card_projection_with_metadata_in_tx, append_rule_set_projection_in_tx,
 };
-
-/// 在 source transaction 内追加 ELIGIBILITY 资格投影事件（与 CARD 事件同事务）。
-///
-/// SUPER_ADMIN 卡的 status / tenant_id / domain_id 变更同样影响资格缓存
-/// （`perm:card:active:{card_id}`），必须同事务落 ELIGIBILITY 事件，否则资格缓存
-/// 在最长 TTL 内 stale-ALLOW。ELIGIBILITY 通道轻量投影（只 evict 资格缓存 + 推进
-/// head），不重建规则快照、不发 CARD refresh，与 CARD 事件并存不会重复改快照语义。
-async fn append_eligibility_projection_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    card_id: i64,
-) -> Result<(), AstralError> {
-    append_aggregate_projection_in_tx(
-        tx,
-        ProjectionAggregate::Eligibility,
-        card_id,
-        EVENT_TYPE_ELIGIBILITY_UPDATE,
-    )
-    .await
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // __SUPERADMIN__ RuleSet BASE 贡献的授权账本物化（共享 ledger adapter helpers）
@@ -253,9 +236,17 @@ fn revision_bound_operation_id(base: &str, revision: u64) -> String {
 /// disable REMOVE 的 operation id（revision 绑定，防多次 disable 撞唯一事件号）。
 fn superadmin_disable_operation_id(admin_row_id: i64, card_id: i64, revision: u64) -> String {
     revision_bound_operation_id(
-        &format!("global-admin:disable:{admin_row_id}:card:{card_id}"),
+        &superadmin_disable_base_operation_id(admin_row_id, card_id),
         revision,
     )
+}
+
+/// superadmin disable 的确定性 base operation id：账本 REMOVE、CARD REVOKE 与
+/// ELIGIBILITY durable invalidation intent 共用同一源 mutation 身份空间。
+/// outbox 唯一性由每事件的 ELIGIBILITY 投影事件 id（messageId）承担，本 id 只做
+/// 源 mutation 关联；随机 fallback 绝不进入事件链。
+fn superadmin_disable_base_operation_id(admin_row_id: i64, card_id: i64) -> String {
+    format!("global-admin:disable:{admin_row_id}:card:{card_id}")
 }
 
 /// disable 路径关联审计行的 change_type：以 CARD REVOKE 投影事件为锚，与 grant
@@ -311,7 +302,7 @@ fn superadmin_contract_error(error: GrantContractError) -> AstralError {
 /// 全部执行，任何失败 fail-closed 并整体回滚。不 commit、不触碰 Redis/MQ。
 #[allow(clippy::too_many_arguments)]
 async fn append_ruleset_resurrection_add_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     head: &astral_db::GrantHeadSnapshot,
     facts: &RuleSetEntryLedgerFacts<'_>,
     operation_id: &str,
@@ -374,7 +365,7 @@ async fn append_ruleset_resurrection_add_in_tx(
     })?;
 
     astral_db::append_grant_revision_in_tx(
-        &mut *tx,
+        tx,
         &astral_db::GrantRevisionAppendRequest {
             tenant_id: facts.tenant_id,
             card_id_scope: Some(facts.card_id),
@@ -390,36 +381,36 @@ async fn append_ruleset_resurrection_add_in_tx(
     )
     .await
     .map_err(map_grant_repository_error)?;
-    astral_db::append_delta_event(
-        &mut **tx,
-        &astral_db::DeltaEventAppendRequest {
-            tenant_id: facts.tenant_id,
-            card_id: Some(facts.card_id),
-            aggregate_type: RULE_SET_AGGREGATE_TYPE.to_owned(),
-            aggregate_id: facts.rule_set_id,
-            grant_id: head.grant_id,
-            event_id: contribution_event_id.to_owned(),
-            operation_id: operation_id.to_owned(),
-            event_type: astral_db::DeltaEventType::Add,
-            base_version,
-            target_version,
-            source_generation: superadmin_projection_u64(
-                parent.source_generation,
-                "source_generation",
-            )?,
-            revoke_fence: superadmin_projection_u64(parent.revoke_fence, "revoke_fence")?,
-            invalidates_published_evidence: false,
-            before_image_json: None,
-            before_digest_hex: None,
-            delta_json,
-            semantic_hash_hex,
-            dependency_hash_hex,
-            compiler_version: COMPILER_VERSION.to_owned(),
-            next_attempt_at: None,
-        },
-    )
-    .await
-    .map_err(map_grant_repository_error)?;
+    let delta_request = astral_db::DeltaEventAppendRequest {
+        tenant_id: facts.tenant_id,
+        card_id: Some(facts.card_id),
+        aggregate_type: RULE_SET_AGGREGATE_TYPE.to_owned(),
+        aggregate_id: facts.rule_set_id,
+        grant_id: head.grant_id,
+        event_id: contribution_event_id.to_owned(),
+        operation_id: operation_id.to_owned(),
+        event_type: astral_db::DeltaEventType::Add,
+        base_version,
+        target_version,
+        source_generation: superadmin_projection_u64(
+            parent.source_generation,
+            "source_generation",
+        )?,
+        revoke_fence: superadmin_projection_u64(parent.revoke_fence, "revoke_fence")?,
+        invalidates_published_evidence: false,
+        before_image_json: None,
+        before_digest_hex: None,
+        delta_json,
+        semantic_hash_hex,
+        dependency_hash_hex,
+        compiler_version: COMPILER_VERSION.to_owned(),
+        next_attempt_at: None,
+    };
+    astral_db::append_delta_event(&mut ***tx, &delta_request)
+        .await
+        .map_err(map_grant_repository_error)?;
+    // 同一 request 实例：durable 行已在本事务 append，commit 证明后直投。
+    tx.stage_projection_receipt(delta_request)?;
     Ok(())
 }
 
@@ -444,7 +435,7 @@ async fn append_ruleset_resurrection_add_in_tx(
 /// 本函数不修改 source 行、不 commit；任一失败向上传播触发整体回滚。
 #[allow(clippy::too_many_arguments)]
 async fn revoke_superadmin_rule_set_contributions_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     admin_row_id: i64,
     card_id: i64,
     user_id: i64,
@@ -463,7 +454,7 @@ async fn revoke_superadmin_rule_set_contributions_in_tx(
          WHERE template_id = ? AND status = 'ACTIVE'",
     )
     .bind(template_id)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut ***tx)
     .await
     .map_err(db_error)?;
     if template_code.as_deref() != Some("__SUPERADMIN__") {
@@ -476,7 +467,7 @@ async fn revoke_superadmin_rule_set_contributions_in_tx(
          WHERE source_type = 'TEMPLATE' AND source_id = ? AND enabled = 1 ORDER BY rule_set_id",
     )
     .bind(template_id)
-    .fetch_all(&mut **tx)
+    .fetch_all(&mut ***tx)
     .await
     .map_err(db_error)?;
     let (rule_set_id, rule_set_tenant_id) = match rule_set_rows.as_slice() {
@@ -499,7 +490,7 @@ async fn revoke_superadmin_rule_set_contributions_in_tx(
     )
     .bind(card_id)
     .bind(rule_set_id)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut ***tx)
     .await
     .map_err(db_error)?;
     let Some(ref_id) = binding_ref_id else {
@@ -550,7 +541,7 @@ async fn revoke_superadmin_rule_set_contributions_in_tx(
     }
 
     // CARD REVOKE parent：generation/fence 锚 + legacy REVOKE 语义（同一路径）。
-    let base_operation_id = format!("global-admin:disable:{admin_row_id}:card:{card_id}");
+    let base_operation_id = superadmin_disable_base_operation_id(admin_row_id, card_id);
     let parent = append_card_projection_with_metadata_in_tx(
         tx,
         card_id,
@@ -665,9 +656,11 @@ pub struct GlobalAdminRecord {
 }
 
 /// 禁用结果（对齐 Java disable 语义）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisableOutcome {
-    /// 已成功禁用
+    /// 已成功禁用，撤销意图已与 source mutation 同事务落盘。
+    DisabledWithIntent { operation_id: String },
+    /// 兼容已有分类结果；正式禁用不得以此返回成功。
     Disabled,
     /// 最后一位活跃管理员，受保护
     LastAdminProtected,
@@ -678,12 +671,38 @@ pub enum DisableOutcome {
 /// 超管发放结果。管理员行、特权卡、BASE 绑定、授权账本贡献（grant revision +
 /// delta event）和 projection outbox 已在同一事务提交；projection 尚未 READY 时
 /// 由 API 返回显式 pending，不能伪装成普通成功。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalAdminGrantOutcome {
     pub admin_id: i64,
     pub card_id: i64,
     pub projection_ready: bool,
+    pub revocation_operation_id: String,
 }
+
+pub(crate) fn revocation_intent_type(operation_id: &str) -> Result<String, AstralError> {
+    let op_type = format!("AUTH_SESSION_REVOCATION:{operation_id}");
+    if operation_id.trim().is_empty() || operation_id.contains(':') || op_type.len() > 64 {
+        return Err(AstralError::Validation(
+            "global admin revocation operation id is invalid".into(),
+        ));
+    }
+    Ok(op_type)
+}
+
+/// 超管发放路径的租户行锁定语句（参数化 + FOR UPDATE）。
+///
+/// 本路径把 `user_card.tenant_id`（INSERT/UPDATE）与 `card_rule_set_ref.tenant_id`
+/// 绑定到 `__SUPERADMIN__` 模板 provenance 的 `tenant_id`（模板行 FOR UPDATE 锁定
+/// 后取出的非 NULL 值；runtime 初始化保证该值来自真实 ACTIVE tenant 行，无 SYSTEM
+/// 伪租户常量）。该 tenant 行必须在任何 source 写入之前锁定并证明存在，缺失即
+/// 整体 Validation 回滚。取锁方向：user_card_template → tenant → rule_set →
+/// identity_global_admin → user_card → card_rule_set_ref —— tenant 行先于
+/// rule_set/user_card，与 tenant_repository（delete_tenant 的 tenant 行锁 →
+/// user_card 引用计数守卫）及 create_card（tenant → user_card → rule_set）同向：
+/// 闭合"发放持 template/rule_set 期间硬删除租户守卫见 0 行 → 提交出孤儿超管卡"
+/// 的竞态，且不引入反向锁边。
+const GRANT_SUPERADMIN_TENANT_LOCK_SQL: &str =
+    "SELECT tenant_id FROM tenant WHERE tenant_id = ? FOR UPDATE";
 
 const STATUS_ACTIVE: &str = "ACTIVE";
 const STATUS_DISABLED: &str = "DISABLED";
@@ -1192,7 +1211,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
         template_id: i64,
         rule_set_id: i64,
     ) -> Result<GlobalAdminGrantOutcome, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
 
         let template_scope: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
             "SELECT domain_id, tenant_id FROM user_card_template \
@@ -1200,7 +1219,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
              FOR UPDATE",
         )
         .bind(template_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let (template_domain_id, template_tenant_id) = template_scope.ok_or_else(|| {
@@ -1213,12 +1232,28 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
             AstralError::Database("__SUPERADMIN__ template tenant_id is NULL".into())
         })?;
 
+        // 租户绑定写点存在性证明（fail-closed，先于本路径任何 source 写入）：
+        // SUPER_ADMIN 卡与 BASE ref 的 tenant_id 都源自模板 provenance，必须先
+        // 锁定并证明 tenant 行存在，才允许落 user_card / card_rule_set_ref 写入；
+        // 模板创建后租户已被硬删除的残留模板一律拒绝发放（孤儿超管卡即权限旁路）。
+        let locked_tenant: Option<(i64,)> = sqlx::query_as(GRANT_SUPERADMIN_TENANT_LOCK_SQL)
+            .bind(tenant_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(db_error)?;
+        if locked_tenant.is_none() {
+            return Err(AstralError::Validation(format!(
+                "global admin grant requires an existing tenant: tenant {tenant_id} not found; \
+                 refusing to bind SUPER_ADMIN user_card.tenant_id to a missing tenant"
+            )));
+        }
+
         let rule_set: Option<(String, i32, Option<i64>, Option<i64>)> = sqlx::query_as(
             "SELECT source_type, enabled, source_id, tenant_id FROM rule_set \
              WHERE rule_set_id = ? FOR UPDATE",
         )
         .bind(rule_set_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let Some((source_type, enabled, source_id, rule_set_tenant_id)) = rule_set else {
@@ -1240,7 +1275,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
             "SELECT id FROM identity_global_admin WHERE user_id = ? FOR UPDATE",
         )
         .bind(user_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?
         {
@@ -1252,7 +1287,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
             .bind(granted_by)
             .bind(reason)
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
             id
@@ -1265,7 +1300,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
             .bind(STATUS_ACTIVE)
             .bind(granted_by)
             .bind(reason)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
             result.last_insert_id() as i64
@@ -1278,7 +1313,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
         )
         .bind(user_id)
         .bind(template_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
 
@@ -1295,7 +1330,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
                     .bind(domain_id)
                     .bind(tenant_id)
                     .bind(card_id)
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await
                     .map_err(db_error)?;
                 }
@@ -1311,7 +1346,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
                 .bind(domain_id)
                 .bind(template_id)
                 .bind(tenant_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .map_err(db_error)?;
                 (result.last_insert_id() as i64, true)
@@ -1325,7 +1360,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
         )
         .bind(card_id)
         .bind(rule_set_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let (ref_id, binding_changed) = match binding {
@@ -1342,7 +1377,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
                 .bind(tenant_id)
                 .bind(card_id)
                 .bind(rule_set_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .map_err(db_error)?;
                 (ref_id, true)
@@ -1355,7 +1390,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
                 .bind(card_id)
                 .bind(rule_set_id)
                 .bind(tenant_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .map_err(db_error)?;
                 (result.last_insert_id() as i64, true)
@@ -1433,7 +1468,12 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
                 },
             )
             .await?;
-            append_eligibility_projection_in_tx(&mut tx, card_id).await?;
+            // SUPER_ADMIN 卡资格面与 CARD 事件同事务落库：ELIGIBILITY 事件与其
+            // durable invalidation intent（ELIGIBILITY_INVALIDATED 同事务落
+            // al_message_outbox）成对写入，commit 证明后直投失效通知，commit
+            // 未知绝不发送（防 stale-ALLOW）。
+            append_eligibility_projection_with_invalidation_in_tx(&mut tx, card_id, &operation_id)
+                .await?;
             for (facts, ledger_head) in &pending_contributions {
                 match grant_ledger_action(ledger_head.as_ref().map(|head| head.entry.state)) {
                     GrantLedgerAction::Skip => continue,
@@ -1505,7 +1545,19 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
             }
         }
 
-        tx.commit().await.map_err(db_error)?;
+        let revocation_operation_id = uuid::Uuid::new_v4().to_string();
+        let revocation_type = revocation_intent_type(&revocation_operation_id)?;
+        sqlx::query(
+            "INSERT INTO pending_compensation (entity_id, op_type, error_msg, status, created_at) \
+             VALUES (?, ?, ?, 'PENDING', NOW())",
+        )
+        .bind(user_id)
+        .bind(revocation_type)
+        .bind("GLOBAL_ADMIN_GRANT_REVOCATION_PENDING")
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+        tx.commit_consuming().await?;
         // is_active_admin 进程缓存 evict 钩子：授权 mutation 提交成功后本进程
         // 立即失效（跨实例由 TTL 兜底，取舍见 ACTIVE_ADMIN_CACHE_TTL）。
         evict_active_admin_entry(user_id);
@@ -1513,6 +1565,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
             admin_id,
             card_id,
             projection_ready,
+            revocation_operation_id,
         })
     }
 
@@ -1523,7 +1576,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
         granted_by: i64,
         reason: Option<&str>,
     ) -> Result<DisableOutcome, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         // 锁定全部活跃管理员行（对齐 Java `IdentityGlobalAdminMapper.selectActiveForUpdate()`）。
         // FOR UPDATE 是当前读：并发 disable A/B 时，后到事务阻塞在先到事务提交后重读最新
         // 状态，消除原 EXISTS 派生表快照读的 TOCTOU（双方各见对方活跃 → 双双通过 → 零活跃）。
@@ -1531,17 +1584,17 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
             "SELECT user_id FROM identity_global_admin WHERE status = ? ORDER BY id FOR UPDATE",
         )
         .bind(STATUS_ACTIVE)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await
         .map_err(db_error)?;
         // 仅剩本行一个活跃管理员 → 受保护（对齐 Java LAST_GLOBAL_ADMIN_PROTECTED）
         if active_ids.len() <= 1 && active_ids.first() == Some(&user_id) {
-            tx.rollback().await.map_err(db_error)?;
+            tx.rollback_consuming().await?;
             return Ok(DisableOutcome::LastAdminProtected);
         }
         // 目标已不在活跃集合（并发下被他人禁用）→ 按 0 行命中分类
         if !active_ids.contains(&user_id) {
-            tx.rollback().await.map_err(db_error)?;
+            tx.rollback_consuming().await?;
             return Ok(classify_disable_outcome(0, active_ids.len() as i64));
         }
         // 在同一 source transaction 内锁定并失活 SUPER_ADMIN 卡，随后追加 REVOKE
@@ -1552,7 +1605,7 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
              WHERE user_id = ? AND card_type = 'SUPER_ADMIN' AND card_status = 'ACTIVE' FOR UPDATE",
         )
         .bind(user_id)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await
         .map_err(db_error)?;
         let result = sqlx::query(
@@ -1566,12 +1619,12 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
         .bind(id)
         .bind(user_id)
         .bind(STATUS_ACTIVE)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
 
         if result.rows_affected() == 0 {
-            tx.rollback().await.map_err(db_error)?;
+            tx.rollback_consuming().await?;
             let active_count = self.count_active().await?;
             return Ok(classify_disable_outcome(0, active_count));
         }
@@ -1596,17 +1649,39 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
                  WHERE card_id = ? AND card_status = 'ACTIVE'",
             )
             .bind(card_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
-            // 卡状态离开 ACTIVE 同步影响资格，同事务落 ELIGIBILITY 事件。
-            append_eligibility_projection_in_tx(&mut tx, card_id).await?;
+            // 卡状态离开 ACTIVE 同步影响资格：ELIGIBILITY 事件与其 durable
+            // invalidation intent 同事务成对落库（身份与账本 REMOVE 共用同一
+            // disable base operation id），commit 证明后直投失效通知。
+            let eligibility_operation_id = superadmin_disable_base_operation_id(id, card_id);
+            append_eligibility_projection_with_invalidation_in_tx(
+                &mut tx,
+                card_id,
+                &eligibility_operation_id,
+            )
+            .await?;
         }
-        tx.commit().await.map_err(db_error)?;
+        // 由本次 source mutation 生成唯一、可重试的跨服务撤销意图。
+        // 它必须与管理员/卡/账本变更在同一事务内落盘。
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let operation_type = revocation_intent_type(&operation_id)?;
+        sqlx::query(
+            "INSERT INTO pending_compensation (entity_id, op_type, error_msg, status, created_at) \
+             VALUES (?, ?, ?, 'PENDING', NOW())",
+        )
+        .bind(user_id)
+        .bind(operation_type)
+        .bind("GLOBAL_ADMIN_DISABLE_REVOCATION_PENDING")
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+        tx.commit_consuming().await?;
         // is_active_admin 进程缓存 evict 钩子：禁用提交成功后本进程立即失效
         // （跨实例由 TTL 兜底，取舍见 ACTIVE_ADMIN_CACHE_TTL）。
         evict_active_admin_entry(user_id);
-        Ok(DisableOutcome::Disabled)
+        Ok(DisableOutcome::DisabledWithIntent { operation_id })
     }
 }
 
@@ -1657,6 +1732,58 @@ mod tests {
     fn disable_outcome_classifies_update_failed_on_race() {
         // UPDATE 未命中但存在其他活跃管理员 → 并发竞态
         assert_eq!(classify_disable_outcome(0, 2), DisableOutcome::UpdateFailed);
+    }
+
+    /// 结构守卫：发放路径的租户绑定写点（user_card INSERT/UPDATE 与
+    /// card_rule_set_ref 写入的 tenant_id 全部源自 `__SUPERADMIN__` 模板
+    /// provenance）必须先锁定并证明 tenant 行存在，再落任何 source 写入。
+    /// tenant 行锁先于 rule_set/user_card，与 tenant_repository 的
+    /// delete_tenant（tenant 行锁 → user_card 引用计数守卫）同向，闭合
+    /// "发放在途 → 硬删除守卫见 0 行 → 提交孤儿超管卡"竞态。
+    #[test]
+    fn grant_tenant_binding_locks_tenant_row_before_source_writes() {
+        // SQL 形状：参数化 + FOR UPDATE，锁定 tenant 行。
+        assert!(GRANT_SUPERADMIN_TENANT_LOCK_SQL.contains("FROM tenant"));
+        assert!(GRANT_SUPERADMIN_TENANT_LOCK_SQL.contains("tenant_id = ?"));
+        assert!(GRANT_SUPERADMIN_TENANT_LOCK_SQL.ends_with("FOR UPDATE"));
+
+        let source = include_str!("global_admin_repository.rs");
+        let implementation = source
+            .split("impl GlobalAdminRepository for SqlxGlobalAdminRepository")
+            .nth(1)
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
+            .expect("global admin repository implementation must exist");
+        let start = implementation
+            .find("async fn grant_with_superadmin_privilege")
+            .expect("grant implementation must exist");
+        let end = implementation[start..]
+            .find("async fn disable_protected")
+            .expect("disable_protected must follow grant_with_superadmin_privilege");
+        let body = &implementation[start..start + end];
+
+        // 锁序：模板 provenance（tenant_id 唯一来源）→ tenant 行锁 → user_card/ref 写入。
+        let tenant_derive = body
+            .find("__SUPERADMIN__ template tenant_id is NULL")
+            .expect("tenant id must be proven from the locked template row");
+        let tenant_lock = body
+            .find("GRANT_SUPERADMIN_TENANT_LOCK_SQL")
+            .expect("the tenant row must be locked FOR UPDATE in-tx before any source write");
+        let card_insert = body
+            .find("INSERT INTO user_card")
+            .expect("the grant path inserts the SUPER_ADMIN card");
+        let ref_insert = body
+            .find("INSERT INTO card_rule_set_ref")
+            .expect("the grant path inserts the BASE ref");
+        assert!(
+            tenant_derive < tenant_lock && tenant_lock < card_insert && tenant_lock < ref_insert,
+            "tenant row FOR UPDATE must follow template provenance and precede every \
+             user_card / card_rule_set_ref tenant binding write"
+        );
+        // 缺租户 fail-closed：锁定行缺失即 Validation 拒绝，绝不静默发放。
+        assert!(
+            body.contains("refusing to bind SUPER_ADMIN user_card.tenant_id to a missing tenant"),
+            "a missing tenant row must fail the whole grant closed"
+        );
     }
 
     #[test]

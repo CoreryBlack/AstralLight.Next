@@ -164,6 +164,20 @@ COMMANDS: list[dict[str, Any]] = [
         "required": True,
         "assertE5AbstractModel": True,
     },
+    {
+        "id": "e5-bounded-model-two-mutations",
+        "argv": ["python", str(TOOLS / "e5_model_check_two_mutations.py"), "--json"],
+        "required": True,
+        "assertTwoMutationModel": True,
+        "timeoutSeconds": 2400,
+    },
+    {
+        "id": "e5-universal-hypotheses",
+        "argv": ["python", str(TOOLS / "universal_hypotheses_check.py"), "--model", "both", "--json"],
+        "required": True,
+        "assertUniversalHypotheses": True,
+        "timeoutSeconds": 3600,
+    },
 ]
 
 HASHED_SOURCES = [
@@ -214,6 +228,13 @@ HASHED_SOURCES = [
     "Docs/authorization-validation/tools/test_e4_fault_driver.py",
     "Docs/authorization-validation/tools/e5_model_check.py",
     "Docs/authorization-validation/tools/test_e5_model_check.py",
+    "Docs/authorization-validation/tools/e5_model_check_two_mutations.py",
+    "Docs/authorization-validation/tools/test_e5_model_check_two_mutations.py",
+    "Docs/authorization-validation/tools/universal_hypotheses_check.py",
+    "Docs/authorization-validation/tools/test_universal_hypotheses_check.py",
+    "Docs/authorization-validation/tools/experiment_register.py",
+    "Docs/authorization-validation/tools/test_experiment_register.py",
+    "Docs/authorization-validation/tools/test_classify_e1_properties.py",
     "Docs/authorization-validation/tools/run_single_node_campaign.py",
     "Docs/authorization-validation/tools/test_run_single_node_campaign.py",
     "Docs/authorization-validation/formal/AdmissionSafety.tla",
@@ -244,6 +265,7 @@ def run_command(spec: dict[str, Any]) -> dict[str, Any]:
     stderr_path = LOGS / f"{command_id}.stderr.log"
     started_at = utc_now()
     monotonic_start_ns = time.monotonic_ns()
+    timeout_seconds = int(spec.get("timeoutSeconds", 1800))
     exit_code: int | None = None
     stdout = ""
     stderr = ""
@@ -258,7 +280,7 @@ def run_command(spec: dict[str, Any]) -> dict[str, Any]:
             errors="replace",
             capture_output=True,
             check=False,
-            timeout=1800,
+            timeout=timeout_seconds,
         )
         exit_code = completed.returncode
         stdout = completed.stdout
@@ -281,6 +303,8 @@ def run_command(spec: dict[str, Any]) -> dict[str, Any]:
         expected_stderr is None or expected_stderr in stderr
     )
     abstract_model_status = None
+    two_mutation_status = None
+    universal_status = None
     if spec.get("assertE5AbstractModel") and execution_status == "PASS":
         try:
             model_report = json.loads(stdout)
@@ -294,6 +318,34 @@ def run_command(spec: dict[str, Any]) -> dict[str, Any]:
         except (ValueError, KeyError, TypeError):
             assertion_ok = False
             abstract_model_status = "UNKNOWN"
+    if spec.get("assertTwoMutationModel") and execution_status == "PASS":
+        try:
+            model_report = json.loads(stdout)
+            modes = model_report["fullContract"]["modes"]
+            assertion_ok = assertion_ok and model_report["fullContract"]["status"] == "PASS"
+            assertion_ok = assertion_ok and all(
+                mode["explorationComplete"] and mode["violations"] == 0
+                for mode in modes.values()
+            )
+            two_mutation_status = model_report["fullContract"]["status"]
+        except (ValueError, KeyError, TypeError):
+            assertion_ok = False
+            two_mutation_status = "UNKNOWN"
+    if spec.get("assertUniversalHypotheses") and execution_status == "PASS":
+        try:
+            check_report = json.loads(stdout)
+            models = check_report["models"]
+            assertion_ok = assertion_ok and check_report["status"] == "PASS"
+            for name, item in models.items():
+                assertion_ok = assertion_ok and item["status"] == "PASS"
+                assertion_ok = assertion_ok and all(
+                    hypothesis["status"] == "PASS"
+                    for hypothesis in item["hypotheses"]
+                )
+            universal_status = check_report["status"]
+        except (ValueError, KeyError, TypeError):
+            assertion_ok = False
+            universal_status = "UNKNOWN"
     ignored_count = sum(
         int(match.group(1)) for match in re.finditer(r"(\d+) ignored;", stdout)
     )
@@ -312,7 +364,7 @@ def run_command(spec: dict[str, Any]) -> dict[str, Any]:
         "endedAt": ended_at,
         "monotonicStartNs": monotonic_start_ns,
         "monotonicEndNs": monotonic_end_ns,
-        "timeoutSeconds": 1800,
+        "timeoutSeconds": timeout_seconds,
         "exitCode": exit_code,
         "expectedOutput": expected,
         "expectedStderr": expected_stderr,
@@ -320,6 +372,8 @@ def run_command(spec: dict[str, Any]) -> dict[str, Any]:
         "ignoredTests": ignored_count,
         "pythonTestsRun": python_tests_run,
         "abstractModelStatus": abstract_model_status,
+        "twoMutationModelStatus": two_mutation_status,
+        "universalHypothesesStatus": universal_status,
         "status": execution_status,
         "stdout": str(stdout_path.relative_to(OUT)).replace("\\", "/"),
         "stderr": str(stderr_path.relative_to(OUT)).replace("\\", "/"),
@@ -441,6 +495,12 @@ def main(argv: list[str] | None = None) -> int:
         "E3-recovery-tail": "BLOCKED",
         "E4-preconditions-and-faults": "BLOCKED",
         "E5-abstract-bounded-model": command_status.get("e5-bounded-model", "SKIP"),
+        "E5-abstract-bounded-model-two-mutations": command_status.get(
+            "e5-bounded-model-two-mutations", "SKIP"
+        ),
+        "E5-universal-hypotheses": command_status.get(
+            "e5-universal-hypotheses", "SKIP"
+        ),
     }
     manifest = {
         "schemaVersion": 2,
@@ -462,7 +522,7 @@ def main(argv: list[str] | None = None) -> int:
         "runtimePreflight": preflight,
         "statisticsUnit": {
             "E2": "one in-memory paired scenario per omission control",
-            "E5": "finite abstract-model schedules, not production implementation proof",
+            "E5": "finite abstract-model schedules (single- and two-mutation models, universal hypotheses), not production implementation proof",
             "E1/E3/E4": "not run",
         },
         "secretHandling": "No private node configuration, credentials, or remote targets were read or written.",

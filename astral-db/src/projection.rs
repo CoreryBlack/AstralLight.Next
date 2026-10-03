@@ -122,13 +122,15 @@ enum TenantResolution {
     Captured(Option<i64>),
 }
 
-const ELIGIBILITY_BY_USER_ID_QUERY: &str = "SELECT card_id, tenant_id FROM user_card \\
-    WHERE user_id = ? AND card_status = 'ACTIVE' ORDER BY card_id FOR UPDATE";
-const ELIGIBILITY_BY_TENANT_ID_QUERY: &str = "SELECT card_id, tenant_id FROM user_card \\
-    WHERE tenant_id = ? AND card_status = 'ACTIVE' ORDER BY card_id FOR UPDATE";
-const ELIGIBILITY_BY_TENANT_AND_DOMAIN_QUERY: &str = "SELECT card_id, tenant_id FROM user_card \\
-    WHERE tenant_id = ? AND domain_id = ? AND card_status = 'ACTIVE' \\
-    ORDER BY card_id FOR UPDATE";
+pub const ELIGIBILITY_FANOUT_CAP: usize = 512;
+
+const ELIGIBILITY_BY_USER_ID_QUERY: &str = "SELECT card_id, tenant_id FROM user_card \
+    WHERE user_id = ? AND card_status = 'ACTIVE' ORDER BY card_id LIMIT ? FOR UPDATE";
+const ELIGIBILITY_BY_TENANT_ID_QUERY: &str = "SELECT card_id, tenant_id FROM user_card \
+    WHERE tenant_id = ? AND card_status = 'ACTIVE' ORDER BY card_id LIMIT ? FOR UPDATE";
+const ELIGIBILITY_BY_TENANT_AND_DOMAIN_QUERY: &str = "SELECT card_id, tenant_id FROM user_card \
+    WHERE tenant_id = ? AND domain_id = ? AND card_status = 'ACTIVE' \
+    ORDER BY card_id LIMIT ? FOR UPDATE";
 
 fn eligibility_selector_query(selector: EligibilityCardSelector) -> &'static str {
     match selector {
@@ -291,12 +293,14 @@ pub async fn append_eligibility_events_for_cards_in_tx(
         EligibilityCardSelector::ByUserId { user_id } => {
             sqlx::query_as::<_, EligibilityCardSourceRow>(eligibility_selector_query(selector))
                 .bind(user_id)
+                .bind((ELIGIBILITY_FANOUT_CAP + 1) as i64)
                 .fetch_all(&mut **tx)
                 .await
         }
         EligibilityCardSelector::ByTenantId { tenant_id } => {
             sqlx::query_as::<_, EligibilityCardSourceRow>(eligibility_selector_query(selector))
                 .bind(tenant_id)
+                .bind((ELIGIBILITY_FANOUT_CAP + 1) as i64)
                 .fetch_all(&mut **tx)
                 .await
         }
@@ -307,12 +311,14 @@ pub async fn append_eligibility_events_for_cards_in_tx(
             sqlx::query_as::<_, EligibilityCardSourceRow>(eligibility_selector_query(selector))
                 .bind(tenant_id)
                 .bind(domain_id)
+                .bind((ELIGIBILITY_FANOUT_CAP + 1) as i64)
                 .fetch_all(&mut **tx)
                 .await
         }
     }
     .map_err(db_error)?;
 
+    validate_eligibility_fanout_capacity(cards.len())?;
     for card in cards {
         append_projection_event_with_tenant_in_tx(
             tx,
@@ -322,6 +328,15 @@ pub async fn append_eligibility_events_for_cards_in_tx(
             card.tenant_id,
         )
         .await?;
+    }
+    Ok(())
+}
+
+fn validate_eligibility_fanout_capacity(count: usize) -> Result<(), AstralError> {
+    if count > ELIGIBILITY_FANOUT_CAP {
+        return Err(AstralError::Validation(
+            "eligibility fanout capacity exceeded".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -684,6 +699,13 @@ mod tests {
     }
 
     #[test]
+    fn eligibility_capacity_refuses_the_entire_overflow_frontier() {
+        assert!(validate_eligibility_fanout_capacity(0).is_ok());
+        assert!(validate_eligibility_fanout_capacity(ELIGIBILITY_FANOUT_CAP).is_ok());
+        assert!(validate_eligibility_fanout_capacity(ELIGIBILITY_FANOUT_CAP + 1).is_err());
+    }
+
+    #[test]
     fn eligibility_selector_queries_lock_active_cards_in_card_order() {
         let selectors = [
             (
@@ -711,7 +733,8 @@ mod tests {
             assert!(query.contains("SELECT card_id, tenant_id FROM user_card"));
             assert!(query.contains(predicate));
             assert!(query.contains("card_status = 'ACTIVE'"));
-            assert!(query.contains("ORDER BY card_id"));
+            assert!(query.contains("ORDER BY card_id LIMIT ?"));
+            assert!(!query.contains('\\'));
             assert!(query.ends_with("FOR UPDATE"));
         }
     }

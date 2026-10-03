@@ -3,12 +3,26 @@
 //! 对齐 Java `TenantMapper` / `TenantMemberMapper` / `TenantInvitationMapper` /
 //! `TenantPurchaseMapper` / `TenantDomainMapMapper` / `TenantAuditLogMapper` 边界。
 //! 事务性方法（create 双步写 path、use_invitation_code 接受邀请）收口为聚合方法。
+//! 影响有效授权的租户/域 mutation（租户状态变更、域映射增删、租户硬删除）以
+//! `AuthorizationSourceTransaction` 为宿主，在同一短事务内成对登记每卡
+//! ELIGIBILITY 投影事件与 durable `ELIGIBILITY_INVALIDATED` 失效意图，
+//! commit 证明后才投递；见 [`append_tenant_eligibility_invalidation_in_tx`]。
+//! 硬删除的 user_card FOR UPDATE 引用守卫保持不变：锁定读在守卫通过后阻止
+//! 并发新增引用行，与 DELETE 原子成立；源事务活动栅栏额外关闭守卫语义与
+//! 在线 repair 之间的竞态（拒绝发证即 fail-closed，绝不留下无栅栏 writer）。
+//! create_tenant 与 update_tenant_name 同宿主（保守同栅栏：前者是 owning-
+//! binding 存在性 source，后者为 metadata-only 字段）。member/invitation
+//! 绑定（accept_invitation）只是 INSERT 类治理行、无缓存负事实依赖，保持
+//! 普通短事务即可（刻意不升级为授权源事务）。
 
 use async_trait::async_trait;
 use sqlx::{MySqlPool, QueryBuilder};
 
-use astral_db::{append_eligibility_events_for_cards_in_tx, EligibilityCardSelector};
 use astral_types::AstralError;
+
+use crate::repository::authorization_source_transaction::{
+    append_eligibility_projection_with_invalidation_in_tx, AuthorizationSourceTransaction,
+};
 
 // ===== Records =====
 
@@ -166,6 +180,32 @@ const TENANT_DOMAIN_STATUS_LOCK_SQL: &str = "SELECT status FROM tenant_domain_ma
 /// 都会被级联删除销毁，且非 ACTIVE 行不在 ELIGIBILITY 捕获范围内。
 const TENANT_CARD_REFERENCES_LOCK_SQL: &str = "SELECT COUNT(*) FROM user_card \
      WHERE tenant_id = ? FOR UPDATE";
+/// 租户级 ELIGIBILITY 批量捕获：按 card_id 序锁定该租户的 ACTIVE user_card 行
+/// （与 astral-db `ELIGIBILITY_BY_TENANT_ID_QUERY` 同一谓词形状，额外以 LIMIT ?
+/// 约束锁定读行数上界；绑定值为 cap+1，多取一行仅用于判定超限）。
+/// 锁序沿用调用方 tenant 行 -> mapping 行 -> 本段 user_card 行的既有顺序。
+const TENANT_CARDS_ELIGIBILITY_LOCK_SQL: &str = "SELECT card_id FROM user_card \
+     WHERE tenant_id = ? AND card_status = 'ACTIVE' ORDER BY card_id LIMIT ? FOR UPDATE";
+/// 租户+域维度的同一批量捕获（与 `ELIGIBILITY_BY_TENANT_AND_DOMAIN_QUERY` 同一
+/// 谓词形状 + LIMIT 上界），锁序同上。
+const TENANT_DOMAIN_CARDS_ELIGIBILITY_LOCK_SQL: &str = "SELECT card_id FROM user_card \
+     WHERE tenant_id = ? AND domain_id = ? AND card_status = 'ACTIVE' \
+     ORDER BY card_id LIMIT ? FOR UPDATE";
+
+/// 租户级 ELIGIBILITY 批量捕获的每事务卡片上限：锁定候选数超过上限即
+/// Validation fail-closed、整体回滚（含已执行的 source mutation），绝不部分
+/// 通知、绝不先提交再补通知。批量路径的规模由上游输入界决定，超限说明
+/// 调用链异常扩大，让调用方显式缩小范围或走受控迁移。
+const TENANT_ELIGIBILITY_CARD_CAP: usize = 512;
+
+/// 合法租户状态字母表（与 API 层 `ACTIVE | SUSPENDED | TERMINATED` 校验同向）。
+/// 进入 operation id 的状态一律先过此复核，随机/任意字符串绝不进入事件链。
+const TENANT_STATUS_ALPHABET: &[&str] = &["ACTIVE", "SUSPENDED", "TERMINATED"];
+
+/// 锁定读的行数上界（cap + 1：多取一行仅用于在单次锁定读内判定超限）。
+fn tenant_eligibility_lock_bound() -> i64 {
+    TENANT_ELIGIBILITY_CARD_CAP as i64 + 1
+}
 
 #[async_trait]
 pub trait TenantRepository: Send + Sync {
@@ -325,6 +365,175 @@ fn push_tenant_filter<'args>(
     }
 }
 
+// ===== 租户级 ELIGIBILITY 捕获（授权源事务接线） =====
+
+/// 租户级 ELIGIBILITY 批量捕获的候选卡 scope（与 astral-db 选择器同一谓词形状）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TenantEligibilityScope {
+    ByTenantId { tenant_id: i64 },
+    ByTenantAndDomain { tenant_id: i64, domain_id: i64 },
+}
+
+/// 域映射变更方向（决定 operation base 的 action 段，grant/revoke 不共享身份）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TenantDomainEligibilityAction {
+    Grant,
+    Revoke,
+}
+
+impl TenantDomainEligibilityAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Grant => "grant",
+            Self::Revoke => "revoke",
+        }
+    }
+}
+
+/// 租户状态变更的稳定 operation base（纯派生，fail-closed，可单测）：
+/// `tenant:status:{tenant_id}:{locked_from}:{to}`。`locked_from` 取**锁定行证明的
+/// 迁移前状态**，身份只绑定 tenant/action/锁定状态等可靠 mutation identity，
+/// 随机 UUID 绝不进入 operation id。跨次重复变更的 outbox 唯一性由每事件的
+/// ELIGIBILITY 投影事件 id（messageId）承担，本 id 只做源 mutation 关联。
+fn derive_tenant_status_operation_base(
+    tenant_id: i64,
+    locked_from: &str,
+    to: &str,
+) -> Result<String, AstralError> {
+    if tenant_id <= 0
+        || !TENANT_STATUS_ALPHABET.contains(&locked_from)
+        || !TENANT_STATUS_ALPHABET.contains(&to)
+    {
+        return Err(AstralError::Validation(format!(
+            "tenant status operation identity requires a positive tenant id and canonical \
+             statuses from {TENANT_STATUS_ALPHABET:?}, got tenant_id={tenant_id}, \
+             {locked_from} -> {to}"
+        )));
+    }
+    Ok(format!("tenant:status:{tenant_id}:{locked_from}:{to}"))
+}
+
+/// 租户域映射变更的稳定 operation base（纯派生，fail-closed，可单测）：
+/// `tenant:domain:{grant|revoke}:{tenant_id}:{domain_id}`。同一域反复
+/// grant/revoke 由每事件 messageId 保证 outbox 唯一性，本 id 只做关联。
+fn derive_tenant_domain_operation_base(
+    tenant_id: i64,
+    domain_id: i64,
+    action: TenantDomainEligibilityAction,
+) -> Result<String, AstralError> {
+    if tenant_id <= 0 || domain_id <= 0 {
+        return Err(AstralError::Validation(format!(
+            "tenant domain operation identity requires positive tenant and domain ids, \
+             got tenant_id={tenant_id}, domain_id={domain_id}"
+        )));
+    }
+    Ok(format!(
+        "tenant:domain:{}:{tenant_id}:{domain_id}",
+        action.as_str()
+    ))
+}
+
+/// 租户硬删除的稳定 operation base（纯派生，fail-closed，可单测）：
+/// `tenant:delete:{tenant_id}`。守卫通过时引用卡片数为 0，fanout 通常为空；
+/// 身份仍由 durable 主键确定性派生，随机 UUID 绝不进入 operation id，未来
+/// 守卫语义变化时每卡 ELIGIBILITY 事件的 messageId 继续承担 outbox 唯一性。
+fn derive_tenant_delete_operation_base(tenant_id: i64) -> Result<String, AstralError> {
+    if tenant_id <= 0 {
+        return Err(AstralError::Validation(format!(
+            "tenant delete operation identity requires a positive tenant id, got {tenant_id}"
+        )));
+    }
+    Ok(format!("tenant:delete:{tenant_id}"))
+}
+
+/// 租户级 ELIGIBILITY 批量捕获：在**授权源事务内**按 card_id 序锁定候选 ACTIVE
+/// user_card 行，并逐卡登记 ELIGIBILITY 投影事件 + durable
+/// `ELIGIBILITY_INVALIDATED` 失效意图（与 user_card owner 的每卡路径
+/// [`append_eligibility_projection_with_invalidation_in_tx`] 同一接线）。
+///
+/// 与 astral-db `append_eligibility_events_for_cards_in_tx` 的差异：后者只落投影
+/// head/outbox、无法逐事件登记 receipt —— 租户路径因此曾遗漏 durable 失效意图。
+/// 本 helper 以 [`AuthorizationSourceTransaction`] 为宿主补齐成对接线；提交语义由
+/// [`AuthorizationSourceTransaction::commit_consuming`] 统一保证：只有 commit 被
+/// 证明成功才按序直投，commit 未知/失败或显式回滚一律不投递，durable outbox 行
+/// 保持为 relay 恢复路径。
+///
+/// 身份合同：每张卡的 operation_id 为 `"{operation_base}:card:{card_id}"` ——
+/// 同一 operation base（由 `derive_*_operation_base` 从 tenant/action/锁定状态
+/// 派生）可携带多卡；每张卡的 ELIGIBILITY 投影事件与失效 envelope 使用事务内
+/// 各自新生成的 durable 事件 id（messageId，承担 outbox 唯一性）。与 user_card
+/// owner 的事件不重复：本 helper **取代**旧的仅投影 fanout，同一事务内每卡只
+/// 产生一对（投影事件, 失效意图），绝不叠加两次追加。
+///
+/// 边界：锁序沿用调用方 tenant 行 -> mapping 行 -> 本段 user_card 行（FOR UPDATE
+/// + card_id 序 + [`TENANT_ELIGIBILITY_CARD_CAP`] 上界，超限 Validation
+///   fail-closed 整体回滚）；事务内不触碰 Redis/MQ，网络投递全部发生在 commit
+///   证明之后。本函数不 commit，由调用方决定提交/回滚。
+async fn append_tenant_eligibility_invalidation_in_tx(
+    tx: &mut AuthorizationSourceTransaction,
+    scope: TenantEligibilityScope,
+    operation_base: &str,
+) -> Result<(), AstralError> {
+    if operation_base.trim().is_empty() || operation_base.trim() != operation_base {
+        return Err(AstralError::Validation(
+            "tenant eligibility fanout requires a canonical, non-empty operation base".into(),
+        ));
+    }
+    let lock_bound = tenant_eligibility_lock_bound();
+    let cards: Vec<(i64,)> = match scope {
+        TenantEligibilityScope::ByTenantId { tenant_id } => {
+            if tenant_id <= 0 {
+                return Err(AstralError::Validation(format!(
+                    "tenant eligibility fanout requires a positive tenant id, got {tenant_id}"
+                )));
+            }
+            sqlx::query_as(TENANT_CARDS_ELIGIBILITY_LOCK_SQL)
+                .bind(tenant_id)
+                .bind(lock_bound)
+                .fetch_all(&mut ***tx)
+                .await
+                .map_err(db_error)?
+        }
+        TenantEligibilityScope::ByTenantAndDomain {
+            tenant_id,
+            domain_id,
+        } => {
+            if tenant_id <= 0 || domain_id <= 0 {
+                return Err(AstralError::Validation(format!(
+                    "tenant domain eligibility fanout requires positive tenant and domain ids, \
+                     got tenant_id={tenant_id}, domain_id={domain_id}"
+                )));
+            }
+            sqlx::query_as(TENANT_DOMAIN_CARDS_ELIGIBILITY_LOCK_SQL)
+                .bind(tenant_id)
+                .bind(domain_id)
+                .bind(lock_bound)
+                .fetch_all(&mut ***tx)
+                .await
+                .map_err(db_error)?
+        }
+    };
+    if cards.len() > TENANT_ELIGIBILITY_CARD_CAP {
+        return Err(AstralError::Validation(format!(
+            "tenant eligibility fanout locked {} candidate cards, exceeding the \
+             per-transaction cap ({TENANT_ELIGIBILITY_CARD_CAP}); failing closed instead of \
+             notifying a subset",
+            cards.len()
+        )));
+    }
+    for (card_id,) in &cards {
+        let operation_id = format!("{operation_base}:card:{card_id}");
+        append_eligibility_projection_with_invalidation_in_tx(&mut *tx, *card_id, &operation_id)
+            .await?;
+    }
+    tracing::debug!(
+        operation_base = %operation_base,
+        cards = cards.len(),
+        "tenant-level eligibility fanout captured in-tx (projection event + durable invalidation intent per card)"
+    );
+    Ok(())
+}
+
 #[async_trait]
 impl TenantRepository for SqlxTenantRepository {
     async fn count_tenants(&self, filter: &TenantFilter) -> Result<i64, AstralError> {
@@ -381,7 +590,10 @@ impl TenantRepository for SqlxTenantRepository {
     }
 
     async fn create_tenant(&self, new: &NewTenant) -> Result<i64, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        // 授权源事务宿主：tenant 行是 owning-binding 存在性 source（user_card
+        // 等授权载体按 tenant_id 绑定，resource/资格 resolver 缓存严格 server
+        // facts，依赖源活动栅栏保证 binding 更新的 epoch complete）。
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
 
         let result = sqlx::query(
             "INSERT INTO tenant (tenant_code, tenant_name, tenant_type, status, parent_tenant_id, path, depth) \
@@ -391,7 +603,7 @@ impl TenantRepository for SqlxTenantRepository {
         .bind(new.parent_tenant_id)
         .bind(&new.path)
         .bind(new.depth)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         let inserted_id = result.last_insert_id() as i64;
@@ -405,90 +617,108 @@ impl TenantRepository for SqlxTenantRepository {
         sqlx::query("UPDATE tenant SET path = ? WHERE tenant_id = ?")
             .bind(&tenant_path)
             .bind(inserted_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
 
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(inserted_id)
     }
 
     async fn update_tenant_name(&self, tenant_id: i64, name: &str) -> Result<(), AstralError> {
+        // 保守同栅栏：租户名是 metadata-only 字段（非授权/归属事实），仍统一
+        // 走授权源事务宿主，与租户聚合其余 mutation 同一栅栏/提交合同。
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         sqlx::query("UPDATE tenant SET tenant_name = ? WHERE tenant_id = ?")
             .bind(name)
             .bind(tenant_id)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(())
     }
 
     async fn update_tenant_status(&self, tenant_id: i64, status: &str) -> Result<(), AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let current: Option<(String,)> = sqlx::query_as(TENANT_STATUS_LOCK_SQL)
             .bind(tenant_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(db_error)?;
         let Some((current_status,)) = current else {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(());
         };
 
         sqlx::query("UPDATE tenant SET status = ? WHERE tenant_id = ?")
             .bind(status)
             .bind(tenant_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
 
         if status_changed(&current_status, status) {
-            append_eligibility_events_for_cards_in_tx(
+            let operation_base =
+                derive_tenant_status_operation_base(tenant_id, &current_status, status)?;
+            append_tenant_eligibility_invalidation_in_tx(
                 &mut tx,
-                EligibilityCardSelector::ByTenantId { tenant_id },
+                TenantEligibilityScope::ByTenantId { tenant_id },
+                &operation_base,
             )
             .await?;
         }
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(())
     }
 
     async fn delete_tenant(&self, tenant_id: i64) -> Result<bool, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        // 授权源事务宿主：栅栏先于 DB begin 取得（hub 拒绝发证即 fail-closed，
+        // 绝不留下无栅栏 writer），commit await 前 arm、Ok 证明才 disarm ——
+        // 与在线 repair 的竞态由此关闭；commit 未知时 receipts 绝不投递。
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         // 先锁租户行证明存在（FOR UPDATE），再执行后续守卫与删除。
+        // executor 位置取 `&mut **tx`（解析为 `&mut MySqlConnection`，sqlx 0.8
+        // 只有 connection 实现 Executor）。
         let tenant: Option<(i64,)> = sqlx::query_as(TENANT_ID_LOCK_SQL)
             .bind(tenant_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(db_error)?;
         if tenant.is_none() {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(false);
         }
 
         // 锁定读前置守卫：仍被 user_card 引用的租户禁止硬删除（fail-closed）。
         // 完整级联（捕获并持久吊销所有受影响的规范授权贡献）不在本仓库范围内；
         // 引用行存在时返回 Validation 冲突错误，事务随 Err 丢弃而整体回滚，
-        // 不产生部分删除。守卫错误先于任何写入返回。
+        // 不产生部分删除。守卫错误先于任何写入返回。锁定读（FOR UPDATE）在
+        // 守卫通过后阻止并发为该租户新增 user_card 行，直到事务结束 ——
+        // 守卫计数与 DELETE 因此原子成立。
         let (card_references,) = sqlx::query_as::<_, (i64,)>(TENANT_CARD_REFERENCES_LOCK_SQL)
             .bind(tenant_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await
             .map_err(db_error)?;
         guard_tenant_delete(card_references, tenant_id)?;
 
         // Capture and enqueue eligibility before a hard delete can cascade user_card rows.
         // 守卫通过后引用行数为 0，此 fanout 为空操作；保留调用点以维持删除路径
-        // 的既有 ELIGIBILITY 捕获语义（与 update/transition 状态路径一致）。
-        append_eligibility_events_for_cards_in_tx(
+        // 的既有 ELIGIBILITY 捕获语义（与 update/transition 状态路径同一成对接线：
+        // 每卡 ELIGIBILITY 投影事件 + durable 失效意图，绝不写"只有投影事件"的
+        // 单腿状态）。operation base 由锁定租户主键确定性派生。
+        let operation_base = derive_tenant_delete_operation_base(tenant_id)?;
+        append_tenant_eligibility_invalidation_in_tx(
             &mut tx,
-            EligibilityCardSelector::ByTenantId { tenant_id },
+            TenantEligibilityScope::ByTenantId { tenant_id },
+            &operation_base,
         )
         .await?;
 
         let result = sqlx::query("DELETE FROM tenant WHERE tenant_id = ?")
             .bind(tenant_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         if result.rows_affected() != 1 {
@@ -496,7 +726,7 @@ impl TenantRepository for SqlxTenantRepository {
                 "tenant {tenant_id} disappeared during locked delete"
             )));
         }
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(true)
     }
 
@@ -506,18 +736,18 @@ impl TenantRepository for SqlxTenantRepository {
         from: &str,
         to: &str,
     ) -> Result<bool, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let current: Option<(String,)> = sqlx::query_as(TENANT_STATUS_LOCK_SQL)
             .bind(tenant_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(db_error)?;
         let Some((current_status,)) = current else {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(false);
         };
         if !status_transition_changes(&current_status, from, to) {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(false);
         }
 
@@ -525,20 +755,23 @@ impl TenantRepository for SqlxTenantRepository {
             .bind(to)
             .bind(tenant_id)
             .bind(from)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         if result.rows_affected() == 0 {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(false);
         }
 
-        append_eligibility_events_for_cards_in_tx(
+        // 锁定行已证明 current == from：operation base 以锁定的迁移前状态为准。
+        let operation_base = derive_tenant_status_operation_base(tenant_id, &current_status, to)?;
+        append_tenant_eligibility_invalidation_in_tx(
             &mut tx,
-            EligibilityCardSelector::ByTenantId { tenant_id },
+            TenantEligibilityScope::ByTenantId { tenant_id },
+            &operation_base,
         )
         .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(true)
     }
 
@@ -839,21 +1072,21 @@ impl TenantRepository for SqlxTenantRepository {
         tenant_id: i64,
         domain_id: i64,
     ) -> Result<(), AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let tenant: Option<(i64,)> = sqlx::query_as(TENANT_ID_LOCK_SQL)
             .bind(tenant_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(db_error)?;
         if tenant.is_none() {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(());
         }
 
         let current: Option<(String,)> = sqlx::query_as(TENANT_DOMAIN_STATUS_LOCK_SQL)
             .bind(tenant_id)
             .bind(domain_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(db_error)?;
 
@@ -866,7 +1099,7 @@ impl TenantRepository for SqlxTenantRepository {
                 )
                 .bind(tenant_id)
                 .bind(domain_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .map_err(db_error)?;
                 true
@@ -880,7 +1113,7 @@ impl TenantRepository for SqlxTenantRepository {
                 )
                 .bind(tenant_id)
                 .bind(domain_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .map_err(db_error)?;
                 result.rows_affected() > 0
@@ -888,16 +1121,22 @@ impl TenantRepository for SqlxTenantRepository {
         };
 
         if changed {
-            append_eligibility_events_for_cards_in_tx(
+            let operation_base = derive_tenant_domain_operation_base(
+                tenant_id,
+                domain_id,
+                TenantDomainEligibilityAction::Grant,
+            )?;
+            append_tenant_eligibility_invalidation_in_tx(
                 &mut tx,
-                EligibilityCardSelector::ByTenantAndDomain {
+                TenantEligibilityScope::ByTenantAndDomain {
                     tenant_id,
                     domain_id,
                 },
+                &operation_base,
             )
             .await?;
         }
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(())
     }
 
@@ -921,25 +1160,25 @@ impl TenantRepository for SqlxTenantRepository {
         tenant_id: i64,
         domain_id: i64,
     ) -> Result<bool, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let tenant: Option<(i64,)> = sqlx::query_as(TENANT_ID_LOCK_SQL)
             .bind(tenant_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(db_error)?;
         if tenant.is_none() {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(false);
         }
 
         let current: Option<(String,)> = sqlx::query_as(TENANT_DOMAIN_STATUS_LOCK_SQL)
             .bind(tenant_id)
             .bind(domain_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(db_error)?;
         if current.is_none() {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(false);
         }
 
@@ -947,23 +1186,29 @@ impl TenantRepository for SqlxTenantRepository {
             sqlx::query("DELETE FROM tenant_domain_map WHERE tenant_id = ? AND domain_id = ?")
                 .bind(tenant_id)
                 .bind(domain_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .map_err(db_error)?;
         if result.rows_affected() == 0 {
-            tx.commit().await.map_err(db_error)?;
+            tx.commit_consuming().await?;
             return Ok(false);
         }
 
-        append_eligibility_events_for_cards_in_tx(
+        let operation_base = derive_tenant_domain_operation_base(
+            tenant_id,
+            domain_id,
+            TenantDomainEligibilityAction::Revoke,
+        )?;
+        append_tenant_eligibility_invalidation_in_tx(
             &mut tx,
-            EligibilityCardSelector::ByTenantAndDomain {
+            TenantEligibilityScope::ByTenantAndDomain {
                 tenant_id,
                 domain_id,
             },
+            &operation_base,
         )
         .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(true)
     }
 
@@ -1086,6 +1331,188 @@ mod tests {
             tenant_lock.find("tenant").unwrap()
                 < TENANT_CARD_REFERENCES_LOCK_SQL.find("user_card").unwrap(),
             "guard must read cards after the tenant source row lock (tenant -> cards order)"
+        );
+    }
+
+    #[test]
+    fn tenant_eligibility_card_locks_are_bounded_locked_and_ordered() {
+        for sql in [
+            TENANT_CARDS_ELIGIBILITY_LOCK_SQL,
+            TENANT_DOMAIN_CARDS_ELIGIBILITY_LOCK_SQL,
+        ] {
+            assert!(sql.contains("FROM user_card"));
+            assert!(sql.contains("card_status = 'ACTIVE'"));
+            assert!(sql.contains("ORDER BY card_id"));
+            assert!(sql.contains("LIMIT ?"), "lock read must be row-bounded");
+            assert!(sql.ends_with("FOR UPDATE"));
+        }
+        assert!(TENANT_CARDS_ELIGIBILITY_LOCK_SQL.contains("tenant_id = ?"));
+        assert!(
+            TENANT_DOMAIN_CARDS_ELIGIBILITY_LOCK_SQL.contains("tenant_id = ? AND domain_id = ?")
+        );
+        // 锁序哨兵：按语句锁定的表给秩，tenant(0) -> mapping(1) -> user_card(2)。
+        // 跨语句的真实加锁顺序由调用方的 await 序列保证（先租户行、再 mapping 行、
+        // 最后本批量捕获），此处静态断言各常量的表归属构成同一偏序。
+        assert!(
+            tenant_mutation_lock_rank(TENANT_ID_LOCK_SQL)
+                < tenant_mutation_lock_rank(TENANT_DOMAIN_STATUS_LOCK_SQL),
+            "tenant source row lock must rank below the mapping row lock"
+        );
+        assert!(
+            tenant_mutation_lock_rank(TENANT_DOMAIN_STATUS_LOCK_SQL)
+                < tenant_mutation_lock_rank(TENANT_DOMAIN_CARDS_ELIGIBILITY_LOCK_SQL),
+            "card fanout lock must rank above the mapping row lock"
+        );
+        assert!(
+            tenant_mutation_lock_rank(TENANT_STATUS_LOCK_SQL)
+                < tenant_mutation_lock_rank(TENANT_CARDS_ELIGIBILITY_LOCK_SQL),
+            "card fanout lock must rank above the tenant source row lock"
+        );
+    }
+
+    /// 测试哨兵：把租户 mutation 相关锁定语句映射到锁序秩。
+    /// `FROM tenant_domain_map` 含前缀 `FROM tenant`，必须先判 domain_map。
+    fn tenant_mutation_lock_rank(sql: &str) -> u8 {
+        if sql.contains("FROM tenant_domain_map") {
+            1
+        } else if sql.contains("FROM user_card") {
+            2
+        } else if sql.contains("FROM tenant") {
+            0
+        } else {
+            panic!("statement locks no tenant-mutation table: {sql}");
+        }
+    }
+
+    #[test]
+    fn tenant_eligibility_cap_is_finite_with_detectable_overflow() {
+        const { assert!(TENANT_ELIGIBILITY_CARD_CAP > 0) };
+        assert_eq!(
+            tenant_eligibility_lock_bound(),
+            TENANT_ELIGIBILITY_CARD_CAP as i64 + 1,
+            "lock bound must be cap + 1 so exceeding the cap is detectable in one locked read"
+        );
+    }
+
+    #[test]
+    fn tenant_status_operation_base_is_deterministic_and_fail_closed() {
+        let base = derive_tenant_status_operation_base(7, "ACTIVE", "SUSPENDED")
+            .expect("canonical inputs must derive");
+        assert_eq!(base, "tenant:status:7:ACTIVE:SUSPENDED");
+        assert_eq!(
+            derive_tenant_status_operation_base(7, "ACTIVE", "SUSPENDED").unwrap(),
+            base,
+            "same locked facts must derive the same operation base (no randomness)"
+        );
+        assert_eq!(
+            derive_tenant_status_operation_base(7, "SUSPENDED", "ACTIVE").unwrap(),
+            "tenant:status:7:SUSPENDED:ACTIVE",
+            "transition direction must be part of the identity"
+        );
+        // 非法租户 / 字母表之外的状态一律 Validation 拒绝。
+        assert!(derive_tenant_status_operation_base(0, "ACTIVE", "SUSPENDED").is_err());
+        assert!(derive_tenant_status_operation_base(-1, "ACTIVE", "SUSPENDED").is_err());
+        assert!(derive_tenant_status_operation_base(7, "ACTIVE", "active").is_err());
+        assert!(derive_tenant_status_operation_base(7, "PAUSED", "SUSPENDED").is_err());
+        assert!(derive_tenant_status_operation_base(7, "  ", "SUSPENDED").is_err());
+        assert!(derive_tenant_status_operation_base(7, "ACTIVE", "TERMINATED\n").is_err());
+    }
+
+    #[test]
+    fn tenant_domain_operation_base_binds_action_and_scope() {
+        let grant = derive_tenant_domain_operation_base(7, 3, TenantDomainEligibilityAction::Grant)
+            .expect("positive ids must derive");
+        let revoke =
+            derive_tenant_domain_operation_base(7, 3, TenantDomainEligibilityAction::Revoke)
+                .expect("positive ids must derive");
+        assert_eq!(grant, "tenant:domain:grant:7:3");
+        assert_eq!(revoke, "tenant:domain:revoke:7:3");
+        assert_ne!(
+            grant, revoke,
+            "grant and revoke must not share operation identity"
+        );
+        assert!(
+            derive_tenant_domain_operation_base(0, 3, TenantDomainEligibilityAction::Grant)
+                .is_err()
+        );
+        assert!(
+            derive_tenant_domain_operation_base(7, 0, TenantDomainEligibilityAction::Revoke)
+                .is_err()
+        );
+        assert!(
+            derive_tenant_domain_operation_base(7, -3, TenantDomainEligibilityAction::Grant)
+                .is_err()
+        );
+    }
+
+    /// 硬删除 operation base：durable 主键确定性派生、fail-closed，与状态/域
+    /// 路径的 identity 家族同构（无随机成分）。
+    #[test]
+    fn tenant_delete_operation_base_is_deterministic_and_fail_closed() {
+        let base = derive_tenant_delete_operation_base(42).expect("positive id must derive");
+        assert_eq!(base, "tenant:delete:42");
+        assert_eq!(
+            derive_tenant_delete_operation_base(42).unwrap(),
+            base,
+            "same locked facts must derive the same operation base (no randomness)"
+        );
+        assert_ne!(
+            derive_tenant_delete_operation_base(43).unwrap(),
+            base,
+            "distinct tenants must not share operation identity"
+        );
+        assert!(derive_tenant_delete_operation_base(0).is_err());
+        assert!(derive_tenant_delete_operation_base(-7).is_err());
+    }
+
+    /// 源序守卫：硬删除必须以授权源事务为宿主（栅栏先于 begin、commit 证明后
+    /// 才投递），先锁租户行再锁 user_card 引用行，ELIGIBILITY 捕获走成对失效
+    /// 接线（投影事件 + durable 失效意图，绝不只写投影单腿），最后 DELETE 与
+    /// commit_consuming。绝不退回裸 begin/commit 或投影-only fanout。
+    #[test]
+    fn delete_tx_uses_source_wrapper_locked_guard_and_paired_invalidation() {
+        let source = include_str!("tenant_repository.rs");
+        let delete_body = source
+            .split("async fn delete_tenant")
+            // 该字面量出现 3 次（trait 声明 / impl 实现 / 本测试字面量）；
+            // nth(2) 才是 impl 实现体段。
+            .nth(2)
+            .and_then(|body| body.split("async fn transition_tenant_status").next())
+            .expect("delete_tenant implementation must be delimited");
+        let wrapper_begin = delete_body
+            .find("AuthorizationSourceTransaction::begin(&self.db)")
+            .expect("delete must host the source mutation in the authorization source wrapper");
+        let tenant_lock = delete_body
+            .find("TENANT_ID_LOCK_SQL")
+            .expect("delete must lock the tenant source row first");
+        let guard = delete_body
+            .find("guard_tenant_delete(card_references, tenant_id)")
+            .expect("delete must wire the user_card reference guard");
+        let invalidation = delete_body
+            .find("append_tenant_eligibility_invalidation_in_tx")
+            .expect("delete must capture eligibility with the paired invalidation wiring");
+        let delete = delete_body
+            .find("DELETE FROM tenant WHERE tenant_id = ?")
+            .expect("delete must remove the tenant row");
+        let commit = delete_body
+            .rfind("tx.commit_consuming()")
+            .expect("delete must commit through the wrapper consuming commit");
+        assert!(
+            wrapper_begin < tenant_lock
+                && tenant_lock < guard
+                && guard < invalidation
+                && invalidation < delete
+                && delete < commit,
+            "delete must order: wrapper begin -> tenant lock -> reference guard -> \
+             paired eligibility invalidation -> DELETE -> commit_consuming"
+        );
+        assert!(
+            !delete_body.contains("tx.commit()"),
+            "delete must not bypass the wrapper's proven-commit gate with a raw commit"
+        );
+        assert!(
+            !delete_body.contains("append_eligibility_events_for_cards_in_tx"),
+            "delete must not regress to the projection-only eligibility fanout"
         );
     }
 }

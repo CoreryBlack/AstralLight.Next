@@ -69,6 +69,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 use policy_engine::{CompilerResult, HotState};
 use sha2::{Digest, Sha256};
 use sqlx::{Executor, MySql, Transaction};
@@ -285,6 +287,30 @@ impl fmt::Debug for Sha256Digest {
         formatter.write_str("Sha256Digest(")?;
         formatter.write_str(&self.as_hex())?;
         formatter.write_str(")")
+    }
+}
+
+// Typed serde wire form: exactly the canonical lowercase 64-character hex
+// string (`as_hex`), decoded strictly through `from_hex` (uppercase, wrong
+// length, non-hex and non-lowercase input all fail closed). No bracketed or
+// byte-array alternative forms exist, so a snapshot can never smuggle a
+// divergent digest encoding past this single round-trip implementation.
+impl Serialize for Sha256Digest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.as_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for Sha256Digest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_hex(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1341,6 +1367,11 @@ where
         delta_event_id,
         cas_version: 0,
     };
+    // Register before source commit; only this event's committed publication
+    // can clear the intent. Rollback residue conservatively defers to DB.
+    if let Some(hub) = crate::memory_projection_hub::memory_projection_hub() {
+        hub.record_pending_delta(request);
+    }
     #[cfg(feature = "e3-observability")]
     log_e3_enqueue_staged(request, &appended);
     Ok(appended)
@@ -3823,6 +3854,361 @@ pub fn partition_ledger_at_published_frontier(
     Ok(outcome)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Stable-event direct claim (local in-process projection dispatch path)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One `authorization_delta_event` row as observed by the stable-event claim.
+/// Mirrors [`DeltaClaimCandidateRow`] plus the evidence-invalidation flag so
+/// the direct-dispatch path can re-bind EVERY durable field against the
+/// commit-proven [`DeltaEventAppendRequest`] the source wrapper carries.
+#[derive(Debug, sqlx::FromRow)]
+struct StableEventClaimRow {
+    delta_event_id: i64,
+    event_id: String,
+    operation_id: String,
+    event_type: String,
+    tenant_id: i64,
+    card_id: Option<i64>,
+    aggregate_type: String,
+    aggregate_id: i64,
+    grant_id: String,
+    base_version: i64,
+    target_version: i64,
+    source_generation: i64,
+    revoke_fence: i64,
+    invalidates_published_evidence: i8,
+    before_image_json: Option<String>,
+    before_digest: Option<Vec<u8>>,
+    delta_json: String,
+    semantic_hash: Vec<u8>,
+    dependency_hash: Vec<u8>,
+    compiler_version: String,
+    status: String,
+    attempts: i64,
+    cas_version: i64,
+}
+
+impl StableEventClaimRow {
+    fn to_candidate(&self) -> DeltaClaimCandidateRow {
+        DeltaClaimCandidateRow {
+            delta_event_id: self.delta_event_id,
+            event_id: self.event_id.clone(),
+            operation_id: self.operation_id.clone(),
+            event_type: self.event_type.clone(),
+            tenant_id: self.tenant_id,
+            card_id: self.card_id,
+            aggregate_type: self.aggregate_type.clone(),
+            aggregate_id: self.aggregate_id,
+            grant_id: self.grant_id.clone(),
+            base_version: self.base_version,
+            target_version: self.target_version,
+            source_generation: self.source_generation,
+            revoke_fence: self.revoke_fence,
+            before_image_json: self.before_image_json.clone(),
+            before_digest: self.before_digest.clone(),
+            delta_json: self.delta_json.clone(),
+            semantic_hash: self.semantic_hash.clone(),
+            dependency_hash: self.dependency_hash.clone(),
+            compiler_version: self.compiler_version.clone(),
+            status: self.status.clone(),
+            attempts: self.attempts,
+            cas_version: self.cas_version,
+        }
+    }
+}
+
+/// Stable-event claim select: locks the exact row behind the globally unique
+/// `event_id` (`uk_ade_event`) inside the caller's transaction so the payload
+/// re-binding and the lease install observe one committed row version.
+const STABLE_EVENT_CLAIM_SELECT_SQL: &str = "SELECT delta_event_id, event_id, operation_id, \
+    event_type, tenant_id, card_id, aggregate_type, aggregate_id, grant_id, base_version, \
+    target_version, source_generation, revoke_fence, invalidates_published_evidence, \
+    CAST(before_image_json AS CHAR) AS before_image_json, before_digest, \
+    CAST(delta_json AS CHAR) AS delta_json, semantic_hash, dependency_hash, compiler_version, \
+    status, attempts, cas_version \
+    FROM authorization_delta_event \
+    WHERE event_id = ? AND tenant_id = ? FOR UPDATE";
+
+/// Locking predecessor probe for the direct-dispatch path. The stable-event
+/// row is already locked by [`STABLE_EVENT_CLAIM_SELECT_SQL`], but a direct
+/// envelope can arrive before an earlier same-grant event's envelope. Probe
+/// the durable predecessor under the same transaction and return `Busy` before
+/// installing a lease, so out-of-order delivery cannot burn attempts.
+const STABLE_EVENT_SIBLING_ORDER_PROBE_SQL: &str = "SELECT pred.delta_event_id \
+    FROM authorization_delta_event pred \
+    WHERE pred.tenant_id = ? \
+      AND pred.grant_id = ? \
+      AND pred.target_version < ? \
+      AND pred.status IN ('PENDING', 'LEASED') \
+    ORDER BY pred.target_version, pred.delta_event_id \
+    LIMIT 1 FOR UPDATE";
+
+/// Field-by-field binding between the dispatch request and the durable row.
+/// Any drift means the envelope does not describe the durable delta it claims
+/// to carry: fail closed, never claim, never replay.
+fn verify_stable_event_request_binding(
+    request: &DeltaEventAppendRequest,
+    row: &StableEventClaimRow,
+) -> Result<(), GrantRepositoryError> {
+    let mismatch = |field: &str| {
+        GrantRepositoryError::ScopeViolation(format!(
+            "code=grant_repository.claim_by_event_payload_mismatch;field={field}"
+        ))
+    };
+    if row.event_id != request.event_id {
+        return Err(mismatch("event_id"));
+    }
+    if row.operation_id != request.operation_id {
+        return Err(mismatch("operation_id"));
+    }
+    let row_event_type = DeltaEventType::from_sql(&row.event_type)?;
+    if row_event_type != request.event_type {
+        return Err(mismatch("event_type"));
+    }
+    if row.tenant_id != request.tenant_id {
+        return Err(mismatch("tenant_id"));
+    }
+    if row.card_id != request.card_id {
+        return Err(mismatch("card_id"));
+    }
+    if row.aggregate_type != request.aggregate_type || row.aggregate_id != request.aggregate_id {
+        return Err(mismatch("aggregate_identity"));
+    }
+    if decode_grant_id_sql(&row.grant_id)? != request.grant_id {
+        return Err(mismatch("grant_id"));
+    }
+    if row.base_version != request.base_version {
+        return Err(mismatch("base_version"));
+    }
+    if row.target_version != request.target_version {
+        return Err(mismatch("target_version"));
+    }
+    if row.source_generation < 0
+        || u64::try_from(row.source_generation).unwrap_or(u64::MAX) != request.source_generation
+    {
+        return Err(mismatch("source_generation"));
+    }
+    if row.revoke_fence < 0
+        || u64::try_from(row.revoke_fence).unwrap_or(u64::MAX) != request.revoke_fence
+    {
+        return Err(mismatch("revoke_fence"));
+    }
+    let row_invalidates = row.invalidates_published_evidence != 0;
+    if row_invalidates != request.invalidates_published_evidence {
+        return Err(mismatch("invalidates_published_evidence"));
+    }
+    match (&request.before_image_json, &request.before_digest_hex) {
+        (Some(image), Some(digest)) => {
+            if row.before_image_json.as_deref() != Some(image.as_str()) {
+                return Err(mismatch("before_image_json"));
+            }
+            let row_digest = Sha256Digest::from_optional_bytes(row.before_digest.as_deref())?;
+            if row_digest != Some(Sha256Digest::from_hex(digest)?) {
+                return Err(mismatch("before_digest"));
+            }
+        }
+        (None, None) => {
+            if row.before_image_json.is_some() || row.before_digest.is_some() {
+                return Err(mismatch("before_image_absent"));
+            }
+        }
+        _ => {
+            return Err(GrantRepositoryError::ScopeViolation(
+                "code=grant_repository.before_image_digest_pairing".to_owned(),
+            ))
+        }
+    }
+    if row.delta_json != request.delta_json {
+        return Err(mismatch("delta_json"));
+    }
+    if Sha256Digest::from_bytes(row.semantic_hash.clone())?
+        != Sha256Digest::from_hex(&request.semantic_hash_hex)?
+    {
+        return Err(mismatch("semantic_hash"));
+    }
+    if Sha256Digest::from_bytes(row.dependency_hash.clone())?
+        != Sha256Digest::from_hex(&request.dependency_hash_hex)?
+    {
+        return Err(mismatch("dependency_hash"));
+    }
+    if row.compiler_version != request.compiler_version {
+        return Err(mismatch("compiler_version"));
+    }
+    Ok(())
+}
+
+/// Outcome of [`claim_delta_event_by_stable_event_in_tx`]: everything except
+/// [`ClaimedStableEventOutcome::Claimed`] leaves the row untouched.
+#[derive(Debug)]
+pub enum ClaimedStableEventOutcome {
+    /// Lease installed inside the caller's transaction; both forms returned in
+    /// the SAME transaction (no readback reload, no id-only DB round trip).
+    Claimed {
+        claim: Box<DeltaEventClaim>,
+        event: Box<ClaimedDeltaEvent>,
+    },
+    /// Durable `SUCCEEDED` proven: processed, skip without replay and without
+    /// any mutation.
+    AlreadyProcessed { event_id: String },
+    /// Durable terminal gate (`QUARANTINED`): this is NOT a success skip. The
+    /// row keeps its gate; the dispatcher must not replay it, and the worker
+    /// surfaces it for reconciliation instead of treating it as processed.
+    TerminalGated {
+        event_id: String,
+        status: &'static str,
+    },
+    /// Live lease held elsewhere, or the row-level eligibility window has not
+    /// opened (future backoff). Not claimable now; durable recovery converges.
+    Busy { event_id: String },
+    /// Unresolvable row state (unknown status vocabulary). NEVER blindly
+    /// replayed; surfaces for reconciliation.
+    InDoubt { event_id: String, reason: String },
+}
+
+/// Claim ONE delta event by its stable event identity inside the caller's
+/// single transaction, reusing the exact claim predicates of
+/// [`claim_next_delta_event_in_tx`] and the shared claim install tail.
+///
+/// Direct-dispatch contract (local in-process projector path):
+/// 1. Locks the row behind the globally unique `event_id` (`uk_ade_event`)
+///    and re-binds EVERY durable field against the commit-proven
+///    [`DeltaEventAppendRequest`] the source wrapper carries — a mismatch is
+///    a fail-closed [`GrantRepositoryError::ScopeViolation`], never a claim.
+/// 2. `SUCCEEDED` rows return [`ClaimedStableEventOutcome::AlreadyProcessed`]
+///    — processed durably, skip silently, never replay. `QUARANTINED` rows
+///    return [`ClaimedStableEventOutcome::TerminalGated`] — the gate stays
+///    in force (never a success skip, never replayed).
+/// 3. Eligible rows (`PENDING` past backoff, `LEASED` with expired lease) get
+///    the same lease install as the queue claim (fresh run-scoped token,
+///    owner, server-side expiry, `attempts + 1`, `cas_version + 1`). A zero-row
+///    install (future backoff / live foreign lease) returns
+///    [`ClaimedStableEventOutcome::Busy`] instead of inventing a claim.
+/// 4. Unknown status vocabulary returns [`ClaimedStableEventOutcome::InDoubt`]
+///    and performs NO mutation — unknown results are never blindly replayed.
+///
+/// The commit/rollback of the transaction stays with the caller, exactly like
+/// every other `*_in_tx` primitive in this module.
+pub async fn claim_delta_event_by_stable_event_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    request: &DeltaEventAppendRequest,
+    lease_owner: &str,
+    lease_seconds: i64,
+) -> Result<ClaimedStableEventOutcome, GrantRepositoryError> {
+    positive_i64(request.tenant_id, "tenant_id")?;
+    validated_text(&request.event_id, MAX_EVENT_ID_LENGTH, "event_id")?;
+    validated_text(lease_owner, MAX_GRANT_LEASE_OWNER_LENGTH, "lease_owner")?;
+    validate_lease_seconds(lease_seconds)?;
+
+    let row: Option<StableEventClaimRow> = sqlx::query_as(STABLE_EVENT_CLAIM_SELECT_SQL)
+        .bind(&request.event_id)
+        .bind(request.tenant_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(row) = row else {
+        // A commit-proven dispatch always references a committed row; a
+        // missing row is a contract violation and fails closed.
+        return Err(GrantRepositoryError::ScopeViolation(format!(
+            "code=grant_repository.claim_by_event_row_missing;event_id={}",
+            request.event_id
+        )));
+    };
+    verify_stable_event_request_binding(request, &row)?;
+
+    match row.status.as_str() {
+        DELTA_STATUS_SUCCEEDED => Ok(ClaimedStableEventOutcome::AlreadyProcessed {
+            event_id: row.event_id.clone(),
+        }),
+        DELTA_STATUS_QUARANTINED => Ok(ClaimedStableEventOutcome::TerminalGated {
+            event_id: row.event_id.clone(),
+            status: DELTA_STATUS_QUARANTINED,
+        }),
+        DELTA_STATUS_PENDING | DELTA_STATUS_LEASED => {
+            let predecessor: Option<(i64,)> = sqlx::query_as(STABLE_EVENT_SIBLING_ORDER_PROBE_SQL)
+                .bind(row.tenant_id)
+                .bind(&row.grant_id)
+                .bind(row.target_version)
+                .fetch_optional(&mut **tx)
+                .await?;
+            if predecessor.is_some() {
+                return Ok(ClaimedStableEventOutcome::Busy {
+                    event_id: row.event_id.clone(),
+                });
+            }
+            let candidate = row.to_candidate();
+            match install_claimed_event(tx, candidate, lease_owner, lease_seconds).await {
+                Ok(claim) => {
+                    let event = ClaimedDeltaEvent {
+                        delta_event_id: row.delta_event_id,
+                        event_id: row.event_id.clone(),
+                        operation_id: row.operation_id.clone(),
+                        event_type: DeltaEventType::from_sql(&row.event_type)?,
+                        tenant_id: row.tenant_id,
+                        card_id: row.card_id,
+                        aggregate_type: row.aggregate_type.clone(),
+                        aggregate_id: row.aggregate_id,
+                        grant_id: decode_grant_id_sql(&row.grant_id)?,
+                        base_version: row.base_version,
+                        target_version: row.target_version,
+                        source_generation: u64::try_from(row.source_generation).map_err(|_| {
+                            GrantRepositoryError::Mapping(
+                                "code=grant_repository.invalid_source_generation".to_owned(),
+                            )
+                        })?,
+                        revoke_fence: {
+                            let revoke_fence = u64::try_from(row.revoke_fence).map_err(|_| {
+                                GrantRepositoryError::Mapping(
+                                    "code=grant_repository.invalid_revoke_fence".to_owned(),
+                                )
+                            })?;
+                            let source_generation =
+                                u64::try_from(row.source_generation).map_err(|_| {
+                                    GrantRepositoryError::Mapping(
+                                        "code=grant_repository.invalid_source_generation"
+                                            .to_owned(),
+                                    )
+                                })?;
+                            validate_delta_fence_relation(source_generation, revoke_fence)?;
+                            revoke_fence
+                        },
+                        before_image_json: row.before_image_json.clone(),
+                        before_digest: Sha256Digest::from_optional_bytes(
+                            row.before_digest.as_deref(),
+                        )?,
+                        delta_json: row.delta_json.clone(),
+                        semantic_hash: Sha256Digest::from_bytes(row.semantic_hash.clone())?,
+                        dependency_hash: Sha256Digest::from_bytes(row.dependency_hash.clone())?,
+                        compiler_version: row.compiler_version.clone(),
+                        // Same-transaction authoritative values from the claim
+                        // install (post-increment attempts + server expiry).
+                        attempts: claim.attempts,
+                        cas_version: row.cas_version,
+                        lease_owner: claim.lease_owner.clone(),
+                        lease_expires_at: claim.lease_expires_at,
+                    };
+                    Ok(ClaimedStableEventOutcome::Claimed {
+                        claim: Box::new(claim),
+                        event: Box::new(event),
+                    })
+                }
+                Err(GrantRepositoryError::ClaimRace) => {
+                    // Zero-row install: future backoff window or a live foreign
+                    // lease won between our locked read and the install. The
+                    // row stays untouched; recovery converges durably.
+                    Ok(ClaimedStableEventOutcome::Busy {
+                        event_id: row.event_id.clone(),
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        }
+        other => Ok(ClaimedStableEventOutcome::InDoubt {
+            event_id: row.event_id.clone(),
+            reason: format!("code=grant_repository.claim_by_event_unknown_status;status={other}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3835,6 +4221,18 @@ mod tests {
 
     // ── Partition lease / discovery contracts (multi-tenant redesign Phase 1) ──
 
+    /// Direct stable-event claims perform the same durable sibling ordering
+    /// probe as the partition claim path before installing a lease.
+    #[test]
+    fn stable_event_claim_has_a_separate_sibling_probe() {
+        assert!(STABLE_EVENT_SIBLING_ORDER_PROBE_SQL.contains("pred.grant_id = ?"));
+        assert!(STABLE_EVENT_SIBLING_ORDER_PROBE_SQL.contains("pred.target_version < ?"));
+        assert!(
+            STABLE_EVENT_SIBLING_ORDER_PROBE_SQL.contains("pred.status IN ('PENDING', 'LEASED')")
+        );
+        assert!(STABLE_EVENT_SIBLING_ORDER_PROBE_SQL.contains("FOR UPDATE"));
+        assert_eq!(placeholder_count(STABLE_EVENT_SIBLING_ORDER_PROBE_SQL), 3);
+    }
     #[test]
     fn partition_lease_audit_contract_is_bounded_and_non_authorizing() {
         assert!(PARTITION_LEASE_AUDIT_INSERT_SQL.starts_with("INSERT INTO audit_log"));
@@ -5870,3 +6268,8 @@ mod tests {
         );
     }
 }
+
+// Pure tests for the stable-event direct-claim binding contract live in their
+// own file (new-file discipline; existing module content untouched).
+#[cfg(test)]
+mod stable_event_claim_tests;

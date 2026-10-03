@@ -6,6 +6,10 @@ description = "AstralLight 权限治理中心 — 策略管理/规则集/审批"
 license.workspace = true
 
 [features]
+# Redis 编译层退役（redis-layer-retirement-20261002）：默认构建零 redis 编译
+# 链接；`delete_redis_keys` eviction compat 路径收敛到本显式 feature
+# （default-off），并传播 astral-common 的同名 marker feature。
+redis-compat = ["dep:redis", "astral-common/redis-compat"]
 e1-observability = [
     "astral-db/e1-observability",
     "policy-engine/e1-observability",
@@ -31,7 +35,7 @@ astral-db = { path = "../astral-db" }
 
 axum = { workspace = true }
 tokio = { workspace = true }
-redis = { workspace = true }
+redis = { workspace = true, optional = true }
 astral-mq = { path = "../astral-mq" }
 lapin = { workspace = true }
 serde = { workspace = true }
@@ -39,6 +43,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 time = { workspace = true }
+futures-util = "0.3"
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tower-http = { workspace = true }
@@ -53,3 +58,8 @@ tokio = { workspace = true, features = ["full"] }
 astral-db = { path = "../astral-db", features = ["test-support"] }
 futures-util = "0.3"
 metrics-exporter-prometheus = { workspace = true }
+
+# 真 Redis 集成测试仅在显式 redis-compat feature 下编译。
+[[test]]
+name = "audit_replay_integration"
+required-features = ["redis-compat"]

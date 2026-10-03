@@ -33,6 +33,7 @@ use astral_types::{AstralError, EVENT_TYPE_REVOKE};
 use crate::repository::audit_log_repository::{
     insert_direct_rule_audit_in_tx, DirectRuleAuditEntry,
 };
+use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
 use crate::repository::grant_ledger_adapter::{
     append_direct_grant_delta_in_tx, build_direct_add_draft, build_direct_remove_draft,
     build_direct_update_draft, derive_direct_contribution_event_id,
@@ -460,7 +461,7 @@ impl RuleRepository for SqlxRuleRepository {
         let effect = crate::service::validate_canonical_grant_effect(&new.effect)?;
         require_canonical_direct_enabled(Some(new.enabled))?;
         reject_unrepresentable_condition(new.condition_json.as_deref(), "direct rule create")?;
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
 
         // 先锁定并验证承载卡：不存在/非 ACTIVE/过期/租户 NULL 一律拒绝，
         // 不再允许静默写旧规则（对齐审批路径的归属闸门）。
@@ -471,7 +472,7 @@ impl RuleRepository for SqlxRuleRepository {
                AND (uc.valid_until IS NULL OR uc.valid_until >= NOW()) FOR UPDATE",
         )
         .bind(new.card_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let Some((user_id, tenant_id, domain_id)) = card else {
@@ -497,7 +498,7 @@ impl RuleRepository for SqlxRuleRepository {
         .bind(&new.valid_from)
         .bind(&new.valid_to)
         .bind(new.enabled)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         if result.rows_affected() != 1 {
@@ -569,7 +570,7 @@ impl RuleRepository for SqlxRuleRepository {
             astral_db::next_delta_version(None).map_err(map_grant_repository_error)?;
         append_direct_grant_delta_in_tx(&mut tx, &draft, base_version, target_version).await?;
 
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         // 读链规模化 Batch E：source 事务已提交（durable delta 入账）。单卡影响面
         // 天然 ≤ 阈值，commit 后以 worker 同一原语在请求内尝试发布本卡 delta；
         // 任何失败只记日志，绝不阻塞本次写请求（收敛由 projector worker 兜底）。
@@ -604,10 +605,10 @@ impl RuleRepository for SqlxRuleRepository {
             return Ok(());
         }
 
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         // 写前 FOR UPDATE 读取完整旧规则行（card/user/tenant/domain/source/
         // effect/resource/action/validity/condition/priority/enabled 全量）。
-        let row = Self::lock_rule_for_mutation(&mut *tx, rule_id)
+        let row = Self::lock_rule_for_mutation(&mut **tx, rule_id)
             .await?
             .ok_or_else(|| AstralError::NotFound(format!("rule {rule_id} not found")))?;
         require_canonical_direct_enabled(row.enabled)?;
@@ -643,7 +644,7 @@ impl RuleRepository for SqlxRuleRepository {
         .bind(&final_valid_from)
         .bind(&final_valid_to)
         .bind(rule_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         if result.rows_affected() > 1 {
@@ -749,7 +750,7 @@ impl RuleRepository for SqlxRuleRepository {
         )?;
         append_direct_grant_delta_in_tx(&mut tx, &draft, base_version, target_version).await?;
 
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         // 读链规模化 Batch E：单卡影响面，commit 后请求内尝试同步发布（失败仅
         // 记日志，绝不阻塞写请求；收敛由 projector worker 兜底）。
         crate::service::sync_publish::after_commit_sync_publish(
@@ -797,15 +798,15 @@ impl RuleRepository for SqlxRuleRepository {
         rule_id: i64,
         context: &DirectRuleMutationContext,
     ) -> Result<bool, AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         // 删除前锁定并读取完整旧规则行；找不到保持原有明确 NotFound 语义。
-        let Some(row) = Self::lock_rule_for_mutation(&mut *tx, rule_id).await? else {
+        let Some(row) = Self::lock_rule_for_mutation(&mut **tx, rule_id).await? else {
             return Ok(false);
         };
 
         let result = sqlx::query("DELETE FROM permission_rule WHERE rule_id=?")
             .bind(rule_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_error)?;
         if result.rows_affected() != 1 {
@@ -880,7 +881,7 @@ impl RuleRepository for SqlxRuleRepository {
         )?;
         append_direct_grant_delta_in_tx(&mut tx, &draft, base_version, target_version).await?;
 
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         // 读链规模化 Batch E：单卡影响面，commit 后请求内尝试同步发布 REMOVE
         // tombstone（撤销零延迟生效；失败仅记日志，绝不阻塞写请求）。
         crate::service::sync_publish::after_commit_sync_publish(
@@ -900,9 +901,9 @@ impl RuleRepository for SqlxRuleRepository {
         card_id: i64,
         context: &DirectRuleMutationContext,
     ) -> Result<(), AstralError> {
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         // 批量路径按确定性 rule_id 升序锁定/处理；任何一条失败整体回滚。
-        let rows = Self::lock_rules_by_card(&mut *tx, card_id).await?;
+        let rows = Self::lock_rules_by_card(&mut **tx, card_id).await?;
 
         let operation_id = derive_direct_rule_batch_operation_id(
             "remove-by-card",
@@ -945,7 +946,7 @@ impl RuleRepository for SqlxRuleRepository {
             for row in &rows {
                 let result = sqlx::query("DELETE FROM permission_rule WHERE rule_id=?")
                     .bind(row.rule_id)
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await
                     .map_err(db_error)?;
                 if result.rows_affected() != 1 {
@@ -1025,7 +1026,7 @@ impl RuleRepository for SqlxRuleRepository {
             .await?;
         }
 
-        tx.commit().await.map_err(db_error)
+        tx.commit_consuming().await
     }
 
     async fn check_effect(
@@ -1065,8 +1066,8 @@ impl RuleRepository for SqlxRuleRepository {
         }
         // 删除后无法回查受影响卡，因此必须在同一事务内先取卡再删并补投影，
         // 避免旧快照继续被读侧接受。
-        let mut tx = self.db.begin().await.map_err(db_error)?;
-        let rows = Self::lock_rules_by_source(&mut *tx, source_type, source_id).await?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let rows = Self::lock_rules_by_source(&mut **tx, source_type, source_id).await?;
 
         let operation_id = derive_direct_rule_batch_operation_id(
             "remove-by-source",
@@ -1121,7 +1122,7 @@ impl RuleRepository for SqlxRuleRepository {
             for row in &group {
                 let result = sqlx::query("DELETE FROM permission_rule WHERE rule_id=?")
                     .bind(row.rule_id)
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await
                     .map_err(db_error)?;
                 if result.rows_affected() != 1 {
@@ -1194,7 +1195,7 @@ impl RuleRepository for SqlxRuleRepository {
             .await?;
         }
 
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(total_removed)
     }
 
@@ -1301,7 +1302,9 @@ mod direct_ledger_shape_tests {
 
     /// include_str! 顺序断言：按 marker 出现顺序校验事务链，且 commit 收尾。
     fn assert_ordered(body: &'static str, markers: &[(&str, &str)]) {
-        let commit_position = body.rfind("tx.commit()").expect("commit must exist");
+        let commit_position = body
+            .rfind("tx.commit_consuming()")
+            .expect("commit must exist");
         let mut previous = 0;
         for (label, marker) in markers {
             let position = body
@@ -1350,7 +1353,7 @@ mod direct_ledger_shape_tests {
                 ("add draft", "build_direct_add_draft"),
                 ("version chain", "next_delta_version"),
                 ("ledger append", "append_direct_grant_delta_in_tx"),
-                ("commit last", "tx.commit()"),
+                ("commit last", "tx.commit_consuming()"),
             ],
         );
     }
@@ -1363,7 +1366,9 @@ mod direct_ledger_shape_tests {
         // 空补丁 no-op 必须出现在 begin 之前（不再打开任何事务）。
         let body = method_body(source, UPDATE_SIG, DELETE_SIG, "update");
         let noop = body.find("patch_is_empty(patch)").expect("no-op guard");
-        let begin = body.find("self.db.begin()").expect("transaction begin");
+        let begin = body
+            .find("AuthorizationSourceTransaction::begin(&self.db)")
+            .expect("transaction begin");
         assert!(
             noop < begin,
             "empty patch no-op must short-circuit before opening any transaction"
@@ -1399,7 +1404,7 @@ mod direct_ledger_shape_tests {
                 ("version successor", "next_delta_version"),
                 ("before-image update draft", "build_direct_update_draft"),
                 ("ledger append", "append_direct_grant_delta_in_tx"),
-                ("commit last", "tx.commit()"),
+                ("commit last", "tx.commit_consuming()"),
             ],
         );
 
@@ -1442,7 +1447,7 @@ mod direct_ledger_shape_tests {
                 ("version chain", "next_delta_version"),
                 ("remove draft", "build_direct_remove_draft"),
                 ("ledger append", "append_direct_grant_delta_in_tx"),
-                ("commit last", "tx.commit()"),
+                ("commit last", "tx.commit_consuming()"),
             ],
         );
 
@@ -1501,7 +1506,12 @@ mod direct_ledger_shape_tests {
             "delete_rules_by_card",
         );
         assert!(batch_body.contains("derive_direct_rule_batch_operation_id"));
-        assert!(batch_body.matches("self.db.begin").count() == 1);
+        assert!(
+            batch_body
+                .matches("AuthorizationSourceTransaction::begin")
+                .count()
+                == 1
+        );
         // 空 result 的既有行为保持：仍然推进 CARD REVOKE 代次/围栏。
         assert!(batch_body.contains("!rows.is_empty()"));
         assert!(batch_body.matches("tx.commit").count() == 1);
@@ -1513,7 +1523,12 @@ mod direct_ledger_shape_tests {
             "delete_rules_by_source",
         );
         assert!(source_batch.contains("only CARD_ONLY or MANUAL"));
-        assert!(source_batch.matches("self.db.begin").count() == 1);
+        assert!(
+            source_batch
+                .matches("AuthorizationSourceTransaction::begin")
+                .count()
+                == 1
+        );
         assert!(source_batch.matches("tx.commit").count() == 1);
         assert!(
             !source_batch.contains("append_card_projection_in_tx("),

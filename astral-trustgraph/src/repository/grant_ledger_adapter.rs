@@ -16,12 +16,11 @@
 //! - 租户/用户/卡片/有效期/projection 身份无法证明时一律 fail-closed
 //!   （`AstralError::Validation` / `AstralError::Internal`），不填假值、不回退 raw source。
 
-use sqlx::MySql;
-
 use astral_types::{
     AstralError, BindingLayer, CanonicalGrant, DeltaEventIdentity, DependencyVector,
     DependencyVersion, GrantDelta, GrantEffect, GrantEvidence, GrantId, GrantIdentityKey,
-    GrantProvenance, GrantRevision, GrantSourceKind, GrantState, TenantScope, ValidityWindow,
+    GrantProvenance, GrantRevision, GrantSourceKind, GrantState, PublishedEvidenceAggregate,
+    TenantScope, ValidityWindow,
 };
 use policy_engine::COMPILER_VERSION;
 // ─────────────────────────────────────────────────────────────────────────────
@@ -35,7 +34,8 @@ use policy_engine::COMPILER_VERSION;
 // 本文件保留同名 re-export，既有 crate 内调用方与结构守卫不受影响。
 // ─────────────────────────────────────────────────────────────────────────────
 pub(crate) use astral_db::grant_ledger::{
-    append_direct_grant_delta_in_tx, append_ruleset_grant_delta_in_tx, binding_key_for,
+    append_direct_grant_delta_in_tx as append_direct_grant_delta_in_tx_base,
+    append_ruleset_grant_delta_in_tx as append_ruleset_grant_delta_in_tx_base, binding_key_for,
     build_direct_add_draft, build_direct_remove_draft, build_direct_update_draft,
     build_ruleset_add_draft, build_ruleset_remove_draft, build_ruleset_update_draft,
     canonical_resource_key, card_dependency_id, derive_direct_identity, derive_direct_tenant,
@@ -49,6 +49,68 @@ pub(crate) use astral_db::grant_ledger::{
     RuleSetMutationKind, DIRECT_AGGREGATE_TYPE, MAX_HEADER_OPERATION_ID_LENGTH,
     RULE_SET_AGGREGATE_TYPE,
 };
+
+use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
+use crate::repository::invalidation_repository::{
+    append_evidence_invalidation_if_published, EvidenceInvalidationAppend,
+};
+
+pub(crate) async fn append_direct_grant_delta_in_tx(
+    tx: &mut AuthorizationSourceTransaction,
+    draft: &astral_db::grant_ledger::DirectGrantDeltaDraft,
+    base_version: i64,
+    target_version: i64,
+) -> Result<(), AstralError> {
+    append_direct_grant_delta_in_tx_base(tx, draft, base_version, target_version).await?;
+    // 同一 draft/version 派生的完整 delta request：base append 已校验并落 durable
+    // 行，这里把同一请求登记为 commit 后直投 receipt（无 commit 后 reload）。
+    tx.stage_projection_receipt(draft.delta_event_request(base_version, target_version)?)?;
+    if draft.invalidates_published_evidence {
+        append_evidence_invalidation_if_published(
+            tx,
+            &EvidenceInvalidationAppend {
+                tenant_id: draft.tenant_id,
+                card_id: Some(draft.card_id),
+                aggregate_type: PublishedEvidenceAggregate::UserCard,
+                aggregate_id: draft.card_id,
+                event_id: draft.event_id.clone(),
+                operation_id: draft.operation_id.clone(),
+                source_generation: draft.source_generation,
+                revoke_fence: draft.revoke_fence,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn append_ruleset_grant_delta_in_tx(
+    tx: &mut AuthorizationSourceTransaction,
+    draft: &astral_db::grant_ledger::RuleSetGrantDeltaDraft,
+    base_version: i64,
+    target_version: i64,
+) -> Result<(), AstralError> {
+    append_ruleset_grant_delta_in_tx_base(tx, draft, base_version, target_version).await?;
+    // 同 direct：base append 后把同一 delta 请求登记为 post-commit receipt。
+    tx.stage_projection_receipt(draft.delta_event_request(base_version, target_version)?)?;
+    if draft.invalidates_published_evidence {
+        append_evidence_invalidation_if_published(
+            tx,
+            &EvidenceInvalidationAppend {
+                tenant_id: draft.tenant_id,
+                card_id: Some(draft.card_id),
+                aggregate_type: PublishedEvidenceAggregate::RuleSet,
+                aggregate_id: draft.rule_set_id,
+                event_id: draft.event_id.clone(),
+                operation_id: draft.operation_id.clone(),
+                source_generation: draft.source_generation,
+                revoke_fence: draft.revoke_fence,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 pub(crate) use astral_db::grant_ledger::DirectGrantDeltaDraft;
@@ -417,7 +479,7 @@ pub(crate) fn build_approval_remove_draft(
 /// 在调用方事务内追加一条审批 REMOVE 贡献：revision（immutable）+ delta event。
 /// 任一错误向上传播触发整体回滚；本函数不 commit、不访问 Redis/MQ、不吞错。
 pub(crate) async fn append_approval_remove_in_tx(
-    tx: &mut sqlx::Transaction<'_, MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     draft: &ApprovalRemoveDraft,
     base_version: i64,
     target_version: i64,
@@ -427,15 +489,28 @@ pub(crate) async fn append_approval_remove_in_tx(
             "approval remove delta version must strictly advance from a non-negative base".into(),
         ));
     }
-    astral_db::append_grant_revision_in_tx(&mut *tx, &draft.revision_request())
+    astral_db::append_grant_revision_in_tx(tx, &draft.revision_request())
         .await
         .map_err(map_grant_repository_error)?;
-    astral_db::append_delta_event(
-        &mut **tx,
-        &draft.delta_event_request(base_version, target_version)?,
+    let delta_request = draft.delta_event_request(base_version, target_version)?;
+    astral_db::append_delta_event(&mut ***tx, &delta_request)
+        .await
+        .map_err(map_grant_repository_error)?;
+    tx.stage_projection_receipt(delta_request)?;
+    append_evidence_invalidation_if_published(
+        tx,
+        &EvidenceInvalidationAppend {
+            tenant_id: draft.tenant_id,
+            card_id: Some(draft.card_id),
+            aggregate_type: PublishedEvidenceAggregate::Approval,
+            aggregate_id: draft.request_id,
+            event_id: draft.event_id.clone(),
+            operation_id: draft.operation_id.clone(),
+            source_generation: draft.source_generation,
+            revoke_fence: draft.revoke_fence,
+        },
     )
-    .await
-    .map_err(map_grant_repository_error)?;
+    .await?;
     Ok(())
 }
 
@@ -807,18 +882,20 @@ pub(crate) fn build_approval_add_draft(
 /// 两个 append 都属于同一事务，任一错误向上传播即可触发整体回滚；
 /// 本函数不 commit、不访问 Redis/MQ、不吞错、不降级。
 pub(crate) async fn append_approval_grant_in_tx(
-    tx: &mut sqlx::Transaction<'_, MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     context: &ApprovalGrantLedgerContext<'_>,
     projection: &astral_db::ProjectionEventIdentity,
 ) -> Result<(), AstralError> {
     let draft = build_approval_add_draft(context, projection)?;
 
-    astral_db::append_grant_revision_in_tx(&mut *tx, &draft.revision_request())
+    astral_db::append_grant_revision_in_tx(tx, &draft.revision_request())
         .await
         .map_err(map_grant_repository_error)?;
-    astral_db::append_delta_event(&mut **tx, &draft.delta_event_request()?)
+    let delta_request = draft.delta_event_request()?;
+    astral_db::append_delta_event(&mut ***tx, &delta_request)
         .await
         .map_err(map_grant_repository_error)?;
+    tx.stage_projection_receipt(delta_request)?;
     Ok(())
 }
 
@@ -1217,7 +1294,7 @@ impl DelegationGrantDeltaDraft {
 /// 两者共享草稿身份；任一错误向上传播触发整体回滚。本函数不 commit、
 /// 不访问 Redis/MQ、不吞错、不降级。
 pub(crate) async fn append_delegation_grant_delta_in_tx(
-    tx: &mut sqlx::Transaction<'_, MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     draft: &DelegationGrantDeltaDraft,
     base_version: i64,
     target_version: i64,
@@ -1227,15 +1304,30 @@ pub(crate) async fn append_delegation_grant_delta_in_tx(
             "delegation delta version must strictly advance from a non-negative base".into(),
         ));
     }
-    astral_db::append_grant_revision_in_tx(&mut *tx, &draft.revision_request())
+    astral_db::append_grant_revision_in_tx(tx, &draft.revision_request())
         .await
         .map_err(map_grant_repository_error)?;
-    astral_db::append_delta_event(
-        &mut **tx,
-        &draft.delta_event_request(base_version, target_version)?,
-    )
-    .await
-    .map_err(map_grant_repository_error)?;
+    let delta_request = draft.delta_event_request(base_version, target_version)?;
+    astral_db::append_delta_event(&mut ***tx, &delta_request)
+        .await
+        .map_err(map_grant_repository_error)?;
+    tx.stage_projection_receipt(delta_request)?;
+    if draft.invalidates_published_evidence {
+        append_evidence_invalidation_if_published(
+            tx,
+            &EvidenceInvalidationAppend {
+                tenant_id: draft.tenant_id,
+                card_id: Some(draft.card_id),
+                aggregate_type: PublishedEvidenceAggregate::Delegation,
+                aggregate_id: draft.delegation_id,
+                event_id: draft.event_id.clone(),
+                operation_id: draft.operation_id.clone(),
+                source_generation: draft.source_generation,
+                revoke_fence: draft.revoke_fence,
+            },
+        )
+        .await?;
+    }
     Ok(())
 }
 

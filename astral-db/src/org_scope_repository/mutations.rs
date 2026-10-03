@@ -1559,7 +1559,7 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         let cmd_json = serde_json::to_string(cmd)
             .map_err(|error| AstralError::Internal(format!("org_scope cmd serialize: {error}")))?;
         let digest = canonical_input_digest("GRANT_REVOKE", &cmd_json);
-        let mut tx = begin_tx(self.pool()).await?;
+        let (mut tx, authority_guard) = begin_authority_tx(self.pool()).await?;
         match claim_operation_in_tx(
             &mut tx,
             &cmd.operation_id,
@@ -1570,7 +1570,9 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         .await?
         {
             OperationClaim::Replayed(mut value) => {
-                tx.commit().await.map_err(db_err)?;
+                commit_authority_tx(tx, authority_guard)
+                    .await
+                    .map_err(db_err)?;
                 // 幂等合同：回放返回首次 outcome，但必须向调用方标明 replayed=true。
                 value["replayed"] = serde_json::Value::Bool(true);
                 serde_json::from_value(value).map_err(|error| {
@@ -1587,7 +1589,9 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
                     records,
                 };
                 record_operation_outcome_in_tx(&mut tx, &cmd.operation_id, &outcome).await?;
-                tx.commit().await.map_err(db_err)?;
+                commit_authority_tx(tx, authority_guard)
+                    .await
+                    .map_err(db_err)?;
                 Ok(outcome)
             }
         }
@@ -1601,7 +1605,7 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         let cmd_json = serde_json::to_string(cmd)
             .map_err(|error| AstralError::Internal(format!("org_scope cmd serialize: {error}")))?;
         let digest = canonical_input_digest("MASK_APPLY", &cmd_json);
-        let mut tx = begin_tx(self.pool()).await?;
+        let (mut tx, authority_guard) = begin_authority_tx(self.pool()).await?;
         match claim_operation_in_tx(
             &mut tx,
             &cmd.operation_id,
@@ -1612,7 +1616,9 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         .await?
         {
             OperationClaim::Replayed(mut value) => {
-                tx.commit().await.map_err(db_err)?;
+                commit_authority_tx(tx, authority_guard)
+                    .await
+                    .map_err(db_err)?;
                 // 幂等合同：回放返回首次 outcome，但必须向调用方标明 replayed=true。
                 value["replayed"] = serde_json::Value::Bool(true);
                 serde_json::from_value(value).map_err(|error| {
@@ -1629,7 +1635,9 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
                     records,
                 };
                 record_operation_outcome_in_tx(&mut tx, &cmd.operation_id, &outcome).await?;
-                tx.commit().await.map_err(db_err)?;
+                commit_authority_tx(tx, authority_guard)
+                    .await
+                    .map_err(db_err)?;
                 Ok(outcome)
             }
         }
@@ -1643,7 +1651,7 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         let cmd_json = serde_json::to_string(cmd)
             .map_err(|error| AstralError::Internal(format!("org_scope cmd serialize: {error}")))?;
         let digest = canonical_input_digest("MASK_REMOVE", &cmd_json);
-        let mut tx = begin_tx(self.pool()).await?;
+        let (mut tx, authority_guard) = begin_authority_tx(self.pool()).await?;
         match claim_operation_in_tx(
             &mut tx,
             &cmd.operation_id,
@@ -1654,7 +1662,9 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         .await?
         {
             OperationClaim::Replayed(mut value) => {
-                tx.commit().await.map_err(db_err)?;
+                commit_authority_tx(tx, authority_guard)
+                    .await
+                    .map_err(db_err)?;
                 // 幂等合同：回放返回首次 outcome，但必须向调用方标明 replayed=true。
                 value["replayed"] = serde_json::Value::Bool(true);
                 serde_json::from_value(value).map_err(|error| {
@@ -1671,7 +1681,9 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
                     records,
                 };
                 record_operation_outcome_in_tx(&mut tx, &cmd.operation_id, &outcome).await?;
-                tx.commit().await.map_err(db_err)?;
+                commit_authority_tx(tx, authority_guard)
+                    .await
+                    .map_err(db_err)?;
                 Ok(outcome)
             }
         }
@@ -1686,7 +1698,7 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         let cmd_json = serde_json::to_string(cmd)
             .map_err(|error| AstralError::Internal(format!("org_scope cmd serialize: {error}")))?;
         let digest = canonical_input_digest("MEMBERSHIP_CREATE", &cmd_json);
-        let mut tx = begin_tx(self.pool()).await?;
+        let (mut tx, authority_guard) = begin_authority_tx(self.pool()).await?;
         match claim_operation_in_tx(
             &mut tx,
             &cmd.operation_id,
@@ -1697,7 +1709,9 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         .await?
         {
             OperationClaim::Replayed(mut value) => {
-                tx.commit().await.map_err(db_err)?;
+                commit_authority_tx(tx, authority_guard)
+                    .await
+                    .map_err(db_err)?;
                 // 幂等合同：回放返回首次 outcome，但必须向调用方标明 replayed=true。
                 value["replayed"] = serde_json::Value::Bool(true);
                 serde_json::from_value(value).map_err(|error| {
@@ -1715,7 +1729,9 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
                     records,
                 };
                 record_operation_outcome_in_tx(&mut tx, &cmd.operation_id, &outcome).await?;
-                tx.commit().await.map_err(db_err)?;
+                commit_authority_tx(tx, authority_guard)
+                    .await
+                    .map_err(db_err)?;
                 Ok(outcome)
             }
         }
@@ -1729,7 +1745,7 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         let cmd_json = serde_json::to_string(cmd)
             .map_err(|error| AstralError::Internal(format!("org_scope cmd serialize: {error}")))?;
         let digest = canonical_input_digest("MEMBERSHIP_REVOKE", &cmd_json);
-        let mut tx = begin_tx(self.pool()).await?;
+        let (mut tx, authority_guard) = begin_authority_tx(self.pool()).await?;
         match claim_operation_in_tx(
             &mut tx,
             &cmd.operation_id,
@@ -1740,7 +1756,9 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         .await?
         {
             OperationClaim::Replayed(mut value) => {
-                tx.commit().await.map_err(db_err)?;
+                commit_authority_tx(tx, authority_guard)
+                    .await
+                    .map_err(db_err)?;
                 // 幂等合同：回放返回首次 outcome，但必须向调用方标明 replayed=true。
                 value["replayed"] = serde_json::Value::Bool(true);
                 serde_json::from_value(value).map_err(|error| {
@@ -1757,7 +1775,9 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
                     records,
                 };
                 record_operation_outcome_in_tx(&mut tx, &cmd.operation_id, &outcome).await?;
-                tx.commit().await.map_err(db_err)?;
+                commit_authority_tx(tx, authority_guard)
+                    .await
+                    .map_err(db_err)?;
                 Ok(outcome)
             }
         }

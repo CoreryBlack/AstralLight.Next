@@ -2,22 +2,37 @@
 name = "astral-cache"
 version = "0.1.0"
 edition = "2021"
-description = "AstralLight 缓存层 — Redis 快照缓存 + 消息幂等"
-license.workspace = true
+description = "AstralLight 缓存层 — Redis 快照缓存 + 消息幂等（已退役 archive crate）"
+license = "AGPL-3.0-or-later"
+
+# 【Redis 编译层退役 · redis-layer-retirement-20261002】
+#
+# 本 crate 已随 Redis 整层退役移出 root workspace `members`（exclude），源码
+# 原样保留、零删除。原 manifest 通过 `license.workspace` / `*.workspace = true`
+# 继承 workspace 依赖——crate 被 exclude 后该继承必然解析失败（独立探针实证：
+# "failed to find a workspace root"，astral-learn 同形态），因此本 manifest 改为
+# **自包含**（各依赖版本与 root Cargo.toml `[workspace.dependencies]` 逐项同步），
+# 成为可独立编译的 archive crate：
+#
+#     cd astral-cache && cargo check
+#
+# 恢复方式：把 "astral-cache" 移回 root `members`，并将下列内联依赖还原为
+# `{ workspace = true }` 继承（license 同理）。
 
 [dependencies]
 policy-engine = { path = "../policy-engine" }
 astral-types = { path = "../astral-types" }
 
-redis = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
+# 与 root [workspace.dependencies] redis 条目逐字同步。
+redis = { version = "1", features = ["tokio-comp", "connection-manager", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
 async-trait = "0.1"
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 policy-engine = { path = "../policy-engine" }
 astral-types = { path = "../astral-types" }

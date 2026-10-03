@@ -96,6 +96,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = Arc::new(AppConfig::from_files("application")?);
+    // Redis 编译层退役收口（redis-layer-retirement-20261002）：宿主能力门 +
+    // 已校验旗标一次性冻结。astral-common 的零依赖 marker 会被 workspace
+    // feature 统一放大——任何其他 crate 打开 redis-compat 都会让集中校验的
+    // cfg 通过，即便本宿主并未编译自己的 compat adapter（历史上只留下 log
+    // 静默跳过）。能力断言以**本 crate** 的 cfg! 为准：旗标开启但 Monitor
+    // 未编译 redis-compat adapter 时，在任何 DB 连接 / collector / 服务装配
+    // 之前显式拒绝启动（fail-closed，非 log-only）；随后把已校验旗标冻结进
+    // 进程级共享源（first-wins、同值幂等、异值冲突拒绝）。
+    config
+        .validate_redis_adapter_support(cfg!(feature = "redis-compat"))
+        .map_err(anyhow::Error::msg)?;
+    astral_common::config::install_redis_projection_compat(config.redis_projection_compat_enabled)
+        .map_err(anyhow::Error::msg)?;
     let db = connect_and_validate_schema(&config.database_url).await?;
     let engine = Arc::new(PolicyEngine::new());
     astral_common::audit::register_audit_db_writer(Arc::new(MonitorAuditDbWriter {

@@ -9,6 +9,7 @@ use sqlx::MySqlPool;
 use astral_types::{AstralError, GrantState};
 
 use crate::repository::audit_log_repository::validated_request_operation_id;
+use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
 use crate::repository::grant_ledger_adapter::{
     append_approval_grant_in_tx, append_approval_remove_in_tx, build_approval_remove_draft,
     derive_approval_contribution_event_id, derive_approval_identity, derive_approval_operation_id,
@@ -366,14 +367,14 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         // 缺失/空白 header 维持既有稳定 fallback（approval:{request_id}），
         // 不产生随机或超长审计关联值。失败时事务未开始，无任何副作用。
         let request_id_header = validated_request_operation_id(request_id_header)?;
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let request: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT user_id, request_content, reason FROM permission_request \
              WHERE request_id=? AND user_id=? AND status='PENDING' FOR UPDATE",
         )
         .bind(request_id)
         .bind(user_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let Some((target_user_id, request_content, request_reason)) = request else {
@@ -393,7 +394,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         .bind(comment)
         .bind(request_id)
         .bind(user_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         if result.rows_affected() != 1 {
@@ -418,7 +419,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
             },
         )
         .await?;
-        tx.commit().await.map_err(db_error)
+        tx.commit_consuming().await
     }
 
     async fn count_pending(&self) -> Result<i64, AstralError> {
@@ -477,7 +478,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         let operation_id =
             derive_approval_revoke_operation_id(request_id, rule_id, request_id_header.as_deref())?;
 
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
 
         // ── 锁 1：请求行 —— 只有 APPROVED 请求的贡献可以撤销 ────────────────────
         let request: Option<(i64, Option<String>, Option<String>, String)> = sqlx::query_as(
@@ -485,7 +486,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
              WHERE request_id=? FOR UPDATE",
         )
         .bind(request_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let Some((target_user_id, request_content, request_reason, status)) = request else {
@@ -505,7 +506,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
              FROM permission_rule WHERE rule_id=? FOR UPDATE",
         )
         .bind(rule_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
 
@@ -713,7 +714,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         )
         .bind(rule_id)
         .bind(request_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         if deleted.rows_affected() != 1 {
@@ -743,7 +744,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         .await?;
 
         // commit 是唯一终态出口：之前任一步失败整体回滚，不存在部分提交。
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(true)
     }
 
@@ -778,7 +779,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         // 业务身份从稳定 request context 派生一次（不生成随机业务 identity）；
         // 失败发生在任何事务副作用之前。
         let operation_id = derive_approval_operation_id(request_id_header, request_id)?;
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
 
         let target_card: Option<(i64,)> = sqlx::query_as(
             "SELECT uc.card_id FROM user_card uc \
@@ -789,7 +790,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         )
         .bind(request_id)
         .bind(card_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         if target_card.is_none() {
@@ -805,7 +806,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         .bind(reviewer_id)
         .bind(comment)
         .bind(request_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         if result.rows_affected() != 1 {
@@ -821,7 +822,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
             "SELECT uc.tenant_id, uc.domain_id FROM user_card uc WHERE uc.card_id = ? FOR UPDATE",
         )
         .bind(card_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?
         .ok_or_else(|| {
@@ -842,7 +843,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         .bind(valid_from)
         .bind(valid_to)
         .bind(request_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         if rule_insert.rows_affected() != 1 {
@@ -875,7 +876,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         let (target_user_id, request_reason): (i64, Option<String>) =
             sqlx::query_as("SELECT user_id, reason FROM permission_request WHERE request_id=?")
                 .bind(request_id)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await
                 .map_err(db_error)?;
         let context = crate::repository::audit_log_repository::ApprovalAuditContext::new(
@@ -927,7 +928,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         )
         .await?;
 
-        tx.commit().await.map_err(db_error)?;
+        tx.commit_consuming().await?;
         Ok(())
     }
 
@@ -946,13 +947,13 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         // 缺失/空白 header 维持既有稳定 fallback（approval:{request_id}），
         // 不产生随机或超长审计关联值。失败时事务未开始，无任何副作用。
         let request_id_header = validated_request_operation_id(request_id_header)?;
-        let mut tx = self.db.begin().await.map_err(db_error)?;
+        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
         let request: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT user_id, request_content, reason FROM permission_request \
              WHERE request_id=? AND status='PENDING' FOR UPDATE",
         )
         .bind(request_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
         let Some((target_user_id, request_content, request_reason)) = request else {
@@ -972,7 +973,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         .bind(reviewer_id)
         .bind(comment)
         .bind(request_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db_error)?;
         if result.rows_affected() != 1 {
@@ -1000,7 +1001,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
             },
         )
         .await?;
-        tx.commit().await.map_err(db_error)
+        tx.commit_consuming().await
     }
 }
 
@@ -1066,9 +1067,11 @@ mod approval_ledger_shape_tests {
             ("operation id bound", "operation_id: &operation_id"),
             ("approval audit", "insert_approval_audit_in_tx"),
             ("grant ledger append", "append_approval_grant_in_tx"),
-            ("commit last", "tx.commit()"),
+            ("commit last", "tx.commit_consuming()"),
         ];
-        let commit_position = body.rfind("tx.commit()").expect("commit must exist");
+        let commit_position = body
+            .rfind("tx.commit_consuming()")
+            .expect("commit must exist");
         let mut previous = 0;
         for (label, marker) in markers {
             let position = body
@@ -1122,7 +1125,7 @@ mod approval_ledger_shape_tests {
             .find("validate_registry_resource_action(")
             .expect("approve must gate resource/action through the shared registry validator");
         let begin = body
-            .find("self.db.begin()")
+            .find("AuthorizationSourceTransaction::begin(&self.db)")
             .expect("transaction begin must exist");
         assert!(
             validation < begin,
@@ -1223,7 +1226,7 @@ mod approval_ledger_shape_tests {
                     panic!("{label} must gate its header through the shared request-id contract")
                 });
             let begin = body
-                .find("self.db.begin()")
+                .find("AuthorizationSourceTransaction::begin(&self.db)")
                 .expect("transaction begin must exist");
             assert!(
                 validation < begin,
@@ -1331,9 +1334,11 @@ mod approval_ledger_shape_tests {
             ("cas source delete", "WHERE rule_id=? AND enabled=1"),
             ("approval audit", "insert_approval_audit_in_tx("),
             ("revoke decision", "decision: \"REVOKED\""),
-            ("commit last", "tx.commit()"),
+            ("commit last", "tx.commit_consuming()"),
         ];
-        let commit_position = body.rfind("tx.commit()").expect("commit must exist");
+        let commit_position = body
+            .rfind("tx.commit_consuming()")
+            .expect("commit must exist");
         let mut previous = 0;
         for (label, marker) in markers {
             let position = body
@@ -1414,7 +1419,7 @@ mod approval_ledger_shape_tests {
     }
 
     /// 撤销门禁先于事务：reviewer/主键正数门禁与统一 64 字节 request-id 合同
-    /// 都在任何 `self.db.begin()` 之前 fail-closed；稳定 operation id 亦在事务前
+    /// 都在任何 `AuthorizationSourceTransaction::begin(&self.db)` 之前 fail-closed；稳定 operation id 亦在事务前
     /// 派生；全程不允许任何截断手段。
     #[test]
     fn revoke_gates_identity_and_header_before_the_transaction() {
@@ -1426,7 +1431,7 @@ mod approval_ledger_shape_tests {
             "revoke_approved_contribution",
         );
         let begin = body
-            .find("self.db.begin()")
+            .find("AuthorizationSourceTransaction::begin(&self.db)")
             .expect("transaction begin must exist");
         for gate in [
             "reviewer_id <= 0",

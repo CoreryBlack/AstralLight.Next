@@ -968,6 +968,90 @@ def classify_e1_allow(request_events: Sequence[Event], mutation_events: Sequence
     }
 
 
+def classify_e1_allow_multi(
+    request_events: Sequence[Event],
+    mutations: Sequence[Sequence[Event]],
+    *,
+    represented: Optional[Mapping[int, bool]] = None,
+) -> dict[str, Any]:
+    """Classify one admitted ALLOW against SEVERAL revocation-class mutations.
+
+    The two-mutation bounded model separates two violation families: a
+    pre-t_f mutation that is NOT represented in the admitted evidence
+    (V1), and admitted evidence that no longer carries the candidate at
+    its own revision (V2). The single-mutation classifier cannot express
+    this split because with one mutation a fully published pre-t_f
+    narrowing removes the candidate, so no ALLOW exists to classify. With
+    several mutations an ALLOW can legitimately coexist with a pre-t_f
+    mutation that IS published and represented.
+
+    ``mutations`` is one commit-interval event list per mutation, all from
+    the same process log as the request. ``represented`` optionally maps
+    a mutation index to whether that mutation's narrowing is represented
+    in the admitted final evidence (from the live manifest correlation
+    between the mutation's terminal READY strict pointer and the final
+    evidence manifest identity). Semantics:
+
+    - without ``represented`` the attribution is CONSERVATIVE (deny-more):
+      every mutation committed before t_f counts as a hazard candidate and
+      as a violation, exactly like the single-mutation classifier;
+    - with ``represented`` the violation attribution is the model's V1:
+      only pre-t_f mutations that are NOT represented are violations; a
+      pre-t_f mutation that is represented yields a safe, in-domain
+      admission (``strictlyBeforeRepresented``).
+
+    The result carries ``hazardCandidates`` (pre-t_f indices),
+    ``violatingMutations`` (the violation attribution), and
+    ``perMutation`` (the single-mutation classifications), so an E1
+    manifest can attribute a violation to specific mutations.
+    """
+    if not mutations:
+        raise EvidenceError("classify_e1_allow_multi requires at least one mutation")
+    _require_same_process(request_events, *mutations)
+    represented_map = dict(represented) if represented is not None else None
+    per_mutation: List[Dict[str, Any]] = []
+    for index, mutation_events in enumerate(mutations):
+        result = classify_e1_allow(request_events, mutation_events)
+        result["mutationIndex"] = index
+        per_mutation.append(result)
+    hazard_candidates = [
+        item["mutationIndex"]
+        for item in per_mutation
+        if item["theoremDomain"]
+    ]
+    if represented_map is None:
+        violating = list(hazard_candidates)
+        attribution_mode = "conservative"
+    else:
+        unknown = [index for index in hazard_candidates if index not in represented_map]
+        if unknown:
+            raise EvidenceError(
+                "representation missing for pre-t_f mutation indices: "
+                + ",".join(str(index) for index in unknown)
+            )
+        violating = [
+            index for index in hazard_candidates if not represented_map[index]
+        ]
+        attribution_mode = "representation-adjudicated"
+    stale_violation = bool(violating)
+    if stale_violation:
+        combined_domain = "strictlyBefore"
+    elif hazard_candidates:
+        combined_domain = "strictlyBeforeRepresented"
+    else:
+        combined_domain = "outsideTheoremDomain"
+    return {
+        "perMutation": per_mutation,
+        "hazardCandidates": hazard_candidates,
+        "violatingMutations": violating,
+        "attributionMode": attribution_mode,
+        "staleAllowViolation": stale_violation,
+        "theoremDomain": stale_violation,
+        "combinedDomain": combined_domain,
+        "categories": [item["category"] for item in per_mutation],
+    }
+
+
 def validate_request_terminal(request_events: Sequence[Event], http_status: int) -> dict[str, Any]:
     decision = one_event(request_events, "decision_return")
     allowed = decision.fields.get("allowed")

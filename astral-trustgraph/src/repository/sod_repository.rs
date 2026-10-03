@@ -11,10 +11,21 @@
 //! `astral_db::load_published_card_grant_evidence` 在单个短事务内锁定并整链
 //! 校验）；不存在 legacy 快照 / 旧链 head / raw source 回退——对牌失败与
 //! 读取失败同样报错，绝不降级为空证据。
+//!
+//! ## sod_policy 写路径 source writer 栅栏
+//!
+//! `create_policy` / `update_policy` / `delete_policy` 是 SoD 判定输入表的
+//! source mutation：hub 已安装时必须先经 canonical
+//! `astral_db::memory_projection_hub::acquire_source_guard` 取得栅栏再执行
+//! autocommit 语句（武装 → await → settle；取消/未知 Drop → sticky
+//! uncertain），使 writer-active 期间辅助读面与 token 绑定策略缓存
+//! fail-closed。`insert_violation` 仅为 bookkeeping 记录（非授权输入），
+//! 不需要栅栏。
 
 use async_trait::async_trait;
 use sqlx::MySqlPool;
 
+use astral_db::memory_projection_hub::SourceTransactionGuard;
 use astral_db::{
     cached_load_published_card_grant_evidence, sod_load_card_tenant, sod_partner_matches_grant,
     sod_resource_type_from_scoped_key, AuthorizationEvidenceError,
@@ -22,6 +33,7 @@ use astral_db::{
 use astral_types::{
     AstralError, DomainScopeRequirement, PublishedCardAuthorization, PublishedCardEvidenceScope,
 };
+use std::future::Future;
 use time::OffsetDateTime;
 
 /// SoD 策略记录（sod_policy）
@@ -118,6 +130,53 @@ pub struct SqlxSodRepository {
     db: MySqlPool,
 }
 
+/// 取得 sod_policy source writer 栅栏（sod_policy 是 SoD 判定的授权**输入**
+/// source 表）。委托 canonical
+/// `astral_db::memory_projection_hub::acquire_source_guard`（本文件不留第二份
+/// begin 语义）：
+/// - hub 未安装（Rabbit 模式/纯测试/离线工具）→ `Ok(None)`，行为不变；
+/// - hub 已安装而栅栏不可得 → `Err`（写点 `?` 拒绝写入，绝不静默 no-op 写）。
+///
+/// begin 即推进 hub mutation/source revision 与辅助纪元：writer-active 期间
+/// 辅助镜像与 token 绑定的 sod_policy 策略缓存一并 fail-closed，读面绝不以
+/// 并发 source 状态放行；Drop 统一失效正向读缓存并再次推进 revision。
+fn begin_sod_policy_source_write() -> Result<Option<SourceTransactionGuard>, AstralError> {
+    astral_db::memory_projection_hub::acquire_source_guard()
+}
+
+/// 单条 autocommit source 语句的围栏执行（与 Identity/card 写点同一合同）：
+/// await 窗口前武装（`mark_commit_started`），结果判定后 settle——Ok →
+/// `mark_commit_proven` 清私有 atomic（Drop 正常释放）；Err → `mark_uncertain`
+/// （sticky，独立 durable 对账前读面 fail-closed）。write pending 时任务被
+/// 取消 → 本 future 连同已武装栅栏一起 Drop → sticky uncertain，覆盖"语句
+/// 可能已提交但结果未知"的窗口（drop cancel = unknown）。`None` 栅栏（hub
+/// 未装）为纯透传。
+async fn fenced_sod_policy_write<T, F>(
+    guard: Option<SourceTransactionGuard>,
+    write: F,
+) -> Result<T, sqlx::Error>
+where
+    F: Future<Output = Result<T, sqlx::Error>>,
+{
+    if let Some(guard) = &guard {
+        guard.mark_commit_started();
+    }
+    let result = write.await;
+    match &result {
+        Ok(_) => {
+            if let Some(guard) = &guard {
+                guard.mark_commit_proven();
+            }
+        }
+        Err(_) => {
+            if let Some(guard) = &guard {
+                guard.mark_uncertain();
+            }
+        }
+    }
+    result
+}
+
 impl SqlxSodRepository {
     pub fn new(db: MySqlPool) -> Self {
         Self { db }
@@ -200,28 +259,35 @@ impl SodRepository for SqlxSodRepository {
     }
 
     async fn create_policy(&self, policy: &SodPolicyRecord) -> Result<i64, AstralError> {
-        let result = sqlx::query(
-            r#"INSERT INTO sod_policy (policy_name, description, conflict_type, resource_type, action_code,
-               permission_a, permission_b, condition_script, status, limit_count, limit_window)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        // source writer 栅栏在 autocommit 语句之前取得（见
+        // begin_sod_policy_source_write：writer-active 期间读面 fail-closed）。
+        let guard = begin_sod_policy_source_write()?;
+        let result = fenced_sod_policy_write(
+            guard,
+            sqlx::query(
+                r#"INSERT INTO sod_policy (policy_name, description, conflict_type, resource_type, action_code,
+                   permission_a, permission_b, condition_script, status, limit_count, limit_window)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&policy.policy_name)
+            .bind(&policy.description)
+            .bind(&policy.conflict_type)
+            .bind(&policy.resource_type)
+            .bind(&policy.action_code)
+            .bind(&policy.permission_a)
+            .bind(&policy.permission_b)
+            .bind(&policy.condition_script)
+            .bind("ACTIVE")
+            .bind(policy.limit_count)
+            .bind(&policy.limit_window)
+            .execute(&self.db),
         )
-        .bind(&policy.policy_name)
-        .bind(&policy.description)
-        .bind(&policy.conflict_type)
-        .bind(&policy.resource_type)
-        .bind(&policy.action_code)
-        .bind(&policy.permission_a)
-        .bind(&policy.permission_b)
-        .bind(&policy.condition_script)
-        .bind("ACTIVE")
-        .bind(policy.limit_count)
-        .bind(&policy.limit_window)
-        .execute(&self.db)
         .await
         .map_err(db_error)?;
-        // sod_policy 写路径 evict 钩子：进程级策略缓存（astral_db::sod_check，
-        // TTL 30s）本进程立即失效；跨实例无广播，由 TTL 兜底（≤30s 失效窗口
-        // 取舍见 astral_db::sod_check 模块文档）。
+        // sod_policy 写路径 evict 钩子：进程级策略缓存（astral_db::sod_check）
+        // 本进程立即失效；composite 模式另有 source writer 栅栏推进 token 的
+        // 精确失效（双保险）；跨实例无广播，由 TTL 兜底（≤30s 失效窗口取舍
+        // 见 astral_db::sod_check 模块文档）。
         astral_db::evict_sod_policy_cache();
         Ok(result.last_insert_id() as i64)
     }
@@ -231,38 +297,48 @@ impl SodRepository for SqlxSodRepository {
         policy_id: i64,
         policy: &SodPolicyRecord,
     ) -> Result<(), AstralError> {
-        sqlx::query(
-            r#"UPDATE sod_policy SET policy_name=?, description=?, conflict_type=?, resource_type=?,
-               action_code=?, permission_a=?, permission_b=?, condition_script=?, status=?
-               WHERE policy_id=?"#,
+        // source writer 栅栏（同 create_policy）。
+        let guard = begin_sod_policy_source_write()?;
+        fenced_sod_policy_write(
+            guard,
+            sqlx::query(
+                r#"UPDATE sod_policy SET policy_name=?, description=?, conflict_type=?, resource_type=?,
+                   action_code=?, permission_a=?, permission_b=?, condition_script=?, status=?
+                   WHERE policy_id=?"#,
+            )
+            .bind(&policy.policy_name)
+            .bind(&policy.description)
+            .bind(&policy.conflict_type)
+            .bind(&policy.resource_type)
+            .bind(&policy.action_code)
+            .bind(&policy.permission_a)
+            .bind(&policy.permission_b)
+            .bind(&policy.condition_script)
+            .bind(&policy.status)
+            .bind(policy_id)
+            .execute(&self.db),
         )
-        .bind(&policy.policy_name)
-        .bind(&policy.description)
-        .bind(&policy.conflict_type)
-        .bind(&policy.resource_type)
-        .bind(&policy.action_code)
-        .bind(&policy.permission_a)
-        .bind(&policy.permission_b)
-        .bind(&policy.condition_script)
-        .bind(&policy.status)
-        .bind(policy_id)
-        .execute(&self.db)
         .await
         .map_err(db_error)?;
         // sod_policy 写路径 evict 钩子（同 create_policy：本进程立即失效，
-        // 跨实例 ≤TTL 兜底）。
+        // composite 另有 token 精确失效，跨实例 ≤TTL 兜底）。
         astral_db::evict_sod_policy_cache();
         Ok(())
     }
 
     async fn delete_policy(&self, policy_id: i64) -> Result<(), AstralError> {
-        sqlx::query("DELETE FROM sod_policy WHERE policy_id=?")
-            .bind(policy_id)
-            .execute(&self.db)
-            .await
-            .map_err(db_error)?;
+        // source writer 栅栏（同 create_policy）。
+        let guard = begin_sod_policy_source_write()?;
+        fenced_sod_policy_write(
+            guard,
+            sqlx::query("DELETE FROM sod_policy WHERE policy_id=?")
+                .bind(policy_id)
+                .execute(&self.db),
+        )
+        .await
+        .map_err(db_error)?;
         // sod_policy 写路径 evict 钩子（同 create_policy：本进程立即失效，
-        // 跨实例 ≤TTL 兜底）。
+        // composite 另有 token 精确失效，跨实例 ≤TTL 兜底）。
         astral_db::evict_sod_policy_cache();
         Ok(())
     }
@@ -600,5 +676,104 @@ mod tests {
         assert!(production.contains("sod_load_card_tenant"));
         assert!(production.contains("PublishedCardEvidenceScope"));
         assert!(production.contains("sod_resource_type_from_scoped_key"));
+    }
+
+    // ===== sod_policy 写路径 source writer 栅栏（形状守卫，无 IO/无 hub 全局态） =====
+
+    /// 形状守卫：create/update/delete 三条 sod_policy source mutation 必须
+    /// 先经 canonical `acquire_source_guard` 取栅栏（hub 已装而不可得 → Err
+    /// 拒写），再进入 fenced write（await 前武装，Ok → proven；Err → sticky
+    /// uncertain；取消 Drop → unknown），最后 evict 进程缓存。写点不得以
+    /// "无栅栏 no-op"静默降级。
+    #[test]
+    fn sod_policy_mutations_hold_the_source_writer_fence() {
+        let source = include_str!("sod_repository.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        // 锚定 impl 块（trait 声明与方法同名，先切出 impl 再取方法体）。
+        let impl_block = production
+            .split("impl SodRepository for SqlxSodRepository")
+            .nth(1)
+            .expect("SqlxSodRepository impl must exist");
+
+        for method in [
+            "async fn create_policy(",
+            "async fn update_policy(",
+            "async fn delete_policy(",
+        ] {
+            let body = impl_block
+                .split(method)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{method} must exist"));
+            let body = body.split("\n    async fn ").next().unwrap();
+            let acquire = body
+                .find("begin_sod_policy_source_write()")
+                .unwrap_or_else(|| panic!("{method} must acquire the source writer guard"));
+            let fenced = body
+                .find("fenced_sod_policy_write(")
+                .unwrap_or_else(|| panic!("{method} must write inside the commit fence"));
+            let evict = body
+                .find("evict_sod_policy_cache()")
+                .unwrap_or_else(|| panic!("{method} must evict the process cache after write"));
+            assert!(
+                acquire < fenced && fenced < evict,
+                "{method} order must be guard acquire -> fenced write -> cache evict"
+            );
+            // execute 必须在 fenced write 内部（不得绕开栅栏裸执行）。
+            assert!(
+                !body[..fenced].contains(".execute(&self.db)"),
+                "{method} must not execute the source statement outside the fence"
+            );
+        }
+
+        // 栅栏 helper：委托 canonical acquire；武装先于 await；Ok → proven，
+        // Err → sticky uncertain（与 identity/card 写点同一合同）。
+        let acquire_helper = production
+            .split("fn begin_sod_policy_source_write()")
+            .nth(1)
+            .expect("guard acquire helper must exist");
+        assert!(acquire_helper.contains("acquire_source_guard()"));
+        let fenced_helper = production
+            .split("async fn fenced_sod_policy_write")
+            .nth(1)
+            .expect("fenced write helper must exist");
+        let armed = fenced_helper
+            .find("guard.mark_commit_started()")
+            .expect("fence must arm before the await window");
+        let awaited = fenced_helper
+            .find("write.await")
+            .expect("fenced helper must await the write");
+        assert!(
+            armed < awaited,
+            "the commit fence must be armed before awaiting the statement"
+        );
+        let settled = fenced_helper
+            .find("guard.mark_commit_proven()")
+            .expect("proven success must disarm the fence");
+        let uncertain = fenced_helper
+            .find("guard.mark_uncertain()")
+            .expect("failed outcome must mark the hub sticky uncertain");
+        assert!(awaited < settled && awaited < uncertain);
+    }
+
+    /// 形状守卫：`insert_violation` 只是 bookkeeping 记录（非授权输入），
+    /// 不取 source writer 栅栏——栅栏语义只属于 sod_policy source mutation。
+    #[test]
+    fn violation_insert_is_bookkeeping_without_source_guard() {
+        let source = include_str!("sod_repository.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let impl_block = production
+            .split("impl SodRepository for SqlxSodRepository")
+            .nth(1)
+            .expect("SqlxSodRepository impl must exist");
+        let body = impl_block
+            .split("async fn insert_violation(")
+            .nth(1)
+            .expect("insert_violation impl must exist");
+        let body = body.split("\n    async fn ").next().unwrap();
+        assert!(
+            !body.contains("begin_sod_policy_source_write()"),
+            "violation bookkeeping must not take the source writer guard"
+        );
+        assert!(body.contains("INSERT INTO sod_violation"));
     }
 }

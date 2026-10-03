@@ -8,6 +8,10 @@ license.workspace = true
 [features]
 e3-observability = []
 e4-observability = []
+# Redis 编译层退役 marker（default-off，零依赖）：由各 runtime 的 redis-compat
+# feature 传播。config 启动期集中校验用它区分"compat 旗标开启但二进制未编译
+# redis-compat"的 fail-closed 拒绝场景（redis-layer-retirement-20261002）。
+redis-compat = []
 
 [dependencies]
 astral-types = { path = "../astral-types" }

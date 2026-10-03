@@ -66,6 +66,7 @@ async fn run_probe_and_evaluate(state: &AppState) {
 async fn run_system_and_redis(state: &AppState) {
     let cycle_start = Instant::now();
     collect_system(state).await;
+    #[cfg(feature = "redis-compat")]
     collect_redis(state).await;
     metrics::histogram!("astral_monitor_collect_cycle_seconds", "kind" => "system")
         .record(cycle_start.elapsed().as_secs_f64());
@@ -166,8 +167,14 @@ async fn collect_system(state: &AppState) {
     }
 }
 
-/// 采集 Redis 指标（INFO memory/stats/clients + DBSIZE）。
+/// 采集 Redis 指标（INFO memory/stats/clients + DBSIZE；仅 redis-compat feature
+/// 编译）。**runtime 门**：feature 已编译但部署未显式启用 compat（旗标关闭或
+/// URL 为空）时不做任何 Redis 网络尝试——compat-on build + env off 仍零网络。
+#[cfg(feature = "redis-compat")]
 async fn collect_redis(state: &AppState) {
+    if !state.config.redis_projection_compat_enabled || state.config.redis_url.trim().is_empty() {
+        return;
+    }
     let redis_url = state.config.redis_url.clone();
     let client = match redis::Client::open(redis_url.as_str()) {
         Ok(client) => client,
@@ -255,6 +262,7 @@ async fn collect_redis(state: &AppState) {
 }
 
 /// 解析 `INFO` 输出中的 `key:value` 字段（整数值）。
+#[cfg(feature = "redis-compat")]
 fn parse_info_field(info: &str, key: &str) -> Option<i64> {
     info.lines()
         .find_map(|line| line.strip_prefix(&format!("{key}:")))

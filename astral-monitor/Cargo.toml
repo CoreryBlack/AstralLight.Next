@@ -9,6 +9,13 @@ license.workspace = true
 name = "astral-monitor"
 path = "src/main.rs"
 
+# Redis 编译层退役（redis-layer-retirement-20261002）：默认构建零 redis 编译
+# 链接；compat 旗标开启 + feature 缺失由 astral-common 启动期集中校验拒绝。
+# Redis 指标采集/健康探测的 compat 路径收敛到本显式 feature（default-off），
+# 并传播 astral-common 的同名 marker feature。
+[features]
+redis-compat = ["dep:redis", "astral-common/redis-compat"]
+
 [dependencies]
 astral-common = { path = "../astral-common" }
 astral-types = { path = "../astral-types" }
@@ -26,7 +33,7 @@ metrics-exporter-prometheus = { workspace = true }
 tower-http = { workspace = true }
 sqlx = { workspace = true }
 reqwest = { workspace = true }
-redis = { workspace = true }
+redis = { workspace = true, optional = true }
 sysinfo = { workspace = true }
 async-trait = "0.1"
 astral-db = { path = "../astral-db" }

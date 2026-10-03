@@ -36,6 +36,15 @@
 //! miss）；空授权仍写 metadata-only 合法命中；evidence `NotReady`/`Corrupt`
 //! 一律空结果 fail-closed，绝不写缓存。
 //!
+//! **Redis 退役（P3 拆线，本批次接缝）**：该 Cache-Aside 仅在
+//! `ASTRAL_REDIS_PROJECTION_COMPAT` 显式开启（`astral-common` compat adapter，
+//! default-off）时读写 Redis；默认路径直接走 evidence 读链（进程内 evidence
+//! 缓存 + 严格 reader 回源），键族与 envelope 形状原样保留（旧 pub API 不隐式
+//! 删除）。缓存键保持卡级 lens 超集契约：`(tenant_id, card_id)` 键控 +
+//! user/domain 由 engine 在 `effective_grants` 上二次收窄（tenant 隔离由键与
+//! reader 的租户戳校验双重承担，user/domain 收窄语义见
+//! `crate::evidence_cache` lens 契约），不存在跨租户/跨域命中面。
+//!
 //! 【上线灰度观察项】登录权限列表可能变宽：evidence 的生效集合包含
 //! APPROVAL / DELEGATION / SYSTEM 来源（旧读链只看卡规则快照 + 规则集快照，
 //! 看不到这些来源）。切换后属于授权面语义修复而非回归，但需关注登录权限
@@ -47,8 +56,10 @@ use astral_types::{
     BindingLayer, DomainScopeRequirement, GrantSourceKind, PublishedCardAuthorization,
     PublishedCardEvidenceScope,
 };
+#[cfg(feature = "redis-compat")]
 use redis::AsyncCommands;
 use sqlx::{MySqlPool, QueryBuilder};
+#[cfg(feature = "redis-compat")]
 use time::OffsetDateTime;
 
 use crate::authorization_projection_repository::AuthorizationEvidenceError;
@@ -81,6 +92,7 @@ fn parse_resource_type(resource_key: &str) -> String {
     }
 }
 
+#[cfg(feature = "redis-compat")]
 fn snapshot_window_is_active(
     valid_from_ts: Option<i64>,
     valid_to_ts: Option<i64>,
@@ -337,6 +349,7 @@ fn tenant_stamp_matches(left: Option<i64>, right: Option<i64>) -> bool {
 }
 
 /// 绑定引用行：`(rule_set_id, ref_tenant_id, rule_set_enabled, rule_set_tenant_id)`。
+#[cfg(feature = "redis-compat")]
 type RuleSetBindingRow = (i64, Option<i64>, Option<i8>, Option<i64>);
 
 /// 缓存信任门禁：绑定引用中不可信 rule set 的 id 清单（升序去重）。
@@ -345,6 +358,7 @@ type RuleSetBindingRow = (i64, Option<i64>, Option<i8>, Option<i64>);
 /// 不匹配、或引用租户戳与卡租户不匹配时该引用不可信。缓存载荷不携带
 /// per-grant 的 rule set 来源，存在任何不可信引用时必须整体拒绝缓存
 /// （对齐旧链 `rule_set_active` 缓存守卫），回退 evidence 读侧过滤。
+#[cfg(feature = "redis-compat")]
 async fn load_unsafe_rule_set_binding_ids(
     pool: &MySqlPool,
     card_id: i64,
@@ -381,6 +395,7 @@ async fn load_unsafe_rule_set_binding_ids(
 /// `enabled != 1`、引用租户戳与卡租户不匹配、或 rule set 租户戳与引用租户戳
 /// 不匹配，均视为不可信（对齐旧读链 SQL 的 `rs.enabled = 1` 与两级
 /// `tenant_id <=>` 纵深防御）。
+#[cfg(feature = "redis-compat")]
 fn rule_set_binding_is_unsafe(
     ref_tenant_id: Option<i64>,
     rule_set_enabled: Option<i8>,
@@ -675,7 +690,9 @@ pub fn permission_cache_key(card_id: i64, tenant_id: Option<i64>) -> String {
 ///
 /// 更早的 v2（head 三版本 + rule_set_versions）与 v3（无 cache_epoch）随历史
 /// 读链一并退役。
+#[cfg(feature = "redis-compat")]
 const EFFECTIVE_PERMISSION_CACHE_SCHEMA: i64 = 5;
+#[cfg(feature = "redis-compat")]
 const CACHE_METADATA_FIELD: &str = "__metadata";
 
 /// 卡作用域缓存栅栏快照：逐聚合指针版本组 + 卡级"存在撤权类未发布 delta"位。
@@ -718,6 +735,7 @@ pub struct PermissionCacheManifestVersion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg(feature = "redis-compat")]
 struct PermissionCacheEnvelope {
     schema_version: i64,
     /// 按 `(aggregate_type, aggregate_id)` 升序的版本组；任一聚合发布推进
@@ -734,6 +752,7 @@ struct PermissionCacheEnvelope {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg(feature = "redis-compat")]
 struct PermissionCacheEntry {
     #[serde(flatten)]
     envelope: PermissionCacheEnvelope,
@@ -949,6 +968,7 @@ pub async fn load_card_scope_fence_snapshot(
 /// 缓存版本兼容性：schema 一致、版本组与当前指针逐项完全匹配、卡作用域无
 /// 未发布 delta（pending 位一致）、且共享缓存时代一致（当前时代未知 = Redis
 /// 降级 → 跳过 epoch 子校验，其余栅栏照常）。
+#[cfg(feature = "redis-compat")]
 fn cache_envelope_is_compatible(
     envelope: &PermissionCacheEnvelope,
     snapshot: &CardScopeFenceSnapshot,
@@ -960,6 +980,7 @@ fn cache_envelope_is_compatible(
         && crate::cache_epoch::cache_epoch_matches(current_epoch, envelope.cache_epoch.as_deref())
 }
 
+#[cfg(feature = "redis-compat")]
 fn permission_cache_entry_is_readable(
     entry: &PermissionCacheEntry,
     metadata: &PermissionCacheEnvelope,
@@ -974,11 +995,21 @@ fn permission_cache_entry_is_readable(
 ///
 /// 读链语义（本批次起为 evidence 读链，替代旧 head/snapshot 读链）：
 /// - 租户缺失/非正 → 空 vec fail-closed（无法构造 evidence scope）；
-/// - 缓存信任门禁：绑定引用存在缺失/禁用/租户戳不匹配的 rule set 时拒绝
-///   信任缓存（载荷无 per-grant rule set 来源），直接走 evidence 读侧过滤；
+/// - **Redis-free 默认路径（P3 拆线）**：compat adapter 未显式开启时跳过
+///   Redis Cache-Aside（`perm:card:*`）——不建连、不读写、不加载缓存信任
+///   门禁（那是 Redis 载荷的按来源过滤防线），直接走 evidence 读链；
+///   进程内 evidence 缓存在 [`cached_load_published_card_grant_evidence`]
+///   内部，命中前提是"指针对牌"双读 + 共享时代，TTL 只是驻留上限（绝不以
+///   TTL alone 作为跨节点证明），miss 严格 reader 回源，失效通道 suspect 时
+///   存疑禁旧 evidence（`evidence_cache` 读取门）；
+/// - **compat adapter（显式开启）**：恢复旧 Redis hash 读/写与缓存信任门禁
+///   （读写仅 explicit enabled），其余栅栏语义不变；
+/// - 缓存信任门禁（compat 路径）：绑定引用存在缺失/禁用/租户戳不匹配的
+///   rule set 时拒绝信任缓存（载荷无 per-grant rule set 来源），直接走
+///   evidence 读侧过滤；
 /// - 缓存栅栏 = 当前指针版本组 + 卡作用域未发布 delta 位 + 共享缓存时代
 ///   （envelope v5）；任一聚合发布推进、source 提交未发布（撤销类越权窗口）
-///   或运维换时代即 miss；
+///   或换时代即 miss；
 /// - evidence `NotReady`/`Corrupt` → 空 vec fail-closed 且不写缓存；
 /// - Redis 不可用时回退 [`find_effective_permissions_from_snapshot`]（同源
 ///   evidence 派生，语义对齐）。
@@ -994,6 +1025,41 @@ pub async fn find_effective_permissions_cached(
         return Ok(Vec::new());
     };
 
+    // Redis-free 默认路径（compat 关闭）：键 `perm:card:*` 的读/写整体旁路，
+    // 直接走 evidence 读链（与 Redis 不可用时的回退路径同源同实现）。
+    if !crate::eligibility::redis_projection_compat_enabled() {
+        return Ok(
+            find_effective_permissions_for_tenant(pool, tenant_id, card_id)
+                .await?
+                .grants,
+        );
+    }
+
+    // redis-compat feature 未编译：compat 门为真的配置已被启动期集中校验拒绝
+    // （astral-common validate_runtime_safety）；此处兜底走同源 evidence 读链
+    // （与 Redis 不可用时的回退路径同实现），默认路径零 redis 类型编译。
+    #[cfg(feature = "redis-compat")]
+    {
+        find_effective_permissions_cached_compat(pool, card_id, tenant_id).await
+    }
+    #[cfg(not(feature = "redis-compat"))]
+    {
+        Ok(
+            find_effective_permissions_for_tenant(pool, tenant_id, card_id)
+                .await?
+                .grants,
+        )
+    }
+}
+
+/// compat 路径（仅 redis-compat feature 编译）：旧 Redis hash 读/写与缓存信任
+/// 门禁，语义与拆线前逐行一致（源码文本断言测试依赖 compat 门与本段的前后序）。
+#[cfg(feature = "redis-compat")]
+async fn find_effective_permissions_cached_compat(
+    pool: &MySqlPool,
+    card_id: i64,
+    tenant_id: i64,
+) -> Result<Vec<PermissionGrantRow>, DbError> {
     let Some(mut conn) = crate::eligibility::redis_conn().await else {
         return Ok(
             find_effective_permissions_for_tenant(pool, tenant_id, card_id)
@@ -1050,6 +1116,7 @@ pub async fn find_effective_permissions_cached(
 
 /// 读取权限缓存（key 不存在或版本组/pending 位/时代不匹配 → None；空授权是
 /// 合法命中）。
+#[cfg(feature = "redis-compat")]
 async fn read_permission_cache(
     conn: &mut redis::aio::ConnectionManager,
     key: &str,
@@ -1105,6 +1172,7 @@ async fn read_permission_cache(
 /// surface cannot be confused with a missing cache entry or bypass the fence.
 /// The envelope carries the current shared cache epoch so a post-restore
 /// epoch rotation invalidates every payload written before it.
+#[cfg(feature = "redis-compat")]
 async fn write_permission_cache(
     conn: &mut redis::aio::ConnectionManager,
     key: &str,
@@ -1158,6 +1226,7 @@ async fn write_permission_cache(
 }
 
 /// TTL jitter（0-59s，避免整点雪崩；不引入 rand 依赖）
+#[cfg(feature = "redis-compat")]
 fn jitter_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1184,6 +1253,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "redis-compat")]
     fn snapshot_window_boundaries_are_inclusive_and_expiry_is_fail_closed() {
         let now = 1_000;
         assert!(snapshot_window_is_active(None, None, now));
@@ -1527,6 +1597,7 @@ mod tests {
     // ===== 有效权限映射与缓存 envelope v4 纯测试（无 I/O）=====
 
     /// 测试夹具共享时代（读写两侧一致即为"当前时代"）。
+    #[cfg(feature = "redis-compat")]
     const CACHE_EPOCH_FIXTURE: &str = "epoch-fixture-1";
 
     fn published_grant_with_validity(
@@ -1659,6 +1730,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "redis-compat")]
     fn cache_envelope_v5_fences_on_any_aggregate_version_or_pending_change() {
         let evidence = published_evidence(vec![
             published_record(
@@ -1763,6 +1835,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "redis-compat")]
     fn cache_envelope_epoch_rotation_fences_known_epochs_only() {
         let baseline = CardScopeFenceSnapshot {
             manifest_versions: Vec::new(),
@@ -1796,6 +1869,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "redis-compat")]
     fn legacy_v3_v4_envelopes_miss_v5_read_side() {
         // v3 旧载荷（无 cache_epoch、无 card_source_pending）：v5 反序列化时
         // 缺必填字段直接失败 → 自动 miss 并被重写覆盖（根本进不了兼容判定）。
@@ -1840,6 +1914,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "redis-compat")]
     fn cache_entry_validity_is_fail_closed_and_boundary_inclusive() {
         let metadata = PermissionCacheEnvelope {
             schema_version: EFFECTIVE_PERMISSION_CACHE_SCHEMA,
@@ -1880,6 +1955,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "redis-compat")]
     fn rule_set_binding_safety_is_null_safe_and_fail_closed() {
         // MySQL NULL 安全等值（<=>）的 Rust 语义
         assert!(tenant_stamp_matches(None, None));
@@ -1953,5 +2029,34 @@ mod tests {
         assert!(!PENDING_DELTA_PROBE_SQL.contains("p.card_id = authorization_delta_event"));
         // 轻探针必须非锁定（严格 reader 的锁定纪律不适用于缓存命中路径）。
         assert!(!PENDING_DELTA_PROBE_SQL.contains("FOR UPDATE"));
+    }
+
+    /// 源码形状守卫（P3 Redis 拆线）：Cache-Aside 的 Redis 读/写必须被
+    /// compat 门（default-off）包住——默认路径在 `redis_conn` 之前整体旁路，
+    /// 直接走 evidence 读链；防止后续重构把 Redis hash 读写重新无条件装配。
+    #[test]
+    fn redis_cache_aside_is_gated_by_the_compat_flag_before_any_connection() {
+        let source = include_str!("permission_query.rs");
+        let entry = source
+            .split("pub async fn find_effective_permissions_cached")
+            .nth(1)
+            .expect("find_effective_permissions_cached must exist");
+        // compat 门必须先于连接获取（redis_conn）与信任门禁/栅栏读。
+        let gate_pos = entry
+            .find("redis_projection_compat_enabled()")
+            .expect("compat gate must be present in find_effective_permissions_cached");
+        let conn_pos = entry
+            .find("redis_conn()")
+            .expect("redis_conn call must remain on the compat path");
+        assert!(
+            gate_pos < conn_pos,
+            "compat gate must short-circuit before any Redis connection attempt"
+        );
+        // 默认分支必须直接回 evidence 读链（find_effective_permissions_for_tenant）。
+        let default_branch = &entry[gate_pos..conn_pos];
+        assert!(
+            default_branch.contains("find_effective_permissions_for_tenant"),
+            "compat-disabled path must go straight to the evidence read chain"
+        );
     }
 }

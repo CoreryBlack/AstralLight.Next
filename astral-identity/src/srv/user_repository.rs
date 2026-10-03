@@ -6,8 +6,9 @@
 use async_trait::async_trait;
 use sqlx::MySqlPool;
 
-use astral_db::{append_eligibility_events_for_cards_in_tx, EligibilityCardSelector};
 use astral_types::{AstralError, UserCard};
+
+use crate::srv::source_writer_guard;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UserListRecord {
@@ -150,24 +151,32 @@ impl UserRepository for SqlxUserRepository {
         // free of projection work; the status-bearing path below owns the
         // source mutation and ELIGIBILITY fanout transaction.
         if status.is_none() {
-            sqlx::query(
-                "UPDATE platform_user SET \
-                 display_name = COALESCE(?, display_name), \
-                 email = COALESCE(?, email), \
-                 phone = COALESCE(?, phone), \
-                 updated_at = UTC_TIMESTAMP() \
-                 WHERE user_id = ? AND deleted_at IS NULL",
+            let guard = source_writer_guard::begin_source_write()?;
+            source_writer_guard::fenced_source_write(
+                guard,
+                sqlx::query(
+                    "UPDATE platform_user SET \
+                     display_name = COALESCE(?, display_name), \
+                     email = COALESCE(?, email), \
+                     phone = COALESCE(?, phone), \
+                     updated_at = UTC_TIMESTAMP() \
+                     WHERE user_id = ? AND deleted_at IS NULL",
+                )
+                .bind(display_name.map(str::trim))
+                .bind(email.map(str::trim))
+                .bind(phone.map(str::trim))
+                .bind(user_id)
+                .execute(&self.db),
             )
-            .bind(display_name.map(str::trim))
-            .bind(email.map(str::trim))
-            .bind(phone.map(str::trim))
-            .bind(user_id)
-            .execute(&self.db)
             .await
             .map_err(|e| AstralError::Database(format!("Update user profile failed: {e}")))?;
             return Ok(());
         }
 
+        // 状态变更 source 事务的 hub writer 栅栏：begin 前取得（hub 已装则必须
+        // 可得，不可得即拒绝写入），COMMIT await 前武装，commit 证明成功后
+        // proven 释放；pre-commit 错误（已知回滚）随 Drop 干净释放。
+        let source_guard = source_writer_guard::begin_source_write()?;
         let mut tx = self
             .db
             .begin()
@@ -178,6 +187,16 @@ impl UserRepository for SqlxUserRepository {
             return Ok(());
         };
         let emit_eligibility = status_change_requires_eligibility_event(&previous_status, status);
+
+        // ELIGIBILITY 扇出 cap+1 预检（仅锁读，零 mutation）：与共享 helper 的
+        // ByUserId 选择器同谓词（FOR UPDATE），锁序保持 platform_user →
+        // user_card 不变；超限在任何 source mutation 之前 fail-closed 拒绝。
+        let eligibility_cards = if emit_eligibility {
+            Some(source_writer_guard::scan_user_eligibility_cards_in_tx(&mut tx, user_id).await?)
+        } else {
+            None
+        };
+        let mut receipts: Vec<source_writer_guard::UserInvalidationReceipt> = Vec::new();
 
         sqlx::query(
             "UPDATE platform_user SET \
@@ -197,20 +216,41 @@ impl UserRepository for SqlxUserRepository {
         .await
         .map_err(|e| AstralError::Database(format!("Update user failed: {e}")))?;
 
-        if emit_eligibility {
-            append_eligibility_events_for_cards_in_tx(
+        if let Some(cards) = eligibility_cards {
+            // per-card ELIGIBILITY 事件 + typed invalidation intent 成对落库
+            //（同一 envelope 实例；head/outbox 为 durable 事实，al_message_outbox
+            // PENDING 行为跨节点通知的 relay 恢复路径），取代无界的共享批量
+            // helper 调用。
+            let requested = status.map(str::trim).unwrap_or(previous_status.as_str());
+            let operation_id =
+                source_writer_guard::user_status_operation_id(user_id, &previous_status, requested);
+            source_writer_guard::append_user_eligibility_with_invalidation_in_tx(
                 &mut tx,
-                EligibilityCardSelector::ByUserId { user_id },
+                user_id,
+                &operation_id,
+                cards,
+                &mut receipts,
             )
             .await?;
         }
-        tx.commit()
-            .await
+
+        // COMMIT await 前武装取消栅栏；commit 证明成功 → proven + LocalBus 直投
+        // receipts（总 5s 预算），unknown/失败 → sticky uncertain + 零投递。
+        source_writer_guard::arm_commit_fence(&source_guard);
+        let commit_result = tx.commit().await;
+        let proven_receipts =
+            source_writer_guard::receipts_for_proven_commit(&mut receipts, &commit_result);
+        source_writer_guard::settle_commit_fence(&source_guard, commit_result.is_ok());
+        commit_result
             .map_err(|e| AstralError::Database(format!("Commit update user tx failed: {e}")))?;
+        drop(source_guard);
+        source_writer_guard::dispatch_proven_user_invalidation_receipts(proven_receipts).await;
         Ok(())
     }
 
     async fn update_user_status(&self, user_id: i64, status: &str) -> Result<(), AstralError> {
+        // 状态变更 source 事务的 hub writer 栅栏（同 update_user 状态路径）。
+        let source_guard = source_writer_guard::begin_source_write()?;
         let mut tx = self.db.begin().await.map_err(|e| {
             AstralError::Database(format!("Begin update user status tx failed: {e}"))
         })?;
@@ -221,6 +261,14 @@ impl UserRepository for SqlxUserRepository {
         let requested_status = status.trim();
         let status_changed = previous_status != requested_status;
 
+        // ELIGIBILITY 扇出 cap+1 预检：超限在任何 source mutation 之前拒绝。
+        let eligibility_cards = if status_changed {
+            Some(source_writer_guard::scan_user_eligibility_cards_in_tx(&mut tx, user_id).await?)
+        } else {
+            None
+        };
+        let mut receipts: Vec<source_writer_guard::UserInvalidationReceipt> = Vec::new();
+
         sqlx::query(
             "UPDATE platform_user SET status = ?, updated_at = UTC_TIMESTAMP() \
              WHERE user_id = ? AND deleted_at IS NULL",
@@ -230,20 +278,39 @@ impl UserRepository for SqlxUserRepository {
         .execute(&mut *tx)
         .await
         .map_err(|e| AstralError::Database(format!("Update user status failed: {e}")))?;
-        if status_changed {
-            append_eligibility_events_for_cards_in_tx(
+        if let Some(cards) = eligibility_cards {
+            // per-card ELIGIBILITY 事件 + typed invalidation intent 成对落库。
+            let operation_id = source_writer_guard::user_status_operation_id(
+                user_id,
+                &previous_status,
+                requested_status,
+            );
+            source_writer_guard::append_user_eligibility_with_invalidation_in_tx(
                 &mut tx,
-                EligibilityCardSelector::ByUserId { user_id },
+                user_id,
+                &operation_id,
+                cards,
+                &mut receipts,
             )
             .await?;
         }
-        tx.commit().await.map_err(|e| {
+
+        source_writer_guard::arm_commit_fence(&source_guard);
+        let commit_result = tx.commit().await;
+        let proven_receipts =
+            source_writer_guard::receipts_for_proven_commit(&mut receipts, &commit_result);
+        source_writer_guard::settle_commit_fence(&source_guard, commit_result.is_ok());
+        commit_result.map_err(|e| {
             AstralError::Database(format!("Commit update user status tx failed: {e}"))
         })?;
+        drop(source_guard);
+        source_writer_guard::dispatch_proven_user_invalidation_receipts(proven_receipts).await;
         Ok(())
     }
 
     async fn soft_delete_user(&self, user_id: i64) -> Result<(), AstralError> {
+        // 软删除 source 事务的 hub writer 栅栏（同 update_user 状态路径）。
+        let source_guard = source_writer_guard::begin_source_write()?;
         let mut tx =
             self.db.begin().await.map_err(|e| {
                 AstralError::Database(format!("Begin soft delete user tx failed: {e}"))
@@ -253,6 +320,11 @@ impl UserRepository for SqlxUserRepository {
             return Ok(());
         }
 
+        // ELIGIBILITY 扇出 cap+1 预检：超限在任何 source mutation 之前拒绝。
+        let eligibility_cards =
+            Some(source_writer_guard::scan_user_eligibility_cards_in_tx(&mut tx, user_id).await?);
+        let mut receipts: Vec<source_writer_guard::UserInvalidationReceipt> = Vec::new();
+
         sqlx::query(
             "UPDATE platform_user SET deleted_at = CURRENT_TIMESTAMP \
              WHERE user_id = ? AND deleted_at IS NULL",
@@ -261,14 +333,29 @@ impl UserRepository for SqlxUserRepository {
         .execute(&mut *tx)
         .await
         .map_err(|e| AstralError::Database(format!("Soft delete user failed: {e}")))?;
-        append_eligibility_events_for_cards_in_tx(
-            &mut tx,
-            EligibilityCardSelector::ByUserId { user_id },
-        )
-        .await?;
-        tx.commit().await.map_err(|e| {
+        if let Some(cards) = eligibility_cards {
+            // per-card ELIGIBILITY 事件 + typed invalidation intent 成对落库。
+            let operation_id = source_writer_guard::user_delete_operation_id(user_id);
+            source_writer_guard::append_user_eligibility_with_invalidation_in_tx(
+                &mut tx,
+                user_id,
+                &operation_id,
+                cards,
+                &mut receipts,
+            )
+            .await?;
+        }
+
+        source_writer_guard::arm_commit_fence(&source_guard);
+        let commit_result = tx.commit().await;
+        let proven_receipts =
+            source_writer_guard::receipts_for_proven_commit(&mut receipts, &commit_result);
+        source_writer_guard::settle_commit_fence(&source_guard, commit_result.is_ok());
+        commit_result.map_err(|e| {
             AstralError::Database(format!("Commit soft delete user tx failed: {e}"))
         })?;
+        drop(source_guard);
+        source_writer_guard::dispatch_proven_user_invalidation_receipts(proven_receipts).await;
         Ok(())
     }
 
@@ -335,5 +422,111 @@ mod tests {
         assert!(soft_delete_requires_eligibility_event(Some("ACTIVE")));
         assert!(soft_delete_requires_eligibility_event(Some("DISABLED")));
         assert!(!soft_delete_requires_eligibility_event(None));
+    }
+
+    /// 五链形状回归（源形状，无 IO）：三个 user 状态事务都必须——
+    /// 1. begin 前取得 source writer 栅栏；
+    /// 2. ELIGIBILITY cap+1 扫描（含 receipts 配对落库）在任何 platform_user
+    ///    状态 UPDATE 之前完成（超限零 mutation fail-closed）；
+    /// 3. COMMIT await 前武装取消栅栏，proven 后投递 receipts。
+    #[test]
+    fn user_status_transactions_fence_scan_before_update_and_dispatch_after_proven_commit() {
+        let source = include_str!("user_repository.rs");
+        // 先切到 impl 块：trait 里也有同名方法声明，find 必须跳过 trait。
+        let impl_source = &source[source
+            .find("impl UserRepository for SqlxUserRepository")
+            .expect("UserRepository impl must stay in user_repository.rs")..];
+
+        let update_body = impl_source
+            .split("async fn update_user(")
+            .nth(1)
+            .unwrap()
+            .split("async fn update_user_status(")
+            .next()
+            .unwrap();
+        assert!(
+            update_body
+                .find("let source_guard = source_writer_guard::begin_source_write()")
+                .expect("status path must hold the hub source writer guard")
+                // 多行方法链：self\n .db\n .begin()
+                < update_body.find(".begin()").expect("status path must open its transaction"),
+            "the hub source writer guard must be acquired before the transaction"
+        );
+        assert!(
+            update_body
+                .find("scan_user_eligibility_cards_in_tx")
+                .unwrap()
+                < update_body
+                    .find("status = COALESCE(?, status)")
+                    .expect("status-bearing UPDATE must stay in update_user"),
+            "the cap+1 eligibility scan must reject before any source mutation"
+        );
+        assert!(
+            update_body
+                .find("append_user_eligibility_with_invalidation_in_tx")
+                .unwrap()
+                < update_body.find("arm_commit_fence").unwrap()
+                && update_body.find("arm_commit_fence").unwrap()
+                    < update_body.find("tx.commit()").unwrap(),
+            "typed intents are appended in-tx and the commit await is armed"
+        );
+        assert!(
+            update_body.find("receipts_for_proven_commit").unwrap()
+                < update_body
+                    .find("dispatch_proven_user_invalidation_receipts")
+                    .unwrap(),
+            "receipts dispatch strictly follows the proven-commit gate"
+        );
+
+        let status_body = impl_source
+            .split("async fn update_user_status(")
+            .nth(1)
+            .unwrap()
+            .split("async fn soft_delete_user(")
+            .next()
+            .unwrap();
+        assert!(
+            status_body
+                .find("let source_guard = source_writer_guard::begin_source_write()")
+                .expect("update_user_status must hold the guard")
+                < status_body.find(".begin()").unwrap()
+                && status_body
+                    .find("scan_user_eligibility_cards_in_tx")
+                    .unwrap()
+                    < status_body
+                        .find("UPDATE platform_user SET status = ?")
+                        .expect("status UPDATE must stay in update_user_status"),
+            "update_user_status must fence, cap-scan, then mutate"
+        );
+
+        let delete_body = impl_source
+            .split("async fn soft_delete_user(")
+            .nth(1)
+            .unwrap()
+            .split("async fn list_user_cards(")
+            .next()
+            .unwrap();
+        assert!(
+            delete_body
+                .find("let source_guard = source_writer_guard::begin_source_write()")
+                .expect("soft_delete_user must hold the guard")
+                < delete_body.find(".begin()").unwrap()
+                && delete_body
+                    .find("scan_user_eligibility_cards_in_tx")
+                    .unwrap()
+                    < delete_body
+                        .find("UPDATE platform_user SET deleted_at")
+                        .expect("soft delete UPDATE must stay in soft_delete_user"),
+            "soft_delete_user must fence, cap-scan, then mutate"
+        );
+
+        // 三个事务都不再调用（曾经无界的）共享批量 helper：其调用被成对 per-card
+        // 落库取代（cap+1 扫描 + ELIGIBILITY 事件 + typed intent 同事务成对）。
+        // needle 由片段拼出，避免本测试源码自匹配。
+        let bulk_helper = format!("append_eligibility_events_for_{}", "cards_in_tx");
+        assert!(
+            !source.contains(&bulk_helper),
+            "user txs must use the bounded paired per-card append, not the bulk helper"
+        );
     }
 }

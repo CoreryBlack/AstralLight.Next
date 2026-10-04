@@ -98,6 +98,21 @@ const LEGACY_SNAPSHOT_REQUIRED_DRAIN_TABLES: &[&str] = &["authorization_projecti
 /// 20260903000001_delta_claim_grant_chain_index.sql.
 const DELTA_CLAIM_GRANT_CHAIN_INDEX_VERSION: i64 = 20260903000001;
 const DELTA_EVENT_PUBLISHED_EVIDENCE_INVALIDATION_VERSION: i64 = 20260914000001;
+const REDUNDANT_ARCHIVE_INDEX_REMOVAL_VERSION: i64 = 20261004000001;
+const REDUNDANT_ARCHIVE_INDEX_REMOVAL_SQL_SHA384: &str =
+    "931864ec1052fda01a6a1ec59a4986b9e37644f193602b1277b4a3eae89cbcbe041a20af58844d426cd55ced754868b1";
+const POST_CREATOR_INDEX_REMOVALS: &[(i64, &str, &str)] = &[
+    (
+        REDUNDANT_ARCHIVE_INDEX_REMOVAL_VERSION,
+        "authorization_impact_plan",
+        "idx_aip_aggregate",
+    ),
+    (
+        REDUNDANT_ARCHIVE_INDEX_REMOVAL_VERSION,
+        "authorization_projection_manifest",
+        "idx_apm_aggregate",
+    ),
+];
 
 /// Indexes appended to creator tables by LATER additive Rust migrations.
 ///
@@ -129,29 +144,72 @@ async fn recorded_post_creator_index_versions(
     Ok(POST_CREATOR_INDEX_ADDITIONS
         .iter()
         .map(|(version, _, _, _, _)| *version)
+        .chain(
+            POST_CREATOR_INDEX_REMOVALS
+                .iter()
+                .map(|(version, _, _)| *version),
+        )
         .filter(|version| recorded.contains(version))
         .collect())
 }
 
-/// Exact-shape index contract for one archive table: creator indexes plus
-/// every post-creator addition whose defining migration is already recorded.
+/// Resolve creator indexes against recorded additions/removals. A pending
+/// removal accepts only the exact old index or its absence after partial DDL.
 async fn incremental_projection_resolved_index_contract(
     pool: &MySqlPool,
     table: &str,
 ) -> Result<Vec<(&'static str, &'static str, &'static [&'static str], bool)>, MigrationError> {
-    let mut resolved: Vec<(&'static str, &'static str, &'static [&'static str], bool)> =
-        INCREMENTAL_PROJECTION_ARCHIVE_INDEXES
-            .iter()
-            .filter(|(index_table, _, _, _)| *index_table == table)
-            .copied()
-            .collect();
     let recorded = recorded_post_creator_index_versions(pool).await?;
-    for (version, index_table, index, columns, unique) in POST_CREATOR_INDEX_ADDITIONS {
-        if index_table == &table && recorded.contains(version) {
-            resolved.push((index_table, index, columns, *unique));
+    let migration = MIGRATOR
+        .migrations
+        .iter()
+        .find(|migration| migration.version == REDUNDANT_ARCHIVE_INDEX_REMOVAL_VERSION)
+        .filter(|migration| exact_migration_artifact_contract(migration).is_some())
+        .ok_or_else(|| {
+            MigrationError::Failed(
+                "redundant archive index removal artifact is missing or unverified".to_owned(),
+            )
+        })?;
+    let mut present_removals = HashSet::new();
+    if !recorded.contains(&migration.version) {
+        for (_, index_table, index) in POST_CREATOR_INDEX_REMOVALS {
+            if *index_table == table && schema_index_exists(pool, table, index).await? {
+                present_removals.insert(*index);
+            }
         }
     }
-    Ok(resolved)
+    Ok(resolve_archive_index_contract(
+        table,
+        &recorded,
+        &present_removals,
+    ))
+}
+
+fn resolve_archive_index_contract(
+    table: &str,
+    recorded: &HashSet<i64>,
+    present_removals: &HashSet<&str>,
+) -> Vec<(&'static str, &'static str, &'static [&'static str], bool)> {
+    let mut resolved: Vec<_> = INCREMENTAL_PROJECTION_ARCHIVE_INDEXES
+        .iter()
+        .filter(|(index_table, index, _, _)| {
+            *index_table == table
+                && !POST_CREATOR_INDEX_REMOVALS.iter().any(
+                    |(version, removal_table, removal_index)| {
+                        removal_table == index_table
+                            && removal_index == index
+                            && (recorded.contains(version) || !present_removals.contains(index))
+                    },
+                )
+        })
+        .copied()
+        .collect();
+    for (version, index_table, index, columns, unique) in POST_CREATOR_INDEX_ADDITIONS {
+        if *index_table == table && recorded.contains(version) {
+            resolved.push((*index_table, *index, *columns, *unique));
+        }
+    }
+    resolved
 }
 const CROSS_CITY_SCHEMA_SQL_SHA384: &str =
     "9d6b15dae4cf03ed45bfd2d342ef2a7238ff78a1bbc56e788c4f1cca8639a1659af3e12db6dc9b64e203a9996ef24f22";
@@ -4054,6 +4112,7 @@ async fn apply_migrations_with_mysql8_compat(pool: &MySqlPool) -> Result<(), Mig
         .run(pool)
         .await
         .map_err(|e| MigrationError::Failed(format!("migrate: {e}")))?;
+    validate_archive_index_removal_postcondition(pool).await?;
 
     // SQLx records a successful migration before returning. This idempotent
     // data backfill therefore runs on every explicit migration invocation,
@@ -4626,11 +4685,7 @@ async fn validate_incremental_projection_archive_table_contract(
         .filter(|expected| expected.table == table)
         .copied()
         .collect();
-    let indexes: Vec<(&str, &str, &[&str], bool)> = INCREMENTAL_PROJECTION_ARCHIVE_INDEXES
-        .iter()
-        .filter(|(index_table, _, _, _)| *index_table == table)
-        .copied()
-        .collect();
+    let indexes = incremental_projection_resolved_index_contract(pool, table).await?;
     if columns.is_empty() || indexes.is_empty() {
         return Err(MigrationError::Failed(format!(
             "incremental projection archive contract has no complete definition for table {table}"
@@ -4668,17 +4723,7 @@ async fn validate_incremental_projection_archive_table_contract(
         )
         .await?;
     }
-    // Exact-shape check over the RESOLVED contract: creator indexes plus every
-    // post-creator addition (e.g. the 10.D-2 claim-gate support index) whose
-    // defining migration is durably recorded — additions stay tolerated while
-    // pending and become required once recorded. Any extra/drifted index on
-    // the live table still fails closed.
-    if !schema_indexes_match(
-        pool,
-        &incremental_projection_resolved_index_contract(pool, table).await?,
-    )
-    .await?
-    {
+    if !schema_indexes_match(pool, &indexes).await? {
         return Err(MigrationError::Failed(format!(
             "incremental projection archive table {table} has incompatible index shape or unexpected indexes; refusing automatic ALTER/DROP"
         )));
@@ -4868,6 +4913,19 @@ async fn preflight_incremental_projection_archive_schema_contract(
                 INCREMENTAL_PROJECTION_ARCHIVE_VERSION
             ))
         })?;
+    let removal_migration = migrations.iter()
+        .find(|migration| migration.version == REDUNDANT_ARCHIVE_INDEX_REMOVAL_VERSION)
+        .filter(|migration| exact_migration_artifact_contract(migration).is_some())
+        .ok_or_else(|| MigrationError::Failed("redundant archive index removal migration is missing or unverified in the execution plan".to_owned()))?;
+    if applied_versions.contains(&removal_migration.version)
+        && !recorded_post_creator_index_versions(pool)
+            .await?
+            .contains(&removal_migration.version)
+    {
+        return Err(MigrationError::Failed(
+            "redundant archive index removal history disagrees with the execution plan".to_owned(),
+        ));
+    }
     let migration_pending = !applied_versions.contains(&INCREMENTAL_PROJECTION_ARCHIVE_VERSION);
     let lineage_recorded = authorization_projection_lineage_fence_recorded(pool).await?;
     let invalidation_recorded = delta_event_published_evidence_invalidation_recorded(pool).await?;
@@ -4981,6 +5039,29 @@ async fn preflight_incremental_projection_archive_schema_contract(
         }
     }
     Ok(complete)
+}
+
+async fn validate_archive_index_removal_postcondition(
+    pool: &MySqlPool,
+) -> Result<(), MigrationError> {
+    let recorded = recorded_post_creator_index_versions(pool).await?;
+    if !recorded.contains(&REDUNDANT_ARCHIVE_INDEX_REMOVAL_VERSION) {
+        return Err(MigrationError::RecoveryRequired {
+            reason:
+                "redundant archive index removal has no successful history row after SQLx execution"
+                    .to_owned(),
+        });
+    }
+    for (_, table, _) in POST_CREATOR_INDEX_REMOVALS {
+        validate_incremental_projection_archive_table_contract(pool, table, None, None)
+            .await
+            .map_err(|error| MigrationError::RecoveryRequired {
+                reason: format!(
+                    "redundant archive index removal postcondition failed for {table}: {error}"
+                ),
+            })?;
+    }
+    Ok(())
 }
 
 async fn validate_cross_city_table_contract(
@@ -9952,6 +10033,14 @@ const CROSS_CITY_SCHEMA_COLUMN_CONTRACTS: &[SchemaColumnContract] = &[
 
 const EXACT_MIGRATION_ARTIFACT_CONTRACTS: &[ExactMigrationArtifactContract] = &[
     ExactMigrationArtifactContract {
+        version: REDUNDANT_ARCHIVE_INDEX_REMOVAL_VERSION,
+        source_sha384: REDUNDANT_ARCHIVE_INDEX_REMOVAL_SQL_SHA384,
+        supports_existing_artifacts: true,
+        tables: &[],
+        columns: &[],
+        indexes: &[],
+    },
+    ExactMigrationArtifactContract {
         version: RUST_RUNTIME_SCHEMA_VERSION,
         source_sha384: RUST_RUNTIME_SCHEMA_SQL_SHA384,
         supports_existing_artifacts: false,
@@ -12721,28 +12810,32 @@ async fn schema_indexes_match(
                 ))
             })
             .collect::<Result<_, MigrationError>>()?;
-        let mut actual = actual;
-        actual.sort();
-        let mut expected_rows = Vec::new();
-        for (_table_name, index, columns, unique) in expected
-            .iter()
-            .filter(|(table_name, _, _, _)| *table_name == table)
-        {
-            for (position, column) in columns.iter().enumerate() {
-                expected_rows.push((
-                    (*index).to_owned(),
-                    !*unique,
-                    position as u64 + 1,
-                    (*column).to_owned(),
-                ));
-            }
-        }
-        expected_rows.sort();
-        if actual != expected_rows {
+        if !schema_index_rows_match(table, actual, expected) {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+fn schema_index_rows_match(
+    table: &str,
+    mut actual: Vec<(String, bool, u64, String)>,
+    expected: &[(&str, &str, &[&str], bool)],
+) -> bool {
+    actual.sort();
+    let mut expected_rows = Vec::new();
+    for (_, index, columns, unique) in expected.iter().filter(|(owner, _, _, _)| *owner == table) {
+        for (position, column) in columns.iter().enumerate() {
+            expected_rows.push((
+                (*index).to_owned(),
+                !*unique,
+                position as u64 + 1,
+                (*column).to_owned(),
+            ));
+        }
+    }
+    expected_rows.sort();
+    actual == expected_rows
 }
 
 async fn schema_foreign_keys_match(

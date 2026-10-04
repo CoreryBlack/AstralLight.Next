@@ -230,6 +230,56 @@ fn seeded_mirror(grant: &CanonicalGrant) -> ScopePlanMirror {
 }
 
 #[test]
+fn shared_ledger_reads_reuse_storage_and_keep_old_snapshots_immutable() {
+    let mirror = seeded_mirror(&canonical_grant(1, GrantState::Active));
+    let key = ScopeKey::of(&identity());
+    let original = mirror.ledger(&key).unwrap();
+    let next_read = mirror.ledger(&key).unwrap();
+    assert!(Arc::ptr_eq(&original, &next_read));
+    let claimed = claimed_for("evt-2", 2);
+    let revision_2 = canonical_grant(2, GrantState::Active);
+    let request = dispatch_request_for(&claimed, &revision_2);
+    assert_eq!(
+        mirror.upsert_claimed_row(&request, &claimed),
+        super::MirrorRowProvenance::Upserted
+    );
+    let extended = mirror.ledger(&key).unwrap();
+    assert!(!Arc::ptr_eq(&original, &extended));
+    assert_eq!(original.len(), 1);
+    assert_eq!(extended.len(), 2);
+    mirror.advance(&claimed, &publish_outcome(published_state(&revision_2)));
+    assert_eq!(original.len(), 1);
+    assert_eq!(extended[1].revision_no, 2);
+    assert_eq!(mirror.ledger(&key).unwrap().len(), 2);
+}
+
+#[test]
+#[ignore = "local CPU-only ledger sharing performance probe"]
+fn shared_ledger_performance_probe() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    for size in [128, 512, 2_048] {
+        let mirror = seeded_mirror(&canonical_grant(1, GrantState::Active));
+        let row = ledger_row_for(&canonical_grant(1, GrantState::Active), "evt-1", 1);
+        mirror.note_ledger(&identity(), vec![row; size]);
+        let key = ScopeKey::of(&identity());
+        let shared = mirror.ledger(&key).unwrap();
+        let start = Instant::now();
+        for _ in 0..100 {
+            black_box((*shared).clone());
+        }
+        let owned_ns = start.elapsed().as_nanos();
+        let start = Instant::now();
+        for _ in 0..100 {
+            black_box(mirror.ledger(&key).unwrap());
+        }
+        let shared_ns = start.elapsed().as_nanos();
+        eprintln!("ledger_reads size={size} reads=100 owned_ns={owned_ns} shared_ns={shared_ns}");
+    }
+}
+
+#[test]
 fn proven_publish_advances_frontier_and_ledger() {
     let revision_1 = canonical_grant(1, GrantState::Active);
     let mirror = seeded_mirror(&revision_1);

@@ -26,6 +26,10 @@ use crate::grant_repository::{
     validate_delta_fence_relation, DeltaEventAppendRequest, DeltaEventType,
 };
 
+mod assembly_cache;
+
+use assembly_cache::{AssemblyCache, AssemblyStamp};
+
 static GLOBAL_MEMORY_PROJECTION_HUB: OnceLock<MemoryProjectionHub> = OnceLock::new();
 
 /// 安装进程级内存镜像中心（单机组合进程启动期调用一次；重复安装返回 false）。
@@ -785,6 +789,7 @@ impl RefillCoordinator {
 pub struct MemoryProjectionHub {
     maps: Arc<RwLock<HubMaps>>,
     refills: Arc<RefillCoordinator>,
+    assemblies: Arc<AssemblyCache>,
 }
 
 /// 内存读面结果：`Serve` = 与 durable 一致的已验证证据；`DeferToDurable` =
@@ -1764,6 +1769,19 @@ impl MemoryProjectionHub {
 
     /// 内存读面入口：pending 拦截面复刻 `FRESHNESS_GATE_PROBE`；命中即回退。
     pub fn try_memory_evidence(&self, scope: &PublishedCardEvidenceScope) -> MemoryEvidenceOutcome {
+        self.try_memory_evidence_with_clock(
+            scope,
+            || OffsetDateTime::now_utc().unix_timestamp(),
+            || {},
+        )
+    }
+
+    fn try_memory_evidence_with_clock(
+        &self,
+        scope: &PublishedCardEvidenceScope,
+        read_clock: impl FnOnce() -> i64,
+        before_recheck: impl FnOnce(),
+    ) -> MemoryEvidenceOutcome {
         if scope.validate().is_err() {
             return MemoryEvidenceOutcome::DeferToDurable;
         }
@@ -1807,13 +1825,23 @@ impl MemoryProjectionHub {
             }
             (ReadToken::for_scope(&maps, scope), states)
         };
-        let now_unix_seconds = OffsetDateTime::now_utc().unix_timestamp();
-        let state_refs: Vec<_> = states.iter().map(Arc::as_ref).collect();
-        let evidence = match assemble_published_card_evidence(scope, now_unix_seconds, &state_refs)
-        {
-            Ok(evidence) => evidence,
-            Err(_) => return MemoryEvidenceOutcome::DeferToDurable,
+        let now_unix_seconds = read_clock();
+        let stamp = AssemblyStamp::new(token, now_unix_seconds, &states);
+        let cached = self.assemblies.get(scope, &stamp, Instant::now());
+        let cache_hit = cached.is_some();
+        let evidence = match cached {
+            Some(evidence) => (*evidence).clone(),
+            None => match assemble_published_card_evidence(scope, now_unix_seconds, &states) {
+                Ok(evidence) => evidence,
+                Err(_) => return MemoryEvidenceOutcome::DeferToDurable,
+            },
         };
+        let refill = if !cache_hit && AssemblyCache::can_store(&stamp, &evidence) {
+            Some(Arc::new(evidence.clone()))
+        } else {
+            None
+        };
+        before_recheck();
         let Ok(maps) = self.maps.read() else {
             return MemoryEvidenceOutcome::DeferToDurable;
         };
@@ -1825,6 +1853,10 @@ impl MemoryProjectionHub {
             || channel_blocks(&maps.channel, Instant::now())
         {
             return MemoryEvidenceOutcome::DeferToDurable;
+        }
+        drop(maps);
+        if let Some(refill) = refill {
+            self.assemblies.insert(scope, stamp, refill, Instant::now());
         }
         MemoryEvidenceOutcome::Serve(evidence)
     }
@@ -2043,6 +2075,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod assembly_cache;
+
     use super::*;
     use astral_types::{
         BindingLayer, CanonicalGrant, DependencyVector, DependencyVersion, DomainScopeRequirement,

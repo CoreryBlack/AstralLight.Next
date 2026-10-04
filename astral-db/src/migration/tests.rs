@@ -1,5 +1,7 @@
 use super::*;
 
+mod archive_indexes;
+
 fn normalize_schema_source_default_contracts() -> bool {
     [
         (Some("unix_timestamp()"), Some("(UNIX_TIMESTAMP())")),
@@ -2061,8 +2063,8 @@ fn record_verified_baseline_is_default_deny_for_post_baseline_migrations() {
             .iter()
             .map(|migration| migration.version)
             .max(),
-        Some(LEARN_SYSTEM_ASSIGNMENT_VERSION),
-        "the Learn system-assignment migration is the current chain tail"
+        Some(REDUNDANT_ARCHIVE_INDEX_REMOVAL_VERSION),
+        "the redundant archive index removal migration is the current chain tail"
     );
     assert!(!is_java_baseline_era(CROSS_CITY_RUNTIME_PROOF_VERSION));
     assert!(!is_java_baseline_era(RUNTIME_REDIS_FREE_TAIL_VERSION));

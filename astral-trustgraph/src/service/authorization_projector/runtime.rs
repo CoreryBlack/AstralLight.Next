@@ -2,6 +2,8 @@
 //! MySQL 环境下单测；生产实现 `SqlxAuthorizationProjectorRuntime` 直连
 //! astral-db durable 原语，提交后镜像安装与 L2 推送保持既有顺序。
 
+use std::sync::Arc;
+
 use super::{reconcile_lease_mutation_loss, CLAIM_LEASE_SECS};
 
 use async_trait::async_trait;
@@ -152,6 +154,20 @@ pub trait AuthorizationProjectorRuntime: Send + Sync + 'static {
         aggregate_id: i64,
         card_id: Option<i64>,
     ) -> Result<Vec<RawLedgerRow>, RuntimeAccessError>;
+
+    /// Share an immutable complete ledger when the adapter has one. The default
+    /// preserves the existing owned-read contract and all repository failures.
+    async fn load_scope_ledger_shared(
+        &self,
+        tenant_id: i64,
+        aggregate_type: &str,
+        aggregate_id: i64,
+        card_id: Option<i64>,
+    ) -> Result<Arc<Vec<RawLedgerRow>>, RuntimeAccessError> {
+        self.load_scope_ledger(tenant_id, aggregate_type, aggregate_id, card_id)
+            .await
+            .map(Arc::new)
+    }
 
     /// Execute the fixed publish sequence and commit. A statement failure rolls
     /// back; commit errors require reconciliation, and local-mirror failure may

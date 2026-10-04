@@ -4,6 +4,9 @@
 //! EventDisposition 与发布计划；不做 I/O、不改租约、不发布。worker 执行见
 //! 主 worker 区块，durable 边界见 [`super::runtime`]。
 
+mod parent_ordinals;
+
+use parent_ordinals::ParentOrdinalLookup;
 use sha2::{Digest, Sha256};
 
 use astral_db::{
@@ -585,43 +588,21 @@ pub(crate) fn assemble_continuation_candidate(
     }
 }
 
-/// Derive the stage segment plan from the candidate hot state.
+/// Derive the stage segment plan using exact payload digests and unused parent ordinals.
 ///
-/// With `Some(parent references)` a candidate segment whose canonical payload
-/// digest equals an UNUSED parent reference digest reuses that exact ordinal:
-/// matching is digest-based (never positional inference) and content-safe, and
-/// the staging transaction still re-verifies the referenced row under lock.
-/// Without references — today's production reality, see module-gap notes —
-/// every entry is [`StagedSegmentContent::New`]: identical payloads dedupe onto
-/// the same content-addressed segment row, nothing is deleted or rewritten.
+/// Reference priority and candidate iteration order are preserved. The staging
+/// transaction re-verifies every reused reference under lock.
 pub(crate) fn plan_stage_segments(
     candidate: &HotState,
     parent_references: Option<&[(u64, ParentReferenceView)]>,
 ) -> Result<Vec<StagedSegmentContent>, String> {
-    let mut plan: Vec<StagedSegmentContent> = Vec::with_capacity(candidate.segments.len());
+    let mut plan = Vec::with_capacity(candidate.segments.len());
+    let mut lookup = ParentOrdinalLookup::new(parent_references.unwrap_or_default());
     for (_key, segment) in candidate.segments.iter() {
         let payload = astral_db::encode_segment_payload(&segment.grants)
             .map_err(|error| format!("code=auth_projector.segment_encode_failed;error={error}"))?;
         let digest_hex = hex_lower(&Sha256::digest(&payload));
-        let mut reused: Option<u64> = None;
-        if let Some(references) = parent_references {
-            for (ordinal, view) in references {
-                if view.content_digest_hex != digest_hex {
-                    continue;
-                }
-                let ordinal_claimed = plan.iter().any(|entry| match entry {
-                    StagedSegmentContent::ReuseParent { parent_ordinal } => {
-                        parent_ordinal == ordinal
-                    }
-                    StagedSegmentContent::New(_) => false,
-                });
-                if !ordinal_claimed {
-                    reused = Some(*ordinal);
-                    break;
-                }
-            }
-        }
-        match reused {
+        match lookup.take(&digest_hex) {
             Some(parent_ordinal) => plan.push(StagedSegmentContent::ReuseParent { parent_ordinal }),
             None => plan.push(StagedSegmentContent::New(
                 segment.grants.as_slice().to_vec(),

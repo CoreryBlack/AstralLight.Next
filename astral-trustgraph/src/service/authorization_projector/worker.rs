@@ -1275,7 +1275,7 @@ pub(crate) async fn process_verified_claim(
         // Phase 3: load the complete scope ledger (read-only).
         let ledger_started = Instant::now();
         let ledger_rows = match runtime
-            .load_scope_ledger(
+            .load_scope_ledger_shared(
                 claimed.tenant_id,
                 &claimed.aggregate_type,
                 claimed.aggregate_id,

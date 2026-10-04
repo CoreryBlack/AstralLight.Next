@@ -776,6 +776,66 @@ async fn stage_planning_reuses_only_exact_content_matched_unused_ordinals() {
     )));
 }
 
+fn legacy_stage_plan(
+    candidate: &HotState,
+    references: &[(u64, ParentReferenceView)],
+) -> Vec<StagedSegmentContent> {
+    let mut plan = Vec::new();
+    for (_, segment) in candidate.segments.iter() {
+        let payload = astral_db::encode_segment_payload(&segment.grants).unwrap();
+        let digest = hex_lower(&Sha256::digest(&payload));
+        let reused = references.iter().find_map(|(ordinal, view)| {
+            if view.content_digest_hex == digest
+                && !plan.iter().any(|entry| {
+                    matches!(entry, StagedSegmentContent::ReuseParent { parent_ordinal } if parent_ordinal == ordinal)
+                })
+            {
+                Some(*ordinal)
+            } else {
+                None
+            }
+        });
+        plan.push(match reused {
+            Some(parent_ordinal) => StagedSegmentContent::ReuseParent { parent_ordinal },
+            None => StagedSegmentContent::New(segment.grants.clone()),
+        });
+    }
+    plan
+}
+
+#[test]
+fn stage_planning_matches_legacy_output_for_mixed_references() {
+    for size in [1_u16, 8, 128, 512] {
+        let grants: Vec<_> = (0..size)
+            .map(|id| {
+                let mut grant = grant(id, 1, GrantState::Active);
+                grant.resource = format!("learn_subject:{id}");
+                grant
+            })
+            .collect();
+        let candidate =
+            HotState::from_grants(tenant_of(17), 4, grants, DependencyVector::default()).unwrap();
+        let mut references = vec![parent_view(
+            99_999,
+            &hex_lower(&Sha256::digest(b"unrelated")),
+        )];
+        for (index, (_, segment)) in candidate.segments.iter().enumerate() {
+            let digest = hex_lower(&Sha256::digest(
+                astral_db::encode_segment_payload(&segment.grants).unwrap(),
+            ));
+            let ordinal = (size as usize - index) as u64;
+            references.push(parent_view(ordinal % 7, &digest));
+            references.push(parent_view(ordinal % 7, &digest));
+            references.push(parent_view(ordinal + 10, &digest));
+        }
+        references.reverse();
+        assert_eq!(
+            plan_stage_segments(&candidate, Some(&references)).unwrap(),
+            legacy_stage_plan(&candidate, &references),
+        );
+    }
+}
+
 // ── Publish-failure taxonomy ─────────────────────────────────────────────
 
 /// Typed construction helper: the projection rejection as the runtime seam
@@ -1222,6 +1282,10 @@ fn worker_source_has_no_legacy_channel_symbols() {
     let runtime_source = include_str!("../authorization_projector/runtime.rs");
     let worker_source = include_str!("../authorization_projector/worker.rs");
     let planning_source = include_str!("../authorization_projector/planning.rs");
+    let ordinal_source = production_source_slice(include_str!(
+        "../authorization_projector/planning/parent_ordinals.rs"
+    ));
+    assert!(ordinal_source.contains("fn take("));
     let production = production_source_slice(main_source);
     // The cut must land exactly on the single test-section marker: no
     // cfg(test)/test-mod text may survive into the scanned production half.
@@ -1262,6 +1326,7 @@ fn worker_source_has_no_legacy_channel_symbols() {
         ("runtime.rs", runtime_source),
         ("worker.rs", worker_source),
         ("planning.rs", planning_source),
+        ("parent_ordinals.rs", ordinal_source),
     ] {
         assert_no_legacy_channel_symbols(source, name);
     }
@@ -3414,6 +3479,27 @@ impl AuthorizationProjectorRuntime for ReplanHarness {
         self.calls.lock().unwrap().push("mark");
         unreachable!("replan tests do not enter quarantine")
     }
+}
+
+#[tokio::test]
+async fn shared_ledger_default_preserves_the_owned_runtime_contract() {
+    let harness = ReplanHarness::new([]);
+    let owned = harness
+        .load_scope_ledger(7, "CARD", 17, Some(17))
+        .await
+        .unwrap();
+    let shared = harness
+        .load_scope_ledger_shared(7, "CARD", 17, Some(17))
+        .await
+        .unwrap();
+    assert_eq!(owned.len(), shared.len());
+    for (owned, shared) in owned.iter().zip(shared.iter()) {
+        assert_eq!(owned.grant_payload, shared.grant_payload);
+        assert_eq!(owned.semantic_hash, shared.semantic_hash);
+        assert_eq!(owned.event_id, shared.event_id);
+        assert_eq!(owned.revision_no, shared.revision_no);
+    }
+    assert_eq!(harness.calls(), ["ledger", "ledger"]);
 }
 
 async fn run_replan_test(

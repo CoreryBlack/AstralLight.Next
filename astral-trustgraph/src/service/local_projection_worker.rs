@@ -395,7 +395,7 @@ struct ScopeMirror {
     /// Strict cold-read publication world (or its memory-advanced successor).
     publication: PublicationContext,
     /// Strict cold-read scope ledger (or its proven-successor extension).
-    ledger_rows: Vec<RawLedgerRow>,
+    ledger_rows: Arc<Vec<RawLedgerRow>>,
 }
 
 /// Provenance result of the claim-time ledger upsert.
@@ -439,10 +439,28 @@ struct ScopePlanMirror {
 }
 
 impl ScopePlanMirror {
-    fn get(&self, key: &ScopeKey) -> Option<(PublicationContext, Vec<RawLedgerRow>)> {
+    fn get(&self, key: &ScopeKey) -> Option<(PublicationContext, Arc<Vec<RawLedgerRow>>)> {
         let inner = self.inner.lock().ok()?;
         let scope = inner.scopes.get(key)?;
-        Some((scope.publication.clone(), scope.ledger_rows.clone()))
+        Some((scope.publication.clone(), Arc::clone(&scope.ledger_rows)))
+    }
+
+    fn publication(&self, key: &ScopeKey) -> Option<PublicationContext> {
+        self.inner
+            .lock()
+            .ok()?
+            .scopes
+            .get(key)
+            .map(|scope| scope.publication.clone())
+    }
+
+    fn ledger(&self, key: &ScopeKey) -> Option<Arc<Vec<RawLedgerRow>>> {
+        self.inner
+            .lock()
+            .ok()?
+            .scopes
+            .get(key)
+            .map(|scope| Arc::clone(&scope.ledger_rows))
     }
 
     /// Record the strict cold-read publication world. Seeding completes only
@@ -469,7 +487,12 @@ impl ScopePlanMirror {
 
     /// Record the strict cold-read scope ledger; completes the seed when the
     /// publication half is pending.
-    fn note_ledger(&self, identity: &ProjectionAggregateIdentity, ledger_rows: Vec<RawLedgerRow>) {
+    fn note_ledger(
+        &self,
+        identity: &ProjectionAggregateIdentity,
+        ledger_rows: impl Into<Arc<Vec<RawLedgerRow>>>,
+    ) {
+        let ledger_rows = ledger_rows.into();
         if ledger_rows.len() > MIRROR_MAX_LEDGER_ROWS_PER_SCOPE {
             // Oversized scope: refuse to mirror (stay strict) instead of
             // storing an unbounded copy.
@@ -582,12 +605,13 @@ impl ScopePlanMirror {
                 };
             }
         };
-        match ledger_rows
+        let rows = Arc::make_mut(&mut ledger_rows);
+        match rows
             .iter_mut()
             .find(|row| row.event_id == ledger_row.event_id)
         {
             Some(slot) => *slot = ledger_row,
-            None => insert_ledger_row_sorted(&mut ledger_rows, ledger_row),
+            None => insert_ledger_row_sorted(rows, ledger_row),
         }
 
         // ── Frontier assembly from the verified published state ──
@@ -676,7 +700,7 @@ impl ScopePlanMirror {
             Ok(identity) => identity,
             Err(_) => return false,
         };
-        let Some((_, ledger_rows)) = self.get(&ScopeKey::of(&identity)) else {
+        let Some(ledger_rows) = self.ledger(&ScopeKey::of(&identity)) else {
             // No mirror entry: the caller will strict-read and seed fresh,
             // which includes this event's row by construction.
             return true;
@@ -722,7 +746,7 @@ impl ScopePlanMirror {
             Ok(identity) => identity,
             Err(_) => return MirrorRowProvenance::StrictFallback,
         };
-        let Some((_, mut ledger_rows)) = self.get(&ScopeKey::of(&identity)) else {
+        let Some(mut ledger_rows) = self.ledger(&ScopeKey::of(&identity)) else {
             // No mirror scope: strict seeding will include this row.
             return MirrorRowProvenance::AlreadyPresent;
         };
@@ -769,7 +793,7 @@ impl ScopePlanMirror {
                 return MirrorRowProvenance::StrictFallback;
             }
         };
-        insert_ledger_row_sorted(&mut ledger_rows, row);
+        insert_ledger_row_sorted(Arc::make_mut(&mut ledger_rows), row);
         if ledger_rows.len() > MIRROR_MAX_LEDGER_ROWS_PER_SCOPE {
             self.poison(&identity);
             return MirrorRowProvenance::StrictFallback;
@@ -1035,7 +1059,7 @@ impl AuthorizationProjectorRuntime for LocalProjectionRuntime {
         &self,
         identity: &ProjectionAggregateIdentity,
     ) -> Result<Option<PublicationContext>, RuntimeAccessError> {
-        if let Some((publication, _)) = self.mirror.get(&ScopeKey::of(identity)) {
+        if let Some(publication) = self.mirror.publication(&ScopeKey::of(identity)) {
             return Ok(Some(publication));
         }
         let observed = self.inner.observe_publication_context(identity).await?;
@@ -1052,16 +1076,29 @@ impl AuthorizationProjectorRuntime for LocalProjectionRuntime {
         aggregate_id: i64,
         card_id: Option<i64>,
     ) -> Result<Vec<RawLedgerRow>, RuntimeAccessError> {
+        self.load_scope_ledger_shared(tenant_id, aggregate_type, aggregate_id, card_id)
+            .await
+            .map(|rows| (*rows).clone())
+    }
+
+    async fn load_scope_ledger_shared(
+        &self,
+        tenant_id: i64,
+        aggregate_type: &str,
+        aggregate_id: i64,
+        card_id: Option<i64>,
+    ) -> Result<Arc<Vec<RawLedgerRow>>, RuntimeAccessError> {
         let identity =
             ProjectionAggregateIdentity::new(tenant_id, aggregate_type.to_owned(), aggregate_id)?;
-        if let Some((_, ledger_rows)) = self.mirror.get(&ScopeKey::of(&identity)) {
+        if let Some(ledger_rows) = self.mirror.ledger(&ScopeKey::of(&identity)) {
             return Ok(ledger_rows);
         }
-        let rows = self
-            .inner
-            .load_scope_ledger(tenant_id, aggregate_type, aggregate_id, card_id)
-            .await?;
-        self.mirror.note_ledger(&identity, rows.clone());
+        let rows = Arc::new(
+            self.inner
+                .load_scope_ledger(tenant_id, aggregate_type, aggregate_id, card_id)
+                .await?,
+        );
+        self.mirror.note_ledger(&identity, Arc::clone(&rows));
         Ok(rows)
     }
 

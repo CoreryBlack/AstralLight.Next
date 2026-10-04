@@ -776,6 +776,9 @@ async fn stage_planning_reuses_only_exact_content_matched_unused_ordinals() {
     )));
 }
 
+#[path = "performance.rs"]
+mod performance;
+
 fn legacy_stage_plan(
     candidate: &HotState,
     references: &[(u64, ParentReferenceView)],

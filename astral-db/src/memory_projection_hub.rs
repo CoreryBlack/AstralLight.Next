@@ -2076,6 +2076,7 @@ where
 #[cfg(test)]
 mod tests {
     mod assembly_cache;
+    mod performance;
 
     use super::*;
     use astral_types::{

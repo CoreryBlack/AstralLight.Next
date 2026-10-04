@@ -38,6 +38,9 @@ impl<'a> ParentOrdinalLookup<'a> {
 
 #[cfg(test)]
 mod tests {
+    mod performance {
+        include!("parent_ordinals/performance.rs");
+    }
     use super::*;
     use astral_db::ProjectionAggregateIdentity;
 

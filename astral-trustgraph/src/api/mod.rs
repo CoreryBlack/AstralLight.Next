@@ -235,6 +235,7 @@ pub mod cross_org_grants;
 pub mod delegation;
 pub mod departments;
 pub mod inheritance;
+pub(crate) mod integrations;
 pub mod org_authorities;
 pub mod permission_check;
 pub mod personal_permissions;

@@ -2063,9 +2063,14 @@ fn record_verified_baseline_is_default_deny_for_post_baseline_migrations() {
             .iter()
             .map(|migration| migration.version)
             .max(),
-        Some(REDUNDANT_ARCHIVE_INDEX_REMOVAL_VERSION),
-        "the redundant archive index removal migration is the current chain tail"
+        Some(20261005000001),
+        "the SDK identity mapping migration is the current chain tail"
     );
+    assert!(!is_java_baseline_era(20261005000001));
+    assert!(MIGRATOR
+        .migrations
+        .iter()
+        .any(|m| m.version == REDUNDANT_ARCHIVE_INDEX_REMOVAL_VERSION));
     assert!(!is_java_baseline_era(CROSS_CITY_RUNTIME_PROOF_VERSION));
     assert!(!is_java_baseline_era(RUNTIME_REDIS_FREE_TAIL_VERSION));
     assert!(

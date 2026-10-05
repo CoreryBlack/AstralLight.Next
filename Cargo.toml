@@ -12,10 +12,13 @@ members = [
     "astral-monitor",
     "astral-single-node",
     "e2e-bootstrap",
+    "astral-sdk-contracts",
+    "astral-sdk",
+    "astral-sdk-axum",
 ]
 # Redis 缓存归档库保留源码，使用自包含 manifest；不参与默认 workspace。
 # 需要归档验证时从 astral-cache/Cargo.toml 单独执行。
-exclude = ["astral-learn", "astral-chat", "astral-cache"]
+exclude = ["astral-learn", "astral-chat", "astral-cache", "integrations"]
 resolver = "2"
 
 [workspace.package]

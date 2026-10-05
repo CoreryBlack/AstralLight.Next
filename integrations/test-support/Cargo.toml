@@ -1,0 +1,14 @@
+[package]
+name = "astral-sdk-test-support"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+astral-sdk = { workspace = true }
+astral-sdk-contracts = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+ed25519-dalek = { workspace = true }

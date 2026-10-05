@@ -423,6 +423,15 @@ where
         .list_registry()
         .await?;
     load_registry_rows(&registry_rows)?;
+    let integration_config =
+        crate::service::integration_authorization::IntegrationConfig::from_env()
+            .map_err(anyhow::Error::msg)?;
+    if integration_config.is_some() {
+        astral_db::validate_integration_mapping_schema(&db).await?;
+        astral_db::validate_auth_internal_request_guard_schema(&db)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
     register_audit_db_writer(Arc::new(TrustGraphAuditDbWriter { pool: db.clone() }));
 
     // ORG_SCOPE enabled 模式的运行期 schema + allowlist coverage 门（只读）：
@@ -1137,8 +1146,21 @@ where
         api::permission_check::permission_check_middleware,
     ));
 
+    let integration_routes: Router<AppState> = match integration_config {
+        Some(config) => api::integrations::routes(Arc::new(
+            crate::service::integration_authorization::IntegrationAuthorizationService {
+                db: state.db.clone(),
+                engine: state.engine.clone(),
+                config,
+                org_scope_enabled: state.org_scope_enabled,
+            },
+        ))
+        .with_state(()),
+        None => Router::new(),
+    };
     let app = Router::new()
         .nest("/main/api/v1", api_routes)
+        .merge(integration_routes)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             gateway_signature_middleware,

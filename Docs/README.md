@@ -24,6 +24,11 @@ This directory contains documentation selected for the standalone Rust backend r
 - [Rule and ruleset semantics](架构/Rust架构设计/Rust权限判定与规则集语义_V1.0.md)
 - [Arbiter and GlobalAdmin governance](架构/Rust架构设计/RustArbiter与GlobalAdmin治理链_V1.0.md)
 
+## SDK Integration
+
+- [SDK 接入 V1](SDK接入V1.md): independent SDK, mandatory identity mapping, registered application scope, and Chat/Learn contract samples. Not a production cutover acceptance record.
+- [SDK V1 实施证据](SDK接入V1_实施证据.md): five-chain review, isolated verification commands, ignored tests and acceptance limits.
+
 ## Migration and Operations
 
 - [Migration index](迁移/README.md)

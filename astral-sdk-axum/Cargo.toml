@@ -1,0 +1,25 @@
+[package]
+name = "astral-sdk-axum"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Axum helpers for bounded authorization manifest declarations"
+
+[dependencies]
+astral-sdk = { path = "../astral-sdk" }
+astral-sdk-contracts = { path = "../astral-sdk-contracts" }
+axum = "0.8.9"
+base64 = "0.22.1"
+ed25519-dalek = "2.2.0"
+getrandom = "0.3.4"
+thiserror = "2.0.20"
+uuid = { version = "1.24.0", features = ["v4"] }
+http = "1.5.0"
+tokio = { version = "1.53.1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5.3", features = ["util"] }
+http = "1.5.0"
+url = "2.5.8"
+serde = { version = "1.0.229", features = ["derive"] }

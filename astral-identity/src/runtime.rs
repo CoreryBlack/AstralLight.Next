@@ -7,6 +7,8 @@
 pub mod api;
 #[path = "auth.rs"]
 pub mod auth;
+#[path = "integration_mappings.rs"]
+mod integration_mappings;
 #[path = "middleware.rs"]
 pub mod middleware;
 #[path = "srv/mod.rs"]
@@ -388,7 +390,12 @@ where
     // 因此必须在任何可能触发租户资格变更的路径之前完成。
     srv::org_repository::install_origin_region(config.region_id.clone())
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let identity_mapping_enabled =
+        integration_mappings::enabled_from_env().map_err(anyhow::Error::msg)?;
     let db = connect_and_validate_schema(&config.database_url).await?;
+    if identity_mapping_enabled {
+        astral_db::validate_integration_mapping_schema(&db).await?;
+    }
     // Redis 兼容 adapter（default-off）：仅当显式开启 compat 旗标时连接
     // （失败即启动失败，显式配置的 adapter 不允许静默降级）；默认 Redis-free
     // 路径完全不连接 Redis，登录/refresh/switch 以 MySQL durable proof 为准。
@@ -558,9 +565,15 @@ where
     );
 
     let internal_routes = Router::new().merge(srv::internal::internal_routes());
+    let identity_mapping_routes = if identity_mapping_enabled {
+        integration_mappings::routes()
+    } else {
+        Router::new()
+    };
 
     // 将所有 /api/v1/auth 路由合并到子路由，应用权限检查中间件
     let auth_routes = Router::new()
+        .merge(identity_mapping_routes)
         .merge(api::auth_routes())
         .merge(srv::users::user_routes())
         .merge(srv::cards::card_routes())

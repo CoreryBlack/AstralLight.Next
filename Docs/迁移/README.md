@@ -2,6 +2,7 @@
 
 本目录仅保留 Rust 后端迁移、schema、ORG_SCOPE 和验证边界相关资料。
 
+- [SDK 身份映射迁移与恢复](SDK身份映射迁移与恢复_V1.0.md)
 - [Rust 后端迁移架构决策](Rust后端迁移架构决策_V1.0.md)
 - [ORG_SCOPE 迁移与回滚操作手册](ORG_SCOPE迁移与回滚操作手册_V0.1.md)
 - [Rust/Java 等价适配状态](Rust迁移Java等价适配状态_2026-08-05.md)

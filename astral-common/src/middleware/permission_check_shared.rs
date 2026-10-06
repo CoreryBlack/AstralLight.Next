@@ -203,13 +203,15 @@ pub fn resolve_permission_action(resource: &str, path: &str, method: &str) -> Op
     }
 
     if resource == "authorization"
-        && method == "POST"
-        && [
-            "/global-admins/grant",
-            "/global-admins/enable",
-            "/global-admins/disable",
-        ]
-        .contains(&path)
+        && ((method == "POST"
+            && [
+                "/global-admins/grant",
+                "/global-admins/enable",
+                "/global-admins/disable",
+                "/integrations/identity-mappings",
+            ]
+            .contains(&path))
+            || (method == "PUT" && path == "/integrations/identity-mappings/status"))
     {
         return Some("update");
     }
@@ -483,6 +485,18 @@ mod tests {
             ("authorization", "/global-admins/grant", "POST", "update"),
             ("authorization", "/global-admins/enable", "POST", "update"),
             ("authorization", "/global-admins/disable", "POST", "update"),
+            (
+                "authorization",
+                "/integrations/identity-mappings",
+                "POST",
+                "update",
+            ),
+            (
+                "authorization",
+                "/integrations/identity-mappings/status",
+                "PUT",
+                "update",
+            ),
             (
                 "permission_inheritance",
                 "/inheritance/config",

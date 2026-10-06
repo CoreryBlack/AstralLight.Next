@@ -35,9 +35,11 @@ pub(crate) fn validate_canonical_grant_effect(effect: &str) -> Result<String, As
     }
 }
 
+pub(crate) mod admission_checks;
 pub mod approval_service;
 pub mod arbiter;
 pub mod audit_replay_worker;
+pub(crate) mod integration_authorization;
 // 新 Rust-owned 版本化授权投影 durable worker（20260825000002/20260827000001 新表
 // 队列的唯一消费者；旧 projection_worker 的 legacy outbox 职责保持不变，互不越界）。
 pub mod authorization_projector;

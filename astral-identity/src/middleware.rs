@@ -22,6 +22,7 @@ use astral_db::{
 use crate::AppState;
 
 pub const IDENTITY_PATH_MAP: PathResourceMap = &[
+    ("/integrations/identity-mappings", "authorization"),
     // 此中间件挂载在 `/api/v1/auth` 路由下，收到的是剥离前缀后的路径。
     ("/sessions", "identity_users"),
     ("/sessions/refresh", "identity_users"),

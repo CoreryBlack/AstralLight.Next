@@ -48,6 +48,14 @@ use crate::rate_limit::rate_limit_middleware;
 /// 不能用未约束的 wildcard 把 Identity 未注册的路径一并代理出去。
 fn identity_user_routes() -> Router<AppConfig> {
     Router::new()
+        .route(
+            "/api/v1/auth/integrations/identity-mappings",
+            any(proxy::forward_to_identity_static),
+        )
+        .route(
+            "/api/v1/auth/integrations/identity-mappings/status",
+            any(proxy::forward_to_identity_static),
+        )
         .route("/api/v1/auth/users", any(proxy::forward_to_identity_static))
         .route(
             "/api/v1/auth/users/{id}",
@@ -466,6 +474,8 @@ mod tests {
             "/api/v1/auth/users/7/status",
             "/api/v1/auth/users/7/cards",
             "/api/v1/auth/users/7/password",
+            "/api/v1/auth/integrations/identity-mappings",
+            "/api/v1/auth/integrations/identity-mappings/status",
         ];
 
         for path in canonical_paths {
@@ -493,6 +503,8 @@ mod tests {
             "/api/v1/users",
             "/api/v1/users/7",
             "/api/v1/auth/users/7/unknown",
+            "/integrations/identity-mappings",
+            "/api/v1/auth/integrations/identity-mappings/unknown",
         ] {
             let response = app
                 .clone()

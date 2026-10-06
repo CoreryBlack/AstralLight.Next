@@ -24,9 +24,7 @@ use astral_common::middleware::permission_check_shared::{
     BoxedResponse,
 };
 use astral_db::{
-    check_sod_conflict_with_context, check_sod_conflict_with_context_and_org,
-    load_org_sod_admission_mirrored, resolve_resource_ownership,
-    CachedPublishedEvidenceRuleRepository, SqlxRuleRepository,
+    resolve_resource_ownership, CachedPublishedEvidenceRuleRepository, SqlxRuleRepository,
 };
 use astral_types::AstralError;
 
@@ -392,7 +390,6 @@ async fn permission_check_middleware_scoped(
     let user_id = ctx.user_id;
     let card_id = ctx.card_id;
     let tenant_id = ctx.tenant_id;
-    let resource_owner_id = ctx.resource_owner_id;
 
     // 进程内 evidence 缓存包装（装配侧接线）：load_published_card_authorization
     // 走"指针对牌 + epoch + 时钟重验"命中协议，miss/漂移回源严格 reader；
@@ -530,19 +527,8 @@ async fn permission_check_middleware_scoped(
     // deny-only 入口（warm 态同样零 DB；durable 回退与旧路径同语义）。
     if let Some(so_card_id) = card_id {
         let sod_started = Instant::now();
-        let sod_result = match load_org_sod_admission_mirrored(&state.db, &ctx, &decision).await {
-            Ok(Some(admission)) => {
-                check_sod_conflict_with_context_and_org(
-                    &state.db,
-                    &ctx,
-                    &admission,
-                    resource_owner_id,
-                )
-                .await
-            }
-            Ok(None) => check_sod_conflict_with_context(&state.db, &ctx, resource_owner_id).await,
-            Err(error) => Err(error),
-        };
+        let sod_result =
+            crate::service::admission_checks::check_sod(&state.db, &ctx, &decision).await;
         match sod_result {
             Ok(result) if result.has_conflict => {
                 record_sod_check(SodCheckOutcome::Conflict, sod_started.elapsed());
@@ -1024,29 +1010,36 @@ mod tests {
         let ownership = production
             .find("resolve_resource_ownership(")
             .expect("ownership resolution must exist after the fence capture");
-        let loader = production
-            .find("load_org_sod_admission_mirrored(&state.db, &ctx, &decision)")
-            .expect("org dispatch must assemble admission via the mirrored context-aware helper");
-        let with_org = production
+        let helper = include_str!("../service/admission_checks.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production helper");
+        let dispatch = production
+            .find("admission_checks::check_sod(&state.db, &ctx, &decision)")
+            .expect("host must use the shared deny-only SoD checks");
+        let loader = helper
+            .find("load_org_sod_admission_mirrored(db, ctx, decision)")
+            .expect("shared helper must assemble fresh org admission");
+        let with_org = helper
             .find("check_sod_conflict_with_context_and_org(")
-            .expect("org admission must recheck via the canonical context-aware and_org entry");
-        let plain = production
-            .find("check_sod_conflict_with_context(&state.db, &ctx, resource_owner_id)")
-            .expect("non-org decisions must keep the context-aware deny-only SoD check");
+            .expect("org admission must use canonical context-aware SoD");
+        let plain = helper
+            .find("check_sod_conflict_with_context(db, ctx, ctx.resource_owner_id)")
+            .expect("plain branch must retain deny-only SoD");
         let fence_recheck = production
             .find("authority_fence_matches")
             .expect("host must recheck the admission fence before admitting");
         assert!(
-            fence_capture < ownership,
-            "the fence must be captured before ANY authority read (ownership resolution included)"
+            fence_capture < ownership && ownership < dispatch,
+            "the fence must be captured before ownership and shared admission"
         );
         assert!(
-            ownership < loader && loader < with_org && with_org < plain,
-            "dispatch order must be ownership -> mirrored loader -> with_org -> context-aware plain"
+            loader < with_org && with_org < plain,
+            "shared helper order must remain loader -> with_org -> plain"
         );
         assert!(
-            plain < fence_recheck,
-            "the fence recheck must run after the whole SoD window, before admission"
+            dispatch < fence_recheck,
+            "the fence recheck must run after the shared SoD window"
         );
         // hub 已安装而栅栏不可得（capture None）→ 立即 503 fail-closed。
         assert!(

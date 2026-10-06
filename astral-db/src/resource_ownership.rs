@@ -683,6 +683,18 @@ fn global_access_requirement(
 ) -> Option<GlobalAccessRequirement> {
     use GlobalAccessRequirement::{ActiveGlobalAdmin, PolicyEvidence};
 
+    // Integration identity administration is platform control-plane work; its
+    // handlers add mapping CAS and mutation audit after the strict engine gate.
+    if resource == "authorization"
+        && matches!(
+            (path, method),
+            ("/integrations/identity-mappings", "POST")
+                | ("/integrations/identity-mappings/status", "PUT")
+        )
+    {
+        return Some(ActiveGlobalAdmin);
+    }
+
     // Self-service/static utilities have no tenant-owned target. Their handlers
     // independently bind any subject to the signed caller (or return fixed
     // metadata), while strict evidence from the active card remains required.
@@ -1709,6 +1721,19 @@ mod tests {
 
     #[test]
     fn global_route_access_contracts_are_exact() {
+        for (path, method) in [
+            ("/integrations/identity-mappings", "POST"),
+            ("/integrations/identity-mappings/status", "PUT"),
+        ] {
+            assert_eq!(
+                global_access_requirement("authorization", path, method, None),
+                Some(GlobalAccessRequirement::ActiveGlobalAdmin)
+            );
+            assert_eq!(
+                global_access_requirement("chat_message", path, method, None),
+                None
+            );
+        }
         assert_eq!(
             global_access_requirement("permission_rule", "/rule-sets", "GET", None),
             Some(GlobalAccessRequirement::ActiveGlobalAdmin)

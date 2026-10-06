@@ -44,6 +44,7 @@ mod eligibility;
 pub mod evidence_cache;
 pub mod grant_ledger;
 mod grant_repository;
+mod integration_identity_mapping;
 pub mod invalidation_inbox_repository;
 pub mod local_message_repository;
 pub mod local_projection_bus;
@@ -80,6 +81,15 @@ pub use cross_city_transport_repository::*;
 pub use eligibility::*;
 pub use evidence_cache::*;
 pub use grant_repository::*;
+pub use integration_identity_mapping::{
+    create_integration_identity_mapping, read_integration_identity_mapping,
+    record_integration_admission_audit, set_integration_identity_mapping_status,
+    validate_integration_mapping_schema, CreateIntegrationIdentityMapping,
+    IntegrationAdmissionAudit, IntegrationIdentityKey, IntegrationIdentityMapping,
+    IntegrationIdentityMappingError, IntegrationIdentityMappingStatus,
+    SetIntegrationIdentityMappingStatus, MAX_INTEGRATION_IDENTITY_APP_ID_BYTES,
+    MAX_INTEGRATION_IDENTITY_COMPONENT_BYTES, MAX_INTEGRATION_IDENTITY_OPERATION_ID_BYTES,
+};
 pub use invalidation_inbox_repository::*;
 pub use local_message_repository::*;
 pub use local_projection_bus::{

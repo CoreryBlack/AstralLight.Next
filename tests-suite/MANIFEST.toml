@@ -70,8 +70,9 @@ owner_crate = "astral-db"
 path = "astral-db/tests/evidence_cache_redis_integration.rs"
 kind = "integration-ignored"
 requires = ["REDIS_URL", "DATABASE_URL(部分用例)", "redis-compat feature", "ASTRAL_REDIS_PROJECTION_COMPAT=true"]
-arch_status = "current"
-run = "cargo test -p astral-db --test evidence_cache_redis_integration --features astral-db/redis-compat -- --ignored"
+arch_status = "compat"
+note = "显式 Redis adapter 兼容窗专项;不属于 Redis-free 默认集成 gate"
+run = "bash scripts/run-tests.sh --redis-compat"
 
 [[entry]]
 id = "astral-db/integration"
@@ -91,7 +92,8 @@ path = "astral-db/tests/integration_identity_mapping.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL(指向 sdk_identity_mapping_test_* 专用库)", "INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE", "专用库需预先迁移"]
 arch_status = "current"
-note = "强制身份映射表契约;必须独立调用(2026-10-06 实测确认的专用调用契约)"
+note = "强制身份映射表契约;必须独立调用并保持专用库 guard"
+run = "bash scripts/run-tests.sh --identity-mapping"
 
 [[entry]]
 id = "astral-db/multi_tenant_isolation"
@@ -148,9 +150,9 @@ category = "integration"
 owner_crate = "astral-trustgraph"
 path = "astral-trustgraph/tests/audit_replay_integration.rs"
 kind = "integration-ignored"
-requires = ["DATABASE_URL", "RabbitMQ", "Redis(lease)", "redis-compat feature"]
+requires = ["DATABASE_URL", "RabbitMQ", "MySQL mq_consumer_lease"]
 arch_status = "current"
-run = "cargo test -p astral-trustgraph --test audit_replay_integration --features astral-trustgraph/redis-compat -- --ignored"
+run = "bash scripts/run-tests.sh --rabbit"
 
 [[entry]]
 id = "astral-trustgraph/org_scope_projector_integration"
@@ -379,10 +381,11 @@ note = "TLA+ AdmissionSafety 草案 + 5 变体 cfg;TLC 运行 BLOCKED(无 pinned
 id = "security/testsuite-premises"
 category = "security"
 owner_crate = "testsuite"
-path = "testsuite/tests/security/"
-kind = "integration-ignored"
+path = "tests-suite/tests/security/"
+kind = "integration-mixed"
+requires = ["DATABASE_URL(除纯配置门)", "RUST_INTEGRATION_REQUIRED=1"]
 arch_status = "current"
-note = "新增架构前提:hub 失效遗漏 / 强制身份映射 / 单写者租约 / Redis-free composite 门(2026-10 新增)"
+note = "Cargo 显式目标:commit-proven hub 失效 / 强制身份映射 / 单写者租约 / Redis-free composite 配置门"
 
 # ═══════════════ e2e / 多租户极限(testsuite 新增)═══════════════
 
@@ -392,7 +395,7 @@ category = "e2e"
 owner_crate = "astral-single-node + bench/loadgen"
 path = "tests-suite/e2e/"
 kind = "campaign"
-requires = ["MySQL", "Redis(可选)", "RabbitMQ(可选)", "composite 二进制", "loadgen 二进制"]
+requires = ["MySQL", "LocalBus/LocalProjectionBus", "composite 二进制", "loadgen 二进制"]
 arch_status = "current"
 note = "部署配方 + bench_matrix 阶梯(seed → bootstrap → 启动 → 收敛 → 压测 → 收尾)"
 
@@ -411,7 +414,7 @@ category = "multi-tenant-extreme"
 owner_crate = "testsuite"
 path = "tests-suite/tests/"
 kind = "integration-ignored"
-requires = ["DATABASE_URL", "RUST_INTEGRATION_REQUIRED=1(部分套件需 Redis/RabbitMQ)"]
+requires = ["DATABASE_URL", "RUST_INTEGRATION_REQUIRED=1", "MySQL migrated isolated schema"]
 tenants = "64(隔离)/ 可配置(搅动)/ 512(容量)"
 arch_status = "current"
 note = "MT-E1 隔离 / MT-E3 搅动 / MT-E4 跨租户失效风暴 / MT-E5 容量 / MT-E6 失败注入;配置矩阵见 matrix/run-mt-matrix.sh"
@@ -425,4 +428,14 @@ owner_crate = "scripts"
 path = "scripts/run-tests.sh"
 kind = "script"
 arch_status = "current"
-note = "unit/check/integration/bench + --mt-extreme/--mt-matrix(testsuite 扩展)"
+note = "Redis-free unit/check/MySQL integration;Rabbit、Redis compat、专属身份映射分别显式运行;--mt-extreme/--mt-matrix 默认 Redis-free"
+
+[[entry]]
+id = "harness/runner-contracts"
+category = "harness"
+owner_crate = "scripts"
+path = "scripts/tests/test-run-tests.sh"
+kind = "shell-tests"
+arch_status = "current"
+note = "命令编排 mock;无真实服务,不作为 DB/MQ 集成证明"
+run = "bash scripts/tests/test-run-tests.sh"

@@ -928,6 +928,8 @@ async fn test_delete_with_cascade_call_through_empty_card() {
     };
 
     let Some(pool) = connect().await else { return };
+    astral_mq::invalidation::install_origin_region("integration-test")
+        .expect("source mutation tests must install their message origin");
     let repo = SqlxUserCardRepository::new(pool.clone());
 
     // 前置状态（独立事务并提交：被测函数自管事务，必须能看到夹具行）。

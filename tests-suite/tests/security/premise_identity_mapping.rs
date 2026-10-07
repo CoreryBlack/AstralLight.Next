@@ -14,19 +14,18 @@ use astral_db::{
     create_integration_identity_mapping, read_integration_identity_mapping,
     CreateIntegrationIdentityMapping, IntegrationIdentityKey,
 };
-use testsuite::connect_suite;
+use testsuite::{connect_suite, SuiteFixture, TenantRole};
 
 #[tokio::test]
 #[ignore = "requires isolated MySQL via DATABASE_URL (identity mapping premise)"]
 async fn identity_mapping_absence_is_the_refusal_contract() {
-    let Some(pool) = connect_suite() else {
+    let Some(pool) = connect_suite().await else {
         return;
     };
+    let fixture = SuiteFixture::new("mapping-premise", &[TenantRole::AllowActive]);
     let salt = uuid::Uuid::new_v4().simple().to_string();
-    // 自播种 actor 与源身份(映射创建要求 ACTIVE actor + (user, identity_card)
-    // 源绑定存在);ID 取 testsuite 专属段,不与既有 fixture 冲突。
-    let user_id: i64 = 40_000_000_000_000_001;
-    let identity_card_id: i64 = 40_000_000_000_000_002;
+    let user_id = fixture.tenants[0].user_id;
+    let identity_card_id = fixture.tenants[0].identity_card_id;
     sqlx::query(
         "INSERT INTO platform_user \
          (user_id, user_no, display_name, source_type, status) \
@@ -47,6 +46,12 @@ async fn identity_mapping_absence_is_the_refusal_contract() {
     .await
     .unwrap();
 
+    sqlx::query("INSERT INTO identity_global_admin (user_id, status) VALUES (?, 'ACTIVE')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
     let app_id = format!("testsuite-mapping-{salt}");
     let key = IntegrationIdentityKey::new(
         app_id.clone(),
@@ -66,7 +71,7 @@ async fn identity_mapping_absence_is_the_refusal_contract() {
     );
 
     // 注册形态:映射建立后,同一 key 解析到绑定的平台身份。
-    create_integration_identity_mapping(
+    let creation = create_integration_identity_mapping(
         &pool,
         CreateIntegrationIdentityMapping {
             key: key.clone(),
@@ -76,8 +81,11 @@ async fn identity_mapping_absence_is_the_refusal_contract() {
             actor_id: user_id,
         },
     )
-    .await
-    .expect("mapping creation must succeed for a fresh key with an active actor");
+    .await;
+    if creation.is_err() {
+        cleanup_mapping_fixture(&pool, &app_id, &salt, user_id, identity_card_id).await;
+    }
+    creation.expect("mapping creation must succeed for a fresh key with an active actor");
 
     let found = read_integration_identity_mapping(&pool, &key)
         .await
@@ -102,32 +110,59 @@ async fn identity_mapping_absence_is_the_refusal_contract() {
         "mappings must not leak across app_id boundaries"
     );
 
-    // 清理:映射行(app_id 为二进制列,按字节绑定)、操作行、actor 行。
-    sqlx::query("DELETE FROM integration_identity_mapping WHERE app_id = ?")
-        .bind(app_id.clone().into_bytes())
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM integration_identity_mapping WHERE app_id = ?")
-        .bind(format!("{app_id}-other").into_bytes())
-        .execute(&pool)
-        .await
-        .unwrap();
+    cleanup_mapping_fixture(&pool, &app_id, &salt, user_id, identity_card_id).await;
+}
+
+async fn cleanup_mapping_fixture(
+    pool: &sqlx::MySqlPool,
+    app_id: &str,
+    salt: &str,
+    user_id: i64,
+    identity_card_id: i64,
+) {
+    let mut tx = pool.begin().await.unwrap();
+    for mapping_app in [app_id.to_owned(), format!("{app_id}-other")] {
+        sqlx::query("DELETE FROM integration_identity_mapping WHERE app_id = ?")
+            .bind(mapping_app.into_bytes())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
     sqlx::query("DELETE FROM integration_identity_mapping_operation WHERE operation_id = ?")
-        .bind(format!("op-ts-mapping-{salt}"))
-        .execute(&pool)
+        .bind(format!("op-ts-mapping-{salt}").into_bytes())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "DELETE FROM audit_log WHERE event_type = 'IDENTITY_INTEGRATION_MAPPING' AND user_id = ? AND request_id = ?",
+    )
+    .bind(user_id)
+    .bind(format!("op-ts-mapping-{salt}"))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM identity_global_admin WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
         .await
         .unwrap();
     sqlx::query("DELETE FROM identity_card WHERE card_id = ?")
         .bind(identity_card_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
     sqlx::query("DELETE FROM platform_user WHERE user_id = ?")
         .bind(user_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
+    tx.commit().await.unwrap();
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM platform_user WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0, "mapping fixture actor must be removed");
 }
 
 #[tokio::test]
@@ -137,7 +172,7 @@ async fn identity_mapping_absence_is_detectable_for_mismatch_probes() {
     // INTEGRATION_NOT_AUTHORIZED。本断言锁定"映射 ≠ 授权"的边界:
     // 映射解析成功只提供绑定事实,绑定与请求上下文的一致性由服务强制;
     // 而一切拒绝语义的起点是映射缺席可被确定性观测。
-    let Some(pool) = connect_suite() else {
+    let Some(pool) = connect_suite().await else {
         return;
     };
     let salt = uuid::Uuid::new_v4().simple().to_string();

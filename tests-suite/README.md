@@ -9,7 +9,7 @@
 | category | 含义 | 运行方式 |
 |---|---|---|
 | `unit-inline` | 内联单元测试(`#[cfg(test)]`,物理上属于属主 crate) | `cargo test --workspace --lib` |
-| `integration` | 真实依赖集成测试(MySQL/Redis/RabbitMQ,`#[ignore]` 门控) | `scripts/run-tests.sh --integration` |
+| `integration` | Redis-free MySQL 集成(`#[ignore]` 门控);Rabbit/Redis 为显式专项 | `bash scripts/run-tests.sh --integration` |
 | `multi-tenant` | 租户隔离/租户拓扑测试 | 同上 + `testsuite` 套件 |
 | `multi-tenant-extreme` | **新增**:多租户混合极限(大规模交错/搅动/风暴/容量/失败注入) | `scripts/run-tests.sh --mt-extreme` |
 | `security` | 安全前提测试(E2 omission 风格 + 新架构前提) | 见 MANIFEST 每条 `run` |
@@ -22,8 +22,35 @@
 
 - MySQL 8.0(`DATABASE_URL`,127.0.0.1:3308,isolated 环境)
 - `ASTRAL_MIGRATION_ENV=isolated` + `RUST_INTEGRATION_REQUIRED=1`
-- Redis/RabbitMQ 仅部分套件需要(见 MANIFEST 每条 `requires`)
-- `scripts/run-tests.sh` 负责起停 docker-compose 隔离环境
+- 默认只需要 MySQL;LocalBus/LocalProjectionBus 的进程内测试不需要消息中间件。
+- `unit`/`--check` 不启动容器;`--integration`/`--mt-extreme` 默认启动 MySQL 并显式迁移。
+- `TEST_USE_EXISTING=1` 复用已迁移的隔离库,不启动/删除容器、不执行 DDL,各测试仍严格验证 schema。
+- 破坏性待命迁移保持批准与证明门禁,脚本不自动填入 allowlist 或证明引用。
+- `--rabbit` 单独验证 MySQL 租约 + RabbitMQ 审计重放;不需要 Redis。
+- `--redis-compat` 是兼容窗专项,不是新架构 gate;脚本仅在此模式启用 Redis adapter。
+- 专属 SDK 映射库通过 `--identity-mapping` 单独验证;不放宽专属库名守卫,不自动建库/迁移。
+- 每阶段完整日志/退出码/耗时在 repo 外的 run-scoped 目录(或 `TEST_ARTIFACT_DIR`);内部 `[SKIP]` 不计 PASS,超时标 UNKNOWN 并停止后续派发。
+
+### 安全前提与入口回归
+
+`Cargo.toml` 显式注册 `tests/security/` 下四个目标。hub 失效测试从真实已提交
+publication 构造镜像,身份映射与单写者租约测试使用真实 MySQL;Redis-free
+composite 配置门不依赖外部服务,随 `unit` 执行。集成只跑 ignored 真依赖目标,
+不把被过滤的纯配置门当作集成通过。
+
+```bash
+bash scripts/tests/test-run-tests.sh
+bash scripts/run-tests.sh unit
+bash scripts/run-tests.sh --integration
+bash scripts/run-tests.sh --rabbit
+bash tests-suite/matrix/run-mt-matrix.sh --suites "mt_extreme_churn mt_extreme_capacity"
+```
+
+矩阵默认只运行 Redis-free profile;显式 `--profile redis-compat` 才启用兼容
+特性与旗标,并要求调用方预先准备 Redis。`--suites` 实际选择目标且拒绝未知项。
+忽略的 CPU-only 性能矩阵、专属映射库、Rabbit 专项、Redis 兼容和 excluded crates
+不属于默认 MySQL gate,须单列证据。架构依据见
+[内存权威读面与失效通道方案](../Docs/架构/Rust架构设计/Rust内存权威读面与失效通道架构方案_V0.1.md)。
 
 ## ID 段隔离
 

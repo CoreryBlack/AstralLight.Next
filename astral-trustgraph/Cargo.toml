@@ -62,8 +62,3 @@ tokio = { workspace = true, features = ["full"] }
 astral-db = { path = "../astral-db", features = ["test-support"] }
 futures-util = "0.3"
 metrics-exporter-prometheus = { workspace = true }
-
-# 真 Redis 集成测试仅在显式 redis-compat feature 下编译。
-[[test]]
-name = "audit_replay_integration"
-required-features = ["redis-compat"]

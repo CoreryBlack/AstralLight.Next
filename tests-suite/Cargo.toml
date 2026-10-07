@@ -28,7 +28,7 @@ sha2 = { workspace = true }
 
 [features]
 default = ["astral-db/test-support"]
-# 按需矩阵运行入口:cargo test -p testsuite --features redis-compat
+# 按需兼容验证入口:cargo test -p testsuite --features redis-compat
 redis-compat = [
     "astral-db/redis-compat",
     "astral-common/redis-compat",
@@ -37,3 +37,21 @@ redis-compat = [
     "astral-trustgraph/redis-compat",
     "astral-mq/redis-compat",
 ]
+
+# Security premise binaries are explicit because Cargo does not discover tests
+# nested below tests/security/ automatically.
+[[test]]
+name = "premise_hub_invalidation"
+path = "tests/security/premise_hub_invalidation.rs"
+
+[[test]]
+name = "premise_identity_mapping"
+path = "tests/security/premise_identity_mapping.rs"
+
+[[test]]
+name = "premise_redis_free_composite"
+path = "tests/security/premise_redis_free_composite.rs"
+
+[[test]]
+name = "premise_single_writer_lease"
+path = "tests/security/premise_single_writer_lease.rs"

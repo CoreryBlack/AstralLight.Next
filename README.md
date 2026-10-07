@@ -59,22 +59,42 @@ cargo clippy --workspace -- -D warnings
 cargo test --workspace
 ```
 
-The isolated test runner makes infrastructure explicit:
+The test runner follows the Redis-free single-node architecture:
 
 ```bash
-./scripts/run-tests.sh --check
-./scripts/run-tests.sh unit
-./scripts/run-tests.sh --integration
+bash scripts/run-tests.sh --check
+bash scripts/run-tests.sh unit
+bash scripts/run-tests.sh --integration
+bash scripts/run-tests.sh --rabbit
 ```
 
-`--check` runs Cargo checks and clippy without starting services. Both `unit`
-and `--integration` start the isolated `docker-compose.test.yml` stack and
-apply Rust-owned migrations; `unit` runs workspace library tests, while
-`--integration` also runs ignored integration tests serially. The real
-integration gate requires MySQL/Redis/RabbitMQ connection variables,
-`ASTRAL_MIGRATION_ENV=isolated`, and `RUST_INTEGRATION_REQUIRED=1`. Credentials
-must be supplied through the process environment and must never be committed.
-A missing required dependency is a failed or blocked gate, not a green skip.
+`unit` and `--check` do not start services or need connection variables. The
+MySQL integration gate requires `DATABASE_URL` on loopback port 3308,
+`ASTRAL_MIGRATION_ENV=isolated`, and `RUST_INTEGRATION_REQUIRED=1`. It sets local
+transport and disables Redis compatibility. By default it starts only MySQL
+from `docker-compose.test.yml` and applies Rust-owned migrations; callers must
+supply isolated MySQL credentials. Destructive standby migrations retain their
+explicit allowlist and approved proof requirements; the runner never grants
+that authorization.
+
+For an already migrated isolated `astral_test`/`astral_rehearsal` database, set
+`TEST_USE_EXISTING=1`; no Docker lifecycle or DDL is performed. Required schema
+validation is still performed by each real test. Missing dependencies are a
+failed or blocked gate, not a green skip. Full per-phase logs, commands, exit
+codes and timing are saved outside the repository in a run-scoped temporary
+directory (or `TEST_ARTIFACT_DIR`). A phase timeout stops further dispatch as
+UNKNOWN; reconcile database and worker state before retrying.
+
+Rabbit transport is a separate MySQL + RabbitMQ gate (`--rabbit`); the URL must
+name a vhost (`%2f` for the default `/`). Redis tests
+are compatibility-only (`--redis-compat`, with `REDIS_URL`); neither is a
+single-node prerequisite. Compose profiles `rabbit` and `redis-compat` expose
+ports only on loopback. The dedicated SDK mapping test remains a separate
+`--identity-mapping` gate with a pre-migrated `sdk_identity_mapping_test_*`
+database and `INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE`; its isolation guard
+is not relaxed. Ignored CPU performance matrices and excluded crates are not
+covered by the MySQL gate. See [tests-suite](tests-suite/README.md) for coverage.
+Credentials must remain in the process environment and must never be committed.
 
 For organization-scope migration inspection, set `ORG_MYSQL_URL` to a TCP MySQL
 URI for the isolated test database, then run the read-only preflight:

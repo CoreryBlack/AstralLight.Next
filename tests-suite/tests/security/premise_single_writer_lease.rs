@@ -14,7 +14,7 @@ use testsuite::connect_suite;
 #[tokio::test]
 #[ignore = "requires isolated MySQL via DATABASE_URL (single-writer lease premise)"]
 async fn single_writer_lease_is_mutually_exclusive_and_releasable() {
-    let Some(pool_a) = connect_suite() else {
+    let Some(pool_a) = connect_suite().await else {
         return;
     };
     // 第一写者:取得租约并持有(连接存活 = 租约存活)。
@@ -25,20 +25,37 @@ async fn single_writer_lease_is_mutually_exclusive_and_releasable() {
     // 第二写者:立即失败,绝不排队等待。
     let pool_b = pool_a.clone();
     let second = acquire_single_writer_lease(&pool_b).await;
-    let error = second.expect_err("second writer must be refused while the lease is held");
+    let error = match second {
+        Err(error) => error,
+        Ok(connection) => {
+            connection.close().await.unwrap();
+            panic!("second writer must be refused while the lease is held");
+        }
+    };
     assert!(
         error.contains("already holds the writer lease"),
         "refusal must identify lease contention: {error}"
     );
 
-    // 释放:持约连接关闭(进程崩溃等价)→ 锁随会话释放 → 新写者可获取。
-    drop(lease_a);
-    drop(pool_a);
-    // 给 MySQL 一点时间完成会话清理(本地回环通常即时)。
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let pool_c = pool_b.clone();
-    acquire_single_writer_lease(&pool_c)
+    // Pool drop can recycle the session, so close the lease connection explicitly.
+    lease_a.close().await.expect("lease session must close");
+    // COM_QUIT has no response; observe server-side release before reacquiring.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let free: i64 = sqlx::query_scalar("SELECT IS_FREE_LOCK('astral_single_node_writer')")
+                .fetch_one(&pool_b)
+                .await
+                .expect("lock release probe must succeed");
+            if free == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("closed writer session must release its lock within the bounded wait");
+    let lease_c = acquire_single_writer_lease(&pool_b)
         .await
         .expect("released lease must be re-acquirable by a new writer");
+    lease_c.close().await.expect("new lease session must close");
 }

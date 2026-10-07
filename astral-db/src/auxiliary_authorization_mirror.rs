@@ -1926,6 +1926,8 @@ mod tests {
                 .org_bytes,
             64
         );
+        // Oversized payload construction may exceed the channel heartbeat window.
+        hub.record_channel_heartbeat();
         assert!(matches!(
             mirror.load_org_authorization(&hub, &ctx_value(CARD)).await,
             Some(OrgAuthorityRead::Disabled)

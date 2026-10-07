@@ -36,6 +36,7 @@ use uuid::Uuid;
 
 const ROUTING_KEY: &str = "audit.log";
 const MESSAGE_TYPE: &str = "AUDIT_LOG";
+const REPLAY_ACTOR_ID: &str = "7901";
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn required() -> bool {
@@ -67,57 +68,13 @@ struct RabbitHarness {
 async fn connect_harness(pool: &MySqlPool) -> Option<RabbitHarness> {
     let _database_url = required_env("DATABASE_URL")?;
     let rabbitmq_url = required_env("RABBITMQ_URL")?;
-    let redis_url = required_env("REDIS_URL")?;
-    let redis_client = match redis::Client::open(redis_url.as_str()) {
-        Ok(client) => client,
-        Err(error) => {
-            if required() {
-                panic!("RUST_INTEGRATION_REQUIRED=1: Redis client setup failed: {error}");
-            }
-            eprintln!("[SKIP] Redis client setup failed: {error}");
-            return None;
+    if let Err(error) = astral_mq::consumer::init_idempotency_db(pool.clone()).await {
+        if required() {
+            panic!("RUST_INTEGRATION_REQUIRED=1: durable DB lease setup failed: {error}");
         }
-    };
-    let mut redis_connection =
-        match timeout(TEST_TIMEOUT, redis_client.get_connection_manager()).await {
-            Ok(Ok(connection)) => connection,
-            Ok(Err(error)) => {
-                if required() {
-                    panic!("RUST_INTEGRATION_REQUIRED=1: Redis connection failed: {error}");
-                }
-                eprintln!("[SKIP] Redis connection failed: {error}");
-                return None;
-            }
-            Err(_) => {
-                if required() {
-                    panic!("RUST_INTEGRATION_REQUIRED=1: Redis health check timed out");
-                }
-                eprintln!("[SKIP] Redis health check timed out");
-                return None;
-            }
-        };
-    let _: String = match timeout(
-        TEST_TIMEOUT,
-        redis::cmd("PING").query_async(&mut redis_connection),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            if required() {
-                panic!("RUST_INTEGRATION_REQUIRED=1: Redis PING failed: {error}");
-            }
-            eprintln!("[SKIP] Redis PING failed: {error}");
-            return None;
-        }
-        Err(_) => {
-            if required() {
-                panic!("RUST_INTEGRATION_REQUIRED=1: Redis PING timed out");
-            }
-            eprintln!("[SKIP] Redis PING timed out");
-            return None;
-        }
-    };
+        eprintln!("[SKIP] durable DB lease setup failed: {error}");
+        return None;
+    }
 
     // The caller validates this already-migrated schema before creating the
     // RabbitMQ harness; this helper never executes DDL.
@@ -215,10 +172,8 @@ async fn connect_harness(pool: &MySqlPool) -> Option<RabbitHarness> {
         }
     };
 
-    // The existing audit consumer provides the second, business-level assertion:
-    // it writes mq_idempotent_log and audit_log after the raw delivery arrives.
-    // It uses its normal Redis idempotency lease (REDIS_URL, or its documented
-    // localhost default), while the replay state machine itself is MySQL+RabbitMQ.
+    // The audit consumer proves business completion in mq_idempotent_log and
+    // audit_log; its processing lease is held in MySQL mq_consumer_lease.
     let consumer_connection =
         match Connection::connect(&rabbitmq_url, ConnectionProperties::default()).await {
             Ok(connection) => connection,
@@ -376,6 +331,14 @@ async fn wait_for_audit_evidence(pool: &MySqlPool, message_id: &str, request_id:
         .fetch_optional(pool)
         .await
         .expect("idempotency evidence query must succeed");
+        let lease_status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM mq_consumer_lease WHERE message_type = ? AND message_id = ?",
+        )
+        .bind(MESSAGE_TYPE)
+        .bind(message_id)
+        .fetch_optional(pool)
+        .await
+        .expect("durable processing lease query must succeed");
         let audit_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM audit_log \
              WHERE request_id = ? AND event_type = 'PERMISSION_CHECK'",
@@ -388,13 +351,14 @@ async fn wait_for_audit_evidence(pool: &MySqlPool, message_id: &str, request_id:
             .as_ref()
             .is_some_and(|(status,)| status == "PROCESSED")
             && audit_count == 1
+            && lease_status.as_deref() == Some("COMPLETED")
         {
             return;
         }
         assert!(
             Instant::now() < deadline,
             "audit consumer evidence missing for message_id={message_id}: \
-             idempotency={idempotency:?}, audit_count={audit_count}"
+             idempotency={idempotency:?}, audit_count={audit_count}, lease={lease_status:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -409,18 +373,26 @@ async fn delete_test_rows(pool: &MySqlPool, quarantine_ids: &[i64], message_ids:
             .expect("quarantine cleanup must succeed");
     }
     for message_id in message_ids {
-        sqlx::query("DELETE FROM audit_log WHERE request_id = ? OR request_id LIKE ?")
-            .bind(request_id_for(message_id))
-            .bind(format!("replay-integration-{message_id}%"))
-            .execute(pool)
-            .await
-            .expect("audit cleanup must succeed");
+        sqlx::query(
+            "DELETE FROM audit_log WHERE request_id = ? OR (event_type = 'AUDIT_REPLAY_REQUEST' AND request_id = ?)",
+        )
+        .bind(request_id_for(message_id))
+        .bind(format!("op-{message_id}"))
+        .execute(pool)
+        .await
+        .expect("audit cleanup must succeed");
         sqlx::query("DELETE FROM mq_idempotent_log WHERE message_type = ? AND message_id = ?")
             .bind(MESSAGE_TYPE)
             .bind(message_id)
             .execute(pool)
             .await
             .expect("idempotency cleanup must succeed");
+        sqlx::query("DELETE FROM mq_consumer_lease WHERE message_type = ? AND message_id = ?")
+            .bind(MESSAGE_TYPE)
+            .bind(message_id)
+            .execute(pool)
+            .await
+            .expect("test processing lease cleanup must succeed");
     }
 }
 
@@ -447,7 +419,7 @@ async fn run_worker_once(
 }
 
 #[tokio::test]
-#[ignore = "requires migrated MySQL, RabbitMQ, and the audit consumer's Redis lease"]
+#[ignore = "requires migrated MySQL and RabbitMQ durable audit replay"]
 async fn mysql_rabbit_audit_replay_real_integration() {
     let database_url = match required_env("DATABASE_URL") {
         Some(value) => value,
@@ -463,7 +435,10 @@ async fn mysql_rabbit_audit_replay_real_integration() {
             return;
         }
     };
-    let Some(mut harness) = connect_harness(&pool).await else {
+    let Some(mut harness) = timeout(TEST_TIMEOUT, connect_harness(&pool))
+        .await
+        .expect("Rabbit connection/topology setup exceeded its deadline")
+    else {
         return;
     };
 
@@ -475,6 +450,7 @@ async fn mysql_rabbit_audit_replay_real_integration() {
     // Confirmation::Ack(None), after which the worker persists REPLAY_CONFIRMED.
     let happy_message_id = unique_message_id("happy");
     let happy_request_id = request_id_for(&happy_message_id);
+    let happy_operation_id = format!("op-{happy_message_id}");
     let happy_payload = audit_envelope(&happy_message_id, &happy_request_id);
     let happy_row = insert_or_increment_terminal(
         &pool,
@@ -485,14 +461,11 @@ async fn mysql_rabbit_audit_replay_real_integration() {
     quarantine_ids.push(happy_row.id);
     message_ids.push(happy_message_id.as_str());
     assert_eq!(happy_row.status, AuditQuarantineStatus::Quarantined);
-    assert!(request_replay(
-        &pool,
-        happy_row.id,
-        "integration-happy-operation",
-        "integration-test"
-    )
-    .await
-    .expect("happy-path request_replay must succeed"));
+    assert!(
+        request_replay(&pool, happy_row.id, &happy_operation_id, REPLAY_ACTOR_ID)
+            .await
+            .expect("happy-path request_replay must succeed")
+    );
     assert_eq!(
         get_quarantine_metadata_by_id(&pool, happy_row.id)
             .await
@@ -585,6 +558,7 @@ async fn mysql_rabbit_audit_replay_real_integration() {
     // Validation failure: the worker claims the row but must return it to
     // QUARANTINED. No broker delivery and no REPLAY_CONFIRMED state are allowed.
     let malformed_message_id = unique_message_id("malformed");
+    let malformed_operation_id = format!("op-{malformed_message_id}");
     let malformed_row = insert_or_increment_terminal(
         &pool,
         &quarantine_input(&malformed_message_id, b"{not-json".to_vec(), ROUTING_KEY),
@@ -596,8 +570,8 @@ async fn mysql_rabbit_audit_replay_real_integration() {
     assert!(request_replay(
         &pool,
         malformed_row.id,
-        "integration-malformed-operation",
-        "integration-test",
+        &malformed_operation_id,
+        REPLAY_ACTOR_ID,
     )
     .await
     .expect("malformed request_replay must succeed"));
@@ -627,6 +601,7 @@ async fn mysql_rabbit_audit_replay_real_integration() {
     // replay allowlist rejects the wrong route before any broker call. The
     // active claim is fenced back to QUARANTINED and can never be confirmed.
     let route_message_id = unique_message_id("route");
+    let route_operation_id = format!("op-{route_message_id}");
     let route_payload = audit_envelope(&route_message_id, &request_id_for(&route_message_id));
     let route_row = insert_or_increment_terminal(
         &pool,
@@ -636,19 +611,16 @@ async fn mysql_rabbit_audit_replay_real_integration() {
     .expect("wrong-route quarantine insert must succeed");
     quarantine_ids.push(route_row.id);
     message_ids.push(route_message_id.as_str());
-    assert!(request_replay(
-        &pool,
-        route_row.id,
-        "integration-route-operation",
-        "integration-test"
-    )
-    .await
-    .expect("wrong-route request_replay must succeed"));
+    assert!(
+        request_replay(&pool, route_row.id, &route_operation_id, REPLAY_ACTOR_ID)
+            .await
+            .expect("wrong-route request_replay must succeed")
+    );
     let route_claim = begin_replay(
         &pool,
         route_row.id,
         "integration-route-worker",
-        "integration-route-operation",
+        &route_operation_id,
         60,
     )
     .await
@@ -682,6 +654,7 @@ async fn mysql_rabbit_audit_replay_real_integration() {
     // Lease recovery and token fencing: reclaim an expired REPLAYING claim, then
     // prove the old owner/token cannot confirm or fail the newly fenced claim.
     let expired_message_id = unique_message_id("expired");
+    let expired_operation_id = format!("op-{expired_message_id}");
     let expired_row = insert_or_increment_terminal(
         &pool,
         &quarantine_input(
@@ -697,8 +670,8 @@ async fn mysql_rabbit_audit_replay_real_integration() {
     assert!(request_replay(
         &pool,
         expired_row.id,
-        "integration-expired-operation",
-        "integration-test"
+        &expired_operation_id,
+        REPLAY_ACTOR_ID
     )
     .await
     .expect("expired request_replay must succeed"));
@@ -706,7 +679,7 @@ async fn mysql_rabbit_audit_replay_real_integration() {
         &pool,
         expired_row.id,
         "integration-old-worker",
-        "integration-expired-operation",
+        &expired_operation_id,
         1,
     )
     .await

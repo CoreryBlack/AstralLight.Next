@@ -1,10 +1,14 @@
-# AstralLight Rust 集成测试环境
-# 启动：docker compose -f docker-compose.test.yml up -d
-# 停止：docker compose -f docker-compose.test.yml down -v
-# Run with explicitly supplied isolated test credentials, for example:
-# MYSQL_ROOT_PASSWORD=... RABBITMQ_USER=... RABBITMQ_PASSWORD=... \
-# DATABASE_URL=... REDIS_URL=... RABBITMQ_URL=... \
-# docker compose -f docker-compose.test.yml up -d --wait
+# AstralLight Rust isolated test environment.
+# Default profile: MySQL only (single-node Redis-free path).
+# Optional profiles: rabbit, redis-compat.
+#
+# Default start:
+#   MYSQL_ROOT_PASSWORD=... DATABASE_URL=... \
+#     docker compose -f docker-compose.test.yml up -d --wait
+# Rabbit transport:
+#   docker compose --profile rabbit -f docker-compose.test.yml up -d --wait
+# Redis compatibility:
+#   docker compose --profile redis-compat -f docker-compose.test.yml up -d --wait
 
 services:
   mysql:
@@ -13,7 +17,7 @@ services:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-astral_test}
     ports:
-      - "3308:3306"
+      - "127.0.0.1:3308:3306"
     tmpfs:
       - /var/lib/mysql
     healthcheck:
@@ -22,15 +26,17 @@ services:
       timeout: 5s
       retries: 10
     # The platform-v4 schema is the integration-test baseline. Rust-owned
-    # incremental DDL is applied explicitly by `cargo run -p astral-db --bin
-    # astral-migrate`, never by an application process or MySQL init hook.
+    # incremental DDL is applied explicitly by astral-migrate.
     volumes:
       - ./Docs/sql/full_schema_v4.sql:/docker-entrypoint-initdb.d/00-platform-v4.sql:ro
+      # The adopted Java-era history includes MFA, absent from the v4 dump.
+      - ./astral-db/migrations/20240630000012_user_mfa.sql:/docker-entrypoint-initdb.d/01-mfa-baseline.sql:ro
 
   redis:
+    profiles: ["redis-compat"]
     image: redis:7
     ports:
-      - "6380:6379"
+      - "127.0.0.1:6380:6379"
     tmpfs:
       - /data
     healthcheck:
@@ -40,13 +46,15 @@ services:
       retries: 10
 
   rabbitmq:
+    profiles: ["rabbit"]
     image: rabbitmq:3-management
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?RABBITMQ_USER is required}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD is required}
+      # Inactive profiles still interpolate; the runner validates these for --rabbit.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-}
     ports:
-      - "5673:5672"
-      - "15673:15672"
+      - "127.0.0.1:5673:5672"
+      - "127.0.0.1:15673:15672"
     tmpfs:
       - /var/lib/rabbitmq
     healthcheck:

@@ -4634,6 +4634,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
+name = "testsuite"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "astral-common",
+ "astral-db",
+ "astral-gateway",
+ "astral-identity",
+ "astral-mq",
+ "astral-trustgraph",
+ "astral-types",
+ "hex",
+ "policy-engine",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"

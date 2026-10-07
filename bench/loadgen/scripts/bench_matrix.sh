@@ -116,10 +116,15 @@ if d['ok'] <= 0:
     sys.exit(3)
 wall = float(t1) - float(t0)
 ok = d['ok']
+# loadgen JSON 契约漂移兼容:当前版本输出 failures/http_fail/transport_err,
+# 无聚合 'err' 键;三者求和等价旧语义(ok=成功,其余=失败)。
+err = d.get('err')
+if err is None:
+    err = d.get('failures', 0) + d.get('http_fail', 0) + d.get('transport_err', 0)
 mq = (int(mq1) - int(mq0)) / ok
 rq = (int(rq1) - int(rq0)) / ok
 cpu = (int(cpu1) - int(cpu0)) / 100.0 / wall  # CLK_TCK=100, 相对单核
-print(f"{label},{conc},{d['qps']:.1f},{d['p50_us']},{d['p90_us']},{d['p99_us']},{d['p999_us']},{d['max_us']},{d['ok']},{d['err']},{mq:.1f},{rq:.1f},{cpu:.2f}")
+print(f"{label},{conc},{d['qps']:.1f},{d['p50_us']},{d['p90_us']},{d['p99_us']},{d['p999_us']},{d['max_us']},{d['ok']},{err},{mq:.1f},{rq:.1f},{cpu:.2f}")
 PY
   echo "done: $label c=$conc"
 }
@@ -132,7 +137,10 @@ if [ "$MODE" = biz ] || [ "$MODE" = all ]; then
   for c in $BIZ_LIST; do run_point biz "$c" "$DUR" "$BIZ_PATH"; done
 fi
 if [ "$MODE" = health ] || [ "$MODE" = all ]; then
-  for c in $HEALTH_LIST; do run_point health "$c" 10 "$HEALTH_PATH"; done
+  # health 场景退役(2026-10-07):/api/health 是 Monitor(9006) 的路径,
+  # trustgraph(9005) 未挂载该路由(实测 404)。基线吞吐由 biz 场景的
+  # 低并发点承载;若需恢复,先把 HEALTH_PATH 指向真实挂载的路由。
+  echo "[skip] health scenario retired: /api/health is not mounted by trustgraph :9005 (404 measured 2026-10-06)"
 fi
 
 echo "=== summary ==="

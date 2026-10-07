@@ -15,6 +15,7 @@ members = [
     "astral-sdk-contracts",
     "astral-sdk",
     "astral-sdk-axum",
+    "tests-suite",
 ]
 # Redis 缓存归档库保留源码，使用自包含 manifest；不参与默认 workspace。
 # 需要归档验证时从 astral-cache/Cargo.toml 单独执行。

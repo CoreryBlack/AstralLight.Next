@@ -12,7 +12,10 @@
 - Durable reconciliation is scoped by canonical aggregate identity
   `(tenant_id, aggregate_type, aggregate_id)`. Cross-tenant rows, old head/outbox
   records, or unscoped source reads cannot prove the current run's postcondition.
-- Use only an isolated test deployment, test database, and run-scoped Redis. Do not
+- Use only an isolated test deployment and test database. Redis is required only for
+  compat-enabled validation runs (the `redis-compat` feature plus
+  `ASTRAL_REDIS_PROJECTION_COMPAT=true`); the single-node composite is a strict Redis-free
+  deployment and its validation must not depend on Redis. Do not
   touch production data, secrets, or externally visible services.
 - Each phase records a manifest, configuration and binary hashes, command, cwd,
   environment summary, start/end time, exit code, stdout/stderr artifacts, and cleanup.
@@ -100,6 +103,21 @@ The abstract state machine contains source commit, durable delta, publication CA
 cache observations, strict current read, final reload, and host admission. The model
 checks only the abstract protocol; runtime tests check implementation behavior. Neither
 is a complete proof of every deployment.
+
+Architectural premises added 2026-10 (runtime tests under `tests-suite/tests/security/`,
+dependency classes registered in `experiment_register.py`):
+
+- `memory_projection_hub` -> the invalidation notification is the load-bearing freshness
+  fence: without it the hub serves the previous generation; with it the hub defers to
+  durable (`premise_hub_invalidation`).
+- `identity_mapping` -> a missing external identity mapping is refused with
+  `INTEGRATION_NOT_AUTHORIZED`; mappings never leak across `app_id` boundaries
+  (`premise_identity_mapping`).
+- `single_writer_lease` -> a second composite writer is refused immediately while the
+  lease is held, and the lease is re-acquirable after the holder's session closes
+  (`premise_single_writer_lease`).
+- redis-free composite -> a compat-enabled configuration on a build without the
+  `redis-compat` adapter is refused at startup (`premise_redis_free_composite`).
 
 The bounded model and controlled omission tests share these stable premise names:
 

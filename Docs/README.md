@@ -56,8 +56,8 @@ All tracked Rust test assets are published with the standalone workspace: crate 
 - [Bounded safety-model inputs](authorization-validation/formal/README.md)
 - [Implementation coverage and limits](authorization-validation/IMPLEMENTATION_MAP.md)
 - [Distributed validation harness](实验/分布式测试/rust-s15/README.md)
-- [Comparison benchmark scripts](实验/基准测试/scripts/README.md)
-- [Java comparison benchmark boundary](../evaluation/benchmark-java/README.md)
+- [Comparison benchmark orchestration](../tests-suite/bench/) (moved from 实验/基准测试/scripts)
+- [Retired Java comparison baseline (archive)](../tests-suite/archive/java-baseline/benchmark-java/README.md)
 
 The sources above are published for local validation and reruns. Historical run
 records, credentials, host routing, binaries, and generated results are intentionally

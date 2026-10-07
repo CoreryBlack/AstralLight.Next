@@ -138,6 +138,12 @@ DEPENDENCY_CLASSES: Tuple[str, ...] = (
     "redis",
     "publication_worker_or_mq",
     "authoritative_database",
+    # 2026-10 架构面扩展:内存权威读面/本地失效通道/SDK 强制身份映射/
+    # 单机组合进程单写者租约(前提测试见 tests-suite/tests/security/)。
+    "memory_projection_hub",
+    "local_projection_bus",
+    "identity_mapping",
+    "single_writer_lease",
 )
 FAULT_TIMINGS: Tuple[str, ...] = ("steady_state", "in_flight_revocation")
 DEPENDENCY_FAULT_MATRIX: Dict[str, Dict[str, Any]] = {

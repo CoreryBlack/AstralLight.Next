@@ -208,7 +208,7 @@ async fn bootstrap_card(
         return Err("fixture_card_owner_or_scope_mismatch".into());
     }
     let existing_actions: Vec<String> = sqlx::query_scalar(
-        "SELECT action_code FROM permission_rule WHERE card_id = ? \\
+        "SELECT action_code FROM permission_rule WHERE card_id = ?
          AND resource_type = 'permission_rule' ORDER BY rule_id",
     )
     .bind(card_id)

@@ -263,7 +263,7 @@ async fn create_read_idempotency_cas_revoke_and_permanent_key_ownership() {
             .is_err());
 
         let distinct_case_key =
-            IntegrationIdentityKey::new(&app_id, &issuer.to_uppercase(), &subject).unwrap();
+            IntegrationIdentityKey::new(&app_id, issuer.to_uppercase(), &subject).unwrap();
         let case_create = CreateIntegrationIdentityMapping {
             key: distinct_case_key.clone(),
             user_id,

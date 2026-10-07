@@ -76,14 +76,18 @@ class RegisterConsistencyTest(unittest.TestCase):
             self.assertEqual(spec["expectedFalseBlockRate"], 0.0)
 
     def test_dependency_fault_matrix_is_full_cross_product(self):
+        # 2026-10 架构面扩展:四个新依赖类(内存权威读面/本地失效通道/
+        # SDK 强制身份映射/单写者租约)进入故障矩阵,叉积完整性约束不变。
         self.assertEqual(
             set(register.DEPENDENCY_CLASSES),
             {"cache", "redis", "publication_worker_or_mq",
-             "authoritative_database"},
+             "authoritative_database", "memory_projection_hub",
+             "local_projection_bus", "identity_mapping",
+             "single_writer_lease"},
         )
         self.assertEqual(set(register.FAULT_TIMINGS),
                          {"steady_state", "in_flight_revocation"})
-        self.assertEqual(len(register.DEPENDENCY_FAULT_MATRIX), 8)
+        self.assertEqual(len(register.DEPENDENCY_FAULT_MATRIX), 16)
         for spec in register.DEPENDENCY_FAULT_MATRIX.values():
             self.assertEqual(spec["acceptance"], "fail_closed")
 

@@ -114,7 +114,7 @@ AGPL does not grant trademark rights in the AstralLight name or logo. Use that
 implies endorsement or official affiliation requires separate written
 permission. Third-party dependencies and copied evaluation material retain
 their own license and attribution terms. See
-[`evaluation/benchmark-java/README.md`](evaluation/benchmark-java/README.md) for
+[`tests-suite/archive/java-baseline/benchmark-java/README.md`](tests-suite/archive/java-baseline/benchmark-java/README.md) for
 the Java comparison source boundary.
 
 ## No legal advice

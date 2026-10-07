@@ -152,6 +152,7 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 ├── astral-trustgraph/         # 治理、审批、审计与授权投影
 ├── astral-monitor/            # 监控、指标与告警
 ├── e2e-bootstrap/             # 隔离启动入口
+├── testsuite/ (tests-suite/)  # 分类测试套件(多租户极限/安全前提;编目见 tests-suite/MANIFEST.toml)
 ├── astral-chat/               # 冻结源码，Cargo workspace exclude
 ├── astral-learn/              # 冻结源码，Cargo workspace exclude
 └── Docs/                      # Rust 工程规范、架构、迁移与 schema

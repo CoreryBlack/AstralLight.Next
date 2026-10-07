@@ -506,10 +506,10 @@ class ModelImplementationDriftGuardTest(unittest.TestCase):
                 rust_root / "astral-db" / "src" / "evidence_cache.rs"
             ).read_text(encoding="utf-8"),
             "e2-exact-identity-omission": (
-                rust_root / "policy-engine" / "src" / "engine.rs"
+                rust_root / "policy-engine" / "src" / "engine" / "tests.rs"
             ).read_text(encoding="utf-8"),
             "e2-final-reload-omission": (
-                rust_root / "policy-engine" / "src" / "engine.rs"
+                rust_root / "policy-engine" / "src" / "engine" / "tests.rs"
             ).read_text(encoding="utf-8"),
             "e2-generation-revoke-fence-omission": (
                 rust_root / "astral-db" / "src" / "evidence_cache.rs"

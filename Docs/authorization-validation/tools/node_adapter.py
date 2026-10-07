@@ -1043,7 +1043,13 @@ class NodeAdapter:
     # -- Durable SELECT reconciliation helpers (sql only; no writes) -----------
 
     def head_state(self, aggregate_type: str, aggregate_id: int) -> List[List[str]]:
-        """RULE_SET/CARD projection head rows (read-only SELECT via :meth:`sql`)."""
+        """RULE_SET/CARD projection head rows (read-only SELECT via :meth:`sql`).
+
+        2026-10 架构标注:DIAGNOSTIC-ONLY。canonical 发布证明以
+        authorization_delta_event / authorization_projection_current 为准
+        (e1_runner.projection_snapshot 即走该路径);legacy head 行不得作为
+        发布证明引用(VALIDATION_PROTOCOL 全局规则)。
+        """
         query = (
             "SELECT aggregate_type, aggregate_id, source_generation, revoke_fence "
             "FROM authorization_projection_head "
@@ -1094,7 +1100,11 @@ class NodeAdapter:
         return self.sql(query)
 
     def outbox_rows(self, aggregate_type: str, aggregate_id: int) -> List[List[str]]:
-        """Projection outbox rows for one aggregate (read-only SELECT via :meth:`sql`)."""
+        """Projection outbox rows for one aggregate (read-only SELECT via :meth:`sql`).
+
+        2026-10 架构标注:DIAGNOSTIC-ONLY。outbox 行是写入侧关联/恢复日志,
+        不是发布完成证明;当前发布证明见 canonical delta/current 读面。
+        """
         query = (
             "SELECT outbox_id, source_generation, status, IFNULL(lease_owner,''), "
             "terminal_transitions, IFNULL(processed_by,''), IFNULL(attempts,0) "

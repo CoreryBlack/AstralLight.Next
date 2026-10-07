@@ -2152,6 +2152,31 @@ mod tests {
 
     /// 从编译后的 HotState 构造一份"已验证 durable 发布状态"镜像。segment
     /// 顺序、载荷编码、manifest 摘要全部复用 durable 发布管线的同一批纯函数。
+    /// test-support 门控的测试构造入口:为 testsuite 安全前提测试暴露与生产
+    /// warm mirror 相同形态的已发布状态封装(seal_state 的纯委托)。仅在显式
+    /// 启用 `test-support` feature 时编译,生产构建零影响。
+    #[cfg(feature = "test-support")]
+    // 消费方是 testsuite(外部 crate)的安全前提测试;astral-db 自身的
+    // lib-test 编译不使用它,dead_code 允许是特性门控支撑 API 的预期形态。
+    #[allow(dead_code)]
+    pub fn seal_published_state_for_tests(
+        identity: &ProjectionAggregateIdentity,
+        card_id: i64,
+        generation: u64,
+        hot: policy_engine::HotState,
+        parent_manifest_id: Option<i64>,
+        revoke_fence: u64,
+    ) -> AuthorizationPublishedState {
+        seal_state(
+            identity,
+            card_id,
+            generation,
+            hot,
+            parent_manifest_id,
+            revoke_fence,
+        )
+    }
+
     fn seal_state(
         identity: &ProjectionAggregateIdentity,
         card_id: i64,

@@ -6,6 +6,8 @@
 #   ./scripts/run-tests.sh --integration   # 严格真实集成 gate（含单元测试）
 #   ./scripts/run-tests.sh --full          # --integration 的兼容别名
 #   ./scripts/run-tests.sh --check         # cargo check + clippy
+#   ./scripts/run-tests.sh --mt-extreme    # testsuite 多租户混合极限套件(默认单配置)
+#   ./scripts/run-tests.sh --mt-matrix     # 按需部署形态矩阵(default/redis-compat)
 #   ./scripts/run-tests.sh --bench         # cargo bench
 #
 # 集成 gate 必须使用 docker-compose.test.yml 的隔离端口，并由调用方显式提供
@@ -113,6 +115,14 @@ stop_docker() {
     "${COMPOSE[@]}" down --remove-orphans || true
 }
 
+run_mt_extreme_gate() {
+    require_integration_environment
+    start_docker
+    start_rust_migrations
+    printf '[cargo] testsuite 多租户混合极限套件(ignored;缺依赖或连接失败必须失败)\n'
+    cargo test -p testsuite --test '*' -- --ignored --nocapture --test-threads=1
+}
+
 run_integration_gate() {
     require_integration_environment
     start_docker
@@ -140,6 +150,13 @@ case "$MODE" in
         ;;
     --integration|--full)
         run_integration_gate
+        ;;
+    --mt-extreme)
+        run_mt_extreme_gate
+        ;;
+    --mt-matrix)
+        shift || true
+        exec tests-suite/matrix/run-mt-matrix.sh "$@"
         ;;
     --bench)
         printf '[cargo] default-feature benchmark\n'

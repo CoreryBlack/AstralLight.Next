@@ -1,0 +1,428 @@
+# tests-suite 全量测试编目
+#
+# 每个条目 = 一个测试面(文件/目录)。category 见 tests-suite/README.md;
+# arch_status: current(适用当前架构)/ compat(兼容语义守卫)/ archived(不适用,带理由)。
+# 本文件是分类事实源;新增测试必须同步登记。
+
+# ═══════════════ workspace 集成测试文件(crate 级 tests/)═══════════════
+
+[[entry]]
+id = "policy-engine/authorization_compiler_alloc"
+category = "performance"
+owner_crate = "policy-engine"
+path = "policy-engine/tests/authorization_compiler_alloc.rs"
+kind = "integration"
+arch_status = "current"
+run = "cargo test -p policy-engine --test authorization_compiler_alloc"
+
+[[entry]]
+id = "policy-engine/tenant_isolation_tests"
+category = "multi-tenant"
+owner_crate = "policy-engine"
+path = "policy-engine/tests/tenant_isolation_tests.rs"
+kind = "integration-mock"
+tenants = "2(成对);10(并发求值)"
+arch_status = "current"
+note = "MockRepo 求值隔离;无并发跨租户写入场景(由 testsuite MT 套件补位)"
+run = "cargo test -p policy-engine --test tenant_isolation_tests"
+
+[[entry]]
+id = "policy-engine/oracle_tests"
+category = "compat-guard"
+owner_crate = "policy-engine"
+path = "policy-engine/tests/oracle_tests.rs"
+kind = "integration-fixture"
+arch_status = "compat"
+note = "Java/Rust 语义 oracle 对齐;L2 CARD_ONLY fallback fixture 属兼容语义(当前文档:legacy 语义仅限 legacy/test 仓储)"
+
+[[entry]]
+id = "astral-common/gateway_contract_tests"
+category = "security"
+owner_crate = "astral-common"
+path = "astral-common/tests/gateway_contract_tests.rs"
+kind = "integration"
+arch_status = "current"
+note = "含 legacy v2 签名被 v3-only 中间件拒绝的退役守卫断言"
+
+[[entry]]
+id = "astral-common/audit_tenant_tests"
+category = "multi-tenant"
+owner_crate = "astral-common"
+path = "astral-common/tests/audit_tenant_tests.rs"
+kind = "unit"
+tenants = "5(ID 不变式枚举)"
+arch_status = "current"
+
+[[entry]]
+id = "astral-db/authorization_projection_integration"
+category = "integration"
+owner_crate = "astral-db"
+path = "astral-db/tests/authorization_projection_integration.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL", "MySQL-8.0-migrated"]
+arch_status = "current"
+run = "cargo test -p astral-db --test authorization_projection_integration -- --ignored"
+
+[[entry]]
+id = "astral-db/evidence_cache_redis_integration"
+category = "integration"
+owner_crate = "astral-db"
+path = "astral-db/tests/evidence_cache_redis_integration.rs"
+kind = "integration-ignored"
+requires = ["REDIS_URL", "DATABASE_URL(部分用例)", "redis-compat feature", "ASTRAL_REDIS_PROJECTION_COMPAT=true"]
+arch_status = "current"
+run = "cargo test -p astral-db --test evidence_cache_redis_integration --features astral-db/redis-compat -- --ignored"
+
+[[entry]]
+id = "astral-db/integration"
+category = "integration"
+owner_crate = "astral-db"
+path = "astral-db/tests/integration.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL"]
+arch_status = "current"
+note = "含 formal loader 无投影头时不回退 permission_rule 的退役守卫断言"
+
+[[entry]]
+id = "astral-db/integration_identity_mapping"
+category = "security"
+owner_crate = "astral-db"
+path = "astral-db/tests/integration_identity_mapping.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL(指向 sdk_identity_mapping_test_* 专用库)", "INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE", "专用库需预先迁移"]
+arch_status = "current"
+note = "强制身份映射表契约;必须独立调用(2026-10-06 实测确认的专用调用契约)"
+
+[[entry]]
+id = "astral-db/multi_tenant_isolation"
+category = "multi-tenant"
+owner_crate = "astral-db"
+path = "astral-db/tests/multi_tenant_isolation.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL"]
+tenants = "3(A/B/C 角色)"
+arch_status = "current"
+note = "含旧快照表退役不读写守卫;testsuite MT 套件在此语义上扩展规模与并发"
+
+[[entry]]
+id = "astral-db/org_scope_integration"
+category = "multi-tenant"
+owner_crate = "astral-db"
+path = "astral-db/tests/org_scope_integration.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL"]
+tenants = "拓扑最多 7 节点"
+arch_status = "current"
+
+[[entry]]
+id = "astral-db/partition_lease_integration"
+category = "integration"
+owner_crate = "astral-db"
+path = "astral-db/tests/partition_lease_integration.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL"]
+arch_status = "current"
+
+[[entry]]
+id = "astral-db/quarantine_integration"
+category = "integration"
+owner_crate = "astral-db"
+path = "astral-db/tests/quarantine_integration.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL"]
+arch_status = "current"
+
+[[entry]]
+id = "astral-identity/integration"
+category = "integration"
+owner_crate = "astral-identity"
+path = "astral-identity/tests/integration.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL"]
+arch_status = "current"
+note = "内联角色测试拒绝 global_admin/super_admin 派生(legacy 角色映射退役守卫)"
+
+[[entry]]
+id = "astral-trustgraph/audit_replay_integration"
+category = "integration"
+owner_crate = "astral-trustgraph"
+path = "astral-trustgraph/tests/audit_replay_integration.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL", "RabbitMQ", "Redis(lease)", "redis-compat feature"]
+arch_status = "current"
+run = "cargo test -p astral-trustgraph --test audit_replay_integration --features astral-trustgraph/redis-compat -- --ignored"
+
+[[entry]]
+id = "astral-trustgraph/org_scope_projector_integration"
+category = "multi-tenant"
+owner_crate = "astral-trustgraph"
+path = "astral-trustgraph/tests/org_scope_projector_integration.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL"]
+tenants = "1(双 worker 竞争)"
+arch_status = "current"
+
+[[entry]]
+id = "astral-trustgraph/integration"
+category = "integration"
+owner_crate = "astral-trustgraph"
+path = "astral-trustgraph/tests/integration.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL"]
+arch_status = "current"
+note = "含级联删除 fail-closed 守卫(依赖 origin region 安装契约)与旧快照退役守卫"
+
+[[entry]]
+id = "astral-monitor/integration"
+category = "integration"
+owner_crate = "astral-monitor"
+path = "astral-monitor/tests/integration.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL"]
+arch_status = "current"
+note = "不含租户隔离场景(MANIFEST 记录该缺口)"
+
+# ═══════════════ excluded / 冻结 crate(编目但不进 workspace gate)═══════════════
+
+[[entry]]
+id = "astral-learn/integration"
+category = "integration"
+owner_crate = "astral-learn"
+path = "astral-learn/tests/integration.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL"]
+arch_status = "archived"
+note = "冻结源码,workspace exclude;独立验证路径见 verify-excluded-services.ps1"
+
+[[entry]]
+id = "astral-chat/integration"
+category = "integration"
+owner_crate = "astral-chat"
+path = "astral-chat/tests/integration.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL"]
+arch_status = "archived"
+note = "冻结源码,workspace exclude"
+
+[[entry]]
+id = "astral-cache/redis_key_scope_tests"
+category = "integration"
+owner_crate = "astral-cache"
+path = "astral-cache/tests/redis_key_scope_tests.rs"
+kind = "unit"
+arch_status = "archived"
+note = "自包含归档库;含已退役 permission:snapshot:{card_id} 键语义(归档理由)"
+
+[[entry]]
+id = "integrations/learn+chat"
+category = "e2e"
+owner_crate = "integrations"
+path = "integrations/learn/tests/ integrations/chat/tests/"
+kind = "integration"
+requires = ["SDK 服务面"]
+arch_status = "current"
+note = "SDK admission/proofs/websocket 授权集成(exclude 目录,独立验证)"
+
+# ═══════════════ 内联单元测试(#[cfg(test)];物理上属于属主 crate)═══════════════
+
+[[entry]]
+id = "inline/policy-engine"
+category = "unit-inline"
+owner_crate = "policy-engine"
+kind = "unit-inline"
+modules = 11
+arch_status = "current"
+note = "src/engine/tests.rs 4287 行,含 5 个 E2 运行时开关测试与 legacy fallback 兼容 mock"
+
+[[entry]]
+id = "inline/astral-db"
+category = "unit-inline"
+owner_crate = "astral-db"
+kind = "unit-inline"
+modules = 36
+arch_status = "current"
+note = "migration/tests.rs 4576 行(退役迁移 pin)、authorization_projection_repository/tests.rs 5714 行(no-legacy-fallback 守卫)、memory_projection_hub 测试与性能矩阵"
+
+[[entry]]
+id = "inline/astral-trustgraph"
+category = "unit-inline"
+owner_crate = "astral-trustgraph"
+kind = "unit-inline"
+modules = 70
+arch_status = "current"
+note = "authorization_projector/tests.rs 3940 行 + 完整阶段规划/父查找性能矩阵;多处 legacy_snapshot_reads_are_gone 守卫"
+
+[[entry]]
+id = "inline/astral-common"
+category = "unit-inline"
+owner_crate = "astral-common"
+kind = "unit-inline"
+modules = 15
+arch_status = "current"
+
+[[entry]]
+id = "inline/astral-mq"
+category = "unit-inline"
+owner_crate = "astral-mq"
+kind = "unit-inline"
+modules = 11
+arch_status = "current"
+
+[[entry]]
+id = "inline/astral-gateway"
+category = "unit-inline"
+owner_crate = "astral-gateway"
+kind = "unit-inline"
+modules = 6
+arch_status = "current"
+note = "角色字符串不派生特权 action(legacy 角色映射退役守卫)"
+
+[[entry]]
+id = "inline/astral-identity"
+category = "unit-inline"
+owner_crate = "astral-identity"
+kind = "unit-inline"
+modules = 19
+arch_status = "current"
+
+[[entry]]
+id = "inline/astral-monitor"
+category = "unit-inline"
+owner_crate = "astral-monitor"
+kind = "unit-inline"
+modules = 7
+arch_status = "current"
+
+[[entry]]
+id = "inline/astral-single-node"
+category = "unit-inline"
+owner_crate = "astral-single-node"
+kind = "unit-inline"
+modules = 2
+arch_status = "current"
+note = "writer lease 监督分类 + 启动顺序形态"
+
+[[entry]]
+id = "inline/e2e-bootstrap"
+category = "unit-inline"
+owner_crate = "e2e-bootstrap"
+kind = "unit-inline"
+modules = 2
+arch_status = "current"
+
+[[entry]]
+id = "inline/astral-sdk*"
+category = "unit-inline"
+owner_crate = "astral-sdk / astral-sdk-contracts / astral-sdk-axum"
+kind = "unit-inline"
+modules = 3
+arch_status = "current"
+
+# ═══════════════ 性能/基准 ═══════════════
+
+[[entry]]
+id = "bench/policy-engine-benches"
+category = "performance"
+owner_crate = "policy-engine"
+path = "policy-engine/benches/"
+kind = "bench"
+arch_status = "current"
+note = "5 个 bench 目标(authorization_compiler/alloc/iai/policy/tenant_isolation);cargo bench -p policy-engine"
+
+[[entry]]
+id = "bench/engine-comparison"
+category = "performance"
+owner_crate = "bench/engine-comparison(独立 crate)"
+path = "bench/engine-comparison/"
+kind = "bench-binary"
+arch_status = "current"
+note = "AstralLight vs Casbin/Cedar(进程内)+ OPA(sidecar);cargo run --release --run-id=..."
+
+[[entry]]
+id = "bench/loadgen"
+category = "performance"
+owner_crate = "bench/loadgen(独立 crate)"
+path = "bench/loadgen/"
+kind = "bench-binary"
+arch_status = "current"
+note = "HMAC v3 压测客户端;scripts/bench_matrix.sh 并发阶梯(native 基准入口)"
+
+[[entry]]
+id = "perf/no-regression-matrices"
+category = "performance"
+owner_crate = "astral-db / astral-trustgraph"
+kind = "ignored-test"
+arch_status = "current"
+note = "3 个 #[ignore] CPU-only 矩阵(memory hub / stage plan / parent lookup);ASTRAL_PERF_SAMPLES/ASTRAL_PERF_CASE 可调"
+
+# ═══════════════ 安全证明 / 形式化 ═══════════════
+
+[[entry]]
+id = "security/authz-validation-tools"
+category = "security"
+owner_crate = "Docs/authorization-validation/tools"
+path = "Docs/authorization-validation/tools/"
+kind = "python-tests"
+arch_status = "current"
+note = "E1-E5 离线工具 + 15 个 test_*.py(473 例);E2 五前提映射见 experiment_register.py"
+
+[[entry]]
+id = "security/admission-safety-tla"
+category = "security"
+owner_crate = "Docs/authorization-validation/formal"
+path = "Docs/authorization-validation/formal/"
+kind = "model"
+arch_status = "current"
+note = "TLA+ AdmissionSafety 草案 + 5 变体 cfg;TLC 运行 BLOCKED(无 pinned checksum-verified TLC)"
+
+[[entry]]
+id = "security/testsuite-premises"
+category = "security"
+owner_crate = "testsuite"
+path = "testsuite/tests/security/"
+kind = "integration-ignored"
+arch_status = "current"
+note = "新增架构前提:hub 失效遗漏 / 强制身份映射 / 单写者租约 / Redis-free composite 门(2026-10 新增)"
+
+# ═══════════════ e2e / 多租户极限(testsuite 新增)═══════════════
+
+[[entry]]
+id = "e2e/single-node-native"
+category = "e2e"
+owner_crate = "astral-single-node + bench/loadgen"
+path = "tests-suite/e2e/"
+kind = "campaign"
+requires = ["MySQL", "Redis(可选)", "RabbitMQ(可选)", "composite 二进制", "loadgen 二进制"]
+arch_status = "current"
+note = "部署配方 + bench_matrix 阶梯(seed → bootstrap → 启动 → 收敛 → 压测 → 收尾)"
+
+[[entry]]
+id = "e2e/distributed-s15"
+category = "e2e"
+owner_crate = "Docs/实验/分布式测试/rust-s15"
+path = "Docs/实验/分布式测试/rust-s15/"
+kind = "campaign"
+arch_status = "current"
+note = "三节点分布式战役 harness(历史);真实运行需受保护环境与审批,保持 BLOCKED 边界"
+
+[[entry]]
+id = "mt-extreme/testsuite"
+category = "multi-tenant-extreme"
+owner_crate = "testsuite"
+path = "tests-suite/tests/"
+kind = "integration-ignored"
+requires = ["DATABASE_URL", "RUST_INTEGRATION_REQUIRED=1(部分套件需 Redis/RabbitMQ)"]
+tenants = "64(隔离)/ 可配置(搅动)/ 512(容量)"
+arch_status = "current"
+note = "MT-E1 隔离 / MT-E3 搅动 / MT-E4 跨租户失效风暴 / MT-E5 容量 / MT-E6 失败注入;配置矩阵见 matrix/run-mt-matrix.sh"
+
+# ═══════════════ harness ═══════════════
+
+[[entry]]
+id = "harness/run-tests"
+category = "harness"
+owner_crate = "scripts"
+path = "scripts/run-tests.sh"
+kind = "script"
+arch_status = "current"
+note = "unit/check/integration/bench + --mt-extreme/--mt-matrix(testsuite 扩展)"

@@ -1,0 +1,39 @@
+[package]
+name = "testsuite"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
+
+# 分类测试套件 crate:承载 tests-suite 下新增的测试(多租户混合极限、
+# 安全前提扩展)。既有各 crate 测试不物理搬迁,由 tests-suite/MANIFEST.toml
+# 全量编目;单元测试(#[cfg(test)] 内联)按 Cargo 语义留在属主 crate。
+
+[dependencies]
+astral-types = { path = "../astral-types" }
+astral-common = { path = "../astral-common" }
+astral-db = { path = "../astral-db" }
+astral-mq = { path = "../astral-mq" }
+astral-gateway = { path = "../astral-gateway" }
+policy-engine = { path = "../policy-engine" }
+astral-trustgraph = { path = "../astral-trustgraph" }
+astral-identity = { path = "../astral-identity" }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+
+[features]
+default = ["astral-db/test-support"]
+# 按需矩阵运行入口:cargo test -p testsuite --features redis-compat
+redis-compat = [
+    "astral-db/redis-compat",
+    "astral-common/redis-compat",
+    "astral-gateway/redis-compat",
+    "astral-identity/redis-compat",
+    "astral-trustgraph/redis-compat",
+    "astral-mq/redis-compat",
+]

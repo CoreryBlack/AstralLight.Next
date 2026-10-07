@@ -1526,7 +1526,15 @@ class E1RunnerTestCase(unittest.TestCase):
         self.assertIn("log_slice_returned_no_e1_events", cycle["problems"])
         self.assertEqual(cycle["classifications"], [])
         self.assertGreater(cycle["counts"]["unknown"], 0)
-        self.assertGreater(cycle["counts"]["unclassified"], 0)
+        # 确定性不变式(替代原 racy ">0" 断言):unclassified 必须精确等于
+        # 成功(200)读者尝试数——空日志切片下没有任何尝试可被分类,成功
+        # 尝试全部计为 unclassified;两者之差永远是缺陷信号。
+        reader_200s = sum(
+            1
+            for attempt in cycle["readerAttempts"]
+            if attempt.get("httpStatus") == 200
+        )
+        self.assertEqual(cycle["counts"]["unclassified"], reader_200s)
 
     def test_missing_delete_audit_correlation_prevents_pass(self) -> None:
         world = FakeWorld()

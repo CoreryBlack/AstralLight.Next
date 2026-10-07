@@ -102,8 +102,9 @@ of the default test commands.
 - `astral-monitor/`: monitoring and alerting.
 - `e2e-bootstrap/`: isolated bootstrap entry point.
 - `bench/`: Rust comparison and load-generation crates, each outside the default members when documented by its manifest.
+- `testsuite/` (under `tests-suite/`): workspace member carrying the consolidated new suites (multi-tenant extreme, security premises).
 - `Docs/`: Rust engineering rules, architecture, migrations, schemas, authorization validation protocols, and reproducibility boundaries.
-- `evaluation/benchmark-java/`: copied Java comparison source and tests; evaluation-only and outside the Cargo workspace.
+- `tests-suite/`: consolidated classified test suite (manifest, new multi-tenant extreme and security suites, benchmark orchestration) with the retired Java comparison baseline archived under `tests-suite/archive/java-baseline/`.
 
 ## Tests and reproducibility code
 
@@ -121,8 +122,12 @@ campaign has passed:
   currently marked `BLOCKED` until a pinned TLC run exists;
 - distributed validation harness source under
   [`Docs/实验/分布式测试/rust-s15/`](Docs/实验/分布式测试/rust-s15/);
-- Rust and Java comparison benchmark source plus the scripts and SQL fixtures
-  under [`Docs/实验/基准测试/scripts/`](Docs/实验/基准测试/scripts/);
+- Rust comparison benchmark orchestration and fixtures under
+  [`tests-suite/bench/`](tests-suite/bench/), with the retired Java comparison
+  baseline and its scripts archived under
+  [`tests-suite/archive/java-baseline/`](tests-suite/archive/java-baseline/);
+- multi-tenant mixed extreme suites and security premises under
+  [`tests-suite/`](tests-suite/README.md);
 - the implementation coverage map at
   [`Docs/authorization-validation/IMPLEMENTATION_MAP.md`](Docs/authorization-validation/IMPLEMENTATION_MAP.md);
 - three tracked historical integration reports, which are records of earlier

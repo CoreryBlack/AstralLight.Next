@@ -218,6 +218,7 @@ class CampaignEntrySafetyTest(unittest.TestCase):
         self.assertIn("e5-bounded-model-two-mutations", specs)
         self.assertIn("e5-universal-hypotheses", specs)
         self.assertTrue(specs["e5-bounded-model-two-mutations"]["assertTwoMutationModel"])
+        self.assertNotIn("--json", specs["e5-bounded-model-two-mutations"]["argv"])
         self.assertTrue(specs["e5-universal-hypotheses"]["assertUniversalHypotheses"])
         # The heavy enumerations carry their own timeouts, never the
         # 1800 s default silently applied to them.
@@ -357,7 +358,7 @@ class RunCommandFailureSemanticsTest(unittest.TestCase):
             {"id": "e5-bad", "argv": ["python"], "assertE5AbstractModel": True},
             return_value=subprocess.CompletedProcess([], 0, "not-json", ""),
         )
-        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["status"], "UNKNOWN")
         self.assertFalse(result["assertionPassed"])
         self.assertEqual(result["abstractModelStatus"], "UNKNOWN")
 
@@ -371,7 +372,7 @@ class RunCommandFailureSemanticsTest(unittest.TestCase):
             {"id": "e5-incomplete", "argv": ["python"], "assertE5AbstractModel": True},
             return_value=subprocess.CompletedProcess([], 0, report, ""),
         )
-        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["status"], "UNKNOWN")
         self.assertEqual(result["abstractModelStatus"], "UNKNOWN")
 
     def test_e5_report_without_full_contract_fails_closed(self) -> None:
@@ -380,15 +381,12 @@ class RunCommandFailureSemanticsTest(unittest.TestCase):
             {"id": "e5-shape", "argv": ["python"], "assertE5AbstractModel": True},
             return_value=subprocess.CompletedProcess([], 0, '{"unexpected": true}', ""),
         )
-        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["status"], "UNKNOWN")
         self.assertEqual(result["abstractModelStatus"], "UNKNOWN")
 
     def test_e5_complete_passing_report_passes(self) -> None:
-        report = (
-            '{"fullContract": {"status": "PASS", "modes": '
-            '{"bracket": {"explorationComplete": true, "violations": 0}, '
-            '"strict": {"explorationComplete": true, "violations": 0}}}}'
-        )
+        from test_model_acceptance import full_report
+        report = __import__("json").dumps(full_report())
         result, _ = _run_isolated_command(
             self.module,
             {"id": "e5-good", "argv": ["python"], "assertE5AbstractModel": True},

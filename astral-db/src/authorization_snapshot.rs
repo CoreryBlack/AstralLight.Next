@@ -1452,7 +1452,7 @@ mod tests {
 
     #[test]
     fn published_card_reader_and_bundle_share_one_strict_load_path() {
-        let source = include_str!("authorization_projection_repository.rs");
+        let source = include_str!("authorization_projection_repository.rs").replace("\r\n", "\n");
         let production = source
             .split("#[cfg(test)]")
             .next()

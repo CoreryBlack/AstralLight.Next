@@ -1255,16 +1255,18 @@ const LEGACY_CHANNEL_SYMBOLS: [&str; 11] = [
 /// `#[cfg(test)] mod tests` marker, asserts that marker is unique, and is
 /// proven end-to-end by
 /// [`legacy_guard_self_test_proves_late_production_symbol_detection`].
-fn production_source_slice(full_source: &'static str) -> &'static str {
+fn production_source_slice(full_source: &str) -> String {
+    let mut source = full_source.replace("\r\n", "\n");
     const TEST_SECTION_MARKER: &str = "\n#[cfg(test)]\nmod tests";
-    let first = full_source.find(TEST_SECTION_MARKER).unwrap_or_else(|| {
+    let first = source.find(TEST_SECTION_MARKER).unwrap_or_else(|| {
         panic!("module-level test section marker missing; production scan refused")
     });
     assert!(
-        !full_source[first + TEST_SECTION_MARKER.len()..].contains(TEST_SECTION_MARKER),
+        !source[first + TEST_SECTION_MARKER.len()..].contains(TEST_SECTION_MARKER),
         "multiple module-level test sections detected; slice would be ambiguous"
     );
-    &full_source[..first + 1]
+    source.truncate(first + 1);
+    source
 }
 
 fn assert_no_legacy_channel_symbols(production: &str, context: &str) {
@@ -1324,12 +1326,12 @@ fn worker_source_has_no_legacy_channel_symbols() {
     assert!(planning_source.contains("partition_ledger_at_published_frontier("));
 
     for (name, source) in [
-        ("authorization_projector.rs", production),
+        ("authorization_projector.rs", production.as_str()),
         ("config.rs", config_source),
         ("runtime.rs", runtime_source),
         ("worker.rs", worker_source),
         ("planning.rs", planning_source),
-        ("parent_ordinals.rs", ordinal_source),
+        ("parent_ordinals.rs", ordinal_source.as_str()),
     ] {
         assert_no_legacy_channel_symbols(source, name);
     }

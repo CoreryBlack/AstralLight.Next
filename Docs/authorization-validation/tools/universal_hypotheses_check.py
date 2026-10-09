@@ -73,8 +73,9 @@ SCOPE AND EVIDENCE BOUNDARY (read this first):
   implementations, of any deployment, or of any runtime behavior, and
   it does not upgrade any live E1/E3/E4 status.
 - The TLA+ input under ``formal/`` remains a draft: no pinned,
-  checksum-verified TLC exists in this checkout, and this checker does
-  not invoke any solver, subprocess, or network.
+  checksum-verified TLC exists in this checkout. Optional bounded worker
+  processes evaluate independent configurations only; no solver or network
+  is invoked, and import has no process side effects.
 - Status vocabulary is shared with the validation protocol: PASS
   requires the property to hold over the complete exploration; FAIL is
   decisive; UNKNOWN marks incomplete or undecidable domains. Live
@@ -174,7 +175,7 @@ def _proper_subsets(items):
     return out
 
 
-def check_universal_hypotheses(bound=None, model_name="single", lattice="full"):
+def check_universal_hypotheses(bound=None, model_name="single", lattice="full", workers=1):
     """Run every universal hypothesis; return a report dict.
 
     ``model_name`` selects the registered model (``single``: one candidate
@@ -187,6 +188,9 @@ def check_universal_hypotheses(bound=None, model_name="single", lattice="full"):
     overall status is PASS only when every hypothesis PASSes.
     """
     mod = MODEL_REGISTRY[model_name]
+    from bounded_model_execution import run_configurations, validate_workers
+
+    validate_workers(workers)
     mapping = (
         OMISSION_SCHEDULE_CLASS if model_name == "single"
         else OMISSION_SCHEDULE_CLASS_TWO_MUTATIONS
@@ -202,6 +206,21 @@ def check_universal_hypotheses(bound=None, model_name="single", lattice="full"):
     # (U8) keep their exact bound in the key. U6/U7/U8/U10 would otherwise
     # re-enumerate the same bracket omissions four times.
     run_cache = {}
+    if workers > 1:
+        configurations = [(full, mode, bound) for mode in ("bracket", "strict")]
+        subsets = _proper_subsets(mod.PREMISES) if lattice == "full" else [(p,) for p in mod.PREMISES]
+        for removed in subsets:
+            configurations.append(({p: p not in removed for p in mod.PREMISES}, "bracket", bound))
+        for premise in mod.PREMISES:
+            configurations.append((mod.without_premise(premise), "bracket", bound))
+        bound_configs = [("full-bracket", full, "bracket"), ("full-strict", full, "strict")]
+        bound_configs.extend(("without-" + p, mod.without_premise(p), "bracket") for p in mod.PREMISES)
+        for name, premises, mode in bound_configs:
+            required = mod.required_bound(premises, mode)
+            configurations.append((premises, mode, required))
+            if (model_name == "single" or name in {"full-bracket", "full-strict"}) and required - 1 >= mod.MIN_BOUND:
+                configurations.append((premises, mode, required - 1))
+        run_cache = run_configurations(mod.__name__, configurations, workers)
 
     def cached_run(prem, mode, run_bound):
         required = mod.required_bound(prem, mode)
@@ -701,6 +720,7 @@ def _format_text_report(report):
 _MANIFEST_SOURCES = (
     "e5_model_check.py",
     "e5_model_check_two_mutations.py",
+    "bounded_model_execution.py",
     "universal_hypotheses_check.py",
     "experiment_common.py",
     "test_universal_hypotheses_check.py",
@@ -744,8 +764,8 @@ def write_manifest(report, out_path, started_at, finished_at, argv):
         },
         "report": report,
         "durablePostcondition": (
-            "none required: the checker is in-process, side-effect-free, "
-            "and writes only this manifest file"
+            "none required: model workers are side-effect-free and owned by "
+            "their invocation; only this manifest file is written"
         ),
         "logCompleteness": (
             "complete: the report embeds all run aggregates; no separate "
@@ -813,6 +833,10 @@ def main(argv=None):
             "evidence/; an existing manifest is never overwritten)"
         ),
     )
+    from bounded_model_execution import MAX_WORKERS
+
+    parser.add_argument("--workers", type=int, choices=range(1, MAX_WORKERS + 1), default=1,
+                        help="bounded independent model processes; configuration coverage is unchanged")
     args = parser.parse_args(argv)
     started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     model_names = (
@@ -822,7 +846,7 @@ def main(argv=None):
     for name in model_names:
         lattice = args.lattice or ("full" if name == "single" else "singles")
         reports[name] = check_universal_hypotheses(
-            args.bound, model_name=name, lattice=lattice
+            args.bound, model_name=name, lattice=lattice, workers=args.workers
         )
     finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     if len(reports) == 1:

@@ -211,19 +211,16 @@ async fn mt_e1_sixty_four_tenant_interleaved_isolation() {
         if target.tenant_id == probe_as.tenant_id {
             continue;
         }
-        let evidence =
+        let error =
             load_published_card_grant_evidence(&pool, &cross_scope(probe_as, target.card_id))
                 .await
-                .expect("cross-tenant probe must not error at transport level");
+                .expect_err("foreign card must have no current pointer in the probe tenant");
         assert!(
-            evidence.gate.status != PublishedEvidenceGateStatus::Ready
-                || evidence.effective_grants.is_empty(),
-            "cross-tenant scope must not serve foreign grants"
+            matches!(error, astral_db::AuthorizationEvidenceError::NotReady(ref code)
+            if code.contains("current_pointer_missing")),
+            "unexpected refusal: {error}"
         );
-        assert!(evidence
-            .effective_grants
-            .iter()
-            .all(|grant| grant.tenant.tenant_id == probe_as.tenant_id));
+        assert_eq!(error.as_gate_status(), PublishedEvidenceGateStatus::Pending);
     }
 
     // 审计:每租户 1 行 + tenant_id 过滤不变式。

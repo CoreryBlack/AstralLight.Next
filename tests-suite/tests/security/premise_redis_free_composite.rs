@@ -13,8 +13,10 @@ use astral_common::config::AppConfig;
 
 #[test]
 fn compat_flag_without_compiled_adapter_is_refused_fail_closed() {
-    let mut cfg = AppConfig::default();
-    cfg.redis_projection_compat_enabled = true;
+    let cfg = AppConfig {
+        redis_projection_compat_enabled: true,
+        ..AppConfig::default()
+    };
     // testsuite 默认构建不含 redis-compat:compiled 必须为 false。
     let compiled = cfg!(feature = "redis-compat");
     let outcome = cfg.validate_redis_adapter_support(compiled);

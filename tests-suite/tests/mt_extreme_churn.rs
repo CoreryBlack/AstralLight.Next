@@ -57,11 +57,10 @@ async fn mt_e3_tenant_grant_churn() {
 
     let pool = std::sync::Arc::new(pool);
     let fixture = std::sync::Arc::new(fixture);
-    let pointers = std::sync::Arc::new(pointers);
 
     for round in 1..=ROUNDS {
         let generation = round + 1;
-        let revoked = round % 2 == 0; // 偶数轮 = 撤销(零有效授权)
+        let revoked = round % 2 == 1; // gen2/gen4 撤销,gen3/gen5 恢复
 
         // 并发读者:writers 翻转期间,读者断言"仅当前代或上一代语义"。
         let mut readers = Vec::new();
@@ -106,7 +105,7 @@ async fn mt_e3_tenant_grant_churn() {
                     (round + 2) as u16,
                 )]
             };
-            publish_card_manifest(
+            let outcome = publish_card_manifest(
                 &pool,
                 tenant.tenant_id,
                 tenant.card_id,
@@ -117,6 +116,7 @@ async fn mt_e3_tenant_grant_churn() {
                 Some(pointers[tenant.ordinal as usize - 1].as_view()),
             )
             .await;
+            pointers[tenant.ordinal as usize - 1] = outcome.pointer;
         }
         for reader in readers {
             reader.await.unwrap();
@@ -137,13 +137,13 @@ async fn mt_e3_tenant_grant_churn() {
         }
     }
 
-    // 终态(第 4 轮 = 撤销):全部零有效授权,READY 而非 Pending。
+    // 终态(第 4 轮 = 恢复):全部 1 条有效授权,READY 而非 Pending。
     for tenant in &fixture.tenants {
         let evidence = load_published_card_grant_evidence(&pool, &tenant.card_scope())
             .await
             .unwrap();
         assert_eq!(evidence.gate.status, PublishedEvidenceGateStatus::Ready);
-        assert_eq!(evidence.gate.effective_grant_count, 0);
+        assert_eq!(evidence.gate.effective_grant_count, 1);
     }
 
     cleanup_suite_rows(&pool, &fixture).await.unwrap();

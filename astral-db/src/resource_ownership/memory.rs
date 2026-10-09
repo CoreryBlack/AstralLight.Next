@@ -727,7 +727,7 @@ mod tests {
 
     #[test]
     fn refill_is_bounded_by_deadlines_and_lock_wait() {
-        let source = include_str!("memory.rs");
+        let source = include_str!("memory.rs").replace("\r\n", "\n");
         let production = source
             .split_once(concat!("#[", "cfg(test)]\nmod tests"))
             .unwrap()

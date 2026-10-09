@@ -4,6 +4,8 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "e3-observability")]
+use super::{log_e3_attempt_event, log_e3_identity_event};
 use super::{reconcile_lease_mutation_loss, CLAIM_LEASE_SECS};
 
 use async_trait::async_trait;

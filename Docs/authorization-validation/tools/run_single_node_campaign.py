@@ -27,6 +27,7 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from experiment_common import atomic_json, verify_checksums, write_checksums
+from model_acceptance import check_full_contract, check_universal
 
 PREVIOUS_ATTEMPT = {
     "campaignId": "authz-validation-20260919-single-node-005",
@@ -166,7 +167,7 @@ COMMANDS: list[dict[str, Any]] = [
     },
     {
         "id": "e5-bounded-model-two-mutations",
-        "argv": ["python", str(TOOLS / "e5_model_check_two_mutations.py"), "--json"],
+        "argv": ["python", str(TOOLS / "e5_model_check_two_mutations.py")],
         "required": True,
         "assertTwoMutationModel": True,
         "timeoutSeconds": 2400,
@@ -236,6 +237,7 @@ HASHED_SOURCES = [
     "Docs/authorization-validation/tools/test_experiment_register.py",
     "Docs/authorization-validation/tools/test_classify_e1_properties.py",
     "Docs/authorization-validation/tools/run_single_node_campaign.py",
+    "Docs/authorization-validation/tools/model_acceptance.py",
     "Docs/authorization-validation/tools/test_run_single_node_campaign.py",
     "Docs/authorization-validation/formal/AdmissionSafety.tla",
     "Docs/authorization-validation/formal/AdmissionSafetyFull.cfg",
@@ -305,47 +307,28 @@ def run_command(spec: dict[str, Any]) -> dict[str, Any]:
     abstract_model_status = None
     two_mutation_status = None
     universal_status = None
-    if spec.get("assertE5AbstractModel") and execution_status == "PASS":
+    model_checks = (
+        ("assertE5AbstractModel", "single"),
+        ("assertTwoMutationModel", "two"),
+        ("assertUniversalHypotheses", "universal"),
+    )
+    for flag, model_name in model_checks:
+        if not spec.get(flag) or execution_status != "PASS":
+            continue
         try:
             model_report = json.loads(stdout)
-            modes = model_report["fullContract"]["modes"]
-            assertion_ok = assertion_ok and model_report["fullContract"]["status"] == "PASS"
-            assertion_ok = assertion_ok and all(
-                mode["explorationComplete"] and mode["violations"] == 0
-                for mode in modes.values()
-            )
-            abstract_model_status = model_report["fullContract"]["status"]
-        except (ValueError, KeyError, TypeError):
-            assertion_ok = False
-            abstract_model_status = "UNKNOWN"
-    if spec.get("assertTwoMutationModel") and execution_status == "PASS":
-        try:
-            model_report = json.loads(stdout)
-            modes = model_report["fullContract"]["modes"]
-            assertion_ok = assertion_ok and model_report["fullContract"]["status"] == "PASS"
-            assertion_ok = assertion_ok and all(
-                mode["explorationComplete"] and mode["violations"] == 0
-                for mode in modes.values()
-            )
-            two_mutation_status = model_report["fullContract"]["status"]
-        except (ValueError, KeyError, TypeError):
-            assertion_ok = False
-            two_mutation_status = "UNKNOWN"
-    if spec.get("assertUniversalHypotheses") and execution_status == "PASS":
-        try:
-            check_report = json.loads(stdout)
-            models = check_report["models"]
-            assertion_ok = assertion_ok and check_report["status"] == "PASS"
-            for name, item in models.items():
-                assertion_ok = assertion_ok and item["status"] == "PASS"
-                assertion_ok = assertion_ok and all(
-                    hypothesis["status"] == "PASS"
-                    for hypothesis in item["hypotheses"]
-                )
-            universal_status = check_report["status"]
-        except (ValueError, KeyError, TypeError):
-            assertion_ok = False
-            universal_status = "UNKNOWN"
+            checked = check_universal(model_report) if model_name == "universal" else check_full_contract(model_report, model_name)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            checked = {"status": "UNKNOWN"}
+        assertion_ok = assertion_ok and checked["status"] == "PASS"
+        if model_name == "single":
+            abstract_model_status = checked["status"]
+        elif model_name == "two":
+            two_mutation_status = checked["status"]
+        else:
+            universal_status = checked["status"]
+        if checked["status"] == "UNKNOWN":
+            execution_status = "UNKNOWN"
     ignored_count = sum(
         int(match.group(1)) for match in re.finditer(r"(\d+) ignored;", stdout)
     )

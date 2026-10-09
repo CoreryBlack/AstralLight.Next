@@ -44,6 +44,18 @@ class TwoMutationStrictContractTest(unittest.TestCase):
         self.assertEqual(self.strict_run["violations"], 0)
         self.assertEqual(self.strict_run["admittedDomainCounts"]["strictlyBefore"], 0)
 
+    def test_branch_backtracking_preserves_complete_strict_counts(self):
+        repeated = m2.run_model(m2.normalize_premises(), "strict", FAST_BOUND)
+        self.assertEqual(repeated, self.strict_run)
+        self.assertEqual(
+            repeated["admittedTraces"] + repeated["deniedTraces"],
+            repeated["exploredTraces"],
+        )
+        self.assertEqual(
+            sum(repeated["admittedDomainCounts"].values()),
+            repeated["admittedTraces"],
+        )
+
     def test_cross_mutation_torn_states_are_reachable_and_rejected(self):
         torn = self.strict_run["mixedManifestBody"]
         self.assertGreater(torn["tornReadTraces"], 0)

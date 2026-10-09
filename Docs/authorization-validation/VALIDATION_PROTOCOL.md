@@ -1,6 +1,6 @@
 # Authorization Validation Protocol
 
-> Updated 2026-09-21. This document defines reusable validation entry points and
+> Updated 2026-10-07. This document defines reusable validation entry points and
 > record formats. It does not authorize execution; every live run still follows the
 > execution, preflight, scope, and durable-postcondition gates in `AGENTS.md`.
 
@@ -91,11 +91,26 @@ weaker boundary supported by the available data.
 
 ## E4: deployment prerequisites and fail closed
 
-For each live run, record MySQL isolation and primary routing, UTC session/time source,
-clock offset, cache-generation initialization/rotation, Redis unavailability, stale
-HMAC, pointer movement, worker restart, lease expiry, and unknown acknowledgements.
+For each live run, record the selected production profile, MySQL isolation and
+primary routing, UTC session/time source, clock offset, integrity key rotation,
+pointer movement, worker/receiver ownership, lease expiry and unknown completion.
+The offline `dependency_profiles.py`, experiment register and `e4_fault_driver.py
+--plan --profile ...` select only faults belonging to that deployment:
+
+- `native-single-node`: MySQL, memory hub freshness/TTL/capacity, local projection
+  admission/overflow/receiver ownership, source-commit uncertainty, sticky worker
+  death, pointer/integrity fences, single-writer session and unknown local completion.
+- `standalone-rabbit` and `distributed`: MySQL plus Rabbit transport and durable
+  consumer/lease evidence. Redis is not a dependency of these current profiles.
+- `redis-compat`: Redis generation/unavailability only in the explicit adapter window;
+  never inject or provision Redis merely to execute a native fault case.
+
 Every unproven failure path must terminate in `PENDING` or `DENY` with a reason code.
-Unprovable prerequisites remain `BLOCKED` or `UNKNOWN`.
+Plans and fake-controller tests are offline contracts, not executed native faults.
+The live controller still requires explicit authorization, run-owned resources,
+restoration, reconciliation, complete observations and durable postcondition proof.
+No unknown outcome is automatically retried; missing live primitives remain
+`BLOCKED`, and interrupted or unproven results remain `UNKNOWN`.
 
 ## E5: model and implementation comparison
 
@@ -116,8 +131,18 @@ dependency classes registered in `experiment_register.py`):
 - `single_writer_lease` -> a second composite writer is refused immediately while the
   lease is held, and the lease is re-acquirable after the holder's session closes
   (`premise_single_writer_lease`).
-- redis-free composite -> a compat-enabled configuration on a build without the
-  `redis-compat` adapter is refused at startup (`premise_redis_free_composite`).
+- redis-free configuration -> a compat-enabled configuration on a build without the
+  `redis-compat` adapter is refused by the AppConfig capability gate
+  (`premise_redis_free_composite`). This fixture is not a full composite startup;
+  the native composite itself does not provide a `redis-compat` feature.
+
+`native_projection_lifecycle` separately exercises a real TrustGraph source
+repository add/revoke, committed local dispatch, durable delta/audit correlation,
+publication pipeline, published pointer/fence and strict PolicyEngine read with a
+production local projector owner. Source APIs can also publish synchronously after
+COMMIT; this test does not attribute every publication exclusively to the async
+worker. It is one MySQL-backed ignored test per binary because process-global bus
+ownership is not resettable, and it is not a signed HTTP host race campaign.
 
 The bounded model and controlled omission tests share these stable premise names:
 
@@ -134,11 +159,29 @@ side only when the corresponding tests are updated together.
 
 ## Offline suites and lifecycle observations
 
+The production-profile/series index is in `tests-suite/MANIFEST.toml`; its runner
+is `scripts/test_campaign.py`. RQ components, authorization assumptions M1-M5,
+E1-E5, MT-E and performance attribution are separate. The runner executes explicit
+argv against a frozen source hash and existing approved dependencies only, requires
+nonempty assertions, retains ignored/internal skips, and records `PASS`, `FAIL`,
+`BLOCKED`, `SKIP`, `UNKNOWN` or `PENDING`. Per-series summaries describe only the
+selected evidence scope, not a full live campaign. E5 omission counterexamples do
+not fail the full model, but incomplete full-contract exploration cannot pass.
+The two-mutation model partitions independent, non-overlapping event prefixes across
+at most twelve owned processes (the CLI default remains one). Its reducer requires
+the exact complete shard set and
+preserves serial state/trace counts, diagnostic counters and minimal counterexamples;
+no model bound or premise is removed. On POSIX, the campaign runner waits for the
+entire command process group to exit before freezing stdout/stderr hashes, including
+late resource-tracker output. A terminated exploration remains `UNKNOWN` and is never
+upgraded by its cleanup warning or by a subsequent independent run.
+
 The local Rust suites cover strict final reload/error classification, gateway identity
 contracts, path/resource registration, and observation wiring. They remain in-process
-checks. MySQL/Redis/RabbitMQ, Docker, ignored integration, remote-node, and live fault
-scenarios require their own environment and remain `BLOCKED` until independently
-reconciled.
+checks. Native real integration requires MySQL only; Rabbit is specific to standalone
+transport and Redis to compatibility. Docker, ignored integration, remote-node and
+live fault scenarios require their own approved environment and remain `BLOCKED`
+until independently reconciled.
 
 Metrics record low-cardinality phases and result enums only. Identity, secrets, raw
 paths, SQL/Redis keys, exception text, and request/operation correlation stay out of

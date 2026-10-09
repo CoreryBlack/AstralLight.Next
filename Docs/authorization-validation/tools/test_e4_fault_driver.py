@@ -46,17 +46,36 @@ from e4_fault_driver import (  # noqa: E402
     CASE_SPECS,
     ControllerDisconnect,
     ControllerTimeout,
-    FAULT_CASES,
+    FAULT_CASES as NATIVE_FAULT_CASES,
+    FAULT_CASES_LEGACY_COMPAT,
     MAX_ATTEMPTS,
     build_fault_plan,
-    run_fault_case,
-    run_fault_matrix,
-    validate_authorization,
+    run_fault_case as _run_fault_case,
+    run_fault_matrix as _run_fault_matrix,
+    validate_authorization as _validate_authorization,
 )
 
+LEGACY_PROFILE = "redis-compat"
+FAULT_CASES = FAULT_CASES_LEGACY_COMPAT
 RUN_ID = "authz-validation-e4demo"
 ISOLATE_TOKEN = "isolate-authz-validation-e4demo-run-a1"
 APPROVAL_TOKEN = "approve-authz-validation-e4demo-run-b2"
+
+
+def run_fault_case(controller: Any, authorization: Any, fault_id: Any, **kwargs: Any) -> Dict[str, Any]:
+    kwargs.setdefault("profile", LEGACY_PROFILE)
+    return _run_fault_case(controller, authorization, fault_id, **kwargs)
+
+
+def run_fault_matrix(controller: Any, authorization: Any, **kwargs: Any) -> Dict[str, Any]:
+    kwargs.setdefault("profile", LEGACY_PROFILE)
+    return _run_fault_matrix(controller, authorization, **kwargs)
+
+
+def validate_authorization(authorization: Any, fault_id: Optional[str] = None, **kwargs: Any) -> List[str]:
+    kwargs.setdefault("profile", LEGACY_PROFILE)
+    return _validate_authorization(authorization, fault_id, **kwargs)
+
 
 DEFAULT_OBSERVATION: Dict[str, Any] = {
     "observed": "PENDING",
@@ -594,7 +613,12 @@ class EvidenceRequirementTests(unittest.TestCase):
         self.assertEqual(result["stages"]["evidence"]["status"], "SKIP")
 
     def test_every_frozen_case_has_a_spec(self) -> None:
-        self.assertEqual(set(CASE_SPECS), set(FAULT_CASES))
+        self.assertEqual(
+            set(CASE_SPECS),
+            set(e4_fault_driver.FAULT_CASES_BY_PROFILE["native-single-node"])
+            | set(FAULT_CASES_LEGACY_COMPAT)
+            | {"rabbit_transport_unavailable"},
+        )
 
 
 class TimeoutDisconnectTests(unittest.TestCase):
@@ -763,6 +787,25 @@ class LiveGateAndHygieneTests(unittest.TestCase):
         self.assertEqual(controller.calls, [])
         self.assertEqual(result["integration_claim"], "BLOCKED")
 
+    def test_native_live_execution_is_explicitly_blocked(self) -> None:
+        controller = FakeController()
+        native_fault = e4_fault_driver.FAULT_CASES_BY_PROFILE["native-single-node"][0]
+        result = _run_fault_case(
+            controller,
+            {
+                **make_authorization(fault_ids=[native_fault]),
+            },
+            native_fault,
+            allow_live_execution=True,
+            profile="native-single-node",
+        )
+        self.assertEqual(result["overall"], "BLOCKED")
+        self.assertEqual(
+            result["stages"]["profile_execution"]["detail"],
+            "native_fault_controller_not_implemented",
+        )
+        self.assertEqual(controller.calls, [])
+
     def test_matrix_without_controller_blocked(self) -> None:
         result = run_fault_matrix(None, make_authorization(), allow_live_execution=True)
         self.assertEqual(result["overall"], "BLOCKED")
@@ -795,7 +838,11 @@ class LiveGateAndHygieneTests(unittest.TestCase):
         self.assertLessEqual(len(stored_ref), 120)
 
     def test_plan_marks_every_case_planned_and_integration_blocked(self) -> None:
-        plan = build_fault_plan(run_id=RUN_ID, campaign_id="authz-validation-20260919-single-node-002")
+        plan = build_fault_plan(
+            run_id=RUN_ID,
+            campaign_id="authz-validation-20260919-single-node-002",
+            profile=LEGACY_PROFILE,
+        )
         self.assertEqual([case["fault_id"] for case in plan["cases"]], list(FAULT_CASES))
         for case in plan["cases"]:
             self.assertEqual(case["status"], "PLANNED")
@@ -839,14 +886,16 @@ class CliTests(unittest.TestCase):
         code, output = self._capture_main([])
         self.assertEqual(code, 0)
         self.assertIn("BLOCKED", output)
-        self.assertIn("redis_unavailable", output)
+        self.assertIn("memory_channel_suspect", output)
+        self.assertNotIn("redis_unavailable", output)
         plan = json.loads(output[output.index("{"):])
         self.assertEqual(plan["kind"], "e4_fault_plan")
+        self.assertEqual(plan["profile"], "native-single-node")
         for case in plan["cases"]:
             self.assertEqual(case["status"], "PLANNED")
 
     def test_plan_flag_prints_the_same_plan(self) -> None:
-        code, output = self._capture_main(["--plan"])
+        code, output = self._capture_main(["--plan", "--profile", LEGACY_PROFILE])
         self.assertEqual(code, 0)
         self.assertIn("live_fault_matrix_integration", output)
         self.assertIn('"status": "BLOCKED"', output)

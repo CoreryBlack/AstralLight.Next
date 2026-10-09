@@ -1775,7 +1775,7 @@ mod tests {
     /// authorization set.
     #[test]
     fn strict_pool_reader_commits_explicitly_and_never_returns_empty_success() {
-        let source = include_str!("authorization_projection_repository.rs");
+        let source = include_str!("authorization_projection_repository.rs").replace("\r\n", "\n");
         let body = source
             .split("pub async fn load_published_card_grant_evidence(\n    pool")
             .nth(1)

@@ -4,6 +4,21 @@
 
 **入口：** `run_cs_evidence.py`（可执行编排器）。源仓库的历史 `REPORT*.md`、JSON/日志结果和 frozen evidence archive 未复制；本目录代码只能在显式提供的受保护三节点环境中运行，不能把源仓库历史结果当作当前仓库验证。
 
+## 当前架构边界
+
+本目录是历史分布式/RQ campaign harness，不是当前 native 单机验收入口。
+其部署、Redis epoch/key invalidation、OPA 比较和恢复脚本仍依赖历史装配；不能
+为了执行这些脚本，向当前 MySQL + LocalBus/LocalProjectionBus/MemoryProjectionHub
+生产路径添加 Redis、RabbitMQ 或 OPA。当前 standalone/distributed Rabbit profile
+只登记 MySQL + RabbitMQ；旧 harness 的额外依赖属于历史比较/兼容边界。
+
+`tests-suite/MANIFEST.toml` 汇集 RQ1-5、M1-5、E1-5、MT 与性能，并分别登记
+组件命令与完整 campaign blocker。`scripts/test_campaign.py` 不派发本目录旧
+live argv：完整 RQ/S15 仍需适配当前部署 owner、签名身份、generation/fence、
+durable consumer 与租户隔离后，再经受保护三节点环境审批和终态核验。
+RQ2-D 仍是结构性 N/A；局部 `--skip`、单机 CPU 数据和源码存在不能构成完整
+三节点 PASS。以下运行说明保留历史合同，不表示本轮执行或生产依赖推荐。
+
 ## 文件清单
 
 | 文件 | 说明 |
@@ -13,10 +28,10 @@
 | `s15_perf.py` | 三节点性能套件（P1 评估基线 / P2 传播收敛 ε / P3 并发写风暴 / P3.5 有界排水 / P4 读扩展） |
 | `deploy_dist.sh` | fresh-only 的 run 专属三节点部署脚本（schema 克隆→专用 Redis→独立 Rabbit vhost→配置→分发→启动→就绪→run_config.json）；目标目录/DB/容器/vhost/端口已存在即失败，不覆盖旧 run |
 | `seed_f4rust.sql` | e2e 种子（namespace e2e_f4rust_*，ID 段 9011–9091） |
-| `s15_result.json` / `s15_run.log` | 一致性 V8 归档轮（2 轮：79 PASS / 10 FAIL / 6 N/A） |
-| `s6_retry.json` / `s6_retry.log` | S6 补充重跑证据 |
-| `perf_result.json` / `perf_run.log` | 性能归档轮（P1–P4） |
-| `arbiter_contract_tests.log` | S12/S13 契约证据：`cargo test -p policy-engine --lib arbiter::` 12/12 PASS |
+| `s15_result.json` / `s15_run.log` | 历史一致性结果名；未复制，不代表当前结果 |
+| `s6_retry.json` / `s6_retry.log` | 历史 S6 重跑证据名；未复制 |
+| `perf_result.json` / `perf_run.log` | 历史 P1-P4 性能结果名；未复制 |
+| `arbiter_contract_tests.log` | 历史契约日志名；未复制，不以其旧通过数证明当前运行 |
 | `FIXPLAN.md` | 产品级问题（F5/F6/arbiter 门/head 对齐/bind 事件缺口）的具体修复方案 |
 
 ## 运行方式（node-b）

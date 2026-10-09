@@ -481,6 +481,14 @@ pub async fn publish_card_manifest(
         );
     }
 
+    assert_eq!(
+        current_pointer,
+        stage_outcome
+            .base_pointer
+            .as_ref()
+            .map(|pointer| pointer.as_view()),
+        "publication fixture must carry the pointer observed during staging"
+    );
     let lease_owner = format!("ts-worker-{tag}");
     let mut tx = pool.begin().await.unwrap();
     let lease = claim_authorization_manifest_in_tx(
@@ -544,14 +552,28 @@ pub async fn seed_all_tenants(pool: &MySqlPool, fixture: &SuiteFixture) -> Resul
     Ok(())
 }
 
-/// 确定性清理:按本次运行的 base 区间删除各类行(随机 base 保证跨运行
-/// 不重叠;先关 FK 检查以忽略删除顺序,结束后恢复)。
+/// Remove this fixture's source and published state in one short transaction.
 pub async fn cleanup_suite_rows(
     pool: &MySqlPool,
     fixture: &SuiteFixture,
 ) -> Result<(), sqlx::Error> {
     let lo = fixture.base;
     let hi = fixture.base + 14 * CATEGORY_STRIDE + 2_000;
+    let tenant_hi = fixture.base + fixture.tenants.len() as i64;
+    let mut tx = pool.begin().await?;
+    for table in [
+        "authorization_projection_manifest_segment",
+        "authorization_projection_current",
+        "authorization_projection_manifest",
+        "authorization_projection_segment",
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE tenant_id > ? AND tenant_id <= ?");
+        sqlx::query(&sql)
+            .bind(lo)
+            .bind(tenant_hi)
+            .execute(&mut *tx)
+            .await?;
+    }
     let statements: [(&str, &str); 11] = [
         ("permission_rule", "card_id"),
         ("card_rule_set_ref", "id"),
@@ -565,20 +587,30 @@ pub async fn cleanup_suite_rows(
         ("tenant", "tenant_id"),
         ("platform_domain", "domain_id"),
     ];
-    sqlx::query("SET FOREIGN_KEY_CHECKS = 0")
-        .execute(pool)
-        .await?;
     for (table, column) in statements {
         let sql = format!("DELETE FROM {table} WHERE {column} >= ? AND {column} <= ?");
-        sqlx::query(&sql).bind(lo).bind(hi).execute(pool).await?;
+        sqlx::query(&sql)
+            .bind(lo)
+            .bind(hi)
+            .execute(&mut *tx)
+            .await?;
     }
     sqlx::query("DELETE FROM audit_log WHERE id >= ? AND id <= ?")
         .bind(lo)
         .bind(hi)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    sqlx::query("SET FOREIGN_KEY_CHECKS = 1")
-        .execute(pool)
-        .await?;
+    tx.commit().await?;
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM authorization_projection_current WHERE tenant_id > ? AND tenant_id <= ?",
+    )
+    .bind(lo)
+    .bind(tenant_hi)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(
+        remaining, 0,
+        "fixture cleanup must remove all published pointers"
+    );
     Ok(())
 }

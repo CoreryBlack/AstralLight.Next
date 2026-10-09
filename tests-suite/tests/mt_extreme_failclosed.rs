@@ -31,6 +31,7 @@ async fn mt_e6_mixed_state_fail_closed_landscape() {
     seed_all_tenants(&pool, &fixture).await.unwrap();
 
     let unpublished = [8usize, 9];
+    let mut pointers = std::collections::HashMap::new();
     for tenant in &fixture.tenants {
         if unpublished.contains(&(tenant.ordinal as usize - 1)) {
             continue; // 保持未发布形态
@@ -50,7 +51,7 @@ async fn mt_e6_mixed_state_fail_closed_landscape() {
         } else {
             Vec::new()
         };
-        publish_card_manifest(
+        let outcome = publish_card_manifest(
             &pool,
             tenant.tenant_id,
             tenant.card_id,
@@ -61,6 +62,7 @@ async fn mt_e6_mixed_state_fail_closed_landscape() {
             None,
         )
         .await;
+        pointers.insert(tenant.card_id, outcome.pointer);
     }
 
     // 4-5 号租户:gen2 撤销(零有效授权)。
@@ -73,7 +75,7 @@ async fn mt_e6_mixed_state_fail_closed_landscape() {
             &format!("revoke-{}", tenant.ordinal),
             fixture.salt,
             2,
-            None,
+            Some(pointers[&tenant.card_id].as_view()),
         )
         .await;
     }
@@ -81,15 +83,18 @@ async fn mt_e6_mixed_state_fail_closed_landscape() {
     // ── 全景断言 ──
     for tenant in &fixture.tenants {
         let ordinal = tenant.ordinal as usize - 1;
-        let evidence = load_published_card_grant_evidence(&pool, &tenant.card_scope())
-            .await
-            .expect("landscape read must not error");
+        let result = load_published_card_grant_evidence(&pool, &tenant.card_scope()).await;
         if unpublished.contains(&ordinal) {
-            // 从未发布:必须显式 PENDING(fail-closed),绝不空 READY 放行。
-            assert_eq!(evidence.gate.status, PublishedEvidenceGateStatus::Pending);
-            assert!(evidence.effective_grants.is_empty());
+            let error = result.expect_err("unpublished card must not yield READY evidence");
+            assert!(
+                matches!(error, astral_db::AuthorizationEvidenceError::NotReady(ref code)
+                if code.contains("current_pointer_missing")),
+                "unexpected refusal: {error}"
+            );
+            assert_eq!(error.as_gate_status(), PublishedEvidenceGateStatus::Pending);
             continue;
         }
+        let evidence = result.expect("published landscape read must not error");
         assert_eq!(evidence.gate.status, PublishedEvidenceGateStatus::Ready);
         let expected = if ordinal <= 3 || ordinal >= 10 {
             1usize
@@ -120,19 +125,15 @@ async fn mt_e6_mixed_state_fail_closed_landscape() {
             user_filter: None,
             domain: DomainScopeRequirement::ExactlySome(probe.domain_id),
         };
-        let evidence = load_published_card_grant_evidence(&pool, &scope)
+        let error = load_published_card_grant_evidence(&pool, &scope)
             .await
-            .expect("cross-tenant landscape probe must not error");
+            .expect_err("foreign card must not yield published evidence");
         assert!(
-            evidence.gate.status != PublishedEvidenceGateStatus::Ready
-                || evidence.effective_grants.is_empty(),
-            "cross-tenant leak detected for probe tenant {}",
-            probe.tenant_id
+            matches!(error, astral_db::AuthorizationEvidenceError::NotReady(ref code)
+            if code.contains("current_pointer_missing")),
+            "unexpected refusal: {error}"
         );
-        assert!(evidence
-            .effective_grants
-            .iter()
-            .all(|grant| grant.tenant.tenant_id == probe.tenant_id));
+        assert_eq!(error.as_gate_status(), PublishedEvidenceGateStatus::Pending);
     }
 
     // 正常租户在全景中的对照面:其证据与单租户场景完全一致(隔离无扰)。

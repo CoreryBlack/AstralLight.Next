@@ -1,71 +1,40 @@
 #!/usr/bin/env bash
-# 多租户混合极限套件 —— 部署形态矩阵驱动(按需)。
-#
-# 诚实边界(不要为覆盖面好看而虚报维度):
-#   可在测试层参数化的维度只有 **部署形态**:
-#     default       默认特性构建 + 基线 env(Redis-free 语义)
-#     redis-compat  redis-compat 联合特性构建 + compat 旗标开启
-#   其余架构开关不可在测试层参数化:
-#     - astral-single-node 的 memory hub 安装是代码路径(组合进程启动期);
-#     - ASTRAL_ORG_SCOPE_ENABLED 是仓储构造期旗标(MT 套件不构造仓储);
-#     上述两者的专项覆盖见 MANIFEST 中 unit-inline 与 security 条目。
-#
-# 用法:
-#   source 与 run-tests.sh 相同的 env(DATABASE_URL 等),然后:
-#   bash tests-suite/matrix/run-mt-matrix.sh                     # 两个形态全跑
-#   bash tests-suite/matrix/run-mt-matrix.sh --profile default   # 仅默认形态
-#   bash tests-suite/matrix/run-mt-matrix.sh \
-#        --suites "mt_extreme_isolation mt_extreme_churn"        # 指定套件
-#
-# 失败语义:任一套件任一形态非零 → 脚本非零退出(不吞错、不折算 PASS)。
+# Tenant matrix selection only; isolation, evidence and fail-fast live in one runner.
 set -euo pipefail
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-cd "$REPO_DIR"
-
-PROFILE_FILTER=""
-SUITES="mt_extreme_isolation mt_extreme_churn mt_extreme_cross_storm mt_extreme_failclosed mt_extreme_capacity"
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --profile) PROFILE_FILTER="$2"; shift 2 ;;
-    --suites)  SUITES="$2"; shift 2 ;;
-    *) echo "未知参数: $1" >&2; exit 1 ;;
-  esac
+PROFILE=native-single-node
+SUITES=(mt_extreme_isolation mt_extreme_churn mt_extreme_cross_storm mt_extreme_failclosed mt_extreme_capacity)
+EXTRA=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --profile)
+            [ "$#" -ge 2 ] || exit 2
+            case "$2" in
+                default|native-single-node) PROFILE=native-single-node ;;
+                redis-compat)
+                    printf '[BLOCKED] tenant matrix uses the native MySQL path; Redis has a dedicated compatibility suite\n' >&2
+                    exit 2
+                    ;;
+                *) printf '[BLOCKED] unknown matrix profile: %s\n' "$2" >&2; exit 2 ;;
+            esac
+            shift 2
+            ;;
+        --suites) [ "$#" -ge 2 ] || exit 2; read -r -a SUITES <<<"$2"; shift 2 ;;
+        --run-id|--artifact-root) [ "$#" -ge 2 ] || exit 2; EXTRA+=("$1" "$2"); shift 2 ;;
+        *) printf '[BLOCKED] unknown matrix argument: %s\n' "$1" >&2; exit 2 ;;
+    esac
 done
-
-: "${DATABASE_URL:?DATABASE_URL is required}"
-: "${ASTRAL_MIGRATION_ENV:=isolated}"
-: "${RUST_INTEGRATION_REQUIRED:=1}"
-export ASTRAL_MIGRATION_ENV RUST_INTEGRATION_REQUIRED
-
-run_profile() {
-  local profile="$1"
-  local features=""
-  local envs=(env "RUST_INTEGRATION_REQUIRED=1")
-  if [ "$profile" = "redis-compat" ]; then
-    : "${REDIS_URL:?REDIS_URL is required for the redis-compat profile}"
-    : "${ASTRAL_REDIS_PROJECTION_COMPAT:=true}"
-    features="--features redis-compat"
-    envs+=("ASTRAL_REDIS_PROJECTION_COMPAT=$ASTRAL_REDIS_PROJECTION_COMPAT")
-  fi
-  echo "=== profile=$profile suites=[$SUITES] ==="
-  # shellcheck disable=SC2086
-  env "${envs[@]}" cargo test -p testsuite $features --test '*' -- --ignored --nocapture --test-threads=1
-}
-
-declare -a FAILED=()
-for profile in default redis-compat; do
-  if [ -n "$PROFILE_FILTER" ] && [ "$PROFILE_FILTER" != "$profile" ]; then
-    continue
-  fi
-  if ! run_profile "$profile"; then
-    FAILED+=("$profile")
-  fi
+[ "${#SUITES[@]}" -gt 0 ] || { printf '[BLOCKED] no suites selected\n' >&2; exit 2; }
+ARGS=(--run --profile "$PROFILE")
+for suite in "${SUITES[@]}"; do
+    case "$suite" in
+        mt_extreme_isolation) ARGS+=(--suite mt-isolation) ;;
+        mt_extreme_churn) ARGS+=(--suite mt-churn) ;;
+        mt_extreme_cross_storm) ARGS+=(--suite mt-cross-storm) ;;
+        mt_extreme_failclosed) ARGS+=(--suite mt-failclosed) ;;
+        mt_extreme_capacity) ARGS+=(--suite mt-capacity) ;;
+        *) printf '[BLOCKED] unknown suite: %s\n' "$suite" >&2; exit 2 ;;
+    esac
 done
-
-if [ "${#FAILED[@]}" -gt 0 ]; then
-  echo "[mt-matrix] FAILED profiles: ${FAILED[*]}" >&2
-  exit 1
-fi
-echo "[mt-matrix] all requested profiles passed"
+command -v python >/dev/null 2>&1 || { printf '[BLOCKED] Python 3.11+ is required\n' >&2; exit 2; }
+exec python -B "$SCRIPT_DIR/../../scripts/test_campaign.py" "${ARGS[@]}" "${EXTRA[@]}"

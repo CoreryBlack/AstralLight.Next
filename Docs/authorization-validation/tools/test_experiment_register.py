@@ -76,20 +76,99 @@ class RegisterConsistencyTest(unittest.TestCase):
             self.assertEqual(spec["expectedFalseBlockRate"], 0.0)
 
     def test_dependency_fault_matrix_is_full_cross_product(self):
-        # 2026-10 架构面扩展:四个新依赖类(内存权威读面/本地失效通道/
-        # SDK 强制身份映射/单写者租约)进入故障矩阵,叉积完整性约束不变。
+        # Each profile gets only the dependency classes present in that
+        # deployment; the default view remains the native single-node matrix.
         self.assertEqual(
-            set(register.DEPENDENCY_CLASSES),
-            {"cache", "redis", "publication_worker_or_mq",
-             "authoritative_database", "memory_projection_hub",
-             "local_projection_bus", "identity_mapping",
-             "single_writer_lease"},
+            set(register.DEPENDENCY_PROFILES),
+            {
+                "native-kernel",
+                "offline-validation",
+                "native-single-node",
+                "standalone-rabbit",
+                "distributed",
+                "redis-compat",
+                "performance-kernel",
+                "performance-native",
+            },
         )
-        self.assertEqual(set(register.FAULT_TIMINGS),
-                         {"steady_state", "in_flight_revocation"})
-        self.assertEqual(len(register.DEPENDENCY_FAULT_MATRIX), 16)
-        for spec in register.DEPENDENCY_FAULT_MATRIX.values():
-            self.assertEqual(spec["acceptance"], "fail_closed")
+        native_dependencies = set(
+            register.DEPENDENCY_CLASSES_BY_PROFILE["native-single-node"]
+        )
+        self.assertEqual(
+            native_dependencies,
+            {
+                "cache",
+                "publication_worker",
+                "authoritative_database",
+                "memory_projection_hub",
+                "local_bus",
+                "local_projection_bus",
+                "identity_mapping",
+                "gateway_integrity",
+                "single_writer_lease",
+            },
+        )
+        self.assertEqual(set(register.DEPENDENCY_CLASSES), native_dependencies)
+        self.assertEqual(
+            {
+                profile
+                for profile, dependencies in register.DEPENDENCY_CLASSES_BY_PROFILE.items()
+                if "redis" in dependencies
+            },
+            {"redis-compat"},
+        )
+        self.assertEqual(
+            {
+                profile
+                for profile, dependencies in register.DEPENDENCY_CLASSES_BY_PROFILE.items()
+                if "rabbitmq" in dependencies
+            },
+            {"standalone-rabbit", "distributed"},
+        )
+        self.assertEqual(
+            register.PROFILE_SERVICE_DEPENDENCIES["native-single-node"], ("mysql",)
+        )
+        self.assertEqual(
+            register.PROFILE_SERVICE_DEPENDENCIES["standalone-rabbit"],
+            ("mysql", "rabbitmq"),
+        )
+        self.assertEqual(
+            register.PROFILE_SERVICE_DEPENDENCIES["redis-compat"],
+            ("mysql", "redis"),
+        )
+        self.assertEqual(
+            set(register.FAULT_TIMINGS),
+            {"steady_state", "in_flight_revocation"},
+        )
+
+        for profile in register.DEPENDENCY_PROFILES:
+            with self.subTest(profile=profile):
+                dependencies = register.DEPENDENCY_CLASSES_BY_PROFILE[profile]
+                matrix = register.DEPENDENCY_FAULT_MATRICES_BY_PROFILE[profile]
+                self.assertEqual(
+                    set(matrix),
+                    {
+                        f"{dependency}:{timing}"
+                        for dependency in dependencies
+                        for timing in register.FAULT_TIMINGS
+                    },
+                )
+                for key, spec in matrix.items():
+                    dependency, timing = key.split(":", 1)
+                    self.assertEqual(spec["profile"], profile)
+                    self.assertEqual(spec["dependency"], dependency)
+                    self.assertEqual(spec["timing"], timing)
+                    self.assertEqual(spec["acceptance"], "fail_closed")
+
+        self.assertEqual(len(register.DEPENDENCY_FAULT_MATRIX), 18)
+        self.assertEqual(
+            len(register.DEPENDENCY_FAULT_MATRICES_BY_PROFILE["redis-compat"]),
+            12,
+        )
+        self.assertEqual(
+            register.DEPENDENCY_FAULT_MATRIX,
+            register.DEPENDENCY_FAULT_MATRICES_BY_PROFILE["native-single-node"],
+        )
 
     def test_capture_and_acceptance_tables_present(self):
         self.assertEqual(

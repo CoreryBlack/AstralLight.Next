@@ -98,9 +98,11 @@ SCOPE AND EVIDENCE BOUNDARY (read this first):
 
 Enumeration: deterministic exhaustive depth-first merge of the event
 chains, fixed chain priority (checklist, pre-observation, mutation A,
-mutation B, rollback, bypass). No external solver, no subprocess, no
-socket, no filesystem access; import is side-effect-free. Status
-semantics are identical to the single model: PASS requires a complete
+mutation B, rollback, bypass). The model uses no external solver, subprocess,
+socket, or filesystem access; import is side-effect-free. The CLI may use
+up to twelve owned processes for disjoint event prefixes, without changing
+event order or coverage. Status semantics are identical to the single model:
+PASS requires a complete
 exploration with zero violations; a concrete counterexample is decisive
 (FAIL); UNKNOWN covers incomplete explorations without counterexamples
 and out-of-domain admissions; BLOCKED never appears in a report.
@@ -318,8 +320,38 @@ def required_bound(premises=None, mode="bracket"):
     return 1 + total_events
 
 
+def shard_prefixes(premises=None, mode="bracket", bound=DEFAULT_BOUND,
+                   rollback_tail_only=True):
+    chains = build_chains(premises, mode)
+    bound = validate_bound(bound)
+    names = ("checklist", "pre", "mutation_a", "mutation_b", "rollback", "bypass")
+    lengths = tuple(len(chains[name]) for name in names)
+    depth = min(2, bound - 1)
+    prefixes = []
+
+    def visit(indices, prefix):
+        if len(prefix) == depth or prefix and prefix[-1] in (EV_ADMIT, EV_BYPASS):
+            prefixes.append(prefix)
+            return
+        for slot, name in enumerate(names):
+            index = indices[slot]
+            if index >= lengths[slot]:
+                continue
+            event = chains[name][index]
+            if slot == 0 and event == EV_MATCH and indices[1] < lengths[1]:
+                continue
+            if slot == 4 and rollback_tail_only and indices[0] != lengths[0] - 1:
+                continue
+            next_indices = list(indices)
+            next_indices[slot] += 1
+            visit(tuple(next_indices), prefix + (event,))
+
+    visit((0, 0, 0, 0, 0, 0), ())
+    return prefixes
+
+
 def run_model(premises=None, mode="bracket", bound=DEFAULT_BOUND,
-              rollback_tail_only=True):
+              rollback_tail_only=True, *, _trace_prefix=()):
     """Exhaustively enumerate the two-mutation configuration; return a run dict.
 
     The run-dict shape mirrors ``e5_model_check.run_model`` so the
@@ -346,6 +378,12 @@ def run_model(premises=None, mode="bracket", bound=DEFAULT_BOUND,
     rollback_chain = chains["rollback"]
     bypass_chain = chains["bypass"]
     recheck_events = chains["recheck"]
+    checklist_len = len(checklist)
+    pre_len = len(pre_chain)
+    mut_a_len = len(mut_a)
+    mut_b_len = len(mut_b)
+    rollback_len = len(rollback_chain)
+    prefix_len = len(_trace_prefix)
     recheck_read_event = recheck_events[-1] if recheck_events else None
     checklist_set = frozenset(checklist)
     mut_a_set = frozenset(mut_a)
@@ -769,17 +807,18 @@ def run_model(premises=None, mode="bracket", bound=DEFAULT_BOUND,
             best_violation[2] = detail
 
     def dfs(ia, ib, ic, idy, ie, ifr, seq, reads, pending_obs, evidence,
-            match_ok, pos, obs_step, rollback_tail_only):
-        counts["exploredStates"] += 1
-        a_next = checklist[ia] if ia < len(checklist) else None
+            match_ok, pos, obs_step, rollback_tail_only, last_read_step):
+        if prefix_len == 0 or len(seq) >= prefix_len + 1:
+            counts["exploredStates"] += 1
+        a_next = checklist[ia] if ia < checklist_len else None
         enabled = []
-        if a_next is not None and not (a_next == EV_MATCH and ib < len(pre_chain)):
+        if a_next is not None and not (a_next == EV_MATCH and ib < pre_len):
             enabled.append(a_next)
-        if ib < len(pre_chain):
+        if ib < pre_len:
             enabled.append(pre_chain[ib])
-        if ic < len(mut_a):
+        if ic < mut_a_len:
             enabled.append(mut_a[ic])
-        if idy < len(mut_b):
+        if idy < mut_b_len:
             enabled.append(mut_b[idy])
         # Rollback: single adversarial event, restricted to the DECISION
         # TAIL (every scheduled read has fired; ADMIT is next). Pre-read
@@ -789,8 +828,8 @@ def run_model(premises=None, mode="bracket", bound=DEFAULT_BOUND,
         # Stress runs may lift the tail restriction with
         # rollback_tail_only=False; the default keeps the enumeration
         # tractable (pre-read rollback hazards live in the single model).
-        if ie < len(rollback_chain) and (
-            not rollback_tail_only or ia == len(checklist) - 1
+        if ie < rollback_len and (
+            not rollback_tail_only or ia == checklist_len - 1
         ):
             enabled.append(EV_ROLLBACK)
         if bypass_chain and ifr == 0:
@@ -800,12 +839,14 @@ def run_model(premises=None, mode="bracket", bound=DEFAULT_BOUND,
             counts["exploredTraces"] += 1
             return
         step = len(seq)
+        if step <= prefix_len:
+            expected = _trace_prefix[step - 1]
+            enabled = [expected] if expected in enabled else []
         for event in enabled:
             n_ia, n_ib, n_ic, n_idy, n_ie, n_ifr = ia, ib, ic, idy, ie, ifr
             n_evidence = evidence
             n_obs_step = obs_step
-            obs_changed = False
-            evidence_changed = False
+            n_last_read_step = last_read_step
             n_match = match_ok
             terminal = False
             outcome = None
@@ -817,16 +858,14 @@ def run_model(premises=None, mode="bracket", bound=DEFAULT_BOUND,
             if boundary_event is not None and event == boundary_event:
                 # The boundary may be an interval-START marker (POST_OBS_BEGIN
                 # / PRE_OBS_BEGIN), which is not itself a read.
-                n_obs_step_old = obs_step
                 n_obs_step = step
-                obs_changed = True
+            if event in M_B_READ_EVENTS or event in PENDING_PROBE_EVENTS:
+                n_last_read_step = step
             if event in M_B_READ_EVENTS:
                 rd = compute_read(event, step, pos)
                 reads[event] = rd
                 if event == tf_event and reload_on:
-                    n_evidence_old = evidence
                     n_evidence = rd if rd["valid"] else None
-                    evidence_changed = True
             elif event == EV_MATCH:
                 if not reload_on:
                     rd = reads.get(EV_PRE_END) if bracket_mode else None
@@ -838,15 +877,13 @@ def run_model(premises=None, mode="bracket", bound=DEFAULT_BOUND,
                 # Terminal: pos already tracks every mutation/rollback
                 # position; reads carry their own steps and t_f is threaded
                 # as a parameter, so no full position-map rebuild is needed.
-                n_pos = dict(pos)
-                n_pos[event] = step
+                pos[event] = step
                 outcome, reason = evaluate_admission(
-                    pending_obs, reads, evidence, match_ok, n_pos
+                    pending_obs, reads, evidence, match_ok, pos
                 )
                 terminal = True
             elif event == EV_BYPASS:
-                n_pos = dict(pos)
-                n_pos[event] = step
+                pos[event] = step
                 outcome = "BYPASS_ADMITTED"
                 terminal = True
             if event in PENDING_PROBE_EVENTS:
@@ -874,25 +911,23 @@ def run_model(premises=None, mode="bracket", bound=DEFAULT_BOUND,
                 n_ib += 1
             else:
                 n_ifr += 1
-            n_seq = seq + (event,)
-            if terminal:
-                last_read_step = max(
-                    (
-                        [rd["step"] for rd in reads.values()]
-                        + [obs["step"] for obs in pending_obs.values()]
-                    ),
-                    default=-1,
-                )
-                record_terminal(
-                    n_seq, n_pos, n_obs_step, reads, pending_obs, n_evidence,
-                    outcome, reason, last_read_step, step,
-                )
-            else:
-                dfs(
-                    n_ia, n_ib, n_ic, n_idy, n_ie, n_ifr, n_seq, reads,
-                    pending_obs, n_evidence, n_match, pos, n_obs_step,
-                    rollback_tail_only,
-                )
+            seq.append(event)
+            try:
+                if terminal:
+                    record_terminal(
+                        seq, pos, n_obs_step, reads, pending_obs, n_evidence,
+                        outcome, reason, n_last_read_step, step,
+                    )
+                else:
+                    dfs(
+                        n_ia, n_ib, n_ic, n_idy, n_ie, n_ifr, seq, reads,
+                        pending_obs, n_evidence, n_match, pos, n_obs_step,
+                        rollback_tail_only, n_last_read_step,
+                    )
+            finally:
+                seq.pop()
+                if terminal:
+                    del pos[event]
             # Undo the in-place mutations before the next sibling branch.
             if event in M_B_READ_EVENTS:
                 del reads[event]
@@ -900,13 +935,9 @@ def run_model(premises=None, mode="bracket", bound=DEFAULT_BOUND,
                 del pending_obs[event]
             if event in mut_a_set or event in mut_b_set or event == EV_ROLLBACK:
                 del pos[event]
-            if evidence_changed:
-                evidence = n_evidence_old
-            if obs_changed:
-                obs_step = n_obs_step_old
 
-    dfs(0, 0, 0, 0, 0, 0, (EV_INIT,), {}, {}, None, None, {}, None,
-        rollback_tail_only)
+    dfs(0, 0, 0, 0, 0, 0, [EV_INIT], {}, {}, None, None, {}, None,
+        rollback_tail_only, -1)
     exploration_complete = counts["incompleteTraces"] == 0
     if counts["violations"]:
         status = "FAIL"
@@ -987,6 +1018,59 @@ def run_model(premises=None, mode="bracket", bound=DEFAULT_BOUND,
     }
 
 
+_ADDITIVE_SHARD_FIELDS = (
+    "exploredStates", "exploredTraces", "incompleteTraces", "admittedTraces",
+    "deniedTraces", "bypassAdmittedTraces", "admittedDomainCounts", "violations",
+    "violationsByMutation", "violationClasses", "denialReasons", "admissionWindow",
+    "mixedManifestBody",
+)
+
+
+def merge_shard_runs(premises, mode, bound, shard_runs):
+    prefixes = shard_prefixes(premises, mode, bound)
+    if [prefix for prefix, _ in shard_runs] != prefixes:
+        raise ValueError("missing, duplicated or reordered model shard")
+    if not shard_runs:
+        raise ValueError("empty model shard set")
+    identity = {
+        "premises": normalize_premises(premises), "mode": mode, "bound": bound,
+        "requiredBound": required_bound(premises, mode),
+    }
+    result = dict(identity)
+
+    def add_values(values):
+        if all(isinstance(value, dict) for value in values):
+            keys = sorted({key for value in values for key in value})
+            return {key: add_values([value.get(key, 0) for value in values])
+                    for key in keys}
+        if any(type(value) is not int or value < 0 for value in values):
+            raise ValueError("invalid model shard counter")
+        return sum(values)
+
+    for _, run in shard_runs:
+        if any(run.get(key) != value for key, value in identity.items()):
+            raise ValueError("model shard configuration drift")
+    for field in _ADDITIVE_SHARD_FIELDS:
+        result[field] = add_values([run[field] for _, run in shard_runs])
+    ancestors = {prefix[:length] for prefix in prefixes
+                 for length in range(len(prefix))}
+    result["exploredStates"] += len(ancestors)
+    result["explorationComplete"] = all(run["explorationComplete"] for _, run in shard_runs)
+    examples = [run["counterexample"] for _, run in shard_runs
+                if run["counterexample"] is not None]
+    result["counterexample"] = min(
+        examples,
+        key=lambda example: (example["eventCount"],
+                             tuple(event["event"] for event in example["trace"])),
+        default=None,
+    )
+    result["status"] = (
+        "FAIL" if result["violations"]
+        else "PASS" if result["explorationComplete"] else "UNKNOWN"
+    )
+    return result
+
+
 SUPPORTS_RUN_CACHE = True
 
 
@@ -1048,7 +1132,18 @@ def build_report(bound=DEFAULT_BOUND, run_cache=None):
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via CLI smoke runs
-    report = build_report(DEFAULT_BOUND)
+    import argparse
+    from bounded_model_execution import MAX_WORKERS, run_configurations
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--workers", type=int, choices=range(1, MAX_WORKERS + 1), default=1)
+    args = parser.parse_args()
+    configurations = [(normalize_premises(), mode, DEFAULT_BOUND)
+                      for mode in ("bracket", "strict")]
+    configurations.extend((without_premise(premise), "bracket", DEFAULT_BOUND)
+                          for premise in PREMISES)
+    run_cache = run_configurations("e5_model_check_two_mutations", configurations, args.workers)
+    report = build_report(DEFAULT_BOUND, run_cache=run_cache)
     print(json.dumps({
         "model": report["model"],
         "bound": report["bound"],

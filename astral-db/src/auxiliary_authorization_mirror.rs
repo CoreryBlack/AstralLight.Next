@@ -1378,7 +1378,7 @@ mod tests {
 
     #[test]
     fn production_refill_retains_guards_and_bounds_both_queries() {
-        let source = include_str!("auxiliary_authorization_mirror.rs");
+        let source = include_str!("auxiliary_authorization_mirror.rs").replace("\r\n", "\n");
         let source = source
             .split_once(concat!(
                 "#[",
@@ -1926,6 +1926,8 @@ mod tests {
                 .org_bytes,
             64
         );
+        // Oversized payload construction may exceed the channel heartbeat window.
+        hub.record_channel_heartbeat();
         assert!(matches!(
             mirror.load_org_authorization(&hub, &ctx_value(CARD)).await,
             Some(OrgAuthorityRead::Disabled)

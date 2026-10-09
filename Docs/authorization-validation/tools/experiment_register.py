@@ -19,13 +19,21 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 
+import dependency_profiles as profiles
+
 __all__ = [
     "REGISTER_VERSION",
     "STIMULUS_CLASSES",
     "E2_CONTROL_SCENARIOS",
     "MODEL_ONLY_PREMISES",
     "CANARY_SCENARIOS",
+    "DEPENDENCY_PROFILES",
+    "PROFILE_SERVICE_DEPENDENCIES",
+    "DEPENDENCY_CLASSES_BY_PROFILE",
+    "DEPENDENCY_CLASSES",
+    "FAULT_TIMINGS",
     "DEPENDENCY_FAULT_MATRIX",
+    "DEPENDENCY_FAULT_MATRICES_BY_PROFILE",
     "CAPTURE_REQUIREMENTS",
     "ACCEPTANCE_CRITERIA",
     "validate_register",
@@ -129,32 +137,22 @@ CANARY_SCENARIOS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# E5/E6: dependency-failure matrix. Every dependency class is injected
-# singly in BOTH timings; acceptance is fail-closed (PENDING/DENY or a
-# strict-reader fallback with complete evidence), zero stale ALLOW, and
-# recovery judged at readiness rather than liveness.
-DEPENDENCY_CLASSES: Tuple[str, ...] = (
-    "cache",
-    "redis",
-    "publication_worker_or_mq",
-    "authoritative_database",
-    # 2026-10 架构面扩展:内存权威读面/本地失效通道/SDK 强制身份映射/
-    # 单机组合进程单写者租约(前提测试见 tests-suite/tests/security/)。
-    "memory_projection_hub",
-    "local_projection_bus",
-    "identity_mapping",
-    "single_writer_lease",
-)
-FAULT_TIMINGS: Tuple[str, ...] = ("steady_state", "in_flight_revocation")
-DEPENDENCY_FAULT_MATRIX: Dict[str, Dict[str, Any]] = {
-    f"{dependency}:{timing}": {
-        "dependency": dependency,
-        "timing": timing,
-        "acceptance": "fail_closed",
-    }
-    for dependency in DEPENDENCY_CLASSES
-    for timing in FAULT_TIMINGS
+# E5/E6: dependency-failure matrix. Each executable deployment profile has
+# only the dependency classes present in that profile. Redis remains an
+# explicit redis-compat dependency; standalone/distributed Rabbit profiles
+# use RabbitMQ while the native single-node profile uses local buses/hub.
+DEPENDENCY_PROFILES: Tuple[str, ...] = profiles.PROFILE_IDS
+PROFILE_SERVICE_DEPENDENCIES = profiles.SERVICE_DEPENDENCIES_BY_PROFILE
+DEPENDENCY_CLASSES_BY_PROFILE = profiles.DEPENDENCY_CLASSES_BY_PROFILE
+DEPENDENCY_CLASSES: Tuple[str, ...] = DEPENDENCY_CLASSES_BY_PROFILE[profiles.DEFAULT_PROFILE]
+FAULT_TIMINGS: Tuple[str, ...] = profiles.FAULT_TIMINGS
+DEPENDENCY_FAULT_MATRICES_BY_PROFILE: Dict[str, Dict[str, Dict[str, Any]]] = {
+    profile: profiles.dependency_fault_matrix(profile)
+    for profile in DEPENDENCY_PROFILES
 }
+# Backward-compatible default view; callers needing another deployment must
+# select its explicit profile matrix above.
+DEPENDENCY_FAULT_MATRIX = DEPENDENCY_FAULT_MATRICES_BY_PROFILE[profiles.DEFAULT_PROFILE]
 
 # Per-experiment capture requirements: the observation fields whose
 # absence downgrades the result (E3 without request-side samples keeps
@@ -256,13 +254,21 @@ def validate_register() -> Dict[str, Any]:
             problems.append(f"canary {key} detection rate is not one")
         if spec.get("expectedFalseBlockRate") != 0.0:
             problems.append(f"canary {key} false-block rate is not zero")
-    expected_pairs = {
-        f"{dependency}:{timing}"
-        for dependency in DEPENDENCY_CLASSES
-        for timing in FAULT_TIMINGS
-    }
-    if set(DEPENDENCY_FAULT_MATRIX) != expected_pairs:
-        problems.append("dependency fault matrix is not the full cross product")
+    profile_report = profiles.validate_dependency_profiles()
+    if profile_report["status"] != "PASS":
+        problems.extend("profile:" + problem for problem in profile_report["problems"])
+    for profile in DEPENDENCY_PROFILES:
+        profile_dependencies = set(DEPENDENCY_CLASSES_BY_PROFILE[profile])
+        expected_profile_pairs = {
+            f"{dependency}:{timing}"
+            for dependency in profile_dependencies
+            for timing in FAULT_TIMINGS
+        }
+        if set(DEPENDENCY_FAULT_MATRICES_BY_PROFILE[profile]) != expected_profile_pairs:
+            problems.append(f"{profile}:dependency fault matrix is not the full cross product")
+        for entry in DEPENDENCY_FAULT_MATRICES_BY_PROFILE[profile].values():
+            if entry.get("profile") != profile or entry.get("acceptance") != "fail_closed":
+                problems.append(f"{profile}:fault matrix metadata is invalid")
     for experiment, fields in CAPTURE_REQUIREMENTS.items():
         if not fields:
             problems.append(f"capture requirements for {experiment} are empty")
@@ -280,6 +286,10 @@ def validate_register() -> Dict[str, Any]:
             "modelOnlyPremises": len(MODEL_ONLY_PREMISES),
             "canaryScenarios": len(CANARY_SCENARIOS),
             "faultMatrixEntries": len(DEPENDENCY_FAULT_MATRIX),
+            "profiles": len(DEPENDENCY_PROFILES),
+            "profileFaultMatrixEntries": sum(
+                len(matrix) for matrix in DEPENDENCY_FAULT_MATRICES_BY_PROFILE.values()
+            ),
         },
     }
 

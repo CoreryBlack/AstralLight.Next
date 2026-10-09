@@ -59,42 +59,65 @@ cargo clippy --workspace -- -D warnings
 cargo test --workspace
 ```
 
-The test runner follows the Redis-free single-node architecture:
+The single execution owner is `scripts/test_campaign.py`; shell and matrix commands
+are selection aliases, not independent runners:
 
 ```bash
-bash scripts/run-tests.sh --check
-bash scripts/run-tests.sh unit
+bash scripts/run-tests.sh --all
+python -B scripts/test_campaign.py --list --json
 bash scripts/run-tests.sh --integration
 bash scripts/run-tests.sh --rabbit
 ```
 
-`unit` and `--check` do not start services or need connection variables. The
-MySQL integration gate requires `DATABASE_URL` on loopback port 3308,
-`ASTRAL_MIGRATION_ENV=isolated`, and `RUST_INTEGRATION_REQUIRED=1`. It sets local
-transport and disables Redis compatibility. By default it starts only MySQL
-from `docker-compose.test.yml` and applies Rust-owned migrations; callers must
-supply isolated MySQL credentials. Destructive standby migrations retain their
-explicit allowlist and approved proof requirements; the runner never grants
-that authorization.
+`--all` verifies every selected portable suite first, then reruns the full collection
+from its first suite under the same frozen source hash. The portable selection includes
+kernel tests, offline models, and measured CPU benchmarks. The first non-PASS stops
+later dispatch. Fix or reconcile that target, rerun it individually, then restart the
+original full collection with a new run ID; no historical PASS is reused.
 
-For an already migrated isolated `astral_test`/`astral_rehearsal` database, set
-`TEST_USE_EXISTING=1`; no Docker lifecycle or DDL is performed. Required schema
-validation is still performed by each real test. Missing dependencies are a
-failed or blocked gate, not a green skip. Full per-phase logs, commands, exit
-codes and timing are saved outside the repository in a run-scoped temporary
-directory (or `TEST_ARTIFACT_DIR`). A phase timeout stops further dispatch as
-UNKNOWN; reconcile database and worker state before retrying.
+`--full` selects every registered profile. All prerequisites are checked before any
+command is started, so missing live infrastructure or an explicitly BLOCKED campaign
+blocks the entire full-profile collection. Outside-selection entries remain visible
+in the report and are never counted as passed.
 
-Rabbit transport is a separate MySQL + RabbitMQ gate (`--rabbit`); the URL must
-name a vhost (`%2f` for the default `/`). Redis tests
-are compatibility-only (`--redis-compat`, with `REDIS_URL`); neither is a
-single-node prerequisite. Compose profiles `rabbit` and `redis-compat` expose
-ports only on loopback. The dedicated SDK mapping test remains a separate
-`--identity-mapping` gate with a pre-migrated `sdk_identity_mapping_test_*`
-database and `INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE`; its isolation guard
-is not relaxed. Ignored CPU performance matrices and excluded crates are not
-covered by the MySQL gate. See [tests-suite](tests-suite/README.md) for coverage.
-Credentials must remain in the process environment and must never be committed.
+No test entrypoint provisions services, starts Docker, migrates, or deletes containers.
+Real integration requires an approved, already migrated loopback database on port 3308,
+`TEST_USE_EXISTING=1`, `ASTRAL_MIGRATION_ENV=isolated`, and
+`RUST_INTEGRATION_REQUIRED=1`. Ordinary MySQL suites require a run-scoped
+`astral_rehearsal_<suffix>` database whose exact name is also supplied through
+`ASTRAL_TEST_DATABASE_NAME`; source and shared rehearsal databases are rejected.
+Native transport is local; Redis is disabled.
+Rabbit requires loopback port 5673 and an explicit vhost; compatibility Redis requires
+loopback port 6380. The dedicated identity-mapping suite uses
+`INTEGRATION_IDENTITY_MAPPING_DATABASE_URL` and a matching
+`INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE` with the `sdk_identity_mapping_test_*`
+prefix. Provisioning and destructive migration approval remain separate operations.
+Credentials stay in the process environment and must never be committed.
+Full phase logs, commands, exit codes and source hashes are retained outside the
+repository. UNKNOWN requires reconciliation before retry. See
+[tests-suite](tests-suite/README.md) for exact profiles and evidence boundaries.
+
+The consolidated runner indexes RQ1-RQ5, authorization assumptions M1-M5,
+E1-E5, MT, performance, compatibility, and excluded suites against explicit
+production deployment profiles:
+
+```bash
+python -B scripts/test_campaign.py --list --json
+bash scripts/run-tests.sh --campaign --run --profile native-kernel --series E2
+python -B scripts/test_campaign.py --run --profile offline-validation --suite offline-validation-tools
+python -B scripts/test_campaign.py --run --profile native-single-node --suite native-projection-lifecycle
+```
+
+It requires Python 3.11+, never provisions or migrates, and uses only approved,
+already migrated isolated dependencies (`TEST_USE_EXISTING=1`). Native integration
+uses only MySQL and in-process buses; Rabbit transport and Redis compatibility
+remain explicit profiles. Each indexed command carries its owner, dependency
+contract, source snapshot, assertion count and proof boundary. Empty, ignored,
+skipped or interrupted checks are not silently promoted to `PASS`. Local component
+coverage and offline models never stand in for a full RQ, live E1-E4, or HTTP
+performance campaign. Legacy Redis/OPA distributed harnesses remain non-dispatched
+`BLOCKED` entries until adapted; frozen/excluded crates are not covered by the root
+workspace gate. See [tests-suite](tests-suite/README.md) for the exact matrix.
 
 For organization-scope migration inspection, set `ORG_MYSQL_URL` to a TCP MySQL
 URI for the isolated test database, then run the read-only preflight:
@@ -114,7 +137,7 @@ of the default test commands.
 - `astral-types/`: shared domain and wire types.
 - `astral-common/`: configuration, errors, middleware, audit, signatures, and observability.
 - `astral-db/`: SQLx repositories, migrations, projection persistence, evidence, and tenant-scoped access.
-- `astral-cache/`: Redis cache and idempotency support.
+- `astral-cache/`: excluded, self-contained Redis compatibility archive; not a native dependency.
 - `astral-mq/`: messaging contracts, delivery, DLX, and idempotency helpers.
 - `astral-gateway/`: gateway authentication and request forwarding.
 - `astral-identity/`: identity and session lifecycle.

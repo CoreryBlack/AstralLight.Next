@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "e4-observability")]
+#[cfg(all(feature = "e4-observability", feature = "redis-compat"))]
 use sha2::{Digest, Sha256};
 
 /// Redis 共享时代键（全部实例共享；值为随机 UUID，无过期时间）。
@@ -53,7 +53,7 @@ const EPOCH_CACHE_TTL: Duration = Duration::from_secs(60);
 /// 进程内时代缓存：`(epoch 值, 写入时刻)`。
 static CACHED_EPOCH: RwLock<Option<(String, Instant)>> = RwLock::new(None);
 
-#[cfg(feature = "e4-observability")]
+#[cfg(all(feature = "e4-observability", feature = "redis-compat"))]
 fn log_epoch_observation(epoch: &str, source: &'static str) {
     let epoch_sha256 = format!("{:x}", Sha256::digest(epoch.as_bytes()));
     let stamp = astral_common::experiment_observation::stamp();

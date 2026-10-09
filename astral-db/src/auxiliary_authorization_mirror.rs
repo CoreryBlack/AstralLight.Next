@@ -1378,7 +1378,7 @@ mod tests {
 
     #[test]
     fn production_refill_retains_guards_and_bounds_both_queries() {
-        let source = include_str!("auxiliary_authorization_mirror.rs");
+        let source = include_str!("auxiliary_authorization_mirror.rs").replace("\r\n", "\n");
         let source = source
             .split_once(concat!(
                 "#[",

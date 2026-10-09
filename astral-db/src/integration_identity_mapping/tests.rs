@@ -45,6 +45,68 @@ fn status_transitions_are_forward_only_and_revoke_is_terminal() {
 }
 
 #[test]
+fn mapping_status_decodes_only_exact_ascii_state_bytes() {
+    use IntegrationIdentityMappingStatus::{Active, Disabled, Revoked};
+
+    assert_eq!(
+        IntegrationIdentityMappingStatus::parse(b"ACTIVE"),
+        Ok(Active)
+    );
+    assert_eq!(
+        IntegrationIdentityMappingStatus::parse(b"DISABLED"),
+        Ok(Disabled)
+    );
+    assert_eq!(
+        IntegrationIdentityMappingStatus::parse(b"REVOKED"),
+        Ok(Revoked)
+    );
+
+    for invalid in [b"active".as_slice(), b"ACTIVE ", b"UNKNOWN", b"\xff"] {
+        assert_eq!(
+            IntegrationIdentityMappingStatus::parse(invalid),
+            Err(IntegrationIdentityMappingError::CorruptRow(
+                "unknown mapping status"
+            ))
+        );
+    }
+}
+
+#[test]
+fn operation_claim_decodes_only_exact_states_and_consistent_claim_fields() {
+    let token = [7; 16];
+    let wrong_token = [8; 16];
+    assert_eq!(
+        resolve_operation_claim_outcome(b"PENDING", Some(token.as_slice()), None, &token),
+        Ok(ClaimOutcome::New)
+    );
+    assert_eq!(
+        resolve_operation_claim_outcome(b"COMPLETED", None, Some(3), &token),
+        Ok(ClaimOutcome::Replay(3))
+    );
+    assert!(matches!(
+        resolve_operation_claim_outcome(b"COMPLETED", Some(token.as_slice()), Some(3), &token),
+        Err(IntegrationIdentityMappingError::InDoubtOperation(
+            "completed operation retains a claim token"
+        ))
+    ));
+
+    for (status, claim, revision) in [
+        (b"completed".as_slice(), None, Some(3)),
+        (b"COMPLETED", Some(token.as_slice()), Some(3)),
+        (b"COMPLETED", None, None),
+        (b"PENDING", Some(wrong_token.as_slice()), None),
+        (b"PENDING", None, None),
+        (b"PENDING", Some(token.as_slice()), Some(3)),
+        (b"\xff", Some(token.as_slice()), None),
+    ] {
+        assert!(matches!(
+            resolve_operation_claim_outcome(status, claim, revision, &token),
+            Err(IntegrationIdentityMappingError::InDoubtOperation(_))
+        ));
+    }
+}
+
+#[test]
 fn operation_digest_binds_actor_command_key_and_content() {
     let key = IntegrationIdentityKey::new("app", "issuer", "subject").unwrap();
     let base = CreateIntegrationIdentityMapping {
@@ -112,6 +174,11 @@ fn sql_and_migration_preserve_the_mapping_contract() {
             .collect::<Vec<_>>()
             .join(" ");
     assert!(migration.contains("app_id VARBINARY(64) NOT NULL"));
+    assert!(migration.contains(
+        "ENUM('ACTIVE', 'DISABLED', 'REVOKED') CHARACTER SET ascii COLLATE ascii_bin NOT NULL"
+    ));
+    assert!(migration
+        .contains("ENUM('PENDING', 'COMPLETED') CHARACTER SET ascii COLLATE ascii_bin NOT NULL"));
     assert!(migration.contains("issuer VARBINARY(512) NOT NULL"));
     assert!(migration.contains("subject VARBINARY(512) NOT NULL"));
     assert!(migration.contains("UNIQUE KEY uq_iim_external_identity (app_id, issuer, subject)"));

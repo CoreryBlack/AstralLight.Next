@@ -2032,7 +2032,11 @@ mod tests {
     /// （Redis 拆线的回归防线）。
     #[test]
     fn production_l2_injection_is_gated_by_the_compat_flag() {
-        let source = include_str!("evidence_cache.rs");
+        let source = include_str!("evidence_cache.rs").replace("\r\n", "\n");
+        let source = source
+            .split_once(concat!("#[", "cfg(test)]\nmod tests"))
+            .expect("production source precedes tests")
+            .0;
         let gated =
             ["redis_projection_compat_enabled().then(|| shared_l2_evidence_store().clone())"];
         for marker in gated {

@@ -161,7 +161,7 @@ fn lock_cleanup_preserves_original_errors_and_escalates_success_cleanup_failure(
 
 #[test]
 fn migration_lock_release_is_scoped_after_all_migration_work() {
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let acquire = source
         .find("acquire_migration_lock(&mut lock_connection).await?")
         .expect("lock acquisition must exist");
@@ -371,7 +371,7 @@ fn trustgraph_baseline_repair_does_not_require_alias_indexes_or_foreign_key() {
 
 #[test]
 fn trustgraph_preflight_runs_before_sqlx_history_execution() {
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let preflight = source
         .find("preflight_historical_migration_schema_contract(pool, migration")
         .expect("apply preflight must exist");
@@ -395,7 +395,7 @@ fn trustgraph_preflight_runs_before_sqlx_history_execution() {
 
 #[test]
 fn trustgraph_baseline_preflight_always_runs_readiness_after_index_convergence() {
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let baseline_arm = source
         .split("TrustgraphRuntimeSchemaState::Baseline {")
         .nth(1)
@@ -416,7 +416,7 @@ fn trustgraph_baseline_preflight_always_runs_readiness_after_index_convergence()
 
 #[test]
 fn sqlx_history_success_is_after_preflight_and_final_failure_is_recovery_required() {
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let preflight = source
         .find("preflight_schema_contract_before_sqlx(pool, &applied_versions")
         .expect("schema preflight call must exist");
@@ -1711,7 +1711,7 @@ fn five_chain_migrations_are_pinned_and_own_only_declared_artifacts() {
 
 #[test]
 fn review_runtime_and_preflight_keep_optional_owners_separate() {
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let production = source
         .split("#[cfg(test)]")
         .next()
@@ -1849,7 +1849,7 @@ fn column_default_normalization_accepts_mysql_expression_parentheses_only() {
 
 #[test]
 fn review_preflight_and_destructive_gate_precede_history_writes_and_sqlx() {
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let production = source
         .split("#[cfg(test)]")
         .next()
@@ -2013,7 +2013,7 @@ fn verified_baseline_adoption_records_exactly_the_java_era() {
 /// 的新迁移被静默吞掉（记录成功、schema 缺增量、无任何报错）。
 #[test]
 fn record_verified_baseline_is_default_deny_for_post_baseline_migrations() {
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let production = source
         .split("#[cfg(test)]")
         .next()
@@ -2831,7 +2831,7 @@ fn cross_city_outbox_routing_direction_is_explicit_and_indexed() {
 
 #[test]
 fn cross_city_table_validator_enforces_exact_whole_shape() {
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let production = source
         .split("#[cfg(test)]")
         .next()
@@ -3401,7 +3401,7 @@ fn required_schema_contract_no_longer_requires_legacy_snapshot_tables() {
             .iter()
             .any(|expected| expected.table == table));
     }
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let production_source = source
         .split("#[cfg(test)]")
         .next()
@@ -3842,7 +3842,7 @@ fn monitor_creator_is_exact_and_never_claims_existing_artifact_repair() {
 
 #[test]
 fn monitor_schema_validation_is_wired_before_sqlx_and_at_startup() {
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let production_source = source
         .split("#[cfg(test)]")
         .next()
@@ -3940,7 +3940,7 @@ fn replay_lease_generation_contract_rejects_schema_drift() {
 
 #[test]
 fn replay_lease_generation_contract_is_checked_before_sqlx_and_at_startup() {
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let production_source = source
         .split("#[cfg(test)]")
         .next()
@@ -4066,7 +4066,7 @@ fn audit_quarantine_pending_definitions_cover_split_creator_and_hardening_migrat
 
 #[test]
 fn baseline_ready_requires_no_foreign_keys_on_all_baseline_tables() {
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let baseline_ready_condition = source
         .split("let no_foreign_keys = schema_foreign_keys_match(pool, \"sod_violation\", &[])")
         .nth(1)
@@ -4400,7 +4400,7 @@ fn repairing_marker_metadata_preserves_event_identity_and_generation() {
 fn migration_backfill_status_columns_are_retired() {
     // 旧链状态列随迁移 20260831000001 退役：backfill 对 head 只维护
     // 代次/围栏/last_event_id，绝不写 projected_generation/projection_status。
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let production_source = source
         .split("#[cfg(test)]")
         .next()
@@ -4414,7 +4414,7 @@ fn migration_backfill_retired_snapshot_proof_is_absent() {
     // 快照重建通道已随迁移 20260827000002 退役（snapshot 表已删除），旧
     // "零行快照 + manifest outbox 关联证明"谓词必须从 backfill 中缺席，
     // PROCESSED 标记即终态；防止重构时静默复活对已删表的 SQL 引用。
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let production_source = source
         .split("#[cfg(test)]")
         .next()
@@ -4443,7 +4443,7 @@ fn migration_backfill_retired_snapshot_proof_is_absent() {
 
 #[test]
 fn rule_set_projection_backfill_is_wired_after_sqlx_under_migration_lock() {
-    let source = include_str!("../migration.rs");
+    let source = include_str!("../migration.rs").replace("\r\n", "\n");
     let production_source = source
         .split("#[cfg(test)]")
         .next()

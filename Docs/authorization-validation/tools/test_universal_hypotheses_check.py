@@ -20,7 +20,9 @@ exploration is complete at it, so the verdicts equal the default-bound
 verdicts while keeping the suite offline-fast.
 """
 
+import datetime
 import unittest
+from unittest.mock import patch
 
 import e5_model_check as model
 import universal_hypotheses_check as uhc
@@ -33,7 +35,16 @@ class UniversalHypothesesTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.report = uhc.check_universal_hypotheses(FAST_BOUND)
+        cls.fixed_time = datetime.datetime(2026, 10, 8, tzinfo=datetime.timezone.utc)
+        with patch.object(uhc.datetime, "datetime", wraps=datetime.datetime) as clock:
+            clock.now.return_value = cls.fixed_time
+            cls.report = uhc.check_universal_hypotheses(FAST_BOUND)
+
+    def test_parallel_execution_preserves_every_hypothesis_and_report_field(self):
+        with patch.object(uhc.datetime, "datetime", wraps=datetime.datetime) as clock:
+            clock.now.return_value = self.fixed_time
+            parallel = uhc.check_universal_hypotheses(FAST_BOUND, workers=2)
+        self.assertEqual(parallel, self.report)
 
     def test_overall_status_pass(self):
         self.assertEqual(self.report["status"], "PASS")

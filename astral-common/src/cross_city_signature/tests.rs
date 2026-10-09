@@ -21,7 +21,8 @@ use super::{
 use astral_types::{MutationProposal, NodeDecision, ZeroDecisionEvidence};
 
 /// The module source itself, pinned at compile time for source-shape tests.
-const MODULE_SOURCE: &str = include_str!("../cross_city_signature.rs");
+static MODULE_SOURCE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| include_str!("../cross_city_signature.rs").replace("\r\n", "\n"));
 
 // ---------------------------------------------------------------------------
 // RFC 8032 known-answer material (section 7.1, TEST 1)

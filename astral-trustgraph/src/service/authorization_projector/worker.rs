@@ -30,63 +30,6 @@ pub(crate) fn budget_exhausted_error(reason: &str, attempts: i64) -> String {
     format!("{ATTEMPT_BUDGET_EXHAUSTED_CODE};attempts={attempts};{reason}")
 }
 
-#[cfg(feature = "e3-observability")]
-fn log_e3_attempt_event(
-    event: &'static str,
-    claimed: &DeltaEventClaim,
-    outcome: &'static str,
-    durable: bool,
-    backoff_seconds: Option<i64>,
-) {
-    let stamp = astral_common::experiment_observation::stamp();
-    tracing::info!(
-        target: "authz_e3",
-        event,
-        process_observation_id = %stamp.process_observation_id,
-        event_sequence = stamp.event_sequence,
-        wall_unix_ns = %stamp.wall_unix_ns,
-        delta_event_id = claimed.delta_event_id,
-        event_id = %claimed.event_id,
-        attempt_id = %format!("{}:{}", claimed.delta_event_id, claimed.attempts),
-        operation_id = %claimed.operation_id,
-        tenant_id = claimed.tenant_id,
-        card_id = ?claimed.card_id,
-        aggregate_type = %claimed.aggregate_type,
-        aggregate_id = claimed.aggregate_id,
-        grant_id = %claimed.grant_id,
-        target_version = claimed.target_version,
-        attempts = claimed.attempts,
-        outcome,
-        durable,
-        backoff_seconds = ?backoff_seconds,
-        "e3 projector observation"
-    );
-}
-
-#[cfg(feature = "e3-observability")]
-fn log_e3_identity_event(
-    event: &'static str,
-    identity: &DeltaLeaseIdentity,
-    outcome: &'static str,
-    durable: bool,
-    backoff_seconds: Option<i64>,
-) {
-    let stamp = astral_common::experiment_observation::stamp();
-    tracing::info!(
-        target: "authz_e3",
-        event,
-        process_observation_id = %stamp.process_observation_id,
-        event_sequence = stamp.event_sequence,
-        wall_unix_ns = %stamp.wall_unix_ns,
-        delta_event_id = identity.delta_event_id,
-        event_id = %identity.event_id,
-        outcome,
-        durable,
-        backoff_seconds = ?backoff_seconds,
-        "e3 projector observation"
-    );
-}
-
 pub(crate) fn clamp_backoff(secs: i64) -> i64 {
     secs.clamp(1, BACKOFF_CAP_SECS.min(MAX_BACKOFF_SECONDS))
 }

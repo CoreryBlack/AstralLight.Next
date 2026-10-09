@@ -30,6 +30,32 @@ migrations; Redis- and RabbitMQ-backed suites additionally require the opt-in `r
 feature and a Rabbit transport respectively. The single-node composite is a strict Redis-free
 deployment (redis projection compatibility is refused at startup without a compiled adapter). Their presence in this checkout is not an execution result.
 
+## Production-profile index
+
+`tests-suite/MANIFEST.toml` indexes every RQ/M/E/MT/performance, compatibility and
+excluded scope with its production dependency contract and exact command or explicit
+blocker. `scripts/test_campaign.py` validates this index before dispatch, retains
+nonempty assertion/ignored/SKIP evidence, records a frozen content hash and never
+provisions dependencies or retries unknown results.
+
+`tests-suite/tests/native_projection_lifecycle.rs` adds a single ignored real-MySQL
+binary exercising the production TrustGraph source repository, post-commit local
+projection dispatch, durable delta/audit correlation, production local worker ownership,
+published pointer/fence and strict PolicyEngine evaluation. Source APIs can publish
+synchronously after COMMIT, so the test does not attribute every publication exclusively
+to the async worker. It contributes selected M1/M2/M3 implementation coverage only.
+Strict tenant fixtures and policy benchmarks separately
+exercise scope and final reload while rejecting legacy/raw ports; their timings are
+CPU component data, not MySQL/HTTP performance.
+
+Native integration requires only MySQL with LocalBus/LocalProjectionBus and the memory
+hub; standalone/current distributed transport requires MySQL + RabbitMQ; Redis remains
+compat-only. Historical RQ/S15 harnesses that require Redis/OPA are retained as legacy
+inputs with `BLOCKED` current-campaign status rather than adding middleware to native.
+Live signed-host races, complete mediation, fault controllers and full distributed
+research campaigns remain outside this local result. A per-series `PASS` applies only
+to selected component/model/integration evidence, never to an unexecuted full campaign.
+
 ## Status boundary
 
 The standalone repository publishes executable source, fixtures, and runners. It does

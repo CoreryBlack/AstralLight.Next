@@ -33,10 +33,10 @@ async fn authorize(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .is_none_or(|value| {
-            !value
+            value
                 .split(';')
                 .next()
-                .is_some_and(|v| v.trim() == "application/json")
+                .is_none_or(|v| v.trim() != "application/json")
         })
     {
         return rejection(

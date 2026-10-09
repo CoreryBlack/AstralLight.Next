@@ -192,8 +192,8 @@ impl AssemblyCache {
                 .values
                 .iter()
                 .filter(|(_, entry)| {
-                    !now.checked_duration_since(entry.installed_at)
-                        .is_some_and(|age| age < TTL)
+                    now.checked_duration_since(entry.installed_at)
+                        .is_none_or(|age| age >= TTL)
                 })
                 .map(|(key, _)| key.clone())
                 .collect();

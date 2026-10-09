@@ -159,14 +159,17 @@ impl IntegrationIdentityMappingStatus {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, IntegrationIdentityMappingError> {
-        match value {
-            "ACTIVE" => Ok(Self::Active),
-            "DISABLED" => Ok(Self::Disabled),
-            "REVOKED" => Ok(Self::Revoked),
-            _ => Err(IntegrationIdentityMappingError::CorruptRow(
+    fn parse(value: &[u8]) -> Result<Self, IntegrationIdentityMappingError> {
+        if value == b"ACTIVE" {
+            Ok(Self::Active)
+        } else if value == b"DISABLED" {
+            Ok(Self::Disabled)
+        } else if value == b"REVOKED" {
+            Ok(Self::Revoked)
+        } else {
+            Err(IntegrationIdentityMappingError::CorruptRow(
                 "unknown mapping status",
-            )),
+            ))
         }
     }
 }
@@ -379,7 +382,7 @@ pub async fn set_integration_identity_mapping_status(
         return Ok(revision);
     }
 
-    let current: Option<(u64, i64, i64, String, u64)> = sqlx::query_as(MAPPING_LOCK_SQL)
+    let current: Option<(u64, i64, i64, Vec<u8>, u64)> = sqlx::query_as(MAPPING_LOCK_SQL)
         .bind(command.key.app_id.as_bytes())
         .bind(command.key.issuer.as_bytes())
         .bind(command.key.subject.as_bytes())
@@ -473,7 +476,7 @@ struct ActiveMappingRow {
     subject: Vec<u8>,
     user_id: i64,
     identity_card_id: i64,
-    status: String,
+    status: Vec<u8>,
     revision: u64,
 }
 
@@ -481,7 +484,7 @@ struct ActiveMappingRow {
 struct OperationRow {
     request_digest: Vec<u8>,
     actor_id: i64,
-    status: String,
+    status: Vec<u8>,
     result_revision: Option<u64>,
     claim_token: Option<Vec<u8>>,
 }
@@ -580,6 +583,42 @@ enum ClaimOutcome {
     Replay(u64),
 }
 
+fn resolve_operation_claim_outcome(
+    status: &[u8],
+    stored_claim: Option<&[u8]>,
+    result_revision: Option<u64>,
+    claim_token: &[u8],
+) -> Result<ClaimOutcome, IntegrationIdentityMappingError> {
+    if status == b"COMPLETED" {
+        if stored_claim.is_some() {
+            return Err(IntegrationIdentityMappingError::InDoubtOperation(
+                "completed operation retains a claim token",
+            ));
+        }
+        return result_revision.map(ClaimOutcome::Replay).ok_or(
+            IntegrationIdentityMappingError::InDoubtOperation(
+                "completed operation has no result revision",
+            ),
+        );
+    }
+    if status == b"PENDING" {
+        if stored_claim != Some(claim_token) {
+            return Err(IntegrationIdentityMappingError::InDoubtOperation(
+                "operation ledger contains a committed pending claim",
+            ));
+        }
+        if result_revision.is_some() {
+            return Err(IntegrationIdentityMappingError::InDoubtOperation(
+                "new operation claim already has a result revision",
+            ));
+        }
+        return Ok(ClaimOutcome::New);
+    }
+    Err(IntegrationIdentityMappingError::InDoubtOperation(
+        "operation ledger has an unknown state",
+    ))
+}
+
 async fn claim_operation_in_tx(
     tx: &mut Transaction<'_, MySql>,
     operation_id: &str,
@@ -617,27 +656,12 @@ async fn claim_operation_in_tx(
             "operation_id is already bound to different content or actor",
         ));
     }
-    match status.as_str() {
-        "COMPLETED" if stored_claim.is_none() => result_revision.map(ClaimOutcome::Replay).ok_or(
-            IntegrationIdentityMappingError::InDoubtOperation(
-                "completed operation has no result revision",
-            ),
-        ),
-        "PENDING" if stored_claim.as_deref() == Some(claim_token.as_slice()) => {
-            if result_revision.is_some() {
-                return Err(IntegrationIdentityMappingError::InDoubtOperation(
-                    "new operation claim already has a result revision",
-                ));
-            }
-            Ok(ClaimOutcome::New)
-        }
-        "PENDING" => Err(IntegrationIdentityMappingError::InDoubtOperation(
-            "operation ledger contains a committed pending claim",
-        )),
-        _ => Err(IntegrationIdentityMappingError::InDoubtOperation(
-            "operation ledger has an unknown state",
-        )),
-    }
+    resolve_operation_claim_outcome(
+        &status,
+        stored_claim.as_deref(),
+        result_revision,
+        claim_token,
+    )
 }
 
 async fn complete_operation_in_tx(

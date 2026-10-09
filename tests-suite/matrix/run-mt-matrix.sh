@@ -1,38 +1,40 @@
 #!/usr/bin/env bash
-# MySQL tenant suites by default; Redis compatibility is an explicit opt-in.
+# Tenant matrix selection only; isolation, evidence and fail-fast live in one runner.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR/../.."
-PROFILE=default
+PROFILE=native-single-node
 SUITES=(mt_extreme_isolation mt_extreme_churn mt_extreme_cross_storm mt_extreme_failclosed mt_extreme_capacity)
+EXTRA=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --profile) [ "$#" -ge 2 ] || exit 2; PROFILE="$2"; shift 2 ;;
+        --profile)
+            [ "$#" -ge 2 ] || exit 2
+            case "$2" in
+                default|native-single-node) PROFILE=native-single-node ;;
+                redis-compat)
+                    printf '[BLOCKED] tenant matrix uses the native MySQL path; Redis has a dedicated compatibility suite\n' >&2
+                    exit 2
+                    ;;
+                *) printf '[BLOCKED] unknown matrix profile: %s\n' "$2" >&2; exit 2 ;;
+            esac
+            shift 2
+            ;;
         --suites) [ "$#" -ge 2 ] || exit 2; read -r -a SUITES <<<"$2"; shift 2 ;;
-        *) printf '[error] unknown matrix argument: %s\n' "$1" >&2; exit 2 ;;
+        --run-id|--artifact-root) [ "$#" -ge 2 ] || exit 2; EXTRA+=("$1" "$2"); shift 2 ;;
+        *) printf '[BLOCKED] unknown matrix argument: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
-[ "${#SUITES[@]}" -gt 0 ] || { printf '[error] no suites selected\n' >&2; exit 2; }
+[ "${#SUITES[@]}" -gt 0 ] || { printf '[BLOCKED] no suites selected\n' >&2; exit 2; }
+ARGS=(--run --profile "$PROFILE")
 for suite in "${SUITES[@]}"; do
-    case "$suite" in mt_extreme_isolation|mt_extreme_churn|mt_extreme_cross_storm|mt_extreme_failclosed|mt_extreme_capacity) ;;
-        *) printf '[error] unknown suite: %s\n' "$suite" >&2; exit 2 ;;
+    case "$suite" in
+        mt_extreme_isolation) ARGS+=(--suite mt-isolation) ;;
+        mt_extreme_churn) ARGS+=(--suite mt-churn) ;;
+        mt_extreme_cross_storm) ARGS+=(--suite mt-cross-storm) ;;
+        mt_extreme_failclosed) ARGS+=(--suite mt-failclosed) ;;
+        mt_extreme_capacity) ARGS+=(--suite mt-capacity) ;;
+        *) printf '[BLOCKED] unknown suite: %s\n' "$suite" >&2; exit 2 ;;
     esac
 done
-: "${DATABASE_URL:?DATABASE_URL is required}"
-[ "${ASTRAL_MIGRATION_ENV:-}" = isolated ] || exit 2
-[ "${RUST_INTEGRATION_REQUIRED:-}" = 1 ] || exit 2
-FEATURES=()
-case "$PROFILE" in
-    default) unset REDIS_URL; export ASTRAL_REDIS_PROJECTION_COMPAT=false ;;
-    redis-compat) : "${REDIS_URL:?explicit compatibility profile requires REDIS_URL}"; export ASTRAL_REDIS_PROJECTION_COMPAT=true; FEATURES=(--features redis-compat) ;;
-    *) printf '[error] unknown profile: %s\n' "$PROFILE" >&2; exit 2 ;;
-esac
-export ASTRAL_MESSAGE_TRANSPORT=local
-printf '[matrix] profile=%s suites=%s\n' "$PROFILE" "${SUITES[*]}"
-FAILED=0
-for suite in "${SUITES[@]}"; do
-    if ! cargo test -p testsuite "${FEATURES[@]}" --test "$suite" -- --ignored --nocapture --test-threads=1; then
-        FAILED=1
-    fi
-done
-exit "$FAILED"
+command -v python >/dev/null 2>&1 || { printf '[BLOCKED] Python 3.11+ is required\n' >&2; exit 2; }
+exec python -B "$SCRIPT_DIR/../../scripts/test_campaign.py" "${ARGS[@]}" "${EXTRA[@]}"

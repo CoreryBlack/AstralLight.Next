@@ -20,10 +20,10 @@ id = "policy-engine/tenant_isolation_tests"
 category = "multi-tenant"
 owner_crate = "policy-engine"
 path = "policy-engine/tests/tenant_isolation_tests.rs"
-kind = "integration-mock"
+kind = "strict-published-fixture"
 tenants = "2(成对);10(并发求值)"
 arch_status = "current"
-note = "MockRepo 求值隔离;无并发跨租户写入场景(由 testsuite MT 套件补位)"
+note = "strict published-evidence 注入夹具;验证 scope/最终重读且禁止 legacy ports;不替代真实 MySQL 或并发写入证明"
 run = "cargo test -p policy-engine --test tenant_isolation_tests"
 
 [[entry]]
@@ -347,7 +347,7 @@ owner_crate = "bench/loadgen(独立 crate)"
 path = "bench/loadgen/"
 kind = "bench-binary"
 arch_status = "current"
-note = "HMAC v3 压测客户端;scripts/bench_matrix.sh 并发阶梯(native 基准入口)"
+note = "HMAC v3 压测客户端;bench/loadgen/scripts/bench_matrix.sh 并发阶梯;需 native composite 实际部署与收敛证据"
 
 [[entry]]
 id = "perf/no-regression-matrices"
@@ -366,7 +366,7 @@ owner_crate = "Docs/authorization-validation/tools"
 path = "Docs/authorization-validation/tools/"
 kind = "python-tests"
 arch_status = "current"
-note = "E1-E5 离线工具 + 15 个 test_*.py(473 例);E2 五前提映射见 experiment_register.py"
+note = "E1-E5 离线工具与 test_*.py;执行数量由本轮 unittest 日志记录;E2 五前提映射见 experiment_register.py"
 
 [[entry]]
 id = "security/admission-safety-tla"
@@ -393,11 +393,11 @@ note = "Cargo 显式目标:commit-proven hub 失效 / 强制身份映射 / 单�
 id = "e2e/single-node-native"
 category = "e2e"
 owner_crate = "astral-single-node + bench/loadgen"
-path = "tests-suite/e2e/"
+path = "bench/loadgen/scripts/bench_matrix.sh"
 kind = "campaign"
 requires = ["MySQL", "LocalBus/LocalProjectionBus", "composite 二进制", "loadgen 二进制"]
 arch_status = "current"
-note = "部署配方 + bench_matrix 阶梯(seed → bootstrap → 启动 → 收敛 → 压测 → 收尾)"
+note = "完整 native HTTP campaign 仍需隔离部署、签名身份、source/bootstrap 与终态证据;压测脚本存在不表示整流程已执行"
 
 [[entry]]
 id = "e2e/distributed-s15"
@@ -405,8 +405,9 @@ category = "e2e"
 owner_crate = "Docs/实验/分布式测试/rust-s15"
 path = "Docs/实验/分布式测试/rust-s15/"
 kind = "campaign"
-arch_status = "current"
-note = "三节点分布式战役 harness(历史);真实运行需受保护环境与审批,保持 BLOCKED 边界"
+requires = ["fresh protected three-node deployment", "MySQL", "RabbitMQ", "Redis", "OPA/image identity", "run_config and source hashes"]
+arch_status = "compat"
+note = "历史三节点 S15 harness;其 Redis/Rabbit/OPA 依赖不属于 native single-node;当前 checkout 无受保护节点与历史 evidence, 因此保持 BLOCKED, 不作为当前架构 PASS"
 
 [[entry]]
 id = "mt-extreme/testsuite"
@@ -439,3 +440,1114 @@ kind = "shell-tests"
 arch_status = "current"
 note = "命令编排 mock;无真实服务,不作为 DB/MQ 集成证明"
 run = "bash scripts/tests/test-run-tests.sh"
+
+[[entry]]
+id = "integration/native-projection-lifecycle"
+category = "integration"
+owner_crate = "testsuite"
+path = "tests-suite/tests/native_projection_lifecycle.rs"
+kind = "integration-ignored"
+requires = ["MySQL migrated isolated schema", "LocalBus", "LocalProjectionBus", "MemoryProjectionHub"]
+arch_status = "current"
+note = "真实 source repository commit -> durable delta/audit -> local worker -> published evidence -> PolicyEngine;单 binary 单测试,不替代 HTTP campaign"
+run = "python -B scripts/test_campaign.py --run --suite native-projection-lifecycle"
+
+[[entry]]
+id = "harness/test-campaign"
+category = "harness"
+owner_crate = "scripts"
+path = "scripts/test_campaign.py"
+kind = "python-runner"
+arch_status = "current"
+note = "下方 profile/series/suite 是可执行索引;只复用已批准/已迁移依赖,不启动服务/迁移/故障注入;legacy entry 分类继续保留"
+run = "python -B scripts/test_campaign.py --list"
+
+# Executable index. SERVICE dependency equality is enforced before dispatch.
+# A series label is coverage attribution, never a claim that a full campaign ran.
+# Native kernel fixtures do not materialize MySQL state or prove host mediation.
+
+[[profile]]
+id = "native-kernel"
+production_services = []
+deployment = "native-single-node component checks"
+boundary = "in-process component assertions; no durable or HTTP integration"
+
+[[profile]]
+id = "offline-validation"
+production_services = []
+deployment = "offline abstract protocol tooling"
+boundary = "Python standard library; no runtime authorization proof"
+
+[[profile]]
+id = "native-single-node"
+production_services = ["mysql"]
+deployment = "MySQL + LocalBus + LocalProjectionBus + MemoryProjectionHub"
+boundary = "existing approved isolated database only; no RabbitMQ/Redis/OPA"
+
+[[profile]]
+id = "standalone-rabbit"
+production_services = ["mysql", "rabbitmq"]
+deployment = "standalone services using Rabbit transport"
+boundary = "explicit Rabbit vhost and MySQL durable consumer proof; no Redis"
+
+[[profile]]
+id = "distributed"
+production_services = ["mysql", "rabbitmq"]
+deployment = "current multi-process Rabbit transport"
+boundary = "full current campaign blocked until legacy Redis/OPA harness is replaced and deployment is approved"
+
+[[profile]]
+id = "redis-compat"
+production_services = ["mysql", "redis"]
+deployment = "explicit redis-compat feature/runtime adapter window"
+boundary = "compat-only; never a native default; registered sunset 2026-12-31"
+
+[[profile]]
+id = "performance-kernel"
+production_services = []
+deployment = "production compiler/policy/hub CPU components"
+boundary = "CPU/allocation measurements only; not HTTP/MySQL/multi-node performance"
+
+[[profile]]
+id = "performance-native"
+production_services = ["mysql"]
+deployment = "native composite with signed HTTP loadgen"
+boundary = "requires approved isolated deployed binary, signed identity and durable convergence"
+
+[[series]]
+id = "CORE"
+boundary = "workspace/static/component verification; ignored and excluded checks retain separate status"
+[[series]]
+id = "RQ1"
+boundary = "component authorization baseline; complete comparative/live research campaign remains separate"
+[[series]]
+id = "RQ2"
+boundary = "compiler/tenant scaling components; historical RQ2-K/I live campaign separate; RQ2-D structurally N/A"
+[[series]]
+id = "RQ3"
+boundary = "incremental compiler/source/publication components; complete distributed write campaign separate"
+[[series]]
+id = "RQ4"
+boundary = "recovery/churn/queue components; full write storm and cross-node convergence not established locally"
+[[series]]
+id = "RQ5"
+boundary = "strict read/hub concurrency components; full warm/cold HTTP read campaign separate"
+[[series]]
+id = "M1"
+boundary = "authorization assumption: source capture; not architecture delivery milestone M1"
+[[series]]
+id = "M2"
+boundary = "authorization assumption: monotone publication; not universal multi-writer proof"
+[[series]]
+id = "M3"
+boundary = "authorization assumption: faithful representation; bounded implementation assertions"
+[[series]]
+id = "M4"
+boundary = "authorization assumption: trusted storage/processes; non-Byzantine premise remains explicit"
+[[series]]
+id = "M5"
+boundary = "authorization assumption: complete mediation; local tests do not prove all deployed host operations"
+[[series]]
+id = "E1"
+boundary = "full decision-path race protocol; local wiring is not a live signed-host race result"
+[[series]]
+id = "E2"
+boundary = "five stable controlled omission tests; host_mediation remains model-only"
+[[series]]
+id = "E3"
+boundary = "recovery-tail protocol; offline observations and native lifecycle distinguish live fault campaign"
+[[series]]
+id = "E4"
+boundary = "profile-specific fault prerequisites and fail-closed checks; no live controller is implied by a plan"
+[[series]]
+id = "E5"
+boundary = "bounded abstract models and implementation comparison; no unbounded/deployment proof"
+[[series]]
+id = "MT-E1"
+boundary = "multi-tenant strict scope isolation; distinct from authorization E1"
+[[series]]
+id = "MT-E2"
+boundary = "no implementation or registered target exists; explicitly BLOCKED"
+[[series]]
+id = "MT-E3"
+boundary = "generation churn and revocation/restore"
+[[series]]
+id = "MT-E4"
+boundary = "cross-tenant invalidation storm; distinct from authorization E4"
+[[series]]
+id = "MT-E5"
+boundary = "bounded tenant/card capacity; not authorization E5 model"
+[[series]]
+id = "MT-E6"
+boundary = "fail-closed injection contracts"
+[[series]]
+id = "PERF"
+boundary = "measured component versus real deployed performance; environment and source snapshot required"
+[[series]]
+id = "COMPAT"
+boundary = "explicit retired/compatibility semantics; not native current deployment acceptance"
+[[series]]
+id = "EXCLUDED"
+boundary = "outside root workspace; dedicated compile/integration paths only"
+
+[[suite]]
+id = "campaign-contracts"
+owner = "scripts"
+profile = "native-kernel"
+test_services = []
+series = ["CORE", "M4", "E4"]
+scope = "component"
+boundary = "runner/manifest assertions and stub subprocesses only; no DB, Docker or live fault"
+sources = ["scripts/test_campaign.py", "scripts/performance_acceptance.py", "Docs/authorization-validation/tools/model_acceptance.py", "scripts/tests", "tests-suite/MANIFEST.toml"]
+argv = ["python", "-B", "-m", "unittest", "discover", "-s", "scripts/tests", "-p", "test_*.py"]
+acceptance = "unittest"
+minimum_tests = 20
+
+[[suite]]
+id = "shell-runner-contracts"
+owner = "scripts"
+profile = "native-kernel"
+test_services = []
+series = ["CORE", "E4"]
+scope = "component"
+boundary = "mock Cargo/Docker orchestration only; no integration proof"
+sources = ["scripts/tests/test-run-tests.sh", "scripts/run-tests.sh"]
+argv = ["bash", "scripts/tests/test-run-tests.sh"]
+acceptance = "command"
+required_output = "runner contracts: entrypoints passed"
+
+[[suite]]
+id = "workspace-check"
+owner = "workspace"
+profile = "native-kernel"
+test_services = []
+series = ["CORE"]
+scope = "component"
+boundary = "current workspace members compile; excluded crates separate"
+sources = ["Cargo.toml", "Cargo.lock"]
+argv = ["cargo", "check", "--workspace", "--locked"]
+acceptance = "command"
+timeout_seconds = 1800
+
+[[suite]]
+id = "workspace-clippy"
+owner = "workspace"
+profile = "native-kernel"
+test_services = []
+series = ["CORE"]
+scope = "component"
+boundary = "required workspace lint; compiler-specific failures are not suppressed"
+sources = ["Cargo.toml", "Cargo.lock"]
+argv = ["cargo", "clippy", "--workspace", "--locked", "--", "-D", "warnings"]
+acceptance = "command"
+timeout_seconds = 1800
+
+[[suite]]
+id = "workspace-fmt"
+owner = "workspace"
+profile = "native-kernel"
+test_services = []
+series = ["CORE"]
+scope = "component"
+boundary = "read-only formatting assertion"
+sources = ["Cargo.toml"]
+argv = ["cargo", "fmt", "--all", "--", "--check"]
+acceptance = "command"
+
+[[suite]]
+id = "workspace-tests"
+owner = "workspace"
+profile = "native-kernel"
+test_services = []
+series = ["CORE"]
+scope = "component"
+boundary = "workspace non-ignored tests; ignored/SKIP counted separately, never real integration PASS"
+sources = ["Cargo.toml", "Cargo.lock"]
+argv = ["cargo", "test", "--workspace", "--locked"]
+acceptance = "rust"
+ignored_policy = "outside-selection"
+minimum_tests = 1
+timeout_seconds = 1800
+
+[[suite]]
+id = "native-dependency-tree"
+owner = "astral-single-node"
+profile = "native-kernel"
+test_services = []
+series = ["CORE", "E4", "M4"]
+scope = "component"
+boundary = "default compiled dependency tree has no Redis; not an actual deployed-config inspection"
+sources = ["Cargo.toml", "astral-single-node/Cargo.toml"]
+argv = ["cargo", "tree", "-p", "astral-single-node", "--locked", "--prefix", "none"]
+acceptance = "dependency-tree"
+
+[[suite]]
+id = "strict-tenant-isolation"
+owner = "policy-engine"
+profile = "native-kernel"
+test_services = []
+series = ["M3", "M5", "MT-E1", "RQ2"]
+scope = "component"
+boundary = "strict published-evidence injected fixture; final reload/scope/legacy-port assertions, no durable DB"
+sources = ["policy-engine/tests/tenant_isolation_tests.rs", "policy-engine/tests/support/published.rs"]
+argv = ["cargo", "test", "-p", "policy-engine", "--test", "tenant_isolation_tests", "--locked", "--", "--nocapture"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "gateway-contracts"
+owner = "astral-common"
+profile = "native-kernel"
+test_services = []
+series = ["E1", "M5"]
+scope = "component"
+boundary = "signed gateway middleware fixture; not deployed host full mediation"
+sources = ["astral-common/tests/gateway_contract_tests.rs"]
+argv = ["cargo", "test", "-p", "astral-common", "--test", "gateway_contract_tests", "--locked"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "redis-free-config"
+owner = "testsuite"
+profile = "native-kernel"
+test_services = []
+series = ["E4", "M4"]
+scope = "component"
+boundary = "AppConfig adapter capability assertion; not private composite startup validation"
+sources = ["tests-suite/tests/security/premise_redis_free_composite.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "premise_redis_free_composite", "--locked"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "strict-policy-targets-check"
+owner = "policy-engine"
+profile = "native-kernel"
+test_services = []
+series = ["CORE", "PERF"]
+scope = "component"
+boundary = "test and benchmark type checking; no measured performance data"
+sources = ["policy-engine/Cargo.toml", "policy-engine/tests/support/published.rs"]
+argv = ["cargo", "check", "-p", "policy-engine", "--tests", "--benches", "--locked"]
+acceptance = "command"
+
+[[suite]]
+id = "native-lifecycle-build"
+owner = "testsuite"
+profile = "native-kernel"
+test_services = []
+series = ["CORE", "M1", "M2", "M3"]
+scope = "component"
+boundary = "compile the ignored MySQL lifecycle target only; no real integration run"
+sources = ["tests-suite/tests/native_projection_lifecycle.rs"]
+argv = ["cargo", "check", "-p", "testsuite", "--test", "native_projection_lifecycle", "--locked"]
+acceptance = "command"
+
+[[suite]]
+id = "native-lifecycle-cleanup-contract"
+owner = "testsuite"
+profile = "native-kernel"
+test_services = []
+series = ["CORE", "E3", "E4"]
+scope = "component"
+boundary = "cleanup admission only; failure/timeout retains fixtures; no database integration"
+sources = ["tests-suite/tests/native_projection_lifecycle.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_lifecycle", "cleanup_requires_successful_lifecycle_and_joined_owners", "--locked", "--", "--exact", "--nocapture"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+
+[[suite]]
+id = "native-lifecycle-drain-contract"
+owner = "testsuite"
+profile = "native-kernel"
+test_services = []
+series = ["CORE", "E3", "E4"]
+scope = "component"
+boundary = "bus occupancy wait requires empty count and byte budgets; no worker completion or database integration proof"
+sources = ["tests-suite/tests/native_projection_lifecycle.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_lifecycle", "projection_bus_drain_wait_requires_empty_occupancy", "--locked", "--", "--exact", "--nocapture"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+
+[[suite]]
+id = "strict-benchmark-smoke"
+owner = "policy-engine"
+profile = "native-kernel"
+test_services = []
+series = ["CORE", "PERF"]
+scope = "component"
+boundary = "Criterion test mode verifies fixture decisions and setup only; no statistical timing"
+sources = ["policy-engine/benches/policy_bench.rs", "policy-engine/benches/tenant_isolation_bench.rs"]
+argv = ["cargo", "test", "-p", "policy-engine", "--bench", "policy_bench", "--bench", "tenant_isolation_bench", "--locked", "--", "--test"]
+acceptance = "criterion-smoke"
+benchmark_cases = [
+  "engine/published_ready_allow", "engine/published_ready_empty_deny",
+  "engine/published_unavailable_pending", "engine/published_ready_nonmatching_set",
+  "engine/published_tenant_gradient_32", "condition/component_time_range",
+  "condition/component_ipv4_range", "condition/component_scope",
+  "tenant_isolation/published_single_tenant_10_rules",
+  "tenant_isolation/published_concurrent_10_tenants", "tenant_isolation/published_concurrent_50_tenants",
+  "tenant_isolation/published_concurrent_100_tenants", "tenant_isolation/data_scope_resolve",
+  "tenant_isolation/data_scope_resolve_personal", "tenant_isolation/published_cross_tenant_100x50",
+  "tenant_isolation/published_empty_deny", "tenant_isolation/published_unavailable_pending",
+]
+
+[[suite]]
+id = "e2-pending-probe"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["E2", "M3"]
+scope = "component"
+boundary = "pending_probe controlled omission; no live production bypass"
+sources = ["astral-db/src/evidence_cache.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--lib", "evidence_cache::tests::e2_pending_probe_omission_accepts_stale_candidate_while_full_contract_reloads", "--locked", "--", "--exact", "--nocapture"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+
+[[suite]]
+id = "e2-post-recheck"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["E2", "M3"]
+scope = "component"
+boundary = "post_recheck cache bracket controlled omission"
+sources = ["astral-db/src/evidence_cache.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--lib", "evidence_cache::tests::e2_post_recheck_omission_accepts_interleaving_while_full_contract_reloads", "--locked", "--", "--exact", "--nocapture"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+
+[[suite]]
+id = "e2-final-reload"
+owner = "policy-engine"
+profile = "native-kernel"
+test_services = []
+series = ["E2", "M3", "M5"]
+scope = "component"
+boundary = "final_reload exact controlled omission; candidate removal cannot survive reload"
+sources = ["policy-engine/src/engine/tests.rs"]
+argv = ["cargo", "test", "-p", "policy-engine", "--lib", "engine::tests::e2_final_reload_omission_accepts_removed_candidate_while_full_contract_reloads", "--locked", "--", "--exact", "--nocapture"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+
+[[suite]]
+id = "e2-exact-identity"
+owner = "policy-engine"
+profile = "native-kernel"
+test_services = []
+series = ["E2", "M3", "M5"]
+scope = "component"
+boundary = "exact_identity original candidate versus successor revision; no host bypass switch"
+sources = ["policy-engine/src/engine/tests.rs"]
+argv = ["cargo", "test", "-p", "policy-engine", "--lib", "engine::tests::test_strict_successor_revision_cannot_replace_original_candidate", "--locked", "--", "--exact", "--nocapture"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+
+[[suite]]
+id = "e2-generation-revoke-fence"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["E2", "M2", "M3"]
+scope = "component"
+boundary = "generation_revoke_fence controlled omission and stale candidate rejection"
+sources = ["astral-db/src/evidence_cache.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--lib", "evidence_cache::tests::e2_generation_revoke_fence_omission_accepts_stale_candidate", "--locked", "--", "--exact", "--nocapture"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+
+[[suite]]
+id = "observability-feature-check"
+owner = "astral-trustgraph"
+profile = "native-kernel"
+test_services = []
+series = ["CORE", "E1", "E3", "E4"]
+scope = "component"
+boundary = "experiment feature target compilation only; no live fault or deployed observation proof"
+sources = ["astral-trustgraph/Cargo.toml", "astral-trustgraph/src/observability.rs"]
+argv = ["cargo", "check", "-p", "astral-trustgraph", "--all-targets", "--features", "e1-observability,e3-observability,e4-observability", "--locked"]
+acceptance = "command"
+timeout_seconds = 1800
+
+[[suite]]
+id = "observability-feature-clippy"
+owner = "astral-trustgraph"
+profile = "native-kernel"
+test_services = []
+series = ["CORE", "E1", "E3", "E4"]
+scope = "component"
+boundary = "all-target lint for experiment features; no integration acceptance"
+sources = ["astral-trustgraph/Cargo.toml"]
+argv = ["cargo", "clippy", "-p", "astral-trustgraph", "--all-targets", "--features", "e1-observability,e3-observability,e4-observability", "--locked", "--", "-D", "warnings"]
+acceptance = "command"
+timeout_seconds = 1800
+
+[[suite]]
+id = "policy-observability-tests"
+owner = "policy-engine"
+profile = "native-kernel"
+test_services = []
+series = ["E1", "M5"]
+scope = "component"
+boundary = "e1-observability library fixtures only; not a signed HTTP race"
+sources = ["policy-engine/Cargo.toml", "policy-engine/src/e1_observation.rs"]
+argv = ["cargo", "test", "-p", "policy-engine", "--lib", "--features", "e1-observability", "--locked"]
+acceptance = "rust"
+ignored_policy = "outside-selection"
+minimum_tests = 1
+timeout_seconds = 1800
+
+[[suite]]
+id = "db-observability-tests"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["E1", "M2", "M3"]
+scope = "component"
+boundary = "e1 evidence/observation fixtures; ignored integration/CPU checks not selected"
+sources = ["astral-db/Cargo.toml", "astral-db/src/evidence_cache.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--lib", "--features", "e1-observability", "--locked"]
+acceptance = "rust"
+ignored_policy = "outside-selection"
+minimum_tests = 1
+timeout_seconds = 1800
+
+[[suite]]
+id = "trustgraph-observability-tests"
+owner = "astral-trustgraph"
+profile = "native-kernel"
+test_services = []
+series = ["E1", "E3", "E4", "M4"]
+scope = "component"
+boundary = "local instrumented worker/reducer fixtures; not external fault injection"
+sources = ["astral-trustgraph/Cargo.toml", "astral-trustgraph/src/observability.rs"]
+argv = ["cargo", "test", "-p", "astral-trustgraph", "--lib", "--features", "e1-observability,e3-observability,e4-observability", "--locked"]
+acceptance = "rust"
+ignored_policy = "outside-selection"
+minimum_tests = 1
+timeout_seconds = 1800
+
+[[suite]]
+id = "offline-validation-tools"
+owner = "authorization-validation"
+profile = "offline-validation"
+test_services = []
+series = ["E1", "E2", "E3", "E4", "E5", "M4", "M5"]
+scope = "offline-model"
+boundary = "standard-library unit/model/protocol fixtures; no actual fault injection or deployed decision proof"
+sources = ["Docs/authorization-validation/tools"]
+argv = ["python", "-B", "-m", "unittest", "discover", "-s", "Docs/authorization-validation/tools", "-p", "test_*.py"]
+acceptance = "unittest"
+minimum_tests = 1
+timeout_seconds = 1800
+
+[[suite]]
+id = "e5-bounded-single"
+owner = "authorization-validation"
+profile = "offline-validation"
+test_services = []
+series = ["E5", "M1", "M2", "M3", "M5"]
+scope = "offline-model"
+boundary = "full abstract contract only; omission counterexamples are expected, not deployment failure"
+sources = ["Docs/authorization-validation/tools/e5_model_check.py"]
+argv = ["python", "-B", "Docs/authorization-validation/tools/e5_model_check.py", "--max-steps", "28", "--json"]
+acceptance = "model-json"
+model_contract = "full-contract"
+model_name = "single"
+timeout_seconds = 1800
+
+[[suite]]
+id = "e5-bounded-two-mutations"
+owner = "authorization-validation"
+profile = "offline-validation"
+test_services = []
+series = ["E5", "M1", "M2", "M3", "M5"]
+scope = "offline-model"
+boundary = "two-mutation bounded abstract protocol; CLI emits JSON without a --json option"
+sources = ["Docs/authorization-validation/tools/e5_model_check_two_mutations.py", "Docs/authorization-validation/tools/bounded_model_execution.py"]
+argv = ["python", "-B", "Docs/authorization-validation/tools/e5_model_check_two_mutations.py", "--workers", "12"]
+acceptance = "model-json"
+model_contract = "full-contract"
+model_name = "two"
+timeout_seconds = 3600
+
+[[suite]]
+id = "e5-universal-bounded"
+owner = "authorization-validation"
+profile = "offline-validation"
+test_services = []
+series = ["E5", "M1", "M2", "M3", "M5"]
+scope = "offline-model"
+boundary = "universal hypotheses over the explicitly bounded abstract models, not unbounded system proof"
+sources = ["Docs/authorization-validation/tools/universal_hypotheses_check.py", "Docs/authorization-validation/tools/bounded_model_execution.py"]
+argv = ["python", "-B", "Docs/authorization-validation/tools/universal_hypotheses_check.py", "--model", "both", "--workers", "12", "--json"]
+acceptance = "model-json"
+model_contract = "universal"
+timeout_seconds = 3600
+
+[[suite]]
+id = "offline-tenant-model"
+owner = "authorization-validation"
+profile = "offline-validation"
+test_services = []
+series = ["E5", "M3", "MT-E1"]
+scope = "offline-model"
+boundary = "abstract tenant isolation hypotheses; no MySQL or policy runtime"
+sources = ["Docs/authorization-validation/tools/tenant_isolation_model.py"]
+argv = ["python", "-B", "Docs/authorization-validation/tools/tenant_isolation_model.py", "--json"]
+acceptance = "model-json"
+model_contract = "tenant"
+timeout_seconds = 1800
+
+[[suite]]
+id = "native-projection-lifecycle"
+owner = "testsuite + astral-trustgraph"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M1", "M2", "M3", "E3", "E4", "RQ3"]
+scope = "integration"
+boundary = "production source commit/local dispatch/publication pipeline/evaluate with worker owner; sync publisher attribution is not exclusive; not signed HTTP host campaign"
+sources = ["tests-suite/tests/native_projection_lifecycle.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_lifecycle", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+
+[[suite]]
+id = "db-authorization-projection"
+owner = "astral-db"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M1", "M2", "M3", "E3", "RQ3"]
+scope = "integration"
+boundary = "durable projection/source/CAS/lineage tests; not complete deployed campaign"
+sources = ["astral-db/tests/authorization_projection_integration.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--test", "authorization_projection_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "db-integration"
+owner = "astral-db"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["CORE", "M1", "M3"]
+scope = "integration"
+boundary = "real MySQL repository contracts and legacy no-fallback guards"
+sources = ["astral-db/tests/integration.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--test", "integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "db-tenant-isolation"
+owner = "astral-db"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M3", "MT-E1"]
+scope = "integration"
+boundary = "three-tenant SQL binding and retired snapshot guards"
+sources = ["astral-db/tests/multi_tenant_isolation.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--test", "multi_tenant_isolation", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "db-org-scope"
+owner = "astral-db"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M2", "M3", "MT-E1"]
+scope = "integration"
+boundary = "organization topology/evidence contracts; production ORG_SCOPE default remains off"
+sources = ["astral-db/tests/org_scope_integration.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--test", "org_scope_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "db-partition-lease"
+owner = "astral-db"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M2", "E3", "E4"]
+scope = "integration"
+boundary = "durable partition ownership/CAS/reclaim contracts"
+sources = ["astral-db/tests/partition_lease_integration.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--test", "partition_lease_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "db-quarantine"
+owner = "astral-db"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M4", "E3", "E4"]
+scope = "integration"
+boundary = "real durable quarantine terminal and retry boundaries"
+sources = ["astral-db/tests/quarantine_integration.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--test", "quarantine_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "identity-integration"
+owner = "astral-identity"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["CORE", "M5"]
+scope = "integration"
+boundary = "real identity/session/card contracts; no legacy role bypass"
+sources = ["astral-identity/tests/integration.rs"]
+argv = ["cargo", "test", "-p", "astral-identity", "--test", "integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "trustgraph-integration"
+owner = "astral-trustgraph"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["CORE", "M1", "M2", "M3"]
+scope = "integration"
+boundary = "source repository and cascade fail-closed contracts with production origin region"
+sources = ["astral-trustgraph/tests/integration.rs"]
+argv = ["cargo", "test", "-p", "astral-trustgraph", "--test", "integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "trustgraph-org-projector"
+owner = "astral-trustgraph"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M2", "E3"]
+scope = "integration"
+boundary = "real dual-worker competition and organization projection contracts"
+sources = ["astral-trustgraph/tests/org_scope_projector_integration.rs"]
+argv = ["cargo", "test", "-p", "astral-trustgraph", "--test", "org_scope_projector_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "monitor-integration"
+owner = "astral-monitor"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["CORE"]
+scope = "integration"
+boundary = "monitor database contracts; no tenant-isolation claim"
+sources = ["astral-monitor/tests/integration.rs"]
+argv = ["cargo", "test", "-p", "astral-monitor", "--test", "integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "hub-invalidation-premise"
+owner = "testsuite"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M3", "E4"]
+scope = "integration"
+boundary = "commit-proven publication mirror and invalidation freshness gate; not whole source/worker lifecycle"
+sources = ["tests-suite/tests/security/premise_hub_invalidation.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "premise_hub_invalidation", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "single-writer-premise"
+owner = "testsuite"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M2", "E4"]
+scope = "integration"
+boundary = "same-session MySQL advisory lock, explicit close and bounded reacquisition"
+sources = ["tests-suite/tests/security/premise_single_writer_lease.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "premise_single_writer_lease", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "identity-mapping-premise"
+owner = "testsuite"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M5", "E4"]
+scope = "integration"
+boundary = "real mapping/app_id isolation and absent mapping refusal; exact-byte MySQL ENUM decoding with strict schema validation"
+sources = ["tests-suite/tests/security/premise_identity_mapping.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "premise_identity_mapping", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "dedicated-identity-mapping"
+owner = "astral-db"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M5", "E4"]
+scope = "integration"
+boundary = "dedicated sdk_identity_mapping_test_* migrated database; guard is not relaxed"
+database_scope = "identity-mapping"
+sources = ["astral-db/tests/integration_identity_mapping.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--test", "integration_identity_mapping", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "mt-isolation"
+owner = "testsuite"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["MT-E1", "M3", "RQ2"]
+scope = "integration"
+boundary = "tenant-scoped canonical publication/evidence isolation; not HTTP performance"
+sources = ["tests-suite/tests/mt_extreme_isolation.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "mt_extreme_isolation", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "mt-churn"
+owner = "testsuite"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["MT-E3", "M2", "RQ3", "RQ4"]
+scope = "integration"
+boundary = "successive CAS pointer add/revoke/restore generations; not three-node propagation"
+sources = ["tests-suite/tests/mt_extreme_churn.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "mt_extreme_churn", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "mt-cross-storm"
+owner = "testsuite"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["MT-E4", "M3", "RQ4"]
+scope = "integration"
+boundary = "cross-tenant invalidation/evidence fixture; not a distributed message storm"
+sources = ["tests-suite/tests/mt_extreme_cross_storm.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "mt_extreme_cross_storm", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "mt-capacity"
+owner = "testsuite"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["MT-E5", "RQ2"]
+scope = "integration"
+boundary = "bounded MySQL tenant/card capacity; not engine/HTTP throughput"
+sources = ["tests-suite/tests/mt_extreme_capacity.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "mt_extreme_capacity", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "mt-failclosed"
+owner = "testsuite"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["MT-E6", "M3", "M4", "E4"]
+scope = "integration"
+boundary = "typed NotReady/Pending, no arbitrary database-error-as-denial acceptance"
+sources = ["tests-suite/tests/mt_extreme_failclosed.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "mt_extreme_failclosed", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "rabbit-audit-replay"
+owner = "astral-trustgraph"
+profile = "standalone-rabbit"
+test_services = ["mysql", "rabbitmq"]
+series = ["M1", "M2", "E3", "E4"]
+scope = "integration"
+boundary = "real Rabbit confirm + MySQL mq_idempotent_log/audit_log/completed lease; no Redis"
+sources = ["astral-trustgraph/tests/audit_replay_integration.rs"]
+argv = ["cargo", "test", "-p", "astral-trustgraph", "--test", "audit_replay_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "redis-evidence-compat"
+owner = "astral-db"
+profile = "redis-compat"
+test_services = ["mysql", "redis"]
+series = ["COMPAT", "E4"]
+scope = "integration"
+boundary = "explicit adapter window only; cannot establish native evidence path acceptance"
+sources = ["astral-db/tests/evidence_cache_redis_integration.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--features", "redis-compat", "--test", "evidence_cache_redis_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "strict-policy-benchmark"
+owner = "policy-engine"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ1", "RQ5"]
+scope = "component"
+boundary = "strict fixture decision and condition CPU timing, preasserted ALLOW/DENY/PENDING; no MySQL/HTTP"
+sources = ["policy-engine/benches/policy_bench.rs", "policy-engine/tests/support/published.rs"]
+argv = ["cargo", "bench", "-p", "policy-engine", "--bench", "policy_bench", "--locked", "--", "--color", "never"]
+acceptance = "criterion"
+benchmark_cases = [
+  "engine/published_ready_allow", "engine/published_ready_empty_deny",
+  "engine/published_unavailable_pending", "engine/published_ready_nonmatching_set",
+  "engine/published_tenant_gradient_32", "condition/component_time_range",
+  "condition/component_ipv4_range", "condition/component_scope",
+]
+timeout_seconds = 1800
+
+[[suite]]
+id = "strict-tenant-benchmark"
+owner = "policy-engine"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ2", "RQ5", "MT-E1"]
+scope = "component"
+boundary = "strict scope-aware positive identities and checked join/decisions; CPU-only"
+sources = ["policy-engine/benches/tenant_isolation_bench.rs", "policy-engine/tests/support/published.rs"]
+argv = ["cargo", "bench", "-p", "policy-engine", "--bench", "tenant_isolation_bench", "--locked", "--", "--color", "never"]
+acceptance = "criterion"
+benchmark_cases = [
+  "tenant_isolation/published_single_tenant_10_rules",
+  "tenant_isolation/published_concurrent_10_tenants", "tenant_isolation/published_concurrent_50_tenants",
+  "tenant_isolation/published_concurrent_100_tenants", "tenant_isolation/data_scope_resolve",
+  "tenant_isolation/data_scope_resolve_personal", "tenant_isolation/published_cross_tenant_100x50",
+  "tenant_isolation/published_empty_deny", "tenant_isolation/published_unavailable_pending",
+]
+timeout_seconds = 1800
+
+[[suite]]
+id = "compiler-benchmark"
+owner = "policy-engine"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ2", "RQ3"]
+scope = "component"
+boundary = "production compiler incremental/full parity, exact/wildcard/multi-delta CPU benchmark"
+sources = ["policy-engine/benches/authorization_compiler_bench.rs"]
+argv = ["cargo", "bench", "-p", "policy-engine", "--bench", "authorization_compiler_bench", "--locked", "--", "--color", "never"]
+acceptance = "criterion"
+benchmark_cases = [
+  "compiler/incremental_exact_add/n=100", "compiler/full_exact_add/n=100",
+  "compiler/incremental_exact_remove/n=100", "compiler/full_exact_remove/n=100",
+  "compiler/incremental_windowed_add/n=100", "compiler/full_windowed_add/n=100",
+  "compiler/incremental_wildcard_add/n=100", "compiler/full_wildcard_add/n=100",
+  "compiler/batch50_incremental/n=100", "compiler/batch50_full/n=100",
+  "compiler/incremental_exact_add/n=1000", "compiler/full_exact_add/n=1000",
+  "compiler/incremental_exact_remove/n=1000", "compiler/full_exact_remove/n=1000",
+  "compiler/incremental_windowed_add/n=1000", "compiler/full_windowed_add/n=1000",
+  "compiler/incremental_wildcard_add/n=1000", "compiler/full_wildcard_add/n=1000",
+  "compiler/batch50_incremental/n=1000", "compiler/batch50_full/n=1000",
+  "compiler/incremental_exact_add/n=4050", "compiler/full_exact_add/n=4050",
+  "compiler/incremental_exact_remove/n=4050", "compiler/full_exact_remove/n=4050",
+  "compiler/incremental_windowed_add/n=4050", "compiler/full_windowed_add/n=4050",
+  "compiler/incremental_wildcard_add/n=4050", "compiler/full_wildcard_add/n=4050",
+  "compiler/batch50_incremental/n=4050", "compiler/batch50_full/n=4050",
+]
+timeout_seconds = 1800
+
+[[suite]]
+id = "compiler-allocation-contracts"
+owner = "policy-engine"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ2", "RQ3"]
+scope = "component"
+boundary = "compiler allocation contract assertions, not service capacity"
+sources = ["policy-engine/tests/authorization_compiler_alloc.rs"]
+argv = ["cargo", "test", "-p", "policy-engine", "--test", "authorization_compiler_alloc", "--locked"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "compiler-allocation-benchmark"
+owner = "policy-engine"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ2", "RQ3"]
+scope = "component"
+boundary = "production compiler allocation microbenchmark; no external services"
+sources = ["policy-engine/benches/authorization_compiler_alloc.rs"]
+argv = ["cargo", "bench", "-p", "policy-engine", "--bench", "authorization_compiler_alloc", "--locked"]
+acceptance = "divan"
+benchmark_cases = ["shared_entry_count_proof", "shared_build", "private_build", "shared_clone", "shared_add_grant", "private_add_grant"]
+allocation_cases = ["shared_build", "private_build", "shared_add_grant", "private_add_grant"]
+timeout_seconds = 1800
+
+[[suite]]
+id = "memory-hub-performance"
+performance_cases = 82
+owner = "astral-db"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ5"]
+scope = "component"
+boundary = "CPU evidence read matrix: cold/hot/token/clock/concurrency/pressure; not SQL/HTTP latency"
+sources = ["astral-db/src/memory_projection_hub/tests/performance.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--lib", "memory_evidence_no_regression_matrix", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 1800
+
+[[suite]]
+id = "stage-plan-performance"
+performance_cases = 15
+owner = "astral-trustgraph"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ3"]
+scope = "component"
+boundary = "CPU complete stage-plan matrix; no durable projector throughput claim"
+sources = ["astral-trustgraph/src/service/authorization_projector/performance.rs"]
+argv = ["cargo", "test", "-p", "astral-trustgraph", "--lib", "complete_stage_plan_no_regression_matrix", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 1800
+
+[[suite]]
+id = "parent-lookup-performance"
+performance_cases = 40
+owner = "astral-trustgraph"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ3"]
+scope = "component"
+boundary = "CPU stable-parent-ordinal lookup matrix; no SQL/worker throughput claim"
+sources = ["astral-trustgraph/src/service/authorization_projector/planning/parent_ordinals/performance.rs"]
+argv = ["cargo", "test", "-p", "astral-trustgraph", "--lib", "parent_lookup_no_regression_matrix", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 1800
+
+[[suite]]
+id = "rq-current-distributed-campaign"
+owner = "distributed harness"
+profile = "distributed"
+test_services = ["mysql", "rabbitmq"]
+series = ["RQ1", "RQ2", "RQ3", "RQ4", "RQ5", "PERF"]
+scope = "live-campaign"
+boundary = "complete current distributed research campaign is not replaced by local component checks; RQ2-D is N/A"
+sources = ["Docs/实验/分布式测试/rust-s15"]
+historical_services = ["mysql", "redis", "rabbitmq", "opa"]
+blocked_reason = "legacy RQ/S15 harness assumes Redis/OPA and protected three-node state; needs current Rabbit-only deployment adapter and approved hashes/routing/postconditions; no legacy argv dispatched"
+
+[[suite]]
+id = "native-http-campaign"
+owner = "astral-single-node + bench/loadgen"
+profile = "performance-native"
+test_services = ["mysql"]
+series = ["PERF", "RQ1", "RQ4", "RQ5", "E1", "M5"]
+scope = "live-campaign"
+boundary = "signed composite HTTP and convergence performance; no extra middleware"
+sources = ["bench/loadgen/scripts/bench_matrix.sh", "astral-single-node/src"]
+blocked_reason = "approved run-owned deployment/source bootstrap/signed identity/readiness and durable publication evidence are required; runner does not start services or invent credentials"
+
+[[suite]]
+id = "native-live-fault-campaign"
+owner = "authorization-validation"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["E1", "E3", "E4", "M4", "M5"]
+scope = "live-campaign"
+boundary = "current profile fault execution with restore/reconciliation and host admission; offline plan is insufficient"
+sources = ["Docs/authorization-validation/tools/e4_fault_driver.py"]
+blocked_reason = "no approved native live fault controller/deployed observation stream; live injection remains disabled and UNKNOWN is never replayed"
+
+[[suite]]
+id = "mt-e2-unimplemented"
+owner = "testsuite"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["MT-E2"]
+scope = "integration"
+boundary = "missing series number is not silently counted as a successful test"
+sources = ["tests-suite/MANIFEST.toml"]
+blocked_reason = "no MT-E2 implementation or approved scenario contract exists"
+
+[[suite]]
+id = "tlc-admission-model"
+owner = "authorization-validation"
+profile = "offline-validation"
+test_services = []
+series = ["E5", "M4"]
+scope = "offline-model"
+boundary = "independent TLA+ draft input; no verified TLC result"
+sources = ["Docs/authorization-validation/formal"]
+blocked_reason = "no pinned checksum-verified TLC executable; runner never downloads tools"
+
+[[suite]]
+id = "iai-instruction-benchmark"
+owner = "policy-engine"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ2", "RQ3"]
+scope = "component"
+boundary = "Linux/Valgrind iai-callgrind instruction and allocation tooling, separate from Criterion"
+sources = ["policy-engine/benches/authorization_compiler_iai.rs"]
+blocked_reason = "requires explicit Linux/Valgrind tooling and iai feature; not dispatched on the default portable profile"
+
+[[suite]]
+id = "historical-engine-comparison"
+owner = "bench/engine-comparison"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ1", "COMPAT", "EXCLUDED"]
+scope = "component"
+boundary = "historical Casbin/Cedar/OPA comparative harness; OPA is a comparator, not a native production dependency"
+sources = ["bench/engine-comparison"]
+blocked_reason = "comparison harness requires separate comparator/profile validation and image provenance; not part of production-equivalent native gate"
+
+[[suite]]
+id = "excluded-service-checks"
+owner = "astral-chat + astral-learn"
+profile = "native-kernel"
+test_services = []
+series = ["CORE", "EXCLUDED", "COMPAT"]
+scope = "component"
+boundary = "frozen excluded services; isolated temporary workspace script is not current native integration"
+sources = ["scripts/verify-excluded-services.ps1"]
+blocked_reason = "frozen sources require dedicated isolated verification and recorded ignored tests; root workspace gate does not cover them"
+
+[[suite]]
+id = "excluded-sdk-integrations"
+owner = "integrations"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M5", "EXCLUDED"]
+scope = "integration"
+boundary = "SDK service integration workspace is excluded from root workspace"
+sources = ["integrations/README.md", "integrations/Cargo.toml"]
+blocked_reason = "dedicated SDK service/test identities and integration deployment contract must be verified separately"
+
+[[suite]]
+id = "archived-cache-contracts"
+owner = "astral-cache"
+profile = "redis-compat"
+test_services = ["mysql", "redis"]
+series = ["COMPAT", "EXCLUDED"]
+scope = "component"
+boundary = "archived Redis cache source; not a current native dependency"
+sources = ["astral-cache/Cargo.toml"]
+blocked_reason = "archive-specific standalone verification only; no implicit reintroduction into native profile"

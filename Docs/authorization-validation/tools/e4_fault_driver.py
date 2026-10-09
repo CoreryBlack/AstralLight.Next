@@ -49,8 +49,8 @@ A mapping with run-scoped, structurally validated fields:
 - ``approval_token``: run-scoped approval token; safe identifier that must
   contain the ``run_id``. Token values are passed to the controller (which
   MUST verify them itself) but are NEVER copied into any result record.
-- ``allowlist``: non-empty collection over the frozen six fault ids; every
-  executed fault must be listed.
+- ``allowlist``: non-empty collection over the selected profile's registered
+  fault ids; every executed fault must be listed.
 - ``approved_by``: non-empty bounded approver/approval record string.
 
 Driver-side validation is structural and therefore necessary but NOT
@@ -140,7 +140,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import (
     Any,
@@ -156,15 +156,20 @@ from typing import (
 
 import e3_e4
 import experiment_common
+import dependency_profiles as profiles
 from experiment_common import EvidenceError, SAFE_ID, stable_id
 
 __all__ = [
     "CASE_SPECS",
+    "DEPENDENCY_PROFILES",
+    "DEFAULT_PROFILE",
+    "FAULT_CASES",
+    "FAULT_CASES_BY_PROFILE",
+    "FAULT_CASES_LEGACY_COMPAT",
     "ControllerDisconnect",
     "ControllerTimeout",
     "EXEC_LEVEL_LIVE",
     "EXEC_LEVEL_OFFLINE",
-    "FAULT_CASES",
     "FaultController",
     "LIVE_FAULT_MATRIX_INTEGRATION",
     "LIVE_INTEGRATION_REASON",
@@ -180,15 +185,15 @@ __all__ = [
 # Constants and statuses.
 # ---------------------------------------------------------------------------
 
-#: Frozen E4 fault matrix (VALIDATION_PROTOCOL.md section E4). Exactly these
-#: six cases exist; unvalidated fault entries are refused.
-FAULT_CASES: Tuple[str, ...] = (
-    "redis_unavailable",
-    "stale_hmac",
-    "pointer_movement",
-    "worker_restart",
-    "lease_expiry",
-    "unknown_ack",
+DEFAULT_PROFILE = profiles.DEFAULT_PROFILE
+DEPENDENCY_PROFILES: Tuple[str, ...] = profiles.PROFILE_IDS
+FAULT_CASES_BY_PROFILE: Dict[str, Tuple[str, ...]] = profiles.E4_FAULTS_BY_PROFILE
+FAULT_CASES_LEGACY_COMPAT: Tuple[str, ...] = profiles.LEGACY_REDIS_COMPAT_FAULTS
+# Canonical default vocabulary is native single-node. The former Redis-bound
+# vocabulary remains separately named so fake-controller coverage is explicit.
+FAULT_CASES: Tuple[str, ...] = FAULT_CASES_BY_PROFILE[DEFAULT_PROFILE]
+_ALL_REGISTERED_FAULTS = frozenset(
+    fault_id for profile_faults in FAULT_CASES_BY_PROFILE.values() for fault_id in profile_faults
 )
 
 #: Hard attempt bound. The driver has no retry loop at all.
@@ -268,9 +273,12 @@ class CaseSpec:
     #: Evidence keys required for a PASS: subsets of
     #: {"generation", "audit", "durable_reconcile_proof"}.
     requires_evidence: frozenset = frozenset()
+    applicable_profiles: Tuple[str, ...] = ()
+    dependency_classes: Tuple[str, ...] = ()
+    compatibility_only: bool = False
     protocol_ref: str = "VALIDATION_PROTOCOL.md E4; AGENTS.md section 3"
     isolation_requirement: str = (
-        "run-scoped isolated deployment; run-scoped Redis; test data only; "
+        "run-scoped isolated deployment; test data only; "
         "allowlisted fault inside an approved Exec-L3 window"
     )
 
@@ -286,7 +294,14 @@ CASE_SPECS: Dict[str, CaseSpec] = {
             "final decision is PENDING or DENY with a preserved reason code; "
             "no stale-cache hit and no source-read fallback may ALLOW"
         ),
+        applicable_profiles=("redis-compat",),
+        dependency_classes=("redis",),
+        compatibility_only=True,
         protocol_ref="VALIDATION_PROTOCOL.md E4; AGENTS.md 3.2 fail-closed read gate",
+        isolation_requirement=(
+            "run-scoped isolated deployment; run-scoped Redis; test data only; "
+            "allowlisted fault inside an approved Exec-L3 window"
+        ),
     ),
     "stale_hmac": CaseSpec(
         fault_id="stale_hmac",
@@ -300,6 +315,9 @@ CASE_SPECS: Dict[str, CaseSpec] = {
             "reason code preserved; no fallback to raw identity headers"
         ),
         requires_evidence=frozenset({"audit"}),
+        applicable_profiles=("redis-compat",),
+        dependency_classes=("gateway_integrity",),
+        compatibility_only=True,
         protocol_ref="VALIDATION_PROTOCOL.md E4; AGENTS.md 3.1/3.5 (audit chain)",
     ),
     "pointer_movement": CaseSpec(
@@ -313,6 +331,9 @@ CASE_SPECS: Dict[str, CaseSpec] = {
             "with the observed generation/epoch recorded"
         ),
         requires_evidence=frozenset({"generation"}),
+        applicable_profiles=("redis-compat",),
+        dependency_classes=("cache", "redis"),
+        compatibility_only=True,
         protocol_ref="VALIDATION_PROTOCOL.md E4; AGENTS.md 3.2 generation fence",
     ),
     "worker_restart": CaseSpec(
@@ -354,11 +375,138 @@ CASE_SPECS: Dict[str, CaseSpec] = {
         requires_evidence=frozenset({"durable_reconcile_proof"}),
         protocol_ref="VALIDATION_PROTOCOL.md E4; AGENTS.md 0C/3.4 (durable proof)",
     ),
+    "rabbit_transport_unavailable": CaseSpec(
+        fault_id="rabbit_transport_unavailable",
+        summary="RabbitMQ transport is unavailable during publication.",
+        fail_closed_expectation=(
+            "transport uncertainty yields PENDING/DENY until durable reconciliation; "
+            "an ACK without proof cannot ALLOW"
+        ),
+        requires_evidence=frozenset({"durable_reconcile_proof"}),
+        applicable_profiles=("standalone-rabbit", "distributed"),
+        dependency_classes=("rabbitmq",),
+        protocol_ref="VALIDATION_PROTOCOL.md E4; Rabbit transport profile",
+        isolation_requirement=(
+            "run-scoped isolated Rabbit deployment; test data only; "
+            "live injection requires a future approved controller"
+        ),
+    ),
 }
 
-# ---------------------------------------------------------------------------
-# Controller protocol and failure classes.
-# ---------------------------------------------------------------------------
+# Native single-node cases are declarations only. No native live controller is
+# implemented here; plans are offline and native execution remains BLOCKED.
+_CASE_METADATA = {
+    "memory_channel_suspect": (
+        "Memory projection channel becomes suspect; freshness evidence must defer.",
+        "memory channel uncertainty yields PENDING/DENY; no prior generation may ALLOW",
+        ("memory_projection_hub",),
+        frozenset({"generation"}),
+    ),
+    "memory_invalidation_omission": (
+        "Memory projection invalidation notification is omitted.",
+        "missing invalidation yields PENDING/DENY until durable freshness is proven",
+        ("memory_projection_hub",),
+        frozenset({"generation"}),
+    ),
+    "local_bus_owner_loss": (
+        "LocalBus or LocalProjectionBus owner is lost.",
+        "owner loss yields PENDING/DENY; stale local state cannot ALLOW",
+        ("local_bus", "local_projection_bus"),
+        frozenset(),
+    ),
+    "local_bus_overflow": (
+        "LocalBus/LocalProjectionBus bounded channel overflows.",
+        "overflow yields PENDING/DENY; dropped completion cannot ALLOW",
+        ("local_bus", "local_projection_bus"),
+        frozenset(),
+    ),
+    "local_bus_unknown_completion": (
+        "LocalBus/LocalProjectionBus completion is unknown.",
+        "unknown completion stays UNKNOWN or fails closed; no automatic replay",
+        ("local_bus", "local_projection_bus"),
+        frozenset({"durable_reconcile_proof"}),
+    ),
+    "source_commit_unknown": (
+        "Authoritative MySQL source commit outcome is unknown.",
+        "unknown commit yields PENDING/DENY until durable reconciliation proves state",
+        ("authoritative_database",),
+        frozenset({"durable_reconcile_proof"}),
+    ),
+    "worker_death_sticky": (
+        "Publication worker dies and remains stopped; no automatic restart is assumed.",
+        "worker death yields PENDING/DENY until readiness and ownership are proven",
+        ("publication_worker",),
+        frozenset(),
+    ),
+    "writer_lease_loss": (
+        "Single-node writer lease is lost.",
+        "lease loss stops stale writers and yields PENDING/DENY",
+        ("single_writer_lease",),
+        frozenset({"generation"}),
+    ),
+    "current_pointer_movement": (
+        "Current authorization pointer moves during a decision.",
+        "stale pointer evidence yields PENDING/DENY with generation recorded",
+        ("cache", "authoritative_database"),
+        frozenset({"generation"}),
+    ),
+    "hmac_failure": (
+        "Gateway identity-header HMAC validation fails.",
+        "invalid gateway integrity yields DENY/PENDING; no raw-header fallback",
+        ("gateway_integrity",),
+        frozenset({"audit"}),
+    ),
+    "mysql_unavailable": (
+        "Authoritative MySQL is unavailable during a decision.",
+        "database uncertainty yields PENDING/DENY; no source fallback may ALLOW",
+        ("authoritative_database",),
+        frozenset(),
+    ),
+}
+for _fault_id, (_summary, _expectation, _dependencies, _evidence) in _CASE_METADATA.items():
+    CASE_SPECS[_fault_id] = CaseSpec(
+        fault_id=_fault_id,
+        summary=_summary,
+        fail_closed_expectation=_expectation,
+        requires_evidence=_evidence,
+        applicable_profiles=("native-single-node",),
+        dependency_classes=_dependencies,
+        protocol_ref="VALIDATION_PROTOCOL.md E4; native single-node profile",
+        isolation_requirement=(
+            "run-scoped isolated native single-node deployment; test data only; "
+            "live injection requires a future approved controller"
+        ),
+    )
+for _fault_id in FAULT_CASES_LEGACY_COMPAT:
+    _spec = CASE_SPECS[_fault_id]
+    CASE_SPECS[_fault_id] = replace(
+        _spec,
+        applicable_profiles=("redis-compat",),
+        dependency_classes=profiles.FAULT_DEPENDENCIES_BY_PROFILE["redis-compat"][_fault_id],
+        compatibility_only=True,
+    )
+for _fault_id, _spec in list(CASE_SPECS.items()):
+    _applicable_profiles = tuple(
+        profile
+        for profile in DEPENDENCY_PROFILES
+        if _fault_id in FAULT_CASES_BY_PROFILE[profile]
+    )
+    if _applicable_profiles:
+        _dependencies = tuple(
+            sorted(
+                {
+                    dependency
+                    for profile in _applicable_profiles
+                    for dependency in profiles.FAULT_DEPENDENCIES_BY_PROFILE[profile][_fault_id]
+                }
+            )
+        )
+        CASE_SPECS[_fault_id] = replace(
+            _spec,
+            applicable_profiles=_applicable_profiles,
+            dependency_classes=_dependencies,
+            compatibility_only=_fault_id in FAULT_CASES_LEGACY_COMPAT,
+        )
 
 
 class ControllerTimeout(RuntimeError):
@@ -396,7 +544,12 @@ class FaultController(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def validate_authorization(authorization: Any, fault_id: Optional[str] = None) -> List[str]:
+def validate_authorization(
+    authorization: Any,
+    fault_id: Optional[str] = None,
+    *,
+    profile: str = DEFAULT_PROFILE,
+) -> List[str]:
     """Structurally validate the run-scoped authorization mapping.
 
     Returns a list of problems (empty = valid). Never mutates the input and
@@ -404,6 +557,11 @@ def validate_authorization(authorization: Any, fault_id: Optional[str] = None) -
     NOT sufficient: the controller must verify the tokens itself and report
     ``authorization_ok`` in its preflight result.
     """
+    try:
+        canonical_profile = profiles.normalize_profile(profile)
+    except ValueError as error:
+        return [str(error)]
+    allowed_faults = FAULT_CASES_BY_PROFILE[canonical_profile]
     if not isinstance(authorization, Mapping):
         return ["authorization_not_a_mapping"]
     problems: List[str] = []
@@ -435,10 +593,10 @@ def validate_authorization(authorization: Any, fault_id: Optional[str] = None) -
         problems.append("invalid:allowlist")
     else:
         for entry in allowlist:
-            if not isinstance(entry, str) or entry not in FAULT_CASES:
+            if not isinstance(entry, str) or entry not in allowed_faults:
                 problems.append("invalid:allowlist_entry")
     if fault_id is not None:
-        if not isinstance(fault_id, str) or fault_id not in FAULT_CASES:
+        if not isinstance(fault_id, str) or fault_id not in allowed_faults:
             problems.append("invalid:fault_id")
         elif not isinstance(allowlist, (list, tuple, frozenset, set)) or fault_id not in allowlist:
             problems.append("fault_not_in_allowlist")
@@ -696,6 +854,7 @@ def run_fault_case(
     *,
     allow_live_execution: bool = False,
     clock: Optional[Any] = None,
+    profile: str = DEFAULT_PROFILE,
 ) -> Dict[str, Any]:
     """Run the E4 protocol for exactly one fault case, once (never retried).
 
@@ -742,6 +901,14 @@ def run_fault_case(
             result["note"] = extra_note
         return result
 
+    try:
+        canonical_profile = profiles.normalize_profile(profile)
+    except ValueError as error:
+        stages["profile"] = {"status": "BLOCKED", "detail": str(error)}
+        return finish("unknown profile rejected before controller contact")
+    result["profile"] = canonical_profile
+    applicable_faults = FAULT_CASES_BY_PROFILE[canonical_profile]
+
     if allow_live_execution is not True:
         stages["live_gate"] = {"status": "BLOCKED", "detail": "allow_live_execution_false"}
         return finish(
@@ -753,9 +920,15 @@ def run_fault_case(
     if spec is None:
         stages["validation"] = {"status": "BLOCKED", "detail": "unknown_fault_id"}
         return finish(
-            "fault id is not part of the frozen E4 matrix; unvalidated fault "
+            "fault id is not part of the registered E4 matrices; unvalidated fault "
             "entries are refused"
         )
+    if fault_id not in applicable_faults:
+        stages["validation"] = {
+            "status": "BLOCKED",
+            "detail": "fault_not_applicable_to_profile",
+        }
+        return finish("fault is not registered for the selected profile")
     result["fault_id"] = spec.fault_id
     result["fail_closed_expectation"] = spec.fail_closed_expectation
 
@@ -763,7 +936,7 @@ def run_fault_case(
         stages["controller"] = {"status": "BLOCKED", "detail": "no_controller_injected"}
         return finish("no FaultController injected; live integration is BLOCKED")
 
-    problems = validate_authorization(authorization, spec.fault_id)
+    problems = validate_authorization(authorization, spec.fault_id, profile=canonical_profile)
     stages["authorization"] = {
         "status": "PASS" if not problems else "BLOCKED",
         "detail": None if not problems else ";".join(problems[:8]),
@@ -771,6 +944,15 @@ def run_fault_case(
     }
     if problems:
         return finish("authorization rejected before any controller contact")
+    if canonical_profile != "redis-compat":
+        stages["profile_execution"] = {
+            "status": "BLOCKED",
+            "detail": "native_fault_controller_not_implemented",
+        }
+        return finish(
+            "native/Rabbit fault execution is BLOCKED until a profile-specific "
+            "controller is approved; the legacy controller is compat-only"
+        )
     run_id = authorization["run_id"]
     result["run_id"] = run_id
     result["campaign_id"] = authorization.get("campaign_id") if isinstance(authorization.get("campaign_id"), str) else None
@@ -940,6 +1122,7 @@ def run_fault_matrix(
     fault_ids: Optional[Sequence[str]] = None,
     allow_live_execution: bool = False,
     clock: Optional[Any] = None,
+    profile: str = DEFAULT_PROFILE,
 ) -> Dict[str, Any]:
     """Run the E4 fault matrix (or a subset), one attempt per fault.
 
@@ -949,12 +1132,27 @@ def run_fault_matrix(
     :func:`run_fault_case`. The result never contains authorization token
     values and never claims a live campaign run by itself.
     """
-    requested = list(FAULT_CASES) if fault_ids is None else list(fault_ids)
+    try:
+        canonical_profile = profiles.normalize_profile(profile)
+    except ValueError as error:
+        return {
+            "kind": "e4_fault_matrix_run",
+            "schemaVersion": 1,
+            "profile": profile,
+            "overall": "BLOCKED",
+            "note": "unknown profile rejected before controller contact",
+            "profile_error": str(error),
+            "faults": [],
+            "integration_claim": LIVE_FAULT_MATRIX_INTEGRATION,
+        }
+    profile_faults = FAULT_CASES_BY_PROFILE[canonical_profile]
+    requested = list(profile_faults) if fault_ids is None else list(fault_ids)
     matrix: Dict[str, Any] = {
         "kind": "e4_fault_matrix_run",
         "schemaVersion": 1,
+        "profile": canonical_profile,
         "max_attempts": MAX_ATTEMPTS,
-        "fault_matrix_items": list(FAULT_CASES),
+        "fault_matrix_items": list(profile_faults),
         "requested_faults": requested,
         "faults": [],
         "limitations": [],
@@ -963,7 +1161,7 @@ def run_fault_matrix(
     matrix["execution_class"] = execution_class
     matrix["live_gate"] = {
         "allow_live_execution": bool(allow_live_execution),
-        "authorization_valid": not validate_authorization(authorization),
+        "authorization_valid": not validate_authorization(authorization, profile=canonical_profile),
         "controller_injected": controller is not None,
     }
 
@@ -975,12 +1173,20 @@ def run_fault_matrix(
         )
         matrix["integration_claim"] = LIVE_FAULT_MATRIX_INTEGRATION
         return matrix
+    if canonical_profile != "redis-compat":
+        matrix["overall"] = "BLOCKED"
+        matrix["note"] = (
+            "native/Rabbit fault execution has no safe controller implementation; "
+            "offline plans are declarative and live execution remains BLOCKED"
+        )
+        matrix["integration_claim"] = LIVE_FAULT_MATRIX_INTEGRATION
+        return matrix
     if controller is None:
         matrix["overall"] = "BLOCKED"
         matrix["note"] = "no FaultController injected; live fault matrix integration is BLOCKED"
         matrix["integration_claim"] = LIVE_FAULT_MATRIX_INTEGRATION
         return matrix
-    problems = validate_authorization(authorization)
+    problems = validate_authorization(authorization, profile=canonical_profile)
     if problems:
         matrix["overall"] = "BLOCKED"
         matrix["note"] = "authorization rejected before any controller contact"
@@ -1002,14 +1208,15 @@ def run_fault_matrix(
             fault_id,
             allow_live_execution=True,
             clock=clock,
+            profile=canonical_profile,
         )
         for fault_id in requested
     ]
     matrix["faults"] = faults
     matrix["overall"] = _worst_status([fault["overall"] for fault in faults]) if faults else "BLOCKED"
     passed = {fault["fault_id"] for fault in faults if fault.get("overall") == "PASS"}
-    matrix["matrix_complete"] = set(FAULT_CASES).issubset(passed)
-    matrix["missing_faults"] = [item for item in FAULT_CASES if item not in set(requested)]
+    matrix["matrix_complete"] = set(profile_faults).issubset(passed)
+    matrix["missing_faults"] = [item for item in profile_faults if item not in set(requested)]
     matrix["integration_claim"] = LIVE_FAULT_MATRIX_INTEGRATION
     matrix["note"] = (
         "one attempt per fault (MAX_ATTEMPTS=1); UNKNOWN results require "
@@ -1047,27 +1254,51 @@ def run_fault_matrix(
 # ---------------------------------------------------------------------------
 
 
-def build_fault_plan(run_id: Optional[str] = None, campaign_id: Optional[str] = None) -> Dict[str, Any]:
+def build_fault_plan(
+    run_id: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    *,
+    profile: str = DEFAULT_PROFILE,
+) -> Dict[str, Any]:
     """Build the offline E4 fault plan. Pure function; performs no I/O."""
+    try:
+        canonical_profile = profiles.normalize_profile(profile)
+    except ValueError as error:
+        return {
+            "kind": "e4_fault_plan",
+            "schemaVersion": 1,
+            "profile": profile,
+            "status": "BLOCKED",
+            "profile_error": str(error),
+            "cases": [],
+            "offline_guarantee": "unknown profile rejected without I/O",
+        }
+    profile_faults = FAULT_CASES_BY_PROFILE[canonical_profile]
     return {
         "kind": "e4_fault_plan",
         "schemaVersion": 1,
+        "profile": canonical_profile,
         "run_id": run_id,
         "campaign_id": campaign_id,
         "execution_class_planned": EXEC_LEVEL_OFFLINE + "-offline-plan (live injection is Exec-L3)",
         "max_attempts": MAX_ATTEMPTS,
-        "fault_matrix_items": list(FAULT_CASES),
+        "fault_matrix_items": list(profile_faults),
         "cases": [
             {
-                "fault_id": spec.fault_id,
-                "summary": spec.summary,
-                "fail_closed_expectation": spec.fail_closed_expectation,
-                "requires_evidence": sorted(spec.requires_evidence),
-                "protocol_ref": spec.protocol_ref,
-                "isolation_requirement": spec.isolation_requirement,
+                "fault_id": fault_id,
+                "summary": CASE_SPECS[fault_id].summary,
+                "fail_closed_expectation": CASE_SPECS[fault_id].fail_closed_expectation,
+                "requires_evidence": sorted(CASE_SPECS[fault_id].requires_evidence),
+                "applicable_profiles": list(CASE_SPECS[fault_id].applicable_profiles),
+                "dependency_classes": list(
+                    profiles.FAULT_DEPENDENCIES_BY_PROFILE[canonical_profile][fault_id]
+                ),
+                "compatibility_only": CASE_SPECS[fault_id].compatibility_only,
+                "protocol_ref": CASE_SPECS[fault_id].protocol_ref,
+                "isolation_requirement": CASE_SPECS[fault_id].isolation_requirement,
                 "status": "PLANNED",
             }
-            for spec in (CASE_SPECS[item] for item in FAULT_CASES)
+            for fault_id in profile_faults
         ],
         "controller_contract": {
             "protocol": "FaultController (runtime_checkable; injected only)",
@@ -1094,7 +1325,7 @@ def build_fault_plan(run_id: Optional[str] = None, campaign_id: Optional[str] = 
                 "exec_level=Exec-L3",
                 "isolate_token (run-scoped)",
                 "approval_token (run-scoped, distinct)",
-                "allowlist (subset of the six fault ids)",
+                "allowlist (subset of the profile's registered fault ids)",
                 "approved_by",
             ],
             "validation": "structural only; controller-side verification required",
@@ -1128,12 +1359,12 @@ def _run_self_test() -> int:
     return 0 if result.wasSuccessful() else 1
 
 
-def _print_plan() -> None:
-    print("E4 fault matrix plan (offline; Exec-L1):")
+def _print_plan(profile: str = DEFAULT_PROFILE) -> None:
+    print("E4 fault matrix plan (offline; Exec-L1; profile=" + profile + "):")
     print(LIVE_INTEGRATION_REASON)
     print("Live fault matrix integration: " + LIVE_FAULT_MATRIX_INTEGRATION)
     print("Every case below is PLANNED; no fault has been or can be applied from this CLI.")
-    print(json.dumps(build_fault_plan(), indent=2, ensure_ascii=False, sort_keys=True))
+    print(json.dumps(build_fault_plan(profile=profile), indent=2, ensure_ascii=False, sort_keys=True))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1145,6 +1376,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "capability; only --plan and --self-test are supported. Live fault "
             "injection is Exec-L3 and requires an injected FaultController."
         ),
+    )
+    parser.add_argument(
+        "--profile",
+        default=DEFAULT_PROFILE,
+        choices=DEPENDENCY_PROFILES,
+        help="deployment profile for the offline plan; default is native-single-node",
     )
     parser.add_argument(
         "--plan",
@@ -1159,7 +1396,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.self_test:
         return _run_self_test()
-    _print_plan()
+    _print_plan(args.profile)
     return 0
 
 

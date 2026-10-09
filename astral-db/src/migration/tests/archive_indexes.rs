@@ -22,7 +22,9 @@ fn rows(contract: &[(&str, &str, &[&str], bool)]) -> Vec<(String, bool, u64, Str
 #[test]
 fn archive_index_removal_reentry_does_not_bypass_dirty_history() {
     assert!(REMOVAL_SQL.contains("success=0"));
-    assert!(REMOVAL_SQL.contains("normal\n-- job refuses rerun"));
+    assert!(REMOVAL_SQL
+        .replace("\r\n", "\n")
+        .contains("normal\n-- job refuses rerun"));
     assert!(REMOVAL_SQL.contains("does not authorize clearing that row"));
     let production = include_str!("../../migration.rs")
         .split("#[cfg(test)]")

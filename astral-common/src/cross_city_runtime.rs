@@ -499,7 +499,14 @@ mod tests {
     use crate::cross_city_signature::cross_city_signature_message;
 
     /// The module source itself, pinned at compile time for source-shape tests.
-    const MODULE_SOURCE: &str = include_str!("cross_city_runtime.rs");
+    static MODULE_SOURCE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        include_str!("cross_city_runtime.rs")
+            .replace("\r\n", "\n")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source precedes the test module")
+            .to_owned()
+    });
 
     // -----------------------------------------------------------------------
     // Fixed test-only fixtures (never production key material)

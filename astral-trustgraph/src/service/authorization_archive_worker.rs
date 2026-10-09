@@ -1692,16 +1692,18 @@ mod tests {
 
     /// Reusable extraction of the FULL production source (everything before
     /// the unique module-level test section), mirroring the projector guard.
-    fn production_source_slice(full_source: &'static str) -> &'static str {
+    fn production_source_slice(full_source: &str) -> String {
+        let mut source = full_source.replace("\r\n", "\n");
         const TEST_SECTION_MARKER: &str = "\n#[cfg(test)]\nmod tests";
-        let first = full_source.find(TEST_SECTION_MARKER).unwrap_or_else(|| {
+        let first = source.find(TEST_SECTION_MARKER).unwrap_or_else(|| {
             panic!("module-level test section marker missing; production scan refused")
         });
         assert!(
-            !full_source[first + TEST_SECTION_MARKER.len()..].contains(TEST_SECTION_MARKER),
+            !source[first + TEST_SECTION_MARKER.len()..].contains(TEST_SECTION_MARKER),
             "multiple module-level test sections detected; slice would be ambiguous"
         );
-        &full_source[..first + 1]
+        source.truncate(first + 1);
+        source
     }
 
     fn assert_no_forbidden_symbols(production: &str, context: &str) {
@@ -1728,7 +1730,7 @@ mod tests {
         assert!(production.contains("async fn dispatch_failure("));
         assert!(production.contains("fn classify_archive_failure("));
 
-        assert_no_forbidden_symbols(production, "authorization_archive_worker.rs");
+        assert_no_forbidden_symbols(&production, "authorization_archive_worker.rs");
 
         // The REAL durable archive primitives are required in the production
         // half (never mocks-only shapes): claim → parent lock → strict

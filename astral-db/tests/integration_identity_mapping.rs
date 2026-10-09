@@ -55,6 +55,64 @@ async fn required_test_pool() -> MySqlPool {
     pool
 }
 
+async fn assert_operation_absent(pool: &MySqlPool, operation_id: &str, actor_id: i64) {
+    let operation_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM integration_identity_mapping_operation WHERE operation_id = ?",
+    )
+    .bind(operation_id.as_bytes())
+    .fetch_one(pool)
+    .await
+    .expect("check that a rejected operation claim rolled back");
+    assert_eq!(operation_count, 0);
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'IDENTITY_INTEGRATION_MAPPING' AND request_id = ? AND user_id = ?",
+    )
+    .bind(operation_id)
+    .bind(actor_id)
+    .fetch_one(pool)
+    .await
+    .expect("check that a rejected operation left no audit entry");
+    assert_eq!(audit_count, 0);
+}
+
+async fn assert_completed_operation(
+    pool: &MySqlPool,
+    operation_id: &str,
+    actor_id: i64,
+    result_revision: u64,
+) {
+    let (status, stored_actor, stored_revision, claim_token): (
+        Vec<u8>,
+        i64,
+        Option<u64>,
+        Option<Vec<u8>>,
+    ) = sqlx::query_as(
+        "SELECT status, actor_id, result_revision, claim_token \
+         FROM integration_identity_mapping_operation WHERE operation_id = ?",
+    )
+    .bind(operation_id.as_bytes())
+    .fetch_one(pool)
+    .await
+    .expect("read committed operation result with binary-compatible status decoding");
+    assert_eq!(status, b"COMPLETED");
+    assert_eq!(stored_actor, actor_id);
+    assert_eq!(stored_revision, Some(result_revision));
+    assert!(claim_token.is_none());
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'IDENTITY_INTEGRATION_MAPPING' AND request_id = ? AND user_id = ?",
+    )
+    .bind(operation_id)
+    .bind(actor_id)
+    .fetch_one(pool)
+    .await
+    .expect("read mapping mutation audit correlation");
+    assert_eq!(audit_count, 1);
+}
+
 async fn create_test_identity(pool: &MySqlPool) -> (i64, i64) {
     let salt = Uuid::new_v4().simple().to_string();
     let user_no = format!("sdk-test-{salt}");
@@ -178,12 +236,14 @@ async fn create_read_idempotency_cas_revoke_and_permanent_key_ownership() {
                 .unwrap(),
             1
         );
+        assert_completed_operation(&pool, &create_operation, user_id, 1).await;
         assert_eq!(
             create_integration_identity_mapping(&pool, create.clone())
                 .await
                 .unwrap(),
             1
         );
+        assert_completed_operation(&pool, &create_operation, user_id, 1).await;
         let mut changed_replay = create.clone();
         changed_replay.identity_card_id += 1;
         assert!(create_integration_identity_mapping(&pool, changed_replay)
@@ -213,6 +273,7 @@ async fn create_read_idempotency_cas_revoke_and_permanent_key_ownership() {
             .unwrap(),
             2
         );
+        assert_completed_operation(&pool, &disable_operation, user_id, 2).await;
         assert!(read_integration_identity_mapping(&pool, &key)
             .await
             .unwrap()
@@ -225,11 +286,13 @@ async fn create_read_idempotency_cas_revoke_and_permanent_key_ownership() {
             operation_id: format!("sdk-test-{salt}-wrong-cas"),
             actor_id: user_id,
         };
+        let wrong_cas_operation = wrong_revision.operation_id.clone();
         assert!(
             set_integration_identity_mapping_status(&pool, wrong_revision)
                 .await
                 .is_err()
         );
+        assert_operation_absent(&pool, &wrong_cas_operation, user_id).await;
 
         assert_eq!(
             set_integration_identity_mapping_status(
@@ -246,6 +309,7 @@ async fn create_read_idempotency_cas_revoke_and_permanent_key_ownership() {
             .unwrap(),
             3
         );
+        assert_completed_operation(&pool, &revoke_operation, user_id, 3).await;
         assert!(read_integration_identity_mapping(&pool, &key)
             .await
             .unwrap()

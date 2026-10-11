@@ -321,6 +321,38 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(self.classify(item)["status"], "FAIL")
         self.assertEqual(self.classify(item, out="12 scenarios passed")["status"], "PASS")
 
+    def test_complete_evaluate_routes_to_strict_evidence_acceptance(self):
+        item = suite(evidence_contract="policy-evaluate-benefit")
+        accepted = {"status": "PASS", "reason": "complete measured collection",
+                    "performance": {"scope": "policy-engine-evaluate-cpu"},
+                    "verified_postcondition": {"allDecisionsChecked": True}}
+        output = "raw benchmark records\n" + rust_result()
+        with patch.object(campaign, "check_evaluate_performance", return_value=accepted) as check:
+            verdict = self.classify(item, out=output)
+        check.assert_called_once_with(output)
+        self.assertEqual(verdict["status"], "PASS")
+        self.assertEqual(verdict["performance"]["scope"], "policy-engine-evaluate-cpu")
+        self.assertEqual(verdict["verified_postcondition"], {"allDecisionsChecked": True})
+        self.assertEqual(verdict["tests"]["passed"], 1)
+
+    def test_complete_evaluate_exit_zero_without_records_fails(self):
+        item = suite(evidence_contract="policy-evaluate-benefit")
+        self.assertEqual(self.classify(item, out=rust_result())["status"], "FAIL")
+
+    def test_complete_evaluate_measurements_cannot_override_rust_nonpass(self):
+        item = suite(evidence_contract="policy-evaluate-benefit", expected_tests=1)
+        for code, output, status in (
+            (101, rust_result(), "FAIL"),
+            (0, rust_result(passed=0), "FAIL"),
+            (0, rust_result(ignored=1), "SKIP"),
+            (0, "[SKIP] required assertion absent\n" + rust_result(), "SKIP"),
+            (124, rust_result(), "UNKNOWN"),
+        ):
+            with self.subTest(status=status, code=code), \
+                    patch.object(campaign, "check_evaluate_performance") as check:
+                self.assertEqual(self.classify(item, code=code, out=output)["status"], status)
+                check.assert_not_called()
+
     def test_complete_cpu_matrix_preserves_measurements(self):
         rows = [{"case": "one", "metric": "ns-per-plan", "legacy": [20] * 15, "current": [10] * 15},
                 {"case": "two", "metric": "ns-per-read", "samples": [30] * 15}]

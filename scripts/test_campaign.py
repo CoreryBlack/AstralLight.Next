@@ -30,6 +30,7 @@ for import_root in (TOOLS, ROOT / "scripts"):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 from model_acceptance import check_full_contract, check_tenant, check_universal
+from evaluate_performance_acceptance import check_evaluate_performance
 from performance_acceptance import check_criterion, check_divan
 
 MANIFEST = ROOT / "tests-suite" / "MANIFEST.toml"
@@ -118,6 +119,8 @@ def read_manifest(path=MANIFEST, root=ROOT):
             raise ValueError(f"benchmark requires measured-output acceptance: {suite_id}")
         if suite.get("model_contract") not in (None, "full-contract", "universal", "tenant"):
             raise ValueError(f"unknown model contract: {suite_id}")
+        if suite.get("evidence_contract") not in (None, "policy-evaluate-benefit") or suite.get("evidence_contract") is not None and suite["acceptance"] != "rust":
+            raise ValueError(f"unknown or incompatible runtime evidence contract: {suite_id}")
         if suite.get("model_contract") == "full-contract" and suite.get("model_name") not in ("single", "two"):
             raise ValueError(f"missing exact model identity: {suite_id}")
         if "--no-fail-fast" in argv:
@@ -269,6 +272,10 @@ def classify_output(suite, code, stdout, stderr, interrupted=False):
             measurements = classify_performance_matrix(suite, stdout)
             measurements["tests"] = counts
             return measurements
+        if suite.get("evidence_contract") == "policy-evaluate-benefit":
+            evidence = check_evaluate_performance(stdout)
+            evidence["tests"] = counts
+            return evidence
         return {"status": "PASS", "reason": "scoped non-ignored Rust assertions executed; ignored checks remain outside selection" if counts["ignored"] else "scoped Rust assertions executed",
                 "tests": counts, "unexecuted_ignored": counts["ignored"]}
     if internal_skip:
@@ -539,7 +546,7 @@ def run_selected(manifest, suites, run_id, artifact_root, verify_items=False):
             if not records or records[-1] is not record:
                 records.append(record)
             record["finished_at"] = utc_now()
-            record["actual_postcondition"] = record["reason"]
+            record["actual_postcondition"] = record.get("verified_postcondition", record["reason"])
             report["phase_timing_seconds"].append({"id": suite["id"], "phase": phase,
                 "finished_at_monotonic_offset": round(time.monotonic() - campaign_started, 3)})
             if record["status"] != "PASS" and stop is None:

@@ -1410,6 +1410,51 @@ expected_tests = 1
 timeout_seconds = 1800
 
 [[suite]]
+id = "policy-evaluate-benefit-controls"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["PERF", "RQ5"]
+scope = "component"
+boundary = "full evaluate fixture parity, ALLOW/DENY/PENDING read counts, expiry and final-revoke controls; no durable or HTTP proof"
+sources = ["astral-db/src/memory_projection_hub/tests/evaluate_performance.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--lib", "memory_projection_hub::tests::evaluate_performance::controls::policy_evaluate_benefit_controls_preserve_decisions_and_fences", "--locked", "--", "--exact", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 600
+
+[[suite]]
+id = "policy-evaluate-benefit"
+owner = "astral-db"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ5"]
+scope = "component"
+boundary = "complete production PolicyEngine.evaluate CPU call-return: Arc-backed assembly hits versus forced misses, actual-clock reference and owned evidence; not signed HTTP/MySQL/SDK admission"
+sources = ["astral-db/src/memory_projection_hub/tests/evaluate_performance.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs", "scripts/evaluate_performance_acceptance.py"]
+argv = ["cargo", "test", "--release", "-p", "astral-db", "--lib", "memory_projection_hub::tests::evaluate_performance::policy_evaluate_complete_benefit_matrix", "--locked", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+evidence_contract = "policy-evaluate-benefit"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 1800
+
+[[suite]]
+id = "policy-evaluate-evidence-contracts"
+owner = "runner-contracts"
+profile = "offline-validation"
+test_services = []
+series = ["PERF", "RQ5"]
+scope = "component"
+boundary = "strict paired full-evaluation measurement acceptance and independent arithmetic; synthetic parser evidence only"
+sources = ["scripts/evaluate_performance_acceptance.py", "scripts/tests/test_evaluate_performance_acceptance.py"]
+argv = ["python", "-B", "-m", "unittest", "discover", "-s", "scripts/tests", "-p", "test_evaluate_performance_acceptance.py"]
+acceptance = "unittest"
+minimum_tests = 1
+timeout_seconds = 600
+
+[[suite]]
 id = "stage-plan-performance"
 performance_cases = 15
 owner = "astral-trustgraph"

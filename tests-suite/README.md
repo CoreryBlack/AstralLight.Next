@@ -105,6 +105,35 @@ CPU-only 的三组 `PERF_MATRIX` 还须分别输出完整 82/15/40 个唯一 cas
 这些矩阵验证组件结果等价和采集完整性，比较数据没有额外性能阈值时不宣称
 统计上“无回退”。独立现有吞吐下限仍由原测试严格断言，runner 不降低它们。
 
+新增 `policy-evaluate-benefit` 不再只测 hub 热读：计时包围实际
+`PolicyEngine.evaluate()` 调用直到完整 `PolicyDecision` 返回，保留 AUTHN、卡片上下文、
+资源 ownership、ORG 端口分类、初始证据校验/匹配、ALLOW 最终复读、统计和断路器开销。
+卡片/ORG/资源归属仍是明确的本地夹具，不是数据库身份或 managed ORG_SCOPE 查询。
+当前 repository 返回 owned evidence，Arc 只在装配缓存内部共享，两次 ALLOW 读取仍深拷贝。
+不能把此结果表述为共享 Arc 穿过评估器或签名 HTTP 的端到端收益。
+
+```bash
+python -B scripts/test_campaign.py --run --suite policy-evaluate-benefit-controls --suite policy-evaluate-evidence-contracts --suite policy-evaluate-benefit
+```
+
+固定 45 个 case（1/8/128/512/2048 grants × 1/4/8 threads × 首/尾命中 ALLOW 与无匹配 DENY），
+每项 18 个配对批次，三组使用全部六种顺序各三次：固定秒缓存命中、每次读取跨秒强制装配、
+生产 UTC 时钟参考。强制装配保留真实 miss 的填充成本；仅用 perpetual grants，逐项检查
+证据/决策等价。实际 1 秒 TTL 不关闭，理想热读组必须证明全部 evidence read 命中，
+生产时钟组按实际命中率报告。每个请求核对完整决策、ALLOW 两次/DEFAULT_DENY 一次读取，
+正向、PENDING、跨秒过期和最终撤权控制在计时前独立执行。
+
+只接受 `--release` 完整矩阵；runner 逐个核验 case、样本、线程/请求数、scope、
+卡片/ORG/read 调用、grant 数、缓存命中、两阶段耗时和完整结束后置条件，归档原始
+逐决策 ns 与批次 wall ns。延迟不含返回后的断言/销毁，吞吐 wall 包含同步唤醒、结果核对、
+记录/销毁和 join，不含线程/runtime 构造与预热。配对收益由原始数据独立计算，
+几何平均比的 bootstrap 95% 区间是同次本地批次的探索性、不校正多重比较估计，
+不是跨机器或部署置信保证。采集 PASS 不要求加速，负收益和不确定结果也必须报告。
+收益分析以该 run 的 `result.json` 和 stdout 为事实来源，不复用历史 hub-only 样本。
+首轮实测、阶段归因与未覆盖边界见
+[完整评估装配缓存收益记录](../Docs/实验/基准测试/policy-evaluate-benefit-20261010.md)；
+该记录只针对明确的本地 CPU run，不将采集 PASS 写成线上端到端验收。
+
 每次执行在仓库外创建不可覆盖的 run 目录，记录 taskId、源码内容 hash、cwd、
 argv、环境名称、墙钟/单调耗时、退出码、完整脱敏 stdout/stderr、断言和 ignored
 数量、postcondition 与重试次数（固定零）。源码在冻结后变化，或超时/取消/

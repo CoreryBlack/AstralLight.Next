@@ -85,6 +85,16 @@ arch_status = "current"
 note = "含 formal loader 无投影头时不回退 permission_rule 的退役守卫断言"
 
 [[entry]]
+id = "astral-db/local_message_stress"
+category = "integration"
+owner_crate = "astral-db"
+path = "astral-db/tests/local_message_stress.rs"
+kind = "integration-ignored"
+requires = ["DATABASE_URL", "MySQL-8.0-migrated", "20260929000001", "20261001000005"]
+arch_status = "current"
+note = "并发重复 append 幂等回归与有界单节点 outbox append/claim 负载观察;不代表 HTTP/broker/多节点吞吐"
+
+[[entry]]
 id = "astral-db/integration_identity_mapping"
 category = "security"
 owner_crate = "astral-db"
@@ -1034,6 +1044,34 @@ sources = ["astral-db/tests/authorization_projection_integration.rs"]
 argv = ["cargo", "test", "-p", "astral-db", "--test", "authorization_projection_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
+
+[[suite]]
+id = "db-local-message-duplicate-stress"
+owner = "astral-db"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M2", "E3", "E4", "RQ4"]
+scope = "integration"
+boundary = "real MySQL concurrent duplicate append, message-id idempotency/conflict, and single-scope sequence allocation; bounded to one row, not throughput"
+sources = ["astral-db/tests/local_message_stress.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--test", "local_message_stress", "duplicate_append_is_idempotent_under_concurrency", "--locked", "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+
+[[suite]]
+id = "db-local-message-load"
+owner = "astral-db"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M2", "E3", "E4", "RQ4"]
+scope = "integration"
+boundary = "bounded 288-message append/claim load with one hot scope and three independent scopes; per-scope sequence/FIFO checks and timing observations only, no HTTP, broker or multi-node throughput claim"
+sources = ["astral-db/tests/local_message_stress.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--test", "local_message_stress", "scoped_append_and_claim_load_preserves_sequence_and_fifo", "--locked", "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
 
 [[suite]]
 id = "db-integration"

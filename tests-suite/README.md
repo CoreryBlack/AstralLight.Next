@@ -74,6 +74,8 @@ python -B scripts/test_campaign.py --run --profile native-single-node --suite na
 python -B scripts/test_campaign.py --run --profile performance-kernel --suite strict-policy-benchmark
 ```
 
+真实 local-message outbox 压力与幂等覆盖可单独选择 `db-local-message-duplicate-stress` 或 `db-local-message-load`；两者需要已迁移隔离 MySQL，计数器高水位保留，负载测试覆盖单一热点 scope，不代表 HTTP、broker 或多节点吞吐。
+
 真实依赖 profile 只复用 `TEST_USE_EXISTING=1` 的已批准、已迁移隔离库，并要求
 `ASTRAL_MIGRATION_ENV=isolated`、`RUST_INTEGRATION_REQUIRED=1`。MySQL 必须是
 loopback:3308 的 run-scoped `astral_rehearsal_<run-suffix>`，并通过

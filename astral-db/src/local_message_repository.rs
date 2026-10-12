@@ -18,12 +18,15 @@
 use sha2::{Digest, Sha256};
 use sqlx::mysql::MySqlPool;
 use sqlx::FromRow;
+use std::time::Duration;
 use time::PrimitiveDateTime;
 use uuid::Uuid;
 
 const LEASE_SECONDS: i64 = 30;
 const MAX_ATTEMPTS: i32 = 5;
 const MAX_BACKOFF_SECONDS: i64 = 900;
+const APPEND_DEADLOCK_RETRIES: usize = 3;
+const CLAIM_DEADLOCK_RETRIES: usize = 3;
 
 pub const LOCAL_MESSAGE_LEASE_SECONDS: u64 = LEASE_SECONDS as u64;
 pub const LOCAL_MESSAGE_MAX_ATTEMPTS: i32 = MAX_ATTEMPTS;
@@ -246,13 +249,28 @@ impl LocalMessageRepository {
         &self,
         input: &LocalMessageInput<'_>,
     ) -> Result<LocalMessageAppend, LocalMessageError> {
-        // The standalone append shares the exact transactional path of
-        // append_in_tx so per-scope sequences stay commit-ordered and the
-        // counter lock is held to a real commit.
-        let mut tx = self.pool.begin().await?;
-        let outcome = append_in_tx(&mut tx, input).await?;
-        tx.commit().await?;
-        Ok(outcome)
+        // A standalone append owns its transaction, so a deadlock victim can
+        // safely retry the complete transaction. The in-transaction API below
+        // deliberately does not retry because its caller owns the boundary.
+        for attempt in 0..=APPEND_DEADLOCK_RETRIES {
+            let mut tx = self.pool.begin().await?;
+            match append_in_tx(&mut tx, input).await {
+                Ok(outcome) => {
+                    tx.commit().await?;
+                    return Ok(outcome);
+                }
+                Err(error)
+                    if attempt < APPEND_DEADLOCK_RETRIES && is_retryable_deadlock(&error) =>
+                {
+                    if tx.rollback().await.is_err() {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(Duration::from_millis(5 * (attempt as u64 + 1))).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("append deadlock retry loop returns or errors on every iteration")
     }
 
     /// Claim one exact committed outbox row after a source transaction has
@@ -261,6 +279,23 @@ impl LocalMessageRepository {
     /// rules as [`Self::claim_batch`], so it cannot jump ahead of an earlier
     /// PENDING, PROCESSING, or IN_DOUBT row.
     pub async fn claim_exact(
+        &self,
+        owner: &str,
+        queue_name: &str,
+        message_id: &str,
+    ) -> Result<LocalMessageExactClaim, LocalMessageError> {
+        for attempt in 0..=CLAIM_DEADLOCK_RETRIES {
+            match self.claim_exact_once(owner, queue_name, message_id).await {
+                Err(error) if attempt < CLAIM_DEADLOCK_RETRIES && is_retryable_deadlock(&error) => {
+                    tokio::time::sleep(Duration::from_millis(5 * (attempt as u64 + 1))).await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("exact claim deadlock retry loop returns or errors on every iteration")
+    }
+
+    async fn claim_exact_once(
         &self,
         owner: &str,
         queue_name: &str,
@@ -685,18 +720,27 @@ impl LocalMessageRepository {
     }
 }
 
+fn is_retryable_deadlock(error: &LocalMessageError) -> bool {
+    matches!(
+        error,
+        LocalMessageError::Database(sqlx::Error::Database(database))
+            if database.code().is_some_and(|code| code == "1213" || code == "40001")
+    )
+}
+
 pub async fn append_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     input: &LocalMessageInput<'_>,
 ) -> Result<LocalMessageAppend, LocalMessageError> {
     validate_input(input)?;
-    let result = sqlx::query(
+    // Insert success, not affected-row counts, distinguishes a new row from a
+    // duplicate because MySQL CLIENT_FOUND_ROWS changes no-op update counts.
+    let insert = sqlx::query(
         "INSERT INTO al_message_outbox \
          (message_id, operation_id, message_type, queue_name, ordering_key, tenant_id, \
           origin_region, target_region, schema_version, payload_json, headers_json, \
           payload_sha256, status, attempts) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0) \
-         ON DUPLICATE KEY UPDATE message_id = message_id",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0)",
     )
     .bind(input.message_id)
     .bind(input.operation_id)
@@ -711,19 +755,29 @@ pub async fn append_in_tx(
     .bind(input.headers_json)
     .bind(input.payload_sha256)
     .execute(&mut **tx)
-    .await?;
+    .await;
 
-    if result.rows_affected() == 1 {
-        allocate_scope_sequence(tx, input).await?;
-        return Ok(LocalMessageAppend::Inserted);
-    }
+    let duplicate_error = match insert {
+        Ok(_) => {
+            allocate_scope_sequence(tx, input).await?;
+            return Ok(LocalMessageAppend::Inserted);
+        }
+        Err(error)
+            if error
+                .as_database_error()
+                .is_some_and(|db| db.is_unique_violation()) =>
+        {
+            error
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     let existing = sqlx::query_as::<_, LocalMessageRow>(
         "SELECT message_id, operation_id, message_type, queue_name, ordering_key, tenant_id, \
                 origin_region, target_region, schema_version, payload_json, headers_json, \
                 payload_sha256, status, attempts, next_attempt_at, lease_owner, \
                 lease_expires_at, processed_at, last_error, created_at, updated_at \
-         FROM al_message_outbox WHERE message_id = ?",
+         FROM al_message_outbox WHERE message_id = ? FOR UPDATE",
     )
     .bind(input.message_id)
     .fetch_optional(&mut **tx)
@@ -747,9 +801,7 @@ pub async fn append_in_tx(
             Ok(LocalMessageAppend::Existing)
         }
         Some(_) => Err(LocalMessageError::PayloadConflict),
-        None => Err(LocalMessageError::Database(sqlx::Error::Protocol(
-            "duplicate local message disappeared before readback".into(),
-        ))),
+        None => Err(LocalMessageError::Database(duplicate_error)),
     }
 }
 

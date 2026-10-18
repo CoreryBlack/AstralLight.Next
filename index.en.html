@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#050505">
+    <meta name="description" content="Fast. Secure. Consistent. AstralLight.Next is a policy decision engine for distributed trust, connecting policy decisions to real execution through evidence admission.">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="AstralLight.Next">
+    <meta property="og:title" content="AstralLight.Next — Next-Generation Policy Decision Engine">
+    <meta property="og:description" content="Fast. Secure. Consistent. A policy decision engine for distributed trust, connecting policy decisions to real execution through evidence admission.">
+    <title>AstralLight.Next — Next-Generation Policy Decision Engine</title>
+    <link rel="icon" href="assets/astral-mark.png" type="image/png">
+    <link rel="alternate" hreflang="zh-Hans-CN" href="index.html">
+    <link rel="stylesheet" href="site.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" id="top">
+      <a class="brand" href="#top" aria-label="AstralLight.Next home"><img class="brand-mark" src="assets/astral-mark.png" alt="" width="28" height="28">AstralLight<span class="brand-period">.</span><span class="brand-next">Next</span></a>
+      <nav class="top-nav" aria-label="Page navigation">
+        <a href="#failure">Problem</a>
+        <a href="#source-publication">Design</a>
+        <a href="validation.en.html" title="Validation data">Validation</a>
+        <a href="#modules">Modules</a>
+        <a href="#status">Status</a>
+      </nav>
+      <a class="lang-switch" href="index.html" hreflang="zh-Hans-CN" lang="zh-Hans-CN" aria-label="Switch to Chinese">中文</a>
+      <a class="header-link" href="https://github.com/CoreryBlack/AstralLight.Next" target="_blank" rel="noreferrer">GitHub <span aria-hidden="true">↗</span></a>
+    </header>
+
+    <main id="main">
+      <article>
+        <header class="article-hero">
+          <div class="hero-backdrop" aria-hidden="true">
+            <picture class="hero-poster">
+              <source srcset="assets/cinematic-poster.avif" type="image/avif">
+              <img src="assets/cinematic-poster.webp" width="1920" height="1080" alt="" fetchpriority="high" decoding="async">
+            </picture>
+            <video class="hero-video" muted autoplay loop playsinline preload="auto" aria-hidden="true" tabindex="-1">
+              <source src="assets/cinematic-loop.webm" type="video/webm">
+              <source src="assets/cinematic-loop.mp4" type="video/mp4">
+            </video>
+            <div class="hero-overlay"></div>
+          </div>
+          <div class="hero-content">
+            <div class="hero-copy">
+              <p class="eyebrow"><span class="eyebrow-mark" aria-hidden="true"></span> ASTRALLIGHT.NEXT <span>/</span> RESEARCH EDITION</p>
+              <h1>Next-Generation<br><em>Policy Decision Engine</em></h1>
+              <p class="hero-subtitle">After access is revoked,<br>how can a system prove that it is no longer effective?</p>
+              <p class="article-deck"><span class="hero-motto">Fast. Secure. Consistent. Built for distributed trust.</span> AstralLight.Next uses Rust to bring identity, authorization, and eligibility into a single high-throughput decision plane. Evidence admission connects policy decisions to real execution in a verifiable, recoverable chain.</p>
+              <div class="hero-actions">
+                <a class="hero-cta" href="#panel-vision">Read vision <span aria-hidden="true">↓</span></a>
+                <a class="hero-cta hero-cta-secondary" href="#failure">Read problem</a>
+                <a class="hero-cta hero-cta-secondary" href="#panel-reserves">Reserves</a>
+                <a class="hero-cta hero-cta-secondary" href="#panel-community">Contribute</a>
+                <a class="hero-source-link" href="https://github.com/CoreryBlack/AstralLight.Next" target="_blank" rel="noreferrer" aria-label="Browse GitHub source code" title="Browse GitHub source code"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false"><path fill="currentColor" d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.44 9.8 8.21 11.39.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.84 2.81 1.31 3.5 1 .11-.78.42-1.31.76-1.61-2.67-.3-5.47-1.34-5.47-5.96 0-1.32.47-2.39 1.24-3.23-.12-.3-.54-1.53.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.66 1.65.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.23 0 4.63-2.8 5.65-5.48 5.95.43.37.81 1.1.81 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 24 12c0-6.63-5.37-12-12-12Z"/></svg></a>
+              </div>
+              <a class="hero-evidence" href="validation.en.html">
+                <span class="hero-evidence-copy">
+                  <span class="hero-evidence-kicker">VALIDATION EVIDENCE · 2026-10-07</span>
+                  <strong><span class="hero-evidence-pass">2,851 PASS</span> · <span class="hero-evidence-fail">2 FAIL</span> · 13 ignored</strong>
+                </span>
+                <span class="hero-evidence-action">View test details <span aria-hidden="true">→</span></span>
+              </a>
+              <div class="article-meta"><span>Problem · Evidence admission</span><span>Rust · Multi-tenant</span><span>Candidate → executable authority</span></div>
+            </div>
+            <div class="system-loop" role="group" aria-label="System flow: source mutation, durable intent, fenced publication, final admission, protected effect, audit reconciliation, then back to source">
+              <div class="loop-visual">
+                <canvas class="loop-canvas" aria-hidden="true"></canvas>
+              </div>
+              <ol class="loop-legend" aria-label="Six stages in the flow">
+                <li><span class="loop-index">01</span><div><strong>SOURCE</strong><em>Source mutation</em></div></li>
+                <li><span class="loop-index">02</span><div><strong>INTENT</strong><em>Durable intent</em></div></li>
+                <li><span class="loop-index">03</span><div><strong>PUBLISH</strong><em>Fenced publication</em></div></li>
+                <li><span class="loop-index">04</span><div><strong>ADMIT</strong><em>Final admission</em></div></li>
+                <li><span class="loop-index">05</span><div><strong>HOST</strong><em>Protected effect</em></div></li>
+                <li><span class="loop-index">06</span><div><strong>AUDIT</strong><em>Audit reconciliation</em></div></li>
+              </ol>
+              <p class="loop-caption">From source to host, then back to evidence and reconciliation.</p>
+            </div>
+          </div>
+          <div class="hero-caption"><span>From candidate entitlement to executable authority</span><span class="hero-caption-rule" aria-hidden="true"></span><span>Scroll to explore <b aria-hidden="true">↓</b></span></div>
+        </header>
+
+        <section class="story-deck" aria-label="Project overview">
+          <div class="deck-bar">
+            <div class="deck-tabs" role="tablist" aria-label="Content sections">
+              <button class="deck-tab is-active" id="tab-vision" type="button" role="tab" aria-selected="true" aria-controls="panel-vision"><span class="deck-tab-num">01</span> <span class="deck-tab-name">Vision</span></button>
+              <button class="deck-tab" id="tab-problem" type="button" role="tab" aria-selected="false" aria-controls="panel-problem" tabindex="-1"><span class="deck-tab-num">02</span> <span class="deck-tab-name">Problem</span></button>
+              <button class="deck-tab" id="tab-reserves" type="button" role="tab" aria-selected="false" aria-controls="panel-reserves" tabindex="-1"><span class="deck-tab-num">03</span> <span class="deck-tab-name">Reserves</span></button>
+              <button class="deck-tab" id="tab-community" type="button" role="tab" aria-selected="false" aria-controls="panel-community" tabindex="-1"><span class="deck-tab-num">04</span> <span class="deck-tab-name">Contribute</span></button>
+            </div>
+            <div class="deck-controls">
+              <span class="deck-hint">Swipe to navigate <span aria-hidden="true">↔</span></span>
+              <span class="deck-counter">01 / 04</span>
+              <button class="deck-nav deck-prev" type="button" aria-label="View previous page" disabled>←</button>
+              <button class="deck-nav deck-next" type="button" aria-label="View next page">→</button>
+            </div>
+            <div class="deck-progress" aria-hidden="true"><span></span></div>
+          </div>
+          <div class="deck-viewport" role="region" aria-label="Project overview, four horizontally swipeable panels" tabindex="0">
+            <div class="deck-track">
+              <section class="deck-panel deck-vision" id="panel-vision" role="tabpanel" aria-labelledby="tab-vision">
+                <div class="vision-wrap">
+                  <div class="vision-intro">
+                    <p class="section-label">Vision <span>PROJECT / VISION</span></p>
+                    <h2>Make every authorization<br>verifiable, secure, and lightweight.</h2>
+                    <p class="lead">AstralLight.Next uses Rust to organize source mutations, evidence publication, admission decisions, host execution, and audit reconciliation into a verifiable, recoverable chain. It is not a new policy language; it adds the evidence-admission layer between a policy engine and real execution.</p>
+                    <div class="vision-grid">
+                      <article><strong>Verifiable chain</strong><span>Every decision can be traced to publication evidence and the admitted grant.</span></article>
+                      <article><strong>Safe access</strong><span>Return PENDING or DENY under uncertainty; never fall back to a stale ALLOW.</span></article>
+                      <article><strong>Low overhead</strong><span>Incremental compilation, bounded caches, and on-demand reads reduce unnecessary cost.</span></article>
+                    </div>
+                    <nav class="panel-jump" aria-label="On this page">
+                      <a href="#progress">01 What is built</a>
+                      <a href="#modules">02 System roles</a>
+                      <a href="#status">03 Project status</a>
+                    </nav>
+                  </div>
+                  <section class="story-section" id="progress">
+                    <p class="section-label">01 <span>What is built</span></p>
+                    <h2>Turning the vision into code, tests, and evidence.</h2>
+                    <p class="proof-lead">Making the vision verifiable through code, real dependencies, and benchmarks.</p>
+                    <div class="work-grid">
+                      <article><span class="work-index">A</span><h3>Evidence-admission chain</h3><p>Short source transactions, durable intent, generation/revoke fences, strict reads, and final identity reload.</p></article>
+                      <article><span class="work-index">B</span><h3>Multi-tenancy and recovery</h3><p>Tenant isolation, partitioned leases, quarantine/replay, single-writer leases, and a Redis-free composite.</p></article>
+                      <article><span class="work-index">C</span><h3>SDK / Identity / Audit</h3><p>SDK contracts, MFA, refresh-token families, audit replay, and signed admission.</p></article>
+                    </div>
+                    <div class="proof-heading"><h3>Key figures</h3><span>Local tests and benchmarks</span></div>
+                    <div class="proof-grid">
+                      <article><span class="proof-value">512</span><span class="proof-label">tenant-capacity tests passed</span><span class="proof-source">MT-E5 · PASS</span></article>
+                      <article><span class="proof-value">13,455</span><span class="proof-label">single-node authorization-chain peak qps, 0 errors</span><span class="proof-source">native composite · c=64</span></article>
+                      <article><span class="proof-value">0.10–0.47 µs</span><span class="proof-label">kernel p50, compiled matching cost</span><span class="proof-source">In-process microbenchmark · complexity 10–810</span></article>
+                    </div>
+                    <div class="proof-compare">
+                      <h3>Comparison with common authorization engines</h3>
+                      <p>Common flat ALLOW/default-DENY subset, 50 cards × 81 entries; values are the mean p50 across five runs.</p>
+                      <div class="compare-table" role="table" aria-label="Authorization-engine p50 comparison">
+                        <div class="compare-row compare-head" role="row"><span role="columnheader">Engine</span><span role="columnheader">p50</span><span role="columnheader">Relative p50</span></div>
+                        <div class="compare-row" role="row"><span role="cell">AstralLight.Next · compiled matching</span><strong role="cell">0.205 µs</strong><span role="cell">1×</span></div>
+                        <div class="compare-row" role="row"><span role="cell">Cedar · in-process</span><strong role="cell">3.310 µs</strong><span role="cell">≈16×</span></div>
+                        <div class="compare-row" role="row"><span role="cell">OPA · HTTP sidecar</span><strong role="cell">370.4 µs</strong><span role="cell">≈1,800×</span></div>
+                        <div class="compare-row" role="row"><span role="cell">Casbin · in-process</span><strong role="cell">1,369.83 µs</strong><span role="cell">≈6,700×</span></div>
+                      </div>
+                      <p class="proof-caveat">The OPA row includes an HTTP sidecar call; the table reports compiled matching cost.</p>
+                    </div>
+                    <p class="proof-note">Also: 169 integration cases with real MySQL / Redis / RabbitMQ passed; 2,765 SDK local-gate tests passed; 0 post-ack stale ALLOWs across 37,413 race samples.</p>
+                  </section>
+                  <section class="story-section" id="modules">
+                    <p class="section-label">02 <span>System roles</span></p>
+                    <h2>Six names, one system.</h2>
+                    <p>These names describe system roles that work together as a connected whole.</p>
+                    <div class="module-carousel-shell">
+                      <div class="module-carousel-head">
+                        <p class="module-scroll-hint">Swipe horizontally to view the six roles <span aria-hidden="true">→</span></p>
+                        <div class="module-controls">
+                          <button class="module-nav module-nav-prev" type="button" aria-label="View previous system role" disabled>←</button>
+                          <button class="module-nav module-nav-next" type="button" aria-label="View next system role">→</button>
+                        </div>
+                      </div>
+                      <div class="module-rail" aria-label="System-role timeline">
+                        <button class="rail-step is-active" type="button" aria-label="View Astra: core decision engine" aria-current="true"><span class="rail-dot"></span><span class="rail-label">Astra</span></button>
+                        <button class="rail-step" type="button" aria-label="View Sol: cryptography and identity trust foundation"><span class="rail-dot"></span><span class="rail-label">Sol</span></button>
+                        <button class="rail-step" type="button" aria-label="View Luna: audit and observability subsystem"><span class="rail-dot"></span><span class="rail-label">Luna</span></button>
+                        <button class="rail-step" type="button" aria-label="View Terra: hardware resource abstraction layer"><span class="rail-dot"></span><span class="rail-label">Terra</span></button>
+                        <button class="rail-step" type="button" aria-label="View Mobius: cross-domain approval and orchestration layer"><span class="rail-dot"></span><span class="rail-label">Mobius</span></button>
+                        <button class="rail-step" type="button" aria-label="View Klein: cross-system integration and enablement layer"><span class="rail-dot"></span><span class="rail-label">Klein</span></button>
+                      </div>
+                      <div class="module-carousel" role="region" aria-roledescription="carousel" aria-label="Six system roles" tabindex="0">
+                        <article class="module-card is-active" data-state="partial" role="group" aria-roledescription="slide" aria-label="1 of 6: Astra">
+                          <div class="module-card-top"><span class="module-mark" aria-hidden="true"></span><span class="module-domain">CORE / POLICY ENGINE</span></div>
+                          <p class="module-number" aria-hidden="true">01</p>
+                          <h3>Astra</h3>
+                          <p class="module-role">Core decision engine</p>
+                          <p class="module-desc">The Rust core includes incremental compilation, generation/fence, strict publication-evidence reads, final reload, and a fail-closed path.</p>
+                          <p class="module-signature">generation · fence · strict evidence</p>
+                          <div class="module-motif" aria-hidden="true">
+                            <svg viewBox="0 0 240 140" fill="none" stroke="currentColor" stroke-width="1" focusable="false">
+                              <path d="M120 14 196 52v56l-76 38-76-38V52Z" opacity=".38"/>
+                              <path d="M120 38 169 62v36l-49 24-49-24V62Z" opacity=".55"/>
+                              <circle cx="120" cy="80" r="7" fill="currentColor" stroke="none"/>
+                              <path d="M120 80 44 44M120 80l76-36M120 80v46" opacity=".65"/>
+                              <circle cx="44" cy="44" r="3" fill="currentColor" stroke="none"/>
+                              <circle cx="196" cy="44" r="3" fill="currentColor" stroke="none"/>
+                              <circle cx="120" cy="126" r="3" fill="currentColor" stroke="none"/>
+                            </svg>
+                          </div>
+                          <div class="module-card-foot"><span class="module-status-chip">Partially implemented</span><span class="module-foot-index">01 / 06</span></div>
+                        </article>
+                        <article class="module-card" data-state="partial" role="group" aria-roledescription="slide" aria-label="2 of 6: Sol">
+                          <div class="module-card-top"><span class="module-mark" aria-hidden="true"></span><span class="module-domain">IDENTITY / CRYPTOGRAPHY</span></div>
+                          <p class="module-number" aria-hidden="true">02</p>
+                          <h3>Sol</h3>
+                          <p class="module-role">Cryptography and identity trust foundation</p>
+                          <p class="module-desc">Dual-card context, Gateway request signing, internal-service assertions, MFA, and session fencing.</p>
+                          <p class="module-signature">identity · signature · session</p>
+                          <div class="module-motif" aria-hidden="true">
+                            <svg viewBox="0 0 240 140" fill="none" stroke="currentColor" stroke-width="1" focusable="false">
+                              <path d="M84 22h72l36 54-36 54H84L48 76Z" opacity=".35"/>
+                              <circle cx="120" cy="76" r="34" opacity=".55"/>
+                              <circle cx="120" cy="76" r="10" fill="currentColor" stroke="none"/>
+                              <path d="M120 42V18M120 110v24M86 76H58M154 76h28" opacity=".5"/>
+                              <path d="M94 102 146 50" opacity=".7"/>
+                              <circle cx="94" cy="102" r="4" fill="currentColor" stroke="none"/>
+                              <path d="M94 102h16v14" opacity=".7"/>
+                            </svg>
+                          </div>
+                          <div class="module-card-foot"><span class="module-status-chip">Partially implemented</span><span class="module-foot-index">02 / 06</span></div>
+                        </article>
+                        <article class="module-card" data-state="partial" role="group" aria-roledescription="slide" aria-label="3 of 6: Luna">
+                          <div class="module-card-top"><span class="module-mark" aria-hidden="true"></span><span class="module-domain">AUDIT / OBSERVABILITY</span></div>
+                          <p class="module-number" aria-hidden="true">03</p>
+                          <h3>Luna</h3>
+                          <p class="module-role">Audit and observability subsystem</p>
+                          <p class="module-desc">Observability components including authorization audits, Prometheus metrics, and audit replay.</p>
+                          <p class="module-signature">audit · metrics · replay</p>
+                          <div class="module-motif" aria-hidden="true">
+                            <svg viewBox="0 0 240 140" fill="none" stroke="currentColor" stroke-width="1" focusable="false">
+                              <circle cx="120" cy="76" r="52" opacity=".2"/>
+                              <circle cx="120" cy="76" r="34" opacity=".35"/>
+                              <path d="M24 84c18-36 36-36 54 0s36 36 54 0 36-36 54 0 36 36 54 0" opacity=".7"/>
+                              <circle cx="120" cy="76" r="5" fill="currentColor" stroke="none"/>
+                              <path d="M120 24v-10M120 128v10M68 76H58M172 76h10" opacity=".45"/>
+                            </svg>
+                          </div>
+                          <div class="module-card-foot"><span class="module-status-chip">Partially implemented</span><span class="module-foot-index">03 / 06</span></div>
+                        </article>
+                        <article class="module-card" data-state="roadmap" role="group" aria-roledescription="slide" aria-label="4 of 6: Terra">
+                          <div class="module-card-top"><span class="module-mark" aria-hidden="true"></span><span class="module-domain">HETEROGENEOUS COMPUTE</span></div>
+                          <p class="module-number" aria-hidden="true">04</p>
+                          <h3>Terra</h3>
+                          <p class="module-role">Hardware resource abstraction layer</p>
+                          <p class="module-desc">Planned resource abstraction and scheduling across CPU, GPU, ARM, and existing devices.</p>
+                          <p class="module-signature">CPU · GPU · ARM · fleet</p>
+                          <div class="module-motif" aria-hidden="true">
+                            <svg viewBox="0 0 240 140" fill="none" stroke="currentColor" stroke-width="1" focusable="false">
+                              <path d="M120 18 192 46 120 74 48 46Z" opacity=".45"/>
+                              <path d="M48 46v20l72 28 72-28V46M48 66v20l72 28 72-28V66M48 86v20l72 28 72-28V86" opacity=".35"/>
+                              <path d="M120 74v28M120 94v28M84 60l72 28M156 60l-72 28" opacity=".25"/>
+                              <rect x="104" y="50" width="32" height="18" opacity=".45"/>
+                              <circle cx="120" cy="116" r="4" fill="currentColor" stroke="none"/>
+                            </svg>
+                          </div>
+                          <div class="module-card-foot"><span class="module-status-chip">Design reserve</span><span class="module-foot-index">04 / 06</span></div>
+                        </article>
+                        <article class="module-card" data-state="roadmap" role="group" aria-roledescription="slide" aria-label="5 of 6: Mobius">
+                          <div class="module-card-top"><span class="module-mark" aria-hidden="true"></span><span class="module-domain">APPROVAL / ORCHESTRATION</span></div>
+                          <p class="module-number" aria-hidden="true">05</p>
+                          <h3>Mobius</h3>
+                          <p class="module-role">Cross-domain approval and orchestration layer</p>
+                          <p class="module-desc">Planned for emergency approvals and business orchestration, including temporary-authorization lifecycles and notification coordination.</p>
+                          <p class="module-signature">approve · delegate · expire</p>
+                          <div class="module-motif" aria-hidden="true">
+                            <svg viewBox="0 0 240 140" fill="none" stroke="currentColor" stroke-width="1" focusable="false">
+                              <path d="M42 62h88a30 30 0 1 1 0 60H76a34 34 0 0 1 0-68h116" opacity=".55"/>
+                              <path d="M42 62h88a30 30 0 0 0 0 60H76a34 34 0 0 0 0-68h116" opacity=".3"/>
+                              <path d="m174 46 14 8-14 8" opacity=".75"/>
+                              <circle cx="76" cy="96" r="4" fill="currentColor" stroke="none"/>
+                              <circle cx="144" cy="96" r="4" fill="currentColor" stroke="none"/>
+                            </svg>
+                          </div>
+                          <div class="module-card-foot"><span class="module-status-chip">Design reserve</span><span class="module-foot-index">05 / 06</span></div>
+                        </article>
+                        <article class="module-card" data-state="roadmap" role="group" aria-roledescription="slide" aria-label="6 of 6: Klein">
+                          <div class="module-card-top"><span class="module-mark" aria-hidden="true"></span><span class="module-domain">INTEGRATION / ADOPTION</span></div>
+                          <p class="module-number" aria-hidden="true">06</p>
+                          <h3>Klein</h3>
+                          <p class="module-role">Cross-system integration and enablement layer</p>
+                          <p class="module-desc">Planned for cross-system integration, connecting existing permission systems with a unified evidence model.</p>
+                          <p class="module-signature">SDK · adapter · bridge</p>
+                          <div class="module-motif" aria-hidden="true">
+                            <svg viewBox="0 0 240 140" fill="none" stroke="currentColor" stroke-width="1" focusable="false">
+                              <path d="M34 38h64v64H34Z" opacity=".45"/>
+                              <path d="M142 38h64v64h-64Z" opacity=".45"/>
+                              <path d="M98 56c20 0 20 28 44 28M142 56c-20 0-20 28-44 28" opacity=".7"/>
+                              <path d="M34 116h172" opacity=".2"/>
+                              <circle cx="66" cy="70" r="4" fill="currentColor" stroke="none"/>
+                              <circle cx="174" cy="70" r="4" fill="currentColor" stroke="none"/>
+                              <circle cx="120" cy="84" r="4" fill="currentColor" stroke="none"/>
+                            </svg>
+                          </div>
+                          <div class="module-card-foot"><span class="module-status-chip">Design reserve</span><span class="module-foot-index">06 / 06</span></div>
+                        </article>
+                      </div>
+                      <div class="module-progress" aria-hidden="true"><span class="module-progress-fill"></span></div>
+                      <p class="module-counter">01 / 06</p>
+                    </div>
+                  </section>
+
+                  <section class="story-section current-status" id="status">
+                    <p class="section-label">03 <span>Project status</span></p>
+                    <h2>Experimental project; not deployed in real production.</h2>
+                    <p>AstralLight.Next is an experimental project and has not been deployed in real production. There is no guarantee it applies to every environment or scenario.</p>
+                    <a class="article-link" href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/&#x6280;&#x672F;&#x80FD;&#x529B;&#x4E0E;&#x50A8;&#x5907;&#x6E05;&#x5355;.md" target="_blank" rel="noreferrer">View the 54-item technology capabilities list <span aria-hidden="true">↗</span></a>
+                  </section>
+                  <nav class="panel-pager" aria-label="Panel navigation">
+                    <a class="is-next" href="#panel-problem">Next · Problem <span aria-hidden="true">→</span></a>
+                  </nav>
+                </div>
+              </section>
+              <section class="deck-panel deck-problem" id="panel-problem" role="tabpanel" aria-labelledby="tab-problem">
+                <div class="article-layout">
+          <aside class="chapter-index" aria-label="Contents">
+            <nav>
+              <div class="index-group">
+                <p class="index-group-title">Problem definition</p>
+                <ul>
+                  <li><a href="#failure">Failure scenario</a></li>
+                  <li><a href="#boundary">The boundary problem</a></li>
+                  <li><a href="#candidate">Candidates and authority</a></li>
+                  <li><a href="#connections">Five connections</a></li>
+                  <li><a href="#omissions">Local correctness</a></li>
+                  <li><a href="#adversary">Adversary and goals</a></li>
+                </ul>
+              </div>
+              <div class="index-group">
+                <p class="index-group-title">Design contract</p>
+                <ul>
+                  <li><a href="#source-publication">Source and publication</a></li>
+                  <li><a href="#narrowing">Omission detection</a></li>
+                  <li><a href="#readers">Read paths</a></li>
+                  <li><a href="#final-reload">Final reload</a></li>
+                  <li><a href="#failure-semantics">Failure semantics</a></li>
+                  <li><a href="#request-lifecycle">Request lifecycle</a></li>
+                </ul>
+              </div>
+              <div class="index-group">
+                <p class="index-group-title">Guarantees and evidence</p>
+                <ul>
+                  <li><a href="#guarantee">Conditional guarantee</a></li>
+                  <li><a href="#evidence">Evaluation overview</a></li>
+                </ul>
+              </div>
+              <div class="index-group">
+                <p class="index-group-title">Further reading</p>
+                <ul>
+                  <li><a href="#explore">Explore further</a></li>
+                </ul>
+              </div>
+            </nav>
+          </aside>
+
+          <div class="article-wrap article-body">
+            <section class="story-section" id="failure">
+              <p class="section-label">01 <span>Failure scenario</span></p>
+              <h2>How can one stale ALLOW pass through checks that are locally correct?</h2>
+              <p class="lead">Let the request context be <code>ctx = (principal, tenant, scope, resource, action)</code>. The candidate grant <code>g₀</code> is still present in evidence set <code>E₀</code>; the source transaction commits a narrowing change <code>d</code> that removes <code>g₀</code> from the effective grants.</p>
+              <p>The projection has not published <code>d</code>, and the cache still holds <code>E₀</code>. The policy matcher evaluates <code>E₀</code> and correctly selects <code>g₀</code>; the host then performs the protected operation. The source commit is correct, the projection progresses on its own schedule, the cache entry is complete and correctly signed, and the matcher is correct—yet the system executes the wrong state.</p>
+              <p>This is more than “the cache was not refreshed.” Even with a fully fresh cache, valid integrity checks, and correct policy-language semantics, a match can still be stale if derived evidence does not yet represent a committed revocation.</p>
+              <ol class="timeline">
+                <li><span class="timeline-time">t<sub>c</sub>(d)</span><p>The source transaction commits the narrowing <code>d</code>, recording a durable delta or outbox, source generation, revoke fence, affected scope, and audit correlation in the same short transaction.</p></li>
+                <li><span class="timeline-time">m<sub>0</sub> → p<sub>0</sub> → m<sub>1</sub> → p<sub>1</sub></span><p>On a cache hit, the reader observes the manifest digest in order <code>M</code> and the unpublished-narrowing predicate <code>b</code>; these four statements do not share one atomic SQL snapshot.</p></li>
+                <li><span class="timeline-time">t<sub>f</sub> = t*</span><p>The first authoritative observation used by the final load. The cache branch uses <code>m<sub>0</sub></code>; the strict-read branch uses the first predicate read view. This provides the final evidence for admission <code>E<sub>1</sub></code>.</p></li>
+                <li><span class="timeline-time">t<sub>v</sub> → t<sub>a</sub></span><p>Identity stability is checked at <code>t<sub>v</sub></code>, and ALLOW is returned to the host at <code>t<sub>a</sub></code>. The guarantee covers only revocation-class changes committed before <code>t<sub>c</sub>(d) &lt; t*</code>; changes within <code>[t*, t<sub>a</sub>]</code> are outside the theorem’s scope.</p></li>
+              </ol>
+              <p class="inline-note"><strong>The key question is not “how long was it cached?”</strong> Until the evidence represents a committed narrowing, the host can turn a locally correct match into a globally incorrect decision.</p>
+            </section>
+
+            <section class="story-section" id="boundary">
+              <p class="section-label">02 <span>The boundary problem</span></p>
+              <h2>A policy engine answers “does it match?”, not “is this state still executable?”</h2>
+              <p>RBAC derives permissions from roles; ABAC combines subject, resource, action, and environment attributes; XACML defines combining behavior and <code>Indeterminate</code> results; Zanzibar exposes consistency tokens for relationship tuples. In-process and sidecar engines such as Cedar, OPA, and Casbin evaluate policies and entity representations supplied by the caller.</p>
+              <p>These systems define how to make a decision from a given input state. They do not—and should not—prove three things on their own:</p>
+              <ul class="boundary-list">
+                <li>Whether the input state includes all relevant source-side narrowings.</li>
+                <li>Whether the derived representation in use is the verifiable representation in the publication chain.</li>
+                <li>Whether a re-authorization for the same resource and action is still the same grant.</li>
+              </ul>
+              <p>The paper frames this problem as the transition from <strong>candidate entitlement</strong> to <strong>executable authority</strong>, known as <strong>evidence admission</strong>. It does not replace policy languages or claim to solve consistency for arbitrary policy semantics. It addresses one systems-safety question: when may a candidate match cross the host boundary and become executable authority?</p>
+              <p>This resembles the check–use gap in distributed systems: source-side checks, derived representations, and host use may observe different states. Leases, sequencers, consistency tokens, probabilistic staleness, CRL/OCSP, and OAuth device pending are useful components, but they do not automatically bind freshness to a specific grant and host effect.</p>
+              <p class="inline-note"><strong>The problem is not policy expressiveness; it is the source, representation, and identity of the input state.</strong> Without this layer, even a correct matcher can only make decisions about a potentially stale world.</p>
+            </section>
+
+            <section class="story-section" id="candidate">
+              <p class="section-label">03 <span>Candidates and authority</span></p>
+              <h2>Candidate entitlement is a match result; executable authority is a security decision.</h2>
+              <p>The paper describes the problem with four general concepts: <strong>principal</strong>, who requests an action on a resource within a tenant and authorization scope; <strong>grant</strong>, which carries an origin, tenant, principal, scope, resource, action, validity period, provenance, logical identifier, and revision; <strong>candidate entitlement</strong>, the deterministic match for a request against a given evidence set <code>E</code>; and <strong>executable authority</strong>, the result when a candidate passes final admission. The request context <code>ctx</code> binds the principal, scope, tenant, resource, and action; the evidence set <code>E</code> contains the admission gate, ordered manifest digest, publication watermark, integrity metadata, and effective grant set.</p>
+              <div class="definition-grid">
+                <article class="definition-card">
+                  <p class="definition-kicker">CANDIDATE ENTITLEMENT</p>
+                  <h3>Candidate entitlement</h3>
+                  <p>Within the given evidence set <code>E</code>, this is the first grant selected by deterministic matching in a fixed order that is in scope, time-valid, and returns ALLOW.</p>
+                  <p class="definition-note">It only says that this request “matches” against this evidence.</p>
+                </article>
+                <article class="definition-card definition-card-authority">
+                  <p class="definition-kicker">EXECUTABLE AUTHORITY</p>
+                  <h3>Executable authority</h3>
+                  <p>A candidate becomes executable authority only after final admission validates source-linked evidence, scope, publication identity, and the exact candidate identity during final reload.</p>
+                  <p class="definition-note">It means the host can now safely perform the protected operation.</p>
+                </article>
+              </div>
+              <p>The difference is not “one more cache lookup”; it is an explicit admission contract. A candidate may come from memory, cache, or a strict read, but only a candidate that passes final admission may cross the host boundary.</p>
+              <div class="claim-box"><span class="claim-kicker">Key distinction</span><p>A policy system can correctly answer <code>match(ctx, E)</code>. Evidence admission must also establish that <code>E</code> does not omit a committed narrowing for this scope, that <code>E</code> is the verifiable published representation, and that the admitted candidate is still <code>g₀</code> itself.</p></div>
+            </section>
+
+            <section class="story-section" id="connections">
+              <p class="section-label">04 <span>Five connections</span></p>
+              <h2>Connect a source mutation to the authorization decision at the host.</h2>
+              <p>The paper’s admission contract has five connections. They are not necessarily novel individually, nor claimed to be the minimal mechanism set; their safety value comes from joining them into one verifiable chain.</p>
+              <ol class="connection-list">
+                <li>
+                  <span class="step-number">01</span>
+                  <div><h3>Source transaction</h3><p>A source mutation durably records a delta or outbox, source generation, revoke fence, tenant, and all affected scopes in a short transaction. Network calls, cache pushes, projection, and retries stay outside the transaction.</p></div>
+                </li>
+                <li>
+                  <span class="step-number">02</span>
+                  <div><h3>Publication fencing</h3><p>generation and revoke fence advance monotonically, so an old owner cannot publish after a newer generation. Successful publication is proven by the committed manifest/segment/current pointer—not by an ACK or best-effort cache push.</p></div>
+                </li>
+                <li>
+                  <span class="step-number">03</span>
+                  <div><h3>Unpublished-narrowing probe</h3><p>Before trusting a cached candidate, conservatively check whether this scope has any visible narrowing not yet successfully published to the current watermark. No result means no known blocking narrowing, not that global policy has converged.</p></div>
+                </li>
+                <li>
+                  <span class="step-number">04</span>
+                  <div><h3>Read-observation contract</h3><p>A cached candidate must pass two ordered authoritative observations that agree, or a strict reader must obtain a fresh committed-state read view. The candidate’s own digest must also match the observed publication identity.</p></div>
+                </li>
+                <li>
+                  <span class="step-number">05</span>
+                  <div><h3>Final identity reload</h3><p>Reload evidence before returning to the host, binding the same scope, publication evidence, logical id, revision, origin, and provenance. Matching only resource/action does not prove it is the same grant.</p></div>
+                </li>
+              </ol>
+              <p class="inline-note"><strong>If any connection breaks, local checks may still appear healthy.</strong> That is “local correctness,” explored next: every component may pass its own checks while the system as a whole no longer represents the latest source narrowing.</p>
+            </section>
+
+            <section class="story-section" id="omissions">
+              <p class="section-label">05 <span>Local correctness</span></p>
+              <h2>Keeping just one local check can still admit stale authority.</h2>
+              <p>The paper uses six <strong>analytical omission schedules</strong> to show that removing one connection while retaining the other local checks can leave the system looking healthy while missing a narrowing that should block. These are design analyses, not completed ablation results.</p>
+              <div class="schedule-list">
+                <article class="schedule-row">
+                  <h3>Keep published generation</h3>
+                  <p>A mutation <code>d</code> commits while publication is pending; the cached grant and pointer remain at the old generation and appear consistent when viewed alone.</p>
+                  <span>Required: a source-visible probe for unpublished narrowing.</span>
+                </article>
+                <article class="schedule-row">
+                  <h3>Keep cache token</h3>
+                  <p>Mutation <code>d</code> has committed, but the token has not rotated; an authenticated cache entry still carries the current token.</p>
+                  <span>Required: token equality proves lineage, not source freshness.</span>
+                </article>
+                <article class="schedule-row">
+                  <h3>Keep publication watermark</h3>
+                  <p>A new pointer has been observed, but the host uses <code>g₀</code> without binding the payload and scope to the validated evidence chain.</p>
+                  <span>Required: evidence representation and identity validation.</span>
+                </article>
+                <article class="schedule-row">
+                  <h3>Run only one manifest–predicate pass</h3>
+                  <p>A mutation <code>d</code> commits between the reads of <code>M</code> and <code>b</code>, so the pair of observations combines two different committed states.</p>
+                  <span>Required: two ordered observations that require <code>Q<sub>pre</sub> = Q<sub>post</sub></code>.</span>
+                </article>
+                <article class="schedule-row">
+                  <h3>Keep projection reload</h3>
+                  <p>Both loads are internally valid, but the committed <code>d</code> has still not been published to the current watermark.</p>
+                  <span>Required: run the source-linked probe during final load too.</span>
+                </article>
+                <article class="schedule-row">
+                  <h3>Keep resource/action rematching</h3>
+                  <p>After revocation, re-authorization has the same resource and action, but the successor has a new revision or different provenance.</p>
+                  <span>Required: bind origin, logical id, revision, payload, and publication identity.</span>
+                </article>
+              </div>
+              <p class="inline-note"><strong>These schedules do not prove that an attack has been reproduced.</strong> They illustrate how the connections compose: gaps between local checks are exactly where stale authority can pass. Controlled omission experiments remain a planned evaluation gate.</p>
+            </section>
+
+            <section class="story-section" id="adversary">
+              <p class="section-label">06 <span>Adversary and goals</span></p>
+              <h2>Decision integrity at the admission boundary is what is protected.</h2>
+              <p>The protected asset is not “an unmodified policy file,” but <strong>decision integrity</strong> at the host admission boundary: a request must not execute as ALLOW based on evidence that omits a visible, relevant narrowing.</p>
+              <p>The primary adversary is an authenticated requester. It can replay a still-valid signed request, switch targets, or race a source mutation against an authorization decision. It need not control trusted storage; it can exploit ordinary asynchronous behavior—projection delay, residual cache entries, worker scheduling, expired leases, and infrastructure failures.</p>
+              <p>The system also protects tenant and scope isolation, candidate provenance, and monotonicity of the publication evidence used to prove decisions. Trust assumptions: Gateway performs external authentication and signs the identity context; the authoritative store, readers, projector, and integrity keys are not Byzantine; each evaluated aggregate has one source writer; and all protected operations receive complete host mediation.</p>
+              <h3 class="subhead">Five security goals</h3>
+              <ol class="connection-list goal-list">
+                <li><span class="step-number">G1</span><div><h3>Revocation admission</h3><p>A candidate becomes executable authority only if all relevant revocation-class changes committed before the final authoritative observation have been published and represented in final evidence; unpublished narrowing can only result in PENDING or DENY.</p></div></li>
+                <li><span class="step-number">G2</span><div><h3>Publication ownership</h3><p>source generation, revoke fence, and publication pointer advance monotonically; a stale worker cannot complete a newer owner’s publication, and a durable event has only one terminal transition.</p></div></li>
+                <li><span class="step-number">G3</span><div><h3>Scope isolation</h3><p>Matching and admission always bind the request’s principal, tenant, scope, resource, and action; replay or context switching cannot broaden these fields.</p></div></li>
+                <li><span class="step-number">G4</span><div><h3>Evidence identity</h3><p>Admitted evidence must identify the candidate’s origin, logical id, revision, provenance, ordered manifest chain, and integrity metadata; a successor with the same resource/action cannot replace the original candidate.</p></div></li>
+                <li><span class="step-number">G5</span><div><h3>Fail-closed uncertainty</h3><p>Missing, changing, malformed, unavailable, or unverifiable evidence cannot produce ALLOW. PENDING is an explicit non-admission result, not a retry or availability promise.</p></div></li>
+              </ol>
+              <p class="inline-note"><strong>Out-of-scope cases are also part of the problem definition:</strong> Byzantine processes, direct compromise of MySQL/RabbitMQ, compromise of the in-process hub, active interception of trusted-node traffic, malicious or multiple writers, replica divergence, compromised keys, unbounded clock skew, and atomicity of subsequent business effects are out of scope. The theorem is a grant-specific admission contract, not a claim of “complete security against any attacker.”</p>
+            </section>
+
+            <section class="story-section" id="source-publication">
+              <p class="section-label">07 <span>Source and publication</span></p>
+              <h2>First make a mutation publishable fact; then make publication verifiable fact.</h2>
+              <h3 class="subhead">The short transaction records source facts only</h3>
+              <p>Commit the source mutation together with the durable delta/outbox, source generation, revoke fence, tenant, all affected scopes, and audit correlation. Keep the transaction short: no network calls, cache pushes, projection work, retries, or validation.</p>
+              <h3 class="subhead">Fenced publication accepts only committed evidence</h3>
+              <p>A supervised projector claims a delta with a compare-and-set lease and generation fence, applies only the approved mutation, validates the resulting immutable segment, and advances the pointer to a committed manifest. The manifest’s ordered digest carries the successful watermark. An older owner cannot publish after a newer generation wins; reconcile unknown worker outcomes before deciding whether to retry.</p>
+              <p>The representation is content-addressed and scope-aware: the manifest digest records the aggregate, generation, revoke fence, and segment chain; each effective grant carries a logical id, revision, scope, validity period, and provenance. Structural sharing in the persistent HAMT reduces unnecessary rebuilding, but it is a performance optimization subordinate to evidence identity—a shared segment that has not changed cannot conceal a changed card binding or fence.</p>
+              <p class="inline-note"><strong>An ACK is not publication proof.</strong> A broker confirm, cache push, queue receipt, or completed handler alone cannot prove that authorization state was successfully published.</p>
+            </section>
+
+            <section class="story-section" id="narrowing">
+              <p class="section-label">08 <span>Omission detection</span></p>
+              <h2>Block unpublished narrowing, not ordinary additions.</h2>
+              <p>Here, <strong>narrowing</strong> means removal, revocation, an authorization-content update conservatively marked as invalidating, or a mutation carrying a higher revoke fence. A true aggregate-wide mutation is represented for each affected scope; removal from a shared rule set expands into per-scope contributions.</p>
+              <p>Before trusting a cached candidate, the reader asks a conservative question:</p>
+              <div class="claim-box"><span class="claim-kicker">THE NARROWING PROBE</span><p>Is there any visible narrowing for this scope that has not yet been successfully published to the current watermark?</p></div>
+              <p>The predicate includes pending, invalid, quarantined, or fence-leading deltas. No result does not mean “all possible policy changes have globally converged”; it means only that no blocking narrowing is known under this scope’s source/publication contract.</p>
+              <p>This asymmetry is deliberate. If an addition is not yet in evidence, the new permission is delayed. If a narrowing is not yet in evidence, an already-matched grant remains executable after source revocation. The former can wait for normal publication; the latter must be blocked. This is a security choice, not a claim that “other cards are completely unaffected.”</p>
+              <p class="inline-note"><strong>Not all delays are equivalent.</strong> ADD delay affects availability; NARROWING delay affects authorization correctness. The admission contract adds a blocking condition only for the latter.</p>
+            </section>
+
+            <section class="story-section" id="readers">
+              <p class="section-label">09 <span>Read paths</span></p>
+              <h2>The cache branch requires two ordered observations; the strict branch requires a fresh read view.</h2>
+              <h3 class="subhead">Cached candidate</h3>
+              <p>A cached candidate includes tenant and scope, evidence gate, ordered manifest digest, generation and revoke fence, content hash, integrity tag, cache-generation token, validity period, and the full effective-grant set. L1 has capacity and time bounds; L2 entries are authenticated and expire. Cache failure, an invalid tag, epoch mismatch, or a changed validity window sends the request to the strict reader.</p>
+              <h3 class="subhead">Two ordered observations</h3>
+              <p>The cache reader performs two authoritative observations, each made up of independent pool-level autocommit statements:</p>
+              <ol class="inline-sequence">
+                <li><code>m<sub>0</sub></code> reads the ordered manifest digest <code>M<sub>0</sub></code>; <code>p<sub>0</sub></code> reads the unpublished-narrowing predicate <code>b<sub>0</sub></code>.</li>
+                <li>Read <code>m<sub>1</sub></code> and <code>p<sub>1</sub></code> again, requiring the observation order <code>m<sub>0</sub> → p<sub>0</sub> → m<sub>1</sub> → p<sub>1</sub></code>.</li>
+                <li>The candidate must satisfy <code>Q<sub>pre</sub> = Q<sub>post</sub></code> and <code>b<sub>0</sub> = b<sub>1</sub> = 0</code>, and its own digest must match the observed publication identity.</li>
+              </ol>
+              <p>These four statements do not form one atomic SQL snapshot. A mutation may commit after <code>m<sub>1</sub></code> and before <code>p<sub>1</sub></code> without changing the sampled <code>M</code> value. Therefore, the theorem covers only narrowings committed before the first authoritative observation <code>m<sub>0</sub></code>, not every event before <code>p<sub>1</sub></code>.</p>
+              <h3 class="subhead">Strict read</h3>
+              <p>The strict reader starts a new transaction and reads the narrowing predicate first as a consistent read; it then obtains the current pointer and manifest, validates scope, segment order, and the hash chain, and rejects inconsistent or stale chains. The proof relies on this fresh committed-state read view, not on an isolation-level claim without a frozen experimental archive.</p>
+              <p class="inline-note"><strong>A cache hit is not authorization evidence.</strong> TTL, token, and hit describe residency and lineage only; source-linked observation must prove source freshness.</p>
+            </section>
+
+            <section class="story-section" id="final-reload">
+              <p class="section-label">10 <span>Final reload</span></p>
+              <h2>A matched g₀ is not authority; final reload must prove again that it is the same grant.</h2>
+              <p>Matching <code>E<sub>0</sub></code> produces a candidate, not authority. The decision path reloads evidence to obtain <code>E<sub>1</sub></code>, then verifies it against the request’s tenant, scope, gate, ordered manifest digest, generation, fence, integrity metadata, and exact canonical grant.</p>
+              <p>The exact check includes more than resource and action: it also checks the grant’s origin, logical id, revision, and provenance. A logical identifier may be reused after a tombstone, but a revision is never reassigned to another record.</p>
+              <h3 class="subhead">Why resource/action are not enough</h3>
+              <p>Re-authorization after revocation may have the same resource and action but a successor revision. If matching uses only resource/action, the successor can “pick up” the old candidate and appear valid, even though its origin, revision, or provenance differs. Final reload must reject this substitution.</p>
+              <h3 class="subhead">host fence</h3>
+              <p>The host captures an opaque authority fence before resource ownership and evaluation, then compares the original fence after auxiliary authoritative reads and before entering the downstream handler. A cold refill that invalidates the original fence cannot silently become a new request baseline; reject that request and reevaluate subsequent requests. This is admission mediation, not atomicity for later handler effects.</p>
+              <p class="inline-note"><strong>Final reload is not “one more lookup.”</strong> It must prove that publication identity, scope, and candidate identity did not drift during the decision.</p>
+            </section>
+
+            <section class="story-section" id="failure-semantics">
+              <p class="section-label">11 <span>Failure semantics</span></p>
+              <h2>On failure, there are only two safe outcomes: PENDING or DENY.</h2>
+              <p>The only success is ALLOW after the stable check. No match or invalid context returns <code>DEFAULT_DENY</code>; if evidence is not ready, is changing, missing, malformed, or unverifiable, return <code>AUTHORIZATION_PENDING</code> or <code>DEFAULT_DENY</code>.</p>
+              <ul class="boundary-list">
+                <li>No match or invalid context: <code>DEFAULT_DENY</code>.</li>
+                <li>Evidence missing, stale, changing, or unverifiable: <code>PENDING</code> or <code>DENY</code>; never fall back to a stale ALLOW.</li>
+                <li>PENDING cannot be cached as authority, used to admit a later request, or replaced with a previous ALLOW.</li>
+                <li>The current API does not promise a universal retry interval; callers must apply their own bounded policy.</li>
+                <li>A business-level PENDING does not advance the infrastructure circuit breaker.</li>
+              </ul>
+              <p>The current compatibility entry point maps both DENY and PENDING to HTTP 403 while preserving the semantic reason code; integration mapping or policy denial uses 403, identity/session failure uses 401, and pending or unavailable evidence may use 503. Transport status does not replace the semantic decision; experiments must record the actual decision and host outcome.</p>
+              <p class="inline-note"><strong>PENDING does not mean “it will be allowed automatically later.”</strong> It explicitly means the evidence is insufficient and the protected effect must not run; the availability cost is part of this contract.</p>
+            </section>
+
+            <section class="story-section" id="request-lifecycle">
+              <p class="section-label">12 <span>Request lifecycle</span></p>
+              <h2>Matching is fast; round trips take the time.</h2>
+              <p class="lead">A signed request passes through connection handling, identity, evidence reads, matching, and final reload. Comparing each stage with existing benchmarks makes the bottleneck clear: compiled matching is a tiny fraction of the cost; most time goes to networking, identity/session, and evidence I/O.</p>
+              <ol class="request-flow">
+                <li><span class="step-number">01</span><div><h3>Ingress and HTTP</h3><p>Connection admission, HTTP parsing, and signed-header validation; cross-process requests incur their first network and queueing costs here.</p><span class="flow-domain">NETWORK</span></div></li>
+                <li><span class="step-number">02</span><div><h3>Identity and context</h3><p>JWT / session, dual-card binding, tenant, scope, and principal validation; requires session or identity-mapping reads.</p><span class="flow-domain">CPU + I/O</span></div></li>
+                <li><span class="step-number">03</span><div><h3>Candidate evidence load</h3><p>An in-memory hub hit, or a strict refill reading the current pointer, manifest, segment, and pending predicate.</p><span class="flow-domain">I/O / CACHE</span></div></li>
+                <li><span class="step-number">04</span><div><h3>Compiled matching</h3><p>The compiled kernel selects a candidate from a stable grant set; this is the part measured by the 0.10–0.47µs microbenchmark.</p><span class="flow-domain">CPU</span></div></li>
+                <li><span class="step-number">05</span><div><h3>Final reload and host fence</h3><p>Reload evidence and recheck the exact grant and publication identity; auxiliary reads and fence comparison remain on the I/O path.</p><span class="flow-domain">I/O</span></div></li>
+                <li><span class="step-number">06</span><div><h3>Response and post-commit work</h3><p>Serialization, HTTP response, and post-commit audit/outbox; asynchronous audit may not be on the request’s critical path.</p><span class="flow-domain">NETWORK / I/O</span></div></li>
+              </ol>
+              <div class="request-cost">
+                <h3>p50 across measurement points</h3>
+                <div class="cost-table" role="table" aria-label="Request-path p50 comparison">
+                  <div class="cost-row cost-head" role="row"><span role="columnheader">Measurement</span><span role="columnheader">p50</span><span role="columnheader">Relative to kernel</span></div>
+                  <div class="cost-row" role="row"><span role="cell">compiled kernel</span><strong role="cell">0.205 µs</strong><span role="cell">1×</span></div>
+                  <div class="cost-row" role="row"><span role="cell">native composite · c=1</span><strong role="cell">411 µs</strong><span role="cell">≈2,000×</span></div>
+                  <div class="cost-row" role="row"><span role="cell">native composite · c=64</span><strong role="cell">4,663 µs</strong><span role="cell">≈22,700×</span></div>
+                  <div class="cost-row" role="row"><span role="cell">historical signed · 1 thread</span><strong role="cell">16.29 ms</strong><span role="cell">≈79,000×</span></div>
+                  <div class="cost-row" role="row"><span role="cell">historical signed · 8 threads</span><strong role="cell">17.18 ms</strong><span role="cell">≈83,800×</span></div>
+                </div>
+                <p class="proof-caveat">The compiled kernel measures matching only; native composite includes HMAC, Gateway, TrustGraph, and a real DB; historical signed requests include identity/permission checks and evidence reads. These are different deployments, so ratios indicate scale, not an end-to-end breakdown.</p>
+              </div>
+              <p class="inline-note"><strong>Bottleneck evidence:</strong> Historical cold/hot decision medians were 18.83 / 18.19ms, a difference of just 0.64ms; native mysql/req fell from 4.0 at c=1 to 1.1 at c=64; c=512 hit the connection-admission limit (9.53M transport errors, only 533 successes). Together, these signals point to networking and evidence I/O, not the matching kernel.</p>
+            </section>
+
+            <section class="story-section" id="guarantee">
+              <p class="section-label">13 <span>Conditional guarantee</span></p>
+              <h2>A conditional safety guarantee for a specific grant, under stated assumptions.</h2>
+              <p>Under the source, publication, storage-integrity, read-observation, and host-mediation assumptions above, the paper states a conditional theorem. It is neither a global snapshot of all policy changes nor a machine-checked proof of a deployment.</p>
+              <h3 class="subhead">Five assumptions</h3>
+              <ul class="lemma-list">
+                <li><strong>M1 Source capture:</strong> Each relevant source mutation atomically records the durable delta/outbox, source generation, revoke fence, tenant, and all affected scopes; narrowing classification is conservative.</li>
+                <li><strong>M2 Monotonic publication:</strong> Successful publication atomically records a strictly advancing affected-scope watermark and pointer; the digest never rolls back or gets reused for another state.</li>
+                <li><strong>M3 Faithful representation:</strong> The projector materializes only approved deltas as ordered, integrity-checked evidence; every contribution covered by publication must remain represented by its watermark.</li>
+                <li><strong>M4 Trusted storage and processes:</strong> The authoritative writer, readers, projector, and integrity keys are not Byzantine; mismatches, missing records, and unknown outcomes all fail closed.</li>
+                <li><strong>M5 Complete mediation:</strong> Every protected host operation invokes the evaluator with a bound context and proceeds only after ALLOW.</li>
+              </ul>
+              <p>In addition to M1–M5, the reader’s two observation contracts and the grant revision ledger are assumptions: see Sections 09 and 10, respectively.</p>
+              <div class="claim-box claim-theorem">
+                <span class="claim-kicker">CONDITIONAL ADMISSION-SAFETY</span>
+                <p>Under M1–M5, the read-observation contract, and the grant revision ledger contract, every successful ALLOW has a consistency point <code>t* = t<sub>f</sub></code>: all revocation-class changes committed before <code>t<sub>f</sub></code> and visible to the request scope have been successfully published and are represented by final evidence <code>E<sub>1</sub></code>; <code>E<sub>1</sub></code> must also bind the exact admitted candidate grant. If this condition cannot be established, the result can only be PENDING or DENY.</p>
+              </div>
+              <h3 class="subhead">Where is the consistency point?</h3>
+              <p><code>t<sub>f</sub></code> is the first authoritative observation that provides successful final evidence: the cache branch uses <code>m<sub>0</sub></code>; the strict-read branch uses the initial predicate read view. Identity stability is checked at <code>t<sub>v</sub></code>, and ALLOW is returned to the host at <code>t<sub>a</sub></code>, so <code>t<sub>f</sub> ≤ t<sub>v</sub> ≤ t<sub>a</sub></code>.</p>
+              <h3 class="subhead">Four supporting lemmas</h3>
+              <ul class="lemma-list">
+                <li><strong>Visibility capture:</strong> A visible narrowing committed before a fresh predicate read either makes <code>b = 1</code> or has already been successfully published.</li>
+                <li><strong>Cache observation and representation:</strong> A cached candidate that passes two ordered observations and the equality check represents every visible revocation-class change committed before the <code>m<sub>0</sub></code> observation.</li>
+                <li><strong>Strict observation and representation:</strong> A successful strict load represents every visible revocation-class change committed before its initial predicate read view.</li>
+                <li><strong>Candidate identity binding:</strong> A different grant revision cannot replace the original candidate while passing the stable check.</li>
+              </ul>
+              <h3 class="subhead">What the theorem does not cover</h3>
+              <ul class="boundary-list">
+                <li>Overlapping mutations committed within <code>[t<sub>f</sub>, t<sub>a</sub>]</code>.</li>
+                <li>Atomicity of subsequent business effects; that requires a host transaction or effect fence.</li>
+                <li>Visibility of ADD, Byzantine storage, multi-writer ordering, and replica divergence.</li>
+                <li>Unbounded clock skew, global policy linearizability, and combining semantics for richer policy languages.</li>
+              </ul>
+              <p class="inline-note"><strong>This is a sufficient conditional contract.</strong> It connects “visible pre-observation revocation” to “the exact admitted grant,” while stating the availability cost and out-of-scope cases alongside the result.</p>
+            </section>
+
+            <section class="story-section" id="evidence">
+              <p class="section-label">14 <span>Evaluation overview</span></p>
+              <h2>From frozen baseline to current implementation.</h2>
+              <p>The historical baseline validated revocation propagation and race behavior; the current implementation covers native lifecycle, transport, and multi-tenant assumption tests.</p>
+              <div class="evidence-list">
+                <article class="evidence-row">
+                  <div><p class="evidence-status">BASELINE</p><h3>Frozen three-process historical baseline</h3></div>
+                  <div><p>Three TrustGraph processes shared MySQL, Redis, and RabbitMQ; all 11/11 planned steps passed, with 270 PASS, 0 FAIL, and 3 N/A. The diagnostic race recorded 30 cycles, 12 readers, and 37,413 samples: 0 post-ack stale or in-flight ALLOW, 669 PENDING; mean propagation was about 572.6ms and mean revocation about 585.2ms.</p></div>
+                </article>
+                <article class="evidence-row">
+                  <div><p class="evidence-status">REGISTERED</p><h3>Current native implementation and tests</h3></div>
+                  <div><p>Covers offline compiler/policy/hub tests, a MySQL-backed native lifecycle, standalone MySQL/RabbitMQ transport, and assumption suites for hub, writer-lock, identity-mapping, Redis-free, and related cases.</p></div>
+                </article>
+              </div>
+              <a class="article-link" href="validation.en.html">View complete validation data and test evidence <span aria-hidden="true">↗</span></a>
+            </section>
+
+            <section class="story-section next-steps" id="explore">
+              <p class="section-label">15 <span>Explore further</span></p>
+              <h2>Start with the problem definition and return to the evidence.</h2>
+              <p>Sections 01–14 summarize the paper draft’s problem definition, design contract, request lifecycle, and conditional guarantee. See the adjacent panels for the project vision, system roles, and status. Conclusions draw on code, repeatable tests, and the paper’s design.</p>
+              <ul class="resource-list">
+                <li><a href="https://github.com/CoreryBlack/AstralLight.Next" target="_blank" rel="noreferrer">Browse the Rust repository <span aria-hidden="true">↗</span></a></li>
+                <li><a href="https://github.com/CoreryBlack/AstralLight.Next/tree/main/Docs/&#x67B6;&#x6784;/Rust&#x67B6;&#x6784;&#x8BBE;&#x8BA1;" target="_blank" rel="noreferrer">Read the architecture design <span aria-hidden="true">↗</span></a></li>
+                <li><a href="https://github.com/CoreryBlack/AstralLight.Next/tree/main/Docs/&#x793E;&#x533A;&#x6587;&#x7AE0;" target="_blank" rel="noreferrer">Read implementation articles <span aria-hidden="true">↗</span></a></li>
+                <li><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/CONTRIBUTING.md" target="_blank" rel="noreferrer">View contribution guide and license <span aria-hidden="true">↗</span></a></li>
+              </ul>
+            </section>
+            <nav class="panel-pager" aria-label="Panel navigation">
+              <a href="#panel-vision"><span aria-hidden="true">←</span> Previous · Vision</a>
+              <a href="#panel-reserves">Next · Reserves <span aria-hidden="true">→</span></a>
+            </nav>
+          </div>
+        </div>
+              </section>
+              <section class="deck-panel deck-reserves" id="panel-reserves" role="tabpanel" aria-labelledby="tab-reserves">
+                <div class="reserves-wrap">
+                  <p class="section-label">Reserves <span>TECHNOLOGY RESERVES</span></p>
+                  <h2>See the actual technology reserves by maturity.</h2>
+                  <p class="reserves-lead">Representative items from the capabilities list, grouped as implemented, partially implemented, and planned.</p>
+                  <div class="reserve-columns">
+                    <section class="reserve-column">
+                      <div class="reserve-column-head"><h3>Implemented</h3><span class="reserve-count">List: complete</span></div>
+                      <p class="reserve-source">Core capabilities integrated into the source.</p>
+                      <ul class="reserve-list">
+                        <li><strong>Generation / Fence version consistency</strong><span>Monotonic generation/fence advancement with CAS protection.</span></li>
+                        <li><strong>Fail-Closed decision invariant</strong><span>The strict reader rejects ALLOW when evidence is missing or invalid; it never falls back to a stale snapshot or raw source.</span></li>
+                        <li><strong>Dual-card token identity credentials</strong><span>PlatformUser has dual-card context; AppUser is identity-only.</span></li>
+                        <li><strong>Bounded snapshots and warm-hint validation</strong><span>Capture, pending deltas, and file size are bounded; loading revalidates the durable pointer and pending state.</span></li>
+                        <li><strong>MFA replay protection / Refresh-token rotation</strong><span>Encrypted TOTP storage, hashed recovery codes, monotonic counter; tokens bind to session/family/epoch.</span></li>
+                        <li><strong>Migration preflight gate</strong><span>Target/schema preflight, migration lock, checksum, and contract checks.</span></li>
+                      </ul>
+                    </section>
+                    <section class="reserve-column">
+                      <div class="reserve-column-head"><h3>Partially implemented</h3><span class="reserve-count">List: partial</span></div>
+                      <p class="reserve-source">Some mechanisms are already in place.</p>
+                      <ul class="reserve-list">
+                        <li><strong>Partitioned projector / parallel workers</strong><span>TenantSerial and explicitly enabled Partitioned mode.</span></li>
+                        <li><strong>Cross-region signed voting and durable receipts</strong><span>Ed25519 signature verification, replay reservation, and dual-region apply receipts.</span></li>
+                        <li><strong>ORG_SCOPE typed governance and publication chain</strong><span>repository, outbox, compile, membership, mask, and publish flow.</span></li>
+                        <li><strong>In-memory authoritative read surface + source fence</strong><span>hub, source guard, lease, and token rechecks.</span></li>
+                        <li><strong>Canonical projection migration and traffic cutover</strong><span>Projector, archive, and strict-reader wiring.</span></li>
+                        <li><strong>AL-native outbox / IN_DOUBT</strong><span>Ordering scope, lease, and reconciliation logic.</span></li>
+                      </ul>
+                    </section>
+                    <section class="reserve-column">
+                      <div class="reserve-column-head"><h3>Planned</h3><span class="reserve-count">List: design reserve</span></div>
+                      <p class="reserve-source">In design or on the roadmap.</p>
+                      <ul class="reserve-list">
+                        <li><strong>Mobius approval orchestration</strong><span>Emergency templates, temporary-authorization lifecycles, tiered notifications, and automatic expiry.</span></li>
+                        <li><strong>Klein cross-system integration</strong><span>Non-invasive sidecar/proxy, integration of existing permissions, and a unified view.</span></li>
+                        <li><strong>Dual-channel redundant delivery across multiple hosts</strong><span>Independent brokers, operation-level atomic claims, and consumer idempotency.</span></li>
+                        <li><strong>Large-card in-memory mirror + FactoredHotState</strong><span>Assembly cache, scale guardrails, shared segments, and operation/event pooling.</span></li>
+                        <li><strong>Governance and migration extensions</strong><span>ORG_SCOPE Phase 2, Gateway A–F decoupling, lifecycle governance, and migration candidates.</span></li>
+                      </ul>
+                    </section>
+                  </div>
+                  <a class="article-link" href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/&#x6280;&#x672F;&#x80FD;&#x529B;&#x4E0E;&#x50A8;&#x5907;&#x6E05;&#x5355;.md" target="_blank" rel="noreferrer">View the 54-item technology capabilities list <span aria-hidden="true">↗</span></a>
+                  <nav class="panel-pager" aria-label="Panel navigation">
+                    <a href="#panel-problem"><span aria-hidden="true">←</span> Previous · Problem</a>
+                    <a href="#panel-community">Next · Contribute <span aria-hidden="true">→</span></a>
+                  </nav>
+                </div>
+              </section>
+              <section class="deck-panel deck-community" id="panel-community" role="tabpanel" aria-labelledby="tab-community">
+                <div class="community-wrap" id="community">
+                  <p class="section-label">Contribute <span>OPEN SOURCE</span></p>
+                  <h2>Help more people validate it.</h2>
+                  <p class="community-lead">We welcome more maintainers to work on code, tests, and documentation; experts to contribute security reviews, formal verification, and architecture guidance; and partners to advance real-world pilots.</p>
+                  <div class="work-grid">
+                    <article><span class="work-index">01</span><h3>Maintainers</h3><p>PRs of any size are welcome, from documentation and tests to core code.</p></article>
+                    <article><span class="work-index">02</span><h3>Expert review</h3><p>Security reviews, formal verification, and protocol and architecture reviews; independent challenges to current assumptions are welcome.</p></article>
+                    <article><span class="work-index">03</span><h3>Partners</h3><p>Real-world pilots, system integration, joint research, and deployment evaluation.</p></article>
+                  </div>
+                  <div class="community-actions">
+                    <a class="article-link" href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/CONTRIBUTING.md" target="_blank" rel="noreferrer">Read the contribution guide <span aria-hidden="true">↗</span></a>
+                    <a class="article-link" href="https://github.com/CoreryBlack/AstralLight.Next/issues" target="_blank" rel="noreferrer">Open an issue or propose a collaboration <span aria-hidden="true">↗</span></a>
+                    <a class="article-link" href="mailto:3095506226@qq.com">Author contact: 3095506226@qq.com <span aria-hidden="true">↗</span></a>
+                  </div>
+                  <nav class="panel-pager" aria-label="Panel navigation">
+                    <a href="#panel-reserves"><span aria-hidden="true">←</span> Previous · Reserves</a>
+                  </nav>
+                </div>
+              </section>
+            </div>
+          </div>
+        </section>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <a class="brand footer-brand" href="index.en.html"><img class="brand-mark" src="assets/astral-mark.png" alt="" width="24" height="24">AstralLight<span class="brand-period">.</span><span class="brand-next">Next</span></a>
+      <span>A policy decision engine for distributed trust.</span>
+      <div class="footer-links"><a href="validation.en.html">Validation data</a><a href="#community">Contribute</a><a href="index.html" hreflang="zh-Hans-CN" lang="zh-Hans-CN">中文</a><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/LICENSE" target="_blank" rel="noreferrer">AGPL-3.0-or-later</a><a href="#top">Back to top ↑</a></div>
+    </footer>
+    <button class="back-to-top" type="button" aria-label="Back to top">↑</button>
+    <script src="site.js" defer></script>
+  </body>
+</html>

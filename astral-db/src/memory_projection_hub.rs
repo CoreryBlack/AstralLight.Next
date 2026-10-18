@@ -2076,6 +2076,7 @@ where
 #[cfg(test)]
 mod tests {
     mod assembly_cache;
+    mod evaluate_performance;
     mod performance;
 
     use super::*;

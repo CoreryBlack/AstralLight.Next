@@ -40,6 +40,10 @@ hex = { workspace = true }
 tokio = { workspace = true }
 astral-common = { path = "../astral-common" }
 
+[[test]]
+name = "local_message_stress"
+path = "tests/local_message_stress.rs"
+
 # 真 Redis 集成测试仅在显式 redis-compat feature 下编译（环境门禁语义不变：
 # 未设置 REDIS_URL 时测试内部显式 [SKIP]，不得由 exit 0 折算 PASS）。
 [[test]]

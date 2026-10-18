@@ -183,6 +183,52 @@ transport and Redis to compatibility. Docker, ignored integration, remote-node a
 live fault scenarios require their own approved environment and remain `BLOCKED`
 until independently reconciled.
 
+## Complete policy evaluation benefit
+
+`policy-evaluate-benefit` measures the actual production `PolicyEngine.evaluate()`
+call through the returned `PolicyDecision`, not only a hub read. Its strict local
+adapter checks fixture PLATFORM_USER identity/card/tenant/domain, uses a classified
+same-tenant target and an explicit Unmanaged ORG port, then calls the actual hub.
+The published evidence port remains owned: Arc reuse is internal to assembly caching,
+not an Arc evidence/decision API through the engine. The normal validation, matching,
+mandatory ALLOW final reload, statistics and circuit-breaker work remain enabled.
+
+Freeze all 45 cases before execution: grant sizes 1/8/128/512/2048, threads 1/4/8,
+and first/last matching ALLOW plus nonmatching DEFAULT_DENY. Each case has 18 paired
+batches, rotating all six permutations of fixed-second cache hits, unique-second
+forced assembly and real production-clock reads three times. Perpetual scoped grants
+keep synthetic clock changes decision-equivalent. Forced assembly retains production
+miss/refill costs, not an invented no-cache implementation. Actual cache TTL remains
+active: the ideal warm arm must prove every read hit, and the production-clock arm
+records its observed hit fraction. Every arm shares the same engine and published
+maps while its assembly store is independent; no legacy/raw fallback is permitted.
+
+Before measurement, execute owned evidence/decision parity, two-read ALLOW, one-read
+DENY/PENDING, cross-second expiry and final-revoke controls. The optimized matrix
+must contain complete `EVALUATE_PERF_META`, 45 `EVALUATE_PERF_CASE` records and one
+`EVALUATE_PERF_END` terminal record. Acceptance checks exact topology, balanced orders,
+per-decision positive ns, wall ns, fixture calls, read scope/grant/cache counts,
+initial/final port timing, correct decisions, and joined workers. Missing/filtered,
+debug, duplicate or malformed evidence is FAIL; interruption remains UNKNOWN.
+
+Preserve the raw observations in the canonical campaign result. Calculate pooled
+p50/p99, median batch throughput, paired mean-decision-time and throughput ratios,
+and reproducible bootstrap intervals over paired batches. These intervals are
+exploratory, unadjusted across cases and conditional on one machine/run; PASS
+certifies correct complete collection even when there is no measured improvement.
+Latency excludes post-return assertions/destruction; throughput includes wake,
+result verification/storage/destruction and joins, but excludes runtime/thread
+construction and prewarm. Separate those units from repository phase timings.
+
+No MySQL identity/eligibility or managed ORG queries, signature validation, HTTP
+transport, durable audit delivery, SDK mapping, business admission, allocation
+counts or deployed service capacity are inferred. Results and limitations are
+recorded with source/tool/profile hashes and command artifacts; earlier hub-only
+measurements cannot establish this complete-evaluation benefit. A bounded measured
+example and its canonical run identifiers are in the
+[complete-evaluation record](../实验/基准测试/policy-evaluate-benefit-20261010.md);
+the protocol registry remains distinct from that run's acceptance state.
+
 Metrics record low-cardinality phases and result enums only. Identity, secrets, raw
 paths, SQL/Redis keys, exception text, and request/operation correlation stay out of
 Prometheus labels. A reducer `PASS` means only that its input boundaries are complete,

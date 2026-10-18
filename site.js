@@ -37,20 +37,14 @@
     let width = 0;
     let height = 0;
     let particles = [];
+    let bucketData = [];
+    let bucketCounts = new Uint32Array(6);
     let running = false;
     let visible = true;
     let animationId = 0;
     let elapsed = 0;
     let lastFrame = 0;
     let lastDraw = 0;
-
-    const project = (x, y, z, yaw, tilt, scale, cx, cy) => {
-      const yawedX = x * Math.cos(yaw) - z * Math.sin(yaw);
-      const yawedZ = x * Math.sin(yaw) + z * Math.cos(yaw);
-      const tiltedY = y * Math.cos(tilt) - yawedZ * Math.sin(tilt);
-      const depth = y * Math.sin(tilt) + yawedZ * Math.cos(tilt);
-      return [cx + yawedX * scale, cy - tiltedY * scale, depth];
-    };
 
     const buildParticles = () => {
       const count = Math.max(3600, Math.min(22000, Math.round((width * height) / 12)));
@@ -67,9 +61,10 @@
           speed: core ? 0.00013 : 0.000055 + Math.random() * 0.00006,
           size: core ? 1.1 + Math.random() * 0.7 : 0.6 + Math.random() * 0.95,
           alpha: core ? 0.5 + Math.random() * 0.28 : 0.16 + Math.random() * 0.32,
-          phase: Math.random() * TAU,
         };
       });
+      bucketData = Array.from({ length: 6 }, () => new Float32Array(count * 3));
+      bucketCounts = new Uint32Array(6);
     };
 
     const draw = (time) => {
@@ -78,44 +73,74 @@
       const cy = height / 2;
       const yaw = 0.35 + Math.sin(time * 0.00012) * 0.07;
       const tilt = 0.42;
+      const cosYaw = Math.cos(yaw);
+      const sinYaw = Math.sin(yaw);
+      const cosTilt = Math.cos(tilt);
+      const sinTilt = Math.sin(tilt);
       const scale = Math.min(width / 2.05, height / 1.65);
+      const pulse = 0.93 + Math.sin(time * 0.0012) * 0.07;
 
       context.beginPath();
       for (let i = 0; i <= 160; i += 1) {
         const t = (i / 160) * TAU;
-        const [x, y] = project(Math.sin(t), 0.55 * Math.sin(2 * t), 0.34 * Math.cos(t), yaw, tilt, scale, cx, cy);
-        if (i === 0) context.moveTo(x, y);
-        else context.lineTo(x, y);
+        const sinT = Math.sin(t);
+        const cosT = Math.cos(t);
+        const x = sinT;
+        const y = 0.55 * (2 * sinT * cosT);
+        const z = 0.34 * cosT;
+        const yawedX = x * cosYaw - z * sinYaw;
+        const yawedZ = x * sinYaw + z * cosYaw;
+        const tiltedY = y * cosTilt - yawedZ * sinTilt;
+        const px = cx + yawedX * scale;
+        const py = cy - tiltedY * scale;
+        if (i === 0) context.moveTo(px, py);
+        else context.lineTo(px, py);
       }
       context.globalCompositeOperation = 'source-over';
       context.strokeStyle = 'rgba(255, 255, 255, .16)';
       context.lineWidth = 1;
       context.stroke();
 
-      const buckets = [[], [], [], [], [], []];
+      bucketCounts.fill(0);
       for (const particle of particles) {
         const t = particle.t + time * particle.speed;
-        const x = Math.sin(t) + particle.ox;
-        const y = 0.55 * Math.sin(2 * t) + particle.oy;
-        const z = 0.34 * Math.cos(t) + particle.oz;
-        const [px, py, depth] = project(x, y, z, yaw, tilt, scale, cx, cy);
+        const sinT = Math.sin(t);
+        const cosT = Math.cos(t);
+        const x = sinT + particle.ox;
+        const y = 0.55 * (2 * sinT * cosT) + particle.oy;
+        const z = 0.34 * cosT + particle.oz;
+        const yawedX = x * cosYaw - z * sinYaw;
+        const yawedZ = x * sinYaw + z * cosYaw;
+        const tiltedY = y * cosTilt - yawedZ * sinTilt;
+        const depth = y * sinTilt + yawedZ * cosTilt;
+        const px = cx + yawedX * scale;
+        const py = cy - tiltedY * scale;
         const depthLight = Math.max(0, Math.min(1, (depth + 0.55) / 1.1));
-        const twinkle = 0.82 + Math.sin(time * 0.0012 + particle.phase) * 0.18;
-        const alpha = Math.max(0.05, Math.min(0.95, particle.alpha * (0.42 + depthLight * 0.58) * twinkle));
+        const alpha = Math.max(0.05, Math.min(0.95, particle.alpha * (0.42 + depthLight * 0.58) * pulse));
         const size = particle.size * (0.72 + depthLight * 0.55);
         const bucket = Math.min(5, Math.floor(alpha * 6));
-        buckets[bucket].push([px, py, size]);
+        const buffer = bucketData[bucket];
+        const offset = bucketCounts[bucket];
+        buffer[offset] = px;
+        buffer[offset + 1] = py;
+        buffer[offset + 2] = size;
+        bucketCounts[bucket] = offset + 3;
       }
 
       context.globalCompositeOperation = 'lighter';
       context.fillStyle = '#ffffff';
-      buckets.forEach((bucket, index) => {
-        if (!bucket.length) return;
+      for (let index = 0; index < 6; index += 1) {
+        const count = bucketCounts[index];
+        if (!count) continue;
         context.globalAlpha = ((index + 1) / 6) * 0.75;
-        for (const [x, y, radius] of bucket) {
+        const buffer = bucketData[index];
+        for (let i = 0; i < count; i += 3) {
+          const x = buffer[i];
+          const y = buffer[i + 1];
+          const radius = buffer[i + 2];
           context.fillRect(x - radius, y - radius, radius * 2, radius * 2);
         }
-      });
+      }
     };
 
     const frame = (now) => {
@@ -153,7 +178,7 @@
       const rect = loopVisual.getBoundingClientRect();
       width = Math.max(1, rect.width);
       height = Math.max(1, rect.height);
-      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const dpr = Math.min(1.5, window.devicePixelRatio || 1);
       loopCanvas.width = Math.round(width * dpr);
       loopCanvas.height = Math.round(height * dpr);
       context.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -199,6 +224,9 @@
     const deckPrev = document.querySelector('.deck-prev');
     const deckNext = document.querySelector('.deck-next');
     const deckCounter = document.querySelector('.deck-counter');
+    const deckProgress = document.querySelector('.deck-progress span');
+    const backToTop = document.querySelector('.back-to-top');
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
     const deckTotal = panels.length;
     let activeDeck = 0;
     let programmaticDeckUntil = 0;
@@ -222,6 +250,7 @@
       }
       if (deckPrev) deckPrev.disabled = activeDeck === 0;
       if (deckNext) deckNext.disabled = activeDeck === deckTotal - 1;
+      updateReadingState();
       if (!scroll) return;
       programmaticDeckUntil = Date.now() + 350;
       deckViewport.scrollTo({ left: activeDeck * deckViewport.clientWidth, behavior: 'auto' });
@@ -234,11 +263,33 @@
       updateDeck(index, { scroll: true });
       const panelTop = panel.getBoundingClientRect().top;
       const targetTop = target.getBoundingClientRect().top;
-      panel.scrollTo({ top: Math.max(0, panel.scrollTop + targetTop - panelTop - 18), behavior: 'auto' });
+      const top = target === panel ? 0 : Math.max(0, panel.scrollTop + targetTop - panelTop - 18);
+      panel.scrollTo({ top, behavior: 'auto' });
       deck.scrollIntoView({ behavior: 'auto', block: 'start' });
       window.dispatchEvent(new Event('scroll'));
+      updateReadingState();
       return true;
     };
+
+    const updateReadingState = () => {
+      const panel = panels[activeDeck];
+      if (!panel) return;
+      const maxScroll = panel.scrollHeight - panel.clientHeight;
+      if (deckProgress) {
+        const progress = maxScroll > 0 ? Math.min(100, Math.max(0, (panel.scrollTop / maxScroll) * 100)) : 0;
+        deckProgress.style.width = `${progress}%`;
+      }
+      if (backToTop) backToTop.classList.toggle('is-visible', panel.scrollTop > 280);
+    };
+
+    panels.forEach((panel) => panel.addEventListener('scroll', updateReadingState, { passive: true }));
+    window.addEventListener('resize', updateReadingState);
+    backToTop?.addEventListener('click', () => {
+      const panel = panels[activeDeck];
+      const behavior = reduceMotion.matches ? 'auto' : 'smooth';
+      if (panel && panel.scrollTop > 0) panel.scrollTo({ top: 0, behavior });
+      else window.scrollTo({ top: 0, behavior });
+    });
 
     deckViewport.addEventListener('scroll', () => {
       if (Date.now() < programmaticDeckUntil) return;

@@ -12,6 +12,10 @@ This directory contains documentation selected for the standalone Rust backend r
 - [Contribution and licensing policy](../CONTRIBUTING.md)
 - [Feature revenue participation template](../FEATURE-REVENUE-AGREEMENT.md)
 
+## API Reference
+
+- [后端接口参考 V1](API/后端接口参考_V1.md): current Rust HTTP routes, Gateway exposure, authentication boundaries, and configuration-gated endpoints.
+
 ## Architecture
 
 - [Rust architecture index](架构/Rust架构设计/README.md)
@@ -23,6 +27,10 @@ This directory contains documentation selected for the standalone Rust backend r
 - [Gateway chain](架构/Rust架构设计/Rust-Gateway当前实际链路与解耦对照设计_V1.0.md)
 - [Rule and ruleset semantics](架构/Rust架构设计/Rust权限判定与规则集语义_V1.0.md)
 - [Arbiter and GlobalAdmin governance](架构/Rust架构设计/RustArbiter与GlobalAdmin治理链_V1.0.md)
+
+## Capability Inventory
+
+- [技术能力与储备清单](技术能力与储备清单.md): 54 项逐项核验、清单外能力、架构储备与验收边界。
 
 ## SDK Integration
 

@@ -1,0 +1,701 @@
+<!doctype html>
+<html lang="zh-Hans-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#050505">
+    <meta name="description" content="从一次 stale ALLOW 失效场景出发，理解投影授权中的证据准入问题：候选资格、五个连接、条件安全保证与当前证据边界。">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="AstralLight — 权限被撤销之后">
+    <meta property="og:description" content="从候选资格到可执行授权：投影授权系统如何在撤权后拒绝旧证据。">
+    <title>AstralLight — 权限被撤销之后</title>
+    <link rel="icon" href="assets/astral-mark.png" type="image/png">
+    <link rel="stylesheet" href="site.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到正文</a>
+    <header class="site-header" id="top">
+      <a class="brand" href="#top" aria-label="AstralLight 首页"><img class="brand-mark" src="assets/astral-mark.png" alt="" width="28" height="28">AstralLight<span class="brand-period">.</span></a>
+      <nav class="top-nav" aria-label="页面导航">
+        <a href="#failure">问题</a>
+        <a href="#source-publication">设计</a>
+        <a href="#evidence">证据</a>
+        <a href="#modules">模块</a>
+        <a href="#status">边界</a>
+      </nav>
+      <a class="header-link" href="https://github.com/CoreryBlack/AstralLight.Next" target="_blank" rel="noreferrer">GitHub <span aria-hidden="true">↗</span></a>
+    </header>
+
+    <main id="main">
+      <article>
+        <header class="article-hero">
+          <div class="hero-backdrop" aria-hidden="true">
+            <picture class="hero-poster">
+              <source srcset="assets/cinematic-poster.avif" type="image/avif">
+              <img src="assets/cinematic-poster.webp" width="1920" height="1080" alt="" fetchpriority="high" decoding="async">
+            </picture>
+            <video class="hero-video" muted autoplay loop playsinline preload="auto" aria-hidden="true" tabindex="-1">
+              <source src="assets/cinematic-loop.webm" type="video/webm">
+              <source src="assets/cinematic-loop.mp4" type="video/mp4">
+            </video>
+            <div class="hero-overlay"></div>
+          </div>
+          <div class="hero-content">
+            <div class="hero-copy">
+              <p class="eyebrow"><span class="eyebrow-mark" aria-hidden="true"></span> ASTRALLIGHT <span>/</span> 证据准入</p>
+              <h1>权限被撤销之后，<br><em>系统如何证明</em><br>它已经失效？</h1>
+              <p class="article-deck">一项授权已被撤权，投影和缓存却仍给出旧证据；策略匹配器对旧证据返回了完全正确的匹配。问题不在策略语言，而在 source 到 host 之间缺少一份可证明的证据准入合同。</p>
+              <div class="hero-actions">
+                <a class="hero-cta" href="#panel-vision">阅读项目愿景 <span aria-hidden="true">↓</span></a>
+                <a class="hero-cta hero-cta-secondary" href="#failure">阅读问题定义 <span aria-hidden="true">↓</span></a>
+                <a class="hero-source-link" href="https://github.com/CoreryBlack/AstralLight.Next" target="_blank" rel="noreferrer">浏览源代码 <span aria-hidden="true">↗</span></a>
+              </div>
+              <div class="article-meta"><span>问题定义 · 证据准入</span><span>Rust · 多租户授权</span><span>从候选资格到可执行授权</span></div>
+            </div>
+            <div class="system-loop" role="group" aria-label="系统链路：来源变更、持久意图、围栏发布、最终准入、受保护效果、审计对账，再回到来源">
+              <div class="loop-visual">
+                <canvas class="loop-canvas" aria-hidden="true"></canvas>
+              </div>
+              <ol class="loop-legend" aria-label="六个链路阶段">
+                <li><span class="loop-index">01</span><div><strong>SOURCE</strong><em>来源变更</em></div></li>
+                <li><span class="loop-index">02</span><div><strong>INTENT</strong><em>持久意图</em></div></li>
+                <li><span class="loop-index">03</span><div><strong>PUBLISH</strong><em>围栏发布</em></div></li>
+                <li><span class="loop-index">04</span><div><strong>ADMIT</strong><em>最终准入</em></div></li>
+                <li><span class="loop-index">05</span><div><strong>HOST</strong><em>受保护效果</em></div></li>
+                <li><span class="loop-index">06</span><div><strong>AUDIT</strong><em>审计对账</em></div></li>
+              </ol>
+              <p class="loop-caption">从 source 到 host，再回到证据与对账。</p>
+            </div>
+          </div>
+          <div class="hero-caption"><span>从候选资格到可执行授权</span><span class="hero-caption-rule" aria-hidden="true"></span><span>向下阅读 <b aria-hidden="true">↓</b></span></div>
+        </header>
+
+        <section class="story-deck" aria-label="项目内容">
+          <div class="deck-bar">
+            <div class="deck-tabs" role="tablist" aria-label="内容分页">
+              <button class="deck-tab is-active" id="tab-vision" type="button" role="tab" aria-selected="true" aria-controls="panel-vision">01 项目与愿景</button>
+              <button class="deck-tab" id="tab-problem" type="button" role="tab" aria-selected="false" aria-controls="panel-problem" tabindex="-1">02 问题与设计</button>
+              <button class="deck-tab" id="tab-reserves" type="button" role="tab" aria-selected="false" aria-controls="panel-reserves" tabindex="-1">03 技术储备</button>
+            </div>
+            <div class="deck-controls">
+              <span class="deck-hint">左右滑动切换 <span aria-hidden="true">↔</span></span>
+              <span class="deck-counter">01 / 03</span>
+              <button class="deck-nav deck-prev" type="button" aria-label="查看上一页" disabled>←</button>
+              <button class="deck-nav deck-next" type="button" aria-label="查看下一页">→</button>
+            </div>
+          </div>
+          <div class="deck-viewport" role="region" aria-label="项目内容，三页横向滑动" tabindex="0">
+            <div class="deck-track">
+              <section class="deck-panel deck-vision" id="panel-vision" role="tabpanel" aria-labelledby="tab-vision">
+                <div class="vision-wrap">
+                  <div class="vision-intro">
+                    <p class="section-label">项目与愿景 <span>PROJECT / VISION</span></p>
+                    <h2>让每一次授权，<br>都可证明、安全、轻量。</h2>
+                    <p class="lead">AstralLight 用 Rust 把 source 变更、证据发布、准入判断、host 执行与审计对账组织成一条可检查、可恢复的链路。它不是新的策略语言，而是补齐策略引擎与真实执行之间的证据准入层。</p>
+                    <div class="vision-grid">
+                      <article><strong>可证明的链路</strong><span>每个决定都能回到发布证据与被准入的 grant。</span></article>
+                      <article><strong>足够安全的访问</strong><span>不确定时返回 PENDING 或 DENY，不回退旧 ALLOW。</span></article>
+                      <article><strong>尽可能低的消耗</strong><span>增量编译、有界缓存、按需读取，减少多余成本。</span></article>
+                    </div>
+                  </div>
+                  <section class="story-section" id="progress">
+                    <p class="section-label">01 <span>已经做了什么</span></p>
+                    <h2>把愿景落成代码、测试与证据。</h2>
+                    <p class="proof-lead">从代码、真实依赖与基准三个层面，把愿景拆成可检查的工程工作。</p>
+                    <div class="work-grid">
+                      <article><span class="work-index">A</span><h3>证据准入链</h3><p>source 短事务、durable intent、generation/revoke fence、严格读取与最终身份重载。</p></article>
+                      <article><span class="work-index">B</span><h3>多租户与恢复</h3><p>租户隔离、分区 lease、quarantine/replay、单写者 lease 与 Redis-free composite。</p></article>
+                      <article><span class="work-index">C</span><h3>SDK / 身份 / 审计</h3><p>SDK contracts、MFA、refresh-token family、审计重放与签名准入。</p></article>
+                    </div>
+                    <div class="proof-heading"><h3>关键数字</h3><span>不同证据面，不可直接相加</span></div>
+                    <div class="proof-grid">
+                      <article><span class="proof-value">512</span><span class="proof-label">租户容量测试通过</span><span class="proof-source">MT-E5 · PASS</span></article>
+                      <article><span class="proof-value">13,455</span><span class="proof-label">单机授权链 qps 峰值，0 错误</span><span class="proof-source">native composite · c=64</span></article>
+                      <article><span class="proof-value">0.10–0.47 µs</span><span class="proof-label">内核引擎 p50，编译匹配成本</span><span class="proof-source">进程内微基准 · 10–810 复杂度</span></article>
+                    </div>
+                    <div class="proof-compare">
+                      <h3>与常见授权引擎对比</h3>
+                      <p>common flat ALLOW/default-DENY 子集，50 卡 × 81 条目；数值为五次重复的 p50 均值。</p>
+                      <div class="compare-table" role="table" aria-label="授权引擎 p50 对比">
+                        <div class="compare-row compare-head" role="row"><span role="columnheader">引擎</span><span role="columnheader">p50</span><span role="columnheader">相对 p50</span></div>
+                        <div class="compare-row" role="row"><span role="cell">AstralLight · 编译匹配</span><strong role="cell">0.205 µs</strong><span role="cell">1×</span></div>
+                        <div class="compare-row" role="row"><span role="cell">Cedar · 进程内</span><strong role="cell">3.310 µs</strong><span role="cell">≈16×</span></div>
+                        <div class="compare-row" role="row"><span role="cell">OPA · HTTP sidecar</span><strong role="cell">370.4 µs</strong><span role="cell">≈1,800×</span></div>
+                        <div class="compare-row" role="row"><span role="cell">Casbin · 进程内</span><strong role="cell">1,369.83 µs</strong><span role="cell">≈6,700×</span></div>
+                      </div>
+                      <p class="proof-caveat">表内是 compiled matching；OPA 包含 HTTP sidecar 调用，各引擎的表示与传输不同，因此这不是端到端吞吐或内在速度排名。相对列表示相对 p50，越高越慢。签名准入与发布恢复成本另属不同证据面。</p>
+                    </div>
+                    <p class="proof-note">补充：169 个真实 MySQL / Redis / RabbitMQ 集成用例通过；2,765 个 SDK 本地门禁测试通过（ignored 未计入）；37,413 个竞态样本中 0 个 post-ack stale ALLOW（历史诊断子路径）。不同证据面不可互相替代，也不构成生产容量承诺；完整集成门禁仍有已知失败，生产集成验收仍为 BLOCKED。</p>
+                  </section>
+                  <section class="story-section" id="modules">
+                    <p class="section-label">02 <span>体系角色</span></p>
+                    <h2>六个代号，一条链路。</h2>
+                    <p>这些代号描述体系职责，不是六个独立 crate，也不代表六个已交付的产品。</p>
+                    <div class="module-carousel-shell">
+                      <div class="module-carousel-head">
+                        <p class="module-scroll-hint">横向滑动，查看六个角色 <span aria-hidden="true">→</span></p>
+                        <div class="module-controls">
+                          <button class="module-nav module-nav-prev" type="button" aria-label="查看上一个体系角色" disabled>←</button>
+                          <button class="module-nav module-nav-next" type="button" aria-label="查看下一个体系角色">→</button>
+                        </div>
+                      </div>
+                      <div class="module-rail" aria-label="体系角色时间线">
+                        <button class="rail-step is-active" type="button" aria-label="查看 Astra：核心裁决内核" aria-current="true"><span class="rail-dot"></span><span class="rail-label">Astra</span></button>
+                        <button class="rail-step" type="button" aria-label="查看 Sol：密码学与身份信任底座"><span class="rail-dot"></span><span class="rail-label">Sol</span></button>
+                        <button class="rail-step" type="button" aria-label="查看 Luna：审计与可观测子系统"><span class="rail-dot"></span><span class="rail-label">Luna</span></button>
+                        <button class="rail-step" type="button" aria-label="查看 Terra：硬件资源抽象层"><span class="rail-dot"></span><span class="rail-label">Terra</span></button>
+                        <button class="rail-step" type="button" aria-label="查看 Mobius：全域审批调度编排层"><span class="rail-dot"></span><span class="rail-label">Mobius</span></button>
+                        <button class="rail-step" type="button" aria-label="查看 Klein：跨系统辐射赋能层"><span class="rail-dot"></span><span class="rail-label">Klein</span></button>
+                      </div>
+                      <div class="module-carousel" role="region" aria-roledescription="carousel" aria-label="六个体系角色" tabindex="0">
+                        <article class="module-card is-active" data-state="partial" role="group" aria-roledescription="slide" aria-label="第 1 个，共 6 个：Astra">
+                          <div class="module-card-top"><span class="module-mark" aria-hidden="true"></span><span class="module-domain">CORE / POLICY ENGINE</span></div>
+                          <p class="module-number" aria-hidden="true">01</p>
+                          <h3>Astra</h3>
+                          <p class="module-role">核心裁决内核</p>
+                          <p class="module-desc">当前 Rust 核心包含增量编译、generation/fence、严格发布证据读取、最终重载与 fail-closed 路径。全链路最坏时间 O(1)、Augment 全闭环和异构后端不在已证实范围内。</p>
+                          <p class="module-signature">generation · fence · strict evidence</p>
+                          <div class="module-motif" aria-hidden="true">
+                            <svg viewBox="0 0 240 140" fill="none" stroke="currentColor" stroke-width="1" focusable="false">
+                              <path d="M120 14 196 52v56l-76 38-76-38V52Z" opacity=".38"/>
+                              <path d="M120 38 169 62v36l-49 24-49-24V62Z" opacity=".55"/>
+                              <circle cx="120" cy="80" r="7" fill="currentColor" stroke="none"/>
+                              <path d="M120 80 44 44M120 80l76-36M120 80v46" opacity=".65"/>
+                              <circle cx="44" cy="44" r="3" fill="currentColor" stroke="none"/>
+                              <circle cx="196" cy="44" r="3" fill="currentColor" stroke="none"/>
+                              <circle cx="120" cy="126" r="3" fill="currentColor" stroke="none"/>
+                            </svg>
+                          </div>
+                          <div class="module-card-foot"><span class="module-status-chip">部分完成</span><span class="module-foot-index">01 / 06</span></div>
+                        </article>
+                        <article class="module-card" data-state="partial" role="group" aria-roledescription="slide" aria-label="第 2 个，共 6 个：Sol">
+                          <div class="module-card-top"><span class="module-mark" aria-hidden="true"></span><span class="module-domain">IDENTITY / CRYPTOGRAPHY</span></div>
+                          <p class="module-number" aria-hidden="true">02</p>
+                          <h3>Sol</h3>
+                          <p class="module-role">密码学与身份信任底座</p>
+                          <p class="module-desc">双卡上下文、Gateway 请求签名、内部服务断言、MFA 和会话栅栏等机制分别存在；它们尚不是覆盖所有服务、凭证与介质的统一信任根。</p>
+                          <p class="module-signature">identity · signature · session</p>
+                          <div class="module-motif" aria-hidden="true">
+                            <svg viewBox="0 0 240 140" fill="none" stroke="currentColor" stroke-width="1" focusable="false">
+                              <path d="M84 22h72l36 54-36 54H84L48 76Z" opacity=".35"/>
+                              <circle cx="120" cy="76" r="34" opacity=".55"/>
+                              <circle cx="120" cy="76" r="10" fill="currentColor" stroke="none"/>
+                              <path d="M120 42V18M120 110v24M86 76H58M154 76h28" opacity=".5"/>
+                              <path d="M94 102 146 50" opacity=".7"/>
+                              <circle cx="94" cy="102" r="4" fill="currentColor" stroke="none"/>
+                              <path d="M94 102h16v14" opacity=".7"/>
+                            </svg>
+                          </div>
+                          <div class="module-card-foot"><span class="module-status-chip">部分完成</span><span class="module-foot-index">02 / 06</span></div>
+                        </article>
+                        <article class="module-card" data-state="partial" role="group" aria-roledescription="slide" aria-label="第 3 个，共 6 个：Luna">
+                          <div class="module-card-top"><span class="module-mark" aria-hidden="true"></span><span class="module-domain">AUDIT / OBSERVABILITY</span></div>
+                          <p class="module-number" aria-hidden="true">03</p>
+                          <h3>Luna</h3>
+                          <p class="module-role">审计与可观测子系统</p>
+                          <p class="module-desc">仓库包含授权审计、Prometheus 指标与审计重放等构件。全行为不可篡改记录、统一保留策略和外部监控闭环不能据此宣称已完成。</p>
+                          <p class="module-signature">audit · metrics · replay</p>
+                          <div class="module-motif" aria-hidden="true">
+                            <svg viewBox="0 0 240 140" fill="none" stroke="currentColor" stroke-width="1" focusable="false">
+                              <circle cx="120" cy="76" r="52" opacity=".2"/>
+                              <circle cx="120" cy="76" r="34" opacity=".35"/>
+                              <path d="M24 84c18-36 36-36 54 0s36 36 54 0 36-36 54 0 36 36 54 0" opacity=".7"/>
+                              <circle cx="120" cy="76" r="5" fill="currentColor" stroke="none"/>
+                              <path d="M120 24v-10M120 128v10M68 76H58M172 76h10" opacity=".45"/>
+                            </svg>
+                          </div>
+                          <div class="module-card-foot"><span class="module-status-chip">部分完成</span><span class="module-foot-index">03 / 06</span></div>
+                        </article>
+                        <article class="module-card" data-state="none" role="group" aria-roledescription="slide" aria-label="第 4 个，共 6 个：Terra">
+                          <div class="module-card-top"><span class="module-mark" aria-hidden="true"></span><span class="module-domain">HETEROGENEOUS COMPUTE</span></div>
+                          <p class="module-number" aria-hidden="true">04</p>
+                          <h3>Terra</h3>
+                          <p class="module-role">硬件资源抽象层</p>
+                          <p class="module-desc">愿景是统一 CPU、GPU、ARM 与存量设备上的资源抽象和调度。当前仓库未找到对应硬件后端、设备内存隔离或跨设备任务路由实现。</p>
+                          <p class="module-signature">CPU · GPU · ARM · fleet</p>
+                          <div class="module-motif" aria-hidden="true">
+                            <svg viewBox="0 0 240 140" fill="none" stroke="currentColor" stroke-width="1" focusable="false">
+                              <path d="M120 18 192 46 120 74 48 46Z" opacity=".45"/>
+                              <path d="M48 46v20l72 28 72-28V46M48 66v20l72 28 72-28V66M48 86v20l72 28 72-28V86" opacity=".35"/>
+                              <path d="M120 74v28M120 94v28M84 60l72 28M156 60l-72 28" opacity=".25"/>
+                              <rect x="104" y="50" width="32" height="18" opacity=".45"/>
+                              <circle cx="120" cy="116" r="4" fill="currentColor" stroke="none"/>
+                            </svg>
+                          </div>
+                          <div class="module-card-foot"><span class="module-status-chip">暂无代码证据</span><span class="module-foot-index">04 / 06</span></div>
+                        </article>
+                        <article class="module-card" data-state="roadmap" role="group" aria-roledescription="slide" aria-label="第 5 个，共 6 个：Mobius">
+                          <div class="module-card-top"><span class="module-mark" aria-hidden="true"></span><span class="module-domain">APPROVAL / ORCHESTRATION</span></div>
+                          <p class="module-number" aria-hidden="true">05</p>
+                          <h3>Mobius</h3>
+                          <p class="module-role">全域审批调度编排层</p>
+                          <p class="module-desc">规划中的应急审批与业务编排方向，涉及临时授权生命周期和通知协调。现有审批到授权账本的局部链路，不等于完整 Mobius 产品。</p>
+                          <p class="module-signature">approve · delegate · expire</p>
+                          <div class="module-motif" aria-hidden="true">
+                            <svg viewBox="0 0 240 140" fill="none" stroke="currentColor" stroke-width="1" focusable="false">
+                              <path d="M42 62h88a30 30 0 1 1 0 60H76a34 34 0 0 1 0-68h116" opacity=".55"/>
+                              <path d="M42 62h88a30 30 0 0 0 0 60H76a34 34 0 0 0 0-68h116" opacity=".3"/>
+                              <path d="m174 46 14 8-14 8" opacity=".75"/>
+                              <circle cx="76" cy="96" r="4" fill="currentColor" stroke="none"/>
+                              <circle cx="144" cy="96" r="4" fill="currentColor" stroke="none"/>
+                            </svg>
+                          </div>
+                          <div class="module-card-foot"><span class="module-status-chip">设计储备</span><span class="module-foot-index">05 / 06</span></div>
+                        </article>
+                        <article class="module-card" data-state="roadmap" role="group" aria-roledescription="slide" aria-label="第 6 个，共 6 个：Klein">
+                          <div class="module-card-top"><span class="module-mark" aria-hidden="true"></span><span class="module-domain">INTEGRATION / ADOPTION</span></div>
+                          <p class="module-number" aria-hidden="true">06</p>
+                          <h3>Klein</h3>
+                          <p class="module-role">跨系统辐射赋能层</p>
+                          <p class="module-desc">规划中的跨系统接入方向，关注存量权限体系与统一证据模型的衔接。当前 SDK/adapter 需要显式集成，不能宣称无侵入自动接管。</p>
+                          <p class="module-signature">SDK · adapter · bridge</p>
+                          <div class="module-motif" aria-hidden="true">
+                            <svg viewBox="0 0 240 140" fill="none" stroke="currentColor" stroke-width="1" focusable="false">
+                              <path d="M34 38h64v64H34Z" opacity=".45"/>
+                              <path d="M142 38h64v64h-64Z" opacity=".45"/>
+                              <path d="M98 56c20 0 20 28 44 28M142 56c-20 0-20 28-44 28" opacity=".7"/>
+                              <path d="M34 116h172" opacity=".2"/>
+                              <circle cx="66" cy="70" r="4" fill="currentColor" stroke="none"/>
+                              <circle cx="174" cy="70" r="4" fill="currentColor" stroke="none"/>
+                              <circle cx="120" cy="84" r="4" fill="currentColor" stroke="none"/>
+                            </svg>
+                          </div>
+                          <div class="module-card-foot"><span class="module-status-chip">设计储备</span><span class="module-foot-index">06 / 06</span></div>
+                        </article>
+                      </div>
+                      <div class="module-progress" aria-hidden="true"><span class="module-progress-fill"></span></div>
+                      <p class="module-counter">01 / 06</p>
+                    </div>
+                  </section>
+
+                  <section class="story-section current-status" id="status">
+                    <p class="section-label">03 <span>当前边界</span></p>
+                    <h2>代码存在，不等于生产已就绪。</h2>
+                    <p>这是可阅读、可验证的 Rust workspace，不是生产部署。下面列出当前明确不声称的能力。</p>
+                    <details class="boundary-details">
+                      <summary>展开查看 10 项边界</summary>
+                      <ul class="boundary-list">
+                        <li>不声称全局策略线性化，或所有撤权已经在全局收敛。</li>
+                        <li>不声称覆盖 <code>t*</code> 之后、host 返回之前的重叠变更。</li>
+                        <li>不声称后续业务效果具备原子性。</li>
+                        <li>不声称 Byzantine、多 writer、replica lag 或无界 clock skew 安全。</li>
+                        <li>不声称 memory-served native admission 已完成定理映射与实测。</li>
+                        <li>不声称全链路最坏时间有界 O(1)。</li>
+                        <li>不声称 GPU / ARM 硬件后端已经支持。</li>
+                        <li>不声称所有行为都有全域不可篡改审计。</li>
+                        <li>不声称已完成生产部署、迁移或正式切流。</li>
+                        <li>不声称可以无侵入接管存量异构系统。</li>
+                      </ul>
+                    </details>
+                    <a class="article-link" href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/技术能力与储备清单.md" target="_blank" rel="noreferrer">查看 54 项技术能力核验与证据边界 <span aria-hidden="true">↗</span></a>
+                  </section>
+                </div>
+              </section>
+              <section class="deck-panel deck-problem" id="panel-problem" role="tabpanel" aria-labelledby="tab-problem">
+                <div class="article-layout">
+          <aside class="chapter-index" aria-label="章节目录">
+            <nav>
+              <div class="index-group">
+                <p class="index-group-title">问题定义</p>
+                <ul>
+                  <li><a href="#failure">失效场景</a></li>
+                  <li><a href="#boundary">边界问题</a></li>
+                  <li><a href="#candidate">候选与授权</a></li>
+                  <li><a href="#connections">五个连接</a></li>
+                  <li><a href="#omissions">局部正确</a></li>
+                  <li><a href="#adversary">对手与目标</a></li>
+                </ul>
+              </div>
+              <div class="index-group">
+                <p class="index-group-title">设计合同</p>
+                <ul>
+                  <li><a href="#source-publication">来源与发布</a></li>
+                  <li><a href="#narrowing">遗漏探测</a></li>
+                  <li><a href="#readers">读取路径</a></li>
+                  <li><a href="#final-reload">最终重载</a></li>
+                  <li><a href="#failure-semantics">失败语义</a></li>
+                  <li><a href="#request-lifecycle">请求生命周期</a></li>
+                </ul>
+              </div>
+              <div class="index-group">
+                <p class="index-group-title">保证与证据</p>
+                <ul>
+                  <li><a href="#guarantee">条件保证</a></li>
+                  <li><a href="#evidence">证据分级</a></li>
+                </ul>
+              </div>
+              <div class="index-group">
+                <p class="index-group-title">继续阅读</p>
+                <ul>
+                  <li><a href="#explore">继续探索</a></li>
+                </ul>
+              </div>
+            </nav>
+          </aside>
+
+          <div class="article-wrap article-body">
+            <section class="story-section" id="failure">
+              <p class="section-label">01 <span>失效场景</span></p>
+              <h2>一次 stale ALLOW，如何穿过所有局部正确的检查？</h2>
+              <p class="lead">设请求上下文为 <code>ctx = (principal, tenant, scope, resource, action)</code>。候选授权 <code>g₀</code> 仍在证据集 <code>E₀</code> 中；source 事务提交了一个收窄变更 <code>d</code>，把 <code>g₀</code> 从有效授权中移除。</p>
+              <p>投影尚未发布 <code>d</code>，缓存仍持有 <code>E₀</code>。策略匹配器对 <code>E₀</code> 执行匹配，正确选中 <code>g₀</code>；host 随后执行受保护操作。source 提交正确，投影按自己的进度工作，缓存记录完整且签名有效，匹配器也没有算错——但系统最终执行了错误的状态。</p>
+              <p>这不是一句“缓存没刷新”能概括的问题。即使缓存完全新鲜、完整性校验通过、策略语言语义正确，只要派生证据还没有表示某项已提交的撤权，匹配结果就可能是一份过期的候选。</p>
+              <ol class="timeline">
+                <li><span class="timeline-time">t<sub>c</sub>(d)</span><p>source 事务提交收窄 <code>d</code>，并在同一短事务中留下 durable delta 或 outbox、source generation、revoke fence、受影响 scope 与审计关联。</p></li>
+                <li><span class="timeline-time">m<sub>0</sub> → p<sub>0</sub> → m<sub>1</sub> → p<sub>1</sub></span><p>若命中缓存，读取端按顺序观察 manifest 摘要 <code>M</code> 与未发布收窄谓词 <code>b</code>；这四个语句不是同一个原子 SQL 快照。</p></li>
+                <li><span class="timeline-time">t<sub>f</sub> = t*</span><p>最终加载的第一次权威观察。缓存分支取 <code>m<sub>0</sub></code>；严格读取分支取首次谓词读视图。它提供用于准入的最终证据 <code>E<sub>1</sub></code>。</p></li>
+                <li><span class="timeline-time">t<sub>v</sub> → t<sub>a</sub></span><p>身份稳定检查完成于 <code>t<sub>v</sub></code>，ALLOW 返回 host 于 <code>t<sub>a</sub></code>。保证只覆盖 <code>t<sub>c</sub>(d) &lt; t*</code> 的撤权类变更；落在 <code>[t*, t<sub>a</sub>]</code> 内的变化不在定理范围内。</p></li>
+              </ol>
+              <p class="inline-note"><strong>关键不在“缓存了多久”。</strong>只要证据还没有表示已提交的收窄，host 就可能把一次正确的局部匹配，执行成一次错误的全局决定。</p>
+            </section>
+
+            <section class="story-section" id="boundary">
+              <p class="section-label">02 <span>边界问题</span></p>
+              <h2>策略引擎回答的是“是否匹配”，不是“这份状态是否仍可执行”。</h2>
+              <p>RBAC 从角色派生权限，ABAC 组合主体、资源、动作与环境属性，XACML 定义组合与 <code>Indeterminate</code> 结果，Zanzibar 暴露关系元组的 consistency token；Cedar、OPA、Casbin 等进程内或 sidecar 引擎，则评估调用方提供的策略与实体表示。</p>
+              <p>这些系统定义了“给定输入状态，如何得到一个决定”。它们没有、也不应该单独负责证明三件事：</p>
+              <ul class="boundary-list">
+                <li>输入状态是否包含了所有相关的 source 侧收窄。</li>
+                <li>正在被使用的派生表示，是否就是发布链上那个可验证的表示。</li>
+                <li>同一资源与动作上的重新授权，是否仍然是原来的那一个 grant。</li>
+              </ul>
+              <p>论文把这一问题概括为从 <strong>candidate entitlement</strong> 到 <strong>executable authority</strong> 的 <strong>evidence admission（证据准入）</strong>。它不替代策略语言，也不声称解决任意策略语义的一致性；它只处理一个系统安全问题：一个候选匹配，什么时候可以跨越 host 边界，变成可执行授权。</p>
+              <p>这类似分布式系统里的 check–use gap：source 侧检查、派生表示和 host 使用可以观察到不同状态。Lease、sequencer、consistency token、概率陈旧度、CRL/OCSP 和 OAuth device pending 都提供了有价值的局部构件，但它们没有自动把 freshness 绑定到具体 grant 与宿主效果上。</p>
+              <p class="inline-note"><strong>问题不在策略表达力，而在输入状态的来源、表示与身份。</strong>把这一层省略掉，再正确的匹配器也只能对一个可能过期的世界负责。</p>
+            </section>
+
+            <section class="story-section" id="candidate">
+              <p class="section-label">03 <span>候选与授权</span></p>
+              <h2>候选资格是匹配结果，可执行授权是安全决定。</h2>
+              <p>论文用四个通用对象描述问题：<strong>principal</strong> 在 tenant 与 authorization scope 内，对某个 resource 请求一个 action；<strong>grant</strong> 带有 origin、tenant、principal、scope、resource、action、有效期、provenance、逻辑标识与 revision；<strong>candidate entitlement</strong> 是请求对给定证据集 <code>E</code> 的确定性匹配；<strong>executable authority</strong> 是候选通过最终准入后的结果。请求上下文 <code>ctx</code> 绑定 principal、scope、tenant、resource 与 action，证据集 <code>E</code> 则包含准入 gate、有序 manifest 摘要、发布 watermark、完整性元数据与有效 grant 集合。</p>
+              <div class="definition-grid">
+                <article class="definition-card">
+                  <p class="definition-kicker">CANDIDATE ENTITLEMENT</p>
+                  <h3>候选资格</h3>
+                  <p>在给定证据集 <code>E</code> 上，按固定顺序执行一次确定性匹配，选出的第一个在 scope 内、时间有效且结果为 ALLOW 的 grant。</p>
+                  <p class="definition-note">它只说明：在这份证据上，这个请求“匹配得上”。</p>
+                </article>
+                <article class="definition-card definition-card-authority">
+                  <p class="definition-kicker">EXECUTABLE AUTHORITY</p>
+                  <h3>可执行授权</h3>
+                  <p>候选只有在最终准入验证了 source-linked evidence、scope、publication identity，以及最终重载时的 exact candidate identity 之后，才成为可执行授权。</p>
+                  <p class="definition-note">它说明的是：host 现在可以安全地执行受保护操作。</p>
+                </article>
+              </div>
+              <p>这两者之间不是“再查一次缓存”的差别，而是一份显式的 admission contract。候选可以来自内存、缓存或严格读取；只有通过最终准入的候选，才允许跨过 host 边界。</p>
+              <div class="claim-box"><span class="claim-kicker">核心区分</span><p>策略系统可以正确回答 <code>match(ctx, E)</code>；证据准入还要回答：<code>E</code> 是否遗漏了本 scope 已提交的收窄，<code>E</code> 是否是可验证的发布表示，以及最终被准入的是否仍是候选 <code>g₀</code> 本身。</p></div>
+            </section>
+
+            <section class="story-section" id="connections">
+              <p class="section-label">04 <span>五个连接</span></p>
+              <h2>把 source 变更，接到 host 的那一次授权决定上。</h2>
+              <p>论文的准入合同由五个连接组成。它们不一定分别新颖，也不声称是最小机制集合；安全价值来自它们被接成一条可检查的链。</p>
+              <ol class="connection-list">
+                <li>
+                  <span class="step-number">01</span>
+                  <div><h3>来源事务</h3><p>source mutation 在短事务内持久记录 durable delta 或 outbox、source generation、revoke fence、tenant 与所有受影响 scope。网络调用、缓存推送、投影和重试都不在事务内。</p></div>
+                </li>
+                <li>
+                  <span class="step-number">02</span>
+                  <div><h3>发布围栏</h3><p>generation 与 revoke fence 单调推进，旧的 owner 不能在更新的 generation 之后完成发布。成功发布由 committed manifest/segment/current pointer 证明，而不是 ACK 或 best-effort cache push。</p></div>
+                </li>
+                <li>
+                  <span class="step-number">03</span>
+                  <div><h3>收窄遗漏探测</h3><p>在信任缓存候选之前，保守检查本 scope 是否存在“可见、但尚未成功发布到当前 watermark”的收窄。零结果只表示没有已知阻塞收窄，不表示全局策略已经收敛。</p></div>
+                </li>
+                <li>
+                  <span class="step-number">04</span>
+                  <div><h3>读取观察合同</h3><p>缓存候选必须通过两次有序权威观察并保持相等，或者由 strict reader 取得一个新鲜的 committed-state 读视图。候选自己的摘要还必须与观察到的发布身份一致。</p></div>
+                </li>
+                <li>
+                  <span class="step-number">05</span>
+                  <div><h3>最终身份重载</h3><p>host 返回前再次加载证据，并绑定相同 scope、发布证据、logical id、revision、origin 与 provenance。只匹配 resource/action 不足以证明还是同一个 grant。</p></div>
+                </li>
+              </ol>
+              <p class="inline-note"><strong>任何一条断开，局部检查都可能仍然显示正常。</strong>这正是下一节要展开的“局部正确”：每个组件都能通过自己的接口，但系统整体已经不再表示 source 的最新收窄。</p>
+            </section>
+
+            <section class="story-section" id="omissions">
+              <p class="section-label">05 <span>局部正确</span></p>
+              <h2>只保留一个局部检查，仍然可能放行旧授权。</h2>
+              <p>论文用六种<strong>分析性遗漏调度</strong>说明：移除一个连接、保留其余局部检查时，系统仍可能看起来健康，却遗漏了本应阻断的收窄。它们是设计推理，不是已经完成的消融实验结果。</p>
+              <div class="schedule-list">
+                <article class="schedule-row">
+                  <h3>保留 published generation</h3>
+                  <p><code>d</code> 在发布等待期间提交；缓存的 grant 与 pointer 仍是旧 generation，单看 generation 也自洽。</p>
+                  <span>必须补上：source-visible 未发布收窄探测。</span>
+                </article>
+                <article class="schedule-row">
+                  <h3>保留 cache token</h3>
+                  <p><code>d</code> 已提交，但 token 未轮换；一条认证通过的缓存记录仍带着当前 token。</p>
+                  <span>必须补上：token equality 是 lineage，不是 source freshness。</span>
+                </article>
+                <article class="schedule-row">
+                  <h3>保留 publication watermark</h3>
+                  <p>新的 pointer 已被观察到，但 host 使用了 <code>g₀</code>，没有把 payload 与 scope 绑定到已校验的证据链。</p>
+                  <span>必须补上：evidence representation 与 identity validation。</span>
+                </article>
+                <article class="schedule-row">
+                  <h3>只做一次 manifest–predicate pass</h3>
+                  <p><code>d</code> 在 <code>M</code> 与 <code>b</code> 两条语句之间提交，这一对观察组合了两个不同的 committed states。</p>
+                  <span>必须补上：两次有序观察并要求 <code>Q<sub>pre</sub> = Q<sub>post</sub></code>。</span>
+                </article>
+                <article class="schedule-row">
+                  <h3>保留 projection reload</h3>
+                  <p>两次加载在内部都有效，但已提交的 <code>d</code> 仍然没有被发布到当前 watermark。</p>
+                  <span>必须补上：最终加载也执行 source-linked probe。</span>
+                </article>
+                <article class="schedule-row">
+                  <h3>保留 resource/action rematch</h3>
+                  <p>撤权后重新授权，resource 与 action 相同，但 successor 获得了新的 revision 或不同的 provenance。</p>
+                  <span>必须补上：绑定 origin、logical id、revision、payload 与 publication identity。</span>
+                </article>
+              </div>
+              <p class="inline-note"><strong>这些调度不是“攻击已经复现”的证据。</strong>它们说明的是组成关系：局部检查之间的空隙，恰好是 stale authority 可以穿过的位置；受控遗漏实验仍属于计划中的评测 gate。</p>
+            </section>
+
+            <section class="story-section" id="adversary">
+              <p class="section-label">06 <span>对手与目标</span></p>
+              <h2>受保护的是准入边界上的决定完整性。</h2>
+              <p>受保护资产不是“策略文件不被修改”，而是 host admission boundary 上的 <strong>decision integrity</strong>：一个请求不能基于遗漏了可见、相关收窄的证据，被当成 ALLOW 执行。</p>
+              <p>主要对手是一个已认证的请求方：它可以重放仍在有效期内的签名请求、切换目标，或把一次 source mutation 与一次授权决定赛跑。它不需要直接控制可信存储，只需要利用正常的异步行为——投影延迟、缓存残留、worker 调度、lease 过期和基础设施故障。</p>
+              <p>系统同时保护 tenant 与 scope 的隔离、候选的 provenance，以及用于证明决定的发布证据的单调性。信任前提是：Gateway 完成外部认证并签名身份上下文；权威存储、读取端、projector 与完整性密钥不是 Byzantine；每个被评估的 aggregate 只有一个 source writer；所有受保护操作都经过完整的 host mediation。</p>
+              <h3 class="subhead">五个安全目标</h3>
+              <ol class="connection-list goal-list">
+                <li><span class="step-number">G1</span><div><h3>Revocation admission</h3><p>候选只有在最终权威观察之前、所有相关撤权类变更都已经成功发布并被最终证据表示时，才成为可执行授权；未发布收窄只能得到 PENDING 或 DENY。</p></div></li>
+                <li><span class="step-number">G2</span><div><h3>Publication ownership</h3><p>source generation、revoke fence 与发布 pointer 单调推进；陈旧 worker 不能完成新 owner 的发布，durable event 只有一个终态转换。</p></div></li>
+                <li><span class="step-number">G3</span><div><h3>Scope isolation</h3><p>匹配与准入始终绑定请求的 principal、tenant、scope、resource 与 action；重放或上下文切换不能扩大这些字段。</p></div></li>
+                <li><span class="step-number">G4</span><div><h3>Evidence identity</h3><p>被准入的证据必须标识候选的 origin、logical id、revision、provenance、有序 manifest 链与完整性元数据；同 resource/action 的 successor 不能替代原候选。</p></div></li>
+                <li><span class="step-number">G5</span><div><h3>Fail-closed uncertainty</h3><p>缺失、变化中、格式错误、不可用或无法验证的证据不能产生 ALLOW；PENDING 是显式的非准入结果，不是重试或可用性承诺。</p></div></li>
+              </ol>
+              <p class="inline-note"><strong>不覆盖的范围同样是问题定义的一部分：</strong>Byzantine 进程、直接入侵 MySQL/RabbitMQ、in-process hub 被攻破、主动拦截可信节点流量、恶意或多个 writer、replica 分歧、密钥被攻破、无界 clock skew，以及后续业务效果的原子性。定理是 grant-specific 的准入合同，不是“任意攻击者下全面安全”的声明。</p>
+            </section>
+
+            <section class="story-section" id="source-publication">
+              <p class="section-label">07 <span>来源与发布</span></p>
+              <h2>先让变更成为可发布的事实，再让发布成为可验证的事实。</h2>
+              <h3 class="subhead">短事务只记录来源事实</h3>
+              <p>source mutation 与 durable delta/outbox、source generation、revoke fence、tenant、全部受影响 scope 以及审计关联一起提交。事务边界保持很短：网络调用、缓存推送、投影工作、重试和验证都不放进去。</p>
+              <h3 class="subhead">围栏发布只承认 committed evidence</h3>
+              <p>受监督的 projector 用 compare-and-set lease 与 generation fence 认领 delta，只应用已批准的 mutation，校验结果的不可变 segment，然后把 pointer 推进到一份已提交的 manifest。manifest 的有序摘要携带成功 watermark。较旧的 owner 不能在新 generation 胜出后完成发布；未知的 worker 结果必须先对账，再决定是否重试。</p>
+              <p>表示是 content-addressed 且 scope-aware 的：manifest 摘要写明 aggregate、generation、revoke fence 与 segment 链；effective grant 带有 logical id、revision、scope、有效期和 provenance。持久 HAMT 的结构性共享减少无关重建，但它是性能优化，从属于证据身份——一个未变化的共享 segment 不能掩盖变化的 card binding 或 fence。</p>
+              <p class="inline-note"><strong>ACK 不是 publication proof。</strong>broker confirm、cache push、队列接收或 handler 完成，都不能单独证明授权状态已经成功发布。</p>
+            </section>
+
+            <section class="story-section" id="narrowing">
+              <p class="section-label">08 <span>遗漏探测</span></p>
+              <h2>只阻挡未发布的收窄，不阻挡正常的新增。</h2>
+              <p>这里的 <strong>narrowing（收窄）</strong> 指移除、撤销、被保守标记为 invalidating 的授权内容更新，或携带更高 revoke fence 的变更。真正的 aggregate-wide mutation 会为每个受影响 scope 表示；共享 rule-set 的移除会展开为逐 scope 贡献。</p>
+              <p>在信任一个缓存候选之前，读取端提出一个保守问题：</p>
+              <div class="claim-box"><span class="claim-kicker">THE NARROWING PROBE</span><p>本 scope 是否存在任何可见、但尚未成功发布到当前 watermark 的收窄变更？</p></div>
+              <p>谓词包含 pending、invalid、quarantined 或 fence-leading 的 delta。零结果不表示“所有可能的策略变化都已在全局收敛”，它只表示：在本 scope 的 source/publication contract 下，没有已知的阻塞性收窄。</p>
+              <p>这种不对称是刻意设计的。若一个新增尚未进入证据，直接后果是新权限被延迟；若一个收窄尚未进入证据，已经匹配的 grant 会在 source 撤回后继续可执行。前者可以等待常规发布，后者必须阻断。这是安全选择，不是“其他 card 完全不受影响”的声明。</p>
+              <p class="inline-note"><strong>不是所有延迟都等价。</strong>ADD 的延迟影响可用性；NARROWING 的延迟影响授权正确性。准入合同只对后者施加额外的阻断条件。</p>
+            </section>
+
+            <section class="story-section" id="readers">
+              <p class="section-label">09 <span>读取路径</span></p>
+              <h2>缓存分支要求两次有序观察，严格分支要求新鲜读视图。</h2>
+              <h3 class="subhead">缓存候选</h3>
+              <p>一个缓存候选包含 tenant 与 scope、evidence gate、有序 manifest 摘要、generation 与 revoke fence、内容 hash、完整性 tag、cache-generation token、有效期以及完整的 effective grant 集合。L1 缓存有容量与时间边界；L2 记录经过认证并会过期。缓存失败、tag 无效、epoch 不匹配或 validity window 变化，都会把请求送到 strict reader。</p>
+              <h3 class="subhead">两次有序观察</h3>
+              <p>缓存读取端执行两次权威观察，每次由独立的 pool-level autocommit 语句组成：</p>
+              <ol class="inline-sequence">
+                <li><code>m<sub>0</sub></code> 读取有序 manifest 摘要 <code>M<sub>0</sub></code>，<code>p<sub>0</sub></code> 读取未发布收窄谓词 <code>b<sub>0</sub></code>。</li>
+                <li>再次读取 <code>m<sub>1</sub></code> 与 <code>p<sub>1</sub></code>，要求观察顺序 <code>m<sub>0</sub> → p<sub>0</sub> → m<sub>1</sub> → p<sub>1</sub></code>。</li>
+                <li>候选必须满足 <code>Q<sub>pre</sub> = Q<sub>post</sub></code> 且 <code>b<sub>0</sub> = b<sub>1</sub> = 0</code>，并且自身摘要与观察到的 publication identity 一致。</li>
+              </ol>
+              <p>这四个语句不是一个原子 SQL 快照。一个 mutation 可能在 <code>m<sub>1</sub></code> 之后、<code>p<sub>1</sub></code> 之前提交，而不改变已采样的 <code>M</code> 值。因此定理只覆盖在第一次权威观察 <code>m<sub>0</sub></code> 之前提交的收窄，而不是 <code>p<sub>1</sub></code> 之前的每一个事件。</p>
+              <h3 class="subhead">严格读取</h3>
+              <p>strict reader 启动一个新事务，把 narrowing predicate 作为第一次一致性读；随后取得当前 pointer 与 manifest，校验 scope、segment 顺序与 hash 链，拒绝不一致或陈旧的链。证明依赖这个新鲜的 committed-state read view，而不依赖一份没有被冻结实验归档过的隔离级别声明。</p>
+              <p class="inline-note"><strong>缓存命中不是授权事实。</strong>TTL、token 和 hit 只描述驻留与谱系；source freshness 必须由 source-linked observation 证明。</p>
+            </section>
+
+            <section class="story-section" id="final-reload">
+              <p class="section-label">10 <span>最终重载</span></p>
+              <h2>匹配出的 g₀ 不是授权，最终重载必须再次证明它是同一个 grant。</h2>
+              <p>对 <code>E<sub>0</sub></code> 的匹配产生候选，而不是 authority。决定路径会重复加载证据，得到 <code>E<sub>1</sub></code>，并验证它与请求的 tenant、scope、gate、有序 manifest 摘要、generation、fence、完整性元数据以及 exact canonical grant 一致。</p>
+              <p>exact check 不只是 resource 与 action：它还包括 grant 的 origin、logical id、revision 与 provenance。一个逻辑标识可能在 tombstone 之后被重新使用，但 revision 不会被重新分配给另一条记录。</p>
+              <h3 class="subhead">为什么 resource/action 不够</h3>
+              <p>撤权后重新授权可能产生相同的 resource 与 action，却是一个 successor revision。若只按 resource/action 重新匹配，旧候选会被这个 successor “接上”，看起来仍然合法；但 origin、revision 或 provenance 已经不是原来那个 grant。最终重载必须让这种替换失败。</p>
+              <h3 class="subhead">host fence</h3>
+              <p>host 在资源归属与评估之前捕获一个 opaque authority fence，在辅助权威读取之后、进入下游 handler 之前比较原 fence。一个使原 fence 失效的 cold refill 不能被静默替换为请求的新基线；该请求必须被拒绝，后续请求重新评估。这是 admission mediation，不是 handler 后续业务效果的原子化。</p>
+              <p class="inline-note"><strong>最终重载不是“再查一次”。</strong>它要同时证明发布身份、scope 与候选身份没有在决定过程中漂移。</p>
+            </section>
+
+            <section class="story-section" id="failure-semantics">
+              <p class="section-label">11 <span>失败语义</span></p>
+              <h2>失败时只有两种安全结果：PENDING 或 DENY。</h2>
+              <p>唯一的成功结果是：通过 stable check 后返回 ALLOW。无匹配或无效上下文返回 <code>DEFAULT_DENY</code>；证据未就绪、变化中、缺失、格式错误或无法验证时，按失败类别返回 <code>AUTHORIZATION_PENDING</code> 或 <code>DEFAULT_DENY</code>。</p>
+              <ul class="boundary-list">
+                <li>没有匹配或上下文无效：<code>DEFAULT_DENY</code>。</li>
+                <li>证据缺失、陈旧、变化中或无法验证：<code>PENDING</code> 或 <code>DENY</code>，绝不回退到旧的 ALLOW。</li>
+                <li>PENDING 不能被缓存为授权，不能被当作后续请求的放行依据，也不能复用之前的 ALLOW。</li>
+                <li>当前 API 不承诺统一的 retry interval；调用方需要应用自己的有界策略。</li>
+                <li>业务 PENDING 不会推进基础设施 circuit breaker。</li>
+              </ul>
+              <p>当前兼容入口把 DENY 与 PENDING 都映射为 HTTP 403，并保留语义 reason code；集成映射或策略拒绝使用 403，身份/会话失败使用 401，pending 或不可用证据可以使用 503。传输状态本身不能替代语义决定，实验必须记录实际 decision 与 host outcome。</p>
+              <p class="inline-note"><strong>PENDING 不是“稍后会自动放行”。</strong>它明确表示证据不足，受保护效果不得执行；可用性代价是这份合同的一部分。</p>
+            </section>
+
+            <section class="story-section" id="request-lifecycle">
+              <p class="section-label">12 <span>请求生命周期</span></p>
+              <h2>匹配很快，时间花在往返上。</h2>
+              <p class="lead">一次签名请求要穿过连接、身份、证据读取、匹配和最终重载。把各阶段与现有基准对齐，瓶颈很明确：编译匹配只占极小部分，主要成本在网络、身份/会话和证据 I/O。</p>
+              <ol class="request-flow">
+                <li><span class="step-number">01</span><div><h3>入口与 HTTP</h3><p>连接接纳、HTTP 解析、签名头校验；跨进程请求在这里产生第一段网络与排队成本。</p><span class="flow-domain">NETWORK</span></div></li>
+                <li><span class="step-number">02</span><div><h3>身份与上下文</h3><p>JWT / session、双卡绑定、tenant、scope 与 principal 校验；需要会话或身份映射读取。</p><span class="flow-domain">CPU + I/O</span></div></li>
+                <li><span class="step-number">03</span><div><h3>候选证据加载</h3><p>内存 hub 命中，或 strict refill 读取 current pointer、manifest、segment 与 pending predicate。</p><span class="flow-domain">I/O / CACHE</span></div></li>
+                <li><span class="step-number">04</span><div><h3>编译匹配</h3><p>编译内核在稳定 grant 集上选出候选；这就是 0.10–0.47µs 微基准所测的部分。</p><span class="flow-domain">CPU</span></div></li>
+                <li><span class="step-number">05</span><div><h3>最终重载与 host fence</h3><p>再次加载证据、复核 exact grant 与发布身份；辅助读取与 fence 比较仍在 I/O 路径上。</p><span class="flow-domain">I/O</span></div></li>
+                <li><span class="step-number">06</span><div><h3>响应与提交后处理</h3><p>序列化、HTTP 返回，以及提交后的审计/outbox；审计异步化时不一定在请求关键路径上。</p><span class="flow-domain">NETWORK / I/O</span></div></li>
+              </ol>
+              <div class="request-cost">
+                <h3>不同观测面的 p50</h3>
+                <div class="cost-table" role="table" aria-label="请求路径 p50 对比">
+                  <div class="cost-row cost-head" role="row"><span role="columnheader">观测面</span><span role="columnheader">p50</span><span role="columnheader">相对内核</span></div>
+                  <div class="cost-row" role="row"><span role="cell">compiled kernel</span><strong role="cell">0.205 µs</strong><span role="cell">1×</span></div>
+                  <div class="cost-row" role="row"><span role="cell">native composite · c=1</span><strong role="cell">411 µs</strong><span role="cell">≈2,000×</span></div>
+                  <div class="cost-row" role="row"><span role="cell">native composite · c=64</span><strong role="cell">4,663 µs</strong><span role="cell">≈22,700×</span></div>
+                  <div class="cost-row" role="row"><span role="cell">historical signed · 1 thread</span><strong role="cell">16.29 ms</strong><span role="cell">≈79,000×</span></div>
+                  <div class="cost-row" role="row"><span role="cell">historical signed · 8 threads</span><strong role="cell">17.18 ms</strong><span role="cell">≈83,800×</span></div>
+                </div>
+                <p class="proof-caveat">compiled kernel 只测匹配；native composite 包含 HMAC、Gateway、TrustGraph 与真实 DB；历史签名请求包含身份/权限检查与证据读取。三者不是同一部署，比值用于量级判断，不是端到端分解。</p>
+              </div>
+              <p class="inline-note"><strong>瓶颈证据：</strong>历史冷/热决策中位数 18.83 / 18.19ms，差异仅 0.64ms；native 的 mysql/req 从 c=1 的 4.0 降到 c=64 的 1.1；c=512 触到连接接纳边界（9.53M transport errors，仅 533 成功）。这些迹象共同指向网络与证据 I/O，而不是匹配内核。</p>
+            </section>
+
+            <section class="story-section" id="guarantee">
+              <p class="section-label">13 <span>条件保证</span></p>
+              <h2>一个带前提、针对具体 grant 的条件安全保证。</h2>
+              <p>在上述来源、发布、存储完整性、读取观察与 host mediation 前提下，论文给出一个条件定理。它不是对所有策略变化的全局快照，也不是对部署的机器化证明。</p>
+              <h3 class="subhead">五个前提</h3>
+              <ul class="lemma-list">
+                <li><strong>M1 来源捕获：</strong>每个相关的 source mutation 原子地记录 durable delta/outbox、source generation、revoke fence、tenant 与全部受影响 scope；收窄分类采取保守策略。</li>
+                <li><strong>M2 单调发布：</strong>成功发布原子地记录严格推进的 affected-scope watermark 与 pointer；摘要不会回滚，也不会被复用于另一个状态。</li>
+                <li><strong>M3 忠实表示：</strong>projector 只把已批准的 delta 物化为有序、带完整性校验的证据；一个已被发布覆盖的贡献，必须持续被其 watermark 所表示。</li>
+                <li><strong>M4 可信存储与进程：</strong>权威 writer、读取端、projector 与完整性密钥不是 Byzantine；不匹配、缺失记录与未知结果都 fail closed。</li>
+                <li><strong>M5 完整中介：</strong>每一个受保护的 host 操作都以绑定的 context 调用 evaluator，并且只有 ALLOW 之后才继续执行。</li>
+              </ul>
+              <p>除 M1–M5 外，读取端的两条观察合同与 grant revision ledger 也是前提：前者见第 09 节，后者见第 10 节。</p>
+              <div class="claim-box claim-theorem">
+                <span class="claim-kicker">CONDITIONAL ADMISSION-SAFETY</span>
+                <p>在 M1–M5、读取观察合同与 grant revision ledger 合同下，每一次成功的 ALLOW 都存在一个一致性点 <code>t* = t<sub>f</sub></code>：所有在 <code>t<sub>f</sub></code> 之前提交、且对请求 scope 可见的撤权类变更，都已成功发布并被最终证据 <code>E<sub>1</sub></code> 表示；<code>E<sub>1</sub></code> 还必须绑定被准入的确切 candidate grant。无法建立该条件时，结果只能是 PENDING 或 DENY。</p>
+              </div>
+              <h3 class="subhead">一致性点在哪里</h3>
+              <p><code>t<sub>f</sub></code> 是提供成功最终证据的第一次权威观察：缓存分支取 <code>m<sub>0</sub></code>，严格读取分支取初始谓词读视图。身份稳定检查完成于 <code>t<sub>v</sub></code>，ALLOW 返回 host 于 <code>t<sub>a</sub></code>，所以 <code>t<sub>f</sub> ≤ t<sub>v</sub> ≤ t<sub>a</sub></code>。</p>
+              <h3 class="subhead">四个支撑引理</h3>
+              <ul class="lemma-list">
+                <li><strong>可见性捕获：</strong>在一次新鲜谓词读之前提交的可见收窄，要么让 <code>b = 1</code>，要么已经成功发布。</li>
+                <li><strong>缓存观察与表示：</strong>通过两次有序观察与相等测试的缓存候选，表示 <code>m<sub>0</sub></code> 之前提交的每一个可见撤权类变更。</li>
+                <li><strong>严格观察与表示：</strong>成功的严格加载表示其初始谓词读视图之前提交的每一个可见撤权类变更。</li>
+                <li><strong>候选身份绑定：</strong>不同的 grant revision 不能在满足 stable check 的同时替代原候选。</li>
+              </ul>
+              <h3 class="subhead">定理不覆盖什么</h3>
+              <ul class="boundary-list">
+                <li><code>[t<sub>f</sub>, t<sub>a</sub>]</code> 之间提交的重叠 mutation。</li>
+                <li>后续业务效果本身的原子性；它需要 host 事务或 effect fence。</li>
+                <li>ADD 的可见性、Byzantine 存储、多 writer 排序与 replica 分歧。</li>
+                <li>无界 clock skew、全局策略线性化，以及更丰富策略语言的组合语义。</li>
+              </ul>
+              <p class="inline-note"><strong>这是一个充分的条件合同。</strong>它连接“可见的 pre-observation 撤权”与“被准入的确切 grant”，同时把可用性代价和未覆盖范围写在结果旁边。</p>
+            </section>
+
+            <section class="story-section" id="evidence">
+              <p class="section-label">14 <span>证据分级</span></p>
+              <h2>旧基线、当前测试与未闭合 gate，是三件不同的事。</h2>
+              <p>论文刻意把证据分成三个 surface。把一个 surface 的 PASS 转移成另一个 surface 的结果，会让“问题定义”看起来比实际更完整。</p>
+              <div class="evidence-list">
+                <article class="evidence-row">
+                  <div><p class="evidence-status">BASELINE</p><h3>冻结的三进程历史基线</h3></div>
+                  <div><p>三个 TrustGraph 进程共享 MySQL、Redis 与 RabbitMQ；11/11 计划步骤 PASS，270 PASS、0 FAIL、3 N/A。诊断 race 记录 30 cycles、12 readers、37,413 samples，0 个 post-ack stale 或 in-flight ALLOW、669 个 PENDING；传播均值约 572.6ms，撤权均值约 585.2ms。</p></div>
+                  <div><p>只支持该部署与被实际执行的路径。诊断 race 不包含 production final identity-stable reload；它不是 native composite 的结果。</p></div>
+                </article>
+                <article class="evidence-row">
+                  <div><p class="evidence-status">REGISTERED</p><h3>当前 native 实现与测试</h3></div>
+                  <div><p>覆盖 compiler/policy/hub 的离线测试、MySQL-backed native lifecycle、standalone MySQL/RabbitMQ transport，以及 hub、writer-lock、identity-mapping、Redis-free 等前提 suite。</p></div>
+                  <div><p>注册测试不等于完成的 campaign，也不能从组件或单机结果推断 signed HTTP host race 已通过。</p></div>
+                </article>
+                <article class="evidence-row">
+                  <div><p class="evidence-status">PLANNED / BLOCKED</p><h3>尚未闭合的评测 gate</h3></div>
+                  <div><p>E1 complete host race、E2 controlled omissions、E3 recovery/availability、E4 native preconditions/faults，以及 memory-served native admission 与定理之间缺失的映射，仍是独立 gate。</p></div>
+                  <div><p>未见完整 artifact、时间点与 postcondition 前，不写成 PASS。ACK、cache hit、模型论证和“没有观察到失败”都不能替代这些证据。</p></div>
+                </article>
+              </div>
+              <p class="inline-note"><strong>证据状态不是 prose confidence。</strong>PLANNED 不能进入结果；UNKNOWN 不能转写成 PASS；旧 Redis/三进程基线不能冒充新 native composite 的测量。</p>
+            </section>
+
+            <section class="story-section next-steps" id="explore">
+              <p class="section-label">15 <span>继续探索</span></p>
+              <h2>从问题定义开始，最后回到证据。</h2>
+              <p>01–14 节整理自论文手稿的问题定义、设计合同、请求生命周期与条件保证；项目愿景、体系角色与当前边界见左侧页面。每个结论都应回到代码、可重复的测试和明确的环境边界。</p>
+              <ul class="resource-list">
+                <li><a href="https://github.com/CoreryBlack/AstralLight.Next" target="_blank" rel="noreferrer">浏览 Rust 仓库 <span aria-hidden="true">↗</span></a></li>
+                <li><a href="https://github.com/CoreryBlack/AstralLight.Next/tree/main/Docs/架构/Rust架构设计" target="_blank" rel="noreferrer">阅读架构设计 <span aria-hidden="true">↗</span></a></li>
+                <li><a href="https://github.com/CoreryBlack/AstralLight.Next/tree/main/Docs/社区文章" target="_blank" rel="noreferrer">阅读实现文章 <span aria-hidden="true">↗</span></a></li>
+                <li><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/CONTRIBUTING.md" target="_blank" rel="noreferrer">查看贡献与许可 <span aria-hidden="true">↗</span></a></li>
+              </ul>
+            </section>
+          </div>
+        </div>
+              </section>
+              <section class="deck-panel deck-reserves" id="panel-reserves" role="tabpanel" aria-labelledby="tab-reserves">
+                <div class="reserves-wrap">
+                  <p class="section-label">技术储备 <span>TECHNOLOGY RESERVES</span></p>
+                  <h2>按证据状态，看真正的技术储备。</h2>
+                  <p class="reserves-lead">不再按 Mobius / Klein 等代号介绍，而是从能力清单中按“已实现、部分实现、规划中”摘录代表项；每一类都带证据边界。</p>
+                  <div class="reserve-columns">
+                    <section class="reserve-column">
+                      <div class="reserve-column-head"><h3>已实现</h3><span class="reserve-count">清单：已完成</span></div>
+                      <p class="reserve-source">有源码证据，不代表生产启用。</p>
+                      <ul class="reserve-list">
+                        <li><strong>Generation / Fence 版本一致性</strong><span>generation/fence 与 CAS 源码；真实 DB/MQ 与正式切流另属验收。</span></li>
+                        <li><strong>Fail-Closed 裁决不变式</strong><span>strict reader 对缺失或错误证据拒绝 ALLOW，不回退旧快照或 raw source。</span></li>
+                        <li><strong>双卡 Token 身份凭证</strong><span>PlatformUser 双卡上下文，AppUser 为 identity-only；不等于客户端凭证托管。</span></li>
+                        <li><strong>有界快照与 warm-hint 校验</strong><span>捕获、pending delta 与文件大小有上限；加载重验 durable pointer 与 pending。</span></li>
+                        <li><strong>MFA 防重放 / Refresh token 轮换</strong><span>TOTP 加密存储、恢复码哈希、counter 单调；token 与 session/family/epoch 绑定。</span></li>
+                        <li><strong>迁移 preflight 门禁</strong><span>目标/schema preflight、migration lock、checksum 与 contract 检查；代码存在不等于迁移已执行。</span></li>
+                      </ul>
+                    </section>
+                    <section class="reserve-column">
+                      <div class="reserve-column-head"><h3>部分实现</h3><span class="reserve-count">清单：部分完成</span></div>
+                      <p class="reserve-source">局部机制存在，仍有默认关闭或验收缺口。</p>
+                      <ul class="reserve-list">
+                        <li><strong>分区 projector / 并行 worker</strong><span>默认仍为 TenantSerial；Partitioned 需显式开启，真实多 worker 未验收。</span></li>
+                        <li><strong>跨城签名投票与 durable receipt</strong><span>Ed25519 验签、replay reservation、双城 apply receipt 有源码；runtime default-off。</span></li>
+                        <li><strong>ORG_SCOPE typed 治理与发布链</strong><span>repository/outbox/compile/membership/mask/publish 有源码；ASTRAL_ORG_SCOPE_ENABLED 缺省关闭，迁移与路径集成未验收。</span></li>
+                        <li><strong>内存权威读面 + source fence</strong><span>hub、source guard、lease 与 token 复检存在；只覆盖登记读面，不代表全 HTTP 零 DB。</span></li>
+                        <li><strong>Canonical 投影迁移与切流</strong><span>projector/archive/strict reader 有接线；backfill、真实 DB/MQ、缓存迁移与正式切流未验收。</span></li>
+                        <li><strong>AL-native outbox / IN_DOUBT</strong><span>ordering scope、lease 与对账逻辑存在；ACK 不等于 durable completion。</span></li>
+                      </ul>
+                    </section>
+                    <section class="reserve-column">
+                      <div class="reserve-column-head"><h3>规划中</h3><span class="reserve-count">清单：设计储备</span></div>
+                      <p class="reserve-source">有设计或路线，不应按已实现能力引用。</p>
+                      <ul class="reserve-list">
+                        <li><strong>Mobius 审批编排</strong><span>应急模板、临时授权生命周期、分级通知与自动到期；现有审批到账本链路不等于完整 Mobius。</span></li>
+                        <li><strong>Klein 跨系统接管</strong><span>非侵入 sidecar/代理、存量权限同化与统一视图；SDK/adapter 仍需显式集成。</span></li>
+                        <li><strong>多机双通道冗余投递</strong><span>要求独立 broker、operation 级原子 claim 与 consumer 幂等，不是同机双队列。</span></li>
+                        <li><strong>巨卡内存镜像 + FactoredHotState</strong><span>装配缓存、规模护栏、共享段与 operation/event 池化；尚未实施。</span></li>
+                        <li><strong>治理与迁移扩展</strong><span>ORG_SCOPE Phase 2、Gateway A–F 解耦、生命周期治理与迁移候选；局部约束不等于全局合同。</span></li>
+                      </ul>
+                    </section>
+                  </div>
+                  <p class="reserve-note">状态口径：已实现=有源码证据但不代表生产启用；部分实现=局部机制/默认关闭/未验收；规划中=设计储备。另有 Terra 等无代码证据项，不计入以上三类；Redis hint 模式 B 仍是未批准讨论稿，文档方案曾给出最多约 5 秒撤销传播窗口。</p>
+                  <a class="article-link" href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/技术能力与储备清单.md" target="_blank" rel="noreferrer">查看 54 项技术能力核验与证据边界 <span aria-hidden="true">↗</span></a>
+                </div>
+              </section>
+            </div>
+          </div>
+        </section>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <a class="brand footer-brand" href="#top"><img class="brand-mark" src="assets/astral-mark.png" alt="" width="24" height="24">AstralLight<span class="brand-period">.</span></a>
+      <span>构建可验证的授权系统，始于承认每个边界。</span>
+      <div class="footer-links"><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/LICENSE" target="_blank" rel="noreferrer">AGPL-3.0-or-later</a><a href="#top">回到顶部 ↑</a></div>
+    </footer>
+    <script src="site.js" defer></script>
+  </body>
+</html>

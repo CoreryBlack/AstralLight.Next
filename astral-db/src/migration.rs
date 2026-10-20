@@ -223,6 +223,9 @@ const IDENTITY_CREDENTIAL_FENCE_VERSION: i64 = 20261003000001;
 const ASYNC_OPERATION_CORRELATION_VERSION: i64 = 20261003000002;
 const CHAT_DELIVERY_INTENT_VERSION: i64 = 20261003000004;
 const LEARN_SYSTEM_ASSIGNMENT_VERSION: i64 = 20261003000005;
+const PROJECTION_OWNED_EXECUTION_VERSION: i64 = 20261015000001;
+const PROJECTION_OWNED_EXECUTION_SQL_SHA384: &str =
+    "283fc5847f61d2d116ece1f7b1ae691f19d667f9bd79f068ac1087bcd5f1697f09c9255df26a52829b159a60ed1a1d76";
 const IDENTITY_CREDENTIAL_FENCE_COLUMNS: &[HistoricalColumnSpec] = &[
     HistoricalColumnSpec {
         table: "user_local_credential",
@@ -765,6 +768,8 @@ const DESTRUCTIVE_MIGRATION_CUTOVER_PROOF_ENV: &str =
     "ASTRAL_DESTRUCTIVE_MIGRATION_CUTOVER_PROOF_ID";
 const DESTRUCTIVE_MIGRATION_DRAIN_SQL: &str = "SELECT 1 FROM authorization_projection_outbox WHERE status = 'PENDING' AND aggregate_type IN ('CARD', 'RULE_SET') LIMIT 1";
 const ISOLATED_MIGRATION_DATABASES: &[&str] = &["astral_test", "astral_rehearsal"];
+const RUN_SCOPED_REHEARSAL_PREFIX: &str = "astral_rehearsal_";
+const MAX_RUN_SCOPED_REHEARSAL_SUFFIX_BYTES: usize = 47;
 const ISOLATED_MIGRATION_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 const ISOLATED_MIGRATION_PORT: u16 = 3308;
 const AUTH_FAMILY_SESSION_TABLE: &str = "auth_device_session";
@@ -810,6 +815,10 @@ const TENANT_SCHOOL_CUTOVER_TABLE_DEFINITION_MYSQL8: &str = "CREATE TABLE IF NOT
 const TENANT_SCHOOL_CUTOVER_EXACT_REWRITES: &[(&str, &str)] = &[(
     TENANT_SCHOOL_CUTOVER_TABLE_DEFINITION,
     TENANT_SCHOOL_CUTOVER_TABLE_DEFINITION_MYSQL8,
+)];
+const AUTH_FAMILY_EXACT_REWRITES: &[(&str, &str)] = &[(
+    "SET @db = DATABASE();",
+    "SET @db = CONVERT(DATABASE() USING utf8mb4) COLLATE utf8mb4_0900_ai_ci;",
 )];
 const AUTH_FAMILY_INCOMPATIBLE_STATEMENTS: &[&str] = &[
     AUTH_FAMILY_SESSION_STATE_STATEMENT,
@@ -1070,7 +1079,7 @@ const HISTORICAL_MIGRATION_COMPATIBILITY: &[HistoricalMigrationCompatibility] = 
         version: AUTH_FAMILY_SCHEMA_CONTRACT_VERSION,
         source_sha384: AUTH_FAMILY_SCHEMA_CONTRACT_SQL_SHA384,
         incompatible_statements: AUTH_FAMILY_INCOMPATIBLE_STATEMENTS,
-        exact_rewrites: &[],
+        exact_rewrites: AUTH_FAMILY_EXACT_REWRITES,
         rewrite: HistoricalMigrationRewrite::ReplaceWithSelect1,
         columns: AUTH_FAMILY_SESSION_COLUMNS,
     },
@@ -1162,6 +1171,22 @@ fn is_valid_destructive_proof_reference(value: &str) -> bool {
         })
 }
 
+fn is_isolated_migration_database(database: &str) -> bool {
+    if ISOLATED_MIGRATION_DATABASES
+        .iter()
+        .any(|allowed| database.eq_ignore_ascii_case(allowed))
+    {
+        return true;
+    }
+    let Some(suffix) = database.strip_prefix(RUN_SCOPED_REHEARSAL_PREFIX) else {
+        return false;
+    };
+    (1..=MAX_RUN_SCOPED_REHEARSAL_SUFFIX_BYTES).contains(&suffix.len())
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 fn ensure_isolated_migration_target(database_url: &str) -> Result<(), MigrationError> {
     if std::env::var("ASTRAL_MIGRATION_ENV").as_deref() != Ok(ISOLATED_MIGRATION_ENV) {
         return Err(MigrationError::Failed(
@@ -1174,12 +1199,9 @@ fn ensure_isolated_migration_target(database_url: &str) -> Result<(), MigrationE
     let database = options.get_database().ok_or_else(|| {
         MigrationError::Failed("migration DATABASE_URL must select a database".into())
     })?;
-    if !ISOLATED_MIGRATION_DATABASES
-        .iter()
-        .any(|allowed| database.eq_ignore_ascii_case(allowed))
-    {
+    if !is_isolated_migration_database(database) {
         return Err(MigrationError::Failed(format!(
-            "refusing migration for database {database:?}; only astral_test or astral_rehearsal are isolated"
+            "refusing migration for database {database:?}; expected astral_test, astral_rehearsal, or a lowercase run-scoped astral_rehearsal_<suffix> name"
         )));
     }
     let host = options.get_host().trim_matches(['[', ']']);
@@ -4012,6 +4034,8 @@ async fn preflight_before_baseline_adoption(pool: &MySqlPool) -> Result<(), Migr
 /// This is intentionally the normal application-startup path. Missing tables
 /// or columns are a deployment error and must be corrected by `astral-migrate`.
 pub async fn connect_and_validate_schema(database_url: &str) -> Result<MySqlPool, MigrationError> {
+    crate::freeze_projection_execution_mode_from_env()
+        .map_err(|error| MigrationError::Failed(error.to_string()))?;
     let pool = mysql_pool_options()
         .connect_with(mysql_connection_options(database_url)?)
         .await
@@ -4679,6 +4703,7 @@ async fn validate_incremental_projection_archive_table_contract(
     table: &str,
     lineage_recorded: Option<bool>,
     invalidation_recorded: Option<bool>,
+    owned_execution_recorded: Option<bool>,
 ) -> Result<(), MigrationError> {
     let columns: Vec<SchemaColumnContract> = INCREMENTAL_PROJECTION_ARCHIVE_COLUMN_CONTRACTS
         .iter()
@@ -4720,6 +4745,7 @@ async fn validate_incremental_projection_archive_table_contract(
             &columns,
             lineage_recorded,
             invalidation_recorded,
+            owned_execution_recorded,
         )
         .await?;
     }
@@ -4732,13 +4758,12 @@ async fn validate_incremental_projection_archive_table_contract(
 }
 
 /// Build the runtime-resolved column contract for one archive table: creator
-/// columns first, then additive columns in migration order. Each additive
-/// migration owns its own tail; the final runtime shape includes both tails.
+/// columns first, then additive columns in migration order.
 fn incremental_projection_resolved_column_contract(
     table: &str,
     base_columns: &[SchemaColumnContract],
 ) -> Vec<SchemaColumnContract> {
-    let mut resolved = Vec::with_capacity(base_columns.len() + 7);
+    let mut resolved = Vec::with_capacity(base_columns.len() + 12);
     resolved.extend_from_slice(base_columns);
     for expected in AUTHORIZATION_PROJECTION_LINEAGE_FENCE_COLUMN_CONTRACTS {
         if expected.table == table {
@@ -4746,6 +4771,11 @@ fn incremental_projection_resolved_column_contract(
         }
     }
     for expected in DELTA_EVENT_PUBLISHED_EVIDENCE_INVALIDATION_COLUMN_CONTRACTS {
+        if expected.table == table {
+            resolved.push(*expected);
+        }
+    }
+    for expected in PROJECTION_OWNED_EXECUTION_DELTA_COLUMN_CONTRACTS {
         if expected.table == table {
             resolved.push(*expected);
         }
@@ -4783,6 +4813,34 @@ async fn validate_lineage_fence_tail_state(
     base_columns: &[SchemaColumnContract],
     lineage_recorded: Option<bool>,
     invalidation_recorded: Option<bool>,
+    owned_execution_recorded: Option<bool>,
+) -> Result<(), MigrationError> {
+    let actual = ordered_table_column_names(pool, table).await?;
+    validate_resolved_archive_column_order(
+        table,
+        base_columns,
+        &actual,
+        lineage_recorded,
+        invalidation_recorded,
+        owned_execution_recorded,
+    )?;
+    for expected in incremental_projection_resolved_column_contract(table, base_columns)
+        .iter()
+        .skip(base_columns.len())
+        .take(actual.len() - base_columns.len())
+    {
+        validate_schema_column_exact(pool, expected).await?;
+    }
+    Ok(())
+}
+
+fn validate_resolved_archive_column_order(
+    table: &str,
+    base_columns: &[SchemaColumnContract],
+    actual: &[String],
+    lineage_recorded: Option<bool>,
+    invalidation_recorded: Option<bool>,
+    owned_execution_recorded: Option<bool>,
 ) -> Result<(), MigrationError> {
     let lineage_tail: Vec<&SchemaColumnContract> =
         AUTHORIZATION_PROJECTION_LINEAGE_FENCE_COLUMN_CONTRACTS
@@ -4794,12 +4852,17 @@ async fn validate_lineage_fence_tail_state(
             .iter()
             .filter(|expected| expected.table == table)
             .collect();
+    let owned_execution_tail: Vec<&SchemaColumnContract> =
+        PROJECTION_OWNED_EXECUTION_DELTA_COLUMN_CONTRACTS
+            .iter()
+            .filter(|expected| expected.table == table)
+            .collect();
     let declared_tail: Vec<&SchemaColumnContract> = lineage_tail
         .iter()
         .chain(invalidation_tail.iter())
+        .chain(owned_execution_tail.iter())
         .copied()
         .collect();
-    let actual = ordered_table_column_names(pool, table).await?;
 
     if actual.len() < base_columns.len()
         || actual[..base_columns.len()]
@@ -4823,7 +4886,6 @@ async fn validate_lineage_fence_tail_state(
                 "incremental projection archive table {table} has incompatible column order or unexpected columns; refusing automatic ALTER/DROP"
             )));
         }
-        validate_schema_column_exact(pool, expected).await?;
     }
     if tail.len() > declared_tail.len() {
         return Err(MigrationError::Failed(format!(
@@ -4842,6 +4904,11 @@ async fn validate_lineage_fence_tail_state(
             "migration 20260914000001 is recorded but table {table} lacks its declared invalidation column; refusing to replay or recreate recorded history"
         )));
     }
+    if owned_execution_recorded == Some(true) && tail.len() < declared_tail.len() {
+        return Err(MigrationError::Failed(format!(
+            "migration {PROJECTION_OWNED_EXECUTION_VERSION} is recorded but table {table} lacks its declared owned-execution columns; refusing to replay or recreate recorded history"
+        )));
+    }
     Ok(())
 }
 
@@ -4851,12 +4918,14 @@ async fn validate_incremental_projection_archive_schema_contract(
     let lineage_recorded = Some(authorization_projection_lineage_fence_recorded(pool).await?);
     let invalidation_recorded =
         Some(delta_event_published_evidence_invalidation_recorded(pool).await?);
+    let owned_execution_recorded = Some(projection_owned_execution_recorded(pool).await?);
     for table in INCREMENTAL_PROJECTION_ARCHIVE_TABLES {
         validate_incremental_projection_archive_table_contract(
             pool,
             table,
             lineage_recorded,
             invalidation_recorded,
+            owned_execution_recorded,
         )
         .await?;
     }
@@ -4888,6 +4957,15 @@ async fn delta_event_published_evidence_invalidation_recorded(
     Ok(recorded_successful_versions(pool)
         .await?
         .contains(&DELTA_EVENT_PUBLISHED_EVIDENCE_INVALIDATION_VERSION))
+}
+
+async fn projection_owned_execution_recorded(pool: &MySqlPool) -> Result<bool, MigrationError> {
+    if !migration_history_table_exists(pool).await? {
+        return Ok(false);
+    }
+    Ok(recorded_successful_versions(pool)
+        .await?
+        .contains(&PROJECTION_OWNED_EXECUTION_VERSION))
 }
 
 async fn migration_history_table_exists(pool: &MySqlPool) -> Result<bool, MigrationError> {
@@ -4929,6 +5007,7 @@ async fn preflight_incremental_projection_archive_schema_contract(
     let migration_pending = !applied_versions.contains(&INCREMENTAL_PROJECTION_ARCHIVE_VERSION);
     let lineage_recorded = authorization_projection_lineage_fence_recorded(pool).await?;
     let invalidation_recorded = delta_event_published_evidence_invalidation_recorded(pool).await?;
+    let owned_execution_recorded = projection_owned_execution_recorded(pool).await?;
     let mut complete = true;
 
     for table in INCREMENTAL_PROJECTION_ARCHIVE_TABLES {
@@ -4975,6 +5054,7 @@ async fn preflight_incremental_projection_archive_schema_contract(
                 table,
                 Some(lineage_recorded),
                 Some(invalidation_recorded),
+                Some(owned_execution_recorded),
             )
             .await?;
         }
@@ -5053,7 +5133,7 @@ async fn validate_archive_index_removal_postcondition(
         });
     }
     for (_, table, _) in POST_CREATOR_INDEX_REMOVALS {
-        validate_incremental_projection_archive_table_contract(pool, table, None, None)
+        validate_incremental_projection_archive_table_contract(pool, table, None, None, None)
             .await
             .map_err(|error| MigrationError::RecoveryRequired {
                 reason: format!(
@@ -5478,6 +5558,10 @@ fn migration_matches_known_source(migration: &Migration) -> bool {
                 .is_some_and(|contract| {
                     canonical_sha384_hex(migration.sql.as_bytes()) == contract.source_sha384
                 });
+        }
+        if migration.version == PROJECTION_OWNED_EXECUTION_VERSION {
+            return canonical_sha384_hex(migration.sql.as_bytes())
+                == PROJECTION_OWNED_EXECUTION_SQL_SHA384;
         }
         if migration.version == CROSS_CITY_RUNTIME_PROOF_VERSION {
             return canonical_sha384_hex(migration.sql.as_bytes())
@@ -10031,7 +10115,79 @@ const CROSS_CITY_SCHEMA_COLUMN_CONTRACTS: &[SchemaColumnContract] = &[
     ),
 ];
 
+const PROJECTION_OWNED_EXECUTION_DELTA_COLUMN_CONTRACTS: &[SchemaColumnContract] = &[
+    incremental_scalar_column(
+        "authorization_delta_event",
+        "execution_attempts",
+        "BIGINT",
+        true,
+        Some("0"),
+    ),
+    incremental_scalar_column(
+        "authorization_delta_event",
+        "execution_failures",
+        "BIGINT",
+        true,
+        Some("0"),
+    ),
+    incremental_scalar_column(
+        "authorization_delta_event",
+        "execution_episode_token_hash",
+        "BINARY(32)",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_delta_event",
+        "failure_recorded_token_hash",
+        "BINARY(32)",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_delta_event",
+        "execution_accounting_version",
+        "INT",
+        true,
+        Some("1"),
+    ),
+];
+
+const PROJECTION_OWNED_EXECUTION_COLUMNS: &[(&str, &str)] = &[
+    (
+        "authorization_projection_partition_lease",
+        "execution_epoch",
+    ),
+    (
+        "authorization_projection_partition_lease",
+        "active_delta_event_id",
+    ),
+    (
+        "authorization_projection_partition_lease",
+        "active_delta_token_hash",
+    ),
+    ("authorization_delta_event", "execution_attempts"),
+    ("authorization_delta_event", "execution_failures"),
+    ("authorization_delta_event", "execution_episode_token_hash"),
+    ("authorization_delta_event", "failure_recorded_token_hash"),
+    ("authorization_delta_event", "execution_accounting_version"),
+];
+const PROJECTION_OWNED_EXECUTION_INDEXES: &[(&str, &str, &[&str], bool)] = &[(
+    "authorization_projection_partition_lease",
+    "idx_appl_active_delta_event",
+    &["active_delta_event_id"],
+    false,
+)];
+
 const EXACT_MIGRATION_ARTIFACT_CONTRACTS: &[ExactMigrationArtifactContract] = &[
+    ExactMigrationArtifactContract {
+        version: PROJECTION_OWNED_EXECUTION_VERSION,
+        source_sha384: PROJECTION_OWNED_EXECUTION_SQL_SHA384,
+        supports_existing_artifacts: true,
+        tables: &[],
+        columns: PROJECTION_OWNED_EXECUTION_COLUMNS,
+        indexes: PROJECTION_OWNED_EXECUTION_INDEXES,
+    },
     ExactMigrationArtifactContract {
         version: REDUNDANT_ARCHIVE_INDEX_REMOVAL_VERSION,
         source_sha384: REDUNDANT_ARCHIVE_INDEX_REMOVAL_SQL_SHA384,
@@ -12006,6 +12162,34 @@ fn pending_migration_can_own_index(
     })
 }
 
+fn unique_duplicate_probe_required(
+    table: &str,
+    columns: &[SchemaColumnContract],
+    index_columns: &[&str],
+    missing_columns: &HashSet<&str>,
+) -> Result<bool, MigrationError> {
+    if !index_columns
+        .iter()
+        .any(|column| missing_columns.contains(column))
+    {
+        return Ok(true);
+    }
+    // An additive nullable NULL-default column makes every historical key
+    // tuple contain NULL; MySQL does not consider those tuples duplicates.
+    if columns.iter().any(|column| {
+        column.table == table
+            && missing_columns.contains(column.name)
+            && index_columns.contains(&column.name)
+            && !column.not_null
+            && column.default.is_none()
+    }) {
+        return Ok(false);
+    }
+    Err(MigrationError::Failed(format!(
+        "unique-key preflight for {table} requires missing non-NULL key columns; explicit forward recovery is required"
+    )))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn preflight_review_table(
     pool: &MySqlPool,
@@ -12025,6 +12209,7 @@ async fn preflight_review_table(
         validate_review_table_engine(pool, table).await?;
     }
     let mut complete = !table_absent;
+    let mut missing_columns = HashSet::new();
     for column in columns.iter().filter(|column| column.table == table) {
         if !table_absent && schema_column_exists(pool, table, column.name).await? {
             validate_schema_column_exact(pool, column).await?;
@@ -12036,6 +12221,7 @@ async fn preflight_review_table(
             table_absent,
         ) {
             complete = false;
+            missing_columns.insert(column.name);
         } else {
             return Err(MigrationError::Failed(format!(
                 "review column {table}.{} missing without a source-pinned additive owner",
@@ -12059,6 +12245,14 @@ async fn preflight_review_table(
         ) {
             complete = false;
             if *unique && !table_absent {
+                if !unique_duplicate_probe_required(
+                    table,
+                    columns,
+                    index_columns,
+                    &missing_columns,
+                )? {
+                    continue;
+                }
                 // All identifiers come from closed, source-pinned contracts.
                 // MySQL permits repeated NULLs in UNIQUE keys, so only complete
                 // non-NULL key tuples conflict with the candidate index.
@@ -12304,6 +12498,15 @@ pub async fn validate_schema_contract(pool: &MySqlPool) -> Result<(), MigrationE
         .await
         .map_err(MigrationError::Failed)?;
     validate_review_runtime_schema(pool).await?;
+    if crate::projection_execution_mode() == crate::ProjectionExecutionMode::WorkerOwned
+        || recorded_successful_versions(pool)
+            .await?
+            .contains(&PROJECTION_OWNED_EXECUTION_VERSION)
+    {
+        crate::validate_projection_owned_schema(pool)
+            .await
+            .map_err(|error| MigrationError::Failed(error.to_string()))?;
+    }
     validate_indexes(pool, REQUIRED_SCHEMA_INDEXES).await?;
     // Archive tables validate over the RESOLVED index contract: post-creator
     // additions (10.D-2 claim-gate support index) are required once recorded

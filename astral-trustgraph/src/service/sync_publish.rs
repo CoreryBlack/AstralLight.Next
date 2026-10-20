@@ -1,61 +1,16 @@
-//! 读链规模化 Batch E —— 授权投影「同步发布混合模式」。
+//! 授权 source 提交后的有界发布观察与 legacy 同步发布兼容入口。
 //!
-//! # 背景与语义（模块文档 = 本切片的行为契约）
+//! `WorkerOwned` 只接受已证明 source COMMIT 的完整 receipt 批次，并按每条
+//! receipt 的完整不可变绑定验证历史 durable completion。请求不认领、编译、
+//! 发布、释放或取消 worker lease；超时仅委派，不改变 source 结果或执行预算。
+//! LocalBus admission、ACK、单个 SUCCEEDED 状态和最新 pointer 都不是完成证明。
 //!
-//! writer 的 source 事务提交（durable delta 入账 `authorization_delta_event`）后
-//! 返回，发布（111→112 翻转）此前完全由 [`super::authorization_projector`] worker
-//! 异步消化：delta 入账到发布之间存在 worker 轮询窗口（秒级），期间已撤销/已变更
-//! 授权仍按旧 manifest 判定（撤销传播延迟窗口）。
+//! `LegacyHybrid` 保留请求侧 claim/process/publish 的兼容行为；仅有 event id 的
+//! 入口在 `WorkerOwned` 中直接委派，不能据此重新进入公共候选集合。任一模式
+//! 超过事件上限都整批委派，不截断批次后报告 Published。
 //!
-//! 本模块在 **不影响 fail-closed 语义** 的前提下消除单卡/小变更的生效延迟：
-//!
-//! - **混合模式**：writer source 事务 **commit 成功之后**（独立事务，绝不进入
-//!   source 事务边界），若本次写入的影响面（受影响卡数）≤
-//!   [`SYNC_PUBLISH_MAX_AFFECTED_CARDS`]，则以 **与 worker 完全相同的原语**
-//!   （`claim_next_delta_event_in_tx` → `process_one_event` → 发布事务
-//!   `project_authorization_delta_in_tx` → commit 后 L2 evidence 推送）在请求内
-//!   尝试把该卡刚入账的 delta 事件发布出去；影响面 > 阈值 → 跳过（现状语义，
-//!   worker 异步消化，秒到分钟级收敛）。
-//! - **零延迟路径**：同步发布成功（[`SyncPublishOutcome::Published`]）⇒ 目标
-//!   delta 事件已在请求内 durable 发布（发布事务 commit 证明 + L2 推送已尝试），
-//!   本请求的授权变更立即生效。
-//! - **大扇出路径**：> 阈值的写入保持纯异步，由 worker 在秒到分钟级收敛。
-//! - **两者都 fail-closed**：同步发布与 worker 使用同一发布事务与同一判定管线
-//!   （[`super::authorization_projector::process_one_event`]），Conflict / 哈希漂移 /
-//!   版本不一致 / unproven history 一律拒绝发布（PENDING/退避/隔离），绝不伪造
-//!   成功，也绝不因同步发布让写请求报错。
-//!
-//! # 失败不阻塞（最高优先级契约）
-//!
-//! source 事务已提交后同步发布才启动，因此同步发布的 **任何** 失败都不允许影响
-//! 写请求结果：本模块不返回 `Result`，调用方（repository 接线点）拿到的是普通的
-//! 单元返回值。失败分类全部降级为「worker 兜底消化」：
-//!
-//! - 目标事件已被 worker claim（live lease 被 claim 谓词排除 → claim 拿到
-//!   `None` 或更早的兄弟事件）→ [`SyncPublishOutcome::Delegated`]（worker 正在
-//!   处理，收敛由 worker 保证）；
-//! - 发布错误 / 判定 Blocked / 预算耗尽 → [`super::authorization_projector`] 的
-//!   统一 attempt-budget 语义已把事件留在队列（PENDING + 有界退避），本模块返回
-//!   [`SyncPublishOutcome::Failed`]；
-//! - 总预算（[`SYNC_PUBLISH_BUDGET`]）超时 → 对仍持有 lease 的事件做一次
-//!   best-effort 释放（守卫式 CAS：若发布事务实际已 commit 则 0 行 no-op；若
-//!   未 commit 则事件立即回到 PENDING），随后返回 [`SyncPublishOutcome::Failed`]。
-//!   极端情况下（释放也失败/未知）lease 按服务端过期时间自愈，worker 原样
-//!   reclaim（attempts+1）——绝不盲目重放、绝不伪造终态。
-//!
-//! # worker 不变性
-//!
-//! worker 循环零改动。claim 原语的资格谓词（astral-db
-//! `claim_next_delta_event_in_tx` + `DELTA_CLAIM_ELIGIBLE_PREDICATE`，由
-//! grant_repository 的 `claim_predicate_gates_future_pending_rows_but_takes_over_expired_leases`
-//! 等测试钉死）保证 **live lease 永不被偷**：worker 对已被同步发布持有 lease 的
-//! 事件只能跳过（claim 返回其它事件或 `None`），绝不会报错或重复发布；反之亦然。
-//!
-//! # 日志级别约定
-//!
-//! `Failed` → `warn`（真实失败，需要关注）；`Delegated` → `debug`（worker 竞争
-//! 获胜/队列让行是健康路径，warn 级别会在正常运行时淹没真实失败）；`Published`
-//! → `debug`（正常成功路径）。
+//! 发布/等待发生在 source 短事务结束之后。失败只记录，不反转已提交写入的返回
+//! 合同。撤销/收窄仍由 strict pending-invalidates gate 阻止旧授权放行。
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -63,38 +18,38 @@ use std::time::{Duration, Instant};
 
 use sqlx::MySqlPool;
 
-use crate::observability::{
-    record_projector_event, record_sync_publish, ProjectorEventOutcome, SyncPublishMetricOutcome,
-};
-
 use super::authorization_projector::{
     process_one_event, AuthorizationProjectorConfig, AuthorizationProjectorRuntime,
     ProjectorCancellationToken, SqlxAuthorizationProjectorRuntime, WorkerRunSummary,
 };
+use crate::observability::{
+    record_projector_event, record_sync_publish, ProjectorEventOutcome, SyncPublishMetricOutcome,
+};
+use crate::repository::authorization_source_transaction::CommittedProjectionReceipts;
 
-/// 影响面阈值：受影响卡数 ≤ 阈值 → 请求内同步发布；> 阈值 → 保持 worker 异步
-/// 消化（现状语义）。扇出越大，请求内串行发布事务越多，超过阈值的写入不应为
-/// 生效延迟付出请求延迟。
+/// 影响面阈值：legacy 模式下限制请求内同步发布；worker-owned 模式下限制有界
+/// completion 等待。超过阈值时整批交由 worker，避免请求延迟随扇出扩大。
 pub const SYNC_PUBLISH_MAX_AFFECTED_CARDS: usize = 50;
 
-/// 同步发布的整体时间预算（含全部 claim + 发布事务）。超时同失败处理，绝不
-/// 阻塞写请求；预算按墙钟计，逐事件用 `timeout_at(deadline, ...)` 收口。
+/// post-commit 请求侧工作的整体墙钟预算：legacy 模式覆盖 claim/发布，worker-owned
+/// 模式覆盖只读 completion 等待。到期后写请求继续返回，事件仍由 worker 收敛。
 pub const SYNC_PUBLISH_BUDGET: Duration = Duration::from_secs(5);
 
-/// 单次同步发布的事件预算（防御上限）：预算内的目标逐卡尝试，超出部分保持
-/// worker 消化。防止「小卡数 × 大条目数」的写入把请求变成发布风暴。
+/// 单次同步发布的事件预算（防御上限）：超过上限时整批委派给 worker，绝不截断
+/// 目标后把部分成功误报为完整 Published。
 pub const SYNC_PUBLISH_MAX_EVENTS: usize = 32;
 
-/// 同步发布 claim 的租约窗口（秒）。短于 worker 的 120s：同步发布的 lease 最坏
-/// 情况是「超时 + 释放未知」，短窗口把该尾巴收敛到 30s 自愈（worker 过期 reclaim），
-/// 而发布事务内部的 `extend_delta_event_lease` 心跳会照常把进行中的发布续到完整
-/// worker 窗口。
+/// exact completion reread 的轮询间隔；LocalBus admission/ACK 不作为完成证据。
+const OWNED_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// LegacyHybrid 请求侧 claim 的租约窗口（秒）。WorkerOwned 不使用此租约；owned
+/// completion 等待超时只委派给 worker，不释放或改变 worker lease。
 pub const SYNC_PUBLISH_CLAIM_LEASE_SECS: i64 = 30;
 
 /// 超时后 best-effort 释放的单次尝试预算；超过即放弃（lease 服务端过期自愈）。
 const RELEASE_BUDGET: Duration = Duration::from_secs(1);
 
-/// 同步发布的单个目标：一张卡在本请求内刚入账的 delta 事件集合。
+/// LegacyHybrid 请求侧同步发布的目标：一张卡在本请求内刚入账的 delta 事件集合。
 ///
 /// `event_ids` 是 `authorization_delta_event.event_id`（各 writer 以稳定维度
 /// 派生、审计已关联的 contribution 事件号），用于在 claim 队列中精确识别
@@ -150,7 +105,7 @@ pub(crate) fn group_targets(triples: Vec<(i64, i64, String)>) -> Vec<SyncPublish
         .collect()
 }
 
-/// 阈值分流（纯逻辑）：受影响卡数落在 `(0, 阈值]` 才尝试同步发布。
+/// 阈值分流（纯逻辑）：受影响卡数落在 `(0, 阈值]` 才允许请求侧工作。
 pub fn should_attempt_synchronous_publish(affected_card_count: usize) -> bool {
     affected_card_count > 0 && affected_card_count <= SYNC_PUBLISH_MAX_AFFECTED_CARDS
 }
@@ -158,24 +113,24 @@ pub fn should_attempt_synchronous_publish(affected_card_count: usize) -> bool {
 /// 同步发布结果分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPublishOutcome {
-    /// 全部目标事件都在请求内 durable 发布（发布事务 commit 证明 + L2 推送已
-    /// 尝试）；本请求的授权变更零延迟生效。
+    /// 全部目标已发布（LegacyHybrid）或完整 receipt 批次的历史 durable completion
+    /// proof 均已验证（WorkerOwned）。
     Published,
-    /// 未全部在请求内发布，但没有任何失败：目标事件（或排在它之前的兄弟事件）
-    /// 由 worker 队列保证收敛——可能已被 worker 抢先 claim（AlreadyClaimed）、
-    /// 已处于终态/退避调度，或存在必须先消化的更早事件。这是健康路径。
+    /// 目标尚未全部完成，或本入口没有足够的完整 receipt；由 worker 保持所有权
+    /// 并继续收敛。这也是超限或 completion 等待超时的结果。
     Delegated,
-    /// 同步发布失败（发布错误 / 判定拒绝 / 预算或 claim 基础设施失败 / 超时）。
-    /// 事件已按 worker 统一 attempt-budget 语义留在队列（或超时后 best-effort
-    /// 释放回 PENDING），收敛由 worker 重试机制兜底；绝不影响写请求结果。
+    /// 请求侧发布或 exact completion 读取失败。source COMMIT 结果不变，worker
+    /// 保留 durable 恢复责任；绝不影响已提交写请求的返回值。
     Failed,
 }
 
-/// repository 接线点入口：在 writer source 事务 **commit 成功之后** 调用。
-///
-/// 执行阈值分流 → 同步发布 → 按结果分类记录日志；任何失败都不上抛、不重试、
-/// 不影响已提交的 source 事务与本次请求的返回值。
+/// LegacyHybrid id-only 入口。WorkerOwned 没有完整 source receipt 时直接委派；
+/// 其他情况下执行阈值分流和同步发布。失败不上抛，不影响请求返回值。
 pub(crate) async fn after_commit_sync_publish(pool: &MySqlPool, targets: Vec<SyncPublishTarget>) {
+    if astral_db::projection_execution_mode() == astral_db::ProjectionExecutionMode::WorkerOwned {
+        record_sync_publish(SyncPublishMetricOutcome::Delegated, Duration::ZERO);
+        return;
+    }
     let started = Instant::now();
     if targets.is_empty() {
         // 本次写入没有可同步发布的 contribution（如零绑定卡/零 ALLOW 条目）：
@@ -234,6 +189,115 @@ pub(crate) async fn after_commit_sync_publish(pool: &MySqlPool, targets: Vec<Syn
     }
 }
 
+/// Commit-receipt-aware post-commit path used by canonical authorization writers.
+/// WorkerOwned mode only rereads durable proof for each full request; LegacyHybrid
+/// keeps the existing request-side claim/publish behavior and its target set.
+pub(crate) async fn after_commit_sync_publish_with_receipts(
+    pool: &MySqlPool,
+    targets: Vec<SyncPublishTarget>,
+    receipts: CommittedProjectionReceipts,
+) {
+    if astral_db::projection_execution_mode() == astral_db::ProjectionExecutionMode::WorkerOwned {
+        let started = Instant::now();
+        let outcome =
+            wait_for_owned_completion(pool, &receipts.requests, SYNC_PUBLISH_BUDGET).await;
+        record_sync_publish(
+            match outcome {
+                SyncPublishOutcome::Published => SyncPublishMetricOutcome::Published,
+                SyncPublishOutcome::Delegated => SyncPublishMetricOutcome::Delegated,
+                SyncPublishOutcome::Failed => SyncPublishMetricOutcome::Failed,
+            },
+            started.elapsed(),
+        );
+        match outcome {
+            SyncPublishOutcome::Published => tracing::debug!(
+                receipts = receipts.requests.len(),
+                "worker-owned projection completion proven for the entire source receipt batch"
+            ),
+            SyncPublishOutcome::Delegated => tracing::debug!(
+                receipts = receipts.requests.len(),
+                "worker-owned projection completion remains delegated to the durable worker"
+            ),
+            SyncPublishOutcome::Failed => tracing::warn!(
+                receipts = receipts.requests.len(),
+                "worker-owned completion waiter failed; durable worker retains ownership"
+            ),
+        }
+        return;
+    }
+
+    after_commit_sync_publish(pool, targets).await;
+}
+
+/// Bounded read-only waiter. `Some` is accepted only from astral-db's exact
+/// request-bound historical completion proof; no bus admission or ACK is proof.
+pub(crate) async fn wait_for_owned_completion(
+    pool: &MySqlPool,
+    requests: &[astral_db::DeltaEventAppendRequest],
+    budget: Duration,
+) -> SyncPublishOutcome {
+    wait_for_owned_completion_with(requests, budget, |request| async move {
+        match astral_db::load_owned_delta_completion(pool, &request).await {
+            Ok(proof) => Ok(proof.is_some()),
+            Err(error) => {
+                tracing::warn!(event_id = %request.event_id, error = %error,
+                    "exact projection completion proof unavailable; worker ownership unchanged");
+                Err(())
+            }
+        }
+    })
+    .await
+}
+
+async fn wait_for_owned_completion_with<F, Fut>(
+    requests: &[astral_db::DeltaEventAppendRequest],
+    budget: Duration,
+    mut exact_completion: F,
+) -> SyncPublishOutcome
+where
+    F: FnMut(astral_db::DeltaEventAppendRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, ()>>,
+{
+    if requests.is_empty() {
+        return SyncPublishOutcome::Delegated;
+    }
+    if requests.len() > SYNC_PUBLISH_MAX_EVENTS {
+        return SyncPublishOutcome::Delegated;
+    }
+    let affected_cards = requests
+        .iter()
+        .filter_map(|request| request.card_id.map(|card_id| (request.tenant_id, card_id)))
+        .collect::<HashSet<_>>()
+        .len();
+    if affected_cards > SYNC_PUBLISH_MAX_AFFECTED_CARDS {
+        return SyncPublishOutcome::Delegated;
+    }
+
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut proven = vec![false; requests.len()];
+    loop {
+        for (index, request) in requests.iter().enumerate() {
+            if proven[index] {
+                continue;
+            }
+            match tokio::time::timeout_at(deadline, exact_completion(request.clone())).await {
+                Ok(Ok(true)) => proven[index] = true,
+                Ok(Ok(false)) => {}
+                Ok(Err(())) => return SyncPublishOutcome::Failed,
+                Err(_) => return SyncPublishOutcome::Delegated,
+            }
+        }
+        if proven.iter().all(|is_proven| *is_proven) {
+            return SyncPublishOutcome::Published;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return SyncPublishOutcome::Delegated;
+        }
+        tokio::time::sleep(OWNED_COMPLETION_POLL_INTERVAL.min(deadline - now)).await;
+    }
+}
+
 /// 同步发布入口：以与 worker 相同的原语尝试在请求内发布目标事件。
 ///
 /// `pool` 仅用于构造 sqlx runtime（与 worker 同一实现，发布 commit 后自动尝试
@@ -242,6 +306,9 @@ pub async fn try_synchronous_publish(
     pool: &MySqlPool,
     targets: &[SyncPublishTarget],
 ) -> SyncPublishOutcome {
+    if astral_db::projection_execution_mode() == astral_db::ProjectionExecutionMode::WorkerOwned {
+        return SyncPublishOutcome::Delegated;
+    }
     let runtime: Arc<dyn AuthorizationProjectorRuntime> =
         Arc::new(SqlxAuthorizationProjectorRuntime::new(pool.clone()));
     try_synchronous_publish_with_runtime(runtime, targets).await
@@ -256,6 +323,11 @@ pub async fn try_synchronous_publish_with_runtime(
     runtime: Arc<dyn AuthorizationProjectorRuntime>,
     targets: &[SyncPublishTarget],
 ) -> SyncPublishOutcome {
+    if astral_db::projection_execution_mode() == astral_db::ProjectionExecutionMode::WorkerOwned
+        || runtime.worker_owned_execution()
+    {
+        return SyncPublishOutcome::Delegated;
+    }
     let runtime_for_publish = Arc::clone(&runtime);
     // manifest 租约 owner 与 delta claim owner 属不同租约域；同为 run-scoped。
     let manifest_owner = format!("sync-publish-manifest:{}", uuid::Uuid::new_v4());
@@ -305,24 +377,21 @@ where
     F: FnMut(astral_db::DeltaEventClaim) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    // 事件预算内的目标才纳入本次同步发布；超出预算的目标保持 worker 消化。
-    let mut scheduled: Vec<&SyncPublishTarget> = Vec::new();
-    let mut total_targets = 0usize;
-    let mut event_budget = SYNC_PUBLISH_MAX_EVENTS;
-    for target in targets {
-        if target.event_ids.is_empty() {
-            continue;
-        }
-        if target.event_ids.len() > event_budget {
-            break;
-        }
-        event_budget -= target.event_ids.len();
-        total_targets += target.event_ids.len();
-        scheduled.push(target);
-    }
-    if scheduled.is_empty() {
+    if astral_db::projection_execution_mode() == astral_db::ProjectionExecutionMode::WorkerOwned
+        || runtime.worker_owned_execution()
+    {
         return SyncPublishOutcome::Delegated;
     }
+    let total_targets = targets.iter().try_fold(0usize, |total, target| {
+        total.checked_add(target.event_ids.len())
+    });
+    let Some(total_targets) = total_targets else {
+        return SyncPublishOutcome::Delegated;
+    };
+    if total_targets == 0 || total_targets > SYNC_PUBLISH_MAX_EVENTS {
+        return SyncPublishOutcome::Delegated;
+    }
+    let scheduled = targets.iter().filter(|target| !target.event_ids.is_empty());
 
     let deadline = tokio::time::Instant::now() + budget;
     // run-scoped claim owner（与 worker 的 `auth-projector:{run_id}` 同形态，
@@ -450,7 +519,8 @@ mod tests {
         DeltaProjectorPublishCommand, DeltaProjectorPublishOutcome, ProjectionAggregateIdentity,
         RawLedgerRow, Sha256Digest,
     };
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use time::PrimitiveDateTime;
 
@@ -466,6 +536,7 @@ mod tests {
         released: Mutex<Vec<i64>>,
         failed: Mutex<Vec<i64>>,
         claim_delay: Option<Duration>,
+        worker_owned: bool,
     }
 
     impl ScriptedRuntime {
@@ -476,6 +547,7 @@ mod tests {
                 released: Mutex::new(Vec::new()),
                 failed: Mutex::new(Vec::new()),
                 claim_delay: None,
+                worker_owned: false,
             })
         }
 
@@ -489,6 +561,18 @@ mod tests {
                 released: Mutex::new(Vec::new()),
                 failed: Mutex::new(Vec::new()),
                 claim_delay: Some(delay),
+                worker_owned: false,
+            })
+        }
+
+        fn worker_owned() -> Arc<Self> {
+            Arc::new(Self {
+                claims: Mutex::new(VecDeque::new()),
+                claims_requested: Mutex::new(Vec::new()),
+                released: Mutex::new(Vec::new()),
+                failed: Mutex::new(Vec::new()),
+                claim_delay: None,
+                worker_owned: true,
             })
         }
 
@@ -503,6 +587,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuthorizationProjectorRuntime for ScriptedRuntime {
+        fn worker_owned_execution(&self) -> bool {
+            self.worker_owned
+        }
+
         async fn claim_next_event(
             &self,
             scope: &astral_db::DeltaEventClaimScope,
@@ -633,6 +721,180 @@ mod tests {
         published: bool,
     ) -> impl FnMut(DeltaEventClaim) -> std::future::Ready<bool> {
         move |_claimed| std::future::ready(published)
+    }
+
+    fn completion_request(
+        event_id: &str,
+        target_version: i64,
+    ) -> astral_db::DeltaEventAppendRequest {
+        astral_db::DeltaEventAppendRequest {
+            tenant_id: TENANT,
+            card_id: Some(CARD_A),
+            aggregate_type: "USER_CARD".to_owned(),
+            aggregate_id: CARD_A,
+            grant_id: astral_types::GrantId::random(),
+            event_id: event_id.to_owned(),
+            operation_id: "op-shared".to_owned(),
+            event_type: DeltaEventType::Add,
+            base_version: target_version - 1,
+            target_version,
+            source_generation: target_version as u64,
+            revoke_fence: 0,
+            invalidates_published_evidence: false,
+            before_image_json: None,
+            before_digest_hex: None,
+            delta_json: "{}".to_owned(),
+            semantic_hash_hex: "a".repeat(64),
+            dependency_hash_hex: "b".repeat(64),
+            compiler_version: "sync-publish-test".to_owned(),
+            next_attempt_at: None,
+        }
+    }
+
+    fn same_operation_requests() -> Vec<astral_db::DeltaEventAppendRequest> {
+        vec![
+            completion_request("evt-a", 1),
+            completion_request("evt-b", 2),
+        ]
+    }
+
+    #[tokio::test]
+    async fn owned_completion_requires_every_receipt_and_does_not_reread_proven_events() {
+        let requests = same_operation_requests();
+        assert_eq!(requests[0].operation_id, requests[1].operation_id);
+        let reads = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        let outcome = wait_for_owned_completion_with(&requests, Duration::from_secs(1), {
+            let reads = Arc::clone(&reads);
+            move |request| {
+                let reads = Arc::clone(&reads);
+                async move {
+                    let count = {
+                        let mut reads = reads.lock().unwrap();
+                        let count = reads.entry(request.event_id.clone()).or_default();
+                        *count += 1;
+                        *count
+                    };
+                    Ok(request.event_id == "evt-a" || count >= 2)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(outcome, SyncPublishOutcome::Published);
+        let reads = reads.lock().unwrap();
+        assert_eq!(reads.get("evt-a"), Some(&1));
+        assert_eq!(reads.get("evt-b"), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn owned_completion_delegates_when_one_receipt_never_publishes() {
+        let requests = same_operation_requests();
+        let reads = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        let outcome = wait_for_owned_completion_with(&requests, Duration::from_millis(80), {
+            let reads = Arc::clone(&reads);
+            move |request| {
+                let reads = Arc::clone(&reads);
+                async move {
+                    let mut reads = reads.lock().unwrap();
+                    *reads.entry(request.event_id.clone()).or_default() += 1;
+                    Ok(request.event_id == "evt-a")
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(outcome, SyncPublishOutcome::Delegated);
+        let reads = reads.lock().unwrap();
+        assert_eq!(reads.get("evt-a"), Some(&1));
+        assert!(reads.get("evt-b").copied().unwrap_or_default() > 0);
+    }
+
+    #[tokio::test]
+    async fn owned_completion_empty_and_oversized_batches_do_not_read() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            wait_for_owned_completion_with(&[], Duration::from_millis(20), {
+                let reads = Arc::clone(&reads);
+                move |_| {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Ok(true))
+                }
+            })
+            .await,
+            SyncPublishOutcome::Delegated
+        );
+        let oversized = (0..=SYNC_PUBLISH_MAX_EVENTS)
+            .map(|index| completion_request(&format!("evt-{index}"), index as i64 + 1))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            wait_for_owned_completion_with(&oversized, Duration::from_millis(20), {
+                let reads = Arc::clone(&reads);
+                move |_| {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Ok(true))
+                }
+            })
+            .await,
+            SyncPublishOutcome::Delegated
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn owned_completion_database_error_fails_closed() {
+        let reads = AtomicUsize::new(0);
+        let outcome = wait_for_owned_completion_with(
+            &same_operation_requests()[..1],
+            Duration::from_secs(1),
+            |_| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err(()))
+            },
+        )
+        .await;
+        assert_eq!(outcome, SyncPublishOutcome::Failed);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn owned_completion_slow_read_times_out_as_delegated() {
+        let reads = AtomicUsize::new(0);
+        let outcome = wait_for_owned_completion_with(
+            &same_operation_requests()[..1],
+            Duration::from_millis(10),
+            |_| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                async {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Ok(true)
+                }
+            },
+        )
+        .await;
+        assert_eq!(outcome, SyncPublishOutcome::Delegated);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_owned_runtime_guard_keeps_legacy_id_only_path_mutation_free() {
+        let runtime = ScriptedRuntime::worker_owned();
+        let publish_calls = AtomicUsize::new(0);
+        let outcome = run_synchronous_publish(
+            &as_runtime(&runtime),
+            &[target(CARD_A, &["evt-id-only"])],
+            SYNC_PUBLISH_BUDGET,
+            |_| {
+                publish_calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(true)
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, SyncPublishOutcome::Delegated);
+        assert!(runtime.requested_scopes().is_empty());
+        assert_eq!(publish_calls.load(Ordering::SeqCst), 0);
+        assert!(runtime.released_ids().is_empty());
+        assert!(runtime.failed.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -788,8 +1050,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_budget_keeps_oversized_targets_on_the_worker_path() {
-        // 目标 1 事件 + 目标 34 事件 > SYNC_PUBLISH_MAX_EVENTS：第二个目标整体
-        // 不纳入本次同步发布（零 claim），保持 worker 消化。
+        // 整批超过上限时连首项也不认领，不能把已完成前缀误报成整批成功。
         let oversized: Vec<String> = (0..(SYNC_PUBLISH_MAX_EVENTS + 2))
             .map(|index| format!("evt-bulk-{index}"))
             .collect();
@@ -809,8 +1070,9 @@ mod tests {
             constant_publisher(true),
         )
         .await;
-        assert_eq!(outcome, SyncPublishOutcome::Published);
-        assert_eq!(runtime.requested_scopes(), vec![(TENANT, CARD_A)]);
+        assert_eq!(outcome, SyncPublishOutcome::Delegated);
+        assert!(runtime.requested_scopes().is_empty());
+        assert!(runtime.released_ids().is_empty());
     }
 
     #[tokio::test]

@@ -150,14 +150,14 @@ pub struct WorkerRunSummary {
     /// Total wall time spent in the pure decide/compile phase across events.
     pub decide_phase_micros: u64,
     /// Events whose processing exceeded
-    /// [`AuthorizationProjectorConfig::event_deadline`] (F5 修复 1b): the
-    /// in-flight work was cancelled, the lease was released best-effort, and
-    /// the loop continued. Orthogonal to the causal counters above.
+    /// [`AuthorizationProjectorConfig::event_deadline`]. Worker-owned episodes
+    /// remain UNKNOWN without a follow-up mutation; legacy processing retains
+    /// its bounded best-effort release. Orthogonal to the causal counters above.
     pub events_deadline_exceeded: u64,
 }
 
 impl WorkerRunSummary {
-    fn record(&mut self, kind: DispositionKind) {
+    pub(crate) fn record(&mut self, kind: DispositionKind) {
         record_projector_event(kind.metric_outcome());
         match kind {
             DispositionKind::Published => self.events_published += 1,
@@ -767,20 +767,24 @@ pub(crate) async fn run_partition_worker(
                 break;
             }
             // 2) 分区租约：拿到才认领；Busy（他人持有）直接跳过，不等待。
-            let handle = match runtime
-                .acquire_partition_lease(&candidate, &lease_owner, PARTITION_LEASE_SECS)
-                .await
-            {
-                Ok(Some(handle)) => handle,
-                Ok(None) => continue,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        aggregate_type = %candidate.aggregate_type,
-                        aggregate_id = candidate.aggregate_id,
-                        "partition lease acquire failed; skipping partition"
-                    );
-                    continue;
+            let handle = if runtime.worker_owned_execution() {
+                None
+            } else {
+                match runtime
+                    .acquire_partition_lease(&candidate, &lease_owner, PARTITION_LEASE_SECS)
+                    .await
+                {
+                    Ok(Some(handle)) => Some(handle),
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            aggregate_type = %candidate.aggregate_type,
+                            aggregate_id = candidate.aggregate_id,
+                            "partition lease acquire failed; skipping partition"
+                        );
+                        continue;
+                    }
                 }
             };
             // 3) 批内逐事件：续租（排他心跳）→ 分区认领 → 与 TenantSerial
@@ -789,17 +793,19 @@ pub(crate) async fn run_partition_worker(
                 if cancellation.is_cancelled() {
                     break;
                 }
-                if let Err(error) = runtime
-                    .renew_partition_lease(&handle, PARTITION_LEASE_SECS)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %error,
-                        aggregate_type = %candidate.aggregate_type,
-                        aggregate_id = candidate.aggregate_id,
-                        "partition lease lost mid-batch; abandoning partition"
-                    );
-                    break;
+                if let Some(handle) = handle.as_ref() {
+                    if let Err(error) = runtime
+                        .renew_partition_lease(handle, PARTITION_LEASE_SECS)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            aggregate_type = %candidate.aggregate_type,
+                            aggregate_id = candidate.aggregate_id,
+                            "partition lease lost mid-batch; abandoning partition"
+                        );
+                        break;
+                    }
                 }
                 let claim_started = Instant::now();
                 let scope = DeltaEventClaimScope {
@@ -875,13 +881,15 @@ pub(crate) async fn run_partition_worker(
                 progress.touch();
             }
             // 4) 尽力释放；崩溃路径由租约到期 reclaim 兜底（释放失败不是错误）。
-            if let Err(error) = runtime.release_partition_lease(&handle).await {
-                tracing::warn!(
-                    error = %error,
-                    aggregate_type = %candidate.aggregate_type,
-                    aggregate_id = candidate.aggregate_id,
-                    "partition lease release failed; expiry will reclaim"
-                );
+            if let Some(handle) = handle.as_ref() {
+                if let Err(error) = runtime.release_partition_lease(handle).await {
+                    tracing::warn!(
+                        error = %error,
+                        aggregate_type = %candidate.aggregate_type,
+                        aggregate_id = candidate.aggregate_id,
+                        "partition lease release failed; expiry will reclaim"
+                    );
+                }
             }
         }
     }
@@ -957,11 +965,9 @@ async fn run_worker(
                     claim_elapsed_us = claim_started.elapsed().as_micros() as u64,
                     "delta event claimed"
                 );
-                // F5 修复 1b：事件级 deadline。任何一步挂起（DB 锁等待、连接
-                // 池耗尽 await、L2 推送等）都必须在 deadline 内变成"计数 + 尽
-                // 力释放租约 + 继续循环"，worker 永不永久停在当次事件内（S15
-                // 实测的 LEASED 冻结形态）。临时 future 在语句结束即 drop：
-                // 进行中的 DB 事务随 sqlx Tx drop 回滚，无半写。
+                // Deadline bounds the event future, not its COMMIT outcome.
+                // Cancellation leaves the capability untouched until durable
+                // reconciliation proves completion or permits a fenced takeover.
                 let processing = tokio::time::timeout(
                     config.event_deadline,
                     process_one_event(
@@ -991,12 +997,9 @@ async fn run_worker(
                         deadline_secs = config.event_deadline.as_secs(),
                         "delta event processing deadline exceeded; lease left to expire-reclaim"
                     );
-                    // 批次 B 调研纪律：发布事务与事件终态同事务 commit，超时
-                    // 只意味着 commit 结果 UNKNOWN——此刻**禁止发布任何租约
-                    // mutation**（含 release）。事件租约在 claim_lease 到期后
-                    // 由既有 reclaim 门接管：已发布行是 SUCCEEDED（不可再
-                    // claim），未发布行按未知结果 takeover 重投，均无需在此
-                    // 对账。
+                    // A cancelled COMMIT may already be durable. Do not release
+                    // or replay here; recovery must reconcile the exact event,
+                    // publication evidence and lane before a fenced takeover.
                 }
                 // F5 修复 1d 看门狗：事件处理完成（无论结果）即进展。
                 progress.touch();
@@ -1507,6 +1510,19 @@ pub(crate) async fn fail_with_budget(
     reason: &str,
     summary: &mut WorkerRunSummary,
 ) {
+    if runtime.worker_owned_execution() {
+        super::owned_worker::schedule_owned_retry(
+            runtime,
+            identity,
+            minimum_backoff_secs,
+            reason,
+            false,
+            kind_for_summary,
+            summary,
+        )
+        .await;
+        return;
+    }
     let schedule = plan_retry_schedule(claimed.attempts, minimum_backoff_secs);
     summary.record(kind_for_summary);
     match schedule {
@@ -1582,6 +1598,31 @@ async fn act_on_disposition(
             command.delta_lease_identity.lease_owner = claimed.lease_owner.clone();
             command.manifest_lease_owner = ctx.lease_owner.to_owned();
             command.manifest_lease_seconds = config.manifest_lease_seconds;
+            if runtime.worker_owned_execution() {
+                let failures = runtime.event_execution_failures(delta_lease_identity);
+                if failures.is_none() {
+                    summary.events_publication_unknown += 1;
+                    return None;
+                }
+                if i64::from(failures.unwrap_or(u32::MAX)) >= MAX_EVENT_ATTEMPTS {
+                    fail_with_budget(
+                        runtime,
+                        delta_lease_identity,
+                        claimed,
+                        DispositionKind::ReleasedRetry,
+                        BACKOFF_CAP_SECS,
+                        "code=auth_projector.execution_failure_budget_exhausted",
+                        summary,
+                    )
+                    .await;
+                    return None;
+                }
+                if let Err(error) = runtime.begin_event_execution(delta_lease_identity).await {
+                    summary.events_publication_unknown += 1;
+                    tracing::warn!(event_id = %claimed.event_id, %error, "begin execution not proven; no publication or release");
+                    return None;
+                }
+            }
             let publish_started = Instant::now();
             match runtime.execute_projection_publish(&command).await {
                 Ok(outcome) => {
@@ -1782,16 +1823,29 @@ async fn act_on_disposition(
                                 reason = %reason,
                                 "publish failed generically; scheduling retry"
                             );
-                            fail_with_budget(
-                                runtime,
-                                delta_lease_identity,
-                                claimed,
-                                DispositionKind::ReleasedRetry,
-                                0,
-                                &reason,
-                                summary,
-                            )
-                            .await;
+                            if runtime.worker_owned_execution() {
+                                super::owned_worker::schedule_owned_retry(
+                                    runtime,
+                                    delta_lease_identity,
+                                    0,
+                                    &reason,
+                                    true,
+                                    DispositionKind::ReleasedRetry,
+                                    summary,
+                                )
+                                .await;
+                            } else {
+                                fail_with_budget(
+                                    runtime,
+                                    delta_lease_identity,
+                                    claimed,
+                                    DispositionKind::ReleasedRetry,
+                                    0,
+                                    &reason,
+                                    summary,
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -1852,7 +1906,6 @@ async fn act_on_disposition(
             .await;
         }
         EventDisposition::Superseded { reason } => {
-            summary.record(DispositionKind::SupersededRelease);
             #[cfg(feature = "e3-observability")]
             log_e3_attempt_event("release_requested", claimed, "superseded", false, None);
             tracing::info!(
@@ -1860,7 +1913,27 @@ async fn act_on_disposition(
                 reason = %reason,
                 "delta event superseded by newer projection chain; releasing"
             );
-            runtime.release_event(delta_lease_identity).await;
+            if runtime.worker_owned_execution() {
+                match runtime.owned_release_transition(delta_lease_identity).await {
+                    OwnedTransitionProof::Applied => {
+                        summary.record(DispositionKind::SupersededRelease);
+                    }
+                    OwnedTransitionProof::LeaseLost => {
+                        summary.record(DispositionKind::LeaseLost);
+                    }
+                    OwnedTransitionProof::Unknown => {
+                        summary.events_publication_unknown += 1;
+                        record_projector_event(ProjectorEventOutcome::PublicationUnknown);
+                        tracing::warn!(
+                            event_id = %claimed.event_id,
+                            "owned superseded release unknown; no success disposition recorded"
+                        );
+                    }
+                }
+            } else {
+                summary.record(DispositionKind::SupersededRelease);
+                runtime.release_event(delta_lease_identity).await;
+            }
         }
     }
     pointer_moved_reason

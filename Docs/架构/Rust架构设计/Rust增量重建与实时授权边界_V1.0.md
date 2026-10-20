@@ -88,6 +88,18 @@
 
 该 worker 已在 TrustGraph `main` 接线，并且不写旧 snapshot 表、不消费旧 head/outbox 队列、不发布旧 refresh MQ、不执行旧 cache eviction。源码证据见 [`main.rs`](../../../astral-trustgraph/src/main.rs#L307-L349) 与 [`authorization_projector.rs`](../../../astral-trustgraph/src/service/authorization_projector.rs#L741-L847)。
 
+### 3.1.1 聚合单执行者组合路径（2026-10-15，default-off）
+
+新增执行协议 `worker-owned` 与缺省 `legacy-hybrid` 分开。完整 source receipt 在 COMMIT 已证明成功后交付本地通道；请求不再参与认领和发布，只有限等待精确历史完成证明。无本地通道时仍保留 durable delta，由 DB worker 恢复，不能让请求补做公共队列认领。`operation_id` 可以对应多个 contribution event，因此等待输入必须是完整事件批次，不能仅凭 operation 或时间下限猜测目标。
+
+同一 current pointer 的所有 worker 路径共用 aggregate lane、持久 epoch、fresh token 和单 active slot。publication generation 与 lane epoch 分离，事件 token 不能独自绕过 owned 发布。发布仍使用原有完整事务和 strict read gate；source transaction 不等待或持有 lane。lane 释放保留 epoch，过期接管先对账活动事件与原子发布状态，UNKNOWN 不等同失败。
+
+owned 发布事务还将规范化 impact item 集合与 plan、source generation、目标 manifest/digest 的 commitment 写入既有审计表，完成验证要求唯一且相符的 seal；不能从已被删减的现存 item 反向补造证明。读取会重验当前指针与保留的连续 manifest/reference/segment 历史，因此代价随历史与载荷增长。完整保留的 `SUPERSEDED` manifest 和同事务 archive intent 可以证明历史发布，但不是归档完成；archive intent 已成功却缺 terminal proof 时拒绝完成证据。清理必须共同保留 delta、plan、manifest 和 completion seal，历史不完整时不再承诺完成。此路径只证明精确事件的历史 publication closure，当前授权仍须单独经过严格 read gate。
+
+削减组合的职责分别是：精确事件认领消除非目标周转；请求退出执行竞争面；聚合 ownership 消除同 pointer 并行编译/发布；独立 execution failure budget 避免等待和 replan 消耗真实失败预算。它们不改变 `AuthorizationCompiler` 的完整 manifest 物化成本：若第 i 次发布仍遍历 `G0+i` 个条目，n 次总成本仍为 `nG0+n(n+1)/2`。每 aggregate 的稳定排队条件至少要求 `lambda_a * E[S_a] < 1`，同时受全局 DB/CPU/连接池约束；唯一索引查找为 `O(log_B N)`，不是数学常数时间。丢通知恢复和公平调度只在 DB 最终可用、前驱可恢复、执行最终成功等前提下提供活性。
+
+有界模型仅验证其显式状态空间；真实 SQL、相同负载双模式 storm、进程内生产签名 HTTP 与跨节点部署分别验收。任一层的通过都不能替代另一层，也不宣称所有负载下的全局最优。启用、迁移和回退入口见 [Rust 编码规范 §15.5](../../规范/Rust后端编码规范_V1.0.md#155-聚合发布-ownership-与请求完成等待2026-10-15default-off) 与 [迁移决策](../../迁移/Rust后端迁移架构决策_V1.0.md)。
+
 ### 3.2 旧 `ProjectionWorker` 的保留边界
 
 旧 [`ProjectionWorker`](../../../astral-trustgraph/src/service/projection_worker.rs#L1-L31) 仍由进程持有，但其当前行为已收敛为兼容 writer-correlation/ELIGIBILITY 通道：CARD/RULE_SET 事件只做终态 `mark_processed`，不重建 `permission_rule_snapshot` 或 `rule_set_snapshot`；ELIGIBILITY 只失效 `perm:card:active:{card_id}` 资格缓存，不推进已删除的旧 READY 状态列。它不是新授权投影器，也不是生产 strict gate 的完成证明。

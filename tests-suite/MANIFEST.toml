@@ -463,6 +463,60 @@ note = "真实 source repository commit -> durable delta/audit -> local worker -
 run = "python -B scripts/test_campaign.py --run --suite native-projection-lifecycle"
 
 [[entry]]
+id = "integration/native-projection-storm"
+category = "integration"
+owner_crate = "testsuite"
+path = "tests-suite/tests/native_projection_storm.rs"
+kind = "integration-ignored"
+requires = ["new run-scoped migrated MySQL schema", "LocalBus", "LocalProjectionBus", "MemoryProjectionHub"]
+arch_status = "current"
+note = "三轮同卡并发 source mutation 与完整 native hybrid publication drain；同步 publisher 保持启用，不声称 worker-only 或历史三节点 RQ4 复跑"
+run = "python -B scripts/test_campaign.py --run --suite native-projection-storm"
+
+[[entry]]
+id = "astral-db/projection_owned_integration"
+category = "integration"
+owner_crate = "astral-db"
+path = "astral-db/tests/projection_owned_integration.rs"
+kind = "integration-ignored"
+requires = ["run-scoped migrated MySQL loopback:3308", "worker-owned", "RUST_INTEGRATION_REQUIRED=1"]
+arch_status = "current"
+note = "真实 SQL 并发认领、聚合前驱、epoch/token、执行预算和陈旧能力拒绝;synthetic typed receipt 不证明 source COMMIT 或 HTTP"
+run = "python -B scripts/test_campaign.py --run --suite projection-owned-sql-contract"
+
+[[entry]]
+id = "astral-db/projection-owned-completion-integrity"
+category = "integration"
+owner_crate = "astral-db"
+path = "astral-db/src/authorization_projection_repository/owned_completion/tests.rs"
+kind = "integration-ignored"
+requires = ["approved run-owned migrated MySQL loopback clone", "worker-owned", "RUST_INTEGRATION_REQUIRED=1"]
+arch_status = "current"
+note = "真实 MySQL 历史发布证明、部分 item 删除等负控及整事务回滚;synthetic publish command 不替代 signed HTTP/source provenance"
+run = "python -B scripts/test_campaign.py --run --suite projection-owned-completion-integrity"
+
+[[entry]]
+id = "integration/projection-owned-http"
+category = "integration"
+owner_crate = "testsuite"
+path = "tests-suite/tests/projection_owned_http.rs"
+kind = "integration-ignored"
+requires = ["run-scoped migrated MySQL", "worker-owned", "RUST_INTEGRATION_REQUIRED=1"]
+arch_status = "current"
+note = "生产 rule router、Gateway v3 签名和权限中间件的进程内真实 MySQL 验证;不代表真实 TCP 或多节点部署"
+run = "python -B scripts/test_campaign.py --run --suite projection-owned-http"
+
+[[entry]]
+id = "harness/projection-owner-model"
+category = "harness"
+owner_crate = "authorization-validation"
+path = "Docs/authorization-validation/tools/projection_owner_model.py"
+kind = "offline-model"
+arch_status = "current"
+note = "显式有限 ownership 状态空间与负控;不证明 SQL、无界活性或全局最优"
+run = "python -B scripts/test_campaign.py --run --suite projection-owner-model-contracts"
+
+[[entry]]
 id = "harness/test-campaign"
 category = "harness"
 owner_crate = "scripts"
@@ -1031,6 +1085,100 @@ argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_lifecyc
 acceptance = "rust"
 minimum_tests = 1
 expected_tests = 1
+
+[[suite]]
+id = "native-projection-storm"
+owner = "testsuite + astral-trustgraph"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M1", "M2", "M3", "E3", "E4", "RQ4"]
+scope = "integration"
+boundary = "bounded same-card production repository/local-worker storm with legacy-hybrid request publication explicitly retained; paired workload controls permit comparison but do not prove cross-node/global optimality; cleanup requires REMOVE/audit/READY-empty proof"
+projection_execution_mode = "legacy-hybrid"
+sources = ["tests-suite/tests/native_projection_storm.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_storm", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 3600
+
+[[suite]]
+id = "native-projection-storm-owned"
+owner = "testsuite + astral-trustgraph"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M1", "M2", "M3", "E3", "E4", "RQ4"]
+scope = "integration"
+boundary = "worker-owned variant of the exact same bounded repository/local-worker workload; checks claim/execution/failure accounting and complete historical durable publication proofs; not signed HTTP, real sockets, or multi-node performance"
+projection_execution_mode = "worker-owned"
+sources = ["tests-suite/tests/native_projection_storm.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_storm", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 3600
+
+[[suite]]
+id = "projection-owned-sql-contract"
+owner = "astral-db"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M1", "M2", "M3", "E3", "E4", "RQ4"]
+scope = "integration"
+boundary = "real MySQL owned claim/epoch/active-slot/concurrent predecessor/accounting and stale capability contract; synthetic typed source receipts, not signed HTTP or complete policy evaluation"
+projection_execution_mode = "worker-owned"
+sources = ["astral-db/tests/projection_owned_integration.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--test", "projection_owned_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 180
+
+[[suite]]
+id = "projection-owned-completion-integrity"
+owner = "astral-db"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M1", "M2", "M3", "E3", "E4", "RQ4"]
+scope = "integration"
+boundary = "real MySQL retained historical publication, multi-item completeness seal, corruption controls and late failure atomic rollback; synthetic typed receipts and commands, not signed HTTP or deployed authorization"
+projection_execution_mode = "worker-owned"
+sources = ["astral-db/src/authorization_projection_repository/owned_completion.rs", "astral-db/src/authorization_projection_repository/owned_completion/seal.rs", "astral-db/src/authorization_projection_repository/owned_completion/tests.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--lib", "owned_completion_real_mysql_integrity_contract", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 180
+
+[[suite]]
+id = "projection-owned-http"
+owner = "testsuite + astral-trustgraph"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M1", "M2", "M3", "E1", "E3", "E4", "RQ3"]
+scope = "integration"
+boundary = "real MySQL plus in-process production rule router, Gateway identity signature and permission middleware; includes pending narrowing before worker startup; not a real-socket Gateway or cross-node campaign"
+projection_execution_mode = "worker-owned"
+sources = ["tests-suite/tests/projection_owned_http.rs", "tests-suite/tests/projection_owned_http_support/mod.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "projection_owned_http", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 1200
+
+[[suite]]
+id = "projection-owner-model-contracts"
+owner = "authorization-validation"
+profile = "offline-validation"
+test_services = []
+series = ["M1", "M2", "M3", "M5", "E5", "RQ4"]
+scope = "offline-model"
+boundary = "finite abstract ownership model, omission controls and fixed-schedule synthetic operation counts; no SQL performance or unbounded/global optimality claim"
+sources = ["Docs/authorization-validation/tools/projection_owner_model.py", "Docs/authorization-validation/tools/test_projection_owner_model.py"]
+argv = ["python", "-B", "-m", "unittest", "discover", "-s", "Docs/authorization-validation/tools", "-p", "test_projection_owner_model.py", "-v"]
+acceptance = "unittest"
+minimum_tests = 1
+timeout_seconds = 600
 
 [[suite]]
 id = "db-authorization-projection"

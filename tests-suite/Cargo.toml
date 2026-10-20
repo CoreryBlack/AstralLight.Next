@@ -25,6 +25,8 @@ uuid = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 
 [features]
 default = ["astral-db/test-support"]
@@ -40,6 +42,14 @@ redis-compat = [
 
 # Security premise binaries are explicit because Cargo does not discover tests
 # nested below tests/security/ automatically.
+[[test]]
+name = "native_projection_storm"
+path = "tests/native_projection_storm.rs"
+
+[[test]]
+name = "projection_owned_http"
+path = "tests/projection_owned_http.rs"
+
 [[test]]
 name = "premise_hub_invalidation"
 path = "tests/security/premise_hub_invalidation.rs"

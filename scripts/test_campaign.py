@@ -117,6 +117,8 @@ def read_manifest(path=MANIFEST, root=ROOT):
                 raise ValueError(f"missing or duplicate benchmark cases: {suite_id}")
         if "bench" in argv and suite["acceptance"] == "command":
             raise ValueError(f"benchmark requires measured-output acceptance: {suite_id}")
+        if suite.get("projection_execution_mode") not in (None, "legacy-hybrid", "worker-owned"):
+            raise ValueError(f"unknown projection execution mode: {suite_id}")
         if suite.get("model_contract") not in (None, "full-contract", "universal", "tenant"):
             raise ValueError(f"unknown model contract: {suite_id}")
         if suite.get("evidence_contract") not in (None, "policy-evaluate-benefit") or suite.get("evidence_contract") is not None and suite["acceptance"] != "rust":
@@ -186,6 +188,12 @@ def prepare_environment(suite, original):
                  "COMPOSE_PROFILES", "SKIP_DOCKER", "ASTRAL_TARGET_REGION", "ASTRAL_PERF_CASE"):
         env.pop(name, None)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.pop("ASTRAL_PROJECTION_EXECUTION_MODE", None)
+    execution_mode = suite.get("projection_execution_mode")
+    if execution_mode is not None:
+        if execution_mode not in ("legacy-hybrid", "worker-owned"):
+            return env, "suite projection execution mode is not registered"
+        env["ASTRAL_PROJECTION_EXECUTION_MODE"] = execution_mode
     env["ASTRAL_REDIS_PROJECTION_COMPAT"] = "true" if "redis" in services else "false"
     env["ASTRAL_MESSAGE_TRANSPORT"] = "rabbit" if "rabbitmq" in services else "local"
     if profile in {"native-kernel", "performance-kernel", "offline-validation"}:
@@ -519,7 +527,8 @@ def run_selected(manifest, suites, run_id, artifact_root, verify_items=False):
                 record["environment_names"] = sorted(name for name in env if name in {
                     "DATABASE_URL", "REDIS_URL", "RABBITMQ_URL", "RUST_INTEGRATION_REQUIRED",
                     "ASTRAL_TEST_DATABASE_NAME", "ASTRAL_REDIS_PROJECTION_COMPAT",
-                    "ASTRAL_MESSAGE_TRANSPORT", "ASTRAL_MIGRATION_ENV"})
+                    "ASTRAL_MESSAGE_TRANSPORT", "ASTRAL_MIGRATION_ENV", "ASTRAL_PROJECTION_EXECUTION_MODE"})
+                record["projection_execution_mode"] = env.get("ASTRAL_PROJECTION_EXECUTION_MODE", "legacy-hybrid")
                 if problem or not shutil.which(executable):
                     record.update(status="BLOCKED", reason=problem or f"required tool unavailable: {executable}")
                 elif snapshot_hash() != frozen:

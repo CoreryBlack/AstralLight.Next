@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS authorization_projection_head (
     updated_at DATETIME,
     PRIMARY KEY (head_id),
     UNIQUE KEY uk_test_projection_head (aggregate_type, aggregate_id)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS authorization_projection_outbox (
     outbox_id BIGINT NOT NULL AUTO_INCREMENT,
@@ -49,4 +49,4 @@ CREATE TABLE IF NOT EXISTS authorization_projection_outbox (
     KEY idx_test_apob_pending (status, next_attempt_at, created_at),
     KEY idx_test_apob_lease (status, lease_expires_at, outbox_id),
     KEY idx_test_apob_aggregate (aggregate_type, aggregate_id, source_generation)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

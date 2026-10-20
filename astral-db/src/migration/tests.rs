@@ -103,6 +103,44 @@ const CROSS_CITY_SCHEMA_MIGRATION_SQL: &str =
 const AL_MESSAGE_OUTBOX_MIGRATION_SQL: &str =
     include_str!("../../migrations/20260929000001_al_message_outbox.sql");
 
+#[test]
+fn owned_execution_migration_is_additive_pinned_and_not_baseline_adopted() {
+    let migration = MIGRATOR
+        .migrations
+        .iter()
+        .find(|migration| migration.version == PROJECTION_OWNED_EXECUTION_VERSION)
+        .expect("owned execution migration must remain embedded");
+    assert_eq!(
+        canonical_sha384_hex(migration.sql.as_bytes()),
+        PROJECTION_OWNED_EXECUTION_SQL_SHA384
+    );
+    assert!(!is_java_baseline_era(migration.version));
+    assert!(!baseline_versions().contains(&migration.version));
+    let artifacts = parsed_migration_artifacts(migration).expect("guarded DDL must be parsed");
+    let contract =
+        exact_migration_artifact_contract(migration).expect("exact source pin must match");
+    assert!(exact_contract_artifacts_match_source(contract, &artifacts));
+    assert!(contract.tables.is_empty());
+    assert_eq!(contract.columns.len(), 8);
+    assert_eq!(contract.indexes.len(), 1);
+    let sql = migration.sql.to_ascii_uppercase();
+    for forbidden in [
+        "DROP TABLE",
+        "DROP COLUMN",
+        "DELETE FROM",
+        "ADD COLUMN IF NOT EXISTS",
+    ] {
+        assert!(!sql.contains(forbidden));
+    }
+    assert!(sql.contains("EXECUTION_ACCOUNTING_VERSION = 0"));
+    assert!(sql.contains("GREATEST(EXECUTION_FAILURES, ATTEMPTS)"));
+    assert!(!sql.contains("SET ATTEMPTS"));
+    let mut changed = migration.clone();
+    changed.sql = format!("{}\nSELECT 1;", migration.sql).into();
+    assert!(!migration_matches_known_source(&changed));
+    assert!(exact_migration_artifact_contract(&changed).is_none());
+}
+
 fn historical_auth_migration() -> &'static Migration {
     MIGRATOR
         .migrations
@@ -798,6 +836,29 @@ fn mysql8_compatibility_rewrites_only_the_known_historical_statements() {
 }
 
 #[test]
+fn auth_family_metadata_database_rewrite_is_pinned_and_preserves_history() {
+    let migration = historical_auth_migration();
+    let checksum = migration.checksum.as_ref().to_vec();
+    let compatible = historical_mysql8_compatible_sql(migration).unwrap();
+
+    assert_eq!(AUTH_FAMILY_EXACT_REWRITES.len(), 1);
+    assert_eq!(migration.sql.matches("SET @db = DATABASE();").count(), 1);
+    assert!(!compatible.contains("SET @db = DATABASE();"));
+    assert_eq!(
+        compatible
+            .matches("SET @db = CONVERT(DATABASE() USING utf8mb4) COLLATE utf8mb4_0900_ai_ci;")
+            .count(),
+        1
+    );
+    assert!(compatible.contains("WHERE CONSTRAINT_SCHEMA = @db"));
+    assert_eq!(migration.checksum.as_ref(), checksum.as_slice());
+    assert_eq!(
+        canonical_sha384_hex(migration.sql.as_bytes()),
+        AUTH_FAMILY_SCHEMA_CONTRACT_SQL_SHA384
+    );
+}
+
+#[test]
 fn auth_session_resilience_contract_pins_lf_hash_and_all_add_column_statements() {
     let migration = auth_session_resilience_migration();
     assert_eq!(migration.version, AUTH_SESSION_RESILIENCE_VERSION);
@@ -1403,6 +1464,28 @@ fn migration_and_service_connection_options_are_separate() {
 #[test]
 fn isolated_migration_gate_rejects_non_isolated_or_wrong_transport_targets() {
     std::env::set_var("ASTRAL_MIGRATION_ENV", ISOLATED_MIGRATION_ENV);
+    assert!(is_isolated_migration_database("astral_rehearsal_nodea_r01"));
+    assert!(!is_isolated_migration_database("astral_rehearsal_"));
+    assert!(!is_isolated_migration_database("astral_rehearsal_Upper"));
+    assert!(!is_isolated_migration_database("astral_rehearsal_foo-bar"));
+    assert!(!is_isolated_migration_database(&format!(
+        "astral_rehearsal_{}",
+        "a".repeat(MAX_RUN_SCOPED_REHEARSAL_SUFFIX_BYTES + 1)
+    )));
+    assert!(is_isolated_migration_database(&format!(
+        "astral_rehearsal_{}",
+        "a".repeat(MAX_RUN_SCOPED_REHEARSAL_SUFFIX_BYTES)
+    )));
+    assert!(ensure_isolated_migration_target(&format!(
+        "mysql://user:password@127.0.0.1:3308/astral_rehearsal_{}",
+        "a".repeat(MAX_RUN_SCOPED_REHEARSAL_SUFFIX_BYTES)
+    ))
+    .is_ok());
+    assert!(ensure_isolated_migration_target(&format!(
+        "mysql://user:password@127.0.0.1:3308/astral_rehearsal_{}",
+        "a".repeat(MAX_RUN_SCOPED_REHEARSAL_SUFFIX_BYTES + 1)
+    ))
+    .is_err());
     assert!(
         ensure_isolated_migration_target("mysql://user:password@localhost:3308/astral_test")
             .is_ok()
@@ -1411,6 +1494,22 @@ fn isolated_migration_gate_rejects_non_isolated_or_wrong_transport_targets() {
         "mysql://user:password@127.0.0.1:3308/astral_rehearsal"
     )
     .is_ok());
+    assert!(ensure_isolated_migration_target(
+        "mysql://user:password@127.0.0.1:3308/astral_rehearsal_storm_20261014_r01"
+    )
+    .is_ok());
+    assert!(ensure_isolated_migration_target(
+        "mysql://user:password@127.0.0.1:3308/astral_rehearsal_"
+    )
+    .is_err());
+    assert!(ensure_isolated_migration_target(
+        "mysql://user:password@127.0.0.1:3308/astral_rehearsal_Upper"
+    )
+    .is_err());
+    assert!(ensure_isolated_migration_target(
+        "mysql://user:password@127.0.0.1:3308/astral_rehearsal_foo-bar"
+    )
+    .is_err());
     assert!(
         ensure_isolated_migration_target("mysql://user:password@[::1]:3308/astral_test").is_ok()
     );
@@ -1818,6 +1917,35 @@ fn learn_system_role_schema_contract_is_explicit_and_non_inferential() {
 }
 
 #[test]
+fn unique_preflight_defers_only_a_proven_new_nullable_null_key() {
+    let columns = LEARN_SYSTEM_ASSIGNMENT_COLUMNS;
+    let key = LEARN_SYSTEM_ASSIGNMENT_INDEXES[0].2;
+    assert!(
+        unique_duplicate_probe_required("learn_assignment", columns, key, &HashSet::new()).unwrap()
+    );
+    let missing = HashSet::from(["system_role"]);
+    assert!(!unique_duplicate_probe_required("learn_assignment", columns, key, &missing).unwrap());
+    let mut nonnullable = columns.to_vec();
+    nonnullable[0].not_null = true;
+    assert!(
+        unique_duplicate_probe_required("learn_assignment", &nonnullable, key, &missing).is_err()
+    );
+    let mut nonnull_default = columns.to_vec();
+    nonnull_default[0].default = Some("DEFAULT_GRADE");
+    assert!(
+        unique_duplicate_probe_required("learn_assignment", &nonnull_default, key, &missing)
+            .is_err()
+    );
+    assert!(unique_duplicate_probe_required(
+        "learn_assignment",
+        columns,
+        key,
+        &HashSet::from(["course_id"])
+    )
+    .is_err());
+}
+
+#[test]
 fn column_default_normalization_accepts_mysql_expression_parentheses_only() {
     assert!(column_default_matches(
         Some("UNIX_TIMESTAMP()"),
@@ -2063,8 +2191,8 @@ fn record_verified_baseline_is_default_deny_for_post_baseline_migrations() {
             .iter()
             .map(|migration| migration.version)
             .max(),
-        Some(20261005000001),
-        "the SDK identity mapping migration is the current chain tail"
+        Some(PROJECTION_OWNED_EXECUTION_VERSION),
+        "the aggregate-owned execution migration is the current chain tail"
     );
     assert!(!is_java_baseline_era(20261005000001));
     assert!(MIGRATOR
@@ -3525,6 +3653,7 @@ fn resolved_runtime_contract_layers_lineage_columns_after_creator_tail() {
             AUTHORIZATION_PROJECTION_LINEAGE_FENCE_COLUMN_CONTRACTS
                 .iter()
                 .chain(DELTA_EVENT_PUBLISHED_EVIDENCE_INVALIDATION_COLUMN_CONTRACTS.iter())
+                .chain(PROJECTION_OWNED_EXECUTION_DELTA_COLUMN_CONTRACTS.iter())
                 .filter(|expected| expected.table == *table)
                 .copied()
                 .collect();
@@ -3549,8 +3678,12 @@ fn resolved_runtime_contract_layers_lineage_columns_after_creator_tail() {
             assert_eq!(declared_tail[1].name, "revoke_fence");
         }
         if *table == "authorization_delta_event" {
-            assert_eq!(declared_tail.len(), 1);
+            assert_eq!(declared_tail.len(), 6);
             assert_eq!(declared_tail[0].name, "invalidates_published_evidence");
+            assert_eq!(
+                &declared_tail[1..],
+                PROJECTION_OWNED_EXECUTION_DELTA_COLUMN_CONTRACTS
+            );
         }
     }
 
@@ -3564,6 +3697,96 @@ fn resolved_runtime_contract_layers_lineage_columns_after_creator_tail() {
             (_, true, Some("0")) => {}
             other => panic!("unexpected lineage contract entry: {other:?}"),
         }
+    }
+}
+
+#[test]
+fn owned_execution_archive_tail_is_exact_and_history_gated() {
+    let table = "authorization_delta_event";
+    let base: Vec<SchemaColumnContract> = INCREMENTAL_PROJECTION_ARCHIVE_COLUMN_CONTRACTS
+        .iter()
+        .filter(|expected| expected.table == table)
+        .copied()
+        .collect();
+    let resolved = incremental_projection_resolved_column_contract(table, &base);
+    let names: Vec<String> = resolved
+        .iter()
+        .map(|column| column.name.to_owned())
+        .collect();
+    let old_tail_len = base.len() + 1;
+    for present in old_tail_len..=names.len() {
+        assert!(validate_resolved_archive_column_order(
+            table,
+            &base,
+            &names[..present],
+            Some(true),
+            Some(true),
+            Some(false)
+        )
+        .is_ok());
+        assert_eq!(
+            validate_resolved_archive_column_order(
+                table,
+                &base,
+                &names[..present],
+                Some(true),
+                Some(true),
+                Some(true)
+            )
+            .is_ok(),
+            present == names.len()
+        );
+    }
+    assert!(validate_resolved_archive_column_order(
+        table,
+        &base,
+        &names[..base.len()],
+        Some(true),
+        Some(true),
+        Some(false)
+    )
+    .is_err());
+    let mut reordered = names.clone();
+    reordered.swap(old_tail_len, old_tail_len + 1);
+    assert!(validate_resolved_archive_column_order(
+        table,
+        &base,
+        &reordered,
+        Some(true),
+        Some(true),
+        Some(true)
+    )
+    .is_err());
+    let mut unknown = names.clone();
+    unknown.push("unknown_execution_column".to_owned());
+    assert!(validate_resolved_archive_column_order(
+        table,
+        &base,
+        &unknown,
+        Some(true),
+        Some(true),
+        Some(true)
+    )
+    .is_err());
+    for expected in PROJECTION_OWNED_EXECUTION_DELTA_COLUMN_CONTRACTS {
+        assert!(schema_column_contract_matches(
+            expected.name,
+            expected.column_type,
+            if expected.not_null { "NO" } else { "YES" },
+            expected.default,
+            expected.charset,
+            expected.collation,
+            expected,
+        ));
+        assert!(!schema_column_contract_matches(
+            expected.name,
+            "VARCHAR(32)",
+            if expected.not_null { "NO" } else { "YES" },
+            expected.default,
+            expected.charset,
+            expected.collation,
+            expected,
+        ));
     }
 }
 

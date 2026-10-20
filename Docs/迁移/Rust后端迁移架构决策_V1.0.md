@@ -103,6 +103,27 @@ pom.xml 中存在 RocketMQ 依赖，但：
 
 ---
 
+## 2.4 worker-owned 授权投影切换（2026-10-15，default-off）
+
+本节定义 `20261015000001_authorization_projection_owned_execution.sql` 的应用与恢复边界，不代表任何共享或生产环境已经迁移。新增列属于 canonical delta 的 execution accounting 与既有 aggregate lane，不创建第二条授权事实链。
+
+### Preflight 与应用
+
+1. 固定 runId、目标 allowlist、二进制/SQL hash 和当前 `legacy-hybrid` 配置；只使用受批准的显式 `astral-migrate --apply`。本地 rehearsal 仍要求 isolated 环境、允许的 loopback 端口和 run-scoped 库名。本文不授权共享/生产迁移。
+2. 停止请求同步 publisher、本地和 DB worker、旧版本执行者；核对不存在未对账 source COMMIT、publication COMMIT、active lease 或异步副作用。进程退出不等于 durable 结果已知；UNKNOWN 必须先逐 event/operation 对账。
+3. 备份受影响 delta、partition lane、impact plan、manifest/current 及关联审计，记录恢复演练。短暂停写保护历史计数初始化；不得把旧 `attempts` 清零。旧 claim 不能事后准确分解为 execution/failure，因此迁移只保守继承其预算成本，并显式标记 accounting 版本。
+4. 执行 additive migration：逐列 information_schema guard 加 prepared DDL；按 accounting marker 仅一次初始化历史 counter；保留旧 attempts 和所有 publication 数据。新 lane epoch 与 publication generation 独立。SQLx 负责原始 checksum、顺序和历史；不手工标成功。
+5. 核对新增字段类型、空值、默认值、主键/索引与 counter/lane 不变式，验证历史记录、新建事件 marker、epoch 墓碑和 inactive sentinel。schema 漂移、负计数、活动槽与 event lease 不一致一律停止启动。
+6. 只有 drain 和 schema postcondition 均已证明，才在全新进程启动 `worker-owned`。先冻结配置，再校验数据库，再启动唯一 owner 与请求。两种协议的旧二进制不得任意混跑，env 不提供热切换能力。
+
+### 故障、forward-fix 与回退
+
+DDL 可能隐式提交。失败后先保存 SQLx history、实际列/索引、marker 分布与受影响行；逐项与固定 SQL 对账，再决定从备份恢复到新的隔离目标或执行显式 forward-fix。各 DDL 的 guard 不等于任意未知结果可自动重放；不得改历史 migration 或删除失败历史来制造通过。
+
+回退采用停新执行者、冻结新写入、对账已发布和 UNKNOWN、确认无活动 episode 后以 `legacy-hybrid` 重启。保留所有新增列、lane epoch、ledger/delta、manifest/current 和审计，不 DROP 或重置 current 来恢复旧快照。旧模式继续运行会改变 claim 计数；再次启用 owned 前必须重新核对 accounting 与未完成事件，不能依赖首次迁移时的历史余额。
+
+MySQL 8.0.46 的历史 auth-family migration 仍保持原 SQLx/source checksum；兼容执行层只对 checksum 已固定的 `SET @db = DATABASE()` 做精确 UTF-8 转换，避免外键元数据排序规则与用户变量冲突。旧 migration 文件和成功历史不改写，正常应用仍由显式 job 完成。
+
 ## 3. 组件替换矩阵
 
 ### 3.1 框架层

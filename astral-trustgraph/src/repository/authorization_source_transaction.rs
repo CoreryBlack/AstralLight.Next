@@ -3,9 +3,10 @@
 //! 影响有效授权的 source mutation 必须在同一短事务内把 typed invalidation
 //! envelope 追加进 durable `al_message_outbox`。本包装器在事务内收集与 durable
 //! outbox **逐字节相同**的 envelope（receipts），并在 `tx.commit()` 取得成功证明
-//! 之后，通过 exact outbox claim、LocalBus handler 和 lease-CAS completion
-//! 证明本地完成。提交后只做有界 claim/settlement，不重建 envelope；低频
-//! MySQL relay 承担未直发、失败或崩溃后的恢复。
+//! 之后按既有顺序执行一次有界 post-commit dispatch；普通提交入口随后以完整
+//! source receipt 批次只读等待 WorkerOwned completion，receipt-returning 入口把
+//! 同一批次交给调用方等待一次。所有等待均在 source 事务结束之后，不重建
+//! envelope；低频 MySQL relay 承担未直发、失败或崩溃后的恢复。
 //!
 //! 合同（fail-closed，Exec-L2 语义）：
 //! - **只有 commit 被证明成功才发送**。`commit()` 返回 `Err`（包括连接中断导致的
@@ -38,9 +39,9 @@ use astral_mq::{EligibilityInvalidated, InvalidationEvent};
 use astral_types::{AstralError, ProjectionAggregate, EVENT_TYPE_ELIGIBILITY_UPDATE};
 use sqlx::{MySql, Transaction};
 
-/// One direct invalidation dispatch budget, including exact DB claim, the shared
-/// LocalBus handler deadline, and owned completion CAS. The underlying calls
-/// each have a stricter bound; this outer deadline makes the receipt path finite.
+/// One direct invalidation dispatch budget, including exact DB claim and the shared
+/// LocalBus handler deadline. Projection completion is observed separately by the
+/// worker-owned request path from its complete source receipts.
 pub(crate) const INVALIDATION_DISPATCH_DEADLINE: Duration = Duration::from_secs(15);
 
 /// 单事务 projection delta receipts 的容量上限。
@@ -70,6 +71,13 @@ pub(crate) enum InvalidationDispatchOutcome {
     CompletedLocally,
     /// The row remains durable and is owned by the configured recovery relay.
     DeferredToRecovery,
+}
+
+/// Exact projection requests staged in one source transaction and returned only
+/// after COMMIT was proven. This is a correlation batch, not a completion proof.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CommittedProjectionReceipts {
+    pub requests: Vec<astral_db::DeltaEventAppendRequest>,
 }
 
 /// Post-commit invalidation dispatcher.
@@ -425,18 +433,62 @@ impl AuthorizationSourceTransaction {
         .await
     }
 
-    /// 可注入两类 dispatcher 的 `commit_consuming`（测试用）。
+    /// Commit and return the exact staged delta batch only after COMMIT is proven.
+    /// The established source dispatcher remains the sole post-commit hand-off;
+    /// completion waiting is performed once by the receipt-aware writer path.
+    pub(crate) async fn commit_consuming_with_receipts(
+        self,
+    ) -> Result<CommittedProjectionReceipts, AstralError> {
+        let invalidation_dispatcher = LocalBusInvalidationDispatcher {
+            pool: self.pool.clone(),
+        };
+        self.commit_consuming_with_dispatchers_and_receipts(
+            &AstralDbProjectionDeltaDispatcher,
+            &invalidation_dispatcher,
+        )
+        .await
+    }
+
+    /// 可注入两类 dispatcher 的 legacy `commit_consuming`（测试用）。
     ///
     /// 投递次序：commit 证明后**先 projection delta**（投影先追平），**后
-    /// invalidation**（再失效读取门）；两者都只有 commit 被证明才发送。
+    /// invalidation（再失效读取门）；两者都只有 commit 被证明才发送。
     pub(crate) async fn commit_consuming_with_dispatchers<
+        P: ProjectionDeltaDispatcher,
+        D: InvalidationDispatcher,
+    >(
+        self,
+        projection_dispatcher: &P,
+        invalidation_dispatcher: &D,
+    ) -> Result<(), AstralError> {
+        let pool = self.pool.clone();
+        let receipts = self
+            .commit_consuming_with_dispatchers_and_receipts(
+                projection_dispatcher,
+                invalidation_dispatcher,
+            )
+            .await?;
+        if astral_db::projection_execution_mode() == astral_db::ProjectionExecutionMode::WorkerOwned
+        {
+            crate::service::sync_publish::after_commit_sync_publish_with_receipts(
+                &pool,
+                Vec::new(),
+                receipts,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    /// Receipt-returning form for writers that await exact post-commit completion.
+    pub(crate) async fn commit_consuming_with_dispatchers_and_receipts<
         P: ProjectionDeltaDispatcher,
         D: InvalidationDispatcher,
     >(
         mut self,
         projection_dispatcher: &P,
         invalidation_dispatcher: &D,
-    ) -> Result<(), AstralError> {
+    ) -> Result<CommittedProjectionReceipts, AstralError> {
         let commit_started = Instant::now();
         // 取消安全：在 await COMMIT **之前** arm 栅栏。COMMIT 等待期间本 future
         // 被取消时，guard 携带 unproven Drop，hub 置 sticky uncertain —— 提交
@@ -459,6 +511,9 @@ impl AuthorizationSourceTransaction {
             }
             return Err(AstralError::Database(error.to_string()));
         }
+        let committed_projection_receipts = CommittedProjectionReceipts {
+            requests: deltas.clone(),
+        };
         // 只有 Ok 证明才 disarm：disarm 只复位本 guard 自身的 unproven 标志，
         // 另一 writer 造成的 hub uncertain 是 sticky 的，绝不在本 writer 的
         // proven 路径上清除。
@@ -473,7 +528,7 @@ impl AuthorizationSourceTransaction {
         );
         dispatch_proven_projection_deltas(deltas, projection_dispatcher);
         dispatch_proven_receipts(invalidations, invalidation_dispatcher).await;
-        Ok(())
+        Ok(committed_projection_receipts)
     }
 
     /// 显式回滚：receipts 归零丢弃，绝不投递。

@@ -136,6 +136,50 @@ pub const MAX_DELTA_STATUS_LIST_ROWS: i64 = 500;
 
 use std::collections::{BTreeMap, HashSet};
 
+mod owned_execution;
+
+pub(super) async fn claim_owned_exact_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    request: &DeltaEventAppendRequest,
+    owner: &str,
+    lease_seconds: i64,
+) -> Result<crate::OwnedStableEventOutcome, GrantRepositoryError> {
+    owned_execution::claim_exact_in_tx(tx, request, owner, lease_seconds).await
+}
+
+pub(super) async fn owned_candidate_receipts(
+    pool: &sqlx::MySqlPool,
+    scope: DeltaEventClaimScope,
+    aggregate: Option<&crate::ProjectionAggregateIdentity>,
+) -> Result<Vec<DeltaEventAppendRequest>, GrantRepositoryError> {
+    owned_execution::candidate_receipts(pool, scope, aggregate).await
+}
+
+pub(super) async fn exact_owned_event_succeeded_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    request: &DeltaEventAppendRequest,
+) -> Result<bool, GrantRepositoryError> {
+    let row: Option<StableEventClaimRow> = sqlx::query_as(STABLE_EVENT_CLAIM_SELECT_SQL)
+        .bind(&request.event_id)
+        .bind(request.tenant_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    verify_stable_event_request_binding(request, &row)?;
+    Ok(row.status == DELTA_STATUS_SUCCEEDED)
+}
+
+fn require_legacy_delta_execution() -> Result<(), GrantRepositoryError> {
+    if crate::projection_execution_mode() == crate::ProjectionExecutionMode::WorkerOwned {
+        return Err(GrantRepositoryError::ScopeViolation(
+            "code=projection_execution.legacy_execution_refused".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Errors
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1965,6 +2009,7 @@ pub async fn claim_next_delta_event_in_tx(
     lease_owner: &str,
     lease_seconds: i64,
 ) -> Result<Option<DeltaEventClaim>, GrantRepositoryError> {
+    require_legacy_delta_execution()?;
     positive_i64(scope.tenant_id, "tenant_id")?;
     if let Some(card_id) = scope.card_id {
         positive_i64(card_id, "card_id")?;
@@ -2036,6 +2081,7 @@ async fn install_claimed_event(
         )));
     }
 
+    owned_execution::join_legacy_accounting(tx, candidate.delta_event_id).await?;
     let token = DeltaLeaseToken::new_run_scoped();
     let install = sqlx::query(DELTA_CLAIM_INSTALL_SQL)
         .bind(lease_owner)
@@ -2161,6 +2207,7 @@ pub async fn acquire_partition_lease(
     lease_owner: &str,
     lease_seconds: i64,
 ) -> Result<Option<PartitionLeaseHandle>, GrantRepositoryError> {
+    require_legacy_delta_execution()?;
     identity.validate().map_err(|error| {
         GrantRepositoryError::Mapping(format!(
             "code=grant_repository.invalid_partition_identity;error={error}"
@@ -2232,6 +2279,7 @@ pub async fn acquire_partition_lease(
     }
 
     let mut takeover_tx = pool.begin().await?;
+    owned_execution::refuse_owned_partition_history(&mut takeover_tx, identity).await?;
     let takeover = sqlx::query(PARTITION_LEASE_TAKEOVER_SQL)
         .bind(lease_owner)
         .bind(token_hash)
@@ -2281,9 +2329,11 @@ pub async fn renew_partition_lease(
     handle: &PartitionLeaseHandle,
     lease_seconds: i64,
 ) -> Result<(), GrantRepositoryError> {
+    require_legacy_delta_execution()?;
     validate_partition_lease_handle(handle)?;
     validate_lease_seconds(lease_seconds)?;
     let mut tx = pool.begin().await?;
+    owned_execution::refuse_owned_partition_history(&mut tx, &handle.identity).await?;
     let result = sqlx::query(PARTITION_LEASE_RENEW_SQL)
         .bind(lease_seconds)
         .bind(handle.identity.tenant_id)
@@ -2320,8 +2370,10 @@ pub async fn release_partition_lease(
     pool: &sqlx::MySqlPool,
     handle: &PartitionLeaseHandle,
 ) -> Result<(), GrantRepositoryError> {
+    require_legacy_delta_execution()?;
     validate_partition_lease_handle(handle)?;
     let mut tx = pool.begin().await?;
+    owned_execution::refuse_owned_partition_history(&mut tx, &handle.identity).await?;
     let audit_state = read_partition_lease_audit_state_for_update_in_tx(
         &mut tx,
         &handle.identity,
@@ -2411,6 +2463,7 @@ pub async fn claim_next_delta_event_in_partition_tx(
     lease_owner: &str,
     lease_seconds: i64,
 ) -> Result<Option<DeltaEventClaim>, GrantRepositoryError> {
+    require_legacy_delta_execution()?;
     positive_i64(scope.tenant_id, "tenant_id")?;
     if let Some(card_id) = scope.card_id {
         positive_i64(card_id, "card_id")?;
@@ -2558,6 +2611,7 @@ pub async fn complete_delta_event<'e, E>(
 where
     E: Executor<'e, Database = MySql>,
 {
+    require_legacy_delta_execution()?;
     if guarded_update(executor, DELTA_COMPLETE_SQL_BASE, identity).await? != 1 {
         return Err(GrantRepositoryError::LeaseCasFailed(format!(
             "code=grant_repository.complete_lost_lease;event={}",
@@ -2581,6 +2635,7 @@ pub async fn fail_delta_event<'e, E>(
 where
     E: Executor<'e, Database = MySql>,
 {
+    require_legacy_delta_execution()?;
     if !(0..=MAX_BACKOFF_SECONDS).contains(&backoff_seconds) {
         return Err(GrantRepositoryError::ScopeViolation(format!(
             "code=grant_repository.invalid_backoff_seconds;value={backoff_seconds}"
@@ -2615,6 +2670,7 @@ pub async fn release_delta_event_lease<'e, E>(
 where
     E: Executor<'e, Database = MySql>,
 {
+    require_legacy_delta_execution()?;
     if guarded_update(executor, DELTA_RELEASE_SQL_BASE, identity).await? != 1 {
         return Err(GrantRepositoryError::LeaseCasFailed(format!(
             "code=grant_repository.release_lost_lease;event={}",
@@ -2675,6 +2731,7 @@ pub async fn extend_delta_event_lease<'e, E>(
 where
     E: Executor<'e, Database = MySql>,
 {
+    require_legacy_delta_execution()?;
     validate_lease_seconds(lease_seconds)?;
     validate_lease_identity(identity)?;
     let result = sqlx::query(DELTA_LEASE_HEARTBEAT_SQL)
@@ -2690,6 +2747,53 @@ where
             "code=grant_repository.heartbeat_lost_lease;event={}",
             identity.event_id
         )));
+    }
+    Ok(())
+}
+
+pub(super) async fn complete_owned_delta_event_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    lease: &crate::OwnedDeltaLease,
+) -> Result<(), GrantRepositoryError> {
+    if crate::projection_execution_mode() != crate::ProjectionExecutionMode::WorkerOwned {
+        return Err(GrantRepositoryError::ScopeViolation(
+            "code=projection_execution.worker_owned_mode_required".to_owned(),
+        ));
+    }
+    if guarded_update(&mut **tx, DELTA_COMPLETE_SQL_BASE, lease.identity()).await? != 1 {
+        return Err(GrantRepositoryError::LeaseCasFailed(
+            "code=projection_execution.complete_lost_lease".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+// Publication has already locked and verified the live lane and exact delta.
+// Keeping both locks through COMMIT fences takeover even if its clock expires.
+pub(super) async fn extend_owned_delta_event_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    lease: &crate::OwnedDeltaLease,
+    lease_seconds: i64,
+) -> Result<(), GrantRepositoryError> {
+    if crate::projection_execution_mode() != crate::ProjectionExecutionMode::WorkerOwned {
+        return Err(GrantRepositoryError::ScopeViolation(
+            "code=projection_execution.worker_owned_mode_required".to_owned(),
+        ));
+    }
+    validate_lease_seconds(lease_seconds)?;
+    let identity = lease.identity();
+    let updated = sqlx::query(DELTA_LEASE_HEARTBEAT_SQL)
+        .bind(lease_seconds)
+        .bind(identity.delta_event_id)
+        .bind(&identity.event_id)
+        .bind(&identity.lease_owner)
+        .bind(identity.lease_token.token_hash().as_bytes().to_vec())
+        .execute(&mut **tx)
+        .await?;
+    if updated.rows_affected() != 1 {
+        return Err(GrantRepositoryError::LeaseCasFailed(
+            "code=projection_execution.heartbeat_lost_lease".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -2791,6 +2895,7 @@ pub async fn mark_delta_event_quarantined<'e, E>(
 where
     E: Executor<'e, Database = MySql>,
 {
+    require_legacy_delta_execution()?;
     let last_error = compose_quarantine_last_error(reason_code, reason_detail)?;
     validate_lease_identity(identity)?;
     let statement: String = format!("{DELTA_QUARANTINE_SQL_BASE}{LEASE_GUARD_SUFFIX}");
@@ -4000,7 +4105,14 @@ fn verify_stable_event_request_binding(
     }
     match (&request.before_image_json, &request.before_digest_hex) {
         (Some(image), Some(digest)) => {
-            if row.before_image_json.as_deref() != Some(image.as_str()) {
+            let request_image: serde_json::Value =
+                serde_json::from_str(image).map_err(|_| mismatch("before_image_json"))?;
+            let stored_image: serde_json::Value = row
+                .before_image_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok())
+                .ok_or_else(|| mismatch("before_image_json"))?;
+            if stored_image != request_image {
                 return Err(mismatch("before_image_json"));
             }
             let row_digest = Sha256Digest::from_optional_bytes(row.before_digest.as_deref())?;
@@ -4019,7 +4131,11 @@ fn verify_stable_event_request_binding(
             ))
         }
     }
-    if row.delta_json != request.delta_json {
+    let requested_delta: serde_json::Value =
+        serde_json::from_str(&request.delta_json).map_err(|_| mismatch("delta_json"))?;
+    let stored_delta: serde_json::Value =
+        serde_json::from_str(&row.delta_json).map_err(|_| mismatch("delta_json"))?;
+    if stored_delta != requested_delta {
         return Err(mismatch("delta_json"));
     }
     if Sha256Digest::from_bytes(row.semantic_hash.clone())?
@@ -4095,6 +4211,7 @@ pub async fn claim_delta_event_by_stable_event_in_tx(
     lease_owner: &str,
     lease_seconds: i64,
 ) -> Result<ClaimedStableEventOutcome, GrantRepositoryError> {
+    require_legacy_delta_execution()?;
     positive_i64(request.tenant_id, "tenant_id")?;
     validated_text(&request.event_id, MAX_EVENT_ID_LENGTH, "event_id")?;
     validated_text(lease_owner, MAX_GRANT_LEASE_OWNER_LENGTH, "lease_owner")?;

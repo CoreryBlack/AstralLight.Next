@@ -1185,6 +1185,18 @@ path = "src/main.rs"
 ---
 
 
+### 15.5 聚合发布 ownership 与请求完成等待（2026-10-15，default-off）
+
+`ASTRAL_PROJECTION_EXECUTION_MODE` 只接受 `legacy-hybrid`（缺省）或 `worker-owned`；启动时冻结，同值幂等、异值或未知值拒绝。配置冻结不执行 SQL；连接后必须先验证对应 schema，再启动 worker 和请求。调度拓扑 `TenantSerial` / `Partitioned` 与执行协议是不同维度，不得按是否安装 LocalBus 临时切换协议。
+
+- **请求边界**：source transaction 保持短事务。只有已证明 COMMIT 成功才交付事务中保存的完整 `DeltaEventAppendRequest` 批次；commit 未知时不投递、不重放 source。`worker-owned` 请求只对完整 receipt 做有界 durable completion 等待，不 claim、编译、发布、release 或取消 worker lease。批次超过等待上限整体交回 worker，不能只完成前缀就报告全部完成。
+- **执行边界**：本地通知、DB polling 和恢复共用 `(tenant_id, aggregate_type, aggregate_id)` 聚合能力、持久单调 epoch、fresh token 和唯一 active-event slot。event lease、operation id、通知 admission 或 ACK 都不能替代聚合能力。互斥不替代发布顺序：同 aggregate 按 `(source_generation, delta_event_id)` 推进，存在更早的未成功贡献时，在安装 event lease 前返回 `Busy`；轮询发现使用相同前驱门。前驱退避、隔离或未知不能由后继越过，且等待不增加认领、execution 或 failure 计数。worker 只物化已批准 source mutation，不产生新的授权事实。
+- **发布与完成**：发布事务保持 lane → active delta → pointer → plan/manifest；只读完成观察使用 lane → pointer → exact delta → plan/manifest，并且仅接受 `SUCCEEDED` delta。完成观察不得先持历史 delta 再等待 pointer，否则会与 pointer-first 的规划读取形成锁环；lane 互斥保证它不会与同 aggregate 的 owned 发布并行持锁。规划 frontier 只纳入当前 generation 以内的已成功贡献，不把 active 未完成事件当作历史完成。impact plan、完整 manifest/segment/current CAS、delta `SUCCEEDED`、完成 seal 与 active slot 清理必须在同一事务。完成观察按精确不可变绑定验证历史发布，并验证目标 plan 的完整 item-set commitment、当前指针和保留历史的连续 parent/reference/segment seal；后继 pointer 不否定已证明的历史完成，但单看最新 pointer、status 或 join count 也不能证明完成。完整保留且通过校验的 `SUPERSEDED` manifest 必须有同一发布事务写入的 archive intent，可以证明历史发布，不能证明归档完成；已标记 `SUCCEEDED` 的 archive intent 必须匹配完整 terminal archive proof。历史被移除、损坏、缺 intent 或缺完成 seal 时不返回完成证明，也不从剩余行静默回填。
+- **完成 commitment 与保留**：owned 发布将规范化 impact item 集合及 plan 身份、版本、generation、目标 manifest/digest 的 SHA-256 commitment 写入既有 `audit_log` 的 `owned_lane_COMPLETION_SEAL` 事件，严格要求唯一匹配。该记录与对应 delta/plan/manifest 历史共同保留；审计清理不得独立删除它后仍承诺历史完成。目标故障是部分 item 删除、字段漂移、重复/缺失 seal 和历史链破坏；阻断点是原子发布或只读完成验证，证据不足只会延迟/拒绝完成，不扩大授权。此 commitment 检测存储损坏或越界写入，不防御同时可任意重写事实与 seal 的数据库管理员；数据库和审计写入权限仍属可信计算基。保留历史验证成本随历史及载荷增长，不是常数时间；请求等待超时只交回 worker，不释放或重放未知执行。
+- **预算与失败**：旧 `attempts` 保留为认领统计；真实执行次数与已证明执行失败分别计数。绑定校验、前驱等待、调度让行、dependency 和 pointer-moved replan 不污染 failure budget。历史计数不能无证据归零；切换前 drain/对账，首次加入 owned accounting 保守继承旧预算。UNKNOWN 先对账，不自动释放、失败标记或重放；已提交但镜像不可用只恢复镜像。
+- **切换与回退**：新迁移 `20261015000001` 只增加 owned lane 与 execution accounting 列，release 保留 epoch 墓碑。启用前停止所有旧执行者并对账 source、delta、lane、manifest/current 和审计；不支持旧二进制与新协议混跑。回退先停新执行者并证明无 active/unknown episode，保留新增列和所有 durable 事实，按兼容模式重新启动；再次启用必须重新对账预算，不靠改 env 热切换。
+- **读安全和证据边界**：撤销/收窄 pending-invalidates gate 与最终严格复读保持；普通新增不作为全卡阻塞。模型、单元测试、进程内签名 HTTP、真实 MySQL 与部署验收分别记录，未执行或缺 durable proof 不计 `PASS`。精确索引点查仍是 B-tree 查找，统一 owner 不消除全 manifest 物化成本。
+
 ## 16. 安全规范
 
 

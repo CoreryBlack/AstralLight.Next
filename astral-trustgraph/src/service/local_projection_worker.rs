@@ -63,6 +63,7 @@
 //! and separate from source-writer statistics.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -82,10 +83,11 @@ use astral_db::{
 
 use super::authorization_projector::{
     process_verified_claim, AuthorizationProjectorConfig, AuthorizationProjectorHandle,
-    AuthorizationProjectorRuntime, ProjectorCancellationToken, ProjectorHealthShared,
-    ProjectorProgress, PublicationContext, RepositoryRejection, RuntimeAccessError,
-    SqlxAuthorizationProjectorRuntime, WorkerRunSummary,
+    AuthorizationProjectorRuntime, OwnedTransitionProof, ProjectorCancellationToken,
+    ProjectorHealthShared, ProjectorProgress, PublicationContext, RepositoryRejection,
+    RuntimeAccessError, SqlxAuthorizationProjectorRuntime, WorkerRunSummary,
 };
+use crate::observability::{record_projector_event, ProjectorEventOutcome};
 
 /// Bounded number of scopes the plan mirror keeps. Eviction is
 /// insert-ordered (oldest scope dropped first); an evicted scope simply
@@ -320,6 +322,7 @@ fn supervise_local_projection_worker(
     let mut inner = AbortOnDropJoin { join: inner };
     async move {
         tokio::select! {
+            biased;
             _ = shutdown.cancelled() => {
                 // Normal shutdown: propagate the inner result; the caller applies
                 // its own bounded join timeout.
@@ -1015,14 +1018,101 @@ impl LocalProjectionRuntime {
     }
 }
 
+trait LocalProjectionRuntimePort: AuthorizationProjectorRuntime {
+    fn local_mirror_advance_after_publish(
+        &self,
+        claimed: &ClaimedDeltaEvent,
+    ) -> MirrorAdvanceReport;
+
+    fn local_mirror_ensure_claimed_row_present(&self, claimed: &ClaimedDeltaEvent) -> bool;
+
+    fn local_mirror_upsert_claimed_row(
+        &self,
+        request: &DeltaEventAppendRequest,
+        claimed: &ClaimedDeltaEvent,
+    ) -> MirrorRowProvenance;
+}
+
+impl LocalProjectionRuntimePort for LocalProjectionRuntime {
+    fn local_mirror_advance_after_publish(
+        &self,
+        claimed: &ClaimedDeltaEvent,
+    ) -> MirrorAdvanceReport {
+        self.advance_mirror_after_publish(claimed)
+    }
+
+    fn local_mirror_ensure_claimed_row_present(&self, claimed: &ClaimedDeltaEvent) -> bool {
+        self.mirror_ensure_claimed_row_present(claimed)
+    }
+
+    fn local_mirror_upsert_claimed_row(
+        &self,
+        request: &DeltaEventAppendRequest,
+        claimed: &ClaimedDeltaEvent,
+    ) -> MirrorRowProvenance {
+        self.mirror_upsert_claimed_row(request, claimed)
+    }
+}
+
 #[async_trait::async_trait]
 impl AuthorizationProjectorRuntime for LocalProjectionRuntime {
+    fn worker_owned_execution(&self) -> bool {
+        self.inner.worker_owned_execution()
+    }
+
+    async fn begin_event_execution(
+        &self,
+        identity: &astral_db::DeltaLeaseIdentity,
+    ) -> Result<u32, RuntimeAccessError> {
+        self.inner.begin_event_execution(identity).await
+    }
+
+    fn event_execution_failures(&self, identity: &astral_db::DeltaLeaseIdentity) -> Option<u32> {
+        self.inner.event_execution_failures(identity)
+    }
+
+    async fn defer_event(
+        &self,
+        identity: &astral_db::DeltaLeaseIdentity,
+        backoff_seconds: i64,
+        reason: &str,
+    ) {
+        self.inner
+            .defer_event(identity, backoff_seconds, reason)
+            .await;
+    }
+
+    async fn owned_fail_transition(
+        &self,
+        identity: &astral_db::DeltaLeaseIdentity,
+        backoff_seconds: i64,
+        message: &str,
+        count_failure: bool,
+    ) -> OwnedTransitionProof {
+        self.inner
+            .owned_fail_transition(identity, backoff_seconds, message, count_failure)
+            .await
+    }
+
+    async fn owned_release_transition(
+        &self,
+        identity: &astral_db::DeltaLeaseIdentity,
+    ) -> OwnedTransitionProof {
+        self.inner.owned_release_transition(identity).await
+    }
+
     async fn claim_event_by_dispatch(
         &self,
         request: &DeltaEventAppendRequest,
         lease_owner: &str,
         lease_seconds: i64,
     ) -> Result<ClaimedStableEventOutcome, RuntimeAccessError> {
+        if self.worker_owned_execution() {
+            return self
+                .inner
+                .claim_event_by_dispatch(request, lease_owner, lease_seconds)
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let outcome = astral_db::claim_delta_event_by_stable_event_in_tx(
             &mut tx,
@@ -1344,11 +1434,12 @@ async fn run_local_projection_worker(
 
     loop {
         tokio::select! {
+        biased;
         _ = shutdown.cancelled() => {
-            return Ok(health.take_summary());
+            return Ok(summary);
         }
         _ = recovery_wait(recovery_tick.as_mut()), if recovery_tick.is_some() => {
-            run_recovery_pass(
+            if run_recovery_pass(
                 &runtime,
                 &config,
                 &claim_owner,
@@ -1356,8 +1447,10 @@ async fn run_local_projection_worker(
                 &shutdown,
                 &mut summary,
             )
-            .await;
-            health.note_progress();
+            .await
+            {
+                health.note_progress();
+            }
         }
         delivery = receiver.recv() => {
             let Some(envelope) = delivery else {
@@ -1372,7 +1465,7 @@ async fn run_local_projection_worker(
             // Release the admission bookkeeping slot immediately: the
             // envelope is out of the queue and owned by this loop.
             bus.acknowledge(&envelope);
-            handle_dispatched_envelope(
+            if handle_dispatched_envelope(
                 &runtime,
                 &config,
                 &claim_owner,
@@ -1381,21 +1474,204 @@ async fn run_local_projection_worker(
                 &mut summary,
                 envelope,
             )
-            .await;
-            health.note_progress();
+            .await
+            {
+                health.note_progress();
+            }
         }        }
     }
 }
 
-async fn handle_dispatched_envelope(
-    runtime: &Arc<LocalProjectionRuntime>,
+/// Result of one bounded local event episode. A deadline or shutdown ends the
+/// in-flight future without inferring anything about a durable commit. The
+/// caller must therefore record UNKNOWN and issue no follow-up mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalEventWaitOutcome<T> {
+    Completed(T),
+    DeadlineExceeded,
+    Shutdown,
+}
+
+async fn bounded_local_event<F, T>(
+    deadline: Duration,
+    shutdown: &ProjectorCancellationToken,
+    future: F,
+) -> LocalEventWaitOutcome<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        // Cancellation wins ties with a completed timeout/future. The dropped
+        // future may have crossed a durable boundary, so the episode is UNKNOWN.
+        biased;
+        _ = shutdown.cancelled() => LocalEventWaitOutcome::Shutdown,
+        result = tokio::time::timeout(deadline, future) => match result {
+            Ok(value) => LocalEventWaitOutcome::Completed(value),
+            Err(_) => LocalEventWaitOutcome::DeadlineExceeded,
+        },
+    }
+}
+
+async fn await_direct_envelope_episode<F, T>(
+    deadline: Duration,
+    shutdown: &ProjectorCancellationToken,
+    episode: F,
+) -> LocalEventWaitOutcome<T>
+where
+    F: Future<Output = T>,
+{
+    bounded_local_event(deadline, shutdown, episode).await
+}
+
+async fn await_recovery_episode<F, T>(
+    deadline: Duration,
+    shutdown: &ProjectorCancellationToken,
+    episode: F,
+) -> LocalEventWaitOutcome<T>
+where
+    F: Future<Output = T>,
+{
+    bounded_local_event(deadline, shutdown, episode).await
+}
+
+fn record_local_event_deadline(
+    summary: &mut WorkerRunSummary,
+    event_id: Option<&str>,
+    phase: &'static str,
+) {
+    summary.events_deadline_exceeded += 1;
+    summary.events_publication_unknown += 1;
+    record_projector_event(ProjectorEventOutcome::DeadlineExceeded);
+    tracing::error!(
+        event_id = ?event_id,
+        phase,
+        "local projection event deadline exceeded; durable outcome UNKNOWN; \
+         lease/capability left unchanged for reconciliation"
+    );
+}
+
+fn record_local_event_unknown(
+    summary: &mut WorkerRunSummary,
+    event_id: Option<&str>,
+    phase: &'static str,
+    reason: &'static str,
+) {
+    summary.events_publication_unknown += 1;
+    record_projector_event(ProjectorEventOutcome::PublicationUnknown);
+    tracing::warn!(
+        event_id = ?event_id,
+        phase,
+        reason,
+        "local projection event outcome UNKNOWN; lease/capability left unchanged for reconciliation"
+    );
+}
+
+fn local_unknown_summary(summary: &WorkerRunSummary) -> u64 {
+    summary.events_publication_unknown
+        + summary.events_quarantine_unknown
+        + summary.events_lease_lost
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalEventEpisodeOutcome {
+    /// The episode completed with a known result, including a durable claim
+    /// followed by a proven publish/retry/quarantine transition.
+    Progress,
+    /// The episode completed without proving useful work or ownership.
+    NoProgress,
+    /// The episode completed, but an inner phase could not prove its durable
+    /// outcome. `recorded` says whether the inner phase already updated the
+    /// summary's UNKNOWN counters.
+    Unknown { recorded: bool },
+}
+
+fn local_claim_error_is_unknown(error: &RuntimeAccessError) -> bool {
+    matches!(
+        error,
+        RuntimeAccessError::PublicationUnknown(_)
+            | RuntimeAccessError::CommittedMirrorUnavailable(_)
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryEpisodeOutcome {
+    NoClaim,
+    Progress,
+    Unknown { recorded: bool },
+    ClaimFailed,
+}
+
+async fn handle_dispatched_envelope<R>(
+    runtime: &Arc<R>,
     config: &LocalProjectionWorkerConfig,
     claim_owner: &str,
     manifest_owner: &str,
     shutdown: &ProjectorCancellationToken,
     summary: &mut WorkerRunSummary,
     envelope: CommitDeltaEnvelope,
-) {
+) -> bool
+where
+    R: LocalProjectionRuntimePort,
+{
+    let event_id = envelope.request.event_id.clone();
+    match await_direct_envelope_episode(
+        config.projector.event_deadline,
+        shutdown,
+        handle_dispatched_envelope_episode(
+            runtime,
+            config,
+            claim_owner,
+            manifest_owner,
+            shutdown,
+            summary,
+            envelope,
+        ),
+    )
+    .await
+    {
+        LocalEventWaitOutcome::Completed(outcome) => match outcome {
+            LocalEventEpisodeOutcome::Progress => true,
+            LocalEventEpisodeOutcome::NoProgress => false,
+            LocalEventEpisodeOutcome::Unknown { recorded } => {
+                if !recorded {
+                    record_local_event_unknown(
+                        summary,
+                        Some(&event_id),
+                        "direct_claim_process",
+                        "inner_phase_unknown",
+                    );
+                }
+                false
+            }
+        },
+        LocalEventWaitOutcome::Shutdown => {
+            record_local_event_unknown(
+                summary,
+                Some(&event_id),
+                "direct_claim_process",
+                "shutdown_interrupted_episode",
+            );
+            false
+        }
+        LocalEventWaitOutcome::DeadlineExceeded => {
+            record_local_event_deadline(summary, Some(&event_id), "direct_claim_process");
+            false
+        }
+    }
+}
+
+async fn handle_dispatched_envelope_episode<R>(
+    runtime: &Arc<R>,
+    config: &LocalProjectionWorkerConfig,
+    claim_owner: &str,
+    manifest_owner: &str,
+    shutdown: &ProjectorCancellationToken,
+    summary: &mut WorkerRunSummary,
+    envelope: CommitDeltaEnvelope,
+) -> LocalEventEpisodeOutcome
+where
+    R: LocalProjectionRuntimePort,
+{
     let request: &DeltaEventAppendRequest = &envelope.request;
     match runtime
         .claim_event_by_dispatch(request, claim_owner, config.projector.claim_lease_seconds)
@@ -1430,12 +1706,17 @@ async fn handle_dispatched_envelope(
                      delta stays queued for recovery"
                 );
             }
+            if local_claim_error_is_unknown(&error) {
+                return LocalEventEpisodeOutcome::Unknown { recorded: false };
+            }
+            LocalEventEpisodeOutcome::NoProgress
         }
         Ok(ClaimedStableEventOutcome::AlreadyProcessed { event_id }) => {
             tracing::debug!(
                 event_id = %event_id,
                 "dispatched delta already durably processed; skip without replay"
             );
+            LocalEventEpisodeOutcome::Progress
         }
         Ok(ClaimedStableEventOutcome::TerminalGated { event_id, status }) => {
             // NOT a success skip: the durable terminal gate stays in force and
@@ -1446,12 +1727,14 @@ async fn handle_dispatched_envelope(
                 "dispatched delta is durably gated (quarantined); no replay, \
                  operator reconciliation required"
             );
+            LocalEventEpisodeOutcome::Progress
         }
         Ok(ClaimedStableEventOutcome::Busy { event_id }) => {
             tracing::debug!(
                 event_id = %event_id,
                 "dispatched delta not claimable now (live lease / backoff window); recovery converges"
             );
+            LocalEventEpisodeOutcome::NoProgress
         }
         Ok(ClaimedStableEventOutcome::InDoubt { event_id, reason }) => {
             tracing::error!(
@@ -1462,6 +1745,7 @@ async fn handle_dispatched_envelope(
             if let Some(hub) = memory_projection_hub() {
                 hub.mark_channel_suspect(reason);
             }
+            LocalEventEpisodeOutcome::Unknown { recorded: false }
         }
         Ok(ClaimedStableEventOutcome::Claimed { claim, event }) => {
             summary.events_claimed += 1;
@@ -1469,7 +1753,7 @@ async fn handle_dispatched_envelope(
             // inserts the event's own ledger row while per-grant continuity
             // against the mirror head holds; any doubt poisons the scope so
             // the compile falls back to strict cold reads.
-            runtime.mirror_upsert_claimed_row(&envelope.request, &event);
+            runtime.local_mirror_upsert_claimed_row(&envelope.request, &event);
             let identity = match ProjectionAggregateIdentity::new(
                 claim.tenant_id,
                 claim.aggregate_type.clone(),
@@ -1485,11 +1769,12 @@ async fn handle_dispatched_envelope(
                         error = %error,
                         "claimed identity invalid on the direct path; lease left to expire"
                     );
-                    return;
+                    return LocalEventEpisodeOutcome::Unknown { recorded: false };
                 }
             };
             let projector_config = config.projector.clone();
             let as_dyn: Arc<dyn AuthorizationProjectorRuntime> = runtime.clone();
+            let unknown_before = local_unknown_summary(summary);
             process_verified_claim(
                 &as_dyn,
                 &projector_config,
@@ -1502,7 +1787,14 @@ async fn handle_dispatched_envelope(
                 summary,
             )
             .await;
-            runtime.advance_mirror_after_publish(&event);
+            let unknown_recorded = local_unknown_summary(summary) != unknown_before;
+            if shutdown.is_cancelled() || unknown_recorded {
+                return LocalEventEpisodeOutcome::Unknown {
+                    recorded: unknown_recorded,
+                };
+            }
+            runtime.local_mirror_advance_after_publish(&event);
+            LocalEventEpisodeOutcome::Progress
         }
     }
 }
@@ -1511,79 +1803,153 @@ async fn handle_dispatched_envelope(
 /// missed, through the SAME verified pipeline (strict reads whenever the
 /// mirror lacks their provenance; missing memory proofs compile PENDING/DB
 /// strict, never from guessed inputs).
-async fn run_recovery_pass(
-    runtime: &Arc<LocalProjectionRuntime>,
+async fn run_recovery_pass<R>(
+    runtime: &Arc<R>,
     config: &LocalProjectionWorkerConfig,
     claim_owner: &str,
     manifest_owner: &str,
     shutdown: &ProjectorCancellationToken,
     summary: &mut WorkerRunSummary,
-) {
+) -> bool
+where
+    R: LocalProjectionRuntimePort,
+{
     let Some(interval) = config.recovery_poll else {
-        return;
+        return false;
     };
     let _ = interval;
+    let mut made_progress = false;
     for tenant_id in &config.projector.tenants {
         if shutdown.is_cancelled() {
-            return;
+            return false;
         }
         let scope = DeltaEventClaimScope {
             tenant_id: *tenant_id,
             card_id: None,
         };
         for _ in 0..config.max_recovery_events_per_pass {
-            match runtime
-                .claim_next_event(&scope, claim_owner, config.projector.claim_lease_seconds)
-                .await
+            match await_recovery_episode(
+                config.projector.event_deadline,
+                shutdown,
+                recovery_event_episode(
+                    runtime,
+                    &config.projector,
+                    &scope,
+                    claim_owner,
+                    manifest_owner,
+                    shutdown,
+                    summary,
+                ),
+            )
+            .await
             {
-                Ok(Some(claim)) => {
-                    summary.events_claimed += 1;
-                    let identity = match ProjectionAggregateIdentity::new(
-                        claim.tenant_id,
-                        claim.aggregate_type.clone(),
-                        claim.aggregate_id,
-                    ) {
-                        Ok(identity) => identity,
-                        Err(_) => return,
-                    };
-                    let _ = identity;
-                    // Recovery events bypass the direct claim path and carry
-                    // no request DTO: the readback pipeline verifies the lease
-                    // and loads the payload strictly. If the mirror exists for
-                    // the scope but lacks this event's provenance row, the
-                    // scope is poisoned back to strict cold reads first.
-                    recovery_process_claimed(
-                        runtime,
-                        &config.projector,
-                        manifest_owner,
-                        shutdown,
-                        claim,
-                        summary,
-                    )
-                    .await;
+                LocalEventWaitOutcome::Completed(RecoveryEpisodeOutcome::NoClaim) => break,
+                LocalEventWaitOutcome::Completed(RecoveryEpisodeOutcome::Progress) => {
+                    made_progress = true;
                 }
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::warn!(
-                        tenant_id,
-                        error = %error,
-                        "recovery pass claim failed; remaining events stay queued"
+                LocalEventWaitOutcome::Completed(RecoveryEpisodeOutcome::ClaimFailed) => break,
+                LocalEventWaitOutcome::Completed(RecoveryEpisodeOutcome::Unknown { recorded }) => {
+                    if !recorded {
+                        record_local_event_unknown(
+                            summary,
+                            None,
+                            "recovery_claim_process",
+                            "inner_phase_unknown",
+                        );
+                    }
+                    return false;
+                }
+                LocalEventWaitOutcome::DeadlineExceeded => {
+                    record_local_event_deadline(summary, None, "recovery_claim_process");
+                    return false;
+                }
+                LocalEventWaitOutcome::Shutdown => {
+                    record_local_event_unknown(
+                        summary,
+                        None,
+                        "recovery_claim_process",
+                        "shutdown_interrupted_episode",
                     );
-                    break;
+                    return false;
                 }
             }
         }
     }
+    made_progress
 }
 
-async fn recovery_process_claimed(
-    runtime: &Arc<LocalProjectionRuntime>,
+async fn recovery_event_episode<R>(
+    runtime: &Arc<R>,
+    projector_config: &AuthorizationProjectorConfig,
+    scope: &DeltaEventClaimScope,
+    claim_owner: &str,
+    manifest_owner: &str,
+    shutdown: &ProjectorCancellationToken,
+    summary: &mut WorkerRunSummary,
+) -> RecoveryEpisodeOutcome
+where
+    R: LocalProjectionRuntimePort,
+{
+    let claim = match runtime
+        .claim_next_event(scope, claim_owner, projector_config.claim_lease_seconds)
+        .await
+    {
+        Ok(Some(claim)) => claim,
+        Ok(None) => return RecoveryEpisodeOutcome::NoClaim,
+        Err(error) => {
+            tracing::warn!(
+                tenant_id = scope.tenant_id,
+                error = %error,
+                "recovery pass claim failed; remaining events stay queued"
+            );
+            if local_claim_error_is_unknown(&error) {
+                return RecoveryEpisodeOutcome::Unknown { recorded: false };
+            }
+            return RecoveryEpisodeOutcome::ClaimFailed;
+        }
+    };
+    summary.events_claimed += 1;
+    let identity = match ProjectionAggregateIdentity::new(
+        claim.tenant_id,
+        claim.aggregate_type.clone(),
+        claim.aggregate_id,
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::error!(
+                event_id = %claim.event_id,
+                error = %error,
+                "recovery claim identity invalid; lease left to expire"
+            );
+            return RecoveryEpisodeOutcome::Unknown { recorded: false };
+        }
+    };
+    // Recovery events carry no request DTO: readback verifies the lease and
+    // loads the payload strictly before the shared authorization pipeline.
+    recovery_process_claimed(
+        runtime,
+        projector_config,
+        manifest_owner,
+        shutdown,
+        claim,
+        identity,
+        summary,
+    )
+    .await
+}
+
+async fn recovery_process_claimed<R>(
+    runtime: &Arc<R>,
     projector_config: &AuthorizationProjectorConfig,
     manifest_owner: &str,
     shutdown: &ProjectorCancellationToken,
     claim: DeltaEventClaim,
+    identity: ProjectionAggregateIdentity,
     summary: &mut WorkerRunSummary,
-) {
+) -> RecoveryEpisodeOutcome
+where
+    R: LocalProjectionRuntimePort,
+{
     let as_dyn: Arc<dyn AuthorizationProjectorRuntime> = runtime.clone();
     // Queue-side claims carry no payload in hand: run the standard pipeline
     // (readback → observe → ledger → decide → publish).
@@ -1595,7 +1961,7 @@ async fn recovery_process_claimed(
     };
     match as_dyn.read_claimed_event(&delta_lease_identity).await {
         Ok(claimed_row) => {
-            let identity = match ProjectionAggregateIdentity::new(
+            let readback_identity = match ProjectionAggregateIdentity::new(
                 claimed_row.tenant_id,
                 claimed_row.aggregate_type.clone(),
                 claimed_row.aggregate_id,
@@ -1605,15 +1971,23 @@ async fn recovery_process_claimed(
                     tracing::error!(
                         event_id = %claim.event_id,
                         error = %error,
-                        "recovery claim identity invalid; lease left to expire"
+                        "recovery readback identity invalid; lease left to expire"
                     );
-                    return;
+                    return RecoveryEpisodeOutcome::Unknown { recorded: false };
                 }
             };
+            if readback_identity != identity {
+                tracing::error!(
+                    event_id = %claim.event_id,
+                    "recovery readback identity diverged from claim; lease left to expire"
+                );
+                return RecoveryEpisodeOutcome::Unknown { recorded: false };
+            }
             // Provenance gate: a mirror that lacks this event's row cannot
             // serve the compile — poison to strict cold reads (never a silent
             // update from guessed inputs).
-            runtime.mirror_ensure_claimed_row_present(&claimed_row);
+            runtime.local_mirror_ensure_claimed_row_present(&claimed_row);
+            let unknown_before = local_unknown_summary(summary);
             process_verified_claim(
                 &as_dyn,
                 projector_config,
@@ -1626,7 +2000,14 @@ async fn recovery_process_claimed(
                 summary,
             )
             .await;
-            runtime.advance_mirror_after_publish(&claimed_row);
+            let unknown_recorded = local_unknown_summary(summary) != unknown_before;
+            if shutdown.is_cancelled() || unknown_recorded {
+                return RecoveryEpisodeOutcome::Unknown {
+                    recorded: unknown_recorded,
+                };
+            }
+            runtime.local_mirror_advance_after_publish(&claimed_row);
+            RecoveryEpisodeOutcome::Progress
         }
         Err(error) => {
             tracing::warn!(
@@ -1634,6 +2015,7 @@ async fn recovery_process_claimed(
                 error = %error,
                 "recovery claim readback refused; event stays for lease-expiry reclaim"
             );
+            RecoveryEpisodeOutcome::Unknown { recorded: false }
         }
     }
 }

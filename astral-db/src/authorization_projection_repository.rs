@@ -240,6 +240,17 @@
 //! stage/publish transaction repeats all verification inside its guarded
 //! statements.
 //!
+//! Worker-owned publication adds the aggregate lane BEFORE its active delta.
+//! Completion observation takes that same lane, then the current pointer,
+//! then the exact receipt delta and target plan/manifest. It checks the locked
+//! delta is `SUCCEEDED`; a pending/leased receipt never proves completion.
+//! Taking a historical delta before the pointer would deadlock with a planning
+//! reader holding the pointer and inspecting that published delta. The lane
+//! serializes completion against owned publication, whose active event is not
+//! part of the published frontier. Legacy execution must not bypass this lane
+//! while worker-owned mode is active; this does not eliminate all possible
+//! MySQL transaction aborts or permit replaying an unknown COMMIT.
+//!
 //! # Delta-event quarantine vocabulary pointer
 //!
 //! The `authorization_delta_event` owner module defines the terminal
@@ -268,6 +279,24 @@ use astral_types::{
 };
 
 pub use crate::grant_repository::Sha256Digest;
+
+mod owned_completion;
+
+pub(super) async fn load_owned_completion_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    request: &crate::DeltaEventAppendRequest,
+) -> Result<Option<(i64, u64, Sha256Digest, i64)>, AuthorizationProjectionError> {
+    Ok(owned_completion::load_in_tx(tx, request)
+        .await?
+        .map(|proof| {
+            (
+                proof.manifest_id,
+                proof.generation,
+                proof.manifest_digest,
+                proof.plan_id,
+            )
+        }))
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants mirrored from migration 20260825000002_incremental_projection_archive.sql
@@ -3416,6 +3445,18 @@ fn post_publish_pointer_agrees(
 /// statement always demands `current_generation`, `manifest_id` and
 /// `cas_version` to match the freshly locked expectation exactly.
 pub async fn publish_current_pointer_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    request: &AuthorizationPublishRequest,
+) -> Result<AuthorizationPublishOutcome, AuthorizationProjectionError> {
+    if crate::projection_execution_mode() == crate::ProjectionExecutionMode::WorkerOwned {
+        return Err(scope_violation(
+            "projection_execution.legacy_execution_refused",
+        ));
+    }
+    publish_current_pointer_core_in_tx(tx, request).await
+}
+
+async fn publish_current_pointer_core_in_tx(
     tx: &mut Transaction<'_, MySql>,
     request: &AuthorizationPublishRequest,
 ) -> Result<AuthorizationPublishOutcome, AuthorizationProjectionError> {
@@ -7558,8 +7599,11 @@ fn frontier_extra_probe_binds(generation: u64) -> Result<(i64, i64), Authorizati
 /// strict read) → impact plans (target ≤ G ascending) → one locked delta row
 /// per plan event. Concurrent projectors lock delta rows FIRST inside their
 /// own transactions, so engine-level deadlock aborts remain possible across
-/// opposite acquisition orders; callers must treat such aborts as retryable
-/// transactions (no state is partially visible — MySQL rolls back atomically).
+/// opposite acquisition orders; a proven whole-transaction abort may be retried,
+/// but an unknown COMMIT must first be reconciled. Worker-owned completion
+/// observations share the pointer-first order after locking their aggregate
+/// lane; they must not pre-lock a historical delta while waiting for this reader.
+/// The owned publisher's active event is outside this published frontier.
 ///
 /// - Returns `Ok(None)` when no current pointer exists: `frontier = 0` with an
 ///   empty event list is representable only as absence here.
@@ -10175,6 +10219,19 @@ pub async fn project_authorization_delta_in_tx(
     tx: &mut Transaction<'_, MySql>,
     command: &DeltaProjectorPublishCommand,
 ) -> Result<DeltaProjectorPublishOutcome, AuthorizationProjectionError> {
+    if crate::projection_execution_mode() == crate::ProjectionExecutionMode::WorkerOwned {
+        return Err(scope_violation(
+            "projection_execution.legacy_publication_refused",
+        ));
+    }
+    project_delta_core_in_tx(tx, command, None).await
+}
+
+pub(super) async fn project_delta_core_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    command: &DeltaProjectorPublishCommand,
+    owned_lease: Option<&crate::OwnedDeltaLease>,
+) -> Result<DeltaProjectorPublishOutcome, AuthorizationProjectionError> {
     validate_projector_command_shape(command)?;
 
     // (1) Lock + strictly re-verify the claimed delta lease.
@@ -10296,7 +10353,7 @@ pub async fn project_authorization_delta_in_tx(
     };
 
     // (7) Atomic publication through the affected-rows-exactly-one CAS.
-    let publish = publish_current_pointer_in_tx(
+    let publish = publish_current_pointer_core_in_tx(
         tx,
         &AuthorizationPublishRequest {
             identity: command.expectation.identity.clone(),
@@ -10325,20 +10382,30 @@ pub async fn project_authorization_delta_in_tx(
     // Renew immediately before terminal completion so a long publication cannot
     // pass the hot-state CAS and then fail only because the original lease window
     // elapsed. A lost lease aborts the transaction and preserves UNKNOWN safety.
-    crate::grant_repository::extend_delta_event_lease(
-        &mut **tx,
-        &command.delta_lease_identity,
-        120,
-    )
-    .await?;
-    crate::grant_repository::complete_delta_event(&mut **tx, &command.delta_lease_identity).await?;
+    if let Some(lease) = owned_lease {
+        crate::grant_repository::extend_owned_delta_event_in_tx(tx, lease, 120).await?;
+        crate::grant_repository::complete_owned_delta_event_in_tx(tx, lease).await?;
+    } else {
+        crate::grant_repository::extend_delta_event_lease(
+            &mut **tx,
+            &command.delta_lease_identity,
+            120,
+        )
+        .await?;
+        crate::grant_repository::complete_delta_event(&mut **tx, &command.delta_lease_identity)
+            .await?;
+    }
 
-    Ok(DeltaProjectorPublishOutcome {
+    let outcome = DeltaProjectorPublishOutcome {
         impact_plan,
         stage,
         archive_intent,
         publish,
-    })
+    };
+    if owned_lease.is_some() {
+        owned_completion::record_publication_in_tx(tx, command, &outcome).await?;
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]

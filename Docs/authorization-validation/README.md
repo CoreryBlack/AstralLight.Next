@@ -52,6 +52,8 @@ python Docs/authorization-validation/tools/e5_model_check.py --json
 python Docs/authorization-validation/tools/e5_model_check_two_mutations.py
 python Docs/authorization-validation/tools/universal_hypotheses_check.py --model both
 python Docs/authorization-validation/tools/tenant_isolation_model.py
+python -B Docs/authorization-validation/tools/projection_owner_model.py --json
+python -B -m unittest discover -s Docs/authorization-validation/tools -p 'test_projection_owner_model.py' -v
 python Docs/authorization-validation/tools/unbounded_confirmation.py
 ```
 
@@ -81,6 +83,27 @@ stay outside mechanical reach today -- parameter unboundedness (the
 reduction lemma to at most two mutations, empirically supported, mechanically
 unconfirmed) and abstraction unboundedness (deductive proof via TLAPS/Coq,
 BLOCKED until a pinned tool exists).
+
+`projection_owner_model.py` separately explores the explicitly bounded request/worker
+ownership protocol and runs omission controls plus deterministic scheduling-cost
+comparisons. Its state/transition counts and synthetic operation counts are not
+MySQL timings, unbounded liveness proofs, or deployment acceptance. The corresponding
+real-database tests retain their own evidence scope and dependency requirements.
+
+The `projection-owned-completion-integrity` campaign suite separately runs an ignored
+real-MySQL contract on the explicitly approved run-owned clone. It checks exact
+historical publication, multi-item commitment completeness, corruption rejection,
+and whole-publication rollback after a late seal failure. Its concurrent lock-order
+controls observe an actual blocked MySQL statement: a planner keeps the pointer
+while completion waits, then verifies delta-lock availability and full frontier
+progress. An inverted-order control must reject the delta `NOWAIT` probe. A
+separate lane-held control verifies that completion cannot pre-lock the pointer
+or active delta and never reports an unfinished event complete. Its synthetic
+commands are not source-transaction or HTTP provenance evidence. Negative probes
+roll back before the next probe; ambiguous outcomes retain fixtures and are not
+replayed.
+The `projection-owned-http` suite covers the in-process production signed router
+and source-to-worker path; neither suite proves real-socket or multi-node deployment.
 
 The runners default to local planning and validation. Remote reads, migrations,
 service startup, fault injection, and durable source mutations require their own

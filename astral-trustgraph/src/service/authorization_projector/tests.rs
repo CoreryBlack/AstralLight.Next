@@ -3666,21 +3666,29 @@ async fn unknown_commit_or_post_commit_install_never_replays_or_mutates_lease() 
 
 #[test]
 fn local_mirror_install_follows_commit_and_precedes_optional_l2() {
-    // 拆分后该发布时序位于 runtime seam 模块（SqlxAuthorizationProjectorRuntime）。
     let source = include_str!("../authorization_projector/runtime.rs");
     let body = source
-        .split("let outcome = project_authorization_delta_in_tx")
+        .split("impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {")
         .nth(1)
         .unwrap()
-        .split("async fn fail_event")
+        .split("async fn execute_projection_publish(")
+        .nth(1)
+        .unwrap()
+        .split("\n    async fn fail_event(")
         .next()
         .unwrap();
+    let owned_publish = body
+        .find("project_owned_authorization_delta_in_tx")
+        .unwrap();
+    let legacy_publish = body.find("project_authorization_delta_in_tx").unwrap();
     let commit = body.find("tx.commit()").unwrap();
+    let retire_capability = body.find("self.owned.remove").unwrap();
     let install = body.find("install_committed_publication").unwrap();
     let l2 = body
         .find("push_published_evidence_to_l2_after_commit")
         .unwrap();
-    assert!(commit < install && install < l2);
+    assert!(owned_publish < commit && legacy_publish < commit);
+    assert!(commit < retire_capability && retire_capability < install && install < l2);
     assert!(!body.contains("refresh_from_durable"));
 }
 

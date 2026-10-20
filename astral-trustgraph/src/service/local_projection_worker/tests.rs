@@ -2,16 +2,20 @@
 //! proven advance, poisoning, provenance gate, and bounded sorted insertion.
 
 use super::{
-    insert_ledger_row_sorted, published_state_ledger_row, supervise_local_projection_worker,
-    validate_recovery_scope, AbortOnDropJoin, MirrorAdvanceReport, PublicationContext, ScopeKey,
-    ScopePlanMirror, WorkerLivenessCell,
+    handle_dispatched_envelope, insert_ledger_row_sorted, published_state_ledger_row,
+    run_recovery_pass, supervise_local_projection_worker, validate_recovery_scope, AbortOnDropJoin,
+    LocalProjectionRuntimePort, LocalProjectionWorkerConfig, MirrorAdvanceReport,
+    MirrorRowProvenance, PublicationContext, ScopeKey, ScopePlanMirror, WorkerLivenessCell,
 };
-use crate::service::authorization_projector::{ProjectorCancellationToken, WorkerRunSummary};
+use crate::service::authorization_projector::{
+    AuthorizationProjectorRuntime, ProjectorCancellationToken, RuntimeAccessError, WorkerRunSummary,
+};
 use astral_db::{
     AuthorizationArchiveIntentOutcome, AuthorizationCurrentPointerRecord,
     AuthorizationImpactPlanOutcome, AuthorizationPublishOutcome, AuthorizationPublishedState,
     AuthorizationSegmentSnapshot, AuthorizationStageOutcome, ClaimedDeltaEvent,
-    DeltaEventAppendRequest, DeltaEventType, DeltaProjectorPublishOutcome,
+    CommitDeltaEnvelope, DeltaEventAppendRequest, DeltaEventClaim, DeltaEventClaimScope,
+    DeltaEventType, DeltaLeaseToken, DeltaProjectorPublishCommand, DeltaProjectorPublishOutcome,
     ProjectionAggregateIdentity, PublishedAggregateFrontier, PublishedGenerationSummary,
     RawLedgerRow, Sha256Digest,
 };
@@ -19,7 +23,11 @@ use astral_types::{
     BindingLayer, CanonicalGrant, GrantEffect, GrantId, GrantProvenance, GrantRevision,
     GrantSourceKind, GrantState, TenantScope, ValidityWindow,
 };
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::Duration;
 
 const GRANT_UUID: &str = "550e8400-e29b-41d4-a716-446655440004";
 
@@ -918,4 +926,505 @@ fn poisoned_liveness_cell_reads_as_dead() {
             "code=local_projection_worker.liveness_cell_poisoned".to_owned()
         )
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockingPhase {
+    DirectClaim,
+    DirectObserve,
+    DirectInDoubt,
+    DirectCompletedUnknown,
+    RecoveryClaim,
+    RecoveryReadback,
+    RecoveryObserve,
+    RecoveryCompletedUnknown,
+}
+
+struct BlockingLocalRuntime {
+    phase: BlockingPhase,
+    started: AtomicBool,
+    release_calls: AtomicUsize,
+    fail_calls: AtomicUsize,
+    publish_calls: AtomicUsize,
+    mirror_advance_calls: AtomicUsize,
+}
+
+impl BlockingLocalRuntime {
+    fn new(phase: BlockingPhase) -> Arc<Self> {
+        Arc::new(Self {
+            phase,
+            started: AtomicBool::new(false),
+            release_calls: AtomicUsize::new(0),
+            fail_calls: AtomicUsize::new(0),
+            publish_calls: AtomicUsize::new(0),
+            mirror_advance_calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn event(&self) -> ClaimedDeltaEvent {
+        claimed_for("evt-blocking", 2)
+    }
+
+    fn claim(&self) -> DeltaEventClaim {
+        let event = self.event();
+        DeltaEventClaim {
+            delta_event_id: event.delta_event_id,
+            event_id: event.event_id.clone(),
+            operation_id: event.operation_id.clone(),
+            event_type: event.event_type,
+            tenant_id: event.tenant_id,
+            card_id: event.card_id,
+            aggregate_type: event.aggregate_type.clone(),
+            aggregate_id: event.aggregate_id,
+            grant_id: event.grant_id,
+            base_version: event.base_version,
+            target_version: event.target_version,
+            source_generation: event.source_generation,
+            revoke_fence: event.revoke_fence,
+            before_image_json: event.before_image_json.clone(),
+            before_digest: event.before_digest.clone(),
+            delta_json: event.delta_json.clone(),
+            semantic_hash: event.semantic_hash.clone(),
+            dependency_hash: event.dependency_hash.clone(),
+            compiler_version: event.compiler_version.clone(),
+            attempts: event.attempts,
+            cas_version: event.cas_version,
+            lease_owner: "local-blocking-test".to_owned(),
+            lease_token: DeltaLeaseToken::new_run_scoped(),
+            lease_expires_at: event.lease_expires_at,
+        }
+    }
+
+    fn mark_started(&self) {
+        self.started.store(true, Ordering::Release);
+    }
+
+    async fn wait_forever<T>(&self) -> T {
+        self.mark_started();
+        std::future::pending::<T>().await
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthorizationProjectorRuntime for BlockingLocalRuntime {
+    fn worker_owned_execution(&self) -> bool {
+        true
+    }
+
+    fn event_execution_failures(&self, _identity: &astral_db::DeltaLeaseIdentity) -> Option<u32> {
+        Some(0)
+    }
+
+    async fn owned_fail_transition(
+        &self,
+        _identity: &astral_db::DeltaLeaseIdentity,
+        _backoff_seconds: i64,
+        _message: &str,
+        _count_failure: bool,
+    ) -> crate::service::authorization_projector::OwnedTransitionProof {
+        self.fail_calls.fetch_add(1, Ordering::AcqRel);
+        crate::service::authorization_projector::OwnedTransitionProof::Unknown
+    }
+
+    async fn claim_event_by_dispatch(
+        &self,
+        _request: &DeltaEventAppendRequest,
+        _lease_owner: &str,
+        _lease_seconds: i64,
+    ) -> Result<astral_db::ClaimedStableEventOutcome, RuntimeAccessError> {
+        if self.phase == BlockingPhase::DirectClaim {
+            return self.wait_forever().await;
+        }
+        if self.phase == BlockingPhase::DirectInDoubt {
+            return Ok(astral_db::ClaimedStableEventOutcome::InDoubt {
+                event_id: "evt-blocking".to_owned(),
+                reason: "code=test.claim_in_doubt".to_owned(),
+            });
+        }
+        Ok(astral_db::ClaimedStableEventOutcome::Claimed {
+            claim: Box::new(self.claim()),
+            event: Box::new(self.event()),
+        })
+    }
+
+    async fn claim_next_event(
+        &self,
+        _scope: &DeltaEventClaimScope,
+        _lease_owner: &str,
+        _lease_seconds: i64,
+    ) -> Result<Option<DeltaEventClaim>, RuntimeAccessError> {
+        if self.phase == BlockingPhase::RecoveryClaim {
+            return self.wait_forever().await;
+        }
+        Ok(Some(self.claim()))
+    }
+
+    async fn read_claimed_event(
+        &self,
+        _identity: &astral_db::DeltaLeaseIdentity,
+    ) -> Result<ClaimedDeltaEvent, RuntimeAccessError> {
+        if self.phase == BlockingPhase::RecoveryReadback {
+            return self.wait_forever().await;
+        }
+        Ok(self.event())
+    }
+
+    async fn observe_publication_context(
+        &self,
+        _identity: &ProjectionAggregateIdentity,
+    ) -> Result<Option<PublicationContext>, RuntimeAccessError> {
+        if matches!(
+            self.phase,
+            BlockingPhase::DirectObserve | BlockingPhase::RecoveryObserve
+        ) {
+            return self.wait_forever().await;
+        }
+        if matches!(
+            self.phase,
+            BlockingPhase::DirectCompletedUnknown | BlockingPhase::RecoveryCompletedUnknown
+        ) {
+            return Err(RuntimeAccessError::Database(
+                "test observe failed".to_owned(),
+            ));
+        }
+        Ok(None)
+    }
+
+    async fn load_scope_ledger(
+        &self,
+        _tenant_id: i64,
+        _aggregate_type: &str,
+        _aggregate_id: i64,
+        _card_id: Option<i64>,
+    ) -> Result<Vec<RawLedgerRow>, RuntimeAccessError> {
+        Ok(Vec::new())
+    }
+
+    async fn execute_projection_publish(
+        &self,
+        _command: &DeltaProjectorPublishCommand,
+    ) -> Result<DeltaProjectorPublishOutcome, RuntimeAccessError> {
+        self.publish_calls.fetch_add(1, Ordering::AcqRel);
+        Err(RuntimeAccessError::Database(
+            "test publish must not run".to_owned(),
+        ))
+    }
+
+    async fn fail_event(
+        &self,
+        _identity: &astral_db::DeltaLeaseIdentity,
+        _backoff_seconds: i64,
+        _message: &str,
+    ) {
+        self.fail_calls.fetch_add(1, Ordering::AcqRel);
+    }
+
+    async fn release_event(&self, _identity: &astral_db::DeltaLeaseIdentity) {
+        self.release_calls.fetch_add(1, Ordering::AcqRel);
+    }
+
+    async fn mark_event_quarantined(
+        &self,
+        _lease: &astral_db::DeltaLeaseIdentity,
+        _reason_code: &str,
+        _reason_detail: &str,
+    ) -> Result<(), RuntimeAccessError> {
+        Ok(())
+    }
+}
+
+impl LocalProjectionRuntimePort for BlockingLocalRuntime {
+    fn local_mirror_advance_after_publish(
+        &self,
+        _claimed: &ClaimedDeltaEvent,
+    ) -> MirrorAdvanceReport {
+        self.mirror_advance_calls.fetch_add(1, Ordering::AcqRel);
+        MirrorAdvanceReport::default()
+    }
+
+    fn local_mirror_ensure_claimed_row_present(&self, _claimed: &ClaimedDeltaEvent) -> bool {
+        true
+    }
+
+    fn local_mirror_upsert_claimed_row(
+        &self,
+        _request: &DeltaEventAppendRequest,
+        _claimed: &ClaimedDeltaEvent,
+    ) -> MirrorRowProvenance {
+        MirrorRowProvenance::StrictFallback
+    }
+}
+
+fn blocking_config() -> LocalProjectionWorkerConfig {
+    let mut config = LocalProjectionWorkerConfig::default();
+    config.projector.tenants = vec![7];
+    config.projector.event_deadline = Duration::from_millis(20);
+    config.recovery_poll = Some(Duration::from_secs(1));
+    config.max_recovery_events_per_pass = 1;
+    config
+}
+
+fn blocking_envelope() -> CommitDeltaEnvelope {
+    let grant = canonical_grant(2, GrantState::Active);
+    let claimed = claimed_for("evt-blocking", 2);
+    CommitDeltaEnvelope {
+        request: dispatch_request_for(&claimed, &grant),
+        dispatch_sequence: 1,
+        payload_bytes: 1,
+    }
+}
+
+fn assert_no_follow_up_mutation(runtime: &BlockingLocalRuntime) {
+    assert_eq!(runtime.release_calls.load(Ordering::Acquire), 0);
+    assert_eq!(runtime.fail_calls.load(Ordering::Acquire), 0);
+    assert_eq!(runtime.publish_calls.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn direct_claim_deadline_is_unknown_without_follow_up_mutation() {
+    let runtime = BlockingLocalRuntime::new(BlockingPhase::DirectClaim);
+    let mut summary = WorkerRunSummary::default();
+    let completed = handle_dispatched_envelope(
+        &runtime,
+        &blocking_config(),
+        "claim-owner",
+        "manifest-owner",
+        &ProjectorCancellationToken::default(),
+        &mut summary,
+        blocking_envelope(),
+    )
+    .await;
+    assert!(!completed);
+    assert!(runtime.started.load(Ordering::Acquire));
+    assert_eq!(summary.events_claimed, 0);
+    assert_eq!(summary.events_publication_unknown, 1);
+    assert_eq!(summary.events_deadline_exceeded, 1);
+    assert_no_follow_up_mutation(&runtime);
+}
+
+#[tokio::test]
+async fn direct_process_deadline_after_claim_is_unknown_without_follow_up_mutation() {
+    let runtime = BlockingLocalRuntime::new(BlockingPhase::DirectObserve);
+    let mut summary = WorkerRunSummary::default();
+    let completed = handle_dispatched_envelope(
+        &runtime,
+        &blocking_config(),
+        "claim-owner",
+        "manifest-owner",
+        &ProjectorCancellationToken::default(),
+        &mut summary,
+        blocking_envelope(),
+    )
+    .await;
+    assert!(!completed);
+    assert!(runtime.started.load(Ordering::Acquire));
+    assert_eq!(summary.events_claimed, 1);
+    assert_eq!(summary.events_publication_unknown, 1);
+    assert_eq!(summary.events_deadline_exceeded, 1);
+    assert_no_follow_up_mutation(&runtime);
+}
+
+#[tokio::test]
+async fn direct_shutdown_during_claim_is_unknown_and_does_not_note_progress() {
+    let runtime = BlockingLocalRuntime::new(BlockingPhase::DirectClaim);
+    let shutdown = ProjectorCancellationToken::default();
+    let config = blocking_config();
+    let task_runtime = Arc::clone(&runtime);
+    let task_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move {
+        let mut summary = WorkerRunSummary::default();
+        let completed = handle_dispatched_envelope(
+            &task_runtime,
+            &config,
+            "claim-owner",
+            "manifest-owner",
+            &task_shutdown,
+            &mut summary,
+            blocking_envelope(),
+        )
+        .await;
+        (completed, summary)
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !runtime.started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("direct claim must start before cancellation");
+    shutdown.cancel();
+    let (completed, summary) = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("shutdown must interrupt direct claim")
+        .expect("direct task must join");
+    assert!(!completed);
+    assert_eq!(summary.events_claimed, 0);
+    assert_eq!(summary.events_publication_unknown, 1);
+    assert_eq!(summary.events_deadline_exceeded, 0);
+    assert_no_follow_up_mutation(&runtime);
+}
+
+#[tokio::test]
+async fn recovery_shutdown_during_claim_is_unknown_without_follow_up_mutation() {
+    let runtime = BlockingLocalRuntime::new(BlockingPhase::RecoveryClaim);
+    let shutdown = ProjectorCancellationToken::default();
+    let config = blocking_config();
+    let task_runtime = Arc::clone(&runtime);
+    let task_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move {
+        let mut summary = WorkerRunSummary::default();
+        let made_progress = run_recovery_pass(
+            &task_runtime,
+            &config,
+            "claim-owner",
+            "manifest-owner",
+            &task_shutdown,
+            &mut summary,
+        )
+        .await;
+        (made_progress, summary)
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !runtime.started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recovery claim must start before cancellation");
+    shutdown.cancel();
+    let (made_progress, summary) = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("shutdown must interrupt recovery claim")
+        .expect("recovery task must join");
+    assert!(!made_progress);
+    assert_eq!(summary.events_claimed, 0);
+    assert_eq!(summary.events_publication_unknown, 1);
+    assert_eq!(summary.events_deadline_exceeded, 0);
+    assert_no_follow_up_mutation(&runtime);
+}
+
+#[tokio::test]
+async fn recovery_claim_deadline_is_unknown_without_follow_up_mutation() {
+    let runtime = BlockingLocalRuntime::new(BlockingPhase::RecoveryClaim);
+    let mut summary = WorkerRunSummary::default();
+    let made_progress = run_recovery_pass(
+        &runtime,
+        &blocking_config(),
+        "claim-owner",
+        "manifest-owner",
+        &ProjectorCancellationToken::default(),
+        &mut summary,
+    )
+    .await;
+    assert!(!made_progress);
+    assert_eq!(summary.events_claimed, 0);
+    assert_eq!(summary.events_publication_unknown, 1);
+    assert_eq!(summary.events_deadline_exceeded, 1);
+    assert_no_follow_up_mutation(&runtime);
+}
+
+#[tokio::test]
+async fn recovery_readback_deadline_is_unknown_without_follow_up_mutation() {
+    let runtime = BlockingLocalRuntime::new(BlockingPhase::RecoveryReadback);
+    let mut summary = WorkerRunSummary::default();
+    let made_progress = run_recovery_pass(
+        &runtime,
+        &blocking_config(),
+        "claim-owner",
+        "manifest-owner",
+        &ProjectorCancellationToken::default(),
+        &mut summary,
+    )
+    .await;
+    assert!(!made_progress);
+    assert_eq!(summary.events_claimed, 1);
+    assert_eq!(summary.events_publication_unknown, 1);
+    assert_eq!(summary.events_deadline_exceeded, 1);
+    assert_no_follow_up_mutation(&runtime);
+}
+
+#[tokio::test]
+async fn recovery_process_deadline_is_unknown_without_follow_up_mutation() {
+    let runtime = BlockingLocalRuntime::new(BlockingPhase::RecoveryObserve);
+    let mut summary = WorkerRunSummary::default();
+    let made_progress = run_recovery_pass(
+        &runtime,
+        &blocking_config(),
+        "claim-owner",
+        "manifest-owner",
+        &ProjectorCancellationToken::default(),
+        &mut summary,
+    )
+    .await;
+    assert!(!made_progress);
+    assert_eq!(summary.events_claimed, 1);
+    assert_eq!(summary.events_publication_unknown, 1);
+    assert_eq!(summary.events_deadline_exceeded, 1);
+    assert_no_follow_up_mutation(&runtime);
+}
+
+#[tokio::test]
+async fn completed_in_doubt_direct_claim_is_unknown_and_not_progress() {
+    let runtime = BlockingLocalRuntime::new(BlockingPhase::DirectInDoubt);
+    let mut summary = WorkerRunSummary::default();
+    let completed = handle_dispatched_envelope(
+        &runtime,
+        &blocking_config(),
+        "claim-owner",
+        "manifest-owner",
+        &ProjectorCancellationToken::default(),
+        &mut summary,
+        blocking_envelope(),
+    )
+    .await;
+    assert!(!completed);
+    assert_eq!(summary.events_claimed, 0);
+    assert_eq!(summary.events_publication_unknown, 1);
+    assert_eq!(summary.events_deadline_exceeded, 0);
+    assert_no_follow_up_mutation(&runtime);
+}
+
+#[tokio::test]
+async fn completed_inner_unknown_never_reports_direct_or_recovery_progress() {
+    for phase in [
+        BlockingPhase::DirectCompletedUnknown,
+        BlockingPhase::RecoveryCompletedUnknown,
+    ] {
+        let runtime = BlockingLocalRuntime::new(phase);
+        let mut summary = WorkerRunSummary::default();
+        let config = blocking_config();
+        let shutdown = ProjectorCancellationToken::default();
+        let made_progress = if phase == BlockingPhase::DirectCompletedUnknown {
+            handle_dispatched_envelope(
+                &runtime,
+                &config,
+                "claim-owner",
+                "manifest-owner",
+                &shutdown,
+                &mut summary,
+                blocking_envelope(),
+            )
+            .await
+        } else {
+            run_recovery_pass(
+                &runtime,
+                &config,
+                "claim-owner",
+                "manifest-owner",
+                &shutdown,
+                &mut summary,
+            )
+            .await
+        };
+        assert!(!made_progress);
+        assert_eq!(summary.events_claimed, 1);
+        assert_eq!(summary.events_publication_unknown, 1);
+        assert_eq!(summary.events_deadline_exceeded, 0);
+        assert_eq!(summary.events_released_retry, 0);
+        assert_eq!(summary.events_published, 0);
+        assert_eq!(runtime.fail_calls.load(Ordering::Acquire), 1);
+        assert_eq!(runtime.release_calls.load(Ordering::Acquire), 0);
+        assert_eq!(runtime.publish_calls.load(Ordering::Acquire), 0);
+        assert_eq!(runtime.mirror_advance_calls.load(Ordering::Acquire), 0);
+    }
 }

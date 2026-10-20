@@ -1,8 +1,30 @@
 # tests-suite — 分类测试套件总入口
 
-> 本目录是全仓测试的**汇集点**:新增套件物理存放于此,既有测试通过
-> `MANIFEST.toml` 全量编目分类。本目录不替代 Cargo 的测试发现机制——
-> `cargo test --workspace` 行为不变。
+> 本目录是全仓测试的**汇集点**:集成测试按主系列物理存放于
+> `series/<系列>/`,单元测试按 Cargo 语义留在属主 crate。`MANIFEST.toml`
+> 保留全部测试的编目、多系列归属和 suite 执行索引。
+
+## 物理系列目录
+
+集成测试按**主系列**集中存放;一个测试仍可在 MANIFEST 中归属多个系列。
+
+| 目录 | 主要测试 |
+|---|---|
+| `series/CORE/` | DB、Identity、Monitor、TrustGraph 基础集成 |
+| `series/E1/` | Gateway 契约 |
+| `series/E3/` | audit replay、ORG scope projector |
+| `series/E4/` | quarantine、安全前提(hub / 身份映射 / 单写者租约 / Redis-free) |
+| `series/M5/` | 强制身份映射 |
+| `series/MT-E1/` | 租户隔离、ORG scope、strict tenant、MT 隔离 |
+| `series/MT-E3/` ~ `series/MT-E6/` | MT 搅动、跨租户风暴、容量、失败注入 |
+| `series/RQ3/` | 授权投影、projection-owned、native lifecycle、projection HTTP |
+| `series/RQ4/` | local message、partition lease、native storm |
+| `series/PERF/` | 分配契约 |
+| `series/COMPAT/` | Redis 兼容、Java/Rust oracle |
+
+`Cargo.toml` 显式登记这些嵌套目标,统一用
+`cargo test -p testsuite --test <target>` 运行。单元测试(`#[cfg(test)]`)
+仍留在各属主 crate,不能脱离 crate 访问内部实现。
 
 ## 分类体系
 
@@ -14,7 +36,7 @@
 | `multi-tenant-extreme` | **新增**:多租户混合极限(大规模交错/搅动/风暴/容量/失败注入) | `scripts/run-tests.sh --mt-extreme` |
 | `security` | 安全前提测试(E2 omission 风格 + 新架构前提) | 见 MANIFEST 每条 `run` |
 | `performance` | CPU-only 回归矩阵 + cargo bench + 引擎对比 | `cargo bench -p policy-engine` 等 |
-| `compat-guard` | 兼容语义守卫(Java 基线语义对齐、legacy 拒绝断言) | 随所属 crate 测试运行 |
+| `compat-guard` | 兼容语义守卫(Java 基线语义对齐、legacy 拒绝断言) | `series/COMPAT/` 的 testsuite 目标 |
 | `e2e` | 端到端(单机 composite 部署 + loadgen、SDK adapters) | `tests-suite/e2e/` 配方 |
 | `archive` | 不适用当前架构/退役面(每条带书面理由) | 不运行 |
 
@@ -30,7 +52,7 @@
 
 ### 安全前提与入口回归
 
-`Cargo.toml` 显式注册 `tests/security/` 下四个目标。真实 MySQL 测试和 native lifecycle
+`Cargo.toml` 显式注册 `series/E4/` 下四个安全前提目标。真实 MySQL 测试和 native lifecycle
 使用 ignored 命令单列；纯配置、生命周期清理条件与排空等待的单测不需要数据库。
 
 ```bash
@@ -94,7 +116,11 @@ manifest（含真实集成和显式 BLOCKED 项），任何前置缺失都会阻
 UNKNOWN/PENDING 会停止派发；先修复或对账该项、重测单项，再用新 runId 从头重跑原集合。
 runner 不自动修源码、不盲目重试、不缓存历史 PASS。
 
-RQ1-5 登记组件覆盖与完整 campaign 边界，RQ2-D 是结构性 N/A。M1-5 是
+RQ1-5 是主标签;`RQ-A` / `RQ-B` / `RQ-Compare` / `RQ5-E` 子系列已登记,
+其中 RQ-A/RQ-B/RQ-Compare 需要外部 comparator/SpiceDB,RQ5-E 需要 live
+signed HTTP/三节点环境,当前均为 BLOCKED。逐项状态见
+[`Docs/测试/RQ子系列覆盖账本_2026-10-20.md`](../Docs/测试/RQ子系列覆盖账本_2026-10-20.md)。
+RQ2-D 是结构性 N/A。M1-5 是
 source capture、monotone publication、faithful representation、trusted
 storage/processes、complete mediation 假设映射，不是五个独立证明，也不是
 架构交付 M1-M3。E1-5 保留独立协议、模型与 live campaign；E2 的五个精确
@@ -177,7 +203,7 @@ Linux/Valgrind IAI 与 frozen/excluded 项有各自明确阻塞原因，统一�
 
 | 段 | 起点 | 归属 |
 |---|---|---|
-| 1e12 起 | astral-db/tests/multi_tenant_isolation.rs | 既有 mt 测试 |
+| 1e12 起 | tests-suite/series/MT-E1/multi_tenant_isolation.rs | 既有 mt 测试 |
 | 9e12 附近 | Docs/实验/分布式测试/rust-s15 | 分布式 e2e |
 | **2e16 起** | testsuite/src/lib.rs(`SUITE_BASE_MIN`) | testsuite 新套件 |
 

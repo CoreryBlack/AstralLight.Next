@@ -800,7 +800,7 @@ Phase 1 完成后，以下测试必须全部通过。测试数据采用 Java ora
 建议 oracle 目录结构：
 
 ```text
-crates/policy-engine/tests/oracle/
+tests-suite/series/COMPAT/oracle/
 ├── overlay_deny_base_allow.json
 ├── expired_card_default_deny.json
 ├── wildcard_rule_match.json

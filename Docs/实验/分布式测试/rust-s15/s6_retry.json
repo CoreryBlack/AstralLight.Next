@@ -1,0 +1,134 @@
+{
+ "results": [
+  {
+   "name": "PRE_alive_node-a",
+   "expected": "200",
+   "verdict": "PASS",
+   "detail": "{\"success\":true,\"code\":200,\"message\":\"操作成功\",\"data\":{\"items\":[{\"id\":9071,\"name\":\""
+  },
+  {
+   "name": "PRE_alive_node-b",
+   "expected": "200",
+   "verdict": "PASS",
+   "detail": "{\"success\":true,\"code\":200,\"message\":\"操作成功\",\"data\":{\"items\":[{\"id\":9071,\"name\":\""
+  },
+  {
+   "name": "PRE_alive_node-c",
+   "expected": "200",
+   "verdict": "PASS",
+   "detail": "{\"success\":true,\"code\":200,\"message\":\"操作成功\",\"data\":{\"items\":[{\"id\":9071,\"name\":\""
+  },
+  {
+   "name": "PRE_pidfile_node-a",
+   "expected": "process alive",
+   "verdict": "PASS",
+   "detail": "pid=386971"
+  },
+  {
+   "name": "PRE_pidfile_node-b",
+   "expected": "process alive",
+   "verdict": "PASS",
+   "detail": "pid=1531203"
+  },
+  {
+   "name": "PRE_pidfile_node-c",
+   "expected": "process alive",
+   "verdict": "PASS",
+   "detail": "pid=3413044"
+  },
+  {
+   "name": "PRE_bootstrap_evidence",
+   "expected": "projection_current >= 2",
+   "verdict": "PASS",
+   "detail": ""
+  },
+  {
+   "name": "PRE_redis",
+   "expected": "PING",
+   "verdict": "PASS",
+   "detail": ""
+  },
+  {
+   "name": "PRE_baseline_deny",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "final="
+  },
+  {
+   "name": "S6_alternating_convergence",
+   "expected": "10 mutations, 3-node each",
+   "verdict": "FAIL",
+   "detail": ""
+  },
+  {
+   "name": "S6_generation_strictly_increasing",
+   "expected": "monotonic",
+   "verdict": "PASS",
+   "detail": "gens=[2, 4, 6, 8, 10]"
+  },
+  {
+   "name": "S6_outbox_integrity",
+   "expected": "contiguous+terminal+deltas SUCCEEDED",
+   "verdict": "FAIL",
+   "detail": "gens=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] deltas={'n': 10, 'all_ok': False, 'maxv': 2, 'gens': [1, 1, 1, 1, 1, 2, 2, 2, 2, 2]} head={'src': 11, 'proj': 0, 'fence': 5, 'status': 'PENDING'}"
+  }
+ ],
+ "timeline": [
+  {
+   "t": 1788125669.5448658,
+   "msg": "between-rounds cluster restart (revive delta workers, see finding F5)"
+  },
+  {
+   "t": 1788125672.2086644,
+   "msg": "node node-a unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788125728.2833118,
+   "msg": "node node-a restarted OK"
+  },
+  {
+   "t": 1788125728.2853794,
+   "msg": "node node-b unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788125768.5030344,
+   "msg": "node node-b restarted OK"
+  },
+  {
+   "t": 1788125768.5061445,
+   "msg": "node node-c unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788125817.6511486,
+   "msg": "node node-c restarted OK"
+  },
+  {
+   "t": 1788125821.5140848,
+   "msg": "unbound rs=9269 (perf prop)"
+  },
+  {
+   "t": 1788125822.1199782,
+   "msg": "unbound rs=9270 (perf storm)"
+  },
+  {
+   "t": 1788125853.1266305,
+   "msg": "S6 round 1: gen=2 allow=False deny=True"
+  },
+  {
+   "t": 1788125884.0728183,
+   "msg": "S6 round 2: gen=4 allow=False deny=True"
+  },
+  {
+   "t": 1788125915.580852,
+   "msg": "S6 round 3: gen=6 allow=False deny=True"
+  },
+  {
+   "t": 1788125946.0030096,
+   "msg": "S6 round 4: gen=8 allow=False deny=True"
+  },
+  {
+   "t": 1788125977.7610877,
+   "msg": "S6 round 5: gen=10 allow=False deny=True"
+  }
+ ]
+}

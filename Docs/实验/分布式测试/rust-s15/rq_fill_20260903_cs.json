@@ -1,0 +1,51 @@
+{
+ "cs": {
+  "CS1_revoke_fence_blocks_allow": {
+   "ok": true,
+   "detail": "base_allow=True pending_no_allow=True ready_deny=True fence=[['1']]"
+  },
+  "CS2_source_oracle_matches_projected": {
+   "ok": true,
+   "detail": "oracle=ALLOW(static subset) nodes_agree=True"
+  },
+  "CS3_new_grant_projection_gate": {
+   "ok": true,
+   "detail": "early_not_allow=True published=True"
+  },
+  "CS4_overlay_deny_precedence": {
+   "ok": true,
+   "detail": "base_allow=True deny_entry_rejected=True allow_persists=True (Rust phase-1: ALLOW-only source, deny=DEFAULT_DENY)"
+  },
+  "CS5_generation_supersession": {
+   "ok": true,
+   "detail": "rounds=3 final=ALLOW deltas=6 all_ok=True"
+  },
+  "CS6_unbind_fence_propagates": {
+   "ok": true,
+   "detail": "base_allow=True unbind_deny=True fence=[['10']]"
+  },
+  "CS7_resource_type_isolation": {
+   "ok": true,
+   "detail": "learn=ALLOW monitor=DENY chat=DEFAULT_DENY \u00d73\uff08\u7c7b\u578b\u7ea7\u7c92\u5ea6\u6620\u5c04\uff09"
+  },
+  "CS8_write_alias_semantics": {
+   "ok": true,
+   "detail": "{'create': True, 'update': True, 'delete': True, 'read': True}"
+  }
+ },
+ "rq2": {},
+ "rq1": {
+  "storage_bytes_by_table": {
+   "authorization_delta_event": 147456,
+   "authorization_grant_revision": 114688,
+   "authorization_impact_plan": 131072,
+   "authorization_projection_current": 114688,
+   "authorization_projection_manifest": 131072,
+   "authorization_projection_segment": 98304
+  },
+  "max_published_generation": 6,
+  "active_grant_revisions": 12
+ },
+ "rq3": {},
+ "rq4": {}
+}

@@ -293,7 +293,7 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 | MQ 部署与架构 | [`Docs/规范/统一消息协议与智能层消息规范_2026-03-18.md`](Docs/规范/统一消息协议与智能层消息规范_2026-03-18.md) |
 | 规则模式与权限模型 | [`Docs/架构/Rust架构设计/Rust权限判定与规则集语义_V1.0.md`](Docs/架构/Rust架构设计/Rust权限判定与规则集语义_V1.0.md) |
 | 规则模型分析与规则集 DDL | [`Docs/sql/full_schema_v4.sql`](Docs/sql/full_schema_v4.sql) 与 Rust 架构文档 |
-| 分布式授权集群测试 | 测试源码与 harness 已公开于 [`Docs/实验/分布式测试/rust-s15/`](Docs/实验/分布式测试/rust-s15/) 和 [`Docs/authorization-validation/`](Docs/authorization-validation/)；历史运行 evidence、节点路由、二进制和部署状态未复制，真实三节点集成需受保护环境、审批和状态证据。 |
+| 分布式授权集群测试 | 测试源码与 harness 已公开于 [`Docs/实验/分布式测试/`](Docs/实验/分布式测试/) 和 [`Docs/authorization-validation/`](Docs/authorization-validation/)；历史报告/JSON/证据归档已继承并脱敏，节点路由、二进制和部署状态未继承，真实三节点集成需受保护环境、审批和状态证据。 |
 
 ---
 

@@ -3,18 +3,28 @@
 //! 对齐 Java `AstralBenchmark`（BenchmarkRunner --comparison-mode）实验结构
 //! （`Docs/实验/基准测试/scripts/README.md` v1.30）：
 //!
-//! - **RQ-Compare-1**（headline）：单点场景（50 卡 × 81 条目）四引擎读决策；
-//! - **RQ-Compare-2**（双轴梯度）：卡数轴（10/50/200 @ 81 条目/卡）× 规则复杂度轴
-//!   （81/405/810 条目/卡 @ 50 卡）；
+//! - **RQ-Compare-1 / RQ-B 卡轴**：100 / 1K / 10K / 50K 卡，每卡 40 条 base 规则；
+//! - **RQ-A 规则轴**：10K 卡 × 10 / 50 / 100 / 500 / 1K base 规则/卡；
 //! - **rule_update_overhead**（写路径）：100 次 Add→Remove 单规则循环写延迟；
 //! - **N× fresh-state 重复**（`--repeats`，默认 5）：聚合 mean±stddev；
 //! - **CSV/LaTeX 落盘**：`results/comparison-{ts}/` 下 comparison_report.csv、
 //!   summary.csv、write_overhead.csv、comparison_table.tex。
+//! - **纳秒精度**：raw `latency_ns`、read 汇总 `load_ns/mean_ns/p50_ns/p99_ns`
+//!   和 write `total_ns/per_op_ns` 均使用纳秒计数；不再输出微秒/毫秒字段。
+//! - **梯度 profile**：默认 `rq-compare-1`；`--gradient=rq-a` / `rq-b` /
+//!   `native-rq-a` / `native-rq-b` / `local` 可切换。`native-*` 是 base-only
+//!   近似（未建模 overlay/ABAC/模板），Storage 仅为 `size_of<CanonicalGrant>`
+//!   估算，不是实际引擎/DB 存储；超过 2M grants 的 cell 必须显式
+//!   `--allow-large-gradient`。`--list-gradients` 可无分配打印完整梯度。
+//! - **引擎**：AstralLight、Casbin、Casbin(Cached)、Cedar、OPA(cached)、
+//!   OPA(no-cache)。SpiceDB 未加入：Java `BenchmarkRunner` 已因 ReBAC 与
+//!   RBAC 不可比而移除 RQ-Compare-4。
 //!
 //! 引擎建模（各按 vendor 推荐惯用法）：AstralLight=grant ledger（增量编译
 //! HotState，决策走 `segment_content` O(1) 查找）；Casbin=策略行精确匹配；
-//! Cedar=实体属性集合（官方大批量授权推荐形态）；OPA=data 文档 + sidecar
-//! HTTP（真实部署形态，含 RTT）。
+//! Casbin(Cached)=官方 CachedEnforcer；Cedar=实体属性集合（官方大批量授权
+//! 推荐形态）；OPA(cached/no-cache)=data 文档 + sidecar HTTP，no-cache 每请求
+//! 注入 cache-buster 和 no-cache 头。
 //!
 //! 运行：`cargo run --release [-- --repeats=5] [--quick] [--opa=http://...] [--run-id=<id>] [--output-dir=<dir>]`
 //!
@@ -174,25 +184,35 @@ fn percentile(sorted: &[u64], p: f64) -> f64 {
 
 #[derive(Clone, Copy)]
 struct ReadMetrics {
-    load_ms: f64,
-    mean_us: f64,
-    p50_us: f64,
-    p99_us: f64,
+    load_ns: u64,
+    mean_ns: f64,
+    p50_ns: f64,
+    p99_ns: f64,
     qps: f64,
 }
 
-/// 延迟样本以**纳秒**采集（亚微秒决策的分辨率要求；微秒整型截断会把
-/// ~0.2µs 的真实值显示为 0）。汇总时换算为微秒小数。
+#[derive(Clone, Copy)]
+struct WriteMetrics {
+    total_ns: u64,
+    per_op_ns: f64,
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// 延迟样本与汇总均以**纳秒**为单位（亚微秒决策的分辨率要求；微秒整型
+/// 截断会把 ~0.2µs 的真实值显示为 0）。报告和 CSV 不再换算为微秒。
 /// 计时开销注记：一对 `Instant::now()` 约 40ns，对 185-406ns 的决策样本
 /// 占 10-20%，mean 由墙钟/QPS 独立印证，两者一致。
-fn summarize(load_ms: f64, mut lat_ns: Vec<u64>, wall: Duration) -> ReadMetrics {
+fn summarize(load_ns: u64, mut lat_ns: Vec<u64>, wall: Duration) -> ReadMetrics {
     lat_ns.sort_unstable();
     let n = lat_ns.len() as f64;
     ReadMetrics {
-        load_ms,
-        mean_us: lat_ns.iter().sum::<u64>() as f64 / n / 1000.0,
-        p50_us: percentile(&lat_ns, 50.0) / 1000.0,
-        p99_us: percentile(&lat_ns, 99.0) / 1000.0,
+        load_ns,
+        mean_ns: lat_ns.iter().sum::<u64>() as f64 / n,
+        p50_ns: percentile(&lat_ns, 50.0),
+        p99_ns: percentile(&lat_ns, 99.0),
         qps: n / wall.as_secs_f64(),
     }
 }
@@ -222,7 +242,7 @@ fn astral_build(cards: i64, entries: usize) -> HotState {
 fn run_astral(cards: i64, entries: usize, queries: &[Query]) -> (ReadMetrics, Vec<u64>) {
     let t0 = Instant::now();
     let state = astral_build(cards, entries);
-    let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let load_ns = elapsed_ns(t0);
     assert_eq!(state.shared_entry_count(), entries);
 
     let mut lat = Vec::with_capacity(queries.len());
@@ -247,12 +267,12 @@ fn run_astral(cards: i64, entries: usize, queries: &[Query]) -> (ReadMetrics, Ve
         );
     }
     let wall = t1.elapsed();
-    let metrics = summarize(load_ms, lat.clone(), wall);
+    let metrics = summarize(load_ns, lat.clone(), wall);
     (metrics, lat)
 }
 
 /// 写开销：每周期唯一 grant_id 的 Add→Remove（真实增量 delta + CAS revision）。
-fn astral_write(base: &HotState) -> (f64, f64) {
+fn astral_write(base: &HotState) -> WriteMetrics {
     let compiler = AuthorizationCompiler::new();
     let t0 = Instant::now();
     for index in 0..WRITE_CYCLES {
@@ -279,8 +299,11 @@ fn astral_write(base: &HotState) -> (f64, f64) {
             )
             .unwrap();
     }
-    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    (total_ms, total_ms * 1000.0 / WRITE_CYCLES as f64)
+    let total_ns = elapsed_ns(t0);
+    WriteMetrics {
+        total_ns,
+        per_op_ns: total_ns as f64 / WRITE_CYCLES as f64,
+    }
 }
 
 // ===== Casbin（casbin-rs 进程内，策略行精确匹配） =====
@@ -326,7 +349,7 @@ fn run_casbin(
         enforcer.add_policies(policies).await.unwrap();
         enforcer
     });
-    let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let load_ns = elapsed_ns(t0);
 
     let mut lat = Vec::with_capacity(queries.len());
     let t1 = Instant::now();
@@ -347,11 +370,55 @@ fn run_casbin(
         );
     }
     let wall = t1.elapsed();
-    let metrics = summarize(load_ms, lat.clone(), wall);
+    let metrics = summarize(load_ns, lat.clone(), wall);
     (metrics, lat)
 }
 
-fn casbin_write(rt: &tokio::runtime::Runtime) -> (f64, f64) {
+fn run_casbin_cached(
+    rt: &tokio::runtime::Runtime,
+    cards: i64,
+    entries: usize,
+    queries: &[Query],
+) -> (ReadMetrics, Vec<u64>) {
+    use casbin::{CachedEnforcer, CoreApi, DefaultModel, MemoryAdapter, MgmtApi};
+    let t0 = Instant::now();
+    let enforcer = rt.block_on(async {
+        let model = DefaultModel::from_str(CASBIN_MODEL).await.unwrap();
+        let mut enforcer = CachedEnforcer::new(model, MemoryAdapter::default())
+            .await
+            .unwrap();
+        let policies: Vec<Vec<String>> = (1..=cards)
+            .flat_map(|card| (0..entries).map(move |index| casbin_policy_line(card, index)))
+            .collect();
+        enforcer.add_policies(policies).await.unwrap();
+        enforcer
+    });
+    let load_ns = elapsed_ns(t0);
+
+    let mut lat = Vec::with_capacity(queries.len());
+    let t1 = Instant::now();
+    for q in queries {
+        let t = Instant::now();
+        let allowed = enforcer
+            .enforce((
+                format!("card{}", q.card).as_str(),
+                format!("learn_subject:{}", q.resource).as_str(),
+                ACTION,
+            ))
+            .unwrap();
+        lat.push(t.elapsed().as_nanos() as u64);
+        assert_eq!(
+            allowed, q.allow,
+            "casbin cached 决策错误 card={} r={}",
+            q.card, q.resource
+        );
+    }
+    let wall = t1.elapsed();
+    let metrics = summarize(load_ns, lat.clone(), wall);
+    (metrics, lat)
+}
+
+fn casbin_write(rt: &tokio::runtime::Runtime) -> WriteMetrics {
     use casbin::{CoreApi, DefaultModel, Enforcer, MemoryAdapter, MgmtApi};
     rt.block_on(async {
         let model = DefaultModel::from_str(CASBIN_MODEL).await.unwrap();
@@ -368,8 +435,11 @@ fn casbin_write(rt: &tokio::runtime::Runtime) -> (f64, f64) {
             enforcer.add_policy(line.clone()).await.unwrap();
             enforcer.remove_policy(line).await.unwrap();
         }
-        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        (total_ms, total_ms * 1000.0 / WRITE_CYCLES as f64)
+        let total_ns = elapsed_ns(t0);
+        WriteMetrics {
+            total_ns,
+            per_op_ns: total_ns as f64 / WRITE_CYCLES as f64,
+        }
     })
 }
 
@@ -435,7 +505,7 @@ fn run_cedar(cards: i64, entries: usize, queries: &[Query]) -> (ReadMetrics, Vec
         );
     }
     let entities = Entities::from_entities(entity_list, None).unwrap();
-    let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let load_ns = elapsed_ns(t0);
 
     let authorizer = Authorizer::default();
     let action = EntityUid::from_type_name_and_id("Action".parse().unwrap(), EntityId::new(ACTION));
@@ -464,11 +534,11 @@ fn run_cedar(cards: i64, entries: usize, queries: &[Query]) -> (ReadMetrics, Vec
         );
     }
     let wall = t1.elapsed();
-    let metrics = summarize(load_ms, lat.clone(), wall);
+    let metrics = summarize(load_ns, lat.clone(), wall);
     (metrics, lat)
 }
 
-fn cedar_write() -> (f64, f64) {
+fn cedar_write() -> WriteMetrics {
     use cedar_policy::PolicySet;
     // Cedar v4 无 PolicySet::remove：策略更新走"新 PolicySet 重建"。
     // 计时含 parse（真实写路径文本→策略对象）+ add；标注为重建语义。
@@ -481,8 +551,11 @@ fn cedar_write() -> (f64, f64) {
         let mut set = PolicySet::new();
         set.add(policy).unwrap();
     }
-    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    (total_ms, total_ms * 1000.0 / WRITE_CYCLES as f64)
+    let total_ns = elapsed_ns(t0);
+    WriteMetrics {
+        total_ns,
+        per_op_ns: total_ns as f64 / WRITE_CYCLES as f64,
+    }
 }
 
 // ===== OPA（sidecar HTTP） =====
@@ -527,6 +600,7 @@ fn run_opa(
     cards: i64,
     entries: usize,
     queries: &[Query],
+    no_cache: bool,
 ) -> Result<(ReadMetrics, Vec<u64>), String> {
     rt.block_on(async {
         let client = opa_client();
@@ -567,17 +641,28 @@ fn run_opa(
             .map_err(|e| format!("OPA PUT data 请求失败：{e}"))?;
         resp.error_for_status()
             .map_err(|e| format!("OPA PUT data HTTP 状态错误：{e}"))?;
-        let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let load_ns = elapsed_ns(t0);
 
         let mut lat = Vec::with_capacity(queries.len());
         let t1 = Instant::now();
-        for q in queries {
+        for (query_index, q) in queries.iter().enumerate() {
             let t = Instant::now();
-            let resp = client
+            let mut input = serde_json::json!({
+                "card": q.card,
+                "resource": format!("learn_subject:{}", q.resource)
+            });
+            if no_cache {
+                input["_cache_buster"] = serde_json::json!(query_index);
+            }
+            let mut request = client
                 .post(format!("{base}/v1/data/astral/allow"))
-                .json(&serde_json::json!({
-                    "input": {"card": q.card, "resource": format!("learn_subject:{}", q.resource)}
-                }))
+                .json(&serde_json::json!({ "input": input }));
+            if no_cache {
+                request = request
+                    .header("Cache-Control", "no-cache, no-store, max-age=0")
+                    .header("Pragma", "no-cache");
+            }
+            let resp = request
                 .send()
                 .await
                 .map_err(|e| format!("OPA 查询请求失败 card={} r={}：{e}", q.card, q.resource))?;
@@ -608,13 +693,13 @@ fn run_opa(
             }
         }
         let wall = t1.elapsed();
-        let metrics = summarize(load_ms, lat.clone(), wall);
+        let metrics = summarize(load_ns, lat.clone(), wall);
         Ok((metrics, lat))
     })
 }
 
 /// OPA 写探针（sidecar 内存 data PUT）。HTTP 错误一律返回 Err，不 unwrap panic。
-fn opa_write(rt: &tokio::runtime::Runtime, base: &str) -> Result<(f64, f64), String> {
+fn opa_write(rt: &tokio::runtime::Runtime, base: &str) -> Result<WriteMetrics, String> {
     rt.block_on(async {
         let client = opa_client();
         let t0 = Instant::now();
@@ -638,8 +723,11 @@ fn opa_write(rt: &tokio::runtime::Runtime, base: &str) -> Result<(f64, f64), Str
                 return Err(format!("OPA write-probe Remove 失败（cycle {index}）：{e}"));
             }
         }
-        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        Ok((total_ms, total_ms * 1000.0 / WRITE_CYCLES as f64))
+        let total_ns = elapsed_ns(t0);
+        Ok(WriteMetrics {
+            total_ns,
+            per_op_ns: total_ns as f64 / WRITE_CYCLES as f64,
+        })
     })
 }
 
@@ -786,7 +874,14 @@ mod mix_tests {
 
     #[test]
     fn query_mix_satisfies_invariants_for_all_cells() {
-        let mut cells = gradient_cells();
+        let mut cells = GradientProfile::Local.cells();
+        for profile in [
+            GradientProfile::RqCompare1,
+            GradientProfile::RqA,
+            GradientProfile::RqB,
+        ] {
+            cells.extend(profile.cells());
+        }
         cells.push((1, 1, "edge"));
         for (cards, entries, _) in cells {
             let queries = query_mix(cards, entries);
@@ -1081,16 +1176,16 @@ fn aggregate(engine: &'static str, cards: i64, entries: usize, runs: &[ReadMetri
         cards,
         entries,
         load: (
-            mean(&runs.iter().map(|r| r.load_ms).collect::<Vec<_>>()),
-            stddev(&runs.iter().map(|r| r.load_ms).collect::<Vec<_>>()),
+            mean(&runs.iter().map(|r| r.load_ns as f64).collect::<Vec<_>>()),
+            stddev(&runs.iter().map(|r| r.load_ns as f64).collect::<Vec<_>>()),
         ),
         p50: (
-            mean(&runs.iter().map(|r| r.p50_us).collect::<Vec<_>>()),
-            stddev(&runs.iter().map(|r| r.p50_us).collect::<Vec<_>>()),
+            mean(&runs.iter().map(|r| r.p50_ns).collect::<Vec<_>>()),
+            stddev(&runs.iter().map(|r| r.p50_ns).collect::<Vec<_>>()),
         ),
         p99: (
-            mean(&runs.iter().map(|r| r.p99_us).collect::<Vec<_>>()),
-            stddev(&runs.iter().map(|r| r.p99_us).collect::<Vec<_>>()),
+            mean(&runs.iter().map(|r| r.p99_ns).collect::<Vec<_>>()),
+            stddev(&runs.iter().map(|r| r.p99_ns).collect::<Vec<_>>()),
         ),
         qps: (
             mean(&runs.iter().map(|r| r.qps).collect::<Vec<_>>()),
@@ -1099,30 +1194,115 @@ fn aggregate(engine: &'static str, cards: i64, entries: usize, runs: &[ReadMetri
     }
 }
 
-fn gradient_cells() -> Vec<(i64, usize, &'static str)> {
-    vec![
-        (10, 81, "card-axis"),
-        (50, 81, "headline"),
-        (200, 81, "card-axis"),
-        (50, 405, "complexity-axis"),
-        (50, 810, "complexity-axis"),
-    ]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GradientProfile {
+    RqCompare1,
+    RqA,
+    RqB,
+    NativeRqA,
+    NativeRqB,
+    Local,
 }
+
+impl GradientProfile {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "rq-compare-1" => Some(Self::RqCompare1),
+            "rq-a" => Some(Self::RqA),
+            "rq-b" => Some(Self::RqB),
+            "native-rq-a" => Some(Self::NativeRqA),
+            "native-rq-b" => Some(Self::NativeRqB),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::RqCompare1 => "rq-compare-1",
+            Self::RqA => "rq-a",
+            Self::RqB => "rq-b",
+            Self::NativeRqA => "native-rq-a",
+            Self::NativeRqB => "native-rq-b",
+            Self::Local => "local",
+        }
+    }
+
+    /// Cross-system gradients aligned with Java ScaleConfig:
+    /// - RQ-Compare-1 / RQ-B card axis: 100 / 1K / 10K / 50K cards, 40 base rules.
+    /// - RQ-A rule axis: 10K cards, 10 / 50 / 100 / 500 / 1K base rules.
+    /// `Local` keeps the previous small development matrix.
+    fn cells(self) -> Vec<(i64, usize, &'static str)> {
+        match self {
+            Self::RqCompare1 => vec![
+                (100, 40, "rq-compare-1"),
+                (1_000, 40, "rq-compare-1"),
+                (10_000, 40, "rq-compare-1"),
+                (50_000, 40, "rq-compare-1"),
+            ],
+            Self::RqA => vec![
+                (10_000, 10, "rq-a"),
+                (10_000, 50, "rq-a"),
+                (10_000, 100, "rq-a"),
+                (10_000, 500, "rq-a"),
+                (10_000, 1_000, "rq-a"),
+            ],
+            Self::RqB => vec![
+                (100, 40, "rq-b"),
+                (1_000, 40, "rq-b"),
+                (10_000, 40, "rq-b"),
+                (50_000, 40, "rq-b"),
+            ],
+            // Native Java RQ-A/RQ-B values. The current harness models base
+            // grants only; overlay/ABAC and Storage/TPS are not equivalent.
+            Self::NativeRqA => vec![
+                (10_000, 10, "native-rq-a"),
+                (10_000, 50, "native-rq-a"),
+                (10_000, 100, "native-rq-a"),
+                (10_000, 500, "native-rq-a"),
+                (10_000, 1_000, "native-rq-a"),
+                (10_000, 5_000, "native-rq-a"),
+            ],
+            Self::NativeRqB => vec![
+                (100, 45, "native-rq-b"),
+                (1_000, 45, "native-rq-b"),
+                (10_000, 45, "native-rq-b"),
+                (50_000, 45, "native-rq-b"),
+                (100_000, 45, "native-rq-b"),
+                (400_000, 45, "native-rq-b"),
+                (500_000, 45, "native-rq-b"),
+                (1_000_000, 45, "native-rq-b"),
+            ],
+            Self::Local => vec![
+                (10, 81, "card-axis"),
+                (50, 81, "headline"),
+                (200, 81, "card-axis"),
+                (50, 405, "complexity-axis"),
+                (50, 810, "complexity-axis"),
+            ],
+        }
+    }
+}
+
+/// Refuse accidental paper-scale allocations unless the caller explicitly opts in.
+const MAX_GRANTS_PER_CELL: i64 = 2_000_000;
 
 /// 引擎名 → 文件名安全 slug（raw 原始样本文件名用）。
 fn engine_slug(engine: &str) -> &'static str {
     match engine {
         "AstralLight(Rust)" => "astral",
         "Casbin(rust)" => "casbin",
+        "Casbin(Cached)" => "casbin_cached",
         "Cedar(rust)" => "cedar",
-        "OPA(sidecar)" => "opa",
+        "OPA(cached)" => "opa_cached",
+        "OPA(no-cache)" => "opa_no_cache",
         _ => "unknown",
     }
 }
 
 fn summary_csv(rows: &[String]) -> String {
     format!(
-        "scenario,cards,entries,engine,load_ms,p50_us,p99_us,qps\n{}",
+        "scenario,cards,entries,engine,load_ns,p50_ns,p99_ns,qps\n{}",
         rows.join("\n")
     )
 }
@@ -1231,6 +1411,9 @@ fn main() {
     let mut repeats_opt: Option<usize> = None;
     let mut quick = false;
     let mut allow_opa_skip = false;
+    let mut gradient_profile = GradientProfile::RqCompare1;
+    let mut allow_large_gradient = false;
+    let mut list_gradients = false;
     let mut opa_base = "http://127.0.0.1:8181".to_owned();
     let mut run_id_flag: Option<String> = None;
     let mut output_dir_flag: Option<String> = None;
@@ -1249,6 +1432,20 @@ fn main() {
             quick = true;
         } else if arg == "--allow-opa-skip" {
             allow_opa_skip = true;
+        } else if arg == "--allow-large-gradient" {
+            allow_large_gradient = true;
+        } else if arg == "--list-gradients" {
+            list_gradients = true;
+        } else if let Some(v) = arg.strip_prefix("--gradient=") {
+            match GradientProfile::parse(v) {
+                Some(profile) => gradient_profile = profile,
+                None => {
+                    eprintln!(
+                        "错误：--gradient 只支持 rq-compare-1 / rq-a / rq-b / native-rq-a / native-rq-b / local，收到 {v:?}（exit 1）。"
+                    );
+                    std::process::exit(1);
+                }
+            }
         } else if let Some(v) = arg.strip_prefix("--opa=") {
             opa_base = v.to_owned();
         } else if let Some(v) = arg.strip_prefix("--run-id=") {
@@ -1258,7 +1455,8 @@ fn main() {
         } else {
             eprintln!(
                 "错误：未知参数 {arg:?}（exit 1）。支持：--repeats=<n≥1> --quick \
-                 --allow-opa-skip --opa=<base> --run-id=<id> --output-dir=<dir>"
+                 --gradient=<rq-compare-1|rq-a|rq-b|native-rq-a|native-rq-b|local> \
+                 --list-gradients --allow-large-gradient --allow-opa-skip --opa=<base> --run-id=<id> --output-dir=<dir>"
             );
             std::process::exit(1);
         }
@@ -1266,6 +1464,22 @@ fn main() {
     let mut repeats = repeats_opt.unwrap_or(DEFAULT_REPEATS);
     if quick {
         repeats = 1;
+    }
+    if list_gradients {
+        for (cards, entries, scenario) in gradient_profile.cells() {
+            let estimate = cards
+                .saturating_mul(entries as i64)
+                .saturating_mul(std::mem::size_of::<CanonicalGrant>() as i64);
+            println!(
+                "profile={} scenario={} cards={} entries={} storage_bytes_estimate={}",
+                gradient_profile.label(),
+                scenario,
+                cards,
+                entries,
+                estimate
+            );
+        }
+        return;
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1328,7 +1542,25 @@ fn main() {
 
     // 查询配比（审计 D）：allow:default-deny = 2:1 数学不变式断言 + run_meta
     // 记录 + mix_tests 单测。每个梯度单元格在采集前同样断言（见主循环）。
-    let mix_probe = query_mix(50, 81);
+    let cells = if quick {
+        vec![(100, 40, "quick")]
+    } else {
+        gradient_profile.cells()
+    };
+    if !quick && !allow_large_gradient {
+        if let Some((cards, entries, _)) = cells
+            .iter()
+            .find(|(cards, entries, _)| cards.saturating_mul(*entries as i64) > MAX_GRANTS_PER_CELL)
+        {
+            eprintln!(
+                "错误：gradient cell {cards}×{entries} 超过 {MAX_GRANTS_PER_CELL} grants；\
+                 如确需 paper-scale，请显式传 --allow-large-gradient（exit 1）。"
+            );
+            std::process::exit(1);
+        }
+    }
+    let (probe_cards, probe_entries, _) = cells[0];
+    let mix_probe = query_mix(probe_cards, probe_entries);
     assert_mix_invariants(&mix_probe);
     let mix_allow = mix_probe.iter().filter(|q| q.allow).count();
     let mix_deny = mix_probe.len() - mix_allow;
@@ -1361,6 +1593,18 @@ fn main() {
         },
         "repeats": repeats,
         "quick": quick,
+        "gradient": {
+            "profile": gradient_profile.label(),
+            "cells": cells.iter().map(|(cards, entries, scenario)| serde_json::json!({
+                "cards": cards,
+                "entries": entries,
+                "scenario": scenario,
+                "storage_bytes_estimate": cards.saturating_mul(*entries as i64).saturating_mul(std::mem::size_of::<CanonicalGrant>() as i64),
+            })).collect::<Vec<_>>(),
+            "storage_estimate_note": "size_of::<CanonicalGrant>() × cards × entries; not a measured DB/engine storage value",
+            "max_grants_per_cell": MAX_GRANTS_PER_CELL,
+            "allow_large_gradient": allow_large_gradient,
+        },
         "write_overhead_semantics": write_semantics,
         "completed": false,
         "failed": false,
@@ -1384,17 +1628,11 @@ fn main() {
 
     let report_path = format!("{out_dir}/comparison_report.csv");
     let mut report =
-        String::from("scenario,cards,entries,engine,repeat,load_ms,mean_us,p50_us,p99_us,qps\n");
+        String::from("scenario,cards,entries,engine,repeat,load_ns,mean_ns,p50_ns,p99_ns,qps\n");
     let mut summary_rows: Vec<String> = Vec::new();
     let mut tex_rows: Vec<String> = Vec::new();
     std::fs::create_dir_all(format!("{out_dir}/raw"))
         .unwrap_or_else(|e| fail_io("创建 raw 原始样本目录", &e));
-
-    let cells = if quick {
-        vec![(50, 81, "headline")]
-    } else {
-        gradient_cells()
-    };
 
     for (cards, entries, scenario) in &cells {
         let queries = query_mix(*cards, *entries);
@@ -1402,33 +1640,44 @@ fn main() {
         for engine in [
             "AstralLight(Rust)",
             "Casbin(rust)",
+            "Casbin(Cached)",
             "Cedar(rust)",
-            "OPA(sidecar)",
+            "OPA(cached)",
+            "OPA(no-cache)",
         ] {
             let mut runs: Vec<ReadMetrics> = Vec::new();
             for repeat in 0..repeats {
                 let (metrics, raw) = match engine {
                     "AstralLight(Rust)" => run_astral(*cards, *entries, &queries),
                     "Casbin(rust)" => run_casbin(&rt, *cards, *entries, &queries),
+                    "Casbin(Cached)" => run_casbin_cached(&rt, *cards, *entries, &queries),
                     "Cedar(rust)" => run_cedar(*cards, *entries, &queries),
-                    _ => {
+                    "OPA(cached)" | "OPA(no-cache)" => {
                         if !opa_reachable {
                             // 仅显式 --allow-opa-skip 时到达（否则启动已退出）
                             break;
                         }
-                        match run_opa(&rt, &opa_base, *cards, *entries, &queries) {
+                        match run_opa(
+                            &rt,
+                            &opa_base,
+                            *cards,
+                            *entries,
+                            &queries,
+                            engine == "OPA(no-cache)",
+                        ) {
                             Ok(pair) => pair,
                             Err(detail) => fail_run(
                                 &out_dir,
                                 &mut run_meta,
                                 &report,
                                 &summary_rows,
-                                "read-phase OPA(sidecar)",
+                                &format!("read-phase {engine}"),
                                 &detail,
                                 3,
                             ),
                         }
                     }
+                    _ => unreachable!("unknown engine"),
                 };
                 // 每 repeat 采集后立即原子 checkpoint：原始纳秒样本 + 完整 CSV 行。
                 // 之后任何中途失败（含 OPA 失联）只损失进行中的样本，既有数据已在盘。
@@ -1445,15 +1694,15 @@ fn main() {
                 atomic_write(&raw_path, &raw_csv)
                     .unwrap_or_else(|e| fail_io(&format!("checkpoint {raw_path}"), &e));
                 report.push_str(&format!(
-                    "{scenario},{cards},{entries},{engine},{repeat},{:.3},{:.3},{:.3},{:.3},{:.1}\n",
-                    metrics.load_ms, metrics.mean_us, metrics.p50_us, metrics.p99_us, metrics.qps
+                    "{scenario},{cards},{entries},{engine},{repeat},{},{:.3},{:.3},{:.3},{:.1}\n",
+                    metrics.load_ns, metrics.mean_ns, metrics.p50_ns, metrics.p99_ns, metrics.qps
                 ));
                 atomic_write(&report_path, &report)
                     .unwrap_or_else(|e| fail_io("checkpoint comparison_report.csv", &e));
                 runs.push(metrics);
             }
             if runs.is_empty() {
-                if engine == "OPA(sidecar)" && !opa_reachable {
+                if engine.starts_with("OPA(") && !opa_reachable {
                     summary_rows.push(format!(
                         "{scenario},{cards},{entries},{engine},skipped,--allow-opa-skip"
                     ));
@@ -1472,7 +1721,7 @@ fn main() {
                 ));
             }
             println!(
-                "[done] {scenario} {engine} cards={cards} entries={entries} p50={:.2}µs qps={:.0}",
+                "[done] {scenario} {engine} cards={cards} entries={entries} p50={:.2}ns qps={:.0}",
                 a.p50.0, a.qps.0
             );
         }
@@ -1482,29 +1731,39 @@ fn main() {
     // OPA write-probe 失败不 panic：如实标记 failed，其余产物照常落盘后 exit 3）
     let mut opa_write_failure: Option<String> = None;
     let base = astral_build(50, 81);
-    let (a_total, a_per) = astral_write(&base);
-    let (c_total, c_per) = casbin_write(&rt);
-    let (cd_total, cd_per) = cedar_write();
-    let (o_total, o_per) = if opa_reachable {
+    let a = astral_write(&base);
+    let c = casbin_write(&rt);
+    let cd = cedar_write();
+    let o = if opa_reachable {
         match opa_write(&rt, &opa_base) {
             Ok(v) => v,
             Err(detail) => {
                 opa_write_failure = Some(detail);
-                (0.0, 0.0)
+                WriteMetrics {
+                    total_ns: 0,
+                    per_op_ns: 0.0,
+                }
             }
         }
     } else {
-        (0.0, 0.0)
+        WriteMetrics {
+            total_ns: 0,
+            per_op_ns: 0.0,
+        }
     };
     let opa_row = if !opa_reachable {
-        "OPA(sidecar),skipped,unreachable --allow-opa-skip,unreachable\n".to_owned()
+        "OPA(cached),skipped,unreachable --allow-opa-skip,unreachable\n".to_owned()
     } else if let Some(d) = &opa_write_failure {
-        format!("OPA(sidecar),failed,{},\n", d.replace(',', ";"))
+        format!("OPA(cached),failed,{},\n", d.replace(',', ";"))
     } else {
-        format!("OPA(sidecar),{WRITE_CYCLES},{o_total:.3},{o_per:.1}\n")
+        format!(
+            "OPA(cached),{WRITE_CYCLES},{},{:.1}\n",
+            o.total_ns, o.per_op_ns
+        )
     };
     let write_csv = format!(
-        "engine,cycles,total_ms,per_op_us\nAstralLight(Rust),{WRITE_CYCLES},{a_total:.3},{a_per:.1}\nCasbin(rust),{WRITE_CYCLES},{c_total:.3},{c_per:.1}\nCedar(rust),{WRITE_CYCLES},{cd_total:.3},{cd_per:.1}\n{opa_row}"
+        "engine,cycles,total_ns,per_op_ns\nAstralLight(Rust),{WRITE_CYCLES},{},{:.1}\nCasbin(rust),{WRITE_CYCLES},{},{:.1}\nCedar(rust),{WRITE_CYCLES},{},{:.1}\n{opa_row}",
+        a.total_ns, a.per_op_ns, c.total_ns, c.per_op_ns, cd.total_ns, cd.per_op_ns
     );
 
     atomic_write(&report_path, &report).unwrap_or_else(|e| fail_io("写 comparison_report.csv", &e));
@@ -1518,7 +1777,7 @@ fn main() {
     atomic_write(
         &format!("{out_dir}/comparison_table.tex"),
         &format!(
-            "\\begin{{tabular}}{{lrrrr}}\n\\toprule\nEngine & P50(µs) & P99(µs) & QPS & Load(ms) \\\\\n\\midrule\n{}\n\\bottomrule\n\\end{{tabular}}\n",
+            "\\begin{{tabular}}{{lrrrr}}\n\\toprule\nEngine & P50(ns) & P99(ns) & QPS & Load(ns) \\\\\n\\midrule\n{}\n\\bottomrule\n\\end{{tabular}}\n",
             tex_rows.join("\n")
         ),
     )
@@ -1528,7 +1787,7 @@ fn main() {
         run_meta["completed"] = serde_json::json!(false);
         run_meta["failed"] = serde_json::json!(true);
         run_meta["failure"] = serde_json::json!({
-            "stage": "write-overhead OPA(sidecar)",
+            "stage": "write-overhead OPA(cached)",
             "detail": d,
             "exit_code": 3,
             "at_utc": utc_now_iso(),
@@ -1536,7 +1795,7 @@ fn main() {
         let _ = atomic_write(
             &format!("{out_dir}/error.json"),
             &serde_json::to_string_pretty(&serde_json::json!({
-                "stage": "write-overhead OPA(sidecar)",
+                "stage": "write-overhead OPA(cached)",
                 "detail": d,
                 "exit_code": 3,
                 "at_utc": utc_now_iso(),
@@ -1566,5 +1825,69 @@ fn main() {
     );
     if opa_write_failure.is_some() {
         std::process::exit(3);
+    }
+}
+
+#[cfg(test)]
+mod nanosecond_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn read_metrics_keep_nanosecond_units() {
+        let metrics = summarize(123, vec![300, 100, 200], Duration::from_nanos(600));
+        assert_eq!(metrics.load_ns, 123);
+        assert_eq!(metrics.mean_ns, 200.0);
+        assert_eq!(metrics.p50_ns, 200.0);
+        assert_eq!(metrics.p99_ns, 300.0);
+    }
+}
+
+#[cfg(test)]
+mod gradient_profile_tests {
+    use super::*;
+
+    #[test]
+    fn cross_system_gradients_match_java_scale_config() {
+        let compare_cards: Vec<i64> = GradientProfile::RqCompare1
+            .cells()
+            .iter()
+            .map(|(cards, _, _)| *cards)
+            .collect();
+        assert_eq!(compare_cards, vec![100, 1_000, 10_000, 50_000]);
+
+        let rule_entries: Vec<usize> = GradientProfile::RqA
+            .cells()
+            .iter()
+            .map(|(_, entries, _)| *entries)
+            .collect();
+        assert_eq!(rule_entries, vec![10, 50, 100, 500, 1_000]);
+
+        let card_entries: Vec<usize> = GradientProfile::RqB
+            .cells()
+            .iter()
+            .map(|(_, entries, _)| *entries)
+            .collect();
+        assert_eq!(card_entries, vec![40, 40, 40, 40]);
+
+        let native_rule_entries: Vec<usize> = GradientProfile::NativeRqA
+            .cells()
+            .iter()
+            .map(|(_, entries, _)| *entries)
+            .collect();
+        assert_eq!(native_rule_entries, vec![10, 50, 100, 500, 1_000, 5_000]);
+
+        let native_cards: Vec<i64> = GradientProfile::NativeRqB
+            .cells()
+            .iter()
+            .map(|(cards, _, _)| *cards)
+            .collect();
+        assert_eq!(
+            native_cards,
+            vec![100, 1_000, 10_000, 50_000, 100_000, 400_000, 500_000, 1_000_000]
+        );
+        assert!(GradientProfile::NativeRqB
+            .cells()
+            .iter()
+            .all(|(_, entries, _)| *entries == 45));
     }
 }

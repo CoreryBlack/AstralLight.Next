@@ -1,0 +1,176 @@
+{
+ "results": [
+  {
+   "name": "PRE_alive_node-a",
+   "expected": "200",
+   "verdict": "PASS",
+   "detail": "{\"success\":true,\"code\":200,\"message\":\"操作成功\",\"data\":{\"items\":[{\"id\":9071,\"name\":\""
+  },
+  {
+   "name": "PRE_alive_node-b",
+   "expected": "200",
+   "verdict": "PASS",
+   "detail": "{\"success\":true,\"code\":200,\"message\":\"操作成功\",\"data\":{\"items\":[{\"id\":9071,\"name\":\""
+  },
+  {
+   "name": "PRE_alive_node-c",
+   "expected": "200",
+   "verdict": "PASS",
+   "detail": "{\"success\":true,\"code\":200,\"message\":\"操作成功\",\"data\":{\"items\":[{\"id\":9071,\"name\":\""
+  },
+  {
+   "name": "PRE_pidfile_node-a",
+   "expected": "process alive",
+   "verdict": "PASS",
+   "detail": "pid=425735"
+  },
+  {
+   "name": "PRE_pidfile_node-b",
+   "expected": "process alive",
+   "verdict": "PASS",
+   "detail": "pid=3222288"
+  },
+  {
+   "name": "PRE_pidfile_node-c",
+   "expected": "process alive",
+   "verdict": "PASS",
+   "detail": "pid=2294675"
+  },
+  {
+   "name": "PRE_bootstrap_evidence",
+   "expected": "projection_current >= 2",
+   "verdict": "PASS",
+   "detail": ""
+  },
+  {
+   "name": "PRE_redis",
+   "expected": "PING",
+   "verdict": "PASS",
+   "detail": ""
+  },
+  {
+   "name": "PRE_baseline_deny",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "final="
+  },
+  {
+   "name": "S12_arbiter_r1_fence_deny",
+   "expected": "DENY + R1_FENCE_DENY",
+   "verdict": "PASS",
+   "detail": "remote control plane"
+  },
+  {
+   "name": "S13_arbiter_unprovable_defers",
+   "expected": "DEFER + EVIDENCE_MISSING/R4_UNPROVABLE",
+   "verdict": "PASS",
+   "detail": "remote control plane"
+  },
+  {
+   "name": "S13_arbiter_empty_evidence_rejected",
+   "expected": "4xx or DEFER",
+   "verdict": "PASS",
+   "detail": "http=400 body=None"
+  },
+  {
+   "name": "S13_arbiter_empty_evidence_rejected",
+   "expected": "4xx or DEFER",
+   "verdict": "PASS",
+   "detail": "http=403 body=None"
+  },
+  {
+   "name": "S12_arbiter_r1_fence_deny",
+   "expected": "DENY + R1_FENCE_DENY",
+   "verdict": "PASS",
+   "detail": "remote control plane"
+  },
+  {
+   "name": "S13_arbiter_unprovable_defers",
+   "expected": "DEFER + EVIDENCE_MISSING/R4_UNPROVABLE",
+   "verdict": "PASS",
+   "detail": "remote control plane"
+  },
+  {
+   "name": "S13_arbiter_empty_evidence_rejected",
+   "expected": "4xx or DEFER",
+   "verdict": "PASS",
+   "detail": "http=400 body=None"
+  },
+  {
+   "name": "S13_arbiter_empty_evidence_rejected",
+   "expected": "4xx or DEFER",
+   "verdict": "PASS",
+   "detail": "http=403 body=None"
+  }
+ ],
+ "timeline": [
+  {
+   "t": 1788411666.2692409,
+   "msg": "between-rounds cluster restart (revive delta workers, see finding F5)"
+  },
+  {
+   "t": 1788411668.9300876,
+   "msg": "node node-a unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788411749.715136,
+   "msg": "node node-a restarted OK"
+  },
+  {
+   "t": 1788411749.7171082,
+   "msg": "node node-b unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788411808.919549,
+   "msg": "node node-b restarted OK"
+  },
+  {
+   "t": 1788411808.9217572,
+   "msg": "node node-c unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788411877.9792616,
+   "msg": "node node-c restarted OK"
+  },
+  {
+   "t": 1788411881.7372792,
+   "msg": "stale-binding probe: http=200"
+  },
+  {
+   "t": 1788411897.3254838,
+   "msg": "arbiter grant probe still denied after 15s; continuing (S12/S13 will classify)"
+  },
+  {
+   "t": 1788411897.7624106,
+   "msg": "between-rounds cluster restart (revive delta workers, see finding F5)"
+  },
+  {
+   "t": 1788411900.4330988,
+   "msg": "node node-a unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788411978.9943717,
+   "msg": "node node-a restarted OK"
+  },
+  {
+   "t": 1788411978.996286,
+   "msg": "node node-b unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788412042.2201152,
+   "msg": "node node-b restarted OK"
+  },
+  {
+   "t": 1788412042.2222817,
+   "msg": "node node-c unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788412111.3010612,
+   "msg": "node node-c restarted OK"
+  },
+  {
+   "t": 1788412128.8569324,
+   "msg": "arbiter grant probe still denied after 15s; continuing (S12/S13 will classify)"
+  }
+ ]
+}

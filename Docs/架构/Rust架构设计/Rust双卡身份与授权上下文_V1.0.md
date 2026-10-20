@@ -120,7 +120,7 @@ AppUser 是一个独立的 `principal_kind` 会话形态，不等于“拥有一
 
 Identity 收到内部请求后校验 active `app_user`，确保 ACTIVE identity card，并通过 `issue_access_token_for_identity_only` 生成 `APP_USER` ACCESS；该路径明确没有 user-card 绑定。见 [`internal.rs:341-411`](../../../astral-identity/src/srv/internal.rs#L341-L411)、[`internal.rs:467-498`](../../../astral-identity/src/srv/internal.rs#L467-L498)、[`auth.rs:251-293`](../../../astral-identity/src/auth.rs#L251-L293)。当前实现还要求该 `app_user` 存在 ACTIVE 的 platform identity mapping，见 [`card_repository.rs:115-143`](../../../astral-identity/src/srv/card_repository.rs#L115-L143)；这说明“AppUser principal”与“底层身份卡记录”并非同一概念。
 
-AppUser 的允许边界是：身份-only 的 App 用户端点可以消费 `identity_card_id`，但任何需要 user-card、tenant 或 domain 授权的路径都必须拒绝或拥有另行定义且已测试的授权模型。测试已覆盖 AppUser 携带任一 user-card 头时拒绝、PlatformUser 缺任一 user-card 头时拒绝。见 [`gateway_contract_tests.rs:350-410`](../../../astral-common/tests/gateway_contract_tests.rs#L350-L410)。
+AppUser 的允许边界是：身份-only 的 App 用户端点可以消费 `identity_card_id`，但任何需要 user-card、tenant 或 domain 授权的路径都必须拒绝或拥有另行定义且已测试的授权模型。测试已覆盖 AppUser 携带任一 user-card 头时拒绝、PlatformUser 缺任一 user-card 头时拒绝。见 [`gateway_contract_tests.rs:350-410`](../../../tests-suite/series/E1/gateway_contract_tests.rs#L350-L410)。
 
 ## 6. Access、Refresh 与 internal-v1 三条链
 
@@ -168,7 +168,7 @@ Client
 | Gateway 自身 | 只生成，不给自身入口加下游验签中间件 | 精确 internal route 使用专用 verifier，绕过普通 Bearer policy |
 | 失败语义 | 缺头、时钟偏差、主体/卡字段不一致、签名不匹配均拒绝 | 缺断言、body hash/签名/时间窗失败、replay/idempotency 冲突或 Redis 不可用均拒绝 |
 
-v3 canonical payload 的字段顺序与前缀由 `compute_hmac_signature_v3` 固定，且 verifier 会按 principal kind 要求双卡字段的存在/缺失关系。见 [`gateway_signature.rs:18-63`](../../../astral-common/src/middleware/gateway_signature.rs#L18-L63)、[`gateway_signature.rs:215-280`](../../../astral-common/src/middleware/gateway_signature.rs#L215-L280)。Gateway HMAC v3 不接受 legacy v2；现有契约测试验证 v2 签名不会到达 handler。见 [`gateway_contract_tests.rs:461-478`](../../../astral-common/tests/gateway_contract_tests.rs#L461-L478)。
+v3 canonical payload 的字段顺序与前缀由 `compute_hmac_signature_v3` 固定，且 verifier 会按 principal kind 要求双卡字段的存在/缺失关系。见 [`gateway_signature.rs:18-63`](../../../astral-common/src/middleware/gateway_signature.rs#L18-L63)、[`gateway_signature.rs:215-280`](../../../astral-common/src/middleware/gateway_signature.rs#L215-L280)。Gateway HMAC v3 不接受 legacy v2；现有契约测试验证 v2 签名不会到达 handler。见 [`gateway_contract_tests.rs:461-478`](../../../tests-suite/series/E1/gateway_contract_tests.rs#L461-L478)。
 
 ## 8. Gateway 及三服务 middleware 矩阵
 
@@ -224,8 +224,8 @@ v3 canonical payload 的字段顺序与前缀由 `compute_hmac_signature_v3` 固
 
 ### 10.2 当前验证边界
 
-- Identity 集成测试明确以 Docker MySQL 验证真实 `platform_user`、凭证、`identity_card`、`auth_token_family`、`auth_device_session` 列名与 FromRow 映射；测试默认不是无条件本地单元测试。见 [`identity/tests/integration.rs:1-9`](../../../astral-identity/tests/integration.rs#L1-L9)。
-- Gateway contract tests 覆盖 v3 字段篡改、主体卡字段关系、缺字段、legacy v2 拒绝和 handler 不执行；见 [`gateway_contract_tests.rs:270-347`](../../../astral-common/tests/gateway_contract_tests.rs#L270-L347)、[`gateway_contract_tests.rs:413-478`](../../../astral-common/tests/gateway_contract_tests.rs#L413-L478)。
+- Identity 集成测试明确以 Docker MySQL 验证真实 `platform_user`、凭证、`identity_card`、`auth_token_family`、`auth_device_session` 列名与 FromRow 映射；测试默认不是无条件本地单元测试。见 [`identity/tests/integration.rs:1-9`](../../../tests-suite/series/CORE/identity_integration.rs#L1-L9)。
+- Gateway contract tests 覆盖 v3 字段篡改、主体卡字段关系、缺字段、legacy v2 拒绝和 handler 不执行；见 [`gateway_contract_tests.rs:270-347`](../../../tests-suite/series/E1/gateway_contract_tests.rs#L270-L347)、[`gateway_contract_tests.rs:413-478`](../../../tests-suite/series/E1/gateway_contract_tests.rs#L413-L478)。
 - 当前材料未把 migration 执行结果、实际 Redis `access:grant` 数据或各服务线上路由探活结果当作事实。需要运行环境证据时，应补充对应部署/集成测试记录，而不是从源码推断部署一致性。
 
 ## 11. 当前事实、缺口、目标决策

@@ -119,7 +119,7 @@ cache observations, strict current read, final reload, and host admission. The m
 checks only the abstract protocol; runtime tests check implementation behavior. Neither
 is a complete proof of every deployment.
 
-Architectural premises added 2026-10 (runtime tests under `tests-suite/tests/security/`,
+Architectural premises added 2026-10 (runtime tests under `tests-suite/series/E4/`,
 dependency classes registered in `experiment_register.py`):
 
 - `memory_projection_hub` -> the invalidation notification is the load-bearing freshness

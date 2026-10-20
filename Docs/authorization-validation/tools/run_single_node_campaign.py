@@ -193,7 +193,7 @@ HASHED_SOURCES = [
     "astral-db/src/authorization_projection_repository.rs",
     "astral-db/src/evidence_cache.rs",
     "astral-db/src/permission_query.rs",
-    "astral-db/tests/authorization_projection_integration.rs",
+    "tests-suite/series/RQ3/authorization_projection_integration.rs",
     "astral-trustgraph/Cargo.toml",
     "astral-trustgraph/src/observability.rs",
     "astral-trustgraph/src/lib.rs",

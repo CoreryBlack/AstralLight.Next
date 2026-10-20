@@ -93,7 +93,7 @@ tg_cpu_ticks() { awk '{print $14+$15}' "/proc/$TG_PID/stat" 2>/dev/null; }
 BIZ_PATH='/main/api/v1/rule-sets/9071/entries'
 HEALTH_PATH='/api/health'
 
-echo "label,concurrency,qps,p50_us,p90_us,p99_us,p999_us,max_us,ok,err,mysql_per_req,redis_per_req,cpu_cores" > "$CSV"
+echo "label,concurrency,qps,p50_ns,p90_ns,p99_ns,p999_ns,max_ns,ok,err,mysql_per_req,redis_per_req,cpu_cores" > "$CSV"
 
 run_point() {
   local label=$1 conc=$2 dur=$3 path=$4
@@ -124,7 +124,7 @@ if err is None:
 mq = (int(mq1) - int(mq0)) / ok
 rq = (int(rq1) - int(rq0)) / ok
 cpu = (int(cpu1) - int(cpu0)) / 100.0 / wall  # CLK_TCK=100, 相对单核
-print(f"{label},{conc},{d['qps']:.1f},{d['p50_us']},{d['p90_us']},{d['p99_us']},{d['p999_us']},{d['max_us']},{d['ok']},{err},{mq:.1f},{rq:.1f},{cpu:.2f}")
+print(f"{label},{conc},{d['qps']:.1f},{d['p50_ns']},{d['p90_ns']},{d['p99_ns']},{d['p999_ns']},{d['max_ns']},{d['ok']},{err},{mq:.1f},{rq:.1f},{cpu:.2f}")
 PY
   echo "done: $label c=$conc"
 }

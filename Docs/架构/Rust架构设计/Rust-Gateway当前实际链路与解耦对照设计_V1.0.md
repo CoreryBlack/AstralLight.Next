@@ -405,7 +405,7 @@ AppUser 不注入 user-card 三头（claims 校验已强制其为空）。
 
 ### 阶段 A — 契约冻结与 golden tests
 
-- **做什么**：把 §5 全部契约（route_credential_policy、JWT claims v2、身份头、HMAC v3-only、Redis key/value/TTL、错误 envelope、路由重写表）固化为可执行 golden 测试。已有局部测试、需补全：`astral-common/tests/gateway_contract_tests.rs`（v3 验签 + 篡改拒绝 + **已新增 v2 签名拒绝测试** `legacy_v2_signature_is_rejected_by_v3_only_middleware`）与 `gateway_signature.rs` 内的 **v3 golden** 对照测试（`v3_golden_vector_is_stable`，锁定 14 段 canonical；目前为 Rust 实现独立计算值，跨语言黄金值对照仍未建立）。**阶段 A 的全部 golden 契约表仍未完成**，以下待补全：路由重写矩阵、Redis key 判定矩阵（REQUIRE/EMIT/OFF）、错误 envelope 形状快照、身份头注入快照。
+- **做什么**：把 §5 全部契约（route_credential_policy、JWT claims v2、身份头、HMAC v3-only、Redis key/value/TTL、错误 envelope、路由重写表）固化为可执行 golden 测试。已有局部测试、需补全：`tests-suite/series/E1/gateway_contract_tests.rs`（v3 验签 + 篡改拒绝 + **已新增 v2 签名拒绝测试** `legacy_v2_signature_is_rejected_by_v3_only_middleware`）与 `gateway_signature.rs` 内的 **v3 golden** 对照测试（`v3_golden_vector_is_stable`，锁定 14 段 canonical；目前为 Rust 实现独立计算值，跨语言黄金值对照仍未建立）。**阶段 A 的全部 golden 契约表仍未完成**，以下待补全：路由重写矩阵、Redis key 判定矩阵（REQUIRE/EMIT/OFF）、错误 envelope 形状快照、身份头注入快照。
 - **不做什么**：不改任何 wire 值；不新增/删除/重写路由；不动 Redis key/TTL；不改签名 canonical payload；不引入新配置。
 - **验收标准**：契约表（§5）每条至少一个自动化用例，producer/consumer 双测；CI 全绿；发现与代码不符处冻结为"已知偏差"记录。
 - **回滚点**：测试只增不改，无运行回滚面；若后续重构触犯冻结契约，CI 即失败。

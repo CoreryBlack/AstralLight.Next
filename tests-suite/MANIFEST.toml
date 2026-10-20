@@ -3,34 +3,37 @@
 # 每个条目 = 一个测试面(文件/目录)。category 见 tests-suite/README.md;
 # arch_status: current(适用当前架构)/ compat(兼容语义守卫)/ archived(不适用,带理由)。
 # 本文件是分类事实源;新增测试必须同步登记。
+#
+# 集成测试按主系列物理存放于 tests-suite/series/<系列>/;suite 的 series
+# 列表仍保留多系列归属。单元测试(#[cfg(test)])留在属主 crate。
 
-# ═══════════════ workspace 集成测试文件(crate 级 tests/)═══════════════
+# ═══════════════ 集成测试文件(按主系列存放于 tests-suite/series/)═══════════════
 
 [[entry]]
 id = "policy-engine/authorization_compiler_alloc"
 category = "performance"
 owner_crate = "policy-engine"
-path = "policy-engine/tests/authorization_compiler_alloc.rs"
+path = "tests-suite/series/PERF/authorization_compiler_alloc.rs"
 kind = "integration"
 arch_status = "current"
-run = "cargo test -p policy-engine --test authorization_compiler_alloc"
+run = "cargo test -p testsuite --test authorization_compiler_alloc"
 
 [[entry]]
 id = "policy-engine/tenant_isolation_tests"
 category = "multi-tenant"
 owner_crate = "policy-engine"
-path = "policy-engine/tests/tenant_isolation_tests.rs"
+path = "tests-suite/series/MT-E1/tenant_isolation_tests.rs"
 kind = "strict-published-fixture"
 tenants = "2(成对);10(并发求值)"
 arch_status = "current"
 note = "strict published-evidence 注入夹具;验证 scope/最终重读且禁止 legacy ports;不替代真实 MySQL 或并发写入证明"
-run = "cargo test -p policy-engine --test tenant_isolation_tests"
+run = "cargo test -p testsuite --test tenant_isolation_tests"
 
 [[entry]]
 id = "policy-engine/oracle_tests"
 category = "compat-guard"
 owner_crate = "policy-engine"
-path = "policy-engine/tests/oracle_tests.rs"
+path = "tests-suite/series/COMPAT/oracle_tests.rs"
 kind = "integration-fixture"
 arch_status = "compat"
 note = "Java/Rust 语义 oracle 对齐;L2 CARD_ONLY fallback fixture 属兼容语义(当前文档:legacy 语义仅限 legacy/test 仓储)"
@@ -39,7 +42,7 @@ note = "Java/Rust 语义 oracle 对齐;L2 CARD_ONLY fallback fixture 属兼容�
 id = "astral-common/gateway_contract_tests"
 category = "security"
 owner_crate = "astral-common"
-path = "astral-common/tests/gateway_contract_tests.rs"
+path = "tests-suite/series/E1/gateway_contract_tests.rs"
 kind = "integration"
 arch_status = "current"
 note = "含 legacy v2 签名被 v3-only 中间件拒绝的退役守卫断言"
@@ -48,7 +51,7 @@ note = "含 legacy v2 签名被 v3-only 中间件拒绝的退役守卫断言"
 id = "astral-common/audit_tenant_tests"
 category = "multi-tenant"
 owner_crate = "astral-common"
-path = "astral-common/tests/audit_tenant_tests.rs"
+path = "tests-suite/series/MT-E1/audit_tenant_tests.rs"
 kind = "unit"
 tenants = "5(ID 不变式枚举)"
 arch_status = "current"
@@ -57,17 +60,17 @@ arch_status = "current"
 id = "astral-db/authorization_projection_integration"
 category = "integration"
 owner_crate = "astral-db"
-path = "astral-db/tests/authorization_projection_integration.rs"
+path = "tests-suite/series/RQ3/authorization_projection_integration.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL", "MySQL-8.0-migrated"]
 arch_status = "current"
-run = "cargo test -p astral-db --test authorization_projection_integration -- --ignored"
+run = "cargo test -p testsuite --test authorization_projection_integration -- --ignored"
 
 [[entry]]
 id = "astral-db/evidence_cache_redis_integration"
 category = "integration"
 owner_crate = "astral-db"
-path = "astral-db/tests/evidence_cache_redis_integration.rs"
+path = "tests-suite/series/COMPAT/evidence_cache_redis_integration.rs"
 kind = "integration-ignored"
 requires = ["REDIS_URL", "DATABASE_URL(部分用例)", "redis-compat feature", "ASTRAL_REDIS_PROJECTION_COMPAT=true"]
 arch_status = "compat"
@@ -78,7 +81,7 @@ run = "bash scripts/run-tests.sh --redis-compat"
 id = "astral-db/integration"
 category = "integration"
 owner_crate = "astral-db"
-path = "astral-db/tests/integration.rs"
+path = "tests-suite/series/CORE/db_integration.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL"]
 arch_status = "current"
@@ -88,7 +91,7 @@ note = "含 formal loader 无投影头时不回退 permission_rule 的退役守�
 id = "astral-db/local_message_stress"
 category = "integration"
 owner_crate = "astral-db"
-path = "astral-db/tests/local_message_stress.rs"
+path = "tests-suite/series/RQ4/local_message_stress.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL", "MySQL-8.0-migrated", "20260929000001", "20261001000005"]
 arch_status = "current"
@@ -98,7 +101,7 @@ note = "并发重复 append 幂等回归与有界单节点 outbox append/claim �
 id = "astral-db/integration_identity_mapping"
 category = "security"
 owner_crate = "astral-db"
-path = "astral-db/tests/integration_identity_mapping.rs"
+path = "tests-suite/series/M5/integration_identity_mapping.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL(指向 sdk_identity_mapping_test_* 专用库)", "INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE", "专用库需预先迁移"]
 arch_status = "current"
@@ -109,7 +112,7 @@ run = "bash scripts/run-tests.sh --identity-mapping"
 id = "astral-db/multi_tenant_isolation"
 category = "multi-tenant"
 owner_crate = "astral-db"
-path = "astral-db/tests/multi_tenant_isolation.rs"
+path = "tests-suite/series/MT-E1/multi_tenant_isolation.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL"]
 tenants = "3(A/B/C 角色)"
@@ -120,7 +123,7 @@ note = "含旧快照表退役不读写守卫;testsuite MT 套件在此语义上�
 id = "astral-db/org_scope_integration"
 category = "multi-tenant"
 owner_crate = "astral-db"
-path = "astral-db/tests/org_scope_integration.rs"
+path = "tests-suite/series/MT-E1/org_scope_integration.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL"]
 tenants = "拓扑最多 7 节点"
@@ -130,7 +133,7 @@ arch_status = "current"
 id = "astral-db/partition_lease_integration"
 category = "integration"
 owner_crate = "astral-db"
-path = "astral-db/tests/partition_lease_integration.rs"
+path = "tests-suite/series/RQ4/partition_lease_integration.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL"]
 arch_status = "current"
@@ -139,7 +142,7 @@ arch_status = "current"
 id = "astral-db/quarantine_integration"
 category = "integration"
 owner_crate = "astral-db"
-path = "astral-db/tests/quarantine_integration.rs"
+path = "tests-suite/series/E4/quarantine_integration.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL"]
 arch_status = "current"
@@ -148,7 +151,7 @@ arch_status = "current"
 id = "astral-identity/integration"
 category = "integration"
 owner_crate = "astral-identity"
-path = "astral-identity/tests/integration.rs"
+path = "tests-suite/series/CORE/identity_integration.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL"]
 arch_status = "current"
@@ -158,7 +161,7 @@ note = "内联角色测试拒绝 global_admin/super_admin 派生(legacy 角色�
 id = "astral-trustgraph/audit_replay_integration"
 category = "integration"
 owner_crate = "astral-trustgraph"
-path = "astral-trustgraph/tests/audit_replay_integration.rs"
+path = "tests-suite/series/E3/audit_replay_integration.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL", "RabbitMQ", "MySQL mq_consumer_lease"]
 arch_status = "current"
@@ -168,7 +171,7 @@ run = "bash scripts/run-tests.sh --rabbit"
 id = "astral-trustgraph/org_scope_projector_integration"
 category = "multi-tenant"
 owner_crate = "astral-trustgraph"
-path = "astral-trustgraph/tests/org_scope_projector_integration.rs"
+path = "tests-suite/series/E3/org_scope_projector_integration.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL"]
 tenants = "1(双 worker 竞争)"
@@ -178,7 +181,7 @@ arch_status = "current"
 id = "astral-trustgraph/integration"
 category = "integration"
 owner_crate = "astral-trustgraph"
-path = "astral-trustgraph/tests/integration.rs"
+path = "tests-suite/series/CORE/trustgraph_integration.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL"]
 arch_status = "current"
@@ -188,7 +191,7 @@ note = "含级联删除 fail-closed 守卫(依赖 origin region 安装契约)与
 id = "astral-monitor/integration"
 category = "integration"
 owner_crate = "astral-monitor"
-path = "astral-monitor/tests/integration.rs"
+path = "tests-suite/series/CORE/monitor_integration.rs"
 kind = "integration-ignored"
 requires = ["DATABASE_URL"]
 arch_status = "current"
@@ -234,6 +237,43 @@ kind = "integration"
 requires = ["SDK 服务面"]
 arch_status = "current"
 note = "SDK admission/proofs/websocket 授权集成(exclude 目录,独立验证)"
+
+[[entry]]
+id = "archive/java-tdsc-post-claim"
+category = "integration"
+owner_crate = "AstralIdentity"
+path = "tests-suite/archive/java-tdsc-post-claim/"
+kind = "archived-java-test"
+arch_status = "archived"
+note = "TDSC post-claim gate 5 个 JUnit 测试及 gate/interface 源码;依赖 Spring/AstralIdentity 父模块,不参与 Cargo,不可独立构建"
+
+[[entry]]
+id = "formal/dual-card-tla"
+category = "security"
+owner_crate = "formal"
+path = "formal/DualCard.tla"
+kind = "model"
+arch_status = "current"
+note = "双卡身份/激活/撤销/规则绑定/审计 TLA+ 模型 + cfg;无 pinned TLC,BLOCKED,不是执行证据"
+
+[[entry]]
+id = "e2e/tdsc-periodic"
+category = "e2e"
+owner_crate = "experiments/tdsc"
+path = "experiments/tdsc/"
+kind = "campaign"
+requires = ["exclusive Docker host", "immutable image digests", "external credentials"]
+arch_status = "current"
+note = "TDSC protocol/fault/performance/lease 四类 workload 与 10 个性能测量测试;未执行,需独占 host 和外部证据"
+
+[[entry]]
+id = "harness/opa-index-experiment"
+category = "performance"
+owner_crate = "Docs/实验/基准测试/scripts"
+path = "Docs/实验/基准测试/scripts/opa_index_test.py"
+kind = "script"
+arch_status = "current"
+note = "手工 OPA index/bindings(deny/priority)实验;不是自动测试,结果不可当作当前 OPA comparator PASS"
 
 # ═══════════════ 内联单元测试(#[cfg(test)];物理上属于属主 crate)═══════════════
 
@@ -391,11 +431,21 @@ note = "TLA+ AdmissionSafety 草案 + 5 变体 cfg;TLC 运行 BLOCKED(无 pinned
 id = "security/testsuite-premises"
 category = "security"
 owner_crate = "testsuite"
-path = "tests-suite/tests/security/"
+path = "tests-suite/series/E4/"
 kind = "integration-mixed"
 requires = ["DATABASE_URL(除纯配置门)", "RUST_INTEGRATION_REQUIRED=1"]
 arch_status = "current"
 note = "Cargo 显式目标:commit-proven hub 失效 / 强制身份映射 / 单写者租约 / Redis-free composite 配置门"
+
+[[entry]]
+id = "security/private-baseline-boundary"
+category = "security"
+owner_crate = "testsuite"
+path = "tests-suite/series/MT-E1/private_security_boundary_tests.rs"
+kind = "unit"
+arch_status = "current"
+note = "从私有 Java SecurityBoundaryTest 迁移测试目的:客户端角色 JSON 与外部租户 evidence 不得替代 strict published grant;不复制 Java 服务装配"
+run = "cargo test -p testsuite --test private_security_boundary_tests"
 
 # ═══════════════ e2e / 多租户极限(testsuite 新增)═══════════════
 
@@ -417,13 +467,13 @@ path = "Docs/实验/分布式测试/rust-s15/"
 kind = "campaign"
 requires = ["fresh protected three-node deployment", "MySQL", "RabbitMQ", "Redis", "OPA/image identity", "run_config and source hashes"]
 arch_status = "compat"
-note = "历史三节点 S15 harness;其 Redis/Rabbit/OPA 依赖不属于 native single-node;当前 checkout 无受保护节点与历史 evidence, 因此保持 BLOCKED, 不作为当前架构 PASS"
+note = "历史三节点 S15 harness;其 Redis/Rabbit/OPA 依赖不属于 native single-node;历史报告/JSON/证据归档已继承并脱敏,但节点路由、二进制和部署状态未继承;当前 checkout 无受保护节点,因此保持 BLOCKED, 不作为当前架构 PASS"
 
 [[entry]]
 id = "mt-extreme/testsuite"
 category = "multi-tenant-extreme"
 owner_crate = "testsuite"
-path = "tests-suite/tests/"
+path = "tests-suite/series/MT-E1/ tests-suite/series/MT-E3/ tests-suite/series/MT-E4/ tests-suite/series/MT-E5/ tests-suite/series/MT-E6/"
 kind = "integration-ignored"
 requires = ["DATABASE_URL", "RUST_INTEGRATION_REQUIRED=1", "MySQL migrated isolated schema"]
 tenants = "64(隔离)/ 可配置(搅动)/ 512(容量)"
@@ -455,7 +505,7 @@ run = "bash scripts/tests/test-run-tests.sh"
 id = "integration/native-projection-lifecycle"
 category = "integration"
 owner_crate = "testsuite"
-path = "tests-suite/tests/native_projection_lifecycle.rs"
+path = "tests-suite/series/RQ3/native_projection_lifecycle.rs"
 kind = "integration-ignored"
 requires = ["MySQL migrated isolated schema", "LocalBus", "LocalProjectionBus", "MemoryProjectionHub"]
 arch_status = "current"
@@ -466,7 +516,7 @@ run = "python -B scripts/test_campaign.py --run --suite native-projection-lifecy
 id = "integration/native-projection-storm"
 category = "integration"
 owner_crate = "testsuite"
-path = "tests-suite/tests/native_projection_storm.rs"
+path = "tests-suite/series/RQ4/native_projection_storm.rs"
 kind = "integration-ignored"
 requires = ["new run-scoped migrated MySQL schema", "LocalBus", "LocalProjectionBus", "MemoryProjectionHub"]
 arch_status = "current"
@@ -477,7 +527,7 @@ run = "python -B scripts/test_campaign.py --run --suite native-projection-storm"
 id = "astral-db/projection_owned_integration"
 category = "integration"
 owner_crate = "astral-db"
-path = "astral-db/tests/projection_owned_integration.rs"
+path = "tests-suite/series/RQ3/projection_owned_integration.rs"
 kind = "integration-ignored"
 requires = ["run-scoped migrated MySQL loopback:3308", "worker-owned", "RUST_INTEGRATION_REQUIRED=1"]
 arch_status = "current"
@@ -499,7 +549,7 @@ run = "python -B scripts/test_campaign.py --run --suite projection-owned-complet
 id = "integration/projection-owned-http"
 category = "integration"
 owner_crate = "testsuite"
-path = "tests-suite/tests/projection_owned_http.rs"
+path = "tests-suite/series/RQ3/projection_owned_http.rs"
 kind = "integration-ignored"
 requires = ["run-scoped migrated MySQL", "worker-owned", "RUST_INTEGRATION_REQUIRED=1"]
 arch_status = "current"
@@ -596,6 +646,18 @@ boundary = "recovery/churn/queue components; full write storm and cross-node con
 [[series]]
 id = "RQ5"
 boundary = "strict read/hub concurrency components; full warm/cold HTTP read campaign separate"
+[[series]]
+id = "RQ-A"
+boundary = "five-system rule-complexity benchmark; external comparators (CasbinCached/OPA cached/SpiceDB) required; not a Rust component PASS"
+[[series]]
+id = "RQ-B"
+boundary = "five-system card-scale plus storage/TPS benchmark; external comparators and large gradients required"
+[[series]]
+id = "RQ-Compare"
+boundary = "Layer 1 Casbin/OPA/Cedar and Layer 2 SpiceDB comparative campaign; current Rust harness lacks SpiceDB and cached comparator variants"
+[[series]]
+id = "RQ5-E"
+boundary = "RQ5 subcases: E2 TOCTOU, E3/E5 throughput, E4 cache window, E11 stale-token replay; live signed HTTP/deployed services required"
 [[series]]
 id = "M1"
 boundary = "authorization assumption: source capture; not architecture delivery milestone M1"
@@ -753,10 +815,23 @@ test_services = []
 series = ["M3", "M5", "MT-E1", "RQ2"]
 scope = "component"
 boundary = "strict published-evidence injected fixture; final reload/scope/legacy-port assertions, no durable DB"
-sources = ["policy-engine/tests/tenant_isolation_tests.rs", "policy-engine/tests/support/published.rs"]
-argv = ["cargo", "test", "-p", "policy-engine", "--test", "tenant_isolation_tests", "--locked", "--", "--nocapture"]
+sources = ["tests-suite/series/MT-E1/tenant_isolation_tests.rs", "tests-suite/series/MT-E1/support/published.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "tenant_isolation_tests", "--locked", "--", "--nocapture"]
 acceptance = "rust"
 minimum_tests = 1
+
+[[suite]]
+id = "private-security-boundary"
+owner = "testsuite"
+profile = "native-kernel"
+test_services = []
+series = ["E1", "M5", "MT-E1"]
+scope = "component"
+boundary = "migrated Java SecurityBoundaryTest purpose: client roles and foreign-tenant evidence never replace strict published grants; no Java service wiring"
+sources = ["tests-suite/series/MT-E1/private_security_boundary_tests.rs", "tests-suite/series/MT-E1/support/published.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "private_security_boundary_tests", "--locked"]
+acceptance = "rust"
+minimum_tests = 2
 
 [[suite]]
 id = "gateway-contracts"
@@ -766,8 +841,8 @@ test_services = []
 series = ["E1", "M5"]
 scope = "component"
 boundary = "signed gateway middleware fixture; not deployed host full mediation"
-sources = ["astral-common/tests/gateway_contract_tests.rs"]
-argv = ["cargo", "test", "-p", "astral-common", "--test", "gateway_contract_tests", "--locked"]
+sources = ["tests-suite/series/E1/gateway_contract_tests.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "gateway_contract_tests", "--locked"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -779,7 +854,7 @@ test_services = []
 series = ["E4", "M4"]
 scope = "component"
 boundary = "AppConfig adapter capability assertion; not private composite startup validation"
-sources = ["tests-suite/tests/security/premise_redis_free_composite.rs"]
+sources = ["tests-suite/series/E4/premise_redis_free_composite.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "premise_redis_free_composite", "--locked"]
 acceptance = "rust"
 minimum_tests = 1
@@ -792,7 +867,7 @@ test_services = []
 series = ["CORE", "PERF"]
 scope = "component"
 boundary = "test and benchmark type checking; no measured performance data"
-sources = ["policy-engine/Cargo.toml", "policy-engine/tests/support/published.rs"]
+sources = ["policy-engine/Cargo.toml", "tests-suite/series/MT-E1/support/published.rs"]
 argv = ["cargo", "check", "-p", "policy-engine", "--tests", "--benches", "--locked"]
 acceptance = "command"
 
@@ -804,7 +879,7 @@ test_services = []
 series = ["CORE", "M1", "M2", "M3"]
 scope = "component"
 boundary = "compile the ignored MySQL lifecycle target only; no real integration run"
-sources = ["tests-suite/tests/native_projection_lifecycle.rs"]
+sources = ["tests-suite/series/RQ3/native_projection_lifecycle.rs"]
 argv = ["cargo", "check", "-p", "testsuite", "--test", "native_projection_lifecycle", "--locked"]
 acceptance = "command"
 
@@ -816,7 +891,7 @@ test_services = []
 series = ["CORE", "E3", "E4"]
 scope = "component"
 boundary = "cleanup admission only; failure/timeout retains fixtures; no database integration"
-sources = ["tests-suite/tests/native_projection_lifecycle.rs"]
+sources = ["tests-suite/series/RQ3/native_projection_lifecycle.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_lifecycle", "cleanup_requires_successful_lifecycle_and_joined_owners", "--locked", "--", "--exact", "--nocapture"]
 acceptance = "rust"
 minimum_tests = 1
@@ -830,7 +905,7 @@ test_services = []
 series = ["CORE", "E3", "E4"]
 scope = "component"
 boundary = "bus occupancy wait requires empty count and byte budgets; no worker completion or database integration proof"
-sources = ["tests-suite/tests/native_projection_lifecycle.rs"]
+sources = ["tests-suite/series/RQ3/native_projection_lifecycle.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_lifecycle", "projection_bus_drain_wait_requires_empty_occupancy", "--locked", "--", "--exact", "--nocapture"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1080,7 +1155,7 @@ test_services = ["mysql"]
 series = ["M1", "M2", "M3", "E3", "E4", "RQ3"]
 scope = "integration"
 boundary = "production source commit/local dispatch/publication pipeline/evaluate with worker owner; sync publisher attribution is not exclusive; not signed HTTP host campaign"
-sources = ["tests-suite/tests/native_projection_lifecycle.rs"]
+sources = ["tests-suite/series/RQ3/native_projection_lifecycle.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_lifecycle", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1095,7 +1170,7 @@ series = ["M1", "M2", "M3", "E3", "E4", "RQ4"]
 scope = "integration"
 boundary = "bounded same-card production repository/local-worker storm with legacy-hybrid request publication explicitly retained; paired workload controls permit comparison but do not prove cross-node/global optimality; cleanup requires REMOVE/audit/READY-empty proof"
 projection_execution_mode = "legacy-hybrid"
-sources = ["tests-suite/tests/native_projection_storm.rs"]
+sources = ["tests-suite/series/RQ4/native_projection_storm.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_storm", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1111,7 +1186,7 @@ series = ["M1", "M2", "M3", "E3", "E4", "RQ4"]
 scope = "integration"
 boundary = "worker-owned variant of the exact same bounded repository/local-worker workload; checks claim/execution/failure accounting and complete historical durable publication proofs; not signed HTTP, real sockets, or multi-node performance"
 projection_execution_mode = "worker-owned"
-sources = ["tests-suite/tests/native_projection_storm.rs"]
+sources = ["tests-suite/series/RQ4/native_projection_storm.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_storm", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1127,8 +1202,8 @@ series = ["M1", "M2", "M3", "E3", "E4", "RQ4"]
 scope = "integration"
 boundary = "real MySQL owned claim/epoch/active-slot/concurrent predecessor/accounting and stale capability contract; synthetic typed source receipts, not signed HTTP or complete policy evaluation"
 projection_execution_mode = "worker-owned"
-sources = ["astral-db/tests/projection_owned_integration.rs"]
-argv = ["cargo", "test", "-p", "astral-db", "--test", "projection_owned_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/RQ3/projection_owned_integration.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "projection_owned_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 expected_tests = 1
@@ -1159,7 +1234,7 @@ series = ["M1", "M2", "M3", "E1", "E3", "E4", "RQ3"]
 scope = "integration"
 boundary = "real MySQL plus in-process production rule router, Gateway identity signature and permission middleware; includes pending narrowing before worker startup; not a real-socket Gateway or cross-node campaign"
 projection_execution_mode = "worker-owned"
-sources = ["tests-suite/tests/projection_owned_http.rs", "tests-suite/tests/projection_owned_http_support/mod.rs"]
+sources = ["tests-suite/series/RQ3/projection_owned_http.rs", "tests-suite/series/RQ3/projection_owned_http_support/mod.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "projection_owned_http", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1188,8 +1263,8 @@ test_services = ["mysql"]
 series = ["M1", "M2", "M3", "E3", "RQ3"]
 scope = "integration"
 boundary = "durable projection/source/CAS/lineage tests; not complete deployed campaign"
-sources = ["astral-db/tests/authorization_projection_integration.rs"]
-argv = ["cargo", "test", "-p", "astral-db", "--test", "authorization_projection_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/RQ3/authorization_projection_integration.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "authorization_projection_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1201,8 +1276,8 @@ test_services = ["mysql"]
 series = ["M2", "E3", "E4", "RQ4"]
 scope = "integration"
 boundary = "real MySQL concurrent duplicate append, message-id idempotency/conflict, and single-scope sequence allocation; bounded to one row, not throughput"
-sources = ["astral-db/tests/local_message_stress.rs"]
-argv = ["cargo", "test", "-p", "astral-db", "--test", "local_message_stress", "duplicate_append_is_idempotent_under_concurrency", "--locked", "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/RQ4/local_message_stress.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "local_message_stress", "duplicate_append_is_idempotent_under_concurrency", "--locked", "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 expected_tests = 1
@@ -1215,8 +1290,8 @@ test_services = ["mysql"]
 series = ["M2", "E3", "E4", "RQ4"]
 scope = "integration"
 boundary = "bounded 288-message append/claim load with one hot scope and three independent scopes; per-scope sequence/FIFO checks and timing observations only, no HTTP, broker or multi-node throughput claim"
-sources = ["astral-db/tests/local_message_stress.rs"]
-argv = ["cargo", "test", "-p", "astral-db", "--test", "local_message_stress", "scoped_append_and_claim_load_preserves_sequence_and_fifo", "--locked", "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/RQ4/local_message_stress.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "local_message_stress", "scoped_append_and_claim_load_preserves_sequence_and_fifo", "--locked", "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 expected_tests = 1
@@ -1229,8 +1304,8 @@ test_services = ["mysql"]
 series = ["CORE", "M1", "M3"]
 scope = "integration"
 boundary = "real MySQL repository contracts and legacy no-fallback guards"
-sources = ["astral-db/tests/integration.rs"]
-argv = ["cargo", "test", "-p", "astral-db", "--test", "integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/CORE/db_integration.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "db_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1242,8 +1317,8 @@ test_services = ["mysql"]
 series = ["M3", "MT-E1"]
 scope = "integration"
 boundary = "three-tenant SQL binding and retired snapshot guards"
-sources = ["astral-db/tests/multi_tenant_isolation.rs"]
-argv = ["cargo", "test", "-p", "astral-db", "--test", "multi_tenant_isolation", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/MT-E1/multi_tenant_isolation.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "multi_tenant_isolation", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1255,8 +1330,8 @@ test_services = ["mysql"]
 series = ["M2", "M3", "MT-E1"]
 scope = "integration"
 boundary = "organization topology/evidence contracts; production ORG_SCOPE default remains off"
-sources = ["astral-db/tests/org_scope_integration.rs"]
-argv = ["cargo", "test", "-p", "astral-db", "--test", "org_scope_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/MT-E1/org_scope_integration.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "org_scope_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1268,8 +1343,8 @@ test_services = ["mysql"]
 series = ["M2", "E3", "E4"]
 scope = "integration"
 boundary = "durable partition ownership/CAS/reclaim contracts"
-sources = ["astral-db/tests/partition_lease_integration.rs"]
-argv = ["cargo", "test", "-p", "astral-db", "--test", "partition_lease_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/RQ4/partition_lease_integration.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "partition_lease_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1281,8 +1356,8 @@ test_services = ["mysql"]
 series = ["M4", "E3", "E4"]
 scope = "integration"
 boundary = "real durable quarantine terminal and retry boundaries"
-sources = ["astral-db/tests/quarantine_integration.rs"]
-argv = ["cargo", "test", "-p", "astral-db", "--test", "quarantine_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/E4/quarantine_integration.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "quarantine_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1294,8 +1369,8 @@ test_services = ["mysql"]
 series = ["CORE", "M5"]
 scope = "integration"
 boundary = "real identity/session/card contracts; no legacy role bypass"
-sources = ["astral-identity/tests/integration.rs"]
-argv = ["cargo", "test", "-p", "astral-identity", "--test", "integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/CORE/identity_integration.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "identity_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1307,8 +1382,8 @@ test_services = ["mysql"]
 series = ["CORE", "M1", "M2", "M3"]
 scope = "integration"
 boundary = "source repository and cascade fail-closed contracts with production origin region"
-sources = ["astral-trustgraph/tests/integration.rs"]
-argv = ["cargo", "test", "-p", "astral-trustgraph", "--test", "integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/CORE/trustgraph_integration.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "trustgraph_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1320,8 +1395,8 @@ test_services = ["mysql"]
 series = ["M2", "E3"]
 scope = "integration"
 boundary = "real dual-worker competition and organization projection contracts"
-sources = ["astral-trustgraph/tests/org_scope_projector_integration.rs"]
-argv = ["cargo", "test", "-p", "astral-trustgraph", "--test", "org_scope_projector_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/E3/org_scope_projector_integration.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "org_scope_projector_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1333,8 +1408,8 @@ test_services = ["mysql"]
 series = ["CORE"]
 scope = "integration"
 boundary = "monitor database contracts; no tenant-isolation claim"
-sources = ["astral-monitor/tests/integration.rs"]
-argv = ["cargo", "test", "-p", "astral-monitor", "--test", "integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/CORE/monitor_integration.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "monitor_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1346,7 +1421,7 @@ test_services = ["mysql"]
 series = ["M3", "E4"]
 scope = "integration"
 boundary = "commit-proven publication mirror and invalidation freshness gate; not whole source/worker lifecycle"
-sources = ["tests-suite/tests/security/premise_hub_invalidation.rs"]
+sources = ["tests-suite/series/E4/premise_hub_invalidation.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "premise_hub_invalidation", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1359,7 +1434,7 @@ test_services = ["mysql"]
 series = ["M2", "E4"]
 scope = "integration"
 boundary = "same-session MySQL advisory lock, explicit close and bounded reacquisition"
-sources = ["tests-suite/tests/security/premise_single_writer_lease.rs"]
+sources = ["tests-suite/series/E4/premise_single_writer_lease.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "premise_single_writer_lease", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1372,7 +1447,7 @@ test_services = ["mysql"]
 series = ["M5", "E4"]
 scope = "integration"
 boundary = "real mapping/app_id isolation and absent mapping refusal; exact-byte MySQL ENUM decoding with strict schema validation"
-sources = ["tests-suite/tests/security/premise_identity_mapping.rs"]
+sources = ["tests-suite/series/E4/premise_identity_mapping.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "premise_identity_mapping", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1386,8 +1461,8 @@ series = ["M5", "E4"]
 scope = "integration"
 boundary = "dedicated sdk_identity_mapping_test_* migrated database; guard is not relaxed"
 database_scope = "identity-mapping"
-sources = ["astral-db/tests/integration_identity_mapping.rs"]
-argv = ["cargo", "test", "-p", "astral-db", "--test", "integration_identity_mapping", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/M5/integration_identity_mapping.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "integration_identity_mapping", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1399,7 +1474,7 @@ test_services = ["mysql"]
 series = ["MT-E1", "M3", "RQ2"]
 scope = "integration"
 boundary = "tenant-scoped canonical publication/evidence isolation; not HTTP performance"
-sources = ["tests-suite/tests/mt_extreme_isolation.rs"]
+sources = ["tests-suite/series/MT-E1/mt_extreme_isolation.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "mt_extreme_isolation", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1412,7 +1487,7 @@ test_services = ["mysql"]
 series = ["MT-E3", "M2", "RQ3", "RQ4"]
 scope = "integration"
 boundary = "successive CAS pointer add/revoke/restore generations; not three-node propagation"
-sources = ["tests-suite/tests/mt_extreme_churn.rs"]
+sources = ["tests-suite/series/MT-E3/mt_extreme_churn.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "mt_extreme_churn", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1425,7 +1500,7 @@ test_services = ["mysql"]
 series = ["MT-E4", "M3", "RQ4"]
 scope = "integration"
 boundary = "cross-tenant invalidation/evidence fixture; not a distributed message storm"
-sources = ["tests-suite/tests/mt_extreme_cross_storm.rs"]
+sources = ["tests-suite/series/MT-E4/mt_extreme_cross_storm.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "mt_extreme_cross_storm", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1438,7 +1513,7 @@ test_services = ["mysql"]
 series = ["MT-E5", "RQ2"]
 scope = "integration"
 boundary = "bounded MySQL tenant/card capacity; not engine/HTTP throughput"
-sources = ["tests-suite/tests/mt_extreme_capacity.rs"]
+sources = ["tests-suite/series/MT-E5/mt_extreme_capacity.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "mt_extreme_capacity", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1451,7 +1526,7 @@ test_services = ["mysql"]
 series = ["MT-E6", "M3", "M4", "E4"]
 scope = "integration"
 boundary = "typed NotReady/Pending, no arbitrary database-error-as-denial acceptance"
-sources = ["tests-suite/tests/mt_extreme_failclosed.rs"]
+sources = ["tests-suite/series/MT-E6/mt_extreme_failclosed.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "mt_extreme_failclosed", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1464,8 +1539,8 @@ test_services = ["mysql", "rabbitmq"]
 series = ["M1", "M2", "E3", "E4"]
 scope = "integration"
 boundary = "real Rabbit confirm + MySQL mq_idempotent_log/audit_log/completed lease; no Redis"
-sources = ["astral-trustgraph/tests/audit_replay_integration.rs"]
-argv = ["cargo", "test", "-p", "astral-trustgraph", "--test", "audit_replay_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/E3/audit_replay_integration.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "audit_replay_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1477,8 +1552,8 @@ test_services = ["mysql", "redis"]
 series = ["COMPAT", "E4"]
 scope = "integration"
 boundary = "explicit adapter window only; cannot establish native evidence path acceptance"
-sources = ["astral-db/tests/evidence_cache_redis_integration.rs"]
-argv = ["cargo", "test", "-p", "astral-db", "--features", "redis-compat", "--test", "evidence_cache_redis_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+sources = ["tests-suite/series/COMPAT/evidence_cache_redis_integration.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--features", "redis-compat", "--test", "evidence_cache_redis_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1490,7 +1565,7 @@ test_services = []
 series = ["PERF", "RQ1", "RQ5"]
 scope = "component"
 boundary = "strict fixture decision and condition CPU timing, preasserted ALLOW/DENY/PENDING; no MySQL/HTTP"
-sources = ["policy-engine/benches/policy_bench.rs", "policy-engine/tests/support/published.rs"]
+sources = ["policy-engine/benches/policy_bench.rs", "tests-suite/series/MT-E1/support/published.rs"]
 argv = ["cargo", "bench", "-p", "policy-engine", "--bench", "policy_bench", "--locked", "--", "--color", "never"]
 acceptance = "criterion"
 benchmark_cases = [
@@ -1502,6 +1577,78 @@ benchmark_cases = [
 timeout_seconds = 1800
 
 [[suite]]
+id = "rq-a-rule-complexity"
+owner = "bench/engine-comparison"
+profile = "performance-kernel"
+test_services = []
+series = ["RQ-A", "PERF"]
+scope = "component"
+boundary = "cross-system rq-a (5 levels) plus base-only native-rq-a (6 levels); CasbinCached/OPA cached are available, but overlay/ABAC and exact five-system provenance are not modeled"
+sources = ["bench/engine-comparison"]
+blocked_reason = "native-rq-a cells above 2M grants require --allow-large-gradient; overlay/ABAC, exact five-system provenance and release-scale runs remain unavailable"
+timeout_seconds = 1800
+
+[[suite]]
+id = "rq-b-card-scale"
+owner = "bench/engine-comparison"
+profile = "performance-kernel"
+test_services = []
+series = ["RQ-B", "PERF"]
+scope = "component"
+boundary = "cross-system rq-b (4 levels) plus base-only native-rq-b (8 levels up to 1M cards); storage is an estimate and actual Storage/TPS is not measured"
+sources = ["bench/engine-comparison"]
+blocked_reason = "native-rq-b paper-scale cells require --allow-large-gradient and may exceed local memory; storage/TPS capture is estimate-only, not Java-equivalent"
+timeout_seconds = 1800
+
+[[suite]]
+id = "rq-compare-layers"
+owner = "bench/engine-comparison"
+profile = "performance-kernel"
+test_services = []
+series = ["RQ-Compare", "PERF"]
+scope = "component"
+boundary = "Layer 1 Casbin/CasbinCached/Cedar/OPA cached/no-cache RQ-Compare-1 4-card profile; Layer 2 SpiceDB was removed by Java as incomparable"
+sources = ["bench/engine-comparison"]
+blocked_reason = "Layer 1 profile is available; full paper campaign provenance remains absent. SpiceDB is intentionally N/A (Java removed RQ-Compare-4)"
+timeout_seconds = 1800
+
+[[suite]]
+id = "rq5-toctou"
+owner = "bench/loadgen"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["RQ5-E", "RQ5"]
+scope = "integration"
+boundary = "TOCTOU revoke-to-decision window against a signed deployed composite"
+sources = ["bench/loadgen/scripts/toctou_race.py"]
+blocked_reason = "requires approved run-owned deployment, signed identity, live HTTP endpoint and durable convergence evidence"
+timeout_seconds = 1800
+
+[[suite]]
+id = "rq5-stale-token-replay"
+owner = "Docs/实验/分布式测试/rust-s15"
+profile = "distributed"
+test_services = ["mysql", "rabbitmq"]
+series = ["RQ5-E", "RQ5"]
+scope = "integration"
+boundary = "E11 stale-token replay on the historical S15 harness"
+sources = ["Docs/实验/分布式测试/rust-s15/rq345_20260903.py"]
+blocked_reason = "historical S15 harness requires protected three-node state and Redis/OPA-era routing; no current adapter is approved"
+timeout_seconds = 1800
+
+[[suite]]
+id = "rq5-throughput"
+owner = "Docs/实验/分布式测试/rust-s15"
+profile = "distributed"
+test_services = ["mysql", "rabbitmq"]
+series = ["RQ5-E", "RQ5"]
+scope = "integration"
+boundary = "E3+E5 throughput/scalability on the historical S15 harness"
+sources = ["Docs/实验/分布式测试/rust-s15/s15_perf.py"]
+blocked_reason = "historical three-node performance harness needs fresh protected deployment and current transport adaptation"
+timeout_seconds = 1800
+
+[[suite]]
 id = "strict-tenant-benchmark"
 owner = "policy-engine"
 profile = "performance-kernel"
@@ -1509,7 +1656,7 @@ test_services = []
 series = ["PERF", "RQ2", "RQ5", "MT-E1"]
 scope = "component"
 boundary = "strict scope-aware positive identities and checked join/decisions; CPU-only"
-sources = ["policy-engine/benches/tenant_isolation_bench.rs", "policy-engine/tests/support/published.rs"]
+sources = ["policy-engine/benches/tenant_isolation_bench.rs", "tests-suite/series/MT-E1/support/published.rs"]
 argv = ["cargo", "bench", "-p", "policy-engine", "--bench", "tenant_isolation_bench", "--locked", "--", "--color", "never"]
 acceptance = "criterion"
 benchmark_cases = [
@@ -1559,8 +1706,8 @@ test_services = []
 series = ["PERF", "RQ2", "RQ3"]
 scope = "component"
 boundary = "compiler allocation contract assertions, not service capacity"
-sources = ["policy-engine/tests/authorization_compiler_alloc.rs"]
-argv = ["cargo", "test", "-p", "policy-engine", "--test", "authorization_compiler_alloc", "--locked"]
+sources = ["tests-suite/series/PERF/authorization_compiler_alloc.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--test", "authorization_compiler_alloc", "--locked"]
 acceptance = "rust"
 minimum_tests = 1
 

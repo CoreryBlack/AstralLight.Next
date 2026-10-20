@@ -4645,12 +4645,14 @@ dependencies = [
  "astral-mq",
  "astral-trustgraph",
  "astral-types",
+ "axum",
  "hex",
  "policy-engine",
  "serde_json",
  "sha2",
  "sqlx",
  "tokio",
+ "tower",
  "uuid",
 ]
 

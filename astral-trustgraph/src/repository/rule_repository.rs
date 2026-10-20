@@ -561,8 +561,8 @@ impl RuleRepository for SqlxRuleRepository {
             valid_from: new.valid_from.as_deref(),
             valid_to: new.valid_to.as_deref(),
         };
-        // 同步发布目标租户（读链规模化 Batch E）：纯派生、与 draft 组装同源，
-        // draft 成功即本解析必然成功；任一失败仍在事务内整体回滚。
+        // 影响面与事件目标只供 LegacyHybrid 的请求侧尝试；WorkerOwned 只消费
+        // source COMMIT 已证明返回的完整 receipt 批次做有界只读 completion 等待。
         let sync_tenant_id = resolve_direct_tenant_id(&facts)?;
         let draft =
             build_direct_add_draft(&facts, &operation_id, context.actor_user_id, &projection)?;
@@ -570,17 +570,17 @@ impl RuleRepository for SqlxRuleRepository {
             astral_db::next_delta_version(None).map_err(map_grant_repository_error)?;
         append_direct_grant_delta_in_tx(&mut tx, &draft, base_version, target_version).await?;
 
-        tx.commit_consuming().await?;
-        // 读链规模化 Batch E：source 事务已提交（durable delta 入账）。单卡影响面
-        // 天然 ≤ 阈值，commit 后以 worker 同一原语在请求内尝试发布本卡 delta；
-        // 任何失败只记日志，绝不阻塞本次写请求（收敛由 projector worker 兜底）。
-        crate::service::sync_publish::after_commit_sync_publish(
+        let receipts = tx.commit_consuming_with_receipts().await?;
+        // source COMMIT 已证明后，LegacyHybrid 可按目标尝试请求侧发布；WorkerOwned
+        // 仅验证完整 receipt 批次的历史 durable completion，失败仍由 worker 收敛。
+        crate::service::sync_publish::after_commit_sync_publish_with_receipts(
             &self.db,
             vec![crate::service::sync_publish::SyncPublishTarget::single(
                 sync_tenant_id,
                 new.card_id,
                 projection.event_id.clone(),
             )],
+            receipts,
         )
         .await;
         Ok(rule_id)
@@ -750,16 +750,17 @@ impl RuleRepository for SqlxRuleRepository {
         )?;
         append_direct_grant_delta_in_tx(&mut tx, &draft, base_version, target_version).await?;
 
-        tx.commit_consuming().await?;
-        // 读链规模化 Batch E：单卡影响面，commit 后请求内尝试同步发布（失败仅
-        // 记日志，绝不阻塞写请求；收敛由 projector worker 兜底）。
-        crate::service::sync_publish::after_commit_sync_publish(
+        let receipts = tx.commit_consuming_with_receipts().await?;
+        // source COMMIT 已证明后交给模式分流；WorkerOwned 不认领、不发布、不释放，
+        // 只对完整 receipts 做有界只读 completion 等待。
+        crate::service::sync_publish::after_commit_sync_publish_with_receipts(
             &self.db,
             vec![crate::service::sync_publish::SyncPublishTarget::single(
                 tenant_scope_for_read,
                 row.card_id,
                 projection.event_id.clone(),
             )],
+            receipts,
         )
         .await;
         Ok(())
@@ -881,16 +882,17 @@ impl RuleRepository for SqlxRuleRepository {
         )?;
         append_direct_grant_delta_in_tx(&mut tx, &draft, base_version, target_version).await?;
 
-        tx.commit_consuming().await?;
-        // 读链规模化 Batch E：单卡影响面，commit 后请求内尝试同步发布 REMOVE
-        // tombstone（撤销零延迟生效；失败仅记日志，绝不阻塞写请求）。
-        crate::service::sync_publish::after_commit_sync_publish(
+        let receipts = tx.commit_consuming_with_receipts().await?;
+        // source COMMIT 已证明后交给模式分流；REMOVE 仍由 strict pending-invalidates
+        // gate 保持 fail-closed。WorkerOwned 仅等待完整 receipts 的只读完成证明。
+        crate::service::sync_publish::after_commit_sync_publish_with_receipts(
             &self.db,
             vec![crate::service::sync_publish::SyncPublishTarget::single(
                 tenant_id,
                 row.card_id,
                 projection.event_id.clone(),
             )],
+            receipts,
         )
         .await;
         Ok(true)
@@ -1303,7 +1305,8 @@ mod direct_ledger_shape_tests {
     /// include_str! 顺序断言：按 marker 出现顺序校验事务链，且 commit 收尾。
     fn assert_ordered(body: &'static str, markers: &[(&str, &str)]) {
         let commit_position = body
-            .rfind("tx.commit_consuming()")
+            .rfind("tx.commit_consuming_with_receipts()")
+            .or_else(|| body.rfind("tx.commit_consuming()"))
             .expect("commit must exist");
         let mut previous = 0;
         for (label, marker) in markers {
@@ -1353,7 +1356,7 @@ mod direct_ledger_shape_tests {
                 ("add draft", "build_direct_add_draft"),
                 ("version chain", "next_delta_version"),
                 ("ledger append", "append_direct_grant_delta_in_tx"),
-                ("commit last", "tx.commit_consuming()"),
+                ("commit last", "tx.commit_consuming_with_receipts()"),
             ],
         );
     }
@@ -1404,7 +1407,7 @@ mod direct_ledger_shape_tests {
                 ("version successor", "next_delta_version"),
                 ("before-image update draft", "build_direct_update_draft"),
                 ("ledger append", "append_direct_grant_delta_in_tx"),
-                ("commit last", "tx.commit_consuming()"),
+                ("commit last", "tx.commit_consuming_with_receipts()"),
             ],
         );
 
@@ -1447,7 +1450,7 @@ mod direct_ledger_shape_tests {
                 ("version chain", "next_delta_version"),
                 ("remove draft", "build_direct_remove_draft"),
                 ("ledger append", "append_direct_grant_delta_in_tx"),
-                ("commit last", "tx.commit_consuming()"),
+                ("commit last", "tx.commit_consuming_with_receipts()"),
             ],
         );
 

@@ -111,6 +111,21 @@ class SelectionTests(unittest.TestCase):
         selected = campaign.select_suites(self.manifest, suite_ids=["native-projection-lifecycle"], running=True)
         self.assertEqual(selected[0]["profile"], "native-single-node")
 
+    def test_owned_projection_suites_keep_their_execution_and_evidence_scope(self):
+        suites = {item["id"]: item for item in self.manifest["suite"]}
+        for name in ("native-projection-storm-owned", "projection-owned-sql-contract", "projection-owned-completion-integrity", "projection-owned-http"):
+            with self.subTest(suite=name):
+                item = suites[name]
+                self.assertEqual(item["projection_execution_mode"], "worker-owned")
+                self.assertEqual(item["test_services"], ["mysql"])
+                self.assertEqual(item["scope"], "integration")
+                self.assertIn("--ignored", item["argv"])
+                self.assertEqual(item["expected_tests"], 1)
+        self.assertEqual(suites["native-projection-storm"]["projection_execution_mode"], "legacy-hybrid")
+        self.assertIn("tests-suite/tests/projection_owned_http_support/mod.rs", suites["projection-owned-http"]["sources"])
+        self.assertEqual(suites["projection-owner-model-contracts"]["scope"], "offline-model")
+        self.assertEqual(suites["projection-owner-model-contracts"]["test_services"], [])
+
     def test_unknown_selection_fails(self):
         for kwargs in ({"profiles": ["rabbit-by-default"]}, {"series": ["E9"]}, {"suite_ids": ["not-a-test"]}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
@@ -154,6 +169,20 @@ class EnvironmentTests(unittest.TestCase):
             self.assertNotIn(name, env)
         self.assertEqual(env["ASTRAL_MESSAGE_TRANSPORT"], "local")
         self.assertEqual(env["ASTRAL_REDIS_PROJECTION_COMPAT"], "false")
+
+    def test_projection_execution_mode_is_selected_by_suite_not_parent(self):
+        parent = environment()
+        parent["ASTRAL_PROJECTION_EXECUTION_MODE"] = "worker-owned"
+        env, problem = campaign.prepare_environment(suite(), parent)
+        self.assertIsNone(problem)
+        self.assertNotIn("ASTRAL_PROJECTION_EXECUTION_MODE", env)
+        for mode in ("legacy-hybrid", "worker-owned"):
+            env, problem = campaign.prepare_environment(suite("native-single-node", projection_execution_mode=mode), parent)
+            self.assertIsNone(problem)
+            self.assertEqual(env["ASTRAL_PROJECTION_EXECUTION_MODE"], mode)
+        env, problem = campaign.prepare_environment(suite(projection_execution_mode=" true "), parent)
+        self.assertIsNotNone(problem)
+        self.assertNotIn("ASTRAL_PROJECTION_EXECUTION_MODE", env)
 
     def test_native_uses_only_mysql(self):
         env, problem = campaign.prepare_environment(suite("native-single-node"), environment())

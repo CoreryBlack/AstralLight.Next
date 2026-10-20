@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#050505">
+    <meta name="description" content="AstralLight.Next validation data: 2,853 tests executed, 2,851 PASS, 2 FAIL, and 13 ignored, with test-group purpose, findings, and evidence boundaries.">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="AstralLight.Next">
+    <meta property="og:title" content="AstralLight.Next — Validation Data">
+    <meta property="og:description" content="A breakdown of the test evidence: what each group covers, what it demonstrates, and its result.">
+    <title>AstralLight.Next — Validation Data</title>
+    <link rel="icon" href="assets/astral-mark.png" type="image/png">
+    <link rel="alternate" hreflang="zh-Hans-CN" href="validation.html">
+    <link rel="stylesheet" href="site.css">
+    <link rel="stylesheet" href="validation.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="validation-progress" aria-hidden="true"><span></span></div>
+    <header class="validation-header" id="top">
+      <a class="brand" href="index.en.html" aria-label="AstralLight.Next home"><img class="brand-mark" src="assets/astral-mark.png" alt="" width="26" height="26">AstralLight<span class="brand-period">.</span><span class="brand-next">Next</span></a>
+      <nav class="validation-nav" aria-label="Page navigation">
+        <a href="index.en.html">Back to Home</a>
+        <a href="#matrix">Test Matrix</a>
+        <a href="#failures">Failures</a>
+        <a class="lang-switch" href="validation.html" hreflang="zh-Hans-CN" lang="zh-Hans-CN" aria-label="Switch to Chinese">中文</a>
+        <a href="https://github.com/CoreryBlack/AstralLight.Next" target="_blank" rel="noreferrer">GitHub ↗</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="validation-hero">
+        <div class="validation-wrap">
+          <p class="section-label">VALIDATION EVIDENCE <span>2026-10-07 · r3</span></p>
+          <h1>How many tests passed, <br><em>and where did they fail?</em></h1>
+          <p class="lead">This page breaks down the test data by evidence group: what each group covers, its result, and what it demonstrates. The 2 failures and 13 ignored tests in r3 are listed separately.</p>
+          <div class="validation-verdict">
+            <span class="verdict-label">r3 OVERALL RESULT</span>
+            <strong>FAIL</strong>
+            <span>2 failures; 13 ignored tests were not run.</span>
+          </div>
+          <div class="summary-grid">
+            <article class="summary-card"><strong class="summary-value">2,853</strong><span class="summary-label">Cargo tests executed</span></article>
+            <article class="summary-card"><strong class="summary-value">2,851</strong><span class="summary-label">PASS</span></article>
+            <article class="summary-card is-fail"><strong class="summary-value">2</strong><span class="summary-label">FAIL</span></article>
+            <article class="summary-card"><strong class="summary-value">13</strong><span class="summary-label">ignored tests found but not run</span></article>
+          </div>
+          <div class="validation-meta">
+            <span>Linux x86_64</span>
+            <span>rustc/cargo 1.98.0</span>
+            <span>MySQL 8.0.46</span>
+            <span>RabbitMQ real integration</span>
+            <span>Redis disabled</span>
+            <span>393s wall</span>
+          </div>
+        </div>
+      </section>
+
+      <nav class="validation-jump" aria-label="Validation data navigation">
+        <div class="validation-jump-inner">
+          <a href="#packages">Evidence Packages</a>
+          <a href="#matrix">Test Matrix</a>
+          <a href="#mt">Multi-Tenant Targets</a>
+          <a href="#performance">Performance & Scale</a>
+          <a href="#sdk">SDK Integration</a>
+          <a href="#series">E / M / RQ</a>
+          <a href="#failures">Failures</a>
+          <a href="#boundary">Evidence Boundaries</a>
+          <a href="#inventory">Test Inventory</a>
+        </div>
+      </nav>
+
+      <section class="validation-section" id="packages">
+        <div class="validation-wrap">
+          <p class="section-label">00 <span>Evidence Packages</span></p>
+          <h2>Three evidence packages, three distinct conclusions.</h2>
+          <p class="section-lead">These three evidence packages come from different dates and environments and are presented separately. r3 is a Linux Cargo test run; the single-machine evidence uses real MySQL / Redis / RabbitMQ; the SDK results are from local macOS gates.</p>
+          <div class="package-grid">
+            <article class="package-card">
+              <div class="package-head"><span>2026-10-07 · r3</span><span class="result is-fail">FAIL</span></div>
+              <h3>Redis-free Cargo Tests</h3>
+              <p>2,853 executed · 2,851 PASS · 2 FAIL · 13 ignored. Covers the workspace, real MySQL, RabbitMQ, and MT-E.</p>
+              <a href="#matrix">View test matrix <span aria-hidden="true">→</span></a>
+            </article>
+            <article class="package-card">
+              <div class="package-head"><span>2026-10-06 · Single machine</span><span class="result is-fail">FAIL</span></div>
+              <h3>Real External Dependencies & Performance</h3>
+              <p>169 core integration cases passed; the full gate still has 5 failures. The single-machine MySQL / Redis / RabbitMQ setup ran successfully, and native and engine-comparison benchmarks were completed.</p>
+              <a href="#performance">View performance and failures <span aria-hidden="true">→</span></a>
+            </article>
+            <article class="package-card">
+              <div class="package-head"><span>2026-10-05 · Local</span><span class="result is-pass">LOCAL PASS</span></div>
+              <h3>SDK Integration V1</h3>
+              <p>2,765 workspace PASS · 0 FAIL · 86 ignored; 12 sample PASS; 9/9 local gate commands exited 0. Production integration remains BLOCKED.</p>
+              <a href="#sdk">View SDK results <span aria-hidden="true">→</span></a>
+            </article>
+          </div>
+          <p class="section-note">Each package conclusion applies to its own test scope: SDK production integration remains BLOCKED, and the single-machine gate still has 5 failures.</p>
+        </div>
+      </section>
+
+      <section class="validation-section" id="matrix">
+        <div class="validation-wrap">
+          <p class="section-label">01 <span>Test Matrix</span></p>
+          <h2>What does each test group demonstrate?</h2>
+          <p class="section-lead">The 2,853 executed items in r3 come from three Cargo evidence areas: Workspace, MySQL, and Rabbit. MT-E comprises 5 targets within the MySQL suite; the Runner’s 12 scenarios are counted separately.</p>
+          <div class="test-table" role="table" aria-label="r3 test group summary">
+            <div class="test-head" role="row">
+              <span role="columnheader">Test group</span>
+              <span role="columnheader">Coverage</span>
+              <span role="columnheader">What it demonstrates</span>
+              <span role="columnheader">Result</span>
+            </div>
+            <div class="test-row" role="row">
+              <div role="cell" data-label="Test group"><strong>Workspace</strong><span class="row-sub">47 binaries + 13 doctests</span></div>
+              <div role="cell" data-label="Coverage"><p>Library unit tests, offline Cargo integration tests, contracts, strict reader, generation/fence, and local omission guards.</p></div>
+              <div role="cell" data-label="What it demonstrates"><p>Crate-level behavior and authorization invariants hold under offline conditions.</p></div>
+              <div role="cell" data-label="Result"><span class="result is-fail">2,769 / 1 FAIL</span></div>
+            </div>
+            <div class="test-row" role="row">
+              <div role="cell" data-label="Test group"><strong>MySQL Real Integration</strong><span class="row-sub">17 phases · 18 binaries</span></div>
+              <div role="cell" data-label="Coverage"><p>published evidence, tenant isolation, ORG_SCOPE, partition lease, quarantine/replay, identity, monitoring, and TrustGraph.</p></div>
+              <div role="cell" data-label="What it demonstrates"><p>Consistency, isolation, and fail-closed behavior on selected paths with real MySQL; this is not equivalent to HTTP/composite end-to-end coverage.</p></div>
+              <div role="cell" data-label="Result"><span class="result is-fail">81 / 1 FAIL</span></div>
+            </div>
+            <div class="test-row" role="row">
+              <div role="cell" data-label="Test group"><strong>RabbitMQ Audit Replay</strong><span class="row-sub">Real MySQL + RabbitMQ · 3 filtered</span></div>
+              <div role="cell" data-label="Coverage"><p>Happy path, durable business proof, malformed payload / invalid routing, expired lease, and token fence.</p></div>
+              <div role="cell" data-label="What it demonstrates"><p>Durable terminal state for replay; publisher confirm is distinct from business completion; an old token cannot confirm a new claim.</p></div>
+              <div role="cell" data-label="Result"><span class="result is-pass">1 PASS</span></div>
+            </div>
+            <div class="test-row" role="row">
+              <div role="cell" data-label="Test group"><strong>MT-E Multi-Tenant</strong><span class="row-sub">MySQL subset · E1 / E3 / E4 / E5 / E6</span></div>
+              <div role="cell" data-label="Coverage"><p>64-tenant interleaved isolation, 8-tenant revoke/recovery, 16-tenant concurrent publication, 512-tenant capacity, and 12-tenant mixed state.</p></div>
+              <div role="cell" data-label="What it demonstrates"><p>Covers tenant boundaries, revoke/recovery convergence, capacity paths, and fail-closed scenarios.</p></div>
+              <div role="cell" data-label="Result"><span class="result is-pass">5 / 5 PASS</span></div>
+            </div>
+            <div class="test-row" role="row">
+              <div role="cell" data-label="Test group"><strong>Runner Orchestration</strong><span class="row-sub">12 mock scenarios · not counted in Cargo</span></div>
+              <div role="cell" data-label="Coverage"><p>Cargo/Docker mocks; failures, timeouts, startup failures, an already-occupied compose project, empty vhost, Redis disabled, and cleanup.</p></div>
+              <div role="cell" data-label="What it demonstrates"><p>The runner does not misreport Cargo 101, ignored tests, successful dispatch, or internal SKIP as PASS.</p></div>
+              <div role="cell" data-label="Result"><span class="result is-pass">12 / 12 PASS</span></div>
+            </div>
+          </div>
+          <p class="section-note">E5 refers to the Linux test environment; MT-E5 is the 512-tenant capacity target. Of the 96 ignored items in the Workspace phase, 83 ran in the MySQL/Rabbit suites and 13 were not run. The Runner’s 12 scenarios are mock orchestration.</p>
+        </div>
+      </section>
+
+      <section class="validation-section" id="mt">
+        <div class="validation-wrap">
+          <p class="section-label">02 <span>Multi-Tenant Targets</span></p>
+          <h2>What each of the five MT-E targets puts under load.</h2>
+          <p class="section-lead">All five targets ran against real MySQL and passed. They cover interleaved isolation, authorization churn, concurrent publication, 512-tenant capacity, and mixed states.</p>
+          <div class="mt-grid">
+            <article class="mt-card">
+              <div class="mt-head"><span class="mt-id">MT-E1</span><span class="result is-pass">PASS</span></div>
+              <h3>64-Tenant Interleaved Isolation</h3>
+              <span class="mt-metric">64 tenants · 8 readers / 8 writers · 1,024 reads</span>
+              <p>16 AllowActive, 32 DenyActive, and 16 DenySuspended; 16 cross-tenant probe pairs sampled in groups of 4 tenants all returned typed Pending. Covers tenant boundaries under interleaved reads and writes.</p>
+            </article>
+            <article class="mt-card">
+              <div class="mt-head"><span class="mt-id">MT-E3</span><span class="result is-pass">PASS</span></div>
+              <h3>8-Tenant Revoke / Recovery Churn</h3>
+              <span class="mt-metric">gen1 → gen5 · 4 readers · final exactly 1 grant</span>
+              <p>Five rounds of publish, revoke, recover, revoke again, and recover again; after each round converges, exactly 0 or 1 grants are asserted. Covers revoke/recovery convergence.</p>
+            </article>
+            <article class="mt-card">
+              <div class="mt-head"><span class="mt-id">MT-E4</span><span class="result is-pass">PASS</span></div>
+              <h3>16-Tenant Concurrent Publication</h3>
+              <span class="mt-metric">16 concurrent gen2 writers · 4 side readers</span>
+              <p>Each tenant concurrently advances from its own gen1 pointer to gen2; asserts Ready, exactly 1 grant for each card in its tenant, and provenance matching that tenant. Covers concurrent MySQL published-evidence updates.</p>
+            </article>
+            <article class="mt-card">
+              <div class="mt-head"><span class="mt-id">MT-E5</span><span class="result is-pass">PASS</span></div>
+              <h3>512-Tenant Capacity</h3>
+              <span class="mt-metric">seed 2.502s · publish 6.555s · read 2.002s</span>
+              <p>All 512 AllowActive cards were seeded, published individually, and read back with strict reads; the maximum single read was 5,366µs. The 512-tenant path passed.</p>
+            </article>
+            <article class="mt-card">
+              <div class="mt-head"><span class="mt-id">MT-E6</span><span class="result is-pass">PASS</span></div>
+              <h3>12-Tenant Mixed State</h3>
+              <span class="mt-metric">6 normal · 2 revoked · 2 suspended · 2 unpublished</span>
+              <p>Revoked/suspended fixtures are Ready with no grants; never-published returns NotReady + Pending. Covers fail-closed behavior across mixed states.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="validation-section" id="details">
+        <div class="validation-wrap">
+          <p class="section-label">03 <span>Real-Dependency Details</span></p>
+          <h2>Which path each real-MySQL test group exercises.</h2>
+          <p class="section-lead">Results grouped by r3 real-dependency suite (MySQL and RabbitMQ); counts in parentheses are PASS / FAIL.</p>
+          <div class="detail-grid">
+            <article class="detail-item"><h3>Authorization projection <span class="detail-count">10 / 0</span></h3><p>stage / finalize / publish, strict evidence, single CAS winner, pending delta gate, revoke fence, and archive proof.</p></article>
+            <article class="detail-item"><h3>DB integration <span class="detail-count">2 / 0</span></h3><p>Concurrent FIFO / token fence for local message exact claim, plus an end-to-end SQLx repository fixture.</p></article>
+            <article class="detail-item"><h3>Tenant isolation <span class="detail-count">7 / 0</span></h3><p>Cross-tenant binding rejection, rule-set / card evidence isolation, typed-corrupt fail-closed behavior for scope split, and audit tenant filter.</p></article>
+            <article class="detail-item"><h3>ORG_SCOPE <span class="detail-count">15 / 0</span></h3><p>Parent-child propagation, mask/remove/revoke/reparent waves, capacity-boundary races, outbox lease/reclaim/stale token, durable backoff, and managed flag not falling back to legacy.</p></article>
+            <article class="detail-item"><h3>Partition lease <span class="detail-count">7 / 0</span></h3><p>acquire/renew/release, partition boundaries, active-owner contention, expired generation bump, single reclaim winner, and pointer advance.</p></article>
+            <article class="detail-item"><h3>Quarantine / replay <span class="detail-count">7 / 0</span></h3><p>Durable lifecycle, requested replay priority, exact route/status, attempt limit, and typed token fencing.</p></article>
+            <article class="detail-item"><h3>Identity <span class="detail-count">8 / 0</span></h3><p>token-family / device-session, distinction between the two card types, three-table registration transaction, token-family cascade revoke, and soft-delete with login JOIN.</p></article>
+            <article class="detail-item"><h3>Monitor <span class="detail-count">5 / 0</span></h3><p>Alert rule toggle, activity log, idempotent acknowledge, 3-hour bucket time series, and notification channel.</p></article>
+            <article class="detail-item"><h3>TrustGraph <span class="detail-count">12 / 0</span></h3><p>approval/audit rollback in the same transaction, governance CRUD/date/alias, empty-card cascade, SoD, and no duplicate work from two production org projector workers.</p></article>
+            <article class="detail-item"><h3>Rabbit audit replay <span class="detail-count">1 / 0</span></h3><p>4 scenarios: happy path; durable audit / idempotency / lease proof; malformed payload / invalid routing; expired lease and token fence.</p></article>
+            <article class="detail-item"><h3>Identity mapping premise <span class="detail-count is-fail">1 / 1</span></h3><p>Missing-mapping detection passed; create failed while decoding operation-ledger status, so positive resolve and cross-app isolation assertions were not run.</p></article>
+          </div>
+        </div>
+      </section>
+
+      <section class="validation-section" id="performance">
+        <div class="validation-wrap">
+          <p class="section-label">04 <span>Performance & Scale</span></p>
+          <h2>What was measured for speed, capacity, and races.</h2>
+          <p class="section-lead">These figures come from single-machine real-dependency evidence and a historical three-process baseline; they illustrate scale and paths.</p>
+          <div class="perf-grid">
+            <article class="perf-card">
+              <span class="perf-label">ENGINE COMPARISON · 5 REPEATS</span>
+              <strong>0.10–0.47 µs</strong>
+              <p>AstralLight compiled-match p50 across complexity 10–810; Cedar 2.24–7.08µs, OPA 154–196µs, and Casbin 207–10,070µs. The OPA row includes an HTTP sidecar.</p>
+            </article>
+            <article class="perf-card">
+              <span class="perf-label">NATIVE COMPOSITE · REAL MYSQL</span>
+              <strong>13,455 qps</strong>
+              <p>Peak at c=64 with 0 errors; mysql/req fell from 4.0 at c=1 to 1.1, Redis/req=0. c=512 reached the connection admission limit: 9.53M transport errors and 533 successes.</p>
+            </article>
+            <article class="perf-card">
+              <span class="perf-label">MT-E5 · 512 TENANTS</span>
+              <strong>5,366 µs</strong>
+              <p>Maximum single strict read; seed 2.502s, publish 6.555s, read 2.002s. The 512-tenant path passed.</p>
+            </article>
+            <article class="perf-card">
+              <span class="perf-label">HISTORICAL RACE · 3-PROCESS BASELINE</span>
+              <strong>37,413 samples</strong>
+              <p>30 cycles, 12 readers, 0 post-ack stale / in-flight ALLOW, and 669 PENDING; mean propagation 572.6ms and mean revocation 585.2ms. Historical three-process baseline.</p>
+            </article>
+          </div>
+          <p class="section-note">2026-10-06 single-machine gate: 169 core integration cases passed and 5 failed (1 TrustGraph fixture in the default run, 4 assertions in the Redis compatibility run); the full gate is FAIL.</p>
+        </div>
+      </section>
+
+      <section class="validation-section" id="sdk">
+        <div class="validation-wrap">
+          <p class="section-label">05 <span>SDK Integration</span></p>
+          <h2>2,765 local tests passed; production integration remains BLOCKED.</h2>
+          <p class="section-lead">The final frozen evidence for SDK Integration V1 used macOS aarch64 and rustc/cargo 1.99.0; all 9 local gate commands exited 0.</p>
+          <div class="sdk-grid">
+            <article class="sdk-card"><strong>2,765</strong><span>workspace PASS</span></article>
+            <article class="sdk-card"><strong>0</strong><span>workspace FAIL</span></article>
+            <article class="sdk-card"><strong>86</strong><span>ignored; not counted as PASS</span></article>
+            <article class="sdk-card"><strong>12</strong><span>sample PASS</span></article>
+            <article class="sdk-card"><strong>9 / 9</strong><span>local gate exit 0</span></article>
+          </div>
+          <p class="section-note">The local gate is PASS; production integration state is BLOCKED. The 86 ignored tests include integration, CPU performance, doctest, and mapping MySQL tests.</p>
+        </div>
+      </section>
+
+      <section class="validation-section" id="series">
+        <div class="validation-wrap">
+          <p class="section-label">06 <span>E / M / RQ Series</span></p>
+          <h2>How far each of the three test series has progressed.</h2>
+          <p class="section-lead">These results come from the 2026-10-06 single-machine campaign and mapping evidence. E is an authorization validation experiment, M is an implementation-assumption map, and RQ is a research-question benchmark; all three are independent of r3’s 2,853 Cargo test items.</p>
+          <div class="series-grid">
+            <article class="series-card">
+              <div class="series-head"><span>E SERIES</span><span class="result is-fail">FAIL / BLOCKED</span></div>
+              <h3>Authorization Validation E1–E5</h3>
+              <ul class="series-list">
+                <li><span>E1 / E2 workspace guards</span><strong>6 PASS</strong></li>
+                <li><span>E2 five runtime switches</span><strong>5 / 5 PASS</strong></li>
+                <li><span>E5 bounded model</span><strong>PASS</strong></li>
+                <li><span>E5 two-mutations</span><strong>PASS · ~35min</strong></li>
+                <li><span>E5 universal hypotheses</span><strong>both PASS</strong></li>
+                <li><span>E1 / E3 / E4 production</span><span class="series-status is-blocked">BLOCKED</span></li>
+                <li><span>offline Python · 473 cases</span><span class="series-status is-fail">3 FAIL</span></li>
+                <li><span>e3 / e4 feature build</span><span class="series-status is-fail">FAIL</span></li>
+              </ul>
+              <p class="series-proof">Local guards, E2 switches, and E5 model checks passed; E1/E3/E4 live remains BLOCKED. campaign overall = FAIL; C2/C6/C7 BLOCKED, C3/C4 PLANNED, local E2 PASS.</p>
+            </article>
+            <article class="series-card">
+              <div class="series-head"><span>M SERIES</span><span class="result is-mixed">PARTIAL / BLOCKED</span></div>
+              <h3>M1–M5 Implementation Map</h3>
+              <ul class="series-list">
+                <li><span>M1 source capture</span><strong>10 / 10 PASS</strong></li>
+                <li><span>M2 monotone publication</span><strong>PASS</strong></li>
+                <li><span>M3 faithful representation</span><strong>25 / 25 + PASS</strong></li>
+                <li><span>M4 trusted storage</span><strong>PASS · TLC BLOCKED</strong></li>
+                <li><span>M5 complete mediation</span><strong>contract PASS · host BLOCKED</strong></li>
+                <li><span>Architecture M1–M3</span><strong>all PASS</strong></li>
+              </ul>
+              <p class="series-proof">This maps implementation assumptions; it is not five independently counted tests. The TLA+/TLC and host-mediation model sides are BLOCKED; positive mapping creation still FAIL.</p>
+            </article>
+            <article class="series-card">
+              <div class="series-head"><span>RQ SERIES</span><span class="result is-fail">BLOCKED / NO RESULT</span></div>
+              <h3>RQ1–RQ5 Tiered Benchmark</h3>
+              <ul class="series-list">
+                <li><span>RQ1–RQ5 current campaign</span><span class="series-status is-blocked">NO ARTIFACT</span></li>
+                <li><span>Java RQ1–RQ4 benchmark</span><span class="series-status is-blocked">BLOCKED</span></li>
+                <li><span>RQ three-node campaign</span><span class="series-status is-blocked">NOT RUN</span></li>
+                <li><span>Cross-node / cross-region recovery</span><span class="series-status is-blocked">NOT RUN</span></li>
+                <li><span>Engine p50 comparison</span><span class="series-status">Independent evidence</span></li>
+              </ul>
+              <p class="series-proof">There is currently no campaign artifact for RQ1–RQ5. The Java benchmark is missing 15 internal Astral parent modules; engine p50 is an independent microbenchmark.</p>
+            </article>
+          </div>
+          <p class="section-note">E/M/RQ are independent of r3’s 2,853 Cargo test items; E workspace guards overlap with r3.</p>
+        </div>
+      </section>
+
+      <section class="validation-section" id="failures">
+        <div class="validation-wrap">
+          <p class="section-label">07 <span>Failures</span></p>
+          <h2>Failures and blocks, listed separately.</h2>
+          <p class="section-lead">This round’s conclusion includes the 2 r3 failures, failures in the single-machine gate, and the SDK production block.</p>
+          <div class="failure-grid">
+            <article class="failure-card">
+              <div class="failure-head"><span>r3 · MySQL</span><span class="result is-fail">FAIL</span></div>
+              <h3>Identity mapping create</h3>
+              <p>Missing-mapping detection passed; create failed while decoding operation-ledger status. Subsequent positive resolve and cross-app isolation assertions were not run.</p>
+              <code class="failure-code">Database("lock integration mapping operation: error occurred while decoding column status: mismatched types; Rust String/VARCHAR is not compatible with SQL BINARY")</code>
+              <p class="failure-impact">Impact: the SDK mapping creation path remains unverified.</p>
+            </article>
+            <article class="failure-card">
+              <div class="failure-head"><span>r3 · E5</span><span class="result is-fail">FAIL</span></div>
+              <h3>Memory read throughput sanity floor</h3>
+              <p>Concurrent throughput was 45,927 reads/s, below the 50,000 threshold; sequential throughput passed at 29,066 reads/s. The concurrent-throughput assertion failed, so the subsequent p99 assertion was not run.</p>
+              <code class="failure-code">sequential 29,066 / 44.269µs p99
+concurrent 45,927 / 353.209µs p99
+concurrent p99.9 504.843µs · max 1,007.968µs</code>
+              <p class="failure-impact">Local recheck: 130,565 reads/s PASS; independent E5 diagnostic: 46,055 reads/s still FAIL.</p>
+            </article>
+          </div>
+          <div class="block-list">
+            <article><h3>Single-Machine Real-Dependency Gate</h3><p>169 core integration cases passed, but the full gate has 5 failures: 1 TrustGraph fixture in the default run and 4 assertions in the Redis compatibility run. Other identified defects include Clippy 1.99, baseline user_mfa, the harness feature string, cargo glob, Redis runtime switch, mapping isolation, fixture origin-region, replay actor type, and information_schema ENUM decoding.</p></article>
+            <article><h3>SDK Production Integration</h3><p>Local gate PASS; production integration BLOCKED. Production-environment integration acceptance is not complete.</p></article>
+            <article><h3>13 ignored</h3><p>Includes 2 mapping schema isolation database tests, 1 audit worker skeleton, 6 CPU matrix / probe tests, and 4 doctests. ignored tests are not counted as passes.</p></article>
+            <article><h3>Not Run</h3><p>Cross-node / cross-region recovery, RQ three-node campaign, full E1–E5 Python/live protocol, TLA+/TLC, full migration on a newly created compose setup, backup/restore drill, production deployment, and authorization cutover.</p></article>
+          </div>
+        </div>
+      </section>
+
+      <section class="validation-section" id="boundary">
+        <div class="validation-wrap">
+          <p class="section-label">08 <span>Evidence Boundaries</span></p>
+          <h2>What the evidence covers.</h2>
+          <div class="boundary-grid">
+            <article class="boundary-column">
+              <h3>Covered</h3>
+              <ul>
+                <li>The default build tree has no compile-time Redis dependency.</li>
+                <li>On real MySQL, selected paths for published evidence, tenant isolation, ORG_SCOPE, partition lease, and quarantine/replay passed.</li>
+                <li>The RabbitMQ audit-replay happy path, durable business proof, invalid routing, and token fence passed.</li>
+                <li>All five targets, MT-E1 / E3 / E4 / E5 / E6, passed.</li>
+                <li>The Runner does not produce false green results for the covered failure, timeout, and ownership scenarios.</li>
+              </ul>
+            </article>
+            <article class="boundary-column">
+              <h3>Out of Scope</h3>
+              <ul>
+                <li>A fully green integration gate (both r3 and the single-machine gate are FAIL).</li>
+                <li>SDK mapping-creation compatibility and successful SDK production integration.</li>
+                <li>E5 performance meeting the sanity floor, and 512 being the capacity limit.</li>
+                <li>Business HTTP end-to-end coverage for a real single-node composite.</li>
+                <li>Cross-node / cross-region recovery, the full E1–E5 protocol, TLA+/TLC, production migration, and authorization cutover.</li>
+              </ul>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="validation-section" id="sources">
+        <div class="validation-wrap">
+          <p class="section-label">09 <span>Evidence Index</span></p>
+          <h2>See the public materials.</h2>
+          <p class="section-lead">This page references redacted test summaries and public repository documents; the original runner / unit logs are kept in the local evidence package.</p>
+          <ul class="source-list">
+            <li><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/authorization-validation/README.md" target="_blank" rel="noreferrer">Authorization Validation Protocol and Tools <span aria-hidden="true">↗</span></a></li>
+            <li><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/authorization-validation/EVIDENCE_BOUNDARY_MATRIX.md" target="_blank" rel="noreferrer">Evidence Boundary Matrix <span aria-hidden="true">↗</span></a></li>
+            <li><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/authorization-validation/VALIDATION_PROTOCOL.md" target="_blank" rel="noreferrer">Validation Protocol <span aria-hidden="true">↗</span></a></li>
+            <li><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/authorization-validation/IMPLEMENTATION_MAP.md" target="_blank" rel="noreferrer">M1–M5 Implementation Map <span aria-hidden="true">↗</span></a></li>
+            <li><a href="https://github.com/CoreryBlack/AstralLight.Next" target="_blank" rel="noreferrer">Browse the Rust repository <span aria-hidden="true">↗</span></a></li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="validation-section" id="inventory">
+        <div class="validation-wrap">
+          <p class="section-label">Appendix <span>TEST INVENTORY</span></p>
+          <h2>Test Inventory by Evidence Group</h2>
+          <p class="section-lead">The named tests in the evidence summary are listed below; the remaining executed items are shown as group counts. Groups overlap, so their counts should not be added together.</p>
+          <div class="inventory-summary">
+            <span><strong>89</strong> named r3 tests</span>
+            <span><strong>12</strong> Runner scenarios</span>
+            <span><strong>13</strong> ignored</span>
+          </div>
+          <div class="inventory-tools"><button class="inventory-toggle" type="button" id="inventory-toggle">Expand all</button></div>
+          <div class="inventory-list">
+            <details class="inventory-group">
+              <summary><span>Workspace E1 / E2 guards</span><span class="inventory-meta">6 PASS</span></summary>
+              <ul class="test-names">
+                <li><code>e1_observation::tests::event_sequence_is_strictly_monotonic</code><span class="result is-pass">PASS</span></li>
+                <li><code>e1_observation::tests::process_observation_id_is_stable_within_one_process</code><span class="result is-pass">PASS</span></li>
+                <li><code>evidence_cache::tests::e2_pending_probe_omission_accepts_stale_candidate_while_full_contract_reloads</code><span class="result is-pass">PASS</span></li>
+                <li><code>evidence_cache::tests::e2_post_recheck_omission_accepts_interleaving_while_full_contract_reloads</code><span class="result is-pass">PASS</span></li>
+                <li><code>evidence_cache::tests::e2_generation_revoke_fence_omission_accepts_stale_candidate</code><span class="result is-pass">PASS</span></li>
+                <li><code>engine::tests::e2_final_reload_omission_accepts_removed_candidate_while_full_contract_reloads</code><span class="result is-pass">PASS</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>Authorization projection</span><span class="inventory-meta">10 PASS</span></summary>
+              <ul class="test-names">
+                <li><code>aggregate_wide_null_card_revoke_delta_gates_any_card_evidence</code><span class="result is-pass">PASS</span></li>
+                <li><code>archive_intent_lease_and_durable_proof_flow</code><span class="result is-pass">PASS</span></li>
+                <li><code>archive_intent_parent_proof_rejects_mismatch_before_outbox_write</code><span class="result is-pass">PASS</span></li>
+                <li><code>claim_gate_defers_behind_unpublished_same_grant_siblings</code><span class="result is-pass">PASS</span></li>
+                <li><code>competing_publications_admit_exactly_one_cas_winner</code><span class="result is-pass">PASS</span></li>
+                <li><code>content_change_update_via_real_writers_raises_card_fence_and_gates_evidence</code><span class="result is-pass">PASS</span></li>
+                <li><code>null_card_pending_delta_covered_by_published_watermark_does_not_gate</code><span class="result is-pass">PASS</span></li>
+                <li><code>published_evidence_reader_fails_closed_without_current_pointer</code><span class="result is-pass">PASS</span></li>
+                <li><code>stage_finalize_publish_round_trip_yields_strict_card_evidence</code><span class="result is-pass">PASS</span></li>
+                <li><code>unpublished_delta_gates_published_card_evidence_to_pending</code><span class="result is-pass">PASS</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>DB integration</span><span class="inventory-meta">2 PASS</span></summary>
+              <ul class="test-names">
+                <li><code>local_message_exact_claim_is_concurrent_fifo_and_token_fenced</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_sqlx_repository_e2e</code><span class="result is-pass">PASS</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>Tenant isolation</span><span class="inventory-meta">7 PASS</span></summary>
+              <ul class="test-names">
+                <li><code>test_audit_log_tenant_filter_invariant</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_cross_tenant_binding_rejection</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_cross_tenant_scope_split_is_corrupt_fail_closed</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_multi_tenant_rule_set_isolation</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_same_tenant_card_evidence_isolation</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_tenant_audit_log_read_write</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_tenant_scoped_query_with_real_db</code><span class="result is-pass">PASS</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>ORG_SCOPE</span><span class="inventory-meta">15 PASS</span></summary>
+              <ul class="test-names">
+                <li><code>org_scope_attach_approval_rejects_non_parent_counterparty</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_authority_end_to_end</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_complete_outbox_event_kind_scoped_membership_contract</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_dependency_propagate_mask_remove_revoke_waves_coalesce_and_advance_generation_only</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_dependency_propagate_reparenting_old_and_new_parent_waves</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_dependency_propagate_root_grant_wave_child_then_grandchild_after_republication</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_managed_tenant_flag_off_never_falls_back_to_legacy</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_membership_cap_is_global_fail_closed_and_revoke_frees_capacity</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_membership_cap_serializes_boundary_race_at_read_committed</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_membership_cap_serializes_concurrent_distinct_cards</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_outbox_concurrent_claim_has_one_winner</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_outbox_renew_reclaim_and_stale_worker_fencing</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_outbox_retry_backoff_and_claim_budget_are_durable</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_propagate_subtree_drains_wide_siblings_before_completion</code><span class="result is-pass">PASS</span></li>
+                <li><code>org_scope_propagate_superseded_intent_and_same_root_invalidation</code><span class="result is-pass">PASS</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>Partition lease</span><span class="inventory-meta">7 PASS</span></summary>
+              <ul class="test-names">
+                <li><code>concurrent_expired_reclaim_has_one_winner_without_duplicate_key_deadlock</code><span class="result is-pass">PASS</span></li>
+                <li><code>partition_claim_installs_lease_and_respects_partition_boundary</code><span class="result is-pass">PASS</span></li>
+                <li><code>partition_discovery_returns_only_claimable_partitions</code><span class="result is-pass">PASS</span></li>
+                <li><code>partition_lease_expired_lease_is_taken_over_with_generation_bump</code><span class="result is-pass">PASS</span></li>
+                <li><code>partition_lease_roundtrip_acquire_renew_release</code><span class="result is-pass">PASS</span></li>
+                <li><code>partition_lease_second_owner_is_busy_while_first_is_live</code><span class="result is-pass">PASS</span></li>
+                <li><code>pointer_advance_reclaims_parked_budget_exhausted_event</code><span class="result is-pass">PASS</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>Quarantine / replay</span><span class="inventory-meta">7 PASS</span></summary>
+              <ul class="test-names">
+                <li><code>test_audit_quarantine_repository_lifecycle</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_concurrent_claim_fencing_and_expired_reclaim</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_expired_reclaim_fences_old_typed_claim</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_max_replay_attempts_are_observable_without_confirmation</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_requested_claim_requires_exact_route_status_and_attempt_ceiling</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_requested_replay_precedes_expired_recovery</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_typed_claim_confirm_and_fail_fencing</code><span class="result is-pass">PASS</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>Identity</span><span class="inventory-meta">8 PASS</span></summary>
+              <ul class="test-names">
+                <li><code>test_auth_token_family_and_device_session</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_identity_card_crud</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_login_aggregate_join</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_platform_user_soft_delete</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_register_user_three_table_transaction</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_token_family_cascade_revoke</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_user_list_left_join</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_user_local_credential_crud</code><span class="result is-pass">PASS</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>Monitor</span><span class="inventory-meta">5 PASS</span></summary>
+              <ul class="test-names">
+                <li><code>test_alert_rule_crud_and_toggle</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_monitor_activity_log</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_monitor_alert_history_acknowledge</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_monitor_metric_snapshot_time_series</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_notification_channel_crud</code><span class="result is-pass">PASS</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>TrustGraph</span><span class="inventory-meta">12 PASS</span></summary>
+              <ul class="test-names">
+                <li><code>test_approval_audit_failure_rolls_back_status</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_audit_log_crud</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_delete_with_cascade_call_through_empty_card</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_permission_request_approve_transaction</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_permission_request_date_format_alias</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_permission_rule_crud</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_rule_set_entry_and_card_ref</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_rule_set_id_and_source_type_aliases</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_sod_policy_and_violation</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_user_card_date_format_aliases</code><span class="result is-pass">PASS</span></li>
+                <li><code>test_user_card_soft_delete_cascade</code><span class="result is-pass">PASS</span></li>
+                <li><code>production_org_scope_projector_publishes_and_two_workers_do_not_duplicate</code><span class="result is-pass">PASS</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>MT-E and premises</span><span class="inventory-meta">7 PASS</span></summary>
+              <ul class="test-names">
+                <li><code>mt_e1_sixty_four_tenant_interleaved_isolation</code><span class="result is-pass">PASS</span></li>
+                <li><code>mt_e3_tenant_grant_churn</code><span class="result is-pass">PASS</span></li>
+                <li><code>mt_e4_cross_tenant_invalidation_storm</code><span class="result is-pass">PASS</span></li>
+                <li><code>mt_e5_capacity_512_tenants</code><span class="result is-pass">PASS</span></li>
+                <li><code>mt_e6_mixed_state_fail_closed_landscape</code><span class="result is-pass">PASS</span></li>
+                <li><code>hub_invalidation_notification_is_the_load_bearing_freshness_fence</code><span class="result is-pass">PASS</span></li>
+                <li><code>single_writer_lease_is_mutually_exclusive_and_releasable</code><span class="result is-pass">PASS</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>RabbitMQ audit replay</span><span class="inventory-meta">1 PASS</span></summary>
+              <ul class="test-names">
+                <li><code>mysql_rabbit_audit_replay_real_integration</code><span class="result is-pass">PASS</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>Identity mapping</span><span class="inventory-meta">1 PASS · 1 FAIL</span></summary>
+              <ul class="test-names">
+                <li><code>identity_mapping_absence_is_detectable_for_mismatch_probes</code><span class="result is-pass">PASS</span></li>
+                <li><code>identity_mapping_absence_is_the_refusal_contract</code><span class="result is-fail">FAIL</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>Runner orchestration</span><span class="inventory-meta">12 PASS · mock</span></summary>
+              <ul class="test-names">
+                <li><span class="test-name">Unit tests without external-service credentials; default feature, local transport, Redis-off</span><span class="result is-pass">PASS</span></li>
+                <li><span class="test-name">Migrated isolated MySQL integration entry point keeps Redis disabled, starts no Docker/DDL, and does not mistakenly select dedicated mapping/Rabbit targets</span><span class="result is-pass">PASS</span></li>
+                <li><span class="test-name">Record Cargo 101 verbatim and fail overall; continue to other known targets after deterministic failures</span><span class="result is-pass">PASS</span></li>
+                <li><span class="test-name">An in-test [SKIP] does not count as PASS</span><span class="result is-pass">PASS</span></li>
+                <li><span class="test-name">Timeout 124 is marked UNKNOWN; stop subsequent dispatch</span><span class="result is-pass">PASS</span></li>
+                <li><span class="test-name">managed compose preflight/up → existing migrator → run-owned cleanup</span><span class="result is-pass">PASS</span></li>
+                <li><span class="test-name">Clean up this run’s resources after partial startup failure; do not start migration</span><span class="result is-pass">PASS</span></li>
+                <li><span class="test-name">Reject an occupied compose project; do not start or delete it</span><span class="result is-pass">PASS</span></li>
+                <li><span class="test-name">Reject Rabbit URL with an empty vhost before testing</span><span class="result is-pass">PASS</span></li>
+                <li><span class="test-name">Rabbit-specific suite selects audit-replay, with Redis-off and no redis feature enabled</span><span class="result is-pass">PASS</span></li>
+                <li><span class="test-name">Redis compat is opt-in only in explicit mode</span><span class="result is-pass">PASS</span></li>
+                <li><span class="test-name">matrix selects the specified suite; the default profile has no Redis and does not use --test '*'</span><span class="result is-pass">PASS</span></li>
+              </ul>
+            </details>
+
+            <details class="inventory-group">
+              <summary><span>Ignored · not executed</span><span class="inventory-meta">13 IGNORED</span></summary>
+              <ul class="test-names">
+                <li><code>create_read_idempotency_cas_revoke_and_permanent_key_ownership</code><span class="result is-ignored">IGNORED</span></li>
+                <li><code>mapping_read_rejects_inactive_or_expired_source_identity</code><span class="result is-ignored">IGNORED</span></li>
+                <li><code>memory_projection_hub::tests::assembly_cache::assembly_cache_performance_probe</code><span class="result is-ignored">IGNORED</span></li>
+                <li><code>memory_projection_hub::tests::performance::memory_evidence_no_regression_matrix</code><span class="result is-ignored">IGNORED</span></li>
+                <li><code>service::audit_replay_worker::tests::mysql_rabbit_replay_worker_integration_skeleton</code><span class="result is-ignored">IGNORED</span></li>
+                <li><code>service::authorization_projector::planning::parent_ordinals::tests::performance::parent_lookup_no_regression_matrix</code><span class="result is-ignored">IGNORED</span></li>
+                <li><code>service::authorization_projector::planning::parent_ordinals::tests::stage_planning_lookup_performance_probe</code><span class="result is-ignored">IGNORED</span></li>
+                <li><code>service::authorization_projector::tests::performance::complete_stage_plan_no_regression_matrix</code><span class="result is-ignored">IGNORED</span></li>
+                <li><code>service::local_projection_worker::tests::shared_ledger_performance_probe</code><span class="result is-ignored">IGNORED</span></li>
+                <li><code>policy-engine/src/client.rs - client (line 8)</code><span class="result is-ignored">IGNORED</span></li>
+                <li><code>policy-engine/src/client.rs - client (line 16)</code><span class="result is-ignored">IGNORED</span></li>
+                <li><code>policy-engine/src/client.rs - client (line 31)</code><span class="result is-ignored">IGNORED</span></li>
+                <li><code>policy-engine/src/client.rs - client::PermissionClient (line 53)</code><span class="result is-ignored">IGNORED</span></li>
+              </ul>
+            </details>
+          </div>
+          <p class="section-note">The inventory covers named items in the evidence summary; the full 2,853-item detail requires the original unit.log or test-results.csv.</p>
+          <a class="article-link validation-back" href="index.en.html">Back to project home <span aria-hidden="true">↗</span></a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <a class="brand footer-brand" href="index.en.html"><img class="brand-mark" src="assets/astral-mark.png" alt="" width="24" height="24">AstralLight<span class="brand-period">.</span><span class="brand-next">Next</span></a>
+      <span>Experimental project; not deployed in production and not guaranteed to be suitable for every environment or use case.</span>
+      <div class="footer-links"><a href="index.en.html">Home</a><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/LICENSE" target="_blank" rel="noreferrer">AGPL-3.0-or-later</a><a href="#top">Back to top ↑</a></div>
+    </footer>
+    <button class="back-to-top" type="button" aria-label="Back to top">↑</button>
+    <script src="validation.js" defer></script>
+  </body>
+</html>

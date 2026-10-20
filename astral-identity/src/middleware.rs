@@ -483,6 +483,8 @@ mod tests {
     #[test]
     fn management_paths_do_not_skip_permission_evaluation() {
         assert!(!is_identity_skip_path("/users"));
+        assert!(!is_identity_skip_path("/users/7/password"));
+        assert!(!is_credential_bootstrap_path("/users/7/password"));
         assert!(!is_identity_skip_path("/admin/stats"));
         assert!(!is_identity_skip_path("/mfa-extra"));
         assert!(!is_identity_skip_path("/wechat/miniprogram/login"));

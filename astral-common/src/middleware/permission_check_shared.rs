@@ -198,6 +198,16 @@ pub fn request_target_id(req: &Request) -> Option<i64> {
 /// 只有明确的业务特例在这里覆盖 HTTP 默认动作；其余操作保持 REST 映射，
 /// 未知方法返回 `None`，由调用方放行非业务的 OPTIONS 等预检请求。
 pub fn resolve_permission_action(resource: &str, path: &str, method: &str) -> Option<&'static str> {
+    if resource == "identity_users"
+        && method == "POST"
+        && path
+            .strip_prefix("/users/")
+            .and_then(|rest| rest.strip_suffix("/password"))
+            .is_some_and(|user_id| !user_id.is_empty() && !user_id.contains('/'))
+    {
+        return Some("reset-password");
+    }
+
     if resource == "learn_level_play" && method == "POST" {
         return Some("play");
     }
@@ -541,6 +551,60 @@ mod tests {
                 "route {method} {path} maps to an unregistered permission {resource}:{expected}"
             );
         }
+    }
+
+    #[test]
+    fn assisted_password_reset_maps_only_the_exact_post_route() {
+        let registry = astral_types::ResourceRegistry::global();
+        for path in [
+            "/users/7/password",
+            "/users/{id}/password",
+            "/users/0/password",
+            "/users/not-an-id/password",
+        ] {
+            assert_eq!(
+                resolve_permission_action("identity_users", path, "POST"),
+                Some("reset-password"),
+                "action for POST {path}"
+            );
+        }
+        assert!(registry
+            .validate("identity_users", "reset-password")
+            .is_ok());
+
+        for path in [
+            "/users",
+            "/cards",
+            "/mfa/enable",
+            "/mfa/disable",
+            "/mfa/verify",
+            "/mfa/recovery-codes",
+            "/users/7/password-extra",
+            "/users/7/password/extra",
+            "/users/7/extra/password",
+            "/users//password",
+            "/password/reset/token",
+        ] {
+            assert_eq!(
+                resolve_permission_action("identity_users", path, "POST"),
+                Some("create"),
+                "unrelated POST {path} must retain its existing action"
+            );
+        }
+        for (method, expected) in [("GET", "read"), ("PUT", "update"), ("DELETE", "delete")] {
+            assert_eq!(
+                resolve_permission_action("identity_users", "/users/7/password", method),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            resolve_permission_action("identity_users", "/users/7/password", "OPTIONS"),
+            None
+        );
+        assert_eq!(
+            resolve_permission_action("permission_rule", "/users/7/password", "POST"),
+            Some("create")
+        );
     }
 
     #[test]

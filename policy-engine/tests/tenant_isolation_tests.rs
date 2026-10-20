@@ -5,7 +5,7 @@ mod published;
 
 use std::sync::Arc;
 
-use astral_types::PolicyContext;
+use astral_types::{PolicyContext, ResourceOwnershipScope};
 use policy_engine::{DataScopeFilter, DataScopeFilterResolver, PolicyEngine};
 use published::{
     assert_allow, assert_deny, canonical_grant, ready_evidence, strict_context, strict_scope,
@@ -324,6 +324,210 @@ async fn test_benchmark_fixture_disables_scope_samples_without_bypassing_strict_
     );
     assert!(missing.scopes().is_empty());
     missing.assert_no_legacy_reads();
+}
+
+fn assisted_password_reset_context() -> PolicyContext {
+    let mut ctx = strict_context(
+        1,
+        1000,
+        100,
+        Some(10),
+        "identity_users:42",
+        "reset-password",
+    );
+    ctx.resource_ownership_scope = ResourceOwnershipScope::TenantScoped;
+    ctx.resource_tenant_id = Some(100);
+    ctx.resource_domain_id = Some(10);
+    ctx.resource_owner_id = Some(42);
+    ctx
+}
+
+#[tokio::test]
+async fn test_assisted_password_reset_rejects_crud_and_write_grants() {
+    for action in ["read", "create", "update", "delete", "write"] {
+        let repo = PublishedRepo::from_grants(vec![canonical_grant(
+            20,
+            100,
+            Some(10),
+            1000,
+            1,
+            "identity_users:*",
+            action,
+        )]);
+        let decision = PolicyEngine::new()
+            .evaluate(&assisted_password_reset_context(), &repo)
+            .await;
+        assert_deny(&decision, "DEFAULT_DENY");
+        assert_eq!(repo.published_reads(), 1);
+        repo.assert_no_legacy_reads();
+    }
+}
+
+#[tokio::test]
+async fn test_assisted_password_reset_grant_does_not_authorize_crud() {
+    let repo = PublishedRepo::from_grants(vec![canonical_grant(
+        21,
+        100,
+        Some(10),
+        1000,
+        1,
+        "identity_users:*",
+        "reset-password",
+    )]);
+    for action in ["read", "create", "update", "delete"] {
+        let mut ctx = assisted_password_reset_context();
+        ctx.action = action.to_owned();
+        let decision = PolicyEngine::new().evaluate(&ctx, &repo).await;
+        assert_deny(&decision, "DEFAULT_DENY");
+    }
+    assert_eq!(repo.published_reads(), 4);
+    repo.assert_no_legacy_reads();
+}
+
+#[tokio::test]
+async fn test_assisted_password_reset_requires_matching_scope_and_final_read() {
+    for resource in ["identity_users:42", "identity_users:*"] {
+        let repo = PublishedRepo::from_grants(vec![canonical_grant(
+            22,
+            100,
+            Some(10),
+            1000,
+            1,
+            resource,
+            "reset-password",
+        )]);
+        let decision = PolicyEngine::new()
+            .evaluate(&assisted_password_reset_context(), &repo)
+            .await;
+        assert_allow(&decision);
+        assert_eq!(repo.published_reads(), 2);
+        assert_eq!(
+            repo.scopes(),
+            vec![
+                strict_scope(100, 1000, 1, Some(10)),
+                strict_scope(100, 1000, 1, Some(10)),
+            ]
+        );
+        repo.assert_no_legacy_reads();
+    }
+
+    let repo = PublishedRepo::from_grants(vec![canonical_grant(
+        23,
+        100,
+        Some(10),
+        1000,
+        1,
+        "identity_users:43",
+        "reset-password",
+    )]);
+    let decision = PolicyEngine::new()
+        .evaluate(&assisted_password_reset_context(), &repo)
+        .await;
+    assert_deny(&decision, "DEFAULT_DENY");
+    repo.assert_no_legacy_reads();
+}
+
+#[tokio::test]
+async fn test_assisted_password_reset_keeps_existing_action_wildcard_semantics() {
+    for resource in ["identity_users:*", "*"] {
+        let repo = PublishedRepo::from_grants(vec![canonical_grant(
+            24,
+            100,
+            Some(10),
+            1000,
+            1,
+            resource,
+            "*",
+        )]);
+        let decision = PolicyEngine::new()
+            .evaluate(&assisted_password_reset_context(), &repo)
+            .await;
+        assert_allow(&decision);
+        assert_eq!(repo.published_reads(), 2);
+        repo.assert_no_legacy_reads();
+    }
+}
+
+#[tokio::test]
+async fn test_assisted_password_reset_rejects_foreign_or_unresolved_target_scope() {
+    let repo = PublishedRepo::from_grants(vec![canonical_grant(
+        25,
+        100,
+        Some(10),
+        1000,
+        1,
+        "identity_users:*",
+        "reset-password",
+    )]);
+    let mut foreign = assisted_password_reset_context();
+    foreign.resource_tenant_id = Some(200);
+    let mut unresolved = assisted_password_reset_context();
+    unresolved.resource_ownership_scope = ResourceOwnershipScope::Unresolved;
+    let mut unavailable = assisted_password_reset_context();
+    unavailable.resource_ownership_scope = ResourceOwnershipScope::Unavailable;
+    for ctx in [foreign, unresolved, unavailable] {
+        let decision = PolicyEngine::new().evaluate(&ctx, &repo).await;
+        assert_deny(&decision, "AUTHORIZATION_PENDING");
+    }
+    assert_eq!(repo.published_reads(), 0);
+
+    let mut wrong_domain = assisted_password_reset_context();
+    wrong_domain.resource_domain_id = Some(20);
+    let decision = PolicyEngine::new().evaluate(&wrong_domain, &repo).await;
+    assert_deny(&decision, "DEFAULT_DENY");
+    repo.assert_no_legacy_reads();
+}
+
+#[tokio::test]
+async fn test_assisted_password_reset_missing_or_unpublished_evidence_stays_pending() {
+    for repo in [
+        PublishedRepo::missing(),
+        PublishedRepo::unpublished(100, 1000),
+    ] {
+        let decision = PolicyEngine::new()
+            .evaluate(&assisted_password_reset_context(), &repo)
+            .await;
+        assert_deny(&decision, "AUTHORIZATION_PENDING");
+        assert_eq!(repo.published_reads(), 1);
+        repo.assert_no_legacy_reads();
+    }
+
+    let repo = PublishedRepo::inactive_with_evidence(vec![canonical_grant(
+        26,
+        100,
+        Some(10),
+        1000,
+        1,
+        "identity_users:*",
+        "reset-password",
+    )]);
+    let decision = PolicyEngine::new()
+        .evaluate(&assisted_password_reset_context(), &repo)
+        .await;
+    assert_deny(&decision, "CARD_DISABLED");
+    assert_eq!(repo.published_reads(), 0);
+    repo.assert_no_legacy_reads();
+}
+
+#[tokio::test]
+async fn test_identity_create_and_write_grants_keep_existing_create_access() {
+    for action in ["create", "write"] {
+        let repo = PublishedRepo::from_grants(vec![canonical_grant(
+            27,
+            100,
+            Some(10),
+            1000,
+            1,
+            "identity_users:*",
+            action,
+        )]);
+        let mut ctx = assisted_password_reset_context();
+        ctx.action = "create".to_owned();
+        let decision = PolicyEngine::new().evaluate(&ctx, &repo).await;
+        assert_allow(&decision);
+        assert_eq!(repo.published_reads(), 2);
+        repo.assert_no_legacy_reads();
+    }
 }
 
 #[tokio::test]

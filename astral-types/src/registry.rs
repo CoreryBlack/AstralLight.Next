@@ -625,7 +625,10 @@ impl ResourceRegistry {
         );
         self.register("user", &["read", "bind-permission"]);
         // Identity 模块
-        self.register("identity_users", &["read", "create", "update", "delete"]);
+        self.register(
+            "identity_users",
+            &["read", "create", "update", "delete", "reset-password"],
+        );
         self.register("identity_card", &["read", "create", "update", "delete"]);
         self.register(
             "identity_level_template",
@@ -802,6 +805,18 @@ mod tests {
         assert!(resources.contains(&"learn_subject".to_string()));
         assert!(resources.contains(&"audit".to_string()));
         assert!(resources.contains(&"audit_quarantine".to_string()));
+    }
+
+    #[test]
+    fn identity_password_reset_is_registered_without_changing_crud_or_write_alias() {
+        let reg = ResourceRegistry::global();
+        for action in ["read", "create", "update", "delete", "reset-password"] {
+            assert!(reg.validate("identity_users", action).is_ok());
+        }
+        assert!(get_alias_sources("reset-password").is_empty());
+        assert_eq!(get_alias_sources("create"), vec!["write"]);
+        assert_eq!(get_alias_sources("update"), vec!["write"]);
+        assert_eq!(get_alias_sources("delete"), vec!["write"]);
     }
 
     #[test]

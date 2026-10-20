@@ -2090,6 +2090,25 @@ mod tests {
     }
 
     #[test]
+    fn assisted_password_reset_preserves_authoritative_user_target_scope() {
+        assert_eq!(
+            route_ownership_contract("identity_users", "/users/7/password", "POST", None),
+            RouteOwnershipContract::TenantTarget {
+                target_id: 7,
+                lookup: TargetLookupKind::User,
+            }
+        );
+        assert_eq!(
+            resolved_target_id("identity_users", "/users/7/password", "POST", Some(7)),
+            Ok(Some(7))
+        );
+        assert_eq!(
+            resolved_target_id("identity_users", "/users/7/password", "POST", Some(8)),
+            Err("resource_ownership.path_query_target_mismatch")
+        );
+    }
+
+    #[test]
     fn tenant_scoped_rejects_non_positive_authoritative_values() {
         assert!(matches!(
             tenant_scoped(Some(7), 0, None, None),

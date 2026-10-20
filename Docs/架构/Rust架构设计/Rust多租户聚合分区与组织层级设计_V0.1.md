@@ -241,7 +241,7 @@ E5/TLA 边界：组织树、批准边、成员资格与撤销捕获是否纳入�
 | 组件 | 状态 | 落点 |
 |------|------|------|
 | 分区租约表迁移 | 已入库（additive，未对任何数据库执行） | `astral-db/migrations/20260921000001_authorization_projection_partition_lease.sql` |
-| 分区租约原语（acquire/过期接管/Busy、renew 心跳、best-effort release、分区发现镜像 claim 资格+版本序门；获取/回收/释放/丢失的 durable audit correlation） | 已实现，typed + ignored 集成断言已编译；真实 MySQL audit 断言未执行 | `astral-db/src/grant_repository.rs`、`astral-db/tests/partition_lease_integration.rs` |
+| 分区租约原语（acquire/过期接管/Busy、renew 心跳、best-effort release、分区发现镜像 claim 资格+版本序门；获取/回收/释放/丢失的 durable audit correlation） | 已实现，typed + ignored 集成断言已编译；真实 MySQL audit 断言未执行 | `astral-db/src/grant_repository.rs`、`tests-suite/series/RQ4/partition_lease_integration.rs` |
 | runtime 端口（discover/acquire/renew/release/claim-in-partition，默认 fail-closed unsupported；生产 Sqlx runtime 全覆盖） | 已实现 | `astral-trustgraph/src/service/authorization_projector.rs` |
 | 调度拓扑 `ProjectorSchedulingMode`（默认 TenantSerial）+ `run_partition_worker`（发现→租约→批内续租认领→复用 `process_one_event`）+ `supervise_partition_projector`（N worker、槽位重启、停滞看门狗、有界关闭宽限） | 已实现，7 个 typed 测试 | 同上 |
 | 部署面：`ASTRAL_PROJECTOR_SCHEDULING_MODE` / `ASTRAL_PROJECTOR_WORKER_COUNT`（fail-fast 解析）+ Q2 池预算守卫（worker×2 ≤ 池上限） | 已接线 | `astral-trustgraph/src/main.rs` |

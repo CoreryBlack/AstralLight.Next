@@ -6,7 +6,7 @@ independent of the separate multi-tenant delivery milestones that also use M1-M3
 
 | Assumption | Public implementation/test surface | What it can establish | Remaining boundary |
 |---|---|---|---|
-| M1: source capture | `astral-db/tests/authorization_projection_integration.rs`; ruleset repository; source-generation, delta, outbox, revoke-fence, and tenant-scoped mutation code | Exercises selected durable source mutation, generation, and tenant-binding contracts | Not a mechanized proof of atomic capture for every aggregate and affected scope |
+| M1: source capture | `tests-suite/series/RQ3/authorization_projection_integration.rs`; ruleset repository; source-generation, delta, outbox, revoke-fence, and tenant-scoped mutation code | Exercises selected durable source mutation, generation, and tenant-binding contracts | Not a mechanized proof of atomic capture for every aggregate and affected scope |
 | M2: monotone publication | projection, organization-scope, and partition-lease tests; CAS/pointer/generation code; the composite single-writer lease (`GET_LOCK` with monitored lifetime) and the local projection bus that dispatches committed deltas in-process | Exercises selected publication, pointer advancement, projector, and lease-reclaim paths | General multi-writer ordering, replica divergence, and every deployment schedule remain outside local proof |
 | M3: faithful representation | projection repository, evidence/cache tests, final-reload tests, and the memory projection hub (invalidation as freshness fence; served state only from committed publications) | Exercises lineage, evidence identity, unpublished-delta gates, and fail-closed reads | Does not prove faithful representation under every storage, process, or deployment failure |
 | M4: trusted storage and processes | fail-closed checks, offline harness tests, and the independent TLA+ input | Exercises mismatch/error handling and safe defaults | Non-Byzantine storage/processes and trusted integrity keys remain explicit assumptions; the TLA+ input is `BLOCKED` until verified |
@@ -38,7 +38,7 @@ blocker. `scripts/test_campaign.py` validates this index before dispatch, retain
 nonempty assertion/ignored/SKIP evidence, records a frozen content hash and never
 provisions dependencies or retries unknown results.
 
-`tests-suite/tests/native_projection_lifecycle.rs` adds a single ignored real-MySQL
+`tests-suite/series/RQ3/native_projection_lifecycle.rs` adds a single ignored real-MySQL
 binary exercising the production TrustGraph source repository, post-commit local
 projection dispatch, durable delta/audit correlation, production local worker ownership,
 published pointer/fence and strict PolicyEngine evaluation. Source APIs can publish

@@ -1,0 +1,229 @@
+{
+ "rq3": {
+  "high_freq_write": {
+   "ops_requested": 60,
+   "ops_ok": 60,
+   "api_errors": 0,
+   "error_samples": [],
+   "add_api": {
+    "n": 60,
+    "p50_ms": 530.02,
+    "p95_ms": 546.9,
+    "max_ms": 552.16,
+    "mean_ms": 527.64
+   },
+   "publish": {
+    "n": 60,
+    "p50_ms": 101.67,
+    "p95_ms": 110.02,
+    "max_ms": 110.17,
+    "mean_ms": 101.59
+   },
+   "publish_timeout": 0,
+   "burst_drain_ms": 98.76,
+   "drain_complete": true,
+   "deltas_terminal": true,
+   "note": "ADD-only 顺序突发（增量编译成本口径）；add+del 交替的撤销重压形态由 v2 门禁语义另列（见报告）"
+  }
+ },
+ "rq4": {
+  "long_storm_60s": {
+   "seconds": 60,
+   "threads": 3,
+   "wall_s": 61.2,
+   "ops": 122,
+   "errors": 28,
+   "error_samples": [
+    {
+     "status": 403,
+     "body": "{\"code\":403,\"decision\":null,\"errorType\":\"PERMISSION_DENIED\",\"message\":\"Permission denied: Permission denied: AUTHORIZATION_PENDING for permission_rule:create\",\""
+    },
+    {
+     "status": 403,
+     "body": "{\"code\":403,\"decision\":null,\"errorType\":\"PERMISSION_DENIED\",\"message\":\"Permission denied: Permission denied: AUTHORIZATION_PENDING for permission_rule:create\",\""
+    },
+    {
+     "status": 403,
+     "body": "{\"code\":403,\"decision\":null,\"errorType\":\"PERMISSION_DENIED\",\"message\":\"Permission denied: Permission denied: AUTHORIZATION_PENDING for permission_rule:create\",\""
+    }
+   ],
+   "qps": 1.99,
+   "drain_ms": 898564.54,
+   "drain_complete": true,
+   "parked_at_budget_exhaustion_at_snapshot": 0,
+   "deltas_terminal": true,
+   "outbox": {
+    "contiguous": true,
+    "all_processed": true,
+    "terminal_once": true,
+    "rows": 184
+   },
+   "card_head_generation": 1772,
+   "note": "ADD-only（撤销重压 add+del 形态的 100% 403 数据见报告叙述）；排水窗含同聚合指针竞争败者的 900s 退避自愈"
+  }
+ },
+ "rq5": {
+  "E4_cache_repopulation": {
+   "cycles": 30,
+   "cold": {
+    "n": 30,
+    "p50_ms": 17.7,
+    "p95_ms": 18.65,
+    "max_ms": 18.83,
+    "mean_ms": 17.44
+   },
+   "warm": {
+    "n": 270,
+    "p50_ms": 16.41,
+    "p95_ms": 17.46,
+    "max_ms": 18.68,
+    "mean_ms": 16.34
+   },
+   "card": "9062 (clean)",
+   "note": "cold=FLUSHALL 后首决策（epoch/L2 全失配 → L3 源回填）；warm=L1/L2 命中；决策语义全程 ALLOW（缓存不可见翻转）"
+  },
+  "E11_stale_replay_context": {
+   "captured_replay_status": [
+    200,
+    200,
+    200,
+    200,
+    200
+   ],
+   "captured_replay_allow_anomalies": 0,
+   "stale_timestamp_status": 403,
+   "stale_timestamp_rejected": true,
+   "cross_card_status": [
+    200,
+    200,
+    200
+   ],
+   "cross_card_denied": 3,
+   "anomalies": 0,
+   "total_evaluations": 8,
+   "anomaly_rate": 0.0,
+   "note": "(a) 撤销前签名请求撤销后原样重放——旧 ALLOW 不复活；(c) 跨租户上下文伪造全节点拒绝"
+  },
+  "E3E5_throughput": {
+   "points": [
+    {
+     "node": "node-b",
+     "threads": 1,
+     "seconds": 10.0,
+     "evals": 682,
+     "errors": 0,
+     "qps": 68.19,
+     "latency": {
+      "n": 682,
+      "p50_ms": 14.73,
+      "p95_ms": 15.46,
+      "max_ms": 17.42,
+      "mean_ms": 14.66
+     },
+     "qps_runs": [
+      68.28,
+      68.19
+     ],
+     "qps_mean": 68.23,
+     "qps_sd": 0.05
+    },
+    {
+     "node": "node-b",
+     "threads": 2,
+     "seconds": 10.0,
+     "evals": 1323,
+     "errors": 0,
+     "qps": 132.24,
+     "latency": {
+      "n": 1323,
+      "p50_ms": 15.16,
+      "p95_ms": 15.8,
+      "max_ms": 17.26,
+      "mean_ms": 15.12
+     },
+     "qps_runs": [
+      132.23,
+      132.24
+     ],
+     "qps_mean": 132.24,
+     "qps_sd": 0.01
+    },
+    {
+     "node": "node-b",
+     "threads": 4,
+     "seconds": 10.02,
+     "evals": 2636,
+     "errors": 0,
+     "qps": 263.17,
+     "latency": {
+      "n": 2636,
+      "p50_ms": 15.2,
+      "p95_ms": 16.14,
+      "max_ms": 20.09,
+      "mean_ms": 15.18
+     },
+     "qps_runs": [
+      266.56,
+      263.17
+     ],
+     "qps_mean": 264.87,
+     "qps_sd": 1.69
+    },
+    {
+     "node": "node-b",
+     "threads": 8,
+     "seconds": 10.01,
+     "evals": 4446,
+     "errors": 0,
+     "qps": 443.99,
+     "latency": {
+      "n": 4446,
+      "p50_ms": 17.25,
+      "p95_ms": 24.33,
+      "max_ms": 41.04,
+      "mean_ms": 17.99
+     },
+     "qps_runs": [
+      445.34,
+      443.99
+     ],
+     "qps_mean": 444.66,
+     "qps_sd": 0.67
+    },
+    {
+     "node": "node-a",
+     "threads": 8,
+     "seconds": 10.04,
+     "evals": 1652,
+     "errors": 0,
+     "qps": 164.46,
+     "latency": {
+      "n": 1652,
+      "p50_ms": 47.51,
+      "p95_ms": 52.06,
+      "max_ms": 281.96,
+      "mean_ms": 48.5
+     }
+    },
+    {
+     "node": "node-c",
+     "threads": 8,
+     "seconds": 10.02,
+     "evals": 4660,
+     "errors": 0,
+     "qps": 465.22,
+     "latency": {
+      "n": 4660,
+      "p50_ms": 17.17,
+      "p95_ms": 19.13,
+      "max_ms": 34.06,
+      "mean_ms": 17.17
+     }
+    }
+   ],
+   "card": "9062 (clean)",
+   "note": "sim 评估全链路（网关签名 + permission check + 严格证据读）；重复间的 QPS SD 为运行方差"
+  }
+ },
+ "elapsed_s": 2083.5
+}

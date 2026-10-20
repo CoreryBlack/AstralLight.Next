@@ -5,9 +5,8 @@ edition = "2021"
 publish = false
 license = "AGPL-3.0-or-later"
 
-# 分类测试套件 crate:承载 tests-suite 下新增的测试(多租户混合极限、
-# 安全前提扩展)。既有各 crate 测试不物理搬迁,由 tests-suite/MANIFEST.toml
-# 全量编目;单元测试(#[cfg(test)] 内联)按 Cargo 语义留在属主 crate。
+# 分类测试套件 crate:集成测试按主系列物理存放于 tests-suite/series/<系列>/。
+# 单元测试(#[cfg(test)] 内联)按 Cargo 语义留在属主 crate,由 MANIFEST 编目。
 
 [dependencies]
 astral-types = { path = "../astral-types" }
@@ -15,23 +14,33 @@ astral-common = { path = "../astral-common" }
 astral-db = { path = "../astral-db" }
 astral-mq = { path = "../astral-mq" }
 astral-gateway = { path = "../astral-gateway" }
+astral-identity = { path = "../astral-identity" }
+astral-monitor = { path = "../astral-monitor" }
 policy-engine = { path = "../policy-engine" }
 astral-trustgraph = { path = "../astral-trustgraph" }
-astral-identity = { path = "../astral-identity" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
+async-trait = "0.1"
 sha2 = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true, features = ["util"] }
+time = { workspace = true }
+hmac = { workspace = true }
+moka = { workspace = true }
+lapin = { workspace = true }
+futures-util = "0.3"
+redis = { workspace = true, optional = true }
 
 [features]
 default = ["astral-db/test-support"]
 # 按需兼容验证入口:cargo test -p testsuite --features redis-compat
 redis-compat = [
+    "dep:redis",
     "astral-db/redis-compat",
     "astral-common/redis-compat",
     "astral-gateway/redis-compat",
@@ -40,28 +49,136 @@ redis-compat = [
     "astral-mq/redis-compat",
 ]
 
-# Security premise binaries are explicit because Cargo does not discover tests
-# nested below tests/security/ automatically.
+# Cargo 不会自动发现 series/<系列>/ 下的测试文件,全部目标显式登记。
 [[test]]
-name = "native_projection_storm"
-path = "tests/native_projection_storm.rs"
+name = "db_integration"
+path = "series/CORE/db_integration.rs"
 
 [[test]]
-name = "projection_owned_http"
-path = "tests/projection_owned_http.rs"
+name = "identity_integration"
+path = "series/CORE/identity_integration.rs"
+
+[[test]]
+name = "monitor_integration"
+path = "series/CORE/monitor_integration.rs"
+
+[[test]]
+name = "trustgraph_integration"
+path = "series/CORE/trustgraph_integration.rs"
+
+[[test]]
+name = "gateway_contract_tests"
+path = "series/E1/gateway_contract_tests.rs"
+
+[[test]]
+name = "audit_replay_integration"
+path = "series/E3/audit_replay_integration.rs"
+
+[[test]]
+name = "org_scope_projector_integration"
+path = "series/E3/org_scope_projector_integration.rs"
 
 [[test]]
 name = "premise_hub_invalidation"
-path = "tests/security/premise_hub_invalidation.rs"
+path = "series/E4/premise_hub_invalidation.rs"
 
 [[test]]
 name = "premise_identity_mapping"
-path = "tests/security/premise_identity_mapping.rs"
+path = "series/E4/premise_identity_mapping.rs"
 
 [[test]]
 name = "premise_redis_free_composite"
-path = "tests/security/premise_redis_free_composite.rs"
+path = "series/E4/premise_redis_free_composite.rs"
 
 [[test]]
 name = "premise_single_writer_lease"
-path = "tests/security/premise_single_writer_lease.rs"
+path = "series/E4/premise_single_writer_lease.rs"
+
+[[test]]
+name = "quarantine_integration"
+path = "series/E4/quarantine_integration.rs"
+
+[[test]]
+name = "integration_identity_mapping"
+path = "series/M5/integration_identity_mapping.rs"
+
+[[test]]
+name = "audit_tenant_tests"
+path = "series/MT-E1/audit_tenant_tests.rs"
+
+[[test]]
+name = "mt_extreme_isolation"
+path = "series/MT-E1/mt_extreme_isolation.rs"
+
+[[test]]
+name = "multi_tenant_isolation"
+path = "series/MT-E1/multi_tenant_isolation.rs"
+
+[[test]]
+name = "org_scope_integration"
+path = "series/MT-E1/org_scope_integration.rs"
+
+[[test]]
+name = "tenant_isolation_tests"
+path = "series/MT-E1/tenant_isolation_tests.rs"
+
+[[test]]
+name = "private_security_boundary_tests"
+path = "series/MT-E1/private_security_boundary_tests.rs"
+
+[[test]]
+name = "mt_extreme_churn"
+path = "series/MT-E3/mt_extreme_churn.rs"
+
+[[test]]
+name = "mt_extreme_cross_storm"
+path = "series/MT-E4/mt_extreme_cross_storm.rs"
+
+[[test]]
+name = "mt_extreme_capacity"
+path = "series/MT-E5/mt_extreme_capacity.rs"
+
+[[test]]
+name = "mt_extreme_failclosed"
+path = "series/MT-E6/mt_extreme_failclosed.rs"
+
+[[test]]
+name = "authorization_projection_integration"
+path = "series/RQ3/authorization_projection_integration.rs"
+
+[[test]]
+name = "native_projection_lifecycle"
+path = "series/RQ3/native_projection_lifecycle.rs"
+
+[[test]]
+name = "projection_owned_http"
+path = "series/RQ3/projection_owned_http.rs"
+
+[[test]]
+name = "projection_owned_integration"
+path = "series/RQ3/projection_owned_integration.rs"
+
+[[test]]
+name = "local_message_stress"
+path = "series/RQ4/local_message_stress.rs"
+
+[[test]]
+name = "native_projection_storm"
+path = "series/RQ4/native_projection_storm.rs"
+
+[[test]]
+name = "partition_lease_integration"
+path = "series/RQ4/partition_lease_integration.rs"
+
+[[test]]
+name = "authorization_compiler_alloc"
+path = "series/PERF/authorization_compiler_alloc.rs"
+
+[[test]]
+name = "evidence_cache_redis_integration"
+path = "series/COMPAT/evidence_cache_redis_integration.rs"
+required-features = ["redis-compat"]
+
+[[test]]
+name = "oracle_tests"
+path = "series/COMPAT/oracle_tests.rs"

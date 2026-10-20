@@ -1,8 +1,8 @@
 # rust-s15：Rust 三节点分布式一致性（S1–S15）+ 分布式性能
 
-本目录公开 final9/S15 的可执行 harness 源码和安全边界。源仓库的历史 `REPORT*.md`、JSON/日志结果和 frozen evidence archive 未复制；本目录代码只能在显式提供的受保护三节点环境中运行，不能把源仓库历史结果当作当前仓库验证。
+本目录公开 final9/S15 的可执行 harness 源码、历史报告/结果副本和安全边界。历史资产继承自私有仓库 S15 提交 `b38aaa7680f6c80e6841d05a17e08cd0e50627b1`，节点地址已脱敏；历史结果只用于回溯场景与测量方法，不代表当前仓库代码或当前部署的验证结果。
 
-**入口：** `run_cs_evidence.py`（可执行编排器）。源仓库的历史 `REPORT*.md`、JSON/日志结果和 frozen evidence archive 未复制；本目录代码只能在显式提供的受保护三节点环境中运行，不能把源仓库历史结果当作当前仓库验证。
+**入口：** `run_cs_evidence.py`（可执行编排器）。本目录代码只能在显式提供的受保护三节点环境中运行，不能把源仓库历史结果当作当前仓库验证。
 
 ## 当前架构边界
 
@@ -28,11 +28,12 @@ RQ2-D 仍是结构性 N/A；局部 `--skip`、单机 CPU 数据和源码存在�
 | `s15_perf.py` | 三节点性能套件（P1 评估基线 / P2 传播收敛 ε / P3 并发写风暴 / P3.5 有界排水 / P4 读扩展） |
 | `deploy_dist.sh` | fresh-only 的 run 专属三节点部署脚本（schema 克隆→专用 Redis→独立 Rabbit vhost→配置→分发→启动→就绪→run_config.json）；目标目录/DB/容器/vhost/端口已存在即失败，不覆盖旧 run |
 | `seed_f4rust.sql` | e2e 种子（namespace e2e_f4rust_*，ID 段 9011–9091） |
-| `s15_result.json` / `s15_run.log` | 历史一致性结果名；未复制，不代表当前结果 |
-| `s6_retry.json` / `s6_retry.log` | 历史 S6 重跑证据名；未复制 |
-| `perf_result.json` / `perf_run.log` | 历史 P1-P4 性能结果名；未复制 |
-| `arbiter_contract_tests.log` | 历史契约日志名；未复制，不以其旧通过数证明当前运行 |
+| `REPORT.md` / `REPORT_20260901.md` / `RQ345_REPORT_20260903.md` / `PERF_20260901.md` | 历史报告；已继承，仅作场景与测量方法参考 |
+| `s15_result*.json` / `s6_retry.json` / `perf_result*.json` / `rq*.json` | 历史结果；已继承，不代表当前代码/部署结果 |
+| `archives/astral-final9-evidence-20260906.redacted.tar.gz` | 历史证据归档脱敏副本；原始 SHA-256 与脱敏规则见 [`archives/README.md`](../archives/README.md) |
+| `arbiter_contract_tests.log` | 源快照未包含该日志；不得以旧通过数证明当前运行 |
 | `FIXPLAN.md` | 产品级问题（F5/F6/arbiter 门/head 对齐/bind 事件缺口）的具体修复方案 |
+| `s15_validation.py` / `test_s15_validation.py` | 当前仓库补充的运行范围/覆盖校验；不是源仓库历史资产 |
 
 ## 运行方式（node-b）
 
@@ -46,7 +47,7 @@ RQ2-D 仍是结构性 N/A；局部 `--skip`、单机 CPU 数据和源码存在�
 - `--run-config` 与零秘密的 `--setup-provenance`；
 - run ID、production/source/dirty patch/bootstrap/engine、10-file harness、routing source、TOCTOU script、382-file integration tree 与 OPA image 的期望 identity；
 - engine comparison 的 5 次重复和可达 OPA；
-- canonical `cargo test --locked -p astral-db --test authorization_projection_integration --release -- --ignored --test-threads=1`、`--integration-cwd E:\\OfficialVersion\\AstralLight-Next` 与环境变量名称 allowlist；
+- canonical `cargo test --locked -p testsuite --test authorization_projection_integration --release -- --ignored --test-threads=1`、`--integration-cwd E:\\OfficialVersion\\AstralLight-Next` 与环境变量名称 allowlist；
 - `--rounds 3` 或更高。
 
 默认 fail-fast。只有11步全部 `PASS`，没有 `FAIL`、`UNKNOWN`、`BLOCKED`、`SKIP`，且

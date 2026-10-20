@@ -1,6 +1,6 @@
 //! Multi-tenant benchmarks for strict published-evidence authorization.
 
-#[path = "../tests/support/published.rs"]
+#[path = "../../tests-suite/series/MT-E1/support/published.rs"]
 mod published;
 
 use std::sync::Arc;

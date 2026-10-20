@@ -13,7 +13,7 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 policy-engine = { path = "../../policy-engine" }
 astral-types = { path = "../../astral-types" }
-casbin = { version = "2", default-features = false, features = ["runtime-tokio"] }
+casbin = { version = "2", default-features = false, features = ["runtime-tokio", "cached"] }
 cedar-policy = "4"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

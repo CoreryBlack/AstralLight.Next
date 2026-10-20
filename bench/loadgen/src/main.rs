@@ -249,7 +249,7 @@ struct Stats {
     http_fail: AtomicU64,
     transport_err: AtomicU64,
     codes: [AtomicU64; 600],
-    lat_us: Mutex<Vec<u64>>,
+    lat_ns: Mutex<Vec<u64>>,
 }
 
 impl Stats {
@@ -259,12 +259,12 @@ impl Stats {
             http_fail: AtomicU64::new(0),
             transport_err: AtomicU64::new(0),
             codes: std::array::from_fn(|_| AtomicU64::new(0)),
-            lat_us: Mutex::new(Vec::new()),
+            lat_ns: Mutex::new(Vec::new()),
         }
     }
 
-    fn record_http(&self, code: u16, us: u64) {
-        self.lat_us.lock().unwrap().push(us);
+    fn record_http(&self, code: u16, ns: u64) {
+        self.lat_ns.lock().unwrap().push(ns);
         self.codes[(code as usize).min(599)].fetch_add(1, Ordering::Relaxed);
         if (200..300).contains(&code) {
             self.ok.fetch_add(1, Ordering::Relaxed);
@@ -273,8 +273,8 @@ impl Stats {
         }
     }
 
-    fn record_transport_err(&self, us: u64) {
-        self.lat_us.lock().unwrap().push(us);
+    fn record_transport_err(&self, ns: u64) {
+        self.lat_ns.lock().unwrap().push(ns);
         self.transport_err.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -333,11 +333,11 @@ async fn one_request(ctx: &Ctx, stats: &Stats) {
         Ok(resp) => {
             let code = resp.status().as_u16();
             match resp.bytes().await {
-                Ok(_) => stats.record_http(code, t0.elapsed().as_micros() as u64),
-                Err(_) => stats.record_transport_err(t0.elapsed().as_micros() as u64),
+                Ok(_) => stats.record_http(code, t0.elapsed().as_nanos() as u64),
+                Err(_) => stats.record_transport_err(t0.elapsed().as_nanos() as u64),
             }
         }
-        Err(_) => stats.record_transport_err(t0.elapsed().as_micros() as u64),
+        Err(_) => stats.record_transport_err(t0.elapsed().as_nanos() as u64),
     }
 }
 
@@ -408,7 +408,7 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 }
 
 fn report(args: &Args, wall: Duration, stats: &Stats) {
-    let mut lat = stats.lat_us.lock().unwrap().clone();
+    let mut lat = stats.lat_ns.lock().unwrap().clone();
     lat.sort_unstable();
     let ok = stats.ok.load(Ordering::Relaxed);
     let http_fail = stats.http_fail.load(Ordering::Relaxed);
@@ -439,13 +439,13 @@ fn report(args: &Args, wall: Duration, stats: &Stats) {
     if args.json {
         println!(
             "{{\"concurrency\":{},\"rate\":{},\"duration_s\":{:.3},\"ok\":{},\"http_fail\":{},\"transport_err\":{},\"failures\":{},\"qps\":{:.1},\
-             \"mean_us\":{},\"p50_us\":{},\"p90_us\":{},\"p99_us\":{},\"p999_us\":{},\"max_us\":{},\"codes\":{{{}}}}}",
+             \"mean_ns\":{},\"p50_ns\":{},\"p90_ns\":{},\"p99_ns\":{},\"p999_ns\":{},\"max_ns\":{},\"codes\":{{{}}}}}",
             args.concurrency, args.rate, wall.as_secs_f64(), ok, http_fail, transport_err, failures, qps,
             mean, p50, p90, p99, p999, max, codes
         );
     } else {
         println!(
-            "并发={} rate={} 墙钟={:.2}s | ok={} http_fail={} transport_err={} failures={} QPS={:.1}\n延迟(µs): mean={} p50={} p90={} p99={} p999={} max={}\n状态码: {}",
+            "并发={} rate={} 墙钟={:.2}s | ok={} http_fail={} transport_err={} failures={} QPS={:.1}\n延迟(ns): mean={} p50={} p90={} p99={} p999={} max={}\n状态码: {}",
             args.concurrency, args.rate, wall.as_secs_f64(), ok, http_fail, transport_err, failures, qps,
             mean, p50, p90, p99, p999, max,
             if codes.is_empty() { "-" } else { &codes }

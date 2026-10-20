@@ -122,7 +122,7 @@ class SelectionTests(unittest.TestCase):
                 self.assertIn("--ignored", item["argv"])
                 self.assertEqual(item["expected_tests"], 1)
         self.assertEqual(suites["native-projection-storm"]["projection_execution_mode"], "legacy-hybrid")
-        self.assertIn("tests-suite/tests/projection_owned_http_support/mod.rs", suites["projection-owned-http"]["sources"])
+        self.assertIn("tests-suite/series/RQ3/projection_owned_http_support/mod.rs", suites["projection-owned-http"]["sources"])
         self.assertEqual(suites["projection-owner-model-contracts"]["scope"], "offline-model")
         self.assertEqual(suites["projection-owner-model-contracts"]["test_services"], [])
 

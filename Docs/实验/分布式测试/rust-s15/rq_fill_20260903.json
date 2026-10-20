@@ -1,0 +1,142 @@
+{
+ "cs": {
+  "CS1_revoke_fence_blocks_allow": {
+   "ok": true,
+   "detail": "base_allow=True pending_no_allow=True ready_deny=True fence=[['5']]"
+  },
+  "CS2_source_oracle_matches_projected": {
+   "ok": true,
+   "detail": "oracle=ALLOW(static subset) nodes_agree=True"
+  },
+  "CS3_new_grant_projection_gate": {
+   "ok": true,
+   "detail": "early_not_allow=True published=True"
+  },
+  "CS4_overlay_deny_precedence": {
+   "ok": false,
+   "detail": "base_allow=True overlay_deny=False"
+  },
+  "CS5_generation_supersession": {
+   "ok": true,
+   "detail": "rounds=3 final=ALLOW deltas=6 all_ok=True"
+  },
+  "CS6_unbind_fence_propagates": {
+   "ok": true,
+   "detail": "base_allow=True unbind_deny=True fence=[['15']]"
+  },
+  "CS7_resource_type_isolation": {
+   "ok": true,
+   "detail": "learn=ALLOW monitor=DENY chat=DEFAULT_DENY \u00d73\uff08\u7c7b\u578b\u7ea7\u7c92\u5ea6\u6620\u5c04\uff09"
+  },
+  "CS8_write_alias_semantics": {
+   "ok": false,
+   "detail": "{'create': False, 'update': False, 'delete': False, 'read': True}"
+  }
+ },
+ "rq2": {
+  "K_rule_count_gradient": [
+   {
+    "entries": 1,
+    "n": 50,
+    "p50_ms": 16.73,
+    "p95_ms": 17.19,
+    "mean_ms": 16.81
+   },
+   {
+    "entries": 10,
+    "n": 50,
+    "p50_ms": 16.98,
+    "p95_ms": 19.34,
+    "mean_ms": 17.16
+   },
+   {
+    "entries": 50,
+    "n": 50,
+    "p50_ms": 18.2,
+    "p95_ms": 20.78,
+    "mean_ms": 18.47
+   },
+   {
+    "entries": 100,
+    "n": 50,
+    "p50_ms": 19.55,
+    "p95_ms": 19.99,
+    "mean_ms": 19.61
+   },
+   {
+    "entries": 200,
+    "n": 50,
+    "p50_ms": 21.86,
+    "p95_ms": 22.79,
+    "mean_ms": 21.84
+   }
+  ],
+  "I_reference_count_gradient": [
+   {
+    "references": 1,
+    "n": 50,
+    "p50_ms": 2.22,
+    "p95_ms": 3.98,
+    "mean_ms": 2.45
+   },
+   {
+    "references": 2,
+    "n": 50,
+    "p50_ms": 2.82,
+    "p95_ms": 4.42,
+    "mean_ms": 3.0
+   },
+   {
+    "references": 4,
+    "n": 50,
+    "p50_ms": 17.37,
+    "p95_ms": 17.98,
+    "mean_ms": 17.36
+   },
+   {
+    "references": 8,
+    "n": 50,
+    "p50_ms": 17.72,
+    "p95_ms": 18.4,
+    "mean_ms": 17.75
+   }
+  ],
+  "D_conflict_density_gradient": [
+   {
+    "overlay_deny_sets": 0,
+    "n": 50,
+    "p50_ms": 17.86,
+    "p95_ms": 18.64,
+    "mean_ms": 17.81
+   },
+   {
+    "overlay_deny_sets": 2,
+    "n": 50,
+    "p50_ms": 17.77,
+    "p95_ms": 18.45,
+    "mean_ms": 17.75
+   },
+   {
+    "overlay_deny_sets": 4,
+    "n": 50,
+    "p50_ms": 17.66,
+    "p95_ms": 18.23,
+    "mean_ms": 17.78
+   }
+  ]
+ },
+ "rq1": {
+  "storage_bytes_by_table": {
+   "authorization_delta_event": 901120,
+   "authorization_grant_revision": 770048,
+   "authorization_impact_plan": 393216,
+   "authorization_projection_current": 114688,
+   "authorization_projection_manifest": 622592,
+   "authorization_projection_segment": 25870336
+  },
+  "max_published_generation": 400,
+  "active_grant_revisions": 219
+ },
+ "rq3": {},
+ "rq4": {}
+}

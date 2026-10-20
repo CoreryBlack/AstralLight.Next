@@ -1,0 +1,856 @@
+{
+ "results": [
+  {
+   "name": "PRE_alive_node-a",
+   "expected": "200",
+   "verdict": "PASS",
+   "detail": "{\"success\":true,\"code\":200,\"message\":\"操作成功\",\"data\":{\"items\":[{\"id\":9071,\"name\":\""
+  },
+  {
+   "name": "PRE_alive_node-b",
+   "expected": "200",
+   "verdict": "PASS",
+   "detail": "{\"success\":true,\"code\":200,\"message\":\"操作成功\",\"data\":{\"items\":[{\"id\":9071,\"name\":\""
+  },
+  {
+   "name": "PRE_alive_node-c",
+   "expected": "200",
+   "verdict": "PASS",
+   "detail": "{\"success\":true,\"code\":200,\"message\":\"操作成功\",\"data\":{\"items\":[{\"id\":9071,\"name\":\""
+  },
+  {
+   "name": "PRE_pidfile_node-a",
+   "expected": "process alive",
+   "verdict": "PASS",
+   "detail": "pid=416445"
+  },
+  {
+   "name": "PRE_pidfile_node-b",
+   "expected": "process alive",
+   "verdict": "PASS",
+   "detail": "pid=3109816"
+  },
+  {
+   "name": "PRE_pidfile_node-c",
+   "expected": "process alive",
+   "verdict": "PASS",
+   "detail": "pid=2133682"
+  },
+  {
+   "name": "PRE_bootstrap_evidence",
+   "expected": "projection_current >= 2",
+   "verdict": "PASS",
+   "detail": ""
+  },
+  {
+   "name": "PRE_redis",
+   "expected": "PING",
+   "verdict": "PASS",
+   "detail": ""
+  },
+  {
+   "name": "PRE_baseline_deny",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "final="
+  },
+  {
+   "name": "S1_both_concurrent_writes_200",
+   "expected": "2x200+entryIds",
+   "verdict": "PASS",
+   "detail": "[('node-b', 200, 7998078326970544), ('node-a', 200, 7998078326970545)][]"
+  },
+  {
+   "name": "S1_all_nodes_allow_after_projection",
+   "expected": "3xALLOW",
+   "verdict": "PASS",
+   "detail": "bind=200 wait=149ms final="
+  },
+  {
+   "name": "S1_unique_head_contiguous_generations",
+   "expected": "2 deltas SUCCEEDED, outbox contiguous, terminal=1",
+   "verdict": "FAIL",
+   "detail": "deltas={'n': 2, 'all_ok': True, 'maxv': 1, 'gens': [1, 1]} head={'src': 3, 'fence': 0} gens=[1, 2, 3]"
+  },
+  {
+   "name": "S2_revoke_commit_200",
+   "expected": "200",
+   "verdict": "PASS",
+   "detail": "{\"success\":true,\"code\":200,\"message\":\"操作成功\",\"data\":null,\"timestamp\":1788397758}"
+  },
+  {
+   "name": "S2_no_stale_allow_window",
+   "expected": "unsafeAllow=0",
+   "verdict": "PASS",
+   "detail": "eval=300 allow=0 pending=0 deny=300"
+  },
+  {
+   "name": "S2_all_nodes_deny",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "windowMs=8125 final={'node-a': False, 'node-b': False, 'node-c': False}"
+  },
+  {
+   "name": "S2_deltas_succeeded_after_projection",
+   "expected": "add+delete deltas SUCCEEDED",
+   "verdict": "PASS",
+   "detail": "deltas={'n': 2, 'all_ok': True, 'maxv': 2, 'gens': [1, 2]} head={'src': 3, 'fence': 1}"
+  },
+  {
+   "name": "S3_stale_replay_structurally_rejected",
+   "expected": "INSERT rejected by uk_ade_target_version",
+   "verdict": "PASS",
+   "detail": "rejected=True"
+  },
+  {
+   "name": "S3_stale_replay_no_resurrect",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "final={'node-a': False, 'node-b': False, 'node-c': False}"
+  },
+  {
+   "name": "S3_pointer_unchanged_by_stale_replay",
+   "expected": "pointer gen not regressed",
+   "verdict": "PASS",
+   "detail": "{'gen': 2, 'status': 'READY', 'fence': 3, 'cas': 1} -> {'gen': 2, 'status': 'READY', 'fence': 3, 'cas': 1}"
+  },
+  {
+   "name": "S3_replayed_row_absent",
+   "expected": "no replay row entered the queue",
+   "verdict": "PASS",
+   "detail": "rows=0"
+  },
+  {
+   "name": "S4_unbind_200",
+   "expected": "200",
+   "verdict": "PASS",
+   "detail": "{\"success\":true,\"code\":200,\"message\":\"操作成功\",\"data\":null,\"timestamp\":1788397775}"
+  },
+  {
+   "name": "S4_unbind_propagates_deny",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "final={'node-a': False, 'node-b': False, 'node-c': False}"
+  },
+  {
+   "name": "S4_revoke_fence_advanced",
+   "expected": "fence increases",
+   "verdict": "PASS",
+   "detail": "fence 0 -> 1"
+  },
+  {
+   "name": "S4_rebind_restores_allow",
+   "expected": "3xALLOW",
+   "verdict": "PASS",
+   "detail": "final={'node-a': True, 'node-b': True, 'node-c': True}"
+  },
+  {
+   "name": "S5_lease_claimed",
+   "expected": "PENDING+lease stranded by SIGSTOP",
+   "verdict": "FAIL",
+   "detail": "stranded=0 pending=0 total=8"
+  },
+  {
+   "name": "S5_reclaimed_by_other_node",
+   "expected": "all rows PROCESSED",
+   "verdict": "PASS",
+   "detail": "gens=[1, 2, 3, 4, 5, 6, 7, 8]"
+  },
+  {
+   "name": "S5_single_terminal_transition",
+   "expected": "terminal==1 per row",
+   "verdict": "PASS",
+   "detail": "terminal=['1', '1', '1', '1', '1', '1', '1', '1']"
+  },
+  {
+   "name": "S5_obsolete_owner_no_second_terminal",
+   "expected": "terminal unchanged after SIGCONT",
+   "verdict": "PASS",
+   "detail": "gens=[1, 2, 3, 4, 5, 6, 7, 8] terminal=['1', '1', '1', '1', '1', '1', '1', '1']"
+  },
+  {
+   "name": "S5_outbox_all_terminal_after_reclaim",
+   "expected": "8 rows all PROCESSED",
+   "verdict": "PASS",
+   "detail": "head={'src': 8, 'fence': 0} rows=8"
+  },
+  {
+   "name": "S6_alternating_convergence",
+   "expected": "10 mutations, 3-node each",
+   "verdict": "PASS",
+   "detail": ""
+  },
+  {
+   "name": "S6_generation_strictly_increasing",
+   "expected": "monotonic",
+   "verdict": "PASS",
+   "detail": "gens=[2, 4, 6, 8, 10]"
+  },
+  {
+   "name": "S6_outbox_integrity",
+   "expected": "contiguous+terminal+deltas SUCCEEDED",
+   "verdict": "PASS",
+   "detail": "gens=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] deltas={'n': 10, 'all_ok': True, 'maxv': 2, 'gens': [1, 1, 1, 1, 1, 2, 2, 2, 2, 2]} head={'src': 11, 'fence': 5}"
+  },
+  {
+   "name": "S7_stale_residue_not_served",
+   "expected": "3xDENY despite poisoned L2 residue",
+   "verdict": "PASS",
+   "detail": "final= residue(deleted=False, epoch_changed=False)"
+  },
+  {
+   "name": "S8_abac_attribute_change",
+   "expected": "I6",
+   "verdict": "N/A",
+   "detail": "Rust rule_set_entry 契约无属性条件列；ABAC 场景在 Rust 侧不适用（如实标注，不进入分母）"
+  },
+  {
+   "name": "S9_storm_no_stale_allow",
+   "expected": "unsafeAllow=0 post-delete",
+   "verdict": "PASS",
+   "detail": "during=75/75 ALLOW samples; post-delete ALLOW=0"
+  },
+  {
+   "name": "S9_storm_converge_deny",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "wait=110ms"
+  },
+  {
+   "name": "S9_generation_no_loss",
+   "expected": "src delta==13, 12 deltas SUCCEEDED, outbox terminal",
+   "verdict": "PASS",
+   "detail": "delta=13 deltas={'n': 12, 'all_ok': True, 'maxv': 2, 'gens': [1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2]} gens=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]"
+  },
+  {
+   "name": "S10_lease_observed",
+   "expected": "active lease stranded by SIGSTOP",
+   "verdict": "FAIL",
+   "detail": "stranded=0 total=9"
+  },
+  {
+   "name": "S10_owner_completes_unique_terminal",
+   "expected": "all PROCESSED terminal==1",
+   "verdict": "PASS",
+   "detail": "gens=[1, 2, 3, 4, 5, 6, 7, 8, 9] terminal=['1', '1', '1', '1', '1', '1', '1', '1', '1']"
+  },
+  {
+   "name": "S10_obsolete_owner_no_duplicate",
+   "expected": "terminal still 1 per row",
+   "verdict": "PASS",
+   "detail": "gens=[1, 2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+   "name": "S11_grant_evidence_self_consistent",
+   "expected": "3x published:ALLOW same matchedRule",
+   "verdict": "PASS",
+   "detail": "ev={'node-a': (True, 'published:learn_subject:*:read:cardId=90'), 'node-b': (True, 'published:learn_subject:*:read:cardId=90'), 'node-c': (True, 'published:learn_subject:*:read:cardId=90')} matched={'baeb4ab6-a98d-5ea6-be55-8a5773a9d29e'}"
+  },
+  {
+   "name": "S11_revoke_evidence_self_consistent",
+   "expected": "3x published:DENY same reason",
+   "verdict": "PASS",
+   "detail": "ev={'node-a': (False, 'published:no-matching-grant:learn_subject:*:read'), 'node-b': (False, 'published:no-matching-grant:learn_subject:*:read'), 'node-c': (False, 'published:no-matching-grant:learn_subject:*:read')}"
+  },
+  {
+   "name": "S12_arbiter_r1_fence_deny",
+   "expected": "DENY + R1_FENCE_DENY",
+   "verdict": "N/A",
+   "detail": "remote gate structurally blocks POST /arbiter (monitor:create unregistered, 403 DEFAULT_DENY)；contract 证据见 policy-engine::arbiter::tests::s12_* 同源快照 cargo 运行"
+  },
+  {
+   "name": "S13_arbiter_unprovable_defers",
+   "expected": "DEFER + EVIDENCE_MISSING/R4_UNPROVABLE",
+   "verdict": "N/A",
+   "detail": "remote gate structurally blocks POST /arbiter (同 S12)；contract 证据见 policy-engine::arbiter::tests::s13_* 同源快照 cargo 运行"
+  },
+  {
+   "name": "S13_arbiter_empty_evidence_rejected",
+   "expected": "4xx or DEFER",
+   "verdict": "PASS",
+   "detail": "http=403 body=None"
+  },
+  {
+   "name": "S14_process_restarted",
+   "expected": "new pid",
+   "verdict": "PASS",
+   "detail": "old=2137014 new=2139035 out=started c pid=2139035 port=9107"
+  },
+  {
+   "name": "S14_no_stale_allow_during_down",
+   "expected": "allowDuringDown=0",
+   "verdict": "PASS",
+   "detail": "samples=8 allow=0"
+  },
+  {
+   "name": "S14_node_c_back_online",
+   "expected": "http 200",
+   "verdict": "FAIL",
+   "detail": ""
+  },
+  {
+   "name": "S14_all_nodes_deny_after_restart",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "final={'node-a': False, 'node-b': False, 'node-c': False}"
+  },
+  {
+   "name": "S15_no_stale_allow_during_redis_down",
+   "expected": "allowDuringDown=0",
+   "verdict": "PASS",
+   "detail": "samples=10 allow=0 pending=0 deny=10"
+  },
+  {
+   "name": "S15_no_stale_allow_after_restart",
+   "expected": "allowAfterRestart=0",
+   "verdict": "PASS",
+   "detail": "allow=0"
+  },
+  {
+   "name": "S15_all_nodes_deny_final",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "final={'node-a': False, 'node-b': False, 'node-c': False}"
+  },
+  {
+   "name": "S1_both_concurrent_writes_200",
+   "expected": "2x200+entryIds",
+   "verdict": "PASS",
+   "detail": "[('node-b', 200, 7998078326970583), ('node-a', 200, 7998078326970584)][]"
+  },
+  {
+   "name": "S1_all_nodes_allow_after_projection",
+   "expected": "3xALLOW",
+   "verdict": "PASS",
+   "detail": "bind=200 wait=205ms final="
+  },
+  {
+   "name": "S1_unique_head_contiguous_generations",
+   "expected": "2 deltas SUCCEEDED, outbox contiguous, terminal=1",
+   "verdict": "PASS",
+   "detail": "deltas={'n': 2, 'all_ok': True, 'maxv': 1, 'gens': [1, 1]} head={'src': 3, 'fence': 0} gens=[1, 2, 3]"
+  },
+  {
+   "name": "S2_revoke_commit_200",
+   "expected": "200",
+   "verdict": "PASS",
+   "detail": "{\"success\":true,\"code\":200,\"message\":\"操作成功\",\"data\":null,\"timestamp\":1788398341}"
+  },
+  {
+   "name": "S2_no_stale_allow_window",
+   "expected": "unsafeAllow=0",
+   "verdict": "PASS",
+   "detail": "eval=296 allow=0 pending=0 deny=296"
+  },
+  {
+   "name": "S2_all_nodes_deny",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "windowMs=8149 final={'node-a': False, 'node-b': False, 'node-c': False}"
+  },
+  {
+   "name": "S2_deltas_succeeded_after_projection",
+   "expected": "add+delete deltas SUCCEEDED",
+   "verdict": "PASS",
+   "detail": "deltas={'n': 2, 'all_ok': True, 'maxv': 2, 'gens': [1, 2]} head={'src': 3, 'fence': 1}"
+  },
+  {
+   "name": "S3_stale_replay_structurally_rejected",
+   "expected": "INSERT rejected by uk_ade_target_version",
+   "verdict": "PASS",
+   "detail": "rejected=True"
+  },
+  {
+   "name": "S3_stale_replay_no_resurrect",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "final={'node-a': False, 'node-b': False, 'node-c': False}"
+  },
+  {
+   "name": "S3_pointer_unchanged_by_stale_replay",
+   "expected": "pointer gen not regressed",
+   "verdict": "PASS",
+   "detail": "{'gen': 2, 'status': 'READY', 'fence': 24, 'cas': 1} -> {'gen': 2, 'status': 'READY', 'fence': 24, 'cas': 1}"
+  },
+  {
+   "name": "S3_replayed_row_absent",
+   "expected": "no replay row entered the queue",
+   "verdict": "PASS",
+   "detail": "rows=0"
+  },
+  {
+   "name": "S4_unbind_200",
+   "expected": "200",
+   "verdict": "PASS",
+   "detail": "{\"success\":true,\"code\":200,\"message\":\"操作成功\",\"data\":null,\"timestamp\":1788398358}"
+  },
+  {
+   "name": "S4_unbind_propagates_deny",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "final={'node-a': False, 'node-b': False, 'node-c': False}"
+  },
+  {
+   "name": "S4_revoke_fence_advanced",
+   "expected": "fence increases",
+   "verdict": "PASS",
+   "detail": "fence 0 -> 1"
+  },
+  {
+   "name": "S4_rebind_restores_allow",
+   "expected": "3xALLOW",
+   "verdict": "PASS",
+   "detail": "final={'node-a': True, 'node-b': True, 'node-c': True}"
+  },
+  {
+   "name": "S5_lease_claimed",
+   "expected": "PENDING+lease stranded by SIGSTOP",
+   "verdict": "FAIL",
+   "detail": "stranded=0 pending=0 total=8"
+  },
+  {
+   "name": "S5_reclaimed_by_other_node",
+   "expected": "all rows PROCESSED",
+   "verdict": "PASS",
+   "detail": "gens=[1, 2, 3, 4, 5, 6, 7, 8]"
+  },
+  {
+   "name": "S5_single_terminal_transition",
+   "expected": "terminal==1 per row",
+   "verdict": "PASS",
+   "detail": "terminal=['1', '1', '1', '1', '1', '1', '1', '1']"
+  },
+  {
+   "name": "S5_obsolete_owner_no_second_terminal",
+   "expected": "terminal unchanged after SIGCONT",
+   "verdict": "PASS",
+   "detail": "gens=[1, 2, 3, 4, 5, 6, 7, 8] terminal=['1', '1', '1', '1', '1', '1', '1', '1']"
+  },
+  {
+   "name": "S5_outbox_all_terminal_after_reclaim",
+   "expected": "8 rows all PROCESSED",
+   "verdict": "PASS",
+   "detail": "head={'src': 8, 'fence': 0} rows=8"
+  },
+  {
+   "name": "S6_alternating_convergence",
+   "expected": "10 mutations, 3-node each",
+   "verdict": "PASS",
+   "detail": ""
+  },
+  {
+   "name": "S6_generation_strictly_increasing",
+   "expected": "monotonic",
+   "verdict": "PASS",
+   "detail": "gens=[2, 4, 6, 8, 10]"
+  },
+  {
+   "name": "S6_outbox_integrity",
+   "expected": "contiguous+terminal+deltas SUCCEEDED",
+   "verdict": "PASS",
+   "detail": "gens=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] deltas={'n': 10, 'all_ok': True, 'maxv': 2, 'gens': [1, 1, 1, 1, 1, 2, 2, 2, 2, 2]} head={'src': 11, 'fence': 5}"
+  },
+  {
+   "name": "S7_stale_residue_not_served",
+   "expected": "3xDENY despite poisoned L2 residue",
+   "verdict": "PASS",
+   "detail": "final= residue(deleted=False, epoch_changed=False)"
+  },
+  {
+   "name": "S8_abac_attribute_change",
+   "expected": "I6",
+   "verdict": "N/A",
+   "detail": "Rust rule_set_entry 契约无属性条件列；ABAC 场景在 Rust 侧不适用（如实标注，不进入分母）"
+  },
+  {
+   "name": "S9_storm_no_stale_allow",
+   "expected": "unsafeAllow=0 post-delete",
+   "verdict": "PASS",
+   "detail": "during=71/71 ALLOW samples; post-delete ALLOW=0"
+  },
+  {
+   "name": "S9_storm_converge_deny",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "wait=134ms"
+  },
+  {
+   "name": "S9_generation_no_loss",
+   "expected": "src delta==13, 12 deltas SUCCEEDED, outbox terminal",
+   "verdict": "PASS",
+   "detail": "delta=13 deltas={'n': 12, 'all_ok': True, 'maxv': 2, 'gens': [1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2]} gens=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]"
+  },
+  {
+   "name": "S10_exception",
+   "expected": "-",
+   "verdict": "FAIL",
+   "detail": "e 1105, in run_round\n    fn()\n  File \"/home/xg/astral-rust3n-20260901/rust-s15/s15_coordinator.py\", line 742, in S10\n    node_stop(\"node-b\")\n  File \"/home/xg/astral-rust3n-20260901/rust-s15/s15_coordinator.py\", line 116, in node_stop\n    assert alive and pid, \"node_stop: %s not alive (pidfile=%s)\" % (node, pid)\n           ^^^^^^^^^^^^^\nAssertionError: node_stop: node-b not alive (pidfile=3119234)\n"
+  },
+  {
+   "name": "S11_grant_evidence_self_consistent",
+   "expected": "3x published:ALLOW same matchedRule",
+   "verdict": "PASS",
+   "detail": "ev={'node-a': (True, 'published:learn_subject:*:read:cardId=90'), 'node-b': (True, 'published:learn_subject:*:read:cardId=90'), 'node-c': (True, 'published:learn_subject:*:read:cardId=90')} matched={'54970a23-5561-5b92-927d-9ae571e03208'}"
+  },
+  {
+   "name": "S11_revoke_evidence_self_consistent",
+   "expected": "3x published:DENY same reason",
+   "verdict": "PASS",
+   "detail": "ev={'node-a': (False, 'published:no-matching-grant:learn_subject:*:read'), 'node-b': (False, 'published:no-matching-grant:learn_subject:*:read'), 'node-c': (False, 'published:no-matching-grant:learn_subject:*:read')}"
+  },
+  {
+   "name": "S12_arbiter_r1_fence_deny",
+   "expected": "DENY + R1_FENCE_DENY",
+   "verdict": "N/A",
+   "detail": "remote gate structurally blocks POST /arbiter (monitor:create unregistered, 403 DEFAULT_DENY)；contract 证据见 policy-engine::arbiter::tests::s12_* 同源快照 cargo 运行"
+  },
+  {
+   "name": "S13_arbiter_unprovable_defers",
+   "expected": "DEFER + EVIDENCE_MISSING/R4_UNPROVABLE",
+   "verdict": "N/A",
+   "detail": "remote gate structurally blocks POST /arbiter (同 S12)；contract 证据见 policy-engine::arbiter::tests::s13_* 同源快照 cargo 运行"
+  },
+  {
+   "name": "S13_arbiter_empty_evidence_rejected",
+   "expected": "4xx or DEFER",
+   "verdict": "PASS",
+   "detail": "http=403 body=None"
+  },
+  {
+   "name": "S14_process_restarted",
+   "expected": "new pid",
+   "verdict": "PASS",
+   "detail": "old=2142257 new=2146568 out=started c pid=2146568 port=9107"
+  },
+  {
+   "name": "S14_no_stale_allow_during_down",
+   "expected": "allowDuringDown=0",
+   "verdict": "PASS",
+   "detail": "samples=8 allow=0"
+  },
+  {
+   "name": "S14_node_c_back_online",
+   "expected": "http 200",
+   "verdict": "FAIL",
+   "detail": ""
+  },
+  {
+   "name": "S14_all_nodes_deny_after_restart",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "final={'node-a': False, 'node-b': False, 'node-c': False}"
+  },
+  {
+   "name": "S15_no_stale_allow_during_redis_down",
+   "expected": "allowDuringDown=0",
+   "verdict": "PASS",
+   "detail": "samples=10 allow=0 pending=0 deny=10"
+  },
+  {
+   "name": "S15_no_stale_allow_after_restart",
+   "expected": "allowAfterRestart=0",
+   "verdict": "PASS",
+   "detail": "allow=0"
+  },
+  {
+   "name": "S15_all_nodes_deny_final",
+   "expected": "3xDENY",
+   "verdict": "PASS",
+   "detail": "final={'node-a': False, 'node-b': False, 'node-c': False}"
+  }
+ ],
+ "timeline": [
+  {
+   "t": 1788397442.816828,
+   "msg": "between-rounds cluster restart (revive delta workers, see finding F5)"
+  },
+  {
+   "t": 1788397445.4838088,
+   "msg": "node node-a unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788397534.0488615,
+   "msg": "node node-a restarted OK"
+  },
+  {
+   "t": 1788397534.0507312,
+   "msg": "node node-b unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788397603.2655592,
+   "msg": "node node-b restarted OK"
+  },
+  {
+   "t": 1788397603.2678738,
+   "msg": "node node-c unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788397680.3499658,
+   "msg": "node node-c restarted OK"
+  },
+  {
+   "t": 1788397682.4458852,
+   "msg": "node node-b unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788397754.7012193,
+   "msg": "node node-b restarted OK"
+  },
+  {
+   "t": 1788397756.4047134,
+   "msg": "stale-binding probe: http=200"
+  },
+  {
+   "t": 1788397757.912717,
+   "msg": "cleanup unbind S1 rs=7998078326970341 ok=200 deny=True"
+  },
+  {
+   "t": 1788397758.5808065,
+   "msg": "fixture S2 ready rs=7998078326970342 (140ms)"
+  },
+  {
+   "t": 1788397767.995241,
+   "msg": "fixture S3 ready rs=7998078326970343 (149ms)"
+  },
+  {
+   "t": 1788397768.688567,
+   "msg": "attempting stale-generation delta replay (same target_version, event_id=s3-replay-b7ac33009833)"
+  },
+  {
+   "t": 1788397768.7940414,
+   "msg": "stale replay rejected: uk_ade_target_version"
+  },
+  {
+   "t": 1788397775.801129,
+   "msg": "fixture S4 ready rs=7998078326970344 (146ms)"
+  },
+  {
+   "t": 1788397776.5994854,
+   "msg": "cleanup unbind S4 rs=7998078326970344 ok=200 deny=True"
+  },
+  {
+   "t": 1788397809.3874407,
+   "msg": "stranded=0 lease_seconds_left=None"
+  },
+  {
+   "t": 1788397837.6823752,
+   "msg": "ensure-running node-a"
+  },
+  {
+   "t": 1788397837.687151,
+   "msg": "ensure-running node-b"
+  },
+  {
+   "t": 1788397837.946434,
+   "msg": "ensure-running node-c"
+  },
+  {
+   "t": 1788397838.0399127,
+   "msg": "node node-c unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788397916.1138825,
+   "msg": "node node-c restarted OK"
+  },
+  {
+   "t": 1788397917.0429065,
+   "msg": "S6 round 1: gen=2 allow=True deny=True"
+  },
+  {
+   "t": 1788397917.625157,
+   "msg": "S6 round 2: gen=4 allow=True deny=True"
+  },
+  {
+   "t": 1788397918.1863964,
+   "msg": "S6 round 3: gen=6 allow=True deny=True"
+  },
+  {
+   "t": 1788397918.734893,
+   "msg": "S6 round 4: gen=8 allow=True deny=True"
+  },
+  {
+   "t": 1788397919.3100467,
+   "msg": "S6 round 5: gen=10 allow=True deny=True"
+  },
+  {
+   "t": 1788397920.2888865,
+   "msg": "fixture S7 ready rs=7998078326970347 (160ms)"
+  },
+  {
+   "t": 1788397920.5133936,
+   "msg": "poisoned astral:auth:l2ev:4634d07b-9fba-45a0-a802-eeb32ef2745c:9001:9061 (epoch 4634d07b-9fba-45a0-a802-eeb32ef2745c)"
+  },
+  {
+   "t": 1788397936.0657253,
+   "msg": "residue observation: deleted=False epoch_changed=False（键存废为机制证据，安全属性由决策正确性断言）"
+  },
+  {
+   "t": 1788397995.791254,
+   "msg": "ensure-running node-a"
+  },
+  {
+   "t": 1788397995.7966473,
+   "msg": "ensure-running node-b"
+  },
+  {
+   "t": 1788397996.0596454,
+   "msg": "ensure-running node-c"
+  },
+  {
+   "t": 1788397996.7896512,
+   "msg": "fixture S11 ready rs=7998078326970351 (176ms)"
+  },
+  {
+   "t": 1788397998.5763288,
+   "msg": "fixture S14 ready rs=7998078326970352 (180ms)"
+  },
+  {
+   "t": 1788398103.949388,
+   "msg": "fixture S15 ready rs=7998078326970353 (200ms)"
+  },
+  {
+   "t": 1788398116.3129823,
+   "msg": "S15 delta pipeline state after redis outage (rs=7998078326970353): [['SUCCEEDED', '2']]"
+  },
+  {
+   "t": 1788398116.4175932,
+   "msg": "between-rounds cluster restart (revive delta workers, see finding F5)"
+  },
+  {
+   "t": 1788398119.0770297,
+   "msg": "node node-a unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788398215.7899945,
+   "msg": "node node-a restarted OK"
+  },
+  {
+   "t": 1788398215.8208709,
+   "msg": "node node-c unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788398336.9874542,
+   "msg": "node node-c restarted OK"
+  },
+  {
+   "t": 1788398340.3277447,
+   "msg": "cleanup unbind S1 rs=7998078326970354 ok=200 deny=True"
+  },
+  {
+   "t": 1788398341.0578,
+   "msg": "fixture S2 ready rs=7998078326970355 (197ms)"
+  },
+  {
+   "t": 1788398350.506131,
+   "msg": "fixture S3 ready rs=7998078326970356 (200ms)"
+  },
+  {
+   "t": 1788398351.294943,
+   "msg": "attempting stale-generation delta replay (same target_version, event_id=s3-replay-43e178f45245)"
+  },
+  {
+   "t": 1788398351.3923473,
+   "msg": "stale replay rejected: uk_ade_target_version"
+  },
+  {
+   "t": 1788398358.4753902,
+   "msg": "fixture S4 ready rs=7998078326970357 (218ms)"
+  },
+  {
+   "t": 1788398359.45636,
+   "msg": "cleanup unbind S4 rs=7998078326970357 ok=200 deny=True"
+  },
+  {
+   "t": 1788398392.2629223,
+   "msg": "stranded=0 lease_seconds_left=None"
+  },
+  {
+   "t": 1788398420.5479019,
+   "msg": "ensure-running node-a"
+  },
+  {
+   "t": 1788398420.5528128,
+   "msg": "ensure-running node-b"
+  },
+  {
+   "t": 1788398420.8182805,
+   "msg": "ensure-running node-c"
+  },
+  {
+   "t": 1788398420.8218086,
+   "msg": "node node-a unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788398514.4227054,
+   "msg": "node node-a restarted OK"
+  },
+  {
+   "t": 1788398514.424617,
+   "msg": "node node-b unresponsive; attempting recovery"
+  },
+  {
+   "t": 1788398583.6554203,
+   "msg": "node node-b restarted OK"
+  },
+  {
+   "t": 1788398584.834219,
+   "msg": "S6 round 1: gen=2 allow=True deny=True"
+  },
+  {
+   "t": 1788398585.4784663,
+   "msg": "S6 round 2: gen=4 allow=True deny=True"
+  },
+  {
+   "t": 1788398586.0895982,
+   "msg": "S6 round 3: gen=6 allow=True deny=True"
+  },
+  {
+   "t": 1788398586.6867483,
+   "msg": "S6 round 4: gen=8 allow=True deny=True"
+  },
+  {
+   "t": 1788398587.3022933,
+   "msg": "S6 round 5: gen=10 allow=True deny=True"
+  },
+  {
+   "t": 1788398589.3985062,
+   "msg": "fixture S7 ready rs=7998078326970360 (191ms)"
+  },
+  {
+   "t": 1788398589.6172318,
+   "msg": "poisoned astral:auth:l2ev:4634d07b-9fba-45a0-a802-eeb32ef2745c:9001:9061 (epoch 4634d07b-9fba-45a0-a802-eeb32ef2745c)"
+  },
+  {
+   "t": 1788398605.1628294,
+   "msg": "residue observation: deleted=False epoch_changed=False（键存废为机制证据，安全属性由决策正确性断言）"
+  },
+  {
+   "t": 1788398617.6453724,
+   "msg": "ensure-running node-a"
+  },
+  {
+   "t": 1788398617.6509893,
+   "msg": "ensure-running node-b"
+  },
+  {
+   "t": 1788398617.9142964,
+   "msg": "ensure-running node-c"
+  },
+  {
+   "t": 1788398618.679186,
+   "msg": "fixture S11 ready rs=7998078326970363 (226ms)"
+  },
+  {
+   "t": 1788398620.603252,
+   "msg": "fixture S14 ready rs=7998078326970364 (237ms)"
+  },
+  {
+   "t": 1788398715.7206566,
+   "msg": "fixture S15 ready rs=7998078326970365 (244ms)"
+  },
+  {
+   "t": 1788398728.1300778,
+   "msg": "S15 delta pipeline state after redis outage (rs=7998078326970365): [['SUCCEEDED', '2']]"
+  }
+ ]
+}

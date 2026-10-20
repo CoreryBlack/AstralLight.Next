@@ -4,8 +4,8 @@
 //! 连接门控、参数化租户拓扑构建、v5 行播种、授权发布路径(stage → claim →
 //! finalize → publish,与生产 worker 分步一致)以及确定性清理。
 //!
-//! 刻意保留的重复:各 crate 既有测试文件内的同名 helper(如
-//! `astral-db/tests/multi_tenant_isolation.rs` 的 `TenantFixture`)是**独立副本**,
+//! 刻意保留的重复:既有集成测试文件内的同名 helper(如
+//! `tests-suite/series/MT-E1/multi_tenant_isolation.rs` 的 `TenantFixture`)是**独立副本**,
 //! 本库不改动它们(测试深度与行为零变化);本库只服务 testsuite 新增套件。
 //!
 //! ID 段隔离:testsuite 使用 `SUITE_BASE_MIN`(2e16)起的专属随机段,与既有

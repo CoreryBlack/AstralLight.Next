@@ -19,6 +19,7 @@ This directory contains documentation selected for the standalone Rust backend r
 ## Architecture
 
 - [Rust architecture index](架构/Rust架构设计/README.md)
+- [项目架构与接口图集](架构/图集/index.html): 22 个组件、279 条 endpoint 全集与单接口调用链。
 - [Access-control overview and adjustment route](架构/Rust架构设计/Rust访问控制总览与调整路线_V1.0.md)
 - [Projection snapshots and version fences](架构/Rust架构设计/Rust权限投影快照与版本栅栏_V1.0.md)
 - [Incremental rebuild and realtime authorization boundary](架构/Rust架构设计/Rust增量重建与实时授权边界_V1.0.md)

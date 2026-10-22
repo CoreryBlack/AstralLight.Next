@@ -3,6 +3,7 @@
 //! The repository fixture models typed published evidence only. It does not prove
 //! durable publication and it aborts if evaluation touches legacy/raw ports.
 
+#[allow(dead_code)]
 #[path = "../../tests-suite/series/MT-E1/support/published.rs"]
 mod published;
 

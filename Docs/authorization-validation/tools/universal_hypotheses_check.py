@@ -723,8 +723,12 @@ _MANIFEST_SOURCES = (
     "bounded_model_execution.py",
     "universal_hypotheses_check.py",
     "experiment_common.py",
-    "test_universal_hypotheses_check.py",
-    "test_classify_e1_properties.py",
+    "../archive/python-tests/test_universal_hypotheses_check.py",
+    "../archive/python-tests/test_classify_e1_properties.py",
+    "../archive/python-tests/test_experiment_common.py",
+    "../archive/python-tests/test_e5_model_check.py",
+    "../archive/python-tests/test_e5_model_check_two_mutations.py",
+    "../archive/python-tests/test_bounded_model_execution.py",
 )
 
 
@@ -760,7 +764,6 @@ def write_manifest(report, out_path, started_at, finished_at, argv):
         "sourceHashes": {
             name: _sha256_of(here / name)
             for name in _MANIFEST_SOURCES
-            if (here / name).exists()
         },
         "report": report,
         "durablePostcondition": (

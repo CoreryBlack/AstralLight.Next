@@ -36,5 +36,9 @@ for suite in "${SUITES[@]}"; do
         *) printf '[BLOCKED] unknown suite: %s\n' "$suite" >&2; exit 2 ;;
     esac
 done
-command -v python >/dev/null 2>&1 || { printf '[BLOCKED] Python 3.11+ is required\n' >&2; exit 2; }
-exec python -B "$SCRIPT_DIR/../../scripts/test_campaign.py" "${ARGS[@]}" "${EXTRA[@]}"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+if [ "${#EXTRA[@]}" -gt 0 ]; then
+    exec cargo run --quiet --locked --manifest-path "$ROOT/Cargo.toml" -p test-harness --bin test-campaign -- "${ARGS[@]}" "${EXTRA[@]}"
+else
+    exec cargo run --quiet --locked --manifest-path "$ROOT/Cargo.toml" -p test-harness --bin test-campaign -- "${ARGS[@]}"
+fi

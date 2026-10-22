@@ -1,0 +1,1768 @@
+{
+  "model": "e5-bounded-model-check",
+  "modelVersion": "2.1.0",
+  "theorem": "E5",
+  "method": "exhaustive depth-first enumeration of a finite explicit state model; no external solver, no subprocess, no network",
+  "bound": 28,
+  "boundValidation": {
+    "min": 2,
+    "max": 64,
+    "valid": true
+  },
+  "exploredStates": 1503835,
+  "exploredTraces": 931110,
+  "fullContract": {
+    "status": "PASS",
+    "meaning": "abstract bounded property only, conditional on every structural assumption in scopeLimitations (fixed checklist order; pending probes latched at read time inside the final load m0<p0<m1<p1 or the atomic strict load; t_f = m0; one mutation, one rollback, one successor revision; two sub-event publication; dense steps; NO admission-time re-derivation and NO admission-side watermark, matching the current Rust implementation): zero traces in this model where a mutation committed strictly before t_f AND a stale candidate reached host admission. The window between the last read and admission is FREE: a publication completing there is caught by the latched unsafe pending delta, not by any admission-time check. Out-of-domain (overlap/after) admissions are reported separately in admittedDomainCounts and are outside the theorem. This implies nothing beyond this model and is not evidence about the production implementation.",
+    "modes": {
+      "bracket": {
+        "premises": {
+          "pending_probe": true,
+          "post_recheck": true,
+          "final_reload": true,
+          "exact_identity": true,
+          "generation_revoke_fence": true,
+          "host_mediation": true
+        },
+        "mode": "bracket",
+        "bound": 28,
+        "requiredBound": 16,
+        "explorationComplete": true,
+        "exploredStates": 333417,
+        "exploredTraces": 129855,
+        "incompleteTraces": 0,
+        "admittedTraces": 1647,
+        "deniedTraces": 128208,
+        "bypassAdmittedTraces": 0,
+        "admittedDomainCounts": {
+          "notStale": 81,
+          "strictlyBefore": 0,
+          "overlapUnknown": 0,
+          "afterFinalObservation": 1566,
+          "unknownDomain": 0
+        },
+        "violations": 0,
+        "violationsByDomain": {
+          "strictlyBefore": 0,
+          "overlapUnknown": 0,
+          "afterFinalObservation": 0,
+          "unknownDomain": 0,
+          "notStale": 0
+        },
+        "violationClasses": {},
+        "denialReasons": {
+          "candidate_match_failed": 6219,
+          "final_load_read_missing_or_rejected": 5419,
+          "final_load_read_missing_or_rejected:RELOAD_M1": 34005,
+          "generation_fence_rejected_reads:POST_OBS_END": 49487,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END": 14753,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END,RELOAD_M0": 308,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END,RELOAD_M0,RELOAD_M1": 2909,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END,RELOAD_M1": 15084,
+          "generation_fence_rejected_reads:POST_OBS_END,RELOAD_M0": 492,
+          "generation_fence_rejected_reads:POST_OBS_END,RELOAD_M0,RELOAD_M1": 702,
+          "generation_fence_rejected_reads:POST_OBS_END,RELOAD_M1": 8830,
+          "generation_fence_rejected_reads:PRE_OBS_END": 3872,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M0": 96,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M0,RELOAD_M1": 448,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M1": 2976,
+          "generation_fence_rejected_reads:RELOAD_M0": 264,
+          "generation_fence_rejected_reads:RELOAD_M0,RELOAD_M1": 200,
+          "generation_fence_rejected_reads:RELOAD_M1": 2856,
+          "pending_probe_latched_unsafe_delta:RELOAD_P0": 86367,
+          "pending_probe_latched_unsafe_delta:RELOAD_P1": 96895,
+          "post_recheck_disagrees_with_evidence": 29520,
+          "post_recheck_read_missing_or_rejected": 92565,
+          "pre_observation_does_not_precede_commit": 44742,
+          "pre_observation_missing_or_rejected": 40446
+        },
+        "admissionWindow": {
+          "publishAfterLastReadBeforeAdmissionTraces": 26400,
+          "admittedPublishAfterLastRead": 1392,
+          "rollbackAfterLastReadBeforeAdmissionTraces": 28050,
+          "publishAfterFinalObservationBeforeAdmissionTraces": 127495,
+          "admittedPublishAfterFinalObservation": 1392,
+          "staleCommitPublishAfterLastReadTraces": 2523,
+          "admittedStaleCommitPublishAfterLastRead": 0
+        },
+        "mixedManifestBody": {
+          "tornReadTraces": 70089,
+          "admittedTornReadTraces": 0,
+          "admittedTornReadTracesByDomain": {},
+          "tornReadTracesByKind": {
+            "manifest_ahead_body_stale": 38003,
+            "body_ahead_manifest_stale": 39544
+          }
+        },
+        "counterexample": null,
+        "status": "PASS"
+      },
+      "strict": {
+        "premises": {
+          "pending_probe": true,
+          "post_recheck": true,
+          "final_reload": true,
+          "exact_identity": true,
+          "generation_revoke_fence": true,
+          "host_mediation": true
+        },
+        "mode": "strict",
+        "bound": 28,
+        "requiredBound": 10,
+        "explorationComplete": true,
+        "exploredStates": 524,
+        "exploredTraces": 328,
+        "incompleteTraces": 0,
+        "admittedTraces": 58,
+        "deniedTraces": 270,
+        "bypassAdmittedTraces": 0,
+        "admittedDomainCounts": {
+          "notStale": 4,
+          "strictlyBefore": 0,
+          "overlapUnknown": 0,
+          "afterFinalObservation": 54,
+          "unknownDomain": 0
+        },
+        "violations": 0,
+        "violationsByDomain": {
+          "strictlyBefore": 0,
+          "overlapUnknown": 0,
+          "afterFinalObservation": 0,
+          "unknownDomain": 0,
+          "notStale": 0
+        },
+        "violationClasses": {},
+        "denialReasons": {
+          "candidate_match_failed": 44,
+          "final_load_read_missing_or_rejected": 36,
+          "generation_fence_rejected_reads:STRICT_LOAD": 8,
+          "generation_fence_rejected_reads:STRICT_LOAD,STRICT_OBS": 28,
+          "generation_fence_rejected_reads:STRICT_OBS": 145,
+          "pending_probe_latched_unsafe_delta:STRICT_LOAD": 179,
+          "post_recheck_disagrees_with_evidence": 56,
+          "post_recheck_read_missing_or_rejected": 173
+        },
+        "admissionWindow": {
+          "publishAfterLastReadBeforeAdmissionTraces": 145,
+          "admittedPublishAfterLastRead": 48,
+          "rollbackAfterLastReadBeforeAdmissionTraces": 110,
+          "publishAfterFinalObservationBeforeAdmissionTraces": 296,
+          "admittedPublishAfterFinalObservation": 48,
+          "staleCommitPublishAfterLastReadTraces": 29,
+          "admittedStaleCommitPublishAfterLastRead": 0
+        },
+        "mixedManifestBody": {
+          "tornReadTraces": 119,
+          "admittedTornReadTraces": 0,
+          "admittedTornReadTracesByDomain": {},
+          "tornReadTracesByKind": {
+            "manifest_ahead_body_stale": 64,
+            "body_ahead_manifest_stale": 58
+          }
+        },
+        "counterexample": null,
+        "status": "PASS"
+      }
+    }
+  },
+  "omissions": [
+    {
+      "premise": "pending_probe",
+      "premiseRemoved": "pending_probe",
+      "status": "FAIL",
+      "finding": "counterexample_found",
+      "intendedSchedule": "source-pending trace: the probes are gone, so a publication completing in the free window after the last read is never latched",
+      "counterexample": {
+        "scheduleClass": "source_pending_commit_without_publication",
+        "outcome": "ADMITTED",
+        "domain": "strictly_before",
+        "staleAtAdmission": true,
+        "eventCount": 11,
+        "stepCount": 11,
+        "reads": {
+          "POST_OBS_END": {
+            "step": 9,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          },
+          "PRE_OBS_END": {
+            "step": 3,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          },
+          "RELOAD_M0": {
+            "step": 5,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          },
+          "RELOAD_M1": {
+            "step": 6,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          }
+        },
+        "pendingObservations": {},
+        "trace": [
+          {
+            "step": 0,
+            "event": "INIT"
+          },
+          {
+            "step": 1,
+            "event": "COMMIT_BEGIN"
+          },
+          {
+            "step": 2,
+            "event": "PRE_OBS_BEGIN"
+          },
+          {
+            "step": 3,
+            "event": "PRE_OBS_END"
+          },
+          {
+            "step": 4,
+            "event": "COMMIT_DURABLE"
+          },
+          {
+            "step": 5,
+            "event": "RELOAD_M0"
+          },
+          {
+            "step": 6,
+            "event": "RELOAD_M1"
+          },
+          {
+            "step": 7,
+            "event": "MATCH"
+          },
+          {
+            "step": 8,
+            "event": "POST_OBS_BEGIN"
+          },
+          {
+            "step": 9,
+            "event": "POST_OBS_END"
+          },
+          {
+            "step": 10,
+            "event": "ADMIT"
+          }
+        ]
+      },
+      "note": "Without the pending probe the load observes only m0 and m1. A schedule where the source commit is durable before t_f (m0), the cache still serves the pre-invalidation pair (g0, r0) through the last read, and the publication completes in the free window after the last read and before admission leaves nothing latched: every remaining gate passes and the stale candidate is admitted. With the probe on, p0/p1 would have captured pending=true at read time and latched the admission fail-closed.",
+      "run": {
+        "premises": {
+          "pending_probe": false,
+          "post_recheck": true,
+          "final_reload": true,
+          "exact_identity": true,
+          "generation_revoke_fence": true,
+          "host_mediation": true
+        },
+        "mode": "bracket",
+        "bound": 28,
+        "requiredBound": 14,
+        "explorationComplete": true,
+        "exploredStates": 49569,
+        "exploredTraces": 21906,
+        "incompleteTraces": 0,
+        "admittedTraces": 1593,
+        "deniedTraces": 20313,
+        "bypassAdmittedTraces": 0,
+        "admittedDomainCounts": {
+          "notStale": 54,
+          "strictlyBefore": 27,
+          "overlapUnknown": 414,
+          "afterFinalObservation": 1098,
+          "unknownDomain": 0
+        },
+        "violations": 27,
+        "violationsByDomain": {
+          "strictlyBefore": 27,
+          "overlapUnknown": 0,
+          "afterFinalObservation": 0,
+          "unknownDomain": 0,
+          "notStale": 0
+        },
+        "violationClasses": {
+          "mutation_published_after_last_read_before_admission": 9,
+          "source_pending_commit_without_publication": 6,
+          "stale_generation_pointer_rollback": 12
+        },
+        "denialReasons": {
+          "candidate_match_failed": 2265,
+          "final_load_read_missing_or_rejected": 1897,
+          "final_load_read_missing_or_rejected:RELOAD_M1": 5600,
+          "generation_fence_rejected_reads:POST_OBS_END": 8520,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END": 1684,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END,RELOAD_M0": 70,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END,RELOAD_M0,RELOAD_M1": 963,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END,RELOAD_M1": 1763,
+          "generation_fence_rejected_reads:POST_OBS_END,RELOAD_M0": 114,
+          "generation_fence_rejected_reads:POST_OBS_END,RELOAD_M0,RELOAD_M1": 358,
+          "generation_fence_rejected_reads:POST_OBS_END,RELOAD_M1": 1396,
+          "generation_fence_rejected_reads:PRE_OBS_END": 508,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M0": 36,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M0,RELOAD_M1": 180,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M1": 396,
+          "generation_fence_rejected_reads:RELOAD_M0": 76,
+          "generation_fence_rejected_reads:RELOAD_M0,RELOAD_M1": 100,
+          "generation_fence_rejected_reads:RELOAD_M1": 444,
+          "post_recheck_disagrees_with_evidence": 4928,
+          "post_recheck_read_missing_or_rejected": 14868,
+          "pre_observation_does_not_precede_commit": 7114,
+          "pre_observation_missing_or_rejected": 5600
+        },
+        "admissionWindow": {
+          "publishAfterLastReadBeforeAdmissionTraces": 5508,
+          "admittedPublishAfterLastRead": 1368,
+          "rollbackAfterLastReadBeforeAdmissionTraces": 5400,
+          "publishAfterFinalObservationBeforeAdmissionTraces": 20971,
+          "admittedPublishAfterFinalObservation": 1368,
+          "staleCommitPublishAfterLastReadTraces": 924,
+          "admittedStaleCommitPublishAfterLastRead": 24
+        },
+        "mixedManifestBody": {
+          "tornReadTraces": 11502,
+          "admittedTornReadTraces": 0,
+          "admittedTornReadTracesByDomain": {},
+          "tornReadTracesByKind": {
+            "manifest_ahead_body_stale": 6348,
+            "body_ahead_manifest_stale": 6198
+          }
+        },
+        "counterexample": {
+          "scheduleClass": "source_pending_commit_without_publication",
+          "outcome": "ADMITTED",
+          "domain": "strictly_before",
+          "staleAtAdmission": true,
+          "eventCount": 11,
+          "stepCount": 11,
+          "reads": {
+            "POST_OBS_END": {
+              "step": 9,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            },
+            "PRE_OBS_END": {
+              "step": 3,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            },
+            "RELOAD_M0": {
+              "step": 5,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            },
+            "RELOAD_M1": {
+              "step": 6,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            }
+          },
+          "pendingObservations": {},
+          "trace": [
+            {
+              "step": 0,
+              "event": "INIT"
+            },
+            {
+              "step": 1,
+              "event": "COMMIT_BEGIN"
+            },
+            {
+              "step": 2,
+              "event": "PRE_OBS_BEGIN"
+            },
+            {
+              "step": 3,
+              "event": "PRE_OBS_END"
+            },
+            {
+              "step": 4,
+              "event": "COMMIT_DURABLE"
+            },
+            {
+              "step": 5,
+              "event": "RELOAD_M0"
+            },
+            {
+              "step": 6,
+              "event": "RELOAD_M1"
+            },
+            {
+              "step": 7,
+              "event": "MATCH"
+            },
+            {
+              "step": 8,
+              "event": "POST_OBS_BEGIN"
+            },
+            {
+              "step": 9,
+              "event": "POST_OBS_END"
+            },
+            {
+              "step": 10,
+              "event": "ADMIT"
+            }
+          ]
+        },
+        "status": "FAIL"
+      }
+    },
+    {
+      "premise": "post_recheck",
+      "premiseRemoved": "post_recheck",
+      "status": "FAIL",
+      "finding": "counterexample_found",
+      "intendedSchedule": "intra-load publication trace: the mutation fully publishes between m0 and p0, the m0-anchored evidence goes stale, and with no post-recheck nothing confronts it",
+      "counterexample": {
+        "scheduleClass": "mutation_published_between_evidence_read_and_last_read",
+        "outcome": "ADMITTED",
+        "domain": "strictly_before",
+        "staleAtAdmission": true,
+        "eventCount": 13,
+        "stepCount": 13,
+        "reads": {
+          "PRE_OBS_END": {
+            "step": 4,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          },
+          "RELOAD_M0": {
+            "step": 5,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          },
+          "RELOAD_M1": {
+            "step": 9,
+            "gen": "g1",
+            "rev": "r1",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          }
+        },
+        "pendingObservations": {
+          "RELOAD_P0": {
+            "step": 8,
+            "pending": false
+          },
+          "RELOAD_P1": {
+            "step": 10,
+            "pending": false
+          }
+        },
+        "trace": [
+          {
+            "step": 0,
+            "event": "INIT"
+          },
+          {
+            "step": 1,
+            "event": "COMMIT_BEGIN"
+          },
+          {
+            "step": 2,
+            "event": "COMMIT_DURABLE"
+          },
+          {
+            "step": 3,
+            "event": "PRE_OBS_BEGIN"
+          },
+          {
+            "step": 4,
+            "event": "PRE_OBS_END"
+          },
+          {
+            "step": 5,
+            "event": "RELOAD_M0"
+          },
+          {
+            "step": 6,
+            "event": "EVIDENCE_BODY_ADVANCE"
+          },
+          {
+            "step": 7,
+            "event": "PUBLISH"
+          },
+          {
+            "step": 8,
+            "event": "RELOAD_P0"
+          },
+          {
+            "step": 9,
+            "event": "RELOAD_M1"
+          },
+          {
+            "step": 10,
+            "event": "RELOAD_P1"
+          },
+          {
+            "step": 11,
+            "event": "MATCH"
+          },
+          {
+            "step": 12,
+            "event": "ADMIT"
+          }
+        ]
+      },
+      "note": "Without the post-recheck, a schedule where the publication fully completes INSIDE the final load, between m0 and p0, survives: p0 and p1 then observe pending=false (the publication is complete at their read steps), the evidence stays anchored at the earlier m0 (g0, r0), and no later read confronts it. The admission is stale (the commit was durable before t_f) and every remaining gate passes. With the recheck on, the post-read disagrees with the m0-anchored evidence and denies -- this is the latched identity stability the real protocol enforces between observations.",
+      "run": {
+        "premises": {
+          "pending_probe": true,
+          "post_recheck": false,
+          "final_reload": true,
+          "exact_identity": true,
+          "generation_revoke_fence": true,
+          "host_mediation": true
+        },
+        "mode": "bracket",
+        "bound": 28,
+        "requiredBound": 14,
+        "explorationComplete": true,
+        "exploredStates": 117597,
+        "exploredTraces": 54765,
+        "incompleteTraces": 0,
+        "admittedTraces": 3278,
+        "deniedTraces": 51487,
+        "bypassAdmittedTraces": 0,
+        "admittedDomainCounts": {
+          "notStale": 51,
+          "strictlyBefore": 302,
+          "overlapUnknown": 302,
+          "afterFinalObservation": 2623,
+          "unknownDomain": 0
+        },
+        "violations": 302,
+        "violationsByDomain": {
+          "strictlyBefore": 302,
+          "overlapUnknown": 0,
+          "afterFinalObservation": 0,
+          "unknownDomain": 0,
+          "notStale": 0
+        },
+        "violationClasses": {
+          "mutation_published_between_evidence_read_and_last_read": 80,
+          "stale_generation_pointer_rollback": 222
+        },
+        "denialReasons": {
+          "candidate_match_failed": 4113,
+          "final_load_read_missing_or_rejected": 3493,
+          "final_load_read_missing_or_rejected:RELOAD_M1": 19695,
+          "generation_fence_rejected_reads:PRE_OBS_END": 9773,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M0": 308,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M0,RELOAD_M1": 2129,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M1": 10512,
+          "generation_fence_rejected_reads:RELOAD_M0": 492,
+          "generation_fence_rejected_reads:RELOAD_M0,RELOAD_M1": 564,
+          "generation_fence_rejected_reads:RELOAD_M1": 6490,
+          "pending_probe_latched_unsafe_delta:RELOAD_P0": 38523,
+          "pending_probe_latched_unsafe_delta:RELOAD_P1": 34025
+        },
+        "admissionWindow": {
+          "publishAfterLastReadBeforeAdmissionTraces": 26160,
+          "admittedPublishAfterLastRead": 988,
+          "rollbackAfterLastReadBeforeAdmissionTraces": 23580,
+          "publishAfterFinalObservationBeforeAdmissionTraces": 52972,
+          "admittedPublishAfterFinalObservation": 3163,
+          "staleCommitPublishAfterLastReadTraces": 3666,
+          "admittedStaleCommitPublishAfterLastRead": 0
+        },
+        "mixedManifestBody": {
+          "tornReadTraces": 23540,
+          "admittedTornReadTraces": 0,
+          "admittedTornReadTracesByDomain": {},
+          "tornReadTracesByKind": {
+            "manifest_ahead_body_stale": 14286,
+            "body_ahead_manifest_stale": 9978
+          }
+        },
+        "counterexample": {
+          "scheduleClass": "mutation_published_between_evidence_read_and_last_read",
+          "outcome": "ADMITTED",
+          "domain": "strictly_before",
+          "staleAtAdmission": true,
+          "eventCount": 13,
+          "stepCount": 13,
+          "reads": {
+            "PRE_OBS_END": {
+              "step": 4,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            },
+            "RELOAD_M0": {
+              "step": 5,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            },
+            "RELOAD_M1": {
+              "step": 9,
+              "gen": "g1",
+              "rev": "r1",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            }
+          },
+          "pendingObservations": {
+            "RELOAD_P0": {
+              "step": 8,
+              "pending": false
+            },
+            "RELOAD_P1": {
+              "step": 10,
+              "pending": false
+            }
+          },
+          "trace": [
+            {
+              "step": 0,
+              "event": "INIT"
+            },
+            {
+              "step": 1,
+              "event": "COMMIT_BEGIN"
+            },
+            {
+              "step": 2,
+              "event": "COMMIT_DURABLE"
+            },
+            {
+              "step": 3,
+              "event": "PRE_OBS_BEGIN"
+            },
+            {
+              "step": 4,
+              "event": "PRE_OBS_END"
+            },
+            {
+              "step": 5,
+              "event": "RELOAD_M0"
+            },
+            {
+              "step": 6,
+              "event": "EVIDENCE_BODY_ADVANCE"
+            },
+            {
+              "step": 7,
+              "event": "PUBLISH"
+            },
+            {
+              "step": 8,
+              "event": "RELOAD_P0"
+            },
+            {
+              "step": 9,
+              "event": "RELOAD_M1"
+            },
+            {
+              "step": 10,
+              "event": "RELOAD_P1"
+            },
+            {
+              "step": 11,
+              "event": "MATCH"
+            },
+            {
+              "step": 12,
+              "event": "ADMIT"
+            }
+          ]
+        },
+        "status": "FAIL"
+      }
+    },
+    {
+      "premise": "final_reload",
+      "premiseRemoved": "final_reload",
+      "status": "FAIL",
+      "finding": "counterexample_found",
+      "intendedSchedule": "no-final-load trace: without the load there are no pending probes and no evidence; the pre-observation fallback admits the stale candidate (matches the Rust e2 final-reload-omission experiment)",
+      "counterexample": {
+        "scheduleClass": "source_pending_commit_without_publication",
+        "outcome": "ADMITTED",
+        "domain": "strictly_before",
+        "staleAtAdmission": true,
+        "eventCount": 9,
+        "stepCount": 9,
+        "reads": {
+          "POST_OBS_END": {
+            "step": 7,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          },
+          "PRE_OBS_END": {
+            "step": 3,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          }
+        },
+        "pendingObservations": {},
+        "trace": [
+          {
+            "step": 0,
+            "event": "INIT"
+          },
+          {
+            "step": 1,
+            "event": "COMMIT_BEGIN"
+          },
+          {
+            "step": 2,
+            "event": "PRE_OBS_BEGIN"
+          },
+          {
+            "step": 3,
+            "event": "PRE_OBS_END"
+          },
+          {
+            "step": 4,
+            "event": "COMMIT_DURABLE"
+          },
+          {
+            "step": 5,
+            "event": "MATCH"
+          },
+          {
+            "step": 6,
+            "event": "POST_OBS_BEGIN"
+          },
+          {
+            "step": 7,
+            "event": "POST_OBS_END"
+          },
+          {
+            "step": 8,
+            "event": "ADMIT"
+          }
+        ]
+      },
+      "note": "Without the final load there are no pending probes (they run inside the load) and no m0-anchored evidence: the admission evidence falls back to the earlier pre-observation. A durable commit before that observation with the publication still incomplete at admission is admitted stale -- matching the Rust e2 final-reload-omission experiment, where omitting the final reload accepts the removed candidate while the full contract reloads.",
+      "run": {
+        "premises": {
+          "pending_probe": true,
+          "post_recheck": true,
+          "final_reload": false,
+          "exact_identity": true,
+          "generation_revoke_fence": true,
+          "host_mediation": true
+        },
+        "mode": "bracket",
+        "bound": 28,
+        "requiredBound": 12,
+        "explorationComplete": true,
+        "exploredStates": 2477,
+        "exploredTraces": 1274,
+        "incompleteTraces": 0,
+        "admittedTraces": 169,
+        "deniedTraces": 1105,
+        "bypassAdmittedTraces": 0,
+        "admittedDomainCounts": {
+          "notStale": 7,
+          "strictlyBefore": 63,
+          "overlapUnknown": 90,
+          "afterFinalObservation": 9,
+          "unknownDomain": 0
+        },
+        "violations": 63,
+        "violationsByDomain": {
+          "strictlyBefore": 63,
+          "overlapUnknown": 0,
+          "afterFinalObservation": 0,
+          "unknownDomain": 0,
+          "notStale": 0
+        },
+        "violationClasses": {
+          "mutation_published_after_last_read_before_admission": 21,
+          "source_pending_commit_without_publication": 14,
+          "stale_generation_pointer_rollback": 28
+        },
+        "denialReasons": {
+          "candidate_match_failed": 269,
+          "generation_fence_rejected_reads:POST_OBS_END": 627,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END": 171,
+          "generation_fence_rejected_reads:PRE_OBS_END": 48,
+          "post_recheck_disagrees_with_evidence": 260,
+          "post_recheck_read_missing_or_rejected": 798,
+          "pre_observation_does_not_precede_commit": 347,
+          "pre_observation_missing_or_rejected": 219
+        },
+        "admissionWindow": {
+          "publishAfterLastReadBeforeAdmissionTraces": 413,
+          "admittedPublishAfterLastRead": 144,
+          "rollbackAfterLastReadBeforeAdmissionTraces": 364,
+          "publishAfterFinalObservationBeforeAdmissionTraces": 0,
+          "admittedPublishAfterFinalObservation": 0,
+          "staleCommitPublishAfterLastReadTraces": 0,
+          "admittedStaleCommitPublishAfterLastRead": 0
+        },
+        "mixedManifestBody": {
+          "tornReadTraces": 526,
+          "admittedTornReadTraces": 0,
+          "admittedTornReadTracesByDomain": {},
+          "tornReadTracesByKind": {
+            "manifest_ahead_body_stale": 271,
+            "body_ahead_manifest_stale": 279
+          }
+        },
+        "counterexample": {
+          "scheduleClass": "source_pending_commit_without_publication",
+          "outcome": "ADMITTED",
+          "domain": "strictly_before",
+          "staleAtAdmission": true,
+          "eventCount": 9,
+          "stepCount": 9,
+          "reads": {
+            "POST_OBS_END": {
+              "step": 7,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            },
+            "PRE_OBS_END": {
+              "step": 3,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            }
+          },
+          "pendingObservations": {},
+          "trace": [
+            {
+              "step": 0,
+              "event": "INIT"
+            },
+            {
+              "step": 1,
+              "event": "COMMIT_BEGIN"
+            },
+            {
+              "step": 2,
+              "event": "PRE_OBS_BEGIN"
+            },
+            {
+              "step": 3,
+              "event": "PRE_OBS_END"
+            },
+            {
+              "step": 4,
+              "event": "COMMIT_DURABLE"
+            },
+            {
+              "step": 5,
+              "event": "MATCH"
+            },
+            {
+              "step": 6,
+              "event": "POST_OBS_BEGIN"
+            },
+            {
+              "step": 7,
+              "event": "POST_OBS_END"
+            },
+            {
+              "step": 8,
+              "event": "ADMIT"
+            }
+          ]
+        },
+        "status": "FAIL"
+      }
+    },
+    {
+      "premise": "exact_identity",
+      "premiseRemoved": "exact_identity",
+      "status": "FAIL",
+      "finding": "counterexample_found",
+      "intendedSchedule": "successor-revision trace",
+      "counterexample": {
+        "scheduleClass": "successor_revision_identity_confusion",
+        "outcome": "ADMITTED",
+        "domain": "strictly_before",
+        "staleAtAdmission": true,
+        "eventCount": 15,
+        "stepCount": 15,
+        "reads": {
+          "POST_OBS_END": {
+            "step": 13,
+            "gen": "g1",
+            "rev": "r1",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          },
+          "PRE_OBS_END": {
+            "step": 3,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          },
+          "RELOAD_M0": {
+            "step": 7,
+            "gen": "g1",
+            "rev": "r1",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          },
+          "RELOAD_M1": {
+            "step": 9,
+            "gen": "g1",
+            "rev": "r1",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          }
+        },
+        "pendingObservations": {
+          "RELOAD_P0": {
+            "step": 8,
+            "pending": false
+          },
+          "RELOAD_P1": {
+            "step": 10,
+            "pending": false
+          }
+        },
+        "trace": [
+          {
+            "step": 0,
+            "event": "INIT"
+          },
+          {
+            "step": 1,
+            "event": "COMMIT_BEGIN"
+          },
+          {
+            "step": 2,
+            "event": "PRE_OBS_BEGIN"
+          },
+          {
+            "step": 3,
+            "event": "PRE_OBS_END"
+          },
+          {
+            "step": 4,
+            "event": "COMMIT_DURABLE"
+          },
+          {
+            "step": 5,
+            "event": "EVIDENCE_BODY_ADVANCE"
+          },
+          {
+            "step": 6,
+            "event": "PUBLISH"
+          },
+          {
+            "step": 7,
+            "event": "RELOAD_M0"
+          },
+          {
+            "step": 8,
+            "event": "RELOAD_P0"
+          },
+          {
+            "step": 9,
+            "event": "RELOAD_M1"
+          },
+          {
+            "step": 10,
+            "event": "RELOAD_P1"
+          },
+          {
+            "step": 11,
+            "event": "MATCH"
+          },
+          {
+            "step": 12,
+            "event": "POST_OBS_BEGIN"
+          },
+          {
+            "step": 13,
+            "event": "POST_OBS_END"
+          },
+          {
+            "step": 14,
+            "event": "ADMIT"
+          }
+        ]
+      },
+      "note": "Without exact identity, a fully published successor revision (r1/g1) satisfies a grant-presence match for candidate r0; the probes observe pending=false (the publication is complete at their read steps), the recheck agrees, and the read gate passes. With identity off a rollback AFTER the last read also violates (the evidence was already read at g1, so no read re-observes the rolled-back cache). The full contract rejects both: exact identity denies the successor revision.",
+      "run": {
+        "premises": {
+          "pending_probe": true,
+          "post_recheck": true,
+          "final_reload": true,
+          "exact_identity": false,
+          "generation_revoke_fence": true,
+          "host_mediation": true
+        },
+        "mode": "bracket",
+        "bound": 28,
+        "requiredBound": 16,
+        "explorationComplete": true,
+        "exploredStates": 333417,
+        "exploredTraces": 129855,
+        "incompleteTraces": 0,
+        "admittedTraces": 1659,
+        "deniedTraces": 128196,
+        "bypassAdmittedTraces": 0,
+        "admittedDomainCounts": {
+          "notStale": 81,
+          "strictlyBefore": 12,
+          "overlapUnknown": 0,
+          "afterFinalObservation": 1566,
+          "unknownDomain": 0
+        },
+        "violations": 12,
+        "violationsByDomain": {
+          "strictlyBefore": 12,
+          "overlapUnknown": 0,
+          "afterFinalObservation": 0,
+          "unknownDomain": 0,
+          "notStale": 0
+        },
+        "violationClasses": {
+          "stale_generation_pointer_rollback": 6,
+          "successor_revision_identity_confusion": 6
+        },
+        "denialReasons": {
+          "candidate_match_failed": 5419,
+          "final_load_read_missing_or_rejected": 5419,
+          "final_load_read_missing_or_rejected:RELOAD_M1": 34005,
+          "generation_fence_rejected_reads:POST_OBS_END": 49487,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END": 14753,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END,RELOAD_M0": 308,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END,RELOAD_M0,RELOAD_M1": 2909,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END,RELOAD_M1": 15084,
+          "generation_fence_rejected_reads:POST_OBS_END,RELOAD_M0": 492,
+          "generation_fence_rejected_reads:POST_OBS_END,RELOAD_M0,RELOAD_M1": 702,
+          "generation_fence_rejected_reads:POST_OBS_END,RELOAD_M1": 8830,
+          "generation_fence_rejected_reads:PRE_OBS_END": 3872,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M0": 96,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M0,RELOAD_M1": 448,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M1": 2976,
+          "generation_fence_rejected_reads:RELOAD_M0": 264,
+          "generation_fence_rejected_reads:RELOAD_M0,RELOAD_M1": 200,
+          "generation_fence_rejected_reads:RELOAD_M1": 2856,
+          "pending_probe_latched_unsafe_delta:RELOAD_P0": 86367,
+          "pending_probe_latched_unsafe_delta:RELOAD_P1": 96895,
+          "post_recheck_disagrees_with_evidence": 29520,
+          "post_recheck_read_missing_or_rejected": 92565,
+          "pre_observation_does_not_precede_commit": 44742,
+          "pre_observation_missing_or_rejected": 40446
+        },
+        "admissionWindow": {
+          "publishAfterLastReadBeforeAdmissionTraces": 26400,
+          "admittedPublishAfterLastRead": 1392,
+          "rollbackAfterLastReadBeforeAdmissionTraces": 28050,
+          "publishAfterFinalObservationBeforeAdmissionTraces": 127495,
+          "admittedPublishAfterFinalObservation": 1392,
+          "staleCommitPublishAfterLastReadTraces": 2523,
+          "admittedStaleCommitPublishAfterLastRead": 0
+        },
+        "mixedManifestBody": {
+          "tornReadTraces": 70089,
+          "admittedTornReadTraces": 0,
+          "admittedTornReadTracesByDomain": {},
+          "tornReadTracesByKind": {
+            "manifest_ahead_body_stale": 38003,
+            "body_ahead_manifest_stale": 39544
+          }
+        },
+        "counterexample": {
+          "scheduleClass": "successor_revision_identity_confusion",
+          "outcome": "ADMITTED",
+          "domain": "strictly_before",
+          "staleAtAdmission": true,
+          "eventCount": 15,
+          "stepCount": 15,
+          "reads": {
+            "POST_OBS_END": {
+              "step": 13,
+              "gen": "g1",
+              "rev": "r1",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            },
+            "PRE_OBS_END": {
+              "step": 3,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            },
+            "RELOAD_M0": {
+              "step": 7,
+              "gen": "g1",
+              "rev": "r1",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            },
+            "RELOAD_M1": {
+              "step": 9,
+              "gen": "g1",
+              "rev": "r1",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            }
+          },
+          "pendingObservations": {
+            "RELOAD_P0": {
+              "step": 8,
+              "pending": false
+            },
+            "RELOAD_P1": {
+              "step": 10,
+              "pending": false
+            }
+          },
+          "trace": [
+            {
+              "step": 0,
+              "event": "INIT"
+            },
+            {
+              "step": 1,
+              "event": "COMMIT_BEGIN"
+            },
+            {
+              "step": 2,
+              "event": "PRE_OBS_BEGIN"
+            },
+            {
+              "step": 3,
+              "event": "PRE_OBS_END"
+            },
+            {
+              "step": 4,
+              "event": "COMMIT_DURABLE"
+            },
+            {
+              "step": 5,
+              "event": "EVIDENCE_BODY_ADVANCE"
+            },
+            {
+              "step": 6,
+              "event": "PUBLISH"
+            },
+            {
+              "step": 7,
+              "event": "RELOAD_M0"
+            },
+            {
+              "step": 8,
+              "event": "RELOAD_P0"
+            },
+            {
+              "step": 9,
+              "event": "RELOAD_M1"
+            },
+            {
+              "step": 10,
+              "event": "RELOAD_P1"
+            },
+            {
+              "step": 11,
+              "event": "MATCH"
+            },
+            {
+              "step": 12,
+              "event": "POST_OBS_BEGIN"
+            },
+            {
+              "step": 13,
+              "event": "POST_OBS_END"
+            },
+            {
+              "step": 14,
+              "event": "ADMIT"
+            }
+          ]
+        },
+        "status": "FAIL"
+      }
+    },
+    {
+      "premise": "generation_revoke_fence",
+      "premiseRemoved": "generation_revoke_fence",
+      "status": "FAIL",
+      "finding": "counterexample_found",
+      "intendedSchedule": "pointer-rollback trace: below-head reads are accepted without the read gate",
+      "counterexample": {
+        "scheduleClass": "stale_generation_pointer_rollback",
+        "outcome": "ADMITTED",
+        "domain": "strictly_before",
+        "staleAtAdmission": true,
+        "eventCount": 16,
+        "stepCount": 16,
+        "reads": {
+          "POST_OBS_END": {
+            "step": 14,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          },
+          "PRE_OBS_END": {
+            "step": 3,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          },
+          "RELOAD_M0": {
+            "step": 8,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          },
+          "RELOAD_M1": {
+            "step": 10,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          }
+        },
+        "pendingObservations": {
+          "RELOAD_P0": {
+            "step": 9,
+            "pending": false
+          },
+          "RELOAD_P1": {
+            "step": 11,
+            "pending": false
+          }
+        },
+        "trace": [
+          {
+            "step": 0,
+            "event": "INIT"
+          },
+          {
+            "step": 1,
+            "event": "COMMIT_BEGIN"
+          },
+          {
+            "step": 2,
+            "event": "PRE_OBS_BEGIN"
+          },
+          {
+            "step": 3,
+            "event": "PRE_OBS_END"
+          },
+          {
+            "step": 4,
+            "event": "COMMIT_DURABLE"
+          },
+          {
+            "step": 5,
+            "event": "EVIDENCE_BODY_ADVANCE"
+          },
+          {
+            "step": 6,
+            "event": "PUBLISH"
+          },
+          {
+            "step": 7,
+            "event": "ROLLBACK"
+          },
+          {
+            "step": 8,
+            "event": "RELOAD_M0"
+          },
+          {
+            "step": 9,
+            "event": "RELOAD_P0"
+          },
+          {
+            "step": 10,
+            "event": "RELOAD_M1"
+          },
+          {
+            "step": 11,
+            "event": "RELOAD_P1"
+          },
+          {
+            "step": 12,
+            "event": "MATCH"
+          },
+          {
+            "step": 13,
+            "event": "POST_OBS_BEGIN"
+          },
+          {
+            "step": 14,
+            "event": "POST_OBS_END"
+          },
+          {
+            "step": 15,
+            "event": "ADMIT"
+          }
+        ]
+      },
+      "note": "Without the read gate, a pointer rollback to (g0, r0) after a complete publication is served to the final load below the published head and accepted: the evidence is the stale r0 body, the probes observe pending=false (the publication completed at their read steps), and every remaining gate passes. Torn manifest/body reads are also enumerated without the fence; in the theorem domain they are still denied (a torn pair implies an incomplete publication, which the probes latch, or a disagreement at the recheck), and the only admitted torn-read traces lie in the after-t_f TOCTOU domain (the mutation begins after m0, publishes, and a rollback restores the old cache so the recheck agrees again) -- outside the theorem, never violations. The reported counterexample is the minimal one.",
+      "run": {
+        "premises": {
+          "pending_probe": true,
+          "post_recheck": true,
+          "final_reload": true,
+          "exact_identity": true,
+          "generation_revoke_fence": false,
+          "host_mediation": true
+        },
+        "mode": "bracket",
+        "bound": 28,
+        "requiredBound": 16,
+        "explorationComplete": true,
+        "exploredStates": 333417,
+        "exploredTraces": 129855,
+        "incompleteTraces": 0,
+        "admittedTraces": 3713,
+        "deniedTraces": 126142,
+        "bypassAdmittedTraces": 0,
+        "admittedDomainCounts": {
+          "notStale": 81,
+          "strictlyBefore": 42,
+          "overlapUnknown": 72,
+          "afterFinalObservation": 3518,
+          "unknownDomain": 0
+        },
+        "violations": 42,
+        "violationsByDomain": {
+          "strictlyBefore": 42,
+          "overlapUnknown": 0,
+          "afterFinalObservation": 0,
+          "unknownDomain": 0,
+          "notStale": 0
+        },
+        "violationClasses": {
+          "stale_generation_pointer_rollback": 42
+        },
+        "denialReasons": {
+          "candidate_match_failed": 2485,
+          "pending_probe_latched_unsafe_delta:RELOAD_P0": 86367,
+          "pending_probe_latched_unsafe_delta:RELOAD_P1": 96895,
+          "post_recheck_disagrees_with_evidence": 71442,
+          "pre_observation_does_not_precede_commit": 85188
+        },
+        "admissionWindow": {
+          "publishAfterLastReadBeforeAdmissionTraces": 26400,
+          "admittedPublishAfterLastRead": 1677,
+          "rollbackAfterLastReadBeforeAdmissionTraces": 28050,
+          "publishAfterFinalObservationBeforeAdmissionTraces": 127495,
+          "admittedPublishAfterFinalObservation": 3452,
+          "staleCommitPublishAfterLastReadTraces": 2523,
+          "admittedStaleCommitPublishAfterLastRead": 0
+        },
+        "mixedManifestBody": {
+          "tornReadTraces": 70089,
+          "admittedTornReadTraces": 80,
+          "admittedTornReadTracesByDomain": {
+            "after_final_observation": 80
+          },
+          "tornReadTracesByKind": {
+            "manifest_ahead_body_stale": 38003,
+            "body_ahead_manifest_stale": 39544
+          }
+        },
+        "counterexample": {
+          "scheduleClass": "stale_generation_pointer_rollback",
+          "outcome": "ADMITTED",
+          "domain": "strictly_before",
+          "staleAtAdmission": true,
+          "eventCount": 16,
+          "stepCount": 16,
+          "reads": {
+            "POST_OBS_END": {
+              "step": 14,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            },
+            "PRE_OBS_END": {
+              "step": 3,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            },
+            "RELOAD_M0": {
+              "step": 8,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            },
+            "RELOAD_M1": {
+              "step": 10,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            }
+          },
+          "pendingObservations": {
+            "RELOAD_P0": {
+              "step": 9,
+              "pending": false
+            },
+            "RELOAD_P1": {
+              "step": 11,
+              "pending": false
+            }
+          },
+          "trace": [
+            {
+              "step": 0,
+              "event": "INIT"
+            },
+            {
+              "step": 1,
+              "event": "COMMIT_BEGIN"
+            },
+            {
+              "step": 2,
+              "event": "PRE_OBS_BEGIN"
+            },
+            {
+              "step": 3,
+              "event": "PRE_OBS_END"
+            },
+            {
+              "step": 4,
+              "event": "COMMIT_DURABLE"
+            },
+            {
+              "step": 5,
+              "event": "EVIDENCE_BODY_ADVANCE"
+            },
+            {
+              "step": 6,
+              "event": "PUBLISH"
+            },
+            {
+              "step": 7,
+              "event": "ROLLBACK"
+            },
+            {
+              "step": 8,
+              "event": "RELOAD_M0"
+            },
+            {
+              "step": 9,
+              "event": "RELOAD_P0"
+            },
+            {
+              "step": 10,
+              "event": "RELOAD_M1"
+            },
+            {
+              "step": 11,
+              "event": "RELOAD_P1"
+            },
+            {
+              "step": 12,
+              "event": "MATCH"
+            },
+            {
+              "step": 13,
+              "event": "POST_OBS_BEGIN"
+            },
+            {
+              "step": 14,
+              "event": "POST_OBS_END"
+            },
+            {
+              "step": 15,
+              "event": "ADMIT"
+            }
+          ]
+        },
+        "status": "FAIL"
+      }
+    },
+    {
+      "premise": "host_mediation",
+      "premiseRemoved": "host_mediation",
+      "status": "FAIL",
+      "finding": "counterexample_found",
+      "intendedSchedule": "unmediated bypass admission trace",
+      "counterexample": {
+        "scheduleClass": "bypass_unmediated_admission",
+        "outcome": "BYPASS_ADMITTED",
+        "domain": "strictly_before",
+        "staleAtAdmission": true,
+        "eventCount": 5,
+        "stepCount": 5,
+        "reads": {
+          "RELOAD_M0": {
+            "step": 3,
+            "gen": "g0",
+            "rev": "r0",
+            "valid": true,
+            "consistent": true,
+            "reason": null
+          }
+        },
+        "pendingObservations": {},
+        "trace": [
+          {
+            "step": 0,
+            "event": "INIT"
+          },
+          {
+            "step": 1,
+            "event": "COMMIT_BEGIN"
+          },
+          {
+            "step": 2,
+            "event": "COMMIT_DURABLE"
+          },
+          {
+            "step": 3,
+            "event": "RELOAD_M0"
+          },
+          {
+            "step": 4,
+            "event": "BYPASS"
+          }
+        ]
+      },
+      "note": "Without host mediation a bypass admission path exists that skips the entire mediated checklist; any schedule reaching it after a durable commit admits the stale candidate without any gate.",
+      "run": {
+        "premises": {
+          "pending_probe": true,
+          "post_recheck": true,
+          "final_reload": true,
+          "exact_identity": true,
+          "generation_revoke_fence": true,
+          "host_mediation": false
+        },
+        "mode": "bracket",
+        "bound": 28,
+        "requiredBound": 17,
+        "explorationComplete": true,
+        "exploredStates": 333417,
+        "exploredTraces": 463272,
+        "incompleteTraces": 0,
+        "admittedTraces": 335064,
+        "deniedTraces": 128208,
+        "bypassAdmittedTraces": 333417,
+        "admittedDomainCounts": {
+          "notStale": 881,
+          "strictlyBefore": 65672,
+          "overlapUnknown": 91210,
+          "afterFinalObservation": 177248,
+          "unknownDomain": 53
+        },
+        "violations": 65672,
+        "violationsByDomain": {
+          "strictlyBefore": 65672,
+          "overlapUnknown": 0,
+          "afterFinalObservation": 0,
+          "unknownDomain": 0,
+          "notStale": 0
+        },
+        "violationClasses": {
+          "bypass_unmediated_admission": 65672
+        },
+        "denialReasons": {
+          "candidate_match_failed": 6219,
+          "final_load_read_missing_or_rejected": 5419,
+          "final_load_read_missing_or_rejected:RELOAD_M1": 34005,
+          "generation_fence_rejected_reads:POST_OBS_END": 49487,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END": 14753,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END,RELOAD_M0": 308,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END,RELOAD_M0,RELOAD_M1": 2909,
+          "generation_fence_rejected_reads:POST_OBS_END,PRE_OBS_END,RELOAD_M1": 15084,
+          "generation_fence_rejected_reads:POST_OBS_END,RELOAD_M0": 492,
+          "generation_fence_rejected_reads:POST_OBS_END,RELOAD_M0,RELOAD_M1": 702,
+          "generation_fence_rejected_reads:POST_OBS_END,RELOAD_M1": 8830,
+          "generation_fence_rejected_reads:PRE_OBS_END": 3872,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M0": 96,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M0,RELOAD_M1": 448,
+          "generation_fence_rejected_reads:PRE_OBS_END,RELOAD_M1": 2976,
+          "generation_fence_rejected_reads:RELOAD_M0": 264,
+          "generation_fence_rejected_reads:RELOAD_M0,RELOAD_M1": 200,
+          "generation_fence_rejected_reads:RELOAD_M1": 2856,
+          "pending_probe_latched_unsafe_delta:RELOAD_P0": 86367,
+          "pending_probe_latched_unsafe_delta:RELOAD_P1": 96895,
+          "post_recheck_disagrees_with_evidence": 29520,
+          "post_recheck_read_missing_or_rejected": 92565,
+          "pre_observation_does_not_precede_commit": 44742,
+          "pre_observation_missing_or_rejected": 40446
+        },
+        "admissionWindow": {
+          "publishAfterLastReadBeforeAdmissionTraces": 26400,
+          "admittedPublishAfterLastRead": 1392,
+          "rollbackAfterLastReadBeforeAdmissionTraces": 28050,
+          "publishAfterFinalObservationBeforeAdmissionTraces": 127495,
+          "admittedPublishAfterFinalObservation": 1392,
+          "staleCommitPublishAfterLastReadTraces": 2523,
+          "admittedStaleCommitPublishAfterLastRead": 0
+        },
+        "mixedManifestBody": {
+          "tornReadTraces": 224374,
+          "admittedTornReadTraces": 154285,
+          "admittedTornReadTracesByDomain": {
+            "after_final_observation": 71083,
+            "overlap_unknown": 42008,
+            "strictly_before": 41194
+          },
+          "tornReadTracesByKind": {
+            "manifest_ahead_body_stale": 126659,
+            "body_ahead_manifest_stale": 115266
+          }
+        },
+        "counterexample": {
+          "scheduleClass": "bypass_unmediated_admission",
+          "outcome": "BYPASS_ADMITTED",
+          "domain": "strictly_before",
+          "staleAtAdmission": true,
+          "eventCount": 5,
+          "stepCount": 5,
+          "reads": {
+            "RELOAD_M0": {
+              "step": 3,
+              "gen": "g0",
+              "rev": "r0",
+              "valid": true,
+              "consistent": true,
+              "reason": null
+            }
+          },
+          "pendingObservations": {},
+          "trace": [
+            {
+              "step": 0,
+              "event": "INIT"
+            },
+            {
+              "step": 1,
+              "event": "COMMIT_BEGIN"
+            },
+            {
+              "step": 2,
+              "event": "COMMIT_DURABLE"
+            },
+            {
+              "step": 3,
+              "event": "RELOAD_M0"
+            },
+            {
+              "step": 4,
+              "event": "BYPASS"
+            }
+          ]
+        },
+        "status": "FAIL"
+      }
+    }
+  ],
+  "status": "PASS",
+  "statusScope": "The top-level status and fullContract.status describe ONLY the full contract (all modeled premises enabled). Each omissions[] entry carries its own independent single-premise status: an omission FAIL is an expected, informative result (the removed control is load-bearing within this model, with a matching Rust E2 omission experiment) and never changes the top-level status; an omission PASS means not-independently-falsifiable within this model, not that the control is useless in the real protocol.",
+  "statusVocabulary": {
+    "PASS": "the property held in every explored trace of the bounded abstract model and the exploration was complete",
+    "FAIL": "at least one in-domain counterexample trace exists in the bounded abstract model; decisive even when the exploration was otherwise incomplete",
+    "BLOCKED": "reserved in the shared evidence vocabulary for a checker that could not run (e.g., invalid configuration); this in-process tool raises BoundError or exits with code 2 before any report exists, so no report produced by this tool ever carries BLOCKED",
+    "UNKNOWN": "the exploration was incomplete (bound below the configuration's required bound) without a counterexample, or the trace domain is undecidable (overlapping commit/final-observation intervals)"
+  },
+  "premiseDescriptions": {
+    "pending_probe": "the final load probes pending state at read time (p0 after m0 and p1 after m1 in the ordered m0<p0<m1<p1 bracket, or the strict load's atomic probe); any probe observing an incomplete mutation (commit begun but not durable, or durable but publication incomplete -- publication completes only when BOTH the manifest advance and the evidence body advance have fired) latches the admission fail-closed; publication completing after the probes does not resurrect a latched unsafe delta and there is no admission-time re-derivation",
+    "post_recheck": "cache pre/post bracket: valid pre-observation strictly before the durable commit, plus a post-recheck read (post-observation interval or strict observation) that is valid and agrees with the m0-anchored admission evidence",
+    "final_reload": "admission evidence must come from a valid final load -- the ordered m0/p0/m1/p1 observation sequence (bracket) or one atomic strict load -- anchored at m0, the theorem's t_f; removing it removes the pending probes with it (they run inside the load)",
+    "exact_identity": "candidate match requires evidence revision == candidate revision r0 (without it, grant-presence matching admits successor revisions)",
+    "generation_revoke_fence": "read gate ONLY (the Rust implementation has no admission-time watermark): reads whose observed manifest/body pair is mismatched (torn) or whose generation is below the published head are rejected fail-closed; a rejected read poisons admission",
+    "host_mediation": "all admission goes through the mediated checklist (no bypass path)"
+  },
+  "scopeLimitations": [
+    "Abstract discrete-event model of ONE candidate grant and ONE revocation-class mutation with a single successor revision; not a mechanized proof of any Rust/Java implementation, deployment, or runtime behavior.",
+    "The full contract fixes the admission checklist order (final load m0<p0<m1<p1 -> candidate match -> post-recheck -> admission; strict mode: atomic strict load -> match -> strict recheck -> admission). Free events -- including both publication sub-events and the rollback -- DO interleave between the last read and the admission step; the model does not suppress them, and NO gate is re-evaluated at the admission step: every gate is latched from read-time observations.",
+    "There is NO admission-side watermark and NO admission-time pending re-derivation in this model: the current Rust implementation has neither. The final-read-to-admission window is closed by the latched read-time pending probes (and the post-recheck/fence/identity gates), not by any admission-time check.",
+    "The theorem's final observation t_f is m0 -- the first authoritative observation that supplies the successful final evidence (strict mode: the atomic strict load) -- matching experiment_common.py's final_observation_interval.",
+    "The final load's observation bracket is ordered m0 < p0 < m1 < p1 (bracket mode) with pending captured at p0/p1 read steps; the evidence is anchored at m0. The within-load cache fence-snapshot bracket (F0==F1) and the cache-miss fallback to the authoritative reader are abstracted: a mid-load manifest move is caught by the latched pending probes (incomplete publication) or the post-recheck agreement (completed publication), not by a modeled F0==F1 equality.",
+    "The pending probes capture 'an incomplete mutation is in flight': commit begun but not durable, or durable but publication incomplete (publication completes only when BOTH the manifest advance and the evidence body advance have fired). Treating begun-but-not-durable as pending is conservative (deny-more) relative to a gate that only tracks durable-but-unpublished deltas.",
+    "Publication is modeled as two independently scheduled sub-events after the durable commit: PUBLISH (manifest/version advance, which also advances the durable published head) and EVIDENCE_BODY_ADVANCE (evidence body advance). Consistent publication requires both; the torn states (g1, r0) and (g0, r1) exist between and around them.",
+    "The mutation chain is a fixed total order (commit begin -> commit durable -> manifest advance -> rollback) with the evidence body advance scheduled freely after the durable commit; at most one rollback, only after the manifest advance.",
+    "Steps are dense (every step fires one event); only relative order affects outcomes, and absolute timing/idle gaps are not modeled.",
+    "Overlapping commit/final-observation intervals (the commit spans t_f: begun at/before m0, durable after) are classified UNKNOWN (outside the theorem domain) and are never counted as violations.",
+    "Traces where the mutation commits strictly after t_f are outside the theorem premise (irreducible TOCTOU window) and are not violations.",
+    "Each omission experiment removes exactly one premise; combined omissions are out of scope.",
+    "Omission experiments run in bracket (pre-observation plus post-recheck cache observation pairs) mode; the full contract is checked in both bracket and strict observation modes.",
+    "Omission entry statuses are independent single-premise results: an omission FAIL demonstrates the removed control is load-bearing within this model (and, for each control, a matching Rust E2 omission experiment exists); an omission PASS means not-independently-falsifiable within this model (the remaining controls close every enumerated schedule) and is NOT a claim that the control is useless in the real protocol.",
+    "The top-level report status and fullContract.status describe ONLY the full contract (all modeled premises enabled); they are never an aggregate over the omission results.",
+    "Status precedence: a concrete counterexample is decisive -- a run with at least one in-domain violation reports FAIL even when the exploration was otherwise incomplete (bound truncation); PASS requires a complete exploration with zero violations; UNKNOWN covers incomplete explorations without counterexamples and undecidable (overlap) trace domains. BLOCKED is reserved in the shared vocabulary for a checker that could not run; this in-process tool raises BoundError or exits with code 2 before any report exists and never emits BLOCKED.",
+    "The rollback adversary performs at most one pointer rollback and only after the manifest advance.",
+    "Cache reads observe the cache state at the read's completion step; the strict-observation mode models an atomic re-check and omits the separate pre-observation requirement of the bracket mode.",
+    "Enumeration is a deterministic exhaustive merge of the event chains with fixed chain priority (checklist, pre-observation, mutation, evidence body, bypass); the first reported counterexample is minimal by (event count, lexicographic event tuple).",
+    "A bound below a configuration's required bound (1 + alphabet size) yields an incomplete exploration reported UNKNOWN, never PASS.",
+    "Full-contract PASS is an abstract bounded property only; it is not evidence about the production implementation by itself."
+  ]
+}

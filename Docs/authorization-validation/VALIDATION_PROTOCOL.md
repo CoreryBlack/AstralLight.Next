@@ -154,27 +154,30 @@ The bounded model and controlled omission tests share these stable premise names
 - `host_mediation` is model-only and has no runtime omission switch.
 
 The classifier vocabulary (`strictly_before`, `overlap_unknown`,
-`after_final_observation`, `not_stale`) is locked by the offline tests. Rename either
-side only when the corresponding tests are updated together.
+`after_final_observation`, `not_stale`) is locked by the current Rust E1 contract.
+Archived Python tests remain migration references only; any contract without a Rust
+replacement is explicitly `BLOCKED` in `tests-suite/MANIFEST.toml`.
 
 ## Offline suites and lifecycle observations
 
-The production-profile/series index is in `tests-suite/MANIFEST.toml`; its runner
-is `scripts/test_campaign.py`. RQ components, authorization assumptions M1-M5,
+The production-profile/series index is in `tests-suite/MANIFEST.toml`; its current
+runner is the Rust `test-harness` crate. RQ components, authorization assumptions M1-M5,
 E1-E5, MT-E and performance attribution are separate. The runner executes explicit
 argv against a frozen source hash and existing approved dependencies only, requires
 nonempty assertions, retains ignored/internal skips, and records `PASS`, `FAIL`,
 `BLOCKED`, `SKIP`, `UNKNOWN` or `PENDING`. Per-series summaries describe only the
-selected evidence scope, not a full live campaign. E5 omission counterexamples do
-not fail the full model, but incomplete full-contract exploration cannot pass.
-The two-mutation model partitions independent, non-overlapping event prefixes across
-at most twelve owned processes (the CLI default remains one). Its reducer requires
-the exact complete shard set and
-preserves serial state/trace counts, diagnostic counters and minimal counterexamples;
-no model bound or premise is removed. On POSIX, the campaign runner waits for the
-entire command process group to exit before freezing stdout/stderr hashes, including
-late resource-tracker output. A terminated exploration remains `UNKNOWN` and is never
-upgraded by its cleanup warning or by a subsequent independent run.
+selected evidence scope, not a full live campaign. The E5 single/two-mutation and
+universal Rust model migrations remain BLOCKED until their complete checkers and
+counterexample contracts are implemented; the previous Python tools are retained as
+migration references. The historical two-mutation model partitions independent,
+non-overlapping event prefixes across at most twelve owned processes (the CLI default
+remains one). Its reducer requires the exact complete shard set and preserves serial
+state/trace counts, diagnostic counters and minimal counterexamples; no model bound or
+premise is removed. On POSIX, the campaign runner waits for the entire command process
+group to exit before freezing stdout/stderr hashes, including late child output. Isolated
+runner tests cover descendant output, timeout termination and bounded shared stdout/stderr
+artifacts. A terminated exploration remains `UNKNOWN` and is never upgraded by cleanup or
+a later run.
 
 The local Rust suites cover strict final reload/error classification, gateway identity
 contracts, path/resource registration, and observation wiring. They remain in-process

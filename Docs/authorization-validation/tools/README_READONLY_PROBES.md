@@ -19,7 +19,7 @@ no I/O unless a caller supplies an injected `ReadOnlyProbe`.
 | File | Purpose |
 |---|---|
 | `e3_e4.py` | Read-only probes, precondition capture, state sampling, and fault-outcome validation |
-| `test_e3_e4.py` | Offline unit tests using in-memory probes |
+| [`archive/python-tests/test_e3_e4.py`](../archive/python-tests/test_e3_e4.py) | Archived test source; not a current executable test gate |
 
 The real adapter is supplied by a separately gated caller. This module checks its own
 query restrictions and does not construct a live adapter.
@@ -39,18 +39,21 @@ row counts, Redis pointers, optional queue depth, worker liveness, and per-card 
 decisions. `evaluate_fault_outcomes` accepts only `PENDING` or `DENY` with a reason
 code for configured failure fixtures.
 
-## Offline checks
+## Current offline checks
 
-From the repository root:
+From the repository root, run the selected Rust contracts:
 
 ```bash
-python -m unittest discover -s Docs/authorization-validation/tools \
-  -t Docs/authorization-validation/tools -p 'test_e3_e4.py' -v
-python Docs/authorization-validation/tools/e3_e4.py --self-test
+cargo test -p test-harness --locked --lib e3_reconciliation::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib e4_protocol::tests:: -- --test-threads=1
 ```
 
-Python 3.8+ standard library only. No database, cache, service, container, migration,
-or network access is involved.
+These Rust suites cover typed reconciliation and protocol rules only; they do not
+replace the probe adapter, SQL/Redis/HTTP restrictions, precondition capture, or
+sampling tests. `e3_e4.py --self-test` is retained as a fail-closed compatibility
+response and exits nonzero with `BLOCKED`; it does not discover archived tests.
+No database, cache, service, container, migration, or network access is involved
+in the Rust offline tests.
 
 ## Limitations
 
@@ -58,3 +61,11 @@ Snapshot sampling is not a complete event history and cannot establish per-attem
 recovery behavior. A successful fixture validator checks only the fixture structure;
 it does not prove a live run. HTTP `ALLOW` observations also require request-side
 admission-event reconciliation before treating them as final.
+
+The Rust `e3_reconciliation` and `e4_protocol` modules cover selected typed,
+post-parse evidence and protocol rules only. They do not implement this module's
+`ReadOnlyProbe`, SQL/Redis/HTTP adapter restrictions, precondition capture, or
+sampling lifecycle. The archived Python test source is a migration reference,
+not an executable fallback; `e3-e4-read-only-probe-parity` remains `BLOCKED` in
+[`../../../tests-suite/MANIFEST.toml`](../../../tests-suite/MANIFEST.toml) until
+those contracts are implemented in Rust.

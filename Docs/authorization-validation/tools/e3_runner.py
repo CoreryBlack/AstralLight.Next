@@ -48,9 +48,10 @@ offline fake tests only):
   (``monotonic_ns``) time. No hosts, secrets, or sensitive deployment
   constants are embedded anywhere in this file.
 
-Python 3.8+ standard library only. Offline unit tests live in
-``test_e3_runner.py`` next to this file and use in-memory fakes only; no
-services, containers, sockets, or migrations are involved.
+Python 3.8+ standard library only. The former Python tests are archived under
+``../archive/python-tests/`` and are not a current test entry point. Rust covers
+selected typed post-parse reconciliation only; runner/report parity remains
+BLOCKED. No services, containers, sockets, or migrations are involved here.
 """
 
 from __future__ import annotations

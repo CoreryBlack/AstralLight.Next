@@ -35,15 +35,16 @@ Validation mapping (Docs/authorization-validation/VALIDATION_PROTOCOL.md):
   expiry, unknown ACK). Accepts only ``PENDING``/``DENY`` with a reason code;
   rejects ``ALLOW``, ``UNKNOWN``, absent outcomes, and missing reason codes.
 
-Python 3.8+ standard library only. Offline unit tests live in
-``test_e3_e4.py`` next to this file and use in-memory fake probes only.
+Python 3.8+ standard library only. The former Python test module is retained
+under ``../archive/python-tests/`` and is not a current test entry point. The Rust
+``e3_reconciliation`` and ``e4_protocol`` suites cover selected typed contracts;
+read-only probes and full test parity remain BLOCKED.
 """
 
 from __future__ import annotations
 
 import argparse
 import math
-import os
 import re
 import time
 from dataclasses import dataclass
@@ -1241,40 +1242,30 @@ def evaluate_fault_outcomes(outcomes: Iterable[Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# CLI: --self-test only. No other command exists, and no flag performs I/O.
+# CLI: --self-test is retained only as a fail-closed compatibility response.
 # ---------------------------------------------------------------------------
-
-
-_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def _run_self_test() -> int:
-    import unittest
-
-    loader = unittest.TestLoader()
-    suite = loader.discover(
-        start_dir=_MODULE_DIR, pattern="test_e3_e4.py", top_level_dir=_MODULE_DIR
-    )
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    return 0 if result.wasSuccessful() else 1
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="e3_e4.py",
         description=(
-            "Read-only E3/E4 evidence helpers. This module has no network, database or "
-            "service capability of its own; only --self-test is supported here."
+            "Read-only E3/E4 evidence helpers. Python tests are archived; selected "
+            "typed contracts are tested by the Rust test-harness."
         ),
     )
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="run the offline unit-test suite (test_e3_e4.py) with in-memory fakes; no services are touched",
+        help="deprecated: archived Python tests are not run; use the Rust offline-validation suites",
     )
     args = parser.parse_args(argv)
     if args.self_test:
-        return _run_self_test()
+        print(
+            "BLOCKED: Python self-tests are archived. Run the Rust test-harness suites; "
+            "read-only probe parity remains BLOCKED."
+        )
+        return 2
     parser.print_help()
     return 0
 

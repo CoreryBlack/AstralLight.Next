@@ -20,8 +20,8 @@ case "$MODE" in
     --bench) ARGS=(--run --profile performance-kernel) ;;
     *) printf '[BLOCKED] unknown test mode: %s\n' "$MODE" >&2; exit 2 ;;
 esac
-command -v python >/dev/null 2>&1 || {
-    printf '[BLOCKED] Python 3.11+ is required\n' >&2
-    exit 2
-}
-exec python -B "$SCRIPT_DIR/test_campaign.py" "${ARGS[@]}" "$@"
+if [ "${#ARGS[@]}" -gt 0 ]; then
+    exec cargo run --quiet --locked --manifest-path "$SCRIPT_DIR/../Cargo.toml" -p test-harness --bin test-campaign -- "${ARGS[@]}" "$@"
+else
+    exec cargo run --quiet --locked --manifest-path "$SCRIPT_DIR/../Cargo.toml" -p test-harness --bin test-campaign -- "$@"
+fi

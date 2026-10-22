@@ -38,6 +38,8 @@ redis = { workspace = true, optional = true }
 
 [features]
 default = ["astral-db/test-support"]
+# Java/Rust oracle compatibility target; never part of the native default gate.
+compat-oracle = []
 # 按需兼容验证入口:cargo test -p testsuite --features redis-compat
 redis-compat = [
     "dep:redis",
@@ -182,3 +184,4 @@ required-features = ["redis-compat"]
 [[test]]
 name = "oracle_tests"
 path = "series/COMPAT/oracle_tests.rs"
+required-features = ["compat-oracle"]

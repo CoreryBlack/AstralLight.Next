@@ -116,15 +116,17 @@
 
 ## 复跑入口
 
-从此 Rust 仓库根目录运行，使用 Python 3.11+ 和隔离的 `CARGO_TARGET_DIR`、仓库外 artifact root；实际 runId 不得复用：
+从此 Rust 仓库根目录运行，使用隔离的 `CARGO_TARGET_DIR` 和仓库外 artifact root；实际 runId 不得复用：
 
 ```bash
-CARGO_BUILD_JOBS=4 CARGO_NET_OFFLINE=true python3 -B scripts/test_campaign.py \
-  --run --suite policy-evaluate-benefit-controls \
+CARGO_BUILD_JOBS=4 CARGO_NET_OFFLINE=true bash scripts/run-tests.sh --campaign --run \
+  --suite policy-evaluate-benefit-controls \
   --suite policy-evaluate-evidence-contracts --suite policy-evaluate-benefit \
   --run-id policy-evaluate-benefit-<unique-run-id> \
   --artifact-root "$EVIDENCE_ROOT"
 ```
+
+历史 Python 接受器作为迁移参考保留；当前命令由 Rust `test-harness` 执行，并使用 `test-harness/src/evaluate_acceptance.rs` 验收完整性能协议。
 
 runner 按 manifest 顺序执行，不按 `--suite` 参数顺序重排。Rust 子命令是精确 release ignored matrix，输出正常 footer 中的 864 filtered tests 表示未选的其他 Rust 测试，不表示 45 个性能 case 被过滤；缺少任一 case 仍 FAIL。
 

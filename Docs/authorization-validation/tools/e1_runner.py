@@ -86,7 +86,10 @@ reports interval categories and stale-ALLOW violations as E1 evidence, and
 never asserts an admission-time watermark, a pending re-read, or any
 full-contract property derived from the E5 model check.
 
-Python 3.8+ standard library only. Offline unit tests: ``test_e1_runner.py``.
+Python 3.8+ standard library only. The former Python tests are archived under
+``../archive/python-tests/`` and are not a current test entry point. The Rust E1
+classifier covers typed event classification only; full log-parser parity remains
+BLOCKED.
 """
 
 from __future__ import annotations

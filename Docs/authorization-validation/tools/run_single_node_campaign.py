@@ -204,6 +204,27 @@ COMMANDS: list[dict[str, Any]] = [
 HASHED_SOURCES = [
     "Cargo.toml",
     "Cargo.lock",
+    "test-harness/Cargo.toml",
+    "tests-suite/MANIFEST.toml",
+    "test-harness/src/lib.rs",
+    "test-harness/src/campaign.rs",
+    "test-harness/src/acceptance.rs",
+    "test-harness/src/evaluate_acceptance.rs",
+    "test-harness/src/model_acceptance.rs",
+    "test-harness/src/e1_log.rs",
+    "test-harness/src/e1_validation.rs",
+    "test-harness/src/e3_reconciliation.rs",
+    "test-harness/src/e4_protocol.rs",
+    "test-harness/src/e5_model.rs",
+    "test-harness/src/e5_model/report.rs",
+    "test-harness/src/models.rs",
+    "test-harness/src/unbounded_confirmation.rs",
+    "test-harness/src/dependency_profiles.rs",
+    "test-harness/src/experiment_register.rs",
+    "test-harness/src/lifecycle.rs",
+    "test-harness/src/bin/e5-model-check.rs",
+    "test-harness/src/bin/test-campaign.rs",
+    "test-harness/src/fixtures/e5-single-reference-28.json",
     "policy-engine/Cargo.toml",
     "policy-engine/src/e1_observation.rs",
     "policy-engine/src/engine.rs",
@@ -289,6 +310,16 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def source_snapshot() -> dict[str, str | None]:
+    snapshot: dict[str, str | None] = {}
+    for relative in HASHED_SOURCES:
+        try:
+            snapshot[relative] = sha256(REPO / relative)
+        except OSError:
+            snapshot[relative] = None
+    return snapshot
+
+
 def run_command(spec: dict[str, Any]) -> dict[str, Any]:
     command_id = spec["id"]
     stdout_path = LOGS / f"{command_id}.stdout.log"
@@ -371,6 +402,16 @@ def tool_version(argv: list[str]) -> str | None:
     return (result.stdout or result.stderr).strip()
 
 
+def aggregate_status(statuses: dict[str, str], required: tuple[str, ...]) -> str:
+    observed = [statuses.get(command_id, "SKIP") for command_id in required]
+    for status in ("FAIL", "UNKNOWN", "BLOCKED", "PENDING"):
+        if status in observed:
+            return status
+    if any(status != "PASS" for status in observed):
+        return "SKIP"
+    return "PASS"
+
+
 def runtime_preflight() -> dict[str, Any]:
     tools = {
         "docker": bool(shutil.which("docker")),
@@ -417,8 +458,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     LOGS.mkdir(parents=True)
     started_at = utc_now()
-    source_hashes = {relative: sha256(REPO / relative) for relative in HASHED_SOURCES}
+    source_hashes = source_snapshot()
     commands: list[dict[str, Any]] = []
+    source_drift: list[str] = []
     for spec in COMMANDS:
         if spec.get("status") == "BLOCKED":
             commands.append(
@@ -438,14 +480,40 @@ def main(argv: list[str] | None = None) -> int:
             continue
         result = run_command(spec)
         commands.append(result)
+        last_executed = result
+        current_hashes = source_snapshot()
+        changed = [
+            relative for relative, digest in source_hashes.items()
+            if current_hashes.get(relative) != digest
+        ]
+        if changed:
+            source_drift = changed
+            for completed in commands:
+                if completed["status"] == "PASS":
+                    completed["status"] = "UNKNOWN"
+                    completed["assertionPassed"] = False
+                    completed["sourceDrift"] = changed
+                    completed["reason"] = "source snapshot changed during readiness execution"
+            break
         if result["status"] != "PASS" and spec.get("required"):
             break
     completed_ids = {item["id"] for item in commands}
     skipped_commands = [spec["id"] for spec in COMMANDS if spec["id"] not in completed_ids]
     preflight = runtime_preflight()
     ended_at = utc_now()
-
-    required_pass = not skipped_commands and all(item["status"] == "PASS" for item in commands)
+    final_source_hashes = source_snapshot()
+    source_drift.extend(
+        relative for relative, digest in source_hashes.items()
+        if final_source_hashes.get(relative) != digest and relative not in source_drift
+    )
+    if source_drift:
+        for result in commands:
+            if result["status"] == "PASS":
+                result["status"] = "UNKNOWN"
+                result["assertionPassed"] = False
+                result["sourceDrift"] = source_drift
+                result["reason"] = "source snapshot changed before final readiness freeze"
+    required_pass = not source_drift and not skipped_commands and all(item["status"] == "PASS" for item in commands)
     command_status = {item["id"]: item["status"] for item in commands}
     e2_ids = [name for name in command_status if name.startswith("e2-")]
     e2_status = (
@@ -456,38 +524,20 @@ def main(argv: list[str] | None = None) -> int:
         else "SKIP"
     )
     scenarios = {
-        "E1-observability-build": (
-            "PASS" if all(
-                command_status.get(name) == "PASS" for name in (
-                    "e1-feature-check", "e1-feature-production-clippy",
-                    "e1-policy-engine-feature-tests-build", "e1-astral-db-build",
-                )
-            ) else "FAIL" if any(
-                command_status.get(name) == "FAIL" for name in (
-                    "e1-feature-check", "e1-feature-production-clippy",
-                    "e1-policy-engine-feature-tests-build", "e1-astral-db-build",
-                )
-            ) else "SKIP"
-        ),
+        "E1-observability-build": aggregate_status(command_status, (
+            "e1-feature-check", "e1-feature-production-clippy",
+            "e1-policy-engine-feature-tests-build", "e1-astral-db-build",
+        )),
         "E1-production-race": "BLOCKED",
         "E2-pending-probe-omission": command_status.get("e2-pending-probe-omission", "SKIP"),
         "E2-cache-post-recheck-omission": command_status.get("e2-cache-post-recheck-omission", "SKIP"),
         "E2-exact-identity-omission": command_status.get("e2-exact-identity-omission", "SKIP"),
         "E2-final-reload-omission": command_status.get("e2-final-reload-omission", "SKIP"),
         "E2-generation-revoke-fence-omission": command_status.get("e2-generation-revoke-fence-omission", "SKIP"),
-        "runtime-suites": (
-            "PASS" if all(
-                command_status.get(name) == "PASS" for name in (
-                    "runtime-policy-engine-lib", "runtime-astral-db-lib",
-                    "runtime-astral-common-gateway-contract", "runtime-astral-trustgraph-lib",
-                )
-            ) else "FAIL" if any(
-                command_status.get(name) == "FAIL" for name in (
-                    "runtime-policy-engine-lib", "runtime-astral-db-lib",
-                    "runtime-astral-common-gateway-contract", "runtime-astral-trustgraph-lib",
-                )
-            ) else "SKIP"
-        ),
+        "runtime-suites": aggregate_status(command_status, (
+            "runtime-policy-engine-lib", "runtime-astral-db-lib",
+            "runtime-astral-common-gateway-contract", "runtime-astral-trustgraph-lib",
+        )),
         "E3-recovery-tail": "BLOCKED",
         "E4-preconditions-and-faults": "BLOCKED",
         "E5-abstract-bounded-model": command_status.get("e5-bounded-model", "SKIP"),
@@ -513,6 +563,8 @@ def main(argv: list[str] | None = None) -> int:
         "platform": {"system": platform.system(), "release": platform.release(), "machine": platform.machine()},
         "tools": {"cargo": tool_version(["cargo", "--version"]), "rustc": tool_version(["rustc", "--version"])},
         "sourceHashes": source_hashes,
+        "finalSourceHashes": final_source_hashes,
+        "sourceDrift": source_drift,
         "commands": commands,
         "skippedCommands": skipped_commands,
         "runtimePreflight": preflight,
@@ -536,6 +588,8 @@ def main(argv: list[str] | None = None) -> int:
     ignored = sum(item["ignoredTests"] for item in commands)
     failed = any(item["status"] == "FAIL" for item in commands)
     unknown = [item["id"] for item in commands if item["status"] == "UNKNOWN"]
+    if source_drift:
+        unknown.append("source-drift")
     blocked_commands = [item["id"] for item in commands if item["status"] == "BLOCKED"]
     blocked_scenarios = [
         scenario_id for scenario_id, scenario_status in scenarios.items()
@@ -552,7 +606,8 @@ def main(argv: list[str] | None = None) -> int:
         "campaignId": campaign_id,
         "overall": "FAIL" if failed else "UNKNOWN" if unknown else "BLOCKED",
         "localReady": local_status,
-        "localE2": e2_status,
+        "localE2": "UNKNOWN" if source_drift and e2_ids else e2_status,
+        "localSourceSnapshot": "UNKNOWN" if source_drift else "PASS",
         "scenarios": scenarios,
         "claims": {"C2": "BLOCKED", "C3": "PLANNED", "C4": "PLANNED", "C6": "BLOCKED", "C7": "BLOCKED"},
         "evidenceBoundary": "Local tests and E5 bounded abstraction do not prove real signed HTTP races, external integration, request-side recovery, or deployment faults.",
@@ -563,6 +618,7 @@ def main(argv: list[str] | None = None) -> int:
             *[f"Required local command not executed after earlier gate: {name}" for name in skipped_commands],
         ],
         "unknown": unknown,
+        "sourceDrift": source_drift,
         "blocked": blocked,
         "postconditions": {
             "noServicesStarted": True,

@@ -63,9 +63,9 @@ When constructed with a default actor, the adapter also satisfies the
 ``e3_e4.ReadOnlyProbe`` duck type (``sql`` / ``redis`` / ``signed_get``), so
 the campaign harness can inject it as the E3/E4 probe.
 
-Python 3.8+ standard library only. Offline unit tests live in
-``test_node_adapter.py`` next to this file and use injected fake runners,
-fake transports, and temporary files only.
+Python 3.8+ standard library only. The former Python unit tests are archived
+under ``../archive/python-tests/`` and are not a current test entry point. Rust
+node-adapter parity remains BLOCKED; see the authorization test archive map.
 """
 
 from __future__ import annotations

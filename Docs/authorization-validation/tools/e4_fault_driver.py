@@ -128,16 +128,16 @@ never PASS. ``MAX_ATTEMPTS == 1``: the driver contains no retry loop, records
 proves durable state (any future attempt would need a NEW operation id and
 its own approval).
 
-Python 3.8+ standard library only. Offline unit tests live in
-``test_e4_fault_driver.py`` next to this file and use fully fake controllers
-only (no services, containers, or network are touched).
+Python 3.8+ standard library only. The former Python test module is retained
+under ``../archive/python-tests/`` and is not a current test entry point. Rust
+``e4_protocol`` covers selected typed recovery rules; the full fake-controller
+lifecycle and profile fault matrix remain BLOCKED.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import time
 from dataclasses import dataclass, replace
@@ -1345,20 +1345,6 @@ def build_fault_plan(
 # CLI: --plan / --self-test only. No flag can execute a fault.
 # ---------------------------------------------------------------------------
 
-_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def _run_self_test() -> int:
-    import unittest
-
-    loader = unittest.TestLoader()
-    suite = loader.discover(
-        start_dir=_MODULE_DIR, pattern="test_e4_fault_driver.py", top_level_dir=_MODULE_DIR
-    )
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    return 0 if result.wasSuccessful() else 1
-
-
 def _print_plan(profile: str = DEFAULT_PROFILE) -> None:
     print("E4 fault matrix plan (offline; Exec-L1; profile=" + profile + "):")
     print(LIVE_INTEGRATION_REASON)
@@ -1373,8 +1359,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         description=(
             "Offline-safe E4 fault-matrix protocol driver (Exec-L1). This module "
             "has no fault primitive and no network, database or service "
-            "capability; only --plan and --self-test are supported. Live fault "
-            "injection is Exec-L3 and requires an injected FaultController."
+            "capability; --self-test is a fail-closed compatibility response. "
+            "Live fault injection is Exec-L3 and requires an injected FaultController."
         ),
     )
     parser.add_argument(
@@ -1391,11 +1377,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="run the offline unit-test suite (test_e4_fault_driver.py) with fully fake controllers",
+        help="deprecated: archived Python tests are not run; use Rust offline-validation suites",
     )
     args = parser.parse_args(argv)
     if args.self_test:
-        return _run_self_test()
+        print(
+            "BLOCKED: Python self-tests are archived. Run the Rust e4-protocol-contract suite; "
+            "full controller lifecycle parity remains BLOCKED."
+        )
+        return 2
     _print_plan(args.profile)
     return 0
 

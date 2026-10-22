@@ -1,146 +1,133 @@
 #!/usr/bin/env bash
-# 真实系统上限测量矩阵（node-b 上运行）。
-# Rust GIL-free 客户端按并发阶梯压测，同时采样 MySQL/Redis 每请求命令数
-# 与 trustgraph 进程 CPU（核数），定位吞吐拐点与饱和组件。
-# 用法: MYSQL_ROOT=... bash bench_matrix.sh [biz|health|all] [并发列表，空格分隔]
-# 必填环境变量（不落盘、不入库、不出现在任何进程 argv）:
-#   MYSQL_ROOT   共享 MySQL root 口令（容器名可用 MYSQL_CNAME 覆盖）
-# 凭据通道（M-A 修正：与实际实现一致）：
-#   - mysql 采样：口令+查询均经 stdin 管道（首行被远端 `read` 消费为
-#     MYSQL_PWD，其余 stdin 作为 mysql 查询输入）——docker 客户端 argv 与
-#     容器内 mysql argv 都不含口令值；
-#   - loadgen HMAC：经 loadgen 支持的 LOADGEN_HMAC_SECRET 环境变量注入
-#     （env 为许可通道），不再使用 --hmac-secret argv。
-# 失败语义（fail-closed）：set -euo pipefail；loadgen 非零、单点 ok=0、
-# 基础设施采样失败任一发生 → 立即非零退出，不产出半截 summary。
+# Offered-load campaign entrypoint; execution requires separate approval.
+# Rust 客户端按 offered RPS 阶梯测量；未对齐的 SUT 资源轮询不作为容量证据。
+# 用法: LOADGEN_HMAC_SECRET=... bash bench_matrix.sh [biz|health|all] [RPS 列表，空格分隔]
+# 必填环境变量: LOADGEN_HMAC_SECRET、P99_SLO_MS、ERROR_RATE_SLO。
+# HMAC 仅通过环境变量传给 loadgen，不写入 provenance 或命令行。
+# 非零 loadgen 测点仍保留 JSON 与 summary；缺失/损坏 artifact 时停止。
+# 此脚本不是离线模拟器；调用它会运行 loadgen 并访问 BASE。
+# 系统容量仍需批准的 SUT 侧资源、队列采样与独立运行级 CI，不由本脚本声称。
 set -euo pipefail
 
 LG=${LG:-$HOME/astral-e2e/loadgen/target/release/loadgen}
 BASE=${BASE:-http://127.0.0.1:9005}
-YML=${YML:-$HOME/astral-e2e/tg-run/application.yml}
 OUT=${OUT:-$HOME/astral-e2e/tg-run/real_limit}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPOSITORY_ROOT=$(git -C "$SCRIPT_DIR/../../.." rev-parse --show-toplevel)
 DUR=${DUR:-20}
-# 凭据一律来自调用方环境（历史版本硬编码口令，已按仓库秘密约束移除）。
-MYSQL_ROOT=${MYSQL_ROOT:?MYSQL_ROOT required (shared mysql root password)}
-MYSQL_CNAME=${MYSQL_CNAME:-astral_bench_mysql}
-REDIS_CNAME=${REDIS_CNAME:-astral_bench_redis}
-mkdir -p "$OUT"
-CSV="$OUT/summary.csv"
-
-SECRET=$(grep -oP 'hmac_secret: "\K[^"]+' "$YML" | head -1 || true)
-[ -z "$SECRET" ] && { echo "无法从 $YML 提取 hmac_secret"; exit 1; }
-[ -x "$LG" ] || { echo "loadgen 不存在: $LG"; exit 1; }
-
-TG_PID=$(ss -ltnp "sport = :9005" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1 || true)
-[ -z "$TG_PID" ] && { echo "trustgraph 未运行"; exit 1; }
-
-# provenance（零秘钥）：本次测量矩阵的身份信息（utc/host/loadgen sha256/git 状态/
-# 参数），落 $OUT/provenance.json。
-python3 - "$OUT" "$LG" "$BASE" "$DUR" "$MYSQL_CNAME" "$REDIS_CNAME" <<'PY'
-import hashlib, json, os, socket, subprocess, sys, time
-out, lg, base, dur, mc, rc = sys.argv[1:8]
-def sha256(p):
-    h = hashlib.sha256()
-    with open(p, "rb") as f:
-        for c in iter(lambda: f.read(1 << 20), b""):
-            h.update(c)
-    return h.hexdigest()
-def git_info():
-    d = os.getcwd()
-    while True:
-        if os.path.isdir(os.path.join(d, ".git")):
-            try:
-                rev = subprocess.run(["git", "-C", d, "rev-parse", "HEAD"],
-                                     capture_output=True, text=True, timeout=10)
-                dirty = subprocess.run(["git", "-C", d, "status", "--porcelain"],
-                                       capture_output=True, text=True, timeout=10)
-                if rev.returncode == 0:
-                    return {"rev": rev.stdout.strip(), "dirty": bool(dirty.stdout.strip())}
-            except Exception:
-                pass
-            return None
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None
-        d = parent
-json.dump({
-    "started_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    "host": socket.gethostname(),
-    "loadgen": {"path": lg, "sha256": sha256(lg)},
-    "base_url": base,
-    "duration_s": dur,
-    "mysql_container": mc,
-    "redis_container": rc,
-    "git": git_info(),
-    "secrets_recorded": False,
-}, open(os.path.join(out, "provenance.json"), "w"), indent=1)
-print("provenance: %s" % os.path.join(out, "provenance.json"))
-PY
-
-mysql_questions() {
-  # 口令与查询均经 stdin（首行被远端 read 消费为 MYSQL_PWD，其余 stdin 作为
-  # mysql 查询输入）——docker 客户端与容器内 mysql argv 均不含口令值。
-  printf '%s\n%s\n' "$MYSQL_ROOT" "SHOW GLOBAL STATUS LIKE 'Questions';" \
-    | docker exec -i "$MYSQL_CNAME" sh -c 'IFS= read -r _pw; MYSQL_PWD="$_pw" exec mysql -uroot -N' 2>/dev/null \
-    | awk '{print $2}'
-}
-redis_cmds() {
-  docker exec "$REDIS_CNAME" redis-cli INFO stats 2>/dev/null \
-    | grep total_commands_processed | tr -d '\r' | cut -d: -f2
-}
-tg_cpu_ticks() { awk '{print $14+$15}' "/proc/$TG_PID/stat" 2>/dev/null; }
-
-BIZ_PATH='/main/api/v1/rule-sets/9071/entries'
-HEALTH_PATH='/api/health'
-
-echo "label,concurrency,qps,p50_ns,p90_ns,p99_ns,p999_ns,max_ns,ok,err,mysql_per_req,redis_per_req,cpu_cores" > "$CSV"
-
-run_point() {
-  local label=$1 conc=$2 dur=$3 path=$4
-  local mq0 rq0 cpu0 t0 t1 mq1 rq1 cpu1
-  mq0=$(mysql_questions); rq0=$(redis_cmds); cpu0=$(tg_cpu_ticks)
-  t0=$(date +%s.%N)
-  # HMAC 经 loadgen 支持的 LOADGEN_HMAC_SECRET env 注入（env 前缀赋值是
-  # shell 内部机制，不进入 loadgen argv）；loadgen 失败 → 立即非零退出。
-  LOADGEN_HMAC_SECRET="$SECRET" "$LG" --url "$BASE" --path "$path" \
-    --concurrency "$conc" --duration "$dur" --warmup 30 --output json \
-    > "$OUT/${label}_c${conc}.json"
-  t1=$(date +%s.%N); mq1=$(mysql_questions); rq1=$(redis_cmds); cpu1=$(tg_cpu_ticks)
-  python3 - "$OUT/${label}_c${conc}.json" "$t0" "$t1" \
-    "$mq0" "$mq1" "$rq0" "$rq1" "$cpu0" "$cpu1" "$label" "$conc" <<'PY' >> "$CSV"
-import json, sys
-path, t0, t1, mq0, mq1, rq0, rq1, cpu0, cpu1, label, conc = sys.argv[1:12]
-d = json.load(open(path, encoding='utf-8'))
-if d['ok'] <= 0:
-    sys.stderr.write("BUSINESS FAIL: ok=0 for %s c=%s（不产出伪测量行）\n" % (label, conc))
-    sys.exit(3)
-wall = float(t1) - float(t0)
-ok = d['ok']
-# loadgen JSON 契约漂移兼容:当前版本输出 failures/http_fail/transport_err,
-# 无聚合 'err' 键;三者求和等价旧语义(ok=成功,其余=失败)。
-err = d.get('err')
-if err is None:
-    err = d.get('failures', 0) + d.get('http_fail', 0) + d.get('transport_err', 0)
-mq = (int(mq1) - int(mq0)) / ok
-rq = (int(rq1) - int(rq0)) / ok
-cpu = (int(cpu1) - int(cpu0)) / 100.0 / wall  # CLK_TCK=100, 相对单核
-print(f"{label},{conc},{d['qps']:.1f},{d['p50_ns']},{d['p90_ns']},{d['p99_ns']},{d['p999_ns']},{d['max_ns']},{d['ok']},{err},{mq:.1f},{rq:.1f},{cpu:.2f}")
-PY
-  echo "done: $label c=$conc"
-}
-
+P99_SLO_MS=${P99_SLO_MS:?P99_SLO_MS required}
+ERROR_RATE_SLO=${ERROR_RATE_SLO:?ERROR_RATE_SLO required}
+LOADGEN_HMAC_SECRET=${LOADGEN_HMAC_SECRET:?LOADGEN_HMAC_SECRET required}
+MAX_IN_FLIGHT=${MAX_IN_FLIGHT:-4096}
+CONCURRENCY=${CONCURRENCY:-1}
+THREADS=${THREADS:-1}
+RUN_ID=${RUN_ID:-loadgen-matrix-$(date -u +%Y%m%dT%H%M%SZ)-$$}
+[[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$ ]] || { echo "RUN_ID contains unsupported characters" >&2; exit 2; }
 MODE=${1:-all}
 BIZ_LIST=${2:-"1 8 32 64 128 256 512"}
-HEALTH_LIST=${2:-"8 64 256"}
+[ "$#" -le 2 ] || { echo "unexpected positional arguments" >&2; exit 2; }
+case "$MODE" in biz|all|health) ;; *) echo "unknown mode: $MODE" >&2; exit 2 ;; esac
+for value_name in DUR P99_SLO_MS ERROR_RATE_SLO; do
+  value=${!value_name}
+  [[ "$value" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || { echo "$value_name must be numeric" >&2; exit 2; }
+done
+awk -v value="$DUR" 'BEGIN { exit !(value + 0 > 0) }' || { echo "DUR must be positive" >&2; exit 2; }
+awk -v value="$P99_SLO_MS" 'BEGIN { exit !(value + 0 > 0) }' || { echo "P99_SLO_MS must be positive" >&2; exit 2; }
+awk -v value="$ERROR_RATE_SLO" 'BEGIN { exit !(value + 0 >= 0 && value + 0 <= 1) }' || { echo "ERROR_RATE_SLO must be between zero and one" >&2; exit 2; }
+for value_name in MAX_IN_FLIGHT CONCURRENCY THREADS; do
+  value=${!value_name}
+  [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ] || { echo "$value_name must be a positive integer" >&2; exit 2; }
+done
+[ "$MAX_IN_FLIGHT" -le 1000000 ] && [ "$CONCURRENCY" -le 1000000 ] && [ "$THREADS" -le 256 ] || { echo "loadgen concurrency/thread setting exceeds supported bounds" >&2; exit 2; }
+BASE_TARGET=$(python3 - "$BASE" <<'PY'
+import sys
+from urllib.parse import urlsplit
+url = urlsplit(sys.argv[1])
+if url.scheme not in ("http", "https") or not url.hostname:
+    raise SystemExit("BASE must be an http(s) origin")
+if url.username is not None or url.password is not None or url.path not in ("", "/") or url.query or url.fragment:
+    raise SystemExit("BASE must not contain userinfo, path, query, or fragment")
+try:
+    url.port
+except ValueError as error:
+    raise SystemExit(f"BASE contains an invalid port: {error}")
+print(f"{url.scheme}://{url.netloc}")
+PY
+) || { echo "invalid BASE origin" >&2; exit 2; }
+read -r -a RATES <<<"$BIZ_LIST"
+if [ "$MODE" = biz ] || [ "$MODE" = all ]; then
+  [ "${#RATES[@]}" -gt 0 ] || { echo "empty RPS list" >&2; exit 2; }
+  for rate in "${RATES[@]}"; do
+    [[ "$rate" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || { echo "invalid offered rate: $rate" >&2; exit 2; }
+    awk -v rate="$rate" 'BEGIN { exit !(rate + 0 > 0) }' || { echo "offered rate must be positive: $rate" >&2; exit 2; }
+  done
+fi
+mkdir "$OUT"
+CSV="$OUT/summary.csv"
+command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum is required to identify loadgen" >&2; exit 2; }
+loadgen_sha256=$(sha256sum "$LG" | awk '{print $1}')
+revision=$(git -C "$REPOSITORY_ROOT" rev-parse HEAD 2>/dev/null || true)
+dirty=false
+[ -z "$(git -C "$REPOSITORY_ROOT" status --porcelain 2>/dev/null || true)" ] || dirty=true
+jq -n \
+  --arg started_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg host "$(hostname)" --arg loadgen_path "$LG" --arg loadgen_sha256 "$loadgen_sha256" \
+  --arg target "$BASE_TARGET" --arg duration "$DUR" --arg run_id "$RUN_ID" \
+  --arg p99_slo_ms "$P99_SLO_MS" --arg error_rate_slo "$ERROR_RATE_SLO" \
+  --arg revision "$revision" --argjson dirty "$dirty" \
+  --argjson max_in_flight "$MAX_IN_FLIGHT" --argjson concurrency "$CONCURRENCY" --argjson threads "$THREADS" \
+  '{started_at_utc:$started_at_utc,host:$host,loadgen:{path:$loadgen_path,sha256:$loadgen_sha256},target_scheme_host:$target,duration_s:($duration|tonumber),run_id:$run_id,workload:{mode:"open_loop",max_in_flight:$max_in_flight,concurrency_metadata:$concurrency,tokio_threads:$threads},slo:{p99_ms:($p99_slo_ms|tonumber),error_rate:($error_rate_slo|tonumber)},git:{rev:$revision,dirty:$dirty},credentials_recorded:false}' \
+  > "$OUT/provenance.json"
+echo "provenance: $OUT/provenance.json"
+
+BIZ_PATH='/main/api/v1/rule-sets/9071/entries'
+echo 'label,offered_rps,loadgen_exit,status,success_rps,scheduled,started,missed,dropped,aborted,completed,ok,failures,request_error_rate,cohort_error_rate,cohort_error_ci_lower,cohort_error_ci_upper,p99_ns,p99_ci95_lower_ns,p99_ci95_upper_ns,p99_sample_ci95_relative_half_width,measurement_window_s,drain_ms,client_measurement_in_flight_end,client_in_flight_snapshot_reliable' > "$CSV"
+
+run_point() {
+  local label=$1 rate=$2 dur=$3 path=$4
+  local stem="${label}_r${rate}"
+  local artifact="$OUT/${stem}.json"
+  local raw="$OUT/${stem}.stdout"
+  local stderr="$OUT/${stem}.stderr"
+  local exit_code=0
+  [ ! -e "$artifact" ] && [ ! -e "$raw" ] && [ ! -e "$stderr" ] || { echo "artifact exists for $stem" >&2; return 2; }
+  if LOADGEN_HMAC_SECRET="$LOADGEN_HMAC_SECRET" "$LG" --url "$BASE" --path "$path" \
+    --concurrency "$CONCURRENCY" --rate "$rate" --max-inflight "$MAX_IN_FLIGHT" \
+    --threads "$THREADS" --duration "$dur" --warmup 30 --output json \
+    --run-id "${RUN_ID}-${stem}" --output-file "$artifact" \
+    --p99-slo-ms "$P99_SLO_MS" --error-rate-slo "$ERROR_RATE_SLO" \
+    > "$raw" 2> "$stderr"; then
+    :
+  else
+    exit_code=$?
+  fi
+  [ -s "$artifact" ] || { echo "missing artifact for $stem (loadgen exit $exit_code)" >&2; return 2; }
+  jq -e '.schema_version == 2 and (.measurement | type == "object")' "$artifact" >/dev/null \
+    || { echo "invalid report artifact for $stem" >&2; return 2; }
+  if [ "$exit_code" -ne 0 ]; then
+    echo "retaining $stem report from nonzero loadgen exit $exit_code" >&2
+  fi
+  jq -r --arg label "$label" --arg rate "$rate" --argjson exit_code "$exit_code" '
+    .measurement as $m | $m.observed as $o | $m.counters as $c |
+    [$label, $rate, $exit_code, $m.status, $o.success_rps, $c.scheduled, $c.started,
+     $c.missed, $c.dropped, $c.aborted, $c.completed, $c.ok, $c.failures,
+     $o.measurement_cohort_error_rate, ($o.measurement_cohort_error_rate_ci95[0] // null),
+     ($o.measurement_cohort_error_rate_ci95[1] // null), $o.p99_ns,
+     ($o.p99_ci95_ns[0] // null), ($o.p99_ci95_ns[1] // null),
+     $o.p99_sample_ci95_relative_half_width, $o.measurement_window_seconds,
+     $o.drain_duration_ms, $c.client_measurement_in_flight_end,
+     $m.timing.client_in_flight_snapshot_reliable] | @csv' "$artifact" >> "$CSV"
+  echo "done: $stem (loadgen exit $exit_code, status $(jq -r '.measurement.status' "$artifact"))"
+  return 0
+}
 
 if [ "$MODE" = biz ] || [ "$MODE" = all ]; then
-  for c in $BIZ_LIST; do run_point biz "$c" "$DUR" "$BIZ_PATH"; done
+  for rate in "${RATES[@]}"; do
+    run_point biz "$rate" "$DUR" "$BIZ_PATH"
+  done
 fi
 if [ "$MODE" = health ] || [ "$MODE" = all ]; then
-  # health 场景退役(2026-10-07):/api/health 是 Monitor(9006) 的路径,
-  # trustgraph(9005) 未挂载该路由(实测 404)。基线吞吐由 biz 场景的
-  # 低并发点承载;若需恢复,先把 HEALTH_PATH 指向真实挂载的路由。
-  echo "[skip] health scenario retired: /api/health is not mounted by trustgraph :9005 (404 measured 2026-10-06)"
+  echo "[skip] health scenario retired: /api/health is not mounted by trustgraph :9005"
 fi
 
 echo "=== summary ==="

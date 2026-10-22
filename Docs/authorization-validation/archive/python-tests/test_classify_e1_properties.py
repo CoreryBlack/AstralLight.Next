@@ -25,9 +25,12 @@ Properties (all must hold for every grid point, both evidence sources):
 - P4  Boundary exactness: the violation flag flips exactly at
       ``commit.end == m0.start`` (a commit durable AT t_f is overlap, not
       strictly-before); verified by an explicit boundary pair per ladder.
-- P5  Branch coverage: the grid exercises all six categories, including
-      the residual ``unclassified-unknown`` (a commit beginning exactly
-      at the host-admission sequence).
+- P5  Reachable branch coverage: the single-process grid exercises the four
+      reachable categories. ``in-flight`` is pre-empted by the post-final
+      observation branch for an ordered, non-overlapping commit, while
+      ``unclassified-unknown`` would require reusing the host-admission
+      sequence. Both remain in the vocabulary for cross-log classification
+      but are unreachable under this classifier's unique-sequence contract.
 
 Malformed inputs (identity mismatch, uncommitted outcome, non-ALLOW
 decision) must raise ``EvidenceError`` -- the classifier fails closed.

@@ -1,5 +1,6 @@
 //! Multi-tenant benchmarks for strict published-evidence authorization.
 
+#[allow(dead_code)]
 #[path = "../../tests-suite/series/MT-E1/support/published.rs"]
 mod published;
 

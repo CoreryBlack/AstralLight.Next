@@ -226,8 +226,9 @@ CLI
 yields an incomplete exploration reported UNKNOWN, never PASS. Exit codes:
 0 = report produced; 2 = invalid arguments.
 
-Python 3.8+ standard library only. Offline unit tests live in
-``test_e5_model_check.py`` next to this file.
+Python 3.8+ standard library only. The former Python unit tests are archived
+under ``../archive/python-tests/`` and are not a current test entry point. The
+Rust single-mutation checker is the current executable model contract.
 """
 
 from __future__ import annotations

@@ -27,7 +27,6 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from experiment_common import atomic_json, verify_checksums, write_checksums
-from model_acceptance import check_full_contract, check_universal
 
 PREVIOUS_ATTEMPT = {
     "campaignId": "authz-validation-20260919-single-node-005",
@@ -148,11 +147,40 @@ COMMANDS: list[dict[str, Any]] = [
         "required": True,
     },
     {
-        "id": "offline-python-tests",
-        "argv": ["python", "-m", "unittest", "discover", "-s", str(TOOLS), "-p", "test_*.py"],
+        "id": "offline-rust-harness-tests",
+        "argv": ["cargo", "test", "--manifest-path", str(RUST / "Cargo.toml"), "-p", "test-harness", "--locked", "--", "--test-threads=1"],
         "required": True,
-        "expectedStderr": "OK",
-        "minimumPythonTests": 1,
+        "expected": "; 0 failed",
+    },
+    {
+        "id": "e5-bounded-model",
+        "argv": ["cargo", "test", "--manifest-path", str(RUST / "Cargo.toml"), "-p", "test-harness", "--locked", "--lib", "e5_model::tests::full_contract_and_omission_counts_match_the_reference_checker", "--", "--exact", "--test-threads=1"],
+        "required": True,
+        "expected": "1 passed; 0 failed",
+    },
+    {
+        "id": "offline-tenant-rust-contract",
+        "argv": ["cargo", "test", "--manifest-path", str(RUST / "Cargo.toml"), "-p", "test-harness", "--locked", "--lib", "models::tests::", "--", "--test-threads=1"],
+        "required": True,
+        "expected": "; 0 failed",
+    },
+    {
+        "id": "e3-reconciliation-rust-contract",
+        "argv": ["cargo", "test", "--manifest-path", str(RUST / "Cargo.toml"), "-p", "test-harness", "--locked", "--lib", "e3_reconciliation::tests::", "--", "--test-threads=1"],
+        "required": True,
+        "expected": "; 0 failed",
+    },
+    {
+        "id": "e4-protocol-rust-contract",
+        "argv": ["cargo", "test", "--manifest-path", str(RUST / "Cargo.toml"), "-p", "test-harness", "--locked", "--lib", "e4_protocol::tests::", "--", "--test-threads=1"],
+        "required": True,
+        "expected": "; 0 failed",
+    },
+    {
+        "id": "unbounded-single-rust-contract",
+        "argv": ["cargo", "test", "--manifest-path", str(RUST / "Cargo.toml"), "-p", "test-harness", "--locked", "--lib", "unbounded_confirmation::tests::", "--", "--test-threads=1"],
+        "required": True,
+        "expected": "; 0 failed",
     },
     {
         "id": "workspace-test-compile",
@@ -160,24 +188,16 @@ COMMANDS: list[dict[str, Any]] = [
         "required": True,
     },
     {
-        "id": "e5-bounded-model",
-        "argv": ["python", str(TOOLS / "e5_model_check.py"), "--max-steps", "28", "--json"],
-        "required": True,
-        "assertE5AbstractModel": True,
-    },
-    {
         "id": "e5-bounded-model-two-mutations",
-        "argv": ["python", str(TOOLS / "e5_model_check_two_mutations.py")],
+        "status": "BLOCKED",
         "required": True,
-        "assertTwoMutationModel": True,
-        "timeoutSeconds": 2400,
+        "reason": "equivalent Rust two-mutation state-space and reducer are not implemented; archived Python reference is not dispatched",
     },
     {
         "id": "e5-universal-hypotheses",
-        "argv": ["python", str(TOOLS / "universal_hypotheses_check.py"), "--model", "both", "--json"],
+        "status": "BLOCKED",
         "required": True,
-        "assertUniversalHypotheses": True,
-        "timeoutSeconds": 3600,
+        "reason": "equivalent Rust universal-hypothesis computation over both models is not implemented; archived Python reference is not dispatched",
     },
 ]
 
@@ -204,7 +224,7 @@ HASHED_SOURCES = [
     "astral-trustgraph/src/service/sync_publish.rs",
     "Docs/authorization-validation/VALIDATION_PROTOCOL.md",
     "Docs/authorization-validation/EVIDENCE_BOUNDARY_MATRIX.md",
-    "Docs/规范/BACKEND_STANDARD.md",
+    "Docs/规范/Rust后端编码规范_V1.0.md",
     "astral-common/Cargo.toml",
     "astral-common/src/audit.rs",
     "astral-common/src/experiment_observation.rs",
@@ -214,31 +234,39 @@ HASHED_SOURCES = [
     "astral-db/src/grant_repository.rs",
     "astral-db/src/lib.rs",
     "Docs/authorization-validation/tools/experiment_common.py",
-    "Docs/authorization-validation/tools/test_experiment_common.py",
     "Docs/authorization-validation/tools/e3_e4.py",
-    "Docs/authorization-validation/tools/test_e3_e4.py",
     "Docs/authorization-validation/tools/node_adapter.py",
-    "Docs/authorization-validation/tools/test_node_adapter.py",
     "Docs/authorization-validation/tools/e1_runner.py",
-    "Docs/authorization-validation/tools/test_e1_runner.py",
     "Docs/authorization-validation/tools/lifecycle_reducer.py",
-    "Docs/authorization-validation/tools/test_lifecycle_reducer.py",
     "Docs/authorization-validation/tools/e3_runner.py",
-    "Docs/authorization-validation/tools/test_e3_runner.py",
     "Docs/authorization-validation/tools/e4_fault_driver.py",
-    "Docs/authorization-validation/tools/test_e4_fault_driver.py",
     "Docs/authorization-validation/tools/e5_model_check.py",
-    "Docs/authorization-validation/tools/test_e5_model_check.py",
     "Docs/authorization-validation/tools/e5_model_check_two_mutations.py",
-    "Docs/authorization-validation/tools/test_e5_model_check_two_mutations.py",
     "Docs/authorization-validation/tools/universal_hypotheses_check.py",
-    "Docs/authorization-validation/tools/test_universal_hypotheses_check.py",
     "Docs/authorization-validation/tools/experiment_register.py",
-    "Docs/authorization-validation/tools/test_experiment_register.py",
-    "Docs/authorization-validation/tools/test_classify_e1_properties.py",
     "Docs/authorization-validation/tools/run_single_node_campaign.py",
     "Docs/authorization-validation/tools/model_acceptance.py",
-    "Docs/authorization-validation/tools/test_run_single_node_campaign.py",
+    "Docs/authorization-validation/tools/README_READONLY_PROBES.md",
+    "Docs/authorization-validation/archive/python-tests/README.md",
+    "Docs/authorization-validation/archive/python-tests/test_bounded_model_execution.py",
+    "Docs/authorization-validation/archive/python-tests/test_classify_e1_properties.py",
+    "Docs/authorization-validation/archive/python-tests/test_dependency_profiles.py",
+    "Docs/authorization-validation/archive/python-tests/test_e1_runner.py",
+    "Docs/authorization-validation/archive/python-tests/test_e3_e4.py",
+    "Docs/authorization-validation/archive/python-tests/test_e3_runner.py",
+    "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py",
+    "Docs/authorization-validation/archive/python-tests/test_e5_model_check.py",
+    "Docs/authorization-validation/archive/python-tests/test_e5_model_check_two_mutations.py",
+    "Docs/authorization-validation/archive/python-tests/test_experiment_common.py",
+    "Docs/authorization-validation/archive/python-tests/test_experiment_register.py",
+    "Docs/authorization-validation/archive/python-tests/test_lifecycle_reducer.py",
+    "Docs/authorization-validation/archive/python-tests/test_model_acceptance.py",
+    "Docs/authorization-validation/archive/python-tests/test_node_adapter.py",
+    "Docs/authorization-validation/archive/python-tests/test_projection_owner_model.py",
+    "Docs/authorization-validation/archive/python-tests/test_run_single_node_campaign.py",
+    "Docs/authorization-validation/archive/python-tests/test_tenant_isolation_model.py",
+    "Docs/authorization-validation/archive/python-tests/test_unbounded_confirmation.py",
+    "Docs/authorization-validation/archive/python-tests/test_universal_hypotheses_check.py",
     "Docs/authorization-validation/formal/AdmissionSafety.tla",
     "Docs/authorization-validation/formal/AdmissionSafetyFull.cfg",
     "Docs/authorization-validation/formal/AdmissionSafetyNoPendingProbe.cfg",
@@ -304,39 +332,10 @@ def run_command(spec: dict[str, Any]) -> dict[str, Any]:
     assertion_ok = (expected is None or expected in stdout) and (
         expected_stderr is None or expected_stderr in stderr
     )
-    abstract_model_status = None
-    two_mutation_status = None
-    universal_status = None
-    model_checks = (
-        ("assertE5AbstractModel", "single"),
-        ("assertTwoMutationModel", "two"),
-        ("assertUniversalHypotheses", "universal"),
-    )
-    for flag, model_name in model_checks:
-        if not spec.get(flag) or execution_status != "PASS":
-            continue
-        try:
-            model_report = json.loads(stdout)
-            checked = check_universal(model_report) if model_name == "universal" else check_full_contract(model_report, model_name)
-        except (ValueError, KeyError, TypeError, AttributeError):
-            checked = {"status": "UNKNOWN"}
-        assertion_ok = assertion_ok and checked["status"] == "PASS"
-        if model_name == "single":
-            abstract_model_status = checked["status"]
-        elif model_name == "two":
-            two_mutation_status = checked["status"]
-        else:
-            universal_status = checked["status"]
-        if checked["status"] == "UNKNOWN":
-            execution_status = "UNKNOWN"
     ignored_count = sum(
         int(match.group(1)) for match in re.finditer(r"(\d+) ignored;", stdout)
     )
-    python_tests_run = None
-    if spec.get("minimumPythonTests") is not None:
-        match = re.search(r"Ran\s+(\d+)\s+tests?\b", stderr)
-        python_tests_run = int(match.group(1)) if match else 0
-        assertion_ok = assertion_ok and python_tests_run >= int(spec["minimumPythonTests"])
+
     if execution_status == "PASS" and (exit_code != 0 or not assertion_ok):
         execution_status = "FAIL"
     return {
@@ -353,10 +352,6 @@ def run_command(spec: dict[str, Any]) -> dict[str, Any]:
         "expectedStderr": expected_stderr,
         "assertionPassed": assertion_ok,
         "ignoredTests": ignored_count,
-        "pythonTestsRun": python_tests_run,
-        "abstractModelStatus": abstract_model_status,
-        "twoMutationModelStatus": two_mutation_status,
-        "universalHypothesesStatus": universal_status,
         "status": execution_status,
         "stdout": str(stdout_path.relative_to(OUT)).replace("\\", "/"),
         "stderr": str(stderr_path.relative_to(OUT)).replace("\\", "/"),
@@ -425,6 +420,22 @@ def main(argv: list[str] | None = None) -> int:
     source_hashes = {relative: sha256(REPO / relative) for relative in HASHED_SOURCES}
     commands: list[dict[str, Any]] = []
     for spec in COMMANDS:
+        if spec.get("status") == "BLOCKED":
+            commands.append(
+                {
+                    "id": spec["id"],
+                    "argv": [],
+                    "cwd": str(RUST),
+                    "startedAt": None,
+                    "endedAt": None,
+                    "exitCode": None,
+                    "assertionPassed": False,
+                    "status": "BLOCKED",
+                    "reason": spec["reason"],
+                    "logComplete": True,
+                }
+            )
+            continue
         result = run_command(spec)
         commands.append(result)
         if result["status"] != "PASS" and spec.get("required"):
@@ -481,10 +492,10 @@ def main(argv: list[str] | None = None) -> int:
         "E4-preconditions-and-faults": "BLOCKED",
         "E5-abstract-bounded-model": command_status.get("e5-bounded-model", "SKIP"),
         "E5-abstract-bounded-model-two-mutations": command_status.get(
-            "e5-bounded-model-two-mutations", "SKIP"
+            "e5-bounded-model-two-mutations", "BLOCKED"
         ),
         "E5-universal-hypotheses": command_status.get(
-            "e5-universal-hypotheses", "SKIP"
+            "e5-universal-hypotheses", "BLOCKED"
         ),
     }
     manifest = {
@@ -507,7 +518,7 @@ def main(argv: list[str] | None = None) -> int:
         "runtimePreflight": preflight,
         "statisticsUnit": {
             "E2": "one in-memory paired scenario per omission control; five one-shot controls, no repeated-run distribution",
-            "E5": "finite abstract-model schedules (single- and two-mutation models, universal hypotheses), not production implementation proof",
+            "E5": "Rust single-mutation abstract model only; two-mutation and universal-hypothesis migrations are BLOCKED, not dispatched",
             "E1/E3/E4": "not run",
         },
         "coverage": {

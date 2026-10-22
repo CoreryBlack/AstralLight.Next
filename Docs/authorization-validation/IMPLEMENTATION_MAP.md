@@ -12,8 +12,11 @@ independent of the separate multi-tenant delivery milestones that also use M1-M3
 | M4: trusted storage and processes | fail-closed checks, offline harness tests, and the independent TLA+ input | Exercises mismatch/error handling and safe defaults | Non-Byzantine storage/processes and trusted integrity keys remain explicit assumptions; the TLA+ input is `BLOCKED` until verified |
 | M5: complete mediation | gateway contract tests, permission middleware, host-admission tests, the mediation omission model, and the SDK integration path's mandatory external identity mapping (`INTEGRATION_NOT_AUTHORIZED` on absence, no bypass) | Exercises signed context, middleware, and selected host-admission contracts | Complete mediation of every deployed host operation is not established by this checkout alone |
 
-E1-E5 are validation/tool labels, not independent proofs of M1-M5. The bounded Python
-model and omission tests provide implementation and model coverage only.
+E1-E5 are validation/tool labels, not independent proofs of M1-M5. The bounded models
+and omission checks provide implementation and model coverage only. Archived Python test
+sources are indexed at [`archive/python-tests/README.md`](archive/python-tests/README.md);
+they are not current gates. Rust coverage is limited to the specified migrated contracts,
+and remaining parity suites stay `BLOCKED` in the manifest.
 
 ## Separate multi-tenant milestones
 
@@ -34,9 +37,10 @@ deployment (redis projection compatibility is refused at startup without a compi
 
 `tests-suite/MANIFEST.toml` indexes every RQ/M/E/MT/performance, compatibility and
 excluded scope with its production dependency contract and exact command or explicit
-blocker. `scripts/test_campaign.py` validates this index before dispatch, retains
+blocker. The Rust `test-harness` runner validates this index before dispatch, retains
 nonempty assertion/ignored/SKIP evidence, records a frozen content hash and never
-provisions dependencies or retries unknown results.
+provisions dependencies or retries unknown results. The previous Python runner remains
+as migration/reference source until its remaining test logic is reconciled.
 
 `tests-suite/series/RQ3/native_projection_lifecycle.rs` adds a single ignored real-MySQL
 binary exercising the production TrustGraph source repository, post-commit local

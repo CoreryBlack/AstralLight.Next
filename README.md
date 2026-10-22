@@ -59,12 +59,12 @@ cargo clippy --workspace -- -D warnings
 cargo test --workspace
 ```
 
-The single execution owner is `scripts/test_campaign.py`; shell and matrix commands
+The Rust `test-harness` crate is the single execution owner; shell and matrix commands
 are selection aliases, not independent runners:
 
 ```bash
 bash scripts/run-tests.sh --all
-python -B scripts/test_campaign.py --list --json
+bash scripts/run-tests.sh --campaign --list --json
 bash scripts/run-tests.sh --integration
 bash scripts/run-tests.sh --rabbit
 ```
@@ -97,18 +97,18 @@ Full phase logs, commands, exit codes and source hashes are retained outside the
 repository. UNKNOWN requires reconciliation before retry. See
 [tests-suite](tests-suite/README.md) for exact profiles and evidence boundaries.
 
-The consolidated runner indexes RQ1-RQ5, authorization assumptions M1-M5,
+The consolidated Rust runner indexes RQ1-RQ5, authorization assumptions M1-M5,
 E1-E5, MT, performance, compatibility, and excluded suites against explicit
 production deployment profiles:
 
 ```bash
-python -B scripts/test_campaign.py --list --json
+bash scripts/run-tests.sh --campaign --list --json
 bash scripts/run-tests.sh --campaign --run --profile native-kernel --series E2
-python -B scripts/test_campaign.py --run --profile offline-validation --suite offline-validation-tools
-python -B scripts/test_campaign.py --run --profile native-single-node --suite native-projection-lifecycle
+bash scripts/run-tests.sh --campaign --run --profile offline-validation --suite offline-validation-tools
+bash scripts/run-tests.sh --campaign --run --profile native-single-node --suite native-projection-lifecycle
 ```
 
-It requires Python 3.11+, never provisions or migrates, and uses only approved,
+It never provisions or migrates, and uses only approved,
 already migrated isolated dependencies (`TEST_USE_EXISTING=1`). Native integration
 uses only MySQL and in-process buses; Rabbit transport and Redis compatibility
 remain explicit profiles. Each indexed command carries its owner, dependency
@@ -159,8 +159,9 @@ campaign has passed:
 - compiler/oracle tests and policy-engine benchmarks;
 - `scripts/run-tests.sh`, `scripts/org_scope_preflight.sh`, and
   `scripts/verify-excluded-services.ps1`;
-- E1-E5 validation tools and offline tests under
-  [`Docs/authorization-validation/tools/`](Docs/authorization-validation/tools/);
+- Rust E5 single-mutation bounded model and exact Python 2.1.0 baseline fixture
+  under `test-harness`; retained E1-E5 migration tools and unmigrated offline
+  checks remain under [`Docs/authorization-validation/tools/`](Docs/authorization-validation/tools/);
 - bounded authorization safety-model inputs under [`Docs/authorization-validation/formal/`](Docs/authorization-validation/formal/),
   currently marked `BLOCKED` until a pinned TLC run exists;
 - distributed validation harness source under

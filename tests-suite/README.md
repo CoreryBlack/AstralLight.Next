@@ -4,6 +4,24 @@
 > `series/<系列>/`,单元测试按 Cargo 语义留在属主 crate。`MANIFEST.toml`
 > 保留全部测试的编目、多系列归属和 suite 执行索引。
 
+## 原生默认与兼容 opt-in
+
+默认 `cargo test --workspace` 只运行当前架构的原生测试。兼容/legacy 覆盖
+必须显式开启，不进入原生通过数：
+
+```bash
+# PolicyEngine legacy L1/L2/fallback/CARD_ONLY
+cargo test -p policy-engine --lib --features legacy-tests
+
+# Java/Rust oracle
+cargo test -p testsuite --test oracle_tests --features compat-oracle
+
+# Redis evidence cache compatibility
+cargo test -p testsuite --features redis-compat --test evidence_cache_redis_integration
+```
+
+归档 Java/S15/TDSC、冻结 learn/chat/cache 和 blocked campaign 不进入默认 gate。
+
 ## 物理系列目录
 
 集成测试按**主系列**集中存放;一个测试仍可在 MANIFEST 中归属多个系列。
@@ -63,37 +81,38 @@ bash scripts/run-tests.sh --rabbit
 bash tests-suite/matrix/run-mt-matrix.sh --suites "mt_extreme_churn mt_extreme_capacity"
 ```
 
-shell 和矩阵均只是 `scripts/test_campaign.py` 的选择别名，没有第二份命令清单或
-数据库校验实现。旧自动 Docker/DDL 行为已移除；已批准的资源不得由测试入口自动
-创建或删除。架构依据见
+shell 和矩阵均只是 Rust `test-harness` 的选择别名，没有第二份命令清单或
+数据库校验实现。`scripts/tests/test-run-tests.sh` 是旧路径兼容入口，转发到 Rust
+fake-Cargo 合同，不启动真实 campaign。旧 Python runner 保留作迁移来源，不属于默认
+执行入口；旧自动 Docker/DDL 行为已移除，已批准的资源不得由测试入口自动创建或删除。架构依据见
 [内存权威读面与失效通道方案](../Docs/架构/Rust架构设计/Rust内存权威读面与失效通道架构方案_V0.1.md)。
 
 ## 统一 Profile 与系列入口
 
 `MANIFEST.toml` 保留全量 `entry` 分类，并新增机器可读的 `profile`、`series`、
-`suite` 索引。`scripts/test_campaign.py` 是统一执行入口（Python 3.11+），不使用
-shell `eval`，不启动容器/服务，不迁移，不注入 live fault，也不重试 UNKNOWN。
+`suite` 索引。统一执行入口是 Rust `test-harness`（由 `scripts/run-tests.sh`
+调用），不使用 shell `eval`，不启动容器/服务，不迁移，不注入 live fault，也不重试 UNKNOWN。
 每个 suite 声明属主、精确 argv、生产/测试服务、源码、断言数量和证明边界；
 测试服务与生产 profile 不一致时，在派发前拒绝。
 
 | profile | 服务依赖 | 证明范围 |
 |---|---|---|
 | `native-kernel` | 无 | 生产组件/strict 注入夹具；不证明 durable DB 或 HTTP |
-| `offline-validation` | 无 | Python 标准库协议与有界模型 |
+| `offline-validation` | 无 | Rust 协议合约与有界模型（含 E5 单 mutation 报告差分）；已归档 Python 测试只作历史迁移参考、不运行；未迁合同保持显式 BLOCKED；形式模型/实装证据边界保持分离 |
 | `native-single-node` | MySQL | LocalBus/LocalProjectionBus/MemoryProjectionHub 真实本地链路 |
 | `standalone-rabbit` | MySQL + RabbitMQ | 独立服务传输与 durable consumer 证明；无 Redis |
 | `distributed` | MySQL + RabbitMQ | 当前多进程目标；历史 Redis/OPA harness 不自动派发 |
 | `redis-compat` | MySQL + Redis | 显式 adapter 兼容窗口，登记到期 2026-12-31 |
 | `performance-kernel` | 无 | compiler/policy/hub CPU 与分配数据 |
-| `performance-native` | MySQL | native composite 签名 HTTP/收敛/负载，需独立部署证据 |
+| `performance-native` | MySQL | native composite 签名 HTTP/收敛/负载，需独立部署、SUT 资源/积压采样和运行级 CI 证据；脚本仅提供 offered-RPS 客户端测量 |
 
 ```bash
-python -B scripts/test_campaign.py --list --json
+bash scripts/run-tests.sh --campaign --list --json
 bash scripts/run-tests.sh --list-series --series RQ
-python -B scripts/test_campaign.py --run --profile native-kernel --series E2
-python -B scripts/test_campaign.py --run --profile offline-validation --suite offline-validation-tools
-python -B scripts/test_campaign.py --run --profile native-single-node --suite native-projection-lifecycle
-python -B scripts/test_campaign.py --run --profile performance-kernel --suite strict-policy-benchmark
+bash scripts/run-tests.sh --campaign --run --profile native-kernel --series E2
+bash scripts/run-tests.sh --campaign --run --profile offline-validation --suite offline-validation-tools
+bash scripts/run-tests.sh --campaign --run --profile native-single-node --suite native-projection-lifecycle
+bash scripts/run-tests.sh --campaign --run --profile performance-kernel --suite strict-policy-benchmark
 ```
 
 真实 local-message outbox 压力与幂等覆盖可单独选择 `db-local-message-duplicate-stress` 或 `db-local-message-load`；两者需要已迁移隔离 MySQL，计数器高水位保留，负载测试覆盖单一热点 scope，不代表 HTTP、broker 或多节点吞吐。
@@ -116,6 +135,12 @@ manifest（含真实集成和显式 BLOCKED 项），任何前置缺失都会阻
 UNKNOWN/PENDING 会停止派发；先修复或对账该项、重测单项，再用新 runId 从头重跑原集合。
 runner 不自动修源码、不盲目重试、不缓存历史 PASS。
 
+Authorization validation 的 19 个旧 Python 测试模块已移入
+[`Docs/authorization-validation/archive/python-tests/`](../Docs/authorization-validation/archive/python-tests/README.md)，
+不再由 `unittest discover` 或 readiness campaign 运行。Rust targets 是当前测试入口；
+归档清单逐项记录其映射与覆盖边界。未迁移合同仍在 `MANIFEST.toml` 标为 `BLOCKED`，
+归档源文件不构成 PASS 或 fallback。
+
 RQ1-5 是主标签;`RQ-A` / `RQ-B` / `RQ-Compare` / `RQ5-E` 子系列已登记,
 其中 RQ-A/RQ-B/RQ-Compare 需要外部 comparator/SpiceDB,RQ5-E 需要 live
 signed HTTP/三节点环境,当前均为 BLOCKED。逐项状态见
@@ -124,7 +149,9 @@ RQ2-D 是结构性 N/A。M1-5 是
 source capture、monotone publication、faithful representation、trusted
 storage/processes、complete mediation 假设映射，不是五个独立证明，也不是
 架构交付 M1-M3。E1-5 保留独立协议、模型与 live campaign；E2 的五个精确
-Rust 目标必须各执行一例，host_mediation 仍为 model-only。MT-E1/E3/E4/E5/E6
+Rust 目标必须各执行一例，host_mediation 仍为 model-only。E5 单 mutation 已由 Rust
+显式状态空间与旧报告 fixture 差分覆盖；双 mutation、universal hypotheses 与
+projection-owner BFS 仍是独立 BLOCKED 项。MT-E1/E3/E4/E5/E6
 保持真实 MySQL suite，未实现的 MT-E2 明确 BLOCKED，不补造一个成功编号。
 
 CPU-only 的三组 `PERF_MATRIX` 还须分别输出完整 82/15/40 个唯一 case、
@@ -141,7 +168,7 @@ CPU-only 的三组 `PERF_MATRIX` 还须分别输出完整 82/15/40 个唯一 cas
 不能把此结果表述为共享 Arc 穿过评估器或签名 HTTP 的端到端收益。
 
 ```bash
-python -B scripts/test_campaign.py --run --suite policy-evaluate-benefit-controls --suite policy-evaluate-evidence-contracts --suite policy-evaluate-benefit
+bash scripts/run-tests.sh --campaign --run --suite policy-evaluate-benefit-controls --suite policy-evaluate-evidence-contracts --suite policy-evaluate-benefit
 ```
 
 固定 45 个 case（1/8/128/512/2048 grants × 1/4/8 threads × 首/尾命中 ALLOW 与无匹配 DENY），

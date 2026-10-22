@@ -93,21 +93,30 @@ and are no longer current executable gates:
   checker's two-model C1/C2 report.
 
 The archived Python tests are not run by the readiness campaign or Rust campaign
-runner. Rust replacements cover only the exact contracts listed above; the E1
-live-log parser, complete E3 runner/report, E4 fake-controller lifecycle,
-read-only E3/E4 probes, bounded worker/shard, node adapter, dependency-profile
-fault matrix, experiment register, lifecycle reducer, and legacy campaign report
-parity remain explicitly `BLOCKED` in `tests-suite/MANIFEST.toml`. E5
-two-mutation, universal-hypothesis, projection-owner BFS, and full two-model
-unbounded-confirmation contracts also remain migration-pending. Archiving their
-Python sources does not convert these items to `PASS`. Live service/DB campaigns
-remain dependency-gated and are not offline migration evidence.
+runner. Current Rust-native offline suites include the E1 JSONL parser, dependency
+profile/fault declaration matrix, experiment register, and E1/E3 lifecycle reducer,
+in addition to the earlier E1 classifier, typed E3 reconciliation, E4 protocol,
+tenant model, E5 single-mutation model, and single-model unbounded-confirmation
+contracts. These contracts cover only the exact boundaries documented in the
+archive mapping; declarations, parser records, and synthetic timing samples are not
+runtime campaign evidence.
 
-The Rust readiness command list now replaces Python test discovery with explicit
-`test-harness` targets for its whole offline suite, E5 single mutation, tenant
-model, E3 reconciliation, E4 protocol, and single-model unbounded confirmation.
-No Rust test is claimed to replace an archived Python contract beyond its
-registered boundary.
+The full E1 runner and report, complete E3 runner/report, read-only E3/E4 probes,
+E4 fake-controller lifecycle, bounded worker/shard, node adapter, legacy campaign
+report schema, two-mutation model, universal-hypothesis computation, projection-owner
+BFS, and full two-model unbounded-confirmation remain `BLOCKED` in
+`tests-suite/MANIFEST.toml`. Archiving their Python sources does not convert these
+items to `PASS`. Live service/DB campaigns remain dependency-gated and are not
+offline migration evidence.
+
+The Rust readiness command list replaces Python test discovery with explicit
+Rust targets. It runs the complete offline harness and then some focused targets
+for E5, tenant, E3, E4 and unbounded confirmation as separate evidence commands.
+Those Rust targets overlap by design; the default `native-kernel`/`offline-validation`
+profile selection in `tests-suite` omits the whole-harness suite unless that suite
+is explicitly selected, preventing the campaign runner from also executing its
+narrow contracts by default. No Rust test is claimed to replace an archived Python
+contract beyond its registered boundary.
 
 The focused Rust contract targets are:
 

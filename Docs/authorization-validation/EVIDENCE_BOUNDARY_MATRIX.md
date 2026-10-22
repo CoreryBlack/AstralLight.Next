@@ -47,8 +47,18 @@ be rewritten as `PASS`.
 The following may be executed without external services:
 
 - the Rust runtime unit suites and gateway contract tests;
-- Python harness, classifier, reducer, and model unit tests;
+- Rust-native authorization validation contracts and bounded models registered in `tests-suite/MANIFEST.toml`;
 - the bounded model command when its local checks are available.
+
+The 19 legacy Python test modules are archived under `archive/python-tests/` and
+are not a current test entry point. Registered Rust contracts now include the E1
+JSONL parser, dependency-profile/fault declarations, experiment register, and
+E1/E3 lifecycle timing reducer, alongside earlier typed classifier, reconciliation,
+protocol and bounded-model targets. Their coverage is limited to the exact offline
+assertions in the archive mapping; full runners/reports, read-only probes, node
+adapter, fake-controller lifecycle, worker/shard, multi-mutation/universal models,
+and projection-owner BFS remain `BLOCKED` where mapped. No offline target establishes
+external service, deployment, or live campaign evidence.
 
 These checks establish tool and in-process contracts only. A standalone TLA+ input
 remains `BLOCKED` until run with an immutable, checksum-verified TLC tool. Database,

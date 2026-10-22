@@ -210,6 +210,13 @@ pub fn read_manifest(root: &Path) -> Result<Manifest, String> {
         if !["component", "offline-model", "integration", "live-campaign"].contains(&scope) {
             return Err(format!("missing evidence scope: {id}"));
         }
+        if suite
+            .get("selection_policy")
+            .and_then(TomlValue::as_str)
+            .is_some_and(|policy| policy != "explicit-suite")
+        {
+            return Err(format!("unknown suite selection policy: {id}"));
+        }
         for field in ["owner", "boundary"] {
             if str_field(suite, field).is_err() {
                 return Err(format!("missing ownership/proof boundary: {id}"));
@@ -406,6 +413,10 @@ pub fn select_suites(
                 && labels_match(&suite_labels(suite), labels)
                 && (suite_ids.is_empty() || suite_ids.contains(&suite_id(suite)))
                 && (!portable || suite.get("blocked_reason").is_none())
+                && !(running
+                    && suite.get("selection_policy").and_then(TomlValue::as_str)
+                        == Some("explicit-suite")
+                    && !suite_ids.contains(&suite_id(suite)))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1927,16 +1938,67 @@ exit "${FAKE_CARGO_EXIT:-0}"
             .iter()
             .any(|label| numbered_family(label, "RQ"))));
         assert!(select_suites(&manifest, &["unknown".into()], &[], &[], true, false).is_err());
-        assert!(select_suites(&manifest, &[], &[], &[], true, false)
-            .unwrap()
+        let default_selection = select_suites(&manifest, &[], &[], &[], true, false).unwrap();
+        assert!(default_selection
             .iter()
             .all(|suite| DEFAULT_PROFILES.contains(&suite_profile(suite).as_str())));
+        assert!(default_selection
+            .iter()
+            .all(|suite| suite_id(suite) != "offline-validation-tools"));
+        assert!(select_suites(
+            &manifest,
+            &[],
+            &[],
+            &["offline-validation-tools".into()],
+            true,
+            false
+        )
+        .unwrap()
+        .iter()
+        .any(|suite| suite_id(suite) == "offline-validation-tools"));
+    }
+
+    fn assert_archived_python_migrations_are_accounted(root: &Path, manifest: &Manifest) {
+        let archive = root.join("Docs/authorization-validation/archive/python-tests");
+        let mapping = fs::read_to_string(archive.join("README.md")).unwrap();
+        let mut archived = fs::read_dir(&archive)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("test_") && name.ends_with(".py"))
+            .collect::<Vec<_>>();
+        archived.sort();
+        assert_eq!(
+            archived.len(),
+            19,
+            "the archived Python test inventory changed"
+        );
+        for source in archived {
+            let relative = format!("Docs/authorization-validation/archive/python-tests/{source}");
+            assert!(
+                mapping.contains(&format!("`{source}`")),
+                "unmapped archive source: {source}"
+            );
+            assert!(
+                manifest.suites.iter().any(|suite| {
+                    string_array(suite, "sources")
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|registered| registered == &relative)
+                }),
+                "archived source is absent from every campaign suite source list: {source}"
+            );
+        }
+        assert!(mapping.contains("`campaign-contracts`"));
+        assert!(mapping.contains("`shell-runner-contracts`"));
+        assert!(mapping.contains("`harness/runner-contracts` is catalog-only"));
     }
 
     #[test]
     fn manifest_entries_are_scoped_and_blocked_entries_are_not_dispatched() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let manifest = read_manifest(root).unwrap();
+        assert_archived_python_migrations_are_accounted(root, &manifest);
         assert!(manifest
             .suites
             .iter()

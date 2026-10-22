@@ -3,8 +3,9 @@
 /target/
 **/target/
 
-# Local agent/session state
+# Local agent/session state and generated architecture artifacts
 .zcode/
+/.archify/
 
 # Local runtime configuration and credentials
 .env

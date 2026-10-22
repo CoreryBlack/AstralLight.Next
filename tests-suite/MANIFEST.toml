@@ -772,9 +772,9 @@ profile = "native-kernel"
 test_services = []
 series = ["CORE", "M4", "E4"]
 scope = "component"
-boundary = "Rust runner/manifest/criterion/Divan/evaluate-performance acceptance and shell argument-routing contracts plus isolated POSIX descendant, timeout, and bounded-log process tests; no DB, Docker or live fault"
+boundary = "Rust campaign MANIFEST parser, selection, summary/report, artifact and isolated command-process contracts; excludes separately dispatched shell-forwarding tests and does not prove DB, Docker or live faults"
 sources = ["test-harness/src/campaign.rs", "test-harness/src/acceptance.rs", "test-harness/src/evaluate_acceptance.rs", "test-harness/src/model_acceptance.rs", "tests-suite/MANIFEST.toml"]
-argv = ["cargo", "test", "-p", "test-harness", "--locked", "--", "--test-threads=1"]
+argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "campaign::tests::", "--", "--test-threads=1", "--skip", "shell_entrypoints_"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1140,14 +1140,29 @@ minimum_tests = 5
 timeout_seconds = 600
 
 [[suite]]
+id = "e1-log-parser-contracts"
+owner = "test-harness"
+profile = "offline-validation"
+test_services = []
+series = ["E1"]
+scope = "offline-model"
+boundary = "Rust E1 JSONL parser filtering, flat/nested field precedence, numeric parsing, process identity validation, epoch-scoped duplicate sequence rejection and deterministic sorting; not full E1 runner parity"
+sources = ["test-harness/src/e1_log.rs", "Docs/authorization-validation/tools/experiment_common.py", "Docs/authorization-validation/archive/python-tests/test_classify_e1_properties.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
+argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e1_log::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 2
+timeout_seconds = 600
+
+[[suite]]
 id = "offline-validation-tools"
+selection_policy = "explicit-suite"
 owner = "test-harness"
 profile = "offline-validation"
 test_services = []
 series = ["E1", "E2", "E3", "E4", "E5", "M4", "M5"]
 scope = "offline-model"
-boundary = "complete test-harness offline Rust crate suite: typed contracts and bounded models only; full E3 runner/report, E4 controller lifecycle, parser, adapter and unbounded/two-mutation parity remain separately blocked below"
-sources = ["test-harness/src/campaign.rs", "test-harness/src/acceptance.rs", "test-harness/src/e1_validation.rs", "test-harness/src/e3_reconciliation.rs", "test-harness/src/e4_protocol.rs", "test-harness/src/e5_model.rs", "test-harness/src/evaluate_acceptance.rs", "test-harness/src/model_acceptance.rs", "test-harness/src/models.rs", "test-harness/src/unbounded_confirmation.rs"]
+boundary = "complete test-harness offline Rust crate suite: typed contracts and bounded models only; full E1 runner, E3 runner/report, E4 controller lifecycle, adapter and unbounded/two-mutation parity remain separately blocked below"
+sources = ["test-harness/src/campaign.rs", "test-harness/src/acceptance.rs", "test-harness/src/e1_log.rs", "test-harness/src/e1_validation.rs", "test-harness/src/e3_reconciliation.rs", "test-harness/src/e4_protocol.rs", "test-harness/src/e5_model.rs", "test-harness/src/evaluate_acceptance.rs", "test-harness/src/model_acceptance.rs", "test-harness/src/models.rs", "test-harness/src/unbounded_confirmation.rs", "test-harness/src/dependency_profiles.rs", "test-harness/src/experiment_register.rs", "test-harness/src/lifecycle.rs"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1254,9 +1269,9 @@ profile = "offline-validation"
 test_services = []
 series = ["E1"]
 scope = "offline-model"
-boundary = "Rust E1 classifier does not parse Python runner JSON/log formats; parser failure, malformed identity and source-precedence contracts remain separate"
-sources = ["Docs/authorization-validation/tools/e1_runner.py", "Docs/authorization-validation/archive/python-tests/test_e1_runner.py", "Docs/authorization-validation/tools/experiment_common.py", "Docs/authorization-validation/archive/python-tests/test_classify_e1_properties.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py", "test-harness/src/e1_validation.rs"]
-blocked_reason = "equivalent Rust live-log parser and differential parser-contract tests are not implemented; classifier tests accept typed events and cannot establish parser parity"
+boundary = "Rust E1 JSONL parser covers matching-record filtering, field precedence, malformed records, process identity and sequence ordering; full runner JSON/report parsing, plan/live gating, adapter injection and campaign parity remain separate"
+sources = ["Docs/authorization-validation/tools/e1_runner.py", "Docs/authorization-validation/archive/python-tests/test_e1_runner.py", "Docs/authorization-validation/tools/experiment_common.py", "Docs/authorization-validation/archive/python-tests/test_classify_e1_properties.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py", "test-harness/src/e1_validation.rs", "test-harness/src/e1_log.rs"]
+blocked_reason = "the E1 JSONL parser contract is migrated separately; full E1 runner orchestration, plan/live gating, adapter injection and campaign report parity remain absent in Rust"
 timeout_seconds = 600
 
 [[suite]]
@@ -1267,7 +1282,7 @@ test_services = []
 series = ["E3"]
 scope = "offline-model"
 boundary = "full E3 phase orchestration, sampling, markers, four output categories, aggregate verdict and report reconciliation"
-sources = ["Docs/authorization-validation/tools/e3_runner.py", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py", "test-harness/src/e3_reconciliation.rs"]
+sources = ["Docs/authorization-validation/tools/e3_runner.py", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py", "test-harness/src/e3_reconciliation.rs", "test-harness/src/lifecycle.rs"]
 blocked_reason = "Rust implements only typed post-parse reconciliation subcontracts; it does not implement the E3 runner/report lifecycle or prove the Python campaign contract"
 timeout_seconds = 1800
 
@@ -1279,7 +1294,7 @@ test_services = []
 series = ["E3", "E4"]
 scope = "offline-model"
 boundary = "read-only SQL/Redis/signed-GET restrictions, precondition capture, interval sampling, worker readiness and fault-outcome probe contracts"
-sources = ["Docs/authorization-validation/tools/e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py", "test-harness/src/e3_reconciliation.rs", "test-harness/src/e4_protocol.rs"]
+sources = ["Docs/authorization-validation/tools/e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py", "test-harness/src/e3_reconciliation.rs", "test-harness/src/e4_protocol.rs", "test-harness/src/dependency_profiles.rs"]
 blocked_reason = "Rust has selected typed evidence checks but no equivalent read-only probe/configuration and sampling implementation; no parser or adjacent protocol unit test may be counted as full probe parity"
 timeout_seconds = 1800
 
@@ -1291,7 +1306,7 @@ test_services = []
 series = ["E4"]
 scope = "offline-model"
 boundary = "fake-controller case preparation, apply/observe/restore/reconcile/postcondition sequencing, per-case evidence requirements and fault-matrix aggregation"
-sources = ["Docs/authorization-validation/tools/e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py", "test-harness/src/e4_protocol.rs"]
+sources = ["Docs/authorization-validation/tools/e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py", "test-harness/src/e4_protocol.rs", "test-harness/src/dependency_profiles.rs", "test-harness/src/experiment_register.rs"]
 blocked_reason = "Rust models selected typed protocol predicates and counters but has no equivalent fake-controller lifecycle runner or complete profile-specific matrix"
 timeout_seconds = 1800
 
@@ -1326,10 +1341,12 @@ profile = "offline-validation"
 test_services = []
 series = ["E4"]
 scope = "offline-model"
-boundary = "eight deployment profiles, service/dependency membership, per-profile fault compatibility and dependency-by-timing fail-closed matrix"
-sources = ["Docs/authorization-validation/tools/dependency_profiles.py", "Docs/authorization-validation/archive/python-tests/test_dependency_profiles.py", "test-harness/src/campaign.rs"]
-blocked_reason = "Rust campaign profile/service validation is not the Python E4 dependency-fault cross-product and does not replace its 8-profile contract"
-timeout_seconds = 900
+boundary = "Rust declaration contract for all eight profiles, exact service/dependency/fault membership, all fault-to-dependency metadata with profile-filtered expansion, Redis-compat-only faults and dependency-by-timing rows carrying profile/dependency/timing/fail-closed fields; not a live fault campaign"
+sources = ["test-harness/src/dependency_profiles.rs", "Docs/authorization-validation/tools/dependency_profiles.py", "Docs/authorization-validation/archive/python-tests/test_dependency_profiles.py", "test-harness/src/experiment_register.rs"]
+argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "dependency_profiles::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 2
+timeout_seconds = 600
 
 [[suite]]
 id = "experiment-register-contracts"
@@ -1338,10 +1355,12 @@ profile = "offline-validation"
 test_services = []
 series = ["E1", "E2", "E3", "E4"]
 scope = "offline-model"
-boundary = "registered stimulus classes, E2 control/premise links, canary ground truth, profile fault matrices, capture requirements and acceptance criteria"
-sources = ["Docs/authorization-validation/tools/experiment_register.py", "Docs/authorization-validation/archive/python-tests/test_experiment_register.py", "test-harness/src/campaign.rs"]
-blocked_reason = "Rust manifest validation does not implement the experiment register or its cross-links to pre-registered controls and acceptance criteria"
-timeout_seconds = 900
+boundary = "Rust declaration contract for stimulus source form/revocation/note metadata, E2 control/premise links, canary injection and ground-truth rates, all profile service/dependency/fault tables, profile-filtered dependency matrices, capture requirements and acceptance criteria; declarations are not execution evidence"
+sources = ["test-harness/src/experiment_register.rs", "test-harness/src/dependency_profiles.rs", "Docs/authorization-validation/tools/experiment_register.py", "Docs/authorization-validation/archive/python-tests/test_experiment_register.py", "Docs/authorization-validation/tools/run_single_node_campaign.py"]
+argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "experiment_register::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 2
+timeout_seconds = 600
 
 [[suite]]
 id = "authorization-lifecycle-reducer-contracts"
@@ -1350,10 +1369,12 @@ profile = "offline-validation"
 test_services = []
 series = ["E1", "E3"]
 scope = "offline-model"
-boundary = "E1/E3 lifecycle timing reductions, epoch-safe pairing, unknown-sample accounting and conservative percentile summaries"
-sources = ["Docs/authorization-validation/tools/lifecycle_reducer.py", "Docs/authorization-validation/archive/python-tests/test_lifecycle_reducer.py", "test-harness/src/e3_reconciliation.rs"]
-blocked_reason = "Rust reconciliation records bounded aggregate attempt time but has no equivalent E1/E3 lifecycle reducer, unknown-sample report or percentile contract"
-timeout_seconds = 900
+boundary = "Rust offline E1/E3 lifecycle timing reductions, epoch-safe pairing, missing/ambiguous evidence exclusion, durable E3 terminal proof, cross-node clock evidence and nearest-rank percentile summaries; diagnostics only, not runtime latency evidence"
+sources = ["test-harness/src/lifecycle.rs", "test-harness/src/e3_reconciliation.rs", "Docs/authorization-validation/tools/lifecycle_reducer.py", "Docs/authorization-validation/archive/python-tests/test_lifecycle_reducer.py", "Docs/authorization-validation/tools/experiment_common.py"]
+argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "lifecycle::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 3
+timeout_seconds = 600
 
 [[suite]]
 id = "legacy-campaign-report-acceptance-parity"

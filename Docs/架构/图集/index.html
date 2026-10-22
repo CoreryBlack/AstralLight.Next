@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AstralLight.Next 架构与接口图集</title>
+<style>
+:root{
+  --bg:#f4f6f8; --panel:#ffffff; --ink:#18212b; --muted:#5d6b7a; --line:#dde3ea;
+  --accent:#0f766e; --accent2:#0b6bcb; --accent3:#a16207; --soft:#e6f4f1;
+  --shadow:0 12px 34px rgba(24,33,43,.08); --radius:16px;
+}
+@media (prefers-color-scheme: dark){
+  :root{--bg:#0d1218;--panel:#141b23;--ink:#e8edf3;--muted:#9aa8b7;--line:#26313d;--accent:#5eead4;--accent2:#7dd3fc;--accent3:#fbbf24;--soft:#12312d;--shadow:0 12px 34px rgba(0,0,0,.3)}
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+a{color:inherit}
+.wrap{max-width:1240px;margin:0 auto;padding:0 24px}
+header.hero{padding:34px 0 22px;border-bottom:1px solid var(--line);background:
+  radial-gradient(900px 240px at 15% -20%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 70%),
+  radial-gradient(700px 220px at 90% -30%, color-mix(in srgb, var(--accent2) 12%, transparent), transparent 70%),
+  var(--panel)}
+.hero h1{margin:0 0 6px;font-size:26px;letter-spacing:.01em}
+.hero p{margin:0;color:var(--muted);max-width:900px;font-size:14px}
+.stats{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+.pill{border:1px solid var(--line);border-radius:999px;padding:3px 11px;font-size:12.5px;color:var(--muted);background:var(--bg)}
+section{padding:28px 0 4px}
+.section-head{display:flex;align-items:baseline;gap:10px;margin:0 0 14px}
+.section-head h2{margin:0;font-size:17px}
+.section-head span{color:var(--muted);font-size:12.5px}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.grid.two{grid-template-columns:repeat(2,minmax(0,1fr))}
+.grid.four{grid-template-columns:repeat(4,minmax(0,1fr))}
+.card{display:flex;flex-direction:column;gap:8px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px 18px 16px;text-decoration:none;box-shadow:var(--shadow);transition:transform .16s ease,border-color .16s ease;min-height:132px}
+.card:hover{transform:translateY(-2px);border-color:var(--accent)}
+.card .tag{font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--accent);font-weight:700}
+.card .tag.blue{color:var(--accent2)}
+.card .tag.amber{color:var(--accent3)}
+.card h3{margin:0;font-size:15.5px;line-height:1.4}
+.card p{margin:0;color:var(--muted);font-size:13px}
+.card .meta{margin-top:auto;color:var(--muted);font-size:12px;display:flex;gap:8px;flex-wrap:wrap}
+.card.primary{border-left:4px solid var(--accent)}
+.card.wide{border-left:4px solid var(--accent2)}
+.card.atlas{min-height:118px}
+.card .count{font:700 12px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:3px 6px}
+.note{margin:30px 0 0;padding:14px 16px;border-left:3px solid var(--accent);background:var(--soft);border-radius:0 10px 10px 0;color:var(--muted);font-size:12.5px}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:2px 6px}
+pre{margin:8px 0 0;padding:12px 14px;background:var(--bg);border:1px solid var(--line);border-radius:10px;overflow:auto;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ink)}
+footer{padding:26px 0 40px;color:var(--muted);font-size:12px;border-top:1px solid var(--line);margin-top:34px}
+@media (max-width:980px){.grid,.grid.four{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:620px){.grid,.grid.two,.grid.four{grid-template-columns:1fr}.hero h1{font-size:22px}}
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <h1>AstralLight.Next 架构与接口图集</h1>
+    <p>模块架构、接口契约、279 条 HTTP endpoint 全集，以及按单条接口查询跨模块调用链。图表反映仓库代码职责与契约模型，不证明任何环境已部署或可达。</p>
+    <div class="stats">
+      <span class="pill">22 个组件</span>
+      <span class="pill">279 条 endpoint</span>
+      <span class="pill">4 张服务全集</span>
+      <span class="pill">14 个接口族</span>
+      <span class="pill">baseline b5e315a</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <section>
+    <div class="section-head"><h2>快速入口</h2><span>先看这三处</span></div>
+    <div class="grid">
+      <a class="card primary" href="./architecture.html">
+        <span class="tag">架构</span>
+        <h3>模块架构（可读版）</h3>
+        <p>Gateway / Identity / TrustGraph / Monitor、授权证据链、SDK 与工具链。22 个组件、22 条关系。</p>
+        <span class="meta"><span>1043px 宽 · 纵向展开</span><span>Showcase</span></span>
+      </a>
+      <a class="card primary" href="./trace-explorer.html">
+        <span class="tag">调用链</span>
+        <h3>单接口跨模块调用查询</h3>
+        <p>搜索任意 endpoint，查看 Gateway → 中间件 → PolicyEngine/仓储 → MySQL/MQ 的分步链路与源码位置。</p>
+        <span class="meta"><span>279 条接口</span><span>可搜索</span></span>
+      </a>
+      <a class="card primary" href="./atlas-trustgraph.html">
+        <span class="tag">接口全集</span>
+        <h3>TrustGraph 148 条 endpoint</h3>
+        <p>规则、规则集、审批、租户、审计、ORG_SCOPE、SDK ingress 等全部路由，按资源组展开。</p>
+        <span class="meta"><span>148 条</span><span>完整路径</span></span>
+      </a>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head"><h2>模块架构</h2><span>两种画布尺寸</span></div>
+    <div class="grid two">
+      <a class="card" href="./architecture.html">
+        <span class="tag">可读版</span>
+        <h3>架构图 · 1043px</h3>
+        <p>保持桌面可读宽度，纵向拉开行距；22 个组件、22 条关系、4 张说明卡、3 个引导视图全部保留。</p>
+        <span class="meta"><span>适合笔记本</span><span>纵向滚动</span></span>
+      </a>
+      <a class="card wide" href="./architecture-wide.html">
+        <span class="tag blue">宽版</span>
+        <h3>架构图 · 1484px</h3>
+        <p>横向展开的宽画布，节点与走廊更松；适合大屏、投屏或缩放查看。</p>
+        <span class="meta"><span>Standard</span><span>适合大屏</span></span>
+      </a>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head"><h2>接口设计</h2><span>接口族与契约</span></div>
+    <div class="grid">
+      <a class="card" href="./interfaces.html">
+        <span class="tag">9 族 · 可读</span>
+        <h3>接口契约视图</h3>
+        <p>Gateway、Identity、TrustGraph、Monitor、PolicyEngine、RuleRepository、MQ、SDK 的接口族与依赖。</p>
+        <span class="meta"><span>1440×900 完整显示</span></span>
+      </a>
+      <a class="card wide" href="./interfaces-wide.html">
+        <span class="tag blue">14 族 · 宽版</span>
+        <h3>接口全景</h3>
+        <p>拆分 GatewayProxy/Session、IdentityAuth/Admin、TrustGraphGovernance/Check，并补 Projector 与 DB 仓储。</p>
+        <span class="meta"><span>1686px 画布</span><span>Standard</span></span>
+      </a>
+      <a class="card" href="./interface-model.html">
+        <span class="tag amber">契约文档</span>
+        <h3>接口模型</h3>
+        <p>凭证策略、路径→资源、动作特例、核心 DTO、PolicyEngine port、投影契约、消息与缺口清单。</p>
+        <span class="meta"><span>HTML</span><span>逐模块</span></span>
+      </a>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head"><h2>接口全集</h2><span>279 条 endpoint · 每条标注作用</span></div>
+    <div class="grid four">
+      <a class="card atlas" href="./atlas-identity.html">
+        <span class="tag">Identity</span>
+        <h3>59 条</h3>
+        <p>会话、用户、卡片、组织/租户、MFA、内部会话。</p>
+        <span class="meta"><span class="count">17 组</span></span>
+      </a>
+      <a class="card atlas" href="./atlas-trustgraph.html">
+        <span class="tag">TrustGraph</span>
+        <h3>148 条</h3>
+        <p>规则、审批、租户、审计、ORG_SCOPE、SDK ingress。</p>
+        <span class="meta"><span class="count">36 组</span></span>
+      </a>
+      <a class="card atlas" href="./atlas-monitor.html">
+        <span class="tag">Monitor</span>
+        <h3>34 条</h3>
+        <p>告警、仪表板、通知、指标与运维探针。</p>
+        <span class="meta"><span class="count">21 组</span></span>
+      </a>
+      <a class="card atlas" href="./atlas-gateway.html">
+        <span class="tag">Gateway</span>
+        <h3>38 条</h3>
+        <p>认证代理、/main、/monitor、内部会话、Chat、Learn、metrics。</p>
+        <span class="meta"><span class="count">7 组</span></span>
+      </a>
+    </div>
+    <div class="grid two" style="margin-top:14px">
+      <a class="card" href="./endpoints.html">
+        <span class="tag amber">完整清单</span>
+        <h3>ENDPOINTS 清单</h3>
+        <p>按服务/资源组排列的方法、路径、作用与备注；适合全文检索与评审。</p>
+      </a>
+      <a class="card" href="./trace-explorer.html">
+        <span class="tag">调用链</span>
+        <h3>TRACE EXPLORER</h3>
+        <p>不想翻长图时，直接从一条接口进入，查看 5–9 步跨模块链路与源码位置。</p>
+      </a>
+    </div>
+  </section>
+
+
+
+  <footer>
+    来源：<code>Docs/API/后端接口参考_V1.md</code>、路由/中间件源码；baseline <code>b5e315a</code>。
+    原始验收回执与截图保留在 <code>.archify/</code> 下对应的项目目录中。
+  </footer>
+</div>
+</body>
+</html>

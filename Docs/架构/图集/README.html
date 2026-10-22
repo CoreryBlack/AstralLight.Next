@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AstralLight.Next 架构与接口图集 · 说明</title>
+<style>
+:root{--bg:#f4f6f8;--panel:#fff;--ink:#18212b;--muted:#5d6b7a;--line:#dde3ea;--accent:#0f766e;--soft:#e6f4f1;--code:#f0f3f6}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1218;--panel:#141b23;--ink:#e8edf3;--muted:#9aa8b7;--line:#26313d;--accent:#5eead4;--soft:#12312d;--code:#0f161d}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+.top{position:sticky;top:0;display:flex;justify-content:space-between;gap:16px;padding:10px 24px;background:var(--panel);border-bottom:1px solid var(--line);font-size:13px;color:var(--muted)}
+.top a{color:var(--accent);text-decoration:none;font-weight:600}.top a:hover{text-decoration:underline}
+main{max-width:1050px;margin:0 auto;padding:28px 24px 60px;background:var(--panel);min-height:100vh}
+h1{font-size:26px;margin:0 0 8px}h2{font-size:19px;margin:30px 0 10px;padding-top:8px;border-top:1px solid var(--line)}
+p,li{font-size:14.5px}a{color:var(--accent)}ul{padding-left:22px}li{margin:4px 0}
+.table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;margin:10px 0 18px}table{border-collapse:collapse;width:100%;min-width:620px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);font-size:13px;vertical-align:top}th{background:var(--code);white-space:nowrap}tr:last-child td{border-bottom:0}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;background:var(--code);border:1px solid var(--line);border-radius:5px;padding:1px 5px}
+blockquote{margin:18px 0;padding:10px 14px;border-left:3px solid var(--accent);background:var(--soft);color:var(--muted);border-radius:0 8px 8px 0}
+@media(max-width:700px){main{padding:18px}.top{padding:8px 14px}h1{font-size:22px}}
+</style>
+</head>
+<body>
+<div class="top"><a href="./index.html">← 返回图集</a><span>图集说明</span></div>
+<main>
+<h1>AstralLight.Next 架构与接口图集</h1>
+<p>基线 <code>b5e315a</code>。图表反映仓库代码职责与契约模型，不证明任何环境已部署或 URI 可达。</p>
+
+<h2>模块架构</h2>
+<div class="table-wrap"><table><thead><tr><th>文件</th><th>说明</th></tr></thead><tbody>
+<tr><td><a href="./architecture.html">architecture.html</a></td><td>可读版：22 个组件、22 条关系、4 张说明卡、3 个视图；宽度控制在笔记本可读范围。</td></tr>
+<tr><td><a href="./architecture-wide.html">architecture-wide.html</a></td><td>宽版：1484px 画布，适合大屏或缩放查看。</td></tr>
+</tbody></table></div>
+
+<h2>接口设计</h2>
+<div class="table-wrap"><table><thead><tr><th>文件</th><th>说明</th></tr></thead><tbody>
+<tr><td><a href="./interfaces.html">interfaces.html</a></td><td>9 个接口族的契约视图，1440×900 下完整显示。</td></tr>
+<tr><td><a href="./interfaces-wide.html">interfaces-wide.html</a></td><td>14 个接口族的宽版全景，拆分 Gateway/Identity/TrustGraph 并补 Projector/DB 契约。</td></tr>
+<tr><td><a href="./interface-model.html">interface-model.html</a></td><td>逐模块契约：鉴权策略、路径→资源、动作特例、DTO、port、消息与缺口。</td></tr>
+</tbody></table></div>
+
+<h2>接口全集（279 条，每条标注作用）</h2>
+<div class="table-wrap"><table><thead><tr><th>文件</th><th>条目</th><th>说明</th></tr></thead><tbody>
+<tr><td><a href="./atlas-identity.html">atlas-identity.html</a></td><td>59</td><td>Identity 全部 endpoint，按资源组展开。</td></tr>
+<tr><td><a href="./atlas-trustgraph.html">atlas-trustgraph.html</a></td><td>148</td><td>TrustGraph 全部 endpoint，按资源组展开。</td></tr>
+<tr><td><a href="./atlas-monitor.html">atlas-monitor.html</a></td><td>34</td><td>Monitor 全部 endpoint，含 actuator/health。</td></tr>
+<tr><td><a href="./atlas-gateway.html">atlas-gateway.html</a></td><td>38</td><td>Gateway 转发面、Chat/Learn 前缀与 metrics。</td></tr>
+<tr><td><a href="./endpoints.html">endpoints.html</a></td><td>279</td><td>完整表格：方法、路径、作用、备注。</td></tr>
+</tbody></table></div>
+<p><code>ANY</code> 表示 Gateway 前缀转发，具体方法由上游 router 决定；Chat/Learn 源码在 workspace 外。</p>
+
+<h2>单接口调用链</h2>
+<div class="table-wrap"><table><thead><tr><th>文件</th><th>说明</th></tr></thead><tbody>
+<tr><td><a href="./trace-explorer.html">trace-explorer.html</a></td><td>搜索 279 条接口，点选查看 Gateway → 中间件 → PolicyEngine/仓储 → MySQL/MQ 的分步链路与源码位置。</td></tr>
+</tbody></table></div>
+<p>链路是契约级模型：来自路由注册、中间件和模块边界，不是运行时 trace；handler 内部调用需按给出的源码位置继续追。</p>
+
+<blockquote>本图集仅保留 HTML。源 Markdown、JSON、Python 查询器、candidate JSON 与验收回执保留在仓库 <code>.archify</code> 下对应的项目目录中，未随图集分发。</blockquote>
+</main>
+</body>
+</html>

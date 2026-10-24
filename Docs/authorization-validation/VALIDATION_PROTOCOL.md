@@ -166,10 +166,12 @@ E1-E5, MT-E and performance attribution are separate. The runner executes explic
 argv against a frozen source hash and existing approved dependencies only, requires
 nonempty assertions, retains ignored/internal skips, and records `PASS`, `FAIL`,
 `BLOCKED`, `SKIP`, `UNKNOWN` or `PENDING`. Per-series summaries describe only the
-selected evidence scope, not a full live campaign. The E5 single/two-mutation and
-universal Rust model migrations remain BLOCKED until their complete checkers and
-counterexample contracts are implemented; the previous Python tools are retained as
-migration references. The historical two-mutation model partitions independent,
+selected evidence scope, not a full live campaign. The E5 single-mutation model and
+the strict complete-bound portion of the two-mutation Rust model have offline
+contracts; finite bracket omission counterexamples explicitly remain incomplete,
+and worker/shard parity remains BLOCKED. The U1-U10 evaluator has fixture-driven
+reducer contracts, but complete enumeration over both models has not been validated
+and remains BLOCKED; the previous Python tools are retained as migration references. The historical two-mutation model partitions independent,
 non-overlapping event prefixes across at most twelve owned processes (the CLI default
 remains one). Its reducer requires the exact complete shard set and preserves serial
 state/trace counts, diagnostic counters and minimal counterexamples; no model bound or

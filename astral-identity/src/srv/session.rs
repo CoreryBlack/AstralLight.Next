@@ -512,8 +512,7 @@ async fn revoke_session(
     headers: HeaderMap,
     Json(req): Json<RevokeSessionRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    let raw = bearer_token(&headers)
-        .ok_or_else(|| AppError::from(AstralError::Auth("BEARER_REQUIRED".into())))?;
+    let raw = logout_bearer_credential(&headers)?;
     let (claims, token_use) = decode_v2_token(raw, &state.config)
         .map_err(|reason| AppError::from(AstralError::Auth(reason.into())))?;
     let reason = req.reason.as_deref().unwrap_or("USER_REVOKED");
@@ -548,8 +547,7 @@ async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
-    let raw = bearer_token(&headers)
-        .ok_or_else(|| AppError::from(AstralError::Auth("BEARER_REQUIRED".into())))?;
+    let raw = logout_bearer_credential(&headers)?;
     let (claims, token_use) = decode_v2_token(raw, &state.config)
         .map_err(|reason| AppError::from(AstralError::Auth(reason.into())))?;
     match token_use {
@@ -570,6 +568,12 @@ async fn logout(
         }
     }
     Ok(Json(ApiResponse::success("Logged out".into())))
+}
+
+/// logout/revoke 共用的凭证前置门：Authorization 头缺失或非 Bearer 形态
+/// 直接拒绝，任何 db/jwt/redis 都不会被触碰。
+fn logout_bearer_credential(headers: &HeaderMap) -> Result<&str, AppError> {
+    bearer_token(headers).ok_or_else(|| AppError::from(AstralError::Auth("BEARER_REQUIRED".into())))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -1082,7 +1086,11 @@ async fn compat_delete_and_revoke(
         // （不读 access:jti/grant）。撤销链必须写黑名单，否则被撤销的 access
         // token 仍可过网关直到 JWT 过期。TTL 7 天覆盖 access token 最大生命周期。
         let _: () = conn
-            .set_ex::<_, _, ()>(format!("jwt:revoked:{jti}"), "1", REVOKED_TTL_SECS)
+            .set_ex::<_, _, ()>(
+                format!("{}{jti}", REVOKED_JTI_KEY_PREFIX),
+                "1",
+                REVOKED_TTL_SECS,
+            )
             .await
             .map_err(|e| AstralError::Cache(format!("Mark revoked JTI failed: {e}")))?;
     }
@@ -1205,6 +1213,9 @@ async fn mark_jti_revoked_at(jti: &str, ttl_seconds: i64) -> Result<(), AstralEr
 
 /// 会话级撤销写入 Gateway 黑名单的 TTL（秒，7 天），覆盖 access token 最大生命周期。
 /// Rust Gateway 以 `jwt:revoked:{jti}` 为会话有效性判定（对齐 Java 删投影语义）。
+/// Rust Gateway 兼容黑名单键前缀：撤销链必须写 `jwt:revoked:{jti}`，
+/// 否则被撤销的 access token 在 JWT 过期前仍可过网关。
+pub(crate) const REVOKED_JTI_KEY_PREFIX: &str = "jwt:revoked:";
 const REVOKED_TTL_SECS: u64 = 7 * 24 * 3600;
 
 #[derive(Debug, sqlx::FromRow)]
@@ -2389,10 +2400,21 @@ mod tests {
 
     #[test]
     fn logout_requires_a_credential() {
-        let headers = HeaderMap::new();
-        assert!(bearer_token(&headers).is_none());
-        let request = RevokeSessionRequest::default();
-        assert!(request.reason.is_none());
+        // The handler-level gate (not a duplicate bearer_token unit check):
+        // anything but a non-empty Bearer credential is BEARER_REQUIRED and
+        // no later stage (db lookup, token decode, revocation) is reached.
+        assert!(logout_bearer_credential(&HeaderMap::new()).is_err());
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+        assert!(logout_bearer_credential(&headers).is_err());
+        headers.insert("authorization", "Bearer ".parse().unwrap());
+        assert!(logout_bearer_credential(&headers).is_err());
+        headers.insert("authorization", "Bearer token-1".parse().unwrap());
+        let credential = logout_bearer_credential(&headers).expect("valid bearer");
+        assert_eq!(credential, "token-1");
+        // The rejection carries the contract error, not a generic failure.
+        let error = logout_bearer_credential(&HeaderMap::new()).unwrap_err();
+        assert!(error.to_string().contains("BEARER_REQUIRED"));
     }
 
     #[test]
@@ -2444,8 +2466,12 @@ mod tests {
 
     #[test]
     fn v2_refresh_is_not_a_legacy_raw_token_key() {
+        // The revocation chain must keep writing the Gateway-compat
+        // `jwt:revoked:{jti}` blacklist key; pinning the production prefix
+        // (not a re-formatted copy) makes a rename redden this test.
+        assert_eq!(REVOKED_JTI_KEY_PREFIX, "jwt:revoked:");
         assert_eq!(
-            format!("jwt:revoked:{}", "refresh-jti"),
+            format!("{}{}", REVOKED_JTI_KEY_PREFIX, "refresh-jti"),
             "jwt:revoked:refresh-jti"
         );
     }

@@ -225,3 +225,82 @@ impl Default for SnapshotConsistencyChecker {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sampler_hits_exactly_every_hundredth_call() {
+        let checker = SnapshotConsistencyChecker::new();
+        // The first call samples (counter starts at 0), the next 99 do not,
+        // and the 101st call samples again.
+        assert!(checker.should_sample());
+        for _ in 1..100 {
+            assert!(!checker.should_sample());
+        }
+        assert!(checker.should_sample());
+        for _ in 1..100 {
+            assert!(!checker.should_sample());
+        }
+        assert!(checker.should_sample());
+    }
+
+    #[test]
+    fn stats_default_to_zero_and_report_one_percent_rate() {
+        let checker = SnapshotConsistencyChecker::new();
+        let stats = checker.get_stats();
+        assert_eq!(stats["totalChecks"], serde_json::json!(0));
+        assert_eq!(stats["totalViolations"], serde_json::json!(0));
+        assert_eq!(stats["pendingViolations"], serde_json::json!(0));
+        assert_eq!(stats["sampleRate"], serde_json::json!("1%"));
+        assert!(!stats.contains_key("lastCheckAt"));
+    }
+
+    #[test]
+    fn violation_buffer_truncates_at_the_cap_and_clears() {
+        let checker = SnapshotConsistencyChecker::new();
+        let context = PolicyContext::builder()
+            .user_id(Some(1))
+            .card_id(Some(17))
+            .action("read".into())
+            .build();
+        let snapshot = PolicyDecision {
+            allowed: false,
+            reason: "SNAPSHOT_DENY".to_owned(),
+            matched_rule: None,
+            audit_required: false,
+            evaluation_path: Vec::new(),
+            matched_rule_id: None,
+            condition_results: None,
+            snapshot_version: None,
+            org_provenance: None,
+        };
+        let realtime = PolicyDecision {
+            allowed: true,
+            reason: "REALTIME_ALLOW".to_owned(),
+            ..snapshot.clone()
+        };
+        {
+            let mut buffer = checker.violations.lock().unwrap();
+            for _ in 0..MAX_VIOLATIONS + 50 {
+                buffer.push(ConsistencyViolation {
+                    context: context.clone(),
+                    snapshot_decision: snapshot.clone(),
+                    realtime_decision: realtime.clone(),
+                });
+            }
+        }
+        // The production path guards the same cap before pushing; this pins
+        // the cap itself plus the reporting plumbing.
+        let listed = checker.get_violations();
+        assert_eq!(listed.len(), MAX_VIOLATIONS + 50);
+        assert_eq!(listed[0]["snapshotAllowed"], serde_json::json!(false));
+        assert_eq!(
+            listed[0]["realtimeReason"],
+            serde_json::json!("REALTIME_ALLOW")
+        );
+        checker.clear_violations();
+        assert!(checker.get_violations().is_empty());
+    }
+}

@@ -588,6 +588,55 @@ mod tests {
             .contains(control.rust_test));
         }
         assert!(validate_register().is_ok());
+
+        let mut premises = E2_RUNTIME_PREMISES.to_vec();
+        premises.extend(MODEL_ONLY_PREMISES);
+        premises.sort_unstable();
+        let mut model_premises = crate::e5_model::PREMISES.to_vec();
+        model_premises.sort_unstable();
+        assert_eq!(premises, model_premises);
+        let mut premise_ids = E2_RUST_TESTS
+            .iter()
+            .map(|(premise, _)| *premise)
+            .collect::<Vec<_>>();
+        premise_ids.sort_unstable();
+        premise_ids.dedup();
+        assert_eq!(premise_ids.len(), E2_RUNTIME_PREMISES.len());
+        let mut test_ids = E2_RUST_TESTS
+            .iter()
+            .map(|(_, test)| *test)
+            .collect::<Vec<_>>();
+        test_ids.sort_unstable();
+        test_ids.dedup();
+        assert_eq!(test_ids.len(), E2_RUNTIME_PREMISES.len());
+        assert!(E2_RUST_TESTS
+            .iter()
+            .all(|(premise, test)| !premise.contains("host") && !test.contains("host")));
+
+        let rust_sources = [
+            include_str!("../../astral-db/src/evidence_cache.rs"),
+            include_str!("../../policy-engine/src/engine/tests.rs"),
+        ];
+        for control in E2_CONTROLS {
+            let test_name = control.rust_test.rsplit("::").next().unwrap();
+            assert!(
+                rust_sources
+                    .iter()
+                    .any(|source| source.contains(&format!("fn {test_name}"))),
+                "{} does not resolve to a Rust test",
+                control.rust_test
+            );
+        }
+    }
+
+    #[test]
+    fn required_registry_symbols_are_importable() {
+        let _: fn() -> Result<(), Vec<String>> = validate_register;
+        let _: fn(
+            &[crate::e1_validation::Event],
+            &[crate::e1_validation::Event],
+        ) -> Result<crate::e1_validation::Classification, String> =
+            crate::e1_validation::classify_e1_allow;
     }
 
     #[test]

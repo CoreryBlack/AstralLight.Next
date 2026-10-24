@@ -1,3 +1,9 @@
+//! ABSTRACT BOUNDED-MODEL EVIDENCE ONLY (E5 v2.1.0).
+//!
+//! NOT a mechanized proof of the AstralLight Rust or Java implementation, any
+//! deployment, or runtime behavior. Structural assumptions are reported in
+//! `scopeLimitations`.
+
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -293,6 +299,16 @@ pub fn validate_bound(bound: usize) -> Result<usize, String> {
         ));
     }
     Ok(bound)
+}
+
+pub fn validate_bound_value(value: &Value) -> Result<usize, String> {
+    let bound = value
+        .as_u64()
+        .and_then(|bound| usize::try_from(bound).ok())
+        .ok_or_else(|| {
+            format!("max-steps must be a finite integer in [{MIN_BOUND}, {MAX_BOUND}]")
+        })?;
+    validate_bound(bound)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1145,6 +1161,11 @@ mod tests {
         );
         assert!(!no_probe.checklist.contains(&"RELOAD_P0"));
         assert!(no_probe.checklist.contains(&"RELOAD_M0"));
+        let no_probe_strict = build_chains(
+            Premises::default().without("pending_probe").unwrap(),
+            Mode::Strict,
+        );
+        assert!(no_probe_strict.checklist.contains(&"STRICT_LOAD"));
         let no_reload = build_chains(
             Premises::default().without("final_reload").unwrap(),
             Mode::Bracket,
@@ -1157,25 +1178,81 @@ mod tests {
     #[test]
     fn cache_observation_covers_consistent_torn_and_rollback_states() {
         let before = cache_observation(10, None, None, None, true);
-        assert_eq!(before["manifest"], "g0");
-        assert_eq!(before["body"], "r0");
-        assert_eq!(before["head"], "g0");
+        assert_eq!(
+            (
+                before["manifest"].as_str(),
+                before["body"].as_str(),
+                before["head"].as_str()
+            ),
+            (Some("g0"), Some("r0"), Some("g0"))
+        );
         assert_eq!(before["valid"], true);
+        assert_eq!(before["consistent"], true);
+        let after = cache_observation(10, Some(4), Some(5), None, true);
+        assert_eq!(
+            (
+                after["manifest"].as_str(),
+                after["body"].as_str(),
+                after["head"].as_str()
+            ),
+            (Some("g1"), Some("r1"), Some("g1"))
+        );
+        assert_eq!(after["valid"], true);
+        assert_eq!(after["consistent"], true);
+        let boundary = cache_observation(4, Some(4), None, None, true);
+        assert_eq!(boundary["manifest"], "g1");
+        assert_eq!(boundary["head"], "g1");
         let published_first = cache_observation(10, Some(4), None, None, true);
+        assert_eq!(published_first["consistent"], false);
+        assert_eq!(published_first["valid"], false);
         assert_eq!(published_first["reason"], "manifest_ahead_body_stale");
         let body_first = cache_observation(10, None, Some(4), None, true);
+        assert_eq!(body_first["consistent"], false);
+        assert_eq!(body_first["valid"], false);
         assert_eq!(body_first["reason"], "body_ahead_manifest_stale");
         let rolled_back = cache_observation(10, Some(4), Some(3), Some(5), true);
+        assert_eq!(rolled_back["manifest"], "g0");
+        assert_eq!(rolled_back["body"], "r0");
+        assert_eq!(rolled_back["head"], "g1");
+        assert_eq!(rolled_back["consistent"], true);
+        assert_eq!(rolled_back["valid"], false);
         assert_eq!(rolled_back["reason"], "generation_below_published_head");
         let re_advanced = cache_observation(10, Some(4), Some(7), Some(5), true);
+        assert_eq!(re_advanced["manifest"], "g0");
+        assert_eq!(re_advanced["body"], "r1");
+        assert_eq!(re_advanced["consistent"], false);
+        assert_eq!(re_advanced["valid"], false);
         assert_eq!(re_advanced["reason"], "body_ahead_manifest_stale");
-        let raw_torn = cache_observation(10, Some(4), None, None, false);
-        assert_eq!(raw_torn["valid"], true);
-        assert_eq!(raw_torn["consistent"], false);
+        let raw_manifest_ahead = cache_observation(10, Some(4), None, None, false);
+        assert_eq!(raw_manifest_ahead["manifest"], "g1");
+        assert_eq!(raw_manifest_ahead["body"], "r0");
+        assert_eq!(raw_manifest_ahead["head"], "g1");
+        assert_eq!(raw_manifest_ahead["valid"], true);
+        assert_eq!(raw_manifest_ahead["consistent"], false);
+        assert_eq!(raw_manifest_ahead["reason"], Value::Null);
+        let raw_body_ahead = cache_observation(10, None, Some(4), None, false);
+        assert_eq!(raw_body_ahead["manifest"], "g0");
+        assert_eq!(raw_body_ahead["body"], "r1");
+        assert_eq!(raw_body_ahead["head"], "g0");
+        assert_eq!(raw_body_ahead["valid"], true);
+        assert_eq!(raw_body_ahead["consistent"], false);
+        assert_eq!(raw_body_ahead["reason"], Value::Null);
     }
 
     #[test]
     fn domain_classification_keeps_overlap_outside_the_theorem() {
+        let report = default_report();
+        for mode in ["bracket", "strict"] {
+            assert_eq!(
+                report["fullContract"]["modes"][mode]["violationsByDomain"]["overlapUnknown"], 0,
+                "{mode}"
+            );
+            assert_eq!(
+                report["fullContract"]["modes"][mode]["violations"],
+                report["fullContract"]["modes"][mode]["admittedDomainCounts"]["strictlyBefore"],
+                "{mode}"
+            );
+        }
         assert_eq!(
             classify_domain(Some((3, 5)), Some((6, 8))),
             "strictly_before"
@@ -1200,13 +1277,37 @@ mod tests {
     fn bound_validation_and_fail_unknown_precedence_are_preserved() {
         assert_eq!(validate_bound(MIN_BOUND), Ok(MIN_BOUND));
         assert_eq!(validate_bound(MAX_BOUND), Ok(MAX_BOUND));
+        assert_eq!(validate_bound(14), Ok(14));
+        assert_eq!(validate_bound_value(&json!(MIN_BOUND)), Ok(MIN_BOUND));
+        assert_eq!(validate_bound_value(&json!(MAX_BOUND)), Ok(MAX_BOUND));
+        assert_eq!(validate_bound_value(&json!(14)), Ok(14));
         for invalid in [0, 1, MAX_BOUND + 1, 1_000_000] {
             assert!(validate_bound(invalid).is_err());
+        }
+        for invalid in [json!(0), json!(1), json!(MAX_BOUND + 1), json!(1_000_000)] {
+            assert!(validate_bound_value(&invalid).is_err(), "{invalid}");
+        }
+        for invalid in [
+            Value::Null,
+            json!("12"),
+            json!(-1),
+            json!(1.0),
+            json!(2.5),
+            json!(true),
+            json!(false),
+            json!([14]),
+            json!({"bound": 14}),
+        ] {
+            assert!(validate_bound_value(&invalid).is_err(), "{invalid}");
         }
         let incomplete = run_model(Premises::default(), Mode::Bracket, 8).unwrap();
         assert_eq!(incomplete["status"], "UNKNOWN");
         assert_eq!(incomplete["explorationComplete"], false);
+        assert_eq!(incomplete["violations"], 0);
         assert!(incomplete["incompleteTraces"].as_u64().unwrap() > 0);
+        assert!(
+            incomplete["bound"].as_u64().unwrap() < incomplete["requiredBound"].as_u64().unwrap()
+        );
         let decisive = run_model(
             Premises::default().without("pending_probe").unwrap(),
             Mode::Bracket,
@@ -1215,7 +1316,10 @@ mod tests {
         .unwrap();
         assert_eq!(decisive["status"], "FAIL");
         assert_eq!(decisive["explorationComplete"], false);
+        assert!(decisive["incompleteTraces"].as_u64().unwrap() > 0);
         assert!(decisive["violations"].as_u64().unwrap() > 0);
+        assert!(decisive["bound"].as_u64().unwrap() < decisive["requiredBound"].as_u64().unwrap());
+        assert!(decisive["counterexample"].is_object());
     }
 
     #[test]
@@ -1223,15 +1327,59 @@ mod tests {
         let report = default_report();
         let reference: Value =
             serde_json::from_str(include_str!("fixtures/e5-single-reference-28.json")).unwrap();
+        let serialized = serde_json::to_string(report).unwrap();
+        let round_tripped: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped["model"], report["model"]);
+        assert!(round_tripped["scopeLimitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap().contains("not a mechanized proof")));
         assert_eq!(*report, reference);
         assert_eq!(report["model"], MODEL_NAME);
         assert_eq!(report["modelVersion"], MODEL_VERSION);
         assert_eq!(report["theorem"], THEOREM_ID);
         assert_eq!(report["status"], "PASS");
+        for mode in ["bracket", "strict"] {
+            let run = &report["fullContract"]["modes"][mode];
+            assert_eq!(run["status"], "PASS", "{mode}");
+            assert_eq!(run["violations"], 0, "{mode}");
+            assert_eq!(run["explorationComplete"], true, "{mode}");
+            assert_eq!(run["bound"], DEFAULT_BOUND, "{mode}");
+            assert!(
+                run["bound"].as_u64().unwrap() >= run["requiredBound"].as_u64().unwrap(),
+                "{mode}"
+            );
+        }
         assert_eq!(report["exploredStates"], 1_503_835);
         assert_eq!(report["exploredTraces"], 931_110);
         let bracket = &report["fullContract"]["modes"]["bracket"];
         assert_eq!(bracket["requiredBound"], 16);
+        assert_eq!(bracket["admittedDomainCounts"]["strictlyBefore"], 0);
+        assert_eq!(bracket["violations"], 0);
+        assert!(
+            bracket["admissionWindow"]["staleCommitPublishAfterLastReadTraces"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            bracket["admissionWindow"]["admittedStaleCommitPublishAfterLastRead"],
+            0
+        );
+        assert!(bracket["denialReasons"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|key| { key.starts_with("pending_probe_latched_unsafe_delta") }));
+        assert!(bracket["denialReasons"]
+            .as_object()
+            .unwrap()
+            .contains_key("pending_probe_latched_unsafe_delta:RELOAD_P0"));
+        assert!(bracket["denialReasons"]
+            .as_object()
+            .unwrap()
+            .contains_key("pending_probe_latched_unsafe_delta:RELOAD_P1"));
         assert_eq!(bracket["exploredStates"], 333_417);
         assert_eq!(bracket["exploredTraces"], 129_855);
         assert_eq!(bracket["violations"], 0);
@@ -1251,6 +1399,8 @@ mod tests {
         assert_eq!(bracket["mixedManifestBody"]["admittedTornReadTraces"], 0);
         let strict = &report["fullContract"]["modes"]["strict"];
         assert_eq!(strict["requiredBound"], 10);
+        assert_eq!(strict["admittedDomainCounts"]["strictlyBefore"], 0);
+        assert_eq!(strict["violations"], 0);
         assert_eq!(strict["exploredStates"], 524);
         assert_eq!(strict["exploredTraces"], 328);
         assert_eq!(strict["violations"], 0);
@@ -1260,6 +1410,76 @@ mod tests {
         );
         assert_eq!(strict["mixedManifestBody"]["tornReadTraces"], 119);
         assert_eq!(strict["mixedManifestBody"]["admittedTornReadTraces"], 0);
+        for mode in ["bracket", "strict"] {
+            let run = &report["fullContract"]["modes"][mode];
+            assert_eq!(run["admittedDomainCounts"]["strictlyBefore"], 0, "{mode}");
+            assert_eq!(run["violations"], 0, "{mode}");
+            assert!(
+                run["mixedManifestBody"]["tornReadTracesByKind"]["manifest_ahead_body_stale"]
+                    .as_u64()
+                    .unwrap()
+                    > 0,
+                "{mode}"
+            );
+            assert!(
+                run["mixedManifestBody"]["tornReadTracesByKind"]["body_ahead_manifest_stale"]
+                    .as_u64()
+                    .unwrap()
+                    > 0,
+                "{mode}"
+            );
+            assert_eq!(
+                run["mixedManifestBody"]["admittedTornReadTraces"], 0,
+                "{mode}"
+            );
+            assert!(
+                run["admissionWindow"]["staleCommitPublishAfterLastReadTraces"]
+                    .as_u64()
+                    .unwrap()
+                    > 0,
+                "{mode}"
+            );
+            assert_eq!(
+                run["admissionWindow"]["admittedStaleCommitPublishAfterLastRead"], 0,
+                "{mode}"
+            );
+            assert!(
+                run["denialReasons"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .any(|key| { key.starts_with("pending_probe_latched_unsafe_delta:") }),
+                "{mode}"
+            );
+            assert!(
+                run["admittedDomainCounts"]["afterFinalObservation"]
+                    .as_u64()
+                    .unwrap()
+                    > 0,
+                "{mode}"
+            );
+            assert!(
+                run["admissionWindow"]["admittedPublishAfterFinalObservation"]
+                    .as_u64()
+                    .unwrap()
+                    > 0,
+                "{mode}"
+            );
+            assert_eq!(
+                run["violationsByDomain"]["afterFinalObservation"], 0,
+                "{mode}"
+            );
+            assert_eq!(run["violationsByDomain"]["overlapUnknown"], 0, "{mode}");
+            assert_eq!(
+                run["violations"], run["admittedDomainCounts"]["strictlyBefore"],
+                "{mode}"
+            );
+            for (domain, count) in run["violationsByDomain"].as_object().unwrap() {
+                if domain != "strictlyBefore" {
+                    assert_eq!(count, 0, "{mode} {domain}");
+                }
+            }
+        }
         let omissions = report["omissions"].as_array().unwrap();
         assert_eq!(omissions.len(), PREMISES.len());
         let expected = [
@@ -1322,6 +1542,114 @@ mod tests {
                 "ADMIT"
             ]
         );
+        for entry in omissions {
+            for key in [
+                "premise",
+                "premiseRemoved",
+                "status",
+                "finding",
+                "intendedSchedule",
+                "counterexample",
+                "note",
+                "run",
+            ] {
+                assert!(
+                    entry.get(key).is_some(),
+                    "{} missing {key}",
+                    entry["premise"]
+                );
+            }
+            assert_eq!(entry["premise"], entry["premiseRemoved"]);
+            assert!(matches!(
+                entry["status"].as_str(),
+                Some("PASS" | "FAIL" | "BLOCKED" | "UNKNOWN")
+            ));
+            assert_eq!(entry["counterexample"]["domain"], "strictly_before");
+            assert_eq!(entry["counterexample"]["staleAtAdmission"], true);
+            for key in [
+                "scheduleClass",
+                "outcome",
+                "domain",
+                "staleAtAdmission",
+                "eventCount",
+                "stepCount",
+                "reads",
+                "pendingObservations",
+                "trace",
+            ] {
+                assert!(
+                    entry["counterexample"].get(key).is_some(),
+                    "{} counterexample missing {key}",
+                    entry["premise"]
+                );
+            }
+        }
+        let pending_probe_counterexample = &omissions[0]["counterexample"];
+        assert_eq!(
+            pending_probe_counterexample["scheduleClass"],
+            "source_pending_commit_without_publication"
+        );
+        assert!(pending_probe_counterexample["trace"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event"] == "COMMIT_DURABLE"));
+        assert!(pending_probe_counterexample["trace"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(
+                event["event"].as_str(),
+                Some("PUBLISH" | "EVIDENCE_BODY_ADVANCE")
+            )));
+        assert!(pending_probe_counterexample["trace"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event"] == "ADMIT"));
+        assert_eq!(pending_probe_counterexample["outcome"], "ADMITTED");
+        assert_eq!(pending_probe_counterexample["staleAtAdmission"], true);
+        assert_eq!(pending_probe_counterexample["domain"], "strictly_before");
+        assert_eq!(
+            pending_probe_counterexample["pendingObservations"],
+            json!({})
+        );
+        let before_t_f_probe_omission = &omissions[0]["run"]["admissionWindow"];
+        assert!(
+            before_t_f_probe_omission["staleCommitPublishAfterLastReadTraces"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            before_t_f_probe_omission["admittedStaleCommitPublishAfterLastRead"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let no_recheck_counterexample = &omissions[1]["counterexample"];
+        let no_recheck_events = events(no_recheck_counterexample);
+        let event_position = |name: &str| {
+            no_recheck_events
+                .iter()
+                .position(|event| *event == name)
+                .unwrap()
+        };
+        assert!(event_position("RELOAD_M0") < event_position("PUBLISH"));
+        assert!(event_position("PUBLISH") < event_position("RELOAD_P0"));
+        assert_eq!(
+            no_recheck_counterexample["pendingObservations"]["RELOAD_P0"]["pending"],
+            false
+        );
+        assert_eq!(
+            no_recheck_counterexample["pendingObservations"]["RELOAD_P1"]["pending"],
+            false
+        );
+        assert_eq!(no_recheck_counterexample["reads"]["RELOAD_M0"]["gen"], "g0");
+        assert_eq!(no_recheck_counterexample["reads"]["RELOAD_M0"]["rev"], "r0");
+        assert_eq!(no_recheck_counterexample["reads"]["RELOAD_M1"]["gen"], "g1");
+        assert_eq!(no_recheck_counterexample["reads"]["RELOAD_M1"]["rev"], "r1");
+        assert!(!no_recheck_events.contains(&"POST_OBS_END"));
         assert_eq!(
             events(&omissions[1]["counterexample"]),
             [
@@ -1395,8 +1723,159 @@ mod tests {
                 "ADMIT"
             ]
         );
+        let no_final_reload_counterexample = &omissions[2]["counterexample"];
+        let no_final_reload_events = events(no_final_reload_counterexample);
+        for event in ["RELOAD_M0", "RELOAD_P0", "RELOAD_M1", "RELOAD_P1"] {
+            assert!(!no_final_reload_events.contains(&event));
+        }
         assert_eq!(
-            events(&omissions[5]["counterexample"]),
+            no_final_reload_counterexample["pendingObservations"],
+            json!({})
+        );
+        assert!(no_final_reload_events.contains(&"COMMIT_DURABLE"));
+        assert_eq!(no_final_reload_counterexample["domain"], "strictly_before");
+
+        let no_identity_counterexample = &omissions[3]["counterexample"];
+        let no_identity_events = events(no_identity_counterexample);
+        assert!(
+            no_identity_events
+                .iter()
+                .position(|event| *event == "PUBLISH")
+                .unwrap()
+                < no_identity_events
+                    .iter()
+                    .position(|event| *event == "RELOAD_M0")
+                    .unwrap()
+        );
+        assert!(!no_identity_events.contains(&"ROLLBACK"));
+        for event in ["RELOAD_P0", "RELOAD_P1", "POST_OBS_END", "MATCH"] {
+            assert!(no_identity_events.contains(&event));
+        }
+        assert_eq!(
+            no_identity_counterexample["reads"]["RELOAD_M0"]["gen"],
+            "g1"
+        );
+        assert_eq!(
+            no_identity_counterexample["reads"]["RELOAD_M0"]["rev"],
+            "r1"
+        );
+        assert!(omissions[3]["run"]["violationClasses"]
+            .get("stale_generation_pointer_rollback")
+            .is_some());
+
+        let no_fence_counterexample = &omissions[4]["counterexample"];
+        let no_fence_events = events(no_fence_counterexample);
+        assert!(
+            no_fence_events
+                .iter()
+                .position(|event| *event == "PUBLISH")
+                .unwrap()
+                < no_fence_events
+                    .iter()
+                    .position(|event| *event == "ROLLBACK")
+                    .unwrap()
+        );
+        assert!(
+            no_fence_events
+                .iter()
+                .position(|event| *event == "ROLLBACK")
+                .unwrap()
+                < no_fence_events
+                    .iter()
+                    .position(|event| *event == "RELOAD_M0")
+                    .unwrap()
+        );
+        assert_eq!(no_fence_counterexample["domain"], "strictly_before");
+        assert_eq!(
+            omissions[4]["run"]["violationClasses"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            omissions[4]["run"]["violationClasses"]["stale_generation_pointer_rollback"],
+            omissions[4]["run"]["violations"]
+        );
+
+        let no_host_mediation = run_model(
+            Premises::default().without("host_mediation").unwrap(),
+            Mode::Bracket,
+            DEFAULT_BOUND,
+        )
+        .unwrap();
+        assert_eq!(no_host_mediation["status"], "FAIL");
+        assert!(
+            no_host_mediation["admittedDomainCounts"]["overlapUnknown"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(no_host_mediation["violationsByDomain"]["overlapUnknown"], 0);
+        assert_eq!(
+            no_host_mediation["violations"],
+            no_host_mediation["admittedDomainCounts"]["strictlyBefore"]
+        );
+        assert_eq!(
+            no_host_mediation["violations"],
+            no_host_mediation["violationsByDomain"]["strictlyBefore"]
+        );
+
+        let fence_omission = run_model(
+            Premises::default()
+                .without("generation_revoke_fence")
+                .unwrap(),
+            Mode::Bracket,
+            DEFAULT_BOUND,
+        )
+        .unwrap();
+        assert_eq!(fence_omission["status"], "FAIL");
+        let mixed = &fence_omission["mixedManifestBody"];
+        assert!(mixed["tornReadTraces"].as_u64().unwrap() > 0);
+        assert!(
+            mixed["tornReadTracesByKind"]["manifest_ahead_body_stale"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            mixed["tornReadTracesByKind"]["body_ahead_manifest_stale"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(mixed["admittedTornReadTraces"].as_u64().unwrap() > 0);
+        let admitted_domains = mixed["admittedTornReadTracesByDomain"].as_object().unwrap();
+        assert_eq!(admitted_domains.len(), 1);
+        assert!(admitted_domains.contains_key("after_final_observation"));
+        assert_eq!(
+            fence_omission["counterexample"]["scheduleClass"],
+            "stale_generation_pointer_rollback"
+        );
+        assert_eq!(
+            fence_omission["violations"],
+            fence_omission["admittedDomainCounts"]["strictlyBefore"]
+        );
+        let bypass_counterexample = &omissions[5]["counterexample"];
+        let bypass_events = events(bypass_counterexample);
+        assert!(bypass_events.contains(&"BYPASS"));
+        assert!(bypass_events.contains(&"COMMIT_DURABLE"));
+        assert!(!bypass_events.contains(&"ADMIT"));
+        assert!(bypass_events.contains(&"RELOAD_M0"));
+        assert!(
+            bypass_events
+                .iter()
+                .position(|event| *event == "COMMIT_DURABLE")
+                .unwrap()
+                < bypass_events
+                    .iter()
+                    .position(|event| *event == "RELOAD_M0")
+                    .unwrap()
+        );
+        assert_eq!(bypass_counterexample["eventCount"], 5);
+        assert_eq!(bypass_counterexample["domain"], "strictly_before");
+        assert_eq!(
+            bypass_events,
             [
                 "INIT",
                 "COMMIT_BEGIN",
@@ -1405,6 +1884,262 @@ mod tests {
                 "BYPASS"
             ]
         );
+    }
+
+    #[test]
+    fn full_contract_passes_at_python_required_bound_and_required_bound_plus_four_in_both_modes() {
+        let required = required_bound(Premises::default(), Mode::Bracket);
+        for extra_steps in [0, 4] {
+            let bound = required + extra_steps;
+            for mode in [Mode::Bracket, Mode::Strict] {
+                let run = run_model(Premises::default(), mode, bound).unwrap();
+                assert_eq!(run["status"], "PASS", "{mode:?}, extra_steps={extra_steps}");
+                assert_eq!(run["violations"], 0, "{mode:?}, extra_steps={extra_steps}");
+                assert_eq!(
+                    run["explorationComplete"], true,
+                    "{mode:?}, extra_steps={extra_steps}"
+                );
+                assert_eq!(run["bound"], bound, "{mode:?}, extra_steps={extra_steps}");
+                assert_eq!(
+                    run["requiredBound"],
+                    required_bound(Premises::default(), mode),
+                    "{mode:?}, extra_steps={extra_steps}"
+                );
+                let anchor = if mode == Mode::Bracket {
+                    "RELOAD_M0"
+                } else {
+                    "STRICT_LOAD"
+                };
+                assert_eq!(run["mode"], mode.as_str());
+                assert_eq!(build_chains(Premises::default(), mode).checklist[0], anchor);
+                assert_eq!(run["admittedDomainCounts"]["strictlyBefore"], 0);
+                assert!(run["bound"].as_u64().unwrap() >= run["requiredBound"].as_u64().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn required_bound_matches_the_reported_mode_bounds() {
+        let report = default_report();
+        assert_eq!(
+            required_bound(Premises::default(), Mode::Bracket),
+            report["fullContract"]["modes"]["bracket"]["requiredBound"]
+        );
+        assert_eq!(
+            required_bound(Premises::default(), Mode::Strict),
+            report["fullContract"]["modes"]["strict"]["requiredBound"]
+        );
+    }
+
+    #[test]
+    fn run_model_is_deterministic_for_full_exact_identity_and_host_mediation_modes() {
+        for (premises, mode) in [
+            (Premises::default(), Mode::Bracket),
+            (
+                Premises::default().without("exact_identity").unwrap(),
+                Mode::Bracket,
+            ),
+            (
+                Premises::default().without("host_mediation").unwrap(),
+                Mode::Bracket,
+            ),
+        ] {
+            let first = run_model(premises, mode, 20).unwrap();
+            let second = run_model(premises, mode, 20).unwrap();
+            assert_eq!(first, second);
+            if first["counterexample"].is_object() {
+                assert_eq!(
+                    first["counterexample"]["trace"],
+                    second["counterexample"]["trace"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn report_scope_limits_and_status_vocabulary_are_frozen() {
+        let report = default_report();
+        let serialized = serde_json::to_string(report).unwrap();
+        for expected in [
+            "NO admission-side watermark",
+            "NO admission-time pending re-derivation",
+            "read-time",
+            "Full-contract PASS is an abstract bounded property only",
+            "does not suppress them",
+            "not by any admission-time check",
+            "t_f is m0",
+            "m0 < p0 < m1 < p1",
+            "latched",
+            "EVIDENCE_BODY_ADVANCE",
+            "torn",
+            "decisive",
+            "independent single-premise results",
+            "ONLY the full contract",
+            "BoundError",
+            "not a mechanized proof",
+            "never counted as violations",
+        ] {
+            assert!(
+                serialized.contains(expected),
+                "missing report scope text: {expected}"
+            );
+        }
+        for status in ["PASS", "FAIL", "BLOCKED", "UNKNOWN"] {
+            assert!(report["statusVocabulary"][status].is_string(), "{status}");
+        }
+        assert_eq!(report["statusVocabulary"].as_object().unwrap().len(), 4);
+        let blocked = report["statusVocabulary"]["BLOCKED"].as_str().unwrap();
+        assert!(blocked.contains("BoundError"));
+        assert!(blocked.contains("code 2"));
+        let status_scope = report["statusScope"].as_str().unwrap();
+        assert!(status_scope.contains("ONLY the full contract"));
+        assert!(status_scope.contains("omissions"));
+        assert!(status_scope.contains("independent single-premise status"));
+        assert_eq!(report["status"], "PASS");
+        assert_eq!(report["status"], report["fullContract"]["status"]);
+        assert!(report["omissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["status"] == "FAIL"));
+
+        let limitations = report["scopeLimitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        for expected in [
+            "does not suppress them",
+            "NO admission-side watermark and NO admission-time pending re-derivation",
+            "not by any admission-time check",
+            "t_f is m0",
+            "m0 < p0 < m1 < p1",
+            "latched",
+            "EVIDENCE_BODY_ADVANCE",
+            "torn",
+            "decisive",
+            "independent single-premise results",
+            "ONLY the full contract",
+            "BoundError",
+            "not a mechanized proof",
+            "never counted as violations",
+        ] {
+            assert!(
+                limitations.contains(expected),
+                "missing structural assumption: {expected}"
+            );
+        }
+
+        let meaning = report["fullContract"]["meaning"].as_str().unwrap();
+        for expected in [
+            "abstract bounded property only",
+            "scopeLimitations",
+            "NO admission-time re-derivation and NO admission-side watermark",
+            "latched unsafe pending delta",
+            "not evidence about the production implementation",
+            "strictly before t_f",
+        ] {
+            assert!(
+                meaning.contains(expected),
+                "missing full-contract qualification: {expected}"
+            );
+        }
+
+        let premise_descriptions = &report["premiseDescriptions"];
+        assert!(premise_descriptions["generation_revoke_fence"]
+            .as_str()
+            .unwrap()
+            .contains("read gate ONLY"));
+        assert!(premise_descriptions["pending_probe"]
+            .as_str()
+            .unwrap()
+            .contains("read time"));
+        for removed_field in ["admissionWatermarkCounterfactual", "admission_watermark"] {
+            assert!(
+                !serialized.contains(removed_field),
+                "obsolete report field: {removed_field}"
+            );
+        }
+        for key in [
+            "model",
+            "modelVersion",
+            "theorem",
+            "bound",
+            "exploredStates",
+            "exploredTraces",
+            "fullContract",
+            "omissions",
+            "status",
+            "statusScope",
+            "statusVocabulary",
+            "scopeLimitations",
+        ] {
+            assert!(
+                report.get(key).is_some(),
+                "missing top-level report field: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn e5_source_documents_abstract_evidence_boundary() {
+        let source = include_str!("../../Docs/authorization-validation/tools/e5_model_check.py");
+        assert!(source.starts_with("#!/usr/bin/env python3\n\"\"\""));
+        let module_doc = source
+            .split_once("\"\"\"")
+            .and_then(|(_, rest)| rest.split_once("\"\"").map(|(doc, _)| doc))
+            .expect("Python checker module docstring");
+        let normalized_doc = module_doc.split_whitespace().collect::<Vec<_>>().join(" ");
+        for expected in [
+            "ABSTRACT BOUNDED-MODEL EVIDENCE ONLY",
+            "NOT a mechanized proof",
+            "Rust (or Java) implementation",
+            "deployment",
+            "runtime behavior",
+            "v2.1.0",
+            "scopeLimitations",
+        ] {
+            assert!(
+                normalized_doc.contains(expected),
+                "missing Python module docstring boundary: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_underbound_report_never_claims_pass() {
+        let report = build_report(8).unwrap();
+        let status = report["fullContract"]["status"].as_str().unwrap();
+        assert!(matches!(status, "UNKNOWN" | "FAIL"));
+        assert_ne!(status, "PASS");
+        assert_eq!(report["status"], status);
+    }
+
+    #[test]
+    fn no_report_status_field_emits_blocked() {
+        fn assert_no_blocked(value: &Value, path: &str) {
+            match value {
+                Value::Object(fields) => {
+                    for (key, nested) in fields {
+                        if key == "status" {
+                            assert_ne!(nested, "BLOCKED", "blocked status at {path}");
+                        }
+                        assert_no_blocked(nested, &format!("{path}.{key}"));
+                    }
+                }
+                Value::Array(items) => {
+                    for (index, nested) in items.iter().enumerate() {
+                        assert_no_blocked(nested, &format!("{path}[{index}]"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_no_blocked(default_report(), "report");
+        assert!(validate_bound(0).is_err());
+        assert!(validate_bound(MAX_BOUND + 1).is_err());
     }
 
     #[test]
@@ -1425,5 +2160,73 @@ mod tests {
         let first_report = build_report(DEFAULT_BOUND).unwrap();
         let second_report = build_report(DEFAULT_BOUND).unwrap();
         assert_eq!(first_report, second_report);
+    }
+
+    fn production(source: &str) -> &str {
+        source.split("#[cfg(test)]").next().unwrap_or(source)
+    }
+
+    #[test]
+    fn model_sources_have_no_process_socket_or_network_coupling() {
+        let sources = [
+            include_str!("e5_model.rs"),
+            include_str!("two_mutation_model.rs"),
+            include_str!("universal_hypotheses.rs"),
+            include_str!("model_acceptance.rs"),
+        ];
+        for token in [
+            "std::process",
+            "std::net",
+            "TcpStream",
+            "UdpSocket",
+            "tokio::net",
+            "tokio::process",
+            "reqwest",
+            "hyper::",
+            "Command::new",
+        ] {
+            for source in sources.map(production) {
+                assert!(!source.contains(token), "{token}");
+            }
+        }
+    }
+
+    #[test]
+    fn model_sources_have_no_mutable_module_initializers() {
+        let sources = [
+            include_str!("e5_model.rs"),
+            include_str!("two_mutation_model.rs"),
+            include_str!("universal_hypotheses.rs"),
+            include_str!("model_acceptance.rs"),
+        ];
+        for token in [
+            "static mut",
+            "lazy_static!",
+            "once_cell",
+            "#[ctor]",
+            "thread_local!",
+        ] {
+            for source in sources.map(production) {
+                assert!(!source.contains(token), "{token}");
+            }
+        }
+    }
+
+    #[test]
+    fn model_entrypoints_are_repeatable_without_environment_or_file_reads() {
+        let sources = [
+            include_str!("e5_model.rs"),
+            include_str!("two_mutation_model.rs"),
+            include_str!("universal_hypotheses.rs"),
+            include_str!("model_acceptance.rs"),
+        ];
+        for token in ["std::fs", "std::env", "std::process"] {
+            for source in sources.map(production) {
+                assert!(!source.contains(token), "{token}");
+            }
+        }
+        let first = run_model(Premises::default(), Mode::Strict, 2).unwrap();
+        let second = run_model(Premises::default(), Mode::Strict, 2).unwrap();
+        assert_eq!(first, second);
     }
 }

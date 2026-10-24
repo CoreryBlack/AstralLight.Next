@@ -906,6 +906,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rate_limit_passes_under_and_rejects_at_the_limit() {
+        let evaluator = RateLimitCondition;
+        let condition = Condition {
+            condition_type: "RateLimitCondition".into(),
+            params: serde_json::json!({ "max_requests": 5 }),
+        };
+        let ctx = |count: u64| {
+            PolicyContext::builder()
+                .action("read".into())
+                .request(Some(serde_json::json!({ "rateLimitCount": count })))
+                .build()
+        };
+        // Under the window budget the condition refines the ALLOW.
+        assert!(evaluator.evaluate(&condition, &ctx(4)).await.unwrap());
+        // At and above the budget it rejects; unknown counts stay an error.
+        assert!(!evaluator.evaluate(&condition, &ctx(5)).await.unwrap());
+        assert!(!evaluator.evaluate(&condition, &ctx(6)).await.unwrap());
+        let missing = evaluator
+            .evaluate(
+                &condition,
+                &PolicyContext::builder().action("read".into()).build(),
+            )
+            .await;
+        assert!(missing.is_err());
+        let no_budget = evaluator
+            .evaluate(
+                &Condition {
+                    condition_type: "RateLimitCondition".into(),
+                    params: serde_json::json!({}),
+                },
+                &ctx(1),
+            )
+            .await;
+        assert!(no_budget.is_err());
+    }
+
+    #[tokio::test]
     async fn test_device_type_mobile() {
         let evaluator = DeviceTypeCondition;
         let condition = Condition {

@@ -2220,6 +2220,9 @@ mod tests {
             inbox.status_of("city-a", "node-1", "event-1"),
             Some("PENDING".into())
         );
+        // Whether apply already ran depends on where the storage failure hit
+        // the sequence; both orders are valid, but applied must be either
+        // untouched or exactly this one event -- never partial or foreign.
         assert!(
             apply.applied().is_empty() || apply.applied() == vec!["event-1".to_owned()],
             "apply may have succeeded but the receipt proof is missing, so the delivery requeues"

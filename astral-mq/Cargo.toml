@@ -35,3 +35,6 @@ redis-compat = ["dep:redis"]
 [[example]]
 name = "check_redis"
 required-features = ["redis-compat"]
+
+[dev-dependencies]
+astral-db = { path = "../astral-db", features = ["test-support"] }

@@ -4102,12 +4102,15 @@ mod tests {
     fn typed_session_revocation_dispatch_fails_closed_without_acceleration_surface() {
         // Neither the revocation registry nor the projection store is installed
         // in this unit-test process; the typed dispatch must refuse (a registry
-        // miss is never an implicit Allow). The guard keeps the test stable if
-        // a future test process installs a surface.
+        // miss is never an implicit Allow). If a future test in this binary
+        // installs a surface, print an explicit SKIP marker instead of
+        // returning silently: a silent return keeps this fail-closed guard
+        // green while protecting nothing.
         if astral_common::session_revocation_registry::global_session_revocation_registry()
             .is_some()
             || astral_common::session_projection_store::global_session_projection_store().is_some()
         {
+            eprintln!("[SKIP] typed_session_revocation_dispatch_fails_closed_without_acceleration_surface: acceleration surface installed");
             return;
         }
         let event = crate::invalidation::InvalidationEvent::SessionRevoked(

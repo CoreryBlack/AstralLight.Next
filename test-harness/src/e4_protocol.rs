@@ -455,9 +455,34 @@ mod tests {
         bad.approval_token = "approve-other-run";
         let invalid = validate_authorization(&bad, "redis_unavailable", &FAULTS);
         assert!(invalid.problems.contains(&"not_run_scoped:approval_token"));
+
+        let mut missing = auth();
+        missing.approval_token = "";
+        assert!(
+            validate_authorization(&missing, "redis_unavailable", &FAULTS)
+                .problems
+                .contains(&"invalid:approval_token")
+        );
         assert!(validate_authorization(&auth(), "not-registered", &FAULTS)
             .problems
             .contains(&"invalid:fault_id"));
+    }
+
+    #[test]
+    fn authorization_validation_does_not_mutate_supplied_input() {
+        let authorization = auth();
+        let original = authorization.clone();
+
+        let valid = validate_authorization(&authorization, "redis_unavailable", &FAULTS);
+        assert!(valid.problems.is_empty());
+        assert_eq!(authorization, original);
+
+        let mut invalid = auth();
+        invalid.approval_token = "approve-other-run";
+        let original_invalid = invalid.clone();
+        let rejected = validate_authorization(&invalid, "redis_unavailable", &FAULTS);
+        assert!(rejected.problems.contains(&"not_run_scoped:approval_token"));
+        assert_eq!(invalid, original_invalid);
     }
 
     #[test]

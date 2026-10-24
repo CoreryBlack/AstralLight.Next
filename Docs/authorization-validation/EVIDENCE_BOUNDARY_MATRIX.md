@@ -56,9 +56,11 @@ JSONL parser, dependency-profile/fault declarations, experiment register, and
 E1/E3 lifecycle timing reducer, alongside earlier typed classifier, reconciliation,
 protocol and bounded-model targets. Their coverage is limited to the exact offline
 assertions in the archive mapping; full runners/reports, read-only probes, node
-adapter, fake-controller lifecycle, worker/shard, multi-mutation/universal models,
-and projection-owner BFS remain `BLOCKED` where mapped. No offline target establishes
-external service, deployment, or live campaign evidence.
+adapter, fake-controller lifecycle, worker/shard parity, and complete U1-U10
+enumeration over both mutation models remain `BLOCKED` where mapped. The strict
+complete-bound two-mutation contract, projection-owner finite BFS, and fixture-driven
+U1-U10 evaluator reducer are registered offline targets, but do not establish
+unbounded properties or external service, deployment, or live campaign evidence.
 
 These checks establish tool and in-process contracts only. A standalone TLA+ input
 remains `BLOCKED` until run with an immutable, checksum-verified TLC tool. Database,

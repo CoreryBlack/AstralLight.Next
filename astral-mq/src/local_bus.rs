@@ -699,6 +699,9 @@ mod tests {
 
     /// 极限探针（informational）：持续收发的端到端吞吐——入队（含 envelope
     /// 校验/序列化/digest）+ 消费全链路，背压下生产者自旋重试。
+    // Informational 100k-message throughput probe with no assertions; seconds
+    // of wall clock in every default run -- run it explicitly.
+    #[ignore = "cpu-only throughput probe; run explicitly with --ignored"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn limit_sustained_delivery_throughput() {
         const MESSAGES: usize = 100_000;

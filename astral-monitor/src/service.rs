@@ -834,6 +834,9 @@ mod tests {
         assert!(evaluate_condition(80.0, "lte", 80.0));
         assert!(evaluate_condition(80.0, "lt", 81.0));
         assert!(evaluate_condition(1.0002, "eq", 1.0));
+        // eq must not be a vacuous true: outside the epsilon window it fails.
+        assert!(!evaluate_condition(1.01, "eq", 1.0));
+        assert!(!evaluate_condition(0.99, "eq", 1.0));
         assert!(!evaluate_condition(1.0, "unknown", 1.0));
     }
 

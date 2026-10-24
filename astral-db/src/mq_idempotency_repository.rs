@@ -457,8 +457,11 @@ fn ensure_digest_compatible(
     }
 }
 
-#[cfg(test)]
-mod tests {
+/// 共享测试支撑：契约级内存租约存储（`test-support` feature 或本 crate 测试可用）。
+/// 消费方（astral-mq 的 consumer 编排测试）与本 crate 的租约契约套件
+/// 使用同一份实现，杜绝各自维护的手写 fake 语义漂移。
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
@@ -466,19 +469,19 @@ mod tests {
     /// In-memory clock shared with the fake store so lease expiry can be
     /// exercised without a real database.
     #[derive(Default)]
-    struct FakeClock(Mutex<i64>);
+    pub struct FakeClock(Mutex<i64>);
 
     impl FakeClock {
-        fn now(&self) -> i64 {
+        pub fn now(&self) -> i64 {
             *self.0.lock().unwrap()
         }
-        fn advance(&self, seconds: i64) {
+        pub fn advance(&self, seconds: i64) {
             *self.0.lock().unwrap() += seconds;
         }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
-    struct FakeRow {
+    pub struct FakeRow {
         payload_sha256: Option<String>,
         status: String,
         lease_owner: Option<String>,
@@ -495,7 +498,7 @@ mod tests {
     /// contract (server clock faked by [`FakeClock`], alive iff
     /// `lease_expires_at >= now`, matching the SQL `>=` comparisons). Used by
     /// the lease contract suite so the semantics stay testable without MySQL.
-    struct InMemoryMqConsumerLeaseStore {
+    pub struct InMemoryMqConsumerLeaseStore {
         rows: Mutex<BTreeMap<(String, String), FakeRow>>,
         idem_keys: Mutex<BTreeMap<String, (String, String)>>,
         clock: Arc<FakeClock>,
@@ -503,7 +506,7 @@ mod tests {
     }
 
     impl InMemoryMqConsumerLeaseStore {
-        fn new(clock: Arc<FakeClock>) -> Self {
+        pub fn new(clock: Arc<FakeClock>) -> Self {
             Self {
                 rows: Mutex::new(BTreeMap::new()),
                 idem_keys: Mutex::new(BTreeMap::new()),
@@ -540,14 +543,14 @@ mod tests {
         }
     }
 
-    fn assert_conflict(error: &MqLeaseError) {
+    pub fn assert_conflict(error: &MqLeaseError) {
         assert!(
             matches!(error, MqLeaseError::Conflict { .. }),
             "expected Conflict, got {error:?}"
         );
     }
 
-    fn claim_input<'a>(
+    pub fn claim_input<'a>(
         message_id: &'a str,
         digest: Option<&'a str>,
         owner: &'a str,
@@ -563,12 +566,12 @@ mod tests {
         }
     }
 
-    fn digest_of(seed: &str) -> String {
+    pub fn digest_of(seed: &str) -> String {
         use sha2::{Digest, Sha256};
         format!("{:x}", Sha256::digest(seed.as_bytes()))
     }
 
-    fn key(message_id: &str) -> MqLeaseKey<'_> {
+    pub fn key(message_id: &str) -> MqLeaseKey<'_> {
         MqLeaseKey {
             message_type: "AUDIT_LOG",
             message_id,
@@ -582,7 +585,13 @@ mod tests {
             input: &MqLeaseClaim<'_>,
         ) -> Result<MqLeaseClaimOutcome, MqLeaseError> {
             validate_claim(input)?;
-            let lease_key = key(input.message_id);
+            // The row lookup must honor the claim's own message type; a
+            // hardcoded type silently reset foreign-type rows to generation 1
+            // on re-claim.
+            let lease_key = MqLeaseKey {
+                message_type: input.message_type,
+                message_id: input.message_id,
+            };
             let row = self.row(&lease_key);
             match row {
                 None => {
@@ -727,7 +736,7 @@ mod tests {
 
     // ===== lease contract suite (pure; no MySQL connection) =====
 
-    async fn contract_claim_complete_is_idempotent(store: &dyn MqConsumerLeaseStore) {
+    pub async fn contract_claim_complete_is_idempotent(store: &dyn MqConsumerLeaseStore) {
         let digest = digest_of("payload-a");
         let first = store
             .claim(&claim_input("msg-1", Some(&digest), "owner-1", 30))
@@ -769,7 +778,7 @@ mod tests {
         assert_eq!(replay, MqLeaseClaimOutcome::Completed);
     }
 
-    async fn contract_digest_conflict_fails_closed(store: &dyn MqConsumerLeaseStore) {
+    pub async fn contract_digest_conflict_fails_closed(store: &dyn MqConsumerLeaseStore) {
         let digest_a = digest_of("payload-a");
         let digest_b = digest_of("payload-b");
         let first = store
@@ -795,7 +804,7 @@ mod tests {
         assert_conflict(&error);
     }
 
-    async fn contract_takeover_increments_generation_fence(
+    pub async fn contract_takeover_increments_generation_fence(
         clock: &FakeClock,
         store: &dyn MqConsumerLeaseStore,
     ) {
@@ -862,7 +871,7 @@ mod tests {
             .expect("complete must succeed"));
     }
 
-    async fn contract_release_allows_immediate_reclaim(store: &dyn MqConsumerLeaseStore) {
+    pub async fn contract_release_allows_immediate_reclaim(store: &dyn MqConsumerLeaseStore) {
         let digest = digest_of("payload-a");
         let first = store
             .claim(&claim_input("msg-4", Some(&digest), "owner-1", 300))
@@ -901,7 +910,7 @@ mod tests {
         assert_eq!(next_generation, 2);
     }
 
-    async fn contract_renew_extends_only_owned_live_lease(
+    pub async fn contract_renew_extends_only_owned_live_lease(
         clock: &FakeClock,
         store: &dyn MqConsumerLeaseStore,
     ) {
@@ -949,7 +958,7 @@ mod tests {
         );
     }
 
-    async fn contract_legacy_digest_backfill_on_takeover(
+    pub async fn contract_legacy_digest_backfill_on_takeover(
         clock: &FakeClock,
         store: &dyn MqConsumerLeaseStore,
     ) {
@@ -984,6 +993,12 @@ mod tests {
             .expect_err("conflict must fail closed after backfill");
         assert_conflict(&error);
     }
+}
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn lease_contract_suite_runs_on_in_memory_store() {

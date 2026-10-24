@@ -610,7 +610,13 @@ mod tests {
                             continue;
                         }
                         let result = classify_e1_allow(&request, &mutation(*start, *end)).unwrap();
-                        let expected_violation = *end < result.final_observation_interval.start;
+                        // Independent oracle from the fixed ladder: the final
+                        // load always starts at m0s (ladder[3]), so a serving
+                        // commit ending before it is a stale allow. Deriving
+                        // the expectation from the ladder — not from the
+                        // classifier's own interval — keeps this test honest.
+                        let m0s = ladder[3];
+                        let expected_violation = *end < m0s;
                         assert_eq!(
                             result.stale_allow_violation, expected_violation,
                             "{ladder_name}/{source}/{start}/{end}"
@@ -720,6 +726,66 @@ mod tests {
             .unwrap()
             .pending = Some(true);
         assert!(classify_e1_allow(&malformed, &mutation(2, 4)).is_err());
+    }
+
+    #[test]
+    fn fuzz_defects_fail_closed_individually() {
+        let l = ladder("odd");
+        let mutation = mutation(2, 4);
+        let base = request(&l, "l1_cache");
+        let variants = [
+            {
+                let mut events = base.clone();
+                events.push(event(EventKind::SignedContextBound, 2));
+                events
+            },
+            {
+                let mut events = base.clone();
+                events
+                    .iter_mut()
+                    .find(|item| item.kind == EventKind::HostAdmission)
+                    .unwrap()
+                    .node = "node-b".into();
+                events
+            },
+            {
+                let mut events = base.clone();
+                events
+                    .iter_mut()
+                    .find(|item| item.kind == EventKind::HostAdmission)
+                    .unwrap()
+                    .process_epoch = "proc-b".into();
+                events
+            },
+            {
+                let mut events = base.clone();
+                events
+                    .iter_mut()
+                    .find(|item| item.kind == EventKind::DecisionReturn)
+                    .unwrap()
+                    .sequence = l[12];
+                events
+            },
+            {
+                let mut events = base;
+                events
+                    .iter_mut()
+                    .find(|item| item.kind == EventKind::CandidateMatch)
+                    .unwrap()
+                    .identity
+                    .as_mut()
+                    .unwrap()
+                    .grant_revision
+                    .clear();
+                events
+            },
+        ];
+        for (index, malformed) in variants.iter().enumerate() {
+            assert!(
+                classify_e1_allow(malformed, &mutation).is_err(),
+                "fuzz defect {index} was accepted"
+            );
+        }
     }
 
     #[test]

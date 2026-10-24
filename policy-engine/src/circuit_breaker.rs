@@ -21,14 +21,23 @@ pub struct AutoCircuitBreaker {
     state: std::sync::RwLock<CircuitBreakerState>,
     failures: AtomicU32,
     last_failure_time: Mutex<Option<Instant>>,
+    recovery_ms: u64,
 }
 
 impl AutoCircuitBreaker {
     pub fn new() -> Self {
+        Self::with_recovery_ms(CB_RECOVERY_MS)
+    }
+
+    /// 生产实现固定使用 `CB_RECOVERY_MS`；阈值注入只服务于测试——用 0
+    /// 阈值可以确定性地驱动真实的 Open→HalfOpen 恢复分支，而不是绕过它
+    /// 直接改写状态。
+    pub fn with_recovery_ms(recovery_ms: u64) -> Self {
         Self {
             state: std::sync::RwLock::new(CircuitBreakerState::Closed),
             failures: AtomicU32::new(0),
             last_failure_time: Mutex::new(None),
+            recovery_ms,
         }
     }
 
@@ -41,7 +50,7 @@ impl AutoCircuitBreaker {
         if *state == CircuitBreakerState::Open {
             if let Ok(last_fail) = self.last_failure_time.lock() {
                 if last_fail
-                    .map(|time| time.elapsed().as_millis() as u64 >= CB_RECOVERY_MS)
+                    .map(|time| time.elapsed().as_millis() as u64 >= self.recovery_ms)
                     .unwrap_or(false)
                 {
                     *state = CircuitBreakerState::HalfOpen(3);
@@ -146,6 +155,53 @@ mod tests {
 
         // HalfOpen 探测失败应重新 Open（重新计时恢复窗口），而不是长期停在探针态。
         breaker.record_failure();
+        assert_eq!(breaker.state(), CircuitBreakerState::Open);
+    }
+
+    fn open_with_recovery(recovery_ms: u64) -> AutoCircuitBreaker {
+        let breaker = AutoCircuitBreaker::with_recovery_ms(recovery_ms);
+        for _ in 0..CB_THRESHOLD {
+            breaker.record_failure();
+        }
+        assert_eq!(breaker.state(), CircuitBreakerState::Open);
+        breaker
+    }
+
+    #[test]
+    fn open_recovers_to_half_open_after_the_recovery_window() {
+        // Threshold 0 drives the real recovery branch deterministically:
+        // the transition happens inside is_open(), not by rewriting state.
+        let breaker = open_with_recovery(0);
+        assert!(!breaker.is_open());
+        assert_eq!(breaker.state(), CircuitBreakerState::HalfOpen(2));
+    }
+
+    #[test]
+    fn recovered_breaker_gets_three_probes_then_blocks_again() {
+        let breaker = open_with_recovery(0);
+        // The transition itself consumes the first probe budget slot.
+        assert!(!breaker.is_open());
+        assert!(!breaker.is_open());
+        assert!(!breaker.is_open());
+        assert!(breaker.is_open());
+    }
+
+    #[test]
+    fn probe_failure_reopens_and_recovers_again_on_the_next_window() {
+        let breaker = open_with_recovery(0);
+        assert!(!breaker.is_open()); // transition + first probe
+        breaker.record_failure();
+        assert_eq!(breaker.state(), CircuitBreakerState::Open);
+        // Fresh window (threshold 0): the breaker may probe again.
+        assert!(!breaker.is_open());
+        assert_eq!(breaker.state(), CircuitBreakerState::HalfOpen(2));
+    }
+
+    #[test]
+    fn below_the_recovery_window_the_breaker_stays_open() {
+        // A window larger than any test elapsed time keeps the breaker Open.
+        let breaker = open_with_recovery(u64::MAX / 2);
+        assert!(breaker.is_open());
         assert_eq!(breaker.state(), CircuitBreakerState::Open);
     }
 

@@ -25,9 +25,16 @@ fn subsets() -> Vec<Vec<usize>> {
     result
 }
 
-pub fn enumerate_tenant_traces(removed: &[usize]) -> [usize; 7] {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TenantTrace {
+    bucket: usize,
+    t1_narrowing: usize,
+    t2_narrowing: usize,
+}
+
+fn enumerate_tenant_trace_details(removed: &[usize]) -> Vec<TenantTrace> {
     let enabled = |gate: usize| !removed.contains(&gate);
-    let mut counts = [0usize; 7];
+    let mut traces = Vec::with_capacity(32);
     for cache_record in 0..2 {
         for probe_read in 0..2 {
             for manifest_source in 0..2 {
@@ -57,14 +64,22 @@ pub fn enumerate_tenant_traces(removed: &[usize]) -> [usize; 7] {
                             } else {
                                 4
                             };
-                            counts[bucket] += 1;
+                            traces.push(TenantTrace {
+                                bucket,
+                                t1_narrowing,
+                                t2_narrowing,
+                            });
                             continue;
                         }
                         let selected = if enabled(4) {
                             if evidence == 0 {
                                 0
                             } else {
-                                counts[6] += 1;
+                                traces.push(TenantTrace {
+                                    bucket: 6,
+                                    t1_narrowing,
+                                    t2_narrowing,
+                                });
                                 continue;
                             }
                         } else if evidence == 1 {
@@ -79,11 +94,23 @@ pub fn enumerate_tenant_traces(removed: &[usize]) -> [usize; 7] {
                         } else {
                             0
                         };
-                        counts[bucket] += 1;
+                        traces.push(TenantTrace {
+                            bucket,
+                            t1_narrowing,
+                            t2_narrowing,
+                        });
                     }
                 }
             }
         }
+    }
+    traces
+}
+
+pub fn enumerate_tenant_traces(removed: &[usize]) -> [usize; 7] {
+    let mut counts = [0usize; 7];
+    for trace in enumerate_tenant_trace_details(removed) {
+        counts[trace.bucket] += 1;
     }
     counts
 }
@@ -192,26 +219,110 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_tenant_lattice_and_conservation_contract() {
-        let report = tenant_report();
-        assert_eq!(report["status"], "PASS");
-        assert_eq!(report["hypotheses"][1]["evidence"]["subsetsChecked"], 30);
-        assert_eq!(
-            report["hypotheses"][1]["evidence"]["contaminatingSubsets"],
-            20
-        );
-        assert_eq!(
-            report["hypotheses"][3]["evidence"]["configurationsAudited"],
-            31
-        );
+    fn overall_tenant_model_status_is_pass() {
+        assert_eq!(tenant_report()["status"], "PASS");
         assert_eq!(verify_tenant_contract(), Ok(()));
     }
 
     #[test]
-    fn cache_contamination_requires_the_complete_missing_gate_chain() {
-        assert_eq!(enumerate_tenant_traces(&[0]).iter().sum::<usize>(), 32);
-        assert!(enumerate_tenant_traces(&[0, 1, 4])[1] > 0);
-        assert!(enumerate_tenant_traces(&[2])[2] > 0);
-        assert!(enumerate_tenant_traces(&[2])[5] > 0);
+    fn every_tenant_hypothesis_passes() {
+        let report = tenant_report();
+        for entry in report["hypotheses"].as_array().unwrap() {
+            assert_eq!(
+                entry["status"], "PASS",
+                "{} failed: {}",
+                entry["id"], entry["statement"]
+            );
+        }
+    }
+
+    #[test]
+    fn t1_full_scoping_is_contamination_free() {
+        let evidence = &tenant_report()["hypotheses"][0]["evidence"];
+        assert_eq!(evidence["admittedForeignGrant"], 0);
+        assert_eq!(evidence["admittedContaminatedInputs"], 0);
+        assert_eq!(evidence["deniedCrossTenantBlock"], 0);
+        assert!(evidence["deniedOwnPending"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn t3_lattice_matches_chain_predicate_for_every_proper_subset() {
+        let evidence = &tenant_report()["hypotheses"][1]["evidence"];
+        assert_eq!(evidence["subsetsChecked"], 30);
+        assert_eq!(evidence["contaminatingSubsets"], 20);
+        assert_eq!(evidence["unexpectedSafeSubsets"], json!([]));
+        let lattice = evidence["lattice"].as_array().unwrap();
+        assert_eq!(lattice.len(), 30);
+        for entry in lattice {
+            assert_eq!(
+                entry["contaminating"], entry["predicted"],
+                "chain predicate mismatch for {:?}",
+                entry["removed"]
+            );
+        }
+        let singles = lattice
+            .iter()
+            .filter(|entry| entry["removed"].as_array().unwrap().len() == 1)
+            .collect::<Vec<_>>();
+        assert_eq!(singles.len(), 5);
+        for entry in singles {
+            let removed = entry["removed"].as_array().unwrap();
+            assert_eq!(
+                entry["contaminating"],
+                removed == &[json!("tenant_scoped_probe")],
+                "unexpected single-gate omission: {removed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn t5_configuration_count_matches_the_audited_lattice() {
+        let audited = &tenant_report()["hypotheses"][3]["evidence"]["configurationsAudited"];
+        assert_eq!(audited, 31);
+        assert_eq!(1 + subsets().len(), audited.as_u64().unwrap() as usize);
+        assert!(std::iter::once(Vec::new())
+            .chain(subsets())
+            .all(|removed| { enumerate_tenant_traces(&removed).iter().sum::<usize>() == 32 }));
+    }
+
+    #[test]
+    fn t4_defense_in_depth_table_is_locked() {
+        let observed = &tenant_report()["hypotheses"][2]["evidence"]["observed"];
+        assert_eq!(observed["tenant_scoped_cache_key"], json!([]));
+        assert_eq!(observed["tenant_scoped_record_validation"], json!([]));
+        assert_eq!(observed["tenant_scoped_watermark"], json!([]));
+        assert_eq!(observed["tenant_scoped_match"], json!([]));
+        assert_eq!(
+            observed["tenant_scoped_probe"],
+            json!(["admittedContaminatedInputs", "deniedCrossTenantBlock"])
+        );
+    }
+
+    #[test]
+    fn cache_vector_needs_both_gates_removed() {
+        let cache_key_removed = enumerate_tenant_traces(&[0]);
+        assert_eq!(cache_key_removed[1], 0);
+
+        let cache_key_and_validation_removed = enumerate_tenant_traces(&[0, 1]);
+        assert_eq!(cache_key_and_validation_removed[1], 0);
+        assert!(cache_key_and_validation_removed[6] > 0);
+
+        let match_also_removed = enumerate_tenant_traces(&[0, 1, 4]);
+        assert!(match_also_removed[1] > 0);
+    }
+
+    #[test]
+    fn cross_tenant_block_requires_an_unscoped_probe() {
+        let unscoped_probe = enumerate_tenant_trace_details(&[2]);
+        let cross_tenant_blocks = unscoped_probe
+            .iter()
+            .filter(|trace| trace.bucket == 5)
+            .collect::<Vec<_>>();
+        assert!(!cross_tenant_blocks.is_empty());
+        for trace in cross_tenant_blocks {
+            assert_eq!(trace.t1_narrowing, 0);
+            assert_eq!(trace.t2_narrowing, 1);
+        }
+        assert_eq!(enumerate_tenant_traces(&[])[5], 0);
     }
 }

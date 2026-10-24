@@ -6,7 +6,6 @@
 //! 四种位置 × N {100, 1000, 4050}，混合资源类型（贴近真实卡面）。
 
 use super::published::{match_published_effective_grant, MATCHER_INDEX_THRESHOLD};
-use crate::PolicyEngine;
 use astral_types::registry::parse_resource_key;
 use astral_types::{
     BindingLayer, CanonicalGrant, GrantEffect, GrantId, GrantProvenance, GrantRevision,
@@ -14,7 +13,6 @@ use astral_types::{
     PublishedCardAuthorization, PublishedCardAuthorizationGate, PublishedEvidenceGateStatus,
     TenantScope, ValidityWindow, VerifiedPublishedGrantRecord,
 };
-use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -265,4 +263,77 @@ fn relay_paths_are_semantically_equivalent() {
             .map(|grant| grant.resource.clone());
         assert_eq!(via_relay, linear(request), "relay diverged for {request}");
     }
+}
+
+/// 抖动退化探针：两张（四张）大卡交错判定——单槽缓存每次 ptr_eq miss
+/// 都全量重建索引。若交错场景成本 >> 线性扫描，接力需要多槽/自适应。
+#[test]
+fn matcher_index_thrash_under_interleaved_cards() {
+    let size = MATCHER_INDEX_THRESHOLD + 1;
+    let evidence_a = std::sync::Arc::new(evidence_from(
+        (0..size)
+            .map(|index| probe_grant(index, format!("invoice:{index}")))
+            .collect(),
+        size,
+    ));
+    let evidence_b = std::sync::Arc::new(evidence_from(
+        (0..size)
+            .map(|index| probe_grant(index, format!("ledger:{index}")))
+            .collect(),
+        size,
+    ));
+    let ctx = probe_ctx();
+    // 线性扫描基线（用 ≤阈值的小证据等价测量）：构造 N=threshold 线性扫描。
+    let small = std::sync::Arc::new(evidence_from(
+        (0..MATCHER_INDEX_THRESHOLD)
+            .map(|index| probe_grant(index, format!("invoice:{index}")))
+            .collect(),
+        MATCHER_INDEX_THRESHOLD,
+    ));
+    let linear_baseline = {
+        // 用小证据测线性成本按比例外推到 size（线性 O(N)）。
+        let per_decision = measure(&small, &ctx, 5_000);
+        per_decision * (size / MATCHER_INDEX_THRESHOLD) as u128
+    };
+
+    let interleave = |evidences: &[std::sync::Arc<PublishedCardAuthorization>]| {
+        for _ in 0..500 {
+            for evidence in evidences {
+                black_box(match_published_effective_grant(&ctx, evidence, "invoice:1").is_some());
+            }
+        }
+        let start = Instant::now();
+        for _ in 0..100 {
+            for evidence in evidences {
+                black_box(match_published_effective_grant(&ctx, evidence, "invoice:1").is_some());
+            }
+        }
+        start.elapsed().as_nanos() / 100
+    };
+
+    let two_card_ns = interleave(&[
+        std::sync::Arc::clone(&evidence_a),
+        std::sync::Arc::clone(&evidence_b),
+    ]);
+    eprintln!(
+        "[thrash] 2-card interleave (index path, rebuild every decision): {two_card_ns} ns/decision | linear-extrapolated baseline {linear_baseline} ns",
+    );
+    let four = vec![
+        std::sync::Arc::clone(&evidence_a),
+        std::sync::Arc::clone(&evidence_b),
+        std::sync::Arc::new(evidence_from(
+            (0..size)
+                .map(|index| probe_grant(index, format!("monitor:{index}")))
+                .collect(),
+            size,
+        )),
+        std::sync::Arc::new(evidence_from(
+            (0..size)
+                .map(|index| probe_grant(index, format!("report:{index}")))
+                .collect(),
+            size,
+        )),
+    ];
+    let four_card_ns = interleave(&four);
+    eprintln!("[thrash] 4-card interleave: {four_card_ns} ns/decision",);
 }

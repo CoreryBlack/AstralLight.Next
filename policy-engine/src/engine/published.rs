@@ -567,24 +567,8 @@ pub(crate) fn finish_published_evaluation(
 /// 缓存与 `validate_shared` 同构：线程本地单槽持有 (Arc, 索引)——强引用
 /// 保证地址在缓存期间不复用（无 ABA）；`Arc::ptr_eq` 命中即同一证据同一
 /// 内容，索引有效。索引只存下标，不克隆 grant。
-struct MatcherIndex {
-    /// 解析后的类型段 → 该类型全部 grant 的下标（含对象级与类型级）。
-    by_type: std::collections::HashMap<String, Vec<usize>>,
-    /// `*` 全局通配段下标（可命中任何请求类型）。
-    wildcard: Vec<usize>,
-}
-
-thread_local! {
-    static MATCHER_INDEX_CACHE: std::cell::RefCell<
-        Option<(
-            std::sync::Arc<PublishedCardAuthorization>,
-            MatcherIndex,
-        )>,
-    > = const { std::cell::RefCell::new(None) };
-}
-
 /// 线性扫描/索引的接力阈值：实测曲线（matcher_curve 探针，混合类型）——
-/// N=1000 线性尾位 5.8µs，索引构建 ~100µs 需在同一证据上摊销；N 超过
+/// N=1000 线性尾位 ~2.5µs，索引构建 ~100µs 需在同一证据上摊销；N 超过
 /// 该值且证据被复用（L1 命中的常态）时索引回本。
 pub(crate) const MATCHER_INDEX_THRESHOLD: usize = 1000;
 
@@ -606,23 +590,121 @@ fn build_matcher_index(evidence: &PublishedCardAuthorization) -> MatcherIndex {
     MatcherIndex { by_type, wildcard }
 }
 
+struct MatcherIndex {
+    /// 解析后的类型段 → 该类型全部 grant 的下标（含对象级与类型级）。
+    by_type: std::collections::HashMap<String, Vec<usize>>,
+    /// `*` 全局通配段下标（可命中任何请求类型）。
+    wildcard: Vec<usize>,
+}
+
+impl MatcherIndex {
+    /// 显式缩短借用生命周期：调用方拿到索引借用后立即使用，槽位借用
+    /// 随作用域结束（匹配器在返回前只读下标，不持有槽引用）。
+    fn borrow_index(&self) -> &Self {
+        self
+    }
+}
+
+thread_local! {
+    /// 每线程匹配器索引缓存：4 槽 LRU（持强 Arc，无 ABA）+ 自适应禁用。
+    /// 4 槽覆盖 ≤4 张热卡交错；更多热卡时命中率崩塌，由
+    /// `MatcherCacheState::disabled_until_ops` 冷却回线性扫描——线性在
+    /// 4050 条时 21µs，远优于每判定 ~400µs 的索引重建（实测 46.8/96µs
+    /// @2/4 卡交错）。冷却结束自动重试（流量模式可能已变化）。
+    static MATCHER_INDEX_CACHE: std::cell::RefCell<MatcherCacheState> =
+        const { std::cell::RefCell::new(MatcherCacheState::new()) };
+}
+
+const MATCHER_CACHE_SLOTS: usize = 4;
+/// 冷却窗口（判定次数）：禁用期间全走线性扫描。
+const MATCHER_CACHE_COOLDOWN_OPS: u64 = 1024;
+/// 冷却判定：窗口内命中率低于该比例（重建远多于复用）→ 禁用。
+const MATCHER_CACHE_MIN_HIT_RATIO_PCT: u64 = 25;
+
+struct MatcherCacheState {
+    slots:
+        [Option<(std::sync::Arc<PublishedCardAuthorization>, MatcherIndex)>; MATCHER_CACHE_SLOTS],
+    next_victim: usize,
+    ops: u64,
+    hits: u64,
+    rebuilds: u64,
+    disabled_until_ops: u64,
+}
+
+impl MatcherCacheState {
+    const fn new() -> Self {
+        Self {
+            slots: [None, None, None, None],
+            next_victim: 0,
+            ops: 0,
+            hits: 0,
+            rebuilds: 0,
+            disabled_until_ops: 0,
+        }
+    }
+
+    fn index_disabled(&mut self) -> bool {
+        self.ops += 1;
+        if self.ops < self.disabled_until_ops {
+            return true;
+        }
+        // 每 1024 次判定评估一次命中率；重建远多于复用 → 冷却禁用。
+        if self.ops.is_multiple_of(MATCHER_CACHE_COOLDOWN_OPS) {
+            let decisions = self.hits + self.rebuilds;
+            let hit_pct = (self.hits * 100).checked_div(decisions);
+            let degraded = hit_pct.is_some_and(|hit_pct| hit_pct < MATCHER_CACHE_MIN_HIT_RATIO_PCT);
+            self.hits = 0;
+            self.rebuilds = 0;
+            if degraded {
+                self.disabled_until_ops = self.ops + MATCHER_CACHE_COOLDOWN_OPS;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn lookup_or_build(
+        &mut self,
+        evidence: &std::sync::Arc<PublishedCardAuthorization>,
+    ) -> &MatcherIndex {
+        // 命中：任一槽 ptr_eq。
+        let mut hit_slot = None;
+        for (position, slot) in self.slots.iter_mut().enumerate() {
+            if slot
+                .as_ref()
+                .is_some_and(|(cached, _)| std::sync::Arc::ptr_eq(cached, evidence))
+            {
+                self.hits += 1;
+                hit_slot = Some(position);
+                break;
+            }
+        }
+        if let Some(position) = hit_slot {
+            return self.slots[position].as_ref().unwrap().1.borrow_index();
+        }
+        // 未命中：构建并放入轮换逐出槽（持强 Arc，地址在槽期间不复用）。
+        self.rebuilds += 1;
+        let index = build_matcher_index(evidence);
+        let victim = self.next_victim;
+        self.slots[victim] = Some((std::sync::Arc::clone(evidence), index));
+        self.next_victim = (victim + 1) % MATCHER_CACHE_SLOTS;
+        self.slots[victim].as_ref().unwrap().1.borrow_index()
+    }
+}
+
 /// 候选下标集合：请求类型的桶 + 全局通配桶。桶外 grant 的类型段不可能
 /// 与请求匹配（grant_type ∈ {request_type, "*"} 是资源匹配的必要条件），
-/// 跳过它们不改变匹配结果。槽位未持有该证据时先构建并缓存（持有强
-/// Arc，地址在缓存期间不复用）。
+/// 跳过它们不改变匹配结果。返回 `None` = 自适应禁用生效，调用方回退
+/// 线性扫描。
 fn matcher_candidates(
-    slot: &mut Option<(std::sync::Arc<PublishedCardAuthorization>, MatcherIndex)>,
+    state: &mut MatcherCacheState,
     evidence: &std::sync::Arc<PublishedCardAuthorization>,
     request_type: &str,
-) -> Vec<usize> {
-    let fresh = !slot
-        .as_ref()
-        .is_some_and(|(cached, _)| std::sync::Arc::ptr_eq(cached, evidence));
-    if fresh {
-        let index = build_matcher_index(evidence);
-        *slot = Some((std::sync::Arc::clone(evidence), index));
+) -> Option<Vec<usize>> {
+    if state.index_disabled() {
+        return None;
     }
-    let (_, index) = slot.as_ref().unwrap();
+    let index = state.lookup_or_build(evidence);
     let mut candidates = Vec::with_capacity(index.wildcard.len() + 64);
     if let Some(bucket) = index.by_type.get(request_type) {
         candidates.extend_from_slice(bucket);
@@ -631,7 +713,7 @@ fn matcher_candidates(
     // 匹配语义是"证据顺序首中即胜"：桶拼接会打乱类型桶与通配桶之间的
     // 原始顺序，按下标排序恢复后首中结果与线性扫描逐位一致。
     candidates.sort_unstable();
-    candidates
+    Some(candidates)
 }
 
 /// 资源段之外的完整匹配谓词（身份/租户/domain/有效期/状态效果/资源/动作）。
@@ -727,9 +809,21 @@ pub(crate) fn match_published_effective_grant<'a>(
             )
         });
     }
-    MATCHER_INDEX_CACHE.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let candidates = matcher_candidates(&mut slot, evidence, request_type);
+    MATCHER_INDEX_CACHE.with(|cache| -> Option<&'a CanonicalGrant> {
+        let mut state = cache.borrow_mut();
+        let Some(candidates) = matcher_candidates(&mut state, evidence, request_type) else {
+            // 自适应禁用（多卡交错抖动）→ 线性扫描接力。
+            return evidence.effective_grants.iter().find(|grant| {
+                grant_matches_request(
+                    ctx,
+                    request_type,
+                    request_id,
+                    type_level_request,
+                    now,
+                    grant,
+                )
+            });
+        };
         for index in candidates {
             let grant = &evidence.effective_grants[index];
             if grant_matches_request(

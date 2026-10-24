@@ -184,7 +184,7 @@ impl RuleRepository for EvaluationProbe<'_> {
     async fn load_published_card_authorization(
         &self,
         request: &PublishedCardEvidenceScope,
-    ) -> Result<Option<PublishedCardAuthorization>, PolicyError> {
+    ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
         let phase = self.phase.fetch_add(1, Ordering::Relaxed);
         assert!(phase < 2, "unexpected third evidence read");
         self.evidence_reads.fetch_add(1, Ordering::Relaxed);

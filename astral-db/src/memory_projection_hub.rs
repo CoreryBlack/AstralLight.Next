@@ -796,7 +796,7 @@ pub struct MemoryProjectionHub {
 /// 交回权威 DB reader（未预热/pending 命中/装配异常）。
 #[derive(Debug)]
 pub enum MemoryEvidenceOutcome {
-    Serve(PublishedCardAuthorization),
+    Serve(Arc<PublishedCardAuthorization>),
     DeferToDurable,
 }
 
@@ -1470,7 +1470,7 @@ impl MemoryProjectionHub {
         &self,
         pool: &MySqlPool,
         scope: &PublishedCardEvidenceScope,
-    ) -> Result<PublishedCardAuthorization, astral_types::PolicyError> {
+    ) -> Result<Arc<PublishedCardAuthorization>, astral_types::PolicyError> {
         let repository_error = |reason: String| astral_types::PolicyError::Repository(reason);
         scope
             .validate()
@@ -1521,7 +1521,7 @@ impl MemoryProjectionHub {
                 ));
             }
         }
-        Ok(evidence)
+        Ok(Arc::new(evidence))
     }
 
     fn install_strict_refill(
@@ -1829,15 +1829,16 @@ impl MemoryProjectionHub {
         let stamp = AssemblyStamp::new(token, now_unix_seconds, &states);
         let cached = self.assemblies.get(scope, &stamp, Instant::now());
         let cache_hit = cached.is_some();
-        let evidence = match cached {
-            Some(evidence) => (*evidence).clone(),
+        // 装配缓存命中即零拷贝：整份 typed 证据以 Arc 传递，不再每读深拷贝。
+        let evidence: Arc<PublishedCardAuthorization> = match cached {
+            Some(evidence) => evidence,
             None => match assemble_published_card_evidence(scope, now_unix_seconds, &states) {
-                Ok(evidence) => evidence,
+                Ok(evidence) => Arc::new(evidence),
                 Err(_) => return MemoryEvidenceOutcome::DeferToDurable,
             },
         };
         let refill = if !cache_hit && AssemblyCache::can_store(&stamp, &evidence) {
-            Some(Arc::new(evidence.clone()))
+            Some(Arc::clone(&evidence))
         } else {
             None
         };
@@ -2045,7 +2046,7 @@ where
     async fn load_published_card_authorization(
         &self,
         scope: &astral_types::PublishedCardEvidenceScope,
-    ) -> Result<Option<PublishedCardAuthorization>, astral_types::PolicyError> {
+    ) -> Result<Option<Arc<PublishedCardAuthorization>>, astral_types::PolicyError> {
         if let Some(hub) = memory_projection_hub() {
             if let MemoryEvidenceOutcome::Serve(evidence) = hub.try_memory_evidence(scope) {
                 return Ok(Some(evidence));
@@ -2346,7 +2347,7 @@ mod tests {
             .unwrap();
     }
 
-    fn serve(outcome: MemoryEvidenceOutcome) -> PublishedCardAuthorization {
+    fn serve(outcome: MemoryEvidenceOutcome) -> std::sync::Arc<PublishedCardAuthorization> {
         match outcome {
             MemoryEvidenceOutcome::Serve(evidence) => evidence,
             MemoryEvidenceOutcome::DeferToDurable => panic!("expected memory evidence"),

@@ -1664,9 +1664,9 @@ async fn shadow_scope_passthrough_keeps_tenant_card_user_domain() {
         async fn load_published_card_authorization(
             &self,
             scope: &PublishedCardEvidenceScope,
-        ) -> Result<Option<PublishedCardAuthorization>, PolicyError> {
+        ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
             self.captured.lock().unwrap().push(scope.clone());
-            Ok(Some(ready_shadow_evidence(scope)))
+            Ok(Some(std::sync::Arc::new(ready_shadow_evidence(scope))))
         }
     }
 
@@ -1705,7 +1705,9 @@ fn shadow_classifier_only_accepts_ready_gated_some() {
         user_filter: None,
         domain: astral_types::DomainScopeRequirement::Unconstrained,
     });
-    assert!(published_card_shadow_evidence_is_usable(&Ok(Some(usable))));
+    assert!(published_card_shadow_evidence_is_usable(&Ok(Some(
+        std::sync::Arc::new(usable)
+    ))));
 
     let mut corrupt = ready_shadow_evidence(&PublishedCardEvidenceScope {
         tenant_id: 1,
@@ -1715,7 +1717,7 @@ fn shadow_classifier_only_accepts_ready_gated_some() {
     });
     corrupt.gate.status = astral_types::PublishedEvidenceGateStatus::Corrupt;
     assert!(!published_card_shadow_evidence_is_usable(&Ok(Some(
-        corrupt
+        std::sync::Arc::new(corrupt)
     ))));
 }
 
@@ -1884,8 +1886,9 @@ fn strict_ready_evidence(grants: Vec<CanonicalGrant>) -> PublishedCardAuthorizat
 /// 的仓库读取是 `load_published_card_authorization`，任何其余读取计数
 /// 非零都意味着 evaluate() 泄漏到了 legacy consistency/realtime 路径。
 struct StrictPublishedRepo {
-    outcomes: Mutex<VecDeque<Result<Option<PublishedCardAuthorization>, PolicyError>>>,
-    fallback: Option<PublishedCardAuthorization>,
+    outcomes:
+        Mutex<VecDeque<Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError>>>,
+    fallback: Option<std::sync::Arc<PublishedCardAuthorization>>,
     global_admin_outcomes: Mutex<VecDeque<Result<bool, PolicyError>>>,
     global_admin_fallback: bool,
     global_admin_reads: AtomicUsize,
@@ -1898,7 +1901,7 @@ impl StrictPublishedRepo {
     fn with_evidence(evidence: PublishedCardAuthorization) -> Self {
         Self {
             outcomes: Mutex::new(VecDeque::new()),
-            fallback: Some(evidence),
+            fallback: Some(std::sync::Arc::new(evidence)),
             global_admin_outcomes: Mutex::new(VecDeque::new()),
             global_admin_fallback: false,
             global_admin_reads: AtomicUsize::new(0),
@@ -1914,7 +1917,7 @@ impl StrictPublishedRepo {
     ) -> Self {
         Self {
             outcomes: Mutex::new(VecDeque::new()),
-            fallback: Some(evidence),
+            fallback: Some(std::sync::Arc::new(evidence)),
             global_admin_outcomes: Mutex::new(global_admin_outcomes.into()),
             global_admin_fallback: false,
             global_admin_reads: AtomicUsize::new(0),
@@ -1927,6 +1930,11 @@ impl StrictPublishedRepo {
     fn with_outcomes(
         outcomes: Vec<Result<Option<PublishedCardAuthorization>, PolicyError>>,
     ) -> Self {
+        let outcomes: Vec<Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError>> =
+            outcomes
+                .into_iter()
+                .map(|outcome| outcome.map(|option| option.map(std::sync::Arc::new)))
+                .collect();
         Self {
             outcomes: Mutex::new(outcomes.into()),
             fallback: None,
@@ -1965,14 +1973,14 @@ impl RuleRepository for StrictPublishedRepo {
     async fn load_published_card_authorization(
         &self,
         scope: &PublishedCardEvidenceScope,
-    ) -> Result<Option<PublishedCardAuthorization>, PolicyError> {
+    ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
         self.published_scopes.lock().unwrap().push(scope.clone());
         self.published_reads.fetch_add(1, Ordering::SeqCst);
         if let Some(outcome) = self.outcomes.lock().unwrap().pop_front() {
             return outcome;
         }
         match &self.fallback {
-            Some(evidence) => Ok(Some(evidence.clone())),
+            Some(evidence) => Ok(Some(std::sync::Arc::clone(evidence))),
             None => panic!("unexpected extra published evidence read"),
         }
     }
@@ -3390,10 +3398,10 @@ impl RuleRepository for OrgGateSwitchRepo {
     async fn load_published_card_authorization(
         &self,
         _scope: &PublishedCardEvidenceScope,
-    ) -> Result<Option<PublishedCardAuthorization>, PolicyError> {
+    ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
         self.published_reads.fetch_add(1, Ordering::SeqCst);
         if self.published_would_allow {
-            Ok(Some(org_gate_strict_allow_evidence()))
+            Ok(Some(std::sync::Arc::new(org_gate_strict_allow_evidence())))
         } else {
             Ok(None)
         }

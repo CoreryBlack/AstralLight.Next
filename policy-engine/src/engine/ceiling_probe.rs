@@ -27,7 +27,7 @@ use astral_types::{PolicyContext, PolicyError, PublishedCardEvidenceScope};
 
 /// 内存权威仓库：整份证据常驻，读取 = 克隆（物化）+ 原子计数。
 struct MemoryAuthorityRepo {
-    evidence: PublishedCardAuthorization,
+    evidence: std::sync::Arc<PublishedCardAuthorization>,
     reads: AtomicUsize,
 }
 
@@ -39,9 +39,10 @@ impl RuleRepository for MemoryAuthorityRepo {
     async fn load_published_card_authorization(
         &self,
         _scope: &PublishedCardEvidenceScope,
-    ) -> Result<Option<PublishedCardAuthorization>, PolicyError> {
+    ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
         self.reads.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(self.evidence.clone()))
+        // 生产读面语义：命中 = 引用计数克隆，零深拷贝。
+        Ok(Some(std::sync::Arc::clone(&self.evidence)))
     }
     async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
         Ok(false)
@@ -321,7 +322,7 @@ fn authorization_ceiling_probe() {
             grants.push(noise_grant(index));
         }
         let repo = MemoryAuthorityRepo {
-            evidence: evidence(grants),
+            evidence: std::sync::Arc::new(evidence(grants)),
             reads: AtomicUsize::new(0),
         };
         let engine = PolicyEngine::new();

@@ -4160,6 +4160,92 @@ mod tests {
         assert!(PublishedCardAuthorization::validate_shared(&good).is_ok());
     }
 
+    // ===== 定向安全用例（针对 D1 Arc 共享 / validate_shared 缓存 / 字节表扫描）=====
+
+    #[test]
+    fn validate_shared_cache_survives_bad_evidence_without_cross_contamination() {
+        // 场景：先验证坏证据（fail-closed），再验证好证据；随后再回看坏证据
+        // ——确认坏结论没有被缓存成通过，也没有污染好证据的槽位。
+        let good = std::sync::Arc::new(PublishedCardAuthorization {
+            tenant_id: 7,
+            card_id: 17,
+            read_unix_seconds: 1,
+            gate: shared_gate(PublishedEvidenceGateStatus::Ready),
+            manifests: Vec::new(),
+            records: Vec::new(),
+            effective_grants: Vec::new(),
+        });
+        let bad = std::sync::Arc::new(PublishedCardAuthorization {
+            tenant_id: 7,
+            card_id: 17,
+            read_unix_seconds: 1,
+            gate: shared_gate(PublishedEvidenceGateStatus::Corrupt),
+            manifests: Vec::new(),
+            records: Vec::new(),
+            effective_grants: Vec::new(),
+        });
+        assert!(PublishedCardAuthorization::validate_shared(&bad).is_err());
+        assert!(PublishedCardAuthorization::validate_shared(&good).is_ok());
+        // 反复交替：坏证据永远错，好证据永远过（缓存寿命/交叉污染双向验证）。
+        for _ in 0..5 {
+            assert!(PublishedCardAuthorization::validate_shared(&bad).is_err());
+            assert!(PublishedCardAuthorization::validate_shared(&good).is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_catches_tampered_shared_evidence_content() {
+        // 场景：共享 Arc 之后证据内容被篡改（字段 pub，防御纵深必须能抓）。
+        // validate 直接重扫（非缓存路径）必须拒绝篡改形态。
+        let mut authorization = PublishedCardAuthorization {
+            tenant_id: 7,
+            card_id: 17,
+            read_unix_seconds: 1,
+            gate: shared_gate(PublishedEvidenceGateStatus::Ready),
+            manifests: Vec::new(),
+            records: Vec::new(),
+            effective_grants: Vec::new(),
+        };
+        assert!(authorization.validate().is_ok());
+        // 篡改 1：gate 计数与实际集合脱节。
+        authorization.gate.effective_grant_count = 7;
+        assert!(authorization.validate().is_err());
+        // 恢复后再篡改 2：records 与 effective 脱钩。
+        authorization.gate.effective_grant_count = 0;
+        authorization.effective_grants = vec![grant()];
+        assert!(authorization.validate().is_err());
+    }
+
+    #[test]
+    fn ensure_identifier_scan_bypass_matrix_is_fail_closed() {
+        // 场景：字节表快路径/Unicode 慢路径的绕过矩阵——每一条都必须拒绝。
+        let bypasses = [
+            "learn\tsubject",       // ASCII 制表
+            "learn\u{0000}subject", // ASCII NUL
+            "learn\u{00a0}subject", // NBSP
+            "learn\u{2028}subject", // 行分隔符
+            "learn\u{3000}subject", // 表意空格
+            "\u{00a0}",             // 纯 NBSP（trim 后为空）
+            "\u{000b}",             // 垂直制表（控制）
+            "a\u{200b}b",           // 零宽空格不是空白——放行是原语义，
+                                    // 但这里确认与 normalize 一致：不拒绝
+        ];
+        // 除最后一条（零宽空格原本就放行）外全部必须 Err。
+        for value in &bypasses[..bypasses.len() - 1] {
+            assert!(
+                ensure_identifier(value, "field").is_err(),
+                "scan bypass accepted: {value:?}"
+            );
+        }
+        assert!(ensure_identifier(bypasses[bypasses.len() - 1], "field").is_ok());
+        // 长度上限仍生效（512 字节、多字节计数按字节）。
+        let long_ascii = "a".repeat(513);
+        assert!(ensure_identifier(&long_ascii, "field").is_err());
+        let long_unicode = "授".repeat(171);
+        assert!(ensure_identifier(&long_unicode, "field").is_err());
+        assert!(ensure_identifier(&"授".repeat(170), "field").is_ok());
+    }
+
     #[test]
     fn non_ready_gates_never_validate_as_evidence() {
         let authorization = PublishedCardAuthorization {

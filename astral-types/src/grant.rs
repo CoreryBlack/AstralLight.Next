@@ -142,32 +142,30 @@ static IDENTIFIER_REJECT: [bool; 256] = {
 /// 零分配的校验版 [`normalize_identifier`]：同一套合法性检查，但不产出
 /// 归一化副本——热路径（每次判定的证据合同校验）只关心合法性。
 pub(crate) fn ensure_identifier(value: &str, field: &'static str) -> GrantContractResult<()> {
-    let bytes = value.as_bytes();
-    let mut start = 0usize;
-    let mut end = bytes.len();
-    // 与 str::trim 相同的空白边界（按字节查表，ASCII 空白必然单字节）。
-    while start < end
-        && IDENTIFIER_REJECT[bytes[start] as usize]
-        && (bytes[start] as char).is_whitespace()
-    {
-        start += 1;
-    }
-    while end > start
-        && IDENTIFIER_REJECT[bytes[end - 1] as usize]
-        && (bytes[end - 1] as char).is_whitespace()
-    {
-        end -= 1;
-    }
-    if start == end {
+    // str::trim 是 Unicode 感知的且零分配：与 normalize_identifier 的边界
+    // 语义逐字符一致（含非 ASCII 空白，如 NBSP/U+2028）。
+    let normalized = value.trim();
+    if normalized.is_empty() {
         return Err(GrantContractError::EmptyIdentifier { field });
     }
-    if end - start > 512 {
+    if normalized.len() > 512 {
         return Err(GrantContractError::IdentifierTooLong { field });
     }
-    for &byte in &bytes[start..end] {
-        if byte < 0x80 && IDENTIFIER_REJECT[byte as usize] {
+    let bytes = normalized.as_bytes();
+    if bytes.is_ascii() {
+        // 快路径（绝大多数标识符）：ASCII 字节表一次扫描，覆盖
+        // is_whitespace || is_control 的完整 ASCII 集合。
+        if bytes.iter().any(|&byte| IDENTIFIER_REJECT[byte as usize]) {
             return Err(GrantContractError::MalformedIdentifier { field });
         }
+    } else if normalized
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        // 慢路径：任何非 ASCII 字节都回退到原 Unicode 逐字符检查，保证
+        // 非 ASCII 空白/控制符（NBSP、U+2028、U+3000 等）的拒绝语义与
+        // normalize_identifier 完全一致。
+        return Err(GrantContractError::MalformedIdentifier { field });
     }
     Ok(())
 }
@@ -2275,34 +2273,32 @@ pub struct PublishedCardAuthorization {
 }
 
 thread_local! {
-    /// 判定路径的校验结论缓存：键 = &Arc<PublishedCardAuthorization> 指针。
-    /// 证据经 Arc 传递后进程内不可变，同一指针的合同结论可复用；跨判定
-    /// 的两次 validate（初读+复检）对同一份 Arc 只全扫一次。线程本地
-    /// 避免共享锁；条目极少（每线程在评估中的证据指针数），无需淘汰。
-    static VALIDATED_EVIDENCE: std::cell::RefCell<std::collections::HashSet<usize>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
+    /// 判定路径的校验结论缓存（每线程单槽）：持有上一次通过全量校验的
+    /// `Arc<PublishedCardAuthorization>`。强引用保证该分配在缓存期间不会
+    /// 被释放复用（无 ABA）；`Arc::ptr_eq` 成立即同一分配、同一内容，而
+    /// 入槽前提是该内容已通过全量 `validate`——结论因此可靠。槽位替换
+    /// 时旧 Arc 释放；每线程一个 Arc，内存有界。
+    static VALIDATED_EVIDENCE: std::cell::RefCell<
+        Option<std::sync::Arc<PublishedCardAuthorization>>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 impl PublishedCardAuthorization {
-    /// 供 `Arc<PublishedCardAuthorization>` 的判定路径使用：同一 Arc 指针
-    /// 在本线程已全量通过 [`Self::validate`] 时直接复用结论，否则执行
-    /// 全量校验并记录。语义与 [`Self::validate`] 完全一致（fail-closed）；
-    /// 指针回收后键不复用（usize 键只在持有 Arc 期间有效，调用方持有
-    /// Arc 保证生命周期）。
     pub fn validate_shared(this: &std::sync::Arc<Self>) -> GrantContractResult<()> {
-        let key = std::sync::Arc::as_ptr(this) as usize;
-        if VALIDATED_EVIDENCE.with(|cache| cache.borrow_mut().insert(key)) {
-            // 首见：全量校验；失败时撤销缓存键，fail-closed。
-            if let Err(error) = this.validate() {
-                VALIDATED_EVIDENCE.with(|cache| {
-                    cache.borrow_mut().remove(&key);
-                });
-                return Err(error);
-            }
-            Ok(())
-        } else {
-            Ok(())
+        let cached = VALIDATED_EVIDENCE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|cached| std::sync::Arc::ptr_eq(cached, this))
+        });
+        if cached {
+            return Ok(());
         }
+        // fail-closed：校验失败的证据永不入槽，下次调用重新全量校验。
+        this.validate()?;
+        VALIDATED_EVIDENCE.with(|slot| {
+            *slot.borrow_mut() = Some(std::sync::Arc::clone(this));
+        });
+        Ok(())
     }
 
     pub fn validate(&self) -> GrantContractResult<()> {
@@ -4098,6 +4094,70 @@ mod tests {
             .map(|record| record.grant.clone())
             .collect();
         reordered.validate().unwrap();
+    }
+
+    #[test]
+    fn ensure_identifier_rejects_non_ascii_whitespace_like_the_producer() {
+        // 回归：字节表快路径不得放松 Unicode 空白/控制符语义。
+        // 内部 NBSP / U+2028 / U+3000 → Malformed（与 normalize 一致）。
+        for value in [
+            "learn\u{00a0}subject",
+            "learn\u{2028}subject",
+            "learn\u{3000}subject",
+        ] {
+            assert!(ensure_identifier(value, "field").is_err(), "{value:?}");
+        }
+        // 仅由非 ASCII 空白组成 → trim 后为空 → EmptyIdentifier。
+        assert!(ensure_identifier("\u{00a0}", "field").is_err());
+        assert!(ensure_identifier("\u{3000}\u{2028}", "field").is_err());
+        // 合法 ASCII / 合法非 ASCII（无空白控制）→ Ok。
+        assert!(ensure_identifier("learn_subject", "field").is_ok());
+        assert!(ensure_identifier("授权资源-1", "field").is_ok());
+        // ASCII 控制符仍在快路径拒绝。
+        assert!(ensure_identifier("a\tb", "field").is_err());
+        assert!(ensure_identifier("a\n b", "field").is_err());
+    }
+
+    fn shared_gate(status: PublishedEvidenceGateStatus) -> PublishedCardAuthorizationGate {
+        PublishedCardAuthorizationGate {
+            status,
+            aggregate_manifest_count: 0,
+            verified_record_count: 0,
+            effective_grant_count: 0,
+            not_in_effective_count: 0,
+            equivalent_duplicate_collapsed_count: 0,
+        }
+    }
+
+    #[test]
+    fn validate_shared_fails_closed_and_never_caches_failures() {
+        let good = std::sync::Arc::new(PublishedCardAuthorization {
+            tenant_id: 7,
+            card_id: 17,
+            read_unix_seconds: 1,
+            gate: shared_gate(PublishedEvidenceGateStatus::Ready),
+            manifests: Vec::new(),
+            records: Vec::new(),
+            effective_grants: Vec::new(),
+        });
+        assert!(PublishedCardAuthorization::validate_shared(&good).is_ok());
+        // 同一 Arc：指针相等快路径，仍 Ok。
+        assert!(PublishedCardAuthorization::validate_shared(&good).is_ok());
+
+        // 畸形证据：现在错、再次调用仍错（绝不把失败缓存成通过）。
+        let bad = std::sync::Arc::new(PublishedCardAuthorization {
+            tenant_id: 7,
+            card_id: 17,
+            read_unix_seconds: 1,
+            gate: shared_gate(PublishedEvidenceGateStatus::Corrupt),
+            manifests: Vec::new(),
+            records: Vec::new(),
+            effective_grants: Vec::new(),
+        });
+        assert!(PublishedCardAuthorization::validate_shared(&bad).is_err());
+        assert!(PublishedCardAuthorization::validate_shared(&bad).is_err());
+        // 失败尝试不污染好证据的槽位。
+        assert!(PublishedCardAuthorization::validate_shared(&good).is_ok());
     }
 
     #[test]

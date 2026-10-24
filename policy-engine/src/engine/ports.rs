@@ -172,7 +172,7 @@ pub trait RuleRepository: Send + Sync {
     async fn load_published_card_authorization(
         &self,
         _scope: &PublishedCardEvidenceScope,
-    ) -> Result<Option<PublishedCardAuthorization>, PolicyError> {
+    ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
         // Legacy/test 默认实现：显式 unavailable。绝不返回伪 Ready 证据，
         // 也绝不产生任何可用于放行的结果。
         Ok(None)
@@ -196,7 +196,7 @@ pub trait RuleRepository: Send + Sync {
 ///
 /// strict gate 与 shadow/read 路径共用同一判据：只有 Ready 证据可参与授权。
 pub fn published_card_shadow_evidence_is_usable(
-    outcome: &Result<Option<PublishedCardAuthorization>, PolicyError>,
+    outcome: &Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError>,
 ) -> bool {
     match outcome {
         Ok(Some(evidence)) => evidence.gate.status.is_authorization_usable(),

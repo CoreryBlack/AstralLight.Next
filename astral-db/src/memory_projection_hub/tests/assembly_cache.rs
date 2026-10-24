@@ -4,7 +4,7 @@ fn at(
     hub: &MemoryProjectionHub,
     scope: &PublishedCardEvidenceScope,
     now: i64,
-) -> PublishedCardAuthorization {
+) -> std::sync::Arc<PublishedCardAuthorization> {
     serve(hub.try_memory_evidence_with_clock(scope, || now, || {}))
 }
 
@@ -26,8 +26,8 @@ fn installed() -> (MemoryProjectionHub, AuthorizationPublishedState) {
 fn assembly_cache_same_second_matches_cold_evidence_and_cross_second_expires_grant() {
     let (hub, state) = installed();
     let cold = assemble_published_card_evidence(&scope(), 100, &[state]).unwrap();
-    assert_eq!(at(&hub, &scope(), 100), cold);
-    assert_eq!(at(&hub.clone(), &scope(), 100), cold);
+    assert_eq!(*at(&hub, &scope(), 100), cold);
+    assert_eq!(*at(&hub.clone(), &scope(), 100), cold);
     assert_eq!(hub.assemblies.hits(), 1);
     let expired = at(&hub, &scope(), 101);
     assert!(expired.effective_grants.is_empty());

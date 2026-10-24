@@ -8,7 +8,7 @@ fn read_at(
     hub: &MemoryProjectionHub,
     scope: &PublishedCardEvidenceScope,
     second: i64,
-) -> PublishedCardAuthorization {
+) -> std::sync::Arc<PublishedCardAuthorization> {
     serve(hub.try_memory_evidence_with_clock(scope, || second, || {}))
 }
 

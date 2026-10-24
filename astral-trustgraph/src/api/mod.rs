@@ -102,7 +102,7 @@ fn published_evidence_error_code(error: &AuthorizationEvidenceError) -> &'static
 pub(crate) async fn load_diagnostic_card_evidence(
     db: &MySqlPool,
     card_id: i64,
-) -> Result<PublishedCardAuthorization, PublishedEvidenceUnavailable> {
+) -> Result<std::sync::Arc<PublishedCardAuthorization>, PublishedEvidenceUnavailable> {
     let tenant_id = match sod_load_card_tenant(db, card_id).await {
         Ok(tenant_id) => tenant_id,
         Err(error) => {

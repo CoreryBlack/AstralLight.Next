@@ -210,7 +210,7 @@ impl RuleRepository for PublishedRepo {
     async fn load_published_card_authorization(
         &self,
         scope: &PublishedCardEvidenceScope,
-    ) -> Result<Option<PublishedCardAuthorization>, PolicyError> {
+    ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
         assert!(
             scope.validate().is_ok(),
             "engine supplied an invalid evidence scope"
@@ -232,7 +232,8 @@ impl RuleRepository for PublishedRepo {
                 .state
                 .evidence
                 .get(&(scope.tenant_id, scope.card_id))
-                .cloned()),
+                .cloned()
+                .map(std::sync::Arc::new)),
         }
     }
 

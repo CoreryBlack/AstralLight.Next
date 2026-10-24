@@ -583,12 +583,12 @@ impl RuleRepository for SqlxRuleRepository {
     async fn load_published_card_authorization(
         &self,
         scope: &PublishedCardEvidenceScope,
-    ) -> Result<Option<PublishedCardAuthorization>, astral_types::PolicyError> {
+    ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, astral_types::PolicyError> {
         crate::authorization_projection_repository::load_published_card_grant_evidence(
             &self.pool, scope,
         )
         .await
-        .map(Some)
+        .map(|evidence| Some(std::sync::Arc::new(evidence)))
         .map_err(published_card_evidence_error_to_policy_error)
     }
 }
@@ -1748,7 +1748,7 @@ mod tests {
             "crate::authorization_projection_repository::load_published_card_grant_evidence(",
             "&self.pool",
             "scope",
-            ".map(Some)",
+            ".map(|evidence| Some(std::sync::Arc::new(evidence)))",
             ".map_err(published_card_evidence_error_to_policy_error)",
         ] {
             assert!(

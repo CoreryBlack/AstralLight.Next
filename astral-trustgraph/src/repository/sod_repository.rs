@@ -235,7 +235,7 @@ impl SqlxSodRepository {
     async fn load_card_evidence(
         &self,
         card_id: i64,
-    ) -> Result<PublishedCardAuthorization, AstralError> {
+    ) -> Result<std::sync::Arc<PublishedCardAuthorization>, AstralError> {
         let tenant_id = sod_load_card_tenant(&self.db, card_id)
             .await
             .map_err(db_error)?;

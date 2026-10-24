@@ -259,7 +259,7 @@ pub trait EvidenceReadDeps: Send + Sync {
     async fn strict_read(
         &self,
         scope: &PublishedCardEvidenceScope,
-    ) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError>;
+    ) -> Result<std::sync::Arc<PublishedCardAuthorization>, AuthorizationEvidenceError>;
     async fn current_epoch(&self) -> Option<String>;
     fn now_unix_seconds(&self) -> i64;
 }
@@ -289,8 +289,10 @@ impl EvidenceReadDeps for MySqlEvidenceReadDeps {
     async fn strict_read(
         &self,
         scope: &PublishedCardEvidenceScope,
-    ) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
-        load_published_card_grant_evidence(&self.pool, scope).await
+    ) -> Result<std::sync::Arc<PublishedCardAuthorization>, AuthorizationEvidenceError> {
+        load_published_card_grant_evidence(&self.pool, scope)
+            .await
+            .map(std::sync::Arc::new)
     }
 
     async fn current_epoch(&self) -> Option<String> {
@@ -1398,7 +1400,7 @@ pub async fn load_evidence_through_cache_with_mac<D: EvidenceReadDeps>(
     l2: Option<&dyn L2EvidenceStore>,
     mac_secret: Option<&[u8]>,
     scope: &PublishedCardEvidenceScope,
-) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
+) -> Result<std::sync::Arc<PublishedCardAuthorization>, AuthorizationEvidenceError> {
     let evidence_read_started = std::time::Instant::now();
     scope.validate().map_err(|contract| {
         AuthorizationEvidenceError::InvalidRequest(format!(
@@ -1438,7 +1440,8 @@ pub async fn load_evidence_through_cache_with_mac<D: EvidenceReadDeps>(
                                 deps.now_unix_seconds(),
                             )
                         {
-                            let evidence = (*entry.evidence).clone();
+                            // 命中即引用计数克隆：整份 typed 证据零深拷贝。
+                            let evidence = std::sync::Arc::clone(&entry.evidence);
                             record_evidence_cache_lookup("l1", "hit");
                             record_evidence_read(
                                 "l1_cache",
@@ -1484,7 +1487,11 @@ pub async fn load_evidence_through_cache_with_mac<D: EvidenceReadDeps>(
             )
             .await
             {
-                L2Lookup::Hit(evidence) => {
+                L2Lookup::Hit(boxed_evidence) => {
+                    // 单次物化：L2 命中只做一次 Box→Arc 转换，L1 回填与本次
+                    // 返回共享同一份，不再各深拷贝一次。
+                    let evidence: std::sync::Arc<PublishedCardAuthorization> =
+                        std::sync::Arc::from(boxed_evidence);
                     // 读后复读对牌：发布落在读前对牌与 L2 接受之间 → 不放行
                     // 旧条目。
                     if let Ok(recheck) = deps
@@ -1499,7 +1506,7 @@ pub async fn load_evidence_through_cache_with_mac<D: EvidenceReadDeps>(
                                 .insert(
                                     key,
                                     EvidenceCacheEntry {
-                                        evidence: Arc::new((*evidence).clone()),
+                                        evidence: std::sync::Arc::clone(&evidence),
                                         baseline: evidence_fence_baseline(&evidence),
                                         cache_epoch: cache_epoch.to_owned(),
                                     },
@@ -1513,7 +1520,7 @@ pub async fn load_evidence_through_cache_with_mac<D: EvidenceReadDeps>(
                                 "success",
                                 evidence_read_started.elapsed(),
                             );
-                            return Ok(*evidence);
+                            return Ok(std::sync::Arc::clone(&evidence));
                         }
                     }
                     record_evidence_cache_lookup("l2", "miss");
@@ -1571,7 +1578,7 @@ pub async fn load_evidence_through_cache_with_mac<D: EvidenceReadDeps>(
             .insert(
                 key,
                 EvidenceCacheEntry {
-                    evidence: Arc::new(evidence.clone()),
+                    evidence: Arc::clone(&evidence),
                     baseline: evidence_fence_baseline(&evidence),
                     cache_epoch: epoch.to_owned(),
                 },
@@ -1599,7 +1606,7 @@ pub async fn load_evidence_through_cache<D: EvidenceReadDeps>(
     cache: &EvidenceCacheStore,
     l2: Option<&dyn L2EvidenceStore>,
     scope: &PublishedCardEvidenceScope,
-) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
+) -> Result<std::sync::Arc<PublishedCardAuthorization>, AuthorizationEvidenceError> {
     let mac_secret = l2.and_then(|_| l2_hmac_secret());
     load_evidence_through_cache_with_mac(deps, cache, l2, mac_secret, scope).await
 }
@@ -1716,7 +1723,7 @@ fn l1_evidence_cache_permitted(hub: Option<&MemoryProjectionHub>) -> bool {
 pub async fn cached_load_published_card_grant_evidence(
     pool: &MySqlPool,
     scope: &PublishedCardEvidenceScope,
-) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
+) -> Result<std::sync::Arc<PublishedCardAuthorization>, AuthorizationEvidenceError> {
     scope.validate().map_err(|contract| {
         AuthorizationEvidenceError::InvalidRequest(format!(
             "code=published_card_evidence.invalid_scope;detail={contract}"
@@ -1905,7 +1912,7 @@ where
     async fn load_published_card_authorization(
         &self,
         scope: &PublishedCardEvidenceScope,
-    ) -> Result<Option<PublishedCardAuthorization>, PolicyError> {
+    ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
         let card_scope = card_level_lens_scope(scope);
         match load_evidence_through_cache(&self.deps, &self.cache, self.l2.as_deref(), &card_scope)
             .await
@@ -2239,7 +2246,9 @@ mod tests {
     struct FixtureState {
         epoch_reads: VecDeque<Option<String>>,
         fence_reads: VecDeque<CardScopeFenceSnapshot>,
-        strict_reads: VecDeque<Result<PublishedCardAuthorization, AuthorizationEvidenceError>>,
+        strict_reads: VecDeque<
+            Result<std::sync::Arc<PublishedCardAuthorization>, AuthorizationEvidenceError>,
+        >,
         fence_calls: usize,
         strict_calls: usize,
         now: i64,
@@ -2253,7 +2262,9 @@ mod tests {
         fn new(
             epoch_reads: Vec<Option<String>>,
             fence_reads: Vec<CardScopeFenceSnapshot>,
-            strict_reads: Vec<Result<PublishedCardAuthorization, AuthorizationEvidenceError>>,
+            strict_reads: Vec<
+                Result<std::sync::Arc<PublishedCardAuthorization>, AuthorizationEvidenceError>,
+            >,
             now: i64,
         ) -> Self {
             Self {
@@ -2295,7 +2306,8 @@ mod tests {
         async fn strict_read(
             &self,
             _scope: &PublishedCardEvidenceScope,
-        ) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
+        ) -> Result<std::sync::Arc<PublishedCardAuthorization>, AuthorizationEvidenceError>
+        {
             let mut state = self.state.lock().unwrap();
             state.strict_calls += 1;
             state
@@ -2360,7 +2372,7 @@ mod tests {
     async fn load_with(
         deps: &FixtureDeps,
         cache: &EvidenceCacheStore,
-    ) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
+    ) -> Result<std::sync::Arc<PublishedCardAuthorization>, AuthorizationEvidenceError> {
         let scope = PublishedCardEvidenceScope {
             tenant_id: TENANT,
             card_id: CARD,
@@ -2391,13 +2403,13 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let first = load_with(&deps, &cache).await.expect("first load");
         assert_eq!(deps.strict_calls(), 1);
         assert_eq!(deps.fence_calls(), 0);
-        assert_eq!(first, direct);
+        assert_eq!(*first, direct);
 
         // 命中：epoch 1 次 + 读前对牌 + 读后复读对牌，零严格读。
         let deps = FixtureDeps::new(
@@ -2410,7 +2422,7 @@ mod tests {
         assert_eq!(deps.strict_calls(), 0);
         assert_eq!(deps.fence_calls(), 2);
         // parity：缓存命中结果 ≡ 直读结果（逐字段）。
-        assert_eq!(second, direct);
+        assert_eq!(*second, direct);
     }
 
     /// 发布推进（generation +1）→ 读前对牌失败 → 回源 → 新 evidence。
@@ -2422,7 +2434,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into()), Some(EPOCH.into())],
             vec![],
-            vec![Ok(stale)],
+            vec![Ok(std::sync::Arc::new(stale))],
             1_050,
         );
         load_with(&deps, &cache).await.expect("fill");
@@ -2435,12 +2447,12 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![advanced_fence.clone()],
-            vec![Ok(published.clone())],
+            vec![Ok(std::sync::Arc::new(published.clone()))],
             1_100,
         );
         let next = load_with(&deps, &cache).await.expect("reload");
         assert_eq!(deps.strict_calls(), 1, "drift must go back to strict read");
-        assert_eq!(next, published);
+        assert_eq!(*next, published);
     }
 
     /// REVOKE 场景：撤销 delta 发布（revoke_fence +1）后下一请求对牌失败 →
@@ -2453,7 +2465,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into()), Some(EPOCH.into())],
             vec![],
-            vec![Ok(stale)],
+            vec![Ok(std::sync::Arc::new(stale))],
             1_050,
         );
         load_with(&deps, &cache).await.expect("fill");
@@ -2463,12 +2475,12 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&revoked)],
-            vec![Ok(revoked.clone())],
+            vec![Ok(std::sync::Arc::new(revoked.clone()))],
             1_100,
         );
         let next = load_with(&deps, &cache).await.expect("reload");
         assert_eq!(deps.strict_calls(), 1);
-        assert_eq!(next, revoked);
+        assert_eq!(*next, revoked);
     }
 
     /// 同 generation 病态重写（manifest_id 变化）→ 对牌失败（content-addressed
@@ -2481,7 +2493,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(stale.clone())],
+            vec![Ok(std::sync::Arc::new(stale.clone()))],
             1_050,
         );
         load_with(&deps, &cache).await.expect("fill");
@@ -2492,14 +2504,14 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&rewritten)],
-            vec![Ok(rewritten.clone())],
+            vec![Ok(std::sync::Arc::new(rewritten.clone()))],
             1_100,
         );
         let next = load_with(&deps, &cache)
             .await
             .expect("reload after rewrite");
         assert_eq!(deps.strict_calls(), 1);
-        assert_eq!(next, rewritten);
+        assert_eq!(*next, rewritten);
 
         // 集合形状变化：新增一个聚合的指针行（版本组形状不一致 → 失配）。
         let extra_row = PermissionCacheManifestVersion {
@@ -2514,12 +2526,12 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![shaped],
-            vec![Ok(rewritten.clone())],
+            vec![Ok(std::sync::Arc::new(rewritten.clone()))],
             1_150,
         );
         let next = load_with(&deps, &cache).await.expect("reload after shape");
         assert_eq!(deps.strict_calls(), 1);
-        assert_eq!(next, rewritten);
+        assert_eq!(*next, rewritten);
     }
 
     /// epoch 严格 current 语义：填充后时代轮换 → miss 并以新时代重填；时代
@@ -2533,7 +2545,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         load_with(&deps, &cache).await.expect("fill");
@@ -2542,7 +2554,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some("rotated-epoch".into())],
             vec![],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_060,
         );
         load_with(&deps, &cache)
@@ -2554,7 +2566,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_070,
         );
         load_with(&deps, &cache)
@@ -2563,7 +2575,12 @@ mod tests {
         assert_eq!(deps.strict_calls(), 1, "stale entry epoch must miss");
 
         // 当前时代未知（Redis 降级）→ miss 回源，且不填充。
-        let deps = FixtureDeps::new(vec![None], vec![], vec![Ok(evidence.clone())], 1_080);
+        let deps = FixtureDeps::new(
+            vec![None],
+            vec![],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
+            1_080,
+        );
         load_with(&deps, &cache)
             .await
             .expect("reload while degraded");
@@ -2578,7 +2595,7 @@ mod tests {
         );
         let hit = load_with(&deps, &cache).await.expect("hit");
         assert_eq!(deps.strict_calls(), 0);
-        assert_eq!(hit, evidence);
+        assert_eq!(*hit, evidence);
     }
 
     /// 时钟重验：accepted 记录过期 → miss 回源（危险方向封死）；
@@ -2612,7 +2629,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         load_with(&deps, &cache).await.expect("fill");
@@ -2632,7 +2649,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence), fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_200,
         );
         load_with(&deps, &cache).await.expect("reload after expiry");
@@ -2642,7 +2659,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence), fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             2_050,
         );
         load_with(&deps, &cache).await.expect("reload after flip");
@@ -2677,7 +2694,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_000,
         );
         load_with(&deps, &cache).await.expect("fill");
@@ -2717,12 +2734,12 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_060,
         );
         let next = load_with(&deps, &cache).await.expect("reload succeeds");
         assert_eq!(deps.strict_calls(), 1, "failed read must not be cached");
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
     }
 
     /// 读后复读对牌：发布恰好落在两次栅栏读之间（第一次等于基准、第二次
@@ -2735,7 +2752,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into()), Some(EPOCH.into())],
             vec![],
-            vec![Ok(stale)],
+            vec![Ok(std::sync::Arc::new(stale))],
             1_050,
         );
         load_with(&deps, &cache).await.expect("fill");
@@ -2750,12 +2767,12 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![baseline, drifted],
-            vec![Ok(published.clone())],
+            vec![Ok(std::sync::Arc::new(published.clone()))],
             1_100,
         );
         let next = load_with(&deps, &cache).await.expect("reload");
         assert_eq!(deps.strict_calls(), 1);
-        assert_eq!(next, published);
+        assert_eq!(*next, published);
     }
 
     #[tokio::test]
@@ -2765,7 +2782,7 @@ mod tests {
         let fill = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(stale.clone())],
+            vec![Ok(std::sync::Arc::new(stale.clone()))],
             1_050,
         );
         load_with(&fill, &cache).await.expect("fill");
@@ -2781,14 +2798,14 @@ mod tests {
         let full = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![pending],
-            vec![Ok(narrowed.clone())],
+            vec![Ok(std::sync::Arc::new(narrowed.clone()))],
             1_100,
         );
         let safe_value = load_with(&full, &cache)
             .await
             .expect("full contract reload");
         assert_eq!(full.strict_calls(), 1);
-        assert_eq!(safe_value, narrowed);
+        assert_eq!(*safe_value, narrowed);
         assert!(safe_value.effective_grants.is_empty());
     }
 
@@ -2799,7 +2816,7 @@ mod tests {
         let fill = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(stale.clone())],
+            vec![Ok(std::sync::Arc::new(stale.clone()))],
             1_050,
         );
         load_with(&fill, &cache).await.expect("fill");
@@ -2816,14 +2833,14 @@ mod tests {
         let full = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![pre_observation, post_observation],
-            vec![Ok(published.clone())],
+            vec![Ok(std::sync::Arc::new(published.clone()))],
             1_100,
         );
         let safe_value = load_with(&full, &cache)
             .await
             .expect("full contract reload");
         assert_eq!(full.strict_calls(), 1);
-        assert_eq!(safe_value, published);
+        assert_eq!(*safe_value, published);
     }
 
     #[tokio::test]
@@ -2834,7 +2851,7 @@ mod tests {
         let fill = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(stale.clone())],
+            vec![Ok(std::sync::Arc::new(stale.clone()))],
             1_050,
         );
         load_with(&fill, &generation_cache)
@@ -2863,14 +2880,14 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![advanced_fence],
-            vec![Ok(advanced.clone())],
+            vec![Ok(std::sync::Arc::new(advanced.clone()))],
             1_100,
         );
         let safe_generation = load_with(&deps, &generation_cache)
             .await
             .expect("generation mismatch reload");
         assert_eq!(deps.strict_calls(), 1);
-        assert_eq!(safe_generation, advanced);
+        assert_eq!(*safe_generation, advanced);
         assert!(safe_generation
             .effective_grants
             .iter()
@@ -2880,7 +2897,7 @@ mod tests {
         let fill = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(stale.clone())],
+            vec![Ok(std::sync::Arc::new(stale.clone()))],
             1_050,
         );
         load_with(&fill, &revoke_cache)
@@ -2909,14 +2926,14 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![revoked_fence],
-            vec![Ok(revoked.clone())],
+            vec![Ok(std::sync::Arc::new(revoked.clone()))],
             1_100,
         );
         let safe_revoke = load_with(&deps, &revoke_cache)
             .await
             .expect("revoke fence mismatch reload");
         assert_eq!(deps.strict_calls(), 1);
-        assert_eq!(safe_revoke, revoked);
+        assert_eq!(*safe_revoke, revoked);
         assert!(safe_revoke.effective_grants.is_empty());
     }
 
@@ -3037,7 +3054,7 @@ mod tests {
         async fn load_published_card_authorization(
             &self,
             _scope: &PublishedCardEvidenceScope,
-        ) -> Result<Option<PublishedCardAuthorization>, PolicyError> {
+        ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
             self.published_reads
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(None)
@@ -3059,7 +3076,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into()), Some(EPOCH.into())],
             vec![fence_of(&evidence), fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let repo = CachedPublishedEvidenceRuleRepository::with_deps(inner, deps, &cache, None);
@@ -3086,7 +3103,7 @@ mod tests {
             .await
             .expect("first load")
             .expect("strict evidence is Some");
-        assert_eq!(first, evidence);
+        assert_eq!(*first, evidence);
 
         // 第二次读取（engine ALLOW 复读形态）：命中缓存，inner 不再被触达。
         let second = repo
@@ -3094,7 +3111,7 @@ mod tests {
             .await
             .expect("second load")
             .expect("cached evidence is Some");
-        assert_eq!(second, evidence, "recheck evidence must be identical");
+        assert_eq!(*second, evidence, "recheck evidence must be identical");
     }
 
     // =====================================================================
@@ -3214,7 +3231,7 @@ mod tests {
         deps: &FixtureDeps,
         cache: &EvidenceCacheStore,
         l2: &dyn L2EvidenceStore,
-    ) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
+    ) -> Result<std::sync::Arc<PublishedCardAuthorization>, AuthorizationEvidenceError> {
         load_card_with_l2(deps, cache, l2, TENANT, CARD).await
     }
 
@@ -3225,7 +3242,7 @@ mod tests {
         l2: &dyn L2EvidenceStore,
         tenant_id: i64,
         card_id: i64,
-    ) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
+    ) -> Result<std::sync::Arc<PublishedCardAuthorization>, AuthorizationEvidenceError> {
         let scope = PublishedCardEvidenceScope {
             tenant_id,
             card_id,
@@ -3354,7 +3371,7 @@ mod tests {
         let first = load_with_l2(&deps, &cache, &l2).await.expect("l2 hit");
         assert_eq!(deps.strict_calls(), 0, "L2 hit must skip the strict read");
         assert_eq!(l2.get_calls(), 1);
-        assert_eq!(first, evidence, "serde roundtrip parity with direct read");
+        assert_eq!(*first, evidence, "serde roundtrip parity with direct read");
 
         // 回填 L1 后：第二次 load 走 L1 命中（L2 不再被读取）。
         let deps = FixtureDeps::new(
@@ -3366,7 +3383,7 @@ mod tests {
         let second = load_with_l2(&deps, &cache, &l2).await.expect("l1 hit");
         assert_eq!(deps.strict_calls(), 0);
         assert_eq!(l2.get_calls(), 1, "L1 hit must not consult L2");
-        assert_eq!(second, evidence);
+        assert_eq!(*second, evidence);
     }
 
     /// L2 版本组与读前对牌失配（发布推进）→ 弃用 + 删键 → 回源严格 reader。
@@ -3382,7 +3399,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&published)],
-            vec![Ok(published.clone())],
+            vec![Ok(std::sync::Arc::new(published.clone()))],
             1_100,
         );
         let next = load_with_l2(&deps, &cache, &l2).await.expect("reload");
@@ -3403,7 +3420,7 @@ mod tests {
             fence_of(&published).manifest_versions
         );
         assert!(!refilled.card_source_pending);
-        assert_eq!(next, published);
+        assert_eq!(*next, published);
     }
 
     /// content_hash 重验失败（污染）→ 删键 → 回源；随后回源成功会以正确
@@ -3422,12 +3439,12 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let next = load_with_l2(&deps, &cache, &l2).await.expect("reload");
         assert_eq!(deps.strict_calls(), 1);
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
         // 回源成功 → L2 被正确内容重写（自愈）。
         assert_eq!(l2.set_calls(), 1, "strict refill must backfill L2");
         let refilled = l2
@@ -3463,7 +3480,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some("new-epoch".into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let next = load_with_l2(&deps, &cache, &l2).await.expect("reload");
@@ -3476,7 +3493,7 @@ mod tests {
             l2.contains(&l2_key_of("new-epoch")),
             "refill must land under the current epoch key"
         );
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
     }
 
     /// Redis 错误全面降级：GET 失败 → 静默旁路回源；SET 失败 → 静默；L1+DB
@@ -3490,12 +3507,12 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let first = load_with_l2(&deps, &cache, &l2).await.expect("reload");
         assert_eq!(deps.strict_calls(), 1, "Redis failure must fall back to DB");
-        assert_eq!(first, evidence);
+        assert_eq!(*first, evidence);
 
         // L1 仍被回填：第二次 load 命中 L1（零严格读、零 L2 读取成功语义）。
         let deps = FixtureDeps::new(
@@ -3506,7 +3523,7 @@ mod tests {
         );
         let second = load_with_l2(&deps, &cache, &l2).await.expect("l1 hit");
         assert_eq!(deps.strict_calls(), 0);
-        assert_eq!(second, evidence);
+        assert_eq!(*second, evidence);
     }
 
     /// L2 命中后读后复读漂移（发布落在读前对牌与 L2 接受之间）→ 不放行旧
@@ -3524,12 +3541,12 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence), drifted],
-            vec![Ok(published.clone())],
+            vec![Ok(std::sync::Arc::new(published.clone()))],
             1_100,
         );
         let next = load_with_l2(&deps, &cache, &l2).await.expect("reload");
         assert_eq!(deps.strict_calls(), 1);
-        assert_eq!(next, published);
+        assert_eq!(*next, published);
         assert!(
             l2.contains(&l2_key_of(EPOCH)),
             "recheck drift must not purge the entry"
@@ -3561,7 +3578,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let next = load_with_l2(&deps, &cache, &l2).await.expect("reload");
@@ -3578,7 +3595,7 @@ mod tests {
         )
         .expect("refilled json");
         assert_eq!(reconstruct_entry_payload(&refilled, &l2), evidence);
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
     }
 
     /// L2 命中路径的时钟重验（与 L1 同一函数）：accepted 记录在当前时钟下
@@ -3593,7 +3610,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             2_000,
         );
         let next = load_with_l2(&deps, &cache, &l2)
@@ -3612,7 +3629,7 @@ mod tests {
         )
         .expect("refilled json");
         assert_eq!(reconstruct_entry_payload(&refilled, &l2), evidence);
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
     }
 
     /// 推送形状：严格读一次 → 以内嵌当前时代的键、schema 3、TTL 300s、
@@ -3624,7 +3641,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_000,
         );
         push_evidence_to_l2_with(&l2, TEST_MAC_SECRET, &deps, TENANT, CARD).await;
@@ -3692,7 +3709,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_000,
         );
         push_evidence_to_l2_with(&l2, TEST_MAC_SECRET, &deps, TENANT, CARD).await;
@@ -3916,7 +3933,7 @@ mod tests {
         );
         let hit = load_with_l2(&deps, &cache, &l2).await.expect("hit");
         assert_eq!(deps.strict_calls(), 0);
-        assert_eq!(hit, evidence);
+        assert_eq!(*hit, evidence);
     }
 
     /// 跨卡存储去重：卡 A/卡 B 的 RULE_SET 内容单元字节级相同 → 恰好共享一个
@@ -4012,7 +4029,7 @@ mod tests {
             .await
             .expect("a hit");
         assert_eq!(deps_a.strict_calls(), 0);
-        assert_eq!(hit_a, evidence_a);
+        assert_eq!(*hit_a, evidence_a);
 
         let cache_b = fresh_cache();
         let deps_b = FixtureDeps::new(
@@ -4025,7 +4042,7 @@ mod tests {
             .await
             .expect("b hit");
         assert_eq!(deps_b.strict_calls(), 0);
-        assert_eq!(hit_b, evidence_b);
+        assert_eq!(*hit_b, evidence_b);
     }
 
     /// 共享单元缺失（部分写/驱逐）→ purge 卡条目 + 回源；绝不放行部分数据。
@@ -4067,7 +4084,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let next = load_with_l2(&deps, &cache, &l2)
@@ -4079,7 +4096,7 @@ mod tests {
             "missing unit must never serve partial data"
         );
         assert_eq!(l2.del_calls(), 1, "card entry must be purged");
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
         // 回源自愈：单元先写、卡条目重写。
         assert!(
             l2.contains(&unit_key),
@@ -4138,7 +4155,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let next = load_with_l2(&deps, &cache, &l2)
@@ -4150,7 +4167,7 @@ mod tests {
             "hash-mismatched unit must never serve"
         );
         assert_eq!(l2.del_calls(), 1, "card entry must be purged");
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
     }
 
     /// 跨卡投毒：卡 B 的完整证据（哈希对 B 一致、条目栅栏伪造为卡 A 的当前
@@ -4188,7 +4205,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence_a)],
-            vec![Ok(evidence_a.clone())],
+            vec![Ok(std::sync::Arc::new(evidence_a.clone()))],
             1_050,
         );
         let next = load_with_l2(&deps, &cache, &l2)
@@ -4201,7 +4218,7 @@ mod tests {
         );
         assert_eq!(l2.del_calls(), 1, "poisoned entry must be purged");
         assert_eq!(
-            next, evidence_a,
+            *next, evidence_a,
             "card A must only ever receive its own evidence"
         );
         // 回源自愈：A 的键被 A 的合法存储形覆盖。
@@ -4251,7 +4268,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence_a)],
-            vec![Ok(evidence_a.clone())],
+            vec![Ok(std::sync::Arc::new(evidence_a.clone()))],
             1_050,
         );
         let next = load_with_l2(&deps, &cache, &l2)
@@ -4263,7 +4280,7 @@ mod tests {
             "cross-tenant payload must never serve"
         );
         assert_eq!(l2.del_calls(), 1, "cross-tenant entry must be purged");
-        assert_eq!(next, evidence_a);
+        assert_eq!(*next, evidence_a);
     }
 
     /// manifest 戳投毒：顶层身份与 scope 一致、但 manifest 摘要携带他卡戳
@@ -4284,7 +4301,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let next = load_with_l2(&deps, &cache, &l2)
@@ -4296,7 +4313,7 @@ mod tests {
             "forged manifest stamp must never serve"
         );
         assert_eq!(l2.del_calls(), 1, "forged entry must be purged");
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
     }
 
     /// 部分写（截断/垃圾字节）→ 解码失败 → 删键回源；半截条目绝不放行。
@@ -4314,7 +4331,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let next = load_with_l2(&deps, &cache, &l2)
@@ -4326,7 +4343,7 @@ mod tests {
             "partial write must fall back to strict read"
         );
         assert_eq!(l2.del_calls(), 1, "undecodable entry must be purged");
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
     }
 
     /// v3 形状违约：payload 携带旧 v2 完整载荷形状（records 无槽位标签、
@@ -4354,7 +4371,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let next = load_with_l2(&deps, &cache, &l2)
@@ -4366,7 +4383,7 @@ mod tests {
             "non-factored payload must never serve"
         );
         assert_eq!(l2.del_calls(), 1, "stuffed entry must be purged");
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
     }
 
     /// 不变式钉死：读侧绝不重写 payload/grant 身份，共享单元绝不含身份。
@@ -4515,7 +4532,7 @@ mod tests {
             .await
             .expect("a hit");
         assert_eq!(deps_a.strict_calls(), 0);
-        assert_eq!(hit_a, evidence_a);
+        assert_eq!(*hit_a, evidence_a);
 
         let cache_b = fresh_cache();
         let deps_b = FixtureDeps::new(
@@ -4528,7 +4545,7 @@ mod tests {
             .await
             .expect("b hit");
         assert_eq!(deps_b.strict_calls(), 0);
-        assert_eq!(hit_b, evidence_b);
+        assert_eq!(*hit_b, evidence_b);
 
         // A 的栅栏推进：A 对牌失败 → purge + 回源；B 的条目与栅栏不受波及。
         let mut advanced = evidence_a.clone();
@@ -4537,7 +4554,7 @@ mod tests {
         let deps_a2 = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&advanced)],
-            vec![Ok(advanced.clone())],
+            vec![Ok(std::sync::Arc::new(advanced.clone()))],
             1_060,
         );
         let next_a = load_card_with_l2(&deps_a2, &cache_a2, &l2, TENANT, CARD)
@@ -4545,7 +4562,7 @@ mod tests {
             .expect("a reload");
         assert_eq!(deps_a2.strict_calls(), 1);
         assert_eq!(l2.del_calls(), 1, "A's mismatched entry must be purged");
-        assert_eq!(next_a, advanced);
+        assert_eq!(*next_a, advanced);
 
         let cache_b2 = fresh_cache();
         let deps_b2 = FixtureDeps::new(
@@ -4558,7 +4575,7 @@ mod tests {
             .await
             .expect("b still hits");
         assert_eq!(deps_b2.strict_calls(), 0, "B must still hit its own entry");
-        assert_eq!(hit_b2, evidence_b);
+        assert_eq!(*hit_b2, evidence_b);
     }
 
     /// MAC 缺失：条目 JSON 移除 `mac` 字段 → 解码失败（mac 必填）→ 删键回源；
@@ -4587,7 +4604,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let next = load_with_l2(&deps, &cache, &l2)
@@ -4595,7 +4612,7 @@ mod tests {
             .expect("strict fallback");
         assert_eq!(deps.strict_calls(), 1, "MAC-less entry must never serve");
         assert_eq!(l2.del_calls(), 1, "MAC-less entry must be purged");
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
     }
 
     /// MAC 错误密钥：cover 全部一致（键/栅栏/哈希/载荷）但 MAC 以攻击者自己的
@@ -4621,7 +4638,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let next = load_with_l2(&deps, &cache, &l2)
@@ -4629,7 +4646,7 @@ mod tests {
             .expect("strict fallback");
         assert_eq!(deps.strict_calls(), 1, "wrong-secret MAC must never serve");
         assert_eq!(l2.del_calls(), 1, "wrong-MAC entry must be purged");
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
     }
 
     /// 键绑定重放：条目为 epoch-1 键签发（MAC cover 绑定该键），复制到同卡
@@ -4657,7 +4674,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some("epoch-2".into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let scope = PublishedCardEvidenceScope {
@@ -4677,7 +4694,7 @@ mod tests {
         .expect("strict fallback");
         assert_eq!(deps.strict_calls(), 1, "key-bound replay must never serve");
         assert_eq!(l2.del_calls(), 1, "replayed entry must be purged");
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
 
         // 2) 跨卡重放：写路径签发的 A 条目字节复制到 B 键 → 顶层 scope 预检拦截。
         seed_valid_entry(&l2, EPOCH, &evidence).await;
@@ -4712,7 +4729,7 @@ mod tests {
         let deps_b = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence_b)],
-            vec![Ok(evidence_b.clone())],
+            vec![Ok(std::sync::Arc::new(evidence_b.clone()))],
             1_050,
         );
         let scope_b = PublishedCardEvidenceScope {
@@ -4741,7 +4758,7 @@ mod tests {
             "cross-card replayed entry must be purged"
         );
         assert_eq!(
-            next_b, evidence_b,
+            *next_b, evidence_b,
             "card B must only receive its own evidence"
         );
     }
@@ -4771,7 +4788,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let next = load_with_l2(&deps, &cache, &l2)
@@ -4783,7 +4800,7 @@ mod tests {
             "foreign-card grant must never serve"
         );
         assert_eq!(l2.del_calls(), 1, "record-poisoned entry must be purged");
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
 
         // 2) 同卡条目 + 他租户 grant。
         let mut cross_tenant = evidence.clone();
@@ -4801,7 +4818,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![fence_of(&evidence)],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_060,
         );
         let next = load_with_l2(&deps, &fresh_cache(), &l2)
@@ -4817,7 +4834,7 @@ mod tests {
             2,
             "record-poisoned entry must be purged again"
         );
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
     }
 
     /// 非 RULE_SET 记录保持内联：USER_CARD 证据写入后零共享单元键、条目全部
@@ -4877,7 +4894,7 @@ mod tests {
         );
         let hit = load_with_l2(&deps, &cache, &l2).await.expect("hit");
         assert_eq!(deps.strict_calls(), 0);
-        assert_eq!(hit, evidence);
+        assert_eq!(*hit, evidence);
     }
 
     /// HMAC 密钥不可用（未设置/无效）→ fail-closed：L2 读零访问、写零落键，
@@ -4897,7 +4914,7 @@ mod tests {
         let deps = FixtureDeps::new(
             vec![Some(EPOCH.into())],
             vec![],
-            vec![Ok(evidence.clone())],
+            vec![Ok(std::sync::Arc::new(evidence.clone()))],
             1_050,
         );
         let next = load_evidence_through_cache_with_mac(&deps, &cache, Some(&l2), None, &scope)
@@ -4911,7 +4928,7 @@ mod tests {
         assert_eq!(l2.get_calls(), 0, "no-secret reads must not touch L2");
         assert_eq!(l2.set_calls(), 0, "no-secret refills must not write L2");
         assert!(l2.is_empty());
-        assert_eq!(next, evidence);
+        assert_eq!(*next, evidence);
 
         // 写旁路：显式 write 调用同样跳过（绝不落未认证条目）。
         write_l2_evidence(&l2, None, EPOCH, &evidence).await;

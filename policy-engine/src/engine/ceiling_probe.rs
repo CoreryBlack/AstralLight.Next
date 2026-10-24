@@ -27,7 +27,7 @@ use astral_types::{PolicyContext, PolicyError, PublishedCardEvidenceScope};
 
 /// 内存权威仓库：整份证据常驻，读取 = 克隆（物化）+ 原子计数。
 struct MemoryAuthorityRepo {
-    evidence: PublishedCardAuthorization,
+    evidence: std::sync::Arc<PublishedCardAuthorization>,
     reads: AtomicUsize,
 }
 
@@ -39,9 +39,10 @@ impl RuleRepository for MemoryAuthorityRepo {
     async fn load_published_card_authorization(
         &self,
         _scope: &PublishedCardEvidenceScope,
-    ) -> Result<Option<PublishedCardAuthorization>, PolicyError> {
+    ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
         self.reads.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(self.evidence.clone()))
+        // 生产读面语义：命中 = 引用计数克隆，零深拷贝。
+        Ok(Some(std::sync::Arc::clone(&self.evidence)))
     }
     async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
         Ok(false)
@@ -87,6 +88,24 @@ fn deterministic_grant_id(seed: u64) -> GrantId {
         seed & 0xffff_ffff_ffff
     ))
     .unwrap()
+}
+
+/// 与 astral_types::grant::ensure_identifier 相同的检查（本地副本，仅归因用）。
+fn ensure_id_local(value: &str, field: &'static str) -> Result<(), &'static str> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return Err(field);
+    }
+    if normalized.len() > 512 {
+        return Err(field);
+    }
+    if normalized
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(field);
+    }
+    Ok(())
 }
 
 fn noise_grant(index: usize) -> CanonicalGrant {
@@ -287,21 +306,31 @@ fn run_threads(
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+/// 计数开关：仅分配计量阶段置位。关闭时计数路径只做一次无争用 Relaxed 读
+/// （缓存行保持共享读态），吞吐/多线程阶段不再被计数器 fetch_add 串行化——
+/// 否则观测本身会制造负扩展假象。
+static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct CountingAlloc;
 
+#[inline]
+unsafe fn count_alloc(bytes: u64) {
+    if COUNTING.load(Ordering::Relaxed) {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
 unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        count_alloc(layout.size() as u64);
         std::alloc::System.alloc(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
         std::alloc::System.dealloc(ptr, layout)
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        ALLOC_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        count_alloc(new_size as u64);
         std::alloc::System.realloc(ptr, layout, new_size)
     }
 }
@@ -321,7 +350,7 @@ fn authorization_ceiling_probe() {
             grants.push(noise_grant(index));
         }
         let repo = MemoryAuthorityRepo {
-            evidence: evidence(grants),
+            evidence: std::sync::Arc::new(evidence(grants)),
             reads: AtomicUsize::new(0),
         };
         let engine = PolicyEngine::new();
@@ -348,18 +377,87 @@ fn authorization_ceiling_probe() {
             );
         }
 
-        // 每操作分配（单线程、无计数争用）：证据克隆 + 引擎内部分配。
-        ALLOCS.store(0, Ordering::Relaxed);
-        ALLOC_BYTES.store(0, Ordering::Relaxed);
+        // 每操作分配归因（单线程、计数仅在本阶段开启）：读取面 vs 完整判定。
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         let alloc_ops = 20_000usize;
+        let scope = PublishedCardEvidenceScope {
+            tenant_id: 7,
+            card_id: 1,
+            user_filter: None,
+            domain: astral_types::DomainScopeRequirement::Unconstrained,
+        };
+        COUNTING.store(true, Ordering::Relaxed);
+        ALLOCS.store(0, Ordering::Relaxed);
+        ALLOC_BYTES.store(0, Ordering::Relaxed);
+        for _ in 0..alloc_ops {
+            let _ = rt.block_on(repo.load_published_card_authorization(&scope));
+        }
+        let load_allocs = ALLOCS.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
+        ALLOCS.store(0, Ordering::Relaxed);
+        ALLOC_BYTES.store(0, Ordering::Relaxed);
         for _ in 0..alloc_ops {
             let _ = rt.block_on(engine.evaluate(&ctx, &repo));
         }
-        let allocs = ALLOCS.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
-        let bytes = ALLOC_BYTES.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
-        eprintln!("[{size:>4} grants] per-op: {allocs:.1} allocs, {bytes:.0} bytes");
+        let eval_allocs = ALLOCS.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
+        let eval_bytes = ALLOC_BYTES.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
+        COUNTING.store(false, Ordering::Relaxed);
+        // 归因二分：合同校验（validate）单独的耗时与分配，再拆三族扫描。
+        let va = Instant::now();
+        COUNTING.store(true, Ordering::Relaxed);
+        ALLOCS.store(0, Ordering::Relaxed);
+        for _ in 0..alloc_ops {
+            let _ = repo.evidence.validate();
+        }
+        let validate_allocs = ALLOCS.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
+        COUNTING.store(false, Ordering::Relaxed);
+        let validate_ns = va.elapsed().as_nanos() as f64 / alloc_ops as f64;
+
+        // 族 A：标识符扫描（ensure_identifier 的逐字符检查）。
+        let mut id_start = Instant::now();
+        let mut id_sink = 0usize;
+        for grant in &repo.evidence.effective_grants {
+            id_sink += grant.resource.len()
+                + grant.action.len()
+                + grant.provenance.operation_id.len()
+                + grant.provenance.source_id.len();
+        }
+        for _ in 0..alloc_ops {
+            for grant in &repo.evidence.effective_grants {
+                id_sink &= ensure_id_local(&grant.resource, "r")
+                    .map(|_| 1)
+                    .unwrap_or(0)
+                    + ensure_id_local(&grant.action, "a").map(|_| 1).unwrap_or(0);
+                id_sink &= ensure_id_local(&grant.provenance.source_id, "s")
+                    .map(|_| 1)
+                    .unwrap_or(0);
+                id_sink &= ensure_id_local(&grant.provenance.operation_id, "o")
+                    .map(|_| 1)
+                    .unwrap_or(0);
+            }
+        }
+        let id_ns = id_start.elapsed().as_nanos() as f64 / alloc_ops as f64;
+
+        // 族 B：对位相等比较（effective vs records 的 accepted 子集）。
+        let eq_start = Instant::now();
+        for _ in 0..alloc_ops {
+            for (effective, record) in repo
+                .evidence
+                .effective_grants
+                .iter()
+                .zip(repo.evidence.records.iter())
+            {
+                std::hint::black_box(*effective == record.grant);
+            }
+        }
+        let eq_ns = eq_start.elapsed().as_nanos() as f64 / alloc_ops as f64;
+        eprintln!(
+            "[{size:>4} grants] validate alone: {validate_ns:.0} ns, {validate_allocs:.1} allocs | id-scan {id_ns:.0} ns | pairwise-eq {eq_ns:.0} ns (sink {id_sink})"
+        );
+        eprintln!(
+            "[{size:>4} grants] per-op: read-face {load_allocs:.1} | evaluate {eval_allocs:.1} allocs / {eval_bytes:.0} bytes (engine-side ~{:.1})",
+            eval_allocs - load_allocs
+        );
     }
 }

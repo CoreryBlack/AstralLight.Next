@@ -162,7 +162,7 @@ impl RuleRepository for RevokeBeforeFinal<'_> {
     async fn load_published_card_authorization(
         &self,
         scope: &PublishedCardEvidenceScope,
-    ) -> Result<Option<PublishedCardAuthorization>, astral_types::PolicyError> {
+    ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, astral_types::PolicyError> {
         if self.reads.fetch_add(1, Ordering::Relaxed) == 1 {
             publish_revoke(self.hub);
         }

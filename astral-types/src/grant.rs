@@ -116,6 +116,60 @@ fn normalize_identifier(value: &str, field: &'static str) -> GrantContractResult
     Ok(normalized.to_owned())
 }
 
+/// 标识符扫描用的 256 项字节分类表：`1` = 空白或控制字符（不允许）。
+/// `ensure_identifier` 与 hex 校验共用这张表，把 UTF-8 逐字符解码换成
+/// 一次按字节的查表；非 ASCII 字节（>=0x80）按非空白处理，其 UTF-8
+/// 合法性由 `&str` 类型不变式保证，与原逐字符实现语义一致。
+static IDENTIFIER_REJECT: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let character = byte as u8 as char;
+        table[byte] = character.is_whitespace() || character.is_control();
+        byte += 1;
+    }
+    // 0x80..=0xFF 在 char 转换下不是合法单字节字符——上表对高位字节的
+    // 映射不可靠，这里显式按"非空白非控制"覆盖（多字节 UTF-8 续字节
+    // 0x80..=0xBF 也不是空白/控制，正确）。
+    let mut high = 0x80usize;
+    while high < 256 {
+        table[high] = false;
+        high += 1;
+    }
+    table
+};
+
+/// 零分配的校验版 [`normalize_identifier`]：同一套合法性检查，但不产出
+/// 归一化副本——热路径（每次判定的证据合同校验）只关心合法性。
+pub(crate) fn ensure_identifier(value: &str, field: &'static str) -> GrantContractResult<()> {
+    // str::trim 是 Unicode 感知的且零分配：与 normalize_identifier 的边界
+    // 语义逐字符一致（含非 ASCII 空白，如 NBSP/U+2028）。
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return Err(GrantContractError::EmptyIdentifier { field });
+    }
+    if normalized.len() > 512 {
+        return Err(GrantContractError::IdentifierTooLong { field });
+    }
+    let bytes = normalized.as_bytes();
+    if bytes.is_ascii() {
+        // 快路径（绝大多数标识符）：ASCII 字节表一次扫描，覆盖
+        // is_whitespace || is_control 的完整 ASCII 集合。
+        if bytes.iter().any(|&byte| IDENTIFIER_REJECT[byte as usize]) {
+            return Err(GrantContractError::MalformedIdentifier { field });
+        }
+    } else if normalized
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        // 慢路径：任何非 ASCII 字节都回退到原 Unicode 逐字符检查，保证
+        // 非 ASCII 空白/控制符（NBSP、U+2028、U+3000 等）的拒绝语义与
+        // normalize_identifier 完全一致。
+        return Err(GrantContractError::MalformedIdentifier { field });
+    }
+    Ok(())
+}
+
 fn validate_positive_id(value: i64, field: &'static str) -> GrantContractResult<()> {
     if value <= 0 {
         Err(GrantContractError::NonPositiveId { field, value })
@@ -151,11 +205,15 @@ fn validate_uuid(value: Uuid, field: &'static str) -> GrantContractResult<()> {
 }
 
 fn validate_sha256_hex(value: &str, field: &'static str) -> GrantContractResult<()> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
-    {
+    // 64 字符小写 hex：单次字节扫描，逐字节同时判长度与字符集，避免
+    // len() 之外的二次遍历。合法小写 hex 集合之外的一切（大写/非 hex）
+    // 拒绝，与原实现等价。
+    let bytes = value.as_bytes();
+    let valid = bytes.len() == 64
+        && bytes
+            .iter()
+            .all(|&byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    if !valid {
         return Err(GrantContractError::InvalidHash { field });
     }
     Ok(())
@@ -652,19 +710,19 @@ pub struct GrantProvenance {
 
 impl GrantProvenance {
     pub fn validate(&self) -> GrantContractResult<()> {
-        normalize_identifier(&self.source_id, "provenance.source_id")?;
+        ensure_identifier(&self.source_id, "provenance.source_id")?;
         if let Some(source_entry) = &self.source_entry {
-            normalize_identifier(source_entry, "provenance.source_entry")?;
+            ensure_identifier(source_entry, "provenance.source_entry")?;
         }
         if let Some(binding_id) = &self.binding_id {
-            normalize_identifier(binding_id, "provenance.binding_id")?;
+            ensure_identifier(binding_id, "provenance.binding_id")?;
         }
         if let Some(delegation_id) = &self.delegation_id {
-            normalize_identifier(delegation_id, "provenance.delegation_id")?;
+            ensure_identifier(delegation_id, "provenance.delegation_id")?;
         }
-        normalize_identifier(&self.operation_id, "provenance.operation_id")?;
+        ensure_identifier(&self.operation_id, "provenance.operation_id")?;
         if let Some(event_id) = &self.event_id {
-            normalize_identifier(event_id, "provenance.event_id")?;
+            ensure_identifier(event_id, "provenance.event_id")?;
         }
         if let Some(actor_user_id) = self.actor_user_id {
             validate_positive_id(actor_user_id, "provenance.actor_user_id")?;
@@ -984,15 +1042,15 @@ impl GrantIdentityKey {
             });
         }
         self.tenant.validate()?;
-        normalize_identifier(&self.aggregate_type, "identity.aggregate_type")?;
-        normalize_identifier(&self.aggregate_id, "identity.aggregate_id")?;
+        ensure_identifier(&self.aggregate_type, "identity.aggregate_type")?;
+        ensure_identifier(&self.aggregate_id, "identity.aggregate_id")?;
         // Both identity scopes are mandatory for every source kind. An empty or
         // malformed source entry would silently merge sibling contributions of
         // the same aggregate onto one shared grant identity, which the ledger
         // then rejects fail-closed (DuplicateActiveGrant); rejection here is
         // cheaper and unambiguous.
-        normalize_identifier(&self.source_entry, "identity.source_entry")?;
-        normalize_identifier(&self.binding_key, "identity.binding_key")?;
+        ensure_identifier(&self.source_entry, "identity.source_entry")?;
+        ensure_identifier(&self.binding_key, "identity.binding_key")?;
         if !source_kind_aligns_with_binding_layer(self.source_kind, self.binding_layer) {
             return Err(GrantContractError::SourceLayerMismatch {
                 source_kind: self.source_kind.as_str(),
@@ -1118,10 +1176,10 @@ impl DeltaEventIdentity<'_> {
     fn validate(&self) -> GrantContractResult<()> {
         validate_positive_id(self.tenant_id, "delta_event.tenant_id")?;
         validate_positive_id(self.aggregate_id, "delta_event.aggregate_id")?;
-        normalize_identifier(self.operation_id, "delta_event.operation_id")?;
-        normalize_identifier(self.aggregate_type, "delta_event.aggregate_type")?;
-        normalize_identifier(self.source_entry, "delta_event.source_entry")?;
-        normalize_identifier(self.mutation_kind, "delta_event.mutation_kind")?;
+        ensure_identifier(self.operation_id, "delta_event.operation_id")?;
+        ensure_identifier(self.aggregate_type, "delta_event.aggregate_type")?;
+        ensure_identifier(self.source_entry, "delta_event.source_entry")?;
+        ensure_identifier(self.mutation_kind, "delta_event.mutation_kind")?;
         Ok(())
     }
 
@@ -1185,8 +1243,8 @@ impl CanonicalGrant {
         self.tenant.validate()?;
         validate_positive_id(self.card_id, "card_id")?;
         validate_positive_id(self.user_id, "user_id")?;
-        normalize_identifier(&self.resource, "resource")?;
-        normalize_identifier(&self.action, "action")?;
+        ensure_identifier(&self.resource, "resource")?;
+        ensure_identifier(&self.action, "action")?;
         self.effect.validate()?;
         self.validity.validate()?;
         self.provenance.validate()?;
@@ -1282,8 +1340,8 @@ pub type CanonicalGrantEvidence = GrantEvidence;
 impl GrantEvidence {
     pub fn validate(&self) -> GrantContractResult<()> {
         self.grant.validate()?;
-        normalize_identifier(&self.event_id, "event_id")?;
-        normalize_identifier(&self.operation_id, "operation_id")?;
+        ensure_identifier(&self.event_id, "event_id")?;
+        ensure_identifier(&self.operation_id, "operation_id")?;
         validate_generation(self.source_generation, "source_generation")?;
         validate_fence(self.source_generation, self.revoke_fence)?;
         self.dependency_vector.validate()?;
@@ -1575,7 +1633,7 @@ impl DependencyVersion {
     }
 
     pub fn validate(&self) -> GrantContractResult<()> {
-        normalize_identifier(&self.dependency_id, "dependency_id")?;
+        ensure_identifier(&self.dependency_id, "dependency_id")?;
         validate_generation(self.generation, "dependency.generation")?;
         validate_fence(self.generation, self.fence)?;
         Ok(())
@@ -1678,7 +1736,7 @@ impl ProjectionEventEnvelope {
         validate_uuid(self.event_id, "event_id")?;
         validate_uuid(self.operation_id, "operation_id")?;
         self.tenant.validate()?;
-        normalize_identifier(&self.aggregate_id, "aggregate_id")?;
+        ensure_identifier(&self.aggregate_id, "aggregate_id")?;
         validate_generation(self.source_generation, "source_generation")?;
         validate_fence(self.source_generation, self.revoke_fence)?;
         self.dependency_vector.validate()?;
@@ -1741,7 +1799,7 @@ pub type SegmentRef = SegmentReference;
 
 impl SegmentReference {
     pub fn validate(&self) -> GrantContractResult<()> {
-        normalize_identifier(&self.segment_id, "segment_id")?;
+        ensure_identifier(&self.segment_id, "segment_id")?;
         validate_generation(self.generation, "segment.generation")?;
         validate_sha256_hex(&self.content_hash, "segment.content_hash")?;
         Ok(())
@@ -2125,10 +2183,10 @@ impl VerifiedPublishedGrantRecord {
         self.grant.validate()?;
         validate_sha256_hex(&self.semantic_hash_hex, "record.semantic_hash_hex")?;
         validate_sha256_hex(&self.dependency_hash_hex, "record.dependency_hash_hex")?;
-        normalize_identifier(&self.aggregate_type, "record.aggregate_type")?;
-        normalize_identifier(&self.event_id, "record.event_id")?;
-        normalize_identifier(&self.operation_id, "record.operation_id")?;
-        normalize_identifier(&self.compiler_version, "record.compiler_version")?;
+        ensure_identifier(&self.aggregate_type, "record.aggregate_type")?;
+        ensure_identifier(&self.event_id, "record.event_id")?;
+        ensure_identifier(&self.operation_id, "record.operation_id")?;
+        ensure_identifier(&self.compiler_version, "record.compiler_version")?;
         validate_positive_id(self.aggregate_id, "record.aggregate_id")?;
         if self.accepted_into_effective_set && self.unaccepted_reason.is_some() {
             return Err(GrantContractError::InvalidProvenance(
@@ -2214,7 +2272,35 @@ pub struct PublishedCardAuthorization {
     pub effective_grants: Vec<CanonicalGrant>,
 }
 
+thread_local! {
+    /// 判定路径的校验结论缓存（每线程单槽）：持有上一次通过全量校验的
+    /// `Arc<PublishedCardAuthorization>`。强引用保证该分配在缓存期间不会
+    /// 被释放复用（无 ABA）；`Arc::ptr_eq` 成立即同一分配、同一内容，而
+    /// 入槽前提是该内容已通过全量 `validate`——结论因此可靠。槽位替换
+    /// 时旧 Arc 释放；每线程一个 Arc，内存有界。
+    static VALIDATED_EVIDENCE: std::cell::RefCell<
+        Option<std::sync::Arc<PublishedCardAuthorization>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
 impl PublishedCardAuthorization {
+    pub fn validate_shared(this: &std::sync::Arc<Self>) -> GrantContractResult<()> {
+        let cached = VALIDATED_EVIDENCE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|cached| std::sync::Arc::ptr_eq(cached, this))
+        });
+        if cached {
+            return Ok(());
+        }
+        // fail-closed：校验失败的证据永不入槽，下次调用重新全量校验。
+        this.validate()?;
+        VALIDATED_EVIDENCE.with(|slot| {
+            *slot.borrow_mut() = Some(std::sync::Arc::clone(this));
+        });
+        Ok(())
+    }
+
     pub fn validate(&self) -> GrantContractResult<()> {
         validate_positive_id(self.tenant_id, "card_authorization.tenant_id")?;
         validate_positive_id(self.card_id, "card_authorization.card_id")?;
@@ -4008,6 +4094,156 @@ mod tests {
             .map(|record| record.grant.clone())
             .collect();
         reordered.validate().unwrap();
+    }
+
+    #[test]
+    fn ensure_identifier_rejects_non_ascii_whitespace_like_the_producer() {
+        // 回归：字节表快路径不得放松 Unicode 空白/控制符语义。
+        // 内部 NBSP / U+2028 / U+3000 → Malformed（与 normalize 一致）。
+        for value in [
+            "learn\u{00a0}subject",
+            "learn\u{2028}subject",
+            "learn\u{3000}subject",
+        ] {
+            assert!(ensure_identifier(value, "field").is_err(), "{value:?}");
+        }
+        // 仅由非 ASCII 空白组成 → trim 后为空 → EmptyIdentifier。
+        assert!(ensure_identifier("\u{00a0}", "field").is_err());
+        assert!(ensure_identifier("\u{3000}\u{2028}", "field").is_err());
+        // 合法 ASCII / 合法非 ASCII（无空白控制）→ Ok。
+        assert!(ensure_identifier("learn_subject", "field").is_ok());
+        assert!(ensure_identifier("授权资源-1", "field").is_ok());
+        // ASCII 控制符仍在快路径拒绝。
+        assert!(ensure_identifier("a\tb", "field").is_err());
+        assert!(ensure_identifier("a\n b", "field").is_err());
+    }
+
+    fn shared_gate(status: PublishedEvidenceGateStatus) -> PublishedCardAuthorizationGate {
+        PublishedCardAuthorizationGate {
+            status,
+            aggregate_manifest_count: 0,
+            verified_record_count: 0,
+            effective_grant_count: 0,
+            not_in_effective_count: 0,
+            equivalent_duplicate_collapsed_count: 0,
+        }
+    }
+
+    #[test]
+    fn validate_shared_fails_closed_and_never_caches_failures() {
+        let good = std::sync::Arc::new(PublishedCardAuthorization {
+            tenant_id: 7,
+            card_id: 17,
+            read_unix_seconds: 1,
+            gate: shared_gate(PublishedEvidenceGateStatus::Ready),
+            manifests: Vec::new(),
+            records: Vec::new(),
+            effective_grants: Vec::new(),
+        });
+        assert!(PublishedCardAuthorization::validate_shared(&good).is_ok());
+        // 同一 Arc：指针相等快路径，仍 Ok。
+        assert!(PublishedCardAuthorization::validate_shared(&good).is_ok());
+
+        // 畸形证据：现在错、再次调用仍错（绝不把失败缓存成通过）。
+        let bad = std::sync::Arc::new(PublishedCardAuthorization {
+            tenant_id: 7,
+            card_id: 17,
+            read_unix_seconds: 1,
+            gate: shared_gate(PublishedEvidenceGateStatus::Corrupt),
+            manifests: Vec::new(),
+            records: Vec::new(),
+            effective_grants: Vec::new(),
+        });
+        assert!(PublishedCardAuthorization::validate_shared(&bad).is_err());
+        assert!(PublishedCardAuthorization::validate_shared(&bad).is_err());
+        // 失败尝试不污染好证据的槽位。
+        assert!(PublishedCardAuthorization::validate_shared(&good).is_ok());
+    }
+
+    // ===== 定向安全用例（针对 D1 Arc 共享 / validate_shared 缓存 / 字节表扫描）=====
+
+    #[test]
+    fn validate_shared_cache_survives_bad_evidence_without_cross_contamination() {
+        // 场景：先验证坏证据（fail-closed），再验证好证据；随后再回看坏证据
+        // ——确认坏结论没有被缓存成通过，也没有污染好证据的槽位。
+        let good = std::sync::Arc::new(PublishedCardAuthorization {
+            tenant_id: 7,
+            card_id: 17,
+            read_unix_seconds: 1,
+            gate: shared_gate(PublishedEvidenceGateStatus::Ready),
+            manifests: Vec::new(),
+            records: Vec::new(),
+            effective_grants: Vec::new(),
+        });
+        let bad = std::sync::Arc::new(PublishedCardAuthorization {
+            tenant_id: 7,
+            card_id: 17,
+            read_unix_seconds: 1,
+            gate: shared_gate(PublishedEvidenceGateStatus::Corrupt),
+            manifests: Vec::new(),
+            records: Vec::new(),
+            effective_grants: Vec::new(),
+        });
+        assert!(PublishedCardAuthorization::validate_shared(&bad).is_err());
+        assert!(PublishedCardAuthorization::validate_shared(&good).is_ok());
+        // 反复交替：坏证据永远错，好证据永远过（缓存寿命/交叉污染双向验证）。
+        for _ in 0..5 {
+            assert!(PublishedCardAuthorization::validate_shared(&bad).is_err());
+            assert!(PublishedCardAuthorization::validate_shared(&good).is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_catches_tampered_shared_evidence_content() {
+        // 场景：共享 Arc 之后证据内容被篡改（字段 pub，防御纵深必须能抓）。
+        // validate 直接重扫（非缓存路径）必须拒绝篡改形态。
+        let mut authorization = PublishedCardAuthorization {
+            tenant_id: 7,
+            card_id: 17,
+            read_unix_seconds: 1,
+            gate: shared_gate(PublishedEvidenceGateStatus::Ready),
+            manifests: Vec::new(),
+            records: Vec::new(),
+            effective_grants: Vec::new(),
+        };
+        assert!(authorization.validate().is_ok());
+        // 篡改 1：gate 计数与实际集合脱节。
+        authorization.gate.effective_grant_count = 7;
+        assert!(authorization.validate().is_err());
+        // 恢复后再篡改 2：records 与 effective 脱钩。
+        authorization.gate.effective_grant_count = 0;
+        authorization.effective_grants = vec![grant()];
+        assert!(authorization.validate().is_err());
+    }
+
+    #[test]
+    fn ensure_identifier_scan_bypass_matrix_is_fail_closed() {
+        // 场景：字节表快路径/Unicode 慢路径的绕过矩阵——每一条都必须拒绝。
+        let bypasses = [
+            "learn\tsubject",       // ASCII 制表
+            "learn\u{0000}subject", // ASCII NUL
+            "learn\u{00a0}subject", // NBSP
+            "learn\u{2028}subject", // 行分隔符
+            "learn\u{3000}subject", // 表意空格
+            "\u{00a0}",             // 纯 NBSP（trim 后为空）
+            "\u{000b}",             // 垂直制表（控制）
+            "a\u{200b}b",           // 零宽空格不是空白——放行是原语义，
+                                    // 但这里确认与 normalize 一致：不拒绝
+        ];
+        // 除最后一条（零宽空格原本就放行）外全部必须 Err。
+        for value in &bypasses[..bypasses.len() - 1] {
+            assert!(
+                ensure_identifier(value, "field").is_err(),
+                "scan bypass accepted: {value:?}"
+            );
+        }
+        assert!(ensure_identifier(bypasses[bypasses.len() - 1], "field").is_ok());
+        // 长度上限仍生效（512 字节、多字节计数按字节）。
+        let long_ascii = "a".repeat(513);
+        assert!(ensure_identifier(&long_ascii, "field").is_err());
+        let long_unicode = "授".repeat(171);
+        assert!(ensure_identifier(&long_unicode, "field").is_err());
+        assert!(ensure_identifier(&"授".repeat(170), "field").is_ok());
     }
 
     #[test]

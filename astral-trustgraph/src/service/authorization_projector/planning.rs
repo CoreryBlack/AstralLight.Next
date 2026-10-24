@@ -592,16 +592,89 @@ pub(crate) fn assemble_continuation_candidate(
 ///
 /// Reference priority and candidate iteration order are preserved. The staging
 /// transaction re-verifies every reused reference under lock.
+/// 段 staging digest 提示缓存（进程级）：键 = `ProjectionKey`（内容寻址：
+/// 键相同 ⇒ 段 grants 相同 ⇒ staging payload 相同 ⇒ digest 相同），值 =
+/// (编译器 content_hash, 上一次真实 encode 的 staging digest_hex)。
+///
+/// 查询命中条件是键与编译器 content_hash **双重匹配**：content_hash 覆盖
+/// compiler_version + key + grants，二者皆等 ⇒ payload 与 digest 必与缓存
+/// 来源一致，跳过 encode 是精确的而非近似的。缓存在发布计划阶段读写，
+/// 频率为每 delta 事件一次，Mutex 无争用热点。
+static SEGMENT_DIGEST_HINTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<policy_engine::ProjectionKey, (String, String)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+const SEGMENT_DIGEST_HINTS_CAP: usize = 20_000;
+
+fn cached_segment_digest(key: &policy_engine::ProjectionKey, content_hash: &str) -> Option<String> {
+    let cache = SEGMENT_DIGEST_HINTS.lock().ok()?;
+    cache
+        .get(key)
+        .filter(|(cached_hash, _)| cached_hash == content_hash)
+        .map(|(_, digest)| digest.clone())
+}
+
+fn remember_segment_digest(
+    key: policy_engine::ProjectionKey,
+    content_hash: String,
+    digest_hex: String,
+) {
+    if let Ok(mut cache) = SEGMENT_DIGEST_HINTS.lock() {
+        if cache.len() >= SEGMENT_DIGEST_HINTS_CAP && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, (content_hash, digest_hex));
+    }
+}
+
+// 仅测试与性能矩阵使用（无提示版 = 提示关闭版）；生产路径一律走
+// `plan_stage_segments_with_hints(..., true)`。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn plan_stage_segments(
     candidate: &HotState,
     parent_references: Option<&[(u64, ParentReferenceView)]>,
 ) -> Result<Vec<StagedSegmentContent>, String> {
+    plan_stage_segments_with_hints(candidate, parent_references, false)
+}
+
+/// 方向 A 生产实现：`use_digest_hints = true` 时，键+content_hash 双重
+/// 命中提示缓存的段跳过 encode（digest 取自缓存——上一次对同一内容的
+/// 真实编码结果），直接与 parent digest 匹配走 ReuseParent；未命中或
+/// 内容变化的段照常 encode 并回填缓存。语义与 `plan_stage_segments`
+/// 完全一致：ReuseParent 仍由 staging 事务在锁下重验。
+pub(crate) fn plan_stage_segments_with_hints(
+    candidate: &HotState,
+    parent_references: Option<&[(u64, ParentReferenceView)]>,
+    use_digest_hints: bool,
+) -> Result<Vec<StagedSegmentContent>, String> {
     let mut plan = Vec::with_capacity(candidate.segments.len());
     let mut lookup = ParentOrdinalLookup::new(parent_references.unwrap_or_default());
-    for (_key, segment) in candidate.segments.iter() {
-        let payload = astral_db::encode_segment_payload(&segment.grants)
-            .map_err(|error| format!("code=auth_projector.segment_encode_failed;error={error}"))?;
-        let digest_hex = hex_lower(&Sha256::digest(&payload));
+    for (key, segment) in candidate.segments.iter() {
+        let digest_hex = if use_digest_hints {
+            match cached_segment_digest(key, &segment.content_hash) {
+                Some(digest) => digest,
+                None => {
+                    let payload =
+                        astral_db::encode_segment_payload(&segment.grants).map_err(|error| {
+                            format!("code=auth_projector.segment_encode_failed;error={error}")
+                        })?;
+                    let digest = hex_lower(&Sha256::digest(&payload));
+                    remember_segment_digest(
+                        key.clone(),
+                        segment.content_hash.clone(),
+                        digest.clone(),
+                    );
+                    digest
+                }
+            }
+        } else {
+            let payload = astral_db::encode_segment_payload(&segment.grants).map_err(|error| {
+                format!("code=auth_projector.segment_encode_failed;error={error}")
+            })?;
+            let digest = hex_lower(&Sha256::digest(&payload));
+            remember_segment_digest(key.clone(), segment.content_hash.clone(), digest.clone());
+            digest
+        };
         match lookup.take(&digest_hex) {
             Some(parent_ordinal) => plan.push(StagedSegmentContent::ReuseParent { parent_ordinal }),
             None => plan.push(StagedSegmentContent::New(
@@ -1100,10 +1173,11 @@ pub(crate) fn decide_event_disposition(input: &EventDecisionInput<'_>) -> EventD
     let parent_references: Option<&[(u64, ParentReferenceView)]> = input
         .publication
         .map(|context| context.parent_references.as_slice());
-    let stage_segments = match plan_stage_segments(&assembled.candidate, parent_references) {
-        Ok(segments) => segments,
-        Err(reason) => return EventDisposition::Quarantine { reason },
-    };
+    let stage_segments =
+        match plan_stage_segments_with_hints(&assembled.candidate, parent_references, true) {
+            Ok(segments) => segments,
+            Err(reason) => return EventDisposition::Quarantine { reason },
+        };
 
     // The authoritative previous fence comes from the observed frontier
     // pointer (`None` ⇒ 0 first-publication sentinel); the publish

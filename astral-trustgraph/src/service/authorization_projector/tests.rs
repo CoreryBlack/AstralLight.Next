@@ -1318,9 +1318,8 @@ fn worker_source_has_no_legacy_channel_symbols() {
     assert!(worker_source.contains("async fn run_worker("));
     assert!(worker_source.contains("async fn act_on_disposition("));
     assert!(worker_source.contains("fn quarantine_reason_parts("));
-    assert!(
-        planning_source.contains("plan_stage_segments(&assembled.candidate, parent_references)")
-    );
+    assert!(planning_source
+        .contains("plan_stage_segments_with_hints(&assembled.candidate, parent_references, true)"));
     // 配置解析归属 config.rs，纯计划归属 planning.rs（拆分后从主文件移出）。
     assert!(config_source.contains("fn parse_projector_tenants("));
     assert!(planning_source.contains("partition_ledger_at_published_frontier("));
@@ -1352,9 +1351,8 @@ fn worker_source_has_no_legacy_channel_symbols() {
     assert!(worker_source.contains("fn quarantine_reason_parts("));
     // Segment reuse is driven by observed parent references (never hard
     // coded None in the production decide path).
-    assert!(
-        planning_source.contains("plan_stage_segments(&assembled.candidate, parent_references)")
-    );
+    assert!(planning_source
+        .contains("plan_stage_segments_with_hints(&assembled.candidate, parent_references, true)"));
 }
 
 /// Watchdog probe / claim-candidate same-shape guard (10.D-2 companion).
@@ -3947,4 +3945,107 @@ fn disposition_kind_mapping_is_total() {
     for (disposition, expected) in cases {
         assert_eq!(disposition.kind(), expected);
     }
+}
+
+// ===== 方向 A：digest 提示缓存的正确性（staging 复用路径）=====
+
+#[test]
+fn digest_hint_cache_reuses_unchanged_segments_and_never_mismatches_content() {
+    let grants: Vec<_> = (0..4)
+        .map(|id| {
+            let mut grant = grant(id, 1, GrantState::Active);
+            grant.resource = format!("learn_subject:{id}");
+            grant
+        })
+        .collect();
+    let candidate = HotState::from_grants(
+        tenant_of(17),
+        4,
+        grants.clone(),
+        DependencyVector::default(),
+    )
+    .unwrap();
+    let references: Vec<_> = candidate
+        .segments
+        .iter()
+        .enumerate()
+        .map(|(index, (_, segment))| {
+            parent_view(
+                index as u64,
+                &hex_lower(&Sha256::digest(
+                    astral_db::encode_segment_payload(&segment.grants).unwrap(),
+                )),
+            )
+        })
+        .collect();
+
+    // 首次：缓存空 → 全部走真实 encode，结果与无提示版本一致。
+    let without = plan_stage_segments(&candidate, Some(&references)).unwrap();
+    let with = plan_stage_segments_with_hints(&candidate, Some(&references), true).unwrap();
+    assert_eq!(without, with);
+
+    // 再次：缓存命中 → 跳过 encode，但结果必须仍与真实 encode 版本一致
+    //（键 + content_hash 双重匹配 ⇒ payload/digest 等价）。
+    let with_again = plan_stage_segments_with_hints(&candidate, Some(&references), true).unwrap();
+    assert_eq!(without, with_again);
+    assert!(with_again
+        .iter()
+        .all(|segment| matches!(segment, StagedSegmentContent::ReuseParent { .. })));
+}
+
+#[test]
+fn digest_hint_cache_content_change_falls_back_to_real_encode() {
+    // 同一 resource 键，但 grant 内容变化（revision 提升）→ 编译器
+    // content_hash 必变 → 缓存 (content_hash, digest) 不匹配 → 回退真实
+    // encode，绝不把旧 digest 冒充新内容。
+    let old_grants: Vec<_> = (0..2)
+        .map(|id| {
+            let mut grant = grant(id, 1, GrantState::Active);
+            grant.resource = format!("learn_subject:{id}");
+            grant
+        })
+        .collect();
+    let old_candidate =
+        HotState::from_grants(tenant_of(17), 1, old_grants, DependencyVector::default()).unwrap();
+    let _ = plan_stage_segments_with_hints(&old_candidate, None, true);
+
+    let new_grants: Vec<_> = (0..2)
+        .map(|id| {
+            let mut grant = grant(id, 2, GrantState::Active);
+            grant.resource = format!("learn_subject:{id}");
+            grant
+        })
+        .collect();
+    let new_candidate = HotState::from_grants(
+        tenant_of(17),
+        2,
+        new_grants.clone(),
+        DependencyVector::default(),
+    )
+    .unwrap();
+    // 新内容：无 parent → 全 New；digest 必须是真实编码的 digest。
+    let planned = plan_stage_segments_with_hints(&new_candidate, None, true).unwrap();
+    for (index, segment) in planned.iter().enumerate() {
+        match segment {
+            StagedSegmentContent::New(plan_grants) => {
+                let expected = hex_lower(&Sha256::digest(
+                    astral_db::encode_segment_payload(plan_grants).unwrap(),
+                ));
+                let actual = plan_stage_segments(&new_candidate, None).unwrap();
+                let actual = match &actual[index] {
+                    StagedSegmentContent::New(grants) => hex_lower(&Sha256::digest(
+                        astral_db::encode_segment_payload(grants).unwrap(),
+                    )),
+                    other => panic!("expected New, got {other:?}"),
+                };
+                assert_eq!(expected, actual);
+            }
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+    // 内容确实变了：plan 里不允许出现针对旧缓存 digest 的 ReuseParent。
+    assert!(planned
+        .iter()
+        .all(|segment| matches!(segment, StagedSegmentContent::New(_))));
+    let _ = new_grants;
 }

@@ -15,6 +15,9 @@ pub mod middleware;
 pub mod service;
 pub mod session_projection_store;
 pub mod session_revocation_registry;
+pub mod task_scheduling;
+#[cfg(test)]
+mod task_scheduling_probe;
 pub mod token_contract;
 pub mod tracing;
 

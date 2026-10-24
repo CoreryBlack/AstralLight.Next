@@ -288,21 +288,31 @@ fn run_threads(
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+/// 计数开关：仅分配计量阶段置位。关闭时计数路径只做一次无争用 Relaxed 读
+/// （缓存行保持共享读态），吞吐/多线程阶段不再被计数器 fetch_add 串行化——
+/// 否则观测本身会制造负扩展假象。
+static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct CountingAlloc;
 
+#[inline]
+unsafe fn count_alloc(bytes: u64) {
+    if COUNTING.load(Ordering::Relaxed) {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
 unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        count_alloc(layout.size() as u64);
         std::alloc::System.alloc(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
         std::alloc::System.dealloc(ptr, layout)
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        ALLOC_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        count_alloc(new_size as u64);
         std::alloc::System.realloc(ptr, layout, new_size)
     }
 }
@@ -349,18 +359,48 @@ fn authorization_ceiling_probe() {
             );
         }
 
-        // 每操作分配（单线程、无计数争用）：证据克隆 + 引擎内部分配。
-        ALLOCS.store(0, Ordering::Relaxed);
-        ALLOC_BYTES.store(0, Ordering::Relaxed);
+        // 每操作分配归因（单线程、计数仅在本阶段开启）：读取面 vs 完整判定。
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         let alloc_ops = 20_000usize;
+        let scope = PublishedCardEvidenceScope {
+            tenant_id: 7,
+            card_id: 1,
+            user_filter: None,
+            domain: astral_types::DomainScopeRequirement::Unconstrained,
+        };
+        COUNTING.store(true, Ordering::Relaxed);
+        ALLOCS.store(0, Ordering::Relaxed);
+        ALLOC_BYTES.store(0, Ordering::Relaxed);
+        for _ in 0..alloc_ops {
+            let _ = rt.block_on(repo.load_published_card_authorization(&scope));
+        }
+        let load_allocs = ALLOCS.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
+        ALLOCS.store(0, Ordering::Relaxed);
+        ALLOC_BYTES.store(0, Ordering::Relaxed);
         for _ in 0..alloc_ops {
             let _ = rt.block_on(engine.evaluate(&ctx, &repo));
         }
-        let allocs = ALLOCS.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
-        let bytes = ALLOC_BYTES.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
-        eprintln!("[{size:>4} grants] per-op: {allocs:.1} allocs, {bytes:.0} bytes");
+        let eval_allocs = ALLOCS.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
+        let eval_bytes = ALLOC_BYTES.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
+        COUNTING.store(false, Ordering::Relaxed);
+        // 归因二分：合同校验（validate）单独的耗时与分配。
+        let va = Instant::now();
+        COUNTING.store(true, Ordering::Relaxed);
+        ALLOCS.store(0, Ordering::Relaxed);
+        for _ in 0..alloc_ops {
+            let _ = repo.evidence.validate();
+        }
+        let validate_allocs = ALLOCS.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
+        COUNTING.store(false, Ordering::Relaxed);
+        let validate_ns = va.elapsed().as_nanos() as f64 / alloc_ops as f64;
+        eprintln!(
+            "[{size:>4} grants] validate alone: {validate_ns:.0} ns, {validate_allocs:.1} allocs"
+        );
+        eprintln!(
+            "[{size:>4} grants] per-op: read-face {load_allocs:.1} | evaluate {eval_allocs:.1} allocs / {eval_bytes:.0} bytes (engine-side ~{:.1})",
+            eval_allocs - load_allocs
+        );
     }
 }

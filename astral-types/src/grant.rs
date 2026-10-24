@@ -116,6 +116,25 @@ fn normalize_identifier(value: &str, field: &'static str) -> GrantContractResult
     Ok(normalized.to_owned())
 }
 
+/// 零分配的校验版 [`normalize_identifier`]：同一套合法性检查，但不产出
+/// 归一化副本——热路径（每次判定的证据合同校验）只关心合法性。
+fn ensure_identifier(value: &str, field: &'static str) -> GrantContractResult<()> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return Err(GrantContractError::EmptyIdentifier { field });
+    }
+    if normalized.len() > 512 {
+        return Err(GrantContractError::IdentifierTooLong { field });
+    }
+    if normalized
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(GrantContractError::MalformedIdentifier { field });
+    }
+    Ok(())
+}
+
 fn validate_positive_id(value: i64, field: &'static str) -> GrantContractResult<()> {
     if value <= 0 {
         Err(GrantContractError::NonPositiveId { field, value })
@@ -652,19 +671,19 @@ pub struct GrantProvenance {
 
 impl GrantProvenance {
     pub fn validate(&self) -> GrantContractResult<()> {
-        normalize_identifier(&self.source_id, "provenance.source_id")?;
+        ensure_identifier(&self.source_id, "provenance.source_id")?;
         if let Some(source_entry) = &self.source_entry {
-            normalize_identifier(source_entry, "provenance.source_entry")?;
+            ensure_identifier(source_entry, "provenance.source_entry")?;
         }
         if let Some(binding_id) = &self.binding_id {
-            normalize_identifier(binding_id, "provenance.binding_id")?;
+            ensure_identifier(binding_id, "provenance.binding_id")?;
         }
         if let Some(delegation_id) = &self.delegation_id {
-            normalize_identifier(delegation_id, "provenance.delegation_id")?;
+            ensure_identifier(delegation_id, "provenance.delegation_id")?;
         }
-        normalize_identifier(&self.operation_id, "provenance.operation_id")?;
+        ensure_identifier(&self.operation_id, "provenance.operation_id")?;
         if let Some(event_id) = &self.event_id {
-            normalize_identifier(event_id, "provenance.event_id")?;
+            ensure_identifier(event_id, "provenance.event_id")?;
         }
         if let Some(actor_user_id) = self.actor_user_id {
             validate_positive_id(actor_user_id, "provenance.actor_user_id")?;
@@ -984,15 +1003,15 @@ impl GrantIdentityKey {
             });
         }
         self.tenant.validate()?;
-        normalize_identifier(&self.aggregate_type, "identity.aggregate_type")?;
-        normalize_identifier(&self.aggregate_id, "identity.aggregate_id")?;
+        ensure_identifier(&self.aggregate_type, "identity.aggregate_type")?;
+        ensure_identifier(&self.aggregate_id, "identity.aggregate_id")?;
         // Both identity scopes are mandatory for every source kind. An empty or
         // malformed source entry would silently merge sibling contributions of
         // the same aggregate onto one shared grant identity, which the ledger
         // then rejects fail-closed (DuplicateActiveGrant); rejection here is
         // cheaper and unambiguous.
-        normalize_identifier(&self.source_entry, "identity.source_entry")?;
-        normalize_identifier(&self.binding_key, "identity.binding_key")?;
+        ensure_identifier(&self.source_entry, "identity.source_entry")?;
+        ensure_identifier(&self.binding_key, "identity.binding_key")?;
         if !source_kind_aligns_with_binding_layer(self.source_kind, self.binding_layer) {
             return Err(GrantContractError::SourceLayerMismatch {
                 source_kind: self.source_kind.as_str(),
@@ -1118,10 +1137,10 @@ impl DeltaEventIdentity<'_> {
     fn validate(&self) -> GrantContractResult<()> {
         validate_positive_id(self.tenant_id, "delta_event.tenant_id")?;
         validate_positive_id(self.aggregate_id, "delta_event.aggregate_id")?;
-        normalize_identifier(self.operation_id, "delta_event.operation_id")?;
-        normalize_identifier(self.aggregate_type, "delta_event.aggregate_type")?;
-        normalize_identifier(self.source_entry, "delta_event.source_entry")?;
-        normalize_identifier(self.mutation_kind, "delta_event.mutation_kind")?;
+        ensure_identifier(self.operation_id, "delta_event.operation_id")?;
+        ensure_identifier(self.aggregate_type, "delta_event.aggregate_type")?;
+        ensure_identifier(self.source_entry, "delta_event.source_entry")?;
+        ensure_identifier(self.mutation_kind, "delta_event.mutation_kind")?;
         Ok(())
     }
 
@@ -1185,8 +1204,8 @@ impl CanonicalGrant {
         self.tenant.validate()?;
         validate_positive_id(self.card_id, "card_id")?;
         validate_positive_id(self.user_id, "user_id")?;
-        normalize_identifier(&self.resource, "resource")?;
-        normalize_identifier(&self.action, "action")?;
+        ensure_identifier(&self.resource, "resource")?;
+        ensure_identifier(&self.action, "action")?;
         self.effect.validate()?;
         self.validity.validate()?;
         self.provenance.validate()?;
@@ -1282,8 +1301,8 @@ pub type CanonicalGrantEvidence = GrantEvidence;
 impl GrantEvidence {
     pub fn validate(&self) -> GrantContractResult<()> {
         self.grant.validate()?;
-        normalize_identifier(&self.event_id, "event_id")?;
-        normalize_identifier(&self.operation_id, "operation_id")?;
+        ensure_identifier(&self.event_id, "event_id")?;
+        ensure_identifier(&self.operation_id, "operation_id")?;
         validate_generation(self.source_generation, "source_generation")?;
         validate_fence(self.source_generation, self.revoke_fence)?;
         self.dependency_vector.validate()?;
@@ -1575,7 +1594,7 @@ impl DependencyVersion {
     }
 
     pub fn validate(&self) -> GrantContractResult<()> {
-        normalize_identifier(&self.dependency_id, "dependency_id")?;
+        ensure_identifier(&self.dependency_id, "dependency_id")?;
         validate_generation(self.generation, "dependency.generation")?;
         validate_fence(self.generation, self.fence)?;
         Ok(())
@@ -1678,7 +1697,7 @@ impl ProjectionEventEnvelope {
         validate_uuid(self.event_id, "event_id")?;
         validate_uuid(self.operation_id, "operation_id")?;
         self.tenant.validate()?;
-        normalize_identifier(&self.aggregate_id, "aggregate_id")?;
+        ensure_identifier(&self.aggregate_id, "aggregate_id")?;
         validate_generation(self.source_generation, "source_generation")?;
         validate_fence(self.source_generation, self.revoke_fence)?;
         self.dependency_vector.validate()?;
@@ -1741,7 +1760,7 @@ pub type SegmentRef = SegmentReference;
 
 impl SegmentReference {
     pub fn validate(&self) -> GrantContractResult<()> {
-        normalize_identifier(&self.segment_id, "segment_id")?;
+        ensure_identifier(&self.segment_id, "segment_id")?;
         validate_generation(self.generation, "segment.generation")?;
         validate_sha256_hex(&self.content_hash, "segment.content_hash")?;
         Ok(())
@@ -2125,10 +2144,10 @@ impl VerifiedPublishedGrantRecord {
         self.grant.validate()?;
         validate_sha256_hex(&self.semantic_hash_hex, "record.semantic_hash_hex")?;
         validate_sha256_hex(&self.dependency_hash_hex, "record.dependency_hash_hex")?;
-        normalize_identifier(&self.aggregate_type, "record.aggregate_type")?;
-        normalize_identifier(&self.event_id, "record.event_id")?;
-        normalize_identifier(&self.operation_id, "record.operation_id")?;
-        normalize_identifier(&self.compiler_version, "record.compiler_version")?;
+        ensure_identifier(&self.aggregate_type, "record.aggregate_type")?;
+        ensure_identifier(&self.event_id, "record.event_id")?;
+        ensure_identifier(&self.operation_id, "record.operation_id")?;
+        ensure_identifier(&self.compiler_version, "record.compiler_version")?;
         validate_positive_id(self.aggregate_id, "record.aggregate_id")?;
         if self.accepted_into_effective_set && self.unaccepted_reason.is_some() {
             return Err(GrantContractError::InvalidProvenance(

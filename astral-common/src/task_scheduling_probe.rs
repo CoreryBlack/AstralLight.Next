@@ -144,18 +144,117 @@ fn measure(fg_threads: usize, bg_threads: usize) -> ForegroundResult {
     }
 }
 
-#[ignore = "release-only scheduling-curve probe; run with --release -- --ignored"]
+/// 接力控制器：三态（延迟模式 / 保护收缩 / 吞吐模式），由实测接力曲线
+/// 调教——bg=0 时曲线平滑（10 线程 p99 1.04ms，可吞吐模式），bg=6 时
+/// 拐点在 4→5 线程（p99 1.25→3.1ms，吞吐增益 <15%）——突破 SLO 时正确
+/// 动作是**收缩到 P 核预算**（保 SLO 牺牲吞吐），而非继续扩池。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayController {
+    pub baseline_threads: usize,
+    pub total_threads: usize,
+    /// p99 SLO：超过即触发保护收缩（fail-safe 优先）。
+    pub p99_slo_ns: u128,
+    /// 吞吐模式准入：仅当 p99 在 SLO 内且吞吐比 ≥ demote 比例才扩池。
+    pub demote_ratio_pct: u64,
+    pub mode: RelayMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayMode {
+    Latency,
+    Throughput,
+}
+
+impl RelayController {
+    pub fn new(baseline_threads: usize, total_threads: usize, p99_slo_ns: u128) -> Self {
+        Self {
+            baseline_threads: baseline_threads.max(1),
+            total_threads: total_threads.max(baseline_threads.max(1)),
+            p99_slo_ns,
+            demote_ratio_pct: 60,
+            mode: RelayMode::Latency,
+        }
+    }
+
+    /// 周期反馈：p99 超 SLO → 立即收缩（任何模式下）；SLO 内且吞吐真实
+    /// （≥ demote 比例，防空闲误报）→ 吞吐模式；SLO 内但吞吐塌了 → 回
+    /// 延迟模式。滞回由吞吐比条件天然提供。
+    pub fn on_sample(&mut self, sustained_p99_ns: u128, throughput_ratio_pct: u64) {
+        if sustained_p99_ns > self.p99_slo_ns {
+            self.mode = RelayMode::Latency;
+            return;
+        }
+        self.mode = if throughput_ratio_pct >= self.demote_ratio_pct {
+            RelayMode::Throughput
+        } else {
+            RelayMode::Latency
+        };
+    }
+
+    pub fn active_threads(&self) -> usize {
+        match self.mode {
+            RelayMode::Latency => self.baseline_threads,
+            RelayMode::Throughput => self.total_threads,
+        }
+    }
+}
+
+/// 接力曲线扫描：线程数 1→10 × 有/无后台风暴，定位延迟模式→吞吐模式的
+/// 拐点（吞吐增益 <15% 而 p99 翻倍的第一个台阶）。
+#[ignore = "release-only relay-curve sweep; run with --release -- --ignored"]
 #[test]
-fn foreground_background_scheduling_curve() {
+fn foreground_relay_curve_sweep() {
     let fg = crate::task_scheduling::foreground_budget();
     let bg = crate::task_scheduling::background_budget();
-    eprintln!("[sched] foreground budget {fg}, background budget {bg}");
-
-    for (fg_threads, bg_threads) in [(fg, 0), (fg, bg), (fg + bg, 0)] {
-        let result = measure(fg_threads, bg_threads);
-        eprintln!(
-            "[sched] foreground {fg_threads:>2} threads + background {bg_threads:>2} threads: {:>10} ops/s | p50={}ns p99={}ns",
-            result.ops_per_second, result.p50, result.p99,
-        );
+    eprintln!(
+        "[relay] foreground budget {fg}, background budget {bg}; sweep 1..={} x background {{0, {bg}}}",
+        fg + bg
+    );
+    for background in [0usize, bg] {
+        let mut previous = (0u128, 0u128);
+        for threads in 1..=(fg + bg) {
+            let result = measure(threads, background);
+            let knee = if previous.0 > 0 {
+                let gain = result.ops_per_second as f64 / previous.0 as f64;
+                let p99_ratio = result.p99 as f64 / previous.1.max(1) as f64;
+                if gain < 1.15 && p99_ratio > 1.8 {
+                    " <-- relay knee (throughput gain <15%, p99 >1.8x)"
+                } else {
+                    ""
+                }
+            } else {
+                ""
+            };
+            eprintln!(
+                "[relay bg={background}] threads {threads:>2}: {:>10} ops/s | p50={}ns p99={}ns{}",
+                result.ops_per_second, result.p50, result.p99, knee,
+            );
+            previous = (result.ops_per_second, result.p99);
+        }
     }
+}
+
+#[test]
+fn relay_controller_transitions_match_the_measured_curve() {
+    // SLO 2ms：来自接力曲线——bg=6 时 4 线程 p99 1.25ms 合规、5 线程
+    // 3.1ms 违规；bg=0 时 10 线程 1.04ms 合规。
+    let mut controller = RelayController::new(4, 10, 2_000_000);
+    assert_eq!(controller.active_threads(), 4);
+
+    // 无后台、p99 合规、吞吐真实 → 吞吐模式（扩池合法）。
+    controller.on_sample(1_000_000, 100);
+    assert_eq!(controller.active_threads(), 10);
+
+    // 后台风暴到来：p99 破 SLO → 立即收缩到 P 核预算（保 SLO）。
+    controller.on_sample(3_100_000, 100);
+    assert_eq!(controller.active_threads(), 4);
+
+    // 收缩后 p99 回到 1.25ms（SLO 内）但吞吐塌了 → 保持延迟模式。
+    controller.on_sample(1_250_000, 30);
+    assert_eq!(controller.active_threads(), 4);
+
+    // 空闲误报：p99 高但吞吐塌 → 不扩池（提升需 p99+吞吐双条件）。
+    let mut idle = RelayController::new(4, 10, 2_000_000);
+    idle.on_sample(3_000_000, 20);
+    assert_eq!(idle.active_threads(), 4);
 }

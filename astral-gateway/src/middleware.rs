@@ -427,6 +427,7 @@ pub(crate) struct SessionGrant {
 }
 
 /// Session grant 校验结果（对齐 Java `SessionGrantVerifier.Verification`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GrantOutcome {
     Match,
     ClaimsMissing,
@@ -435,6 +436,65 @@ enum GrantOutcome {
 }
 
 /// Verify a v2 session grant without collapsing the identity and user-card namespaces.
+/// Redis 兼容会话判定面的纯判定核心。middleware 只负责 Redis 读写与超时；
+/// 拒绝语义（黑名单命中、标量强制比对、REQUIRE 模式 grant 校验、读取失败
+/// fail-closed）全部收敛在这里，可离线穷举测试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedisSessionGate {
+    /// `jwt:revoked:{jti}` 命中 → 401 TOKEN_REVOKED
+    Revoked,
+    /// `access:jti` 缺失或不等于 sub → 401 SESSION_NOT_FOUND
+    SessionNotFound,
+    /// REQUIRE 模式下 grant 校验不通过 → 401 TOKEN_REVOKED
+    GrantRejected,
+    /// 任一所需读取失败或超时 → 503 依赖不可用
+    DependencyUnavailable,
+    Pass,
+}
+
+/// grant 读取三态：模式关闭无需读取 / 读取失败 / 读取成功并校验。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrantRead {
+    NotRequired,
+    ReadFailed,
+    Verified(GrantOutcome),
+}
+
+fn redis_session_gate(
+    revoked: Result<bool, ()>,
+    scalar: Result<Option<&str>, ()>,
+    claims_sub: &str,
+    grant_read: GrantRead,
+    session_grant_claims_mode: &str,
+) -> RedisSessionGate {
+    let Ok(revoked) = revoked else {
+        return RedisSessionGate::DependencyUnavailable;
+    };
+    if revoked {
+        return RedisSessionGate::Revoked;
+    }
+    let Ok(scalar) = scalar else {
+        return RedisSessionGate::DependencyUnavailable;
+    };
+    let scalar_live = scalar.is_some_and(|value| value == claims_sub);
+    if !scalar_live {
+        return RedisSessionGate::SessionNotFound;
+    }
+    let mode = session_grant_claims_mode.to_uppercase();
+    if mode == "EMIT" || mode == "REQUIRE" {
+        match grant_read {
+            GrantRead::ReadFailed => return RedisSessionGate::DependencyUnavailable,
+            GrantRead::Verified(outcome) => {
+                if mode == "REQUIRE" && !matches!(outcome, GrantOutcome::Match) {
+                    return RedisSessionGate::GrantRejected;
+                }
+            }
+            GrantRead::NotRequired => {}
+        }
+    }
+    RedisSessionGate::Pass
+}
+
 fn verify_session_grant(claims: &JwtClaims, grant_json: Option<&str>) -> GrantOutcome {
     let sid = claims.sid;
     let sev = claims.sev;
@@ -1398,82 +1458,49 @@ pub async fn jwt_auth_middleware(
                         )
                     }
                 };
-                let revoked: bool = match tokio::time::timeout(
+                let revoked = match tokio::time::timeout(
                     std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
                     conn.exists::<String, bool>(format!("jwt:revoked:{}", claims.jti)),
                 )
                 .await
                 {
-                    Ok(Ok(value)) => value,
-                    _ => {
-                        return dependency_unavailable(
-                            req.method().as_str(),
-                            &path,
-                            request_trace_id(&req),
-                        )
-                    }
+                    Ok(Ok(value)) => Ok(value),
+                    _ => Err(()),
                 };
-                if revoked {
-                    return json_error(
-                        req.method().as_str(),
-                        &path,
-                        request_trace_id(&req),
-                        401,
-                        "Token has been revoked",
-                        "UNAUTHORIZED",
-                        "TOKEN_REVOKED",
-                    );
-                }
-
-                let scalar: Option<String> = match tokio::time::timeout(
+                let scalar = match tokio::time::timeout(
                     std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
                     conn.get::<_, Option<String>>(format!("access:jti:{}", claims.jti)),
                 )
                 .await
                 {
-                    Ok(Ok(value)) => value,
-                    _ => {
-                        return dependency_unavailable(
-                            req.method().as_str(),
-                            &path,
-                            request_trace_id(&req),
-                        )
-                    }
+                    Ok(Ok(value)) => Ok(value.as_deref()),
+                    _ => Err(()),
                 };
-                let scalar_live = scalar
-                    .as_deref()
-                    .is_some_and(|value| value == claims.sub.as_str());
-                if !scalar_live {
-                    return json_error(
-                        req.method().as_str(),
-                        &path,
-                        request_trace_id(&req),
-                        401,
-                        "Access session not found",
-                        "UNAUTHORIZED",
-                        "SESSION_NOT_FOUND",
-                    );
-                }
-
                 let mode = config.session_grant_claims_mode.to_uppercase();
-                if mode == "EMIT" || mode == "REQUIRE" {
-                    let grant_json: Option<String> = match tokio::time::timeout(
+                let grant_read = if mode == "EMIT" || mode == "REQUIRE" {
+                    match tokio::time::timeout(
                         std::time::Duration::from_secs(REDIS_TIMEOUT_SECS),
                         conn.get::<_, Option<String>>(format!("access:grant:{}", claims.jti)),
                     )
                     .await
                     {
-                        Ok(Ok(value)) => value,
-                        _ => {
-                            return dependency_unavailable(
-                                req.method().as_str(),
-                                &path,
-                                request_trace_id(&req),
-                            )
+                        Ok(Ok(value)) => {
+                            GrantRead::Verified(verify_session_grant(&claims, value.as_deref()))
                         }
-                    };
-                    let outcome = verify_session_grant(&claims, grant_json.as_deref());
-                    if mode == "REQUIRE" && !matches!(outcome, GrantOutcome::Match) {
+                        _ => GrantRead::ReadFailed,
+                    }
+                } else {
+                    GrantRead::NotRequired
+                };
+                match redis_session_gate(
+                    revoked,
+                    scalar,
+                    claims.sub.as_str(),
+                    grant_read,
+                    &config.session_grant_claims_mode,
+                ) {
+                    RedisSessionGate::Pass => {}
+                    RedisSessionGate::Revoked | RedisSessionGate::GrantRejected => {
                         return json_error(
                             req.method().as_str(),
                             &path,
@@ -1484,7 +1511,24 @@ pub async fn jwt_auth_middleware(
                             "TOKEN_REVOKED",
                         );
                     }
-                    // EMIT：grant 读取失败已在上面 fail-closed；校验结果不阻塞（对齐 Java）。
+                    RedisSessionGate::SessionNotFound => {
+                        return json_error(
+                            req.method().as_str(),
+                            &path,
+                            request_trace_id(&req),
+                            401,
+                            "Access session not found",
+                            "UNAUTHORIZED",
+                            "SESSION_NOT_FOUND",
+                        );
+                    }
+                    RedisSessionGate::DependencyUnavailable => {
+                        return dependency_unavailable(
+                            req.method().as_str(),
+                            &path,
+                            request_trace_id(&req),
+                        );
+                    }
                 }
             }
             #[cfg(not(feature = "redis-compat"))]
@@ -1848,6 +1892,149 @@ mod tests {
         assert_eq!(session_bind_context(&unknown).principal_kind, "");
     }
 
+    #[test]
+    fn redis_session_gate_rejects_blacklisted_tokens() {
+        let gate = redis_session_gate(
+            Ok(true),
+            Ok(Some("sub-1")),
+            "sub-1",
+            GrantRead::Verified(GrantOutcome::Match),
+            "REQUIRE",
+        );
+        assert_eq!(gate, RedisSessionGate::Revoked);
+    }
+
+    #[test]
+    fn redis_session_gate_rejects_missing_or_mismatched_scalar_session() {
+        // Missing access:jti key: a stale token must never pass.
+        assert_eq!(
+            redis_session_gate(Ok(false), Ok(None), "sub-1", GrantRead::NotRequired, "OFF"),
+            RedisSessionGate::SessionNotFound
+        );
+        // Residual key carrying a different subject does not resurrect the session.
+        assert_eq!(
+            redis_session_gate(
+                Ok(false),
+                Ok(Some("someone-else")),
+                "sub-1",
+                GrantRead::NotRequired,
+                "OFF"
+            ),
+            RedisSessionGate::SessionNotFound
+        );
+        // Live matching scalar passes when grants are not in play.
+        assert_eq!(
+            redis_session_gate(
+                Ok(false),
+                Ok(Some("sub-1")),
+                "sub-1",
+                GrantRead::NotRequired,
+                "off"
+            ),
+            RedisSessionGate::Pass
+        );
+    }
+
+    #[test]
+    fn redis_session_gate_require_rejects_bad_grants_but_emit_allows() {
+        assert_eq!(
+            redis_session_gate(
+                Ok(false),
+                Ok(Some("sub-1")),
+                "sub-1",
+                GrantRead::Verified(GrantOutcome::Mismatch),
+                "REQUIRE"
+            ),
+            RedisSessionGate::GrantRejected
+        );
+        // EMIT only observes; a non-matching grant never blocks.
+        assert_eq!(
+            redis_session_gate(
+                Ok(false),
+                Ok(Some("sub-1")),
+                "sub-1",
+                GrantRead::Verified(GrantOutcome::Missing),
+                "EMIT"
+            ),
+            RedisSessionGate::Pass
+        );
+        assert_eq!(
+            redis_session_gate(
+                Ok(false),
+                Ok(Some("sub-1")),
+                "sub-1",
+                GrantRead::Verified(GrantOutcome::Match),
+                "REQUIRE"
+            ),
+            RedisSessionGate::Pass
+        );
+    }
+
+    #[test]
+    fn redis_session_gate_fails_closed_on_any_read_failure() {
+        assert_eq!(
+            redis_session_gate(
+                Err(()),
+                Ok(Some("sub-1")),
+                "sub-1",
+                GrantRead::NotRequired,
+                "OFF"
+            ),
+            RedisSessionGate::DependencyUnavailable
+        );
+        assert_eq!(
+            redis_session_gate(Ok(false), Err(()), "sub-1", GrantRead::NotRequired, "OFF"),
+            RedisSessionGate::DependencyUnavailable
+        );
+        assert_eq!(
+            redis_session_gate(
+                Ok(false),
+                Ok(Some("sub-1")),
+                "sub-1",
+                GrantRead::ReadFailed,
+                "REQUIRE"
+            ),
+            RedisSessionGate::DependencyUnavailable
+        );
+        // Read failures outside EMIT/REQUIRE never consult the grant read.
+        assert_eq!(
+            redis_session_gate(
+                Ok(false),
+                Ok(Some("sub-1")),
+                "sub-1",
+                GrantRead::ReadFailed,
+                "OFF"
+            ),
+            RedisSessionGate::Pass
+        );
+    }
+
+    #[test]
+    fn redis_session_gate_revocation_outranks_scalar_and_grant_problems() {
+        // Blacklist hit wins over a mismatched scalar and a rejected grant.
+        assert_eq!(
+            redis_session_gate(
+                Ok(true),
+                Ok(Some("someone-else")),
+                "sub-1",
+                GrantRead::Verified(GrantOutcome::Mismatch),
+                "REQUIRE"
+            ),
+            RedisSessionGate::Revoked
+        );
+        // Scalar mismatch wins over a rejected grant.
+        assert_eq!(
+            redis_session_gate(
+                Ok(false),
+                Ok(None),
+                "sub-1",
+                GrantRead::Verified(GrantOutcome::Mismatch),
+                "REQUIRE"
+            ),
+            RedisSessionGate::SessionNotFound
+        );
+    }
+
     fn claims(sub: &str) -> JwtClaims {
         JwtClaims {
             claims_version: CLAIMS_VERSION,
@@ -1874,6 +2061,72 @@ mod tests {
             iat: 0,
             nbf: 0,
         }
+    }
+
+    fn matching_platform_grant(mutate: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut grant = serde_json::json!({
+            "formatVersion": 2,
+            "principalKind": "PLATFORM_USER",
+            "userId": 42,
+            "sessionId": 1,
+            "identityCardId": 10,
+            "userCardId": 40,
+            "userCardTenantId": 20,
+            "userCardDomainId": 30,
+            "sessionVersion": 1,
+            "sessionEpoch": 1,
+            "tokenFamilyId": 1,
+            "sessionState": "ACTIVE",
+            "issuedAtEpochSecond": 0,
+            "expiresAtEpochSecond": time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+        });
+        mutate(&mut grant);
+        grant.to_string()
+    }
+
+    #[test]
+    fn session_grant_rejects_non_active_session_state() {
+        let grant = matching_platform_grant(|grant| {
+            grant["sessionState"] = serde_json::json!("REVOKED");
+        });
+        assert_eq!(
+            verify_session_grant(&claims("42"), Some(&grant)),
+            GrantOutcome::Mismatch
+        );
+        // State matching stays case-insensitive for the ACTIVE value.
+        let grant = matching_platform_grant(|grant| {
+            grant["sessionState"] = serde_json::json!("active");
+        });
+        assert_eq!(
+            verify_session_grant(&claims("42"), Some(&grant)),
+            GrantOutcome::Match
+        );
+    }
+
+    #[test]
+    fn session_grant_rejects_expired_grants() {
+        let grant = matching_platform_grant(|grant| {
+            grant["expiresAtEpochSecond"] =
+                serde_json::json!(time::OffsetDateTime::now_utc().unix_timestamp() - 10);
+        });
+        assert_eq!(
+            verify_session_grant(&claims("42"), Some(&grant)),
+            GrantOutcome::Mismatch
+        );
+    }
+
+    #[test]
+    fn session_grant_rejects_tokens_issued_before_the_grant() {
+        // claims.iat (0) must not predate the grant issuance; a grant minted
+        // "in the future" relative to the token cannot back it.
+        let grant = matching_platform_grant(|grant| {
+            grant["issuedAtEpochSecond"] =
+                serde_json::json!(time::OffsetDateTime::now_utc().unix_timestamp() + 3600);
+        });
+        assert_eq!(
+            verify_session_grant(&claims("42"), Some(&grant)),
+            GrantOutcome::Mismatch
+        );
     }
 
     #[test]

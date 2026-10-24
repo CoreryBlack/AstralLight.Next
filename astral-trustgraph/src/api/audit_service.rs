@@ -215,82 +215,138 @@ impl AuditDualWriteService {
 
     /// MQ 主路径 + DB 降级双写（核心方法）
     ///
-    /// 对齐 Java `AuditService.sendViaMQ()` (AuditService.java:124-137)：
-    /// 1. 尝试 MQ 发送 → 成功则返回
-    /// 2. MQ 失败 → 降级为 DB 直接写入 (fallbackInsert: AuditService.java:139-158)
-    /// 3. 无论如何都写入 tracing 结构化日志 (record_audit 兜底)
+    /// 编排细节见 [`dispatch_audit_dual_write`]；此处只绑定生产 sink。
     async fn send_via_mq(&self, entry: AuditEntry, category: AuditCategory) {
-        let event_type_str = serde_json::to_value(&entry.event_type)
-            .ok()
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_default();
-
-        // Step 1: MQ 主路径（对齐 Java AuditService.java:127-130）
-        // message_id 必须唯一：audit consumer 以它为 mq_idempotent_log 幂等键，
-        // 恒 None 会回退到 (user,event,action,resource,request) 派生键——permission
-        // 审计的 request_id 恒 None，相同 user+resource+action 的重复判定会被
-        // INSERT IGNORE 丢弃，丢失真实审计行。这里生成 UUID 保证每条唯一。
-        let payload = producer::AuditLogPayload {
-            message_id: Some(uuid::Uuid::new_v4().to_string()),
-            user_id: entry.user_id,
-            card_id: entry.card_id,
-            action: entry.action.clone(),
-            resource: entry.resource.clone(),
-            decision: entry.decision.clone(),
-            reason: entry.reason.clone(),
-            event_type: event_type_str.clone(),
-            source_ip: entry.source_ip.clone(),
-            request_id: entry.request_id.clone(),
-            domain_id: entry.domain_id,
-            tenant_id: entry.tenant_id,
-            // producer detail（例如 data-scope 明细）随消息透传；与 DB fallback
-            // 一致保留 entry.detail，consumer 仅在非空白时落库。
-            detail: entry.detail.clone(),
-        };
-
-        match self.producer.publish_audit_log(payload).await {
-            Ok(()) => {
-                tracing::debug!(
-                    category = ?category,
-                    event_type = %event_type_str,
-                    "audit log sent via MQ"
-                );
-                // MQ 成功，仍写入 tracing 作为备份
-                record_audit(entry);
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    category = ?category,
-                    event_type = %event_type_str,
-                    error = %e,
-                    "MQ send failed, falling back to DB direct insert"
-                );
-            }
-        }
-
-        // Step 2: DB 降级路径（对齐 Java AuditService.java:139-158 fallbackInsert）
-        match astral_db::insert_audit_log(&self.pool, &entry).await {
-            Ok(()) => {
-                tracing::info!(
-                    category = ?category,
-                    event_type = %event_type_str,
-                    "audit log written to DB (fallback path)"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    category = ?category,
-                    event_type = %event_type_str,
-                    error = %e,
-                    "audit log DB fallback insert failed"
-                );
-            }
-        }
-
-        // Step 3: 无论如何都写入 tracing 结构化日志（三级兜底）
-        record_audit(entry);
+        dispatch_audit_dual_write(
+            &ProducerMqSink(&self.producer),
+            &PoolDbSink(&self.pool),
+            entry,
+            category,
+        )
+        .await;
     }
+}
+
+/// 可注入的 MQ 发送面，使降级编排可离线测试。
+#[async_trait::async_trait]
+pub(crate) trait AuditMqSink {
+    async fn publish(&self, payload: producer::AuditLogPayload) -> Result<(), String>;
+}
+
+/// 可注入的 DB 降级写入面。
+#[async_trait::async_trait]
+pub(crate) trait AuditDbSink {
+    async fn insert(&self, entry: &AuditEntry) -> Result<(), String>;
+}
+
+struct ProducerMqSink<'a>(&'a Producer);
+
+#[async_trait::async_trait]
+impl AuditMqSink for ProducerMqSink<'_> {
+    async fn publish(&self, payload: producer::AuditLogPayload) -> Result<(), String> {
+        self.0
+            .publish_audit_log(payload)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+struct PoolDbSink<'a>(&'a MySqlPool);
+
+#[async_trait::async_trait]
+impl AuditDbSink for PoolDbSink<'_> {
+    async fn insert(&self, entry: &AuditEntry) -> Result<(), String> {
+        astral_db::insert_audit_log(self.0, entry)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// 双写路径终态：哪一层实际承接了本条审计。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuditDispatchOutcome {
+    /// MQ 主路径成功（tracing 备份照写）。
+    MqPrimary,
+    /// MQ 失败后 DB 降级成功。
+    DbFallback,
+    /// MQ 与 DB 都失败，仅剩 tracing 结构化日志兜底。
+    TracingOnly,
+}
+
+/// MQ 主路径 + DB 降级 + tracing 兜底的三级编排（对齐 Java
+/// AuditService.java:124-158）。每条审计恰好调用一次 tracing 记录。
+pub(crate) async fn dispatch_audit_dual_write<M: AuditMqSink + Sync, D: AuditDbSink + Sync>(
+    mq: &M,
+    db: &D,
+    entry: AuditEntry,
+    category: AuditCategory,
+) -> AuditDispatchOutcome {
+    let event_type_str = serde_json::to_value(&entry.event_type)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default();
+
+    // Step 1: MQ 主路径。message_id 必须唯一：audit consumer 以它为
+    // mq_idempotent_log 幂等键，恒 None 会回退派生键，导致相同
+    // user+resource+action 的真实审计行被 INSERT IGNORE 丢弃。
+    let payload = producer::AuditLogPayload {
+        message_id: Some(uuid::Uuid::new_v4().to_string()),
+        user_id: entry.user_id,
+        card_id: entry.card_id,
+        action: entry.action.clone(),
+        resource: entry.resource.clone(),
+        decision: entry.decision.clone(),
+        reason: entry.reason.clone(),
+        event_type: event_type_str.clone(),
+        source_ip: entry.source_ip.clone(),
+        request_id: entry.request_id.clone(),
+        domain_id: entry.domain_id,
+        tenant_id: entry.tenant_id,
+        // producer detail（例如 data-scope 明细）随消息透传；与 DB fallback
+        // 一致保留 entry.detail，consumer 仅在非空白时落库。
+        detail: entry.detail.clone(),
+    };
+
+    if let Ok(()) = mq.publish(payload).await {
+        tracing::debug!(
+            category = ?category,
+            event_type = %event_type_str,
+            "audit log sent via MQ"
+        );
+        // MQ 成功，仍写入 tracing 作为备份
+        record_audit(entry);
+        return AuditDispatchOutcome::MqPrimary;
+    }
+    tracing::warn!(
+        category = ?category,
+        event_type = %event_type_str,
+        "MQ send failed, falling back to DB direct insert"
+    );
+
+    // Step 2: DB 降级路径（对齐 Java fallbackInsert）
+    let outcome = match db.insert(&entry).await {
+        Ok(()) => {
+            tracing::info!(
+                category = ?category,
+                event_type = %event_type_str,
+                "audit log written to DB (fallback path)"
+            );
+            AuditDispatchOutcome::DbFallback
+        }
+        Err(error) => {
+            tracing::error!(
+                category = ?category,
+                event_type = %event_type_str,
+                error = %error,
+                "audit log DB fallback insert failed"
+            );
+            AuditDispatchOutcome::TracingOnly
+        }
+    };
+
+    // Step 3: 无论如何都写入 tracing 结构化日志（三级兜底）
+    record_audit(entry);
+    outcome
 }
 
 #[cfg(test)]
@@ -315,6 +371,117 @@ mod tests {
         let event = AuditEventType::IdentityUnbind;
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json.as_str().unwrap(), "IDENTITY_UNBIND");
+    }
+
+    struct FakeMq {
+        fail: bool,
+        calls: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl AuditMqSink for FakeMq {
+        async fn publish(&self, _payload: producer::AuditLogPayload) -> Result<(), String> {
+            *self.calls.lock().unwrap() += 1;
+            if self.fail {
+                Err("mq down".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct FakeDb {
+        fail: bool,
+        calls: std::sync::Mutex<usize>,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AuditDbSink for FakeDb {
+        async fn insert(&self, entry: &AuditEntry) -> Result<(), String> {
+            *self.calls.lock().unwrap() += 1;
+            self.seen.lock().unwrap().push(entry.action.clone());
+            if self.fail {
+                Err("db down".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn audit_entry() -> AuditEntry {
+        AuditEntry {
+            user_id: Some(42),
+            card_id: Some(7),
+            action: "permission-check".into(),
+            resource: "learn_subject".into(),
+            decision: "ALLOW".into(),
+            reason: None,
+            event_type: AuditEventType::PermissionCheck,
+            category: Some(AuditCategory::Permission),
+            source_ip: None,
+            request_id: None,
+            domain_id: None,
+            tenant_id: None,
+            detail: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mq_primary_success_never_touches_the_db_sink() {
+        let mq = FakeMq {
+            fail: false,
+            calls: std::sync::Mutex::new(0),
+        };
+        let db = FakeDb {
+            fail: false,
+            calls: std::sync::Mutex::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let outcome =
+            dispatch_audit_dual_write(&mq, &db, audit_entry(), AuditCategory::Permission).await;
+        assert_eq!(outcome, AuditDispatchOutcome::MqPrimary);
+        assert_eq!(*mq.calls.lock().unwrap(), 1);
+        assert_eq!(
+            *db.calls.lock().unwrap(),
+            0,
+            "MQ success must skip the DB path"
+        );
+    }
+
+    #[tokio::test]
+    async fn mq_failure_falls_back_to_the_db_sink() {
+        let mq = FakeMq {
+            fail: true,
+            calls: std::sync::Mutex::new(0),
+        };
+        let db = FakeDb {
+            fail: false,
+            calls: std::sync::Mutex::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let outcome =
+            dispatch_audit_dual_write(&mq, &db, audit_entry(), AuditCategory::Permission).await;
+        assert_eq!(outcome, AuditDispatchOutcome::DbFallback);
+        assert_eq!(*db.calls.lock().unwrap(), 1);
+        assert_eq!(db.seen.lock().unwrap().as_slice(), ["permission-check"]);
+    }
+
+    #[tokio::test]
+    async fn mq_and_db_failure_end_at_the_tracing_floor() {
+        let mq = FakeMq {
+            fail: true,
+            calls: std::sync::Mutex::new(0),
+        };
+        let db = FakeDb {
+            fail: true,
+            calls: std::sync::Mutex::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let outcome =
+            dispatch_audit_dual_write(&mq, &db, audit_entry(), AuditCategory::Permission).await;
+        assert_eq!(outcome, AuditDispatchOutcome::TracingOnly);
+        assert_eq!(*db.calls.lock().unwrap(), 1);
     }
 
     #[test]

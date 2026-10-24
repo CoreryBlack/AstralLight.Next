@@ -52,6 +52,10 @@ pub mod local_projection_snapshot;
 pub mod memory_projection_hub;
 mod migration;
 mod mq_idempotency_repository;
+
+/// 测试支撑门控出口：契约级内存租约存储仅在 test 或 test-support 下可见。
+#[cfg(any(test, feature = "test-support"))]
+pub use mq_idempotency_repository::testing;
 pub mod org_scope_repository;
 mod permission_query;
 mod projection;

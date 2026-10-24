@@ -66,7 +66,11 @@ impl RateLimiter {
             counter.count = 0;
             counter.window_start = now;
         }
-        if counter.count >= self.config.requests_per_second as u64 {
+        // 突发余量：burst_size 允许单个 1s 窗口内短时超过稳态速率
+        // （cap = requests_per_second + burst_size），窗口重置后回到稳态
+        // 预算；此前该配置项被静默忽略。
+        let cap = self.config.requests_per_second as u64 + self.config.burst_size as u64;
+        if counter.count >= cap {
             false
         } else {
             counter.count += 1;
@@ -187,11 +191,28 @@ mod tests {
     }
 
     #[test]
-    fn test_rate_limiter_under_limit() {
-        let limiter = RateLimiter::new(test_config());
+    fn strict_cap_applies_when_burst_is_zero() {
+        let config = RateLimitCfg {
+            enabled: true,
+            requests_per_second: 2,
+            burst_size: 0,
+        };
+        let limiter = RateLimiter::new(config);
         assert!(limiter.check("a"));
         assert!(limiter.check("a"));
         assert!(!limiter.check("a")); // 第 3 个超限
+    }
+
+    #[test]
+    fn burst_size_adds_in_window_headroom() {
+        // rps=2 + burst=4：单窗口内允许 6 次，第 7 次拒绝。
+        let limiter = RateLimiter::new(test_config());
+        for _ in 0..6 {
+            assert!(limiter.check("a"));
+        }
+        assert!(!limiter.check("a"));
+        // 突发余量按 key 隔离，不影响其他客户端。
+        assert!(limiter.check("b"));
     }
 
     #[test]

@@ -44,16 +44,21 @@ code for configured failure fixtures.
 From the repository root, run the selected Rust contracts:
 
 ```bash
+cargo test -p test-harness --locked --lib e4_preconditions::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib e3_e4_events::tests:: -- --test-threads=1
 cargo test -p test-harness --locked --lib e3_reconciliation::tests:: -- --test-threads=1
 cargo test -p test-harness --locked --lib e4_protocol::tests:: -- --test-threads=1
 ```
 
-These Rust suites cover typed reconciliation and protocol rules only; they do not
-replace the probe adapter, SQL/Redis/HTTP restrictions, precondition capture, or
-sampling tests. `e3_e4.py --self-test` is retained as a fail-closed compatibility
-response and exits nonzero with `BLOCKED`; it does not discover archived tests.
-No database, cache, service, container, migration, or network access is involved
-in the Rust offline tests.
+`e4_preconditions::tests::` uses an in-memory typed fake to check SELECT-only scalar
+capture, the MySQL 5.7 isolation fallback, the Redis GET allowlist, clock skew,
+fail-closed status folding, and host scrubbing. It does not invoke a live probe or
+prove any deployed database/cache state. `e3_e4_events::tests::` checks offline log
+parsing and request-terminal rules. The E3 sampling, signed HTTP transport and full
+probe lifecycle remain outside these contracts. `e3_e4.py --self-test` is retained
+as a fail-closed compatibility response and exits nonzero with `BLOCKED`; it does
+not discover archived tests. No database, cache, service, container, migration,
+or network access is involved in the Rust offline tests.
 
 ## Limitations
 
@@ -62,10 +67,11 @@ recovery behavior. A successful fixture validator checks only the fixture struct
 it does not prove a live run. HTTP `ALLOW` observations also require request-side
 admission-event reconciliation before treating them as final.
 
-The Rust `e3_reconciliation` and `e4_protocol` modules cover selected typed,
-post-parse evidence and protocol rules only. They do not implement this module's
-`ReadOnlyProbe`, SQL/Redis/HTTP adapter restrictions, precondition capture, or
-sampling lifecycle. The archived Python test source is a migration reference,
-not an executable fallback; `e3-e4-read-only-probe-parity` remains `BLOCKED` in
-[`../../../tests-suite/MANIFEST.toml`](../../../tests-suite/MANIFEST.toml) until
-those contracts are implemented in Rust.
+The Rust `e4_preconditions` module covers the offline typed fake-probe contract
+for E4 precondition capture; `e3_e4_events`, `e3_reconciliation`, and `e4_protocol`
+cover their separately registered parser, evidence, and protocol boundaries. They
+do not establish live database/cache state, implement E3 interval sampling, or
+prove signed HTTP transport and worker readiness. The archived Python test source
+is a migration reference, not an executable fallback; the full
+`e3-e4-read-only-probe-parity` suite remains `BLOCKED` in
+[`../../../tests-suite/MANIFEST.toml`](../../../tests-suite/MANIFEST.toml).

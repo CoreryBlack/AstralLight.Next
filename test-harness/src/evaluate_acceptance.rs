@@ -826,6 +826,13 @@ fn median(values: &[f64]) -> f64 {
 }
 
 pub fn check_evaluate_performance(stdout: &str) -> Value {
+    check_evaluate_performance_value(&Value::String(stdout.to_owned()))
+}
+
+pub fn check_evaluate_performance_value(stdout: &Value) -> Value {
+    let Some(stdout) = stdout.as_str() else {
+        return fail("stdout must be a string");
+    };
     match check_evaluate_performance_inner(stdout) {
         Ok(value) => value,
         Err(reason) => fail(reason),
@@ -970,6 +977,31 @@ mod tests {
     fn end() -> Value {
         json!({"schema":SCHEMA,"status":"PASS","cases":45,"samples":810,"measurements":2430,"postconditions":{"workersJoined":true,"allDecisionsChecked":true,"allReadCountsChecked":true}})
     }
+    fn mutate_record(output: &str, prefix: &str, mutate: impl FnOnce(&mut Value)) -> String {
+        let mut mutate = Some(mutate);
+        let mut changed = false;
+        let mut lines = Vec::new();
+        for line in output.lines() {
+            let Some(payload) = line.strip_prefix(&format!("{prefix} ")) else {
+                lines.push(line.to_owned());
+                continue;
+            };
+            if changed {
+                lines.push(line.to_owned());
+                continue;
+            }
+            changed = true;
+            let mut value: Value = serde_json::from_str(payload).unwrap();
+            mutate.take().unwrap()(&mut value);
+            lines.push(format!(
+                "{prefix} {}",
+                serde_json::to_string(&value).unwrap()
+            ));
+        }
+        assert!(changed, "fixture contains {prefix}");
+        lines.join("\n") + "\n"
+    }
+
     pub(super) fn valid_stdout() -> String {
         let mut lines = vec![format!("EVALUATE_PERF_META {}", meta())];
         for (_name, grants, threads, outcome) in expected_cases() {
@@ -982,6 +1014,14 @@ mod tests {
         lines.push("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 864 filtered out; finished in 12.34s".to_owned());
         lines.join("\n") + "\n"
     }
+    #[test]
+    fn public_acceptance_rejects_non_string_stdout_without_panicking() {
+        let result = check_evaluate_performance_value(&Value::Null);
+        assert_eq!(result["status"], "FAIL");
+        assert_eq!(result["performance"], Value::Null);
+        assert_eq!(result["verified_postcondition"]["complete"], false);
+    }
+
     #[test]
     fn complete_policy_evaluate_protocol_is_accepted_without_speed_threshold() {
         let output = valid_stdout();
@@ -1101,5 +1141,187 @@ mod tests {
         assert_eq!(first, second);
         assert!((first.0 - 0.8709967875166152).abs() < 1e-12);
         assert!((first.1 - 1.2294281908073685).abs() < 1e-12);
+    }
+
+    #[test]
+    fn python_test_rejects_footer_placement_and_count_mutations() {
+        let good = valid_stdout();
+        let footer = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 864 filtered out; finished in 12.34s\n";
+        let protocol = good
+            .lines()
+            .filter(|line| !line.starts_with("test result: "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let with_test_name = format!(
+            "running 1 test\n{protocol}\ntest policy_evaluate_complete_benefit_matrix ... ok\n{footer}"
+        );
+        let accepted = check_evaluate_performance(&with_test_name);
+        assert_eq!(accepted["status"], "PASS", "{}", accepted["reason"]);
+        for malformed in [
+            format!("{footer}{good}"),
+            format!("{good}{footer}{footer}"),
+            good.replace("1 passed", "0 passed"),
+            good.replace("0 ignored", "1 ignored"),
+        ] {
+            assert_eq!(check_evaluate_performance(&malformed)["status"], "FAIL");
+        }
+    }
+
+    #[test]
+    fn python_test_rejects_malformed_json_meta_topology_and_debug_markers() {
+        for input in [
+            "EVALUATE_PERF_META {\"schema\":NaN}\n",
+            "EVALUATE_PERF_META {\"schema\":\"one\",\"schema\":\"two\"}\n",
+            "EVALUATE_PERF_META {\"schema\":\"unterminated}\n",
+        ] {
+            assert_eq!(check_evaluate_performance(input)["status"], "FAIL");
+        }
+        let good = valid_stdout();
+        let invalid_meta = [
+            mutate_record(&good, "EVALUATE_PERF_META", |meta| {
+                meta["samplesPerCase"] = json!(true)
+            }),
+            mutate_record(&good, "EVALUATE_PERF_META", |meta| {
+                meta["grantSizes"][0] = json!(true)
+            }),
+            mutate_record(&good, "EVALUATE_PERF_META", |meta| {
+                meta["threads"] = json!([1, 4, 7])
+            }),
+            mutate_record(&good, "EVALUATE_PERF_META", |meta| {
+                meta["controls"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("crossSecondExpiry");
+            }),
+            mutate_record(&good, "EVALUATE_PERF_META", |meta| {
+                meta["premises"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("scopeExclusions");
+            }),
+            mutate_record(&good, "EVALUATE_PERF_META", |meta| {
+                meta["controls"]["denyOneRead"] = json!(1)
+            }),
+            mutate_record(&good, "EVALUATE_PERF_META", |meta| {
+                meta["debugAssertions"] = json!(true)
+            }),
+            mutate_record(&good, "EVALUATE_PERF_META", |meta| {
+                meta["buildProfile"] = json!("debug")
+            }),
+        ];
+        for input in invalid_meta {
+            assert_eq!(check_evaluate_performance(&input)["status"], "FAIL");
+        }
+    }
+
+    #[test]
+    fn python_test_rejects_case_topology_boolean_and_order_mutations() {
+        let good = valid_stdout();
+        let invalid_cases = [
+            mutate_record(&good, "EVALUATE_PERF_CASE", |row| {
+                row["decisionsPerThread"] = json!(255)
+            }),
+            mutate_record(&good, "EVALUATE_PERF_CASE", |row| {
+                row["grants"] = json!(true)
+            }),
+            mutate_record(&good, "EVALUATE_PERF_CASE", |row| {
+                row["threads"] = json!(true)
+            }),
+            mutate_record(&good, "EVALUATE_PERF_CASE", |row| {
+                row["samples"][0]["order"] =
+                    json!(["production-clock", "forced-assembly", "cached-fixed-second"])
+            }),
+            mutate_record(&good, "EVALUATE_PERF_CASE", |row| {
+                row["samples"].as_array_mut().unwrap().pop();
+            }),
+        ];
+        for input in invalid_cases {
+            assert_eq!(check_evaluate_performance(&input)["status"], "FAIL");
+        }
+    }
+
+    #[test]
+    fn python_test_rejects_measurement_count_cache_and_timing_mutations() {
+        let good = valid_stdout();
+        let mutations = [
+            ("allowed", 0, "cached-fixed-second"),
+            ("denied", 1, "production-clock"),
+            ("pending", 1, "forced-assembly"),
+            ("mismatches", 1, "production-clock"),
+            ("legacyReads", 1, "cached-fixed-second"),
+            ("cardChecks", 0, "forced-assembly"),
+            ("orgReads", 0, "forced-assembly"),
+            ("evidenceReads", 1, "production-clock"),
+            ("scopedReads", 1, "production-clock"),
+            ("evidenceGrants", 1, "production-clock"),
+            ("cacheHits", 0, "cached-fixed-second"),
+            ("cacheHits", 1, "forced-assembly"),
+            ("wallNs", 1, "production-clock"),
+            ("wallNs", 200, "production-clock"),
+            ("initialEvidenceNs", 0, "production-clock"),
+            ("finalEvidenceNs", 0, "cached-fixed-second"),
+        ];
+        for (field, value, arm) in mutations {
+            let input = mutate_record(&good, "EVALUATE_PERF_CASE", |row| {
+                row["samples"][0]["measurements"][arm][field] = json!(value)
+            });
+            assert_eq!(
+                check_evaluate_performance(&input)["status"],
+                "FAIL",
+                "{field}/{arm}"
+            );
+        }
+        let bool_latency = mutate_record(&good, "EVALUATE_PERF_CASE", |row| {
+            row["samples"][0]["measurements"]["cached-fixed-second"]["latencyNs"][0] = json!(true);
+        });
+        let zero_latency = mutate_record(&good, "EVALUATE_PERF_CASE", |row| {
+            row["samples"][0]["measurements"]["cached-fixed-second"]["latencyNs"][0] = json!(0);
+        });
+        let bool_cache_hits = mutate_record(&good, "EVALUATE_PERF_CASE", |row| {
+            row["samples"][0]["measurements"]["cached-fixed-second"]["cacheHits"] = json!(true);
+        });
+        for input in [bool_latency, zero_latency, bool_cache_hits] {
+            assert_eq!(check_evaluate_performance(&input)["status"], "FAIL");
+        }
+        let short_latency = mutate_record(&good, "EVALUATE_PERF_CASE", |row| {
+            row["samples"][0]["measurements"]["cached-fixed-second"]["latencyNs"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+        });
+        assert_eq!(check_evaluate_performance(&short_latency)["status"], "FAIL");
+    }
+
+    #[test]
+    fn python_test_deny_footer_and_wrong_input_preserve_fail_closed_results() {
+        let good = valid_stdout();
+        let deny = mutate_record(&good, "EVALUATE_PERF_CASE", |row| {
+            row["outcome"] = json!("deny");
+            let grants = row["grants"].as_u64().unwrap();
+            let threads = row["threads"].as_u64().unwrap();
+            for arm in ARMS {
+                row["samples"][0]["measurements"][arm] = measurement(arm, grants, threads, "deny");
+            }
+        });
+        assert_eq!(check_evaluate_performance(&deny)["status"], "FAIL");
+        let mut invalid_end = end();
+        invalid_end["cases"] = json!(44);
+        assert!(validate_end(&invalid_end).is_err());
+        invalid_end = end();
+        invalid_end["samples"] = json!(809);
+        assert!(validate_end(&invalid_end).is_err());
+        invalid_end = end();
+        invalid_end["measurements"] = json!(2429);
+        assert!(validate_end(&invalid_end).is_err());
+        invalid_end = end();
+        invalid_end["postconditions"]["workersJoined"] = json!(false);
+        assert!(validate_end(&invalid_end).is_err());
+        invalid_end = end();
+        invalid_end["postconditions"]["extra"] = json!(true);
+        assert!(validate_end(&invalid_end).is_err());
+        invalid_end = end();
+        invalid_end["measurements"] = json!(true);
+        assert!(validate_end(&invalid_end).is_err());
+        assert_eq!(check_evaluate_performance("")["status"], "FAIL");
     }
 }

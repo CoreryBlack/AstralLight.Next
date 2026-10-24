@@ -341,6 +341,24 @@ mod tests {
             30,
             1_700_000_040_001
         ));
+        // A zero or negative tolerance must reject everything, including an
+        // exact timestamp match: there is no window to be inside of.
+        assert!(!timestamp_is_within_tolerance(
+            "1700000000000",
+            0,
+            1_700_000_000_000
+        ));
+        assert!(!timestamp_is_within_tolerance(
+            "1700000000000",
+            -30,
+            1_700_000_000_000
+        ));
+        // The boundary of a positive window is inclusive.
+        assert!(timestamp_is_within_tolerance(
+            "1700000000000",
+            30,
+            1_700_000_030_000
+        ));
     }
 
     #[test]

@@ -189,15 +189,22 @@ COMMANDS: list[dict[str, Any]] = [
     },
     {
         "id": "e5-bounded-model-two-mutations",
+        "argv": ["cargo", "test", "--manifest-path", str(RUST / "Cargo.toml"), "-p", "test-harness", "--locked", "--lib", "two_mutation_model::tests::", "--", "--test-threads=1"],
+        "required": True,
+        "expected": "; 0 failed",
+        "timeoutSeconds": 1800,
+    },
+    {
+        "id": "e5-two-mutation-worker-shards",
         "status": "BLOCKED",
         "required": True,
-        "reason": "equivalent Rust two-mutation state-space and reducer are not implemented; archived Python reference is not dispatched",
+        "reason": "ProcessPoolExecutor parity, Rust model-derived trace sharding, complete shard result merge and serial/parallel report parity are not implemented; the two-mutation offline model suite is narrower",
     },
     {
         "id": "e5-universal-hypotheses",
         "status": "BLOCKED",
         "required": True,
-        "reason": "equivalent Rust universal-hypothesis computation over both models is not implemented; archived Python reference is not dispatched",
+        "reason": "the Rust U1-U10 evaluator contract is fixture-driven only; complete enumeration and validated aggregate evidence over actual single- and two-mutation runs remain unverified, so the archived Python reference is not dispatched",
     },
 ]
 
@@ -207,6 +214,16 @@ HASHED_SOURCES = [
     "test-harness/Cargo.toml",
     "tests-suite/MANIFEST.toml",
     "test-harness/src/lib.rs",
+    "test-harness/src/e3_e4_events.rs",
+    "test-harness/src/e3_report.rs",
+    "test-harness/src/e4_fault_lifecycle.rs",
+    "test-harness/src/e4_preconditions.rs",
+    "test-harness/src/node_adapter_contract.rs",
+    "test-harness/src/readiness_contract.rs",
+    "test-harness/src/bounded_execution_contract.rs",
+    "test-harness/src/two_mutation_model.rs",
+    "test-harness/src/projection_owner_model.rs",
+    "test-harness/src/universal_hypotheses.rs",
     "test-harness/src/campaign.rs",
     "test-harness/src/acceptance.rs",
     "test-harness/src/evaluate_acceptance.rs",
@@ -570,7 +587,7 @@ def main(argv: list[str] | None = None) -> int:
         "runtimePreflight": preflight,
         "statisticsUnit": {
             "E2": "one in-memory paired scenario per omission control; five one-shot controls, no repeated-run distribution",
-            "E5": "Rust single-mutation abstract model only; two-mutation and universal-hypothesis migrations are BLOCKED, not dispatched",
+            "E5": "This readiness command runs the single- and two-mutation abstract Rust model targets; U1-U10 evaluator fixtures are registered separately, while full two-model universal enumeration and worker/shard parity remain BLOCKED and are not dispatched",
             "E1/E3/E4": "not run",
         },
         "coverage": {

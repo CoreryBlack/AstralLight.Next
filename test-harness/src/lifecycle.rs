@@ -56,14 +56,17 @@ pub struct Percentiles {
     pub p99_ns: u64,
 }
 
-fn percentile(values: &[u64], rank_percent: usize) -> Option<u64> {
-    if values.is_empty() || ![50, 95, 99].contains(&rank_percent) {
-        return None;
+fn percentile(values: &[u64], rank_percent: usize) -> Result<Option<u64>, &'static str> {
+    if ![50, 95, 99].contains(&rank_percent) {
+        return Err("only p50, p95, and p99 are supported");
+    }
+    if values.is_empty() {
+        return Ok(None);
     }
     let mut ordered = values.to_vec();
     ordered.sort_unstable();
     let rank = (ordered.len() * rank_percent).div_ceil(100).max(1);
-    ordered.get(rank - 1).copied()
+    Ok(ordered.get(rank - 1).copied())
 }
 
 fn report(
@@ -79,16 +82,22 @@ fn report(
     }
     let percentiles = values
         .into_iter()
-        .filter_map(|(stage, values)| {
-            Some((
+        .map(|(stage, values)| {
+            (
                 stage,
                 Percentiles {
                     samples: values.len(),
-                    p50_ns: percentile(&values, 50)?,
-                    p95_ns: percentile(&values, 95)?,
-                    p99_ns: percentile(&values, 99)?,
+                    p50_ns: percentile(&values, 50)
+                        .expect("supported percentile")
+                        .expect("non-empty sample"),
+                    p95_ns: percentile(&values, 95)
+                        .expect("supported percentile")
+                        .expect("non-empty sample"),
+                    p99_ns: percentile(&values, 99)
+                        .expect("supported percentile")
+                        .expect("non-empty sample"),
                 },
-            ))
+            )
         })
         .collect();
     let status = if !samples.is_empty() && unknown.is_empty() {
@@ -431,6 +440,37 @@ mod tests {
         assert_eq!(result.samples, 0);
         assert_eq!(result.unknown["req-1"], ["missing:initial_evidence_load"]);
 
+        let mut missing_final = complete_e1();
+        missing_final.retain(|event| event.sequence != 5);
+        assert_eq!(
+            reduce_e1(&missing_final).unknown["req-1"],
+            ["missing:final_evidence_load"]
+        );
+        let mut ambiguous_final = complete_e1();
+        ambiguous_final[5].sequence = 7;
+        ambiguous_final[5].wall_unix_ns = 7_000;
+        ambiguous_final[6].sequence = 8;
+        ambiguous_final[6].wall_unix_ns = 8_000;
+        ambiguous_final[7].sequence = 9;
+        ambiguous_final[7].wall_unix_ns = 9_000;
+        ambiguous_final.push(e1(6, "evidence_load_result"));
+        assert_eq!(
+            reduce_e1(&ambiguous_final).unknown["req-1"],
+            ["ambiguous:final_evidence_load"]
+        );
+        let mut ambiguous_initial = complete_e1();
+        ambiguous_initial[1].sequence = 3;
+        ambiguous_initial[1].wall_unix_ns = 3_000;
+        for event in &mut ambiguous_initial[2..] {
+            event.sequence += 1;
+            event.wall_unix_ns += 1_000;
+        }
+        ambiguous_initial.push(e1(2, "evidence_load_result"));
+        assert_eq!(
+            reduce_e1(&ambiguous_initial).unknown["req-1"],
+            ["ambiguous:initial_evidence_load"]
+        );
+
         let mut cross_epoch = complete_e1();
         cross_epoch.last_mut().unwrap().process_observation_id = "proc-b".into();
         assert_eq!(reduce_e1(&cross_epoch).unknown["req-1"], ["cross_epoch"]);
@@ -450,6 +490,7 @@ mod tests {
         ];
         let result = reduce_e3(&complete);
         assert_eq!(result.status, "PASS");
+        assert_eq!(result.samples, 1);
         assert_eq!(result.percentiles["claim_to_terminal"].p95_ns, 4_000);
 
         let mut restarted = complete.to_vec();
@@ -497,9 +538,18 @@ mod tests {
             reduce_cross_node_interval("node-a", 200, "node-a", 100, false),
             Err("wall_clock_order")
         );
-        assert_eq!(percentile(&[10, 1, 7, 4, 3, 2, 9, 5, 8, 6], 50), Some(5));
-        assert_eq!(percentile(&[10, 1, 7, 4, 3, 2, 9, 5, 8, 6], 95), Some(10));
-        assert_eq!(percentile(&[], 50), None);
-        assert_eq!(percentile(&[1], 90), None);
+        assert_eq!(
+            percentile(&[10, 1, 7, 4, 3, 2, 9, 5, 8, 6], 50),
+            Ok(Some(5))
+        );
+        assert_eq!(
+            percentile(&[10, 1, 7, 4, 3, 2, 9, 5, 8, 6], 95),
+            Ok(Some(10))
+        );
+        assert_eq!(percentile(&[], 50), Ok(None));
+        assert_eq!(
+            percentile(&[1], 90),
+            Err("only p50, p95, and p99 are supported")
+        );
     }
 }

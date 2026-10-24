@@ -203,4 +203,6 @@ impl Default for PolicyEngine {
     }
 }
 #[cfg(test)]
+mod ceiling_probe;
+#[cfg(test)]
 mod tests;

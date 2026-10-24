@@ -138,21 +138,29 @@ runner 不自动修源码、不盲目重试、不缓存历史 PASS。
 Authorization validation 的 19 个旧 Python 测试模块已移入
 [`Docs/authorization-validation/archive/python-tests/`](../Docs/authorization-validation/archive/python-tests/README.md)，
 不再由 `unittest discover` 或 readiness campaign 运行。Rust targets 是当前测试入口；
-归档清单逐项记录其映射与覆盖边界。未迁移合同仍在 `MANIFEST.toml` 标为 `BLOCKED`，
+归档清单逐项记录其映射与覆盖边界。逐方法 crosswalk 已把全部 622 个归档方法映射到命名的
+Rust 测试（离线/注入输入范围）；`MANIFEST.toml` 中剩余的 `BLOCKED` suite 是 live、
+部署、ProcessPool 或外部工具的运行证据缺口，不代表仍有未迁移的 Python 测试。
 归档源文件不构成 PASS 或 fallback。
 
-RQ1-5 是主标签;`RQ-A` / `RQ-B` / `RQ-Compare` / `RQ5-E` 子系列已登记,
-其中 RQ-A/RQ-B/RQ-Compare 需要外部 comparator/SpiceDB,RQ5-E 需要 live
-signed HTTP/三节点环境,当前均为 BLOCKED。逐项状态见
+RQ1-5 是主标签;`RQ-A` / `RQ-B` / `RQ-Compare` / `RQ5-E` 子系列已登记。
+RQ-A/RQ-B/RQ-Compare 的外部 comparator/paper-scale 运行和 RQ5-E 的 live
+signed HTTP/三节点运行未在本机验证；MANIFEST 为这些项登记了 Rust gate/static
+contract，boundary 明确 live 未执行，不能据此宣称 live PASS。逐项证据边界见
 [`Docs/测试/RQ子系列覆盖账本_2026-10-20.md`](../Docs/测试/RQ子系列覆盖账本_2026-10-20.md)。
 RQ2-D 是结构性 N/A。M1-5 是
 source capture、monotone publication、faithful representation、trusted
 storage/processes、complete mediation 假设映射，不是五个独立证明，也不是
 架构交付 M1-M3。E1-5 保留独立协议、模型与 live campaign；E2 的五个精确
 Rust 目标必须各执行一例，host_mediation 仍为 model-only。E5 单 mutation 已由 Rust
-显式状态空间与旧报告 fixture 差分覆盖；双 mutation、universal hypotheses 与
-projection-owner BFS 仍是独立 BLOCKED 项。MT-E1/E3/E4/E5/E6
-保持真实 MySQL suite，未实现的 MT-E2 明确 BLOCKED，不补造一个成功编号。
+显式状态空间与旧报告 fixture 差分覆盖；双 mutation 的 strict 完整界已有独立
+离线合同，bracket omission 仍只找到有限反例且不完整；worker/shard parity 由
+Rust scoped-thread suite 覆盖并逐字段对照串行报告。projection-owner 有限 BFS 与
+U1-U10 evaluator fixture contract 已登记为 Rust 离线 suite；完整双模型 universal
+枚举由 `e5-universal-bounded` 的 release suite 实际执行，fixture 仍不算模型运行证据。
+MT-E1/E3/E4/E5/E6
+保持真实 MySQL suite；MT-E2 尚无实现，MANIFEST 只保留显式的 unimplemented
+占位合同，不补造成功编号，也不把占位合同当作 MT-E2 已覆盖。
 
 CPU-only 的三组 `PERF_MATRIX` 还须分别输出完整 82/15/40 个唯一 case、
 每项至少 15 个有效样本，原始指标进入同一份 result.json；只执行一个 Rust

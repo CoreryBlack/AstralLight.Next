@@ -87,41 +87,85 @@ and are no longer current executable gates:
   T1/T3/T4/T5 registry rather than inventing one.
 - `unbounded_confirmation::tests::` checks event-chain closure for the Rust
   single-mutation model in bracket/strict modes with all premises enabled and
-  disabled, and compares its default and maximum bounds in both modes. Rust C1
-  remains `BLOCKED` because the two-mutation model is absent; C2 covers only the
-  single model, and C3/C4 remain `UNKNOWN`. This is not parity with the Python
+  disabled, compares its default and maximum bounds, and pins C1/C2 report fields
+  plus explicit C3/C4 obligations. The same contract checks two-mutation
+  event-chain closure for C1, while C2's bound-invariance report remains
+  single-model only; C3/C4 remain `UNKNOWN`. This is not parity with the Python
   checker's two-model C1/C2 report.
+- `two_mutation_model::tests::` executes the abstract Rust two-mutation model
+  at the complete strict-mode bound and checks strict omission outcomes,
+  cross-mutation torn states, rollback/read timing, fail-closed admissions,
+  mutation attribution, and bounded bracket omission counterexamples. The
+  bracket omission tests deliberately report incomplete enumeration; there is
+  no full bracket/default-bound parity or model-derived sharding claim.
+- `model_acceptance::tests::` validates synthetic single/two/universal report
+  shapes and exact identities, count/status types, omission/hypothesis registries,
+  U1/U6/U8/U9 evidence and lattice rules. A structurally valid synthetic report
+  is not evidence that the universal model was actually run.
+
+- `universal_hypotheses::tests::` checks the U1–U10 reducer, two-model aggregate,
+  62/6 premise-lattice policy and incomplete-evidence handling against injected
+  synthetic run records. The suite proves evaluator-contract behavior only; it
+  does not execute the two state-space models.
+
+- `projection_owner_model::tests::` executes a finite BFS over the Rust
+  projection-owner abstraction, including lease/recovery/UNKNOWN reconciliation,
+  atomic publication, strict read gating, aggregate predecessor ordering and
+  bounded negative controls. Search cutoff is `UNKNOWN`; the finite model is not
+  SQL, deployment, fairness or global-optimality evidence.
 
 The archived Python tests are not run by the readiness campaign or Rust campaign
-runner. Current Rust-native offline suites include the E1 JSONL parser, dependency
-profile/fault declaration matrix, experiment register, and E1/E3 lifecycle reducer,
-in addition to the earlier E1 classifier, typed E3 reconciliation, E4 protocol,
-tenant model, E5 single-mutation model, and single-model unbounded-confirmation
-contracts. These contracts cover only the exact boundaries documented in the
-archive mapping; declarations, parser records, and synthetic timing samples are not
-runtime campaign evidence.
+runner. Current Rust-native offline suites include the E1 JSONL parser, E3/E4 log/event
+helpers and report reducer, the typed E4 precondition fake-probe contract,
+dependency profile/fault declaration matrix, experiment register, E1/E3
+lifecycle reducer, offline node-adapter contract, and lower-level readiness-runner
+status/source-hash/checksum, bounded-execution helper, two-mutation model,
+projection-owner BFS, U1–U10 evaluator contract over injected records, and synthetic
+model-report acceptance contracts, in addition to the earlier E1 classifier, typed
+E3 reconciliation, E4 protocol, tenant model, E5 single-mutation model, and
+single-model unbounded-confirmation contracts. These contracts cover only the
+exact boundaries documented in the archive mapping; declarations, parser records,
+fake probe capture, and synthetic timing samples are not runtime campaign evidence.
 
-The full E1 runner and report, complete E3 runner/report, read-only E3/E4 probes,
-E4 fake-controller lifecycle, bounded worker/shard, node adapter, legacy campaign
-report schema, two-mutation model, universal-hypothesis computation, projection-owner
-BFS, and full two-model unbounded-confirmation remain `BLOCKED` in
-`tests-suite/MANIFEST.toml`. Archiving their Python sources does not convert these
-items to `PASS`. Live service/DB campaigns remain dependency-gated and are not
-offline migration evidence.
+The full E1 runner and report, complete E3 runner/report and interval sampling,
+signed HTTP probe transport and worker readiness, E4 fake-controller lifecycle,
+bounded process-worker and two-mutation shard execution, live node subprocess/SSH/HTTP transport, full readiness-runner
+artifact lifecycle and legacy campaign report schema, full U1–U10 model enumeration,
+and full two-model unbounded-confirmation remain `BLOCKED` in
+`tests-suite/MANIFEST.toml`. The U1–U10 fixture evaluator contract and projection-owner
+finite BFS are registered separately and do not establish complete universal model
+execution or live behavior. Archiving Python sources does not convert these items to
+`PASS`. Live service/DB campaigns remain dependency-gated and are not offline migration
+evidence.
 
 The Rust readiness command list replaces Python test discovery with explicit
 Rust targets. It runs the complete offline harness and then some focused targets
-for E5, tenant, E3, E4 and unbounded confirmation as separate evidence commands.
+for E5, tenant, E3, E4, node-adapter, and unbounded-confirmation contracts as separate evidence commands.
 Those Rust targets overlap by design; the default `native-kernel`/`offline-validation`
 profile selection in `tests-suite` omits the whole-harness suite unless that suite
 is explicitly selected, preventing the campaign runner from also executing its
 narrow contracts by default. No Rust test is claimed to replace an archived Python
 contract beyond its registered boundary.
 
+The focused Rust contract targets include the two-mutation bounded model,
+projection-owner BFS, and the U1–U10 evaluator contract over injected records. The
+strict two-mutation run remains separate from blocked worker/shard execution and the
+full U1–U10 enumeration; the latter is not validated by fixture-driven tests.
+
 The focused Rust contract targets are:
 
 ```bash
+cargo test -p test-harness --locked --lib projection_owner_model::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib universal_hypotheses::tests:: -- --test-threads=1
 cargo test -p test-harness --locked --lib e3_reconciliation::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib e3_e4_events::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib e3_report::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib e4_preconditions::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib e4_fault_lifecycle::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib readiness_contract::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib bounded_execution_contract::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib two_mutation_model::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib model_acceptance::tests:: -- --test-threads=1
 cargo test -p test-harness --locked --lib e4_protocol::tests:: -- --test-threads=1
 cargo test -p test-harness --locked --lib models::tests:: -- --test-threads=1
 cargo test -p test-harness --locked --lib unbounded_confirmation::tests:: -- --test-threads=1
@@ -131,25 +175,33 @@ The former Python test commands are historical only: the 19 `test_*.py`
 modules are preserved in [`archive/python-tests/`](archive/python-tests/README.md)
 and are not discovered or dispatched. Do not run them as a current gate. Rust
 `test-harness` targets above are the current offline test entry points within
-their documented boundaries; parity suites for the remaining archived contracts
-stay `BLOCKED` in the manifest. Live service/DB campaigns remain
+their documented boundaries; incomplete runner/worker parity and full universal
+model enumeration remain `BLOCKED` in the manifest. Live service/DB campaigns remain
 dependency-gated and are not offline migration evidence. Remote reads,
 migrations, service startup, fault injection, and durable source mutations
 require separate safety gates and are not performed by the default offline tests.
 
 The underlying Python model tools remain migration references, but after their
-tests are archived they are not invoked as required readiness evidence. In
-particular, the two-mutation and universal-hypothesis models remain `BLOCKED`
-until their Rust equivalents are implemented.
+tests are archived they are not invoked as required readiness evidence. The Rust
+two-mutation and projection-owner finite models are registered as offline suites;
+the U1–U10 evaluator fixture contract is separate from the release-gated two-model
+universal enumeration (`e5-universal-bounded`). None of these results is evidence
+about a live implementation or deployment.
 
 ```bash
 cargo test -p test-harness --locked -- --test-threads=1
+cargo test -p test-harness --locked --lib projection_owner_model::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib universal_hypotheses::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib two_mutation_model::tests:: -- --test-threads=1
 cargo test -p test-harness --locked --lib e5_model::tests::full_contract_and_omission_counts_match_the_reference_checker -- --exact
 cargo test -p test-harness --locked --lib models::tests:: -- --test-threads=1
 cargo test -p test-harness --locked --lib e3_reconciliation::tests:: -- --test-threads=1
 cargo test -p test-harness --locked --lib e4_protocol::tests:: -- --test-threads=1
 cargo test -p test-harness --locked --lib unbounded_confirmation::tests:: -- --test-threads=1
 ```
+
+The final full harness suite is an explicit `offline-validation-tools` suite;
+this list records focused contract commands and is not a second full-harness gate.
 
 `e1_validation::tests::` runs the five pure Rust E1 classifier tests. They cover
 the exhaustive interval/domain grid, fail-closed identity/epoch/order/commit

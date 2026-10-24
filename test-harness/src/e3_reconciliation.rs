@@ -826,6 +826,21 @@ pub fn publication_drain_status(
     }
 }
 
+pub fn campaign_problems(report: &AttemptHistoryReport) -> Vec<String> {
+    let mut problems = Vec::new();
+    if !report.attempt_bound_exceeded.is_empty() {
+        problems.push("attempt_bound_exceeded".to_owned());
+    }
+    for reason in &report.unknown {
+        if reason == "event_id_bound_exceeded" || reason == "event_log_bound_exceeded" {
+            problems.push(reason.clone());
+        }
+    }
+    problems.sort();
+    problems.dedup();
+    problems
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1033,6 +1048,7 @@ mod tests {
         let over_attempt = validate_attempt_history(&over_attempt, Some(&row("SUCCEEDED", 2)), 1);
         assert_eq!(over_attempt.status, EvidenceStatus::Unknown);
         assert_eq!(over_attempt.attempt_bound_exceeded, ["101"]);
+        assert!(campaign_problems(&over_attempt).contains(&"attempt_bound_exceeded".to_owned()));
 
         let duplicate_sequence = vec![
             event(E3EventKind::ClaimCommitted, 1, Some(1), None, None),
@@ -1048,6 +1064,33 @@ mod tests {
             validate_attempt_history(&duplicate_sequence, Some(&row("SUCCEEDED", 1)), 8).status,
             EvidenceStatus::Unknown
         );
+    }
+
+    #[test]
+    fn event_id_and_event_log_bounds_fail_closed() {
+        let mut unique_ids = Vec::with_capacity(MAX_EVENT_IDS + 1);
+        for sequence in 1..=MAX_EVENT_IDS as u64 + 1 {
+            let mut item = event(E3EventKind::ClaimCommitted, sequence, Some(1), None, None);
+            item.event_id = format!("evt-{sequence}");
+            unique_ids.push(item);
+        }
+        let over_ids = validate_attempt_history(&unique_ids, Some(&BTreeMap::new()), 8);
+        assert_eq!(over_ids.status, EvidenceStatus::Blocked);
+        assert_eq!(over_ids.events, MAX_EVENT_IDS + 1);
+        assert!(over_ids
+            .unknown
+            .contains(&"event_id_bound_exceeded".to_owned()));
+        assert!(campaign_problems(&over_ids).contains(&"event_id_bound_exceeded".to_owned()));
+
+        let base = event(E3EventKind::ClaimCommitted, 1, Some(1), None, None);
+        let over_log = vec![base; MAX_EVENTS + 1];
+        let report = validate_attempt_history(&over_log, Some(&BTreeMap::new()), 8);
+        assert_eq!(report.status, EvidenceStatus::Blocked);
+        assert_eq!(report.events, MAX_EVENTS + 1);
+        assert!(report
+            .unknown
+            .contains(&"event_log_bound_exceeded".to_owned()));
+        assert!(campaign_problems(&report).contains(&"event_log_bound_exceeded".to_owned()));
     }
 
     #[test]
@@ -1100,6 +1143,16 @@ mod tests {
         let missing = crosscheck_host_admissions(&decisions, &logs, &quality());
         assert_eq!(missing.status, EvidenceStatus::Unknown);
         assert_eq!(missing.unverified, 1);
+
+        let missing_return = [request_event(
+            RequestEventKind::HostAdmission,
+            6,
+            Some(true),
+            None,
+        )];
+        let report = crosscheck_host_admissions(&decisions, &missing_return, &quality());
+        assert_eq!(report.status, EvidenceStatus::Unknown);
+        assert_eq!(report.unverified, 1);
     }
 
     #[test]
@@ -1174,10 +1227,38 @@ mod tests {
             "host_admission_identity_order_or_context_mismatch"
         );
 
-        let mut incomplete = quality();
-        incomplete.sample_stream_truncated = true;
-        let report = crosscheck_host_admissions(&decisions, &duplicate, &incomplete);
-        assert_eq!(report.status, EvidenceStatus::Fail);
+        let complete = [
+            request_event(
+                RequestEventKind::DecisionReturn,
+                5,
+                Some(true),
+                Some("RULE_MATCH"),
+            ),
+            request_event(RequestEventKind::HostAdmission, 6, Some(true), None),
+        ];
+        assert_eq!(
+            crosscheck_host_admissions(&decisions, &complete, &quality()).status,
+            EvidenceStatus::Pass
+        );
+        for defect in [
+            CrosscheckQuality {
+                invalid_request_ids: 1,
+                ..quality()
+            },
+            CrosscheckQuality {
+                duplicate_request_ids: vec!["req-1".into()],
+                ..quality()
+            },
+            CrosscheckQuality {
+                sample_stream_truncated: true,
+                ..quality()
+            },
+        ] {
+            assert_eq!(
+                crosscheck_host_admissions(&decisions, &complete, &defect).status,
+                EvidenceStatus::Unknown
+            );
+        }
     }
 
     #[test]

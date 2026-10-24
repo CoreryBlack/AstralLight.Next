@@ -379,6 +379,35 @@ mod tests {
     }
 
     #[test]
+    fn newest_allow_outranks_older_deny() {
+        // R1 reverse direction: an older READY deny must not block a newer
+        // consensus ALLOW (deny_max < allow_max falls through to R2'/R2).
+        let evidence = vec![
+            evidence("node-a", false, Some(gate(true, 2, 5))),
+            evidence("node-b", true, Some(gate(true, 3, 6))),
+            evidence("node-c", true, Some(gate(true, 3, 6))),
+        ];
+        let outcome = arbitrate(&ctx(), &evidence);
+        assert_eq!(outcome.verdict, ArbitrationVerdict::Allow);
+        assert_eq!(outcome.reason_code, "R2_NEWEST_ALLOW");
+    }
+
+    #[test]
+    fn even_split_at_the_same_version_fails_closed() {
+        // 2v2 at identical versions: allows*2 > len is false (4 > 4), so the
+        // tie must deny rather than assume the allows carry the day.
+        let evidence = vec![
+            evidence("node-a", true, Some(gate(true, 3, 6))),
+            evidence("node-b", true, Some(gate(true, 3, 6))),
+            evidence("node-c", false, Some(gate(true, 3, 6))),
+            evidence("node-d", false, Some(gate(true, 3, 6))),
+        ];
+        let outcome = arbitrate(&ctx(), &evidence);
+        assert_eq!(outcome.verdict, ArbitrationVerdict::Deny);
+        assert_eq!(outcome.reason_code, "R3_VERSION_AGREED_DIVERGED");
+    }
+
+    #[test]
     fn version_agreed_tie_fails_closed() {
         // 全部 READY 同版本：1 ALLOW 1 DENY → 非多数 → DENY（fail-closed）
         let evidence = vec![

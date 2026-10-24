@@ -239,6 +239,44 @@ pub fn check_divan(cases: &[String], allocation_cases: &[String], output: &str) 
     json!({"status":"PASS","reason":"complete CPU allocation benchmark; no service-capacity claim","performance":{"scope":"CPU/allocation component only; instrumented timing","cases":seen.len(),"measurements":seen,"allocations":allocations}})
 }
 
+pub fn check_performance_matrix(expected_cases: usize, stdout: &str) -> Value {
+    let rows_re = Regex::new(r"PERF_MATRIX (\{[^\n]+\})").expect("constant regex");
+    let mut rows = Vec::new();
+    let mut cases = BTreeSet::new();
+    for captures in rows_re.captures_iter(stdout) {
+        let Ok(row) = serde_json::from_str::<Value>(&captures[1]) else {
+            return verdict("FAIL", "performance matrix row is malformed");
+        };
+        let Some(case) = row.get("case").and_then(Value::as_str) else {
+            return verdict("FAIL", "performance matrix case name is missing");
+        };
+        if !cases.insert(case.to_owned()) {
+            return verdict("FAIL", "performance matrix has duplicate cases");
+        }
+        let sample_fields: Vec<&str> = if row.get("current").is_some() {
+            vec!["legacy", "current"]
+        } else {
+            vec!["samples"]
+        };
+        for field in sample_fields {
+            let Some(samples) = row.get(field).and_then(Value::as_array) else {
+                return verdict("FAIL", "performance matrix samples are missing");
+            };
+            if samples.len() < 15 || samples.iter().any(|value| !valid_sample(value)) {
+                return verdict(
+                    "FAIL",
+                    "performance matrix contains invalid or insufficient samples",
+                );
+            }
+        }
+        rows.push(row);
+    }
+    if rows.len() != expected_cases {
+        return verdict("FAIL", "performance matrix is incomplete");
+    }
+    json!({"status":"PASS", "reason":"complete CPU performance matrix measured; no HTTP/DB claim", "performance":{"scope":"CPU component only", "cases":rows.len(), "measurements":rows}})
+}
+
 pub fn check_rust_output(
     expected_tests: Option<usize>,
     minimum_tests: usize,
@@ -301,9 +339,6 @@ pub fn check_rust_output_with_policy(policy: RustOutputPolicy<'_>) -> Value {
             return json!({"status":status, "reason":format!("command reported explicit [{status}] state")});
         }
     }
-    if contains_status(&combined, "SKIP") {
-        return verdict("SKIP", "a required check returned an internal skip");
-    }
     let result_re = Regex::new(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out")
         .expect("constant regex");
     let mut counts = [0usize; 5];
@@ -319,6 +354,9 @@ pub fn check_rust_output_with_policy(policy: RustOutputPolicy<'_>) -> Value {
     }
     let labels = ["passed", "failed", "ignored", "measured", "filtered"];
     let test_counts = labels.into_iter().zip(counts).collect::<BTreeMap<_, _>>();
+    if contains_status(&combined, "SKIP") {
+        return json!({"status":"SKIP", "reason":"a required check returned an internal skip", "tests":test_counts});
+    }
     if counts[1] != 0 || !found || counts[0] < minimum_tests {
         return json!({"status":"FAIL", "reason":"missing, empty, or failing Rust assertion summary", "tests":test_counts});
     }
@@ -331,43 +369,13 @@ pub fn check_rust_output_with_policy(policy: RustOutputPolicy<'_>) -> Value {
         return json!({"status":"SKIP", "reason":"selected Rust target contains unexecuted ignored checks", "tests":test_counts});
     }
     if let Some(expected_cases) = performance_cases {
-        let rows_re = Regex::new(r"PERF_MATRIX (\{[^\n]+\})").expect("constant regex");
-        let mut rows = Vec::new();
-        let mut cases = BTreeSet::new();
-        for captures in rows_re.captures_iter(&combined) {
-            let Ok(row) = serde_json::from_str::<Value>(&captures[1]) else {
-                return verdict("FAIL", "performance matrix row is malformed");
-            };
-            let Some(case) = row.get("case").and_then(Value::as_str) else {
-                return verdict("FAIL", "performance matrix case name is missing");
-            };
-            if !cases.insert(case.to_owned()) {
-                return verdict("FAIL", "performance matrix has duplicate cases");
-            }
-            let sample_fields: Vec<&str> = if row.get("current").is_some() {
-                vec!["legacy", "current"]
-            } else {
-                vec!["samples"]
-            };
-            for field in sample_fields {
-                let Some(samples) = row.get(field).and_then(Value::as_array) else {
-                    return verdict("FAIL", "performance matrix samples are missing");
-                };
-                if samples.len() < 15 || samples.iter().any(|value| !valid_sample(value)) {
-                    return verdict(
-                        "FAIL",
-                        "performance matrix contains invalid or insufficient samples",
-                    );
-                }
-            }
-            rows.push(row);
+        let mut performance = check_performance_matrix(expected_cases, stdout);
+        if let Some(object) = performance.as_object_mut() {
+            object.insert("tests".into(), json!(test_counts));
         }
-        if rows.len() != expected_cases {
-            return verdict("FAIL", "performance matrix is incomplete");
-        }
-        return json!({"status":"PASS", "reason":"complete CPU performance matrix measured; no HTTP/DB claim", "performance":{"scope":"CPU component only", "cases":rows.len(), "measurements":rows}, "tests":test_counts});
+        return performance;
     }
-    json!({"status":"PASS", "reason":"scoped Rust assertions executed", "tests":test_counts, "unexecuted_ignored":0})
+    json!({"status":"PASS", "reason":"scoped Rust assertions executed", "tests":test_counts, "unexecuted_ignored":counts[2]})
 }
 
 fn valid_sample(value: &Value) -> bool {
@@ -384,7 +392,8 @@ fn valid_sample(value: &Value) -> bool {
 }
 
 fn contains_status(input: &str, status: &str) -> bool {
-    let pattern = format!(r"(?i)\[{status}\]");
+    let lowercase = status.to_ascii_lowercase();
+    let pattern = format!(r"(?:\[{status}\]|\[{lowercase}\])");
     Regex::new(&pattern)
         .expect("constant regex")
         .is_match(input)
@@ -428,6 +437,40 @@ mod tests {
             check_criterion(&cases, "engine/allow time: [5 ns 2 ns 3 ns]\n", false)["status"],
             "FAIL"
         );
+    }
+
+    #[test]
+    fn python_test_smoke_is_not_measured_criterion_acceptance() {
+        let cases = vec!["engine/allow".to_owned(), "engine/deny".to_owned()];
+        let smoke = "Testing engine/allow\nSuccess\nTesting engine/deny\nSuccess\n";
+        assert_eq!(check_criterion(&cases, smoke, true)["status"], "PASS");
+        assert_eq!(check_criterion(&cases, smoke, false)["status"], "FAIL");
+    }
+
+    #[test]
+    fn python_test_partial_empty_and_duplicate_criterion_measurements_fail() {
+        let cases = vec!["engine/allow".to_owned(), "engine/deny".to_owned()];
+        let complete = "engine/allow time: [1 ns 2 ns 3 ns]\nengine/deny time: [2 ns 3 ns 4 ns]\n";
+        for output in [
+            "",
+            "Success",
+            "engine/allow time: [1 ns 2 ns 3 ns]\n",
+            &format!("{complete}{complete}"),
+        ] {
+            assert_eq!(check_criterion(&cases, output, false)["status"], "FAIL");
+        }
+    }
+
+    #[test]
+    fn python_test_criterion_rejects_nonpositive_reversed_and_unbound_intervals() {
+        let cases = vec!["engine/allow".to_owned()];
+        for output in [
+            "engine/allow time: [0 ns 2 ns 3 ns]",
+            "engine/allow time: [5 ns 2 ns 3 ns]",
+            "time: [1 ns 2 ns 3 ns]",
+        ] {
+            assert_eq!(check_criterion(&cases, output, false)["status"], "FAIL");
+        }
     }
 
     #[test]
@@ -491,22 +534,63 @@ mod tests {
             check_rust_output(None, 1, None, &row(12, 0, 3, 0), "", 0, false)["status"],
             "SKIP"
         );
-        assert_eq!(
-            check_rust_output(
-                None,
-                1,
-                None,
-                "[SKIP] missing check\\n",
-                &row(1, 0, 0, 0),
-                0,
-                false
-            )["status"],
-            "SKIP"
+        let internal_skip = check_rust_output(
+            None,
+            1,
+            None,
+            "[SKIP] missing check\n",
+            &row(1, 0, 0, 0),
+            0,
+            false,
         );
+        assert_eq!(internal_skip["status"], "SKIP");
+        assert_eq!(internal_skip["tests"]["passed"], 1);
         assert_eq!(
             check_rust_output(None, 1, None, &row(1, 0, 0, 0), "", 124, false)["status"],
             "UNKNOWN"
         );
+    }
+
+    #[test]
+    fn python_test_divan_parser_covers_native_table_and_all_allocation_edges() {
+        let cases = vec!["shared_build".to_owned(), "private_build".to_owned()];
+        let allocation_cases = cases.clone();
+        let complete = [
+            "├─ shared_build │ 1 ns │ 4 ns │ 2 ns │ 3 ns │ 100 │ 200",
+            "  │ alloc: │ │ │ │ │",
+            "  │ 1 │ 2 │ 1.5 │ 1.6 │ │",
+            "  │ 8 B │ 16 B │ 12 B │ 12.8 B │ │",
+            "└─ private_build 1 ns │ 4 ns │ 2 ns │ 3 ns │ 100 │ 200",
+            "  │ alloc: │ │ │ │ │",
+            "  │ 1 │ 2 │ 1.5 │ 1.6 │ │",
+            "  │ 8 B │ 16 B │ 12 B │ 12.8 B │ │",
+        ]
+        .join("\n");
+        let fastest_in_name_column = complete.replace(" │ 1 ns", "  1 ns");
+        assert_eq!(
+            check_divan(&cases, &allocation_cases, &fastest_in_name_column),
+            check_divan(&cases, &allocation_cases, &complete)
+        );
+        let rounded_terminal_branch = complete.replace("└─ private_build", "╰─ private_build");
+        assert_eq!(
+            check_divan(&cases, &allocation_cases, &rounded_terminal_branch)["status"],
+            "PASS"
+        );
+        assert_eq!(check_divan(&cases, &allocation_cases, "")["status"], "FAIL");
+        for malformed in [
+            complete.replace("private_build 1 ns", "private_build nope"),
+            complete.replace("private_build 1 ns", "private_build 0 ns"),
+            complete.replace("100", "0"),
+            complete.lines().take(4).collect::<Vec<_>>().join("\n"),
+            rounded_terminal_branch.replace("alloc:", "max alloc:"),
+            rounded_terminal_branch.replace("8 B", "8"),
+            format!("{complete}\n{complete}"),
+        ] {
+            assert_eq!(
+                check_divan(&cases, &allocation_cases, &malformed)["status"],
+                "FAIL"
+            );
+        }
     }
 
     #[test]

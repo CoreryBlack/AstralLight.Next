@@ -304,13 +304,200 @@ mod tests {
         assert_eq!(check_full_contract(&bad, "single")["status"], "FAIL");
     }
 
+    fn universal() -> Value {
+        let models = [("single", MODEL_SINGLE, "full", 62), ("two", MODEL_TWO, "singles", 6)]
+            .into_iter()
+            .map(|(name, underlying, policy, subsets)| {
+                let hypotheses = (1..=10)
+                    .map(|number| {
+                        let id = format!("U{number}");
+                        let evidence = match number {
+                            1 => json!({
+                                "bracket":{"status":"PASS","explorationComplete":true,"admittedStrictlyBefore":0},
+                                "strict":{"status":"PASS","explorationComplete":true,"admittedStrictlyBefore":0}
+                            }),
+                            6 => json!({"latticePolicy":policy,"subsetsChecked":subsets}),
+                            8 => {
+                                let mut bounds = json!({
+                                    "full-bracket":{"completeAtRequired":true},
+                                    "full-strict":{"completeAtRequired":true}
+                                });
+                                for premise in PREMISES {
+                                    bounds[format!("without-{premise}")] = json!({"completeAtRequired":true});
+                                }
+                                bounds
+                            }
+                            9 => json!({
+                                "bracket":{"status":"PASS","violations":0,"explorationComplete":true},
+                                "strict":{"status":"PASS","violations":0,"explorationComplete":true}
+                            }),
+                            _ => json!({}),
+                        };
+                        json!({"id":id,"status":"PASS","evidence":evidence})
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "modelName":name,
+                    "underlyingModel":underlying,
+                    "status":"PASS",
+                    "hypotheses":hypotheses
+                })
+            })
+            .map(|item| (item["modelName"].as_str().unwrap().to_owned(), item))
+            .collect::<serde_json::Map<_, _>>();
+        json!({"checker":"universal-hypotheses-check","status":"PASS","models":models})
+    }
+
     #[test]
-    fn tenant_hypotheses_require_complete_registry() {
+    fn tenant_hypotheses_require_the_exact_complete_registry() {
+        let valid = json!({
+            "model":"tenant-isolation-bounded-model",
+            "status":"PASS",
+            "hypotheses":[
+                {"id":"T5","status":"PASS"},
+                {"id":"T1","status":"PASS"},
+                {"id":"T4","status":"PASS"},
+                {"id":"T3","status":"PASS"}
+            ]
+        });
+        assert_eq!(check_tenant(&valid)["status"], "PASS");
+
+        let mut duplicate = valid.clone();
+        duplicate["hypotheses"][1]["id"] = json!("T5");
+        assert_eq!(check_tenant(&duplicate)["status"], "UNKNOWN");
+        let mut extra = valid.clone();
+        extra["hypotheses"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"T2","status":"PASS"}));
+        assert_eq!(check_tenant(&extra)["status"], "UNKNOWN");
+        let mut failed = valid;
+        failed["hypotheses"][0]["status"] = json!("FAIL");
+        assert_eq!(check_tenant(&failed)["status"], "FAIL");
         assert_eq!(
-            check_tenant(
-                &json!({"model":"tenant-isolation-bounded-model","status":"PASS","hypotheses":[{"id":"T1","status":"PASS"}]})
-            )["status"],
+            check_tenant(&json!({"model":"wrong-model","status":"PASS","hypotheses":[]}))["status"],
             "UNKNOWN"
         );
+    }
+
+    #[test]
+    fn full_contract_checks_identity_modes_counts_status_and_omissions() {
+        assert_eq!(
+            check_full_contract(&full(MODEL_SINGLE, false), "single")["status"],
+            "PASS"
+        );
+        assert_eq!(
+            check_full_contract(&full(MODEL_TWO, true), "two")["status"],
+            "PASS"
+        );
+        assert_eq!(
+            check_full_contract(&full(MODEL_TWO, false), "single")["status"],
+            "UNKNOWN"
+        );
+        assert_eq!(
+            check_full_contract(&full(MODEL_SINGLE, false), "other")["status"],
+            "UNKNOWN"
+        );
+
+        for violations in [json!(false), json!(1.5), json!(-1), json!("0")] {
+            let mut report = full(MODEL_SINGLE, false);
+            report["fullContract"]["modes"]["strict"]["violations"] = violations;
+            assert_ne!(check_full_contract(&report, "single")["status"], "PASS");
+        }
+        let mut failed_mode = full(MODEL_SINGLE, false);
+        failed_mode["fullContract"]["modes"]["strict"]["status"] = json!("FAIL");
+        assert_eq!(
+            check_full_contract(&failed_mode, "single")["status"],
+            "FAIL"
+        );
+
+        for mutate in [0, 1, 2, 3] {
+            let mut report = full(MODEL_SINGLE, false);
+            match mutate {
+                0 => {
+                    report["omissions"].as_array_mut().unwrap().pop();
+                }
+                1 => {
+                    let duplicate = report["omissions"][0].clone();
+                    report["omissions"].as_array_mut().unwrap().push(duplicate);
+                }
+                2 => {
+                    report["omissions"][0]["premise"] = json!("unexpected");
+                }
+                _ => {
+                    report["omissions"] = json!(null);
+                }
+            }
+            assert_eq!(check_full_contract(&report, "single")["status"], "UNKNOWN");
+        }
+    }
+
+    #[test]
+    fn universal_acceptance_requires_exact_two_models_and_all_hypothesis_evidence() {
+        let report = universal();
+        assert_eq!(check_universal(&report)["status"], "PASS");
+
+        let mut extra_model = report.clone();
+        extra_model["models"]["third"] = extra_model["models"]["single"].clone();
+        assert_eq!(check_universal(&extra_model)["status"], "UNKNOWN");
+
+        let mut wrong_identity = report.clone();
+        wrong_identity["models"]["two"]["underlyingModel"] = json!(MODEL_SINGLE);
+        assert_eq!(check_universal(&wrong_identity)["status"], "UNKNOWN");
+
+        for index in 0..10 {
+            let mut missing = report.clone();
+            missing["models"]["single"]["hypotheses"]
+                .as_array_mut()
+                .unwrap()
+                .remove(index);
+            assert_eq!(check_universal(&missing)["status"], "UNKNOWN");
+        }
+
+        let mut duplicate = report.clone();
+        duplicate["models"]["two"]["hypotheses"][1]["id"] = json!("U1");
+        assert_eq!(check_universal(&duplicate)["status"], "UNKNOWN");
+
+        let mut failed = report.clone();
+        failed["models"]["two"]["hypotheses"][3]["status"] = json!("FAIL");
+        assert_eq!(check_universal(&failed)["status"], "FAIL");
+
+        let mut bad_u1 = report.clone();
+        bad_u1["models"]["single"]["hypotheses"][0]["evidence"]["strict"]
+            ["admittedStrictlyBefore"] = json!(1);
+        assert_eq!(check_universal(&bad_u1)["status"], "UNKNOWN");
+
+        let mut bad_u9 = report.clone();
+        bad_u9["models"]["two"]["hypotheses"][8]["evidence"]["strict"]["violations"] = json!(true);
+        assert_eq!(check_universal(&bad_u9)["status"], "UNKNOWN");
+
+        let mut bad_u8 = report.clone();
+        bad_u8["models"]["single"]["hypotheses"][7]["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("without-host_mediation");
+        assert_eq!(check_universal(&bad_u8)["status"], "UNKNOWN");
+
+        let mut extra_u8 = report.clone();
+        extra_u8["models"]["single"]["hypotheses"][7]["evidence"]["unexpected"] =
+            json!({"completeAtRequired":true});
+        assert_eq!(check_universal(&extra_u8)["status"], "UNKNOWN");
+
+        for (model, expected_policy, expected_count) in
+            [("single", "full", 62), ("two", "singles", 6)]
+        {
+            let mut bad_lattice = report.clone();
+            bad_lattice["models"][model]["hypotheses"][5]["evidence"]["latticePolicy"] =
+                json!(if expected_policy == "full" {
+                    "singles"
+                } else {
+                    "full"
+                });
+            assert_eq!(check_universal(&bad_lattice)["status"], "UNKNOWN");
+            let mut bad_count = report.clone();
+            bad_count["models"][model]["hypotheses"][5]["evidence"]["subsetsChecked"] =
+                json!(expected_count + 1);
+            assert_eq!(check_universal(&bad_count)["status"], "UNKNOWN");
+        }
     }
 }

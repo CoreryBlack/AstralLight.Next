@@ -281,6 +281,7 @@ pub fn read_manifest(root: &Path) -> Result<Manifest, String> {
         let acceptance = str_field(suite, "acceptance")?;
         if ![
             "rust",
+            "unittest",
             "model-json",
             "command",
             "dependency-tree",
@@ -414,9 +415,10 @@ pub fn select_suites(
                 && (suite_ids.is_empty() || suite_ids.contains(&suite_id(suite)))
                 && (!portable || suite.get("blocked_reason").is_none())
                 && !(running
+                    && !all_profiles
+                    && suite_ids.is_empty()
                     && suite.get("selection_policy").and_then(TomlValue::as_str)
-                        == Some("explicit-suite")
-                    && !suite_ids.contains(&suite_id(suite)))
+                        == Some("explicit-suite"))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -606,6 +608,17 @@ pub fn classify_output(
         .get("acceptance")
         .and_then(TomlValue::as_str)
         .unwrap_or("command");
+    let combined = format!("{stdout}\n{stderr}");
+    if interrupted
+        || matches!(exit_code, 124 | 130 | 137 | 143)
+        || exit_code < 0
+        || status_marker(&combined, "UNKNOWN")
+    {
+        return json!({"status":"UNKNOWN", "reason":"runner interrupted, deadline exceeded or durable outcome unproven"});
+    }
+    if exit_code != 0 {
+        return json!({"status":"FAIL", "reason":format!("required command exited {exit_code}")});
+    }
     if suite.get("evidence_contract").is_some() && acceptance != "rust" {
         return json!({"status":"FAIL", "reason":"evidence contracts require Rust summary acceptance"});
     }
@@ -620,16 +633,7 @@ pub fn classify_output(
         .map(|value| value.max(0) as usize);
     let allow_ignored =
         suite.get("ignored_policy").and_then(TomlValue::as_str) == Some("outside-selection");
-    let combined = format!("{stdout}\n{stderr}");
     if acceptance == "rust" {
-        if suite.get("evidence_contract").is_some()
-            && (interrupted || matches!(exit_code, 124 | 130 | 137 | 143) || exit_code < 0)
-        {
-            return json!({"status":"UNKNOWN", "reason":"runner interrupted, deadline exceeded or durable outcome unproven"});
-        }
-        if exit_code != 0 && !matches!(exit_code, 124 | 130 | 137 | 143) {
-            return json!({"status":"FAIL", "reason":format!("required command exited {exit_code}")});
-        }
         let result = acceptance::check_rust_output_with_policy(acceptance::RustOutputPolicy {
             expected_tests: expected,
             minimum_tests: minimum,
@@ -663,16 +667,6 @@ pub fn classify_output(
             return evidence;
         }
         return result;
-    }
-    if interrupted
-        || matches!(exit_code, 124 | 130 | 137 | 143)
-        || exit_code < 0
-        || status_marker(&combined, "UNKNOWN")
-    {
-        return json!({"status":"UNKNOWN", "reason":"runner interrupted, deadline exceeded or durable outcome unproven"});
-    }
-    if exit_code != 0 {
-        return json!({"status":"FAIL", "reason":format!("required command exited {exit_code}")});
     }
     for status in ["PENDING", "BLOCKED", "FAIL"] {
         if status_marker(&combined, status) {
@@ -754,8 +748,9 @@ pub fn classify_output(
             if stdout.lines().any(|line| line.starts_with("redis v")) {
                 return json!({"status":"FAIL", "reason":"default native binary compiled a Redis dependency"});
             }
-            json!({"status":"PASS", "reason":"native dependency tree contains no Redis"})
+            json!({"status":"PASS","reason":"native dependency tree contains no Redis"})
         }
+        "unittest" => check_unittest_output(minimum, &combined),
         _ => {
             if suite
                 .get("required_output")
@@ -773,6 +768,32 @@ fn status_marker(text: &str, status: &str) -> bool {
     let lower = format!("[{status}]", status = status.to_ascii_lowercase());
     text.lines()
         .any(|line| line.contains(&format!("[{status}]")) || line.contains(&lower))
+}
+
+fn check_unittest_output(minimum: usize, combined: &str) -> Value {
+    let summary = regex::Regex::new(r"Ran ([0-9]+) tests? in [0-9.]+s").expect("constant regex");
+    let counts = summary
+        .captures_iter(combined)
+        .filter_map(|captures| captures[1].parse::<usize>().ok())
+        .collect::<Vec<_>>();
+    let executed = counts.iter().sum::<usize>();
+    if counts.is_empty()
+        || executed < minimum
+        || !regex::Regex::new(r"(?m)^OK(?:\s|$)")
+            .expect("constant regex")
+            .is_match(combined)
+    {
+        return json!({"status":"FAIL","reason":"missing or empty Python assertion summary","tests":{"executed":executed}});
+    }
+    let skipped_re = regex::Regex::new(r"skipped=(\d+)").expect("constant regex");
+    let skipped = skipped_re
+        .captures_iter(combined)
+        .filter_map(|captures| captures[1].parse::<usize>().ok())
+        .sum::<usize>();
+    if skipped > 0 {
+        return json!({"status":"SKIP","reason":"Python checks skipped","tests":{"executed":executed,"skipped":skipped}});
+    }
+    json!({"status":"PASS","reason":"offline Python assertions executed","tests":{"executed":executed}})
 }
 
 pub fn fold_status(records: &[Value]) -> &'static str {
@@ -1427,6 +1448,12 @@ fn write_report(path: &Path, report: &Value) -> Result<(), String> {
     fs::rename(&temporary, path).map_err(|error| format!("publish evidence: {error}"))
 }
 
+struct SelectedRuntime<'a, F, E> {
+    environment: &'a [(OsString, OsString)],
+    snapshot: F,
+    execute_command: E,
+}
+
 fn run_selected(
     manifest: &Manifest,
     suites: &[TomlValue],
@@ -1434,6 +1461,38 @@ fn run_selected(
     artifact_root: &Path,
     verify_items: bool,
 ) -> Result<i32, String> {
+    let environment = env::vars_os().collect::<Vec<_>>();
+    run_selected_with_runtime(
+        manifest,
+        suites,
+        run_id,
+        artifact_root,
+        verify_items,
+        SelectedRuntime {
+            environment: &environment,
+            snapshot: snapshot_hash,
+            execute_command: execute,
+        },
+    )
+}
+
+fn run_selected_with_runtime<F, E>(
+    manifest: &Manifest,
+    suites: &[TomlValue],
+    run_id: &str,
+    artifact_root: &Path,
+    verify_items: bool,
+    runtime: SelectedRuntime<'_, F, E>,
+) -> Result<i32, String>
+where
+    F: FnMut(&Path) -> Result<String, String>,
+    E: FnMut(&TomlValue, &BTreeMap<OsString, OsString>, &Path, &Path) -> Result<Value, String>,
+{
+    let SelectedRuntime {
+        environment,
+        mut snapshot,
+        mut execute_command,
+    } = runtime;
     if !safe_id(run_id) {
         return Err("invalid run id".into());
     }
@@ -1443,8 +1502,7 @@ fn run_selected(
     let directory = parent.join(run_id);
     fs::create_dir(&directory).map_err(|error| format!("create run directory: {error}"))?;
     let directory = validate_artifact_root(&manifest.root, &directory)?;
-    let frozen = snapshot_hash(&manifest.root)?;
-    let environment = env::vars_os().collect::<Vec<_>>();
+    let frozen = snapshot(&manifest.root)?;
     let mut report = json!({"schema_version":2,"taskId":run_id,"run_id":run_id,"delegated":false,"responsible_agent":"test-harness","cwd":manifest.root,"started_at":utc_now(),"source_sha256":frozen,"status":"PENDING","retries":0,"provisioning":"none; pre-migrated approved dependencies only","selection":suites.iter().map(suite_id).collect::<Vec<_>>(),"results":[],"item_results":[],"verify_items":verify_items,"phase_timing_seconds":[],"rerun_policy":"fix or reconcile the first non-PASS target; rerun the full original selection with a new run id; no cached PASS reuse"});
     let report_path = directory.join("result.json");
     write_report(&report_path, &report)?;
@@ -1459,7 +1517,7 @@ fn run_selected(
                 problem =
                     Some("campaign execution requires POSIX process-group log capture".into());
             } else {
-                let (_, environment_problem) = prepare_environment(suite, &environment);
+                let (_, environment_problem) = prepare_environment(suite, environment);
                 problem = environment_problem;
                 if problem.is_none() {
                     let argv = string_array(suite, "argv")?;
@@ -1509,12 +1567,12 @@ fn run_selected(
             } else if let Some((stop_id, stop_status, _)) = &stopped {
                 record["status"] = json!("BLOCKED");
                 record["reason"] = json!(format!("prior {stop_status} in {stop_id}; fix or reconcile before a fresh full collection"));
-            } else if snapshot_hash(&manifest.root)? != frozen {
+            } else if snapshot(&manifest.root)? != frozen {
                 record["status"] = json!("UNKNOWN");
                 record["reason"] =
                     json!("source changed after freeze; evidence belongs to another snapshot");
             } else {
-                let (mut child_env, issue) = prepare_environment(suite, &environment);
+                let (mut child_env, issue) = prepare_environment(suite, environment);
                 child_env.insert(
                     "CRITERION_HOME".into(),
                     phase_directory.join("criterion").join(&id).into_os_string(),
@@ -1568,7 +1626,7 @@ fn run_selected(
                         .push(record.clone());
                     report["status"] = json!("PENDING");
                     write_report(&report_path, &report)?;
-                    match execute(suite, &child_env, &manifest.root, &phase_directory) {
+                    match execute_command(suite, &child_env, &manifest.root, &phase_directory) {
                         Ok(result) => {
                             record
                                 .as_object_mut()
@@ -1585,7 +1643,7 @@ fn run_selected(
                             record["stream_disconnect"] = json!(true);
                         }
                     }
-                    if snapshot_hash(&manifest.root)? != frozen {
+                    if snapshot(&manifest.root)? != frozen {
                         record["status"] = json!("UNKNOWN");
                         record["reason"] =
                             json!("source changed while required command was running");
@@ -1601,6 +1659,7 @@ fn run_selected(
             let status = record["status"].as_str().unwrap_or("UNKNOWN").to_owned();
             if status != "PASS" && stopped.is_none() {
                 stopped = Some((id.clone(), status.clone(), phase.to_string()));
+                report["stopped_at"] = json!({"id":id,"status":status,"phase":phase});
             }
             let records = report[records_key].as_array_mut().unwrap();
             if records
@@ -1657,6 +1716,10 @@ fn resolve_executable(command: &str, path: &str) -> Option<PathBuf> {
         .map(|directory| directory.join(command))
         .find(|candidate| candidate.is_file())
 }
+
+#[cfg(test)]
+#[path = "campaign/run_tests.rs"]
+mod run_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1721,6 +1784,84 @@ mod tests {
             TomlValue::Integer(timeout_seconds),
         );
         TomlValue::Table(table)
+    }
+
+    fn rust_summary(passed: usize, failed: usize, ignored: usize, filtered: usize) -> String {
+        format!("test result: ok. {passed} passed; {failed} failed; {ignored} ignored; 0 measured; {filtered} filtered out; finished in 0.00s\n")
+    }
+
+    fn full_model_report(model: &str, summary: bool) -> Value {
+        let modes = json!({
+            "bracket":{"status":"PASS","violations":0,"explorationComplete":true},
+            "strict":{"status":"PASS","violations":0,"explorationComplete":true}
+        });
+        let model_id = match model {
+            "single" => "e5-bounded-model-check",
+            "two" => "e5-bounded-model-check-two-mutations",
+            _ => unreachable!("known model fixture"),
+        };
+        let omissions = [
+            "pending_probe",
+            "post_recheck",
+            "final_reload",
+            "exact_identity",
+            "generation_revoke_fence",
+            "host_mediation",
+        ];
+        let omissions = if summary {
+            Value::Object(
+                omissions
+                    .into_iter()
+                    .map(|premise| (premise.to_owned(), json!("FAIL")))
+                    .collect(),
+            )
+        } else {
+            json!(omissions
+                .into_iter()
+                .map(|premise| json!({"premise":premise,"status":"FAIL"}))
+                .collect::<Vec<_>>())
+        };
+        let mut report = json!({"model":model_id,"status":"PASS","omissions":omissions});
+        if summary {
+            report["modes"] = modes;
+        } else {
+            report["fullContract"] = json!({"status":"PASS","modes":modes});
+        }
+        report
+    }
+
+    fn isolated_environment() -> Vec<(OsString, OsString)> {
+        [
+            ("TEST_USE_EXISTING", "1"),
+            ("ASTRAL_MIGRATION_ENV", "isolated"),
+            ("RUST_INTEGRATION_REQUIRED", "1"),
+            (
+                "DATABASE_URL",
+                "mysql://fixture@127.0.0.1:3308/astral_rehearsal_contract",
+            ),
+            ("ASTRAL_TEST_DATABASE_NAME", "astral_rehearsal_contract"),
+            (
+                "INTEGRATION_IDENTITY_MAPPING_DATABASE_URL",
+                "mysql://fixture@127.0.0.1:3308/sdk_identity_mapping_test_contract",
+            ),
+            (
+                "INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE",
+                "sdk_identity_mapping_test_contract",
+            ),
+            ("RABBITMQ_URL", "amqp://fixture@127.0.0.1:5673/%2f"),
+            ("REDIS_URL", "redis://fixture@127.0.0.1:6380/0"),
+            ("MYSQL_ROOT_PASSWORD", "temporary-fixture"),
+            ("MYSQL_DATABASE", "untrusted-database"),
+            ("RABBITMQ_USER", "untrusted-user"),
+            ("RABBITMQ_PASSWORD", "untrusted-password"),
+            ("COMPOSE_PROFILES", "rabbit,redis-compat"),
+            ("SKIP_DOCKER", "1"),
+            ("ASTRAL_TARGET_REGION", "foreign-region"),
+            ("ASTRAL_PERF_CASE", "filtered-case"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect()
     }
 
     #[cfg(unix)]
@@ -1956,6 +2097,169 @@ exit "${FAKE_CARGO_EXIT:-0}"
         .unwrap()
         .iter()
         .any(|suite| suite_id(suite) == "offline-validation-tools"));
+
+        let expected_series = [
+            "RQ1", "RQ2", "RQ3", "RQ4", "RQ5", "M1", "M2", "M3", "M4", "M5", "E1", "E2", "E3",
+            "E4", "E5", "MT-E1", "MT-E2", "MT-E3", "MT-E4", "MT-E5", "MT-E6", "PERF", "COMPAT",
+            "EXCLUDED",
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        assert!(expected_series.is_subset(
+            &manifest
+                .series
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+        ));
+
+        let default_running = select_suites(&manifest, &[], &[], &[], true, false).unwrap();
+        assert!(default_running
+            .iter()
+            .all(|suite| DEFAULT_PROFILES.contains(&suite_profile(suite).as_str())));
+        assert!(default_running
+            .iter()
+            .all(|suite| suite.get("blocked_reason").is_none()));
+        assert!(default_running
+            .iter()
+            .all(|suite| string_array(suite, "test_services").unwrap().is_empty()));
+
+        let all_profiles = select_suites(&manifest, &[], &[], &[], true, true).unwrap();
+        assert_eq!(all_profiles.len(), manifest.suites.len());
+
+        let mut with_blocked = manifest.clone();
+        let mut blocked = with_blocked.suites[0].clone();
+        if let TomlValue::Table(table) = &mut blocked {
+            table.insert(
+                "id".to_owned(),
+                TomlValue::String("synthetic-blocked".to_owned()),
+            );
+            table.insert(
+                "blocked_reason".to_owned(),
+                TomlValue::String("synthetic blocked fixture".to_owned()),
+            );
+        }
+        with_blocked.suites.push(blocked);
+        let all_with_blocked = select_suites(&with_blocked, &[], &[], &[], true, true).unwrap();
+        assert!(all_with_blocked
+            .iter()
+            .any(|suite| suite.get("blocked_reason").is_some()));
+        assert!(all_profiles
+            .iter()
+            .all(|suite| suite.get("blocked_reason").is_none()));
+        assert!(all_profiles
+            .iter()
+            .any(|suite| !string_array(suite, "test_services").unwrap().is_empty()));
+
+        let m_family = select_suites(&manifest, &[], &["M".into()], &[], false, false).unwrap();
+        assert!(m_family
+            .iter()
+            .all(|suite| suite_labels(suite).iter().any(|label| {
+                label.starts_with('M') && label[1..].bytes().all(|byte| byte.is_ascii_digit())
+            })));
+        assert!(m_family
+            .iter()
+            .all(|suite| suite_id(suite) != "mt-capacity"));
+        let e_family = select_suites(&manifest, &[], &["E".into()], &[], false, false).unwrap();
+        assert!(e_family
+            .iter()
+            .all(|suite| suite_id(suite) != "excluded-service-checks"));
+        assert!(e_family
+            .iter()
+            .all(|suite| suite_id(suite) != "mt-capacity"));
+
+        let e2 = select_suites(
+            &manifest,
+            &["native-kernel".into()],
+            &["E2".into()],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(e2.len(), 5);
+        assert!(e2.iter().all(|suite| {
+            suite.get("expected_tests").and_then(TomlValue::as_integer) == Some(1)
+                && string_array(suite, "argv")
+                    .unwrap()
+                    .iter()
+                    .any(|argument| argument == "--exact")
+        }));
+
+        let explicit_integration = select_suites(
+            &manifest,
+            &[],
+            &[],
+            &["native-projection-lifecycle".into()],
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(explicit_integration.len(), 1);
+        assert_eq!(
+            suite_profile(&explicit_integration[0]),
+            "native-single-node"
+        );
+
+        let registered = manifest
+            .suites
+            .iter()
+            .map(|suite| (suite_id(suite), suite))
+            .collect::<BTreeMap<_, _>>();
+        for name in [
+            "policy-observability-tests",
+            "db-observability-tests",
+            "trustgraph-observability-tests",
+        ] {
+            let suite = registered.get(name).unwrap();
+            assert!(string_array(suite, "argv")
+                .unwrap()
+                .join(" ")
+                .contains("e1-observability"));
+            assert!(string_array(suite, "test_services").unwrap().is_empty());
+        }
+        assert!(
+            string_array(registered["trustgraph-observability-tests"], "argv")
+                .unwrap()
+                .join(" ")
+                .contains("e3-observability,e4-observability")
+        );
+
+        for (profiles, labels, suite_ids) in [
+            (vec!["unknown".into()], vec![], vec![]),
+            (vec![], vec!["E9".into()], vec![]),
+            (vec![], vec![], vec!["not-a-test".into()]),
+        ] {
+            assert!(select_suites(&manifest, &profiles, &labels, &suite_ids, true, false).is_err());
+        }
+        assert!(select_suites(
+            &manifest,
+            &["standalone-rabbit".into()],
+            &["MT-E1".into()],
+            &[],
+            false,
+            false,
+        )
+        .is_err());
+        let mt_e2 = select_suites(&manifest, &[], &["MT-E2".into()], &[], false, false).unwrap();
+        assert_eq!(mt_e2.len(), 1);
+        assert_eq!(suite_id(&mt_e2[0]), "mt-e2-unimplemented");
+        assert_eq!(str_field(&mt_e2[0], "acceptance").unwrap(), "rust");
+        assert!(string_array(&mt_e2[0], "argv")
+            .unwrap()
+            .iter()
+            .any(|arg| arg.contains("mt_e2_has_no_fabricated_executable_suite")));
+
+        for suite in &manifest.suites {
+            assert_eq!(
+                string_array(suite, "test_services").unwrap(),
+                string_array(
+                    &manifest.profiles[&suite_profile(suite)],
+                    "production_services"
+                )
+                .unwrap()
+            );
+        }
     }
 
     fn assert_archived_python_migrations_are_accounted(root: &Path, manifest: &Manifest) {
@@ -1994,11 +2298,632 @@ exit "${FAKE_CARGO_EXIT:-0}"
         assert!(mapping.contains("`harness/runner-contracts` is catalog-only"));
     }
 
+    fn assert_python_crosswalk_targets_exist(root: &Path, source: &str, method: &str, row: &str) {
+        let rust_targets = row
+            .split('|')
+            .nth(2)
+            .unwrap_or_default()
+            .split('`')
+            .map(str::trim)
+            .filter(|target| target.contains(".rs::"))
+            .collect::<Vec<_>>();
+        for target in rust_targets {
+            let Some((file, symbol)) = target.split_once(".rs::") else {
+                continue;
+            };
+            let relative_source = format!("{file}.rs");
+            let mut source_path = root.join("test-harness/src").join(&relative_source);
+            if !source_path.is_file() {
+                source_path = root.join("test-harness/src/bin").join(
+                    Path::new(&relative_source)
+                        .file_name()
+                        .expect("binary source filename"),
+                );
+            }
+            if !source_path.is_file() {
+                source_path = root.join("test-harness/tests").join(
+                    Path::new(&relative_source)
+                        .file_name()
+                        .expect("integration test filename"),
+                );
+            }
+            if !source_path.is_file() {
+                source_path = root.join("test-harness").join(&relative_source);
+            }
+            assert!(
+                source_path.is_file(),
+                "crosswalk target source is missing for {source}::{method}: {file}.rs"
+            );
+            let contents = fs::read_to_string(&source_path).unwrap_or_else(|error| {
+                panic!(
+                    "read crosswalk Rust target for {source}::{method} at {}: {error}",
+                    source_path.display()
+                )
+            });
+            let lines = contents.lines().collect::<Vec<_>>();
+            let target_name = symbol.rsplit("::").next().unwrap_or_default();
+            let target_exists = lines.iter().any(|line| {
+                let trimmed = line.trim_start();
+                let function_name = trimmed
+                    .strip_prefix("pub fn ")
+                    .or_else(|| trimmed.strip_prefix("pub async fn "))
+                    .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+                    .or_else(|| trimmed.strip_prefix("pub(crate) async fn "))
+                    .or_else(|| trimmed.strip_prefix("fn "))
+                    .or_else(|| trimmed.strip_prefix("async fn "))
+                    .and_then(|name| {
+                        name.split(|character: char| {
+                            !(character.is_ascii_alphanumeric() || character == '_')
+                        })
+                        .next()
+                    });
+                let function_matches = function_name == Some(target_name);
+                let constant_matches = ["const ", "pub const ", "static ", "pub static "]
+                    .iter()
+                    .any(|prefix| {
+                        trimmed
+                            .strip_prefix(prefix)
+                            .is_some_and(|name| name.starts_with(&format!("{target_name}:")))
+                    });
+                function_matches || constant_matches
+            });
+            assert!(
+                target_exists,
+                "crosswalk Rust symbol is missing for {source}::{method}: {file}::{symbol}"
+            );
+            let test_name = symbol.strip_prefix("tests::").unwrap_or(target_name);
+            if symbol.starts_with("tests::")
+                || lines.iter().enumerate().any(|(index, line)| {
+                    let trimmed = line.trim_start();
+                    trimmed == format!("fn {test_name}() {{")
+                        && lines[index.saturating_sub(5)..index]
+                            .iter()
+                            .any(|previous| matches!(previous.trim(), "#[test]" | "#[tokio::test]"))
+                })
+            {
+                let target_test_exists = lines.iter().enumerate().any(|(index, line)| {
+                    let trimmed = line.trim_start();
+                    let function_name = trimmed
+                        .strip_prefix("fn ")
+                        .or_else(|| trimmed.strip_prefix("async fn "))
+                        .and_then(|name| {
+                            name.split(|character: char| {
+                                !(character.is_ascii_alphanumeric() || character == '_')
+                            })
+                            .next()
+                        });
+                    let mut previous = index;
+                    while previous > 0 && index - previous < 6 {
+                        previous -= 1;
+                        if matches!(lines[previous].trim(), "#[test]" | "#[tokio::test]") {
+                            return function_name == Some(test_name);
+                        }
+                        if lines[previous].trim().starts_with("fn ")
+                            || lines[previous].trim().starts_with("async fn ")
+                        {
+                            break;
+                        }
+                    }
+                    false
+                });
+                assert!(
+                    target_test_exists,
+                    "crosswalk target test function is missing for {source}::{method}: {}::{test_name}",
+                    source_path
+                        .strip_prefix(root.join("test-harness/src"))
+                        .unwrap_or(&source_path)
+                        .display()
+                );
+            }
+        }
+    }
+
+    fn assert_python_unittest_inventory_is_accounted(root: &Path, manifest: &Manifest) {
+        let modules = [
+            "Docs/authorization-validation/archive/python-tests/test_bounded_model_execution.py",
+            "Docs/authorization-validation/archive/python-tests/test_classify_e1_properties.py",
+            "Docs/authorization-validation/archive/python-tests/test_dependency_profiles.py",
+            "Docs/authorization-validation/archive/python-tests/test_e1_runner.py",
+            "Docs/authorization-validation/archive/python-tests/test_e3_e4.py",
+            "Docs/authorization-validation/archive/python-tests/test_e3_runner.py",
+            "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py",
+            "Docs/authorization-validation/archive/python-tests/test_e5_model_check.py",
+            "Docs/authorization-validation/archive/python-tests/test_e5_model_check_two_mutations.py",
+            "Docs/authorization-validation/archive/python-tests/test_experiment_common.py",
+            "Docs/authorization-validation/archive/python-tests/test_experiment_register.py",
+            "Docs/authorization-validation/archive/python-tests/test_lifecycle_reducer.py",
+            "Docs/authorization-validation/archive/python-tests/test_model_acceptance.py",
+            "Docs/authorization-validation/archive/python-tests/test_node_adapter.py",
+            "Docs/authorization-validation/archive/python-tests/test_projection_owner_model.py",
+            "Docs/authorization-validation/archive/python-tests/test_run_single_node_campaign.py",
+            "Docs/authorization-validation/archive/python-tests/test_tenant_isolation_model.py",
+            "Docs/authorization-validation/archive/python-tests/test_unbounded_confirmation.py",
+            "Docs/authorization-validation/archive/python-tests/test_universal_hypotheses_check.py",
+            "scripts/tests/test_entrypoints.py",
+            "scripts/tests/test_evaluate_performance_acceptance.py",
+            "scripts/tests/test_performance_acceptance.py",
+            "scripts/tests/test_test_campaign.py",
+            "experiments/tdsc/protocol-runner/test_run_performance.py",
+            "Docs/实验/分布式测试/rust-s15/test_s15_validation.py",
+        ];
+        let mut total_methods = 0usize;
+        let crosswalk = fs::read_to_string(
+            root.join("Docs/authorization-validation/python-test-method-crosswalk.md"),
+        )
+        .expect("read Python-to-Rust method crosswalk");
+        let crosswalk_lines = crosswalk.lines().collect::<Vec<_>>();
+        for source in modules {
+            let contents = fs::read_to_string(root.join(source))
+                .unwrap_or_else(|error| panic!("read Python migration source {source}: {error}"));
+            let methods = contents
+                .lines()
+                .filter_map(|line| {
+                    let trimmed = line.trim_start();
+                    trimmed.strip_prefix("def test_").and_then(|name| {
+                        name.split_once('(').map(|(name, _)| format!("test_{name}"))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let method_count = methods.len();
+            assert!(
+                method_count > 0,
+                "Python unittest module has no test methods: {source}"
+            );
+            total_methods += method_count;
+            assert!(
+                manifest.suites.iter().any(|suite| {
+                    string_array(suite, "sources")
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|registered| registered == source)
+                }),
+                "Python unittest module is absent from every suite source list: {source}"
+            );
+            let marker = format!("<!-- python-source: {source} -->");
+            assert_eq!(
+                crosswalk_lines
+                    .iter()
+                    .filter(|line| line.trim() == marker)
+                    .count(),
+                1,
+                "crosswalk must contain exactly one source marker: {source}"
+            );
+            let marker_index = crosswalk_lines
+                .iter()
+                .position(|line| line.trim() == marker)
+                .unwrap();
+            let section_start = crosswalk_lines[marker_index + 1..]
+                .iter()
+                .position(|line| line.trim_start().starts_with('#'))
+                .map(|offset| marker_index + 1 + offset)
+                .unwrap_or_else(|| panic!("crosswalk source marker has no heading: {source}"));
+            let section_end = crosswalk_lines[section_start + 1..]
+                .iter()
+                .position(|line| line.trim_start().starts_with("#"))
+                .map(|offset| section_start + 1 + offset)
+                .unwrap_or(crosswalk_lines.len());
+            let section = &crosswalk_lines[section_start..section_end];
+            assert!(
+                crosswalk_lines[marker_index..section_end]
+                    .iter()
+                    .any(|line| line.contains(source)),
+                "crosswalk source section must identify full source path: {source}"
+            );
+            let section_header = crosswalk_lines[section_start].trim();
+            assert!(
+                section_header.contains(
+                    Path::new(source)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .expect("Python source filename")
+                ),
+                "crosswalk heading does not match source: {source}"
+            );
+            for method in methods {
+                let method_rows = section
+                    .iter()
+                    .filter(|line| line.contains('|') && line.contains(&format!("`{method}`")))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    method_rows.len(),
+                    1,
+                    "crosswalk source section must contain exactly one method row for {source}::{method}"
+                );
+                assert!(
+                    method_rows[0].matches('|').count() >= 4,
+                    "crosswalk method row must include source, Rust target, and status columns: {source}::{method}"
+                );
+                assert!(
+                    ["EQUIVALENT", "PARTIAL", "BLOCKED"]
+                        .iter()
+                        .any(|status| method_rows[0].contains(status)),
+                    "crosswalk method row must declare an evidence status: {source}::{method}"
+                );
+                assert_python_crosswalk_targets_exist(root, source, &method, method_rows[0]);
+            }
+        }
+        assert_eq!(
+            modules.len(),
+            25,
+            "the Python unittest module inventory changed"
+        );
+        assert_eq!(
+            total_methods, 622,
+            "the Python unittest method inventory changed"
+        );
+
+        let campaign = manifest
+            .suites
+            .iter()
+            .find(|suite| suite_id(suite) == "campaign-contracts")
+            .unwrap();
+        assert_eq!(str_field(campaign, "owner").unwrap(), "test-harness");
+        assert_eq!(str_field(campaign, "profile").unwrap(), "native-kernel");
+        assert_eq!(
+            string_array(campaign, "test_services").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(str_field(campaign, "acceptance").unwrap(), "rust");
+        assert_eq!(
+            campaign
+                .get("expected_tests")
+                .and_then(TomlValue::as_integer),
+            Some(33)
+        );
+        assert!(campaign.get("blocked_reason").is_none());
+        assert_eq!(
+            string_array(campaign, "argv").unwrap(),
+            vec![
+                "cargo",
+                "test",
+                "-p",
+                "test-harness",
+                "--locked",
+                "--lib",
+                "campaign::",
+                "--",
+                "--test-threads=1",
+                "--skip",
+                "shell_entrypoints_"
+            ]
+        );
+        assert_eq!(
+            campaign
+                .get("minimum_tests")
+                .and_then(TomlValue::as_integer),
+            Some(33)
+        );
+        assert!(campaign.get("blocked_reason").is_none());
+
+        let tenant_model = manifest
+            .suites
+            .iter()
+            .find(|suite| suite_id(suite) == "offline-tenant-model")
+            .unwrap();
+        assert_eq!(str_field(tenant_model, "owner").unwrap(), "test-harness");
+        assert_eq!(
+            str_field(tenant_model, "profile").unwrap(),
+            "offline-validation"
+        );
+        assert_eq!(str_field(tenant_model, "scope").unwrap(), "offline-model");
+        assert_eq!(str_field(tenant_model, "acceptance").unwrap(), "rust");
+        assert_eq!(
+            string_array(tenant_model, "test_services").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            string_array(tenant_model, "sources").unwrap(),
+            vec![
+                "test-harness/src/models.rs",
+                "Docs/authorization-validation/tools/tenant_isolation_model.py",
+                "Docs/authorization-validation/archive/python-tests/test_tenant_isolation_model.py",
+            ]
+        );
+        assert_eq!(
+            string_array(tenant_model, "argv").unwrap(),
+            vec![
+                "cargo",
+                "test",
+                "-p",
+                "test-harness",
+                "--locked",
+                "--lib",
+                "models::tests::",
+                "--",
+                "--test-threads=1",
+            ]
+        );
+        for field in ["minimum_tests", "expected_tests"] {
+            assert_eq!(
+                tenant_model.get(field).and_then(TomlValue::as_integer),
+                Some(8)
+            );
+        }
+        assert!(tenant_model.get("blocked_reason").is_none());
+
+        let parser_acceptance = manifest
+            .suites
+            .iter()
+            .find(|suite| suite_id(suite) == "performance-acceptance-parser-contracts")
+            .unwrap();
+        for source in [
+            "scripts/performance_acceptance.py",
+            "scripts/tests/test_performance_acceptance.py",
+        ] {
+            assert!(string_array(parser_acceptance, "sources")
+                .unwrap()
+                .iter()
+                .any(|registered| registered == source));
+        }
+        assert_eq!(
+            str_field(parser_acceptance, "owner").unwrap(),
+            "test-harness"
+        );
+        assert_eq!(
+            str_field(parser_acceptance, "profile").unwrap(),
+            "offline-validation"
+        );
+        assert_eq!(
+            string_array(parser_acceptance, "test_services").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(str_field(parser_acceptance, "acceptance").unwrap(), "rust");
+        assert_eq!(
+            string_array(parser_acceptance, "argv").unwrap(),
+            vec![
+                "cargo",
+                "test",
+                "-p",
+                "test-harness",
+                "--locked",
+                "--lib",
+                "acceptance::tests::",
+                "--",
+                "--test-threads=1",
+                "--skip",
+                "evaluate_acceptance::tests::",
+                "--skip",
+                "model_acceptance::tests::"
+            ]
+        );
+        for field in ["minimum_tests", "expected_tests"] {
+            assert_eq!(
+                parser_acceptance.get(field).and_then(TomlValue::as_integer),
+                Some(8)
+            );
+        }
+
+        let evaluate_acceptance = manifest
+            .suites
+            .iter()
+            .find(|suite| suite_id(suite) == "policy-evaluate-evidence-contracts")
+            .unwrap();
+        for source in [
+            "scripts/evaluate_performance_acceptance.py",
+            "scripts/tests/test_evaluate_performance_acceptance.py",
+        ] {
+            assert!(string_array(evaluate_acceptance, "sources")
+                .unwrap()
+                .iter()
+                .any(|registered| registered == source));
+        }
+        assert_eq!(
+            str_field(evaluate_acceptance, "owner").unwrap(),
+            "test-harness"
+        );
+        assert_eq!(
+            str_field(evaluate_acceptance, "profile").unwrap(),
+            "offline-validation"
+        );
+        assert_eq!(
+            string_array(evaluate_acceptance, "test_services").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            str_field(evaluate_acceptance, "acceptance").unwrap(),
+            "rust"
+        );
+        assert_eq!(
+            string_array(evaluate_acceptance, "argv").unwrap(),
+            vec![
+                "cargo",
+                "test",
+                "-p",
+                "test-harness",
+                "--locked",
+                "--lib",
+                "evaluate_acceptance::tests::",
+                "--",
+                "--test-threads=1"
+            ]
+        );
+        for field in ["minimum_tests", "expected_tests"] {
+            assert_eq!(
+                evaluate_acceptance
+                    .get(field)
+                    .and_then(TomlValue::as_integer),
+                Some(11)
+            );
+        }
+
+        for (id, expected_series, rust_filter, expected_tests, expected_sources) in [
+            (
+                "e1-frozen-result-contracts",
+                "E1",
+                "e1_frozen_result::tests::",
+                1,
+                vec![
+                    "test-harness/src/e1_frozen_result.rs",
+                    "Docs/authorization-validation/tools/e1_runner.py",
+                    "Docs/authorization-validation/archive/python-tests/test_e1_runner.py",
+                ],
+            ),
+            (
+                "e3-config-validation-contracts",
+                "E3",
+                "e3_config::tests::",
+                8,
+                vec![
+                    "test-harness/src/e3_config.rs",
+                    "Docs/authorization-validation/tools/e3_runner.py",
+                    "Docs/authorization-validation/archive/python-tests/test_e3_runner.py",
+                ],
+            ),
+            (
+                "e3-report-category-contracts",
+                "E3",
+                "e3_report::tests::",
+                16,
+                vec![
+                    "test-harness/src/e3_report.rs",
+                    "Docs/authorization-validation/tools/e3_e4.py",
+                    "Docs/authorization-validation/tools/e3_runner.py",
+                    "Docs/authorization-validation/archive/python-tests/test_e3_e4.py",
+                    "Docs/authorization-validation/archive/python-tests/test_e3_runner.py",
+                ],
+            ),
+            (
+                "e4-protocol-contract",
+                "E4",
+                "e4_protocol::tests::",
+                7,
+                vec![
+                    "test-harness/src/e4_protocol.rs",
+                    "Docs/authorization-validation/tools/e4_fault_driver.py",
+                    "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py",
+                    "Docs/authorization-validation/archive/python-tests/test_experiment_common.py",
+                ],
+            ),
+        ] {
+            let suite = manifest
+                .suites
+                .iter()
+                .find(|suite| suite_id(suite) == id)
+                .unwrap_or_else(|| panic!("missing offline contract suite {id}"));
+            assert_eq!(str_field(suite, "owner").unwrap(), "test-harness");
+            assert_eq!(str_field(suite, "profile").unwrap(), "offline-validation");
+            assert_eq!(str_field(suite, "scope").unwrap(), "offline-model");
+            assert_eq!(str_field(suite, "acceptance").unwrap(), "rust");
+            assert_eq!(
+                string_array(suite, "series").unwrap(),
+                vec![expected_series.to_owned()]
+            );
+            assert_eq!(
+                string_array(suite, "test_services").unwrap(),
+                Vec::<String>::new()
+            );
+            assert_eq!(
+                string_array(suite, "sources").unwrap(),
+                expected_sources
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                string_array(suite, "argv").unwrap(),
+                vec![
+                    "cargo",
+                    "test",
+                    "-p",
+                    "test-harness",
+                    "--locked",
+                    "--lib",
+                    rust_filter,
+                    "--",
+                    "--test-threads=1",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+            );
+            for field in ["minimum_tests", "expected_tests"] {
+                assert_eq!(
+                    suite.get(field).and_then(TomlValue::as_integer),
+                    Some(expected_tests),
+                    "{id} {field} must match the Rust test count"
+                );
+            }
+            assert!(suite.get("blocked_reason").is_none());
+        }
+
+        for (id, module, expected_tests, rust_filter) in [
+            (
+                "tdsc-performance-helper-contracts",
+                "experiments/tdsc/protocol-runner/test_run_performance.py",
+                10,
+                "tdsc_performance::tests::",
+            ),
+            (
+                "s15-validation-helper-contracts",
+                "Docs/实验/分布式测试/rust-s15/test_s15_validation.py",
+                6,
+                "s15_validation::tests::",
+            ),
+        ] {
+            let suite = manifest
+                .suites
+                .iter()
+                .find(|suite| suite_id(suite) == id)
+                .unwrap_or_else(|| panic!("missing native Rust suite {id}"));
+            assert_eq!(str_field(suite, "owner").unwrap(), "test-harness");
+            assert_eq!(str_field(suite, "profile").unwrap(), "offline-validation");
+            assert_eq!(
+                string_array(suite, "test_services").unwrap(),
+                Vec::<String>::new()
+            );
+            assert_eq!(str_field(suite, "scope").unwrap(), "component");
+            assert_eq!(str_field(suite, "acceptance").unwrap(), "rust");
+            assert_eq!(
+                string_array(suite, "sources").unwrap(),
+                vec![
+                    format!(
+                        "test-harness/src/{}.rs",
+                        if id.starts_with("tdsc") {
+                            "tdsc_performance"
+                        } else {
+                            "s15_validation"
+                        }
+                    ),
+                    module.to_owned(),
+                    if id.starts_with("tdsc") {
+                        "experiments/tdsc/protocol-runner/run-performance.py".to_owned()
+                    } else {
+                        "Docs/实验/分布式测试/rust-s15/s15_validation.py".to_owned()
+                    },
+                ]
+            );
+            assert_eq!(
+                string_array(suite, "argv").unwrap(),
+                vec![
+                    "cargo",
+                    "test",
+                    "-p",
+                    "test-harness",
+                    "--locked",
+                    "--lib",
+                    rust_filter,
+                    "--",
+                    "--test-threads=1"
+                ]
+            );
+            assert_eq!(
+                suite.get("minimum_tests").and_then(TomlValue::as_integer),
+                Some(expected_tests)
+            );
+            assert_eq!(
+                suite.get("expected_tests").and_then(TomlValue::as_integer),
+                Some(expected_tests)
+            );
+            assert!(suite.get("blocked_reason").is_none());
+        }
+    }
+
     #[test]
     fn manifest_entries_are_scoped_and_blocked_entries_are_not_dispatched() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let manifest = read_manifest(root).unwrap();
         assert_archived_python_migrations_are_accounted(root, &manifest);
+        assert_python_unittest_inventory_is_accounted(root, &manifest);
         assert!(manifest
             .suites
             .iter()
@@ -2014,7 +2939,28 @@ exit "${FAKE_CARGO_EXIT:-0}"
             .unwrap();
         assert!(e5_single.get("blocked_reason").is_none());
         assert_eq!(str_field(e5_single, "owner").unwrap(), "test-harness");
+        assert_eq!(
+            str_field(e5_single, "profile").unwrap(),
+            "offline-validation"
+        );
+        assert_eq!(str_field(e5_single, "scope").unwrap(), "offline-model");
         assert_eq!(str_field(e5_single, "acceptance").unwrap(), "rust");
+        assert_eq!(
+            string_array(e5_single, "test_services").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            string_array(e5_single, "sources").unwrap(),
+            vec![
+                "test-harness/src/e5_model.rs",
+                "test-harness/src/e5_model/report.rs",
+                "test-harness/src/bin/e5-model-check.rs",
+                "test-harness/tests/e5_model_check_cli.rs",
+                "test-harness/src/fixtures/e5-single-reference-28.json",
+                "Docs/authorization-validation/tools/e5_model_check.py",
+                "Docs/authorization-validation/archive/python-tests/test_e5_model_check.py",
+            ]
+        );
         assert_eq!(
             string_array(e5_single, "argv").unwrap(),
             vec![
@@ -2024,28 +2970,221 @@ exit "${FAKE_CARGO_EXIT:-0}"
                 "test-harness",
                 "--locked",
                 "--lib",
-                "e5_model::tests::full_contract_and_omission_counts_match_the_reference_checker",
+                "e5_model::tests::",
                 "--",
-                "--exact",
                 "--test-threads=1",
             ]
         );
-        for id in [
-            "e5-bounded-two-mutations",
-            "e5-universal-bounded",
-            "projection-owner-model-contracts",
-        ] {
-            let suite = manifest
-                .suites
-                .iter()
-                .find(|suite| suite_id(suite) == id)
-                .unwrap();
-            assert!(suite.get("blocked_reason").is_some(), "{id}");
-            assert!(
-                string_array(suite, "argv").unwrap_or_default().is_empty(),
-                "{id}"
-            );
-        }
+        assert_eq!(
+            e5_single
+                .get("minimum_tests")
+                .and_then(TomlValue::as_integer),
+            Some(16)
+        );
+        assert_eq!(
+            e5_single
+                .get("expected_tests")
+                .and_then(TomlValue::as_integer),
+            Some(16)
+        );
+        let e5_cli = manifest
+            .suites
+            .iter()
+            .find(|suite| suite_id(suite) == "e5-single-cli-contracts")
+            .expect("E5 CLI binary tests have a dedicated manifest suite");
+        assert_eq!(str_field(e5_cli, "owner").unwrap(), "test-harness");
+        assert_eq!(str_field(e5_cli, "profile").unwrap(), "offline-validation");
+        assert_eq!(str_field(e5_cli, "scope").unwrap(), "offline-model");
+        assert_eq!(str_field(e5_cli, "acceptance").unwrap(), "rust");
+        assert_eq!(
+            string_array(e5_cli, "test_services").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            string_array(e5_cli, "sources").unwrap(),
+            vec![
+                "test-harness/tests/e5_model_check_cli.rs",
+                "test-harness/src/bin/e5-model-check.rs",
+                "Docs/authorization-validation/tools/e5_model_check.py",
+                "Docs/authorization-validation/archive/python-tests/test_e5_model_check.py",
+            ]
+        );
+        assert_eq!(
+            string_array(e5_cli, "argv").unwrap(),
+            vec![
+                "cargo",
+                "test",
+                "-p",
+                "test-harness",
+                "--locked",
+                "--test",
+                "e5_model_check_cli",
+                "--",
+                "--test-threads=1",
+            ]
+        );
+        assert_eq!(
+            e5_cli.get("minimum_tests").and_then(TomlValue::as_integer),
+            Some(4)
+        );
+        assert_eq!(
+            e5_cli.get("expected_tests").and_then(TomlValue::as_integer),
+            Some(4)
+        );
+        let report_acceptance = manifest
+            .suites
+            .iter()
+            .find(|suite| suite_id(suite) == "e5-report-acceptance-contracts")
+            .unwrap();
+        assert_eq!(
+            report_acceptance
+                .get("minimum_tests")
+                .and_then(TomlValue::as_integer),
+            Some(4)
+        );
+        let e5_two_mutations = manifest
+            .suites
+            .iter()
+            .find(|suite| suite_id(suite) == "e5-bounded-two-mutations")
+            .unwrap();
+        assert!(e5_two_mutations.get("blocked_reason").is_none());
+        assert_eq!(str_field(e5_two_mutations, "acceptance").unwrap(), "rust");
+        assert_eq!(
+            str_field(e5_two_mutations, "owner").unwrap(),
+            "test-harness"
+        );
+        assert_eq!(
+            string_array(e5_two_mutations, "sources").unwrap(),
+            vec![
+                "test-harness/src/two_mutation_model.rs",
+                "Docs/authorization-validation/tools/e5_model_check_two_mutations.py",
+                "Docs/authorization-validation/archive/python-tests/test_e5_model_check_two_mutations.py",
+            ]
+        );
+        assert_eq!(
+            string_array(e5_two_mutations, "argv").unwrap(),
+            vec![
+                "cargo",
+                "test",
+                "-p",
+                "test-harness",
+                "--locked",
+                "--lib",
+                "two_mutation_model::tests::",
+                "--",
+                "--test-threads=1",
+            ]
+        );
+        let universal = manifest
+            .suites
+            .iter()
+            .find(|suite| suite_id(suite) == "e5-universal-bounded")
+            .unwrap();
+        assert!(universal.get("blocked_reason").is_none());
+        assert_eq!(str_field(universal, "acceptance").unwrap(), "rust");
+        assert_eq!(
+            string_array(universal, "argv").unwrap(),
+            vec![
+                "cargo",
+                "test",
+                "--release",
+                "-p",
+                "test-harness",
+                "--locked",
+                "--test",
+                "e5_universal_native",
+                "--",
+                "--ignored",
+                "--test-threads=1",
+            ]
+        );
+        assert_eq!(
+            universal
+                .get("minimum_tests")
+                .and_then(TomlValue::as_integer),
+            Some(1)
+        );
+
+        let evaluator = manifest
+            .suites
+            .iter()
+            .find(|suite| suite_id(suite) == "e5-universal-evaluator-contracts")
+            .unwrap();
+        assert!(evaluator.get("blocked_reason").is_none());
+        assert_eq!(str_field(evaluator, "owner").unwrap(), "test-harness");
+        assert_eq!(str_field(evaluator, "acceptance").unwrap(), "rust");
+        assert_eq!(
+            string_array(evaluator, "sources").unwrap(),
+            vec![
+                "test-harness/src/universal_hypotheses.rs",
+                "test-harness/src/model_acceptance.rs",
+                "Docs/authorization-validation/tools/universal_hypotheses_check.py",
+                "Docs/authorization-validation/tools/model_acceptance.py",
+                "Docs/authorization-validation/archive/python-tests/test_universal_hypotheses_check.py",
+            ]
+        );
+        assert_eq!(
+            string_array(evaluator, "argv").unwrap(),
+            vec![
+                "cargo",
+                "test",
+                "-p",
+                "test-harness",
+                "--locked",
+                "--lib",
+                "universal_hypotheses::tests::",
+                "--",
+                "--test-threads=1",
+            ]
+        );
+        assert_eq!(
+            evaluator
+                .get("minimum_tests")
+                .and_then(TomlValue::as_integer),
+            Some(7)
+        );
+
+        let projection_owner = manifest
+            .suites
+            .iter()
+            .find(|suite| suite_id(suite) == "projection-owner-model-contracts")
+            .unwrap();
+        assert!(projection_owner.get("blocked_reason").is_none());
+        assert_eq!(
+            str_field(projection_owner, "owner").unwrap(),
+            "test-harness"
+        );
+        assert_eq!(str_field(projection_owner, "acceptance").unwrap(), "rust");
+        assert_eq!(
+            string_array(projection_owner, "sources").unwrap(),
+            vec![
+                "test-harness/src/projection_owner_model.rs",
+                "Docs/authorization-validation/tools/projection_owner_model.py",
+                "Docs/authorization-validation/archive/python-tests/test_projection_owner_model.py",
+                "tests-suite/series/RQ3/native_projection_lifecycle.rs",
+                "tests-suite/series/RQ3/projection_owned_integration.rs",
+            ]
+        );
+        assert_eq!(
+            string_array(projection_owner, "argv").unwrap(),
+            vec![
+                "cargo",
+                "test",
+                "-p",
+                "test-harness",
+                "--locked",
+                "--lib",
+                "projection_owner_model::tests::",
+                "--",
+                "--test-threads=1",
+            ]
+        );
+        assert_eq!(
+            projection_owner
+                .get("minimum_tests")
+                .and_then(TomlValue::as_integer),
+            Some(15)
+        );
         let benefit = manifest
             .suites
             .iter()
@@ -2111,6 +3250,211 @@ exit "${FAKE_CARGO_EXIT:-0}"
                 .unwrap();
         assert_eq!(
             classify_output(&incompatible, 0, &complete, "", false)["status"],
+            "FAIL"
+        );
+        let no_records = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\\n";
+        assert_eq!(
+            classify_output(&evidence_suite, 0, no_records, "", false)["status"],
+            "FAIL"
+        );
+        for (exit_code, output, expected) in [
+            (101, no_records, "FAIL"),
+            (0, "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\\n", "FAIL"),
+            (0, "test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s\\n", "SKIP"),
+            (0, "[SKIP] missing assertion\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\\n", "SKIP"),
+            (124, no_records, "UNKNOWN"),
+        ] {
+            assert_eq!(
+                classify_output(&evidence_suite, exit_code, output, "", false)["status"],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_status_and_process_outcomes_keep_fail_closed_precedence() {
+        let command: TomlValue =
+            toml::from_str("acceptance='command'\nrequired_output='contract'\n").unwrap();
+        let unittest: TomlValue =
+            toml::from_str("acceptance='unittest'\nminimum_tests=1\n").unwrap();
+        let rust: TomlValue = toml::from_str("acceptance='rust'\nminimum_tests=1\n").unwrap();
+        let successful = [
+            (&command, "contract\n", ""),
+            (&unittest, "", "Ran 2 tests in 0.001s\n\nOK\n"),
+            (&rust, &rust_summary(1, 0, 0, 0), ""),
+        ];
+        for status in ["PENDING", "BLOCKED", "FAIL", "UNKNOWN", "SKIP"] {
+            for (suite, stdout, stderr) in successful {
+                for marker_stream in ["stdout", "stderr"] {
+                    let marker = format!("[{status}] explicit runner state\n");
+                    let out = if marker_stream == "stdout" {
+                        format!("{stdout}{marker}")
+                    } else {
+                        stdout.to_owned()
+                    };
+                    let err = if marker_stream == "stderr" {
+                        format!("{stderr}{marker}")
+                    } else {
+                        stderr.to_owned()
+                    };
+                    assert_eq!(
+                        classify_output(suite, 0, &out, &err, false)["status"],
+                        status,
+                        "{status}/{marker_stream}/{}",
+                        str_field(suite, "acceptance").unwrap()
+                    );
+                    let lower =
+                        format!("[{}] explicit runner state\n", status.to_ascii_lowercase());
+                    assert_eq!(
+                        classify_output(suite, 0, &format!("{stdout}{lower}"), stderr, false)
+                            ["status"],
+                        status,
+                        "lowercase {status}/{}",
+                        str_field(suite, "acceptance").unwrap()
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            classify_output(&command, 101, "contract\n[PENDING] unproven\n", "", false)["status"],
+            "FAIL"
+        );
+        assert_eq!(
+            classify_output(&command, 0, "contract\n[PENDING] unproven\n", "", true)["status"],
+            "UNKNOWN"
+        );
+        assert_eq!(
+            classify_output(&command, 0, "contract\n[UNKNOWN] unproven\n", "", false)["status"],
+            "UNKNOWN"
+        );
+        for code in [124, 130, 137, 143, -9] {
+            assert_eq!(
+                classify_output(&command, code, "", "", false)["status"],
+                "UNKNOWN"
+            );
+        }
+        assert_eq!(
+            classify_output(&command, 101, "", "", false)["status"],
+            "FAIL"
+        );
+    }
+
+    #[test]
+    fn model_dependency_and_required_output_acceptance_keep_contract_boundaries() {
+        let full_contract: TomlValue = toml::from_str(
+            "acceptance='model-json'\nmodel_contract='full-contract'\nmodel_name='single'\n",
+        )
+        .unwrap();
+        let single = full_model_report("single", false);
+        assert_eq!(
+            classify_output(&full_contract, 0, &single.to_string(), "", false)["status"],
+            "PASS"
+        );
+        let two_summary = full_model_report("two", true);
+        let two_contract: TomlValue = toml::from_str(
+            "acceptance='model-json'\nmodel_contract='full-contract'\nmodel_name='two'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            classify_output(&two_contract, 0, &two_summary.to_string(), "", false)["status"],
+            "PASS"
+        );
+        let mut incomplete = single.clone();
+        incomplete["fullContract"]["modes"]
+            .as_object_mut()
+            .unwrap()
+            .remove("strict");
+        assert_eq!(
+            classify_output(&full_contract, 0, &incomplete.to_string(), "", false)["status"],
+            "UNKNOWN"
+        );
+        let mut violation = single.clone();
+        violation["fullContract"]["modes"]["strict"]["violations"] = json!(1);
+        assert_eq!(
+            classify_output(&full_contract, 0, &violation.to_string(), "", false)["status"],
+            "FAIL"
+        );
+        assert_eq!(
+            classify_output(&full_contract, 0, "not-json", "", false)["status"],
+            "UNKNOWN"
+        );
+
+        let dependency_tree: TomlValue = toml::from_str("acceptance='dependency-tree'\n").unwrap();
+        assert_eq!(
+            classify_output(
+                &dependency_tree,
+                0,
+                "astral-single-node v0.1.0\nmysql v8\n",
+                "",
+                false
+            )["status"],
+            "PASS"
+        );
+        assert_eq!(
+            classify_output(
+                &dependency_tree,
+                0,
+                "astral-single-node v0.1.0\nredis v1\n",
+                "",
+                false
+            )["status"],
+            "FAIL"
+        );
+        assert_eq!(
+            classify_output(&dependency_tree, 0, "", "", false)["status"],
+            "FAIL"
+        );
+
+        let command: TomlValue =
+            toml::from_str("acceptance='command'\nrequired_output='12 scenarios passed'\n")
+                .unwrap();
+        assert_eq!(
+            classify_output(&command, 0, "", "", false)["status"],
+            "FAIL"
+        );
+        assert_eq!(
+            classify_output(&command, 0, "12 scenarios passed", "", false)["status"],
+            "PASS"
+        );
+    }
+
+    #[test]
+    fn cpu_performance_matrix_requires_exact_unique_cases_and_fifteen_samples() {
+        let item: TomlValue =
+            toml::from_str("acceptance='rust'\nminimum_tests=1\nperformance_cases=2\n").unwrap();
+        let samples = serde_json::to_string(&vec![10; 15]).unwrap();
+        let one = format!("PERF_MATRIX {{\"case\":\"one\",\"samples\":{samples}}}");
+        let two = format!("PERF_MATRIX {{\"case\":\"two\",\"samples\":{samples}}}");
+        let complete = format!("{one}\n{two}\n{}", rust_summary(1, 0, 0, 0));
+        let accepted = classify_output(&item, 0, &complete, "", false);
+        assert_eq!(accepted["status"], "PASS", "{accepted}");
+        assert_eq!(accepted["performance"]["cases"], 2);
+        assert_eq!(accepted["tests"]["passed"], 1);
+        for malformed in [
+            rust_summary(1, 0, 0, 0),
+            format!("{one}\n{one}\n{}", rust_summary(1, 0, 0, 0)),
+            format!(
+                "{one}\nPERF_MATRIX {{\"case\":\"two\",\"samples\":[]}}\n{}",
+                rust_summary(1, 0, 0, 0)
+            ),
+            format!(
+                "PERF_MATRIX {{\"case\":\"one\",\"samples\":[{}]}}\n{two}\n{}",
+                vec!["true"; 15].join(","),
+                rust_summary(1, 0, 0, 0)
+            ),
+        ] {
+            assert_eq!(
+                classify_output(&item, 0, &malformed, "", false)["status"],
+                "FAIL",
+                "{malformed}"
+            );
+        }
+        assert_eq!(
+            classify_output(&item, 0, &complete, "", true)["status"],
+            "UNKNOWN"
+        );
+        assert_eq!(
+            classify_output(&item, 101, &complete, "", false)["status"],
             "FAIL"
         );
     }
@@ -2187,6 +3531,110 @@ exit "${FAKE_CARGO_EXIT:-0}"
 
     #[cfg(unix)]
     #[test]
+    fn execute_waits_for_descendant_stderr_and_hashes_the_frozen_bytes() {
+        let directory = TestDirectory::new();
+        let suite = command_suite(
+            &[
+                "/bin/sh",
+                "-c",
+                "(/bin/sleep 0.2; printf 'descendant complete\\n' >&2) & printf 'parent complete\\n'",
+            ],
+            5,
+        );
+        let result =
+            execute_posix(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
+        assert_eq!(result["status"], "PASS", "{result}");
+        assert_eq!(result["log_integrity"], "complete");
+        let stderr_path = result["stderr"].as_str().unwrap();
+        let stderr = fs::read(stderr_path).unwrap();
+        assert!(String::from_utf8_lossy(&stderr).contains("descendant complete"));
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(fs::read(stderr_path).unwrap(), stderr);
+        assert_eq!(
+            result["stderr_sha256"],
+            format!("{:x}", Sha256::digest(&stderr))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_timeout_waits_for_delayed_descendant_stderr_before_hashing() {
+        let directory = TestDirectory::new();
+        use std::os::unix::fs::PermissionsExt;
+        let child = directory.0.join("delayed-child.sh");
+        fs::write(
+            &child,
+            "#!/bin/sh\ntrap 'sleep 0.25; printf \"descendant shutdown\\n\" >&2; exit 0' TERM\nwhile :; do /bin/sleep 0.1; done\n",
+        )
+        .unwrap();
+        let parent = directory.0.join("parent.sh");
+        fs::write(&parent, format!("#!/bin/sh\n{} &\nwait\n", child.display())).unwrap();
+        for script in [&child, &parent] {
+            let mut permissions = fs::metadata(script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(script, permissions).unwrap();
+        }
+        let suite = command_suite(&[parent.to_str().unwrap()], 1);
+        let result =
+            execute_posix(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
+        assert_eq!(result["status"], "UNKNOWN", "{result}");
+        assert_eq!(result["stream_disconnect"], true);
+        let stderr_path = result["stderr"].as_str().unwrap();
+        let stderr = fs::read(stderr_path).unwrap();
+        assert!(String::from_utf8_lossy(&stderr).contains("descendant shutdown"));
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(fs::read(stderr_path).unwrap(), stderr);
+        assert_eq!(
+            result["stderr_sha256"],
+            format!("{:x}", Sha256::digest(&stderr))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_redacts_short_secrets_normalizes_newlines_and_hashes_exact_artifacts() {
+        let directory = TestDirectory::new();
+        let suite = command_suite(
+            &[
+                "/bin/sh",
+                "-c",
+                "printf 'abc123 key-value mixed-case private-value visible mysql://fixture@localhost/db\\r\\n'; printf 'private-value stderr\\r\\n' >&2",
+            ],
+            5,
+        );
+        let environment = BTreeMap::from([
+            (OsString::from("API_KEY"), OsString::from("abc123")),
+            (OsString::from("ACCESS_KEY"), OsString::from("key-value")),
+            (OsString::from("apiKey"), OsString::from("mixed-case")),
+            (
+                OsString::from("PRIVATE_KEY"),
+                OsString::from("private-value"),
+            ),
+            (OsString::from("ORDINARY"), OsString::from("visible")),
+        ]);
+        let result = execute_posix(&suite, &environment, &directory.0, &directory.0, 1024).unwrap();
+        assert_eq!(result["status"], "PASS", "{result}");
+        for stream in ["stdout", "stderr"] {
+            let bytes = fs::read(result[stream].as_str().unwrap()).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains("abc123"));
+            assert!(!text.contains("key-value"));
+            assert!(!text.contains("mixed-case"));
+            assert!(!text.contains("private-value"));
+            assert!(!text.contains("mysql://"));
+            assert!(!bytes.windows(2).any(|pair| pair == b"\r\n"));
+            assert_eq!(
+                result[format!("{stream}_sha256")],
+                format!("{:x}", Sha256::digest(&bytes))
+            );
+        }
+        assert!(fs::read_to_string(result["stdout"].as_str().unwrap())
+            .unwrap()
+            .contains("visible"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn execute_marks_fast_oversized_logs_unknown_and_keeps_bounded_prefix() {
         let directory = TestDirectory::new();
         let suite = command_suite(&["/bin/sh", "-c", "printf 12345; printf abcde >&2"], 5);
@@ -2226,61 +3674,275 @@ exit "${FAKE_CARGO_EXIT:-0}"
     #[test]
     fn native_environment_clears_live_credentials() {
         let item: TomlValue = toml::from_str("id='x'\nprofile='native-kernel'\ntest_services=[]\nseries=['E1']\nscope='component'\nowner='x'\nboundary='x'\nsources=[]\nargv=['cargo','test']\nacceptance='rust'\n").unwrap();
-        let input = vec![
-            (
-                "DATABASE_URL".into(),
-                "mysql://secret@127.0.0.1:3308/db".into(),
-            ),
-            (
-                "RABBITMQ_URL".into(),
-                "amqp://secret@127.0.0.1:5673/vhost".into(),
-            ),
-        ];
+        let input = isolated_environment();
         let (result, error) = prepare_environment(&item, &input);
         assert!(error.is_none());
-        assert!(!result.contains_key(std::ffi::OsStr::new("DATABASE_URL")));
+        for name in [
+            "DATABASE_URL",
+            "REDIS_URL",
+            "RABBITMQ_URL",
+            "RUST_INTEGRATION_REQUIRED",
+            "ASTRAL_TEST_DATABASE_NAME",
+            "INTEGRATION_IDENTITY_MAPPING_DATABASE_URL",
+            "INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE",
+            "ASTRAL_MIGRATION_ENV",
+            "COMPOSE_PROFILES",
+        ] {
+            assert!(!result.contains_key(std::ffi::OsStr::new(name)), "{name}");
+        }
         assert_eq!(
             result
                 .get(std::ffi::OsStr::new("ASTRAL_MESSAGE_TRANSPORT"))
                 .unwrap(),
             "local"
         );
+        assert_eq!(
+            result
+                .get(std::ffi::OsStr::new("ASTRAL_REDIS_PROJECTION_COMPAT"))
+                .unwrap(),
+            "false"
+        );
+    }
+
+    #[test]
+    fn native_profiles_select_only_declared_services_and_suite_mode() {
+        let mut parent = isolated_environment();
+        parent.push((
+            "ASTRAL_PROJECTION_EXECUTION_MODE".into(),
+            "worker-owned".into(),
+        ));
+        let mut inherited = parent.clone();
+        inherited.push((
+            "ASTRAL_PROJECTION_EXECUTION_MODE".into(),
+            "worker-owned".into(),
+        ));
+        let kernel: TomlValue = toml::from_str("id='kernel'\nprofile='native-kernel'\ntest_services=[]\nseries=['E1']\nscope='component'\nowner='x'\nboundary='x'\nsources=[]\nargv=['cargo','test']\nacceptance='rust'\n").unwrap();
+        let (env, error) = prepare_environment(&kernel, &inherited);
+        assert!(error.is_none());
+        assert!(!env.contains_key(std::ffi::OsStr::new("ASTRAL_PROJECTION_EXECUTION_MODE")));
+        assert!(!env.contains_key(std::ffi::OsStr::new("DATABASE_URL")));
+        assert!(!env.contains_key(std::ffi::OsStr::new("RABBITMQ_URL")));
+        assert!(!env.contains_key(std::ffi::OsStr::new("REDIS_URL")));
+
+        let rabbit: TomlValue = toml::from_str("id='rabbit'\nprofile='standalone-rabbit'\ntest_services=['mysql','rabbitmq']\nseries=['RQ3']\nscope='integration'\nowner='x'\nboundary='x'\nsources=[]\nargv=['cargo','test']\nacceptance='rust'\n").unwrap();
+        let (env, error) = prepare_environment(&rabbit, &parent);
+        assert!(error.is_none(), "{error:?}");
+        assert!(env.contains_key(std::ffi::OsStr::new("RABBITMQ_URL")));
+        assert!(!env.contains_key(std::ffi::OsStr::new("REDIS_URL")));
+        assert_eq!(
+            env[std::ffi::OsStr::new("ASTRAL_MESSAGE_TRANSPORT")],
+            "rabbit"
+        );
+        let mut bad_vhost = parent.clone();
+        bad_vhost
+            .iter_mut()
+            .find(|(key, _)| key == "RABBITMQ_URL")
+            .unwrap()
+            .1 = "amqp://fixture@127.0.0.1:5673/".into();
+        assert!(prepare_environment(&rabbit, &bad_vhost).1.is_some());
+
+        let redis: TomlValue = toml::from_str("id='redis'\nprofile='redis-compat'\ntest_services=['mysql','redis']\nseries=['COMPAT']\nscope='integration'\nowner='x'\nboundary='x'\nsources=[]\nargv=['cargo','test']\nacceptance='rust'\n").unwrap();
+        let (env, error) = prepare_environment(&redis, &parent);
+        assert!(error.is_none(), "{error:?}");
+        assert!(env.contains_key(std::ffi::OsStr::new("REDIS_URL")));
+        assert!(!env.contains_key(std::ffi::OsStr::new("RABBITMQ_URL")));
+        assert_eq!(
+            env[std::ffi::OsStr::new("ASTRAL_REDIS_PROJECTION_COMPAT")],
+            "true"
+        );
+        let mut bad_redis = parent.clone();
+        bad_redis
+            .iter_mut()
+            .find(|(key, _)| key == "REDIS_URL")
+            .unwrap()
+            .1 = "redis://example.invalid:6380/0".into();
+        assert!(prepare_environment(&redis, &bad_redis).1.is_some());
     }
 
     #[test]
     fn preflight_requires_an_exact_isolated_database_and_loopback_service() {
         let item: TomlValue = toml::from_str("id='x'\nprofile='standalone-rabbit'\ntest_services=['mysql','rabbitmq']\nseries=['RQ3']\nscope='integration'\nowner='x'\nboundary='x'\nsources=[]\nargv=['cargo','test']\nacceptance='rust'\n").unwrap();
-        let input = vec![
-            ("TEST_USE_EXISTING".into(), "1".into()),
-            ("ASTRAL_MIGRATION_ENV".into(), "isolated".into()),
-            ("RUST_INTEGRATION_REQUIRED".into(), "1".into()),
-            (
-                "DATABASE_URL".into(),
-                "mysql://fixture@127.0.0.1:3308/astral_rehearsal_contract".into(),
-            ),
-            (
-                "ASTRAL_TEST_DATABASE_NAME".into(),
-                "astral_rehearsal_contract".into(),
-            ),
-            (
-                "RABBITMQ_URL".into(),
-                "amqp://fixture@127.0.0.1:5673/%2f".into(),
-            ),
-        ];
+        let input = isolated_environment();
         let (good, error) = prepare_environment(&item, &input);
         assert!(error.is_none(), "{error:?}");
         assert!(good.contains_key(std::ffi::OsStr::new("DATABASE_URL")));
         let mut bad = input.clone();
-        bad[3].1 = "mysql://fixture@example.invalid:3308/astral_rehearsal_contract".into();
+        bad.iter_mut()
+            .find(|(key, _)| key == "DATABASE_URL")
+            .unwrap()
+            .1 = "mysql://fixture@example.invalid:3308/astral_rehearsal_contract".into();
         assert!(prepare_environment(&item, &bad).1.is_some());
+
+        for (key, value) in [
+            ("TEST_USE_EXISTING", "0"),
+            ("ASTRAL_MIGRATION_ENV", "production"),
+            ("RUST_INTEGRATION_REQUIRED", "0"),
+        ] {
+            let mut missing = input.clone();
+            missing.iter_mut().find(|(name, _)| name == key).unwrap().1 = value.into();
+            assert!(prepare_environment(&item, &missing).1.is_some(), "{key}");
+        }
+        for name in [
+            "astral_test",
+            "astral_rehearsal_",
+            "astral_rehearsal_uppercase",
+            "astral_rehearsal_bad-hyphen",
+            "astral_rehearsal_other",
+        ] {
+            let mut mismatch = input.clone();
+            mismatch
+                .iter_mut()
+                .find(|(key, _)| key == "DATABASE_URL")
+                .unwrap()
+                .1 = format!("mysql://fixture@127.0.0.1:3308/{name}").into();
+            assert!(prepare_environment(&item, &mismatch).1.is_some(), "{name}");
+        }
+        for value in [
+            "mysql://fixture@127.0.0.1:3306/astral_rehearsal_contract",
+            "mysql://fixture@127.0.0.1:3308/astral_rehearsal_contract?option=1",
+        ] {
+            let mut mismatch = input.clone();
+            mismatch
+                .iter_mut()
+                .find(|(key, _)| key == "DATABASE_URL")
+                .unwrap()
+                .1 = value.into();
+            assert!(prepare_environment(&item, &mismatch).1.is_some(), "{value}");
+        }
+    }
+
+    #[test]
+    fn dedicated_identity_mapping_requires_its_exact_run_scoped_database() {
+        let item: TomlValue = toml::from_str("id='mapping'\nprofile='native-single-node'\ntest_services=['mysql']\nseries=['M5']\nscope='integration'\ndatabase_scope='identity-mapping'\nowner='x'\nboundary='x'\nsources=[]\nargv=['cargo','test']\nacceptance='rust'\n").unwrap();
+        let mut input = isolated_environment();
+        input.retain(|(key, _)| {
+            key != "INTEGRATION_IDENTITY_MAPPING_DATABASE_URL"
+                && key != "INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE"
+        });
+        assert!(prepare_environment(&item, &input).1.is_some());
+
+        let mut valid = isolated_environment();
+        valid
+            .iter_mut()
+            .find(|(key, _)| key == "INTEGRATION_IDENTITY_MAPPING_DATABASE_URL")
+            .unwrap()
+            .1 = "mysql://fixture@127.0.0.1:3308/sdk_identity_mapping_test_run_01".into();
+        valid
+            .iter_mut()
+            .find(|(key, _)| key == "INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE")
+            .unwrap()
+            .1 = "sdk_identity_mapping_test_run_01".into();
+        let (prepared, error) = prepare_environment(&item, &valid);
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(
+            prepared[std::ffi::OsStr::new("DATABASE_URL")],
+            valid
+                .iter()
+                .find(|(key, _)| key == "INTEGRATION_IDENTITY_MAPPING_DATABASE_URL")
+                .unwrap()
+                .1
+        );
+        assert_eq!(
+            prepared[std::ffi::OsStr::new("INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE")],
+            "sdk_identity_mapping_test_run_01"
+        );
+        for name in [
+            "sdk_identity_mapping_test_",
+            "sdk_identity_mapping_test_upper-case",
+        ] {
+            let mut invalid = valid.clone();
+            invalid
+                .iter_mut()
+                .find(|(key, _)| key == "INTEGRATION_IDENTITY_MAPPING_DATABASE_URL")
+                .unwrap()
+                .1 = format!("mysql://fixture@127.0.0.1:3308/{name}").into();
+            invalid
+                .iter_mut()
+                .find(|(key, _)| key == "INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE")
+                .unwrap()
+                .1 = name.into();
+            assert!(prepare_environment(&item, &invalid).1.is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn unittest_acceptance_requires_a_nonempty_ok_summary_and_preserves_skips() {
+        let item: TomlValue = toml::from_str("acceptance='unittest'\nminimum_tests=1\n").unwrap();
+        assert_eq!(
+            classify_output(&item, 0, "", "Ran 2 tests in 0.001s\n\nOK\n", false)["status"],
+            "PASS"
+        );
+        assert_eq!(
+            classify_output(&item, 0, "", "Ran 0 tests in 0.001s\n\nOK\n", false)["status"],
+            "FAIL"
+        );
+        assert_eq!(
+            classify_output(
+                &item,
+                0,
+                "",
+                "Ran 2 tests in 0.001s\n\nOK (skipped=1)\n",
+                false
+            )["status"],
+            "SKIP"
+        );
+        assert_eq!(
+            classify_output(&item, 0, "", "OK\n", false)["status"],
+            "FAIL"
+        );
+        assert_eq!(
+            classify_output(
+                &item,
+                0,
+                "",
+                "Ran 1 test in 0.001s\n\nFAIL: test_contract\n",
+                false
+            )["status"],
+            "FAIL"
+        );
+        assert_eq!(
+            classify_output(
+                &item,
+                0,
+                "[skip] optional\n",
+                "Ran 2 tests in 0.001s\n\nOK\n",
+                false
+            )["status"],
+            "SKIP"
+        );
+        assert_eq!(
+            classify_output(&item, 101, "", "Ran 2 tests in 0.001s\n\nOK\n", false)["status"],
+            "FAIL"
+        );
+        assert_eq!(
+            classify_output(&item, 0, "", "Ran 2 tests in 0.001s\n\nOK\n", true)["status"],
+            "UNKNOWN"
+        );
     }
 
     #[test]
     fn secrets_urls_and_status_folding_remain_fail_closed() {
-        let env = vec![("API_KEY".into(), "secret-value".into())];
-        let scrubbed = scrub_log("key=secret-value db=mysql://user@host/db", &env);
-        assert!(!scrubbed.contains("secret-value"));
-        assert!(!scrubbed.contains("mysql://"));
+        let env = vec![
+            ("API_KEY".into(), "secret-value".into()),
+            ("ACCESS_KEY".into(), "abc123".into()),
+            ("apiKey".into(), "mixed-case".into()),
+            ("PRIVATE_KEY".into(), "private-value".into()),
+            ("ORDINARY".into(), "visible".into()),
+        ];
+        let scrubbed = scrub_log(
+            "key=secret-value short=abc123 mixed=mixed-case private=private-value visible=mysql://user@host/db",
+            &env,
+        );
+        for secret in [
+            "secret-value",
+            "abc123",
+            "mixed-case",
+            "private-value",
+            "mysql://",
+        ] {
+            assert!(!scrubbed.contains(secret), "{secret}");
+        }
+        assert!(scrubbed.contains("visible"));
         assert_eq!(
             fold_status(&[json!({"status":"PASS"}), json!({"status":"UNKNOWN"})]),
             "UNKNOWN"

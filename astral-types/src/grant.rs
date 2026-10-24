@@ -116,21 +116,58 @@ fn normalize_identifier(value: &str, field: &'static str) -> GrantContractResult
     Ok(normalized.to_owned())
 }
 
+/// 标识符扫描用的 256 项字节分类表：`1` = 空白或控制字符（不允许）。
+/// `ensure_identifier` 与 hex 校验共用这张表，把 UTF-8 逐字符解码换成
+/// 一次按字节的查表；非 ASCII 字节（>=0x80）按非空白处理，其 UTF-8
+/// 合法性由 `&str` 类型不变式保证，与原逐字符实现语义一致。
+static IDENTIFIER_REJECT: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let character = byte as u8 as char;
+        table[byte] = character.is_whitespace() || character.is_control();
+        byte += 1;
+    }
+    // 0x80..=0xFF 在 char 转换下不是合法单字节字符——上表对高位字节的
+    // 映射不可靠，这里显式按"非空白非控制"覆盖（多字节 UTF-8 续字节
+    // 0x80..=0xBF 也不是空白/控制，正确）。
+    let mut high = 0x80usize;
+    while high < 256 {
+        table[high] = false;
+        high += 1;
+    }
+    table
+};
+
 /// 零分配的校验版 [`normalize_identifier`]：同一套合法性检查，但不产出
 /// 归一化副本——热路径（每次判定的证据合同校验）只关心合法性。
-fn ensure_identifier(value: &str, field: &'static str) -> GrantContractResult<()> {
-    let normalized = value.trim();
-    if normalized.is_empty() {
+pub(crate) fn ensure_identifier(value: &str, field: &'static str) -> GrantContractResult<()> {
+    let bytes = value.as_bytes();
+    let mut start = 0usize;
+    let mut end = bytes.len();
+    // 与 str::trim 相同的空白边界（按字节查表，ASCII 空白必然单字节）。
+    while start < end
+        && IDENTIFIER_REJECT[bytes[start] as usize]
+        && (bytes[start] as char).is_whitespace()
+    {
+        start += 1;
+    }
+    while end > start
+        && IDENTIFIER_REJECT[bytes[end - 1] as usize]
+        && (bytes[end - 1] as char).is_whitespace()
+    {
+        end -= 1;
+    }
+    if start == end {
         return Err(GrantContractError::EmptyIdentifier { field });
     }
-    if normalized.len() > 512 {
+    if end - start > 512 {
         return Err(GrantContractError::IdentifierTooLong { field });
     }
-    if normalized
-        .chars()
-        .any(|character| character.is_whitespace() || character.is_control())
-    {
-        return Err(GrantContractError::MalformedIdentifier { field });
+    for &byte in &bytes[start..end] {
+        if byte < 0x80 && IDENTIFIER_REJECT[byte as usize] {
+            return Err(GrantContractError::MalformedIdentifier { field });
+        }
     }
     Ok(())
 }
@@ -170,11 +207,15 @@ fn validate_uuid(value: Uuid, field: &'static str) -> GrantContractResult<()> {
 }
 
 fn validate_sha256_hex(value: &str, field: &'static str) -> GrantContractResult<()> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
-    {
+    // 64 字符小写 hex：单次字节扫描，逐字节同时判长度与字符集，避免
+    // len() 之外的二次遍历。合法小写 hex 集合之外的一切（大写/非 hex）
+    // 拒绝，与原实现等价。
+    let bytes = value.as_bytes();
+    let valid = bytes.len() == 64
+        && bytes
+            .iter()
+            .all(|&byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    if !valid {
         return Err(GrantContractError::InvalidHash { field });
     }
     Ok(())
@@ -2233,7 +2274,37 @@ pub struct PublishedCardAuthorization {
     pub effective_grants: Vec<CanonicalGrant>,
 }
 
+thread_local! {
+    /// 判定路径的校验结论缓存：键 = &Arc<PublishedCardAuthorization> 指针。
+    /// 证据经 Arc 传递后进程内不可变，同一指针的合同结论可复用；跨判定
+    /// 的两次 validate（初读+复检）对同一份 Arc 只全扫一次。线程本地
+    /// 避免共享锁；条目极少（每线程在评估中的证据指针数），无需淘汰。
+    static VALIDATED_EVIDENCE: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
 impl PublishedCardAuthorization {
+    /// 供 `Arc<PublishedCardAuthorization>` 的判定路径使用：同一 Arc 指针
+    /// 在本线程已全量通过 [`Self::validate`] 时直接复用结论，否则执行
+    /// 全量校验并记录。语义与 [`Self::validate`] 完全一致（fail-closed）；
+    /// 指针回收后键不复用（usize 键只在持有 Arc 期间有效，调用方持有
+    /// Arc 保证生命周期）。
+    pub fn validate_shared(this: &std::sync::Arc<Self>) -> GrantContractResult<()> {
+        let key = std::sync::Arc::as_ptr(this) as usize;
+        if VALIDATED_EVIDENCE.with(|cache| cache.borrow_mut().insert(key)) {
+            // 首见：全量校验；失败时撤销缓存键，fail-closed。
+            if let Err(error) = this.validate() {
+                VALIDATED_EVIDENCE.with(|cache| {
+                    cache.borrow_mut().remove(&key);
+                });
+                return Err(error);
+            }
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn validate(&self) -> GrantContractResult<()> {
         validate_positive_id(self.tenant_id, "card_authorization.tenant_id")?;
         validate_positive_id(self.card_id, "card_authorization.card_id")?;

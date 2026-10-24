@@ -152,7 +152,7 @@ impl PolicyEngine {
         };
 
         // 畸形证据（合同校验失败）→ fail-closed，不区分内部形态。
-        if evidence.validate().is_err() {
+        if PublishedCardAuthorization::validate_shared(&evidence).is_err() {
             steps.push(step(
                 "PUBLISHED_EVIDENCE",
                 "DENY",

@@ -90,6 +90,24 @@ fn deterministic_grant_id(seed: u64) -> GrantId {
     .unwrap()
 }
 
+/// 与 astral_types::grant::ensure_identifier 相同的检查（本地副本，仅归因用）。
+fn ensure_id_local(value: &str, field: &'static str) -> Result<(), &'static str> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return Err(field);
+    }
+    if normalized.len() > 512 {
+        return Err(field);
+    }
+    if normalized
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(field);
+    }
+    Ok(())
+}
+
 fn noise_grant(index: usize) -> CanonicalGrant {
     CanonicalGrant {
         grant_id: deterministic_grant_id(index as u64),
@@ -385,7 +403,7 @@ fn authorization_ceiling_probe() {
         let eval_allocs = ALLOCS.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
         let eval_bytes = ALLOC_BYTES.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
         COUNTING.store(false, Ordering::Relaxed);
-        // 归因二分：合同校验（validate）单独的耗时与分配。
+        // 归因二分：合同校验（validate）单独的耗时与分配，再拆三族扫描。
         let va = Instant::now();
         COUNTING.store(true, Ordering::Relaxed);
         ALLOCS.store(0, Ordering::Relaxed);
@@ -395,8 +413,47 @@ fn authorization_ceiling_probe() {
         let validate_allocs = ALLOCS.load(Ordering::Relaxed) as f64 / alloc_ops as f64;
         COUNTING.store(false, Ordering::Relaxed);
         let validate_ns = va.elapsed().as_nanos() as f64 / alloc_ops as f64;
+
+        // 族 A：标识符扫描（ensure_identifier 的逐字符检查）。
+        let mut id_start = Instant::now();
+        let mut id_sink = 0usize;
+        for grant in &repo.evidence.effective_grants {
+            id_sink += grant.resource.len()
+                + grant.action.len()
+                + grant.provenance.operation_id.len()
+                + grant.provenance.source_id.len();
+        }
+        for _ in 0..alloc_ops {
+            for grant in &repo.evidence.effective_grants {
+                id_sink &= ensure_id_local(&grant.resource, "r")
+                    .map(|_| 1)
+                    .unwrap_or(0)
+                    + ensure_id_local(&grant.action, "a").map(|_| 1).unwrap_or(0);
+                id_sink &= ensure_id_local(&grant.provenance.source_id, "s")
+                    .map(|_| 1)
+                    .unwrap_or(0);
+                id_sink &= ensure_id_local(&grant.provenance.operation_id, "o")
+                    .map(|_| 1)
+                    .unwrap_or(0);
+            }
+        }
+        let id_ns = id_start.elapsed().as_nanos() as f64 / alloc_ops as f64;
+
+        // 族 B：对位相等比较（effective vs records 的 accepted 子集）。
+        let eq_start = Instant::now();
+        for _ in 0..alloc_ops {
+            for (effective, record) in repo
+                .evidence
+                .effective_grants
+                .iter()
+                .zip(repo.evidence.records.iter())
+            {
+                std::hint::black_box(*effective == record.grant);
+            }
+        }
+        let eq_ns = eq_start.elapsed().as_nanos() as f64 / alloc_ops as f64;
         eprintln!(
-            "[{size:>4} grants] validate alone: {validate_ns:.0} ns, {validate_allocs:.1} allocs"
+            "[{size:>4} grants] validate alone: {validate_ns:.0} ns, {validate_allocs:.1} allocs | id-scan {id_ns:.0} ns | pairwise-eq {eq_ns:.0} ns (sink {id_sink})"
         );
         eprintln!(
             "[{size:>4} grants] per-op: read-face {load_allocs:.1} | evaluate {eval_allocs:.1} allocs / {eval_bytes:.0} bytes (engine-side ~{:.1})",

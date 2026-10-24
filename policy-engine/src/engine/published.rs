@@ -558,72 +558,192 @@ pub(crate) fn finish_published_evaluation(
 /// - 条件：`CanonicalGrant` 合同当前不含 condition 字段，所有 effective grant
 ///   均为无条件 ALLOW；匹配器不得把任何未来/非法 condition 表示当作已满足
 ///   （合同层 serde/ledger 对新字段 fail-closed），本函数只消费无条件集合。
-pub(crate) fn match_published_effective_grant<'a>(
+///
+/// 匹配器接力的技术 B：按资源类型（`parse_resource_key` 语义的类型段）
+/// 预索引 effective_grants。技术 A（线性扫描）小 N 最优（零构建成本），
+/// 大 N/尾部命中退化为 O(N) 逐条字符串解析；技术 B 构建 O(N) 一次、每
+/// 判定 O(桶大小 + 通配桶)。证据经 Arc 跨判定复用后构建成本摊销。
+///
+/// 缓存与 `validate_shared` 同构：线程本地单槽持有 (Arc, 索引)——强引用
+/// 保证地址在缓存期间不复用（无 ABA）；`Arc::ptr_eq` 命中即同一证据同一
+/// 内容，索引有效。索引只存下标，不克隆 grant。
+struct MatcherIndex {
+    /// 解析后的类型段 → 该类型全部 grant 的下标（含对象级与类型级）。
+    by_type: std::collections::HashMap<String, Vec<usize>>,
+    /// `*` 全局通配段下标（可命中任何请求类型）。
+    wildcard: Vec<usize>,
+}
+
+thread_local! {
+    static MATCHER_INDEX_CACHE: std::cell::RefCell<
+        Option<(
+            std::sync::Arc<PublishedCardAuthorization>,
+            MatcherIndex,
+        )>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// 线性扫描/索引的接力阈值：实测曲线（matcher_curve 探针，混合类型）——
+/// N=1000 线性尾位 5.8µs，索引构建 ~100µs 需在同一证据上摊销；N 超过
+/// 该值且证据被复用（L1 命中的常态）时索引回本。
+pub(crate) const MATCHER_INDEX_THRESHOLD: usize = 1000;
+
+fn build_matcher_index(evidence: &PublishedCardAuthorization) -> MatcherIndex {
+    let mut by_type: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut wildcard = Vec::new();
+    for (index, grant) in evidence.effective_grants.iter().enumerate() {
+        let (grant_type, _) = parse_resource_key(&grant.resource);
+        if grant_type == "*" {
+            wildcard.push(index);
+        } else {
+            by_type
+                .entry(grant_type.to_owned())
+                .or_default()
+                .push(index);
+        }
+    }
+    MatcherIndex { by_type, wildcard }
+}
+
+/// 候选下标集合：请求类型的桶 + 全局通配桶。桶外 grant 的类型段不可能
+/// 与请求匹配（grant_type ∈ {request_type, "*"} 是资源匹配的必要条件），
+/// 跳过它们不改变匹配结果。槽位未持有该证据时先构建并缓存（持有强
+/// Arc，地址在缓存期间不复用）。
+fn matcher_candidates(
+    slot: &mut Option<(std::sync::Arc<PublishedCardAuthorization>, MatcherIndex)>,
+    evidence: &std::sync::Arc<PublishedCardAuthorization>,
+    request_type: &str,
+) -> Vec<usize> {
+    let fresh = !slot
+        .as_ref()
+        .is_some_and(|(cached, _)| std::sync::Arc::ptr_eq(cached, evidence));
+    if fresh {
+        let index = build_matcher_index(evidence);
+        *slot = Some((std::sync::Arc::clone(evidence), index));
+    }
+    let (_, index) = slot.as_ref().unwrap();
+    let mut candidates = Vec::with_capacity(index.wildcard.len() + 64);
+    if let Some(bucket) = index.by_type.get(request_type) {
+        candidates.extend_from_slice(bucket);
+    }
+    candidates.extend_from_slice(&index.wildcard);
+    // 匹配语义是"证据顺序首中即胜"：桶拼接会打乱类型桶与通配桶之间的
+    // 原始顺序，按下标排序恢复后首中结果与线性扫描逐位一致。
+    candidates.sort_unstable();
+    candidates
+}
+
+/// 资源段之外的完整匹配谓词（身份/租户/domain/有效期/状态效果/资源/动作）。
+/// 线性与索引两条路径共用同一谓词——语义等价由结构保证而非逐行对照。
+#[allow(clippy::too_many_arguments)]
+fn grant_matches_request(
     ctx: &PolicyContext,
-    evidence: &'a PublishedCardAuthorization,
-    resource_key: &str,
-) -> Option<&'a CanonicalGrant> {
+    request_type: &str,
+    request_id: Option<&str>,
+    type_level_request: bool,
+    now: i64,
+    grant: &CanonicalGrant,
+) -> bool {
     let card_id = ctx.card_id.unwrap_or(0);
     let request_tenant = ctx.tenant_id.unwrap_or(0);
+    // 身份/租户边界：grant 必须属于本次请求的卡、用户、租户。
+    if grant.card_id != card_id
+        || ctx.user_id.is_none_or(|user_id| grant.user_id != user_id)
+        || grant.tenant.tenant_id != request_tenant
+    {
+        return false;
+    }
+    // Card-domain provenance: a grant must remain bound to the active actor
+    // card domain. This is distinct from the protected target's domain below.
+    if let Some(domain_id) = ctx.domain_id {
+        if grant.tenant.domain_id != Some(domain_id) {
+            return false;
+        }
+    }
+    // A resolver-classified tenant target with a domain may consume ordinary
+    // card evidence only from that same authoritative target domain. A
+    // domainless target remains tenant-level; `None` is not a requirement
+    // that the actor card's grant itself be domainless.
+    if matches!(
+        ctx.resource_ownership_scope,
+        ResourceOwnershipScope::TenantScoped
+    ) {
+        if let Some(resource_domain_id) = ctx.resource_domain_id {
+            if grant.tenant.domain_id != Some(resource_domain_id) {
+                return false;
+            }
+        }
+    }
+    // 有效期（统一 UTC 时钟）。
+    if !grant.validity.is_valid_at(now) {
+        return false;
+    }
+    // 合同只允许 ACTIVE+ALLOW 形态进入 effective_grants；漂移 fail-closed。
+    if grant.state != GrantState::Active || grant.effect != GrantEffect::Allow {
+        return false;
+    }
+    // 资源匹配：类型级 grant 通配本类型，`*` 全局通配；对象级 grant 只命中
+    // 同一对象；类型级请求绝不命中对象级 grant。
+    let (grant_type, grant_id) = parse_resource_key(&grant.resource);
+    if grant_type != request_type && grant_type != "*" {
+        return false;
+    }
+    if type_level_request {
+        if grant_id.is_some() {
+            return false;
+        }
+    } else if grant_id.is_some() && grant_id != request_id {
+        return false;
+    }
+    // 动作匹配：exact / write 别名 / '*'。
+    let action = ctx.action.as_str();
+    grant.action == action
+        || grant.action == "*"
+        || get_alias_sources(action).contains(&grant.action.as_str())
+}
+
+pub(crate) fn match_published_effective_grant<'a>(
+    ctx: &PolicyContext,
+    evidence: &'a std::sync::Arc<PublishedCardAuthorization>,
+    resource_key: &str,
+) -> Option<&'a CanonicalGrant> {
     let (request_type, request_id) = parse_resource_key(resource_key);
     let type_level_request = request_id.is_none();
     let now = evidence.read_unix_seconds;
 
-    evidence.effective_grants.iter().find(|grant| {
-        // 身份/租户边界：grant 必须属于本次请求的卡、用户、租户。
-        if grant.card_id != card_id
-            || ctx.user_id.is_none_or(|user_id| grant.user_id != user_id)
-            || grant.tenant.tenant_id != request_tenant
-        {
-            return false;
-        }
-        // Card-domain provenance: a grant must remain bound to the active actor
-        // card domain. This is distinct from the protected target's domain below.
-        if let Some(domain_id) = ctx.domain_id {
-            if grant.tenant.domain_id != Some(domain_id) {
-                return false;
+    // 接力：小 N 线性扫描（技术 A，零构建成本）；大 N 走类型索引（技术
+    // B，构建 O(N) 一次、跨判定摊销，每判定 O(桶 + 通配)）。索引桶是匹
+    // 配的必要候选集合，两路径共用同一谓词——语义等价由结构保证。
+    if evidence.effective_grants.len() <= MATCHER_INDEX_THRESHOLD {
+        return evidence.effective_grants.iter().find(|grant| {
+            grant_matches_request(
+                ctx,
+                request_type,
+                request_id,
+                type_level_request,
+                now,
+                grant,
+            )
+        });
+    }
+    MATCHER_INDEX_CACHE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let candidates = matcher_candidates(&mut slot, evidence, request_type);
+        for index in candidates {
+            let grant = &evidence.effective_grants[index];
+            if grant_matches_request(
+                ctx,
+                request_type,
+                request_id,
+                type_level_request,
+                now,
+                grant,
+            ) {
+                return Some(grant);
             }
         }
-        // A resolver-classified tenant target with a domain may consume ordinary
-        // card evidence only from that same authoritative target domain. A
-        // domainless target remains tenant-level; `None` is not a requirement
-        // that the actor card's grant itself be domainless.
-        if matches!(
-            ctx.resource_ownership_scope,
-            ResourceOwnershipScope::TenantScoped
-        ) {
-            if let Some(resource_domain_id) = ctx.resource_domain_id {
-                if grant.tenant.domain_id != Some(resource_domain_id) {
-                    return false;
-                }
-            }
-        }
-        // 有效期（统一 UTC 时钟）。
-        if !grant.validity.is_valid_at(now) {
-            return false;
-        }
-        // 合同只允许 ACTIVE+ALLOW 形态进入 effective_grants；漂移 fail-closed。
-        if grant.state != GrantState::Active || grant.effect != GrantEffect::Allow {
-            return false;
-        }
-        // 资源匹配：类型级 grant 通配本类型，`*` 全局通配；对象级 grant 只命中
-        // 同一对象；类型级请求绝不命中对象级 grant。
-        let (grant_type, grant_id) = parse_resource_key(&grant.resource);
-        if grant_type != request_type && grant_type != "*" {
-            return false;
-        }
-        if type_level_request {
-            if grant_id.is_some() {
-                return false;
-            }
-        } else if grant_id.is_some() && grant_id != request_id {
-            return false;
-        }
-        // 动作匹配：exact / write 别名 / '*'。
-        let action = ctx.action.as_str();
-        grant.action == action
-            || grant.action == "*"
-            || get_alias_sources(action).contains(&grant.action.as_str())
+        None
     })
 }
 

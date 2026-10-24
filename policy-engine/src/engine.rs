@@ -205,4 +205,6 @@ impl Default for PolicyEngine {
 #[cfg(test)]
 mod ceiling_probe;
 #[cfg(test)]
+mod matcher_curve;
+#[cfg(test)]
 mod tests;

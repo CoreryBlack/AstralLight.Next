@@ -604,6 +604,17 @@ static SEGMENT_DIGEST_HINTS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<policy_engine::ProjectionKey, (String, String)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// 提示命中率遥测（调度曲线的观测面）：hit = 键+content_hash 双重命中而
+/// 跳过 encode；miss = 回退真实 encode。全局单调计数，供探针/运维读出
+/// 实际命中率并校准"是否值得保持 hints 开启"。
+pub(crate) static SEGMENT_DIGEST_HINT_STATS: (
+    std::sync::atomic::AtomicU64,
+    std::sync::atomic::AtomicU64,
+) = (
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+);
+
 const SEGMENT_DIGEST_HINTS_CAP: usize = 20_000;
 
 fn cached_segment_digest(key: &policy_engine::ProjectionKey, content_hash: &str) -> Option<String> {
@@ -652,8 +663,16 @@ pub(crate) fn plan_stage_segments_with_hints(
     for (key, segment) in candidate.segments.iter() {
         let digest_hex = if use_digest_hints {
             match cached_segment_digest(key, &segment.content_hash) {
-                Some(digest) => digest,
+                Some(digest) => {
+                    SEGMENT_DIGEST_HINT_STATS
+                        .0
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    digest
+                }
                 None => {
+                    SEGMENT_DIGEST_HINT_STATS
+                        .1
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let payload =
                         astral_db::encode_segment_payload(&segment.grants).map_err(|error| {
                             format!("code=auth_projector.segment_encode_failed;error={error}")

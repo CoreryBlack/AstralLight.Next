@@ -4039,4 +4039,181 @@ mod tests {
         assert!(*org_called.lock().unwrap());
         assert!(*ga_called.lock().unwrap());
     }
+    // ===== 供给链上限探针（release + --ignored）：安装→装配→serve→失效→再装配全周期 =====
+
+    fn probe_grants(count: usize) -> Vec<CanonicalGrant> {
+        (0..count)
+            .map(|index| {
+                let mut value = grant(0x21);
+                value.grant_id = GrantId::parse(&format!(
+                    "00000000-0000-0000-0000-{:012x}",
+                    (index as u64 + 1) & 0xffff_ffff_ffff
+                ))
+                .unwrap();
+                value.resource = format!("learn_subject:{index}");
+                value
+            })
+            .collect()
+    }
+
+    fn probe_percentile(sorted: &[u64], fraction: f64) -> u64 {
+        let index = ((sorted.len() as f64) * fraction) as usize;
+        sorted[index.min(sorted.len() - 1)]
+    }
+
+    fn scoped(hub: &MemoryProjectionHub, card_id: i64) -> PublishedCardEvidenceScope {
+        let _ = hub;
+        PublishedCardEvidenceScope {
+            tenant_id: 7,
+            card_id,
+            user_filter: None,
+            domain: astral_types::DomainScopeRequirement::Unconstrained,
+        }
+    }
+
+    #[ignore = "release-only supply-chain probe; run with --release -- --ignored"]
+    #[test]
+    fn supply_chain_ceiling_probe() {
+        const PHASE_BUDGET: Duration = Duration::from_secs(3);
+        let started = Instant::now();
+        eprintln!("machine: 4P+6E cores (10 logical), phase budget {PHASE_BUDGET:?}");
+
+        // ---- 阶段 A：安装→装配→serve 单周期成本（规模梯度）----
+        for size in [1usize, 1000, 4050] {
+            let hub = MemoryProjectionHub::default();
+            let identity = ProjectionAggregateIdentity::new(7, "USER_CARD", 17).unwrap();
+            let hot = policy_engine::HotState::from_grants(
+                tenant(),
+                1,
+                probe_grants(size),
+                dependency_vector(),
+            )
+            .unwrap();
+            let install_start = Instant::now();
+            hub.install_published_state(seal_state(&identity, 17, 1, hot, None, 0));
+            let install_ns = install_start.elapsed().as_nanos() as u64;
+            let scope = scoped(&hub, 17);
+
+            // 冷装配（首轮 serve）。
+            let cold_start = Instant::now();
+            let MemoryEvidenceOutcome::Serve(first) = hub.try_memory_evidence(&scope) else {
+                panic!("fresh hub must serve");
+            };
+            let cold_ns = cold_start.elapsed().as_nanos() as u64;
+
+            // 热命中循环：跑满预算，测吞吐与尾延迟。
+            let mut samples = Vec::new();
+            let warm_start = Instant::now();
+            let mut ops = 0usize;
+            loop {
+                let op_start = Instant::now();
+                let _ = hub.try_memory_evidence(&scope);
+                if samples.len() < 150_000 {
+                    samples.push(op_start.elapsed().as_nanos() as u64);
+                }
+                ops += 1;
+                if warm_start.elapsed() >= PHASE_BUDGET || samples.len() >= 150_000 {
+                    break;
+                }
+            }
+            let warm_wall = warm_start.elapsed().as_secs_f64();
+            samples.sort_unstable();
+            eprintln!(
+                "[supply {size:>4}] install {install_ns:>8}ns | cold-assemble {cold_ns:>9}ns | warm {ops:>9} ops ({:>0} ops/s) p50={}ns p99={}ns p999={}ns | grants_served={}",
+                ops as f64 / warm_wall,
+                probe_percentile(&samples, 0.50),
+                probe_percentile(&samples, 0.99),
+                probe_percentile(&samples, 0.999),
+                first.gate.effective_grant_count,
+            );
+
+            // ---- 阶段 B：失效→重装配传播延迟（事件→下一次 serve 反映新内容）----
+            let invalidations = 200usize;
+            let mut latencies = Vec::with_capacity(invalidations);
+            let mut served_count = 0usize;
+            for round in 0..invalidations {
+                let generation = 2 + round as u64;
+                let published_frontier = generation - 1;
+                let mut next_grants = probe_grants(size);
+                next_grants[0].resource = format!("learn_subject:mutated-{round}");
+                let hot = policy_engine::HotState::from_grants(
+                    tenant(),
+                    generation,
+                    next_grants,
+                    dependency_vector(),
+                )
+                .unwrap();
+                let inv_start = Instant::now();
+                hub.apply_evidence_invalidation(EvidenceInvalidationRequest {
+                    tenant_id: 7,
+                    card_id: Some(17),
+                    aggregate_type: PublishedEvidenceAggregate::UserCard,
+                    aggregate_id: 17,
+                    event_id: format!("event-{generation}"),
+                    operation_id: format!("operation-{generation}"),
+                    source_generation: generation,
+                    published_generation: published_frontier,
+                    revoke_fence: 0,
+                })
+                .expect("invalidation must apply");
+                // 镜像生产提交序列：install_committed_publication 安装状态
+                // 并解除匹配的 pending；install_published_state 不做 pending
+                // 完成——那是提交事务路径的职责。
+                let state = seal_state(&identity, 17, generation, hot, None, 0);
+                let manifest_id = state.manifest_id;
+                let outcome =
+                    crate::authorization_projection_repository::DeltaProjectorPublishOutcome {
+                        impact_plan:
+                            crate::authorization_projection_repository::AuthorizationImpactPlanOutcome {
+                                plan_id: generation as i64,
+                                resumed_existing_plan: false,
+                                item_count: 0,
+                            },
+                        stage:
+                            crate::authorization_projection_repository::AuthorizationStageOutcome {
+                                manifest_id,
+                                manifest_digest: state.manifest_digest.clone(),
+                                target_generation: generation,
+                                total_grant_count: state.total_grant_count,
+                                new_segment_count: 1,
+                                reused_segment_count: 0,
+                                resumed_existing_manifest: false,
+                                base_pointer: None,
+                            },
+                        archive_intent: None,
+                        publish:
+                            crate::authorization_projection_repository::AuthorizationPublishOutcome {
+                                pointer: state.pointer.clone(),
+                                published_state: std::sync::Arc::new(state),
+                                published_manifest_id: manifest_id,
+                                previous_superseded_manifest_id: None,
+                                initialized_first_pointer: generation == 2,
+                            },
+                    };
+                hub.install_committed_publication(&outcome)
+                    .expect("committed publication must install");
+                let served_new = match hub.try_memory_evidence(&scope) {
+                    MemoryEvidenceOutcome::Serve(next) => {
+                        assert!(next
+                            .effective_grants
+                            .iter()
+                            .any(|grant| grant.resource.starts_with("learn_subject:mutated")));
+                        true
+                    }
+                    // 语义允许：pending 未清时回退 durable 是 fail-closed 正态。
+                    MemoryEvidenceOutcome::DeferToDurable => false,
+                };
+                latencies.push(inv_start.elapsed().as_nanos() as u64);
+                served_count += usize::from(served_new);
+            }
+            latencies.sort_unstable();
+            eprintln!(
+                "[supply {size:>4}] invalidate+reinstall+serve: p50={}ns p99={}ns max={}ns | immediate-serve {served_count}/{invalidations} (rest defer-to-durable, fail-closed)",
+                probe_percentile(&latencies, 0.50),
+                probe_percentile(&latencies, 0.99),
+                latencies[latencies.len() - 1],
+            );
+        }
+        let _ = started;
+    }
 }

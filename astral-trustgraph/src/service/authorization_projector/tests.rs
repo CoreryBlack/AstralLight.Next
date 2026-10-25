@@ -4,6 +4,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use super::planning::digest_hint_test_support::{
+    plan_stage_segments_with_cache, DigestHintCache, DIGEST_HINT_CACHE_CAPACITY,
+};
 use super::worker::{
     budget_exhausted_error, clamp_backoff, event_backoff_secs, fail_with_budget,
     plan_retry_schedule, quarantine_event_terminal, quarantine_reason_parts, run_partition_worker,
@@ -1290,7 +1293,11 @@ fn worker_source_has_no_legacy_channel_symbols() {
     let ordinal_source = production_source_slice(include_str!(
         "../authorization_projector/planning/parent_ordinals.rs"
     ));
+    let digest_hint_source = production_source_slice(include_str!(
+        "../authorization_projector/planning/digest_hints.rs"
+    ));
     assert!(ordinal_source.contains("fn take("));
+    assert!(digest_hint_source.contains("struct DigestHintCache"));
     let production = production_source_slice(main_source);
     // The cut must land exactly on the single test-section marker: no
     // cfg(test)/test-mod text may survive into the scanned production half.
@@ -1302,13 +1309,18 @@ fn worker_source_has_no_legacy_channel_symbols() {
         ("config.rs", config_source),
         ("runtime.rs", runtime_source),
         ("worker.rs", worker_source),
-        ("planning.rs", planning_source),
     ] {
         assert!(
             !source.contains("#[cfg(test)]"),
             "{name} must not carry a test section"
         );
     }
+    assert_eq!(
+        planning_source.matches("#[cfg(test)]").count(),
+        1,
+        "planning.rs may only gate its isolated test-support module"
+    );
+    assert!(planning_source.contains("#[cfg(test)]\npub(crate) mod digest_hint_test_support;"));
 
     // Coverage proof across the whole runtime half (fixed scan regression):
     // early constants/policy, the loop body, the disposition actuator and
@@ -1331,6 +1343,7 @@ fn worker_source_has_no_legacy_channel_symbols() {
         ("worker.rs", worker_source),
         ("planning.rs", planning_source),
         ("parent_ordinals.rs", ordinal_source.as_str()),
+        ("digest_hints.rs", digest_hint_source.as_str()),
     ] {
         assert_no_legacy_channel_symbols(source, name);
     }
@@ -4048,4 +4061,104 @@ fn digest_hint_cache_content_change_falls_back_to_real_encode() {
         .iter()
         .all(|segment| matches!(segment, StagedSegmentContent::New(_))));
     let _ = new_grants;
+}
+
+#[test]
+fn digest_hint_cache_plans_match_real_encoding_after_hit_eviction_and_expiry() {
+    let grants: Vec<_> = (0..3)
+        .map(|id| {
+            let mut grant = grant(id, 1, GrantState::Active);
+            grant.resource = format!("learn_subject:{id}");
+            grant
+        })
+        .collect();
+    let candidate =
+        HotState::from_grants(tenant_of(17), 5, grants, DependencyVector::default()).unwrap();
+    let references: Vec<_> = candidate
+        .segments
+        .iter()
+        .enumerate()
+        .map(|(index, (_, segment))| {
+            parent_view(
+                index as u64,
+                &hex_lower(&Sha256::digest(
+                    astral_db::encode_segment_payload(&segment.grants).unwrap(),
+                )),
+            )
+        })
+        .collect();
+    let expected = plan_stage_segments(&candidate, Some(&references)).unwrap();
+
+    let mut cache = DigestHintCache::new_for_test(8, Duration::from_secs(60));
+    let first = plan_stage_segments_with_cache(&candidate, Some(&references), &mut cache).unwrap();
+    assert_eq!(first, expected);
+    assert_eq!(cache.len(), candidate.segments.len());
+    let hit = plan_stage_segments_with_cache(&candidate, Some(&references), &mut cache).unwrap();
+    assert_eq!(hit, expected);
+
+    let key = candidate.segments.iter().next().unwrap().0;
+    cache.remember_at_for_test(
+        key.clone(),
+        "stale-content-hash".to_owned(),
+        "not-the-real-digest".to_owned(),
+        std::time::Instant::now(),
+    );
+    let updated =
+        plan_stage_segments_with_cache(&candidate, Some(&references), &mut cache).unwrap();
+    assert_eq!(updated, expected);
+
+    let mut eviction_cache = DigestHintCache::new_for_test(1, Duration::from_secs(60));
+    let after_eviction =
+        plan_stage_segments_with_cache(&candidate, Some(&references), &mut eviction_cache).unwrap();
+    assert_eq!(after_eviction, expected);
+    assert_eq!(eviction_cache.len(), 1);
+
+    let mut expired_cache = DigestHintCache::new_for_test(8, Duration::ZERO);
+    let expired =
+        plan_stage_segments_with_cache(&candidate, Some(&references), &mut expired_cache).unwrap();
+    assert_eq!(expired, expected);
+}
+
+#[test]
+fn digest_hint_cache_capacity_pressure_remains_bounded_and_correct() {
+    let capacity = DIGEST_HINT_CACHE_CAPACITY;
+    let now = std::time::Instant::now();
+    let mut cache = DigestHintCache::new_for_test(capacity, Duration::from_secs(600));
+    let mut keys = Vec::with_capacity(capacity + 1);
+    for id in 1..=(capacity as i64 + 1) {
+        let key = policy_engine::ProjectionKey::new(id, 42, format!("learn_subject:{id}"), "read")
+            .unwrap();
+        cache.remember_at_for_test(
+            key.clone(),
+            format!("content-{id}"),
+            format!("digest-{id}"),
+            now,
+        );
+        keys.push(key);
+    }
+
+    assert_eq!(cache.len(), capacity);
+    assert!(cache.queue_len() <= capacity * 2);
+    assert_eq!(cache.cached_at_for_test(&keys[0], "content-1", now).0, None);
+    assert_eq!(
+        cache
+            .cached_at_for_test(&keys[1], "content-2", now)
+            .0
+            .as_deref(),
+        Some("digest-2")
+    );
+    assert_eq!(
+        cache
+            .cached_at_for_test(&keys[capacity], &format!("content-{}", capacity + 1), now)
+            .0
+            .as_deref(),
+        Some(format!("digest-{}", capacity + 1).as_str())
+    );
+
+    let plan_grants = vec![grant(20, 1, GrantState::Active)];
+    let candidate =
+        HotState::from_grants(tenant_of(17), 6, plan_grants, DependencyVector::default()).unwrap();
+    let expected = plan_stage_segments(&candidate, None).unwrap();
+    let planned = plan_stage_segments_with_cache(&candidate, None, &mut cache).unwrap();
+    assert_eq!(planned, expected);
 }

@@ -4,8 +4,12 @@
 //! EventDisposition 与发布计划；不做 I/O、不改租约、不发布。worker 执行见
 //! 主 worker 区块，durable 边界见 [`super::runtime`]。
 
+mod digest_hints;
 mod parent_ordinals;
 
+#[cfg(test)]
+pub(crate) mod digest_hint_test_support;
+use digest_hints::{DigestHintStore, ProcessDigestHintStore, SEGMENT_DIGEST_HINT_STATS};
 use parent_ordinals::ParentOrdinalLookup;
 use sha2::{Digest, Sha256};
 
@@ -592,52 +596,6 @@ pub(crate) fn assemble_continuation_candidate(
 ///
 /// Reference priority and candidate iteration order are preserved. The staging
 /// transaction re-verifies every reused reference under lock.
-/// 段 staging digest 提示缓存（进程级）：键 = `ProjectionKey`（内容寻址：
-/// 键相同 ⇒ 段 grants 相同 ⇒ staging payload 相同 ⇒ digest 相同），值 =
-/// (编译器 content_hash, 上一次真实 encode 的 staging digest_hex)。
-///
-/// 查询命中条件是键与编译器 content_hash **双重匹配**：content_hash 覆盖
-/// compiler_version + key + grants，二者皆等 ⇒ payload 与 digest 必与缓存
-/// 来源一致，跳过 encode 是精确的而非近似的。缓存在发布计划阶段读写，
-/// 频率为每 delta 事件一次，Mutex 无争用热点。
-static SEGMENT_DIGEST_HINTS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<policy_engine::ProjectionKey, (String, String)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-/// 提示命中率遥测（调度曲线的观测面）：hit = 键+content_hash 双重命中而
-/// 跳过 encode；miss = 回退真实 encode。全局单调计数，供探针/运维读出
-/// 实际命中率并校准"是否值得保持 hints 开启"。
-pub(crate) static SEGMENT_DIGEST_HINT_STATS: (
-    std::sync::atomic::AtomicU64,
-    std::sync::atomic::AtomicU64,
-) = (
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-);
-
-const SEGMENT_DIGEST_HINTS_CAP: usize = 20_000;
-
-fn cached_segment_digest(key: &policy_engine::ProjectionKey, content_hash: &str) -> Option<String> {
-    let cache = SEGMENT_DIGEST_HINTS.lock().ok()?;
-    cache
-        .get(key)
-        .filter(|(cached_hash, _)| cached_hash == content_hash)
-        .map(|(_, digest)| digest.clone())
-}
-
-fn remember_segment_digest(
-    key: policy_engine::ProjectionKey,
-    content_hash: String,
-    digest_hex: String,
-) {
-    if let Ok(mut cache) = SEGMENT_DIGEST_HINTS.lock() {
-        if cache.len() >= SEGMENT_DIGEST_HINTS_CAP && !cache.contains_key(&key) {
-            cache.clear();
-        }
-        cache.insert(key, (content_hash, digest_hex));
-    }
-}
-
 // 仅测试与性能矩阵使用（无提示版 = 提示关闭版）；生产路径一律走
 // `plan_stage_segments_with_hints(..., true)`。
 #[cfg_attr(not(test), allow(dead_code))]
@@ -658,27 +616,45 @@ pub(crate) fn plan_stage_segments_with_hints(
     parent_references: Option<&[(u64, ParentReferenceView)]>,
     use_digest_hints: bool,
 ) -> Result<Vec<StagedSegmentContent>, String> {
+    let mut cache = ProcessDigestHintStore;
+    plan_stage_segments_with_store(candidate, parent_references, use_digest_hints, &mut cache)
+}
+
+fn plan_stage_segments_with_store(
+    candidate: &HotState,
+    parent_references: Option<&[(u64, ParentReferenceView)]>,
+    use_digest_hints: bool,
+    cache: &mut impl DigestHintStore,
+) -> Result<Vec<StagedSegmentContent>, String> {
     let mut plan = Vec::with_capacity(candidate.segments.len());
     let mut lookup = ParentOrdinalLookup::new(parent_references.unwrap_or_default());
     for (key, segment) in candidate.segments.iter() {
         let digest_hex = if use_digest_hints {
-            match cached_segment_digest(key, &segment.content_hash) {
+            match cache.cached_digest(key, &segment.content_hash) {
                 Some(digest) => {
                     SEGMENT_DIGEST_HINT_STATS
                         .0
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::observability::record_segment_digest_hint_cache(
+                        crate::observability::SegmentDigestHintCacheOutcome::Hit,
+                        1,
+                    );
                     digest
                 }
                 None => {
                     SEGMENT_DIGEST_HINT_STATS
                         .1
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::observability::record_segment_digest_hint_cache(
+                        crate::observability::SegmentDigestHintCacheOutcome::Miss,
+                        1,
+                    );
                     let payload =
                         astral_db::encode_segment_payload(&segment.grants).map_err(|error| {
                             format!("code=auth_projector.segment_encode_failed;error={error}")
                         })?;
                     let digest = hex_lower(&Sha256::digest(&payload));
-                    remember_segment_digest(
+                    cache.remember_digest(
                         key.clone(),
                         segment.content_hash.clone(),
                         digest.clone(),
@@ -691,7 +667,7 @@ pub(crate) fn plan_stage_segments_with_hints(
                 format!("code=auth_projector.segment_encode_failed;error={error}")
             })?;
             let digest = hex_lower(&Sha256::digest(&payload));
-            remember_segment_digest(key.clone(), segment.content_hash.clone(), digest.clone());
+            cache.remember_digest(key.clone(), segment.content_hash.clone(), digest.clone());
             digest
         };
         match lookup.take(&digest_hex) {

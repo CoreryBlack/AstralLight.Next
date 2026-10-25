@@ -204,6 +204,33 @@ pub(crate) fn record_projector_phase(phase: ProjectorPhase, elapsed: Duration) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SegmentDigestHintCacheOutcome {
+    Hit,
+    Miss,
+    Evicted,
+    Expired,
+}
+
+impl SegmentDigestHintCacheOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Evicted => "evicted",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+pub(crate) fn record_segment_digest_hint_cache(outcome: SegmentDigestHintCacheOutcome, count: u64) {
+    metrics::counter!(
+        "astral_authz_projector_segment_digest_hints_total",
+        "outcome" => outcome.label()
+    )
+    .increment(count);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SyncPublishMetricOutcome {
     Published,
     Delegated,
@@ -242,9 +269,10 @@ pub(crate) fn record_sync_publish(outcome: SyncPublishMetricOutcome, elapsed: Du
 mod tests {
     use super::{
         classify_policy_decision, record_authorization_decision, record_authorization_request,
-        record_projector_event, record_projector_phase, record_sod_check, record_sync_publish,
-        AuthorizationAdmissionOutcome, AuthorizationDecisionOutcome, ProjectorEventOutcome,
-        ProjectorPhase, SodCheckOutcome, SyncPublishMetricOutcome,
+        record_projector_event, record_projector_phase, record_segment_digest_hint_cache,
+        record_sod_check, record_sync_publish, AuthorizationAdmissionOutcome,
+        AuthorizationDecisionOutcome, ProjectorEventOutcome, ProjectorPhase,
+        SegmentDigestHintCacheOutcome, SodCheckOutcome, SyncPublishMetricOutcome,
     };
     use astral_types::PolicyDecision;
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -339,6 +367,10 @@ mod tests {
             SyncPublishMetricOutcome::Delegated,
             std::time::Duration::from_millis(4),
         );
+        record_segment_digest_hint_cache(SegmentDigestHintCacheOutcome::Hit, 1);
+        record_segment_digest_hint_cache(SegmentDigestHintCacheOutcome::Miss, 1);
+        record_segment_digest_hint_cache(SegmentDigestHintCacheOutcome::Evicted, 2);
+        record_segment_digest_hint_cache(SegmentDigestHintCacheOutcome::Expired, 3);
         let body = handle.render();
         assert!(body.contains("astral_authz_decisions_total"));
         assert!(body.contains("outcome=\"pending\""));
@@ -352,6 +384,13 @@ mod tests {
         assert!(body.contains("phase=\"publish\""));
         assert!(body.contains("astral_authz_sync_publish_total"));
         assert!(body.contains("outcome=\"delegated\""));
+        assert!(body.contains("astral_authz_projector_segment_digest_hints_total"));
+        assert!(body.contains("outcome=\"hit\""));
+        assert!(body.contains("outcome=\"miss\""));
+        assert!(body.contains("outcome=\"evicted\""));
+        assert!(body.contains("outcome=\"expired\""));
+        assert!(!body.contains("projection_key"));
+        assert!(!body.contains("tenant_id"));
     }
 
     fn assert_closed_vocabulary(labels: &[&str]) {
@@ -435,5 +474,14 @@ mod tests {
         ];
         assert_closed_vocabulary(&sync.map(SyncPublishMetricOutcome::label));
         assert_eq!(sync.len(), 5);
+
+        let digest_hints = [
+            SegmentDigestHintCacheOutcome::Hit,
+            SegmentDigestHintCacheOutcome::Miss,
+            SegmentDigestHintCacheOutcome::Evicted,
+            SegmentDigestHintCacheOutcome::Expired,
+        ];
+        assert_closed_vocabulary(&digest_hints.map(SegmentDigestHintCacheOutcome::label));
+        assert_eq!(digest_hints.len(), 4);
     }
 }

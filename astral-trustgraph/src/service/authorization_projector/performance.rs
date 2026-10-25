@@ -1,3 +1,7 @@
+use super::super::planning::digest_hint_test_support::{
+    plan_stage_segments_with_cache_mode, plan_stage_segments_with_store_for_test, DigestHintCache,
+    DisabledDigestHintStore, DIGEST_HINT_CACHE_CAPACITY,
+};
 use super::*;
 use std::hint::black_box;
 use std::time::Instant;
@@ -124,7 +128,6 @@ fn segment_digest_hint_scheduling_curve() {
         .unwrap_or(9)
         .clamp(3, 30);
     let size = 4050usize;
-    let compiler_version = policy_engine::COMPILER_VERSION.to_owned();
 
     let make_segments = |round: u64| -> Vec<(
         policy_engine::ProjectionKey,
@@ -149,14 +152,15 @@ fn segment_digest_hint_scheduling_curve() {
     };
 
     let warm = make_segments(1);
+    let warm_candidate = warm_to_candidate(&warm);
+    let warm_references = true_to_refs();
     // 预备：真实 encode 一轮把全部键写入提示缓存（100% 命中基准）。
-    let _ = plan_stage_segments_with_hints(&warm_to_candidate(&warm), None, true);
+    let _ = plan_stage_segments_with_hints(&warm_candidate, None, true);
 
     for hit_ratio in [0.0f64, 0.25, 0.5, 1.0] {
         let mutated = ((1.0 - hit_ratio) * size as f64).round() as usize;
         let mut mixed = Vec::with_capacity(size);
-        let mut index = 0usize;
-        for (key, segment) in &warm {
+        for (index, (key, segment)) in warm.iter().enumerate() {
             if index < mutated {
                 let mut grants = segment.grants.clone();
                 for g in &mut grants {
@@ -173,46 +177,46 @@ fn segment_digest_hint_scheduling_curve() {
             } else {
                 mixed.push((key.clone(), std::sync::Arc::clone(segment)));
             }
-            index += 1;
         }
-        let candidate = HotState::from_grants(
-            tenant_of(17),
-            2,
-            Vec::<astral_types::CanonicalGrant>::new(),
-            DependencyVector::default(),
-        )
-        .unwrap();
-        let _ = candidate;
-
+        let candidate = warm_to_candidate(&mixed);
         let measure_on = || {
-            let started = Instant::now();
+            let mut elapsed_ns = 0;
             for _ in 0..samples {
+                let mut cache = DigestHintCache::new_for_test(20_000, Duration::from_secs(600));
+                plan_stage_segments_with_cache_mode(&warm_candidate, None, true, &mut cache)
+                    .unwrap();
+                let started = Instant::now();
                 black_box(
-                    plan_stage_segments_with_hints(
-                        &warm_to_candidate(&mixed),
-                        Some(&true_to_refs()),
+                    plan_stage_segments_with_cache_mode(
+                        &candidate,
+                        Some(&warm_references),
                         true,
+                        &mut cache,
                     )
                     .unwrap()
                     .len(),
                 );
+                elapsed_ns += started.elapsed().as_nanos();
             }
-            started.elapsed().as_nanos() / samples as u128
+            elapsed_ns / samples as u128
         };
         let measure_off = || {
-            let started = Instant::now();
+            let mut elapsed_ns = 0;
             for _ in 0..samples {
+                let mut cache = DisabledDigestHintStore;
+                let started = Instant::now();
                 black_box(
-                    plan_stage_segments_with_hints(
-                        &warm_to_candidate(&mixed),
-                        Some(&true_to_refs()),
-                        false,
+                    plan_stage_segments_with_store_for_test(
+                        &candidate,
+                        Some(&warm_references),
+                        &mut cache,
                     )
                     .unwrap()
                     .len(),
                 );
+                elapsed_ns += started.elapsed().as_nanos();
             }
-            started.elapsed().as_nanos() / samples as u128
+            elapsed_ns / samples as u128
         };
         let on_ns = measure_on();
         let off_ns = measure_off();
@@ -242,4 +246,54 @@ fn warm_to_candidate(
 
 fn true_to_refs() -> Vec<(u64, ParentReferenceView)> {
     Vec::new()
+}
+
+#[test]
+#[ignore = "local release-only digest-hint capacity pressure probe"]
+fn segment_digest_hint_capacity_pressure_curve() {
+    let samples = std::env::var("ASTRAL_PERF_SAMPLES")
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(9)
+        .clamp(3, 30);
+    let capacity = DIGEST_HINT_CACHE_CAPACITY;
+    let now = std::time::Instant::now();
+    let keys: Vec<_> = (1..=capacity as i64 + 1)
+        .map(|id| {
+            policy_engine::ProjectionKey::new(id, 42, format!("learn_subject:{id}"), "read")
+                .unwrap()
+        })
+        .collect();
+
+    let mut elapsed = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let started = Instant::now();
+        let mut cache = DigestHintCache::new_for_test(capacity, Duration::from_secs(600));
+        for (index, key) in keys.iter().enumerate() {
+            cache.remember_at_for_test(
+                key.clone(),
+                format!("content-{index}"),
+                format!("digest-{index}"),
+                now,
+            );
+        }
+        assert_eq!(cache.len(), capacity);
+        assert!(cache.queue_len() <= capacity * 2);
+        assert_eq!(cache.cached_at_for_test(&keys[0], "content-0", now).0, None);
+        assert_eq!(
+            cache
+                .cached_at_for_test(&keys[capacity], &format!("content-{capacity}"), now)
+                .0
+                .as_deref(),
+            Some(format!("digest-{capacity}").as_str())
+        );
+        elapsed.push(started.elapsed().as_nanos());
+    }
+    elapsed.sort_unstable();
+    let median = elapsed[elapsed.len() / 2];
+    let p95 = elapsed[((elapsed.len() - 1) * 95) / 100];
+    eprintln!(
+        "DIGEST_HINT_CAPACITY_PRESSURE {{\"capacity\":{capacity},\"keys_inserted\":{},\"samples\":{},\"median_ns\":{median},\"p95_ns\":{p95}}}",
+        keys.len(),
+        elapsed.len()
+    );
 }

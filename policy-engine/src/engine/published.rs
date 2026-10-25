@@ -16,6 +16,10 @@ use super::ports::RuleRepository;
 use super::types::*;
 use super::PolicyEngine;
 
+#[cfg(test)]
+#[path = "matcher_curve.rs"]
+mod matcher_curve;
+
 impl PolicyEngine {
     // ==================== 正式已发布证据路径（strict gate） ====================
 
@@ -558,72 +562,303 @@ pub(crate) fn finish_published_evaluation(
 /// - 条件：`CanonicalGrant` 合同当前不含 condition 字段，所有 effective grant
 ///   均为无条件 ALLOW；匹配器不得把任何未来/非法 condition 表示当作已满足
 ///   （合同层 serde/ledger 对新字段 fail-closed），本函数只消费无条件集合。
-pub(crate) fn match_published_effective_grant<'a>(
+///
+/// 匹配器接力的技术 B：按资源类型（`parse_resource_key` 语义的类型段）
+/// 预索引 effective_grants。技术 A（线性扫描）小 N 最优（零构建成本），
+/// 大 N/尾部命中退化为 O(N) 逐条字符串解析；技术 B 构建 O(N) 一次、每
+/// 判定 O(桶大小 + 通配桶)。证据经 Arc 跨判定复用后构建成本摊销。
+///
+/// The thread-local four-slot cache retains strong evidence Arcs to prevent pointer
+/// reuse (ABA). A new Arc is matched linearly once; its index is built only when
+/// the same Arc is seen again. The index stores positions and never clones grants.
+pub(crate) const MATCHER_INDEX_THRESHOLD: usize = 1000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatcherPath {
+    LinearThreshold,
+    FirstSeenLinear,
+    IndexBuild,
+    IndexHit,
+}
+
+impl MatcherPath {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LinearThreshold => "linear_threshold",
+            Self::FirstSeenLinear => "first_seen_linear",
+            Self::IndexBuild => "index_build",
+            Self::IndexHit => "index_hit",
+        }
+    }
+}
+
+fn record_matcher_path(path: MatcherPath) {
+    metrics::counter!("astral_authz_matcher_paths_total", "path" => path.label()).increment(1);
+}
+
+fn record_matcher_evidence_size(grant_count: usize) {
+    metrics::histogram!("astral_authz_matcher_effective_grants").record(grant_count as f64);
+}
+
+fn build_matcher_index(evidence: &PublishedCardAuthorization) -> MatcherIndex {
+    let mut by_type: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut wildcard = Vec::new();
+    for (index, grant) in evidence.effective_grants.iter().enumerate() {
+        let (grant_type, _) = parse_resource_key(&grant.resource);
+        if grant_type == "*" {
+            wildcard.push(index);
+        } else {
+            by_type
+                .entry(grant_type.to_owned())
+                .or_default()
+                .push(index);
+        }
+    }
+    MatcherIndex { by_type, wildcard }
+}
+
+struct MatcherIndex {
+    /// 解析后的类型段 → 该类型全部 grant 的下标（含对象级与类型级）。
+    by_type: std::collections::HashMap<String, Vec<usize>>,
+    /// `*` 全局通配段下标（可命中任何请求类型）。
+    wildcard: Vec<usize>,
+}
+
+impl MatcherIndex {
+    /// 显式缩短借用生命周期：调用方拿到索引借用后立即使用，槽位借用
+    /// 随作用域结束（匹配器在返回前只读下标，不持有槽引用）。
+    fn borrow_index(&self) -> &Self {
+        self
+    }
+}
+
+thread_local! {
+    /// Each thread retains four strong evidence Arcs to prevent pointer reuse (ABA).
+    static MATCHER_INDEX_CACHE: std::cell::RefCell<MatcherCacheState> =
+        const { std::cell::RefCell::new(MatcherCacheState::new()) };
+}
+
+const MATCHER_CACHE_SLOTS: usize = 4;
+
+struct MatcherCacheState {
+    slots: [Option<MatcherCacheSlot>; MATCHER_CACHE_SLOTS],
+    next_victim: usize,
+}
+
+struct MatcherCacheSlot {
+    evidence: std::sync::Arc<PublishedCardAuthorization>,
+    index: Option<MatcherIndex>,
+}
+
+impl MatcherCacheState {
+    const fn new() -> Self {
+        Self {
+            slots: [None, None, None, None],
+            next_victim: 0,
+        }
+    }
+
+    fn lookup_or_build(
+        &mut self,
+        evidence: &std::sync::Arc<PublishedCardAuthorization>,
+    ) -> (Option<&MatcherIndex>, MatcherPath) {
+        let position = self.slots.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|slot| std::sync::Arc::ptr_eq(&slot.evidence, evidence))
+        });
+        let (position, first_seen) = match position {
+            Some(position) => (position, false),
+            None => {
+                let position = self.next_victim;
+                self.slots[position] = Some(MatcherCacheSlot {
+                    evidence: std::sync::Arc::clone(evidence),
+                    index: None,
+                });
+                self.next_victim = (position + 1) % MATCHER_CACHE_SLOTS;
+                (position, true)
+            }
+        };
+
+        if first_seen {
+            return (None, MatcherPath::FirstSeenLinear);
+        }
+        let slot = self.slots[position]
+            .as_mut()
+            .expect("matcher slot has just been selected");
+        if slot.index.is_none() {
+            slot.index = Some(build_matcher_index(evidence));
+            return (
+                slot.index.as_ref().map(MatcherIndex::borrow_index),
+                MatcherPath::IndexBuild,
+            );
+        }
+        (
+            slot.index.as_ref().map(MatcherIndex::borrow_index),
+            MatcherPath::IndexHit,
+        )
+    }
+}
+
+/// Candidate indices are the request-type bucket plus global wildcard bucket.
+/// Sorting restores evidence order so the indexed path preserves first-match semantics.
+fn matcher_candidates(
+    state: &mut MatcherCacheState,
+    evidence: &std::sync::Arc<PublishedCardAuthorization>,
+    request_type: &str,
+) -> (Option<Vec<usize>>, MatcherPath) {
+    let (index, path) = state.lookup_or_build(evidence);
+    let Some(index) = index else {
+        return (None, path);
+    };
+    let mut candidates = Vec::with_capacity(index.wildcard.len() + 64);
+    if let Some(bucket) = index.by_type.get(request_type) {
+        candidates.extend_from_slice(bucket);
+    }
+    candidates.extend_from_slice(&index.wildcard);
+    candidates.sort_unstable();
+    (Some(candidates), path)
+}
+
+fn find_linear_published_grant<'a>(
     ctx: &PolicyContext,
     evidence: &'a PublishedCardAuthorization,
-    resource_key: &str,
+    request_type: &str,
+    request_id: Option<&str>,
 ) -> Option<&'a CanonicalGrant> {
+    let type_level_request = request_id.is_none();
+    evidence.effective_grants.iter().find(|grant| {
+        grant_matches_request(
+            ctx,
+            request_type,
+            request_id,
+            type_level_request,
+            evidence.read_unix_seconds,
+            grant,
+        )
+    })
+}
+
+/// 资源段之外的完整匹配谓词（身份/租户/domain/有效期/状态效果/资源/动作）。
+/// 线性与索引两条路径共用同一谓词——语义等价由结构保证而非逐行对照。
+#[allow(clippy::too_many_arguments)]
+fn grant_matches_request(
+    ctx: &PolicyContext,
+    request_type: &str,
+    request_id: Option<&str>,
+    type_level_request: bool,
+    now: i64,
+    grant: &CanonicalGrant,
+) -> bool {
     let card_id = ctx.card_id.unwrap_or(0);
     let request_tenant = ctx.tenant_id.unwrap_or(0);
-    let (request_type, request_id) = parse_resource_key(resource_key);
-    let type_level_request = request_id.is_none();
-    let now = evidence.read_unix_seconds;
+    // 身份/租户边界：grant 必须属于本次请求的卡、用户、租户。
+    if grant.card_id != card_id
+        || ctx.user_id.is_none_or(|user_id| grant.user_id != user_id)
+        || grant.tenant.tenant_id != request_tenant
+    {
+        return false;
+    }
+    // Card-domain provenance: a grant must remain bound to the active actor
+    // card domain. This is distinct from the protected target's domain below.
+    if let Some(domain_id) = ctx.domain_id {
+        if grant.tenant.domain_id != Some(domain_id) {
+            return false;
+        }
+    }
+    // A resolver-classified tenant target with a domain may consume ordinary
+    // card evidence only from that same authoritative target domain. A
+    // domainless target remains tenant-level; `None` is not a requirement
+    // that the actor card's grant itself be domainless.
+    if matches!(
+        ctx.resource_ownership_scope,
+        ResourceOwnershipScope::TenantScoped
+    ) {
+        if let Some(resource_domain_id) = ctx.resource_domain_id {
+            if grant.tenant.domain_id != Some(resource_domain_id) {
+                return false;
+            }
+        }
+    }
+    // 有效期（统一 UTC 时钟）。
+    if !grant.validity.is_valid_at(now) {
+        return false;
+    }
+    // 合同只允许 ACTIVE+ALLOW 形态进入 effective_grants；漂移 fail-closed。
+    if grant.state != GrantState::Active || grant.effect != GrantEffect::Allow {
+        return false;
+    }
+    // 资源匹配：类型级 grant 通配本类型，`*` 全局通配；对象级 grant 只命中
+    // 同一对象；类型级请求绝不命中对象级 grant。
+    let (grant_type, grant_id) = parse_resource_key(&grant.resource);
+    if grant_type != request_type && grant_type != "*" {
+        return false;
+    }
+    if type_level_request {
+        if grant_id.is_some() {
+            return false;
+        }
+    } else if grant_id.is_some() && grant_id != request_id {
+        return false;
+    }
+    // 动作匹配：exact / write 别名 / '*'。
+    let action = ctx.action.as_str();
+    grant.action == action
+        || grant.action == "*"
+        || get_alias_sources(action).contains(&grant.action.as_str())
+}
 
-    evidence.effective_grants.iter().find(|grant| {
-        // 身份/租户边界：grant 必须属于本次请求的卡、用户、租户。
-        if grant.card_id != card_id
-            || ctx.user_id.is_none_or(|user_id| grant.user_id != user_id)
-            || grant.tenant.tenant_id != request_tenant
-        {
-            return false;
-        }
-        // Card-domain provenance: a grant must remain bound to the active actor
-        // card domain. This is distinct from the protected target's domain below.
-        if let Some(domain_id) = ctx.domain_id {
-            if grant.tenant.domain_id != Some(domain_id) {
-                return false;
-            }
-        }
-        // A resolver-classified tenant target with a domain may consume ordinary
-        // card evidence only from that same authoritative target domain. A
-        // domainless target remains tenant-level; `None` is not a requirement
-        // that the actor card's grant itself be domainless.
-        if matches!(
-            ctx.resource_ownership_scope,
-            ResourceOwnershipScope::TenantScoped
+fn match_indexed_with_state<'a>(
+    ctx: &PolicyContext,
+    evidence: &'a std::sync::Arc<PublishedCardAuthorization>,
+    request_type: &str,
+    request_id: Option<&str>,
+    state: &mut MatcherCacheState,
+) -> (Option<&'a CanonicalGrant>, MatcherPath) {
+    let (candidates, path) = matcher_candidates(state, evidence, request_type);
+    let Some(candidates) = candidates else {
+        return (
+            find_linear_published_grant(ctx, evidence, request_type, request_id),
+            path,
+        );
+    };
+    for index in candidates {
+        let grant = &evidence.effective_grants[index];
+        if grant_matches_request(
+            ctx,
+            request_type,
+            request_id,
+            request_id.is_none(),
+            evidence.read_unix_seconds,
+            grant,
         ) {
-            if let Some(resource_domain_id) = ctx.resource_domain_id {
-                if grant.tenant.domain_id != Some(resource_domain_id) {
-                    return false;
-                }
-            }
+            return (Some(grant), path);
         }
-        // 有效期（统一 UTC 时钟）。
-        if !grant.validity.is_valid_at(now) {
-            return false;
-        }
-        // 合同只允许 ACTIVE+ALLOW 形态进入 effective_grants；漂移 fail-closed。
-        if grant.state != GrantState::Active || grant.effect != GrantEffect::Allow {
-            return false;
-        }
-        // 资源匹配：类型级 grant 通配本类型，`*` 全局通配；对象级 grant 只命中
-        // 同一对象；类型级请求绝不命中对象级 grant。
-        let (grant_type, grant_id) = parse_resource_key(&grant.resource);
-        if grant_type != request_type && grant_type != "*" {
-            return false;
-        }
-        if type_level_request {
-            if grant_id.is_some() {
-                return false;
-            }
-        } else if grant_id.is_some() && grant_id != request_id {
-            return false;
-        }
-        // 动作匹配：exact / write 别名 / '*'。
-        let action = ctx.action.as_str();
-        grant.action == action
-            || grant.action == "*"
-            || get_alias_sources(action).contains(&grant.action.as_str())
+    }
+    (None, path)
+}
+
+pub(crate) fn match_published_effective_grant<'a>(
+    ctx: &PolicyContext,
+    evidence: &'a std::sync::Arc<PublishedCardAuthorization>,
+    resource_key: &str,
+) -> Option<&'a CanonicalGrant> {
+    let (request_type, request_id) = parse_resource_key(resource_key);
+    record_matcher_evidence_size(evidence.effective_grants.len());
+
+    // 接力：小 N 线性扫描（技术 A，零构建成本）；大 N 走类型索引（技术
+    // B，构建 O(N) 一次、跨判定摊销，每判定 O(桶 + 通配桶)）。索引桶是匹
+    // 配的必要候选集合，两路径共用同一谓词——语义等价由结构保证。
+    if evidence.effective_grants.len() <= MATCHER_INDEX_THRESHOLD {
+        record_matcher_path(MatcherPath::LinearThreshold);
+        return find_linear_published_grant(ctx, evidence, request_type, request_id);
+    }
+    MATCHER_INDEX_CACHE.with(|cache| -> Option<&'a CanonicalGrant> {
+        let mut state = cache.borrow_mut();
+        let (matched, path) =
+            match_indexed_with_state(ctx, evidence, request_type, request_id, &mut state);
+        record_matcher_path(path);
+        matched
     })
 }
 

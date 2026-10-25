@@ -367,6 +367,19 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
     D: std::future::Future<Output = ()> + Send + 'static,
 {
+    if let Some(metrics_addr) =
+        astral_common::metrics_runtime::metrics_listen_addr("127.0.0.1:9103")
+    {
+        match astral_common::metrics_runtime::install_prometheus_recorder() {
+            Ok(handle) => {
+                astral_common::metrics_runtime::spawn_metrics_server(metrics_addr, handle);
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "prometheus recorder install failed; /metrics disabled")
+            }
+        }
+    }
+
     let config = Arc::new(AppConfig::from_files_for(
         "application",
         JwtValidationRole::Identity,

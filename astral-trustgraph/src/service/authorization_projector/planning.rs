@@ -4,8 +4,12 @@
 //! EventDisposition 与发布计划；不做 I/O、不改租约、不发布。worker 执行见
 //! 主 worker 区块，durable 边界见 [`super::runtime`]。
 
+mod digest_hints;
 mod parent_ordinals;
 
+#[cfg(test)]
+pub(crate) mod digest_hint_test_support;
+use digest_hints::{DigestHintStore, ProcessDigestHintStore, SEGMENT_DIGEST_HINT_STATS};
 use parent_ordinals::ParentOrdinalLookup;
 use sha2::{Digest, Sha256};
 
@@ -592,16 +596,80 @@ pub(crate) fn assemble_continuation_candidate(
 ///
 /// Reference priority and candidate iteration order are preserved. The staging
 /// transaction re-verifies every reused reference under lock.
+// 仅测试与性能矩阵使用（无提示版 = 提示关闭版）；生产路径一律走
+// `plan_stage_segments_with_hints(..., true)`。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn plan_stage_segments(
     candidate: &HotState,
     parent_references: Option<&[(u64, ParentReferenceView)]>,
 ) -> Result<Vec<StagedSegmentContent>, String> {
+    plan_stage_segments_with_hints(candidate, parent_references, false)
+}
+
+/// 方向 A 生产实现：`use_digest_hints = true` 时，键+content_hash 双重
+/// 命中提示缓存的段跳过 encode（digest 取自缓存——上一次对同一内容的
+/// 真实编码结果），直接与 parent digest 匹配走 ReuseParent；未命中或
+/// 内容变化的段照常 encode 并回填缓存。语义与 `plan_stage_segments`
+/// 完全一致：ReuseParent 仍由 staging 事务在锁下重验。
+pub(crate) fn plan_stage_segments_with_hints(
+    candidate: &HotState,
+    parent_references: Option<&[(u64, ParentReferenceView)]>,
+    use_digest_hints: bool,
+) -> Result<Vec<StagedSegmentContent>, String> {
+    let mut cache = ProcessDigestHintStore;
+    plan_stage_segments_with_store(candidate, parent_references, use_digest_hints, &mut cache)
+}
+
+fn plan_stage_segments_with_store(
+    candidate: &HotState,
+    parent_references: Option<&[(u64, ParentReferenceView)]>,
+    use_digest_hints: bool,
+    cache: &mut impl DigestHintStore,
+) -> Result<Vec<StagedSegmentContent>, String> {
     let mut plan = Vec::with_capacity(candidate.segments.len());
     let mut lookup = ParentOrdinalLookup::new(parent_references.unwrap_or_default());
-    for (_key, segment) in candidate.segments.iter() {
-        let payload = astral_db::encode_segment_payload(&segment.grants)
-            .map_err(|error| format!("code=auth_projector.segment_encode_failed;error={error}"))?;
-        let digest_hex = hex_lower(&Sha256::digest(&payload));
+    for (key, segment) in candidate.segments.iter() {
+        let digest_hex = if use_digest_hints {
+            match cache.cached_digest(key, &segment.content_hash) {
+                Some(digest) => {
+                    SEGMENT_DIGEST_HINT_STATS
+                        .0
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::observability::record_segment_digest_hint_cache(
+                        crate::observability::SegmentDigestHintCacheOutcome::Hit,
+                        1,
+                    );
+                    digest
+                }
+                None => {
+                    SEGMENT_DIGEST_HINT_STATS
+                        .1
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::observability::record_segment_digest_hint_cache(
+                        crate::observability::SegmentDigestHintCacheOutcome::Miss,
+                        1,
+                    );
+                    let payload =
+                        astral_db::encode_segment_payload(&segment.grants).map_err(|error| {
+                            format!("code=auth_projector.segment_encode_failed;error={error}")
+                        })?;
+                    let digest = hex_lower(&Sha256::digest(&payload));
+                    cache.remember_digest(
+                        key.clone(),
+                        segment.content_hash.clone(),
+                        digest.clone(),
+                    );
+                    digest
+                }
+            }
+        } else {
+            let payload = astral_db::encode_segment_payload(&segment.grants).map_err(|error| {
+                format!("code=auth_projector.segment_encode_failed;error={error}")
+            })?;
+            let digest = hex_lower(&Sha256::digest(&payload));
+            cache.remember_digest(key.clone(), segment.content_hash.clone(), digest.clone());
+            digest
+        };
         match lookup.take(&digest_hex) {
             Some(parent_ordinal) => plan.push(StagedSegmentContent::ReuseParent { parent_ordinal }),
             None => plan.push(StagedSegmentContent::New(
@@ -1100,10 +1168,11 @@ pub(crate) fn decide_event_disposition(input: &EventDecisionInput<'_>) -> EventD
     let parent_references: Option<&[(u64, ParentReferenceView)]> = input
         .publication
         .map(|context| context.parent_references.as_slice());
-    let stage_segments = match plan_stage_segments(&assembled.candidate, parent_references) {
-        Ok(segments) => segments,
-        Err(reason) => return EventDisposition::Quarantine { reason },
-    };
+    let stage_segments =
+        match plan_stage_segments_with_hints(&assembled.candidate, parent_references, true) {
+            Ok(segments) => segments,
+            Err(reason) => return EventDisposition::Quarantine { reason },
+        };
 
     // The authoritative previous fence comes from the observed frontier
     // pointer (`None` ⇒ 0 first-publication sentinel); the publish

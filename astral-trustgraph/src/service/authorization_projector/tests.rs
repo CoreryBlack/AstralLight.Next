@@ -4,6 +4,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use super::planning::digest_hint_test_support::{
+    plan_stage_segments_with_cache, DigestHintCache, DIGEST_HINT_CACHE_CAPACITY,
+};
 use super::worker::{
     budget_exhausted_error, clamp_backoff, event_backoff_secs, fail_with_budget,
     plan_retry_schedule, quarantine_event_terminal, quarantine_reason_parts, run_partition_worker,
@@ -1290,7 +1293,11 @@ fn worker_source_has_no_legacy_channel_symbols() {
     let ordinal_source = production_source_slice(include_str!(
         "../authorization_projector/planning/parent_ordinals.rs"
     ));
+    let digest_hint_source = production_source_slice(include_str!(
+        "../authorization_projector/planning/digest_hints.rs"
+    ));
     assert!(ordinal_source.contains("fn take("));
+    assert!(digest_hint_source.contains("struct DigestHintCache"));
     let production = production_source_slice(main_source);
     // The cut must land exactly on the single test-section marker: no
     // cfg(test)/test-mod text may survive into the scanned production half.
@@ -1302,13 +1309,18 @@ fn worker_source_has_no_legacy_channel_symbols() {
         ("config.rs", config_source),
         ("runtime.rs", runtime_source),
         ("worker.rs", worker_source),
-        ("planning.rs", planning_source),
     ] {
         assert!(
             !source.contains("#[cfg(test)]"),
             "{name} must not carry a test section"
         );
     }
+    assert_eq!(
+        planning_source.matches("#[cfg(test)]").count(),
+        1,
+        "planning.rs may only gate its isolated test-support module"
+    );
+    assert!(planning_source.contains("#[cfg(test)]\npub(crate) mod digest_hint_test_support;"));
 
     // Coverage proof across the whole runtime half (fixed scan regression):
     // early constants/policy, the loop body, the disposition actuator and
@@ -1318,9 +1330,8 @@ fn worker_source_has_no_legacy_channel_symbols() {
     assert!(worker_source.contains("async fn run_worker("));
     assert!(worker_source.contains("async fn act_on_disposition("));
     assert!(worker_source.contains("fn quarantine_reason_parts("));
-    assert!(
-        planning_source.contains("plan_stage_segments(&assembled.candidate, parent_references)")
-    );
+    assert!(planning_source
+        .contains("plan_stage_segments_with_hints(&assembled.candidate, parent_references, true)"));
     // 配置解析归属 config.rs，纯计划归属 planning.rs（拆分后从主文件移出）。
     assert!(config_source.contains("fn parse_projector_tenants("));
     assert!(planning_source.contains("partition_ledger_at_published_frontier("));
@@ -1332,6 +1343,7 @@ fn worker_source_has_no_legacy_channel_symbols() {
         ("worker.rs", worker_source),
         ("planning.rs", planning_source),
         ("parent_ordinals.rs", ordinal_source.as_str()),
+        ("digest_hints.rs", digest_hint_source.as_str()),
     ] {
         assert_no_legacy_channel_symbols(source, name);
     }
@@ -1352,9 +1364,8 @@ fn worker_source_has_no_legacy_channel_symbols() {
     assert!(worker_source.contains("fn quarantine_reason_parts("));
     // Segment reuse is driven by observed parent references (never hard
     // coded None in the production decide path).
-    assert!(
-        planning_source.contains("plan_stage_segments(&assembled.candidate, parent_references)")
-    );
+    assert!(planning_source
+        .contains("plan_stage_segments_with_hints(&assembled.candidate, parent_references, true)"));
 }
 
 /// Watchdog probe / claim-candidate same-shape guard (10.D-2 companion).
@@ -3947,4 +3958,207 @@ fn disposition_kind_mapping_is_total() {
     for (disposition, expected) in cases {
         assert_eq!(disposition.kind(), expected);
     }
+}
+
+// ===== 方向 A：digest 提示缓存的正确性（staging 复用路径）=====
+
+#[test]
+fn digest_hint_cache_reuses_unchanged_segments_and_never_mismatches_content() {
+    let grants: Vec<_> = (0..4)
+        .map(|id| {
+            let mut grant = grant(id, 1, GrantState::Active);
+            grant.resource = format!("learn_subject:{id}");
+            grant
+        })
+        .collect();
+    let candidate = HotState::from_grants(
+        tenant_of(17),
+        4,
+        grants.clone(),
+        DependencyVector::default(),
+    )
+    .unwrap();
+    let references: Vec<_> = candidate
+        .segments
+        .iter()
+        .enumerate()
+        .map(|(index, (_, segment))| {
+            parent_view(
+                index as u64,
+                &hex_lower(&Sha256::digest(
+                    astral_db::encode_segment_payload(&segment.grants).unwrap(),
+                )),
+            )
+        })
+        .collect();
+
+    // 首次：缓存空 → 全部走真实 encode，结果与无提示版本一致。
+    let without = plan_stage_segments(&candidate, Some(&references)).unwrap();
+    let with = plan_stage_segments_with_hints(&candidate, Some(&references), true).unwrap();
+    assert_eq!(without, with);
+
+    // 再次：缓存命中 → 跳过 encode，但结果必须仍与真实 encode 版本一致
+    //（键 + content_hash 双重匹配 ⇒ payload/digest 等价）。
+    let with_again = plan_stage_segments_with_hints(&candidate, Some(&references), true).unwrap();
+    assert_eq!(without, with_again);
+    assert!(with_again
+        .iter()
+        .all(|segment| matches!(segment, StagedSegmentContent::ReuseParent { .. })));
+}
+
+#[test]
+fn digest_hint_cache_content_change_falls_back_to_real_encode() {
+    // 同一 resource 键，但 grant 内容变化（revision 提升）→ 编译器
+    // content_hash 必变 → 缓存 (content_hash, digest) 不匹配 → 回退真实
+    // encode，绝不把旧 digest 冒充新内容。
+    let old_grants: Vec<_> = (0..2)
+        .map(|id| {
+            let mut grant = grant(id, 1, GrantState::Active);
+            grant.resource = format!("learn_subject:{id}");
+            grant
+        })
+        .collect();
+    let old_candidate =
+        HotState::from_grants(tenant_of(17), 1, old_grants, DependencyVector::default()).unwrap();
+    let _ = plan_stage_segments_with_hints(&old_candidate, None, true);
+
+    let new_grants: Vec<_> = (0..2)
+        .map(|id| {
+            let mut grant = grant(id, 2, GrantState::Active);
+            grant.resource = format!("learn_subject:{id}");
+            grant
+        })
+        .collect();
+    let new_candidate = HotState::from_grants(
+        tenant_of(17),
+        2,
+        new_grants.clone(),
+        DependencyVector::default(),
+    )
+    .unwrap();
+    // 新内容：无 parent → 全 New；digest 必须是真实编码的 digest。
+    let planned = plan_stage_segments_with_hints(&new_candidate, None, true).unwrap();
+    for (index, segment) in planned.iter().enumerate() {
+        match segment {
+            StagedSegmentContent::New(plan_grants) => {
+                let expected = hex_lower(&Sha256::digest(
+                    astral_db::encode_segment_payload(plan_grants).unwrap(),
+                ));
+                let actual = plan_stage_segments(&new_candidate, None).unwrap();
+                let actual = match &actual[index] {
+                    StagedSegmentContent::New(grants) => hex_lower(&Sha256::digest(
+                        astral_db::encode_segment_payload(grants).unwrap(),
+                    )),
+                    other => panic!("expected New, got {other:?}"),
+                };
+                assert_eq!(expected, actual);
+            }
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+    // 内容确实变了：plan 里不允许出现针对旧缓存 digest 的 ReuseParent。
+    assert!(planned
+        .iter()
+        .all(|segment| matches!(segment, StagedSegmentContent::New(_))));
+    let _ = new_grants;
+}
+
+#[test]
+fn digest_hint_cache_plans_match_real_encoding_after_hit_eviction_and_expiry() {
+    let grants: Vec<_> = (0..3)
+        .map(|id| {
+            let mut grant = grant(id, 1, GrantState::Active);
+            grant.resource = format!("learn_subject:{id}");
+            grant
+        })
+        .collect();
+    let candidate =
+        HotState::from_grants(tenant_of(17), 5, grants, DependencyVector::default()).unwrap();
+    let references: Vec<_> = candidate
+        .segments
+        .iter()
+        .enumerate()
+        .map(|(index, (_, segment))| {
+            parent_view(
+                index as u64,
+                &hex_lower(&Sha256::digest(
+                    astral_db::encode_segment_payload(&segment.grants).unwrap(),
+                )),
+            )
+        })
+        .collect();
+    let expected = plan_stage_segments(&candidate, Some(&references)).unwrap();
+
+    let mut cache = DigestHintCache::new_for_test(8, Duration::from_secs(60));
+    let first = plan_stage_segments_with_cache(&candidate, Some(&references), &mut cache).unwrap();
+    assert_eq!(first, expected);
+    assert_eq!(cache.len(), candidate.segments.len());
+    let hit = plan_stage_segments_with_cache(&candidate, Some(&references), &mut cache).unwrap();
+    assert_eq!(hit, expected);
+
+    let key = candidate.segments.iter().next().unwrap().0;
+    cache.remember_at_for_test(
+        key.clone(),
+        "stale-content-hash".to_owned(),
+        "not-the-real-digest".to_owned(),
+        std::time::Instant::now(),
+    );
+    let updated =
+        plan_stage_segments_with_cache(&candidate, Some(&references), &mut cache).unwrap();
+    assert_eq!(updated, expected);
+
+    let mut eviction_cache = DigestHintCache::new_for_test(1, Duration::from_secs(60));
+    let after_eviction =
+        plan_stage_segments_with_cache(&candidate, Some(&references), &mut eviction_cache).unwrap();
+    assert_eq!(after_eviction, expected);
+    assert_eq!(eviction_cache.len(), 1);
+
+    let mut expired_cache = DigestHintCache::new_for_test(8, Duration::ZERO);
+    let expired =
+        plan_stage_segments_with_cache(&candidate, Some(&references), &mut expired_cache).unwrap();
+    assert_eq!(expired, expected);
+}
+
+#[test]
+fn digest_hint_cache_capacity_pressure_remains_bounded_and_correct() {
+    let capacity = DIGEST_HINT_CACHE_CAPACITY;
+    let now = std::time::Instant::now();
+    let mut cache = DigestHintCache::new_for_test(capacity, Duration::from_secs(600));
+    let mut keys = Vec::with_capacity(capacity + 1);
+    for id in 1..=(capacity as i64 + 1) {
+        let key = policy_engine::ProjectionKey::new(id, 42, format!("learn_subject:{id}"), "read")
+            .unwrap();
+        cache.remember_at_for_test(
+            key.clone(),
+            format!("content-{id}"),
+            format!("digest-{id}"),
+            now,
+        );
+        keys.push(key);
+    }
+
+    assert_eq!(cache.len(), capacity);
+    assert!(cache.queue_len() <= capacity * 2);
+    assert_eq!(cache.cached_at_for_test(&keys[0], "content-1", now).0, None);
+    assert_eq!(
+        cache
+            .cached_at_for_test(&keys[1], "content-2", now)
+            .0
+            .as_deref(),
+        Some("digest-2")
+    );
+    assert_eq!(
+        cache
+            .cached_at_for_test(&keys[capacity], &format!("content-{}", capacity + 1), now)
+            .0
+            .as_deref(),
+        Some(format!("digest-{}", capacity + 1).as_str())
+    );
+
+    let plan_grants = vec![grant(20, 1, GrantState::Active)];
+    let candidate =
+        HotState::from_grants(tenant_of(17), 6, plan_grants, DependencyVector::default()).unwrap();
+    let expected = plan_stage_segments(&candidate, None).unwrap();
+    let planned = plan_stage_segments_with_cache(&candidate, None, &mut cache).unwrap();
+    assert_eq!(planned, expected);
 }

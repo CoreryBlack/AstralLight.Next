@@ -4089,9 +4089,30 @@ mod tests {
                 dependency_vector(),
             )
             .unwrap();
+            // 构造成本三段归因：canonicalized 校验/JSON 编码/SHA256 摘要。
+            let grants_for_probe = probe_grants(size);
+            let canon_start = Instant::now();
+            for grant in &grants_for_probe {
+                let _ = grant.canonicalized();
+            }
+            let canon_ns = canon_start.elapsed().as_nanos() as u64;
+            let encode_start = Instant::now();
+            let payload = crate::authorization_projection_repository::encode_segment_payload(
+                &grants_for_probe,
+            )
+            .unwrap();
+            let encode_ns = encode_start.elapsed().as_nanos() as u64;
+            let digest_start = Instant::now();
+            let _ = Sha256::digest(&payload);
+            let digest_ns = digest_start.elapsed().as_nanos() as u64;
+            eprintln!(
+                "[supply {size:>4}] construction split: canonicalized {canon_ns:>9}ns | encode {encode_ns:>9}ns | sha256 {digest_ns:>8}ns (payload {} bytes)",
+                payload.len()
+            );
             let install_start = Instant::now();
             hub.install_published_state(seal_state(&identity, 17, 1, hot, None, 0));
             let install_ns = install_start.elapsed().as_nanos() as u64;
+            let _ = install_ns;
             let scope = scoped(&hub, 17);
 
             // 冷装配（首轮 serve）。
@@ -4213,6 +4234,172 @@ mod tests {
                 probe_percentile(&latencies, 0.99),
                 latencies[latencies.len() - 1],
             );
+        }
+        // ===== 方向 A（写侧段复用）：变更段重编码，未变更段复用上一状态的
+        // content_digest/payload——O(变更) 替代 O(N)。仅构造层，装配不变。
+        for size in [1000usize, 4050] {
+            let identity = ProjectionAggregateIdentity::new(7, "USER_CARD", 17).unwrap();
+            let hub = MemoryProjectionHub::default();
+            let hot0 = policy_engine::HotState::from_grants(
+                tenant(),
+                1,
+                probe_grants(size),
+                dependency_vector(),
+            )
+            .unwrap();
+            let base = seal_state(&identity, 17, 1, hot0, None, 0);
+
+            for changed in [1usize, size / 50, size] {
+                let mut grants = probe_grants(size);
+                for g in grants.iter_mut().take(changed) {
+                    g.resource = format!("learn_subject:changed-{changed}");
+                }
+                let hot =
+                    policy_engine::HotState::from_grants(tenant(), 2, grants, dependency_vector())
+                        .unwrap();
+
+                // 方向 A 计时：只对内容变化的段重编码。探针场景为单段，
+                // 以 grant 级 digest 比对模拟段级复用判定 + 仅编码变更部分。
+                let a_start = Instant::now();
+                // 方向 A 核心：先做 O(1)/grant 的内容相等比较（PartialEq），
+                // 只有内容变化的 grant 才走 encode+SHA256——未变更段的
+                // content_digest 直接复用上一状态。
+                let all = hot.all_grants();
+                let previous: std::collections::HashMap<astral_types::GrantId, &CanonicalGrant> =
+                    base.segments
+                        .iter()
+                        .flat_map(|segment| segment.grants.iter())
+                        .map(|grant| (grant.grant_id, grant))
+                        .collect();
+                let mut reencoded = 0usize;
+                let mut digests = Vec::with_capacity(size);
+                for grant in &all {
+                    // 注意：生产语义下 provenance 的 operation_id/event_id 随
+                    // publication 变化，因此"未变更"以 grant 内容除
+                    // provenance.operation_id/event_id 外全部相等为准——探针
+                    // 中上一状态与新状态使用同一 operation/event 前缀时即
+                    // 全量相等。此处与生产对齐：内容含 provenance 比较。
+                    let unchanged = previous
+                        .get(&grant.grant_id)
+                        .is_some_and(|previous_grant| *previous_grant == grant);
+                    if unchanged {
+                        digests.push(None);
+                    } else {
+                        let payload = serde_json::to_vec(grant).unwrap();
+                        digests.push(Some(Sha256::digest(&payload)));
+                        reencoded += 1;
+                        std::hint::black_box(&payload);
+                    }
+                }
+                let a_ns = a_start.elapsed().as_nanos() as u64;
+                eprintln!(
+                    "[dir-A {size:>4} x{changed:>4}] construction-with-reuse: {a_ns:>9}ns (re-encoded {reencoded}/{size} grants)",
+                );
+            }
+        }
+
+        // ===== 方向 B（读侧快照携带）：安装直接携带上一份已装配
+        // PublishedCardAuthorization，只对变更记录打补丁；读取面零装配。
+        for size in [1000usize, 4050] {
+            let identity = ProjectionAggregateIdentity::new(7, "USER_CARD", 17).unwrap();
+            let hub = MemoryProjectionHub::default();
+            let hot0 = policy_engine::HotState::from_grants(
+                tenant(),
+                1,
+                probe_grants(size),
+                dependency_vector(),
+            )
+            .unwrap();
+            let base = seal_state(&identity, 17, 1, hot0, None, 0);
+            hub.install_published_state(base.clone());
+            let scope = PublishedCardEvidenceScope {
+                tenant_id: 7,
+                card_id: 17,
+                user_filter: None,
+                domain: astral_types::DomainScopeRequirement::Unconstrained,
+            };
+            let MemoryEvidenceOutcome::Serve(prev_evidence) = hub.try_memory_evidence(&scope)
+            else {
+                panic!("base must serve");
+            };
+
+            for changed in [1usize, size / 50, size] {
+                let mut grants = probe_grants(size);
+                for g in grants.iter_mut().take(changed) {
+                    g.resource = format!("learn_subject:changed-{changed}");
+                }
+                let hot = policy_engine::HotState::from_grants(
+                    tenant(),
+                    2,
+                    grants.clone(),
+                    dependency_vector(),
+                )
+                .unwrap();
+
+                // 方向 B 计时：只计"快照携带+补丁"——seal_state 的 O(N)
+                // 构造在方向 B 中被完全跳过（这正是其与方向 A 的分界），
+                // 变更记录从 hot.all_grants() 直接取。
+                let b_start = Instant::now();
+                let updated_grants = hot.all_grants();
+                let mut records: Vec<astral_types::VerifiedPublishedGrantRecord> =
+                    Vec::with_capacity(size);
+                for record in &prev_evidence.records {
+                    let grant_id = record.grant.grant_id;
+                    let mutated = grants
+                        .iter()
+                        .take(changed)
+                        .any(|grant| grant.grant_id == grant_id);
+                    if mutated {
+                        if let Some(updated) = updated_grants
+                            .iter()
+                            .find(|grant| grant.grant_id == grant_id)
+                        {
+                            records.push(astral_types::VerifiedPublishedGrantRecord {
+                                aggregate_type: record.aggregate_type.clone(),
+                                aggregate_id: record.aggregate_id,
+                                publication_generation: 2,
+                                revoke_fence: 0,
+                                manifest_id: 2,
+                                event_id: format!("event-2"),
+                                operation_id: format!("operation-2"),
+                                semantic_hash_hex: record.semantic_hash_hex.clone(),
+                                dependency_hash_hex: record.dependency_hash_hex.clone(),
+                                compiler_version: record.compiler_version.clone(),
+                                segment_ordinal: record.segment_ordinal,
+                                position_in_segment: record.position_in_segment,
+                                grant: updated.clone(),
+                                accepted_into_effective_set: true,
+                                unaccepted_reason: None,
+                            });
+                            continue;
+                        }
+                    }
+                    let mut carried = record.clone();
+                    carried.publication_generation = 2;
+                    carried.manifest_id = 2;
+                    carried.event_id = "event-2".to_owned();
+                    carried.operation_id = "operation-2".to_owned();
+                    records.push(carried);
+                }
+                let effective = records
+                    .iter()
+                    .filter(|record| record.accepted_into_effective_set)
+                    .map(|record| record.grant.clone())
+                    .collect::<Vec<_>>();
+                let _gate = astral_types::PublishedCardAuthorizationGate {
+                    status: astral_types::PublishedEvidenceGateStatus::Ready,
+                    aggregate_manifest_count: 1,
+                    verified_record_count: records.len(),
+                    effective_grant_count: effective.len(),
+                    not_in_effective_count: 0,
+                    equivalent_duplicate_collapsed_count: 0,
+                };
+                let b_ns = b_start.elapsed().as_nanos() as u64;
+                eprintln!(
+                    "[dir-B {size:>4} x{changed:>4}] snapshot-carry+patch: {b_ns:>9}ns (records {size}, effective {})",
+                    effective.len()
+                );
+            }
         }
         let _ = started;
     }

@@ -22,6 +22,7 @@ im = { workspace = true }
 async-trait = "0.1"
 
 [dev-dependencies]
+metrics-exporter-prometheus = { workspace = true }
 tokio = { workspace = true }
 tokio-test = { workspace = true }
 mockall = { workspace = true }

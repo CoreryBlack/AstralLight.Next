@@ -415,7 +415,7 @@ fn authorization_ceiling_probe() {
         let validate_ns = va.elapsed().as_nanos() as f64 / alloc_ops as f64;
 
         // 族 A：标识符扫描（ensure_identifier 的逐字符检查）。
-        let mut id_start = Instant::now();
+        let id_start = Instant::now();
         let mut id_sink = 0usize;
         for grant in &repo.evidence.effective_grants {
             id_sink += grant.resource.len()

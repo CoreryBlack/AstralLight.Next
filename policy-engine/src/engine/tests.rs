@@ -2793,7 +2793,7 @@ async fn test_strict_stale_allow_rejected_when_evidence_changes() {
 
 fn unsafe_allow_omitting_final_reload(
     ctx: &PolicyContext,
-    evidence: &PublishedCardAuthorization,
+    evidence: &std::sync::Arc<PublishedCardAuthorization>,
 ) -> bool {
     match_published_effective_grant(ctx, evidence, "learn_subject:42").is_some()
 }
@@ -2814,12 +2814,14 @@ async fn e2_final_reload_omission_accepts_removed_candidate_while_full_contract_
     narrowed.manifests[0].cas_version = 2;
     assert!(first.validate().is_ok());
     assert!(narrowed.validate().is_ok());
+    let first = std::sync::Arc::new(first);
     assert!(
         unsafe_allow_omitting_final_reload(&strict_ctx(), &first),
         "omitting the final reload admits the initial stale candidate"
     );
 
-    let repo = StrictPublishedRepo::with_outcomes(vec![Ok(Some(first)), Ok(Some(narrowed))]);
+    let repo =
+        StrictPublishedRepo::with_outcomes(vec![Ok(Some((*first).clone())), Ok(Some(narrowed))]);
     let decision = PolicyEngine::new().evaluate(&strict_ctx(), &repo).await;
     assert!(!decision.allowed);
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");

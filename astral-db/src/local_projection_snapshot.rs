@@ -604,9 +604,14 @@ pub enum RebuildCause {
     /// The snapshot frontier is older than the durable frontier; warming from
     /// it would risk missing deltas, so rebuild replays the ledger instead.
     ///
-    /// Produced only by the deprecated global-maximum decision
+    /// Retained for compatibility with the deprecated global-maximum decision
     /// ([`decide_snapshot_fallback`]); the per-scope decision reports the
     /// offending aggregate via [`RebuildCause::ScopeDivergence`] instead.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use ScopeDivergence for per-aggregate stale generations"
+    )]
+    #[allow(deprecated)]
     #[error("snapshot generation {snapshot_generation} is behind durable generation {durable_generation}")]
     StaleGeneration {
         snapshot_generation: u64,
@@ -653,15 +658,16 @@ pub enum ScopeDivergenceKind {
 /// ledger rebuild, fail-closed).
 #[derive(Debug)]
 pub enum SnapshotFallbackDecision {
-    /// Snapshot bytes validated and its frontier exactly matches the durable
-    /// published scope; the payload may pre-warm the in-memory mirror.
-    /// Readiness still refuses to serve until the durable frontier is proven
-    /// caught up.
+    /// A decision accepted the validated snapshot as a warm-up input. The
+    /// current per-scope decision emits this only for an exact durable-frontier
+    /// match; the deprecated scalar decision may emit it from a global-maximum
+    /// comparison that does not prove completeness. Readiness still refuses to
+    /// serve until the durable frontier is proven caught up.
     WarmFromSnapshot {
         /// Advisory telemetry only: the highest generation in the snapshot
-        /// frontier. Completeness is proven by the exact per-aggregate
-        /// identity comparison, never by this maximum (0 for an empty-system
-        /// snapshot).
+        /// frontier. The per-scope decision proves completeness by exact
+        /// aggregate identity, never by this maximum (0 for an empty-system
+        /// snapshot); the deprecated scalar decision does not prove it.
         frontier_generation: u64,
     },
     /// Ledger rebuild is mandatory; never authorize from this snapshot.
@@ -821,14 +827,16 @@ fn find_scope_divergence(
 ///
 /// **Deprecated because it cannot prove completeness**: a multi-aggregate
 /// snapshot with one aggregate ahead and one behind the durable frontier has
-/// a high maximum and is (wrongly) accepted here. Retained only for callers
-/// that predate the per-scope decision; the runtime authorization path must
-/// use [`decide_snapshot_fallback_per_scope`], which requires exact
-/// per-aggregate identity and generation equality.
+/// a high maximum and is (wrongly) accepted here. Retained only for source
+/// compatibility; its result is a warm-up hint at most and must never establish
+/// service readiness. Runtime authorization must use
+/// [`decide_snapshot_fallback_per_scope`], which requires exact per-aggregate
+/// identity and generation equality.
 #[deprecated(
     since = "0.1.0",
     note = "global max_generation cannot prove per-aggregate completeness; use decide_snapshot_fallback_per_scope"
 )]
+#[allow(deprecated)]
 pub fn decide_snapshot_fallback(
     load_result: Result<SnapshotEnvelope, LocalSnapshotError>,
     durable_frontier_generation: u64,
@@ -993,6 +1001,7 @@ pub fn readiness_from_decision(decision: &SnapshotFallbackDecision) -> SnapshotR
         SnapshotFallbackDecision::RebuildRequired(RebuildCause::Corrupt(_)) => {
             SnapshotReadiness::Corrupt
         }
+        #[allow(deprecated)]
         SnapshotFallbackDecision::RebuildRequired(RebuildCause::StaleGeneration { .. }) => {
             SnapshotReadiness::RebuildRequired
         }
@@ -1540,8 +1549,8 @@ mod tests {
             }) => assert_eq!(aggregate_key, "b"),
             other => panic!("expected stale divergence on 'b', got {other:?}"),
         }
-        // Contrast: the deprecated global-max decision accepts the same
-        // snapshot, which is exactly why it must stay off the runtime path.
+        // The deprecated global-max decision accepts the same incomplete
+        // snapshot as a warm-up hint only. It cannot establish serviceability.
         #[allow(deprecated)]
         {
             let legacy = decide_snapshot_fallback(
@@ -1554,6 +1563,9 @@ mod tests {
                     frontier_generation: 9
                 }
             ));
+            let readiness = readiness_from_decision(&legacy);
+            assert_eq!(readiness, SnapshotReadiness::Warming);
+            assert!(!readiness.is_serviceable());
         }
     }
 
@@ -1634,6 +1646,10 @@ mod tests {
             decision,
             SnapshotFallbackDecision::RebuildRequired(RebuildCause::StaleGeneration { .. })
         ));
+        assert_eq!(
+            readiness_from_decision(&decision),
+            SnapshotReadiness::RebuildRequired
+        );
         let decision = decide_snapshot_fallback(Ok(test_envelope(9)), 9);
         assert!(matches!(
             decision,
@@ -1641,6 +1657,9 @@ mod tests {
                 frontier_generation: 9
             }
         ));
+        let readiness = readiness_from_decision(&decision);
+        assert_eq!(readiness, SnapshotReadiness::Warming);
+        assert!(!readiness.is_serviceable());
     }
 
     #[test]

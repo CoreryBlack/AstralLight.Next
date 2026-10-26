@@ -3,14 +3,15 @@
 //! 供各业务 crate 创建轻量权限检查中间件。
 //! 每个 crate 需要自行创建 `SqlxRuleRepository` 后传入。
 //!
-//! `check_permission` remains a compatibility helper for parsing and test use,
-//! not a production HTTP authorization entry point: it constructs an
-//! `Unresolved` context and therefore denies at the resource-ownership gate.
-//! Production middleware must resolve server-side target ownership and apply it
-//! to the context before invoking `PolicyEngine.evaluate()`.
+//! `check_permission` is retained as a deprecated compatibility helper for
+//! parsing and legacy callers, not as a production HTTP authorization entry
+//! point: it constructs an `Unresolved` context and therefore denies protected
+//! targets at the resource-ownership gate. Production middleware must resolve
+//! server-side target ownership before invoking `PolicyEngine.evaluate()`.
 //!
 //! Usage of the parsing utilities (not a production authorization template):
 //! ```
+//! #![allow(deprecated)]
 //! use astral_common::middleware::permission_check_shared::{
 //!     check_permission, PathResourceMap,
 //! };
@@ -341,10 +342,16 @@ pub fn resolve_permission_action(resource: &str, path: &str, method: &str) -> Op
     }
 }
 
-/// Compatibility route-mapping helper. It deliberately constructs an
-/// `Unresolved` HTTP context and therefore cannot authorize a protected target
-/// without a service-specific resource-owner resolver. Production middleware
-/// must enrich ownership before calling `PolicyEngine.evaluate()`.
+/// Legacy compatibility helper for route mapping and callers that require the
+/// former shared middleware API. `skip_paths` is a trusted configuration
+/// allowlist, not a request-controlled bypass. The helper deliberately
+/// constructs an `Unresolved` HTTP context and therefore cannot authorize a
+/// protected target. Production middleware must resolve target ownership before
+/// calling `PolicyEngine.evaluate()`.
+#[deprecated(
+    since = "0.1.0",
+    note = "does not resolve protected-resource ownership; use a service-specific owner resolver before PolicyEngine::evaluate"
+)]
 pub async fn check_permission<R: RuleRepository>(
     req: &Request,
     engine: &PolicyEngine,
@@ -355,7 +362,10 @@ pub async fn check_permission<R: RuleRepository>(
     let path = req.uri().path();
     let method = req.method().clone();
 
-    if skip_paths.iter().any(|p| path.starts_with(p)) {
+    if skip_paths
+        .iter()
+        .any(|prefix| !prefix.is_empty() && path_matches_prefix(path, prefix))
+    {
         return Ok(());
     }
 
@@ -378,7 +388,12 @@ pub async fn check_permission<R: RuleRepository>(
 
     let action = match resolve_permission_action(resource, path, method.as_str()) {
         Some(action) => action,
-        None => return Ok(()),
+        None if method == axum::http::Method::OPTIONS => return Ok(()),
+        None => {
+            return Err(BoxedResponse::new(
+                (StatusCode::METHOD_NOT_ALLOWED, "Unsupported HTTP method").into_response(),
+            ));
+        }
     };
 
     let ctx = physical_policy_context(req.headers(), resource, action, request_target_id(req))
@@ -449,6 +464,7 @@ pub fn validate_path_map(path_map: PathResourceMap, service_name: &str) {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::{request_target_id, resolve_permission_action};
     use astral_types::ResourceOwnershipScope;
@@ -943,15 +959,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_permission_skip_paths_bypass_before_repository_read() {
+    async fn check_permission_skip_paths_bypass_only_at_segment_boundaries() {
         let repo = CountingRepo(AtomicUsize::new(0));
+        let engine = PolicyEngine::new();
+
         let req = Request::builder()
             .uri("/open/thing")
             .body(Body::empty())
             .unwrap();
-        let engine = PolicyEngine::new();
         let outcome = check_permission(&req, &engine, &repo, MAPPED_ROUTES, &["/open"]).await;
         assert!(outcome.is_ok());
         assert_eq!(repo.reads(), 0);
+
+        let req = Request::builder()
+            .uri("/open-admin/thing")
+            .body(Body::empty())
+            .unwrap();
+        let outcome = check_permission(&req, &engine, &repo, MAPPED_ROUTES, &["/open"]).await;
+        assert_eq!(
+            outcome
+                .err()
+                .map(|response| response.into_response().status()),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            repo.reads(),
+            0,
+            "unmapped lookalike path must not reach repository"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_permission_empty_skip_prefix_does_not_bypass_every_path() {
+        let repo = CountingRepo(AtomicUsize::new(0));
+        let req = Request::builder()
+            .uri("/unknown-route")
+            .body(Body::empty())
+            .unwrap();
+        let engine = PolicyEngine::new();
+        let outcome = check_permission(&req, &engine, &repo, MAPPED_ROUTES, &[""]).await;
+        assert_eq!(
+            outcome
+                .err()
+                .map(|response| response.into_response().status()),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(repo.reads(), 0);
+    }
+
+    #[tokio::test]
+    async fn check_permission_only_options_is_bypassed_for_unmapped_methods() {
+        let repo = CountingRepo(AtomicUsize::new(0));
+        let options = run_check("/things", "OPTIONS", platform_headers(), &repo).await;
+        assert!(options.is_ok(), "OPTIONS preflight must pass through");
+        assert_eq!(repo.reads(), 0);
+
+        let trace = run_check("/things", "TRACE", platform_headers(), &repo).await;
+        assert_eq!(trace, Err(StatusCode::METHOD_NOT_ALLOWED));
+        assert_eq!(
+            repo.reads(),
+            0,
+            "unsupported methods must be rejected without reads"
+        );
     }
 }

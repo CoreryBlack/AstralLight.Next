@@ -1,7 +1,7 @@
 //! 权限检查中间件与工具函数
 //!
-//! 提供 `require_permission()` 函数供路由处理器调用，
-//! 以及 `extract_user_id()` 从请求头提取用户身份。
+//! 保留 `require_permission()` 作为兼容 helper；受保护资源授权必须先由服务解析目标 owner。
+//! `extract_user_id()` 从请求头提取用户身份。
 //!
 //! 对应 Java `@RequirePermission` + `PermissionAspect`。
 //! 内置 1% 采样一致性巡检（对齐 Java `SnapshotConsistencyChecker`）。

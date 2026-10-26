@@ -102,10 +102,15 @@ fn snapshot_window_is_active(
         && valid_to_ts.is_none_or(|valid_to| now_secs <= valid_to)
 }
 
-/// 查询卡的有效权限（evidence 派生；Redis 不可用时的权威回退路径）。
+/// Deprecated compatibility wrapper for the former snapshot-named permission query.
 ///
-/// 语义与 [`find_effective_permissions_cached`] 的回源路径完全一致：不读
-/// legacy 快照表，不受 head gate 约束，只信严格 reader 产出的已发布证据。
+/// The implementation reads only canonical published evidence, matching the
+/// source path used by [`find_effective_permissions_cached`]. It does not read
+/// legacy snapshot tables or raw authorization sources.
+#[deprecated(
+    since = "0.1.0",
+    note = "the query reads published evidence, not snapshots; use find_effective_permissions_cached"
+)]
 pub async fn find_effective_permissions_from_snapshot(
     pool: &MySqlPool,
     card_id: i64,
@@ -1011,8 +1016,7 @@ fn permission_cache_entry_is_readable(
 ///   （envelope v5）；任一聚合发布推进、source 提交未发布（撤销类越权窗口）
 ///   或换时代即 miss；
 /// - evidence `NotReady`/`Corrupt` → 空 vec fail-closed 且不写缓存；
-/// - Redis 不可用时回退 [`find_effective_permissions_from_snapshot`]（同源
-///   evidence 派生，语义对齐）。
+/// - Redis 不可用时直接读取同一 published-evidence 来源（语义不变）。
 pub async fn find_effective_permissions_cached(
     pool: &MySqlPool,
     card_id: i64,

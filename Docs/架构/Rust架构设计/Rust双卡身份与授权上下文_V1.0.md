@@ -28,7 +28,7 @@ PlatformUser 的 ACCESS credential 必须带完整双卡 scope；AppUser 的 ACC
 | 对象 | 当前职责 | 当前 owner / 主要生产者 | 当前消费者与约束 | 证据 |
 |---|---|---|---|---|
 | `identity_card` | 认证身份事实：`user_id`、ACTIVE 状态、token version、有效期；不承载 tenant/domain scope | Identity 的 `CardRepository` 负责查询/确保 App 会话所需的 ACTIVE identity card；Identity 登录、App 内部会话签发和 access token 生产使用它 | Gateway 注入 `x-identity-card-id`；下游把它映射到 `PolicyContext.identity_card_id`；资格服务只用它做身份线路检查 | [`card_repository.rs:16-49`](../../../astral-identity/src/srv/card_repository.rs#L16-L49)、[`internal.rs:389-411`](../../../astral-identity/src/srv/internal.rs#L389-L411)、[`context.rs:21-24`](../../../astral-types/src/context.rs#L21-L24) |
-| `user_card` | 授权卡实例：卡类型、模板/等级、ACTIVE 与有效窗口、`tenant_id`、`domain_id`；承载业务授权 scope | TrustGraph 的 user-card API/repository 负责管理与读取；Identity 在登录、刷新、切卡时消费所选卡并重签 access | Gateway 注入 `x-user-card-id`、`x-user-card-tenant-id`、`x-user-card-domain-id`；`PolicyContext.card_id` 指向它；不得从 identity 侧 scope 回退 | [`user_cards.rs:189-250`](../../../astral-trustgraph/src/api/user_cards.rs#L189-L250)、[`user_card_repository.rs:90-138`](../../../astral-trustgraph/src/repository/user_card_repository.rs#L90-L138)、[`permission_check_shared.rs:123-165`](../../../astral-common/src/middleware/permission_check_shared.rs#L123-L165) |
+| `user_card` | 授权卡实例：卡类型、模板/等级、ACTIVE 与有效窗口、`tenant_id`、`domain_id`；承载业务授权 scope | TrustGraph 的 user-card API/repository 负责管理与读取；Identity 在登录、刷新、切卡时消费所选卡并重签 access | Gateway 注入 `x-user-card-id`、`x-user-card-tenant-id`、`x-user-card-domain-id`；`PolicyContext.card_id` 指向它；不得从 identity 侧 scope 回退 | [`user_cards.rs:189-250`](../../../astral-trustgraph/src/api/user_cards.rs#L189-L250)、[`user_card_repository.rs:90-138`](../../../astral-trustgraph/src/repository/user_card_repository.rs#L90-L138)、[`physical_policy_context()`](../../../astral-common/src/middleware/permission_check_shared.rs#L55-L118) |
 
 ### 2.1 当前身份事实与授权事实
 
@@ -61,11 +61,11 @@ PlatformUser 的 ACCESS credential 必须带完整双卡 scope；AppUser 的 ACC
 | 路径映射与方法 | `resource` / `action` | 由 service middleware 解析 | 仅 identity-only 路径可使用 |
 | 显式 query ID | `target_id` | 作为对象级授权目标 | 仅在允许的 identity-only 业务中可用 |
 
-映射函数对 PlatformUser 缺任一 user-card 字段返回 `FORBIDDEN`，对 AppUser 明确返回 `(None, None, None)` 的 user-card scope；它不会把 identity-card 的任何 tenant/domain 旧头转换成授权 scope。见 [`permission_check_shared.rs:103-166`](../../../astral-common/src/middleware/permission_check_shared.rs#L103-L166)。
+映射函数对 PlatformUser 缺任一 user-card 字段返回 `FORBIDDEN`，对 AppUser 明确返回 `(None, None, None)` 的 user-card scope；它不会把 identity-card 的任何 tenant/domain 旧头转换成授权 scope。见 [`physical_policy_context()`](../../../astral-common/src/middleware/permission_check_shared.rs#L55-L118)。
 
 ### 3.2 PolicyEngine 入口
 
-Identity、Learn、TrustGraph 的业务权限中间件都先调用共享 `physical_policy_context`，再调用 `state.engine.evaluate(&ctx, &repo)`；路由未匹配资源映射或上下文缺失时拒绝。TrustGraph 的具体入口见 [`permission_check.rs:120-180`](../../../astral-trustgraph/src/api/permission_check.rs#L120-L180)，Identity 的对应入口见 [`middleware.rs:114-128`](../../../astral-identity/src/middleware.rs#L114-L128)，Learn 的对应入口见 [`learn/middleware.rs:107-136`](../../../astral-learn/src/middleware.rs#L107-L136)。
+业务权限中间件先解析 path/action，并调用共享 `physical_policy_context` 构造身份/双卡 actor context；该 helper 将 `resource_ownership_scope` 保持为 `Unresolved`，不证明目标资源 owner。服务必须先运行自己的 owner resolver 并将解析结果应用到 context；resolver 未解析或不可用时拒绝/defer，只有 owner 结果满足契约后才调用 `PolicyEngine::evaluate()`。Identity、Monitor、TrustGraph、Learn 的 resolver-before-evaluate 顺序分别见 [`identity/middleware.rs:136-149`](../../../astral-identity/src/middleware.rs#L136-L149)、[`monitor/middleware.rs:74-87`](../../../astral-monitor/src/middleware.rs#L74-L87)、[`trustgraph/permission_check.rs:344-369`](../../../astral-trustgraph/src/api/permission_check.rs#L344-L369) 和 [`learn/middleware.rs:153-190`](../../../astral-learn/src/middleware.rs#L153-L190)。Chat 的 HTTP 目标资源由 middleware 解析；WebSocket 帧按 conversation target 在 [`realtime.rs:804-853`](../../../astral-chat/src/srv/realtime.rs#L804-L853) 单独解析并评估。
 
 **当前事实**：AppUser 只在 Learn 的 `learn-app-users` service 且主体为 `APP_USER` 时被显式放行；登录/登出认证端点也在资源策略之外。见 [`learn/middleware.rs:116-129`](../../../astral-learn/src/middleware.rs#L116-L129)、[`learn/middleware.rs:258-279`](../../../astral-learn/src/middleware.rs#L258-L279)。
 
@@ -246,7 +246,7 @@ v3 canonical payload 的字段顺序与前缀由 `compute_hmac_signature_v3` 固
 
 本文件最小证据集合如下：
 
-- 双卡与资格：[`permission_check_shared.rs:103-166`](../../../astral-common/src/middleware/permission_check_shared.rs#L103-L166)、[`context.rs:7-85`](../../../astral-types/src/context.rs#L7-L85)、[`eligibility.rs:236-307`](../../../astral-db/src/eligibility.rs#L236-L307)。
+- 双卡与资格：[`physical_policy_context()`](../../../astral-common/src/middleware/permission_check_shared.rs#L55-L118)、[`context.rs:7-85`](../../../astral-types/src/context.rs#L7-L85)、[`eligibility.rs:236-307`](../../../astral-db/src/eligibility.rs#L236-L307)。
 - Gateway route/internal/auth/forward：[`gateway/main.rs:203-287`](../../../astral-gateway/src/main.rs#L203-L287)、[`gateway/middleware.rs:678-877`](../../../astral-gateway/src/middleware.rs#L678-L877)、[`gateway/proxy.rs:257-455`](../../../astral-gateway/src/proxy.rs#L257-L455)、[`gateway/proxy.rs:866-997`](../../../astral-gateway/src/proxy.rs#L866-L997)。
 - Learn AppUser producer：[`app_user_service.rs:41-115`](../../../astral-learn/src/service/app_user_service.rs#L41-L115)。
 - Identity internal/auth/session：[`internal.rs:136-221`](../../../astral-identity/src/srv/internal.rs#L136-L221)、[`auth.rs:251-338`](../../../astral-identity/src/auth.rs#L251-L338)、[`session.rs:47-90`](../../../astral-identity/src/srv/session.rs#L47-L90)、[`session.rs:1021-1563`](../../../astral-identity/src/srv/session.rs#L1021-L1563)。

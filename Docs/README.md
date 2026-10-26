@@ -16,6 +16,11 @@ This directory contains documentation selected for the standalone Rust backend r
 
 - [后端接口参考 V1](API/后端接口参考_V1.md): current Rust HTTP routes, Gateway exposure, authentication boundaries, and configuration-gated endpoints.
 
+## Technical Analysis and Measurements
+
+- [技术专题解析与架构取舍（2026-10-25）](技术专题解析与架构取舍_2026-10-25.md): Java-to-Rust migration boundaries, framework/data/MQ choices, authorization-engine topology, and canonical-vs-legacy projection roles. Design records and current implementation evidence are distinguished.
+- [授权执行期能力曲线（2026-10-25）](实验/基准测试/授权执行期能力曲线_20261025.md): a local release-mode `PolicyEngine::evaluate()` CPU matrix with an explicitly limited historical comparison; not HTTP QPS, live integration, or production capacity.
+
 ## Architecture
 
 - [Rust architecture index](架构/Rust架构设计/README.md)
@@ -31,7 +36,7 @@ This directory contains documentation selected for the standalone Rust backend r
 
 ## Capability Inventory
 
-- [技术能力与储备清单](技术能力与储备清单.md): 54 项逐项核验、清单外能力、架构储备与验收边界。
+- [技术能力与储备清单](技术能力与储备清单.md): 唯一静态能力/技术储备总览，含 54 项逐项证据核验、清单外能力与验收边界。储备和架构主题的实质分析按专题链接进入[架构设计索引](架构/Rust架构设计/README.md)；原 54 项是逐项盘点，不代表每项都有独立长篇详解；清单不报告运行性能分数。
 
 ## SDK Integration
 

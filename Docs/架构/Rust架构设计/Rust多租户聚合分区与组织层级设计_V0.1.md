@@ -139,7 +139,7 @@ OVERLAY 只接受以下操作：
 
 - 每个治理单元使用一张共享授权载体，成员复用单元已发布证据；个人卡不复制完整组织规则。**现有 `user_card.user_id`、`CanonicalGrant.user_id`、双卡资格 SQL 和 `ProjectionKey` 都按单用户归属设计**，一人多卡不代表已支持共享卡。共享内容、单元归属和成员资格必须分别建模，不能通过删除 user/tenant 校验实现。
 - 成员资格是独立版本化事实，至少绑定主体/身份、目标 tenant、单元、行政根及关系版本、有效期和撤销栅栏。加入、退出、禁用、到期、调岗均有批准来源与 durable 失效路径。共享卡证据健康不能替代“当前请求者仍是合法持有者”的证明。
-- 工程默认：行政树单父；成员可以显式拥有多个单元资格，但每项独立批准并限制数量。**当前工作区实现（2026-09-22，未提交）**：每个 `user_id` 全局最多持有 8 条 `active=1` 的 ORG_SCOPE membership（不按行政根或 tenant 分桶）；有效期已结束但尚未显式撤销的 active 行仍占用名额。创建在同一 source 短事务中按固定顺序锁定 `identity_card.uk_ic_user(user_id)` 单表用户锚点、物理双卡绑定、`idx_osmem_card(card_id, active)` 卡级范围和 `idx_osmem_user_active(user_id, active)` 用户范围，再以 bounded count 拒绝超限；单表用户锚点使容量边界不依赖 InnoDB gap-lock 语义，在 `READ COMMITTED` 下也保持串行。超限回滚 operation claim/revision/outbox/audit，不产生 durable 残留。启用前 preflight 必须证明 `uk_ic_user(user_id)` 为唯一单列索引；该基线契约属于既有 identity-card schema，本 additive migration 不创建或修复它。跨 tenant 的资格不是一张跨 tenant 通行证，一次请求只消费对其目标资源作用域有效的分支；首版不自动组合不同独立行政根的权限。
+- 工程默认：行政树单父；成员可以显式拥有多个单元资格，但每项独立批准并限制数量。**当前仓库实现（截至 2026-10-26 已进入 `HEAD`）**：每个 `user_id` 全局最多持有 8 条 `active=1` 的 ORG_SCOPE membership（不按行政根或 tenant 分桶）；有效期已结束但尚未显式撤销的 active 行仍占用名额。创建在同一 source 短事务中按固定顺序锁定 `identity_card.uk_ic_user(user_id)` 单表用户锚点、物理双卡绑定、`idx_osmem_card(card_id, active)` 卡级范围和 `idx_osmem_user_active(user_id, active)` 用户范围，再以 bounded count 拒绝超限；单表用户锚点使容量边界不依赖 InnoDB gap-lock 语义，在 `READ COMMITTED` 下也保持串行。超限回滚 operation claim/revision/outbox/audit，不产生 durable 残留。启用前 preflight 必须证明 `uk_ic_user(user_id)` 为唯一单列索引；该基线契约属于既有 identity-card schema，本 additive migration 不创建或修复它。跨 tenant 的资格不是一张跨 tenant 通行证，一次请求只消费对其目标资源作用域有效的分支；首版不自动组合不同独立行政根的权限。以上是代码/仓库状态，不等于已对数据库执行 migration 或通过真实部署验收。
 - **非独立单位员工的所有组织业务授权，包括个人卡上的直接/审批授权，都必须追溯到该单位所属行政根。** “个人独立授权”只表示它不依赖某一条部门共享贡献，不表示可以脱离祖先树、绕过授予上限或从未批准的外部来源取权。独立单位员工则按该独立单位自己的祖先树配置权限。
 - 祖先单元卡仅是继承编译依赖，不自动成为成员可直接使用的额外分支。否则部门剪裁会被祖先卡重新放行；额外持有者资格必须显式批准，并接受职责分离等共同约束。
 
@@ -253,17 +253,17 @@ E5/TLA 边界：组织树、批准边、成员资格与撤销捕获是否纳入�
 
 | 组件 | 状态 | 落点 |
 |------|------|------|
-| ORG_SCOPE additive 迁移（13 表，无 ALTER/回填/删除） | 已创建于当前工作区（截至 2026-09-22 git 未跟踪、待提交；additive，**未对任何数据库执行**） | `astral-db/migrations/20260922000001_org_scope_authority.sql` |
+| ORG_SCOPE additive 迁移（13 表，无 ALTER/回填/删除） | 已进入当前仓库提交历史（截至 2026-10-26）；additive；**目标数据库是否应用仍未验收** | `astral-db/migrations/20260922000001_org_scope_authority.sql` |
 | org_scope_repository（node/request/grant/mask/membership/revision/outbox/publication/current/dependency/operation/audit、flatten compile input、complete_publish） | 已实现，typed 测试覆盖；membership 创建额外执行 global-per-user active cap（8）与 user-range lock，超限 fail-closed | `astral-db/src/org_scope_repository/` |
 | org 治理 API/service（ROOT_INIT、挂靠、授予、剪裁、成员资格等路由） | 已实现并注册路由；治理行为受 `ASTRAL_ORG_SCOPE_ENABLED` 门控 | `astral-trustgraph/src/api/org_authorities.rs`、`astral-trustgraph/src/service/org_authorities.rs` |
 | org 准入门与编译内核 | 已实现 | `policy-engine/src/org_admission.rs`、`policy-engine/src/org_compiler.rs`（`repository.rs` 提供 `load_org_authorization` hook） |
 | org projector worker | 源码已接线：仅在 frozen `ASTRAL_ORG_SCOPE_ENABLED=true` 时解析显式 tenant allowlist、执行只读 schema guard 并启动；关闭时严格逆序 drain。typed 测试已覆盖，未启动 worker、未做真实集成验收 | `astral-trustgraph/src/service/org_scope_projector.rs`、`astral-trustgraph/src/main.rs` |
-| 迁移 preflight/回滚脚本 | 已创建于当前工作区（git 未跟踪、待提交；preflight 只读；rollback 破坏性，带逐表空表守卫） | `scripts/org_scope_preflight.sh` |
+| 迁移 preflight / rollback 子命令 | 脚本已进入当前仓库提交历史；preflight 只读；`rollback` 子命令有逐表空表守卫且为破坏性动作；无独立 rollback 脚本 | `scripts/org_scope_preflight.sh` |
 | 真实迁移应用、preflight/备份恢复/回滚演练、真实集成验收 | 未执行（BLOCKED，依赖 Exec-L3）；其中 membership-cap 的跨独立根、expired-active、revoke-then-create 与并发不同卡断言已编译为 ignored MySQL 测试，尚未运行 | — |
 
-ORG_SCOPE 运行时**默认关闭**：`ASTRAL_ORG_SCOPE_ENABLED` 严格 bool（默认 false，非法值拒绝启动）；迁移文件存在不等于目标数据库已应用；受管租户在旗标关闭/陈旧/未知时必须 DENY，不回退 legacy 或 raw source。迁移/回滚流程与执行状态见 [ORG_SCOPE迁移与回滚操作手册_V0.1.md](../../迁移/ORG_SCOPE迁移与回滚操作手册_V0.1.md)。上表仅记录代码层现状，**不构成 M2 完成或部署验收**。另注（交付状态，截至 2026-09-22）：上表所列 ORG_SCOPE 文件（迁移 SQL、`org_scope_repository`、org 治理 API/service、`org_admission`/`org_compiler`、`org_scope_projector`、preflight/回滚脚本）及相关文档均为 git 未跟踪（untracked），须由后续授权交付步骤 stage/commit 后才进入仓库提交历史；在此之前 release/CI checkout 不包含这些文件，本表状态只对包含这些文件的工作区快照有效（最终冻结语义见 [AGENTS.md §7.2](../../../AGENTS.md)）。
+ORG_SCOPE 运行时**默认关闭**：`ASTRAL_ORG_SCOPE_ENABLED` 严格 bool（默认 false，非法值拒绝启动）；迁移文件已进入当前仓库提交历史，但不等于目标数据库已应用；受管租户在旗标关闭/陈旧/未知时必须 DENY，不回退 legacy 或 raw source。迁移/回滚流程与执行状态见 [ORG_SCOPE迁移与回滚操作手册_V0.1.md](../../迁移/ORG_SCOPE迁移与回滚操作手册_V0.1.md)。上表仅记录代码层现状，**不构成 M2 完成或部署验收**。历史交付快照（2026-09-22）称这些文件为 untracked；该状态已过期。经当前仓库提交对象核对，迁移、repository、API/service、admission/compiler、projector、preflight 脚本与操作手册均已进入当前 `HEAD`。操作手册所称 rollback 是 `scripts/org_scope_preflight.sh rollback` 子命令，不存在独立的 `scripts/org_scope_rollback.sh`。以上不改变真实迁移、preflight、备份恢复、回滚演练和集成验收未执行/未验收的状态（最终冻结语义见 [AGENTS.md §7.2](../../../AGENTS.md)）。
 
-**BREAKING CHANGE（Rust 0.x workspace 内部接口下线，2026-09-22；按 [AGENTS.md §3.3](../../../AGENTS.md) 内部接口门登记）**：`astral_types::org_scope::OrgSubjectFilter::All` 已从源码移除。**替代入口**：`SharedOnly`（共享单元贡献）或精确 `PersonalOf { user_id, card_id }`（显式个人卡对），不再提供"取全部"隐式过滤器。**影响范围**：repository-wide 扫描确认仓内零调用方（现存引用均为 `SharedOnly`/`PersonalOf`，含 typed 测试）；仅 Rust workspace 内部类型，不构成 wire 协议、MQ 协议或数据库协议变化，**无外部 HTTP/MQ/DB 兼容性声明**。**迁移方案**：调用方必须改用显式过滤器（`SharedOnly` 或精确 `PersonalOf`），禁止依赖隐式全量语义。**回滚方案**：仅在源码层恢复该变体；**不得**把恢复 `All` 当作授权语义放宽或绕过 fail-closed 默认拒绝的 workaround。**生效时间**：随包含本次移除的工作区快照即时生效；进入仓库提交历史以后续授权 stage/commit 为准（交付状态见上文另注）。
+**BREAKING CHANGE（Rust 0.x workspace 内部接口下线，2026-09-22；按 [AGENTS.md §3.3](../../../AGENTS.md) 内部接口门登记）**：`astral_types::org_scope::OrgSubjectFilter::All` 已从源码移除。**替代入口**：`SharedOnly`（共享单元贡献）或精确 `PersonalOf { user_id, card_id }`（显式个人卡对），不再提供"取全部"隐式过滤器。**影响范围**：repository-wide 扫描确认仓内零调用方（现存引用均为 `SharedOnly`/`PersonalOf`，含 typed 测试）；仅 Rust workspace 内部类型，不构成 wire 协议、MQ 协议或数据库协议变化，**无外部 HTTP/MQ/DB 兼容性声明**。**迁移方案**：调用方必须改用显式过滤器（`SharedOnly` 或精确 `PersonalOf`），禁止依赖隐式全量语义。**回滚方案**：仅在源码层恢复该变体；**不得**把恢复 `All` 当作授权语义放宽或绕过 fail-closed 默认拒绝的 workaround。**生效时间**：随包含本次移除的工作区快照即时生效；该源码状态已进入当前仓库 `HEAD`（截至 2026-10-26 静态核对）。这只证明接口移除已版本化，不代表 ORG_SCOPE 迁移已应用、运行时已启用或真实集成已验收（交付状态见上文另注）。
 
 ## 7. 已确定的决策与工程默认方案
 

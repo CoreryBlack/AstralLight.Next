@@ -17,6 +17,7 @@
 关联资料：
 
 - [Rust 权限投影快照与版本栅栏](./Rust权限投影快照与版本栅栏_V1.0.md)：source mutation、projection worker、snapshot/cache/MQ、版本栅栏与审计旁路。
+- [技术专题解析与架构取舍（2026-10-25）](../../技术专题解析与架构取舍_2026-10-25.md)：跨主题概览和未验证边界；当前判定语义仍以本文件及源码为准。
 - [Rust 架构模型设计修正记录](./Rust架构模型设计修正记录.md)：问题 4（L2 错误与委托）、问题 9/14（资格投影）等核实记录。
 - [物理双卡权限链路评估与设计](./物理双卡权限链路评估与设计_V1.0.md)：双卡事实线路、CARD gate、ELIGIBILITY gate 与残余边界。
 - [Rust 迁移 Java 等价适配状态](../../迁移/Rust迁移Java等价适配状态_2026-08-05.md)：L2 exact-first、投影 gate、条件语义和未完成项。
@@ -197,7 +198,7 @@ canonical generation 由 current pointer、manifest/segment seal、parent lineag
 
 ### 7.6 CARD/ELIGIBILITY gate 的范围边界
 
-**事实**：legacy CARD gate 决定旧规则授权 snapshot 是否可读；ELIGIBILITY gate 决定物理资格缓存是否可命中；生产正式授权由 canonical published-evidence gate 决定。CARD 与 ELIGIBILITY 共享 aggregate id 但不共享版本来源。见 [Rust 权限投影快照与版本栅栏](./Rust权限投影快照与版本栅栏_V1.0.md#5-card-与-eligibility-的投影产物)。
+**事实**：legacy CARD gate 决定旧规则授权 snapshot 是否可读；ELIGIBILITY gate 决定物理资格缓存是否可命中；生产正式授权由 canonical published-evidence gate 决定。CARD 与 ELIGIBILITY 共享 aggregate id 但不共享版本来源。见 [Rust 权限投影快照与版本栅栏](./Rust权限投影快照与版本栅栏_V1.0.md)。
 
 **缺口**：若未来新增影响资格的 source mutation、tenant/domain fan-out 或 identity 显式到期变更，必须明确事件进入 ELIGIBILITY、CARD 还是新的 aggregate；当前不存在 `IDENTITY` aggregate，不能默认由现有 CARD/ELIGIBILITY 代替。
 

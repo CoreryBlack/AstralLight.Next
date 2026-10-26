@@ -18,17 +18,17 @@
 - Arbiter 的纯函数规则已经表达了 READY、generation/fence、DENY、多数、平局和 DEFER 语义，但其中的“多数”仅针对调用方提供的同版本 evidence vector 做计数，不等同于已认证节点 quorum；控制面目前接受调用方提交的上下文和证据，证据真实性尚未建立。
 - 因此，Arbiter 返回的 `ALLOW` 只能作为一致性治理结果、审计和观测结果，**不得进入正常 `PolicyEngine.evaluate()` 的 ALLOW 链路，也不得替代正常 PolicyEngine 决策**。
 - 只有在具备签名节点身份、请求上下文绑定、nonce/replay protection 和明确 quorum 成员/阈值后，才可以评估是否允许 Arbiter 结果参与受控的授权决策；在此之前，Arbiter 只能作为 `PolicyEngine` 之外的冲突检测器和控制面 resolver，用于一致性治理、审计和观测。
-- GlobalAdmin/SuperAdmin 的正常权限来源已经收敛到双卡上下文、`__SUPERADMIN__` 模板、BASE RuleSet、投影门禁和 `PolicyEngine` 评估；禁止用 `isSuperAdmin()`、角色字符串或通配权限直接放行。
-- GlobalAdmin 的发放/启用/禁用已经覆盖卡片投影、资格投影、会话撤销和最后活跃管理员保护，但 GlobalAdmin 生命周期 API 的 ACTIVE 管理员范围守卫和操作级审计仍未完全统一。
+- GlobalAdmin/SuperAdmin 的正常权限来源已经收敛到双卡上下文、`__SUPERADMIN__` 模板、BASE RuleSet、生产 strict published-evidence gate 和 `PolicyEngine` 评估；旧 CARD head gate 仅属于 legacy/test 与 realtime-oracle 路径，不是生产授权门禁。禁止用 `isSuperAdmin()`、角色字符串或通配权限直接放行。
+- GlobalAdmin 的发放/启用/禁用已覆盖卡片投影、资格投影、会话撤销和最后活跃管理员保护；当前 `/global-admins` 路由还通过显式 `ActiveGlobalAdmin` ownership contract 与 strict published-evidence gate 校验调用者。生命周期操作专属的 durable operation audit 仍未补齐。
 - audit-quarantine replay 是当前已存在的特权运维路径：仅 ACTIVE GlobalAdmin 可申请重放，申请有 durable 操作审计，worker 通过 allowlist、租约、代次和 CAS 确认完成；它不是授权决策路径，也不应被 Arbiter 结果绕过。
 
 ## 2. 术语和职责边界
 
 | 术语 | 当前含义 | 不应解释为 |
 | --- | --- | --- |
-| `PolicyEngine` | 正常权限决策唯一入口，按 AUTHN、卡片上下文、投影门禁、RuleSet、`permission_rule`、L2.5 委托和 DEFAULT_DENY 评估 | 可被 Arbiter、GlobalAdmin 状态或角色字符串旁路的函数 |
+| `PolicyEngine` | 正常权限决策唯一入口；生产 repository 走 strict published-evidence gate，未声明该能力的 legacy/test repository 才保留 L1 RuleSet、L2 `permission_rule`、L2.5 委托兼容路径 | 可被 Arbiter、GlobalAdmin 状态或角色字符串旁路的函数 |
 | Arbiter / 执剑人 | 对跨节点/快照与实时证据做确定性冲突解析的治理组件；同版本输入证据可按多数解析 | 正常 `PolicyEngine` 授权链中的投票阶段、节点身份认证器、正常请求 PDP 或普通请求授权器 |
-| `ProjectionGate` | `source_generation`、`projected_generation`、`revoke_fence` 与 READY 状态组成的读侧证据门禁 | 证明提交者身份或证明 HTTP 请求未被重放的凭据 |
+| `ProjectionGate` | 旧 CARD head/legacy reader 与 `evaluate_realtime()` 一致性 oracle 使用的 `source_generation`、`projected_generation`、`revoke_fence`/READY 证明 | 当前生产 strict published-evidence read gate；也不能证明提交者身份或 HTTP 请求未被重放 |
 | GlobalAdmin | `identity_global_admin` 中的 ACTIVE/DISABLED 平台管理员资格记录 | 直接等价于全量权限或 `['*']` |
 | SuperAdmin card | `user_card.card_type = SUPER_ADMIN` 的授权卡，绑定 `__SUPERADMIN__` BASE RuleSet | 可被 `card_type` 检测后直接放行的角色标记 |
 | audit quarantine replay | 对隔离审计消息执行受控查看、申请、租约领取、校验、原始重发和确认的运维路径 | 普通业务消息重放、权限放行或 Arbiter 的证据收集机制 |
@@ -66,11 +66,11 @@ PolicyEngine.evaluate()
 - `gate`：可选的 `ProjectionGate`；缺失表示无法证明决策基于哪个投影版本；
 - `observed_at_ms`：观测时间，仅用于审计排序，不参与裁决。[`DecisionEvidence` 定义](../../../policy-engine/src/arbiter.rs#L24-L33)
 
-`ProjectionGate` 的设计语义是 head READY 且 `source_generation == projected_generation`，并携带 `revoke_fence`；投影链路规定 source generation 每次 source mutation 递增，REVOKE 同时推进 fence，读侧只能在 source 与 projected 对齐时读取。[`ProjectionGate` 与投影门禁](../../../policy-engine/src/engine.rs#L88-L112)；[`projection_repository.rs` 版本语义](../../../astral-trustgraph/src/repository/projection_repository.rs#L18-L23)
+`ProjectionGate` 是旧 CARD head/realtime-oracle 版本证明的类型：head READY 且 `source_generation == projected_generation`，并携带 `revoke_fence`；它不是当前生产 strict authorization evidence。生产 `SqlxRuleRepository` 的 `evaluate()` 在 AUTHN/CARD_CONTEXT 与 resource/action 校验后走 published-evidence gate，消费 canonical publication；旧 projection gate 只服务兼容路径与 `evaluate_realtime()` 一致性 oracle（oracle 不授权）。[`ProjectionGate` 类型](../../../policy-engine/src/engine.rs#L88-L112)；[`strict published gate`](../../../policy-engine/src/engine/formal.rs#L449-L468)；[`realtime oracle`](../../../policy-engine/src/engine/formal.rs#L895-L899)
 
 需要特别区分两个事实：
 
-1. 在正常 PolicyEngine 读路径中，gate 来自 repository 对 `authorization_projection_head` 的读取，并在 ALLOW 前复检，读取失败或未 READY 会进入 `AUTHORIZATION_PENDING`/拒绝语义。[`PolicyEngine` 投影门禁与 ALLOW 前复检](../../../policy-engine/src/engine.rs#L298-L355)；[`PolicyEngine` 投影复检](../../../policy-engine/src/engine.rs#L359-L408)
+1. 生产 `PolicyEngine.evaluate()` 的授权 gate 是 strict published-evidence read：消费 canonical evidence，缺失/未就绪/无效或读取错误进入 `AUTHORIZATION_PENDING`，不回退旧 CARD head/snapshot/raw source/cache。旧 `authorization_projection_head` 在 legacy/test 兼容路径及 `evaluate_realtime()` oracle 中承担版本门禁；oracle 只用于一致性比较，不授权。[`strict production gate`](../../../policy-engine/src/engine/formal.rs#L449-L468)；[`realtime oracle`](../../../policy-engine/src/engine/formal.rs#L895-L899)
 2. 在当前 Arbiter HTTP 端点中，`ready`、generation、fence、`node_id`、`allowed` 和 `reason` 都由请求体转成 `DecisionEvidence`；纯函数只检查 `gate.ready`，不会重新查询节点、数据库或签名。[`arbiter.rs` 请求输入与证据组装](../../../astral-trustgraph/src/api/arbiter.rs#L24-L51)；[`arbiter.rs` 请求到 DecisionEvidence 的转换](../../../astral-trustgraph/src/api/arbiter.rs#L76-L115)
 
 所以，当前 Arbiter 的 READY 是**证据对象中的声明**，不是当前控制面已经验证过的节点事实。它可用于测试确定性规则和观测投影一致性，但不能独立成为授权信任根。
@@ -126,7 +126,7 @@ TrustGraph 暴露两个控制面端点：
 - 没有节点成员清单、唯一节点计数、quorum 阈值或重复节点拒绝；当前“多数”只是传入 vector 内的计数；
 - `arbitrate()` 的 `ctx` 当前仅被读取后丢弃，纯函数不会验证 evidence 与 context 的一致性。[`arbitrate()` ctx 未参与证据真实性验证](../../../policy-engine/src/arbiter.rs#L160-L189)
 
-既有双卡上下文本身在普通 Gateway/TrustGraph 路径有更强的校验边界：Gateway session grant 会绑定 platform user 的 identity card、user card、tenant 和 domain，TrustGraph 普通权限中间件也可从 Gateway 头部构建物理 `PolicyContext`。[`Gateway` session grant 上下文匹配](../../../astral-gateway/src/middleware.rs#L197-L261)；[`physical_policy_context()`](../../../astral-common/src/middleware/permission_check_shared.rs#L103-L165)
+既有双卡上下文本身在普通 Gateway/TrustGraph 路径有更强的校验边界：Gateway session grant 会绑定 platform user 的 identity card、user card、tenant 和 domain，TrustGraph 普通权限中间件也可从 Gateway 头部构建物理 `PolicyContext`。[`Gateway` session grant 上下文匹配](../../../astral-gateway/src/middleware.rs#L197-L261)；[`physical_policy_context()`](../../../astral-common/src/middleware/permission_check_shared.rs#L55-L118)
 
 但这套普通请求校验并不会自动验证 Arbiter 请求体中的跨节点证据。因此，当前实现必须按以下边界解释：
 
@@ -137,14 +137,14 @@ TrustGraph 暴露两个控制面端点：
 ### 4.1 当前架构边界
 
 1. 正常权限唯一入口是 `PolicyEngine.evaluate()`；Arbiter 不得在其前面做特判，也不得在其后把 `ALLOW` 改写成业务放行。
-2. 投影未 READY、generation/projected 不一致、fence 读取失败、证据缺失或证据无法认证时，默认出口必须是 DENY 或 `AUTHORIZATION_PENDING`/`DEFER` 的 fail-closed 语义。
-3. 规则集评估顺序保持 `OVERLAY DENY -> OVERLAY ALLOW -> BASE DENY -> BASE ALLOW -> permission_rule -> L2.5 delegation -> DEFAULT_DENY`，不可因 Arbiter 增加新的特权层。[`PolicyEngine` L1/L2/L2.5/L3 执行顺序](../../../policy-engine/src/engine.rs#L360-L603)
+2. 生产 strict published evidence 缺失/未就绪/无效或读取失败时，默认返回 `AUTHORIZATION_PENDING`/拒绝；Arbiter 的请求体 gate 仍是未认证声明，不能因其中 READY 或 generation 字段而改变正式授权结果。legacy/test 与 realtime-oracle CARD projection gate 不可替代生产 evidence gate。
+3. legacy/test 兼容 reader 的顺序保持 `OVERLAY DENY -> OVERLAY ALLOW -> BASE DENY -> BASE ALLOW -> permission_rule -> L2.5 delegation -> DEFAULT_DENY`；L2 Err 立即 fail-closed。生产 `evaluate()` 不执行该旧 reader 序列，而消费 strict published evidence；Arbiter 不能增加新的特权层。[`strict production gate`](../../../policy-engine/src/engine/formal.rs#L449-L468)；[`legacy L2 error termination`](../../../policy-engine/src/engine/formal.rs#L587-L610)
 4. Arbiter 的审计必须保留 context、裁决结果、reason code、证据摘要和关联请求标识；审计失败不能转换为 ALLOW。
 5. Arbiter 控制面必须继续受 Gateway 签名和 TrustGraph 路由权限保护，但这两个保护不能被写成“证据已认证”的替代品。
 
-当前实现的 L2 错误路径仍会在 `load_permission_rules()` 失败后记录 repository error、返回“无匹配”，并继续尝试 L2.5；如果委托规则命中 ALLOW，结果仍可能被返回为 ALLOW。[`evaluate_permission_rules()` L2 错误处理](../../../policy-engine/src/engine.rs#L1443-L1473)；[`evaluate()` L2 到 L2.5 流程](../../../policy-engine/src/engine.rs#L412-L575)
+**历史问题 R2 已由当前代码级 fail-closed 路径修复**：对保留 L1/L2/L2.5 的 legacy/test repository，`load_permission_rules()` 错误会在 `formal.rs` 的 L2 分支立即返回 `DEPENDENCY_UNAVAILABLE`，不会继续尝试 L2.5；旧快照中的“委托 ALLOW 可遮蔽 L2 错误”不再描述当前行为。生产 `SqlxRuleRepository` 则声明 strict published-evidence capability，在 AUTHN/CARD_CONTEXT 后直接走已发布证据读门，不调用旧 L1/L2/L2.5 reader，也不回退到旧 snapshot、raw source 或普通缓存。[strict production gate](../../../policy-engine/src/engine/formal.rs#L449-L468)；[legacy L2 error termination](../../../policy-engine/src/engine/formal.rs#L587-L610)
 
-**目标 P0（尚未实现）**：L2 `permission_rule` 读取错误必须在进入 L2.5 前走 fail-closed 的拒绝/PENDING 终止路径，不能由委托命中覆盖 L2 故障。当前源码尚未实现该目标。
+**状态**：原 P0 要求已在代码层满足；这次只做静态源码核对，没有运行集成或部署验收。
 
 这些要求与 Rust crate 边界一致：`policy-engine` 不直接依赖 MySQL、Redis、RabbitMQ，TrustGraph 负责治理编排和控制面。[Rust 后端规范的 crate 边界](../../规范/Rust后端编码规范_V1.0.md#L19-L62)
 
@@ -167,7 +167,7 @@ TrustGraph 暴露两个控制面端点：
 
 - `identity_card` 证明用户身份，是认证上下文；
 - `user_card` 承载用户所属的授权、tenant/domain 和投影状态；
-- PlatformUser 的 PolicyContext 必须同时携带 identity card 与 user card scope；AppUser 是 identity-only，不能送入需要 `user_card` 的平台 PolicyEngine 路径。[`physical_policy_context()` 双卡边界](../../../astral-common/src/middleware/permission_check_shared.rs#L103-L165)
+- PlatformUser 的 PolicyContext 必须同时携带 identity card 与 user card scope；AppUser 是 identity-only，不能送入需要 `user_card` 的平台 PolicyEngine 路径。[`physical_policy_context()` 双卡边界](../../../astral-common/src/middleware/permission_check_shared.rs#L55-L118)
 
 所以 GlobalAdmin 发放不是“给用户加一个角色字符串”，而是完成以下聚合：
 
@@ -175,9 +175,12 @@ TrustGraph 暴露两个控制面端点：
 identity_global_admin（ACTIVE 资格）
   -> user_card（SUPER_ADMIN、ACTIVE、template_id、tenant_id、domain_id）
   -> card_rule_set_ref（SUPER_ADMIN card -> __SUPERADMIN__ BASE RuleSet）
-  -> authorization_projection_head/outbox
-  -> projection worker -> snapshot/cache/MQ refresh
-  -> PolicyEngine.evaluate()
+  -> source mutation + durable authorization delta
+  -> AuthorizationProjector 发布 canonical manifest/segment/current-pointer
+  -> PolicyEngine.evaluate() strict published-evidence gate
+
+旧 authorization_projection_head/outbox 仅处理 legacy writer-correlation：
+  CARD/RULE_SET -> ProjectionWorker 终态标记；ELIGIBILITY -> 资格缓存失效
 ```
 
 ### 5.2 启动期 SuperAdmin 模板和 RuleSet
@@ -229,24 +232,19 @@ API 将 `LAST_GLOBAL_ADMIN_PROTECTED` 映射为校验错误，并在成功禁用
 - REVOKE 不递增 fence 导致旧 refresh 消息重新生效；
 - 并发禁用两个管理员造成零 ACTIVE 管理员。
 
-projection 的当前实现不是单一重建入口：source mutation 与 head/outbox 在同一事务闭合后，CARD 事件由 durable worker 重建卡级快照、失效缓存并发布 refresh；RuleSet 写路径当前仍同步重建共享 `rule_set_snapshot`，受影响卡的 per-card projection 则由 durable CARD 事件交给 worker 处理。禁止写路径绕过各自已定义的事务/事件边界直接同步 evict 或发布；统一 RULE_SET 版本契约仍是待完成项。[`projection_repository.rs` durable projection 说明](../../../astral-trustgraph/src/repository/projection_repository.rs#L1-L23)；[`side_effects.rs` projection 副作用边界](../../../astral-trustgraph/src/api/side_effects.rs#L1-L6)
+当前 projection 已分为旧 outbox 处置与 canonical 授权发布两条职责：旧 `ProjectionWorker` 对 CARD/RULE_SET writer-correlation 事件只做终态 `mark_processed`，不再重建 `permission_rule_snapshot`/`rule_set_snapshot`、evict 或发布旧 CARD refresh；ELIGIBILITY 分支仍只失效资格缓存。授权变更由 `authorization_delta_event` 进入 `AuthorizationProjector`，编译并提交 canonical manifest/segment/current-pointer 证据；正式生产读侧消费 strict published evidence，不把旧快照当作 ALLOW 依据。[旧 worker aggregate 分派](../../../astral-trustgraph/src/service/projection_worker.rs#L260-L303)；[canonical projector 职责](../../../astral-trustgraph/src/service/authorization_projector.rs#L1-L21)；[strict production gate](../../../policy-engine/src/engine/formal.rs#L449-L468)
 
 ## 6. GlobalAdmin 当前守卫、审计与缺口
 
-### 6.1 ACTIVE 管理员守卫的当前分布
+### 6.1 ACTIVE 管理员守卫与操作审计的当前分布
 
 TrustGraph 已有 `require_platform_admin()`：从 Gateway 注入的 `x-user-id` 解析用户，并通过 `GlobalAdminRepository.is_active_admin()` 查询 ACTIVE 状态；它不解析角色字符串，也不把 caller-supplied scope 当作跨范围管理凭据。[`api/mod.rs` 平台管理员守卫](../../../astral-trustgraph/src/api/mod.rs#L7-L37)
 
-该守卫已经用于审计隔离重放、审批全表查询、RuleSet、模板、域、动作、卡片模板等平台治理端点。例如 audit-quarantine 的列表、详情和 replay 申请都在 handler 内调用该守卫。[`audit_replay.rs` ACTIVE GlobalAdmin 门禁](../../../astral-trustgraph/src/api/audit_replay.rs#L121-L180)
+该 handler-level 守卫用于审计隔离重放、审批全表查询、RuleSet、模板、域、动作、卡片模板等平台治理端点。例如 audit-quarantine 的列表、详情和 replay 申请都在 handler 内调用该守卫。[`audit_replay.rs` ACTIVE GlobalAdmin 门禁](../../../astral-trustgraph/src/api/audit_replay.rs#L121-L180)
 
-但 GlobalAdmin 自身的五个生命周期端点目前只在外层 `permission_check` 中把 `/global-admins` 映射到 `authorization` 资源；handler 仅提取 `x-user-id` 作为 `caller_id`，没有显式调用 `require_platform_admin()`。[`global_admin_routes()` 与 caller 提取](../../../astral-trustgraph/src/api/global_admin.rs#L83-L103)；[`global_admin` list/summary/grant/disable handler](../../../astral-trustgraph/src/api/global_admin.rs#L106-L184)
+GlobalAdmin 自身生命周期路由的分层不同：`global_admin_routes()` 注册五个端点；permission middleware 将其映射到 `authorization` 资源；正式 `resolve_resource_ownership()` 将该资源的无租户目标分类为 `Global + ActiveGlobalAdmin`。生产 PolicyEngine 再要求 strict published evidence，并在证据稳定性检查前后新鲜读取 ACTIVE GlobalAdmin source。因此，handler 没有显式调用 `require_platform_admin()` 不等于缺少正式 ACTIVE 守卫，也不应把这五条路由记作当前绕过；handler 仍从已验签 Gateway 上下文提取 caller id，用于 durable mutation。[`global_admin_routes()`](../../../astral-trustgraph/src/api/global_admin.rs#L84-L103)；[`authorization` Global route contract](../../../astral-db/src/resource_ownership.rs#L678-L736)；[`GlobalAdmin` ALLOW 前新鲜复核](../../../policy-engine/src/engine/published.rs#L355-L416)
 
-这不是允许匿名访问的结论：外层路由仍经过 Gateway 和 PolicyEngine。但它留下了明确的治理缺口：
-
-- 统一的 ACTIVE GlobalAdmin operator guard 尚未覆盖 GlobalAdmin lifecycle 自身；
-- `grant`/`enable`/`disable` 的目标用户、目标卡、tenant/domain scope 没有在 handler 内形成独立的 operator-to-target scope proof；
-- caller identity 的来源只在 Gateway 签名链中可信，handler 没有把完整物理双卡上下文作为生命周期操作的显式输入；
-- grant/enable 是否允许由当前唯一管理员、另一个平台管理员或更细粒度治理规则执行，尚未形成独立的规范化策略。
+当前仍明确的缺口是操作级审计：`grant`/`enable`/`disable` 的业务行含操作者/原因等字段，但尚无统一 durable operation audit，将完整操作者上下文、旧/新状态、卡片 mutation、generation/fence 和 session-revocation 结果关联起来。对象是平台级 GlobalAdmin 记录；当前正式授权合同是显式全局管理范围，不应把缺少 tenant scope 描述为跨租户 owner proof 缺失。
 
 #### 6.1.1 Formal Global resource contract and fresh authority proof (implemented 2026-09-22)
 

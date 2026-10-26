@@ -15,6 +15,7 @@
 - **架构材料**：记录当前事实、证据、缺口和目标决策；本目录材料是非规范性的，不能把目标态写成已实现，也不能替代工程规范。
 - **Java 参考**：用于迁移语义对照，不覆盖 Rust 当前事实。
 - **JSA/历史材料**：解释规则模型的来源和演进，不作为当前 Rust 已实现能力的证明。
+- **跨专题技术分析与运行测量**：[技术专题解析与架构取舍（2026-10-25）](../../技术专题解析与架构取舍_2026-10-25.md)区分迁移决策、当前实现与候选方案；[授权执行期能力曲线（2026-10-25）](../../实验/基准测试/授权执行期能力曲线_20261025.md)只说明本机 fixture 下的完整 `PolicyEngine::evaluate()` CPU 测量，不替代本文引用的授权源码、迁移或集成证据。
 
 当前 workspace 明确 exclude `astral-learn` 与 `astral-chat`；它们的源码仍在仓库中，但不参加默认 workspace 编译和测试。依据见 [`Cargo.toml`](../../../Cargo.toml#L1-L15)。因此，本文对 Learn/Chat 的实现描述必须注明“源码存在、默认验证边界之外”。
 
@@ -40,7 +41,8 @@
   -> Gateway HMAC v3 转发
   -> 下游 gateway_signature 验签
   -> 服务 path/resource/action 映射 + ResourceRegistry 校验
-  -> physical_policy_context 构建双卡 PolicyContext
+  -> physical_policy_context 构建双卡 actor context（目标 ownership=Unresolved）
+  -> 服务专属 resource-owner resolver 解析/验证目标归属；失败时 PENDING/DENY
   -> PolicyEngine.evaluate()
        -> AUTHN / CARD_CONTEXT
        -> resource/action 校验
@@ -79,7 +81,7 @@ Gateway 运行时的实际顺序是：
 
 Gateway 的路由凭证策略类型和会话 grant 校验在 [`middleware.rs`](../../../astral-gateway/src/middleware.rs#L166-L290)，中间件入口在 [`#L898-L980`](../../../astral-gateway/src/middleware.rs#L898-L980)。下游验签在 [`gateway_signature.rs`](../../../astral-common/src/middleware/gateway_signature.rs#L64-L258)。
 
-**当前边界**：Gateway 负责认证、撤销和可信头，不代替下游 PolicyEngine 做资源动作授权。Gateway 路径层的 principal 守卫仍属于纵深加固路线；当前 AppUser 对需要用户卡的授权路径依赖下游 `CARD_REQUIRED`，见[物理双卡权限链路评估与设计 §3.3 D2](./物理双卡权限链路评估与设计_V1.0.md#d2--网关-principal-路由守卫可选加固不冻结路径)。
+**当前边界**：Gateway 负责认证、撤销和可信头，不代替下游 PolicyEngine 做资源动作授权。Gateway 路径层的 principal 守卫仍属于纵深加固路线；当前 AppUser 对需要用户卡的授权路径依赖下游 `CARD_REQUIRED`，见[物理双卡权限链路评估与设计 §3.3 D2](./物理双卡权限链路评估与设计_V1.0.md#L257)。
 
 ### 3.4 L2：下游可信头、资源注册和 PolicyContext
 
@@ -89,9 +91,9 @@ Gateway 的路由凭证策略类型和会话 grant 校验在 [`middleware.rs`](.
 - PlatformUser 缺少任一用户卡 ID/tenant/domain，返回拒绝；
 - AppUser 构造 identity-only context，`card_id/tenant_id/domain_id` 为空，进入要求用户卡的引擎路径时由 `CARD_REQUIRED` 拒绝。
 
-实现见 [`permission_check_shared.rs`](../../../astral-common/src/middleware/permission_check_shared.rs#L102-L165)。
+实现见 [`physical_policy_context`](../../../astral-common/src/middleware/permission_check_shared.rs#L55-L118)。
 
-请求路径先由各服务的 path map 解析资源类型和动作；缺少映射直接拒绝，未知 HTTP 方法才跳过业务权限检查。随后调用 `engine.evaluate(&ctx, repo)`。实现见 [`check_permission`](../../../astral-common/src/middleware/permission_check_shared.rs#L284-L347)。
+请求路径由各服务中间件按各自 path map 解析资源类型和动作，先通过服务专属 owner resolver 建立目标所有权，再调用 `engine.evaluate(&ctx, repo)`。本次删除的是 `astral_common::middleware::permission_check_shared::check_permission`：它提交 `Unresolved` 目标上下文，不能授权受保护资源。另一个公开兼容 helper `astral_common::middleware::permission::require_permission` 仍保留；它同样不能替代 owner resolver，且当前仓内没有调用方，不得作为生产授权入口。共享解析与双卡上下文 helper 仍由各服务中间件复用。
 
 `ResourceRegistry` 是 `astral-types` 的集中注册表，提供资源/动作/条件校验；启动期 `validate_path_map` 交叉检查 path map 是否引用未注册资源，但当前检查记录错误并继续启动，不能当作强制启动失败门禁。注册表和校验见 [`registry.rs`](../../../astral-types/src/registry.rs#L113-L144) 与 [`#L319-L383`](../../../astral-types/src/registry.rs#L319-L383)。
 
@@ -160,14 +162,14 @@ CARD/ELIGIBILITY/RULE_SET 旧 head 的状态列不再作为 canonical 生产读�
 |------------|-------------|--------------|----------|
 | `astral-types` | 类型/契约 owner | `PolicyContext`、`PolicyDecision`、`ResourceRegistry`、投影聚合枚举与事件常量 | [`context.rs`](../../../astral-types/src/context.rs#L7-L85)；[`registry.rs`](../../../astral-types/src/registry.rs#L113-L144)；[`projection.rs`](../../../astral-types/src/projection.rs#L9-L92) |
 | `policy-engine` | 纯授权内核 owner | `PolicyEngine.evaluate`、L1/L2/L2.5/DEFAULT_DENY、实时一致性、断路器、Arbiter 纯函数 | [`engine.rs`](../../../policy-engine/src/engine.rs#L163-L215)；[`arbiter.rs`](../../../policy-engine/src/arbiter.rs#L1-L15) |
-| `astral-common` | 共享运行时/契约 owner | Gateway HMAC 下游验签、权限中间件、审计端口和双写适配 | [`permission_check_shared.rs`](../../../astral-common/src/middleware/permission_check_shared.rs#L284-L347)；[`audit.rs`](../../../astral-common/src/audit.rs#L88-L163) |
+| `astral-common` | 共享运行时/契约 owner | Gateway HMAC 下游验签、双卡上下文/路由解析 helper、审计端口和双写适配 | [`permission_check_shared.rs`](../../../astral-common/src/middleware/permission_check_shared.rs)；[`audit.rs`](../../../astral-common/src/audit.rs#L88-L163) |
 | `astral-gateway` | Gateway runtime owner | 路由、凭证策略、JWT、Redis session/grant/revocation、可信头、转发签名、限流 | [`main.rs`](../../../astral-gateway/src/main.rs#L203-L289)；[`middleware.rs`](../../../astral-gateway/src/middleware.rs#L898-L980) |
 | `astral-identity` | 身份/会话 owner | login/refresh/switch-card、JWT/SessionGrant 签发、会话撤销投影 | [`auth_service.rs`](../../../astral-identity/src/srv/auth_service.rs#L205-L289)；[`session.rs`](../../../astral-identity/src/srv/session.rs#L796-L838) |
 | `astral-db` | SQL/资格读取 owner | `SqlxRuleRepository`、双卡资格 JOIN、CARD/ELIGIBILITY/RULE_SET 读门禁和缓存读写、公共投影事务 helper | [`repository.rs`](../../../astral-db/src/repository.rs#L181-L217)；[`eligibility.rs`](../../../astral-db/src/eligibility.rs#L80-L186)；[`projection.rs`](../../../astral-db/src/projection.rs#L48-L151) |
 | `astral-trustgraph` | 权限治理/投影控制面 owner | 规则集、规则写入、委托、GlobalAdmin、canonical authorization projector/archive、legacy ELIGIBILITY worker、Arbiter control plane、审计消费 | [`authorization_projector.rs`](../../../astral-trustgraph/src/service/authorization_projector.rs#L1-L25)；[`authorization_archive_worker.rs`](../../../astral-trustgraph/src/service/authorization_archive_worker.rs#L1-L25)；[`projection_worker.rs`](../../../astral-trustgraph/src/service/projection_worker.rs#L1-L31)；[`main.rs`](../../../astral-trustgraph/src/main.rs#L307-L365) |
 | `astral-cache` | 缓存装饰 owner | `RuleRepository` 缓存装饰和 Redis key scope 测试；不得改变引擎的 fail-closed 语义 | [`cache_repository.rs`](../../../astral-cache/src/cache_repository.rs#L31-L113) |
 | `astral-mq` | 消息传输 owner | permission.refresh、audit.log 和消息确认/消费基础设施 | [`astral-mq/src`](../../../astral-mq/src/lib.rs#L1-L21) |
-| `astral-learn` / `astral-chat` | 源码保留、当前 workspace exclude | Learn/Chat 路由、业务 handler、Chat realtime scope；解冻前不计入默认 CI 证据 | [`Cargo.toml`](../../../Cargo.toml#L1-L15)；[Gateway Chat 路由](../../../astral-gateway/src/main.rs#L128-L172) |
+| `astral-learn` / `astral-chat` | 源码保留、当前 workspace exclude | Learn/Chat 路由、业务 handler、Chat realtime scope；解冻前不计入默认 workspace 验证证据 | [`Cargo.toml`](../../../Cargo.toml#L1-L15)；[Gateway Chat 路由](../../../astral-gateway/src/main.rs#L128-L172) |
 | `astral-monitor` | 监控 owner | 健康/指标/一致性和 Arbiter 统计观察面；不得成为授权旁路 | [`astral-monitor/src`](../../../astral-monitor/src/lib.rs#L1-L37) |
 
 2026-08-26 增补（canonical 模型切片的当前 owner；其中严格 published-evidence 读门已由生产 `SqlxRuleRepository` 的 capability marker 门控接入正式 `evaluate()`，读侧现状见 §2 第 6 条与 §8/§14）：`policy-engine` 另有无 IO 的 [`authorization_compiler.rs`](../../../policy-engine/src/authorization_compiler.rs#L1)（版本化热状态编译内核，candidate/full-rebuild oracle）；`astral-db` 另有 [`authorization_projection_repository.rs`](../../../astral-db/src/authorization_projection_repository.rs#L1)（manifest/segment/current/archive 表链与严格 published-evidence 读门）与 [`grant_repository.rs`](../../../astral-db/src/grant_repository.rs)（revision ledger + delta queue，ALLOW-only 合同 gate）；`astral-trustgraph` 另有 [`authorization_projector.rs`](../../../astral-trustgraph/src/service/authorization_projector.rs#L1)（新 delta 队列唯一消费者）、[`authorization_archive_worker.rs`](../../../astral-trustgraph/src/service/authorization_archive_worker.rs#L1)（异步归档证明）与 [`grant_ledger_adapter.rs`](../../../astral-trustgraph/src/repository/grant_ledger_adapter.rs#L1)（审批→typed 账本 DTO 组装）。
@@ -203,25 +205,24 @@ CARD/ELIGIBILITY/RULE_SET 旧 head 的状态列不再作为 canonical 生产读�
 - [GlobalAdmin API](../../../astral-trustgraph/src/api/global_admin.rs#L85-L298)
 - [GlobalAdmin repository](../../../astral-trustgraph/src/repository/global_admin_repository.rs#L74-L429)
 
-## 7. 当前 CI/test 证据边界
+## 7. 当前测试入口与证据边界
 
-### 7.1 CI 定义了什么
+### 7.1 仓库提供的测试入口
 
-当前 CI 在 `.github/workflows/ci.yml` 定义两个相关 job：
+当前 checkout 未跟踪 `.github/workflows/ci.yml` 或其他 Rust GitHub Actions workflow；本仓库的自动化发布 workflow 状态不能从测试文档或 README 反推。可确认的测试入口是各 crate 的 Cargo tests、`tests-suite/` 编目，以及 `README.md` 所列 `scripts/run-tests.sh` 等显式 runner。其依赖前置、ignored/blocked profile、外部服务约束与执行结果应以对应入口和本次运行日志为准；文档列出命令不等于它已执行或通过。
 
-- **Rust Check**：启动 MySQL/Redis/RabbitMQ 服务容器，加载 canonical schema，执行 Rust migration；随后运行 `cargo fmt --all -- --check`、`cargo check --workspace --all-targets`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --lib` 和 ignored integration tests。
-- **Replay Integration**：独立服务容器和 schema/migration 后，运行 TrustGraph audit replay 以及两个 quarantine integration 测试。
+- workspace 默认检查应遵循根 `AGENTS.md` 中的最小充分验证与 workspace gate；`astral-learn`/`astral-chat` 位于 workspace `exclude`，不会被默认 workspace 检查覆盖。
+- 需要真实 MySQL/Redis/RabbitMQ 的 integration/replay profile 必须显式使用隔离依赖并按测试入口完成前置；不得用 mock、静态清单或无依赖 `exit 0` 替代真实集成验收。
+- `tests-suite/README.md` 说明默认与显式 opt-in 覆盖边界；测试编排和 campaign 状态见 `README.md` 与 `scripts/run-tests.sh`，运行结果必须绑定当前源码快照和完整日志。
 
-对应 workflow 行号见 [Rust Check](../../README.md#L136-L249) 和 [Replay Integration](../../README.md#L251-L361)。
+### 7.2 不能从测试定义或源码推出什么
 
-### 7.2 不能从 CI 定义推出什么
-
-1. **本文没有运行本次 Rust CI**：workflow 行号是仓库定义的证据入口，不是本次会话的通过结果。
-2. `astral-learn`/`astral-chat` 位于 workspace `exclude`，因此默认 `--workspace` 检查不会证明这两个源码目录全量编译或测试通过。
-3. CI 的 unit/integration/replay 覆盖不能自动证明所有生产 source mutation 都经过 CARD/ELIGIBILITY projection，也不能证明所有跨节点 Arbiter 证据都来自可信节点。
+1. **本文未运行本次 Rust tests、真实集成或 replay**：测试入口是执行方式的证据，不是本次会话的通过结果。
+2. 由于默认 workspace 排除 `astral-learn`/`astral-chat`，workspace 检查不会证明这两个源码目录全量编译或测试通过。
+3. crate unit/integration/replay 覆盖不能自动证明所有生产 source mutation 都经过 CARD/ELIGIBILITY projection，也不能证明所有跨节点 Arbiter evidence 都来自可信节点。
 4. canonical `AuthorizationCompiler`、`AuthorizationProjector`、`evaluate_realtime`、Arbiter 纯函数和 mock repository 测试证明接口/纯逻辑或代码接线存在，不等同于真实 MySQL/Redis/RabbitMQ 生产切流已完成。
-5. 历史迁移材料中的“对齐率”是历史快照，不能替代当前源码和当前 CI 结果；以当前源码和测试为准。
-6. 2026-08-26 增补：canonical 模型切片（`AuthorizationCompiler`、新表链 repository、projector/archive worker、严格 published-evidence 读门）当前只有无 DB 的 typed/shape 测试覆盖；生产 `SqlxRuleRepository` 已声明 capability marker 且正式 `evaluate()` 在 marker 为真时进入 strict gate，但真实 MySQL/Redis/RabbitMQ 集成与正式切流验收均未执行，CI 未运行，不能据此宣称集成通过。Java、Chat、Learn、Duo 的行为或部署不是该模型验收依赖；`astral-learn`/`astral-chat` 仍按 workspace `exclude` 边界处理。
+5. 历史迁移材料中的“对齐率”是历史快照，不能替代当前源码和当前 test 结果；以当前源码、suite manifest 和运行证据为准。
+6. 2026-08-26 增补：canonical 模型切片（`AuthorizationCompiler`、新表链 repository、projector/archive worker、严格 published-evidence 读门）当前只有无 DB 的 typed/shape 测试覆盖；生产 `SqlxRuleRepository` 已声明 capability marker 且正式 `evaluate()` 在 marker 为真时进入 strict gate，但真实 MySQL/Redis/RabbitMQ 集成与正式切流验收均未执行。Java、Chat、Learn、Duo 的行为或部署不是该模型验收依赖；`astral-learn`/`astral-chat` 仍按 workspace `exclude` 边界处理。
 
 ## 8. 当前已实现、当前有边界、明确未实现
 
@@ -265,9 +266,9 @@ CARD/ELIGIBILITY/RULE_SET 旧 head 的状态列不再作为 canonical 生产读�
 
 ### AD-1：授权决策只能由 PolicyEngine.evaluate 产生
 
-**决策**：Gateway 只认证和签发可信头；服务中间件只解析资源动作并构造 context；所有需要资源/动作授权的请求必须进入 `PolicyEngine::evaluate()`。任何 `isSuperAdmin()`、角色字符串、请求体 context、身份卡 fallback 或直接 `permission_rule` 查询都不能在引擎前形成 ALLOW。
+**决策**：Gateway 只认证和签发可信头；服务中间件解析资源动作、用共享 helper 构造 actor context，再由服务专属 owner resolver 确认目标归属；所有需要资源/动作授权的请求只有在 owner resolution 满足资源合同后，才能进入 `PolicyEngine::evaluate()`。未解析/不可用的 ownership 保持 `PENDING`/`DENY`。任何 `isSuperAdmin()`、角色字符串、请求体 context、身份卡 fallback 或直接 `permission_rule` 查询都不能在引擎前形成 ALLOW。
 
-**理由**：将身份事实、授权卡事实、规则集语义和故障降级集中到一个入口，避免同一变更在 Gateway、Controller、Service 和 raw SQL 各自产生不同放行口径。代码级入口见 [`check_permission`](../../../astral-common/src/middleware/permission_check_shared.rs#L284-L347) 和 [`PolicyEngine::evaluate`](../../../policy-engine/src/engine.rs#L191-L215)。
+**理由**：将身份事实、授权卡事实、规则集语义和故障降级集中到 `PolicyEngine::evaluate()`，避免同一变更在 Gateway、Controller、Service 和 raw SQL 各自产生不同放行口径。各服务 middleware 先用共享 helper 构造 actor context，再调用目标资源 owner resolver 并将其结果写入 context；只在 resolver 成功且资源合同满足后才评估。本次删除仅限 `astral_common::middleware::permission_check_shared::check_permission`；另一个公开 helper `astral_common::middleware::permission::require_permission` 仍保留，但同样无法证明目标 ownership、当前无仓内调用方，不能用于受保护目标授权或替代服务 owner resolver。
 
 ### AD-2：投影是授权读模型的 durable admission gate
 
@@ -361,7 +362,7 @@ CARD/ELIGIBILITY/RULE_SET 旧 head 的状态列不再作为 canonical 生产读�
 
 **路线**：将 realtime 标为 `diagnostic/consistency-only`；限制 raw read 的 owner、采样预算、DB timeout、结果行数、并发和速率；结果必须携带 source timestamp/version，不能生成没有 projection gate 的生产 ALLOW；冲突信号记录 decision、gate 和 context hash。
 
-**状态与验收**：**路径已存在，生产边界未完全冻结**。生产 `check_permission` 不因 realtime 失败而放行；超时/DB 故障/结果过大 deny/defer；sampling 与 Arbiter 不递归或无限重试。
+**状态与验收**：**诊断路径已存在，生产边界未完全冻结**。生产服务 middleware 先解析目标资源 owner，再调用正式 `PolicyEngine::evaluate()`；realtime 不因失败而放行；超时/DB 故障/结果过大 deny/defer；sampling 与 Arbiter 不递归或无限重试。
 
 ### 12.9 P1-3：cache/timeout/lifecycle
 
@@ -376,7 +377,7 @@ CARD/ELIGIBILITY/RULE_SET 旧 head 的状态列不再作为 canonical 生产读�
 
 **路线**：handler 内从可信 Gateway 头重建操作者 context；evidence 必须包含可信 node identity、source/projected/fence、snapshot version、observed time、event/message id 和 idempotency key；只接收已登记节点和允许 schema；只在 READY 且版本可区分分歧时裁决；DEFER 强制映射 PENDING/拒绝，caller 不能自转 ALLOW。
 
-**状态与验收**：**内核已实现，控制面信任边界未完成**。修改请求体 context 不扩大权限；伪造节点、旧代或跨卡 evidence 被拒绝/DEFER；replay 幂等；Arbiter ALLOW 可追溯到 caller、evidence 和 projection contract。问题登记见[模型修正记录问题5](./Rust架构模型设计修正记录.md#问题-5--arbiter-端点接受请求体-ctx-无双卡复验r3)。
+**状态与验收**：**内核已实现，控制面信任边界未完成**。修改请求体 context 不扩大权限；伪造节点、旧代或跨卡 evidence 被拒绝/DEFER；replay 幂等；Arbiter ALLOW 可追溯到 caller、evidence 和 projection contract。问题登记见[模型修正记录问题5](./Rust架构模型设计修正记录.md#L83)。
 
 ### 12.11 P1-5：GlobalAdmin/audit closure
 
@@ -427,7 +428,7 @@ P0-3 delegation caller scope --------+--> P0-4 canonical authorization projectio
 
 ## 13. 路线验证门与证据边界
 
-实施每一阶段时，最低验证集沿用仓库 CI：
+实施每一阶段时，按仓库根目录 `AGENTS.md` 的 Rust 验证门禁、测试套件约定及本次变更风险选择验证集。以下列出 workspace 与显式 integration 检查的代表性命令；当前 checkout 未发现已跟踪的 Rust GitHub Actions workflow，不能把它们描述成当前 CI job：
 
 ```text
 cargo fmt --all -- --check
@@ -437,7 +438,7 @@ cargo test --workspace --lib
 cargo test --workspace --test '*' -- --ignored --test-threads=1
 ```
 
-真实 MySQL/Redis/RabbitMQ 集成和 replay 必须走 [`.github/workflows/ci.yml`](../../README.md#L136-L361) 的服务容器路径。以上是验收命令和 CI 定义，不是本次会话已执行或已通过的结果；默认 workspace 不包含 `astral-learn`/`astral-chat`，解冻前不能声称它们通过全工作区验证。纯函数、mock repository、benchmark 和历史报告只能证明局部逻辑或方法存在，不能证明生产 source mutation、跨节点 evidence、生命周期故障和审计降级闭环。
+真实 MySQL/Redis/RabbitMQ 集成和 replay 必须按 [`tests-suite/README.md`](../../../tests-suite/README.md) 与仓库测试入口的隔离依赖约束显式运行；本文列出的命令只是验证方式，不是本次会话已执行或已通过的结果。默认 workspace 不包含 `astral-learn`/`astral-chat`，解冻前不能声称它们通过全工作区验证。纯函数、mock repository、benchmark 和历史报告只能证明局部逻辑或方法存在，不能证明生产 source mutation、跨节点 evidence、生命周期故障和审计降级闭环。
 
 ## 14. 未实现项清单
 
@@ -453,7 +454,7 @@ cargo test --workspace --test '*' -- --ignored --test-threads=1
 - [ ] Redis/DB/MQ/worker cache、timeout、lease、shutdown、replay 全组合验收；
 - [ ] Arbiter caller context、节点 evidence provenance、签名/重放/幂等和 DEFER 强制出口；
 - [ ] GlobalAdmin caller scope 与全链审计/补偿 replay 闭环；
-- [ ] tenant/domain status fan-out、identity expiry/status source mutation、user-card validity API 等生命周期补齐，参见 [V5 迁移路线](./V5模型修正筹划_专供Rust_V1.0.md#五迁移路径v4--v5专供-rust)。
+- [ ] tenant/domain status fan-out、identity expiry/status source mutation、user-card validity API 等生命周期补齐，参见 [V5 迁移路线](./V5模型修正筹划_专供Rust_V1.0.md#L131)。
 
 2026-08-26 增补（canonical 模型“版本化热状态 + 异步归档”切片；已实现项同样列出以免被误写为待办）：
 

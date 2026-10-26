@@ -909,7 +909,7 @@ crates/policy-engine/src/
 
 | # | 问题 | 建议 | 等待决策 |
 |---|------|------|---------|
-| 1 | ORM：sqlx vs SeaORM vs Diesel | **sqlx** | 🔴 **需确认** |
+| 1 | ORM：sqlx vs SeaORM vs Diesel | **sqlx** | 🟢 **已确认（见 §3.2）** |
 | 2 | Gateway 迁移时机 | Phase 3（PolicyEngine 跑通后） | 🟢 建议通过 |
 | 3 | 双引擎策略 | 影子模式比对 | 🟢 建议通过 |
 | 4 | etcd/Consul | 跳过初期，env 即可 | 🟢 建议通过 |

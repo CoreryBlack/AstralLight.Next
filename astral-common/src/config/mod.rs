@@ -152,7 +152,7 @@ pub fn parse_org_scope_enabled(raw: Option<&str>) -> Result<bool, ConfigValidati
 /// 启动期一次性读取并解析 `ASTRAL_ORG_SCOPE_ENABLED`。
 ///
 /// 只允许在进程 main / 配置装配路径调用一次并把结果冻结（见
-/// [`AppConfig::org_scope_enabled`] 与 [`apply_flat_env_overrides`]）；
+/// [`AppConfig::org_scope_enabled`] 与 `apply_flat_env_overrides`）；
 /// 授权 / 请求路径禁止调用本函数。
 pub fn org_scope_enabled_from_env() -> Result<bool, ConfigValidationError> {
     let raw = std::env::var(ORG_SCOPE_ENABLED_ENV).ok();
@@ -400,7 +400,7 @@ pub struct AppConfig {
 
     /// ORG_SCOPE 部署旗标（default-off）：启动期由 [`parse_org_scope_enabled`]
     /// 从 `ASTRAL_ORG_SCOPE_ENABLED` 一次性解析并冻结（见
-    /// [`apply_flat_env_overrides`]）；此后授权读取只使用本冻结值，绝不逐请求
+    /// `apply_flat_env_overrides`）；此后授权读取只使用本冻结值，绝不逐请求
     /// 读 env。非法值使配置加载失败（启动拒绝，见
     /// [`ConfigValidationError::InvalidOrgScopeEnabled`]）。`serde(skip)`：该
     /// 旗标只认 env 严格契约，YAML 不提供开关（防止绕过共享解析器静默开启）。

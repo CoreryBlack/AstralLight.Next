@@ -1988,15 +1988,14 @@ pub(crate) mod tests {
         verify_checksums(&out, &out.join("checksums.sha256")).expect("checksums");
 
         let mut seen = BTreeSet::new();
+        let operation_id_pattern = Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$").unwrap();
         for cycle in plan["cycles"].as_array().unwrap() {
             let operations = cycle["operationIds"].as_object().unwrap();
             assert_eq!(operations.len(), 4);
             for (name, operation_id) in operations {
                 let value = operation_id.as_str().unwrap();
                 assert!(value.len() <= 64, "{name}");
-                assert!(Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$")
-                    .unwrap()
-                    .is_match(value));
+                assert!(operation_id_pattern.is_match(value));
                 assert!(seen.insert(value.to_owned()), "{name}");
             }
         }

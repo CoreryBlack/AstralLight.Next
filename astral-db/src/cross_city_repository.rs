@@ -644,7 +644,7 @@ fn ensure_transition_within_expiry(
 /// insert time (`phase == parent.state`; pure) — a city row can never be born
 /// ahead of or beside its parent. Post-insert drift (a parent that advanced
 /// while a lease lapsed) is handled by the catch-up oracle
-/// ([`next_catchup_hop`]), not by this rule.
+/// (`next_catchup_hop`), not by this rule.
 fn verify_city_phase_mirrors_parent(
     parent: &CrossCityOperationRecord,
     phase: CrossCityOperationState,
@@ -775,7 +775,7 @@ fn next_catchup_hop(
 
 /// A live lease may be held only over a row that is in sync with its parent
 /// or deterministically catchable to it (pure). Leading, divergent, and
-/// ambiguous rows fail closed via [`next_catchup_hop`].
+/// ambiguous rows fail closed via `next_catchup_hop`.
 fn verify_city_phase_catchable(
     parent: &CrossCityOperationRecord,
     row_phase: CrossCityOperationState,
@@ -843,7 +843,7 @@ const CITY_STATE_INSERT_SQL: &str = "INSERT INTO authorization_cross_city_city_s
 /// Phase-free claim candidate: whichever (operation, city) row exists with an
 /// inactive lease, whatever its phase — the claimant must prove catchability
 /// against the locked parent before the lease installs (see
-/// [`next_catchup_hop`]).
+/// `next_catchup_hop`).
 const CITY_STATE_CLAIM_CANDIDATE_SQL: &str = "SELECT state_id, operation_id, city_id, phase \
     FROM authorization_cross_city_city_state \
     WHERE operation_id = ? AND city_id = ? \
@@ -1456,7 +1456,7 @@ fn validate_takeover_request(
 /// bound to `operation_id + expected state + OLD epoch` writing the new
 /// epoch; `rows_affected() != 1` fails closed. After the epoch CAS succeeds,
 /// in the SAME transaction and still under the fixed operation → city_state
-/// lock order, [`OPERATION_TAKEOVER_REVOKE_LEASES_SQL`] clears ONLY the lease
+/// lock order, `OPERATION_TAKEOVER_REVOKE_LEASES_SQL` clears ONLY the lease
 /// material (`lease_owner`/`lease_token_hash`/`lease_expires_at`) of every
 /// city row selected purely by `operation_id` — phases and digests are never
 /// touched, and any row count `0..=[CROSS_CITY_CITY_COUNT]` is a legal
@@ -1753,7 +1753,7 @@ fn decode_vote_row(row: VoteRow) -> Result<StoredCityVote, CrossCityRepositoryEr
 ///
 /// Evidence is accepted ONLY while the locked parent operation is in
 /// `PROPOSED` or `VOTING` (closed whitelist, see
-/// [`validate_vote_accepting_state`]): once an agreement is sealed, the
+/// `validate_vote_accepting_state`): once an agreement is sealed, the
 /// evidence set is immutable and any later vote attempt is a typed conflict —
 /// the certified evidence can never be polluted retroactively.
 ///
@@ -2170,7 +2170,7 @@ pub async fn insert_city_state_in_tx(
 /// city_state: the parent operation is locked first and must be live
 /// (non-terminal, unexpired). The row's actual stored phase is parsed through
 /// the closed-set parser and must be IN SYNC with the parent state or sit on a
-/// deterministic catch-up path to it ([`next_catchup_hop`]); leading,
+/// deterministic catch-up path to it (`next_catchup_hop`); leading,
 /// divergent, and ambiguous rows are poisoned for claiming and fail closed.
 /// This is what lets a lease that lapsed across a parent advance be re-claimed
 /// and catch up hop-by-hop. Live leases are never stolen. Installs a fresh
@@ -2265,7 +2265,7 @@ pub async fn claim_city_state_in_tx(
 /// city_state: the parent operation is locked first and must be live
 /// (non-terminal, unexpired), the locked row identity must match the proof,
 /// and the row phase must be in sync with the parent state or deterministically
-/// catchable to it ([`next_catchup_hop`] — a lagging row that outlived a lease
+/// catchable to it (`next_catchup_hop` — a lagging row that outlived a lease
 /// across a parent advance may still be heartbeated); then a strict
 /// owner + token-hash + server-side liveness CAS extends the lease. A lost
 /// lease, dead parent, or leading/divergent/ambiguous row is an explicit
@@ -2304,7 +2304,7 @@ pub async fn heartbeat_city_state_in_tx(
 /// live (non-terminal, unexpired); the locked row identity is verified
 /// against the proof and its phase is re-parsed through the closed-set
 /// parser. The ONLY admitted target is the unique next hop the deterministic
-/// catch-up oracle ([`next_catchup_hop`]) derives from the row's current
+/// catch-up oracle (`next_catchup_hop`) derives from the row's current
 /// phase toward the locked parent state: an in-sync row has nothing to
 /// transition, a lagging row advances exactly one shortest-path hop (multi-
 /// phase catch-up happens across fresh leases), and leading, divergent, and
@@ -2373,7 +2373,7 @@ pub async fn transition_city_state_in_tx(
 /// fixed lock order operation → city_state: the parent operation is locked
 /// first and must be live (non-terminal, unexpired), the locked row identity
 /// must match the proof, and the row phase must be in sync with the parent
-/// state or deterministically catchable to it ([`next_catchup_hop`]);
+/// state or deterministically catchable to it (`next_catchup_hop`);
 /// then a strict owner + token-hash + liveness CAS clears the lease. A lost
 /// lease, dead parent, or leading/divergent/ambiguous row is an explicit
 /// error — releasing a lease over a dead parent can never report success.
@@ -3212,7 +3212,7 @@ pub struct CrossCityOperationActivationMintOutcome {
 ///    (`ACTIVATING`/`IN_DOUBT`) at the caller's coordinator epoch;
 /// 2. every stored vote must carry its durable replay-reservation row (the
 ///    storage-level witness of cryptographic verification, owned by
-///    [`crate::cross_city_runtime_repository`]) — a stored vote without one
+///    `crate::cross_city_runtime_repository`) — a stored vote without one
 ///    is poisoned storage and fails the mint closed;
 /// 3. the agreement certificate is re-derived from those verified votes and
 ///    must equal the stored agreement digest;

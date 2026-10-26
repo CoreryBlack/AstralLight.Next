@@ -9,8 +9,8 @@
 //! - **命中前提是"指针对牌"**：`authorization_projection_current` 卡作用域
 //!   **全部**指针行的版本组（`aggregate_type`/`aggregate_id`/`manifest_id`/
 //!   `current_generation`/`revoke_fence`，含集合形状）与填充时刻逐项相等
-//!   （基准组来自 [`crate::permission_query::evidence_manifest_versions`]，
-//!   现场组来自 [`crate::permission_query::load_pointer_fence_versions`]，
+//!   （基准组来自 `crate::permission_query::evidence_manifest_versions`，
+//!   现场组来自 `crate::permission_query::load_pointer_fence_versions`，
 //!   两者同源同形），且共享缓存时代（`crate::cache_epoch`）严格一致。
 //! - **正确性论证（pointer 未变 ⇒ evidence 未变）**：published evidence 是
 //!   content-addressed 的 —— segment 载荷 sha256 重算比对、seal 校验、
@@ -34,8 +34,8 @@
 //!
 //! 证据的 validity 判定冻结于填充时刻的统一 UTC 时钟
 //! （`PublishedCardAuthorization::read_unix_seconds`）。TTL 封顶 30s
-//! （[`EVIDENCE_CACHE_TTL`]，显著小于 validity 的业务粒度），且命中时按
-//! **当前时钟**重验全部 records 的窗口状态（[`cached_evidence_is_clock_fresh`]）：
+//! （`EVIDENCE_CACHE_TTL`，显著小于 validity 的业务粒度），且命中时按
+//! **当前时钟**重验全部 records 的窗口状态（`cached_evidence_is_clock_fresh`）：
 //! 任一 accepted 记录在当前时钟下不再有效，或任一因 `Expired`/`NotYetValid`
 //! 被排除的记录窗口翻转（任一方向），即判证据时钟陈旧 → miss 回源。因此
 //! "过期 grant 被多放行 ≤TTL" 的危险方向被封死；缓存条目本身只读（`Arc`），
@@ -71,7 +71,7 @@
 //!
 //! `moka`（future 特性）进程内缓存：TTL/容量上限/并发分片驱逐内建，已在本
 //! workspace 依赖树中（0.12.16），避免手写 RwLock+LRU 在并发淘汰上的错误面。
-//! 容量上限 [`EVIDENCE_CACHE_MAX_CAPACITY`] = 100_000 条（单条 Ready 证据约
+//! 容量上限 `EVIDENCE_CACHE_MAX_CAPACITY` = 100_000 条（单条 Ready 证据约
 //! 1-1.5KB，最坏 ≈150MB）。第一版不做 single-flight：同卡并发 miss 在指针行
 //! 锁上自然串行化，最坏情况是重复一次严格读，结果仍然正确。
 //!
@@ -83,20 +83,20 @@
 //!
 //! - **键族**（全部时代**内嵌**，换时代（`crate::cache_epoch`
 //!   `DEL astral:auth:cache_epoch`）后旧键自然失配，无需扫描删除）：
-//!   - 卡证据键 [`L2_EVIDENCE_KEY_PREFIX`] `astral:auth:l2ev:{cache_epoch}:
+//!   - 卡证据键 `L2_EVIDENCE_KEY_PREFIX` `astral:auth:l2ev:{cache_epoch}:
 //!     {tenant_id}:{card_id}` —— 逐卡私有（条目/栅栏/envelope 绝不跨卡共享）；
-//!   - 共享内容单元键 [`L2_EVIDENCE_SHARED_KEY_PREFIX`]
+//!   - 共享内容单元键 `L2_EVIDENCE_SHARED_KEY_PREFIX`
 //!     `astral:auth:l2sh:{cache_epoch}:{tenant_id}:{digest}` —— **tenant+时代
 //!     限定**的内容寻址 RULE_SET 存储单元（见"去重边界"）。
-//! - **值 JSON（schema 3 因子化存储形态）**：[`L2EvidenceEntry`] `{
+//! - **值 JSON（schema 3 因子化存储形态）**：`L2EvidenceEntry` `{
 //!   schema_version, manifest_versions（与 L1 基准组同结构
 //!   [`PermissionCacheManifestVersion`]，逐卡 envelope）, content_hash, mac,
 //!   payload }`。`payload` 是**因子化存储形态**
-//!   （[`L2FactoredCardPayload`]）：非 RULE_SET 记录完整内联；RULE_SET 记录
+//!   （`L2FactoredCardPayload`）：非 RULE_SET 记录完整内联；RULE_SET 记录
 //!   拆为"逐卡 envelope（身份/绑定/来源字段 + 单元摘要引用）"+"tenant+时代
-//!   限定的共享内容单元"（[`L2SharedUnit`]，只含规则内容 resource/action/
+//!   限定的共享内容单元"（`L2SharedUnit`，只含规则内容 resource/action/
 //!   effect/validity 与编译器元数据，**绝不含 tenant/card/user/grant 身份**，
-//!   自带内容摘要自校验）。读侧以纯函数 join 重建（[`l2_reconstruct_full_payload`]），
+//!   自带内容摘要自校验）。读侧以纯函数 join 重建（`l2_reconstruct_full_payload`），
 //!   `effective_grants` 由合同定理（必须恰好等于 records 中 accepted 子集、
 //!   同序同内容）展开，**身份字段全部来自逐卡 envelope，读侧绝不改写、补盖
 //!   或重定戳任何身份**。`content_hash` = **重建后完整 payload** 序列化 JSON
@@ -105,7 +105,7 @@
 //!   自愈（与 permission_query v4 envelope 的既有先例同一模式）。
 //! - **HMAC 认证（强制，fail-closed）**：每张卡证据条目携带
 //!   `mac = HMAC-SHA256(ASTRAL_L2_EVIDENCE_HMAC_SECRET, 规范序列化 cover)`，
-//!   cover 绑定：域分隔符（[`L2_MAC_DOMAIN`]）+ **精确 Redis 键**（防键间
+//!   cover 绑定：域分隔符（`L2_MAC_DOMAIN`）+ **精确 Redis 键**（防键间
 //!   重放）+ schema 版本 + 版本组 + content_hash + **重建后完整 payload**。
 //!   密钥来自专用环境变量 [`L2_EVIDENCE_HMAC_SECRET_ENV`]（绝不复用网关/
 //!   内部签名密钥，绝不硬编码）：仅接受非占位符且 ≥32 字节/字符的值；未设置
@@ -114,7 +114,7 @@
 //!   不接受双密钥）；轮换 = 更换环境变量并轮换共享时代（Exec-L3 运维动作），
 //!   旧密钥条目在新密钥下 MAC 失配 → purge → 严格读 → 新密钥重填（即使忘记
 //!   换时代也自愈，只是旧键多驻留一个 TTL）。
-//! - **命中前提**（[`try_l2_evidence_hit`]）：HMAC 密钥可用 + schema 匹配 +
+//! - **命中前提**（`try_l2_evidence_hit`）：HMAC 密钥可用 + schema 匹配 +
 //!   L2 版本组与**读前对牌**的 DB 指针组逐项一致（并发两次发布的推送竞态由
 //!   该对牌兜底：版本不符即弃）+ envelope 顶层 scope 一致 + 共享单元逐个
 //!   GET 且自校验（缺失/摘要失配 → purge 卡键回源，绝不放行部分数据）+
@@ -507,7 +507,7 @@ pub trait L2EvidenceStore: Send + Sync {
 /// `ConnectionManager`（池化复用 + runtime 边界语义见该函数文档；连接管理器
 /// 自带自动重连）。Redis 不可用 → `Err` → 调用方降级为 L1+DB。
 /// 生产 L2 存取（仅 redis-compat feature 编译；feature-off 构建由
-/// [`NoopL2EvidenceStore`] 承担同签名语义）。
+/// `NoopL2EvidenceStore` 承担同签名语义）。
 #[cfg(feature = "redis-compat")]
 pub struct RedisL2EvidenceStore;
 
@@ -548,7 +548,7 @@ impl L2EvidenceStore for RedisL2EvidenceStore {
 static SHARED_L2_EVIDENCE_STORE: OnceLock<Arc<dyn L2EvidenceStore>> = OnceLock::new();
 
 /// 生产 L2 存取句柄：redis-compat feature 编译时为 `RedisL2EvidenceStore`；
-/// feature-off 构建为 [`NoopL2EvidenceStore`]（等价"Redis 永久不可用"的既有
+/// feature-off 构建为 `NoopL2EvidenceStore`（等价"Redis 永久不可用"的既有
 /// 降级语义：读恒 miss、写静默丢弃，L1 + strict DB 兜底，fail-closed 不变）。
 pub fn shared_l2_evidence_store() -> &'static Arc<dyn L2EvidenceStore> {
     SHARED_L2_EVIDENCE_STORE.get_or_init(|| Arc::new(shared_l2_evidence_store_impl()))
@@ -596,7 +596,7 @@ pub fn l2_evidence_key(cache_epoch: &str, tenant_id: i64, card_id: i64) -> Strin
 /// `content_hash` 绑定**重建后完整 payload** 的序列化字节（写侧对完整证据
 /// 计算、读侧对重建结果重验，独立于 MAC 的全载荷完整性校验）；`mac` 为强制
 /// HMAC-SHA256 条目认证（见 [`L2MacCover`]）；`payload` 是因子化存储形态
-/// （[`L2FactoredCardPayload`]，读侧 [`l2_reconstruct_full_payload`] 唯一重建）。
+/// （`L2FactoredCardPayload`，读侧 `l2_reconstruct_full_payload` 唯一重建）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct L2EvidenceEntry {
@@ -635,7 +635,7 @@ struct L2FactoredCardPayload {
 
 /// 单条记录的存储槽位：保持原始 `records` 顺序（字节级重建的前提）。
 /// `Inline` = 非 RULE_SET 记录完整内联；`Shared` = RULE_SET 记录的逐卡
-/// envelope + 共享单元摘要引用（内容在 [`L2SharedUnit`]）。
+/// envelope + 共享单元摘要引用（内容在 `L2SharedUnit`）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum L2RecordSlot {

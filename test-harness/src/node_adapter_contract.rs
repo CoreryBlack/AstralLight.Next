@@ -2256,12 +2256,15 @@ mod tests {
 
     #[test]
     fn api_response_envelope_is_preserved_end_to_end() {
-        let mut transport = FakeTransport::default();
-        transport.response = Some(HttpResponse {
-            status: 200,
-            body: r#"{"code":200,"message":"ok","data":{"allowed":true,"reason":"RULE_MATCH"}}"#
-                .to_owned(),
-        });
+        let mut transport = FakeTransport {
+            response: Some(HttpResponse {
+                status: 200,
+                body:
+                    r#"{"code":200,"message":"ok","data":{"allowed":true,"reason":"RULE_MATCH"}}"#
+                        .to_owned(),
+            }),
+            ..FakeTransport::default()
+        };
         let (status, body, request_id) = execute_signed_request(
             &config(),
             &mut transport,

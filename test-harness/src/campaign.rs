@@ -3574,7 +3574,7 @@ exit "${FAKE_CARGO_EXIT:-0}"
             permissions.set_mode(0o755);
             fs::set_permissions(script, permissions).unwrap();
         }
-        let suite = command_suite(&[parent.to_str().unwrap()], 1);
+        let suite = command_suite(&[parent.to_str().unwrap()], 3);
         let result =
             execute_posix(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
         assert_eq!(result["status"], "UNKNOWN", "{result}");

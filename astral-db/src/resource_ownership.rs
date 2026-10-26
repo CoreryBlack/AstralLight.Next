@@ -99,7 +99,7 @@ impl ResourceOwnershipResolution {
 /// tenant/domain headers into the target scope.
 ///
 /// Public signature is frozen. The strict DB resolver below is the only
-/// authority; a process-local memory read face (see [`memory`]) may serve
+/// authority; a process-local memory read face (see `memory`) may serve
 /// previously strict-verified positive `TenantScoped` outcomes for normal
 /// protected routes when the composite single-node gate is open (healthy hub +
 /// installed auxiliary authorization mirror). Chat-table lookups and all

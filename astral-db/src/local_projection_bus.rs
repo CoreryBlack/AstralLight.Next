@@ -31,7 +31,7 @@
 //!   every dimension bounded; no unbounded queue exists on this path.
 //! - **One owner / start once**: [`install_local_projection_bus`] installs the
 //!   process-global bus exactly once; the receiver can be taken exactly once
-//!   by the projector worker ([`LocalProjectionBus::take_receiver`]). Closing
+//!   by the projector worker (`LocalProjectionBus::take_receiver`). Closing
 //!   is idempotent; the receiver drains remaining envelopes after close.
 //!
 //! The bus carries the strict durable source facts only — the same

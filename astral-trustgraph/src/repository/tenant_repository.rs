@@ -6,7 +6,7 @@
 //! 影响有效授权的租户/域 mutation（租户状态变更、域映射增删、租户硬删除）以
 //! `AuthorizationSourceTransaction` 为宿主，在同一短事务内成对登记每卡
 //! ELIGIBILITY 投影事件与 durable `ELIGIBILITY_INVALIDATED` 失效意图，
-//! commit 证明后才投递；见 [`append_tenant_eligibility_invalidation_in_tx`]。
+//! commit 证明后才投递；见 `append_tenant_eligibility_invalidation_in_tx`。
 //! 硬删除的 user_card FOR UPDATE 引用守卫保持不变：锁定读在守卫通过后阻止
 //! 并发新增引用行，与 DELETE 原子成立；源事务活动栅栏额外关闭守卫语义与
 //! 在线 repair 之间的竞态（拒绝发证即 fail-closed，绝不留下无栅栏 writer）。

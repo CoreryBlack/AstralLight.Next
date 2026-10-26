@@ -289,7 +289,7 @@ async fn duplicate_append_is_idempotent_under_concurrency() {
     assert_eq!(preserved.0, message.operation_id);
     assert_eq!(preserved.1, message.payload_sha256);
     assert_eq!(preserved.2, Some(1));
-    cleanup(&pool, &[message.message_id.clone()])
+    cleanup(&pool, std::slice::from_ref(&message.message_id))
         .await
         .expect("clean run-owned row");
     let remaining: i64 =
@@ -425,10 +425,9 @@ async fn scoped_append_and_claim_load_preserves_sequence_and_fifo() {
     let completed = Arc::new(AtomicUsize::new(0));
     let claim_started = Instant::now();
     let mut claim_tasks = Vec::new();
-    for scope in 0..scope_count {
+    for (scope, ordering_key) in ordering_keys.iter().cloned().enumerate() {
         let pool = pool.clone();
         let rows = rows.clone();
-        let ordering_key = ordering_keys[scope].clone();
         let completed = completed.clone();
         claim_tasks.push(tokio::spawn(async move {
             let repository = LocalMessageRepository::new(pool.clone());

@@ -17,7 +17,7 @@
 //!
 //! # Scope mirror (planning hints, never proofs)
 //!
-//! [`ScopePlanMirror`] keeps bounded per-scope planning state so a normal
+//! `ScopePlanMirror` keeps bounded per-scope planning state so a normal
 //! delta compiles WITHOUT per-event DB reads:
 //!
 //! - **Frontier**: after each DURABLE publish (commit-proven outcome), the
@@ -50,7 +50,7 @@
 //!
 //! # Liveness supervision (worker-supervision-20261002)
 //!
-//! The worker task is owned by [`supervise_local_projection_worker`]: an
+//! The worker task is owned by `supervise_local_projection_worker`: an
 //! unexpected exit (panic, abort, or a bus close that no shutdown requested)
 //! is recorded into the process-global [`WorkerLivenessCell`] as
 //! [`LocalProjectionWorkerLiveness::Dead`] and raises the memory projection
@@ -1008,7 +1008,7 @@ impl LocalProjectionRuntime {
     /// hand): inserts the claimed event's own ledger row from the strict
     /// durable request facts while per-grant continuity holds; any doubt
     /// poisons the scope to strict cold reads. See
-    /// [`ScopePlanMirror::upsert_claimed_row`].
+    /// `ScopePlanMirror::upsert_claimed_row`.
     pub fn mirror_upsert_claimed_row(
         &self,
         request: &DeltaEventAppendRequest,
@@ -1321,7 +1321,7 @@ fn claim_error_marks_hub_suspect(error: &RuntimeAccessError) -> bool {
 /// the bus's single receiver; a second worker start fails with
 /// [`LocalProjectionWorkerStartError::ReceiverTaken`].
 ///
-/// The task is supervised ( [`supervise_local_projection_worker`]): an
+/// The task is supervised (`supervise_local_projection_worker`): an
 /// unexpected exit is sticky fail-closed (global liveness `Dead` + hub
 /// `mark_runtime_owner_failed`) and is never blindly restarted. The
 /// empty-tenant-scope contract is enforced BEFORE the single receiver is

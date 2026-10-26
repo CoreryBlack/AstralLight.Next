@@ -30,7 +30,7 @@
 //!                      source mutation 与 head 代次/围栏在同一 source 事务
 //!                      提交，栅栏失配即缓存 miss 回权威 SQL，无需 worker
 //!                      消费证明即可保持 fail-closed。
-//! 失败 → release_failed（attempts+1 + next_attempt_at 指数退避 2^(n-1) 截断 [1,300]s）
+//! 失败 → release_failed（attempts+1 + next_attempt_at 指数退避 2^(n-1) 截断 `[1,300]`s）
 //! ```
 //!
 //! 未知 `aggregate_type` 必须 fail-closed（release_failed 重试），绝不 mark processed 成功，
@@ -438,7 +438,7 @@ async fn mark_event_obsolete(
     }
 }
 
-/// 失败处理：attempts+1 + 指数退避 + 释放租约（对齐 Java backoff 2^(n-1) 截断 [1,300]）
+/// 失败处理：attempts+1 + 指数退避 + 释放租约（对齐 Java backoff 2^(n-1) 截断 `[1,300]`）
 async fn fail_event(
     repo: &dyn ProjectionRepository,
     worker_id: &str,

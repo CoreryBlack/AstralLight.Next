@@ -6,9 +6,9 @@
 //!
 //! ## 数据流（新链对照，旧链下线前置改造）
 //!
-//! - 新链判定：卡级 published evidence（[`crate::api::load_diagnostic_card_evidence`]，
+//! - 新链判定：卡级 published evidence（`load_diagnostic_card_evidence`，
 //!   严格 reader 单短事务内锁定当前指针并整链校验 + 卡级 lens）经统一
-//!   ALLOW-only 匹配器（[`crate::api::match_published_effective_grant`]，与
+//!   ALLOW-only 匹配器（`match_published_effective_grant`，与
 //!   PolicyEngine strict gate 同语义）得出 ALLOW/DENY；
 //! - oracle 判定：`PolicyEngine::evaluate_realtime`（raw source，oracle 语义
 //!   原样保留，强制全量比对不走 1% 采样门）；

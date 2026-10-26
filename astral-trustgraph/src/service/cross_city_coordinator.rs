@@ -396,7 +396,7 @@ pub struct CrossCityCoordinator {
 
 impl CrossCityCoordinator {
     /// Load the durable node key registry and return it as the explicit
-    /// fixed provider for [`Self::new`]/[`Self::try_new`]. One durable read;
+    /// fixed provider for [`Self::disabled`]/[`Self::try_new`]. One durable read;
     /// no transaction of its own.
     pub async fn load_node_key_provider(
         pool: &MySqlPool,

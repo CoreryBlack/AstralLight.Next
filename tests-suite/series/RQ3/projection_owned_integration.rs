@@ -123,16 +123,24 @@ struct PointerState {
     cas_version: i64,
 }
 
-fn request_for(
-    namespace: &Namespace,
-    tag: &str,
+struct RequestFields {
     grant_id: GrantId,
     event_type: DeltaEventType,
     base_version: i64,
     target_version: i64,
     source_generation: u64,
     delta: GrantDelta,
-) -> DeltaEventAppendRequest {
+}
+
+fn request_for(namespace: &Namespace, tag: &str, fields: RequestFields) -> DeltaEventAppendRequest {
+    let RequestFields {
+        grant_id,
+        event_type,
+        base_version,
+        target_version,
+        source_generation,
+        delta,
+    } = fields;
     DeltaEventAppendRequest {
         tenant_id: namespace.tenant_id,
         card_id: Some(namespace.card_id),
@@ -187,12 +195,14 @@ fn add_request(namespace: &Namespace, tag: &str, ordinal: u64) -> DeltaEventAppe
     request_for(
         namespace,
         tag,
-        grant_id,
-        DeltaEventType::Add,
-        0,
-        1,
-        1,
-        GrantDelta::add(grant),
+        RequestFields {
+            grant_id,
+            event_type: DeltaEventType::Add,
+            base_version: 0,
+            target_version: 1,
+            source_generation: 1,
+            delta: GrantDelta::add(grant),
+        },
     )
 }
 
@@ -214,12 +224,14 @@ fn successor_request(
     request_for(
         namespace,
         tag,
-        predecessor.grant_id,
-        DeltaEventType::Update,
-        1,
-        2,
-        2,
-        GrantDelta::update(grant, GrantRevision::initial()),
+        RequestFields {
+            grant_id: predecessor.grant_id,
+            event_type: DeltaEventType::Update,
+            base_version: 1,
+            target_version: 2,
+            source_generation: 2,
+            delta: GrantDelta::update(grant, GrantRevision::initial()),
+        },
     )
 }
 
@@ -391,16 +403,26 @@ fn set_before_image(request: &mut DeltaEventAppendRequest, image: &str) {
     request.before_digest_hex = Some(format!("{:x}", sha2::Sha256::digest(image.as_bytes())));
 }
 
+struct ReceiptDriftExpectation<'a> {
+    event_before: &'a EventState,
+    lane_before: &'a Option<LaneState>,
+    owner_tag: &'a str,
+    expected_code: &'a str,
+}
+
 async fn assert_receipt_drift_rejected(
     pool: &MySqlPool,
     namespace: &Namespace,
     stored: &DeltaEventAppendRequest,
     drift: DeltaEventAppendRequest,
-    event_before: &EventState,
-    lane_before: &Option<LaneState>,
-    owner_tag: &str,
-    expected_code: &str,
+    expectation: ReceiptDriftExpectation<'_>,
 ) {
+    let ReceiptDriftExpectation {
+        event_before,
+        lane_before,
+        owner_tag,
+        expected_code,
+    } = expectation;
     let error = claim_owned_delta_event_by_stable_event(
         pool,
         &drift,
@@ -933,7 +955,7 @@ async fn run_contract() {
 
     let event_ids = append_fixture_events(&pool, &[first.clone(), successor.clone()]).await;
     assert_eq!(event_ids.len(), 2);
-    append_fixture_events(&pool, &[sibling.clone()]).await;
+    append_fixture_events(&pool, std::slice::from_ref(&sibling)).await;
     append_fixture_events(
         &pool,
         &[concurrent_earliest.clone(), concurrent_later.clone()],
@@ -945,8 +967,8 @@ async fn run_contract() {
     )
     .await;
     append_fixture_events(&pool, &[ordering_later.clone(), ordering_earliest.clone()]).await;
-    append_fixture_events(&pool, &[independent_left.clone()]).await;
-    append_fixture_events(&pool, &[independent_right.clone()]).await;
+    append_fixture_events(&pool, std::slice::from_ref(&independent_left)).await;
+    append_fixture_events(&pool, std::slice::from_ref(&independent_right)).await;
     append_fixture_events(&pool, &[binding.clone()]).await;
     append_fixture_events(&pool, &[normalized.clone()]).await;
     let first_before = event_state(&pool, &first).await;
@@ -1480,10 +1502,12 @@ async fn run_contract() {
             &binding_namespace,
             &binding,
             drift,
-            &binding_before,
-            &binding_lane_before,
-            &format!("binding-drift-{index}-{expected_field}"),
-            expected_code,
+            ReceiptDriftExpectation {
+                event_before: &binding_before,
+                lane_before: &binding_lane_before,
+                owner_tag: &format!("binding-drift-{index}-{expected_field}"),
+                expected_code,
+            },
         )
         .await;
     }

@@ -314,11 +314,13 @@ fn rule_body(card_id: i64, priority: i32) -> serde_json::Value {
 }
 
 fn start_owner(pool: &sqlx::MySqlPool, fixture: &OwnedFixture) -> AuthorizationProjectorHandle {
-    let mut config = AuthorizationProjectorConfig::default();
-    config.tenants = vec![fixture.tenant_id];
-    config.poll_interval_secs = 1;
-    config.watchdog_tick = Duration::from_millis(100);
-    config.watchdog_stall_threshold = Duration::from_secs(10);
+    let config = AuthorizationProjectorConfig {
+        tenants: vec![fixture.tenant_id],
+        poll_interval_secs: 1,
+        watchdog_tick: Duration::from_millis(100),
+        watchdog_stall_threshold: Duration::from_secs(10),
+        ..AuthorizationProjectorConfig::default()
+    };
     start_authorization_projector(pool.clone(), config)
 }
 

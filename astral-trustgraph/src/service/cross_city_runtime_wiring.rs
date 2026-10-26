@@ -126,15 +126,15 @@ pub const CROSS_CITY_COORDINATOR_EPOCH_ENV: &str = "ASTRAL_CROSS_CITY_COORDINATO
 pub const CROSS_CITY_AMQP_URL_ENV: &str = "ASTRAL_CROSS_CITY_AMQP_URL";
 /// Explicit peer city ids (comma-separated; NO discovery, NO defaults).
 pub const CROSS_CITY_PEER_CITIES_ENV: &str = "ASTRAL_CROSS_CITY_PEER_CITIES";
-/// Outbox relay batch bound (optional; default [`DEFAULT_RELAY_BATCH`]).
+/// Outbox relay batch bound (optional; default `DEFAULT_RELAY_BATCH`).
 pub const CROSS_CITY_RELAY_BATCH_ENV: &str = "ASTRAL_CROSS_CITY_RELAY_BATCH";
 /// Relay tick interval in milliseconds (optional; default
-/// [`DEFAULT_RELAY_TICK_MS`]).
+/// `DEFAULT_RELAY_TICK_MS`).
 pub const CROSS_CITY_RELAY_TICK_MS_ENV: &str = "ASTRAL_CROSS_CITY_RELAY_TICK_MS";
-/// Inbound prefetch bound (optional; default [`DEFAULT_INBOX_BATCH`]).
+/// Inbound prefetch bound (optional; default `DEFAULT_INBOX_BATCH`).
 pub const CROSS_CITY_INBOX_BATCH_ENV: &str = "ASTRAL_CROSS_CITY_INBOX_BATCH";
 /// Transport lease seconds for the durable outbox/inbox claim (optional;
-/// default [`LEASE_SECONDS_DEFAULT`]). A distinct variable on purpose: the
+/// default `LEASE_SECONDS_DEFAULT`). A distinct variable on purpose: the
 /// relay tick and the lease budget are independent bounds and must never be
 /// derived from each other.
 pub const CROSS_CITY_TRANSPORT_LEASE_SECONDS_ENV: &str =

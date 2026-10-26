@@ -1,7 +1,7 @@
 //! P5 L1 local persistence snapshot for the in-memory authorization mirror.
 //!
 //! The single-node runtime opts in with `SINGLE_NODE_SNAPSHOT_PATH` and uses
-//! [`crate::authorization_snapshot`] for exact durable pointer validation.
+//! `authorization_snapshot` for exact durable pointer validation.
 //! Startup still rebuilds against the complete durable state before serving.
 //! A snapshot is saved only after bounded service shutdown succeeds.
 //!
@@ -544,7 +544,7 @@ fn write_sync_rename(
 /// sync + rename (+ POSIX directory fsync).
 ///
 /// A temp-name collision (v4 UUID or a hostile pre-planted name) retries with
-/// a fresh run-scoped token within [`ATOMIC_WRITE_TEMP_ATTEMPTS`]; a
+/// a fresh run-scoped token within `ATOMIC_WRITE_TEMP_ATTEMPTS`; a
 /// persistent collision fails closed without touching the occupied file. On
 /// any other failure the temp file (if this call created it) is removed and
 /// the previous snapshot, if any, stays untouched. Durability boundary: the

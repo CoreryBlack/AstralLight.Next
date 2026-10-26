@@ -30,7 +30,7 @@
 //!    observe_publication_context`] 在一次短事务内经 astral-db 公开 loader 同时
 //!    加载严格 published frontier（generation 1..=G）与当前 parent reference
 //!    快照；无 pointer 返回 `None`，有 pointer 而 parent 快照缺失按 Corrupt 处理。
-//!    结果只作为 planning hint——发布事务 [`project_authorization_delta_in_tx`]
+//!    结果只作为 planning hint——发布事务 [`astral_db::project_authorization_delta_in_tx`]
 //!    内部重锁指针/fence/parent 做二次权威复核，观察值永远不充当放行证明。
 //! 2. **多 grant ledger 分区**：claim/readback 之后加载完整 aggregate ledger，
 //!    调用 `partition_ledger_at_published_frontier(rows, frontier,
@@ -47,7 +47,7 @@
 //!    aggregate generation 与 per-grant version 永不直接比较：successor 关系
 //!    只对照该 grant 自己的 frontier last delta target。
 //! 3. **Segment reuse**：观察到 parent references 时将 digest 匹配的 unchanged
-//!    segment 计划为 [`StagedSegmentContent::ReuseParent`]（digest 判等 + ordinal
+//!    segment 计划为 [`astral_db::StagedSegmentContent::ReuseParent`]（digest 判等 + ordinal
 //!    去重），changed/new 用 New。planning view 只是 hint，staging 事务内部全部
 //!    重验（指针代差 → PointerMoved 快速 retry，不用旧 refs 强行发布）；无
 //!    parent 视图全 New（同内容 segment 行仍由存储层按 digest 去重复用，绝无
@@ -59,7 +59,7 @@
 //!    quarantined。lease/CAS 丢失或查询失败记 UNKNOWN（见
 //!    [`WorkerRunSummary::events_quarantine_unknown`]）并停止一切后续 mutation，
 //!    绝不 fail/retry/伪装成功。attempt 预算耗尽仍保持 PENDING + 最大退避 +
-//!    [`ATTEMPT_BUDGET_EXHAUSTED_CODE`]（持续基础设施故障可能自愈），不转隔离；
+//!    `ATTEMPT_BUDGET_EXHAUSTED_CODE`（持续基础设施故障可能自愈），不转隔离；
 //!    无 operator HTTP requeue（requeue API 属 repository/operator 层）。
 //! 5. **Publish 租约心跳与 unproven-history 阻塞**：发布事务开始时先在同一
 //!    事务内以 owner+token+status CAS + 服务端时间续租

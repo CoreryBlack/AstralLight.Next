@@ -1504,11 +1504,6 @@ mod tests {
 #[cfg(test)]
 mod db_idempotency_tests {
     use super::*;
-    use astral_db::{
-        MqConsumerLeaseStore, MqLeaseClaim, MqLeaseClaimOutcome, MqLeaseError, MqLeaseRelease,
-        MqLeaseRenew,
-    };
-    use std::collections::BTreeMap;
 
     /// Fixed server clock (now = 0); leases with TTL 300 never expire inside
     /// these tests. Expiry/takeover semantics are covered by the lease

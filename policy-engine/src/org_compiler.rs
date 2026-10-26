@@ -2,7 +2,7 @@
 //! `astral_types::org_scope` 与 implementation-contract）。
 //!
 //! 职责（types/compiler owner）：
-//! - 从 DB 已证明的批准事实快照（[`OrgCompileInput`]）编译单元证据状态：
+//! - 从 DB 已证明的批准事实快照（[`astral_types::org_scope::OrgCompileInput`]）编译单元证据状态：
 //!   父授权解析（精确 revision）、范围包含证明、本地 mask 剪裁、provenance 链；
 //! - HAMT（`im::HashMap`）贡献/桶结构：O(1) 结构共享 clone + 未变段 `Arc` 复用，
 //!   增量编译只重算受影响桶（祖先差量依赖由调用方以完整输入快照呈现，
@@ -13,7 +13,7 @@
 //!   返回有界确定性候选桶，请求级身份/有效期/主体过滤 fail-closed。
 //!
 //! 编译代次 = `node.generation`（node 每次相关 mutation 前进；publication 与
-//! node 头栅栏逐项相等，由 [`OrgAdmissionEvidence::validate`] 强制）。
+//! node 头栅栏逐项相等，由 [`astral_types::org_scope::OrgAdmissionEvidence::validate`] 强制）。
 //! 编译器绝不产生授权：PENDING（未对账 mask/缺失或漂移父授权/不可证明范围）
 //! 与 Conflict（结构合同破坏）都绝不静默放行。
 

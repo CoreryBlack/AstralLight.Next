@@ -62,7 +62,7 @@ impl DelegationExpiryWorkerConfig {
     /// spawn 之前的 fail-fast 校验（Exec-L2 启动门禁）：
     /// - `poll_interval_secs` 必须在 `1..=MAX_POLL_INTERVAL_SECS`；
     /// - `batch_limit` 复用 repository 的单一事实源
-    ///   [`validated_expiry_batch_limit`]（正数且 ≤ MAX_EXPIRY_RECONCILIATION_BATCH=500）。
+    ///   `validated_expiry_batch_limit`（正数且 ≤ `MAX_EXPIRY_RECONCILIATION_BATCH`=500）。
     ///
     /// 非法配置返回 [`DelegationExpiryConfigError`]，调用方必须拒绝启动，
     /// 绝不降级为"顺便用默认值"。

@@ -93,7 +93,7 @@ Gateway 的路由凭证策略类型和会话 grant 校验在 [`middleware.rs`](.
 
 实现见 [`physical_policy_context`](../../../astral-common/src/middleware/permission_check_shared.rs#L55-L118)。
 
-请求路径由各服务中间件按各自 path map 解析资源类型和动作，先通过服务专属 owner resolver 建立目标所有权，再调用 `engine.evaluate(&ctx, repo)`。公开 helper `astral_common::middleware::permission_check_shared::check_permission` 保留为 deprecated compatibility helper：它提交 `Unresolved` 目标上下文，不能授权受保护资源，也不能替代服务专属 owner resolver；生产路径必须在评估前解析目标 owner。另一个公开兼容 helper `astral_common::middleware::permission::require_permission` 仍保留；它同样不能替代 owner resolver，且当前仓内没有调用方，不得作为生产授权入口。共享解析与双卡上下文 helper 仍由各服务中间件复用。
+请求路径由各服务中间件按各自 path map 解析资源类型和动作，先通过服务专属 owner resolver 建立目标所有权，再调用 `engine.evaluate(&ctx, repo)`。公开 helper `astral_common::middleware::permission_check_shared::check_permission` 保留为兼容入口：它提交 `Unresolved` 目标上下文，不能授权受保护资源，也不能替代服务专属 owner resolver；生产路径必须在评估前解析目标 owner。另一个公开兼容 helper `astral_common::middleware::permission::require_permission` 仍保留；它同样不能替代 owner resolver，且当前仓内没有调用方，不得作为生产授权入口。共享解析与双卡上下文 helper 仍由各服务中间件复用。
 
 `ResourceRegistry` 是 `astral-types` 的集中注册表，提供资源/动作/条件校验；启动期 `validate_path_map` 交叉检查 path map 是否引用未注册资源，但当前检查记录错误并继续启动，不能当作强制启动失败门禁。注册表和校验见 [`registry.rs`](../../../astral-types/src/registry.rs#L113-L144) 与 [`#L319-L383`](../../../astral-types/src/registry.rs#L319-L383)。
 

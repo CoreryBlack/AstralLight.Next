@@ -1,21 +1,70 @@
 # AstralLight Rust
 
-AstralLight Rust is a standalone Rust workspace for multi-tenant authorization and
-its surrounding runtime: identity, gateway authentication, durable projection,
-policy evaluation, messaging, persistence, and monitoring.
+AstralLight Rust is a Rust backend for **centralized, tenant-scoped authorization across API services**. It brings identity and session handling, gateway authentication, policy evaluation, durable authorization evidence, governance, messaging, and audit into one workspace. Instead of letting each application invent its own role checks or read permission tables directly, services use a shared authorization decision path.
 
-The public repository is designed for engineers who need to inspect the
-authorization path, run the local unit suite, reproduce the published test
-contracts, or evaluate the Rust implementation against comparison engines. It
-is not a packaged production deployment and does not include credentials,
-private infrastructure, or historical experiment archives.
+The project is for teams building multi-tenant services where access depends on **who is acting, which authorization card they use, which tenant owns the data, and what resource/action is requested**. It is not a frontend application or a drop-in, preconfigured production deployment: this repository provides the Rust implementation, integration SDKs, schemas, tests, and technical documentation. It does not include credentials or private infrastructure, and published test assets do not mean every live integration or deployment has been accepted.
+
+## Project overview
+
+AstralLight is a backend for applications that need a shared, tenant-aware way to decide whether an authenticated user may perform an action. It combines identity and session services with a gateway, a policy engine, durable authorization projections, governance services, and integration tooling. An application keeps ownership of its business data and handlers; AstralLight supplies the identity context and authorization decision path those services can use.
+
+### The authorization model
+
+The project distinguishes identity from the authority used to access data:
+
+- An **identity card** represents who the user is and anchors their session.
+- A **user card** carries an authorization context, including its tenant/domain scope and permission bindings. It is not interchangeable with an identity card, and identity alone does not grant business permissions.
+- A decision applies to a registered **resource and action**, within the user's valid scope. For an individual object, the application service must resolve and validate the object's owner; the caller cannot authorize itself by supplying an unverified target or tenant.
+
+This model is intended for systems where one person may act through different authorization contexts, data is partitioned by tenant or domain, and access must be checked consistently across multiple services. Applications do not grant access by checking a role string, trusting client-supplied identity headers, or reading a stale permission snapshot themselves.
+
+### How a request is authorized
+
+```text
+User / application
+  -> Gateway validates the session, removes untrusted identity headers,
+     and establishes signed identity context
+  -> Service verifies the Gateway context and resolves the target resource's owner
+  -> PolicyEngine.evaluate() checks identity, user card, tenant, resource/action,
+     and current published authorization evidence
+  -> Service continues only when the decision is ALLOW
+```
+
+`PolicyEngine.evaluate()` is the normal authorization entry point. Gateway authentication establishes who is making the request; the owning service supplies the business-specific target facts; the policy engine decides whether the current evidence permits that exact operation. These responsibilities are deliberately separate, so a valid login or a trusted gateway header is not by itself permission to read or change an object.
+
+### What the workspace provides
+
+- **Identity and sessions:** account-facing identity and session lifecycle, including the identity-card and user-card context used by protected requests.
+- **Gateway boundary:** external request authentication and signed context propagation to backend services. Downstream services verify the signature instead of trusting client-provided internal headers.
+- **Policy evaluation:** shared resource/action validation and authorization decisions with tenant and card scope. Missing or inconsistent facts do not silently widen access.
+- **Authorization projection:** database-backed source records, versioned published evidence, and workers that materialize approved permission changes. This separates a durable permission change from the read model used to make fast decisions.
+- **Governance and operations:** TrustGraph services for authorization administration and governance, with audit and monitoring support. Arbiter is a consistency/conflict-analysis component, not an alternate path for granting normal requests.
+- **Application integration:** Rust SDK contract, client, and Axum helper crates for services that need to request signed authorization decisions. SDK integration uses explicitly approved application scope and identity mapping; it does not automatically import an application's roles as platform permissions.
+- **Development and validation:** workspace crates, schemas, test harnesses, validation tools, and benchmark sources for inspecting and checking the implementation. Their presence is not a claim that every real database, message-broker, migration, or deployment scenario has passed acceptance.
+
+### Permission changes and fail-closed behavior
+
+Permission changes follow a durable lifecycle: the source change and its audit/outbox correlation are recorded first; projection workers then publish versioned authorization evidence; the decision path checks that the evidence is current, complete, and ready. This helps keep permission updates, revocation, and authorization reads aligned even when asynchronous work is delayed or fails. If required evidence is missing, stale, failed, or unproven, the result is `PENDING` or `DENY`. The normal production decision path does not fall back to raw source rows, an old snapshot, or a cache entry to grant access.
+
+### Where to explore next
+
+- [Architecture index](Docs/架构/Rust架构设计/README.md) for service responsibilities and design boundaries.
+- [Backend API reference](Docs/API/后端接口参考_V1.md) for registered routes and Gateway exposure.
+- [SDK integration guide](Docs/SDK接入V1.md) for the application-side authorization contract and Axum examples.
+- [Tests and evidence](tests-suite/README.md) for test profiles and their dependency/acceptance boundaries.
+
+This repository is the Rust implementation and its supporting code, schemas, and documentation—not a packaged, preconfigured production deployment. Live integration, migration, and deployment acceptance require their own approved environment and evidence. The repository does not include credentials or private infrastructure; see [Repository boundary](#repository-boundary) for what is and is not included.
+
+The public repository is designed for engineers who need to understand or extend the authorization path, run local checks, reproduce published test contracts, integrate a Rust application, or evaluate the implementation against comparison engines. It does not include historical experiment archives.
 
 ## What is protected
 
 The runtime's authorization root is `PolicyEngine::evaluate()`. A decision must
 be supported by the current identity, an active user card, the requested
 resource/action scope, tenant isolation, projection generation and dependency
-readiness, and published evidence. Missing, stale, failed, or unproven
+readiness, and published evidence. For object-level resources, the owning service
+must resolve and validate the target owner before evaluation; actor identity or an
+unresolved target scope cannot grant access. Missing, stale, failed, or unproven
 projection state fails closed as `PENDING` or `DENY`; raw source reads, old
 snapshots, and cache fallbacks do not grant access.
 
@@ -143,6 +192,8 @@ of the default test commands.
 - `astral-identity/`: identity and session lifecycle.
 - `astral-trustgraph/`: governance, authority, audit, and projection services.
 - `astral-monitor/`: monitoring and alerting.
+- `astral-single-node/`: composite single-process runtime assembled from the Gateway, Identity, and TrustGraph services.
+- `astral-sdk-contracts/`, `astral-sdk/`, and `astral-sdk-axum/`: signed authorization-manifest contracts, a Rust client, and Axum integration helpers for application services.
 - `e2e-bootstrap/`: isolated bootstrap entry point.
 - `bench/`: Rust comparison and load-generation crates, each outside the default members when documented by its manifest.
 - `testsuite/` (under `tests-suite/`): workspace member carrying the consolidated new suites (multi-tenant extreme, security premises).
@@ -189,6 +240,12 @@ use [`Docs/README.md`](Docs/README.md) for the Rust documentation index.
 [`PROVENANCE.md`](PROVENANCE.md) records the copy boundary and excluded runtime
 artifacts. The authorization validation protocols and model boundaries are under
 [`Docs/authorization-validation/`](Docs/authorization-validation/).
+
+For cross-cutting implementation analysis and measured performance, see the
+[2026-10-25 technical-topic analysis](Docs/技术专题解析与架构取舍_2026-10-25.md)
+and the [PolicyEngine execution-time capability curve](Docs/实验/基准测试/授权执行期能力曲线_20261025.md).
+The first distinguishes current Rust evidence from migration decisions and candidates;
+the second is a local CPU fixture measurement, not HTTP throughput or production capacity.
 
 ## Licensing
 

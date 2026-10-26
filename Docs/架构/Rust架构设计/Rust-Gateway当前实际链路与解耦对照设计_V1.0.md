@@ -91,7 +91,7 @@ resolver = "2"
 | 配置 | `astral-common/src/config/mod.rs` | `AppConfig`、`JwtConfig`/`JwtTokenProfile`、`GatewayCfg`、`session_grant_claims_mode`、密钥占位符校验 |
 | 统一响应契约 | `astral-common/src/contract/mod.rs` | `ApiResponse<T>`、`PageResponse<T>`、`PaginationParams` |
 | 统一错误 | `astral-common/src/error/mod.rs` | `AppError`、`global_exception_handler` |
-| 共享权限检查 | `astral-common/src/middleware/permission_check_shared.rs` | `physical_policy_context`、`resolve_permission_action`、`check_permission`、`validate_path_map` |
+| 权限上下文 / 路由 helper | `astral-common/src/middleware/permission_check_shared.rs` | `physical_policy_context`、`resolve_permission_action`、`validate_path_map`；公开的 `permission_check_shared::check_permission` 保留为兼容入口，其 context ownership 为 `Unresolved`，不能替代服务 owner resolver。另一个公开 helper `astral_common::middleware::permission::require_permission` 也不能替代服务 owner resolver；当前无仓内调用方 |
 | 审计 | `astral-common/src/audit.rs` | `AuditDualWrite`（MQ-first / DB-fallback）、`record_permission_audit` |
 
 ### 3.2 Gateway 依赖图（当前）
@@ -104,7 +104,7 @@ astral-gateway (bin)
 
 astral-common（被 Gateway 与所有下游服务共享）
   ├─ astral-types        # PolicyError / PolicyContext / ResourceRegistry
-  ├─ policy-engine       # PolicyEngine（permission_check_shared / service 依赖）
+  ├─ policy-engine       # PolicyEngine（service / permission middleware 依赖）
   ├─ redis / jsonwebtoken / hmac / sha2 / hex
   └─ axum / reqwest / tower / config / ...
 ```
@@ -222,10 +222,9 @@ AppUser 不注入 user-card 三头（claims 校验已强制其为空）。
 
 #### ⑧ physical_policy_context / PolicyEngine
 
-- 下游服务中间件（`astral-learn/src/middleware.rs`、`astral-chat/src/middleware.rs`、`astral-identity/src/middleware.rs`、`astral-trustgraph/src/api/permission_check.rs`）先按各自 `*_PATH_MAP` 把路径解析为 `(resource, action)`（`resolve_permission_action` 做业务动作覆盖，如 `learn_level_play`→`play`），再调用 `physical_policy_context(headers, resource, action, target_id)` 构建 `PolicyContext`：
-  - PlatformUser：`x-user-id` / `x-principal-kind` / `x-identity-card-id` 缺失 → 401；`x-user-card-id` / `x-user-card-tenant-id` / `x-user-card-domain-id` 缺失 → 403；三者组成完整物理双卡上下文。
-  - AppUser：返回 identity-only 上下文（三个 user-card 字段为 None），进入引擎后由 `CARD_REQUIRED` 拒绝（除 Learn app-users 的 `APP_USER` 放行分支）。
-- 随后调 `PolicyEngine::evaluate(&ctx, &repo)`（`policy-engine` crate），按 前置校验 → `check_card_active`（权威双卡 SQL）→ 投影门禁（`authorization_projection_head`）→ L1 规则集（OVERLAY DENY→ALLOW→BASE DENY→ALLOW）→ L2 `permission_rule` → L2.5 委托 → `DEFAULT_DENY` 评估。
+- 下游服务中间件（Identity、Monitor、TrustGraph、Learn、Chat）先按各自 path map 解析 `(resource, action)`，再调用 `physical_policy_context(headers, resource, action, target_id)` 构建 actor `PolicyContext`。PlatformUser 缺少身份头返回 401、缺少任一 user-card 头返回 403；AppUser 返回 identity-only 上下文（三个 user-card 字段为 None）。共享 helper 将 `resource_ownership_scope` 留为 `Unresolved`，不替服务证明目标归属。
+- 各服务先用自己的 owner resolver 解析目标并将结果应用到 context；resolver 未解析/不可用时拒绝或 defer。只有 owner resolution 满足资源合同后才调用 `PolicyEngine::evaluate(&ctx, &repo)`。TrustGraph、Identity、Monitor、Learn 的顺序分别由 [`permission_check.rs`](../../../astral-trustgraph/src/api/permission_check.rs)、[`identity middleware`](../../../astral-identity/src/middleware.rs)、[`monitor middleware`](../../../astral-monitor/src/middleware.rs)、[`Learn middleware`](../../../astral-learn/src/middleware.rs) 执行；Chat WebSocket 对每帧 conversation target 单独解析并重验。
+- 引擎评估按 AUTHN/上下文前置校验 → `check_card_active`（权威双卡 SQL）→ published-evidence strict gate（正式 `SqlxRuleRepository`）→ 兼容/诊断路径的规则阶段 → `DEFAULT_DENY` 执行；不得将未解析的 actor context 直接当作目标资源授权上下文。
 - Learn/Chat/Identity 中间件在 evaluate 后还执行 SoD 冲突检查（`check_sod_conflict`，失败 fail-closed 503）。
 
 #### ⑨ 业务 handler / 审计
@@ -458,7 +457,7 @@ AppUser 不注入 user-card 三头（claims 校验已强制其为空）。
 
 ### 8.1 禁止的直接操作
 
-1. **禁止绕过 Gateway 直接修改/伪造身份头**：下游任何服务不得信任客户端直连时的 `x-user-*`/`x-gateway-*` 头（网关最内层剥离）；不得在业务 service 内绕过 `physical_policy_context` + `PolicyEngine::evaluate` 直接查 `permission_rule` 做授权判定（AGENTS.md §3.5）。
+1. **禁止绕过 Gateway 直接修改/伪造身份头**：下游任何服务不得信任客户端直连时的 `x-user-*`/`x-gateway-*` 头（网关最内层剥离）；不得在业务 service 内绕过 `physical_policy_context`、服务 owner resolver 与 `PolicyEngine::evaluate` 直接查 `permission_rule` 做授权判定（AGENTS.md §3.5）。
 2. **禁止超管特判**：任何代码路径禁止检测 `SUPER_ADMIN`/`isSuperAdmin()` 直接放行；`derive_action_codes` 不得返回特权动作码（AGENTS.md §3.8，违规 P0）。
 3. **禁止在 Git 跟踪文件中硬编码密钥/IP**：`astral-common/src/config/mod.rs` 已有占位符校验（`is_placeholder_secret`）；`application.yml` 已 `.gitignore`，不得提交。
 4. **禁止直接改 Redis key/TTL 或 gateway_signature payload**：必须走阶段 A 冻结 → B 拆分 → C 迁移，任何一步都不得先于 golden 测试。Gateway HMAC v3 与 `astral-internal-v1` internal assertion 是不同协议，任一 canonical payload、头语义或密钥边界变更都要求对应 producer/consumer lockstep 同批升级。
@@ -541,7 +540,7 @@ astral-gateway（监听端口 9001）                              astral-gatewa
      astral-trustgraph :9005 │ astral-identity :9004 │ astral-learn :9002
      astral-chat :9003 │ astral-monitor :9006（learn / chat 源码暂 exclude，仅作示例）
 
-   每个下游统一按以下顺序执行（astral-common 共享中间件 + 各服务权限中间件）；
+   每个下游统一按以下顺序执行（共享验签/上下文 helper + 各服务 owner-aware 权限中间件）；
    例外：Identity 对 `/sessions/refresh`、`/sessions/switch-card` 等凭证引导路径
    （`IDENTITY_SKIP_PATHS` + `is_credential_bootstrap_path`）直接放行到业务 handler，
    不进入第 2~5 步的授权链（见下方图例注释 6）：
@@ -549,9 +548,10 @@ astral-gateway（监听端口 9001）                              astral-gatewa
       x-gateway-auth==verified → ts 容差 30s → 常量时间重算 v3 比对
       （失败 403 GATEWAY_AUTH_INVALID / GATEWAY_SIGNATURE_MISSING /
         GATEWAY_TIMESTAMP_SKEW / GATEWAY_SIGNATURE_MISMATCH）
-   2) 权限中间件：路径 → (resource, action)（resolve_permission_action）
-      → physical_policy_context 从已验签头构建 PolicyContext
+   2) 服务权限中间件：路径 → (resource, action)（共享 resolve_permission_action helper）
+      → physical_policy_context 从已验签头构建身份/双卡上下文
         PlatformUser：缺 user-card 三头 → 403；AppUser：identity-only 上下文
+      → 服务专属 owner resolver 确认目标所有权，失败时拒绝或 defer
    3) correspondence / 物理双卡资格：identity_card 身份事实 + user_card 授权/组织事实
       （不做 identity 侧 tenant/domain 互匹；组织归属只来自 user-card）
       → check_card_active_cached[_with_options]（权威 SQL + perm:card:active ELIGIBILITY 资格缓存，
@@ -578,7 +578,7 @@ Redis：jwt:revoked:{jti}(7d) / access:jti:{jti}（==sub，token TTL）/ access:
 **图例 / 事实注释**：
 
 1. **Gateway 只负责认证 / 会话 / 转发，不做最终资源授权**：`jwt_auth_middleware` 只校验凭证、判定会话有效性、注入身份头并签名转发；`x-action-codes` 当前恒为 `"read"`（`derive_action_codes` 恒返回 `"read"`，`astral-gateway/src/middleware.rs`），仅兼容透传，不作放行条件（§5.2）。
-2. **最终授权唯一发生在下游 PolicyEngine**：下游 `gateway_signature_middleware` 验签后，由 `physical_policy_context` 构建授权上下文并交给 `PolicyEngine::evaluate` 产出 ALLOW/DENY（`astral-common/src/middleware/permission_check_shared.rs` + `policy-engine` crate）；Gateway 进程内不存在任何资源/动作授权判定。
+2. **最终授权唯一发生在下游 PolicyEngine**：下游 `gateway_signature_middleware` 验签后，各服务权限 middleware 解析资源/action、构建双卡上下文并经服务专属 owner resolver 确认目标所有权，随后交给 `PolicyEngine::evaluate` 产出 ALLOW/DENY（共享 helper 位于 `astral-common/src/middleware/permission_check_shared.rs`）；Gateway 进程内不存在任何资源/动作授权判定。
 3. **D1 已收敛：`astral-db::CardEligibilityService` 已实现**（`astral-db/src/eligibility.rs`，见修正记录问题 14）：`verify_platform_card_pair`（单条权威 SQL：identity 身份事实 + user_card 授权/组织事实 + 对应关系证明，**identity 不读 tenant/domain**）已被 login / refresh / switch-card 三处签发统一复用（login `auth_service.rs::login_inner`、refresh/switch `srv/session.rs`），switch 签发前补 tenant/domain ACTIVE 校验；`check_cached`（兼容 wrapper `check_card_active_cached[_with_options]`）供 PolicyEngine / Chat 运行期复用。**Gateway 本身不执行资格投影**，本链路图只记录签发侧调用事实与运行期资格 helper。
 4. **`perm:card:active:{card_id}` 是资格缓存，不是规则快照**（`astral-db/src/eligibility.rs`）：payload 明确 `projection_type=ELIGIBILITY`，绑定 ELIGIBILITY head 的 source/projected/revoke 版本与物理双卡上下文；自然到期由读时 SQL/时间检查 + TTL 截断 fail-closed；旧 `"1"`/`"0"` scalar 与旧 JSON（无 `projection_type`）一律 miss 回权威 SQL。运行期物理资格校验（身份事实 + 授权/组织事实 + 对应关系证明 + ELIGIBILITY 版本门禁）与签发期校验是两条独立路径，互不替代。
 5. **待运行验证项（对齐修正记录 问题 10/11，未擅自标为已修复）**：`/actuator/health` 未在 `route_credential_policy_with_config` 的 `APPROVED_PUBLIC_ROUTES` 中显式声明，若未被 `config.public_paths` 配置命中则按默认 `AccessOnly` 处理，无 token 时预期 401（健康 handler 不可达）；未知路径在 axum 默认 404 之前先被全局 JWT 中间件拦截（无 token 时预期 401 而非 404）。两者均为代码级观察，修正决策待定。

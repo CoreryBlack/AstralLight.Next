@@ -4,7 +4,7 @@
 > 日期：2026-08-10
 > 范围：基于 **v4 canonical 表架构**（`Docs/sql/full_schema_v4.sql`）筹划 **v5 模型修正**——未来专供 Rust 使用（Rust 独立演进，不要求 Java 同步）。
 > 依据：《Rust架构模型设计修正记录.md》问题 1-8、问题 14。
-> 状态：**部分实施/筹划中**；每项标注 决策/待定/前置条件（已完成项以「已完成」标注，未完成项保留 决策/待定/前置条件）。**2026-08-11 更新**：公共资格服务（D1）与 CARD/ELIGIBILITY 双投影通道已落地（见 §3.5、§四、§五），资格 fan-out / identity expiry / validity API 列为后续项。
+> 状态：**部分实施/筹划中**；本文保留各项决策/待定/前置条件。**历史状态记录（2026-08-11）**：公共资格服务（D1）与当时记载的 CARD/ELIGIBILITY 接线已落地；后续代码将旧 `ProjectionWorker` 的 CARD/RULE_SET 重建职责退役，并将正式授权读面迁至 `AuthorizationProjector` + strict published evidence，详见当前源码校准后的架构设计与修正记录。身份组织列的 guarded-drop migration 文件现已存在于当前仓库，但本次未连接/检查任何目标数据库，数据库应用状态未知；代码接线不代表迁移或部署验收。
 
 ---
 
@@ -28,7 +28,7 @@
 
 | 表 | v4 关键列 | 现状问题（v5 动因） |
 |----|----------|---------------------|
-| `identity_card` | domain_id（注释"默认领域上下文"）、tenant_id、status、token_version、expires_at、disabled_reason | tenant/domain **无人写入**；Rust 曾读取（问题 1/2）——代码层已移除读取/写入（见 §3.1 状态） |
+| `identity_card` | v4 canonical 有 domain_id（注释"默认领域上下文"）、tenant_id、status、token_version、expires_at、disabled_reason；Rust migration 中存在 guarded-drop artifact | tenant/domain **无人写入**；Rust 已移除读取/写入；迁移文件存在不等于任何目标库已应用（见 §3.1） |
 | `user_card` | domain_id、tenant_id、card_type、card_status、template_id、level_id、priority、is_primary、valid_from/valid_until | 组织归属唯一承载点（v5 强化）；starter 卡 tenant/domain 为 NULL |
 | `auth_device_session` | current_user_card_id（注释"当前激活的用户卡ID"）、refresh_token_hash、session_version/epoch、family_id | 已绑 user_card，语义正确；v5 明确"会话只绑 user_card" |
 | `auth_token_family` | family_id、user_id、family_key、status、revoked_at | 无问题；保持 |
@@ -36,7 +36,7 @@
 | `card_rule_set_ref` | card_id（用户卡）、rule_set_id、ref_type BASE/OVERLAY、tenant_id | 评估不依赖其 tenant_id（user_card 为源）；保持 |
 | `rule_set` / `rule_set_entry` / `rule_set_snapshot` | tenant_id、resource/action/effect/condition/priority/valid_from/valid_to | tenant_id 仅管理用途；保持 |
 | `permission_rule` / `permission_rule_snapshot` | card_id（用户卡）、resource、action、effect、valid、tenant_id | 评估不依赖其 tenant_id；保持 |
-| `authorization_projection_head` | aggregate_type/aggregate_id、source/projected generation、revoke_fence、status（Rust migration 20260729000003） | 语义为 **CARD（user_card）** + **ELIGIBILITY（资格，2026-08-11 新增）** 双聚合通道（`ProjectionAggregate::Card/Eligibility`，见 `astral-types/src/projection.rs`） |
+| `authorization_projection_head` | aggregate_type/aggregate_id、source/projected generation、revoke_fence、status（Rust migration 20260729000003） | 旧 head/outbox 支持 **CARD（user_card）**、**ELIGIBILITY（资格）**、**RULE_SET** 三种聚合；当前 TrustGraph worker 只保留 ELIGIBILITY 资格缓存失效，CARD/RULE_SET writer-correlation 事件终态标记。该表不是生产 strict authorization read gate；生产 reader 消费 canonical published evidence。类型定义见 `astral-types/src/projection.rs` |
 | `chat_conversation` | **domain_id NOT NULL、无 tenant_id**、owner_id、status、is_deleted | 问题 3：无 tenant 归属 |
 | `chat_conversation_member` | conversation_id、user_id（UNIQUE）、role、left_at、invite_by | 用户级成员；v5 决策见 §3.4 |
 | `chat_message` | conversation_id、sender_id、domain_id NOT NULL、message_id UUID | 已 scope（domain）；保持 |
@@ -44,7 +44,7 @@
 ### 2.2 关键漂移事实（问题 2）
 
 - Rust baseline（20240630000001_baseline.sql）identity_card 仅 id/user_id/card_number/password_hash/real_name/status/valid_from/valid_until/deleted_at——**连 tenant_id/domain_id/expires_at/token_version 都没有**，与 canonical 严重不一致。
-- `authorization_projection_head`、`auth_session_jti_index` 仅在 Rust 自有 migration 定义，canonical 无——**Rust 已在 v4 之上独立加表**，v5 是把这层独立正式化。
+- `authorization_projection_head`、`auth_session_jti_index` 仅在 Rust 自有 migration 定义，canonical 无——**Rust 已在 v4 之上独立加表**，v5 是把这层独立正式化。`authorization_projection_head` 属于旧 source-head/outbox 与 compatibility/oracle 边界，不是当前生产授权读门；生产 strict reader 消费 canonical published evidence。
 
 ---
 
@@ -54,13 +54,13 @@
 
 | 项 | v4 | v5 决策 | 理由 |
 |----|----|--------|------|
-| `tenant_id` | 列存在（NULL，无人写） | **Rust 不再读取/写入**；列保留（Java 兼容）或标注 DEPRECATED | 身份证不承担组织归属（问题 1） |
-| `domain_id` | 列存在（注释"默认领域上下文"） | **Rust 不再读取**；同上去语义 | 同上 |
+| `tenant_id` | v4 canonical 列存在（NULL、无人写）；另有 guarded-drop migration artifact | **Rust 不再读取/写入**；当前 Rust migration 选择 guarded drop；Java/共享部署兼容性仍需按目标环境验证 | 身份证不承担组织归属（问题 1） |
+| `domain_id` | v4 canonical 列存在（注释"默认领域上下文"）；另有 guarded-drop migration artifact | **Rust 不再读取**；当前 Rust migration 选择 guarded drop；不能据此推断目标数据库已执行 | 同上 |
 | `expires_at` | 列存在 | 保留；**补索引**（登录/refresh 频繁过滤） | 身份过期校验是硬约束 |
 | `token_version` | 列存在 | 保留 | 会话撤销用 |
 | 新增 | — | 无 | 不引入新身份属性 |
 
-**状态：部分实施/决策（已完成：代码层移除依赖）**——Rust 代码层已不再读取/写入 identity tenant/domain（claims/header/ctx/ChatScope 已同步，问题 1 修正已落地）；`identity_card.expires_at` 保留并待补索引；列保留/删除仍是 Java 兼容与 schema 决策（本筹划仅作决策，不代表 DDL 已完成）。
+**状态：部分实施/决策**——Rust 代码层已不再读取/写入 identity tenant/domain（claims/header/ctx/ChatScope 已同步）；仓库已有 `astral-db/migrations/20260830000001_identity_card_dual_card_separation.sql`，其 guarded-drop 目标是移除 `identity_card.domain_id`、`tenant_id` 及相应索引/外键。迁移 artifact 存在不等于 DDL 已在数据库执行；本次未检查目标库，应用状态未知。Java/共享部署兼容性仍是上线前核验事项；`identity_card.expires_at` 索引和其他 schema 对齐仍待实施。
 
 ### 3.2 user_card — 组织归属唯一承载点
 
@@ -99,7 +99,7 @@
 | 表 | v5 决策 |
 |----|--------|
 | `card_rule_set_ref` / `rule_set` / `rule_set_entry` / `permission_rule` | 评估链**不读**这些表的 tenant_id；租户上下文统一来自 `user_card.tenant_id/domain_id`（配合 `tenant`/`tenant_domain_map` 校验）。表的 tenant_id 保留作管理/审计用途 |
-| `authorization_projection_head` | 保持（aggregate 语义 = user_card）；如未来需要按 tenant 投影可加 tenant_id 列（暂不） |
+| `authorization_projection_head` | 保持为旧 CARD/ELIGIBILITY/RULE_SET source-head 与 compatibility/oracle gate；不表示生产授权读门。生产 strict reader 消费 canonical published evidence。该 head 的 aggregate_id 按类型对应 user_card、资格卡或 rule_set；如未来需要按 tenant 投影可评估 tenant_id（暂不） |
 | 运行期物理资格校验（`check_card_active`/`check_card_active_cached`） | 当前语义：identity_card 做归属/ACTIVE/expires_at，user_card 做归属/ACTIVE/有效期/tenant/domain 有效（含 `tenant`/`tenant_domain_map` ACTIVE）；**双卡 tenant/domain 互匹断言已撤销**，不再比对身份侧租户（问题 1 修正）；`check_card_active_cached` 委托 `CardEligibilityService::check_cached`，资格缓存绑定 **ELIGIBILITY head**（`projection_type=ELIGIBILITY`） |
 | D1 `CardEligibilityService::verify_platform_card_pair` | **已实现（2026-08-11）**：`astral-db::CardEligibilityService`（`astral-db/src/eligibility.rs`）提供 `verify_platform_card_pair`（login/refresh/switch-card 三处复用）与 `check_cached`（兼容 wrapper `check_card_active_cached[_with_options]`，PolicyEngine/Chat 复用）；权威 SQL 只读 identity 身份事实 + user_card 授权/组织事实，identity 不读 tenant/domain |
 
@@ -136,10 +136,11 @@
 3. [已完成] D1 `CardEligibilityService::verify_platform_card_pair` 按新语义统一落地（`astral-db/src/eligibility.rs`），login/refresh/switch-card 三处复用，switch 签发前补 tenant/domain ACTIVE 校验（修正记录问题 14）。
 > 核实：当前未发现 Rust v3 变更所需的 Java 依赖（静态扫描未见 Java 依赖 identityTenantId/identityDomainId），但最终兼容仍需部署/集成验证，未完全确认；部署库 schema 现状核实见问题 2 前置。
 
-### Phase B — schema 对齐（v5 DDL）——**待实施**
-1. [待实施] 发布 v5 增量 migration：identity_card 索引（expires_at）、user_card `(tenant_id, domain_id)` 索引。
-2. [待决策/待实施] Chat conversation tenant_id（若 §3.4 决策加）。
-3. [待实施] Rust baseline 与 v5 合一（消除问题 2 漂移）。
+### Phase B — schema 对齐（v5 DDL）——**部分 migration artifact 已存在，目标库状态未知**
+1. [artifact 已存在；数据库应用状态未知] `20260830000001_identity_card_dual_card_separation.sql` 提供 guarded drop，移除 identity_card 旧 tenant/domain 列及依赖索引/外键；不得把文件存在写成已执行。
+2. [待实施] identity_card `expires_at` 索引、user_card `(tenant_id, domain_id)` 索引及其他 v5 增量 migration。
+3. [待决策/待实施] Chat conversation tenant_id（若 §3.4 决策加）。
+4. [待实施] Rust baseline 与 v5 合一（消除问题 2 漂移）。
 
 ### Phase B（后续）— 资格事件 fan-out / identity expiry / validity API——**待实施**
 1. [待实施] tenant/domain status 变化对 user_card 影响范围的可靠 fan-out（当前依赖运行期 JOIN；CARD/ELIGIBILITY 事件仅覆盖 user_card 自身状态/绑定变更，**未覆盖 tenant/domain status fan-out**，不得写成 ELIGIBILITY 事件已覆盖）。
@@ -155,7 +156,7 @@ Chat scoped 仍处于冻结/待解冻状态；解冻后按修正记录问题 3 �
 
 | 决策点 | 选项 | 建议 |
 |--------|------|------|
-| identity_card.tenant/domain 列保留 or 删除 | a) 保留标注 DEPRECATED（Java 兼容） b) 删除（纯 Rust 库） | **a**（专供 Rust 但部署库可能仍与 Java 共享） |
+| identity_card.tenant/domain 列的部署处置 | v4 canonical 保留；当前 Rust 有 guarded-drop migration artifact；共享 Java 部署兼容性需单独核验 | Rust migration 已选择 guarded drop；目标库是否已应用未知，不能由文件推断 |
 | user_card tenant/domain 必填约束 | a) 平台卡必填 b) 全保持可空 | **a**，starter 卡例外 |
 | chat_conversation 加 tenant_id | a) 加 b) 不加（domain 即 scope） | **待定**：先核实"domain 是否唯一映射 tenant" |
 | platform_user↔tenant 成员关系表 | a) 新增 b) 经 user_card 表达 | **b**（当前无需求）；需求出现再加 |
@@ -169,7 +170,7 @@ Chat scoped 仍处于冻结/待解冻状态；解冻后按修正记录问题 3 �
 - [x] Rust 代码层移除 identity tenant/domain 读取/写入（claims/header/ctx/ChatScope 已同步，问题 1 修正）
 - [x] `check_card_active`/相关物理资格校验撤销双卡 tenant/domain 互匹断言（identity_card 归属/ACTIVE/expires_at + user_card 归属/ACTIVE/有效期/tenant/domain 有效）
 - [x] D1 统一 `CardEligibilityService`（`astral-db/src/eligibility.rs`）：`verify_platform_card_pair` login/refresh/switch-card 三处复用，`check_cached` 供 PolicyEngine/Chat 复用（修正记录问题 14）
-- [x] CARD/ELIGIBILITY 双投影通道落地：`astral-types::ProjectionAggregate::Card/Eligibility`，公共事务 helper `astral-db::append_projection_event_in_tx`，TrustGraph 单 worker 按 aggregate 分派（CARD 重建规则快照 + 完整 evict + CARD refresh；ELIGIBILITY 仅 evict `perm:card:active`）
+- [x] CARD/ELIGIBILITY source 事件接线（2026-08 历史记录）：`astral-types::ProjectionAggregate::Card/Eligibility` 与公共事务 helper `astral-db::append_projection_event_in_tx` 已建立。**当时**的 TrustGraph worker 描述为按 aggregate 处理 CARD 快照重建/evict/refresh 与 ELIGIBILITY 资格缓存失效；该旧 CARD/RULE_SET 投影职责现已退役。当前旧 `ProjectionWorker` 对 CARD/RULE_SET writer-correlation 事件只做终态标记，ELIGIBILITY 分支只失效 `perm:card:active`；正式授权 mutation 由 `authorization_delta_event` → `AuthorizationProjector` 发布 canonical manifest/segment/current-pointer，生产 reader 消费 strict published evidence。源码接线不等于数据库迁移、worker 运行或真实集成验收。
 - [x] Identity starter card、user_card create/status 与 TrustGraph user-card status/create/delete/restore/bind、global-admin card status 写路径同事务写 CARD + ELIGIBILITY 事件
 
 ### 待实施
@@ -184,5 +185,5 @@ Chat scoped 仍处于冻结/待解冻状态；解冻后按修正记录问题 3 �
 ### 待决策
 - [ ] 核实部署库 identity_card/user_card 实际 schema（问题 2 前置）
 - [ ] 核实 "domain → tenant 是否唯一映射"（决定 chat conversation tenant_id，§3.4）
-- [ ] identity_card.tenant/domain 列保留 or 删除（Java 兼容与 schema 决策；本筹划仅作决策，DDL 未实施）
+- [ ] 核验 `20260830000001_identity_card_dual_card_separation.sql` 在目标环境的应用状态，以及 Java/共享库对 guarded-drop 列删除的兼容性；artifact 已存在，不得视作数据库验收
 - [ ] 部署/集成层面最终兼容性验证（当前仅静态扫描未见 Java 依赖 identityTenantId/identityDomainId，未完全确认）

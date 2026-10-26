@@ -67,15 +67,16 @@ Chat 冻结期内保持现状并记录为已知边界（消息链路已 fail-clo
 ## 问题 4 — 引擎 L2 失败可被委托遮蔽（R2，已修正）
 
 ### 问题陈述
-`load_permission_rules`（L2）失败仅记录 repo_error 继续 L2.5；若委托 ALLOW 命中，最终仍 ALLOW——依赖故障可被委托遮蔽。
+**历史问题（2026-08 基线）**：当时的 `load_permission_rules`（L2）错误路径只记 repository error 并继续 L2.5；若委托 ALLOW 命中，最终仍可能 ALLOW，依赖故障可能被委托遮蔽。该描述是当时源码快照，不代表当前 checkout。
 
 ### 核实记录
-- engine.rs L2 Err → repo_error，继续 L2.5；L2.5 命中 ALLOW → allow。
-- L1 快照失败已 DENY 不降级；L2/L2.5 是两个独立聚合的独立读取。
+- 2026-08 记录观察到 legacy L2 Err → repository error → L2.5；L2.5 命中 ALLOW 可返回 allow。
+- 当前保留 L1/L2/L2.5 兼容路径在 `policy-engine/src/engine/formal.rs:587-610` 对 L2 读取错误立即返回 `DEPENDENCY_UNAVAILABLE`，不继续 L2.5。
+- 生产 `SqlxRuleRepository` 声明 strict published-evidence capability，在 `formal.rs:449-468` 直接进入正式已发布证据读门；不使用旧 L1/L2/L2.5 reader，也不从旧快照、raw source 或普通缓存回退。
 
 ### 修正决策
-L2 repository error 必须在进入 L2.5 delegation 前终止授权聚合，返回 `DEPENDENCY_UNAVAILABLE`/PENDING；只有 L2 明确无匹配时才允许继续读取 L2.5。L2.5 使用 generation-gated projected delegation reader，raw/source reader 仅供 realtime/一致性巡检，不得作为正式授权 fallback。
-- **状态：已实施（2026-08-22）**：`PolicyEngine` 在 L2 snapshot 读取错误时 fail-closed，正式 delegation 读取验证 CARD generation、source/projection 一致性和 snapshot rows；L2 error 不再被委托 ALLOW 遮蔽。
+L2 repository error 在进入 L2.5 delegation 前终止兼容评估并返回 `DEPENDENCY_UNAVAILABLE`；只有 L2 明确 no-match 时才继续兼容 L2.5。正式生产授权只消费 strict published evidence。旧的 generation-gated projected delegation 路径留作历史实现记录，不将其写成当前生产读门。
+- **状态：L2 fail-closed 在当前代码层已实施；生产 strict path 已接线。本记录不构成真实数据库、集成或部署验收。**
 
 ---
 
@@ -205,22 +206,22 @@ login/refresh/switch-card 三路径签发时未强制 identity_card 与 user_car
 ## 问题 12 — identity_card / user_card 双线路与对应关系证明边界
 
 ### 问题陈述
-当前鉴权链路中 identity_card 与 user_card 的事实确认、双卡对应关系证明与授权判断在实现层合并，职责边界未显式化——身份线路易被误认为可提供组织/授权事实，授权线路易在对应关系证明前被提前触发。
+原始审查将 identity_card 与 user_card 的资格事实、双卡对应关系和目标授权判断视作可能混合的实现边界。该问题陈述保留为设计动因；当前核对需分别检查主体资格证明和目标资源 ownership 证明，不能把共享上下文 helper 当作二者的替代。
 
 ### 核实记录
 - 问题 1 已确认 identity_card 回归纯身份证（user_id/status/token_version/expires_at），不承担 tenant/domain；组织归属由 user_card 唯一承载。
 - 问题 8 已将签发校验（CardEligibilityService）简化为 identity_card 校验 + user_card 校验（归属/状态/有效期/scope 有效），不再比对身份侧租户。
-- 当前代码映射：`physical_policy_context` 从已验签头构造物理上下文；`check_card_active`/Repository 权威校验逻辑上承担身份事实、用户卡事实与双卡对应关系的联合证明；`PolicyEngine` 承载后续规则集评估。
-- PlatformUser 与 AppUser 线路差异：AppUser 仅可达 identity-only 路径（问题 6 已记录），无 user_card 事实来源。
+- 当前代码映射：`physical_policy_context` 从已验签头构造 actor 上下文，受保护请求的 ownership 初始为 `Unresolved`；服务专属 `resolve_resource_ownership()` 按路由合同从服务端权威数据证明目标归属，然后才调用 `PolicyEngine.evaluate()`。`CardEligibilityService`/Repository 的双卡检查证明身份事实、user_card 资格与双卡对应关系；这是主体资格证明，不等于目标资源 owner proof。
+- PlatformUser 与 AppUser 线路差异：AppUser 仅可达 identity-only 路径（问题 6 已记录），无 user_card 事实来源；需要 user_card 的正式授权目标不能由 AppUser 上下文伪造。
 
 ### 修正决策
 - **identity_card 线路只确认身份事实**：用户、身份卡归属、状态、expires_at、会话身份锚点；identity_card 不承担 tenant/domain，不负责资源、动作、rule_set 或授权结论。
 - **user_card 线路只确认授权与组织事实**：用户卡归属、状态、valid_from/valid_until、tenant/domain 及组织状态；它是后续授权主体，但在线路本身只确认事实，不提前做资源权限判断。
 - **中间层是"对应关系证明"**：证明 identity_card 与 user_card 属于同一 user_id，并与当前 Token/SessionGrant 声明一致；tenant/domain 来源只能是 user_card；不得用 identity_card 回退或提供组织范围。
 - **对应关系证明成功后，才进入 `user_card + 对应 rule_set` 的授权线路**：解析 resource/action/target，解析 BASE/OVERLAY rule_set，执行规则集、permission_rule、委托和 DEFAULT_DENY；资源和权限属于 user_card 授权线路，不属于 identity_card 线路或对应关系证明层。
-- **当前代码映射**：`physical_policy_context` 负责从已验签头构造上下文；`check_card_active`/Repository 权威校验逻辑上承担身份事实、用户卡事实与双卡对应关系的联合证明；`PolicyEngine` 后续规则集评估应被记录为 user_card 授权阶段。若当前实现把这些步骤合并，明确这是实现合并而非职责混淆的目标边界。
-- **平台用户与 App 用户**：PlatformUser 必须走完整两条事实线路并通过对应关系；AppUser 只有 identity-only 线路，不能伪造 user_card，进入需要 user_card 的授权线路应拒绝或走明确的 AppUser 专用路径。
-- **状态：方案已确认，代码边界拆分待实施**
+- **当前代码边界**：`physical_policy_context` 仅从已验签头构造 actor context，ownership 保持 `Unresolved`；服务专属 owner resolver 按目标 route contract 证明资源归属。`CardEligibilityService`/Repository 负责双卡资格与对应关系证明，`PolicyEngine` 负责后续授权证据判定。共享 helper 不证明 owner；资格检查与目标 owner resolver 已在调用链职责上分层，未主张全部领域读取已拆成独立 SQL 或模块。
+- **平台用户与 App 用户**：PlatformUser 必须通过双卡资格证明；AppUser 只有 identity-only 线路，不能伪造 user_card，进入需要 user_card 的正式授权路径应拒绝或走明确的 AppUser 专用路径。
+- **状态：职责边界已有代码接线；部署/真实集成验收不由静态源码核对替代。**
 
 ---
 
@@ -245,7 +246,7 @@ login/refresh/switch-card 三路径签发时未强制 identity_card 与 user_car
 
 ---
 
-## 问题 14 — 公共资格服务 + CARD/ELIGIBILITY/RULE_SET 三条投影通道（D1 落地与分离）
+## 问题 14 — 公共资格服务与旧 CARD/ELIGIBILITY/RULE_SET 投影职责（D1 落地与分离）
 
 ### 问题陈述
 问题 8 的 D1 统一签发校验与运行期资格校验需要单点权威实现；同时 `perm:card:active:{card_id}` 此前被 `check_card_active_cached` 当作"投影缓存"误绑定 CARD projection head，卡片资格（身份过期/user_card 有效期）是**时间函数**而非事件驱动快照，需要与规则快照（`rule_set_snapshot`/`permission_rule_snapshot`）分离为独立通道，避免"资格事件触发全量规则重建 / CARD refresh"的过度失效。
@@ -256,23 +257,23 @@ login/refresh/switch-card 三路径签发时未强制 identity_card 与 user_car
   - `check_cached`：运行期资格检查（时间感知 `perm:card:active:{card_id}` 缓存 + 权威 SQL 回退），兼容 wrapper `check_card_active_cached[_with_options]`（`astral-db/src/repository.rs`）；
   - login（`astral-identity/src/srv/auth_service.rs::login_inner`）、refresh / switch（`astral-identity/src/srv/session.rs`）统一调用 `verify_platform_card_pair`；switch 签发前补 user_card tenant/domain ACTIVE 校验（原 `load_active_switch_cards` 缺口闭合）。
 - **资格缓存（不是规则快照）**：`perm:card:active:{card_id}` payload 明确 `projection_type=ELIGIBILITY`，绑定 ELIGIBILITY head 的 source/projected/revoke 版本 + 物理双卡上下文；自然到期由读时 SQL/时间检查 + TTL 截断（`min(identity.expires_at, user_card.valid_until)` 封顶）fail-closed；旧 `"1"`/`"0"` scalar 与旧 JSON（无 `projection_type`）一律 miss 回权威 SQL。
-- **投影通道（已建立）**：`astral-types::ProjectionAggregate::Card/Eligibility/RuleSet`（`astral-types/src/projection.rs`）为 head/outbox `aggregate_type` 唯一事实源；公共事务 helper `astral-db::append_projection_event_in_tx`（`astral-db/src/projection.rs`）与 source mutation 同事务写 head/outbox；TrustGraph 单 worker（`astral-trustgraph/src/service/projection_worker.rs`）按 aggregate 分派：
-  - **CARD 通道**：重建 `permission_rule_snapshot` + 完整 CARD 缓存 evict + 推进 CARD head + 发布现有 CARD `permission.refresh`；PolicyEngine 的 CARD projection gate、L1/L2/L2.5/DEFAULT_DENY 语义不变；
-  - **ELIGIBILITY 通道**：仅 evict `perm:card:active:{card_id}`（`side_effects::evict_eligibility_gate_cache`）+ 推进 ELIGIBILITY head，不重建规则快照、不发 CARD refresh；资格 head 不作为 PolicyEngine CARD gate（`check_cached` 内独立读取 ELIGIBILITY head，`require_projection_ready` 由调用方控制：Chat=true，PolicyEngine=false）；
-  - **RULE_SET 通道**：由 RuleSet source mutation 同事务写 RULE_SET head/outbox，worker 重建共享 `rule_set_snapshot`、写 `projection_generation`、记录 correlated rebuild audit、失效规则集/绑定卡缓存并推进 RULE_SET head；正式读侧逐绑定规则集检查 READY/代次/快照证明，未 READY 不回读 source 放行；
-  - 未知 aggregate fail-closed（release_failed 退避重试，绝不 mark processed）；`mark_aggregate_projected` 并发不推进时不发旧 CARD MQ、不标记 PROCESSED（superseded/retry 处置）。
+- **投影通道（当前源码状态）**：CARD/ELIGIBILITY/RULE_SET 是旧 projection head/outbox 的 aggregate 类型，但旧 `ProjectionWorker` 已不再负责 CARD/RULE_SET 授权快照构建；legacy/test CARD gate 与 realtime oracle 不作为生产 strict gate：
+  - 旧 **CARD/RULE_SET** writer-correlation 事件由 `projection_worker.rs` 终态 `mark_processed`；不重建 `permission_rule_snapshot`/`rule_set_snapshot`、不做旧缓存 evict、也不发布旧 CARD refresh；
+  - 旧 **ELIGIBILITY** 分支仍是 worker 的存续职责，只失效 `perm:card:active:{card_id}` 资格缓存；不重建规则快照、不发 CARD refresh。资格缓存另行校验 ELIGIBILITY 版本和有效窗，ELIGIBILITY head 不替代正式授权读门；
+  - 正式授权 mutation 走 `authorization_delta_event` 与 canonical `AuthorizationProjector`，编译并提交 manifest/segment/current-pointer。生产 `SqlxRuleRepository` 进入 strict published-evidence gate；旧快照、raw source 和普通缓存不是授权回退；
+  - 未知旧 outbox aggregate 仍 fail-closed 退避。源码接线不等于目标数据库迁移、worker 运行或真实集成验收。
 - **写路径接入（已建立）**：Identity starter card 注册、user_card create/status（`astral-identity/src/srv/auth_repository.rs`、`srv/card_repository.rs`）同事务写 CARD + ELIGIBILITY 事件；TrustGraph user-card status/create/delete/restore/bind（`astral-trustgraph/src/repository/user_card_repository.rs`，`patch_affects_eligibility` 判定 card_status 变更才发资格事件）与 global-admin card status（`repository/global_admin_repository.rs`）同样接入。
 
 ### 修正决策
-1. **资格服务与规则投影通道分离**：`perm:card:active` 为资格缓存（ELIGIBILITY head 门禁），卡级规则快照由 CARD 通道维护，共享规则集快照由 RULE_SET 通道维护；`20260822000002_snapshot_validity_windows.sql` 已为两张 snapshot 表补充 validity 列并修复可证明历史行，但当前 RuleSet worker INSERT 尚未写入 winner validity，且没有独立 wall-clock expiry scheduler/event，不能宣称 RuleSet 时间到期自动投影已完成。
+1. **资格缓存、授权发布与有效期边界分离**：`perm:card:active` 是资格缓存（ELIGIBILITY head 版本关联），不等同授权快照；旧 `ProjectionWorker` 不再重建 CARD/RULE_SET 快照。`20260822000002_snapshot_validity_windows.sql` 为旧 snapshot 表补充 validity 列并修复可证明历史行，但 legacy RuleSet snapshot INSERT 未持久化 winner validity。当前生产 strict published-evidence reader 在统一 UTC 读时检查 grant validity，证据缓存命中也会重新排除过期 grant，因此缺少到期调度器不等于读时仍会放行过期 grant。与 Delegation 已有专用 expiry reconciler 不同，RuleSet 自然到期后的 durable source mutation/expiry event、generation 推进、canonical publication 与审计收敛尚无闭环；Delegation 的对账不能替代 RuleSet 过期生命周期。不得将该缺口表述为读时过期授权问题，也不得宣称到期后的 RuleSet durable 状态会自动收敛。
 2. **D1 已收敛**：签发侧统一 `verify_platform_card_pair`，运行期统一 `check_cached`，两套路径同语义互为兜底。
 3. **五链边界**：
    - 调用链：三处签发调用方已统一到资格服务，错误映射 `map_eligibility_error`（NotEligible→业务码、Repository→Database，fail-closed）；
-   - 逻辑链：ELIGIBILITY 事件不触发 CARD 重建，CARD gate 语义不变；`patch_affects_eligibility` 保证非资格字段变更不误发资格事件；
+   - 逻辑链：ELIGIBILITY 事件不触发已退役的 CARD/RULE_SET 快照重建；legacy/test CARD gate 语义保持兼容，生产严格走 published-evidence gate；`patch_affects_eligibility` 保证非资格字段变更不误发资格事件；
    - 事故链：Redis 读失败/解析失败回权威 SQL（不因缓存拒绝合法授权，也不因缓存放行过期卡）；TTL 以自然到期截断；worker 未知 aggregate / stale mark 一律 fail-closed；
-   - 数据链：head/outbox 按 aggregate_type 分离，source mutation 与事件同事务；RULE_SET snapshot 以 `projection_generation` 绑定 head，validity migration 只修复可证明窗口行；缓存 payload 带 `projection_type`，旧 scalar/旧 JSON 显式 miss；
-   - 审计链：CARD refresh 仍发现有 permission.refresh；ELIGIBILITY 通道不发 CARD MQ；RULE_SET source/rebuild 使用 event/generation/operation correlation，资格与授权决策仍分别走既有审计链。
-- **状态：已实施（2026-08-11）**，`astral-learn`/`astral-chat` 处于 exclude 编译冻结态，完整 workspace 验证需在解冻后补做。
+   - 数据链：旧 head/outbox 按 aggregate_type 分离，source mutation 与旧 writer-correlation event 同事务；正式授权 evidence 由 canonical delta/projector 发布。旧 RULE_SET snapshot 的 `projection_generation` 绑定 head，validity migration 只修复可证明窗口行；资格缓存 payload 带 `projection_type`，旧 scalar/旧 JSON 显式 miss；
+   - 审计链：旧 CARD/RULE_SET writer-correlation 事件不再由 `ProjectionWorker` 发布 CARD refresh；ELIGIBILITY 分支仅失效资格缓存、不发 CARD MQ。当前授权发布由 `AuthorizationProjector` 关联 authorization event/generation/operation；RuleSet 自然到期尚缺 durable event、generation 与审计收敛闭环。Delegation 的专用 expiry reconciler 只处理委托，不覆盖 RuleSet。资格与授权决策仍分别走既有审计链。
+- **状态：双卡资格服务与旧 CARD/ELIGIBILITY source 事件接线记录为已实施（原记录日期 2026-08-11）；投影 consumer ownership 后续演进为“旧 worker 只保留 ELIGIBILITY 失效、canonical AuthorizationProjector 负责授权发布”**。`astral-learn`/`astral-chat` 的 exclude 编译冻结与真实集成验收状态须按当前验证记录另行判断；本条不作为当前 workspace 或部署验收证据。
 
 ### 未覆盖项（诚实保留，未写成 ELIGIBILITY 事件已覆盖）
 - tenant/domain status 变化**尚未**做可靠的 user_card 影响范围 fan-out（当前依赖运行期 JOIN；TrustGraph `update_tenant_status` 未写投影事件），不得宣称 ELIGIBILITY 事件已覆盖组织级停服。

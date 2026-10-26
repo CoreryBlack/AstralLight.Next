@@ -1,8 +1,8 @@
 # ORG_SCOPE 迁移与回滚操作手册（V0.1）
 
-> 状态：**文档就绪；真实迁移、演练均未执行（BLOCKED，待 Exec-L3）**。
+> 状态：**文档就绪；目标数据库是否已应用迁移未知；本次未执行真实迁移。真实 preflight、备份/恢复、回滚演练与集成验收仍未执行，后续执行须满足 Exec-L3 门禁。**
 > 对象：additive 迁移 [20260922000001_org_scope_authority.sql](../../astral-db/migrations/20260922000001_org_scope_authority.sql)（多租户改造 Phase 2，ORG_SCOPE 行政授权链 DB owner 切片）。
-> 交付状态（截至 2026-09-22）：迁移文件与全部 ORG_SCOPE 相关源码（迁移 SQL、`org_scope_repository`、org 治理 API/service、`org_admission`/`org_compiler`、`org_scope_projector`、preflight/回滚脚本及本手册）均为**当前工作区已创建、git 未跟踪（untracked）、尚未 stage/commit**。本文所有"完成"均指工作区状态，不等于已进入仓库提交历史；须由后续授权交付步骤完成 stage/commit，在此之前 release/CI checkout 不包含这些文件。**未对任何数据库应用**；应用与否属 Exec-L3 运维动作。本手册不记录服务器地址、凭据或连接串，数据库目标一律经 `ORG_MYSQL_URL` 环境变量注入。
+> 交付状态校准（2026-10-26）：2026-09-22 的原交付快照称这些 ORG_SCOPE 文件未跟踪；经当前仓库 `HEAD` 对象核对，迁移、源码、preflight 脚本及本手册现已进入提交历史。该仓库状态不证明任何目标数据库已应用迁移：真实数据库应用状态仍未知，本手册记录的真实 preflight、备份恢复、回滚演练及集成验收仍未执行。回滚由 `scripts/org_scope_preflight.sh rollback --i-understand-data-loss` 子命令完成，不存在独立 rollback 脚本。本手册不记录服务器地址、凭据或连接串，数据库目标一律经 `ORG_MYSQL_URL` 环境变量注入。
 > 关联：[Rust多租户聚合分区与组织层级设计_V0.1.md](../架构/Rust架构设计/Rust多租户聚合分区与组织层级设计_V0.1.md)（§4/§7 目标合同与 M2 状态）、[Rust后端编码规范_V1.0.md](../规范/Rust后端编码规范_V1.0.md)、[AGENTS.md](../../AGENTS.md)（Exec 分层、五链审查与迁移门禁）。
 
 ## 1. 迁移定位与边界
@@ -87,10 +87,9 @@
 
 | 动作 | 状态 |
 |------|------|
-| 迁移文件、preflight/回滚脚本、本手册在当前工作区创建 | 完成（截至 2026-09-22：迁移 SQL、脚本和手册均未提交；`migration.rs` 与本目录 README 为已跟踪文件的未提交修改；未触碰任何数据库） |
-| preflight 脚本离线契约验证（`ORG_SCOPE-PREFLIGHT-OFFLINE-20260922`） | **PASS**：`bash -n scripts/org_scope_preflight.sh`、`bash scripts/org_scope_preflight.sh self-test`、URI 连接参数/`MYSQL_PWD` 静态断言及无 CRLF 检查均通过；本机缺少 `mysql` 客户端时 `preflight` 在任何 DB 调用前 fail-closed。该证据仅覆盖脚本语法与 URI 边界，不等价于真实数据库 preflight。 |
-| ORG_SCOPE 文件 stage/commit（后续授权交付步骤） | **未执行**；提交前 release/CI checkout 不包含上述文件 |
-| 真实数据库迁移应用 | **未执行（BLOCKED，待 Exec-L3）** |
+| 迁移文件、源码、preflight 脚本和本手册的仓库交付 | **已进入当前仓库 `HEAD`（2026-10-26 静态核对）**；仅证明文件版本化，不证明数据库已应用 |
+| preflight 脚本离线契约验证（`ORG_SCOPE-PREFLIGHT-OFFLINE-20260922`） | 历史证据记录为 **PASS**：`bash -n scripts/org_scope_preflight.sh`、`bash scripts/org_scope_preflight.sh self-test`、URI 连接参数/`MYSQL_PWD` 静态断言及无 CRLF 检查均通过；本次未重跑。该证据仅覆盖脚本语法与 URI 边界，不等价于真实数据库 preflight。 |
+| 真实数据库迁移应用 | 目标数据库应用状态 **未知**（本次未检查，不能据仓库记录判断）；本次未执行迁移，后续执行须先满足 Exec-L3 批准与本手册前置条件 |
 | preflight 对真实数据库运行 | **未执行** |
 | 备份/恢复演练 | **未执行** |
 | 回滚演练 | **未执行** |

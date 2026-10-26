@@ -182,7 +182,7 @@ impl<T: Serialize> PageResponse<T> {
     }
 }
 
-/// 空响应体（用于 ApiResponse<T> 的 T 占位）
+/// 空响应体（用于 `ApiResponse<T>` 的 `T` 占位）
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EmptyResponse;

@@ -19,7 +19,7 @@
 //!    分叉风险由周期 durable 水位对账兜底。
 //! 3. **supervisor 清门协议**（与 hub 的 mutation_revision 封印协同）：
 //!    liveness OK（owned 连接实际可用——真实 connect/订阅成功的
-//!    Arc<AtomicBool>，绝非 lapin auto-recover 的 `is_connected`——且心跳新鲜
+//!    `Arc<AtomicBool>`，绝非 lapin auto-recover 的 `is_connected`——且心跳新鲜
 //!    3s 窗口）时**每个 tick** 都执行 bounded durable 全量对账：suspect 清门
 //!    与健康态漏通知兜底共用同一条 durable 证明路径（水位对账是必要 DB 兜底，
 //!    不是正常消息热路径）。连接关闭/超时/心跳缺失一律保持/拉起 suspect 且
@@ -31,7 +31,7 @@
 //!
 //! 关闭语义：fanout relay/inbox/supervisor 句柄持有到 runtime shutdown，
 //! 正常路径按启动逆序 bounded `shutdown_and_join`；启动失败与外层提前返回
-//! 由 [`InvalidationFanoutRuntime::Drop`]（RAII）信号 + abort 覆盖。
+//! 由 `InvalidationFanoutRuntime::drop`（RAII）信号 + abort 覆盖。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};

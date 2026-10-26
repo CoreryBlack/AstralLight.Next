@@ -187,7 +187,7 @@ static GATEWAY_SESSION_DB: OnceLock<sqlx::MySqlPool> = OnceLock::new();
 ///   `identity_card` 单条 JOIN）。
 /// - `mirror`：可选的有界镜像加速器。**positive allow 只在单写者组合进程
 ///   且显式配置下启用**（`policy`）；独立多写者 Gateway 必须传
-///   [`MirrorPolicy::DenyOnly`]——撤销 marker 仍可加速 deny，ALLOW 每请求
+///   [`astral_common::session_projection_store::MirrorPolicy::DenyOnly`]——撤销 marker 仍可加速 deny，ALLOW 每请求
 ///   strict DB，直到自身拥有完整 channel proof/watermark。
 /// - `disable_mirror_positive`：显式配置开关——置 true 时对镜像调用
 ///   `mark_suspect_permanent()`，positive cache 全部旁路（deny marker 加速

@@ -16,7 +16,7 @@
 //! ## is_active_admin 进程级缓存（读链规模化）
 //!
 //! [`GlobalAdminRepository::is_active_admin`]（管理范围例外判定，非
-//! PolicyEngine 评估链）经进程级短窗缓存（TTL [`ACTIVE_ADMIN_CACHE_TTL`]，
+//! PolicyEngine 评估链）经进程级短窗缓存（TTL `ACTIVE_ADMIN_CACHE_TTL`，
 //! 5s）。失效方式：本进程的 grant/disable 提交成功后按 user 主动 evict
 //! （立即生效）；跨实例（含 Java 侧对同表的写入）无广播，由 TTL 兜底（≤5s）。
 //! 缓存 miss/DB 错误一律回源权威查询并原样上抛（fail-closed 不变），错误绝不
@@ -766,7 +766,7 @@ fn store_active_admin_entry(user_id: i64, active: bool) {
 }
 
 /// 按 user 主动失效（grant/disable 提交成功后的 evict 钩子：本进程立即生效；
-/// 跨实例无广播，由 TTL 兜底，见 [`ACTIVE_ADMIN_CACHE_TTL`] 取舍记录）。
+/// 跨实例无广播，由 TTL 兜底，见 `ACTIVE_ADMIN_CACHE_TTL` 取舍记录）。
 fn evict_active_admin_entry(user_id: i64) {
     if let Ok(mut cache) = active_admin_cache().write() {
         cache.remove(&user_id);

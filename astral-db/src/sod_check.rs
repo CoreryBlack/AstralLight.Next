@@ -73,7 +73,7 @@
 //! 合同**）对"持有授权"的定义只认**已发布 evidence** 的 `effective_grants`
 //! （与 `sod_repository::card_permissions` 同一 effective-grant contract）：
 //! raw `permission_rule` 行是 legacy 直写事实、未经发布链验证，**不构成持有
-//! 授权**，canonical 路径冷/热均不执行 [`SOD_RAW_RULE_CONFLICT_SQL`] 扫描。
+//! 授权**，canonical 路径冷/热均不执行 `SOD_RAW_RULE_CONFLICT_SQL` 扫描。
 //! 旧公开诊断入口 [`check_sod_conflict`] 与 [`check_sod_conflict_with_org`]
 //! 保留 raw deny-biased 扫描。两类入口因此**不是**逐字节等同：canonical
 //! 移除了 raw 扫描（raw 行命中只会把 has_conflict 变 true，即移除后同请求
@@ -693,7 +693,7 @@ fn org_sod_contributions(
 /// - STATIC: 查询预定义互斥权限对；持有判定来自已发布 evidence 的
 ///   `effective_grants`（全部来源的生效 ALLOW，resource_key 归一化后匹配）；
 ///   raw `permission_rule` 分支仅为 deny-biased 诊断，见
-///   [`SOD_RAW_RULE_CONFLICT_SQL`] 注释
+///   `SOD_RAW_RULE_CONFLICT_SQL` 注释
 /// - 不支持的脚本或缺失 owner fact → 返回错误，调用方必须拒绝请求
 /// - "读取后复核"由 reader 事务 + FOR UPDATE + 指针一致性校验接管
 ///   （`pointer_moved_under_read` → `Corrupt` → Err）
@@ -782,7 +782,7 @@ pub async fn check_sod_conflict_with_org(
 
 /// ADDITIVE canonical 宿主 ORG 复核入口（冷/热同一 published-only 持有合同，
 /// 含 composite 栅栏）：org provenance 判定的 deny-only 复核走
-/// [`check_sod_conflict_with_context_inner`]——复合进程 warm 态（内存镜像 +
+/// `check_sod_conflict_with_context_inner`——复合进程 warm 态（内存镜像 +
 /// token 绑定策略快照）零 DB，cold durable 回退与 warm 同一持有语义
 /// （raw `permission_rule` 扫描冷/热均不执行，见模块文档 BREAKING CHANGE
 /// 登记）；TG/Identity 宿主应使用本入口而非旧 [`check_sod_conflict_with_org`]
@@ -806,7 +806,7 @@ pub async fn check_sod_conflict_with_context_and_org(
 /// 供宿主在 `PolicyEngine` ALLOW 之后、以**已验证的完整 `PolicyContext`**
 /// （resource/owner fact 由 resource-owner loader 解析，绝不来自客户端头）
 /// 调用：复合进程 warm 态（内存镜像 + token 绑定策略快照）零 DB；镜像
-/// miss/pending/未安装一律回落既有 durable 严格链（[`check_sod_conflict_inner`]，
+/// miss/pending/未安装一律回落既有 durable 严格链（`check_sod_conflict_inner`，
 /// 读取协议与旧路径一致）。错误沿 [`sod_gate_error`]
 /// fail-closed，调用方必须拒绝请求。
 ///
@@ -1045,7 +1045,7 @@ pub async fn load_org_sod_admission(
 /// [`check_sod_conflict_with_org`] provenance 对牌解析器，不产生任何新授权
 /// 事实。
 ///
-/// 映射（fail-closed，与 [`org_sod_admission_outcome`] 同向）：
+/// 映射（fail-closed，与 `org_sod_admission_outcome` 同向）：
 /// - 镜像 `Ready(evidence)` → 与 fresh DB 读同源的 `OrgSodAdmission`；
 /// - 镜像 `Pending { code }` → `org_scope_sod_evidence_pending;`（fail-closed）；
 /// - 镜像 `Unavailable { code }` → `org_scope_sod_evidence_unavailable;`

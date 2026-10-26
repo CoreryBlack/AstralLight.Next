@@ -100,7 +100,7 @@ pub struct NewUserCard {
     /// 显式携带时先通过统一持久化安全校验（不安全 header Validation fail-closed），
     /// 通过后作为本次创建全部账本/投影/审计事件的 stable operation id；缺失或空白
     /// 时以锁定中的 durable 代次确定性派生（见
-    /// [`derive_create_card_template_operation_id`]），随机 fallback 永不允许进入
+    /// `derive_create_card_template_operation_id`），随机 fallback 永不允许进入
     /// 账本事件链。identity starter 的无模板路径只用它做 legacy correlation。
     pub request_operation_id: Option<String>,
 }
@@ -1174,7 +1174,7 @@ pub trait UserCardRepository: Send + Sync {
     async fn restore_card(&self, card_id: i64) -> Result<bool, AstralError>;
     /// 绑定单卡（PENDING/INACTIVE → ACTIVE + user_id），返回是否命中。
     ///
-    /// 与 [`Self::bind_card_async_one`] 共享 [`bind_card_with_reassignment_guard`]
+    /// 与 [`Self::bind_card_async_one`] 共享 `bind_card_with_reassignment_guard`
     /// 同一受守卫核心：正目标用户校验、锁卡证明候选状态、归属/贡献 fail-closed
     /// 守卫全部先于换主 UPDATE（详见核心函数文档）。
     async fn bind_card(&self, card_id: i64, user_id: i64) -> Result<bool, AstralError>;

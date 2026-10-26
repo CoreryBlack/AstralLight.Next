@@ -316,7 +316,7 @@ pub async fn try_synchronous_publish(
 
 /// 注入 runtime 的同步发布入口（测试与未来复用面）。
 ///
-/// 发布动作复用 worker 的 [`process_one_event`] 完整管线（readback → 观察发布
+/// 发布动作复用 worker 的 `process_one_event` 完整管线（readback → 观察发布
 /// 上下文 → 账本分区 → 纯编译判定 → 单事务发布 → L2 推送），因此同步路径的
 /// fail-closed 语义与 worker 逐分支一致。
 pub async fn try_synchronous_publish_with_runtime(

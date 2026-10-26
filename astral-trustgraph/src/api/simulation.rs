@@ -6,9 +6,9 @@
 //!
 //! ## 数据流（新链，旧链下线前置改造）
 //!
-//! - 主判定：卡级 published evidence（[`crate::api::load_diagnostic_card_evidence`]，
+//! - 主判定：卡级 published evidence（`load_diagnostic_card_evidence`，
 //!   严格 reader 单短事务内锁定当前指针并整链校验 + 卡级 lens）经统一
-//!   ALLOW-only 匹配器（[`crate::api::match_published_effective_grant`]，与
+//!   ALLOW-only 匹配器（`match_published_effective_grant`，与
 //!   PolicyEngine strict gate 同语义）——展示"若现在发起该请求，按当前已发布
 //!   授权将得到 ALLOW/DENY"；
 //! - 假设判定：proposed 规则按 OVERLAY 优先（首条命中即胜出），未命中回落到

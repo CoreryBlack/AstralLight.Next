@@ -1086,7 +1086,7 @@ pub struct DirectRuleLedgerFacts<'a> {
     /// source 行真实条件文本（原样传入，不解析）；非空值在 ADD/UPDATE 组装期
     /// fail-closed（canonical 合同无 condition 槽位）。REMOVE 路径不消费本字段。
     pub condition_json: Option<&'a str>,
-    /// source 行的真实有效期（UTC 'YYYY-MM-DD' 或 'YYYY-MM-DD[ T]HH:MM:SS'）。
+    /// source 行的真实有效期（UTC `YYYY-MM-DD` 或 `YYYY-MM-DD[ T]HH:MM:SS`）。
     pub valid_from: Option<&'a str>,
     pub valid_to: Option<&'a str>,
 }

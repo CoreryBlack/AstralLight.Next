@@ -10,7 +10,7 @@
 //!   （domain/subject/parent）带**哨兵 default**——JSON 缺键时填入非法哨兵值，
 //!   由 `validate()` fail-closed 拒绝，因此"缺字段"不可能被解释成更宽的默认授权
 //!   （None 必须显式写 `null`）。tagged enum 的例外见各类型注释。
-//! - 本模块零 I/O、零 panic：对外部数据只返回 typed [`OrgError`]。
+//! - 本模块零 I/O、零 panic：对外部数据只返回 typed [`crate::org_scope::OrgError`]。
 //! - 资源/动作语义与既有引擎匹配器对齐（`crate::registry::parse_resource_key`
 //!   同形态语义 / `get_alias_sources` 别名直接复用）：对象/类型/全局三级 +
 //!   write 别名，保守可证明才匹配。

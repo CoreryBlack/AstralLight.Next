@@ -258,8 +258,8 @@ pub fn decode_projection_snapshot_payload(
 ///    segment-local semantic/dependency seals
 ///    ([`verify_segment_local_seal`]).
 /// 2. **The one assembly contract** — the manifest row is rebuilt from the
-///    state ([`ManifestRawSqlRow::from_published_state`]) and re-run through
-///    the same [`assemble_verified_published_state`] the strict reader and
+///    state (`ManifestRawSqlRow::from_published_state`) and re-run through
+///    the same `assemble_verified_published_state` the strict reader and
 ///    guarded publisher share (pointer proof state, pointer/manifest
 ///    generation-identity-fence-hash agreement, contiguous reference pairing,
 ///    manifest digest seal, grant-count sums). The reassembled state must be
@@ -816,7 +816,7 @@ pub(crate) fn classify_projection_snapshot_hint(
 /// SQL-bounded at [`MAX_CAPTURE_PUBLISHED_STATES`] + 1 rows — an over-cap
 /// durable scope fails closed because it can never be classified as a whole)
 /// and ALL pending delta rows (bounded) → pure exact-token classification
-/// ([`classify_projection_snapshot_hint`]).
+/// (`classify_projection_snapshot_hint`).
 ///
 /// Generation alone is never accepted as the durable comparison: the token
 /// covers pointer id, identity, card scope, generation, manifest id,

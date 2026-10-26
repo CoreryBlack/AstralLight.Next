@@ -7,7 +7,7 @@
 //!    actor/approver/root authority 字段直接解析失败，input claim 不当批准）；
 //! 2. **签名 actor 提取**：`Extension<PolicyContext>` 由 permission_check 中间件
 //!    在 Gateway 验签 + `PolicyEngine.evaluate()` 之后注入，本层不再读原始身份头；
-//! 3. **default-off 路由装配**：[`org_authorities_config_from_env`] 为 `None`
+//! 3. **default-off 路由装配**：[`org_config_from_env`] 为 `None`
 //!    （unset/false）时 main 不 merge 任何 router（fail-closed 404）；非法值由
 //!    main 拒绝启动。路由合并由 main 完成（本文件不持有 AppState 构造）。
 //!

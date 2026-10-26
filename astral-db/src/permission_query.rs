@@ -428,7 +428,7 @@ async fn load_single_card_tenant(pool: &MySqlPool, card_id: i64) -> Result<Optio
 /// 批量加载卡片权限摘要（卡级 action_codes + BASE/OVERLAY 规则集 id）。
 ///
 /// 正式摘要一律派生自 Rust-owned published card evidence：严格 reader
-/// [`load_published_card_grant_evidence`] 在单个短事务内按
+/// [`crate::authorization_projection_repository::load_published_card_grant_evidence`] 在单个短事务内按
 /// `authorization_projection_current` 当前指针（FOR UPDATE）读取并整链校验
 /// 每张卡作用域的全部已发布聚合。legacy `permission_rule_snapshot` /
 /// `rule_set_snapshot` 的 MAX(version_no) 读取已从本路径移除，不存在任何
@@ -443,7 +443,7 @@ async fn load_single_card_tenant(pool: &MySqlPool, card_id: i64) -> Result<Optio
 /// - DB 传输错误原样向上传播为 [`DbError`]，绝不吞错降级为“缺摘要继续”。
 ///
 /// 派生映射（只消费 accepted=已进入有效授权集合的 verified 记录，见
-/// [`card_permission_summary_from_evidence`]）：
+/// `card_permission_summary_from_evidence`）：
 /// - 非 `RULE_SET` 来源（DIRECT/APPROVAL/DELEGATION/SYSTEM）→ 去重升序
 ///   action codes（对齐 legacy 卡规则摘要 CSV 输出）；
 /// - `RULE_SET` 来源 → 按 `binding_layer` 分组到 BASE / OVERLAY 规则集 id

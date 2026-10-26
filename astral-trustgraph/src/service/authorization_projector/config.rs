@@ -16,11 +16,11 @@ use astral_db::MAX_MANIFEST_LEASE_SECONDS;
 
 /// Idle poll period between cycles.
 pub const POLL_INTERVAL_SECS: u64 = 5;
-/// One claimed event's lease window (≤ [`MAX_DELTA_LEASE_SECONDS`]).
+/// One claimed event's lease window (≤ [`astral_db::MAX_DELTA_LEASE_SECONDS`]).
 pub const CLAIM_LEASE_SECS: i64 = 120;
 /// Hard attempt budget per event. The budget is judged against the durable
-/// post-install `attempts` value of the row ([`DeltaEventClaim::attempts`] and
-/// the strict [`ClaimedDeltaEvent`] readback both carry that current value):
+/// post-install `attempts` value of the row ([`astral_db::DeltaEventClaim::attempts`] and
+/// the strict [`astral_db::ClaimedDeltaEvent`] readback both carry that current value):
 /// attempts 1..=5 are in-budget retries, a failure observed at attempts >= 5 is
 /// exhausted and can never schedule another short backoff.
 pub const MAX_EVENT_ATTEMPTS: i64 = 5;

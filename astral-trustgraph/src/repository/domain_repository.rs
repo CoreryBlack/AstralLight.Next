@@ -11,7 +11,7 @@ use astral_types::AstralError;
 /// 域记录（platform_domain）。
 ///
 /// 注意：platform_v4 中 platform_domain 表无 org_id 列，org_id 保留为
-/// Option<i64> 用于前端兼容（查询时恒为 NULL）。
+/// `Option<i64>` 用于前端兼容（查询时恒为 NULL）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DomainRecord {
     pub id: i64,

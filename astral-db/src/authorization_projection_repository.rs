@@ -324,7 +324,7 @@ pub const SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1: &str = "authorization_gra
 /// but was stamped by a different producer compiler version.
 ///
 /// The content digest lookup plus the identity/card/format equality checks in
-/// [`assert_identical_segment`] PROVE the payload bytes are intact, so this is
+/// `assert_identical_segment` PROVE the payload bytes are intact, so this is
 /// the documented Phase 1 modeling limit for a compiler upgrade that
 /// legitimately reuses content — a stamp-ownership decision for operators,
 /// never an "accidental permanent data corruption" signal. It is still
@@ -1525,9 +1525,9 @@ pub struct AuthorizationSegmentSnapshot {
 /// the whole read with an explicit error, never a degraded result.
 ///
 /// The typed serde form is consumed by the durable local-snapshot warm hint
-/// ([`crate::authorization_snapshot`]); it is a wire form only, never an
+/// (`crate::authorization_snapshot`); it is a wire form only, never an
 /// alternative constructor path — every deserialized instance must pass
-/// [`crate::authorization_snapshot::validate_published_state_snapshot`]
+/// `crate::authorization_snapshot::validate_published_state_snapshot`
 /// (full payload re-encoding + the one assembly contract below) before use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationPublishedState {
@@ -5395,7 +5395,7 @@ pub async fn load_published_card_grant_evidence_in_tx(
 ///
 /// The struct is deliberately opaque: its fields are private and there is no
 /// public constructor, so the only way to obtain a bundle is
-/// [`load_published_card_state_bundle`] / [`load_published_card_state_bundle_in_tx`]
+/// [`load_published_card_state_bundle`] / `load_published_card_state_bundle_in_tx`
 /// — a caller can never fabricate or extend one from unverified data. The
 /// bundle carries no freshness of its own after the transaction ends; it is a
 /// durable-proven snapshot as of that commit, and every authorization verdict
@@ -5438,7 +5438,7 @@ impl PublishedCardStateBundle {
     /// the already-proven states — no database access, no cache, no fallback.
     ///
     /// Pure re-assembly over verified data: the same
-    /// [`assemble_published_card_evidence`] contract the transaction reader
+    /// `assemble_published_card_evidence` contract the transaction reader
     /// uses, so absent state stays an explicit `NotReady` and any structural
     /// inconsistency stays `Corrupt`. Validity (`Expired`/`NotYetValid`) and
     /// scope lensing are re-evaluated at `now_unix_seconds`, which is the
@@ -5579,7 +5579,7 @@ pub async fn load_published_card_grant_evidence(
 ///
 /// The resulting vector's positions are the ordinals. HotState's segment map is
 /// a persistent HAMT (O(1) structural-sharing clone) whose iteration is unordered,
-/// so this bridge explicitly sorts entries by [`ProjectionKey`] (which implements
+/// so this bridge explicitly sorts entries by `ProjectionKey` (which implements
 /// `Ord`) to derive the same deterministic ordinal order as
 /// [`policy_engine::HotState::segment_references`]. Reuse decisions belong to the
 /// caller: unchanged segments become `ReuseParent` entries only when the caller
@@ -5622,7 +5622,7 @@ pub const MAX_IMPACT_PLAN_ITEMS: usize = 100_000;
 /// Character cap for one stable `projection_key` (`VARCHAR(191)` column).
 ///
 /// Keys longer than this cannot be persisted faithfully; callers must pick a
-/// compact canonical form ([`ProjectionKey`]-style canonical input) rather
+/// compact canonical form (`ProjectionKey`-style canonical input) rather
 /// than truncate, since truncation would silently merge distinct keys.
 pub const MAX_PROJECTION_KEY_LENGTH: usize = 191;
 
@@ -8354,7 +8354,7 @@ fn prove_archive_intent_against_live_pointer(
 ///   exactly this parent (identity, card scope, manifest id, generation,
 ///   provenance, hashes, compiler version and revoke fence) AND carry the
 ///   durable fence-proof latch `revoke_fence_proven = true`
-///   ([`prove_archive_intent_against_live_pointer`]). A numeric fence alone —
+///   (`prove_archive_intent_against_live_pointer`). A numeric fence alone —
 ///   on the manifest row or anywhere else — never seeds a new intent:
 ///   `revoke_fence_proven` exists only on the current pointer, so superseded
 ///   or legacy/unproven history (including an honest proven-zero parent's
@@ -8368,7 +8368,7 @@ fn prove_archive_intent_against_live_pointer(
 ///   cycle; the pointer lock also serializes appends and stays compatible
 ///   with the publish caller that already holds it;
 /// - the parent manifest row is locked `FOR UPDATE` and proven on BOTH paths
-///   via [`prove_archive_intent_against_parent_manifest`]; a missing,
+///   via `prove_archive_intent_against_parent_manifest`; a missing,
 ///   unreadable, not-yet-archivable or drifted parent fails closed with
 ///   stable machine codes and nothing touches the outbox;
 /// - writing the intent NEVER proves archiving happened; the row stays
@@ -9843,7 +9843,7 @@ fn prove_archive_proof_request_against_parent_manifest(
 ///    unified parent-manifest→outbox lock order — proof recording must never
 ///    take the outbox lock before the parent) and strictly re-proven against
 ///    the request via
-///    [`prove_archive_proof_request_against_parent_manifest`]: `COMMITTED`/
+///    `prove_archive_proof_request_against_parent_manifest`: `COMMITTED`/
 ///    `SUPERSEDED` lifecycle, identity/generation/provenance/card/fence
 ///    agreement PLUS direct semantic-hash, dependency-hash and compiler
 ///    comparisons as defense in depth;

@@ -252,7 +252,7 @@ impl CardEligibilityService {
     /// - **L1 进程内正缓存**（卡点 1：资格检查 L1 化，10 万 QPS 下收敛 Redis
     ///   命令与 ELIGIBILITY head 点查）：仅服务 `require_projection_ready=false`
     ///   的 PolicyEngine CARD_CONTEXT 路径，命中免 Redis 读 + 免 head 点查；
-    ///   只缓存 valid=true 正向结果，TTL 5s（取舍见 [`l1_card_active_lookup`]）；
+    ///   只缓存 valid=true 正向结果，TTL 5s（取舍见 `l1_card_active_lookup`）；
     /// - require_projection_ready=true（Chat WebSocket revalidate）**不参与
     ///   L1**：L1 只缓存 valid 事实、不缓存 gate READY 事实，ready 判定必须
     ///   逐请求读取 ELIGIBILITY head，保持原 Redis/DB 协议不变；
@@ -1097,7 +1097,7 @@ pub fn evict_l1_card_active_cache(user_card_id: i64) {
 /// 遗漏清空的 5s 正向 cache 窗口（单一收口点，替代逐调用点枚举）。
 ///
 /// 边界（与 [`evict_l1_card_active_cache`] 的逐卡语义互补）：
-/// - 只清空 [`L1_CARD_ACTIVE_CACHE`] 与 [`L1_ELIGIBILITY_HEAD_CACHE`] 两个
+/// - 只清空 `L1_CARD_ACTIVE_CACHE` 与 `L1_ELIGIBILITY_HEAD_CACHE` 两个
 ///   进程内条目存储的全部条目；静态未初始化时 no-op（无缓存即无窗口）；
 /// - 不动 cache epoch、不触碰 memory hub、不承担任何 durable 失效职责
 ///   （跨节点失效仍由指针对牌/资格头栅栏 + 失效通知承担，见模块文档）；

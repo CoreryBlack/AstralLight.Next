@@ -163,7 +163,7 @@ impl PolicyEngine {
     /// 累加单次评估的命中计数与时序数据到全局统计（对齐 Java PolicyEngine 的 AtomicLong 计数器 + 时序字段）
     ///
     /// `layer` 表示本次评估命中的层次："L1" / "L2" / "L3"，或 ORG_SCOPE 准入
-    /// 决策的稳定类别 "ORG_AUTHORITY"（见 [`ORG_AUTHORITY_EVAL_LAYER`]，不冒领
+    /// 决策的稳定类别 "ORG_AUTHORITY"（见 `ORG_AUTHORITY_EVAL_LAYER`，不冒领
     /// legacy 层命中；`HitStats` 公共 schema 无专属 ORG 桶，保守计入 l3_hits）。
     fn record_evaluation(&self, layer: &str, timing: &TimingBreakdown) {
         let mut stats = HitStats::clone(self.stats.load().as_ref());

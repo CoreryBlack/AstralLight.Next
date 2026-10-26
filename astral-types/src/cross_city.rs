@@ -2469,7 +2469,7 @@ pub struct CrossCityMessageIdentity {
     pub phase: CrossCityMessagePhase,
     /// Sending city identifier (non-empty, no whitespace/control characters,
     /// no invisible Unicode format characters, at most
-    /// [`IDENTIFIER_MAX_LEN`] bytes).
+    /// `IDENTIFIER_MAX_LEN` bytes).
     pub source_city_id: String,
     /// Receiving city identifier; must differ from `source_city_id`.
     pub destination_city_id: String,

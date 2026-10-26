@@ -6,7 +6,7 @@
 //! reservation, then a typed admission decision. It adds no I/O, no
 //! database, no network, no cache, no configuration loading, and no runtime
 //! caller of its own. It never flips the cross-city mode switch and never
-//! performs a state transition of [`CrossCityOperationState`]; state
+//! performs a state transition of [`astral_types::CrossCityOperationState`]; state
 //! transitions remain the coordinator's job backed by durable proof.
 //!
 //! # Default-off
@@ -311,7 +311,7 @@ fn classify_verification_error(error: CrossCitySignatureError) -> CrossCityActiv
 ///    [`CrossCityActivationAdmission::Admitted`], `DENY` ->
 ///    [`CrossCityActivationAdmission::Denied`].
 /// 4. A verification failure is mapped fail-closed by
-///    [`classify_verification_error`] (`ReplayGuardUnavailable` ->
+///    `classify_verification_error` (`ReplayGuardUnavailable` ->
 ///    `InDoubt`, everything else -> `Quarantined`).
 ///
 /// This function is pure and synchronous. It performs no I/O of its own and

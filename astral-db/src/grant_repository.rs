@@ -1556,7 +1556,7 @@ const DELTA_CLAIM_ELIGIBLE_PREDICATE: &str = "((status = 'PENDING' \
 ///
 /// The correlated NOT EXISTS reads the same table as the outer SELECT — legal
 /// for SELECT, but MySQL's error 1093 forbids it inside
-/// [`DELTA_CLAIM_INSTALL_SQL`]. The install therefore keeps only the row-level
+/// `DELTA_CLAIM_INSTALL_SQL`. The install therefore keeps only the row-level
 /// eligibility mirror: the candidate row is already `FOR UPDATE`-locked in the
 /// same transaction, and any cross-row race (predecessor published/claimed
 /// between candidate read and install) is fail-closed by the partitioner
@@ -2985,7 +2985,7 @@ where
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Typed filter for bounded status listings; unknown stored strings fail closed
-/// via [`decode_delta_status_row`], never normalize into a variant.
+/// via `decode_delta_status_row`, never normalize into a variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaQueueStatus {
     Pending,

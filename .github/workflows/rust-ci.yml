@@ -1,0 +1,56 @@
+name: Rust CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TARGET_DIR: target
+  RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
+
+concurrency:
+  group: rust-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workspace-gate:
+    name: Rust Workspace Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Test Cargo warning gate
+        run: bash scripts/ci/test-cargo-no-warnings.sh
+
+      - name: Check formatting
+        run: bash scripts/ci/cargo-no-warnings.sh fmt --all -- --check
+
+      - name: Check workspace
+        run: bash scripts/ci/cargo-no-warnings.sh check --workspace --locked --future-incompat-report
+
+      - name: Run Clippy
+        run: bash scripts/ci/cargo-no-warnings.sh clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test workspace
+        run: bash scripts/ci/cargo-no-warnings.sh test --workspace --locked --future-incompat-report
+
+      - name: Check workspace documentation
+        run: bash scripts/ci/cargo-no-warnings.sh doc --workspace --locked --no-deps

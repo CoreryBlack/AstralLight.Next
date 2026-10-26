@@ -24,6 +24,7 @@ struct TaskBudgets {
 
 static TASK_BUDGETS: std::sync::OnceLock<TaskBudgets> = std::sync::OnceLock::new();
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_performance_core_count(stdout: &[u8]) -> Option<usize> {
     let text = std::str::from_utf8(stdout).ok()?;
     text.trim().parse::<usize>().ok().filter(|count| *count > 0)

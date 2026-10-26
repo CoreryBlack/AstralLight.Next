@@ -87,7 +87,7 @@ fn measure(fg_threads: usize, bg_threads: usize) -> ForegroundResult {
         let mut background = Vec::new();
         for _ in 0..bg_threads {
             let stop = &stop;
-            background.push(scope.spawn(move || background_encode_storm(&stop)));
+            background.push(scope.spawn(move || background_encode_storm(stop)));
         }
         let mut handles = Vec::new();
         for _ in 0..fg_threads {

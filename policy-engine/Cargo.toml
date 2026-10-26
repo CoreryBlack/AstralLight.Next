@@ -20,6 +20,7 @@ uuid = { workspace = true, optional = true }
 arc-swap = { workspace = true }
 im = { workspace = true }
 async-trait = "0.1"
+iai-callgrind = { version = "0.14", optional = true }
 
 [dev-dependencies]
 metrics-exporter-prometheus = { workspace = true }
@@ -30,16 +31,11 @@ serde = { workspace = true }
 criterion = { workspace = true }
 divan = { workspace = true }
 
-# iai-callgrind 运行时需要 valgrind（仅 Linux/CI），但 bench 源码无条件
-# import 该 crate，Windows 上 `--features iai` 编译检查同样依赖它，因此
-# 保持无条件 dev-dependency；bench 目标经 required-features = ["iai"] 门控。
-iai-callgrind = "0.14"
-
 [features]
 # Legacy/test-only engine paths (L1/L2/fallback/CARD_ONLY). Native tests use
 # strict published evidence; enable explicitly to run compatibility coverage.
 legacy-tests = []
-iai = []
+iai = ["dep:iai-callgrind"]
 e1-observability = ["dep:uuid"]
 
 [[bench]]

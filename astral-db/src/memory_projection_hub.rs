@@ -98,11 +98,11 @@ pub async fn acquire_single_writer_lease(
 
 /// 启动重放清单：全部当前已发布聚合与卡作用域（只读、确定性排序）。
 ///
-/// 容量栅栏：`LIMIT` 是 cap+1 探针（cap = [`MAX_MIRROR_STATES`]，与
-/// reconcile 扫描 [`LIST_CURRENT_FRONTIER_SQL`] 共用同一上界）。行数读满
+/// 容量栅栏：`LIMIT` 是 cap+1 探针（cap = `MAX_MIRROR_STATES`，与
+/// reconcile 扫描 `LIST_CURRENT_FRONTIER_SQL` 共用同一上界）。行数读满
 /// cap+1 ⟺ durable frontier 超出镜像容量：warm-up 必须整体失败并拒绝启动，
 /// 绝不把 LIMIT 截断的部分 frontier 装进镜像冒充完整读面（判定见
-/// [`warm_scan_capacity_verdict`]）。
+/// `warm_scan_capacity_verdict`）。
 pub const LIST_CURRENT_IDENTITIES_SQL: &str =
     "SELECT tenant_id, card_id, aggregate_type, aggregate_id \
      FROM authorization_projection_current \
@@ -112,10 +112,10 @@ pub const LIST_CURRENT_IDENTITIES_SQL: &str =
 /// 与正式 freshness probe 同域：所有未完成撤权和携带 fence 的意图。
 /// 不过滤重试时间或租约有效期，崩溃残留与隔离事件必须继续阻止 stale-ALLOW。
 ///
-/// 容量栅栏：`LIMIT` 是 cap+1 探针（cap = [`MAX_PENDING_ENTRIES`]，与
+/// 容量栅栏：`LIMIT` 是 cap+1 探针（cap = `MAX_PENDING_ENTRIES`，与
 /// `read_reconciliation` 的 durable pending 容量判定一致）。行数读满 cap+1
 /// ⟺ durable pending 超出镜像容量：warm-up 必须整体失败并拒绝启动，同时
-/// 保证本进程不会先物化一条无界 Vec（判定见 [`warm_scan_capacity_verdict`]）。
+/// 保证本进程不会先物化一条无界 Vec（判定见 `warm_scan_capacity_verdict`）。
 pub const LIST_PENDING_INVALIDATIONS_SQL: &str = "SELECT tenant_id, card_id, aggregate_type, \
     aggregate_id, event_id, operation_id, source_generation, revoke_fence, event_type, \
     invalidates_published_evidence \
@@ -4193,7 +4193,7 @@ mod tests {
                         stage:
                             crate::authorization_projection_repository::AuthorizationStageOutcome {
                                 manifest_id,
-                                manifest_digest: state.manifest_digest.clone(),
+                                manifest_digest: state.manifest_digest,
                                 target_generation: generation,
                                 total_grant_count: state.total_grant_count,
                                 new_segment_count: 1,
@@ -4239,7 +4239,6 @@ mod tests {
         // content_digest/payload——O(变更) 替代 O(N)。仅构造层，装配不变。
         for size in [1000usize, 4050] {
             let identity = ProjectionAggregateIdentity::new(7, "USER_CARD", 17).unwrap();
-            let hub = MemoryProjectionHub::default();
             let hot0 = policy_engine::HotState::from_grants(
                 tenant(),
                 1,
@@ -4360,8 +4359,8 @@ mod tests {
                                 publication_generation: 2,
                                 revoke_fence: 0,
                                 manifest_id: 2,
-                                event_id: format!("event-2"),
-                                operation_id: format!("operation-2"),
+                                event_id: "event-2".to_owned(),
+                                operation_id: "operation-2".to_owned(),
                                 semantic_hash_hex: record.semantic_hash_hex.clone(),
                                 dependency_hash_hex: record.dependency_hash_hex.clone(),
                                 compiler_version: record.compiler_version.clone(),

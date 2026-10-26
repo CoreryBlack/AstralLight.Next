@@ -581,16 +581,14 @@ async fn signed_request(
         .map_err(|error| anyhow!("production Router::oneshot failed: {error}"))
 }
 
-pub fn response_rule_id(response: Response) -> impl std::future::Future<Output = Result<i64>> {
-    async move {
-        let bytes = to_bytes(response.into_body(), HTTP_BODY_LIMIT)
-            .await
-            .context("read rule response body")?;
-        let json: Value = serde_json::from_slice(&bytes).context("decode rule response")?;
-        json.pointer("/data/ruleId")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| anyhow!("production rule response did not contain data.ruleId"))
-    }
+pub async fn response_rule_id(response: Response) -> Result<i64> {
+    let bytes = to_bytes(response.into_body(), HTTP_BODY_LIMIT)
+        .await
+        .context("read rule response body")?;
+    let json: Value = serde_json::from_slice(&bytes).context("decode rule response")?;
+    json.pointer("/data/ruleId")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow!("production rule response did not contain data.ruleId"))
 }
 
 pub async fn require_success(response: Response, label: &str) -> Result<Response> {

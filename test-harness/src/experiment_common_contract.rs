@@ -901,15 +901,18 @@ mod tests {
 
     #[test]
     fn required_parser_and_validator_symbols_remain_callable() {
-        let _: fn(&str, &str) -> String = stable_id;
-        let _: fn(&[CommonEvent]) -> Result<(SequenceInterval, String), &'static str> =
-            final_observation_interval;
-        let _: fn(
+        type ObservationIntervalValidator =
+            fn(&[CommonEvent]) -> Result<(SequenceInterval, String), &'static str>;
+        type RuntimePreconditionValidator = fn(
             &[&str],
             &[RuntimeConnection],
             bool,
             Option<&std::collections::BTreeMap<String, usize>>,
-        ) -> Value = validate_runtime_preconditions;
+        ) -> Value;
+
+        let _: fn(&str, &str) -> String = stable_id;
+        let _: ObservationIntervalValidator = final_observation_interval;
+        let _: RuntimePreconditionValidator = validate_runtime_preconditions;
         let _: fn(&[&str], Option<&Value>) -> Result<(), &'static str> = validate_route_journal;
     }
 

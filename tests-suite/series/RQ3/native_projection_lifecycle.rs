@@ -58,6 +58,21 @@ const DB_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 const WARMUP_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+type MutationDatabaseRow = (
+    String,
+    String,
+    i64,
+    String,
+    String,
+    i64,
+    String,
+    i64,
+    i64,
+    String,
+    i64,
+    i64,
+);
+
 #[derive(Debug, Clone)]
 struct MutationIdentity {
     operation_id: String,
@@ -188,13 +203,14 @@ async fn native_projection_lifecycle_add_revoke_is_fail_closed_and_owned() {
         let mut owners = install_runtime(&pool).await?;
         let lifecycle = exercise_lifecycle(
             &pool,
-            &fixture,
             &tenant,
             &mut owners,
-            &add_one_operation,
-            &add_two_operation,
-            &remove_one_operation,
-            &remove_two_operation,
+            LifecycleOperations {
+                add_one: &add_one_operation,
+                add_two: &add_two_operation,
+                remove_one: &remove_one_operation,
+                remove_two: &remove_two_operation,
+            },
         )
         .await;
         let shutdown = owners.shutdown().await;
@@ -380,16 +396,25 @@ async fn run_invalidation_consumer(
     }
 }
 
+struct LifecycleOperations<'a> {
+    add_one: &'a str,
+    add_two: &'a str,
+    remove_one: &'a str,
+    remove_two: &'a str,
+}
+
 async fn exercise_lifecycle(
     pool: &MySqlPool,
-    _fixture: &SuiteFixture,
     tenant: &testsuite::SuiteTenant,
     owners: &mut RuntimeOwners,
-    add_one_operation: &str,
-    add_two_operation: &str,
-    remove_one_operation: &str,
-    remove_two_operation: &str,
+    operations: LifecycleOperations<'_>,
 ) -> Result<()> {
+    let LifecycleOperations {
+        add_one: add_one_operation,
+        add_two: add_two_operation,
+        remove_one: remove_one_operation,
+        remove_two: remove_two_operation,
+    } = operations;
     let repo = SqlxRuleRepository::new(pool.clone());
     let first_rule_id = create_direct_rule(
         &repo,
@@ -437,7 +462,7 @@ async fn exercise_lifecycle(
     let removed_one =
         delete_direct_rule(&repo, first_rule_id, tenant.user_id, remove_one_operation).await?;
     let remove_one = wait_for_mutation(pool, tenant.tenant_id, remove_one_operation, true).await?;
-    assert_eq!(removed_one, true);
+    assert!(removed_one);
     assert_mutation_shape(&remove_one, tenant, first_rule_id, true, "REMOVE")?;
     assert_eq!(remove_one.grant_id, first.grant_id);
     let allow_after_first_revoke = evaluate(pool, tenant, true).await?;
@@ -451,7 +476,7 @@ async fn exercise_lifecycle(
     let removed_two =
         delete_direct_rule(&repo, second_rule_id, tenant.user_id, remove_two_operation).await?;
     let remove_two = wait_for_mutation(pool, tenant.tenant_id, remove_two_operation, true).await?;
-    assert_eq!(removed_two, true);
+    assert!(removed_two);
     assert_mutation_shape(&remove_two, tenant, second_rule_id, true, "REMOVE")?;
     assert_eq!(remove_two.grant_id, second.grant_id);
     assert!(remove_two.revoke_fence > 0);
@@ -491,8 +516,10 @@ async fn exercise_lifecycle(
 
     // Install the real one-owner production worker only after source/revoke
     // assertions. A second start must be rejected without spawning a task.
-    let mut config = AuthorizationProjectorConfig::default();
-    config.tenants = vec![tenant.tenant_id];
+    let config = AuthorizationProjectorConfig {
+        tenants: vec![tenant.tenant_id],
+        ..AuthorizationProjectorConfig::default()
+    };
     let worker = start_local_projection_worker(
         pool.clone(),
         LocalProjectionWorkerConfig {
@@ -594,20 +621,7 @@ async fn wait_for_mutation(
         || {
             let operation_id = operation_id.to_owned();
             async move {
-                let row: Option<(
-                    String,
-                    String,
-                    i64,
-                    String,
-                    String,
-                    i64,
-                    String,
-                    i64,
-                    i64,
-                    String,
-                    i64,
-                    i64,
-                )> =
+                let row: Option<MutationDatabaseRow> =
                     tokio::time::timeout(
                         DB_CALL_TIMEOUT,
                         sqlx::query_as(
@@ -677,7 +691,6 @@ async fn wait_for_mutation(
         },
     )
     .await
-    .and_then(|value| Ok(value))
 }
 
 async fn first_status(pool: &MySqlPool, tenant_id: i64, event_id: &str) -> Result<String> {
@@ -827,7 +840,6 @@ async fn wait_for_current(
         },
     )
     .await
-    .and_then(|value| Ok(value))
 }
 
 async fn evaluate(

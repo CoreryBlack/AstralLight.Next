@@ -91,7 +91,7 @@ resolver = "2"
 | 配置 | `astral-common/src/config/mod.rs` | `AppConfig`、`JwtConfig`/`JwtTokenProfile`、`GatewayCfg`、`session_grant_claims_mode`、密钥占位符校验 |
 | 统一响应契约 | `astral-common/src/contract/mod.rs` | `ApiResponse<T>`、`PageResponse<T>`、`PaginationParams` |
 | 统一错误 | `astral-common/src/error/mod.rs` | `AppError`、`global_exception_handler` |
-| 权限上下文 / 路由 helper | `astral-common/src/middleware/permission_check_shared.rs` | `physical_policy_context`、`resolve_permission_action`、`validate_path_map`；本次仅移除 `permission_check_shared::check_permission`。另一个公开 helper `astral_common::middleware::permission::require_permission` 仍保留，但其 context 的 ownership 为 `Unresolved`，不能替代服务 owner resolver；当前无仓内调用方 |
+| 权限上下文 / 路由 helper | `astral-common/src/middleware/permission_check_shared.rs` | `physical_policy_context`、`resolve_permission_action`、`validate_path_map`；公开的 `permission_check_shared::check_permission` 保留为 deprecated compatibility helper，其 context ownership 为 `Unresolved`，不能替代服务 owner resolver。另一个公开 helper `astral_common::middleware::permission::require_permission` 也不能替代服务 owner resolver；当前无仓内调用方 |
 | 审计 | `astral-common/src/audit.rs` | `AuditDualWrite`（MQ-first / DB-fallback）、`record_permission_audit` |
 
 ### 3.2 Gateway 依赖图（当前）

@@ -93,7 +93,7 @@ Gateway 的路由凭证策略类型和会话 grant 校验在 [`middleware.rs`](.
 
 实现见 [`physical_policy_context`](../../../astral-common/src/middleware/permission_check_shared.rs#L55-L118)。
 
-请求路径由各服务中间件按各自 path map 解析资源类型和动作，先通过服务专属 owner resolver 建立目标所有权，再调用 `engine.evaluate(&ctx, repo)`。本次删除的是 `astral_common::middleware::permission_check_shared::check_permission`：它提交 `Unresolved` 目标上下文，不能授权受保护资源。另一个公开兼容 helper `astral_common::middleware::permission::require_permission` 仍保留；它同样不能替代 owner resolver，且当前仓内没有调用方，不得作为生产授权入口。共享解析与双卡上下文 helper 仍由各服务中间件复用。
+请求路径由各服务中间件按各自 path map 解析资源类型和动作，先通过服务专属 owner resolver 建立目标所有权，再调用 `engine.evaluate(&ctx, repo)`。公开 helper `astral_common::middleware::permission_check_shared::check_permission` 保留为 deprecated compatibility helper：它提交 `Unresolved` 目标上下文，不能授权受保护资源，也不能替代服务专属 owner resolver；生产路径必须在评估前解析目标 owner。另一个公开兼容 helper `astral_common::middleware::permission::require_permission` 仍保留；它同样不能替代 owner resolver，且当前仓内没有调用方，不得作为生产授权入口。共享解析与双卡上下文 helper 仍由各服务中间件复用。
 
 `ResourceRegistry` 是 `astral-types` 的集中注册表，提供资源/动作/条件校验；启动期 `validate_path_map` 交叉检查 path map 是否引用未注册资源，但当前检查记录错误并继续启动，不能当作强制启动失败门禁。注册表和校验见 [`registry.rs`](../../../astral-types/src/registry.rs#L113-L144) 与 [`#L319-L383`](../../../astral-types/src/registry.rs#L319-L383)。
 
@@ -268,7 +268,7 @@ CARD/ELIGIBILITY/RULE_SET 旧 head 的状态列不再作为 canonical 生产读�
 
 **决策**：Gateway 只认证和签发可信头；服务中间件解析资源动作、用共享 helper 构造 actor context，再由服务专属 owner resolver 确认目标归属；所有需要资源/动作授权的请求只有在 owner resolution 满足资源合同后，才能进入 `PolicyEngine::evaluate()`。未解析/不可用的 ownership 保持 `PENDING`/`DENY`。任何 `isSuperAdmin()`、角色字符串、请求体 context、身份卡 fallback 或直接 `permission_rule` 查询都不能在引擎前形成 ALLOW。
 
-**理由**：将身份事实、授权卡事实、规则集语义和故障降级集中到 `PolicyEngine::evaluate()`，避免同一变更在 Gateway、Controller、Service 和 raw SQL 各自产生不同放行口径。各服务 middleware 先用共享 helper 构造 actor context，再调用目标资源 owner resolver 并将其结果写入 context；只在 resolver 成功且资源合同满足后才评估。本次删除仅限 `astral_common::middleware::permission_check_shared::check_permission`；另一个公开 helper `astral_common::middleware::permission::require_permission` 仍保留，但同样无法证明目标 ownership、当前无仓内调用方，不能用于受保护目标授权或替代服务 owner resolver。
+**理由**：将身份事实、授权卡事实、规则集语义和故障降级集中到 `PolicyEngine::evaluate()`，避免同一变更在 Gateway、Controller、Service 和 raw SQL 各自产生不同放行口径。各服务 middleware 先用共享 helper 构造 actor context，再调用目标资源 owner resolver 并将其结果写入 context；只在 resolver 成功且资源合同满足后才评估。公开的 `astral_common::middleware::permission_check_shared::check_permission` 保留为 deprecated compatibility helper，但其 `Unresolved` ownership 不能证明目标归属、不能授权受保护目标，也不能替代服务 owner resolver。另一个公开 helper `astral_common::middleware::permission::require_permission` 同样无法证明目标 ownership、当前无仓内调用方，不能用于受保护目标授权或替代服务 owner resolver。
 
 ### AD-2：投影是授权读模型的 durable admission gate
 

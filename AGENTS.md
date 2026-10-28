@@ -1,7 +1,7 @@
 # AstralLight Rust 项目编码规范（Agent 规则入口）
 
-> 版本：2.5.0
-> 更新日期：2026-10-04
+> 版本：2.6.0
+> 更新日期：2026-10-27
 >
 > **本文档是仓库唯一的 Agent 规则入口**。CLAUDE.md、`.trae/rules/project_rules.md`、`.trae/skills/project_rules.md` 已移除，不新增规则副本。
 > **工程规范正文的唯一规范源是 `Docs/规范/`**，其目录清单以 [`Docs/规范/README.md`](Docs/规范/README.md) 为准。
@@ -227,6 +227,8 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 
 验证范围随风险和变更面增加，不以“全量命令”替代风险判断。本地检查可按变更面最小化，但 Rust 提交/合并/CI 仍保留 workspace gate。共享契约、权限链、schema/migration、跨模块/跨 crate 或 Exec-L3 变更，合并前必须完整验证；其余任务优先使用相关模块的最小检查。
 
+**测试语言门禁：本项目全部测试必须使用 Rust，不允许使用其他语言实现测试。** 单元、集成、端到端、契约、安全、故障注入、性能/基准测试及测试 harness、断言、参考算法和结果判定均通过 Cargo/Rust 工具链实现；不得用 Python、JavaScript、Shell 或其他语言编写或包装测试逻辑。Shell 仅可启动 Cargo/标准工具及收集原始日志。既有其他语言测试不得作为验收证据；涉及其覆盖的变更时须先迁移为 Rust。实施细则见 [`Rust后端编码规范_V1.0.md` §10.0](Docs/规范/Rust后端编码规范_V1.0.md#100-测试语言与执行入口)。
+
 | 变更面 | 最小充分验证 |
 |--------|--------------|
 | 只读、纯文档、格式、注释 | 文件范围、Markdown 结构/链接（适用时）和工作区未误改；五链 N/A。 |
@@ -291,6 +293,7 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 | migration、rollback、preflight 与 acceptance | [`Docs/迁移/README.md`](Docs/迁移/README.md) |
 | 数据迁移 API 与操作指南 | [`Docs/迁移/README.md`](Docs/迁移/README.md)、[`Docs/迁移/README.md`](Docs/迁移/README.md) |
 | MQ 部署与架构 | [`Docs/规范/统一消息协议与智能层消息规范_2026-03-18.md`](Docs/规范/统一消息协议与智能层消息规范_2026-03-18.md) |
+| 规则集完整结构、命令/读视图与轻量发布栅栏 | [`Rust后端编码规范_V1.0.md` §15.7](Docs/规范/Rust后端编码规范_V1.0.md#157-规则集完整结构与轻量发布栅栏标准2026-10-28) |
 | 规则模式与权限模型 | [`Docs/架构/Rust架构设计/Rust权限判定与规则集语义_V1.0.md`](Docs/架构/Rust架构设计/Rust权限判定与规则集语义_V1.0.md) |
 | 规则模型分析与规则集 DDL | [`Docs/sql/full_schema_v4.sql`](Docs/sql/full_schema_v4.sql) 与 Rust 架构文档 |
 | 分布式授权集群测试 | 测试源码与 harness 已公开于 [`Docs/实验/分布式测试/`](Docs/实验/分布式测试/) 和 [`Docs/authorization-validation/`](Docs/authorization-validation/)；历史报告/JSON/证据归档已继承并脱敏，节点路由、二进制和部署状态未继承，真实三节点集成需受保护环境、审批和状态证据。 |

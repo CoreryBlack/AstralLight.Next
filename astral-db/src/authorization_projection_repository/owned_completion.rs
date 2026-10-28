@@ -36,6 +36,16 @@ pub(super) async fn record_publication_in_tx(
                 "code=projection_execution.completion_manifest_missing".to_owned(),
             )
         })?;
+    let published = &outcome.publish.published_state;
+    if manifest.decode_seal()? != published.seal
+        || manifest.decode_seal()? != outcome.stage.seal
+        || manifest.decode_hashes()?.2 != published.manifest_digest
+        || manifest.decode_hashes()?.2 != outcome.stage.manifest_digest
+    {
+        return Err(AuthorizationProjectionError::Corrupt(
+            "code=projection_execution.completion_publication_seal_split".to_owned(),
+        ));
+    }
     seal::record_in_tx(
         tx,
         &plan,

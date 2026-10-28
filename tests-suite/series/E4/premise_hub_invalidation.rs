@@ -68,6 +68,7 @@ async fn hub_invalidation_notification_is_the_load_bearing_freshness_fence() {
         operation_id: format!("hub-operation-{:032x}", fixture.salt),
         source_generation: 2,
         published_generation: 1,
+        stamp: published.published_state.publication_stamp().unwrap(),
         revoke_fence: 0,
     })
     .unwrap();

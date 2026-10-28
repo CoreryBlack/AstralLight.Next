@@ -73,7 +73,8 @@ pub use authorization_snapshot::{
     validate_published_state_snapshot, PendingDeltaSnapshot, ProjectionSnapshotCapture,
     ProjectionSnapshotDocument, ProjectionSnapshotError, ProjectionSnapshotHint,
     SnapshotAggregateDivergence, SnapshotHintDivergenceKind, MAX_CAPTURE_PUBLISHED_STATES,
-    MAX_PENDING_DELTA_ROWS, MAX_PROJECTION_SNAPSHOT_HINT_AGE_SECONDS, SNAPSHOT_PAYLOAD_VERSION_V1,
+    MAX_PENDING_DELTA_ROWS, MAX_PROJECTION_SNAPSHOT_HINT_AGE_SECONDS, SNAPSHOT_PAYLOAD_VERSION,
+    SNAPSHOT_PAYLOAD_VERSION_V2,
 };
 pub use auxiliary_authorization_mirror::{
     auxiliary_authorization_mirror, install_auxiliary_authorization_mirror,

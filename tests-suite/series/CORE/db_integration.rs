@@ -527,7 +527,7 @@ async fn local_message_exact_claim_is_concurrent_fifo_and_token_fenced() {
         serde_json::to_string(&serde_json::json!({
             "messageId": message_id,
             "operationId": operation_id,
-            "messageType": "EVIDENCE_INVALIDATED",
+            "messageType": "LOCAL_OUTBOX_TEST",
             "schemaVersion": 1,
             "tenantId": null,
             "originRegion": "integration",
@@ -550,7 +550,7 @@ async fn local_message_exact_claim_is_concurrent_fifo_and_token_fenced() {
     let input_for = |index: usize| astral_db::LocalMessageInput {
         message_id: &message_ids[index],
         operation_id: &operation_ids[index],
-        message_type: "EVIDENCE_INVALIDATED",
+        message_type: "LOCAL_OUTBOX_TEST",
         queue_name,
         ordering_key: Some(&ordering_key),
         tenant_id: None,

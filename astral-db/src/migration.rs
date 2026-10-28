@@ -20,6 +20,13 @@ use std::str::FromStr;
 
 use astral_types::{ProjectionAggregate, EVENT_TYPE_RULE_SET_UPDATE};
 
+mod manifest_v3;
+
+use manifest_v3::{
+    authorization_projection_manifest_v3_recorded, preflight_manifest_v3,
+    validate_manifest_v3_postcondition, validate_manifest_v3_runtime,
+};
+
 const MIGRATION_LOCK_NAME: &str = "astral_light_rust_migrations";
 const MYSQL_SCHEMA_CHARSET: &str = "utf8mb4";
 const MYSQL_SCHEMA_COLLATION: &str = "utf8mb4_unicode_ci";
@@ -99,6 +106,11 @@ const LEGACY_SNAPSHOT_REQUIRED_DRAIN_TABLES: &[&str] = &["authorization_projecti
 const DELTA_CLAIM_GRANT_CHAIN_INDEX_VERSION: i64 = 20260903000001;
 const DELTA_EVENT_PUBLISHED_EVIDENCE_INVALIDATION_VERSION: i64 = 20260914000001;
 const REDUNDANT_ARCHIVE_INDEX_REMOVAL_VERSION: i64 = 20261004000001;
+const AUTHORIZATION_PROJECTION_MANIFEST_V3_VERSION: i64 = 20261027000001;
+const AUTHORIZATION_PROJECTION_MANIFEST_V3_MIGRATION_SQL: &str =
+    include_str!("../migrations/20261027000001_authorization_projection_manifest_v3.sql");
+const AUTHORIZATION_PROJECTION_MANIFEST_V3_SQL_SHA384: &str =
+    "cb26222047cef5ac7c35b4e8185b075a367310b9ed3393c08c9f1f48483ca91e31603e23b05e613725211f4b59cafec9";
 const REDUNDANT_ARCHIVE_INDEX_REMOVAL_SQL_SHA384: &str =
     "931864ec1052fda01a6a1ec59a4986b9e37644f193602b1277b4a3eae89cbcbe041a20af58844d426cd55ced754868b1";
 const POST_CREATOR_INDEX_REMOVALS: &[(i64, &str, &str)] = &[
@@ -4137,6 +4149,7 @@ async fn apply_migrations_with_mysql8_compat(pool: &MySqlPool) -> Result<(), Mig
         .await
         .map_err(|e| MigrationError::Failed(format!("migrate: {e}")))?;
     validate_archive_index_removal_postcondition(pool).await?;
+    validate_manifest_v3_postcondition(pool).await?;
 
     // SQLx records a successful migration before returning. This idempotent
     // data backfill therefore runs on every explicit migration invocation,
@@ -4704,6 +4717,7 @@ async fn validate_incremental_projection_archive_table_contract(
     lineage_recorded: Option<bool>,
     invalidation_recorded: Option<bool>,
     owned_execution_recorded: Option<bool>,
+    manifest_v3_recorded: Option<bool>,
 ) -> Result<(), MigrationError> {
     let columns: Vec<SchemaColumnContract> = INCREMENTAL_PROJECTION_ARCHIVE_COLUMN_CONTRACTS
         .iter()
@@ -4746,6 +4760,7 @@ async fn validate_incremental_projection_archive_table_contract(
             lineage_recorded,
             invalidation_recorded,
             owned_execution_recorded,
+            manifest_v3_recorded,
         )
         .await?;
     }
@@ -4763,7 +4778,7 @@ fn incremental_projection_resolved_column_contract(
     table: &str,
     base_columns: &[SchemaColumnContract],
 ) -> Vec<SchemaColumnContract> {
-    let mut resolved = Vec::with_capacity(base_columns.len() + 12);
+    let mut resolved = Vec::with_capacity(base_columns.len() + 14);
     resolved.extend_from_slice(base_columns);
     for expected in AUTHORIZATION_PROJECTION_LINEAGE_FENCE_COLUMN_CONTRACTS {
         if expected.table == table {
@@ -4779,6 +4794,9 @@ fn incremental_projection_resolved_column_contract(
         if expected.table == table {
             resolved.push(*expected);
         }
+    }
+    if table == "authorization_projection_manifest" {
+        resolved.extend_from_slice(AUTHORIZATION_PROJECTION_MANIFEST_V3_COLUMN_CONTRACTS);
     }
     resolved
 }
@@ -4814,6 +4832,7 @@ async fn validate_lineage_fence_tail_state(
     lineage_recorded: Option<bool>,
     invalidation_recorded: Option<bool>,
     owned_execution_recorded: Option<bool>,
+    manifest_v3_recorded: Option<bool>,
 ) -> Result<(), MigrationError> {
     let actual = ordered_table_column_names(pool, table).await?;
     validate_resolved_archive_column_order(
@@ -4823,6 +4842,7 @@ async fn validate_lineage_fence_tail_state(
         lineage_recorded,
         invalidation_recorded,
         owned_execution_recorded,
+        manifest_v3_recorded,
     )?;
     for expected in incremental_projection_resolved_column_contract(table, base_columns)
         .iter()
@@ -4841,6 +4861,7 @@ fn validate_resolved_archive_column_order(
     lineage_recorded: Option<bool>,
     invalidation_recorded: Option<bool>,
     owned_execution_recorded: Option<bool>,
+    manifest_v3_recorded: Option<bool>,
 ) -> Result<(), MigrationError> {
     let lineage_tail: Vec<&SchemaColumnContract> =
         AUTHORIZATION_PROJECTION_LINEAGE_FENCE_COLUMN_CONTRACTS
@@ -4857,10 +4878,16 @@ fn validate_resolved_archive_column_order(
             .iter()
             .filter(|expected| expected.table == table)
             .collect();
+    let manifest_v3_tail: Vec<&SchemaColumnContract> =
+        AUTHORIZATION_PROJECTION_MANIFEST_V3_COLUMN_CONTRACTS
+            .iter()
+            .filter(|expected| expected.table == table)
+            .collect();
     let declared_tail: Vec<&SchemaColumnContract> = lineage_tail
         .iter()
         .chain(invalidation_tail.iter())
         .chain(owned_execution_tail.iter())
+        .chain(manifest_v3_tail.iter())
         .copied()
         .collect();
 
@@ -4904,10 +4931,25 @@ fn validate_resolved_archive_column_order(
             "migration 20260914000001 is recorded but table {table} lacks its declared invalidation column; refusing to replay or recreate recorded history"
         )));
     }
-    if owned_execution_recorded == Some(true) && tail.len() < declared_tail.len() {
+    if owned_execution_recorded == Some(true)
+        && tail.len() < lineage_tail.len() + invalidation_tail.len() + owned_execution_tail.len()
+    {
         return Err(MigrationError::Failed(format!(
             "migration {PROJECTION_OWNED_EXECUTION_VERSION} is recorded but table {table} lacks its declared owned-execution columns; refusing to replay or recreate recorded history"
         )));
+    }
+    if !manifest_v3_tail.is_empty() {
+        let previous_tail_len = declared_tail.len() - manifest_v3_tail.len();
+        if tail.len() > previous_tail_len && tail.len() != declared_tail.len() {
+            return Err(MigrationError::Failed(
+                "authorization manifest v3 columns are partially present; refusing partial seal schema".to_owned(),
+            ));
+        }
+        if manifest_v3_recorded == Some(true) && tail.len() != declared_tail.len() {
+            return Err(MigrationError::Failed(format!(
+                "migration {AUTHORIZATION_PROJECTION_MANIFEST_V3_VERSION} is recorded but manifest seal columns are missing; refusing to replay recorded history"
+            )));
+        }
     }
     Ok(())
 }
@@ -4919,6 +4961,7 @@ async fn validate_incremental_projection_archive_schema_contract(
     let invalidation_recorded =
         Some(delta_event_published_evidence_invalidation_recorded(pool).await?);
     let owned_execution_recorded = Some(projection_owned_execution_recorded(pool).await?);
+    let manifest_v3_recorded = Some(authorization_projection_manifest_v3_recorded(pool).await?);
     for table in INCREMENTAL_PROJECTION_ARCHIVE_TABLES {
         validate_incremental_projection_archive_table_contract(
             pool,
@@ -4926,6 +4969,7 @@ async fn validate_incremental_projection_archive_schema_contract(
             lineage_recorded,
             invalidation_recorded,
             owned_execution_recorded,
+            manifest_v3_recorded,
         )
         .await?;
     }
@@ -5008,6 +5052,7 @@ async fn preflight_incremental_projection_archive_schema_contract(
     let lineage_recorded = authorization_projection_lineage_fence_recorded(pool).await?;
     let invalidation_recorded = delta_event_published_evidence_invalidation_recorded(pool).await?;
     let owned_execution_recorded = projection_owned_execution_recorded(pool).await?;
+    let manifest_v3_recorded = authorization_projection_manifest_v3_recorded(pool).await?;
     let mut complete = true;
 
     for table in INCREMENTAL_PROJECTION_ARCHIVE_TABLES {
@@ -5055,6 +5100,7 @@ async fn preflight_incremental_projection_archive_schema_contract(
                 Some(lineage_recorded),
                 Some(invalidation_recorded),
                 Some(owned_execution_recorded),
+                Some(manifest_v3_recorded),
             )
             .await?;
         }
@@ -5133,7 +5179,7 @@ async fn validate_archive_index_removal_postcondition(
         });
     }
     for (_, table, _) in POST_CREATOR_INDEX_REMOVALS {
-        validate_incremental_projection_archive_table_contract(pool, table, None, None, None)
+        validate_incremental_projection_archive_table_contract(pool, table, None, None, None, None)
             .await
             .map_err(|error| MigrationError::RecoveryRequired {
                 reason: format!(
@@ -5417,6 +5463,7 @@ async fn preflight_schema_contract_before_sqlx(
     migrations: &[Migration],
 ) -> Result<(), MigrationError> {
     preflight_standby_migration_gate(pool, applied_versions, migrations).await?;
+    let manifest_v3_complete = preflight_manifest_v3(pool, applied_versions, migrations).await?;
     let review_schema_complete =
         preflight_review_schema_contracts(pool, applied_versions, migrations).await?;
     preflight_monitor_schema_contract(pool, applied_versions, migrations).await?;
@@ -5433,8 +5480,10 @@ async fn preflight_schema_contract_before_sqlx(
         .filter(|migration| !applied_versions.contains(&migration.version))
         .collect();
 
-    let mut all_required_artifacts_present =
-        incremental_archive_complete && cross_city_schema_complete && review_schema_complete;
+    let mut all_required_artifacts_present = incremental_archive_complete
+        && cross_city_schema_complete
+        && review_schema_complete
+        && manifest_v3_complete;
     let mut absent_tables = HashSet::new();
     for (table, columns) in REQUIRED_SCHEMA_COLUMNS {
         let table_exists = schema_table_exists(pool, table).await?;
@@ -5558,6 +5607,11 @@ fn migration_matches_known_source(migration: &Migration) -> bool {
                 .is_some_and(|contract| {
                     canonical_sha384_hex(migration.sql.as_bytes()) == contract.source_sha384
                 });
+        }
+        if migration.version == AUTHORIZATION_PROJECTION_MANIFEST_V3_VERSION {
+            return migration.sql.as_ref() == AUTHORIZATION_PROJECTION_MANIFEST_V3_MIGRATION_SQL
+                && canonical_sha384_hex(migration.sql.as_bytes())
+                    == AUTHORIZATION_PROJECTION_MANIFEST_V3_SQL_SHA384;
         }
         if migration.version == PROJECTION_OWNED_EXECUTION_VERSION {
             return canonical_sha384_hex(migration.sql.as_bytes())
@@ -8377,6 +8431,35 @@ const DELTA_EVENT_PUBLISHED_EVIDENCE_INVALIDATION_COLUMN_CONTRACTS: &[SchemaColu
         collation: None,
     }];
 
+const AUTHORIZATION_PROJECTION_MANIFEST_V3_COLUMNS: &[(&str, &str)] = &[
+    (
+        "authorization_projection_manifest",
+        "manifest_digest_version",
+    ),
+    ("authorization_projection_manifest", "sealed_at"),
+];
+
+const AUTHORIZATION_PROJECTION_MANIFEST_V3_COLUMN_CONTRACTS: &[SchemaColumnContract] = &[
+    SchemaColumnContract {
+        table: "authorization_projection_manifest",
+        name: "manifest_digest_version",
+        column_type: "SMALLINT UNSIGNED",
+        not_null: true,
+        default: None,
+        charset: None,
+        collation: None,
+    },
+    SchemaColumnContract {
+        table: "authorization_projection_manifest",
+        name: "sealed_at",
+        column_type: "DATETIME",
+        not_null: true,
+        default: None,
+        charset: None,
+        collation: None,
+    },
+];
+
 const RULE_SET_SNAPSHOT_MANIFEST_COLUMN_CONTRACTS: &[SchemaColumnContract] = &[
     SchemaColumnContract {
         table: "rule_set_snapshot_manifest",
@@ -10180,6 +10263,14 @@ const PROJECTION_OWNED_EXECUTION_INDEXES: &[(&str, &str, &[&str], bool)] = &[(
 )];
 
 const EXACT_MIGRATION_ARTIFACT_CONTRACTS: &[ExactMigrationArtifactContract] = &[
+    ExactMigrationArtifactContract {
+        version: AUTHORIZATION_PROJECTION_MANIFEST_V3_VERSION,
+        source_sha384: AUTHORIZATION_PROJECTION_MANIFEST_V3_SQL_SHA384,
+        supports_existing_artifacts: true,
+        tables: &[],
+        columns: AUTHORIZATION_PROJECTION_MANIFEST_V3_COLUMNS,
+        indexes: &[],
+    },
     ExactMigrationArtifactContract {
         version: PROJECTION_OWNED_EXECUTION_VERSION,
         source_sha384: PROJECTION_OWNED_EXECUTION_SQL_SHA384,
@@ -12488,6 +12579,7 @@ pub async fn validate_schema_contract(pool: &MySqlPool) -> Result<(), MigrationE
         validate_indexes(pool, RULE_SET_SNAPSHOT_MANIFEST_INDEXES).await?;
     }
     validate_incremental_projection_archive_schema_contract(pool).await?;
+    validate_manifest_v3_runtime(pool).await?;
     // Cross-city schema is optional and default-off. Its enabled-only runtime
     // admission validates creator and proof tables in
     // `validate_cross_city_runtime_schema`; ordinary service startup never probes it.

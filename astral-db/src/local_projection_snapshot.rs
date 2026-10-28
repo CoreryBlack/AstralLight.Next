@@ -24,7 +24,8 @@
 //!   variant.
 //! - Frontier completeness is decided **per aggregate with exact identity**:
 //!   the snapshot frontier and the durable published scope must contain the
-//!   same aggregate keys with equal generations. A durable aggregate missing
+//!   same aggregate keys with equal publication stamps (generation, final
+//!   manifest digest and original sealing time). A durable aggregate missing
 //!   from the snapshot, a snapshot aggregate absent from the durable scope
 //!   (stale or foreign identity), a generation behind the durable one, and a
 //!   generation ahead of the durable one all map to rebuild/reconciliation.
@@ -40,11 +41,13 @@
 //!
 //! ```text
 //! [0..8)      magic: b"ASTRLPS1" (fixed ASCII)
-//! [8..12)     framed schema_version: u32 BE (1 = SNAPSHOT_SCHEMA_VERSION_V1)
+//! [8..12)     framed schema_version: u32 BE (current authorization edition)
 //! [12..20)    envelope_len: u64 BE (length of the canonical JSON envelope)
 //! [20..20+n)  envelope: canonical JSON bytes (n = envelope_len)
-//! [20+n..+32) integrity: SHA-256 over bytes[0..20+n) (raw 32 bytes)
+//! [20+n..+32) integrity: SHA-256(domain || bytes[0..20+n)) (raw 32 bytes)
 //! ```
+//!
+//! The integrity domain is [`astral_types::AUTHORIZATION_SNAPSHOT_DIGEST_DOMAIN`].
 //!
 //! The envelope JSON carries `schema_version` (must mirror the frame header),
 //! `created_at` (RFC 3339), the `source_frontier` (per-aggregate published
@@ -90,6 +93,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
+use astral_types::PublicationStamp;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Format constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,8 +103,12 @@ use time::OffsetDateTime;
 /// any parsing happens.
 pub const SNAPSHOT_MAGIC: [u8; 8] = *b"ASTRLPS1";
 
-/// Framed + envelope schema version understood by this reader/writer.
+/// Retired frame versions, retained as public identifiers for rejection diagnostics.
+/// Runtime readers and writers use [`SNAPSHOT_SCHEMA_VERSION`] exclusively.
 pub const SNAPSHOT_SCHEMA_VERSION_V1: u32 = 1;
+pub const SNAPSHOT_SCHEMA_VERSION_V2: u32 = 2;
+/// Current framed + envelope schema version, shared with the authorization edition.
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = astral_types::AUTHORIZATION_EDITION as u32;
 
 /// `magic(8) + schema_version(4) + envelope_len(8)`.
 const HEADER_LEN: usize = 20;
@@ -143,7 +152,9 @@ pub enum LocalSnapshotError {
     BadMagic(String),
 
     /// The framed schema version is not understood by this build.
-    #[error("snapshot schema version {found} is not supported (supported: {SNAPSHOT_SCHEMA_VERSION_V1})")]
+    #[error(
+        "snapshot schema version {found} is not supported (supported: {SNAPSHOT_SCHEMA_VERSION})"
+    )]
     UnsupportedSchemaVersion { found: u32 },
 
     /// The declared envelope length disagrees with the actual file size.
@@ -194,9 +205,9 @@ pub enum LocalSnapshotError {
 /// generations follow the projection convention (start at 1, never 0).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotFrontier {
-    /// Aggregate key -> published generation covered by the payload.
+    /// Aggregate key -> complete published stamp covered by the payload.
     #[serde(default)]
-    pub aggregates: BTreeMap<String, u64>,
+    pub aggregates: BTreeMap<String, PublicationStamp>,
 }
 
 impl SnapshotFrontier {
@@ -204,12 +215,17 @@ impl SnapshotFrontier {
     /// empty-system snapshot). Advisory telemetry only: it never proves
     /// completeness (see [`decide_snapshot_fallback_per_scope`]).
     pub fn max_generation(&self) -> Option<u64> {
-        self.aggregates.values().copied().max()
+        self.aggregates.values().map(|stamp| stamp.generation).max()
+    }
+
+    /// Complete publication stamp covered for one aggregate (`None` when not covered).
+    pub fn stamp_for(&self, aggregate_key: &str) -> Option<&PublicationStamp> {
+        self.aggregates.get(aggregate_key)
     }
 
     /// Generation covered for one aggregate (`None` when not covered).
     pub fn generation_for(&self, aggregate_key: &str) -> Option<u64> {
-        self.aggregates.get(aggregate_key).copied()
+        self.stamp_for(aggregate_key).map(|stamp| stamp.generation)
     }
 
     /// Whether the frontier covers `durable_generation` for one aggregate.
@@ -223,17 +239,16 @@ impl SnapshotFrontier {
         )
     }
 
-    /// Frontier sanity: aggregate keys non-empty, generations >= 1 (zero is
-    /// not a valid published generation and would silently weaken staleness
-    /// checks).
+    /// Frontier sanity: aggregate keys non-empty and every publication stamp
+    /// is valid. A generation-only value is never accepted as proof.
     pub fn validate(&self) -> Result<(), String> {
-        for (key, generation) in &self.aggregates {
+        for (key, stamp) in &self.aggregates {
             if key.is_empty() {
                 return Err("aggregate key is empty".to_owned());
             }
-            if *generation == 0 {
-                return Err(format!("aggregate '{key}' carries generation 0"));
-            }
+            stamp.validate().map_err(|error| {
+                format!("aggregate '{key}' carries invalid publication stamp: {error}")
+            })?;
         }
         Ok(())
     }
@@ -266,14 +281,14 @@ pub struct SnapshotEnvelope {
 }
 
 impl SnapshotEnvelope {
-    /// Builds a V1 envelope; the schema version is fixed by this module.
+    /// The framed schema version is fixed by this module.
     pub fn new(
         created_at: OffsetDateTime,
         source_frontier: SnapshotFrontier,
         payload: serde_json::Value,
     ) -> Self {
         Self {
-            schema_version: SNAPSHOT_SCHEMA_VERSION_V1,
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
             created_at,
             source_frontier,
             payload,
@@ -298,7 +313,7 @@ fn frame_snapshot_with_limit(
     envelope: &SnapshotEnvelope,
     max_envelope_bytes: u64,
 ) -> Result<Vec<u8>, LocalSnapshotError> {
-    if envelope.schema_version != SNAPSHOT_SCHEMA_VERSION_V1 {
+    if envelope.schema_version != SNAPSHOT_SCHEMA_VERSION {
         return Err(LocalSnapshotError::UnsupportedSchemaVersion {
             found: envelope.schema_version,
         });
@@ -332,10 +347,12 @@ fn framed_bytes(schema_version: u32, envelope_bytes: &[u8]) -> Vec<u8> {
     framed
 }
 
-/// SHA-256 over magic + version + length prefix + envelope bytes; the length
-/// prefix is covered so a truncated envelope can never re-align the trailer.
+/// SHA-256 over the immutable framing fields plus the V6 snapshot domain,
+/// magic + version + length prefix + envelope bytes; the length prefix is
+/// covered so a truncated envelope can never re-align the trailer.
 fn framed_digest(schema_version: u32, envelope_bytes: &[u8]) -> [u8; DIGEST_LEN] {
     let mut hasher = Sha256::new();
+    hasher.update(astral_types::AUTHORIZATION_SNAPSHOT_DIGEST_DOMAIN);
     hasher.update(SNAPSHOT_MAGIC);
     hasher.update(schema_version.to_be_bytes());
     hasher.update((envelope_bytes.len() as u64).to_be_bytes());
@@ -370,7 +387,7 @@ fn parse_snapshot_bytes_with_limit(
         return Err(LocalSnapshotError::BadMagic(hex::encode(magic)));
     }
     let schema_version = u32::from_be_bytes(bytes[8..12].try_into().expect("fixed 4-byte slice"));
-    if schema_version != SNAPSHOT_SCHEMA_VERSION_V1 {
+    if schema_version != SNAPSHOT_SCHEMA_VERSION {
         return Err(LocalSnapshotError::UnsupportedSchemaVersion {
             found: schema_version,
         });
@@ -646,6 +663,9 @@ pub enum ScopeDivergenceKind {
     /// Snapshot generation beyond the durable generation; the ledger cannot
     /// account for that publication, so reconcile via rebuild.
     Ahead,
+    /// Snapshot and durable generations are equal but their manifest digest or
+    /// seal differs, so the publication proof is not the same.
+    StampMismatch,
 }
 
 /// What a startup path must do with the local snapshot.
@@ -681,13 +701,13 @@ pub enum SnapshotFallbackDecision {
 /// durable scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableFrontier {
-    aggregates: BTreeMap<String, u64>,
+    aggregates: BTreeMap<String, PublicationStamp>,
 }
 
 impl DurableFrontier {
-    /// Validates and wraps a durable scope; empty keys and zero generations
-    /// are rejected with [`LocalSnapshotError::InvalidFrontier`].
-    pub fn new(aggregates: BTreeMap<String, u64>) -> Result<Self, LocalSnapshotError> {
+    /// Validates and wraps a durable scope; empty keys and invalid stamps are
+    /// rejected with [`LocalSnapshotError::InvalidFrontier`].
+    pub fn new(aggregates: BTreeMap<String, PublicationStamp>) -> Result<Self, LocalSnapshotError> {
         let frontier = SnapshotFrontier { aggregates };
         frontier
             .validate()
@@ -704,14 +724,19 @@ impl DurableFrontier {
         }
     }
 
-    /// The validated durable scope as key -> generation.
-    pub fn aggregates(&self) -> &BTreeMap<String, u64> {
+    /// The validated durable scope as key -> complete publication stamp.
+    pub fn aggregates(&self) -> &BTreeMap<String, PublicationStamp> {
         &self.aggregates
+    }
+
+    /// Complete durable publication stamp for one aggregate.
+    pub fn stamp_for(&self, aggregate_key: &str) -> Option<&PublicationStamp> {
+        self.aggregates.get(aggregate_key)
     }
 
     /// Durable generation for one aggregate (`None` when not published).
     pub fn generation_for(&self, aggregate_key: &str) -> Option<u64> {
-        self.aggregates.get(aggregate_key).copied()
+        self.stamp_for(aggregate_key).map(|stamp| stamp.generation)
     }
 
     /// Whether the durable scope publishes nothing.
@@ -760,61 +785,71 @@ fn find_scope_divergence(
     let mut next_durable = durable_entries.next();
     loop {
         match (next_snapshot, next_durable) {
-            (
-                Some((snapshot_key, snapshot_generation)),
-                Some((durable_key, durable_generation)),
-            ) => match snapshot_key.cmp(durable_key) {
-                Ordering::Equal => {
-                    if snapshot_generation < durable_generation {
+            (Some((snapshot_key, snapshot_stamp)), Some((durable_key, durable_stamp))) => {
+                match snapshot_key.cmp(durable_key) {
+                    Ordering::Equal => {
+                        match snapshot_stamp.generation.cmp(&durable_stamp.generation) {
+                            Ordering::Less => {
+                                return Some(RebuildCause::ScopeDivergence {
+                                    aggregate_key: snapshot_key.clone(),
+                                    kind: ScopeDivergenceKind::Stale,
+                                    snapshot_generation: Some(snapshot_stamp.generation),
+                                    durable_generation: Some(durable_stamp.generation),
+                                });
+                            }
+                            Ordering::Greater => {
+                                return Some(RebuildCause::ScopeDivergence {
+                                    aggregate_key: snapshot_key.clone(),
+                                    kind: ScopeDivergenceKind::Ahead,
+                                    snapshot_generation: Some(snapshot_stamp.generation),
+                                    durable_generation: Some(durable_stamp.generation),
+                                });
+                            }
+                            Ordering::Equal if snapshot_stamp != durable_stamp => {
+                                return Some(RebuildCause::ScopeDivergence {
+                                    aggregate_key: snapshot_key.clone(),
+                                    kind: ScopeDivergenceKind::StampMismatch,
+                                    snapshot_generation: Some(snapshot_stamp.generation),
+                                    durable_generation: Some(durable_stamp.generation),
+                                });
+                            }
+                            Ordering::Equal => {}
+                        }
+                        next_snapshot = snapshot_entries.next();
+                        next_durable = durable_entries.next();
+                    }
+                    Ordering::Less => {
                         return Some(RebuildCause::ScopeDivergence {
                             aggregate_key: snapshot_key.clone(),
-                            kind: ScopeDivergenceKind::Stale,
-                            snapshot_generation: Some(*snapshot_generation),
-                            durable_generation: Some(*durable_generation),
+                            kind: ScopeDivergenceKind::ExtraInSnapshot,
+                            snapshot_generation: Some(snapshot_stamp.generation),
+                            durable_generation: None,
                         });
                     }
-                    if snapshot_generation > durable_generation {
+                    Ordering::Greater => {
                         return Some(RebuildCause::ScopeDivergence {
-                            aggregate_key: snapshot_key.clone(),
-                            kind: ScopeDivergenceKind::Ahead,
-                            snapshot_generation: Some(*snapshot_generation),
-                            durable_generation: Some(*durable_generation),
+                            aggregate_key: durable_key.clone(),
+                            kind: ScopeDivergenceKind::MissingFromSnapshot,
+                            snapshot_generation: None,
+                            durable_generation: Some(durable_stamp.generation),
                         });
                     }
-                    next_snapshot = snapshot_entries.next();
-                    next_durable = durable_entries.next();
                 }
-                Ordering::Less => {
-                    return Some(RebuildCause::ScopeDivergence {
-                        aggregate_key: snapshot_key.clone(),
-                        kind: ScopeDivergenceKind::ExtraInSnapshot,
-                        snapshot_generation: Some(*snapshot_generation),
-                        durable_generation: None,
-                    });
-                }
-                Ordering::Greater => {
-                    return Some(RebuildCause::ScopeDivergence {
-                        aggregate_key: durable_key.clone(),
-                        kind: ScopeDivergenceKind::MissingFromSnapshot,
-                        snapshot_generation: None,
-                        durable_generation: Some(*durable_generation),
-                    });
-                }
-            },
-            (Some((snapshot_key, snapshot_generation)), None) => {
+            }
+            (Some((snapshot_key, snapshot_stamp)), None) => {
                 return Some(RebuildCause::ScopeDivergence {
                     aggregate_key: snapshot_key.clone(),
                     kind: ScopeDivergenceKind::ExtraInSnapshot,
-                    snapshot_generation: Some(*snapshot_generation),
+                    snapshot_generation: Some(snapshot_stamp.generation),
                     durable_generation: None,
                 });
             }
-            (None, Some((durable_key, durable_generation))) => {
+            (None, Some((durable_key, durable_stamp))) => {
                 return Some(RebuildCause::ScopeDivergence {
                     aggregate_key: durable_key.clone(),
                     kind: ScopeDivergenceKind::MissingFromSnapshot,
                     snapshot_generation: None,
-                    durable_generation: Some(*durable_generation),
+                    durable_generation: Some(durable_stamp.generation),
                 });
             }
             (None, None) => return None,
@@ -1028,11 +1063,29 @@ mod tests {
         envelope_with_frontier(frontier(&[("tenant:1:card:2", frontier_generation)]))
     }
 
+    fn valid_stamp(generation: u64) -> PublicationStamp {
+        PublicationStamp::new(
+            generation,
+            "a".repeat(64),
+            astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).expect("valid seal"),
+        )
+        .expect("valid publication stamp")
+    }
+
+    fn raw_stamp(generation: u64) -> PublicationStamp {
+        PublicationStamp {
+            generation,
+            manifest_digest_hex: "a".repeat(64),
+            seal: astral_types::PublicationSeal::from_unix_seconds(1_700_000_000)
+                .expect("valid seal"),
+        }
+    }
+
     fn frontier(pairs: &[(&str, u64)]) -> SnapshotFrontier {
         SnapshotFrontier {
             aggregates: pairs
                 .iter()
-                .map(|(key, generation)| ((*key).to_owned(), *generation))
+                .map(|(key, generation)| ((*key).to_owned(), valid_stamp(*generation)))
                 .collect(),
         }
     }
@@ -1059,7 +1112,7 @@ mod tests {
         let framed = frame_snapshot(&envelope).expect("frame");
         let parsed = parse_snapshot_bytes(&framed).expect("parse");
         assert_eq!(parsed, envelope);
-        assert_eq!(parsed.schema_version, SNAPSHOT_SCHEMA_VERSION_V1);
+        assert_eq!(parsed.schema_version, SNAPSHOT_SCHEMA_VERSION);
         assert_eq!(
             parsed.source_frontier.generation_for("tenant:1:card:2"),
             Some(7)
@@ -1151,31 +1204,33 @@ mod tests {
 
     #[test]
     fn unsupported_framed_schema_version_rejected_before_digest() {
-        // Hand-build a V2 frame with a V2-consistent digest: the version gate
-        // must fire regardless of digest correctness.
+        // Hand-build a legacy V1 frame with a V1-consistent digest: the
+        // version gate must fire regardless of digest correctness.
         let envelope_bytes = serde_json::to_vec(&test_envelope(7)).expect("serialize");
-        let digest = framed_digest(2, &envelope_bytes);
+        let digest = framed_digest(SNAPSHOT_SCHEMA_VERSION_V1, &envelope_bytes);
         let mut framed = Vec::new();
         framed.extend_from_slice(&SNAPSHOT_MAGIC);
-        framed.extend_from_slice(&2u32.to_be_bytes());
+        framed.extend_from_slice(&SNAPSHOT_SCHEMA_VERSION_V1.to_be_bytes());
         framed.extend_from_slice(&(envelope_bytes.len() as u64).to_be_bytes());
         framed.extend_from_slice(&envelope_bytes);
         framed.extend_from_slice(&digest);
-        let error = parse_snapshot_bytes(&framed).expect_err("v2 frame");
+        let error = parse_snapshot_bytes(&framed).expect_err("v1 frame");
         assert!(matches!(
             error,
-            LocalSnapshotError::UnsupportedSchemaVersion { found: 2 }
+            LocalSnapshotError::UnsupportedSchemaVersion {
+                found: SNAPSHOT_SCHEMA_VERSION_V1
+            }
         ));
     }
 
     #[test]
     fn stale_digest_on_unknown_version_still_reports_version_first() {
         let mut framed = frame_snapshot(&test_envelope(7)).expect("frame");
-        framed[11] = 2; // version bytes 0..0=2, digest now stale
-        let error = parse_snapshot_bytes(&framed).expect_err("v2 frame, stale digest");
+        framed[11] = 1; // legacy V1, digest now stale
+        let error = parse_snapshot_bytes(&framed).expect_err("v1 frame, stale digest");
         assert!(matches!(
             error,
-            LocalSnapshotError::UnsupportedSchemaVersion { found: 2 }
+            LocalSnapshotError::UnsupportedSchemaVersion { found: 1 }
         ));
     }
 
@@ -1183,15 +1238,15 @@ mod tests {
     fn envelope_schema_disagreeing_with_frame_rejected() {
         // Valid digest, but the inner envelope claims a different version.
         let mut tampered = test_envelope(7);
-        tampered.schema_version = 2;
+        tampered.schema_version = 1;
         let envelope_bytes = serde_json::to_vec(&tampered).expect("serialize");
-        let framed = framed_bytes(SNAPSHOT_SCHEMA_VERSION_V1, &envelope_bytes);
+        let framed = framed_bytes(SNAPSHOT_SCHEMA_VERSION, &envelope_bytes);
         let error = parse_snapshot_bytes(&framed).expect_err("version disagreement");
         assert!(matches!(
             error,
             LocalSnapshotError::EnvelopeSchemaMismatch {
-                frame: SNAPSHOT_SCHEMA_VERSION_V1,
-                envelope: 2
+                frame: SNAPSHOT_SCHEMA_VERSION,
+                envelope: SNAPSHOT_SCHEMA_VERSION_V1
             }
         ));
     }
@@ -1219,9 +1274,9 @@ mod tests {
             pretty.as_bytes(),
             serde_json::to_vec(&envelope).expect("compact")
         );
-        let mut framed = framed_bytes(SNAPSHOT_SCHEMA_VERSION_V1, pretty.as_bytes());
+        let mut framed = framed_bytes(SNAPSHOT_SCHEMA_VERSION, pretty.as_bytes());
         let trailer_at = HEADER_LEN + pretty.len();
-        let digest = framed_digest(SNAPSHOT_SCHEMA_VERSION_V1, pretty.as_bytes());
+        let digest = framed_digest(SNAPSHOT_SCHEMA_VERSION, pretty.as_bytes());
         framed.truncate(trailer_at);
         framed.extend_from_slice(&digest);
         let error = parse_snapshot_bytes(&framed).expect_err("pretty JSON");
@@ -1231,9 +1286,9 @@ mod tests {
     #[test]
     fn malformed_envelope_json_rejected() {
         let envelope_bytes = b"{}" as &[u8];
-        let mut framed = framed_bytes(SNAPSHOT_SCHEMA_VERSION_V1, envelope_bytes);
+        let mut framed = framed_bytes(SNAPSHOT_SCHEMA_VERSION, envelope_bytes);
         let trailer_at = HEADER_LEN + envelope_bytes.len();
-        let digest = framed_digest(SNAPSHOT_SCHEMA_VERSION_V1, envelope_bytes);
+        let digest = framed_digest(SNAPSHOT_SCHEMA_VERSION, envelope_bytes);
         framed.truncate(trailer_at);
         framed.extend_from_slice(&digest);
         let error = parse_snapshot_bytes(&framed).expect_err("empty object");
@@ -1245,9 +1300,9 @@ mod tests {
         let mut value = serde_json::to_value(test_envelope(7)).expect("to value");
         value["extra_field"] = json!("surprise");
         let envelope_bytes = serde_json::to_vec(&value).expect("serialize");
-        let mut framed = framed_bytes(SNAPSHOT_SCHEMA_VERSION_V1, &envelope_bytes);
+        let mut framed = framed_bytes(SNAPSHOT_SCHEMA_VERSION, &envelope_bytes);
         let trailer_at = HEADER_LEN + envelope_bytes.len();
-        let digest = framed_digest(SNAPSHOT_SCHEMA_VERSION_V1, &envelope_bytes);
+        let digest = framed_digest(SNAPSHOT_SCHEMA_VERSION, &envelope_bytes);
         framed.truncate(trailer_at);
         framed.extend_from_slice(&digest);
         let error = parse_snapshot_bytes(&framed).expect_err("extra field");
@@ -1256,7 +1311,11 @@ mod tests {
 
     #[test]
     fn invalid_frontier_zero_generation_rejected() {
-        let envelope = envelope_with_frontier(frontier(&[("tenant:1:card:2", 7), ("x", 0)]));
+        let mut source_frontier = frontier(&[("tenant:1:card:2", 7)]);
+        source_frontier
+            .aggregates
+            .insert("x".to_owned(), raw_stamp(0));
+        let envelope = envelope_with_frontier(source_frontier);
         let error = frame_snapshot(&envelope).expect_err("zero generation");
         assert!(matches!(error, LocalSnapshotError::InvalidFrontier(_)));
     }
@@ -1277,7 +1336,7 @@ mod tests {
         // fire before any length arithmetic or slicing.
         let mut framed = Vec::new();
         framed.extend_from_slice(&SNAPSHOT_MAGIC);
-        framed.extend_from_slice(&SNAPSHOT_SCHEMA_VERSION_V1.to_be_bytes());
+        framed.extend_from_slice(&SNAPSHOT_SCHEMA_VERSION.to_be_bytes());
         framed.extend_from_slice(&(MAX_SNAPSHOT_ENVELOPE_BYTES + 1).to_be_bytes());
         framed.extend_from_slice(&[0u8; DIGEST_LEN]);
         let error = parse_snapshot_bytes(&framed).expect_err("oversized declaration");
@@ -1665,14 +1724,14 @@ mod tests {
     #[test]
     fn durable_frontier_rejects_invalid_entries() {
         let mut zero_generation = BTreeMap::new();
-        zero_generation.insert("a".to_owned(), 0u64);
+        zero_generation.insert("a".to_owned(), raw_stamp(0));
         assert!(matches!(
             DurableFrontier::new(zero_generation),
             Err(LocalSnapshotError::InvalidFrontier(_))
         ));
 
         let mut empty_key = BTreeMap::new();
-        empty_key.insert(String::new(), 1u64);
+        empty_key.insert(String::new(), raw_stamp(1));
         assert!(matches!(
             DurableFrontier::new(empty_key),
             Err(LocalSnapshotError::InvalidFrontier(_))

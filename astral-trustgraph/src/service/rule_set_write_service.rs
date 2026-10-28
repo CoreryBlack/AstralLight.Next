@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use astral_types::{AstralError, ResourceRegistry, ACTION_ALIASES};
+use astral_types::{AstralError, ResourceRegistry, RuleSetEntryDefinition, ACTION_ALIASES};
 
 use crate::repository::audit_log_repository::RuleSetMutationContext;
 use policy_engine::{evaluator_for, normalize_condition_json, ConditionGroup};
@@ -245,7 +245,7 @@ impl RuleSetWriteService {
         Ok(())
     }
 
-    /// 新增条目 → rebuild 规则集快照（卡片 projection 已在 repository source tx 登记）
+    /// 新增条目并登记规则集及受影响卡片的 durable 投影，提交后由 worker 物化。
     pub async fn add_entry(
         &self,
         rule_set_id: i64,
@@ -272,7 +272,7 @@ impl RuleSetWriteService {
         Ok(entry_id)
     }
 
-    /// 更新条目 → rebuild 规则集快照（卡片 projection 已在 repository source tx 登记）
+    /// 更新条目并登记规则集及受影响卡片的 durable 投影，提交后由 worker 物化。
     pub async fn update_entry(
         &self,
         rule_set_id: i64,
@@ -345,9 +345,18 @@ impl RuleSetWriteService {
     pub async fn list_card_bindings(
         &self,
         card_id: i64,
-    ) -> Result<Vec<crate::repository::rule_set_repository::CardRuleSetBindingRow>, AstralError>
+    ) -> Result<Vec<crate::repository::rule_set_repository::CardRuleSetBindingView>, AstralError>
     {
         self.repo.list_card_bindings(card_id).await
+    }
+
+    /// 查询单个完整 canonical source entry，供写入成功响应回读。
+    pub async fn get_entry(
+        &self,
+        rule_set_id: i64,
+        entry_id: i64,
+    ) -> Result<Option<RuleSetEntryDefinition>, AstralError> {
+        self.repo.get_entry(rule_set_id, entry_id).await
     }
 
     /// 绑定卡 → 卡片落 durable 投影事件
@@ -397,8 +406,7 @@ mod tests {
 
     #[test]
     fn update_request_shape_carries_no_ownership_mutation_field() {
-        // 编译期 source 形状测试：UpdateRuleSetRequest 不再携带 ref_type/source_type
-        // 字段 —— HTTP wire DTO 仍接受 refType（请求兼容），但它不会被转发为变更字段。
+        // HTTP refType 仅作当前 source_type 的一致性断言，不进入 mutation。
         let req = UpdateRuleSetRequest {
             name: "n".into(),
             description: Some("d".into()),

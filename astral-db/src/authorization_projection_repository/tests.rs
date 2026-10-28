@@ -2,7 +2,9 @@ use super::*;
 use crate::grant_repository::DELTA_STATUS_QUARANTINED;
 use astral_types::{
     BindingLayer, DomainScopeRequirement, GrantEffect, GrantId, GrantProvenance, GrantRevision,
-    GrantSourceKind, GrantState, TenantScope, ValidityWindow,
+    GrantSourceKind, GrantState, TenantScope, ValidityWindow, AUTHORIZATION_EDITION,
+    AUTHORIZATION_MANIFEST_DIGEST_DOMAIN, AUTHORIZATION_SEGMENT_DEPENDENCY_DOMAIN,
+    AUTHORIZATION_SEGMENT_FORMAT, AUTHORIZATION_SEGMENT_SEMANTIC_DOMAIN,
 };
 
 /// 维度守卫测试的“字段名 + 篡改函数”用例（type_complexity 别名）。
@@ -151,6 +153,7 @@ fn identity() -> ProjectionAggregateIdentity {
 
 fn digest_input<'a>(digest_hexes: Vec<String>) -> ManifestDigestInput<'a> {
     ManifestDigestInput {
+        seal: PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
         tenant_id: 7,
         aggregate_type: "CARD",
         aggregate_id: 17,
@@ -823,9 +826,10 @@ fn zero_sentinel_never_proves_history_without_the_latch() {
 
 #[test]
 fn staging_sql_shape_persists_durable_lineage_columns() {
-    // The manifest insert writes BOTH new columns on every build.
     assert!(
-        MANIFEST_INSERT_SQL.contains("parent_manifest_id, revoke_fence, status"),
+        MANIFEST_INSERT_SQL.contains(
+            "parent_manifest_id, revoke_fence, manifest_digest_version, sealed_at, status"
+        ),
         "{MANIFEST_INSERT_SQL}"
     );
     assert!(MANIFEST_INSERT_SQL.ends_with("'BUILDING')"));
@@ -833,6 +837,8 @@ fn staging_sql_shape_persists_durable_lineage_columns() {
     // immutable-replay verification can rely on them byte-for-byte.
     assert!(MANIFEST_ROW_COLUMNS.contains("parent_manifest_id"));
     assert!(MANIFEST_ROW_COLUMNS.contains("revoke_fence"));
+    assert!(MANIFEST_ROW_COLUMNS.contains("manifest_digest_version"));
+    assert!(MANIFEST_ROW_COLUMNS.contains("sealed_at"));
     assert!(POINTER_ROW_COLUMNS.contains("revoke_fence"));
     assert!(POINTER_ROW_COLUMNS.contains("revoke_fence_proven"));
 }
@@ -864,7 +870,7 @@ fn resumed_reference_equivalence_requires_full_field_agreement() {
         semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap(),
         dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap(),
         compiler_version: "phase2-authorization-kernel-v1".to_owned(),
-        format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1.to_owned(),
+        format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON.to_owned(),
         row_count: 2,
         byte_size: 128,
         grants: vec![grant(1), grant(2)],
@@ -1124,7 +1130,7 @@ fn staged_queries_are_parameterized_without_interpolation_surface() {
         );
     }
     assert_eq!(REFERENCE_INSERT_SQL.matches('?').count(), 11);
-    assert_eq!(MANIFEST_INSERT_SQL.matches('?').count(), 15);
+    assert_eq!(MANIFEST_INSERT_SQL.matches('?').count(), 17);
     assert_eq!(SEGMENT_INSERT_SQL.matches('?').count(), 12);
     assert_eq!(MANIFEST_CLAIM_INSTALL_SQL.matches('?').count(), 4);
     assert_eq!(MANIFEST_FINALIZE_SQL.matches('?').count(), 8);
@@ -2339,7 +2345,7 @@ fn sealed_snapshot(
         semantic_hash: semantic,
         dependency_hash: dependency,
         compiler_version: compiler_version.to_owned(),
-        format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1.to_owned(),
+        format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON.to_owned(),
         row_count: grants.len() as u64,
         byte_size: payload.len() as u64,
         grants: grants.to_vec(),
@@ -2428,6 +2434,61 @@ fn segment_local_seals_bind_every_immutable_dimension_and_stay_generation_invari
             "{mutation} must move the dependency seal"
         );
     }
+}
+
+#[test]
+fn segment_local_seals_reject_legacy_domains_and_bind_current_domains_independently() {
+    let identity = identity();
+    let payload = encode_segment_payload(&[grant(1)]).unwrap();
+    let content_digest = Sha256Digest::from_raw_bytes(sha256_digest_bytes(&payload));
+    let input = SegmentLocalSealInput {
+        identity: &identity,
+        card_id: Some(17),
+        compiler_version: "compiler-v1",
+        segment_format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON,
+        row_count: 1,
+        content_digest: &content_digest,
+    };
+    let current_semantic =
+        compute_segment_local_seal(AUTHORIZATION_SEGMENT_SEMANTIC_DOMAIN, &input).unwrap();
+    let current_dependency =
+        compute_segment_local_seal(AUTHORIZATION_SEGMENT_DEPENDENCY_DOMAIN, &input).unwrap();
+    assert_eq!(
+        current_semantic,
+        compute_segment_semantic_hash(&input).unwrap()
+    );
+    assert_eq!(
+        current_dependency,
+        compute_segment_dependency_hash(&input).unwrap()
+    );
+    assert_ne!(current_semantic, current_dependency);
+
+    let legacy_semantic =
+        compute_segment_local_seal(b"astral-auth-segment-seal-v1/semantic", &input).unwrap();
+    let legacy_dependency =
+        compute_segment_local_seal(b"astral-auth-segment-seal-v1/dependency", &input).unwrap();
+    assert_ne!(legacy_semantic, current_semantic);
+    assert_ne!(legacy_dependency, current_dependency);
+
+    let legacy_snapshot = AuthorizationSegmentSnapshot {
+        segment_id: 9,
+        identity: identity.clone(),
+        card_id: Some(17),
+        content_digest,
+        semantic_hash: legacy_semantic,
+        dependency_hash: legacy_dependency,
+        compiler_version: input.compiler_version.to_owned(),
+        format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON.to_owned(),
+        row_count: input.row_count,
+        byte_size: payload.len() as u64,
+        grants: vec![grant(1)],
+    };
+    assert!(verify_segment_local_seal(&legacy_snapshot).is_err());
+    assert_eq!(
+        SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON,
+        AUTHORIZATION_SEGMENT_FORMAT
+    );
+    assert_eq!(AUTHORIZATION_EDITION, PublicationSeal::DIGEST_VERSION);
 }
 
 #[test]
@@ -2546,7 +2607,7 @@ fn identical_segment_verification_reports_compiler_stamp_divergence_as_its_own_c
     assert!(error.contains("digest_metadata_collision"), "{error}");
 
     let mut foreign_format = snapshot.clone();
-    foreign_format.format = "foreign_format".to_owned();
+    foreign_format.format = SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1.to_owned();
     let error = assert_identical_segment(
         &foreign_format,
         &request,
@@ -2723,6 +2784,13 @@ fn parent_chain_verification_pins_the_parents_own_global_hashes_only() {
         lease_owner: None,
         lease_token_hash: None,
         lease_expires_at: None,
+        manifest_digest_version: PublicationSeal::DIGEST_VERSION,
+        sealed_at: {
+            let at = PublicationSeal::from_unix_seconds(1_700_000_000)
+                .unwrap()
+                .sealed_at();
+            PrimitiveDateTime::new(at.date(), at.time())
+        },
         parent_manifest_id: None,
         revoke_fence: 0,
     };
@@ -2756,6 +2824,7 @@ fn parent_chain_verification_pins_the_parents_own_global_hashes_only() {
     let semantic_hex = hex::encode(&parent_row.semantic_hash);
     let dependency_hex = hex::encode(&parent_row.dependency_hash);
     let sealed = compute_manifest_digest(&ManifestDigestInput {
+        seal: parent_row.decode_seal().unwrap(),
         tenant_id: parent_row.tenant_id,
         aggregate_type: &parent_row.aggregate_type,
         aggregate_id: parent_row.aggregate_id,
@@ -3173,7 +3242,12 @@ fn frontier_manifest(
     source_generation: u64,
     revoke_fence: u64,
 ) -> PublishedGenerationSummary {
+    let seal = PublicationSeal::from_unix_seconds(1_700_000_000).unwrap();
+    let manifest_digest = Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"manifest"));
     PublishedGenerationSummary {
+        seal,
+        stamp: astral_types::PublicationStamp::new(generation, manifest_digest.as_hex(), seal)
+            .unwrap(),
         manifest_id: 700 + generation as i64,
         generation,
         source_generation,
@@ -3183,7 +3257,7 @@ fn frontier_manifest(
         semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap(),
         dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap(),
         compiler_version: FRONTIER_COMPILER.to_owned(),
-        manifest_digest: Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"manifest")),
+        manifest_digest,
         parent_manifest_id: Some(699),
         revoke_fence,
         card_id: Some(17),
@@ -3330,6 +3404,57 @@ fn published_frontier_assembles_contiguous_chain_with_event_mapping() {
     );
     assert_eq!(frontier.frontier_generation("e-g2"), Some(2));
     assert_eq!(frontier.frontier_generation("absent"), None);
+}
+
+#[test]
+fn published_frontier_rejects_compact_stamp_and_pointer_identity_splits() {
+    let frontier = assemble_happy();
+    frontier.validate_publication_stamp().unwrap();
+    for dimension in 0..6 {
+        let mut divergent = frontier.clone();
+        match dimension {
+            0 => divergent.stamp.generation += 1,
+            1 => divergent.stamp.manifest_digest_hex = "cd".repeat(32),
+            2 => {
+                divergent.stamp.seal =
+                    astral_types::PublicationSeal::from_unix_seconds(1_700_000_001).unwrap()
+            }
+            3 => divergent.pointer.current_generation += 1,
+            4 => divergent.pointer.manifest_id += 1,
+            5 => divergent.pointer.identity.tenant_id += 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            divergent.validate_publication_stamp().is_err(),
+            "dimension={dimension}"
+        );
+    }
+    let (identity, mut pointer, mut manifest, plans, deltas) = happy_frontier_inputs();
+    pointer.manifest_id += 1;
+    assert!(assemble_published_aggregate_frontier(
+        &identity,
+        &pointer,
+        &manifest,
+        &plans,
+        &deltas,
+        &[],
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("frontier_pointer_manifest_id_split"));
+    pointer.manifest_id -= 1;
+    manifest.stamp.manifest_digest_hex = "cd".repeat(32);
+    assert!(assemble_published_aggregate_frontier(
+        &identity,
+        &pointer,
+        &manifest,
+        &plans,
+        &deltas,
+        &[],
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("summary_publication_stamp_mismatch"));
 }
 
 #[test]
@@ -3710,7 +3835,7 @@ fn evidence_segment(
         semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap(),
         dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap(),
         compiler_version: "phase2-authorization-kernel-v1".to_owned(),
-        format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1.to_owned(),
+        format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON.to_owned(),
         row_count: grants.len() as u64,
         byte_size: 128,
         grants,
@@ -3747,6 +3872,7 @@ fn published_card_state(
         .collect();
     let total_grant_count = segments.iter().map(|s| s.row_count).sum::<u64>();
     AuthorizationPublishedState {
+        seal: PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
         pointer: pointer.clone(),
         manifest_id: pointer.manifest_id,
         generation: pointer.current_generation,
@@ -3827,15 +3953,6 @@ fn whole_scope_pointer_scans_are_sql_bounded_cap_plus_one() {
     // Exactly the one over-limit probe binding; no hidden second
     // placeholder.
     assert_eq!(sql_placeholder_count(&locked), 1);
-
-    // Non-locking hint variant: same bounded cut, no row locks.
-    let ordered =
-        format!("{SELECT_PREFIX}{POINTER_ROW_COLUMNS}{POINTER_ROWS_ALL_ORDERED_BOUNDED_TAIL}");
-    assert!(ordered.contains("FROM authorization_projection_current"));
-    assert!(ordered.contains("ORDER BY tenant_id ASC, aggregate_type ASC, aggregate_id ASC"));
-    assert!(ordered.ends_with("LIMIT ?"), "{ordered}");
-    assert!(!ordered.contains("FOR UPDATE"));
-    assert_eq!(sql_placeholder_count(&ordered), 1);
 }
 
 #[test]
@@ -4381,6 +4498,13 @@ fn archive_parent_row(status: &str) -> ManifestRawSqlRow {
         lease_owner: None,
         lease_token_hash: None,
         lease_expires_at: None,
+        manifest_digest_version: PublicationSeal::DIGEST_VERSION,
+        sealed_at: {
+            let at = PublicationSeal::from_unix_seconds(1_700_000_000)
+                .unwrap()
+                .sealed_at();
+            PrimitiveDateTime::new(at.date(), at.time())
+        },
         parent_manifest_id: Some(2),
         revoke_fence: 1,
     }
@@ -4685,18 +4809,14 @@ fn archive_intent_pointer_proof_rejects_every_dimension_mismatch_fail_closed() {
     }
 }
 
-// ── Manifest v2 digest regressions (pure known answer + sensitivity) ────
+// ── Manifest current-edition digest regressions (pure known answer + sensitivity) ────
 
-/// Independent known answer over the exact `astral-auth-manifest-v2`
-/// material (domain tag, big-endian i64 counters, `-1` sentinels for
-/// absent card/parent, u32 length-prefixed ASCII, raw 32-byte hashes),
-/// computed outside Rust from the documented encoding. Any change to the
-/// domain, field order, widths or sentinels trips this pin.
-const MANIFEST_V2_KNOWN_ANSWER: &str =
-    "fc4c41e842bf940e5831626a40bde563be2dfe678eb1a1533d8f9229b6a286fd";
+const MANIFEST_V6_KNOWN_ANSWER: &str =
+    "ff9cbd3ee8a9d0931838e5625dccd8db1fc59a22af4d0e5ef7143695b8a8af54";
 
-fn digest_input_v2(segments: Vec<String>) -> ManifestDigestInput<'static> {
+fn digest_input_v6(segments: Vec<String>) -> ManifestDigestInput<'static> {
     ManifestDigestInput {
+        seal: PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
         tenant_id: 7,
         aggregate_type: "CARD",
         aggregate_id: 17,
@@ -4716,15 +4836,72 @@ fn digest_input_v2(segments: Vec<String>) -> ManifestDigestInput<'static> {
 }
 
 #[test]
-fn manifest_digest_v2_known_answer_pins_domain_encoding() {
-    let digest = compute_manifest_digest(&digest_input_v2(vec![HASH_A.to_owned()])).unwrap();
-    assert_eq!(digest.as_hex(), MANIFEST_V2_KNOWN_ANSWER);
+fn manifest_digest_v6_known_answer_pins_domain_encoding() {
+    use sha2::Digest as _;
+
+    assert_eq!(
+        AUTHORIZATION_MANIFEST_DIGEST_DOMAIN,
+        b"astral-auth-manifest-v6"
+    );
+    let mut material = b"astral-auth-manifest-v6".to_vec();
+    material.extend(
+        hex::decode(concat!(
+            "0006",
+            "000000006553f100",
+            "0000000000000007",
+            "0000000443415244",
+            "0000000000000011",
+            "00",
+            "0000000000000003",
+            "0000000000000009",
+            "0000000000000009",
+            "0000000b6576656e742d7374616765",
+            "000000086f702d7374616765",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "0000001e7068617365322d617574686f72697a6174696f6e2d6b65726e656c2d7631",
+            "01",
+            "0000000000000002",
+            "0000000000000001",
+            "0000000000000001",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ))
+        .unwrap(),
+    );
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(material)),
+        MANIFEST_V6_KNOWN_ANSWER
+    );
+    let digest = compute_manifest_digest(&digest_input_v6(vec![HASH_A.to_owned()])).unwrap();
+    assert_eq!(digest.as_hex(), MANIFEST_V6_KNOWN_ANSWER);
 }
 
 #[test]
 fn manifest_digest_changes_when_any_sealed_dimension_changes() {
-    let base = compute_manifest_digest(&digest_input_v2(vec![HASH_A.to_owned()])).unwrap();
-    let mutations: [DimensionCase<'static, ManifestDigestInput<'static>>; 7] = [
+    let base = compute_manifest_digest(&digest_input_v6(vec![HASH_A.to_owned()])).unwrap();
+    let mutations: [DimensionCase<'static, ManifestDigestInput<'static>>; 17] = [
+        (
+            "sealed_at",
+            Box::new(|i| i.seal = PublicationSeal::from_unix_seconds(1_700_000_001).unwrap()),
+        ),
+        ("tenant_id", Box::new(|i| i.tenant_id += 1)),
+        (
+            "aggregate_type",
+            Box::new(|i| i.aggregate_type = "RULE_SET"),
+        ),
+        ("aggregate_id", Box::new(|i| i.aggregate_id += 1)),
+        ("card_id", Box::new(|i| i.card_id = Some(17))),
+        ("generation", Box::new(|i| i.generation += 1)),
+        ("source_generation", Box::new(|i| i.source_generation += 1)),
+        (
+            "projected_generation",
+            Box::new(|i| i.projected_generation += 1),
+        ),
+        ("semantic_hash", Box::new(|i| i.semantic_hash_hex = HASH_B)),
+        (
+            "dependency_hash",
+            Box::new(|i| i.dependency_hash_hex = HASH_A),
+        ),
         (
             "parent_manifest_id",
             Box::new(|i| i.parent_manifest_id = Some(3)),
@@ -4746,7 +4923,7 @@ fn manifest_digest_changes_when_any_sealed_dimension_changes() {
         ),
     ];
     for (dimension, mutate) in mutations {
-        let mut input = digest_input_v2(vec![HASH_A.to_owned()]);
+        let mut input = digest_input_v6(vec![HASH_A.to_owned()]);
         mutate(&mut input);
         let digest = compute_manifest_digest(&input).unwrap();
         assert_ne!(digest, base, "{dimension} must change the manifest digest");
@@ -4756,7 +4933,7 @@ fn manifest_digest_changes_when_any_sealed_dimension_changes() {
 #[test]
 fn manifest_digest_fails_closed_on_non_positive_parent_and_non_ascii_fields() {
     for parent in [0, -1] {
-        let mut input = digest_input_v2(vec![HASH_A.to_owned()]);
+        let mut input = digest_input_v6(vec![HASH_A.to_owned()]);
         input.parent_manifest_id = Some(parent);
         let error = compute_manifest_digest(&input).unwrap_err();
         assert!(
@@ -4767,7 +4944,7 @@ fn manifest_digest_fails_closed_on_non_positive_parent_and_non_ascii_fields() {
         );
     }
 
-    let mut input = digest_input_v2(vec![HASH_A.to_owned()]);
+    let mut input = digest_input_v6(vec![HASH_A.to_owned()]);
     input.event_id = "événement";
     let error = compute_manifest_digest(&input).unwrap_err();
     assert!(
@@ -4775,13 +4952,111 @@ fn manifest_digest_fails_closed_on_non_positive_parent_and_non_ascii_fields() {
             if message.contains("non_ascii_provenance_digest_field"))
     );
 
-    let mut input = digest_input_v2(vec![HASH_A.to_owned()]);
+    let mut input = digest_input_v6(vec![HASH_A.to_owned()]);
     input.compiler_version = "compilateur-vé2";
     let error = compute_manifest_digest(&input).unwrap_err();
     assert!(
         matches!(error, AuthorizationProjectionError::ScopeViolation(ref message)
             if message.contains("non_ascii_manifest_digest_field"))
     );
+}
+
+#[test]
+fn archive_commitment_changes_with_the_current_manifest_seal_time() {
+    let mut input = digest_input_v6(vec![HASH_A.to_owned()]);
+    let before = compute_manifest_digest(&input).unwrap();
+    input.seal = PublicationSeal::from_unix_seconds(1_700_000_001).unwrap();
+    let after = compute_manifest_digest(&input).unwrap();
+    let semantic = Sha256Digest::from_hex(HASH_A).unwrap();
+    let dependency = Sha256Digest::from_hex(HASH_B).unwrap();
+    assert_ne!(
+        compute_authorization_archive_digest(&archive_digest_input(
+            &semantic,
+            &dependency,
+            &before
+        ))
+        .unwrap(),
+        compute_authorization_archive_digest(&archive_digest_input(&semantic, &dependency, &after))
+            .unwrap(),
+    );
+}
+
+#[test]
+fn staged_candidate_reuses_its_stored_seal_and_rejects_identity_conflicts() {
+    let request = shaped_stage();
+    let seal = PublicationSeal::from_unix_seconds(1_700_000_000).unwrap();
+    let at = seal.sealed_at();
+    let mut row = ManifestRawSqlRow {
+        manifest_id: 701,
+        tenant_id: request.identity.tenant_id,
+        card_id: request.card_id,
+        aggregate_type: request.identity.aggregate_type.clone(),
+        aggregate_id: request.identity.aggregate_id,
+        generation: request.target_generation as i64,
+        source_generation: request.source_generation as i64,
+        projected_generation: request.projected_generation as i64,
+        event_id: request.event_id.clone(),
+        operation_id: request.operation_id.clone(),
+        semantic_hash: Sha256Digest::from_hex(&request.semantic_hash_hex)
+            .unwrap()
+            .as_bytes()
+            .to_vec(),
+        dependency_hash: Sha256Digest::from_hex(&request.dependency_hash_hex)
+            .unwrap()
+            .as_bytes()
+            .to_vec(),
+        compiler_version: request.compiler_version.clone(),
+        manifest_digest: Vec::new(),
+        status: MANIFEST_STATUS_BUILDING.to_owned(),
+        cas_version: 0,
+        lease_owner: None,
+        lease_token_hash: None,
+        lease_expires_at: None,
+        parent_manifest_id: Some(700),
+        revoke_fence: request.revoke_fence as i64,
+        manifest_digest_version: seal.digest_version(),
+        sealed_at: PrimitiveDateTime::new(at.date(), at.time()),
+    };
+    let digest = row.recomputed_digest(vec![HASH_A.to_owned()]).unwrap();
+    row.manifest_digest = digest.as_bytes().to_vec();
+    for _ in 0..2 {
+        let resumed = manifest_seal::verify_staged_candidate(
+            &row,
+            &request,
+            Some(700),
+            vec![HASH_A.to_owned()],
+        )
+        .unwrap();
+        assert_eq!(resumed, (seal, digest));
+    }
+    let mut changed_request = request.clone();
+    changed_request.operation_id.push_str("-different");
+    assert!(manifest_seal::verify_staged_candidate(
+        &row,
+        &changed_request,
+        Some(700),
+        vec![HASH_A.to_owned()],
+    )
+    .is_err());
+    assert!(manifest_seal::verify_staged_candidate(
+        &row,
+        &request,
+        Some(700),
+        vec![HASH_B.to_owned()],
+    )
+    .is_err());
+    let mut changed_row = row.clone();
+    changed_row.sealed_at += time::Duration::seconds(1);
+    assert!(manifest_seal::verify_staged_candidate(
+        &changed_row,
+        &request,
+        Some(700),
+        vec![HASH_A.to_owned()],
+    )
+    .is_err());
+    changed_row = row.clone();
+    changed_row.manifest_digest_version = 2;
+    assert!(changed_row.decode_seal().is_err());
 }
 
 #[test]
@@ -5040,6 +5315,13 @@ fn rehearsal_manifest_row(status: &str) -> ManifestRawSqlRow {
         lease_owner: None,
         lease_token_hash: None,
         lease_expires_at: None,
+        manifest_digest_version: PublicationSeal::DIGEST_VERSION,
+        sealed_at: {
+            let at = PublicationSeal::from_unix_seconds(1_700_000_000)
+                .unwrap()
+                .sealed_at();
+            PrimitiveDateTime::new(at.date(), at.time())
+        },
         parent_manifest_id: None,
         revoke_fence: 0,
     }

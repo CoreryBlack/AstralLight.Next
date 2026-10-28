@@ -35,8 +35,9 @@
 //! （`private_grants`：非 RULE_SET 来源 grant）+ 记录层（`RuleSetGrantRecord`：
 //! RULE_SET grant 的 per-grant 生命周期与归属，经 `Arc` 引用共享层）。
 //! 编译输入输出（`GrantLedgerEntry`/`GrantDelta`）、段表示、hash 语义与
-//! durable 发布契约全部不变；`COMPILER_VERSION` 不升版（无段/hash 语义变化，
-//! 升版会令滚动窗口内 in-flight 事件被 producer 版本门拒绝）。设计、转换规则
+//! durable 发布契约在该次 factored 布局变更时不变。当前编译器标识随共享
+//! `AUTHORIZATION_EDITION` 成套升降；不支持跨 edition 复用 in-flight 候选。
+//! 设计、转换规则
 //! 与等价性论证见
 //! `Docs/架构/Rust架构设计/FactoredHotState设计_V1.0.md`。
 
@@ -52,21 +53,12 @@ use astral_types::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Compiler semantic version. Changing wildcard, validity, ordering, or segment semantics
-/// requires a full rebuild instead of reusing a candidate produced by another version.
-/// v2（2026-08-29）：触发面收窄——窗口不再强制全量、base 形态不再污染增量资格；
-/// 旧版本 base 遇到 v2 编译器按 CompilerVersionMismatch 全量重建一次后恢复增量。
-/// v3（2026-08-28）：semantic hash 改为段聚合语义——只绑定 Active 段内容
-/// （`semantic_hash` 输入从全量 ledger 记录改为按 key 排序的段内容 hash 列表）。
-/// Inactive/墓碑记录不产生授权，"Active 集相同"的两个 ledger 状态自此给出相同
-/// semantic hash（更粗粒度但更正确的授权语义等价）；旧版本 base 遇到 v3 编译器
-/// 按 CompilerVersionMismatch 全量重建一次后恢复增量。
-/// v4（2026-08-28）：HotState 结构迁移为持久化数据结构（im::HashMap HAMT，
-/// clone O(1) 结构共享、单键 O(1) avg 查/增/删）且 semantic hash 重定义为版本
-/// 绑定标识——`sha256(JSON{compiler_version, tenant, version, dependency_hash})`，
-/// 全部 O(1) 字段（详见 `semantic_hash` 语义说明）。旧版本 base 遇到 v4 编译器
-/// 按 CompilerVersionMismatch 全量重建一次后恢复增量。
-pub const COMPILER_VERSION: &str = "phase2-authorization-kernel-v4";
+/// Compiler identifier derived from the shared authorization release edition.
+///
+/// A different edition requires a full rebuild instead of reusing its candidate.
+/// `semantic_hash` binds compiler, tenant, projection version and dependencies;
+/// segment content hashes and the publication manifest bind the complete content.
+pub const COMPILER_VERSION: &str = astral_types::AUTHORIZATION_COMPILER_VERSION;
 
 /// Maximum number of deltas that the local incremental planner accepts.
 pub const MAX_INCREMENTAL_DELTAS: usize = 100;
@@ -3670,9 +3662,8 @@ mod tests {
         assert_eq!(large.segments.len(), 2000);
     }
 
-    /// v4 迁移语义：旧编译器版本（v3）产出的 base 遇 v4 编译器必须显式
-    /// FullRebuildRequired(CompilerVersionMismatch)；全量重建一次后 base 为
-    /// v4，后续精确 delta 恢复增量路径。
+    /// 旧编译器产出的 base 必须显式要求全量重建；重建为当前统一 edition
+    /// 后，后续精确 delta 才可恢复增量路径。
     #[test]
     fn compiler_version_mismatch_requires_full_rebuild_then_resumes_incremental() {
         let value = grant(
@@ -3743,6 +3734,40 @@ mod tests {
             .state
             .segment_content(&ProjectionKey::from_grant(&value).unwrap())
             .is_none());
+    }
+
+    #[test]
+    fn previous_release_compiler_candidates_require_a_full_rebuild() {
+        let compiler = AuthorizationCompiler::new();
+        for version in [
+            "phase2-authorization-kernel-v4".to_owned(),
+            format!(
+                "astral-authorization-v{}",
+                astral_types::AUTHORIZATION_EDITION - 1
+            ),
+        ] {
+            let legacy = HotState::from_grants_with_compiler(
+                tenant(),
+                CURRENT_VERSION,
+                Vec::new(),
+                dependencies(),
+                &version,
+            )
+            .unwrap();
+            let outcome = compiler
+                .compile_incremental(&legacy, TARGET_VERSION, dependencies(), Vec::new())
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    CompileOutcome::FullRebuildRequired(FullRebuildRequired {
+                        reason: FullRebuildReason::CompilerVersionMismatch,
+                        ..
+                    })
+                ),
+                "legacy compiler {version}"
+            );
+        }
     }
 
     #[test]

@@ -273,14 +273,20 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 
 use astral_types::{
     CanonicalGrant, GrantContractError, GrantId, GrantState, ProjectionCompileMode,
-    PublishedAggregateManifestSummary, PublishedCardAuthorization, PublishedCardAuthorizationGate,
-    PublishedCardEvidenceScope, PublishedEvidenceGateStatus, UnacceptedGrantReason, ValidityWindow,
-    VerifiedPublishedGrantRecord,
+    PublicationSeal, PublicationStamp, PublishedAggregateManifestSummary,
+    PublishedCardAuthorization, PublishedCardAuthorizationGate, PublishedCardEvidenceScope,
+    PublishedEvidenceGateStatus, UnacceptedGrantReason, ValidityWindow,
+    VerifiedPublishedGrantRecord, AUTHORIZATION_ARCHIVE_DIGEST_DOMAIN,
+    AUTHORIZATION_SEGMENT_DEPENDENCY_DOMAIN, AUTHORIZATION_SEGMENT_FORMAT,
+    AUTHORIZATION_SEGMENT_SEMANTIC_DOMAIN,
 };
 
 pub use crate::grant_repository::Sha256Digest;
 
+mod manifest_seal;
 mod owned_completion;
+
+pub use manifest_seal::{compute_manifest_digest, ManifestDigestInput};
 
 pub(super) async fn load_owned_completion_in_tx(
     tx: &mut Transaction<'_, MySql>,
@@ -316,7 +322,9 @@ pub const MANIFEST_STATUS_QUARANTINED: &str = "QUARANTINED";
 /// Reference and segment readiness status used by the schema defaults.
 pub const PROJECTION_STATUS_READY: &str = "READY";
 
-/// Storage format tag of segment payloads written and verified by this module.
+/// Current V6 storage format tag for authorization-grant segment payloads.
+pub const SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON: &str = AUTHORIZATION_SEGMENT_FORMAT;
+/// Retired V1 format tag retained only for rejection diagnostics and migrations.
 pub const SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1: &str = "authorization_grants_json_v1";
 
 /// Stable machine code for the compiler-stamp-only segment divergence: a
@@ -706,6 +714,8 @@ pub struct AuthorizationStageRequest {
 /// Durable evidence returned by successful staging.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationStageOutcome {
+    /// Stable current-edition seal persisted with the candidate, including on resumed staging.
+    pub seal: PublicationSeal,
     pub manifest_id: i64,
     pub manifest_digest: Sha256Digest,
     pub target_generation: u64,
@@ -779,105 +789,6 @@ fn sha256_digest_bytes(value: &[u8]) -> [u8; 32] {
     Sha256::digest(value).into()
 }
 
-/// Deterministic manifest digest composition input.
-///
-/// The digest seals the whole semantic proof: aggregate identity, generation
-/// fences, provenance ids, hashes, compiler version and the ordered digest
-/// list of every referenced segment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManifestDigestInput<'a> {
-    pub tenant_id: i64,
-    pub aggregate_type: &'a str,
-    pub aggregate_id: i64,
-    pub card_id: Option<i64>,
-    pub generation: u64,
-    pub source_generation: u64,
-    pub projected_generation: u64,
-    pub event_id: &'a str,
-    pub operation_id: &'a str,
-    pub semantic_hash_hex: &'a str,
-    pub dependency_hash_hex: &'a str,
-    pub compiler_version: &'a str,
-    /// Durable parent lineage (`None` only for the first generation).
-    pub parent_manifest_id: Option<i64>,
-    /// Revoke fence sealed into this manifest generation.
-    pub revoke_fence: u64,
-    /// Ordered lowercase-hex content digests of the manifest's segments.
-    pub segment_content_digests_hex: Vec<String>,
-}
-
-impl<'a> ManifestDigestInput<'a> {
-    fn digest_hexes(&self) -> Result<Vec<[u8; 32]>, AuthorizationProjectionError> {
-        self.segment_content_digests_hex
-            .iter()
-            .map(|hex| {
-                Sha256Digest::from_hex(hex)
-                    .map(|digest| digest.as_bytes())
-                    .map_err(AuthorizationProjectionError::from)
-            })
-            .collect()
-    }
-}
-
-/// Compute the sealed `authorization_projection_manifest.manifest_digest`.
-///
-/// Fixed-width big-endian counters plus length-prefixed ASCII keep the binary
-/// encoding unambiguous without depending on serializer key ordering; empty
-/// versus missing strings stay distinguishable.
-pub fn compute_manifest_digest(
-    input: &ManifestDigestInput<'_>,
-) -> Result<Sha256Digest, AuthorizationProjectionError> {
-    if !input.aggregate_type.is_ascii() || !input.compiler_version.is_ascii() {
-        return Err(scope_violation(
-            "authorization_projection.non_ascii_manifest_digest_field",
-        ));
-    }
-    if !input.event_id.is_ascii() || !input.operation_id.is_ascii() {
-        return Err(scope_violation(
-            "authorization_projection.non_ascii_provenance_digest_field",
-        ));
-    }
-    let mut material = Vec::with_capacity(280);
-    material.extend_from_slice(b"astral-auth-manifest-v2");
-    material.extend_from_slice(&input.tenant_id.to_be_bytes());
-    material.extend_from_slice(input.aggregate_type.as_bytes());
-    material.push(b'\x00');
-    material.extend_from_slice(&input.aggregate_id.to_be_bytes());
-    match input.card_id {
-        None => material.extend_from_slice(&(-1_i64).to_be_bytes()),
-        Some(card_id) => material.extend_from_slice(&card_id.to_be_bytes()),
-    }
-    material.extend_from_slice(&bind_u64(input.generation, "generation")?.to_be_bytes());
-    material
-        .extend_from_slice(&bind_u64(input.source_generation, "source_generation")?.to_be_bytes());
-    material.extend_from_slice(
-        &bind_u64(input.projected_generation, "projected_generation")?.to_be_bytes(),
-    );
-    material.extend_from_slice(&encode_len_prefixed_text(input.event_id, "event_id"));
-    material.extend_from_slice(&encode_len_prefixed_text(
-        input.operation_id,
-        "operation_id",
-    ));
-    material.extend_from_slice(&Sha256Digest::from_hex(input.semantic_hash_hex)?.as_bytes());
-    material.extend_from_slice(&Sha256Digest::from_hex(input.dependency_hash_hex)?.as_bytes());
-    material.extend_from_slice(&encode_len_prefixed_text(
-        input.compiler_version,
-        "compiler_version",
-    ));
-    match input.parent_manifest_id {
-        None => material.extend_from_slice(&(-1_i64).to_be_bytes()),
-        Some(parent_manifest_id) => {
-            positive_i64(parent_manifest_id, "parent_manifest_id")?;
-            material.extend_from_slice(&parent_manifest_id.to_be_bytes());
-        }
-    }
-    material.extend_from_slice(&bind_u64(input.revoke_fence, "revoke_fence")?.to_be_bytes());
-    for digest in input.digest_hexes()? {
-        material.extend_from_slice(&digest);
-    }
-    Ok(Sha256Digest::from_raw_bytes(sha256_digest_bytes(&material)))
-}
-
 fn encode_len_prefixed_text(value: &str, field: &'static str) -> Vec<u8> {
     // Length prefixes keep empty strings distinguishable from absent fields;
     // upstream validation caps every participating field far below u32::MAX.
@@ -893,9 +804,9 @@ fn encode_len_prefixed_text(value: &str, field: &'static str) -> Vec<u8> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Domain separator of the SEGMENT-LOCAL semantic seal.
-pub const SEGMENT_SEAL_DOMAIN_SEMANTIC: &[u8] = b"astral-auth-segment-seal-v1/semantic";
+pub const SEGMENT_SEAL_DOMAIN_SEMANTIC: &[u8] = AUTHORIZATION_SEGMENT_SEMANTIC_DOMAIN;
 /// Domain separator of the SEGMENT-LOCAL dependency seal.
-pub const SEGMENT_SEAL_DOMAIN_DEPENDENCY: &[u8] = b"astral-auth-segment-seal-v1/dependency";
+pub const SEGMENT_SEAL_DOMAIN_DEPENDENCY: &[u8] = AUTHORIZATION_SEGMENT_DEPENDENCY_DOMAIN;
 
 /// Every immutable local dimension a segment row's hash columns must seal.
 ///
@@ -1531,6 +1442,8 @@ pub struct AuthorizationSegmentSnapshot {
 /// (full payload re-encoding + the one assembly contract below) before use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationPublishedState {
+    /// Time and format bound by the final manifest digest.
+    pub seal: PublicationSeal,
     pub pointer: AuthorizationCurrentPointerRecord,
     pub manifest_id: i64,
     pub generation: u64,
@@ -1552,6 +1465,21 @@ pub struct AuthorizationPublishedState {
     pub total_grant_count: u64,
 }
 
+impl AuthorizationPublishedState {
+    /// Derive the compact publication identity only from the complete verified
+    /// manifest state. Source generations, leases and recovery rows do not
+    /// have enough evidence to construct this value.
+    pub fn publication_stamp(&self) -> Result<PublicationStamp, AuthorizationProjectionError> {
+        PublicationStamp::new(self.generation, self.manifest_digest.as_hex(), self.seal).map_err(
+            |error| {
+                mapping_error(format!(
+                    "code=authorization_projection.invalid_publication_stamp;error={error}"
+                ))
+            },
+        )
+    }
+}
+
 // Reflexive AsRef lets the pure evidence assembler take both the tx reader's
 // owned `&[State]` and the memory mirror's `&[&State]` (std blankets then
 // cover the `&State` element) — one assembly implementation, one semantics.
@@ -1566,6 +1494,8 @@ impl AsRef<AuthorizationPublishedState> for AuthorizationPublishedState {
 /// only the accepted status set differs, so corruption still fails closed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuthorizationRecoveryState {
+    /// Original candidate seal; recovery never replaces it with the current time.
+    pub seal: PublicationSeal,
     pub manifest_id: i64,
     pub identity: ProjectionAggregateIdentity,
     pub card_id: Option<i64>,
@@ -1598,7 +1528,7 @@ const MANIFEST_ROW_COLUMNS: &str = "manifest_id, tenant_id, card_id, aggregate_t
     aggregate_id, generation, source_generation, projected_generation, event_id, \
     operation_id, semantic_hash, dependency_hash, compiler_version, manifest_digest, \
     status, cas_version, lease_owner, lease_token_hash, lease_expires_at, \
-    parent_manifest_id, revoke_fence";
+    parent_manifest_id, revoke_fence, manifest_digest_version, sealed_at";
 
 const REFERENCE_ROW_COLUMNS: &str = "reference_id, manifest_id, tenant_id, card_id, \
     aggregate_type, aggregate_id, generation, segment_ordinal, segment_id, \
@@ -1617,9 +1547,6 @@ const SELECT_PREFIX: &str = "SELECT ";
 
 const MANIFEST_BY_ID_TAIL: &str =
     " FROM authorization_projection_manifest WHERE manifest_id = ? FOR UPDATE";
-
-const MANIFEST_BY_DIGEST_TAIL: &str = " FROM authorization_projection_manifest \
-    WHERE tenant_id = ? AND manifest_digest = ? FOR UPDATE";
 
 const MANIFEST_BY_GENERATION_TAIL: &str = " FROM authorization_projection_manifest \
     WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ? AND generation = ? \
@@ -1663,6 +1590,8 @@ pub(crate) struct ManifestRawSqlRow {
     lease_expires_at: Option<PrimitiveDateTime>,
     parent_manifest_id: Option<i64>,
     revoke_fence: i64,
+    manifest_digest_version: u16,
+    sealed_at: PrimitiveDateTime,
 }
 
 impl ManifestRawSqlRow {
@@ -1703,6 +1632,24 @@ impl ManifestRawSqlRow {
             lease_expires_at: None,
             parent_manifest_id: state.parent_manifest_id,
             revoke_fence: bind_u64(state.revoke_fence, "manifest.revoke_fence")?,
+            manifest_digest_version: state.seal.digest_version(),
+            sealed_at: PrimitiveDateTime::new(
+                state.seal.sealed_at().date(),
+                state.seal.sealed_at().time(),
+            ),
+        })
+    }
+
+    fn decode_seal(&self) -> Result<PublicationSeal, AuthorizationProjectionError> {
+        if self.manifest_digest_version != PublicationSeal::DIGEST_VERSION {
+            return Err(AuthorizationProjectionError::Corrupt(
+                "code=authorization_projection.unsupported_manifest_digest_version".to_owned(),
+            ));
+        }
+        PublicationSeal::new(self.sealed_at.assume_utc()).map_err(|error| {
+            mapping_error(format!(
+                "code=authorization_projection.invalid_manifest_seal;{error}"
+            ))
         })
     }
 
@@ -1761,6 +1708,7 @@ impl ManifestRawSqlRow {
     ) -> Result<Sha256Digest, AuthorizationProjectionError> {
         let (generation, source_generation, projected_generation) = self.decode_generations()?;
         compute_manifest_digest(&ManifestDigestInput {
+            seal: self.decode_seal()?,
             tenant_id: self.tenant_id,
             aggregate_type: &self.aggregate_type,
             aggregate_id: self.aggregate_id,
@@ -1862,7 +1810,7 @@ impl SegmentRawSqlRow {
                 self.status
             )));
         }
-        if self.segment_format != SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1 {
+        if self.segment_format != SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON {
             return Err(mapping_error(format!(
                 "code=authorization_projection.unknown_segment_format;value={}",
                 self.segment_format
@@ -1975,58 +1923,11 @@ impl PointerRawSqlRow {
     }
 }
 
-/// Enumerate EVERY current pointer row under one deterministic locked read
-/// (`tenant_id, aggregate_type, aggregate_id` order) for the durable snapshot
-/// capture.
+/// Enumerate snapshot pointers in deterministic global order under row locks.
 ///
-/// Lock-order note: this is the same per-scope discipline the card reader
-/// uses (pointers first, ordered, then each aggregate's manifest chain), taken
-/// globally in one statement so a capture can never interleave with itself or
-/// deadlock against per-card readers that only ever lock one tenant's rows in
-/// the matching `(aggregate_type, aggregate_id)` sub-order. Nothing here
-/// writes; callers own the transaction and its commit proof.
-///
-/// Retained unbounded contract variant: the snapshot capture and hint load
-/// paths use the SQL-bounded variants
-/// ([`lock_all_current_pointer_records_in_tx_bounded`] /
-/// [`read_all_current_pointer_records_in_tx_bounded`]) and are pinned to them
-/// by source-anchor tests; new callers must prefer the bounded pair.
-#[allow(dead_code)]
-pub(crate) async fn lock_all_current_pointer_records_in_tx(
-    tx: &mut Transaction<'_, MySql>,
-) -> Result<Vec<AuthorizationCurrentPointerRecord>, AuthorizationProjectionError> {
-    let statement = format!("{SELECT_PREFIX}{POINTER_ROW_COLUMNS}{POINTER_ROWS_ALL_LOCKED_TAIL}");
-    let raw_rows: Vec<PointerRawSqlRow> = sqlx::query_as(statement.as_str())
-        .fetch_all(&mut **tx)
-        .await?;
-    raw_rows.iter().map(|raw| raw.decode()).collect()
-}
-
-/// Non-locking counterpart of [`lock_all_current_pointer_records_in_tx`] for
-/// the snapshot hint load: the full durable pointer token set as one
-/// consistent read, never used alone as freshness proof.
-///
-/// Retained unbounded contract variant: the hint load uses the SQL-bounded
-/// [`read_all_current_pointer_records_in_tx_bounded`]; new callers must
-/// prefer the bounded variant.
-#[allow(dead_code)]
-pub(crate) async fn read_all_current_pointer_records_in_tx(
-    tx: &mut Transaction<'_, MySql>,
-) -> Result<Vec<AuthorizationCurrentPointerRecord>, AuthorizationProjectionError> {
-    let statement = format!("{SELECT_PREFIX}{POINTER_ROW_COLUMNS}{POINTER_ROWS_ALL_ORDERED_TAIL}");
-    let raw_rows: Vec<PointerRawSqlRow> = sqlx::query_as(statement.as_str())
-        .fetch_all(&mut **tx)
-        .await?;
-    raw_rows.iter().map(|raw| raw.decode()).collect()
-}
-
-/// SQL-bounded variant of [`lock_all_current_pointer_records_in_tx`] for the
-/// durable snapshot capture: identical column list, deterministic
-/// `tenant_id, aggregate_type, aggregate_id` order and `FOR UPDATE` lock
-/// discipline, with the read set itself cut off by the SQL at `limit` rows.
-/// Callers pass `cap + 1`: seeing all `limit` rows means the scope exceeded
-/// the cap, and the caller must refuse the whole capture (`TooLarge`)
-/// instead of assembling a partial frontier. `positive_i64` guards the bind.
+/// Snapshot capture and hint load take pointer locks before strict manifest
+/// reads in the same transaction. `limit` is `cap + 1`; exceeding the cap
+/// refuses the whole snapshot rather than accepting a partial frontier.
 pub(crate) async fn lock_all_current_pointer_records_in_tx_bounded(
     tx: &mut Transaction<'_, MySql>,
     limit: i64,
@@ -2034,26 +1935,6 @@ pub(crate) async fn lock_all_current_pointer_records_in_tx_bounded(
     positive_i64(limit, "pointer_scan_limit")?;
     let statement =
         format!("{SELECT_PREFIX}{POINTER_ROW_COLUMNS}{POINTER_ROWS_ALL_LOCKED_BOUNDED_TAIL}");
-    let raw_rows: Vec<PointerRawSqlRow> = sqlx::query_as(statement.as_str())
-        .bind(limit)
-        .fetch_all(&mut **tx)
-        .await?;
-    raw_rows.iter().map(|raw| raw.decode()).collect()
-}
-
-/// Non-locking SQL-bounded counterpart of
-/// [`lock_all_current_pointer_records_in_tx_bounded`] for the snapshot hint
-/// load: the durable pointer token set as one consistent read cut off by the
-/// SQL at `limit` rows, never used alone as freshness proof. Same contract as
-/// the locked variant: `limit` = `cap + 1`, over-cap fails closed at the
-/// caller.
-pub(crate) async fn read_all_current_pointer_records_in_tx_bounded(
-    tx: &mut Transaction<'_, MySql>,
-    limit: i64,
-) -> Result<Vec<AuthorizationCurrentPointerRecord>, AuthorizationProjectionError> {
-    positive_i64(limit, "pointer_scan_limit")?;
-    let statement =
-        format!("{SELECT_PREFIX}{POINTER_ROW_COLUMNS}{POINTER_ROWS_ALL_ORDERED_BOUNDED_TAIL}");
     let raw_rows: Vec<PointerRawSqlRow> = sqlx::query_as(statement.as_str())
         .bind(limit)
         .fetch_all(&mut **tx)
@@ -2072,6 +1953,21 @@ async fn fetch_manifest_for_update(
         .fetch_optional(&mut **tx)
         .await?;
     Ok(row)
+}
+
+async fn fetch_manifest_generation_for_update(
+    tx: &mut Transaction<'_, MySql>,
+    identity: &ProjectionAggregateIdentity,
+    generation: u64,
+) -> Result<Option<ManifestRawSqlRow>, AuthorizationProjectionError> {
+    let statement = format!("{SELECT_PREFIX}{MANIFEST_ROW_COLUMNS}{MANIFEST_BY_GENERATION_TAIL}");
+    Ok(sqlx::query_as(statement.as_str())
+        .bind(identity.tenant_id)
+        .bind(&identity.aggregate_type)
+        .bind(identity.aggregate_id)
+        .bind(bind_u64(generation, "manifest.generation")?)
+        .fetch_optional(&mut **tx)
+        .await?)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2149,8 +2045,9 @@ const REFERENCE_INSERT_SQL: &str = "INSERT INTO authorization_projection_manifes
 const MANIFEST_INSERT_SQL: &str = "INSERT INTO authorization_projection_manifest \
     (tenant_id, card_id, aggregate_type, aggregate_id, generation, source_generation, \
      projected_generation, event_id, operation_id, semantic_hash, dependency_hash, \
-     compiler_version, manifest_digest, parent_manifest_id, revoke_fence, status) \
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'BUILDING')";
+     compiler_version, manifest_digest, parent_manifest_id, revoke_fence, \
+     manifest_digest_version, sealed_at, status) \
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'BUILDING')";
 
 struct ResolvedSegment {
     snapshot: AuthorizationSegmentSnapshot,
@@ -2173,7 +2070,7 @@ fn segment_local_seal_pair(
         identity,
         card_id,
         compiler_version,
-        segment_format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1,
+        segment_format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON,
         row_count,
         content_digest,
     };
@@ -2224,7 +2121,7 @@ fn assert_identical_segment(
     // 3. A seal mismatch with the SAME stamp means the stored columns disagree
     //    with recomputation from the row's own metadata — tampering or a seal
     //    bug; corruption family.
-    if snapshot.format != SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1 {
+    if snapshot.format != SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON {
         return Err(AuthorizationProjectionError::SegmentDigestCollision(
             "code=authorization_projection.digest_metadata_collision".to_owned(),
         ));
@@ -2303,7 +2200,7 @@ async fn upsert_content_addressed_segment(
         .bind(semantic_seal.as_bytes().to_vec())
         .bind(dependency_seal.as_bytes().to_vec())
         .bind(compiler_version)
-        .bind(SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1)
+        .bind(SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON)
         .bind(row_count)
         .bind(byte_size)
         .bind(payload.as_slice())
@@ -2329,7 +2226,7 @@ async fn upsert_content_addressed_segment(
                 semantic_hash: semantic_seal,
                 dependency_hash: dependency_seal,
                 compiler_version: compiler_version.to_owned(),
-                format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1.to_owned(),
+                format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON.to_owned(),
                 row_count: row_count as u64,
                 byte_size: payload.len() as u64,
                 grants: grants.to_vec(),
@@ -2574,16 +2471,22 @@ pub async fn stage_authorization_manifest_in_tx(
         )));
     }
 
+    let parent_manifest = match &base_pointer {
+        Some(pointer) => fetch_manifest_for_update(tx, pointer.manifest_id).await?,
+        None => None,
+    };
+    let existing_candidate =
+        fetch_manifest_generation_for_update(tx, &request.identity, request.target_generation)
+            .await?;
+
     // (2) Resolve the parent manifest and its ordered references under lock.
     let mut parent_records: Vec<AuthorizationSegmentReferenceRecord> = Vec::new();
     if let Some(pointer) = &base_pointer {
-        let parent = fetch_manifest_for_update(tx, pointer.manifest_id)
-            .await?
-            .ok_or_else(|| {
-                AuthorizationProjectionError::Corrupt(
-                    "code=authorization_projection.parent_manifest_missing".to_owned(),
-                )
-            })?;
+        let parent = parent_manifest.ok_or_else(|| {
+            AuthorizationProjectionError::Corrupt(
+                "code=authorization_projection.parent_manifest_missing".to_owned(),
+            )
+        })?;
         if parent.decode_identity()? != request.identity {
             return Err(AuthorizationProjectionError::IdentityMismatch(
                 "code=authorization_projection.parent_identity_mismatch".to_owned(),
@@ -2736,8 +2639,29 @@ pub async fn stage_authorization_manifest_in_tx(
         ));
     }
 
-    // (4) Seal the manifest digest over the final ordered reference list.
-    let manifest_digest = compute_manifest_digest(&ManifestDigestInput {
+    let ordered_digests: Vec<String> = resolved_segments
+        .iter()
+        .map(|resolved| resolved.snapshot.content_digest.as_hex())
+        .collect();
+    let mut seal = match &existing_candidate {
+        Some(existing) => {
+            manifest_seal::verify_staged_candidate(
+                existing,
+                request,
+                resolved_parent_manifest_id,
+                ordered_digests.clone(),
+            )?
+            .0
+        }
+        None => PublicationSeal::from_unix_seconds(OffsetDateTime::now_utc().unix_timestamp())
+            .map_err(|error| {
+                mapping_error(format!(
+                    "code=authorization_projection.invalid_seal_clock;{error}"
+                ))
+            })?,
+    };
+    let mut manifest_digest = compute_manifest_digest(&ManifestDigestInput {
+        seal,
         tenant_id: request.identity.tenant_id,
         aggregate_type: &request.identity.aggregate_type,
         aggregate_id: request.identity.aggregate_id,
@@ -2752,103 +2676,81 @@ pub async fn stage_authorization_manifest_in_tx(
         compiler_version: &request.compiler_version,
         parent_manifest_id: resolved_parent_manifest_id,
         revoke_fence: request.revoke_fence,
-        segment_content_digests_hex: resolved_segments
-            .iter()
-            .map(|resolved| resolved.snapshot.content_digest.as_hex())
-            .collect(),
+        segment_content_digests_hex: ordered_digests.clone(),
     })?;
 
-    // (5) Insert the BUILDING manifest row; tolerate idempotent retries by
-    // proving the winner is byte-for-byte identical.
-    let inserted = sqlx::query(MANIFEST_INSERT_SQL)
-        .bind(request.identity.tenant_id)
-        .bind(request.card_id)
-        .bind(&request.identity.aggregate_type)
-        .bind(request.identity.aggregate_id)
-        .bind(bind_u64(request.target_generation, "manifest.generation")?)
-        .bind(bind_u64(
-            request.source_generation,
-            "manifest.source_generation",
-        )?)
-        .bind(bind_u64(
-            request.projected_generation,
-            "manifest.projected_generation",
-        )?)
-        .bind(&request.event_id)
-        .bind(&request.operation_id)
-        .bind(semantic_hash.as_bytes().to_vec())
-        .bind(dependency_hash.as_bytes().to_vec())
-        .bind(&request.compiler_version)
-        .bind(manifest_digest.as_bytes().to_vec())
-        .bind(resolved_parent_manifest_id)
-        .bind(bind_u64(request.revoke_fence, "manifest.revoke_fence")?)
-        .execute(&mut **tx)
-        .await;
-    let (manifest_id, resumed) = match inserted {
-        Ok(result) => {
-            if result.rows_affected() != 1 {
-                return Err(AuthorizationProjectionError::DuplicateRow(
-                    "code=authorization_projection.manifest_insert_not_applied".to_owned(),
-                ));
+    let (manifest_id, resumed) = if let Some(existing) = existing_candidate {
+        (existing.manifest_id, true)
+    } else {
+        let inserted = sqlx::query(MANIFEST_INSERT_SQL)
+            .bind(request.identity.tenant_id)
+            .bind(request.card_id)
+            .bind(&request.identity.aggregate_type)
+            .bind(request.identity.aggregate_id)
+            .bind(bind_u64(request.target_generation, "manifest.generation")?)
+            .bind(bind_u64(
+                request.source_generation,
+                "manifest.source_generation",
+            )?)
+            .bind(bind_u64(
+                request.projected_generation,
+                "manifest.projected_generation",
+            )?)
+            .bind(&request.event_id)
+            .bind(&request.operation_id)
+            .bind(semantic_hash.as_bytes().to_vec())
+            .bind(dependency_hash.as_bytes().to_vec())
+            .bind(&request.compiler_version)
+            .bind(manifest_digest.as_bytes().to_vec())
+            .bind(resolved_parent_manifest_id)
+            .bind(bind_u64(request.revoke_fence, "manifest.revoke_fence")?)
+            .bind(seal.digest_version())
+            .bind(PrimitiveDateTime::new(
+                seal.sealed_at().date(),
+                seal.sealed_at().time(),
+            ))
+            .execute(&mut **tx)
+            .await;
+        match inserted {
+            Ok(result) => {
+                if result.rows_affected() != 1 {
+                    return Err(AuthorizationProjectionError::DuplicateRow(
+                        "code=authorization_projection.manifest_insert_not_applied".to_owned(),
+                    ));
+                }
+                (
+                    i64::try_from(result.last_insert_id()).map_err(|_| {
+                        mapping_error(
+                            "code=authorization_projection.bigint_overflow;field=manifest_id"
+                                .to_owned(),
+                        )
+                    })?,
+                    false,
+                )
             }
-            (
-                i64::try_from(result.last_insert_id()).map_err(|_| {
-                    mapping_error(
-                        "code=authorization_projection.bigint_overflow;field=manifest_id"
-                            .to_owned(),
+            Err(error) => {
+                if !unique_violation(&error) {
+                    return Err(error.into());
+                }
+                let existing = fetch_manifest_generation_for_update(
+                    tx,
+                    &request.identity,
+                    request.target_generation,
+                )
+                .await?
+                .ok_or_else(|| {
+                    AuthorizationProjectionError::DuplicateRow(
+                        "code=authorization_projection.manifest_race_unknown_winner".to_owned(),
                     )
-                })?,
-                false,
-            )
-        }
-        Err(error) => {
-            if !unique_violation(&error) {
-                return Err(error.into());
+                })?;
+                (seal, manifest_digest) = manifest_seal::verify_staged_candidate(
+                    &existing,
+                    request,
+                    resolved_parent_manifest_id,
+                    ordered_digests,
+                )?;
+                (existing.manifest_id, true)
             }
-            let statement =
-                format!("{SELECT_PREFIX}{MANIFEST_ROW_COLUMNS}{MANIFEST_BY_DIGEST_TAIL}");
-            let existing: Option<ManifestRawSqlRow> = sqlx::query_as(statement.as_str())
-                .bind(request.identity.tenant_id)
-                .bind(manifest_digest.as_bytes().to_vec())
-                .fetch_optional(&mut **tx)
-                .await?;
-            let Some(existing) = existing else {
-                return Err(AuthorizationProjectionError::DuplicateRow(
-                    "code=authorization_projection.manifest_race_unknown_winner".to_owned(),
-                ));
-            };
-            let identical = existing.tenant_id == request.identity.tenant_id
-                && existing.card_id == request.card_id
-                && existing.aggregate_type == request.identity.aggregate_type
-                && existing.aggregate_id == request.identity.aggregate_id
-                && existing.generation
-                    == bind_u64(request.target_generation, "manifest.generation")?
-                && existing.source_generation
-                    == bind_u64(request.source_generation, "manifest.source_generation")?
-                && existing.projected_generation
-                    == bind_u64(
-                        request.projected_generation,
-                        "manifest.projected_generation",
-                    )?
-                && existing.event_id == request.event_id
-                && existing.operation_id == request.operation_id
-                && existing.semantic_hash == semantic_hash.as_bytes().to_vec()
-                && existing.dependency_hash == dependency_hash.as_bytes().to_vec()
-                && existing.compiler_version == request.compiler_version
-                && existing.manifest_digest == manifest_digest.as_bytes().to_vec()
-                // Immutable replay compares BOTH new durable columns: lineage
-                // parent and revoke fence must match the resolved authoritative
-                // values, never a stale or divergent winner. Decoding fails
-                // closed on malformed (negative / overflowing) stored values.
-                && existing.decode_parent_manifest_id()? == resolved_parent_manifest_id
-                && existing.decode_revoke_fence()?
-                    == request.revoke_fence;
-            if !identical {
-                return Err(AuthorizationProjectionError::DuplicateRow(
-                    "code=authorization_projection.manifest_identity_conflict".to_owned(),
-                ));
-            }
-            (existing.manifest_id, true)
         }
     };
 
@@ -2869,6 +2771,7 @@ pub async fn stage_authorization_manifest_in_tx(
     }
 
     Ok(AuthorizationStageOutcome {
+        seal,
         manifest_id,
         manifest_digest,
         target_generation: request.target_generation,
@@ -3569,6 +3472,7 @@ async fn publish_current_pointer_core_in_tx(
         expected_target_compiler_version: request.expected_target_compiler_version.clone(),
     };
     validate_manifest_publish(&expectation, &target_view)?;
+    verify_parent_manifest_chain(&target, &reference_records)?;
     // Mandatory paired fence evidence; overflow-checked into the SQL BIGINT
     // domain, then monotonicity plus the first-publication previous-fence gate.
     bind_u64(
@@ -4094,6 +3998,7 @@ pub(crate) fn assemble_verified_published_state(
     let total_grant_count = sum_grant_counts(&segments)?;
 
     Ok(AuthorizationPublishedState {
+        seal: manifest.decode_seal()?,
         pointer,
         manifest_id: manifest.manifest_id,
         generation,
@@ -4180,6 +4085,7 @@ pub async fn load_authorization_recovery_state_in_tx(
     let total_grant_count = sum_grant_counts(&segments)?;
 
     Ok(Some(AuthorizationRecoveryState {
+        seal: manifest.decode_seal()?,
         manifest_id: manifest.manifest_id,
         identity: identity.clone(),
         card_id: manifest.card_id,
@@ -4799,19 +4705,6 @@ const POINTER_ROWS_FOR_TENANT_CARD_LOCKED_TAIL: &str = " FROM authorization_proj
     WHERE tenant_id = ? AND card_id = ? \
     ORDER BY aggregate_type ASC, aggregate_id ASC FOR UPDATE";
 
-/// Whole-table deterministic pointer enumeration for the durable local
-/// snapshot capture (one locked consistent read; see
-/// [`lock_all_current_pointer_records_in_tx`]).
-pub(crate) const POINTER_ROWS_ALL_LOCKED_TAIL: &str = " FROM authorization_projection_current \
-    ORDER BY tenant_id ASC, aggregate_type ASC, aggregate_id ASC FOR UPDATE";
-
-/// Whole-table deterministic pointer enumeration WITHOUT row locks — the
-/// snapshot hint load reads the durable pointer tokens with a non-locking
-/// consistent read: a hint never blocks publishers, and every offered state is
-/// re-proven against the exact durable token before it may warm anything.
-pub(crate) const POINTER_ROWS_ALL_ORDERED_TAIL: &str = " FROM authorization_projection_current \
-    ORDER BY tenant_id ASC, aggregate_type ASC, aggregate_id ASC";
-
 /// SQL-bounded whole-table deterministic pointer enumeration for the durable
 /// local snapshot capture (one locked consistent read; see
 /// [`lock_all_current_pointer_records_in_tx_bounded`]). `LIMIT ?` (= cap + 1)
@@ -4820,16 +4713,6 @@ pub(crate) const POINTER_ROWS_ALL_ORDERED_TAIL: &str = " FROM authorization_proj
 pub(crate) const POINTER_ROWS_ALL_LOCKED_BOUNDED_TAIL: &str =
     " FROM authorization_projection_current \
     ORDER BY tenant_id ASC, aggregate_type ASC, aggregate_id ASC LIMIT ? FOR UPDATE";
-
-/// SQL-bounded whole-table deterministic pointer enumeration WITHOUT row
-/// locks — the snapshot hint load reads the durable pointer tokens with a
-/// non-locking consistent read cut off by the SQL at `LIMIT ?` (= cap + 1):
-/// a hint never blocks publishers, an over-cap durable scope fails closed at
-/// the caller, and every offered state is re-proven against the exact durable
-/// token before it may warm anything.
-pub(crate) const POINTER_ROWS_ALL_ORDERED_BOUNDED_TAIL: &str =
-    " FROM authorization_projection_current \
-    ORDER BY tenant_id ASC, aggregate_type ASC, aggregate_id ASC LIMIT ?";
 
 /// Defensive fan-out cap: how many published aggregates one card read may
 /// compose before refusing with an explicit `NotReady`. Purely operational;
@@ -5175,6 +5058,7 @@ pub(crate) fn assemble_published_card_evidence<S: AsRef<AuthorizationPublishedSt
             }
         }
         manifests.push(PublishedAggregateManifestSummary {
+            seal: state.seal,
             tenant_id: identity.tenant_id,
             card_id: scope.card_id,
             aggregate_type: identity.aggregate_type.clone(),
@@ -6958,6 +6842,10 @@ const MAX_EXTRA_SUCCEEDED_FRONTIER_SCAN: i64 = 32;
 /// assembly and parent-reference views.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedGenerationSummary {
+    /// Complete current-edition seal copied from the verified manifest.
+    pub seal: PublicationSeal,
+    /// Compact publication identity derived from the same verified manifest.
+    pub stamp: PublicationStamp,
     pub manifest_id: i64,
     /// Aggregate generation (`G`). NEVER comparable to per-grant delta
     /// versions directly; [`PublishedAggregateFrontier::events`] connects the
@@ -6979,6 +6867,26 @@ pub struct PublishedGenerationSummary {
     /// Card scope of the manifest row; the strict read proves equality with
     /// the pointer's scope, so this always mirrors the pointer's card here.
     pub card_id: Option<i64>,
+}
+
+impl PublishedGenerationSummary {
+    /// Validate the compact stamp against the duplicated manifest evidence.
+    pub fn validate_publication_stamp(&self) -> Result<(), AuthorizationProjectionError> {
+        self.stamp.validate().map_err(|error| {
+            mapping_error(format!(
+                "code=authorization_projection.invalid_publication_stamp;error={error}"
+            ))
+        })?;
+        if self.stamp.generation != self.generation
+            || self.stamp.manifest_digest_hex != self.manifest_digest.as_hex()
+            || self.stamp.seal != self.seal
+        {
+            return Err(AuthorizationProjectionError::Corrupt(
+                "code=authorization_projection.summary_publication_stamp_mismatch".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Durable impact-plan slice consumed by pure frontier assembly.
@@ -7054,6 +6962,8 @@ pub struct PublishedAggregateFrontier {
     /// Card scope shared by pointer, manifest chain, plans and deltas.
     pub card_id: Option<i64>,
     pub pointer: AuthorizationCurrentPointerRecord,
+    /// Compact publication identity for the frontier's current generation.
+    pub stamp: PublicationStamp,
     pub manifest: PublishedGenerationSummary,
     /// Ascending by generation, one event per generation, no gaps.
     pub events: Vec<PublishedFrontierEvent>,
@@ -7067,6 +6977,40 @@ impl PublishedAggregateFrontier {
             .iter()
             .find(|event| event.event_id == event_id)
             .map(|event| event.generation)
+    }
+
+    /// Validate the frontier-level stamp and identity bridges after construction
+    /// or import. The compact stamp carries publication evidence only; pointer
+    /// identity, manifest identity, and card scope remain explicit on the
+    /// surrounding frontier and must stay closed as one tuple.
+    pub fn validate_publication_stamp(&self) -> Result<(), AuthorizationProjectionError> {
+        if self.pointer.identity != self.identity {
+            return Err(AuthorizationProjectionError::IdentityMismatch(
+                "code=authorization_projection.frontier_pointer_identity_split".to_owned(),
+            ));
+        }
+        if self.pointer.manifest_id != self.manifest.manifest_id {
+            return Err(AuthorizationProjectionError::Corrupt(
+                "code=authorization_projection.frontier_pointer_manifest_id_split".to_owned(),
+            ));
+        }
+        if self.pointer.card_id != self.card_id || self.manifest.card_id != self.card_id {
+            return Err(AuthorizationProjectionError::IdentityMismatch(
+                "code=authorization_projection.frontier_card_scope_split".to_owned(),
+            ));
+        }
+        self.manifest.validate_publication_stamp()?;
+        if self.stamp != self.manifest.stamp {
+            return Err(AuthorizationProjectionError::Corrupt(
+                "code=authorization_projection.frontier_publication_stamp_mismatch".to_owned(),
+            ));
+        }
+        if self.stamp.generation != self.pointer.current_generation {
+            return Err(AuthorizationProjectionError::Corrupt(
+                "code=authorization_projection.frontier_stamp_generation_mismatch".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -7132,6 +7076,12 @@ pub fn assemble_published_aggregate_frontier(
             "code=authorization_projection.frontier_manifest_card_split".to_owned(),
         ));
     }
+    if pointer.current_generation == 0 {
+        return Err(AuthorizationProjectionError::Corrupt(
+            "code=authorization_projection.frontier_zero_generation".to_owned(),
+        ));
+    }
+    manifest.validate_publication_stamp()?;
 
     if !extra_succeeded_beyond_current.is_empty() {
         let rendered = extra_succeeded_beyond_current
@@ -7148,11 +7098,6 @@ pub fn assemble_published_aggregate_frontier(
 
     // ── (2) exact contiguous plan coverage 1..=G ────────────────────────────
     let frontier_generation = pointer.current_generation;
-    if frontier_generation == 0 {
-        return Err(AuthorizationProjectionError::Corrupt(
-            "code=authorization_projection.frontier_zero_generation".to_owned(),
-        ));
-    }
     let expected_count = usize::try_from(frontier_generation).map_err(|_| {
         mapping_error("code=authorization_projection.frontier_generation_overflow".to_owned())
     })?;
@@ -7330,13 +7275,16 @@ pub fn assemble_published_aggregate_frontier(
         ));
     }
 
-    Ok(PublishedAggregateFrontier {
+    let frontier = PublishedAggregateFrontier {
         identity: identity.clone(),
         card_id: pointer.card_id,
         pointer: pointer.clone(),
+        stamp: manifest.stamp.clone(),
         manifest: manifest.clone(),
         events: assembled,
-    })
+    };
+    frontier.validate_publication_stamp()?;
+    Ok(frontier)
 }
 
 /// Locate the single matching delta evidence for one plan so failure codes
@@ -7719,10 +7667,11 @@ pub async fn load_published_aggregate_frontier_in_tx(
         });
     }
 
+    let manifest_summary = published_generation_summary_from_state(&published)?;
     Ok(Some(assemble_published_aggregate_frontier(
         identity,
         &published.pointer,
-        &published_generation_summary_from_state(&published),
+        &manifest_summary,
         &plan_evidence,
         &delta_evidence_by_event,
         &extra_succeeded_beyond_current,
@@ -7735,8 +7684,11 @@ pub async fn load_published_aggregate_frontier_in_tx(
 /// equality fail-closed before reaching this projection step.
 fn published_generation_summary_from_state(
     published: &AuthorizationPublishedState,
-) -> PublishedGenerationSummary {
-    PublishedGenerationSummary {
+) -> Result<PublishedGenerationSummary, AuthorizationProjectionError> {
+    let stamp = published.publication_stamp()?;
+    let summary = PublishedGenerationSummary {
+        seal: published.seal,
+        stamp,
         manifest_id: published.manifest_id,
         generation: published.generation,
         source_generation: published.source_generation,
@@ -7750,7 +7702,9 @@ fn published_generation_summary_from_state(
         parent_manifest_id: published.parent_manifest_id,
         revoke_fence: published.revoke_fence,
         card_id: published.pointer.card_id,
-    }
+    };
+    summary.validate_publication_stamp()?;
+    Ok(summary)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -7806,7 +7760,7 @@ pub async fn load_published_parent_reference_views_in_tx(
     Ok(Some(PublishedParentReferenceSnapshot {
         pointer_view: published.pointer.as_view(),
         pointer: published.pointer.clone(),
-        manifest_summary: published_generation_summary_from_state(&published),
+        manifest_summary: published_generation_summary_from_state(&published)?,
         parent_manifest_id: published.parent_manifest_id,
         references,
     }))
@@ -9210,12 +9164,11 @@ pub struct AuthorizationArchiveDigestInput<'a> {
     pub manifest_chain_digest: &'a Sha256Digest,
 }
 
-const AUTHORIZATION_ARCHIVE_DIGEST_DOMAIN: &[u8] = b"astral-auth-archive-proof-v2";
-
 /// Compute the deterministic `authorization_archive_manifest.archive_digest`.
 ///
-/// Mirrors [`compute_manifest_digest`]'s encoding discipline; status and
-/// timestamps mutate by design and never enter the seal. The Phase 1 schema
+/// Mirrors [`compute_manifest_digest`]'s encoding discipline; mutable archive
+/// status/timestamps do not enter this seal. The pinned parent-chain digest
+/// already binds the immutable current-edition publication seal time. The Phase 1 schema
 /// carries no `source_generation` / `base_version` / outbox-id columns, so
 /// they are NOT fabricated here — provenance is bound instead through the
 /// recorded identities above plus the pinned parent-chain digest.
@@ -10368,6 +10321,13 @@ pub(super) async fn project_delta_core_in_tx(
         },
     )
     .await?;
+    if publish.published_state.seal != stage.seal
+        || publish.published_state.manifest_digest != stage.manifest_digest
+    {
+        return Err(AuthorizationProjectionError::Corrupt(
+            "code=authorization_projection.stage_publication_seal_split".to_owned(),
+        ));
+    }
 
     // (8) Terminal bookkeeping inside the same atomic unit.
     complete_authorization_impact_plan_in_tx(

@@ -666,6 +666,12 @@ mod tests {
             aggregate_type,
             aggregate_id,
             published_generation,
+            stamp: astral_types::PublicationStamp::new(
+                published_generation,
+                "ab".repeat(32),
+                astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+            )
+            .unwrap(),
             source_generation: 11,
             revoke_fence: 0,
         })

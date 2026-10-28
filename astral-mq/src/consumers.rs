@@ -164,6 +164,7 @@ pub fn dispatch_typed_invalidation(
                 source_generation: value.source_generation,
                 revoke_fence: value.revoke_fence,
                 published_generation: value.published_generation,
+                stamp: value.stamp,
             })
         }
         crate::invalidation::InvalidationEvent::EligibilityInvalidated(value) => {
@@ -3387,6 +3388,12 @@ mod tests {
                 aggregate_type: astral_types::PublishedEvidenceAggregate::UserCard,
                 aggregate_id: 42,
                 published_generation: 10,
+                stamp: astral_types::PublicationStamp::new(
+                    10,
+                    "ab".repeat(32),
+                    astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+                )
+                .unwrap(),
                 source_generation: 10,
                 revoke_fence: 0,
             },
@@ -3491,7 +3498,7 @@ mod tests {
             .contains("does not match durable row"));
 
         let mut row = relay_test_row(&envelope);
-        row.schema_version = 2;
+        row.schema_version = envelope.schema_version + 1;
         assert!(bind_relay_envelope(&row)
             .unwrap_err()
             .contains("does not match durable row"));

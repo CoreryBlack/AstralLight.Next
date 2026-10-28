@@ -1219,6 +1219,12 @@ mod tests {
             aggregate_type: PublishedEvidenceAggregate::UserCard,
             aggregate_id: card_id,
             published_generation: 10,
+            stamp: astral_types::PublicationStamp::new(
+                10,
+                "ab".repeat(32),
+                astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+            )
+            .unwrap(),
             source_generation: 10,
             revoke_fence: 0,
         });
@@ -1240,7 +1246,7 @@ mod tests {
             "heartbeat-1",
             "heartbeat-op",
             INVALIDATION_HEARTBEAT_MESSAGE_TYPE,
-            1,
+            crate::invalidation::INVALIDATION_SCHEMA_VERSION,
             "city-a",
             payload,
         )

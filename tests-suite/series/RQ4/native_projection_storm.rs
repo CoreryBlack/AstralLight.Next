@@ -454,6 +454,12 @@ fn fixture_message_scope(fixture: &SuiteFixture) -> (String, String) {
         aggregate_type: astral_types::PublishedEvidenceAggregate::UserCard,
         aggregate_id: tenant.card_id,
         published_generation: 1,
+        stamp: astral_types::PublicationStamp::new(
+            1,
+            "ab".repeat(32),
+            astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+        )
+        .unwrap(),
         source_generation: 1,
         revoke_fence: 0,
     })

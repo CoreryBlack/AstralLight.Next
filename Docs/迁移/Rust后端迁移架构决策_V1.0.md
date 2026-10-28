@@ -124,6 +124,35 @@ DDL 可能隐式提交。失败后先保存 SQLx history、实际列/索引、ma
 
 MySQL 8.0.46 的历史 auth-family migration 仍保持原 SQLx/source checksum；兼容执行层只对 checksum 已固定的 `SET @db = DATABASE()` 做精确 UTF-8 转换，避免外键元数据排序规则与用户变量冲突。旧 migration 文件和成功历史不改写，正常应用仍由显式 job 完成。
 
+<a id="25-仅-v3-的代际封存切换2026-10-27"></a>
+
+## 2.5 历史 v3 代际封存 migration artifact（2026-10-27；CURRENT V6 见 §2.6）
+
+`20261027000001_authorization_projection_manifest_v3.sql` 是 2026-10-27 历史请求对应的 canonical manifest migration artifact。该文件名、文件字节、migration ID、SQLx/source checksum 和历史 SQL 内容必须 byte-for-byte immutable；它不是当前授权 release number。CURRENT V6 由共享 `astral-types/src/edition.rs` 的 `AUTHORIZATION_EDITION=6` 派生，当前 reader/runtime 只接受 V6 bundle。既有 v3 rows 或旧开发证据缺少 CURRENT V6 证明时必须保持 BLOCKED，需另行批准的 derived-state rebuild 从保留 source/ledger、撤销和审计事实重建；不得自动重写、原地重标、重置 generation 或恢复 revoked access。本节不证明任何环境已执行迁移。
+
+### Preflight、应用与 postcondition
+
+1. 固定 runId、allowlist、代码/SQL hash 与待操作库；停止全部旧 publisher/worker，核验 ownership 和 source/publication COMMIT、lease、lane、消息/审计的 UNKNOWN 均已对账。真实操作须另行批准。
+2. 保存 schema、SQLx 历史、source/ledger、撤销 tombstone/fence、delta/impact plan、current/manifest/references/segments、archive intent/proof 及 completion 审计，证明备份可恢复或具备 forward-fix 路径。
+3. 新字段缺失且 manifest 无行时才允许首次加列。发现旧 manifest 时阻止应用，不把当前时间或 `created_at` 填作历史封存时间；单列缺失、错误类型/顺序/default 等漂移同样拒绝。
+4. 有旧开发证据时先停在阻塞状态，形成另行批准的派生状态重建单元：current/manifest/reference/segment、impact plan、archive intent/proof、已处理 delta 状态与 owned completion 证明必须一并对账，不能只清 manifest 或重置 generation 后复用旧完成记录。source/ledger、撤销及审计事实保留，按合法 source/evidence 路径重建；本次 migration 不删除或自动重放这些数据。
+5. 由显式 `astral-migrate --apply` 执行，再核对 SQLx 版本/checksum、两列精确元数据、所有新证据符合 CURRENT V6 edition 且时间有效。运行时 schema gate 只验证，不自动修复。
+6. 首次 CURRENT V6 发布应证明 V6 `seal`、最终摘要、parent/revoke fence、完整 references/segments、pointer CAS 与 delta completion 一致；同候选重试时间/摘要不变，严格读取、快照 durable token、归档/completion 重验成功。真实 MySQL 集成、崩溃/UNKNOWN 与部署验收分别记录，不能用编译成功替代。
+
+### 失败恢复与回退
+
+DDL 可能隐式提交；失败先核对实际 schema 与迁移历史，禁止删失败记录或改历史 checksum 自动重跑。恢复到新的隔离目标或经批准 forward-fix，必须保持 source/ledger、撤销及审计历史完整。新 reader 不接受旧 v1/v2/v3/v5 durable proof、MAC、wire、cache 或 snapshot，不能把历史 artifact 原地重标为 V6；只允许停止、reconcile、validate 后进入批准的 CURRENT V6 bundle 或修复版本。旧本地快照被明确拒绝，重新从严格 durable 证据捕获，不补造封存时间。代码回退也不授权 DROP 新列、清理数据、重置 generation 或恢复 revoked access。
+
+## 2.6 CURRENT V6 完整规则集视图与轻量发布证据切换（2026-10-28）
+
+标准统一见[规范 §15.7](../规范/Rust后端编码规范_V1.0.md#157-规则集完整结构与轻量发布栅栏标准2026-10-28)。完整 source/read view 与轻量 `PublicationStamp` 分离；stamp 从严格验证的 CURRENT V6 manifest 的 generation、最终 digest 和原 seal 派生，不在 current pointer 重复保存封存列，也不为 pending source 生成发布时间。V6 的 digest/seal/compiler、segment/archive/completion、invalidation、cache/MAC、snapshot schema/payload 与 reader gate 是一个授权 bundle；此源码升级不自动执行数据库迁移。
+
+切换单元包含 producer/consumer、durable invalidation JSON、LocalBus、内存/缓存与本地 snapshot frontier。当前 `EVIDENCE_INVALIDATED`、`ELIGIBILITY_INVALIDATED`、`SESSION_REVOKED` 和 `INVALIDATION_HEARTBEAT` 全部为 V6；permission envelope、L2 evidence、共享内容单元和 snapshot schema/payload 也全部为 CURRENT V6，L2 MAC 为 `astral:l2-evidence:v6:hmac-sha256`。旧 V1/V2/V3/V5 durable proof、wire、cache、MAC 或 snapshot 不被接受，不能通过自动协商、补字段或当前时间重放；停止旧执行者后，按原 operation/message identity 对账旧 outbox/inbox 的 PENDING、UNKNOWN 与撤权状态。旧快照拒绝后从已通过 strict reader 的 CURRENT V6 durable 证据重新捕获，不作为 source 授权批准。
+
+API 响应补齐 canonical 字段，既有公开键保留；写入命令拒绝生成字段、未知字段和所有权改写。部署前逐项核对调用方请求形状，不能继续依赖服务器静默忽略字段。SQL 历史与 source/ledger/撤销/审计事实保留；回退不得重置 generation、删除 pending 或恢复 generation-only 放行。
+
+postcondition 应分别证明完整 source 字段读取、UTC 表达、精确 stamp 往返、source-baseline 失效与新发布的区分、同代 hash/time 冲突拒绝、CURRENT V6 版本及 domain 一致、快照与 durable token 一致及 ALLOW 最终复读。Rust unit/contract gate、真实 MySQL/MQ/Redis、crash/UNKNOWN、多节点及部署验收分别记录；此文不宣称任何环境已切换。
+
 ## 3. 组件替换矩阵
 
 ### 3.1 框架层

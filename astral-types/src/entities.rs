@@ -198,7 +198,11 @@ pub struct PermissionRuleTemplate {
     pub updated_at: Option<String>,
 }
 
-/// 卡片规则集引用
+/// Legacy card-to-rule-set reference shape kept for public compatibility.
+///
+/// The canonical active-schema source shape is `CardRuleSetBinding` from the
+/// `rule_set` module. This type retains its historical fields and wire shape;
+/// it is not the canonical repository model.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CardRuleSetRef {
@@ -346,9 +350,11 @@ pub struct MfaAttemptLog {
 // Java 基线对照: AstralGeneral/entity/platform/ 下 ~34 个实体
 // Rust 原 18 个 → 现补充 6 个关键实体 → 共 24 个
 
-/// 规则集容器（对齐 Java RuleSet）
+/// Legacy RuleSet container shape kept for public compatibility.
 ///
-/// Java 基线: AstralGeneral/entity/platform/RuleSet.java
+/// The canonical active-schema source shape is `RuleSetDefinition` from the
+/// `rule_set` module. This type retains its historical fields and wire shape;
+/// it is not the canonical repository model.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleSet {
@@ -362,9 +368,11 @@ pub struct RuleSet {
     pub updated_at: Option<i64>,
 }
 
-/// 规则集条目（对齐 Java RuleSetEntry）
+/// Legacy RuleSet entry shape kept for public compatibility.
 ///
-/// Java 基线: AstralGeneral/entity/platform/RuleSetEntry.java
+/// The canonical active-schema source shape is `RuleSetEntryDefinition` from
+/// the `rule_set` module. This type retains its historical fields and wire
+/// shape; it is not the canonical repository model.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleSetEntry {

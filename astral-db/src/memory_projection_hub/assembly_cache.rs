@@ -5,10 +5,13 @@ use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use astral_types::{CanonicalGrant, PublishedCardAuthorization, PublishedCardEvidenceScope};
+use astral_types::{
+    CanonicalGrant, PublicationStamp, PublishedCardAuthorization, PublishedCardEvidenceScope,
+};
 
 use super::{AuthorizationPublishedState, ReadToken, RefillScope};
 use crate::authorization_projection_repository::AuthorizationCurrentPointerRecord;
+#[cfg(test)]
 use crate::grant_repository::Sha256Digest;
 
 const MAX_ENTRIES: usize = 1_024;
@@ -17,21 +20,20 @@ const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 const TTL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, PartialEq, Eq)]
-struct PublicationStamp {
+struct AssemblyPublicationIdentity {
     pointer: AuthorizationCurrentPointerRecord,
+    stamp: PublicationStamp,
     manifest_id: i64,
-    generation: u64,
     source_generation: u64,
     projected_generation: u64,
     revoke_fence: u64,
-    manifest_digest: Sha256Digest,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct AssemblyStamp {
     token: ReadToken,
     read_unix_seconds: i64,
-    publications: Vec<PublicationStamp>,
+    publications: Vec<AssemblyPublicationIdentity>,
 }
 
 impl AssemblyStamp {
@@ -39,19 +41,22 @@ impl AssemblyStamp {
         token: ReadToken,
         read_unix_seconds: i64,
         states: &[Arc<AuthorizationPublishedState>],
-    ) -> Self {
+    ) -> Result<Self, String> {
         let mut publications: Vec<_> = states
             .iter()
-            .map(|state| PublicationStamp {
-                pointer: state.pointer.clone(),
-                manifest_id: state.manifest_id,
-                generation: state.generation,
-                source_generation: state.source_generation,
-                projected_generation: state.projected_generation,
-                revoke_fence: state.revoke_fence,
-                manifest_digest: state.manifest_digest,
+            .map(|state| {
+                Ok(AssemblyPublicationIdentity {
+                    pointer: state.pointer.clone(),
+                    stamp: state
+                        .publication_stamp()
+                        .map_err(|error| error.to_string())?,
+                    manifest_id: state.manifest_id,
+                    source_generation: state.source_generation,
+                    projected_generation: state.projected_generation,
+                    revoke_fence: state.revoke_fence,
+                })
             })
-            .collect();
+            .collect::<Result<_, String>>()?;
         publications.sort_unstable_by(|a, b| {
             let a = &a.pointer.identity;
             let b = &b.pointer.identity;
@@ -61,22 +66,23 @@ impl AssemblyStamp {
                 b.aggregate_id,
             ))
         });
-        Self {
+        Ok(Self {
             token,
             read_unix_seconds,
             publications,
-        }
+        })
     }
 
     fn retained_bytes(&self) -> usize {
         self.publications.iter().fold(
-            self.publications.capacity() * size_of::<PublicationStamp>(),
+            self.publications.capacity() * size_of::<AssemblyPublicationIdentity>(),
             |bytes, stamp| {
                 bytes.saturating_add(
                     stamp.pointer.identity.aggregate_type.capacity()
                         + stamp.pointer.event_id.capacity()
                         + stamp.pointer.operation_id.capacity()
-                        + stamp.pointer.compiler_version.capacity(),
+                        + stamp.pointer.compiler_version.capacity()
+                        + stamp.stamp.manifest_digest_hex.capacity(),
                 )
             },
         )

@@ -138,6 +138,13 @@ fn pointer(generation: u64, manifest_id: i64, event_id: &str) -> AuthorizationCu
 
 fn summary_for(generation: u64, manifest_id: i64, event_id: &str) -> PublishedGenerationSummary {
     PublishedGenerationSummary {
+        stamp: astral_types::PublicationStamp::new(
+            generation,
+            digest(3).as_hex(),
+            astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+        )
+        .unwrap(),
+        seal: astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
         manifest_id,
         generation,
         source_generation: 5,
@@ -156,6 +163,7 @@ fn summary_for(generation: u64, manifest_id: i64, event_id: &str) -> PublishedGe
 
 fn published_state(grant: &CanonicalGrant) -> AuthorizationPublishedState {
     AuthorizationPublishedState {
+        seal: astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
         pointer: pointer(2, 22, "evt-2"),
         manifest_id: 22,
         generation: 2,
@@ -195,6 +203,7 @@ fn publish_outcome(state: AuthorizationPublishedState) -> DeltaProjectorPublishO
             item_count: 1,
         },
         stage: AuthorizationStageOutcome {
+            seal: state.seal,
             manifest_id: 22,
             manifest_digest: digest(3),
             target_generation: 2,
@@ -224,6 +233,7 @@ fn seeded_mirror(grant: &CanonicalGrant) -> ScopePlanMirror {
         &identity(),
         PublicationContext {
             frontier: PublishedAggregateFrontier {
+                stamp: summary_for(1, 11, "evt-1").stamp,
                 identity: identity(),
                 card_id: Some(11),
                 pointer: pointer(1, 11, "evt-1"),
@@ -318,6 +328,29 @@ fn proven_publish_advances_frontier_and_ledger() {
     assert_eq!(ledger_rows[0].event_id, "evt-1");
     assert_eq!(ledger_rows[1].event_id, "evt-2");
     assert_eq!(ledger_rows[1].revision_no, 2);
+}
+
+#[test]
+fn mirror_rejects_publication_stamp_pointer_splits_before_advancing() {
+    for dimension in 0..4 {
+        let mirror = seeded_mirror(&canonical_grant(1, GrantState::Active));
+        let mut state = published_state(&canonical_grant(2, GrantState::Active));
+        match dimension {
+            0 => state.pointer.current_generation += 1,
+            1 => state.pointer.manifest_id += 1,
+            2 => state.pointer.card_id = Some(12),
+            3 => {
+                state.pointer.identity =
+                    ProjectionAggregateIdentity::new(7, "card".to_owned(), 43).unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let report = mirror.advance(&claimed_for("evt-2", 2), &publish_outcome(state));
+        assert!(report.scope_poisoned, "dimension={dimension}");
+        assert!(!report.frontier_advanced);
+        assert!(!report.ledger_row_appended);
+        assert!(mirror.get(&ScopeKey::of(&identity())).is_none());
+    }
 }
 
 #[test]

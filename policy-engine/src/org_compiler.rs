@@ -31,7 +31,7 @@ use astral_types::org_scope::{
 };
 
 /// ORG_SCOPE 编译器版本戳（写入 publication.compiler_version；语义变化必须升版）。
-pub const ORG_COMPILER_VERSION: &str = "org-compiler-v1";
+pub const ORG_COMPILER_VERSION: &str = astral_types::AUTHORIZATION_ORG_COMPILER_VERSION;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 编译器内部段单元与编译状态

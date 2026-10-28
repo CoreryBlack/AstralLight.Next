@@ -1,6 +1,6 @@
 use astral_types::{
     CanonicalGrant, DomainScopeRequirement, Effect, EvaluationStep, GlobalAccessRequirement,
-    PolicyContext, PolicyDecision, PolicyError, PublishedCardAuthorization,
+    PolicyContext, PolicyDecision, PolicyError, PublicationSeal, PublishedCardAuthorization,
     PublishedCardEvidenceScope, ResourceOwnershipScope,
 };
 
@@ -1821,6 +1821,7 @@ fn strict_published_grant(
 fn strict_ready_evidence(grants: Vec<CanonicalGrant>) -> PublishedCardAuthorization {
     let record_count = grants.len();
     let manifest = astral_types::PublishedAggregateManifestSummary {
+        seal: PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
         tenant_id: 7,
         card_id: 1,
         aggregate_type: "CARD".to_string(),
@@ -3200,6 +3201,58 @@ fn published_recheck_identity_rejects_tenant_card_drift() {
         7,
         2,
         &matched
+    ));
+}
+
+#[test]
+fn published_recheck_rejects_same_generation_seal_drift() {
+    let baseline = strict_ready_evidence(vec![strict_published_grant(
+        STRICT_RULESET_BASE_GRANT_ID,
+        astral_types::GrantSourceKind::RuleSet,
+        astral_types::BindingLayer::Base,
+        "learn_subject:42",
+        "read",
+    )]);
+    let matched = baseline.effective_grants[0].clone();
+    let mut next = baseline.clone();
+    next.manifests[0].seal = astral_types::PublicationSeal::from_unix_seconds(
+        baseline.manifests[0].seal.unix_seconds() + 1,
+    )
+    .unwrap();
+    assert_eq!(
+        baseline.manifests[0].generation,
+        next.manifests[0].generation
+    );
+    assert!(!published_recheck_identity_stable(
+        &baseline, &next, 7, 1, &matched
+    ));
+}
+
+#[test]
+fn published_recheck_rejects_same_generation_hash_drift_and_invalid_stamp() {
+    let baseline = strict_ready_evidence(vec![strict_published_grant(
+        STRICT_RULESET_BASE_GRANT_ID,
+        astral_types::GrantSourceKind::RuleSet,
+        astral_types::BindingLayer::Base,
+        "learn_subject:42",
+        "read",
+    )]);
+    let matched = baseline.effective_grants[0].clone();
+    for digest in ["d".repeat(64), "D".repeat(64), String::new()] {
+        let mut next = baseline.clone();
+        next.manifests[0].manifest_digest_hex = digest;
+        assert_eq!(
+            baseline.manifests[0].generation,
+            next.manifests[0].generation
+        );
+        assert!(!published_recheck_identity_stable(
+            &baseline, &next, 7, 1, &matched
+        ));
+    }
+    let mut next = baseline.clone();
+    next.manifests[0].generation = 0;
+    assert!(!published_recheck_identity_stable(
+        &baseline, &next, 7, 1, &matched
     ));
 }
 

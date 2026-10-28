@@ -2870,7 +2870,10 @@ mod tests {
             CompileVerdict::Publish(publication) => {
                 assert_eq!(publication.tenant_id, 7);
                 assert_eq!(publication.generation, 1);
-                assert_eq!(publication.compiler_version, "org-compiler-v1");
+                assert_eq!(
+                    publication.compiler_version,
+                    astral_types::AUTHORIZATION_ORG_COMPILER_VERSION
+                );
                 publication
                     .validate()
                     .expect("rendered publication must satisfy the wire contract");

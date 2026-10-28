@@ -118,6 +118,12 @@ impl FanoutFrame {
             .map_err(InvalidationFanoutContractError::InvalidFrame)?;
         match envelope.message_type.as_str() {
             INVALIDATION_HEARTBEAT_MESSAGE_TYPE => {
+                if envelope.schema_version != INVALIDATION_SCHEMA_VERSION {
+                    return Err(InvalidationFanoutContractError::InvalidFrame(format!(
+                        "heartbeat requires schemaVersion {}, got {}",
+                        INVALIDATION_SCHEMA_VERSION, envelope.schema_version
+                    )));
+                }
                 let scope: HeartbeatScope = serde_json::from_value(envelope.payload.clone())
                     .map_err(|error| {
                         InvalidationFanoutContractError::InvalidFrame(format!(
@@ -913,6 +919,12 @@ mod tests {
                 aggregate_type: astral_types::PublishedEvidenceAggregate::UserCard,
                 aggregate_id: 42,
                 published_generation: 10,
+                stamp: astral_types::PublicationStamp::new(
+                    10,
+                    "ab".repeat(32),
+                    astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+                )
+                .unwrap(),
                 source_generation: 10,
                 revoke_fence: 0,
             },
@@ -1024,6 +1036,25 @@ mod tests {
             sent_at: "2026-10-01T00:00:00Z".into(),
         };
         assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn heartbeat_uses_shared_v6_and_rejects_retired_versions() {
+        let mut envelope = heartbeat_envelope();
+        assert_eq!(
+            envelope.schema_version,
+            crate::invalidation::INVALIDATION_SCHEMA_VERSION
+        );
+        let edition = crate::invalidation::INVALIDATION_SCHEMA_VERSION;
+        let retired_versions = (1..edition).chain(std::iter::once(edition + 1));
+        for retired_version in retired_versions {
+            envelope.schema_version = retired_version;
+            let body = serde_json::to_vec(&envelope).unwrap();
+            assert!(
+                FanoutFrame::decode(&body).is_err(),
+                "retired heartbeat schema version {retired_version} must be rejected"
+            );
+        }
     }
 
     #[test]

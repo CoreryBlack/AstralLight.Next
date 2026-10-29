@@ -10,13 +10,28 @@
 //! 需要 `DATABASE_URL`(isolated MySQL,已应用 Rust migrations)。
 
 use astral_db::load_published_card_grant_evidence;
+#[path = "support/source_identity.rs"]
+mod source_identity;
+
+use astral_trustgraph::service::rule_set_write_service::AddEntryRequest;
 use astral_types::{
     DomainScopeRequirement, PublishedCardEvidenceScope, PublishedEvidenceGateStatus,
 };
 use testsuite::{
-    allow_rule_set_grant, cleanup_suite_rows, connect_suite, publish_card_manifest,
-    seed_all_tenants, SuiteFixture, SuiteTenant, TenantRole,
+    cleanup_suite_rows, connect_suite, publish_card_manifest, seed_all_tenants, SuiteFixture,
+    SuiteTenant, TenantRole,
 };
+
+fn allow_entry(priority: i32) -> AddEntryRequest {
+    AddEntryRequest {
+        effect: "ALLOW".to_owned(),
+        resource_type: Some("learn_subject".to_owned()),
+        resource_id: None,
+        action_code: Some("read".to_owned()),
+        condition_json: None,
+        priority,
+    }
+}
 
 const TENANTS: usize = 64;
 
@@ -48,36 +63,39 @@ async fn mt_e1_sixty_four_tenant_interleaved_isolation() {
     let fixture = SuiteFixture::new("mt-e1", &roles());
     seed_all_tenants(&pool, &fixture).await.unwrap();
 
-    // gen1:allow 租户发布 1 条 ALLOW;deny/suspended 租户发布零有效授权。
-    let mut pointers = Vec::new();
+    // Publish a real ADD for each active card, then create genuine REMOVE
+    // episodes for deny/suspended roles. Tenant suspension remains in tenant.status;
+    // user_card stays active for the production source writer precondition.
     for tenant in &fixture.tenants {
-        let grants = if tenant.role.has_allow_rule() {
-            vec![allow_rule_set_grant(
-                fixture.salt,
-                tenant.tenant_id,
-                tenant.domain_id,
-                tenant.card_id,
-                tenant.user_id,
-                "learn_subject:*",
-                tenant.entry_id,
-                tenant.card_rule_set_ref_id,
-                1,
-            )]
-        } else {
-            Vec::new()
-        };
+        let tag = format!("g1-{}", tenant.ordinal);
         let outcome = publish_card_manifest(
             &pool,
             tenant.tenant_id,
             tenant.card_id,
-            grants,
-            &format!("g1-{}", tenant.ordinal),
-            fixture.salt,
-            1,
-            None,
+            tenant.rule_set_id,
+            tenant.user_id,
+            vec![allow_entry(2)],
+            (&tag, fixture.salt),
         )
         .await;
-        pointers.push(outcome.pointer);
+        assert_eq!(outcome.pointer.card_id, Some(tenant.card_id));
+        assert_eq!(outcome.pointer.identity.aggregate_id, tenant.rule_set_id);
+        if !tenant.role.has_allow_rule() {
+            let revoke_tag = format!("deny-{}", tenant.ordinal);
+            let revoked = publish_card_manifest(
+                &pool,
+                tenant.tenant_id,
+                tenant.card_id,
+                tenant.rule_set_id,
+                tenant.user_id,
+                Vec::new(),
+                (&revoke_tag, fixture.salt),
+            )
+            .await;
+            assert_eq!(revoked.pointer.card_id, Some(tenant.card_id));
+            assert_eq!(revoked.pointer.identity.aggregate_id, tenant.rule_set_id);
+            assert_eq!(revoked.published_state.total_grant_count, 0);
+        }
     }
 
     // 逐租户语义核对(全部 64 个)。
@@ -93,57 +111,43 @@ async fn mt_e1_sixty_four_tenant_interleaved_isolation() {
             .effective_grants
             .iter()
             .all(|grant| grant.tenant.tenant_id == tenant.tenant_id));
+        for grant in &evidence.effective_grants {
+            source_identity::assert_ruleset_source_binding(
+                &pool,
+                grant,
+                tenant.tenant_id,
+                tenant.card_id,
+                tenant.rule_set_id,
+            )
+            .await;
+        }
     }
 
     // 混合负载:8 读者全租户交错读取 × 8 写者对 allow 租户做 gen2 扩权。
     let pool = std::sync::Arc::new(pool);
     let fixture = std::sync::Arc::new(fixture);
-    let pointers = std::sync::Arc::new(pointers);
     let mut writers = Vec::new();
     for worker in 0..8usize {
         let pool = pool.clone();
         let fixture = fixture.clone();
-        let pointers = pointers.clone();
         writers.push(tokio::spawn(async move {
             for tenant in fixture.tenants.iter().skip(worker).step_by(8) {
                 if !tenant.role.has_allow_rule() {
                     continue;
                 }
-                let grants = vec![
-                    allow_rule_set_grant(
-                        fixture.salt,
-                        tenant.tenant_id,
-                        tenant.domain_id,
-                        tenant.card_id,
-                        tenant.user_id,
-                        "learn_subject:*",
-                        tenant.entry_id,
-                        tenant.card_rule_set_ref_id,
-                        1,
-                    ),
-                    allow_rule_set_grant(
-                        fixture.salt,
-                        tenant.tenant_id,
-                        tenant.domain_id,
-                        tenant.card_id,
-                        tenant.user_id,
-                        "learn_subject:*",
-                        tenant.entry_id,
-                        tenant.card_rule_set_ref_id,
-                        2,
-                    ),
-                ];
-                publish_card_manifest(
+                let entries = vec![allow_entry(3), allow_entry(4)];
+                let tag = format!("g2-w{worker}-{}", tenant.ordinal);
+                let outcome = publish_card_manifest(
                     &pool,
                     tenant.tenant_id,
                     tenant.card_id,
-                    grants,
-                    &format!("g2-w{worker}-{}", tenant.ordinal),
-                    fixture.salt,
-                    2,
-                    Some(pointers[tenant.ordinal as usize - 1].as_view()),
+                    tenant.rule_set_id,
+                    tenant.user_id,
+                    entries,
+                    (&tag, fixture.salt),
                 )
                 .await;
+                assert_eq!(outcome.published_state.total_grant_count, 2);
             }
         }));
     }
@@ -169,7 +173,17 @@ async fn mt_e1_sixty_four_tenant_interleaved_isolation() {
                     .effective_grants
                     .iter()
                     .all(|grant| grant.tenant.tenant_id == tenant.tenant_id));
-                // gen2 扩权期间允许 1→2 的单调过渡,绝不出现其他形态。
+                for grant in &evidence.effective_grants {
+                    source_identity::assert_ruleset_source_binding(
+                        &pool,
+                        grant,
+                        tenant.tenant_id,
+                        tenant.card_id,
+                        tenant.rule_set_id,
+                    )
+                    .await;
+                }
+                // gen2 扩权期间允许 1→2 的单调过渡,绝不出现其他形态.
                 if tenant.role.has_allow_rule() {
                     assert!(
                         evidence.gate.effective_grant_count == 1
@@ -196,6 +210,16 @@ async fn mt_e1_sixty_four_tenant_interleaved_isolation() {
         let evidence = load_published_card_grant_evidence(&pool, &tenant.card_scope())
             .await
             .expect("post-storm evidence must load");
+        for grant in &evidence.effective_grants {
+            source_identity::assert_ruleset_source_binding(
+                &pool,
+                grant,
+                tenant.tenant_id,
+                tenant.card_id,
+                tenant.rule_set_id,
+            )
+            .await;
+        }
         let expected = if tenant.role.has_allow_rule() {
             2usize
         } else {

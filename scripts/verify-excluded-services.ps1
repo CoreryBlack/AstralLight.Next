@@ -8,7 +8,7 @@ param(
 # Use -Offline to pass --offline; it fails instead of using the network when the
 # local Cargo registry/cache is incomplete.
 # Integration tests marked #[ignore] are intentionally not run here. They require
-# external MySQL, Redis, RabbitMQ, and migration setup.
+# external MySQL/RabbitMQ and an approved, already migrated isolated environment.
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'

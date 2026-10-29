@@ -256,11 +256,7 @@ async fn delete_card_template(
 mod tests {
     use super::operation_id_for_request;
 
-    /// 生产 handler 身份链守卫：actor 必须取自 require_platform_admin
-    /// （Gateway 验证），operation 必须经 `RuleSetMutationContext::user` 的
-    /// 统一持久化安全性校验（缺失 → 本次请求生成一次 UUID v4；非法 → 拒绝），
-    /// 并调用 additive 的 `update_template_with_context`；派生 system 身份的
-    /// legacy 路径仅供兼容，不得被生产 handler 调用。
+    /// HTTP mutations carry the verified Gateway actor and stable operation identity.
     #[test]
     fn update_handler_wires_verified_identity_into_with_context() {
         let source = include_str!("card_templates.rs");

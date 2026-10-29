@@ -13,7 +13,6 @@ case "$MODE" in
     --check) ARGS=(--run --suite workspace-fmt --suite workspace-check --suite workspace-clippy) ;;
     --integration) ARGS=(--run --profile native-single-node) ;;
     --rabbit) ARGS=(--run --profile standalone-rabbit) ;;
-    --redis-compat) ARGS=(--run --profile redis-compat --suite redis-evidence-compat) ;;
     --identity-mapping) ARGS=(--run --suite dedicated-identity-mapping) ;;
     --mt-extreme) ARGS=(--run --profile native-single-node --suite mt-isolation --suite mt-churn --suite mt-cross-storm --suite mt-failclosed --suite mt-capacity) ;;
     --mt-matrix) exec bash "$SCRIPT_DIR/../tests-suite/matrix/run-mt-matrix.sh" "$@" ;;

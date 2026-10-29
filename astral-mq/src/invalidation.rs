@@ -361,9 +361,9 @@ pub enum InvalidationAppendError {
 }
 
 /// Append an invalidation envelope to the caller's existing source
-/// transaction. The function never commits, publishes to a broker, or touches
-/// Redis; the caller owns the transaction boundary and must send any fanout
-/// only after a proven commit.
+/// transaction. The function never commits or publishes to a broker; the caller
+/// owns the transaction boundary and must send any fanout only after a proven
+/// commit.
 pub async fn append_invalidation_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     event: &InvalidationEvent,

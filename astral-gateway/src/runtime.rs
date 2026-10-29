@@ -236,15 +236,10 @@ where
     }
 
     let config = AppConfig::from_files_for("application", JwtValidationRole::Gateway)?;
-    // Redis 编译层退役收口：宿主能力门（本 crate cfg! 为准，marker 会被
-    // workspace feature 统一放大）+ 已校验旗标一次性冻结（组合成员一致，
-    // 异值冲突拒绝启动）。旗标开启而 adapter 未编译 → DB 连接前显式拒绝。
-    config
-        .validate_redis_adapter_support(cfg!(feature = "redis-compat"))
-        .map_err(anyhow::Error::msg)?;
-    astral_common::config::install_redis_projection_compat(config.redis_projection_compat_enabled)
-        .map_err(anyhow::Error::msg)?;
     let session_db = astral_db::connect_and_validate_schema(&config.database_url)
+        .await
+        .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+    astral_db::validate_projection_owned_schema(&session_db)
         .await
         .map_err(|error| anyhow::Error::msg(error.to_string()))?;
     // 镜像 positive 资格 = 组合进程强条件（观测事实，非 invented bool）：
@@ -282,24 +277,9 @@ where
         config.session_grant_mirror_positive_disabled,
     )
     .map_err(anyhow::Error::msg)?;
-    // Redis 编译层退役：feature-off 构建无 compat adapter 可装配；compat 旗标
-    // 开启 + feature 缺失的配置已被 astral-common 集中校验与上方宿主能力门
-    // 双重拒绝（fail-closed），此处 cfg 分支只做装配或说明，不再承担拒绝职责。
-    #[cfg(feature = "redis-compat")]
-    if config.redis_projection_compat_enabled {
-        middleware::init_gateway_redis(&config.redis_url)
-            .await
-            .map_err(anyhow::Error::msg)?;
-    } else {
-        tracing::info!(
-            transport = "mysql",
-            "gateway session auth uses strict MySQL durable facts; redis projection adapter disabled"
-        );
-    }
-    #[cfg(not(feature = "redis-compat"))]
     tracing::info!(
         transport = "mysql",
-        "redis projection adapter not compiled (redis-compat feature disabled); strict MySQL durable facts in use"
+        "gateway session auth uses strict MySQL durable facts"
     );
 
     tracing::info!("gateway starting");
@@ -394,8 +374,8 @@ where
             .merge(chat_routes())
             .route("/main/api/v1/{*path}", any(proxy::forward_to_trustgraph))
             .route("/api/v1/monitor/{*path}", any(proxy::forward_to_monitor))
-            // JWT 中间件（公共路径放行 + strict MySQL 会话判定（可选已证明镜像/
-            // 显式 Redis 兼容 adapter）+ 租户状态严格校验 + 身份头注入）
+            // JWT 中间件（公共路径放行 + strict MySQL 会话判定（可选已证明镜像）+
+            // 租户状态严格校验 + 身份头注入）
             .route_layer(axum_middleware::from_fn_with_state(
                 config.clone(),
                 jwt_auth_middleware,

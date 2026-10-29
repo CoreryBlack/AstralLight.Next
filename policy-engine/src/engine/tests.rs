@@ -1,1730 +1,24 @@
+use astral_types::org_scope::{
+    org_build_segment, org_manifest_digest_hex, OrgAdmissionEvidence, OrgContribution, OrgGrant,
+    OrgGrantRef, OrgManifestDigestMaterial, OrgMembership, OrgNode, OrgProvenance, OrgPublication,
+    OrgRootActivation, OrgScope, OrgScopeKey, OrgSegmentContent,
+};
 use astral_types::{
     CanonicalGrant, DomainScopeRequirement, Effect, EvaluationStep, GlobalAccessRequirement,
     PolicyContext, PolicyDecision, PolicyError, PublicationSeal, PublishedCardAuthorization,
-    PublishedCardEvidenceScope, ResourceOwnershipScope,
+    PublishedCardEvidenceScope, ResourceOwnershipScope, ValidityWindow,
 };
 
 use super::decision::*;
 use super::ports::RuleRepository;
 use super::published::*;
-use super::types::*;
 use super::*;
-use std::sync::Mutex;
-
-/// 模拟 RuleRepository（空数据，L1/L2 无匹配 → L3 DEFAULT_DENY）
-struct EmptyRepo;
-
-#[async_trait::async_trait]
-impl RuleRepository for EmptyRepo {
-    async fn load_rule_set_snapshots(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-        Ok(vec![])
-    }
-    async fn load_permission_rules(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        Ok(vec![])
-    }
-
-    async fn load_projected_delegated_rules(
-        &self,
-        _delegate_id: i64,
-        _resource: &str,
-        _action: &str,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        Ok(vec![])
-    }
-}
-
-// ===== 工具函数 =====
-
-fn allow_entry(resource: &str, action: &str) -> RuleSetEntry {
-    RuleSetEntry {
-        effect: Effect::Allow,
-        resource: Some(resource.to_string()),
-        action: Some(action.to_string()),
-        condition: None,
-    }
-}
-
-#[cfg(feature = "legacy-tests")]
-fn deny_entry(resource: &str, action: &str) -> RuleSetEntry {
-    RuleSetEntry {
-        effect: Effect::Deny,
-        resource: Some(resource.to_string()),
-        action: Some(action.to_string()),
-        condition: None,
-    }
-}
-
-fn allow_rule(resource: &str, action: &str) -> PermissionRule {
-    PermissionRule {
-        id: 0,
-        effect: Effect::Allow,
-        resource: resource.to_string(),
-        action: action.to_string(),
-        condition: None,
-    }
-}
-
-#[cfg(feature = "legacy-tests")]
-fn deny_rule(resource: &str, action: &str) -> PermissionRule {
-    PermissionRule {
-        id: 0,
-        effect: Effect::Deny,
-        resource: resource.to_string(),
-        action: action.to_string(),
-        condition: None,
-    }
-}
-
-/// 默认策略上下文（card_id=1, action=read, resource=learn_subject）
-fn test_ctx() -> PolicyContext {
-    PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("read".into())
-        .resource(Some("learn_subject".into()))
-        .target_id(Some(42))
-        .build()
-}
-
-/// 模拟仓库（指定 snapshots 和 rules）
-#[cfg(feature = "legacy-tests")]
-struct MockRepo {
-    snapshots: Vec<RuleSetSnapshot>,
-    rules: Vec<PermissionRule>,
-}
-
-#[async_trait::async_trait]
-#[cfg(feature = "legacy-tests")]
-impl RuleRepository for MockRepo {
-    async fn load_rule_set_snapshots(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-        Ok(self.snapshots.clone())
-    }
-    async fn load_snapshot_winners(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<SnapshotWinner>, PolicyError> {
-        // 从源表条目编译胜者（对齐投影器语义）：跳过带运行时条件的条目，
-        // 裸资源名视为类型级 `type:*`，同 (resource_key, action) DENY 优先。
-        let mut winners: Vec<SnapshotWinner> = Vec::new();
-        for snapshot in &self.snapshots {
-            for entry in &snapshot.entries {
-                if entry.condition.is_some() {
-                    continue;
-                }
-                let resource = entry.resource.clone().unwrap_or_default();
-                // 已含 `:` 的是完整 key（`type:*` 或 `type:id`）原样保留；
-                // 裸类型名视为类型级 `type:*`。
-                let resource_key = if resource.contains(':') {
-                    resource
-                } else {
-                    format!("{resource}:*")
-                };
-                let action = entry.action.clone().unwrap_or_default();
-                if let Some(existing) = winners.iter_mut().find(|w: &&mut SnapshotWinner| {
-                    w.rule_set_id == snapshot.rule_set_id
-                        && w.resource_key == resource_key
-                        && w.action_code == action
-                }) {
-                    if entry.effect == Effect::Deny {
-                        existing.final_effect = "DENY".into();
-                    }
-                } else {
-                    winners.push(SnapshotWinner {
-                        ref_type: snapshot.ref_type.clone(),
-                        rule_set_id: snapshot.rule_set_id,
-                        resource_key,
-                        action_code: action,
-                        final_effect: match entry.effect {
-                            Effect::Allow => "ALLOW".into(),
-                            _ => "DENY".into(),
-                        },
-                    });
-                }
-            }
-        }
-        Ok(winners)
-    }
-    async fn load_permission_rules(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        Ok(self.rules.clone())
-    }
-
-    async fn load_projected_delegated_rules(
-        &self,
-        _delegate_id: i64,
-        _resource: &str,
-        _action: &str,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        Ok(vec![])
-    }
-}
-
-/// 带投影门禁的模拟仓库：gate 可配置；advance_on_read 在读取规则后推进
-/// 版本（模拟 worker 在评估期间完成投影 → 验证 ALLOW 前复检拒绝旧 ALLOW）
-#[cfg(feature = "legacy-tests")]
-struct GateRepo {
-    gate: Option<ProjectionGate>,
-    advance_on_read: bool,
-    reads: std::sync::atomic::AtomicUsize,
-    gate_override: Mutex<Option<ProjectionGate>>,
-}
-
-#[cfg(feature = "legacy-tests")]
-impl GateRepo {
-    fn ready(gate: ProjectionGate) -> Self {
-        Self {
-            gate: Some(gate),
-            advance_on_read: false,
-            reads: std::sync::atomic::AtomicUsize::new(0),
-            gate_override: Mutex::new(None),
-        }
-    }
-    fn pending() -> Self {
-        Self {
-            gate: Some(ProjectionGate {
-                ready: false,
-                source_generation: 2,
-                revoke_fence: 0,
-            }),
-            advance_on_read: false,
-            reads: std::sync::atomic::AtomicUsize::new(0),
-            gate_override: Mutex::new(None),
-        }
-    }
-    fn legacy() -> Self {
-        Self {
-            gate: None,
-            advance_on_read: false,
-            reads: std::sync::atomic::AtomicUsize::new(0),
-            gate_override: Mutex::new(None),
-        }
-    }
-    fn advancing(initial: ProjectionGate) -> Self {
-        Self {
-            gate: Some(initial),
-            advance_on_read: true,
-            reads: std::sync::atomic::AtomicUsize::new(0),
-            gate_override: Mutex::new(None),
-        }
-    }
-    fn current_gate(&self) -> ProjectionGate {
-        self.gate_override
-            .lock()
-            .unwrap()
-            .unwrap_or(self.gate.unwrap_or(ProjectionGate {
-                ready: true,
-                source_generation: 0,
-                revoke_fence: 0,
-            }))
-    }
-}
-
-#[async_trait::async_trait]
-#[cfg(feature = "legacy-tests")]
-impl RuleRepository for GateRepo {
-    async fn load_snapshot_winners(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<SnapshotWinner>, PolicyError> {
-        // 首次读取后推进（模拟 worker 在评估期间完成重建）。
-        // 投影托管卡（有 head）走快照胜者快速路径，推进点放在此处与
-        // 真实 worker 重建时序一致。
-        if self.advance_on_read && self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
-        {
-            *self.gate_override.lock().unwrap() = Some(ProjectionGate {
-                ready: true,
-                source_generation: 2,
-                revoke_fence: 0,
-            });
-        }
-        Ok(vec![SnapshotWinner {
-            ref_type: "BASE".into(),
-            rule_set_id: 1,
-            resource_key: "learn_subject:*".into(),
-            action_code: "read".into(),
-            final_effect: "ALLOW".into(),
-        }])
-    }
-    async fn load_rule_set_snapshots(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-        Ok(vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![RuleSetEntry {
-                effect: Effect::Allow,
-                resource: Some("learn_subject".into()),
-                action: Some("read".into()),
-                condition: None,
-            }],
-        }])
-    }
-    async fn load_permission_rules(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        Ok(vec![])
-    }
-    async fn get_projection_gate(
-        &self,
-        _card_id: i64,
-    ) -> Result<Option<ProjectionGate>, PolicyError> {
-        Ok(Some(self.current_gate()))
-    }
-
-    async fn load_projected_delegated_rules(
-        &self,
-        _delegate_id: i64,
-        _resource: &str,
-        _action: &str,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        Ok(vec![])
-    }
-}
-
-// ===== 投影门禁测试（对齐 Java AuthorizationReadPort gate 语义） =====
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_projection_pending_denies_before_evaluation() {
-    // head 存在但未 READY（source=2, projected=1）→ AUTHORIZATION_PENDING，
-    // 即使规则集包含 ALLOW 也不放行
-    let engine = PolicyEngine::new();
-    let repo = GateRepo::pending();
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(!decision.allowed);
-    assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
-    let phases: Vec<&str> = decision
-        .evaluation_path
-        .iter()
-        .map(|s| s.phase.as_str())
-        .collect();
-    assert!(phases.contains(&"PROJECTION"));
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_projection_ready_allows_rule_set() {
-    // head READY 且 source==projected → 正常评估，BASE ALLOW 生效
-    let engine = PolicyEngine::new();
-    let repo = GateRepo::ready(ProjectionGate {
-        ready: true,
-        source_generation: 2,
-        revoke_fence: 0,
-    });
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        decision.allowed,
-        "expected ALLOW, got {:?}",
-        decision.reason
-    );
-    assert_eq!(decision.reason, "RULE_SET_ALLOW");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_default_repository_without_projection_gate_allows() {
-    // 未接入 durable gate 的 test repository 保持其显式默认行为。
-    let engine = PolicyEngine::new();
-    let repo = GateRepo::legacy();
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(decision.allowed);
-    assert_eq!(decision.reason, "RULE_SET_ALLOW");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_stale_allow_rejected_when_projection_advances() {
-    // 规则读取期间投影推进（source 1→2, projected 1→2）→ 旧 ALLOW 转 AUTHORIZATION_PENDING
-    let engine = PolicyEngine::new();
-    let repo = GateRepo::advancing(ProjectionGate {
-        ready: true,
-        source_generation: 1,
-        revoke_fence: 0,
-    });
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(!decision.allowed);
-    assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
-    let phases: Vec<&str> = decision
-        .evaluation_path
-        .iter()
-        .map(|s| s.phase.as_str())
-        .collect();
-    assert!(phases.contains(&"PROJECTION"));
-}
-
-#[cfg(feature = "legacy-tests")]
-#[test]
-fn test_ruleset_dependency_readiness_allows_generation_stamped_empty_projection() {
-    let base = RuleSetDependencyStatus {
-        rule_set_id: 7,
-        ref_type: "BASE".into(),
-        rule_set_active: true,
-        head_ready: true,
-        source_generation: 4,
-        projected_generation: 4,
-        revoke_fence: 0,
-        snapshot_generation: Some(4),
-        snapshot_row_count: 0,
-        stale_snapshot_rows: 0,
-    };
-    assert!(base.is_ready());
-
-    let mut disabled = base.clone();
-    disabled.rule_set_active = false;
-    assert!(disabled.is_ready());
-
-    let mut missing = base;
-    missing.snapshot_generation = None;
-    assert!(!missing.is_ready());
-
-    let mut residual = disabled;
-    residual.snapshot_row_count = 1;
-    assert!(residual.is_ready());
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_default_deny() {
-    let engine = PolicyEngine::new();
-    let repo = EmptyRepo;
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(!decision.allowed);
-    assert_eq!(decision.reason, "DEFAULT_DENY");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_missing_user_id() {
-    let engine = PolicyEngine::new();
-    let repo = EmptyRepo;
-    let ctx = PolicyContext::builder()
-        .card_id(Some(1))
-        .action("read".into())
-        .resource(Some("test".into()))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(!decision.allowed);
-    assert_eq!(decision.reason, "AUTHN_REQUIRED");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_missing_card_id() {
-    let engine = PolicyEngine::new();
-    let repo = EmptyRepo;
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .action("read".into())
-        .resource(Some("test".into()))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(!decision.allowed);
-    assert_eq!(decision.reason, "CARD_REQUIRED");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_missing_resource() {
-    let engine = PolicyEngine::new();
-    let repo = EmptyRepo;
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("read".into())
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(!decision.allowed);
-    assert_eq!(decision.reason, "RESOURCE_REQUIRED");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_empty_action_rejected() {
-    let engine = PolicyEngine::new();
-    let repo = EmptyRepo;
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .resource(Some("test".into()))
-        .action("".into())
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(!decision.allowed);
-    assert_eq!(decision.reason, "ACTION_REQUIRED");
-}
-
-// ===== L1 BASE 测试 =====
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_l1_base_allow() {
-    let engine = PolicyEngine::new();
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![allow_entry("learn_subject", "read")],
-        }],
-        rules: vec![],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(decision.allowed);
-    assert_eq!(decision.reason, "RULE_SET_ALLOW");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_l1_base_deny() {
-    let engine = PolicyEngine::new();
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![deny_entry("learn_subject:*", "read")],
-        }],
-        rules: vec![],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(!decision.allowed);
-    assert_eq!(decision.reason, "RULE_SET_DENY");
-}
-
-// ===== L1 OVERLAY > BASE 优先级测试 =====
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_overlay_deny_overrides_base_allow() {
-    let engine = PolicyEngine::new();
-    let repo = MockRepo {
-        snapshots: vec![
-            RuleSetSnapshot {
-                rule_set_id: 1,
-                ref_type: "OVERLAY".into(),
-                entries: vec![deny_entry("learn_subject:*", "read")],
-            },
-            RuleSetSnapshot {
-                rule_set_id: 2,
-                ref_type: "BASE".into(),
-                entries: vec![allow_entry("learn_subject", "read")],
-            },
-        ],
-        rules: vec![],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(!decision.allowed, "OVERLAY DENY must override BASE ALLOW");
-    assert_eq!(decision.reason, "RULE_SET_DENY");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_overlay_allow_beats_base_deny() {
-    let engine = PolicyEngine::new();
-    let repo = MockRepo {
-        snapshots: vec![
-            RuleSetSnapshot {
-                rule_set_id: 1,
-                ref_type: "OVERLAY".into(),
-                entries: vec![allow_entry("learn_subject", "read")],
-            },
-            RuleSetSnapshot {
-                rule_set_id: 2,
-                ref_type: "BASE".into(),
-                entries: vec![deny_entry("learn_subject", "read")],
-            },
-        ],
-        rules: vec![],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(decision.allowed, "OVERLAY ALLOW must beat BASE DENY");
-    assert_eq!(decision.reason, "RULE_SET_ALLOW");
-}
-
-// ===== 层内 DENY-OVERRIDES 测试（评估正式语义） =====
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_priority_based_within_overlay() {
-    let engine = PolicyEngine::new();
-    // 同一 overlay snapshot 中同 key 的 ALLOW 与 DENY：快照唯一键约束
-    // （rule_set_id, resource_key, action_code）下由投影器编译胜者，
-    // 同优先级冲突 DENY 优先（对齐 Java `MergeSemantics.resolveConflict`）。
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "OVERLAY".into(),
-            entries: vec![
-                allow_entry("learn_subject", "read"),
-                deny_entry("learn_subject", "read"),
-            ],
-        }],
-        rules: vec![],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        !decision.allowed,
-        "same-key conflict must compile to DENY (resolveConflict)"
-    );
-    assert_eq!(decision.reason, "RULE_SET_DENY");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_priority_based_within_base() {
-    let engine = PolicyEngine::new();
-    // BASE 中：类型级 ALLOW 与对象级 DENY 并存。
-    // 请求 learn_subject:42 → L1 逐 ref 匹配：exact 命中对象级 DENY
-    // （快照胜者含 learn_subject:42 DENY），DENY 优先于类型级 ALLOW。
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![
-                allow_entry("learn_subject:*", "read"),
-                deny_entry("learn_subject:42", "read"),
-            ],
-        }],
-        rules: vec![],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        !decision.allowed,
-        "exact object DENY must beat type-level ALLOW in L1"
-    );
-    assert_eq!(decision.reason, "RULE_SET_DENY");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_multi_overlay_first_match_wins() {
-    let engine = PolicyEngine::new();
-    // 两个 overlay 规则集：第一个有 allow，第二个有 deny
-    // Java 行为：第一个匹配的 overlay 生效（first-match-wins per ref type）
-    let repo = MockRepo {
-        snapshots: vec![
-            RuleSetSnapshot {
-                rule_set_id: 1,
-                ref_type: "OVERLAY".into(),
-                entries: vec![allow_entry("learn_subject", "read")],
-            },
-            RuleSetSnapshot {
-                rule_set_id: 2,
-                ref_type: "OVERLAY".into(),
-                entries: vec![deny_entry("learn_subject", "read")],
-            },
-        ],
-        rules: vec![],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        decision.allowed,
-        "Java behavior: first OVERLAY ref with ALLOW wins"
-    );
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_l1_low_order_ref_wildcard_deny_beats_high_order_ref_exact_allow() {
-    // A4 回归：跨 ref 匹配必须按 Java 逐 ref first-match-wins，
-    // 而不是跨 ref 的 exact-first（exact 优先会让高序 ref 的精确 ALLOW
-    // 遮蔽低序 ref 的通配 DENY，造成越权方向不一致）。
-    // 低序 ref(id=1) 类型级 DENY 命中 → 层效果 DENY，高序 ref(id=2) 不再评估。
-    let engine = PolicyEngine::new();
-    let repo = MockRepo {
-        snapshots: vec![
-            RuleSetSnapshot {
-                rule_set_id: 1,
-                ref_type: "OVERLAY".into(),
-                entries: vec![deny_entry("learn_subject:*", "read")],
-            },
-            RuleSetSnapshot {
-                rule_set_id: 2,
-                ref_type: "OVERLAY".into(),
-                entries: vec![allow_entry("learn_subject", "read")],
-            },
-        ],
-        rules: vec![],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        !decision.allowed,
-        "per-ref first-match: low-order ref DENY must win over high-order ref ALLOW"
-    );
-    assert_eq!(decision.reason, "RULE_SET_DENY");
-}
-
-#[tokio::test]
-async fn test_l1_snapshot_load_failure_denies_without_l2_fallback() {
-    // A1 回归：快照加载失败必须立即 DENY（RULE_SET_UNAVAILABLE），
-    // 不得继续 L2 评估——即使 L2 存在旧 ALLOW 规则（快照不可用可能掩盖已撤销权限）。
-    struct ErrorWinnersRepo {
-        rules: Vec<PermissionRule>,
-    }
-
-    #[async_trait::async_trait]
-    impl RuleRepository for ErrorWinnersRepo {
-        async fn load_snapshot_winners(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<SnapshotWinner>, PolicyError> {
-            Err(PolicyError::Repository("simulated snapshot failure".into()))
-        }
-        async fn load_permission_rules(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            Ok(self.rules.clone())
-        }
-        async fn load_rule_set_snapshots(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-            Ok(vec![])
-        }
-    }
-
-    let engine = PolicyEngine::new();
-    let repo = ErrorWinnersRepo {
-        rules: vec![allow_rule("learn_subject:*", "read")],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        !decision.allowed,
-        "snapshot load failure must deny without falling back to L2"
-    );
-    assert_eq!(decision.reason, "RULE_SET_UNAVAILABLE");
-}
-
-// ===== Forward/Reverse Wildcard 测试 =====
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_forward_wildcard_type_matches_instance() {
-    let engine = PolicyEngine::new();
-    // entry 是类型级通配 "learn_subject:*", request 是 "learn_subject:42"
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![allow_entry("learn_subject:*", "read")],
-        }],
-        rules: vec![],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        decision.allowed,
-        "Forward wildcard: type:* must match type:42"
-    );
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_forward_wildcard_type_name_matches() {
-    let engine = PolicyEngine::new();
-    // entry 用裸类型名 "learn_subject"（不含 :），request 是 "learn_subject:42"
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![allow_entry("learn_subject", "read")],
-        }],
-        rules: vec![],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        decision.allowed,
-        "Forward wildcard: bare type name must match type:id"
-    );
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_object_rule_does_not_match_type_request() {
-    let engine = PolicyEngine::new();
-    // 类型级请求（无 target_id，key=`learn_subject:*`）+ 对象级快照条目。
-    // Java `checkRuleSetEffect` Step3 reverse wildcard：请求为 `type:*` 时扫描
-    // 对象级条目，DENY 优先；此处只有对象级 ALLOW → 返回 ALLOW。
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![allow_entry("learn_subject:42", "read")],
-        }],
-        rules: vec![],
-    };
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("read".into())
-        .resource(Some("learn_subject".into()))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        decision.allowed,
-        "reverse wildcard: type request matches object ALLOW (Java scanSnapshotEffect)"
-    );
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_reverse_wildcard_object_deny_beats_type_request() {
-    let engine = PolicyEngine::new();
-    // 类型级请求 + 对象级 DENY → L1 reverse wildcard 返回 DENY（DENY 优先，
-    // 对齐 Java `scanSnapshotEffect` orderByDesc(final_effect)）。
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![deny_entry("learn_subject:42", "read")],
-        }],
-        rules: vec![],
-    };
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("read".into())
-        .resource(Some("learn_subject".into()))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        !decision.allowed,
-        "reverse wildcard: object DENY must block type request"
-    );
-    assert_eq!(decision.reason, "RULE_SET_DENY");
-}
-
-// ===== 动作别名测试 =====
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_action_alias_write_matches_create() {
-    let engine = PolicyEngine::new();
-    // entry 定义 write，request 要 create
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![allow_entry("learn_subject:*", "write")],
-        }],
-        rules: vec![],
-    };
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("create".into())
-        .resource(Some("learn_subject".into()))
-        .target_id(Some(42))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(decision.allowed, "Alias 'write' must match 'create'");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_action_alias_write_matches_delete() {
-    let engine = PolicyEngine::new();
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![allow_entry("learn_subject:*", "write")],
-        }],
-        rules: vec![],
-    };
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("delete".into())
-        .resource(Some("learn_subject".into()))
-        .target_id(Some(42))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(decision.allowed, "Alias 'write' must match 'delete'");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_alias_forward_wildcard_combined() {
-    let engine = PolicyEngine::new();
-    // entry 是类型级 write, request 是具体 ID 的 delete
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![allow_entry("learn_subject", "write")],
-        }],
-        rules: vec![],
-    };
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("delete".into())
-        .resource(Some("learn_subject".into()))
-        .target_id(Some(42))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        decision.allowed,
-        "Alias + forward wildcard: write + type matches delete + instance"
-    );
-}
-
-// ===== L2 PermissionRule 回退测试 =====
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_l2_fallback() {
-    let engine = PolicyEngine::new();
-    let repo = MockRepo {
-        snapshots: vec![],
-        rules: vec![allow_rule("learn_subject:*", "read")],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(decision.allowed);
-    assert_eq!(decision.reason, "RULE_ALLOW");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_l2_fallback_alias() {
-    let engine = PolicyEngine::new();
-    let repo = MockRepo {
-        snapshots: vec![],
-        rules: vec![allow_rule("learn_subject:*", "write")],
-    };
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("update".into())
-        .resource(Some("learn_subject".into()))
-        .target_id(Some(42))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(decision.allowed, "L2 alias: 'write' must match 'update'");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_l2_exact_object_deny_beats_type_allow() {
-    // 对齐 Java `findSnapshot` 精确 selectOne：具体对象 DENY 必须先于类型级 ALLOW 判定，
-    // 否则 learn_subject:42 的 DENY 会被 learn_subject:* ALLOW 按行序遮蔽（越权）。
-    let engine = PolicyEngine::new();
-    let repo = MockRepo {
-        snapshots: vec![],
-        rules: vec![
-            allow_rule("learn_subject:*", "read"),
-            deny_rule("learn_subject:42", "read"),
-        ],
-    };
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("read".into())
-        .resource(Some("learn_subject".into()))
-        .target_id(Some(42))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        !decision.allowed,
-        "exact object DENY must beat type-level ALLOW"
-    );
-    assert_eq!(decision.reason, "RULE_DENY");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_l2_exact_object_allow_beats_type_deny() {
-    // 具体对象 ALLOW 优先于类型级 DENY（精确优先两段式的正向用例）
-    let engine = PolicyEngine::new();
-    let repo = MockRepo {
-        snapshots: vec![],
-        rules: vec![
-            deny_rule("learn_subject:*", "read"),
-            allow_rule("learn_subject:42", "read"),
-        ],
-    };
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("read".into())
-        .resource(Some("learn_subject".into()))
-        .target_id(Some(42))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        decision.allowed,
-        "exact object ALLOW must beat type-level DENY"
-    );
-    assert_eq!(decision.reason, "RULE_ALLOW");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_l2_type_request_ignores_object_rule() {
-    // 类型级请求（无 target_id）不能命中具体对象规则：
-    // 仅有 learn_subject:42 DENY 时，learn_subject:* 请求不得被对象规则拒绝。
-    let engine = PolicyEngine::new();
-    let repo = MockRepo {
-        snapshots: vec![],
-        rules: vec![deny_rule("learn_subject:42", "read")],
-    };
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("read".into())
-        .resource(Some("learn_subject".into()))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(!decision.allowed, "no type-level rule should match");
-    assert_eq!(decision.reason, "DEFAULT_DENY");
-}
-
-// ===== 条件评估测试 =====
-//
-// 对齐 Java：运行时条件仅在 L2（permission_rule）级别评估，
-// L1（rule_set）中带运行时条件的条目被跳过（如同 Java snapshot 编译时排除）。
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_condition_time_range_passes_at_l2() {
-    let engine = PolicyEngine::new();
-    let condition = serde_json::json!({
-        "condition_type": "TimeRangeCondition",
-        "params": { "start": "00:00", "end": "23:59" }
-    });
-    let repo = MockRepo {
-        snapshots: vec![],
-        rules: vec![PermissionRule {
-            id: 1,
-            effect: Effect::Allow,
-            resource: "learn_subject:*".into(),
-            action: "read".into(),
-            condition: Some(condition),
-        }],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        decision.allowed,
-        "TimeRange 00:00-23:59 should pass at any time (L2)"
-    );
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_condition_owner_only_pass_at_l2() {
-    let engine = PolicyEngine::new();
-    let condition = serde_json::json!({
-        "condition_type": "OwnerOnlyCondition",
-        "params": {}
-    });
-    let repo = MockRepo {
-        snapshots: vec![],
-        rules: vec![PermissionRule {
-            id: 1,
-            effect: Effect::Allow,
-            resource: "learn_subject:*".into(),
-            action: "read".into(),
-            condition: Some(condition),
-        }],
-    };
-    // 对齐 Java ConditionEvaluator.ownerOnly：resourceOwnerId == currentUserId → allow
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("read".into())
-        .resource(Some("learn_subject".into()))
-        .target_id(Some(100))
-        .resource_owner_id(Some(1))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        decision.allowed,
-        "OwnerOnly with matching resource owner should pass at L2"
-    );
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_condition_owner_only_blocks_at_l2() {
-    let engine = PolicyEngine::new();
-    let condition = serde_json::json!({
-        "condition_type": "OwnerOnlyCondition",
-        "params": {}
-    });
-    let repo = MockRepo {
-        snapshots: vec![],
-        rules: vec![PermissionRule {
-            id: 1,
-            effect: Effect::Allow,
-            resource: "learn_subject:*".into(),
-            action: "read".into(),
-            condition: Some(condition),
-        }],
-    };
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("read".into())
-        .resource(Some("learn_subject".into()))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        !decision.allowed,
-        "OwnerOnly without target_id should block at L2"
-    );
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_l1_skips_condition_entry_falls_to_unconditional() {
-    let engine = PolicyEngine::new();
-    // 第一个 entry 有时间范围条件（L1 中跳过），第二个无条件（L1 匹配）
-    let past_condition = serde_json::json!({
-        "condition_type": "TimeRangeCondition",
-        "params": { "start": "00:00", "end": "01:00" }
-    });
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![
-                RuleSetEntry {
-                    effect: Effect::Allow,
-                    resource: Some("learn_subject:*".into()),
-                    action: Some("read".into()),
-                    condition: Some(past_condition),
-                },
-                allow_entry("learn_subject:*", "read"), // 无条件，兜底
-            ],
-        }],
-        rules: vec![],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    // 第一个 entry 带运行时条件被 L1 跳过，第二个无条件 entry 应匹配
-    assert!(
-        decision.allowed,
-        "L1 should skip condition entry and match unconditional fallback"
-    );
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_l1_condition_entry_skipped_falls_to_l2() {
-    let engine = PolicyEngine::new();
-    let condition = serde_json::json!({
-        "condition_type": "TimeRangeCondition",
-        "params": { "start": "00:00", "end": "23:59" }
-    });
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![RuleSetEntry {
-                effect: Effect::Allow,
-                resource: Some("learn_subject:*".into()),
-                action: Some("read".into()),
-                condition: Some(condition),
-            }],
-        }],
-        // 带条件的 entry 被 L1 跳过，L2 无条件 fallback 匹配
-        rules: vec![allow_rule("learn_subject:*", "read")],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        decision.allowed,
-        "L1 condition entry skipped, L2 fallback should match"
-    );
-}
-
-#[tokio::test]
-async fn test_l2_repository_error_terminates_before_l2_5() {
-    struct ErrorL2DelegationRepo {
-        projected_delegation_reads: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl RuleRepository for ErrorL2DelegationRepo {
-        async fn load_rule_set_snapshots(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-            Ok(vec![])
-        }
-
-        async fn load_permission_rules(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            Err(PolicyError::Repository("L2 unavailable".into()))
-        }
-
-        async fn load_delegated_rules(
-            &self,
-            _delegate_id: i64,
-            _resource: &str,
-            _action: &str,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            Ok(vec![allow_rule("learn_subject:*", "read")])
-        }
-
-        async fn load_projected_delegated_rules(
-            &self,
-            _delegate_id: i64,
-            _resource: &str,
-            _action: &str,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            self.projected_delegation_reads
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(vec![allow_rule("learn_subject:*", "read")])
-        }
-    }
-
-    let engine = PolicyEngine::new();
-    let repo = ErrorL2DelegationRepo {
-        projected_delegation_reads: std::sync::atomic::AtomicUsize::new(0),
-    };
-    let ctx = test_ctx();
-
-    for _ in 0..10 {
-        let decision = engine.evaluate(&ctx, &repo).await;
-        assert!(!decision.allowed);
-        assert_eq!(decision.reason, "DEPENDENCY_UNAVAILABLE");
-        assert!(decision
-            .evaluation_path
-            .iter()
-            .all(|step| step.phase != "DELEGATION"));
-    }
-    assert_eq!(
-        repo.projected_delegation_reads
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "L2 errors must terminate before projected delegation fallback"
-    );
-    assert_eq!(engine.circuit_breaker_state(), CircuitBreakerState::Open);
-
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert_eq!(decision.reason, "CIRCUIT_BREAKER_OPEN");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_projected_delegation_is_evaluated_only_at_l2_5() {
-    struct ProjectedDelegationRepo;
-
-    #[async_trait::async_trait]
-    impl RuleRepository for ProjectedDelegationRepo {
-        async fn load_rule_set_snapshots(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-            Ok(vec![])
-        }
-
-        async fn load_permission_rules(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            Ok(vec![])
-        }
-
-        async fn load_delegated_rules(
-            &self,
-            _delegate_id: i64,
-            _resource: &str,
-            _action: &str,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            Ok(vec![])
-        }
-
-        async fn load_projected_delegated_rules(
-            &self,
-            _delegate_id: i64,
-            _resource: &str,
-            _action: &str,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            Ok(vec![allow_rule("learn_subject:*", "read")])
-        }
-    }
-
-    let engine = PolicyEngine::new();
-    let decision = engine.evaluate(&test_ctx(), &ProjectedDelegationRepo).await;
-
-    assert!(decision.allowed);
-    assert_eq!(decision.reason, "DELEGATION_ALLOW");
-    assert!(decision
-        .evaluation_path
-        .iter()
-        .any(|step| step.phase == "DELEGATION" && step.result == Effect::Allow));
-    assert!(!decision
-        .evaluation_path
-        .iter()
-        .any(|step| step.phase == "PERMISSION_RULE" && step.result == Effect::Allow));
-    assert_eq!(engine.get_stats().l2_hits, 0);
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_l2_5_repository_error_counts_as_failure() {
-    struct ErrorDelegationRepo;
-
-    #[async_trait::async_trait]
-    impl RuleRepository for ErrorDelegationRepo {
-        async fn load_rule_set_snapshots(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-            Ok(vec![])
-        }
-
-        async fn load_permission_rules(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            Ok(vec![])
-        }
-
-        async fn load_projected_delegated_rules(
-            &self,
-            _delegate_id: i64,
-            _resource: &str,
-            _action: &str,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            Err(PolicyError::Repository("delegation unavailable".into()))
-        }
-    }
-
-    let engine = PolicyEngine::new();
-    let repo = ErrorDelegationRepo;
-    let ctx = test_ctx();
-
-    for _ in 0..10 {
-        let decision = engine.evaluate(&ctx, &repo).await;
-        assert!(!decision.allowed);
-        assert_eq!(decision.reason, "DEFAULT_DENY");
-    }
-    assert_eq!(engine.circuit_breaker_state(), CircuitBreakerState::Open);
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_alias_plus_wildcard_at_l1() {
-    let engine = PolicyEngine::new();
-    // 别名 write + 类型级通配（无条件 → L1 正常匹配）
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![RuleSetEntry {
-                effect: Effect::Allow,
-                resource: Some("learn_subject".into()), // 类型级
-                action: Some("write".into()),           // 别名
-                condition: None,                        // 无条件
-            }],
-        }],
-        rules: vec![],
-    };
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("delete".into())
-        .resource(Some("learn_subject".into()))
-        .target_id(Some(42))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(
-        decision.allowed,
-        "L1: alias+wildcard without condition should pass"
-    );
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_alias_plus_condition_at_l2() {
-    let engine = PolicyEngine::new();
-    // 别名 write + 时间范围条件 → L2 匹配（L1 无条件则 fall through）
-    let condition = serde_json::json!({
-        "condition_type": "TimeRangeCondition",
-        "params": { "start": "00:00", "end": "23:59" }
-    });
-    let repo = MockRepo {
-        snapshots: vec![],
-        rules: vec![PermissionRule {
-            id: 1,
-            effect: Effect::Allow,
-            resource: "learn_subject:*".into(),
-            action: "write".into(),
-            condition: Some(condition),
-        }],
-    };
-    let ctx = PolicyContext::builder()
-        .user_id(Some(1))
-        .card_id(Some(1))
-        .action("delete".into())
-        .resource(Some("learn_subject".into()))
-        .target_id(Some(42))
-        .build();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(decision.allowed, "L2: alias+condition+wildcard should pass");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_wildcard_action_match() {
-    let engine = PolicyEngine::new();
-    // 快照胜者 action 为 read，请求 read → 精确匹配。
-    // （Java 快照/引擎均不支持 `*` 动作通配，此处验证类型级资源匹配。）
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![allow_entry("learn_subject:*", "read")],
-        }],
-        rules: vec![],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(decision.allowed);
-}
-
-// ===== 断路器 + 并发测试 =====
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_circuit_breaker_fall_closed() {
-    let engine = PolicyEngine::new();
-    engine.force_open_circuit_breaker();
-
-    let repo = MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![allow_entry("anything", "read")],
-        }],
-        rules: vec![],
-    };
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(!decision.allowed, "circuit breaker open must deny");
-    assert_eq!(decision.reason, "CIRCUIT_BREAKER_OPEN");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_inactive_card_rejected() {
-    struct InactiveRepo;
-    #[async_trait::async_trait]
-    impl RuleRepository for InactiveRepo {
-        async fn load_rule_set_snapshots(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-            Ok(vec![])
-        }
-        async fn load_permission_rules(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            Ok(vec![])
-        }
-        async fn check_card_active(&self, _ctx: &PolicyContext) -> Result<bool, PolicyError> {
-            Ok(false)
-        }
-    }
-
-    let engine = PolicyEngine::new();
-    let repo = InactiveRepo;
-    let ctx = test_ctx();
-    let decision = engine.evaluate(&ctx, &repo).await;
-    assert!(!decision.allowed);
-    assert_eq!(decision.reason, "CARD_DISABLED");
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_concurrent_evaluations() {
-    let engine = std::sync::Arc::new(PolicyEngine::new());
-    let repo = std::sync::Arc::new(MockRepo {
-        snapshots: vec![RuleSetSnapshot {
-            rule_set_id: 1,
-            ref_type: "BASE".into(),
-            entries: vec![allow_entry("test:*", "read")],
-        }],
-        rules: vec![],
-    });
-
-    let mut handles = vec![];
-    for i in 0..10 {
-        let engine = engine.clone();
-        let repo = repo.clone();
-        handles.push(tokio::spawn(async move {
-            let ctx = PolicyContext::builder()
-                .user_id(Some(i))
-                .card_id(Some(i))
-                .action("read".into())
-                .resource(Some("test".into()))
-                .target_id(Some(i))
-                .build();
-            engine.evaluate(&ctx, repo.as_ref()).await
-        }));
-    }
-
-    for handle in handles {
-        let decision = handle.await.unwrap();
-        assert!(decision.allowed);
-    }
-}
-
-// ===== Published-card shadow read port（非正式 evaluate 端口） =====
-
-/// Minimal Ready-gate evidence fixture for classifier tests ONLY.
-///
-/// The real strict reader is the sole legitimate constructor of
-/// [`astral_types::PublishedCardAuthorization`] with non-empty collections;
-/// this hand-made empty collection fixture must never leak outside tests.
-fn ready_shadow_evidence(scope: &PublishedCardEvidenceScope) -> PublishedCardAuthorization {
-    PublishedCardAuthorization {
-        tenant_id: scope.tenant_id,
-        card_id: scope.card_id,
-        read_unix_seconds: 1_700_000_000,
-        gate: astral_types::PublishedCardAuthorizationGate {
-            status: astral_types::PublishedEvidenceGateStatus::Ready,
-            aggregate_manifest_count: 0,
-            verified_record_count: 0,
-            effective_grant_count: 0,
-            not_in_effective_count: 0,
-            equivalent_duplicate_collapsed_count: 0,
-        },
-        manifests: vec![],
-        records: vec![],
-        effective_grants: vec![],
-    }
-}
-
-#[test]
-fn formal_evaluate_switches_to_published_evidence_only_behind_capability_marker() {
-    // 拆分后正式评估主链位于 formal.rs，RuleRepository port 位于 ports.rs；
-    // 本测试分别扫描两个模块文件，断言语义与拆分前一致。
-    let formal_source = include_str!("../engine/formal.rs");
-    let ports_source = include_str!("../engine/ports.rs");
-
-    // evaluate() gates the strict published-evidence path on the capability
-    // marker and delegates to the dedicated strict-gate helper.
-    let evaluate_region = formal_source
-        .split("pub async fn evaluate<R: RuleRepository>")
-        .nth(1)
-        .and_then(|body| {
-            body.split("async fn evaluate_rule_sets<R: RuleRepository>")
-                .next()
-        })
-        .expect("formal evaluate entry must exist");
-    assert!(
-        evaluate_region.contains("requires_published_card_evidence"),
-        "formal evaluate must gate the strict path on the capability marker"
-    );
-    assert!(
-        evaluate_region.contains("evaluate_published_card_evidence"),
-        "formal evaluate must delegate the strict path to the published-evidence helper"
-    );
-
-    // The L1/L2 union helpers themselves stay free of the published-evidence
-    // port: only the strict gate consumes it, never the rule readers.
-    let rule_set_union_region = formal_source
-        .split("async fn evaluate_rule_sets<R: RuleRepository>")
-        .nth(1)
-        .and_then(|body| {
-            body.split("async fn evaluate_permission_rules<R: RuleRepository>")
-                .next()
-        })
-        .expect("rule set union region must exist");
-    let permission_rules_region = formal_source
-        .split("async fn evaluate_permission_rules<R: RuleRepository>")
-        .nth(1)
-        .and_then(|body| body.split("pub fn evaluate_fallback").next())
-        .expect("permission rules L2 region must exist");
-    for body in [rule_set_union_region, permission_rules_region] {
-        assert!(
-            !body.contains("load_published_card_authorization"),
-            "L1/L2 union paths must never consult the published-evidence port"
-        );
-        assert!(
-            !body.contains("published_card_shadow_evidence_is_usable"),
-            "L1/L2 union paths must never consult the shadow classifier"
-        );
-    }
-
-    // The trait default stays an explicit unavailable marker (`Ok(None)`),
-    // never a synthetic Ready payload.
-    let default_impl = ports_source
-        .split("async fn load_published_card_authorization")
-        .nth(1)
-        .expect("published evidence port declaration must exist");
-    let default_impl_body = default_impl.split('}').next().unwrap_or(default_impl);
-    assert!(
-        default_impl_body.contains("Ok(None)"),
-        "trait default must remain the explicit legacy/test unavailable marker"
-    );
-    assert!(
-        !default_impl_body.contains("PublishedEvidenceGateStatus::Ready"),
-        "trait default must never fabricate a Ready gate"
-    );
-
-    // The capability marker defaults to false for test/default repositories.
-    let marker_default = ports_source
-        .split("fn requires_published_card_evidence")
-        .nth(1)
-        .and_then(|body| body.split('}').next())
-        .expect("capability marker declaration must exist");
-    assert!(
-        marker_default.contains("false"),
-        "capability marker must default to false for test/default repositories"
-    );
-}
-
-#[tokio::test]
-async fn shadow_port_default_is_unavailable_and_never_authorizes() {
-    let repo = EmptyRepo;
-    let scope = PublishedCardEvidenceScope {
-        tenant_id: 7,
-        card_id: 17,
-        user_filter: Some(42),
-        domain: astral_types::DomainScopeRequirement::ExactlySome(11),
-    };
-    let outcome = repo
-        .load_published_card_authorization(&scope)
-        .await
-        .unwrap();
-    assert_eq!(outcome, None);
-    // Ok(None) is an unavailable marker, NOT an empty-but-valid ALLOW.
-    assert!(!published_card_shadow_evidence_is_usable(&Ok(None)));
-    // Repository failures classify as unusable too (pending/deny upstream).
-    assert!(!published_card_shadow_evidence_is_usable(&Err(PolicyError::Repository(
-            "published_card_evidence_not_ready;code=published_card_evidence.current_pointer_missing"
-                .into(),
-        ))));
-    assert!(!published_card_shadow_evidence_is_usable(&Err(
-        PolicyError::InvalidContext("published_card_evidence_invalid_request;code=x".into(),)
-    )));
-}
-
-/// A repository overriding the port must receive the exact caller scope
-/// (tenant/card/user/domain lens unchanged) and a Ready gate result is the
-/// only outcome classified usable.
-#[tokio::test]
-async fn shadow_scope_passthrough_keeps_tenant_card_user_domain() {
-    struct ScopeCaptureRepo {
-        captured: Mutex<Vec<PublishedCardEvidenceScope>>,
-    }
-
-    #[async_trait::async_trait]
-    impl RuleRepository for ScopeCaptureRepo {
-        async fn load_rule_set_snapshots(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-            Ok(vec![])
-        }
-        async fn load_permission_rules(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            Ok(vec![])
-        }
-        async fn load_published_card_authorization(
-            &self,
-            scope: &PublishedCardEvidenceScope,
-        ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
-            self.captured.lock().unwrap().push(scope.clone());
-            Ok(Some(std::sync::Arc::new(ready_shadow_evidence(scope))))
-        }
-    }
-
-    let repo = ScopeCaptureRepo {
-        captured: Mutex::new(vec![]),
-    };
-    let scope = PublishedCardEvidenceScope {
-        tenant_id: 9,
-        card_id: 33,
-        user_filter: None,
-        domain: astral_types::DomainScopeRequirement::ExactlyNone,
-    };
-    let outcome = repo
-        .load_published_card_authorization(&scope)
-        .await
-        .unwrap();
-    assert!(outcome.is_some());
-    assert!(published_card_shadow_evidence_is_usable(&Ok(outcome)));
-    let captured = repo.captured.lock().unwrap();
-    assert_eq!(captured.len(), 1);
-    assert_eq!(captured[0], scope);
-    assert_eq!(captured[0].tenant_id, 9);
-    assert_eq!(captured[0].card_id, 33);
-    assert_eq!(captured[0].user_filter, None);
-    assert_eq!(
-        captured[0].domain,
-        astral_types::DomainScopeRequirement::ExactlyNone
-    );
-}
-
-#[test]
-fn shadow_classifier_only_accepts_ready_gated_some() {
-    let usable = ready_shadow_evidence(&PublishedCardEvidenceScope {
-        tenant_id: 1,
-        card_id: 1,
-        user_filter: None,
-        domain: astral_types::DomainScopeRequirement::Unconstrained,
-    });
-    assert!(published_card_shadow_evidence_is_usable(&Ok(Some(
-        std::sync::Arc::new(usable)
-    ))));
-
-    let mut corrupt = ready_shadow_evidence(&PublishedCardEvidenceScope {
-        tenant_id: 1,
-        card_id: 1,
-        user_filter: None,
-        domain: astral_types::DomainScopeRequirement::Unconstrained,
-    });
-    corrupt.gate.status = astral_types::PublishedEvidenceGateStatus::Corrupt;
-    assert!(!published_card_shadow_evidence_is_usable(&Ok(Some(
-        std::sync::Arc::new(corrupt)
-    ))));
-}
-
-// ===== Published-evidence strict gate（正式路径，capability marker = true） =====
-
+use crate::org_admission::OrgAuthorityRead;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+// ===== CURRENT V6 strict published-evidence evaluator =====
 
 /// strict gate 上下文：PLATFORM 域完整身份（tenant/domain 与 fixture 对齐）。
 fn strict_ctx() -> PolicyContext {
@@ -1835,7 +129,7 @@ fn strict_ready_evidence(grants: Vec<CanonicalGrant>) -> PublishedCardAuthorizat
         semantic_hash_hex: "a".repeat(64),
         dependency_hash_hex: "b".repeat(64),
         manifest_digest_hex: "c".repeat(64),
-        compiler_version: "test".to_string(),
+        compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_string(),
         event_id: "event-1".to_string(),
         operation_id: "op-1".to_string(),
         parent_manifest_id: None,
@@ -1854,7 +148,7 @@ fn strict_ready_evidence(grants: Vec<CanonicalGrant>) -> PublishedCardAuthorizat
             operation_id: "op-1".to_string(),
             semantic_hash_hex: "a".repeat(64),
             dependency_hash_hex: "b".repeat(64),
-            compiler_version: "test".to_string(),
+            compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_string(),
             segment_ordinal: 0,
             position_in_segment: 0,
             grant: grant.clone(),
@@ -1880,12 +174,8 @@ fn strict_ready_evidence(grants: Vec<CanonicalGrant>) -> PublishedCardAuthorizat
     }
 }
 
-/// strict gate 测试仓库：capability marker = true，按序返回预置读取结果，
-/// 预置耗尽后复用 fallback 证据；L1/L2/L2.5 读取器一旦被调用即计数。
-/// 一致性采样/realtime oracle 专用读取器（projection gate、raw rule_set、
-/// raw permission_rule、legacy delegation）同样计数：strict 路径唯一合法
-/// 的仓库读取是 `load_published_card_authorization`，任何其余读取计数
-/// 非零都意味着 evaluate() 泄漏到了 legacy consistency/realtime 路径。
+/// CURRENT V6 test repository: publish evidence reads are scripted and identity
+/// gates have explicit outcomes. No legacy authorization ports are available.
 struct StrictPublishedRepo {
     outcomes:
         Mutex<VecDeque<Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError>>>,
@@ -1893,7 +183,7 @@ struct StrictPublishedRepo {
     global_admin_outcomes: Mutex<VecDeque<Result<bool, PolicyError>>>,
     global_admin_fallback: bool,
     global_admin_reads: AtomicUsize,
-    legacy_reader_calls: AtomicUsize,
+    card_checks: AtomicUsize,
     published_reads: AtomicUsize,
     published_scopes: Mutex<Vec<PublishedCardEvidenceScope>>,
 }
@@ -1906,7 +196,7 @@ impl StrictPublishedRepo {
             global_admin_outcomes: Mutex::new(VecDeque::new()),
             global_admin_fallback: false,
             global_admin_reads: AtomicUsize::new(0),
-            legacy_reader_calls: AtomicUsize::new(0),
+            card_checks: AtomicUsize::new(0),
             published_reads: AtomicUsize::new(0),
             published_scopes: Mutex::new(vec![]),
         }
@@ -1922,7 +212,7 @@ impl StrictPublishedRepo {
             global_admin_outcomes: Mutex::new(global_admin_outcomes.into()),
             global_admin_fallback: false,
             global_admin_reads: AtomicUsize::new(0),
-            legacy_reader_calls: AtomicUsize::new(0),
+            card_checks: AtomicUsize::new(0),
             published_reads: AtomicUsize::new(0),
             published_scopes: Mutex::new(vec![]),
         }
@@ -1942,14 +232,10 @@ impl StrictPublishedRepo {
             global_admin_outcomes: Mutex::new(VecDeque::new()),
             global_admin_fallback: false,
             global_admin_reads: AtomicUsize::new(0),
-            legacy_reader_calls: AtomicUsize::new(0),
+            card_checks: AtomicUsize::new(0),
             published_reads: AtomicUsize::new(0),
             published_scopes: Mutex::new(vec![]),
         }
-    }
-
-    fn legacy_calls(&self) -> usize {
-        self.legacy_reader_calls.load(Ordering::SeqCst)
     }
 
     fn published_reads(&self) -> usize {
@@ -1967,8 +253,17 @@ impl StrictPublishedRepo {
 
 #[async_trait::async_trait]
 impl RuleRepository for StrictPublishedRepo {
-    fn requires_published_card_evidence(&self) -> bool {
-        true
+    async fn check_card_active(&self, _ctx: &PolicyContext) -> Result<bool, PolicyError> {
+        self.card_checks.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    }
+
+    async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
+        self.global_admin_reads.fetch_add(1, Ordering::SeqCst);
+        if let Some(outcome) = self.global_admin_outcomes.lock().unwrap().pop_front() {
+            return outcome;
+        }
+        Ok(self.global_admin_fallback)
     }
 
     async fn load_published_card_authorization(
@@ -1986,81 +281,46 @@ impl RuleRepository for StrictPublishedRepo {
         }
     }
 
-    async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
-        self.global_admin_reads.fetch_add(1, Ordering::SeqCst);
-        if let Some(outcome) = self.global_admin_outcomes.lock().unwrap().pop_front() {
-            return outcome;
-        }
-        Ok(self.global_admin_fallback)
-    }
-
-    // 一致性采样/realtime oracle 专用读取器：strict 路径绝不调用；
-    // 计数非零即说明 evaluate() 触碰了 legacy consistency/realtime 路径。
-    async fn get_projection_gate(
+    async fn load_org_authorization(
         &self,
-        _card_id: i64,
-    ) -> Result<Option<ProjectionGate>, PolicyError> {
-        self.legacy_reader_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(None)
-    }
-    async fn load_rule_set_entries_raw(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-        self.legacy_reader_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(vec![])
-    }
-    async fn load_permission_rules_raw(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        self.legacy_reader_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(vec![])
-    }
-    async fn load_delegated_rules(
-        &self,
-        _delegate_id: i64,
-        _resource: &str,
-        _action: &str,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        self.legacy_reader_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(vec![])
-    }
-
-    // strict 路径绝不触碰 L1/L2/L2.5 读取器；调用即被计数并在断言中失败。
-    async fn load_rule_set_snapshots(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-        self.legacy_reader_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(vec![])
-    }
-    async fn load_snapshot_winners(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<SnapshotWinner>, PolicyError> {
-        self.legacy_reader_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(vec![])
-    }
-    async fn load_permission_rules(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        self.legacy_reader_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(vec![])
-    }
-    async fn load_projected_delegated_rules(
-        &self,
-        _delegate_id: i64,
-        _resource: &str,
-        _action: &str,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        self.legacy_reader_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(vec![])
+        _ctx: &PolicyContext,
+    ) -> Result<OrgAuthorityRead, PolicyError> {
+        Ok(OrgAuthorityRead::Unmanaged)
     }
 }
 
 const STRICT_RULESET_BASE_GRANT_ID: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+#[tokio::test]
+async fn strict_missing_context_denies_before_published_authority_read() {
+    let cases = [
+        ("user", "AUTHN_REQUIRED", 0),
+        ("card", "CARD_REQUIRED", 0),
+        ("resource", "RESOURCE_REQUIRED", 1),
+        ("action", "ACTION_REQUIRED", 1),
+    ];
+    for (missing, reason, expected_card_checks) in cases {
+        let mut ctx = strict_ctx();
+        match missing {
+            "user" => ctx.user_id = None,
+            "card" => ctx.card_id = None,
+            "resource" => ctx.resource = None,
+            "action" => ctx.action.clear(),
+            _ => unreachable!(),
+        }
+        let repo = StrictPublishedRepo::with_outcomes(vec![]);
+        let decision = PolicyEngine::new().evaluate(&ctx, &repo).await;
+        assert!(!decision.allowed, "missing {missing} must deny");
+        assert_eq!(decision.reason, reason, "missing {missing}");
+        assert_eq!(repo.published_reads(), 0, "missing {missing}");
+        assert_eq!(repo.global_admin_reads(), 0, "missing {missing}");
+        assert_eq!(
+            repo.card_checks.load(Ordering::SeqCst),
+            expected_card_checks,
+            "missing {missing}"
+        );
+    }
+}
 
 #[test]
 fn published_not_ready_is_business_pending_but_query_is_failure() {
@@ -2118,21 +378,11 @@ async fn test_strict_published_evidence_allows_matching_grant() {
     assert!(timing.initial_evidence_load_ns > 0);
     assert!(timing.final_evidence_reload_ns > 0);
     assert_eq!(
-        timing.refs_load_ns,
-        timing.initial_evidence_load_ns + timing.final_evidence_reload_ns,
-        "legacy aggregate must equal the separately observed strict reads"
-    );
-    assert_eq!(
         repo.published_reads(),
         2,
         "ALLOW requires initial + final strict read"
     );
     // ALLOW 复读发生在返回前：initial + recheck 两次读取，无第三次。
-    assert_eq!(
-        repo.legacy_calls(),
-        0,
-        "strict path must not read L1/L2/L2.5"
-    );
     let allow_step = decision
         .evaluation_path
         .iter()
@@ -2145,64 +395,6 @@ async fn test_strict_published_evidence_allows_matching_grant() {
         PolicyEngine::allow_source_phase(&decision),
         Some("RULE_SET")
     );
-}
-
-#[tokio::test]
-async fn global_control_plane_requires_strict_evidence_before_legacy_reads() {
-    struct LegacyGlobalRepo {
-        global_admin_reads: AtomicUsize,
-        legacy_reads: AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl RuleRepository for LegacyGlobalRepo {
-        async fn load_rule_set_snapshots(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-            self.legacy_reads.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![RuleSetSnapshot {
-                rule_set_id: 1,
-                ref_type: "BASE".into(),
-                entries: vec![allow_entry("learn_subject", "read")],
-            }])
-        }
-
-        async fn load_permission_rules(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            self.legacy_reads.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![allow_rule("learn_subject", "read")])
-        }
-
-        async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
-            self.global_admin_reads.fetch_add(1, Ordering::SeqCst);
-            Ok(true)
-        }
-    }
-
-    let repo = LegacyGlobalRepo {
-        global_admin_reads: AtomicUsize::new(0),
-        legacy_reads: AtomicUsize::new(0),
-    };
-    let mut ctx = test_ctx();
-    ctx.resource_ownership_scope = ResourceOwnershipScope::Global;
-    ctx.global_access_requirement = GlobalAccessRequirement::ActiveGlobalAdmin;
-
-    let decision = PolicyEngine::new().evaluate(&ctx, &repo).await;
-
-    assert!(!decision.allowed);
-    assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
-    assert_eq!(
-        decision
-            .evaluation_path
-            .last()
-            .map(|step| step.detail.as_str()),
-        Some("global control-plane requests require strict published evidence")
-    );
-    assert_eq!(repo.global_admin_reads.load(Ordering::SeqCst), 0);
-    assert_eq!(repo.legacy_reads.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -2226,7 +418,6 @@ async fn global_control_plane_requires_active_admin_before_evidence() {
     assert_eq!(decision.reason, "GLOBAL_ADMIN_REQUIRED");
     assert_eq!(repo.global_admin_reads(), 1);
     assert_eq!(repo.published_reads(), 0);
-    assert_eq!(repo.legacy_calls(), 0);
     assert_eq!(
         decision
             .evaluation_path
@@ -2260,7 +451,6 @@ async fn global_utility_keeps_rule_evidence_without_global_admin_lookup() {
     assert_eq!(decision.reason, "PUBLISHED_EVIDENCE_ALLOW");
     assert_eq!(repo.global_admin_reads(), 0);
     assert_eq!(repo.published_reads(), 2);
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2290,7 +480,6 @@ async fn global_control_plane_rechecks_active_admin_before_allow() {
     assert_eq!(decision.reason, "GLOBAL_ADMIN_REQUIRED");
     assert_eq!(repo.global_admin_reads(), 2);
     assert_eq!(repo.published_reads(), 2);
-    assert_eq!(repo.legacy_calls(), 0);
     assert_eq!(
         decision
             .evaluation_path
@@ -2322,7 +511,6 @@ async fn global_control_plane_active_admin_still_requires_matching_evidence() {
     assert_eq!(decision.reason, "DEFAULT_DENY");
     assert_eq!(repo.global_admin_reads(), 1);
     assert_eq!(repo.published_reads(), 1);
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2358,7 +546,6 @@ async fn global_control_plane_unavailable_gate_opens_breaker_without_evidence_re
         crate::circuit_breaker::CB_THRESHOLD as usize
     );
     assert_eq!(repo.published_reads(), 0);
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2382,7 +569,6 @@ async fn global_target_without_resolver_contract_fails_before_evidence() {
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
     assert_eq!(repo.global_admin_reads(), 0);
     assert_eq!(repo.published_reads(), 0);
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2406,7 +592,6 @@ async fn strict_tenant_scoped_target_domain_denies_actor_domain_evidence() {
         1,
         "a target-domain mismatch must not begin an ALLOW recheck"
     );
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2430,24 +615,23 @@ async fn strict_tenant_scoped_target_domain_allows_matching_evidence() {
     assert_eq!(decision.reason, "PUBLISHED_EVIDENCE_ALLOW");
     assert_eq!(repo.published_reads(), 2);
     assert_eq!(
-            repo.published_scopes(),
-            vec![
-                PublishedCardEvidenceScope {
-                    tenant_id: 7,
-                    card_id: 1,
-                    user_filter: Some(1),
-                    domain: DomainScopeRequirement::ExactlySome(11),
-                },
-                PublishedCardEvidenceScope {
-                    tenant_id: 7,
-                    card_id: 1,
-                    user_filter: Some(1),
-                    domain: DomainScopeRequirement::ExactlySome(11),
-                },
-            ],
-            "both strict reads retain the actor-card provenance lens; target-domain enforcement belongs in the matcher"
-        );
-    assert_eq!(repo.legacy_calls(), 0);
+        repo.published_scopes(),
+        vec![
+            PublishedCardEvidenceScope {
+                tenant_id: 7,
+                card_id: 1,
+                user_filter: Some(1),
+                domain: DomainScopeRequirement::ExactlySome(11),
+            },
+            PublishedCardEvidenceScope {
+                tenant_id: 7,
+                card_id: 1,
+                user_filter: Some(1),
+                domain: DomainScopeRequirement::ExactlySome(11),
+            },
+        ],
+        "both strict reads retain the actor-card provenance lens; target-domain enforcement belongs in the matcher"
+    );
 }
 
 #[tokio::test]
@@ -2470,7 +654,6 @@ async fn strict_tenant_scoped_domainless_target_keeps_tenant_level_evidence() {
     );
     assert_eq!(decision.reason, "PUBLISHED_EVIDENCE_ALLOW");
     assert_eq!(repo.published_reads(), 2);
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2488,7 +671,6 @@ async fn test_strict_published_evidence_default_denies_without_match() {
     let decision = engine.evaluate(&strict_ctx(), &repo).await;
     assert!(!decision.allowed);
     assert_eq!(decision.reason, "DEFAULT_DENY");
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2499,7 +681,6 @@ async fn test_strict_missing_evidence_is_fail_closed_pending() {
     let decision = engine.evaluate(&strict_ctx(), &repo).await;
     assert!(!decision.allowed);
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2513,7 +694,6 @@ async fn test_strict_evidence_error_is_fail_closed_pending() {
     let decision = engine.evaluate(&strict_ctx(), &repo).await;
     assert!(!decision.allowed);
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2533,7 +713,6 @@ async fn test_strict_non_ready_gate_is_fail_closed_pending() {
     let decision = engine.evaluate(&strict_ctx(), &repo).await;
     assert!(!decision.allowed);
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2552,7 +731,6 @@ async fn test_strict_evidence_scope_mismatch_is_fail_closed_pending() {
     let decision = engine.evaluate(&strict_ctx(), &repo).await;
     assert!(!decision.allowed);
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2577,7 +755,6 @@ async fn test_strict_missing_tenant_scope_is_fail_closed_pending() {
     let decision = engine.evaluate(&ctx, &repo).await;
     assert!(!decision.allowed);
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2626,7 +803,6 @@ async fn test_strict_object_grant_never_authorizes_type_request() {
     let decision = engine.evaluate(&strict_ctx_type_level(), &repo).await;
     assert!(!decision.allowed);
     assert_eq!(decision.reason, "DEFAULT_DENY");
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2789,7 +965,6 @@ async fn test_strict_stale_allow_rejected_when_evidence_changes() {
     let decision = engine.evaluate(&strict_ctx(), &repo).await;
     assert!(!decision.allowed);
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 fn unsafe_allow_omitting_final_reload(
@@ -2827,7 +1002,6 @@ async fn e2_final_reload_omission_accepts_removed_candidate_while_full_contract_
     assert!(!decision.allowed);
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
     assert_eq!(repo.published_reads(), 2);
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 fn unsafe_recheck_by_resource_action_only(
@@ -2890,7 +1064,6 @@ async fn test_strict_successor_revision_cannot_replace_original_candidate() {
     assert!(!decision.allowed);
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
     assert_eq!(repo.published_reads(), 2);
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2913,7 +1086,6 @@ async fn test_strict_recheck_error_is_fail_closed() {
     let decision = engine.evaluate(&strict_ctx(), &repo).await;
     assert!(!decision.allowed);
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -2934,7 +1106,6 @@ async fn test_strict_final_reload_missing_evidence_is_fail_closed_without_breake
     assert!(!decision.allowed);
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
     assert_eq!(repo.published_reads(), 2);
-    assert_eq!(repo.legacy_calls(), 0);
     assert_eq!(engine.circuit_breaker_state(), CircuitBreakerState::Closed);
 }
 
@@ -2969,7 +1140,6 @@ async fn test_strict_final_reload_business_pending_repeats_keep_breaker_closed()
         repo.published_reads(),
         2 * (crate::circuit_breaker::CB_THRESHOLD as usize + 1)
     );
-    assert_eq!(repo.legacy_calls(), 0);
     assert_eq!(engine.circuit_breaker_state(), CircuitBreakerState::Closed);
 }
 
@@ -3011,7 +1181,6 @@ async fn test_strict_final_reload_hard_errors_open_breaker() {
         repo.published_reads(),
         2 * crate::circuit_breaker::CB_THRESHOLD as usize
     );
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -3040,7 +1209,6 @@ async fn test_strict_initial_load_hard_errors_open_breaker() {
 
     let decision = engine.evaluate(&strict_ctx(), &repo).await;
     assert_eq!(decision.reason, "CIRCUIT_BREAKER_OPEN");
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
 #[tokio::test]
@@ -3081,20 +1249,16 @@ async fn test_strict_success_resets_hard_error_streak_before_threshold() {
             "success must reset the failure streak"
         );
     }
-    assert_eq!(repo.legacy_calls(), 0);
 }
 
-// ===== strict gate 与 legacy 一致性采样隔离 =====
+// ===== strict gate evidence-read behavior =====
 
-/// 一致性采样窗口：`SnapshotConsistencyChecker` 按 1% 采样（间隔 100），
-/// 连续 1000 次 evaluate() 在未跳过采样的实现下期望触发约 10 次采样，
-/// 每次采样都会调用 projection gate / evaluate_realtime 的 raw 读取器并在
-/// StrictPublishedRepo 留下 legacy 计数。整个窗口内计数保持 0 才能证明
-/// strict 评估与 legacy consistency/realtime 路径完全隔离。
-const CONSISTENCY_SAMPLE_WINDOW: usize = 1000;
+/// Repeated evaluations verify that the current gate performs only the
+/// authoritative evidence reads required by the decision.
+const STRICT_EVALUATION_LOOP: usize = 1000;
 
 #[tokio::test]
-async fn test_strict_allow_loop_never_invokes_legacy_consistency_or_realtime() {
+async fn test_strict_allow_loop_uses_only_initial_and_final_evidence_reads() {
     let evidence = strict_ready_evidence(vec![strict_published_grant(
         STRICT_RULESET_BASE_GRANT_ID,
         astral_types::GrantSourceKind::RuleSet,
@@ -3106,7 +1270,7 @@ async fn test_strict_allow_loop_never_invokes_legacy_consistency_or_realtime() {
     let engine = PolicyEngine::new();
     let ctx = strict_ctx();
 
-    for _ in 0..CONSISTENCY_SAMPLE_WINDOW {
+    for _ in 0..STRICT_EVALUATION_LOOP {
         let decision = engine.evaluate(&ctx, &repo).await;
         assert!(
             decision.allowed,
@@ -3114,22 +1278,15 @@ async fn test_strict_allow_loop_never_invokes_legacy_consistency_or_realtime() {
             decision.reason
         );
         assert_eq!(decision.reason, "PUBLISHED_EVIDENCE_ALLOW");
-        assert_eq!(
-            repo.legacy_calls(),
-            0,
-            "strict evaluation must not invoke legacy consistency/realtime/raw readers"
-        );
     }
 
-    // 每次 strict ALLOW 恰好两次 published 读取（initial + ALLOW 前复读）；
-    // 一致性/realtime 路径不消费 published evidence，计数不得超出。
-    assert_eq!(repo.published_reads(), CONSISTENCY_SAMPLE_WINDOW * 2);
+    // Each strict ALLOW reads initial evidence and rereads it before returning.
+    assert_eq!(repo.published_reads(), STRICT_EVALUATION_LOOP * 2);
 }
 
 #[tokio::test]
-async fn test_strict_fail_closed_loop_never_invokes_legacy_consistency_or_realtime() {
-    // 证据不包含本次请求的 grant → DEFAULT_DENY（fail-closed，无复读）。
-    // fail-closed 决策同样不得触碰 legacy consistency/realtime/raw 读取器。
+async fn test_strict_fail_closed_loop_uses_initial_evidence_read_only() {
+    // Evidence without a matching grant returns DEFAULT_DENY after the initial read.
     let evidence = strict_ready_evidence(vec![strict_published_grant(
         "550e8400-e29b-41d4-a716-446655440002",
         astral_types::GrantSourceKind::RuleSet,
@@ -3140,7 +1297,7 @@ async fn test_strict_fail_closed_loop_never_invokes_legacy_consistency_or_realti
     let repo = StrictPublishedRepo::with_evidence(evidence);
     let engine = PolicyEngine::new();
 
-    for _ in 0..CONSISTENCY_SAMPLE_WINDOW {
+    for _ in 0..STRICT_EVALUATION_LOOP {
         let decision = engine.evaluate(&strict_ctx(), &repo).await;
         assert!(
             !decision.allowed,
@@ -3148,15 +1305,10 @@ async fn test_strict_fail_closed_loop_never_invokes_legacy_consistency_or_realti
             decision.reason
         );
         assert_eq!(decision.reason, "DEFAULT_DENY");
-        assert_eq!(
-            repo.legacy_calls(),
-            0,
-            "strict fail-closed path must not invoke legacy consistency/realtime/raw readers"
-        );
     }
 
-    // 无命中 → 仅 initial 读取，无复读，也无一额外读取。
-    assert_eq!(repo.published_reads(), CONSISTENCY_SAMPLE_WINDOW);
+    // No match reads initial evidence only; there is no ALLOW-time reread.
+    assert_eq!(repo.published_reads(), STRICT_EVALUATION_LOOP);
 }
 
 #[test]
@@ -3260,9 +1412,8 @@ fn published_recheck_rejects_same_generation_hash_drift_and_invalid_stamp() {
 
 #[test]
 fn test_allow_source_phase_org_allow_reports_org_authority() {
-    // ORG_SCOPE 准入的 ALLOW 步（org_admission 产生的 ORG_AUTHORITY 步，
-    // source=ORG_PERSONAL/ORG_SHARED）必须精确上报为 ORG_AUTHORITY，
-    // 不得落入 PERMISSION_RULE 兜底。
+    // ORG_SCOPE ALLOW steps carry ORG_PERSONAL/ORG_SHARED and map to the
+    // dedicated ORG_AUTHORITY hit category.
     for org_source in ["ORG_PERSONAL", "ORG_SHARED"] {
         let decision = allow(
             "ORG_PUBLISHED_EVIDENCE_ALLOW",
@@ -3284,13 +1435,13 @@ fn test_allow_source_phase_org_allow_reports_org_authority() {
         );
     }
 
-    // 命中来源取“最近一个 ALLOW”步：更早的 PERMISSION_RULE ALLOW 不遮蔽
-    // 其后的 ORG_AUTHORITY ALLOW。
+    // Hit attribution follows the latest ALLOW: an earlier phase cannot mask
+    // the subsequent ORG_AUTHORITY ALLOW.
     let decision = allow(
         "ORG_PUBLISHED_EVIDENCE_ALLOW",
         "org-grant-1",
         vec![
-            step("PERMISSION_RULE", "ALLOW", "earlier allow", None),
+            step("PUBLISHED_EVIDENCE", "ALLOW", "earlier allow", None),
             step("ORG_AUTHORITY", "DENY", "recheck pending", None),
             step(
                 "ORG_AUTHORITY",
@@ -3306,39 +1457,14 @@ fn test_allow_source_phase_org_allow_reports_org_authority() {
     );
 }
 
-#[cfg(feature = "legacy-tests")]
 #[test]
-fn test_allow_source_phase_legacy_mappings_unchanged() {
-    // ORG 之外的 phase → source 映射（含 PERMISSION_RULE 兜底）保持不变。
-    let phase_cases: &[(&str, &str)] = &[
-        ("RULESET", "RULE_SET"),
-        ("RULE_SET", "RULE_SET"),
-        ("SNAPSHOT", "RULE_SET"),
-        ("PERMISSION_RULE", "PERMISSION_RULE"),
-        ("DELEGATION", "DELEGATION"),
-        ("TEMPLATE", "TEMPLATE"),
-        ("SOME_FUTURE_PHASE", "PERMISSION_RULE"),
-    ];
-    for (phase, expected) in phase_cases {
-        let decision = allow("ALLOW", "rule-1", vec![step(phase, "ALLOW", "hit", None)]);
-        assert_eq!(
-            PolicyEngine::allow_source_phase(&decision),
-            Some(*expected),
-            "phase {phase} mapping must stay intact"
-        );
-    }
-
-    // PUBLISHED_EVIDENCE 分支按 grant source 归因，未知 source 兜底
-    // PERMISSION_RULE；ORG_PERSONAL/ORG_SHARED 只属于 ORG_AUTHORITY 步，
-    // 不影响本分支。
+fn allow_source_phase_reports_only_current_v6_sources() {
     let published_cases: &[(&str, &str)] = &[
         ("RULE_SET_BASE", "RULE_SET"),
         ("RULE_SET_OVERLAY", "RULE_SET"),
-        ("RULE_SET", "RULE_SET"),
         ("DIRECT", "DIRECT"),
         ("APPROVAL", "APPROVAL"),
         ("DELEGATION", "DELEGATION"),
-        ("SYSTEM", "PERMISSION_RULE"),
     ];
     for (source, expected) in published_cases {
         let decision = allow(
@@ -3354,11 +1480,44 @@ fn test_allow_source_phase_legacy_mappings_unchanged() {
         assert_eq!(
             PolicyEngine::allow_source_phase(&decision),
             Some(*expected),
-            "published source {source} mapping must stay intact"
+            "CURRENT V6 source {source} mapping"
         );
     }
 
-    // DENY 决策无命中来源（含 ORG_AUTHORITY DENY 步）。
+    let org_allow = allow(
+        "ORG_PUBLISHED_EVIDENCE_ALLOW",
+        "org-grant-1",
+        vec![step(
+            "ORG_AUTHORITY",
+            "ALLOW",
+            "org_scope contribution matched",
+            Some("ORG_SHARED".to_owned()),
+        )],
+    );
+    assert_eq!(
+        PolicyEngine::allow_source_phase(&org_allow),
+        Some("ORG_AUTHORITY")
+    );
+
+    // Retired phases and reserved SYSTEM provenance have no current hit source.
+    let retired = allow(
+        "ALLOW",
+        "retired-rule",
+        vec![step("SNAPSHOT", "ALLOW", "hit", None)],
+    );
+    assert_eq!(PolicyEngine::allow_source_phase(&retired), None);
+    let reserved_system = allow(
+        "PUBLISHED_EVIDENCE_ALLOW",
+        "grant-1",
+        vec![step(
+            "PUBLISHED_EVIDENCE",
+            "ALLOW",
+            "hit",
+            Some("SYSTEM".to_owned()),
+        )],
+    );
+    assert_eq!(PolicyEngine::allow_source_phase(&reserved_system), None);
+
     let denied = deny(
         "DEFAULT_DENY",
         "denied",
@@ -3372,24 +1531,11 @@ fn test_allow_source_phase_legacy_mappings_unchanged() {
     assert_eq!(PolicyEngine::allow_source_phase(&denied), None);
 }
 
-// ===== ORG_SCOPE 准入门禁（load_org_authorization 五态切换回归） =====
+// ===== ORG_SCOPE admission gate regression coverage =====
 //
-// 覆盖 `PolicyEngine.evaluate()` 在 AUTHN/CARD_CONTEXT/resource/action 校验
-// 之后对 `RuleRepository::load_org_authorization` 五态的调度：
-// - Disabled → ORG_AUTHORITY_DISABLED（先于 legacy L1/L2 与 strict published
-//   evidence 两条证据路径，绝不放行）；
-// - Pending → AUTHORIZATION_PENDING（已确认业务态，fail-closed，无 legacy 回落）；
-// - Unavailable → AUTHORIZATION_PENDING（依赖不可用，fail-closed 且累计断路器失败）；
-// - Unmanaged → 保持既有 legacy 评估路由行为（既有兼容 ALLOW 夹具）；
-// - Ready → 经公共入口走 org_admission 正式准入（初始读取 + ALLOW 前复读）。
-// 全部为进程内 stub 仓库，不触碰数据库/网络/运行时配置。
-use crate::org_admission::OrgAuthorityRead;
-use astral_types::org_scope::{
-    org_build_segment, org_manifest_digest_hex, OrgAdmissionEvidence, OrgContribution, OrgGrant,
-    OrgGrantRef, OrgManifestDigestMaterial, OrgMembership, OrgNode, OrgProvenance, OrgPublication,
-    OrgRootActivation, OrgScope, OrgScopeKey, OrgSegmentContent,
-};
-use astral_types::ValidityWindow;
+// Cover public evaluate() scheduling for authoritative ORG reads:
+// managed states fail closed before card evidence, Unmanaged uses strict CURRENT V6
+// evidence, and Ready requires the ORG proof's final reread.
 
 /// 行政单元（签名 actor）租户与身份四元组（org_admission 夹具同源）。
 const ORG_GATE_TENANT: i64 = 100;
@@ -3399,35 +1545,22 @@ const ORG_GATE_CARD_ID: i64 = 222;
 /// 统一读取时钟：落在 grant validity (1000..2000) 与 membership 窗口内。
 const ORG_GATE_READ_CLOCK: i64 = 1_500;
 
-/// ORG_SCOPE 门禁测试仓库：`load_org_authorization` 恒返回预置三态；
-/// strict published-evidence 读取器与 legacy L1/L2 读取器全部计数，用于证明
-/// Disabled/Pending 在两条证据路径之前短路、Ready 短路整个旧链、Unmanaged
-/// 继续消费既有 legacy 评估路由。
+/// ORG_SCOPE test repository with a potentially authorizing CURRENT V6 card
+/// evidence fixture. Tests assert that managed ORG outcomes take precedence.
 struct OrgGateSwitchRepo {
     org_read: OrgAuthorityRead,
-    strict_published_evidence: bool,
-    /// published evidence 读取器被（错误）触达时的返回：true = 与请求身份
-    /// 逐项匹配的 would-allow Ready 夹具（门禁一旦失效即放行，测试立即
-    /// 失败），false = 显式 unavailable（Ok(None)）。
-    published_would_allow: bool,
-    snapshot_winners: Vec<SnapshotWinner>,
-    permission_rules: Vec<PermissionRule>,
+    published_evidence: std::sync::Arc<PublishedCardAuthorization>,
     org_reads: AtomicUsize,
     published_reads: AtomicUsize,
-    legacy_reader_calls: AtomicUsize,
 }
 
 impl OrgGateSwitchRepo {
-    fn new(org_read: OrgAuthorityRead, strict_published_evidence: bool) -> Self {
+    fn new(org_read: OrgAuthorityRead) -> Self {
         Self {
             org_read,
-            strict_published_evidence,
-            published_would_allow: strict_published_evidence,
-            snapshot_winners: vec![org_gate_legacy_allow_winner()],
-            permission_rules: vec![allow_rule("learn_subject:42", "read")],
+            published_evidence: std::sync::Arc::new(org_gate_strict_allow_evidence()),
             org_reads: AtomicUsize::new(0),
             published_reads: AtomicUsize::new(0),
-            legacy_reader_calls: AtomicUsize::new(0),
         }
     }
 
@@ -3438,16 +1571,16 @@ impl OrgGateSwitchRepo {
     fn published_reads(&self) -> usize {
         self.published_reads.load(Ordering::SeqCst)
     }
-
-    fn legacy_reader_calls(&self) -> usize {
-        self.legacy_reader_calls.load(Ordering::SeqCst)
-    }
 }
 
 #[async_trait::async_trait]
 impl RuleRepository for OrgGateSwitchRepo {
-    fn requires_published_card_evidence(&self) -> bool {
-        self.strict_published_evidence
+    async fn check_card_active(&self, _ctx: &PolicyContext) -> Result<bool, PolicyError> {
+        Ok(true)
+    }
+
+    async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
+        Ok(false)
     }
 
     async fn load_published_card_authorization(
@@ -3455,11 +1588,7 @@ impl RuleRepository for OrgGateSwitchRepo {
         _scope: &PublishedCardEvidenceScope,
     ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
         self.published_reads.fetch_add(1, Ordering::SeqCst);
-        if self.published_would_allow {
-            Ok(Some(std::sync::Arc::new(org_gate_strict_allow_evidence())))
-        } else {
-            Ok(None)
-        }
+        Ok(Some(std::sync::Arc::clone(&self.published_evidence)))
     }
 
     async fn load_org_authorization(
@@ -3468,43 +1597,6 @@ impl RuleRepository for OrgGateSwitchRepo {
     ) -> Result<OrgAuthorityRead, PolicyError> {
         self.org_reads.fetch_add(1, Ordering::SeqCst);
         Ok(self.org_read.clone())
-    }
-
-    // 以下均为 legacy 一致性/评估读取器：Disabled/Pending/Ready 分支必须
-    // 保持零调用，否则对应断言失败。
-    async fn get_projection_gate(
-        &self,
-        _card_id: i64,
-    ) -> Result<Option<ProjectionGate>, PolicyError> {
-        self.legacy_reader_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(None)
-    }
-
-    async fn load_snapshot_winners(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<SnapshotWinner>, PolicyError> {
-        self.legacy_reader_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.snapshot_winners.clone())
-    }
-
-    async fn load_permission_rules(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        self.legacy_reader_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.permission_rules.clone())
-    }
-}
-
-/// 与既有 GateRepo 一致的 BASE 类型级 ALLOW 胜者（learn_subject:* / read）。
-fn org_gate_legacy_allow_winner() -> SnapshotWinner {
-    SnapshotWinner {
-        ref_type: "BASE".into(),
-        rule_set_id: 1,
-        resource_key: "learn_subject:*".into(),
-        action_code: "read".into(),
-        final_effect: "ALLOW".into(),
     }
 }
 
@@ -3591,7 +1683,7 @@ fn org_gate_admission_evidence() -> OrgAdmissionEvidence {
         revoke_fence: 1,
         dependencies: Vec::new(),
         manifest_digest_hex: String::new(),
-        compiler_version: "org-compiler-v1".to_owned(),
+        compiler_version: astral_types::AUTHORIZATION_ORG_COMPILER_VERSION.to_owned(),
         segments: vec![segment],
         operation_id: "op-publish-1".to_owned(),
     };
@@ -3650,12 +1742,11 @@ fn org_gate_last_step(decision: &PolicyDecision) -> &EvaluationStep {
 }
 
 #[tokio::test]
-async fn test_org_gate_disabled_denies_before_legacy_and_strict_evidence() {
-    // Disabled：仓库同时声明 strict published-evidence 能力（且预置
-    // would-allow 证据）与 legacy L2 ALLOW 规则——若门禁失效，任一路径都会
-    // 放行。断言 ORG_AUTHORITY_DISABLED 先于两者短路。
+async fn test_org_gate_disabled_denies_before_card_evidence() {
+    // A managed tenant whose ORG gate is disabled must deny before consulting
+    // otherwise authorizing CURRENT V6 card evidence.
     let engine = PolicyEngine::new();
-    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Disabled, true);
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Disabled);
     let decision = engine.evaluate(&strict_ctx(), &repo).await;
     assert!(!decision.allowed, "Disabled 必须拒绝: {decision:?}");
     assert_eq!(decision.reason, "ORG_AUTHORITY_DISABLED");
@@ -3668,7 +1759,7 @@ async fn test_org_gate_disabled_denies_before_legacy_and_strict_evidence() {
     assert_eq!(last.source, None);
     assert_eq!(
         last.detail,
-        "managed authority cannot fall back to legacy evidence"
+        "managed authority cannot fall back to card evidence"
     );
     let phases: Vec<&str> = decision
         .evaluation_path
@@ -3678,7 +1769,7 @@ async fn test_org_gate_disabled_denies_before_legacy_and_strict_evidence() {
     assert_eq!(
         phases,
         vec!["AUTHN", "CARD_CONTEXT", "ORG_AUTHORITY"],
-        "Disabled 必须先于 legacy/strict 证据路径短路"
+        "Disabled must short-circuit before card evidence"
     );
     assert_eq!(repo.org_reads(), 1);
     assert_eq!(
@@ -3686,24 +1777,16 @@ async fn test_org_gate_disabled_denies_before_legacy_and_strict_evidence() {
         0,
         "Disabled 不得触碰 strict published evidence 读取器"
     );
-    assert_eq!(
-        repo.legacy_reader_calls(),
-        0,
-        "Disabled 不得回落 legacy L1/L2 读取器"
-    );
 }
 
 #[tokio::test]
-async fn test_org_gate_pending_fail_closed_without_legacy_fallback() {
-    // Pending：稳定 code 原样透传为 ORG_AUTHORITY 步 detail；fail-closed
-    // AUTHORIZATION_PENDING，绝不回落 legacy（would-allow 夹具确保回归即失败）。
+async fn test_org_gate_pending_fails_closed_without_card_fallback() {
+    // Pending preserves the stable ORG detail and rejects despite a matching
+    // CURRENT V6 card grant, proving that managed tenants cannot fall back.
     let engine = PolicyEngine::new();
-    let repo = OrgGateSwitchRepo::new(
-        OrgAuthorityRead::Pending {
-            code: "org_gate.membership_pending".to_owned(),
-        },
-        true,
-    );
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Pending {
+        code: "org_gate.membership_pending".to_owned(),
+    });
     let decision = engine.evaluate(&strict_ctx(), &repo).await;
     assert!(!decision.allowed, "Pending 必须 fail-closed: {decision:?}");
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
@@ -3722,40 +1805,16 @@ async fn test_org_gate_pending_fail_closed_without_legacy_fallback() {
     assert_eq!(
         phases,
         vec!["AUTHN", "CARD_CONTEXT", "ORG_AUTHORITY"],
-        "Pending 必须先于 legacy/strict 证据路径短路"
+        "Pending must short-circuit before card evidence"
     );
     assert_eq!(repo.org_reads(), 1);
-    assert_eq!(repo.published_reads(), 0);
-    assert_eq!(repo.legacy_reader_calls(), 0);
-}
-
-#[cfg(feature = "legacy-tests")]
-#[tokio::test]
-async fn test_org_gate_unmanaged_retains_legacy_route() {
-    // Unmanaged：保持既有 legacy 路由行为——既有兼容 ALLOW 夹具
-    // （legacy-compatible 无 head + BASE 类型级快照胜者）照常放行，
-    // 不因门禁接入而改变既有严格证据假设。
-    let engine = PolicyEngine::new();
-    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged, false);
-    let decision = engine.evaluate(&test_ctx(), &repo).await;
-    assert!(
-        decision.allowed,
-        "Unmanaged 必须保留 legacy 路由: {:?}",
-        decision.reason
-    );
-    assert_eq!(decision.reason, "RULE_SET_ALLOW");
-    assert_eq!(repo.org_reads(), 1);
-    assert!(
-        repo.legacy_reader_calls() >= 1,
-        "Unmanaged 必须继续走 legacy 评估链"
-    );
     assert_eq!(repo.published_reads(), 0);
 }
 
 #[tokio::test]
 async fn test_resource_ownership_unresolved_short_circuits_before_org_or_evidence() {
     let engine = PolicyEngine::new();
-    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged, true);
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged);
     let mut ctx = strict_ctx();
     ctx.resource_ownership_scope = ResourceOwnershipScope::Unresolved;
 
@@ -3768,13 +1827,12 @@ async fn test_resource_ownership_unresolved_short_circuits_before_org_or_evidenc
     assert_eq!(last.detail, "target resource ownership was not resolved");
     assert_eq!(repo.org_reads(), 0);
     assert_eq!(repo.published_reads(), 0);
-    assert_eq!(repo.legacy_reader_calls(), 0);
 }
 
 #[tokio::test]
 async fn test_resource_ownership_invalid_tenant_scope_short_circuits_before_org_or_evidence() {
     let engine = PolicyEngine::new();
-    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged, true);
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged);
     let mut ctx = strict_ctx();
     ctx.resource_ownership_scope = ResourceOwnershipScope::TenantScoped;
     ctx.resource_tenant_id = None;
@@ -3791,14 +1849,13 @@ async fn test_resource_ownership_invalid_tenant_scope_short_circuits_before_org_
     );
     assert_eq!(repo.org_reads(), 0);
     assert_eq!(repo.published_reads(), 0);
-    assert_eq!(repo.legacy_reader_calls(), 0);
 }
 
 #[tokio::test]
 async fn test_resource_ownership_non_positive_tenant_scoped_domain_or_owner_short_circuits() {
     for (resource_domain_id, resource_owner_id) in [(Some(0), None), (None, Some(-1))] {
         let engine = PolicyEngine::new();
-        let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged, true);
+        let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged);
         let mut ctx = strict_ctx();
         ctx.resource_ownership_scope = ResourceOwnershipScope::TenantScoped;
         ctx.resource_tenant_id = Some(7);
@@ -3815,14 +1872,13 @@ async fn test_resource_ownership_non_positive_tenant_scoped_domain_or_owner_shor
         );
         assert_eq!(repo.org_reads(), 0);
         assert_eq!(repo.published_reads(), 0);
-        assert_eq!(repo.legacy_reader_calls(), 0);
     }
 }
 
 #[tokio::test]
 async fn test_resource_ownership_invalid_global_scope_short_circuits_before_evidence() {
     let engine = PolicyEngine::new();
-    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged, true);
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged);
     let mut ctx = strict_ctx();
     ctx.resource_ownership_scope = ResourceOwnershipScope::Global;
     ctx.resource_owner_id = Some(99);
@@ -3836,13 +1892,12 @@ async fn test_resource_ownership_invalid_global_scope_short_circuits_before_evid
     assert_eq!(last.detail, "global target carried tenant or owner facts");
     assert_eq!(repo.org_reads(), 0);
     assert_eq!(repo.published_reads(), 0);
-    assert_eq!(repo.legacy_reader_calls(), 0);
 }
 
 #[tokio::test]
 async fn test_global_target_skips_org_admission_but_keeps_strict_evidence() {
     let engine = PolicyEngine::new();
-    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Disabled, true);
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Disabled);
     let mut ctx = strict_ctx();
     ctx.resource_ownership_scope = ResourceOwnershipScope::Global;
     ctx.global_access_requirement = GlobalAccessRequirement::PolicyEvidence;
@@ -3856,13 +1911,12 @@ async fn test_global_target_skips_org_admission_but_keeps_strict_evidence() {
     assert_eq!(decision.reason, "PUBLISHED_EVIDENCE_ALLOW");
     assert_eq!(repo.org_reads(), 0, "global target must skip ORG admission");
     assert_eq!(repo.published_reads(), 2);
-    assert_eq!(repo.legacy_reader_calls(), 0);
 }
 
 #[tokio::test]
 async fn test_resource_ownership_unavailable_accrues_breaker_failures() {
     let engine = PolicyEngine::new();
-    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged, true);
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged);
     let mut ctx = strict_ctx();
     ctx.resource_ownership_scope = ResourceOwnershipScope::Unavailable;
 
@@ -3878,13 +1932,12 @@ async fn test_resource_ownership_unavailable_accrues_breaker_failures() {
     assert_eq!(engine.circuit_breaker_state(), CircuitBreakerState::Open);
     assert_eq!(repo.org_reads(), 0);
     assert_eq!(repo.published_reads(), 0);
-    assert_eq!(repo.legacy_reader_calls(), 0);
 }
 
 #[tokio::test]
 async fn test_org_gate_unmanaged_foreign_tenant_without_actor_tenant_short_circuits() {
     let engine = PolicyEngine::new();
-    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged, true);
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged);
     let mut ctx = strict_ctx();
     ctx.tenant_id = None;
     ctx.resource_ownership_scope = ResourceOwnershipScope::TenantScoped;
@@ -3900,13 +1953,12 @@ async fn test_org_gate_unmanaged_foreign_tenant_without_actor_tenant_short_circu
     );
     assert_eq!(repo.org_reads(), 1);
     assert_eq!(repo.published_reads(), 0);
-    assert_eq!(repo.legacy_reader_calls(), 0);
 }
 
 #[tokio::test]
 async fn test_org_gate_unmanaged_foreign_tenant_target_short_circuits_strict_evidence() {
     let engine = PolicyEngine::new();
-    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged, true);
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged);
     let mut ctx = strict_ctx();
     ctx.resource_ownership_scope = ResourceOwnershipScope::TenantScoped;
     ctx.resource_tenant_id = Some(900);
@@ -3924,31 +1976,12 @@ async fn test_org_gate_unmanaged_foreign_tenant_target_short_circuits_strict_evi
     );
     assert_eq!(repo.org_reads(), 1);
     assert_eq!(repo.published_reads(), 0);
-    assert_eq!(repo.legacy_reader_calls(), 0);
-}
-
-#[tokio::test]
-async fn test_org_gate_unmanaged_foreign_tenant_target_short_circuits_legacy_evidence() {
-    let engine = PolicyEngine::new();
-    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged, false);
-    let mut ctx = strict_ctx();
-    ctx.resource_ownership_scope = ResourceOwnershipScope::TenantScoped;
-    ctx.resource_tenant_id = Some(900);
-
-    let decision = engine.evaluate(&ctx, &repo).await;
-
-    assert!(!decision.allowed);
-    assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
-    assert_eq!(org_gate_last_step(&decision).phase, "RESOURCE_OWNERSHIP");
-    assert_eq!(repo.org_reads(), 1);
-    assert_eq!(repo.published_reads(), 0);
-    assert_eq!(repo.legacy_reader_calls(), 0);
 }
 
 #[tokio::test]
 async fn test_org_gate_unmanaged_same_tenant_target_keeps_strict_evidence_path() {
     let engine = PolicyEngine::new();
-    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged, true);
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unmanaged);
     let mut ctx = strict_ctx();
     ctx.resource_ownership_scope = ResourceOwnershipScope::TenantScoped;
     ctx.resource_tenant_id = ctx.tenant_id;
@@ -3962,26 +1995,21 @@ async fn test_org_gate_unmanaged_same_tenant_target_keeps_strict_evidence_path()
     assert_eq!(decision.reason, "PUBLISHED_EVIDENCE_ALLOW");
     assert_eq!(repo.org_reads(), 1);
     assert_eq!(repo.published_reads(), 2);
-    assert_eq!(repo.legacy_reader_calls(), 0);
 }
 
-#[cfg(feature = "legacy-tests")]
 #[tokio::test]
 async fn test_org_gate_ready_evidence_allows_via_public_entry() {
-    // Ready：公共入口端到端走 org_admission 正式准入——初始读取 +
-    // ALLOW 前复读共 2 次 org 读取；legacy L1/L2 与 strict published
-    // evidence 都绝不被触碰（Ready 短路整个旧链，不被 legacy 夹具遮蔽）。
+    // Ready ORG evidence takes precedence over an independently authorizing V6
+    // card-evidence fixture, and is reread before ALLOW.
     let engine = PolicyEngine::new();
     let grant_id = "00000000-0000-0000-0000-000000000001";
-    let repo = OrgGateSwitchRepo::new(
-        OrgAuthorityRead::Ready(Box::new(org_gate_admission_evidence())),
-        false,
-    );
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Ready(Box::new(
+        org_gate_admission_evidence(),
+    )));
     let decision = engine.evaluate(&org_gate_ctx(), &repo).await;
     assert!(
         decision.allowed,
-        "Ready ORG 证据应经公共入口放行: {:?}",
-        decision.reason
+        "Ready ORG evidence should allow: {decision:?}"
     );
     assert_eq!(decision.reason, "ORG_PUBLISHED_EVIDENCE_ALLOW");
     assert_eq!(decision.matched_rule.as_deref(), Some(grant_id));
@@ -3996,8 +2024,11 @@ async fn test_org_gate_ready_evidence_allows_via_public_entry() {
         .map(|s| s.phase.as_str())
         .collect();
     assert_eq!(phases, vec!["AUTHN", "CARD_CONTEXT", "ORG_AUTHORITY"]);
-    assert_eq!(repo.org_reads(), 2, "Ready 需要初始读取 + ALLOW 前复读");
-    assert_eq!(repo.legacy_reader_calls(), 0);
+    assert_eq!(
+        repo.org_reads(),
+        2,
+        "Ready requires initial + final ORG reads"
+    );
     assert_eq!(repo.published_reads(), 0);
 }
 
@@ -4023,11 +2054,19 @@ impl OrgGateErrRepo {
 
 #[async_trait::async_trait]
 impl RuleRepository for OrgGateErrRepo {
-    async fn load_permission_rules(
+    async fn check_card_active(&self, _ctx: &PolicyContext) -> Result<bool, PolicyError> {
+        Ok(true)
+    }
+
+    async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
+        Ok(false)
+    }
+
+    async fn load_published_card_authorization(
         &self,
-        _card_id: i64,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        Ok(vec![])
+        _scope: &PublishedCardEvidenceScope,
+    ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
+        Ok(None)
     }
 
     async fn load_org_authorization(
@@ -4067,11 +2106,24 @@ impl OrgGateReadyProbeRepo {
 
 #[async_trait::async_trait]
 impl RuleRepository for OrgGateReadyProbeRepo {
-    async fn load_permission_rules(
+    async fn check_card_active(&self, _ctx: &PolicyContext) -> Result<bool, PolicyError> {
+        let check_index = self.card_checks.fetch_add(1, Ordering::SeqCst);
+        if self.card_active_err && check_index > 0 {
+            Err(PolicyError::Repository("card_context_read_failed".into()))
+        } else {
+            Ok(true)
+        }
+    }
+
+    async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
+        Ok(false)
+    }
+
+    async fn load_published_card_authorization(
         &self,
-        _card_id: i64,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        Ok(vec![])
+        _scope: &PublishedCardEvidenceScope,
+    ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
+        Ok(None)
     }
 
     async fn load_org_authorization(
@@ -4087,17 +2139,6 @@ impl RuleRepository for OrgGateReadyProbeRepo {
                 Some(read) => Ok(read.clone()),
                 None => Err(PolicyError::Repository("org_reread_failed".into())),
             }
-        }
-    }
-
-    async fn check_card_active(&self, _ctx: &PolicyContext) -> Result<bool, PolicyError> {
-        // 首次校验是门禁前的 CARD_CONTEXT，必须成功；仅 admission 内的
-        // 终局校验按预设失败，保证评估命中 Ready 分支内部失败点。
-        let check_index = self.card_checks.fetch_add(1, Ordering::SeqCst);
-        if self.card_active_err && check_index > 0 {
-            Err(PolicyError::Repository("card_context_read_failed".into()))
-        } else {
-            Ok(true)
         }
     }
 }
@@ -4118,7 +2159,7 @@ async fn seed_breaker_failures_below_threshold(engine: &PolicyEngine) {
 
 #[tokio::test]
 async fn test_org_gate_read_error_accrues_breaker_failures_and_opens() {
-    // Err：org 权威读取不可用必须累计断路器失败并打开断路器（修复核心）。
+    // Err：org 权威读取不可用必须累计断路器失败并打开断路器。
     let engine = PolicyEngine::new();
     let repo = OrgGateErrRepo::new();
     let ctx = strict_ctx();
@@ -4142,26 +2183,28 @@ async fn test_org_gate_read_error_accrues_breaker_failures_and_opens() {
         crate::circuit_breaker::CB_THRESHOLD as usize,
     );
 
-    // 每次失败评估都恰好记账一次（layer=ORG_AUTHORITY → 保守 l3 桶）。
+    // Every completed evaluation is counted once, and all outcomes denied.
     let stats = engine.get_stats();
-    assert_eq!(stats.l3_hits, crate::circuit_breaker::CB_THRESHOLD as u64);
-    assert_eq!(stats.l1_hits, 0);
-    assert_eq!(stats.l2_hits, 0);
+    assert_eq!(
+        stats.evaluation_count,
+        crate::circuit_breaker::CB_THRESHOLD as u64
+    );
+    assert_eq!(stats.allow_count, 0);
+    assert_eq!(
+        stats.deny_count,
+        crate::circuit_breaker::CB_THRESHOLD as u64
+    );
     assert!(stats.timing_ns.total_ns > 0);
 }
 
 #[tokio::test]
 async fn test_org_gate_unavailable_accrues_breaker_failures_and_opens() {
-    // Unavailable is an explicit fail-closed infrastructure outcome, distinct
-    // from a completed business Pending read. It must therefore affect the
-    // breaker exactly like an Err rather than being laundered into success.
+    // Unavailable is an explicit infrastructure failure, distinct from
+    // completed business Pending, and contributes to the breaker.
     let engine = PolicyEngine::new();
-    let repo = OrgGateSwitchRepo::new(
-        OrgAuthorityRead::Unavailable {
-            code: "org_scope.pending.reader_unavailable".into(),
-        },
-        true,
-    );
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Unavailable {
+        code: "org_scope.pending.reader_unavailable".into(),
+    });
     let ctx = strict_ctx();
 
     for _ in 0..crate::circuit_breaker::CB_THRESHOLD {
@@ -4183,12 +2226,17 @@ async fn test_org_gate_unavailable_accrues_breaker_failures_and_opens() {
         "the open breaker must short-circuit before another ORG read"
     );
     assert_eq!(repo.published_reads(), 0);
-    assert_eq!(repo.legacy_reader_calls(), 0);
 
     let stats = engine.get_stats();
-    assert_eq!(stats.l3_hits, crate::circuit_breaker::CB_THRESHOLD as u64);
-    assert_eq!(stats.l1_hits, 0);
-    assert_eq!(stats.l2_hits, 0);
+    assert_eq!(
+        stats.evaluation_count,
+        crate::circuit_breaker::CB_THRESHOLD as u64
+    );
+    assert_eq!(stats.allow_count, 0);
+    assert_eq!(
+        stats.deny_count,
+        crate::circuit_breaker::CB_THRESHOLD as u64
+    );
 }
 
 #[tokio::test]
@@ -4198,7 +2246,7 @@ async fn test_org_gate_disabled_records_success_not_failure() {
     // 失败；若被测评估未记成功，最后一次失败会到阈值并打开断路器。
     let engine = PolicyEngine::new();
     seed_breaker_failures_below_threshold(&engine).await;
-    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Disabled, true);
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Disabled);
     let decision = engine.evaluate(&strict_ctx(), &repo).await;
     assert_eq!(decision.reason, "ORG_AUTHORITY_DISABLED");
     let tail = OrgGateErrRepo::new();
@@ -4208,14 +2256,17 @@ async fn test_org_gate_disabled_records_success_not_failure() {
         CircuitBreakerState::Closed,
         "Disabled 必须记成功（清零失败计数），不得记依赖失败"
     );
-    // 记账恰好一次：阈值-1（Err 预热）+ 1（Disabled）+ 1（Err 收尾）。
+    // Threshold-1 failed reads, Disabled, and one final failed read are counted.
     let stats = engine.get_stats();
     assert_eq!(
-        stats.l3_hits,
+        stats.evaluation_count,
         crate::circuit_breaker::CB_THRESHOLD as u64 + 1
     );
-    assert_eq!(stats.l1_hits, 0);
-    assert_eq!(stats.l2_hits, 0);
+    assert_eq!(stats.allow_count, 0);
+    assert_eq!(
+        stats.deny_count,
+        crate::circuit_breaker::CB_THRESHOLD as u64 + 1
+    );
     assert!(stats.timing_ns.total_ns > 0);
 }
 
@@ -4224,12 +2275,9 @@ async fn test_org_gate_pending_records_success_not_failure() {
     // Pending：读取已成功（Ok），业务 pending 是确定性授权结果 → 记成功。
     let engine = PolicyEngine::new();
     seed_breaker_failures_below_threshold(&engine).await;
-    let repo = OrgGateSwitchRepo::new(
-        OrgAuthorityRead::Pending {
-            code: "org_gate.membership_pending".into(),
-        },
-        true,
-    );
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Pending {
+        code: "org_gate.membership_pending".into(),
+    });
     let decision = engine.evaluate(&strict_ctx(), &repo).await;
     assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
     assert_eq!(
@@ -4245,11 +2293,14 @@ async fn test_org_gate_pending_records_success_not_failure() {
     );
     let stats = engine.get_stats();
     assert_eq!(
-        stats.l3_hits,
+        stats.evaluation_count,
         crate::circuit_breaker::CB_THRESHOLD as u64 + 1
     );
-    assert_eq!(stats.l1_hits, 0);
-    assert_eq!(stats.l2_hits, 0);
+    assert_eq!(stats.allow_count, 0);
+    assert_eq!(
+        stats.deny_count,
+        crate::circuit_breaker::CB_THRESHOLD as u64 + 1
+    );
 }
 
 #[tokio::test]
@@ -4257,10 +2308,9 @@ async fn test_org_gate_ready_allow_records_success_and_evaluation() {
     // Ready ALLOW：确定性授权结果 → 记成功，且记账恰好一次。
     let engine = PolicyEngine::new();
     seed_breaker_failures_below_threshold(&engine).await;
-    let repo = OrgGateSwitchRepo::new(
-        OrgAuthorityRead::Ready(Box::new(org_gate_admission_evidence())),
-        false,
-    );
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Ready(Box::new(
+        org_gate_admission_evidence(),
+    )));
     let decision = engine.evaluate(&org_gate_ctx(), &repo).await;
     assert!(decision.allowed);
     assert_eq!(decision.reason, "ORG_PUBLISHED_EVIDENCE_ALLOW");
@@ -4274,11 +2324,14 @@ async fn test_org_gate_ready_allow_records_success_and_evaluation() {
     );
     let stats = engine.get_stats();
     assert_eq!(
-        stats.l3_hits,
+        stats.evaluation_count,
         crate::circuit_breaker::CB_THRESHOLD as u64 + 1
     );
-    assert_eq!(stats.l1_hits, 0);
-    assert_eq!(stats.l2_hits, 0);
+    assert_eq!(stats.allow_count, 1);
+    assert_eq!(
+        stats.deny_count,
+        crate::circuit_breaker::CB_THRESHOLD as u64
+    );
     assert!(stats.timing_ns.total_ns > 0);
 }
 
@@ -4288,10 +2341,9 @@ async fn test_org_gate_ready_default_deny_records_success_not_failure() {
     // 绝不能记为依赖失败。
     let engine = PolicyEngine::new();
     seed_breaker_failures_below_threshold(&engine).await;
-    let repo = OrgGateSwitchRepo::new(
-        OrgAuthorityRead::Ready(Box::new(org_gate_admission_evidence())),
-        false,
-    );
+    let repo = OrgGateSwitchRepo::new(OrgAuthorityRead::Ready(Box::new(
+        org_gate_admission_evidence(),
+    )));
     // 请求 doc:43 → 段键 doc:42 无匹配贡献 → DEFAULT_DENY。
     let mut ctx = org_gate_ctx();
     ctx.target_id = Some(43);
@@ -4311,11 +2363,14 @@ async fn test_org_gate_ready_default_deny_records_success_not_failure() {
     );
     let stats = engine.get_stats();
     assert_eq!(
-        stats.l3_hits,
+        stats.evaluation_count,
         crate::circuit_breaker::CB_THRESHOLD as u64 + 1
     );
-    assert_eq!(stats.l1_hits, 0);
-    assert_eq!(stats.l2_hits, 0);
+    assert_eq!(stats.allow_count, 0);
+    assert_eq!(
+        stats.deny_count,
+        crate::circuit_breaker::CB_THRESHOLD as u64 + 1
+    );
 }
 
 #[tokio::test]
@@ -4342,11 +2397,14 @@ async fn test_org_gate_ready_identity_drift_records_success_not_failure() {
     );
     let stats = engine.get_stats();
     assert_eq!(
-        stats.l3_hits,
+        stats.evaluation_count,
         crate::circuit_breaker::CB_THRESHOLD as u64 + 1
     );
-    assert_eq!(stats.l1_hits, 0);
-    assert_eq!(stats.l2_hits, 0);
+    assert_eq!(stats.allow_count, 0);
+    assert_eq!(
+        stats.deny_count,
+        crate::circuit_breaker::CB_THRESHOLD as u64 + 1
+    );
 }
 
 #[tokio::test]
@@ -4390,14 +2448,18 @@ async fn test_org_gate_ready_internal_read_unavailable_accrues_breaker_failures(
             CircuitBreakerState::Open,
             "{label} 必须累计断路器失败"
         );
-        // 每次失败评估都恰好记账一次（layer=ORG_AUTHORITY → 保守 l3 桶）。
+        // Every final-read/card-context infrastructure failure is counted as DENY.
         let stats = engine.get_stats();
         assert_eq!(
-            stats.l3_hits,
+            stats.evaluation_count,
             crate::circuit_breaker::CB_THRESHOLD as u64,
             "{label}"
         );
-        assert_eq!(stats.l1_hits, 0, "{label}");
-        assert_eq!(stats.l2_hits, 0, "{label}");
+        assert_eq!(stats.allow_count, 0, "{label}");
+        assert_eq!(
+            stats.deny_count,
+            crate::circuit_breaker::CB_THRESHOLD as u64,
+            "{label}"
+        );
     }
 }

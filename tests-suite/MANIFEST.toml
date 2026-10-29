@@ -30,15 +30,6 @@ note = "strict published-evidence 注入夹具;验证 scope/最终重读且禁�
 run = "cargo test -p testsuite --test tenant_isolation_tests"
 
 [[entry]]
-id = "policy-engine/oracle_tests"
-category = "compat-guard"
-owner_crate = "policy-engine"
-path = "tests-suite/series/COMPAT/oracle_tests.rs"
-kind = "integration-fixture"
-arch_status = "compat"
-note = "Java/Rust 语义 oracle 对齐;L2 CARD_ONLY fallback fixture 属兼容语义;默认原生 gate 不编译,需 --features compat-oracle 显式运行"
-
-[[entry]]
 id = "astral-common/gateway_contract_tests"
 category = "security"
 owner_crate = "astral-common"
@@ -65,17 +56,6 @@ kind = "integration-ignored"
 requires = ["DATABASE_URL", "MySQL-8.0-migrated"]
 arch_status = "current"
 run = "cargo test -p testsuite --test authorization_projection_integration -- --ignored"
-
-[[entry]]
-id = "astral-db/evidence_cache_redis_integration"
-category = "integration"
-owner_crate = "astral-db"
-path = "tests-suite/series/COMPAT/evidence_cache_redis_integration.rs"
-kind = "integration-ignored"
-requires = ["REDIS_URL", "DATABASE_URL(部分用例)", "redis-compat feature", "ASTRAL_REDIS_PROJECTION_COMPAT=true"]
-arch_status = "compat"
-note = "显式 Redis adapter 兼容窗专项;不属于 Redis-free 默认集成 gate"
-run = "bash scripts/run-tests.sh --redis-compat"
 
 [[entry]]
 id = "astral-db/integration"
@@ -135,8 +115,9 @@ category = "integration"
 owner_crate = "astral-db"
 path = "tests-suite/series/RQ4/partition_lease_integration.rs"
 kind = "integration-ignored"
-requires = ["DATABASE_URL"]
+requires = ["DATABASE_URL", "RUST_INTEGRATION_REQUIRED", "TEST_USE_EXISTING", "ASTRAL_MIGRATION_ENV", "ASTRAL_TEST_DATABASE_NAME"]
 arch_status = "current"
+note = "7 个 run-scoped 用例；真实 source receipt 与 WorkerOwned partition claim；pointer advance 后预算回收未覆盖；必须使用已迁移的 loopback:3308 隔离库"
 
 [[entry]]
 id = "astral-db/quarantine_integration"
@@ -220,15 +201,6 @@ arch_status = "archived"
 note = "冻结源码,workspace exclude"
 
 [[entry]]
-id = "astral-cache/redis_key_scope_tests"
-category = "integration"
-owner_crate = "astral-cache"
-path = "astral-cache/tests/redis_key_scope_tests.rs"
-kind = "unit"
-arch_status = "archived"
-note = "自包含归档库;含已退役 permission:snapshot:{card_id} 键语义(归档理由)"
-
-[[entry]]
 id = "integrations/learn+chat"
 category = "e2e"
 owner_crate = "integrations"
@@ -266,16 +238,6 @@ arch_status = "current"
 note = "双卡身份/激活/撤销/规则绑定/审计 TLA+ 模型 + cfg;无 pinned TLC,BLOCKED,不是执行证据"
 
 [[entry]]
-id = "e2e/tdsc-periodic"
-category = "e2e"
-owner_crate = "experiments/tdsc"
-path = "experiments/tdsc/"
-kind = "campaign"
-requires = ["exclusive Docker host", "immutable image digests", "external credentials"]
-arch_status = "current"
-note = "TDSC protocol/fault/performance/lease 四类 workload 与 10 个性能测量测试;未执行,需独占 host 和外部证据"
-
-[[entry]]
 id = "harness/opa-index-experiment"
 category = "performance"
 owner_crate = "Docs/实验/基准测试/scripts"
@@ -293,7 +255,7 @@ owner_crate = "policy-engine"
 kind = "unit-inline"
 modules = 11
 arch_status = "current"
-note = "src/engine/tests.rs 4287 行、94 个测试；默认原生 gate 只编译 strict published/当前路径的 248 个 policy-engine 测试，46 个 L1/L2/fallback/CARD_ONLY/legacy 测试由 --features legacy-tests 显式启用，不证明当前生产 strict 路径"
+note = "PolicyEngine 默认 crate suite 验证当前 strict published-evidence 路径；退役的 L1/L2/fallback/CARD_ONLY/legacy 测试不再作为 suite 或 PASS 计数"
 
 [[entry]]
 id = "inline/astral-db"
@@ -406,7 +368,7 @@ owner_crate = "bench/loadgen(独立 crate)"
 path = "bench/loadgen/"
 kind = "bench-binary"
 arch_status = "current"
-note = "HMAC v3 压测客户端;bench/loadgen/scripts/bench_matrix.sh 有界 open-loop offered-RPS 阶梯;每次测点独立 SLO;需 native composite 实际部署、可信 SUT 采样、积压稳定与运行级 95% CI 半宽 <=2% 收敛证据"
+note = "HMAC v3 Rust 压测客户端;由 crate 内 Rust CLI 配置 bounded open-loop offered-RPS 测点;每次测点独立 SLO;需 native composite 实际部署、可信 SUT 采样、积压稳定与运行级 95% CI 半宽 <=2% 收敛证据;旧复合 shell wrapper 已移除"
 
 [[entry]]
 id = "perf/no-regression-matrices"
@@ -444,7 +406,7 @@ path = "tests-suite/series/E4/"
 kind = "integration-mixed"
 requires = ["DATABASE_URL(除纯配置门)", "RUST_INTEGRATION_REQUIRED=1"]
 arch_status = "current"
-note = "Cargo 显式目标:commit-proven hub 失效 / 强制身份映射 / 单写者租约 / Redis-free composite 配置门"
+note = "Cargo 显式目标:commit-proven hub 失效 / 强制身份映射 / 单写者租约；当前依赖树由 Rust harness 核对"
 
 [[entry]]
 id = "security/private-baseline-boundary"
@@ -462,11 +424,11 @@ run = "cargo test -p testsuite --test private_security_boundary_tests"
 id = "e2e/single-node-native"
 category = "e2e"
 owner_crate = "astral-single-node + bench/loadgen"
-path = "bench/loadgen/scripts/bench_matrix.sh"
+path = "bench/loadgen/"
 kind = "campaign"
 requires = ["MySQL", "LocalBus/LocalProjectionBus", "composite 二进制", "loadgen 二进制"]
 arch_status = "current"
-note = "完整 native HTTP campaign 仍需隔离部署、签名身份、source/bootstrap、可信 SUT/积压采样与终态证据;压测脚本存在不表示整流程已执行"
+note = "完整 native HTTP campaign 仍需隔离部署、签名身份、source/bootstrap、可信 SUT/积压采样与终态证据;Rust loadgen CLI 只提供测量入口,完整流程仍须显式部署并运行"
 
 [[entry]]
 id = "e2e/distributed-s15"
@@ -498,7 +460,7 @@ owner_crate = "scripts"
 path = "scripts/run-tests.sh"
 kind = "script"
 arch_status = "current"
-note = "Redis-free unit/check/MySQL integration;Rabbit、Redis compat、专属身份映射分别显式运行;--mt-extreme/--mt-matrix 默认 Redis-free"
+note = "原生 unit/check/MySQL integration；Rabbit 与专属身份映射分别显式运行；运行器不提供 Redis profile"
 
 [[entry]]
 id = "harness/runner-contracts"
@@ -529,7 +491,7 @@ path = "tests-suite/series/RQ4/native_projection_storm.rs"
 kind = "integration-ignored"
 requires = ["new run-scoped migrated MySQL schema", "LocalBus", "LocalProjectionBus", "MemoryProjectionHub"]
 arch_status = "current"
-note = "三轮同卡并发 source mutation 与完整 native hybrid publication drain；同步 publisher 保持启用，不声称 worker-only 或历史三节点 RQ4 复跑"
+note = "三轮同卡并发 source mutation 与完整 worker-owned publication drain；请求只观察精确完成证明，不执行发布；不声称历史三节点 RQ4 复跑"
 run = "bash scripts/run-tests.sh --campaign --run --suite native-projection-storm"
 
 [[entry]]
@@ -648,8 +610,8 @@ boundary = "in-process component assertions; no durable or HTTP integration"
 [[profile]]
 id = "offline-validation"
 production_services = []
-deployment = "offline Rust and retained migration-source tooling"
-boundary = "Rust bounded model execution; retained Python sources are migration/oracle inputs only; no runtime authorization proof"
+deployment = "offline Rust contracts and bounded models"
+boundary = "Rust bounded model execution and explicit historical migration metadata; no runtime authorization proof"
 
 [[profile]]
 id = "native-single-node"
@@ -668,12 +630,6 @@ id = "distributed"
 production_services = ["mysql", "rabbitmq"]
 deployment = "current multi-process Rabbit transport"
 boundary = "full current campaign blocked until legacy Redis/OPA harness is replaced and deployment is approved"
-
-[[profile]]
-id = "redis-compat"
-production_services = ["mysql", "redis"]
-deployment = "explicit redis-compat feature/runtime adapter window"
-boundary = "compat-only; never a native default; registered sunset 2026-12-31"
 
 [[profile]]
 id = "performance-kernel"
@@ -783,11 +739,25 @@ test_services = []
 series = ["CORE", "M4", "E4"]
 scope = "component"
 boundary = "Rust campaign manifest/parser, selection, environment isolation, summary/status acceptance, report, artifact and local process contracts; Python runner sources are migration references; excludes separately dispatched shell-forwarding tests and does not prove DB, Docker or live faults"
-sources = ["test-harness/src/campaign.rs", "test-harness/src/campaign/run_tests.rs", "test-harness/src/acceptance.rs", "test-harness/src/evaluate_acceptance.rs", "test-harness/src/model_acceptance.rs", "scripts/test_campaign.py", "scripts/tests/test_test_campaign.py", "Docs/authorization-validation/python-test-method-crosswalk.md", "tests-suite/MANIFEST.toml"]
+sources = ["test-harness/src/campaign.rs", "test-harness/src/campaign/run_tests.rs", "test-harness/src/acceptance.rs", "test-harness/src/evaluate_acceptance.rs", "test-harness/src/model_acceptance.rs", "scripts/tests/test_test_campaign.py", "Docs/authorization-validation/python-test-method-crosswalk.md", "tests-suite/MANIFEST.toml"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "campaign::", "--", "--test-threads=1", "--skip", "shell_entrypoints_"]
 acceptance = "rust"
 minimum_tests = 33
 expected_tests = 33
+
+[[suite]]
+id = "v6-runtime-retirement-contracts"
+owner = "test-harness"
+profile = "native-kernel"
+test_services = []
+series = ["CORE", "COMPAT"]
+scope = "component"
+boundary = "Cargo TOML and production Rust source invariants for physical runtime retirement; includes split-owner and test-literal guard checks; no live dependency or cutover proof"
+sources = ["test-harness/src/runtime_retirement.rs", "test-harness/src/lib.rs", "Cargo.toml", "Cargo.lock"]
+argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "runtime_retirement::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 3
+expected_tests = 3
 
 [[suite]]
 id = "shell-runner-contracts"
@@ -801,6 +771,7 @@ sources = ["test-harness/src/campaign.rs", "scripts/run-tests.sh", "tests-suite/
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "campaign::tests::shell_entrypoints_", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 2
+expected_tests = 2
 
 
 [[suite]]
@@ -904,19 +875,6 @@ scope = "component"
 boundary = "signed gateway middleware fixture; not deployed host full mediation"
 sources = ["tests-suite/series/E1/gateway_contract_tests.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "gateway_contract_tests", "--locked"]
-acceptance = "rust"
-minimum_tests = 1
-
-[[suite]]
-id = "redis-free-config"
-owner = "testsuite"
-profile = "native-kernel"
-test_services = []
-series = ["E4", "M4"]
-scope = "component"
-boundary = "AppConfig adapter capability assertion; not private composite startup validation"
-sources = ["tests-suite/series/E4/premise_redis_free_composite.rs"]
-argv = ["cargo", "test", "-p", "testsuite", "--test", "premise_redis_free_composite", "--locked"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1144,7 +1102,7 @@ test_services = []
 series = ["E1", "E3", "E5"]
 scope = "offline-model"
 boundary = "five Rust unit tests for pure same-process event-order, exact candidate identity, final-observation interval and multi-mutation attribution; does not parse live logs or prove deployment"
-sources = ["test-harness/src/e1_validation.rs", "Docs/authorization-validation/archive/python-tests/test_classify_e1_properties.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py", "Docs/authorization-validation/tools/experiment_common.py"]
+sources = ["test-harness/src/e1_validation.rs", "Docs/authorization-validation/archive/python-tests/test_classify_e1_properties.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e1_validation::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 5
@@ -1158,7 +1116,7 @@ test_services = []
 series = ["E1"]
 scope = "offline-model"
 boundary = "pure offline immutable-result contract: once frozen, guarded mutation methods refuse changes and preserve the snapshot; no E1 runner, campaign lifecycle, or external evidence"
-sources = ["test-harness/src/e1_frozen_result.rs", "Docs/authorization-validation/tools/e1_runner.py", "Docs/authorization-validation/archive/python-tests/test_e1_runner.py"]
+sources = ["test-harness/src/e1_frozen_result.rs", "Docs/authorization-validation/archive/python-tests/test_e1_runner.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e1_frozen_result::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -1173,7 +1131,7 @@ test_services = []
 series = ["E1"]
 scope = "offline-model"
 boundary = "Rust E1 JSONL parser filtering, flat/nested field precedence, numeric parsing, process identity validation, epoch-scoped duplicate sequence rejection and deterministic sorting; not full E1 runner parity"
-sources = ["test-harness/src/e1_log.rs", "Docs/authorization-validation/tools/experiment_common.py", "Docs/authorization-validation/archive/python-tests/test_classify_e1_properties.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
+sources = ["test-harness/src/e1_log.rs", "Docs/authorization-validation/archive/python-tests/test_classify_e1_properties.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e1_log::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 2
@@ -1187,7 +1145,7 @@ test_services = []
 series = ["E1"]
 scope = "offline-model"
 boundary = "native E1 settings validation, UUIDv5 operation/request identity, offline plan artifacts and checksums, GET/SELECT-only preflight with all dirty-precondition labels, the mechanical live gate, and an injected-adapter campaign contract covering add/bind/reader/delete/unbind cleanup, foreign-binding protection, per-cycle artifacts and checksums; no real HTTP/SSH/MySQL, live phase runner, stale-race orchestration, durable reconciliation joins or independent validator process"
-sources = ["test-harness/src/e1_runner_contract.rs", "Docs/authorization-validation/tools/e1_runner.py", "Docs/authorization-validation/archive/python-tests/test_e1_runner.py", "Docs/authorization-validation/tools/experiment_common.py", "Docs/authorization-validation/tools/node_adapter.py"]
+sources = ["test-harness/src/e1_runner_contract.rs", "Docs/authorization-validation/archive/python-tests/test_e1_runner.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e1_runner_contract::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 14
@@ -1202,7 +1160,7 @@ test_services = []
 series = ["E1"]
 scope = "offline-model"
 boundary = "E1 durable reconciliation and reader classification over supplied evidence: RULE_SET-only delta/query scope, tenant-scoped queries, delete audit scope/duplication/correlation, source-row and count ambiguity, operation-delta attributes, pointer card/generation identity, malformed rows, bounded unknown-delete reconciliation with one corrective attempt, projection convergence race skip, stale-ALLOW classification, pending/transport and incomplete-identity boundaries; no live SQL/HTTP, node contact or campaign orchestration"
-sources = ["test-harness/src/e1_durable_contract.rs", "Docs/authorization-validation/tools/e1_runner.py", "Docs/authorization-validation/archive/python-tests/test_e1_runner.py", "Docs/authorization-validation/tools/experiment_common.py"]
+sources = ["test-harness/src/e1_durable_contract.rs", "Docs/authorization-validation/archive/python-tests/test_e1_runner.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e1_durable_contract::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 20
@@ -1336,7 +1294,7 @@ test_services = []
 series = ["E3"]
 scope = "offline-model"
 boundary = "typed contract over already parsed E3 events: attempt/process-epoch pairing, durable-row matching, host-admission cross-check and publication-drain evidence; not the JSON parser, sampler, phase runner, four-category aggregator, or complete E3 report"
-sources = ["test-harness/src/e3_reconciliation.rs", "Docs/authorization-validation/tools/e3_runner.py", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py", "Docs/authorization-validation/archive/python-tests/test_model_acceptance.py"]
+sources = ["test-harness/src/e3_reconciliation.rs", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py", "Docs/authorization-validation/archive/python-tests/test_model_acceptance.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e3_reconciliation::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 12
@@ -1350,7 +1308,7 @@ test_services = []
 series = ["E4"]
 scope = "offline-model"
 boundary = "typed offline observation/auth/preflight/recovery contract with one apply, durable retry proof and authorization validator input immutability; no controller execution, full fake-controller lifecycle, profile fault matrix, or live integration"
-sources = ["test-harness/src/e4_protocol.rs", "Docs/authorization-validation/tools/e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
+sources = ["test-harness/src/e4_protocol.rs", "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e4_protocol::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 7
@@ -1379,7 +1337,7 @@ test_services = []
 series = ["E1"]
 scope = "offline-model"
 boundary = "native E1 live-campaign orchestration over injected CampaignAdapter, E1 log collector and independent approval validator: plan/live gate, preflight and add/bind/reader/delete/unbind phases, E1 JSONL collection/parsing, per-request terminal classification, live report/claim and checksum artifacts; live HTTP/SQL/SSH transport, deployment evidence and an external validator process remain outside the offline-injected suite"
-sources = ["test-harness/src/e1_runner_native.rs", "test-harness/src/e1_runner_contract.rs", "test-harness/src/e1_durable_contract.rs", "test-harness/src/e1_log.rs", "test-harness/src/e1_validation.rs", "test-harness/src/e3_e4_events.rs", "test-harness/src/e3_reconciliation.rs", "Docs/authorization-validation/tools/e1_runner.py", "Docs/authorization-validation/archive/python-tests/test_e1_runner.py", "Docs/authorization-validation/tools/experiment_common.py", "Docs/authorization-validation/archive/python-tests/test_classify_e1_properties.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
+sources = ["test-harness/src/e1_runner_native.rs", "test-harness/src/e1_runner_contract.rs", "test-harness/src/e1_durable_contract.rs", "test-harness/src/e1_log.rs", "test-harness/src/e1_validation.rs", "test-harness/src/e3_e4_events.rs", "test-harness/src/e3_reconciliation.rs", "Docs/authorization-validation/archive/python-tests/test_e1_runner.py", "Docs/authorization-validation/archive/python-tests/test_classify_e1_properties.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e1_runner_native::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 5
@@ -1394,7 +1352,7 @@ test_services = []
 series = ["E3"]
 scope = "offline-model"
 boundary = "native E3 phase orchestration over injected controller/probe/collector/row-reader/request-log ports: four phases once each, marker capture/validation, interval sampling, E3 log collection and parsing, durable-row reconciliation, host-admission crosscheck, four-category report fold, manifest/report/markers artifacts and checksums; live services, a real controller/probe transport and deployment evidence remain outside this suite"
-sources = ["test-harness/src/e3_runner_native.rs", "test-harness/src/e3_runner_contract.rs", "test-harness/src/e3_campaign_model.rs", "test-harness/src/e3_e4_events.rs", "test-harness/src/e3_reconciliation.rs", "test-harness/src/e3_report.rs", "test-harness/src/lifecycle.rs", "Docs/authorization-validation/tools/e3_runner.py", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py"]
+sources = ["test-harness/src/e3_runner_native.rs", "test-harness/src/e3_runner_contract.rs", "test-harness/src/e3_campaign_model.rs", "test-harness/src/e3_e4_events.rs", "test-harness/src/e3_reconciliation.rs", "test-harness/src/e3_report.rs", "test-harness/src/lifecycle.rs", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e3_runner_native::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 10
@@ -1409,7 +1367,7 @@ test_services = []
 series = ["E1", "E3", "E4"]
 scope = "offline-model"
 boundary = "offline E1/E3/E4 event parse, request selection/terminal mapping, candidate E0 identity and reader classification helpers; no runner, sampling, signed HTTP transport, database or deployment evidence"
-sources = ["test-harness/src/e3_e4_events.rs", "test-harness/src/e1_log.rs", "Docs/authorization-validation/tools/experiment_common.py", "Docs/authorization-validation/archive/python-tests/test_e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
+sources = ["test-harness/src/e3_e4_events.rs", "test-harness/src/e1_log.rs", "Docs/authorization-validation/archive/python-tests/test_e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e3_e4_events::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 6
@@ -1423,7 +1381,7 @@ test_services = []
 series = ["E3"]
 scope = "offline-model"
 boundary = "typed offline E3 config parsing and numeric, boolean, card, node, attempt and sample-count boundaries; no plan artifacts, live gate, runner, probe, sampler or service execution"
-sources = ["test-harness/src/e3_config.rs", "Docs/authorization-validation/tools/e3_runner.py", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py"]
+sources = ["test-harness/src/e3_config.rs", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e3_config::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 8
@@ -1438,7 +1396,7 @@ test_services = []
 series = ["E3"]
 scope = "offline-model"
 boundary = "offline marker, abort-evidence and four-category reducer, snapshot-only evidence-limit report contract, supplied worker-health tuple/status normalization, publication-not-configured SKIP fold, request-side SKIP fold, unrelated-PENDING UNKNOWN fold, supplied missing-request-log-collector UNKNOWN/no-claim fold, actor-aware-probe-unavailable BLOCKED category fold, failed-publication-indicator UNKNOWN fold, empty per-event history and missing-row-reader BLOCKED/no-claim folds, zero-duration window status fold, and static E3 runner source-secret audit; no E3 runner phases, timers, sampler loop, sink lifecycle, collector detection/invocation, live indicator sampling, or live host-admission proof"
-sources = ["test-harness/src/e3_report.rs", "Docs/authorization-validation/tools/e3_e4.py", "Docs/authorization-validation/tools/e3_runner.py", "Docs/authorization-validation/archive/python-tests/test_e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py"]
+sources = ["test-harness/src/e3_report.rs", "Docs/authorization-validation/archive/python-tests/test_e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e3_report::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 16
@@ -1460,7 +1418,7 @@ test_services = []
 series = ["E3"]
 scope = "offline-model"
 boundary = "native E3 plan identity and checksums, live gate, approval record file loading, canonical config hash, approval validator call ordering, CLI plan/run/bad-config exit behavior, missing probe/controller labels, marker-abort evidence, validator bound-reason aggregation and stored-output scrubbing; no sampling loop, phase execution, probe/controller invocation, live host evidence or durable reconciliation joins"
-sources = ["test-harness/src/e3_runner_contract.rs", "test-harness/src/e3_report.rs", "test-harness/src/e3_reconciliation.rs", "Docs/authorization-validation/tools/e3_runner.py", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py"]
+sources = ["test-harness/src/e3_runner_contract.rs", "test-harness/src/e3_report.rs", "test-harness/src/e3_reconciliation.rs", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e3_runner_contract::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 11
@@ -1475,7 +1433,7 @@ test_services = []
 series = ["E3"]
 scope = "offline-model"
 boundary = "E3 campaign-control contracts over supplied phase/collector/category inputs: full-claim PASS fold, three-role card bindings, begin/end injection and drain failure flags, timeout without retry, pending backoff, collector error BLOCKED, request-side SKIP, publication UNKNOWN, actor-aware BLOCKED, missing request-log collector UNKNOWN and cross-node parse-failure UNKNOWN; no controller/probe/sampler execution, artifact lifecycle or live host evidence"
-sources = ["test-harness/src/e3_campaign_model.rs", "test-harness/src/e3_runner_contract.rs", "test-harness/src/e3_report.rs", "test-harness/src/e3_reconciliation.rs", "Docs/authorization-validation/tools/e3_runner.py", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py"]
+sources = ["test-harness/src/e3_campaign_model.rs", "test-harness/src/e3_runner_contract.rs", "test-harness/src/e3_report.rs", "test-harness/src/e3_reconciliation.rs", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e3_campaign_model::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 15
@@ -1490,7 +1448,7 @@ test_services = []
 series = ["E4"]
 scope = "offline-model"
 boundary = "deterministic offline evaluation of supplied controller-hook outcomes, stage accounting, prepare/apply timeout and disconnect recovery, hook context/authorization identity without token retention, per-fault evidence, pure fault-outcome validation and matrix completeness; it does not call a real controller, validate live tokens or run plan/CLI surfaces, and is not profile-matrix or live fault evidence"
-sources = ["test-harness/src/e4_fault_lifecycle.rs", "test-harness/src/e4_protocol.rs", "Docs/authorization-validation/tools/e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py", "Docs/authorization-validation/tools/e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_e3_e4.py"]
+sources = ["test-harness/src/e4_fault_lifecycle.rs", "test-harness/src/e4_protocol.rs", "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_e3_e4.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e4_fault_lifecycle::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 11
@@ -1505,7 +1463,7 @@ test_services = []
 series = ["E4"]
 scope = "offline-model"
 boundary = "native E4 fault-plan construction, exact controller hook inventory, default/matrix live-gate blocking with zero controller contact, invalid-authorization short-circuit, native-profile explicit BLOCKED reason, and CLI plan/--plan/--run/--help exit behavior; no FaultController construction or invocation, no fake-hook lifecycle, no profile fault matrix execution and no live evidence"
-sources = ["test-harness/src/e4_fault_driver_contract.rs", "test-harness/src/e4_protocol.rs", "test-harness/src/dependency_profiles.rs", "Docs/authorization-validation/tools/e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py"]
+sources = ["test-harness/src/e4_fault_driver_contract.rs", "test-harness/src/e4_protocol.rs", "test-harness/src/dependency_profiles.rs", "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e4_fault_driver_contract::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 10
@@ -1519,8 +1477,8 @@ profile = "offline-validation"
 test_services = []
 series = ["E4"]
 scope = "offline-model"
-boundary = "offline typed fake-probe contract for E4 precondition capture, including SELECT-only scalar reads, MySQL isolation fallback, read-only Redis GET, UTC clock skew, status aggregation and host scrubbing; no live probe, E3 sampling, HTTP transport or deployment evidence"
-sources = ["test-harness/src/e4_preconditions.rs", "Docs/authorization-validation/tools/e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_e3_e4.py"]
+boundary = "offline typed fake-probe contract for E4 precondition capture, including SELECT-only scalar reads, explicit optional SQL cache epoch with SKIP when unconfigured, MySQL isolation fallback, UTC clock skew, status aggregation and host scrubbing; no live probe, E3 sampling, HTTP transport or deployment evidence"
+sources = ["test-harness/src/e4_preconditions.rs", "Docs/authorization-validation/archive/python-tests/test_e3_e4.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e4_preconditions::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 12
@@ -1534,7 +1492,7 @@ test_services = []
 series = ["E3", "E4"]
 scope = "offline-model"
 boundary = "native read-only E3/E4 probe over injected NodeAdapter/HttpTransport/CommandRunner ports: actor-aware signed decisions, SELECT-only snapshot sampling, worker readiness and complete probe/report folding, with blocked/unknown fail-closed and no host/secret retention; live deployment transport remains outside this offline suite"
-sources = ["test-harness/src/e3_e4_probe_native.rs", "test-harness/src/node_adapter_native.rs", "test-harness/src/node_adapter_contract.rs", "test-harness/src/e3_e4_events.rs", "test-harness/src/e3_report.rs", "test-harness/src/e3_reconciliation.rs", "test-harness/src/e4_protocol.rs", "test-harness/src/e4_preconditions.rs", "test-harness/src/dependency_profiles.rs", "Docs/authorization-validation/tools/e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
+sources = ["test-harness/src/e3_e4_probe_native.rs", "test-harness/src/node_adapter_native.rs", "test-harness/src/node_adapter_contract.rs", "test-harness/src/e3_e4_events.rs", "test-harness/src/e3_report.rs", "test-harness/src/e3_reconciliation.rs", "test-harness/src/e4_protocol.rs", "test-harness/src/e4_preconditions.rs", "test-harness/src/dependency_profiles.rs", "Docs/authorization-validation/archive/python-tests/test_e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e3_e4_probe_native::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 4
@@ -1549,7 +1507,7 @@ test_services = []
 series = ["E4"]
 scope = "offline-model"
 boundary = "native E4 fake-controller invocation over an injected controller port: authorization/plan/CLI validation, capabilities/preflight/prepare/apply/observe/restore/reconcile/verify_postcondition called at most once with run/fault/operation/stage context, scrubbed/bounded controller strings, timeout recovery without retry, and profile-specific fault-matrix aggregation with integration_claim=BLOCKED; no real fault controller, deployed host or profile fault execution"
-sources = ["test-harness/src/e4_fault_runner_native.rs", "test-harness/src/e4_fault_driver_contract.rs", "test-harness/src/e4_fault_lifecycle.rs", "test-harness/src/e4_protocol.rs", "test-harness/src/dependency_profiles.rs", "test-harness/src/experiment_register.rs", "Docs/authorization-validation/tools/e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
+sources = ["test-harness/src/e4_fault_runner_native.rs", "test-harness/src/e4_fault_driver_contract.rs", "test-harness/src/e4_fault_lifecycle.rs", "test-harness/src/e4_protocol.rs", "test-harness/src/dependency_profiles.rs", "test-harness/src/experiment_register.rs", "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e4_fault_", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 28
@@ -1578,8 +1536,8 @@ profile = "offline-validation"
 test_services = []
 series = ["E3", "E4"]
 scope = "offline-model"
-boundary = "native NodeAdapter runtime over injected CommandRunner/HttpTransport ports: fixed SQL/Redis/log-slice argv and stdin auth, signed actor-aware GET with envelope parsing, request-terminal classification from injected log lines, missing-secret short-circuit before dispatch and secret-free debug output; live SSH/subprocess/HTTP deployment remains outside this offline suite"
-sources = ["test-harness/src/node_adapter_native.rs", "test-harness/src/node_adapter_contract.rs", "test-harness/src/e3_e4_events.rs", "test-harness/src/e3_reconciliation.rs", "Docs/authorization-validation/tools/node_adapter.py", "Docs/authorization-validation/archive/python-tests/test_node_adapter.py"]
+boundary = "native NodeAdapter runtime over injected CommandRunner/HttpTransport ports: fixed SQL and bounded raw-log argv, Rust identifier filtering/redaction and stdin auth, signed actor-aware GET with envelope parsing, request-terminal classification from injected log lines, missing-secret short-circuit before dispatch and secret-free debug output; live SSH/subprocess/HTTP deployment remains outside this offline suite"
+sources = ["test-harness/src/node_adapter_native.rs", "test-harness/src/node_adapter_contract.rs", "test-harness/src/e3_e4_events.rs", "test-harness/src/e3_reconciliation.rs", "Docs/authorization-validation/archive/python-tests/test_node_adapter.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "node_adapter_native::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 5
@@ -1593,8 +1551,8 @@ profile = "offline-validation"
 test_services = []
 series = ["E1", "E3", "E4"]
 scope = "offline-model"
-boundary = "Rust pure contracts for validated node configuration and provenance-only public metadata, exact flat-config loading without IO, actor/card binding, exact Gateway v3 payload/HMAC vector, lazy HMAC-secret load without retention, SQL/Redis/log-slice command planning with exact argv and TSV parsing, missing-secret guards, scrubbed failure details, signed request planning with fake transport, durable SELECT query builders, and a disabled subprocess runner; no real subprocess, secret-file lifecycle at runtime, SSH, network, or live service execution"
-sources = ["test-harness/src/node_adapter_contract.rs", "Docs/authorization-validation/tools/node_adapter.py", "Docs/authorization-validation/archive/python-tests/test_node_adapter.py", "Docs/authorization-validation/tools/experiment_common.py"]
+boundary = "Rust pure contracts for validated node configuration and provenance-only public metadata, exact flat-config loading without IO, actor/card binding, exact Gateway v3 payload/HMAC vector, lazy HMAC-secret load without retention, SQL and bounded raw-log command planning with exact argv, Rust filtering/redaction, explicit retired-field rejection and TSV parsing, missing-secret guards, scrubbed failure details, signed request planning with fake transport, durable SELECT query builders, and a disabled subprocess runner; no real subprocess, secret-file lifecycle at runtime, SSH, network, or live service execution"
+sources = ["test-harness/src/node_adapter_contract.rs", "Docs/authorization-validation/archive/python-tests/test_node_adapter.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "node_adapter_contract::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 22
@@ -1609,11 +1567,11 @@ test_services = []
 series = ["CORE", "E1", "E2", "E3", "E4", "E5"]
 scope = "offline-model"
 boundary = "typed offline contracts for safe campaign IDs/artifact paths, unique source inventory and SHA-256 drift, injected command timeout/spawn/marker/JSON statuses, required-gate fail-stop, scenario/local status aggregation, and deterministic checksum validation; no command execution, file writes, complete runner lifecycle, or live campaign evidence"
-sources = ["test-harness/src/readiness_contract.rs", "Docs/authorization-validation/tools/run_single_node_campaign.py", "Docs/authorization-validation/tools/experiment_common.py", "Docs/authorization-validation/archive/python-tests/test_run_single_node_campaign.py"]
+sources = ["test-harness/src/readiness_contract.rs", "Docs/authorization-validation/archive/python-tests/test_run_single_node_campaign.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "readiness_contract::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
-minimum_tests = 12
-expected_tests = 12
+minimum_tests = 15
+expected_tests = 15
 timeout_seconds = 600
 
 [[suite]]
@@ -1624,7 +1582,7 @@ test_services = []
 series = ["CORE", "E1", "E2", "E3", "E4", "E5"]
 scope = "offline-model"
 boundary = "legacy single-node readiness command inventory and control-flow contracts: runtime suites are required cargo test executions (no --no-run), upgraded E5 gates are registered with explicit flags/timeouts, source preflight blocks before directory creation, required failures stop later commands with SKIP, scenario status aggregation is fail-closed, previous-attempt linkage and timeout/OS-error evidence fields are pinned, and missing --config/--out exits 2 before writes; no command execution or runner lifecycle"
-sources = ["test-harness/src/legacy_campaign_contract.rs", "Docs/authorization-validation/tools/run_single_node_campaign.py", "Docs/authorization-validation/archive/python-tests/test_run_single_node_campaign.py"]
+sources = ["test-harness/src/legacy_campaign_contract.rs", "Docs/authorization-validation/archive/python-tests/test_run_single_node_campaign.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "legacy_campaign_contract::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 9
@@ -1652,8 +1610,8 @@ profile = "offline-validation"
 test_services = []
 series = ["E4"]
 scope = "offline-model"
-boundary = "Rust declaration contract for all eight profiles, exact service/dependency/fault membership, all fault-to-dependency metadata with profile-filtered expansion, Redis-compat-only faults and dependency-by-timing rows carrying profile/dependency/timing/fail-closed fields; not a live fault campaign"
-sources = ["test-harness/src/dependency_profiles.rs", "Docs/authorization-validation/tools/dependency_profiles.py", "Docs/authorization-validation/archive/python-tests/test_dependency_profiles.py", "test-harness/src/experiment_register.rs"]
+boundary = "Rust declaration contract for all seven native profiles, exact service/dependency/fault membership, all fault-to-dependency metadata with profile-filtered expansion, rejection of retired Redis profiles/faults and dependency-by-timing rows carrying profile/dependency/timing/fail-closed fields; not a live fault campaign"
+sources = ["test-harness/src/dependency_profiles.rs", "Docs/authorization-validation/archive/python-tests/test_dependency_profiles.py", "test-harness/src/experiment_register.rs"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "dependency_profiles::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 2
@@ -1667,7 +1625,7 @@ test_services = []
 series = ["E1", "E2", "E3", "E4"]
 scope = "offline-model"
 boundary = "Rust declaration contract for stimulus source form/revocation/note metadata, E2 control/premise links including exact premise/test uniqueness and Rust-source resolution, canary injection and ground-truth rates, all profile service/dependency/fault tables, profile-filtered dependency matrices, capture requirements and acceptance criteria; declarations are not execution evidence"
-sources = ["test-harness/src/experiment_register.rs", "test-harness/src/dependency_profiles.rs", "Docs/authorization-validation/tools/experiment_register.py", "Docs/authorization-validation/archive/python-tests/test_experiment_register.py", "Docs/authorization-validation/tools/run_single_node_campaign.py"]
+sources = ["test-harness/src/experiment_register.rs", "test-harness/src/dependency_profiles.rs", "Docs/authorization-validation/archive/python-tests/test_experiment_register.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "experiment_register::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 3
@@ -1682,7 +1640,7 @@ test_services = []
 series = ["E1", "E2", "E3", "E4"]
 scope = "offline-model"
 boundary = "shared offline contracts for Python-compatible UUIDv5 stable ids, atomic JSON writes with LF checksums and tamper detection, route-journal admission for multiple server identities, sampling stop-between-samples control flow, sink error accounting without abort, a non-executing self-test help entrypoint, and strict/cache final-observation bracket assembly with missing/misordered/pending rejection; no live sampling loop, sink I/O, route deployment or fault execution"
-sources = ["test-harness/src/experiment_common_contract.rs", "Docs/authorization-validation/tools/experiment_common.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
+sources = ["test-harness/src/experiment_common_contract.rs", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "experiment_common_contract::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 26
@@ -1697,7 +1655,7 @@ test_services = []
 series = ["E1", "E3"]
 scope = "offline-model"
 boundary = "Rust offline E1/E3 lifecycle timing reductions, epoch-safe pairing, missing/ambiguous evidence exclusion, durable E3 terminal proof, cross-node clock evidence and nearest-rank percentile summaries; diagnostics only, not runtime latency evidence"
-sources = ["test-harness/src/lifecycle.rs", "test-harness/src/e3_reconciliation.rs", "Docs/authorization-validation/tools/lifecycle_reducer.py", "Docs/authorization-validation/archive/python-tests/test_lifecycle_reducer.py", "Docs/authorization-validation/tools/experiment_common.py"]
+sources = ["test-harness/src/lifecycle.rs", "test-harness/src/e3_reconciliation.rs", "Docs/authorization-validation/tools/lifecycle_reducer.py", "Docs/authorization-validation/archive/python-tests/test_lifecycle_reducer.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "lifecycle::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 3
@@ -1711,7 +1669,7 @@ test_services = []
 series = ["CORE", "E1", "E2", "E3", "E4", "E5"]
 scope = "offline-model"
 boundary = "native legacy-campaign report/artifact contract over injected suite results: per-suite status folding, required-gate claim semantics, source-hash inventory, model/performance acceptance fields, LF report/status/manifest artifacts and checksum tamper detection; it does not execute the legacy runner, spawn suite commands or reproduce the full legacy artifact tree"
-sources = ["test-harness/src/legacy_campaign_report_native.rs", "test-harness/src/legacy_campaign_contract.rs", "test-harness/src/experiment_common_contract.rs", "test-harness/src/readiness_contract.rs", "test-harness/src/acceptance.rs", "test-harness/src/campaign.rs", "scripts/test_campaign.py", "scripts/tests/test_test_campaign.py", "Docs/authorization-validation/tools/run_single_node_campaign.py", "Docs/authorization-validation/tools/experiment_common.py", "Docs/authorization-validation/archive/python-tests/test_model_acceptance.py", "Docs/authorization-validation/archive/python-tests/test_run_single_node_campaign.py"]
+sources = ["test-harness/src/legacy_campaign_report_native.rs", "test-harness/src/legacy_campaign_contract.rs", "test-harness/src/experiment_common_contract.rs", "test-harness/src/readiness_contract.rs", "test-harness/src/acceptance.rs", "test-harness/src/campaign.rs", "scripts/tests/test_test_campaign.py", "Docs/authorization-validation/archive/python-tests/test_model_acceptance.py", "Docs/authorization-validation/archive/python-tests/test_run_single_node_campaign.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "legacy_campaign_report_native::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 4
@@ -1740,7 +1698,7 @@ profile = "native-single-node"
 test_services = ["mysql"]
 series = ["M1", "M2", "M3", "E3", "E4", "RQ3"]
 scope = "integration"
-boundary = "production source commit/local dispatch/publication pipeline/evaluate with worker owner; sync publisher attribution is not exclusive; not signed HTTP host campaign"
+boundary = "production source commit/local dispatch/publication pipeline/evaluate with worker owner; owned publication is the only publication authority; not signed HTTP host campaign"
 sources = ["tests-suite/series/RQ3/native_projection_lifecycle.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_lifecycle", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
@@ -1754,24 +1712,7 @@ profile = "native-single-node"
 test_services = ["mysql"]
 series = ["M1", "M2", "M3", "E3", "E4", "RQ4"]
 scope = "integration"
-boundary = "bounded same-card production repository/local-worker storm with legacy-hybrid request publication explicitly retained; paired workload controls permit comparison but do not prove cross-node/global optimality; cleanup requires REMOVE/audit/READY-empty proof"
-projection_execution_mode = "legacy-hybrid"
-sources = ["tests-suite/series/RQ4/native_projection_storm.rs"]
-argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_storm", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
-acceptance = "rust"
-minimum_tests = 1
-expected_tests = 1
-timeout_seconds = 3600
-
-[[suite]]
-id = "native-projection-storm-owned"
-owner = "testsuite + astral-trustgraph"
-profile = "native-single-node"
-test_services = ["mysql"]
-series = ["M1", "M2", "M3", "E3", "E4", "RQ4"]
-scope = "integration"
-boundary = "worker-owned variant of the exact same bounded repository/local-worker workload; checks claim/execution/failure accounting and complete historical durable publication proofs; not signed HTTP, real sockets, or multi-node performance"
-projection_execution_mode = "worker-owned"
+boundary = "bounded same-card production repository/local-worker storm using owned publication only; checks claim/execution/failure accounting, UNKNOWN behavior and durable evidence; paired workload controls do not prove cross-node/global optimality; cleanup requires REMOVE/audit/READY-empty proof"
 sources = ["tests-suite/series/RQ4/native_projection_storm.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_storm", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
@@ -1787,7 +1728,6 @@ test_services = ["mysql"]
 series = ["M1", "M2", "M3", "E3", "E4", "RQ4"]
 scope = "integration"
 boundary = "real MySQL owned claim/epoch/active-slot/concurrent predecessor/accounting and stale capability contract; synthetic typed source receipts, not signed HTTP or complete policy evaluation"
-projection_execution_mode = "worker-owned"
 sources = ["tests-suite/series/RQ3/projection_owned_integration.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "projection_owned_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
@@ -1803,7 +1743,6 @@ test_services = ["mysql"]
 series = ["M1", "M2", "M3", "E3", "E4", "RQ4"]
 scope = "integration"
 boundary = "real MySQL retained historical publication, multi-item completeness seal, corruption controls and late failure atomic rollback; synthetic typed receipts and commands, not signed HTTP or deployed authorization"
-projection_execution_mode = "worker-owned"
 sources = ["astral-db/src/authorization_projection_repository/owned_completion.rs", "astral-db/src/authorization_projection_repository/owned_completion/seal.rs", "astral-db/src/authorization_projection_repository/owned_completion/tests.rs"]
 argv = ["cargo", "test", "-p", "astral-db", "--lib", "owned_completion_real_mysql_integrity_contract", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
@@ -1819,7 +1758,6 @@ test_services = ["mysql"]
 series = ["M1", "M2", "M3", "E1", "E3", "E4", "RQ3"]
 scope = "integration"
 boundary = "real MySQL plus in-process production rule router, Gateway identity signature and permission middleware; includes pending narrowing before worker startup; not a real-socket Gateway or cross-node campaign"
-projection_execution_mode = "worker-owned"
 sources = ["tests-suite/series/RQ3/projection_owned_http.rs", "tests-suite/series/RQ3/projection_owned_http_support/mod.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "projection_owned_http", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
@@ -1928,11 +1866,12 @@ profile = "native-single-node"
 test_services = ["mysql"]
 series = ["M2", "E3", "E4"]
 scope = "integration"
-boundary = "durable partition ownership/CAS/reclaim contracts"
+boundary = "run-owned loopback:3308 schema required; seven lifecycle/source-backed owned-claim tests; pointer-advance recovery remains uncovered"
 sources = ["tests-suite/series/RQ4/partition_lease_integration.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "partition_lease_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
-minimum_tests = 1
+minimum_tests = 7
+expected_tests = 7
 
 [[suite]]
 id = "db-quarantine"
@@ -2131,19 +2070,6 @@ acceptance = "rust"
 minimum_tests = 1
 
 [[suite]]
-id = "redis-evidence-compat"
-owner = "astral-db"
-profile = "redis-compat"
-test_services = ["mysql", "redis"]
-series = ["COMPAT", "E4"]
-scope = "integration"
-boundary = "explicit adapter window only; cannot establish native evidence path acceptance"
-sources = ["tests-suite/series/COMPAT/evidence_cache_redis_integration.rs"]
-argv = ["cargo", "test", "-p", "testsuite", "--features", "redis-compat", "--test", "evidence_cache_redis_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
-acceptance = "rust"
-minimum_tests = 1
-
-[[suite]]
 id = "strict-policy-benchmark"
 owner = "policy-engine"
 profile = "performance-kernel"
@@ -2215,7 +2141,7 @@ test_services = []
 series = ["RQ5-E", "RQ5"]
 scope = "integration"
 boundary = "live TOCTOU campaign prerequisite gate: approved deployment, signed identity and durable convergence are required; offline contract asserts no dispatch without them"
-sources = ["test-harness/src/remaining_contracts.rs", "bench/loadgen/scripts/toctou_race.py"]
+sources = ["test-harness/src/remaining_contracts.rs", "bench/loadgen/src/main.rs", "bench/loadgen/src/measurement.rs"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "remaining_contracts::tests::rq5_toctou_requires_live_prerequisites", "--", "--exact", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -2412,10 +2338,10 @@ id = "tdsc-performance-helper-contracts"
 owner = "test-harness"
 profile = "offline-validation"
 test_services = []
-series = ["PERF"]
+series = ["PERF", "RQ5"]
 scope = "component"
-boundary = "Rust offline equivalents for TDSC performance helper classifications, parser/schema/statistics; no HTTP, Docker, database, deployment or campaign evidence"
-sources = ["test-harness/src/tdsc_performance.rs", "experiments/tdsc/protocol-runner/test_run_performance.py", "experiments/tdsc/protocol-runner/run-performance.py"]
+boundary = "Native statistics/parser assertions retained from the historical TDSC migration inventory; the removed Python runner and Redis deployment are not restored or executed"
+sources = ["test-harness/src/tdsc_performance.rs"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "tdsc_performance::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 10
@@ -2492,7 +2418,7 @@ test_services = []
 series = ["PERF", "RQ1", "RQ4", "RQ5", "E1", "M5"]
 scope = "live-campaign"
 boundary = "native signed-HTTP campaign prerequisite gate: approved deployment, signed identity, readiness and durable publication evidence are required; offline contract only"
-sources = ["test-harness/src/remaining_contracts.rs", "bench/loadgen/scripts/bench_matrix.sh", "astral-single-node/src"]
+sources = ["test-harness/src/remaining_contracts.rs", "bench/loadgen/src", "astral-single-node/src"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "remaining_contracts::tests::native_http_campaign_requires_live_prerequisites", "--", "--exact", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -2507,7 +2433,7 @@ test_services = []
 series = ["E1", "E3", "E4", "M4", "M5"]
 scope = "live-campaign"
 boundary = "native live fault campaign prerequisite gate: approved deployment, injected controller and signed identity are required; offline contract only"
-sources = ["test-harness/src/remaining_contracts.rs", "Docs/authorization-validation/tools/e4_fault_driver.py"]
+sources = ["test-harness/src/remaining_contracts.rs"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "remaining_contracts::tests::native_live_fault_campaign_requires_live_prerequisites", "--", "--exact", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
@@ -2603,33 +2529,3 @@ acceptance = "rust"
 minimum_tests = 1
 expected_tests = 1
 timeout_seconds = 600
-
-[[suite]]
-id = "archived-cache-contracts"
-owner = "astral-cache"
-profile = "offline-validation"
-test_services = []
-series = ["COMPAT", "EXCLUDED"]
-scope = "component"
-boundary = "standalone archived astral-cache crate verification: 5 library tests plus 16 key/scope/idempotency/TTL integration tests run from the archive manifest; the crate remains outside the root workspace and is not reintroduced as a native dependency or profile service"
-sources = ["astral-cache/Cargo.toml", "astral-cache/src/lib.rs", "astral-cache/src/idempotent.rs", "astral-cache/src/cache_repository.rs", "astral-cache/tests/redis_key_scope_tests.rs"]
-argv = ["cargo", "test", "--manifest-path", "astral-cache/Cargo.toml", "--locked", "--offline", "--", "--test-threads=1"]
-acceptance = "rust"
-minimum_tests = 21
-expected_tests = 21
-timeout_seconds = 600
-
-[[suite]]
-id = "policy-engine-legacy-tests"
-owner = "policy-engine"
-profile = "native-kernel"
-test_services = []
-series = ["COMPAT", "CORE"]
-scope = "component"
-boundary = "legacy L1/L2/fallback/CARD_ONLY/projection-gate semantics behind the explicit legacy-tests feature (53 gated test blocks); documented opt-in design, dispatched here so legacy regressions still redden a suite; not evidence for the current strict published-evidence path"
-sources = ["policy-engine/src/engine/tests.rs", "policy-engine/Cargo.toml"]
-argv = ["cargo", "test", "-p", "policy-engine", "--locked", "--features", "legacy-tests", "--lib", "--", "--test-threads=1"]
-acceptance = "rust"
-minimum_tests = 294
-expected_tests = 294
-timeout_seconds = 900

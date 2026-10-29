@@ -2,7 +2,7 @@
 
 use sqlx::MySqlPool;
 
-use crate::{GrantRepositoryError, ProjectionExecutionMode};
+use crate::GrantRepositoryError;
 
 const COLUMN_SQL: &str = "SELECT CAST(LOWER(COLUMN_TYPE) AS BINARY), \
     CAST(IS_NULLABLE AS BINARY), CAST(COLUMN_DEFAULT AS BINARY) \
@@ -191,27 +191,25 @@ pub async fn validate_projection_owned_schema(
         return Err(schema_error("schema_lane_invariant_violation"));
     }
 
-    if super::projection_execution_mode() == ProjectionExecutionMode::WorkerOwned {
-        let legacy_execution: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM authorization_projection_partition_lease \
-             WHERE execution_epoch = 0 AND lease_expires_at > UTC_TIMESTAMP(6) \
-             UNION ALL SELECT 1 FROM authorization_delta_event e \
-             WHERE e.status = 'LEASED' AND NOT EXISTS \
-               (SELECT 1 FROM authorization_projection_partition_lease l \
-                WHERE l.tenant_id = e.tenant_id \
-                  AND CAST(l.aggregate_type AS BINARY) = CAST(e.aggregate_type AS BINARY) \
-                  AND l.aggregate_id = e.aggregate_id AND l.execution_epoch > 0 \
-                  AND l.active_delta_event_id = e.delta_event_id \
-                  AND l.active_delta_token_hash = e.lease_token_hash \
-                  AND CAST(l.lease_owner AS BINARY) = CAST(e.lease_owner AS BINARY)) LIMIT 1",
-        )
-        .fetch_optional(pool)
-        .await?;
-        if legacy_execution.is_some() {
-            return Err(schema_error(
-                "legacy_execution_requires_drain_and_reconciliation",
-            ));
-        }
+    let unowned_execution: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM authorization_projection_partition_lease \
+         WHERE execution_epoch = 0 AND lease_expires_at > UTC_TIMESTAMP(6) \
+         UNION ALL SELECT 1 FROM authorization_delta_event e \
+         WHERE e.status = 'LEASED' AND NOT EXISTS \
+           (SELECT 1 FROM authorization_projection_partition_lease l \
+            WHERE l.tenant_id = e.tenant_id \
+              AND CAST(l.aggregate_type AS BINARY) = CAST(e.aggregate_type AS BINARY) \
+              AND l.aggregate_id = e.aggregate_id AND l.execution_epoch > 0 \
+              AND l.active_delta_event_id = e.delta_event_id \
+              AND l.active_delta_token_hash = e.lease_token_hash \
+              AND CAST(l.lease_owner AS BINARY) = CAST(e.lease_owner AS BINARY)) LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if unowned_execution.is_some() {
+        return Err(schema_error(
+            "unowned_execution_requires_drain_and_reconciliation",
+        ));
     }
     Ok(())
 }

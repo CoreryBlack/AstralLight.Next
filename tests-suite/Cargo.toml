@@ -34,22 +34,9 @@ hmac = { workspace = true }
 moka = { workspace = true }
 lapin = { workspace = true }
 futures-util = "0.3"
-redis = { workspace = true, optional = true }
 
 [features]
 default = ["astral-db/test-support"]
-# Java/Rust oracle compatibility target; never part of the native default gate.
-compat-oracle = []
-# 按需兼容验证入口:cargo test -p testsuite --features redis-compat
-redis-compat = [
-    "dep:redis",
-    "astral-db/redis-compat",
-    "astral-common/redis-compat",
-    "astral-gateway/redis-compat",
-    "astral-identity/redis-compat",
-    "astral-trustgraph/redis-compat",
-    "astral-mq/redis-compat",
-]
 
 # Cargo 不会自动发现 series/<系列>/ 下的测试文件,全部目标显式登记。
 [[test]]
@@ -87,10 +74,6 @@ path = "series/E4/premise_hub_invalidation.rs"
 [[test]]
 name = "premise_identity_mapping"
 path = "series/E4/premise_identity_mapping.rs"
-
-[[test]]
-name = "premise_redis_free_composite"
-path = "series/E4/premise_redis_free_composite.rs"
 
 [[test]]
 name = "premise_single_writer_lease"
@@ -175,13 +158,3 @@ path = "series/RQ4/partition_lease_integration.rs"
 [[test]]
 name = "authorization_compiler_alloc"
 path = "series/PERF/authorization_compiler_alloc.rs"
-
-[[test]]
-name = "evidence_cache_redis_integration"
-path = "series/COMPAT/evidence_cache_redis_integration.rs"
-required-features = ["redis-compat"]
-
-[[test]]
-name = "oracle_tests"
-path = "series/COMPAT/oracle_tests.rs"
-required-features = ["compat-oracle"]

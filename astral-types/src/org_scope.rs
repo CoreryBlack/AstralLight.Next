@@ -1294,6 +1294,12 @@ impl OrgPublication {
             "publication.compiler_version",
             MAX_ORG_ID_TEXT_LEN,
         )?;
+        if self.compiler_version != crate::AUTHORIZATION_ORG_COMPILER_VERSION {
+            return Err(OrgError::new(
+                OrgErrorCode::InvalidField,
+                "publication compiler version is not the current authorization edition",
+            ));
+        }
         org_validate_operation_id(&self.operation_id, "publication.operation_id")?;
         if self.dependencies.len() > MAX_ORG_DEPENDENCIES {
             return Err(OrgError::new(
@@ -2618,7 +2624,7 @@ mod tests {
             revoke_fence,
             dependencies,
             manifest_digest_hex: String::new(),
-            compiler_version: "org-compiler-v1".to_owned(),
+            compiler_version: crate::AUTHORIZATION_ORG_COMPILER_VERSION.to_owned(),
             segments,
             operation_id: operation_id.to_owned(),
         };
@@ -2658,7 +2664,7 @@ mod tests {
             revoke_fence: 1,
             dependencies: Vec::new(),
             manifest_digest_hex: String::new(),
-            compiler_version: "org-compiler-v1".to_owned(),
+            compiler_version: crate::AUTHORIZATION_ORG_COMPILER_VERSION.to_owned(),
             segments: vec![segment],
             operation_id: "op-publish-1".to_owned(),
         };
@@ -2677,6 +2683,36 @@ mod tests {
         OrgPublication {
             manifest_digest_hex: digest,
             ..publication
+        }
+    }
+
+    #[test]
+    fn publication_rejects_other_compiler_editions_even_with_recomputed_digest() {
+        let compilers = (1..=crate::AUTHORIZATION_EDITION + 1)
+            .filter(|edition| *edition != crate::AUTHORIZATION_EDITION)
+            .map(|edition| format!("astral-org-authorization-v{edition}"))
+            .chain(std::iter::once("foreign-org-compiler".to_owned()));
+        for compiler in compilers {
+            let mut publication = single_segment_publication();
+            publication.compiler_version = compiler;
+            publication.manifest_digest_hex = org_manifest_digest_hex(&OrgManifestDigestMaterial {
+                tenant_id: publication.tenant_id,
+                root_tenant_id: publication.root_tenant_id,
+                generation: publication.generation,
+                relationship_revision: publication.relationship_revision,
+                revoke_fence: publication.revoke_fence,
+                dependencies: &publication.dependencies,
+                segments: &publication.segments,
+                compiler_version: &publication.compiler_version,
+                operation_id: &publication.operation_id,
+            })
+            .unwrap();
+            assert_eq!(
+                publication.validate().unwrap_err().code,
+                OrgErrorCode::InvalidField,
+                "compiler {} must not be admitted",
+                publication.compiler_version,
+            );
         }
     }
 

@@ -1,14 +1,12 @@
 # AstralLight Rust isolated test environment.
-# Default profile: MySQL only (single-node Redis-free path).
-# Optional profiles: rabbit, redis-compat.
+# Default profile: MySQL only (single-node native path).
+# Optional profile: rabbit.
 #
 # Default start:
 #   MYSQL_ROOT_PASSWORD=... DATABASE_URL=... \
 #     docker compose -f docker-compose.test.yml up -d --wait
 # Rabbit transport:
 #   docker compose --profile rabbit -f docker-compose.test.yml up -d --wait
-# Redis compatibility:
-#   docker compose --profile redis-compat -f docker-compose.test.yml up -d --wait
 
 services:
   mysql:
@@ -31,19 +29,6 @@ services:
       - ./Docs/sql/full_schema_v4.sql:/docker-entrypoint-initdb.d/00-platform-v4.sql:ro
       # The adopted Java-era history includes MFA, absent from the v4 dump.
       - ./astral-db/migrations/20240630000012_user_mfa.sql:/docker-entrypoint-initdb.d/01-mfa-baseline.sql:ro
-
-  redis:
-    profiles: ["redis-compat"]
-    image: redis:7
-    ports:
-      - "127.0.0.1:6380:6379"
-    tmpfs:
-      - /data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
 
   rabbitmq:
     profiles: ["rabbit"]

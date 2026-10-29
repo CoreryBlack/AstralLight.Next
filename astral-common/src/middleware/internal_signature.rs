@@ -135,8 +135,8 @@ pub fn timestamp_is_within_tolerance(timestamp: &str, tolerance_secs: i64, now_m
     tolerance_ms > 0 && (now_ms - timestamp_ms).abs() <= tolerance_ms
 }
 
-/// Derive a bounded Redis replay key from protocol/request context. The marker
-/// contains no token or secret material and namespaces each hop.
+/// Derive a bounded durable replay-guard key from protocol/request context. The
+/// key contains no token or secret material and namespaces each hop.
 pub fn replay_key(namespace: &str, input: &InternalSignatureInput<'_>) -> String {
     let context = format!(
         "{}|{}|{}|{}|{}|{}|{}|{}",

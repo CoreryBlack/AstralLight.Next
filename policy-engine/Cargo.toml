@@ -32,9 +32,6 @@ criterion = { workspace = true }
 divan = { workspace = true }
 
 [features]
-# Legacy/test-only engine paths (L1/L2/fallback/CARD_ONLY). Native tests use
-# strict published evidence; enable explicitly to run compatibility coverage.
-legacy-tests = []
 iai = ["dep:iai-callgrind"]
 e1-observability = ["dep:uuid"]
 

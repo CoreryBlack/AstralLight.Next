@@ -10,20 +10,14 @@ use astral_types::AstralError;
 use crate::repository::user_card_repository::{
     DeleteCascadeResult, NewUserCard, UserCardPatch, UserCardRecord, UserCardRepository,
 };
-use crate::service::side_effect::PermissionSideEffects;
-
 /// UserCardService
 pub struct UserCardService {
     repo: Arc<dyn UserCardRepository>,
-    side_effects: Arc<dyn PermissionSideEffects>,
 }
 
 impl UserCardService {
-    pub fn new(
-        repo: Arc<dyn UserCardRepository>,
-        side_effects: Arc<dyn PermissionSideEffects>,
-    ) -> Self {
-        Self { repo, side_effects }
+    pub fn new(repo: Arc<dyn UserCardRepository>) -> Self {
+        Self { repo }
     }
 
     /// 创建卡（含模板规则集绑定）→ 落 durable 投影事件，返回卡
@@ -49,14 +43,14 @@ impl UserCardService {
         self.repo.update_card(card_id, patch).await?;
         // Repository 已将 source mutation 与 projection append 放入同一事务。
         // 这里仅清理运行时状态缓存，不再重复追加 head/outbox 事件。
-        self.side_effects.evict_card_cache(card_id).await;
+        astral_db::evict_l1_card_active_cache(card_id);
         Ok(())
     }
 
     /// 删除卡（级联事务）→ post-commit evict 缓存 + 落 durable 投影事件（对齐 Java evictCardCache）
     pub async fn delete_card(&self, card_id: i64) -> Result<DeleteCascadeResult, AstralError> {
         let result = self.repo.delete_with_cascade(card_id).await?;
-        self.side_effects.evict_card_cache(card_id).await;
+        astral_db::evict_l1_card_active_cache(card_id);
         tracing::warn!(
             card_id,
             permission_rule_deleted = result.permission_rule_deleted,

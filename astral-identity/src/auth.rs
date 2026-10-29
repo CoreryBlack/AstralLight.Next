@@ -1,4 +1,4 @@
-//! 认证核心：密码验证（含 BCrypt/MD5 兼容迁移）+ JWT 签发 + 工具函数
+//! 认证核心：Argon2id 密码验证 + JWT 签发 + 工具函数
 //!
 //! 对应 Java `AuthServiceImpl` + `TokenServiceImpl` + `PasswordValidationServiceImpl`。
 //!
@@ -11,7 +11,6 @@
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use md5::Md5;
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -23,57 +22,13 @@ use astral_types::{AstralError, IdentityCard, PolicyError, UserCard};
 
 use crate::srv::source_writer_guard;
 
-/// 密码验证（含自动迁移：Argon2 → BCrypt → MD5）
-///
-/// 对齐 Java `PasswordValidationServiceImpl.verifyAndMigrate()`。
-/// - 如果 hash 是 Argon2 格式，直接验证
-/// - 如果是 BCrypt 格式，验证后自动迁移到 Argon2
-/// - 如果是 MD5（32 hex），验证后自动迁移到 Argon2
-///
-/// 返回 `Ok(true)` 表示验证成功且无需迁移。
-/// 返回 `Ok((new_hash))` 表示验证成功但已迁移到新 hash（调用方需 UPDATE）。
-/// 返回 `Err` 表示验证失败。
-pub fn verify_password(
-    password: &str,
-    hash_str: &str,
-) -> Result<PasswordVerifyResult, AstralError> {
-    // 检测算法并验证
-    if hash_str.starts_with("$argon2") {
-        // Argon2 — 当前标准
-        verify_argon2(password, hash_str).map(|_| PasswordVerifyResult::Match)
-    } else if hash_str.starts_with("$2") {
-        // BCrypt — 遗留算法
-        let matched = verify_bcrypt(password, hash_str)?;
-        if matched {
-            let new_hash = hash_password(password)?;
-            Ok(PasswordVerifyResult::Migrated(new_hash))
-        } else {
-            // BCrypt 不匹配时，尝试 Argon2 回退（对齐 Java 容错逻辑）
-            verify_argon2(password, hash_str).map(|_| PasswordVerifyResult::Match)
-        }
-    } else if hash_str.len() == 32 && hash_str.chars().all(|c| c.is_ascii_hexdigit()) {
-        // MD5 hex — 遗留算法
-        let md5_hash = format!("{:x}", Md5::digest(password.as_bytes()));
-        if md5_hash == hash_str.to_lowercase() {
-            let new_hash = hash_password(password)?;
-            Ok(PasswordVerifyResult::Migrated(new_hash))
-        } else {
-            Err(AstralError::Auth("Invalid password".into()))
-        }
-    } else if hash_str.contains("PLACEHOLDER") || hash_str.contains("NEED_RESET") {
-        Err(AstralError::Auth("Password reset required".into()))
-    } else {
-        // 默认为 Argon2 尝试
-        verify_argon2(password, hash_str).map(|_| PasswordVerifyResult::Match)
+/// Verify only current Argon2id credentials. Legacy or unknown formats must be
+/// reset explicitly; successful login never migrates an old verifier in place.
+pub fn verify_password(password: &str, hash_str: &str) -> Result<(), AstralError> {
+    if !hash_str.starts_with("$argon2id$") {
+        return Err(AstralError::Auth("Password reset required".into()));
     }
-}
-
-/// 密码验证结果
-pub enum PasswordVerifyResult {
-    /// 验证通过，hash 已是最新
-    Match,
-    /// 验证通过，但已迁移到新 hash（含 Argon2 hash 字符串）
-    Migrated(String),
+    verify_argon2(password, hash_str)
 }
 
 /// Argon2 验证
@@ -85,15 +40,6 @@ fn verify_argon2(password: &str, hash_str: &str) -> Result<(), AstralError> {
     argon2
         .verify_password(password.as_bytes(), &parsed_hash)
         .map_err(|_| AstralError::Auth("Invalid password".into()))
-}
-
-/// BCrypt 验证
-fn verify_bcrypt(password: &str, hash_str: &str) -> Result<bool, AstralError> {
-    match bcrypt::verify(password, hash_str) {
-        Ok(true) => Ok(true),
-        Ok(false) => Ok(false),
-        Err(_) => Ok(false), // 格式错误当作不匹配，不阻塞认证
-    }
 }
 
 /// 密码哈希（Argon2id，对齐 Java 参数：m=16MB, t=1, p=4, output=32）
@@ -133,16 +79,10 @@ pub struct LoginResponse {
     pub expires_in_millis: i64,
     /// refresh token 有效时长（毫秒）
     pub refresh_expires_in_millis: i64,
-    /// 别名字段：token = accessToken（对齐 Java getToken()）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
     /// 用户信息（对齐 Java AuthResponse.user）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<serde_json::Value>,
-    /// Java serializes this alias alongside currentCard through setCurrentCard().
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identity_card: Option<serde_json::Value>,
-    /// 当前身份卡上下文（对齐 Java AuthResponse.currentCard / identityCard）
+    /// 当前授权卡上下文（规范响应字段 `currentCard`）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_card: Option<serde_json::Value>,
     /// 可用卡片列表（对齐 Java AuthResponse.availableCards）
@@ -162,11 +102,10 @@ pub struct LoginResponse {
     pub session: Option<serde_json::Value>,
 }
 
-/// Claims supplements evaluated at issuance time. They are allowed only on
-/// ACCESS tokens and are never copied to REFRESH tokens.
+/// Display metadata included in ACCESS token v2 claims. Refresh tokens receive
+/// no identity or authorization metadata.
 pub struct TokenClaimsExtra {
     pub roles: Vec<String>,
-    pub permissions: Option<Vec<String>>,
     pub tenant_status: Option<String>,
 }
 
@@ -231,6 +170,8 @@ pub fn issue_access_token(
         template_id: card.template_id,
         structure_node_id: None,
         tenant_status: extra.and_then(|value| value.tenant_status.clone()),
+        // Keep the deprecated v2 slot absent; permissions are response-only and
+        // never become an authorization input from this token.
         permissions: None,
         sid: Some(session.session_id),
         session_version: Some(session.session_version),
@@ -807,8 +748,7 @@ mod tests {
     fn test_password_hash_and_verify() {
         let password = "test".repeat(8);
         let hash = hash_password(&password).unwrap();
-        let result = verify_password(&password, &hash).unwrap();
-        assert!(matches!(result, PasswordVerifyResult::Match));
+        verify_password(&password, &hash).unwrap();
     }
 
     #[test]
@@ -816,6 +756,21 @@ mod tests {
         let hash = hash_password("correct").unwrap();
         let result = verify_password("wrong", &hash);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn legacy_and_unknown_password_hashes_require_reset() {
+        for legacy_hash in [
+            "$2b$12$invalid-bcrypt-hash".to_owned(),
+            format!("{:032x}", 42),
+            "PLACEHOLDER".to_owned(),
+            "unknown-hash-format".to_owned(),
+        ] {
+            assert!(matches!(
+                verify_password("candidate", &legacy_hash),
+                Err(AstralError::Auth(message)) if message == "Password reset required"
+            ));
+        }
     }
 
     #[test]
@@ -1032,7 +987,6 @@ mod tests {
         };
         let extra = TokenClaimsExtra {
             roles: vec!["learn_subject:read".into()],
-            permissions: Some(vec!["learn_subject:read".into()]),
             tenant_status: Some("ACTIVE".into()),
         };
         let result = issue_access_token(

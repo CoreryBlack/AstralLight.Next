@@ -1,13 +1,14 @@
 # Python unittest 到 Rust 原生测试逐方法 crosswalk
 
-> 状态：迁移审查账本（2026-10-24）。此表登记 25 个 unittest 模块的 622 个 `test_*` 方法及当前可执行 Rust 行为合同。它不将相似 suite、测试数量、source 登记或 helper/fake 测试当作真实集成证据。Python unittest/归档 Python 测试不运行；Rust 等价仅在对应 MANIFEST suite 的离线/本机约束下成立。每项均逐一列出来源方法、目标 Rust 文件/测试名和证据状态。`EQUIVALENT` 仅指列出的离线行为断言等价；`PARTIAL` 指存在相邻合同但仍有未覆盖关键断言；`BLOCKED` 指断言要求真实 runner、进程池、网络、外部服务或部署，当前不作离线等价声明。
+> 状态：迁移审查账本（2026-10-24 建立，CURRENT V6 删除任务同步）。此表保留 25 个历史 unittest 模块的 622 个 `test_*` 方法来源，并登记保留的 Rust 行为合同或明确退役的能力。Python unittest/归档 Python 测试不运行。`EQUIVALENT` 仅指列出的离线行为断言等价；`PARTIAL` 指仍有关键断言差异；`BLOCKED` 指依赖或执行证据缺失；`RETIRED` 指 CURRENT V6 已物理删除原正向能力，所列 Rust 目标仅验证替代入口或拒绝旧配置，不计等价覆盖，也不表示测试 PASS。
 
 ## 总体结论
 
-- Python unittest 库存：25 模块、622 方法；Rust 登记包含 campaign 33、E5 单模型16、E5 CLI 4、Criterion/Divan acceptance 8、evaluate acceptance 10、TDSC helper 10、S15 helper 6 项等精确 suite。E5 crosswalk 共 52 个方法行；E1 frozen-result contract 含 1 项、E1 runner offline contract 含 14 项、E1 durable reconciliation contract 含 20 项、E1 live runner native 含 5 项、E3 config contract 含 8 项、E3 report suite含 16 项、E3 runner offline contract 含 11 项、E3 campaign offline contract 含 15 项、E3 runner native parity 含 10 项、E4 fault driver offline contract 含 10 项、E4 fake-controller native parity 含 28 项、node adapter offline contract 含 22 项、node adapter probe 含 5 项、E3/E4 read-only probe 含 4 项、legacy campaign report 含 4 项、experiment common offline contract 含 26 项、bounded worker-shard 含 2 项、E5 universal release 含 1 项、two-model confirmation release 含 1 项、remaining gate/static contracts 含 15 项，E4 protocol suite含 7 项、E4 lifecycle suite含 11 项。
-- 当前逐方法状态计数为 **621 EQUIVALENT、1 PARTIAL、0 BLOCKED**，合计 622。PARTIAL 仅 `test_actor_switching_roles_and_cards`（runner 级角色/卡片绑定传递验证未接线，静态清单已核对）。全部 622 个归档 Python 方法均有命名的 Rust 测试目标；`EQUIVALENT` 仅指对应离线/注入输入合同，live 部署与真实三节点 campaign 仍是独立的运行证据缺口。
-- `test_test_campaign.py` 67 项已在下表逐项映射；其中 fake、本机受限子进程合同不构成真实依赖或 campaign 证据。
-- 手工 OPA 实验脚本、pipeline 扫描脚本、旧 Python campaign runner 实现不是 unittest 模块，不计入 25/622。旧 runner 规格/解析行为由 `scripts/tests/test_test_campaign.py` 的方法覆盖；OPA/pipeline 仅为工具/实验材料，不作为测试 gate。
+- 历史 Python unittest 库存为 25 模块、622 方法，来源方法与分区保持不变。2026-10-24 的审查曾登记 621 EQUIVALENT、1 PARTIAL；该历史计数不再代表 CURRENT V6 的覆盖结论。CURRENT V6 当前清单为 599 EQUIVALENT、9 PARTIAL、0 BLOCKED、14 RETIRED，合计 622；各行状态以本表为准，执行数量和结果以对应 Cargo 日志与唯一任务证据为准。
+- Redis profile、Redis adapter/command、执行协议 selector 和 Python 日志过滤器的正向合同已经退役；拒绝旧配置、SQL 只读、原生有界日志采集/过滤/脱敏及 UNKNOWN 状态保留为当前 Rust 断言。旧能力删除不计为等价迁移。
+- `test_actor_switching_roles_and_cards` 仍为 PARTIAL；fake、受限本机子进程及 parser/reducer 断言均不证明真实依赖、HTTP campaign 或三节点部署通过。
+- 已删除的 `experiments/tdsc/protocol-runner/test_run_performance.py` 以基线 `62b434937270352d54ea70c9be7081d616099b24` 的 Git blob `53839fda51d4fe8888da598810b7e75ffb5b18a7` 固定十个历史方法名；库存由 Rust guard 保存，当前独立统计 parser 测试只运行 `tdsc_performance.rs`，不恢复旧 runner。
+- 手工 OPA 实验脚本、pipeline 扫描脚本、旧 Python campaign runner 实现不是 unittest 模块，不计入 25/622。OPA/pipeline 仅为工具/历史实验材料，不作为现行系统验收入口。
 
 <!-- python-source: scripts/tests/test_test_campaign.py -->
 ## `scripts/tests/test_test_campaign.py`（67 方法）
@@ -26,14 +27,14 @@
 | `test_unknown_selection_fails` | `selection_uses_registered_profiles_and_series_families` | EQUIVALENT：未知 profile/series/suite 拒绝。 |
 | `test_empty_selection_fails` | `selection_uses_registered_profiles_and_series_families` | EQUIVALENT：空选择拒绝。 |
 | `test_test_services_equal_their_production_profile` | `selection_uses_registered_profiles_and_series_families`; `manifest_entries_are_scoped_and_blocked_entries_are_not_dispatched` | EQUIVALENT：服务拓扑一致。 |
-| `test_service_contract_matches_offline_fault_profiles` | `dependency_profiles.rs::tests::all_profiles_pin_exact_services_dependencies_and_fault_membership`; `every_fault_dependency_and_matrix_entry_is_explicit`; `unknown_profiles_and_redis_compat_faults_fail_closed` | EQUIVALENT：离线注册表/profile 矩阵；不证明 live fault。 |
+| `test_service_contract_matches_offline_fault_profiles` | `dependency_profiles.rs::tests::all_profiles_pin_exact_services_dependencies_and_fault_membership`; `every_fault_dependency_and_matrix_entry_is_explicit`; `unknown_profiles_and_retired_redis_faults_fail_closed` | EQUIVALENT：离线注册表/profile 矩阵；不证明 live fault。 |
 | `test_blocked_campaign_cannot_dispatch_legacy_command` | `manifest_entries_are_scoped_and_blocked_entries_are_not_dispatched` | EQUIVALENT：blocked entry argv 必为空。 |
 | `test_missing_mt_e2_is_explicit` | `selection_uses_registered_profiles_and_series_families` | EQUIVALENT：单项存在并保持 blocked。 |
-| `test_kernel_removes_all_live_credentials` | `campaign.rs::tests::native_environment_clears_live_credentials` | EQUIVALENT：离线 profile 清理 live env，设置 local/default compatibility flags。 |
-| `test_projection_execution_mode_is_selected_by_suite_not_parent` | `campaign.rs::tests::native_profiles_select_only_declared_services_and_suite_mode` | EQUIVALENT：parent mode 不可信，suite allowlist 生效。 |
-| `test_native_uses_only_mysql` | `campaign.rs::tests::native_profiles_select_only_declared_services_and_suite_mode`; `preflight_requires_an_exact_isolated_database_and_loopback_service` | EQUIVALENT：service selection 和 MySQL 配置。 |
-| `test_rabbit_uses_mysql_and_explicit_vhost_only` | `campaign.rs::tests::native_profiles_select_only_declared_services_and_suite_mode` | EQUIVALENT：Rabbit profile 与显式 vhost。 |
-| `test_redis_is_explicit_compat_only` | `campaign.rs::tests::native_profiles_select_only_declared_services_and_suite_mode`; `dependency_profiles.rs::tests::unknown_profiles_and_redis_compat_faults_fail_closed` | EQUIVALENT：Redis 只在兼容 profile 启用。 |
+| `test_kernel_removes_all_live_credentials` | `campaign.rs::tests::native_environment_clears_live_credentials` | EQUIVALENT：离线 profile 清理 live env 并固定本地传输，移除继承的退役 selector。 |
+| `test_projection_execution_mode_is_selected_by_suite_not_parent` | `campaign.rs::tests::native_profiles_select_only_declared_services_and_scrub_retired_selectors` | RETIRED：执行协议 selector 已删除；当前只有 WorkerOwned，Rust 断言仅验证继承 selector 被清除。 |
+| `test_native_uses_only_mysql` | `campaign.rs::tests::native_profiles_select_only_declared_services_and_scrub_retired_selectors`; `preflight_requires_an_exact_isolated_database_and_loopback_service` | EQUIVALENT：service selection 和 MySQL 配置。 |
+| `test_rabbit_uses_mysql_and_explicit_vhost_only` | `campaign.rs::tests::native_profiles_select_only_declared_services_and_scrub_retired_selectors` | EQUIVALENT：Rabbit profile 与显式 vhost。 |
+| `test_redis_is_explicit_compat_only` | `campaign.rs::tests::native_profiles_select_only_declared_services_and_scrub_retired_selectors`; `dependency_profiles.rs::tests::unknown_profiles_and_retired_redis_faults_fail_closed` | RETIRED：Redis profile 已删除；替代断言拒绝退役 profile 并清除继承变量，不再启用 Redis。 |
 | `test_absent_live_prerequisite_is_blocked` | `campaign.rs::tests::preflight_requires_an_exact_isolated_database_and_loopback_service`; `campaign/run_tests.rs::tests::run_selected_collection_preflight_blocks_every_suite_for_missing_database` | EQUIVALENT：blocked preflight 全量 fail-before-dispatch。 |
 | `test_nonisolated_database_and_extra_options_are_rejected` | `campaign.rs::tests::preflight_requires_an_exact_isolated_database_and_loopback_service` | EQUIVALENT：host/库名/端口/query fail-closed；Rust 额外也检查 fragment。 |
 | `test_run_scoped_database_requires_exact_name_environment` | `campaign.rs::tests::preflight_requires_an_exact_isolated_database_and_loopback_service` | EQUIVALENT：run-scoped 名称前缀、匹配及格式。 |
@@ -44,7 +45,7 @@
 | `test_exact_assertion_count_is_required` | `acceptance.rs::tests::rust_summary_requires_nonempty_exact_and_unskipped_assertions` | EQUIVALENT：exact/minimum test counts。 |
 | `test_cargo_ignored_not_hidden_by_exit_zero` | `acceptance.rs::tests::rust_summary_requires_nonempty_exact_and_unskipped_assertions` | EQUIVALENT：ignored 保留 SKIP/count。 |
 | `test_internal_skip_preserves_assertion_counts` | `acceptance.rs::tests::rust_summary_requires_nonempty_exact_and_unskipped_assertions`; `campaign.rs::tests::classify_output_requires_complete_evaluate_and_divan_evidence` | EQUIVALENT：internal SKIP 优先且保留 Rust summary counts。 |
-| `test_python_requires_nonempty_ok_summary` | `campaign.rs::tests::unittest_acceptance_requires_a_nonempty_ok_summary_and_preserves_skips` | EQUIVALENT：summary/OK/minimum/skipped/failure/interruption。 |
+| `test_python_requires_nonempty_ok_summary` | `campaign.rs::tests::retired_unittest_acceptance_never_mints_pass_from_python_output` | RETIRED：Python unittest summary 验收器已删除；替代断言保证旧 summary 不能生成 PASS。 |
 | `test_expected_model_counterexample_is_not_whole_failure` | `campaign.rs::tests::model_dependency_and_required_output_acceptance_keep_contract_boundaries`; `model_acceptance.rs::tests::full_contract_checks_identity_modes_counts_status_and_omissions` | EQUIVALENT：预期 omission/counterexample 不等于 full-contract FAIL。 |
 | `test_incomplete_and_missing_model_modes_not_pass` | `campaign.rs::tests::model_dependency_and_required_output_acceptance_keep_contract_boundaries`; `model_acceptance.rs::tests::accepts_both_full_contract_wire_shapes_and_rejects_missing_modes` | EQUIVALENT：缺模式 UNKNOWN。 |
 | `test_model_violation_and_inconsistent_contract_fail` | `campaign.rs::tests::model_dependency_and_required_output_acceptance_keep_contract_boundaries`; `model_acceptance.rs::tests::full_contract_checks_identity_modes_counts_status_and_omissions` | EQUIVALENT：违规和不一致 FAIL；identity/count 检查。 |
@@ -200,11 +201,11 @@
 | Python 方法 | Rust 映射 | 状态 |
 |---|---|---|
 | `test_profile_contract_validates` | `dependency_profiles.rs::tests::all_profiles_pin_exact_services_dependencies_and_fault_membership` | EQUIVALENT |
-| `test_canonical_profile_ids_and_services` | `dependency_profiles.rs::tests::all_profiles_pin_exact_services_dependencies_and_fault_membership` | EQUIVALENT |
-| `test_default_native_profile_has_no_redis_or_rabbit` | `dependency_profiles.rs::tests::all_profiles_pin_exact_services_dependencies_and_fault_membership`; `unknown_profiles_and_redis_compat_faults_fail_closed` | EQUIVALENT |
+| `test_canonical_profile_ids_and_services` | `dependency_profiles.rs::tests::all_profiles_pin_exact_services_dependencies_and_fault_membership` | RETIRED：原八 profile 库存包含 Redis 兼容项；当前七个原生 profile 的精确清单由替代断言固定。 |
+| `test_default_native_profile_has_no_redis_or_rabbit` | `dependency_profiles.rs::tests::all_profiles_pin_exact_services_dependencies_and_fault_membership`; `unknown_profiles_and_retired_redis_faults_fail_closed` | EQUIVALENT：默认原生 profile 仅 MySQL。 |
 | `test_native_fault_matrix_is_explicit_and_stable` | `dependency_profiles.rs::tests::every_fault_dependency_and_matrix_entry_is_explicit` | EQUIVALENT |
-| `test_legacy_faults_are_compat_only` | `dependency_profiles.rs::tests::unknown_profiles_and_redis_compat_faults_fail_closed` | EQUIVALENT |
-| `test_unknown_profile_is_rejected` | `dependency_profiles.rs::tests::unknown_profiles_and_redis_compat_faults_fail_closed` | EQUIVALENT |
+| `test_legacy_faults_are_compat_only` | `dependency_profiles.rs::tests::unknown_profiles_and_retired_redis_faults_fail_closed` | RETIRED：旧 Redis faults/profile 已删除，当前断言只证明拒绝它们。 |
+| `test_unknown_profile_is_rejected` | `dependency_profiles.rs::tests::unknown_profiles_and_retired_redis_faults_fail_closed` | EQUIVALENT |
 | `test_each_matrix_is_full_timing_cross_product` | `dependency_profiles.rs::tests::every_fault_dependency_and_matrix_entry_is_explicit` | EQUIVALENT |
 
 <!-- python-source: Docs/authorization-validation/archive/python-tests/test_e1_runner.py -->
@@ -268,10 +269,10 @@
 
 | Python 方法 | Rust target | 状态 |
 |---|---|---|
-| `test_fake_probe_satisfies_read_only_probe` | `e4_preconditions.rs::tests::happy_path_is_select_only_and_reads_only_the_cache_epoch_key` | EQUIVALENT：fake probe 的 read-only port 合同。 |
+| `test_fake_probe_satisfies_read_only_probe` | `e4_preconditions.rs::tests::happy_path_is_select_only_and_unconfigured_cache_epoch_is_skipped` | PARTIAL：当前端口只有 SQL；未配置可选 cache epoch 明确 SKIP，原 Redis probe 合同已删除。 |
 | `test_fake_probe_satisfies_actor_aware_probe` | `node_adapter_contract.rs::tests::role_actor_and_decision_path_keep_exact_card_binding` | EQUIVALENT：actor-aware 输入与 card binding。 |
-| `test_probe_without_redis_does_not_satisfy_protocol` | `e4_preconditions.rs::tests::cache_epoch_absence_errors_capability_and_sql_source_are_distinct` | EQUIVALENT：缺少 Redis 能力不能伪造满足。 |
-| `test_redis_verb_allowlist_is_read_only` | `node_adapter_contract.rs::tests::redis_allowlist_arity_and_key_validation_precede_command_creation` | EQUIVALENT：Redis 只读 allowlist/arity/key。 |
+| `test_probe_without_redis_does_not_satisfy_protocol` | `e4_preconditions.rs::tests::cache_epoch_is_optional_sql_evidence_and_never_fabricated` | RETIRED：Redis capability 已删除；当前只读可选 SQL 证据未配置为 SKIP，无伪造 epoch。 |
+| `test_redis_verb_allowlist_is_read_only` | `node_adapter_contract.rs::tests::retired_redis_fields_are_rejected_without_affecting_sql_or_metadata` | RETIRED：Redis command API 已物理删除；替代断言只拒绝旧配置。 |
 | `test_accepts_select_statements` | `node_adapter_contract.rs::tests::sql_guard_and_fixed_argv_are_read_only_and_secret_stays_off_argv` | EQUIVALENT：只读 SELECT。 |
 | `test_rejects_non_select_statements` | `node_adapter_contract.rs::tests::sql_guard_and_fixed_argv_are_read_only_and_secret_stays_off_argv` | EQUIVALENT：mutation statements 拒绝。 |
 | `test_rejects_multiple_statements` | `node_adapter_contract.rs::tests::sql_guard_and_fixed_argv_are_read_only_and_secret_stays_off_argv` | EQUIVALENT：多语句拒绝。 |
@@ -282,8 +283,8 @@
 | `test_empty_and_ambiguous_results_are_unknown` | `e4_preconditions.rs::tests::sql_errors_empty_ambiguous_null_and_unexpected_shapes_stay_unknown` | EQUIVALENT：空/歧义结果 UNKNOWN。 |
 | `test_unrecognized_isolation_is_unknown` | `e4_preconditions.rs::tests::invalid_isolation_and_clock_skew_fail_closed` | EQUIVALENT：未知隔离级别不通过。 |
 | `test_clock_skew_beyond_threshold_fails` | `e4_preconditions.rs::tests::invalid_isolation_and_clock_skew_fail_closed` | EQUIVALENT：时钟偏差超阈值 FAIL。 |
-| `test_fail_outranks_blocked_when_redis_capability_missing` | `e4_preconditions.rs::tests::clock_failure_and_fail_status_outrank_missing_redis_capability` | EQUIVALENT：FAIL 优先于能力缺失。 |
-| `test_cache_epoch_variants` | `e4_preconditions.rs::tests::cache_epoch_absence_errors_capability_and_sql_source_are_distinct` | EQUIVALENT：缓存 epoch 证据来源/缺失状态区分。 |
+| `test_fail_outranks_blocked_when_redis_capability_missing` | `e4_preconditions.rs::tests::clock_failure_and_fail_status_are_not_masked_by_unconfigured_cache_epoch` | PARTIAL：保留 FAIL/UNKNOWN 高于未配置 SKIP 的原生断言，Redis capability/BLOCKED 分支已删除。 |
+| `test_cache_epoch_variants` | `e4_preconditions.rs::tests::cache_epoch_is_optional_sql_evidence_and_never_fabricated` | PARTIAL：仅保留显式 SQL 来源、未配置 SKIP、查询异常 UNKNOWN；Redis GET/缺 key 分支已删除。 |
 | `test_unproven_checks_never_yield_overall_pass` | `e4_preconditions.rs::tests::sql_errors_empty_ambiguous_null_and_unexpected_shapes_stay_unknown` | EQUIVALENT：未证明前置不能 PASS。 |
 | `test_input_validation` | `e4_preconditions.rs::tests::unsafe_inputs_are_rejected_before_any_probe_call` | EQUIVALENT：输入检查先于 probe。 |
 | `test_no_hosts_or_secrets_in_report` | `e4_preconditions.rs::tests::hostnames_urls_node_aliases_and_probe_errors_are_not_retained` | EQUIVALENT：输出不保留 host/secret。 |
@@ -292,7 +293,7 @@
 | `test_snapshot_only_limitations_always_present` | `e3_report.rs::tests::snapshot_report_keeps_evidence_limits_and_snapshot_only_status_note` | EQUIVALENT：offline boundary contract 核对 `NOT_CLAIMED`、snapshot-only status note、per-attempt limitation 及全部固定 SKIP 项；不构造 sampling report 或 runtime samples。 |
 | `test_stop_event_stops_between_samples` | `experiment_common_contract.rs::tests::sampling_stop_event_stops_between_samples` | EQUIVALENT：stop 在样本边界生效，已产生的样本保留且不追加后续样本。 |
 | `test_zero_duration_is_blocked_and_touches_nothing` | `experiment_common_contract.rs::tests::zero_duration_is_blocked_and_touches_nothing` | EQUIVALENT：零时长采样为 BLOCKED 且 probe 计数为 0。 |
-| `test_missing_redis_capability_is_blocked_but_sampling_continues` | `experiment_common_contract.rs::tests::blocked_or_unknown_sample_does_not_abort_sampling` | EQUIVALENT：BLOCKED 样本后继续后续样本，顺序与 probe 计数保留。 |
+| `test_missing_redis_capability_is_blocked_but_sampling_continues` | `experiment_common_contract.rs::tests::blocked_or_unknown_sample_does_not_abort_sampling` | PARTIAL：通用 BLOCKED/UNKNOWN 样本后的继续采样断言保留，Redis capability 分支退役。 |
 | `test_missing_actor_aware_capability_is_blocked` | `experiment_common_contract.rs::tests::blocked_or_unknown_sample_does_not_abort_sampling` | EQUIVALENT：BLOCKED 样本不中止采样；能力缺失以样本状态表达。 |
 | `test_signed_get_error_is_unknown_and_does_not_abort` | `experiment_common_contract.rs::tests::blocked_or_unknown_sample_does_not_abort_sampling` | EQUIVALENT：UNKNOWN 样本保留且后续采样继续。 |
 | `test_http_200_without_allowed_true_is_unknown_classification` | `e3_e4_events.rs::tests::e1_request_selection_terminal_status_and_status_vocabulary_are_explicit` | EQUIVALENT：200 非 `allowed=true` 不产生 ALLOW。 |
@@ -473,7 +474,7 @@
 | `test_plan_marks_every_case_planned_and_integration_blocked` | `e4_fault_driver_contract.rs::tests::plan_marks_every_case_planned_and_integration_blocked` | EQUIVALENT：cases 与 profile fault 表一致且均 PLANNED，integration BLOCKED，8 个 hook 顺序与首个 returns 精确匹配，plan 不含 controller。 |
 | `test_module_integration_claim_is_blocked` | `e4_fault_driver_contract.rs::tests::module_integration_claim_is_blocked` | EQUIVALENT：`LIVE_FAULT_MATRIX_INTEGRATION=BLOCKED`，原因含 `test_control.rs`。 |
 | `test_default_cli_prints_plan_and_blocked` | `e4_fault_driver_contract.rs::tests::default_cli_prints_plan_and_blocked` | EQUIVALENT：默认 CLI 退出 0，输出含 BLOCKED 与 memory_channel_suspect、不含 redis_unavailable，JSON plan kind/profile 正确。 |
-| `test_plan_flag_prints_the_same_plan` | `e4_fault_driver_contract.rs::tests::plan_flag_prints_the_same_plan` | EQUIVALENT：`--plan --profile redis-compat` 退出 0，输出含 integration 字段与 `"status": "BLOCKED"`。 |
+| `test_plan_flag_prints_the_same_plan` | `e4_fault_driver_contract.rs::tests::plan_flag_prints_the_same_plan` | PARTIAL：当前原生 profile 的 `--plan` 输出保留 BLOCKED；`redis-compat` 被拒绝，原兼容 profile 正向合同退役。 |
 | `test_no_execution_flag_exists` | `e4_fault_driver_contract.rs::tests::no_execution_flag_exists` | EQUIVALENT：`--run` 退出 2 且无 stdout。 |
 | `test_help_exits_zero_without_executing_anything` | `e4_fault_driver_contract.rs::tests::help_exits_zero_without_executing_anything` | EQUIVALENT：`--help` 退出 0，输出含 "fault primitive" 与 "--plan"。 |
 
@@ -607,7 +608,7 @@
 |---|---|---|
 | `test_register_validates` | `experiment_register.rs::tests::registry_pins_stimulus_canary_capture_and_acceptance_surfaces` | EQUIVALENT：registry consistency。 |
 | `test_stimulus_classes_complete_and_revocation_class` | `experiment_register.rs::tests::registry_pins_stimulus_canary_capture_and_acceptance_surfaces` | EQUIVALENT：刺激类型集合/revocation metadata。 |
-| `test_e2_controls_cover_every_runtime_switch_premise` | `experiment_register.rs::tests::registry_links_every_runtime_e2_premise_to_a_readiness_test` | EQUIVALENT：E2 premise 和 Rust test link。 |
+| `test_e2_controls_cover_every_runtime_switch_premise` | `experiment_register.rs::tests::registry_links_every_runtime_e2_premise_to_a_native_rust_test` | EQUIVALENT：E2 premise 和 Rust test link。 |
 | `test_canary_ground_truth_fixed_by_construction` | `experiment_register.rs::tests::registry_pins_stimulus_canary_capture_and_acceptance_surfaces` | EQUIVALENT：检测/误阻断率固定。 |
 | `test_dependency_fault_matrix_is_full_cross_product` | `dependency_profiles.rs::tests::every_fault_dependency_and_matrix_entry_is_explicit` | EQUIVALENT：profile-filtered dependency×fault timing rows。 |
 | `test_capture_and_acceptance_tables_present` | `experiment_register.rs::tests::registry_pins_stimulus_canary_capture_and_acceptance_surfaces` | EQUIVALENT：capture/acceptance field inventories。 |
@@ -661,18 +662,18 @@
 | `test_field_order_is_load_bearing` | `node_adapter_contract.rs::tests::gateway_v3_signature_matches_byte_exact_hmac_vector` | EQUIVALENT：签名前序列化顺序。 |
 | `test_actor_aliases_and_rejection` | `node_adapter_contract.rs::tests::actor_aliases_and_signed_payload_field_order_are_explicit` | EQUIVALENT：actor alias 与非法输入。 |
 | `test_invalid_method_path_and_request_id_rejected` | `node_adapter_contract.rs::tests::signed_request_restricts_path_method_body_and_parses_object_responses` | EQUIVALENT：method/path/request id 校验。 |
-| `test_hmac_secret_loaded_lazily_and_validated` | `node_adapter_contract.rs::tests::fixed_script_literals_and_hmac_secret_load_lazily` | EQUIVALENT：secret 仅由显式 load 读取；缺失/空文件分别报 `hmac_secret_unreadable`/`hmac_secret_empty`；SQL plan 不读取 secret。 |
-| `test_secret_not_retained_on_adapter` | `node_adapter_contract.rs::tests::fixed_script_literals_and_hmac_secret_load_lazily` | EQUIVALENT：签名后 config 的 Debug/public metadata 均不含 secret sentinel；secret 不进入配置对象。 |
+| `test_hmac_secret_loaded_lazily_and_validated` | `node_adapter_contract.rs::tests::fixed_sql_script_and_hmac_secret_load_lazily` | EQUIVALENT：secret 仅由显式 load 读取；缺失/空文件分别报 `hmac_secret_unreadable`/`hmac_secret_empty`；SQL plan 不读取 secret。 |
+| `test_secret_not_retained_on_adapter` | `node_adapter_contract.rs::tests::fixed_sql_script_and_hmac_secret_load_lazily` | EQUIVALENT：签名后 config 的 Debug/public metadata 均不含 secret sentinel；secret 不进入配置对象。 |
 | `test_fixed_argv_stdin_and_tsv_parse` | `node_adapter_contract.rs::tests::sql_command_has_fixed_argv_stdin_tsv_and_missing_root_guard` | EQUIVALENT：SQL argv/stdin/timeout 精确、secret 不出现在 argv、TSV 空列保留。 |
-| `test_fixed_script_literal_shape` | `node_adapter_contract.rs::tests::fixed_script_literals_and_hmac_secret_load_lazily` | EQUIVALENT：MYSQL/REDIS stdin 脚本字面量与 Python 合同逐字一致，`$(cat)`/`"$@"` 均存在。 |
+| `test_fixed_script_literal_shape` | `node_adapter_contract.rs::tests::fixed_sql_script_and_hmac_secret_load_lazily` | PARTIAL：MySQL 固定 stdin/凭据隔离断言保留，Redis 固定脚本已删除，不再声称两套脚本等价。 |
 | `test_select_only_guard` | `node_adapter_contract.rs::tests::sql_guard_and_fixed_argv_are_read_only_and_secret_stays_off_argv` | EQUIVALENT：只读 SQL guard。 |
-| `test_sql_failure_raises_scrubbed_error` | `node_adapter_contract.rs::tests::sql_redis_and_log_failures_are_scrubbed_and_bounded` | EQUIVALENT：sql_failed 返回 scrubbed/bounded detail，host 与 secret 均不出现。 |
+| `test_sql_failure_raises_scrubbed_error` | `node_adapter_contract.rs::tests::sql_and_log_failures_are_scrubbed_and_bounded` | EQUIVALENT：sql_failed 返回 scrubbed/bounded detail，host 与 secret 均不出现。 |
 | `test_missing_mysql_root_fails_closed_before_runner` | `node_adapter_contract.rs::tests::sql_command_has_fixed_argv_stdin_tsv_and_missing_root_guard` | EQUIVALENT：缺 mysql_root 在 runner 调用前报 `mysql_root_missing`，calls 保持 0。 |
-| `test_allowlist_verbs_and_fixed_argv` | `node_adapter_contract.rs::tests::redis_allowlist_arity_and_key_validation_precede_command_creation` | EQUIVALENT：Redis command allowlist/fixed argv。 |
-| `test_verbs_outside_allowlist_rejected_before_runner` | `node_adapter_contract.rs::tests::redis_allowlist_arity_and_key_validation_precede_command_creation` | EQUIVALENT：command creation 前拒绝。 |
-| `test_arity_and_key_validation` | `node_adapter_contract.rs::tests::redis_allowlist_arity_and_key_validation_precede_command_creation` | EQUIVALENT：arity/key allowlist。 |
-| `test_missing_redis_password_fails_closed` | `node_adapter_contract.rs::tests::redis_command_has_fixed_argv_and_missing_password_guard` | EQUIVALENT：缺 redis_password 在 command 创建时报 `redis_password_missing`。 |
-| `test_redis_failure_raises_scrubbed_error` | `node_adapter_contract.rs::tests::sql_redis_and_log_failures_are_scrubbed_and_bounded` | EQUIVALENT：redis_failed 返回 scrubbed/bounded detail，host 与 password 均不出现。 |
+| `test_allowlist_verbs_and_fixed_argv` | `node_adapter_contract.rs::tests::retired_redis_fields_are_rejected_without_affecting_sql_or_metadata` | RETIRED：Redis command API 和 argv 构造器已删除；替代断言拒绝旧配置。 |
+| `test_verbs_outside_allowlist_rejected_before_runner` | `node_adapter_contract.rs::tests::retired_redis_fields_are_rejected_without_affecting_sql_or_metadata` | RETIRED：Redis 端口已删除，不存在可派发命令。 |
+| `test_arity_and_key_validation` | `node_adapter_contract.rs::tests::retired_redis_fields_are_rejected_without_affecting_sql_or_metadata` | RETIRED：旧 Redis verb/key/arity 合同已删除。 |
+| `test_missing_redis_password_fails_closed` | `node_adapter_contract.rs::tests::retired_redis_fields_are_rejected_without_affecting_sql_or_metadata` | RETIRED：不再读取 Redis 密码或构造命令；旧配置字段被拒绝。 |
+| `test_redis_failure_raises_scrubbed_error` | `node_adapter_contract.rs::tests::sql_and_log_failures_are_scrubbed_and_bounded` | RETIRED：Redis 执行/错误路径已删除；SQL 与日志错误脱敏单独保留，不计原 Redis 等价覆盖。 |
 | `test_returns_status_parsed_dict_and_request_id` | `node_adapter_contract.rs::tests::signed_request_restricts_path_method_body_and_parses_object_responses` | EQUIVALENT：成功 status、JSON object、request id。 |
 | `test_path_restrictions` | `node_adapter_contract.rs::tests::signed_request_restricts_path_method_body_and_parses_object_responses` | EQUIVALENT：路径 allowlist。 |
 | `test_node_alias_restrictions` | `node_adapter_contract.rs::tests::node_alias_restrictions_apply_to_signed_requests` | EQUIVALENT：node-a/b/c 通过；gateway/node-d/NODE-A/node_a/空串均在 signing 前报 `invalid_node_alias`。 |
@@ -682,10 +683,10 @@
 | `test_non_json_rejection` | `node_adapter_contract.rs::tests::signed_request_restricts_path_method_body_and_parses_object_responses` | EQUIVALENT：non-object/non-JSON response 未证明。 |
 | `test_role_specific_signatures_and_card_binding` | `node_adapter_contract.rs::tests::role_actor_and_decision_path_keep_exact_card_binding`; `gateway_v3_signature_matches_byte_exact_hmac_vector` | EQUIVALENT：role-specific actor/signature binding。 |
 | `test_missing_role_mapping_is_rejected_before_any_io` | `node_adapter_contract.rs::tests::role_actor_and_decision_path_keep_exact_card_binding` | EQUIVALENT：role mapping 不完整先拒绝。 |
-| `test_node_b_uses_local_direct_argv` | `node_adapter_contract.rs::tests::log_slice_commands_use_local_and_ssh_fixed_argv` | EQUIVALENT：node-b 本地 argv 为 python3/-/展开 base/server_b.log/payload，stdin 为固定 grep script。 |
-| `test_node_a_and_c_use_ssh_batchmode_fixed_args` | `node_adapter_contract.rs::tests::log_slice_commands_use_local_and_ssh_fixed_argv` | EQUIVALENT：SSH argv 前缀、目标、remote python3 命令、server_a.log、payload 与 stdin script 均精确断言。 |
+| `test_node_b_uses_local_direct_argv` | `node_adapter_contract.rs::tests::log_slice_commands_use_bounded_raw_collection_and_rust_filtering` | PARTIAL：保留本地固定 argv，改用 `head -c` 有界原始采集和 Rust 过滤/脱敏；Python/script stdin 已删除。 |
+| `test_node_a_and_c_use_ssh_batchmode_fixed_args` | `node_adapter_contract.rs::tests::log_slice_commands_use_bounded_raw_collection_and_rust_filtering` | PARTIAL：保留 BatchMode 固定 SSH argv，远端仅执行有界原始采集，过滤/判定在 Rust；旧远端 Python/payload 合同退役。 |
 | `test_identifiers_validated_and_empty_short_circuit` | `node_adapter_contract.rs::tests::log_slice_validates_and_deduplicates_ids_before_runner_dispatch` | EQUIVALENT：空/非法 identifiers 先拒绝。 |
-| `test_failure_raises_error_without_host_target` | `node_adapter_contract.rs::tests::sql_redis_and_log_failures_are_scrubbed_and_bounded` | EQUIVALENT：log_slice_failed 的 detail 已 scrub，host 不出现且含 `[redacted-host]`。 |
+| `test_failure_raises_error_without_host_target` | `node_adapter_contract.rs::tests::sql_and_log_failures_are_scrubbed_and_bounded` | EQUIVALENT：log_slice_failed 的 detail 已 scrub，host 不出现且含 `[redacted-host]`。 |
 | `test_unknown_node_alias_rejected` | `node_adapter_contract.rs::tests::config_shape_errors_are_constant_sorted_and_invalid_maps_fail_closed` | EQUIVALENT：未注册 node alias 拒绝。 |
 | `test_helpers_issue_select_only_queries_through_sql` | `node_adapter_contract.rs::tests::durable_reconciliation_query_builders_are_select_only_and_reject_bad_inputs` | EQUIVALENT：query helper SELECT-only。 |
 | `test_helper_input_validation` | `node_adapter_contract.rs::tests::durable_reconciliation_query_builders_are_select_only_and_reject_bad_inputs` | EQUIVALENT：query input allowlist。 |
@@ -695,7 +696,7 @@
 | `test_adapter_repr_hides_everything_private` | `node_adapter_contract.rs::tests::config_is_validated_without_io_and_public_metadata_hides_private_topology` | EQUIVALENT：debug/public metadata 不泄漏 private fields。 |
 | `test_adapter_rejects_bad_config_type` | `node_adapter_contract.rs::tests::config_shape_errors_are_constant_sorted_and_invalid_maps_fail_closed` | EQUIVALENT：config 类型不符拒绝。 |
 | `test_scrub_covers_url_ip_and_hostname` | `node_adapter_contract.rs::tests::scrubber_redacts_url_ipv4_hostname_and_bounds_strings` | EQUIVALENT：URL/IP/hostname scrub。 |
-| `test_log_grep_script_uses_the_payload_emitted_by_read_log_lines` | `node_adapter_contract.rs::tests::log_slice_commands_use_local_and_ssh_fixed_argv` | EQUIVALENT：base64(JSON(ids)) payload、固定 script stdin 与 argv 位置均断言；不执行脚本。 |
+| `test_log_grep_script_uses_the_payload_emitted_by_read_log_lines` | `node_adapter_contract.rs::tests::log_slice_commands_use_bounded_raw_collection_and_rust_filtering` | RETIRED：Python grep script/base64 payload 已物理删除；替代 Rust 断言验证原始采集、ID 上限、过滤和脱敏，不计旧脚本等价。 |
 
 <!-- python-source: Docs/authorization-validation/archive/python-tests/test_projection_owner_model.py -->
 ### `test_projection_owner_model.py`（14）
@@ -736,7 +737,7 @@
 | `test_runtime_suites_scenario_aggregates_command_status` | `legacy_campaign_contract.rs::tests::runtime_suites_scenario_aggregates_command_status` | EQUIVALENT：四个 runtime suite 中任一 FAIL 时 scenario=FAIL。 |
 | `test_upgraded_verification_gates_are_registered` | `legacy_campaign_contract.rs::tests::upgraded_verification_gates_are_registered` | EQUIVALENT：两个 E5 gate 已注册，two-mutation/universal 标志与 timeout>1800 精确断言。 |
 | `test_experiment_register_and_multi_classifier_importable` | `experiment_register.rs::tests::required_registry_symbols_are_importable` | EQUIVALENT：validate_register 与 classify_e1_allow 以明确函数指针类型可调用。 |
-| `test_zero_python_tests_cannot_pass` | `readiness_contract.rs::tests::exit_zero_needs_markers_and_minimum_python_tests` | EQUIVALENT：非空 python test summary 才能通过。 |
+| `test_zero_python_tests_cannot_pass` | `readiness_contract.rs::tests::exit_zero_needs_markers_and_minimum_rust_tests` | RETIRED：Python summary 成功验收已删除；当前 Rust summary 必须满足非空断言、数量与状态要求。 |
 | `test_e1_observability_failure_is_not_reported_as_skip` | `legacy_campaign_contract.rs::tests::e1_observability_failure_is_not_reported_as_skip` | EQUIVALENT：E1 观测 gate FAIL 时 scenario=FAIL，不降级为 SKIP。 |
 | `test_missing_required_argument_exits_before_write` | `legacy_campaign_contract.rs::tests::missing_required_argument_exits_before_write` | EQUIVALENT：缺 --config 或 --out 时退出码 2，解析函数在任何写入前返回。 |
 | `test_timeout_reports_unknown_with_incomplete_logs_and_partial_output` | `legacy_campaign_contract.rs::tests::timeout_and_os_error_keep_exact_evidence_fields` | EQUIVALENT：timeout 返回 UNKNOWN、exitCode=None、logComplete=false，并保留部分 stdout/stderr。 |
@@ -747,9 +748,9 @@
 | `test_e5_complete_passing_report_passes` | `model_acceptance.rs::tests::full_contract_checks_identity_modes_counts_status_and_omissions` | EQUIVALENT：完整报告 PASS。 |
 | `test_exit_zero_without_expected_marker_is_fail` | `campaign.rs::tests::model_dependency_and_required_output_acceptance_keep_contract_boundaries` | EQUIVALENT：marker/postcondition 必须出现。 |
 | `test_checksum_verifier_detects_artifact_tampering` | `readiness_contract.rs::tests::checksum_manifest_detects_tampering_bad_lines_and_path_escape` | EQUIVALENT：篡改检测。 |
-| `test_every_modeled_premise_maps_to_exactly_one_executed_command` | `experiment_register.rs::tests::registry_links_every_runtime_e2_premise_to_a_readiness_test` | EQUIVALENT：5 个 runtime premise + host_mediation 完整覆盖 E5 premises；每个 premise/test id 唯一一次映射。 |
-| `test_each_e2_command_targets_a_real_test_with_an_exact_marker` | `experiment_register.rs::tests::registry_links_every_runtime_e2_premise_to_a_readiness_test` | EQUIVALENT：每个 E2 rust_test 均能在 astral-db/policy-engine 源中找到对应 `fn`，且注册表登记于 campaign 源。 |
-| `test_host_mediation_has_no_claimed_omission_command` | `experiment_register.rs::tests::registry_links_every_runtime_e2_premise_to_a_readiness_test` | EQUIVALENT：host_mediation 仅存在于 model-only premises，E2 premise/test id 均不含 host。 |
+| `test_every_modeled_premise_maps_to_exactly_one_executed_command` | `experiment_register.rs::tests::registry_links_every_runtime_e2_premise_to_a_native_rust_test` | EQUIVALENT：5 个 runtime premise + host_mediation 完整覆盖 E5 premises；每个 premise/test id 唯一一次映射。 |
+| `test_each_e2_command_targets_a_real_test_with_an_exact_marker` | `experiment_register.rs::tests::registry_links_every_runtime_e2_premise_to_a_native_rust_test` | EQUIVALENT：每个 E2 rust_test 均能在 astral-db/policy-engine 源中找到对应 `fn`，且注册表登记于 campaign 源。 |
+| `test_host_mediation_has_no_claimed_omission_command` | `experiment_register.rs::tests::registry_links_every_runtime_e2_premise_to_a_native_rust_test` | EQUIVALENT：host_mediation 仅存在于 model-only premises，E2 premise/test id 均不含 host。 |
 
 <!-- python-source: Docs/authorization-validation/archive/python-tests/test_tenant_isolation_model.py -->
 ### `test_tenant_isolation_model.py`（8）
@@ -798,11 +799,11 @@
 
 ### `test_e1_runner.py`（46）
 
-`test_e1_runner.py` 的 46 个 Python 方法全部列在上方 `test_e1_runner.py` 表中并维持 `PARTIAL/BLOCKED`；该表位置为 archive ledger 的 runner section。Rust parser/reducer 对应不构成 E1 campaign、live HTTP/DB 或节点运行证据。
+`test_e1_runner.py` 的 46 个历史方法均保留在上方对应表中；每行只说明当前 Rust 离线断言范围。Rust parser/reducer 与注入 adapter 不构成 E1 campaign、live HTTP/DB 或节点运行证据。
 
 ## 非 unittest 文件分类
 
-- `scripts/test_campaign.py`：生产 runner 实现/规格源，不是 unittest；其离线行为断言来源是 `scripts/tests/test_test_campaign.py`。Rust contract suites 不执行 Python runner。
+- `scripts/test_campaign.py`：已删除的旧 runner，不是 unittest；历史离线行为断言来源 `scripts/tests/test_test_campaign.py` 仍用于迁移库存，当前只运行 Rust contract suites。
 - `Docs/实验/基准测试/scripts/opa_index_test.py` 与归档 Java baseline 的 `opa_index_test.py`：手工 OPA/索引实验脚本，不是 `unittest.TestCase` inventory。
 - `Docs/实验/分布式测试/pipeline/.astral-final8-scan-gate-test.py`：历史 pipeline scan gate 工具，不是 Python unittest 模块，不计入 25/622。
 - `tests-suite`/实验目录的其他 `test` 命名 Rust 文件是 Rust suites，不构成 Python unittest source。
@@ -810,6 +811,6 @@
 ## 证据/执行边界与剩余项
 
 - 可以离线验证：campaign manifest/selection、环境隔离/前置检查、summary/status precedence、model/benchmark 解析、fake-Cargo 转发、有限模型/reducer/协议解析。
-- 必须保持 BLOCKED/未执行：Python 原测试；E1/E3/E4 live runners/probes/HTTP/SQL/Redis/broker/SSH；DB/RabbitMQ/Redis/真实 Docker、TDSC HTTP load、S15 三节点/部署；ProcessPool 真正并行执行；campaign artifact/file lifecycle 的未覆盖行为。
-- 尚未全量完成的 19 个 archive module 逐方法对账是阻断完成验收的开放项。模块级 README 和 source/counter guard 不折算为等价。
-- 本轮五链：N/A（仅迁移合同测试、Rust test harness 和证据文档；不改外部行为、授权逻辑、schema/projection/message/audit 或部署）；残余风险是跨语言逐方法映射和 live 外部证据仍需专门补齐/取得。
+- 必须保持未执行/独立取证：E1/E3/E4 live runners/probes/HTTP/SQL/broker/SSH、真实 DB/RabbitMQ/Docker、TDSC HTTP load 与 S15 三节点部署。Python 原测试不运行；Redis 原正向能力已退役，不再作为 current integration 前置。
+- 25/622 的来源行保留，不把 source/counter guard 或退役替代断言折算为等价。当前 `PARTIAL` 的具体边界见对应方法行；`RETIRED` 记录能力删除，无运行成功含义。
+- 本次账本同步不改变授权、schema 或数据库事实；日志过滤、故障状态和原生读取合同的实际验证与风险统一记录在 V6-only 删除任务证据中。

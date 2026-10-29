@@ -28,6 +28,9 @@ use crate::grant_repository::{
 
 mod assembly_cache;
 mod invalidation;
+mod repository;
+
+pub use repository::MemoryMirroredRuleRepository;
 
 use assembly_cache::{AssemblyCache, AssemblyStamp};
 pub use invalidation::EvidenceInvalidationRequest;
@@ -1843,198 +1846,6 @@ pub async fn refresh_from_durable(pool: &MySqlPool, identity: &ProjectionAggrega
             error = %error,
             "memory projection mirror refresh failed; readers keep deferring to the durable path"
         ),
-    }
-}
-
-/// 内存镜像装饰器：命中 [`MemoryEvidenceOutcome::Serve`] 直接返回与 durable
-/// 同源的已验证证据；否则整体回退 `inner`（既有 `CachedPublishedEvidence`
-/// /`SqlxRuleRepository` 链）。其余端口全部逐方法转发，语义零改动。
-///
-/// 辅助授权端口（`load_org_authorization` / `is_active_global_admin`）在
-/// hub 健康且辅助镜像已安装（或测试注入）时先问镜像；镜像不适用一律回落
-/// `inner`，与既有 DB 链逐字节同语义。default-off：未安装镜像时零行为变化。
-pub struct MemoryMirroredRuleRepository<R> {
-    inner: R,
-    refill_pool: Option<MySqlPool>,
-}
-
-impl<R> MemoryMirroredRuleRepository<R> {
-    pub fn new(inner: R) -> Self {
-        Self {
-            inner,
-            refill_pool: None,
-        }
-    }
-
-    /// Enable commit-proven strict refills on memory misses.
-    pub fn with_durable_refill(mut self, pool: MySqlPool) -> Self {
-        self.refill_pool = Some(pool);
-        self
-    }
-
-    async fn strict_authority_read<T>(
-        &self,
-        read: impl std::future::Future<Output = Result<T, astral_types::PolicyError>>,
-    ) -> Result<T, astral_types::PolicyError> {
-        let Some(hub) = memory_projection_hub() else {
-            return read.await;
-        };
-        let token = hub.strict_read_token().ok_or_else(|| {
-            astral_types::PolicyError::Repository(
-                "source writer or unknown outcome blocks authority read".to_owned(),
-            )
-        })?;
-        let result = tokio::time::timeout(Duration::from_secs(3), read)
-            .await
-            .map_err(|_| {
-                astral_types::PolicyError::Repository("strict authority read timed out".to_owned())
-            })?;
-        if !hub.strict_read_matches(token) {
-            return Err(astral_types::PolicyError::Repository(
-                "source mutation raced authority read".to_owned(),
-            ));
-        }
-        result
-    }
-
-    fn auxiliary_mirror(
-        &self,
-    ) -> Option<crate::auxiliary_authorization_mirror::AuxiliaryAuthorizationMirror> {
-        crate::auxiliary_authorization_mirror()
-    }
-}
-
-#[async_trait::async_trait]
-impl<R> policy_engine::RuleRepository for MemoryMirroredRuleRepository<R>
-where
-    R: policy_engine::RuleRepository + Send + Sync,
-{
-    async fn load_rule_set_snapshots(
-        &self,
-        card_id: i64,
-    ) -> Result<Vec<policy_engine::RuleSetSnapshot>, astral_types::PolicyError> {
-        self.inner.load_rule_set_snapshots(card_id).await
-    }
-
-    async fn load_permission_rules(
-        &self,
-        card_id: i64,
-    ) -> Result<Vec<policy_engine::PermissionRule>, astral_types::PolicyError> {
-        self.inner.load_permission_rules(card_id).await
-    }
-
-    async fn load_rule_set_dependency_statuses(
-        &self,
-        card_id: i64,
-    ) -> Result<Option<Vec<policy_engine::RuleSetDependencyStatus>>, astral_types::PolicyError>
-    {
-        self.inner.load_rule_set_dependency_statuses(card_id).await
-    }
-
-    async fn check_card_active(
-        &self,
-        ctx: &astral_types::PolicyContext,
-    ) -> Result<bool, astral_types::PolicyError> {
-        self.strict_authority_read(self.inner.check_card_active(ctx))
-            .await
-    }
-
-    async fn is_active_global_admin(
-        &self,
-        user_id: i64,
-    ) -> Result<bool, astral_types::PolicyError> {
-        // 通道可证明时使用镜像；writer/未知与回填竞争均保持 fail-closed。
-        if let (Some(hub), Some(mirror)) = (memory_projection_hub(), self.auxiliary_mirror()) {
-            if let Some(result) = mirror.is_active_global_admin(hub, user_id).await {
-                return result;
-            }
-        }
-        self.strict_authority_read(self.inner.is_active_global_admin(user_id))
-            .await
-    }
-
-    async fn load_snapshot_winners(
-        &self,
-        card_id: i64,
-    ) -> Result<Vec<policy_engine::SnapshotWinner>, astral_types::PolicyError> {
-        self.inner.load_snapshot_winners(card_id).await
-    }
-
-    async fn load_rule_set_entries_raw(
-        &self,
-        card_id: i64,
-    ) -> Result<Vec<policy_engine::RuleSetSnapshot>, astral_types::PolicyError> {
-        self.inner.load_rule_set_entries_raw(card_id).await
-    }
-
-    async fn load_permission_rules_raw(
-        &self,
-        card_id: i64,
-    ) -> Result<Vec<policy_engine::PermissionRule>, astral_types::PolicyError> {
-        self.inner.load_permission_rules_raw(card_id).await
-    }
-
-    async fn load_delegated_rules(
-        &self,
-        delegate_id: i64,
-        resource: &str,
-        action: &str,
-    ) -> Result<Vec<policy_engine::PermissionRule>, astral_types::PolicyError> {
-        self.inner
-            .load_delegated_rules(delegate_id, resource, action)
-            .await
-    }
-
-    async fn load_projected_delegated_rules(
-        &self,
-        delegate_id: i64,
-        resource: &str,
-        action: &str,
-    ) -> Result<Vec<policy_engine::PermissionRule>, astral_types::PolicyError> {
-        self.inner
-            .load_projected_delegated_rules(delegate_id, resource, action)
-            .await
-    }
-
-    async fn get_projection_gate(
-        &self,
-        card_id: i64,
-    ) -> Result<Option<policy_engine::ProjectionGate>, astral_types::PolicyError> {
-        self.inner.get_projection_gate(card_id).await
-    }
-
-    fn requires_published_card_evidence(&self) -> bool {
-        self.inner.requires_published_card_evidence()
-    }
-
-    async fn load_published_card_authorization(
-        &self,
-        scope: &astral_types::PublishedCardEvidenceScope,
-    ) -> Result<Option<Arc<PublishedCardAuthorization>>, astral_types::PolicyError> {
-        if let Some(hub) = memory_projection_hub() {
-            if let MemoryEvidenceOutcome::Serve(evidence) = hub.try_memory_evidence(scope) {
-                return Ok(Some(evidence));
-            }
-            if let Some(pool) = &self.refill_pool {
-                return hub.strict_refill(pool, scope).await.map(Some);
-            }
-        }
-        self.strict_authority_read(self.inner.load_published_card_authorization(scope))
-            .await
-    }
-
-    async fn load_org_authorization(
-        &self,
-        ctx: &astral_types::PolicyContext,
-    ) -> Result<policy_engine::org_admission::OrgAuthorityRead, astral_types::PolicyError> {
-        // 严格回源同样需要前后源状态 token；不能绕过活动 writer 或未知提交。
-        if let (Some(hub), Some(mirror)) = (memory_projection_hub(), self.auxiliary_mirror()) {
-            if let Some(read) = mirror.load_org_authorization(hub, ctx).await {
-                return Ok(read);
-            }
-        }
-        self.strict_authority_read(self.inner.load_org_authorization(ctx))
-            .await
     }
 }
 
@@ -4103,11 +3914,19 @@ mod tests {
 
         #[async_trait::async_trait]
         impl policy_engine::RuleRepository for ForwardProbe {
-            async fn load_permission_rules(
+            async fn check_card_active(
                 &self,
-                _card_id: i64,
-            ) -> Result<Vec<policy_engine::PermissionRule>, astral_types::PolicyError> {
-                Ok(vec![])
+                _ctx: &astral_types::PolicyContext,
+            ) -> Result<bool, astral_types::PolicyError> {
+                Ok(false)
+            }
+
+            async fn load_published_card_authorization(
+                &self,
+                _scope: &astral_types::PublishedCardEvidenceScope,
+            ) -> Result<Option<Arc<PublishedCardAuthorization>>, astral_types::PolicyError>
+            {
+                Ok(None)
             }
 
             async fn load_org_authorization(

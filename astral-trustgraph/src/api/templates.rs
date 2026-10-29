@@ -1,7 +1,8 @@
-//! 策略模板管理与审计报表 — HTTP adapter
+//! 策略模板管理 — HTTP adapter
 //!
-//! 数据访问在 `repository::template_repository`，sync 的逐卡 rebuild 编排在
-//! `service::template_service`。HTTP 层仅解析参数、组装 DTO、包装响应。
+//! source/delta 写入在 `repository::template_repository`；发布快照、缓存失效和消息由
+//! projection worker 处理。`service::template_service` 仅包装同步结果，HTTP 层解析参数、
+//! 组装 DTO 并包装响应。
 
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -138,40 +139,12 @@ pub struct PolicyTemplate {
     pub resources: Vec<String>,
 }
 
-/// 合规报表
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ComplianceReport {
-    pub total_policies: i64,
-    pub active_policies: i64,
-    pub over_permission_count: i64,
-    pub unused_permission_count: i64,
-    pub recent_changes: Vec<PolicyChange>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PolicyChange {
-    pub id: i64,
-    pub resource: String,
-    pub action: String,
-    pub changed_by: i64,
-    pub changed_at: String,
-}
-
 pub fn template_routes() -> Router<AppState> {
     Router::new()
         .route("/templates", get(list_templates))
         .route("/templates", post(create_template))
         .route("/templates/{id}", get(get_template))
         .route("/templates/{id}", put(update_template))
-        // Retained only to return an explicit breaking/deprecation error. Direct
-        // template-to-card materialization is no longer a supported write path.
-        .route("/templates/{id}/apply", post(retired_template_apply))
-        .route(
-            "/templates/{id}/apply/async",
-            post(retired_template_apply_async),
-        )
         .route("/templates/{id}/sync", post(sync_template))
         .route("/templates/{id}/rules", get(list_template_rules))
         .route("/templates/{id}/rules", post(create_template_rule))
@@ -179,9 +152,6 @@ pub fn template_routes() -> Router<AppState> {
         .route("/templates/rules/{rule_id}", delete(delete_template_rule))
         .route("/templates/rules/{rule_id}", get(get_template_rule))
         .route("/operations/{task_id}", get(get_operation_status))
-        // Java 兼容别名
-        .route("/compliance/overview", get(compliance_overview))
-        .route("/compliance/report", get(compliance_report))
 }
 
 /// GET /main/api/v1/templates
@@ -288,73 +258,6 @@ async fn update_template(
     Ok(Json(ApiResponse::success(serde_json::json!({
         "template_id": id,
         "rules_inserted": inserted,
-    }))))
-}
-
-const RETIRED_TEMPLATE_APPLY_MESSAGE: &str =
-    "template apply endpoints are retired; materialize the template RuleSet and bind cards through /rule-sets/card/{card_id}/bind";
-
-async fn retired_template_apply(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(_id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    require_template_admin(&state, &headers).await?;
-    Err(AppError(AstralError::NotImplemented(
-        RETIRED_TEMPLATE_APPLY_MESSAGE.into(),
-    )))
-}
-
-async fn retired_template_apply_async(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(_id): Path<String>,
-) -> Result<Json<ApiResponse<AsyncTask>>, AppError> {
-    require_template_admin(&state, &headers).await?;
-    Err(AppError(AstralError::NotImplemented(
-        RETIRED_TEMPLATE_APPLY_MESSAGE.into(),
-    )))
-}
-
-/// GET /main/api/v1/compliance/overview
-async fn compliance_overview(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<ApiResponse<ComplianceReport>>, AppError> {
-    require_template_admin(&state, &headers).await?;
-    let data = state.template_repository.compliance_overview().await?;
-    Ok(Json(ApiResponse::success(ComplianceReport {
-        total_policies: data.total_rules,
-        active_policies: data.active_rules,
-        over_permission_count: data.over_permission_cards,
-        unused_permission_count: data.unused_permission_rules,
-        recent_changes: data
-            .recent_changes
-            .into_iter()
-            .map(|c| PolicyChange {
-                id: c.id,
-                resource: c.resource,
-                action: c.action,
-                changed_by: c.changed_by,
-                changed_at: c.changed_at,
-            })
-            .collect(),
-    })))
-}
-
-/// GET /main/api/v1/compliance/report
-async fn compliance_report(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    require_template_admin(&state, &headers).await?;
-    let (total_cards, total_rules, avg_rules) =
-        state.template_repository.compliance_report().await?;
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "generated_at": time::OffsetDateTime::now_utc().to_string(),
-        "total_cards": total_cards,
-        "total_policies": total_rules,
-        "policies_per_card_avg": avg_rules.unwrap_or(0.0),
     }))))
 }
 
@@ -695,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn template_rule_apply_requires_numeric_schema_id() {
+    fn template_authorization_sync_requires_numeric_schema_id() {
         assert!(parse_template_numeric_id("__SUPERADMIN__").is_err());
         assert!(parse_template_numeric_id("0").is_err());
         assert!(parse_template_numeric_id("-1").is_err());
@@ -703,9 +606,54 @@ mod tests {
     }
 
     #[test]
-    fn retired_template_apply_has_explicit_breaking_message() {
-        assert!(RETIRED_TEMPLATE_APPLY_MESSAGE.contains("retired"));
-        assert!(RETIRED_TEMPLATE_APPLY_MESSAGE.contains("RuleSet"));
+    fn retired_template_compatibility_routes_are_absent() {
+        let production = include_str!("templates.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production module must be separable");
+
+        for retired_route in [
+            "/templates/{id}/apply",
+            "/templates/{id}/apply/async",
+            "/compliance/overview",
+            "/compliance/report",
+        ] {
+            assert!(
+                !production.contains(retired_route),
+                "retired template compatibility route remains: {retired_route}"
+            );
+        }
+        for retired_symbol in [
+            "retired_template_apply",
+            "compliance_overview",
+            "compliance_report",
+            "ComplianceReport",
+            "PolicyChange",
+        ] {
+            assert!(
+                !production.contains(retired_symbol),
+                "retired template compatibility symbol remains: {retired_symbol}"
+            );
+        }
+
+        for active_route in [
+            ".route(\"/templates\", get(list_templates))",
+            ".route(\"/templates\", post(create_template))",
+            ".route(\"/templates/{id}\", get(get_template))",
+            ".route(\"/templates/{id}\", put(update_template))",
+            ".route(\"/templates/{id}/sync\", post(sync_template))",
+            ".route(\"/templates/{id}/rules\", get(list_template_rules))",
+            ".route(\"/templates/{id}/rules\", post(create_template_rule))",
+            ".route(\"/templates/rules/{rule_id}\", put(update_template_rule))",
+            ".route(\"/templates/rules/{rule_id}\", delete(delete_template_rule))",
+            ".route(\"/templates/rules/{rule_id}\", get(get_template_rule))",
+            ".route(\"/operations/{task_id}\", get(get_operation_status))",
+        ] {
+            assert!(
+                production.contains(active_route),
+                "active template source route must remain: {active_route}"
+            );
+        }
     }
 
     #[test]

@@ -21,20 +21,7 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 futures-util = "0.3"
 async-trait = "0.1"
-# Redis 编译层退役（redis-layer-retirement-20261002）：durable DB 幂等
-# （init_idempotency_db）是默认要求；redis 幂等 compat 路径
-# （init_idempotency_redis）与会话撤销投影注入（set_session_revocation_redis）
-# 收敛到本显式 feature（default-off）。
-redis = { workspace = true, optional = true }
 sqlx = { workspace = true }
-
-[features]
-redis-compat = ["dep:redis"]
-
-# check_redis 诊断示例仅在显式 redis-compat feature 下编译。
-[[example]]
-name = "check_redis"
-required-features = ["redis-compat"]
 
 [dev-dependencies]
 astral-db = { path = "../astral-db", features = ["test-support"] }

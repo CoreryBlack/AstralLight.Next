@@ -1,7 +1,7 @@
 //! 认证应用服务 — 对应 Java `AuthServiceImpl` + `TokenServiceImpl` 编排边界。
 //!
 //! 负责登录、注册、资料与改密编排。数据访问通过 `AuthRepository`，
-//! 会话 family/Redis 投影通过 `srv::session` 的安全编排保留。
+//! 会话 family 与 verified local mirror 通过 `srv::session` 的安全编排保留。
 
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use astral_types::{AstralError, IdentityCard};
 use crate::auth::{
     derive_roles_from_action_codes, derive_roles_from_cards, hash_password, issue_access_token,
     issue_refresh_token, map_eligibility_error, normalize_phone, sha256_hash, verify_password,
-    LoginResponse, PasswordVerifyResult, SessionContext, SessionGrant, TokenClaimsExtra,
+    LoginResponse, SessionContext, SessionGrant, TokenClaimsExtra,
 };
 use crate::srv::auth_repository::AuthRepository;
 use crate::srv::session::{project_password_revocation, store_session_grant_projection};
@@ -187,10 +187,7 @@ impl AuthService {
             .password
             .as_deref()
             .ok_or_else(|| AstralError::Validation("password required for local login".into()))?;
-        let migrated_password_hash = match verify_password(password, agg.password_hash.as_str())? {
-            PasswordVerifyResult::Match => None,
-            PasswordVerifyResult::Migrated(new_hash) => Some(new_hash),
-        };
+        verify_password(password, agg.password_hash.as_str())?;
 
         let cards = self.repository.find_login_cards(agg.user_id).await?;
         let cards_json: Vec<serde_json::Value> = cards.iter().map(login_card_to_json).collect();
@@ -310,7 +307,6 @@ impl AuthService {
                 user_id: agg.user_id,
                 expected_password_hash: agg.password_hash.clone(),
                 credential_version: agg.credential_version,
-                migrated_password_hash,
                 identity_card_id,
                 mfa_attempt_code: mfa_attempt_code.clone(),
                 mfa_method: Some(method.to_string()),
@@ -329,22 +325,9 @@ impl AuthService {
             tracing::warn!(user_id = %agg.user_id, error = %error, "update last_login_at failed, non-blocking");
         }
 
-        // 权限/角色/租户状态（对齐 Java TokenServiceImpl 签发时刻实时求值）：
-        // - permissions 来自投影快照（find_effective_permissions_cached，投影未 READY
-        //   安全 miss 返回空，不直读源表）；仅 claims-mode 非 OFF 时写入 JWT（Java 默认 OFF 不发）。
-        // - roles 来自当前卡 actionCodes（Java resolveRolesFromCard，排除 super_admin 类）；
-        //   空则回退默认 USER。
-        // - tenantStatus 来自卡所属 tenant status；无租户/无卡时保持 None。
-        let current_permissions: Vec<String> = if let Some(card_id) = jwt_card_id {
-            self.repository
-                .find_login_permissions(card_id)
-                .await?
-                .into_iter()
-                .map(|p| format!("{}:{}", p.resource_type, p.action_code))
-                .collect()
-        } else {
-            vec![]
-        };
+        // Token v2 的会话授权绑定只使用 durable session/JTI proof；权限列表是
+        // 独立登录响应展示数据，不放入 JWT claims。角色也只用于兼容展示/转发，
+        // PolicyEngine 是唯一授权决策入口。
         let current_action_codes: Vec<String> = jwt_card_id
             .and_then(|card_id| cards.iter().find(|c| c.card_id == card_id))
             .and_then(|c| c.action_codes.as_ref())
@@ -362,15 +345,6 @@ impl AuthService {
         };
         let claims_extra = TokenClaimsExtra {
             roles: derive_roles_from_action_codes(&current_action_codes),
-            permissions: if state
-                .config
-                .session_grant_claims_mode
-                .eq_ignore_ascii_case("OFF")
-            {
-                None
-            } else {
-                Some(current_permissions.clone())
-            },
             tenant_status: current_tenant_status,
         };
 
@@ -509,14 +483,7 @@ impl AuthService {
             token_type: "Bearer".into(),
             expires_in_millis,
             refresh_expires_in_millis,
-            token: None,
             user: Some(user_info),
-            identity_card: Some(serde_json::json!({
-                "cardId": agg.card_id,
-                "userId": agg.user_id,
-                "status": agg.card_status,
-                "tokenVersion": agg.token_version,
-            })),
             current_card,
             available_cards: if cards_json.is_empty() {
                 None
@@ -699,7 +666,6 @@ impl AuthService {
 
     pub async fn change_password(
         &self,
-        state: &AppState,
         user_id: i64,
         req: &ChangePasswordRequest,
     ) -> Result<(), AppError> {
@@ -739,11 +705,7 @@ impl AuthService {
             )
             .await
             .map_err(AppError::from)?;
-        #[cfg(feature = "redis-compat")]
-        let redis = state.redis.as_ref();
-        #[cfg(not(feature = "redis-compat"))]
-        let redis: Option<&()> = None;
-        project_password_revocation(state, &revoked_jtis, redis)
+        project_password_revocation(&revoked_jtis)
             .await
             .map_err(AppError::from)?;
 

@@ -10,11 +10,7 @@ while [ "$#" -gt 0 ]; do
         --profile)
             [ "$#" -ge 2 ] || exit 2
             case "$2" in
-                default|native-single-node) PROFILE=native-single-node ;;
-                redis-compat)
-                    printf '[BLOCKED] tenant matrix uses the native MySQL path; Redis has a dedicated compatibility suite\n' >&2
-                    exit 2
-                    ;;
+                native-single-node) PROFILE=native-single-node ;;
                 *) printf '[BLOCKED] unknown matrix profile: %s\n' "$2" >&2; exit 2 ;;
             esac
             shift 2

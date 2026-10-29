@@ -130,12 +130,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arcstr"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
-
-[[package]]
 name = "argon2"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -233,11 +227,9 @@ dependencies = [
  "astral-types",
  "async-trait",
  "hex",
- "hmac",
  "metrics",
  "moka",
  "policy-engine",
- "redis",
  "serde",
  "serde_json",
  "sha2",
@@ -265,7 +257,6 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "once_cell",
- "redis",
  "reqwest",
  "serde",
  "serde_json",
@@ -297,18 +288,15 @@ dependencies = [
  "axum",
  "base32",
  "base64",
- "bcrypt",
  "config",
  "garde",
  "hex",
  "jsonwebtoken",
  "lapin",
- "md-5",
  "once_cell",
  "policy-engine",
  "rand 0.8.7",
  "rand_core 0.6.4",
- "redis",
  "reqwest",
  "serde",
  "serde_json",
@@ -339,7 +327,6 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "policy-engine",
- "redis",
  "reqwest",
  "serde",
  "serde_json",
@@ -362,7 +349,6 @@ dependencies = [
  "async-trait",
  "futures-util",
  "lapin",
- "redis",
  "serde",
  "serde_json",
  "sha2",
@@ -456,7 +442,6 @@ dependencies = [
  "metrics-exporter-prometheus",
  "once_cell",
  "policy-engine",
- "redis",
  "serde",
  "serde_json",
  "sha2",
@@ -715,19 +700,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "bcrypt"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b1866ecef4f2d06a0bb77880015fdf2b89e25a1c2e5addacb87e459c86dc67e"
-dependencies = [
- "base64",
- "blowfish",
- "getrandom 0.2.17",
- "subtle",
- "zeroize",
-]
-
-[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -792,16 +764,6 @@ dependencies = [
  "futures-io",
  "futures-lite",
  "piper",
-]
-
-[[package]]
-name = "blowfish"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e412e2cd0f2b2d93e02543ceae7917b3c70331573df19ee046bcbc35e45e87d7"
-dependencies = [
- "byteorder",
- "cipher",
 ]
 
 [[package]]
@@ -972,11 +934,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
- "futures-core",
  "memchr",
- "pin-project-lite",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -3632,36 +3590,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "redis"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3257df217f7eab0044627a268c9cc6cdb60c0c421c88f83ac41c4e31520b6b84"
-dependencies = [
- "arc-swap",
- "arcstr",
- "async-lock",
- "backon",
- "bytes",
- "cfg-if",
- "combine",
- "futures-channel",
- "futures-util",
- "itoa",
- "num-bigint",
- "percent-encoding",
- "pin-project-lite",
- "ryu",
- "serde",
- "serde_json",
- "sha1_smol",
- "socket2",
- "tokio",
- "tokio-util",
- "url",
- "xxhash-rust",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4670,7 +4598,6 @@ dependencies = [
  "lapin",
  "moka",
  "policy-engine",
- "redis",
  "serde",
  "serde_json",
  "sha2",
@@ -5692,12 +5619,6 @@ dependencies = [
  "thiserror",
  "time",
 ]
-
-[[package]]
-name = "xxhash-rust"
-version = "0.8.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "yaml-rust2"

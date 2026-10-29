@@ -15,7 +15,7 @@ use crate::RuleRepository;
 #[derive(Debug, Clone)]
 pub enum OrgAuthorityRead {
     /// The tenant is outside durable ORG_SCOPE management, so the caller may
-    /// continue through the pre-existing authorization path.
+    /// continue through the ordinary strict CURRENT V6 card-evidence path.
     Unmanaged,
     /// The tenant is durably managed but the startup-frozen feature is disabled.
     Disabled,
@@ -230,14 +230,13 @@ pub(crate) fn unavailable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RuleRepository;
     use astral_types::org_scope::{
         org_build_segment, org_manifest_digest_hex, OrgGrant, OrgGrantRef,
         OrgManifestDigestMaterial, OrgMembership, OrgNode, OrgProvenance, OrgPublication,
         OrgRootActivation, OrgScope, OrgScopeKey, OrgSegmentContent, OrgSubject,
     };
     use astral_types::{PolicyError, ValidityWindow};
-
-    use crate::PermissionRule;
 
     /// 权威单元（行政根）租户，即签名 actor 的租户与 publication 归属租户。
     const TENANT: i64 = 100;
@@ -317,7 +316,7 @@ mod tests {
             revoke_fence: 1,
             dependencies: Vec::new(),
             manifest_digest_hex: String::new(),
-            compiler_version: "org-compiler-v1".to_owned(),
+            compiler_version: astral_types::AUTHORIZATION_ORG_COMPILER_VERSION.to_owned(),
             segments: vec![segment],
             operation_id: "op-publish-1".to_owned(),
         };
@@ -423,11 +422,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RuleRepository for OrgTestRepo {
-        async fn load_permission_rules(
+        async fn check_card_active(&self, _ctx: &PolicyContext) -> Result<bool, PolicyError> {
+            Ok(self.card_active)
+        }
+
+        async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
+            Ok(false)
+        }
+
+        async fn load_published_card_authorization(
             &self,
-            _card_id: i64,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            Ok(vec![])
+            _scope: &astral_types::PublishedCardEvidenceScope,
+        ) -> Result<Option<std::sync::Arc<astral_types::PublishedCardAuthorization>>, PolicyError>
+        {
+            Ok(None)
         }
 
         async fn load_org_authorization(
@@ -435,10 +443,6 @@ mod tests {
             _ctx: &PolicyContext,
         ) -> Result<OrgAuthorityRead, PolicyError> {
             Ok(self.next.clone())
-        }
-
-        async fn check_card_active(&self, _ctx: &PolicyContext) -> Result<bool, PolicyError> {
-            Ok(self.card_active)
         }
     }
 
@@ -681,6 +685,28 @@ mod tests {
         missing_tenant.tenant_id = None;
         let decision = evaluate(&missing_tenant, &repo, &evidence_value, Vec::new()).await;
         assert_pending(&decision, "org_scope.evidence_invalid");
+
+        // (f) 旧版或未来版 ORG publication compiler tags are never admission
+        // evidence, even when all identity and grant fields otherwise match.
+        for retired_version in ["org-compiler-v1", "astral-org-authorization-v5"] {
+            let mut non_current = evidence(base_publication.clone());
+            non_current.publication.compiler_version = retired_version.to_owned();
+            let error = non_current
+                .validate()
+                .expect_err("ORG admission accepts only the current V6 compiler tag");
+            assert_eq!(
+                error.message,
+                "publication compiler version is not the current authorization edition"
+            );
+            let decision = evaluate(
+                &ctx(Some(TENANT), None, None, None),
+                &repo,
+                &non_current,
+                Vec::new(),
+            )
+            .await;
+            assert_pending(&decision, "org_scope.evidence_invalid");
+        }
     }
 
     #[tokio::test]

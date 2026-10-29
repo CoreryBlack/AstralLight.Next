@@ -49,7 +49,7 @@ pub enum ContractError {
 pub struct CommandExpectation {
     pub stdout_marker: Option<String>,
     pub stderr_marker: Option<String>,
-    pub minimum_python_tests: Option<u64>,
+    pub minimum_rust_tests: Option<u64>,
     pub require_full_contract_json: bool,
 }
 
@@ -163,20 +163,6 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn parse_python_test_count(output: &str) -> Option<u64> {
-    output.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        if fields.next()? != "Ran" {
-            return None;
-        }
-        let count = fields.next()?.parse().ok()?;
-        if !matches!(fields.next()?, "test" | "tests") {
-            return None;
-        }
-        Some(count)
-    })
-}
-
 fn full_contract_status(stdout: &str) -> ReadinessStatus {
     let parsed = serde_json::from_str::<Value>(stdout).ok();
     let status = parsed
@@ -238,6 +224,29 @@ pub fn evaluate_command(
         ),
     };
 
+    if expectation.minimum_rust_tests.is_some() && status == ReadinessStatus::Pass {
+        let output_status =
+            crate::acceptance::check_rust_output_with_policy(crate::acceptance::RustOutputPolicy {
+                expected_tests: None,
+                minimum_tests: usize::try_from(expectation.minimum_rust_tests.unwrap_or(1).max(1))
+                    .unwrap_or(usize::MAX),
+                performance_cases: None,
+                stdout: &stdout,
+                stderr: &stderr,
+                exit_code: 0,
+                interrupted: false,
+                allow_outside_selection_ignored: false,
+            });
+        status = match output_status["status"].as_str() {
+            Some("PASS") => ReadinessStatus::Pass,
+            Some("SKIP") => ReadinessStatus::Skip,
+            Some("UNKNOWN") => ReadinessStatus::Unknown,
+            Some("PENDING") => ReadinessStatus::Pending,
+            Some("BLOCKED") => ReadinessStatus::Blocked,
+            Some("FAIL") => ReadinessStatus::Fail,
+            _ => ReadinessStatus::Unknown,
+        };
+    }
     let output_assertion_failed = expectation
         .stdout_marker
         .as_ref()
@@ -245,10 +254,7 @@ pub fn evaluate_command(
         || expectation
             .stderr_marker
             .as_ref()
-            .is_some_and(|marker| !stderr.contains(marker))
-        || expectation
-            .minimum_python_tests
-            .is_some_and(|minimum| parse_python_test_count(&stderr).unwrap_or_default() < minimum);
+            .is_some_and(|marker| !stderr.contains(marker));
     let mut assertion_passed = status == ReadinessStatus::Pass;
     if assertion_passed && output_assertion_failed {
         status = ReadinessStatus::Fail;
@@ -650,11 +656,11 @@ mod tests {
     }
 
     #[test]
-    fn exit_zero_needs_markers_and_minimum_python_tests() {
+    fn exit_zero_needs_markers_and_minimum_rust_tests() {
         let expectation = CommandExpectation {
             stdout_marker: Some("1 passed; 0 failed".to_owned()),
-            stderr_marker: Some("OK".to_owned()),
-            minimum_python_tests: Some(1),
+            stderr_marker: Some("completed".to_owned()),
+            minimum_rust_tests: Some(1),
             require_full_contract_json: false,
         };
         let empty = evaluate_command(
@@ -662,8 +668,8 @@ mod tests {
             &expectation,
             CommandExecution::Completed {
                 exit_code: 0,
-                stdout: String::new(),
-                stderr: "Ran 0 tests in 0.000s\n\nOK\n".to_owned(),
+                stdout: rust_test_summary(0, 0, 0, 1),
+                stderr: "completed".to_owned(),
             },
         );
         assert_eq!(empty.status, ReadinessStatus::Fail);
@@ -673,11 +679,120 @@ mod tests {
             &expectation,
             CommandExecution::Completed {
                 exit_code: 0,
-                stdout: "1 passed; 0 failed".to_owned(),
-                stderr: "Ran 1 test in 0.001s\n\nOK\n".to_owned(),
+                stdout: rust_test_summary(1, 0, 0, 0),
+                stderr: "completed".to_owned(),
             },
         );
         assert_eq!(passing.status, ReadinessStatus::Pass);
+        let ignored = evaluate_command(
+            "ignored-test",
+            &expectation,
+            CommandExecution::Completed {
+                exit_code: 0,
+                stdout: rust_test_summary(1, 0, 1, 0),
+                stderr: "completed".to_owned(),
+            },
+        );
+        assert_eq!(ignored.status, ReadinessStatus::Skip);
+        assert!(!ignored.assertion_passed);
+        let internal_skip = evaluate_command(
+            "internal-skip",
+            &expectation,
+            CommandExecution::Completed {
+                exit_code: 0,
+                stdout: rust_test_summary(1, 0, 0, 0),
+                stderr: "[SKIP] missing dependency\ncompleted".to_owned(),
+            },
+        );
+
+        assert_eq!(internal_skip.status, ReadinessStatus::Skip);
+        assert!(!internal_skip.assertion_passed);
+        let failed = evaluate_command(
+            "failed-test",
+            &expectation,
+            CommandExecution::Completed {
+                exit_code: 0,
+                stdout: rust_test_summary(1, 1, 0, 0),
+                stderr: "completed".to_owned(),
+            },
+        );
+        assert_eq!(failed.status, ReadinessStatus::Fail);
+        assert!(!failed.assertion_passed);
+    }
+
+    fn rust_test_summary(passed: u64, failed: u64, ignored: u64, filtered: u64) -> String {
+        format!(
+            "test result: ok. {passed} passed; {failed} failed; {ignored} ignored; 0 measured; {filtered} filtered out; finished in 0.00s\n"
+        )
+    }
+
+    #[test]
+    fn minimum_rust_tests_reject_exit_zero_without_cargo_summary() {
+        let expectation = CommandExpectation {
+            minimum_rust_tests: Some(1),
+            ..CommandExpectation::default()
+        };
+        let result = evaluate_command(
+            "missing-summary",
+            &expectation,
+            CommandExecution::Completed {
+                exit_code: 0,
+                stdout: "process completed without a Rust test summary".to_owned(),
+                stderr: String::new(),
+            },
+        );
+        assert_eq!(result.status, ReadinessStatus::Fail);
+        assert!(!result.assertion_passed);
+    }
+
+    #[test]
+    fn minimum_rust_test_count_cannot_turn_an_empty_target_into_pass() {
+        let expectation = CommandExpectation {
+            minimum_rust_tests: Some(0),
+            ..CommandExpectation::default()
+        };
+        let result = evaluate_command(
+            "empty-target",
+            &expectation,
+            CommandExecution::Completed {
+                exit_code: 0,
+                stdout: rust_test_summary(0, 0, 0, 0),
+                stderr: String::new(),
+            },
+        );
+        assert_eq!(result.status, ReadinessStatus::Fail);
+        assert!(!result.assertion_passed);
+    }
+
+    #[test]
+    fn rust_test_acceptance_preserves_pending_unknown_and_blocked_statuses() {
+        let expectation = CommandExpectation {
+            minimum_rust_tests: Some(1),
+            ..CommandExpectation::default()
+        };
+        for (marker, expected) in [
+            (
+                "[PENDING] reconciliation required",
+                ReadinessStatus::Pending,
+            ),
+            ("[UNKNOWN] stream ended", ReadinessStatus::Unknown),
+            (
+                "[BLOCKED] integration prerequisite missing",
+                ReadinessStatus::Blocked,
+            ),
+        ] {
+            let result = evaluate_command(
+                "non-pass-state",
+                &expectation,
+                CommandExecution::Completed {
+                    exit_code: 0,
+                    stdout: rust_test_summary(1, 0, 0, 0),
+                    stderr: marker.to_owned(),
+                },
+            );
+            assert_eq!(result.status, expected, "{marker}");
+            assert!(!result.assertion_passed, "{marker}");
+        }
     }
 
     #[test]

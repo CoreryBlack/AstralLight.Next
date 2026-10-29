@@ -8,19 +8,18 @@
 //! - `authorization_grant_revision`: an append-only, immutable per-grant
 //!   revision ledger (including tombstones). Existing revisions are never
 //!   `UPDATE`d or deleted by this module.
-//! - `authorization_delta_event`: a durable typed delta work queue with CAS
-//!   lease claim / mark / release semantics for the future incremental
-//!   projection worker.
+//! - `authorization_delta_event`: a durable typed delta work queue. Claims and
+//!   terminal transitions are available only through the aggregate-owned
+//!   `WorkerOwned` execution protocol.
 //!
 //! The `authorization_impact_plan(_item)`, projection manifest chain and
 //! archive outbox tables of the same migration are owned by
-//! [`crate::authorization_projection_repository`] as of this slice; this module
-//! never writes them. Both modules write ONLY the new Rust-owned tables of
-//! migration `20260825000002_incremental_projection_archive.sql`. The legacy
-//! `permission_rule_snapshot` / `rule_set_snapshot` tables, the legacy
-//! `authorization_projection_head`/outbox path, MQ queues and caches stay under
-//! the exclusive ownership of the existing worker — no statement here may touch
-//! them (no double writer).
+//! [`crate::authorization_projection_repository`]; this module never writes
+//! them. Both modules write ONLY the Rust-owned tables of migration
+//! `20260825000002_incremental_projection_archive.sql`. The retained
+//! `authorization_projection_head`/outbox path is limited to source correlation,
+//! revoke / RuleSet initialization association and ELIGIBILITY L1 invalidation;
+//! it is not a canonical publication path and no statement here writes it.
 //!
 //! # Canonical identity and hash boundary
 //!
@@ -79,7 +78,7 @@ use uuid::Uuid;
 
 use astral_types::{
     CanonicalGrant, DependencyVector, GrantDelta, GrantId, GrantRevision, GrantState, TenantScope,
-    SYSTEM_ACTOR_ID,
+    AUTHORIZATION_COMPILER_VERSION, SYSTEM_ACTOR_ID,
 };
 
 /// Ledger row status allowed to receive new revisions.
@@ -92,18 +91,13 @@ pub const DELTA_STATUS_LEASED: &str = "LEASED";
 pub const DELTA_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 /// Operator-quarantined terminal delta event status (`QUARANTINED`).
 ///
-/// The `status` column carries no CHECK constraint, so the type system and
-/// every statement in this module enforce the vocabulary instead:
-/// - [`claim_next_delta_event_in_tx`] only ever selects `PENDING` rows whose
-///   backoff window elapsed or `LEASED` rows whose lease expired; a
-///   quarantined row is never selectable again.
-/// - [`load_claimed_delta_event_for_update_in_tx`] (read_claimed) accepts
-///   `LEASED` rows only and re-checks the status inside its decode, so a
-///   quarantined row can never be surfaced to a worker through recovery.
-/// - Only [`requeue_quarantined_delta_event`] moves a row out of quarantine,
-///   back to `PENDING`; no other mutation knows this state and nothing may
-///   jump from `PENDING`/`SUCCEEDED` directly into it except
-///   [`mark_delta_event_quarantined`] applied to a live lease.
+/// The `status` column carries no CHECK constraint, so the owned claim
+/// candidates enforce the status vocabulary: only due `PENDING` rows and
+/// expired `LEASED` rows are selectable, never `QUARANTINED`. The strict
+/// owned claim readback also accepts only `LEASED` rows.
+/// Only [`requeue_quarantined_delta_event`] moves a row out of
+/// quarantine and back into `PENDING`; owned transitions are the sole execution
+/// mutation path.
 ///
 /// Because the schema has no `quarantined_at` column, `updated_at`
 /// (`ON UPDATE CURRENT_TIMESTAMP`) is the minimal durable terminal-state
@@ -155,11 +149,218 @@ pub(super) async fn owned_candidate_receipts(
     owned_execution::candidate_receipts(pool, scope, aggregate).await
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct OwnedStableEventRow {
+    delta_event_id: i64,
+    event_id: String,
+    operation_id: String,
+    event_type: String,
+    tenant_id: i64,
+    card_id: Option<i64>,
+    aggregate_type: String,
+    aggregate_id: i64,
+    grant_id: String,
+    base_version: i64,
+    target_version: i64,
+    source_generation: i64,
+    revoke_fence: i64,
+    invalidates_published_evidence: i8,
+    before_image_json: Option<String>,
+    before_digest: Option<Vec<u8>>,
+    delta_json: String,
+    semantic_hash: Vec<u8>,
+    dependency_hash: Vec<u8>,
+    compiler_version: String,
+    status: String,
+    attempts: i64,
+    cas_version: i64,
+}
+
+impl OwnedStableEventRow {
+    fn to_candidate(&self) -> DeltaClaimCandidateRow {
+        DeltaClaimCandidateRow {
+            delta_event_id: self.delta_event_id,
+            event_id: self.event_id.clone(),
+            operation_id: self.operation_id.clone(),
+            event_type: self.event_type.clone(),
+            tenant_id: self.tenant_id,
+            card_id: self.card_id,
+            aggregate_type: self.aggregate_type.clone(),
+            aggregate_id: self.aggregate_id,
+            grant_id: self.grant_id.clone(),
+            base_version: self.base_version,
+            target_version: self.target_version,
+            source_generation: self.source_generation,
+            revoke_fence: self.revoke_fence,
+            before_image_json: self.before_image_json.clone(),
+            before_digest: self.before_digest.clone(),
+            delta_json: self.delta_json.clone(),
+            semantic_hash: self.semantic_hash.clone(),
+            dependency_hash: self.dependency_hash.clone(),
+            compiler_version: self.compiler_version.clone(),
+            status: self.status.clone(),
+            attempts: self.attempts,
+            cas_version: self.cas_version,
+        }
+    }
+}
+
+/// Owned protocol receipt lookup. Only the WorkerOwned claim path consumes this
+/// row; no unowned claim outcome or transition API is exposed.
+const OWNED_STABLE_EVENT_SELECT_SQL: &str = "SELECT delta_event_id, event_id, operation_id, \
+    event_type, tenant_id, card_id, aggregate_type, aggregate_id, grant_id, base_version, \
+    target_version, source_generation, revoke_fence, invalidates_published_evidence, \
+    CAST(before_image_json AS CHAR) AS before_image_json, before_digest, \
+    CAST(delta_json AS CHAR) AS delta_json, semantic_hash, dependency_hash, compiler_version, \
+    status, attempts, cas_version \
+    FROM authorization_delta_event \
+    WHERE event_id = ? AND tenant_id = ? FOR UPDATE";
+
+/// Same-grant predecessor probe within an aggregate-owned claim.
+const OWNED_STABLE_EVENT_SIBLING_ORDER_PROBE_SQL: &str = "SELECT pred.delta_event_id \
+    FROM authorization_delta_event pred \
+    WHERE pred.tenant_id = ? \
+      AND pred.grant_id = ? \
+      AND pred.target_version < ? \
+      AND pred.status IN ('PENDING', 'LEASED') \
+    ORDER BY pred.target_version, pred.delta_event_id \
+    LIMIT 1 FOR UPDATE";
+
+/// Shared claimability predicate for owned candidate admission and the watchdog.
+pub const OWNED_DELTA_CLAIM_SIBLING_ORDER_GATE: &str =
+    "AND NOT EXISTS (SELECT 1 FROM authorization_delta_event pred \
+    WHERE pred.tenant_id = authorization_delta_event.tenant_id \
+      AND pred.grant_id = authorization_delta_event.grant_id \
+      AND pred.target_version < authorization_delta_event.target_version \
+      AND pred.status IN ('PENDING', 'LEASED'))";
+
+/// Evaluated only after locking the aggregate lane and exact delta.
+const OWNED_DELTA_CLAIM_ELIGIBILITY: &str = "AND ((status = 'PENDING' \
+           AND (next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP())) \
+          OR (status = 'LEASED' \
+              AND lease_expires_at IS NOT NULL \
+              AND lease_expires_at <= UTC_TIMESTAMP()))";
+
+const OWNED_DELTA_CLAIM_INSTALL_SQL: &str = "UPDATE authorization_delta_event \
+    SET status = 'LEASED', \
+        lease_owner = ?, \
+        lease_token_hash = ?, \
+        lease_expires_at = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()), \
+        cas_version = cas_version + 1, \
+        attempts = attempts + 1 \
+    WHERE delta_event_id = ? ";
+
+const OWNED_DELTA_CLAIM_READBACK_SQL: &str =
+    "SELECT lease_expires_at, attempts FROM authorization_delta_event WHERE delta_event_id = ?";
+
+fn verify_owned_stable_event_request_binding(
+    request: &DeltaEventAppendRequest,
+    row: &OwnedStableEventRow,
+) -> Result<(), GrantRepositoryError> {
+    let mismatch = |field: &str| {
+        GrantRepositoryError::ScopeViolation(format!(
+            "code=grant_repository.owned_event_payload_mismatch;field={field}"
+        ))
+    };
+    if row.event_id != request.event_id {
+        return Err(mismatch("event_id"));
+    }
+    if row.operation_id != request.operation_id {
+        return Err(mismatch("operation_id"));
+    }
+    if DeltaEventType::from_sql(&row.event_type)? != request.event_type {
+        return Err(mismatch("event_type"));
+    }
+    if row.tenant_id != request.tenant_id {
+        return Err(mismatch("tenant_id"));
+    }
+    if row.card_id != request.card_id {
+        return Err(mismatch("card_id"));
+    }
+    if row.aggregate_type != request.aggregate_type || row.aggregate_id != request.aggregate_id {
+        return Err(mismatch("aggregate_identity"));
+    }
+    if decode_grant_id_sql(&row.grant_id)? != request.grant_id {
+        return Err(mismatch("grant_id"));
+    }
+    if row.base_version != request.base_version {
+        return Err(mismatch("base_version"));
+    }
+    if row.target_version != request.target_version {
+        return Err(mismatch("target_version"));
+    }
+    if row.source_generation < 0
+        || u64::try_from(row.source_generation).unwrap_or(u64::MAX) != request.source_generation
+    {
+        return Err(mismatch("source_generation"));
+    }
+    if row.revoke_fence < 0
+        || u64::try_from(row.revoke_fence).unwrap_or(u64::MAX) != request.revoke_fence
+    {
+        return Err(mismatch("revoke_fence"));
+    }
+    if (row.invalidates_published_evidence != 0) != request.invalidates_published_evidence {
+        return Err(mismatch("invalidates_published_evidence"));
+    }
+    match (&request.before_image_json, &request.before_digest_hex) {
+        (Some(image), Some(digest)) => {
+            let request_image: serde_json::Value =
+                serde_json::from_str(image).map_err(|_| mismatch("before_image_json"))?;
+            let stored_image: serde_json::Value = row
+                .before_image_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok())
+                .ok_or_else(|| mismatch("before_image_json"))?;
+            if stored_image != request_image {
+                return Err(mismatch("before_image_json"));
+            }
+            let row_digest = Sha256Digest::from_optional_bytes(row.before_digest.as_deref())?;
+            if row_digest != Some(Sha256Digest::from_hex(digest)?) {
+                return Err(mismatch("before_digest"));
+            }
+        }
+        (None, None) => {
+            if row.before_image_json.is_some() || row.before_digest.is_some() {
+                return Err(mismatch("before_image_absent"));
+            }
+        }
+        _ => {
+            return Err(GrantRepositoryError::ScopeViolation(
+                "code=grant_repository.before_image_digest_pairing".to_owned(),
+            ))
+        }
+    }
+    let requested_delta: serde_json::Value =
+        serde_json::from_str(&request.delta_json).map_err(|_| mismatch("delta_json"))?;
+    let stored_delta: serde_json::Value =
+        serde_json::from_str(&row.delta_json).map_err(|_| mismatch("delta_json"))?;
+    if stored_delta != requested_delta {
+        return Err(mismatch("delta_json"));
+    }
+    if Sha256Digest::from_bytes(row.semantic_hash.clone())?
+        != Sha256Digest::from_hex(&request.semantic_hash_hex)?
+    {
+        return Err(mismatch("semantic_hash"));
+    }
+    if Sha256Digest::from_bytes(row.dependency_hash.clone())?
+        != Sha256Digest::from_hex(&request.dependency_hash_hex)?
+    {
+        return Err(mismatch("dependency_hash"));
+    }
+    if row.compiler_version != AUTHORIZATION_COMPILER_VERSION
+        || request.compiler_version != AUTHORIZATION_COMPILER_VERSION
+        || row.compiler_version != request.compiler_version
+    {
+        return Err(mismatch("compiler_version"));
+    }
+    Ok(())
+}
+
 pub(super) async fn exact_owned_event_succeeded_in_tx(
     tx: &mut Transaction<'_, MySql>,
     request: &DeltaEventAppendRequest,
 ) -> Result<bool, GrantRepositoryError> {
-    let row: Option<StableEventClaimRow> = sqlx::query_as(STABLE_EVENT_CLAIM_SELECT_SQL)
+    let row: Option<OwnedStableEventRow> = sqlx::query_as(OWNED_STABLE_EVENT_SELECT_SQL)
         .bind(&request.event_id)
         .bind(request.tenant_id)
         .fetch_optional(&mut **tx)
@@ -167,17 +368,8 @@ pub(super) async fn exact_owned_event_succeeded_in_tx(
     let Some(row) = row else {
         return Ok(false);
     };
-    verify_stable_event_request_binding(request, &row)?;
+    verify_owned_stable_event_request_binding(request, &row)?;
     Ok(row.status == DELTA_STATUS_SUCCEEDED)
-}
-
-fn require_legacy_delta_execution() -> Result<(), GrantRepositoryError> {
-    if crate::projection_execution_mode() == crate::ProjectionExecutionMode::WorkerOwned {
-        return Err(GrantRepositoryError::ScopeViolation(
-            "code=projection_execution.legacy_execution_refused".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -432,10 +624,6 @@ fn validated_json(value: &str, field: &'static str) -> Result<(), GrantRepositor
         ))
     })?;
     Ok(())
-}
-
-fn truncate_last_error(message: &str) -> String {
-    message.chars().take(MAX_LAST_ERROR_LENGTH).collect()
 }
 
 fn db_unique_violation(error: &sqlx::Error) -> bool {
@@ -880,11 +1068,11 @@ fn validate_revision_request(
         MAX_GRANT_OPERATION_ID_LENGTH,
         "operation_id",
     )?;
-    validated_text(
-        &request.compiler_version,
-        MAX_COMPILER_VERSION_LENGTH,
-        "compiler_version",
-    )?;
+    if request.compiler_version != AUTHORIZATION_COMPILER_VERSION {
+        return Err(GrantRepositoryError::ScopeViolation(
+            "code=grant_repository.non_current_compiler".to_owned(),
+        ));
+    }
     if let Some(card_id) = request.card_id_scope {
         positive_i64(card_id, "card_id_scope")?;
     }
@@ -1313,11 +1501,11 @@ where
         MAX_GRANT_OPERATION_ID_LENGTH,
         "operation_id",
     )?;
-    validated_text(
-        &request.compiler_version,
-        MAX_COMPILER_VERSION_LENGTH,
-        "compiler_version",
-    )?;
+    if request.compiler_version != AUTHORIZATION_COMPILER_VERSION {
+        return Err(GrantRepositoryError::ScopeViolation(
+            "code=grant_repository.non_current_compiler".to_owned(),
+        ));
+    }
     if request.base_version < 0 || request.target_version < 0 {
         return Err(GrantRepositoryError::ScopeViolation(
             "code=grant_repository.negative_version".to_owned(),
@@ -1507,145 +1695,6 @@ pub struct DeltaEventClaimScope {
     pub tenant_id: i64,
     pub card_id: Option<i64>,
 }
-
-/// Eligibility predicate text embedded verbatim into BOTH claim statements
-/// below.
-///
-/// Semantics:
-/// - A `PENDING` row is claimable only once its optional backoff window has
-///   elapsed (`next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP()`);
-///   a future-scheduled retry is never hot-looped.
-/// - An EXPIRED `LEASED` row is an unknown-result takeover and must NOT be
-///   gated by any stale `next_attempt_at`: reconciliation of the unknown
-///   outcome takes precedence over an old failure schedule, so this branch
-///   deliberately ignores that column entirely.
-/// - No other status (`SUCCEEDED`, `QUARANTINED`, …) is ever selectable.
-///
-/// The install UPDATE embeds this exact text so a selected row cannot be
-/// seized by an inconsistent condition afterwards; char-for-char mirroring
-/// between candidate and install copies is pinned by
-/// [`delta_event_statements_match_their_bind_lists`] (no DRY cross-statement
-/// construction exists because `concat!` only accepts literals).
-///
-/// Index note: `idx_ade_lease(status, lease_expires_at, delta_event_id)`
-/// serves both arms of the row-level eligibility predicate through its
-/// `status` prefix, and `idx_ade_grant_chain(tenant_id, grant_id, status,
-/// target_version)` (migration 20260903000001) serves the sibling-ordering
-/// gate's per-grant seek.
-#[cfg(test)]
-const DELTA_CLAIM_ELIGIBLE_PREDICATE: &str = "((status = 'PENDING' \
-    AND (next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP())) \
-    OR (status = 'LEASED' \
-        AND lease_expires_at IS NOT NULL \
-        AND lease_expires_at <= UTC_TIMESTAMP()))";
-
-/// Claim-side per-grant chain ordering gate (campaign finding 10.D-2).
-///
-/// An event whose same-grant chain predecessor is still non-terminal
-/// (PENDING / LEASED) must NOT be claimed: the partitioner would deterministically
-/// answer `claimed_behind_unpublished_siblings` (a per-grant chain revision can
-/// never skip an unpublished predecessor), so claiming would only burn the
-/// attempt budget (`attempts = attempts + 1` at install) with zero progress and
-/// eventually park the sibling under the maximal backoff — the high-churn
-/// drainage pathology. Deferring the claim keeps `attempts` at zero; the event
-/// becomes claimable the moment its predecessor reaches a terminal state.
-///
-/// QUARANTINED predecessors deliberately do NOT gate the claim: the event stays
-/// claimable so the decision path surfaces the unorderable chain through its
-/// observable Blocked / budget-exhausted path instead of a silent stall.
-///
-/// The correlated NOT EXISTS reads the same table as the outer SELECT — legal
-/// for SELECT, but MySQL's error 1093 forbids it inside
-/// `DELTA_CLAIM_INSTALL_SQL`. The install therefore keeps only the row-level
-/// eligibility mirror: the candidate row is already `FOR UPDATE`-locked in the
-/// same transaction, and any cross-row race (predecessor published/claimed
-/// between candidate read and install) is fail-closed by the partitioner
-/// decision, never by a silent skip.
-///
-/// Reference text for the watchdog probe in astral-trustgraph, which must stay
-/// same-shaped with the claim candidate predicate (`has_claimable_work`).
-pub const DELTA_CLAIM_SIBLING_ORDER_GATE: &str =
-    "AND NOT EXISTS (SELECT 1 FROM authorization_delta_event pred \
-    WHERE pred.tenant_id = authorization_delta_event.tenant_id \
-      AND pred.grant_id = authorization_delta_event.grant_id \
-      AND pred.target_version < authorization_delta_event.target_version \
-      AND pred.status IN ('PENDING', 'LEASED'))";
-
-/// Candidate selection for a claim. Ordered deterministically; expired leases
-/// are reclaimable exactly like pending rows whose backoff window ended, and
-/// the per-grant sibling-ordering gate (pinned byte-equal to
-/// [`DELTA_CLAIM_SIBLING_ORDER_GATE`] by the statement-shape tests — no DRY
-/// cross-statement construction exists because `concat!` only accepts
-/// literals) defers any event whose own chain has a non-terminal predecessor.
-/// Locks the candidate row.
-const DELTA_CLAIM_CANDIDATE_UNSCOPED_SQL: &str = "SELECT delta_event_id, event_id, operation_id, \
-    event_type, tenant_id, card_id, aggregate_type, aggregate_id, grant_id, base_version, \
-    target_version, source_generation, revoke_fence, CAST(before_image_json AS CHAR) AS before_image_json, before_digest, \
-    CAST(delta_json AS CHAR) AS delta_json, semantic_hash, dependency_hash, compiler_version, status, attempts, cas_version \
-    FROM authorization_delta_event \
-    WHERE tenant_id = ? \
-      AND ((status = 'PENDING' \
-           AND (next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP())) \
-          OR (status = 'LEASED' \
-              AND lease_expires_at IS NOT NULL \
-              AND lease_expires_at <= UTC_TIMESTAMP())) \
-      AND NOT EXISTS (SELECT 1 FROM authorization_delta_event pred \
-          WHERE pred.tenant_id = authorization_delta_event.tenant_id \
-            AND pred.grant_id = authorization_delta_event.grant_id \
-            AND pred.target_version < authorization_delta_event.target_version \
-            AND pred.status IN ('PENDING', 'LEASED')) \
-    ORDER BY COALESCE(next_attempt_at, created_at), delta_event_id \
-    LIMIT 1 FOR UPDATE";
-
-const DELTA_CLAIM_CANDIDATE_CARD_SCOPED_SQL: &str =
-    "SELECT delta_event_id, event_id, operation_id, \
-    event_type, tenant_id, card_id, aggregate_type, aggregate_id, grant_id, base_version, \
-    target_version, source_generation, revoke_fence, CAST(before_image_json AS CHAR) AS before_image_json, before_digest, \
-    CAST(delta_json AS CHAR) AS delta_json, semantic_hash, dependency_hash, compiler_version, status, attempts, cas_version \
-    FROM authorization_delta_event \
-    WHERE tenant_id = ? AND card_id = ? \
-      AND ((status = 'PENDING' \
-           AND (next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP())) \
-          OR (status = 'LEASED' \
-              AND lease_expires_at IS NOT NULL \
-              AND lease_expires_at <= UTC_TIMESTAMP())) \
-      AND NOT EXISTS (SELECT 1 FROM authorization_delta_event pred \
-          WHERE pred.tenant_id = authorization_delta_event.tenant_id \
-            AND pred.grant_id = authorization_delta_event.grant_id \
-            AND pred.target_version < authorization_delta_event.target_version \
-            AND pred.status IN ('PENDING', 'LEASED')) \
-    ORDER BY COALESCE(next_attempt_at, created_at), delta_event_id \
-    LIMIT 1 FOR UPDATE";
-
-/// Defense-in-depth install: the row is already locked, but the row-level
-/// eligibility predicate (mirroring the candidate statements verbatim) is
-/// repeated here so the mutation can never promote a row that became
-/// ineligible between candidate read and install. The sibling-ordering gate
-/// is deliberately absent: MySQL's error 1093 forbids a correlated subquery
-/// on the UPDATE target table, the gate's cross-row state is re-evaluated by
-/// the partitioner decision anyway (fail-closed), and the candidate→install
-/// window holds the row lock so its own eligibility cannot change.
-const DELTA_CLAIM_INSTALL_SQL: &str = "UPDATE authorization_delta_event \
-    SET status = 'LEASED', \
-        lease_owner = ?, \
-        lease_token_hash = ?, \
-        lease_expires_at = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()), \
-        cas_version = cas_version + 1, \
-        attempts = attempts + 1 \
-    WHERE delta_event_id = ? \
-      AND ((status = 'PENDING' \
-           AND (next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP())) \
-          OR (status = 'LEASED' \
-              AND lease_expires_at IS NOT NULL \
-              AND lease_expires_at <= UTC_TIMESTAMP()))";
-
-/// Authoritative post-install readback: server-side expiry PLUS the durable
-/// attempt counter written by this very claim (`attempts = attempts + 1`),
-/// so [`DeltaEventClaim::attempts`] always equals the persisted row value.
-/// Worker budget decisions MUST consume this current attempt count, never a
-/// pre-install view.
-const DELTA_CLAIM_READBACK_SQL: &str =
-    "SELECT lease_expires_at, attempts FROM authorization_delta_event WHERE delta_event_id = ?";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Partition lease (multi-tenant redesign Phase 1; design doc
@@ -1896,28 +1945,6 @@ const PARTITION_DISCOVERY_ELIGIBILITY_SQL: &str = " \
     ORDER BY oldest_due, tenant_id, aggregate_type, aggregate_id \
     LIMIT ?";
 
-/// Partition-scoped claim candidate: the unscoped candidate statement plus the
-/// partition identity filter. Everything else — eligibility, sibling-ordering
-/// gate, ordering, locking — is byte-identical to the tenant claim.
-const DELTA_CLAIM_CANDIDATE_PARTITION_SQL: &str = "SELECT delta_event_id, event_id, operation_id, \
-    event_type, tenant_id, card_id, aggregate_type, aggregate_id, grant_id, base_version, \
-    target_version, source_generation, revoke_fence, CAST(before_image_json AS CHAR) AS before_image_json, before_digest, \
-    CAST(delta_json AS CHAR) AS delta_json, semantic_hash, dependency_hash, compiler_version, status, attempts, cas_version \
-    FROM authorization_delta_event \
-    WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ? \
-      AND ((status = 'PENDING' \
-           AND (next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP())) \
-          OR (status = 'LEASED' \
-              AND lease_expires_at IS NOT NULL \
-              AND lease_expires_at <= UTC_TIMESTAMP())) \
-      AND NOT EXISTS (SELECT 1 FROM authorization_delta_event pred \
-          WHERE pred.tenant_id = authorization_delta_event.tenant_id \
-            AND pred.grant_id = authorization_delta_event.grant_id \
-            AND pred.target_version < authorization_delta_event.target_version \
-            AND pred.status IN ('PENDING', 'LEASED')) \
-    ORDER BY COALESCE(next_attempt_at, created_at), delta_event_id \
-    LIMIT 1 FOR UPDATE";
-
 #[derive(Debug, sqlx::FromRow)]
 struct DeltaClaimCandidateRow {
     delta_event_id: i64,
@@ -1986,79 +2013,10 @@ fn validate_lease_seconds(lease_seconds: i64) -> Result<(), GrantRepositoryError
     Ok(())
 }
 
-/// Claim the next claimable delta event for `scope` inside the caller's
-/// transaction.
-///
-/// - Only rows whose lease expired (`lease_expires_at <= UTC_TIMESTAMP()`) are
-///   taken over regardless of schedule history, and `PENDING` rows are eligible
-///   only once their optional `next_attempt_at` window has elapsed; live leases
-///   are never stolen and future-scheduled backoffs are never jumped.
-/// - Generates a fresh run-scoped [`DeltaLeaseToken`], installs owner + token
-///   hash + server-side expiry atomically and bumps `attempts`/`cas_version`.
-/// - The returned `attempts` value is read back AFTER the install, i.e. it is
-///   the durable post-increment row value (first-ever attempt = 1); workers
-///   must base attempt budgets on it, never on a pre-claim counter.
-/// - Returns `Ok(None)` when nothing is claimable; the transaction stays open
-///   (no rows locked) and the caller decides commit/rollback.
-/// - A zero-row install while holding the row lock means the engine betrayed
-///   the read snapshot; that becomes [`GrantRepositoryError::ClaimRace`]
-///   instead of a silent retry.
-pub async fn claim_next_delta_event_in_tx(
-    tx: &mut Transaction<'_, MySql>,
-    scope: DeltaEventClaimScope,
-    lease_owner: &str,
-    lease_seconds: i64,
-) -> Result<Option<DeltaEventClaim>, GrantRepositoryError> {
-    require_legacy_delta_execution()?;
-    positive_i64(scope.tenant_id, "tenant_id")?;
-    if let Some(card_id) = scope.card_id {
-        positive_i64(card_id, "card_id")?;
-    }
-    validated_text(lease_owner, MAX_GRANT_LEASE_OWNER_LENGTH, "lease_owner")?;
-    validate_lease_seconds(lease_seconds)?;
-
-    let candidate: Option<DeltaClaimCandidateRow> = if scope.card_id.is_some() {
-        sqlx::query_as(DELTA_CLAIM_CANDIDATE_CARD_SCOPED_SQL)
-            .bind(scope.tenant_id)
-            .bind(scope.card_id)
-            .fetch_optional(&mut **tx)
-            .await?
-    } else {
-        sqlx::query_as(DELTA_CLAIM_CANDIDATE_UNSCOPED_SQL)
-            .bind(scope.tenant_id)
-            .fetch_optional(&mut **tx)
-            .await?
-    };
-    let Some(candidate) = candidate else {
-        return Ok(None);
-    };
-    // The SQL predicate already restricts eligibility; this mirror check makes
-    // the invariant explicit and keeps every row field read defensively.
-    if candidate.status != DELTA_STATUS_PENDING && candidate.status != DELTA_STATUS_LEASED {
-        return Err(GrantRepositoryError::Mapping(format!(
-            "code=grant_repository.claim_ineligible_status;value={}",
-            candidate.status
-        )));
-    }
-    // Defensive sanity on the pre-install snapshot; the AUTHORITATIVE attempt
-    // counter returned to workers comes from DELTA_CLAIM_READBACK_SQL below.
-    if candidate.attempts < 0 {
-        return Err(GrantRepositoryError::Mapping(format!(
-            "code=grant_repository.claim_negative_attempts_snapshot;value={}",
-            candidate.attempts
-        )));
-    }
-
-    install_claimed_event(tx, candidate, lease_owner, lease_seconds)
-        .await
-        .map(Some)
-}
-
-/// Shared claim tail for every candidate flavor (tenant/card-scoped and
-/// partition-scoped): install the lease, read back the authoritative expiry
-/// AND the durable post-install attempt counter, and assemble the claim. The
-/// eligibility mirror checks ride along so no candidate flavor can skip them.
-async fn install_claimed_event(
+/// Shared tail for a WorkerOwned exact event: install its event lease, read
+/// back the authoritative expiry and durable post-install attempt counter, and
+/// assemble the owned protocol's event claim.
+async fn install_owned_claimed_event(
     tx: &mut Transaction<'_, MySql>,
     candidate: DeltaClaimCandidateRow,
     lease_owner: &str,
@@ -2073,7 +2031,7 @@ async fn install_claimed_event(
         )));
     }
     // Defensive sanity on the pre-install snapshot; the AUTHORITATIVE attempt
-    // counter returned to workers comes from DELTA_CLAIM_READBACK_SQL below.
+    // counter returned to workers comes from OWNED_DELTA_CLAIM_READBACK_SQL below.
     if candidate.attempts < 0 {
         return Err(GrantRepositoryError::Mapping(format!(
             "code=grant_repository.claim_negative_attempts_snapshot;value={}",
@@ -2081,9 +2039,10 @@ async fn install_claimed_event(
         )));
     }
 
-    owned_execution::join_legacy_accounting(tx, candidate.delta_event_id).await?;
     let token = DeltaLeaseToken::new_run_scoped();
-    let install = sqlx::query(DELTA_CLAIM_INSTALL_SQL)
+    let install_statement =
+        format!("{OWNED_DELTA_CLAIM_INSTALL_SQL}{OWNED_DELTA_CLAIM_ELIGIBILITY}");
+    let install = sqlx::query(&install_statement)
         .bind(lease_owner)
         .bind(token.token_hash().as_bytes().to_vec())
         .bind(lease_seconds)
@@ -2098,7 +2057,7 @@ async fn install_claimed_event(
     // attempt counter back instead of mirroring a client clock or reusing the
     // pre-install candidate snapshot, keeping the returned claim honest.
     let (expires_at, installed_attempts): (Option<PrimitiveDateTime>, i64) =
-        sqlx::query_as(DELTA_CLAIM_READBACK_SQL)
+        sqlx::query_as(OWNED_DELTA_CLAIM_READBACK_SQL)
             .bind(candidate.delta_event_id)
             .fetch_one(&mut **tx)
             .await?;
@@ -2207,7 +2166,6 @@ pub async fn acquire_partition_lease(
     lease_owner: &str,
     lease_seconds: i64,
 ) -> Result<Option<PartitionLeaseHandle>, GrantRepositoryError> {
-    require_legacy_delta_execution()?;
     identity.validate().map_err(|error| {
         GrantRepositoryError::Mapping(format!(
             "code=grant_repository.invalid_partition_identity;error={error}"
@@ -2279,7 +2237,6 @@ pub async fn acquire_partition_lease(
     }
 
     let mut takeover_tx = pool.begin().await?;
-    owned_execution::refuse_owned_partition_history(&mut takeover_tx, identity).await?;
     let takeover = sqlx::query(PARTITION_LEASE_TAKEOVER_SQL)
         .bind(lease_owner)
         .bind(token_hash)
@@ -2329,11 +2286,9 @@ pub async fn renew_partition_lease(
     handle: &PartitionLeaseHandle,
     lease_seconds: i64,
 ) -> Result<(), GrantRepositoryError> {
-    require_legacy_delta_execution()?;
     validate_partition_lease_handle(handle)?;
     validate_lease_seconds(lease_seconds)?;
     let mut tx = pool.begin().await?;
-    owned_execution::refuse_owned_partition_history(&mut tx, &handle.identity).await?;
     let result = sqlx::query(PARTITION_LEASE_RENEW_SQL)
         .bind(lease_seconds)
         .bind(handle.identity.tenant_id)
@@ -2370,10 +2325,8 @@ pub async fn release_partition_lease(
     pool: &sqlx::MySqlPool,
     handle: &PartitionLeaseHandle,
 ) -> Result<(), GrantRepositoryError> {
-    require_legacy_delta_execution()?;
     validate_partition_lease_handle(handle)?;
     let mut tx = pool.begin().await?;
-    owned_execution::refuse_owned_partition_history(&mut tx, &handle.identity).await?;
     let audit_state = read_partition_lease_audit_state_for_update_in_tx(
         &mut tx,
         &handle.identity,
@@ -2449,46 +2402,6 @@ pub async fn discover_claimable_partitions(
     }
     let rows = query.bind(limit).fetch_all(pool).await?;
     Ok(rows)
-}
-
-/// Partition-scoped claim: identical contract to
-/// [`claim_next_delta_event_in_tx`] but restricted to one
-/// `(tenant_id, aggregate_type, aggregate_id)` partition. The caller MUST hold
-/// that partition's lease; the lease is what makes per-partition publication
-/// serialization real, this function only narrows the candidate surface.
-pub async fn claim_next_delta_event_in_partition_tx(
-    tx: &mut Transaction<'_, MySql>,
-    scope: DeltaEventClaimScope,
-    identity: &crate::authorization_projection_repository::ProjectionAggregateIdentity,
-    lease_owner: &str,
-    lease_seconds: i64,
-) -> Result<Option<DeltaEventClaim>, GrantRepositoryError> {
-    require_legacy_delta_execution()?;
-    positive_i64(scope.tenant_id, "tenant_id")?;
-    if let Some(card_id) = scope.card_id {
-        positive_i64(card_id, "card_id")?;
-    }
-    validated_text(lease_owner, MAX_GRANT_LEASE_OWNER_LENGTH, "lease_owner")?;
-    validate_lease_seconds(lease_seconds)?;
-    identity.validate().map_err(|error| {
-        GrantRepositoryError::Mapping(format!(
-            "code=grant_repository.invalid_partition_identity;error={error}"
-        ))
-    })?;
-
-    let candidate: Option<DeltaClaimCandidateRow> =
-        sqlx::query_as(DELTA_CLAIM_CANDIDATE_PARTITION_SQL)
-            .bind(scope.tenant_id)
-            .bind(&identity.aggregate_type)
-            .bind(identity.aggregate_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    let Some(candidate) = candidate else {
-        return Ok(None);
-    };
-    install_claimed_event(tx, candidate, lease_owner, lease_seconds)
-        .await
-        .map(Some)
 }
 
 /// Pointer-advance reclaim (multi-tenant redesign M3; the ~898s finding):
@@ -2571,15 +2484,6 @@ const DELTA_COMPLETE_SQL_BASE: &str = "UPDATE authorization_delta_event \
     SET status = 'SUCCEEDED', lease_owner = NULL, lease_token_hash = NULL, \
         lease_expires_at = NULL, last_error = NULL ";
 
-const DELTA_FAIL_SQL_BASE: &str = "UPDATE authorization_delta_event \
-    SET status = 'PENDING', lease_owner = NULL, lease_token_hash = NULL, \
-        lease_expires_at = NULL, next_attempt_at = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()), \
-        last_error = ? ";
-
-const DELTA_RELEASE_SQL_BASE: &str = "UPDATE authorization_delta_event \
-    SET status = 'PENDING', lease_owner = NULL, lease_token_hash = NULL, \
-        lease_expires_at = NULL, next_attempt_at = NULL ";
-
 async fn guarded_update<'e, E>(
     executor: E,
     statement_base: &str,
@@ -2600,91 +2504,11 @@ where
     Ok(result.rows_affected())
 }
 
-/// Mark a claimed event durably succeeded.
-///
-/// Fails closed unless exactly one leased, unexpired row owned by
-/// `identity.lease_owner` carrying the claimed token hash matches.
-pub async fn complete_delta_event<'e, E>(
-    executor: E,
-    identity: &DeltaLeaseIdentity,
-) -> Result<(), GrantRepositoryError>
-where
-    E: Executor<'e, Database = MySql>,
-{
-    require_legacy_delta_execution()?;
-    if guarded_update(executor, DELTA_COMPLETE_SQL_BASE, identity).await? != 1 {
-        return Err(GrantRepositoryError::LeaseCasFailed(format!(
-            "code=grant_repository.complete_lost_lease;event={}",
-            identity.event_id
-        )));
-    }
-    Ok(())
-}
-
-/// Record a processing failure: release the lease, schedule a bounded retry and
-/// persist the (truncated) error. Attempt budgets stay a worker policy (P2).
-///
-/// Bind order follows the statement text: the two `SET` placeholders
-/// (`backoff_seconds`, `last_error`) precede the four guard parameters.
-pub async fn fail_delta_event<'e, E>(
-    executor: E,
-    identity: &DeltaLeaseIdentity,
-    backoff_seconds: i64,
-    last_error: &str,
-) -> Result<(), GrantRepositoryError>
-where
-    E: Executor<'e, Database = MySql>,
-{
-    require_legacy_delta_execution()?;
-    if !(0..=MAX_BACKOFF_SECONDS).contains(&backoff_seconds) {
-        return Err(GrantRepositoryError::ScopeViolation(format!(
-            "code=grant_repository.invalid_backoff_seconds;value={backoff_seconds}"
-        )));
-    }
-    validate_lease_identity(identity)?;
-    let statement: String = format!("{DELTA_FAIL_SQL_BASE}{LEASE_GUARD_SUFFIX}");
-    let result = sqlx::query(&statement)
-        .bind(backoff_seconds)
-        .bind(truncate_last_error(last_error))
-        .bind(identity.delta_event_id)
-        .bind(&identity.event_id)
-        .bind(&identity.lease_owner)
-        .bind(identity.lease_token.token_hash().as_bytes().to_vec())
-        .execute(executor)
-        .await?;
-    if result.rows_affected() != 1 {
-        return Err(GrantRepositoryError::LeaseCasFailed(format!(
-            "code=grant_repository.fail_lost_lease;event={}",
-            identity.event_id
-        )));
-    }
-    Ok(())
-}
-
-/// Relinquish a claim without recording failure; the event becomes immediately
-/// retryable. Same owner/token/expiry guards apply.
-pub async fn release_delta_event_lease<'e, E>(
-    executor: E,
-    identity: &DeltaLeaseIdentity,
-) -> Result<(), GrantRepositoryError>
-where
-    E: Executor<'e, Database = MySql>,
-{
-    require_legacy_delta_execution()?;
-    if guarded_update(executor, DELTA_RELEASE_SQL_BASE, identity).await? != 1 {
-        return Err(GrantRepositoryError::LeaseCasFailed(format!(
-            "code=grant_repository.release_lost_lease;event={}",
-            identity.event_id
-        )));
-    }
-    Ok(())
-}
-
 /// Lease heartbeat for potentially long publish transactions.
 ///
 /// A claim's window (e.g. 120s) can elapse while pure planning/compile phases
 /// run or while a large publish transaction waits on locks; the in-transaction
-/// completion ([`complete_delta_event`]) would then fail its live-expiry guard
+/// completion ([`complete_owned_delta_event_in_tx`]) would then fail its live-expiry guard
 /// and roll back an otherwise valid publication merely because time passed.
 /// This heartbeat renews `lease_expires_at` from SERVER time inside the same
 /// transaction, before the publish work runs, under a strict ownership CAS:
@@ -2717,49 +2541,10 @@ const DELTA_LEASE_HEARTBEAT_SQL: &str = "UPDATE authorization_delta_event \
       AND lease_owner = ? AND lease_token_hash = ? \
       AND status = 'LEASED'";
 
-/// Renew one claimed delta event's lease expiry for another `lease_seconds`
-/// measured from the database server's clock.
-///
-/// Fails closed unless exactly one row is still `LEASED` under
-/// `identity.lease_owner` carrying the claimed token hash; expired rows match
-/// as long as nobody took them over (see the SQL contract above).
-pub async fn extend_delta_event_lease<'e, E>(
-    executor: E,
-    identity: &DeltaLeaseIdentity,
-    lease_seconds: i64,
-) -> Result<(), GrantRepositoryError>
-where
-    E: Executor<'e, Database = MySql>,
-{
-    require_legacy_delta_execution()?;
-    validate_lease_seconds(lease_seconds)?;
-    validate_lease_identity(identity)?;
-    let result = sqlx::query(DELTA_LEASE_HEARTBEAT_SQL)
-        .bind(lease_seconds)
-        .bind(identity.delta_event_id)
-        .bind(&identity.event_id)
-        .bind(&identity.lease_owner)
-        .bind(identity.lease_token.token_hash().as_bytes().to_vec())
-        .execute(executor)
-        .await?;
-    if result.rows_affected() != 1 {
-        return Err(GrantRepositoryError::LeaseCasFailed(format!(
-            "code=grant_repository.heartbeat_lost_lease;event={}",
-            identity.event_id
-        )));
-    }
-    Ok(())
-}
-
 pub(super) async fn complete_owned_delta_event_in_tx(
     tx: &mut Transaction<'_, MySql>,
     lease: &crate::OwnedDeltaLease,
 ) -> Result<(), GrantRepositoryError> {
-    if crate::projection_execution_mode() != crate::ProjectionExecutionMode::WorkerOwned {
-        return Err(GrantRepositoryError::ScopeViolation(
-            "code=projection_execution.worker_owned_mode_required".to_owned(),
-        ));
-    }
     if guarded_update(&mut **tx, DELTA_COMPLETE_SQL_BASE, lease.identity()).await? != 1 {
         return Err(GrantRepositoryError::LeaseCasFailed(
             "code=projection_execution.complete_lost_lease".to_owned(),
@@ -2775,11 +2560,6 @@ pub(super) async fn extend_owned_delta_event_in_tx(
     lease: &crate::OwnedDeltaLease,
     lease_seconds: i64,
 ) -> Result<(), GrantRepositoryError> {
-    if crate::projection_execution_mode() != crate::ProjectionExecutionMode::WorkerOwned {
-        return Err(GrantRepositoryError::ScopeViolation(
-            "code=projection_execution.worker_owned_mode_required".to_owned(),
-        ));
-    }
     validate_lease_seconds(lease_seconds)?;
     let identity = lease.identity();
     let updated = sqlx::query(DELTA_LEASE_HEARTBEAT_SQL)
@@ -2801,33 +2581,6 @@ pub(super) async fn extend_owned_delta_event_in_tx(
 // ─────────────────────────────────────────────────────────────────────────────
 // Terminal QUARANTINED state and explicit operator requeue
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Quarantine transition: a live `LEASED` row becomes terminal `QUARANTINED`.
-///
-/// Same guard family as complete/fail/release (`status = 'LEASED'`, live
-/// server-side expiry, owner + token hash) — an affected-rows count of zero is
-/// a lost lease surfaced as [`GrantRepositoryError::LeaseCasFailed`]; the
-/// caller must reconcile unknown results instead of retrying blindly. Rows in
-/// `PENDING`/`SUCCEEDED` can never enter quarantine through this boundary.
-const DELTA_QUARANTINE_SQL_BASE: &str = "UPDATE authorization_delta_event \
-    SET status = 'QUARANTINED', lease_owner = NULL, lease_token_hash = NULL, \
-        lease_expires_at = NULL, next_attempt_at = NULL, last_error = ? ";
-
-/// Pure input gate shared by [`mark_delta_event_quarantined`] and its tests:
-/// composes the stable `code=...;detail=...` audit text or refuses empty codes.
-fn compose_quarantine_last_error(
-    reason_code: &str,
-    reason_detail: &str,
-) -> Result<String, GrantRepositoryError> {
-    if reason_code.trim().is_empty() {
-        return Err(GrantRepositoryError::ScopeViolation(
-            "code=grant_repository.empty_quarantine_reason_code".to_owned(),
-        ));
-    }
-    Ok(truncate_last_error(&format!(
-        "code={reason_code};detail={reason_detail}"
-    )))
-}
 
 /// Pure input gate for [`requeue_quarantined_delta_event`]; on success returns
 /// the deterministic post-CAS version.
@@ -2872,48 +2625,6 @@ fn validate_requeue_inputs(
     request.expected_cas_version.checked_add(1).ok_or_else(|| {
         GrantRepositoryError::Mapping("code=grant_repository.cas_version_overflow".to_owned())
     })
-}
-
-/// Move one live leased delta event into terminal [`DELTA_STATUS_QUARANTINED`].
-///
-/// Writes a stable `code=...;detail=...` reason into `last_error` (truncated to
-/// the column limit), clears the schedule and every lease column, keeps the
-/// attempt counter and PRESERVES the row's current `cas_version` (quarantine
-/// deliberately does not bump it). That stability is what makes operator
-/// revival safe: [`requeue_quarantined_delta_event`] captures this untouched
-/// `cas_version` as its `expected_cas_version` pin and advances it exactly
-/// once during requeue (`cas_version = cas_version + 1`). Normal claim paths
-/// never select a quarantined row again; only
-/// [`requeue_quarantined_delta_event`] revives it.
-/// Never call this for a row whose outcome is unknown — reconcile first.
-pub async fn mark_delta_event_quarantined<'e, E>(
-    executor: E,
-    identity: &DeltaLeaseIdentity,
-    reason_code: &str,
-    reason_detail: &str,
-) -> Result<(), GrantRepositoryError>
-where
-    E: Executor<'e, Database = MySql>,
-{
-    require_legacy_delta_execution()?;
-    let last_error = compose_quarantine_last_error(reason_code, reason_detail)?;
-    validate_lease_identity(identity)?;
-    let statement: String = format!("{DELTA_QUARANTINE_SQL_BASE}{LEASE_GUARD_SUFFIX}");
-    let result = sqlx::query(&statement)
-        .bind(last_error)
-        .bind(identity.delta_event_id)
-        .bind(&identity.event_id)
-        .bind(&identity.lease_owner)
-        .bind(identity.lease_token.token_hash().as_bytes().to_vec())
-        .execute(executor)
-        .await?;
-    if result.rows_affected() != 1 {
-        return Err(GrantRepositoryError::LeaseCasFailed(format!(
-            "code=grant_repository.quarantine_lost_lease;event={}",
-            identity.event_id
-        )));
-    }
-    Ok(())
 }
 
 /// Explicit operator requeue request for one quarantined delta event.
@@ -3286,11 +2997,11 @@ impl ClaimedDeltaRawRow {
             MAX_GRANT_OPERATION_ID_LENGTH,
             "operation_id",
         )?;
-        validated_text(
-            &self.compiler_version,
-            MAX_COMPILER_VERSION_LENGTH,
-            "compiler_version",
-        )?;
+        if self.compiler_version != AUTHORIZATION_COMPILER_VERSION {
+            return Err(GrantRepositoryError::Mapping(
+                "code=grant_repository.non_current_claimed_compiler".to_owned(),
+            ));
+        }
         if self.attempts < 1 {
             return Err(GrantRepositoryError::Mapping(format!(
                 "code=grant_repository.claimed_attempts_below_one;value={}",
@@ -3387,7 +3098,7 @@ impl ClaimedDeltaRawRow {
 /// success every stored value has been strictly revalidated (canonical UUID,
 /// BINARY(32) digests, positive identities, version relation, before-image /
 /// digest pairing, payload/event-type/grant agreement), never normalized.
-pub async fn load_claimed_delta_event_for_update_in_tx(
+pub(crate) async fn load_claimed_delta_event_for_update_in_tx(
     tx: &mut Transaction<'_, MySql>,
     identity: &DeltaLeaseIdentity,
 ) -> Result<ClaimedDeltaEvent, GrantRepositoryError> {
@@ -3581,11 +3292,11 @@ pub fn decode_ledger_row(row: &RawLedgerRow) -> Result<GrantLedgerEntry, GrantRe
         "operation_id",
     )?;
     validated_text(&row.event_id, MAX_EVENT_ID_LENGTH, "event_id")?;
-    validated_text(
-        &row.compiler_version,
-        MAX_COMPILER_VERSION_LENGTH,
-        "compiler_version",
-    )?;
+    if row.compiler_version != AUTHORIZATION_COMPILER_VERSION {
+        return Err(GrantRepositoryError::Mapping(
+            "code=grant_repository.non_current_ledger_compiler".to_owned(),
+        ));
+    }
     Ok(GrantLedgerEntry {
         grant: payload,
         revision_no: row.revision_no as u64,
@@ -3959,373 +3670,6 @@ pub fn partition_ledger_at_published_frontier(
     Ok(outcome)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Stable-event direct claim (local in-process projection dispatch path)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// One `authorization_delta_event` row as observed by the stable-event claim.
-/// Mirrors [`DeltaClaimCandidateRow`] plus the evidence-invalidation flag so
-/// the direct-dispatch path can re-bind EVERY durable field against the
-/// commit-proven [`DeltaEventAppendRequest`] the source wrapper carries.
-#[derive(Debug, sqlx::FromRow)]
-struct StableEventClaimRow {
-    delta_event_id: i64,
-    event_id: String,
-    operation_id: String,
-    event_type: String,
-    tenant_id: i64,
-    card_id: Option<i64>,
-    aggregate_type: String,
-    aggregate_id: i64,
-    grant_id: String,
-    base_version: i64,
-    target_version: i64,
-    source_generation: i64,
-    revoke_fence: i64,
-    invalidates_published_evidence: i8,
-    before_image_json: Option<String>,
-    before_digest: Option<Vec<u8>>,
-    delta_json: String,
-    semantic_hash: Vec<u8>,
-    dependency_hash: Vec<u8>,
-    compiler_version: String,
-    status: String,
-    attempts: i64,
-    cas_version: i64,
-}
-
-impl StableEventClaimRow {
-    fn to_candidate(&self) -> DeltaClaimCandidateRow {
-        DeltaClaimCandidateRow {
-            delta_event_id: self.delta_event_id,
-            event_id: self.event_id.clone(),
-            operation_id: self.operation_id.clone(),
-            event_type: self.event_type.clone(),
-            tenant_id: self.tenant_id,
-            card_id: self.card_id,
-            aggregate_type: self.aggregate_type.clone(),
-            aggregate_id: self.aggregate_id,
-            grant_id: self.grant_id.clone(),
-            base_version: self.base_version,
-            target_version: self.target_version,
-            source_generation: self.source_generation,
-            revoke_fence: self.revoke_fence,
-            before_image_json: self.before_image_json.clone(),
-            before_digest: self.before_digest.clone(),
-            delta_json: self.delta_json.clone(),
-            semantic_hash: self.semantic_hash.clone(),
-            dependency_hash: self.dependency_hash.clone(),
-            compiler_version: self.compiler_version.clone(),
-            status: self.status.clone(),
-            attempts: self.attempts,
-            cas_version: self.cas_version,
-        }
-    }
-}
-
-/// Stable-event claim select: locks the exact row behind the globally unique
-/// `event_id` (`uk_ade_event`) inside the caller's transaction so the payload
-/// re-binding and the lease install observe one committed row version.
-const STABLE_EVENT_CLAIM_SELECT_SQL: &str = "SELECT delta_event_id, event_id, operation_id, \
-    event_type, tenant_id, card_id, aggregate_type, aggregate_id, grant_id, base_version, \
-    target_version, source_generation, revoke_fence, invalidates_published_evidence, \
-    CAST(before_image_json AS CHAR) AS before_image_json, before_digest, \
-    CAST(delta_json AS CHAR) AS delta_json, semantic_hash, dependency_hash, compiler_version, \
-    status, attempts, cas_version \
-    FROM authorization_delta_event \
-    WHERE event_id = ? AND tenant_id = ? FOR UPDATE";
-
-/// Locking predecessor probe for the direct-dispatch path. The stable-event
-/// row is already locked by [`STABLE_EVENT_CLAIM_SELECT_SQL`], but a direct
-/// envelope can arrive before an earlier same-grant event's envelope. Probe
-/// the durable predecessor under the same transaction and return `Busy` before
-/// installing a lease, so out-of-order delivery cannot burn attempts.
-const STABLE_EVENT_SIBLING_ORDER_PROBE_SQL: &str = "SELECT pred.delta_event_id \
-    FROM authorization_delta_event pred \
-    WHERE pred.tenant_id = ? \
-      AND pred.grant_id = ? \
-      AND pred.target_version < ? \
-      AND pred.status IN ('PENDING', 'LEASED') \
-    ORDER BY pred.target_version, pred.delta_event_id \
-    LIMIT 1 FOR UPDATE";
-
-/// Field-by-field binding between the dispatch request and the durable row.
-/// Any drift means the envelope does not describe the durable delta it claims
-/// to carry: fail closed, never claim, never replay.
-fn verify_stable_event_request_binding(
-    request: &DeltaEventAppendRequest,
-    row: &StableEventClaimRow,
-) -> Result<(), GrantRepositoryError> {
-    let mismatch = |field: &str| {
-        GrantRepositoryError::ScopeViolation(format!(
-            "code=grant_repository.claim_by_event_payload_mismatch;field={field}"
-        ))
-    };
-    if row.event_id != request.event_id {
-        return Err(mismatch("event_id"));
-    }
-    if row.operation_id != request.operation_id {
-        return Err(mismatch("operation_id"));
-    }
-    let row_event_type = DeltaEventType::from_sql(&row.event_type)?;
-    if row_event_type != request.event_type {
-        return Err(mismatch("event_type"));
-    }
-    if row.tenant_id != request.tenant_id {
-        return Err(mismatch("tenant_id"));
-    }
-    if row.card_id != request.card_id {
-        return Err(mismatch("card_id"));
-    }
-    if row.aggregate_type != request.aggregate_type || row.aggregate_id != request.aggregate_id {
-        return Err(mismatch("aggregate_identity"));
-    }
-    if decode_grant_id_sql(&row.grant_id)? != request.grant_id {
-        return Err(mismatch("grant_id"));
-    }
-    if row.base_version != request.base_version {
-        return Err(mismatch("base_version"));
-    }
-    if row.target_version != request.target_version {
-        return Err(mismatch("target_version"));
-    }
-    if row.source_generation < 0
-        || u64::try_from(row.source_generation).unwrap_or(u64::MAX) != request.source_generation
-    {
-        return Err(mismatch("source_generation"));
-    }
-    if row.revoke_fence < 0
-        || u64::try_from(row.revoke_fence).unwrap_or(u64::MAX) != request.revoke_fence
-    {
-        return Err(mismatch("revoke_fence"));
-    }
-    let row_invalidates = row.invalidates_published_evidence != 0;
-    if row_invalidates != request.invalidates_published_evidence {
-        return Err(mismatch("invalidates_published_evidence"));
-    }
-    match (&request.before_image_json, &request.before_digest_hex) {
-        (Some(image), Some(digest)) => {
-            let request_image: serde_json::Value =
-                serde_json::from_str(image).map_err(|_| mismatch("before_image_json"))?;
-            let stored_image: serde_json::Value = row
-                .before_image_json
-                .as_deref()
-                .and_then(|value| serde_json::from_str(value).ok())
-                .ok_or_else(|| mismatch("before_image_json"))?;
-            if stored_image != request_image {
-                return Err(mismatch("before_image_json"));
-            }
-            let row_digest = Sha256Digest::from_optional_bytes(row.before_digest.as_deref())?;
-            if row_digest != Some(Sha256Digest::from_hex(digest)?) {
-                return Err(mismatch("before_digest"));
-            }
-        }
-        (None, None) => {
-            if row.before_image_json.is_some() || row.before_digest.is_some() {
-                return Err(mismatch("before_image_absent"));
-            }
-        }
-        _ => {
-            return Err(GrantRepositoryError::ScopeViolation(
-                "code=grant_repository.before_image_digest_pairing".to_owned(),
-            ))
-        }
-    }
-    let requested_delta: serde_json::Value =
-        serde_json::from_str(&request.delta_json).map_err(|_| mismatch("delta_json"))?;
-    let stored_delta: serde_json::Value =
-        serde_json::from_str(&row.delta_json).map_err(|_| mismatch("delta_json"))?;
-    if stored_delta != requested_delta {
-        return Err(mismatch("delta_json"));
-    }
-    if Sha256Digest::from_bytes(row.semantic_hash.clone())?
-        != Sha256Digest::from_hex(&request.semantic_hash_hex)?
-    {
-        return Err(mismatch("semantic_hash"));
-    }
-    if Sha256Digest::from_bytes(row.dependency_hash.clone())?
-        != Sha256Digest::from_hex(&request.dependency_hash_hex)?
-    {
-        return Err(mismatch("dependency_hash"));
-    }
-    if row.compiler_version != request.compiler_version {
-        return Err(mismatch("compiler_version"));
-    }
-    Ok(())
-}
-
-/// Outcome of [`claim_delta_event_by_stable_event_in_tx`]: everything except
-/// [`ClaimedStableEventOutcome::Claimed`] leaves the row untouched.
-#[derive(Debug)]
-pub enum ClaimedStableEventOutcome {
-    /// Lease installed inside the caller's transaction; both forms returned in
-    /// the SAME transaction (no readback reload, no id-only DB round trip).
-    Claimed {
-        claim: Box<DeltaEventClaim>,
-        event: Box<ClaimedDeltaEvent>,
-    },
-    /// Durable `SUCCEEDED` proven: processed, skip without replay and without
-    /// any mutation.
-    AlreadyProcessed { event_id: String },
-    /// Durable terminal gate (`QUARANTINED`): this is NOT a success skip. The
-    /// row keeps its gate; the dispatcher must not replay it, and the worker
-    /// surfaces it for reconciliation instead of treating it as processed.
-    TerminalGated {
-        event_id: String,
-        status: &'static str,
-    },
-    /// Live lease held elsewhere, or the row-level eligibility window has not
-    /// opened (future backoff). Not claimable now; durable recovery converges.
-    Busy { event_id: String },
-    /// Unresolvable row state (unknown status vocabulary). NEVER blindly
-    /// replayed; surfaces for reconciliation.
-    InDoubt { event_id: String, reason: String },
-}
-
-/// Claim ONE delta event by its stable event identity inside the caller's
-/// single transaction, reusing the exact claim predicates of
-/// [`claim_next_delta_event_in_tx`] and the shared claim install tail.
-///
-/// Direct-dispatch contract (local in-process projector path):
-/// 1. Locks the row behind the globally unique `event_id` (`uk_ade_event`)
-///    and re-binds EVERY durable field against the commit-proven
-///    [`DeltaEventAppendRequest`] the source wrapper carries — a mismatch is
-///    a fail-closed [`GrantRepositoryError::ScopeViolation`], never a claim.
-/// 2. `SUCCEEDED` rows return [`ClaimedStableEventOutcome::AlreadyProcessed`]
-///    — processed durably, skip silently, never replay. `QUARANTINED` rows
-///    return [`ClaimedStableEventOutcome::TerminalGated`] — the gate stays
-///    in force (never a success skip, never replayed).
-/// 3. Eligible rows (`PENDING` past backoff, `LEASED` with expired lease) get
-///    the same lease install as the queue claim (fresh run-scoped token,
-///    owner, server-side expiry, `attempts + 1`, `cas_version + 1`). A zero-row
-///    install (future backoff / live foreign lease) returns
-///    [`ClaimedStableEventOutcome::Busy`] instead of inventing a claim.
-/// 4. Unknown status vocabulary returns [`ClaimedStableEventOutcome::InDoubt`]
-///    and performs NO mutation — unknown results are never blindly replayed.
-///
-/// The commit/rollback of the transaction stays with the caller, exactly like
-/// every other `*_in_tx` primitive in this module.
-pub async fn claim_delta_event_by_stable_event_in_tx(
-    tx: &mut Transaction<'_, MySql>,
-    request: &DeltaEventAppendRequest,
-    lease_owner: &str,
-    lease_seconds: i64,
-) -> Result<ClaimedStableEventOutcome, GrantRepositoryError> {
-    require_legacy_delta_execution()?;
-    positive_i64(request.tenant_id, "tenant_id")?;
-    validated_text(&request.event_id, MAX_EVENT_ID_LENGTH, "event_id")?;
-    validated_text(lease_owner, MAX_GRANT_LEASE_OWNER_LENGTH, "lease_owner")?;
-    validate_lease_seconds(lease_seconds)?;
-
-    let row: Option<StableEventClaimRow> = sqlx::query_as(STABLE_EVENT_CLAIM_SELECT_SQL)
-        .bind(&request.event_id)
-        .bind(request.tenant_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-    let Some(row) = row else {
-        // A commit-proven dispatch always references a committed row; a
-        // missing row is a contract violation and fails closed.
-        return Err(GrantRepositoryError::ScopeViolation(format!(
-            "code=grant_repository.claim_by_event_row_missing;event_id={}",
-            request.event_id
-        )));
-    };
-    verify_stable_event_request_binding(request, &row)?;
-
-    match row.status.as_str() {
-        DELTA_STATUS_SUCCEEDED => Ok(ClaimedStableEventOutcome::AlreadyProcessed {
-            event_id: row.event_id.clone(),
-        }),
-        DELTA_STATUS_QUARANTINED => Ok(ClaimedStableEventOutcome::TerminalGated {
-            event_id: row.event_id.clone(),
-            status: DELTA_STATUS_QUARANTINED,
-        }),
-        DELTA_STATUS_PENDING | DELTA_STATUS_LEASED => {
-            let predecessor: Option<(i64,)> = sqlx::query_as(STABLE_EVENT_SIBLING_ORDER_PROBE_SQL)
-                .bind(row.tenant_id)
-                .bind(&row.grant_id)
-                .bind(row.target_version)
-                .fetch_optional(&mut **tx)
-                .await?;
-            if predecessor.is_some() {
-                return Ok(ClaimedStableEventOutcome::Busy {
-                    event_id: row.event_id.clone(),
-                });
-            }
-            let candidate = row.to_candidate();
-            match install_claimed_event(tx, candidate, lease_owner, lease_seconds).await {
-                Ok(claim) => {
-                    let event = ClaimedDeltaEvent {
-                        delta_event_id: row.delta_event_id,
-                        event_id: row.event_id.clone(),
-                        operation_id: row.operation_id.clone(),
-                        event_type: DeltaEventType::from_sql(&row.event_type)?,
-                        tenant_id: row.tenant_id,
-                        card_id: row.card_id,
-                        aggregate_type: row.aggregate_type.clone(),
-                        aggregate_id: row.aggregate_id,
-                        grant_id: decode_grant_id_sql(&row.grant_id)?,
-                        base_version: row.base_version,
-                        target_version: row.target_version,
-                        source_generation: u64::try_from(row.source_generation).map_err(|_| {
-                            GrantRepositoryError::Mapping(
-                                "code=grant_repository.invalid_source_generation".to_owned(),
-                            )
-                        })?,
-                        revoke_fence: {
-                            let revoke_fence = u64::try_from(row.revoke_fence).map_err(|_| {
-                                GrantRepositoryError::Mapping(
-                                    "code=grant_repository.invalid_revoke_fence".to_owned(),
-                                )
-                            })?;
-                            let source_generation =
-                                u64::try_from(row.source_generation).map_err(|_| {
-                                    GrantRepositoryError::Mapping(
-                                        "code=grant_repository.invalid_source_generation"
-                                            .to_owned(),
-                                    )
-                                })?;
-                            validate_delta_fence_relation(source_generation, revoke_fence)?;
-                            revoke_fence
-                        },
-                        before_image_json: row.before_image_json.clone(),
-                        before_digest: Sha256Digest::from_optional_bytes(
-                            row.before_digest.as_deref(),
-                        )?,
-                        delta_json: row.delta_json.clone(),
-                        semantic_hash: Sha256Digest::from_bytes(row.semantic_hash.clone())?,
-                        dependency_hash: Sha256Digest::from_bytes(row.dependency_hash.clone())?,
-                        compiler_version: row.compiler_version.clone(),
-                        // Same-transaction authoritative values from the claim
-                        // install (post-increment attempts + server expiry).
-                        attempts: claim.attempts,
-                        cas_version: row.cas_version,
-                        lease_owner: claim.lease_owner.clone(),
-                        lease_expires_at: claim.lease_expires_at,
-                    };
-                    Ok(ClaimedStableEventOutcome::Claimed {
-                        claim: Box::new(claim),
-                        event: Box::new(event),
-                    })
-                }
-                Err(GrantRepositoryError::ClaimRace) => {
-                    // Zero-row install: future backoff window or a live foreign
-                    // lease won between our locked read and the install. The
-                    // row stays untouched; recovery converges durably.
-                    Ok(ClaimedStableEventOutcome::Busy {
-                        event_id: row.event_id.clone(),
-                    })
-                }
-                Err(error) => Err(error),
-            }
-        }
-        other => Ok(ClaimedStableEventOutcome::InDoubt {
-            event_id: row.event_id.clone(),
-            reason: format!("code=grant_repository.claim_by_event_unknown_status;status={other}"),
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4338,17 +3682,35 @@ mod tests {
 
     // ── Partition lease / discovery contracts (multi-tenant redesign Phase 1) ──
 
-    /// Direct stable-event claims perform the same durable sibling ordering
-    /// probe as the partition claim path before installing a lease.
+    /// WorkerOwned exact claims pin same-grant predecessor ordering in the
+    /// locked durable probe and in bounded candidate admission.
     #[test]
-    fn stable_event_claim_has_a_separate_sibling_probe() {
-        assert!(STABLE_EVENT_SIBLING_ORDER_PROBE_SQL.contains("pred.grant_id = ?"));
-        assert!(STABLE_EVENT_SIBLING_ORDER_PROBE_SQL.contains("pred.target_version < ?"));
-        assert!(
-            STABLE_EVENT_SIBLING_ORDER_PROBE_SQL.contains("pred.status IN ('PENDING', 'LEASED')")
+    fn owned_stable_event_probe_enforces_predecessor_order() {
+        for fragment in [
+            "pred.tenant_id = ?",
+            "pred.grant_id = ?",
+            "pred.target_version < ?",
+            "pred.status IN ('PENDING', 'LEASED')",
+            "ORDER BY pred.target_version, pred.delta_event_id",
+            "FOR UPDATE",
+        ] {
+            assert!(
+                OWNED_STABLE_EVENT_SIBLING_ORDER_PROBE_SQL.contains(fragment),
+                "owned stable-event probe must contain {fragment}"
+            );
+        }
+        assert_eq!(
+            placeholder_count(OWNED_STABLE_EVENT_SIBLING_ORDER_PROBE_SQL),
+            3
         );
-        assert!(STABLE_EVENT_SIBLING_ORDER_PROBE_SQL.contains("FOR UPDATE"));
-        assert_eq!(placeholder_count(STABLE_EVENT_SIBLING_ORDER_PROBE_SQL), 3);
+        assert!(OWNED_DELTA_CLAIM_SIBLING_ORDER_GATE
+            .contains("pred.grant_id = authorization_delta_event.grant_id"));
+        assert!(OWNED_DELTA_CLAIM_SIBLING_ORDER_GATE
+            .contains("pred.target_version < authorization_delta_event.target_version"));
+        assert!(
+            OWNED_DELTA_CLAIM_SIBLING_ORDER_GATE.contains("pred.status IN ('PENDING', 'LEASED')")
+        );
+        assert_eq!(placeholder_count(OWNED_DELTA_CLAIM_SIBLING_ORDER_GATE), 0);
     }
     #[test]
     fn partition_lease_audit_contract_is_bounded_and_non_authorizing() {
@@ -4483,19 +3845,6 @@ mod tests {
             !PARTITION_LEASE_RENEW_SQL.contains("audit_log"),
             "successful heartbeats must stay on the lease-table liveness path"
         );
-    }
-
-    #[test]
-    fn partition_claim_candidate_narrows_identity_and_mirrors_the_claim_gate() {
-        // Partition narrowing: the identity filter rides on the tenant filter.
-        assert!(DELTA_CLAIM_CANDIDATE_PARTITION_SQL
-            .contains("WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ?"));
-        // Sibling-ordering gate must mirror the tenant claim statements.
-        assert!(DELTA_CLAIM_CANDIDATE_PARTITION_SQL
-            .contains("pred.grant_id = authorization_delta_event.grant_id"));
-        assert!(DELTA_CLAIM_CANDIDATE_PARTITION_SQL
-            .contains("pred.target_version < authorization_delta_event.target_version"));
-        assert!(DELTA_CLAIM_CANDIDATE_PARTITION_SQL.contains("LIMIT 1 FOR UPDATE"));
     }
 
     #[test]
@@ -4659,7 +4008,7 @@ mod tests {
             dependency_hash: vec![2u8; 32],
             operation_id: "op-1".to_owned(),
             event_id: "event-1".to_owned(),
-            compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+            compiler_version: AUTHORIZATION_COMPILER_VERSION.to_owned(),
         }
     }
 
@@ -4740,16 +4089,6 @@ mod tests {
     fn bigint_binds_reject_overflow() {
         assert_eq!(bind_i64(1, "f").unwrap(), 1i64);
         assert!(bind_i64(u64::MAX, "f").is_err());
-    }
-
-    #[test]
-    fn last_error_is_truncated_to_column_limit() {
-        let oversized = String::from("x").repeat(MAX_LAST_ERROR_LENGTH + 50);
-        assert_eq!(
-            truncate_last_error(&oversized).chars().count(),
-            MAX_LAST_ERROR_LENGTH
-        );
-        assert_eq!(truncate_last_error("short"), "short");
     }
 
     #[test]
@@ -5085,7 +4424,7 @@ mod tests {
                 delta_json: serde_json::to_string(&delta).unwrap(),
                 semantic_hash_hex: "a".repeat(64),
                 dependency_hash_hex: "b".repeat(64),
-                compiler_version: "test".to_owned(),
+                compiler_version: AUTHORIZATION_COMPILER_VERSION.to_owned(),
                 next_attempt_at: None,
             };
             let error = append_delta_event(&pool, &request)
@@ -5107,106 +4446,33 @@ mod tests {
                 || placeholder_count(DELTA_EVENT_INSERT_SQL) == 21
         );
 
-        // Claim selection locks exactly one deterministic candidate row.
-        for candidate_sql in [
-            DELTA_CLAIM_CANDIDATE_UNSCOPED_SQL,
-            DELTA_CLAIM_CANDIDATE_CARD_SCOPED_SQL,
-        ] {
-            assert!(candidate_sql.contains("FOR UPDATE"));
-            assert!(candidate_sql.contains("LIMIT 1"));
-            assert!(candidate_sql.contains("ORDER BY COALESCE(next_attempt_at, created_at)"));
-            assert!(candidate_sql.contains("lease_expires_at <= UTC_TIMESTAMP()"));
-            // Future-scheduled PENDING rows are gated; expired-LEASED takeover
-            // and every other status rule live in the shared predicate.
-            assert!(candidate_sql.contains(DELTA_CLAIM_ELIGIBLE_PREDICATE));
-            // The per-grant sibling-ordering gate rides on BOTH candidate
-            // statements byte-equal to the reference const: claiming an event
-            // whose chain predecessor is non-terminal would only burn the
-            // attempt budget (partitioner deterministically blocks it).
-            assert!(
-                candidate_sql.contains(DELTA_CLAIM_SIBLING_ORDER_GATE),
-                "claim candidate must carry the sibling-ordering gate"
-            );
-        }
-        assert_eq!(placeholder_count(DELTA_CLAIM_CANDIDATE_UNSCOPED_SQL), 1);
-        assert_eq!(placeholder_count(DELTA_CLAIM_CANDIDATE_CARD_SCOPED_SQL), 2);
-        assert!(DELTA_CLAIM_CANDIDATE_UNSCOPED_SQL.starts_with("SELECT delta_event_id"));
-        assert!(DELTA_CLAIM_CANDIDATE_CARD_SCOPED_SQL.contains("tenant_id = ? AND card_id = ?"));
-
-        // Install = owner + token hash + server-side expiry, guarded by the
-        // SAME row-level eligibility text as candidate selection (defensive
-        // mirror). The sibling-ordering gate is deliberately NOT here: MySQL
-        // error 1093 forbids a correlated subquery on the UPDATE target, the
-        // row is already FOR UPDATE-locked, and the partitioner decision
-        // fail-closes any cross-row race — a gate here could not even compile
-        // as SQL without a whole-table materialized workaround.
-        assert_eq!(placeholder_count(DELTA_CLAIM_INSTALL_SQL), 4);
-        assert!(DELTA_CLAIM_INSTALL_SQL.contains(DELTA_CLAIM_ELIGIBLE_PREDICATE));
-        assert!(!DELTA_CLAIM_INSTALL_SQL.contains("NOT EXISTS"));
-        assert!(DELTA_CLAIM_INSTALL_SQL.contains("status = 'LEASED'"));
-        assert!(DELTA_CLAIM_INSTALL_SQL.contains("lease_token_hash = ?"));
-        assert!(DELTA_CLAIM_INSTALL_SQL.contains("attempts = attempts + 1"));
-        assert!(DELTA_CLAIM_INSTALL_SQL.contains("cas_version = cas_version + 1"));
-        assert!(DELTA_CLAIM_INSTALL_SQL.contains("TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())"));
-        assert!(DELTA_CLAIM_INSTALL_SQL.contains("lease_expires_at <= UTC_TIMESTAMP()"));
-
-        // Post-install readback surfaces expiry AND the durable attempts.
-        assert!(DELTA_CLAIM_READBACK_SQL.contains("SELECT lease_expires_at, attempts "));
-        assert_eq!(placeholder_count(DELTA_CLAIM_READBACK_SQL), 1);
+        // Only WorkerOwned exact admission retains an install primitive: its
+        // eligibility arms permit due PENDING work and expired-LEASED recovery.
+        let install = format!("{OWNED_DELTA_CLAIM_INSTALL_SQL}{OWNED_DELTA_CLAIM_ELIGIBILITY}");
+        assert_eq!(placeholder_count(&install), 4);
+        assert!(OWNED_DELTA_CLAIM_INSTALL_SQL.contains("WHERE delta_event_id = ?"));
+        assert!(OWNED_DELTA_CLAIM_INSTALL_SQL.contains("status = 'LEASED'"));
+        assert!(OWNED_DELTA_CLAIM_INSTALL_SQL.contains("lease_token_hash = ?"));
+        assert!(OWNED_DELTA_CLAIM_INSTALL_SQL.contains("attempts = attempts + 1"));
+        assert!(OWNED_DELTA_CLAIM_INSTALL_SQL.contains("cas_version = cas_version + 1"));
+        assert!(OWNED_DELTA_CLAIM_INSTALL_SQL.contains("TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())"));
+        assert!(install.contains(OWNED_DELTA_CLAIM_ELIGIBILITY));
+        assert!(!OWNED_DELTA_CLAIM_INSTALL_SQL.contains("NOT EXISTS"));
+        assert!(OWNED_DELTA_CLAIM_ELIGIBILITY
+            .contains("next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP()"));
+        assert!(OWNED_DELTA_CLAIM_ELIGIBILITY.contains("lease_expires_at IS NOT NULL"));
+        assert!(OWNED_DELTA_CLAIM_ELIGIBILITY.contains("lease_expires_at <= UTC_TIMESTAMP()"));
+        assert!(!OWNED_DELTA_CLAIM_ELIGIBILITY.contains("QUARANTINED"));
+        assert!(OWNED_DELTA_CLAIM_READBACK_SQL.contains("SELECT lease_expires_at, attempts "));
+        assert_eq!(placeholder_count(OWNED_DELTA_CLAIM_READBACK_SQL), 1);
     }
 
     #[test]
-    fn claim_predicate_gates_future_pending_rows_but_takes_over_expired_leases() {
-        // The PENDING arm is the only arm allowed to consult next_attempt_at:
-        // a scheduled retry must cool down before re-entering the queue.
-        let pending_arm_start = DELTA_CLAIM_ELIGIBLE_PREDICATE
-            .find("status = 'PENDING'")
-            .expect("predicate must gate PENDING");
-        let leased_arm_offset = DELTA_CLAIM_ELIGIBLE_PREDICATE
-            .find("status = 'LEASED'")
-            .expect("predicate must reclaim LEASED");
-        assert!(pending_arm_start < leased_arm_offset);
-        let pending_arm = &DELTA_CLAIM_ELIGIBLE_PREDICATE[pending_arm_start..leased_arm_offset];
-        assert!(
-            pending_arm.contains("next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP()")
-        );
-        // The expired-LEASED branch is an unknown-result takeover: it MUST NOT
-        // be blocked by any stale next_attempt_at (reconcile first), so that
-        // column appears nowhere inside it.
-        let leased_arm = &DELTA_CLAIM_ELIGIBLE_PREDICATE[leased_arm_offset..];
-        assert!(!leased_arm.contains("next_attempt_at"), "{leased_arm}");
-        assert!(leased_arm.contains("lease_expires_at IS NOT NULL"));
-        assert!(leased_arm.contains("lease_expires_at <= UTC_TIMESTAMP()"));
-
-        // Terminal rows are unreachable through both statements.
-        for sql in [
-            DELTA_CLAIM_CANDIDATE_UNSCOPED_SQL,
-            DELTA_CLAIM_CANDIDATE_CARD_SCOPED_SQL,
-            DELTA_CLAIM_INSTALL_SQL,
-        ] {
-            assert!(!sql.contains(DELTA_STATUS_SUCCEEDED));
-            assert!(sql.contains(DELTA_STATUS_PENDING) && sql.contains(DELTA_STATUS_LEASED));
-        }
-
-        // Sibling-ordering gate shape: same-grant predecessors block the
-        // claim only while non-terminal; a published (SUCCEEDED) or
-        // quarantined predecessor never appears in the gate, so the gate can
-        // neither skip a published chain nor silently stall an unorderable one.
-        assert!(
-            DELTA_CLAIM_SIBLING_ORDER_GATE
-                .contains("pred.grant_id = authorization_delta_event.grant_id"),
-            "the gate must key on the per-grant chain, not the aggregate"
-        );
-        assert!(
-            DELTA_CLAIM_SIBLING_ORDER_GATE
-                .contains("pred.target_version < authorization_delta_event.target_version"),
-            "only strict chain predecessors may gate"
-        );
-        assert!(
-            DELTA_CLAIM_SIBLING_ORDER_GATE.contains("pred.status IN ('PENDING', 'LEASED')"),
-            "terminal predecessors (SUCCEEDED/QUARANTINED) must never gate"
-        );
-        assert_eq!(placeholder_count(DELTA_CLAIM_SIBLING_ORDER_GATE), 0);
+    fn owned_claim_install_does_not_reintroduce_raw_candidate_selection() {
+        assert!(!OWNED_DELTA_CLAIM_INSTALL_SQL.contains("ORDER BY"));
+        assert!(!OWNED_DELTA_CLAIM_INSTALL_SQL.contains("LIMIT"));
+        assert!(!OWNED_DELTA_CLAIM_INSTALL_SQL.contains("NOT EXISTS"));
+        assert!(OWNED_DELTA_CLAIM_INSTALL_SQL.contains("delta_event_id = ?"));
     }
 
     #[test]
@@ -5220,30 +4486,6 @@ mod tests {
         assert!(guard.contains("lease_expires_at IS NOT NULL"));
         assert!(guard.contains("lease_expires_at > UTC_TIMESTAMP()"));
         assert_eq!(placeholder_count(guard), 4);
-
-        for base in [
-            DELTA_COMPLETE_SQL_BASE,
-            DELTA_FAIL_SQL_BASE,
-            DELTA_RELEASE_SQL_BASE,
-        ] {
-            assert!(base.starts_with("UPDATE authorization_delta_event"));
-            assert!(base.contains("lease_owner = NULL"));
-            assert!(base.contains("lease_token_hash = NULL"));
-            assert!(base.contains("lease_expires_at = NULL"));
-        }
-        // Completion clears the error field; failure records it; release keeps
-        // the event immediately retryable.
-        assert!(DELTA_COMPLETE_SQL_BASE.contains("last_error = NULL"));
-        assert!(DELTA_COMPLETE_SQL_BASE.contains("'SUCCEEDED'"));
-        assert!(DELTA_FAIL_SQL_BASE.contains("last_error = ?"));
-        assert!(DELTA_FAIL_SQL_BASE
-            .contains("next_attempt_at = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())"));
-        assert!(DELTA_RELEASE_SQL_BASE.contains("next_attempt_at = NULL"));
-
-        // Fail-path SET placeholders precede the four guard parameters.
-        let composed = format!("{DELTA_FAIL_SQL_BASE}{LEASE_GUARD_SUFFIX}");
-        assert_eq!(placeholder_count(&composed), 6);
-        assert!(composed.rfind("last_error = ?").unwrap() < composed.find("WHERE").unwrap());
 
         assert_eq!(STATUS_ACTIVE, "ACTIVE");
         assert_eq!(DELTA_STATUS_PENDING, "PENDING");
@@ -5383,7 +4625,7 @@ mod tests {
             entry.semantic_hash.as_hex(),
             Sha256Digest::from_bytes(vec![1; 32]).unwrap().as_hex()
         );
-        assert_eq!(entry.compiler_version, "phase2-authorization-kernel-v1");
+        assert_eq!(entry.compiler_version, "astral-authorization-v6");
         assert_eq!(entry.operation_id, "op-1");
     }
 
@@ -5627,7 +4869,7 @@ mod tests {
             delta_json,
             semantic_hash: vec![9u8; 32],
             dependency_hash: vec![8u8; 32],
-            compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+            compiler_version: AUTHORIZATION_COMPILER_VERSION.to_owned(),
             status: DELTA_STATUS_LEASED.to_owned(),
             attempts: 3,
             cas_version: 5,
@@ -5662,10 +4904,64 @@ mod tests {
         assert!(decoded.before_image_json.is_none() && decoded.before_digest.is_none());
         assert_eq!(decoded.semantic_hash.as_bytes(), [9u8; 32]);
         assert_eq!(decoded.dependency_hash.as_bytes(), [8u8; 32]);
-        assert_eq!(decoded.compiler_version, "phase2-authorization-kernel-v1");
+        assert_eq!(decoded.compiler_version, "astral-authorization-v6");
         assert_eq!(decoded.attempts, 3);
         assert_eq!(decoded.cas_version, 5);
         assert_eq!(decoded.lease_owner, "worker-a");
+    }
+
+    #[test]
+    fn claimed_ledger_and_completion_reject_non_current_compilers() {
+        let row = claimed_raw_row();
+        let decoded = row.clone().decode("worker-a", &[7u8; 32]).unwrap();
+        let receipt = DeltaEventAppendRequest {
+            tenant_id: decoded.tenant_id,
+            card_id: decoded.card_id,
+            aggregate_type: decoded.aggregate_type.clone(),
+            aggregate_id: decoded.aggregate_id,
+            grant_id: decoded.grant_id,
+            event_id: decoded.event_id.clone(),
+            operation_id: decoded.operation_id.clone(),
+            event_type: decoded.event_type,
+            base_version: decoded.base_version,
+            target_version: decoded.target_version,
+            source_generation: decoded.source_generation,
+            revoke_fence: decoded.revoke_fence,
+            invalidates_published_evidence: false,
+            before_image_json: None,
+            before_digest_hex: None,
+            delta_json: decoded.delta_json.clone(),
+            semantic_hash_hex: decoded.semantic_hash.as_hex(),
+            dependency_hash_hex: decoded.dependency_hash.as_hex(),
+            compiler_version: AUTHORIZATION_COMPILER_VERSION.to_owned(),
+            next_attempt_at: None,
+        };
+        crate::OwnedCompletionIdentity::from_request(&receipt).unwrap();
+        for compiler in [
+            "astral-authorization-v5",
+            "astral-authorization-v7",
+            "foreign-v6",
+        ] {
+            let mut claimed = row.clone();
+            claimed.compiler_version = compiler.to_owned();
+            assert!(claimed
+                .decode("worker-a", &[7u8; 32])
+                .unwrap_err()
+                .to_string()
+                .contains("non_current_claimed_compiler"));
+            let mut ledger = ledger_row(&active_grant(1));
+            ledger.compiler_version = compiler.to_owned();
+            assert!(decode_ledger_row(&ledger)
+                .unwrap_err()
+                .to_string()
+                .contains("non_current_ledger_compiler"));
+            let mut old_receipt = receipt.clone();
+            old_receipt.compiler_version = compiler.to_owned();
+            assert!(crate::OwnedCompletionIdentity::from_request(&old_receipt)
+                .unwrap_err()
+                .to_string()
+                .contains("non_current_completion_compiler"));
+        }
     }
 
     #[test]
@@ -5836,7 +5132,7 @@ mod tests {
             dependency_hash: vec![2u8; 32],
             operation_id: format!("op-{event}"),
             event_id: event.to_owned(),
-            compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+            compiler_version: AUTHORIZATION_COMPILER_VERSION.to_owned(),
         }
     }
 
@@ -5865,7 +5161,7 @@ mod tests {
                 operation_id: "op-frontier".to_owned(),
                 semantic_hash: Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"semantic")),
                 dependency_hash: Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"dependency")),
-                compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+                compiler_version: AUTHORIZATION_COMPILER_VERSION.to_owned(),
                 revoke_fence: 0,
                 revoke_fence_proven: true,
                 cas_version: 3,
@@ -5885,7 +5181,7 @@ mod tests {
             operation_id: "op-frontier".to_owned(),
             semantic_hash: Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"semantic")),
             dependency_hash: Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"dependency")),
-            compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+            compiler_version: AUTHORIZATION_COMPILER_VERSION.to_owned(),
             manifest_digest: Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"manifest")),
             parent_manifest_id: None,
             revoke_fence: 0,
@@ -5906,7 +5202,7 @@ mod tests {
                 revoke_fence: 0,
                 semantic_hash: Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"semantic")),
                 dependency_hash: Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"dependency")),
-                compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+                compiler_version: AUTHORIZATION_COMPILER_VERSION.to_owned(),
             })
             .collect();
         PublishedAggregateFrontier {
@@ -5921,28 +5217,6 @@ mod tests {
 
     #[test]
     fn quarantine_statements_pin_shape_guards_and_cas() {
-        // Quarantine = same live-lease guard family, one extra last_error bind.
-        let composed = format!("{DELTA_QUARANTINE_SQL_BASE}{LEASE_GUARD_SUFFIX}");
-        assert_eq!(placeholder_count(&composed), 5);
-        for fragment in [
-            "SET status = 'QUARANTINED'",
-            "next_attempt_at = NULL",
-            "lease_owner = NULL",
-            "lease_token_hash = NULL",
-            "AND status = 'LEASED'",
-            "lease_token_hash = ?",
-            "lease_expires_at > UTC_TIMESTAMP()",
-        ] {
-            assert!(composed.contains(fragment), "missing {fragment}");
-        }
-        // Quarantine deliberately leaves `cas_version` untouched: the stable
-        // post-quarantine CAS is the operator requeue's expected pin, bumped
-        // only once by `cas_version = cas_version + 1` in DELTA_REQUEUE_SQL.
-        assert!(
-            !DELTA_QUARANTINE_SQL_BASE.contains("cas_version"),
-            "quarantine must preserve cas_version for the requeue CAS pin"
-        );
-
         // Operator requeue: exactly the QUARANTINED row pinned by CAS; no lease
         // guards (a quarantined row owns none), no automatic scheduling.
         assert_eq!(placeholder_count(DELTA_REQUEUE_SQL), 5);
@@ -5967,18 +5241,12 @@ mod tests {
 
     #[test]
     fn quarantined_rows_are_never_claimable_and_never_readable_as_claimed() {
-        // Claim candidate SQL arms only ever mention PENDING / expired LEASED.
-        for sql in [
-            DELTA_CLAIM_CANDIDATE_UNSCOPED_SQL,
-            DELTA_CLAIM_CANDIDATE_CARD_SCOPED_SQL,
-            DELTA_CLAIM_INSTALL_SQL,
-        ] {
-            assert!(
-                !sql.contains(DELTA_STATUS_QUARANTINED),
-                "claim statements must never select quarantined rows"
-            );
-            assert!(sql.contains("'PENDING'") && sql.contains("'LEASED'"));
-        }
+        let sql = OWNED_DELTA_CLAIM_ELIGIBILITY;
+        assert!(
+            !sql.contains(DELTA_STATUS_QUARANTINED),
+            "claim statements must never select quarantined rows"
+        );
+        assert!(sql.contains("'PENDING'") && sql.contains("'LEASED'"));
         // read_claimed accepts LEASED only: a stored QUARANTINED status is
         // refused by the WHERE guard AND re-checked in the decoder.
         let mut row = claimed_raw_row();
@@ -5989,22 +5257,6 @@ mod tests {
 
     #[test]
     fn quarantine_and_requeue_input_gates_fail_closed() {
-        // Stable code + detail composition; empty codes refused.
-        let composed =
-            compose_quarantine_last_error("projection_verify_failed", "digest drift").unwrap();
-        assert_eq!(
-            composed,
-            "code=projection_verify_failed;detail=digest drift"
-        );
-        let oversized_code = String::from("x").repeat(MAX_LAST_ERROR_LENGTH + 10);
-        let truncated = compose_quarantine_last_error(&oversized_code, "").unwrap();
-        assert_eq!(truncated.chars().count(), MAX_LAST_ERROR_LENGTH);
-        assert!(
-            compose_quarantine_last_error("   ", "detail").is_err()
-                || compose_quarantine_last_error("", "detail").is_err()
-                || compose_quarantine_last_error("\t", "detail").is_err()
-        );
-
         let base_request = QuarantinedDeltaRequeueRequest {
             delta_event_id: 41,
             event_id: "event-q".to_owned(),

@@ -10,7 +10,6 @@ mod support;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use astral_db::{freeze_projection_execution_mode, ProjectionExecutionMode};
 use astral_trustgraph::service::authorization_projector::{
     shutdown_authorization_projector, start_authorization_projector, AuthorizationProjectorConfig,
     AuthorizationProjectorHandle,
@@ -27,9 +26,6 @@ const ACTION: &str = "read";
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires approved isolated MySQL and the production owned projector"]
 async fn projection_owned_signed_http_mutation_source_receipt_worker_strict_evaluate() {
-    freeze_projection_execution_mode(ProjectionExecutionMode::WorkerOwned)
-        .expect("WorkerOwned must be frozen before any source mutation");
-
     let pool = connect_required().await;
     let fixture = OwnedFixture::new("projection-owned-http");
     astral_mq::invalidation::install_origin_region(format!("owned-http-{:x}", fixture.suite.salt))

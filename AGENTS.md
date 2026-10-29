@@ -145,7 +145,6 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 ├── policy-engine/             # 权限评估、编译内核、strict evidence gate
 ├── astral-common/             # 配置、错误、API 契约、中间件、审计与可观测性
 ├── astral-db/                 # SQLx repository、迁移、投影与证据持久化
-├── astral-cache/              # Redis 缓存与消息幂等；已退出 workspace（exclude 自包含 archive，源码零删除，见规范 15.3）
 ├── astral-mq/                 # RabbitMQ 消息契约与传输
 ├── astral-gateway/            # Gateway 身份校验与请求转发
 ├── astral-identity/           # 身份、会话、JWT 与卡片管理
@@ -177,11 +176,11 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 
 - `identity_card` 表示认证身份，每人一张；`user_card` 表示授权载体，每人可多张。两者不得混用，权限不得从旧角色映射旁路取得。
 - 所有有效授权读取和写入都必须带租户边界；跨租户数据、缓存键、projection 和审计关联不得相互污染。
-- **凡影响有效授权或资格的 source mutation**，必须按对应 aggregate contract 进入 durable source/evidence path；CARD/RULE_SET 使用 head/outbox + audit correlation，ELIGIBILITY 使用其自身记录的资格/缓存失效路径，不能被遗漏，也不能被误当成规则快照刷新。正式授权路径的 projection/read-gate 不足时只能返回 `PENDING` 或 `DENY`。
-- source transaction 只覆盖必要的 source、durable head/outbox 和 audit correlation 写入；不得把网络、MQ/Redis、快照构建、重试、安装或验收放进事务。提交后由 projector/worker 处理 durable projection、缓存失效、消息和审计。
+- **凡影响有效授权或资格的 source mutation**，必须按 aggregate contract 进入 durable source/evidence path；canonical 授权发布以 grant revision/delta、manifest/segment 与 current pointer 证明。保留的 head/outbox 只承担 source correlation、revoke / RuleSet 初始化关联及 ELIGIBILITY L1 资格缓存失效等已登记职责，不代表授权发布完成，也不意味着本次变更删除表。
+- source transaction 只覆盖必要的 source、durable correlation/outbox 和 audit correlation 写入；不得把网络、MQ、缓存操作、快照构建、重试、安装或验收放进事务。提交后由 projector/worker 处理 durable projection、进程内缓存失效、消息和审计。缓存有界 TTL/容量；缓存失败、过期或不一致不得绕过 strict DB read gate。
 - `CARD` refresh 与 `ELIGIBILITY` cache eviction 是不同语义，必须分别记录、分别失效和分别验证，不得用一个事件代替另一个。
 - 正式授权路径必须同时满足 generation、dependency、`READY` 和 read-gate；任一不足、unknown、failed 或 stale 时只能 `PENDING`/`DENY`，禁止使用旧快照、source/raw 读取或缓存回退放行，不得以 ACK 代替 durable proof。
-- 如必须保留 Java `CARD_ONLY` 迁移兼容，只能是对应 Docs 已登记、default-off 或仅在明确迁移窗口配置时启用的逐卡/租户边界例外；必须有审计、指标、到期日和替代路径。unknown/failed/stale gate 仍只能 `PENDING`/`DENY`，不得授权于 raw/source 读取或未证明的旧快照；仍必须经过 `PolicyEngine.evaluate()`，不得扩展为通用 fallback。
+- CURRENT V6 不接受 native `CARD_ONLY` 输入；保留 `MANUAL`/direct-delta 的明示语义。不得自动改写旧 source 数据；如需迁移，必须使用单独批准的 offline preflight/rebuild，并保留 revoke/fence 与审计事实。正式授权仍必须经过 `PolicyEngine.evaluate()` 与 published-evidence strict gate。
 
 ### 3.3 规则、资源与路径
 
@@ -189,13 +188,14 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 - 规则集共享和 BASE/OVERLAY 语义遵循实现规范；新的长期路径不得直接制造旧 TEMPLATE `permission_rule` 写入或旧映射 owner。
 - 新接口使用已冻结主路径、复数资源名和 `kebab-case`；不得新增 camelCase 路径段、裸资源、`/duo/**` 或新的外部 `/identity/**` 路径。
 - 路径规则不得误伤已冻结的 TrustGraph `/main/api/v1/**`；该路径是现有主入口，不应被“禁止新增 `/main/**`”之类的宽泛规则错误拦截。其他冻结路径和兼容窗口以 [`统一接口路径规范_V5.md`](Docs/规范/统一接口路径规范_V5.md) 为准。
-- Rust 0.x workspace 内部接口只有在本次变更清单逐项列明、同步迁移全部仓内调用方/测试/文档，并标注 `BREAKING CHANGE`、替代入口、影响范围、生效时间、迁移方案和回滚方案时，才可直接下线；稳定 `pub` API、跨仓或外部 HTTP、消息及消息协议、数据库协议和既有 `compatibility`/`legacy` 入口不适用，不得隐式删除。
+- Rust 0.x workspace 内部接口只有在本次变更清单逐项列明、同步迁移全部仓内调用方/测试/文档，并标注 `BREAKING CHANGE`、替代入口、影响范围、生效时间、迁移方案和回滚方案时，才可直接下线；稳定 `pub` API、跨仓或外部 HTTP、消息及消息协议、数据库协议和既有 `compatibility`/`legacy` 入口不得隐式删除。本次经用户明确批准的 V6-only 物理退役，仅对 [`Rust后端编码规范_V1.0.md` §15.8](Docs/规范/Rust后端编码规范_V1.0.md#158-current-v6-breaking-change-inventory-与-adoption-notice) 逐项登记的删除面适用，仍须完成调用方迁移、拒绝旧输入、adoption/preflight 与回滚记录；未列出的入口不在该批准范围内。
 
 ### 3.4 事务、投影、消息与恢复
 
 - Rust 的分层、事务、projection、消息和错误语义以 [`Rust后端编码规范_V1.0.md`](Docs/规范/Rust后端编码规范_V1.0.md) 为准；Java 专属实现不在本独立仓库范围内，本文件不复制实现正文。
-- 对 CARD/RULE_SET 授权 projection 而言，durable head/outbox 是 source mutation 与提交后 worker 的边界；ELIGIBILITY 只处理其自身资格记录和缓存失效语义。projector/worker 只能物化已批准的 source mutation，不得自行创造新授权；worker 必须保留 ownership、CAS lease、generation/token fence、幂等和有限重试，未知结果先对账。
-- source transaction 必须保持短事务边界，只覆盖必要的 source、durable head/outbox 和 audit correlation 写入；网络、MQ/Redis、projection/快照构建、重试、安装和验收均在事务外执行。
+- `WorkerOwned` 是唯一授权 projection 执行协议；source transaction 只有在 COMMIT 已证明后才交付完整 receipt，请求端只能有界等待完整 receipt 批次的 exact durable completion，不能 claim、compile 或 publish。worker 必须保留 ownership、CAS lease、generation/token fence、幂等、有限重试和 UNKNOWN 对账。`TenantSerial`/`Partitioned` 是独立调度拓扑，默认值及 ORG_SCOPE 的 default-off 状态不因本次清理改变。
+- 保留的 source head/outbox 仅承担 source correlation、revoke / RuleSet 初始化关联和 ELIGIBILITY L1 失效等职责；不得把它当成 canonical 发布证明，也不得从本次 V6 文档更新推断数据库表已删除。
+- source transaction 必须保持短事务边界，只覆盖必要的 source、durable head/outbox 和 audit correlation 写入；网络、MQ/缓存、projection/快照构建、重试、安装和验收均在事务外执行。
 - 迁移必须按所在技术栈规范设计可回滚、可恢复、可重入的步骤，并完成 preflight、备份/恢复演练和 postcondition 验证后才可进入 Exec-L3。
 - 投影不一致、消息 ACK 无 durable proof 或恢复状态未知时默认 `PENDING`/`DENY`；其中因审计证据不足而触发 `PENDING`/`DENY`，仅限授权变更、敏感访问、关键写操作及 projection audit correlation。普通成功 `ALLOW` 的审计频率和是否同步由对应技术栈 Docs 决定，本文件不新增“每次 `ALLOW` 必须同步审计”的要求。
 
@@ -266,7 +266,7 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
   - `PENDING`：异步 durable 操作已启动但尚未到达可证明终态。
 - 测试内部 `[SKIP]`、Cargo ignored 统计和 `RUST_INTEGRATION_REQUIRED` 必须与退出码分开记录；`exit 0` 不等于业务 `PASS`。不得以历史报告、mock/unit 测试或文档单独证明外部集成成功。
 - 发生 stream 断流或 runner 不可用时，记录阶段、时间、重试次数、最后完整证据、退出码和 artifact 完整性，默认标记 `UNKNOWN`。只有独立对账确认工作区、进程、durable state、head/outbox、业务消费、审计和 postcondition 后，才能转为 `PASS` 或 `FAIL`；未知结果不得盲目重试。
-- Rust workspace 命令必须从新仓库根目录执行，或显式使用 `--manifest-path E:\OfficialVersion\AstralLight-Next\Cargo.toml`。在上层目录找不到 `Cargo.toml` 只算验证未开始。workspace 只覆盖当前 `members`；`exclude` crate 必须单列为未覆盖并执行专用验证。`cargo test --workspace` 不代表 ignored integration 已执行；完整 integration 必须使用显式 ignored 命令和真实依赖。设置 `SKIP_DOCKER` 或缺少 MySQL/Redis/RabbitMQ 时，不得报告绿色的真实集成 `PASS`。Rust 验证必须记录 cwd、命令、环境、退出码、日志/artifact 和 postcondition。
+- Rust workspace 命令必须从新仓库根目录执行，或显式使用 `--manifest-path E:\OfficialVersion\AstralLight-Next\Cargo.toml`。在上层目录找不到 `Cargo.toml` 只算验证未开始。workspace 只覆盖当前 `members`；`exclude` crate 必须单列为未覆盖并执行专用验证。`cargo test --workspace` 不代表 ignored integration 已执行；完整 integration 必须使用显式 ignored 命令和真实依赖。设置 `SKIP_DOCKER` 或缺少当前 profile 必需的 MySQL/RabbitMQ 时，不得报告绿色的真实集成 `PASS`。Redis 已退出当前运行与验收 profile。Rust 验证必须记录 cwd、命令、环境、退出码、日志/artifact 和 postcondition。
 
 ### 7.2 断流、接管与最终冻结
 

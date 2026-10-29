@@ -1,12 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const PROFILE_IDS: [&str; 8] = [
+pub const PROFILE_IDS: [&str; 7] = [
     "native-kernel",
     "offline-validation",
     "native-single-node",
     "standalone-rabbit",
     "distributed",
-    "redis-compat",
     "performance-kernel",
     "performance-native",
 ];
@@ -31,14 +30,6 @@ const RABBIT_FAULTS: [&str; 6] = [
     "current_pointer_movement",
     "hmac_failure",
     "mysql_unavailable",
-];
-const REDIS_COMPAT_FAULTS: [&str; 6] = [
-    "redis_unavailable",
-    "stale_hmac",
-    "pointer_movement",
-    "worker_restart",
-    "lease_expiry",
-    "unknown_ack",
 ];
 const PERFORMANCE_NATIVE_FAULTS: [&str; 4] = [
     "source_commit_unknown",
@@ -65,14 +56,6 @@ const RABBIT_DEPENDENCIES: [&str; 6] = [
     "identity_mapping",
     "gateway_integrity",
 ];
-const REDIS_DEPENDENCIES: [&str; 6] = [
-    "cache",
-    "redis",
-    "publication_worker_or_mq",
-    "authoritative_database",
-    "identity_mapping",
-    "gateway_integrity",
-];
 const PERFORMANCE_NATIVE_DEPENDENCIES: [&str; 3] =
     ["cache", "authoritative_database", "gateway_integrity"];
 pub const FAULT_TIMINGS: [&str; 2] = ["steady_state", "in_flight_revocation"];
@@ -85,7 +68,7 @@ pub struct Profile {
     pub faults: &'static [&'static str],
 }
 
-pub const PROFILES: [Profile; 8] = [
+pub const PROFILES: [Profile; 7] = [
     Profile {
         id: "native-kernel",
         services: &[],
@@ -117,12 +100,6 @@ pub const PROFILES: [Profile; 8] = [
         faults: &RABBIT_FAULTS,
     },
     Profile {
-        id: "redis-compat",
-        services: &["mysql", "redis"],
-        dependencies: &REDIS_DEPENDENCIES,
-        faults: &REDIS_COMPAT_FAULTS,
-    },
-    Profile {
         id: "performance-kernel",
         services: &[],
         dependencies: &[],
@@ -152,7 +129,7 @@ pub fn profile_faults(id: &str) -> Option<&'static [&'static str]> {
     profile(id).map(|profile| profile.faults)
 }
 
-pub const FAULT_DEPENDENCIES: [(&str, &[&str]); 18] = [
+pub const FAULT_DEPENDENCIES: [(&str, &[&str]); 12] = [
     ("memory_channel_suspect", &["memory_projection_hub"]),
     ("memory_invalidation_omission", &["memory_projection_hub"]),
     (
@@ -177,12 +154,6 @@ pub const FAULT_DEPENDENCIES: [(&str, &[&str]); 18] = [
     ("hmac_failure", &["gateway_integrity"]),
     ("mysql_unavailable", &["authoritative_database"]),
     ("rabbit_transport_unavailable", &["rabbitmq"]),
-    ("redis_unavailable", &["redis"]),
-    ("stale_hmac", &["gateway_integrity"]),
-    ("pointer_movement", &["cache", "redis"]),
-    ("worker_restart", &["publication_worker_or_mq"]),
-    ("lease_expiry", &["publication_worker_or_mq"]),
-    ("unknown_ack", &["publication_worker_or_mq"]),
 ];
 
 pub fn fault_dependencies(fault: &str) -> Option<&'static [&'static str]> {
@@ -257,9 +228,6 @@ pub fn validate_profiles() -> Result<usize, Vec<String>> {
                 profile.id
             ));
         }
-        if dependencies.contains("redis") && !services.contains("redis") {
-            problems.push(format!("{}:dependency_without_service:redis", profile.id));
-        }
         for fault in profile.faults {
             let valid = fault_dependencies(fault).is_some_and(|required| {
                 !required.is_empty()
@@ -302,22 +270,9 @@ pub fn validate_profiles() -> Result<usize, Vec<String>> {
         problems.push("profile_ids_do_not_match_registry".to_owned());
     }
     if profile("native-single-node").is_some_and(|item| {
-        item.services
-            .iter()
-            .any(|service| *service == "redis" || *service == "rabbitmq")
-            || item
-                .dependencies
-                .iter()
-                .any(|dependency| *dependency == "redis" || *dependency == "rabbitmq")
+        item.services.contains(&"rabbitmq") || item.dependencies.contains(&"rabbitmq")
     }) {
-        problems.push("default_profile_includes_legacy_service".to_owned());
-    }
-    if profile("native-single-node").is_some_and(|item| {
-        item.faults
-            .iter()
-            .any(|fault| REDIS_COMPAT_FAULTS.contains(fault))
-    }) {
-        problems.push("legacy_faults_escape_redis_compat".to_owned());
+        problems.push("default_profile_includes_broker_service".to_owned());
     }
     if problems.is_empty() {
         Ok(PROFILES.len())
@@ -353,12 +308,6 @@ mod tests {
                 &RABBIT_DEPENDENCIES[..],
                 &RABBIT_FAULTS[..],
             ),
-            (
-                "redis-compat",
-                &["mysql", "redis"][..],
-                &REDIS_DEPENDENCIES[..],
-                &REDIS_COMPAT_FAULTS[..],
-            ),
             ("performance-kernel", &[][..], &[][..], &[][..]),
             (
                 "performance-native",
@@ -367,7 +316,7 @@ mod tests {
                 &PERFORMANCE_NATIVE_FAULTS[..],
             ),
         ];
-        assert_eq!(validate_profiles(), Ok(8));
+        assert_eq!(validate_profiles(), Ok(7));
         assert_eq!(PROFILE_IDS, expected.map(|(id, _, _, _)| id));
         for (id, services, dependencies, faults) in expected {
             let actual = profile(id).unwrap();
@@ -379,7 +328,7 @@ mod tests {
 
     #[test]
     fn every_fault_dependency_and_matrix_entry_is_explicit() {
-        assert_eq!(FAULT_DEPENDENCIES.len(), 18);
+        assert_eq!(FAULT_DEPENDENCIES.len(), 12);
         assert_eq!(
             fault_dependencies("local_bus_overflow"),
             Some(["local_bus", "local_projection_bus"].as_slice())
@@ -389,8 +338,13 @@ mod tests {
             Some(["gateway_integrity"].as_slice())
         );
         assert_eq!(
-            fault_dependencies("unknown_ack"),
-            Some(["publication_worker_or_mq"].as_slice())
+            fault_dependencies("rabbit_transport_unavailable"),
+            Some(["rabbitmq"].as_slice())
+        );
+        assert!(
+            fault_dependencies_for("standalone-rabbit", "rabbit_transport_unavailable")
+                .unwrap()
+                .contains(&"rabbitmq")
         );
         assert_eq!(
             fault_dependencies_for("standalone-rabbit", "worker_death_sticky").unwrap(),
@@ -400,13 +354,11 @@ mod tests {
             fault_dependencies_for("native-single-node", "worker_death_sticky").unwrap(),
             ["publication_worker"]
         );
-        assert_eq!(
-            fault_dependencies_for("redis-compat", "unknown_ack").unwrap(),
-            ["publication_worker_or_mq"]
+        assert!(
+            fault_dependencies_for("native-kernel", "rabbit_transport_unavailable")
+                .unwrap()
+                .is_empty()
         );
-        assert!(fault_dependencies_for("native-kernel", "unknown_ack")
-            .unwrap()
-            .is_empty());
         for fault in [
             "memory_channel_suspect",
             "memory_invalidation_omission",
@@ -420,12 +372,6 @@ mod tests {
             "hmac_failure",
             "mysql_unavailable",
             "rabbit_transport_unavailable",
-            "redis_unavailable",
-            "stale_hmac",
-            "pointer_movement",
-            "worker_restart",
-            "lease_expiry",
-            "unknown_ack",
         ] {
             assert!(fault_dependencies(fault).is_some(), "{fault}");
         }
@@ -449,19 +395,25 @@ mod tests {
     }
 
     #[test]
-    fn unknown_profiles_and_redis_compat_faults_fail_closed() {
+    fn unknown_profiles_and_retired_redis_faults_fail_closed() {
         assert_eq!(
             dependency_fault_matrix("not-a-profile").unwrap_err(),
             "unknown_profile:not-a-profile"
         );
-        for fault in REDIS_COMPAT_FAULTS {
-            assert!(profile("redis-compat").unwrap().faults.contains(&fault));
-            for item in PROFILES.iter().filter(|item| item.id != "redis-compat") {
-                assert!(!item.faults.contains(&fault), "{}:{fault}", item.id);
-            }
+        assert_eq!(
+            dependency_fault_matrix("redis-compat").unwrap_err(),
+            "unknown_profile:redis-compat"
+        );
+        for fault in [
+            "redis_unavailable",
+            "stale_hmac",
+            "pointer_movement",
+            "worker_restart",
+            "lease_expiry",
+        ] {
+            assert!(fault_dependencies(fault).is_none(), "{fault}");
         }
         let native = profile("native-single-node").unwrap();
-        assert!(!native.dependencies.contains(&"redis"));
         assert!(!native.dependencies.contains(&"rabbitmq"));
         assert_eq!(native.services, &["mysql"]);
     }

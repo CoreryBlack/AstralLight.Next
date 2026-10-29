@@ -27,11 +27,9 @@
 //!   same aggregate keys with equal publication stamps (generation, final
 //!   manifest digest and original sealing time). A durable aggregate missing
 //!   from the snapshot, a snapshot aggregate absent from the durable scope
-//!   (stale or foreign identity), a generation behind the durable one, and a
-//!   generation ahead of the durable one all map to rebuild/reconciliation.
-//!   The global maximum generation never proves coverage (a snapshot with one
-//!   aggregate ahead and one behind has a high maximum; see the deprecated
-//!   [`decide_snapshot_fallback`] documentation).
+//!   (stale or foreign identity), a generation behind or ahead of the durable
+//!   one, or a stamp mismatch all map to rebuild/reconciliation. Global maximum
+//!   generation is telemetry only and never proves per-scope coverage.
 //! - Even [`SnapshotFallbackDecision::WarmFromSnapshot`] only permits warming;
 //!   readiness refuses to serve until the caller proves catch-up against the
 //!   durable frontier ([`SnapshotReadiness::Ready`] is the only serviceable
@@ -103,10 +101,6 @@ use astral_types::PublicationStamp;
 /// any parsing happens.
 pub const SNAPSHOT_MAGIC: [u8; 8] = *b"ASTRLPS1";
 
-/// Retired frame versions, retained as public identifiers for rejection diagnostics.
-/// Runtime readers and writers use [`SNAPSHOT_SCHEMA_VERSION`] exclusively.
-pub const SNAPSHOT_SCHEMA_VERSION_V1: u32 = 1;
-pub const SNAPSHOT_SCHEMA_VERSION_V2: u32 = 2;
 /// Current framed + envelope schema version, shared with the authorization edition.
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = astral_types::AUTHORIZATION_EDITION as u32;
 
@@ -618,29 +612,12 @@ pub enum RebuildCause {
     #[error("snapshot unusable: {0}")]
     Corrupt(#[from] LocalSnapshotError),
 
-    /// The snapshot frontier is older than the durable frontier; warming from
-    /// it would risk missing deltas, so rebuild replays the ledger instead.
-    ///
-    /// Retained for compatibility with the deprecated global-maximum decision
-    /// ([`decide_snapshot_fallback`]); the per-scope decision reports the
-    /// offending aggregate via [`RebuildCause::ScopeDivergence`] instead.
-    #[deprecated(
-        since = "0.1.0",
-        note = "use ScopeDivergence for per-aggregate stale generations"
-    )]
-    #[allow(deprecated)]
-    #[error("snapshot generation {snapshot_generation} is behind durable generation {durable_generation}")]
-    StaleGeneration {
-        snapshot_generation: u64,
-        durable_generation: u64,
-    },
-
     /// The snapshot frontier does not exactly match the durable published
     /// scope at one aggregate. Missing (durable aggregate absent from the
     /// snapshot), extra (snapshot aggregate absent from the durable scope --
-    /// stale or foreign identity, a tenant-isolation hazard), stale
-    /// (generation behind), and ahead (generation beyond anything the durable
-    /// ledger can account for) all rebuild/reconcile; none ever serves.
+    /// stale or foreign identity, a tenant-isolation hazard), stale (generation
+    /// behind), ahead (generation beyond anything the durable ledger can account
+    /// for), or a complete-stamp mismatch all rebuild/reconcile; none ever serves.
     #[error("snapshot scope diverges at '{aggregate_key}' ({kind:?}): snapshot generation {snapshot_generation:?} vs durable {durable_generation:?}")]
     ScopeDivergence {
         aggregate_key: String,
@@ -679,15 +656,13 @@ pub enum ScopeDivergenceKind {
 #[derive(Debug)]
 pub enum SnapshotFallbackDecision {
     /// A decision accepted the validated snapshot as a warm-up input. The
-    /// current per-scope decision emits this only for an exact durable-frontier
-    /// match; the deprecated scalar decision may emit it from a global-maximum
-    /// comparison that does not prove completeness. Readiness still refuses to
-    /// serve until the durable frontier is proven caught up.
+    /// per-scope decision emits this only for an exact durable-frontier match.
+    /// Readiness still refuses to serve until the durable frontier is proven
+    /// caught up.
     WarmFromSnapshot {
         /// Advisory telemetry only: the highest generation in the snapshot
-        /// frontier. The per-scope decision proves completeness by exact
-        /// aggregate identity, never by this maximum (0 for an empty-system
-        /// snapshot); the deprecated scalar decision does not prove it.
+        /// frontier. Completeness is proven by the per-scope exact-stamp
+        /// comparison, never by this maximum (0 for an empty-system snapshot).
         frontier_generation: u64,
     },
     /// Ledger rebuild is mandatory; never authorize from this snapshot.
@@ -748,9 +723,9 @@ impl DurableFrontier {
 /// Pure per-aggregate decision over a snapshot load result versus the durable
 /// published scope. Completeness requires **exact identity**: the snapshot
 /// frontier and the durable scope must contain the same aggregate keys with
-/// equal generations. Missing, extra, stale, and ahead aggregates each
-/// rebuild with the offending key preserved for reconciliation; the global
-/// maximum generation is never used as a coverage proof.
+/// identical complete publication stamps. Missing, extra, stale, ahead, or
+/// mismatched stamps rebuild with the offending key preserved for reconciliation;
+/// the global maximum generation is never used as a coverage proof.
 pub fn decide_snapshot_fallback_per_scope(
     load_result: Result<SnapshotEnvelope, LocalSnapshotError>,
     durable_frontier: &DurableFrontier,
@@ -774,7 +749,7 @@ pub fn decide_snapshot_fallback_per_scope(
 
 /// First divergence between the snapshot frontier and the durable scope in
 /// deterministic (lexicographic) key order. `None` means exact identity: same
-/// key set, equal generation per key.
+/// key set and full publication-stamp equality for each key.
 fn find_scope_divergence(
     snapshot: &SnapshotFrontier,
     durable: &DurableFrontier,
@@ -854,52 +829,6 @@ fn find_scope_divergence(
             }
             (None, None) => return None,
         }
-    }
-}
-
-/// Legacy global-maximum decision: compares only the highest generation
-/// across aggregates against one durable number.
-///
-/// **Deprecated because it cannot prove completeness**: a multi-aggregate
-/// snapshot with one aggregate ahead and one behind the durable frontier has
-/// a high maximum and is (wrongly) accepted here. Retained only for source
-/// compatibility; its result is a warm-up hint at most and must never establish
-/// service readiness. Runtime authorization must use
-/// [`decide_snapshot_fallback_per_scope`], which requires exact per-aggregate
-/// identity and generation equality.
-#[deprecated(
-    since = "0.1.0",
-    note = "global max_generation cannot prove per-aggregate completeness; use decide_snapshot_fallback_per_scope"
-)]
-#[allow(deprecated)]
-pub fn decide_snapshot_fallback(
-    load_result: Result<SnapshotEnvelope, LocalSnapshotError>,
-    durable_frontier_generation: u64,
-) -> SnapshotFallbackDecision {
-    let envelope = match load_result {
-        Ok(envelope) => envelope,
-        Err(LocalSnapshotError::Missing(_)) => {
-            return SnapshotFallbackDecision::RebuildRequired(RebuildCause::Missing);
-        }
-        Err(error) => {
-            return SnapshotFallbackDecision::RebuildRequired(RebuildCause::Corrupt(error));
-        }
-    };
-    let snapshot_generation = envelope.source_frontier.max_generation();
-    let covers = match snapshot_generation {
-        Some(max_generation) => max_generation >= durable_frontier_generation,
-        // Empty frontier only covers an empty system (durable generation 0).
-        None => durable_frontier_generation == 0,
-    };
-    if covers {
-        SnapshotFallbackDecision::WarmFromSnapshot {
-            frontier_generation: snapshot_generation.unwrap_or(0),
-        }
-    } else {
-        SnapshotFallbackDecision::RebuildRequired(RebuildCause::StaleGeneration {
-            snapshot_generation: snapshot_generation.unwrap_or(0),
-            durable_generation: durable_frontier_generation,
-        })
     }
 }
 
@@ -1035,10 +964,6 @@ pub fn readiness_from_decision(decision: &SnapshotFallbackDecision) -> SnapshotR
         }
         SnapshotFallbackDecision::RebuildRequired(RebuildCause::Corrupt(_)) => {
             SnapshotReadiness::Corrupt
-        }
-        #[allow(deprecated)]
-        SnapshotFallbackDecision::RebuildRequired(RebuildCause::StaleGeneration { .. }) => {
-            SnapshotReadiness::RebuildRequired
         }
         SnapshotFallbackDecision::RebuildRequired(RebuildCause::ScopeDivergence { .. }) => {
             SnapshotReadiness::RebuildRequired
@@ -1203,34 +1128,52 @@ mod tests {
     // ── schema version handling ──────────────────────────────────────────────
 
     #[test]
-    fn unsupported_framed_schema_version_rejected_before_digest() {
-        // Hand-build a legacy V1 frame with a V1-consistent digest: the
-        // version gate must fire regardless of digest correctness.
+    fn unsupported_framed_schema_versions_rejected_before_digest() {
+        // Hand-build each older supported-layout frame with a matching digest:
+        // the version gate must fire regardless of digest correctness.
         let envelope_bytes = serde_json::to_vec(&test_envelope(7)).expect("serialize");
-        let digest = framed_digest(SNAPSHOT_SCHEMA_VERSION_V1, &envelope_bytes);
-        let mut framed = Vec::new();
-        framed.extend_from_slice(&SNAPSHOT_MAGIC);
-        framed.extend_from_slice(&SNAPSHOT_SCHEMA_VERSION_V1.to_be_bytes());
-        framed.extend_from_slice(&(envelope_bytes.len() as u64).to_be_bytes());
-        framed.extend_from_slice(&envelope_bytes);
-        framed.extend_from_slice(&digest);
-        let error = parse_snapshot_bytes(&framed).expect_err("v1 frame");
+        for retired_version in 0..SNAPSHOT_SCHEMA_VERSION {
+            let digest = framed_digest(retired_version, &envelope_bytes);
+            let mut framed = Vec::new();
+            framed.extend_from_slice(&SNAPSHOT_MAGIC);
+            framed.extend_from_slice(&retired_version.to_be_bytes());
+            framed.extend_from_slice(&(envelope_bytes.len() as u64).to_be_bytes());
+            framed.extend_from_slice(&envelope_bytes);
+            framed.extend_from_slice(&digest);
+            let error = parse_snapshot_bytes(&framed).expect_err("retired schema frame");
+            assert!(matches!(
+                error,
+                LocalSnapshotError::UnsupportedSchemaVersion { found }
+                    if found == retired_version
+            ));
+        }
+    }
+
+    #[test]
+    fn framed_future_schema_version_is_rejected_before_digest() {
+        let mut framed = frame_snapshot(&test_envelope(7)).expect("frame");
+        let future_version = SNAPSHOT_SCHEMA_VERSION + 1;
+        framed[8..12].copy_from_slice(&future_version.to_be_bytes());
+        let error = parse_snapshot_bytes(&framed).expect_err("future frame, stale digest");
         assert!(matches!(
             error,
-            LocalSnapshotError::UnsupportedSchemaVersion {
-                found: SNAPSHOT_SCHEMA_VERSION_V1
-            }
+            LocalSnapshotError::UnsupportedSchemaVersion { found } if found == future_version
         ));
     }
 
     #[test]
-    fn stale_digest_on_unknown_version_still_reports_version_first() {
-        let mut framed = frame_snapshot(&test_envelope(7)).expect("frame");
-        framed[11] = 1; // legacy V1, digest now stale
-        let error = parse_snapshot_bytes(&framed).expect_err("v1 frame, stale digest");
+    fn envelope_future_schema_version_is_rejected() {
+        let mut future = test_envelope(7);
+        future.schema_version = SNAPSHOT_SCHEMA_VERSION + 1;
+        let envelope_bytes = serde_json::to_vec(&future).expect("serialize");
+        let framed = framed_bytes(SNAPSHOT_SCHEMA_VERSION, &envelope_bytes);
+        let error = parse_snapshot_bytes(&framed).expect_err("future envelope version");
         assert!(matches!(
             error,
-            LocalSnapshotError::UnsupportedSchemaVersion { found: 1 }
+            LocalSnapshotError::EnvelopeSchemaMismatch {
+                frame: SNAPSHOT_SCHEMA_VERSION,
+                envelope
+            } if envelope == SNAPSHOT_SCHEMA_VERSION + 1
         ));
     }
 
@@ -1246,7 +1189,7 @@ mod tests {
             error,
             LocalSnapshotError::EnvelopeSchemaMismatch {
                 frame: SNAPSHOT_SCHEMA_VERSION,
-                envelope: SNAPSHOT_SCHEMA_VERSION_V1
+                envelope: 1
             }
         ));
     }
@@ -1572,6 +1515,32 @@ mod tests {
     }
 
     #[test]
+    fn per_scope_complete_stamp_mismatch_rebuilds() {
+        let snapshot_stamp = valid_stamp(7);
+        let mut durable_stamp = snapshot_stamp.clone();
+        durable_stamp.manifest_digest_hex = "b".repeat(64);
+        let snapshot = SnapshotEnvelope::new(
+            fixed_time(),
+            SnapshotFrontier {
+                aggregates: BTreeMap::from([("a".to_owned(), snapshot_stamp)]),
+            },
+            json!({"grants": []}),
+        );
+        let durable = DurableFrontier::new(BTreeMap::from([("a".to_owned(), durable_stamp)]))
+            .expect("durable stamp is valid");
+
+        assert!(matches!(
+            decide_snapshot_fallback_per_scope(Ok(snapshot), &durable),
+            SnapshotFallbackDecision::RebuildRequired(RebuildCause::ScopeDivergence {
+                aggregate_key,
+                kind: ScopeDivergenceKind::StampMismatch,
+                snapshot_generation: Some(7),
+                durable_generation: Some(7),
+            }) if aggregate_key == "a"
+        ));
+    }
+
+    #[test]
     fn per_scope_ahead_generation_rebuilds() {
         // The snapshot claims a generation the durable ledger does not have:
         // a divergence the ledger cannot account for -> reconcile via rebuild.
@@ -1592,13 +1561,13 @@ mod tests {
 
     #[test]
     fn multi_aggregate_one_high_one_low_cannot_cover_by_max() {
-        // Snapshot: "a" ahead at 9, "b" behind at 1; the durable max is 9.
-        // A max-based comparison sees 9 >= 9 and would wrongly warm; the
-        // per-scope decision must rebuild because "b" is not covered.
-        let decision = decide_snapshot_fallback_per_scope(
-            Ok(envelope_with_frontier(frontier(&[("a", 9), ("b", 1)]))),
-            &durable_frontier(&[("a", 9), ("b", 9)]),
-        );
+        // Snapshot: "a" is current at 9, "b" is stale at 1; the global maximum
+        // equals the durable maximum, but cannot prove scope completeness.
+        let snapshot = envelope_with_frontier(frontier(&[("a", 9), ("b", 1)]));
+        let durable = durable_frontier(&[("a", 9), ("b", 9)]);
+        assert_eq!(snapshot.source_frontier.max_generation(), Some(9));
+        assert_eq!(durable.generation_for("b"), Some(9));
+        let decision = decide_snapshot_fallback_per_scope(Ok(snapshot), &durable);
         match decision {
             SnapshotFallbackDecision::RebuildRequired(RebuildCause::ScopeDivergence {
                 aggregate_key,
@@ -1607,24 +1576,6 @@ mod tests {
                 durable_generation: Some(9),
             }) => assert_eq!(aggregate_key, "b"),
             other => panic!("expected stale divergence on 'b', got {other:?}"),
-        }
-        // The deprecated global-max decision accepts the same incomplete
-        // snapshot as a warm-up hint only. It cannot establish serviceability.
-        #[allow(deprecated)]
-        {
-            let legacy = decide_snapshot_fallback(
-                Ok(envelope_with_frontier(frontier(&[("a", 9), ("b", 1)]))),
-                9,
-            );
-            assert!(matches!(
-                legacy,
-                SnapshotFallbackDecision::WarmFromSnapshot {
-                    frontier_generation: 9
-                }
-            ));
-            let readiness = readiness_from_decision(&legacy);
-            assert_eq!(readiness, SnapshotReadiness::Warming);
-            assert!(!readiness.is_serviceable());
         }
     }
 
@@ -1690,35 +1641,6 @@ mod tests {
             )),
             "ledger rebuild"
         );
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn legacy_max_decision_is_deprecated_and_insufficient() {
-        // Behavior pin for the deprecated API only: it still reports
-        // StaleGeneration on a low max and warms on a matching max, but it
-        // cannot detect per-aggregate divergence (see
-        // multi_aggregate_one_high_one_low_cannot_cover_by_max). The runtime
-        // authorization path must use decide_snapshot_fallback_per_scope.
-        let decision = decide_snapshot_fallback(Ok(test_envelope(5)), 9);
-        assert!(matches!(
-            decision,
-            SnapshotFallbackDecision::RebuildRequired(RebuildCause::StaleGeneration { .. })
-        ));
-        assert_eq!(
-            readiness_from_decision(&decision),
-            SnapshotReadiness::RebuildRequired
-        );
-        let decision = decide_snapshot_fallback(Ok(test_envelope(9)), 9);
-        assert!(matches!(
-            decision,
-            SnapshotFallbackDecision::WarmFromSnapshot {
-                frontier_generation: 9
-            }
-        ));
-        let readiness = readiness_from_decision(&decision);
-        assert_eq!(readiness, SnapshotReadiness::Warming);
-        assert!(!readiness.is_serviceable());
     }
 
     #[test]

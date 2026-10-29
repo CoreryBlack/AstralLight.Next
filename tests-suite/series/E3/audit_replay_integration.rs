@@ -235,7 +235,6 @@ fn request_id_for(message_id: &str) -> String {
 
 fn audit_envelope(message_id: &str, request_id: &str) -> Vec<u8> {
     let payload = AuditLogPayload {
-        message_id: Some(message_id.to_owned()),
         user_id: Some(7_901),
         card_id: Some(7_902),
         action: "replay-read".to_owned(),

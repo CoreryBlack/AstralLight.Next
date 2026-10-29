@@ -4,6 +4,7 @@ use crate::{
     AuthorizationProjectionError, DeltaEventAppendRequest, GrantRepositoryError,
     ProjectionAggregateIdentity, Sha256Digest,
 };
+use astral_types::AUTHORIZATION_COMPILER_VERSION;
 
 /// Immutable receipt identity; it cannot be replaced by an operation-only query.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,8 +29,6 @@ impl OwnedCompletionIdentity {
             || request.event_id.chars().count() > crate::MAX_EVENT_ID_LENGTH
             || request.operation_id.is_empty()
             || request.operation_id.chars().count() > crate::MAX_GRANT_OPERATION_ID_LENGTH
-            || request.compiler_version.is_empty()
-            || request.compiler_version.chars().count() > crate::MAX_COMPILER_VERSION_LENGTH
             || request.source_generation == 0
             || request.source_generation > i64::MAX as u64
             || request.revoke_fence > request.source_generation
@@ -39,6 +38,11 @@ impl OwnedCompletionIdentity {
         {
             return Err(GrantRepositoryError::ScopeViolation(
                 "code=projection_execution.invalid_completion_receipt".to_owned(),
+            ));
+        }
+        if request.compiler_version != AUTHORIZATION_COMPILER_VERSION {
+            return Err(GrantRepositoryError::ScopeViolation(
+                "code=projection_execution.non_current_completion_compiler".to_owned(),
             ));
         }
         Sha256Digest::from_hex(&request.semantic_hash_hex)?;

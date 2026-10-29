@@ -2,7 +2,7 @@ use sqlx::MySqlPool;
 
 use super::{
     transitions::{audit_owned_lane_in_tx, commit_owned_transition},
-    OwnedDeltaClaim, OwnedStableEventOutcome, ProjectionExecutionMode,
+    OwnedDeltaClaim, OwnedStableEventOutcome,
 };
 use crate::{DeltaEventAppendRequest, DeltaEventClaimScope, GrantRepositoryError};
 
@@ -13,11 +13,6 @@ pub async fn claim_owned_delta_event_by_stable_event(
     owner: &str,
     lease_seconds: i64,
 ) -> Result<OwnedStableEventOutcome, GrantRepositoryError> {
-    if super::projection_execution_mode() != ProjectionExecutionMode::WorkerOwned {
-        return Err(GrantRepositoryError::ScopeViolation(
-            "code=projection_execution.worker_owned_mode_required".to_owned(),
-        ));
-    }
     let mut tx = pool.begin().await?;
     let outcome =
         crate::grant_repository::claim_owned_exact_in_tx(&mut tx, request, owner, lease_seconds)

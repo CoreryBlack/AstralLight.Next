@@ -497,7 +497,7 @@ mod tests {
             revoke_fence,
             dependencies: Vec::new(),
             manifest_digest_hex: manifest_digest_hex.to_owned(),
-            compiler_version: "test-compiler".to_owned(),
+            compiler_version: astral_types::AUTHORIZATION_ORG_COMPILER_VERSION.to_owned(),
             segments: Vec::new(),
             operation_id: "op-test".to_owned(),
         }

@@ -85,10 +85,6 @@ impl MqProducerRef for LearnMqProducer {
     async fn publish_audit_log(&self, event: AuditLogEvent) -> Result<(), String> {
         self.inner
             .publish_audit_log(astral_mq::producer::AuditLogPayload {
-                // message_id 必须唯一：audit consumer 以它为 mq_idempotent_log 幂等键，
-                // 恒 None 会回退到派生键，permission 审计 request_id 恒 None，
-                // 相同 user+resource+action 的重复判定会被 INSERT IGNORE 静默丢弃。
-                message_id: Some(uuid::Uuid::new_v4().to_string()),
                 user_id: event.user_id,
                 card_id: event.card_id,
                 action: event.action,
@@ -117,7 +113,6 @@ impl MqProducerRef for LearnMqProducer {
     ) -> Result<(), String> {
         self.inner
             .publish_login_event(astral_mq::producer::LoginEventPayload {
-                message_id: Some(uuid::Uuid::new_v4().to_string()),
                 user_id,
                 card_id: None,
                 login_type: login_type.to_string(),
@@ -178,12 +173,6 @@ impl Drop for LearnRabbitOwner {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let loaded_config = AppConfig::from_files("application")?;
-    // Validate the Learn binary's own Redis adapter capability and freeze the
-    // shared setting before DB connections, service assembly, or network calls.
-    loaded_config.validate_redis_adapter_support(cfg!(feature = "redis-compat"))?;
-    astral_common::config::install_redis_projection_compat(
-        loaded_config.redis_projection_compat_enabled,
-    )?;
     let config = Arc::new(loaded_config);
     let db = connect_and_validate_schema(&config.database_url).await?;
     // Grade reads/writes rely on one additive main-owned schema contract. Check
@@ -195,14 +184,13 @@ async fn main() -> anyhow::Result<()> {
     let engine = Arc::new(PolicyEngine::new());
     register_audit_db_writer(Arc::new(LearnAuditDbWriter { pool: db.clone() }));
     let rabbitmq_url = config.rabbitmq_url.clone();
-    let redis_url = config.redis_url.clone();
 
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:9002".into());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let mut producer_owner = None;
     let initialization = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        init_mq_producer(&rabbitmq_url, &redis_url, &mut producer_owner),
+        init_mq_producer(&rabbitmq_url, &mut producer_owner),
     )
     .await;
     let mq_producer = match initialization {
@@ -340,7 +328,6 @@ async fn main() -> anyhow::Result<()> {
     // RabbitMQ 暂不可用时进行有限重启；预算耗尽即触发服务优雅关闭。
     let pool = state.db.clone();
     let mq_url = state.config.rabbitmq_url.clone();
-    let redis_url = state.config.redis_url.clone();
     let subject_service_for_consumer = state.subject_service.clone();
     let relay_pool = state.db.clone();
     let relay_service = state.subject_service.clone();
@@ -357,7 +344,6 @@ async fn main() -> anyhow::Result<()> {
     let consumer_worker = LearnTaskHandle::spawn("rabbit-consumers", async move {
         let result = run_mq_consumer_supervisor(
             mq_url,
-            redis_url,
             pool,
             subject_service_for_consumer,
             supervisor_stop_rx,
@@ -671,7 +657,6 @@ async fn sleep_or_stopped(
 
 async fn run_mq_consumer_supervisor(
     rabbitmq_url: String,
-    redis_url: String,
     pool: MySqlPool,
     subject_service: Arc<SubjectService>,
     mut stop: tokio::sync::watch::Receiver<bool>,
@@ -691,7 +676,6 @@ async fn run_mq_consumer_supervisor(
                 LEARN_CONSUMER_STARTUP_BOUND,
                 init_mq_consumers(
                     &rabbitmq_url,
-                    &redis_url,
                     pool.clone(),
                     subject_service.clone(),
                     &mut consumers,
@@ -1032,18 +1016,8 @@ async fn confirm_subject_delete_receipt(
 
 async fn init_mq_producer(
     rabbitmq_url: &str,
-    redis_url: &str,
     owner: &mut Option<LearnRabbitOwner>,
 ) -> Result<astral_mq::producer::Producer, String> {
-    if astral_common::config::redis_projection_compat_frozen() {
-        #[cfg(feature = "redis-compat")]
-        astral_mq::consumer::init_idempotency_redis(redis_url)
-            .await
-            .map_err(|_| "Learn Redis idempotency initialization failed".to_owned())?;
-        #[cfg(not(feature = "redis-compat"))]
-        return Err("Learn Redis compatibility adapter is unavailable".into());
-    }
-    let _ = redis_url;
     let connection = Arc::new(
         Connection::connect(
             rabbitmq_url,
@@ -1092,18 +1066,10 @@ impl LearnMqConsumers {
 /// registers its subject-delete relay alongside its local durable dispatcher.
 async fn init_mq_consumers(
     rabbitmq_url: &str,
-    redis_url: &str,
     pool: MySqlPool,
     _subject_service: Arc<SubjectService>,
     consumers: &mut LearnMqConsumers,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if astral_common::config::redis_projection_compat_frozen() {
-        #[cfg(feature = "redis-compat")]
-        astral_mq::consumer::init_idempotency_redis(redis_url).await?;
-        #[cfg(not(feature = "redis-compat"))]
-        return Err("Redis idempotency compat requested without Learn redis-compat feature".into());
-    }
-    let _ = redis_url;
     let connection = Arc::new(
         Connection::connect(
             rabbitmq_url,

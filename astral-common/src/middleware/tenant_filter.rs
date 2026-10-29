@@ -12,9 +12,13 @@ use astral_types::{GlobalAccessRequirement, PolicyContext, ResourceOwnershipScop
 use policy_engine::{PolicyEngine, RuleRepository};
 
 #[cfg(test)]
-use policy_engine::{PermissionRule, RuleSetSnapshot};
+use astral_types::{
+    BindingLayer, CanonicalGrant, GrantEffect, GrantId, GrantProvenance, GrantRevision,
+    GrantSourceKind, GrantState, GrantValidity, PublishedAggregateManifestSummary,
+    PublishedCardAuthorization, PublishedCardAuthorizationGate, PublishedEvidenceGateStatus,
+    TenantScope, VerifiedPublishedGrantRecord,
+};
 
-const FAIL_CLOSED_SQL: &str = "SELECT NULL WHERE 1 = 0";
 const MAX_SQL_BYTES: usize = 4096;
 const MAX_TOKENS: usize = 512;
 
@@ -76,10 +80,7 @@ impl AuthorizedGlobalScope {
 }
 
 /// Restricted parameterized tenant-scope SELECT builder.
-///
-/// `new`, `build`, `build_sql`, and `params` preserve the previous signatures.
-/// Legacy infallible builders now return a fixed zero-row SELECT on invalid
-/// scope/SQL; use `try_build`/`try_build_sql` to inspect validation failures.
+/// Invalid scope or unsupported SQL returns an explicit validation error.
 #[derive(Debug, Clone)]
 pub struct TenantScopedQuery {
     base_sql: String,
@@ -217,24 +218,8 @@ impl TenantScopedQuery {
         Ok((sql, params))
     }
 
-    /// Legacy infallible API. Invalid input returns a fixed query that returns no rows.
-    pub fn build(&self) -> (String, Vec<String>) {
-        self.try_build()
-            .unwrap_or_else(|_| (FAIL_CLOSED_SQL.to_owned(), Vec::new()))
-    }
-
     pub fn try_build_sql(&self) -> Result<String, TenantScopeQueryError> {
         self.try_build().map(|(sql, _)| sql)
-    }
-
-    /// Legacy infallible API; invalid input returns `SELECT NULL WHERE 1 = 0`.
-    pub fn build_sql(&self) -> String {
-        self.build().0
-    }
-
-    /// Legacy infallible API; invalid input has no bind values.
-    pub fn params(&self) -> Vec<String> {
-        self.build().1
     }
 
     pub fn try_params(&self) -> Result<Vec<String>, TenantScopeQueryError> {
@@ -444,8 +429,8 @@ fn tokenize(sql: &str) -> Result<Vec<Token>, TenantScopeQueryError> {
             }
             Token::Operator(operator.into())
         } else {
-            // Quotes, comments, semicolons, parenthesis and all unsupported tokens
-            // are rejected: legacy builder will return a fixed zero-row SELECT.
+            // Quotes, comments, semicolons, parentheses and unsupported tokens
+            // must fail before the caller can issue a scoped query.
             return Err(TenantScopeQueryError::UnsupportedSql);
         };
         tokens.push(token);
@@ -509,14 +494,6 @@ pub trait DataFrameScopeFilter {
     fn org_id(&self) -> Option<i64>;
 }
 
-/// Legacy compatibility helper. Invalid input returns a fixed no-rows SELECT.
-pub async fn apply_tenant_scope(
-    base_sql: &str,
-    filter: &impl DataFrameScopeFilter,
-) -> (String, Vec<String>) {
-    TenantScopedQuery::new(base_sql).with_filter(filter).build()
-}
-
 pub async fn try_apply_tenant_scope(
     base_sql: &str,
     filter: &impl DataFrameScopeFilter,
@@ -556,24 +533,119 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RuleRepository for AllowGlobalRepository {
-        async fn load_rule_set_snapshots(
+        async fn check_card_active(
             &self,
-            _card_id: i64,
-        ) -> Result<Vec<RuleSetSnapshot>, astral_types::PolicyError> {
-            Ok(vec![])
+            _ctx: &PolicyContext,
+        ) -> Result<bool, astral_types::PolicyError> {
+            Ok(true)
         }
 
-        async fn load_permission_rules(
+        async fn is_active_global_admin(
             &self,
-            _card_id: i64,
-        ) -> Result<Vec<PermissionRule>, astral_types::PolicyError> {
-            Ok(vec![PermissionRule {
-                id: 1,
-                effect: astral_types::Effect::Allow,
+            _user_id: i64,
+        ) -> Result<bool, astral_types::PolicyError> {
+            Ok(false)
+        }
+
+        async fn load_published_card_authorization(
+            &self,
+            scope: &astral_types::PublishedCardEvidenceScope,
+        ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, astral_types::PolicyError>
+        {
+            let grant = CanonicalGrant {
+                grant_id: GrantId::parse("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("fixture grant id is valid"),
+                revision: GrantRevision::new(1).expect("fixture revision is positive"),
+                state: GrantState::Active,
+                source_kind: GrantSourceKind::Direct,
+                binding_layer: BindingLayer::None,
+                tenant: TenantScope::new(scope.tenant_id, None)
+                    .expect("fixture evidence tenant is positive"),
+                card_id: scope.card_id,
+                user_id: scope.user_filter.unwrap_or(1),
                 resource: "global_resource".into(),
                 action: "read".into(),
-                condition: None,
-            }])
+                effect: GrantEffect::Allow,
+                validity: GrantValidity::perpetual(),
+                provenance: GrantProvenance {
+                    source_id: "user-card-1".into(),
+                    source_entry: Some("permission-1".into()),
+                    binding_id: None,
+                    delegation_id: None,
+                    operation_id: "operation-1".into(),
+                    event_id: Some("event-1".into()),
+                    actor_user_id: None,
+                },
+            };
+            let compiler_version = astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned();
+            let semantic_hash = "a".repeat(64);
+            let dependency_hash = "b".repeat(64);
+            let manifest_digest = "c".repeat(64);
+            let manifest = PublishedAggregateManifestSummary {
+                seal: astral_types::PublicationSeal::from_unix_seconds(1_700_000_000)
+                    .expect("fixture seal is in range"),
+                tenant_id: scope.tenant_id,
+                card_id: scope.card_id,
+                aggregate_type: "CARD".into(),
+                aggregate_id: scope.card_id,
+                manifest_id: 1,
+                generation: 1,
+                source_generation: 1,
+                projected_generation: 1,
+                revoke_fence: 0,
+                cas_version: 1,
+                semantic_hash_hex: semantic_hash.clone(),
+                dependency_hash_hex: dependency_hash.clone(),
+                manifest_digest_hex: manifest_digest,
+                compiler_version: compiler_version.clone(),
+                event_id: "event-1".into(),
+                operation_id: "operation-1".into(),
+                parent_manifest_id: None,
+                segment_count: 1,
+                declared_grant_row_count: 1,
+            };
+            let record = VerifiedPublishedGrantRecord {
+                aggregate_type: "CARD".into(),
+                aggregate_id: scope.card_id,
+                publication_generation: 1,
+                revoke_fence: 0,
+                manifest_id: 1,
+                event_id: "event-1".into(),
+                operation_id: "operation-1".into(),
+                semantic_hash_hex: semantic_hash,
+                dependency_hash_hex: dependency_hash,
+                compiler_version,
+                segment_ordinal: 0,
+                position_in_segment: 0,
+                grant: grant.clone(),
+                accepted_into_effective_set: true,
+                unaccepted_reason: None,
+            };
+            Ok(Some(std::sync::Arc::new(PublishedCardAuthorization {
+                tenant_id: scope.tenant_id,
+                card_id: scope.card_id,
+                read_unix_seconds: 1_700_000_000,
+                gate: PublishedCardAuthorizationGate {
+                    status: PublishedEvidenceGateStatus::Ready,
+                    aggregate_manifest_count: 1,
+                    verified_record_count: 1,
+                    effective_grant_count: 1,
+                    not_in_effective_count: 0,
+                    equivalent_duplicate_collapsed_count: 0,
+                },
+                manifests: vec![manifest],
+                records: vec![record],
+                effective_grants: vec![grant],
+            })))
+        }
+
+        async fn load_org_authorization(
+            &self,
+            _ctx: &PolicyContext,
+        ) -> Result<policy_engine::OrgAuthorityRead, astral_types::PolicyError> {
+            // This fixture models an authoritative owner that has established
+            // the tenant is not under durable ORG_SCOPE management.
+            Ok(policy_engine::OrgAuthorityRead::Unmanaged)
         }
     }
 
@@ -581,6 +653,7 @@ mod tests {
         let context = PolicyContext::builder()
             .user_id(Some(1))
             .card_id(Some(1))
+            .tenant_id(Some(10))
             .action("read".into())
             .resource(Some("global_resource".into()))
             .target_id(Some(1))
@@ -621,12 +694,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_tenant_rejects_and_legacy_build_returns_constant_zero_rows_query() {
+    async fn missing_tenant_rejects_every_fallible_query_view() {
         let query = TenantScopedQuery::new("SELECT * FROM resources");
         assert_eq!(query.try_build(), Err(TenantScopeQueryError::ScopeRequired));
-        assert_eq!(query.build(), (FAIL_CLOSED_SQL.into(), vec![]));
-        assert_eq!(query.build_sql(), FAIL_CLOSED_SQL);
-        assert!(query.params().is_empty());
+        assert_eq!(
+            query.try_build_sql(),
+            Err(TenantScopeQueryError::ScopeRequired)
+        );
+        assert_eq!(
+            query.try_params(),
+            Err(TenantScopeQueryError::ScopeRequired)
+        );
+        assert_eq!(
+            try_apply_tenant_scope("SELECT * FROM resources", &Filter::default()).await,
+            Err(TenantScopeQueryError::ScopeRequired)
+        );
     }
 
     #[tokio::test]
@@ -676,7 +758,6 @@ mod tests {
                 Err(TenantScopeQueryError::UnsupportedSql),
                 "{sql}"
             );
-            assert_eq!(query.build(), (FAIL_CLOSED_SQL.into(), vec![]), "{sql}");
         }
     }
 

@@ -1,35 +1,15 @@
 //! testsuite 共享夹具库。
 //!
-//! 为 tests-suite 下新增的分类测试套件(多租户混合极限、安全前提扩展)提供:
-//! 连接门控、参数化租户拓扑构建、v5 行播种、授权发布路径(stage → claim →
-//! finalize → publish,与生产 worker 分步一致)以及确定性清理。
+//! 分类集成测试共用隔离租户拓扑、真实 RuleSet source mutation、worker-owned
+//! 发布及 exact receipt completion 验证。测试不构造 manifest、lease 或 impact plan。
 //!
-//! 刻意保留的重复:既有集成测试文件内的同名 helper(如
-//! `tests-suite/series/MT-E1/multi_tenant_isolation.rs` 的 `TenantFixture`)是**独立副本**,
-//! 本库不改动它们(测试深度与行为零变化);本库只服务 testsuite 新增套件。
-//!
-//! ID 段隔离:testsuite 使用 `SUITE_BASE_MIN`(2e16)起的专属随机段,与既有
-//! 测试段(1e12 起,上限 ~8e15)和分布式 e2e 段(9e12 附近)互不重叠。
+//! ID 段从 `SUITE_BASE_MIN` 起，与既有集成测试和分布式 e2e fixture 隔离。
 
-use astral_db::{
-    claim_authorization_manifest_in_tx, connect_and_validate_schema,
-    finalize_authorization_manifest_in_tx, publish_current_pointer_in_tx,
-    stage_authorization_manifest_in_tx, AuthorizationFinalizeRequest, AuthorizationPublishOutcome,
-    AuthorizationPublishRequest, AuthorizationStageRequest, CurrentPointerView,
-    ProjectionAggregateIdentity, PublishRevokeFenceEvidence, StagedSegmentContent,
-};
-use astral_types::{
-    BindingLayer, CanonicalGrant, DomainScopeRequirement, GrantEffect, GrantId, GrantProvenance,
-    GrantRevision, GrantSourceKind, GrantState, PublishedCardEvidenceScope, TenantScope,
-    ValidityWindow,
-};
+use astral_db::connect_and_validate_schema;
+use astral_types::{DomainScopeRequirement, PublishedCardEvidenceScope};
 use sha2::{Digest, Sha256};
 use sqlx::MySqlPool;
 use uuid::Uuid;
-
-/// 卡级聚合类型:合法标识符,且属于卡级证据读取器接受的类型集。
-pub const AGGREGATE_TYPE: &str = "USER_CARD";
-pub const MANIFEST_LEASE_SECONDS: i64 = 600;
 
 /// testsuite 专属随机段起点(2e16),与既有 fixture 段隔离。
 pub const SUITE_BASE_MIN: i64 = 20_000_000_000_000_000;
@@ -237,7 +217,7 @@ pub async fn connect_suite() -> Option<MySqlPool> {
     Some(pool)
 }
 
-/// seed 单个租户的全部 v5 行(不含任何旧链表写入)。
+/// Seed isolated topology and a disabled source entry; authorization is created by the writer.
 pub async fn seed_tenant_rows(
     pool: &MySqlPool,
     fixture: &SuiteFixture,
@@ -338,7 +318,7 @@ pub async fn seed_tenant_rows(
     sqlx::query(
         "INSERT INTO rule_set \
          (rule_set_id, name, code, description, source_type, enabled, tenant_id) \
-         VALUES (?, ?, ?, ?, 'TEMPLATE', 1, ?)",
+         VALUES (?, ?, ?, ?, 'MANUAL', 1, ?)",
     )
     .bind(tenant.rule_set_id)
     .bind(format!("TS rule set {}", tenant.ordinal))
@@ -354,15 +334,10 @@ pub async fn seed_tenant_rows(
     sqlx::query(
         "INSERT INTO rule_set_entry \
          (entry_id, rule_set_id, resource_type, action_code, effect, priority, enabled, tenant_id) \
-         VALUES (?, ?, 'learn_subject', 'read', ?, 1, 1, ?)",
+         VALUES (?, ?, 'learn_subject', 'read', 'ALLOW', 1, 0, ?)",
     )
     .bind(tenant.entry_id)
     .bind(tenant.rule_set_id)
-    .bind(if tenant.role.has_allow_rule() {
-        "ALLOW"
-    } else {
-        "DENY"
-    })
     .bind(tenant.tenant_id)
     .execute(pool)
     .await?;
@@ -370,178 +345,12 @@ pub async fn seed_tenant_rows(
     Ok(())
 }
 
-/// 构造一条 fixture ALLOW grant(provenance 与 manifest 事件身份在
-/// [`publish_card_manifest`] 内对齐)。
-#[allow(clippy::too_many_arguments)]
-pub fn allow_rule_set_grant(
-    salt: u128,
-    tenant_id: i64,
-    domain_id: i64,
-    card_id: i64,
-    user_id: i64,
-    resource: &str,
-    entry_id: i64,
-    binding_ref_id: i64,
-    unique_tail: u16,
-) -> CanonicalGrant {
-    assert!(
-        unique_tail <= 0x0FFF,
-        "tail must fit the 12 hex digit field"
-    );
-    let entropy = (salt & 0xFFFF_FFFF_F000) | u128::from(unique_tail);
-    CanonicalGrant {
-        grant_id: GrantId::parse(&format!("550e8400-e29b-41d4-a716-{entropy:012x}"))
-            .expect("fixture grant id must be a valid UUID"),
-        revision: GrantRevision::initial(),
-        state: GrantState::Active,
-        source_kind: GrantSourceKind::RuleSet,
-        binding_layer: BindingLayer::Base,
-        tenant: TenantScope::new(tenant_id, Some(domain_id))
-            .expect("fixture tenant scope must be valid"),
-        card_id,
-        user_id,
-        resource: resource.to_owned(),
-        action: "read".to_owned(),
-        effect: GrantEffect::Allow,
-        validity: ValidityWindow::perpetual(),
-        provenance: GrantProvenance {
-            source_id: format!("rule-set-entry:{entry_id}"),
-            source_entry: None,
-            binding_id: Some(format!("card-rule-set-ref:{binding_ref_id}")),
-            delegation_id: None,
-            operation_id: "fixture-op-placeholder".to_owned(),
-            event_id: None,
-            actor_user_id: Some(user_id),
-        },
-    }
-}
+/// Publish through the source writer and owned projector, retaining exact proof.
+mod publication;
+pub use publication::{publish_card_manifest, PublishedCardFixture};
 
 pub fn sha256_hex(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
-}
-
-/// 以最小正确方式构造一张卡的已发布 evidence:走公共
-/// stage → claim lease → finalize → publish API(各自独立短事务,与生产
-/// worker 分步一致)。空 `grants` 表示"投影已完成、零有效授权"(DENY 语义)。
-/// `generation == 1` 为首次发布;更高代为增量发布(必须携带锁定到的当前
-/// 指针视图)。
-#[allow(clippy::too_many_arguments)]
-pub async fn publish_card_manifest(
-    pool: &MySqlPool,
-    tenant_id: i64,
-    card_id: i64,
-    grants: Vec<CanonicalGrant>,
-    tag: &str,
-    salt: u128,
-    generation: u64,
-    current_pointer: Option<CurrentPointerView>,
-) -> AuthorizationPublishOutcome {
-    let identity = ProjectionAggregateIdentity::new(tenant_id, AGGREGATE_TYPE, card_id)
-        .expect("fixture card aggregate identity must be valid");
-    let event_id = format!("ev-ts-{salt:032x}-{tag}");
-    let operation_id = format!("op-ts-{salt:032x}-{tag}");
-    let semantic_hash_hex = sha256_hex(&format!("ts/{tenant_id}/semantic/{tag}"));
-    let dependency_hash_hex = sha256_hex(&format!("ts/{tenant_id}/dependency/{tag}"));
-    let compiler_version = astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned();
-
-    let mut payload_grants = grants;
-    for grant in &mut payload_grants {
-        grant.provenance.operation_id = operation_id.clone();
-        grant.provenance.event_id = Some(event_id.clone());
-    }
-
-    let stage_request = AuthorizationStageRequest {
-        identity: identity.clone(),
-        card_id: Some(card_id),
-        target_generation: generation,
-        source_generation: generation,
-        projected_generation: generation,
-        event_id: event_id.clone(),
-        operation_id: operation_id.clone(),
-        semantic_hash_hex: semantic_hash_hex.clone(),
-        dependency_hash_hex: dependency_hash_hex.clone(),
-        compiler_version: compiler_version.clone(),
-        revoke_fence: 0,
-        segments: vec![StagedSegmentContent::New(payload_grants)],
-    };
-
-    let mut tx = pool.begin().await.unwrap();
-    let stage_outcome = stage_authorization_manifest_in_tx(&mut tx, &stage_request)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    assert!(
-        !stage_outcome.resumed_existing_manifest,
-        "a fresh suite namespace must never resume an existing manifest"
-    );
-    if generation == 1 {
-        assert!(
-            stage_outcome.base_pointer.is_none(),
-            "first generation must observe no current pointer"
-        );
-    }
-
-    assert_eq!(
-        current_pointer,
-        stage_outcome
-            .base_pointer
-            .as_ref()
-            .map(|pointer| pointer.as_view()),
-        "publication fixture must carry the pointer observed during staging"
-    );
-    let lease_owner = format!("ts-worker-{tag}");
-    let mut tx = pool.begin().await.unwrap();
-    let lease = claim_authorization_manifest_in_tx(
-        &mut tx,
-        &identity,
-        generation,
-        &lease_owner,
-        MANIFEST_LEASE_SECONDS,
-    )
-    .await
-    .unwrap()
-    .expect("the staged BUILDING manifest must be claimable right after staging");
-    tx.commit().await.unwrap();
-    assert_eq!(lease.manifest_id, stage_outcome.manifest_id);
-    assert_eq!(lease.generation as u64, generation);
-
-    let finalize_request = AuthorizationFinalizeRequest {
-        identity: identity.clone(),
-        target_generation: generation,
-        manifest_id: stage_outcome.manifest_id,
-        lease_owner: lease.lease_owner.clone(),
-        lease_token: lease.lease_token,
-        expected_cas_version: lease.cas_version_after_claim,
-        expected_reference_count: Some(1),
-    };
-    let mut tx = pool.begin().await.unwrap();
-    finalize_authorization_manifest_in_tx(&mut tx, &finalize_request)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-
-    let publish_request = AuthorizationPublishRequest {
-        identity,
-        card_id: Some(card_id),
-        target_manifest_id: stage_outcome.manifest_id,
-        target_generation: generation,
-        current_pointer,
-        expected_target_semantic_hash_hex: semantic_hash_hex,
-        expected_target_dependency_hash_hex: dependency_hash_hex,
-        expected_target_compiler_version: compiler_version,
-        fences: PublishRevokeFenceEvidence {
-            previous_revoke_fence: 0,
-            new_revoke_fence: 0,
-        },
-    };
-    let mut tx = pool.begin().await.unwrap();
-    let outcome = publish_current_pointer_in_tx(&mut tx, &publish_request)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    assert_eq!(outcome.pointer.current_generation as u64, generation);
-    assert_eq!(outcome.pointer.manifest_id, stage_outcome.manifest_id);
-    outcome
 }
 
 /// 播种全部租户。
@@ -557,61 +366,138 @@ pub async fn cleanup_suite_rows(
     pool: &MySqlPool,
     fixture: &SuiteFixture,
 ) -> Result<(), sqlx::Error> {
-    let lo = fixture.base;
-    let hi = fixture.base + 14 * CATEGORY_STRIDE + 2_000;
-    let tenant_hi = fixture.base + fixture.tenants.len() as i64;
     let mut tx = pool.begin().await?;
-    for table in [
-        "authorization_projection_manifest_segment",
-        "authorization_projection_current",
-        "authorization_projection_manifest",
-        "authorization_projection_segment",
-    ] {
-        let sql = format!("DELETE FROM {table} WHERE tenant_id > ? AND tenant_id <= ?");
-        sqlx::query(&sql)
-            .bind(lo)
-            .bind(tenant_hi)
+    for tenant in &fixture.tenants {
+        let code: Option<String> =
+            sqlx::query_scalar("SELECT tenant_code FROM tenant WHERE tenant_id = ? FOR UPDATE")
+                .bind(tenant.tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let expected_code = format!("ts_{}_tenant_{}", fixture.code_prefix, tenant.tenant_id);
+        if code.as_deref() != Some(expected_code.as_str()) {
+            return Err(sqlx::Error::Protocol(
+                "fixture cleanup cannot prove tenant ownership".into(),
+            ));
+        }
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM authorization_projection_partition_lease \
+             WHERE tenant_id = ? AND (active_delta_event_id IS NOT NULL \
+               OR lease_expires_at > UTC_TIMESTAMP(6))",
+        )
+        .bind(tenant.tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active != 0 {
+            return Err(sqlx::Error::Protocol(
+                "fixture cleanup requires worker shutdown and owned-lease reconciliation".into(),
+            ));
+        }
+        // The head has no tenant column. Prove ownership while source/outbox
+        // rows still exist; an unrelated numeric aggregate id is never enough.
+        for aggregate in ["CARD", "ELIGIBILITY"] {
+            sqlx::query(
+                "DELETE h FROM authorization_projection_head h \
+                 INNER JOIN user_card uc ON uc.card_id = h.aggregate_id \
+                 WHERE h.aggregate_type = ? AND uc.tenant_id = ?",
+            )
+            .bind(aggregate)
+            .bind(tenant.tenant_id)
             .execute(&mut *tx)
             .await?;
-    }
-    let statements: [(&str, &str); 11] = [
-        ("permission_rule", "card_id"),
-        ("card_rule_set_ref", "id"),
-        ("rule_set_entry", "entry_id"),
-        ("rule_set", "rule_set_id"),
-        ("user_card", "card_id"),
-        ("user_card_template", "template_id"),
-        ("identity_card", "card_id"),
-        ("platform_user", "user_id"),
-        ("tenant_domain_map", "id"),
-        ("tenant", "tenant_id"),
-        ("platform_domain", "domain_id"),
-    ];
-    for (table, column) in statements {
-        let sql = format!("DELETE FROM {table} WHERE {column} >= ? AND {column} <= ?");
-        sqlx::query(&sql)
-            .bind(lo)
-            .bind(hi)
-            .execute(&mut *tx)
-            .await?;
-    }
-    sqlx::query("DELETE FROM audit_log WHERE id >= ? AND id <= ?")
-        .bind(lo)
-        .bind(hi)
+        }
+        sqlx::query(
+            "DELETE h FROM authorization_projection_head h \
+             INNER JOIN rule_set rs ON rs.rule_set_id = h.aggregate_id \
+             WHERE h.aggregate_type = 'RULE_SET' AND rs.tenant_id = ?",
+        )
+        .bind(tenant.tenant_id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "DELETE h FROM authorization_projection_head h \
+             INNER JOIN authorization_projection_outbox o \
+               ON o.aggregate_type = h.aggregate_type AND o.aggregate_id = h.aggregate_id \
+                 AND o.event_id = h.last_event_id AND o.source_generation = h.source_generation \
+             WHERE o.tenant_id = ?",
+        )
+        .bind(tenant.tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        for table in [
+            "authorization_projection_partition_lease",
+            "authorization_archive_manifest",
+            "authorization_archive_outbox",
+            "authorization_impact_plan_item",
+            "authorization_impact_plan",
+            "authorization_projection_manifest_segment",
+            "authorization_projection_current",
+            "authorization_projection_manifest",
+            "authorization_projection_segment",
+            "authorization_delta_event",
+            "authorization_grant_revision",
+            "rule_set_projection_audit",
+            "authorization_projection_outbox",
+            "al_message_outbox",
+            "audit_log",
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE tenant_id = ?");
+            sqlx::query(&sql)
+                .bind(tenant.tenant_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for statement in [
+            "DELETE pr FROM permission_rule pr INNER JOIN user_card uc ON uc.card_id = pr.card_id WHERE uc.tenant_id = ?",
+            "DELETE b FROM card_rule_set_ref b INNER JOIN user_card uc ON uc.card_id = b.card_id WHERE uc.tenant_id = ?",
+            "DELETE e FROM rule_set_entry e INNER JOIN rule_set rs ON rs.rule_set_id = e.rule_set_id WHERE rs.tenant_id = ?",
+            "DELETE FROM rule_set WHERE tenant_id = ?",
+            "DELETE FROM user_card WHERE tenant_id = ?",
+            "DELETE FROM user_card_template WHERE tenant_id = ?",
+            "DELETE FROM tenant_domain_map WHERE tenant_id = ?",
+        ] {
+            sqlx::query(statement)
+                .bind(tenant.tenant_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("DELETE FROM identity_card WHERE card_id = ? AND user_id = ?")
+            .bind(tenant.identity_card_id)
+            .bind(tenant.user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM platform_user WHERE user_id = ? AND user_no = ?")
+            .bind(tenant.user_id)
+            .bind(format!(
+                "ts_{}_user_{}",
+                fixture.code_prefix, tenant.user_id
+            ))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM tenant WHERE tenant_id = ? AND tenant_code = ?")
+            .bind(tenant.tenant_id)
+            .bind(expected_code)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM platform_domain WHERE domain_id = ? AND domain_code = ?")
+            .bind(tenant.domain_id)
+            .bind(format!(
+                "ts_{}_domain_{}",
+                fixture.code_prefix, tenant.domain_id
+            ))
+            .execute(&mut *tx)
+            .await?;
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM authorization_projection_current WHERE tenant_id = ?",
+        )
+        .bind(tenant.tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        assert_eq!(
+            remaining, 0,
+            "fixture cleanup must remove all published pointers"
+        );
+    }
     tx.commit().await?;
-    let remaining: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM authorization_projection_current WHERE tenant_id > ? AND tenant_id <= ?",
-    )
-    .bind(lo)
-    .bind(tenant_hi)
-    .fetch_one(pool)
-    .await?;
-    assert_eq!(
-        remaining, 0,
-        "fixture cleanup must remove all published pointers"
-    );
     Ok(())
 }
 
@@ -626,7 +512,6 @@ mod edition_contract {
             astral_mq::EVIDENCE_INVALIDATION_SCHEMA_VERSION,
             i32::from(edition)
         );
-        assert_eq!(astral_db::L2_EVIDENCE_SCHEMA_VERSION, i64::from(edition));
         assert_eq!(astral_db::SNAPSHOT_SCHEMA_VERSION, u32::from(edition));
         assert_eq!(astral_db::SNAPSHOT_PAYLOAD_VERSION, u32::from(edition));
         assert_eq!(

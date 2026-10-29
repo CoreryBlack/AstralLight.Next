@@ -1,65 +1,7 @@
-//! 共享权限检查中间件核心
+//! 共享权限解析与上下文构造工具。
 //!
-//! 供各业务 crate 创建轻量权限检查中间件。
-//! 每个 crate 需要自行创建 `SqlxRuleRepository` 后传入。
-//!
-//! `check_permission` is retained as a deprecated compatibility helper for
-//! parsing and legacy callers, not as a production HTTP authorization entry
-//! point: it constructs an `Unresolved` context and therefore denies protected
-//! targets at the resource-ownership gate. Production middleware must resolve
-//! server-side target ownership before invoking `PolicyEngine.evaluate()`.
-//!
-//! Usage of the parsing utilities (not a production authorization template):
-//! ```
-//! #![allow(deprecated)]
-//! use astral_common::middleware::permission_check_shared::{
-//!     check_permission, PathResourceMap,
-//! };
-//! use astral_types::PolicyError;
-//! use axum::extract::{Request, State};
-//! use axum::middleware::Next;
-//! use axum::response::{IntoResponse, Response};
-//! use policy_engine::{PermissionRule, PolicyEngine, RuleRepository, RuleSetSnapshot};
-//!
-//! // Each service supplies its own RuleRepository implementation. In a service
-//! // crate this can be `astral_db::SqlxRuleRepository`.
-//! struct ExampleRepository;
-//!
-//! #[async_trait::async_trait]
-//! impl RuleRepository for ExampleRepository {
-//!     async fn load_rule_set_snapshots(
-//!         &self,
-//!         _card_id: i64,
-//!     ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-//!         Ok(Vec::new())
-//!     }
-//!
-//!     async fn load_permission_rules(
-//!         &self,
-//!         _card_id: i64,
-//!     ) -> Result<Vec<PermissionRule>, PolicyError> {
-//!         Ok(Vec::new())
-//!     }
-//! }
-//!
-//! struct AppState<R> {
-//!     engine: PolicyEngine,
-//!     repo: R,
-//! }
-//!
-//! const MY_PATH_MAP: PathResourceMap = &[("/resources", "example_resource")];
-//!
-//! async fn my_middleware(
-//!     State(state): State<AppState<ExampleRepository>>,
-//!     req: Request,
-//!     next: Next,
-//! ) -> Response {
-//!     match check_permission(&req, &state.engine, &state.repo, MY_PATH_MAP, &[]).await {
-//!         Ok(()) => next.run(req).await,
-//!         Err(response) => response.into_response(),
-//!     }
-//! }
-//! ```
+//! 各服务必须先解析目标 owner，再自行调用 `PolicyEngine.evaluate()`；本模块
+//! 仅提供路径/动作解析、目标 ID 提取和身份上下文构造，不提供通用授权入口。
 
 use std::collections::HashSet;
 
@@ -69,14 +11,10 @@ use astral_types::{PolicyContext, ResourceOwnershipScope};
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use policy_engine::{PolicyEngine, RuleRepository};
-
-/// 路径前缀 → 资源类型映射表
-pub type PathResourceMap = &'static [(&'static str, &'static str)];
 
 /// Heap-backed middleware response error.
 ///
-/// Axum middleware must return an error that implements [`IntoResponse`]. Keeping
+/// Axum middleware must return an error that implements `IntoResponse`. Keeping
 /// the full response on the heap preserves its status, headers, and body while
 /// satisfying `clippy::result_large_err`.
 #[derive(Debug)]
@@ -94,6 +32,9 @@ impl IntoResponse for BoxedResponse {
         *self.0
     }
 }
+
+/// 路径前缀 → 资源类型映射表
+pub type PathResourceMap = &'static [(&'static str, &'static str)];
 
 /// Match a route prefix without treating a longer resource name as the same path.
 pub fn path_matches_prefix(path: &str, prefix: &str) -> bool {
@@ -235,12 +176,8 @@ pub fn resolve_permission_action(resource: &str, path: &str, method: &str) -> Op
     }
 
     if resource == "monitor" {
-        match (path, method) {
-            ("/stats/reset", "POST") => return Some("reset"),
-            ("/consistency/check", "GET") | ("/consistency-check", "GET") => return Some("scan"),
-            ("/consistency/check/violations", "DELETE") => return Some("delete"),
-            ("/arbiter/arbitrate", "POST") => return Some("arbitrate"),
-            _ => {}
+        if path == "/stats/reset" && method == "POST" {
+            return Some("reset");
         }
         if method == "POST" && path.starts_with("/alerts/") && path.ends_with("/toggle") {
             return Some("update");
@@ -342,90 +279,6 @@ pub fn resolve_permission_action(resource: &str, path: &str, method: &str) -> Op
     }
 }
 
-/// Legacy compatibility helper for route mapping and callers that require the
-/// former shared middleware API. `skip_paths` is a trusted configuration
-/// allowlist, not a request-controlled bypass. The helper deliberately
-/// constructs an `Unresolved` HTTP context and therefore cannot authorize a
-/// protected target. Production middleware must resolve target ownership before
-/// calling `PolicyEngine.evaluate()`.
-#[deprecated(
-    since = "0.1.0",
-    note = "does not resolve protected-resource ownership; use a service-specific owner resolver before PolicyEngine::evaluate"
-)]
-pub async fn check_permission<R: RuleRepository>(
-    req: &Request,
-    engine: &PolicyEngine,
-    repo: &R,
-    path_map: PathResourceMap,
-    skip_paths: &[&str],
-) -> Result<(), BoxedResponse> {
-    let path = req.uri().path();
-    let method = req.method().clone();
-
-    if skip_paths
-        .iter()
-        .any(|prefix| !prefix.is_empty() && path_matches_prefix(path, prefix))
-    {
-        return Ok(());
-    }
-
-    let resource = match path_map
-        .iter()
-        .find(|(prefix, _)| path_matches_prefix(path, prefix))
-    {
-        Some((_, r)) => *r,
-        None => {
-            tracing::warn!(path, "no resource mapping for path, denying");
-            return Err(BoxedResponse::new(
-                (
-                    StatusCode::FORBIDDEN,
-                    format!("No permission mapping for path: {}", path),
-                )
-                    .into_response(),
-            ));
-        }
-    };
-
-    let action = match resolve_permission_action(resource, path, method.as_str()) {
-        Some(action) => action,
-        None if method == axum::http::Method::OPTIONS => return Ok(()),
-        None => {
-            return Err(BoxedResponse::new(
-                (StatusCode::METHOD_NOT_ALLOWED, "Unsupported HTTP method").into_response(),
-            ));
-        }
-    };
-
-    let ctx = physical_policy_context(req.headers(), resource, action, request_target_id(req))
-        .map_err(|status| BoxedResponse::new(status.into_response()))?;
-
-    let decision = engine.evaluate(&ctx, repo).await;
-
-    if !decision.allowed {
-        tracing::warn!(
-            user_id = ?ctx.user_id,
-            card_id = ?ctx.card_id,
-            resource = resource,
-            action = action,
-            reason = %decision.reason,
-            path = path,
-            "permission_denied"
-        );
-        return Err(BoxedResponse::new(
-            (
-                StatusCode::FORBIDDEN,
-                format!(
-                    "Permission denied: {} for {}:{}",
-                    decision.reason, resource, action
-                ),
-            )
-                .into_response(),
-        ));
-    }
-
-    Ok(())
-}
-
 /// 启动期注册校验：验证 PATH_RESOURCE_MAP 中所有资源类型已在 ResourceRegistry 注册
 ///
 /// 对齐 Java `@PostConstruct` 全项目扫描 `@RequirePermission` 的交叉校验。
@@ -464,7 +317,6 @@ pub fn validate_path_map(path_map: PathResourceMap, service_name: &str) {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::{request_target_id, resolve_permission_action};
     use astral_types::ResourceOwnershipScope;
@@ -536,15 +388,6 @@ mod tests {
                 "update",
             ),
             ("monitor", "/stats/reset", "POST", "reset"),
-            ("monitor", "/consistency/check", "GET", "scan"),
-            (
-                "monitor",
-                "/consistency/check/violations",
-                "DELETE",
-                "delete",
-            ),
-            ("monitor", "/consistency-check", "GET", "scan"),
-            ("monitor", "/arbiter/arbitrate", "POST", "arbitrate"),
             ("monitor", "/alerts/3/toggle", "POST", "update"),
             ("notification", "/notifications/3/test", "POST", "test"),
             ("permission_rule", "/sod-policies/detect", "POST", "read"),
@@ -854,172 +697,5 @@ mod tests {
                 "platform user with {header}={value:?} must be 403"
             );
         }
-    }
-
-    // ===== check_permission：早期拒绝必须在 repository 读取之前终止 =====
-
-    use super::check_permission;
-    use axum::body::Body;
-    use axum::http::Request;
-    use axum::response::IntoResponse;
-    use policy_engine::{PermissionRule, PolicyEngine, RuleSetSnapshot};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::PathResourceMap;
-
-    /// 计数 repository：任何读取器被调用即计数，用于证明早期拒绝分支
-    /// 在触碰 repository 之前终止。
-    struct CountingRepo(AtomicUsize);
-
-    impl CountingRepo {
-        fn reads(&self) -> usize {
-            self.0.load(Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl policy_engine::RuleRepository for CountingRepo {
-        async fn load_rule_set_snapshots(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<RuleSetSnapshot>, astral_types::PolicyError> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![])
-        }
-
-        async fn load_permission_rules(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<PermissionRule>, astral_types::PolicyError> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![])
-        }
-    }
-
-    const MAPPED_ROUTES: PathResourceMap = &[("/things", "example_resource")];
-
-    async fn run_check(
-        uri: &str,
-        method: &str,
-        headers: HeaderMap,
-        repo: &CountingRepo,
-    ) -> Result<(), StatusCode> {
-        let mut req = Request::builder()
-            .method(method)
-            .uri(uri)
-            .body(Body::empty())
-            .unwrap();
-        *req.headers_mut() = headers;
-        let engine = PolicyEngine::new();
-        match check_permission(&req, &engine, repo, MAPPED_ROUTES, &[]).await {
-            Ok(()) => Ok(()),
-            Err(boxed) => {
-                let response = boxed.into_response();
-                Err(response.status())
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn check_permission_denies_unknown_path_before_any_repository_read() {
-        let repo = CountingRepo(AtomicUsize::new(0));
-        let outcome = run_check("/unknown-route", "GET", platform_headers(), &repo).await;
-        assert_eq!(outcome, Err(StatusCode::FORBIDDEN));
-        assert_eq!(repo.reads(), 0, "unknown path must be denied before reads");
-    }
-
-    #[tokio::test]
-    async fn check_permission_rejects_missing_identity_headers_before_repository_read() {
-        let repo = CountingRepo(AtomicUsize::new(0));
-        let outcome = run_check("/things", "GET", HeaderMap::new(), &repo).await;
-        assert_eq!(outcome, Err(StatusCode::UNAUTHORIZED));
-        assert_eq!(repo.reads(), 0, "missing identity must short-circuit reads");
-    }
-
-    #[tokio::test]
-    async fn check_permission_lets_preflight_through_without_repository_read() {
-        let repo = CountingRepo(AtomicUsize::new(0));
-        let outcome = run_check("/things", "OPTIONS", platform_headers(), &repo).await;
-        assert!(outcome.is_ok(), "OPTIONS preflight must pass through");
-        assert_eq!(repo.reads(), 0);
-    }
-
-    #[tokio::test]
-    async fn check_permission_fails_closed_without_resource_resolver_before_repository_read() {
-        let repo = CountingRepo(AtomicUsize::new(0));
-        let outcome = run_check("/things", "GET", platform_headers(), &repo).await;
-        // The compatibility helper reaches PolicyEngine with `Unresolved` target
-        // ownership. The engine must deny before any authorization evidence read.
-        assert_eq!(outcome, Err(StatusCode::FORBIDDEN));
-        assert_eq!(
-            repo.reads(),
-            0,
-            "unresolved HTTP target must short-circuit before repository reads"
-        );
-    }
-
-    #[tokio::test]
-    async fn check_permission_skip_paths_bypass_only_at_segment_boundaries() {
-        let repo = CountingRepo(AtomicUsize::new(0));
-        let engine = PolicyEngine::new();
-
-        let req = Request::builder()
-            .uri("/open/thing")
-            .body(Body::empty())
-            .unwrap();
-        let outcome = check_permission(&req, &engine, &repo, MAPPED_ROUTES, &["/open"]).await;
-        assert!(outcome.is_ok());
-        assert_eq!(repo.reads(), 0);
-
-        let req = Request::builder()
-            .uri("/open-admin/thing")
-            .body(Body::empty())
-            .unwrap();
-        let outcome = check_permission(&req, &engine, &repo, MAPPED_ROUTES, &["/open"]).await;
-        assert_eq!(
-            outcome
-                .err()
-                .map(|response| response.into_response().status()),
-            Some(StatusCode::FORBIDDEN)
-        );
-        assert_eq!(
-            repo.reads(),
-            0,
-            "unmapped lookalike path must not reach repository"
-        );
-    }
-
-    #[tokio::test]
-    async fn check_permission_empty_skip_prefix_does_not_bypass_every_path() {
-        let repo = CountingRepo(AtomicUsize::new(0));
-        let req = Request::builder()
-            .uri("/unknown-route")
-            .body(Body::empty())
-            .unwrap();
-        let engine = PolicyEngine::new();
-        let outcome = check_permission(&req, &engine, &repo, MAPPED_ROUTES, &[""]).await;
-        assert_eq!(
-            outcome
-                .err()
-                .map(|response| response.into_response().status()),
-            Some(StatusCode::FORBIDDEN)
-        );
-        assert_eq!(repo.reads(), 0);
-    }
-
-    #[tokio::test]
-    async fn check_permission_only_options_is_bypassed_for_unmapped_methods() {
-        let repo = CountingRepo(AtomicUsize::new(0));
-        let options = run_check("/things", "OPTIONS", platform_headers(), &repo).await;
-        assert!(options.is_ok(), "OPTIONS preflight must pass through");
-        assert_eq!(repo.reads(), 0);
-
-        let trace = run_check("/things", "TRACE", platform_headers(), &repo).await;
-        assert_eq!(trace, Err(StatusCode::METHOD_NOT_ALLOWED));
-        assert_eq!(
-            repo.reads(),
-            0,
-            "unsupported methods must be rejected without reads"
-        );
     }
 }

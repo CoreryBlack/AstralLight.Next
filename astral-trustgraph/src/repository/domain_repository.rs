@@ -9,16 +9,12 @@ use sqlx::{MySqlPool, QueryBuilder};
 use astral_types::AstralError;
 
 /// 域记录（platform_domain）。
-///
-/// 注意：platform_v4 中 platform_domain 表无 org_id 列，org_id 保留为
-/// `Option<i64>` 用于前端兼容（查询时恒为 NULL）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DomainRecord {
     pub id: i64,
     pub name: String,
     pub code: Option<String>,
     pub description: Option<String>,
-    pub org_id: Option<i64>,
     pub status: String,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
@@ -47,7 +43,7 @@ pub struct DefaultDomainSyncResult {
 
 /// platform_v4 真实列名映射（domain_id → id, domain_name → name 等）
 const DOMAIN_SELECT_COLUMNS: &str = "domain_id as id, domain_name as name, domain_code as code, \
-     domain_description as description, NULL as org_id, status, \
+     domain_description as description, status, \
      DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%sZ') as created_at, \
      DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%sZ') as updated_at";
 

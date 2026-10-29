@@ -57,7 +57,6 @@ async fn test_multi_tenant_same_resource_allow_and_deny() {
     assert_eq!(scopes[0], strict_scope(100, 1000, 2000, Some(10)));
     assert_eq!(scopes[1], strict_scope(100, 1000, 2000, Some(10)));
     assert_eq!(scopes[2], strict_scope(200, 2000, 3000, Some(20)));
-    repo.assert_no_legacy_reads();
 }
 
 #[tokio::test]
@@ -86,7 +85,6 @@ async fn test_tenant_id_in_context_preserved() {
             strict_scope(42, 42, 1, Some(10)),
         ]
     );
-    repo.assert_no_legacy_reads();
 }
 
 #[tokio::test]
@@ -124,7 +122,6 @@ async fn test_cross_tenant_rule_no_cross_talk() {
         )
         .await;
     assert_deny(&tenant_b, "DEFAULT_DENY");
-    repo.assert_no_legacy_reads();
 }
 
 #[tokio::test]
@@ -149,7 +146,6 @@ async fn test_same_card_wrong_tenant_is_pending_without_leakage() {
     assert_deny(&decision, "AUTHORIZATION_PENDING");
     assert_eq!(repo.published_reads(), 1);
     assert_eq!(repo.scopes(), vec![strict_scope(200, 1000, 1, Some(10))]);
-    repo.assert_no_legacy_reads();
 }
 
 #[tokio::test]
@@ -188,7 +184,6 @@ async fn test_same_card_wrong_user_or_domain_fails_closed() {
             strict_scope(100, 1000, 1, Some(20)),
         ]
     );
-    repo.assert_no_legacy_reads();
 }
 
 #[tokio::test]
@@ -201,7 +196,6 @@ async fn test_missing_or_unpublished_evidence_is_pending() {
     assert_deny(&missing_decision, "AUTHORIZATION_PENDING");
     assert_eq!(missing.published_reads(), 1);
     assert_eq!(missing.scopes(), vec![strict_scope(100, 1000, 1, Some(10))]);
-    missing.assert_no_legacy_reads();
 
     let unpublished = PublishedRepo::unpublished(100, 1000);
     let unpublished_decision = engine.evaluate(&ctx, &unpublished).await;
@@ -211,7 +205,6 @@ async fn test_missing_or_unpublished_evidence_is_pending() {
         unpublished.scopes(),
         vec![strict_scope(100, 1000, 1, Some(10))]
     );
-    unpublished.assert_no_legacy_reads();
 }
 
 #[tokio::test]
@@ -265,7 +258,6 @@ async fn test_concurrent_multi_tenant_evaluations_use_positive_ids() {
         let expected = strict_scope(100 + index, 1000 + index, 2000 + index, Some(3000 + index));
         assert_eq!(scopes.iter().filter(|scope| **scope == expected).count(), 2);
     }
-    repo.assert_no_legacy_reads();
 }
 
 #[tokio::test]
@@ -287,7 +279,6 @@ async fn test_inactive_card_rejected_multi_tenant() {
         assert_deny(&decision, "CARD_DISABLED");
     }
     assert_eq!(repo.published_reads(), 0);
-    repo.assert_no_legacy_reads();
 }
 
 #[tokio::test]
@@ -305,7 +296,6 @@ async fn test_benchmark_fixture_disables_scope_samples_without_bypassing_strict_
         assert_allow(&PolicyEngine::new().evaluate(&ctx, &repo).await);
         assert_eq!(repo.published_reads(), 2);
         assert!(repo.scopes().is_empty());
-        repo.assert_no_legacy_reads();
         repo.reset_counters();
         assert_eq!(repo.published_reads(), 0);
         assert!(repo.scopes().is_empty());
@@ -316,14 +306,13 @@ async fn test_benchmark_fixture_disables_scope_samples_without_bypassing_strict_
         "DEFAULT_DENY",
     );
     assert!(empty.scopes().is_empty());
-    empty.assert_no_legacy_reads();
+    assert_eq!(empty.published_reads(), 1);
     let missing = PublishedRepo::unavailable_without_scope_recording();
     assert_deny(
         &PolicyEngine::new().evaluate(&ctx, &missing).await,
         "AUTHORIZATION_PENDING",
     );
     assert!(missing.scopes().is_empty());
-    missing.assert_no_legacy_reads();
 }
 
 fn assisted_password_reset_context() -> PolicyContext {
@@ -359,7 +348,6 @@ async fn test_assisted_password_reset_rejects_crud_and_write_grants() {
             .await;
         assert_deny(&decision, "DEFAULT_DENY");
         assert_eq!(repo.published_reads(), 1);
-        repo.assert_no_legacy_reads();
     }
 }
 
@@ -381,7 +369,6 @@ async fn test_assisted_password_reset_grant_does_not_authorize_crud() {
         assert_deny(&decision, "DEFAULT_DENY");
     }
     assert_eq!(repo.published_reads(), 4);
-    repo.assert_no_legacy_reads();
 }
 
 #[tokio::test]
@@ -408,7 +395,6 @@ async fn test_assisted_password_reset_requires_matching_scope_and_final_read() {
                 strict_scope(100, 1000, 1, Some(10)),
             ]
         );
-        repo.assert_no_legacy_reads();
     }
 
     let repo = PublishedRepo::from_grants(vec![canonical_grant(
@@ -424,7 +410,6 @@ async fn test_assisted_password_reset_requires_matching_scope_and_final_read() {
         .evaluate(&assisted_password_reset_context(), &repo)
         .await;
     assert_deny(&decision, "DEFAULT_DENY");
-    repo.assert_no_legacy_reads();
 }
 
 #[tokio::test]
@@ -444,7 +429,6 @@ async fn test_assisted_password_reset_keeps_existing_action_wildcard_semantics()
             .await;
         assert_allow(&decision);
         assert_eq!(repo.published_reads(), 2);
-        repo.assert_no_legacy_reads();
     }
 }
 
@@ -475,7 +459,6 @@ async fn test_assisted_password_reset_rejects_foreign_or_unresolved_target_scope
     wrong_domain.resource_domain_id = Some(20);
     let decision = PolicyEngine::new().evaluate(&wrong_domain, &repo).await;
     assert_deny(&decision, "DEFAULT_DENY");
-    repo.assert_no_legacy_reads();
 }
 
 #[tokio::test]
@@ -489,7 +472,6 @@ async fn test_assisted_password_reset_missing_or_unpublished_evidence_stays_pend
             .await;
         assert_deny(&decision, "AUTHORIZATION_PENDING");
         assert_eq!(repo.published_reads(), 1);
-        repo.assert_no_legacy_reads();
     }
 
     let repo = PublishedRepo::inactive_with_evidence(vec![canonical_grant(
@@ -506,7 +488,6 @@ async fn test_assisted_password_reset_missing_or_unpublished_evidence_stays_pend
         .await;
     assert_deny(&decision, "CARD_DISABLED");
     assert_eq!(repo.published_reads(), 0);
-    repo.assert_no_legacy_reads();
 }
 
 #[tokio::test]
@@ -526,7 +507,6 @@ async fn test_identity_create_and_write_grants_keep_existing_create_access() {
         let decision = PolicyEngine::new().evaluate(&ctx, &repo).await;
         assert_allow(&decision);
         assert_eq!(repo.published_reads(), 2);
-        repo.assert_no_legacy_reads();
     }
 }
 

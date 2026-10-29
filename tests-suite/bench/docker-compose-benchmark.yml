@@ -1,8 +1,8 @@
 # =============================================================================
 # AstralLight Benchmark — Docker Compose for 5× Comparison Runs
 # =============================================================================
-# Container names: astral_bench_mysql, astral_bench_redis, astral_bench_opa
-# Ports: MySQL 3308, Redis 6381, OPA 8181
+# Container names: astral_bench_mysql, astral_bench_opa
+# Ports: MySQL 3308, OPA 8181
 # =============================================================================
 
 services:
@@ -30,25 +30,6 @@ services:
       timeout: 5s
       start_period: 30s
       retries: 15
-
-  benchmark-redis:
-    image: redis:7
-    container_name: astral_bench_redis
-    restart: unless-stopped
-    ports:
-      - "6381:6379"
-    command: >
-      redis-server
-      --maxmemory 800mb
-      --maxmemory-policy allkeys-lru
-      --save ""
-      --appendonly no
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      start_period: 5s
-      retries: 10
 
   benchmark-opa:
     image: openpolicyagent/opa:latest

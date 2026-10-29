@@ -16,47 +16,41 @@ use crate::repository::rule_set_repository::{
     RuleSetPatch, RuleSetRepository,
 };
 
-/// 新建规则集参数
-///
-/// `ref_type` 是写入 `rule_set.source_type` 的所有权判别器：generic create 只能
-/// 创建自定义所有权；空值与 `TEMPLATE`（模板投影路径专属）在任何 source mutation
-/// 之前 fail-closed（service 与 repository 双重门禁，同一纯函数）。
+/// 新建规则集参数；source_type 是规则集来源/ownership 判别器。
+/// 空值与 `TEMPLATE`（模板投影路径专属）在任何 source mutation 之前
+/// fail-closed（service 与 repository 双重门禁，同一纯函数）。
 #[derive(Debug)]
 pub struct CreateRuleSetRequest {
     pub name: String,
-    pub ref_type: String,
+    pub source_type: String,
     pub description: Option<String>,
 }
 
-/// 更新规则集参数
-///
-/// source_type 是所有权判别器，generic update 不可变：本请求刻意不携带
-/// ref_type/source_type 字段。wire DTO（HTTP 层）仍接受 `refType` 以保持请求
-/// 兼容，但不再把它转发为变更字段。
+/// 更新规则集参数。source_type 是 immutable ownership 字段，不属于变更补丁。
 #[derive(Debug)]
 pub struct UpdateRuleSetRequest {
     pub name: String,
     pub description: Option<String>,
 }
 
-/// 新建条目参数
+/// 新建条目参数，使用 canonical resource_type/action_code 命名。
 #[derive(Debug)]
 pub struct AddEntryRequest {
     pub effect: String,
-    pub resource: Option<String>,
+    pub resource_type: Option<String>,
     pub resource_id: Option<i64>,
-    pub action: Option<String>,
+    pub action_code: Option<String>,
     pub condition_json: Option<String>,
     pub priority: i32,
 }
 
-/// 更新条目参数
+/// 更新条目参数，使用 canonical resource_type/action_code 命名。
 #[derive(Debug)]
 pub struct UpdateEntryRequest {
     pub effect: String,
-    pub resource: Option<String>,
+    pub resource_type: Option<String>,
     pub resource_id: Option<i64>,
-    pub action: Option<String>,
+    pub action_code: Option<String>,
     pub condition_json: Option<String>,
     pub priority: i32,
 }
@@ -172,8 +166,8 @@ impl RuleSetWriteService {
     fn validate_entry(&self, entry: &AddEntryRequest) -> Result<String, AstralError> {
         validate_entry_fields(
             &entry.effect,
-            entry.resource.as_deref(),
-            entry.action.as_deref(),
+            entry.resource_type.as_deref(),
+            entry.action_code.as_deref(),
             entry.condition_json.as_deref(),
         )
     }
@@ -181,8 +175,8 @@ impl RuleSetWriteService {
     fn validate_update_entry(&self, entry: &UpdateEntryRequest) -> Result<String, AstralError> {
         validate_entry_fields(
             &entry.effect,
-            entry.resource.as_deref(),
-            entry.action.as_deref(),
+            entry.resource_type.as_deref(),
+            entry.action_code.as_deref(),
             entry.condition_json.as_deref(),
         )
     }
@@ -194,13 +188,13 @@ impl RuleSetWriteService {
     ) -> Result<i64, AstralError> {
         // 所有权预留门禁：空/TEMPLATE source_type 在任何事务或 source mutation
         // 之前拒绝（repository INSERT 前还有同一纯函数的第二道门禁）。
-        validate_generic_rule_set_source_type(&req.ref_type)?;
+        validate_generic_rule_set_source_type(&req.source_type)?;
         let id = self
             .repo
             .create_rule_set(
                 &NewRuleSet {
                     name: req.name.clone(),
-                    ref_type: req.ref_type.clone(),
+                    source_type: req.source_type.clone(),
                     description: req.description.clone(),
                 },
                 context,
@@ -260,9 +254,9 @@ impl RuleSetWriteService {
                 rule_set_id,
                 &NewRuleSetEntry {
                     effect,
-                    resource: req.resource.clone(),
+                    resource_type: req.resource_type.clone(),
                     resource_id: req.resource_id,
-                    action: req.action.clone(),
+                    action_code: req.action_code.clone(),
                     condition_json: req.condition_json.clone(),
                     priority: req.priority,
                 },
@@ -288,9 +282,9 @@ impl RuleSetWriteService {
                 entry_id,
                 &RuleSetEntryPatch {
                     effect,
-                    resource: req.resource.clone(),
+                    resource_type: req.resource_type.clone(),
                     resource_id: req.resource_id,
-                    action: req.action.clone(),
+                    action_code: req.action_code.clone(),
                     condition_json: req.condition_json.clone(),
                     priority: req.priority,
                 },
@@ -331,9 +325,9 @@ impl RuleSetWriteService {
             let effect = self.validate_entry(entry)?;
             rows.push(NewRuleSetEntry {
                 effect,
-                resource: entry.resource.clone(),
+                resource_type: entry.resource_type.clone(),
                 resource_id: entry.resource_id,
-                action: entry.action.clone(),
+                action_code: entry.action_code.clone(),
                 condition_json: entry.condition_json.clone(),
                 priority: entry.priority,
             });
@@ -406,7 +400,7 @@ mod tests {
 
     #[test]
     fn update_request_shape_carries_no_ownership_mutation_field() {
-        // HTTP refType 仅作当前 source_type 的一致性断言，不进入 mutation。
+        // HTTP sourceType 仅作当前 ownership 的一致性断言，不进入 mutation。
         let req = UpdateRuleSetRequest {
             name: "n".into(),
             description: Some("d".into()),
@@ -505,12 +499,41 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_condition_for_resource() {
+    fn accepts_native_pascal_case_condition_for_registered_resource() {
+        let condition =
+            r#"{"conditionType":"TimeRangeCondition","params":{"start":"09:00","end":"18:00"}}"#;
+        validate_entry_fields("ALLOW", Some("learn_course"), Some("read"), Some(condition))
+            .expect("native conditionType/params form must be accepted");
+
+        let group = r#"{"allOf":[{"conditionType":"TimeRangeCondition","params":{"start":"09:00","end":"18:00"}}]}"#;
+        validate_entry_fields("ALLOW", Some("learn_course"), Some("read"), Some(group))
+            .expect("native allOf group must be accepted");
+    }
+
+    #[test]
+    fn rejects_legacy_java_condition_shapes_before_mutation() {
+        for condition in [
+            r#"{"ownerOnly":true}"#,
+            r#"{"conditionGroup":{"allOf":[{"ownerOnly":true}]}}"#,
+            r#"{"timeRange":{"start":"09:00","end":"18:00"}}"#,
+        ] {
+            let error =
+                validate_entry_fields("ALLOW", Some("learn_course"), Some("read"), Some(condition))
+                    .expect_err("legacy Java condition shape must fail closed");
+            assert!(
+                matches!(&error, AstralError::Validation(message) if message.contains("condition_json")),
+                "condition={condition:?} unexpected={error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_native_condition_not_registered_for_resource() {
         let error = validate_entry_fields(
             "ALLOW",
             Some("learn_device"),
             Some("read"),
-            Some(r#"{"ownerOnly":true}"#),
+            Some(r#"{"conditionType":"OwnerOnlyCondition","params":{}}"#),
         )
         .unwrap_err();
         assert!(

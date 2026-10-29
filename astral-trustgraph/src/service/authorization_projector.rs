@@ -9,10 +9,11 @@
 //! - 不触碰旧表职责：不调用旧 CARD/RULE_SET 快照重建入口（`*snapshot_inner`
 //!   家族），不写两张旧快照表，不消费旧 outbox 队列表，不发布旧 refresh MQ，
 //!   不做旧 cache evict；具体符号清单由 shape tests 锁定。
-//! - 每个 event 使用稳定 `event_id`/`operation_id` + run-scoped lease token；
-//!   claim 用独立短事务；发布由 `project_authorization_delta_in_tx` 在单事务内
-//!   重新校验租约/链接/指针/fence 并完成 complete impact-plan + complete delta，
-//!   durable pointer/manifest proof 提交后才向调用方返回成功。
+//! - 每个 event 使用稳定 `event_id`/`operation_id` + `WorkerOwned` aggregate-lane
+//!   capability（epoch、fresh token、active slot 与 event lease）；request-side
+//!   只 claim commit-proven receipt，poll/recovery 使用同一 owned claim primitives。
+//!   `project_owned_authorization_delta_in_tx` 在单事务内校验 lane/event fence，
+//!   发布与 completion proof 原子提交后才记录成功。
 //! - 纯编译阶段全部在事务外：scope ledger 全量读取 →
 //!   `latest_entries_from_history`（tombstone 不授权）→ 复核 claimed DTO ↔
 //!   ledger ↔ 依赖向量哈希 → `AuthorizationCompiler` 增量编译；
@@ -30,7 +31,7 @@
 //!    observe_publication_context`] 在一次短事务内经 astral-db 公开 loader 同时
 //!    加载严格 published frontier（generation 1..=G）与当前 parent reference
 //!    快照；无 pointer 返回 `None`，有 pointer 而 parent 快照缺失按 Corrupt 处理。
-//!    结果只作为 planning hint——发布事务 [`astral_db::project_authorization_delta_in_tx`]
+//!    结果只作为 planning hint——发布事务 [`astral_db::project_owned_authorization_delta_in_tx`]
 //!    内部重锁指针/fence/parent 做二次权威复核，观察值永远不充当放行证明。
 //! 2. **多 grant ledger 分区**：claim/readback 之后加载完整 aggregate ledger，
 //!    调用 `partition_ledger_at_published_frontier(rows, frontier,
@@ -61,14 +62,16 @@
 //!    绝不 fail/retry/伪装成功。attempt 预算耗尽仍保持 PENDING + 最大退避 +
 //!    `ATTEMPT_BUDGET_EXHAUSTED_CODE`（持续基础设施故障可能自愈），不转隔离；
 //!    无 operator HTTP requeue（requeue API 属 repository/operator 层）。
-//! 5. **Publish 租约心跳与 unproven-history 阻塞**：发布事务开始时先在同一
-//!    事务内以 owner+token+status CAS + 服务端时间续租
-//!    （astral-db `extend_delta_event_lease`，不改 attempts/cas_version），
+//! 5. **Publish owned lane heartbeat 与 unproven-history 阻塞**：发布事务开始前
+//!    由 owned runtime 续期 event/lane capability；发布事务内部再校验两者
+//!    live expiry 与 epoch/token/active slot fence，不改 attempts/cas_version，
 //!    完成不再仅因原 claim 120s 窗口耗尽而失败；CAS 失败 = 丢失所有权 →
 //!    LeaseLost/UNKNOWN，零后续写入（typed `GrantRepositoryError` 变体跨
 //!    [`RepositoryRejection`] 保留，绝不按 Display 文本分类）。过期 `LEASED`
-//!    行只能被原样 reclaim（attempts+1），其后的每条失败路径都经统一
-//!    attempt 预算退避（`next_attempt_at`/cap），绝不热循环。
+//!    episode 由 exact WorkerOwned claim 检查 active slot、绑定和发布证据；
+//!    发现终态证据或不一致返回 InDoubt，不盲目 replay；仅经该对账门并以新
+//!    epoch/token fence 接管。queue `attempts` 与 execution-failure 预算分离，
+//!    失败路径统一按 `execution_failures` 退避（`next_attempt_at`/cap），绝不热循环。
 //!    `backfill_or_rehearsal_required` 属 unproven history（等待 operator
 //!    backfill/rehearsal 提供带证明的指针），按 Blocked 在预算内退避，绝不
 //!    消耗终态隔离。

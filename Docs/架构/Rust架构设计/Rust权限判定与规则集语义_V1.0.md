@@ -1,18 +1,19 @@
 # Rust 权限判定与规则集语义 V1.0
 
 > 版本：V1.0
-> 日期：2026-08-22
-> 适用范围：`AstralLight-Rust` 的 `PolicyEngine`、RuleSet/permission rule 读模型、双卡资格门禁、委托回退与冲突检测。
-> 文档性质：**非规范性架构设计/证据材料**，记录当前态事实、审计缺口与目标决策对照；目标决策不表示已经实施。工程规范与实施约束以 [Docs/规范/](../../规范/) 和仓库根目录 [AGENTS.md](../../../AGENTS.md) 为准。
-> 证据口径：所有当前态结论以 Rust 源码、migration/schema 或已登记审计为依据；本文不把 Java 历史设计或目标态描述冒充 Rust 当前实现。
+> 原始版本日期：2026-08-22；CURRENT V6 现状补记：2026-10-28
+> 适用范围：`AstralLight-Rust` 的 `PolicyEngine`、RuleSet source/compiler 输入语义、双卡资格门禁、已发布授权证据读取与冲突检测。
+> 文档性质：**非规范性架构设计/证据材料**，记录当前态事实、审计缺口与历史目标决策对照；历史决策不表示仍为当前实现。工程规范与实施约束以 [Docs/规范/](../../规范/) 和仓库根目录 [AGENTS.md](../../../AGENTS.md) 为准。
+> 证据口径：CURRENT V6 当前态以 Rust 源码、migration/schema 或已登记审计为依据；本文保留的旧阶段和快照语义仅作历史/迁移证据，不得解释为当前 API 或授权兼容路径。
 
 ## 1. 标记、关联文档与术语
 
 本文使用以下标记：
 
-- **事实**：可由当前代码/schema 直接核验的行为。
-- **缺口**：审计已识别或从当前调用/数据链可证明的未闭合边界。
-- **目标决策**：2026-08-22 记录的设计选择；尚未实施的内容保持未来时态。
+- **事实（CURRENT V6）**：可由当前代码/schema 直接核验的行为。
+- **缺口**：按当前 CURRENT V6 调用/数据链复核后仍存在的未闭合边界；旧版中描述的 legacy 阶段缺口不自动沿用。
+- **历史/迁移对照**：旧 snapshot、旧 head、staged evaluator 与 raw/realtime 对照路径的历史定义，只用于解释来源和语义演进，不代表当前接口或兼容行为。
+- **目标决策（2026-08-22）**：原始设计记录；与 CURRENT V6 冲突的部分明确视为已取代的历史决策，不作当前目标。
 
 关联资料：
 
@@ -27,214 +28,167 @@
 - Structurizr 权限投影链路
 - 授权决策排查图
 
-术语：
+CURRENT V6 术语与读门边界：
 
-- **CARD**：以 `user_card.card_id` 关联授权来源的历史/兼容聚合；旧 CARD snapshot/head 只用于迁移、对账或未声明 strict capability 的测试 repository。生产授权证据来自 canonical grant ledger 与 published current pointer。
-- **ELIGIBILITY**：以同一 `user_card.card_id` 为聚合 ID 的物理资格投影；只维护资格缓存门禁，不重建规则快照。
-- **RuleSet L1（legacy/test 语义标签）**：通过 `card_rule_set_ref` 找到绑定的 BASE/OVERLAY 规则集，并在兼容路径读取带旧 RULE_SET gate 的 `rule_set_snapshot` winner；该 staged first-match 语义也是 canonical compiler 输入语言的一部分，但不是生产 reader 的数据来源。
-- **permission-rule L2 / L2.5（legacy/test 语义标签）**：旧 L2 读取卡级 `permission_rule_snapshot`，L2.5 读取带代次证明的委托投影；raw reader 只给 realtime/一致性巡检。生产 `SqlxRuleRepository` 不进入这些阶段，而是读取 published evidence 中的 `effective_grants`。无论哪条兼容路径，读取失败或未证明状态都不得交给下一阶段产生 ALLOW。
-- **grant 合同（2026-08-26 增补，2026-08-27 同步）**：新 Rust-owned 授权账本为 ALLOW-only——普通 DENY 是评估/规则层关注点，不持久化为正授权 grant，撤销以 tombstone/fence 表达；RULE_SET 贡献携带 BASE/OVERLAY 优先级标签（`BindingLayer`），DELEGATION 贡献恒为 layer=None。该合同已接入正式授权读侧：生产 `SqlxRuleRepository` 声明 capability marker 后，`PolicyEngine::evaluate()` 以统一 ALLOW-only 匹配器消费 published evidence 中的 `effective_grants`（严格 strict gate，fail-closed）。新账本 source 侧已由 `grant_ledger_adapter` 把 Direct（USER_CARD 聚合）/Approval/RuleSet/Delegation typed 贡献在 source transaction 内写入授权账本并追加 delta event，projector 按 aggregate 消费新 delta 队列，不限于 `GrantSourceKind::RuleSet`；`GrantSourceKind::System` 预留给 migration/backfill 溯源（backfill 本身待办）。真实 MySQL/Redis/RabbitMQ 集成与正式切流验收未完成前不得宣称生产验收。本节其余判定语义（L1/L2/L2.5 阶段标签）在 legacy/test repository 路径上保持不变。
+- **CARD / ELIGIBILITY**：旧 CARD projection/read-gate 为历史/迁移语义；ELIGIBILITY 是独立物理资格检查/缓存失效语义，不替代规则授权证据，也不因 V6 改写成 CARD 规则 snapshot。
+- **RuleSet source/compiler input**：`rule_set`、`rule_set_entry` 与绑定描述规则语言来源；OVERLAY/BASE、ref/entry 匹配语义是 compiler/admission 解释输入 provenance 的语义，不表示生产 reader 逐层查询旧 snapshot。
+- **canonical published evidence**：普通卡正式授权由 CURRENT V6 grant revision/delta，经唯一 WorkerOwned projector 发布 manifest/segment/current，再由 strict reader 消费 `effective_grants`；缺少完整 scope、generation、lineage、seal 或 revoke-fence 证明，只能 PENDING/DENY。
+- **ALLOW-only grant 合同**：授权账本只持久化正授权贡献；普通 DENY 不作为 ALLOW grant，撤销由 tombstone/fence 表达。RULE_SET 贡献保留 BASE/OVERLAY provenance；DELEGATION contribution 的 layer 为 None。此数据语义不是旧 L1/L2/L2.5 运行阶段。
+- **旧 L1/L2/L2.5、marker dispatch 与 raw/realtime evaluator**：仅为历史文档/迁移对照词汇，不是当前 `PolicyEngine` API、生产路由、test compatibility API 或 fallback。
 
-## 2. 当前判定总链路
+## 2. 当前判定总链路（CURRENT V6）
 
-**事实（2026-08-27 同步）**：生产 `SqlxRuleRepository` 声明 capability marker `requires_published_card_evidence() == true` 后，`PolicyEngine::evaluate()` 在 AUTHN/CARD_CONTEXT 与 resource/action 校验之后直接进入 published-evidence strict gate（见 §9.6），不再进入本节下述 CARD projection gate 与六阶段序列；下述顺序适用于未声明 marker 的 legacy/test repository 路径。证据：[`engine.rs:460-471`](../../../policy-engine/src/engine.rs#L460-L471)、[`repository.rs:342-351`](../../../astral-db/src/repository.rs#L342-L351)。
+**事实**：正式授权唯一入口 `PolicyEngine::evaluate()` 在 AUTHN/CARD_CONTEXT 与 resource/action/ownership 校验后，经 `RuleRepository` 的四个无默认实现 required ports 进入 CURRENT V6 published-evidence strict gate。四个 ports 为 `check_card_active`、`is_active_global_admin`、`load_published_card_authorization`、`load_org_authorization`；不存在 capability marker dispatch、legacy evaluator 或 L1/L2/L2.5 阶段。有效 ALLOW 前复读证据，任何缺失、错误、scope 不符或证明漂移均 PENDING/DENY。接口证据：[`engine/ports.rs`](../../../policy-engine/src/engine/ports.rs)、[`engine/formal.rs`](../../../policy-engine/src/engine/formal.rs)、[`engine/published.rs`](../../../policy-engine/src/engine/published.rs)。
 
 ### 2.1 入口与双卡资格
 
-**事实**：`PolicyEngine::evaluate` 的生产入口先进行 AUTHN、card context 和 resource/action 检查；生产 `SqlxRuleRepository` 随后进入 published-evidence strict gate。真实 `PLATFORM_USER` 的物理双卡资格由 `astral-db::CardEligibilityService` 负责。旧 CARD projection gate 仅在未声明 strict capability 的 legacy/test repository 中存在。引擎入口和资格服务证据：[`policy-engine/src/engine.rs:182-190`](../../../policy-engine/src/engine.rs#L182-L190)、[`engine.rs:209-357`](../../../policy-engine/src/engine.rs#L209-L357)。
+**事实**：`PolicyEngine::evaluate()` 先进行 AUTHN、card context、resource/action 与适用的 ownership 检查，再通过 required ports 读取 CURRENT V6 published evidence。真实 `PLATFORM_USER` 的物理双卡资格由 `astral-db::CardEligibilityService` 负责；`identity_card` 只证明身份，`user_card` 承载授权/组织事实。入口和资格服务证据：[`policy-engine/src/engine/formal.rs`](../../../policy-engine/src/engine/formal.rs)、[`astral-db/src/eligibility.rs`](../../../astral-db/src/eligibility.rs)。
 
 **事实**：资格服务的权威 JOIN 将 identity_card 作为身份事实，将 user_card 作为授权/组织事实，并要求两卡通过同一 user_id 对齐；identity_card 不参与 tenant/domain 比较。见 [`astral-db/src/eligibility.rs:80-153`](../../../astral-db/src/eligibility.rs#L80-L153)、[`eligibility.rs:235-276`](../../../astral-db/src/eligibility.rs#L235-L276)。
 
-**事实**：运行期资格缓存使用 ELIGIBILITY head 的三项版本和物理上下文，命中前校验 `projection_type`、user/identity/user-card/tenant/domain、`source_generation`、`projected_generation`、`revoke_fence` 以及自然到期时间；缓存失配或异常回到权威 SQL。见 [`eligibility.rs:156-231`](../../../astral-db/src/eligibility.rs#L156-L231)、[`eligibility.rs:338-373`](../../../astral-db/src/eligibility.rs#L338-L373)。
+**事实**：物理资格读侧独立于 canonical 规则授权 evidence，使用双卡上下文、strict authority checks 和有界进程内 qualification cache；失配/异常回到权威 SQL 或安全拒绝。该资格 cache 不是规则授权证明。细节以 [`astral-db/src/eligibility.rs`](../../../astral-db/src/eligibility.rs) 当前实现为准。
 
-### 2.2 生产 strict gate 与 legacy 六阶段
+### 2.2 CURRENT V6 published-evidence strict gate
 
-**事实**：生产 `SqlxRuleRepository` 声明 `requires_published_card_evidence() == true`。`PolicyEngine::evaluate()` 在 AUTHN/CARD_CONTEXT 与 resource/action 校验后直接调用 published-evidence reader，使用 canonical `effective_grants` 进行 ALLOW-only 匹配；current、manifest/segment seal、scope、lineage、generation 或 `revoke_fence_proven` 任一证明不足时只能 `AUTHORIZATION_PENDING`/DENY，不进入旧 L1/L2/L2.5，也不回退旧 snapshot/raw source/cache。证据：[`engine.rs:460-471`](../../../policy-engine/src/engine.rs#L460-L471)、[`repository.rs:342-351`](../../../astral-db/src/repository.rs#L342-L351)。
+普通卡授权通过 `load_published_card_authorization` 读取 canonical evidence，以 ALLOW-only `effective_grants` 匹配。current pointer、manifest/segment seal、scope、lineage、generation/dependency 与 `revoke_fence_proven` 任一证明不足、读取失败或最终证据复读漂移，都只能 `AUTHORIZATION_PENDING`/DENY；不读取旧 snapshot，不查询 raw source，也不回退 cache。证据：[`engine/published.rs`](../../../policy-engine/src/engine/published.rs)、[`astral-db/src/authorization_projection_repository.rs`](../../../astral-db/src/authorization_projection_repository.rs)。
 
-**兼容事实**：未声明 marker 的 legacy/test repository 仍可执行 CARD/RULE_SET gate → L1 RuleSet → L2 `permission_rule_snapshot` → L2.5 generation-gated delegation → `DEFAULT_DENY`。本节后续的六阶段规则和 first-match 语义只适用于该兼容/诊断模型，不能写成生产 `SqlxRuleRepository` 的当前放行链。
+### 2.3 历史 staged 规则语言与历史 evaluator（非当前接口）
 
-**事实**：L1 命中 ALLOW、L2 命中 ALLOW、L2.5 委托命中 ALLOW 前都复检 projection gate；复检为 stale 或 error 时，旧 ALLOW 转为 `AUTHORIZATION_PENDING`。见 [`engine.rs:371-408`](../../../policy-engine/src/engine.rs#L371-L408)、[`engine.rs:424-462`](../../../policy-engine/src/engine.rs#L424-L462)、[`engine.rs:493-565`](../../../policy-engine/src/engine.rs#L493-L565)。
+下文关于 OVERLAY/BASE、ref/entry 顺序、wildcard/alias 和 winner 语义，描述 RuleSet source/compiler input 的语言含义及历史规则模型。旧 L1/L2/L2.5 执行顺序、CARD gate、snapshot winner reader、raw/realtime evaluator 和 marker-selected dispatch 只作为历史/迁移证据保留；它们不是当前 `RuleRepository` 接口、兼容 repository 路径或生产 read route。不得将旧 gate/recheck 的历史测试或源码当作 CURRENT V6 的授权实现证明。
 
 ## 3. RuleSet 当前语义
 
 ### 3.1 数据与读取 owner
 
-**事实**：`rule_set`、`rule_set_entry` 和 `card_rule_set_ref` 仍是 RuleSet 规则语言的 source 模型；`rule_set_snapshot` 是 legacy/迁移对照中的 winner 读模型。其结构和 winner 字段可由 baseline/migration 核验，但生产 `SqlxRuleRepository` 不以该表作为授权来源。canonical projector 将 RuleSet 贡献编译到 grant ledger，并通过 manifest/segment/current 发布证据。见 [`20240630000001_baseline.sql:7-58`](../../../astral-db/migrations/20240630000001_baseline.sql#L7-L58)、[`authorization_compiler.rs`](../../../policy-engine/src/authorization_compiler.rs#L1-L72)。
+**事实**：`rule_set`、`rule_set_entry` 和 `card_rule_set_ref` 是 RuleSet 完整 source 模型；`rule_set_snapshot` 只属于 legacy/迁移对照读模型，不是生产授权来源。canonical projector 将经验证的 RuleSet grant contribution 编译到 ledger，再通过 manifest/segment/current 发布证据；生产 reader 只通过 `load_published_card_authorization` 消费已发布证据。规范字段与读模型合同见 [Rust 后端编码规范 §15.7](../../规范/Rust后端编码规范_V1.0.md#157-规则集完整结构与轻量发布栅栏标准2026-10-28)，代码入口见 [`authorization_compiler.rs`](../../../policy-engine/src/authorization_compiler.rs) 与 [`authorization_projection_repository.rs`](../../../astral-db/src/authorization_projection_repository.rs)。
 
-**兼容事实**：`load_rule_set_snapshots`、`load_snapshot_winners` 等方法仍保留在 `RuleRepository` trait 中，供未声明 strict capability 的 legacy/test repository、迁移对照和显式诊断使用；它们不能成为生产 `SqlxRuleRepository` 的授权入口。生产读侧调用 `load_published_card_authorization`，并验证 current pointer 指向的 manifest/segment 链、scope、lineage、generation、摘要/seal 与 `revoke_fence_proven`。
+旧 `load_rule_set_snapshots`、`load_snapshot_winners` 等方法名及旧读模型只可作为历史源码/迁移证据；CURRENT V6 的 `RuleRepository` 是四个 required ports，不提供 snapshot reader compatibility dispatch。生产读侧验证 current pointer 指向的 manifest/segment 链、scope、lineage、generation、摘要/seal 与 `revoke_fence_proven`。
 
 ### 3.2 跨层顺序：OVERLAY 先于 BASE（规则语言语义）
 
-**事实**：`OVERLAY > BASE` 是 RuleSet 规则语言和 canonical compiler 输入的跨层优先级：OVERLAY 中命中 DENY 或 ALLOW 都先于 BASE，只有 OVERLAY 全部 no-match 才进入 BASE。生产 reader 不逐表读取这些 refs，而是消费已由 compiler/projector 证明的 `effective_grants`；该顺序用于解释 grant provenance 和兼容/test 结果。见 [`engine.rs:966-1064`](../../../policy-engine/src/engine.rs#L966-L1064)。
+**规则语言事实**：`OVERLAY > BASE` 描述 RuleSet contribution 的 provenance/层级语义，compiler/admission 按完整规则集合同解释其 effect、priority 和来源；这不是 production reader 逐层遍历旧 refs 的执行阶段。正式 reader 只消费 compiler/projector 证明的 CURRENT V6 `effective_grants`，并通过 published evidence gate 后做 allow-only 匹配。CURRENT V6 具体规则集 source/read-view 语义见 [规范 §15.7](../../规范/Rust后端编码规范_V1.0.md#157-规则集完整结构与轻量发布栅栏标准2026-10-28)。
 
-这意味着当前 Rust 语义不是“BASE ALLOW 与 OVERLAY DENY 再做一次全局优先级比较”，而是分阶段：
+以下旧 staged first-match 图只保留为历史 RuleSet evaluator 证据，不是当前调用链：
 
 ```text
-OVERLAY refs：首个命中即结束
-  no match -> BASE refs：首个命中即结束
-  no match -> 进入 L2
+[历史] OVERLAY refs -> first match -> BASE refs -> L2 -> L2.5 -> DEFAULT_DENY
 ```
 
 ### 3.3 层内顺序：ref first-match-wins
 
-**兼容事实**：每一层的旧规则集 ref 按兼容 repository 返回顺序遍历；单个 ref 有命中就立即返回。该 first-match 规则仍是 canonical compiler 必须保留的输入语义，但生产读侧以 published evidence 的稳定 grant/provenance 结果为准，不依赖运行时数据库返回顺序。`match_layer_first_match` 的实现见 [`engine.rs:1066-1091`](../../../policy-engine/src/engine.rs#L1066-L1091)。
+**历史语义**：旧 evaluator 按 repository 返回顺序遍历每层 refs，单个 ref 命中即返回。此内容用于解释历史行为；不推断该 first-match 算法当前由 compiler 或 production reader 实现。CURRENT V6 生产语义以规范 §15.7 的完整 RuleSet contract、compiler/admission 实现与 published evidence 为准。旧 `match_layer_first_match` 源码如仍可定位，只作为历史证据，不是当前 API。
 
-**事实**：单 ref 内当前快照匹配顺序为：
-
-1. exact `resource_key + action_code`；
-2. 具体对象请求的 forward wildcard，例如 `type:42` → `type:*`；
-3. 类型级请求的 reverse wildcard，扫描对象级条目，若存在 DENY 则 DENY，否则有对象 ALLOW 则 ALLOW；
-4. 对动作别名重复上述顺序。
-
-证据：[`engine.rs:1093-1188`](../../../policy-engine/src/engine.rs#L1093-L1188)、[`engine.rs:1223-1281`](../../../policy-engine/src/engine.rs#L1223-L1281)。
-
-**事实**：在 legacy/raw 的 `RuleSetSnapshot.entries` 扫描路径中，条目按查询的 `priority DESC, effect DESC` 顺序进入单 pass；第一个匹配条目决定效果，运行时条件条目被跳过。见 [`engine.rs:1340-1441`](../../../policy-engine/src/engine.rs#L1340-L1441)。这一路径与正式 winner lookup 的 exact/forward/reverse 语义不可混写。
+**历史 evaluator 语义**：旧 snapshot reader 使用 exact、forward/reverse wildcard 与 action alias 匹配；旧 `RuleSetSnapshot.entries` raw scan 按 priority/effect 顺序单 pass。此处保留用于历史语义追溯，不是 CURRENT V6 `PolicyEngine` 路径或规范化的 current matching contract；不能从旧源码结构推断新 compiler/admission 的实现细节。
 
 ### 3.4 winner 语义与 canonical 编译边界
 
-**事实**：`OVERLAY → BASE`、单 ref first-match、exact/forward/reverse wildcard、动作别名和同优先级 `entry_id` tie-break 是当前 RuleSet 规则语言/编译内核需要保持的语义。旧 `ProjectionWorker` 的 snapshot winner 重建只保留为 legacy/迁移证据；生产 canonical `AuthorizationCompiler` 将已验证的 RuleSet 贡献编译为 ALLOW-only grant candidate，再由 `AuthorizationProjector` 通过 manifest/segment/current durable CAS 发布。旧 snapshot 的 `valid_from/valid_to` 写入缺口不等于 canonical wall-clock expiry 已实现。见 [`authorization_compiler.rs`](../../../policy-engine/src/authorization_compiler.rs#L1-L72)、[`side_effects.rs:704-761`](../../../astral-trustgraph/src/api/side_effects.rs#L704-L761)。
+CURRENT V6 的规则集 source/read-view、command validation 与 publication identity 以 [Rust 后端编码规范 §15.7](../../规范/Rust后端编码规范_V1.0.md#157-规则集完整结构与轻量发布栅栏标准2026-10-28) 为准。`AuthorizationCompiler` 对已验证 typed grants 构造 ALLOW-only candidate，`AuthorizationProjector` 将其发布为 manifest/segment/current durable evidence；旧 `ProjectionWorker` 的 snapshot winner 重建、旧 `MAX(version_no)`/`projection_generation`/head gate 只作为 legacy/迁移历史。旧 snapshot 的 `valid_from/valid_to` 写入缺口不等同于 CURRENT V6 strict reader、matcher 与 evidence L1 的 grant-time validity 检查；后者的自然到期也不自动产生 source mutation、delta 或 generation 推进。详见 [`authorization_compiler.rs`](../../../policy-engine/src/authorization_compiler.rs)、[`authorization_projector.rs`](../../../astral-trustgraph/src/service/authorization_projector.rs)、[`authorization_projection_repository.rs`](../../../astral-db/src/authorization_projection_repository.rs)、[`published.rs`](../../../policy-engine/src/engine/published.rs) 与 [`evidence_cache.rs`](../../../astral-db/src/evidence_cache.rs)。
 
-**兼容事实**：在未声明 strict capability 的 repository 中，旧 winner 读取仍以 `MAX(version_no)` 和旧 `projection_generation`/head 进行对账；这些值不能单独授权，也不能替代 canonical current proof。
-**事实**：equal-priority 且 effect 相同的 RuleSet 条目使用最低 `entry_id` 作为最终 tie-break，不再依赖数据库返回顺序。
+旧 equal-priority `entry_id` tie-break 是历史 winner 编译规则记录，不单独定义 CURRENT V6 的 grant matching contract；source/read view 中的优先级、entry identity 与 canonical publication stamp 依规范和当前 compiler/admission 实现核对。
 
-## 4. `permission_rule_snapshot` 与 `rule_set_snapshot`
+## 4. 旧快照历史证据与 CURRENT V6 生产来源
 
 ### 4.1 语义与生产数据来源
 
-| 维度 | `permission_rule_snapshot`（legacy） | `rule_set_snapshot`（legacy） | canonical published evidence |
-|------|----------------------------|---------------------|------------------------------|
-| 逻辑来源 | 卡级 `permission_rule` | `rule_set_entry` + `rule_set` | grant revision ledger + typed delta |
-| 绑定粒度 | `card_id` | `rule_set_id` 经绑定关系使用 | card/tenant scope 由 current/manifest 证明 |
-| 兼容消费者 | 未声明 strict capability 的 L2/test/迁移对照 | 未声明 strict capability 的 L1/test/迁移对照 | 生产 `SqlxRuleRepository` → `load_published_card_authorization` |
-| 版本选择 | 旧表 `MAX(version_no)` | 旧表 `MAX(version_no)` | current pointer → manifest/segment seal + generation/lineage/fence |
-| source fallback | 仅 raw/一致性巡检；不作为生产 fallback | 仅 raw/一致性巡检；不作为生产 fallback | 无 source/snapshot/cache fallback |
-| 未证明行为 | legacy/test 读取失败或 gate 不足 → PENDING/DENY | 同左 | current/manifest/segment 任一 proof 不足 → PENDING/DENY |
+| 维度 | `permission_rule_snapshot`（历史） | `rule_set_snapshot`（历史） | CURRENT V6 published evidence |
+|------|----------------------------|---------------------|-------------------------------|
+| 历史逻辑来源 | 卡级 `permission_rule` | `rule_set_entry` + `rule_set` | grant revision ledger + typed delta |
+| 历史绑定粒度 | `card_id` | `rule_set_id` 经绑定关系使用 | card/tenant scope 由 current/manifest 证明 |
+| 当前生产消费者 | 无；仅迁移/历史证据 | 无；仅迁移/历史证据 | `SqlxRuleRepository` → `load_published_card_authorization` |
+| 历史版本选择 | 旧表 `MAX(version_no)` | 旧表 `MAX(version_no)` | current pointer → manifest/segment seal + generation/lineage/fence |
+| source fallback | 旧历史路径；不是当前 API | 旧历史路径；不是当前 API | 无 source/snapshot/cache fallback |
+| 未证明行为 | 当前 formal reader 不消费该表 | 当前 formal reader 不消费该表 | 任一 V6 proof 不足 → PENDING/DENY |
 
-表结构与旧兼容读取实现仍可作为历史证据核验，但不能将两张 snapshot 表称为生产 canonical 授权来源。
+旧快照表结构、迁移和代码仅作为历史/迁移证据核验，不能将它们称为生产授权来源或兼容 evaluator。
 
-### 4.2 legacy snapshot 行与源规则行的匹配语义
+### 4.2 历史 snapshot 行匹配语义
 
-**兼容事实**：在未声明 strict capability 的 repository 中，旧 L2 根据返回行的 `id` 区分预编译 snapshot winner 与源规则行。`PermissionRule.id == 0` 的旧 winner 使用 exact-first 两段式匹配；源规则行使用带 priority 的单 pass。该差异只描述 legacy/test/迁移对照输入，不是生产 `SqlxRuleRepository` 的读取路径。见 [`engine.rs:1476-1559`](../../../policy-engine/src/engine.rs#L1476-L1559)。
+以下为旧 L2 evaluator 对 `permission_rule_snapshot` / source-rule 行的区分及 exact-first、priority 单 pass 规则，仅供历史行为追溯；CURRENT V6 formal reader 不读取这些行。旧 snapshot 为空也不能作为当前“空授权”证明，正式读门只能由 current/manifest/segment V6 proof 决定。
 
-**兼容事实**：旧 snapshot winner 的 exact-first 语义是具体对象先找完全相同的 `resource_key`，再找类型/全局通配；类型级请求不命中对象级条目。源规则单 pass 按 `priority DESC, effect DESC` 排序。生产 canonical reader 不消费这些行，而是匹配 published evidence 的 `effective_grants`。见 [`engine.rs:1563-1667`](../../../policy-engine/src/engine.rs#L1563-L1667)。
+### 4.3 旧快照 schema 与 migration 历史
 
-旧 snapshot 为空时，legacy/test 路径可把空集视为已证明的空授权结果且不回读 source；生产 strict gate 的“无有效证据”由 current/manifest/segment proof 决定，不能用旧空快照代替。
+以下 schema、唯一键、`version_no`、旧 `projection_generation`、`MAX(version_no)` 和 validity-window migration 只描述 legacy snapshot 的历史结构与部署差异。它们不属于 CURRENT V6 production read gate，不定义当前兼容 API，也不证明任一部署库已应用迁移或完成清理。`20260827000002_legacy_snapshot_tables_decommission.sql` 的存在亦不证明表已 DROP；环境 postcondition 必须独立取证。canonical 授权当前只以 CURRENT V6 manifest/segment/current proof 为准。
 
-### 4.3 当前唯一键与版本号事实
+## 5. 历史 staged error 行为与 CURRENT V6 source ownership
 
-**事实**：canonical SQL 设计中，`permission_rule_snapshot` 的唯一键是 `(card_id, resource_key, action_code)`，`rule_set_snapshot` 的唯一键是 `(rule_set_id, resource_key, action_code)`，同时两者均有 `version_no`。见 [full_schema_v4.sql permission snapshot](../../sql/full_schema_v4.sql#L1340-L1353) 与 [full_schema_v4.sql RuleSet snapshot](../../sql/full_schema_v4.sql#L1567-L1579)。
+### 5.1 历史 L2/L2.5 repository-error 行为
 
-**事实**：Rust baseline 对两表只声明普通索引；`permission_rule_snapshot` 的 `version_no` 后续由 migration 添加并建 `(card_id, version_no)` 索引；RuleSet winner migration 只增加字段和 lookup index。对 `rule_set_snapshot` 而言，baseline 声明的是 `version` 列，而当前 RuleSet 重建/读取 SQL 使用 `version_no`；在已读取的 Rust migrations 中没有看到将 `version` 显式迁移/重命名为 `version_no` 的步骤。见 [`20240630000001_baseline.sql:35-86`](../../../astral-db/migrations/20240630000001_baseline.sql#L35-L86)、[`20240630000009_snapshot_version.sql:1-9`](../../../astral-db/migrations/20240630000009_snapshot_version.sql#L1-L9)、[`20240630000006_snapshot_winners.sql:1-13`](../../../astral-db/migrations/20240630000006_snapshot_winners.sql#L1-L13)、[`side_effects.rs:651-769`](../../../astral-trustgraph/src/api/side_effects.rs#L651-L769)。
+旧 evaluator 对 `permission_rule_snapshot` 读取失败会 fail-closed，旧阶段不将错误当成 no-match 再进入委托；旧委托读侧依赖 CARD generation 证明，raw/source reader 与 realtime 路径均为历史实现。该段保留供审计历史错误处理，不是 CURRENT V6 production 或 compatibility API 的调用链。
 
-**缺口**：若部署库仍只有 baseline 的 `version` 而没有代码所需的 `version_no`，RuleSet snapshot 的重建/读取会发生 schema 运行时错误；本文不假设部署库已完成对齐。
+### 5.2 当前 source ownership 与授权贡献
 
-**事实（legacy/迁移对照）**：legacy/test 读路径仍使用每个快照的 `MAX(version_no)` 选择行，但不会单独以该值证明可读性：CARD cache 绑定旧 CARD head 三元版本，RuleSet dependency gate 还要求旧 `RULE_SET` head READY、source/projected 对齐、snapshot 行 `projection_generation` 等于 projected generation；未证明时安全 miss/PENDING。生产 `SqlxRuleRepository` 不经过该路径，直接消费 canonical published evidence。见 [`permission_query.rs:342-420`](../../../astral-db/src/permission_query.rs#L342-L420)、[`permission_query.rs:531-556`](../../../astral-db/src/permission_query.rs#L531-L556)。
+CURRENT V6 授权贡献使用封闭的 typed `GrantSourceKind`：`RULE_SET` 的 contribution 必须带 `BASE` 或 `OVERLAY` binding layer；`DIRECT`、`DELEGATION`、`APPROVAL`、`SYSTEM` 均为 `NONE`。普通 direct permission-rule 新增只接受 enabled `MANUAL`；旧 `CARD_ONLY` 仅可读/删除，不能自动改写。`SYSTEM` 当前 reserved-unused，没有生产 append path；不得描述成已经承载 migration/backfill。详见 [`astral-types/src/grant.rs`](../../../astral-types/src/grant.rs) 和 [CURRENT V6 规范 §15.8](../../规范/Rust后端编码规范_V1.0.md#158-current-v6-breaking-change-inventory-与-adoption-notice)。
 
-**缺口**：如果部署 schema 未应用 canonical snapshot 唯一键，当前 Rust baseline 不能由自身保证每个逻辑 key 的数据库唯一性；应用侧 winner 去重和最新版本过滤不能替代唯一约束。
+`source_type` 的旧数据库字段和旧 evaluator source filters 不能代表 typed source ownership；RuleSet/direct/delegation/approval 的 grant mutation 由各自 source owner 同事务记录 grant revision/delta 与 audit correlation，再由唯一 projector 物化。direct mutation 的 `MANUAL` gate 由 `RuleWriteService` 强制，delegation contribution 由 delegation owner 同事务维护，RuleSet 与 approval 使用各自 typed append path。SoD 限制另见 §7.3。规则自然时间窗由 reader/matcher 的读时有效期判定和 L1 时钟复验处理，但不会自动触发 source delta 或 publication-generation advance。
 
-**事实**：`projection_generation` 是 RuleSet snapshot 与 durable RULE_SET head 的关联栅栏；`20260822000001_rule_set_projection_schema_repair.sql` 给既有 schema 添加该列并以 0 作为未证明哨兵，显式 migration backfill 为既有 RuleSet 创建/修复 head、outbox marker 和审计关联，再由 worker 重建后转 READY。`20260822000002_snapshot_validity_windows.sql` 另行添加两张 snapshot 表的 `valid_from/valid_to`，从仍可证明的 source identity 回填窗口并删除无法证明来源的旧行。迁移或回填失败时不推断 READY，读侧保持 fail-closed。见 [`20260822000001_rule_set_projection_schema_repair.sql`](../../../astral-db/migrations/20260822000001_rule_set_projection_schema_repair.sql)、[`20260822000002_snapshot_validity_windows.sql`](../../../astral-db/migrations/20260822000002_snapshot_validity_windows.sql)、[`migration.rs:3233-3638`](../../../astral-db/src/migration.rs#L3233-L3638)。
 
-## 5. L2、L2.5 与 source-type ownership
+## 6. 其他非授权用途与历史路径
 
-### 5.1 legacy L2/L2.5 repository-error 行为
+### 6.1 历史 realtime/raw-source evaluator
 
-**兼容事实**：未声明 strict capability 的 repository 在旧 L2 `permission_rule_snapshot` 读取失败时立即返回 `DEPENDENCY_UNAVAILABLE`，不会进入旧 L2.5；只有明确无匹配才继续。旧 L2.5 使用 `load_projected_delegated_rules`，要求 CARD 代次证明；raw/source reader 只供 realtime/一致性巡检。见 [`engine.rs:554-625`](../../../policy-engine/src/engine.rs#L554-L625)、[`repository.rs:776-895`](../../../astral-db/src/repository.rs#L776-L895)。
+旧版本曾记录 `evaluate_realtime()` 读取 raw `rule_set_entry`/`permission_rule` 的一致性比较路径。CURRENT V6 已将 capability marker、raw/realtime evaluator 及其 read API 从当前正式/兼容授权合同中移除；历史源码链接仅用于回溯，不能称其为当前诊断 API，也不能让它成为生产 ALLOW 的旁路。
 
-**生产边界**：`SqlxRuleRepository` 不执行上述旧阶段，而是直接读取 canonical published evidence；current/manifest/segment 读取错误或证明不足保持 PENDING/DENY。
+### 6.2 Arbiter 与模拟用途
 
-### 5.2 source_type 当前分布
+CURRENT V6 规范明确正式调用链不含 Arbiter/oracle 决策阶段，且当前 checkout 已移除旧 Arbiter kernel/service/API 源文件。若将来另行批准非授权诊断/模拟功能，须以新的 owner、caller trust 和 API/source contract 单独设计；旧路线记录及文件名不证明该 runtime feature 仍存在。任何模拟结果都不能作为正式请求 ALLOW 输入。
 
-**事实**：`permission_rule` 写入记录带 `source_type` 与可选 `source_id`；普通规则 repository 接受 `NewRule.source_type`，并从目标 user_card source row 派生 tenant_id。见 [`rule_repository.rs:181-223`](../../../astral-trustgraph/src/repository/rule_repository.rs#L181-L223)。
+## 7. 当前合同与待验证边界
 
-**事实**：legacy/test 阶段与巡检读取对来源有不同过滤：raw permission rules 使用 `MANUAL`/`DELEGATION`，delegation 另从 `permission_delegation` 查询；RuleSet 则从 `rule_set_entry`/snapshot 读取。生产 strict reader 只消费 canonical published evidence，不做上述旧 source/type 过滤。见 [`astral-db/src/repository.rs:517-615`](../../../astral-db/src/repository.rs#L517-L615)。
+> 本节记录的真实验证缺口仅指本任务未执行或尚无证据的 MySQL/MQ/部署场景；不得从下方历史 §9 复用已取代的 legacy/realtime/cache TODO。
 
-**事实**：委托 repository 在创建/更新时以同一 transaction 写 `permission_delegation` 与 `permission_rule(source_type='DELEGATION')`，并追加被委托卡 CARD projection。见 [`delegation_repository.rs:43-67`](../../../astral-trustgraph/src/repository/delegation_repository.rs#L43-L67)、[`delegation_repository.rs:162-181`](../../../astral-trustgraph/src/repository/delegation_repository.rs#L162-L181)、[`delegation_repository.rs:262-289`](../../../astral-trustgraph/src/repository/delegation_repository.rs#L262-L289)。
+### 7.1 CURRENT V6 strict gate
 
-**缺口**：当前没有跨 RuleSet、permission_rule、delegation、snapshot 和 projection aggregate 的统一 source-type owner 合同。字段存在不等于 ownership 已闭合：无法仅从 `source_type` 全局推出写入 owner、投影 aggregate、快照消费者、撤销 fence 与审计事件的完整对应关系。该缺口仍与共享 RuleSet fan-out 和 L2/L2.5 双路径耦合；`version_no` 的行选择问题不能替代或削弱已落地的 RULE_SET durable generation gate。
+正式读门经 `load_published_card_authorization` 消费 current pointer 指向的 CURRENT V6 manifest/segment 完整证明，校验 scope、摘要/seal、lineage、generation/dependency 与 `revoke_fence_proven`，并在 ALLOW 前复读；任一缺失、错误或漂移都保持 PENDING/DENY。来源见 [`policy-engine/src/engine/published.rs`](../../../policy-engine/src/engine/published.rs)、[`astral-db/src/authorization_projection_repository.rs`](../../../astral-db/src/authorization_projection_repository.rs) 与 [`astral-trustgraph/src/service/authorization_projector.rs`](../../../astral-trustgraph/src/service/authorization_projector.rs)。
 
-## 6. 一致性巡检与 Arbiter
+### 7.2 独立 qualification 与 time-window 边界
 
-### 6.1 realtime 对照路径
+ELIGIBILITY qualification 是身份卡/用户卡事实校验与独立资格缓存失效语义，不等同旧 CARD rule gate，也不替代 CURRENT V6 published authorization evidence。规则 grant 的 `not_before`/`expires_at` 按每次 strict read 的统一 UTC now 分类，未生效或已到期 contribution 不进入 `effective_grants`；formal matcher 也在评估时复核 validity，evidence L1 命中前按当前时钟重验窗口，翻转即 miss 回 strict reader。自然到期不产生 source mutation、delta 或 publication-generation advance，因此不自动推进 projection/audit lifecycle；若需独立 expiry event 或代际推进须另立合同。旧 snapshot validity migration 不证明此类 scheduler/event 已实现。代码入口：[`authorization_projection_repository.rs`](../../../astral-db/src/authorization_projection_repository.rs#L4682-L4769)、[`published.rs`](../../../policy-engine/src/engine/published.rs#L640-L705)、[`evidence_cache.rs`](../../../astral-db/src/evidence_cache.rs#L34-L43)。
 
-**事实**：`evaluate_realtime` 是一致性检查专用路径，绕过 RuleSet snapshot 与 permission_rule_snapshot，读取原始 `rule_set_entry` 和 `permission_rule`；正常正式授权不使用这条路径作为宽松 fallback。见 [`engine.rs:663-670`](../../../policy-engine/src/engine.rs#L663-L670)、[`engine.rs:766-871`](../../../policy-engine/src/engine.rs#L766-L871)。
+### 7.3 Grant-time SoD
 
-**事实**：realtime 路径也读取 projection gate，并在 gate 不 ready 或评估期间版本推进时返回 PENDING 语义；它不是绕过版本栅栏的旁路授权入口。见 [`engine.rs:724-755`](../../../policy-engine/src/engine.rs#L724-L755)、[`engine.rs:789-844`](../../../policy-engine/src/engine.rs#L789-L844)。
+enabled `MANUAL` 直接授权 create/update 在 source transaction 内无条件执行 `astral_db::check_grant_sod_conflict_in_tx`；CREATE 另保留 service 层显式注入的 early validator。锁定卡与 source-rule/card tenant、user/domain 必须一致，未完成卡级/NULL-card aggregate-wide 贡献、缺失证据、策略读取失败或超时均阻止写入。UPDATE 只有在完整锁定 before-image 对应唯一 exact published grant 时，才能从 STATIC held grants 排除该项稳定 `GrantId`，其他 grant 与 DYNAMIC 检查仍执行。事务有界读取与完整身份/内容/provenance 证明以 [Rust 后端编码规范 §15.4](../../规范/Rust后端编码规范_V1.0.md#154-单机内存读写生命周期sod-与审计边界) 为准。代码入口：[`rule_write_service.rs`](../../../astral-trustgraph/src/service/rule_write_service.rs)、[`rule_repository.rs`](../../../astral-trustgraph/src/repository/rule_repository.rs)、[`sod_check.rs`](../../../astral-db/src/sod_check.rs)。
 
-### 6.2 Arbiter 当前定位
+此交易内锁序/并发路径目前只具源码证据；真实 MySQL 下的锁冲突、并发事务与 deadlock/恢复语义尚未执行验证，不得声称已验收。
 
-**事实**：Arbiter 是无 IO 的冲突解析器。它只对已经带版本/来源证明的对照证据发出冲突信号；旧 snapshot gate 的 READY 语义仅适用于 legacy/test 对照，canonical 生产读门仍由 current/manifest/segment proof 决定。gate 未证明的收敛窗口不进入仲裁。见 [`arbiter.rs:1-16`](../../../policy-engine/src/arbiter.rs#L1-L16)、[`arbiter.rs:112-133`](../../../policy-engine/src/arbiter.rs#L112-L133)。
+### 7.4 source/贡献边界
 
-**事实**：Arbiter 按 `(source_generation, revoke_fence)` 版本序处理证据；无法证明时返回 `Defer`，其安全出口对应 `AUTHORIZATION_PENDING`，不是新的日常授权来源。见 [`arbiter.rs:160-229`](../../../policy-engine/src/arbiter.rs#L160-L229)。
+CURRENT V6 typed `GrantSourceKind` 闭集及 `BindingLayer` 约束见 §5.2；它替代旧数据库 `source_type` 字段被当作全局 owner registry 的描述。`SYSTEM` reserved-unused，backfill writer 与实际恢复过程仍不是已证明行为。
 
-**事实**：PolicyEngine 在一致性违规时调用 `detect_conflict` 并发出 signal；当前信号 sink 默认可为 no-op，仲裁执行不插入正常 evaluate 的 L1/L2/L2.5 顺序。见 [`engine.rs:605-615`](../../../policy-engine/src/engine.rs#L605-L615)。
-
-## 7. 已识别缺口汇总
-
-### 7.1 canonical published evidence 与 legacy gate 边界
-
-**事实**：生产 `SqlxRuleRepository` 的 strict capability 已接线，正式授权只接受 current pointer 指向的 manifest/segment 完整证明、scope、lineage、generation、摘要/seal 与 `revoke_fence_proven`；任一缺失或读取错误均为 `AUTHORIZATION_PENDING`/DENY。旧 RuleSet head、旧 snapshot `projection_generation` 和旧 CARD gate 仍可作为 legacy/test/迁移对照，但不是生产授权完成证明。
-
-证据：[published reader](../../../astral-db/src/authorization_projection_repository.rs#L1-L44)、[strict repository marker](../../../astral-db/src/repository.rs#L342-L351)、[projector](../../../astral-trustgraph/src/service/authorization_projector.rs#L741-L847)。
-
-### 7.2 legacy snapshot version 与 canonical generation
-
-**事实**：旧两张 snapshot 表的 `MAX(version_no)`、旧 head 的 `source_generation/projected_generation` 和 RuleSet 的 `projection_generation` 只用于兼容路径、迁移和对账。它们不能单独证明生产授权可读，也不能使 canonical current pointer 的证明状态回退或前进。
-
-canonical generation 由 current pointer、manifest/segment seal、parent lineage、semantic/dependency hash 和 `revoke_fence_proven` 联合证明；proof 不足时保持 PENDING/DENY。
-
-### 7.3 equal-priority ordering 的当前边界
-
-**事实**：RuleSet winner 对同 priority、同 effect 的候选使用最低 `entry_id` 作为最终 tie-break；CARD 纯逻辑 winner 选择仍保留输入先序语义，不能把 CARD 与 RuleSet 的排序合同混写。见 [`side_effects.rs:704-761`](../../../astral-trustgraph/src/api/side_effects.rs#L704-L761)、[`side_effects.rs:396-439`](../../../astral-trustgraph/src/api/side_effects.rs#L396-L439)。
-
-**剩余边界**：CARD 同 priority、同 effect 的规则尚未引入统一 `rule_id` tie-break；这不影响 RuleSet durable generation gate。
-
-### 7.4 L2 repository-error delegation 已 fail-closed
-
-**事实（legacy/test 路径）**：旧 L2 `permission_rule_snapshot` repository error 在进入旧 L2.5 前返回 `DEPENDENCY_UNAVAILABLE`；只有明确无匹配才继续。旧 L2.5 使用 generation-gated projected delegation reader，raw/source reader 只供 realtime/一致性巡检；生产 strict gate 不经过这些阶段。见 §5.1。
-
-### 7.5 source-type ownership gap
-
-**缺口**：`source_type` 分散在多条写/读路径，尚无统一 owner 矩阵或注册合同，不能仅凭字段值证明 projection、快照、审计和撤销链完整对应。见 §5.2。
-
-### 7.6 CARD/ELIGIBILITY gate 的范围边界
-
-**事实**：legacy CARD gate 决定旧规则授权 snapshot 是否可读；ELIGIBILITY gate 决定物理资格缓存是否可命中；生产正式授权由 canonical published-evidence gate 决定。CARD 与 ELIGIBILITY 共享 aggregate id 但不共享版本来源。见 [Rust 权限投影快照与版本栅栏](./Rust权限投影快照与版本栅栏_V1.0.md)。
-
-**缺口**：若未来新增影响资格的 source mutation、tenant/domain fan-out 或 identity 显式到期变更，必须明确事件进入 ELIGIBILITY、CARD 还是新的 aggregate；当前不存在 `IDENTITY` aggregate，不能默认由现有 CARD/ELIGIBILITY 代替。
-
-## 8. 五链审查结论
+## 8. 五链审查边界
 
 ### 8.1 调用链
 
-**事实**：生产调用链为 Gateway/下游中间件构造 `PolicyContext` → `PolicyEngine::evaluate` → canonical published-evidence reader → ALLOW-only `effective_grants` matcher → `DEFAULT_DENY`；一致性巡检另走 `evaluate_realtime` 与 Arbiter signal。未声明 strict capability 的 legacy/test repository 才使用本文记录的 CARD/RULE_SET gate、L1、L2、L2.5 兼容阶段。
+**事实**：CURRENT V6 formal authorization is `PolicyEngine::evaluate()` → four required ports → published-evidence strict gate → ALLOW-only matcher; no staged, marker-selected, raw/realtime or snapshot evaluator is a current branch. Source mutation reaches the unique WorkerOwned projector through committed immutable receipts.
 
-**结论**：本文没有增加第二个授权入口，也没有把 realtime、Arbiter 或旧 snapshot reader 写成生产授权 fallback。
+**结论**：保持一个正式授权入口；旧快照、管理模拟与历史 evaluator 不构成生产 fallback。
 
 ### 8.2 逻辑链
 
-**事实**：`OVERLAY → BASE`、层内 ref first-match、单 ref exact/forward/reverse/alias 是 legacy/test 规则语言和 canonical compiler 输入的语义；生产 reader 不从旧 snapshot 读取，而验证 current/manifest/segment proof 后匹配 `effective_grants`。旧 L2 repository error 的 fail-closed 规则只约束兼容路径。
+**事实**：RuleSet source/provenance 与 `GrantSourceKind` / `BindingLayer` 约束、完整 compiler/admission bundle 依 CURRENT V6 规范；published reader 不逐层读取旧 refs，任何 proof 不足或 final reread drift 都不能 ALLOW。
 
-**结论**：任何版本、来源或绑定变化都必须保持 proof-before-ALLOW；旧 snapshot/head 的 READY 或 `MAX(version_no)` 不能替代 canonical 证据。
+**结论**：版本、来源或绑定变化须保持 proof-before-ALLOW；旧 snapshot/head READY、`MAX(version_no)` 或旧 staged match 不能替代 canonical 证据。
 
 ### 8.3 事故链
 
-**事实**：canonical current/manifest/segment 读取失败、scope/lineage/fence/hash 证明不足、projector lease/CAS 未知或 archive proof 未完成，都保持 PENDING/DENY 或进入有界 Blocked/Quarantine/Unknown；不会回退旧 snapshot/source/cache。legacy/test 路径的 L2/L2.5 repository error 也保持 fail-closed。
+**事实**：canonical current/manifest/segment 读取失败、scope/lineage/fence/hash 证明不足、projector lease/CAS UNKNOWN 或 archive proof 未完成，都保持 PENDING/DENY 或进入 bounded Blocked/Quarantine/Unknown；不会回退旧 snapshot/source/cache。source-side SoD recheck 遇到 unpublished contribution、缺失 evidence、policy read error 或 transaction deadline 亦拒绝写入。
 
-**结论**：组合故障和真实部署验收仍需独立覆盖，不能用 typed/mock 测试或旧 worker 的可重试状态宣布生产集成通过。
+**结论**：代码路径不等于组合故障或真实部署验收；不能用 typed/mock 测试、静态形状或历史 worker 状态宣布生产集成通过。SoD 真实 MySQL 并发/锁序仍未验证。
 
 ### 8.4 数据链
 
-**事实**：旧 RuleSet/permission snapshot 是不同 source、粒度和兼容匹配语义的历史读模型；canonical 数据链是 grant revision → delta event → manifest/segment/current → published evidence。ELIGIBILITY head 只门禁物理资格缓存，不替代 canonical 授权证据。
+**事实**：canonical 数据链是 grant revision → typed delta + immutable receipt → WorkerOwned projector → manifest/segment/current → published evidence；ELIGIBILITY qualification/cache invalidation 独立，不替代 canonical 授权证据。旧 snapshot/head 和 raw evaluator 只作历史/迁移材料。
 
-**结论**：未来任何规则来源、编译字段、版本或唯一键调整，都必须同步 ledger、delta、manifest/segment seal、lineage/fence、reader dispatch、realtime comparator 和 stale-message consumer。
+**结论**：未来调整须同步 ledger、delta/receipt、manifest/segment seal、lineage/fence、四个 required reader ports、invalidation consumer、SoD published-only evidence 与适用的 migration/backfill 证据；不增加 realtime/raw-source 授权旁路。
 
 ### 8.5 审计链
 
-**事实**：权限检查审计通过 `AuditDualWrite::record_permission_check` 走 MQ-first/DB-fallback，MQ consumer 以 messageId/processing lease 做幂等，失败可重试；审计旁路不改变 PolicyEngine 的 decision。见 [`astral-common/src/audit.rs:165-195`](../../../astral-common/src/audit.rs#L165-L195)、[`astral-mq/src/consumer.rs:368-464`](../../../astral-mq/src/consumer.rs#L368-L464)。
+**事实**：source mutation 的 audit correlation 与 grant revision/delta 在 source transaction 内关联；projector publication/archive proof 有独立 durable proof。权限审计旁路与授权判断/发布完成不是同一状态；审计消息/消费完成不能代替 projection proof。
 
-**结论**：RuleSet/permission-rule source ownership gap 也必须在审计中可追踪到来源和聚合，但当前审计消息完成不等于 projection READY。
+**结论**：授权变更、SoD 拒绝或证据不足须沿对应稳定 operation/message/source identity 可关联；真实审计传输、恢复与部署验收需另取证，本文不声称已通过。
 
-## 9. 目标决策（2026-08-22，非当前实现）
+## 9. 历史目标决策（2026-08-22；冲突部分已由 CURRENT V6 取代）
+
+> 本节保留原始决策记录，不是当前路线、API 或实现说明。旧 staged evaluator、L1/L2/L2.5、snapshot CAS/head、realtime/raw-source 和 marker/capability 相关内容仅用于历史追溯；CURRENT V6 事实见 §2–§8 与规范 §15.7–§15.8。
 
 ### 9.1 决策：保持 staged first-match
 
@@ -270,18 +224,19 @@ OVERLAY refs（按稳定 ref 顺序逐个 first-match）
 
 **目标决策**：未来为每个 source type 建立显式 owner 矩阵，至少记录：source table、写入 owner、投影 aggregate、snapshot target、读侧阶段、撤销/fence 语义、审计事件和补偿入口。此项用于解决 §7.5 ownership gap，当前各局部路径的 source_type 字段不能被视为该矩阵已经存在。
 
-### 9.5 决策：L2 错误在 L2.5 前 fail-closed
+### 9.5 历史决策：L2 错误在 L2.5 前 fail-closed
 
-**当前实现**：L2 repository error 已在进入 L2.5 delegation 前 fail-closed，返回 `DEPENDENCY_UNAVAILABLE`；只有 L2 明确 `NoMatch` 才允许继续读取 L2.5。L2.5 使用受 CARD gate 与 snapshot provenance 保护的 `load_projected_delegated_rules`，raw/source reader 只供 realtime/一致性巡检，不是正式授权 fallback。组合故障下仍需持续验证断路器计数、审计 reason_code 与回滚策略。
+原始决策记录：旧 L2 repository error 在进入 L2.5 delegation 前 fail-closed，只有明确 NoMatch 才能继续旧阶段。此旧行为不构成当前 evaluator implementation；CURRENT V6 不存在这些阶段。
 
-### 9.6 决策：L1/L2/L2.5 为阶段标签、ALLOW-only 账本（2026-08-26，切片已入库；strict gate 已接线代码层、正式切流验收未完成）
+### 9.6 历史决策：L1/L2/L2.5 阶段标签与 ALLOW-only 账本（2026-08-26）
 
-**目标决策**：L1/L2/L2.5 继续作为三类授权来源（共享规则集 BASE/OVERLAY、卡级规则、委托）的阶段标签，不是互相回退链；任一层的读取失败/未证明状态只能 PENDING/DENY，不得转化为下一层的放行输入。新授权账本持久化 ALLOW-only grant（`GrantEffect` 只接受 ALLOW，普通 DENY 不持久化，撤销走 tombstone/fence），并把 BASE/OVERLAY 作为 RULE_SET 贡献的源标签（`BindingLayer`，DELEGATION 恒 None）。读侧现状：生产 `SqlxRuleRepository` 以 capability marker `requires_published_card_evidence() == true` 声明正式授权走 published evidence，`PolicyEngine::evaluate()` 在 marker 为真时以 ALLOW-only 匹配器消费账本 `effective_grants`（证据：[`repository.rs`](../../../astral-db/src/repository.rs#L342-L351)、[`engine.rs`](../../../policy-engine/src/engine.rs#L933-L960)），当前由 typed 测试覆盖。尚未完成：既有数据 backfill/rehearsal、缓存/摘要读侧迁移、真实 MySQL 集成验收与正式切流验收，均不得写成已完成或宣称生产验收；direct/approval/delegation/rule-set 贡献已由 `grant_ledger_adapter` 接线进入新账本（projector 按 aggregate 消费），其真实集成与切流验收包含在上述待办内。
+本条保留 2026-08-26 对 ALLOW-only grant、tombstone/fence 与 BASE/OVERLAY provenance 的历史设计记录；其中把 L1/L2/L2.5 作为当前或 compatibility 阶段，以及 capability marker dispatch、旧 reader/cache migration 状态等描述，均已由 CURRENT V6 取代。当前 grant/source schema、four-port strict reader、WorkerOwned receipt 与 V6 wire/edition 只以 §2–§8 和规范 §15.7–§15.8 为准。历史文本所提 MySQL/backfill/deployment/integration 状态不得推断为已验收或当前待办结论。
 
-## 10. 文档验收要点
+## 10. CURRENT V6 文档边界核对
 
-- **事实/缺口/目标决策分离**：staged first-match、CARD/RULE_SET generation gate、Arbiter 定位和 L2 error fail-closed 均有源码证据；未实施项保持未来时态。
-- **RuleSet 语义完整**：OVERLAY/BASE 跨层顺序、层内 ref first-match、单 ref exact/forward/reverse/alias、winner 编译和 entry_id tie-break 均有说明。
-- **两类快照分离**：`permission_rule_snapshot` 与 `rule_set_snapshot` 的 source、owner、消费者、版本和 gate 差异明确。
-- **剩余边界完整**：snapshot validity migration、RuleSet worker 尚未写入 winner validity、无 wall-clock expiry scheduler/event、CARD 同 effect tie-break、source-type ownership 和组合部署验收均明确标记。
-- **安全约束**：本文不含绝对文件 URI、服务器 IP、密码、Token 或密钥；源码引用使用仓库相对链接。
+- **当前/历史区分**：CURRENT V6 formal chain、four required ports、WorkerOwned receipts 和 V6 published gate 位于 §2–§8；旧 evaluator/staged/snapshot 词汇显式标为历史。
+- **时间边界**：strict reader、matcher 与 bounded L1 对 grant validity window 执行读时/命中时判定；自然时间窗到期不产生 source mutation、delta 或 publication-generation advance。
+- **RuleSet source/compiler 区分**：完整 source/read view 与 BASE/OVERLAY provenance 不被写成旧 L1 阶段或旧 snapshot runtime reader；字段与公开合同引用规范 §15.7。
+- **SoD**：mandatory early published-only validator 与 source-transaction unconditional recheck 分开说明；明确真实 MySQL 并发/锁序未执行验收。
+- **迁移/运行边界**：历史 snapshot/migration 不证明 DROP、backfill、rehearsal、部署或运行时验收；真实 MySQL/MQ 与切流状态必须独立取证。
+- **安全与链接**：不含绝对文件 URI、服务器 IP、密码、Token 或密钥；新增源码/规范引用使用仓库相对链接。

@@ -31,7 +31,7 @@ const MAX_TRACKED_TARGETS: usize = 4096;
 
 /// 进程内失败尝试计数器（key = `{target}|{purpose}` → 失败时间戳队列）。
 /// 跨副本不做强一致（与验证码 TTL 相比窗口极短），单副本即可阻断在线穷举；
-/// Redis 分发由全局 rate_limit 中间件负责（本服务未接线，属已知差异）。
+/// 跨副本分发由全局 rate_limit 中间件负责（本服务未接线，属已知差异）。
 static VERIFY_FAILURES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Vec<time::OffsetDateTime>>>,
 > = std::sync::OnceLock::new();

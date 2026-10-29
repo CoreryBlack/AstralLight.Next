@@ -17,13 +17,13 @@ use astral_common::config::{AppConfig, JwtValidationRole};
 use astral_common::error::global_exception_handler;
 use astral_common::middleware::gateway_signature::gateway_signature_middleware;
 use astral_common::service::{register_mq_producer, AuditLogEvent, MqProducerRef};
-use astral_db::connect_and_validate_schema_with_pool_options;
 use astral_db::org_scope_repository::{
     list_org_scope_managed_tenant_ids, missing_org_scope_tenant_allowlist_entries,
     validate_org_scope_schema_prerequisites, SqlxOrgScopeRepository,
 };
 use astral_db::probe_org_scope_gate;
 use astral_db::OrgScopeGateState;
+use astral_db::{connect_and_validate_schema_with_pool_options, validate_projection_owned_schema};
 use astral_types::ResourceRegistry;
 
 use crate::api;
@@ -94,8 +94,7 @@ use crate::service::projection_worker::{
     shutdown_projection_worker, spawn_worker, ProjectionWorkerHandle,
 };
 use crate::service::rule_set_write_service::RuleSetWriteService;
-use crate::service::rule_write_service::RuleWriteService;
-use crate::service::side_effect::SqlxPermissionSideEffects;
+use crate::service::rule_write_service::{RuleWriteService, SqlxGrantSodValidator};
 use crate::service::template_service::TemplateService;
 use crate::service::tenant_service::TenantService;
 use crate::service::user_card_service::UserCardService;
@@ -163,11 +162,6 @@ impl MqProducerRef for TrustGraphMqProducer {
     async fn publish_audit_log(&self, event: AuditLogEvent) -> Result<(), String> {
         self.inner
             .publish_audit_log(astral_mq::producer::AuditLogPayload {
-                // message_id 必须唯一：audit consumer 以它为 mq_idempotent_log 幂等键，
-                // 恒 None 会回退到 (user,event,action,resource,request) 派生键——permission
-                // 审计 request_id 恒 None，相同 user+resource+action 的重复判定会被
-                // INSERT IGNORE 丢弃，真实审计行静默丢失。
-                message_id: Some(uuid::Uuid::new_v4().to_string()),
                 user_id: event.user_id,
                 card_id: event.card_id,
                 action: event.action,
@@ -197,8 +191,6 @@ impl MqProducerRef for TrustGraphMqProducer {
     ) -> Result<(), String> {
         self.inner
             .publish_login_event(astral_mq::producer::LoginEventPayload {
-                // 与审计一致：UUID 幂等键，防 DLX 重投重复登录审计行
-                message_id: Some(uuid::Uuid::new_v4().to_string()),
                 user_id,
                 card_id: None,
                 login_type: login_type.to_string(),
@@ -266,20 +258,6 @@ where
         "application",
         JwtValidationRole::Gateway,
     )?);
-    // Redis 编译层退役收口（redis-layer-retirement-20261002）：宿主能力门 +
-    // 已校验旗标一次性冻结。astral-common 的零依赖 marker 会被 workspace
-    // feature 统一放大——任何其他 crate 打开 redis-compat 都会让集中校验的
-    // cfg 通过，即便本宿主并未编译自己的 compat adapter（历史上只留下 warn
-    // log 静默跳过）。能力断言以**本 crate** 的 cfg! 为准（TrustGraph 自身
-    // redis-compat 仅覆盖 delete_redis_keys eviction 兼容路径）：旗标开启但
-    // 未编译时，在任何 DB 连接 / worker / 服务装配之前显式拒绝启动
-    // （fail-closed，非 log-only）；随后把已校验旗标冻结进进程级共享源
-    // （first-wins、同值幂等、异值冲突拒绝），同进程读取方统一取值。
-    config
-        .validate_redis_adapter_support(cfg!(feature = "redis-compat"))
-        .map_err(anyhow::Error::msg)?;
-    astral_common::config::install_redis_projection_compat(config.redis_projection_compat_enabled)
-        .map_err(anyhow::Error::msg)?;
     crate::repository::invalidation_repository::install_origin_region(config.region_id.clone())
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     // ORG_SCOPE 部署旗标：由 AppConfig 在启动期经 astral-common 共享严格解析器
@@ -419,6 +397,9 @@ where
             .map_err(anyhow::Error::msg)?,
     )
     .await?;
+    validate_projection_owned_schema(&db)
+        .await
+        .map_err(anyhow::Error::msg)?;
     let registry_rows = SqlxResourceTypeRepository::new(db.clone())
         .list_registry()
         .await?;
@@ -546,49 +527,39 @@ where
     let dlq_quarantine_db = db.clone();
 
     // 第二批：规则/规则集/委托 repository + service 装配（副作用执行器共享连接池）
-    let side_effects = Arc::new(SqlxPermissionSideEffects::new(db.clone()));
     let rule_repository = Arc::new(SqlxRuleRepository::new(db.clone()));
     let rule_set_repository = Arc::new(SqlxRuleSetRepository::new(db.clone()));
     let delegation_repository = Arc::new(SqlxDelegationRepository::new(db.clone()));
     let admin_group_repository: Arc<
         dyn crate::repository::admin_group_repository::AdminGroupRepository,
     > = Arc::new(SqlxAdminGroupRepository::new(db.clone()));
-    let rule_write_service = Arc::new(
-        RuleWriteService::new(rule_repository.clone(), side_effects.clone())
-            .with_sod_db(db.clone()),
-    );
+    let grant_sod_validator = Arc::new(SqlxGrantSodValidator::new(db.clone()));
+    let rule_write_service = Arc::new(RuleWriteService::new(
+        rule_repository.clone(),
+        grant_sod_validator.clone(),
+    ));
     let rule_set_write_service = Arc::new(RuleSetWriteService::new(rule_set_repository.clone()));
     let delegation_service = Arc::new(DelegationWriteService::new(delegation_repository.clone()));
 
     // 第五批：审批/模板 repository + service 装配
     let permission_request_repository = Arc::new(SqlxPermissionRequestRepository::new(db.clone()));
     let template_repository = Arc::new(SqlxTemplateRepository::new(db.clone()));
-    let approval_service = Arc::new(ApprovalService::new(
-        permission_request_repository.clone(),
-        side_effects.clone(),
-    ));
+    let approval_service = Arc::new(ApprovalService::new(permission_request_repository.clone()));
     let template_service = Arc::new(TemplateService::new(template_repository.clone()));
     let level_template_repository = Arc::new(SqlxLevelTemplateRepository::new(db.clone()));
     let user_card_repository = Arc::new(SqlxUserCardRepository::new(db.clone()));
-    let level_template_service = Arc::new(LevelTemplateService::new(
-        level_template_repository.clone(),
-        side_effects.clone(),
+    let level_template_service =
+        Arc::new(LevelTemplateService::new(level_template_repository.clone()));
+    let user_card_service = Arc::new(UserCardService::new(user_card_repository.clone()));
+    let personal_permission_service = Arc::new(PersonalPermissionService::new(
+        rule_repository.clone(),
+        grant_sod_validator,
     ));
-    let user_card_service = Arc::new(UserCardService::new(
-        user_card_repository.clone(),
-        side_effects.clone(),
-    ));
-    let personal_permission_service = Arc::new(
-        PersonalPermissionService::new(rule_repository.clone(), side_effects.clone())
-            .with_sod_db(db.clone()),
-    );
 
     // 第六批：租户 repository + service 装配
     let tenant_repository = Arc::new(SqlxTenantRepository::new(db.clone()));
     let tenant_service = Arc::new(TenantService::new(tenant_repository.clone()));
 
-    // 执剑人运行侧服务（阶段 B：冲突信号统计 + 跨节点证据仲裁）
-    let arbiter_service = Arc::new(crate::service::arbiter::ArbiterService::new());
     let audit_replay_producer = AuditReplayProducerSlot::new();
 
     // 内部测试控制面（S1-S15 分布式授权实验）：默认关闭。仅当
@@ -645,16 +616,11 @@ where
         personal_permission_service,
         tenant_repository,
         tenant_service,
-        arbiter_service,
         audit_replay_producer: audit_replay_producer.clone(),
         test_control: test_control.clone(),
         org_scope_enabled,
         org_scope_tenant_allowlist,
     };
-
-    // 执剑人哨兵挂接：TrustGraph 进程内的 evaluate() 冲突信号计入 arbiter 统计
-    // （阶段 B；仲裁执行由控制面 POST /arbiter/arbitrate 触发，DEFER 必须 fail-closed）。
-    state.arbiter_service.register_sink();
 
     // 启动期注册校验（对齐 Java @PostConstruct 校验）
     astral_common::middleware::permission_check_shared::validate_path_map(
@@ -899,8 +865,7 @@ where
     //  backoff）；每次尝试持有 owned 连接，失败/放弃必须 close（未知连接结果
     //  绝不留活连接）；成功后连接由 RabbitMqRuntime 持有到本函数作用域结束
     //  （RAII 覆盖 bind 失败/启动失败回滚/正常关闭），keepalive 任务被所有权
-    //  取代。幂等后端为 durable DB store（Redis compat 保持 default-off，本
-    //  runtime 不选择加入）。Audit/DLQ 消费语义保持不变。
+    //  取代。幂等后端使用 durable DB store；Audit/DLQ 消费语义保持不变。
     // - 失效 fanout runtime（旗标开启时）在两个分支各自装配恰好一次；启动
     //  失败按启动逆序回滚已启动 worker 后拒绝启动。
     let (local_stop_tx, local_stop_rx) = tokio::sync::watch::channel(false);
@@ -1114,8 +1079,6 @@ where
         .merge(api::platform_packages::platform_package_routes())
         .merge(api::departments::department_routes())
         .merge(api::personal_permissions::personal_permission_routes())
-        .merge(api::consistency_monitor::consistency_monitor_routes())
-        .merge(api::arbiter::arbiter_routes())
         .merge(api::inheritance::inheritance_routes())
         .merge(api::cross_org_grants::cross_org_grant_routes())
         // DomainControl 拆分后的 7 个独立模块
@@ -1252,10 +1215,10 @@ where
             if let Err(join_failure) = projection_worker_report.summary {
                 tracing::error!(
                     reason = %join_failure,
-                    "legacy projection worker did not stop cleanly during bind-failure shutdown"
+                    "source-correlation worker did not stop cleanly during bind-failure shutdown"
                 );
                 return Err(anyhow::anyhow!(
-                    "legacy projection worker shutdown failed after bind error: {join_failure}"
+                    "source-correlation worker shutdown failed after bind error: {join_failure}"
                 ));
             }
             return Err(error.into());
@@ -1560,7 +1523,7 @@ where
         .map_err(|failure| anyhow::anyhow!("authorization projector shutdown failed: {failure}"))?;
     if let Err(projection_worker_failure) = projection_worker_report.summary {
         return Err(anyhow::anyhow!(
-            "legacy projection worker shutdown failed: {projection_worker_failure}"
+            "source-correlation worker shutdown failed: {projection_worker_failure}"
         ));
     }
     server_result?;
@@ -1719,11 +1682,11 @@ async fn rollback_started_workers_after_org_scope_failure(
     if let Err(failure) = projection_worker_report.summary {
         tracing::error!(
             reason = %failure,
-            "legacy projection worker did not stop cleanly after \
+            "source-correlation worker did not stop cleanly after \
              org scope projector startup failure"
         );
         return Some(format!(
-            "legacy projection worker shutdown failed after org scope projector \
+            "source-correlation worker shutdown failed after org scope projector \
              startup failure: {failure}"
         ));
     }
@@ -1862,8 +1825,7 @@ async fn init_mq_consumers(
     quarantine_db: &sqlx::MySqlPool,
     audit_replay_producer: AuditReplayProducerSlot,
 ) -> Result<lapin::Channel, Box<dyn std::error::Error>> {
-    // 幂等后端切换（Redis-free final review 决议）：durable DB store 是默认且
-    // 唯一要求；Redis compat 保持 default-off，本 runtime 不选择加入。
+    // The durable DB store is the sole MQ idempotency backend.
     astral_mq::consumer::init_idempotency_db(quarantine_db.clone()).await?;
     // 1. 声明通道并启用 publisher confirms
     let channel = conn.create_channel().await?;
@@ -2225,8 +2187,6 @@ mod tests {
             "platform_packages::platform_package_routes",
             "departments::department_routes",
             "personal_permissions::personal_permission_routes",
-            "consistency_monitor::consistency_monitor_routes",
-            "arbiter::arbiter_routes",
             "inheritance::inheritance_routes",
             "cross_org_grants::cross_org_grant_routes",
             "domains::domain_routes",
@@ -2377,7 +2337,7 @@ mod tests {
             .expect("DB connect must remain on the startup path");
         let first_worker = source
             .find("let projection_worker: ProjectionWorkerHandle")
-            .expect("legacy projection worker startup must remain");
+            .expect("source-correlation worker startup must remain");
         assert!(config_gate < db_connect && db_connect < first_worker);
         let flag_off = source[config_gate..]
             .find("} else {\n        None\n    };")
@@ -2532,7 +2492,7 @@ mod tests {
             .expect("rollback must stop the authorization projector third");
         let rollback_projection_worker = rollback_body
             .find("shutdown_projection_worker(")
-            .expect("rollback must stop the legacy projection worker last");
+            .expect("rollback must stop the source-correlation worker last");
         assert!(
             rollback_delegation < rollback_archive
                 && rollback_archive < rollback_projector

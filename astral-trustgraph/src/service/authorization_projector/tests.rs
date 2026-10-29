@@ -17,7 +17,7 @@ use astral_db::{
     decode_ledger_row, hot_state_from_entries, AuthorizationCurrentPointerRecord,
     AuthorizationImpactItemType, AuthorizationProjectionError, ClaimedDeltaEvent, DeltaEventClaim,
     DeltaEventClaimScope, DeltaLeaseIdentity, DeltaProjectorPublishCommand,
-    DeltaProjectorPublishOutcome, GrantLedgerEntry, ParentReferenceView, PartitionLeaseHandle,
+    DeltaProjectorPublishOutcome, GrantLedgerEntry, ParentReferenceView,
     PartitionedGrantLedgerAtFrontier, ProjectionAggregateIdentity, PublishedAggregateFrontier,
     RawLedgerRow, Sha256Digest, StagedSegmentContent, MAX_BACKOFF_SECONDS, MAX_DELTA_LEASE_SECONDS,
     SEGMENT_COMPILER_STAMP_DIVERGENCE_CODE,
@@ -37,14 +37,12 @@ const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 type PartitionJournal = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
 /// Minimal partition-mode runtime: claims always return `None`, so the
-/// per-event processing path stays unreachable; the contracts under test
-/// are discovery fairness, lease exclusivity (Busy), lost-lease abort, and
-/// release discipline.
+/// per-event processing path stays unreachable; the contracts under test are
+/// tenant-scoped discovery ordering, transient discovery retry, and routing
+/// each candidate through the WorkerOwned partition-claim port.
 struct PartitionSchedulingFake {
     journal: PartitionJournal,
     partitions: Vec<ProjectionAggregateIdentity>,
-    busy: Vec<(i64, String, i64)>,
-    lose_renewal_on: Vec<i64>,
     fail_first_discovery: bool,
     discovery_calls: std::sync::atomic::AtomicUsize,
 }
@@ -105,16 +103,20 @@ impl AuthorizationProjectorRuntime for PartitionSchedulingFake {
         unreachable!("no event is ever claimed by the partition scheduling fake")
     }
 
-    async fn fail_event(
+    async fn owned_fail_transition(
         &self,
         _identity: &DeltaLeaseIdentity,
         _backoff_seconds: i64,
         _message: &str,
-    ) {
+        _count_failure: bool,
+    ) -> OwnedTransitionProof {
         unreachable!("no event is ever claimed by the partition scheduling fake")
     }
 
-    async fn release_event(&self, _identity: &DeltaLeaseIdentity) {
+    async fn owned_release_transition(
+        &self,
+        _identity: &DeltaLeaseIdentity,
+    ) -> OwnedTransitionProof {
         unreachable!("no event is ever claimed by the partition scheduling fake")
     }
 
@@ -144,68 +146,6 @@ impl AuthorizationProjectorRuntime for PartitionSchedulingFake {
             )));
         }
         Ok(self.partitions.clone())
-    }
-
-    async fn acquire_partition_lease(
-        &self,
-        identity: &ProjectionAggregateIdentity,
-        lease_owner: &str,
-        _lease_seconds: i64,
-    ) -> Result<Option<PartitionLeaseHandle>, RuntimeAccessError> {
-        let key = Self::key(
-            identity.tenant_id,
-            &identity.aggregate_type,
-            identity.aggregate_id,
-        );
-        if self.busy.iter().any(|(tenant, kind, id)| {
-            *tenant == identity.tenant_id
-                && kind == &identity.aggregate_type
-                && *id == identity.aggregate_id
-        }) {
-            self.note(format!("busy:{key}"));
-            return Ok(None);
-        }
-        self.note(format!("acquire:{key}"));
-        Ok(Some(PartitionLeaseHandle {
-            identity: identity.clone(),
-            lease_owner: lease_owner.to_owned(),
-            token: astral_db::DeltaLeaseToken::new_run_scoped(),
-        }))
-    }
-
-    async fn renew_partition_lease(
-        &self,
-        handle: &PartitionLeaseHandle,
-        _lease_seconds: i64,
-    ) -> Result<(), RuntimeAccessError> {
-        let key = Self::key(
-            handle.identity.tenant_id,
-            &handle.identity.aggregate_type,
-            handle.identity.aggregate_id,
-        );
-        if self.lose_renewal_on.contains(&handle.identity.aggregate_id) {
-            self.note(format!("renew_lost:{key}"));
-            return Err(RuntimeAccessError::Repository(RepositoryRejection::Other(
-                "code=test.partition_lease_lost".to_owned(),
-            )));
-        }
-        self.note(format!("renew:{key}"));
-        Ok(())
-    }
-
-    async fn release_partition_lease(
-        &self,
-        handle: &PartitionLeaseHandle,
-    ) -> Result<(), RuntimeAccessError> {
-        self.note(format!(
-            "release:{}",
-            Self::key(
-                handle.identity.tenant_id,
-                &handle.identity.aggregate_type,
-                handle.identity.aggregate_id,
-            )
-        ));
-        Ok(())
     }
 
     async fn claim_next_event_in_partition(
@@ -267,74 +207,47 @@ fn partition_identity(id: i64) -> ProjectionAggregateIdentity {
 }
 
 #[tokio::test]
-async fn partition_worker_drains_discovered_partitions_in_order_and_releases() {
+async fn partition_worker_claims_discovered_partitions_in_order_without_extra_lease() {
     let fake = std::sync::Arc::new(PartitionSchedulingFake {
         journal: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         partitions: vec![partition_identity(1), partition_identity(2)],
-        busy: Vec::new(),
-        lose_renewal_on: Vec::new(),
         fail_first_discovery: false,
         discovery_calls: std::sync::atomic::AtomicUsize::new(0),
     });
-    run_partition_worker_until(fake.clone(), "release:1:CARD:2", partition_config()).await;
+    run_partition_worker_until(fake.clone(), "claim:1:CARD:2", partition_config()).await;
     let journal = fake.journal();
-    // 公平序：发现 → 按 oldest_due 序逐分区 acquire/renew/claim(None)/release。
     let expected_prefix = [
         "discover".to_owned(),
-        "acquire:1:CARD:1".to_owned(),
-        "renew:1:CARD:1".to_owned(),
         "claim:1:CARD:1".to_owned(),
-        "release:1:CARD:1".to_owned(),
-        "acquire:1:CARD:2".to_owned(),
-        "renew:1:CARD:2".to_owned(),
         "claim:1:CARD:2".to_owned(),
-        "release:1:CARD:2".to_owned(),
     ];
     assert!(
         journal.len() >= expected_prefix.len(),
         "journal too short: {journal:?}"
     );
     assert_eq!(journal[..expected_prefix.len()], expected_prefix[..]);
+    assert!(
+        journal.iter().all(|entry| {
+            !entry.starts_with("acquire:")
+                && !entry.starts_with("renew:")
+                && !entry.starts_with("release:")
+        }),
+        "topology must not add a second ownership protocol: {journal:?}"
+    );
 }
 
 #[tokio::test]
-async fn partition_worker_skips_busy_partitions_without_waiting() {
+async fn partition_worker_routes_candidates_to_owned_claim_decision() {
     let fake = std::sync::Arc::new(PartitionSchedulingFake {
         journal: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         partitions: vec![partition_identity(1), partition_identity(2)],
-        busy: vec![(1, "CARD".to_owned(), 1)],
-        lose_renewal_on: Vec::new(),
         fail_first_discovery: false,
         discovery_calls: std::sync::atomic::AtomicUsize::new(0),
     });
-    run_partition_worker_until(fake.clone(), "release:1:CARD:2", partition_config()).await;
+    run_partition_worker_until(fake.clone(), "claim:1:CARD:2", partition_config()).await;
     let journal = fake.journal();
-    assert!(journal.contains(&"busy:1:CARD:1".to_owned()));
-    // Busy 分区绝不 renew/claim/release：拿不到租约就跳过，绝不等待。
-    assert!(!journal.iter().any(|entry| entry.contains("renew:1:CARD:1")));
-    assert!(!journal.iter().any(|entry| entry.contains("claim:1:CARD:1")));
-    assert!(!journal
-        .iter()
-        .any(|entry| entry.contains("release:1:CARD:1")));
-    assert!(journal.contains(&"release:1:CARD:2".to_owned()));
-}
-
-#[tokio::test]
-async fn partition_worker_stops_touching_a_partition_when_the_lease_is_lost() {
-    let fake = std::sync::Arc::new(PartitionSchedulingFake {
-        journal: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-        partitions: vec![partition_identity(1)],
-        busy: Vec::new(),
-        lose_renewal_on: vec![1],
-        fail_first_discovery: false,
-        discovery_calls: std::sync::atomic::AtomicUsize::new(0),
-    });
-    run_partition_worker_until(fake.clone(), "release:1:CARD:1", partition_config()).await;
-    let journal = fake.journal();
-    // 续租失败 = 分区已被接管：立即弃置（release 仍尽力执行），绝不 claim。
-    assert!(journal.contains(&"renew_lost:1:CARD:1".to_owned()));
-    assert!(journal.contains(&"release:1:CARD:1".to_owned()));
-    assert!(!journal.iter().any(|entry| entry.contains("claim:1:CARD:1")));
+    assert!(journal.contains(&"claim:1:CARD:1".to_owned()));
+    assert!(journal.contains(&"claim:1:CARD:2".to_owned()));
 }
 
 #[tokio::test]
@@ -342,12 +255,10 @@ async fn partition_worker_survives_transient_discovery_failures() {
     let fake = std::sync::Arc::new(PartitionSchedulingFake {
         journal: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         partitions: vec![partition_identity(1)],
-        busy: Vec::new(),
-        lose_renewal_on: Vec::new(),
         fail_first_discovery: true,
         discovery_calls: std::sync::atomic::AtomicUsize::new(0),
     });
-    run_partition_worker_until(fake.clone(), "acquire:1:CARD:1", partition_config()).await;
+    run_partition_worker_until(fake.clone(), "claim:1:CARD:1", partition_config()).await;
     let journal = fake.journal();
     // 瞬态失败：第一轮 discovery 失败只跳过本轮，第二轮照常调度。
     let discovers = journal
@@ -358,7 +269,7 @@ async fn partition_worker_survives_transient_discovery_failures() {
         discovers >= 2,
         "expected a retried discovery round: {journal:?}"
     );
-    assert!(journal.contains(&"acquire:1:CARD:1".to_owned()));
+    assert!(journal.contains(&"claim:1:CARD:1".to_owned()));
 }
 
 #[test]
@@ -1336,21 +1247,36 @@ fn worker_source_has_no_legacy_channel_symbols() {
     assert!(config_source.contains("fn parse_projector_tenants("));
     assert!(planning_source.contains("partition_ledger_at_published_frontier("));
 
+    let local_worker_source = include_str!("../local_projection_worker.rs");
+    let sync_publish_source = include_str!("../sync_publish.rs");
     for (name, source) in [
         ("authorization_projector.rs", production.as_str()),
         ("config.rs", config_source),
         ("runtime.rs", runtime_source),
         ("worker.rs", worker_source),
+        ("local_projection_worker.rs", local_worker_source),
+        ("sync_publish.rs", sync_publish_source),
         ("planning.rs", planning_source),
         ("parent_ordinals.rs", ordinal_source.as_str()),
         ("digest_hints.rs", digest_hint_source.as_str()),
     ] {
         assert_no_legacy_channel_symbols(source, name);
     }
-    // The fixed publish sequence helper IS required (runtime seam)。
-    assert!(runtime_source.contains("project_authorization_delta_in_tx"));
-    assert!(runtime_source.contains("load_claimed_delta_event_for_update_in_tx"));
-    assert!(runtime_source.contains("claim_next_delta_event_in_tx"));
+    // V6 has one owned publish/read/claim protocol; physical legacy APIs are
+    // not present in the production runtime adapter.
+    assert!(runtime_source.contains("project_owned_authorization_delta_in_tx"));
+    assert!(runtime_source.contains("load_owned_claimed_delta_event"));
+    assert!(runtime_source.contains("claim_next_owned_delta_event"));
+    assert!(runtime_source.contains("claim_next_owned_delta_event_in_partition"));
+    assert!(runtime_source.contains("claim_owned_delta_event_by_stable_event"));
+    assert!(!runtime_source.contains("project_authorization_delta_in_tx"));
+    assert!(!runtime_source.contains("claim_next_delta_event_in_tx"));
+    assert!(!local_worker_source.contains("claim_delta_event_by_stable_event_in_tx"));
+    assert!(!local_worker_source.contains("resolve_claim_commit"));
+    assert!(!local_worker_source.contains("worker_owned_execution"));
+    assert!(!worker_source.contains("worker_owned_execution"));
+    assert!(!worker_source.contains("acquire_partition_lease"));
+    assert!(!worker_source.contains("release_partition_lease"));
 
     // Slice-2 wiring must stay present: one-transaction publication
     // context, strict frontier loader, parent reference loader, multi-
@@ -1360,7 +1286,7 @@ fn worker_source_has_no_legacy_channel_symbols() {
     assert!(runtime_source.contains("load_published_parent_reference_views_in_tx"));
     assert!(planning_source.contains("partition_ledger_at_published_frontier("));
     assert!(runtime_source.contains("async fn mark_event_quarantined("));
-    assert!(runtime_source.contains("mark_delta_event_quarantined("));
+    assert!(runtime_source.contains("quarantine_owned_delta_event("));
     assert!(worker_source.contains("fn quarantine_reason_parts("));
     // Segment reuse is driven by observed parent references (never hard
     // coded None in the production decide path).
@@ -1384,9 +1310,9 @@ fn watchdog_probe_carries_the_claim_sibling_order_gate() {
     // equality claim is byte-exact (a raw-source scan would compare a
     // compiled value against un-collapsed source text and be meaningless).
     assert!(
-        WATCHDOG_CLAIMABLE_PROBE_SQL.contains(astral_db::DELTA_CLAIM_SIBLING_ORDER_GATE),
+        WATCHDOG_CLAIMABLE_PROBE_SQL.contains(astral_db::OWNED_DELTA_CLAIM_SIBLING_ORDER_GATE),
         "watchdog probe must embed the claim sibling-ordering gate \
-             byte-equal to astral_db::DELTA_CLAIM_SIBLING_ORDER_GATE"
+             byte-equal to astral_db::OWNED_DELTA_CLAIM_SIBLING_ORDER_GATE"
     );
     // The probe stays tenant-scoped and never widens to a cross-tenant
     // backlog signal.
@@ -1477,14 +1403,21 @@ async fn shutdown_times_out_when_worker_refuses_to_stop() {
         ) -> Result<DeltaProjectorPublishOutcome, RuntimeAccessError> {
             unreachable!()
         }
-        async fn fail_event(
+        async fn owned_fail_transition(
             &self,
             _identity: &DeltaLeaseIdentity,
             _backoff_seconds: i64,
             _message: &str,
-        ) {
+            _count_failure: bool,
+        ) -> OwnedTransitionProof {
+            OwnedTransitionProof::Unknown
         }
-        async fn release_event(&self, _identity: &DeltaLeaseIdentity) {}
+        async fn owned_release_transition(
+            &self,
+            _identity: &DeltaLeaseIdentity,
+        ) -> OwnedTransitionProof {
+            OwnedTransitionProof::Unknown
+        }
         async fn mark_event_quarantined(
             &self,
             _lease: &DeltaLeaseIdentity,
@@ -1563,14 +1496,21 @@ async fn worker_stops_cleanly_on_cancellation_between_claims() {
         ) -> Result<DeltaProjectorPublishOutcome, RuntimeAccessError> {
             unreachable!()
         }
-        async fn fail_event(
+        async fn owned_fail_transition(
             &self,
             _identity: &DeltaLeaseIdentity,
             _backoff_seconds: i64,
             _message: &str,
-        ) {
+            _count_failure: bool,
+        ) -> OwnedTransitionProof {
+            OwnedTransitionProof::Unknown
         }
-        async fn release_event(&self, _identity: &DeltaLeaseIdentity) {}
+        async fn owned_release_transition(
+            &self,
+            _identity: &DeltaLeaseIdentity,
+        ) -> OwnedTransitionProof {
+            OwnedTransitionProof::Unknown
+        }
         async fn mark_event_quarantined(
             &self,
             _lease: &DeltaLeaseIdentity,
@@ -2826,27 +2766,32 @@ fn decide_quarantines_dependency_drift_and_unsupported_compilers() {
         other => panic!("expected quarantine on hash drift, got {other:?}"),
     }
 
-    // Unknown producer compiler version refuses before any compilation.
-    // Row and claim stay MUTUALLY consistent so only the kernel gate fires.
-    let mut foreign_compiler = claimed_event(&own, &delta, 5, 1, "evt-cv", "op-cv", &dep_hash);
-    foreign_compiler.compiler_version = "rogue-compiler-v0".to_owned();
-    let mut rogue_row = raw_row(&own, "evt-cv", "op-cv", 1);
-    rogue_row.compiler_version = "rogue-compiler-v0".to_owned();
-    let compiler_rows = vec![rogue_row];
-    let compiler_input = EventDecisionInput {
-        claimed: &foreign_compiler,
-        publication: None,
-        ledger_rows: &compiler_rows,
-        identity: ProjectionAggregateIdentity::new(7, "CARD", 17).unwrap(),
-    };
-    match decide_event_disposition(&compiler_input) {
-        EventDisposition::Quarantine { reason } => {
-            assert!(
-                reason.contains("unsupported_producer_compiler"),
-                "unexpected quarantine reason: {reason}"
-            );
+    for compiler in [
+        "astral-authorization-v5",
+        "astral-authorization-v7",
+        "foreign-v6",
+    ] {
+        let mut foreign_compiler = claimed_event(&own, &delta, 5, 1, "evt-cv", "op-cv", &dep_hash);
+        foreign_compiler.compiler_version = compiler.to_owned();
+        let mut rogue_row = raw_row(&own, "evt-cv", "op-cv", 1);
+        rogue_row.compiler_version = compiler.to_owned();
+        let compiler_rows = vec![rogue_row];
+        let compiler_input = EventDecisionInput {
+            claimed: &foreign_compiler,
+            publication: None,
+            ledger_rows: &compiler_rows,
+            identity: ProjectionAggregateIdentity::new(7, "CARD", 17).unwrap(),
+        };
+        match decide_event_disposition(&compiler_input) {
+            EventDisposition::Quarantine { reason } => {
+                assert!(
+                    reason.starts_with("code=auth_projector.own_revision_unreadable;")
+                        && reason.contains("code=grant_repository.non_current_ledger_compiler"),
+                    "unexpected quarantine reason for {compiler}: {reason}"
+                );
+            }
+            other => panic!("expected quarantine on {compiler}, got {other:?}"),
         }
-        other => panic!("expected quarantine on unknown compiler, got {other:?}"),
     }
 }
 
@@ -2887,13 +2832,19 @@ fn quarantine_reason_parts_keep_stable_code_and_free_detail() {
 /// can be asserted without any database.
 struct QuarantineHarness {
     outcome: Result<(), String>,
+    execution_failures: std::sync::atomic::AtomicU32,
     calls: std::sync::Mutex<Vec<&'static str>>,
 }
 
 impl QuarantineHarness {
     fn new(outcome: Result<(), String>) -> Self {
+        Self::new_with_failures(outcome, 0)
+    }
+
+    fn new_with_failures(outcome: Result<(), String>, execution_failures: u32) -> Self {
         Self {
             outcome,
+            execution_failures: std::sync::atomic::AtomicU32::new(execution_failures),
             calls: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -2905,6 +2856,13 @@ impl QuarantineHarness {
 
 #[async_trait]
 impl AuthorizationProjectorRuntime for QuarantineHarness {
+    fn event_execution_failures(&self, _identity: &DeltaLeaseIdentity) -> Option<u32> {
+        Some(
+            self.execution_failures
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
     async fn claim_next_event(
         &self,
         _scope: &DeltaEventClaimScope,
@@ -2940,17 +2898,23 @@ impl AuthorizationProjectorRuntime for QuarantineHarness {
     ) -> Result<DeltaProjectorPublishOutcome, RuntimeAccessError> {
         unreachable!("harness drives quarantining directly")
     }
-    async fn fail_event(
+    async fn owned_fail_transition(
         &self,
         _identity: &DeltaLeaseIdentity,
         backoff_seconds: i64,
         message: &str,
-    ) {
+        _count_failure: bool,
+    ) -> OwnedTransitionProof {
         self.calls.lock().unwrap().push("fail");
         let _ = (backoff_seconds, message);
+        OwnedTransitionProof::Applied
     }
-    async fn release_event(&self, _identity: &DeltaLeaseIdentity) {
+    async fn owned_release_transition(
+        &self,
+        _identity: &DeltaLeaseIdentity,
+    ) -> OwnedTransitionProof {
         self.calls.lock().unwrap().push("release");
+        OwnedTransitionProof::Applied
     }
     async fn mark_event_quarantined(
         &self,
@@ -2973,10 +2937,10 @@ impl AuthorizationProjectorRuntime for QuarantineHarness {
     }
 }
 
-/// F5 修复 1b：任何处理步骤挂起都必须被 event_deadline 收口——计数、
-/// 尽力释放租约、循环继续，worker 永不永久停在当次事件内。
+/// F5 修复 1b：任何处理步骤挂起都必须被 event_deadline 收口；
+/// WorkerOwned capability 保持不变，未知事件结果由 reconciliation 接手。
 #[tokio::test]
-async fn event_deadline_releases_lease_and_keeps_the_worker_looping() {
+async fn owned_event_deadline_preserves_unknown_and_keeps_worker_looping() {
     use std::sync::Mutex as StdMutex;
     struct HangingReadbackRuntime {
         claims: StdMutex<u32>,
@@ -3026,18 +2990,27 @@ async fn event_deadline_releases_lease_and_keeps_the_worker_looping() {
         ) -> Result<DeltaProjectorPublishOutcome, RuntimeAccessError> {
             unreachable!("readback hangs before this seam")
         }
-        async fn fail_event(
+        fn event_execution_failures(&self, _identity: &DeltaLeaseIdentity) -> Option<u32> {
+            Some(0)
+        }
+        async fn owned_fail_transition(
             &self,
             _identity: &DeltaLeaseIdentity,
             _backoff_seconds: i64,
             _message: &str,
-        ) {
+            _count_failure: bool,
+        ) -> OwnedTransitionProof {
+            OwnedTransitionProof::Unknown
         }
-        async fn release_event(&self, identity: &DeltaLeaseIdentity) {
+        async fn owned_release_transition(
+            &self,
+            identity: &DeltaLeaseIdentity,
+        ) -> OwnedTransitionProof {
             self.released
                 .lock()
                 .unwrap()
                 .push(identity.event_id.clone());
+            OwnedTransitionProof::Applied
         }
         async fn mark_event_quarantined(
             &self,
@@ -3060,7 +3033,7 @@ async fn event_deadline_releases_lease_and_keeps_the_worker_looping() {
         ..Default::default()
     };
     let handle = start_authorization_projector_with_runtime(runtime.clone(), config);
-    // 第一轮循环内完成：claim → readback 挂起 → deadline 触发 → 释放 →
+    // 第一轮循环内完成：claim → readback 挂起 → deadline 触发并保留 capability；
     // 下一次 claim 返回空 → 空闲等待 cancellation。
     tokio::time::sleep(Duration::from_millis(400)).await;
     let report = shutdown_authorization_projector(handle, Duration::from_secs(2)).await;
@@ -3071,8 +3044,8 @@ async fn event_deadline_releases_lease_and_keeps_the_worker_looping() {
         summary.events_deadline_exceeded, 1,
         "a hanging step must be converted into exactly one deadline event"
     );
-    // 批次 B 调研纪律：deadline 超时不得发布任何租约 mutation——不释放，
-    // 由租约过期 reclaim 门接管；因此这里绝不出现 release 记录。
+    // deadline 超时不得发布任何 lease mutation——UNKNOWN 保留给 WorkerOwned
+    // exact claim 对账，不能由测试把简单过期当成安全 replay 证明。
     assert!(
         runtime.released.lock().unwrap().is_empty(),
         "deadline timeout must NOT issue a lease release (unknown commit result)"
@@ -3129,14 +3102,21 @@ async fn watchdog_rebuilds_stalled_generation_when_claimable_backlog_exists() {
         ) -> Result<DeltaProjectorPublishOutcome, RuntimeAccessError> {
             unreachable!("claim wedges before this seam")
         }
-        async fn fail_event(
+        async fn owned_fail_transition(
             &self,
             _identity: &DeltaLeaseIdentity,
             _backoff_seconds: i64,
             _message: &str,
-        ) {
+            _count_failure: bool,
+        ) -> OwnedTransitionProof {
+            OwnedTransitionProof::Unknown
         }
-        async fn release_event(&self, _identity: &DeltaLeaseIdentity) {}
+        async fn owned_release_transition(
+            &self,
+            _identity: &DeltaLeaseIdentity,
+        ) -> OwnedTransitionProof {
+            OwnedTransitionProof::Unknown
+        }
         async fn mark_event_quarantined(
             &self,
             _lease: &DeltaLeaseIdentity,
@@ -3229,14 +3209,21 @@ async fn watchdog_does_not_rebuild_without_claimable_backlog() {
         ) -> Result<DeltaProjectorPublishOutcome, RuntimeAccessError> {
             unreachable!("claim wedges before this seam")
         }
-        async fn fail_event(
+        async fn owned_fail_transition(
             &self,
             _identity: &DeltaLeaseIdentity,
             _backoff_seconds: i64,
             _message: &str,
-        ) {
+            _count_failure: bool,
+        ) -> OwnedTransitionProof {
+            OwnedTransitionProof::Unknown
         }
-        async fn release_event(&self, _identity: &DeltaLeaseIdentity) {}
+        async fn owned_release_transition(
+            &self,
+            _identity: &DeltaLeaseIdentity,
+        ) -> OwnedTransitionProof {
+            OwnedTransitionProof::Unknown
+        }
         async fn mark_event_quarantined(
             &self,
             _lease: &DeltaLeaseIdentity,
@@ -3311,6 +3298,7 @@ fn harness_claim() -> DeltaEventClaim {
 
 struct ReplanHarness {
     publish_steps: std::sync::Mutex<std::collections::VecDeque<ReplanPublishStep>>,
+    execution_failures: std::sync::atomic::AtomicU32,
     calls: std::sync::Mutex<Vec<&'static str>>,
 }
 
@@ -3327,6 +3315,7 @@ impl ReplanHarness {
     fn new(steps: impl IntoIterator<Item = ReplanPublishStep>) -> Self {
         Self {
             publish_steps: std::sync::Mutex::new(steps.into_iter().collect()),
+            execution_failures: std::sync::atomic::AtomicU32::new(0),
             calls: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -3418,6 +3407,25 @@ impl AuthorizationProjectorRuntime for ReplanHarness {
         unreachable!("replan tests call process_one_event directly")
     }
 
+    fn event_execution_failures(&self, _identity: &DeltaLeaseIdentity) -> Option<u32> {
+        Some(
+            self.execution_failures
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    async fn begin_event_execution(
+        &self,
+        _identity: &DeltaLeaseIdentity,
+    ) -> Result<u32, RuntimeAccessError> {
+        let mut calls = self.calls.lock().unwrap();
+        calls.push("begin");
+        calls.push("begin_proof");
+        Ok(self
+            .execution_failures
+            .load(std::sync::atomic::Ordering::SeqCst))
+    }
+
     async fn read_claimed_event(
         &self,
         _identity: &DeltaLeaseIdentity,
@@ -3450,6 +3458,7 @@ impl AuthorizationProjectorRuntime for ReplanHarness {
         &self,
         _command: &DeltaProjectorPublishCommand,
     ) -> Result<DeltaProjectorPublishOutcome, RuntimeAccessError> {
+        self.calls.lock().unwrap().push("renew");
         self.calls.lock().unwrap().push("publish");
         match self
                 .publish_steps
@@ -3482,17 +3491,27 @@ impl AuthorizationProjectorRuntime for ReplanHarness {
             }
     }
 
-    async fn fail_event(
+    async fn owned_fail_transition(
         &self,
         _identity: &DeltaLeaseIdentity,
         _backoff_seconds: i64,
         _message: &str,
-    ) {
+        count_failure: bool,
+    ) -> OwnedTransitionProof {
         self.calls.lock().unwrap().push("fail");
+        if count_failure {
+            self.execution_failures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        OwnedTransitionProof::Applied
     }
 
-    async fn release_event(&self, _identity: &DeltaLeaseIdentity) {
+    async fn owned_release_transition(
+        &self,
+        _identity: &DeltaLeaseIdentity,
+    ) -> OwnedTransitionProof {
         self.calls.lock().unwrap().push("release");
+        OwnedTransitionProof::Applied
     }
 
     async fn mark_event_quarantined(
@@ -3567,8 +3586,25 @@ async fn pointer_moved_replans_under_one_lease_then_publishes() {
     assert_eq!(
         harness.calls(),
         vec![
-            "read", "observe", "ledger", "publish", "observe", "ledger", "publish", "observe",
-            "ledger", "publish",
+            "read",
+            "observe",
+            "ledger",
+            "begin",
+            "begin_proof",
+            "renew",
+            "publish",
+            "observe",
+            "ledger",
+            "begin",
+            "begin_proof",
+            "renew",
+            "publish",
+            "observe",
+            "ledger",
+            "begin",
+            "begin_proof",
+            "renew",
+            "publish",
         ]
     );
     assert!(
@@ -3595,13 +3631,33 @@ async fn pointer_moved_replan_exhaustion_enters_budget_once() {
     );
     assert_eq!(summary.events_released_retry, 1);
     assert_eq!(summary.events_budget_exhausted, 0);
+    let calls = harness.calls();
+    assert_eq!(
+        calls.iter().filter(|call| **call == "publish").count(),
+        MAX_POINTER_MOVED_REPLANS + 1
+    );
+    let mut begins = 0;
+    let mut publications = 0;
+    for call in &calls {
+        match *call {
+            "begin_proof" => begins += 1,
+            "publish" => {
+                publications += 1;
+                assert_eq!(
+                    begins, publications,
+                    "each publication must have its own preceding execution proof"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(begins, MAX_POINTER_MOVED_REPLANS + 1);
     assert_eq!(
         harness
-            .calls()
-            .iter()
-            .filter(|call| **call == "publish")
-            .count(),
-        4
+            .execution_failures
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "in-place replans consume one failure only when their allowance is exhausted"
     );
     assert_eq!(
         harness
@@ -3625,7 +3681,16 @@ async fn generic_publish_failure_does_not_enter_replan() {
     assert_eq!(summary.events_released_retry, 1);
     assert_eq!(
         harness.calls(),
-        vec!["read", "observe", "ledger", "publish", "fail"]
+        vec![
+            "read",
+            "observe",
+            "ledger",
+            "begin",
+            "begin_proof",
+            "renew",
+            "publish",
+            "fail"
+        ]
     );
 }
 
@@ -3679,13 +3744,21 @@ async fn unknown_commit_or_post_commit_install_never_replays_or_mutates_lease() 
         assert_eq!(summary.events_released_retry, 0);
         assert_eq!(
             harness.calls(),
-            vec!["read", "observe", "ledger", "publish"]
+            vec![
+                "read",
+                "observe",
+                "ledger",
+                "begin",
+                "begin_proof",
+                "renew",
+                "publish"
+            ]
         );
     }
 }
 
 #[test]
-fn local_mirror_install_follows_commit_and_precedes_optional_l2() {
+fn owned_publish_commit_precedes_capability_retire_and_mirror_install() {
     let source = include_str!("../authorization_projector/runtime.rs");
     let body = source
         .split("impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {")
@@ -3694,21 +3767,20 @@ fn local_mirror_install_follows_commit_and_precedes_optional_l2() {
         .split("async fn execute_projection_publish(")
         .nth(1)
         .unwrap()
-        .split("\n    async fn fail_event(")
+        .split("\n    async fn has_claimable_work(")
         .next()
         .unwrap();
+    let renew = body.find("extend_owned_delta_execution_lease").unwrap();
     let owned_publish = body
         .find("project_owned_authorization_delta_in_tx")
         .unwrap();
-    let legacy_publish = body.find("project_authorization_delta_in_tx").unwrap();
     let commit = body.find("tx.commit()").unwrap();
     let retire_capability = body.find("self.owned.remove").unwrap();
     let install = body.find("install_committed_publication").unwrap();
-    let l2 = body
-        .find("push_published_evidence_to_l2_after_commit")
-        .unwrap();
-    assert!(owned_publish < commit && legacy_publish < commit);
-    assert!(commit < retire_capability && retire_capability < install && install < l2);
+    assert!(renew < owned_publish && owned_publish < commit);
+    assert!(commit < retire_capability && retire_capability < install);
+    assert!(!body.contains("project_authorization_delta_in_tx"));
+    assert!(!body.contains("push_published_evidence_to_l2_after_commit"));
     assert!(!body.contains("refresh_from_durable"));
 }
 
@@ -3795,7 +3867,10 @@ async fn terminal_quarantine_unknown_results_issue_no_followup_mutation() {
 
 #[tokio::test]
 async fn budget_exhaustion_stays_pending_and_never_fakes_terminal_states() {
-    let harness = Arc::new(QuarantineHarness::new(Ok(())));
+    let harness = Arc::new(QuarantineHarness::new_with_failures(
+        Ok(()),
+        u32::try_from(MAX_EVENT_ATTEMPTS).expect("positive event attempt budget"),
+    ));
     let runtime: Arc<dyn AuthorizationProjectorRuntime> = harness.clone();
     let identity = DeltaLeaseIdentity {
         delta_event_id: 77,
@@ -3804,7 +3879,7 @@ async fn budget_exhaustion_stays_pending_and_never_fakes_terminal_states() {
         lease_token: astral_db::DeltaLeaseToken::for_test("secret-test-token"),
     };
     let mut claimed = harness_claim();
-    claimed.attempts = MAX_EVENT_ATTEMPTS; // exhausted budget
+    claimed.attempts = MAX_EVENT_ATTEMPTS; // claim count is not the durable owned budget
     let mut summary = WorkerRunSummary::default();
     fail_with_budget(
         &runtime,

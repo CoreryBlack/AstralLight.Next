@@ -36,6 +36,7 @@ pub mod node_adapter_native;
 pub mod projection_owner_model;
 pub mod readiness_contract;
 pub mod remaining_contracts;
+pub mod runtime_retirement;
 pub mod s15_validation;
 pub mod tdsc_performance;
 pub mod two_mutation_model;

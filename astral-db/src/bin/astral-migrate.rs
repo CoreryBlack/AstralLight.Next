@@ -1,8 +1,6 @@
 //! Explicit Rust-owned schema migration entry point.
 
-use astral_db::{
-    apply_migrations, freeze_projection_execution_mode_from_env, school_tenant_cutover_report,
-};
+use astral_db::{apply_migrations, school_tenant_cutover_report};
 
 const APPLY_FLAG: &str = "--apply";
 const ISOLATED_ENV: &str = "isolated";
@@ -10,7 +8,6 @@ const ISOLATED_ENV: &str = "isolated";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     require_explicit_apply()?;
-    freeze_projection_execution_mode_from_env()?;
 
     let database_url = std::env::var("DATABASE_URL")
         .map_err(|_| "DATABASE_URL is required for the explicit migration job")?;

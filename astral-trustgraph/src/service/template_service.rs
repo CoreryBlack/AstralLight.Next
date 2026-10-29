@@ -166,16 +166,6 @@ mod tests {
         ) -> Result<bool, AstralError> {
             Ok(false)
         }
-
-        async fn compliance_overview(
-            &self,
-        ) -> Result<crate::repository::template_repository::ComplianceData, AstralError> {
-            Ok(Default::default())
-        }
-
-        async fn compliance_report(&self) -> Result<(i64, i64, Option<f64>), AstralError> {
-            Ok((0, 0, None))
-        }
     }
 
     #[tokio::test]

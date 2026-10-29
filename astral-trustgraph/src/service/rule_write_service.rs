@@ -1,18 +1,68 @@
 //! 权限规则写路径编排 — RuleWriteService
 //!
-//! 对齐 Java `PermissionRuleWriteCoordinator`：写库后统一触发快照重建副作用。
-//! 写操作编排为「repository 变更 → 查回 → rebuild_card_snapshot」，
-//! rebuild 在查回之后执行，避免快照重建阻塞响应。
+//! Direct permission-rule source changes are written by the repository in one
+//! transaction with V6 projection, audit correlation, and grant-ledger deltas.
 
 use std::sync::Arc;
 
 use astral_types::AstralError;
+use async_trait::async_trait;
 use sqlx::MySqlPool;
+
+#[async_trait]
+pub trait GrantSodValidator: Send + Sync {
+    async fn check_grant(
+        &self,
+        card_id: i64,
+        resource_type: &str,
+        action_code: &str,
+    ) -> Result<astral_db::SodCheckResult, AstralError>;
+}
+
+pub struct SqlxGrantSodValidator {
+    db: MySqlPool,
+}
+
+impl SqlxGrantSodValidator {
+    pub fn new(db: MySqlPool) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl GrantSodValidator for SqlxGrantSodValidator {
+    async fn check_grant(
+        &self,
+        card_id: i64,
+        resource_type: &str,
+        action_code: &str,
+    ) -> Result<astral_db::SodCheckResult, AstralError> {
+        astral_db::check_grant_sod_conflict(&self.db, card_id, resource_type, action_code)
+            .await
+            .map_err(|error| AstralError::Database(format!("SoD grant validation failed: {error}")))
+    }
+}
+
+pub(crate) fn reject_sod_conflict(
+    result: astral_db::SodCheckResult,
+    resource_type: &str,
+    action_code: &str,
+) -> Result<(), AstralError> {
+    if result.has_conflict {
+        return Err(AstralError::Permission(format!(
+            "SoD grant conflict: permission '{resource_type}:{action_code}' conflicts with '{}' under policy '{}'",
+            result.conflict_permission.unwrap_or_default(),
+            result.conflict_policy.unwrap_or_default()
+        )));
+    }
+    Ok(())
+}
+
+const PUBLIC_RULE_SOURCE_TYPE: &str = "MANUAL";
 
 use crate::repository::grant_ledger_adapter::DirectRuleMutationContext;
 use crate::repository::rule_repository::{NewRule, RulePatch, RuleRecord, RuleRepository};
 use crate::service::personal_permission_service::validate_registry_resource_action;
-use crate::service::side_effect::PermissionSideEffects;
 
 /// 新建规则请求（默认值解析在 service 完成，对齐现有 handler 语义）
 #[derive(Debug, Clone)]
@@ -43,14 +93,11 @@ pub struct UpdateRuleRequest {
     pub valid_to: Option<String>,
 }
 
-/// RuleWriteService（依赖注入 `Arc<dyn RuleRepository>` + 副作用执行器）
+/// Direct-rule source orchestration with an explicit CREATE SoD validator.
 pub struct RuleWriteService {
     repo: Arc<dyn RuleRepository>,
-    side_effects: Arc<dyn PermissionSideEffects>,
-    sod_db: Option<MySqlPool>,
+    grant_sod_validator: Arc<dyn GrantSodValidator>,
 }
-
-const PUBLIC_RULE_SOURCE_TYPES: &[&str] = &["CARD_ONLY", "MANUAL"];
 
 /// Normalize and enforce the ownership contract for public permission-rule
 /// CRUD. TEMPLATE rules are materialized only through permission_rule_template →
@@ -63,11 +110,11 @@ pub(crate) fn validate_public_rule_source_type(
         .filter(|value| !value.is_empty())
         .unwrap_or("MANUAL")
         .to_ascii_uppercase();
-    if PUBLIC_RULE_SOURCE_TYPES.contains(&normalized.as_str()) {
-        Ok(normalized)
+    if normalized == PUBLIC_RULE_SOURCE_TYPE {
+        Ok(PUBLIC_RULE_SOURCE_TYPE.to_owned())
     } else {
         Err(AstralError::Validation(format!(
-            "source_type must be CARD_ONLY or MANUAL; TEMPLATE is managed by RuleSet APIs (received {normalized})"
+            "source_type must be MANUAL; CARD_ONLY and TEMPLATE are not accepted for new permission-rule writes (received {normalized})"
         )))
     }
 }
@@ -75,20 +122,12 @@ pub(crate) fn validate_public_rule_source_type(
 impl RuleWriteService {
     pub fn new(
         repo: Arc<dyn RuleRepository>,
-        side_effects: Arc<dyn PermissionSideEffects>,
+        grant_sod_validator: Arc<dyn GrantSodValidator>,
     ) -> Self {
         Self {
             repo,
-            side_effects,
-            sod_db: None,
+            grant_sod_validator,
         }
-    }
-
-    /// 生产路径启用 Java 等价的 MANUAL 授权前 SoD 校验；测试/旧注入器保持
-    /// 不连接数据库的兼容构造函数，默认不启用该外部依赖。
-    pub fn with_sod_db(mut self, db: MySqlPool) -> Self {
-        self.sod_db = Some(db);
-        self
     }
 
     async fn validate_manual_grant(
@@ -96,31 +135,15 @@ impl RuleWriteService {
         card_id: i64,
         resource_type: &str,
         action_code: &str,
-        source_type: &str,
     ) -> Result<(), AstralError> {
-        if source_type == "CARD_ONLY" {
-            return Ok(());
-        }
-        let Some(db) = &self.sod_db else {
-            return Ok(());
-        };
-        let result =
-            astral_db::check_sod_conflict(db, card_id, None, resource_type, action_code, None)
-                .await
-                .map_err(|error| {
-                    AstralError::Database(format!("SoD grant validation failed: {error}"))
-                })?;
-        if result.has_conflict {
-            return Err(AstralError::Permission(format!(
-                "SoD grant conflict: permission '{resource_type}:{action_code}' conflicts with '{}' under policy '{}'",
-                result.conflict_permission.unwrap_or_default(),
-                result.conflict_policy.unwrap_or_default()
-            )));
-        }
-        Ok(())
+        let result = self
+            .grant_sod_validator
+            .check_grant(card_id, resource_type, action_code)
+            .await?;
+        reject_sod_conflict(result, resource_type, action_code)
     }
 
-    /// 创建规则 → 查回 → rebuild（返回完整规则）
+    /// Validate the grant, commit source/ledger/audit, then read back the rule.
     pub async fn create_rule(
         &self,
         req: &CreateRuleRequest,
@@ -135,11 +158,14 @@ impl RuleWriteService {
         let (resource_type, action_code) =
             validate_registry_resource_action(&req.resource_type, &req.action_code)?;
         let enabled = req.enabled.unwrap_or(1);
-        let priority = req.priority.unwrap_or(100);
-        if enabled != 0 {
-            self.validate_manual_grant(req.card_id, &resource_type, &action_code, &source_type)
-                .await?;
+        if enabled != 1 {
+            return Err(AstralError::Validation(
+                "canonical direct rules require enabled=1; withdraw a grant by deleting it".into(),
+            ));
         }
+        let priority = req.priority.unwrap_or(100);
+        self.validate_manual_grant(req.card_id, &resource_type, &action_code)
+            .await?;
 
         let rule_id = self
             .repo
@@ -171,19 +197,10 @@ impl RuleWriteService {
             action_code = %action_code,
             "rule created"
         );
-
-        // SQLx repository 已在 source transaction 内追加 projection；兼容测试/旧实现
-        // 仍通过 side-effect port 记录 durable 请求。新 grant 恒为 ALLOW，
-        // 使用 CREATED 生命周期事件（删除/撤销才使用 REVOKE）。
-        if !self.repo.writes_projection_in_transaction() {
-            self.side_effects
-                .request_card_projection(req.card_id, "RULE_CREATED")
-                .await?;
-        }
         Ok(row)
     }
 
-    /// 更新规则 → 查回 → rebuild（返回完整规则）
+    /// Validate and commit the source/ledger change, then read back the rule.
     pub async fn update_rule(
         &self,
         rule_id: i64,
@@ -209,7 +226,16 @@ impl RuleWriteService {
                 "rule card context does not match requested card".into(),
             ));
         }
-
+        if existing.source_type != PUBLIC_RULE_SOURCE_TYPE {
+            return Err(AstralError::Validation(
+                "permission-rule updates require MANUAL source_type; historical CARD_ONLY rows are read/delete-only"
+                    .into(),
+            ));
+        }
+        // UPDATE uses the mandatory transaction-level SoD gate after the repository
+        // locks the exact source/card scope and proves the published before-image.
+        // A pool precheck cannot carry this identity safely, so it is intentionally
+        // not used as a decision point here.
         self.repo
             .update_rule(
                 rule_id,
@@ -231,18 +257,10 @@ impl RuleWriteService {
         })?;
 
         tracing::info!(id = rule_id, card_id = existing.card_id, "rule updated");
-
-        // SQLx repository 已在同一 source transaction 内追加 projection。
-        // 更新后的 canonical grant 恒为 ALLOW，使用 UPDATED 生命周期事件。
-        if !self.repo.writes_projection_in_transaction() {
-            self.side_effects
-                .request_card_projection(existing.card_id, "RULE_UPDATED")
-                .await?;
-        }
         Ok(row)
     }
 
-    /// 删除规则 → rebuild 该卡的快照
+    /// Delete through the repository-owned source, revocation and ledger transaction.
     pub async fn delete_rule(
         &self,
         rule_id: i64,
@@ -261,12 +279,6 @@ impl RuleWriteService {
         }
 
         tracing::warn!(id = rule_id, card_id, "rule deleted");
-
-        if !self.repo.writes_projection_in_transaction() {
-            self.side_effects
-                .request_card_projection(card_id, "REVOKE")
-                .await?;
-        }
         Ok(())
     }
 
@@ -278,23 +290,7 @@ impl RuleWriteService {
     ) -> Result<(), AstralError> {
         self.repo.delete_rules_by_card(card_id, context).await?;
         tracing::warn!(card_id, "all rules for card deleted");
-
-        if !self.repo.writes_projection_in_transaction() {
-            self.side_effects
-                .request_card_projection(card_id, "REVOKE")
-                .await?;
-        }
         Ok(())
-    }
-
-    /// 手动重建卡片快照（对齐 Java `PermissionRuleController.rebuildSnapshot`）：
-    /// 只落 durable `CARD_REBUILD` 投影事件，由投影 worker 统一重建快照、失效缓存并
-    /// MQ 刷新。不再直接同步 rebuild/evict/publish —— 绕过 head/outbox 会让刷新消息
-    /// 缺少 generation/fence，且与不变式 2「禁止绕过 durable 链」冲突。
-    pub async fn rebuild_snapshot(&self, card_id: i64) -> Result<(), AstralError> {
-        self.side_effects
-            .request_card_projection(card_id, "CARD_REBUILD")
-            .await
     }
 }
 
@@ -303,7 +299,6 @@ mod tests {
     use super::*;
     use crate::repository::grant_ledger_adapter::DirectRuleMutationContext;
     use crate::repository::rule_repository::NewRule;
-    use crate::service::side_effect::PermissionSideEffects;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -312,15 +307,19 @@ mod tests {
         DirectRuleMutationContext::user(17, None).expect("positive actor must be accepted")
     }
 
-    /// 记录触发的 durable 投影事件（no-op，不连 DB）
-    struct RecordingSideEffects {
+    /// Explicit, no-DB SoD validator used by service tests.
+    struct RecordingGrantSodValidator {
         events: Mutex<Vec<(i64, String)>>,
+        has_conflict: bool,
+        unavailable: bool,
     }
 
-    impl RecordingSideEffects {
+    impl RecordingGrantSodValidator {
         fn new() -> Self {
             Self {
                 events: Mutex::new(Vec::new()),
+                has_conflict: false,
+                unavailable: false,
             }
         }
 
@@ -330,26 +329,35 @@ mod tests {
     }
 
     #[async_trait]
-    impl PermissionSideEffects for RecordingSideEffects {
-        async fn request_card_projection(
+    impl GrantSodValidator for RecordingGrantSodValidator {
+        async fn check_grant(
             &self,
             card_id: i64,
-            event_type: &str,
-        ) -> Result<(), AstralError> {
+            resource_type: &str,
+            action_code: &str,
+        ) -> Result<astral_db::SodCheckResult, AstralError> {
             self.events
                 .lock()
                 .unwrap()
-                .push((card_id, event_type.to_string()));
-            Ok(())
+                .push((card_id, format!("{resource_type}:{action_code}")));
+            if self.unavailable {
+                return Err(AstralError::Database(
+                    "published SoD evidence unavailable".into(),
+                ));
+            }
+            Ok(astral_db::SodCheckResult {
+                has_conflict: self.has_conflict,
+                conflict_policy: Some("separation".into()),
+                conflict_permission: Some("learn_course:delete".into()),
+                conflict_type: Some("STATIC".into()),
+            })
         }
+    }
 
-        async fn rebuild_card_snapshot(&self, _card_id: i64) {}
-
-        async fn rebuild_rule_set_snapshot(&self, _rule_set_id: i64) -> Result<(), AstralError> {
-            Ok(())
-        }
-
-        async fn evict_card_cache(&self, _card_id: i64) {}
+    #[derive(Clone, Copy)]
+    enum UpdateFailure {
+        Conflict,
+        EvidenceUnavailable,
     }
 
     /// 顺序追踪用 Fake RuleRepository（记录调用顺序与参数，便于断言编排）
@@ -359,6 +367,7 @@ mod tests {
         rule: Mutex<Option<RuleRecord>>,
         last_new: Mutex<Option<NewRule>>,
         last_patch: Mutex<Option<RulePatch>>,
+        update_failure: Option<UpdateFailure>,
     }
 
     impl FakeRuleRepository {
@@ -369,6 +378,7 @@ mod tests {
                 rule: Mutex::new(rule),
                 last_new: Mutex::new(None),
                 last_patch: Mutex::new(None),
+                update_failure: None,
             }
         }
 
@@ -442,6 +452,17 @@ mod tests {
                 "update:{rule_id}:priority={}",
                 patch.priority.unwrap_or(-1)
             ));
+            match self.update_failure {
+                Some(UpdateFailure::Conflict) => {
+                    return Err(AstralError::Permission("transactional SoD conflict".into()));
+                }
+                Some(UpdateFailure::EvidenceUnavailable) => {
+                    return Err(AstralError::Database(
+                        "transactional SoD evidence unavailable".into(),
+                    ));
+                }
+                None => {}
+            }
             // RulePatch 未实现 Clone（repository 层类型，测试不得改动），
             // 在 fake 内逐字段复制以记录 service 实际下发的补丁值。
             *self.last_patch.lock().unwrap() = Some(RulePatch {
@@ -547,16 +568,16 @@ mod tests {
         }
     }
 
-    /// 构建测试用 service（副作用 no-op，不连 DB）
+    /// Service orchestration fixture; repository transaction behavior is tested separately.
     fn make_service(
         fake: Arc<FakeRuleRepository>,
-        se: Arc<RecordingSideEffects>,
+        sod: Arc<RecordingGrantSodValidator>,
     ) -> RuleWriteService {
-        RuleWriteService::new(fake, se)
+        RuleWriteService::new(fake, sod)
     }
 
     #[test]
-    fn public_rule_source_allowlist_rejects_template_and_accepts_card_owned() {
+    fn public_rule_source_accepts_only_manual() {
         assert!(matches!(
             validate_public_rule_source_type(Some("TEMPLATE")),
             Err(AstralError::Validation(message)) if message.contains("TEMPLATE")
@@ -565,18 +586,132 @@ mod tests {
             validate_public_rule_source_type(Some("manual")).unwrap(),
             "MANUAL"
         );
-        assert_eq!(
-            validate_public_rule_source_type(Some("CARD_ONLY")).unwrap(),
-            "CARD_ONLY"
-        );
+        assert!(matches!(
+            validate_public_rule_source_type(Some("CARD_ONLY")),
+            Err(AstralError::Validation(message)) if message.contains("MANUAL")
+        ));
         assert_eq!(validate_public_rule_source_type(None).unwrap(), "MANUAL");
+    }
+
+    fn create_request() -> CreateRuleRequest {
+        CreateRuleRequest {
+            card_id: 7,
+            effect: "ALLOW".into(),
+            resource_type: "learn_course".into(),
+            action_code: "read".into(),
+            priority: None,
+            condition_json: None,
+            valid_from: None,
+            valid_to: None,
+            source_type: None,
+            resource_id: None,
+            enabled: None,
+        }
+    }
+
+    fn update_request() -> UpdateRuleRequest {
+        UpdateRuleRequest {
+            card_id: 7,
+            effect: "ALLOW".into(),
+            resource_type: "learn_course".into(),
+            action_code: "read".into(),
+            priority: None,
+            condition_json: None,
+            valid_from: None,
+            valid_to: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sod_conflict_or_unavailable_evidence_prevents_create_and_update() {
+        for unavailable in [false, true] {
+            let mut repository = FakeRuleRepository::new(Some(sample_rule(9)));
+            repository.update_failure = Some(if unavailable {
+                UpdateFailure::EvidenceUnavailable
+            } else {
+                UpdateFailure::Conflict
+            });
+            let fake = Arc::new(repository);
+            let sod = Arc::new(RecordingGrantSodValidator {
+                has_conflict: !unavailable,
+                unavailable,
+                ..RecordingGrantSodValidator::new()
+            });
+            let service = make_service(fake.clone(), sod.clone());
+            let create = service
+                .create_rule(&create_request(), &mutation_context())
+                .await
+                .unwrap_err();
+            let update = service
+                .update_rule(9, &update_request(), &mutation_context())
+                .await
+                .unwrap_err();
+            for error in [create, update] {
+                if unavailable {
+                    assert!(matches!(error, AstralError::Database(_)));
+                } else {
+                    assert!(matches!(error, AstralError::Permission(_)));
+                }
+            }
+            assert_eq!(fake.calls(), vec!["get:9", "update:9:priority=100"]);
+            assert!(fake.last_patch.lock().unwrap().is_none());
+            assert_eq!(sod.events(), vec![(7, "learn_course:read".into())]);
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_or_nonmanual_sources_never_reach_grant_validation_or_mutation() {
+        let fake = Arc::new(FakeRuleRepository::new(Some(sample_rule(9))));
+        let sod = Arc::new(RecordingGrantSodValidator::new());
+        let service = make_service(fake.clone(), sod.clone());
+        for enabled in [0, -1, 2] {
+            let request = CreateRuleRequest {
+                enabled: Some(enabled),
+                ..create_request()
+            };
+            assert!(matches!(
+                service.create_rule(&request, &mutation_context()).await,
+                Err(AstralError::Validation(_))
+            ));
+        }
+        for source in ["CARD_ONLY", "TEMPLATE"] {
+            let request = CreateRuleRequest {
+                source_type: Some(source.into()),
+                ..create_request()
+            };
+            assert!(matches!(
+                service.create_rule(&request, &mutation_context()).await,
+                Err(AstralError::Validation(_))
+            ));
+        }
+        assert!(fake.calls().is_empty());
+        assert!(sod.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn historical_card_only_update_is_rejected_before_sod_and_source_write() {
+        let rule = RuleRecord {
+            source_type: "CARD_ONLY".into(),
+            ..sample_rule(9)
+        };
+        let fake = Arc::new(FakeRuleRepository::new(Some(rule)));
+        let sod = Arc::new(RecordingGrantSodValidator::new());
+        let service = make_service(fake.clone(), sod.clone());
+        assert!(matches!(
+            service
+                .update_rule(9, &update_request(), &mutation_context())
+                .await,
+            Err(AstralError::Validation(_))
+        ));
+        assert_eq!(fake.calls(), vec!["get:9"]);
+        assert!(sod.events().is_empty());
     }
 
     #[tokio::test]
     async fn create_rule_creates_then_reads_back() {
         let fake = Arc::new(FakeRuleRepository::new(Some(sample_rule(43))));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = make_service(fake.clone(), se.clone());
+        let sod = Arc::new(RecordingGrantSodValidator::new());
+        let svc = make_service(fake.clone(), sod.clone());
 
         let row = svc
             .create_rule(
@@ -598,19 +733,18 @@ mod tests {
             .await
             .unwrap();
 
-        // 编排顺序：create → get（read-back）→ request_card_projection
         let calls = fake.calls();
         assert_eq!(calls[0], "create:43");
         assert_eq!(calls[1], "get:43");
         assert_eq!(row.rule_id, 43);
-        assert_eq!(se.events(), vec![(7, "RULE_CREATED".to_string())]);
+        assert_eq!(sod.events(), vec![(7, "learn_course:read".to_string())]);
     }
 
     #[tokio::test]
     async fn create_rule_accepts_lowercased_allow_and_normalizes_source_effect() {
         let fake = Arc::new(FakeRuleRepository::new(Some(sample_rule(44))));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = make_service(fake.clone(), se.clone());
+        let sod = Arc::new(RecordingGrantSodValidator::new());
+        let svc = make_service(fake.clone(), sod.clone());
 
         svc.create_rule(
             &CreateRuleRequest {
@@ -639,8 +773,8 @@ mod tests {
     async fn create_rule_rejects_deny_unknown_and_empty_without_side_effects() {
         for rejected in ["DENY", "deny", "GRANT", "", "   "] {
             let fake = Arc::new(FakeRuleRepository::new(Some(sample_rule(45))));
-            let se = Arc::new(RecordingSideEffects::new());
-            let svc = make_service(fake.clone(), se.clone());
+            let sod = Arc::new(RecordingGrantSodValidator::new());
+            let svc = make_service(fake.clone(), sod.clone());
 
             let error = svc
                 .create_rule(
@@ -668,15 +802,15 @@ mod tests {
             );
             // 事故链：验证失败时无任何 repository 调用、无 durable 投影事件
             assert!(fake.calls().is_empty(), "rejected={rejected:?}");
-            assert!(se.events().is_empty(), "rejected={rejected:?}");
+            assert!(sod.events().is_empty(), "rejected={rejected:?}");
         }
     }
 
     #[tokio::test]
     async fn create_rule_rejects_unregistered_resource_without_side_effects() {
         let fake = Arc::new(FakeRuleRepository::new(Some(sample_rule(46))));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = make_service(fake.clone(), se.clone());
+        let sod = Arc::new(RecordingGrantSodValidator::new());
+        let svc = make_service(fake.clone(), sod.clone());
 
         let error = svc
             .create_rule(
@@ -704,15 +838,15 @@ mod tests {
         );
         // 事故链：校验先于 SoD/source mutation，无任何 repository 调用与投影事件
         assert!(fake.calls().is_empty());
-        assert!(se.events().is_empty());
+        assert!(sod.events().is_empty());
     }
 
     #[tokio::test]
     async fn create_rule_rejects_unregistered_action_without_side_effects() {
         for action in ["no_such_action", "", "   "] {
             let fake = Arc::new(FakeRuleRepository::new(Some(sample_rule(47))));
-            let se = Arc::new(RecordingSideEffects::new());
-            let svc = make_service(fake.clone(), se.clone());
+            let sod = Arc::new(RecordingGrantSodValidator::new());
+            let svc = make_service(fake.clone(), sod.clone());
 
             let error = svc
                 .create_rule(
@@ -740,7 +874,7 @@ mod tests {
                 "rejected={action:?} unexpected={error:?}"
             );
             assert!(fake.calls().is_empty(), "rejected={action:?}");
-            assert!(se.events().is_empty(), "rejected={action:?}");
+            assert!(sod.events().is_empty(), "rejected={action:?}");
         }
     }
 
@@ -748,8 +882,8 @@ mod tests {
     async fn create_rule_rejects_blank_resource_without_side_effects() {
         for resource in ["", "   ", "\t\n"] {
             let fake = Arc::new(FakeRuleRepository::new(Some(sample_rule(48))));
-            let se = Arc::new(RecordingSideEffects::new());
-            let svc = make_service(fake.clone(), se.clone());
+            let sod = Arc::new(RecordingGrantSodValidator::new());
+            let svc = make_service(fake.clone(), sod.clone());
 
             let error = svc
                 .create_rule(
@@ -777,15 +911,15 @@ mod tests {
                 "rejected={resource:?} unexpected={error:?}"
             );
             assert!(fake.calls().is_empty(), "rejected={resource:?}");
-            assert!(se.events().is_empty(), "rejected={resource:?}");
+            assert!(sod.events().is_empty(), "rejected={resource:?}");
         }
     }
 
     #[tokio::test]
     async fn create_rule_trims_and_persists_normalized_resource_action() {
         let fake = Arc::new(FakeRuleRepository::new(Some(sample_rule(49))));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = make_service(fake.clone(), se.clone());
+        let sod = Arc::new(RecordingGrantSodValidator::new());
+        let svc = make_service(fake.clone(), sod.clone());
 
         svc.create_rule(
             &CreateRuleRequest {
@@ -816,8 +950,11 @@ mod tests {
     #[tokio::test]
     async fn update_rule_defaults_priority_to_100() {
         let fake = Arc::new(FakeRuleRepository::new(Some(sample_rule(9))));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = make_service(fake.clone(), se.clone());
+        let sod = Arc::new(RecordingGrantSodValidator {
+            unavailable: true,
+            ..RecordingGrantSodValidator::new()
+        });
+        let svc = make_service(fake.clone(), sod.clone());
 
         svc.update_rule(
             9,
@@ -842,14 +979,14 @@ mod tests {
         assert_eq!(calls[0], "get:9");
         assert_eq!(calls[1], "update:9:priority=100");
         assert_eq!(calls[2], "get:9");
-        assert_eq!(se.events(), vec![(7, "RULE_UPDATED".to_string())]);
+        assert!(sod.events().is_empty());
     }
 
     #[tokio::test]
     async fn update_rule_rejects_deny_before_any_transaction_or_projection() {
         let fake = Arc::new(FakeRuleRepository::new(Some(sample_rule(10))));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = make_service(fake.clone(), se.clone());
+        let sod = Arc::new(RecordingGrantSodValidator::new());
+        let svc = make_service(fake.clone(), sod.clone());
 
         let error = svc
             .update_rule(
@@ -872,7 +1009,7 @@ mod tests {
         assert!(matches!(error, AstralError::Validation(message) if message.contains("ALLOW")));
         // 校验先于读取/事务：无任何 repository 调用与投影事件
         assert!(fake.calls().is_empty());
-        assert!(se.events().is_empty());
+        assert!(sod.events().is_empty());
     }
 
     #[tokio::test]
@@ -884,8 +1021,8 @@ mod tests {
             ("learn_course", ""),
         ] {
             let fake = Arc::new(FakeRuleRepository::new(Some(sample_rule(11))));
-            let se = Arc::new(RecordingSideEffects::new());
-            let svc = make_service(fake.clone(), se.clone());
+            let sod = Arc::new(RecordingGrantSodValidator::new());
+            let svc = make_service(fake.clone(), sod.clone());
 
             let error = svc
                 .update_rule(
@@ -915,15 +1052,18 @@ mod tests {
                 fake.calls().is_empty(),
                 "rejected=({resource:?},{action:?})"
             );
-            assert!(se.events().is_empty(), "rejected=({resource:?},{action:?})");
+            assert!(
+                sod.events().is_empty(),
+                "rejected=({resource:?},{action:?})"
+            );
         }
     }
 
     #[tokio::test]
     async fn update_rule_trims_and_writes_normalized_patch_values() {
         let fake = Arc::new(FakeRuleRepository::new(Some(sample_rule(12))));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = make_service(fake.clone(), se.clone());
+        let sod = Arc::new(RecordingGrantSodValidator::new());
+        let svc = make_service(fake.clone(), sod.clone());
 
         svc.update_rule(
             12,
@@ -947,14 +1087,14 @@ mod tests {
         assert_eq!(patch.resource_type.as_deref(), Some("learn_course"));
         assert_eq!(patch.action_code.as_deref(), Some("read"));
         assert_eq!(patch.effect.as_deref(), Some("ALLOW"));
-        assert_eq!(se.events(), vec![(7, "RULE_UPDATED".to_string())]);
+        assert!(sod.events().is_empty());
     }
 
     #[tokio::test]
     async fn delete_rule_fetches_card_id_before_delete() {
         let fake = Arc::new(FakeRuleRepository::new(None));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = make_service(fake.clone(), se.clone());
+        let sod = Arc::new(RecordingGrantSodValidator::new());
+        let svc = make_service(fake.clone(), sod.clone());
 
         svc.delete_rule(9, &mutation_context()).await.unwrap();
 
@@ -962,20 +1102,20 @@ mod tests {
         let calls = fake.calls();
         assert_eq!(calls[0], "card_id:9");
         assert_eq!(calls[1], "delete:9");
-        assert_eq!(se.events(), vec![(7, "REVOKE".to_string())]);
+        assert!(sod.events().is_empty());
     }
 
     #[tokio::test]
     async fn delete_rules_by_card_delegates_to_repository() {
         let fake = Arc::new(FakeRuleRepository::new(None));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = make_service(fake.clone(), se.clone());
+        let sod = Arc::new(RecordingGrantSodValidator::new());
+        let svc = make_service(fake.clone(), sod.clone());
 
         svc.delete_rules_by_card(7, &mutation_context())
             .await
             .unwrap();
 
         assert_eq!(fake.calls(), vec!["delete_by_card:7".to_string()]);
-        assert_eq!(se.events(), vec![(7, "REVOKE".to_string())]);
+        assert!(sod.events().is_empty());
     }
 }

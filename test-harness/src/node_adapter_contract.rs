@@ -2,7 +2,7 @@ use hmac::{Hmac, Mac};
 use regex::Regex;
 use serde_json::{Map, Value};
 use sha2::Sha256;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::OnceLock;
 
@@ -12,40 +12,17 @@ pub const GATEWAY_AUTH_VERIFIED: &str = "verified";
 pub const GATEWAY_PATH_PREFIX: &str = "/main/api/v1/";
 pub const NODE_ALIASES: [&str; 3] = ["node-a", "node-b", "node-c"];
 pub const SIGNED_HTTP_METHODS: [&str; 4] = ["GET", "POST", "PUT", "DELETE"];
-pub const READONLY_REDIS_VERBS: [&str; 3] = ["GET", "LLEN", "PING"];
 pub const MYSQL_STDIN_SCRIPT: &str = "MYSQL_PWD=\"$(cat)\" exec mysql -uroot -N -e \"$2\" \"$1\"";
-pub const REDIS_STDIN_SCRIPT: &str = "REDISCLI_AUTH=\"$(cat)\" exec redis-cli \"$@\"";
 
 const LOG_FILES: [&str; 3] = ["server_a.log", "server_b.log", "server_c.log"];
-pub const LOG_GREP_SCRIPT: &str = r#"import base64, binascii, json, re, sys
+const MAX_LOG_COLLECTION_BYTES: usize = 1_048_576;
+const MAX_LOG_LINE_BYTES: usize = 16_384;
+const MAX_LOG_OUTPUT_BYTES: usize = 262_144;
+const MAX_LOG_OUTPUT_LINES: usize = 4_096;
+const MAX_LOG_LINES_SCANNED: usize = 16_384;
+const MAX_LOG_IDENTIFIERS: usize = 256;
+const MAX_LOG_IDENTIFIER_TOTAL_BYTES: usize = 16_384;
 
-_SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
-
-
-def main(argv):
-    if len(argv) != 4:
-        raise SystemExit(2)
-    base, name, payload = argv[1], argv[2], argv[3]
-    # The argv payload is base64(json(identifiers)) -- encoded by read_log_lines
-    # so the identifier list never rides as raw shell-visible JSON.
-    try:
-        identifiers = json.loads(base64.b64decode(payload, validate=True))
-    except (binascii.Error, ValueError, json.JSONDecodeError):
-        raise SystemExit(2)
-    if not isinstance(identifiers, list) or not identifiers:
-        raise SystemExit(2)
-    for item in identifiers:
-        if not isinstance(item, str) or not _SAFE_ID.fullmatch(item):
-            raise SystemExit(2)
-    path = base.rstrip("/") + "/" + name
-    with open(path, "r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            if any(item in line for item in identifiers):
-                sys.stdout.write(line)
-
-
-main(sys.argv)
-"#;
 #[cfg(test)]
 const MAX_SIGNED_I64: i64 = i64::MAX;
 
@@ -80,13 +57,10 @@ pub struct NodeAdapterConfig {
     base_dir: String,
     db: String,
     mysql_container: String,
-    redis_container: String,
     hmac_secret_file: String,
     ports: BTreeMap<String, u16>,
     git_rev: Option<String>,
-    redis_port: Option<u16>,
     mysql_root: Option<String>,
-    redis_password: Option<String>,
 }
 
 impl fmt::Debug for NodeAdapterConfig {
@@ -146,17 +120,11 @@ impl NodeAdapterConfig {
         self.mysql_root.is_some()
     }
 
-    pub fn redis_password_present(&self) -> bool {
-        self.redis_password.is_some()
-    }
-
     pub fn private_config_is_stored_but_not_published(&self) -> bool {
         !self.hmac_secret_file.is_empty()
             && !self.mysql_container.is_empty()
-            && !self.redis_container.is_empty()
             && !self.ports.is_empty()
             && self.git_rev.as_ref().is_none_or(|value| !value.is_empty())
-            && self.redis_port.is_none_or(|value| value > 0)
     }
 }
 
@@ -225,6 +193,14 @@ pub fn load_config(raw: &Value) -> Result<NodeAdapterConfig, ContractError> {
     let Some(raw) = raw.as_object() else {
         return Err(ContractError::one("config_not_a_mapping"));
     };
+    let mut problems = Vec::new();
+    for name in raw.keys() {
+        let normalized = name.to_ascii_lowercase();
+        if normalized.contains("redis") {
+            problems.push("retired_redis_config_field");
+        }
+    }
+
     let required = [
         "run_id",
         "nodes",
@@ -232,7 +208,6 @@ pub fn load_config(raw: &Value) -> Result<NodeAdapterConfig, ContractError> {
         "base_dir",
         "db",
         "mysql_container",
-        "redis_container",
         "hmac_secret_file",
         "binary_sha256",
         "source_snapshot_sha256",
@@ -240,7 +215,6 @@ pub fn load_config(raw: &Value) -> Result<NodeAdapterConfig, ContractError> {
         "source_dirty_patch_sha256",
         "bootstrap_bin_sha256",
     ];
-    let mut problems = Vec::new();
     for name in required {
         if !raw.contains_key(name) {
             problems.push("missing_required_field");
@@ -313,19 +287,10 @@ pub fn load_config(raw: &Value) -> Result<NodeAdapterConfig, ContractError> {
         .get("mysql_container")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let redis_container = raw
-        .get("redis_container")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     add_problem(
         &mut problems,
         container_name(mysql_container),
         "invalid_mysql_container",
-    );
-    add_problem(
-        &mut problems,
-        container_name(redis_container),
-        "invalid_redis_container",
     );
     let hmac_secret_file = raw
         .get("hmac_secret_file")
@@ -350,17 +315,12 @@ pub fn load_config(raw: &Value) -> Result<NodeAdapterConfig, ContractError> {
     } else if raw.contains_key("ports") {
         problems.push("invalid_ports");
     }
-    for (field, problem) in [
-        ("mysql_root", "invalid_mysql_root"),
-        ("redis_password", "invalid_redis_password"),
-    ] {
-        if let Some(value) = raw.get(field) {
-            add_problem(
-                &mut problems,
-                value.as_str().is_some_and(|secret| !secret.is_empty()),
-                problem,
-            );
-        }
+    if let Some(value) = raw.get("mysql_root") {
+        add_problem(
+            &mut problems,
+            value.as_str().is_some_and(|secret| !secret.is_empty()),
+            "invalid_mysql_root",
+        );
     }
     if let Some(git_rev) = raw.get("git_rev") {
         add_problem(
@@ -369,15 +329,6 @@ pub fn load_config(raw: &Value) -> Result<NodeAdapterConfig, ContractError> {
                 value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
             }),
             "invalid_git_rev",
-        );
-    }
-    if let Some(redis_port) = raw.get("redis_port") {
-        add_problem(
-            &mut problems,
-            redis_port
-                .as_u64()
-                .is_some_and(|port| (1..=65535).contains(&port)),
-            "invalid_redis_port",
         );
     }
     if problems.is_empty() {
@@ -416,7 +367,6 @@ pub fn load_config(raw: &Value) -> Result<NodeAdapterConfig, ContractError> {
             base_dir: base_dir.to_owned(),
             db: db.to_owned(),
             mysql_container: mysql_container.to_owned(),
-            redis_container: redis_container.to_owned(),
             hmac_secret_file: hmac_secret_file.to_owned(),
             ports: ports
                 .map(|ports| {
@@ -435,16 +385,8 @@ pub fn load_config(raw: &Value) -> Result<NodeAdapterConfig, ContractError> {
                 .get("git_rev")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            redis_port: raw
-                .get("redis_port")
-                .and_then(Value::as_u64)
-                .map(|port| u16::try_from(port).unwrap()),
             mysql_root: raw
                 .get("mysql_root")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            redis_password: raw
-                .get("redis_password")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
         })
@@ -707,58 +649,6 @@ pub fn parse_tsv(stdout: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn redis_key_is_safe(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= 512
-        && key.as_bytes()[0].is_ascii_alphanumeric()
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._:+*-".contains(&byte))
-}
-
-pub fn build_redis_command(
-    config: &NodeAdapterConfig,
-    verb: &str,
-    args: &[&str],
-    timeout_ms: u64,
-) -> Result<CommandPlan, ContractError> {
-    let verb = verb.to_ascii_uppercase();
-    if !READONLY_REDIS_VERBS.contains(&verb.as_str()) {
-        return Err(ContractError::one("redis_verb_not_allowlisted"));
-    }
-    match verb.as_str() {
-        "PING" if !args.is_empty() => return Err(ContractError::one("redis_ping_arity")),
-        "GET" | "LLEN" if args.len() != 1 => {
-            return Err(ContractError::one("redis_key_arity"));
-        }
-        _ => {}
-    }
-    if args.len() == 1 && !redis_key_is_safe(args[0]) {
-        return Err(ContractError::one("invalid_redis_key"));
-    }
-    let password = config
-        .redis_password
-        .as_ref()
-        .ok_or_else(|| ContractError::one("redis_password_missing"))?;
-    let mut argv = vec![
-        "docker".to_owned(),
-        "exec".to_owned(),
-        "-i".to_owned(),
-        config.redis_container.clone(),
-        "sh".to_owned(),
-        "-c".to_owned(),
-        REDIS_STDIN_SCRIPT.to_owned(),
-        "sh".to_owned(),
-        verb,
-    ];
-    argv.extend(args.iter().map(|value| (*value).to_owned()));
-    Ok(CommandPlan {
-        argv,
-        stdin: password.clone(),
-        timeout_ms,
-    })
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandResult {
     pub exit_code: i32,
@@ -790,23 +680,6 @@ pub fn execute_sql<R: CommandRunner>(
         return Err(ContractError::one("sql_failed"));
     }
     Ok(parse_tsv(&result.stdout))
-}
-
-pub fn execute_redis<R: CommandRunner>(
-    config: &NodeAdapterConfig,
-    runner: &mut R,
-    verb: &str,
-    args: &[&str],
-    timeout_ms: u64,
-) -> Result<String, ContractError> {
-    let plan = build_redis_command(config, verb, args, timeout_ms)?;
-    let result = runner
-        .run(&plan)
-        .map_err(|error| ContractError::one(error.kind))?;
-    if result.exit_code != 0 {
-        return Err(ContractError::one("redis_failed"));
-    }
-    Ok(result.stdout.trim().to_owned())
 }
 
 pub fn load_hmac_secret(path: &str) -> Result<Vec<u8>, ContractError> {
@@ -843,31 +716,6 @@ pub fn execute_sql_with_detail<R: CommandRunner>(
     Ok(parse_tsv(&result.stdout))
 }
 
-pub fn execute_redis_with_detail<R: CommandRunner>(
-    config: &NodeAdapterConfig,
-    runner: &mut R,
-    verb: &str,
-    args: &[&str],
-    timeout_ms: u64,
-) -> Result<String, RunnerError> {
-    let plan =
-        build_redis_command(config, verb, args, timeout_ms).map_err(|error| RunnerError {
-            kind: error.kind,
-            detail: String::new(),
-        })?;
-    let result = runner.run(&plan).map_err(|mut error| {
-        error.detail = scrub_text(&error.detail, 300);
-        error
-    })?;
-    if result.exit_code != 0 {
-        return Err(RunnerError {
-            kind: "redis_failed",
-            detail: scrub_text(&result.stderr, 300),
-        });
-    }
-    Ok(result.stdout.trim().to_owned())
-}
-
 pub fn execute_log_slice_with_detail<R: CommandRunner>(
     config: &NodeAdapterConfig,
     runner: &mut R,
@@ -895,7 +743,7 @@ pub fn execute_log_slice_with_detail<R: CommandRunner>(
             detail: scrub_text(&result.stderr, 300),
         });
     }
-    Ok(result.stdout.lines().map(str::to_owned).collect())
+    filter_and_redact_log_lines(&result.stdout, identifiers)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1059,27 +907,26 @@ fn safe_log_identifier(value: &str) -> bool {
     safe_id(value, 128)
 }
 
-fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let a = chunk[0];
-        let b = *chunk.get(1).unwrap_or(&0);
-        let c = *chunk.get(2).unwrap_or(&0);
-        out.push(TABLE[(a >> 2) as usize] as char);
-        out.push(TABLE[(((a & 0x03) << 4) | (b >> 4)) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[(((b & 0x0f) << 2) | (c >> 6)) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(c & 0x3f) as usize] as char
-        } else {
-            '='
-        });
+fn unique_log_identifiers<'a>(identifiers: &[&'a str]) -> Result<BTreeSet<&'a str>, &'static str> {
+    if identifiers.len() > MAX_LOG_IDENTIFIERS {
+        return Err("log_identifier_limit_exceeded");
     }
-    out
+    let mut unique = BTreeSet::new();
+    for identifier in identifiers {
+        if !safe_log_identifier(identifier) {
+            return Err("invalid_log_identifier");
+        }
+        unique.insert(*identifier);
+    }
+    if unique
+        .iter()
+        .map(|identifier| identifier.len())
+        .sum::<usize>()
+        > MAX_LOG_IDENTIFIER_TOTAL_BYTES
+    {
+        return Err("log_identifier_limit_exceeded");
+    }
+    Ok(unique)
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1114,53 +961,35 @@ pub fn build_log_slice_command(
     if !NODE_ALIASES.contains(&node) {
         return Err(ContractError::one("invalid_node_alias"));
     }
-    let mut unique = Vec::new();
-    for identifier in identifiers {
-        if !safe_log_identifier(identifier) {
-            return Err(ContractError::one("invalid_log_identifier"));
-        }
-        if !unique.contains(identifier) {
-            unique.push(*identifier);
-        }
-    }
+    let unique = unique_log_identifiers(identifiers).map_err(ContractError::one)?;
     if unique.is_empty() {
         return Ok(None);
     }
-    let payload = Value::Array(
-        unique
-            .iter()
-            .map(|identifier| Value::String((*identifier).to_owned()))
-            .collect(),
-    )
-    .to_string();
-    let payload = base64_encode(payload.as_bytes());
     let file = LOG_FILES[NODE_ALIASES
         .iter()
         .position(|alias| *alias == node)
         .unwrap()];
     let argv = if node == "node-b" {
         vec![
-            "python3".to_owned(),
-            "-".to_owned(),
+            "sh".to_owned(),
+            "-c".to_owned(),
+            local_log_collection_command(),
+            "sh".to_owned(),
             local_base_dir(&config.base_dir, home_dir),
             file.to_owned(),
-            payload,
         ]
     } else {
         let ssh = config
             .ssh
             .get(node)
             .ok_or_else(|| ContractError::one("ssh_target_missing"))?;
-        let remote_base = if let Some(rest) = config.base_dir.strip_prefix('~') {
-            format!("\"$HOME\"{rest}")
-        } else {
-            format!("'{}'", config.base_dir)
-        };
         let remote = format!(
-            "python3 - {remote_base} {} {}",
-            shell_quote(file),
-            shell_quote(&payload)
+            "{} {}/{}",
+            remote_log_collection_command(),
+            remote_base_dir_expression(&config.base_dir),
+            shell_quote(file)
         );
+
         vec![
             "ssh".to_owned(),
             "-o".to_owned(),
@@ -1173,9 +1002,153 @@ pub fn build_log_slice_command(
     };
     Ok(Some(CommandPlan {
         argv,
-        stdin: LOG_GREP_SCRIPT.to_owned(),
+        stdin: String::new(),
         timeout_ms,
     }))
+}
+
+fn local_log_collection_command() -> String {
+    format!("exec head -c {} -- \"$1/$2\"", MAX_LOG_COLLECTION_BYTES + 1)
+}
+
+fn remote_base_dir_expression(base_dir: &str) -> String {
+    if let Some(rest) = base_dir.strip_prefix('~') {
+        format!("\"$HOME\"{rest}")
+    } else {
+        shell_quote(base_dir)
+    }
+}
+
+fn remote_log_collection_command() -> String {
+    format!("head -c {} --", MAX_LOG_COLLECTION_BYTES + 1)
+}
+
+pub fn filter_and_redact_log_lines(
+    raw: &str,
+    identifiers: &[&str],
+) -> Result<Vec<String>, RunnerError> {
+    if raw.len() > MAX_LOG_COLLECTION_BYTES {
+        return Err(RunnerError {
+            kind: "log_collection_limit_exceeded",
+            detail: String::new(),
+        });
+    }
+    if identifiers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let unique = unique_log_identifiers(identifiers).map_err(|kind| RunnerError {
+        kind,
+        detail: String::new(),
+    })?;
+    if unique.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut output = Vec::new();
+    let mut output_bytes = 0usize;
+    let mut scanned_lines = 0usize;
+    for raw_line in raw.split_terminator('\n') {
+        scanned_lines += 1;
+        if scanned_lines > MAX_LOG_LINES_SCANNED || raw_line.len() > MAX_LOG_LINE_BYTES {
+            return Err(RunnerError {
+                kind: "log_line_limit_exceeded",
+                detail: String::new(),
+            });
+        }
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if !unique.iter().any(|identifier| line.contains(identifier)) {
+            continue;
+        }
+        if output.len() >= MAX_LOG_OUTPUT_LINES
+            || output_bytes.saturating_add(line.len()) > MAX_LOG_OUTPUT_BYTES
+        {
+            return Err(RunnerError {
+                kind: "log_output_limit_exceeded",
+                detail: String::new(),
+            });
+        }
+        let redacted = redact_log_line(line);
+        output_bytes = output_bytes.saturating_add(redacted.len());
+        if output_bytes > MAX_LOG_OUTPUT_BYTES {
+            return Err(RunnerError {
+                kind: "log_output_limit_exceeded",
+                detail: String::new(),
+            });
+        }
+        output.push(redacted);
+    }
+    Ok(output)
+}
+
+fn redact_log_line(line: &str) -> String {
+    scrub_text(line, MAX_LOG_LINE_BYTES)
+}
+
+fn redact_authorization_assignments() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)([\"']?\bauthorization[\"']?[ \t]*[:=][ \t]*)(\"(?:\\.|[^\"\\\r\n])*\"|'(?:\\.|[^'\\\r\n])*'|[^,\r\n;}\]]*?)([ \t]*(?:[,;}\]]|$)|[ \t]*\r?\n)"#,
+        )
+        .expect("constant authorization-redaction regex")
+    })
+}
+
+fn redact_sensitive_assignments() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)([\"']?\b(?:password|passwd|secret|token|signature|credential|api[_-]?key|mysql_root|redis_password|hmac_secret|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key)\b[\"']?\s*[:=]\s*)(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:Bearer\s+)+[A-Za-z0-9._~+/-]+=*|[^\s,;}]+)"#,
+        )
+        .expect("constant credential-redaction regex")
+    })
+}
+
+fn redact_bearer_tokens() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)\b((?:Bearer\s+)+)[A-Za-z0-9._~+/-]+=*"#)
+            .expect("constant bearer-token regex")
+    })
+}
+
+fn redact_sensitive_text(value: &str) -> String {
+    let value = url_regex().replace_all(value, "[redacted-host]");
+    let value = ipv4_regex().replace_all(&value, "[redacted-host]");
+    let value = hostname_regex().replace_all(&value, "[redacted-host]");
+    let value =
+        redact_authorization_assignments().replace_all(&value, |captures: &regex::Captures<'_>| {
+            let value = captures.get(2).map_or("", |match_| match_.as_str());
+            let replacement = if value.starts_with('"') && value.ends_with('"') {
+                "\"[redacted]\""
+            } else if value.starts_with('\'') && value.ends_with('\'') {
+                "'[redacted]'"
+            } else {
+                "[redacted]"
+            };
+            format!(
+                "{}{replacement}{}",
+                captures.get(1).map_or("", |match_| match_.as_str()),
+                captures.get(3).map_or("", |match_| match_.as_str())
+            )
+        });
+    let value =
+        redact_sensitive_assignments().replace_all(&value, |captures: &regex::Captures<'_>| {
+            let secret = captures.get(2).map_or("", |match_| match_.as_str());
+            let replacement = if secret.starts_with('\"') && secret.ends_with('\"') {
+                "\"[redacted]\""
+            } else if secret.starts_with('\'') && secret.ends_with('\'') {
+                "'[redacted]'"
+            } else {
+                "[redacted]"
+            };
+            format!(
+                "{}{replacement}",
+                captures.get(1).map_or("", |match_| match_.as_str())
+            )
+        });
+    redact_bearer_tokens()
+        .replace_all(&value, "$1[redacted]")
+        .into_owned()
 }
 
 fn validate_aggregate_type(value: &str) -> Result<(), ContractError> {
@@ -1266,13 +1239,7 @@ pub fn projection_pointer_query(
 }
 
 pub fn scrub_text(value: &str, max_len: usize) -> String {
-    let value = url_regex().replace_all(value, "[redacted-host]");
-    let value = ipv4_regex().replace_all(&value, "[redacted-host]");
-    hostname_regex()
-        .replace_all(&value, "[redacted-host]")
-        .chars()
-        .take(max_len)
-        .collect()
+    redact_sensitive_text(value).chars().take(max_len).collect()
 }
 
 fn url_regex() -> &'static Regex {
@@ -1299,7 +1266,6 @@ mod tests {
     use serde_json::json;
 
     const MYSQL_SECRET: &str = "mysql-root-secret-xyzzy";
-    const REDIS_SECRET: &str = "redis-pass-secret-abcdef";
     const HMAC_SECRET: &str = "unit-test-hmac-secret-0123456789abcdef";
 
     fn raw_config() -> Value {
@@ -1314,10 +1280,8 @@ mod tests {
             "base_dir":"~/authz-validation-20260919-single-node-002",
             "db":"astral_bench",
             "mysql_container":"astral_bench_mysql",
-            "redis_container":"astral_bench_redis",
             "hmac_secret_file":"/run/secrets/hmac.txt",
             "mysql_root":MYSQL_SECRET,
-            "redis_password":REDIS_SECRET,
             "binary_sha256":"a".repeat(64),
             "source_snapshot_sha256":"b".repeat(64),
             "source_git_rev":"c".repeat(40),
@@ -1385,7 +1349,6 @@ mod tests {
         let config = config();
         assert_eq!(config.run_id(), "authz-validation-20260919-single-node-002");
         assert!(config.mysql_root_present());
-        assert!(config.redis_password_present());
         assert!(config.private_config_is_stored_but_not_published());
         assert_eq!(
             config.public_metadata(),
@@ -1403,7 +1366,6 @@ mod tests {
         let private = format!("{config:?}");
         for forbidden in [
             MYSQL_SECRET,
-            REDIS_SECRET,
             "example.invalid",
             "127.0.0.1",
             "astral_bench",
@@ -1595,52 +1557,28 @@ mod tests {
     }
 
     #[test]
-    fn redis_allowlist_arity_and_key_validation_precede_command_creation() {
-        let config = config();
-        let get =
-            build_redis_command(&config, "get", &["astral:auth:cache_epoch"], 30_000).unwrap();
-        assert_eq!(
-            get.argv[0..8],
-            [
-                "docker",
-                "exec",
-                "-i",
-                "astral_bench_redis",
-                "sh",
-                "-c",
-                REDIS_STDIN_SCRIPT,
-                "sh"
-            ]
-        );
-        assert_eq!(get.argv[8..], ["GET", "astral:auth:cache_epoch"]);
-        assert!(get.stdin_is(REDIS_SECRET));
-        assert!(get.argv.iter().all(|part| !part.contains(REDIS_SECRET)));
-        let ping = build_redis_command(&config, "PING", &[], 30_000).unwrap();
-        assert_eq!(ping.argv.last().map(String::as_str), Some("PING"));
-        for verb in ["SET", "DEL", "CONFIG", "FLUSHALL", "get ", "SETEX"] {
-            assert!(
-                build_redis_command(&config, verb, &["k"], 30_000).is_err(),
-                "{verb}"
-            );
-        }
-        for (verb, args) in [
-            ("GET", &[][..]),
-            ("GET", &["k1", "k2"][..]),
-            ("LLEN", &[][..]),
-            ("PING", &["extra"][..]),
-            ("GET", &["has space"][..]),
-            ("GET", &["key;DEL x"][..]),
+    fn retired_redis_fields_are_rejected_without_affecting_sql_or_metadata() {
+        for (field, value) in [
+            ("redis_container", json!("retired_redis")),
+            ("redis_port", json!(6379)),
+            ("redis_password", json!("redis-secret")),
+            ("REDIS_URL", json!("redis://cache.invalid")),
+            ("ASTRAL_REDIS_PROJECTION_COMPAT", json!("true")),
         ] {
-            assert!(build_redis_command(&config, verb, args, 30_000).is_err());
+            let mut raw = raw_config();
+            raw[field] = value;
+            let error = load_config(&raw).unwrap_err();
+            assert!(
+                error.problems.contains(&"retired_redis_config_field"),
+                "{field}"
+            );
+            assert!(!format!("{error:?}").contains("redis-secret"));
         }
-        let mut missing = raw_config();
-        missing.as_object_mut().unwrap().remove("redis_password");
-        assert_eq!(
-            build_redis_command(&load_config(&missing).unwrap(), "PING", &[], 30_000)
-                .unwrap_err()
-                .kind,
-            "redis_password_missing"
-        );
+        let config = config();
+        assert_eq!(config.run_id(), "authz-validation-20260919-single-node-002");
+        assert!(config.mysql_root_present());
+        assert!(config.private_config_is_stored_but_not_published());
+        assert!(build_sql_command(&config, "SELECT 1", 30_000).is_ok());
     }
 
     #[test]
@@ -1815,15 +1753,17 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(
-            local.argv[0..4],
+            local.argv,
             [
-                "python3",
-                "-",
+                "sh",
+                "-c",
+                "exec head -c 1048577 -- \"$1/$2\"",
+                "sh",
                 "/home/test/authz-validation-20260919-single-node-002",
                 "server_b.log"
             ]
         );
-        assert_eq!(local.argv[4], "WyJyZXEtMSIsIm9wLTIiXQ==");
+        assert!(local.stdin.is_empty());
         assert_eq!(local.timeout_ms, 120_000);
         let remote =
             build_log_slice_command(&config, "node-a", &["op-1", "req-2"], "/home/test", 120_000)
@@ -1840,10 +1780,23 @@ mod tests {
                 "ops@node-a.example.invalid"
             ]
         );
-        assert!(remote.argv[6].contains("\"$HOME\"/authz-validation-20260919-single-node-002"));
-        assert!(remote.argv[6].contains("server_a.log"));
-        assert!(!remote.argv[6].contains("open("));
-        assert_eq!(remote.stdin, LOG_GREP_SCRIPT);
+        assert_eq!(
+            remote.argv[6],
+            "head -c 1048577 -- \"$HOME\"/authz-validation-20260919-single-node-002/server_a.log"
+        );
+        assert!(remote.stdin.is_empty());
+        assert!(!remote.argv[6].contains("req-2"));
+        assert!(!remote.argv[6].contains("python"));
+        assert!(build_log_slice_command(
+            &config,
+            "node-a",
+            &vec!["req-1"; MAX_LOG_IDENTIFIERS + 1],
+            "/home/test",
+            1,
+        )
+        .unwrap_err()
+        .problems
+        .contains(&"log_identifier_limit_exceeded"));
     }
 
     #[test]
@@ -1884,20 +1837,88 @@ mod tests {
         assert!(!value.contains("db.host.example.org"));
         assert_eq!(value.matches("[redacted-host]").count(), 3);
         assert_eq!(scrub_text(&"x".repeat(400), 300).len(), 300);
+        for sensitive in [
+            "password=plain-secret",
+            r#"{"token":"quoted-secret"}"#,
+            "Authorization: Bearer abc.def.ghi",
+            "client_secret: 'single-quoted-secret'",
+        ] {
+            let redacted = scrub_text(sensitive, 300);
+            assert!(!redacted.contains("plain-secret"));
+            assert!(!redacted.contains("quoted-secret"));
+            assert!(!redacted.contains("abc.def.ghi"));
+            assert!(!redacted.contains("single-quoted-secret"));
+        }
     }
 
     #[test]
-    fn fixed_script_literals_and_hmac_secret_load_lazily() {
+    fn authorization_redaction_covers_full_values_and_keeps_adjacent_fields() {
+        let cases = [
+            (
+                "Authorization: Basic basic-secret, peer=visible",
+                "basic-secret",
+                "peer=visible",
+            ),
+            (
+                "authorization=Basic basic-equals-secret, peer=visible",
+                "basic-equals-secret",
+                "peer=visible",
+            ),
+            (
+                "authorization: 'Custom multi-token single-quoted-secret', peer=visible",
+                "single-quoted-secret",
+                "peer=visible",
+            ),
+            (
+                "authorization=Digest digest-secret; peer=visible",
+                "digest-secret",
+                "peer=visible",
+            ),
+            (
+                r#"{"authorization":"Custom multi-token custom-secret realm=example","peer":"visible"}"#,
+                "custom-secret",
+                r#""peer":"visible""#,
+            ),
+            (
+                r#"{"authorization":"Basic escaped \"quoted-secret\" token","peer":"visible"}"#,
+                "quoted-secret",
+                r#""peer":"visible""#,
+            ),
+        ];
+        for (input, secret, adjacent_field) in cases {
+            let redacted = scrub_text(input, 300);
+            assert!(
+                !redacted.contains(secret),
+                "authorization credential leaked from {input:?}"
+            );
+            assert!(
+                redacted.contains(adjacent_field),
+                "adjacent field was not preserved in {redacted:?}"
+            );
+        }
+
+        let escaped_json = scrub_text(
+            r#"{"authorization":"Basic escaped \"quoted-secret\" token","peer":"visible"}"#,
+            300,
+        );
+        let parsed: Value = serde_json::from_str(&escaped_json).unwrap();
+        assert_eq!(parsed["authorization"], "[redacted]");
+        assert_eq!(parsed["peer"], "visible");
+
+        let multiline = scrub_text(
+            "Authorization: Basic line-secret\nordinary log line remains",
+            300,
+        );
+        assert!(!multiline.contains("line-secret"));
+        assert!(multiline.contains("ordinary log line remains"));
+    }
+
+    #[test]
+    fn fixed_sql_script_and_hmac_secret_load_lazily() {
         assert_eq!(
             MYSQL_STDIN_SCRIPT,
             "MYSQL_PWD=\"$(cat)\" exec mysql -uroot -N -e \"$2\" \"$1\""
         );
-        assert_eq!(
-            REDIS_STDIN_SCRIPT,
-            "REDISCLI_AUTH=\"$(cat)\" exec redis-cli \"$@\""
-        );
-        assert!(LOG_GREP_SCRIPT.contains("_SAFE_ID"));
-        assert!(LOG_GREP_SCRIPT.contains("base64.b64decode"));
         let dir =
             std::env::temp_dir().join(format!("astral-node-adapter-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1971,39 +1992,7 @@ mod tests {
     }
 
     #[test]
-    fn redis_command_has_fixed_argv_and_missing_password_guard() {
-        let config = config();
-        let plan =
-            build_redis_command(&config, "GET", &["astral:auth:cache_epoch"], 30_000).unwrap();
-        assert_eq!(
-            plan.argv,
-            vec![
-                "docker".to_owned(),
-                "exec".to_owned(),
-                "-i".to_owned(),
-                "astral_bench_redis".to_owned(),
-                "sh".to_owned(),
-                "-c".to_owned(),
-                REDIS_STDIN_SCRIPT.to_owned(),
-                "sh".to_owned(),
-                "GET".to_owned(),
-                "astral:auth:cache_epoch".to_owned(),
-            ]
-        );
-        assert!(plan.stdin_is(REDIS_SECRET));
-        let mut raw = raw_config();
-        raw.as_object_mut().unwrap().remove("redis_password");
-        let missing = load_config(&raw).unwrap();
-        assert_eq!(
-            build_redis_command(&missing, "PING", &[], 30_000)
-                .unwrap_err()
-                .kind,
-            "redis_password_missing"
-        );
-    }
-
-    #[test]
-    fn sql_redis_and_log_failures_are_scrubbed_and_bounded() {
+    fn sql_and_log_failures_are_scrubbed_and_bounded() {
         let config = config();
         let mut runner = FakeRunner::default();
         runner.results.push(CommandResult {
@@ -2017,19 +2006,6 @@ mod tests {
         assert!(!error.detail.contains("example.invalid"));
         assert!(!error.detail.contains(MYSQL_SECRET));
         assert!(error.detail.len() <= 300);
-
-        let mut runner = FakeRunner::default();
-        runner.results.push(CommandResult {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: "NOAUTH at redis://cache.example.invalid:6380".to_owned(),
-        });
-        let error =
-            execute_redis_with_detail(&config, &mut runner, "GET", &["k1"], 30_000).unwrap_err();
-        assert_eq!(error.kind, "redis_failed");
-        assert!(error.detail.contains("[redacted-host]"));
-        assert!(!error.detail.contains("example.invalid"));
-        assert!(!error.detail.contains(REDIS_SECRET));
 
         let mut runner = FakeRunner::default();
         runner.results.push(CommandResult {
@@ -2052,45 +2028,46 @@ mod tests {
     }
 
     #[test]
-    fn log_slice_commands_use_local_and_ssh_fixed_argv() {
+    fn log_slice_commands_use_bounded_raw_collection_and_rust_filtering() {
         let config = config();
-        let payload = base64_encode(json!(["req-1"]).to_string().as_bytes());
         let local = build_log_slice_command(&config, "node-b", &["req-1"], "/home/ops", 120_000)
             .unwrap()
             .unwrap();
         assert_eq!(
-            local.argv[..3].to_vec(),
-            vec![
-                "python3".to_owned(),
-                "-".to_owned(),
-                "/home/ops/authz-validation-20260919-single-node-002".to_owned(),
+            local.argv,
+            [
+                "sh",
+                "-c",
+                "exec head -c 1048577 -- \"$1/$2\"",
+                "sh",
+                "/home/ops/authz-validation-20260919-single-node-002",
+                "server_b.log"
             ]
         );
-        assert_eq!(local.argv[3], "server_b.log");
-        assert_eq!(local.argv[4], payload);
-        assert!(local.stdin_is(LOG_GREP_SCRIPT));
+        assert!(local.stdin.is_empty());
 
         let remote =
             build_log_slice_command(&config, "node-a", &["op-1", "req-2"], "/home/ops", 120_000)
                 .unwrap()
                 .unwrap();
         assert_eq!(
-            remote.argv[..6].to_vec(),
-            vec![
-                "ssh".to_owned(),
-                "-o".to_owned(),
-                "BatchMode=yes".to_owned(),
-                "-o".to_owned(),
-                "ConnectTimeout=10".to_owned(),
-                "ops@node-a.example.invalid".to_owned(),
+            remote.argv[..6],
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "ops@node-a.example.invalid"
             ]
         );
-        let command = &remote.argv[6];
-        assert!(command.starts_with("python3 - "));
-        assert!(command.contains("\"$HOME\"/authz-validation-20260919-single-node-002"));
-        assert!(command.contains("server_a.log"));
-        assert!(!command.contains("open("));
-        assert!(remote.stdin_is(LOG_GREP_SCRIPT));
+        assert_eq!(
+            remote.argv[6],
+            "head -c 1048577 -- \"$HOME\"/authz-validation-20260919-single-node-002/server_a.log"
+        );
+        assert!(remote.stdin.is_empty());
+        assert!(!remote.argv[6].contains("req-2"));
+        assert!(!remote.argv[6].contains("python"));
         assert_eq!(
             build_log_slice_command(&config, "node-z", &["req-1"], "/home/ops", 1)
                 .unwrap_err()
@@ -2101,6 +2078,73 @@ mod tests {
             build_log_slice_command(&config, "node-a", &[], "/home/ops", 1)
                 .unwrap()
                 .is_none()
+        );
+
+        let lines = filter_and_redact_log_lines(
+            "unrelated\nreq-1 ok\nreq-2 token=hidden\nreq-2 bearer Bearer abc.def.ghi\nreq-2 Authorization: Bearer Bearer abc.def.ghi\nreq-2 authorization=BEARER bearer Bearer abc.def.ghi\n",
+            &["req-2"],
+        )
+        .unwrap();
+        assert_eq!(lines.len(), 4);
+        assert!(lines.iter().all(|line| line.starts_with("req-2")));
+        assert!(lines
+            .iter()
+            .all(|line| !line.contains("hidden") && !line.contains("abc.def.ghi")));
+        assert_eq!(
+            filter_and_redact_log_lines(&"x".repeat(MAX_LOG_COLLECTION_BYTES + 1), &["req-1"])
+                .unwrap_err()
+                .kind,
+            "log_collection_limit_exceeded"
+        );
+        assert_eq!(
+            filter_and_redact_log_lines(&"x".repeat(MAX_LOG_LINE_BYTES + 1), &["req-1"])
+                .unwrap_err()
+                .kind,
+            "log_line_limit_exceeded"
+        );
+        assert_eq!(
+            filter_and_redact_log_lines("req-1 ", &["bad id"])
+                .unwrap_err()
+                .kind,
+            "invalid_log_identifier"
+        );
+        assert_eq!(
+            filter_and_redact_log_lines(
+                &"unmatched\n".repeat(MAX_LOG_LINES_SCANNED + 1),
+                &["req-1"]
+            )
+            .unwrap_err()
+            .kind,
+            "log_line_limit_exceeded"
+        );
+        assert_eq!(
+            filter_and_redact_log_lines(&"req-1\n".repeat(MAX_LOG_OUTPUT_LINES + 1), &["req-1"])
+                .unwrap_err()
+                .kind,
+            "log_output_limit_exceeded"
+        );
+        let oversized_output_lines = (0..MAX_LOG_OUTPUT_BYTES / 70 + 1)
+            .map(|index| format!("req-1 {index:04} {}\n", "x".repeat(60)))
+            .collect::<String>();
+        assert!(oversized_output_lines.len() < MAX_LOG_COLLECTION_BYTES);
+        assert_eq!(
+            filter_and_redact_log_lines(&oversized_output_lines, &["req-1"])
+                .unwrap_err()
+                .kind,
+            "log_output_limit_exceeded"
+        );
+        let oversized_identifiers = (0..129)
+            .map(|index| format!("{}{:03}", "x".repeat(125), index))
+            .collect::<Vec<_>>();
+        let oversized_identifier_refs = oversized_identifiers
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            filter_and_redact_log_lines("req-1", &oversized_identifier_refs)
+                .unwrap_err()
+                .kind,
+            "log_identifier_limit_exceeded"
         );
     }
 
@@ -2194,7 +2238,6 @@ mod tests {
         let config = load_config(&raw).unwrap();
         assert_eq!(config.run_id(), "authz-validation-20260919-single-node-002");
         assert!(config.mysql_root_present());
-        assert!(config.redis_password_present());
         assert!(config.private_config_is_stored_but_not_published());
         let metadata = config.public_metadata();
         let object = metadata.as_object().unwrap();
@@ -2211,7 +2254,6 @@ mod tests {
         );
         let text = metadata.to_string();
         assert!(!text.contains(MYSQL_SECRET));
-        assert!(!text.contains(REDIS_SECRET));
         assert!(!text.contains(HMAC_SECRET));
         assert!(!text.contains("node-a.example.invalid"));
         assert!(!text.contains("astral_bench_mysql"));

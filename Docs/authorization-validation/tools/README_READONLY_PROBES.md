@@ -1,77 +1,40 @@
-# Read-Only Authorization Probes
+# Read-only authorization probe contracts
 
-This module provides offline-tested read-only helpers for sampling authorization
-state and validating fault-matrix fixtures. It uses `Exec-L1` by default and performs
-no I/O unless a caller supplies an injected `ReadOnlyProbe`.
+The former Python `e3_e4.py` probe implementation and its executable compatibility response have been physically removed. Its archived tests remain a historical method inventory. CURRENT V6 uses the Rust contracts registered in [`tests-suite/MANIFEST.toml`](../../../tests-suite/MANIFEST.toml); Redis probes and adapters are outside the current runtime and validation profiles.
 
-## Safety boundary
+## Current sources
 
-- All SQL is validated as a single `SELECT`; Redis access is limited to `LLEN`, `GET`,
-  and `PING`; HTTP reads use signed `GET` requests.
-- The module does not mutate data, inject faults, start or stop services, or write results.
-- Node labels are replaced with `node-<index>` aliases. Probe strings are scrubbed for
-  host-like values and truncated before return.
-- Unprovable prerequisites remain `BLOCKED`, `UNKNOWN`, or `SKIP`; they never collapse
-  into `PASS`.
-
-## Files
-
-| File | Purpose |
+| Source | Scope |
 |---|---|
-| `e3_e4.py` | Read-only probes, precondition capture, state sampling, and fault-outcome validation |
-| [`archive/python-tests/test_e3_e4.py`](../archive/python-tests/test_e3_e4.py) | Archived test source; not a current executable test gate |
+| [`test-harness/src/e4_preconditions.rs`](../../../test-harness/src/e4_preconditions.rs) | Typed SELECT-only precondition capture, optional SQL cache-epoch evidence, clock checks and status folding |
+| [`test-harness/src/e3_e4_probe_native.rs`](../../../test-harness/src/e3_e4_probe_native.rs) | Read-only probe orchestration over injected SQL, command and signed-HTTP ports |
+| [`test-harness/src/e3_e4_events.rs`](../../../test-harness/src/e3_e4_events.rs), [`e3_reconciliation.rs`](../../../test-harness/src/e3_reconciliation.rs), [`e4_protocol.rs`](../../../test-harness/src/e4_protocol.rs) | Offline event parsing, request reconciliation and protocol rules |
+| [`archive/python-tests/test_e3_e4.py`](../archive/python-tests/test_e3_e4.py) | Non-executing historical method inventory; no Python fallback |
 
-The real adapter is supplied by a separately gated caller. This module checks its own
-query restrictions and does not construct a live adapter.
+## Evidence boundary
 
-## Probe contract
+The Rust offline suites use typed fakes or injected ports. They do not connect to a database, broker or deployed HTTP service, inject real faults, start workers, or prove deployed readiness. Their results must be recorded separately from real integration acceptance.
 
-```python
-class ReadOnlyProbe(Protocol):
-    def sql(self, query: str) -> list[list[str]]: ...
-    def redis(self, *argv: str) -> str: ...
-    def signed_get(self, node: str, path: str) -> tuple[int, dict]: ...
-```
+Precondition capture accepts single SELECT statements and records only bounded, scrubbed results. An explicitly configured SQL cache-epoch query is optional; absence yields `SKIP`, and missing or unreadable evidence cannot become `PASS`. This epoch field does not restore Redis support. Node names use aliases, and secret or host details must not enter stored reports.
 
-`capture_e4_preconditions` records database isolation/read-only state, session timezone,
-clock offset, and cache-generation state. `sample_e3` captures fixed-interval durable
-row counts, Redis pointers, optional queue depth, worker liveness, and per-card signed
-decisions. `evaluate_fault_outcomes` accepts only `PENDING` or `DENY` with a reason
-code for configured failure fixtures.
+The native probe contract includes injected signed decisions, SELECT snapshots, supplied worker-readiness facts and report folding. Real SQL, signed HTTP, SSH and worker lifecycle require separately authorized adapters and their own observed postconditions. No `e3_e4.py --self-test` entry point remains.
 
-## Current offline checks
+## Rust offline commands
 
-From the repository root, run the selected Rust contracts:
+From the repository root:
 
 ```bash
 cargo test -p test-harness --locked --lib e4_preconditions::tests:: -- --test-threads=1
 cargo test -p test-harness --locked --lib e3_e4_events::tests:: -- --test-threads=1
 cargo test -p test-harness --locked --lib e3_reconciliation::tests:: -- --test-threads=1
 cargo test -p test-harness --locked --lib e4_protocol::tests:: -- --test-threads=1
+cargo test -p test-harness --locked --lib e3_e4_probe_native::tests:: -- --test-threads=1
 ```
 
-`e4_preconditions::tests::` uses an in-memory typed fake to check SELECT-only scalar
-capture, the MySQL 5.7 isolation fallback, the Redis GET allowlist, clock skew,
-fail-closed status folding, and host scrubbing. It does not invoke a live probe or
-prove any deployed database/cache state. `e3_e4_events::tests::` checks offline log
-parsing and request-terminal rules. The E3 sampling, signed HTTP transport and full
-probe lifecycle remain outside these contracts. `e3_e4.py --self-test` is retained
-as a fail-closed compatibility response and exits nonzero with `BLOCKED`; it does
-not discover archived tests. No database, cache, service, container, migration,
-or network access is involved in the Rust offline tests.
+These commands select the corresponding Rust assertions. A command listing is not execution evidence; test counts, ignored tests, internal `SKIP` markers and results belong in the task evidence.
 
 ## Limitations
 
-Snapshot sampling is not a complete event history and cannot establish per-attempt
-recovery behavior. A successful fixture validator checks only the fixture structure;
-it does not prove a live run. HTTP `ALLOW` observations also require request-side
-admission-event reconciliation before treating them as final.
+Snapshot samples are not a complete event history and cannot establish per-attempt recovery. Supplied worker-health tuples do not prove a live worker is ready. HTTP `ALLOW` samples require request-side admission-event reconciliation before they can support a final authorization observation.
 
-The Rust `e4_preconditions` module covers the offline typed fake-probe contract
-for E4 precondition capture; `e3_e4_events`, `e3_reconciliation`, and `e4_protocol`
-cover their separately registered parser, evidence, and protocol boundaries. They
-do not establish live database/cache state, implement E3 interval sampling, or
-prove signed HTTP transport and worker readiness. The archived Python test source
-is a migration reference, not an executable fallback; the full
-`e3-e4-read-only-probe-parity` suite remains `BLOCKED` in
-[`../../../tests-suite/MANIFEST.toml`](../../../tests-suite/MANIFEST.toml).
+The registered `e3-e4-read-only-probe-parity` suite covers the native injected-port contract at offline scope. Deployment transport, real dependency state and recovery remain separate integration obligations. Historical Python files and independent model references are not executable acceptance alternatives.

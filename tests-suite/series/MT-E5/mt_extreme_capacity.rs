@@ -8,11 +8,26 @@
 //! 预期运行时长数分钟(512 × 4 短事务发布 + 512 次严格读取)。
 
 use astral_db::load_published_card_grant_evidence;
+#[path = "../MT-E1/support/source_identity.rs"]
+mod source_identity;
+
+use astral_trustgraph::service::rule_set_write_service::AddEntryRequest;
 use astral_types::PublishedEvidenceGateStatus;
 use testsuite::{
-    allow_rule_set_grant, cleanup_suite_rows, connect_suite, publish_card_manifest,
-    seed_all_tenants, SuiteFixture, TenantRole,
+    cleanup_suite_rows, connect_suite, publish_card_manifest, seed_all_tenants, SuiteFixture,
+    TenantRole,
 };
+
+fn allow_entry(priority: i32) -> AddEntryRequest {
+    AddEntryRequest {
+        effect: "ALLOW".to_owned(),
+        resource_type: Some("learn_subject".to_owned()),
+        resource_id: None,
+        action_code: Some("read".to_owned()),
+        condition_json: None,
+        priority,
+    }
+}
 
 const TENANTS: usize = 512;
 
@@ -31,28 +46,18 @@ async fn mt_e5_capacity_512_tenants() {
 
     let publish_started = std::time::Instant::now();
     for tenant in &fixture.tenants {
-        let grants = vec![allow_rule_set_grant(
-            fixture.salt,
-            tenant.tenant_id,
-            tenant.domain_id,
-            tenant.card_id,
-            tenant.user_id,
-            "learn_subject:*",
-            tenant.entry_id,
-            tenant.card_rule_set_ref_id,
-            1,
-        )];
-        publish_card_manifest(
+        let tag = format!("g1-{}", tenant.ordinal);
+        let published = publish_card_manifest(
             &pool,
             tenant.tenant_id,
             tenant.card_id,
-            grants,
-            &format!("g1-{}", tenant.ordinal),
-            fixture.salt,
-            1,
-            None,
+            tenant.rule_set_id,
+            tenant.user_id,
+            vec![allow_entry(2)],
+            (&tag, fixture.salt),
         )
         .await;
+        assert_eq!(published.published_state.total_grant_count, 1);
     }
     let publish_elapsed = publish_started.elapsed();
 
@@ -71,6 +76,14 @@ async fn mt_e5_capacity_512_tenants() {
         assert_eq!(grant.tenant.tenant_id, tenant.tenant_id);
         assert_eq!(grant.card_id, tenant.card_id);
         assert_eq!(grant.user_id, tenant.user_id);
+        source_identity::assert_ruleset_source_binding(
+            &pool,
+            grant,
+            tenant.tenant_id,
+            tenant.card_id,
+            tenant.rule_set_id,
+        )
+        .await;
     }
     let read_elapsed = read_started.elapsed();
 

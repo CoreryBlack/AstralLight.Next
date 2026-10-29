@@ -3,8 +3,6 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-#[cfg(feature = "redis-compat")]
-use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 use uuid::Uuid;
@@ -66,7 +64,7 @@ pub fn internal_routes() -> Router<AppState> {
 /// （对齐 Gateway durable guard 前例；默认 tolerance=30 时与历史固定 60s
 /// 完全一致）。
 const INTERNAL_REPLAY_TTL_SECS: i64 = 60;
-/// 幂等 in-flight 标记 TTL（秒）：与历史 Redis `SET NX EX 300` 语义一致。
+/// 幂等 in-flight 标记 TTL（秒）：与原子 durable guard 的 300 秒恢复窗口一致。
 const INTERNAL_IDEMPOTENCY_TTL_SECS: i64 = 300;
 const MAX_INTERNAL_BODY_BYTES: usize = 1024 * 1024;
 
@@ -146,7 +144,7 @@ struct InternalAssertionRequest<'a> {
     now_ms: i128,
 }
 
-/// Validate the complete assertion without touching Redis. This pure boundary
+/// Validate the complete assertion without touching durable guards. This pure boundary
 /// keeps protocol rejection testable and ensures no request value is audited
 /// before the HMAC has verified the signed target user id.
 fn validate_internal_assertion(
@@ -235,7 +233,7 @@ fn validate_internal_assertion(
 }
 
 /// Guard 声明阶段的统一拒绝语义（纯枚举，fail-closed）：store 故障/未知
-/// 一律 `StateUnavailable`，绝不本地放行；其余按历史 Redis 语义分类。
+/// 一律 `StateUnavailable`，绝不本地放行；其余按 replay/idempotency 契约分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InternalGuardRejection {
     ReplayDetected,
@@ -298,7 +296,7 @@ fn idempotency_claim_outcome(
     }
 }
 
-/// 默认 Redis-free 路径：MySQL durable guard（`auth_internal_request_guard`，
+/// Identity internal request path: MySQL durable guard（`auth_internal_request_guard`，
 /// 与 Gateway 完全相同的原语）。UNIQUE(guard_scope, guard_key) 即分布式互斥，
 /// `expires_at` 承载 TTL（purge 过期后可重声明，等价 SET NX EX），多节点安全；
 /// DB 不可用 → `StateUnavailable`（fail-closed），绝不本地放行。
@@ -344,73 +342,13 @@ async fn claim_internal_guards_mysql(
     idempotency_claim_outcome(claim, marker, body_hash)
 }
 
-/// 兼容路径：仅在 runtime 依据 `redis_projection_compat_enabled`（显式开启且
-/// URL 非空，见 `RedisCompatRequiresUrl` 校验）装配 compat adapter 时可达。
-/// 复用启动期建立的 ConnectionManager，不再逐请求 `Client::open`；claim 语义
-/// 与历史 `SET NX EX` 逐字段一致。
-#[cfg(feature = "redis-compat")]
-async fn claim_internal_guards_redis_compat(
-    conn: &mut redis::aio::ConnectionManager,
-    input: &InternalSignatureInput<'_>,
-    body_hash: &str,
-    replay_ttl_secs: i64,
-) -> Result<(), InternalGuardRejection> {
-    // Redis SET NX 返回 Ok(nil) 表示键已存在 → Duplicate；命令错误 → Err(())。
-    let replay_key = replay_key("identity", input);
-    let claimed: Result<Option<String>, _> = redis::cmd("SET")
-        .arg(&replay_key)
-        .arg("1")
-        .arg("NX")
-        .arg("EX")
-        .arg(replay_ttl_secs)
-        .query_async(conn)
-        .await;
-    let claim: Result<GuardClaim, ()> = match claimed {
-        Ok(Some(_)) => Ok(GuardClaim::Claimed),
-        Ok(None) => Ok(GuardClaim::Duplicate),
-        Err(_) => Err(()),
-    };
-    replay_claim_outcome(claim)?;
-
-    let idem_key = idempotency_key(
-        "identity",
-        input.caller_service,
-        input.route,
-        input.idempotency_key,
-    );
-    let claimed: Result<Option<String>, _> = redis::cmd("SET")
-        .arg(&idem_key)
-        .arg(format!("processing:{body_hash}"))
-        .arg("NX")
-        .arg("EX")
-        .arg(INTERNAL_IDEMPOTENCY_TTL_SECS)
-        .query_async(conn)
-        .await;
-    let claim: Result<GuardClaim, ()> = match claimed {
-        Ok(Some(_)) => Ok(GuardClaim::Claimed),
-        Ok(None) => Ok(GuardClaim::Duplicate),
-        Err(_) => Err(()),
-    };
-    let marker = if matches!(claim, Ok(GuardClaim::Duplicate)) {
-        conn.get::<_, Option<String>>(&idem_key)
-            .await
-            .map_err(|_| ())
-    } else {
-        Ok(None)
-    };
-    idempotency_claim_outcome(claim, marker, body_hash)
-}
-
 /// Verify Gateway's complete internal-v1 assertion after buffering the raw body.
 ///
-/// replay/idempotency 声明只在 HMAC 验签通过后进行。默认 Redis-free 路径使用
-/// MySQL durable guard（与 Gateway 相同原语，多节点安全、fail-closed）；仅当
-/// `redis_projection_compat_enabled` 显式开启且 runtime 装配了 compat adapter
-/// （`state.redis = Some`，启动期已验证非空 URL 并完成连接）时走历史 Redis
-/// 语义。两条路径共享同一套纯判定层（`replay_claim_outcome` /
-/// `idempotency_claim_outcome`），错误语义逐项对齐：
-/// store 故障/未知 → `AuthStateUnavailable`（审计后拒绝），重放/冲突分别
-/// `InternalReplayDetected` / `IdempotencyReplay` / `IdempotencyConflict`。
+/// Replay/idempotency claims are made only after HMAC verification and use the
+/// MySQL durable guard for multi-node coordination. Store failure or unknown
+/// outcomes map to `AuthStateUnavailable` (audited and denied); duplicate and
+/// conflict outcomes remain `InternalReplayDetected`, `IdempotencyReplay`, or
+/// `IdempotencyConflict`.
 async fn verify_internal_service_request(
     state: &AppState,
     headers: &HeaderMap,
@@ -441,21 +379,6 @@ async fn verify_internal_service_request(
         .gateway
         .timestamp_tolerance_secs
         .max(INTERNAL_REPLAY_TTL_SECS);
-    #[cfg(feature = "redis-compat")]
-    let outcome = match state.redis.as_ref() {
-        // 显式 compat：runtime 仅在 redis_projection_compat_enabled 开启且
-        // URL 非空时装配（见 runtime.rs），复用其 ConnectionManager。
-        Some(conn) => {
-            let mut conn = conn.clone();
-            claim_internal_guards_redis_compat(&mut conn, &input, body_hash, replay_ttl_secs).await
-        }
-        // 默认 Redis-free：MySQL durable guard（auth_internal_request_guard）。
-        None => claim_internal_guards_mysql(&state.db, &input, body_hash, replay_ttl_secs).await,
-    };
-    // 默认 Redis-free：MySQL durable guard（auth_internal_request_guard）。
-    // feature-off 构建中 compat adapter 不存在（AppState 无 redis 字段），
-    // 一律 durable guard，绝不静默改判。
-    #[cfg(not(feature = "redis-compat"))]
     let outcome = claim_internal_guards_mysql(&state.db, &input, body_hash, replay_ttl_secs).await;
     outcome.map_err(|rejection| guard_rejection_error(user_id, rejection))
 }
@@ -878,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_assertion_is_accepted_without_redis() {
+    fn valid_assertion_is_accepted_before_durable_guard_claims() {
         let body = br#"{"userId":42}"#;
         let headers = signed_headers(body, "1700000000000");
         let assertion = validate(&headers, body, USER_ID).expect("valid assertion");
@@ -1020,9 +943,9 @@ mod tests {
     }
 
     #[test]
-    fn claimed_guard_outcomes_accept_request_without_redis() {
-        // 默认 MySQL durable 路径的接受判定：两阶段均 Claimed → 放行，
-        // 全程无 Redis 参与（state.redis = None 时唯一可达路径）。
+    fn claimed_guard_outcomes_accept_request_after_hmac_verification() {
+        // MySQL durable guard 的接受判定：两阶段均 Claimed → 放行；
+        // HMAC 验证成功之后才允许进入 durable replay/idempotency claims。
         assert_eq!(replay_claim_outcome(Ok(GuardClaim::Claimed)), Ok(()));
         assert_eq!(
             idempotency_claim_outcome(Ok(GuardClaim::Claimed), Ok(None), "abc"),
@@ -1137,24 +1060,28 @@ mod tests {
     }
 
     #[test]
-    fn redis_free_default_path_is_wired_to_durable_guard() {
+    fn internal_request_path_is_wired_to_durable_mysql_guard() {
         let source = include_str!("internal.rs");
-        // 逐请求 Client::open 必须移除：默认路径不得再依赖 Redis 可用性。
-        // needle 由片段拼出，避免本测试源码自匹配。
+        // No request may construct a Redis client or use a non-durable replay guard.
+        // The needle is assembled to avoid self-matching this source-shape test.
         let needle = format!("redis::Client::{}", "ope");
         let needle = format!("{needle}n");
         assert!(
             !source.contains(&needle),
-            "per-request redis client construction must not return"
+            "per-request Redis client construction must not return"
         );
         // 默认路径绑定 MySQL durable guard 原语（与 Gateway 同表同语义）。
         assert!(source.contains("claim_replay_guard"));
         assert!(source.contains("claim_idempotency_guard"));
         assert!(source.contains("GUARD_SCOPE_IDENTITY_REPLAY"));
         assert!(source.contains("GUARD_SCOPE_IDENTITY_IDEMPOTENCY"));
-        // 实现选择以 runtime 装配的 compat adapter 为准：Some=显式兼容路径，
-        // None=默认 MySQL durable 路径。
-        assert!(source.contains("match state.redis.as_ref()"));
+        // Every accepted request claims the MySQL replay and idempotency guards
+        // after the signed assertion has passed validation.
+        assert!(source.contains(
+            "claim_internal_guards_mysql(&state.db, &input, body_hash, replay_ttl_secs).await"
+        ));
+        assert!(source.contains("let assertion = match validate_internal_assertion("));
+        assert!(source.contains("let input = assertion.signature_input()"));
         // 判定层复用共享 marker 决策原语，与 Gateway 语义一致。
         assert!(source.contains("idempotency_marker_decision"));
     }

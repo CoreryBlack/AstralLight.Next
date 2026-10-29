@@ -67,7 +67,7 @@
 //! No `authorization_delta_event` consumer loop, no ArchiveWorker, no source
 //! writers, no legacy table access and no PolicyEngine wiring. The module
 //! provides the primitives and a documented single-transaction orchestration
-//! ([`project_authorization_delta_in_tx`]); background execution, retry
+//! ([`crate::project_owned_authorization_delta_in_tx`]); background execution, retry
 //! budgeting and scheduling stay outside. Callers own commit / rollback; this
 //! module never commits, never touches Redis/MQ/network and performs no
 //! compilation.
@@ -210,7 +210,7 @@
 //! 4. `authorization_projection_segment` — referenced content rows.
 //!
 //! The combined projector contract
-//! ([`project_authorization_delta_in_tx`]) prefixes a fixed head so no
+//! ([`crate::project_owned_authorization_delta_in_tx`]) prefixes a fixed head so no
 //! statement cycle can ever form with the owner modules of the other tables:
 //! 0. `authorization_delta_event` row `FOR UPDATE` (granted identity,
 //!    locked by [`crate::grant_repository::load_claimed_delta_event_for_update_in_tx`])
@@ -277,8 +277,8 @@ use astral_types::{
     PublishedCardAuthorization, PublishedCardAuthorizationGate, PublishedCardEvidenceScope,
     PublishedEvidenceGateStatus, UnacceptedGrantReason, ValidityWindow,
     VerifiedPublishedGrantRecord, AUTHORIZATION_ARCHIVE_DIGEST_DOMAIN,
-    AUTHORIZATION_SEGMENT_DEPENDENCY_DOMAIN, AUTHORIZATION_SEGMENT_FORMAT,
-    AUTHORIZATION_SEGMENT_SEMANTIC_DOMAIN,
+    AUTHORIZATION_COMPILER_VERSION, AUTHORIZATION_SEGMENT_DEPENDENCY_DOMAIN,
+    AUTHORIZATION_SEGMENT_FORMAT, AUTHORIZATION_SEGMENT_SEMANTIC_DOMAIN,
 };
 
 pub use crate::grant_repository::Sha256Digest;
@@ -468,6 +468,28 @@ fn scope_violation(code: &str) -> AuthorizationProjectionError {
 
 fn mapping_error(code: String) -> AuthorizationProjectionError {
     AuthorizationProjectionError::Mapping(code)
+}
+
+fn require_current_compiler_request(
+    compiler_version: &str,
+    code: &'static str,
+) -> Result<(), AuthorizationProjectionError> {
+    if compiler_version != AUTHORIZATION_COMPILER_VERSION {
+        return Err(scope_violation(code));
+    }
+    Ok(())
+}
+
+fn require_current_compiler_proof(
+    compiler_version: &str,
+    code: &'static str,
+) -> Result<(), AuthorizationProjectionError> {
+    if compiler_version != AUTHORIZATION_COMPILER_VERSION {
+        return Err(AuthorizationProjectionError::Corrupt(format!(
+            "code={code}"
+        )));
+    }
+    Ok(())
 }
 
 fn unique_violation(error: &sqlx::Error) -> bool {
@@ -896,6 +918,10 @@ pub fn compute_segment_dependency_hash(
 pub fn verify_segment_local_seal(
     snapshot: &AuthorizationSegmentSnapshot,
 ) -> Result<(), AuthorizationProjectionError> {
+    require_current_compiler_proof(
+        &snapshot.compiler_version,
+        "authorization_projection.non_current_segment_compiler",
+    )?;
     let input = SegmentLocalSealInput {
         identity: &snapshot.identity,
         card_id: snapshot.card_id,
@@ -957,6 +983,10 @@ fn verify_parent_manifest_chain(
     parent: &ManifestRawSqlRow,
     references: &[AuthorizationSegmentReferenceRecord],
 ) -> Result<(), AuthorizationProjectionError> {
+    require_current_compiler_proof(
+        &parent.compiler_version,
+        "authorization_projection.non_current_manifest_compiler",
+    )?;
     let counted: Vec<(u64, u64)> = references.iter().map(|r| (r.ordinal, 0_u64)).collect();
     validate_contiguous_ordinals(&counted)?;
     let recomputed = parent.recomputed_digest(
@@ -1275,6 +1305,10 @@ pub fn validate_manifest_publish(
             "code=authorization_projection.publish_expected_dependency_hash_invalid".to_owned(),
         ));
     }
+    require_current_compiler_proof(
+        &expectation.expected_target_compiler_version,
+        "authorization_projection.non_current_publish_target_compiler",
+    )?;
     validated_text(
         &expectation.expected_target_compiler_version,
         MAX_COMPILER_VERSION_LENGTH,
@@ -1470,6 +1504,14 @@ impl AuthorizationPublishedState {
     /// manifest state. Source generations, leases and recovery rows do not
     /// have enough evidence to construct this value.
     pub fn publication_stamp(&self) -> Result<PublicationStamp, AuthorizationProjectionError> {
+        require_current_compiler_proof(
+            &self.compiler_version,
+            "authorization_projection.non_current_state_compiler",
+        )?;
+        require_current_compiler_proof(
+            &self.pointer.compiler_version,
+            "authorization_projection.non_current_pointer_compiler",
+        )?;
         PublicationStamp::new(self.generation, self.manifest_digest.as_hex(), self.seal).map_err(
             |error| {
                 mapping_error(format!(
@@ -1706,6 +1748,10 @@ impl ManifestRawSqlRow {
         &self,
         segment_content_digests_hex: Vec<String>,
     ) -> Result<Sha256Digest, AuthorizationProjectionError> {
+        require_current_compiler_proof(
+            &self.compiler_version,
+            "authorization_projection.non_current_manifest_compiler",
+        )?;
         let (generation, source_generation, projected_generation) = self.decode_generations()?;
         compute_manifest_digest(&ManifestDigestInput {
             seal: self.decode_seal()?,
@@ -1883,6 +1929,10 @@ struct PointerRawSqlRow {
 
 impl PointerRawSqlRow {
     fn decode(&self) -> Result<AuthorizationCurrentPointerRecord, AuthorizationProjectionError> {
+        require_current_compiler_proof(
+            &self.compiler_version,
+            "authorization_projection.non_current_pointer_compiler",
+        )?;
         if self.status != PROJECTION_STATUS_READY {
             return Err(AuthorizationProjectionError::NotReady(format!(
                 "code=authorization_projection.pointer_not_ready;status={}",
@@ -2401,7 +2451,7 @@ async fn ensure_reference_row_in_tx(
 ///
 /// The function neither commits nor releases locks; callers own commit /
 /// rollback plus the subsequent claim/finalize/publish steps.
-pub async fn stage_authorization_manifest_in_tx(
+async fn stage_authorization_manifest_in_tx(
     tx: &mut Transaction<'_, MySql>,
     request: &AuthorizationStageRequest,
 ) -> Result<AuthorizationStageOutcome, AuthorizationProjectionError> {
@@ -2421,16 +2471,19 @@ pub async fn stage_authorization_manifest_in_tx(
             "authorization_projection.projected_generation_exceeds_source",
         ));
     }
+    require_current_compiler_request(
+        &request.compiler_version,
+        "authorization_projection.non_current_stage_compiler",
+    )?;
     validated_text(&request.event_id, MAX_EVENT_ID_LENGTH, "event_id")?;
     validated_text(
         &request.operation_id,
         MAX_GRANT_OPERATION_ID_LENGTH,
         "operation_id",
     )?;
-    validated_text(
+    require_current_compiler_request(
         &request.compiler_version,
-        MAX_COMPILER_VERSION_LENGTH,
-        "compiler_version",
+        "authorization_projection.non_current_request_compiler",
     )?;
     let semantic_hash = Sha256Digest::from_hex(&request.semantic_hash_hex)?;
     let dependency_hash = Sha256Digest::from_hex(&request.dependency_hash_hex)?;
@@ -2444,6 +2497,10 @@ pub async fn stage_authorization_manifest_in_tx(
     let base_pointer = lock_current_pointer_in_tx(tx, &request.identity).await?;
     if let Some(pointer) = &base_pointer {
         validate_pointer_proof_state(pointer.revoke_fence, pointer.revoke_fence_proven)?;
+        require_current_compiler_proof(
+            &pointer.compiler_version,
+            "authorization_projection.non_current_parent_pointer_compiler",
+        )?;
     }
     // Authoritative parent lineage for the durable `parent_manifest_id`
     // column: NULL only for a genuine first build, otherwise the locked
@@ -2784,25 +2841,20 @@ pub async fn stage_authorization_manifest_in_tx(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Manifest lease primitives (claim / heartbeat / release / quarantine)
+// Manifest lease inside the owned atomic publication transaction
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Run-scoped secret fencing one manifest lease; identical policy to the delta
 /// queue lease: the database stores only the SHA-256 token hash.
 #[derive(Clone, PartialEq, Eq)]
-pub struct ManifestLeaseToken(String);
+struct ManifestLeaseToken(String);
 
 impl ManifestLeaseToken {
     fn new_run_scoped() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn for_test(token: &str) -> Self {
-        Self(token.to_owned())
-    }
-
-    pub fn as_str(&self) -> &str {
+    fn as_str(&self) -> &str {
         &self.0
     }
 
@@ -2815,14 +2867,6 @@ impl fmt::Debug for ManifestLeaseToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ManifestLeaseToken(REDACTED)")
     }
-}
-
-/// Owner + token proof every lease-guarded manifest mutation must present.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManifestLeaseProof {
-    pub manifest_id: i64,
-    pub lease_owner: String,
-    pub lease_token: ManifestLeaseToken,
 }
 
 fn validate_lease_material(
@@ -2838,31 +2882,12 @@ fn validate_lease_material(
     Ok(())
 }
 
-fn validate_lease_proof(proof: &ManifestLeaseProof) -> Result<(), AuthorizationProjectionError> {
-    positive_i64(proof.manifest_id, "manifest_id")?;
-    validated_text(
-        &proof.lease_owner,
-        MAX_GRANT_LEASE_OWNER_LENGTH,
-        "lease_owner",
-    )?;
-    if proof.lease_token.as_str().trim().is_empty() {
-        return Err(scope_violation(
-            "authorization_projection.empty_lease_token",
-        ));
-    }
-    Ok(())
-}
-
 /// Lease granted on one `BUILDING` manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorizationManifestLeaseGrant {
-    pub manifest_id: i64,
-    pub identity: ProjectionAggregateIdentity,
-    pub generation: u64,
-    pub lease_owner: String,
-    pub lease_token: ManifestLeaseToken,
-    pub lease_expires_at: PrimitiveDateTime,
-    pub cas_version_after_claim: i64,
+struct AuthorizationManifestLeaseGrant {
+    lease_owner: String,
+    lease_token: ManifestLeaseToken,
+    cas_version_after_claim: i64,
 }
 
 const MANIFEST_CLAIM_CANDIDATE_SQL: &str = "SELECT manifest_id, status \
@@ -2890,7 +2915,7 @@ const MANIFEST_CLAIM_READBACK_SQL: &str = "SELECT lease_expires_at, cas_version,
 /// Live leases are never stolen; expired leases are reclaimable exactly like
 /// unleased rows. Returns `Ok(None)` when nothing is claimable. Generates a
 /// fresh run-scoped [`ManifestLeaseToken`]; only its SHA-256 hash persists.
-pub async fn claim_authorization_manifest_in_tx(
+async fn claim_authorization_manifest_in_tx(
     tx: &mut Transaction<'_, MySql>,
     identity: &ProjectionAggregateIdentity,
     generation: u64,
@@ -2948,29 +2973,27 @@ pub async fn claim_authorization_manifest_in_tx(
         .bind(candidate.manifest_id)
         .fetch_one(&mut **tx)
         .await?;
-    let Some(lease_expires_at) = readback.lease_expires_at else {
+    if readback.lease_expires_at.is_none() {
         return Err(mapping_error(
             "code=authorization_projection.claim_expiry_missing".to_owned(),
         ));
-    };
+    }
     let claimed_identity = ProjectionAggregateIdentity::new(
         readback.tenant_id,
         readback.aggregate_type,
         readback.aggregate_id,
     )?;
-    if claimed_identity != *identity {
+    if claimed_identity != *identity
+        || read_counter_i64(readback.generation, "claim.generation")? != generation
+    {
         return Err(AuthorizationProjectionError::IdentityMismatch(
             "code=authorization_projection.claim_identity_drift".to_owned(),
         ));
     }
 
     Ok(Some(AuthorizationManifestLeaseGrant {
-        manifest_id: candidate.manifest_id,
-        identity: identity.clone(),
-        generation: read_counter_i64(readback.generation, "claim.generation")?,
         lease_owner: lease_owner.to_owned(),
         lease_token: token,
-        lease_expires_at,
         cas_version_after_claim: readback.cas_version,
     }))
 }
@@ -2981,141 +3004,13 @@ struct ManifestClaimCandidateRow {
     status: String,
 }
 
-/// Extend a live lease keeping the SAME run-scoped token (expiry forward,
-/// cas + 1).
-///
-/// Fails closed unless exactly one live leased row owned by
-/// `proof.lease_owner` carrying the claimed token hash matches. With
-/// `expected_cas_version` present the mutation additionally pins the row to
-/// that CAS counter before advancing it.
-pub async fn heartbeat_authorization_manifest_lease<'e, E>(
-    executor: E,
-    proof: &ManifestLeaseProof,
-    expected_cas_version: Option<i64>,
-    extension_seconds: i64,
-) -> Result<(), AuthorizationProjectionError>
-where
-    E: Executor<'e, Database = MySql>,
-{
-    validate_lease_proof(proof)?;
-    validate_lease_material(&proof.lease_owner, extension_seconds)?;
-    let token_hash_bytes = proof.lease_token.token_hash().as_bytes().to_vec();
-    let result = match expected_cas_version {
-        None => {
-            // Bind order follows statement text: SET expiry, then guard
-            // (manifest_id, owner, token hash).
-            sqlx::query(MANIFEST_HEARTBEAT_SQL)
-                .bind(extension_seconds)
-                .bind(proof.manifest_id)
-                .bind(&proof.lease_owner)
-                .bind(token_hash_bytes.clone())
-                .execute(executor)
-                .await?
-        }
-        Some(expected_cas) => {
-            sqlx::query(MANIFEST_HEARTBEAT_WITH_CAS_SQL)
-                .bind(extension_seconds)
-                .bind(proof.manifest_id)
-                .bind(expected_cas)
-                .bind(&proof.lease_owner)
-                .bind(token_hash_bytes)
-                .execute(executor)
-                .await?
-        }
-    };
-    if result.rows_affected() != 1 {
-        return Err(AuthorizationProjectionError::LeaseCasFailed(
-            "code=authorization_projection.heartbeat_lost_lease".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-const MANIFEST_HEARTBEAT_SQL: &str = "UPDATE authorization_projection_manifest \
-    SET lease_expires_at = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()), \
-        cas_version = cas_version + 1 \
-    WHERE manifest_id = ? AND lease_owner = ? AND lease_token_hash = ? \
-      AND lease_expires_at IS NOT NULL AND lease_expires_at > UTC_TIMESTAMP()";
-
-const MANIFEST_HEARTBEAT_WITH_CAS_SQL: &str = "UPDATE authorization_projection_manifest \
-    SET lease_expires_at = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()), \
-        cas_version = cas_version + 1 \
-    WHERE manifest_id = ? AND cas_version = ? AND lease_owner = ? AND lease_token_hash = ? \
-      AND lease_expires_at IS NOT NULL AND lease_expires_at > UTC_TIMESTAMP()";
-
-/// Relinquish the lease without changing the manifest status (it stays
-/// `BUILDING`, remaining safely unpublishable until someone claims again).
-pub async fn release_authorization_manifest_lease<'e, E>(
-    executor: E,
-    proof: &ManifestLeaseProof,
-) -> Result<(), AuthorizationProjectionError>
-where
-    E: Executor<'e, Database = MySql>,
-{
-    validate_lease_proof(proof)?;
-    let result = sqlx::query(MANIFEST_RELEASE_SQL)
-        .bind(proof.manifest_id)
-        .bind(&proof.lease_owner)
-        .bind(proof.lease_token.token_hash().as_bytes().to_vec())
-        .execute(executor)
-        .await?;
-    if result.rows_affected() != 1 {
-        return Err(AuthorizationProjectionError::LeaseCasFailed(
-            "code=authorization_projection.release_lost_lease".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-const MANIFEST_RELEASE_SQL: &str = "UPDATE authorization_projection_manifest \
-    SET lease_owner = NULL, lease_token_hash = NULL, lease_expires_at = NULL \
-    WHERE manifest_id = ? AND lease_owner = ? AND lease_token_hash = ? \
-      AND status = 'BUILDING' \
-      AND lease_expires_at IS NOT NULL AND lease_expires_at > UTC_TIMESTAMP()";
-
-/// Operator-quarantine of a `BUILDING`/`READY` manifest held under a live
-/// lease; stores a truncated failure reason and clears the lease.
-///
-/// Historical states (`COMMITTED`/`SUPERSEDED`) stay untouched here so the
-/// readable evidence trail cannot be flipped by one operator action.
-pub async fn mark_authorization_manifest_quarantined<'e, E>(
-    executor: E,
-    proof: &ManifestLeaseProof,
-    reason: &str,
-) -> Result<(), AuthorizationProjectionError>
-where
-    E: Executor<'e, Database = MySql>,
-{
-    validate_lease_proof(proof)?;
-    let result = sqlx::query(MANIFEST_QUARANTINE_SQL)
-        .bind(truncate_last_error(reason))
-        .bind(proof.manifest_id)
-        .bind(&proof.lease_owner)
-        .bind(proof.lease_token.token_hash().as_bytes().to_vec())
-        .execute(executor)
-        .await?;
-    if result.rows_affected() != 1 {
-        return Err(AuthorizationProjectionError::LeaseCasFailed(
-            "code=authorization_projection.quarantine_lost_lease".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-const MANIFEST_QUARANTINE_SQL: &str = "UPDATE authorization_projection_manifest \
-    SET status = 'QUARANTINED', lease_owner = NULL, lease_token_hash = NULL, \
-        lease_expires_at = NULL, last_error = ? \
-    WHERE manifest_id = ? AND lease_owner = ? AND lease_token_hash = ? \
-      AND status IN ('BUILDING', 'READY') \
-      AND lease_expires_at IS NOT NULL AND lease_expires_at > UTC_TIMESTAMP()";
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Finalize: BUILDING -> READY after full completeness verification
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Inputs for finalizing a staged manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorizationFinalizeRequest {
+struct AuthorizationFinalizeRequest {
     pub identity: ProjectionAggregateIdentity,
     pub target_generation: u64,
     pub manifest_id: i64,
@@ -3134,7 +3029,7 @@ pub struct AuthorizationFinalizeRequest {
 /// continuous references and every referenced segment being READY with an
 /// unchanged hash chain. Completeness violations abort BEFORE the status
 /// update; the manifest simply stays `BUILDING` (unpublishable).
-pub async fn finalize_authorization_manifest_in_tx(
+async fn finalize_authorization_manifest_in_tx(
     tx: &mut Transaction<'_, MySql>,
     request: &AuthorizationFinalizeRequest,
 ) -> Result<(), AuthorizationProjectionError> {
@@ -3347,18 +3242,6 @@ fn post_publish_pointer_agrees(
 /// There is no unconditional overwrite path: with an existing pointer the
 /// statement always demands `current_generation`, `manifest_id` and
 /// `cas_version` to match the freshly locked expectation exactly.
-pub async fn publish_current_pointer_in_tx(
-    tx: &mut Transaction<'_, MySql>,
-    request: &AuthorizationPublishRequest,
-) -> Result<AuthorizationPublishOutcome, AuthorizationProjectionError> {
-    if crate::projection_execution_mode() == crate::ProjectionExecutionMode::WorkerOwned {
-        return Err(scope_violation(
-            "projection_execution.legacy_execution_refused",
-        ));
-    }
-    publish_current_pointer_core_in_tx(tx, request).await
-}
-
 async fn publish_current_pointer_core_in_tx(
     tx: &mut Transaction<'_, MySql>,
     request: &AuthorizationPublishRequest,
@@ -3944,6 +3827,14 @@ pub(crate) fn assemble_verified_published_state(
             "code=authorization_projection.pointer_manifest_card_split".to_owned(),
         ));
     }
+    require_current_compiler_proof(
+        &manifest.compiler_version,
+        "authorization_projection.non_current_published_compiler",
+    )?;
+    require_current_compiler_proof(
+        &pointer.compiler_version,
+        "authorization_projection.non_current_pointer_compiler",
+    )?;
     let (semantic_hash, dependency_hash, manifest_digest) = manifest.decode_hashes()?;
     if semantic_hash != pointer.semantic_hash
         || dependency_hash != pointer.dependency_hash
@@ -4066,6 +3957,10 @@ pub async fn load_authorization_recovery_state_in_tx(
             "code=authorization_projection.recovery_identity_mismatch".to_owned(),
         ));
     }
+    require_current_compiler_proof(
+        &manifest.compiler_version,
+        "authorization_projection.non_current_recovery_compiler",
+    )?;
     let status = manifest.decode_status()?;
     let (recovered_generation, recovered_source, recovered_projected) =
         manifest.decode_generations()?;
@@ -4649,14 +4544,10 @@ pub async fn rehearse_legacy_fence_proof_in_tx(
 // Strict published card grant evidence reader (read-only slice)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// This is the formal read-side prerequisite for `PolicyEngine.evaluate()` when
-// the repository capability `requires_published_card_evidence()` is true. It
-// does not change policy semantics, does not touch the legacy snapshot/read
-// path, and does not integrate CACHE or MQ. It reads EXCLUSIVELY the Rust-owned
-// manifest/segment tables created by migration `20260825000002` (as extended by
-// `20260827000001`); legacy `permission_rule_snapshot` / `rule_set_snapshot`
-// rows, the legacy head/outbox path and every cache fallback are invisible to
-// this code by construction.
+// This is the mandatory CARD published-evidence prerequisite for
+// `PolicyEngine.evaluate()`. It reads exclusively the current Rust-owned
+// manifest/segment contract; source correlation, historical snapshot rows,
+// process caches and MQ cannot substitute for this durable proof.
 //
 // Guarantees provided to the formal caller:
 // 1. One deterministic lock order: all matching `authorization_projection_current`
@@ -5362,7 +5253,7 @@ pub(crate) async fn load_published_card_state_bundle_in_tx(
     // `NotReady → PENDING`。ADD/UPDATE 类未发布 delta 不阻塞（缺新授权只是
     // ms 级漏授权窗口，deny-biased EC 语义）。该门只挂正式证据读入口——
     // projector 的 frontier/发布路径（`read_published_authorization_state_in_tx`
-    // / `load_published_aggregate_frontier_in_tx` / `project_authorization_delta_in_tx`）
+    // / `load_published_aggregate_frontier_in_tx` / `crate::project_owned_authorization_delta_in_tx`）
     // 不得经过本探针，否则发布事务会被自己未完成的 delta 自锁（由源码锚定
     // 守卫测试钉住）。
     if card_has_unsafe_pending_delta_in_tx(tx, scope.tenant_id, scope.card_id).await? {
@@ -5735,7 +5626,7 @@ pub struct AuthorizationImpactPlanAppendRequest {
     pub items: Vec<AuthorizationImpactItemInput>,
 }
 
-/// Evidence returned by [`ensure_authorization_impact_plan_in_tx`].
+/// Evidence of the immutable impact plan verified by the owned publisher.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationImpactPlanOutcome {
     pub plan_id: i64,
@@ -5961,10 +5852,9 @@ impl ImpactPlanRawSqlRow {
             MAX_GRANT_OPERATION_ID_LENGTH,
             "operation_id",
         )?;
-        validated_text(
+        require_current_compiler_proof(
             &self.compiler_version,
-            MAX_COMPILER_VERSION_LENGTH,
-            "compiler_version",
+            "authorization_projection.non_current_proof_compiler",
         )?;
         if self.attempts < 0 || self.cas_version < 0 {
             return Err(mapping_error(
@@ -6234,7 +6124,7 @@ async fn ensure_impact_item_row_in_tx(
 ///   (`0 <= base < target`), and at least one item is required.
 ///
 /// Neither commit nor lock release happens here; callers own the transaction.
-pub async fn ensure_authorization_impact_plan_in_tx(
+async fn ensure_authorization_impact_plan_in_tx(
     tx: &mut Transaction<'_, MySql>,
     request: &AuthorizationImpactPlanAppendRequest,
 ) -> Result<AuthorizationImpactPlanOutcome, AuthorizationProjectionError> {
@@ -6246,10 +6136,13 @@ pub async fn ensure_authorization_impact_plan_in_tx(
         MAX_GRANT_OPERATION_ID_LENGTH,
         "operation_id",
     )?;
-    validated_text(
+    require_current_compiler_request(
         &request.compiler_version,
-        MAX_COMPILER_VERSION_LENGTH,
-        "compiler_version",
+        "authorization_projection.non_current_impact_plan_compiler",
+    )?;
+    require_current_compiler_request(
+        &request.compiler_version,
+        "authorization_projection.non_current_request_compiler",
     )?;
     if request.base_version < 0 || request.target_version <= request.base_version {
         return Err(scope_violation(
@@ -6521,7 +6414,7 @@ pub async fn load_authorization_impact_plan_by_event_in_tx(
 /// Guarded by plan/event/aggregate identity; `affected_rows != 1` (already
 /// completed, foreign state or unknown plan) fails closed so an anomalous
 /// history surfaces instead of silently de-duplicating worker results.
-pub async fn complete_authorization_impact_plan_in_tx(
+async fn complete_authorization_impact_plan_in_tx(
     tx: &mut Transaction<'_, MySql>,
     plan_id: i64,
     identity: &ProjectionAggregateIdentity,
@@ -6872,6 +6765,10 @@ pub struct PublishedGenerationSummary {
 impl PublishedGenerationSummary {
     /// Validate the compact stamp against the duplicated manifest evidence.
     pub fn validate_publication_stamp(&self) -> Result<(), AuthorizationProjectionError> {
+        require_current_compiler_proof(
+            &self.compiler_version,
+            "authorization_projection.non_current_summary_compiler",
+        )?;
         self.stamp.validate().map_err(|error| {
             mapping_error(format!(
                 "code=authorization_projection.invalid_publication_stamp;error={error}"
@@ -6984,6 +6881,16 @@ impl PublishedAggregateFrontier {
     /// identity, manifest identity, and card scope remain explicit on the
     /// surrounding frontier and must stay closed as one tuple.
     pub fn validate_publication_stamp(&self) -> Result<(), AuthorizationProjectionError> {
+        require_current_compiler_proof(
+            &self.pointer.compiler_version,
+            "authorization_projection.non_current_frontier_pointer_compiler",
+        )?;
+        for event in &self.events {
+            require_current_compiler_proof(
+                &event.compiler_version,
+                "authorization_projection.non_current_frontier_event_compiler",
+            )?;
+        }
         if self.pointer.identity != self.identity {
             return Err(AuthorizationProjectionError::IdentityMismatch(
                 "code=authorization_projection.frontier_pointer_identity_split".to_owned(),
@@ -7135,10 +7042,11 @@ pub fn assemble_published_aggregate_frontier(
                 "code=authorization_projection.frontier_plan_card_mismatch;generation={expected_generation}"
             )));
         }
-        if plan.event_id.is_empty()
-            || plan.operation_id.is_empty()
-            || plan.compiler_version.is_empty()
-        {
+        require_current_compiler_proof(
+            &plan.compiler_version,
+            "authorization_projection.non_current_frontier_plan_compiler",
+        )?;
+        if plan.event_id.is_empty() || plan.operation_id.is_empty() {
             return Err(mapping_error(format!(
                 "code=authorization_projection.frontier_plan_identity_invalid;generation={expected_generation}"
             )));
@@ -7998,10 +7906,9 @@ impl ArchiveOutboxRawSqlRow {
             "operation_id",
         )?;
         validated_text(&self.archive_key, MAX_ARCHIVE_KEY_LENGTH, "archive_key")?;
-        validated_text(
+        require_current_compiler_proof(
             &self.compiler_version,
-            MAX_COMPILER_VERSION_LENGTH,
-            "compiler_version",
+            "authorization_projection.non_current_proof_compiler",
         )?;
         if self.attempts < 0 || self.cas_version < 0 {
             return Err(mapping_error(
@@ -8334,7 +8241,7 @@ fn prove_archive_intent_against_live_pointer(
 ///   with explicit conflicts instead of silent skips;
 /// - first publications (`NoArchiveRequired`) must not reach this function
 ///   with fabricated parent values — [`decide_archive_intent`] gates that.
-pub async fn ensure_authorization_archive_intent_in_tx(
+async fn ensure_authorization_archive_intent_in_tx(
     tx: &mut Transaction<'_, MySql>,
     request: &AuthorizationArchiveIntentAppendRequest,
 ) -> Result<AuthorizationArchiveIntentOutcome, AuthorizationProjectionError> {
@@ -8354,10 +8261,9 @@ pub async fn ensure_authorization_archive_intent_in_tx(
         "operation_id",
     )?;
     validated_text(&request.archive_key, MAX_ARCHIVE_KEY_LENGTH, "archive_key")?;
-    validated_text(
+    require_current_compiler_request(
         &request.compiler_version,
-        MAX_COMPILER_VERSION_LENGTH,
-        "compiler_version",
+        "authorization_projection.non_current_request_compiler",
     )?;
     // Fence overflow gate into the signed BIGINT domain before any SQL runs.
     bind_u64(
@@ -9311,10 +9217,9 @@ impl ArchiveManifestRawSqlRow {
             "operation_id",
         )?;
         validated_text(&self.archive_key, MAX_ARCHIVE_KEY_LENGTH, "archive_key")?;
-        validated_text(
+        require_current_compiler_proof(
             &self.compiler_version,
-            MAX_COMPILER_VERSION_LENGTH,
-            "compiler_version",
+            "authorization_projection.non_current_proof_compiler",
         )?;
         if self.cas_version < 0 {
             return Err(mapping_error(
@@ -9834,10 +9739,9 @@ pub async fn record_authorization_archive_proof_in_tx(
         "operation_id",
     )?;
     validated_text(&request.archive_key, MAX_ARCHIVE_KEY_LENGTH, "archive_key")?;
-    validated_text(
+    require_current_compiler_request(
         &request.compiler_version,
-        MAX_COMPILER_VERSION_LENGTH,
-        "compiler_version",
+        "authorization_projection.non_current_request_compiler",
     )?;
     bind_u64(
         request.archived_revoke_fence,
@@ -10032,9 +9936,8 @@ pub async fn record_authorization_archive_proof_in_tx(
 
 /// One fully assembled single-transaction projector command.
 ///
-/// Assembly is pure/manual; execution happens only via
-/// [`project_authorization_delta_in_tx`], which runs the fixed step order and
-/// verifies each pairing. Workers must not hand-write their own sequence.
+/// Assembly is pure/manual; execution happens only via the owned publication
+/// primitive, which runs the fixed step order and verifies each pairing.
 #[derive(Debug, Clone)]
 pub struct DeltaProjectorPublishCommand {
     /// Live delta lease presented by the claiming transaction. It will be
@@ -10115,6 +10018,10 @@ fn validate_projector_command_shape(
             "authorization_projection.command_hash_mismatch",
         ));
     }
+    require_current_compiler_request(
+        &command.expectation.compiler_version,
+        "authorization_projection.non_current_publish_compiler",
+    )?;
     if command.stage.compiler_version != command.expectation.compiler_version
         || command.impact_plan.compiler_version != command.expectation.compiler_version
     {
@@ -10145,7 +10052,7 @@ fn validate_projector_command_shape(
     Ok(())
 }
 
-/// Execute the documented single-transaction projector sequence:
+/// Execute the documented single-transaction worker-owned projector sequence:
 ///
 /// 1. re-lock and strictly verify the claimed delta lease (fail-closed on
 ///    expiry/theft/status drift — a claim ACK alone is never durable proof);
@@ -10167,23 +10074,12 @@ fn validate_projector_command_shape(
 /// explicit error so the caller can roll back atomically. There is no
 /// generalized "AlreadyCurrent converts into success" shortcut: only a full
 /// `COMMITTED` manifest at the expected generation behind the moved pointer
-/// counts as success. Nothing commits; the caller owns the transaction.
-pub async fn project_authorization_delta_in_tx(
-    tx: &mut Transaction<'_, MySql>,
-    command: &DeltaProjectorPublishCommand,
-) -> Result<DeltaProjectorPublishOutcome, AuthorizationProjectionError> {
-    if crate::projection_execution_mode() == crate::ProjectionExecutionMode::WorkerOwned {
-        return Err(scope_violation(
-            "projection_execution.legacy_publication_refused",
-        ));
-    }
-    project_delta_core_in_tx(tx, command, None).await
-}
-
+/// counts as success. Nothing commits; the caller owns the transaction. The
+/// unforgeable aggregate capability is required for the entire sequence.
 pub(super) async fn project_delta_core_in_tx(
     tx: &mut Transaction<'_, MySql>,
     command: &DeltaProjectorPublishCommand,
-    owned_lease: Option<&crate::OwnedDeltaLease>,
+    owned_lease: &crate::OwnedDeltaLease,
 ) -> Result<DeltaProjectorPublishOutcome, AuthorizationProjectionError> {
     validate_projector_command_shape(command)?;
 
@@ -10342,19 +10238,8 @@ pub(super) async fn project_delta_core_in_tx(
     // Renew immediately before terminal completion so a long publication cannot
     // pass the hot-state CAS and then fail only because the original lease window
     // elapsed. A lost lease aborts the transaction and preserves UNKNOWN safety.
-    if let Some(lease) = owned_lease {
-        crate::grant_repository::extend_owned_delta_event_in_tx(tx, lease, 120).await?;
-        crate::grant_repository::complete_owned_delta_event_in_tx(tx, lease).await?;
-    } else {
-        crate::grant_repository::extend_delta_event_lease(
-            &mut **tx,
-            &command.delta_lease_identity,
-            120,
-        )
-        .await?;
-        crate::grant_repository::complete_delta_event(&mut **tx, &command.delta_lease_identity)
-            .await?;
-    }
+    crate::grant_repository::extend_owned_delta_event_in_tx(tx, owned_lease, 120).await?;
+    crate::grant_repository::complete_owned_delta_event_in_tx(tx, owned_lease).await?;
 
     let outcome = DeltaProjectorPublishOutcome {
         impact_plan,
@@ -10362,9 +10247,7 @@ pub(super) async fn project_delta_core_in_tx(
         archive_intent,
         publish,
     };
-    if owned_lease.is_some() {
-        owned_completion::record_publication_in_tx(tx, command, &outcome).await?;
-    }
+    owned_completion::record_publication_in_tx(tx, command, &outcome).await?;
     Ok(outcome)
 }
 

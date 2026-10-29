@@ -139,10 +139,6 @@ pub trait PermissionRequestRepository: Send + Sync {
             "approval contribution revoke is not implemented by this repository".into(),
         ))
     }
-    /// 是否由审批聚合事务追加 authorization projection。
-    fn writes_projection_in_transaction(&self) -> bool {
-        false
-    }
 }
 
 pub struct SqlxPermissionRequestRepository {
@@ -236,10 +232,6 @@ fn derive_approval_revoke_operation_id(
 
 #[async_trait]
 impl PermissionRequestRepository for SqlxPermissionRequestRepository {
-    fn writes_projection_in_transaction(&self) -> bool {
-        true
-    }
-
     async fn create_request(&self, new: &NewRequest) -> Result<i64, AstralError> {
         let result = sqlx::query(
             "INSERT INTO permission_request (user_id, request_type, request_content, reason, status) \

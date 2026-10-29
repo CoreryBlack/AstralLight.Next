@@ -2,32 +2,31 @@
 //!
 //! ## 语义边界（安全相关，必须原文理解）
 //!
-//! - **Redis/DB 仍是权威**：本注册表只是组合进程内的加速镜像。查不到
-//!   （未安装、条目被逐出、进程重启后为空）一律回退既有 Redis
-//!   `jwt:revoked:{jti}` 检查路径，fail-closed 语义不变。
-//! - **只增不漏**：写入方是 Identity 的撤销路径（本进程内已证明的撤销
-//!   事实），误判方向只可能是"漏记 → 回退 Redis"，绝无"多记 → 误杀"。
-//! - **容量上界**：条目数到达 `MAX_REGISTRY_ENTRIES` 时先清理过期条目，
-//!   仍满则淘汰最早写入的存活条目。被淘汰条目的撤销由 Redis TTL
-//!   （7 天）继续覆盖——淘汰是性能退化，不是安全洞。
-//! - 进程重启后注册表为空：Gateway 检查全部回退 Redis，直到本进程再次
-//!   见证撤销事实。这与"崩溃 = 全员可见失败 + durable 收口"的单机模型
-//!   一致，不引入持久化。
+//! - **MySQL durable evidence remains authoritative**：本注册表只是组合进程内的
+//!   bounded accelerator。查不到（未安装、条目被逐出、进程重启后为空）时，
+//!   Gateway 必须继续 strict MySQL durable session/JTI 判定；不得据此推出 ACTIVE。
+//! - **只增不漏**：写入方是 Identity 的已证明 durable 撤销路径；镜像漏记只会
+//!   让读取回到 strict MySQL，绝无"多记 → 放行"。
+//! - **容量与 TTL 有界**：条目数达到 `MAX_REGISTRY_ENTRIES` 时先清过期条目，
+//!   仍满则淘汰存活条目。TTL 保留窗口与 durable proof 保持安全分工；淘汰只使
+//!   读取退化为 MySQL，不影响撤销正确性。
+//! - 进程重启后注册表为空：Gateway 所有请求回到 strict MySQL durable reader，
+//!   不引入新的持久化 source。
 //!
-//! 写入点：`astral-identity` 的会话/刷新/全量撤销路径（与 Redis
-//! `jwt:revoked:{jti}` 写入同一位置、同一 TTL）。读取点：Gateway
-//! 鉴权中间件的撤销检查（注册表命中即 401，未命中继续 Redis 检查）。
+//! 写入点：`astral-identity` 的会话/刷新/全量撤销路径（durable close 已提交后，
+//! 同步登记进程加速面）。读取点：Gateway 鉴权中间件，撤销命中即拒绝，未命中
+//! 继续 strict MySQL durable 判定。
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 注册表条目上界（键数）。超限先清过期，仍超限淘汰最早写入条目；
-/// 淘汰安全由 Redis 权威回退兜底（见模块文档）。
+/// 淘汰后调用方必须继续执行 strict MySQL durable 判定（见模块文档）。
 const MAX_REGISTRY_ENTRIES: usize = 100_000;
 
-/// 容量防线里对存活条目使用的最小剩余 TTL（秒）：淘汰后 Redis 侧至少仍
-/// 覆盖该时长，注册表侧不承诺。
+/// 容量防线里对存活条目使用的最小剩余 TTL（秒）：严格 durable reader 仍是
+/// 权威，注册表侧不承诺被淘汰条目的持续留存。
 const MIN_RETAINED_TTL_SECS: i64 = 60;
 
 static GLOBAL_SESSION_REVOCATION_REGISTRY: OnceLock<SessionRevocationRegistry> = OnceLock::new();
@@ -48,8 +47,8 @@ fn unix_now_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
-        // 时钟倒退的宿主上退化为"立即过期"：注册表不命中 → 回退 Redis，
-        // 绝不因时钟异常延长或伪造撤销状态。
+        // 时钟倒退的宿主上退化为"立即过期"：注册表不命中 → 回到 strict
+        // durable reader，绝不因时钟异常延长或伪造撤销状态。
         .unwrap_or(0)
 }
 
@@ -60,8 +59,8 @@ pub struct SessionRevocationRegistry {
 }
 
 impl SessionRevocationRegistry {
-    /// 登记一条撤销事实（与 Redis 黑名单写入同点同 TTL；调用方是本进程内
-    /// 已证明的撤销路径）。空 jti 忽略（Redis 侧同样拒绝空键）。
+    /// 登记一条撤销事实（调用方是本进程内已证明的 durable 撤销路径）。
+    /// 空 jti 忽略。
     pub fn mark_revoked(&self, jti: &str, ttl_seconds: i64) {
         let jti = jti.trim();
         if jti.is_empty() {
@@ -75,8 +74,8 @@ impl SessionRevocationRegistry {
             let now = unix_now_seconds();
             entries.retain(|_, expires| *expires > now);
             if entries.len() >= MAX_REGISTRY_ENTRIES {
-                // 仍满：淘汰任意一个存活条目。被淘汰 jti 的撤销由 Redis
-                // 权威路径继续覆盖（注册表未命中 → 回退 Redis）。
+                // 仍满：淘汰任意一个存活条目。被淘汰 jti 的后续读取仍由
+                // strict MySQL durable 路径决定，不以注册表未命中推出 ACTIVE。
                 if let Some(first) = entries.keys().next().cloned() {
                     entries.remove(&first);
                 }
@@ -86,7 +85,7 @@ impl SessionRevocationRegistry {
     }
 
     /// 撤销查询：命中未过期条目返回 true；未命中/已过期（惰性清除）返回
-    /// false，调用方必须继续走 Redis 权威检查。
+    /// false，调用方必须继续执行 strict MySQL durable 检查。
     pub fn is_revoked(&self, jti: &str) -> bool {
         let jti = jti.trim();
         if jti.is_empty() {

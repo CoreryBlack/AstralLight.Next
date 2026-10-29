@@ -3,7 +3,7 @@
 > 版本：V1.0
 > 核对基线：2026-08-22
 > 文档性质：当前事实 / 证据索引 / 缺口与目标决策
-> 适用范围：`` 的 Gateway、Identity、Learn、TrustGraph、公共权限上下文与认证会话链路。
+> 适用范围：当前 checkout 的 Gateway、Identity、TrustGraph、公共权限上下文与认证会话链路。Learn/Chat 生产 runtime 已退役并物理移除；独立 SDK consumer sample 与历史资料不属于当前服务链路。
 
 ## 0. 阅读口径
 
@@ -21,13 +21,13 @@
 
 当前 Rust 链路把“认证你是谁”和“授权你能做什么”拆成两条物理事实线路：`identity_card` 提供身份事实，`user_card` 提供授权与组织 scope。`PolicyContext` 只把 `identity_card_id` 放在身份字段，把 `card_id`、`tenant_id`、`domain_id` 映射为 user-card 上下文；`identity_card` 不再作为 tenant/domain 的来源。权威双卡资格由 `CardEligibilityService` 的单条 JOIN 与运行期资格缓存/SQL 回退共同守门。
 
-PlatformUser 的 ACCESS credential 必须带完整双卡 scope；AppUser 的 ACCESS credential 只带 identity-card 上下文，不能把缺失的 user-card scope 当作授权。REFRESH credential 两类主体都不带业务卡字段，由 Identity 按持久化 session 重新读取并在 PlatformUser 路径重新校验目标 user-card。Learn App 登录不是 Gateway HMAC v3 身份转发的替代路径，而是 `astral-internal-v1` 的 Learn → Gateway → Identity 会话签发链；Gateway HMAC v3 用于 Gateway → 下游服务的可信身份转发，两个签名域必须保持分离。
+PlatformUser 的 ACCESS credential 必须带完整双卡 scope；历史 `APP_USER` credential 只作为拒绝/迁移识别，不再有 active issuance 或 refresh 路径。REFRESH credential 由 Identity 按持久化 PlatformUser session 重新读取并校验目标 user-card。Learn/Chat 生产 runtime 已退役；当前 Gateway→下游可信转发统一使用 Gateway HMAC v3。
 
 ## 2. 两张卡与 owner 边界
 
 | 对象 | 当前职责 | 当前 owner / 主要生产者 | 当前消费者与约束 | 证据 |
 |---|---|---|---|---|
-| `identity_card` | 认证身份事实：`user_id`、ACTIVE 状态、token version、有效期；不承载 tenant/domain scope | Identity 的 `CardRepository` 负责查询/确保 App 会话所需的 ACTIVE identity card；Identity 登录、App 内部会话签发和 access token 生产使用它 | Gateway 注入 `x-identity-card-id`；下游把它映射到 `PolicyContext.identity_card_id`；资格服务只用它做身份线路检查 | [`card_repository.rs:16-49`](../../../astral-identity/src/srv/card_repository.rs#L16-L49)、[`internal.rs:389-411`](../../../astral-identity/src/srv/internal.rs#L389-L411)、[`context.rs:21-24`](../../../astral-types/src/context.rs#L21-L24) |
+| `identity_card` | 认证身份事实：`user_id`、ACTIVE 状态、token version、有效期；不承载 tenant/domain scope | Identity 的 `CardRepository` 负责当前 PlatformUser 身份卡查询与校验 | Gateway 注入 `x-identity-card-id`；下游把它映射到 `PolicyContext.identity_card_id`；资格服务只用它做身份线路检查 | [`card_repository.rs`](../../../astral-identity/src/srv/card_repository.rs)、[`context.rs:21-24`](../../../astral-types/src/context.rs#L21-L24) |
 | `user_card` | 授权卡实例：卡类型、模板/等级、ACTIVE 与有效窗口、`tenant_id`、`domain_id`；承载业务授权 scope | TrustGraph 的 user-card API/repository 负责管理与读取；Identity 在登录、刷新、切卡时消费所选卡并重签 access | Gateway 注入 `x-user-card-id`、`x-user-card-tenant-id`、`x-user-card-domain-id`；`PolicyContext.card_id` 指向它；不得从 identity 侧 scope 回退 | [`user_cards.rs:189-250`](../../../astral-trustgraph/src/api/user_cards.rs#L189-L250)、[`user_card_repository.rs:90-138`](../../../astral-trustgraph/src/repository/user_card_repository.rs#L90-L138)、[`physical_policy_context()`](../../../astral-common/src/middleware/permission_check_shared.rs#L55-L118) |
 
 ### 2.1 当前身份事实与授权事实
@@ -38,7 +38,7 @@ PlatformUser 的 ACCESS credential 必须带完整双卡 scope；AppUser 的 ACC
 
 ### 2.2 owner 结论
 
-**当前事实**：Identity owner 认证身份与 session/token；TrustGraph owner user-card、模板、规则和授权投影。Identity 可以在签发时读取 user-card，但这不改变 user-card 的领域 owner。Learn 只消费已签发的 principal/context，并通过公共权限中间件进入 `PolicyEngine`。
+**当前事实**：Identity owner 认证身份与 PlatformUser session/token；TrustGraph owner user-card、模板、规则和授权投影。Learn/Chat 生产 runtime 已退役，独立 SDK consumer sample 不属于当前授权服务链路。
 
 **缺口**：历史 baseline 仍把两张卡描述成旧字段组合，不能单独作为当前运行 schema 证据，见第 10 节。任何跨 owner 的卡片变更仍需同时检查 session projection、eligibility projection、规则快照和审计副作用。
 
@@ -50,46 +50,43 @@ PlatformUser 的 ACCESS credential 必须带完整双卡 scope；AppUser 的 ACC
 
 ### 3.1 Gateway 头到上下文
 
-| Gateway 头 | `PolicyContext` 字段 | PlatformUser | AppUser |
-|---|---|---:|---:|
-| `x-user-id` | `user_id` | 必须为正数 | 必须为正数 |
-| `x-principal-kind` | `principal_kind` | `PLATFORM_USER` | `APP_USER` |
-| `x-identity-card-id` | `identity_card_id` | 必须存在 | 必须存在 |
-| `x-user-card-id` | `card_id` | 必须存在 | 必须不存在 |
-| `x-user-card-tenant-id` | `tenant_id` | 必须存在 | 必须不存在 |
-| `x-user-card-domain-id` | `domain_id` | 必须存在 | 必须不存在 |
-| 路径映射与方法 | `resource` / `action` | 由 service middleware 解析 | 仅 identity-only 路径可使用 |
-| 显式 query ID | `target_id` | 作为对象级授权目标 | 仅在允许的 identity-only 业务中可用 |
+当前正式授权上下文只接受 `PLATFORM_USER`，并要求 identity card 与 user-card 的完整 scope。`APP_USER` 仍可在 token/parser 与拒绝测试中被识别，但不进入当前业务授权路径。
 
-映射函数对 PlatformUser 缺任一 user-card 字段返回 `FORBIDDEN`，对 AppUser 明确返回 `(None, None, None)` 的 user-card scope；它不会把 identity-card 的任何 tenant/domain 旧头转换成授权 scope。见 [`physical_policy_context()`](../../../astral-common/src/middleware/permission_check_shared.rs#L55-L118)。
+| Gateway 头 | `PolicyContext` 字段 | 当前 PlatformUser 合同 | 旧/非法主体 |
+|---|---|---|---|
+| `x-user-id` | `user_id` | 必须为正数 | 缺失或非法则拒绝 |
+| `x-principal-kind` | `principal_kind` | 必须为 `PLATFORM_USER` | `APP_USER` 或未知值只用于拒绝/迁移识别 |
+| `x-identity-card-id` | `identity_card_id` | 必须存在且为正数 | 缺失或非法则拒绝 |
+| `x-user-card-id` | `card_id` | 必须存在且为正数 | 缺失则拒绝 |
+| `x-user-card-tenant-id` | `tenant_id` | 必须存在且为正数 | 缺失则拒绝 |
+| `x-user-card-domain-id` | `domain_id` | 必须存在且为正数 | 缺失则拒绝 |
+| 路径映射与方法 | `resource` / `action` | 由 service middleware 解析 | 未注册资源/动作拒绝 |
+| 显式 query ID | `target_id` | 作为对象级授权目标 | 不从未知路径段推断 |
+
+`physical_policy_context()` 对缺任一 PlatformUser user-card 字段返回 `FORBIDDEN`，对非 PlatformUser 主体不构造可用于业务授权的 identity-only 放行上下文；它不会把 identity-card 的任何 tenant/domain 旧头转换成授权 scope。见 [`physical_policy_context()`](../../../astral-common/src/middleware/permission_check_shared.rs#L55-L118)。
 
 ### 3.2 PolicyEngine 入口
 
-业务权限中间件先解析 path/action，并调用共享 `physical_policy_context` 构造身份/双卡 actor context；该 helper 将 `resource_ownership_scope` 保持为 `Unresolved`，不证明目标资源 owner。服务必须先运行自己的 owner resolver 并将解析结果应用到 context；resolver 未解析或不可用时拒绝/defer，只有 owner 结果满足契约后才调用 `PolicyEngine::evaluate()`。Identity、Monitor、TrustGraph、Learn 的 resolver-before-evaluate 顺序分别见 [`identity/middleware.rs:136-149`](../../../astral-identity/src/middleware.rs#L136-L149)、[`monitor/middleware.rs:74-87`](../../../astral-monitor/src/middleware.rs#L74-L87)、[`trustgraph/permission_check.rs:344-369`](../../../astral-trustgraph/src/api/permission_check.rs#L344-L369) 和 [`learn/middleware.rs:153-190`](../../../astral-learn/src/middleware.rs#L153-L190)。Chat 的 HTTP 目标资源由 middleware 解析；WebSocket 帧按 conversation target 在 [`realtime.rs:804-853`](../../../astral-chat/src/srv/realtime.rs#L804-L853) 单独解析并评估。
-
-**当前事实**：AppUser 只在 Learn 的 `learn-app-users` service 且主体为 `APP_USER` 时被显式放行；登录/登出认证端点也在资源策略之外。见 [`learn/middleware.rs:116-129`](../../../astral-learn/src/middleware.rs#L116-L129)、[`learn/middleware.rs:258-279`](../../../astral-learn/src/middleware.rs#L258-L279)。
-
-**缺口**：`/v1/app/learn` 使用与管理端相同的物理上下文与 PolicyEngine 入口，而 AppUser 上下文没有 user-card scope。当前代码能够证明“identity-only 被保留并拒绝补 scope”，但不能仅凭中间件源码证明所有 App Learn 业务都具备可用的 AppUser 授权模型；需要按实际路由和运行数据补充契约测试或明确其身份-only 边界。
-
+业务权限中间件先解析 path/action，并调用共享 `physical_policy_context` 构造身份/双卡 actor context；该 helper 将 `resource_ownership_scope` 保持为 `Unresolved`，不证明目标资源 owner。服务必须先运行自己的 owner resolver 并将解析结果应用到 context；resolver 未解析或不可用时拒绝/defer，只有 owner 结果满足契约后才调用 `PolicyEngine::evaluate()`。当前 active resolver 入口位于 Identity、Monitor 与 TrustGraph 的服务中；Learn/Chat resolver 已随生产 runtime 物理移除。
 ## 4. SessionGrant 与身份头
 
 ### 4.1 SessionGrant producer / consumer
 
-`SessionGrant` 存储在 `access:grant:{jti}`，生产结构与 Gateway 消费结构字段一致，`formatVersion` 当前为 `2`。生产结构见 [`auth.rs:421-472`](../../../astral-identity/src/auth.rs#L421-L472)，Gateway 反序列化与校验见 [`gateway/middleware.rs:167-267`](../../../astral-gateway/src/middleware.rs#L167-L267)。
+`SessionGrant` 是 Identity 在签发后用于登记 access JTI durable proof 的版本化内部结构；当前 Gateway 准入事实不是 Redis grant，而是 MySQL `auth_session_jti_index` 与 `auth_device_session`、`auth_token_family`、identity/user-card 事实的 strict JOIN。生产结构见 [`auth.rs:319-369`](../../../astral-identity/src/auth.rs#L319-L369)，strict 读取与绑定校验见 [`session_state_repository.rs:35-109`](../../../astral-db/src/session_state_repository.rs#L35-L109) 和 [`session_projection_store.rs:145-257`](../../../astral-common/src/session_projection_store.rs#L145-L257)。
 
-| 字段 | producer 语义 | consumer 校验/用途 |
+| 字段 | 当前 PlatformUser producer 语义 | consumer 校验/用途 |
 |---|---|---|
-| `formatVersion` | 固定 `2` | 仅接受 `2`，未知字段拒绝 |
-| `principalKind` | `PLATFORM_USER` 或 `APP_USER` | 必须与 JWT principal 一致 |
-| `userId` / `sessionId` | 用户与设备 session 绑定 | 与 JWT `sub` / `sid` 一致 |
-| `identityCardId` | 两类 session 都带身份卡 ID | 必须为正数，且与 JWT 一致 |
-| `userCardId` | PlatformUser 带；AppUser 为 `null` | PlatformUser 必须为正数并一致；AppUser 必须为空 |
-| `userCardTenantId` / `userCardDomainId` | PlatformUser 的 user-card 组织 scope；AppUser 为空 | PlatformUser 必须为正数并一致；AppUser 必须为空 |
-| `sessionVersion` / `sessionEpoch` | session 轮换栅栏 | 与 JWT 一致，阻止旧版本继续存活 |
-| `tokenFamilyId` / `sessionState` | family 及 ACTIVE 状态 | 与 JWT/family 约束一致，非 ACTIVE 不接受 |
-| `issuedAtEpochSecond` / `expiresAtEpochSecond` | grant 生命周期 | JWT 时间必须落在 grant 窗口内，grant 不能已过期 |
+| `formatVersion` | 固定 `2`，属于 session-grant wire contract | 未知版本拒绝 |
+| `principalKind` | 固定 `PLATFORM_USER` | 必须与 JWT principal 一致；其他主体拒绝 |
+| `userId` / `sessionId` | 用户与设备 session 绑定 | 与 JWT `sub` / `sid` 及 durable row 一致 |
+| `identityCardId` | 当前身份卡绑定 | 必须为正数并与 durable identity fact 一致 |
+| `userCardId` | 当前授权卡绑定 | 必须与 session/current user-card 及 JWT 一致 |
+| `userCardTenantId` / `userCardDomainId` | user-card 组织 scope | 必须与 durable tenant/domain facts 一致且处于有效状态 |
+| `sessionVersion` / `sessionEpoch` | session 轮换栅栏 | 逐项绑定，阻止旧版本继续存活 |
+| `tokenFamilyId` / `sessionState` | family 及 ACTIVE 状态 | family/session 非 ACTIVE 不接受 |
+| `issuedAtEpochSecond` / `expiresAtEpochSecond` | grant 生命周期 | JWT 时间必须落在 durable proof 窗口内 |
 
-Identity 登录会用 PlatformUser 双卡字段写入 grant，见 [`auth_service.rs:398-429`](../../../astral-identity/src/srv/auth_service.rs#L398-L429)；Learn App internal-v1 会话用 AppUser + identity-only 字段写入 grant，见 [`internal.rs:549-585`](../../../astral-identity/src/srv/internal.rs#L549-L585)。Gateway 在 `EMIT` / `REQUIRE` 模式读取并按上述字段校验；`REQUIRE` 不匹配时拒绝，读取依赖失败时 fail-closed。见 [`gateway/middleware.rs:1099-1160`](../../../astral-gateway/src/middleware.rs#L1099-L1160)。
+Identity 只为 PlatformUser 写入严格 JTI proof；proof 写入失败时签发失败并关闭 family，镜像安装只能在 durable proof 完成后作为有界进程内加速，不能替代 strict DB。见 [`session.rs:817-899`](../../../astral-identity/src/srv/session.rs#L817-L899)。Gateway 在每次带 Bearer 的请求上执行 strict session admission；镜像 miss、过期、suspect 或未安装时回到 MySQL，DB 不可用时 fail-closed。见 [`gateway/middleware.rs:606-666`](../../../astral-gateway/src/middleware.rs#L606-L666)。
 
 ### 4.2 Gateway 注入与下游可信边界
 
@@ -97,7 +94,7 @@ ACCESS 校验通过后，Gateway 将 `x-user-id`、`x-identity-card-id`、`x-use
 
 Gateway 转发时只从认证后的头重新取值并将同一组字段绑定到 HMAC v3；客户端的敏感头不会直接覆盖这些值。见 [`gateway/proxy.rs:897-997`](../../../astral-gateway/src/proxy.rs#L897-L997)。
 
-## 5. PlatformUser 与 AppUser
+## 5. PlatformUser 与历史主体拒绝边界
 
 ### 5.1 PlatformUser
 
@@ -107,96 +104,66 @@ PlatformUser 的业务权限链为：
 
 ```text
 ACCESS JWT
-  -> Gateway session/grant 校验与身份头注入
+  -> Gateway strict MySQL session admission + 身份头注入
   -> Gateway HMAC v3
-  -> Learn / Identity / TrustGraph gateway_signature_middleware
+  -> Identity / TrustGraph / Monitor gateway_signature_middleware
   -> physical_policy_context（双卡完整 scope）
   -> PolicyEngine.evaluate()
 ```
 
-### 5.2 AppUser
+### 5.2 `APP_USER` 与旧主体
 
-AppUser 是一个独立的 `principal_kind` 会话形态，不等于“拥有一张隐含的 user_card”。Learn 登录流程先原子消费验证码、find-or-create `app_user`，再调用 `AppSessionIssuer` 请求内部会话；失败时对新建用户执行补偿删除。见 [`app_user_service.rs:21-39`](../../../astral-learn/src/service/app_user_service.rs#L21-L39)、[`app_user_service.rs:146-232`](../../../astral-learn/src/service/app_user_service.rs#L146-L232)。
+`APP_USER` 不再有 active issuance、refresh、Gateway route 或业务授权入口。token/parser、permission-context 与 session-proof 代码中保留的 `APP_USER` 分支只用于识别历史凭证并 fail-closed 拒绝；它们不是当前能力，也不提供 identity-only 放行。当前 Identity refresh、switch-card、revoke/logout 和受保护 middleware 均要求 `PLATFORM_USER`。
 
-Identity 收到内部请求后校验 active `app_user`，确保 ACTIVE identity card，并通过 `issue_access_token_for_identity_only` 生成 `APP_USER` ACCESS；该路径明确没有 user-card 绑定。见 [`internal.rs:341-411`](../../../astral-identity/src/srv/internal.rs#L341-L411)、[`internal.rs:467-498`](../../../astral-identity/src/srv/internal.rs#L467-L498)、[`auth.rs:251-293`](../../../astral-identity/src/auth.rs#L251-L293)。当前实现还要求该 `app_user` 存在 ACTIVE 的 platform identity mapping，见 [`card_repository.rs:115-143`](../../../astral-identity/src/srv/card_repository.rs#L115-L143)；这说明“AppUser principal”与“底层身份卡记录”并非同一概念。
+Learn/Chat 生产 runtime、AppUser repository、Identity internal session route 与对应服务间签名模块已物理移除。历史测试清单、迁移说明和归档资料仍可能出现这些名称，但只能作为历史事实或旧输入拒绝证据，不得作为当前路由、部署 profile 或 PASS 证据。
 
-AppUser 的允许边界是：身份-only 的 App 用户端点可以消费 `identity_card_id`，但任何需要 user-card、tenant 或 domain 授权的路径都必须拒绝或拥有另行定义且已测试的授权模型。测试已覆盖 AppUser 携带任一 user-card 头时拒绝、PlatformUser 缺任一 user-card 头时拒绝。见 [`gateway_contract_tests.rs:350-410`](../../../tests-suite/series/E1/gateway_contract_tests.rs#L350-L410)。
-
-## 6. Access、Refresh 与 internal-v1 三条链
+## 6. Access、Refresh 与 Gateway HMAC v3
 
 ### 6.1 ACCESS 链
 
-1. Identity 负责签发 JWT；PlatformUser 使用双卡 access，AppUser 使用 identity-only access。见 [`auth.rs:200-293`](../../../astral-identity/src/auth.rs#L200-L293)。
-2. Gateway 按路径先分类 credential policy，再解码 JWT。公共路径只有在没有 Authorization 时匿名放行；带 Bearer 的公共路径仍需通过 access 校验。见 [`gateway/middleware.rs:953-1008`](../../../astral-gateway/src/middleware.rs#L953-L1008)。
-3. Gateway 检查 revoked JTI、`access:jti:{jti}` subject 投影，并按配置读取 `access:grant:{jti}`。见 [`gateway/middleware.rs:1066-1159`](../../../astral-gateway/src/middleware.rs#L1066-L1159)。
-4. Gateway 注入可信身份头，代理为下游计算 HMAC v3；下游先验签，再使用身份头。见 [`gateway/proxy.rs:963-993`](../../../astral-gateway/src/proxy.rs#L963-L993)、[`gateway_signature.rs:65-74`](../../../astral-common/src/middleware/gateway_signature.rs#L65-L74)。
+1. Identity 只签发 `PLATFORM_USER` JWT；ACCESS 必须携带 identity card、user-card、tenant/domain 与 session 绑定字段。见 [`auth.rs:150-248`](../../../astral-identity/src/auth.rs#L150-L248)。
+2. Gateway 按路径分类 credential policy，再解码 JWT。公共路径只有在没有 Authorization 时匿名放行；带 Bearer 的公共路径仍需通过 access 校验。见 [`gateway/middleware.rs:953-1008`](../../../astral-gateway/src/middleware.rs#L953-L1008)。
+3. Gateway 检查 revoked JTI，并通过 MySQL `auth_session_jti_index`、session/family、identity-card 和 user-card strict facts 做逐项绑定判定；缺失、过期、撤销、scope 不一致或 DB 不可用均拒绝。见 [`gateway/middleware.rs:606-666`](../../../astral-gateway/src/middleware.rs#L606-L666)、[`session_state_repository.rs:35-109`](../../../astral-db/src/session_state_repository.rs#L35-L109)。
+4. Gateway 注入可信身份头，代理为下游计算 HMAC v3；下游先验签，再使用身份头。见 [`gateway/proxy.rs:335-452`](../../../astral-gateway/src/proxy.rs#L335-L452)、[`gateway_signature.rs:65-74`](../../../astral-common/src/middleware/gateway_signature.rs#L65-L74)。
 
 ### 6.2 REFRESH 链
 
-Gateway 的 refresh 与 switch-card 路由只接受 REFRESH；logout/revoke 接受 ACCESS 或 REFRESH。见 [`gateway/middleware.rs:505-523`](../../../astral-gateway/src/middleware.rs#L505-L523)。Identity refresh 会读取 refresh token 对应的持久化 session、校验 family/过期/版本，然后按主体重建身份上下文；PlatformUser 从 `current_user_card_id` 读取 user-card 并再次执行双卡资格检查，AppUser 保持无 user-card。见 [`session.rs:47-90`](../../../astral-identity/src/srv/session.rs#L47-L90)、[`session.rs:164-299`](../../../astral-identity/src/srv/session.rs#L164-L299)。
+Gateway 的 refresh 与 switch-card 路由只接受 REFRESH；logout/revoke 接受 ACCESS 或 REFRESH。Identity refresh 会先拒绝非 PlatformUser principal，再读取 refresh token 对应的持久化 session，校验 family/过期/版本/epoch，从 `current_user_card_id` 重建双卡上下文并再次执行资格检查。关键状态失败时不返回可用的新 access。见 [`session.rs:47-90`](../../../astral-identity/src/srv/session.rs#L47-L90)、[`session.rs:164-299`](../../../astral-identity/src/srv/session.rs#L164-L299)。
 
-REFRESH JWT 自身不携带 identity card、user card、roles 或 permissions；它只携带 refresh 用的主体、session 和 family 元数据。见 [`auth.rs:295-338`](../../../astral-identity/src/auth.rs#L295-L338)、[`auth.rs:895-903`](../../../astral-identity/src/auth.rs#L895-L903)。因此 REFRESH 不能直接作为下游业务身份凭证。
+REFRESH JWT 自身不携带可直接用于下游授权的完整业务 scope；它只携带 refresh 所需的主体、session、family 与轮换元数据。因此 REFRESH 不能直接作为业务身份凭证，必须由 Identity 重新读取 durable session/card facts 后签发新的 PlatformUser access。见 [`auth.rs:250-315`](../../../astral-identity/src/auth.rs#L250-L315)。
 
-### 6.3 `astral-internal-v1` 链
+### 6.3 旧协议边界
 
-内部链与 Gateway HMAC v3 完全分离，签名 canonical payload 绑定 protocol、key id、caller、method/path/query、body hash、target user、timestamp、nonce、request id、idempotency key 和 route。常量与字段定义见 [`internal_signature.rs:1-31`](../../../astral-common/src/middleware/internal_signature.rs#L1-L31)，canonical payload、计算和验证见 [`internal_signature.rs:35-100`](../../../astral-common/src/middleware/internal_signature.rs#L35-L100)。
+`astral-internal-v1`、Learn→Gateway→Identity AppUser session chain、Chat WebSocket credential conversion 和 Redis replay/idempotency runtime 已从当前 checkout 物理移除。历史代码、归档文档或拒绝测试中的同名字符串不构成 active caller、route、feature 或启动 profile；当前 Gateway→下游可信转发只使用 HMAC v3。
 
-当前 App 登录链为：
+## 7. Gateway HMAC v3 与身份边界
 
-```text
-Client
-  -> Gateway /v1/app/users/login
-  -> Learn AppUserService
-  -> Learn -- astral-internal-v1 / k-lg / learn-to-gateway --> Gateway
-  -> Gateway -- astral-internal-v1 / k-gi / gateway-to-identity --> Identity
-  -> Identity 签发 APP_USER ACCESS + REFRESH
-```
+Gateway HMAC v3 是当前唯一的 Gateway→下游可信转发协议。其 canonical payload 绑定 method/path、user/principal/token、双卡字段、token use、claims version、action/roles 与 timestamp；下游验签失败、缺头、时钟偏差或主体/卡字段不一致均拒绝。见 [`gateway_signature.rs:18-63`](../../../astral-common/src/middleware/gateway_signature.rs#L18-L63)、[`gateway_signature.rs:215-280`](../../../astral-common/src/middleware/gateway_signature.rs#L215-L280)。Gateway HMAC v3 不接受 legacy v2；现有契约测试验证旧签名不会到达 handler。见 [`gateway_contract_tests.rs:461-478`](../../../tests-suite/series/E1/gateway_contract_tests.rs#L461-L478)。
 
-- Learn 是 internal-v1 的第一段 producer，向 `/api/v1/auth/internal/sessions` 发送 `userId`、body hash、replay/idempotency 与 Learn→Gateway 签名。见 [`app_user_service.rs:41-115`](../../../astral-learn/src/service/app_user_service.rs#L41-L115)。
-- Gateway 只在精确的 POST internal route 上运行专用断言中间件：禁止 query 与 Authorization，检查完整 internal headers、body hash、target user、时间窗、HMAC、replay 与 idempotency。见 [`gateway/middleware.rs:678-877`](../../../astral-gateway/src/middleware.rs#L678-L877)。
-- Gateway 验证 Learn→Gateway 后，再以 Gateway→Identity 的 key/route 重签并转发请求；故障会释放内部幂等占位并通过 circuit breaker 返回错误。见 [`gateway/proxy.rs:257-455`](../../../astral-gateway/src/proxy.rs#L257-L455)。
-- Identity 只接受 Gateway caller、Gateway route 和 Gateway→Identity key，并在 cryptographic verification 后才写 Redis replay/idempotency 状态；直接 Learn headers 或旧内部头被拒绝。见 [`internal.rs:136-221`](../../../astral-identity/src/srv/internal.rs#L136-L221)、[`internal.rs:224-315`](../../../astral-identity/src/srv/internal.rs#L224-L315)。
+## 8. Gateway 及服务 middleware 矩阵
 
-## 7. Gateway HMAC v3 与内部签名边界
-
-| 项目 | Gateway HMAC v3 | `astral-internal-v1` |
-|---|---|---|
-| 目的 | Gateway 向下游证明请求及身份头来源可信 | 服务间证明调用者、完整请求和目标用户可信 |
-| 主要方向 | Gateway → Identity / Learn / TrustGraph / 其他下游 | Learn → Gateway；Gateway → Identity |
-| 绑定内容 | method/path、user/principal/token、双卡字段、token use、claims version、action/roles、timestamp | protocol/key/caller、method/path/query、body hash、target user、timestamp、nonce、request/idempotency、route |
-| 接收方 | Identity/Learn/TrustGraph 的 `gateway_signature_middleware` | Gateway internal middleware 与 Identity internal assertion verifier |
-| Gateway 自身 | 只生成，不给自身入口加下游验签中间件 | 精确 internal route 使用专用 verifier，绕过普通 Bearer policy |
-| 失败语义 | 缺头、时钟偏差、主体/卡字段不一致、签名不匹配均拒绝 | 缺断言、body hash/签名/时间窗失败、replay/idempotency 冲突或 Redis 不可用均拒绝 |
-
-v3 canonical payload 的字段顺序与前缀由 `compute_hmac_signature_v3` 固定，且 verifier 会按 principal kind 要求双卡字段的存在/缺失关系。见 [`gateway_signature.rs:18-63`](../../../astral-common/src/middleware/gateway_signature.rs#L18-L63)、[`gateway_signature.rs:215-280`](../../../astral-common/src/middleware/gateway_signature.rs#L215-L280)。Gateway HMAC v3 不接受 legacy v2；现有契约测试验证 v2 签名不会到达 handler。见 [`gateway_contract_tests.rs:461-478`](../../../tests-suite/series/E1/gateway_contract_tests.rs#L461-L478)。
-
-## 8. Gateway 及三服务 middleware 矩阵
-
-### 8.1 服务挂载矩阵
+### 8.1 当前服务挂载矩阵
 
 | 服务 / 路由 | Gateway 入口行为 | 服务侧签名边界 | 服务侧权限行为 | 例外 / 备注 |
 |---|---|---|---|---|
-| Gateway `/api/v1/auth/**`、`/v1/admin/learn/**`、`/v1/app/learn/**`、`/v1/app/users/**`、`/main/api/v1/**` | 先清洗客户端敏感身份头，再执行 route credential policy 与 JWT session/grant 校验 | Gateway 自己是 HMAC producer | 不执行下游 `gateway_signature_middleware` | 精确 internal session route 单独使用 internal-v1 verifier；Gateway route 表与层挂载见 [`main.rs:203-287`](../../../astral-gateway/src/main.rs#L203-L287) |
-| Identity `/api/v1/auth/**` | Gateway 转发的正常请求携带 v3 头 | `public_routes` 统一挂 `gateway_signature_middleware` | auth routes 挂 `identity_permission_middleware`；bootstrap/self-service 按路径例外 | internal routes 在 public_routes 外单独合并，使用自己的 internal-v1 verifier，不依赖 Gateway v3；挂载见 [`identity/main.rs:212-242`](../../../astral-identity/src/main.rs#L212-L242) |
-| Learn `/v1/admin/learn/**` | Gateway 生成 v3 | 整个 Learn app 挂 `gateway_signature_middleware` | admin 使用 `learn_permission_middleware` | 所有业务资源先映射再进入 PolicyEngine |
-| Learn `/v1/app/learn/**` | Gateway 生成 v3；AppUser 若无 user-card 仍只有 identity-only context | 同上 | 使用 `learn_app_permission_middleware`，当前未因 AppUser 自动跳过 | 需明确 AppUser 的 App Learn 授权能力或保持拒绝 |
-| Learn `/v1/app/users/**` | 登录为 Gateway public route；登录后其他请求走 access | 整个 Learn app 仍验 v3 | `learn_app_user_permission_middleware`；`APP_USER` 对 profile 类资源有显式例外，login/logout 是认证例外 | 见 [`learn/main.rs:312-377`](../../../astral-learn/src/main.rs#L312-L377)、[`learn/middleware.rs:224-279`](../../../astral-learn/src/middleware.rs#L224-L279) |
-| TrustGraph `/main/api/v1/**` | Gateway 生成 v3 | 整个主路由挂 `gateway_signature_middleware` | 所有资源路由挂 `permission_check_middleware`；未映射路径拒绝 | health 不在主业务 permission map 内；挂载见 [`trustgraph/main.rs:323-367`](../../../astral-trustgraph/src/main.rs#L323-L367) |
+| Gateway `/api/v1/auth/**` | 清洗客户端敏感身份头，执行 route credential policy 与 strict MySQL session admission | Gateway 自身是 HMAC producer | 不执行下游 verifier | 只暴露 Identity 当前明确注册的固定路由 |
+| Identity `/api/v1/auth/**` | Gateway 转发的正常请求携带 v3 头 | 统一挂 `gateway_signature_middleware` | 认证 bootstrap 按路径例外；受保护入口要求 PlatformUser、资源映射和 PolicyEngine | 无 internal session 子路由 |
+| TrustGraph `/main/api/v1/**` | Gateway 生成 v3 | 主路由挂 `gateway_signature_middleware` | 资源路由挂 `permission_check_middleware`；未映射路径拒绝 | `/main/api/v1/**` 是现有冻结主入口 |
+| Monitor `/api/v1/monitor/{*path}` | Gateway 生成 v3 | 按当前 Monitor runtime 校验 Gateway 身份 | 健康/指标入口按当前显式 route policy 处理 | 不再探测或依赖 Redis、Learn、Chat |
 
 ### 8.2 Gateway middleware 例外
 
-1. `OPTIONS` 预检直接继续，不进入 Bearer 解码；精确 internal session route 直接交给专用 internal verifier，不进入普通 public/Bearer policy。见 [`gateway/middleware.rs:920-950`](../../../astral-gateway/src/middleware.rs#L920-L950)。
-2. `sanitize_internal_auth_headers` 对精确 internal session route 保留 internal assertion 头；其他请求移除 internal headers 以及客户端伪造的敏感 auth/identity/gateway 头。见 [`gateway/middleware.rs:898-915`](../../../astral-gateway/src/middleware.rs#L898-L915)。
-3. 匿名放行只适用于 Gateway 已注册的 public route 且没有 Authorization；一旦带 Bearer，即使路径是 public，也必须是有效的 access credential。见 [`gateway/middleware.rs:300-331`](../../../astral-gateway/src/middleware.rs#L300-L331)、[`gateway/middleware.rs:953-1008`](../../../astral-gateway/src/middleware.rs#L953-L1008)。
-4. REFRESH 只作为 session capability 进入 Identity refresh/switch/logout/revoke，不读取 access grant，不产生业务身份头；ACCESS 才进入 Redis live-session 与 grant 校验。见 [`gateway/middleware.rs:1019-1034`](../../../astral-gateway/src/middleware.rs#L1019-L1034)。
-5. Chat WebSocket 仅在 canonical chat route 将受控 subprotocol credential 转成普通 Bearer；其他路径不接受这种转换。见 [`gateway/middleware.rs:938-950`](../../../astral-gateway/src/middleware.rs#L938-L950)。
+1. `OPTIONS` 预检直接继续，不进入 Bearer 解码；没有任何 internal session route 例外。见 [`gateway/middleware.rs:920-950`](../../../astral-gateway/src/middleware.rs#L920-L950)。
+2. `sanitize_internal_auth_headers` 对普通请求移除客户端伪造的 internal、auth、identity、gateway 头；可信身份头只由 Gateway 在 JWT strict admission 后重新注入。见 [`gateway/middleware.rs:898-915`](../../../astral-gateway/src/middleware.rs#L898-L915)。
+3. 匿名放行只适用于 Gateway 已注册的 public route 且没有 Authorization；一旦带 Bearer，即使路径是 public，也必须是有效的 PlatformUser access credential。见 [`gateway/middleware.rs:300-331`](../../../astral-gateway/src/middleware.rs#L300-L331)、[`gateway/middleware.rs:953-1008`](../../../astral-gateway/src/middleware.rs#L953-L1008)。
+4. REFRESH 只作为 session capability 进入 Identity refresh/switch/logout/revoke，不产生业务身份头；ACCESS 才进入 Gateway strict MySQL session admission。见 [`gateway/middleware.rs:1019-1034`](../../../astral-gateway/src/middleware.rs#L1019-L1034)。
 
 ## 9. 卡资格、session switch 与 refresh
 
 ### 9.1 签发资格
 
 - PlatformUser login 在选卡后调用双卡资格服务，失败即拒绝签发；见 [`auth_service.rs:257-290`](../../../astral-identity/src/srv/auth_service.rs#L257-L290)。
-- PlatformUser refresh 读取 session 持久化的 `current_user_card_id`，重新读取 user-card 并调用同一资格服务；AppUser refresh 不读取 user-card；见 [`session.rs:193-299`](../../../astral-identity/src/srv/session.rs#L193-L299)。
+- PlatformUser refresh 读取 session 持久化的 `current_user_card_id`，重新读取 user-card 并调用同一资格服务；非 PlatformUser refresh 在进入 session lookup 前拒绝。见 [`session.rs:47-90`](../../../astral-identity/src/srv/session.rs#L47-L90)、[`session.rs:164-299`](../../../astral-identity/src/srv/session.rs#L164-L299)。
 - PolicyEngine 运行期资格检查优先读取 `ELIGIBILITY` projection gate 与带物理上下文的缓存，缓存 miss/版本不匹配再回权威 SQL；要求 projection ready 时未 READY 直接拒绝。见 [`eligibility.rs:157-230`](../../../astral-db/src/eligibility.rs#L157-L230)、[`eligibility.rs:280-307`](../../../astral-db/src/eligibility.rs#L280-L307)。
 
 ### 9.2 Session refresh
@@ -226,19 +193,18 @@ v3 canonical payload 的字段顺序与前缀由 `compute_hmac_signature_v3` 固
 
 - Identity 集成测试明确以 Docker MySQL 验证真实 `platform_user`、凭证、`identity_card`、`auth_token_family`、`auth_device_session` 列名与 FromRow 映射；测试默认不是无条件本地单元测试。见 [`identity/tests/integration.rs:1-9`](../../../tests-suite/series/CORE/identity_integration.rs#L1-L9)。
 - Gateway contract tests 覆盖 v3 字段篡改、主体卡字段关系、缺字段、legacy v2 拒绝和 handler 不执行；见 [`gateway_contract_tests.rs:270-347`](../../../tests-suite/series/E1/gateway_contract_tests.rs#L270-L347)、[`gateway_contract_tests.rs:413-478`](../../../tests-suite/series/E1/gateway_contract_tests.rs#L413-L478)。
-- 当前材料未把 migration 执行结果、实际 Redis `access:grant` 数据或各服务线上路由探活结果当作事实。需要运行环境证据时，应补充对应部署/集成测试记录，而不是从源码推断部署一致性。
+- 当前材料未把 migration 执行结果、实际 Redis 历史数据、各服务线上路由探活结果或未运行的集成命令当作事实。Redis 不属于当前 runtime；如需验证部署一致性，应补充对应 MySQL/RabbitMQ/服务环境证据，而不是从源码或历史 Redis 报告推断部署状态。
 
 ## 11. 当前事实、缺口、目标决策
 
 | 主题 | 当前事实 | 当前缺口 | 目标决策（未实施声明） |
 |---|---|---|---|
 | 双卡 ownership | Identity 生产/消费 identity-card 身份事实；TrustGraph 管理 user-card 与授权 scope | 历史 baseline 与 runtime canonical 字段漂移 | 维持单一 owner，跨 owner 只通过明确 DTO/查询契约交互 |
-| 上下文映射 | `physical_policy_context` 强制 PlatformUser 双卡，AppUser identity-only | AppUser 对 `/v1/app/learn` 的业务授权边界未由统一契约完全说明 | 为每条 App 路径明确 identity-only 或 user-card-required，并以测试锁定 |
-| SessionGrant | producer/consumer 已有 v2 字段契约，Platform/App 条件分支明确 | 运行环境 grant mode、Redis projection 完整性仍需部署验证 | 继续以 grant + session version/epoch 作为 access live gate，失败 fail-closed |
-| ACCESS / REFRESH | ACCESS 承载身份，REFRESH 不承载业务卡；refresh 重新读取 session/card | 切卡注释与实际 refresh token 轮换语义不完全一致 | 明确 family 保留、refresh 是否轮换、projection 删除与 CAS 顺序，并补回归测试 |
-| internal-v1 | Learn→Gateway→Identity 有双段签名、body hash、replay/idempotency | 未证明所有未来内部调用都不会复用 Gateway v3 或 legacy internal header | 内部调用统一声明 caller/key/route，禁止把 Bearer 或 v3 身份头当服务间认证 |
-| Gateway HMAC v3 | Gateway 生成；Identity/Learn/TrustGraph 验证；v2 测试拒绝 | 运行时密钥配置和多服务部署一致性不由源码证明 | v3 只用于 Gateway→下游可信转发，服务间调用继续使用 internal-v1 |
-| middleware | 三个服务的主业务入口均有 v3 verifier；Identity internal route 有专用 verifier | skip/public/identity-only 例外较多，新增 route 易遗漏矩阵 | 新增路由必须同时登记 Gateway route policy、服务签名层、权限层和测试 |
+| 上下文映射 | `physical_policy_context` 要求 PlatformUser 完整双卡 scope；非 PlatformUser 仅作拒绝识别 | 历史 permission-context 负向测试仍保留旧主体字符串 | 新增业务路径继续只接受 PlatformUser，并以 PolicyEngine.evaluate() 完成授权 |
+| SessionGrant | Identity 只为 PlatformUser 写入 proof；Gateway 以 MySQL durable facts strict admission，镜像只作有界加速 | 真实数据库 schema、服务启动和故障恢复仍需环境验收 | 继续以 JTI proof + session version/epoch + card/scope fence 作为 access live gate，失败 fail-closed |
+| ACCESS / REFRESH | ACCESS 承载完整双卡身份；REFRESH 由 Identity 按 durable session/card facts 重建，非 PlatformUser 拒绝 | 切卡注释与实际 refresh token 轮换语义仍需补充回归证据 | 保持 family、version/epoch、JTI proof、CAS 与撤销顺序一致 |
+| Gateway HMAC v3 | Gateway 生成；Identity/TrustGraph/Monitor 验证；旧 v2 与伪造头拒绝 | 运行时密钥配置和多服务部署一致性不由源码证明 | v3 只用于 Gateway→当前下游可信转发，不恢复旧 internal-v1 域 |
+| middleware | 当前主业务入口有 v3 verifier；Identity 受保护入口要求 PlatformUser 与资源映射 | skip/public 路径新增时仍需同步 route policy、签名层、权限层和测试 | 新增路由必须登记固定 Gateway 路由、服务签名层、PolicyEngine 入口和拒绝测试 |
 | schema | auth family/session 有 canonical migration；integration test 记录真实列契约 | identity/user-card baseline 仍是旧形态，不能单独作为部署基线 | 将 runtime 所需 identity/user-card schema 形成可验证 canonical migration，并在 CI/集成环境执行 |
 | 审计与副作用 | 登录、内部会话、切卡、权限决策已有审计调用；切卡 adapter 记录 CardSwitch | 异步审计和 projection 的运行失败重试/最终一致性仍需按环境核验 | 权限/卡片/session mutation 保持审计、幂等、补偿与 fail-closed 验收 |
 
@@ -247,10 +213,10 @@ v3 canonical payload 的字段顺序与前缀由 `compute_hmac_signature_v3` 固
 本文件最小证据集合如下：
 
 - 双卡与资格：[`physical_policy_context()`](../../../astral-common/src/middleware/permission_check_shared.rs#L55-L118)、[`context.rs:7-85`](../../../astral-types/src/context.rs#L7-L85)、[`eligibility.rs:236-307`](../../../astral-db/src/eligibility.rs#L236-L307)。
-- Gateway route/internal/auth/forward：[`gateway/main.rs:203-287`](../../../astral-gateway/src/main.rs#L203-L287)、[`gateway/middleware.rs:678-877`](../../../astral-gateway/src/middleware.rs#L678-L877)、[`gateway/proxy.rs:257-455`](../../../astral-gateway/src/proxy.rs#L257-L455)、[`gateway/proxy.rs:866-997`](../../../astral-gateway/src/proxy.rs#L866-L997)。
-- Learn AppUser producer：[`app_user_service.rs:41-115`](../../../astral-learn/src/service/app_user_service.rs#L41-L115)。
-- Identity internal/auth/session：[`internal.rs:136-221`](../../../astral-identity/src/srv/internal.rs#L136-L221)、[`auth.rs:251-338`](../../../astral-identity/src/auth.rs#L251-L338)、[`session.rs:47-90`](../../../astral-identity/src/srv/session.rs#L47-L90)、[`session.rs:1021-1563`](../../../astral-identity/src/srv/session.rs#L1021-L1563)。
-- 三服务 middleware：[`identity/main.rs:212-242`](../../../astral-identity/src/main.rs#L212-L242)、[`learn/main.rs:312-377`](../../../astral-learn/src/main.rs#L312-L377)、[`trustgraph/main.rs:323-367`](../../../astral-trustgraph/src/main.rs#L323-L367)。
-- 规范边界：[`Rust 后端编码规范`](../../规范/Rust后端编码规范_V1.0.md)、[`BACKEND_STANDARD`](../../规范/Rust后端编码规范_V1.0.md)、[`统一接口路径规范 V5`](../../规范/统一接口路径规范_V5.md)。
+- Gateway route/auth/forward：[`gateway/runtime.rs:38-285`](../../../astral-gateway/src/runtime.rs#L38-L285)、[`gateway/middleware.rs:606-724`](../../../astral-gateway/src/middleware.rs#L606-L724)、[`gateway/proxy.rs:231-452`](../../../astral-gateway/src/proxy.rs#L231-L452)。
+- Identity PlatformUser auth/session：[`auth.rs:150-369`](../../../astral-identity/src/auth.rs#L150-L369)、[`session.rs:47-90`](../../../astral-identity/src/srv/session.rs#L47-L90)、[`session.rs:817-899`](../../../astral-identity/src/srv/session.rs#L817-L899)、[`session.rs:1021-1563`](../../../astral-identity/src/srv/session.rs#L1021-L1563)。
+- Durable session admission：[`session_state_repository.rs:35-109`](../../../astral-db/src/session_state_repository.rs#L35-L109)、[`session_projection_store.rs:145-257`](../../../astral-common/src/session_projection_store.rs#L145-L257)。
+- 服务 middleware：[`identity/middleware.rs:65-115`](../../../astral-identity/src/middleware.rs#L65-L115)、[`trustgraph/runtime.rs:253-269`](../../../astral-trustgraph/src/runtime.rs#L253-L269)、[`gateway_signature.rs:139-330`](../../../astral-common/src/middleware/gateway_signature.rs#L139-L330)。
+- 规范边界：[`Rust 后端编码规范`](../../规范/Rust后端编码规范_V1.0.md)、[`统一接口路径规范 V5`](../../规范/统一接口路径规范_V5.md)。
 
-维护本文时，先重新核对源码、schema/migration 和测试，再更新当前事实与行号；不要把目标决策写成已完成，不要用历史 Java/JSA 文档覆盖 Rust 当前证据。任何工程规范变化仍只修改 `Docs/规范/` 与按 AGENTS.md 要求同步的入口文件；本任务不修改既有文档。
+维护本文时，先重新核对源码、schema/migration 和测试，再更新当前事实与行号；不要把目标决策写成已完成，不要用历史 Java/JSA、Learn/Chat 归档或 Redis 比较资料覆盖 Rust 当前证据。本文可以记录退役边界和旧输入拒绝守卫，但不得把已删除源码、旧 profile 或历史报告写成当前 runtime。

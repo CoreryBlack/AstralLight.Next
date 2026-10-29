@@ -191,54 +191,9 @@ pub fn issue_access_token(
     })
 }
 
-pub fn issue_access_token_for_identity_only(
-    config: &JwtConfig,
-    user: &IdentityCard,
-    session: SessionContext,
-) -> Result<TokenResult, AstralError> {
-    let profile = &config.access;
-    let now = OffsetDateTime::now_utc().unix_timestamp() as usize;
-    let expiry = now + profile.expiry_seconds as usize;
-    let jti = uuid::Uuid::new_v4().to_string();
-    let claims = JwtClaims {
-        claims_version: CLAIMS_VERSION,
-        issuer: profile.issuer.clone(),
-        audience: profile.audience.clone(),
-        sub: user.user_id.to_string(),
-        jti: jti.clone(),
-        roles: Vec::new(),
-        token_use: "ACCESS".into(),
-        principal_kind: PrincipalKind::AppUser.as_str().into(),
-        identity_card_id: user.card_id,
-        user_card_id: None,
-        user_card_tenant_id: None,
-        user_card_domain_id: None,
-        template_id: None,
-        structure_node_id: None,
-        tenant_status: None,
-        permissions: None,
-        sid: Some(session.session_id),
-        session_version: Some(session.session_version),
-        sev: Some(session.session_epoch),
-        family_id: Some(session.family_id),
-        exp: expiry,
-        iat: now,
-        nbf: now,
-    };
-    let token = encode_profile(profile, ACCESS_TYP, &claims)?;
-    Ok(TokenResult {
-        token,
-        jti,
-        expires_in: profile.expiry_seconds,
-        issued_at_epoch_second: now as i64,
-        expires_at_epoch_second: expiry as i64,
-    })
-}
-
 pub fn issue_refresh_token(
     config: &JwtConfig,
     user_id: i64,
-    principal_kind: PrincipalKind,
     session: SessionContext,
 ) -> Result<TokenResult, AstralError> {
     let profile = &config.refresh;
@@ -253,7 +208,7 @@ pub fn issue_refresh_token(
         jti: jti.clone(),
         roles: Vec::new(),
         token_use: "REFRESH".into(),
-        principal_kind: principal_kind.as_str().into(),
+        principal_kind: PrincipalKind::PlatformUser.as_str().into(),
         identity_card_id: None,
         user_card_id: None,
         user_card_tenant_id: None,
@@ -385,7 +340,6 @@ impl SessionGrant {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn active(
         token: &TokenResult,
-        principal_kind: PrincipalKind,
         user_id: i64,
         session_id: i64,
         identity_card_id: Option<i64>,
@@ -398,7 +352,7 @@ impl SessionGrant {
     ) -> Self {
         Self {
             format_version: 2,
-            principal_kind: principal_kind.as_str().to_string(),
+            principal_kind: PrincipalKind::PlatformUser.as_str().to_string(),
             user_id,
             session_id,
             identity_card_id,
@@ -840,9 +794,7 @@ mod tests {
             family_id: 2,
         };
         let access = issue_access_token(&config, &user, &card, session, None).unwrap();
-        let refresh =
-            issue_refresh_token(&config, user.user_id, PrincipalKind::PlatformUser, session)
-                .unwrap();
+        let refresh = issue_refresh_token(&config, user.user_id, session).unwrap();
         let access_header = jsonwebtoken::decode_header(&access.token).unwrap();
         let refresh_header = jsonwebtoken::decode_header(&refresh.token).unwrap();
         assert_eq!(access_header.typ.as_deref(), Some(ACCESS_TYP));
@@ -861,6 +813,7 @@ mod tests {
         .claims;
         assert_eq!(access_claims.claims_version, CLAIMS_VERSION);
         assert_eq!(access_claims.token_use, "ACCESS");
+        assert_eq!(access_claims.principal_kind, "PLATFORM_USER");
         assert_eq!(access_claims.identity_card_id, Some(1));
         assert_eq!(access_claims.user_card_id, Some(3));
 

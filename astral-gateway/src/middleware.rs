@@ -12,17 +12,14 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
 use std::sync::OnceLock;
 
 use astral_common::config::AppConfig;
-use astral_common::middleware::internal_signature::INTERNAL_SESSION_PATH;
 use astral_common::middleware::{decode_v2_token, JwtClaims};
 use astral_common::session_projection_store::SessionProjectionDecision;
 use astral_common::token_contract::{
-    PrincipalKind, TokenUse, CHAT_WS_BEARER_SUBPROTOCOL_PREFIX, CHAT_WS_SUBPROTOCOL,
-    CLAIMS_VERSION_HEADER, IDENTITY_CARD_ID_HEADER, PRINCIPAL_KIND_HEADER, TOKEN_USE_HEADER,
-    USER_CARD_DOMAIN_ID_HEADER, USER_CARD_ID_HEADER, USER_CARD_TENANT_ID_HEADER,
+    PrincipalKind, TokenUse, CLAIMS_VERSION_HEADER, IDENTITY_CARD_ID_HEADER, PRINCIPAL_KIND_HEADER,
+    TOKEN_USE_HEADER, USER_CARD_DOMAIN_ID_HEADER, USER_CARD_ID_HEADER, USER_CARD_TENANT_ID_HEADER,
 };
 
 /// 内部身份头列表（客户端伪造的可能来源）
@@ -315,8 +312,8 @@ fn tenant_status_mode(
 /// 即使仅在未来 bind 构造与 claims 解耦时才可能出现——一律拒绝快路径回落
 /// strict DB。durable 事实侧的 tenant 一致性由 canonical verifier 的
 /// 逐项绑定评估（Allow 即证明 fact tenant == bind tenant）承担，本检查
-/// 只钉住 claims ↔ bind 这一段。APP_USER（无卡绑定，tid None）不进本检查
-/// 所在分支，天然保留 DB 路径。
+/// 只钉住 claims ↔ bind 这一段。缺少租户绑定的 claims 不进入本检查所在分支，
+/// 因而天然保留 DB 路径。
 fn claims_tenant_matches_bind(
     tenant_id: Option<i64>,
     bind: &astral_common::session_projection_store::SessionBindContext,
@@ -333,7 +330,6 @@ pub enum RouteCredentialPolicy {
     AccessOnly,
     RefreshOnly,
     AccessOrRefresh,
-    InternalOnly,
 }
 
 impl RouteCredentialPolicy {
@@ -347,7 +343,6 @@ impl RouteCredentialPolicy {
             Self::AccessOrRefresh => {
                 matches!(token_use, Some(TokenUse::Access | TokenUse::Refresh))
             }
-            Self::InternalOnly => false,
         }
     }
 }
@@ -384,10 +379,6 @@ const APPROVED_PUBLIC_ROUTES: &[ApprovedPublicRoute] = &[
     ApprovedPublicRoute {
         method: "POST",
         pattern: "/api/v1/auth/verification/verify",
-    },
-    ApprovedPublicRoute {
-        method: "POST",
-        pattern: "/v1/app/users/login",
     },
 ];
 
@@ -439,130 +430,6 @@ fn configured_public_route(config: &AppConfig, method: &Method, path: &str) -> b
                 .any(|configured| segment_glob_matches(configured, path)))
 }
 
-const CHAT_WS_ROUTE_PREFIX: &str = "/v1/chat/ws/";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WsCredentialError {
-    MissingProtocol,
-    DuplicateProtocol,
-    MissingBearerCredential,
-    DuplicateBearerCredential,
-    QueryCredentialForbidden,
-    ConflictingCredentials,
-    InvalidBearerCredential,
-}
-
-impl WsCredentialError {
-    const fn message(self) -> &'static str {
-        match self {
-            Self::MissingProtocol => "WebSocket subprotocol is required",
-            Self::DuplicateProtocol => "Multiple WebSocket subprotocols are not allowed",
-            Self::MissingBearerCredential => "WebSocket bearer credential is required",
-            Self::DuplicateBearerCredential => {
-                "Multiple WebSocket bearer credentials are not allowed"
-            }
-            Self::QueryCredentialForbidden => "WebSocket query credentials are forbidden",
-            Self::ConflictingCredentials => "WebSocket credentials conflict",
-            Self::InvalidBearerCredential => "Invalid WebSocket bearer credential",
-        }
-    }
-
-    const fn reason(self) -> &'static str {
-        match self {
-            Self::MissingProtocol => "WS_SUBPROTOCOL_REQUIRED",
-            Self::DuplicateProtocol => "DUPLICATE_WS_SUBPROTOCOL",
-            Self::MissingBearerCredential => "WS_BEARER_REQUIRED",
-            Self::DuplicateBearerCredential => "DUPLICATE_WS_BEARER",
-            Self::QueryCredentialForbidden => "WS_QUERY_CREDENTIAL_FORBIDDEN",
-            Self::ConflictingCredentials => "CONFLICTING_WS_CREDENTIALS",
-            Self::InvalidBearerCredential => "INVALID_WS_BEARER",
-        }
-    }
-}
-
-/// Browser WebSocket authentication is limited to the canonical chat route.
-/// The client offers the stable wire protocol plus one bearer credential
-/// protocol; the credential is converted into the normal HTTP Bearer header.
-fn is_canonical_chat_ws_route(method: &Method, path: &str) -> bool {
-    *method == Method::GET
-        && path
-            .strip_prefix(CHAT_WS_ROUTE_PREFIX)
-            .is_some_and(|user_id| {
-                !user_id.is_empty()
-                    && !user_id.contains('/')
-                    && user_id.parse::<i64>().is_ok_and(|value| value > 0)
-            })
-}
-
-fn extract_chat_ws_credential(req: &mut Request) -> Result<(), WsCredentialError> {
-    if !is_canonical_chat_ws_route(req.method(), req.uri().path()) {
-        return Ok(());
-    }
-    if req.uri().query().is_some() {
-        return Err(WsCredentialError::QueryCredentialForbidden);
-    }
-
-    let protocols = req
-        .headers()
-        .get_all("sec-websocket-protocol")
-        .iter()
-        .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
-        .map(|value| std::str::from_utf8(value.trim_ascii()).ok())
-        .collect::<Option<Vec<_>>>()
-        .ok_or(WsCredentialError::InvalidBearerCredential)?;
-    if protocols.is_empty() {
-        return Err(WsCredentialError::MissingProtocol);
-    }
-
-    let unknown_count = protocols
-        .iter()
-        .filter(|protocol| {
-            **protocol != CHAT_WS_SUBPROTOCOL
-                && !protocol.starts_with(CHAT_WS_BEARER_SUBPROTOCOL_PREFIX)
-        })
-        .count();
-    if unknown_count > 0 {
-        return Err(WsCredentialError::DuplicateProtocol);
-    }
-    let stable_count = protocols
-        .iter()
-        .filter(|protocol| **protocol == CHAT_WS_SUBPROTOCOL)
-        .count();
-    let bearer_tokens = protocols
-        .iter()
-        .filter_map(|protocol| protocol.strip_prefix(CHAT_WS_BEARER_SUBPROTOCOL_PREFIX))
-        .collect::<Vec<_>>();
-    if stable_count != 1 {
-        return Err(if stable_count == 0 {
-            WsCredentialError::MissingProtocol
-        } else {
-            WsCredentialError::DuplicateProtocol
-        });
-    }
-    if bearer_tokens.is_empty() {
-        return Err(WsCredentialError::MissingBearerCredential);
-    }
-    if bearer_tokens.len() != 1 {
-        return Err(WsCredentialError::DuplicateBearerCredential);
-    }
-    let token = bearer_tokens[0].trim();
-    if token.is_empty() {
-        return Err(WsCredentialError::InvalidBearerCredential);
-    }
-    if req.headers().contains_key("authorization") {
-        return Err(WsCredentialError::ConflictingCredentials);
-    }
-
-    let authorization = HeaderValue::from_str(&format!("Bearer {token}"))
-        .map_err(|_| WsCredentialError::InvalidBearerCredential)?;
-    req.headers_mut().insert("authorization", authorization);
-    req.headers_mut().insert(
-        "sec-websocket-protocol",
-        HeaderValue::from_static(CHAT_WS_SUBPROTOCOL),
-    );
-    Ok(())
-}
-
 fn route_credential_policy_inner(
     method: &Method,
     path: &str,
@@ -579,7 +446,6 @@ fn route_credential_policy_inner(
         }
         (&Method::POST, "/api/v1/auth/sessions/logout")
         | (&Method::POST, "/api/v1/auth/sessions/revoke") => RouteCredentialPolicy::AccessOrRefresh,
-        (&Method::POST, "/api/v1/auth/internal/sessions") => RouteCredentialPolicy::InternalOnly,
         _ => RouteCredentialPolicy::AccessOnly,
     }
 }
@@ -592,375 +458,7 @@ fn route_credential_policy_with_config(
     route_credential_policy_inner(method, path, configured_public_route(config, method, path))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct InternalSessionRequest {
-    pub user_id: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InternalIdempotencyClaim {
-    Claimed,
-    Duplicate,
-}
-
-fn internal_header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
-    req.headers()
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn internal_error(req: &Request, status: u16, message: &str, reason: &str) -> Response {
-    json_error(
-        req.method().as_str(),
-        req.uri().path(),
-        internal_header(req, "x-internal-request-id").or_else(|| request_trace_id(req)),
-        status,
-        message,
-        if status == 503 {
-            "DEPENDENCY_UNAVAILABLE"
-        } else {
-            "UNAUTHORIZED"
-        },
-        reason,
-    )
-}
-
-/// durable replay 声明：`auth_internal_request_guard` 上的 "purge 过期 +
-/// UNIQUE INSERT"（多节点安全；UNIQUE 约束即分布式互斥，TTL 由 expires_at
-/// 承载）。DB 不可用时返回 `Err` → 调用方 503 fail-closed，绝不本地放行。
-async fn claim_internal_replay(
-    config: &AppConfig,
-    input: &astral_common::middleware::internal_signature::InternalSignatureInput<'_>,
-) -> Result<bool, ()> {
-    let Some(pool) = gateway_session_db() else {
-        return Err(());
-    };
-    let key = astral_common::middleware::internal_signature::replay_key("gateway", input);
-    let ttl = config.gateway.timestamp_tolerance_secs.max(60);
-    match astral_db::claim_replay_guard(pool, astral_db::GUARD_SCOPE_GATEWAY_REPLAY, &key, ttl)
-        .await
-    {
-        Ok(astral_db::GuardClaim::Claimed) => Ok(true),
-        Ok(astral_db::GuardClaim::Duplicate) => Ok(false),
-        Err(_) => Err(()),
-    }
-}
-
-async fn claim_internal_idempotency(
-    _config: &AppConfig,
-    caller: &str,
-    route: &str,
-    key: &str,
-    body_hash: &str,
-) -> Result<InternalIdempotencyClaim, ()> {
-    let Some(pool) = gateway_session_db() else {
-        return Err(());
-    };
-    let guard_key = astral_common::middleware::internal_signature::idempotency_key(
-        "gateway", caller, route, key,
-    );
-    // processing 标记使用有界 300s in-flight 窗口。
-    match astral_db::claim_idempotency_guard(
-        pool,
-        astral_db::GUARD_SCOPE_GATEWAY_IDEMPOTENCY,
-        &guard_key,
-        body_hash,
-        300,
-    )
-    .await
-    {
-        Ok(astral_db::GuardClaim::Claimed) => Ok(InternalIdempotencyClaim::Claimed),
-        Ok(astral_db::GuardClaim::Duplicate) => {
-            let marker = astral_db::load_guard_marker(
-                pool,
-                astral_db::GUARD_SCOPE_GATEWAY_IDEMPOTENCY,
-                &guard_key,
-            )
-            .await
-            .map_err(|_| ())?;
-            match astral_db::idempotency_marker_decision(marker.as_deref(), body_hash) {
-                Ok(astral_db::GuardClaim::Duplicate) => Ok(InternalIdempotencyClaim::Duplicate),
-                // 同 key 绑定不同请求体 / 行消失（并发 purge 竞态）→ 冲突拒绝。
-                // marker 判定不会产生 Claimed（仅声明路径返回），穷尽匹配兜底拒绝。
-                Ok(astral_db::GuardClaim::Claimed) | Err(_) => Err(()),
-            }
-        }
-        Err(_) => Err(()),
-    }
-}
-
-pub(crate) async fn complete_internal_idempotency(
-    _config: &AppConfig,
-    caller: &str,
-    route: &str,
-    key: &str,
-    body_hash: &str,
-) -> Result<(), ()> {
-    let Some(pool) = gateway_session_db() else {
-        return Err(());
-    };
-    let guard_key = astral_common::middleware::internal_signature::idempotency_key(
-        "gateway", caller, route, key,
-    );
-    astral_db::complete_idempotency_guard(
-        pool,
-        astral_db::GUARD_SCOPE_GATEWAY_IDEMPOTENCY,
-        &guard_key,
-        body_hash,
-        300,
-    )
-    .await
-    .map_err(|_| ())
-}
-
-pub(crate) async fn release_internal_idempotency(
-    _config: &AppConfig,
-    caller: &str,
-    route: &str,
-    key: &str,
-) -> Result<(), ()> {
-    let Some(pool) = gateway_session_db() else {
-        return Err(());
-    };
-    let guard_key = astral_common::middleware::internal_signature::idempotency_key(
-        "gateway", caller, route, key,
-    );
-    astral_db::release_idempotency_guard(
-        pool,
-        astral_db::GUARD_SCOPE_GATEWAY_IDEMPOTENCY,
-        &guard_key,
-    )
-    .await
-    .map_err(|_| ())
-}
-
-/// Verify the exact Learn -> Gateway internal session assertion before the
-/// global sanitizer/JWT policy can treat the request as an ordinary route.
-pub async fn internal_session_auth_middleware_with_config(
-    config: AppConfig,
-    req: Request,
-    next: Next,
-) -> Response {
-    if req.method() != Method::POST || req.uri().path() != INTERNAL_SESSION_PATH {
-        return internal_error(
-            &req,
-            401,
-            "Internal route authentication required",
-            "INTERNAL_AUTH_REQUIRED",
-        );
-    }
-    if req.uri().query().is_some() || req.headers().contains_key("authorization") {
-        return internal_error(
-            &req,
-            401,
-            "Invalid internal session request",
-            "INTERNAL_REQUEST_INVALID",
-        );
-    }
-    let required = [
-        "x-internal-protocol",
-        "x-internal-service",
-        "x-internal-caller",
-        "x-internal-timestamp",
-        "x-internal-nonce",
-        "x-internal-request-id",
-        "x-idempotency-key",
-        "x-internal-body-sha256",
-        "x-internal-signature",
-        "x-internal-key-id",
-        "x-internal-route",
-    ];
-    if required
-        .iter()
-        .any(|name| internal_header(&req, name).is_none())
-    {
-        return internal_error(
-            &req,
-            401,
-            "Internal assertion is incomplete",
-            "INTERNAL_ASSERTION_MISSING",
-        );
-    }
-
-    let (parts, body_stream) = req.into_parts();
-    let body = match axum::body::to_bytes(body_stream, 1024 * 1024).await {
-        Ok(body) => body,
-        Err(_) => {
-            return internal_error_from_parts(
-                INTERNAL_SESSION_PATH,
-                "",
-                401,
-                "Internal request body is too large",
-                "BODY_TOO_LARGE",
-            )
-        }
-    };
-    let body_hash = astral_common::middleware::internal_signature::sha256_hex(&body);
-    let parsed: InternalSessionRequest =
-        match serde_json::from_slice::<InternalSessionRequest>(&body) {
-            Ok(value) if value.user_id > 0 => value,
-            _ => {
-                return internal_error_from_parts(
-                    INTERNAL_SESSION_PATH,
-                    "",
-                    401,
-                    "Invalid internal session body",
-                    "BODY_INVALID",
-                )
-            }
-        };
-    let req = Request::from_parts(parts, Body::from(body));
-
-    let user_id_string = parsed.user_id.to_string();
-    let protocol = internal_header(&req, "x-internal-protocol")
-        .unwrap_or("")
-        .to_string();
-    let service = internal_header(&req, "x-internal-service")
-        .unwrap_or("")
-        .to_string();
-    let caller = internal_header(&req, "x-internal-caller")
-        .unwrap_or("")
-        .to_string();
-    let key_id = internal_header(&req, "x-internal-key-id")
-        .unwrap_or("")
-        .to_string();
-    let route = internal_header(&req, "x-internal-route")
-        .unwrap_or("")
-        .to_string();
-    let timestamp = internal_header(&req, "x-internal-timestamp")
-        .unwrap_or("")
-        .to_string();
-    let nonce = internal_header(&req, "x-internal-nonce")
-        .unwrap_or("")
-        .to_string();
-    let request_id = internal_header(&req, "x-internal-request-id")
-        .unwrap_or("")
-        .to_string();
-    let idempotency_key = internal_header(&req, "x-idempotency-key")
-        .unwrap_or("")
-        .to_string();
-    let signed_body_hash = internal_header(&req, "x-internal-body-sha256")
-        .unwrap_or("")
-        .to_string();
-    let signature = internal_header(&req, "x-internal-signature")
-        .unwrap_or("")
-        .to_string();
-    if protocol != astral_common::middleware::internal_signature::INTERNAL_PROTOCOL_VERSION
-        || service != astral_common::middleware::internal_signature::INTERNAL_CALLER_LEARN
-        || caller != astral_common::middleware::internal_signature::INTERNAL_CALLER_LEARN
-        || key_id != astral_common::middleware::internal_signature::KEY_ID_LEARN_TO_GATEWAY
-        || route != astral_common::middleware::internal_signature::ROUTE_LEARN_TO_GATEWAY
-        || signed_body_hash != body_hash
-        || !astral_common::middleware::internal_signature::valid_sha256_hex(&signed_body_hash)
-    {
-        return internal_error(
-            &req,
-            401,
-            "Invalid internal assertion",
-            "INTERNAL_ASSERTION_INVALID",
-        );
-    }
-    let query = astral_common::middleware::internal_signature::normalize_query(req.uri().query());
-    let input = astral_common::middleware::internal_signature::InternalSignatureInput {
-        protocol_version: &protocol,
-        key_id: &key_id,
-        caller_service: &service,
-        method: req.method().as_str(),
-        path: req.uri().path(),
-        normalized_query: &query,
-        body_sha256: &signed_body_hash,
-        target_user_id: &user_id_string,
-        timestamp: &timestamp,
-        nonce: &nonce,
-        request_id: &request_id,
-        idempotency_key: &idempotency_key,
-        route: &route,
-    };
-    if !astral_common::middleware::internal_signature::timestamp_is_within_tolerance(
-        input.timestamp,
-        config.gateway.timestamp_tolerance_secs,
-        time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
-    ) || !astral_common::middleware::internal_signature::verify_internal_signature(
-        &config.internal_service_secret,
-        &input,
-        &signature,
-    ) {
-        return internal_error(
-            &req,
-            401,
-            "Invalid internal assertion",
-            "INTERNAL_SIGNATURE_INVALID",
-        );
-    }
-    match claim_internal_replay(&config, &input).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return internal_error(
-                &req,
-                401,
-                "Internal assertion replayed",
-                "INTERNAL_REPLAY_DETECTED",
-            )
-        }
-        Err(_) => {
-            return internal_error(
-                &req,
-                503,
-                "Internal authentication dependency unavailable",
-                "AUTH_STATE_UNAVAILABLE",
-            )
-        }
-    }
-    match claim_internal_idempotency(
-        &config,
-        input.caller_service,
-        input.route,
-        input.idempotency_key,
-        input.body_sha256,
-    )
-    .await
-    {
-        Ok(InternalIdempotencyClaim::Claimed) => next.run(req).await,
-        Ok(InternalIdempotencyClaim::Duplicate) => internal_error(
-            &req,
-            409,
-            "Internal request already completed or in flight",
-            "IDEMPOTENCY_REPLAY",
-        ),
-        Err(_) => internal_error(
-            &req,
-            409,
-            "Idempotency key is bound to another request",
-            "IDEMPOTENCY_CONFLICT",
-        ),
-    }
-}
-
-fn internal_error_from_parts(
-    path: &str,
-    request_id: &str,
-    status: u16,
-    message: &str,
-    reason: &str,
-) -> Response {
-    json_error(
-        "POST",
-        path,
-        (!request_id.is_empty()).then_some(request_id),
-        status,
-        message,
-        "UNAUTHORIZED",
-        reason,
-    )
-}
-
 pub async fn sanitize_internal_auth_headers(mut req: Request, next: Next) -> Response {
-    if req.method() == Method::POST && req.uri().path() == INTERNAL_SESSION_PATH {
-        return next.run(req).await;
-    }
     let headers = req.headers_mut();
     for name in INTERNAL_AUTH_HEADERS {
         headers.remove(*name);
@@ -989,27 +487,6 @@ pub async fn jwt_auth_middleware(
     // Step 0: CORS 预检直通
     if req.method() == "OPTIONS" {
         return next.run(req).await;
-    }
-
-    // The exact internal route is authenticated by the dedicated assertion
-    // middleware. It must not enter the public/Bearer policy below.
-    if req.method() == Method::POST && path == INTERNAL_SESSION_PATH {
-        return next.run(req).await;
-    }
-
-    // Browser WebSocket clients cannot set Authorization during the native
-    // handshake. Translate the credential only for the canonical chat WS route;
-    // all subsequent validation remains the normal HTTP Bearer path.
-    if let Err(error) = extract_chat_ws_credential(&mut req) {
-        return json_error(
-            req.method().as_str(),
-            &path,
-            request_trace_id(&req),
-            401,
-            error.message(),
-            "UNAUTHORIZED",
-            error.reason(),
-        );
     }
 
     // Route classification is performed before credential decoding. Unknown
@@ -1076,17 +553,6 @@ pub async fn jwt_auth_middleware(
             "Token type is not accepted on this route",
             "UNAUTHORIZED",
             "TOKEN_ROUTE_MISMATCH",
-        );
-    }
-    if policy == RouteCredentialPolicy::InternalOnly {
-        return json_error(
-            req.method().as_str(),
-            &path,
-            request_trace_id(&req),
-            401,
-            "Internal route requires service authentication",
-            "UNAUTHORIZED",
-            "INTERNAL_AUTH_REQUIRED",
         );
     }
     if token_use == TokenUse::Refresh {
@@ -1340,9 +806,9 @@ pub async fn jwt_auth_middleware(
     // JOIN 已含 tenant × tenant_domain_map ACTIVE 与完整卡/租户绑定；镜像命中
     // 为 verified-only + hub fanout 失效面）、claims 卡/租户绑定一致、组合
     // positive 强条件逐请求复观测为真——此时租户状态已被会话复合 ALLOW 事实
-    // 覆盖，跳过逐请求 duplicate tenant SQL（warmed 会话检查零 DB）。APP_USER
-    // 无卡绑定（tenant_id None）天然进不了本快路径。任一条件缺失即保留
-    // strict DB 读取并加硬 deadline（超时 503）；仅按 claims/flag 跳过是被
+    // 覆盖，跳过逐请求 duplicate tenant SQL（warmed 会话检查零 DB）。缺少租户
+    // 绑定的 claims 天然进不了本快路径。任一条件缺失即保留 strict DB 读取并
+    // 加硬 deadline（超时 503）；仅按 claims/flag 跳过是被
     // 禁止的。
     if let Some(tid) = tenant_id {
         let claims_tenant_bound = claims_tenant_matches_bind(Some(tid), &bind);
@@ -1610,157 +1076,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_ws_route_is_exact_and_segment_bounded() {
-        assert!(is_canonical_chat_ws_route(&Method::GET, "/v1/chat/ws/42"));
-        assert!(!is_canonical_chat_ws_route(&Method::POST, "/v1/chat/ws/42"));
-        assert!(!is_canonical_chat_ws_route(
-            &Method::GET,
-            "/v1/chat/ws/42/extra"
-        ));
-        assert!(!is_canonical_chat_ws_route(
-            &Method::GET,
-            "/v1/chat/ws/not-a-user"
-        ));
-    }
-
-    #[test]
-    fn chat_ws_subprotocol_promotes_bearer_and_keeps_stable_protocol() {
-        let mut request = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/chat/ws/42")
-            .header("sec-websocket-protocol", "astral-chat-v1, bearer.jwt-token")
-            .body(Body::empty())
-            .unwrap();
-
-        extract_chat_ws_credential(&mut request).unwrap();
-
-        assert_eq!(
-            request.headers().get("authorization").unwrap(),
-            "Bearer jwt-token"
-        );
-        assert_eq!(
-            request.headers().get("sec-websocket-protocol").unwrap(),
-            CHAT_WS_SUBPROTOCOL
-        );
-    }
-
-    #[test]
-    fn chat_ws_rejects_missing_invalid_duplicate_and_conflicting_credentials() {
-        let mut missing = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/chat/ws/42")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            extract_chat_ws_credential(&mut missing),
-            Err(WsCredentialError::MissingProtocol)
-        );
-
-        let mut missing_bearer = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/chat/ws/42")
-            .header("sec-websocket-protocol", CHAT_WS_SUBPROTOCOL)
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            extract_chat_ws_credential(&mut missing_bearer),
-            Err(WsCredentialError::MissingBearerCredential)
-        );
-
-        let mut duplicate_protocol = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/chat/ws/42")
-            .header(
-                "sec-websocket-protocol",
-                "astral-chat-v1, astral-chat-v1, bearer.one",
-            )
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            extract_chat_ws_credential(&mut duplicate_protocol),
-            Err(WsCredentialError::DuplicateProtocol)
-        );
-
-        let mut duplicate_bearer = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/chat/ws/42")
-            .header(
-                "sec-websocket-protocol",
-                "astral-chat-v1, bearer.one, bearer.two",
-            )
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            extract_chat_ws_credential(&mut duplicate_bearer),
-            Err(WsCredentialError::DuplicateBearerCredential)
-        );
-
-        let mut invalid_bearer = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/chat/ws/42")
-            .header("sec-websocket-protocol", "astral-chat-v1, bearer.")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            extract_chat_ws_credential(&mut invalid_bearer),
-            Err(WsCredentialError::InvalidBearerCredential)
-        );
-
-        let mut unknown_protocol = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/chat/ws/42")
-            .header(
-                "sec-websocket-protocol",
-                "astral-chat-v1, bearer.one, unknown",
-            )
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            extract_chat_ws_credential(&mut unknown_protocol),
-            Err(WsCredentialError::DuplicateProtocol)
-        );
-
-        let mut query_credential = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/chat/ws/42?access_token=query-token")
-            .header("sec-websocket-protocol", "astral-chat-v1, bearer.one")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            extract_chat_ws_credential(&mut query_credential),
-            Err(WsCredentialError::QueryCredentialForbidden)
-        );
-
-        let mut conflicting = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/chat/ws/42")
-            .header("authorization", "Bearer header-token")
-            .header(
-                "sec-websocket-protocol",
-                "astral-chat-v1, bearer.query-token",
-            )
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            extract_chat_ws_credential(&mut conflicting),
-            Err(WsCredentialError::ConflictingCredentials)
-        );
-    }
-
-    #[test]
-    fn non_chat_routes_do_not_interpret_websocket_credentials() {
-        let mut request = Request::builder()
-            .method(Method::GET)
-            .uri("/api/v1/auth/profile?access_token=not-a-credential")
-            .header("sec-websocket-protocol", "bearer.not-a-credential")
-            .body(Body::empty())
-            .unwrap();
-        extract_chat_ws_credential(&mut request).unwrap();
-        assert!(request.headers().get("authorization").is_none());
-        assert_eq!(request.uri().query(), Some("access_token=not-a-credential"));
-    }
-
-    #[test]
     fn segment_glob_is_segment_bounded() {
         assert!(segment_glob_matches(
             "/api/v1/auth/password/reset/*",
@@ -1865,11 +1180,6 @@ mod tests {
                 RouteCredentialPolicy::PublicOnly,
             ),
             (
-                Method::POST,
-                "/v1/app/users/login",
-                RouteCredentialPolicy::PublicOnly,
-            ),
-            (
                 Method::GET,
                 "/api/v1/auth/mfa/status",
                 RouteCredentialPolicy::AccessOnly,
@@ -1898,11 +1208,6 @@ mod tests {
                 Method::POST,
                 "/api/v1/auth/sessions/revoke",
                 RouteCredentialPolicy::AccessOrRefresh,
-            ),
-            (
-                Method::POST,
-                "/api/v1/auth/internal/sessions",
-                RouteCredentialPolicy::InternalOnly,
             ),
         ];
         for (method, path, expected) in cases {

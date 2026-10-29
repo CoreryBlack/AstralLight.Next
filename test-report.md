@@ -511,7 +511,7 @@ policy-engine/src/client.rs - client::PermissionClient (line 53)
 
 - 新建 compose 的 MySQL/MFA 初始化、全量 approved migration、backup/restore drill。
 - Redis compat feature suite；本轮刻意关闭 Redis，optional Redis 在 Cargo.lock 中不等于默认编译依赖。
-- excluded/frozen `astral-chat`、`astral-learn`、`astral-cache`、独立 integrations/bench crates。
+- **2026-10-07 报告时的排除范围**：当时 excluded/frozen 的 `astral-chat`、`astral-learn`、`astral-cache`，以及独立 integrations/bench crates 均未执行。其后 Chat/Learn 生产 runtime crates/routes/proxies 已退役并已从本 checkout 物理移除；`integrations/` 下独立 SDK 样板不是生产服务，本报告不把它们计为通过。
 - Criterion/引擎比较、OPA sidecar、loadgen/HTTP 饱和阶梯。
 - 真实 single-node composite 启动后业务 HTTP end-to-end。
 - RQ 三节点 campaign、跨节点/跨区恢复/故障、授权验证 E1–E5 Python/live 全协议、TLC 模型。

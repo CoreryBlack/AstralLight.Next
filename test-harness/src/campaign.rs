@@ -2084,9 +2084,6 @@ exit "${FAKE_CARGO_EXIT:-0}"
         let e_family = select_suites(&manifest, &[], &["E".into()], &[], false, false).unwrap();
         assert!(e_family
             .iter()
-            .all(|suite| suite_id(suite) != "excluded-service-checks"));
-        assert!(e_family
-            .iter()
             .all(|suite| suite_id(suite) != "mt-capacity"));
 
         let e2 = select_suites(

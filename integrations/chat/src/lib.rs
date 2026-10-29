@@ -55,11 +55,11 @@ impl ChatStore {
     }
 
     pub fn facts(&self, id: i64) -> Result<ResourceFacts, &'static str> {
-        self.resource_facts(id, "chat_message")
+        self.resource_facts(id, "message_record")
     }
 
     pub fn handshake_facts(&self, id: i64) -> Result<ResourceFacts, &'static str> {
-        self.resource_facts(id, "chat_conversation")
+        self.resource_facts(id, "conversation_record")
     }
 
     fn resource_facts(&self, id: i64, resource: &str) -> Result<ResourceFacts, &'static str> {
@@ -108,8 +108,8 @@ impl ChatStore {
 
     fn require_member(&self, id: i64, request: &AuthorizationRequest) -> Result<(), &'static str> {
         let conversation = self.conversations.get(&id).ok_or("NOT_FOUND")?;
-        if request.app_id != "astral-chat"
-            || request.subject.issuer != "chat-local"
+        if request.app_id != "messaging-app"
+            || request.subject.issuer != "messaging-local"
             || !conversation.members.contains(&request.subject.subject)
         {
             return Err("MEMBERSHIP_CHANGED");
@@ -135,7 +135,7 @@ impl ChatStore {
             || content.is_empty()
             || content.len() > 4096
             || request.path != format!("/conversations/{id}/messages")
-            || request.facts.resource_type != "chat_message"
+            || request.facts.resource_type != "message_record"
             || self.facts(id)? != request.facts
         {
             return Err("MEMBERSHIP_CHANGED");
@@ -212,13 +212,13 @@ impl ChatStore {
 
 pub fn manifest() -> ApplicationManifest {
     ApplicationManifest {
-        app_id: "astral-chat".into(),
+        app_id: "messaging-app".into(),
         revision: "1".into(),
         routes: vec![
             ManifestRoute {
                 method: "GET".into(),
                 path: "/conversations/{id}/socket".into(),
-                resource_type: "chat_conversation".into(),
+                resource_type: "conversation_record".into(),
                 action: "read".into(),
                 operation: ResourceOperation::Object,
                 resolver: ResourceResolver::Object {
@@ -228,7 +228,7 @@ pub fn manifest() -> ApplicationManifest {
             ManifestRoute {
                 method: "POST".into(),
                 path: "/conversations/{id}/messages".into(),
-                resource_type: "chat_message".into(),
+                resource_type: "message_record".into(),
                 action: "create".into(),
                 operation: ResourceOperation::Object,
                 resolver: ResourceResolver::Object {
@@ -238,7 +238,7 @@ pub fn manifest() -> ApplicationManifest {
             ManifestRoute {
                 method: "GET".into(),
                 path: "/conversations/{id}/messages".into(),
-                resource_type: "chat_message".into(),
+                resource_type: "message_record".into(),
                 action: "read".into(),
                 operation: ResourceOperation::Object,
                 resolver: ResourceResolver::Object {
@@ -251,7 +251,7 @@ pub fn manifest() -> ApplicationManifest {
 
 pub fn actor(subject: &str) -> ExternalSubject {
     ExternalSubject {
-        issuer: "chat-local".into(),
+        issuer: "messaging-local".into(),
         subject: subject.into(),
     }
 }

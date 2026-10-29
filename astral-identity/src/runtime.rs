@@ -514,7 +514,6 @@ where
         "identity",
     );
 
-    let internal_routes = Router::new().merge(srv::internal::internal_routes());
     let identity_mapping_routes = if identity_mapping_enabled {
         integration_mappings::routes()
     } else {
@@ -547,7 +546,6 @@ where
 
     let app = Router::new()
         .merge(public_routes)
-        .merge(internal_routes)
         .layer(axum::middleware::from_fn(global_exception_handler))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);

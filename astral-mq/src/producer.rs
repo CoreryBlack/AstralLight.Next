@@ -350,43 +350,6 @@ pub struct LoginEventPayload {
     pub success: bool,
 }
 
-/// 聊天消息通知
-///
-/// `messageId` 属于 `MqMessage` envelope，由 producer 生成并同时写入 Rabbit
-/// properties，不能在业务 payload 中重复声明。`id` 是 chat handler 的消息
-/// 数据库主键；字段通过 `rename_all = "camelCase"` 生成统一 wire 名称。
-#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ChatMessagePayload {
-    pub id: i64,
-    pub conversation_id: i64,
-    pub sender_id: i64,
-    pub content: String,
-    pub message_type: String,
-}
-
-/// 学习进度更新
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LearningProgressPayload {
-    pub user_id: i64,
-    pub subject_id: i64,
-    pub progress: f64,
-}
-
-/// 学科删除事件
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SubjectDeletePayload {
-    pub subject_id: i64,
-    pub subject_ids: Option<Vec<i64>>,
-    pub operator_id: i64,
-    pub cascade_delete: bool,
-    pub domain_id: Option<i64>,
-    pub tenant_id: Option<i64>,
-    pub subject_name: Option<String>,
-}
-
 // ===== 通用消息包装 =====
 
 /// 通用消息包装。业务字段与 envelope 字段展平到同一根对象；解码只接受此结构。
@@ -512,9 +475,6 @@ fn local_message_type(queue_name: &str) -> &'static str {
         QUEUE_AUDIT_LOG => "AUDIT_LOG",
         QUEUE_LOGIN_EVENT => "LOGIN_EVENT",
         crate::config::QUEUE_AUTH_SESSION_REVOCATION => "AUTH_SESSION_REVOCATION",
-        crate::config::QUEUE_CHAT_MESSAGE => "CHAT_MESSAGE",
-        crate::config::QUEUE_LEARNING_PROGRESS => "LEARNING_PROGRESS",
-        crate::config::QUEUE_SUBJECT_DELETE => "SUBJECT_DELETE",
         _ => "BUSINESS_MESSAGE",
     }
 }
@@ -726,9 +686,7 @@ impl Producer {
             payload,
         };
         let exchange = match queue_name {
-            crate::config::QUEUE_NOTIFICATION | crate::config::QUEUE_BUSINESS_CHAT => {
-                crate::config::EXCHANGE_TOPIC
-            }
+            crate::config::QUEUE_NOTIFICATION => crate::config::EXCHANGE_TOPIC,
             _ => crate::config::EXCHANGE_DIRECT,
         };
         if crate::config::route_for(queue_name, routing_key).is_none() {
@@ -823,88 +781,6 @@ impl Producer {
     /// 发布登录事件消息
     pub async fn publish_login_event(&self, payload: LoginEventPayload) -> Result<(), MqError> {
         self.publish_to_queue(crate::config::QUEUE_LOGIN_EVENT, "login.event", payload)
-            .await
-    }
-
-    /// 发布聊天消息通知。
-    ///
-    /// ChatMessageConsumer 监听 `astral.chat.message`，该队列绑定
-    /// `astral.direct`/`chat.message`；不要将它路由到 business-chat topic 队列。
-    pub async fn publish_chat_message(&self, payload: ChatMessagePayload) -> Result<(), MqError> {
-        self.publish_to_queue(crate::config::QUEUE_CHAT_MESSAGE, "chat.message", payload)
-            .await
-    }
-
-    /// Publish with an explicit transport identity. This convenience method
-    /// generates a new timestamp; durable retries must use `publish_committed_chat_message`.
-    pub async fn publish_chat_message_with_message_id(
-        &self,
-        payload: ChatMessagePayload,
-        message_id: &str,
-    ) -> Result<(), MqError> {
-        if message_id.is_empty()
-            || message_id.len() > u8::MAX as usize
-            || message_id.trim() != message_id
-            || message_id.chars().any(char::is_control)
-        {
-            return Err(MqError::Publish("invalid stable Chat message id".into()));
-        }
-        self.publish_to_queue_with_message_id(
-            crate::config::QUEUE_CHAT_MESSAGE,
-            "chat.message",
-            Some(message_id.to_owned()),
-            Some(message_id.to_owned()),
-            payload,
-        )
-        .await
-    }
-
-    /// Publish the exact persisted Chat message, including its original timestamp.
-    /// Confirmation proves broker admission, not recipient delivery.
-    pub async fn publish_committed_chat_message(
-        &self,
-        message: &MqMessage<ChatMessagePayload>,
-    ) -> Result<(), MqError> {
-        if message.message_id.is_empty()
-            || message.message_id.len() > u8::MAX as usize
-            || message.message_id.trim() != message.message_id
-            || message.message_id.chars().any(char::is_control)
-            || message.timestamp.len() > 64
-            || time::OffsetDateTime::parse(
-                &message.timestamp,
-                &time::format_description::well_known::Rfc3339,
-            )
-            .is_err()
-        {
-            return Err(MqError::Publish(
-                "invalid committed Chat message identity".into(),
-            ));
-        }
-        self.publish_with_queue_name(
-            crate::config::QUEUE_CHAT_MESSAGE,
-            crate::config::EXCHANGE_DIRECT,
-            "chat.message",
-            message,
-            &message.message_id,
-        )
-        .await
-    }
-
-    /// 发布学习进度更新
-    pub async fn publish_learning_progress(
-        &self,
-        payload: LearningProgressPayload,
-    ) -> Result<(), MqError> {
-        self.publish_to_queue("astral.learning.progress", "learning.progress", payload)
-            .await
-    }
-
-    /// 发布学科删除事件
-    pub async fn publish_subject_delete(
-        &self,
-        payload: SubjectDeletePayload,
-    ) -> Result<(), MqError> {
-        self.publish_to_queue("astral.subject.delete", "subject.delete", payload)
             .await
     }
 
@@ -1289,16 +1165,6 @@ mod tests {
         }
     }
 
-    fn chat_payload() -> ChatMessagePayload {
-        ChatMessagePayload {
-            id: 42,
-            conversation_id: 10,
-            sender_id: 1,
-            content: "hello".into(),
-            message_type: "TEXT".into(),
-        }
-    }
-
     #[test]
     fn audit_payload_detail_is_optional_within_a_canonical_flat_message() {
         // `detail` is optional business data; envelope identity remains root-level.
@@ -1350,67 +1216,27 @@ mod tests {
     #[test]
     fn mq_message_rejects_noncanonical_identity_and_nested_payload_shape() {
         let valid = json!({
-            "messageId": "chat-message-1",
+            "messageId": "message-1",
             "timestamp": "2026-10-28T00:00:00Z",
-            "id": 42,
-            "conversationId": 10,
-            "senderId": 1,
-            "content": "hello",
-            "messageType": "TEXT"
+            "event": "created"
         });
-        let decoded: MqMessage<ChatMessagePayload> = serde_json::from_value(valid).unwrap();
-        assert_eq!(decoded.message_id, "chat-message-1");
+        let decoded: MqMessage<serde_json::Value> = serde_json::from_value(valid).unwrap();
+        assert_eq!(decoded.message_id, "message-1");
+        assert_eq!(decoded.payload["event"], "created");
 
         let invalid_messages = [
+            json!({"timestamp": "2026-10-28T00:00:00Z", "event": "created"}),
+            json!({"messageId": 7, "timestamp": "2026-10-28T00:00:00Z", "event": "created"}),
+            json!({"messageId": "message-1", "timestamp": 1_798_156_800, "event": "created"}),
+            json!({"messageId": "message-1", "timestamp": "not-a-time", "event": "created"}),
             json!({
+                "messageId": "message-1",
                 "timestamp": "2026-10-28T00:00:00Z",
-                "id": 42,
-                "conversationId": 10,
-                "senderId": 1,
-                "content": "hello",
-                "messageType": "TEXT"
-            }),
-            json!({
-                "messageId": 7,
-                "timestamp": "2026-10-28T00:00:00Z",
-                "id": 42,
-                "conversationId": 10,
-                "senderId": 1,
-                "content": "hello",
-                "messageType": "TEXT"
-            }),
-            json!({
-                "messageId": "chat-message-1",
-                "timestamp": 1_798_156_800,
-                "id": 42,
-                "conversationId": 10,
-                "senderId": 1,
-                "content": "hello",
-                "messageType": "TEXT"
-            }),
-            json!({
-                "messageId": "chat-message-1",
-                "timestamp": "not-a-time",
-                "id": 42,
-                "conversationId": 10,
-                "senderId": 1,
-                "content": "hello",
-                "messageType": "TEXT"
-            }),
-            json!({
-                "messageId": "chat-message-1",
-                "timestamp": "2026-10-28T00:00:00Z",
-                "payload": {
-                    "id": 42,
-                    "conversationId": 10,
-                    "senderId": 1,
-                    "content": "hello",
-                    "messageType": "TEXT"
-                }
+                "payload": {"event": "created"}
             }),
         ];
         for message in invalid_messages {
-            assert!(serde_json::from_value::<MqMessage<ChatMessagePayload>>(message).is_err());
+            assert!(serde_json::from_value::<MqMessage<serde_json::Value>>(message).is_err());
         }
     }
 
@@ -1419,21 +1245,21 @@ mod tests {
         let blank_id = MqMessage {
             message_id: "  ".into(),
             timestamp: "2026-10-28T00:00:00Z".into(),
-            payload: chat_payload(),
+            payload: json!({"event": "created"}),
         };
         assert!(serde_json::to_value(blank_id).is_err());
 
         let invalid_timestamp = MqMessage {
-            message_id: "chat-message-1".into(),
+            message_id: "message-1".into(),
             timestamp: "invalid".into(),
-            payload: chat_payload(),
+            payload: json!({"event": "created"}),
         };
         assert!(serde_json::to_value(invalid_timestamp).is_err());
 
         let nested = MqMessage {
-            message_id: "chat-message-1".into(),
+            message_id: "message-1".into(),
             timestamp: "2026-10-28T00:00:00Z".into(),
-            payload: json!({"payload": {"id": 42}}),
+            payload: json!({"payload": {"event": "created"}}),
         };
         assert!(serde_json::to_value(nested).is_err());
     }
@@ -1456,91 +1282,42 @@ mod tests {
     }
 
     #[test]
-    fn chat_payload_uses_canonical_camel_case_wire_fields() {
-        let value = serde_json::to_value(chat_payload()).unwrap();
-        assert_eq!(
-            value,
-            json!({
-                "id": 42,
-                "conversationId": 10,
-                "senderId": 1,
-                "content": "hello",
-                "messageType": "TEXT"
-            })
+    fn generic_publish_requires_a_declared_queue_and_routing_key() {
+        assert!(crate::config::route_for(crate::config::QUEUE_AUDIT_LOG, "audit.log").is_some());
+        assert!(
+            crate::config::route_for(crate::config::QUEUE_LOGIN_EVENT, "login.event").is_some()
         );
-        assert!(!value.as_object().unwrap().contains_key("sessionId"));
-        assert!(!value.as_object().unwrap().contains_key("msgType"));
-        assert!(!value.as_object().unwrap().contains_key("messageId"));
+        assert!(crate::config::route_for(
+            crate::config::QUEUE_AUTH_SESSION_REVOCATION,
+            "auth.session.revocation"
+        )
+        .is_some());
+        assert_eq!(crate::config::QUEUES.len(), 4);
+        assert!(crate::config::QUEUES
+            .iter()
+            .all(|queue| { crate::config::route_for(queue.name, queue.routing_key).is_some() }));
     }
 
     #[test]
-    fn chat_payload_rejects_legacy_field_names() {
-        let legacy = json!({
-            "messageId": "legacy-message",
-            "sessionId": 10,
-            "senderId": 1,
-            "content": "hello",
-            "msgType": "TEXT"
-        });
-        assert!(serde_json::from_value::<ChatMessagePayload>(legacy).is_err());
-    }
-
-    #[test]
-    fn chat_envelope_keeps_global_message_id_for_idempotency() {
+    fn producer_message_id_is_root_level_and_replayable() {
         let message = MqMessage {
-            message_id: "msg-chat-42".into(),
-            timestamp: "2026-08-17T00:00:00Z".into(),
-            payload: chat_payload(),
+            message_id: "message-42".into(),
+            timestamp: "2026-10-03T00:00:00Z".into(),
+            payload: json!({"event": "created"}),
         };
-        let value = serde_json::to_value(&message).unwrap();
-        assert_eq!(value["messageId"], "msg-chat-42");
-        assert_eq!(value["id"], 42);
-        assert_eq!(value["conversationId"], 10);
-        assert_eq!(value["messageType"], "TEXT");
-        assert!(value.get("sessionId").is_none());
-        assert!(value.get("msgType").is_none());
-
-        let decoded: MqMessage<ChatMessagePayload> = serde_json::from_value(value).unwrap();
-        assert_eq!(decoded.message_id, "msg-chat-42");
-        assert_eq!(decoded.payload, chat_payload());
-    }
-
-    #[tokio::test]
-    async fn stable_chat_message_id_rejects_invalid_ids_before_transport() {
-        let bus = LocalBus::new(LocalBusLimits::default()).unwrap();
-        let producer = Producer::new_local(bus, "local");
-        for message_id in [
-            "".to_owned(),
-            " ".into(),
-            " id".into(),
-            "id ".into(),
-            "id\n".into(),
-            "x".repeat(256),
-        ] {
-            let error = producer
-                .publish_chat_message_with_message_id(chat_payload(), &message_id)
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(error, MqError::Publish(reason) if reason == "invalid stable Chat message id")
-            );
-        }
+        let bytes = serde_json::to_vec(&message).unwrap();
+        let reloaded: MqMessage<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let replayed = serde_json::to_vec(&reloaded).unwrap();
+        assert_eq!(bytes, replayed);
+        assert_eq!(Sha256::digest(&bytes), Sha256::digest(&replayed));
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["messageId"], "message-42");
+        assert_eq!(value["event"], "created");
     }
 
     #[test]
-    fn stable_chat_publisher_preserves_envelope_and_amqp_message_id() {
+    fn publisher_confirms_and_mandatory_routing_are_preserved() {
         let source = include_str!("producer.rs");
-        let stable = source
-            .split("pub async fn publish_chat_message_with_message_id(")
-            .nth(1)
-            .unwrap()
-            .split("pub async fn publish_learning_progress(")
-            .next()
-            .unwrap();
-        assert!(stable.contains("Some(message_id.to_owned())"));
-        assert!(!stable.contains("Uuid::new_v4"));
-        assert!(stable.contains("crate::config::QUEUE_CHAT_MESSAGE"));
-        assert!(stable.contains("\"chat.message\""));
         let rabbit = source
             .split("let properties = BasicProperties::default()")
             .nth(1)
@@ -1551,62 +1328,6 @@ mod tests {
         assert!(rabbit.contains(".with_message_id(message.message_id.as_str().into())"));
         assert!(rabbit.contains("Confirmation::Ack(None)"));
         assert!(rabbit.contains("mandatory: true"));
-    }
-
-    #[test]
-    fn committed_chat_wire_digest_is_stable_across_durable_round_trips() {
-        let message = MqMessage {
-            message_id: "committed-chat-message".into(),
-            timestamp: "2026-10-03T00:00:00Z".into(),
-            payload: chat_payload(),
-        };
-        let bytes = serde_json::to_vec(&message).unwrap();
-        let reloaded: MqMessage<ChatMessagePayload> = serde_json::from_slice(&bytes).unwrap();
-        let replayed = serde_json::to_vec(&reloaded).unwrap();
-        assert_eq!(bytes, replayed);
-        assert_eq!(Sha256::digest(&bytes), Sha256::digest(&replayed));
-        let source = include_str!("producer.rs");
-        let committed = source
-            .split("pub async fn publish_committed_chat_message(")
-            .nth(1)
-            .unwrap()
-            .split("pub async fn publish_learning_progress(")
-            .next()
-            .unwrap();
-        assert!(!committed.contains("now_timestamp"));
-        assert!(!committed.contains("Uuid::new_v4"));
-        assert!(committed.contains("message,"));
-        assert!(committed.contains("&message.message_id"));
-    }
-
-    #[tokio::test]
-    async fn committed_chat_message_refuses_unproven_timestamp_before_transport() {
-        let producer =
-            Producer::new_local(LocalBus::new(LocalBusLimits::default()).unwrap(), "local");
-        for timestamp in ["", "not-a-time"] {
-            let message = MqMessage {
-                message_id: "committed-chat-message".into(),
-                timestamp: timestamp.into(),
-                payload: chat_payload(),
-            };
-            let error = producer
-                .publish_committed_chat_message(&message)
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(error, MqError::Publish(reason) if reason == "invalid committed Chat message identity")
-            );
-        }
-    }
-
-    #[test]
-    fn chat_queue_uses_direct_chat_message_binding() {
-        let queue = crate::config::QUEUES
-            .iter()
-            .find(|queue| queue.name == crate::config::QUEUE_CHAT_MESSAGE)
-            .unwrap();
-        assert_eq!(queue.exchange_name, crate::config::EXCHANGE_DIRECT);
-        assert_eq!(queue.routing_key, "chat.message");
     }
 
     #[tokio::test]

@@ -171,7 +171,7 @@ mod tests {
         let repo = SqlxCrossOrgGrantRepository::new(pool);
 
         let error = repo
-            .upsert_grant(1, 2, "learn_course", "read", None)
+            .upsert_grant(1, 2, "permission_rule", "read", None)
             .await
             .expect_err("cross_org_grant upsert must fail closed");
 

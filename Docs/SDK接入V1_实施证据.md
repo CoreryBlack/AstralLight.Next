@@ -1,5 +1,7 @@
 # SDK V1 实施证据
 
+> 历史证据快照：本记录描述 2026-10-05/06 的 SDK 实施与验证，不是当前 Chat/Learn 服务清单。记录时 `astral-chat` / `astral-learn` 生产源码仍存在于 workspace 外；这些生产 runtime crates、Gateway routes/proxies 与 API contracts 现已退役并已从本 checkout 物理移除。`integrations/` 的独立 Chat/Learn SDK consumer samples 保留为示例/测试应用，不是生产服务或其 API 的替代实现。以下历史执行范围与结果保留为当时证据。
+
 ## 任务与状态
 
 - taskId: `sdk-integration-v1-20261005`；责任 Agent: 主 Agent。

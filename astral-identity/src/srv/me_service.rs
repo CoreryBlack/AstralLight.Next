@@ -12,12 +12,10 @@ use super::me_repository::{MeRepository, PermissionRecord, ProfileRecord, UserCa
 
 const ALWAYS_VISIBLE_MENUS: &[&str] = &[
     "dashboard",
-    "chatPage",
     "identitySecurity",
     "helpDocs",
     "systemSettings",
     "userManagement",
-    "studentManagement",
 ];
 
 pub struct MeService {
@@ -126,58 +124,15 @@ fn compact_or_full_permissions(rules: Vec<PermissionRecord>) -> Vec<String> {
 fn compact_permission(resource: &str, action: &str) -> Option<String> {
     let resource = resource.trim().to_lowercase();
     let action = action.trim().to_lowercase();
-    if resource.starts_with("learn:")
-        || resource.starts_with("authz:")
-        || resource.starts_with("platform:")
-        || resource == "*"
-    {
+    if resource.starts_with("authz:") || resource.starts_with("platform:") || resource == "*" {
         return Some(format!("{resource}:{action}"));
     }
 
-    let crud = |prefix: &str| match action.as_str() {
-        "read" | "get" => Some(format!("{prefix}:read")),
-        "create" | "update" | "delete" | "post" | "put" => Some(format!("{prefix}:write")),
-        "import" => Some(format!("{prefix}:import")),
-        "export" => Some(format!("{prefix}:export")),
-        _ => None,
-    };
-
-    if resource.contains("learn_subject") {
-        return crud("learn:subjects");
-    }
-    if resource.contains("learn_chapter") {
-        return crud("learn:chapters");
-    }
-    if resource.contains("learn_level") {
-        return crud("learn:levels");
-    }
-    if resource.contains("learn_question_bank") || resource.contains("learn_app_question") {
-        return crud("learn:questions");
-    }
-    if resource.contains("learn_course") {
-        return crud("learn:courses");
-    }
-    if resource.contains("learn_checkin") {
-        return crud("learn:checkins");
-    }
-    if resource.contains("learn_statistics") && matches!(action.as_str(), "read" | "get") {
-        return Some("learn:statistics:read".into());
-    }
     None
 }
 
 fn menu_for_resource(resource: &str) -> Option<&'static str> {
     match resource {
-        "learn_subject" | "learn_course" | "learn_chapter" | "learn_level" | "learn_level_play" => {
-            Some("courseManagement")
-        }
-        "learn_question" | "learn_solution" | "learn_wrong_question" | "learn_exam" => {
-            Some("contentManagement")
-        }
-        "learn_checkin" => Some("checkIn"),
-        "learn_statistics" => Some("dataStatistics"),
-        "learn_device" => Some("deviceStatus"),
-        "learn_school" => Some("studentManagement"),
         "permission_rule"
         | "permission_request"
         | "domain"
@@ -190,7 +145,6 @@ fn menu_for_resource(resource: &str) -> Option<&'static str> {
         "platform_package" => Some("packageManagement"),
         "platform_dept" => Some("departmentManagement"),
         "identity_users" => Some("userManagement"),
-        "chat_message" | "chat_conversation" | "chat_offline_message" => Some("chatPage"),
         "permission_inheritance" | "cross_org_grant" | "enterprise_permission" => {
             Some("sodManagement")
         }
@@ -321,6 +275,6 @@ mod tests {
         let service = MeService::new(repository);
         let menus = service.menus(1, None).await.unwrap();
         assert!(menus.contains(&"dashboard".to_string()));
-        assert!(menus.contains(&"studentManagement".to_string()));
+        assert!(menus.contains(&"identitySecurity".to_string()));
     }
 }

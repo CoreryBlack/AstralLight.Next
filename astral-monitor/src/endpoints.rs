@@ -31,8 +31,6 @@ pub struct HealthStatus {
 pub struct ServiceStatus {
     pub gateway: String,
     pub identity: String,
-    pub learn: String,
-    pub chat: String,
     pub trustgraph: String,
     pub database: String,
     pub rabbitmq: String,
@@ -180,12 +178,10 @@ async fn query_service_status(state: &AppState, service_name: &str) -> String {
 async fn detailed_health(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<ServiceStatus>>, AppError> {
-    let (db_status, gateway, identity, learn, chat, trustgraph, rabbitmq) = tokio::join!(
+    let (db_status, gateway, identity, trustgraph, rabbitmq) = tokio::join!(
         check_db_health(&state),
         gateway_status(&state),
         query_service_status(&state, "identity"),
-        query_service_status(&state, "learn"),
-        query_service_status(&state, "chat"),
         query_service_status(&state, "trustgraph"),
         check_rabbitmq_health(&state.config),
     );
@@ -193,8 +189,6 @@ async fn detailed_health(
     Ok(Json(ApiResponse::success(ServiceStatus {
         gateway,
         identity,
-        learn,
-        chat,
         trustgraph,
         database: db_status,
         rabbitmq,
@@ -286,12 +280,10 @@ pub async fn frontend_metrics(
 async fn service_status(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<ServiceStatus>>, AppError> {
-    let (db_status, gateway, identity, learn, chat, trustgraph, rabbitmq) = tokio::join!(
+    let (db_status, gateway, identity, trustgraph, rabbitmq) = tokio::join!(
         check_db_health(&state),
         gateway_status(&state),
         query_service_status(&state, "identity"),
-        query_service_status(&state, "learn"),
-        query_service_status(&state, "chat"),
         query_service_status(&state, "trustgraph"),
         check_rabbitmq_health(&state.config),
     );
@@ -299,8 +291,6 @@ async fn service_status(
     Ok(Json(ApiResponse::success(ServiceStatus {
         gateway,
         identity,
-        learn,
-        chat,
         trustgraph,
         database: db_status,
         rabbitmq,

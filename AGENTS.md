@@ -152,9 +152,8 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 ├── astral-monitor/            # 监控、指标与告警
 ├── e2e-bootstrap/             # 隔离启动入口
 ├── testsuite/ (tests-suite/)  # 分类测试套件(多租户极限/安全前提;编目见 tests-suite/MANIFEST.toml)
-├── astral-chat/               # 冻结源码，Cargo workspace exclude
-├── astral-learn/              # 冻结源码，Cargo workspace exclude
-└── Docs/                      # Rust 工程规范、架构、迁移与 schema
+├── integrations/             # 独立 SDK consumer 样例(nested workspace)
+└── Docs/                     # Rust 工程规范、架构、迁移与 schema
 ```
 
 模块边界、投影 owner、MQ 消费者和消息幂等以 [`Docs/规范/Rust后端编码规范_V1.0.md`](Docs/规范/Rust后端编码规范_V1.0.md)、[`Docs/规范/统一消息协议与智能层消息规范_2026-03-18.md`](Docs/规范/统一消息协议与智能层消息规范_2026-03-18.md) 及 [`Docs/规范/README.md`](Docs/规范/README.md) 为准。

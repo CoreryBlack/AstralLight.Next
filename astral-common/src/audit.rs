@@ -458,91 +458,6 @@ pub fn global_audit_dual_write() -> Option<AuditDualWrite> {
         .map(AuditDualWrite::new)
 }
 
-/// Static reasons permitted for Gateway -> Identity internal app-session
-/// audit events. Keeping this as an enum prevents request data from leaking
-/// into the audit reason/detail fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InternalSessionAuditReason {
-    AppSessionSuccess,
-    AppUserNotFound,
-    SessionIssuanceFailed,
-    InternalAssertionInvalid,
-    InternalAssertionMissing,
-    InternalBodyHashInvalid,
-    InternalSignatureInvalid,
-    InternalReplayDetected,
-    IdempotencyReplay,
-    IdempotencyConflict,
-    AuthStateUnavailable,
-    BodyInvalid,
-    BodyTooLarge,
-}
-
-impl InternalSessionAuditReason {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::AppSessionSuccess => "APP_SESSION_SUCCESS",
-            Self::AppUserNotFound => "APP_USER_NOT_FOUND",
-            Self::SessionIssuanceFailed => "SESSION_ISSUANCE_FAILED",
-            Self::InternalAssertionInvalid => "INTERNAL_ASSERTION_INVALID",
-            Self::InternalAssertionMissing => "INTERNAL_ASSERTION_MISSING",
-            Self::InternalBodyHashInvalid => "INTERNAL_BODY_HASH_INVALID",
-            Self::InternalSignatureInvalid => "INTERNAL_SIGNATURE_INVALID",
-            Self::InternalReplayDetected => "INTERNAL_REPLAY_DETECTED",
-            Self::IdempotencyReplay => "IDEMPOTENCY_REPLAY",
-            Self::IdempotencyConflict => "IDEMPOTENCY_CONFLICT",
-            Self::AuthStateUnavailable => "AUTH_STATE_UNAVAILABLE",
-            Self::BodyInvalid => "BODY_INVALID",
-            Self::BodyTooLarge => "BODY_TOO_LARGE",
-        }
-    }
-}
-
-/// Queue an internal app-session audit event without blocking authentication.
-/// The registered writer retains MQ-first/DB-fallback semantics; when no
-/// writer is registered, structured tracing remains the safe fallback.
-pub fn spawn_internal_session_audit(
-    user_id: i64,
-    success: bool,
-    reason: InternalSessionAuditReason,
-) {
-    let entry = AuditEntry {
-        user_id: Some(user_id),
-        card_id: None,
-        action: "login".into(),
-        resource: "identity-internal-session".into(),
-        decision: if success { "ALLOW" } else { "DENY" }.into(),
-        reason: Some(reason.as_str().into()),
-        event_type: if success {
-            AuditEventType::LoginSuccess
-        } else {
-            AuditEventType::LoginFailure
-        },
-        category: Some(AuditCategory::IdentityLogin),
-        source_ip: None,
-        request_id: None,
-        domain_id: None,
-        tenant_id: None,
-        detail: Some("gateway-to-identity-internal-session".into()),
-    };
-
-    let Some(writer) = global_audit_dual_write() else {
-        record_audit(entry);
-        return;
-    };
-    if tokio::runtime::Handle::try_current().is_err() {
-        record_audit(entry);
-        return;
-    }
-    let queued_entry = entry.clone();
-    if let Err(reason) = spawn_owned_audit(async move {
-        writer.write(queued_entry).await;
-    }) {
-        tracing::warn!(reason, "internal session audit admission refused");
-        record_audit(entry);
-    }
-}
-
 /// 公共权限审计入口：没有初始化 DB writer 时也保留 tracing 可观测记录。
 #[allow(clippy::too_many_arguments)]
 pub async fn record_permission_audit(
@@ -724,21 +639,6 @@ mod tests {
             .shutdown(std::time::Duration::from_secs(1))
             .await
             .is_err());
-    }
-
-    #[test]
-    fn internal_session_audit_uses_owned_admission_with_tracing_fallback() {
-        let source = include_str!("audit.rs");
-        let body = source
-            .split("pub fn spawn_internal_session_audit(")
-            .nth(1)
-            .unwrap()
-            .split("pub async fn record_permission_audit(")
-            .next()
-            .unwrap();
-        assert!(body.contains("spawn_owned_audit(async move"));
-        assert!(body.contains("record_audit(entry)"));
-        assert!(!body.contains("handle.spawn("));
     }
 
     #[test]

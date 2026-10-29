@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use policy_engine::PolicyEngine;
 
 use astral_common::audit::{AuditDbWriter, AuditEntry};
-use astral_common::config::AppConfig;
+use astral_common::config::{AppConfig, JwtValidationRole};
 use astral_common::contract::ApiResponse;
 use astral_common::error::global_exception_handler;
 use astral_common::middleware::gateway_signature::gateway_signature_middleware;
@@ -89,7 +89,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let config = Arc::new(AppConfig::from_files("application")?);
+    let config = Arc::new(AppConfig::from_files_for(
+        "application",
+        JwtValidationRole::Gateway,
+    )?);
     let db = connect_and_validate_schema(&config.database_url).await?;
     let engine = Arc::new(PolicyEngine::new());
     astral_common::audit::register_audit_db_writer(Arc::new(MonitorAuditDbWriter {

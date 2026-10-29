@@ -84,7 +84,7 @@ impl LearnStore {
         let course = self.courses.get(&id).ok_or("NOT_FOUND")?;
         let scope = self.scopes.get(&course.scope_id).ok_or("INVALID_SCOPE")?;
         Ok(ResourceFacts {
-            resource_type: "learn_course".into(),
+            resource_type: "course_record".into(),
             target_id: id.to_string(),
             external_tenant_id: scope.tenant.clone(),
             external_domain_id: scope.domain.clone(),
@@ -97,7 +97,7 @@ impl LearnStore {
     pub fn collection_facts(&self, scope_id: i64) -> Result<ResourceFacts, &'static str> {
         let scope = self.scopes.get(&scope_id).ok_or("NOT_FOUND")?;
         Ok(ResourceFacts {
-            resource_type: "learn_course".into(),
+            resource_type: "course_record".into(),
             target_id: scope.id.to_string(),
             external_tenant_id: scope.tenant.clone(),
             external_domain_id: scope.domain.clone(),
@@ -116,15 +116,15 @@ impl LearnStore {
             .require_allow_current(request)
             .map_err(|_| "DENIED")?;
         if !manifest().permits(
-            "learn_course",
+            "course_record",
             "update",
             &request.method,
             &request.path,
             request.facts.operation,
-        ) || request.app_id != "astral-learn"
+        ) || request.app_id != "course-app"
             || request.action != "update"
-            || request.facts.resource_type != "learn_course"
-            || request.subject.issuer != "learn-local"
+            || request.facts.resource_type != "course_record"
+            || request.subject.issuer != "course-local"
             || request.path != format!("/courses/{}/publish", request.facts.target_id)
         {
             return Err("DENIED");
@@ -230,8 +230,8 @@ impl LearnStore {
             .target_id
             .parse::<i64>()
             .map_err(|_| "INVALID_TARGET")?;
-        if request.app_id != "astral-learn"
-            || request.subject.issuer != "learn-local"
+        if request.app_id != "course-app"
+            || request.subject.issuer != "course-local"
             || request.action != "read"
             || request.method != "GET"
             || request.path != format!("/course-scopes/{id}/courses")
@@ -251,13 +251,13 @@ impl LearnStore {
 
 pub fn manifest() -> ApplicationManifest {
     ApplicationManifest {
-        app_id: "astral-learn".into(),
+        app_id: "course-app".into(),
         revision: "1".into(),
         routes: vec![
             ManifestRoute {
                 method: "POST".into(),
                 path: "/courses/{id}/publish".into(),
-                resource_type: "learn_course".into(),
+                resource_type: "course_record".into(),
                 action: "update".into(),
                 operation: ResourceOperation::Object,
                 resolver: ResourceResolver::Object {
@@ -267,7 +267,7 @@ pub fn manifest() -> ApplicationManifest {
             ManifestRoute {
                 method: "GET".into(),
                 path: "/course-scopes/{id}/courses".into(),
-                resource_type: "learn_course".into(),
+                resource_type: "course_record".into(),
                 action: "read".into(),
                 operation: ResourceOperation::ScopedCollection,
                 resolver: ResourceResolver::ScopedCollection {
@@ -280,7 +280,7 @@ pub fn manifest() -> ApplicationManifest {
 
 pub fn actor(subject: &str) -> ExternalSubject {
     ExternalSubject {
-        issuer: "learn-local".into(),
+        issuer: "course-local".into(),
         subject: subject.into(),
     }
 }

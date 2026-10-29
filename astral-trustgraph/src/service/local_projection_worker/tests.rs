@@ -46,7 +46,7 @@ fn canonical_grant(revision: u64, state: GrantState) -> CanonicalGrant {
         tenant: TenantScope::new(7, Some(11)).expect("tenant"),
         card_id: 11,
         user_id: 3,
-        resource: "learn_subject".to_owned(),
+        resource: "permission_rule".to_owned(),
         action: "read".to_owned(),
         effect: GrantEffect::Allow,
         validity: ValidityWindow::between(100, 200),

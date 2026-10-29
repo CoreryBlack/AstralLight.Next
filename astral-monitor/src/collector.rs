@@ -1,9 +1,7 @@
 //! 定时采集后台任务 — 对应 Java `MetricCollectTask` + `AlertEvaluationTask`。
 //!
 //! Service probes only use an explicitly registered endpoint/authentication
-//! contract. Existing Learn health is Gateway-signature protected and Chat has no
-//! registered `/api/health` route, so neither is fetched with an unsigned request;
-//! an unavailable probe contract is recorded as UNKNOWN rather than DOWN.
+//! contract. Unavailable probe contracts are recorded as UNKNOWN rather than DOWN.
 //!
 //! Shutdown is cooperative and bounded. The collector owns its JoinSet of alert
 //! dispatches and never detaches one task per alert.
@@ -23,13 +21,9 @@ const MAX_ALERT_DISPATCH_CONCURRENCY: usize = 4;
 const ALERT_DISPATCH_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const COLLECTOR_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Registered service health endpoint/authentication contracts.
+/// No registered endpoint contract exists for configured services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeContract {
-    /// A real path exists, but requires Gateway v3 identity signing. The monitor
-    /// currently has no service-principal identity and must not synthesize one.
-    GatewaySigned { path: &'static str },
-    /// No registered endpoint contract exists for this service.
     Unavailable { reason: &'static str },
 }
 
@@ -287,8 +281,6 @@ async fn maybe_cleanup(state: &AppState) {
 fn probe_targets(config: &AppConfig) -> Vec<ProbeTarget> {
     [
         ("identity", config.identity_service_uri.as_str()),
-        ("learn", config.learn_service_uri.as_str()),
-        ("chat", config.chat_service_uri.as_str()),
         ("gateway", config.gateway_service_uri.as_str()),
         ("trustgraph", config.trust_graph_uri.as_str()),
     ]
@@ -303,12 +295,6 @@ fn probe_targets(config: &AppConfig) -> Vec<ProbeTarget> {
 
 fn probe_contract(service_name: &str) -> ProbeContract {
     match service_name {
-        "learn" => ProbeContract::GatewaySigned {
-            path: "/api/health",
-        },
-        "chat" => ProbeContract::Unavailable {
-            reason: "Chat has no registered /api/health route",
-        },
         "identity" | "gateway" | "trustgraph" => ProbeContract::Unavailable {
             reason: "service has no registered health route",
         },
@@ -321,12 +307,8 @@ fn probe_contract(service_name: &str) -> ProbeContract {
 /// No protected/absent health endpoint is contacted without its declared
 /// authentication contract. New public probes must add a concrete contract here.
 async fn probe_service(state: &AppState, target: &ProbeTarget) {
-    let reason = match target.contract {
-        ProbeContract::GatewaySigned { path } => format!(
-            "health endpoint {path} requires Gateway v3 identity signing; monitor service identity is unavailable"
-        ),
-        ProbeContract::Unavailable { reason } => reason.to_owned(),
-    };
+    let ProbeContract::Unavailable { reason } = target.contract;
+    let reason = reason.to_owned();
     tracing::debug!(
         service = target.service_name,
         reason,

@@ -517,8 +517,8 @@ mod tests {
     fn malformed_template_rules_are_rejected_instead_of_dropped() {
         let request = serde_json::json!({
             "rules": [
-                {"resource": "learn_course", "action": "read"},
-                {"resource": "learn_course"}
+                {"resource": "permission_rule", "action": "read"},
+                {"resource": "permission_rule"}
             ]
         });
         let error = parse_template_rules(&request).unwrap_err();
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn non_array_template_rules_are_rejected() {
-        let request = serde_json::json!({"rules": {"resource": "learn_course"}});
+        let request = serde_json::json!({"rules": {"resource": "permission_rule"}});
         assert!(matches!(
             parse_template_rules(&request),
             Err(AppError(AstralError::Validation(message))) if message.contains("array")
@@ -541,14 +541,14 @@ mod tests {
     fn template_rule_effect_is_allow_only() {
         // 缺省 effect 视为 ALLOW
         let rules = parse_template_rules(&serde_json::json!({
-            "rules": [{"resource": "learn_course", "action": "read"}]
+            "rules": [{"resource": "permission_rule", "action": "read"}]
         }))
         .expect("missing effect defaults to ALLOW");
         assert_eq!(rules[0].effect, "ALLOW");
 
         // 大小写/空白归一后写入 canonical ALLOW
         let rules = parse_template_rules(&serde_json::json!({
-            "rules": [{"resource": "learn_course", "action": "read", "effect": " allow "}]
+            "rules": [{"resource": "permission_rule", "action": "read", "effect": " allow "}]
         }))
         .expect("case-insensitive ALLOW must be accepted");
         assert_eq!(rules[0].effect, "ALLOW");
@@ -556,7 +556,7 @@ mod tests {
         // DENY/未知值/空值在解析期拒绝，不进入任何 source 写入
         for rejected in ["DENY", "deny", "GRANT", "", "   "] {
             let error = parse_template_rules(&serde_json::json!({
-                "rules": [{"resource": "learn_course", "action": "read", "effect": rejected}]
+                "rules": [{"resource": "permission_rule", "action": "read", "effect": rejected}]
             }))
             .expect_err("non-ALLOW template rule effect must be rejected");
             assert!(

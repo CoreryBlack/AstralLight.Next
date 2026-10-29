@@ -3,12 +3,10 @@
 //! 用户管理、卡片管理、会话管理、密码重置、管理员端点等。
 
 pub mod admin;
-pub(crate) mod app_user_repository;
 pub(crate) mod auth_repository;
 pub(crate) mod auth_service;
 pub(crate) mod card_repository;
 pub mod cards;
-pub mod internal;
 pub mod me;
 pub(crate) mod me_repository;
 pub(crate) mod me_service;

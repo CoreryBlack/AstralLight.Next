@@ -1,6 +1,6 @@
 # SDK 接入 V1
 
-V1 已实现平台独立 SDK、默认关闭的远程准入和最小身份映射管理，另有独立 Chat/Learn 接入样板。它不是生产开户、迁移或切流验收记录。验证状态见 [实施证据](SDK接入V1_实施证据.md)。
+V1 已实现平台独立 SDK、默认关闭的远程准入和最小身份映射管理，另有 `integrations/` 下独立 Chat/Learn 公共 SDK consumer samples。样板只是示例/测试应用，不是生产 `astral-chat` / `astral-learn` 服务或 HTTP/WebSocket API 的替代品；这些生产 runtime crates 与 Gateway routes/proxies 已退役并已从本 checkout 物理移除。本文不是生产开户、迁移或切流验收记录。验证状态见 [实施证据](SDK接入V1_实施证据.md)。
 
 ## 1. 必须建立的映射
 
@@ -16,7 +16,7 @@ V1 已实现平台独立 SDK、默认关闭的远程准入和最小身份映射�
 
 ## 2. 接入顺序
 
-1. 管理员批准应用 ID、公钥、issuer、资源/动作 manifest 和外部 tenant/domain 到平台范围的映射。每个资源只有一个应用 owner；内置资源只允许 Chat/Learn 业务资源，其他资源必须已在 ResourceRegistry 注册。注册不授予规则。
+1. 管理员批准应用 ID、公钥、issuer、资源/动作 manifest 和外部 tenant/domain 到平台范围的映射。每个资源只有一个应用 owner；平台内置资源不能由应用接管，应用资源必须是非内置资源并已在 ResourceRegistry 中显式注册。注册不授予规则或权限。
 2. 使用集中路由声明生成 manifest，批准其 digest/revision。SDK 无自注册和自扩权入口。配置启动期冻结，修改应用或密钥、撤销应用须停用准入并更新批准配置/重启；映射停用则由数据库读取即时复核。
 3. 在 Identity 的受保护管理入口预置已有身份映射。管理入口经 Gateway、PolicyEngine、ACTIVE GlobalAdmin，仓储事务内再次锁定管理员状态。
 4. 业务认证适配器从可信本地会话给出 external subject、平台 token ID 和平台 Bearer。不能把业务客户端的身份头当成可信事实。
@@ -76,7 +76,7 @@ Axum 按路由组集中装配 `AuthorizationLayer::new`，实现 `ActorResolver`
 
 handler 用 `AuthorizedRequestExtension::take()` 获取一次性 `{ request, proof }`，在本地事务前 `require_allow_current` 和事实 CAS。所有写请求必须提供稳定 `x-operation-id`，中间件不会用随机 ID 替代；读请求可自动生成标识。`x-request-id` 缺省自动生成，nonce 使用操作系统随机源。
 
-公开路由通过 `public_route(method, exact_path)` 显式登记，只允许 GET/HEAD/OPTIONS、无动态参数/通配符/与保护路由重叠。未声明路由和方法拒绝。特殊动作显式声明，普通动作可使用小型 read/create/update/delete 映射。Learn publish 当前映射已注册的 `learn_course:update`，不凭空新增 publish 动作。
+公开路由通过 `public_route(method, exact_path)` 显式登记，只允许 GET/HEAD/OPTIONS、无动态参数/通配符/与保护路由重叠。未声明路由和方法拒绝。特殊动作显式声明，普通动作可使用小型 read/create/update/delete 映射。课程样板的 publish 操作映射已注册的 `course_record:update`，不凭空新增 publish 动作；这只是样板授权声明，不表示存在生产课程服务 route。
 
 完整示例见 [Learn Axum 测试](../integrations/learn/tests/axum.rs)；WebSocket/后台逐目标调用见 [Chat WebSocket 测试](../integrations/chat/tests/websocket.rs)。
 
@@ -101,6 +101,6 @@ feature 默认关闭。Identity 用 `ASTRAL_SDK_IDENTITY_MAPPING_ENABLED`，Trus
 
 平台在最终复核后记录签名候选 `ASSESSED`，审计等待后的状态漂移记录 `INVALIDATED` PENDING 并拒绝旧 ALLOW。所有记录绑定 request/decision/facts digest；审计不证明响应已送达，更不证明业务提交。`audit_log` 没有 request/phase 唯一约束，因此准入审计是单次尝试、未知结果先对账，不宣称 exactly-once；对账按事件类型、requestId、requestDigest、phase，不仅靠 operationId。无可信上下文时只记脱敏拒绝日志，不能伪造用户审计。
 
-Learn/Chat 样板有界内存 ledger 记录本地提交的 operation ID、request/facts digest；真实业务需在自己的事务/outbox 中持久化这些证据。Learn 支持课程发布、父范围 revision、精确列表和授权期间对象迁移；Chat 支持握手、逐目标消息、出站范围、撤销、重连、背压和去重。签名 fixture、loopback HTTP、Axum 和真实 loopback WebSocket 测试只证明这些合同，不证明真实映射/数据库/投影的部署成功。
+`integrations/` 下独立 Learn/Chat SDK 样板以有界内存 ledger 记录本地提交的 operation ID、request/facts digest；真实业务需在自己的事务/outbox 中持久化这些证据。Learn 样板覆盖课程发布、父范围 revision、精确列表和授权期间对象迁移；Chat 样板覆盖握手、逐目标消息、出站范围、撤销、重连、背压和去重。签名 fixture、loopback HTTP、Axum 和真实 loopback WebSocket 测试只证明样板合同，不证明真实映射/数据库/投影的部署成功。
 
-原 `astral-chat`、`astral-learn` 继续 workspace exclude，源码未改，本次不等于其完整服务迁移或独立部署完成。真实 MySQL/MQ、崩溃恢复、跨节点、迁移和部署未执行；未知审计/COMMIT 与撤销窗口仍需受保护环境验收。
+生产 `astral-chat`、`astral-learn` runtime crates 和 Gateway routes/proxies 已退役并已从本 checkout 物理移除；独立 SDK 样板保留，但不构成完整服务迁移、生产 API 或独立部署。真实 MySQL/MQ、崩溃恢复、跨节点、迁移和部署未执行；未知审计/COMMIT 与撤销窗口仍需受保护环境验收。

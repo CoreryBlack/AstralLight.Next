@@ -725,7 +725,7 @@ mod tests {
         };
         let seed_dto = || SeedDto {
             resource_tenant_id: 30,
-            resource: "learn_course".into(),
+            resource: "permission_rule".into(),
             action: "read".into(),
             domain_id: Some(5),
             not_before: None,
@@ -878,22 +878,22 @@ mod tests {
     #[test]
     fn seed_dto_requires_explicit_resource_tenant_and_domain_and_maps_input() {
         let missing_resource_tenant =
-            r#"{"resource":"learn_course","action":"read","domainId":null,"delegable":false}"#;
+            r#"{"resource":"permission_rule","action":"read","domainId":null,"delegable":false}"#;
         assert!(serde_json::from_str::<SeedDto>(missing_resource_tenant).is_err());
 
-        let missing_domain = r#"{"resourceTenantId":30,"resource":"learn_course","action":"read","delegable":false}"#;
+        let missing_domain = r#"{"resourceTenantId":30,"resource":"permission_rule","action":"read","delegable":false}"#;
         assert!(serde_json::from_str::<SeedDto>(missing_domain).is_err());
 
-        let explicit = r#"{"resourceTenantId":30,"resource":"learn_course","action":"read","domainId":null,"delegable":true}"#;
+        let explicit = r#"{"resourceTenantId":30,"resource":"permission_rule","action":"read","domainId":null,"delegable":true}"#;
         let dto = serde_json::from_str::<SeedDto>(explicit).expect("explicit seed must parse");
         let input = dto.into_input().expect("seed input must build");
         assert_eq!(input.resource_tenant_id, 30);
-        assert_eq!(input.resource, "learn_course");
+        assert_eq!(input.resource, "permission_rule");
         assert_eq!(input.action, "read");
         assert_eq!(input.domain_id, None);
         assert!(input.delegable);
 
-        let unknown = r#"{"resourceTenantId":30,"resource":"learn_course","action":"read","domainId":null,"delegable":true,"approverUserId":9}"#;
+        let unknown = r#"{"resourceTenantId":30,"resource":"permission_rule","action":"read","domainId":null,"delegable":true,"approverUserId":9}"#;
         assert!(serde_json::from_str::<SeedDto>(unknown).is_err());
     }
 

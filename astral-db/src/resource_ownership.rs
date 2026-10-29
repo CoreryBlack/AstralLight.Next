@@ -102,8 +102,8 @@ impl ResourceOwnershipResolution {
 /// authority; a process-local memory read face (see `memory`) may serve
 /// previously strict-verified positive `TenantScoped` outcomes for normal
 /// protected routes when the composite single-node gate is open (healthy hub +
-/// installed auxiliary authorization mirror). Chat-table lookups and all
-/// negative outcomes always take the strict path.
+/// installed auxiliary authorization mirror). Negative outcomes always take the
+/// strict path.
 pub async fn resolve_resource_ownership(
     pool: &MySqlPool,
     resource: &str,
@@ -248,8 +248,7 @@ where
 #[derive(Debug)]
 enum ResolvePlan {
     Pure(ResourceOwnershipResolution),
-    /// 完全不走记忆路径：chat 冻结表 lookup（写者不受 hub 栅栏保护）与
-    /// 超界键，保持既有严格 DB 显式限制。
+    /// 超界键保持严格 DB 显式限制。
     StrictDbOnly,
     /// 正常受保护目标：允许在复合激活门下走记忆读面。
     MemoryEligible(memory::OwnershipMemoryKey),
@@ -319,10 +318,6 @@ fn resolve_plan(
 /// lookup kind 必须先在此分类 —— 默认落入 `false`（StrictDbOnly，闭合
 /// 门），只有其事实面全部写点完成 hub 栅栏覆盖并更新
 /// `memory_writer_coverage_inventory` 后才允许开启 `true`。
-///
-/// chat 三变体（`ChatConversation` / `ChatConversationWithoutOwner` /
-/// `ChatMessage`）读冻结仓 astral-chat 的表，写者不受 hub 栅栏保护：永久
-/// 闭合 —— 绝不缓存无失效语义的授权事实。
 fn memory_supported_kind(kind: TargetLookupKind) -> bool {
     match kind {
         TargetLookupKind::Tenant
@@ -339,9 +334,6 @@ fn memory_supported_kind(kind: TargetLookupKind) -> bool {
         | TargetLookupKind::CardTemplate
         | TargetLookupKind::UserLevel
         | TargetLookupKind::UserGrading => true,
-        TargetLookupKind::ChatConversation
-        | TargetLookupKind::ChatConversationWithoutOwner
-        | TargetLookupKind::ChatMessage => false,
     }
 }
 
@@ -405,9 +397,6 @@ enum TargetLookupKind {
     OrgScopeRequest,
     PermissionRequest,
     AuditRecord,
-    ChatConversation,
-    ChatConversationWithoutOwner,
-    ChatMessage,
     CardTemplate,
     UserLevel,
     UserGrading,
@@ -509,18 +498,6 @@ fn target_lookup_kind(resource: &str, path: &str) -> Option<TargetLookupKind> {
         }
         "audit" if path == "/hit-stats/by-card" => Some(TargetLookupKind::UserCard),
         "audit" => Some(TargetLookupKind::AuditRecord),
-        "chat_conversation" if path.starts_with("/ws/") => Some(TargetLookupKind::User),
-        "chat_conversation" => Some(TargetLookupKind::ChatConversation),
-        "chat_message"
-            if path.starts_with("/messages/") && !path.starts_with("/messages/session/") =>
-        {
-            Some(TargetLookupKind::ChatMessage)
-        }
-        "chat_message"
-            if path.starts_with("/receipts/") || path.starts_with("/messages/session/") =>
-        {
-            Some(TargetLookupKind::ChatConversationWithoutOwner)
-        }
         "domain" if path.starts_with("/user-cards/") => Some(TargetLookupKind::UserCard),
         "domain" if path.starts_with("/card-templates/") => Some(TargetLookupKind::CardTemplate),
         "domain" if path.starts_with("/user-levels/") => Some(TargetLookupKind::UserLevel),
@@ -536,7 +513,6 @@ fn target_lookup_unresolved_code(resource: &str) -> &'static str {
         "identity_users" | "user" => "resource_ownership.identity_user_route_unmapped",
         "permission_rule" => "resource_ownership.permission_rule_route_unmapped",
         "permission_request" => "resource_ownership.permission_request_route_unmapped",
-        "chat_message" => "resource_ownership.chat_message_route_unmapped",
         "domain" => "resource_ownership.domain_route_unmapped",
         _ => "resource_ownership.resource_unmapped",
     }
@@ -561,11 +537,6 @@ async fn resolve_target_lookup(
         TargetLookupKind::OrgScopeRequest => resolve_org_scope_request(pool, target_id).await,
         TargetLookupKind::PermissionRequest => resolve_permission_request(pool, target_id).await,
         TargetLookupKind::AuditRecord => resolve_audit_record(pool, target_id).await,
-        TargetLookupKind::ChatConversation => resolve_chat_conversation(pool, target_id).await,
-        TargetLookupKind::ChatConversationWithoutOwner => {
-            resolve_chat_conversation_without_owner(pool, target_id).await
-        }
-        TargetLookupKind::ChatMessage => resolve_chat_message(pool, target_id).await,
         TargetLookupKind::CardTemplate => resolve_card_template(pool, target_id).await,
         TargetLookupKind::UserLevel => resolve_user_level(pool, target_id).await,
         TargetLookupKind::UserGrading => resolve_user_grading(pool, target_id).await,
@@ -648,13 +619,6 @@ fn is_actor_unit_route(resource: &str, path: &str, method: &str) -> bool {
             // management-scope check before any repository write/read.
             | ("permission_rule", "/permission-rules", "GET")
             | ("permission_rule", "/permission-rules", "POST")
-            // Chat collection/create routes construct `ChatScope` only for a
-            // verified PlatformUser and all repository operations constrain the
-            // work to that active card's tenant/domain scope.
-            | ("chat_conversation", "/groups", "GET")
-            | ("chat_conversation", "/groups", "POST")
-            | ("chat_conversation", "/sessions", "GET")
-            | ("chat_conversation", "/sessions", "POST")
     )
 }
 
@@ -835,22 +799,6 @@ fn global_access_requirement(
 /// identifier for a different resource family.
 fn path_target_id(resource: &str, path: &str) -> Option<i64> {
     match resource {
-        "chat_message" if path.starts_with("/messages/session/") => {
-            positive_path_segment(path, "/messages/session/")
-        }
-        "chat_message" if path.starts_with("/messages/") => {
-            positive_path_segment(path, "/messages/")
-        }
-        "chat_message" if path.starts_with("/receipts/") => {
-            positive_path_segment(path, "/receipts/")
-        }
-        "chat_conversation" if path.starts_with("/sessions/") => {
-            positive_path_segment(path, "/sessions/")
-        }
-        "chat_conversation" if path.starts_with("/groups/") => {
-            positive_path_segment(path, "/groups/")
-        }
-        "chat_conversation" if path.starts_with("/ws/") => positive_path_segment(path, "/ws/"),
         "identity_users" | "user" if path.starts_with("/cards/") => {
             positive_path_segment(path, "/cards/")
         }
@@ -1364,80 +1312,6 @@ async fn resolve_audit_record(
     })
 }
 
-async fn resolve_chat_conversation(
-    pool: &MySqlPool,
-    conversation_id: i64,
-) -> Result<(i64, Option<i64>, Option<i64>), ResolverLookupError> {
-    resolve_chat_conversation_inner(pool, conversation_id, true).await
-}
-
-async fn resolve_chat_conversation_without_owner(
-    pool: &MySqlPool,
-    conversation_id: i64,
-) -> Result<(i64, Option<i64>, Option<i64>), ResolverLookupError> {
-    resolve_chat_conversation_inner(pool, conversation_id, false).await
-}
-
-async fn resolve_chat_conversation_inner(
-    pool: &MySqlPool,
-    conversation_id: i64,
-    include_owner: bool,
-) -> Result<(i64, Option<i64>, Option<i64>), ResolverLookupError> {
-    let row: Option<(i64, i64, Option<i64>)> = sqlx::query_as(
-        "SELECT scoped.tenant_id, c.domain_id, c.owner_id \
-         FROM chat_conversation c \
-         INNER JOIN ( \
-             SELECT domain_id, MIN(tenant_id) AS tenant_id \
-             FROM tenant_domain_map WHERE status = 'ACTIVE' \
-             GROUP BY domain_id HAVING COUNT(DISTINCT tenant_id) = 1 \
-         ) scoped ON scoped.domain_id = c.domain_id \
-         WHERE c.id = ? AND c.is_deleted = 0",
-    )
-    .bind(conversation_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|_| {
-        ResolverLookupError::Unavailable("resource_ownership.chat_conversation_lookup_failed")
-    })?;
-    row.map(|(tenant_id, domain_id, owner_id)| {
-        (
-            tenant_id,
-            Some(domain_id),
-            include_owner.then_some(owner_id).flatten(),
-        )
-    })
-    .ok_or(ResolverLookupError::Unresolved(
-        "resource_ownership.chat_conversation_scope_missing_or_ambiguous",
-    ))
-}
-
-async fn resolve_chat_message(
-    pool: &MySqlPool,
-    message_id: i64,
-) -> Result<(i64, Option<i64>, Option<i64>), ResolverLookupError> {
-    let row: Option<(i64, i64, Option<i64>)> = sqlx::query_as(
-        "SELECT scoped.tenant_id, c.domain_id, msg.sender_id \
-         FROM chat_message msg \
-         INNER JOIN chat_conversation c ON c.id = msg.conversation_id \
-         INNER JOIN ( \
-             SELECT domain_id, MIN(tenant_id) AS tenant_id \
-             FROM tenant_domain_map WHERE status = 'ACTIVE' \
-             GROUP BY domain_id HAVING COUNT(DISTINCT tenant_id) = 1 \
-         ) scoped ON scoped.domain_id = c.domain_id \
-         WHERE msg.id = ? AND c.is_deleted = 0",
-    )
-    .bind(message_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|_| {
-        ResolverLookupError::Unavailable("resource_ownership.chat_message_lookup_failed")
-    })?;
-    row.map(|(tenant_id, domain_id, owner_id)| (tenant_id, Some(domain_id), owner_id))
-        .ok_or(ResolverLookupError::Unresolved(
-            "resource_ownership.chat_message_scope_missing_or_ambiguous",
-        ))
-}
-
 async fn resolve_card_template(
     pool: &MySqlPool,
     template_id: i64,
@@ -1600,10 +1474,6 @@ mod tests {
     #[test]
     fn unknown_numeric_segments_are_not_targets() {
         assert_eq!(
-            resolved_target_id("learn_level", "/levels/5/play", "GET", None),
-            Ok(None)
-        );
-        assert_eq!(
             resolved_target_id("unknown", "/not-a-route/5", "GET", None),
             Ok(None)
         );
@@ -1664,9 +1534,6 @@ mod tests {
             "POST"
         ));
         assert!(!is_actor_unit_route("identity_users", "/users", "GET"));
-        assert!(is_actor_unit_route("chat_conversation", "/groups", "POST"));
-        assert!(is_actor_unit_route("chat_conversation", "/sessions", "GET"));
-        assert!(!is_actor_unit_route("chat_message", "/messages", "POST"));
         assert!(!is_actor_unit_route(
             "permission_rule",
             "/delegations/7",
@@ -1721,10 +1588,6 @@ mod tests {
             assert_eq!(
                 global_access_requirement("authorization", path, method, None),
                 Some(GlobalAccessRequirement::ActiveGlobalAdmin)
-            );
-            assert_eq!(
-                global_access_requirement("chat_message", path, method, None),
-                None
             );
         }
         assert_eq!(
@@ -2074,12 +1937,6 @@ mod tests {
                 access_requirement: GlobalAccessRequirement::PolicyEvidence,
             }
         );
-        assert_eq!(
-            route_ownership_contract("chat_message", "/messages", "POST", None),
-            RouteOwnershipContract::Unresolved {
-                code: "resource_ownership.target_missing",
-            }
-        );
     }
 
     #[test]
@@ -2173,91 +2030,6 @@ mod tests {
             }
         }
         panic!("route call must have a closing parenthesis");
-    }
-
-    fn route_function_source<'a>(source: &'a str, function_name: &str) -> &'a str {
-        let marker = format!("fn {function_name}(");
-        let function_start = source
-            .find(&marker)
-            .unwrap_or_else(|| panic!("route function must exist: {function_name}"));
-        let body_start = function_start
-            + source[function_start..]
-                .find('{')
-                .expect("route function must open a body");
-        let body_end = brace_block_end(source, body_start);
-        &source[function_start..=body_end]
-    }
-
-    fn brace_block_end(source: &str, open_brace: usize) -> usize {
-        let mut depth = 0usize;
-        let mut quoted = false;
-        let mut escaped = false;
-        for (offset, character) in source[open_brace..].char_indices() {
-            let index = open_brace + offset;
-            if quoted {
-                if escaped {
-                    escaped = false;
-                } else if character == '\\' {
-                    escaped = true;
-                } else if character == '"' {
-                    quoted = false;
-                }
-                continue;
-            }
-            match character {
-                '"' => quoted = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth = depth
-                        .checked_sub(1)
-                        .expect("route function braces must be balanced");
-                    if depth == 0 {
-                        return index;
-                    }
-                }
-                _ => {}
-            }
-        }
-        panic!("route function body must close");
-    }
-
-    fn router_merge_calls(source: &str, binding: &str) -> Vec<String> {
-        let binding_marker = format!("let {binding} = Router::new()");
-        let router = source
-            .split(&binding_marker)
-            .nth(1)
-            .unwrap_or_else(|| panic!("router binding must exist: {binding}"));
-        let router = router
-            .split(".layer(axum::middleware::from_fn_with_state(")
-            .next()
-            .expect("protected router must retain its permission layer");
-        let mut cursor = 0usize;
-        let mut calls = Vec::new();
-        while let Some(relative_start) = router[cursor..].find(".merge(") {
-            let start = cursor + relative_start;
-            let open_paren = start + ".merge".len();
-            let end = route_call_end(router, open_paren);
-            let call = router[open_paren + 1..end].trim();
-            assert!(
-                call.starts_with("srv::"),
-                "protected router merge must name a service route builder: {call}"
-            );
-            calls.push(call.to_owned());
-            cursor = end + 1;
-        }
-        calls
-    }
-
-    fn assert_router_merge_inventory(source: &str, binding: &str, expected: &[&str]) {
-        let actual = router_merge_calls(source, binding);
-        let expected = expected
-            .iter()
-            .map(|call| (*call).to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            actual, expected,
-            "{binding} router merge list changed; update the ownership-contract inventory"
-        );
     }
 
     fn literal_route_methods(source: &str) -> Vec<DeclaredRouteMethod> {
@@ -2386,36 +2158,7 @@ mod tests {
     }
 
     fn intentionally_pre_resolver_route(service: &str, path: &str, method: &str) -> bool {
-        (service == "identity" && is_identity_pre_resolver_deny(path, method))
-            || matches!(
-                (service, path, method),
-                ("learn-admin", "/announcements", "GET")
-                    | ("learn-admin", "/announcements", "POST")
-                    | ("learn-admin", "/announcements/{id}", "GET")
-                    | ("learn-admin", "/announcements/{id}", "PUT")
-                    | ("learn-admin", "/announcements/{id}", "DELETE")
-                    | ("learn-app-users", "/login", "POST")
-                    | ("learn-app-users", "/logout", "POST")
-            )
-    }
-
-    fn intentionally_principal_kind_bypass_route(
-        service: &str,
-        resource: &str,
-        path: &str,
-        method: &str,
-    ) -> bool {
-        matches!(
-            (service, resource, path, method),
-            ("learn-app-users", "user_profile", "/me", "GET")
-                | ("learn-app-users", "user_profile", "/identity", "GET")
-                | (
-                    "learn-app-users",
-                    "user_profile",
-                    "/learning-profile",
-                    "GET"
-                )
-        )
+        service == "identity" && is_identity_pre_resolver_deny(path, method)
     }
 
     fn intentionally_fail_closed(
@@ -2425,27 +2168,9 @@ mod tests {
         method: &str,
         code: &str,
     ) -> bool {
-        if matches!(service, "learn-admin" | "learn-app")
-            && resource.starts_with("learn_")
-            && code == "resource_ownership.target_missing"
-        {
-            return true;
-        }
         matches!(
             (service, resource, path, method, code),
             (
-                "chat",
-                "chat_message",
-                "/messages",
-                "POST",
-                "resource_ownership.target_missing"
-            ) | (
-                "chat",
-                "chat_message",
-                "/receipts",
-                "POST",
-                "resource_ownership.target_missing"
-            ) | (
                 "trustgraph",
                 "permission_request",
                 "/permission-requests",
@@ -2545,12 +2270,6 @@ mod tests {
                     );
                     continue;
                 };
-                let principal_kind_bypass = intentionally_principal_kind_bypass_route(
-                    service,
-                    resource,
-                    &route.path,
-                    route.method,
-                );
                 let concrete_path = concrete_path(&route.path);
                 if service == "trustgraph"
                     && route.path == "/operations/{task_id}"
@@ -2570,7 +2289,7 @@ mod tests {
                             &route.path,
                             route.method,
                             code,
-                        ) || (principal_kind_bypass && code == "resource_ownership.target_missing"),
+                        ),
                         "protected route has an unreviewed fail-closed resolver outcome: {service}:{}:{} resource={resource} code={code}",
                         route.method,
                         route.path,
@@ -2720,271 +2439,6 @@ mod tests {
             "reviewed monitor inventory: 18 alert, 5 notification, 7 dashboard and 3 root methods"
         );
 
-        let chat_main = include_str!("../../astral-chat/src/main.rs");
-        assert_router_merge_inventory(
-            chat_main,
-            "api_routes",
-            &[
-                "srv::messages::message_routes()",
-                "srv::sessions::session_routes()",
-                "srv::groups::group_routes()",
-                "srv::realtime::ws_routes()",
-                "srv::receipts::receipt_routes()",
-            ],
-        );
-        let learn_main = include_str!("../../astral-learn/src/main.rs");
-        assert_router_merge_inventory(
-            learn_main,
-            "admin_routes",
-            &[
-                "srv::subjects::subject_routes()",
-                "srv::questions::question_routes()",
-                "srv::exams::exam_routes()",
-                "srv::courses::course_routes()",
-                "srv::enrollments::enrollment_routes()",
-                "srv::grades::grade_routes()",
-                "srv::publishing::publishing_routes()",
-                "srv::assignments::assignment_routes()",
-                "srv::discussions::discussion_routes()",
-                "srv::classes::class_routes()",
-                "srv::submissions::submission_routes()",
-                "srv::chapters::chapter_routes()",
-                "srv::levels::level_routes()",
-                "srv::statistics::statistics_routes()",
-                "srv::checkins::checkin_admin_routes()",
-                "srv::documents::document_routes()",
-                "srv::devices::device_admin_routes()",
-                "srv::system_settings::system_setting_routes()",
-                "srv::webhook_configs::webhook_config_routes()",
-                "srv::wrong_questions::wrong_question_routes()",
-                "srv::solutions::solution_routes()",
-            ],
-        );
-        assert_router_merge_inventory(
-            learn_main,
-            "app_learn_routes",
-            &[
-                "srv::progress::progress_routes()",
-                "srv::levels::level_app_routes()",
-                "srv::checkins::checkin_app_routes()",
-                "srv::solutions::solution_routes()",
-                "srv::wrong_questions::wrong_question_routes()",
-                "srv::user_answers::user_answer_routes()",
-                "srv::user_subjects::user_subject_routes()",
-                "srv::first_attempts::first_attempt_routes()",
-                "srv::exams_app::exam_app_routes()",
-                "srv::devices::device_app_routes()",
-                "srv::subjects::subject_routes()",
-                "srv::courses::course_routes()",
-            ],
-        );
-        assert_router_merge_inventory(
-            learn_main,
-            "app_user_routes",
-            &["srv::app_users::app_user_routes()"],
-        );
-
-        let chat_middleware = include_str!("../../astral-chat/src/middleware.rs");
-        let chat_count = assert_service_route_contracts(
-            "chat",
-            &[
-                route_function_source(
-                    include_str!("../../astral-chat/src/srv/messages.rs"),
-                    "message_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-chat/src/srv/sessions.rs"),
-                    "session_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-chat/src/srv/groups.rs"),
-                    "group_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-chat/src/srv/realtime.rs"),
-                    "ws_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-chat/src/srv/receipts.rs"),
-                    "receipt_routes",
-                ),
-            ],
-            chat_middleware,
-            "pub const CHAT_PATH_MAP:",
-        );
-        assert_eq!(chat_count, 22, "review every protected Chat route");
-
-        let learn_middleware = include_str!("../../astral-learn/src/middleware.rs");
-        let learn_admin_count = assert_service_route_contracts(
-            "learn-admin",
-            &[
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/subjects.rs"),
-                    "subject_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/questions.rs"),
-                    "question_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/exams.rs"),
-                    "exam_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/courses.rs"),
-                    "course_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/enrollments.rs"),
-                    "enrollment_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/grades.rs"),
-                    "grade_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/publishing.rs"),
-                    "publishing_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/assignments.rs"),
-                    "assignment_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/discussions.rs"),
-                    "discussion_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/classes.rs"),
-                    "class_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/submissions.rs"),
-                    "submission_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/chapters.rs"),
-                    "chapter_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/levels.rs"),
-                    "level_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/statistics.rs"),
-                    "statistics_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/checkins.rs"),
-                    "checkin_admin_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/documents.rs"),
-                    "document_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/devices.rs"),
-                    "device_admin_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/system_settings.rs"),
-                    "system_setting_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/webhook_configs.rs"),
-                    "webhook_config_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/wrong_questions.rs"),
-                    "wrong_question_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/solutions.rs"),
-                    "solution_routes",
-                ),
-            ],
-            learn_middleware,
-            "pub const LEARN_PATH_MAP:",
-        );
-        assert_eq!(
-            learn_admin_count, 103,
-            "review every protected Learn admin route"
-        );
-
-        let learn_app_count = assert_service_route_contracts(
-            "learn-app",
-            &[
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/progress.rs"),
-                    "progress_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/levels.rs"),
-                    "level_app_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/checkins.rs"),
-                    "checkin_app_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/solutions.rs"),
-                    "solution_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/wrong_questions.rs"),
-                    "wrong_question_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/user_answers.rs"),
-                    "user_answer_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/user_subjects.rs"),
-                    "user_subject_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/first_attempts.rs"),
-                    "first_attempt_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/exams_app.rs"),
-                    "exam_app_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/devices.rs"),
-                    "device_app_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/subjects.rs"),
-                    "subject_routes",
-                ),
-                route_function_source(
-                    include_str!("../../astral-learn/src/srv/courses.rs"),
-                    "course_routes",
-                ),
-            ],
-            learn_middleware,
-            "pub const LEARN_APP_PATH_MAP:",
-        );
-        assert_eq!(
-            learn_app_count, 40,
-            "review every protected Learn app route"
-        );
-
-        let learn_app_user_count = assert_service_route_contracts(
-            "learn-app-users",
-            &[route_function_source(
-                include_str!("../../astral-learn/src/srv/app_users.rs"),
-                "app_user_routes",
-            )],
-            learn_middleware,
-            "pub const LEARN_APP_USER_PATH_MAP:",
-        );
-        assert_eq!(
-            learn_app_user_count, 5,
-            "review every Learn app-user route, including explicit exemptions"
-        );
-
         assert_eq!(
             route_ownership_contract("monitor", "/internal/test-control/worker-id", "GET", None,),
             RouteOwnershipContract::Global {
@@ -3010,11 +2464,6 @@ mod tests {
                 "monitor",
                 include_str!("../../astral-monitor/src/middleware.rs"),
             ),
-            ("chat", include_str!("../../astral-chat/src/middleware.rs")),
-            (
-                "learn",
-                include_str!("../../astral-learn/src/middleware.rs"),
-            ),
         ];
         for (service, source) in middleware_sources {
             let production = source.split("#[cfg(test)]").next().unwrap_or(source);
@@ -3022,11 +2471,7 @@ mod tests {
                 production.contains("physical_policy_context("),
                 "{service} HTTP middleware must start from verified physical actor facts"
             );
-            let ownership_entry = if service == "learn" {
-                "resolve_learn_resource_ownership("
-            } else {
-                "resolve_resource_ownership("
-            };
+            let ownership_entry = "resolve_resource_ownership(";
             assert!(
                 production.contains(ownership_entry),
                 "{service} HTTP middleware must resolve server-side target ownership"
@@ -3069,30 +2514,6 @@ mod tests {
             domain_id: Some(8),
             owner_id: Some(9),
         }
-    }
-
-    #[test]
-    fn chat_lookup_variants_never_enter_the_memory_plan() {
-        for (resource, path, method) in [
-            ("chat_conversation", "/sessions/7", "GET"),
-            ("chat_conversation", "/groups/7", "PUT"),
-            ("chat_message", "/messages/7", "GET"),
-            ("chat_message", "/messages/session/7", "GET"),
-            ("chat_message", "/receipts/7", "POST"),
-        ] {
-            assert!(
-                matches!(
-                    resolve_plan(resource, path, method, None, Some(1), Some(2)),
-                    ResolvePlan::StrictDbOnly
-                ),
-                "frozen chat table lookups must stay strictly DB: {resource} {path} {method}"
-            );
-        }
-        // chat 的 /ws/ 路由读的是 user_card（受栅栏写者），不是 chat 表。
-        assert!(matches!(
-            resolve_plan("chat_conversation", "/ws/7", "GET", None, Some(1), Some(2)),
-            ResolvePlan::MemoryEligible(_)
-        ));
     }
 
     #[test]
@@ -3351,7 +2772,7 @@ mod tests {
 
     /// 写面覆盖闭合清单：记忆路径支持的每个 lookup kind 的事实面表与唯一
     /// 受栅栏写点。清单必须与 `memory_supported_kind`（穷尽 match）保持
-    /// 一致；chat 变体不在清单内且被计划永久闭合。
+    /// 一致。
     #[test]
     fn memory_writer_coverage_inventory_covers_every_supported_kind() {
         let inventory: [(TargetLookupKind, &str, &str); 14] = [
@@ -3432,29 +2853,6 @@ mod tests {
                 "inventory kind must be memory supported: {kind:?}"
             );
             assert!(!tables.is_empty() && !writer.is_empty(), "{kind:?}");
-        }
-        // chat 三变体：写者不受栅栏（frozen writers unguarded）→ 永久闭合。
-        for (kind, resource, path) in [
-            (
-                TargetLookupKind::ChatConversation,
-                "chat_conversation",
-                "/sessions/7",
-            ),
-            (
-                TargetLookupKind::ChatConversationWithoutOwner,
-                "chat_message",
-                "/receipts/7",
-            ),
-            (TargetLookupKind::ChatMessage, "chat_message", "/messages/7"),
-        ] {
-            assert!(
-                !memory_supported_kind(kind),
-                "chat kinds must never be memory supported: {kind:?}"
-            );
-            assert!(matches!(
-                resolve_plan(resource, path, "GET", None, Some(1), Some(2)),
-                ResolvePlan::StrictDbOnly
-            ));
         }
     }
 }

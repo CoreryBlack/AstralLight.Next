@@ -349,7 +349,7 @@ mod evidence_matcher_tests {
                     None,
                     7,
                     1,
-                    "learn_subject:42",
+                    "permission_rule:42",
                     "read",
                     ValidityWindow::perpetual(),
                 ),
@@ -358,7 +358,7 @@ mod evidence_matcher_tests {
                     None,
                     7,
                     1,
-                    "learn_subject:*",
+                    "permission_rule:*",
                     "read",
                     ValidityWindow::perpetual(),
                 ),
@@ -366,16 +366,16 @@ mod evidence_matcher_tests {
         );
         // 对象请求命中对象级 grant（首中即胜）。
         assert!(match_published_effective_grant(
-            &ctx(Some(1), None, Some(1), "learn_subject:42", "read"),
+            &ctx(Some(1), None, Some(1), "permission_rule:42", "read"),
             &evidence,
-            "learn_subject:42"
+            "permission_rule:42"
         )
         .is_some());
         // 对象请求同样命中类型级 grant。
         assert!(match_published_effective_grant(
-            &ctx(Some(1), None, Some(1), "learn_subject:43", "read"),
+            &ctx(Some(1), None, Some(1), "permission_rule:43", "read"),
             &evidence,
-            "learn_subject:43"
+            "permission_rule:43"
         )
         .is_some());
         // 其它类型不命中。
@@ -396,22 +396,22 @@ mod evidence_matcher_tests {
                 None,
                 7,
                 1,
-                "learn_subject:42",
+                "permission_rule:42",
                 "read",
                 ValidityWindow::perpetual(),
             )],
         );
-        // 类型级请求（"learn_subject" / "learn_subject:*"）绝不命中对象级 grant。
+        // 类型级请求（"permission_rule" / "permission_rule:*"）绝不命中对象级 grant。
         assert!(match_published_effective_grant(
-            &ctx(Some(1), None, Some(1), "learn_subject", "read"),
+            &ctx(Some(1), None, Some(1), "permission_rule", "read"),
             &evidence,
-            "learn_subject"
+            "permission_rule"
         )
         .is_none());
         assert!(match_published_effective_grant(
-            &ctx(Some(1), None, Some(1), "learn_subject", "read"),
+            &ctx(Some(1), None, Some(1), "permission_rule", "read"),
             &evidence,
-            "learn_subject:*"
+            "permission_rule:*"
         )
         .is_none());
     }
@@ -431,9 +431,9 @@ mod evidence_matcher_tests {
             )],
         );
         assert!(match_published_effective_grant(
-            &ctx(Some(1), None, Some(1), "learn_subject:42", "read"),
+            &ctx(Some(1), None, Some(1), "permission_rule:42", "read"),
             &evidence,
-            "learn_subject:42"
+            "permission_rule:42"
         )
         .is_some());
         assert!(match_published_effective_grant(
@@ -455,7 +455,7 @@ mod evidence_matcher_tests {
                 None,
                 7,
                 1,
-                "learn_subject:*",
+                "permission_rule:*",
                 "read",
                 ValidityWindow::perpetual(),
             )],
@@ -463,22 +463,22 @@ mod evidence_matcher_tests {
         // user 不一致 → 不命中；请求不携带 user 一律不命中（与 engine 匹配器
         // 的 `is_none_or` 语义逐行一致：strict gate 的请求恒携带 user）。
         assert!(match_published_effective_grant(
-            &ctx(Some(2), None, Some(1), "learn_subject:1", "read"),
+            &ctx(Some(2), None, Some(1), "permission_rule:1", "read"),
             &evidence,
-            "learn_subject:1"
+            "permission_rule:1"
         )
         .is_none());
         assert!(match_published_effective_grant(
-            &ctx(None, None, Some(1), "learn_subject:1", "read"),
+            &ctx(None, None, Some(1), "permission_rule:1", "read"),
             &evidence,
-            "learn_subject:1"
+            "permission_rule:1"
         )
         .is_none());
         // tenant 不一致 → 不命中。
         assert!(match_published_effective_grant(
-            &ctx(Some(1), None, Some(2), "learn_subject:1", "read"),
+            &ctx(Some(1), None, Some(2), "permission_rule:1", "read"),
             &evidence,
-            "learn_subject:1"
+            "permission_rule:1"
         )
         .is_none());
         // card 不一致（证据属卡 7，请求卡 8）→ 不命中。
@@ -486,11 +486,11 @@ mod evidence_matcher_tests {
             .user_id(Some(1))
             .card_id(Some(8))
             .tenant_id(Some(1))
-            .resource(Some("learn_subject:1".to_string()))
+            .resource(Some("permission_rule:1".to_string()))
             .action("read".to_string())
             .build();
         assert!(
-            match_published_effective_grant(&other_card_ctx, &evidence, "learn_subject:1")
+            match_published_effective_grant(&other_card_ctx, &evidence, "permission_rule:1")
                 .is_none()
         );
     }
@@ -502,23 +502,23 @@ mod evidence_matcher_tests {
             Some(5),
             7,
             1,
-            "learn_subject:*",
+            "permission_rule:*",
             "read",
             ValidityWindow::perpetual(),
         );
         let evidence = ready_evidence(7, vec![domain_grant]);
         // 请求携带同 domain → 命中。
         assert!(match_published_effective_grant(
-            &ctx(Some(1), Some(5), Some(1), "learn_subject:1", "read"),
+            &ctx(Some(1), Some(5), Some(1), "permission_rule:1", "read"),
             &evidence,
-            "learn_subject:1"
+            "permission_rule:1"
         )
         .is_some());
         // 请求携带不同 domain → 不命中。
         assert!(match_published_effective_grant(
-            &ctx(Some(1), Some(6), Some(1), "learn_subject:1", "read"),
+            &ctx(Some(1), Some(6), Some(1), "permission_rule:1", "read"),
             &evidence,
-            "learn_subject:1"
+            "permission_rule:1"
         )
         .is_none());
     }
@@ -534,16 +534,16 @@ mod evidence_matcher_tests {
                 None,
                 7,
                 1,
-                "learn_subject:*",
+                "permission_rule:*",
                 "read",
                 ValidityWindow::between(NOW - 100, NOW - 1),
             )],
         );
         // 已过期（以 evidence.read_unix_seconds 为唯一时钟）→ 不命中。
         assert!(match_published_effective_grant(
-            &ctx(Some(1), None, Some(1), "learn_subject:1", "read"),
+            &ctx(Some(1), None, Some(1), "permission_rule:1", "read"),
             &evidence,
-            "learn_subject:1"
+            "permission_rule:1"
         )
         .is_none());
     }
@@ -557,7 +557,7 @@ mod evidence_matcher_tests {
                 None,
                 7,
                 1,
-                "learn_subject:*",
+                "permission_rule:*",
                 "write",
                 ValidityWindow::perpetual(),
             )],
@@ -566,18 +566,18 @@ mod evidence_matcher_tests {
         for action in ["create", "update", "delete"] {
             assert!(
                 match_published_effective_grant(
-                    &ctx(Some(1), None, Some(1), "learn_subject:1", action),
+                    &ctx(Some(1), None, Some(1), "permission_rule:1", action),
                     &evidence,
-                    "learn_subject:1"
+                    "permission_rule:1"
                 )
                 .is_some(),
                 "action {action} must match via write alias"
             );
         }
         assert!(match_published_effective_grant(
-            &ctx(Some(1), None, Some(1), "learn_subject:1", "read"),
+            &ctx(Some(1), None, Some(1), "permission_rule:1", "read"),
             &evidence,
-            "learn_subject:1"
+            "permission_rule:1"
         )
         .is_none());
 
@@ -589,15 +589,15 @@ mod evidence_matcher_tests {
                 None,
                 7,
                 1,
-                "learn_subject:*",
+                "permission_rule:*",
                 "*",
                 ValidityWindow::perpetual(),
             )],
         );
         assert!(match_published_effective_grant(
-            &ctx(Some(1), None, Some(1), "learn_subject:1", "read"),
+            &ctx(Some(1), None, Some(1), "permission_rule:1", "read"),
             &wildcard,
-            "learn_subject:1"
+            "permission_rule:1"
         )
         .is_some());
     }

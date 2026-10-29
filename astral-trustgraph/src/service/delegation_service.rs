@@ -384,7 +384,7 @@ mod tests {
             delegation_id: 5,
             delegator_card_id: 1,
             delegate_card_id: 3,
-            resource_type: "learn_course".into(),
+            resource_type: "permission_rule".into(),
             action_code: "read".into(),
             effective_from_ts: 1_699_000_000,
             effective_until_ts: Some(1_700_000_000),
@@ -407,7 +407,7 @@ mod tests {
                 &CreateDelegationRequest {
                     delegator_id: 1,
                     delegate_id: 3,
-                    resource: "learn_course".into(),
+                    resource: "permission_rule".into(),
                     action: "read".into(),
                     expires_at: None,
                 },
@@ -431,7 +431,7 @@ mod tests {
                 &CreateDelegationRequest {
                     delegator_id: 1,
                     delegate_id: 3,
-                    resource: "learn_course".into(),
+                    resource: "permission_rule".into(),
                     action: "read".into(),
                     expires_at: Some("4102444800".into()),
                 },
@@ -473,7 +473,7 @@ mod tests {
         svc.update_delegation(
             5,
             &UpdateDelegationRequest {
-                resource: "learn_quiz".into(),
+                resource: "permission_rule".into(),
                 action: "write".into(),
                 expires_at: Some("4102444800".into()),
             },

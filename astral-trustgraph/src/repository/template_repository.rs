@@ -788,24 +788,28 @@ mod tests {
     #[test]
     fn template_rows_map_to_normalized_allow_only_entry_requests() {
         let rows = template_rows_to_entry_requests(vec![
-            template_row("allow", "learn_course", "read", 0),
-            template_row("ALLOW", "learn_subject", "create", 7),
+            template_row("allow", "permission_rule", "read", 0),
+            template_row("ALLOW", "permission_rule", "create", 7),
         ])
         .unwrap();
         assert_eq!(rows.len(), 2);
         // effect 归一恒为 ALLOW：模板条目是 canonical 授权来源。
         assert!(rows.iter().all(|row| row.effect == "ALLOW"));
-        assert_eq!(rows[0].resource_type.as_deref(), Some("learn_course"));
-        assert_eq!(rows[1].resource_type.as_deref(), Some("learn_subject"));
+        assert_eq!(rows[0].resource_type.as_deref(), Some("permission_rule"));
+        assert_eq!(rows[1].resource_type.as_deref(), Some("permission_rule"));
         assert_eq!(rows[1].action_code.as_deref(), Some("create"));
         assert_eq!(rows[1].priority, 7);
     }
 
     #[test]
     fn legacy_deny_and_unregistered_template_rows_fail_closed() {
-        let error =
-            template_rows_to_entry_requests(vec![template_row("DENY", "learn_course", "read", 0)])
-                .unwrap_err();
+        let error = template_rows_to_entry_requests(vec![template_row(
+            "DENY",
+            "permission_rule",
+            "read",
+            0,
+        )])
+        .unwrap_err();
         assert!(
             matches!(error, AstralError::Validation(ref message) if message.contains("ALLOW")),
             "legacy DENY template rows must be rejected, not converted"
@@ -834,7 +838,7 @@ mod tests {
         for raw in ["ALLOW", "allow", " Allow ", "\tALLOW\n"] {
             let effect = validate_template_rule(&TemplateRuleInput {
                 effect: raw.to_owned(),
-                resource: "learn_course".to_owned(),
+                resource: "permission_rule".to_owned(),
                 action: "read".to_owned(),
             })
             .unwrap_or_else(|error| panic!("effect variant {raw:?} must be accepted: {error:?}"));
@@ -844,7 +848,7 @@ mod tests {
             assert!(
                 validate_template_rule(&TemplateRuleInput {
                     effect: raw.to_owned(),
-                    resource: "learn_course".to_owned(),
+                    resource: "permission_rule".to_owned(),
                     action: "read".to_owned(),
                 })
                 .is_err(),
@@ -862,9 +866,9 @@ mod tests {
         let persisted = validate_template_rule_update(
             Some(" allow "),
             "ALLOW",
-            "learn_course",
+            "permission_rule",
             "read",
-            Some("learn_course"),
+            Some("permission_rule"),
             Some("create"),
         )
         .unwrap();
@@ -873,9 +877,9 @@ mod tests {
         let persisted = validate_template_rule_update(
             None,
             "ALLOW",
-            "learn_course",
+            "permission_rule",
             "read",
-            Some("learn_subject"),
+            Some("permission_rule"),
             None,
         )
         .unwrap();
@@ -885,9 +889,9 @@ mod tests {
         assert!(validate_template_rule_update(
             None,
             "DENY",
-            "learn_course",
+            "permission_rule",
             "read",
-            Some("learn_course"),
+            Some("permission_rule"),
             None,
         )
         .is_err());
@@ -895,7 +899,7 @@ mod tests {
         assert!(validate_template_rule_update(
             Some("DENY"),
             "ALLOW",
-            "learn_course",
+            "permission_rule",
             "read",
             None,
             None,

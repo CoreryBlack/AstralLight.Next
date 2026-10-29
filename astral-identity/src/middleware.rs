@@ -42,7 +42,6 @@ pub const IDENTITY_PATH_MAP: PathResourceMap = &[
     ("/tenants", "platform_tenant"),
     ("/me", "identity_users"),
     ("/mfa", "identity_users"),
-    ("/internal/sessions", "identity_users"),
 ];
 
 const IDENTITY_SKIP_PATHS: &[&str] = &[
@@ -57,7 +56,6 @@ const IDENTITY_SKIP_PATHS: &[&str] = &[
     "/password/reset",
     "/verification/send",
     "/verification/verify",
-    "/internal/sessions",
     // 自服务路径（仅需有效 JWT，不需要权限规则检查）
     "/me",
     "/providers",
@@ -88,8 +86,11 @@ pub async fn identity_permission_middleware(
             request_target_id(&req),
         )
         .map_err(|status| BoxedResponse::new(status.into_response()))?;
+        require_platform_user(&ctx)?;
         verify_active_identity_context(&state, &ctx).await?;
-        if ctx.principal_kind.as_deref() == Some(PrincipalKind::PlatformUser.as_str()) {
+        if ctx.principal_kind.as_deref().and_then(PrincipalKind::parse)
+            == Some(PrincipalKind::PlatformUser)
+        {
             verify_active_card_context(
                 &state,
                 ctx.card_id,
@@ -136,6 +137,7 @@ pub async fn identity_permission_middleware(
     let query_target_id = request_target_id(&req);
     let mut ctx = physical_policy_context(req.headers(), resource, action, query_target_id)
         .map_err(|status| BoxedResponse::new(status.into_response()))?;
+    require_platform_user(&ctx)?;
     let resolution = resolve_resource_ownership(
         &state.db,
         resource,
@@ -359,13 +361,30 @@ fn verify_identity_admission_fence(fence: Option<AuthorityReadFence>) -> Result<
     Ok(())
 }
 
+fn require_platform_user(ctx: &astral_types::PolicyContext) -> Result<(), BoxedResponse> {
+    if ctx.principal_kind.as_deref().and_then(PrincipalKind::parse)
+        == Some(PrincipalKind::PlatformUser)
+    {
+        return Ok(());
+    }
+
+    Err(BoxedResponse::new(
+        (
+            StatusCode::FORBIDDEN,
+            "Identity service requires a platform user principal",
+        )
+            .into_response(),
+    ))
+}
+
 fn is_identity_skip_path(path: &str) -> bool {
-    IDENTITY_SKIP_PATHS.iter().any(|prefix| {
-        path == *prefix
-            || path
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.starts_with('/'))
-    })
+    matches!(path, "/profile" | "/change-password")
+        || IDENTITY_SKIP_PATHS.iter().any(|prefix| {
+            path == *prefix
+                || path
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
 }
 
 fn is_credential_bootstrap_path(path: &str) -> bool {
@@ -380,7 +399,6 @@ fn is_credential_bootstrap_path(path: &str) -> bool {
             | "/password/forgot"
             | "/verification/send"
             | "/verification/verify"
-            | "/internal/sessions"
     ) || path
         .strip_prefix("/password/reset/")
         .is_some_and(|token| !token.is_empty() && !token.contains('/'))
@@ -482,6 +500,11 @@ mod tests {
 
     #[test]
     fn management_paths_do_not_skip_permission_evaluation() {
+        assert!(is_identity_skip_path("/profile"));
+        assert!(is_identity_skip_path("/change-password"));
+        assert!(!is_identity_skip_path("/profile/extra"));
+        assert!(!is_identity_skip_path("/profile-extra"));
+        assert!(!is_identity_skip_path("/change-password-extra"));
         assert!(!is_identity_skip_path("/users"));
         assert!(!is_identity_skip_path("/users/7/password"));
         assert!(!is_credential_bootstrap_path("/users/7/password"));

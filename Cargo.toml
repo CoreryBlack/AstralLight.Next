@@ -1,5 +1,4 @@
 [workspace]
-# Learn/Chat 源码暂存但冻结：默认 workspace 不纳入这两个服务，待新规范建立后再恢复。
 members = [
     "policy-engine",
     "astral-types",
@@ -18,7 +17,7 @@ members = [
     "tests-suite",
     "test-harness",
 ]
-exclude = ["astral-learn", "astral-chat", "integrations"]
+exclude = ["integrations"]
 resolver = "2"
 
 [workspace.package]

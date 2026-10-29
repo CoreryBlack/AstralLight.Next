@@ -5,7 +5,7 @@
 > 状态：决策确认稿
 > 对应：Java → Rust 全量迁移，AstralLight 后端重构计划
 >
-> 本文保留 2026-06-29 的历史决策、示例与阶段计划；§§5.3–7 的旧 L1/L2、Java oracle、双引擎 shadow 和回退 Java 不构成 CURRENT V6 运行或兼容合同。现行授权读取、唯一 WorkerOwned 发布及采用/回退以 [Rust 后端编码规范 §§15.4–15.8](../规范/Rust后端编码规范_V1.0.md#154-单机内存读写生命周期sod-与审计边界) 为准：停旧 owner、drain/reconcile、验证完整证明，必要时停止新执行并对账后恢复基线 `62b4349`；本轮不执行环境迁移或回退。
+> 本文保留 2026-06-29 的历史决策、示例与阶段计划；§§5.3–7 的旧 L1/L2、Java oracle、双引擎 shadow 和回退 Java 不构成 CURRENT V6 运行或兼容合同。历史中的 Chat/Learn 服务 URI、路由、workspace 示例、消息和资源登记均是当时的迁移规划材料，不表示现行生产服务或 API。Rust `astral-chat`、`astral-learn` 生产 runtime crates 及其 Gateway routes/proxies 已退役并已从本 checkout 物理移除；`integrations/` 中独立 SDK consumer samples 不是这些生产服务的替代部署。现行授权读取、唯一 WorkerOwned 发布及采用/回退以 [Rust 后端编码规范 §§15.4–15.8](../规范/Rust后端编码规范_V1.0.md#154-单机内存读写生命周期sod-与审计边界) 为准：停旧 owner、drain/reconcile、验证完整证明，必要时停止新执行并对账后恢复基线 `62b4349`；本轮不执行环境迁移或回退。
 
 ---
 

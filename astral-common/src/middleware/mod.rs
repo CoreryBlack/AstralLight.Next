@@ -7,11 +7,21 @@
 //! 速率限制、路由凭证策略）已迁移至 `astral-gateway`。
 
 pub mod gateway_signature;
-pub mod internal_signature;
 pub mod permission;
 pub mod permission_check_shared;
 pub mod tenant_context;
 pub mod tenant_filter;
+
+/// Constant-time byte comparison for security-sensitive tokens and signatures.
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |accumulator, (a, b)| accumulator | (a ^ b))
+        == 0
+}
 
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
@@ -37,7 +47,7 @@ fn validate_v2_claims(claims: &JwtClaims, token_use: TokenUse) -> Result<(), &'s
     if TokenUse::parse(&claims.token_use) != Some(token_use) {
         return Err("TOKEN_USE_INVALID");
     }
-    if PrincipalKind::parse(&claims.principal_kind).is_none() {
+    if claims.principal_kind != PrincipalKind::PlatformUser.as_str() {
         return Err("PRINCIPAL_KIND_INVALID");
     }
     if claims.sid.is_none_or(|value| value <= 0)
@@ -58,37 +68,24 @@ fn validated_access_claims(claims: &JwtClaims) -> Result<(), &'static str> {
     if claims.identity_card_id.is_none_or(|value| value <= 0) {
         return Err("IDENTITY_CONTEXT_REQUIRED");
     }
-    match PrincipalKind::parse(&claims.principal_kind) {
-        Some(PrincipalKind::PlatformUser) => {
-            if claims.user_card_id.is_none()
-                || claims.user_card_tenant_id.is_none()
-                || claims.user_card_domain_id.is_none()
-            {
-                return Err("USER_CARD_CONTEXT_REQUIRED");
-            }
-            if claims.user_card_id.is_some_and(|value| value <= 0)
-                || claims.user_card_tenant_id.is_some_and(|value| value <= 0)
-                || claims.user_card_domain_id.is_some_and(|value| value <= 0)
-            {
-                return Err("USER_CARD_CONTEXT_INVALID");
-            }
-        }
-        Some(PrincipalKind::AppUser) => {
-            if claims.user_card_id.is_some()
-                || claims.user_card_tenant_id.is_some()
-                || claims.user_card_domain_id.is_some()
-            {
-                return Err("APP_USER_CARD_CONTEXT_FORBIDDEN");
-            }
-        }
-        None => return Err("PRINCIPAL_KIND_INVALID"),
+    if claims.user_card_id.is_none()
+        || claims.user_card_tenant_id.is_none()
+        || claims.user_card_domain_id.is_none()
+    {
+        return Err("USER_CARD_CONTEXT_REQUIRED");
+    }
+    if claims.user_card_id.is_some_and(|value| value <= 0)
+        || claims.user_card_tenant_id.is_some_and(|value| value <= 0)
+        || claims.user_card_domain_id.is_some_and(|value| value <= 0)
+    {
+        return Err("USER_CARD_CONTEXT_INVALID");
     }
     Ok(())
 }
 
 fn validated_refresh_claims(claims: &JwtClaims) -> Result<(), &'static str> {
     validate_v2_claims(claims, TokenUse::Refresh)?;
-    if PrincipalKind::parse(&claims.principal_kind).is_none()
+    if claims.principal_kind != PrincipalKind::PlatformUser.as_str()
         || claims.identity_card_id.is_some()
         || claims.user_card_id.is_some()
         || claims.user_card_tenant_id.is_some()
@@ -267,34 +264,38 @@ mod tests {
     }
 
     #[test]
-    fn validated_access_claims_accept_identity_only_app_user() {
-        let mut claims = claims("42");
-        claims.principal_kind = "APP_USER".into();
-        claims.user_card_id = None;
-        claims.user_card_tenant_id = None;
-        claims.user_card_domain_id = None;
-        assert!(validated_access_claims(&claims).is_ok());
+    fn validated_access_claims_reject_stale_app_user_credentials() {
+        let mut stale_access = claims("42");
+        stale_access.principal_kind = "APP_USER".into();
+        stale_access.user_card_id = None;
+        stale_access.user_card_tenant_id = None;
+        stale_access.user_card_domain_id = None;
+        assert_eq!(
+            validated_access_claims(&stale_access),
+            Err("PRINCIPAL_KIND_INVALID")
+        );
+
+        let mut old_token_with_card_context = claims("42");
+        old_token_with_card_context.principal_kind = "APP_USER".into();
+        assert_eq!(
+            validated_access_claims(&old_token_with_card_context),
+            Err("PRINCIPAL_KIND_INVALID")
+        );
     }
 
     #[test]
-    fn validated_access_claims_reject_app_user_card_context() {
-        for (label, user_card_id, user_card_domain_id, user_card_tenant_id) in [
-            ("id", Some(40), None, None),
-            ("domain", None, Some(30), None),
-            ("tenant", None, None, Some(20)),
-            ("all", Some(40), Some(30), Some(20)),
-        ] {
-            let mut claims = claims("42");
-            claims.principal_kind = "APP_USER".into();
-            claims.user_card_id = user_card_id;
-            claims.user_card_domain_id = user_card_domain_id;
-            claims.user_card_tenant_id = user_card_tenant_id;
-            assert_eq!(
-                validated_access_claims(&claims),
-                Err("APP_USER_CARD_CONTEXT_FORBIDDEN"),
-                "APP_USER user-card context must be rejected: {label}"
-            );
-        }
+    fn validated_refresh_claims_reject_stale_app_user_credentials() {
+        let mut stale_refresh = claims("42");
+        stale_refresh.token_use = "REFRESH".into();
+        stale_refresh.principal_kind = "APP_USER".into();
+        stale_refresh.identity_card_id = None;
+        stale_refresh.user_card_id = None;
+        stale_refresh.user_card_tenant_id = None;
+        stale_refresh.user_card_domain_id = None;
+        assert_eq!(
+            validated_refresh_claims(&stale_refresh),
+            Err("PRINCIPAL_KIND_INVALID")
+        );
     }
 
     #[test]

@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use astral_sdk_contracts::{ApplicationManifest, ExternalSubject};
-use astral_types::ResourceRegistry;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Deserialize;
 
@@ -124,21 +123,18 @@ impl IntegrationConfig {
                 }
             }
             for route in &app.manifest.routes {
-                let registry = ResourceRegistry::global();
-                if registry.is_builtin_resource(&route.resource_type)
-                    && !route.resource_type.starts_with("chat_")
-                    && !route.resource_type.starts_with("learn_")
-                {
-                    return Err("SDK may own business resources only");
+                let registry = astral_types::ResourceRegistry::global();
+                if registry.is_builtin_resource(&route.resource_type) {
+                    return Err("SDK resources must be application-owned");
                 }
+                registry
+                    .validate(&route.resource_type, &route.action)
+                    .map_err(|_| "SDK resource/action not registered")?;
                 if let Some(owner) = resource_owners.insert(&route.resource_type, &app.app_id) {
                     if owner != &app.app_id {
                         return Err("SDK resource has multiple application owners");
                     }
                 }
-                registry
-                    .validate(&route.resource_type, &route.action)
-                    .map_err(|_| "SDK resource/action not registered")?;
             }
         }
         Ok(Self {
@@ -180,8 +176,16 @@ mod tests {
     use serde_json::{json, Value};
 
     fn application(app_id: &str, resource: &str) -> Value {
+        if !astral_types::ResourceRegistry::global().is_builtin_resource(resource) {
+            astral_types::ResourceRegistry::global()
+                .register_custom_resources([astral_types::CustomResourceRegistration {
+                    resource_type: resource.into(),
+                    actions: vec!["read".into(), "update".into()],
+                }])
+                .expect("test SDK resource registration must be valid");
+        }
         json!({
-            "appId": app_id, "keyId": "test-app", "issuer": "learn-local",
+            "appId": app_id, "keyId": "test-app", "issuer": "course-local",
             "publicKeyHex": hex::encode(SigningKey::from_bytes(&[31; 32]).verifying_key().to_bytes()),
             "manifest": {
                 "app_id": app_id, "revision": "1", "routes": [{
@@ -198,7 +202,7 @@ mod tests {
     pub(super) fn test_config() -> Arc<IntegrationConfig> {
         Arc::new(
             IntegrationConfig::parse(
-                &json!({"applications": [application("astral-learn", "learn_course")]}).to_string(),
+                &json!({"applications": [application("course-app", "course_record")]}).to_string(),
                 "test-decision".into(),
                 &hex::encode([32; 32]),
             )
@@ -219,19 +223,19 @@ mod tests {
     #[test]
     fn explicit_app_and_scope_are_byte_exact() {
         let config = test_config();
-        let app = config.application("astral-learn").unwrap();
-        assert!(config.application("ASTRAL-LEARN").is_none());
+        let app = config.application("course-app").unwrap();
+        assert!(config.application("COURSE-APP").is_none());
         assert!(app.tenant_binding("school-a", "courses").is_some());
         assert!(app.tenant_binding("School-a", "courses").is_none());
     }
 
     #[test]
-    fn platform_resources_and_duplicate_business_owners_are_refused() {
+    fn builtin_resources_and_duplicate_business_owners_are_refused() {
         for apps in [
             vec![application("third-party", "authorization")],
             vec![
-                application("first", "learn_course"),
-                application("second", "learn_course"),
+                application("first", "course_record"),
+                application("second", "course_record"),
             ],
         ] {
             assert!(IntegrationConfig::parse(
@@ -244,8 +248,8 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_scope_or_unregistered_action_refuses_startup() {
-        let mut app = application("astral-learn", "learn_course");
+    fn duplicate_scope_or_invalid_manifest_refuses_startup() {
+        let mut app = application("course-app", "course_record");
         let duplicate = app["tenantBindings"][0].clone();
         app["tenantBindings"]
             .as_array_mut()
@@ -257,8 +261,8 @@ mod tests {
             &hex::encode([32; 32])
         )
         .is_err());
-        let mut app = application("astral-learn", "learn_course");
-        app["manifest"]["routes"][0]["action"] = json!("super-allow");
+        let mut app = application("course-app", "course_record");
+        app["manifest"]["routes"][0]["action"] = json!("bad action");
         assert!(IntegrationConfig::parse(
             &json!({"applications": [app]}).to_string(),
             "test-decision".into(),

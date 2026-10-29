@@ -11,7 +11,7 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 
-const PATH: &str = "/v1/app/learn/progress/42";
+const PATH: &str = "/contract-tests/gateway/resources/42";
 const USER_ID: &str = "42";
 const TOKEN_ID: &str = "token-1";
 const ACTION_CODES: &str = "read";
@@ -25,53 +25,11 @@ fn config() -> AppConfig {
     AppConfig {
         gateway: GatewayCfg {
             hmac_secret: gateway_secret(),
-            internal_service_secret: "gateway-internal-test-secret-0123456789".into(),
             timestamp_tolerance_secs: 30,
             trusted_proxy_ips: vec![],
         },
         ..Default::default()
     }
-}
-
-fn signed_request(method: &str, path: &str) -> Request<Body> {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        .to_string();
-    let signature = compute_hmac_signature_v3(
-        &gateway_secret(),
-        method,
-        path,
-        USER_ID,
-        "APP_USER",
-        TOKEN_ID,
-        "identity-card",
-        "",
-        "",
-        "",
-        "ACCESS",
-        "2",
-        ACTION_CODES,
-        USER_ROLES,
-        &timestamp,
-    );
-    Request::builder()
-        .method(method)
-        .uri(path)
-        .header("x-gateway-auth", "verified")
-        .header("x-gateway-ts", timestamp)
-        .header("x-gateway-signature", signature)
-        .header("x-user-id", USER_ID)
-        .header("x-principal-kind", "APP_USER")
-        .header("x-token-id", TOKEN_ID)
-        .header("x-identity-card-id", "identity-card")
-        .header("x-token-use", "ACCESS")
-        .header("x-claims-version", "2")
-        .header("x-action-codes", ACTION_CODES)
-        .header("x-user-roles", USER_ROLES)
-        .body(Body::empty())
-        .unwrap()
 }
 
 fn platform_signed_request(method: &str, path: &str) -> Request<Body> {
@@ -271,7 +229,7 @@ fn app_with_counter(counter: Arc<AtomicUsize>) -> Router {
 async fn signed_request_with_unchanged_fields_reaches_handler() {
     let counter = Arc::new(AtomicUsize::new(0));
     let response = app_with_counter(Arc::clone(&counter))
-        .oneshot(signed_request("GET", PATH))
+        .oneshot(platform_signed_request("GET", PATH))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -285,20 +243,20 @@ async fn signed_request_with_unchanged_fields_reaches_handler() {
     assert_eq!(
         counter.load(Ordering::SeqCst),
         1,
-        "valid request must invoke handler exactly once"
+        "valid PlatformUser request must invoke handler exactly once"
     );
 }
 
 #[tokio::test]
 async fn changing_method_path_or_identity_invalidates_signature_and_skips_handler() {
     for (label, mut request) in [
-        ("method", signed_request("GET", PATH)),
-        ("path", signed_request("GET", PATH)),
-        ("identity", signed_request("GET", PATH)),
+        ("method", platform_signed_request("GET", PATH)),
+        ("path", platform_signed_request("GET", PATH)),
+        ("identity", platform_signed_request("GET", PATH)),
     ] {
         match label {
             "method" => *request.method_mut() = Method::POST,
-            "path" => *request.uri_mut() = "/v1/app/learn/progress/43".parse().unwrap(),
+            "path" => *request.uri_mut() = "/contract-tests/gateway/resources/43".parse().unwrap(),
             "identity" => {
                 request
                     .headers_mut()
@@ -323,8 +281,8 @@ async fn changing_method_path_or_identity_invalidates_signature_and_skips_handle
 #[tokio::test]
 async fn missing_gateway_auth_and_invalid_signature_are_rejected_before_handler() {
     for (label, mut request) in [
-        ("missing auth", signed_request("GET", PATH)),
-        ("invalid signature", signed_request("GET", PATH)),
+        ("missing auth", platform_signed_request("GET", PATH)),
+        ("invalid signature", platform_signed_request("GET", PATH)),
     ] {
         if label == "missing auth" {
             request.headers_mut().remove("x-gateway-auth");
@@ -343,44 +301,6 @@ async fn missing_gateway_auth_and_invalid_signature_are_rejected_before_handler(
             counter.load(Ordering::SeqCst),
             0,
             "{label} must not invoke handler"
-        );
-    }
-}
-
-#[tokio::test]
-async fn app_user_with_any_user_card_field_is_rejected() {
-    for field in [
-        "x-user-card-id",
-        "x-user-card-domain-id",
-        "x-user-card-tenant-id",
-    ] {
-        let mut request = signed_request("GET", PATH);
-        request
-            .headers_mut()
-            .insert(field, "unexpected-card-context".parse().unwrap());
-        resign_request(&mut request);
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let response = app_with_counter(Arc::clone(&counter))
-            .oneshot(request)
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{field}");
-        let body: serde_json::Value = serde_json::from_slice(
-            to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .as_ref(),
-        )
-        .unwrap();
-        assert_eq!(
-            body["reasonCode"], "PRINCIPAL_CARD_CONTEXT_INVALID",
-            "APP_USER with {field} must expose the card-context rejection reason"
-        );
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            0,
-            "APP_USER with {field} must not invoke handler"
         );
     }
 }
@@ -413,11 +333,6 @@ async fn platform_user_missing_any_user_card_field_is_rejected() {
 #[tokio::test]
 async fn identity_and_user_card_field_tampering_invalidates_signature() {
     let cases = vec![
-        (
-            "APP_USER identity card",
-            signed_request("GET", PATH),
-            "x-identity-card-id",
-        ),
         (
             "PLATFORM_USER identity card",
             platform_signed_request("GET", PATH),

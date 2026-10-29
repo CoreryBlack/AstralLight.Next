@@ -16,7 +16,7 @@
 //!    `ASTRAL_TEST_CONTROL_TOKEN` 非空时才注册路由；配置缺失/无效一律
 //!    fail-closed——路由根本不存在（404），绝不暴露控制面。
 //! 2. **专用 token，常量时间比较**：复用
-//!    `astral_common::middleware::internal_signature::constant_time_eq` 字节
+//!    `astral_common::middleware::constant_time_eq` 字节
 //!    比较（通用原语，不共享任何密钥材料）；不复用 Gateway HMAC secret，不
 //!    硬编码 secret，绝不记录 token 值。
 //! 3. **不绕过中间件**：路由挂在 `/main/api/v1` 子路由内，照常经过 Gateway
@@ -56,7 +56,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use astral_common::error::AppError;
-use astral_common::middleware::internal_signature::constant_time_eq;
+use astral_common::middleware::constant_time_eq;
 use astral_types::AstralError;
 
 use crate::AppState;

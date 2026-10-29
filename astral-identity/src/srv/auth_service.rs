@@ -9,7 +9,6 @@ use serde::Deserialize;
 use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 
 use astral_common::error::AppError;
-use astral_common::token_contract::PrincipalKind;
 use astral_types::{AstralError, IdentityCard};
 
 use crate::auth::{
@@ -361,12 +360,8 @@ impl AuthService {
             session_context,
             Some(&claims_extra),
         )?;
-        let refresh_token_result = issue_refresh_token(
-            &state.config.jwt,
-            agg.user_id,
-            PrincipalKind::PlatformUser,
-            session_context,
-        )?;
+        let refresh_token_result =
+            issue_refresh_token(&state.config.jwt, agg.user_id, session_context)?;
         let refresh_hash = sha256_hash(&refresh_token_result.token);
         if let Err(error) = self
             .repository
@@ -390,7 +385,6 @@ impl AuthService {
             &access_token_result,
             SessionGrant::active(
                 &access_token_result,
-                PrincipalKind::PlatformUser,
                 agg.user_id,
                 session_id,
                 id_card.card_id,

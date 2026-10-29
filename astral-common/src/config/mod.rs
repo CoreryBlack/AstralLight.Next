@@ -34,14 +34,6 @@ pub enum ConfigValidationError {
     GatewayHmacSecretTooShort,
     #[error("GATEWAY_HMAC_SECRET must not use a known placeholder value")]
     GatewayHmacSecretPlaceholder,
-    #[error("INTERNAL_SERVICE_SECRET (K_LG) must be at least 32 characters")]
-    InternalServiceSecretTooShort,
-    #[error("INTERNAL_SERVICE_SECRET (K_LG) must not use a known placeholder value")]
-    InternalServiceSecretPlaceholder,
-    #[error("GATEWAY_INTERNAL_SERVICE_SECRET (K_GI) must be at least 32 characters")]
-    GatewayInternalServiceSecretTooShort,
-    #[error("GATEWAY_INTERNAL_SERVICE_SECRET (K_GI) must not use a known placeholder value")]
-    GatewayInternalServiceSecretPlaceholder,
     #[error("GATEWAY timestamp tolerance must be positive")]
     GatewayTimestampToleranceInvalid,
     #[error("DATABASE_URL is required outside the test profile")]
@@ -189,10 +181,6 @@ fn is_placeholder_secret(secret: &str) -> bool {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
-    pub learn_service_uri: String,
-    #[serde(default)]
-    pub chat_service_uri: String,
-    #[serde(default)]
     pub identity_service_uri: String,
     #[serde(default)]
     pub gateway_service_uri: String,
@@ -201,9 +189,6 @@ pub struct AppConfig {
     pub trust_graph_uri: String,
     #[serde(default)]
     pub monitor_service_uri: String,
-
-    #[serde(default)]
-    pub internal_service_secret: String,
 
     #[serde(default = "default_public_paths")]
     pub public_paths: Vec<String>,
@@ -301,13 +286,10 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            learn_service_uri: String::new(),
-            chat_service_uri: String::new(),
             identity_service_uri: String::new(),
             gateway_service_uri: String::new(),
             trust_graph_uri: String::new(),
             monitor_service_uri: String::new(),
-            internal_service_secret: String::new(),
             public_paths: default_public_paths(),
             max_permission_header_length: default_max_permission_header_length(),
             cors: CorsConfig::default(),
@@ -338,7 +320,6 @@ fn default_public_paths() -> Vec<String> {
         "/api/v1/auth/password/reset/*".into(),
         "/api/v1/auth/verification/send".into(),
         "/api/v1/auth/verification/verify".into(),
-        "/v1/app/users/login".into(),
         "/api/health".into(),
         "/api/health/metrics".into(),
         "/api/health/**".into(),
@@ -478,9 +459,6 @@ fn default_access_expiry() -> i64 {
 pub struct GatewayCfg {
     #[serde(default)]
     pub hmac_secret: String,
-    /// Gateway -> Identity internal assertion key (K_GI).
-    #[serde(default)]
-    pub internal_service_secret: String,
     #[serde(default = "default_tolerance")]
     pub timestamp_tolerance_secs: i64,
     /// Exact proxy addresses (or CIDR prefixes) allowed to supply client IP headers.
@@ -492,7 +470,6 @@ impl Default for GatewayCfg {
     fn default() -> Self {
         Self {
             hmac_secret: String::new(),
-            internal_service_secret: String::new(),
             timestamp_tolerance_secs: default_tolerance(),
             trusted_proxy_ips: Vec::new(),
         }
@@ -546,7 +523,6 @@ pub struct WeChatConfig {
 pub enum JwtValidationRole {
     Gateway,
     Identity,
-    Learn,
 }
 
 impl JwtValidationRole {
@@ -665,9 +641,6 @@ fn apply_flat_env_overrides(cfg: &mut AppConfig) -> Result<(), config::ConfigErr
 
     // Upstream URIs and connection strings (trim; scheme/host policy is checked
     // by the relevant runtime owner). Empty overrides preserve YAML/defaults.
-    if let Some(value) = optional_env("LEARN_SERVICE_URI") {
-        cfg.learn_service_uri = value.trim().to_string();
-    }
     if let Some(value) = optional_env("IDENTITY_SERVICE_URI") {
         cfg.identity_service_uri = value.trim().to_string();
     }
@@ -703,7 +676,7 @@ fn apply_flat_env_overrides(cfg: &mut AppConfig) -> Result<(), config::ConfigErr
     // 注释），因此不提供共享的 `JWT_SECRET` 名，避免静默复用。issuer/audience
     // 必须显式提供：只要 env 或 YAML 中存在任一 `jwt.<profile>` 子键，serde
     // 就走字段级默认（audience 字段默认为空串），file-less 部署若不显式映射
-    // 这两个元数据字段，Learn 校验会以 "invalid token profile metadata" 拒绝。
+    // 这两个元数据字段会被拒绝。
     if let Some(value) = optional_env("JWT_ACCESS_SECRET") {
         cfg.jwt.access.secret = value;
     }
@@ -722,15 +695,9 @@ fn apply_flat_env_overrides(cfg: &mut AppConfig) -> Result<(), config::ConfigErr
     if let Some(value) = optional_env("JWT_REFRESH_AUDIENCE") {
         cfg.jwt.refresh.audience = value.trim().to_string();
     }
-    // Gateway HMAC（探针/身份头验签）与两把内部服务密钥（K_LG / K_GI）。
+    // Gateway HMAC（探针/身份头验签）。
     if let Some(value) = optional_env("GATEWAY_HMAC_SECRET") {
         cfg.gateway.hmac_secret = value;
-    }
-    if let Some(value) = optional_env("INTERNAL_SERVICE_SECRET") {
-        cfg.internal_service_secret = value;
-    }
-    if let Some(value) = optional_env("GATEWAY_INTERNAL_SERVICE_SECRET") {
-        cfg.gateway.internal_service_secret = value;
     }
     // ORG_SCOPE 部署旗标（default-off）：所有 PolicyEngine 宿主（trustgraph /
     // identity / monitor）经共享严格解析器在启动期一次解析并冻结到本字段，
@@ -803,7 +770,7 @@ impl AppConfig {
     }
 
     pub fn from_files(path: &str) -> Result<Self, config::ConfigError> {
-        Self::from_files_for(path, JwtValidationRole::Learn)
+        Self::from_files_for(path, JwtValidationRole::Identity)
     }
 
     pub fn from_files_for(
@@ -942,25 +909,6 @@ impl AppConfig {
         }
         if self.gateway.timestamp_tolerance_secs <= 0 {
             return Err(ConfigValidationError::GatewayTimestampToleranceInvalid);
-        }
-        if matches!(role, JwtValidationRole::Gateway | JwtValidationRole::Learn) {
-            if self.internal_service_secret.len() < 32 {
-                return Err(ConfigValidationError::InternalServiceSecretTooShort);
-            }
-            if is_placeholder_secret(&self.internal_service_secret) {
-                return Err(ConfigValidationError::InternalServiceSecretPlaceholder);
-            }
-        }
-        if matches!(
-            role,
-            JwtValidationRole::Gateway | JwtValidationRole::Identity
-        ) {
-            if self.gateway.internal_service_secret.len() < 32 {
-                return Err(ConfigValidationError::GatewayInternalServiceSecretTooShort);
-            }
-            if is_placeholder_secret(&self.gateway.internal_service_secret) {
-                return Err(ConfigValidationError::GatewayInternalServiceSecretPlaceholder);
-            }
         }
         Ok(())
     }
@@ -1142,7 +1090,6 @@ mod tests {
     fn valid_gateway() -> GatewayCfg {
         GatewayCfg {
             hmac_secret: "gateway-test-secret-0123456789abcdef".into(),
-            internal_service_secret: "gateway-internal-test-secret-0123456789".into(),
             ..Default::default()
         }
     }
@@ -1164,7 +1111,6 @@ mod tests {
         "RUST_ENV",
         "ENVIRONMENT",
         // apply_flat_env_overrides 契约名。
-        "LEARN_SERVICE_URI",
         "IDENTITY_SERVICE_URI",
         "TRUST_GRAPH_URI",
         "MONITOR_SERVICE_URI",
@@ -1181,8 +1127,6 @@ mod tests {
         "JWT_ACCESS_AUDIENCE",
         "JWT_REFRESH_AUDIENCE",
         "GATEWAY_HMAC_SECRET",
-        "INTERNAL_SERVICE_SECRET",
-        "GATEWAY_INTERNAL_SERVICE_SECRET",
         "CORS_ALLOWED_ORIGINS",
         "CORS_ALLOW_CREDENTIALS",
         // ORG_SCOPE 部署旗标（parse_org_scope_enabled 契约）。
@@ -1269,11 +1213,9 @@ mod tests {
     }
 
     #[test]
-    fn trustgraph_gateway_role_requires_real_hmac_while_learn_default_skips_it() {
-        // HMAC 审计缺口修复的合同钉子（2026-09-21）：from_files() 的默认角色
-        // 是 Learn（跳过 gateway.hmac_secret 强制校验，历史兼容语义保持不变）；
-        // 任何验签 Gateway 身份头的服务（trustgraph）必须显式走 Gateway 角色，
-        // 占位/过短 hmac 一律启动失败。
+    fn trustgraph_gateway_role_requires_real_hmac() {
+        // Any service that verifies Gateway identity headers must use the Gateway
+        // validation role; placeholder HMAC material is rejected for both active roles.
         let config = AppConfig {
             jwt: valid_jwt_config(),
             gateway: GatewayCfg {
@@ -1288,13 +1230,11 @@ mod tests {
                 .unwrap_err(),
             ConfigValidationError::GatewayHmacSecretPlaceholder
         ));
-        // Learn 角色保持历史行为：hmac 不在强制清单内（其余密钥要求不变，
-        // 该部分配置字段的不满足会以其他错误形态出现，与本合同无关）。
-        let learn_error = config.validate_secrets_for(JwtValidationRole::Learn).err();
-        assert!(!matches!(
-            learn_error,
-            Some(ConfigValidationError::GatewayHmacSecretPlaceholder)
-                | Some(ConfigValidationError::GatewayHmacSecretTooShort)
+        assert!(matches!(
+            config
+                .validate_secrets_for(JwtValidationRole::Identity)
+                .unwrap_err(),
+            ConfigValidationError::GatewayHmacSecretPlaceholder
         ));
     }
 
@@ -1494,7 +1434,6 @@ mod tests {
         }
         let config = AppConfig {
             jwt,
-            internal_service_secret: "learn-gateway-test-secret-0123456789".into(),
             gateway: valid_gateway(),
             ..Default::default()
         };
@@ -1694,15 +1633,13 @@ mod tests {
     }
 
     #[test]
-    fn runtime_validation_rejects_missing_service_secret() {
-        let config = AppConfig {
-            jwt: valid_jwt_config(),
-            gateway: valid_gateway(),
-            ..valid_runtime_config()
-        };
+    fn runtime_validation_rejects_missing_gateway_hmac() {
+        let mut config = valid_runtime_config();
+        config.jwt = valid_jwt_config();
+        config.gateway.hmac_secret.clear();
         assert!(matches!(
             config.validate_secrets_for(JwtValidationRole::Gateway),
-            Err(ConfigValidationError::InternalServiceSecretTooShort)
+            Err(ConfigValidationError::GatewayHmacSecretTooShort)
         ));
     }
 
@@ -1879,15 +1816,15 @@ mod tests {
         guard.set("JWT_ACCESS_AUDIENCE", "dist-test-astral-api");
         guard.set("JWT_REFRESH_AUDIENCE", "dist-test-astral-session");
         guard.set(
-            "INTERNAL_SERVICE_SECRET",
-            "internal-lg-override-secret-0123456789",
+            "GATEWAY_HMAC_SECRET",
+            "gateway-hmac-override-secret-0123456789",
         );
         guard.set("CORS_ALLOWED_ORIGINS", "https://console.example.invalid");
 
         guard.set(SESSION_GRANT_MIRROR_ENV, "false");
         let config = AppConfig::from_files_for(
             "astral-common-mirror-contract-no-such-file",
-            JwtValidationRole::Learn,
+            JwtValidationRole::Identity,
         )
         .expect("explicit mirror opt-out must pass validation");
         assert!(!config.session_grant_mirror_enabled);
@@ -1895,7 +1832,7 @@ mod tests {
         guard.set(SESSION_GRANT_MIRROR_ENV, "true");
         let config = AppConfig::from_files_for(
             "astral-common-mirror-contract-no-such-file",
-            JwtValidationRole::Learn,
+            JwtValidationRole::Identity,
         )
         .expect("explicit mirror opt-in must pass validation");
         assert!(config.session_grant_mirror_enabled);
@@ -1903,7 +1840,7 @@ mod tests {
         guard.set(SESSION_GRANT_MIRROR_ENV, "maybe");
         let error = AppConfig::from_files_for(
             "astral-common-mirror-contract-no-such-file",
-            JwtValidationRole::Learn,
+            JwtValidationRole::Identity,
         )
         .expect_err("invalid mirror flag must fail closed");
         let rendered = error.to_string();
@@ -1951,12 +1888,12 @@ cors:
             "dist-refresh-override-secret-0123456789abcdef",
         );
         guard.set(
-            "INTERNAL_SERVICE_SECRET",
-            "internal-lg-override-secret-0123456789",
+            "GATEWAY_HMAC_SECRET",
+            "gateway-hmac-override-secret-0123456789",
         );
 
-        let config = AppConfig::from_files_for(&yaml_stem, JwtValidationRole::Learn)
-            .expect("yaml explicit mirror opt-out must pass Learn validation");
+        let config = AppConfig::from_files_for(&yaml_stem, JwtValidationRole::Identity)
+            .expect("yaml explicit mirror opt-out must pass current identity validation");
         let _ = fs::remove_file(&yaml_path);
         assert!(
             !config.session_grant_mirror_enabled,
@@ -1991,21 +1928,13 @@ cors:
             "GATEWAY_HMAC_SECRET",
             "gateway-hmac-override-secret-0123456789",
         );
-        guard.set(
-            "INTERNAL_SERVICE_SECRET",
-            "internal-lg-override-secret-0123456789",
-        );
-        guard.set(
-            "GATEWAY_INTERNAL_SERVICE_SECRET",
-            "gateway-internal-gi-override-secret-0123456",
-        );
         guard.set("CORS_ALLOWED_ORIGINS", "https://console.example.invalid");
         guard.set("CORS_ALLOW_CREDENTIALS", "false");
 
         // env 缺失 → default-off。
         let config = AppConfig::from_files_for(
             "astral-common-org-scope-contract-no-such-file",
-            JwtValidationRole::Learn,
+            JwtValidationRole::Identity,
         )
         .expect("file-less node without the org flag must pass validation");
         assert!(!config.org_scope_enabled);
@@ -2014,7 +1943,7 @@ cors:
         guard.set(ORG_SCOPE_ENABLED_ENV, "true");
         let config = AppConfig::from_files_for(
             "astral-common-org-scope-contract-no-such-file",
-            JwtValidationRole::Learn,
+            JwtValidationRole::Identity,
         )
         .expect("explicit org flag must freeze into config");
         assert!(config.org_scope_enabled);
@@ -2023,7 +1952,7 @@ cors:
         guard.set(ORG_SCOPE_ENABLED_ENV, "maybe");
         let error = AppConfig::from_files_for(
             "astral-common-org-scope-contract-no-such-file",
-            JwtValidationRole::Learn,
+            JwtValidationRole::Identity,
         )
         .expect_err("invalid org flag must fail closed");
         let rendered = error.to_string();
@@ -2071,12 +2000,12 @@ cors:
             "dist-refresh-override-secret-0123456789abcdef",
         );
         guard.set(
-            "INTERNAL_SERVICE_SECRET",
-            "internal-lg-override-secret-0123456789",
+            "GATEWAY_HMAC_SECRET",
+            "gateway-hmac-override-secret-0123456789",
         );
 
-        let config = AppConfig::from_files_for(&yaml_stem, JwtValidationRole::Learn)
-            .expect("yaml fallback must pass Learn validation");
+        let config = AppConfig::from_files_for(&yaml_stem, JwtValidationRole::Identity)
+            .expect("yaml fallback must pass current identity validation");
         let _ = fs::remove_file(&yaml_path);
         assert!(
             !config.org_scope_enabled,
@@ -2084,15 +2013,11 @@ cors:
         );
     }
 
-    /// HIGH-1 缺陷回归：config-rs 以 `_` 为层级分隔符，flat 部署名
-    /// （`DATABASE_URL` 等）无法命中 serde 扁平字段，且远程部署目录没有
-    /// application.yml，节点因此启动即退出。本用例证明：无任何配置文件时，
-    /// 显式 flat env 契约即可提供全部启动字段并通过 Learn 角色的完整启动
+    /// 显式 flat env 契约即可提供全部启动字段并通过当前 Identity 角色的完整启动
     /// 校验（secret 长度/占位符、issuer 元数据、URL scheme/主机、CORS 策略）。
     #[test]
-    fn flat_env_config_overrides_reach_fields_and_fileless_learn_validation_passes() {
+    fn flat_env_config_overrides_reach_fields_and_fileless_identity_validation_passes() {
         let guard = FlatEnvGuard::acquire();
-        guard.set("LEARN_SERVICE_URI", " http://learn.example.invalid:9002 ");
         guard.set(
             "IDENTITY_SERVICE_URI",
             " http://identity.example.invalid:9004 ",
@@ -2127,14 +2052,6 @@ cors:
             "gateway-hmac-override-secret-0123456789",
         );
         guard.set(
-            "INTERNAL_SERVICE_SECRET",
-            "internal-lg-override-secret-0123456789",
-        );
-        guard.set(
-            "GATEWAY_INTERNAL_SERVICE_SECRET",
-            "gateway-internal-gi-override-secret-0123456",
-        );
-        guard.set(
             "CORS_ALLOWED_ORIGINS",
             "https://console.example.invalid, https://admin.example.invalid",
         );
@@ -2142,19 +2059,15 @@ cors:
 
         let config = AppConfig::from_files_for(
             "astral-common-flat-env-contract-no-such-file",
-            JwtValidationRole::Learn,
+            JwtValidationRole::Identity,
         )
-        .expect("file-less node with the explicit flat env contract must pass Learn validation");
+        .expect("file-less node with the explicit flat env contract must pass current identity validation");
 
         assert_eq!(
             config.database_url,
             "mysql://db.example.invalid:3306/astral_test"
         );
         assert_eq!(config.rabbitmq_url, "amqps://mq.example.invalid:5671/%2f");
-        assert_eq!(
-            config.learn_service_uri,
-            "http://learn.example.invalid:9002"
-        );
         assert_eq!(
             config.identity_service_uri,
             "http://identity.example.invalid:9004"
@@ -2188,14 +2101,6 @@ cors:
             "gateway-hmac-override-secret-0123456789"
         );
         assert_eq!(
-            config.internal_service_secret,
-            "internal-lg-override-secret-0123456789"
-        );
-        assert_eq!(
-            config.gateway.internal_service_secret,
-            "gateway-internal-gi-override-secret-0123456"
-        );
-        assert_eq!(
             config.cors.allowed_origins,
             vec![
                 "https://console.example.invalid".to_string(),
@@ -2215,7 +2120,7 @@ cors:
         guard.set("CORS_ALLOW_CREDENTIALS", "maybe");
         let error = AppConfig::from_files_for(
             "astral-common-flat-env-contract-no-such-file",
-            JwtValidationRole::Learn,
+            JwtValidationRole::Identity,
         )
         .expect_err("malformed bool override must fail closed");
         let rendered = error.to_string();
@@ -2229,7 +2134,7 @@ cors:
         );
         let error = AppConfig::from_files_for(
             "astral-common-flat-env-contract-no-such-file",
-            JwtValidationRole::Learn,
+            JwtValidationRole::Identity,
         )
         .expect_err("empty origin entry must fail closed");
         assert!(error.to_string().contains("CORS_ALLOWED_ORIGINS"));
@@ -2246,8 +2151,7 @@ cors:
         ));
         fs::write(
             &yaml_path,
-            r#"learn_service_uri: "http://yaml-learn.example.invalid:9002"
-identity_service_uri: "http://yaml-identity.example.invalid:9004"
+            r#"identity_service_uri: "http://yaml-identity.example.invalid:9004"
 trust_graph_uri: "http://yaml-trustgraph.example.invalid:9005"
 monitor_service_uri: "http://yaml-monitor.example.invalid:9006"
 jwt:
@@ -2280,12 +2184,12 @@ cors:
             "dist-refresh-override-secret-0123456789abcdef",
         );
         guard.set(
-            "INTERNAL_SERVICE_SECRET",
-            "internal-lg-override-secret-0123456789",
+            "GATEWAY_HMAC_SECRET",
+            "gateway-hmac-override-secret-0123456789",
         );
 
-        let config = AppConfig::from_files_for(&yaml_stem, JwtValidationRole::Learn)
-            .expect("yaml fallback + partial env overrides must pass Learn validation");
+        let config = AppConfig::from_files_for(&yaml_stem, JwtValidationRole::Identity)
+            .expect("yaml fallback + partial env overrides must pass current identity validation");
         let _ = fs::remove_file(&yaml_path);
 
         // env 未覆盖的字段保留 YAML 值。
@@ -2298,10 +2202,6 @@ cors:
             vec!["https://yaml-origin.example.invalid".to_string()]
         );
         assert!(config.cors.allow_credentials);
-        assert_eq!(
-            config.learn_service_uri,
-            "http://yaml-learn.example.invalid:9002"
-        );
         assert_eq!(
             config.identity_service_uri,
             "http://yaml-identity.example.invalid:9004"
@@ -2331,8 +2231,7 @@ cors:
     }
 
     /// `from_env_for` 与 `from_files_for` 应用同一份 flat 覆盖契约；Gateway
-    /// 角色的三把密钥（Gateway HMAC、K_LG、K_GI）都必须从各自独立 env 名
-    /// 落位，绝不允许共用一个变量。
+    /// 角色的 HMAC 密钥必须从独立 env 名落位，绝不允许共用 JWT 签名材料。
     #[test]
     fn flat_env_config_from_env_for_applies_overrides_for_gateway_role() {
         let guard = FlatEnvGuard::acquire();
@@ -2340,7 +2239,6 @@ cors:
             "DATABASE_URL",
             "mysql://db.example.invalid:3306/astral_test",
         );
-        guard.set("LEARN_SERVICE_URI", "http://env-learn.example.invalid:9002");
         guard.set(
             "IDENTITY_SERVICE_URI",
             "http://env-identity.example.invalid:9004",
@@ -2370,24 +2268,12 @@ cors:
             "GATEWAY_HMAC_SECRET",
             "gateway-hmac-override-secret-0123456789",
         );
-        guard.set(
-            "INTERNAL_SERVICE_SECRET",
-            "internal-lg-override-secret-0123456789",
-        );
-        guard.set(
-            "GATEWAY_INTERNAL_SERVICE_SECRET",
-            "gateway-internal-gi-override-secret-0123456",
-        );
         guard.set("CORS_ALLOWED_ORIGINS", "https://console.example.invalid");
         guard.set("CORS_ALLOW_CREDENTIALS", "false");
 
         let config = AppConfig::from_env_for(JwtValidationRole::Gateway)
             .expect("gateway role with the explicit flat env contract must pass validation");
 
-        assert_eq!(
-            config.learn_service_uri,
-            "http://env-learn.example.invalid:9002"
-        );
         assert_eq!(
             config.identity_service_uri,
             "http://env-identity.example.invalid:9004"
@@ -2403,14 +2289,6 @@ cors:
         assert_eq!(
             config.gateway.hmac_secret,
             "gateway-hmac-override-secret-0123456789"
-        );
-        assert_eq!(
-            config.internal_service_secret,
-            "internal-lg-override-secret-0123456789"
-        );
-        assert_eq!(
-            config.gateway.internal_service_secret,
-            "gateway-internal-gi-override-secret-0123456"
         );
         assert_eq!(
             config.jwt.access.secret,

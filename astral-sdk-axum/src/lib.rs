@@ -364,13 +364,9 @@ where
                 .public_routes
                 .iter()
                 .any(|r| r.0 == method && r.1 == path)
-            || self
-                .state
-                .application
-                .manifest
-                .routes
-                .iter()
-                .any(|r| r.method == method && route_matches(&r.path, path))
+            || self.state.application.manifest.routes.iter().any(|route| {
+                methods_overlap(method, &route.method) && route_matches(&route.path, path)
+            })
         {
             return Err(AdapterError::RouterMismatch);
         }
@@ -565,6 +561,10 @@ fn header_identifier(headers: &HeaderMap, name: &'static str) -> Result<Option<S
         return Err(());
     }
     Ok(Some(value.to_owned()))
+}
+
+fn methods_overlap(public_method: &str, protected_method: &str) -> bool {
+    public_method == protected_method || (public_method == "HEAD" && protected_method == "GET")
 }
 
 fn route_matches(template: &str, path: &str) -> bool {

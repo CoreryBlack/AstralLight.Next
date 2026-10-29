@@ -207,7 +207,7 @@ mod tests {
             Ok(astral_db::SodCheckResult {
                 has_conflict: self.has_conflict,
                 conflict_policy: Some("separation".into()),
-                conflict_permission: Some("learn_course:delete".into()),
+                conflict_permission: Some("permission_rule:delete".into()),
                 conflict_type: Some("STATIC".into()),
             })
         }
@@ -385,7 +385,7 @@ mod tests {
             let error = service
                 .grant(
                     7,
-                    "learn_question",
+                    "permission_rule",
                     "read",
                     "ALLOW",
                     None,
@@ -411,7 +411,7 @@ mod tests {
         let outcome = svc
             .grant(
                 7,
-                "learn_question",
+                "permission_rule",
                 "read",
                 "ALLOW",
                 None,
@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(new.source_type, "MANUAL");
         assert_eq!(new.priority, 0);
         assert_eq!(new.card_id, 7);
-        assert_eq!(new.resource_type, "learn_question");
+        assert_eq!(new.resource_type, "permission_rule");
         assert_eq!(new.action_code, "read");
         assert_eq!(new.effect, "ALLOW");
         assert_eq!(repo.calls(), vec!["create:101:card=7"]);
@@ -441,7 +441,7 @@ mod tests {
 
         svc.grant(
             7,
-            "learn_question",
+            "permission_rule",
             "read",
             " allow ",
             None,
@@ -463,7 +463,7 @@ mod tests {
             let error = svc
                 .grant(
                     7,
-                    "learn_question",
+                    "permission_rule",
                     "read",
                     rejected,
                     None,
@@ -536,7 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn grant_rejects_action_not_registered_for_resource() {
-        // learn_question 已注册，但不含动作 "fly"
+        // permission_rule 已注册，但不含动作 "fly"
         let repo = Arc::new(FakeRuleRepository::new(Some(7)));
         let sod = grant_sod_validator();
         let svc = PersonalPermissionService::new(repo.clone(), sod);
@@ -544,7 +544,7 @@ mod tests {
         let error = svc
             .grant(
                 7,
-                "learn_question",
+                "permission_rule",
                 "fly",
                 "ALLOW",
                 None,
@@ -565,8 +565,8 @@ mod tests {
         for (resource, action) in [
             ("", "read"),
             ("   ", "read"),
-            ("learn_question", ""),
-            ("learn_question", "   "),
+            ("permission_rule", ""),
+            ("permission_rule", "   "),
         ] {
             let repo = Arc::new(FakeRuleRepository::new(Some(7)));
             let sod = grant_sod_validator();
@@ -594,7 +594,7 @@ mod tests {
         let outcome = svc
             .grant(
                 7,
-                "  learn_question  ",
+                "  permission_rule  ",
                 " read ",
                 "ALLOW",
                 Some(3),
@@ -605,11 +605,11 @@ mod tests {
 
         // source 只落归一化（trim）后的 resource/action；ALLOW-only 由既有测试覆盖
         let new = repo.last_new();
-        assert_eq!(new.resource_type, "learn_question");
+        assert_eq!(new.resource_type, "permission_rule");
         assert_eq!(new.action_code, "read");
         assert_eq!(new.priority, 3);
         // outcome 回显归一化持久化值（handler DTO 不回显原始入参）
-        assert_eq!(outcome.resource_type, "learn_question");
+        assert_eq!(outcome.resource_type, "permission_rule");
         assert_eq!(outcome.action_code, "read");
         assert_eq!(outcome.effect, "ALLOW");
         assert_eq!(outcome.priority, 3);
@@ -617,13 +617,13 @@ mod tests {
 
     #[test]
     fn registry_validation_rejects_known_unregistered_pairs_directly() {
-        let ok = validate_registry_resource_action(" learn_question ", " read ")
+        let ok = validate_registry_resource_action(" permission_rule ", " read ")
             .expect("registered pair must pass");
-        assert_eq!(ok, ("learn_question".to_string(), "read".to_string()));
+        assert_eq!(ok, ("permission_rule".to_string(), "read".to_string()));
 
         assert!(validate_registry_resource_action("no_such_resource", "read").is_err());
-        assert!(validate_registry_resource_action("learn_subject", "no_such_action").is_err());
+        assert!(validate_registry_resource_action("permission_rule", "no_such_action").is_err());
         assert!(validate_registry_resource_action("", "read").is_err());
-        assert!(validate_registry_resource_action("learn_subject", "  ").is_err());
+        assert!(validate_registry_resource_action("permission_rule", "  ").is_err());
     }
 }

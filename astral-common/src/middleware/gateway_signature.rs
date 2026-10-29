@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 use hmac::Mac;
 
 use crate::config::AppConfig;
+use crate::middleware::constant_time_eq;
 use crate::token_contract::PrincipalKind;
 
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
@@ -81,7 +82,6 @@ fn is_identity_empty_signed_transport(method: &str, path: &str) -> bool {
             | "/api/v1/auth/password/reset/token"
             | "/api/v1/auth/verification/send"
             | "/api/v1/auth/verification/verify"
-            | "/v1/app/users/login"
             | "/api/v1/auth/sessions/refresh"
             | "/api/v1/auth/sessions/switch-card"
             | "/api/v1/auth/sessions/logout"
@@ -358,18 +358,6 @@ pub async fn gateway_signature_middleware(
     }
 
     next.run(req).await
-}
-
-/// 常量时间字节比较
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
 }
 
 /// Shared gateway contract error shape. The verifier does not expose internal details.
@@ -732,7 +720,6 @@ mod tests {
             "/api/v1/auth/password/reset/token",
             "/api/v1/auth/verification/send",
             "/api/v1/auth/verification/verify",
-            "/v1/app/users/login",
             "/api/v1/auth/sessions/refresh",
             "/api/v1/auth/sessions/switch-card",
             "/api/v1/auth/sessions/logout",

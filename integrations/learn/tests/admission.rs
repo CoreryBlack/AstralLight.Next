@@ -45,7 +45,7 @@ fn request(facts: ResourceFacts) -> AuthorizationRequest {
         format!("/courses/{}/publish", facts.target_id)
     };
     AuthorizationRequest {
-        app_id: "astral-learn".into(),
+        app_id: "course-app".into(),
         key_id: "test-app".into(),
         manifest_digest: manifest().digest().unwrap(),
         revision: "1".into(),

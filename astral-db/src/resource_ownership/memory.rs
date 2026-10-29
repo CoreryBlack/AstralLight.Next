@@ -28,10 +28,6 @@
 //!   actor_card/actor_user 全量入键，绝不跨键命中；不拷贝任何客户端签名
 //!   租户/域头（resolver 本身也不信任它们）。键字符串有界，超界键一律
 //!   回落严格读。
-//! - **chat 变体完全排除**：`ChatConversation` / `ChatConversationWithoutOwner`
-//!   / `ChatMessage` 三类 lookup 读冻结仓 `astral-chat` 的表，其写者不受
-//!   hub 栅栏保护（frozen writers unguarded），缓存它们等于无纪元失效的
-//!   stale 授权面 —— 这三类完全不走记忆路径，保持既有严格 DB 读。
 //! - **容量有界**：entries 上限 + 估算字节上限 + TTL（仅 GC 语义，正确性
 //!   完全来自 token 栅栏）；超限拒绝安装（严格结果仍返回，只是不驻留）。
 //! - **回填 single-flight**：同键并发只放一个严格回源（scope 上限 1024、

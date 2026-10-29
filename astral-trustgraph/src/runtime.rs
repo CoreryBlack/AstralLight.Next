@@ -250,10 +250,8 @@ where
         "ResourceRegistry initialized: {} resource types",
         reg.count()
     );
-    // HMAC 审计缺口修复（2026-09-21）：from_files() 的默认角色是 Learn，
-    // 会跳过 gateway.hmac_secret 的强制校验——而本服务恰恰是验签 Gateway
-    // 身份头的授权核心。显式声明 Gateway 角色：hmac/internal 密钥缺失、
-    // 过短或占位值一律启动失败（fail-closed），绝不以占位密钥上线。
+    // Gateway 验签服务必须显式声明 Gateway 角色；角色缺失、过短或占位密钥
+    // 一律在配置加载时 fail-closed，不能回退到默认 loader。
     let config = Arc::new(AppConfig::from_files_for(
         "application",
         JwtValidationRole::Gateway,
@@ -2624,9 +2622,8 @@ mod tests {
 
 #[cfg(test)]
 mod config_role_tests {
-    /// HMAC 审计缺口修复的形状钉子：启动路径必须显式声明 Gateway 角色，
-    /// 绝不回退到 from_files() 的 Learn 默认（该默认跳过 gateway.hmac_secret
-    /// 强制校验，占位密钥会静默上线）。
+    /// 启动路径必须显式声明 Gateway 角色；不能回退到默认 loader，避免绕过
+    /// gateway.hmac_secret 的强制校验。
     #[test]
     fn startup_loads_config_with_explicit_gateway_role() {
         let source = include_str!("runtime.rs");
@@ -2640,7 +2637,7 @@ mod config_role_tests {
         );
         assert!(
             !source.contains("AppConfig::from_files(\"application\")"),
-            "the role-default Learn loader must not come back on the startup path"
+            "the default config loader must not come back on the startup path"
         );
     }
 }

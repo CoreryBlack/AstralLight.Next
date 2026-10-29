@@ -1654,7 +1654,7 @@ mod tests {
             request_id: REQUEST_ID,
             reviewer_id: REVIEWER_ID,
             rule_id: RULE_ID,
-            resource: "learn_course",
+            resource: "permission_rule",
             resource_id: None,
             action: "read",
             condition_json: None,
@@ -1752,7 +1752,7 @@ mod tests {
         assert_eq!(grant.card_id, CARD_ID);
         assert_eq!(grant.user_id, USER_ID);
         // 审批请求内容不携带 resource id：canonical 资源是显式类型级通配形态。
-        assert_eq!(grant.resource, "learn_course:*");
+        assert_eq!(grant.resource, "permission_rule:*");
         assert_eq!(grant.action, "read");
 
         // provenance：真实 reviewer/请求主键/rule entry/projection 事件绑定。
@@ -2052,7 +2052,7 @@ mod tests {
             card_id: CARD_ID,
             user_id: USER_ID,
             rule_id: RULE_ID,
-            resource: "learn_course",
+            resource: "permission_rule",
             resource_id: None,
             action: "read",
             condition_json: None,
@@ -2095,13 +2095,13 @@ mod tests {
     fn canonical_resource_key_preserves_object_scope_and_never_widens() {
         // 携带 resource_id 的 source 行必须保留对象作用域，绝不放宽成裸类型。
         assert_eq!(
-            canonical_resource_key("learn_course", Some(42)).unwrap(),
-            "learn_course:42"
+            canonical_resource_key("permission_rule", Some(42)).unwrap(),
+            "permission_rule:42"
         );
         // 无 id 的 source 行是显式类型级通配形态，而不是裸类型。
         assert_eq!(
-            canonical_resource_key("  learn_course  ", None).unwrap(),
-            "learn_course:*"
+            canonical_resource_key("  permission_rule  ", None).unwrap(),
+            "permission_rule:*"
         );
         // 空类型与携带 ':' 分隔符的类型无法安全组成 scoped key → fail-closed。
         assert!(matches!(
@@ -2129,9 +2129,9 @@ mod tests {
         .unwrap();
         match &add.delta {
             GrantDelta::Add { grant } => {
-                assert_eq!(grant.resource, "learn_course:42");
+                assert_eq!(grant.resource, "permission_rule:42");
                 assert_ne!(
-                    grant.resource, "learn_course",
+                    grant.resource, "permission_rule",
                     "object grant must not widen"
                 );
             }
@@ -2149,7 +2149,7 @@ mod tests {
         )
         .unwrap();
         match &updated.delta {
-            GrantDelta::Update { grant, .. } => assert_eq!(grant.resource, "learn_course:42"),
+            GrantDelta::Update { grant, .. } => assert_eq!(grant.resource, "permission_rule:42"),
             other => panic!("expected UPDATE delta, got {other:?}"),
         }
 
@@ -2178,9 +2178,9 @@ mod tests {
         .unwrap();
         match &add.delta {
             GrantDelta::Add { grant } => {
-                assert_eq!(grant.resource, "learn_course:7");
+                assert_eq!(grant.resource, "permission_rule:7");
                 assert_ne!(
-                    grant.resource, "learn_course",
+                    grant.resource, "permission_rule",
                     "object grant must not widen"
                 );
             }
@@ -2198,7 +2198,7 @@ mod tests {
         )
         .unwrap();
         match &update.delta {
-            GrantDelta::Update { grant, .. } => assert_eq!(grant.resource, "learn_course:7"),
+            GrantDelta::Update { grant, .. } => assert_eq!(grant.resource, "permission_rule:7"),
             other => panic!("expected UPDATE delta, got {other:?}"),
         }
     }
@@ -2394,7 +2394,7 @@ mod tests {
                 assert_eq!(*expected_revision, head.entry.revision);
                 assert_eq!(grant.revision, expected);
                 assert_eq!(grant.action, "write");
-                assert_eq!(grant.resource, "learn_course:*");
+                assert_eq!(grant.resource, "permission_rule:*");
                 // ALLOW-only 纵深防御：UPDATE 产出恒为显式 ALLOW，不继承 head。
                 assert_eq!(grant.effect, GrantEffect::Allow);
                 assert_eq!(grant.provenance.operation_id, DIRECT_OPERATION);
@@ -2906,7 +2906,7 @@ mod tests {
             CARD_ID,
             TENANT_ID,
             "BASE",
-            "learn_course",
+            "permission_rule",
             "read",
             ("", ""),
         )
@@ -3270,7 +3270,7 @@ mod tests {
             CARD_ID,
             TENANT_ID,
             "BASE",
-            "learn_course_v2",
+            "user_profile",
             "read",
             ("2026-01-01", "2026-03-01T00:00:00"),
         );
@@ -3299,7 +3299,7 @@ mod tests {
             } => {
                 assert_eq!(*expected_revision, head.entry.revision);
                 assert_eq!(grant.revision.value(), head.entry.revision.value() + 1);
-                assert_eq!(grant.resource, "learn_course_v2:*");
+                assert_eq!(grant.resource, "user_profile:*");
                 assert_eq!(grant.action, "read");
                 // expires_at exclusive 边界：日期解析为 UTC 零点。
                 let from = time::PrimitiveDateTime::new(
@@ -3870,7 +3870,7 @@ mod tests {
 
     #[test]
     fn delegation_add_draft_is_deterministic_and_binds_delegation_provenance() {
-        let facts = delegation_facts_test("learn_course", "read");
+        let facts = delegation_facts_test("permission_rule", "read");
         let projection = projection(5, 0);
         let first =
             build_delegation_add_draft(&facts, "delegation:create:7001", 10, &projection, "e1")
@@ -3931,7 +3931,7 @@ mod tests {
     #[test]
     fn delegation_contribution_event_ids_fork_by_kind_delegation_and_tenant() {
         let op = "req-fixed";
-        let facts = delegation_facts_test("learn_course", "read");
+        let facts = delegation_facts_test("permission_rule", "read");
         let add =
             derive_delegation_contribution_event_id(op, &facts, DelegationContributionKind::Add)
                 .unwrap();
@@ -3952,14 +3952,14 @@ mod tests {
         );
 
         // 不同委托/租户/operation 必然分叉。
-        let mut other = delegation_facts_test("learn_course", "read");
+        let mut other = delegation_facts_test("permission_rule", "read");
         other.delegation_id = DEL_DELEGATION_ID + 1;
         assert_ne!(
             add,
             derive_delegation_contribution_event_id(op, &other, DelegationContributionKind::Add)
                 .unwrap()
         );
-        let mut cross_tenant = delegation_facts_test("learn_course", "read");
+        let mut cross_tenant = delegation_facts_test("permission_rule", "read");
         cross_tenant.tenant_id += 1;
         assert_ne!(
             add,
@@ -4071,7 +4071,7 @@ mod tests {
 
         // 分叉的 operation id 穿透 DeltaEventIdentity 后事件号同样分叉：
         // 同一代次重试得到同一 contribution event id，不同代次的事件号不同。
-        let facts = delegation_facts_test("learn_course", "read");
+        let facts = delegation_facts_test("permission_rule", "read");
         let event_first = derive_delegation_contribution_event_id(
             &first_update,
             &facts,
@@ -4146,7 +4146,7 @@ mod tests {
     /// 但派生自不同的域分离 helper，输出永不混同。
     #[test]
     fn delegation_contribution_event_id_is_never_the_grant_identity() {
-        let facts = delegation_facts_test("learn_course", "read");
+        let facts = delegation_facts_test("permission_rule", "read");
         let event_id = derive_delegation_contribution_event_id(
             "op-grant-vs-event",
             &facts,
@@ -4169,10 +4169,10 @@ mod tests {
 
     #[test]
     fn delegation_update_draft_keeps_identity_carries_cas_successor_and_before_pair() {
-        let old_facts = delegation_facts_test("learn_course", "read");
+        let old_facts = delegation_facts_test("permission_rule", "read");
         let head = delegation_head_for(&old_facts, 3);
         // 更新只改可变属性（resource/action/effective_until）；身份不变。
-        let new_facts = delegation_facts_test("learn_quiz", "write");
+        let new_facts = delegation_facts_test("permission_rule", "write");
         let projection = projection(6, 0);
         let draft = build_delegation_update_draft(
             &new_facts,
@@ -4197,7 +4197,7 @@ mod tests {
                 assert_eq!(grant.effect, GrantEffect::Allow);
                 assert_eq!(grant.source_kind, GrantSourceKind::Delegation);
                 assert_eq!(grant.grant_id, head.grant_id);
-                assert_eq!(grant.resource, "learn_quiz");
+                assert_eq!(grant.resource, "permission_rule");
                 assert_eq!(grant.action, "write");
                 assert_eq!(grant.validity.expires_at, Some(DEL_EXPIRES));
             }
@@ -4250,7 +4250,7 @@ mod tests {
             other => panic!("expected UPDATE delta, got {other:?}"),
         }
 
-        let delegation_facts = delegation_facts_test("learn_course", "read");
+        let delegation_facts = delegation_facts_test("permission_rule", "read");
         let delegation_head = delegation_head_for(&delegation_facts, 3);
         let delegation_update = build_delegation_update_draft(
             &delegation_facts,
@@ -4308,7 +4308,7 @@ mod tests {
 
     #[test]
     fn delegation_revoke_draft_is_revoked_tombstone_anchored_to_before_image() {
-        let facts = delegation_facts_test("learn_course", "read");
+        let facts = delegation_facts_test("permission_rule", "read");
         let head = delegation_head_for(&facts, 2);
         let projection = projection(7, 1);
         let draft = build_delegation_revoke_draft(
@@ -4342,7 +4342,7 @@ mod tests {
     /// 账本事件维度，parent 只提供 generation/fence 绑定。
     #[test]
     fn delegation_parent_projection_event_is_distinct_from_contribution_event() {
-        let facts = delegation_facts_test("learn_course", "read");
+        let facts = delegation_facts_test("permission_rule", "read");
         let projection = projection(8, 0);
         let draft = build_delegation_add_draft(
             &facts,
@@ -4398,7 +4398,7 @@ mod tests {
         // resource 移动（type:1 → type:2 同形）：旧对象授权被移除 → true。
         assert!(update_authorization_content_changed(
             &payload,
-            "learn_quiz:*",
+            "user_profile:*",
             &payload.action,
             &payload.validity,
         ));
@@ -4533,7 +4533,7 @@ mod tests {
                     CARD_ID,
                     TENANT_ID,
                     "BASE",
-                    "learn_quiz",
+                    "user_profile",
                     "read",
                     ("", ""),
                 ),
@@ -4547,7 +4547,7 @@ mod tests {
                     CARD_ID,
                     TENANT_ID,
                     "BASE",
-                    "learn_course",
+                    "permission_rule",
                     "write",
                     ("", ""),
                 ),
@@ -4561,7 +4561,7 @@ mod tests {
                     CARD_ID,
                     TENANT_ID,
                     "BASE",
-                    "learn_course",
+                    "permission_rule",
                     "read",
                     ("2026-01-01", "2026-12-31"),
                 ),
@@ -4604,15 +4604,15 @@ mod tests {
 
         // delegation：no-op → false；resource/action/上界变化 → true；provenance-only
         // （仅 operation/actor 不同）→ false。
-        let delegation_old = delegation_facts_test("learn_course", "read");
+        let delegation_old = delegation_facts_test("permission_rule", "read");
         let delegation_head = delegation_head_for(&delegation_old, 3);
         for (facts, expected) in [
-            (delegation_facts_test("learn_course", "read"), false),
-            (delegation_facts_test("learn_quiz", "write"), true),
+            (delegation_facts_test("permission_rule", "read"), false),
+            (delegation_facts_test("permission_rule", "write"), true),
             (
                 DelegationLedgerFacts {
                     expires_at_unix: DEL_EXPIRES - 1,
-                    ..delegation_facts_test("learn_course", "read")
+                    ..delegation_facts_test("permission_rule", "read")
                 },
                 true,
             ),
@@ -4671,7 +4671,7 @@ mod tests {
         assert!(!ruleset.invalidates_published_evidence);
 
         let delegation = build_delegation_add_draft(
-            &delegation_facts_test("learn_course", "read"),
+            &delegation_facts_test("permission_rule", "read"),
             "op-add-unaffected",
             10,
             &projection(3, 0),

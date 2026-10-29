@@ -1589,7 +1589,7 @@ mod tests {
         let payload = validate_and_build_payload(
             &actor(20),
             &OrgScopeSubmitInput::Grant {
-                seed: seed("learn_course"),
+                seed: seed("permission_rule"),
                 parent_grant: parent_ref(),
             },
         )
@@ -1606,14 +1606,14 @@ mod tests {
         // receiving tenant 来自签名 actor；scope resource tenant 来自显式种子。
         assert_eq!(*receiving_tenant_id, 20);
         assert_eq!(scope.resource_tenant_id, 20);
-        assert_eq!(scope.resource, "learn_course");
+        assert_eq!(scope.resource, "permission_rule");
         assert_eq!(parent_grant.tenant_id, 30);
         assert_eq!(parent_grant.revision, 2);
     }
 
     #[test]
     fn grant_payload_preserves_personal_subject() {
-        let mut personal_seed = seed("learn_course");
+        let mut personal_seed = seed("permission_rule");
         personal_seed.subject = Some(OrgSubject {
             user_id: 7,
             card_id: 70,
@@ -1640,7 +1640,7 @@ mod tests {
 
     #[test]
     fn root_payload_rejects_personal_subject() {
-        let mut personal_seed = seed("learn_course");
+        let mut personal_seed = seed("permission_rule");
         personal_seed.subject = Some(OrgSubject {
             user_id: 7,
             card_id: 70,
@@ -1659,7 +1659,7 @@ mod tests {
     /// 绝不被 actor tenant 覆写；DB 在审批事务内用父 grant 包含性证明。
     #[test]
     fn grant_seed_resource_tenant_is_preserved_not_replaced_by_actor_tenant() {
-        let mut cross_tenant_seed = seed("learn_course");
+        let mut cross_tenant_seed = seed("permission_rule");
         cross_tenant_seed.resource_tenant_id = 30;
         let payload = validate_and_build_payload(
             &actor(20),
@@ -1688,7 +1688,7 @@ mod tests {
     /// 下发，不能由根请求隐式代理外部资源属主。
     #[test]
     fn root_init_rejects_seed_resource_tenant_outside_actor_tenant() {
-        let mut foreign_seed = seed("learn_course");
+        let mut foreign_seed = seed("permission_rule");
         foreign_seed.resource_tenant_id = 30;
         let error = validate_and_build_payload(
             &actor(20),
@@ -1703,7 +1703,7 @@ mod tests {
 
     #[test]
     fn root_grant_rejects_seed_resource_tenant_outside_actor_tenant() {
-        let mut foreign_seed = seed("learn_course");
+        let mut foreign_seed = seed("permission_rule");
         foreign_seed.resource_tenant_id = 30;
         let error = validate_and_build_payload(
             &actor(20),
@@ -1720,7 +1720,7 @@ mod tests {
         let payload = validate_and_build_payload(
             &actor(20),
             &OrgScopeSubmitInput::RootGrant {
-                seed: seed("learn_course"),
+                seed: seed("permission_rule"),
             },
         )
         .expect("self-sourced ROOT_GRANT seed must build");
@@ -1760,7 +1760,7 @@ mod tests {
         let payload = validate_and_build_payload(
             &actor(20),
             &OrgScopeSubmitInput::RootInit {
-                seeds: vec![seed("learn_course")],
+                seeds: vec![seed("permission_rule")],
             },
         )
         .expect("single seed root init must build");
@@ -1780,7 +1780,7 @@ mod tests {
     fn inverted_validity_window_is_rejected() {
         let input = SeedInput {
             resource_tenant_id: 20,
-            resource: "learn_course".to_owned(),
+            resource: "permission_rule".to_owned(),
             action: "read".to_owned(),
             domain_id: Some(5),
             not_before: Some(200),
@@ -1804,7 +1804,7 @@ mod tests {
         let error = validate_and_build_payload(
             &actor(20),
             &OrgScopeSubmitInput::Grant {
-                seed: seed("learn_course"),
+                seed: seed("permission_rule"),
                 parent_grant: OrgGrantRef {
                     tenant_id: 0,
                     grant_id: parent_ref().grant_id,

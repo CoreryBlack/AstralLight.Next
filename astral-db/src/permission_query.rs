@@ -14,37 +14,12 @@
 //!    verified 记录参与派生；`NotReady`/`Corrupt` 一律 fail-closed。
 //!
 //! 进程内 evidence 缓存：本模块两处卡级 evidence 读取统一经
-//! [`crate::evidence_cache::cached_load_published_card_grant_evidence`] ——
-//! 命中前提是"指针对牌"（当前指针版本组 + 共享缓存时代与填充时刻逐项相等，
-//! 命中前复读一次栅栏未漂移）；miss/漂移回源严格 reader 取数。正确性论证
-//! 与失效语义见 `crate::evidence_cache` 模块文档。
-//! 2. 读侧纵深防御（对齐旧读链 SQL 的 `rs.enabled = 1` 防线）：RULE_SET 来源
-//!    的生效 grant 在读取时再按 `rule_set.enabled = 1` + 租户戳过滤；绑定引用
-//!    中存在缺失/禁用/租户戳不匹配的 rule set 时拒绝信任缓存。发布侧对
-//!    "入账后 rule_set 被禁用"目前没有运行时防线（仓内不存在 enabled 置 0 的
-//!    写路径，该形状只能来自 legacy/外部写入），此过滤是唯一的防线；
-//!    【后续项】发布侧应在 rule_set 禁用流转时对已入账贡献做 REMOVE/REVOKE
-//!    物化，读侧过滤届时退化为纯纵深防御。
-//!
-//! Cache-Aside（`find_effective_permissions_cached`）：对齐 Java `findSnapshot`
-//! 缓存语义 —— Redis `perm:card:[tenantId:]cardId` Hash，field
-//! `snapshot:{resourceType}:{actionCode}`；缓存 envelope（schema_version=6，
-//! also the shared authorization edition）
-//! 携带 evidence 各已发布聚合的版本组（generation + revoke_fence）、卡作用域
-//! 未发布 delta 位（`card_source_pending`，撤销类变更的越权窗口内全部 miss）
-//! 作栅栏，任一聚合发布推进即自动 miss；同时携带共享缓存时代
-//! （`crate::cache_epoch`，整库恢复/重建后运维换时代 → 携带旧时代的条目全部
-//! miss）；空授权仍写 metadata-only 合法命中；evidence `NotReady`/`Corrupt`
-//! 一律空结果 fail-closed，绝不写缓存。
-//!
-//! **Redis 退役（P3 拆线，本批次接缝）**：该 Cache-Aside 仅在
-//! `ASTRAL_REDIS_PROJECTION_COMPAT` 显式开启（`astral-common` compat adapter，
-//! default-off）时读写 Redis；默认路径直接走 evidence 读链（进程内 evidence
-//! 缓存 + 严格 reader 回源），键族与 envelope 形状原样保留（旧 pub API 不隐式
-//! 删除）。缓存键保持卡级 lens 超集契约：`(tenant_id, card_id)` 键控 +
-//! user/domain 由 engine 在 `effective_grants` 上二次收窄（tenant 隔离由键与
-//! reader 的租户戳校验双重承担，user/domain 收窄语义见
-//! `crate::evidence_cache` lens 契约），不存在跨租户/跨域命中面。
+//! [`crate::evidence_cache::cached_load_published_card_grant_evidence`] ——命中前
+//! 逐项复读当前指针版本组、pending delta 位及严格读栅栏；miss/漂移回源唯一的
+//! 来源是严格 published-evidence reader。正确性论证与失效语义见
+//! `crate::evidence_cache` 模块文档。
+//! 2. 读侧纵深防御：RULE_SET 来源的 grant 在读取时按 `rule_set.enabled = 1` 和
+//!    租户戳过滤；缺失、禁用或租户戳不匹配的 rule set 不参与权限派生。
 //!
 //! 【上线灰度观察项】登录权限列表可能变宽：evidence 的生效集合包含
 //! APPROVAL / DELEGATION / SYSTEM 来源（旧读链只看卡规则快照 + 规则集快照，
@@ -57,19 +32,15 @@ use astral_types::{
     BindingLayer, DomainScopeRequirement, GrantSourceKind, PublishedCardAuthorization,
     PublishedCardEvidenceScope,
 };
-#[cfg(feature = "redis-compat")]
-use redis::AsyncCommands;
 use sqlx::{MySqlPool, QueryBuilder};
-#[cfg(feature = "redis-compat")]
-use time::OffsetDateTime;
 
 use crate::authorization_projection_repository::AuthorizationEvidenceError;
 use crate::evidence_cache::cached_load_published_card_grant_evidence;
 use crate::DbError;
 
 mod fence;
+pub(crate) use fence::evidence_fence_baseline;
 use fence::{decode_pointer_fence_rows, PointerFenceSqlRow, POINTER_FENCE_VERSIONS_SQL};
-pub(crate) use fence::{evidence_fence_baseline, evidence_manifest_versions};
 pub use fence::{CardScopeFenceSnapshot, PermissionCacheManifestVersion};
 
 /// 权限授予记录（resource_type 由 resource_key 拆分，对齐 Java `parseResourceKey`）。
@@ -98,49 +69,6 @@ fn parse_resource_type(resource_key: &str) -> String {
     }
 }
 
-#[cfg(feature = "redis-compat")]
-fn snapshot_window_is_active(
-    valid_from_ts: Option<i64>,
-    valid_to_ts: Option<i64>,
-    now_secs: i64,
-) -> bool {
-    valid_from_ts.is_none_or(|valid_from| now_secs >= valid_from)
-        && valid_to_ts.is_none_or(|valid_to| now_secs <= valid_to)
-}
-
-/// Deprecated compatibility wrapper for the former snapshot-named permission query.
-///
-/// The implementation reads only canonical published evidence, matching the
-/// source path used by [`find_effective_permissions_cached`]. It does not read
-/// legacy snapshot tables or raw authorization sources.
-#[deprecated(
-    since = "0.1.0",
-    note = "the query reads published evidence, not snapshots; use find_effective_permissions_cached"
-)]
-pub async fn find_effective_permissions_from_snapshot(
-    pool: &MySqlPool,
-    card_id: i64,
-) -> Result<Vec<PermissionGrantRow>, DbError> {
-    let Some(tenant_id) = load_single_card_tenant(pool, card_id).await? else {
-        return Ok(Vec::new());
-    };
-    Ok(
-        find_effective_permissions_for_tenant(pool, tenant_id, card_id)
-            .await?
-            .grants,
-    )
-}
-
-/// 一次有效权限读取的产物：授权行 + 证据版本组（缓存栅栏输入）。
-///
-/// `manifest_versions` 为空当且仅当本次读取未成功消费 Ready 证据
-/// （fail-closed 路径），调用方据此跳过缓存写回。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EffectivePermissionRead {
-    grants: Vec<PermissionGrantRow>,
-    manifest_versions: Vec<PermissionCacheManifestVersion>,
-}
-
 /// 有效权限的核心读取：卡级 published evidence → 生效 grant 映射。
 ///
 /// fail-closed 语义（对齐 [`load_card_permission_summaries`] 先例）：
@@ -154,7 +82,7 @@ async fn find_effective_permissions_for_tenant(
     pool: &MySqlPool,
     tenant_id: i64,
     card_id: i64,
-) -> Result<EffectivePermissionRead, DbError> {
+) -> Result<Vec<PermissionGrantRow>, DbError> {
     // 卡级 lens：不按 user 收窄、不限 domain（对齐 legacy 卡级列表语义）。
     let scope = PublishedCardEvidenceScope {
         tenant_id,
@@ -172,10 +100,7 @@ async fn find_effective_permissions_for_tenant(
                 detail = detail.as_str(),
                 "published card evidence not ready, returning safe permission miss"
             );
-            return Ok(EffectivePermissionRead {
-                grants: Vec::new(),
-                manifest_versions: Vec::new(),
-            });
+            return Ok(Vec::new());
         }
         Err(AuthorizationEvidenceError::Corrupt(detail)) => {
             tracing::warn!(
@@ -183,10 +108,7 @@ async fn find_effective_permissions_for_tenant(
                 detail = detail.as_str(),
                 "published card evidence corrupt, returning safe permission miss (reconciliation required)"
             );
-            return Ok(EffectivePermissionRead {
-                grants: Vec::new(),
-                manifest_versions: Vec::new(),
-            });
+            return Ok(Vec::new());
         }
         // DB 传输失败响亮上抛；scope 由本函数构造，InvalidRequest 只可能是
         // 编程错误，同样不允许静默降级为空授权视图。
@@ -206,10 +128,7 @@ async fn find_effective_permissions_for_tenant(
             error = ?contract_error,
             "published card evidence failed contract validation, returning safe permission miss"
         );
-        return Ok(EffectivePermissionRead {
-            grants: Vec::new(),
-            manifest_versions: Vec::new(),
-        });
+        return Ok(Vec::new());
     }
 
     // 读侧纵深防御（对齐旧读链 SQL 的 `rs.enabled = 1` + 租户戳防线）：
@@ -238,18 +157,10 @@ async fn find_effective_permissions_for_tenant(
                 error = ?shape_error,
                 "published card evidence shape cannot produce permission rows, returning safe permission miss"
             );
-            return Ok(EffectivePermissionRead {
-                grants: Vec::new(),
-                manifest_versions: Vec::new(),
-            });
+            return Ok(Vec::new());
         }
     };
-    let manifest_versions = evidence_manifest_versions(&evidence)
-        .map_err(|error| DbError::Mapping(error.to_string()))?;
-    Ok(EffectivePermissionRead {
-        grants,
-        manifest_versions,
-    })
+    Ok(grants)
 }
 
 /// Ready 证据内部使其授权行不可安全派生的形状矛盾（Corrupt 族，整卡不产出）。
@@ -358,65 +269,6 @@ fn enabled_rule_set_row_is_allowed(
 /// MySQL NULL 安全等值（`<=>`）的 Rust 语义：`None` 只与 `None` 相等。
 fn tenant_stamp_matches(left: Option<i64>, right: Option<i64>) -> bool {
     left == right
-}
-
-/// 绑定引用行：`(rule_set_id, ref_tenant_id, rule_set_enabled, rule_set_tenant_id)`。
-#[cfg(feature = "redis-compat")]
-type RuleSetBindingRow = (i64, Option<i64>, Option<i8>, Option<i64>);
-
-/// 缓存信任门禁：绑定引用中不可信 rule set 的 id 清单（升序去重）。
-///
-/// 引用对应的 rule set 缺失、`enabled != 1`、rule set 租户戳与引用租户戳
-/// 不匹配、或引用租户戳与卡租户不匹配时该引用不可信。缓存载荷不携带
-/// per-grant 的 rule set 来源，存在任何不可信引用时必须整体拒绝缓存
-/// （对齐旧链 `rule_set_active` 缓存守卫），回退 evidence 读侧过滤。
-#[cfg(feature = "redis-compat")]
-async fn load_unsafe_rule_set_binding_ids(
-    pool: &MySqlPool,
-    card_id: i64,
-    card_tenant_id: i64,
-) -> Result<Vec<i64>, DbError> {
-    let rows: Vec<RuleSetBindingRow> = sqlx::query_as(
-        "SELECT crsrf.rule_set_id, crsrf.tenant_id, rs.enabled, rs.tenant_id \
-         FROM card_rule_set_ref crsrf \
-         LEFT JOIN rule_set rs ON rs.rule_set_id = crsrf.rule_set_id \
-         WHERE crsrf.card_id = ?",
-    )
-    .bind(card_id)
-    .fetch_all(pool)
-    .await?;
-
-    let mut unsafe_ids: Vec<i64> = rows
-        .into_iter()
-        .filter(|(_, ref_tenant_id, rule_set_enabled, rule_set_tenant_id)| {
-            rule_set_binding_is_unsafe(
-                *ref_tenant_id,
-                *rule_set_enabled,
-                *rule_set_tenant_id,
-                card_tenant_id,
-            )
-        })
-        .map(|(rule_set_id, _, _, _)| rule_set_id)
-        .collect();
-    unsafe_ids.sort_unstable();
-    unsafe_ids.dedup();
-    Ok(unsafe_ids)
-}
-
-/// 单条绑定引用是否不可信（纯逻辑）：rule set 缺失（enabled 为 NULL）、
-/// `enabled != 1`、引用租户戳与卡租户不匹配、或 rule set 租户戳与引用租户戳
-/// 不匹配，均视为不可信（对齐旧读链 SQL 的 `rs.enabled = 1` 与两级
-/// `tenant_id <=>` 纵深防御）。
-#[cfg(feature = "redis-compat")]
-fn rule_set_binding_is_unsafe(
-    ref_tenant_id: Option<i64>,
-    rule_set_enabled: Option<i8>,
-    rule_set_tenant_id: Option<i64>,
-    card_tenant_id: i64,
-) -> bool {
-    rule_set_enabled != Some(1)
-        || !tenant_stamp_matches(ref_tenant_id, Some(card_tenant_id))
-        || !tenant_stamp_matches(rule_set_tenant_id, ref_tenant_id)
 }
 
 /// 单卡租户定位（evidence scope 必需输入；不是授权事实）。
@@ -673,60 +525,6 @@ where
     (!joined.is_empty()).then_some(joined)
 }
 
-// ===== 读侧投影缓存（对齐 Java PermissionSnapshotService.findSnapshot Cache-Aside）=====
-
-// 旧 head/snapshot 读链的 `ProjectionStatus`（head READY + source==projected 门禁）
-// 随本批次读链切换移除：evidence 读链的发布事实以 `authorization_projection_current`
-// 指针版本组 + 卡作用域未发布 delta 位为准（见下方 envelope v6），不再读取
-// `authorization_projection_head`。
-
-/// 读侧投影缓存 key（对齐 Java PermissionCacheService：`perm:card:[tenantId:]cardId`）。
-pub fn permission_cache_key(card_id: i64, tenant_id: Option<i64>) -> String {
-    match tenant_id {
-        Some(tid) => format!("perm:card:{tid}:{card_id}"),
-        None => format!("perm:card:{card_id}"),
-    }
-}
-
-// 旧 v2 兼容函数 `is_cache_version_compatible`（head 三版本逐项匹配）随旧
-// 读链一并退役：envelope 兼容判定见 [`cache_envelope_is_compatible`]。
-
-/// The effective-permission envelope was already schema 6 before the unified
-/// authorization edition. The edition wiring keeps that number but does not
-/// relabel old bytes: non-empty legacy entries carrying old publication-seal
-/// versions fail deserialization, while an empty metadata-only shape can remain
-/// syntactically decodable and is still subject to the pending, fence, epoch,
-/// and read-gate checks. A rollout should flush the old permission-cache family.
-#[cfg(feature = "redis-compat")]
-const EFFECTIVE_PERMISSION_CACHE_SCHEMA: i64 = astral_types::AUTHORIZATION_EDITION as i64;
-#[cfg(feature = "redis-compat")]
-const CACHE_METADATA_FIELD: &str = "__metadata";
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[cfg(feature = "redis-compat")]
-struct PermissionCacheEnvelope {
-    schema_version: i64,
-    /// 按 `(aggregate_type, aggregate_id)` 升序的版本组；任一聚合发布推进
-    /// （generation 或 revoke_fence 变化）即令旧缓存失效。
-    manifest_versions: Vec<PermissionCacheManifestVersion>,
-    /// 现场 pending 为 true 时缓存不得命中；填充基线只来自严格 reader。
-    card_source_pending: bool,
-    /// 写入时刻的共享缓存时代（`crate::cache_epoch`；键格式不变，Java 契约
-    /// 键不受影响）。整库恢复/重建后运维 `DEL astral:auth:cache_epoch` 换
-    /// 时代，携带旧时代的条目在读取侧 epoch 不等 → miss 重写。
-    cache_epoch: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[cfg(feature = "redis-compat")]
-struct PermissionCacheEntry {
-    #[serde(flatten)]
-    envelope: PermissionCacheEnvelope,
-    effect: String,
-    valid_from_ts: Option<i64>,
-    valid_to_ts: Option<i64>,
-}
-
 /// 卡作用域（含 aggregate-wide `NULL` card delta）撤权类未发布 delta 轻探针
 /// （无锁、单条 SQL；缓存命中校验的 pending 位输入）。与严格 reader 的
 /// freshness 门同谓词：存在撤权类（REMOVE/REVOKE 或行级
@@ -778,9 +576,9 @@ fn log_e1_fence_observation(
 
 /// 轻读卡作用域缓存栅栏快照（缓存命中校验的栅栏输入；无锁）。
 ///
-/// 该读不是授权事实：进程内 evidence 缓存（`crate::evidence_cache`）与 Redis
-/// envelope 的命中校验都以它为对牌基准——快照逐字段相等（版本组含集合形状
-/// 与 pending 位）才允许命中，且命中前还会复核一次栅栏未漂移；miss 时一律
+/// 该读不是授权事实：进程内 evidence 缓存（`crate::evidence_cache`）的命中校验
+/// 以它为对牌基准——快照逐字段相等（版本组含集合形状与 pending 位）才允许
+/// 命中，且命中前还会复核一次栅栏未漂移；miss 时一律
 /// 回到严格 evidence reader（锁定 + 整链校验 + source-freshness 门）取数。
 pub async fn load_card_scope_fence_snapshot(
     pool: &MySqlPool,
@@ -846,55 +644,11 @@ pub async fn load_card_scope_fence_snapshot(
     })
 }
 
-/// 缓存版本兼容性：schema 一致、版本组与当前指针逐项完全匹配、卡作用域无
-/// 未发布 delta（pending 位一致）、且共享缓存时代一致（当前时代未知 = Redis
-/// 降级 → 跳过 epoch 子校验，其余栅栏照常）。
-#[cfg(feature = "redis-compat")]
-fn cache_envelope_is_compatible(
-    envelope: &PermissionCacheEnvelope,
-    snapshot: &CardScopeFenceSnapshot,
-    current_epoch: Option<&str>,
-) -> bool {
-    envelope.schema_version == EFFECTIVE_PERMISSION_CACHE_SCHEMA
-        && snapshot.is_valid()
-        && !snapshot.card_source_pending
-        && envelope.manifest_versions == snapshot.manifest_versions
-        && envelope.card_source_pending == snapshot.card_source_pending
-        && crate::cache_epoch::cache_epoch_matches(current_epoch, envelope.cache_epoch.as_deref())
-}
-
-#[cfg(feature = "redis-compat")]
-fn permission_cache_entry_is_readable(
-    entry: &PermissionCacheEntry,
-    metadata: &PermissionCacheEnvelope,
-    now_secs: i64,
-) -> bool {
-    entry.effect == "ALLOW"
-        && entry.envelope == *metadata
-        && snapshot_window_is_active(entry.valid_from_ts, entry.valid_to_ts, now_secs)
-}
-
-/// 读卡有效权限（Cache-Aside，对齐 Java `PermissionSnapshotService.findSnapshot`）。
+/// Read effective permissions exclusively from CURRENT V6 published evidence.
 ///
-/// 读链语义（本批次起为 evidence 读链，替代旧 head/snapshot 读链）：
-/// - 租户缺失/非正 → 空 vec fail-closed（无法构造 evidence scope）；
-/// - **Redis-free 默认路径（P3 拆线）**：compat adapter 未显式开启时跳过
-///   Redis Cache-Aside（`perm:card:*`）——不建连、不读写、不加载缓存信任
-///   门禁（那是 Redis 载荷的按来源过滤防线），直接走 evidence 读链；
-///   进程内 evidence 缓存在 [`cached_load_published_card_grant_evidence`]
-///   内部，命中前提是"指针对牌"双读 + 共享时代，TTL 只是驻留上限（绝不以
-///   TTL alone 作为跨节点证明），miss 严格 reader 回源，失效通道 suspect 时
-///   存疑禁旧 evidence（`evidence_cache` 读取门）；
-/// - **compat adapter（显式开启）**：恢复旧 Redis hash 读/写与缓存信任门禁
-///   （读写仅 explicit enabled），其余栅栏语义不变；
-/// - 缓存信任门禁（compat 路径）：绑定引用存在缺失/禁用/租户戳不匹配的
-///   rule set 时拒绝信任缓存（载荷无 per-grant rule set 来源），直接走
-///   evidence 读侧过滤；
-/// - 缓存栅栏 = 当前指针版本组 + 卡作用域未发布 delta 位 + 共享缓存时代
-///   （envelope v6）；任一聚合发布推进、source 提交未发布（撤销类越权窗口）
-///   或换时代即 miss；
-/// - evidence `NotReady`/`Corrupt` → 空 vec fail-closed 且不写缓存；
-/// - Redis 不可用时直接读取同一 published-evidence 来源（语义不变）。
+/// The process-local evidence L1 is fenced by current pointer versions, pending
+/// source deltas, read-before/read-after checks, and evidence validity windows.
+/// A miss or fence drift falls back only to the strict published-evidence reader.
 pub async fn find_effective_permissions_cached(
     pool: &MySqlPool,
     card_id: i64,
@@ -906,215 +660,7 @@ pub async fn find_effective_permissions_cached(
         );
         return Ok(Vec::new());
     };
-
-    // Redis-free 默认路径（compat 关闭）：键 `perm:card:*` 的读/写整体旁路，
-    // 直接走 evidence 读链（与 Redis 不可用时的回退路径同源同实现）。
-    if !crate::eligibility::redis_projection_compat_enabled() {
-        return Ok(
-            find_effective_permissions_for_tenant(pool, tenant_id, card_id)
-                .await?
-                .grants,
-        );
-    }
-
-    // redis-compat feature 未编译：compat 门为真的配置已被启动期集中校验拒绝
-    // （astral-common validate_runtime_safety）；此处兜底走同源 evidence 读链
-    // （与 Redis 不可用时的回退路径同实现），默认路径零 redis 类型编译。
-    #[cfg(feature = "redis-compat")]
-    {
-        find_effective_permissions_cached_compat(pool, card_id, tenant_id).await
-    }
-    #[cfg(not(feature = "redis-compat"))]
-    {
-        Ok(
-            find_effective_permissions_for_tenant(pool, tenant_id, card_id)
-                .await?
-                .grants,
-        )
-    }
-}
-
-/// compat 路径（仅 redis-compat feature 编译）：旧 Redis hash 读/写与缓存信任
-/// 门禁，语义与拆线前逐行一致（源码文本断言测试依赖 compat 门与本段的前后序）。
-#[cfg(feature = "redis-compat")]
-async fn find_effective_permissions_cached_compat(
-    pool: &MySqlPool,
-    card_id: i64,
-    tenant_id: i64,
-) -> Result<Vec<PermissionGrantRow>, DbError> {
-    let Some(mut conn) = crate::eligibility::redis_conn().await else {
-        return Ok(
-            find_effective_permissions_for_tenant(pool, tenant_id, card_id)
-                .await?
-                .grants,
-        );
-    };
-
-    // 缓存信任门禁（对齐旧链 rule_set_active 守卫）：不可信引用在场时缓存
-    // 载荷无法按来源过滤，整体旁路，回退 evidence 读侧过滤路径。
-    let unsafe_binding_ids = load_unsafe_rule_set_binding_ids(pool, card_id, tenant_id).await?;
-    if !unsafe_binding_ids.is_empty() {
-        tracing::debug!(
-            card_id,
-            unsafe_rule_set_ids = ?unsafe_binding_ids,
-            "unsafe rule set bindings present, bypassing permission cache"
-        );
-        return Ok(
-            find_effective_permissions_for_tenant(pool, tenant_id, card_id)
-                .await?
-                .grants,
-        );
-    }
-
-    let key = permission_cache_key(card_id, Some(tenant_id));
-    let fence = load_card_scope_fence_snapshot(pool, tenant_id, card_id).await?;
-    if let Some(grants) = read_permission_cache(&mut conn, &key, &fence).await {
-        // 发布可能在两次栅栏读之间推进。命中后复核栅栏未漂移再返回，避免
-        // 命中瞬间掠过的发布被旧缓存掩盖（对齐旧链 gate recheck 语义）。
-        let rechecked_fence = load_card_scope_fence_snapshot(pool, tenant_id, card_id).await?;
-        if rechecked_fence == fence {
-            return Ok(grants);
-        }
-    }
-
-    let read = find_effective_permissions_for_tenant(pool, tenant_id, card_id).await?;
-    // manifest_versions 为空 ⟺ 未成功消费 Ready 证据（fail-closed），绝不写缓存。
-    // 非空 ⟺ 严格 reader 的 source-freshness 门已通过（无未发布 delta），
-    // 因此写入侧 pending 基线恒为 false。
-    if !read.manifest_versions.is_empty() {
-        write_permission_cache(
-            &mut conn,
-            &key,
-            &CardScopeFenceSnapshot {
-                manifest_versions: read.manifest_versions.clone(),
-                card_source_pending: false,
-            },
-            &read.grants,
-        )
-        .await;
-    }
-    Ok(read.grants)
-}
-
-/// 读取权限缓存（key 不存在或版本组/pending 位/时代不匹配 → None；空授权是
-/// 合法命中）。
-#[cfg(feature = "redis-compat")]
-async fn read_permission_cache(
-    conn: &mut redis::aio::ConnectionManager,
-    key: &str,
-    snapshot: &CardScopeFenceSnapshot,
-) -> Option<Vec<PermissionGrantRow>> {
-    let exists: i64 = conn.exists(key).await.ok()?;
-    if exists == 0 {
-        return None;
-    }
-    let entries: HashMap<String, String> = conn.hgetall(key).await.ok()?;
-    let metadata: PermissionCacheEnvelope =
-        serde_json::from_str(entries.get(CACHE_METADATA_FIELD)?).ok()?;
-    let current_epoch = crate::cache_epoch::current_cache_epoch().await;
-    if !cache_envelope_is_compatible(&metadata, snapshot, current_epoch.as_deref()) {
-        return None;
-    }
-
-    let mut grants = Vec::new();
-    for (field, value) in &entries {
-        let Some(suffix) = field.strip_prefix("snapshot:") else {
-            continue;
-        };
-        let mut parts = suffix.splitn(2, ':');
-        let (Some(resource_type), Some(action_code)) = (parts.next(), parts.next()) else {
-            return None;
-        };
-        let entry: PermissionCacheEntry = serde_json::from_str(value).ok()?;
-        let now_secs = OffsetDateTime::now_utc().unix_timestamp();
-        if !permission_cache_entry_is_readable(&entry, &metadata, now_secs) {
-            return None;
-        }
-        grants.push(PermissionGrantRow {
-            resource_type: resource_type.to_string(),
-            action_code: action_code.to_string(),
-            valid_from_ts: entry.valid_from_ts,
-            valid_to_ts: entry.valid_to_ts,
-        });
-    }
-
-    // A metadata-only hash is the durable representation of an empty
-    // projected permission set; it must remain a valid fenced cache hit.
-    grants.sort_by(|a, b| {
-        a.resource_type
-            .cmp(&b.resource_type)
-            .then(a.action_code.cmp(&b.action_code))
-    });
-    grants.dedup();
-    Some(grants)
-}
-
-/// Write back a fenced cache payload (Hash + TTL 3600 + jitter 60s).
-/// Empty grants still write the metadata field so an empty authorization
-/// surface cannot be confused with a missing cache entry or bypass the fence.
-/// The envelope carries the current shared cache epoch so a post-restore
-/// epoch rotation invalidates every payload written before it.
-#[cfg(feature = "redis-compat")]
-async fn write_permission_cache(
-    conn: &mut redis::aio::ConnectionManager,
-    key: &str,
-    snapshot: &CardScopeFenceSnapshot,
-    grants: &[PermissionGrantRow],
-) {
-    let cache_epoch = crate::cache_epoch::current_cache_epoch().await;
-    let envelope = PermissionCacheEnvelope {
-        schema_version: EFFECTIVE_PERMISSION_CACHE_SCHEMA,
-        manifest_versions: snapshot.manifest_versions.clone(),
-        card_source_pending: snapshot.card_source_pending,
-        cache_epoch,
-    };
-    let metadata = serde_json::to_string(&envelope).unwrap_or_default();
-    if metadata.is_empty() {
-        return;
-    }
-    let mut fields = vec![(CACHE_METADATA_FIELD.to_string(), metadata)];
-    fields.extend(grants.iter().map(|g| {
-        let field = format!("snapshot:{}:{}", g.resource_type, g.action_code);
-        let value = serde_json::json!({
-            "effect": "ALLOW",
-            "valid_from_ts": g.valid_from_ts,
-            "valid_to_ts": g.valid_to_ts,
-            "schema_version": envelope.schema_version,
-            "manifest_versions": envelope.manifest_versions.clone(),
-            "card_source_pending": envelope.card_source_pending,
-            "cache_epoch": envelope.cache_epoch.clone(),
-        });
-        (field, value.to_string())
-    }));
-    let ttl = 3600 + jitter_secs();
-    let mut pipeline = redis::pipe();
-    pipeline
-        .atomic()
-        .cmd("DEL")
-        .arg(key)
-        .ignore()
-        .cmd("HSET")
-        .arg(key);
-    for (field, value) in &fields {
-        pipeline.arg(field).arg(value);
-    }
-    pipeline
-        .ignore()
-        .cmd("EXPIRE")
-        .arg(key)
-        .arg(ttl as i64)
-        .ignore();
-    let _: Result<(), _> = pipeline.query_async(conn).await;
-}
-
-/// TTL jitter（0-59s，避免整点雪崩；不引入 rand 依赖）
-#[cfg(feature = "redis-compat")]
-fn jitter_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64
-        % 60
+    find_effective_permissions_for_tenant(pool, tenant_id, card_id).await
 }
 
 #[cfg(test)]
@@ -1127,22 +673,6 @@ mod tests {
         PublishedEvidenceGateStatus, TenantScope, UnacceptedGrantReason, ValidityWindow,
         VerifiedPublishedGrantRecord,
     };
-
-    #[test]
-    fn cache_key_matches_java_layout() {
-        assert_eq!(permission_cache_key(7, None), "perm:card:7");
-        assert_eq!(permission_cache_key(7, Some(3)), "perm:card:3:7");
-    }
-
-    #[test]
-    #[cfg(feature = "redis-compat")]
-    fn snapshot_window_boundaries_are_inclusive_and_expiry_is_fail_closed() {
-        let now = 1_000;
-        assert!(snapshot_window_is_active(None, None, now));
-        assert!(snapshot_window_is_active(Some(now), Some(now), now));
-        assert!(!snapshot_window_is_active(Some(now + 1), None, now));
-        assert!(!snapshot_window_is_active(None, Some(now - 1), now));
-    }
 
     // ===== 卡摘要：published card evidence 纯派生测试（无 I/O）=====
 
@@ -1477,402 +1007,20 @@ mod tests {
         assert_eq!(sorted_csv(Vec::<&str>::new()), None);
     }
 
-    // ===== 有效权限映射与缓存 envelope v6 纯测试（无 I/O）=====
-
-    /// 测试夹具共享时代（读写两侧一致即为"当前时代"）。
-    #[cfg(feature = "redis-compat")]
-    const CACHE_EPOCH_FIXTURE: &str = "epoch-fixture-1";
-
-    fn published_grant_with_validity(
-        base: &CanonicalGrant,
-        validity: ValidityWindow,
-    ) -> CanonicalGrant {
-        let mut grant = base.clone();
-        grant.validity = validity;
-        grant
-    }
+    // ===== Published-evidence permission derivation tests =====
 
     #[test]
-    fn permission_rows_map_from_accepted_records_and_filter_disabled_rule_sets() {
-        let direct = published_record(
-            "USER_CARD",
-            1,
-            published_grant(
-                &fixed_grant_id(1),
-                GrantSourceKind::Direct,
-                BindingLayer::None,
-                "read",
-            ),
-            true,
-        );
-        // 同 (type, action) 的第二来源（APPROVAL）→ 去重保留确定性顺序首行窗口
-        let approval = published_record(
-            "USER_CARD",
-            1,
-            published_grant_with_validity(
-                &published_grant(
-                    &fixed_grant_id(2),
-                    GrantSourceKind::Approval,
-                    BindingLayer::None,
-                    "read",
-                ),
-                ValidityWindow::between(100, 200),
-            ),
-            true,
-        );
-        // enabled 规则集来源 → 参与授权行
-        let ruleset_enabled = published_record(
-            "RULE_SET",
-            10,
-            published_grant(
-                &fixed_grant_id(3),
-                GrantSourceKind::RuleSet,
-                BindingLayer::Base,
-                "export",
-            ),
-            true,
-        );
-        // disabled（未通过 enabled 集合）规则集来源 → 读侧排除
-        let ruleset_disabled = published_record(
-            "RULE_SET",
-            11,
-            published_grant(
-                &fixed_grant_id(4),
-                GrantSourceKind::RuleSet,
-                BindingLayer::Base,
-                "secret",
-            ),
-            true,
-        );
-        // 被安全排除（过期）的记录绝不参与授权行
-        let excluded = published_record(
-            "USER_CARD",
-            1,
-            published_grant(
-                &fixed_grant_id(5),
-                GrantSourceKind::Direct,
-                BindingLayer::None,
-                "hidden",
-            ),
-            false,
-        );
-        let evidence = published_evidence(vec![
-            direct,
-            approval,
-            ruleset_enabled,
-            ruleset_disabled,
-            excluded,
-        ]);
-        let contract = evidence.validate();
-        assert!(contract.is_ok(), "fixture invalid: {contract:?}");
-
-        let allowed = std::collections::HashSet::from([10_i64]);
-        let rows = permission_grant_rows_from_evidence(&evidence, &allowed).expect("shape ok");
-        // 输出按 (resource_type, action_code) 升序；"read" 去重后保留首行
-        // （DIRECT, perpetual）窗口；disabled 来源与被排除记录不出现。
-        assert_eq!(
-            rows,
-            vec![
-                PermissionGrantRow {
-                    resource_type: "learn_subject".to_string(),
-                    action_code: "export".to_string(),
-                    valid_from_ts: None,
-                    valid_to_ts: None,
-                },
-                PermissionGrantRow {
-                    resource_type: "learn_subject".to_string(),
-                    action_code: "read".to_string(),
-                    valid_from_ts: None,
-                    valid_to_ts: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn ruleset_grant_without_ruleset_aggregate_provenance_fails_rows() {
-        let evidence = published_evidence(vec![published_record(
-            "USER_CARD",
-            1,
-            published_grant(
-                &fixed_grant_id(1),
-                GrantSourceKind::RuleSet,
-                BindingLayer::Base,
-                "read",
-            ),
-            true,
-        )]);
-        assert_eq!(
-            permission_grant_rows_from_evidence(&evidence, &std::collections::HashSet::new()),
-            Err(PublishedGrantShapeError::RuleSetProvenanceMissing {
-                grant_id: GrantId::parse(&fixed_grant_id(1))
-                    .expect("valid grant id")
-                    .to_string(),
-            })
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "redis-compat")]
-    fn cache_envelope_v6_fences_on_any_aggregate_version_or_pending_change() {
-        let evidence = published_evidence(vec![
-            published_record(
-                "USER_CARD",
-                1,
-                published_grant(
-                    &fixed_grant_id(1),
-                    GrantSourceKind::Direct,
-                    BindingLayer::None,
-                    "read",
-                ),
-                true,
-            ),
-            published_record(
-                "RULE_SET",
-                10,
-                published_grant(
-                    &fixed_grant_id(2),
-                    GrantSourceKind::RuleSet,
-                    BindingLayer::Base,
-                    "export",
-                ),
-                true,
-            ),
-        ]);
-        // 填充侧基准：pending 恒为 false（严格 reader 门禁通过后才可能有证据）。
-        let baseline = evidence_fence_baseline(&evidence).unwrap();
-        assert!(!baseline.card_source_pending);
-        let versions = &baseline.manifest_versions;
-        assert_eq!(versions.len(), 2);
-        // 防御性重排：按 (aggregate_type, aggregate_id) 升序
-        assert_eq!(versions[0].aggregate_type, "RULE_SET");
-        assert_eq!(versions[0].aggregate_id, 10);
-        assert_eq!(versions[1].aggregate_type, "USER_CARD");
-
-        let envelope = PermissionCacheEnvelope {
-            schema_version: EFFECTIVE_PERMISSION_CACHE_SCHEMA,
-            manifest_versions: versions.clone(),
-            card_source_pending: false,
-            cache_epoch: Some(CACHE_EPOCH_FIXTURE.to_string()),
-        };
-        assert!(cache_envelope_is_compatible(
-            &envelope,
-            &baseline,
-            Some(CACHE_EPOCH_FIXTURE)
-        ));
-
-        // 任一聚合 generation 推进 → 失效
-        let mut advanced = baseline.clone();
-        advanced.manifest_versions[0].generation += 1;
-        assert!(!cache_envelope_is_compatible(
-            &envelope,
-            &advanced,
-            Some(CACHE_EPOCH_FIXTURE)
-        ));
-
-        // 任一聚合 revoke_fence 变化 → 失效
-        let mut revoked = baseline.clone();
-        revoked.manifest_versions[1].revoke_fence += 1;
-        assert!(!cache_envelope_is_compatible(
-            &envelope,
-            &revoked,
-            Some(CACHE_EPOCH_FIXTURE)
-        ));
-
-        // 新聚合发布（版本组形状变化）→ 失效
-        let mut added = baseline.clone();
-        added
-            .manifest_versions
-            .push(PermissionCacheManifestVersion {
-                aggregate_type: "APPROVAL".to_string(),
-                aggregate_id: 3,
-                manifest_id: 1,
-                generation: 1,
-                revoke_fence: 0,
-                publication_stamp: evidence.manifests[0].publication_stamp().unwrap(),
-            });
-        assert!(!cache_envelope_is_compatible(
-            &envelope,
-            &added,
-            Some(CACHE_EPOCH_FIXTURE)
-        ));
-
-        // source 提交未发布（pending 位翻转）→ 失效：撤销类变更的越权窗口内
-        // 全部缓存条目立即 miss，回源撞 source-freshness 门。
-        let mut pending = baseline.clone();
-        pending.card_source_pending = true;
-        assert!(!cache_envelope_is_compatible(
-            &envelope,
-            &pending,
-            Some(CACHE_EPOCH_FIXTURE)
-        ));
-
-        // retired editions 1–5 automatically miss
-        for legacy_schema in [1, 2, 3, 4, 5] {
-            let mut legacy = envelope.clone();
-            legacy.schema_version = legacy_schema;
-            assert!(
-                !cache_envelope_is_compatible(&legacy, &baseline, Some(CACHE_EPOCH_FIXTURE)),
-                "legacy schema {legacy_schema} must miss"
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "redis-compat")]
-    fn cache_envelope_epoch_rotation_fences_known_epochs_only() {
-        let baseline = CardScopeFenceSnapshot {
-            manifest_versions: Vec::new(),
-            card_source_pending: false,
-        };
-        let envelope = PermissionCacheEnvelope {
-            schema_version: EFFECTIVE_PERMISSION_CACHE_SCHEMA,
-            manifest_versions: baseline.manifest_versions.clone(),
-            card_source_pending: baseline.card_source_pending,
-            cache_epoch: Some(CACHE_EPOCH_FIXTURE.to_string()),
-        };
-
-        // 整库恢复/重建后运维换时代：携带旧时代的条目 → miss
-        assert!(!cache_envelope_is_compatible(
-            &envelope,
-            &baseline,
-            Some("rotated-epoch")
-        ));
-        // 当前时代未知（Redis 降级）→ 跳过 epoch 子校验，其余栅栏照常
-        assert!(cache_envelope_is_compatible(&envelope, &baseline, None));
-
-        // 条目未携带时代（写侧降级窗口）：两侧语义均放行（版本组栅栏兜底）
-        let mut no_epoch = envelope.clone();
-        no_epoch.cache_epoch = None;
-        assert!(cache_envelope_is_compatible(
-            &no_epoch,
-            &baseline,
-            Some(CACHE_EPOCH_FIXTURE)
-        ));
-        assert!(cache_envelope_is_compatible(&no_epoch, &baseline, None));
-    }
-
-    #[test]
-    #[cfg(feature = "redis-compat")]
-    fn legacy_v3_v5_envelopes_miss_current_read_side() {
-        // Retired edition 3 has no cache_epoch/card_source_pending and cannot decode.
-        let legacy_v3_json = r#"{"schema_version":3,"manifest_versions":[]}"#;
-        assert!(
-            serde_json::from_str::<PermissionCacheEnvelope>(legacy_v3_json).is_err(),
-            "v3 payload must fail v6 deserialization (missing card_source_pending)"
-        );
-
-        // Retired edition 5 has the pending bit but no complete publication stamp;
-        // an empty set still fails the current schema gate.
-        let legacy_v5_json = format!(
-            r#"{{"schema_version":5,"manifest_versions":[],"card_source_pending":false,"cache_epoch":"{CACHE_EPOCH_FIXTURE}"}}"#
-        );
-        let legacy: PermissionCacheEnvelope = serde_json::from_str(&legacy_v5_json).unwrap();
-        let empty = CardScopeFenceSnapshot {
-            manifest_versions: Vec::new(),
-            card_source_pending: false,
-        };
-        assert!(!cache_envelope_is_compatible(
-            &legacy,
-            &empty,
-            Some(CACHE_EPOCH_FIXTURE)
-        ));
-
-        // v6 完整载荷在相同输入下是合法命中。
-        let v6_json = format!(
-            r#"{{"schema_version":{} ,"manifest_versions":[],"card_source_pending":false,"cache_epoch":"{CACHE_EPOCH_FIXTURE}"}}"#,
-            EFFECTIVE_PERMISSION_CACHE_SCHEMA
-        );
-        let decoded_v6: PermissionCacheEnvelope = serde_json::from_str(&v6_json).unwrap();
-        let baseline = CardScopeFenceSnapshot {
-            manifest_versions: Vec::new(),
-            card_source_pending: false,
-        };
-        assert!(cache_envelope_is_compatible(
-            &decoded_v6,
-            &baseline,
-            Some(CACHE_EPOCH_FIXTURE)
-        ));
-        // 现场翻 pending → miss。
-        let mut pending = baseline.clone();
-        pending.card_source_pending = true;
-        assert!(!cache_envelope_is_compatible(
-            &decoded_v6,
-            &pending,
-            Some(CACHE_EPOCH_FIXTURE)
-        ));
-    }
-
-    #[test]
-    #[cfg(feature = "redis-compat")]
-    fn cache_entry_validity_is_fail_closed_and_boundary_inclusive() {
-        let metadata = PermissionCacheEnvelope {
-            schema_version: EFFECTIVE_PERMISSION_CACHE_SCHEMA,
-            manifest_versions: vec![PermissionCacheManifestVersion {
-                aggregate_type: "USER_CARD".to_string(),
-                aggregate_id: 1,
-                manifest_id: 9,
-                generation: 4,
-                revoke_fence: 2,
-                publication_stamp: astral_types::PublicationStamp::new(
-                    4,
-                    "ab".repeat(32),
-                    PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
-                )
-                .unwrap(),
-            }],
-            card_source_pending: false,
-            cache_epoch: Some(CACHE_EPOCH_FIXTURE.to_string()),
-        };
-        let entry = PermissionCacheEntry {
-            envelope: metadata.clone(),
-            effect: "ALLOW".to_string(),
-            valid_from_ts: Some(1_000),
-            valid_to_ts: Some(1_000),
-        };
-        assert!(permission_cache_entry_is_readable(&entry, &metadata, 1_000));
-        assert!(!permission_cache_entry_is_readable(
-            &entry, &metadata, 1_001
-        ));
-        assert!(!permission_cache_entry_is_readable(&entry, &metadata, 999));
-
-        let mut denied = entry.clone();
-        denied.effect = "DENY".to_string();
-        assert!(!permission_cache_entry_is_readable(
-            &denied, &metadata, 1_000
-        ));
-
-        // entry 内嵌 envelope 与 metadata 漂移（例如部分写入）→ 不可读
-        let mut drifted = entry.clone();
-        drifted.envelope.manifest_versions[0].generation = 5;
-        assert!(!permission_cache_entry_is_readable(
-            &drifted, &metadata, 1_000
-        ));
-    }
-
-    #[test]
-    #[cfg(feature = "redis-compat")]
-    fn rule_set_binding_safety_is_null_safe_and_fail_closed() {
-        // MySQL NULL 安全等值（<=>）的 Rust 语义
+    fn enabled_rule_set_filter_is_tenant_scoped_and_fail_closed() {
         assert!(tenant_stamp_matches(None, None));
         assert!(tenant_stamp_matches(Some(7), Some(7)));
         assert!(!tenant_stamp_matches(None, Some(7)));
         assert!(!tenant_stamp_matches(Some(7), None));
         assert!(!tenant_stamp_matches(Some(7), Some(8)));
-
-        // enabled 行过滤：禁用 / 租户戳不匹配 / 平台规则集对租户卡 一律不通过
         assert!(enabled_rule_set_row_is_allowed(1, Some(7), 7));
         assert!(!enabled_rule_set_row_is_allowed(0, Some(7), 7));
         assert!(!enabled_rule_set_row_is_allowed(1, Some(8), 7));
         assert!(!enabled_rule_set_row_is_allowed(1, None, 7));
         assert!(!enabled_rule_set_row_is_allowed(1, Some(7), 8));
-
-        // 缓存信任门禁：缺失/禁用/租户戳不匹配的绑定引用均不可信
-        assert!(rule_set_binding_is_unsafe(None, None, None, 7));
-        assert!(rule_set_binding_is_unsafe(Some(7), Some(0), Some(7), 7));
-        assert!(rule_set_binding_is_unsafe(Some(8), Some(1), Some(8), 7));
-        assert!(rule_set_binding_is_unsafe(Some(7), Some(1), Some(8), 7));
-        assert!(!rule_set_binding_is_unsafe(Some(7), Some(1), Some(7), 7));
     }
 
     #[test]
@@ -1935,34 +1083,5 @@ mod tests {
         assert!(!PENDING_DELTA_PROBE_SQL.contains("p.card_id = authorization_delta_event"));
         // 轻探针必须非锁定（严格 reader 的锁定纪律不适用于缓存命中路径）。
         assert!(!PENDING_DELTA_PROBE_SQL.contains("FOR UPDATE"));
-    }
-
-    /// 源码形状守卫（P3 Redis 拆线）：Cache-Aside 的 Redis 读/写必须被
-    /// compat 门（default-off）包住——默认路径在 `redis_conn` 之前整体旁路，
-    /// 直接走 evidence 读链；防止后续重构把 Redis hash 读写重新无条件装配。
-    #[test]
-    fn redis_cache_aside_is_gated_by_the_compat_flag_before_any_connection() {
-        let source = include_str!("permission_query.rs");
-        let entry = source
-            .split("pub async fn find_effective_permissions_cached")
-            .nth(1)
-            .expect("find_effective_permissions_cached must exist");
-        // compat 门必须先于连接获取（redis_conn）与信任门禁/栅栏读。
-        let gate_pos = entry
-            .find("redis_projection_compat_enabled()")
-            .expect("compat gate must be present in find_effective_permissions_cached");
-        let conn_pos = entry
-            .find("redis_conn()")
-            .expect("redis_conn call must remain on the compat path");
-        assert!(
-            gate_pos < conn_pos,
-            "compat gate must short-circuit before any Redis connection attempt"
-        );
-        // 默认分支必须直接回 evidence 读链（find_effective_permissions_for_tenant）。
-        let default_branch = &entry[gate_pos..conn_pos];
-        assert!(
-            default_branch.contains("find_effective_permissions_for_tenant"),
-            "compat-disabled path must go straight to the evidence read chain"
-        );
     }
 }

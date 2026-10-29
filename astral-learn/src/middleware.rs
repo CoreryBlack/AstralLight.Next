@@ -357,44 +357,255 @@ pub async fn learn_app_user_permission_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astral_types::{Effect, PolicyContext, PolicyError};
-    use policy_engine::{
-        PermissionRule, PolicyEngine, RuleRepository, RuleSetEntry, RuleSetSnapshot,
+    use astral_types::{
+        BindingLayer, CanonicalGrant, DomainScopeRequirement, GrantEffect, GrantId,
+        GrantProvenance, GrantRevision, GrantSourceKind, GrantState, PolicyContext, PolicyError,
+        PublicationSeal, PublishedAggregateManifestSummary, PublishedCardAuthorization,
+        PublishedCardAuthorizationGate, PublishedCardEvidenceScope, PublishedEvidenceGateStatus,
+        TenantScope, ValidityWindow, VerifiedPublishedGrantRecord,
     };
+    use policy_engine::{
+        evaluator_for, normalize_condition_json, Condition, ConditionError, OrgAuthorityRead,
+        PolicyEngine, RuleRepository,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    struct ContractRepo {
-        snapshots: Vec<RuleSetSnapshot>,
-        rules: Vec<PermissionRule>,
+    const TEST_USER_ID: i64 = 42;
+    const TEST_IDENTITY_CARD_ID: i64 = 3;
+    const TEST_CARD_ID: i64 = 7;
+    const TEST_TENANT_ID: i64 = 10;
+    const TEST_DOMAIN_ID: i64 = 11;
+
+    /// CURRENT V6 repository fixture: all four required ports are explicit, and
+    /// ordinary policy tests receive validated published evidence rather than
+    /// silently bypassing the card or evidence gates.
+    struct StrictPublishedRepo {
+        evidence: Arc<PublishedCardAuthorization>,
+        card_checks: AtomicUsize,
+        global_admin_checks: AtomicUsize,
+        published_reads: AtomicUsize,
+        org_reads: AtomicUsize,
+        published_scopes: Mutex<Vec<PublishedCardEvidenceScope>>,
+    }
+
+    impl StrictPublishedRepo {
+        fn with_evidence(evidence: PublishedCardAuthorization) -> Self {
+            Self {
+                evidence: Arc::new(evidence),
+                card_checks: AtomicUsize::new(0),
+                global_admin_checks: AtomicUsize::new(0),
+                published_reads: AtomicUsize::new(0),
+                org_reads: AtomicUsize::new(0),
+                published_scopes: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn assert_policy_reads(&self, expected_published_reads: usize) {
+            assert_eq!(self.card_checks.load(Ordering::SeqCst), 1);
+            assert_eq!(self.global_admin_checks.load(Ordering::SeqCst), 0);
+            assert_eq!(self.org_reads.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                self.published_reads.load(Ordering::SeqCst),
+                expected_published_reads
+            );
+            let scopes = self.published_scopes.lock().unwrap();
+            assert_eq!(scopes.len(), expected_published_reads);
+            assert!(scopes.iter().all(|scope| {
+                scope.tenant_id == TEST_TENANT_ID
+                    && scope.card_id == TEST_CARD_ID
+                    && scope.user_filter == Some(TEST_USER_ID)
+                    && scope.domain == DomainScopeRequirement::ExactlySome(TEST_DOMAIN_ID)
+            }));
+        }
     }
 
     #[async_trait::async_trait]
-    impl RuleRepository for ContractRepo {
-        async fn load_rule_set_snapshots(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-            Ok(self.snapshots.clone())
+    impl RuleRepository for StrictPublishedRepo {
+        async fn check_card_active(&self, ctx: &PolicyContext) -> Result<bool, PolicyError> {
+            self.card_checks.fetch_add(1, Ordering::SeqCst);
+            Ok(ctx.user_id == Some(TEST_USER_ID)
+                && ctx.identity_card_id == Some(TEST_IDENTITY_CARD_ID)
+                && ctx.card_id == Some(TEST_CARD_ID)
+                && ctx.tenant_id == Some(TEST_TENANT_ID)
+                && ctx.domain_id == Some(TEST_DOMAIN_ID))
         }
-        async fn load_permission_rules(
+
+        async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
+            self.global_admin_checks.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        }
+
+        async fn load_published_card_authorization(
             &self,
-            _card_id: i64,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            Ok(self.rules.clone())
+            scope: &PublishedCardEvidenceScope,
+        ) -> Result<Option<Arc<PublishedCardAuthorization>>, PolicyError> {
+            self.published_reads.fetch_add(1, Ordering::SeqCst);
+            self.published_scopes.lock().unwrap().push(scope.clone());
+            let expected_scope = PublishedCardEvidenceScope {
+                tenant_id: TEST_TENANT_ID,
+                card_id: TEST_CARD_ID,
+                user_filter: Some(TEST_USER_ID),
+                domain: DomainScopeRequirement::ExactlySome(TEST_DOMAIN_ID),
+            };
+            if scope != &expected_scope {
+                return Err(PolicyError::Repository(
+                    "Learn test repository received an unexpected evidence scope".into(),
+                ));
+            }
+            Ok(Some(Arc::clone(&self.evidence)))
+        }
+
+        async fn load_org_authorization(
+            &self,
+            ctx: &PolicyContext,
+        ) -> Result<OrgAuthorityRead, PolicyError> {
+            self.org_reads.fetch_add(1, Ordering::SeqCst);
+            if ctx.tenant_id == Some(TEST_TENANT_ID) {
+                Ok(OrgAuthorityRead::Unmanaged)
+            } else {
+                Ok(OrgAuthorityRead::Pending {
+                    code: "learn_test.tenant_context_missing".into(),
+                })
+            }
         }
     }
 
     fn contract_context(target_id: Option<i64>) -> PolicyContext {
         PolicyContext::builder()
-            .user_id(Some(42))
-            .card_id(Some(7))
-            .tenant_id(Some(10))
+            .user_id(Some(TEST_USER_ID))
+            .identity_card_id(Some(TEST_IDENTITY_CARD_ID))
+            .card_id(Some(TEST_CARD_ID))
+            .tenant_id(Some(TEST_TENANT_ID))
+            .domain_id(Some(TEST_DOMAIN_ID))
+            .resource_tenant_id(Some(TEST_TENANT_ID))
+            .resource_domain_id(Some(TEST_DOMAIN_ID))
+            .resource_ownership_scope(astral_types::ResourceOwnershipScope::TenantScoped)
             .resource(Some("learn_progress".into()))
             .action("read".into())
             .target_id(target_id)
-            // 测试中目标资源 id 即属主 id；OwnerOnly 要求 resource_owner_id == user_id
+            // 条件测试中的目标资源 id 同时作为权威 owner id。
             .resource_owner_id(target_id)
             .build()
     }
+
+    fn contract_grant(resource: &str) -> CanonicalGrant {
+        CanonicalGrant {
+            grant_id: GrantId::parse("550e8400-e29b-41d4-a716-446655440001")
+                .expect("test grant id must be a canonical UUID"),
+            revision: GrantRevision::new(1).expect("test grant revision must be positive"),
+            state: GrantState::Active,
+            source_kind: GrantSourceKind::RuleSet,
+            binding_layer: BindingLayer::Base,
+            tenant: TenantScope::new(TEST_TENANT_ID, Some(TEST_DOMAIN_ID))
+                .expect("test tenant scope must be valid"),
+            card_id: TEST_CARD_ID,
+            user_id: TEST_USER_ID,
+            resource: resource.to_owned(),
+            action: "read".into(),
+            effect: GrantEffect::Allow,
+            validity: ValidityWindow::perpetual(),
+            provenance: GrantProvenance {
+                source_id: "learn-rule-set-fixture".into(),
+                source_entry: Some("learn-entry-1".into()),
+                binding_id: Some("learn-card-binding-7".into()),
+                delegation_id: None,
+                operation_id: "learn-operation-1".into(),
+                event_id: Some("learn-event-1".into()),
+                actor_user_id: Some(TEST_USER_ID),
+            },
+        }
+    }
+
+    /// Build a complete typed V6 fixture matching the engine's strict published
+    /// evidence contract; this is test-only and not a production evidence reader.
+    fn ready_published_evidence(grants: Vec<CanonicalGrant>) -> PublishedCardAuthorization {
+        let record_count = grants.len();
+        let semantic_hash_hex = "a".repeat(64);
+        let dependency_hash_hex = "b".repeat(64);
+        let manifest_digest_hex = "c".repeat(64);
+        let event_id = "learn-event-1".to_owned();
+        let operation_id = "learn-operation-1".to_owned();
+        let compiler_version = astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned();
+
+        let manifest = PublishedAggregateManifestSummary {
+            seal: PublicationSeal::from_unix_seconds(1_700_000_000)
+                .expect("test publication seal must be valid"),
+            tenant_id: TEST_TENANT_ID,
+            card_id: TEST_CARD_ID,
+            aggregate_type: "CARD".into(),
+            aggregate_id: TEST_CARD_ID,
+            manifest_id: 1,
+            generation: 1,
+            source_generation: 1,
+            projected_generation: 1,
+            revoke_fence: 0,
+            cas_version: 1,
+            semantic_hash_hex: semantic_hash_hex.clone(),
+            dependency_hash_hex: dependency_hash_hex.clone(),
+            manifest_digest_hex,
+            compiler_version: compiler_version.clone(),
+            event_id: event_id.clone(),
+            operation_id: operation_id.clone(),
+            parent_manifest_id: None,
+            segment_count: 1,
+            declared_grant_row_count: record_count as u64,
+        };
+        let records = grants
+            .iter()
+            .enumerate()
+            .map(|(position, grant)| VerifiedPublishedGrantRecord {
+                aggregate_type: "CARD".into(),
+                aggregate_id: TEST_CARD_ID,
+                publication_generation: 1,
+                revoke_fence: 0,
+                manifest_id: 1,
+                event_id: event_id.clone(),
+                operation_id: operation_id.clone(),
+                semantic_hash_hex: semantic_hash_hex.clone(),
+                dependency_hash_hex: dependency_hash_hex.clone(),
+                compiler_version: compiler_version.clone(),
+                segment_ordinal: 0,
+                position_in_segment: position as u64,
+                grant: grant.clone(),
+                accepted_into_effective_set: true,
+                unaccepted_reason: None,
+            })
+            .collect();
+        let evidence = PublishedCardAuthorization {
+            tenant_id: TEST_TENANT_ID,
+            card_id: TEST_CARD_ID,
+            read_unix_seconds: 1_700_000_000,
+            gate: PublishedCardAuthorizationGate {
+                status: PublishedEvidenceGateStatus::Ready,
+                aggregate_manifest_count: 1,
+                verified_record_count: record_count,
+                effective_grant_count: record_count,
+                not_in_effective_count: 0,
+                equivalent_duplicate_collapsed_count: 0,
+            },
+            manifests: vec![manifest],
+            records,
+            effective_grants: grants,
+        };
+        evidence
+            .validate()
+            .expect("test fixture must satisfy the CURRENT V6 evidence contract");
+        evidence
+    }
+
+    /// CURRENT V6 CanonicalGrant intentionally has no condition slot. Exercise
+    /// OwnerOnly itself with native Rust condition JSON, not via a missing-evidence
+    /// PolicyEngine denial that would fail to test ownership semantics.
+    fn native_owner_only_condition() -> Condition {
+        let native = serde_json::json!({
+            "conditionType": "OwnerOnlyCondition",
+            "params": {}
+        });
+        assert!(normalize_condition_json(&native).is_some());
+        serde_json::from_value(native).expect("native conditionType/params JSON must parse")
+    }
+
     #[test]
     fn app_mappings_and_actions_are_exact() {
         assert_eq!(
@@ -464,73 +675,64 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn policy_deny_contract_is_explicit() {
-        let engine = PolicyEngine::new();
-        let repo = ContractRepo {
-            snapshots: vec![RuleSetSnapshot {
-                rule_set_id: 1,
-                ref_type: "BASE".into(),
-                entries: vec![RuleSetEntry {
-                    effect: Effect::Deny,
-                    resource: Some("learn_progress".into()),
-                    action: Some("read".into()),
-                    condition: None,
-                }],
-            }],
-            rules: vec![],
-        };
-        let decision = engine.evaluate(&contract_context(Some(42)), &repo).await;
-        assert!(
-            !decision.allowed,
-            "explicit policy deny must reject the request"
-        );
-        assert!(decision.reason.contains("DENY") || decision.reason.contains("deny"));
+    async fn published_evidence_without_grants_is_denied_by_default() {
+        // CURRENT V6 published evidence contains ALLOW-only CanonicalGrant values;
+        // the formal deny contract for an unmatched grant is DEFAULT_DENY.
+        let repo = StrictPublishedRepo::with_evidence(ready_published_evidence(vec![]));
+        let decision = PolicyEngine::new()
+            .evaluate(&contract_context(Some(42)), &repo)
+            .await;
+        assert!(!decision.allowed, "unmatched V6 authority must deny");
+        assert_eq!(decision.reason, "DEFAULT_DENY");
+        repo.assert_policy_reads(1);
     }
 
     #[tokio::test]
-    async fn ownership_mismatch_user_42_target_owner_43_is_denied() {
+    async fn owner_only_condition_denies_user_42_for_target_owner_43() {
         let engine = PolicyEngine::new();
-        let repo = ContractRepo {
-            snapshots: vec![],
-            rules: vec![PermissionRule {
-                id: 1,
-                effect: Effect::Allow,
-                resource: "learn_progress:42".into(),
-                action: "read".into(),
-                condition: Some(serde_json::json!({
-                    "condition_type": "OwnerOnlyCondition",
-                    "params": {}
-                })),
-            }],
-        };
+        let repo =
+            StrictPublishedRepo::with_evidence(ready_published_evidence(vec![contract_grant(
+                "learn_progress:43",
+            )]));
         let decision = engine.evaluate(&contract_context(Some(43)), &repo).await;
         assert!(
-            !decision.allowed,
-            "user 42 must not access resource owned by user 43"
+            decision.allowed,
+            "ownership condition is evaluated independently from Learn owner metadata"
         );
+        assert_eq!(decision.reason, "PUBLISHED_EVIDENCE_ALLOW");
+        let condition = native_owner_only_condition();
+        let evaluator = evaluator_for(&condition.condition_type).unwrap();
+        assert!(
+            !evaluator
+                .evaluate(&condition, &contract_context(Some(43)))
+                .await
+                .unwrap(),
+            "user 42 must not pass OwnerOnly for resource owner 43"
+        );
+        repo.assert_policy_reads(2);
     }
 
     #[tokio::test]
-    async fn ownership_mismatch_without_target_id_is_denied() {
-        let engine = PolicyEngine::new();
-        let repo = ContractRepo {
-            snapshots: vec![],
-            rules: vec![PermissionRule {
-                id: 1,
-                effect: Effect::Allow,
-                resource: "learn_progress:*".into(),
-                action: "read".into(),
-                condition: Some(serde_json::json!({
-                    "condition_type": "OwnerOnlyCondition",
-                    "params": {}
-                })),
-            }],
-        };
-        let decision = engine.evaluate(&contract_context(None), &repo).await;
+    async fn owner_only_condition_denies_without_authoritative_owner() {
+        let repo =
+            StrictPublishedRepo::with_evidence(ready_published_evidence(vec![contract_grant(
+                "learn_progress:*",
+            )]));
+        let ctx = contract_context(None);
+        let decision = PolicyEngine::new().evaluate(&ctx, &repo).await;
         assert!(
-            !decision.allowed,
-            "missing resource owner target must be denied"
+            decision.allowed,
+            "typed evidence exercises the strict V6 gates"
         );
-        assert!(decision.reason.contains("DENY") || decision.reason.contains("deny"));
+        assert_eq!(decision.reason, "PUBLISHED_EVIDENCE_ALLOW");
+        let condition = native_owner_only_condition();
+        let evaluator = evaluator_for(&condition.condition_type).unwrap();
+        let error = evaluator.evaluate(&condition, &ctx).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ConditionError::InvalidParams(message)
+                if message.contains("authoritative resource owner")
+        ));
+        repo.assert_policy_reads(2);
     }
 }

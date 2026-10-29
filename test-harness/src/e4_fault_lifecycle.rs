@@ -2,13 +2,18 @@ use crate::e4_protocol::{Authorization, Decision, Status};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const FAULTS: [&str; 6] = [
-    "redis_unavailable",
-    "stale_hmac",
-    "pointer_movement",
-    "worker_restart",
-    "lease_expiry",
-    "unknown_ack",
+pub const FAULTS: [&str; 11] = [
+    "memory_channel_suspect",
+    "memory_invalidation_omission",
+    "local_bus_owner_loss",
+    "local_bus_overflow",
+    "local_bus_unknown_completion",
+    "source_commit_unknown",
+    "worker_death_sticky",
+    "writer_lease_loss",
+    "current_pointer_movement",
+    "hmac_failure",
+    "mysql_unavailable",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +31,7 @@ pub enum HookResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FaultEvidence {
     pub generation: bool,
+    pub compare_and_swap: bool,
     pub audit: bool,
     pub durable_reconcile: bool,
 }
@@ -139,9 +145,9 @@ fn observation_status(hook: HookResult, outcome: FaultOutcome) -> (Status, &'sta
 
 fn required_evidence(fault_id: &str) -> &'static [&'static str] {
     match fault_id {
-        "pointer_movement" | "lease_expiry" => &["generation"],
-        "stale_hmac" => &["audit"],
-        "unknown_ack" => &["durable_reconcile"],
+        "current_pointer_movement" | "writer_lease_loss" => &["generation", "compare_and_swap"],
+        "hmac_failure" => &["audit"],
+        "source_commit_unknown" | "local_bus_unknown_completion" => &["durable_reconcile"],
         _ => &[],
     }
 }
@@ -159,13 +165,14 @@ fn evidence_status(
     if !observation_exists && required.iter().all(|item| *item != "durable_reconcile") {
         return (Status::Skip, "no_observation_for_evidence");
     }
-    if !observation_exists && required.contains(&"durable_reconcile") && !reconciliation_proven {
-        return (Status::Blocked, "required_fault_evidence_missing");
+    if required.contains(&"durable_reconcile") && !reconciliation_proven {
+        return (Status::Unknown, "durable_reconciliation_unproven");
     }
     if required.iter().any(|item| match *item {
         "generation" => !evidence.generation,
+        "compare_and_swap" => !evidence.compare_and_swap,
         "audit" => !evidence.audit,
-        "durable_reconcile" => !evidence.durable_reconcile || !reconciliation_proven,
+        "durable_reconcile" => !evidence.durable_reconcile,
         _ => true,
     }) {
         return (Status::Blocked, "required_fault_evidence_missing");
@@ -173,14 +180,7 @@ fn evidence_status(
     (Status::Pass, "required_fault_evidence_present")
 }
 
-pub const OUTCOME_FAULT_MATRIX_ITEMS: [&str; 6] = [
-    "redis_unavailable",
-    "stale_hmac",
-    "pointer_movement",
-    "worker_restart",
-    "lease_expiry",
-    "unknown_ack",
-];
+pub const OUTCOME_FAULT_MATRIX_ITEMS: [&str; 11] = FAULTS;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FaultOutcomeVerdict {
@@ -640,13 +640,12 @@ pub fn run_fault_case(input: &FaultCaseInput, run_id: &str) -> FaultCaseReport {
             1,
         ),
     );
-    let observation_exists = input.observe == HookResult::Pass && input.outcome.observed.is_some();
+    let observation_exists = stages
+        .get("observe")
+        .is_some_and(|observation| observation.calls > 0 && observation.status == Status::Pass);
     let (evidence_status, evidence_detail) = evidence_status(
         input.fault_id,
-        FaultEvidence {
-            durable_reconcile: input.evidence.durable_reconcile && reconciliation_proven,
-            ..input.evidence
-        },
+        input.evidence,
         observation_exists,
         reconciliation_proven,
     );
@@ -759,6 +758,7 @@ mod tests {
             postcondition_ok: Some(true),
             evidence: FaultEvidence {
                 generation: true,
+                compare_and_swap: true,
                 audit: true,
                 durable_reconcile: true,
             },
@@ -767,7 +767,7 @@ mod tests {
 
     #[test]
     fn prepare_is_a_hard_gate_and_unknown_prepare_runs_recovery_once() {
-        let mut refused = good("redis_unavailable");
+        let mut refused = good("local_bus_overflow");
         refused.prepare_durable_ref = false;
         refused.prepare = HookResult::Refused;
         let refused = run_fault_case(&refused, "run-1");
@@ -776,7 +776,7 @@ mod tests {
         assert!(!refused.stages.contains_key("restore"));
         assert!(!refused.stages.contains_key("reconcile"));
 
-        let mut unknown = good("redis_unavailable");
+        let mut unknown = good("local_bus_unknown_completion");
         unknown.prepare_durable_ref = false;
         let unknown = run_fault_case(&unknown, "run-1");
         assert_eq!(unknown.overall, Status::Unknown);
@@ -789,22 +789,37 @@ mod tests {
 
     #[test]
     fn recovery_path_is_once_and_retry_requires_durable_reconciliation() {
-        let mut input = good("unknown_ack");
+        let mut input = good("source_commit_unknown");
         input.apply = HookResult::Timeout;
-        input.reconcile = HookResult::Disconnect;
-        input.reconciliation_proven = false;
         let result = run_fault_case(&input, "run-1");
-        assert_eq!(result.overall, Status::Blocked);
+        assert_eq!(result.overall, Status::Unknown);
+        assert_eq!(result.stages["apply"].status, Status::Unknown);
         assert_eq!(result.stages["apply"].calls, 1);
         assert_eq!(result.stages["observe"].status, Status::Skip);
         assert_eq!(result.stages["restore"].calls, 1);
         assert_eq!(result.stages["reconcile"].calls, 1);
+        assert_eq!(result.stages["reconcile"].status, Status::Pass);
         assert_eq!(result.stages["postcondition"].calls, 1);
-        assert_eq!(result.stages["evidence"].status, Status::Blocked);
-        assert!(!result.retry_permitted);
+        assert_eq!(result.stages["evidence"].status, Status::Pass);
+        assert!(result.retry_permitted);
         assert_eq!(result.retries, 0);
 
-        let mut disconnect = good("redis_unavailable");
+        let mut unproven = good("source_commit_unknown");
+        unproven.apply = HookResult::Timeout;
+        unproven.reconcile = HookResult::Disconnect;
+        unproven.reconciliation_proven = false;
+        let unproven = run_fault_case(&unproven, "run-1");
+        assert_eq!(unproven.overall, Status::Unknown);
+        assert_eq!(unproven.stages["apply"].status, Status::Unknown);
+        assert_eq!(unproven.stages["apply"].calls, 1);
+        assert_eq!(unproven.stages["reconcile"].status, Status::Unknown);
+        assert_eq!(unproven.stages["restore"].calls, 1);
+        assert_eq!(unproven.stages["reconcile"].calls, 1);
+        assert_eq!(unproven.stages["evidence"].status, Status::Unknown);
+        assert!(!unproven.retry_permitted);
+        assert_eq!(unproven.retries, 0);
+
+        let mut disconnect = good("local_bus_owner_loss");
         disconnect.observe = HookResult::Disconnect;
         let observed = run_fault_case(&disconnect, "run-1");
         assert_eq!(observed.overall, Status::Unknown);
@@ -813,7 +828,7 @@ mod tests {
         assert_eq!(observed.stages["restore"].calls, 1);
         assert_eq!(observed.stages["reconcile"].calls, 1);
 
-        let mut refused = good("redis_unavailable");
+        let mut refused = good("worker_death_sticky");
         refused.apply = HookResult::Refused;
         let refused = run_fault_case(&refused, "run-1");
         assert_eq!(refused.overall, Status::Blocked);
@@ -826,33 +841,55 @@ mod tests {
 
     #[test]
     fn case_evidence_requirements_and_observation_fail_closed_are_distinct() {
-        let mut pointer = good("pointer_movement");
-        pointer.evidence.generation = false;
-        let result = run_fault_case(&pointer, "run-1");
-        assert_eq!(result.stages["evidence"].status, Status::Blocked);
+        for fault in ["current_pointer_movement", "writer_lease_loss"] {
+            let mut missing_generation = good(fault);
+            missing_generation.evidence.generation = false;
+            assert_eq!(
+                run_fault_case(&missing_generation, "run-1").stages["evidence"].status,
+                Status::Blocked,
+                "{fault} requires generation evidence"
+            );
 
-        let mut hmac = good("stale_hmac");
+            let mut missing_cas = good(fault);
+            missing_cas.evidence.compare_and_swap = false;
+            assert_eq!(
+                run_fault_case(&missing_cas, "run-1").stages["evidence"].status,
+                Status::Blocked,
+                "{fault} requires compare-and-swap evidence"
+            );
+        }
+
+        let mut hmac = good("hmac_failure");
         hmac.evidence.audit = false;
         assert_eq!(
             run_fault_case(&hmac, "run-1").stages["evidence"].status,
             Status::Blocked
         );
-
-        let mut unknown_ack = good("unknown_ack");
-        unknown_ack.evidence.durable_reconcile = false;
+        let mut valid_hmac = good("hmac_failure");
+        valid_hmac.evidence.audit = true;
         assert_eq!(
-            run_fault_case(&unknown_ack, "run-1").stages["evidence"].status,
-            Status::Blocked
+            run_fault_case(&valid_hmac, "run-1").stages["evidence"].status,
+            Status::Pass
         );
 
-        let mut allow = good("redis_unavailable");
+        for fault in ["source_commit_unknown", "local_bus_unknown_completion"] {
+            let mut unknown = good(fault);
+            unknown.evidence.durable_reconcile = false;
+            assert_eq!(
+                run_fault_case(&unknown, "run-1").stages["evidence"].status,
+                Status::Blocked,
+                "{fault} requires durable reconciliation evidence"
+            );
+        }
+
+        let mut allow = good("memory_channel_suspect");
         allow.outcome.observed = Some(Decision::Allow);
         assert_eq!(
             run_fault_case(&allow, "run-1").stages["observe"].status,
             Status::Fail
         );
 
-        let mut host_allow = good("redis_unavailable");
+        let mut host_allow = good("memory_invalidation_omission");
         host_allow.outcome.host_admission = Some(Decision::Allow);
         assert_eq!(
             run_fault_case(&host_allow, "run-1").stages["observe"].status,
@@ -862,7 +899,7 @@ mod tests {
 
     #[test]
     fn runtime_preconditions_gate_mutation_and_leave_audit_free_of_controller_values() {
-        let mut unsupported = good("pointer_movement");
+        let mut unsupported = good("writer_lease_loss");
         unsupported.fault_supported = false;
         let report = run_fault_case(&unsupported, "run-1");
         assert_eq!(report.overall, Status::Blocked);
@@ -873,20 +910,20 @@ mod tests {
         assert!(!report.stages.contains_key("preflight"));
         assert!(!report.stages.contains_key("prepare"));
 
-        let mut unsafe_preflight = good("redis_unavailable");
+        let mut unsafe_preflight = good("local_bus_overflow");
         unsafe_preflight.read_only_preflight = false;
         let report = run_fault_case(&unsafe_preflight, "run-1");
         assert_eq!(report.stages["capabilities"].status, Status::Blocked);
         assert!(!report.stages.contains_key("prepare"));
 
-        let mut wrong_isolation = good("redis_unavailable");
+        let mut wrong_isolation = good("local_bus_owner_loss");
         wrong_isolation.run_scoped_isolation = false;
         assert_eq!(
             run_fault_case(&wrong_isolation, "run-1").stages["capabilities"].detail,
             "controller_isolation_not_run_scoped"
         );
 
-        let mut unauthorized = good("redis_unavailable");
+        let mut unauthorized = good("source_commit_unknown");
         unauthorized.authorization_ok = false;
         let report = run_fault_case(&unauthorized, "run-1");
         assert_eq!(
@@ -899,7 +936,7 @@ mod tests {
             HookResult::Error("controller_error"),
             HookResult::NonMapping,
         ] {
-            let mut rejected = good("redis_unavailable");
+            let mut rejected = good("worker_death_sticky");
             rejected.preflight = preflight;
             let report = run_fault_case(&rejected, "run-1");
             assert_eq!(report.overall, Status::Blocked);
@@ -937,12 +974,12 @@ mod tests {
 
     #[test]
     fn restore_reconcile_postcondition_and_outcome_aggregation_fail_closed() {
-        let mut restore = good("redis_unavailable");
+        let mut restore = good("local_bus_owner_loss");
         restore.restore = HookResult::Error("controller_error");
         let restore_report = run_fault_case(&restore, "run-1");
         assert_eq!(restore_report.stages["restore"].status, Status::Unknown);
 
-        let mut apply_error = good("worker_restart");
+        let mut apply_error = good("worker_death_sticky");
         apply_error.apply = HookResult::Error("ValueError");
         let apply_error_report = run_fault_case(&apply_error, "run-1");
         assert_eq!(apply_error_report.overall, Status::Unknown);
@@ -952,7 +989,7 @@ mod tests {
         assert_eq!(apply_error_report.stages["reconcile"].calls, 1);
         assert_eq!(apply_error_report.retries, 0);
 
-        let mut missing_ref = good("redis_unavailable");
+        let mut missing_ref = good("local_bus_unknown_completion");
         missing_ref.proof_ref = false;
         let report = run_fault_case(&missing_ref, "run-1");
         assert_eq!(
@@ -961,7 +998,7 @@ mod tests {
         );
         assert!(!report.retry_permitted);
 
-        let mut no_postcondition = good("redis_unavailable");
+        let mut no_postcondition = good("mysql_unavailable");
         no_postcondition.postcondition_ok = None;
         assert_eq!(
             run_fault_case(&no_postcondition, "run-1").stages["postcondition"].detail,
@@ -1051,24 +1088,32 @@ mod tests {
 
         let subset = aggregate_matrix(reports[..1].to_vec(), &[FAULTS[0]]);
         assert!(!subset.matrix_complete);
-        assert_eq!(subset.missing_faults.len(), 5);
+        assert_eq!(subset.missing_faults.len(), FAULTS.len() - 1);
         assert_eq!(subset.status, Status::Pass);
 
-        let mut incomplete = good("unknown_ack");
+        let mut incomplete = good("source_commit_unknown");
+        incomplete.apply = HookResult::Timeout;
         incomplete.reconcile = HookResult::Disconnect;
         incomplete.reconciliation_proven = false;
         let incomplete = run_fault_case(&incomplete, "run-1");
+        assert_eq!(incomplete.overall, Status::Unknown);
+        assert_eq!(incomplete.stages["apply"].status, Status::Unknown);
+        assert_eq!(incomplete.stages["apply"].calls, 1);
+        assert_eq!(incomplete.stages["reconcile"].status, Status::Unknown);
+        assert_eq!(incomplete.stages["reconcile"].calls, 1);
+        assert_eq!(incomplete.stages["evidence"].status, Status::Unknown);
+        assert!(!incomplete.retry_permitted);
         let failed_matrix = aggregate_matrix(vec![incomplete], &FAULTS);
-        assert_eq!(failed_matrix.status, Status::Blocked);
+        assert_eq!(failed_matrix.status, Status::Unknown);
         assert!(!failed_matrix.matrix_complete);
         assert!(failed_matrix.missing_faults.is_empty());
         assert_eq!(
-            stable_operation_id("run-1", "e4-fault:redis_unavailable:attempt-1"),
-            Ok("9666e4b2-45f9-59a4-a96d-494940ac0739".to_owned())
+            stable_operation_id("run-1", "e4-fault:memory_channel_suspect:attempt-1"),
+            Ok("4dc22a28-770a-5eb6-b4ab-6e5138cde29f".to_owned())
         );
         assert_eq!(
-            stable_operation_id("run-1", "e4-fault:unknown_ack:attempt-1"),
-            Ok("23c535c6-6064-5969-8dd5-8e54aa55a7ff".to_owned())
+            stable_operation_id("run-1", "e4-fault:source_commit_unknown:attempt-1"),
+            Ok("9144814f-668e-573f-9924-5e6e2c150fa9".to_owned())
         );
         let ids = FAULTS
             .iter()
@@ -1077,12 +1122,32 @@ mod tests {
             })
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(ids.len(), FAULTS.len());
-        assert!(stable_operation_id("run id", "e4-fault:redis_unavailable:attempt-1").is_err());
+        for (fault_id, evidence_key) in [
+            ("current_pointer_movement", "generation"),
+            ("current_pointer_movement", "compare_and_swap"),
+            ("writer_lease_loss", "generation"),
+            ("writer_lease_loss", "compare_and_swap"),
+            ("hmac_failure", "audit"),
+            ("source_commit_unknown", "durable_reconcile"),
+            ("local_bus_unknown_completion", "durable_reconcile"),
+        ] {
+            assert!(
+                required_evidence(fault_id).contains(&evidence_key),
+                "{fault_id} requires {evidence_key}"
+            );
+        }
+        assert_eq!(
+            aggregate_matrix(reports.clone(), &FAULTS).missing_faults,
+            Vec::<&str>::new()
+        );
+        assert!(
+            stable_operation_id("run id", "e4-fault:memory_channel_suspect:attempt-1").is_err()
+        );
     }
 
     #[test]
     fn prepare_timeout_skips_apply_and_runs_recovery_once() {
-        let mut input = good("redis_unavailable");
+        let mut input = good("memory_channel_suspect");
         input.prepare = HookResult::Timeout;
         let result = run_fault_case(&input, "run-1");
         assert_eq!(result.overall, Status::Unknown);
@@ -1097,7 +1162,7 @@ mod tests {
     #[test]
     fn apply_timeout_and_disconnect_are_unknown_without_retry() {
         for hook in [HookResult::Timeout, HookResult::Disconnect] {
-            let mut input = good("redis_unavailable");
+            let mut input = good("memory_channel_suspect");
             input.apply = hook;
             let result = run_fault_case(&input, "run-1");
             assert_eq!(result.overall, Status::Unknown, "{hook:?}");
@@ -1116,22 +1181,23 @@ mod tests {
             exec_level: "Exec-L3",
             isolate_token: "isolate-run-1-a",
             approval_token: "approve-run-1-b",
-            allowlist: &["redis_unavailable"],
+            allowlist: &["memory_channel_suspect"],
             approved_by: "human-operator",
         };
         let original = auth.clone();
-        let context = build_hook_context("run-1", "redis_unavailable", "apply", &auth).unwrap();
+        let context =
+            build_hook_context("run-1", "memory_channel_suspect", "apply", &auth).unwrap();
         assert_eq!(context.run_id, "run-1");
-        assert_eq!(context.fault_id, "redis_unavailable");
+        assert_eq!(context.fault_id, "memory_channel_suspect");
         assert_eq!(context.stage, "apply");
         assert_eq!(context.attempt, 1);
         assert_eq!(
             context.operation_id,
-            stable_operation_id("run-1", "e4-fault:redis_unavailable:attempt-1").unwrap()
+            stable_operation_id("run-1", "e4-fault:memory_channel_suspect:attempt-1").unwrap()
         );
         assert_eq!(context.authorization_run_id, "run-1");
         assert!(!context.token_values_recorded);
         assert_eq!(auth, original);
-        assert!(build_hook_context("other-run", "redis_unavailable", "apply", &auth).is_err());
+        assert!(build_hook_context("other-run", "memory_channel_suspect", "apply", &auth).is_err());
     }
 }

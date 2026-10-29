@@ -213,12 +213,7 @@ mod tests {
     #[test]
     fn excluded_service_sources_are_outside_the_workspace_gate() {
         let root = include_str!("../../Cargo.toml");
-        for excluded in [
-            "\"astral-learn\"",
-            "\"astral-chat\"",
-            "\"astral-cache\"",
-            "\"integrations\"",
-        ] {
+        for excluded in ["\"astral-learn\"", "\"astral-chat\"", "\"integrations\""] {
             assert!(root.contains(excluded), "{excluded}");
         }
         let chat_tests = include_str!("../../astral-chat/tests/integration.rs");

@@ -18,10 +18,6 @@ use astral_common::error::AppError;
 use astral_common::middleware::decode_v2_token;
 use astral_common::token_contract::{PrincipalKind, TokenUse};
 use astral_types::AstralError;
-#[cfg(feature = "redis-compat")]
-use redis::aio::ConnectionManager;
-#[cfg(feature = "redis-compat")]
-use redis::AsyncCommands;
 
 use super::session_repository::{self as session_repo, DeviceSessionRow};
 use super::source_writer_guard;
@@ -378,22 +374,20 @@ async fn refresh_token_from_session(
     let new_access_token = token_result.token.clone();
     let expires_in = token_result.expires_in;
 
-    // Session epoch fencing requires every credential issued before this rotation
-    // to lose both Gateway projections before a replacement can be returned.
+    // Session epoch fencing first closes every prior durable JTI proof and installs
+    // bounded deny accelerators before a replacement credential can be returned.
     delete_session_projections_before_epoch(state, session.session_id, next_session_epoch)
         .await
         .map_err(AppError::from)?;
 
-    // Step 5.5: 记录 durable jti proof（TTL = token 过期时间，用于撤销 fan-out）；
-    // Redis 投影仅是 default-off 兼容 adapter。
-    // This is intentionally done only after the refresh-token CAS below succeeds.
+    // The durable JTI proof is written only after the refresh-token CAS succeeds.
 
     // Step 6: 原子轮换 refresh token。旧 hash 必须仍是当前值；并发请求中只有一个
     // UPDATE 能影响一行，失败者按 token reuse 处理并撤销整个 family。
     // 会话轮换的 autocommit source 栅栏：hub 已装则 fail-closed 取得（不可得即
     // 拒绝轮换），await 窗口前武装取消栅栏——窗口内取消/掉线 → sticky
     // uncertain_source；结果判定后 proven 释放（CAS 未命中 0 行未发生 mutation，
-    // 同样 proven）。栅栏只围本条 SQL，不覆盖其前后的 Redis 投影段。
+    // 同样 proven）。栅栏只围本条 SQL，不覆盖其前后的已验证本地加速登记。
     let rotation_guard = source_writer_guard::begin_source_write()?;
     let rotation = source_writer_guard::fenced_source_write(
         rotation_guard,
@@ -437,10 +431,9 @@ async fn refresh_token_from_session(
         )));
     }
 
-    // Step 5.5: 凭证追踪是安全关键。Redis-free 默认路径的权威事实是 durable
-    // jti proof（auth_session_jti_index）；兼容 adapter（default-off Redis
-    // 投影）失败同样硬失败。任一失败都撤销 durable family，避免轮换后的
-    // refresh 状态在没有可追踪 access 凭证时静默存活。
+    // Credential tracking is security-critical: durable JTI proof in
+    // auth_session_jti_index is authoritative. Failure revokes the durable family
+    // so a rotated refresh state cannot survive without a trackable access token.
     if let Err(projection_error) = store_session_grant_projection(
         state,
         &token_result,
@@ -486,9 +479,7 @@ async fn refresh_token_from_session(
         token_type: "Bearer".into(),
         expires_in_millis,
         refresh_expires_in_millis,
-        token: None,
         user: None,
-        identity_card: None,
         current_card: None,
         available_cards: None,
         permissions: None,
@@ -519,14 +510,6 @@ async fn revoke_session(
     match token_use {
         TokenUse::Access => {
             delete_access_projections(&state, &claims.jti).await?;
-            #[cfg(feature = "redis-compat")]
-            mark_jti_revoked_at(
-                state.redis.as_ref(),
-                &claims.jti,
-                state.config.jwt.access.expiry_seconds,
-            )
-            .await?;
-            #[cfg(not(feature = "redis-compat"))]
             mark_jti_revoked_at(&claims.jti, state.config.jwt.access.expiry_seconds).await?;
         }
         TokenUse::Refresh => {
@@ -553,14 +536,6 @@ async fn logout(
     match token_use {
         TokenUse::Access => {
             delete_access_projections(&state, &claims.jti).await?;
-            #[cfg(feature = "redis-compat")]
-            mark_jti_revoked_at(
-                state.redis.as_ref(),
-                &claims.jti,
-                state.config.jwt.access.expiry_seconds,
-            )
-            .await?;
-            #[cfg(not(feature = "redis-compat"))]
             mark_jti_revoked_at(&claims.jti, state.config.jwt.access.expiry_seconds).await?;
         }
         TokenUse::Refresh => {
@@ -571,7 +546,7 @@ async fn logout(
 }
 
 /// logout/revoke 共用的凭证前置门：Authorization 头缺失或非 Bearer 形态
-/// 直接拒绝，任何 db/jwt/redis 都不会被触碰。
+/// 直接拒绝，任何数据库或 token 解码都不会被触碰。
 fn logout_bearer_credential(headers: &HeaderMap) -> Result<&str, AppError> {
     bearer_token(headers).ok_or_else(|| AppError::from(AstralError::Auth("BEARER_REQUIRED".into())))
 }
@@ -608,8 +583,8 @@ async fn revoke_logout_refresh(
     })?
     .ok_or_else(|| AppError::from(AstralError::Auth("Invalid refresh token".into())))?;
 
-    // Redis projection removal precedes durable revocation so a cache failure
-    // cannot leave a Gateway-live credential behind a closed session state.
+    // Close the durable session grant proofs before completing revocation; a
+    // failure cannot leave a Gateway-live credential behind a closed session.
     delete_session_projections(state, session.session_id)
         .await
         .map_err(AppError::from)?;
@@ -620,15 +595,6 @@ async fn revoke_logout_refresh(
     write_session_revocation_outbox(state, session.session_id, "LOGOUT")
         .await
         .map_err(AppError::from)?;
-    #[cfg(feature = "redis-compat")]
-    mark_jti_revoked_at(
-        state.redis.as_ref(),
-        refresh_jti,
-        state.config.jwt.refresh.expiry_seconds * 2,
-    )
-    .await
-    .map_err(AppError::from)?;
-    #[cfg(not(feature = "redis-compat"))]
     mark_jti_revoked_at(refresh_jti, state.config.jwt.refresh.expiry_seconds * 2)
         .await
         .map_err(AppError::from)?;
@@ -637,8 +603,8 @@ async fn revoke_logout_refresh(
 
 /// 记录单会话撤销 outbox（对齐 Java durable 补偿路径；列契约见 20260728000001 DDL）
 ///
-/// 单会话撤销（token revoke / logout）同样留 durable 轨迹：Redis 投影删除失败时
-/// 可经补偿 worker 按 `session:{session_id}` 补删，避免撤销只落内存/黑名单。
+/// 单会话撤销（token revoke / logout）同样留 durable 轨迹：补偿 worker 可按
+/// `session:{session_id}` 重建已提交的撤销拒绝镜像，避免只依赖进程内 marker。
 /// autocommit INSERT 带 source 栅栏（hub 未装 no-op；await 窗口武装取消栅栏）。
 async fn write_session_revocation_outbox(
     state: &AppState,
@@ -743,7 +709,7 @@ async fn revoke_token_family(
     // 语句（零网络段），统一持有一份 writer 栅栏——begin 前取得、首语句 await 前
     // 武装、outbox 落盘后 proven 释放。中途任何失败/取消以已武装 Drop 保持
     // sticky uncertain_source（部分 autocommit 效果已存在，属未知结果）。栅栏
-    // 绝不覆盖其前后的 Redis 投影段。
+    // 绝不覆盖其前后的本地拒绝加速登记。
     let source_guard = source_writer_guard::begin_source_write()?;
     source_writer_guard::arm_commit_fence(&source_guard);
     session_repo::revoke_family_cas(&state.db, family_id, reason).await?;
@@ -779,9 +745,9 @@ async fn revoke_token_family(
 /// Revoke every active session and token family for a user.
 ///
 /// Java's `AuthDeviceSessionService.revokeAllForUser()` closes the durable
-/// session/family state and removes every indexed Redis projection. Projection
-/// removal happens first so a partial failure cannot leave a live credential
-/// after the security mutation has started.
+/// session/family state and records a durable recovery event. Verified local
+/// deny markers are installed from indexed JTIs before source mutation; a miss
+/// or eviction always falls back to the authoritative MySQL state.
 pub(crate) async fn revoke_all_sessions_for_user(
     state: &AppState,
     user_id: i64,
@@ -850,26 +816,18 @@ async fn db_revoke_session(db: &sqlx::MySqlPool, id: i64, reason: &str) -> Resul
     .await
 }
 
-/// Store the durable access projection for a newly issued credential.
+/// Store the durable access proof for a newly issued credential.
 ///
-/// Redis-free 默认路径的安全顺序：
-/// 1. **durable proof 先行**——`auth_session_jti_index` INSERT...SELECT 门控于
-///    durable session 仍 ACTIVE 且 epoch 一致（[`astral_db::record_session_jti_proof`]）。
-///    这是 Gateway strict 判定的权威事实；失败即签发失败（调用方回滚 family）。
-/// 2. 兼容 adapter（default-off，`state.redis` 已安装时）：追加历史 Redis
-///    `access:jti`/`access:grant` 投影；失败语义与历史一致（返回 Err →
-///    调用方撤销 family），防止兼容部署里 Gateway 仍以 Redis 为判定面时
-///    出现未跟踪凭证。
-/// 3. 镜像登记（verified-only）：签发后以 strict DB 复核登记进程内镜像，
-///    任意外部快照不得直接进入 Allow（见
-///    [`astral_db::install_verified_access_grant`]）。
+/// `auth_session_jti_index` is the authoritative Gateway admission fact; proof
+/// failure aborts issuance (the caller compensates by closing the family).
+/// After the strict MySQL proof, the verified-only mirror is best-effort and
+/// cannot authorize an unverified grant (see
+/// [`astral_db::install_verified_access_grant`]).
 pub(crate) async fn store_session_grant_projection(
     state: &AppState,
     token: &TokenResult,
     grant: SessionGrant,
 ) -> Result<(), AstralError> {
-    #[cfg(feature = "redis-compat")]
-    let ttl = token.expires_in.max(60) as u64;
     let principal_kind = PrincipalKind::parse(&grant.principal_kind)
         .ok_or_else(|| AstralError::Auth("PRINCIPAL_KIND_INVALID".into()))?;
     if principal_kind == PrincipalKind::PlatformUser {
@@ -894,28 +852,6 @@ pub(crate) async fn store_session_grant_projection(
             token.expires_at_epoch_second,
         )
         .await?;
-    }
-
-    // 兼容 adapter：仅当显式配置（redis_projection_compat_enabled → runtime
-    // 装配 redis）时写入历史 Redis 投影，失败即签发失败。
-    #[cfg(feature = "redis-compat")]
-    if let Some(redis) = &state.redis {
-        let grant_json = serde_json::to_string(&grant)
-            .map_err(|e| AstralError::Cache(format!("Serialize session grant failed: {e}")))?;
-        let mut conn = redis.clone();
-        let scalar_key = format!("access:jti:{}", token.jti);
-        let grant_key = format!("access:grant:{}", token.jti);
-        conn.set_ex::<_, _, ()>(&scalar_key, grant.user_id.to_string(), ttl)
-            .await
-            .map_err(|e| {
-                AstralError::Cache(format!("Store token scalar projection failed: {e}"))
-            })?;
-        if let Err(error) = conn.set_ex::<_, _, ()>(&grant_key, grant_json, ttl).await {
-            let _: Result<(), _> = conn.del(&scalar_key).await;
-            return Err(AstralError::Cache(format!(
-                "Store session grant projection failed: {error}"
-            )));
-        }
     }
 
     install_verified_session_grant_mirror(state, token, &grant);
@@ -1042,7 +978,6 @@ async fn delete_session_projections_before_epoch(
         astral_db::load_active_jtis_by_session_before_epoch(&state.db, session_id, epoch_exclusive)
             .await?;
     delete_indexed_session_projections(
-        state,
         &indexed_jtis
             .iter()
             .map(|jti| (jti.clone(),))
@@ -1054,14 +989,13 @@ async fn delete_session_projections_before_epoch(
     Ok(())
 }
 
-/// 单机组合进程加速器：与本文件各 Redis `jwt:revoked:{jti}` 写入同点登记
-/// 进程内注册表/镜像（同一 TTL）；未安装时 no-op，strict DB 仍是权威回退。
+/// Register a durably revoked JTI in bounded process-local acceleration
+/// surfaces. These markers only accelerate denial; MySQL remains authoritative.
 fn mark_registry_revoked(jti: &str, ttl_seconds: u64) {
     if let Some(store) = astral_common::session_projection_store::global_session_projection_store()
     {
         store.note_revocation(jti, ttl_seconds);
     }
-    // 既有撤销注册表（default-off，命中即拒的加速面）继续同点登记。
     if let Some(registry) =
         astral_common::session_revocation_registry::global_session_revocation_registry()
     {
@@ -1069,62 +1003,17 @@ fn mark_registry_revoked(jti: &str, ttl_seconds: u64) {
     }
 }
 
-/// 兼容 adapter 的 Redis 撤销投影（default-off；`state.redis` 已安装时调用）。
-/// 失败硬失败：兼容部署的 Gateway 仍以 Redis 为判定面，投影残留 = 撤销失效。
-#[cfg(feature = "redis-compat")]
-async fn compat_delete_and_revoke(
-    redis: &ConnectionManager,
-    jtis: &[String],
-) -> Result<(), AstralError> {
-    let mut conn = redis.clone();
-    for jti in jtis {
-        let _: () = conn
-            .del((format!("access:jti:{jti}"), format!("access:grant:{jti}")))
-            .await
-            .map_err(|e| AstralError::Cache(format!("Delete session projection failed: {e}")))?;
-        // Rust Gateway 兼容路径以 `jwt:revoked:{jti}` 黑名单为会话有效性判定
-        // （不读 access:jti/grant）。撤销链必须写黑名单，否则被撤销的 access
-        // token 仍可过网关直到 JWT 过期。TTL 7 天覆盖 access token 最大生命周期。
-        let _: () = conn
-            .set_ex::<_, _, ()>(
-                format!("{}{jti}", REVOKED_JTI_KEY_PREFIX),
-                "1",
-                REVOKED_TTL_SECS,
-            )
-            .await
-            .map_err(|e| AstralError::Cache(format!("Mark revoked JTI failed: {e}")))?;
-    }
-    Ok(())
-}
-
-async fn delete_indexed_session_projections(
-    _state: &AppState,
-    indexed_jtis: &[(String,)],
-) -> Result<(), AstralError> {
-    if indexed_jtis.is_empty() {
-        return Ok(());
-    }
-    let jtis: Vec<String> = indexed_jtis.iter().map(|(jti,)| jti.clone()).collect();
-    // 兼容 adapter：保持历史"投影删除先于 durable 关闭"的顺序（Gateway 兼容
-    // 判定面以 Redis 为准）；Redis-free 默认路径跳过本块（feature-off 构建
-    // 中 compat adapter 不存在，`_state` 仅 compat 编译时引用）。
-    #[cfg(feature = "redis-compat")]
-    if let Some(redis) = &_state.redis {
-        compat_delete_and_revoke(redis, &jtis).await?;
-    }
-    for jti in &jtis {
+async fn delete_indexed_session_projections(indexed_jtis: &[(String,)]) -> Result<(), AstralError> {
+    for (jti,) in indexed_jtis {
         mark_registry_revoked(jti, REVOKED_TTL_SECS);
     }
     Ok(())
 }
 
-/// Post-commit password revocation projection. Source JTIs/session/family were
-/// already committed atomically; this function never reloads a broader snapshot.
+/// Post-commit projection of only the JTI snapshot returned by the atomic
+/// password mutation; this helper never reloads a broader snapshot.
 pub(crate) async fn project_password_revocation(
-    _state: &AppState,
     revoked_jtis: &[String],
-    #[cfg(feature = "redis-compat")] redis: Option<&ConnectionManager>,
-    #[cfg(not(feature = "redis-compat"))] _redis: Option<&()>,
 ) -> Result<(), AstralError> {
     for jti in revoked_jtis {
         if jti.trim().is_empty() {
@@ -1132,10 +1021,6 @@ pub(crate) async fn project_password_revocation(
                 "Password revocation snapshot contains an empty JTI".into(),
             ));
         }
-    }
-    #[cfg(feature = "redis-compat")]
-    if let Some(redis) = redis {
-        compat_delete_and_revoke(redis, revoked_jtis).await?;
     }
     astral_db::note_revocations_in_process(revoked_jtis, astral_db::REVOCATION_MIRROR_TTL_SECS);
     for jti in revoked_jtis {
@@ -1147,7 +1032,6 @@ pub(crate) async fn project_password_revocation(
 async fn delete_session_projections(state: &AppState, session_id: i64) -> Result<(), AstralError> {
     let indexed_jtis = astral_db::load_active_jtis_by_session(&state.db, session_id).await?;
     delete_indexed_session_projections(
-        state,
         &indexed_jtis
             .iter()
             .map(|jti| (jti.clone(),))
@@ -1159,49 +1043,14 @@ async fn delete_session_projections(state: &AppState, session_id: i64) -> Result
 }
 
 async fn delete_access_projections(state: &AppState, jti: &str) -> Result<(), AstralError> {
-    // 兼容 adapter：保持历史"投影删除先于 durable 关闭"的顺序。
-    #[cfg(feature = "redis-compat")]
-    if let Some(redis) = &state.redis {
-        compat_delete_and_revoke(redis, std::slice::from_ref(&jti.to_string())).await?;
-    }
+    // Durable proof closure is authoritative; the local marker only accelerates deny.
     mark_registry_revoked(jti, REVOKED_TTL_SECS);
-    // durable 关闭是 Redis-free 默认路径的权威撤销事实（Gateway strict 判定）。
     astral_db::close_jti_proof(&state.db, jti).await?;
     Ok(())
 }
 
-/// Mark an access JTI as revoked in the shared projection surfaces.
-///
-/// 兼容 adapter（`redis` 已安装）写入 `jwt:revoked:{jti}` 黑名单，失败硬失败
-/// （与历史语义一致）；Redis-free 默认路径仅登记进程内加速面，权威事实是
-/// 调用方已完成的 durable 关闭。
-/// compat 路径签名（仅 redis-compat feature 编译）：`redis` 为 `Some` 时写
-/// `jwt:revoked:{jti}` 黑名单（失败硬失败），`None` 时与默认路径等价。
-#[cfg(feature = "redis-compat")]
-async fn mark_jti_revoked_at(
-    redis: Option<&ConnectionManager>,
-    jti: &str,
-    ttl_seconds: i64,
-) -> Result<(), AstralError> {
-    if jti.trim().is_empty() {
-        return Err(AstralError::Auth("TOKEN_ID_REQUIRED".into()));
-    }
-    let ttl = ttl_seconds.max(60) as u64;
-    if let Some(redis) = redis {
-        let key = format!("jwt:revoked:{jti}");
-        let mut conn = redis.clone();
-        conn.set_ex::<_, _, ()>(&key, "1", ttl)
-            .await
-            .map_err(|e| AstralError::Cache(format!("Mark token revoked in Redis failed: {e}")))?;
-        tracing::debug!(key = %key, "marked token as revoked in Redis");
-    }
-    mark_registry_revoked(jti, ttl);
-    Ok(())
-}
-
-/// redis-compat feature 未编译：无 compat adapter 可用，仅登记进程内加速面
-/// （权威事实是调用方已完成的 durable 关闭；Registry/mark 语义不变）。
-#[cfg(not(feature = "redis-compat"))]
+/// Mark an access JTI revoked in bounded local acceleration surfaces after its
+/// caller has established the durable close/outbox source mutation.
 async fn mark_jti_revoked_at(jti: &str, ttl_seconds: i64) -> Result<(), AstralError> {
     if jti.trim().is_empty() {
         return Err(AstralError::Auth("TOKEN_ID_REQUIRED".into()));
@@ -1211,12 +1060,20 @@ async fn mark_jti_revoked_at(jti: &str, ttl_seconds: i64) -> Result<(), AstralEr
     Ok(())
 }
 
-/// 会话级撤销写入 Gateway 黑名单的 TTL（秒，7 天），覆盖 access token 最大生命周期。
-/// Rust Gateway 以 `jwt:revoked:{jti}` 为会话有效性判定（对齐 Java 删投影语义）。
-/// Rust Gateway 兼容黑名单键前缀：撤销链必须写 `jwt:revoked:{jti}`，
-/// 否则被撤销的 access token 在 JWT 过期前仍可过网关。
-pub(crate) const REVOKED_JTI_KEY_PREFIX: &str = "jwt:revoked:";
 const REVOKED_TTL_SECS: u64 = 7 * 24 * 3600;
+
+/// Durable operation status emitted before the session/JTI grant mirror step.
+/// Existing rows may still carry the pre-V6 status; those rows are recoverable
+/// only after `reproject_switch_response` proves the current MySQL session and JTI.
+const LEGACY_SWITCH_OPERATION_STATUS_COMMITTED_PENDING_REDIS: &str = "COMMITTED_PENDING_REDIS";
+const SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION: &str = "COMMITTED_PENDING_PROJECTION";
+const SWITCH_OPERATION_STATUS_NAMES: [&str; 2] = [
+    LEGACY_SWITCH_OPERATION_STATUS_COMMITTED_PENDING_REDIS,
+    SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION,
+];
+fn is_recoverable_switch_operation_status(status: &str) -> bool {
+    SWITCH_OPERATION_STATUS_NAMES.contains(&status)
+}
 
 #[derive(Debug, sqlx::FromRow)]
 struct SwitchOperationRow {
@@ -1376,17 +1233,20 @@ pub(crate) async fn switch_card_session(
             };
             let response_expires_at = response_expiry()?;
             let persisted = sqlx::query(
-                "UPDATE auth_session_operation SET session_id = ?, status = 'COMMITTED_PENDING_REDIS', \
+                "UPDATE auth_session_operation SET session_id = ?, status = ?, \
                  response_ciphertext = ?, response_expires_at = ?, updated_at = UTC_TIMESTAMP() \
                  WHERE operation_id = ? AND status = 'PENDING'",
             )
             .bind(session.session_id)
+            .bind(SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION)
             .bind(ciphertext)
             .bind(response_expires_at)
             .bind(&operation_id)
             .execute(&state.db)
             .await
-            .map_err(|error| AstralError::Database(format!("Persist switch operation failed: {error}")))?;
+            .map_err(|error| {
+                AstralError::Database(format!("Persist switch operation failed: {error}"))
+            })?;
             if persisted.rows_affected() != 1 {
                 revoke_token_family(
                     state,
@@ -1445,9 +1305,10 @@ pub(crate) async fn switch_card_session(
 
             let completed = sqlx::query(
                 "UPDATE auth_session_operation SET status = 'COMPLETED', completed_at = UTC_TIMESTAMP(), \
-                 updated_at = UTC_TIMESTAMP() WHERE operation_id = ? AND status = 'COMMITTED_PENDING_REDIS'",
+                 updated_at = UTC_TIMESTAMP() WHERE operation_id = ? AND status = ?",
             )
             .bind(&operation_id)
+            .bind(SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION)
             .execute(&state.db)
             .await
             .map_err(|error| AstralError::Database(format!("Complete switch operation failed: {error}")))?;
@@ -1568,21 +1429,30 @@ async fn replay_or_recover_switch_operation(
     if operation.status == "COMPLETED" {
         return Ok(response);
     }
-    if operation.status != "COMMITTED_PENDING_REDIS" {
+    if !is_recoverable_switch_operation_status(&operation.status) {
         return Err(AppError::from(AstralError::Auth(
             "SESSION_OPERATION_IN_PROGRESS".into(),
         )));
     }
 
     reproject_switch_response(state, &response).await?;
+    // Accept only the two known durable in-flight labels. The legacy label is
+    // retained for rows created before V6; the recovered response is still
+    // revalidated against durable session and JTI proof before completion.
     let updated = sqlx::query(
         "UPDATE auth_session_operation SET status = 'COMPLETED', completed_at = UTC_TIMESTAMP(), \
-         updated_at = UTC_TIMESTAMP() WHERE operation_id = ? AND status = 'COMMITTED_PENDING_REDIS'",
+         updated_at = UTC_TIMESTAMP() WHERE operation_id = ? AND status IN (?, ?)",
     )
     .bind(&operation.operation_id)
+    .bind(LEGACY_SWITCH_OPERATION_STATUS_COMMITTED_PENDING_REDIS)
+    .bind(SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION)
     .execute(&state.db)
     .await
-    .map_err(|error| AstralError::Database(format!("Complete recovered switch operation failed: {error}")))?;
+    .map_err(|error| {
+        AstralError::Database(format!(
+            "Complete recovered switch operation failed: {error}"
+        ))
+    })?;
     if updated.rows_affected() != 1 {
         return Err(AppError::from(AstralError::Auth(
             "Session operation completion could not be confirmed".into(),
@@ -1743,7 +1613,6 @@ async fn switch_card_once(
         token_type: "Bearer".into(),
         expires_in_millis: token.expires_in * 1000,
         refresh_expires_in_millis: refresh_lifetime * 1000,
-        token: Some(token.token.clone()),
         user: Some(serde_json::json!({
             "userId": user.user_id,
             "username": user.user_no,
@@ -1752,12 +1621,6 @@ async fn switch_card_once(
             "phone": user.phone,
             "status": user.status,
             "hasLocalCredential": true,
-        })),
-        identity_card: Some(serde_json::json!({
-            "cardId": identity.0,
-            "userId": user_id,
-            "status": "ACTIVE",
-            "tokenVersion": identity.1,
         })),
         current_card: Some(target_card),
         available_cards: Some(available_cards),
@@ -2240,35 +2103,13 @@ async fn reproject_switch_response(
 
 /// Re-project a previously proven access credential (switch-card recovery).
 ///
-/// durable proof 由调用方先行写入（`auth_session_jti_index`）；本函数只负责
-/// 兼容 adapter 的 Redis 投影（default-off）与 verified 镜像登记。
+/// Durable proof is written by the caller (`auth_session_jti_index`); this
+/// function only installs the verified process-local acceleration mirror.
 async fn restore_session_grant_projection(
     state: &AppState,
     token: &TokenResult,
     grant: SessionGrant,
 ) -> Result<(), AstralError> {
-    #[cfg(feature = "redis-compat")]
-    let ttl = token.expires_in.max(1) as u64;
-    #[cfg(feature = "redis-compat")]
-    if let Some(redis) = &state.redis {
-        let grant_json = serde_json::to_string(&grant).map_err(|error| {
-            AstralError::Cache(format!("Serialize switch replay grant failed: {error}"))
-        })?;
-        let mut conn = redis.clone();
-        let scalar_key = format!("access:jti:{}", token.jti);
-        let grant_key = format!("access:grant:{}", token.jti);
-        conn.set_ex::<_, _, ()>(&scalar_key, grant.user_id.to_string(), ttl)
-            .await
-            .map_err(|error| {
-                AstralError::Cache(format!("Restore token scalar projection failed: {error}"))
-            })?;
-        if let Err(error) = conn.set_ex::<_, _, ()>(&grant_key, grant_json, ttl).await {
-            let _: Result<(), _> = conn.del(&scalar_key).await;
-            return Err(AstralError::Cache(format!(
-                "Restore session grant projection failed: {error}"
-            )));
-        }
-    }
     install_verified_session_grant_mirror(state, token, &grant);
     Ok(())
 }
@@ -2322,6 +2163,23 @@ mod tests {
     }
 
     #[test]
+    fn switch_operation_recovers_only_known_projection_pending_statuses() {
+        assert_eq!(
+            SWITCH_OPERATION_STATUS_NAMES,
+            ["COMMITTED_PENDING_REDIS", "COMMITTED_PENDING_PROJECTION"]
+        );
+        assert!(is_recoverable_switch_operation_status(
+            LEGACY_SWITCH_OPERATION_STATUS_COMMITTED_PENDING_REDIS
+        ));
+        assert!(is_recoverable_switch_operation_status(
+            SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION
+        ));
+        for status in ["PENDING", "COMPLETED", "FAILED", "UNKNOWN"] {
+            assert!(!is_recoverable_switch_operation_status(status));
+        }
+    }
+
+    #[test]
     fn session_response_key_requires_base64_encoded_256_bit_key() {
         let _guard = session_response_env_lock().lock().unwrap();
         unsafe { std::env::remove_var("IDENTITY_SESSION_RESPONSE_AES_GCM_KEY") };
@@ -2353,9 +2211,7 @@ mod tests {
             token_type: "Bearer".into(),
             expires_in_millis: 1_000,
             refresh_expires_in_millis: 2_000,
-            token: Some("access".into()),
             user: None,
-            identity_card: None,
             current_card: None,
             available_cards: None,
             permissions: Some(vec![]),
@@ -2426,22 +2282,6 @@ mod tests {
         assert!(bearer_token(&headers).is_none());
     }
 
-    #[cfg(feature = "redis-compat")]
-    #[tokio::test]
-    async fn compat_redis_revoke_failure_is_returned_and_redis_free_path_succeeds() {
-        let client = redis::Client::open("redis://127.0.0.1:1/").unwrap();
-        let redis = redis::aio::ConnectionManager::new_lazy_with_config(
-            client,
-            redis::aio::ConnectionManagerConfig::new(),
-        )
-        .unwrap();
-        // 兼容 adapter（显式安装 Redis）：撤销投影失败必须报错，不得吞掉。
-        let result = mark_jti_revoked_at(Some(&redis), "refresh-jti", 1).await;
-        assert!(matches!(result, Err(AstralError::Cache(_))));
-        // Redis-free 默认路径：无 Redis 时撤销登记成功（权威事实是调用方的
-        // durable 关闭，进程内登记 best-effort）。
-        assert!(mark_jti_revoked_at(None, "refresh-jti", 1).await.is_ok());
-    }
     #[test]
     fn refresh_requires_persisted_positive_family_id() {
         assert!(!is_refresh_family_id_valid(0));
@@ -2464,18 +2304,6 @@ mod tests {
         assert!(!rotation_succeeded(2));
     }
 
-    #[test]
-    fn v2_refresh_is_not_a_legacy_raw_token_key() {
-        // The revocation chain must keep writing the Gateway-compat
-        // `jwt:revoked:{jti}` blacklist key; pinning the production prefix
-        // (not a re-formatted copy) makes a rename redden this test.
-        assert_eq!(REVOKED_JTI_KEY_PREFIX, "jwt:revoked:");
-        assert_eq!(
-            format!("{}{}", REVOKED_JTI_KEY_PREFIX, "refresh-jti"),
-            "jwt:revoked:refresh-jti"
-        );
-    }
-
     #[tokio::test]
     async fn family_database_failure_is_an_error() {
         let db = sqlx::MySqlPool::connect_lazy("mysql://localhost:1/identity")
@@ -2486,7 +2314,7 @@ mod tests {
 
     /// 撤销/轮换集群 source 栅栏形状回归（源形状，无 IO）：
     /// 1. family 撤销集群（CAS + 级联 + outbox）持有一份栅栏，武装先于首条
-    ///    await，settle 在 outbox 落盘后，Redis 投影段在栅栏之外；
+    ///    await，settle 在 outbox 落盘后，本地拒绝 marker 段在栅栏之外；
     /// 2. user 撤销集群同形状；
     /// 3. refresh 轮换与单会话撤销、撤销 outbox 均经 fenced_source_write。
     #[test]
@@ -2519,7 +2347,7 @@ mod tests {
             .find("source_writer_guard::settle_commit_fence(&source_guard, true)")
             .expect("the cluster fence must settle after the outbox append");
         assert!(guard < arm && arm < cas && cas < cascade && cascade < outbox && outbox < settle);
-        // Redis 投影删除段在栅栏之外（删除循环位于集群前/后）。
+        // 本地拒绝加速登记在栅栏之外（marker 循环位于集群前/后）。
         assert!(
             family_body
                 .find("delete_session_projections(state")

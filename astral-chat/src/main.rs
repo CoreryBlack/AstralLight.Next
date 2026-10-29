@@ -58,10 +58,6 @@ impl MqProducerRef for ChatMqProducer {
     async fn publish_audit_log(&self, event: AuditLogEvent) -> Result<(), String> {
         self.inner
             .publish_audit_log(astral_mq::producer::AuditLogPayload {
-                // message_id 必须唯一：audit consumer 以它为 mq_idempotent_log 幂等键，
-                // 恒 None 会回退到派生键，permission 审计 request_id 恒 None，
-                // 相同 user+resource+action 的重复判定会被 INSERT IGNORE 静默丢弃。
-                message_id: Some(uuid::Uuid::new_v4().to_string()),
                 user_id: event.user_id,
                 card_id: event.card_id,
                 action: event.action,
@@ -90,7 +86,6 @@ impl MqProducerRef for ChatMqProducer {
     ) -> Result<(), String> {
         self.inner
             .publish_login_event(astral_mq::producer::LoginEventPayload {
-                message_id: Some(uuid::Uuid::new_v4().to_string()),
                 user_id,
                 card_id: None,
                 login_type: login_type.to_string(),

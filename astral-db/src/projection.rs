@@ -1,21 +1,14 @@
-//! 公共投影事务写入器 — 与 source mutation 同事务落 durable 投影事件
+//! 公共 source correlation 与资格失效事务写入器。
 //!
-//! 投影链写侧的**唯一公共实现**：source mutation（user_card 增删改、资格状态变更、
-//! starter-card 注册等）必须在同一事务内调用 `append_projection_event_in_tx` 落
-//! `authorization_projection_head` + `authorization_projection_outbox` durable 事件，
-//! 由 projection worker 在提交后重建快照、显式失效缓存并发布刷新消息。
+//! source mutation 与 `authorization_projection_head/outbox` 必须处于同一短事务。
+//! CARD/RULE_SET 记录 source generation、撤销 fence 与审计关联；其消费终态
+//! 不代表 V6 授权已发布。ELIGIBILITY 事件由提交后的资格 owner 失效进程内条目。
+//! V6 canonical grant 发布独立使用 owned delta、manifest 与 completion proof。
 //!
-//! 语义与 TrustGraph `append_aggregate_projection_in_tx` 完全一致：
-//! - tenant_id 取对应聚合 source row（CARD/ELIGIBILITY 为 `user_card`，RULE_SET 为
-//!   `rule_set`），避免使用不可信的请求上下文；
-//! - head `FOR UPDATE` 串行化；`source_generation` +1（首事件为 1）；
-//! - 仅 `event_type == EVENT_TYPE_REVOKE` 时 `revoke_fence` +1（其余事件围栏不变）；
-//! - head 置 `PENDING`；outbox 落 `PENDING` 事件（event_id=UUID、
-//!   `sequence_number` = `source_generation`、payload JSON）。
-//!
-//! 事务内仅写 head/outbox，**不访问 Redis/MQ**；提交后的快照重建、缓存失效与 MQ 发布
-//! 全部由 projection worker 负责。本模块不依赖 TrustGraph/MQ，仅依赖 astral-types 的
-//! `ProjectionAggregate` / 事件常量与 sqlx/serde_json/uuid。
+//! - tenant_id 从对应 source row 或同事务捕获的可信值取得；
+//! - head `FOR UPDATE` 串行化；source_generation 递增，REVOKE 递增撤销 fence；
+//! - outbox 的稳定 event_id、operation_id 和 generation 关联原始 mutation；
+//! - 本模块不 commit，不执行网络、授权物化、消息发布或重试。
 
 use sqlx::MySql;
 
@@ -37,7 +30,6 @@ const CARD_PROJECTION_EVENT_TYPES: &[&str] = &[
     "APPROVED",
     "RULE_CREATED",
     "RULE_UPDATED",
-    "CARD_REBUILD",
     "GRANT",
     EVENT_TYPE_RULE_SET_UPDATE,
 ];
@@ -83,8 +75,8 @@ pub struct ProjectionEventIdentity {
 }
 
 /// Trusted mutation metadata serialized into a durable outbox payload. The
-/// projection worker uses it to write the post-snapshot audit evidence without
-/// inventing an HTTP actor.
+/// source correlation owner uses it to preserve the actor and operation evidence
+/// without inventing an HTTP actor during consumption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProjectionEventMetadata<'a> {
     pub actor_id: i64,
@@ -236,8 +228,8 @@ fn next_projection_generation(
 
 /// 在调用方已有的 source transaction 中追加任一聚合（CARD/ELIGIBILITY/RULE_SET）投影事件。
 ///
-/// source mutation 与 head/outbox 必须共用同一事务；提交后的快照重建、缓存失效和 MQ
-/// 发布仍由 projection worker 负责。调用方不得在此事务内触发 Redis 或 RabbitMQ 副作用。
+/// source mutation 与 head/outbox 必须共用同一事务；提交后分别执行 source
+/// correlation 完成记录或资格失效。调用方不得在此事务内进行网络或授权物化。
 ///
 /// # 参数
 /// - `tx`：调用方已持有的 source transaction（本函数不 commit，由调用方决定提交/回滚）；
@@ -576,8 +568,7 @@ mod tests {
 
     #[test]
     fn projection_event_allowlists_match_active_callers_and_reject_mismatches() {
-        // This inventory mirrors every event string currently passed to a CARD
-        // projection writer, including compatibility/service fallback paths.
+        // Source-transaction producers use only these registered correlation events.
         let card_event_types = [
             "CARD_CREATED",
             EVENT_TYPE_CARD_UPDATE,
@@ -591,7 +582,6 @@ mod tests {
             "APPROVED",
             "RULE_CREATED",
             "RULE_UPDATED",
-            "CARD_REBUILD",
             "GRANT",
             EVENT_TYPE_RULE_SET_UPDATE,
         ];
@@ -638,6 +628,7 @@ mod tests {
             EVENT_TYPE_CARD_UPDATE
         ));
         assert!(!event_type_allowed(ProjectionAggregate::Card, "UNKNOWN"));
+        assert!(validate_projection_event(ProjectionAggregate::Card, 1, "CARD_REBUILD").is_err());
     }
 
     #[test]

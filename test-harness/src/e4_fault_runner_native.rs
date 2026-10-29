@@ -350,7 +350,7 @@ mod tests {
         fn capabilities(&mut self) -> Result<Value, String> {
             self.calls.push("capabilities".to_owned());
             Ok(json!({
-                "supported_faults": dependency_profiles::profile_faults("redis-compat").unwrap(),
+                "supported_faults": dependency_profiles::profile_faults("native-single-node").unwrap(),
                 "read_only_preflight": true,
             }))
         }
@@ -387,7 +387,7 @@ mod tests {
     impl FaultController for AllowingController {
         fn capabilities(&mut self) -> Result<Value, String> {
             Ok(json!({
-                "supported_faults": dependency_profiles::profile_faults("redis-compat").unwrap(),
+                "supported_faults": dependency_profiles::profile_faults("native-single-node").unwrap(),
                 "read_only_preflight": true,
             }))
         }
@@ -430,7 +430,7 @@ mod tests {
     impl FaultController for ProoflessReconcileController {
         fn capabilities(&mut self) -> Result<Value, String> {
             Ok(json!({
-                "supported_faults": dependency_profiles::profile_faults("redis-compat").unwrap(),
+                "supported_faults": dependency_profiles::profile_faults("native-single-node").unwrap(),
                 "read_only_preflight": true,
             }))
         }
@@ -476,7 +476,7 @@ mod tests {
     }
 
     fn faults() -> &'static [&'static str] {
-        dependency_profiles::profile_faults("redis-compat").unwrap()
+        dependency_profiles::profile_faults("native-single-node").unwrap()
     }
 
     #[test]
@@ -489,7 +489,12 @@ mod tests {
             contexts: Vec::new(),
             prepare_ref: Some("prepare-ref-1".to_owned()),
         };
-        let result = run_fault_case(&auth, "redis_unavailable", "redis-compat", &mut controller);
+        let result = run_fault_case(
+            &auth,
+            "memory_channel_suspect",
+            "native-single-node",
+            &mut controller,
+        );
         assert_eq!(result.overall, "PASS");
         assert_eq!(
             controller.calls,
@@ -509,7 +514,7 @@ mod tests {
         assert!(!result.token_values_recorded);
         assert_eq!(result.context.len(), 7);
         assert_eq!(result.context[0].run_id, "authz-validation-e4-test");
-        assert_eq!(result.context[0].fault_id, "redis_unavailable");
+        assert_eq!(result.context[0].fault_id, "memory_channel_suspect");
         assert_eq!(result.context[0].attempt, 1);
         assert_eq!(result.context[0].stage, "preflight");
         assert!(!result.context[0].operation_id.is_empty());
@@ -524,7 +529,12 @@ mod tests {
             contexts: Vec::new(),
             prepare_ref: Some("prepare-ref-1".to_owned()),
         };
-        let result = run_fault_case(&auth, "redis_unavailable", "redis-compat", &mut controller);
+        let result = run_fault_case(
+            &auth,
+            "memory_channel_suspect",
+            "native-single-node",
+            &mut controller,
+        );
         assert_eq!(result.overall, "UNKNOWN");
         assert_eq!(result.stages["apply"].status, "UNKNOWN");
         assert_eq!(result.stages["observe"].status, "SKIP");
@@ -538,6 +548,7 @@ mod tests {
         );
         assert_eq!(result.stages["restore"].calls, 1);
         assert_eq!(result.stages["reconcile"].calls, 1);
+        assert_eq!(result.overall, "UNKNOWN");
     }
 
     #[test]
@@ -549,7 +560,12 @@ mod tests {
             contexts: Vec::new(),
             prepare_ref: Some("prepare-ref-1".to_owned()),
         };
-        let result = run_fault_case(&auth, "redis_unavailable", "redis-compat", &mut controller);
+        let result = run_fault_case(
+            &auth,
+            "memory_channel_suspect",
+            "native-single-node",
+            &mut controller,
+        );
         assert_ne!(result.overall, "PASS");
         assert!(!controller.calls.contains(&"apply".to_owned()));
         assert_eq!(result.stages["apply"].status, "SKIP");
@@ -570,7 +586,12 @@ mod tests {
             contexts: Vec::new(),
             prepare_ref: None,
         };
-        let result = run_fault_case(&auth, "redis_unavailable", "redis-compat", &mut controller);
+        let result = run_fault_case(
+            &auth,
+            "memory_channel_suspect",
+            "native-single-node",
+            &mut controller,
+        );
         assert_eq!(result.stages["prepare"].status, "UNKNOWN");
         assert_eq!(
             result.stages["prepare"].detail,
@@ -585,7 +606,12 @@ mod tests {
     fn observed_allow_during_a_fault_is_a_hard_fail() {
         let auth = authorization(faults());
         let mut controller = AllowingController::default();
-        let result = run_fault_case(&auth, "redis_unavailable", "redis-compat", &mut controller);
+        let result = run_fault_case(
+            &auth,
+            "memory_channel_suspect",
+            "native-single-node",
+            &mut controller,
+        );
         assert_eq!(result.stages["observe"].status, "FAIL");
         assert_eq!(
             result.stages["observe"].detail,
@@ -598,7 +624,12 @@ mod tests {
     fn reconcile_without_durable_proof_stays_unknown() {
         let auth = authorization(faults());
         let mut controller = ProoflessReconcileController::default();
-        let result = run_fault_case(&auth, "redis_unavailable", "redis-compat", &mut controller);
+        let result = run_fault_case(
+            &auth,
+            "memory_channel_suspect",
+            "native-single-node",
+            &mut controller,
+        );
         assert_eq!(result.stages["reconcile"].status, "UNKNOWN");
         assert_eq!(
             result.stages["reconcile"].detail,
@@ -623,8 +654,8 @@ mod tests {
         };
         let result = run_fault_case(
             &invalid,
-            "redis_unavailable",
-            "redis-compat",
+            "memory_channel_suspect",
+            "native-single-node",
             &mut controller,
         );
         assert_eq!(result.overall, "BLOCKED");
@@ -643,7 +674,12 @@ mod tests {
                 "ref at fault-node.example.invalid and https://secret.example.com/x".to_owned(),
             ),
         };
-        let result = run_fault_case(&auth, "redis_unavailable", "redis-compat", &mut controller);
+        let result = run_fault_case(
+            &auth,
+            "memory_channel_suspect",
+            "native-single-node",
+            &mut controller,
+        );
         let detail = &result.stages["prepare"].detail;
         assert!(detail.contains("[redacted-host]"));
         assert!(!detail.contains("fault-node.example.invalid"));
@@ -653,6 +689,11 @@ mod tests {
 
     #[test]
     fn profile_matrix_aggregates_cases_and_keeps_integration_blocked() {
+        assert_eq!(
+            faults(),
+            dependency_profiles::profile_faults("native-single-node").unwrap()
+        );
+        assert!(dependency_profiles::profile_faults("redis-compat").is_none());
         let auth = authorization(faults());
         let mut controller = FakeController {
             fail: None,
@@ -660,7 +701,7 @@ mod tests {
             contexts: Vec::new(),
             prepare_ref: Some("prepare-ref-1".to_owned()),
         };
-        let matrix = run_fault_matrix(&auth, "redis-compat", &mut controller);
+        let matrix = run_fault_matrix(&auth, "native-single-node", &mut controller);
         assert_eq!(matrix["overall"], "PASS");
         assert_eq!(matrix["integration_claim"], "BLOCKED");
         assert_eq!(matrix["cases"].as_array().unwrap().len(), faults().len());
@@ -671,7 +712,7 @@ mod tests {
             contexts: Vec::new(),
             prepare_ref: Some("prepare-ref-1".to_owned()),
         };
-        let matrix = run_fault_matrix(&auth, "redis-compat", &mut failing);
+        let matrix = run_fault_matrix(&auth, "native-single-node", &mut failing);
         assert_eq!(matrix["overall"], "UNKNOWN");
     }
 
@@ -684,11 +725,11 @@ mod tests {
             contexts: Vec::new(),
             prepare_ref: Some("prepare-ref-1".to_owned()),
         };
-        let result = run_fault_case(&auth, "stale_hmac", "redis-compat", &mut controller);
+        let result = run_fault_case(&auth, "hmac_failure", "native-single-node", &mut controller);
         assert_eq!(result.overall, "PASS");
         for (index, context) in result.context.iter().enumerate() {
             assert_eq!(context.run_id, auth.run_id);
-            assert_eq!(context.fault_id, "stale_hmac");
+            assert_eq!(context.fault_id, "hmac_failure");
             assert_eq!(context.attempt, 1);
             assert_eq!(context.authorization_run_id, auth.run_id);
             assert!(!context.token_values_recorded);

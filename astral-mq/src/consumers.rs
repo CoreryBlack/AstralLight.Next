@@ -16,23 +16,20 @@ use lapin::message::Delivery;
 use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions};
 use lapin::types::{FieldTable, ShortString};
 use lapin::{Channel, Confirmation};
-#[cfg(feature = "redis-compat")]
-use redis::AsyncCommands;
 use serde_json::Value;
 use sqlx::MySqlPool;
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
-use uuid::Uuid;
 
 use crate::config::{
     QueueDef, EXCHANGE_DLX, MAX_RETRY, QUEUES, QUEUE_AUDIT_LOG, QUEUE_AUTHORIZATION_INVALIDATION,
     QUEUE_AUTH_SESSION_REVOCATION, QUEUE_LOGIN_EVENT,
 };
 use crate::consumer::{
-    canonical_legacy_message_id, claim_message, complete_message, decode_delivery,
-    delivery_message_id, message_type_for_queue, release_message, retry_count_from_delivery,
-    terminal_canonical_message_id, validate_delivery_envelope, CompletionPolicy, Consumer,
-    IdempotencyClaim,
+    claim_message_with_digest_for_batch, complete_lease, decode_delivery, delivery_message_id,
+    message_type_for_queue, release_lease, retry_count_from_delivery,
+    terminal_canonical_message_id, validate_delivery_envelope, validate_delivery_message_id,
+    CompletionPolicy, Consumer, IdempotencyClaim, LeaseHandle,
 };
 use crate::error::MqError;
 use crate::local_bus::{LocalBus, LocalBusError};
@@ -46,11 +43,6 @@ const LOCAL_INVALIDATION_DB_CALL_BOUND: Duration = Duration::from_secs(3);
 /// 会话撤销消费所需 DB（由 identity main.rs 注入）
 static SESSION_REVOCATION_DB: OnceLock<MySqlPool> = OnceLock::new();
 
-/// 会话撤销消费所需 Redis projection manager（由 identity runtime 注入；仅
-/// redis-compat feature 编译——feature-off 构建中 compat 投影面不存在）。
-#[cfg(feature = "redis-compat")]
-static SESSION_REVOCATION_REDIS: OnceLock<redis::aio::ConnectionManager> = OnceLock::new();
-
 /// 登录事件消费所需 DB（由 identity main.rs 注入）
 static LOGIN_EVENT_DB: OnceLock<MySqlPool> = OnceLock::new();
 
@@ -60,14 +52,6 @@ static AUDIT_LOG_DB: OnceLock<MySqlPool> = OnceLock::new();
 /// 注入会话撤销 consumer 使用的 DB pool（仅 identity main.rs 调用一次）
 pub fn set_session_revocation_db(pool: MySqlPool) {
     let _ = SESSION_REVOCATION_DB.set(pool);
-}
-
-/// 注入会话撤销 consumer 使用的 Redis projection manager（仅 identity runtime
-/// 调用一次）。仅 redis-compat feature 编译；feature-off 构建中本 API 不存在
-/// ——redis 编译层退役的显式 BREAKING 收敛点，登记于架构文档。
-#[cfg(feature = "redis-compat")]
-pub fn set_session_revocation_redis(redis: redis::aio::ConnectionManager) {
-    let _ = SESSION_REVOCATION_REDIS.set(redis);
 }
 
 /// 注入登录事件 consumer 使用的 DB pool（仅 identity main.rs 调用一次）
@@ -184,11 +168,8 @@ pub fn dispatch_typed_invalidation(
     }
 }
 
-/// In-process TTL shared by every session-revocation acceleration surface
-/// (7 days, aligned with the legacy `jwt:revoked:{jti}` coverage window).
+/// In-process TTL for each session-revocation acceleration surface.
 const SESSION_REVOCATION_MARKER_TTL_SECS: i64 = 7 * 24 * 3600;
-/// `u64` view for the surfaces that count seconds as `u64` (projection store
-/// note and Redis `set_ex`); the 7-day value is a positive constant.
 const SESSION_REVOCATION_MARKER_TTL_SECS_U64: u64 = 7 * 24 * 3600;
 
 /// Session-revocation acceleration dispatch, strict about registry misses.
@@ -222,7 +203,7 @@ fn dispatch_session_revocation(revoked_jtis: Vec<String>) -> Result<(), String> 
     )
 }
 
-/// Recovery-fallback settings for the local invalidation relay.
+/// Recovery settings for the local invalidation relay.
 ///
 /// The relay is ONLY the recovery leg for `al_message_outbox` invalidation
 /// rows whose normal post-commit direct `LocalBus` delivery never completed.
@@ -438,7 +419,7 @@ fn mark_relay_suspect(reason: impl Into<String>) {
 ///
 /// Source transactions append typed invalidations to `al_message_outbox` and
 /// the normal path is the direct post-commit `LocalBus` delivery; this worker
-/// is the fallback that advances only committed rows the direct leg never
+/// is the recovery path that advances only committed rows the direct leg never
 /// settled. It claims one row at a time at a low-frequency idle poll, delivers
 /// the exact committed envelope through the bounded LocalBus, and advances the
 /// row only on a proven lease transition. Cancellation, unproven claims,
@@ -993,142 +974,6 @@ fn classify_relay_bus_failure(error: LocalBusError) -> LocalInvalidationRelayOut
     }
 }
 
-/// Legacy database-polling worker retained only for migration/reconciliation
-/// tooling. Production `local` transport must use `LocalBus` in the composite
-/// runtime; this function is intentionally not called by service entrypoints.
-#[deprecated(note = "use LocalBus owner consumers in the composite runtime")]
-pub fn spawn_local_message_worker(
-    pool: MySqlPool,
-    queue_name: &'static str,
-    worker_id: impl Into<String>,
-) {
-    let worker_id = worker_id.into();
-    tokio::spawn(async move {
-        let repository = LocalMessageRepository::new(pool.clone());
-        loop {
-            match repository.claim_batch(&worker_id, queue_name, 16).await {
-                Ok(rows) if rows.is_empty() => tokio::time::sleep(Duration::from_millis(250)).await,
-                Ok(rows) => {
-                    for row in rows {
-                        let lease_token = row.lease_owner.clone().unwrap_or_default();
-                        let heartbeat_repository = repository.clone();
-                        let heartbeat_message_id = row.message_id.clone();
-                        let heartbeat_token = lease_token.clone();
-                        let heartbeat = tokio::spawn(async move {
-                            let interval = Duration::from_secs(
-                                astral_db::LOCAL_MESSAGE_LEASE_SECONDS
-                                    .saturating_div(3)
-                                    .max(1),
-                            );
-                            loop {
-                                tokio::time::sleep(interval).await;
-                                if heartbeat_repository
-                                    .heartbeat(&heartbeat_message_id, &heartbeat_token)
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                        });
-                        let result = dispatch_local_message(&pool, &row).await;
-                        heartbeat.abort();
-                        match result {
-                            Ok(()) => {
-                                if let Err(error) =
-                                    repository.complete(&row.message_id, &lease_token).await
-                                {
-                                    tracing::error!(queue = queue_name, message_id = %row.message_id, error = %error, "local message completion failed; durable result is unknown");
-                                }
-                            }
-                            Err(error) if row.attempts >= LOCAL_MESSAGE_MAX_ATTEMPTS => {
-                                if let Err(transition_error) = repository
-                                    .quarantine(&row.message_id, &lease_token, &error)
-                                    .await
-                                {
-                                    tracing::error!(queue = queue_name, message_id = %row.message_id, error = %transition_error, "local message quarantine transition failed");
-                                }
-                            }
-                            Err(error) => {
-                                if let Err(transition_error) = repository
-                                    .schedule_retry(&row.message_id, &lease_token, &error)
-                                    .await
-                                {
-                                    tracing::error!(queue = queue_name, message_id = %row.message_id, error = %transition_error, "local message retry transition failed");
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(queue = queue_name, error = %error, "local message claim failed");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
-    });
-}
-
-async fn dispatch_local_message(
-    _pool: &MySqlPool,
-    row: &astral_db::LocalMessageRow,
-) -> Result<(), String> {
-    let envelope: crate::envelope::MessageEnvelope =
-        serde_json::from_str(&row.payload_json).map_err(|error| error.to_string())?;
-    envelope.validate().map_err(|error| error.to_string())?;
-    if envelope.message_id != row.message_id || envelope.payload_sha256 != row.payload_sha256 {
-        return Err("local message envelope identity mismatch".into());
-    }
-    match row.queue_name.as_str() {
-        QUEUE_AUDIT_LOG => {
-            let payload: AuditLogPayload = serde_json::from_value(envelope.payload.clone())
-                .map_err(|error| error.to_string())?;
-            handle_audit_log(&envelope.message_id, &payload)
-                .await
-                .map_err(|error| error.to_string())
-        }
-        QUEUE_LOGIN_EVENT => {
-            let payload: LoginEventPayload = serde_json::from_value(envelope.payload.clone())
-                .map_err(|error| error.to_string())?;
-            handle_login_event(&envelope.message_id, &payload)
-                .await
-                .map_err(|error| error.to_string())
-        }
-        QUEUE_AUTH_SESSION_REVOCATION => {
-            let payload: AuthSessionRevocationPayload =
-                serde_json::from_value(envelope.payload.clone())
-                    .map_err(|error| error.to_string())?;
-            handle_auth_session_revocation(&envelope.message_id, &payload)
-                .await
-                .map_err(|error| error.to_string())
-        }
-        QUEUE_AUTHORIZATION_INVALIDATION => dispatch_invalidation_event(&envelope).await,
-        _ => Err("local queue has no owner".into()),
-    }
-}
-
-/// inspect an untyped message. Business consumers must use a typed payload.
-#[allow(dead_code)]
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GenericMessage {
-    pub message_id: String,
-    pub message_type: Option<String>,
-    #[allow(dead_code)]
-    pub card_id: Option<i64>,
-    #[allow(dead_code)]
-    pub user_id: Option<i64>,
-    pub payload: Option<serde_json::Value>,
-}
-
-/// 启动通用业务消费者。
-///
-/// 审计、登录、权限刷新和会话撤销由各自 owner 服务显式启动；这里不再
-/// 注册会 ACK 丢弃 payload 的通用 handler。
-pub async fn start_all_consumers(_channel: &Channel) -> Result<Vec<String>, MqError> {
-    Ok(Vec::new())
-}
-
 /// DLQ 消费归属。
 ///
 /// `start_dlq_consumers` 只接受这两个当前有明确 owner 的值；没有 owner 的
@@ -1380,9 +1225,9 @@ fn quarantine_failure_reason(reason: &str, republish_count: u32) -> String {
     format!("{reason};dlq_republish_count={republish_count}")
 }
 
-/// Capture one terminal delivery only for the queues whose owner has the
+/// Capture one terminal delivery only for queues whose owner has the
 /// quarantine repository. The original bytes and routing metadata are kept;
-/// legacy login identities are resolved by `terminal_canonical_message_id`.
+/// only canonical envelope identities are attached when present.
 async fn capture_terminal_delivery(
     context: &DlqConsumerContext,
     delivery: &lapin::message::Delivery,
@@ -2101,7 +1946,16 @@ fn validate_owner_queue_set(owner: DlqOwner, names: &[&str]) -> Result<(), Strin
 
 fn terminal_failure_reason(delivery: &lapin::message::Delivery) -> String {
     match validate_delivery_envelope(&delivery.data) {
-        Ok(_) => "max_retries_exceeded".to_owned(),
+        Ok(value) => {
+            let message_id = value
+                .get("messageId")
+                .and_then(Value::as_str)
+                .expect("validated canonical envelope has a string messageId");
+            match validate_delivery_message_id(delivery, message_id) {
+                Ok(()) => "max_retries_exceeded".to_owned(),
+                Err(reason) => reason,
+            }
+        }
         Err(reason) => reason,
     }
 }
@@ -2145,7 +1999,7 @@ pub async fn start_audit_log_consumer(channel: &Channel) -> Result<(), MqError> 
 // + mark PROCESSED 多行），DB 命令数从 3×N 降为 4/批。
 //
 // 幂等与失败语义（与逐条路径一致，at-least-once 保持）：
-// - Redis 租约 claim 层（`crate::consumer::claim_message`）逐条不变：
+// - MySQL lease claim (`claim_message_with_digest_for_batch`) per delivery:
 //   Completed → ack；InFlight → requeue（不消耗重试预算）；Claimed → 批量持久化
 //   → complete → ack；
 // - DB 幂等预检使用 `SELECT ... FOR UPDATE` 锁定既有行（与在途写者互斥）：行已
@@ -2165,10 +2019,10 @@ const AUDIT_BATCH_COLLECT_WINDOW: Duration = Duration::from_millis(25);
 /// 已 claim 且待批量持久化的审计投递。
 struct ClaimedAuditDelivery {
     delivery: Delivery,
-    /// MQ 信封 messageId（Redis 租约键使用该 id）。
+    /// MQ envelope messageId (MySQL lease key).
     message_id: String,
-    /// Redis 处理租约 owner（complete/release 需要证明占有）。
-    owner: String,
+    /// MySQL lease handle (token + generation for complete/release fencing).
+    lease: LeaseHandle,
     payload: AuditLogPayload,
 }
 
@@ -2254,7 +2108,7 @@ async fn process_audit_delivery_batch(
     let mut claimed: Vec<ClaimedAuditDelivery> = Vec::new();
     for delivery in batch.drain(..) {
         let retry_count = retry_count_from_delivery(&delivery);
-        // Parse before invoking Redis or business handlers（与逐条路径一致）。
+        // Parse before any lease claim or business handler (same as the per-message path).
         let msg = match decode_delivery::<AuditLogPayload>(&delivery.data, audit_q) {
             Ok(msg) => msg,
             Err(failure_reason) => {
@@ -2270,6 +2124,17 @@ async fn process_audit_delivery_batch(
                 continue;
             }
         };
+        if let Err(failure_reason) = validate_delivery_message_id(&delivery, &msg.message_id) {
+            tracing::error!(
+                queue = %audit_q,
+                message_id = %msg.message_id,
+                retry = retry_count,
+                failure_reason = %failure_reason,
+                "delivery transport metadata conflicts with canonical envelope; sending to DLX"
+            );
+            dead_letter_delivery(channel, &delivery).await?;
+            continue;
+        }
         if retry_count >= MAX_RETRY {
             tracing::warn!(
                 queue = %audit_q,
@@ -2281,7 +2146,19 @@ async fn process_audit_delivery_batch(
             dead_letter_delivery(channel, &delivery).await?;
             continue;
         }
-        match claim_message(&msg.message_id, message_type).await {
+        let payload_digest = crate::consumer::payload_digest_hex(&delivery.data);
+        match claim_message_with_digest_for_batch(&msg.message_id, message_type, &payload_digest)
+            .await
+        {
+            Err(error) if crate::consumer::is_idempotency_conflict(&error) => {
+                tracing::error!(
+                    queue = %audit_q,
+                    message_id = %msg.message_id,
+                    error = %error,
+                    "payload digest conflict for an existing message id; fail-closed to DLX"
+                );
+                dead_letter_delivery(channel, &delivery).await?;
+            }
             Err(error) => {
                 tracing::error!(
                     queue = %audit_q,
@@ -2307,11 +2184,11 @@ async fn process_audit_delivery_batch(
                 );
                 requeue_delivery(channel, &delivery).await?;
             }
-            Ok(IdempotencyClaim::Claimed(owner)) => {
+            Ok(IdempotencyClaim::Claimed(lease)) => {
                 claimed.push(ClaimedAuditDelivery {
                     delivery,
                     message_id: msg.message_id.clone(),
-                    owner,
+                    lease,
                     payload: msg.payload,
                 });
             }
@@ -2352,9 +2229,9 @@ async fn flush_claimed_audit_batch(
                 "audit batch persisted"
             );
             for item in claimed {
-                // complete（Redis 幂等标记 '1'）→ ack；complete 失败与逐条路径
-                // 一致：不 ack（redelivery 后由 DB 幂等 claim 去重兜底）。
-                match complete_message(&item.message_id, message_type, &item.owner).await {
+                // complete the MySQL lease then ack; an unknown complete result
+                // follows the per-message durable DB dedupe path on redelivery.
+                match complete_lease(&item.message_id, message_type, &item.lease).await {
                     Ok(true) | Ok(false) | Err(_) => {
                         if let Err(error) = ack_delivery(channel, &item.delivery).await {
                             tracing::error!(
@@ -2380,7 +2257,7 @@ async fn flush_claimed_audit_batch(
             for item in claimed {
                 match handle_audit_log(&item.message_id, &item.payload).await {
                     Ok(()) => {
-                        match complete_message(&item.message_id, message_type, &item.owner).await {
+                        match complete_lease(&item.message_id, message_type, &item.lease).await {
                             Ok(true) | Ok(false) | Err(_) => {
                                 if let Err(error) = ack_delivery(channel, &item.delivery).await {
                                     tracing::error!(
@@ -2402,7 +2279,7 @@ async fn flush_claimed_audit_batch(
     }
 }
 
-/// 释放 Redis 处理租约并 nack（requeue=false → DLX），对齐逐条失败语义。
+/// Release the MySQL processing lease then nack (requeue=false → DLX), matching per-message failure handling.
 async fn release_and_nack(
     channel: &Channel,
     audit_q: &str,
@@ -2416,7 +2293,7 @@ async fn release_and_nack(
         error = %handler_error,
         "nacking for DLX retry"
     );
-    if let Err(release_error) = release_message(&item.message_id, message_type, &item.owner).await {
+    if let Err(release_error) = release_lease(&item.message_id, message_type, &item.lease).await {
         tracing::error!(
             queue = %audit_q,
             message_id = %item.message_id,
@@ -2451,14 +2328,9 @@ async fn persist_audit_record_batch(
             deduped.push(item);
         }
     }
-    let resolved_ids: Vec<String> = deduped
-        .iter()
-        .map(|item| resolve_audit_message_id(&item.message_id, &item.payload))
-        .collect();
     let records: Vec<AuditRecord> = deduped
         .iter()
-        .zip(&resolved_ids)
-        .map(|(item, message_id)| audit_record_for_batch(message_id, &item.payload))
+        .map(|item| audit_record_for_batch(&item.message_id, &item.payload))
         .collect();
 
     let mut tx = pool.begin().await.map_err(box_err)?;
@@ -2534,57 +2406,12 @@ async fn persist_audit_record_batch(
     Ok(())
 }
 
-/// 从信封 id + payload 解析最终幂等 id（与 `handle_audit_log` 同规则：信封 id
-/// 缺失时回退 canonical legacy id）。
-fn resolve_audit_message_id(envelope_message_id: &str, msg: &AuditLogPayload) -> String {
-    if !envelope_message_id.is_empty() {
-        return envelope_message_id.to_owned();
-    }
-    msg.message_id.clone().unwrap_or_else(|| {
-        let fields = [
-            (
-                "userId",
-                msg.user_id
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "null".to_owned()),
-            ),
-            (
-                "cardId",
-                msg.card_id
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "null".to_owned()),
-            ),
-            ("action", msg.action.clone()),
-            ("resource", msg.resource.clone()),
-            ("decision", msg.decision.clone()),
-            ("eventType", msg.event_type.clone()),
-            (
-                "requestId",
-                msg.request_id.clone().unwrap_or_else(|| "null".to_owned()),
-            ),
-        ];
-        canonical_legacy_message_id("audit", &fields)
-    })
-}
-
-/// audit_log detail 字段（与 `handle_audit_log` 同规则）。
-fn audit_detail_for_message_id(message_id: &str) -> Option<String> {
-    Some(if message_id.starts_with("legacy-audit-v1-") {
-        format!("messageId={message_id};legacyMessageIdFallback=true")
-    } else {
-        format!("messageId={message_id}")
-    })
-}
-
-/// audit_log detail 落库规则：producer 提供的非空白 detail 优先（例如
-/// ORG_SCOPE ALLOW 的结构化 JSON provenance，不得被 messageId-only 文本覆盖）；
-/// 未提供时回退既有 messageId 关联文本（含 legacy 回退标记）。message-id 关联
-/// 本身始终由 `mq_idempotent_log (message_type, message_id)` 持久化，不依赖
-/// detail 列，因此保留 producer detail 不损失幂等/关联语义。
+/// Keep producer detail when present; otherwise retain a stable envelope-id
+/// correlation string in the audit row.
 fn audit_record_detail(payload_detail: Option<&str>, message_id: &str) -> Option<String> {
     match payload_detail {
         Some(detail) if !detail.trim().is_empty() => Some(detail.to_owned()),
-        _ => audit_detail_for_message_id(message_id),
+        _ => Some(format!("messageId={message_id}")),
     }
 }
 
@@ -2769,14 +2596,13 @@ async fn handle_audit_log(
             "audit log consumer DB not initialized",
         )));
     };
-    let message_id = resolve_audit_message_id(message_id, msg);
     let mut tx = pool.begin().await.map_err(box_err)?;
     let mut audit_tx = SqlxAuditTransaction { tx: &mut tx };
     persist_audit_record(
         &mut audit_tx,
         &AuditRecord {
             message_type: AUDIT_MESSAGE_TYPE,
-            message_id: &message_id,
+            message_id,
             user_id: msg.user_id.unwrap_or(0),
             card_id: msg.card_id,
             action: &msg.action,
@@ -2788,7 +2614,7 @@ async fn handle_audit_log(
             request_id: &msg.request_id,
             domain_id: msg.domain_id,
             tenant_id: msg.tenant_id,
-            detail: audit_record_detail(msg.detail.as_deref(), &message_id),
+            detail: audit_record_detail(msg.detail.as_deref(), message_id),
         },
     )
     .await?;
@@ -2855,27 +2681,13 @@ async fn handle_login_event(
         "LOGIN_FAILURE"
     };
     let decision = if msg.success { "ALLOW" } else { "DENY" };
-    let (message_id, legacy) = if message_id.is_empty() {
-        let message_id = msg.message_id.clone().ok_or_else(|| {
-            box_err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "login event messageId missing after envelope normalization",
-            ))
-        })?;
-        (message_id, false)
-    } else {
-        (
-            message_id.to_owned(),
-            message_id.starts_with("legacy-login-v1-"),
-        )
-    };
     let mut tx = pool.begin().await.map_err(box_err)?;
     let mut audit_tx = SqlxAuditTransaction { tx: &mut tx };
     persist_audit_record(
         &mut audit_tx,
         &AuditRecord {
             message_type: LOGIN_EVENT_MESSAGE_TYPE,
-            message_id: &message_id,
+            message_id,
             user_id: msg.user_id,
             card_id: msg.card_id,
             action: "login",
@@ -2887,11 +2699,7 @@ async fn handle_login_event(
             request_id: &None,
             domain_id: None,
             tenant_id: None,
-            detail: Some(if legacy {
-                format!("loginType={};legacyMessageIdFallback=true", msg.login_type)
-            } else {
-                format!("loginType={}", msg.login_type)
-            }),
+            detail: Some(format!("loginType={}", msg.login_type)),
         },
     )
     .await?;
@@ -2956,13 +2764,9 @@ fn queue_name(suffix: &str) -> &'static str {
 
 // ===== AuthSessionRevocationConsumer（对齐 Java AuthSessionRevocationConsumer）=====
 
-/// 处理 auth.session.revocation 命令：在同一 source 事务中保存 session/family/
-/// JTI/outbox，提交后走 strict DB 撤销投影（Redis-free 权威路径），可选 Redis
-/// compat 投影仅在运行时显式注入 manager 时调用。未安装 Redis 时 strict DB
-/// 路径必须照常完成，命令不会因缺 Redis 而失败。
-///
-/// 对齐 Java `AuthDeviceSessionService.revokeAllForUser`：DB 撤销 + session outbox
-/// +（可选）Redis projection delete。失败返回 Err → Consumer 框架 nack/DLX 重试（不吞失败）。
+/// Handle auth.session.revocation by committing session/family/JTI/outbox mutations
+/// in one source transaction, then applying the strict MySQL revocation projection.
+/// Failures return Err so the Consumer framework nacks to DLX for bounded retry.
 async fn handle_auth_session_revocation(
     envelope_message_id: &str,
     msg: &AuthSessionRevocationPayload,
@@ -2973,10 +2777,6 @@ async fn handle_auth_session_revocation(
             "auth session revocation consumer DB not initialized",
         )));
     };
-    // Redis is an optional compat projection, never a hard requirement: the
-    // strict DB path below is the authority and must complete without it.
-    #[cfg(feature = "redis-compat")]
-    let redis_compat = SESSION_REVOCATION_REDIS.get().cloned();
     let operation_id = revocation_operation_id(envelope_message_id, msg)?;
     let reason = msg.reason.trim();
     if reason.is_empty() {
@@ -3146,36 +2946,15 @@ async fn handle_auth_session_revocation(
     // source replay.
     deliver_committed_session_shards(&committed_shards).await;
 
-    // Strict durable revocation projection (Redis-free authority): close each
-    // JTI proof and mirror the revocation into the in-process acceleration
-    // store. Errors escape so the command is retried, never acknowledged
-    // half-applied. This runs before any optional compat surface.
+    // Strict durable revocation projection closes each JTI proof and mirrors
+    // the revocation into the in-process acceleration store. Errors escape so
+    // the command is retried, never acknowledged half-applied.
     astral_db::apply_revocation_projection_mysql(pool, &jti_keys)
         .await
         .map_err(box_err)?;
 
-    // Optional Redis compat projection: only invoked when the runtime
-    // explicitly installed a compat manager. Its failure still fails the
-    // command (nack + retry) — a deployment that declares the Redis
-    // access-session contract must not acknowledge while its projections stay
-    // live. Without the compat manager this block is skipped entirely.
-    #[cfg(feature = "redis-compat")]
-    if let Some(mut conn) = redis_compat {
-        for jti in &jti_keys {
-            conn.del::<_, ()>((format!("access:jti:{jti}"), format!("access:grant:{jti}")))
-                .await
-                .map_err(box_err)?;
-            conn.set_ex::<_, _, ()>(
-                format!("jwt:revoked:{jti}"),
-                "1",
-                SESSION_REVOCATION_MARKER_TTL_SECS_U64,
-            )
-            .await
-            .map_err(box_err)?;
-        }
-    }
-
-    // Redis projection and the in-process registry are now complete. Close the
+    // Strict DB projection and the in-process acceleration surfaces are now
+    // complete. Close the
     // durable outbox in the same operation identity so the caller can distinguish
     // business completion from LocalBus/Rabbit admission. A lost CAS is unknown;
     // do not acknowledge it as success until the status is reconciled.
@@ -3311,27 +3090,26 @@ fn revocation_operation_id(
     envelope_message_id: &str,
     msg: &AuthSessionRevocationPayload,
 ) -> Result<String, Box<dyn std::error::Error + Send>> {
-    let candidate = msg
-        .operation_id
-        .as_deref()
-        .or_else(|| (!envelope_message_id.trim().is_empty()).then_some(envelope_message_id))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| {
-            let seed = format!("{}\n{}\n{}", msg.user_id, msg.reason.trim(), msg.timestamp);
-            format!(
-                "legacy-revoke-{}",
-                Uuid::new_v5(&Uuid::NAMESPACE_URL, seed.as_bytes())
-            )
-        });
+    let candidate = msg.operation_id.as_str();
+    if candidate.trim().is_empty() {
+        return Err(box_err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "auth session revocation operation id is required",
+        )));
+    }
+    if candidate != envelope_message_id {
+        return Err(box_err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth session revocation operation id must match the envelope messageId",
+        )));
+    }
     if candidate.len() > 64 || candidate.contains('\0') {
         return Err(box_err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "auth session revocation operation id is invalid",
         )));
     }
-    Ok(candidate)
+    Ok(candidate.to_owned())
 }
 
 fn revocation_jtis_from_payload(
@@ -4082,27 +3860,23 @@ mod tests {
     }
 
     #[test]
-    fn revocation_completion_follows_source_commit_strict_db_then_optional_redis() {
+    fn revocation_completion_follows_source_commit_strict_db_then_outbox_proof() {
         let source = include_str!("consumers.rs");
         let body = source
             .split("async fn handle_auth_session_revocation(")
             .nth(1)
             .unwrap()
-            .split("const REVOCATION_OUTBOX_COMPLETE_SQL")
+            .split("const MAX_REVOCATION_SNAPSHOT_JTIS: usize")
             .next()
             .unwrap();
         let commit = body.find("tx.commit()").unwrap();
         let strict_db = body.find("apply_revocation_projection_mysql(pool").unwrap();
-        let redis = body.find("conn.set_ex").unwrap();
         let complete = body.find("mark_revocation_outbox_processed(pool").unwrap();
-        // Source tx commit → strict DB projection → optional Redis compat →
-        // outbox completion proof. The outbox stays the only completion proof.
-        assert!(commit < strict_db && strict_db < redis && redis < complete);
-        // Redis compat is optional: a missing projection manager must not fail
-        // the handler, and the strict DB path must be unconditional.
-        assert!(!body.contains("Redis projection manager not initialized"));
-        assert!(body.contains("if let Some(mut conn) = redis_compat"));
+        // Source commit → strict DB projection → durable outbox completion proof.
+        assert!(commit < strict_db && strict_db < complete);
         assert!(body.contains("astral_db::apply_revocation_projection_mysql(pool, &jti_keys)"));
+        assert!(!body.contains("redis_compat"));
+        assert!(!body.contains("conn.set_ex"));
     }
 
     #[test]
@@ -4162,7 +3936,6 @@ mod tests {
 
     fn sample_audit_payload() -> AuditLogPayload {
         AuditLogPayload {
-            message_id: None,
             user_id: Some(7),
             card_id: Some(70),
             action: "read".into(),
@@ -4179,20 +3952,28 @@ mod tests {
     }
 
     #[test]
-    fn audit_message_id_resolution_prefers_envelope_and_falls_back_to_legacy() {
-        // 信封 id 存在 → 直接使用（Redis 租约与 DB 幂等键同源）。
+    fn revocation_operation_id_requires_a_stable_explicit_command_id() {
+        let missing_id = AuthSessionRevocationPayload {
+            operation_id: "  ".into(),
+            user_id: 7,
+            reason: "admin-reset".into(),
+        };
+        let missing = revocation_operation_id("", &missing_id).unwrap_err();
+        assert!(missing.to_string().contains("operation id is required"));
+
+        let explicit = AuthSessionRevocationPayload {
+            operation_id: "operation-1".into(),
+            user_id: 7,
+            reason: "admin-reset".into(),
+        };
         assert_eq!(
-            resolve_audit_message_id("envelope-1", &sample_audit_payload()),
-            "envelope-1"
+            revocation_operation_id("operation-1", &explicit).unwrap(),
+            "operation-1"
         );
-        // 信封 id 缺失且 payload 无 id → canonical legacy id（与逐条路径同规则）。
-        let resolved = resolve_audit_message_id("", &sample_audit_payload());
-        assert!(resolved.starts_with("legacy-audit-v1-"));
-        // 相同 payload 的解析结果必须稳定（幂等键确定性）。
-        assert_eq!(
-            resolved,
-            resolve_audit_message_id("", &sample_audit_payload())
-        );
+        let conflict = revocation_operation_id("other-envelope-id", &explicit).unwrap_err();
+        assert!(conflict
+            .to_string()
+            .contains("must match the envelope messageId"));
     }
 
     #[test]
@@ -4214,12 +3995,6 @@ mod tests {
         assert_eq!(record.domain_id, Some(2));
         assert_eq!(record.tenant_id, Some(1));
         assert_eq!(record.detail.as_deref(), Some("messageId=envelope-9"));
-        // legacy 前缀 id 携带回退标记（与逐条路径 detail 规则一致）。
-        let legacy = audit_record_for_batch("legacy-audit-v1-abc", &payload);
-        assert_eq!(
-            legacy.detail.as_deref(),
-            Some("messageId=legacy-audit-v1-abc;legacyMessageIdFallback=true")
-        );
     }
 
     #[test]
@@ -4233,9 +4008,9 @@ mod tests {
             record.detail.as_deref(),
             Some("{\"schema\":\"audit-detail-org-v1\",\"path\":\"/stats\"}")
         );
-        // 逐条回退路径同规则。
+        // The per-record path preserves the same producer-supplied detail.
         assert_eq!(
-            audit_record_detail(payload.detail.as_deref(), "legacy-audit-v1-abc").as_deref(),
+            audit_record_detail(payload.detail.as_deref(), "envelope-10").as_deref(),
             Some("{\"schema\":\"audit-detail-org-v1\",\"path\":\"/stats\"}")
         );
     }
@@ -4253,10 +4028,6 @@ mod tests {
         assert_eq!(
             audit_record_detail(blank.detail.as_deref(), "envelope-12").as_deref(),
             Some("messageId=envelope-12")
-        );
-        assert_eq!(
-            audit_record_detail(blank.detail.as_deref(), "legacy-audit-v1-abc").as_deref(),
-            Some("messageId=legacy-audit-v1-abc;legacyMessageIdFallback=true")
         );
     }
 

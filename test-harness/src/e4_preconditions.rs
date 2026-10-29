@@ -2,9 +2,7 @@ use crate::e4_protocol::Status;
 use regex::Regex;
 use std::sync::OnceLock;
 
-pub const DEFAULT_CACHE_EPOCH_KEY: &str = "astral:auth:cache_epoch";
 pub const DEFAULT_CLOCK_SKEW_THRESHOLD_S: f64 = 2.0;
-pub const READONLY_REDIS_VERBS: [&str; 3] = ["GET", "LLEN", "PING"];
 pub const MAX_STORED_STRING: usize = 120;
 
 const ISOLATION_QUERY: &str = "SELECT @@global.transaction_isolation";
@@ -43,14 +41,11 @@ pub enum SqlReply {
 
 pub trait ReadOnlyProbe {
     fn sql(&mut self, query: &str) -> Result<SqlReply, ProbeError>;
-    fn has_redis(&self) -> bool;
-    fn redis(&mut self, argv: &[&str]) -> Result<Option<String>, ProbeError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CaptureConfig<'a> {
     pub clock_skew_threshold_s: f64,
-    pub cache_epoch_key: &'a str,
     pub cache_epoch_query: Option<&'a str>,
 }
 
@@ -58,7 +53,6 @@ impl Default for CaptureConfig<'static> {
     fn default() -> Self {
         Self {
             clock_skew_threshold_s: DEFAULT_CLOCK_SKEW_THRESHOLD_S,
-            cache_epoch_key: DEFAULT_CACHE_EPOCH_KEY,
             cache_epoch_query: None,
         }
     }
@@ -108,8 +102,8 @@ pub struct NodeReport {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheEpochSource {
-    RedisGet,
     Sql,
+    NotConfigured,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -418,81 +412,38 @@ where
 
 fn cache_epoch<P: ReadOnlyProbe>(
     probe: &mut P,
-    cache_epoch_key: &str,
     cache_epoch_query: Option<&str>,
 ) -> CacheEpochReport {
-    if let Some(query) = cache_epoch_query {
-        return match read_scalar(probe, query) {
-            Ok(value) => {
-                let non_empty = !value.trim().is_empty();
-                CacheEpochReport {
-                    status: if non_empty {
-                        Status::Pass
-                    } else {
-                        Status::Unknown
-                    },
-                    source: CacheEpochSource::Sql,
-                    value: Some(scrub_and_bound(&value)),
-                    note: (!non_empty).then_some("empty_value"),
-                    error_class: None,
-                }
-            }
-            Err(problem) => CacheEpochReport {
-                status: Status::Unknown,
-                source: CacheEpochSource::Sql,
-                value: None,
-                note: Some(problem.note),
-                error_class: problem.error_class,
-            },
-        };
-    }
-    if cache_epoch_key.is_empty() {
+    let Some(query) = cache_epoch_query else {
         return CacheEpochReport {
             status: Status::Skip,
-            source: CacheEpochSource::RedisGet,
+            source: CacheEpochSource::NotConfigured,
             value: None,
-            note: Some("no_cache_epoch_key_configured"),
+            note: Some("no_cache_epoch_query_configured"),
             error_class: None,
         };
-    }
-    if !probe.has_redis() {
-        return CacheEpochReport {
-            status: Status::Blocked,
-            source: CacheEpochSource::RedisGet,
-            value: None,
-            note: Some("redis_capability_missing"),
-            error_class: None,
-        };
-    }
-    let argv = ["GET", cache_epoch_key];
-    match probe.redis(&argv) {
+    };
+    match read_scalar(probe, query) {
         Ok(value) => {
-            let value = value.unwrap_or_default();
-            let value = value.trim();
-            if value.is_empty() || value.eq_ignore_ascii_case("nil") {
-                CacheEpochReport {
-                    status: Status::Skip,
-                    source: CacheEpochSource::RedisGet,
-                    value: None,
-                    note: Some("cache_epoch_absent"),
-                    error_class: None,
-                }
-            } else {
-                CacheEpochReport {
-                    status: Status::Pass,
-                    source: CacheEpochSource::RedisGet,
-                    value: Some(scrub_and_bound(value)),
-                    note: None,
-                    error_class: None,
-                }
+            let non_empty = !value.trim().is_empty();
+            CacheEpochReport {
+                status: if non_empty {
+                    Status::Pass
+                } else {
+                    Status::Unknown
+                },
+                source: CacheEpochSource::Sql,
+                value: Some(scrub_and_bound(&value)),
+                note: (!non_empty).then_some("empty_value"),
+                error_class: None,
             }
         }
-        Err(error) => CacheEpochReport {
+        Err(problem) => CacheEpochReport {
             status: Status::Unknown,
-            source: CacheEpochSource::RedisGet,
+            source: CacheEpochSource::Sql,
             value: None,
-            note: Some("redis_error"),
-            error_class: Some(error.class),
+            note: Some(problem.note),
+            error_class: problem.error_class,
         },
     }
 }
@@ -547,7 +498,7 @@ where
         });
     }
 
-    let cache_epoch = cache_epoch(probe, config.cache_epoch_key, config.cache_epoch_query);
+    let cache_epoch = cache_epoch(probe, config.cache_epoch_query);
     let overall = status_of(
         node_reports
             .iter()
@@ -585,9 +536,6 @@ mod tests {
     struct FakeProbe {
         sql_replies: BTreeMap<String, Result<SqlReply, ProbeError>>,
         sql_queries: Vec<String>,
-        redis_available: bool,
-        redis_reply: Result<Option<String>, ProbeError>,
-        redis_commands: Vec<Vec<String>>,
     }
 
     impl FakeProbe {
@@ -595,9 +543,6 @@ mod tests {
             let mut probe = Self {
                 sql_replies: BTreeMap::new(),
                 sql_queries: Vec::new(),
-                redis_available: true,
-                redis_reply: Ok(Some("550e8400-e29b-41d4-a716-446655440000".to_owned())),
-                redis_commands: Vec::new(),
             };
             probe.set_row(ISOLATION_QUERY, "REPEATABLE-READ");
             probe.set_row(READ_ONLY_QUERY, "0");
@@ -636,19 +581,6 @@ mod tests {
                 .cloned()
                 .unwrap_or_else(|| Ok(SqlReply::Rows(Vec::new())))
         }
-
-        fn has_redis(&self) -> bool {
-            self.redis_available
-        }
-
-        fn redis(&mut self, argv: &[&str]) -> Result<Option<String>, ProbeError> {
-            self.redis_commands
-                .push(argv.iter().map(|arg| (*arg).to_owned()).collect());
-            if argv.is_empty() || !READONLY_REDIS_VERBS.contains(&argv[0]) {
-                return Err(ProbeError::new("UnsafeCommand", "command rejected"));
-            }
-            self.redis_reply.clone()
-        }
     }
 
     fn capture(probe: &mut FakeProbe, nodes: &[&str]) -> PreconditionReport {
@@ -657,11 +589,10 @@ mod tests {
     }
 
     #[test]
-    fn happy_path_is_select_only_and_reads_only_the_cache_epoch_key() {
+    fn happy_path_is_select_only_and_unconfigured_cache_epoch_is_skipped() {
         let mut probe = FakeProbe::ready();
         let report = capture(&mut probe, &["writer-a"]);
         assert_eq!(report.kind, "e4_preconditions");
-        assert_eq!(report.overall, Status::Pass);
         assert_eq!(report.node_count, 1);
         assert_eq!(report.nodes[0].node_key, "node-0");
         let checks = &report.nodes[0].checks;
@@ -678,16 +609,14 @@ mod tests {
                 skew_s: 0.0,
             })
         );
-        assert_eq!(report.cache_epoch.status, Status::Pass);
-        assert_eq!(
-            report.cache_epoch.value.as_deref(),
-            Some("550e8400-e29b-41d4-a716-446655440000")
-        );
+        assert_eq!(report.cache_epoch.status, Status::Skip);
+        assert_eq!(report.cache_epoch.source, CacheEpochSource::NotConfigured);
+        assert_eq!(report.cache_epoch.value, None);
+        assert_eq!(report.overall, Status::Skip);
         assert!(probe
             .sql_queries
             .iter()
             .all(|query| require_select_only(query).is_ok()));
-        assert_eq!(probe.redis_commands, [["GET", DEFAULT_CACHE_EPOCH_KEY]]);
     }
 
     #[test]
@@ -789,9 +718,8 @@ mod tests {
     }
 
     #[test]
-    fn clock_failure_and_fail_status_outrank_missing_redis_capability() {
+    fn clock_failure_and_fail_status_are_not_masked_by_unconfigured_cache_epoch() {
         let mut probe = FakeProbe::ready();
-        probe.redis_available = false;
         let report = capture_e4_preconditions(&mut probe, &["n"], CaptureConfig::default(), || {
             Err(ProbeError::new("RuntimeError", "clock unavailable"))
         })
@@ -800,48 +728,30 @@ mod tests {
             report.nodes[0].checks.utc_clock_offset.status,
             Status::Unknown
         );
-        assert_eq!(report.cache_epoch.status, Status::Blocked);
-        assert_eq!(report.overall, Status::Blocked);
+        assert_eq!(report.cache_epoch.status, Status::Skip);
+        assert_eq!(report.overall, Status::Unknown);
 
         let mut skewed = FakeProbe::ready();
-        skewed.redis_available = false;
         let clock = skewed.clock() + 10.0;
         let report =
             capture_e4_preconditions(&mut skewed, &["n"], CaptureConfig::default(), || Ok(clock))
                 .unwrap();
         assert_eq!(report.nodes[0].checks.utc_clock_offset.status, Status::Fail);
-        assert_eq!(report.cache_epoch.status, Status::Blocked);
+        assert_eq!(report.cache_epoch.status, Status::Skip);
         assert_eq!(report.overall, Status::Fail);
     }
 
     #[test]
-    fn cache_epoch_absence_errors_capability_and_sql_source_are_distinct() {
-        for reply in [
-            Ok(None),
-            Ok(Some(String::new())),
-            Ok(Some("nil".to_owned())),
-        ] {
-            let mut probe = FakeProbe::ready();
-            probe.redis_reply = reply;
-            assert_eq!(capture(&mut probe, &["n"]).cache_epoch.status, Status::Skip);
-        }
-
-        let mut errored = FakeProbe::ready();
-        errored.redis_reply = Err(ProbeError::new(
-            "RuntimeError",
-            "redis.example.invalid down",
-        ));
-        let report = capture(&mut errored, &["n"]);
-        assert_eq!(report.cache_epoch.status, Status::Unknown);
-        assert_eq!(report.cache_epoch.error_class, Some("RuntimeError"));
-        assert!(!format!("{report:#?}").contains("redis.example.invalid"));
-
-        let mut no_redis = FakeProbe::ready();
-        no_redis.redis_available = false;
-        assert_eq!(
-            capture(&mut no_redis, &["n"]).cache_epoch.status,
-            Status::Blocked
-        );
+    fn cache_epoch_is_optional_sql_evidence_and_never_fabricated() {
+        let mut unconfigured = FakeProbe::ready();
+        let report = capture(&mut unconfigured, &["n"]);
+        assert_eq!(report.cache_epoch.status, Status::Skip);
+        assert_eq!(report.cache_epoch.source, CacheEpochSource::NotConfigured);
+        assert_eq!(report.cache_epoch.value, None);
+        assert!(!unconfigured
+            .sql_queries
+            .iter()
+            .any(|query| query.contains("cache_epoch")));
 
         let mut via_sql = FakeProbe::ready();
         via_sql.set_row(READ_ONLY_QUERY, "0");
@@ -859,23 +769,28 @@ mod tests {
         assert_eq!(report.cache_epoch.status, Status::Pass);
         assert_eq!(report.cache_epoch.source, CacheEpochSource::Sql);
         assert_eq!(report.cache_epoch.value.as_deref(), Some("0"));
-        assert!(via_sql.redis_commands.is_empty());
+        assert!(via_sql
+            .sql_queries
+            .iter()
+            .any(|query| query == READ_ONLY_QUERY));
 
-        let mut no_key = FakeProbe::ready();
-        let clock_value = no_key.clock();
+        let mut missing_sql = FakeProbe::ready();
+        let clock_value = missing_sql.clock();
         let report = capture_e4_preconditions(
-            &mut no_key,
+            &mut missing_sql,
             &["n"],
             CaptureConfig {
-                cache_epoch_key: "",
+                cache_epoch_query: Some("SELECT cache_epoch FROM missing_table"),
                 ..CaptureConfig::default()
             },
             || Ok(clock_value),
         )
         .unwrap();
-        assert_eq!(report.cache_epoch.status, Status::Skip);
-        assert_eq!(report.cache_epoch.source, CacheEpochSource::RedisGet);
-        assert!(no_key.redis_commands.is_empty());
+        assert_eq!(report.cache_epoch.status, Status::Unknown);
+        assert_eq!(report.cache_epoch.source, CacheEpochSource::Sql);
+        assert_eq!(report.cache_epoch.value, None);
+        assert_eq!(report.cache_epoch.note, Some("empty_result"));
+        assert_eq!(report.overall, Status::Unknown);
     }
 
     #[test]
@@ -933,7 +848,6 @@ mod tests {
             );
         }
         assert!(probe.sql_queries.is_empty());
-        assert!(probe.redis_commands.is_empty());
     }
 
     #[test]
@@ -973,11 +887,10 @@ mod tests {
             CaptureInputError::InvalidThreshold
         );
         assert!(probe.sql_queries.is_empty());
-        assert!(probe.redis_commands.is_empty());
     }
 
     #[test]
-    fn configured_query_uses_select_guard_and_cache_key_absence_is_skipped() {
+    fn configured_query_uses_select_guard_and_absence_is_skipped() {
         for query in [
             "SELECT 1",
             "/* lead */ SELECT 1",
@@ -1003,35 +916,26 @@ mod tests {
         }
         let mut probe = FakeProbe::ready();
         let clock_value = probe.clock();
-        let report = capture_e4_preconditions(
-            &mut probe,
-            &["n"],
-            CaptureConfig {
-                cache_epoch_key: "",
-                ..CaptureConfig::default()
-            },
-            || Ok(clock_value),
-        )
+        let report = capture_e4_preconditions(&mut probe, &["n"], CaptureConfig::default(), || {
+            Ok(clock_value)
+        })
         .unwrap();
         assert_eq!(report.cache_epoch.status, Status::Skip);
-        assert!(probe.redis_commands.is_empty());
-        assert_eq!(READONLY_REDIS_VERBS, ["GET", "LLEN", "PING"]);
+        assert_eq!(report.cache_epoch.source, CacheEpochSource::NotConfigured);
+        assert_eq!(
+            report.cache_epoch.note,
+            Some("no_cache_epoch_query_configured")
+        );
+        assert_eq!(report.overall, Status::Skip);
     }
 
     #[test]
     fn hostnames_urls_node_aliases_and_probe_errors_are_not_retained() {
         let mut probe = FakeProbe::ready();
         probe.set_row(SESSION_TIME_ZONE_QUERY, "db01.internal.example.com");
-        probe.redis_reply = Ok(Some("redis://cache.example.invalid:6380/0".to_owned()));
         let report = capture(&mut probe, &["node.example.invalid"]);
         let output = format!("{report:#?}");
-        for forbidden in [
-            "node.example.invalid",
-            "cache.example.invalid",
-            "example.com",
-            "db01.internal",
-            "redis://",
-        ] {
+        for forbidden in ["node.example.invalid", "example.com", "db01.internal"] {
             assert!(!output.contains(forbidden), "report leaked {forbidden}");
         }
         assert!(output.contains("[redacted-host]"));

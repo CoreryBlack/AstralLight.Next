@@ -37,7 +37,6 @@ async fn main() {
                     // Test publish
                     let producer = astral_mq::producer::Producer::new(ch.clone());
                     let payload = astral_mq::producer::LoginEventPayload {
-                        message_id: None,
                         user_id: 12345,
                         card_id: Some(12345),
                         login_type: "PASSWORD".into(),

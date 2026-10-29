@@ -1,6 +1,4 @@
-//! Frozen execution mode and aggregate-owned authorization projection capabilities.
-
-use std::sync::OnceLock;
+//! Aggregate-owned authorization projection capabilities.
 
 use crate::{
     ClaimedDeltaEvent, DeltaEventClaim, DeltaLeaseIdentity, DeltaLeaseToken,
@@ -27,80 +25,6 @@ pub use transitions::{
     load_owned_claimed_delta_event, owned_delta_lease_is_retired,
     owned_execution_outcome_is_unknown, quarantine_owned_delta_event, release_owned_delta_event,
 };
-
-static PROJECTION_EXECUTION_MODE: OnceLock<ProjectionExecutionMode> = OnceLock::new();
-
-/// Process-wide ownership protocol, frozen before connecting workers or serving requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjectionExecutionMode {
-    /// Compatibility path with request-side publication and event leases.
-    LegacyHybrid,
-    /// Only workers execute, under an aggregate capability and active-event slot.
-    WorkerOwned,
-}
-
-impl ProjectionExecutionMode {
-    fn from_environment_value(value: Option<&str>) -> Result<Self, ProjectionExecutionModeError> {
-        match value {
-            None | Some("legacy-hybrid") => Ok(Self::LegacyHybrid),
-            Some("worker-owned") => Ok(Self::WorkerOwned),
-            Some(_) => Err(ProjectionExecutionModeError::InvalidEnvironment),
-        }
-    }
-}
-
-/// Invalid or conflicting execution-mode configuration; startup must stop.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ProjectionExecutionModeError {
-    /// Another value was already frozen in this process.
-    #[error("projection execution mode is already frozen to a different value")]
-    AlreadyFrozen,
-    /// Configuration values are exact and must not be silently normalized.
-    #[error("invalid ASTRAL_PROJECTION_EXECUTION_MODE; expected legacy-hybrid or worker-owned")]
-    InvalidEnvironment,
-}
-
-fn freeze_mode(
-    cell: &OnceLock<ProjectionExecutionMode>,
-    mode: ProjectionExecutionMode,
-) -> Result<ProjectionExecutionMode, ProjectionExecutionModeError> {
-    let frozen = *cell.get_or_init(|| mode);
-    if frozen == mode {
-        Ok(frozen)
-    } else {
-        Err(ProjectionExecutionModeError::AlreadyFrozen)
-    }
-}
-
-/// Freeze configuration only; schema validation happens after connection and before execution.
-pub fn freeze_projection_execution_mode(
-    mode: ProjectionExecutionMode,
-) -> Result<ProjectionExecutionMode, ProjectionExecutionModeError> {
-    freeze_mode(&PROJECTION_EXECUTION_MODE, mode)
-}
-
-/// Read the frozen mode. Unconfigured library callers retain the default compatibility path.
-pub fn projection_execution_mode() -> ProjectionExecutionMode {
-    PROJECTION_EXECUTION_MODE
-        .get()
-        .copied()
-        .unwrap_or(ProjectionExecutionMode::LegacyHybrid)
-}
-
-/// Parse and freeze the startup environment. Unknown and non-Unicode values are refused.
-pub fn freeze_projection_execution_mode_from_env(
-) -> Result<ProjectionExecutionMode, ProjectionExecutionModeError> {
-    let value = match std::env::var("ASTRAL_PROJECTION_EXECUTION_MODE") {
-        Ok(value) => Some(value),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(ProjectionExecutionModeError::InvalidEnvironment);
-        }
-    };
-    freeze_projection_execution_mode(ProjectionExecutionMode::from_environment_value(
-        value.as_deref(),
-    )?)
-}
 
 /// Exact committed-receipt claim outcome. Admission alone never proves publication.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,48 +157,5 @@ impl std::fmt::Debug for OwnedDeltaLease {
             .field("event_identity", &self.event_identity)
             .field("execution_failures", &self.execution_failures)
             .finish_non_exhaustive()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn execution_mode_is_default_off_and_strictly_parsed() {
-        for (value, expected) in [
-            (None, ProjectionExecutionMode::LegacyHybrid),
-            (Some("legacy-hybrid"), ProjectionExecutionMode::LegacyHybrid),
-            (Some("worker-owned"), ProjectionExecutionMode::WorkerOwned),
-        ] {
-            assert_eq!(
-                ProjectionExecutionMode::from_environment_value(value),
-                Ok(expected)
-            );
-        }
-        for value in ["", "true", "WORKER-OWNED", "worker-owned ", " worker-owned"] {
-            assert_eq!(
-                ProjectionExecutionMode::from_environment_value(Some(value)),
-                Err(ProjectionExecutionModeError::InvalidEnvironment)
-            );
-        }
-    }
-
-    #[test]
-    fn mode_freeze_is_idempotent_and_rejects_in_process_switching() {
-        let cell = OnceLock::new();
-        assert_eq!(
-            freeze_mode(&cell, ProjectionExecutionMode::WorkerOwned),
-            Ok(ProjectionExecutionMode::WorkerOwned)
-        );
-        assert_eq!(
-            freeze_mode(&cell, ProjectionExecutionMode::WorkerOwned),
-            Ok(ProjectionExecutionMode::WorkerOwned)
-        );
-        assert_eq!(
-            freeze_mode(&cell, ProjectionExecutionMode::LegacyHybrid),
-            Err(ProjectionExecutionModeError::AlreadyFrozen)
-        );
-        assert_eq!(cell.get(), Some(&ProjectionExecutionMode::WorkerOwned));
     }
 }

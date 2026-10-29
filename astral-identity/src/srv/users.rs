@@ -97,6 +97,6 @@ async fn set_password(
     Path(id): Path<i64>,
     Json(req): Json<SetPasswordRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.user_service.set_password(&state, id, &req).await?;
+    state.user_service.set_password(id, &req).await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }

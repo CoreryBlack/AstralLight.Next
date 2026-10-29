@@ -338,10 +338,6 @@ pub trait LevelTemplateRepository: Send + Sync {
         id: i64,
         context: &LevelTemplateMutationContext,
     ) -> Result<DeleteOutcome, AstralError>;
-    /// 兼容哨兵（trait 默认 false；本 repository 覆写为 true，见 impl）。
-    fn writes_projection_in_transaction(&self) -> bool {
-        false
-    }
 }
 
 pub struct SqlxLevelTemplateRepository {
@@ -417,14 +413,6 @@ async fn capture_affected_card_scope_in_tx(
 
 #[async_trait]
 impl LevelTemplateRepository for SqlxLevelTemplateRepository {
-    /// 覆写哨兵：本 repository 在自身事务内闭环处理全部副作用（无 post-commit
-    /// 补偿）。retired 旧 CARD REVOKE 链路已随范围结论移除；保持 `true` 防止
-    /// service 旧补偿路径（`request_card_projection("REVOKE")`，同为 retired
-    /// 无效果链路）被重新激活。
-    fn writes_projection_in_transaction(&self) -> bool {
-        true
-    }
-
     async fn count_templates(&self, filter: &LevelTemplateFilter) -> Result<i64, AstralError> {
         let mut builder = QueryBuilder::<sqlx::MySql>::new(
             "SELECT COUNT(*) FROM identity_level_template WHERE 1=1",

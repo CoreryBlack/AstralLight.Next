@@ -124,13 +124,7 @@ fn string_array(value: &TomlValue, name: &str) -> Result<Vec<String>, String> {
 }
 
 fn registered_services(profile: &str) -> Option<Vec<&'static str>> {
-    match profile {
-        "native-kernel" | "offline-validation" | "performance-kernel" => Some(vec![]),
-        "native-single-node" | "performance-native" => Some(vec!["mysql"]),
-        "standalone-rabbit" | "distributed" => Some(vec!["mysql", "rabbitmq"]),
-        "redis-compat" => Some(vec!["mysql", "redis"]),
-        _ => None,
-    }
+    crate::dependency_profiles::profile_services(profile).map(|services| services.to_vec())
 }
 
 pub fn read_manifest(root: &Path) -> Result<Manifest, String> {
@@ -151,18 +145,9 @@ pub fn read_manifest(root: &Path) -> Result<Manifest, String> {
     if profiles.len() != toml_array(raw.get("profile")).len() {
         return Err("duplicate profile id".into());
     }
-    let expected_profiles = [
-        "native-kernel",
-        "offline-validation",
-        "native-single-node",
-        "standalone-rabbit",
-        "distributed",
-        "redis-compat",
-        "performance-kernel",
-        "performance-native",
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
+    let expected_profiles = crate::dependency_profiles::PROFILE_IDS
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     if profiles.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_profiles {
         return Err("unknown or missing production profile".into());
     }
@@ -268,9 +253,6 @@ pub fn read_manifest(root: &Path) -> Result<Manifest, String> {
                 return Err(format!("unknown or incompatible evidence contract: {id}"));
             }
         }
-        if profile != "redis-compat" && argv.iter().any(|arg| arg.contains("redis-compat")) {
-            return Err(format!("Redis feature outside compatibility: {id}"));
-        }
         let timeout = suite
             .get("timeout_seconds")
             .and_then(TomlValue::as_integer)
@@ -281,7 +263,6 @@ pub fn read_manifest(root: &Path) -> Result<Manifest, String> {
         let acceptance = str_field(suite, "acceptance")?;
         if ![
             "rust",
-            "unittest",
             "model-json",
             "command",
             "dependency-tree",
@@ -463,28 +444,12 @@ pub fn prepare_environment(
     }
     result.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
     let profile = suite_profile(suite);
-    let services = registered_services(&profile).unwrap_or_default();
-    if let Some(mode) = suite
-        .get("projection_execution_mode")
-        .and_then(TomlValue::as_str)
-    {
-        if !["legacy-hybrid", "worker-owned"].contains(&mode) {
-            return (
-                result,
-                Some("suite projection execution mode is not registered".into()),
-            );
-        }
-        result.insert("ASTRAL_PROJECTION_EXECUTION_MODE".into(), mode.into());
-    }
-    result.insert(
-        "ASTRAL_REDIS_PROJECTION_COMPAT".into(),
-        if services.contains(&"redis") {
-            "true"
-        } else {
-            "false"
-        }
-        .into(),
-    );
+    let Some(services) = registered_services(&profile) else {
+        return (
+            result,
+            Some(format!("unregistered test profile: {profile}")),
+        );
+    };
     result.insert(
         "ASTRAL_MESSAGE_TRANSPORT".into(),
         if services.contains(&"rabbitmq") {
@@ -568,10 +533,7 @@ pub fn prepare_environment(
     result.insert("RUST_INTEGRATION_REQUIRED".into(), "1".into());
     result.insert("ASTRAL_MIGRATION_ENV".into(), "isolated".into());
     result.insert(name_key.into(), path_name.into());
-    for (service, key, scheme, port) in [
-        ("rabbitmq", "RABBITMQ_URL", "amqp", 5673),
-        ("redis", "REDIS_URL", "redis", 6380),
-    ] {
+    for (service, key, scheme, port) in [("rabbitmq", "RABBITMQ_URL", "amqp", 5673)] {
         if !services.contains(&service) {
             continue;
         }
@@ -750,7 +712,9 @@ pub fn classify_output(
             }
             json!({"status":"PASS","reason":"native dependency tree contains no Redis"})
         }
-        "unittest" => check_unittest_output(minimum, &combined),
+        "unittest" => {
+            json!({"status":"FAIL", "reason":"retired non-Rust test acceptance contract"})
+        }
         _ => {
             if suite
                 .get("required_output")
@@ -768,32 +732,6 @@ fn status_marker(text: &str, status: &str) -> bool {
     let lower = format!("[{status}]", status = status.to_ascii_lowercase());
     text.lines()
         .any(|line| line.contains(&format!("[{status}]")) || line.contains(&lower))
-}
-
-fn check_unittest_output(minimum: usize, combined: &str) -> Value {
-    let summary = regex::Regex::new(r"Ran ([0-9]+) tests? in [0-9.]+s").expect("constant regex");
-    let counts = summary
-        .captures_iter(combined)
-        .filter_map(|captures| captures[1].parse::<usize>().ok())
-        .collect::<Vec<_>>();
-    let executed = counts.iter().sum::<usize>();
-    if counts.is_empty()
-        || executed < minimum
-        || !regex::Regex::new(r"(?m)^OK(?:\s|$)")
-            .expect("constant regex")
-            .is_match(combined)
-    {
-        return json!({"status":"FAIL","reason":"missing or empty Python assertion summary","tests":{"executed":executed}});
-    }
-    let skipped_re = regex::Regex::new(r"skipped=(\d+)").expect("constant regex");
-    let skipped = skipped_re
-        .captures_iter(combined)
-        .filter_map(|captures| captures[1].parse::<usize>().ok())
-        .sum::<usize>();
-    if skipped > 0 {
-        return json!({"status":"SKIP","reason":"Python checks skipped","tests":{"executed":executed,"skipped":skipped}});
-    }
-    json!({"status":"PASS","reason":"offline Python assertions executed","tests":{"executed":executed}})
 }
 
 pub fn fold_status(records: &[Value]) -> &'static str {
@@ -1583,24 +1521,20 @@ where
                         let name = key.to_string_lossy();
                         [
                             "DATABASE_URL",
-                            "REDIS_URL",
                             "RABBITMQ_URL",
+                            "REDIS_URL",
                             "RUST_INTEGRATION_REQUIRED",
                             "ASTRAL_TEST_DATABASE_NAME",
-                            "ASTRAL_REDIS_PROJECTION_COMPAT",
+                            "INTEGRATION_IDENTITY_MAPPING_DATABASE_URL",
+                            "INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE",
                             "ASTRAL_MESSAGE_TRANSPORT",
                             "ASTRAL_MIGRATION_ENV",
-                            "ASTRAL_PROJECTION_EXECUTION_MODE",
                         ]
                         .contains(&name.as_ref())
                         .then_some(name.to_string())
                     })
                     .collect::<Vec<_>>();
                 record["environment_names"] = json!(names);
-                record["projection_execution_mode"] = json!(child_env
-                    .get(std::ffi::OsStr::new("ASTRAL_PROJECTION_EXECUTION_MODE"))
-                    .map(|value| value.to_string_lossy())
-                    .unwrap_or_else(|| "legacy-hybrid".into()));
                 let argv = string_array(suite, "argv")?;
                 if let Some(reason) = issue {
                     record["status"] = json!("BLOCKED");
@@ -1849,12 +1783,11 @@ mod tests {
                 "sdk_identity_mapping_test_contract",
             ),
             ("RABBITMQ_URL", "amqp://fixture@127.0.0.1:5673/%2f"),
-            ("REDIS_URL", "redis://fixture@127.0.0.1:6380/0"),
             ("MYSQL_ROOT_PASSWORD", "temporary-fixture"),
             ("MYSQL_DATABASE", "untrusted-database"),
             ("RABBITMQ_USER", "untrusted-user"),
             ("RABBITMQ_PASSWORD", "untrusted-password"),
-            ("COMPOSE_PROFILES", "rabbit,redis-compat"),
+            ("COMPOSE_PROFILES", "rabbit"),
             ("SKIP_DOCKER", "1"),
             ("ASTRAL_TARGET_REGION", "foreign-region"),
             ("ASTRAL_PERF_CASE", "filtered-case"),
@@ -1948,18 +1881,6 @@ exit "${FAKE_CARGO_EXIT:-0}"
                 "scripts/run-tests.sh",
                 vec!["--identity-mapping"],
                 vec!["--", "--run", "--suite", "dedicated-identity-mapping"],
-            ),
-            (
-                "scripts/run-tests.sh",
-                vec!["--redis-compat"],
-                vec![
-                    "--",
-                    "--run",
-                    "--profile",
-                    "redis-compat",
-                    "--suite",
-                    "redis-evidence-compat",
-                ],
             ),
             (
                 "scripts/run-tests.sh",
@@ -2447,37 +2368,70 @@ exit "${FAKE_CARGO_EXIT:-0}"
             "Docs/实验/分布式测试/rust-s15/test_s15_validation.py",
         ];
         let mut total_methods = 0usize;
+        let mut status_counts = BTreeMap::new();
         let crosswalk = fs::read_to_string(
             root.join("Docs/authorization-validation/python-test-method-crosswalk.md"),
         )
         .expect("read Python-to-Rust method crosswalk");
         let crosswalk_lines = crosswalk.lines().collect::<Vec<_>>();
+        const RETIRED_TDSC_SOURCE: &str =
+            "experiments/tdsc/protocol-runner/test_run_performance.py";
+        // Baseline 62b4349, Git blob 53839fda51d4fe8888da598810b7e75ffb5b18a7.
+        const RETIRED_TDSC_METHODS: [&str; 10] = [
+            "test_status_classification_is_mutually_exclusive",
+            "test_exception_classification_distinguishes_timeout",
+            "test_percentiles_are_interpolated",
+            "test_empty_percentile_is_none",
+            "test_percentile_rejects_invalid_range",
+            "test_sample_row_matches_declared_schema",
+            "test_schema_rejects_invalid_outcome",
+            "test_concurrency_parser_requires_unique_positive_values",
+            "test_replicate_summary_has_rate_and_success_throughput_metrics",
+            "test_concurrency_summary_uses_replicate_level_metrics",
+        ];
         for source in modules {
-            let contents = fs::read_to_string(root.join(source))
-                .unwrap_or_else(|error| panic!("read Python migration source {source}: {error}"));
-            let methods = contents
-                .lines()
-                .filter_map(|line| {
-                    let trimmed = line.trim_start();
-                    trimmed.strip_prefix("def test_").and_then(|name| {
-                        name.split_once('(').map(|(name, _)| format!("test_{name}"))
+            let methods = if source == RETIRED_TDSC_SOURCE {
+                assert!(
+                    !root.join(source).exists(),
+                    "retired TDSC Python test must not be restored as a current entrypoint"
+                );
+                RETIRED_TDSC_METHODS
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect::<Vec<_>>()
+            } else {
+                let contents = fs::read_to_string(root.join(source)).unwrap_or_else(|error| {
+                    panic!("read Python migration source {source}: {error}")
+                });
+                contents
+                    .lines()
+                    .filter_map(|line| {
+                        let trimmed = line.trim_start();
+                        trimmed.strip_prefix("def test_").and_then(|name| {
+                            name.split_once('(').map(|(name, _)| format!("test_{name}"))
+                        })
                     })
-                })
-                .collect::<Vec<_>>();
+                    .collect::<Vec<_>>()
+            };
             let method_count = methods.len();
             assert!(
                 method_count > 0,
                 "Python unittest module has no test methods: {source}"
             );
             total_methods += method_count;
+            let registration_source = if source == RETIRED_TDSC_SOURCE {
+                "test-harness/src/tdsc_performance.rs"
+            } else {
+                source
+            };
             assert!(
                 manifest.suites.iter().any(|suite| {
                     string_array(suite, "sources")
                         .unwrap_or_default()
                         .iter()
-                        .any(|registered| registered == source)
+                        .any(|registered| registered == registration_source)
                 }),
-                "Python unittest module is absent from every suite source list: {source}"
+                "Python migration contract is absent from every suite source list: {source}"
             );
             let marker = format!("<!-- python-source: {source} -->");
             assert_eq!(
@@ -2533,12 +2487,24 @@ exit "${FAKE_CARGO_EXIT:-0}"
                     method_rows[0].matches('|').count() >= 4,
                     "crosswalk method row must include source, Rust target, and status columns: {source}::{method}"
                 );
-                assert!(
-                    ["EQUIVALENT", "PARTIAL", "BLOCKED"]
-                        .iter()
-                        .any(|status| method_rows[0].contains(status)),
-                    "crosswalk method row must declare an evidence status: {source}::{method}"
-                );
+                let status = method_rows[0].split('|').nth(3).unwrap_or_default().trim();
+                let status_kind = ["EQUIVALENT", "PARTIAL", "BLOCKED", "RETIRED"]
+                    .into_iter()
+                    .find(|known| status.starts_with(known))
+                    .unwrap_or_else(|| {
+                        panic!("crosswalk method row must declare an evidence status: {source}::{method}")
+                    });
+                *status_counts.entry(status_kind).or_insert(0usize) += 1;
+                if status.starts_with("RETIRED") {
+                    assert!(
+                        method_rows[0].split('|').nth(2).unwrap_or_default().contains(".rs::"),
+                        "retired contract must identify its current rejection or replacement test: {source}::{method}"
+                    );
+                    assert!(
+                        status.contains('：'),
+                        "retired contract requires its removal boundary"
+                    );
+                }
                 assert_python_crosswalk_targets_exist(root, source, &method, method_rows[0]);
             }
         }
@@ -2551,6 +2517,18 @@ exit "${FAKE_CARGO_EXIT:-0}"
             total_methods, 622,
             "the Python unittest method inventory changed"
         );
+        for (status, expected) in [
+            ("EQUIVALENT", 599),
+            ("PARTIAL", 9),
+            ("BLOCKED", 0),
+            ("RETIRED", 14),
+        ] {
+            assert_eq!(
+                status_counts.get(status).copied().unwrap_or(0),
+                expected,
+                "crosswalk {status} inventory changed; reconcile method and summary boundaries"
+            );
+        }
 
         let campaign = manifest
             .suites
@@ -2754,7 +2732,6 @@ exit "${FAKE_CARGO_EXIT:-0}"
                 1,
                 vec![
                     "test-harness/src/e1_frozen_result.rs",
-                    "Docs/authorization-validation/tools/e1_runner.py",
                     "Docs/authorization-validation/archive/python-tests/test_e1_runner.py",
                 ],
             ),
@@ -2765,7 +2742,6 @@ exit "${FAKE_CARGO_EXIT:-0}"
                 8,
                 vec![
                     "test-harness/src/e3_config.rs",
-                    "Docs/authorization-validation/tools/e3_runner.py",
                     "Docs/authorization-validation/archive/python-tests/test_e3_runner.py",
                 ],
             ),
@@ -2776,8 +2752,6 @@ exit "${FAKE_CARGO_EXIT:-0}"
                 16,
                 vec![
                     "test-harness/src/e3_report.rs",
-                    "Docs/authorization-validation/tools/e3_e4.py",
-                    "Docs/authorization-validation/tools/e3_runner.py",
                     "Docs/authorization-validation/archive/python-tests/test_e3_e4.py",
                     "Docs/authorization-validation/archive/python-tests/test_e3_runner.py",
                 ],
@@ -2789,7 +2763,6 @@ exit "${FAKE_CARGO_EXIT:-0}"
                 7,
                 vec![
                     "test-harness/src/e4_protocol.rs",
-                    "Docs/authorization-validation/tools/e4_fault_driver.py",
                     "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py",
                     "Docs/authorization-validation/archive/python-tests/test_experiment_common.py",
                 ],
@@ -2873,25 +2846,16 @@ exit "${FAKE_CARGO_EXIT:-0}"
             );
             assert_eq!(str_field(suite, "scope").unwrap(), "component");
             assert_eq!(str_field(suite, "acceptance").unwrap(), "rust");
-            assert_eq!(
-                string_array(suite, "sources").unwrap(),
+            let expected_sources = if id.starts_with("tdsc") {
+                vec!["test-harness/src/tdsc_performance.rs".to_owned()]
+            } else {
                 vec![
-                    format!(
-                        "test-harness/src/{}.rs",
-                        if id.starts_with("tdsc") {
-                            "tdsc_performance"
-                        } else {
-                            "s15_validation"
-                        }
-                    ),
+                    "test-harness/src/s15_validation.rs".to_owned(),
                     module.to_owned(),
-                    if id.starts_with("tdsc") {
-                        "experiments/tdsc/protocol-runner/run-performance.py".to_owned()
-                    } else {
-                        "Docs/实验/分布式测试/rust-s15/s15_validation.py".to_owned()
-                    },
+                    "Docs/实验/分布式测试/rust-s15/s15_validation.py".to_owned(),
                 ]
-            );
+            };
+            assert_eq!(string_array(suite, "sources").unwrap(), expected_sources);
             assert_eq!(
                 string_array(suite, "argv").unwrap(),
                 vec![
@@ -3275,12 +3239,9 @@ exit "${FAKE_CARGO_EXIT:-0}"
     fn explicit_status_and_process_outcomes_keep_fail_closed_precedence() {
         let command: TomlValue =
             toml::from_str("acceptance='command'\nrequired_output='contract'\n").unwrap();
-        let unittest: TomlValue =
-            toml::from_str("acceptance='unittest'\nminimum_tests=1\n").unwrap();
         let rust: TomlValue = toml::from_str("acceptance='rust'\nminimum_tests=1\n").unwrap();
         let successful = [
             (&command, "contract\n", ""),
-            (&unittest, "", "Ran 2 tests in 0.001s\n\nOK\n"),
             (&rust, &rust_summary(1, 0, 0, 0), ""),
         ];
         for status in ["PENDING", "BLOCKED", "FAIL", "UNKNOWN", "SKIP"] {
@@ -3696,30 +3657,28 @@ exit "${FAKE_CARGO_EXIT:-0}"
                 .unwrap(),
             "local"
         );
-        assert_eq!(
-            result
-                .get(std::ffi::OsStr::new("ASTRAL_REDIS_PROJECTION_COMPAT"))
-                .unwrap(),
-            "false"
-        );
+        assert!(!result.contains_key(std::ffi::OsStr::new("ASTRAL_REDIS_PROJECTION_COMPAT")));
+        assert!(!result.contains_key(std::ffi::OsStr::new("ASTRAL_PROJECTION_EXECUTION_MODE")));
     }
 
     #[test]
-    fn native_profiles_select_only_declared_services_and_suite_mode() {
+    fn native_profiles_select_only_declared_services_and_scrub_retired_selectors() {
         let mut parent = isolated_environment();
         parent.push((
             "ASTRAL_PROJECTION_EXECUTION_MODE".into(),
             "worker-owned".into(),
         ));
+        parent.push(("ASTRAL_REDIS_PROJECTION_COMPAT".into(), "true".into()));
         let mut inherited = parent.clone();
         inherited.push((
             "ASTRAL_PROJECTION_EXECUTION_MODE".into(),
-            "worker-owned".into(),
+            "legacy-hybrid".into(),
         ));
         let kernel: TomlValue = toml::from_str("id='kernel'\nprofile='native-kernel'\ntest_services=[]\nseries=['E1']\nscope='component'\nowner='x'\nboundary='x'\nsources=[]\nargv=['cargo','test']\nacceptance='rust'\n").unwrap();
         let (env, error) = prepare_environment(&kernel, &inherited);
         assert!(error.is_none());
         assert!(!env.contains_key(std::ffi::OsStr::new("ASTRAL_PROJECTION_EXECUTION_MODE")));
+        assert!(!env.contains_key(std::ffi::OsStr::new("ASTRAL_REDIS_PROJECTION_COMPAT")));
         assert!(!env.contains_key(std::ffi::OsStr::new("DATABASE_URL")));
         assert!(!env.contains_key(std::ffi::OsStr::new("RABBITMQ_URL")));
         assert!(!env.contains_key(std::ffi::OsStr::new("REDIS_URL")));
@@ -3733,6 +3692,8 @@ exit "${FAKE_CARGO_EXIT:-0}"
             env[std::ffi::OsStr::new("ASTRAL_MESSAGE_TRANSPORT")],
             "rabbit"
         );
+        assert!(!env.contains_key(std::ffi::OsStr::new("ASTRAL_PROJECTION_EXECUTION_MODE")));
+        assert!(!env.contains_key(std::ffi::OsStr::new("ASTRAL_REDIS_PROJECTION_COMPAT")));
         let mut bad_vhost = parent.clone();
         bad_vhost
             .iter_mut()
@@ -3741,22 +3702,9 @@ exit "${FAKE_CARGO_EXIT:-0}"
             .1 = "amqp://fixture@127.0.0.1:5673/".into();
         assert!(prepare_environment(&rabbit, &bad_vhost).1.is_some());
 
-        let redis: TomlValue = toml::from_str("id='redis'\nprofile='redis-compat'\ntest_services=['mysql','redis']\nseries=['COMPAT']\nscope='integration'\nowner='x'\nboundary='x'\nsources=[]\nargv=['cargo','test']\nacceptance='rust'\n").unwrap();
-        let (env, error) = prepare_environment(&redis, &parent);
-        assert!(error.is_none(), "{error:?}");
-        assert!(env.contains_key(std::ffi::OsStr::new("REDIS_URL")));
-        assert!(!env.contains_key(std::ffi::OsStr::new("RABBITMQ_URL")));
-        assert_eq!(
-            env[std::ffi::OsStr::new("ASTRAL_REDIS_PROJECTION_COMPAT")],
-            "true"
-        );
-        let mut bad_redis = parent.clone();
-        bad_redis
-            .iter_mut()
-            .find(|(key, _)| key == "REDIS_URL")
-            .unwrap()
-            .1 = "redis://example.invalid:6380/0".into();
-        assert!(prepare_environment(&redis, &bad_redis).1.is_some());
+        let unknown_profile: TomlValue = toml::from_str("id='unregistered'\nprofile='unregistered-profile'\ntest_services=[]\nseries=['E1']\nscope='component'\nowner='x'\nboundary='x'\nsources=[]\nargv=['cargo','test']\nacceptance='rust'\n").unwrap();
+        assert!(registered_services("unregistered-profile").is_none());
+        assert!(prepare_environment(&unknown_profile, &parent).1.is_some());
     }
 
     #[test]
@@ -3866,50 +3814,22 @@ exit "${FAKE_CARGO_EXIT:-0}"
     }
 
     #[test]
-    fn unittest_acceptance_requires_a_nonempty_ok_summary_and_preserves_skips() {
+    fn retired_unittest_acceptance_never_mints_pass_from_python_output() {
         let item: TomlValue = toml::from_str("acceptance='unittest'\nminimum_tests=1\n").unwrap();
-        assert_eq!(
-            classify_output(&item, 0, "", "Ran 2 tests in 0.001s\n\nOK\n", false)["status"],
-            "PASS"
-        );
-        assert_eq!(
-            classify_output(&item, 0, "", "Ran 0 tests in 0.001s\n\nOK\n", false)["status"],
-            "FAIL"
-        );
-        assert_eq!(
-            classify_output(
-                &item,
-                0,
-                "",
-                "Ran 2 tests in 0.001s\n\nOK (skipped=1)\n",
-                false
-            )["status"],
-            "SKIP"
-        );
-        assert_eq!(
-            classify_output(&item, 0, "", "OK\n", false)["status"],
-            "FAIL"
-        );
-        assert_eq!(
-            classify_output(
-                &item,
-                0,
-                "",
-                "Ran 1 test in 0.001s\n\nFAIL: test_contract\n",
-                false
-            )["status"],
-            "FAIL"
-        );
-        assert_eq!(
-            classify_output(
-                &item,
-                0,
-                "[skip] optional\n",
-                "Ran 2 tests in 0.001s\n\nOK\n",
-                false
-            )["status"],
-            "SKIP"
-        );
+        for output in [
+            "Ran 2 tests in 0.001s\n\nOK\n",
+            "Ran 0 tests in 0.001s\n\nOK\n",
+            "Ran 2 tests in 0.001s\n\nOK (skipped=1)\n",
+            "OK\n",
+            "Ran 1 test in 0.001s\n\nFAIL: test_contract\n",
+        ] {
+            let result = classify_output(&item, 0, "", output, false);
+            assert_eq!(result["status"], "FAIL");
+            assert_eq!(
+                result["reason"],
+                "retired non-Rust test acceptance contract"
+            );
+        }
         assert_eq!(
             classify_output(&item, 101, "", "Ran 2 tests in 0.001s\n\nOK\n", false)["status"],
             "FAIL"

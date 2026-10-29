@@ -1,7 +1,7 @@
 //! PolicyEngine benchmarks for the strict published-evidence authorization path.
 //!
 //! The repository fixture models typed published evidence only. It does not prove
-//! durable publication and it aborts if evaluation touches legacy/raw ports.
+//! durable publication; correctness checks assert current strict evidence reads.
 
 #[allow(dead_code)]
 #[path = "../../tests-suite/series/MT-E1/support/published.rs"]
@@ -35,7 +35,6 @@ fn bench_strict_published_engine(c: &mut Criterion) {
     let allow_decision = rt.block_on(engine.evaluate(&allow_ctx, &allow_repo));
     assert_allow(&allow_decision);
     assert_eq!(allow_repo.published_reads(), 2);
-    allow_repo.assert_no_legacy_reads();
     allow_repo.reset_counters();
 
     c.bench_function("engine/published_ready_allow", |b| {
@@ -47,7 +46,6 @@ fn bench_strict_published_engine(c: &mut Criterion) {
     });
     assert!(allow_repo.published_reads() > 0);
     assert_eq!(allow_repo.published_reads() % 2, 0);
-    allow_repo.assert_no_legacy_reads();
 
     let empty_repo =
         PublishedRepo::from_evidence_without_scope_recording(vec![published::ready_evidence(
@@ -58,7 +56,6 @@ fn bench_strict_published_engine(c: &mut Criterion) {
     let empty_decision = rt.block_on(engine.evaluate(&allow_ctx, &empty_repo));
     assert_deny(&empty_decision, "DEFAULT_DENY");
     assert_eq!(empty_repo.published_reads(), 1);
-    empty_repo.assert_no_legacy_reads();
     empty_repo.reset_counters();
 
     c.bench_function("engine/published_ready_empty_deny", |b| {
@@ -69,13 +66,11 @@ fn bench_strict_published_engine(c: &mut Criterion) {
         });
     });
     assert!(empty_repo.published_reads() > 0);
-    empty_repo.assert_no_legacy_reads();
 
     let unavailable_repo = PublishedRepo::unavailable_without_scope_recording();
     let unavailable_decision = rt.block_on(engine.evaluate(&allow_ctx, &unavailable_repo));
     assert_deny(&unavailable_decision, "AUTHORIZATION_PENDING");
     assert_eq!(unavailable_repo.published_reads(), 1);
-    unavailable_repo.assert_no_legacy_reads();
     unavailable_repo.reset_counters();
 
     c.bench_function("engine/published_unavailable_pending", |b| {
@@ -86,7 +81,6 @@ fn bench_strict_published_engine(c: &mut Criterion) {
         });
     });
     assert!(unavailable_repo.published_reads() > 0);
-    unavailable_repo.assert_no_legacy_reads();
 
     let nonmatching_repo = PublishedRepo::from_grants_without_scope_recording(
         (0..500u64)
@@ -106,7 +100,6 @@ fn bench_strict_published_engine(c: &mut Criterion) {
     let nonmatching_decision = rt.block_on(engine.evaluate(&allow_ctx, &nonmatching_repo));
     assert_deny(&nonmatching_decision, "DEFAULT_DENY");
     assert_eq!(nonmatching_repo.published_reads(), 1);
-    nonmatching_repo.assert_no_legacy_reads();
     nonmatching_repo.reset_counters();
 
     c.bench_function("engine/published_ready_nonmatching_set", |b| {
@@ -117,7 +110,6 @@ fn bench_strict_published_engine(c: &mut Criterion) {
         });
     });
     assert!(nonmatching_repo.published_reads() > 0);
-    nonmatching_repo.assert_no_legacy_reads();
 
     let gradient_repo = Arc::new(PublishedRepo::from_grants(
         (0..32u64)
@@ -147,7 +139,6 @@ fn bench_strict_published_engine(c: &mut Criterion) {
         let decision = rt.block_on(engine.evaluate(&ctx, gradient_repo.as_ref()));
         assert_allow(&decision);
     }
-    gradient_repo.assert_no_legacy_reads();
     gradient_repo.reset_counters();
 
     c.bench_function("engine/published_tenant_gradient_32", |b| {
@@ -171,7 +162,6 @@ fn bench_strict_published_engine(c: &mut Criterion) {
     });
     assert!(gradient_repo.published_reads() > 0);
     assert_eq!(gradient_repo.published_reads() % 2, 0);
-    gradient_repo.assert_no_legacy_reads();
 }
 
 fn bench_condition_components(c: &mut Criterion) {

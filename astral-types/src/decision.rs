@@ -12,22 +12,20 @@ pub enum Effect {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvaluationStep {
-    /// 评估阶段："L1_RULESET", "L2_PERMISSION_RULE", "L3_DEFAULT_DENY"
+    /// 当前身份、资格、组织准入及 V6 published evidence 评估阶段。
     pub phase: String,
     pub result: Effect,
     pub detail: String,
     pub matched_rule_id: Option<i64>,
-    /// 规则来源："OVERLAY", "BASE", "CARD_ONLY"
+    /// 命中规则的当前来源或 binding layer。
     pub source: Option<String>,
 }
 
 /// 策略决策结果
 ///
-/// 对齐 Java `PolicyDecision` 全部字段：
-/// - `allowed` / `reason` / `matchedRule` / `auditRequired` / `evaluationPath`
-/// - `matchedRuleId` — 命中的规则 ID（L2 时填充）
-/// - `conditionResults` — 条件评估明细
-/// - `snapshotVersion` — 决策依据的快照版本（L1 时填充）
+/// `evaluationPath` 保存资格、组织准入与当前 published evidence 的评估记录。
+/// `matchedRuleId` 和 `conditionResults` 仅在该判定分支提供相应事实时填写；
+/// `snapshotVersion` 可记录已验证组织发布的 generation。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyDecision {

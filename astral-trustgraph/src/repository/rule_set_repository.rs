@@ -32,45 +32,8 @@ use crate::service::rule_set_write_service::validate_entry_fields;
 #[derive(Debug, Clone)]
 pub struct RuleSetSummary {
     pub definition: RuleSetDefinition,
-    pub id: i64,
-    pub name: String,
-    pub ref_type: String,
-    pub description: Option<String>,
     pub entry_count: i64,
     pub bound_card_count: i64,
-}
-
-/// Legacy SQL row shape retained for callers that still import this repository type.
-/// Production reads use the private complete row and `RuleSetDefinition` instead.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct RuleSetRow {
-    pub id: i64,
-    pub name: String,
-    pub ref_type: String,
-    pub description: Option<String>,
-}
-
-/// Legacy entry row shape retained for compatibility; production reads return the
-/// complete shared `RuleSetEntryDefinition`.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct RuleSetEntryRow {
-    pub entry_id: i64,
-    pub effect: String,
-    pub resource_type: Option<String>,
-    pub resource_id: Option<i64>,
-    pub action_code: Option<String>,
-    pub condition_json: Option<String>,
-    pub priority: i32,
-}
-
-/// Legacy binding join row retained for stable repository callers.
-/// Production reads use `CardRuleSetBindingView` with its complete canonical binding.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct CardRuleSetBindingRow {
-    pub rule_set_id: i64,
-    pub rule_set_name: String,
-    pub rule_set_code: String,
-    pub ref_type: String,
 }
 
 /// Complete binding read view: canonical source binding plus joined display fields.
@@ -86,46 +49,40 @@ use read_model::{
     CardRuleSetBindingSqlRow, RuleSetEntrySqlRow, RuleSetSqlRow, ENTRY_SELECT, RULE_SET_SELECT,
 };
 
-/// 新建规则集参数
-///
-/// `ref_type` 是写入 `rule_set.source_type` 的所有权判别器：generic create 只能
-/// 创建自定义所有权；空值与 `TEMPLATE`（模板投影路径专属）在 INSERT 前 fail-closed。
+/// 新建规则集参数；`source_type` 表示 RuleSet 所有权。
 #[derive(Debug)]
 pub struct NewRuleSet {
     pub name: String,
-    pub ref_type: String,
+    pub source_type: String,
     pub description: Option<String>,
 }
 
-/// 规则集更新补丁（generic update 只允许变更 name/description）
-///
-/// source_type 是所有权判别器，generic update 不可变：本结构体刻意不携带
-/// ref_type/source_type 字段，使所有权改写在类型层面不可表达。wire DTO 可提供
-/// `refType` 作为当前 source_type 的一致性断言；HTTP adapter 不把它转发为变更字段。
+/// 规则集更新补丁（generic update 只允许变更 name/description）。
+/// source_type 不可变，因而不在该 patch 中表达。
 #[derive(Debug)]
 pub struct RuleSetPatch {
     pub name: String,
     pub description: Option<String>,
 }
 
-/// 新建条目参数
+/// 新建条目参数，字段与 canonical entry 模型一致。
 #[derive(Debug)]
 pub struct NewRuleSetEntry {
     pub effect: String,
-    pub resource: Option<String>,
+    pub resource_type: Option<String>,
     pub resource_id: Option<i64>,
-    pub action: Option<String>,
+    pub action_code: Option<String>,
     pub condition_json: Option<String>,
     pub priority: i32,
 }
 
-/// 条目更新补丁
+/// 条目更新补丁，字段与 canonical entry 模型一致。
 #[derive(Debug)]
 pub struct RuleSetEntryPatch {
     pub effect: String,
-    pub resource: Option<String>,
+    pub resource_type: Option<String>,
     pub resource_id: Option<i64>,
-    pub action: Option<String>,
+    pub action_code: Option<String>,
     pub condition_json: Option<String>,
     pub priority: i32,
 }
@@ -307,10 +264,6 @@ async fn summarize(
         .map(|definition| {
             let rule_set_id = definition.rule_set_id;
             RuleSetSummary {
-                id: rule_set_id,
-                name: definition.name.clone(),
-                ref_type: definition.source_type.clone(),
-                description: definition.description.clone(),
                 definition,
                 entry_count: entry_map.get(&rule_set_id).copied().unwrap_or(0),
                 bound_card_count: ref_map.get(&rule_set_id).copied().unwrap_or(0),
@@ -1084,7 +1037,7 @@ async fn materialize_ruleset_adds_for_bound_card_in_tx(
 
 /// 为每个受影响绑定卡追加 CARD 投影事件并物化 UPDATE（rev=head+1，成对
 /// before-image/digest）。任一卡缺账本头即整体失败：旧数据未 backfill 前禁止
-/// 用 legacy 写法替代版本化链路。返回同步发布事件面（读链规模化 Batch E）。
+/// 用 legacy 写法替代版本化链路。
 ///
 /// 收窄 UPDATE 的 stale-ALLOW 闭合（2026-09-04）：每卡先锁定全部条目的
 /// grant head 并以与 `build_ruleset_update_draft` 同源的比较判定
@@ -1100,11 +1053,10 @@ async fn append_ruleset_entry_update_fanout_in_tx(
     entries: &[&LockedRuleSetEntryRow],
     card_event_type: &str,
     context: &RuleSetMutationContext,
-) -> Result<Vec<RuleSetSyncSurface>, AstralError> {
+) -> Result<(), AstralError> {
     require_proven_ruleset_operation_identity(context)?;
     let operation_id = context.operation_id();
     let actor_user_id = ruleset_mutation_actor(context.actor_id());
-    let mut surfaces = Vec::new();
     for bound in provable_bound_cards_in_tx(tx, rule_set_id, None).await? {
         // 第一遍：锁定本卡全部条目的 grant head（FOR UPDATE）并做 before-image
         // 与新 grant 的 authorization-content 比较（head 先于 CARD 父投影事件
@@ -1176,14 +1128,9 @@ async fn append_ruleset_entry_update_fanout_in_tx(
                 &contribution_event_id,
             )?;
             append_ruleset_grant_delta_in_tx(tx, &draft, base_version, target_version).await?;
-            surfaces.push(RuleSetSyncSurface {
-                tenant_id: bound.tenant_id,
-                card_id: bound.card_id,
-                event_id: contribution_event_id,
-            });
         }
     }
-    Ok(surfaces)
+    Ok(())
 }
 
 /// 为每个受影响绑定卡追加 CARD REVOKE 投影事件并物化 REMOVE tombstone
@@ -1196,10 +1143,9 @@ async fn append_ruleset_entry_remove_fanout_in_tx(
     rule_set_id: i64,
     entries: &[&LockedRuleSetEntryRow],
     context: &RuleSetMutationContext,
-) -> Result<Vec<RuleSetSyncSurface>, AstralError> {
+) -> Result<(), AstralError> {
     require_proven_ruleset_operation_identity(context)?;
     let operation_id = context.operation_id();
-    let mut surfaces = Vec::new();
     for bound in provable_bound_cards_in_tx(tx, rule_set_id, None).await? {
         let card_projection = append_card_projection_with_metadata_in_tx(
             tx,
@@ -1253,14 +1199,9 @@ async fn append_ruleset_entry_remove_fanout_in_tx(
                 &contribution_event_id,
             )?;
             append_ruleset_grant_delta_in_tx(tx, &draft, base_version, target_version).await?;
-            surfaces.push(RuleSetSyncSurface {
-                tenant_id: bound.tenant_id,
-                card_id: bound.card_id,
-                event_id: contribution_event_id,
-            });
         }
     }
-    Ok(surfaces)
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1290,13 +1231,6 @@ struct RulesetRemovalContribution {
 /// （`service::sync_publish` 按 `(tenant_id, card_id)` 作用域 claim 并以
 /// `event_id` 识别本次写入的事件），不承载账本/审计语义 —— 审计 correlation
 /// 仍以各自的 contribution 证据结构为准。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RuleSetSyncSurface {
-    pub(crate) tenant_id: i64,
-    pub(crate) card_id: i64,
-    pub(crate) event_id: String,
-}
-
 /// 组装 removal 审计 detail 的关联字段（键名是消费方契约）：
 /// parent source 事件号 + 全部贡献的事件号/条目/卡/绑定行维度。
 fn ruleset_removal_audit_detail(
@@ -1415,7 +1349,6 @@ fn unbind_bound_card_facts(
 /// [`append_card_create_ruleset_entry_adds_in_tx`] 复用同一物化核心并消费证据面。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RulesetAdditionContribution {
-    /// 贡献所属租户（bound card 的稳定租户边界；同步发布事件面消费）。
     pub(crate) tenant_id: i64,
     pub(crate) card_id: i64,
     pub(crate) ref_id: i64,
@@ -1528,9 +1461,9 @@ fn batch_replacement_is_fully_equal(
         .iter()
         .map(|entry| CanonicalRowKey {
             effect: entry.effect.trim().to_ascii_uppercase(),
-            resource_type: entry.resource.clone(),
+            resource_type: entry.resource_type.clone(),
             resource_id: entry.resource_id,
-            action_code: entry.action.clone(),
+            action_code: entry.action_code.clone(),
             condition_json: entry.condition_json.clone(),
             priority: entry.priority,
         })
@@ -2128,9 +2061,9 @@ pub(crate) async fn replace_rule_set_entries_churn_with_ledger_in_tx(
         )
         .bind(rule_set_id)
         .bind(&entry.effect)
-        .bind(&entry.resource)
+        .bind(&entry.resource_type)
         .bind(entry.resource_id)
-        .bind(&entry.action)
+        .bind(&entry.action_code)
         .bind(&entry.condition_json)
         .bind(entry.priority)
         .execute(&mut ***tx)
@@ -2254,7 +2187,7 @@ pub(crate) fn validate_generic_rule_set_source_type(source_type: &str) -> Result
     let trimmed = source_type.trim();
     if trimmed.is_empty() {
         return Err(AstralError::Validation(
-            "rule set source_type (refType) must not be empty".into(),
+            "rule set source_type must not be empty".into(),
         ));
     }
     if trimmed.eq_ignore_ascii_case("TEMPLATE") {
@@ -2348,7 +2281,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
     ) -> Result<i64, AstralError> {
         // source_type 是所有权判别器：generic create 不得创建空所有权，也不得
         // 占用模板投影路径专属的 TEMPLATE 判别器；INSERT 前 fail-closed。
-        validate_generic_rule_set_source_type(&new.ref_type)?;
+        validate_generic_rule_set_source_type(&new.source_type)?;
         // 对齐 platform_v4：code (UNIQUE NOT NULL) 用 name 作为默认值，source_type 存储 ref_type。
         // source mutation 与 RULE_SET durable projection 在同一事务内提交。
         let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
@@ -2357,7 +2290,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         )
         .bind(&new.name)
         .bind(&new.name)
-        .bind(&new.ref_type)
+        .bind(&new.source_type)
         .bind(&new.description)
         .execute(&mut **tx)
         .await
@@ -2385,7 +2318,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         .await?;
         let new_value = serde_json::json!({
             "name": new.name,
-            "refType": new.ref_type,
+            "refType": new.source_type,
             "description": new.description,
         })
         .to_string();
@@ -2407,7 +2340,8 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             },
         )
         .await?;
-        tx.commit_consuming().await?;
+        let receipts = tx.commit_consuming_with_receipts().await?;
+        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
         Ok(rule_set_id)
     }
 
@@ -2436,7 +2370,9 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         if !changes.any() {
             // 幂等更新：没有任何可变字段实际变化 ⇒ 无 source mutation、无投影、
             // 无审计（审计只记录实际变更的字段；空变更集没有可审计内容）。
-            tx.commit_consuming().await?;
+            let receipts = tx.commit_consuming_with_receipts().await?;
+            crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts)
+                .await;
             return Ok(());
         }
         // Operation identity 前置：source UPDATE 与任何 projection/audit durable
@@ -2500,7 +2436,8 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         .await?;
         append_bound_card_projections_in_tx(&mut tx, rule_set_id, EVENT_TYPE_RULE_SET_UPDATE)
             .await?;
-        tx.commit_consuming().await?;
+        let receipts = tx.commit_consuming_with_receipts().await?;
+        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
         Ok(())
     }
 
@@ -2518,7 +2455,9 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         .await
         .map_err(db_error)?;
         let Some((_, source_tenant_id)) = source else {
-            tx.commit_consuming().await?;
+            let receipts = tx.commit_consuming_with_receipts().await?;
+            crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts)
+                .await;
             return Ok(false);
         };
         // Operation identity 前置：capture-before-delete 与任何 durable 写入之前
@@ -2605,27 +2544,8 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                  transaction; rolled back to avoid committing partial projection/ledger state"
             )));
         }
-        tx.commit_consuming().await?;
-        // 读链规模化 Batch E：规则集删除的全部 REMOVE 贡献事件面（卡 → 租户映射
-        // 来自提交前锁定的 proven cards）；影响面超阈值或任何失败由 sync_publish
-        // 降级为 worker 消化，绝不阻塞本次写请求。
-        let tenant_by_card: std::collections::HashMap<i64, i64> = proven_refs
-            .iter()
-            .map(|bound| (bound.card_id, bound.tenant_id))
-            .collect();
-        let sync_surfaces: Vec<RuleSetSyncSurface> = contributions
-            .iter()
-            .filter_map(|contribution| {
-                tenant_by_card
-                    .get(&contribution.card_id)
-                    .map(|tenant_id| RuleSetSyncSurface {
-                        tenant_id: *tenant_id,
-                        card_id: contribution.card_id,
-                        event_id: contribution.event_id.clone(),
-                    })
-            })
-            .collect();
-        commit_sync_publish(&self.db, sync_surfaces).await;
+        let receipts = tx.commit_consuming_with_receipts().await?;
+        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
         Ok(true)
     }
 
@@ -2668,8 +2588,8 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         // 防御加固：repository 不是校验旁路；写入归一化后的 canonical ALLOW。
         let effect = validate_entry_fields(
             &new.effect,
-            new.resource.as_deref(),
-            new.action.as_deref(),
+            new.resource_type.as_deref(),
+            new.action_code.as_deref(),
             new.condition_json.as_deref(),
         )?;
         // source entry、RULE_SET projection 与受影响卡 projection 在同一事务内提交。
@@ -2691,9 +2611,9 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         )
         .bind(rule_set_id)
         .bind(&effect)
-        .bind(&new.resource)
+        .bind(&new.resource_type)
         .bind(new.resource_id)
-        .bind(&new.action)
+        .bind(&new.action_code)
         .bind(&new.condition_json)
         .bind(new.priority)
         .execute(&mut **tx)
@@ -2714,9 +2634,9 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         let new_value = serde_json::json!({
             "entryId": entry_id,
             "effect": effect,
-            "resource": new.resource,
+            "resource": new.resource_type,
             "resourceId": new.resource_id,
-            "action": new.action,
+            "action": new.action_code,
             "priority": new.priority,
         })
         .to_string();
@@ -2748,9 +2668,9 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 ))
             })?;
         let allow_entries = materializable_allow_entries(std::slice::from_ref(&stored_entry))?;
-        // 影响面透出（读链规模化 Batch E）：捕获全部 ADD 贡献的租户/卡/事件号，
-        // 供 source 提交后的同步发布目标定位；失败不阻塞（函数内部保证）。
-        let sync_surfaces: Vec<RuleSetSyncSurface> = append_ruleset_entry_add_fanout_in_tx(
+        // The ADD event ids remain in audit correlation; projection completion is
+        // observed from the exact transaction receipts after proven COMMIT.
+        append_ruleset_entry_add_fanout_in_tx(
             &mut tx,
             rule_set_id,
             &allow_entries,
@@ -2758,16 +2678,9 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             event_type,
             context,
         )
-        .await?
-        .into_iter()
-        .map(|contribution| RuleSetSyncSurface {
-            tenant_id: contribution.tenant_id,
-            card_id: contribution.card_id,
-            event_id: contribution.event_id,
-        })
-        .collect();
-        tx.commit_consuming().await?;
-        commit_sync_publish(&self.db, sync_surfaces).await;
+        .await?;
+        let receipts = tx.commit_consuming_with_receipts().await?;
+        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
         Ok(entry_id)
     }
     async fn update_entry(
@@ -2780,8 +2693,8 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         // 防御加固：repository 不是校验旁路；最终写入 effect 必须为 ALLOW。
         let effect = validate_entry_fields(
             &patch.effect,
-            patch.resource.as_deref(),
-            patch.action.as_deref(),
+            patch.resource_type.as_deref(),
+            patch.action_code.as_deref(),
             patch.condition_json.as_deref(),
         )?;
         let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
@@ -2805,9 +2718,9 @@ impl RuleSetRepository for SqlxRuleSetRepository {
              WHERE entry_id=? AND rule_set_id=?",
         )
         .bind(&effect)
-        .bind(&patch.resource)
+        .bind(&patch.resource_type)
         .bind(patch.resource_id)
-        .bind(&patch.action)
+        .bind(&patch.action_code)
         .bind(&patch.condition_json)
         .bind(patch.priority)
         .bind(entry_id)
@@ -2836,9 +2749,9 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         let new_value = serde_json::json!({
             "entryId": entry_id,
             "effect": effect,
-            "resource": patch.resource,
+            "resourceType": patch.resource_type,
             "resourceId": patch.resource_id,
-            "action": patch.action,
+            "actionCode": patch.action_code,
             "priority": patch.priority,
         })
         .to_string();
@@ -2870,7 +2783,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 ))
             })?;
         let allow_entries = materializable_allow_entries(std::slice::from_ref(&updated_entry))?;
-        let sync_surfaces = append_ruleset_entry_update_fanout_in_tx(
+        append_ruleset_entry_update_fanout_in_tx(
             &mut tx,
             rule_set_id,
             &allow_entries,
@@ -2895,7 +2808,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 "e1 authorization observation"
             );
         }
-        let commit_result = tx.commit_consuming().await;
+        let commit_result = tx.commit_consuming_with_receipts().await;
         #[cfg(feature = "e1-observability")]
         {
             let stamp = policy_engine::e1_observation::stamp();
@@ -2914,8 +2827,8 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 "e1 authorization observation"
             );
         }
-        commit_result?;
-        commit_sync_publish(&self.db, sync_surfaces).await;
+        let receipts = commit_result?;
+        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
         Ok(())
     }
 
@@ -2988,9 +2901,8 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         // 仅对 ENABLED+ALLOW 的旧条目物化 REMOVE tombstone：DENY/禁用行从未进入
         // 账本，没有可移除的授权贡献。未 backfill 的 ALLOW 旧数据在此显式拒绝。
         let allow_entries = materializable_allow_entries(std::slice::from_ref(&old_entry))?;
-        let sync_surfaces =
-            append_ruleset_entry_remove_fanout_in_tx(&mut tx, rule_set_id, &allow_entries, context)
-                .await?;
+        append_ruleset_entry_remove_fanout_in_tx(&mut tx, rule_set_id, &allow_entries, context)
+            .await?;
         #[cfg(feature = "e1-observability")]
         {
             let stamp = policy_engine::e1_observation::stamp();
@@ -3008,7 +2920,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 "e1 authorization observation"
             );
         }
-        let commit_result = tx.commit_consuming().await;
+        let commit_result = tx.commit_consuming_with_receipts().await;
         #[cfg(feature = "e1-observability")]
         {
             let stamp = policy_engine::e1_observation::stamp();
@@ -3027,8 +2939,8 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 "e1 authorization observation"
             );
         }
-        commit_result?;
-        commit_sync_publish(&self.db, sync_surfaces).await;
+        let receipts = commit_result?;
+        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
         Ok(true)
     }
 
@@ -3046,13 +2958,13 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                 Ok(NewRuleSetEntry {
                     effect: validate_entry_fields(
                         &entry.effect,
-                        entry.resource.as_deref(),
-                        entry.action.as_deref(),
+                        entry.resource_type.as_deref(),
+                        entry.action_code.as_deref(),
                         entry.condition_json.as_deref(),
                     )?,
-                    resource: entry.resource.clone(),
+                    resource_type: entry.resource_type.clone(),
                     resource_id: entry.resource_id,
-                    action: entry.action.clone(),
+                    action_code: entry.action_code.clone(),
                     condition_json: entry.condition_json.clone(),
                     priority: entry.priority,
                 })
@@ -3075,7 +2987,9 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             context,
         )
         .await?;
-        tx.commit_consuming().await
+        let receipts = tx.commit_consuming_with_receipts().await?;
+        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        Ok(())
     }
 
     async fn list_card_bindings(
@@ -3172,9 +3086,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         // 依据。租户/用户/层无法完整证明时整体回滚；layer=ref_type BASE/OVERLAY。
         let existing_entries = read_rule_set_entries_in_tx(&mut tx, rule_set_id, true).await?;
         let allow_entries = materializable_allow_entries(&existing_entries)?;
-        // 影响面透出（读链规模化 Batch E）：单卡绑定物化的全部 ADD 贡献事件号，
-        // 供 source 提交后的同步发布目标定位。
-        let sync_surfaces: Vec<RuleSetSyncSurface> = append_ruleset_entry_add_fanout_in_tx(
+        append_ruleset_entry_add_fanout_in_tx(
             &mut tx,
             rule_set_id,
             &allow_entries,
@@ -3182,16 +3094,9 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             "RULE_SET_BOUND",
             context,
         )
-        .await?
-        .into_iter()
-        .map(|contribution| RuleSetSyncSurface {
-            tenant_id: contribution.tenant_id,
-            card_id: contribution.card_id,
-            event_id: contribution.event_id,
-        })
-        .collect();
-        tx.commit_consuming().await?;
-        commit_sync_publish(&self.db, sync_surfaces).await;
+        .await?;
+        let receipts = tx.commit_consuming_with_receipts().await?;
+        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
         Ok(())
     }
 
@@ -3253,7 +3158,9 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         let Some((ref_id, ref_type, binding_tenant_id)) = binding else {
             // No source mutation and no projection/audit events for a missing
             // binding, including when the RuleSet source is already gone.
-            tx.commit_consuming().await?;
+            let receipts = tx.commit_consuming_with_receipts().await?;
+            crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts)
+                .await;
             return Ok(false);
         };
 
@@ -3364,17 +3271,8 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         if result.rows_affected() == 0 {
             return Ok(false);
         }
-        tx.commit_consuming().await?;
-        // 读链规模化 Batch E：解绑属单卡影响面；贡献事件面由 REMOVE 物化捕获。
-        let sync_surfaces = contributions
-            .iter()
-            .map(|contribution| RuleSetSyncSurface {
-                tenant_id: bound.tenant_id,
-                card_id: contribution.card_id,
-                event_id: contribution.event_id.clone(),
-            })
-            .collect();
-        commit_sync_publish(&self.db, sync_surfaces).await;
+        let receipts = tx.commit_consuming_with_receipts().await?;
+        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
         Ok(true)
     }
 
@@ -3523,9 +3421,9 @@ impl RuleSetRepository for SqlxRuleSetRepository {
                     )?;
                     Ok(NewRuleSetEntry {
                         effect,
-                        resource: Some(resource_type),
+                        resource_type: Some(resource_type),
                         resource_id,
-                        action: Some(action_code),
+                        action_code: Some(action_code),
                         condition_json,
                         priority,
                     })
@@ -3550,7 +3448,8 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         )
         .await?;
 
-        tx.commit_consuming().await?;
+        let receipts = tx.commit_consuming_with_receipts().await?;
+        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
         tracing::info!(
             rule_set_id,
             template_id,
@@ -3563,22 +3462,6 @@ impl RuleSetRepository for SqlxRuleSetRepository {
 
 fn db_error(error: sqlx::Error) -> AstralError {
     AstralError::Database(format!("Rule set repository query failed: {error}"))
-}
-
-/// 读链规模化 Batch E：source 事务 commit 成功后的同步发布接线点。
-///
-/// 把本事务物化的全部 contribution 事件面按卡聚合后交给
-/// `service::sync_publish::after_commit_sync_publish`：影响面（受影响卡数）≤
-/// 阈值 → 以 worker 同一原语在请求内尝试发布；> 阈值或任何失败（claim 竞争/
-/// 发布错误/超时）→ 仅记日志，保持 worker 异步消化，绝不阻塞写请求。
-async fn commit_sync_publish(pool: &sqlx::MySqlPool, surfaces: Vec<RuleSetSyncSurface>) {
-    let targets = crate::service::sync_publish::group_targets(
-        surfaces
-            .into_iter()
-            .map(|surface| (surface.tenant_id, surface.card_id, surface.event_id))
-            .collect(),
-    );
-    crate::service::sync_publish::after_commit_sync_publish(pool, targets).await;
 }
 
 #[cfg(test)]
@@ -4687,15 +4570,15 @@ mod tests {
     fn batch_replacement_noop_requires_byte_provable_equality() {
         fn requested_entry_with(
             effect: &str,
-            resource: Option<&str>,
+            resource_type: Option<&str>,
             priority: i32,
             condition_json: Option<String>,
         ) -> NewRuleSetEntry {
             NewRuleSetEntry {
                 effect: effect.to_owned(),
-                resource: resource.map(str::to_owned),
+                resource_type: resource_type.map(str::to_owned),
                 resource_id: Some(3),
-                action: Some("read".to_owned()),
+                action_code: Some("read".to_owned()),
                 condition_json,
                 priority,
             }

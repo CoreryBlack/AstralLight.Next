@@ -11,8 +11,8 @@ use astral_common::middleware::permission_check_shared::{
     BoxedResponse, PathResourceMap,
 };
 use astral_db::{
-    check_sod_conflict, check_sod_conflict_with_org, load_org_sod_admission,
-    resolve_resource_ownership, SqlxRuleRepository,
+    check_sod_conflict_with_context, check_sod_conflict_with_context_and_org,
+    load_org_sod_admission, resolve_resource_ownership, SqlxRuleRepository,
 };
 
 use crate::AppState;
@@ -25,7 +25,6 @@ pub const MONITOR_PATH_MAP: PathResourceMap = &[
     ("/alert-history", "monitor"),
     ("/notifications", "notification"),
     ("/channels", "notification"),
-    ("/cache", "monitor"),
     ("/latency", "monitor"),
     ("/resources", "monitor"),
     ("/trend", "monitor"),
@@ -38,7 +37,6 @@ pub const MONITOR_PATH_MAP: PathResourceMap = &[
     ("/rules", "monitor"),
     ("/system-info", "monitor"),
     ("/dashboard", "monitor"),
-    ("/consistency-check", "monitor"),
 ];
 
 pub async fn monitor_permission_middleware(
@@ -168,19 +166,15 @@ pub async fn monitor_permission_middleware(
         // 权限折算为空集。非 ORG 判定保持既有纯 deny-only 检查不变。
         let sod_result = match load_org_sod_admission(&state.db, &ctx, &decision).await {
             Ok(Some(admission)) => {
-                check_sod_conflict_with_org(&state.db, &ctx, &admission, resource_owner_id).await
-            }
-            Ok(None) => {
-                check_sod_conflict(
+                check_sod_conflict_with_context_and_org(
                     &state.db,
-                    so_card_id,
-                    user_id,
-                    resource,
-                    action,
+                    &ctx,
+                    &admission,
                     resource_owner_id,
                 )
                 .await
             }
+            Ok(None) => check_sod_conflict_with_context(&state.db, &ctx, resource_owner_id).await,
             Err(error) => Err(error),
         };
         match sod_result {
@@ -273,23 +267,27 @@ mod tests {
 
     /// 宿主 SoD 分发形状守卫（对齐 TrustGraph/identity 的源文本守卫惯例）：
     /// ORG provenance 判定必须先经 shared fresh 准入装配
-    /// （`load_org_sod_admission`）再进入 `check_sod_conflict_with_org`
-    /// deny-only 复核；无 provenance 时回落纯 `check_sod_conflict`；审计
+    /// （`load_org_sod_admission`）再进入 context-aware org SoD
+    /// deny-only 复核；无 provenance 时使用同一 context-aware 卡级检查；审计
     /// detail 必须经 shared 有界 provenance helper 并通过显式 detail 审计
     /// 入口传播。本地不得重新引入任何重复 helper 定义。
     #[test]
     fn sod_dispatch_wires_org_provenance_to_fresh_admission_recheck() {
         let source = include_str!("middleware.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-        let loader = production
-            .find("load_org_sod_admission(&state.db, &ctx, &decision)")
+        let dispatch: String = production
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        let loader = dispatch
+            .find("load_org_sod_admission(&state.db,&ctx,&decision)")
             .expect("org dispatch must load fresh admission via the shared helper");
-        let with_org = production
-            .find("check_sod_conflict_with_org(&state.db, &ctx, &admission, resource_owner_id)")
-            .expect("org admission must recheck via check_sod_conflict_with_org");
-        let plain = production
-            .find("check_sod_conflict(")
-            .expect("non-org decisions must keep the plain deny-only SoD check");
+        let with_org = dispatch
+            .find("check_sod_conflict_with_context_and_org(&state.db,&ctx,&admission,resource_owner_id,)")
+            .expect("org admission must recheck with the complete context");
+        let plain = dispatch
+            .find("check_sod_conflict_with_context(&state.db,&ctx,resource_owner_id)")
+            .expect("non-org decisions must use the complete context");
         assert!(
             loader < with_org && with_org < plain,
             "dispatch order must be loader -> with_org -> plain fallback"

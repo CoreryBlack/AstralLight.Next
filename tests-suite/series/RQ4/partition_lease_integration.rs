@@ -1,150 +1,243 @@
 #![cfg(test)]
-//! Real-MySQL integration acceptance for the partition scheduling primitives
-//! (multi-tenant redesign Phase 1; design doc
-//! Rust多租户聚合分区与组织层级设计_V0.1.md §3.3).
+//! Source-backed real-MySQL tests for partition scheduling and WorkerOwned claims.
 //!
-//! Execution class: real MySQL via `DATABASE_URL`; run with
+//! These ignored tests require an already-migrated, run-owned isolated MySQL
+//! database. Baseline publication uses a bounded fixture-owned projector that
+//! is joined before each claim exercise. Tests do not run migrations. Delta
+//! receipts are created only through the MANUAL RuleSet source writer; the
+//! `OwnedCompletionIdentity` is checked before a partition claim.
 //!
-//! ```text
-//! RUST_INTEGRATION_REQUIRED=1 DATABASE_URL=mysql://.../astral_test_e5m1_20260921 \
-//!   cargo test -p testsuite --test partition_lease_integration -- --ignored --test-threads=1
-//! ```
-//!
-//! Without `DATABASE_URL` every test is an explicit `[SKIP]`; with
-//! `RUST_INTEGRATION_REQUIRED=1` a missing URL or unreachable database is a
-//! hard failure (never a silent green). The database name must contain
-//! `test` (migration gate) and is expected to have the embedded migrator
-//! applied (`authorization_projection_partition_lease` +
-//! `authorization_delta_event` exist).
-//!
-//! Seeded delta rows use distinct partition identities per test and are
-//! removed in each test's cleanup; single-threaded execution keeps the lease
-//! windows deterministic.
+//! Required environment: `RUST_INTEGRATION_REQUIRED=1`, `TEST_USE_EXISTING=1`,
+//! `ASTRAL_MIGRATION_ENV=isolated`, `ASTRAL_TEST_DATABASE_NAME`, and `DATABASE_URL`.
+
+use std::{collections::HashSet, env, str::FromStr, sync::Arc, time::Duration};
 
 use astral_db::{
-    acquire_partition_lease, claim_next_delta_event_in_partition_tx, discover_claimable_partitions,
-    release_partition_lease, renew_partition_lease, PartitionLeaseHandle,
-    ProjectionAggregateIdentity,
+    acquire_partition_lease, begin_owned_delta_execution,
+    claim_next_owned_delta_event_in_partition, discover_claimable_partitions,
+    fail_owned_delta_event, release_owned_delta_event, release_partition_lease,
+    renew_partition_lease, validate_projection_owned_schema, DeltaEventAppendRequest,
+    DeltaEventClaimScope, DeltaEventType, OwnedCompletionIdentity, OwnedDeltaClaim,
+    PartitionLeaseHandle, ProjectionAggregateIdentity, Sha256Digest,
 };
-use std::collections::HashSet;
-use std::sync::Arc;
-
+use astral_trustgraph::{
+    repository::{
+        audit_log_repository::RuleSetMutationContext, rule_set_repository::SqlxRuleSetRepository,
+    },
+    service::{
+        authorization_projector::{BACKOFF_CAP_SECS, MAX_EVENT_ATTEMPTS},
+        rule_set_write_service::{AddEntryRequest, RuleSetWriteService, UpdateEntryRequest},
+    },
+};
 use astral_types::SYSTEM_ACTOR_ID;
-use sqlx::{pool::PoolOptions, MySql, MySqlPool, Row};
+use sqlx::{mysql::MySqlConnectOptions, FromRow, MySqlPool, Row};
+use testsuite::{
+    cleanup_suite_rows, publish_card_manifest, seed_all_tenants, SuiteFixture, SuiteTenant,
+    TenantRole,
+};
+use time::PrimitiveDateTime;
 use tokio::sync::Barrier;
 
-fn required_mode() -> bool {
-    std::env::var("RUST_INTEGRATION_REQUIRED").as_deref() == Ok("1")
-}
+const REQUIRED_DATABASE_PREFIX: &str = "astral_rehearsal_";
+const REQUIRED_MIGRATIONS: &[i64] = &[20260921000001, 20261015000001];
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const CLAIM_LEASE_SECONDS: i64 = 120;
+const ATTEMPT_BUDGET_EXHAUSTED_MARKER: &str = "code=auth_projector.attempt_budget_exhausted";
 
-async fn test_pool() -> Option<MySqlPool> {
-    let url = match std::env::var("DATABASE_URL") {
-        Ok(url) if !url.trim().is_empty() => url,
-        _ => {
-            if required_mode() {
-                panic!("RUST_INTEGRATION_REQUIRED=1: DATABASE_URL must be set");
-            }
-            eprintln!("[SKIP] partition_lease_integration: DATABASE_URL not set");
-            return None;
-        }
-    };
-    let pool = PoolOptions::<MySql>::new()
-        .max_connections(4)
-        .acquire_timeout(std::time::Duration::from_secs(10))
-        .connect_lazy(&url)
-        .expect("lazy pool construction");
-    // Fail fast (and loudly) when the database is unreachable.
-    match sqlx::query("SELECT 1").fetch_one(&pool).await {
-        Ok(_) => Some(pool),
-        Err(error) => {
-            if required_mode() {
-                panic!("RUST_INTEGRATION_REQUIRED=1: database unreachable: {error}");
-            }
-            eprintln!("[SKIP] partition_lease_integration: database unreachable: {error}");
-            None
-        }
+async fn required_pool() -> MySqlPool {
+    assert_eq!(
+        env::var("RUST_INTEGRATION_REQUIRED").as_deref(),
+        Ok("1"),
+        "RUST_INTEGRATION_REQUIRED=1 is mandatory; this test never silently skips"
+    );
+    assert_eq!(
+        env::var("TEST_USE_EXISTING").as_deref(),
+        Ok("1"),
+        "the caller must supply the already-created run-owned database"
+    );
+    assert_eq!(
+        env::var("ASTRAL_MIGRATION_ENV").as_deref(),
+        Ok("isolated"),
+        "ASTRAL_MIGRATION_ENV=isolated is mandatory"
+    );
+
+    let expected_database = env::var("ASTRAL_TEST_DATABASE_NAME")
+        .expect("ASTRAL_TEST_DATABASE_NAME must name the approved clone");
+    let suffix = expected_database
+        .strip_prefix(REQUIRED_DATABASE_PREFIX)
+        .expect("database must use the run-scoped astral_rehearsal_ prefix");
+    assert!(
+        !suffix.is_empty()
+            && suffix.len() <= 47
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+        "database name must have a bounded lowercase run suffix"
+    );
+
+    let url = env::var("DATABASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .expect("DATABASE_URL is mandatory when RUST_INTEGRATION_REQUIRED=1");
+    assert!(
+        !url.contains('?') && !url.contains('#'),
+        "DATABASE_URL query parameters and fragments are not allowed"
+    );
+    let options = MySqlConnectOptions::from_str(&url).expect("DATABASE_URL must parse");
+    assert!(
+        matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+        "partition integration tests may only use loopback MySQL"
+    );
+    assert_eq!(
+        options.get_port(),
+        3308,
+        "expected isolated MySQL port 3308"
+    );
+    assert!(
+        options.get_socket().is_none(),
+        "Unix socket URLs are not accepted"
+    );
+    assert_eq!(
+        options.get_database(),
+        Some(expected_database.as_str()),
+        "DATABASE_URL must select exactly ASTRAL_TEST_DATABASE_NAME"
+    );
+
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(8)
+        .acquire_timeout(CONNECT_TIMEOUT)
+        .connect_with(options)
+        .await
+        .expect("required isolated MySQL connection must succeed");
+    validate_projection_owned_schema(&pool)
+        .await
+        .expect("owned execution schema and existing rows must validate read-only");
+    let applied: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM _sqlx_migrations WHERE success = TRUE ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read already-applied migration markers");
+    for required in REQUIRED_MIGRATIONS {
+        assert!(
+            applied.contains(required),
+            "required migration {required} must already be applied; tests never migrate"
+        );
     }
+    pool
 }
 
 fn identity(tenant: i64, kind: &str, id: i64) -> ProjectionAggregateIdentity {
     ProjectionAggregateIdentity::new(tenant, kind, id).expect("valid partition identity")
 }
 
-/// Seed one PENDING delta event into `authorization_delta_event`. Columns
-/// satisfy the creator DDL; `revoke_fence` keeps the documented
-/// `revoke_fence <= source_generation` relation.
-async fn seed_pending_event(
-    pool: &MySqlPool,
-    tenant: i64,
-    aggregate_type: &str,
-    aggregate_id: i64,
-    grant_id: &str,
-    event_id: &str,
-) {
-    sqlx::query(
-        "INSERT INTO authorization_delta_event \
-         (tenant_id, card_id, aggregate_type, aggregate_id, grant_id, event_id, operation_id, \
-          event_type, base_version, target_version, source_generation, revoke_fence, \
-          delta_json, semantic_hash, dependency_hash, compiler_version, status) \
-         VALUES (?, NULL, ?, ?, ?, ?, ?, 'ADD', 0, 1, 1, 0, \
-                 JSON_OBJECT('op', 'add'), UNHEX(REPEAT('a', 64)), \
-                 UNHEX(REPEAT('b', 64)), 'integration-test', 'PENDING')",
-    )
-    .bind(tenant)
-    .bind(aggregate_type)
-    .bind(aggregate_id)
-    .bind(grant_id)
-    .bind(event_id)
-    .bind(format!("op-{event_id}"))
-    .execute(pool)
-    .await
-    .expect("seed delta event");
+fn worker_id(salt: u128, tag: &str) -> String {
+    format!("rq4-worker-{salt:032x}-{tag}")
 }
 
-async fn cleanup_partition(pool: &MySqlPool, tenant: i64, aggregate_id: i64) {
-    sqlx::query("DELETE FROM authorization_delta_event WHERE tenant_id = ? AND aggregate_id = ?")
-        .bind(tenant)
-        .bind(aggregate_id)
-        .execute(pool)
+fn operation_id(suite: &SuiteFixture, tag: &str) -> String {
+    format!("rq4-{:032x}-{tag}", suite.salt)
+}
+
+async fn lease_test_partition(
+    pool: &MySqlPool,
+    label: &str,
+) -> (SuiteFixture, ProjectionAggregateIdentity) {
+    let suite = SuiteFixture::new(label, &[TenantRole::AllowActive]);
+    seed_all_tenants(pool, &suite)
         .await
-        .expect("cleanup delta events");
-    sqlx::query(
-        "DELETE FROM authorization_projection_partition_lease WHERE tenant_id = ? AND aggregate_id = ?",
+        .expect("seed run-scoped source ownership for the lease-only partition");
+    let tenant = suite.tenants[0];
+    (suite, identity(tenant.tenant_id, "CARD", tenant.card_id))
+}
+
+async fn assert_partition_identity_unused(
+    pool: &MySqlPool,
+    partition: &ProjectionAggregateIdentity,
+) {
+    let lease_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM authorization_projection_partition_lease \
+         WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ?",
     )
-    .bind(tenant)
-    .bind(aggregate_id)
+    .bind(partition.tenant_id)
+    .bind(&partition.aggregate_type)
+    .bind(partition.aggregate_id)
+    .fetch_one(pool)
+    .await
+    .expect("preflight partition lease identity");
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM authorization_delta_event \
+         WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ?",
+    )
+    .bind(partition.tenant_id)
+    .bind(&partition.aggregate_type)
+    .bind(partition.aggregate_id)
+    .fetch_one(pool)
+    .await
+    .expect("preflight partition delta identity");
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE event_type = 'AUTHZ_PARTITION_LEASE' AND tenant_id = ? \
+           AND resource = 'authorization_projection_partition_lease' \
+           AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.aggregateType')) = ? \
+           AND CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.aggregateId')) AS SIGNED) = ?",
+    )
+    .bind(partition.tenant_id)
+    .bind(&partition.aggregate_type)
+    .bind(partition.aggregate_id)
+    .fetch_one(pool)
+    .await
+    .expect("preflight partition lease audit identity");
+    assert_eq!(lease_count, 0, "run-scoped lease identity already exists");
+    assert_eq!(event_count, 0, "run-scoped delta identity already exists");
+    assert_eq!(
+        audit_count, 0,
+        "run-scoped lease audit identity already exists"
+    );
+}
+
+async fn cleanup_partition_identity(pool: &MySqlPool, partition: &ProjectionAggregateIdentity) {
+    sqlx::query(
+        "DELETE FROM authorization_projection_partition_lease \
+         WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ?",
+    )
+    .bind(partition.tenant_id)
+    .bind(&partition.aggregate_type)
+    .bind(partition.aggregate_id)
     .execute(pool)
     .await
-    .expect("cleanup partition lease");
+    .expect("cleanup this run-owned partition lease");
     sqlx::query(
-        "DELETE FROM audit_log WHERE event_type = 'AUTHZ_PARTITION_LEASE' \
-         AND tenant_id = ? AND resource = 'authorization_projection_partition_lease' \
-         AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.aggregateType')) = 'CARD' \
-         AND CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.aggregateId')) AS SIGNED) = ?",
+        "DELETE FROM audit_log \
+         WHERE event_type = 'AUTHZ_PARTITION_LEASE' AND tenant_id = ? \
+           AND resource = 'authorization_projection_partition_lease' \
+           AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.aggregateType')) = ? \
+           AND CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.aggregateId')) AS SIGNED) = ?",
     )
-    .bind(tenant)
-    .bind(aggregate_id)
+    .bind(partition.tenant_id)
+    .bind(&partition.aggregate_type)
+    .bind(partition.aggregate_id)
     .execute(pool)
     .await
-    .expect("cleanup partition lease audit");
+    .expect("cleanup only this run-owned partition lease audit");
 }
 
 async fn partition_lease_audit_actions(
     pool: &MySqlPool,
-    tenant: i64,
-    aggregate_id: i64,
+    partition: &ProjectionAggregateIdentity,
 ) -> Vec<String> {
     sqlx::query(
         "SELECT action FROM audit_log \
          WHERE event_type = 'AUTHZ_PARTITION_LEASE' \
            AND tenant_id = ? \
            AND resource = 'authorization_projection_partition_lease' \
-           AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.aggregateType')) = 'CARD' \
+           AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.aggregateType')) = ? \
            AND CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.aggregateId')) AS SIGNED) = ? \
          ORDER BY id",
     )
-    .bind(tenant)
-    .bind(aggregate_id)
+    .bind(partition.tenant_id)
+    .bind(&partition.aggregate_type)
+    .bind(partition.aggregate_id)
     .fetch_all(pool)
     .await
     .expect("read partition lease audit")
@@ -155,20 +248,20 @@ async fn partition_lease_audit_actions(
 
 async fn partition_lease_audit_rows(
     pool: &MySqlPool,
-    tenant: i64,
-    aggregate_id: i64,
+    partition: &ProjectionAggregateIdentity,
 ) -> Vec<(i64, String, String, String)> {
     sqlx::query(
         "SELECT user_id, decision, request_id, detail FROM audit_log \
          WHERE event_type = 'AUTHZ_PARTITION_LEASE' \
            AND tenant_id = ? \
            AND resource = 'authorization_projection_partition_lease' \
-           AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.aggregateType')) = 'CARD' \
+           AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.aggregateType')) = ? \
            AND CAST(JSON_UNQUOTE(JSON_EXTRACT(detail, '$.aggregateId')) AS SIGNED) = ? \
          ORDER BY id",
     )
-    .bind(tenant)
-    .bind(aggregate_id)
+    .bind(partition.tenant_id)
+    .bind(&partition.aggregate_type)
+    .bind(partition.aggregate_id)
     .fetch_all(pool)
     .await
     .expect("read partition lease audit rows")
@@ -194,14 +287,18 @@ fn lease_correlation_id(detail: &serde_json::Value) -> &str {
         .expect("non-secret lease correlation id")
 }
 
-async fn lease_row(pool: &MySqlPool, tenant: i64, aggregate_id: i64) -> Option<(String, i64, i64)> {
+async fn lease_row(
+    pool: &MySqlPool,
+    partition: &ProjectionAggregateIdentity,
+) -> Option<(String, i64, i64)> {
     let row = sqlx::query(
         "SELECT lease_owner, generation, cas_version \
          FROM authorization_projection_partition_lease \
-         WHERE tenant_id = ? AND aggregate_id = ?",
+         WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ?",
     )
-    .bind(tenant)
-    .bind(aggregate_id)
+    .bind(partition.tenant_id)
+    .bind(&partition.aggregate_type)
+    .bind(partition.aggregate_id)
     .fetch_optional(pool)
     .await
     .expect("read partition lease row");
@@ -214,54 +311,430 @@ async fn lease_row(pool: &MySqlPool, tenant: i64, aggregate_id: i64) -> Option<(
     })
 }
 
-const TENANT: i64 = 990_001;
+#[derive(Debug, FromRow)]
+struct DeltaQueueState {
+    status: String,
+    attempts: i64,
+    execution_attempts: i64,
+    execution_failures: i64,
+    retry_is_future: i64,
+    last_error: Option<String>,
+    lease_owner: Option<String>,
+    lease_token_hash: Option<Vec<u8>>,
+}
+
+#[derive(Debug, PartialEq, Eq, FromRow)]
+struct OwnedLaneState {
+    execution_epoch: i64,
+    lease_owner: String,
+    lease_token_hash: Vec<u8>,
+    lease_expires_at: PrimitiveDateTime,
+    active_delta_event_id: Option<i64>,
+    active_delta_token_hash: Option<Vec<u8>>,
+    lease_is_expired: i64,
+}
+
+async fn delta_queue_state(pool: &MySqlPool, request: &DeltaEventAppendRequest) -> DeltaQueueState {
+    sqlx::query_as(
+        "SELECT status, attempts, execution_attempts, execution_failures, \
+         CAST(COALESCE(next_attempt_at > UTC_TIMESTAMP(6), 0) AS SIGNED) AS retry_is_future, \
+         last_error, lease_owner, lease_token_hash \
+         FROM authorization_delta_event \
+         WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ? AND event_id = ?",
+    )
+    .bind(request.tenant_id)
+    .bind(&request.aggregate_type)
+    .bind(request.aggregate_id)
+    .bind(&request.event_id)
+    .fetch_one(pool)
+    .await
+    .expect("read exact source-owned delta queue state")
+}
+
+async fn owned_lane_state(
+    pool: &MySqlPool,
+    partition: &ProjectionAggregateIdentity,
+) -> OwnedLaneState {
+    sqlx::query_as(
+        "SELECT execution_epoch, lease_owner, lease_token_hash, lease_expires_at, \
+         active_delta_event_id, active_delta_token_hash, \
+         CAST(lease_expires_at <= UTC_TIMESTAMP(6) AS SIGNED) AS lease_is_expired \
+         FROM authorization_projection_partition_lease \
+         WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ?",
+    )
+    .bind(partition.tenant_id)
+    .bind(&partition.aggregate_type)
+    .bind(partition.aggregate_id)
+    .fetch_one(pool)
+    .await
+    .expect("owned execution must preserve its aggregate lane history")
+}
+
+fn assert_inactive_lane(lane: &OwnedLaneState) {
+    assert!(lane.execution_epoch > 0);
+    assert_eq!(lane.lease_owner, "");
+    assert_eq!(lane.lease_token_hash, vec![0_u8; 32]);
+    assert!(lane.active_delta_event_id.is_none());
+    assert!(lane.active_delta_token_hash.is_none());
+    assert_eq!(lane.lease_is_expired, 1);
+}
+
+async fn assert_owned_lane_inactive(pool: &MySqlPool, request: &DeltaEventAppendRequest) {
+    let partition = identity(
+        request.tenant_id,
+        &request.aggregate_type,
+        request.aggregate_id,
+    );
+    assert_inactive_lane(&owned_lane_state(pool, &partition).await);
+}
+
+fn source_entry(action: &str) -> AddEntryRequest {
+    AddEntryRequest {
+        effect: "ALLOW".to_owned(),
+        resource_type: Some("learn_subject".to_owned()),
+        resource_id: None,
+        action_code: Some(action.to_owned()),
+        condition_json: None,
+        priority: 100,
+    }
+}
+
+fn source_entry_update(action: &str) -> UpdateEntryRequest {
+    UpdateEntryRequest {
+        effect: "ALLOW".to_owned(),
+        resource_type: Some("learn_subject".to_owned()),
+        resource_id: None,
+        action_code: Some(action.to_owned()),
+        condition_json: None,
+        priority: 100,
+    }
+}
+
+async fn seed_source_fixture(pool: &MySqlPool, label: &str, tenant_count: usize) -> SuiteFixture {
+    assert!(tenant_count > 0 && tenant_count <= 3);
+    let suite = SuiteFixture::new(label, &vec![TenantRole::AllowActive; tenant_count]);
+    seed_all_tenants(pool, &suite)
+        .await
+        .expect("seed run-scoped tenant and MANUAL RuleSet rows");
+    for tenant in &suite.tenants {
+        publish_card_manifest(
+            pool,
+            tenant.tenant_id,
+            tenant.card_id,
+            tenant.rule_set_id,
+            tenant.user_id,
+            vec![source_entry("read")],
+            ("rq4-partition-baseline", suite.salt),
+        )
+        .await;
+    }
+    suite
+}
+
+async fn load_source_receipts(
+    pool: &MySqlPool,
+    tenant_id: i64,
+    operation_id: &str,
+) -> Vec<DeltaEventAppendRequest> {
+    let rows = sqlx::query(
+        "SELECT tenant_id, card_id, aggregate_type, aggregate_id, grant_id, event_id, operation_id, \
+         event_type, base_version, target_version, source_generation, revoke_fence, \
+         invalidates_published_evidence, \
+         CAST(before_image_json AS CHAR CHARACTER SET utf8mb4) AS before_image_json, \
+         before_digest, CAST(delta_json AS CHAR CHARACTER SET utf8mb4) AS delta_json, \
+         semantic_hash, dependency_hash, compiler_version, next_attempt_at \
+         FROM authorization_delta_event WHERE tenant_id = ? AND operation_id = ? \
+         ORDER BY delta_event_id LIMIT 1025",
+    )
+    .bind(tenant_id)
+    .bind(operation_id)
+    .fetch_all(pool)
+    .await
+    .expect("read immutable source-committed delta receipts");
+    assert!(
+        rows.len() <= 1024,
+        "source receipt batch exceeds test bound"
+    );
+
+    rows.into_iter()
+        .map(|row| {
+            let event_type: String = row.get("event_type");
+            let event_type = match event_type.as_str() {
+                "ADD" => DeltaEventType::Add,
+                "UPDATE" => DeltaEventType::Update,
+                "REMOVE" => DeltaEventType::Remove,
+                "REVOKE" => DeltaEventType::Revoke,
+                other => panic!("unknown source-owned event type {other}"),
+            };
+            let before_digest: Option<Vec<u8>> = row.get("before_digest");
+            let semantic_hash: Vec<u8> = row.get("semantic_hash");
+            let dependency_hash: Vec<u8> = row.get("dependency_hash");
+            let request = DeltaEventAppendRequest {
+                tenant_id: row.get("tenant_id"),
+                card_id: row.get("card_id"),
+                aggregate_type: row.get("aggregate_type"),
+                aggregate_id: row.get("aggregate_id"),
+                grant_id: astral_db::decode_grant_id_sql(row.get::<&str, _>("grant_id"))
+                    .expect("decode source-owned grant id"),
+                event_id: row.get("event_id"),
+                operation_id: row.get("operation_id"),
+                event_type,
+                base_version: row.get("base_version"),
+                target_version: row.get("target_version"),
+                source_generation: u64::try_from(row.get::<i64, _>("source_generation"))
+                    .expect("source generation is positive"),
+                revoke_fence: u64::try_from(row.get::<i64, _>("revoke_fence"))
+                    .expect("revoke fence is nonnegative"),
+                invalidates_published_evidence: row.get::<i8, _>("invalidates_published_evidence")
+                    != 0,
+                before_image_json: row.get("before_image_json"),
+                before_digest_hex: before_digest.map(|bytes| {
+                    Sha256Digest::from_bytes(bytes)
+                        .expect("decode source-owned before-image digest")
+                        .as_hex()
+                }),
+                delta_json: row.get("delta_json"),
+                semantic_hash_hex: Sha256Digest::from_bytes(semantic_hash)
+                    .expect("decode source-owned semantic hash")
+                    .as_hex(),
+                dependency_hash_hex: Sha256Digest::from_bytes(dependency_hash)
+                    .expect("decode source-owned dependency hash")
+                    .as_hex(),
+                compiler_version: row.get("compiler_version"),
+                next_attempt_at: row.get("next_attempt_at"),
+            };
+            assert_eq!(request.tenant_id, tenant_id);
+            assert_eq!(request.operation_id, operation_id);
+            assert_eq!(
+                request.compiler_version,
+                astral_types::AUTHORIZATION_COMPILER_VERSION,
+                "source receipt must use the current compiler stamp"
+            );
+            OwnedCompletionIdentity::from_request(&request)
+                .expect("complete immutable source receipt must validate");
+            request
+        })
+        .collect()
+}
+
+async fn update_source_entry(
+    pool: &MySqlPool,
+    suite: &SuiteFixture,
+    tenant: SuiteTenant,
+    tag: &str,
+    action: &str,
+) -> DeltaEventAppendRequest {
+    let operation_id = operation_id(suite, tag);
+    let context = RuleSetMutationContext::user(tenant.user_id, Some(&operation_id))
+        .expect("source mutation has a verified fixture actor and stable operation id");
+    let entry_id: i64 = sqlx::query_scalar(
+        "SELECT entry_id FROM rule_set_entry WHERE rule_set_id = ? AND enabled = 1 \
+         ORDER BY entry_id DESC LIMIT 1",
+    )
+    .bind(tenant.rule_set_id)
+    .fetch_one(pool)
+    .await
+    .expect("read actual enabled MANUAL RuleSet entry id");
+    let service = RuleSetWriteService::new(Arc::new(SqlxRuleSetRepository::new(pool.clone())));
+    service
+        .update_entry(
+            tenant.rule_set_id,
+            entry_id,
+            &source_entry_update(action),
+            &context,
+        )
+        .await
+        .expect("RuleSet source mutation must commit through the production writer");
+
+    let receipts = load_source_receipts(pool, tenant.tenant_id, &operation_id).await;
+    assert_eq!(
+        receipts.len(),
+        1,
+        "one bound source entry update must produce one immutable contribution receipt"
+    );
+    let request = receipts.into_iter().next().expect("one source receipt");
+    assert_eq!(request.card_id, Some(tenant.card_id));
+    assert_eq!(request.aggregate_type, "RULE_SET");
+    assert_eq!(request.aggregate_id, tenant.rule_set_id);
+    assert_eq!(request.event_type, DeltaEventType::Update);
+    assert!(request.invalidates_published_evidence);
+    assert!(request.source_generation > 0);
+    assert!(request.revoke_fence <= request.source_generation);
+    request
+}
+
+fn assert_claim_matches_receipt(request: &DeltaEventAppendRequest, claim: &OwnedDeltaClaim) {
+    let persisted = &claim.claim;
+    let readback = &claim.event;
+    assert_eq!(persisted.event_id, request.event_id);
+    assert_eq!(persisted.operation_id, request.operation_id);
+    assert_eq!(persisted.event_type, request.event_type);
+    assert_eq!(persisted.tenant_id, request.tenant_id);
+    assert_eq!(persisted.card_id, request.card_id);
+    assert_eq!(persisted.aggregate_type, request.aggregate_type);
+    assert_eq!(persisted.aggregate_id, request.aggregate_id);
+    assert_eq!(persisted.grant_id, request.grant_id);
+    assert_eq!(persisted.base_version, request.base_version);
+    assert_eq!(persisted.target_version, request.target_version);
+    assert_eq!(persisted.source_generation, request.source_generation);
+    assert_eq!(persisted.revoke_fence, request.revoke_fence);
+    assert_eq!(persisted.before_image_json, request.before_image_json);
+    assert_eq!(
+        persisted
+            .before_digest
+            .as_ref()
+            .map(Sha256Digest::as_hex)
+            .as_deref(),
+        request.before_digest_hex.as_deref()
+    );
+    assert_eq!(persisted.delta_json, request.delta_json);
+    assert_eq!(persisted.semantic_hash.as_hex(), request.semantic_hash_hex);
+    assert_eq!(
+        persisted.dependency_hash.as_hex(),
+        request.dependency_hash_hex
+    );
+    assert_eq!(persisted.compiler_version, request.compiler_version);
+    assert_eq!(readback.event_id, request.event_id);
+    assert_eq!(readback.operation_id, request.operation_id);
+    assert_eq!(readback.event_type, request.event_type);
+    assert_eq!(readback.tenant_id, request.tenant_id);
+    assert_eq!(readback.card_id, request.card_id);
+    assert_eq!(readback.aggregate_type, request.aggregate_type);
+    assert_eq!(readback.aggregate_id, request.aggregate_id);
+    assert_eq!(readback.grant_id, request.grant_id);
+    assert_eq!(readback.base_version, request.base_version);
+    assert_eq!(readback.target_version, request.target_version);
+    assert_eq!(readback.source_generation, request.source_generation);
+    assert_eq!(readback.revoke_fence, request.revoke_fence);
+    assert_eq!(
+        readback.before_image_json.as_deref(),
+        request.before_image_json.as_deref()
+    );
+    assert_eq!(
+        readback
+            .before_digest
+            .as_ref()
+            .map(Sha256Digest::as_hex)
+            .as_deref(),
+        request.before_digest_hex.as_deref()
+    );
+    assert_eq!(readback.delta_json, request.delta_json);
+    assert_eq!(readback.semantic_hash.as_hex(), request.semantic_hash_hex);
+    assert_eq!(
+        readback.dependency_hash.as_hex(),
+        request.dependency_hash_hex
+    );
+    assert_eq!(readback.compiler_version, request.compiler_version);
+    assert_eq!(persisted.attempts, readback.attempts);
+    assert_eq!(persisted.lease_owner, readback.lease_owner);
+    assert_eq!(
+        claim.lease.aggregate_identity(),
+        &identity(
+            request.tenant_id,
+            &request.aggregate_type,
+            request.aggregate_id
+        )
+    );
+}
+
+async fn claim_source_partition(
+    pool: &MySqlPool,
+    request: &DeltaEventAppendRequest,
+    owner: &str,
+) -> OwnedDeltaClaim {
+    OwnedCompletionIdentity::from_request(request)
+        .expect("validate full immutable source receipt before partition claim");
+    let aggregate = identity(
+        request.tenant_id,
+        &request.aggregate_type,
+        request.aggregate_id,
+    );
+    let claim = claim_next_owned_delta_event_in_partition(
+        pool,
+        DeltaEventClaimScope {
+            tenant_id: request.tenant_id,
+            card_id: request.card_id,
+        },
+        &aggregate,
+        owner,
+        CLAIM_LEASE_SECONDS,
+    )
+    .await
+    .expect("WorkerOwned partition claim must complete durably")
+    .expect("source-owned receipt must be claimable in its exact partition");
+    assert_claim_matches_receipt(request, &claim);
+    claim
+}
+
+async fn claim_empty_partition(
+    pool: &MySqlPool,
+    tenant: SuiteTenant,
+    owner: &str,
+) -> Option<OwnedDeltaClaim> {
+    let aggregate = identity(tenant.tenant_id, "RULE_SET", tenant.rule_set_id);
+    claim_next_owned_delta_event_in_partition(
+        pool,
+        DeltaEventClaimScope {
+            tenant_id: tenant.tenant_id,
+            card_id: Some(tenant.card_id),
+        },
+        &aggregate,
+        owner,
+        CLAIM_LEASE_SECONDS,
+    )
+    .await
+    .expect("empty WorkerOwned partition claim must complete without error")
+}
+
+async fn release_source_claim(pool: &MySqlPool, claim: &OwnedDeltaClaim) {
+    assert!(
+        release_owned_delta_event(pool, &claim.lease)
+            .await
+            .expect("release exact opaque owned capability"),
+        "the current opaque capability must release its own claim"
+    );
+}
 
 #[tokio::test]
-#[ignore = "real MySQL integration; RUST_INTEGRATION_REQUIRED=1 DATABASE_URL=..."]
+#[ignore = "run-owned isolated MySQL integration; requires RUST_INTEGRATION_REQUIRED=1"]
 async fn partition_lease_roundtrip_acquire_renew_release() {
-    let Some(pool) = test_pool().await else {
-        return;
-    };
-    let ident = identity(TENANT, "CARD", 1001);
-    cleanup_partition(&pool, TENANT, 1001).await;
+    let pool = required_pool().await;
+    let (suite, partition) = lease_test_partition(&pool, "rq4-partition-roundtrip").await;
+    assert_partition_identity_unused(&pool, &partition).await;
 
-    let handle: PartitionLeaseHandle = acquire_partition_lease(&pool, &ident, "worker-a", 300)
+    let owner = worker_id(suite.salt, "roundtrip");
+    let handle: PartitionLeaseHandle = acquire_partition_lease(&pool, &partition, &owner, 300)
         .await
         .expect("acquire on fresh partition")
         .expect("fresh partition must not be Busy");
-    assert_eq!(handle.lease_owner, "worker-a");
+    assert_eq!(handle.lease_owner, owner);
 
-    let (_, generation_before, cas_before) = lease_row(&pool, TENANT, 1001)
+    let (_, generation_before, cas_before) = lease_row(&pool, &partition)
         .await
         .expect("lease row before self renew");
-    // Self-renew keeps the ownership epoch stable and advances only the
-    // liveness/CAS version.
     renew_partition_lease(&pool, &handle, 300)
         .await
         .expect("self renew");
-    let (owner, generation, cas) = lease_row(&pool, TENANT, 1001)
+    let (actual_owner, generation, cas) = lease_row(&pool, &partition)
         .await
         .expect("lease row exists");
-    assert_eq!(owner, "worker-a");
+    assert_eq!(actual_owner, handle.lease_owner);
     assert_eq!(
         generation, generation_before,
         "heartbeat must not manufacture a new ownership generation"
     );
     assert!(cas > cas_before, "self renew must advance the CAS version");
 
-    // Best-effort release removes the row entirely. Successful heartbeats are
-    // represented by the lease row, not audit spam; only acquire and release
-    // create durable lifecycle audit rows.
     release_partition_lease(&pool, &handle)
         .await
         .expect("release");
-    assert!(lease_row(&pool, TENANT, 1001).await.is_none());
+    assert!(lease_row(&pool, &partition).await.is_none());
     assert_eq!(
-        partition_lease_audit_actions(&pool, TENANT, 1001).await,
+        partition_lease_audit_actions(&pool, &partition).await,
         vec!["partition_lease_acquire", "partition_lease_release"],
         "renew success must not emit an audit row"
     );
-    let audit_rows = partition_lease_audit_rows(&pool, TENANT, 1001).await;
+    let audit_rows = partition_lease_audit_rows(&pool, &partition).await;
     assert_eq!(audit_rows.len(), 2);
     let acquire_detail = audit_detail(&audit_rows[0]);
     let release_detail = audit_detail(&audit_rows[1]);
@@ -269,9 +742,9 @@ async fn partition_lease_roundtrip_acquire_renew_release() {
         assert_eq!(row.0, SYSTEM_ACTOR_ID);
         assert_eq!(row.1, "INTERNAL");
         assert_eq!(detail["requestId"], row.2);
-        assert_eq!(detail["tenantId"], TENANT);
-        assert_eq!(detail["aggregateType"], "CARD");
-        assert_eq!(detail["aggregateId"], 1001);
+        assert_eq!(detail["tenantId"], partition.tenant_id);
+        assert_eq!(detail["aggregateType"], partition.aggregate_type);
+        assert_eq!(detail["aggregateId"], partition.aggregate_id);
     }
     assert_eq!(
         lease_correlation_id(&acquire_detail),
@@ -284,54 +757,56 @@ async fn partition_lease_roundtrip_acquire_renew_release() {
     );
     assert_eq!(acquire_detail["outcome"], "ACQUIRE");
     assert_eq!(release_detail["outcome"], "RELEASE");
-    cleanup_partition(&pool, TENANT, 1001).await;
+    cleanup_partition_identity(&pool, &partition).await;
+    cleanup_suite_rows(&pool, &suite)
+        .await
+        .expect("cleanup only the run-owned lease lifecycle fixture");
 }
 
 #[tokio::test]
-#[ignore = "real MySQL integration; RUST_INTEGRATION_REQUIRED=1 DATABASE_URL=..."]
+#[ignore = "run-owned isolated MySQL integration; requires RUST_INTEGRATION_REQUIRED=1"]
 async fn partition_lease_second_owner_is_busy_while_first_is_live() {
-    let Some(pool) = test_pool().await else {
-        return;
-    };
-    let ident = identity(TENANT, "CARD", 1002);
-    cleanup_partition(&pool, TENANT, 1002).await;
+    let pool = required_pool().await;
+    let (suite, partition) = lease_test_partition(&pool, "rq4-partition-busy").await;
+    assert_partition_identity_unused(&pool, &partition).await;
+    let first_owner = worker_id(suite.salt, "first");
+    let second_owner = worker_id(suite.salt, "second");
 
-    let first = acquire_partition_lease(&pool, &ident, "worker-a", 300)
+    let first = acquire_partition_lease(&pool, &partition, &first_owner, 300)
         .await
         .expect("acquire")
         .expect("first owner acquires");
-    // A live lease held by another owner is BUSY: skip, never wait, never steal.
-    let second = acquire_partition_lease(&pool, &ident, "worker-b", 300)
+    let second = acquire_partition_lease(&pool, &partition, &second_owner, 300)
         .await
         .expect("acquire probe must not error");
     assert!(second.is_none(), "live foreign lease must be Busy");
-    let (owner, _, _) = lease_row(&pool, TENANT, 1002)
+    let (owner, _, _) = lease_row(&pool, &partition)
         .await
         .expect("lease row still first owner's");
-    assert_eq!(owner, "worker-a");
+    assert_eq!(owner, first_owner);
 
     release_partition_lease(&pool, &first)
         .await
-        .expect("release");
-    // After release the partition is free again.
-    let reclaimed = acquire_partition_lease(&pool, &ident, "worker-b", 300)
+        .expect("release first owner");
+    let reclaimed = acquire_partition_lease(&pool, &partition, &second_owner, 300)
         .await
         .expect("acquire after release")
         .expect("released partition must be acquirable");
-    assert_eq!(reclaimed.lease_owner, "worker-b");
+    assert_eq!(reclaimed.lease_owner, second_owner);
     release_partition_lease(&pool, &reclaimed)
         .await
         .expect("release second owner");
-    let repeated_owner = acquire_partition_lease(&pool, &ident, "worker-a", 300)
+    let repeated_owner = acquire_partition_lease(&pool, &partition, &first_owner, 300)
         .await
         .expect("acquire same owner after a completed episode")
         .expect("released partition must be acquirable");
     release_partition_lease(&pool, &repeated_owner)
         .await
         .expect("release repeated owner");
-    let audit_rows = partition_lease_audit_rows(&pool, TENANT, 1002).await;
+
+    let audit_rows = partition_lease_audit_rows(&pool, &partition).await;
     assert_eq!(
-        partition_lease_audit_actions(&pool, TENANT, 1002).await,
+        partition_lease_audit_actions(&pool, &partition).await,
         vec![
             "partition_lease_acquire",
             "partition_lease_release",
@@ -369,48 +844,42 @@ async fn partition_lease_second_owner_is_busy_while_first_is_live() {
         lease_correlation_id(&details[4]),
         "the same worker identity must start a new audit episode after release"
     );
-    cleanup_partition(&pool, TENANT, 1002).await;
+    cleanup_partition_identity(&pool, &partition).await;
+    cleanup_suite_rows(&pool, &suite)
+        .await
+        .expect("cleanup only the run-owned lease lifecycle fixture");
 }
 
 #[tokio::test]
-#[ignore = "real MySQL integration; RUST_INTEGRATION_REQUIRED=1 DATABASE_URL=..."]
+#[ignore = "run-owned isolated MySQL integration; requires RUST_INTEGRATION_REQUIRED=1"]
 async fn partition_lease_expired_lease_is_taken_over_with_generation_bump() {
-    let Some(pool) = test_pool().await else {
-        return;
-    };
-    let ident = identity(TENANT, "CARD", 1003);
-    cleanup_partition(&pool, TENANT, 1003).await;
+    let pool = required_pool().await;
+    let (suite, partition) = lease_test_partition(&pool, "rq4-partition-expiry").await;
+    assert_partition_identity_unused(&pool, &partition).await;
+    let abandoned_owner = worker_id(suite.salt, "abandoned");
+    let takeover_owner = worker_id(suite.salt, "takeover");
 
-    // One-second lease: the original owner abandons the partition (crash
-    // simulation) without releasing.
-    let abandoned = acquire_partition_lease(&pool, &ident, "worker-a", 1)
+    let abandoned = acquire_partition_lease(&pool, &partition, &abandoned_owner, 1)
         .await
         .expect("acquire")
         .expect("first acquire");
-    let (_, generation_before, _) = lease_row(&pool, TENANT, 1003)
+    let (_, generation_before, _) = lease_row(&pool, &partition)
         .await
         .expect("lease row after first acquire");
-    // Keep the stale handle so the post-takeover CAS and best-effort release
-    // paths can prove that a previous owner cannot affect the new holder.
 
-    // Wait out the one-second window, then another worker must be able to
-    // take the partition over (never blocked by a dead owner).
-    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
-    let takeover = acquire_partition_lease(&pool, &ident, "worker-b", 300)
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let takeover = acquire_partition_lease(&pool, &partition, &takeover_owner, 300)
         .await
         .expect("acquire after expiry")
         .expect("expired lease must be reclaimable");
-    assert_eq!(takeover.lease_owner, "worker-b");
-    let (_, generation_after, _) = lease_row(&pool, TENANT, 1003)
+    assert_eq!(takeover.lease_owner, takeover_owner);
+    let (_, generation_after, _) = lease_row(&pool, &partition)
         .await
         .expect("lease row after takeover");
     assert!(
         generation_after > generation_before,
         "takeover must bump generation: {generation_before} -> {generation_after}"
     );
-    // The abandoned owner's stale handle cannot renew after takeover; the
-    // failed CAS becomes a durable RENEW_LOST observation while the current
-    // owner's successful heartbeat stays audit-free.
     assert!(
         renew_partition_lease(&pool, &abandoned, 300).await.is_err(),
         "stale owner must observe lease loss"
@@ -422,8 +891,7 @@ async fn partition_lease_expired_lease_is_taken_over_with_generation_bump() {
     release_partition_lease(&pool, &takeover)
         .await
         .expect("release takeover lease");
-    let audit_actions_before_stale_release =
-        partition_lease_audit_actions(&pool, TENANT, 1003).await;
+    let audit_actions_before_stale_release = partition_lease_audit_actions(&pool, &partition).await;
     assert_eq!(
         audit_actions_before_stale_release,
         vec![
@@ -433,18 +901,15 @@ async fn partition_lease_expired_lease_is_taken_over_with_generation_bump() {
             "partition_lease_release",
         ]
     );
-    // A stale owner cannot delete the successor's row. Its best-effort no-op
-    // must not manufacture a second release observation; `RENEW_LOST` and
-    // `RECLAIM` already record the meaningful fencing transition.
     release_partition_lease(&pool, &abandoned)
         .await
         .expect("stale release remains a best-effort no-op");
     assert_eq!(
-        partition_lease_audit_actions(&pool, TENANT, 1003).await,
+        partition_lease_audit_actions(&pool, &partition).await,
         audit_actions_before_stale_release,
         "stale release must not create an audit row"
     );
-    let audit_rows = partition_lease_audit_rows(&pool, TENANT, 1003).await;
+    let audit_rows = partition_lease_audit_rows(&pool, &partition).await;
     let reclaim_detail: serde_json::Value =
         serde_json::from_str(&audit_rows[1].3).expect("reclaim audit detail JSON");
     assert_eq!(audit_rows[1].0, SYSTEM_ACTOR_ID);
@@ -471,48 +936,50 @@ async fn partition_lease_expired_lease_is_taken_over_with_generation_bump() {
     );
     assert_ne!(audit_rows[0].2, audit_rows[2].2);
     assert_ne!(audit_rows[1].2, audit_rows[3].2);
-    assert_eq!(
-        reclaim_detail["generation"], generation_after,
-        "reclaim audit must report the durable post-takeover fence"
-    );
+    assert_eq!(reclaim_detail["generation"], generation_after);
     assert!(
         reclaim_detail["casVersion"]
             .as_i64()
             .is_some_and(|value| value >= 1),
         "reclaim audit must report a durable CAS version"
     );
-    cleanup_partition(&pool, TENANT, 1003).await;
+    cleanup_partition_identity(&pool, &partition).await;
+    cleanup_suite_rows(&pool, &suite)
+        .await
+        .expect("cleanup only the run-owned lease lifecycle fixture");
 }
 
 #[tokio::test]
-#[ignore = "real MySQL integration; RUST_INTEGRATION_REQUIRED=1 DATABASE_URL=..."]
+#[ignore = "run-owned isolated MySQL integration; requires RUST_INTEGRATION_REQUIRED=1"]
 async fn concurrent_expired_reclaim_has_one_winner_without_duplicate_key_deadlock() {
-    let Some(pool) = test_pool().await else {
-        return;
-    };
-    let ident = identity(TENANT, "CARD", 1004);
-    cleanup_partition(&pool, TENANT, 1004).await;
-
-    let abandoned = acquire_partition_lease(&pool, &ident, "worker-seed", 1)
-        .await
-        .expect("seed acquire")
-        .expect("seed owner acquires");
-    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    let pool = required_pool().await;
+    let (suite, partition) = lease_test_partition(&pool, "rq4-partition-reclaim-race").await;
+    assert_partition_identity_unused(&pool, &partition).await;
+    let abandoned =
+        acquire_partition_lease(&pool, &partition, &worker_id(suite.salt, "race-seed"), 1)
+            .await
+            .expect("seed acquire")
+            .expect("seed owner acquires");
+    tokio::time::sleep(Duration::from_millis(1300)).await;
 
     let barrier = Arc::new(Barrier::new(3));
     let first_pool = pool.clone();
-    let first_identity = ident.clone();
+    let first_identity = partition.clone();
     let first_barrier = barrier.clone();
+    let first_owner = worker_id(suite.salt, "race-a");
+    let first_owner_for_task = first_owner.clone();
     let first = tokio::spawn(async move {
         first_barrier.wait().await;
-        acquire_partition_lease(&first_pool, &first_identity, "worker-race-a", 300).await
+        acquire_partition_lease(&first_pool, &first_identity, &first_owner_for_task, 300).await
     });
     let second_pool = pool.clone();
-    let second_identity = ident.clone();
+    let second_identity = partition.clone();
     let second_barrier = barrier.clone();
+    let second_owner = worker_id(suite.salt, "race-b");
+    let second_owner_for_task = second_owner.clone();
     let second = tokio::spawn(async move {
         second_barrier.wait().await;
-        acquire_partition_lease(&second_pool, &second_identity, "worker-race-b", 300).await
+        acquire_partition_lease(&second_pool, &second_identity, &second_owner_for_task, 300).await
     });
     barrier.wait().await;
 
@@ -532,7 +999,7 @@ async fn concurrent_expired_reclaim_has_one_winner_without_duplicate_key_deadloc
         .await
         .expect("release winner");
     assert_eq!(
-        partition_lease_audit_actions(&pool, TENANT, 1004).await,
+        partition_lease_audit_actions(&pool, &partition).await,
         vec![
             "partition_lease_acquire",
             "partition_lease_reclaim",
@@ -543,275 +1010,229 @@ async fn concurrent_expired_reclaim_has_one_winner_without_duplicate_key_deadloc
     release_partition_lease(&pool, &abandoned)
         .await
         .expect("stale seed release remains best effort");
-    cleanup_partition(&pool, TENANT, 1004).await;
+    cleanup_partition_identity(&pool, &partition).await;
+    cleanup_suite_rows(&pool, &suite)
+        .await
+        .expect("cleanup only the run-owned lease lifecycle fixture");
 }
 
 #[tokio::test]
-#[ignore = "real MySQL integration; RUST_INTEGRATION_REQUIRED=1 DATABASE_URL=..."]
-async fn partition_discovery_returns_only_claimable_partitions() {
-    let Some(pool) = test_pool().await else {
-        return;
-    };
-    // Partition 2001: one due PENDING event -> discoverable.
-    // Partition 2002: its ONLY event is parked in a backoff window
-    // (`next_attempt_at` in the future) -> NOT discoverable: the eligibility
-    // predicate mirrors the claim candidate, so a partition whose every event
-    // is scheduled for later (e.g. the 898s budget-exhausted backoff) never
-    // produces a discover-then-starve round. Note a same-grant blocked
-    // successor cannot make a partition undiscoverable: the blocked row's
-    // chain head is itself claimable, so the partition stays schedulable.
-    cleanup_partition(&pool, TENANT, 2001).await;
-    cleanup_partition(&pool, TENANT, 2002).await;
-    seed_pending_event(
-        &pool,
-        TENANT,
-        "CARD",
-        2001,
-        "aaaaaaaa-1111-4111-8111-cccccccccccc",
-        "evt-disc-2001",
-    )
-    .await;
-    seed_pending_event(
-        &pool,
-        TENANT,
-        "CARD",
-        2002,
-        "bbbbbbbb-1111-4111-8111-cccccccccccc",
-        "evt-disc-2002-backoff",
-    )
-    .await;
-    sqlx::query(
-        "UPDATE authorization_delta_event          SET next_attempt_at = TIMESTAMPADD(SECOND, 3600, UTC_TIMESTAMP())          WHERE event_id = 'evt-disc-2002-backoff'",
-    )
-    .execute(&pool)
-    .await
-    .expect("park event in a backoff window");
+#[ignore = "run-owned isolated MySQL integration; requires RUST_INTEGRATION_REQUIRED=1"]
+async fn partition_discovery_returns_only_claimable_source_partitions() {
+    let pool = required_pool().await;
+    let suite = seed_source_fixture(&pool, "rq4-partition-discovery", 2).await;
+    let due_tenant = suite.tenants[0];
+    let parked_tenant = suite.tenants[1];
+    let due = update_source_entry(&pool, &suite, due_tenant, "due", "create").await;
+    let parked = update_source_entry(&pool, &suite, parked_tenant, "parked", "update").await;
 
-    let rows = discover_claimable_partitions(&pool, &[TENANT], 64)
+    // A real owned execution failure moves the second source receipt into a
+    // future retry window; discovery must omit that parked partition.
+    let parked_claim =
+        claim_source_partition(&pool, &parked, &worker_id(suite.salt, "parked-failure")).await;
+    assert_eq!(
+        begin_owned_delta_execution(&pool, &parked_claim.lease)
+            .await
+            .expect("begin real owned failure episode"),
+        0
+    );
+    assert!(
+        fail_owned_delta_event(
+            &pool,
+            &parked_claim.lease,
+            "code=rq4.partition_discovery_backoff",
+            BACKOFF_CAP_SECS,
+            true,
+        )
         .await
-        .expect("discovery query");
-    let found: Vec<i64> = rows
+        .expect("record the real source-owned retry transition"),
+        "the live failure capability must persist its backoff"
+    );
+    let parked_state = delta_queue_state(&pool, &parked).await;
+    assert_eq!(parked_state.status, "PENDING");
+    assert_eq!(parked_state.attempts, 1);
+    assert_eq!(parked_state.execution_attempts, 1);
+    assert_eq!(parked_state.execution_failures, 1);
+    assert_eq!(parked_state.retry_is_future, 1);
+    assert!(parked_state.lease_owner.is_none());
+    assert!(parked_state.lease_token_hash.is_none());
+    assert_owned_lane_inactive(&pool, &parked).await;
+
+    let rows =
+        discover_claimable_partitions(&pool, &[due_tenant.tenant_id, parked_tenant.tenant_id], 64)
+            .await
+            .expect("discover claimable source partitions");
+    let found: Vec<_> = rows
         .iter()
-        .filter(|row| row.tenant_id == TENANT)
-        .map(|row| row.aggregate_id)
+        .map(|row| (row.tenant_id, row.aggregate_type.as_str(), row.aggregate_id))
         .collect();
     assert!(
-        found.contains(&2001),
-        "claimable partition must be discovered: {found:?}"
+        found.contains(&(due.tenant_id, "RULE_SET", due.aggregate_id)),
+        "due source partition must be discoverable: {found:?}"
     );
     assert!(
-        !found.contains(&2002),
-        "backoff-parked partition must NOT be discovered: {found:?}"
+        !found.contains(&(parked.tenant_id, "RULE_SET", parked.aggregate_id)),
+        "backoff-parked source partition must not be discoverable: {found:?}"
     );
 
-    cleanup_partition(&pool, TENANT, 2001).await;
-    cleanup_partition(&pool, TENANT, 2002).await;
+    let due_claim = claim_source_partition(&pool, &due, &worker_id(suite.salt, "due-claim")).await;
+    release_source_claim(&pool, &due_claim).await;
+    let due_state = delta_queue_state(&pool, &due).await;
+    assert_eq!(due_state.status, "PENDING");
+    assert_eq!(due_state.attempts, 1);
+    assert!(due_state.lease_owner.is_none());
+    assert_owned_lane_inactive(&pool, &due).await;
+
+    cleanup_suite_rows(&pool, &suite)
+        .await
+        .expect("cleanup only the source-owned fixture after lanes are inactive");
 }
 
 #[tokio::test]
-#[ignore = "real MySQL integration; RUST_INTEGRATION_REQUIRED=1 DATABASE_URL=..."]
-async fn partition_claim_installs_lease_and_respects_partition_boundary() {
-    let Some(pool) = test_pool().await else {
-        return;
-    };
-    seed_pending_event(
-        &pool,
-        TENANT,
-        "CARD",
-        3001,
-        "cccccccc-1111-4111-8111-cccccccccccc",
-        "evt-claim-3001",
-    )
-    .await;
-    seed_pending_event(
-        &pool,
-        TENANT,
-        "CARD",
-        3002,
-        "dddddddd-1111-4111-8111-cccccccccccc",
-        "evt-claim-3002",
-    )
-    .await;
+#[ignore = "run-owned isolated MySQL integration; requires RUST_INTEGRATION_REQUIRED=1"]
+async fn partition_claim_respects_exact_boundary_foreign_row_and_empty_partition() {
+    let pool = required_pool().await;
+    let suite = seed_source_fixture(&pool, "rq4-partition-boundary", 3).await;
+    let target_tenant = suite.tenants[0];
+    let foreign_tenant = suite.tenants[1];
+    let empty_tenant = suite.tenants[2];
+    let target = update_source_entry(&pool, &suite, target_tenant, "target", "create").await;
+    let foreign = update_source_entry(&pool, &suite, foreign_tenant, "foreign", "update").await;
 
-    // Holding partition 3001's lease, claim inside it: returns 3001's event
-    // with an installed lease (LEASED, attempts bumped to the durable value 1).
-    let handle = acquire_partition_lease(&pool, &identity(TENANT, "CARD", 3001), "worker-a", 300)
-        .await
-        .expect("acquire")
-        .expect("claim partition must be free");
-    let mut tx = pool.begin().await.expect("claim tx");
-    let claim = claim_next_delta_event_in_partition_tx(
-        &mut tx,
-        astral_db::DeltaEventClaimScope {
-            tenant_id: TENANT,
-            card_id: None,
-        },
-        &identity(TENANT, "CARD", 3001),
-        "worker-a",
-        120,
-    )
-    .await
-    .expect("partition claim")
-    .expect("seeded event must be claimed");
-    tx.commit().await.expect("claim commit");
-    assert_eq!(claim.event_id, "evt-claim-3001");
-    assert_eq!(claim.aggregate_id, 3001);
-    assert_eq!(
-        claim.attempts, 1,
-        "install bumps the durable attempt counter"
-    );
-    assert_eq!(claim.lease_owner, "worker-a");
+    let claim =
+        claim_source_partition(&pool, &target, &worker_id(suite.salt, "target-claim")).await;
+    assert_eq!(claim.claim.tenant_id, target_tenant.tenant_id);
+    assert_eq!(claim.claim.aggregate_type, "RULE_SET");
+    assert_eq!(claim.claim.aggregate_id, target_tenant.rule_set_id);
 
-    // The other partition's row is untouched by the 3001 claim...
-    let untouched: i64 =
-        sqlx::query("SELECT COUNT(*) AS c FROM authorization_delta_event WHERE event_id = 'evt-claim-3002' AND status = 'PENDING'")
-            .fetch_one(&pool)
+    let foreign_before_release = delta_queue_state(&pool, &foreign).await;
+    assert_eq!(foreign_before_release.status, "PENDING");
+    assert_eq!(foreign_before_release.attempts, 0);
+    assert_eq!(foreign_before_release.execution_attempts, 0);
+    assert_eq!(foreign_before_release.execution_failures, 0);
+    assert!(foreign_before_release.lease_owner.is_none());
+    assert!(foreign_before_release.lease_token_hash.is_none());
+
+    let empty_partition = identity(empty_tenant.tenant_id, "RULE_SET", empty_tenant.rule_set_id);
+    let empty_before = owned_lane_state(&pool, &empty_partition).await;
+    assert_inactive_lane(&empty_before);
+    assert!(
+        claim_empty_partition(&pool, empty_tenant, &worker_id(suite.salt, "empty-probe"))
             .await
-            .expect("count query")
-            .get("c");
-    assert_eq!(untouched, 1, "foreign partition must stay PENDING");
+            .is_none(),
+        "real baseline-only RuleSet aggregate must claim None"
+    );
+    let empty_after = owned_lane_state(&pool, &empty_partition).await;
+    assert_inactive_lane(&empty_after);
+    assert_eq!(
+        empty_before, empty_after,
+        "empty queue observation must preserve the baseline publication's retired lane"
+    );
 
-    // ...and an EMPTY partition claims None without error.
-    let mut tx = pool.begin().await.expect("empty-claim tx");
-    let none = claim_next_delta_event_in_partition_tx(
-        &mut tx,
-        astral_db::DeltaEventClaimScope {
-            tenant_id: TENANT,
-            card_id: None,
-        },
-        &identity(TENANT, "CARD", 3999),
-        "worker-a",
-        120,
-    )
-    .await
-    .expect("empty partition claim");
-    tx.commit().await.expect("empty-claim commit");
-    assert!(none.is_none(), "empty partition must claim None");
+    release_source_claim(&pool, &claim).await;
+    let target_after_release = delta_queue_state(&pool, &target).await;
+    assert_eq!(target_after_release.status, "PENDING");
+    assert_eq!(target_after_release.attempts, 1);
+    assert!(target_after_release.lease_owner.is_none());
+    assert!(target_after_release.lease_token_hash.is_none());
+    assert_owned_lane_inactive(&pool, &target).await;
+    let foreign_after_release = delta_queue_state(&pool, &foreign).await;
+    assert_eq!(foreign_after_release.status, "PENDING");
+    assert_eq!(foreign_after_release.attempts, 0);
+    assert_eq!(foreign_after_release.execution_attempts, 0);
+    assert_eq!(foreign_after_release.execution_failures, 0);
+    assert!(foreign_after_release.lease_owner.is_none());
+    assert!(foreign_after_release.lease_token_hash.is_none());
 
-    release_partition_lease(&pool, &handle)
+    cleanup_suite_rows(&pool, &suite)
         .await
-        .expect("release");
-    cleanup_partition(&pool, TENANT, 3001).await;
-    cleanup_partition(&pool, TENANT, 3002).await;
+        .expect("cleanup only source-owned fixture after exact claim release");
 }
 
 #[tokio::test]
-#[ignore = "real MySQL integration; RUST_INTEGRATION_REQUIRED=1 DATABASE_URL=..."]
-async fn pointer_advance_reclaims_parked_budget_exhausted_event() {
-    let Some(pool) = test_pool().await else {
-        return;
-    };
-    // The ~898s stall shape: a budget-exhausted loser parks ~15 minutes out
-    // with the stable exhaustion marker. The E5 finding: while parked, the
-    // partition is INVISIBLE to the scheduler (discovery mirrors claim
-    // eligibility), so only rewriting the row itself can bring it back.
-    cleanup_partition(&pool, TENANT, 4001).await;
-    cleanup_partition(&pool, TENANT, 4002).await;
-    seed_pending_event(
-        &pool,
-        TENANT,
-        "CARD",
-        4001,
-        "eeeeeeee-1111-4111-8111-cccccccccccc",
-        "evt-reclaim-4001",
-    )
-    .await;
-    sqlx::query(
-        "UPDATE authorization_delta_event          SET attempts = 6,              next_attempt_at = TIMESTAMPADD(SECOND, 900, UTC_TIMESTAMP()),              last_error = CONCAT('contention loser;', 'code=auth_projector.attempt_budget_exhausted', ';attempts=6')          WHERE event_id = 'evt-reclaim-4001'",
-    )
-    .execute(&pool)
-    .await
-    .expect("park the exhausted row");
-    // Negative control: a plain parked row WITHOUT the exhaustion marker in a
-    // sibling partition must never be touched by the reclaim.
-    seed_pending_event(
-        &pool,
-        TENANT,
-        "CARD",
-        4002,
-        "ffffffff-1111-4111-8111-cccccccccccc",
-        "evt-reclaim-4002",
-    )
-    .await;
-    sqlx::query(
-        "UPDATE authorization_delta_event          SET next_attempt_at = TIMESTAMPADD(SECOND, 900, UTC_TIMESTAMP())          WHERE event_id = 'evt-reclaim-4002'",
-    )
-    .execute(&pool)
-    .await
-    .expect("park the plain row");
+#[ignore = "run-owned isolated MySQL integration; requires RUST_INTEGRATION_REQUIRED=1"]
+async fn attempt_budget_exhaustion_parks_real_source_receipt() {
+    let pool = required_pool().await;
+    let suite = seed_source_fixture(&pool, "rq4-attempt-budget", 1).await;
+    let tenant = suite.tenants[0];
+    let request = update_source_entry(&pool, &suite, tenant, "budget", "create").await;
+    OwnedCompletionIdentity::from_request(&request)
+        .expect("attempt-budget exercise starts from a valid full source receipt");
 
-    // Before the pointer advance: both partitions are undiscoverable.
-    let rows = discover_claimable_partitions(&pool, &[TENANT], 64)
+    for expected_failure in 1..=MAX_EVENT_ATTEMPTS {
+        let claim = claim_source_partition(
+            &pool,
+            &request,
+            &worker_id(suite.salt, &format!("budget-{expected_failure}")),
+        )
+        .await;
+        assert_eq!(claim.claim.attempts, expected_failure);
+        assert_eq!(
+            claim.lease.execution_failures(),
+            (expected_failure - 1) as u32
+        );
+        assert_eq!(
+            begin_owned_delta_execution(&pool, &claim.lease)
+                .await
+                .expect("begin actual owned retry episode"),
+            (expected_failure - 1) as u32
+        );
+
+        let exhausted = expected_failure == MAX_EVENT_ATTEMPTS;
+        let reason = if exhausted {
+            format!(
+                "{ATTEMPT_BUDGET_EXHAUSTED_MARKER};attempts={MAX_EVENT_ATTEMPTS};rq4-owned-transition"
+            )
+        } else {
+            "code=rq4.attempt_budget_failure_probe".to_owned()
+        };
+        let backoff = if exhausted { BACKOFF_CAP_SECS } else { 0 };
+        assert!(
+            fail_owned_delta_event(&pool, &claim.lease, &reason, backoff, true)
+                .await
+                .expect("persist failure through the production owned transition"),
+            "each live capability must persist one real failure transition"
+        );
+
+        let state = delta_queue_state(&pool, &request).await;
+        assert_eq!(state.status, "PENDING", "failure is not a terminal status");
+        assert_eq!(state.attempts, expected_failure);
+        assert_eq!(state.execution_attempts, expected_failure);
+        assert_eq!(state.execution_failures, expected_failure);
+        assert!(state.lease_owner.is_none());
+        assert!(state.lease_token_hash.is_none());
+        if exhausted {
+            assert_eq!(state.retry_is_future, 1);
+            assert!(state
+                .last_error
+                .as_deref()
+                .is_some_and(|value| value.starts_with(ATTEMPT_BUDGET_EXHAUSTED_MARKER)));
+        } else {
+            assert_eq!(state.retry_is_future, 0);
+            assert!(state
+                .last_error
+                .as_deref()
+                .is_some_and(|value| value.contains("rq4.attempt_budget_failure_probe")));
+        }
+        assert_owned_lane_inactive(&pool, &request).await;
+    }
+
+    let discovered = discover_claimable_partitions(&pool, &[tenant.tenant_id], 64)
         .await
-        .expect("discovery before reclaim");
+        .expect("discovery after real exhausted failure transitions");
     assert!(
-        !rows
-            .iter()
-            .any(|row| row.tenant_id == TENANT && row.aggregate_id == 4001),
-        "parked exhausted partition must be undiscoverable before the pointer advance: {:?}",
-        rows.iter().map(|row| row.aggregate_id).collect::<Vec<_>>()
+        !discovered.iter().any(|row| {
+            row.tenant_id == request.tenant_id
+                && row.aggregate_type == request.aggregate_type
+                && row.aggregate_id == request.aggregate_id
+        }),
+        "the exhausted source receipt remains parked and its partition is not claimable"
     );
 
-    // The pointer ADVANCES (durable publication) -> reclaim this partition.
-    let reclaimed =
-        astral_db::reclaim_budget_exhausted_events(&pool, &identity(TENANT, "CARD", 4001))
-            .await
-            .expect("reclaim");
-    assert_eq!(
-        reclaimed, 1,
-        "exactly the marked parked row is pulled forward"
-    );
-
-    // After the reclaim the partition is discoverable and claimable again;
-    // `attempts` stays authoritative (6 -> 7 on the next install).
-    let rows = discover_claimable_partitions(&pool, &[TENANT], 64)
+    // This bounded integration target does not claim pointer-advance recovery:
+    // invoking reclaim_budget_exhausted_events directly would not prove that a
+    // real WorkerOwned publication advanced this aggregate's current pointer.
+    cleanup_suite_rows(&pool, &suite)
         .await
-        .expect("discovery after reclaim");
-    assert!(
-        rows.iter()
-            .any(|row| row.tenant_id == TENANT && row.aggregate_id == 4001),
-        "reclaimed partition must be discoverable"
-    );
-    let mut tx = pool.begin().await.expect("claim tx");
-    let claim = claim_next_delta_event_in_partition_tx(
-        &mut tx,
-        astral_db::DeltaEventClaimScope {
-            tenant_id: TENANT,
-            card_id: None,
-        },
-        &identity(TENANT, "CARD", 4001),
-        "worker-a",
-        120,
-    )
-    .await
-    .expect("claim after reclaim")
-    .expect("reclaimed event must be claimable");
-    tx.commit().await.expect("claim commit");
-    assert_eq!(claim.event_id, "evt-reclaim-4001");
-    assert_eq!(
-        claim.attempts, 7,
-        "install bumps the durable attempt counter"
-    );
-
-    // The sibling WITHOUT the marker is untouched: reclaim on its partition
-    // pulls zero rows and the row stays parked in the future window.
-    let untouched =
-        astral_db::reclaim_budget_exhausted_events(&pool, &identity(TENANT, "CARD", 4002))
-            .await
-            .expect("reclaim on non-exhausted partition");
-    assert_eq!(
-        untouched, 0,
-        "rows without the exhaustion marker match nothing"
-    );
-    let still_parked: i64 = sqlx::query(
-        "SELECT COUNT(*) AS c FROM authorization_delta_event          WHERE event_id = 'evt-reclaim-4002'            AND next_attempt_at > UTC_TIMESTAMP()",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("parked count")
-    .get("c");
-    assert_eq!(still_parked, 1, "the non-exhausted row keeps its backoff");
-
-    cleanup_partition(&pool, TENANT, 4001).await;
-    cleanup_partition(&pool, TENANT, 4002).await;
+        .expect("cleanup only source-owned fixture after owned failure transitions");
 }

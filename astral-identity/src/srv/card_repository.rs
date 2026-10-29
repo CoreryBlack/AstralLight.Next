@@ -1926,7 +1926,7 @@ async fn append_initial_rule_set_projection_in_tx(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 投影与审计写入（全部在调用方 source transaction 内，不 commit、不触 Redis/MQ）
+// 投影与审计写入（全部在调用方 source transaction 内，不 commit、不触 MQ/网络）
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// 追加携带可信 actor/operation 元数据的投影事件（CARD/RULE_SET 通用）。

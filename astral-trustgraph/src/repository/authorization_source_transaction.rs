@@ -449,10 +449,9 @@ impl AuthorizationSourceTransaction {
         .await
     }
 
-    /// 可注入两类 dispatcher 的 legacy `commit_consuming`（测试用）。
-    ///
-    /// 投递次序：commit 证明后**先 projection delta**（投影先追平），**后
-    /// invalidation（再失效读取门）；两者都只有 commit 被证明才发送。
+    /// Commit through injected dispatchers, then observe exact durable completion.
+    /// Dispatch order is projection delta followed by invalidation; dispatch
+    /// admission never proves projection completion.
     pub(crate) async fn commit_consuming_with_dispatchers<
         P: ProjectionDeltaDispatcher,
         D: InvalidationDispatcher,
@@ -468,15 +467,7 @@ impl AuthorizationSourceTransaction {
                 invalidation_dispatcher,
             )
             .await?;
-        if astral_db::projection_execution_mode() == astral_db::ProjectionExecutionMode::WorkerOwned
-        {
-            crate::service::sync_publish::after_commit_sync_publish_with_receipts(
-                &pool,
-                Vec::new(),
-                receipts,
-            )
-            .await;
-        }
+        crate::service::sync_publish::after_commit_wait_for_projection(&pool, &receipts).await;
         Ok(())
     }
 
@@ -881,7 +872,7 @@ mod tests {
             delta_json: "{\"delta\":\"x\"}".into(),
             semantic_hash_hex: "a".repeat(64),
             dependency_hash_hex: "b".repeat(64),
-            compiler_version: "test".into(),
+            compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.into(),
             next_attempt_at: None,
         }
     }

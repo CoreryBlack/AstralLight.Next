@@ -1,7 +1,6 @@
 //! 共享 Tower 中间件
 //!
 //! - `decode_v2_token` / `JwtClaims` — v2 JWT 解码与 claims 结构（Identity 与 Gateway 共享）
-//! - `require_permission` — 权限检查工具函数
 //! - `tenant_filter` — SQLx 自动 tenant_id 过滤工具（SQL 重写 + TenantScopedQuery）
 //!
 //! Gateway 专属运行时（`sanitize_internal_auth_headers`、`jwt_auth_middleware`、
@@ -97,6 +96,7 @@ fn validated_refresh_claims(claims: &JwtClaims) -> Result<(), &'static str> {
         || claims.template_id.is_some()
         || claims.structure_node_id.is_some()
         || claims.tenant_status.is_some()
+        // Retained only so v2 REFRESH decoding can reject injected authorization context.
         || claims.permissions.is_some()
         || !claims.roles.is_empty()
     {
@@ -157,32 +157,6 @@ pub fn decode_v2_token(
     Ok((claims, token_type))
 }
 
-fn deserialize_roles<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-        serde_json::Value::String(value) => Ok(value
-            .split(',')
-            .map(str::trim)
-            .filter(|role| !role.is_empty())
-            .map(ToOwned::to_owned)
-            .collect()),
-        serde_json::Value::Array(values) => values
-            .into_iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(ToOwned::to_owned)
-                    .ok_or_else(|| serde::de::Error::custom("roles must contain strings"))
-            })
-            .collect(),
-        serde_json::Value::Null => Ok(Vec::new()),
-        _ => Err(serde::de::Error::custom("roles must be a string or array")),
-    }
-}
-
 /// JWT Claims v2 shared by Gateway and Rust Identity.
 ///
 /// The non-default version/profile fields intentionally make legacy JWTs fail
@@ -197,11 +171,7 @@ pub struct JwtClaims {
     pub audience: String,
     pub sub: String,
     pub jti: String,
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "deserialize_roles"
-    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
     #[serde(rename = "tokenUse")]
     pub token_use: String,
@@ -221,8 +191,8 @@ pub struct JwtClaims {
     pub structure_node_id: Option<i64>,
     #[serde(rename = "tenantStatus", skip_serializing_if = "Option::is_none")]
     pub tenant_status: Option<String>,
-    /// Deprecated in the v2 wire contract; retained internally only for the
-    /// permission response path and never populated on REFRESH tokens.
+    /// Deprecated v2 claim retained for decoding older tokens; never used for
+    /// authorization or emitted on new tokens. REFRESH tokens must omit it.
     #[serde(default, skip_serializing)]
     pub permissions: Option<Vec<String>>,
     #[serde(rename = "sid")]
@@ -241,6 +211,24 @@ pub struct JwtClaims {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roles_claim_accepts_only_canonical_arrays() {
+        let canonical = serde_json::to_value(claims("42")).unwrap();
+        for rejected in [
+            serde_json::json!("USER,manager"),
+            serde_json::Value::Null,
+            serde_json::json!(["USER", 1]),
+        ] {
+            let mut value = canonical.clone();
+            value["roles"] = rejected;
+            assert!(serde_json::from_value::<JwtClaims>(value).is_err());
+        }
+        let mut array = canonical;
+        array["roles"] = serde_json::json!(["USER", "manager"]);
+        let decoded: JwtClaims = serde_json::from_value(array).unwrap();
+        assert_eq!(decoded.roles, vec!["USER", "manager"]);
+    }
 
     #[test]
     fn jwt_algorithm_rejects_everything_except_supported_algorithms() {

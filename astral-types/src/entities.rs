@@ -158,27 +158,6 @@ pub struct UserCardTemplate {
     pub updated_at: Option<String>,
 }
 
-/// 身份等级模板（对齐 `platform_v4.identity_level_template`，已废弃于 user_card 权限模型）
-#[deprecated(note = "user_card 权限不再基于身份等级模板，仅用于数据兼容")]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentityLevelTemplate {
-    pub template_id: Option<i64>,
-    pub template_code: String,
-    pub template_name: String,
-    pub domain_id: i64,
-    pub principal_type: Option<String>,
-    pub grant_type: Option<String>,
-    pub level_no: i32,
-    pub user_card_template_id: Option<i64>,
-    pub status: Option<String>,
-    pub version_no: Option<i32>,
-    pub force_cover: Option<bool>,
-    pub description: Option<String>,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-}
-
 /// 权限规则模板条目（对齐 `platform_v4.permission_rule_template`）
 ///
 /// 模板级规则定义，发放时实例化到 `permission_rule` 表。
@@ -196,31 +175,6 @@ pub struct PermissionRuleTemplate {
     pub enabled: Option<bool>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
-}
-
-/// Legacy card-to-rule-set reference shape kept for public compatibility.
-///
-/// The canonical active-schema source shape is `CardRuleSetBinding` from the
-/// `rule_set` module. This type retains its historical fields and wire shape;
-/// it is not the canonical repository model.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CardRuleSetRef {
-    pub id: Option<i64>,
-    pub card_id: i64,
-    pub rule_set_id: i64,
-    pub ref_type: String, // BASE | OVERLAY
-}
-
-/// 角色定义（已废弃于规则模型，仅用于数据兼容）
-#[deprecated(note = "权限模型已迁移到 RuleSet 规则模式")]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DomainRole {
-    pub id: Option<i64>,
-    pub domain_id: i64,
-    pub role_name: String,
-    pub role_code: String,
 }
 
 // ===== P0 实体（被迁移差距修复直接依赖）=====
@@ -345,59 +299,7 @@ pub struct MfaAttemptLog {
     pub failure_reason: Option<String>,
 }
 
-// ===== P2 补充实体（I-3: 补齐缺失的关键实体，对齐 Java 对应类型）=====
-//
-// Java 基线对照: AstralGeneral/entity/platform/ 下 ~34 个实体
-// Rust 原 18 个 → 现补充 6 个关键实体 → 共 24 个
-
-/// Legacy RuleSet container shape kept for public compatibility.
-///
-/// The canonical active-schema source shape is `RuleSetDefinition` from the
-/// `rule_set` module. This type retains its historical fields and wire shape;
-/// it is not the canonical repository model.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RuleSet {
-    pub id: Option<i64>,
-    pub name: String,
-    pub ref_type: String, // BASE | OVERLAY
-    pub description: Option<String>,
-    pub is_active: bool,
-    pub version: i64,
-    pub created_at: Option<i64>,
-    pub updated_at: Option<i64>,
-}
-
-/// Legacy RuleSet entry shape kept for public compatibility.
-///
-/// The canonical active-schema source shape is `RuleSetEntryDefinition` from
-/// the `rule_set` module. This type retains its historical fields and wire
-/// shape; it is not the canonical repository model.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RuleSetEntry {
-    pub id: Option<i64>,
-    pub rule_set_id: i64,
-    pub effect: String, // ALLOW | DENY
-    pub resource: Option<String>,
-    pub action: Option<String>,
-    pub condition_json: Option<String>,
-    pub priority: i32,
-    pub created_at: Option<i64>,
-}
-
-/// 规则集快照（对齐 Java RuleSetSnapshot）
-///
-/// Java 基线: AstralGeneral/entity/platform/RuleSetSnapshot.java
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RuleSetSnapshotEntity {
-    pub id: Option<i64>,
-    pub rule_set_id: i64,
-    pub is_active: bool,
-    pub version: i64,
-    pub created_at: Option<i64>,
-}
+// ===== P2 supplemental entities (current shared records only) =====
 
 /// SoD 职责分离策略（对齐 Java SodPolicy）
 ///

@@ -2,10 +2,13 @@ use super::*;
 use crate::grant_repository::DELTA_STATUS_QUARANTINED;
 use astral_types::{
     BindingLayer, DomainScopeRequirement, GrantEffect, GrantId, GrantProvenance, GrantRevision,
-    GrantSourceKind, GrantState, TenantScope, ValidityWindow, AUTHORIZATION_EDITION,
-    AUTHORIZATION_MANIFEST_DIGEST_DOMAIN, AUTHORIZATION_SEGMENT_DEPENDENCY_DOMAIN,
-    AUTHORIZATION_SEGMENT_FORMAT, AUTHORIZATION_SEGMENT_SEMANTIC_DOMAIN,
+    GrantSourceKind, GrantState, TenantScope, ValidityWindow, AUTHORIZATION_COMPILER_VERSION,
+    AUTHORIZATION_EDITION, AUTHORIZATION_MANIFEST_DIGEST_DOMAIN,
+    AUTHORIZATION_SEGMENT_DEPENDENCY_DOMAIN, AUTHORIZATION_SEGMENT_FORMAT,
+    AUTHORIZATION_SEGMENT_SEMANTIC_DOMAIN,
 };
+
+const CURRENT_COMPILER: &str = AUTHORIZATION_COMPILER_VERSION;
 
 /// 维度守卫测试的“字段名 + 篡改函数”用例（type_complexity 别名）。
 type DimensionCase<'a, T> = (&'a str, Box<dyn Fn(&mut T) + 'a>);
@@ -16,7 +19,7 @@ const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 /// 源码锚定守卫：source-freshness 门（撤权类未发布 delta 探针）只允许
 /// 出现在正式证据读入口（`load_published_card_grant_evidence_in_tx`）。
 /// projector 的 frontier/发布路径（`read_published_authorization_state_in_tx`
-/// / `load_published_aggregate_frontier_in_tx` / `project_authorization_delta_in_tx`）
+/// / `load_published_aggregate_frontier_in_tx` / `project_owned_authorization_delta_in_tx`）
 /// 在发布时自身 delta 尚未 `SUCCEEDED`——若经过探针会被自己自锁，永远
 /// 无法发布。该不变式由本测试钉死，防止未来重构误接线。另钉两个语义：
 /// 探针必须是非锁定读（锁定读会与发布者在 delta 行锁上互饿——P3 风暴
@@ -95,16 +98,27 @@ fn source_freshness_gate_is_reader_only_and_never_on_projector_paths() {
     );
 
     // projector 路径：任何函数体都不得引用探针。
-    for projector_fn in [
-        "pub async fn read_published_authorization_state_in_tx",
-        "pub async fn load_published_aggregate_frontier_in_tx",
-        "pub async fn project_authorization_delta_in_tx",
-        "pub async fn publish_current_pointer_in_tx",
+    let owned_source = include_str!("../projection_execution/publication.rs");
+    let owned_production = owned_source.split("#[cfg(test)]").next().unwrap();
+    for (source, projector_fn) in [
+        (
+            production,
+            "pub async fn read_published_authorization_state_in_tx",
+        ),
+        (
+            production,
+            "pub async fn load_published_aggregate_frontier_in_tx",
+        ),
+        (production, "pub(super) async fn project_delta_core_in_tx"),
+        (
+            owned_production,
+            "pub async fn project_owned_authorization_delta_in_tx",
+        ),
     ] {
-        let body = production
+        let body = source
             .split(projector_fn)
             .nth(1)
-            .and_then(|body| body.split("\npub ").next())
+            .and_then(|body| body.split("\n}").next())
             .unwrap_or_else(|| panic!("{projector_fn} must exist"));
         assert!(
             !body.contains("card_has_unsafe_pending_delta_in_tx"),
@@ -165,7 +179,7 @@ fn digest_input<'a>(digest_hexes: Vec<String>) -> ManifestDigestInput<'a> {
         operation_id: "op-stage",
         semantic_hash_hex: HASH_A,
         dependency_hash_hex: HASH_B,
-        compiler_version: "phase2-authorization-kernel-v1",
+        compiler_version: CURRENT_COMPILER,
         parent_manifest_id: Some(2),
         revoke_fence: 1,
         segment_content_digests_hex: digest_hexes,
@@ -517,7 +531,7 @@ fn ready_target(generation: u64, manifest_id: i64) -> TargetManifestView {
         status_str: MANIFEST_STATUS_READY.to_owned(),
         semantic_hash_hex: HASH_A.to_owned(),
         dependency_hash_hex: HASH_B.to_owned(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         reference_count: 1,
     }
 }
@@ -529,7 +543,7 @@ fn publish_validation_happy_path_and_first_publication_gate() {
         current_pointer: None,
         expected_target_semantic_hash_hex: HASH_A.to_owned(),
         expected_target_dependency_hash_hex: HASH_B.to_owned(),
-        expected_target_compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        expected_target_compiler_version: CURRENT_COMPILER.to_owned(),
     };
     assert!(validate_manifest_publish(&expectation, &target).is_ok());
 
@@ -567,7 +581,7 @@ fn publish_validation_fails_closed_on_target_deviations() {
         current_pointer: None,
         expected_target_semantic_hash_hex: HASH_A.to_owned(),
         expected_target_dependency_hash_hex: HASH_B.to_owned(),
-        expected_target_compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        expected_target_compiler_version: CURRENT_COMPILER.to_owned(),
     };
 
     // Target not READY.
@@ -611,6 +625,20 @@ fn publish_validation_fails_closed_on_target_deviations() {
     };
     let error = validate_manifest_publish(&drifted, &target).unwrap_err();
     assert!(
+        matches!(error, AuthorizationProjectionError::Corrupt(ref message)
+            if message.contains("non_current_publish_target_compiler"))
+    );
+    let mut drifted_target = target;
+    drifted_target.compiler_version = "astral-authorization-v5".to_owned();
+    let error = validate_manifest_publish(
+        &AuthorizationPublishExpectation {
+            expected_target_compiler_version: CURRENT_COMPILER.to_owned(),
+            ..drifted
+        },
+        &drifted_target,
+    )
+    .unwrap_err();
+    assert!(
         matches!(error, AuthorizationProjectionError::ManifestPublishConflict(ref message)
             if message.contains("publish_target_compiler_mismatch"))
     );
@@ -635,7 +663,7 @@ fn publish_validation_fails_closed_on_pointer_chain_breaks() {
             current_pointer: pointer_view,
             expected_target_semantic_hash_hex: HASH_A.to_owned(),
             expected_target_dependency_hash_hex: HASH_B.to_owned(),
-            expected_target_compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+            expected_target_compiler_version: CURRENT_COMPILER.to_owned(),
         };
 
     // Generation gap between pointer and target.
@@ -687,7 +715,7 @@ fn publish_validation_rejects_card_scope_splits() {
             current_pointer: pointer_view,
             expected_target_semantic_hash_hex: HASH_A.to_owned(),
             expected_target_dependency_hash_hex: HASH_B.to_owned(),
-            expected_target_compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+            expected_target_compiler_version: CURRENT_COMPILER.to_owned(),
         };
 
     // Card-scoped pointer reading back against a NULL-scoped target.
@@ -869,7 +897,7 @@ fn resumed_reference_equivalence_requires_full_field_agreement() {
         content_digest: Sha256Digest::from_hex(HASH_A).unwrap(),
         semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap(),
         dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON.to_owned(),
         row_count: 2,
         byte_size: 128,
@@ -1083,28 +1111,22 @@ fn pointer_statements_propagate_card_scope_and_promotion_clears_lease() {
 }
 
 #[test]
-fn lease_statements_guard_owner_token_liveness_and_status() {
-    for (statement, status_fragment) in [
-        (MANIFEST_HEARTBEAT_SQL, None),
-        (MANIFEST_HEARTBEAT_WITH_CAS_SQL, None),
-        (MANIFEST_RELEASE_SQL, Some("AND status = 'BUILDING'")),
-        (
-            MANIFEST_QUARANTINE_SQL,
-            Some("status IN ('BUILDING', 'READY')"),
-        ),
+fn manifest_claim_and_finalize_pin_live_owner_token_and_cas() {
+    let statement = MANIFEST_FINALIZE_SQL;
+    assert!(statement.contains("AND lease_owner = ?"));
+    assert!(statement.contains("AND lease_token_hash = ?"));
+    assert!(statement.contains("AND cas_version = ?"));
+    assert!(statement.contains("lease_expires_at > UTC_TIMESTAMP()"));
+    assert!(statement.contains("status = 'BUILDING'"));
+    for dimension in [
+        "AND cas_version = ?",
+        "AND revoke_fence = ?",
+        "AND semantic_hash = ?",
+        "AND dependency_hash = ?",
+        "AND compiler_version = ?",
+        "status = 'READY'",
     ] {
-        assert!(statement.contains("AND lease_owner = ?"), "{statement}");
-        assert!(
-            statement.contains("AND lease_token_hash = ?"),
-            "{statement}"
-        );
-        assert!(
-            statement.contains("lease_expires_at > UTC_TIMESTAMP()"),
-            "{statement}"
-        );
-        if let Some(fragment) = status_fragment {
-            assert!(statement.contains(fragment));
-        }
+        assert!(MANIFEST_PROMOTE_SQL.contains(dimension), "{dimension}");
     }
     // Only hashed tokens ever travel into statements.
     assert!(!MANIFEST_CLAIM_INSTALL_SQL.contains("lease_token ="));
@@ -1473,7 +1495,7 @@ fn compiler_plan_bridge_maps_changed_segments_only() {
         1,
         HASH_A,
         HASH_B,
-        "phase2-authorization-kernel-v1",
+        CURRENT_COMPILER,
         &plan,
     )
     .unwrap();
@@ -1517,7 +1539,7 @@ fn compiler_plan_bridge_maps_changed_segments_only() {
             1,
             HASH_A,
             HASH_B,
-            "phase2-authorization-kernel-v1",
+            CURRENT_COMPILER,
             &empty_evidence,
         ),
         Err(AuthorizationProjectionError::Mapping(ref message))
@@ -1548,7 +1570,7 @@ fn build_claimed_event() -> (ClaimedDeltaEvent, DeltaLeaseIdentity) {
         delta_json,
         semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap(),
         dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         attempts: 1,
         cas_version: 4,
         lease_owner: "worker-x".to_owned(),
@@ -1908,7 +1930,7 @@ fn pointer_record(generation: u64, manifest_id: i64) -> AuthorizationCurrentPoin
         operation_id: "parent-op".to_owned(),
         semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap(),
         dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         revoke_fence: 2,
         revoke_fence_proven: true,
         cas_version: 12,
@@ -1945,7 +1967,7 @@ fn archive_raw_row() -> ArchiveOutboxRawSqlRow {
         archive_key: "astral-auth-archive/v1/7/CARD/17/generation-3".to_owned(),
         semantic_hash: vec![1u8; 32],
         dependency_hash: vec![2u8; 32],
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         archived_revoke_fence: 2,
         status: "PENDING".to_owned(),
         attempts: 0,
@@ -2183,7 +2205,7 @@ fn shaped_stage() -> AuthorizationStageRequest {
         operation_id: "op-delta".to_owned(),
         semantic_hash_hex: HASH_A.to_owned(),
         dependency_hash_hex: HASH_B.to_owned(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         revoke_fence: 2,
         segments: vec![StagedSegmentContent::New(vec![grant(1)])],
     }
@@ -2201,7 +2223,7 @@ fn shaped_plan() -> AuthorizationImpactPlanAppendRequest {
         target_version: 1,
         semantic_hash_hex: HASH_A.to_owned(),
         dependency_hash_hex: HASH_B.to_owned(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         items: vec![impact_item_upsert("{\"action\":\"read\",\"cardId\":17}")],
     }
 }
@@ -2220,7 +2242,7 @@ fn shaped_command() -> DeltaProjectorPublishCommand {
             source_generation: 5,
             semantic_hash_hex: HASH_A.to_owned(),
             dependency_hash_hex: HASH_B.to_owned(),
-            compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+            compiler_version: CURRENT_COMPILER.to_owned(),
         },
         fences: PublishRevokeFenceEvidence {
             previous_revoke_fence: 2,
@@ -2355,13 +2377,13 @@ fn sealed_snapshot(
 #[test]
 fn segment_local_seals_bind_every_immutable_dimension_and_stay_generation_invariant() {
     let identity = identity();
-    let snapshot = sealed_snapshot(&identity, Some(17), "compiler-v1", &[grant(1)], 9);
+    let snapshot = sealed_snapshot(&identity, Some(17), CURRENT_COMPILER, &[grant(1)], 9);
 
     // Deterministic: recomputation reproduces both seals exactly.
     let recomputed = segment_local_seal_pair(
         &identity,
         Some(17),
-        "compiler-v1",
+        CURRENT_COMPILER,
         snapshot.row_count,
         &snapshot.content_digest,
     )
@@ -2391,18 +2413,24 @@ fn segment_local_seals_bind_every_immutable_dimension_and_stay_generation_invari
             "tenant" => drifted_input(
                 &ProjectionAggregateIdentity::new(8, "CARD", 17).unwrap(),
                 Some(17),
-                "compiler-v1",
+                CURRENT_COMPILER,
                 1,
                 &snapshot.content_digest,
             ),
             "aggregate" => drifted_input(
                 &ProjectionAggregateIdentity::new(7, "CARD", 18).unwrap(),
                 Some(17),
-                "compiler-v1",
+                CURRENT_COMPILER,
                 1,
                 &snapshot.content_digest,
             ),
-            "card" => drifted_input(&identity, None, "compiler-v1", 1, &snapshot.content_digest),
+            "card" => drifted_input(
+                &identity,
+                None,
+                CURRENT_COMPILER,
+                1,
+                &snapshot.content_digest,
+            ),
             "compiler" => drifted_input(
                 &identity,
                 Some(17),
@@ -2413,14 +2441,14 @@ fn segment_local_seals_bind_every_immutable_dimension_and_stay_generation_invari
             "row_count" => drifted_input(
                 &identity,
                 Some(17),
-                "compiler-v1",
+                CURRENT_COMPILER,
                 2,
                 &snapshot.content_digest,
             ),
             _ => drifted_input(
                 &identity,
                 Some(17),
-                "compiler-v1",
+                CURRENT_COMPILER,
                 1,
                 &Sha256Digest::from_hex(HASH_B).unwrap(),
             ),
@@ -2444,7 +2472,7 @@ fn segment_local_seals_reject_legacy_domains_and_bind_current_domains_independen
     let input = SegmentLocalSealInput {
         identity: &identity,
         card_id: Some(17),
-        compiler_version: "compiler-v1",
+        compiler_version: CURRENT_COMPILER,
         segment_format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON,
         row_count: 1,
         content_digest: &content_digest,
@@ -2494,7 +2522,7 @@ fn segment_local_seals_reject_legacy_domains_and_bind_current_domains_independen
 #[test]
 fn verify_segment_local_seal_refuses_tampered_metadata_fail_closed() {
     let identity = identity();
-    let base = sealed_snapshot(&identity, Some(17), "compiler-v1", &[grant(1)], 9);
+    let base = sealed_snapshot(&identity, Some(17), CURRENT_COMPILER, &[grant(1)], 9);
     verify_segment_local_seal(&base).unwrap();
 
     // Tampering ANY local dimension without recomputing the seals is
@@ -2648,7 +2676,7 @@ fn identical_segment_verification_reports_compiler_stamp_divergence_as_its_own_c
 #[test]
 fn generation_delta_reuses_unchanged_segments_and_writes_only_the_changed_one() {
     let identity = identity();
-    let compiler = "phase2-authorization-kernel-v1";
+    let compiler = CURRENT_COMPILER;
 
     // Generation 1: three NEW segments A / B / C.
     let grants_a = vec![grant(1)];
@@ -2760,7 +2788,7 @@ fn generation_delta_reuses_unchanged_segments_and_writes_only_the_changed_one() 
 #[test]
 fn parent_chain_verification_pins_the_parents_own_global_hashes_only() {
     let identity = identity();
-    let compiler = "phase2-authorization-kernel-v1";
+    let compiler = CURRENT_COMPILER;
     let snap_a = sealed_snapshot(&identity, Some(17), compiler, &[grant(1)], 201);
     let snap_b = sealed_snapshot(&identity, Some(17), compiler, &[grant(2)], 202);
 
@@ -2896,7 +2924,7 @@ fn archive_digest_input<'a>(
         archived_revoke_fence: 2,
         semantic_hash: semantic,
         dependency_hash: dependency,
-        compiler_version: "phase2-authorization-kernel-v1",
+        compiler_version: CURRENT_COMPILER,
         manifest_chain_digest: chain,
     }
 }
@@ -3025,7 +3053,7 @@ fn archive_manifest_raw_row(
         archive_digest: sha256_digest_bytes(b"archive").to_vec(),
         semantic_hash: sha256_digest_bytes(b"semantic").to_vec(),
         dependency_hash: sha256_digest_bytes(b"dependency").to_vec(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         archived_revoke_fence: 2,
         status: status.to_owned(),
         cas_version: 1,
@@ -3094,7 +3122,7 @@ fn succeeded_outbox_record() -> AuthorizationArchiveOutboxRecord {
         archive_key: "astral-auth-archive/v1/7/CARD/17/generation-3".to_owned(),
         semantic_hash: Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"semantic")),
         dependency_hash: Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"dependency")),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         archived_revoke_fence: 2,
         status: AuthorizationArchiveOutboxStatus::Leased,
         attempts: 1,
@@ -3117,7 +3145,7 @@ fn archiving_proof_record(
         archive_key: "astral-auth-archive/v1/7/CARD/17/generation-3".to_owned(),
         semantic_hash: Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"semantic")),
         dependency_hash: Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"dependency")),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         archived_revoke_fence: 2,
         archive_digest: Sha256Digest::from_raw_bytes(sha256_digest_bytes(b"sealed")),
         status: AuthorizationArchiveManifestStatus::Archived,
@@ -3211,7 +3239,7 @@ fn frontier_identity() -> ProjectionAggregateIdentity {
     ProjectionAggregateIdentity::new(7, "CARD", 17).unwrap()
 }
 
-const FRONTIER_COMPILER: &str = "phase2-authorization-kernel-v1";
+const FRONTIER_COMPILER: &str = CURRENT_COMPILER;
 
 fn frontier_pointer(
     generation: u64,
@@ -3404,6 +3432,58 @@ fn published_frontier_assembles_contiguous_chain_with_event_mapping() {
     );
     assert_eq!(frontier.frontier_generation("e-g2"), Some(2));
     assert_eq!(frontier.frontier_generation("absent"), None);
+}
+
+#[test]
+fn published_frontier_rejects_non_current_compilers_even_when_all_rows_agree() {
+    for compiler in [
+        "astral-authorization-v5",
+        "astral-authorization-v7",
+        "foreign-v6",
+    ] {
+        let (identity, mut pointer, mut manifest, mut plans, mut deltas) = happy_frontier_inputs();
+        pointer.compiler_version = compiler.to_owned();
+        manifest.compiler_version = compiler.to_owned();
+        for plan in &mut plans {
+            plan.compiler_version = compiler.to_owned();
+        }
+        for delta in deltas.values_mut() {
+            delta.compiler_version = compiler.to_owned();
+        }
+        assert!(assemble_published_aggregate_frontier(
+            &identity,
+            &pointer,
+            &manifest,
+            &plans,
+            &deltas,
+            &[],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("non_current"));
+
+        let mut imported = assemble_happy();
+        imported.events[0].compiler_version = compiler.to_owned();
+        assert!(imported
+            .validate_publication_stamp()
+            .unwrap_err()
+            .to_string()
+            .contains("non_current_frontier_event_compiler"));
+        let (identity, pointer, manifest, mut plans, mut deltas) = happy_frontier_inputs();
+        plans[0].compiler_version = compiler.to_owned();
+        deltas.get_mut("e-g1").unwrap().compiler_version = compiler.to_owned();
+        assert!(assemble_published_aggregate_frontier(
+            &identity,
+            &pointer,
+            &manifest,
+            &plans,
+            &deltas,
+            &[],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("non_current_frontier_plan_compiler"));
+    }
 }
 
 #[test]
@@ -3809,7 +3889,7 @@ fn evidence_pointer(
         operation_id: format!("op-{aggregate_type}-{manifest_id}"),
         semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap(),
         dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         revoke_fence: 1,
         revoke_fence_proven: true,
         cas_version: 5,
@@ -3834,7 +3914,7 @@ fn evidence_segment(
         content_digest: Sha256Digest::from_hex(&repeated_hex((segment_id as u8) | 1)).unwrap(),
         semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap(),
         dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON.to_owned(),
         row_count: grants.len() as u64,
         byte_size: 128,
@@ -4491,7 +4571,7 @@ fn archive_parent_row(status: &str) -> ManifestRawSqlRow {
         operation_id: "op-stage".to_owned(),
         semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap().as_bytes().to_vec(),
         dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap().as_bytes().to_vec(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         manifest_digest: Sha256Digest::from_hex(HASH_A).unwrap().as_bytes().to_vec(),
         status: status.to_owned(),
         cas_version: 4,
@@ -4521,7 +4601,7 @@ fn archive_intent_request() -> AuthorizationArchiveIntentAppendRequest {
         archive_key: "astral-auth-archive/v1/7/CARD/17/generation-3".to_owned(),
         semantic_hash_hex: HASH_A.to_owned(),
         dependency_hash_hex: HASH_B.to_owned(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         archived_revoke_fence: 1,
     }
 }
@@ -4682,7 +4762,7 @@ fn archive_live_pointer() -> AuthorizationCurrentPointerRecord {
         operation_id: "op-stage".to_owned(),
         semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap(),
         dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         revoke_fence: 1,
         revoke_fence_proven: true,
         cas_version: 6,
@@ -4812,7 +4892,7 @@ fn archive_intent_pointer_proof_rejects_every_dimension_mismatch_fail_closed() {
 // ── Manifest current-edition digest regressions (pure known answer + sensitivity) ────
 
 const MANIFEST_V6_KNOWN_ANSWER: &str =
-    "ff9cbd3ee8a9d0931838e5625dccd8db1fc59a22af4d0e5ef7143695b8a8af54";
+    "144e5ea80b81787891e20c2a14ab56c4c675ce15af5d5b7c008c6e064de3f3a9";
 
 fn digest_input_v6(segments: Vec<String>) -> ManifestDigestInput<'static> {
     ManifestDigestInput {
@@ -4828,7 +4908,7 @@ fn digest_input_v6(segments: Vec<String>) -> ManifestDigestInput<'static> {
         operation_id: "op-stage",
         semantic_hash_hex: HASH_A,
         dependency_hash_hex: HASH_B,
-        compiler_version: "phase2-authorization-kernel-v1",
+        compiler_version: CURRENT_COMPILER,
         parent_manifest_id: Some(2),
         revoke_fence: 1,
         segment_content_digests_hex: segments,
@@ -4859,7 +4939,7 @@ fn manifest_digest_v6_known_answer_pins_domain_encoding() {
             "000000086f702d7374616765",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "0000001e7068617365322d617574686f72697a6174696f6e2d6b65726e656c2d7631",
+            "0000001761737472616c2d617574686f72697a6174696f6e2d7636",
             "01",
             "0000000000000002",
             "0000000000000001",
@@ -5065,7 +5145,7 @@ fn first_publication_rejects_sealed_parent_lineage_fail_closed() {
         current_pointer: None,
         expected_target_semantic_hash_hex: HASH_A.to_owned(),
         expected_target_dependency_hash_hex: HASH_B.to_owned(),
-        expected_target_compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        expected_target_compiler_version: CURRENT_COMPILER.to_owned(),
     };
     let mut target = ready_target(1, 500);
     target.parent_manifest_id = Some(400);
@@ -5090,7 +5170,7 @@ fn archive_proof_request() -> AuthorizationArchiveProofRequest {
         archive_key: "astral-auth-archive/v1/7/CARD/17/generation-3".to_owned(),
         semantic_hash_hex: HASH_A.to_owned(),
         dependency_hash_hex: HASH_B.to_owned(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         archived_revoke_fence: 1,
         manifest_chain_digest_hex: HASH_A.to_owned(),
     }
@@ -5255,7 +5335,7 @@ fn rehearsal_expectation() -> AuthorizationFenceProofRehearsalExpectation {
         generation: 1,
         semantic_hash_hex: HASH_A.to_owned(),
         dependency_hash_hex: HASH_B.to_owned(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         revoke_fence: 0,
         cas_version: 4,
     }
@@ -5285,7 +5365,7 @@ fn rehearsal_pointer(revoke_fence_proven: bool) -> AuthorizationCurrentPointerRe
         operation_id: "op-stage".to_owned(),
         semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap(),
         dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         revoke_fence: 0,
         revoke_fence_proven,
         cas_version: 4,
@@ -5308,7 +5388,7 @@ fn rehearsal_manifest_row(status: &str) -> ManifestRawSqlRow {
         operation_id: "op-stage".to_owned(),
         semantic_hash: Sha256Digest::from_hex(HASH_A).unwrap().as_bytes().to_vec(),
         dependency_hash: Sha256Digest::from_hex(HASH_B).unwrap().as_bytes().to_vec(),
-        compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        compiler_version: CURRENT_COMPILER.to_owned(),
         manifest_digest: Sha256Digest::from_hex(HASH_A).unwrap().as_bytes().to_vec(),
         status: status.to_owned(),
         cas_version: 4,
@@ -5519,7 +5599,7 @@ fn publish_readback_request() -> AuthorizationPublishRequest {
         current_pointer: None,
         expected_target_semantic_hash_hex: HASH_A.to_owned(),
         expected_target_dependency_hash_hex: HASH_B.to_owned(),
-        expected_target_compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+        expected_target_compiler_version: CURRENT_COMPILER.to_owned(),
         fences: PublishRevokeFenceEvidence {
             previous_revoke_fence: 0,
             new_revoke_fence: 5,

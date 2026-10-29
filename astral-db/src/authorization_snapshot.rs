@@ -66,9 +66,6 @@ use crate::local_projection_snapshot::{
 // Bounds and format version
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Retired payload version retained as a public identifier for rejection diagnostics.
-/// Runtime readers and writers use [`SNAPSHOT_PAYLOAD_VERSION`] exclusively.
-pub const SNAPSHOT_PAYLOAD_VERSION_V2: u32 = 2;
 /// Current payload schema version, shared with the authorization edition.
 pub const SNAPSHOT_PAYLOAD_VERSION: u32 = astral_types::AUTHORIZATION_EDITION as u32;
 

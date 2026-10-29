@@ -26,11 +26,9 @@ pub struct Organization {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Domain {
     pub id: Option<i64>,
-    /// platform_v4 无 org_id 列，保留为 Option 用于前端兼容（始终为 None）。
-    pub org_id: Option<i64>,
     pub name: String,
     pub code: Option<String>,
     pub status: String,
@@ -38,15 +36,11 @@ pub struct Domain {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Tenant {
     pub id: Option<i64>,
-    /// platform_v4.tenant 无 domain_id 列，保留为 i64 占位（始终为 0）。
-    pub domain_id: i64,
     pub name: String,
     pub code: String,
-    /// platform_v4.tenant 无 org_id 列，保留为 Option 用于前端兼容。
-    pub org_id: Option<i64>,
     pub status: String,
     pub created_at: Option<String>,
 }
@@ -162,7 +156,6 @@ impl OrgService {
             .await?;
         Ok(Domain {
             id: Some(id),
-            org_id: None,
             created_at: Some(now_rfc3339()),
             ..req.clone()
         })
@@ -179,7 +172,6 @@ impl OrgService {
             .await?;
         Ok(Domain {
             id: Some(id),
-            org_id: None,
             created_at: Some(now_rfc3339()),
             ..req.clone()
         })
@@ -340,7 +332,6 @@ fn organization_from_record(r: crate::srv::org_repository::OrganizationRecord) -
 fn domain_from_record(r: crate::srv::org_repository::DomainRecord) -> Domain {
     Domain {
         id: Some(r.id),
-        org_id: None,
         name: r.name,
         code: r.code,
         status: r.status,
@@ -351,10 +342,8 @@ fn domain_from_record(r: crate::srv::org_repository::DomainRecord) -> Domain {
 fn tenant_from_record(r: crate::srv::org_repository::TenantRecord) -> Tenant {
     Tenant {
         id: Some(r.id),
-        domain_id: 0,
         name: r.name,
         code: r.code,
-        org_id: None,
         status: r.status,
         created_at: r.created_at,
     }

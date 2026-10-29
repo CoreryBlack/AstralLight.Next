@@ -3531,6 +3531,7 @@ mod tests {
             card_id: 21,
             user_id: 42,
             tenant_id: Some(7),
+            card_tenant_id: Some(7),
             domain_id: Some(11),
             resource_type: "learn_course".into(),
             resource_id: None,

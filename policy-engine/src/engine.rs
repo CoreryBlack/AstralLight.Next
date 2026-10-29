@@ -1,12 +1,9 @@
 //! PolicyEngine 评估引擎
 //!
-//! 三层评估主入口，对齐 Java MergeSemantics.evaluateFormal 正式规范：
-//! L1: RuleSet（OVERLAY > BASE，每层内 DENY-OVERRIDES）
-//! L2: PermissionRule 回退
-//! L3: DEFAULT_DENY（fail-closed）
+//! CURRENT V6 published-evidence authorization evaluator.
 //!
-//! 评估链（对齐 Java PolicyEngine.evaluate()）：
-//! AUTHN → CARD_CONTEXT → RULESET(OVERLAY>BASE) → PERMISSION_RULE → DEFAULT_DENY
+//! Evaluation is fail-closed and consumes only strict published evidence after
+//! AUTHN, CARD_CONTEXT, target ownership, ORG_SCOPE, and GlobalAdmin gates.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,13 +17,8 @@ mod decision;
 mod formal;
 mod ports;
 mod published;
-mod types;
 
-pub use ports::{published_card_shadow_evidence_is_usable, RuleRepository};
-pub use types::{
-    PermissionRule, ProjectionGate, RuleSetDependencyStatus, RuleSetEntry, RuleSetSnapshot,
-    SnapshotWinner,
-};
+pub use ports::RuleRepository;
 
 /// PolicyEngine（线程安全，ArcSwap 实现运行时配置热更新）
 pub struct PolicyEngine {
@@ -133,7 +125,7 @@ impl PolicyEngine {
         }
     }
 
-    /// 返回全局断路器状态（兼容旧 API）
+    /// 返回全局断路器状态
     pub fn circuit_breaker_state(&self) -> CircuitBreakerState {
         let guard = self
             .circuit_breakers
@@ -160,28 +152,19 @@ impl PolicyEngine {
 
     // ==================== 统计 ====================
 
-    /// 累加单次评估的命中计数与时序数据到全局统计（对齐 Java PolicyEngine 的 AtomicLong 计数器 + 时序字段）
-    ///
-    /// `layer` 表示本次评估命中的层次："L1" / "L2" / "L3"，或 ORG_SCOPE 准入
-    /// 决策的稳定类别 "ORG_AUTHORITY"（见 `ORG_AUTHORITY_EVAL_LAYER`，不冒领
-    /// legacy 层命中；`HitStats` 公共 schema 无专属 ORG 桶，保守计入 l3_hits）。
-    fn record_evaluation(&self, layer: &str, timing: &TimingBreakdown) {
+    /// 累加 CURRENT V6 evidence evaluation 的结果计数与阶段耗时。
+    fn record_evaluation(&self, allowed: bool, timing: &TimingBreakdown) {
         let mut stats = HitStats::clone(self.stats.load().as_ref());
-        match layer {
-            "L1" => stats.l1_hits += 1,
-            "L2" => stats.l2_hits += 1,
-            // ORG_SCOPE 准入决策：稳定类别 ORG_AUTHORITY；公共 schema 无专属
-            // ORG 桶 → 保守映射进终局 fail-closed 层 l3_hits（同未知 layer 兜底）。
-            "ORG_AUTHORITY" => stats.l3_hits += 1,
-            _ => stats.l3_hits += 1,
+        stats.evaluation_count += 1;
+        if allowed {
+            stats.allow_count += 1;
+        } else {
+            stats.deny_count += 1;
         }
-        stats.timing_ns.card_active_check_ns += timing.card_active_check_ns;
-        stats.timing_ns.refs_load_ns += timing.refs_load_ns;
+        stats.timing_ns.card_context_check_ns += timing.card_context_check_ns;
         stats.timing_ns.initial_evidence_load_ns += timing.initial_evidence_load_ns;
         stats.timing_ns.final_evidence_reload_ns += timing.final_evidence_reload_ns;
-        stats.timing_ns.overlay_eval_ns += timing.overlay_eval_ns;
-        stats.timing_ns.base_eval_ns += timing.base_eval_ns;
-        stats.timing_ns.perm_rule_eval_ns += timing.perm_rule_eval_ns;
+        stats.timing_ns.evidence_match_ns += timing.evidence_match_ns;
         stats.timing_ns.total_ns += timing.total_ns;
         self.stats.store(Arc::new(stats));
     }

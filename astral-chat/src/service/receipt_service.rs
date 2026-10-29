@@ -109,7 +109,9 @@ impl ReceiptService {
 mod tests {
     use super::*;
     use crate::repository::member_repository::GroupMemberRecord;
-    use crate::repository::message_repository::MessageRecord;
+    use crate::repository::message_repository::{
+        MessageRecord, PersistedSendIntent, SendIntentClaim, SendIntentRecipient,
+    };
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -319,37 +321,66 @@ mod tests {
             _message_type: &str,
             _content: &str,
             _client_msg_id: &str,
-        ) -> Result<crate::repository::message_repository::PersistedSendIntent, AstralError>
-        {
+        ) -> Result<PersistedSendIntent, AstralError> {
             Err(AstralError::NotImplemented(
                 "send not used in receipt test".into(),
             ))
         }
 
-        async fn insert_message(
+        async fn claim_send_intents(
             &self,
+            _owner: &str,
+            _limit: u32,
+        ) -> Result<Vec<SendIntentClaim>, AstralError> {
+            Ok(vec![])
+        }
+
+        async fn send_intent_recipients(
+            &self,
+            _claim: &SendIntentClaim,
+        ) -> Result<Vec<SendIntentRecipient>, AstralError> {
+            Ok(vec![])
+        }
+
+        async fn complete_send_intent(&self, _claim: &SendIntentClaim) -> Result<(), AstralError> {
+            Ok(())
+        }
+
+        async fn retry_known_not_admitted(
+            &self,
+            _claim: &SendIntentClaim,
+            _error: &str,
+        ) -> Result<(), AstralError> {
+            Ok(())
+        }
+
+        async fn mark_send_intent_in_doubt(
+            &self,
+            _claim: &SendIntentClaim,
+            _error: &str,
+        ) -> Result<(), AstralError> {
+            Ok(())
+        }
+
+        async fn get_message_scoped(
+            &self,
+            _scope: &ChatScope,
+            _id: i64,
+        ) -> Result<Option<MessageRecord>, AstralError> {
+            Ok(None)
+        }
+
+        async fn count_by_session_scoped(
+            &self,
+            _scope: &ChatScope,
             _conversation_id: i64,
-            _sender_id: i64,
-            _message_type: &str,
-            _content: &str,
         ) -> Result<i64, AstralError> {
-            Ok(1)
-        }
-
-        async fn get_message(&self, _id: i64) -> Result<Option<MessageRecord>, AstralError> {
-            Ok(None)
-        }
-
-        async fn get_sender_id(&self, _id: i64) -> Result<Option<i64>, AstralError> {
-            Ok(None)
-        }
-
-        async fn count_by_session(&self, _conversation_id: i64) -> Result<i64, AstralError> {
             Ok(0)
         }
 
-        async fn list_by_session(
+        async fn list_by_session_scoped(
             &self,
+            _scope: &ChatScope,
             _conversation_id: i64,
             _limit: i64,
             _offset: i64,
@@ -357,7 +388,11 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn recall_message(&self, _id: i64) -> Result<(), AstralError> {
+        async fn recall_message_scoped(
+            &self,
+            _scope: &ChatScope,
+            _id: i64,
+        ) -> Result<(), AstralError> {
             Ok(())
         }
 
@@ -372,21 +407,6 @@ mod tests {
                 .unwrap()
                 .push(last_read_message_id);
             Ok(7)
-        }
-        async fn count_unread(
-            &self,
-            _conversation_id: i64,
-            _last_read_message_id: i64,
-        ) -> Result<i64, AstralError> {
-            Ok(7)
-        }
-
-        async fn insert_delivery(
-            &self,
-            _message_id: i64,
-            _recipient_id: i64,
-        ) -> Result<(), AstralError> {
-            Ok(())
         }
     }
 

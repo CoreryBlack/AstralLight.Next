@@ -15,8 +15,8 @@ use std::sync::Barrier;
 use std::time::{Duration, Instant};
 
 use super::ports::RuleRepository;
-use super::types::*;
 use super::PolicyEngine;
+use crate::org_admission::OrgAuthorityRead;
 use astral_types::{
     BindingLayer, CanonicalGrant, GrantEffect, GrantId, GrantProvenance, GrantRevision,
     GrantSourceKind, GrantState, PublicationSeal, PublishedAggregateManifestSummary,
@@ -33,9 +33,14 @@ struct MemoryAuthorityRepo {
 
 #[async_trait::async_trait]
 impl RuleRepository for MemoryAuthorityRepo {
-    fn requires_published_card_evidence(&self) -> bool {
-        true
+    async fn check_card_active(&self, _ctx: &PolicyContext) -> Result<bool, PolicyError> {
+        Ok(true)
     }
+
+    async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
+        Ok(false)
+    }
+
     async fn load_published_card_authorization(
         &self,
         _scope: &PublishedCardEvidenceScope,
@@ -44,40 +49,12 @@ impl RuleRepository for MemoryAuthorityRepo {
         // 生产读面语义：命中 = 引用计数克隆，零深拷贝。
         Ok(Some(std::sync::Arc::clone(&self.evidence)))
     }
-    async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
-        Ok(false)
-    }
-    async fn get_projection_gate(
+
+    async fn load_org_authorization(
         &self,
-        _card_id: i64,
-    ) -> Result<Option<ProjectionGate>, PolicyError> {
-        Ok(None)
-    }
-    async fn load_rule_set_entries_raw(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-        Ok(vec![])
-    }
-    async fn load_permission_rules_raw(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        Ok(vec![])
-    }
-    async fn load_permission_rules(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        Ok(vec![])
-    }
-    async fn load_projected_delegated_rules(
-        &self,
-        _delegate_id: i64,
-        _resource: &str,
-        _action: &str,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        Ok(vec![])
+        _ctx: &PolicyContext,
+    ) -> Result<OrgAuthorityRead, PolicyError> {
+        Ok(OrgAuthorityRead::Unmanaged)
     }
 }
 
@@ -159,7 +136,7 @@ fn evidence(grants: Vec<CanonicalGrant>) -> PublishedCardAuthorization {
         semantic_hash_hex: "a".repeat(64),
         dependency_hash_hex: "b".repeat(64),
         manifest_digest_hex: "c".repeat(64),
-        compiler_version: "test".to_string(),
+        compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_string(),
         event_id: "event-1".to_string(),
         operation_id: "op-1".to_string(),
         parent_manifest_id: None,
@@ -178,7 +155,7 @@ fn evidence(grants: Vec<CanonicalGrant>) -> PublishedCardAuthorization {
             operation_id: "op-1".to_string(),
             semantic_hash_hex: "a".repeat(64),
             dependency_hash_hex: "b".repeat(64),
-            compiler_version: "test".to_string(),
+            compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_string(),
             segment_ordinal: 0,
             position_in_segment: 0,
             grant: grant.clone(),

@@ -149,7 +149,7 @@ pub const SNAPSHOT_LIMITATIONS: [(&str, &str); 5] = [
     ),
     (
         "worker_readiness",
-        "SKIP: Redis liveness is not worker readiness",
+        "SKIP: snapshot sampling does not prove worker ownership or durable completion",
     ),
 ];
 

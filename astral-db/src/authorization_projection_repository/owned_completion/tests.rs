@@ -114,7 +114,7 @@ impl Fixture {
                 "dependency-{}-{ordinal}",
                 self.salt
             ))),
-            compiler_version: "owned-completion-contract-v1".to_owned(),
+            compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
             next_attempt_at: None,
         }
     }
@@ -133,10 +133,6 @@ async fn pool() -> MySqlPool {
             "required isolated environment: {key}"
         );
     }
-    assert_eq!(
-        crate::freeze_projection_execution_mode(crate::ProjectionExecutionMode::WorkerOwned),
-        Ok(crate::ProjectionExecutionMode::WorkerOwned)
-    );
     let url = std::env::var("DATABASE_URL").expect("required run-owned MySQL URL");
     assert!(!url.contains('?') && !url.contains('#'));
     let options = MySqlConnectOptions::from_str(&url).expect("parse private connection options");

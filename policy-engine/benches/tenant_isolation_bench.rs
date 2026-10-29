@@ -55,7 +55,6 @@ fn bench_single_tenant(c: &mut Criterion) {
     let decision = rt.block_on(engine.evaluate(&ctx, &repo));
     assert_allow(&decision);
     assert_eq!(repo.published_reads(), 2);
-    repo.assert_no_legacy_reads();
     repo.reset_counters();
 
     c.bench_function("tenant_isolation/published_single_tenant_10_rules", |b| {
@@ -67,7 +66,6 @@ fn bench_single_tenant(c: &mut Criterion) {
     });
     assert!(repo.published_reads() > 0);
     assert_eq!(repo.published_reads() % 2, 0);
-    repo.assert_no_legacy_reads();
 }
 
 fn bench_multi_tenant_concurrent(c: &mut Criterion) {
@@ -81,7 +79,6 @@ fn bench_multi_tenant_concurrent(c: &mut Criterion) {
             let decision = rt.block_on(engine.evaluate(&ctx, repo.as_ref()));
             assert_allow(&decision);
         }
-        repo.assert_no_legacy_reads();
         repo.reset_counters();
 
         let label = format!("tenant_isolation/published_concurrent_{tenant_count}_tenants");
@@ -107,7 +104,6 @@ fn bench_multi_tenant_concurrent(c: &mut Criterion) {
         });
         assert_eq!(repo.published_reads() % 2, 0);
         assert!(repo.published_reads() > 0);
-        repo.assert_no_legacy_reads();
     }
 }
 
@@ -150,14 +146,12 @@ fn bench_cross_tenant_published_lookup(c: &mut Criterion) {
     let matching_ctx = tenant_context(25, 25);
     let matching_decision = rt.block_on(engine.evaluate(&matching_ctx, &repo));
     assert_allow(&matching_decision);
-    repo.assert_no_legacy_reads();
     repo.reset_counters();
 
     let mut nonmatching_ctx = tenant_context(25, 25);
     nonmatching_ctx.resource = Some("tenant_26_resource_25".to_owned());
     let nonmatching_decision = rt.block_on(engine.evaluate(&nonmatching_ctx, &repo));
     assert_deny(&nonmatching_decision, "DEFAULT_DENY");
-    repo.assert_no_legacy_reads();
     repo.reset_counters();
 
     c.bench_function("tenant_isolation/published_cross_tenant_100x50", |b| {
@@ -174,7 +168,6 @@ fn bench_cross_tenant_published_lookup(c: &mut Criterion) {
     });
     assert!(repo.published_reads() > 0);
     assert_eq!(repo.published_reads() % 2, 0);
-    repo.assert_no_legacy_reads();
 }
 
 fn bench_ready_empty_and_unavailable(c: &mut Criterion) {
@@ -185,7 +178,6 @@ fn bench_ready_empty_and_unavailable(c: &mut Criterion) {
     let empty_repo = PublishedRepo::ready_empty_without_scope_recording(1000, 2000);
     let empty_decision = rt.block_on(engine.evaluate(&ctx, &empty_repo));
     assert_deny(&empty_decision, "DEFAULT_DENY");
-    empty_repo.assert_no_legacy_reads();
     empty_repo.reset_counters();
     c.bench_function("tenant_isolation/published_empty_deny", |b| {
         b.iter(|| {
@@ -195,12 +187,10 @@ fn bench_ready_empty_and_unavailable(c: &mut Criterion) {
         });
     });
     assert!(empty_repo.published_reads() > 0);
-    empty_repo.assert_no_legacy_reads();
 
     let unavailable_repo = PublishedRepo::unavailable_without_scope_recording();
     let unavailable_decision = rt.block_on(engine.evaluate(&ctx, &unavailable_repo));
     assert_deny(&unavailable_decision, "AUTHORIZATION_PENDING");
-    unavailable_repo.assert_no_legacy_reads();
     unavailable_repo.reset_counters();
     c.bench_function("tenant_isolation/published_unavailable_pending", |b| {
         b.iter(|| {
@@ -210,7 +200,6 @@ fn bench_ready_empty_and_unavailable(c: &mut Criterion) {
         });
     });
     assert!(unavailable_repo.published_reads() > 0);
-    unavailable_repo.assert_no_legacy_reads();
 }
 
 criterion_group! {

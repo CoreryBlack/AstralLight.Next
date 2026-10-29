@@ -1,7 +1,7 @@
 //! 会话数据访问 — SessionRepository
 //!
 //! 只承载 auth_device_session / auth_token_family / auth_session_jti_index 的
-//! **纯单语句原子 SQL**。CAS 轮换顺序、Redis 投影、jti fan-out 和 family
+//! **纯单语句原子 SQL**。CAS 轮换顺序、session grant mirror、jti fan-out 和 family
 //! 级联撤销编排保留在 `srv::session`，不允许把编排函数下沉到本文件。
 //!
 //! source writer 栅栏边界：仅**无外部调用方栅栏兜底**的两个签发叶子

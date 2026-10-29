@@ -359,42 +359,6 @@ impl MonitorService {
             .await
     }
 
-    /// 写入 redis 服务的 6 个指标。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn collect_redis_metrics(
-        &self,
-        hit_rate: f64,
-        connected_clients: i64,
-        used_memory_mb: f64,
-        max_memory_mb: f64,
-        key_count: i64,
-    ) -> Result<(), AstralError> {
-        self.repository
-            .insert_metric("redis", "hit_rate", hit_rate)
-            .await?;
-        self.repository
-            .insert_metric("redis", "connected_clients", connected_clients as f64)
-            .await?;
-        self.repository
-            .insert_metric("redis", "used_memory_mb", used_memory_mb)
-            .await?;
-        self.repository
-            .insert_metric("redis", "max_memory_mb", max_memory_mb)
-            .await?;
-        let memory_percent = if max_memory_mb > 0.0 {
-            used_memory_mb * 100.0 / max_memory_mb
-        } else {
-            0.0
-        };
-        self.repository
-            .insert_metric("redis", "memory_usage", memory_percent)
-            .await?;
-        self.repository
-            .insert_metric("redis", "key_count", key_count as f64)
-            .await?;
-        Ok(())
-    }
-
     /// 评估启用规则：近 `window_secs` 最新 metric → 条件判定 → 窗口去重 → 写告警历史。
     ///
     /// 返回本次新触发的告警（已去重、已持久化），由调用方负责通知派发；

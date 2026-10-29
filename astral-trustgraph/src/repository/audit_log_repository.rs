@@ -880,16 +880,6 @@ fn audit_authorization_source_predicate_sql() -> &'static str {
     "event_type = 'AUTHZ_CHECK' AND decision IN ('ALLOW', 'DENY')"
 }
 
-pub(crate) fn audit_mutation_source_predicate_sql() -> &'static str {
-    "decision <> 'INTERNAL' AND \
-     (event_type IN ('USER_CARD_MUTATION', 'PERMISSION_RULE_MUTATION', 'RULE_CHANGE', \
-                     'APPROVAL_DECISION', 'CARD_TEMPLATE_MUTATION', 'LEVEL_TEMPLATE_MUTATION', \
-                     'DELEGATION_CREATED', 'DELEGATION_UPDATED', 'DELEGATION_REVOKED') \
-      OR (resource IN ('user_card', 'permission_rule', 'permission_request', \
-                       'card_template', 'level_template', 'permission_delegation') \
-          AND event_type IS NOT NULL AND event_type <> 'AUTHZ_CHECK'))"
-}
-
 fn audit_stats_counts_sql() -> String {
     format!(
         "SELECT COUNT(*), COALESCE(SUM(decision = 'ALLOW'), 0), \
@@ -1016,15 +1006,6 @@ mod tests {
         assert!(AuditLogFilter::new(None, None, Some("2026-01-03"), Some("2026-01-02")).is_err());
     }
 
-    #[test]
-    fn stats_and_compliance_feed_are_explicit_policy_and_mutation_scopes() {
-        assert!(audit_authorization_source_predicate_sql().contains("AUTHZ_CHECK"));
-        assert!(audit_mutation_source_predicate_sql().contains("USER_CARD_MUTATION"));
-        assert!(audit_mutation_source_predicate_sql().contains("PERMISSION_RULE_MUTATION"));
-        assert!(audit_mutation_source_predicate_sql().contains("APPROVAL_DECISION"));
-        assert!(audit_mutation_source_predicate_sql().contains("DELEGATION_UPDATED"));
-        assert!(audit_mutation_source_predicate_sql().contains("event_type <> 'AUTHZ_CHECK'"));
-    }
     #[test]
     fn approval_audit_detail_preserves_actor_target_decision_and_request_context() {
         let context = ApprovalAuditContext::new(Some("http-request-7"), 42);

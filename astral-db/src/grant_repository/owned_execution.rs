@@ -1,14 +1,14 @@
 use sqlx::{MySql, Transaction};
 
 use super::{
-    decode_grant_id_sql, install_claimed_event, load_claimed_delta_event_for_update_in_tx,
+    decode_grant_id_sql, install_owned_claimed_event, load_claimed_delta_event_for_update_in_tx,
     positive_i64, validate_lease_seconds, validated_aggregate_type, validated_text,
-    verify_stable_event_request_binding, DeltaEventAppendRequest, DeltaEventClaimScope,
-    DeltaEventType, DeltaLeaseIdentity, DeltaLeaseToken, GrantRepositoryError, Sha256Digest,
-    StableEventClaimRow, DELTA_CLAIM_SIBLING_ORDER_GATE, DELTA_STATUS_LEASED, DELTA_STATUS_PENDING,
-    DELTA_STATUS_QUARANTINED, DELTA_STATUS_SUCCEEDED, MAX_EVENT_ID_LENGTH,
-    MAX_GRANT_LEASE_OWNER_LENGTH, STABLE_EVENT_CLAIM_SELECT_SQL,
-    STABLE_EVENT_SIBLING_ORDER_PROBE_SQL,
+    verify_owned_stable_event_request_binding, DeltaEventAppendRequest, DeltaEventClaimScope,
+    DeltaEventType, DeltaLeaseIdentity, DeltaLeaseToken, GrantRepositoryError, OwnedStableEventRow,
+    Sha256Digest, DELTA_STATUS_LEASED, DELTA_STATUS_PENDING, DELTA_STATUS_QUARANTINED,
+    DELTA_STATUS_SUCCEEDED, MAX_EVENT_ID_LENGTH, MAX_GRANT_LEASE_OWNER_LENGTH,
+    OWNED_DELTA_CLAIM_ELIGIBILITY, OWNED_DELTA_CLAIM_SIBLING_ORDER_GATE,
+    OWNED_STABLE_EVENT_SELECT_SQL, OWNED_STABLE_EVENT_SIBLING_ORDER_PROBE_SQL,
 };
 use crate::{
     OwnedDeltaClaim, OwnedDeltaLease, OwnedStableEventOutcome, ProjectionAggregateIdentity,
@@ -39,15 +39,6 @@ struct AccountingState {
     claimable: i64,
 }
 
-fn require_owned() -> Result<(), GrantRepositoryError> {
-    if crate::projection_execution_mode() != crate::ProjectionExecutionMode::WorkerOwned {
-        return Err(GrantRepositoryError::ScopeViolation(
-            "code=projection_execution.worker_owned_mode_required".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 fn in_doubt(request: &DeltaEventAppendRequest, reason: &str) -> OwnedStableEventOutcome {
     OwnedStableEventOutcome::InDoubt {
         event_id: request.event_id.clone(),
@@ -65,11 +56,11 @@ async fn read_stable_event(
     tx: &mut Transaction<'_, MySql>,
     request: &DeltaEventAppendRequest,
     locking: bool,
-) -> Result<StableEventClaimRow, GrantRepositoryError> {
+) -> Result<OwnedStableEventRow, GrantRepositoryError> {
     let statement = if locking {
-        STABLE_EVENT_CLAIM_SELECT_SQL
+        OWNED_STABLE_EVENT_SELECT_SQL
     } else {
-        STABLE_EVENT_CLAIM_SELECT_SQL
+        OWNED_STABLE_EVENT_SELECT_SQL
             .strip_suffix(" FOR UPDATE")
             .expect("stable-event select has a locking tail")
     };
@@ -83,7 +74,7 @@ async fn read_stable_event(
                 "code=projection_execution.stable_event_missing".to_owned(),
             )
         })?;
-    verify_stable_event_request_binding(request, &row)?;
+    verify_owned_stable_event_request_binding(request, &row)?;
     Ok(row)
 }
 
@@ -93,7 +84,6 @@ pub(super) async fn claim_exact_in_tx(
     owner: &str,
     lease_seconds: i64,
 ) -> Result<OwnedStableEventOutcome, GrantRepositoryError> {
-    require_owned()?;
     positive_i64(request.tenant_id, "tenant_id")?;
     positive_i64(request.aggregate_id, "aggregate_id")?;
     validated_aggregate_type(&request.aggregate_type)?;
@@ -239,7 +229,7 @@ pub(super) async fn claim_exact_in_tx(
     if aggregate_predecessor.is_some() {
         return Ok(busy(request));
     }
-    let predecessor: Option<(i64,)> = sqlx::query_as(STABLE_EVENT_SIBLING_ORDER_PROBE_SQL)
+    let predecessor: Option<(i64,)> = sqlx::query_as(OWNED_STABLE_EVENT_SIBLING_ORDER_PROBE_SQL)
         .bind(row.tenant_id)
         .bind(&row.grant_id)
         .bind(row.target_version)
@@ -284,7 +274,7 @@ pub(super) async fn claim_exact_in_tx(
         .execute(&mut **tx)
         .await?;
     }
-    let claim = install_claimed_event(tx, row.to_candidate(), owner, lease_seconds).await?;
+    let claim = install_owned_claimed_event(tx, row.to_candidate(), owner, lease_seconds).await?;
     let identity = DeltaLeaseIdentity {
         delta_event_id: claim.delta_event_id,
         event_id: claim.event_id.clone(),
@@ -344,12 +334,11 @@ pub(super) async fn candidate_receipts(
     scope: DeltaEventClaimScope,
     aggregate: Option<&ProjectionAggregateIdentity>,
 ) -> Result<Vec<DeltaEventAppendRequest>, GrantRepositoryError> {
-    require_owned()?;
     positive_i64(scope.tenant_id, "tenant_id")?;
     if let Some(card_id) = scope.card_id {
         positive_i64(card_id, "card_id")?;
     }
-    let columns = STABLE_EVENT_CLAIM_SELECT_SQL
+    let columns = OWNED_STABLE_EVENT_SELECT_SQL
         .split_once(" FROM authorization_delta_event ")
         .expect("stable-event select has its table")
         .0;
@@ -371,11 +360,8 @@ pub(super) async fn candidate_receipts(
     let statement = format!(
         "{columns} FROM authorization_delta_event \
          WHERE tenant_id = ?{card_filter}{aggregate_filter} \
-           AND ((status = 'PENDING' AND \
-             (next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP())) \
-             OR (status = 'LEASED' AND lease_expires_at IS NOT NULL \
-               AND lease_expires_at <= UTC_TIMESTAMP())) \
-           {DELTA_CLAIM_SIBLING_ORDER_GATE} \
+           {OWNED_DELTA_CLAIM_ELIGIBILITY} \
+           {OWNED_DELTA_CLAIM_SIBLING_ORDER_GATE} \
            AND NOT EXISTS (SELECT 1 FROM authorization_delta_event predecessor \
              WHERE predecessor.tenant_id = authorization_delta_event.tenant_id \
                AND predecessor.aggregate_type = authorization_delta_event.aggregate_type \
@@ -396,7 +382,7 @@ pub(super) async fn candidate_receipts(
                      AND lane.active_delta_event_id <> authorization_delta_event.delta_event_id))) \
          ORDER BY COALESCE(next_attempt_at, created_at), delta_event_id LIMIT ?"
     );
-    let mut query = sqlx::query_as::<_, StableEventClaimRow>(&statement).bind(scope.tenant_id);
+    let mut query = sqlx::query_as::<_, OwnedStableEventRow>(&statement).bind(scope.tenant_id);
     if let Some(card_id) = scope.card_id {
         query = query.bind(card_id);
     }
@@ -445,77 +431,4 @@ pub(super) async fn candidate_receipts(
             })
         })
         .collect()
-}
-
-async fn owned_columns_exist(
-    tx: &mut Transaction<'_, MySql>,
-    table: &str,
-    column: &str,
-) -> Result<bool, GrantRepositoryError> {
-    let (count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM information_schema.COLUMNS \
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
-    )
-    .bind(table)
-    .bind(column)
-    .fetch_one(&mut **tx)
-    .await?;
-    Ok(count == 1)
-}
-
-pub(super) async fn join_legacy_accounting(
-    tx: &mut Transaction<'_, MySql>,
-    delta_event_id: i64,
-) -> Result<(), GrantRepositoryError> {
-    if crate::projection_execution_mode() != crate::ProjectionExecutionMode::LegacyHybrid
-        || !owned_columns_exist(
-            tx,
-            "authorization_delta_event",
-            "execution_accounting_version",
-        )
-        .await?
-    {
-        return Ok(());
-    }
-    sqlx::query(
-        "UPDATE authorization_delta_event \
-         SET execution_attempts = GREATEST(execution_attempts, attempts), \
-             execution_failures = GREATEST(execution_failures, attempts), \
-             execution_accounting_version = 1 \
-         WHERE delta_event_id = ? AND execution_accounting_version = 2",
-    )
-    .bind(delta_event_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-pub(super) async fn refuse_owned_partition_history(
-    tx: &mut Transaction<'_, MySql>,
-    identity: &ProjectionAggregateIdentity,
-) -> Result<(), GrantRepositoryError> {
-    if !owned_columns_exist(
-        tx,
-        "authorization_projection_partition_lease",
-        "execution_epoch",
-    )
-    .await?
-    {
-        return Ok(());
-    }
-    let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT execution_epoch FROM authorization_projection_partition_lease \
-         WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ? FOR UPDATE",
-    )
-    .bind(identity.tenant_id)
-    .bind(&identity.aggregate_type)
-    .bind(identity.aggregate_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if row.is_some_and(|(epoch,)| epoch != 0) {
-        return Err(GrantRepositoryError::ScopeViolation(
-            "code=projection_execution.legacy_partition_cannot_reset_owned_epoch".to_owned(),
-        ));
-    }
-    Ok(())
 }

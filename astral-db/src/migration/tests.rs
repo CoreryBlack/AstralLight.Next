@@ -141,6 +141,35 @@ fn owned_execution_migration_is_additive_pinned_and_not_baseline_adopted() {
     assert!(exact_migration_artifact_contract(&changed).is_none());
 }
 
+#[test]
+fn runtime_schema_always_requires_owned_execution_contract() {
+    let production = include_str!("../migration.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .expect("production migration runtime");
+    let runtime = production
+        .split("pub async fn validate_schema_contract")
+        .nth(1)
+        .and_then(|body| {
+            body.split("async fn validate_decommissionable_snapshot_column_contracts")
+                .next()
+        })
+        .expect("startup schema contract");
+    assert!(runtime.contains("crate::validate_projection_owned_schema(pool)"));
+    for removed in [
+        "projection_execution_mode",
+        "PROJECTION_OWNED_EXECUTION_VERSION",
+    ] {
+        assert!(
+            !runtime.contains(removed),
+            "owned schema cannot depend on {removed}"
+        );
+    }
+    let entry = include_str!("../bin/astral-migrate.rs");
+    assert!(!entry.contains("freeze_projection_execution_mode"));
+    assert!(entry.contains("require_explicit_apply()?"));
+}
+
 fn historical_auth_migration() -> &'static Migration {
     MIGRATOR
         .migrations

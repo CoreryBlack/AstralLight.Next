@@ -18,11 +18,10 @@ use astral_db::MAX_MANIFEST_LEASE_SECONDS;
 pub const POLL_INTERVAL_SECS: u64 = 5;
 /// One claimed event's lease window (≤ [`astral_db::MAX_DELTA_LEASE_SECONDS`]).
 pub const CLAIM_LEASE_SECS: i64 = 120;
-/// Hard attempt budget per event. The budget is judged against the durable
-/// post-install `attempts` value of the row ([`astral_db::DeltaEventClaim::attempts`] and
-/// the strict [`astral_db::ClaimedDeltaEvent`] readback both carry that current value):
-/// attempts 1..=5 are in-budget retries, a failure observed at attempts >= 5 is
-/// exhausted and can never schedule another short backoff.
+/// Hard owned-execution failure budget per event. It is judged from the durable
+/// `execution_failures` bound to the WorkerOwned capability, never from queue
+/// claim attempts; the fifth proven execution failure exhausts the short-backoff
+/// budget. The name remains stable for existing projector diagnostics.
 pub const MAX_EVENT_ATTEMPTS: i64 = 5;
 /// Backoff ceiling handed to `fail_delta_event`.
 pub const BACKOFF_CAP_SECS: i64 = 900;
@@ -41,14 +40,9 @@ pub(crate) const MAX_EVENTS_PER_TENANT_PER_CYCLE: usize = 8;
 // integration acceptance.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Maximum events one worker may drain from ONE partition while holding its
-/// lease. The lease is renewed before every claim iteration; losing it stops
-/// the batch immediately (fail-closed: never touch a partition you no longer
-/// own).
+/// Maximum events one worker may claim from ONE discovered aggregate per round.
+/// Each event independently acquires its WorkerOwned lane capability.
 pub(crate) const MAX_EVENTS_PER_PARTITION_PER_BATCH: usize = 8;
-/// Partition lease window: one event's claim lease plus margin for the
-/// discover/acquire/renew/release round-trips.
-pub const PARTITION_LEASE_SECS: i64 = CLAIM_LEASE_SECS + 60;
 /// Discovery candidate bound handed to the ledger query per worker round.
 pub const PARTITION_DISCOVERY_LIMIT: i64 = 64;
 /// Parallel partition workers (Q2 decision): default 4, hard-bounded.
@@ -57,8 +51,8 @@ pub const MAX_PARTITION_WORKER_COUNT: usize = 32;
 
 /// Scheduling topology of the projection worker pool. `TenantSerial` is the
 /// historical, fully-accepted behavior and remains the DEFAULT; `Partitioned`
-/// activates ledger-discovered aggregate partitions with per-partition lease
-/// exclusivity and cross-partition parallelism.
+/// activates ledger-discovered aggregate partitions for cross-partition
+/// parallelism while each event still acquires the same WorkerOwned lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectorSchedulingMode {
     TenantSerial,
@@ -170,9 +164,9 @@ pub struct AuthorizationProjectorConfig {
     pub claim_lease_seconds: i64,
     pub manifest_lease_seconds: i64,
     /// 单个 delta 事件的整体处理 deadline（F5 修复 1b）：任何一步挂起都必须
-    /// 在 deadline 内变成"计数 + 尽力释放租约 + 继续循环"，worker 永不永久
-    /// 停在当次事件内。应严格小于 `claim_lease_seconds`，为释放/租约过期
-    /// reclaim 留出余量。
+    /// 在 deadline 内报告 UNKNOWN 并停止本次 episode；WorkerOwned capability
+    /// 保持不变，交由 exact claim 的 active-slot/绑定/发布证据对账后再恢复，
+    /// 不执行盲目 release/replay。应严格小于 `claim_lease_seconds`，为恢复留余量。
     pub event_deadline: Duration,
     /// 看门狗停滞阈值（F5 修复 1d）：连续该时长无任何 claim 返回/事件完成
     /// 进展，且 runtime 报告存在可 claim 积压 → 监督循环重建 worker 代。
@@ -295,8 +289,8 @@ impl Default for AuthorizationProjectorConfig {
             poll_interval_secs: POLL_INTERVAL_SECS,
             claim_lease_seconds: CLAIM_LEASE_SECS,
             manifest_lease_seconds: MAX_MANIFEST_LEASE_SECONDS.min(600),
-            // 90s = claim 租约（120s）的 75%：deadline 先于租约过期触发，
-            // 释放失败时租约 reclaim 仍是安全网。
+            // 90s = claim 租约（120s）的 75%：deadline 先于租约过期触发；
+            // UNKNOWN capability 保持原样，由 WorkerOwned reconciliation 决定恢复。
             event_deadline: Duration::from_secs((CLAIM_LEASE_SECS as u64) * 3 / 4),
             // 看门狗默认：5 分钟零进展 + 积压存在 → 重建；15s 探测周期。
             watchdog_stall_threshold: Duration::from_secs(300),

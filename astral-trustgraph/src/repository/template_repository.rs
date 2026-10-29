@@ -1,7 +1,7 @@
 //! 策略模板数据访问 — TemplateRepository
 //!
-//! 对齐 Java `PermissionRuleTemplateMapper` 边界（permission_rule_template 表）。
-//! 事务性更新（delete-then-insert）收口为聚合方法；apply/async apply 的下沉查询在此。
+//! 对齐模板 source 仓储边界（permission_rule_template 表）。
+//! 事务性更新（delete-then-insert）收口为聚合方法。
 
 use async_trait::async_trait;
 use sqlx::MySqlPool;
@@ -41,26 +41,6 @@ pub struct TemplateRuleInput {
     pub action: String,
 }
 
-/// 合规报表数据
-#[derive(Debug, Clone, Default)]
-pub struct ComplianceData {
-    pub total_rules: i64,
-    pub active_rules: i64,
-    pub over_permission_cards: i64,
-    pub unused_permission_rules: i64,
-    pub recent_changes: Vec<PolicyChangeRow>,
-}
-
-/// 最近权限变更行
-#[derive(Debug, Clone)]
-pub struct PolicyChangeRow {
-    pub id: i64,
-    pub resource: String,
-    pub action: String,
-    pub changed_by: i64,
-    pub changed_at: String,
-}
-
 #[async_trait]
 pub trait TemplateRepository: Send + Sync {
     /// 模板总数（DISTINCT template_id）
@@ -92,8 +72,6 @@ pub trait TemplateRepository: Send + Sync {
         &self,
         template_id: &str,
     ) -> Result<Vec<TemplateRuleRecord>, AstralError>;
-    /// Legacy template apply endpoints are intentionally retired. Template
-    /// authorization is materialized/bound through the RuleSet API instead.
     /// 使用模板规则全量同步其共享 RuleSet；source mutation、RULE_SET 事件、
     /// ACTIVE 绑定卡 CARD 事件与授权账本（old REMOVE + new ADD 贡献）在同一
     /// 事务内提交，返回受影响卡数。
@@ -129,10 +107,6 @@ pub trait TemplateRepository: Send + Sync {
         rule_id: i64,
         context: &RuleSetMutationContext,
     ) -> Result<bool, AstralError>;
-    /// 合规概览数据
-    async fn compliance_overview(&self) -> Result<ComplianceData, AstralError>;
-    /// 合规报表：总卡数 / 启用规则数 / 人均规则数
-    async fn compliance_report(&self) -> Result<(i64, i64, Option<f64>), AstralError>;
 }
 
 pub struct SqlxTemplateRepository {
@@ -366,9 +340,9 @@ fn template_rows_to_entry_requests(
                 )?;
                 Ok(NewRuleSetEntry {
                     effect,
-                    resource: Some(resource_type),
+                    resource_type: Some(resource_type),
                     resource_id,
-                    action: Some(action_code),
+                    action_code: Some(action_code),
                     condition_json,
                     priority,
                 })
@@ -783,98 +757,6 @@ impl TemplateRepository for SqlxTemplateRepository {
         tx.commit_consuming().await?;
         Ok(true)
     }
-
-    async fn compliance_overview(&self) -> Result<ComplianceData, AstralError> {
-        use sqlx::Row;
-        let total_rules: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM permission_rule \
-             WHERE source_type IN ('CARD_ONLY', 'MANUAL')",
-        )
-        .fetch_one(&self.db)
-        .await
-        .map_err(db_error)?;
-        let active_rules: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM permission_rule pr \
-             JOIN user_card uc ON uc.card_id = pr.card_id \
-             WHERE uc.card_status = 'ACTIVE' \
-               AND pr.source_type IN ('CARD_ONLY', 'MANUAL')",
-        )
-        .fetch_one(&self.db)
-        .await
-        .map_err(db_error)?;
-        let over_permission_cards: i64 = sqlx::query_scalar(
-            "SELECT COUNT(DISTINCT pr.card_id) FROM permission_rule pr \
-             WHERE pr.effect = 'ALLOW' AND pr.action_code = 'delete' \
-               AND pr.source_type IN ('CARD_ONLY', 'MANUAL')",
-        )
-        .fetch_one(&self.db)
-        .await
-        .map_err(db_error)?;
-        let unused_permission_rules: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM ( \
-             SELECT DISTINCT pr.resource_type, pr.action_code FROM permission_rule pr \
-             WHERE pr.effect = 'ALLOW' \
-               AND pr.source_type IN ('CARD_ONLY', 'MANUAL') \
-             AND NOT EXISTS ( \
-                 SELECT 1 FROM permission_hit_stat phs \
-                 WHERE phs.resource_type = pr.resource_type COLLATE utf8mb4_unicode_ci \
-                 AND phs.action_code = pr.action_code COLLATE utf8mb4_unicode_ci \
-             ) \
-             ) t",
-        )
-        .fetch_one(&self.db)
-        .await
-        .map_err(db_error)?;
-
-        let mutation_audit_predicate =
-            crate::repository::audit_log_repository::audit_mutation_source_predicate_sql();
-        let recent_rows = sqlx::query(&format!(
-            "SELECT id, resource, action, user_id, \
-             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%sZ') as changed_at \
-             FROM audit_log WHERE {mutation_audit_predicate} \
-             ORDER BY created_at DESC, id DESC LIMIT 10"
-        ))
-        .fetch_all(&self.db)
-        .await
-        .map_err(db_error)?;
-        let recent_changes = recent_rows
-            .iter()
-            .map(|r| PolicyChangeRow {
-                id: r.get("id"),
-                resource: r.get("resource"),
-                action: r.get("action"),
-                changed_by: r.get("user_id"),
-                changed_at: r.get("changed_at"),
-            })
-            .collect();
-
-        Ok(ComplianceData {
-            total_rules,
-            active_rules,
-            over_permission_cards,
-            unused_permission_rules,
-            recent_changes,
-        })
-    }
-
-    async fn compliance_report(&self) -> Result<(i64, i64, Option<f64>), AstralError> {
-        let total_cards: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_card")
-            .fetch_one(&self.db)
-            .await
-            .map_err(db_error)?;
-        let total_rules: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM permission_rule WHERE enabled = 1")
-                .fetch_one(&self.db)
-                .await
-                .map_err(db_error)?;
-        let avg_rules: Option<f64> = sqlx::query_scalar(
-            "SELECT AVG(cnt) FROM (SELECT COUNT(*) as cnt FROM permission_rule WHERE enabled = 1 GROUP BY card_id) t",
-        )
-        .fetch_one(&self.db)
-        .await
-        .map_err(db_error)?;
-        Ok((total_cards, total_rules, avg_rules))
-    }
 }
 
 fn db_error(error: sqlx::Error) -> AstralError {
@@ -913,9 +795,9 @@ mod tests {
         assert_eq!(rows.len(), 2);
         // effect 归一恒为 ALLOW：模板条目是 canonical 授权来源。
         assert!(rows.iter().all(|row| row.effect == "ALLOW"));
-        assert_eq!(rows[0].resource.as_deref(), Some("learn_course"));
-        assert_eq!(rows[1].resource.as_deref(), Some("learn_subject"));
-        assert_eq!(rows[1].action.as_deref(), Some("create"));
+        assert_eq!(rows[0].resource_type.as_deref(), Some("learn_course"));
+        assert_eq!(rows[1].resource_type.as_deref(), Some("learn_subject"));
+        assert_eq!(rows[1].action_code.as_deref(), Some("create"));
         assert_eq!(rows[1].priority, 7);
     }
 
@@ -1121,5 +1003,36 @@ mod tests {
             source.contains("const CANONICAL_TEMPLATE_EFFECT: &str = \"ALLOW\";"),
             "canonical ALLOW constant must remain the single persistence value"
         );
+    }
+
+    #[test]
+    fn retired_compliance_repository_surface_and_sql_are_absent() {
+        let production = include_str!("template_repository.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("repository implementation must be separable");
+
+        for retired_symbol in [
+            "compliance_overview",
+            "compliance_report",
+            "ComplianceData",
+            "PolicyChangeRow",
+        ] {
+            assert!(
+                !production.contains(retired_symbol),
+                "retired compliance repository surface remains: {retired_symbol}"
+            );
+        }
+        for retired_query in [
+            "FROM audit_log WHERE",
+            "FROM permission_hit_stat",
+            "source_type IN ('CARD_ONLY', 'MANUAL')",
+            "SELECT AVG(cnt)",
+        ] {
+            assert!(
+                !production.contains(retired_query),
+                "retired compliance-only SQL remains: {retired_query}"
+            );
+        }
     }
 }

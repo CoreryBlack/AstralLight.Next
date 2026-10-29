@@ -71,7 +71,7 @@ pub struct ProfileRecord {
     pub card_id: Option<i64>,
 }
 
-/// Existing generic login-session insertion parameters (kept stable for crate callers).
+/// Single-use, actor-bound facts used by the atomic local-login issuance path.
 #[derive(Debug, Clone)]
 pub struct NewLoginSession {
     pub family_id: i64,
@@ -92,7 +92,6 @@ pub struct AtomicLoginSession {
     pub user_id: i64,
     pub expected_password_hash: String,
     pub credential_version: i64,
-    pub migrated_password_hash: Option<String>,
     pub identity_card_id: i64,
     pub mfa_attempt_code: Option<String>,
     pub mfa_method: Option<String>,
@@ -135,9 +134,6 @@ pub trait AuthRepository: Send + Sync {
         &self,
         user_id: i64,
     ) -> Result<Option<PasswordCredential>, AstralError>;
-
-    /// Stable compatibility entry point; the atomic revocation snapshot stays internal.
-    async fn update_password_hash(&self, user_id: i64, new_hash: &str) -> Result<(), AstralError>;
 
     /// Atomically rotate a password and return the exact JTI snapshot committed to its v2 outbox.
     async fn update_password_hash_with_revocation(
@@ -237,7 +233,7 @@ pub trait AuthRepository: Send + Sync {
         refresh_expiry: PrimitiveDateTime,
     ) -> Result<(), AstralError>;
 
-    /// Redis 投影失败后的 family 清理（与 api.rs 原内联 DELETE 语义一致）。
+    /// Token tracking failure compensation: clean up the durable family.
     async fn delete_active_family(&self, family_id: i64, user_id: i64) -> Result<(), AstralError>;
 }
 
@@ -732,30 +728,9 @@ impl AuthRepository for SqlxAuthRepository {
             }
         }
 
-        let version = if let Some(migrated_hash) = session.migrated_password_hash.as_deref() {
-            let updated = sqlx::query(
-                "UPDATE user_local_credential SET password_hash = ?, password_algo = 'ARGON2ID', \
-                 credential_version = credential_version + 1, password_updated_at = CURRENT_TIMESTAMP, \
-                 updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND status = 'ACTIVE' \
-                   AND password_hash = ? AND credential_version = ?",
-            )
-            .bind(migrated_hash)
-            .bind(session.user_id)
-            .bind(&session.expected_password_hash)
-            .bind(session.credential_version)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AstralError::Database(format!("Migrate login credential failed: {e}")))?;
-            if updated.rows_affected() != 1 {
-                return Err(AstralError::Auth("Invalid credentials".into()));
-            }
-            session
-                .credential_version
-                .checked_add(1)
-                .ok_or_else(|| AstralError::Auth("Credential revision exhausted".into()))?
-        } else {
-            session.credential_version
-        };
+        // The credential row is locked and rechecked against the verified hash
+        // and version; password format changes happen only through explicit reset.
+        let version = session.credential_version;
 
         sqlx::query(
             "INSERT INTO auth_token_family (user_id, family_key, status, issued_at, expires_at) \
@@ -824,12 +799,6 @@ impl AuthRepository for SqlxAuthRepository {
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AstralError::Database(format!("Load password credential failed: {e}")))
-    }
-
-    async fn update_password_hash(&self, user_id: i64, new_hash: &str) -> Result<(), AstralError> {
-        self.update_password_hash_with_revocation(user_id, new_hash, "PASSWORD_CHANGED", None)
-            .await
-            .map(|_| ())
     }
 
     async fn update_password_hash_with_revocation(
@@ -1253,10 +1222,9 @@ mod tests {
         }
 
         let password_body = body_between(
-            "async fn update_password_hash(",
+            "async fn update_password_hash_with_revocation(",
             "async fn update_last_login_at(",
         );
-        assert!(password_body.contains("self.update_password_hash_with_revocation("));
         assert!(password_body.contains("self.update_password_transaction("));
         let transaction_body = source
             .split("async fn update_password_transaction(")

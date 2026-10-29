@@ -44,14 +44,12 @@ use astral_trustgraph::{
     },
     service::{
         approval_service::ApprovalService,
-        arbiter::ArbiterService,
         audit_replay_worker::AuditReplayProducerSlot,
         delegation_service::DelegationWriteService,
         level_template_service::LevelTemplateService,
         personal_permission_service::PersonalPermissionService,
         rule_set_write_service::{AddEntryRequest, BindCardRequest, RuleSetWriteService},
-        rule_write_service::RuleWriteService,
-        side_effect::SqlxPermissionSideEffects,
+        rule_write_service::{RuleWriteService, SqlxGrantSodValidator},
         template_service::TemplateService,
         tenant_service::TenantService,
         user_card_service::UserCardService,
@@ -326,9 +324,9 @@ pub async fn seed_governance_fixture(pool: &MySqlPool, fixture: &OwnedFixture) -
 fn ruleset_entry(resource: &str, action: &str, priority: i32) -> AddEntryRequest {
     AddEntryRequest {
         effect: "ALLOW".to_owned(),
-        resource: Some(resource.to_owned()),
+        resource_type: Some(resource.to_owned()),
+        action_code: Some(action.to_owned()),
         resource_id: None,
-        action: Some(action.to_owned()),
         condition_json: None,
         priority,
     }
@@ -363,7 +361,7 @@ pub fn build_signed_router(pool: &MySqlPool, gateway_secret: &str) -> Result<Rou
 
 fn build_app_state(pool: MySqlPool, config: AppConfig) -> AppState {
     let config = Arc::new(config);
-    let side_effects = Arc::new(SqlxPermissionSideEffects::new(pool.clone()));
+    let grant_sod_validator = Arc::new(SqlxGrantSodValidator::new(pool.clone()));
     let rule_repository = Arc::new(SqlxRuleRepository::new(pool.clone()));
     let rule_set_repository = Arc::new(SqlxRuleSetRepository::new(pool.clone()));
     let delegation_repository = Arc::new(SqlxDelegationRepository::new(pool.clone()));
@@ -389,10 +387,10 @@ fn build_app_state(pool: MySqlPool, config: AppConfig) -> AppState {
         rule_set_repository: rule_set_repository.clone(),
         delegation_repository: delegation_repository.clone(),
         admin_group_repository,
-        rule_write_service: Arc::new(
-            RuleWriteService::new(rule_repository.clone(), side_effects.clone())
-                .with_sod_db(pool.clone()),
-        ),
+        rule_write_service: Arc::new(RuleWriteService::new(
+            rule_repository.clone(),
+            grant_sod_validator.clone(),
+        )),
         rule_set_write_service: Arc::new(RuleSetWriteService::new(rule_set_repository.clone())),
         delegation_service: Arc::new(DelegationWriteService::new(delegation_repository.clone())),
         department_repository: Arc::new(SqlxDepartmentRepository::new(pool.clone())),
@@ -409,24 +407,15 @@ fn build_app_state(pool: MySqlPool, config: AppConfig) -> AppState {
         user_card_repository: user_card_repository.clone(),
         tenant_repository: tenant_repository.clone(),
         tenant_service: Arc::new(TenantService::new(tenant_repository)),
-        approval_service: Arc::new(ApprovalService::new(
-            permission_request_repository,
-            side_effects.clone(),
-        )),
+        approval_service: Arc::new(ApprovalService::new(permission_request_repository)),
         template_service: Arc::new(TemplateService::new(template_repository)),
-        level_template_service: Arc::new(LevelTemplateService::new(
-            level_template_repository,
-            side_effects.clone(),
+        level_template_service: Arc::new(LevelTemplateService::new(level_template_repository)),
+        user_card_service: Arc::new(UserCardService::new(user_card_repository)),
+        personal_permission_service: Arc::new(PersonalPermissionService::new(
+            rule_repository,
+            grant_sod_validator,
         )),
-        user_card_service: Arc::new(UserCardService::new(
-            user_card_repository,
-            side_effects.clone(),
-        )),
-        personal_permission_service: Arc::new(
-            PersonalPermissionService::new(rule_repository, side_effects).with_sod_db(pool),
-        ),
         projector_health: Arc::new(OnceLock::new()),
-        arbiter_service: Arc::new(ArbiterService::new()),
         audit_replay_producer: AuditReplayProducerSlot::new(),
         test_control: None,
         org_scope_enabled: false,

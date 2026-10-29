@@ -1,7 +1,7 @@
 # 多云、半区权威与攻击恢复设计 QA
 
 > 创建日期：2026-10-27
-> 更新日期：2026-10-27
+> 更新日期：2026-10-28
 > 状态：逐项讨论中；本文记录设计设想、既有回答和待明确问题，不构成已批准的完整协议、实现证明、部署批准或等保测评结论。
 > 来源：2026-10-27 关于攻击场景、多云、双数据库、半区内存权威、代际栅栏和 NTP 授时的对话。
 
@@ -346,12 +346,12 @@
 
 **用户本轮回答（2026-10-27）：** “服务器保证稳定使用 NTP 授时，我们的规则代际保持哈希＋版本号＋内容＋时间戳等的结构，考虑当前改造的难度。”
 
-**当前设计结论：** 用户随后要求“先针对结构进行改进”，选择“直接接入发布链”，并明确“项目未正式投入使用，可直接采用 CURRENT V6”；此前的 v3 仅保留为 2026-10-27 历史请求及不可变 migration artifact。当前统一 V6 代际封存及其发布、内存、快照、消息、缓存和恢复读取，不保留旧 edition 运行时兼容。恢复旧内容的合法性仍须单独证明，新的时间、版本和哈希不会自动补回已撤销权限。关联 Q08、Q09、Q12、Q14。
+**当前设计结论：** 用户随后要求“先针对结构进行改进”，选择“直接接入发布链”，并明确“项目未正式投入使用，可直接采用 CURRENT V6”；此前的 v3 仅保留为 2026-10-27 历史请求及不可变 migration artifact。当前统一 V6 代际封存及其发布、编译、admission/read gate、segment、archive/completion、invalidation、snapshot 与 wire contract 为一个授权 bundle，不保留旧 edition 运行时兼容。Redis L2/MAC/shared-unit 及 `astral-cache` 已退出当前合同；缓存仅为有界进程内 L1，miss/failure 回到 strict DB read 或 PENDING/DENY，不等价替代跨实例 Redis 行为。恢复旧内容的合法性仍须单独证明，新的时间、版本和哈希不会自动补回已撤销权限。该 CURRENT V6 合同不表示数据库表已删除、迁移已执行或部署已完成。关联 Q08、Q09、Q12、Q14。
 
 **已批准结构与实施边界：**
 
-- 以 manifest/发布证据为 owner，完整代际包含范围、publication/source/projected generation、父代、撤销栅栏、event/operation、编译器、语义/依赖摘要、有序内容引用，以及必填 `PublicationSeal`。CURRENT V6 的 edition、digest/seal/compiler、segment/archive/completion、invalidation、cache/MAC 与 snapshot schema/payload 由共享 `authorization_edition!(6)` 宏派生；内容继续由不可变 segments 承载，不复制整份 payload。
-- 历史 v3 请求的摘要域为 `astral-auth-manifest-v3`，仅作为 immutable artifact 的历史事实；CURRENT V6 的唯一 manifest digest domain 为 `astral-auth-manifest-v6`，由共享 edition 宏派生，直接绑定上述全部不可变证据及封存时间。旧 v1/v2/v3/v5 proof、MAC、wire、cache 和 snapshot 不被新 reader 接受，不自动补字段或原地重标。
+- 以 manifest/发布证据为 owner，完整代际包含范围、publication/source/projected generation、父代、撤销栅栏、event/operation、编译器、语义/依赖摘要、有序内容引用，以及必填 `PublicationSeal`。CURRENT V6 的 edition、digest/seal/compiler、segment/archive/completion、invalidation 与 snapshot schema/payload 由共享 `authorization_edition!(6)` 宏派生；内容继续由不可变 segments 承载，不复制整份 payload。Redis L2/MAC/shared-unit 不属于当前 bundle。
+- 历史 v3 请求的摘要域为 `astral-auth-manifest-v3`，仅作为 immutable artifact 的历史事实；CURRENT V6 的唯一 manifest digest domain 为 `astral-auth-manifest-v6`，由共享 edition 宏派生，直接绑定上述全部不可变证据及封存时间。旧 v1/v2/v3/v5 proof、wire、cache 和 snapshot 不被新 reader 接受，不自动补字段或原地重标；历史 MAC 实现不构成当前缓存合同。
 - `sealed_at` 表示候选首次成功持久化封存的 UTC 整秒时间。staging 按 aggregate＋target generation 核验同一候选并复用持久值；同代不同内容或 provenance 拒绝。COMMIT 未知先对账，不能重取时间自动重放。edition 版本一致性不等于权限或 generation downgrade，NTP 时间也不承担提交排序或授权排序。
 - 编译器仍无时钟和 IO，segment 内容地址不包含时间，保留跨代复用；时间不替代 generation、CAS、lease、撤销栅栏或 source mutation 的合法性。
 - 新 schema 只作为历史 v3 artifact 保持原 migration ID、文件字节和 checksum；CURRENT V6 reader/runtime 对现有 v3 rows 缺少 edition 证明时保持 BLOCKED。旧开发 manifest 必须经批准从 source/ledger、撤销和审计事实执行 derived-state rebuild，不能自动改写、重置 generation 或恢复 revoked access。真实数据清理、重建与迁移另行批准，不因项目尚未正式投入使用而自动删除数据。
@@ -403,7 +403,7 @@
 
 **用户本轮回答（2026-10-27）：** 内存权威状态改变只能通过引擎校验后的合法请求，配合投影器物化和消息通道；城市部署由多台服务器和多个本地、云供应商承担，四台 AL 只是示意。
 
-**当前设计结论：** 消息通道参与合法状态变更，但通知或消息单独到达不构成授权状态变更依据。当前 `EVIDENCE_INVALIDATED`、`ELIGIBILITY_INVALIDATED`、`SESSION_REVOKED` 和 `INVALIDATION_HEARTBEAT` 统一为 V6 contract，且与 permission/L2/shared-content、snapshot schema/payload、MAC 一起切换；旧 wire、旧 cache 或旧 proof 不自动协商、补字段或重放。通知协议需面向城市级多节点、多供应商部署设计，不能按固定四台 AL 作为规模前提；传播和校验的具体合同尚未形成。关联 Q01、Q08、Q10、Q11、Q12、Q16。
+**当前设计结论：** 消息通道参与合法状态变更，但通知或消息单独到达不构成授权状态变更依据。当前 `EVIDENCE_INVALIDATED`、`ELIGIBILITY_INVALIDATED`、`SESSION_REVOKED` 和 `INVALIDATION_HEARTBEAT` 统一为 V6 contract，且与 published permission、snapshot schema/payload 和恢复读取一并切换；Redis L2/MAC/shared-content cache 已退出当前合同，旧 wire、旧 cache 或旧 proof 不自动协商、补字段或重放。通知协议需面向城市级多节点、多供应商部署设计，不能按固定四台 AL 作为规模前提；传播和校验的具体合同尚未形成。关联 Q01、Q08、Q10、Q11、Q12、Q16。
 
 ## 7. 多云、物理安全与合规目标
 

@@ -8,7 +8,6 @@ use std::sync::Arc;
 use astral_types::AstralError;
 
 use crate::repository::permission_request_repository::{NewRequest, PermissionRequestRepository};
-use crate::service::side_effect::PermissionSideEffects;
 
 /// 审批结果（approve 的 card_id，供响应使用）
 #[derive(Debug, Clone)]
@@ -19,15 +18,11 @@ pub struct ApproveOutcome {
 /// ApprovalService
 pub struct ApprovalService {
     repo: Arc<dyn PermissionRequestRepository>,
-    side_effects: Arc<dyn PermissionSideEffects>,
 }
 
 impl ApprovalService {
-    pub fn new(
-        repo: Arc<dyn PermissionRequestRepository>,
-        side_effects: Arc<dyn PermissionSideEffects>,
-    ) -> Self {
-        Self { repo, side_effects }
+    pub fn new(repo: Arc<dyn PermissionRequestRepository>) -> Self {
+        Self { repo }
     }
 
     /// 新建请求：在写入 PENDING 前验证请求者拥有目标卡，且卡片 ACTIVE、当前有效。
@@ -109,11 +104,6 @@ impl ApprovalService {
                 request_id_header,
             )
             .await?;
-        if !self.repo.writes_projection_in_transaction() {
-            self.side_effects
-                .request_card_projection(card_id, "APPROVED")
-                .await?;
-        }
 
         // approve_with_rule 已在同一事务内完成状态、规则与 projection append。
         // CARD projection outbox/worker 负责 canonical refresh，不能再从这里旁路发布 USER 刷新。
@@ -182,47 +172,8 @@ fn parse_rule_content(value: &str) -> Result<RequestContent, AstralError> {
 mod tests {
     use super::*;
     use crate::repository::permission_request_repository::PermissionRequestRecord;
-    use crate::service::side_effect::PermissionSideEffects;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
-
-    /// no-op compatibility recorder for test-only legacy side effects
-    struct RecordingSideEffects {
-        events: Mutex<Vec<(i64, String)>>,
-    }
-
-    impl RecordingSideEffects {
-        fn new() -> Self {
-            Self {
-                events: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn events(&self) -> Vec<(i64, String)> {
-            self.events.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait]
-    impl PermissionSideEffects for RecordingSideEffects {
-        async fn request_card_projection(
-            &self,
-            card_id: i64,
-            event_type: &str,
-        ) -> Result<(), AstralError> {
-            self.events
-                .lock()
-                .unwrap()
-                .push((card_id, event_type.to_string()));
-            Ok(())
-        }
-
-        async fn rebuild_card_snapshot(&self, _card_id: i64) {}
-        async fn rebuild_rule_set_snapshot(&self, _rule_set_id: i64) -> Result<(), AstralError> {
-            Ok(())
-        }
-        async fn evict_card_cache(&self, _card_id: i64) {}
-    }
 
     #[derive(Debug, Clone)]
     struct ApproveTxArgs {
@@ -417,7 +368,7 @@ mod tests {
     #[test]
     fn rule_metadata_is_parsed_without_loss() {
         let content = parse_rule_content(
-            r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"effect":"allow","priority":9,"conditionJson":{"ownerOnly":true},"validFrom":"2026-01-01","validTo":"2026-12-31"}"#,
+            r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"effect":"allow","priority":9,"conditionJson":{"conditionType":"OwnerOnlyCondition","params":{}},"validFrom":"2026-01-01","validTo":"2026-12-31"}"#,
         )
         .expect("metadata should parse");
         // canonical grant 只接受 ALLOW；入参大小写归一后回写
@@ -425,7 +376,7 @@ mod tests {
         assert_eq!(content.priority, Some(9));
         assert_eq!(
             content.condition_json,
-            Some(serde_json::json!({"ownerOnly": true}))
+            Some(serde_json::json!({"conditionType": "OwnerOnlyCondition", "params": {}}))
         );
         assert_eq!(content.valid_from.as_deref(), Some("2026-01-01"));
         assert_eq!(content.valid_to.as_deref(), Some("2026-12-31"));
@@ -507,8 +458,7 @@ mod tests {
         let mut rec = pending_record();
         rec.status = "APPROVED".into();
         let repo = Arc::new(FakeRequestRepository::new(Some(rec)));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = ApprovalService::new(repo, se);
+        let svc = ApprovalService::new(repo);
 
         let err = svc.approve(5, 1, None, None).await.unwrap_err();
         assert!(matches!(err, AstralError::Validation(_)));
@@ -517,8 +467,7 @@ mod tests {
     #[tokio::test]
     async fn approve_writes_rule_tx_and_rebuilds() {
         let repo = Arc::new(FakeRequestRepository::new(Some(pending_record())));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = ApprovalService::new(repo.clone(), se.clone());
+        let svc = ApprovalService::new(repo.clone());
 
         let outcome = svc
             .approve(5, 1, Some("ok"), Some("request-5"))
@@ -537,16 +486,13 @@ mod tests {
         // 请求未带 effect → 默认 ALLOW 写入
         assert_eq!(tx.effect, "ALLOW");
         assert_eq!(tx.request_id_header.as_deref(), Some("request-5"));
-        // 异步副作用触发 durable 投影事件（tokio::spawn 已在当前 runtime 执行）
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert_eq!(se.events(), vec![(3, "APPROVED".to_string())]);
+        // Repository approval transaction owns the durable projection append.
     }
 
     #[tokio::test]
     async fn reject_and_cancel_forward_decision_parameters() {
         let repo = Arc::new(FakeRequestRepository::new(Some(pending_record())));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = ApprovalService::new(repo.clone(), se);
+        let svc = ApprovalService::new(repo.clone());
 
         svc.reject(5, 11, Some("not enough scope"), Some("req-reject"))
             .await
@@ -599,7 +545,7 @@ mod tests {
                     "resourceType": "learn_course",
                     "actionCode": "read",
                     "cardId": 3,
-                    "condition_json": {"ownerOnly": true}
+                    "condition_json": {"conditionType": "OwnerOnlyCondition", "params": {}}
                 }),
                 "valid_from" => serde_json::json!({
                     "resourceType": "learn_course",
@@ -631,15 +577,14 @@ mod tests {
             r#"{"resource":"learn_course","actionCode":"read","cardId":3}"#,
             r#"{"resourceType":"learn_course","action":"read","cardId":3}"#,
             r#"{"resourceType":"learn_course","actionCode":"read","card_id":3}"#,
-            r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"condition_json":{"ownerOnly":true}}"#,
+            r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"condition_json":{"conditionType":"OwnerOnlyCondition","params":{}}}"#,
             r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"valid_from":"2026-01-01"}"#,
             r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"valid_to":"2026-12-31"}"#,
         ] {
             let mut record = pending_record();
             record.request_content = Some(legacy_content.into());
             let repo = Arc::new(FakeRequestRepository::new(Some(record)));
-            let se = Arc::new(RecordingSideEffects::new());
-            let svc = ApprovalService::new(repo.clone(), se.clone());
+            let svc = ApprovalService::new(repo.clone());
 
             let error = svc
                 .approve(5, 1, None, None)
@@ -647,7 +592,6 @@ mod tests {
                 .expect_err("approval must reject legacy RULE fields");
             assert!(matches!(error, AstralError::Validation(_)));
             assert!(repo.approve_tx.lock().unwrap().is_none());
-            assert!(se.events().is_empty());
         }
     }
 
@@ -659,8 +603,7 @@ mod tests {
                 .into(),
         );
         let repo = Arc::new(FakeRequestRepository::new(Some(rec)));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = ApprovalService::new(repo.clone(), se.clone());
+        let svc = ApprovalService::new(repo.clone());
 
         let error = svc
             .approve(5, 1, None, None)
@@ -669,7 +612,6 @@ mod tests {
         assert!(matches!(error, AstralError::Validation(message) if message.contains("ALLOW")));
         // 审计链：拒绝发生在事务前，无 source 写入、无审批副作用
         assert!(repo.approve_tx.lock().unwrap().is_none());
-        assert!(se.events().is_empty());
     }
 
     #[tokio::test]
@@ -684,8 +626,7 @@ mod tests {
                     .to_string(),
             );
             let repo = Arc::new(FakeRequestRepository::new(Some(rec)));
-            let se = Arc::new(RecordingSideEffects::new());
-            let svc = ApprovalService::new(repo.clone(), se.clone());
+            let svc = ApprovalService::new(repo.clone());
 
             let error = svc
                 .approve(5, 1, None, None)
@@ -698,7 +639,6 @@ mod tests {
             );
             // 审计链：拒绝发生在事务前，无 source 写入、无审批副作用
             assert!(repo.approve_tx.lock().unwrap().is_none());
-            assert!(se.events().is_empty());
         }
     }
 
@@ -710,8 +650,7 @@ mod tests {
             ),
             ..pending_record()
         })));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = ApprovalService::new(repo.clone(), se);
+        let svc = ApprovalService::new(repo.clone());
 
         svc.approve(5, 1, None, None)
             .await
@@ -727,12 +666,11 @@ mod tests {
     async fn approve_preserves_canonical_rule_metadata() {
         let repo = Arc::new(FakeRequestRepository::new(Some(PermissionRequestRecord {
             request_content: Some(
-                r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"effect":"allow","conditionJson":{"ownerOnly":true},"validFrom":"2026-01-01","validTo":"2026-12-31"}"#.into(),
+                r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"effect":"allow","conditionJson":{"conditionType":"OwnerOnlyCondition","params":{}},"validFrom":"2026-01-01","validTo":"2026-12-31"}"#.into(),
             ),
             ..pending_record()
         })));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = ApprovalService::new(repo.clone(), se);
+        let svc = ApprovalService::new(repo.clone());
 
         svc.approve(5, 1, None, None)
             .await
@@ -751,12 +689,10 @@ mod tests {
         rec.request_content =
             Some(r#"{"resourceType":"learn_course","actionCode":"read","cardId":null}"#.into());
         let repo = Arc::new(FakeRequestRepository::new(Some(rec)));
-        let se = Arc::new(RecordingSideEffects::new());
-        let svc = ApprovalService::new(repo.clone(), se.clone());
+        let svc = ApprovalService::new(repo.clone());
 
         let err = svc.approve(5, 1, None, None).await.unwrap_err();
         assert!(matches!(err, AstralError::Validation(_)));
         assert!(repo.approve_tx.lock().unwrap().is_none());
-        assert!(se.events().is_empty());
     }
 }

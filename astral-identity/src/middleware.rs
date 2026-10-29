@@ -163,7 +163,7 @@ pub async fn identity_permission_middleware(
             SqlxRuleRepository::new(state.db.clone())
                 .with_org_scope_enabled(state.org_scope_enabled),
         )
-        // 镜像 miss 时回填 strict durable bundle（MySQL 直读，不跳 Redis L2），
+        // 镜像 miss 时回填 strict durable bundle（MySQL 直读），
         // 与 hub strict_refill 契约一致；读取失败按既有 pending/DB 回退语义处理。
         .with_durable_refill(state.db.clone());
         state.engine.evaluate(&ctx, &repo).await

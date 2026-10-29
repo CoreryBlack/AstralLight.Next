@@ -92,6 +92,10 @@ impl<'a> EvaluationProbe<'a> {
 
 #[async_trait::async_trait]
 impl RuleRepository for EvaluationProbe<'_> {
+    async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
+        Ok(false)
+    }
+
     async fn check_card_active(&self, ctx: &PolicyContext) -> Result<bool, PolicyError> {
         self.card_checks.fetch_add(1, Ordering::Relaxed);
         Ok(ctx.user_id == Some(42)
@@ -108,77 +112,6 @@ impl RuleRepository for EvaluationProbe<'_> {
     ) -> Result<OrgAuthorityRead, PolicyError> {
         self.org_reads.fetch_add(1, Ordering::Relaxed);
         Ok(OrgAuthorityRead::Unmanaged)
-    }
-
-    async fn load_permission_rules(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<policy_engine::PermissionRule>, PolicyError> {
-        panic!("strict evaluation benchmark must not read legacy permission rules")
-    }
-
-    async fn load_rule_set_snapshots(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<policy_engine::RuleSetSnapshot>, PolicyError> {
-        panic!("strict evaluation benchmark must not read legacy snapshots")
-    }
-
-    async fn load_snapshot_winners(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<policy_engine::SnapshotWinner>, PolicyError> {
-        panic!("strict evaluation benchmark must not read legacy winners")
-    }
-
-    async fn load_rule_set_dependency_statuses(
-        &self,
-        _card_id: i64,
-    ) -> Result<Option<Vec<policy_engine::RuleSetDependencyStatus>>, PolicyError> {
-        panic!("strict evaluation benchmark must not read legacy dependencies")
-    }
-
-    async fn get_projection_gate(
-        &self,
-        _card_id: i64,
-    ) -> Result<Option<policy_engine::ProjectionGate>, PolicyError> {
-        panic!("strict evaluation benchmark must not read legacy projection gates")
-    }
-
-    async fn load_rule_set_entries_raw(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<policy_engine::RuleSetSnapshot>, PolicyError> {
-        panic!("strict evaluation benchmark must not read raw rulesets")
-    }
-
-    async fn load_permission_rules_raw(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<policy_engine::PermissionRule>, PolicyError> {
-        panic!("strict evaluation benchmark must not read raw permission rules")
-    }
-
-    async fn load_projected_delegated_rules(
-        &self,
-        _delegate_id: i64,
-        _resource: &str,
-        _action: &str,
-    ) -> Result<Vec<policy_engine::PermissionRule>, PolicyError> {
-        panic!("strict evaluation benchmark must not read legacy delegations")
-    }
-
-    async fn load_delegated_rules(
-        &self,
-        _delegate_id: i64,
-        _resource: &str,
-        _action: &str,
-    ) -> Result<Vec<policy_engine::PermissionRule>, PolicyError> {
-        panic!("strict evaluation benchmark must not read raw delegations")
-    }
-
-    fn requires_published_card_evidence(&self) -> bool {
-        true
     }
 
     async fn load_published_card_authorization(

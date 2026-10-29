@@ -302,9 +302,6 @@ fn test_scoped_query_missing_tenant_fails_closed() {
         q.try_build(),
         Err(astral_common::middleware::tenant_filter::TenantScopeQueryError::ScopeRequired)
     );
-    let (sql, params) = q.build();
-    assert_eq!(sql, "SELECT NULL WHERE 1 = 0");
-    assert!(params.is_empty());
 }
 
 #[test]
@@ -402,9 +399,6 @@ fn test_scoped_query_with_filter_empty_fails_closed() {
         q.try_build(),
         Err(astral_common::middleware::tenant_filter::TenantScopeQueryError::ScopeRequired)
     );
-    let (sql, params) = q.build();
-    assert_eq!(sql, "SELECT NULL WHERE 1 = 0");
-    assert!(params.is_empty());
 }
 
 // ===== 跨租户隔离不变式测试 =====

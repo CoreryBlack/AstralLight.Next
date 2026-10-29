@@ -1,4 +1,4 @@
-//! Redis-free 会话投影存储（strict durable facts + 有界进程内镜像）。
+//! 会话投影存储（strict durable facts + 有界进程内镜像）。
 //!
 //! ## 背景
 //!
@@ -6,8 +6,8 @@
 //! `access:jti:{jti}` 标量存活投影与 `access:grant:{jti}` 版本化 grant。本模块
 //! 把同一批判定迁移到 **MySQL strict durable facts**（`auth_session_jti_index`
 //! × `auth_device_session` × `auth_token_family` × `user_card` × `identity_card`），
-//! 并提供**有界进程内镜像**作为可选加速器；Redis 退化为显式配置的
-//! default-off 兼容 adapter。
+//! 并提供**有界进程内镜像**作为可选加速器。兼容 Redis 适配层已从宿主中移除；
+//! 镜像 miss、过期、驱逐或 suspect 时始终回到 strict durable reader。
 //!
 //! ## 安全语义（必须原文理解）
 //!

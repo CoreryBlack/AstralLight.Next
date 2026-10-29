@@ -159,11 +159,7 @@ async fn reset_password(
         )
         .await
         .map_err(AppError::from)?;
-    #[cfg(feature = "redis-compat")]
-    let redis = state.redis.as_ref();
-    #[cfg(not(feature = "redis-compat"))]
-    let redis: Option<&()> = None;
-    project_password_revocation(&state, &revoked_jtis, redis)
+    project_password_revocation(&revoked_jtis)
         .await
         .map_err(AppError::from)?;
 
@@ -191,7 +187,7 @@ mod tests {
             .find("Some(row.id)")
             .expect("reset token identity must be consumed in the source transaction");
         let projection = body
-            .find("project_password_revocation(&state, &revoked_jtis")
+            .find("project_password_revocation(&revoked_jtis")
             .expect("post-commit projection must receive only the transaction snapshot");
         assert!(mutation < consume && consume < projection);
         assert!(!body.contains("revoke_all_sessions_for_user"));

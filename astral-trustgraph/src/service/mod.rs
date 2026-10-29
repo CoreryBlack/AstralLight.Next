@@ -1,9 +1,8 @@
 //! TrustGraph 应用服务层
 //!
-//! 对齐 Java `PermissionRuleWriteCoordinator` / `RuleSetService` /
-//! `DelegationService` 编排边界：source mutation 与 durable 投影事件/快照重建/缓存失效等
-//! 副作用的编排收口在 service，handler 只做 HTTP 适配。
-//! `side_effects.rs` 的内部实现（乐观锁重建、Redis evict、补偿、MQ）不动。
+//! Source mutation orchestration lives in application services and transaction-owning
+//! repositories. Handlers adapt HTTP; owned workers publish durable authorization
+//! evidence. Native invalidation and revocation delivery run only after source COMMIT.
 
 use astral_types::AstralError;
 
@@ -37,7 +36,6 @@ pub(crate) fn validate_canonical_grant_effect(effect: &str) -> Result<String, As
 
 pub(crate) mod admission_checks;
 pub mod approval_service;
-pub mod arbiter;
 pub mod audit_replay_worker;
 pub(crate) mod integration_authorization;
 // 新 Rust-owned 版本化授权投影 durable worker（20260825000002/20260827000001 新表
@@ -97,10 +95,7 @@ pub mod personal_permission_service;
 pub mod projection_worker;
 pub mod rule_set_write_service;
 pub mod rule_write_service;
-pub mod side_effect;
-// 读链规模化 Batch E：授权投影「同步发布混合模式」——source 事务提交后，影响面
-// ≤ 阈值的单卡/小变更经 worker 同一原语在请求内发布 delta（消除撤销传播延迟
-// 窗口）；大扇出与任何失败都降级为 worker 异步消化，绝不阻塞写请求。
+// Source COMMIT callers may wait read-only for exact owned completion receipts.
 pub mod sync_publish;
 pub mod template_service;
 pub mod tenant_service;

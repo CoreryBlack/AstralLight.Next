@@ -6,9 +6,9 @@
 //! source tx commit (source wrapper)
 //!   └─ astral_db::dispatch_committed_projection_delta(request)   [bounded bus]
 //!        └─ LOCAL WORKER recv → acknowledge
-//!             └─ claim_event_by_dispatch (ONE DB tx: durable CAS lease install
-//!                 + field-by-field payload binding; SUCCEEDED/QUARANTINED skip;
-//!                 Busy/InDoubt never replay)
+//!             └─ owned claim_event_by_dispatch (atomic lane + event claim,
+//!                 exact payload binding; AlreadyProcessed/TerminalGated/Busy/
+//!                 InDoubt never replay; token capability registered before use)
 //!                  └─ process_verified_claim (same pure decide pipeline as the
 //!                      DB-poll worker: observe → ledger → pure decide →
 //!                      single-transaction durable publish)
@@ -41,12 +41,12 @@
 //!
 //! # Recovery
 //!
-//! The Rabbit/DB-poll worker stays unchanged for multi-node deployments. A
-//! low-frequency recovery pass (default 15s) re-claims queue-side events the
-//! bus may have missed (overflow / rejected dispatch — e.g. a missed ADD
-//! receipt) through the SAME verified pipeline; only deltas the durable claim
-//! predicates prove claimable are recovered, and mirror provenance gaps
-//! compile from strict cold reads.
+//! The WorkerOwned recovery pass shares the same aggregate-lane capability
+//! protocol as direct dispatch. It discovers queue-side events the bus may have
+//! missed (overflow / rejected dispatch — e.g. a missed ADD receipt) through the
+//! SAME verified pipeline; only deltas the durable claim predicates prove
+//! claimable are recovered, and mirror provenance gaps compile from strict cold
+//! reads.
 //!
 //! # Liveness supervision (worker-supervision-20261002)
 //!
@@ -74,18 +74,18 @@ use tokio::task::JoinHandle;
 use astral_db::{
     local_projection_bus, memory_mirror_is_installed, memory_projection_hub,
     take_global_local_projection_receiver, AuthorizationCurrentPointerRecord,
-    AuthorizationPublishedState, ClaimedDeltaEvent, ClaimedStableEventOutcome, CommitDeltaEnvelope,
-    DeltaEventAppendRequest, DeltaEventClaim, DeltaEventClaimScope, DeltaEventType,
-    DeltaLeaseIdentity, DeltaProjectorPublishOutcome, LocalProjectionBus,
-    LocalProjectionOwnerTaken, ProjectionAggregateIdentity, PublishedAggregateFrontier,
-    PublishedFrontierEvent, PublishedGenerationSummary, RawLedgerRow, STATUS_ACTIVE,
+    AuthorizationPublishedState, ClaimedDeltaEvent, CommitDeltaEnvelope, DeltaEventAppendRequest,
+    DeltaEventClaim, DeltaEventClaimScope, DeltaEventType, DeltaLeaseIdentity,
+    DeltaProjectorPublishOutcome, LocalProjectionBus, LocalProjectionOwnerTaken,
+    ProjectionAggregateIdentity, PublishedAggregateFrontier, PublishedFrontierEvent,
+    PublishedGenerationSummary, RawLedgerRow, STATUS_ACTIVE,
 };
 
 use super::authorization_projector::{
     process_verified_claim, AuthorizationProjectorConfig, AuthorizationProjectorHandle,
-    AuthorizationProjectorRuntime, OwnedTransitionProof, ProjectorCancellationToken,
-    ProjectorHealthShared, ProjectorProgress, PublicationContext, RepositoryRejection,
-    RuntimeAccessError, SqlxAuthorizationProjectorRuntime, WorkerRunSummary,
+    AuthorizationProjectorRuntime, DispatchedClaimOutcome, OwnedTransitionProof,
+    ProjectorCancellationToken, ProjectorHealthShared, ProjectorProgress, PublicationContext,
+    RepositoryRejection, RuntimeAccessError, SqlxAuthorizationProjectorRuntime, WorkerRunSummary,
 };
 use crate::observability::{record_projector_event, ProjectorEventOutcome};
 
@@ -985,7 +985,6 @@ fn insert_ledger_row_sorted(rows: &mut Vec<RawLedgerRow>, row: RawLedgerRow) {
 /// exists. The publish outcome is stashed so the worker can advance the
 /// mirror after the pipeline reports a durable publish.
 pub struct LocalProjectionRuntime {
-    pool: MySqlPool,
     inner: SqlxAuthorizationProjectorRuntime,
     mirror: ScopePlanMirror,
     /// Publish outcomes of THIS runtime instance keyed by event id (single
@@ -996,8 +995,7 @@ pub struct LocalProjectionRuntime {
 impl LocalProjectionRuntime {
     pub fn new(pool: MySqlPool) -> Self {
         Self {
-            inner: SqlxAuthorizationProjectorRuntime::new(pool.clone()),
-            pool,
+            inner: SqlxAuthorizationProjectorRuntime::new(pool),
             mirror: ScopePlanMirror::default(),
             published: Mutex::new(HashMap::new()),
         }
@@ -1078,10 +1076,6 @@ impl LocalProjectionRuntimePort for LocalProjectionRuntime {
 
 #[async_trait::async_trait]
 impl AuthorizationProjectorRuntime for LocalProjectionRuntime {
-    fn worker_owned_execution(&self) -> bool {
-        self.inner.worker_owned_execution()
-    }
-
     async fn begin_event_execution(
         &self,
         identity: &astral_db::DeltaLeaseIdentity,
@@ -1091,17 +1085,6 @@ impl AuthorizationProjectorRuntime for LocalProjectionRuntime {
 
     fn event_execution_failures(&self, identity: &astral_db::DeltaLeaseIdentity) -> Option<u32> {
         self.inner.event_execution_failures(identity)
-    }
-
-    async fn defer_event(
-        &self,
-        identity: &astral_db::DeltaLeaseIdentity,
-        backoff_seconds: i64,
-        reason: &str,
-    ) {
-        self.inner
-            .defer_event(identity, backoff_seconds, reason)
-            .await;
     }
 
     async fn owned_fail_transition(
@@ -1128,25 +1111,10 @@ impl AuthorizationProjectorRuntime for LocalProjectionRuntime {
         request: &DeltaEventAppendRequest,
         lease_owner: &str,
         lease_seconds: i64,
-    ) -> Result<ClaimedStableEventOutcome, RuntimeAccessError> {
-        if self.worker_owned_execution() {
-            return self
-                .inner
-                .claim_event_by_dispatch(request, lease_owner, lease_seconds)
-                .await;
-        }
-        let mut tx = self.pool.begin().await?;
-        let outcome = astral_db::claim_delta_event_by_stable_event_in_tx(
-            &mut tx,
-            request,
-            lease_owner,
-            lease_seconds,
-        )
-        .await?;
-        match tx.commit().await {
-            Ok(()) => Ok(outcome),
-            Err(error) => resolve_claim_commit(outcome, &error.to_string(), &request.event_id),
-        }
+    ) -> Result<DispatchedClaimOutcome, RuntimeAccessError> {
+        self.inner
+            .claim_event_by_dispatch(request, lease_owner, lease_seconds)
+            .await
     }
 
     async fn claim_next_event(
@@ -1242,21 +1210,6 @@ impl AuthorizationProjectorRuntime for LocalProjectionRuntime {
         }
     }
 
-    async fn fail_event(
-        &self,
-        identity: &astral_db::DeltaLeaseIdentity,
-        backoff_seconds: i64,
-        message: &str,
-    ) {
-        self.inner
-            .fail_event(identity, backoff_seconds, message)
-            .await;
-    }
-
-    async fn release_event(&self, identity: &astral_db::DeltaLeaseIdentity) {
-        self.inner.release_event(identity).await;
-    }
-
     async fn mark_event_quarantined(
         &self,
         lease: &astral_db::DeltaLeaseIdentity,
@@ -1283,38 +1236,6 @@ impl AuthorizationProjectorRuntime for LocalProjectionRuntime {
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure claim-tail / classification helpers (unit-tested without a database)
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Resolve the tail of the direct-claim transaction.
-///
-/// Commit-unknown status semantics: a FAILED commit after a lease install is
-/// an UNRESOLVABLE state — the install may be durable (an orphaned lease
-/// token this process never learned) or rolled back, and the caller cannot
-/// distinguish the two. The resolution therefore NEVER implies rollback
-/// success: a `Claimed` outcome becomes
-/// [`ClaimedStableEventOutcome::InDoubt`] (no replay, hub suspect) while the
-/// durable lease is left in place for server-side expiry reclaim. Read-only
-/// arms (no mutation attempted) fail transiently instead.
-fn resolve_claim_commit(
-    outcome: ClaimedStableEventOutcome,
-    commit_error: &str,
-    event_id: &str,
-) -> Result<ClaimedStableEventOutcome, RuntimeAccessError> {
-    match outcome {
-        ClaimedStableEventOutcome::Claimed { .. } => Ok(ClaimedStableEventOutcome::InDoubt {
-            event_id: event_id.to_owned(),
-            reason: format!(
-                "code=local_projection_worker.claim_commit_unknown;event_id={event_id};\
-                     durable_lease=left_for_expiry_reclaim;error={commit_error}"
-            ),
-        }),
-        other => {
-            // Read-only arms never mutated the row; a failed commit only
-            // discards the read snapshot.
-            let _ = commit_error;
-            Ok(other)
-        }
-    }
-}
 
 /// Whether a direct-claim refusal is a durable CONTRACT divergence between
 /// the commit-proven envelope and the durable row (field-by-field payload
@@ -1733,14 +1654,14 @@ where
             }
             LocalEventEpisodeOutcome::NoProgress
         }
-        Ok(ClaimedStableEventOutcome::AlreadyProcessed { event_id }) => {
+        Ok(DispatchedClaimOutcome::AlreadyProcessed { event_id }) => {
             tracing::debug!(
                 event_id = %event_id,
                 "dispatched delta already durably processed; skip without replay"
             );
             LocalEventEpisodeOutcome::Progress
         }
-        Ok(ClaimedStableEventOutcome::TerminalGated { event_id, status }) => {
+        Ok(DispatchedClaimOutcome::TerminalGated { event_id, status }) => {
             // NOT a success skip: the durable terminal gate stays in force and
             // the redispatch is surfaced for reconciliation.
             tracing::error!(
@@ -1751,14 +1672,14 @@ where
             );
             LocalEventEpisodeOutcome::Progress
         }
-        Ok(ClaimedStableEventOutcome::Busy { event_id }) => {
+        Ok(DispatchedClaimOutcome::Busy { event_id }) => {
             tracing::debug!(
                 event_id = %event_id,
                 "dispatched delta not claimable now (live lease / backoff window); recovery converges"
             );
             LocalEventEpisodeOutcome::NoProgress
         }
-        Ok(ClaimedStableEventOutcome::InDoubt { event_id, reason }) => {
+        Ok(DispatchedClaimOutcome::InDoubt { event_id, reason }) => {
             tracing::error!(
                 event_id = %event_id,
                 reason = %reason,
@@ -1769,7 +1690,7 @@ where
             }
             LocalEventEpisodeOutcome::Unknown { recorded: false }
         }
-        Ok(ClaimedStableEventOutcome::Claimed { claim, event }) => {
+        Ok(DispatchedClaimOutcome::Claimed { claim, event }) => {
             summary.events_claimed += 1;
             // Claim-time provenance upsert from the commit-proven request:
             // inserts the event's own ledger row while per-grant continuity
@@ -1785,11 +1706,11 @@ where
                 Err(error) => {
                     // Shape corruption of a payload-bound claim: quarantine is
                     // impossible without a valid identity, so record UNKNOWN
-                    // and leave the leased row to expire for reclaim.
+                    // and retain the owned capability for exact reconciliation.
                     tracing::error!(
                         event_id = %claim.event_id,
                         error = %error,
-                        "claimed identity invalid on the direct path; lease left to expire"
+                        "claimed identity invalid on the direct path; owned capability retained for reconciliation"
                     );
                     return LocalEventEpisodeOutcome::Unknown { recorded: false };
                 }
@@ -1941,7 +1862,7 @@ where
             tracing::error!(
                 event_id = %claim.event_id,
                 error = %error,
-                "recovery claim identity invalid; lease left to expire"
+                "recovery claim identity invalid; owned capability retained for reconciliation"
             );
             return RecoveryEpisodeOutcome::Unknown { recorded: false };
         }
@@ -1993,7 +1914,7 @@ where
                     tracing::error!(
                         event_id = %claim.event_id,
                         error = %error,
-                        "recovery readback identity invalid; lease left to expire"
+                        "recovery readback identity invalid; owned capability retained for reconciliation"
                     );
                     return RecoveryEpisodeOutcome::Unknown { recorded: false };
                 }
@@ -2001,7 +1922,7 @@ where
             if readback_identity != identity {
                 tracing::error!(
                     event_id = %claim.event_id,
-                    "recovery readback identity diverged from claim; lease left to expire"
+                    "recovery readback identity diverged from claim; owned capability retained for reconciliation"
                 );
                 return RecoveryEpisodeOutcome::Unknown { recorded: false };
             }
@@ -2035,7 +1956,7 @@ where
             tracing::warn!(
                 event_id = %claim.event_id,
                 error = %error,
-                "recovery claim readback refused; event stays for lease-expiry reclaim"
+                "recovery claim readback refused; owned capability retained for reconciliation"
             );
             RecoveryEpisodeOutcome::Unknown { recorded: false }
         }

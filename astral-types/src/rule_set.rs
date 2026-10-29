@@ -222,7 +222,7 @@ mod tests {
             resource_id: Some(3),
             action_code: "read".into(),
             effect: "ALLOW".into(),
-            condition_json: Some(r#"{"ownerOnly":true}"#.into()),
+            condition_json: Some(r#"{"conditionType":"OwnerOnlyCondition","params":{}}"#.into()),
             priority: 4,
             enabled: true,
             valid_from: Some(valid_from),

@@ -1,6 +1,7 @@
 //! SoD 冲突检查（供权限中间件集成）
 //!
-//! 在权限检查通过后调用，防止持有互斥权限的卡访问敏感资源。
+//! 宿主请求路径在权限检查通过后调用，防止持有互斥权限的卡访问敏感资源；
+//! 原生授权写入另走 grant-time 校验，在写入前拒绝互斥授权。
 //! 对齐 Java `SodService.checkDynamicSoD()` + `SodService.checkStaticSoD()`。
 //!
 //! STATIC: 预定义的互斥权限对（如"审批者"+"提交者"）
@@ -15,8 +16,7 @@
 //! scope 合同拒绝（`InvalidRequest`）、`user_card.tenant_id` 缺失或非正时，
 //! 本模块返回数据库错误而不是"无冲突"结果；调用方（中间件/授权链）对 Err
 //! 一律拒绝请求（503/fail-closed）。"读取后复核"语义由 reader 事务 +
-//! FOR UPDATE + 指针一致性校验天然接管，本模块不再读取旧链 CARD head 表，
-//! 也不存在任何 legacy 快照 / raw source 回退。
+//! FOR UPDATE + 指针一致性校验天然接管，本模块不读取旧快照或 raw 授权源。
 //!
 //! 证据读取统一经 [`crate::evidence_cache::
 //! cached_load_published_card_grant_evidence`]（进程内 evidence 缓存 + 指针
@@ -66,21 +66,15 @@
 //!   零 DB；writer-active/unknown 一律 fail-closed，绝不以并发/未知 source
 //!   状态放行；非 composite 保留既有 TTL 30s 语义不变。
 //!
-//! ### canonical 宿主路径的持有语义（冷/热一致；BREAKING CHANGE 登记）
+//! ### published-evidence 合同
 //!
-//! canonical 宿主 SoD 路径（[`check_sod_conflict_with_context`] /
+//! 宿主 SoD 路径（[`check_sod_conflict_with_context`] /
 //! [`check_sod_conflict_with_context_and_org`]，cold durable 回退与 warm 记忆路径**同一
-//! 合同**）对"持有授权"的定义只认**已发布 evidence** 的 `effective_grants`
-//! （与 `sod_repository::card_permissions` 同一 effective-grant contract）：
-//! raw `permission_rule` 行是 legacy 直写事实、未经发布链验证，**不构成持有
-//! 授权**，canonical 路径冷/热均不执行 `SOD_RAW_RULE_CONFLICT_SQL` 扫描。
-//! 旧公开诊断入口 [`check_sod_conflict`] 与 [`check_sod_conflict_with_org`]
-//! 保留 raw deny-biased 扫描。两类入口因此**不是**逐字节等同：canonical
-//! 移除了 raw 扫描（raw 行命中只会把 has_conflict 变 true，即移除后同请求
-//! 可能从拒绝变为放行）——该差异由主域规范登记为 BREAKING CHANGE/语义修正，
-//! 冷/热合同一致性由此保证（warm 相对 cold 不再有任何放行面扩大）。
+//! 合同**）及原生授权写入路径 [`check_grant_sod_conflict`] 只把经过严格校验的
+//! 已发布 `effective_grants` 视为持有授权。未发布 source rows 不参与 SoD；所有
+//! 路径共用同一 native conflict evaluator，不提供 raw-source 诊断或授权回退。
 //!
-//! 策略快照回填（两种模式共用）全部有界：`LIMIT cap+1` 探针（超限
+//! 策略快照回填（各模式共用）全部有界：`LIMIT cap+1` 探针（超限
 //! fail-closed）、快照字节预算、3s 查询 deadline、进程级 single-flight
 //! 有界锁等待；composite 回填前后经 hub 严格 token 对牌（读前取 token、
 //! 读后复核，竞争即报错，绝不缓存竞争产物）。
@@ -117,13 +111,191 @@ use crate::memory_projection_hub::{
 };
 use crate::org_scope_repository::{OrgAdmissionQuery, OrgScopeRepository, SqlxOrgScopeRepository};
 
-/// SoD 冲突检查结果
+/// Result from a deny-only SoD conflict check.
 #[derive(Debug)]
 pub struct SodCheckResult {
     pub has_conflict: bool,
     pub conflict_policy: Option<String>,
     pub conflict_permission: Option<String>,
     pub conflict_type: Option<String>, // "STATIC" | "DYNAMIC"
+}
+
+/// Complete, locked source before-image for a direct-rule UPDATE SoD check.
+///
+/// The repository constructs this only from the `permission_rule` + `user_card`
+/// rows read `FOR UPDATE`. The transaction-level gate re-locks the card, checks
+/// both tenant columns plus user/domain, then proves that exactly one published
+/// record has this stable DIRECT identity and the same authorization content.
+/// Rule tenant is compared to the separately locked card tenant as well as the
+/// card's fresh transaction lock; domain is reconciled against the source card.
+/// CREATE must pass `None`; callers cannot select an arbitrary grant id to omit.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectGrantSodUpdateBeforeImage<'a> {
+    pub rule_tenant_id: Option<i64>,
+    pub source_card_tenant_id: Option<i64>,
+    pub domain_id: Option<i64>,
+    pub card_id: i64,
+    pub user_id: i64,
+    pub rule_id: i64,
+    pub source_type: &'a str,
+    pub enabled: Option<i32>,
+    pub effect: &'a str,
+    pub resource_type: &'a str,
+    pub resource_id: Option<i64>,
+    pub action_code: &'a str,
+    pub condition_json: Option<&'a str>,
+    pub valid_from: Option<&'a str>,
+    pub valid_to: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, sqlx::FromRow)]
+struct LockedSodCardScope {
+    card_id: i64,
+    tenant_id: Option<i64>,
+    domain_id: Option<i64>,
+    user_id: Option<i64>,
+}
+
+/// Validate that the source-row tenant and card tenant agree with the current
+/// locked card before any pending/evidence reads or source mutation proceed.
+fn validate_direct_update_scope(
+    before: &DirectGrantSodUpdateBeforeImage<'_>,
+    locked_card: LockedSodCardScope,
+    requested_card_id: i64,
+) -> Result<i64, &'static str> {
+    if requested_card_id <= 0
+        || before.card_id != requested_card_id
+        || locked_card.card_id != requested_card_id
+    {
+        return Err("sod_grant_update_card_scope_mismatch");
+    }
+    let Some(rule_tenant_id) = before.rule_tenant_id.filter(|tenant| *tenant > 0) else {
+        return Err("sod_grant_update_rule_tenant_missing");
+    };
+    let Some(source_card_tenant_id) = before.source_card_tenant_id.filter(|tenant| *tenant > 0)
+    else {
+        return Err("sod_grant_update_source_card_tenant_missing");
+    };
+    let Some(locked_tenant_id) = locked_card.tenant_id.filter(|tenant| *tenant > 0) else {
+        return Err("sod_grant_update_locked_card_tenant_missing");
+    };
+    if rule_tenant_id != source_card_tenant_id || source_card_tenant_id != locked_tenant_id {
+        return Err("sod_grant_update_tenant_scope_mismatch");
+    }
+    if before.domain_id.is_some_and(|domain_id| domain_id <= 0)
+        || before.domain_id != locked_card.domain_id
+    {
+        return Err("sod_grant_update_domain_scope_mismatch");
+    }
+    if before.user_id <= 0 || locked_card.user_id != Some(before.user_id) {
+        return Err("sod_grant_update_user_scope_mismatch");
+    }
+    if before.rule_id <= 0 || before.source_type != "MANUAL" || before.enabled.unwrap_or(1) != 1 {
+        return Err("sod_grant_update_source_identity_unusable");
+    }
+    Ok(locked_tenant_id)
+}
+
+/// Prove the unique published before-image for an update. The result is only the
+/// stable identity to omit from STATIC conflict matching; every other grant and
+/// all DYNAMIC checks remain unchanged.
+fn prove_direct_update_self_exclusion(
+    evidence: &PublishedCardAuthorization,
+    before: &DirectGrantSodUpdateBeforeImage<'_>,
+    locked_card: LockedSodCardScope,
+    requested_card_id: i64,
+) -> Result<astral_types::GrantId, &'static str> {
+    let tenant_id = validate_direct_update_scope(before, locked_card, requested_card_id)?;
+    if !before.effect.trim().eq_ignore_ascii_case("ALLOW")
+        || before.resource_type.trim().is_empty()
+        || before.action_code.trim().is_empty()
+    {
+        return Err("sod_grant_update_before_image_unrepresentable");
+    }
+    crate::grant_ledger::reject_unrepresentable_condition(
+        before.condition_json,
+        "direct rule update SoD before-image",
+    )
+    .map_err(|_| "sod_grant_update_before_image_unrepresentable")?;
+
+    let facts = crate::grant_ledger::DirectRuleLedgerFacts {
+        tenant_id: Some(tenant_id),
+        domain_id: before.domain_id,
+        card_id: before.card_id,
+        user_id: before.user_id,
+        rule_id: before.rule_id,
+        resource: before.resource_type,
+        resource_id: before.resource_id,
+        action: before.action_code,
+        condition_json: before.condition_json,
+        valid_from: before.valid_from,
+        valid_to: before.valid_to,
+    };
+    let grant_id = crate::grant_ledger::derive_direct_identity(&facts)
+        .map_err(|_| "sod_grant_update_identity_invalid")?;
+    let expected_resource =
+        crate::grant_ledger::canonical_resource_key(before.resource_type, before.resource_id)
+            .map_err(|_| "sod_grant_update_before_image_unrepresentable")?;
+    let expected_validity =
+        crate::grant_ledger::parse_validity_window(before.valid_from, before.valid_to)
+            .map_err(|_| "sod_grant_update_before_image_unrepresentable")?;
+    let expected_tenant = astral_types::TenantScope::new(tenant_id, before.domain_id)
+        .map_err(|_| "sod_grant_update_before_image_scope_invalid")?;
+    let card_identity = before.card_id.to_string();
+    let rule_identity = before.rule_id.to_string();
+
+    if evidence.tenant_id != tenant_id || evidence.card_id != before.card_id {
+        return Err("sod_grant_update_evidence_scope_mismatch");
+    }
+    // Include the derived id and the source-entry locator in the candidate set:
+    // a corrupt/mis-provenanced duplicate is ambiguity, never an excuse to skip it.
+    let candidates: Vec<_> = evidence
+        .records
+        .iter()
+        .filter(|record| {
+            record.grant.grant_id == grant_id
+                || (record.aggregate_id == before.card_id
+                    && record.grant.provenance.source_entry.as_deref()
+                        == Some(rule_identity.as_str()))
+        })
+        .collect();
+    if candidates.len() != 1 {
+        return Err("sod_grant_update_published_identity_missing_or_ambiguous");
+    }
+    let record = candidates[0];
+    let grant = &record.grant;
+    let exact_before_image = record.aggregate_type == crate::grant_ledger::DIRECT_AGGREGATE_TYPE
+        && record.aggregate_id == before.card_id
+        && grant.grant_id == grant_id
+        && grant.state == astral_types::GrantState::Active
+        && grant.source_kind == astral_types::GrantSourceKind::Direct
+        && grant.binding_layer == astral_types::BindingLayer::None
+        && grant.tenant == expected_tenant
+        && grant.card_id == before.card_id
+        && grant.user_id == before.user_id
+        && grant.resource == expected_resource
+        && grant.action == before.action_code.trim()
+        && grant.effect == astral_types::GrantEffect::Allow
+        && grant.validity == expected_validity
+        && grant.provenance.source_id == card_identity
+        && grant.provenance.source_entry.as_deref() == Some(rule_identity.as_str())
+        && grant.provenance.binding_id.is_none()
+        && grant.provenance.delegation_id.is_none()
+        && grant.provenance.operation_id == record.operation_id
+        && grant.provenance.event_id.as_deref() == Some(record.event_id.as_str());
+    if !exact_before_image {
+        return Err("sod_grant_update_published_before_image_mismatch");
+    }
+    if evidence
+        .effective_grants
+        .iter()
+        .filter(|grant| grant.grant_id == grant_id)
+        .count()
+        > 1
+    {
+        return Err("sod_grant_update_effective_identity_ambiguous");
+    }
+    Ok(grant_id)
 }
 
 /// 解析 scoped resource key 为 plain resource type：`type:*` 与 `type:id` 均返回
@@ -146,8 +318,8 @@ pub fn sod_resource_type_from_scoped_key(resource_key: &str) -> String {
 ///
 /// grant 侧 resource 是 scoped key，先经 [`sod_resource_type_from_scoped_key`]
 /// 归一为 plain type 再与伙伴 plain type 精确比较；action 精确比较。
-/// `check_sod_conflict` 的 STATIC 分支与 `sod_repository::card_has_permission`
-/// 共用本函数，保证两条读路径的归一化语义一致。
+/// STATIC 冲突 evaluator 与 `sod_repository::card_has_permission` 共用本函数，
+/// 保证两条读路径的归一化语义一致。
 pub fn sod_partner_matches_grant(
     grant_resource: &str,
     grant_action: &str,
@@ -214,9 +386,8 @@ pub fn sod_evidence_error_message(card_id: i64, error: &AuthorizationEvidenceErr
 }
 
 /// Ready 证据合同校验失败的稳定错误消息（`Corrupt` 族，形状矛盾的证据
-/// 绝不让其参与冲突判定）。`check_sod_conflict` 与
-/// `sod_repository::load_card_evidence` 共用，保证两条读路径的 Corrupt
-/// 错误形状一致。
+/// 绝不让其参与冲突判定）。SoD 检查与 `sod_repository::load_card_evidence`
+/// 共用，保证两条读路径的 Corrupt 错误形状一致。
 pub fn sod_evidence_contract_message(
     card_id: i64,
     contract_error: impl std::fmt::Display,
@@ -685,108 +856,165 @@ fn org_sod_contributions(
     Ok(contributions)
 }
 
-/// 检查当前请求是否触发 SoD 冲突（STATIC + DYNAMIC）。
+/// Native pre-grant SoD validation for a card-level grant.
 ///
-/// - 前置：卡级 published evidence 必须可读（严格 reader 单短事务内锁定当前
-///   指针并整链校验全部已发布聚合），否则返回错误——调用方必须拒绝请求，
-///   绝不返回"无冲突"放行；tenant 缺失/非正同样报错。
-/// - STATIC: 查询预定义互斥权限对；持有判定来自已发布 evidence 的
-///   `effective_grants`（全部来源的生效 ALLOW，resource_key 归一化后匹配）；
-///   raw `permission_rule` 分支仅为 deny-biased 诊断，见
-///   `SOD_RAW_RULE_CONFLICT_SQL` 注释
-/// - 不支持的脚本或缺失 owner fact → 返回错误，调用方必须拒绝请求
-/// - "读取后复核"由 reader 事务 + FOR UPDATE + 指针一致性校验接管
-///   （`pointer_moved_under_read` → `Corrupt` → Err）
+/// This is intentionally a grant-time API, not the post-ALLOW request check.
+/// It derives tenant scope from `user_card`, requires strict card-level
+/// published evidence, and evaluates the active STATIC/DYNAMIC policies with
+/// no user or resource-owner facts. Missing evidence, unavailable dependencies,
+/// unsupported conditions, or an active dynamic policy requiring absent facts
+/// return `Err`; none are interpreted as a conflict-free grant.
 ///
-/// # 参数
-/// - `pool`: 数据库连接池
-/// - `card_id`: 请求卡片的 ID
-/// - `user_id`: 当前用户 ID（用于 DYNAMIC 脚本求值）
-/// - `resource_type`: 请求的资源类型
-/// - `action_code`: 请求的动作
-/// - `resource_owner_id`: 由受保护资源 loader 派生的资源所有者 ID；不能来自客户端请求头
-pub async fn check_sod_conflict(
+/// If a memory projection hub is installed, the entire read is fenced by one
+/// captured source token. An unavailable token or any change to that exact
+/// token before return fails closed.
+pub async fn check_grant_sod_conflict(
     pool: &MySqlPool,
     card_id: i64,
-    user_id: Option<i64>,
     resource_type: &str,
     action_code: &str,
-    resource_owner_id: Option<i64>,
 ) -> Result<SodCheckResult, sqlx::Error> {
-    check_sod_conflict_inner(
-        pool,
-        card_id,
-        user_id,
-        resource_type,
-        action_code,
-        resource_owner_id,
-        None,
-        // 旧公开诊断入口：保留 raw `permission_rule` deny-biased 扫描
-        // （历史行为不变；canonical 宿主路径的差异见模块文档 BREAKING
-        // CHANGE 登记）。
-        SodReadPath::DurableRawDiagnostic,
+    let hub = memory_projection_hub();
+    let fence = match hub {
+        Some(hub) => Some(hub.strict_read_token().ok_or_else(|| {
+            sod_gate_error("sod_grant_source_state_unavailable;writer_active_or_unknown")
+        })?),
+        None => None,
+    };
+
+    let result = tokio::time::timeout(
+        SOD_POLICY_QUERY_DEADLINE,
+        check_published_sod_conflict(pool, card_id, None, resource_type, action_code, None, None),
     )
     .await
+    .map_err(|_| sod_gate_error("sod_grant_query_deadline_exceeded"))??;
+
+    if let (Some(hub), Some(fence)) = (hub, fence) {
+        if !hub.strict_read_matches(fence) {
+            return Err(sod_gate_error("sod_grant_source_mutation_raced_read"));
+        }
+    }
+    Ok(result)
 }
 
-/// Run the deny-only SoD recheck after a successful ORG_SCOPE decision
-/// （旧公开诊断入口，行为保持不变：SQL strict scope + raw `permission_rule`
-/// deny-biased 扫描）。
+const GRANT_SOD_PENDING_SQL: &str = "SELECT delta_event_id FROM authorization_delta_event \
+    WHERE tenant_id = ? AND (card_id = ? OR card_id IS NULL) \
+      AND status <> 'SUCCEEDED' AND event_type IN ('ADD', 'UPDATE', 'REMOVE', 'REVOKE') \
+    ORDER BY delta_event_id LIMIT 1 FOR UPDATE";
+
+/// Revalidate a direct grant in its source transaction, before source mutation.
 ///
-/// The caller supplies the organization admission (fresh durable read via
-/// [`load_org_sod_admission`] or mirror-served strict evidence via
-/// [`load_org_sod_admission_mirrored`]) plus the `PolicyDecision` provenance
-/// that was returned by `PolicyEngine`. The recheck requires both to describe
-/// the same winner before it lets any organization contribution participate
-/// in conflict detection. It never grants access and never bypasses the
-/// card-level published-evidence gate.
-///
-/// Target-resource facts on `ctx` (`resource_tenant_id`/`resource_domain_id`)
-/// are authoritative — resolved by the resource-owner loader, never accepted
-/// from client headers. `TenantScoped` requests consume only those resolver
-/// facts; `Internal` typed calls retain the legacy actor-scope fallback. Holding
-/// validation evaluates each contribution under its own published resource
-/// tenant. Missing tenant facts and provenance/publication mismatches stay
-/// fail-closed (Err → the caller must reject the request).
-///
-/// 注意：本入口是 legacy 诊断合同（保留 raw 扫描，无 composite 记忆读面/
-/// 栅栏）；宿主 canonical 入口（冷/热 published-only + 栅栏）请使用
-/// [`check_sod_conflict_with_context_and_org`]。
-pub async fn check_sod_conflict_with_org(
-    pool: &MySqlPool,
-    ctx: &PolicyContext,
-    admission: &OrgSodAdmission,
-    resource_owner_id: Option<i64>,
+/// The card lock serializes card writers. The current delta read rejects every
+/// unpublished contribution, including additive work invisible to the published
+/// frontier. Locks follow card → delta → pointer; the strict reader and current
+/// policy reads use this transaction only, without caches or pool acquisition.
+/// Missing authoritative dynamic-condition facts remain a refusal.
+pub async fn check_grant_sod_conflict_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    card_id: i64,
+    resource_type: &str,
+    action_code: &str,
+    update_before_image: Option<DirectGrantSodUpdateBeforeImage<'_>>,
 ) -> Result<SodCheckResult, sqlx::Error> {
-    let (Some(card_id), Some(user_id), Some(resource_type)) =
-        (ctx.card_id, ctx.user_id, ctx.resource.as_deref())
-    else {
-        return Err(sod_gate_error("org_scope_sod_context_missing"));
-    };
-    check_sod_conflict_inner(
-        pool,
-        card_id,
-        Some(user_id),
-        resource_type,
-        &ctx.action,
-        resource_owner_id,
-        Some(OrgSodInput {
-            context: ctx,
-            admission,
-        }),
-        // 旧公开诊断合同：保留 raw `permission_rule` deny-biased 扫描。
-        SodReadPath::DurableRawDiagnostic,
-    )
+    tokio::time::timeout(SOD_POLICY_QUERY_DEADLINE, async {
+        let locked_card = sqlx::query_as::<_, LockedSodCardScope>(
+            "SELECT card_id, user_id, tenant_id, domain_id FROM user_card WHERE card_id = ? \
+             AND card_status = 'ACTIVE' \
+             AND (valid_from IS NULL OR valid_from <= UTC_TIMESTAMP()) \
+             AND (valid_until IS NULL OR valid_until >= UTC_TIMESTAMP()) FOR UPDATE",
+        )
+        .bind(card_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(locked_scope) = locked_card else {
+            return Err(sod_gate_error("sod_grant_locked_card_unavailable"));
+        };
+        if card_id <= 0
+            || locked_scope.card_id != card_id
+            || locked_scope.tenant_id.is_none_or(|tenant| tenant <= 0)
+            || locked_scope.user_id.is_none_or(|user| user <= 0)
+            || locked_scope.domain_id.is_some_and(|domain| domain <= 0)
+        {
+            return Err(sod_gate_error("sod_grant_locked_card_scope_invalid"));
+        }
+        let tenant_id = if let Some(before_image) = update_before_image.as_ref() {
+            validate_direct_update_scope(before_image, locked_scope, card_id)
+                .map_err(sod_gate_error)?
+        } else {
+            // CREATE has no source rule before-image; retain its strict card-only
+            // check and do not derive or omit any published grant.
+            locked_scope
+                .tenant_id
+                .expect("positive card tenant checked above")
+        };
+        let pending: Option<i64> = sqlx::query_scalar(GRANT_SOD_PENDING_SQL)
+            .bind(tenant_id)
+            .bind(card_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        if pending.is_some() {
+            return Err(sod_gate_error("sod_grant_unpublished_source_pending"));
+        }
+        let scope = PublishedCardEvidenceScope {
+            tenant_id,
+            card_id,
+            user_filter: None,
+            domain: DomainScopeRequirement::Unconstrained,
+        };
+        let evidence = crate::load_published_card_grant_evidence_in_tx(tx, &scope)
+            .await
+            .map_err(|error| match error {
+                AuthorizationEvidenceError::Query(error) => error,
+                other => sod_gate_error(&sod_evidence_error_message(card_id, &other)),
+            })?;
+        evidence
+            .validate()
+            .map_err(|error| sod_gate_error(&sod_evidence_contract_message(card_id, &error)))?;
+        let self_excluded_grant = update_before_image
+            .as_ref()
+            .map(|before_image| {
+                prove_direct_update_self_exclusion(&evidence, before_image, locked_scope, card_id)
+                    .map_err(sod_gate_error)
+            })
+            .transpose()?;
+        let static_policies = sqlx::query_as::<_, StaticPolicy>(&format!(
+            "SELECT policy_name, permission_a, permission_b FROM sod_policy \
+             WHERE conflict_type = 'STATIC' AND status = 'ACTIVE' \
+             ORDER BY policy_id LIMIT {} FOR SHARE",
+            SOD_POLICY_SNAPSHOT_ROW_CAP + 1,
+        ))
+        .fetch_all(&mut **tx)
+        .await?;
+        let dynamic_policies = sqlx::query_as::<_, DynamicPolicy>(&format!(
+            "SELECT policy_name, condition_script, resource_type, action_code FROM sod_policy \
+             WHERE conflict_type = 'DYNAMIC' AND status = 'ACTIVE' \
+             ORDER BY policy_id LIMIT {} FOR SHARE",
+            SOD_POLICY_SNAPSHOT_ROW_CAP + 1,
+        ))
+        .fetch_all(&mut **tx)
+        .await?;
+        let snapshot = bounded_sod_policy_snapshot(static_policies, dynamic_policies)?;
+        evaluate_sod_conflicts(
+            &format!("{resource_type}:{action_code}"),
+            &evidence,
+            &snapshot,
+            None,
+            resource_type,
+            action_code,
+            None,
+            None,
+            self_excluded_grant,
+        )
+    })
     .await
+    .map_err(|_| sod_gate_error("sod_grant_transaction_deadline_exceeded"))?
 }
 
 /// ADDITIVE canonical 宿主 ORG 复核入口（冷/热同一 published-only 持有合同，
 /// 含 composite 栅栏）：org provenance 判定的 deny-only 复核走
 /// `check_sod_conflict_with_context_inner`——复合进程 warm 态（内存镜像 +
-/// token 绑定策略快照）零 DB，cold durable 回退与 warm 同一持有语义
-/// （raw `permission_rule` 扫描冷/热均不执行，见模块文档 BREAKING CHANGE
-/// 登记）；TG/Identity 宿主应使用本入口而非旧 [`check_sod_conflict_with_org`]
-/// （后者为 legacy 诊断合同，保留 raw 扫描）。
+/// token 绑定策略快照）零 DB，cold durable 回退与 warm 同一持有语义；宿主
+/// 应使用本入口，不提供 raw-source 诊断或扫描路径。
 pub async fn check_sod_conflict_with_context_and_org(
     pool: &MySqlPool,
     ctx: &PolicyContext,
@@ -801,22 +1029,17 @@ pub async fn check_sod_conflict_with_context_and_org(
     check_sod_conflict_with_context_inner(pool, ctx, Some(admission), resource_owner_id).await
 }
 
-/// ADDITIVE context-aware 宿主 SoD 入口（纯 deny-only，无 ORG provenance）。
+/// Context-aware host SoD entry (deny-only, without ORG provenance).
 ///
-/// 供宿主在 `PolicyEngine` ALLOW 之后、以**已验证的完整 `PolicyContext`**
-/// （resource/owner fact 由 resource-owner loader 解析，绝不来自客户端头）
-/// 调用：复合进程 warm 态（内存镜像 + token 绑定策略快照）零 DB；镜像
-/// miss/pending/未安装一律回落既有 durable 严格链（`check_sod_conflict_inner`，
-/// 读取协议与旧路径一致）。错误沿 [`sod_gate_error`]
-/// fail-closed，调用方必须拒绝请求。
+/// Call after `PolicyEngine` ALLOW with the complete, validated `PolicyContext`;
+/// resource/owner facts must be resolved server-side, never taken from client
+/// headers. Composite warm reads use the memory mirror and token-bound policy
+/// snapshot; a miss or unavailable mirror defers to the strict durable reader.
+/// Every failure is fail-closed, and held grants come only from validated
+/// published evidence.
 ///
-/// 与旧 [`check_sod_conflict`]（SQL strict scope + raw 扫描，保留为公开
-/// 诊断/兼容入口）**不是逐字节等同**：本入口为 canonical 宿主合同——
-/// evidence scope 直接取服务端 ctx 事实（tenant 已被 PolicyEngine 鉴权；
-/// card-tenant 绑定由 hub durable card index 命中再证明），冲突判定共用
-/// 同一纯评估函数；raw `permission_rule` 扫描冷/热均不执行（持有授权 =
-/// 已发布 evidence effective-grant 合同），该语义差异由主域规范登记为
-/// BREAKING CHANGE，见模块文档。
+/// Evidence scope uses server-side context facts: the tenant was authenticated
+/// by `PolicyEngine`, and the hub's durable card index proves card/tenant binding.
 pub async fn check_sod_conflict_with_context(
     pool: &MySqlPool,
     ctx: &PolicyContext,
@@ -871,7 +1094,7 @@ async fn check_sod_conflict_with_context_inner(
         // 同一持有语义）；读取窗口之后同一栅栏终检——漂移 fail-closed。
         let result = tokio::time::timeout(
             SOD_POLICY_QUERY_DEADLINE,
-            check_sod_conflict_inner(
+            check_published_sod_conflict(
                 pool,
                 card_id,
                 ctx.user_id,
@@ -879,7 +1102,6 @@ async fn check_sod_conflict_with_context_inner(
                 &ctx.action,
                 resource_owner_id,
                 org_input,
-                SodReadPath::PublishedEvidenceOnly,
             ),
         )
         .await
@@ -890,7 +1112,7 @@ async fn check_sod_conflict_with_context_inner(
         return Ok(result);
     }
     // 非 composite（hub 未安装）：既有 durable 严格链，行为不变。
-    check_sod_conflict_inner(
+    check_published_sod_conflict(
         pool,
         card_id,
         ctx.user_id,
@@ -898,9 +1120,6 @@ async fn check_sod_conflict_with_context_inner(
         &ctx.action,
         resource_owner_id,
         org_input,
-        // canonical 宿主路径：cold durable 回退与 warm 记忆路径同一合同
-        // （持有授权只认已发布 evidence，raw 扫描冷/热均不执行）。
-        SodReadPath::PublishedEvidenceOnly,
     )
     .await
 }
@@ -940,6 +1159,9 @@ async fn try_check_sod_conflict_from_memory(
         MemoryEvidenceOutcome::Serve(evidence) => evidence,
         MemoryEvidenceOutcome::DeferToDurable => return Ok(None),
     };
+    if evidence.tenant_id != tenant_id || evidence.card_id != card_id {
+        return Err(sod_gate_error("sod_memory_evidence_scope_mismatch"));
+    }
     if let Err(contract_error) = evidence.validate() {
         tracing::warn!(
             card_id,
@@ -951,7 +1173,6 @@ async fn try_check_sod_conflict_from_memory(
             &contract_error,
         )));
     }
-    let snapshot = load_sod_policy_snapshot(pool).await?;
     let org_contributions = match org_input {
         Some(input) => {
             let user_id = ctx
@@ -968,10 +1189,9 @@ async fn try_check_sod_conflict_from_memory(
         }
         None => None,
     };
+    let snapshot = load_sod_policy_snapshot(pool).await?;
     let perm_key = format!("{resource_type}:{}", ctx.action);
     let result = evaluate_sod_conflicts(
-        pool,
-        card_id,
         &perm_key,
         &evidence,
         &snapshot,
@@ -980,11 +1200,8 @@ async fn try_check_sod_conflict_from_memory(
         &ctx.action,
         ctx.user_id,
         resource_owner_id,
-        // canonical 宿主路径（warm）：raw permission_rule 扫描冷/热均不执行
-        // （持有授权 = 已发布 evidence 合同；见模块文档 BREAKING CHANGE 登记）。
-        SodReadPath::PublishedEvidenceOnly,
-    )
-    .await?;
+        None,
+    )?;
     // after-eval 终检：记忆读面 + 策略快照 + 评估窗口内 source 零 mutation
     // 才允许返回记忆路径结果（只比较已捕获栅栏，绝不重采新 token 覆盖旧读）；
     // 漂移 → fail-closed，宿主必须拒绝请求。
@@ -998,7 +1215,7 @@ async fn try_check_sod_conflict_from_memory(
 /// TrustGraph/Identity/Monitor 宿主中间件统一接线，消除本地重复实现）。
 ///
 /// - 决策未携带 org provenance（非 ORG 判定）→ `Ok(None)`：调用方对本次请求
-///   走既有 [`check_sod_conflict`] 纯 deny-only 路径，行为不变；
+///   走普通 context-aware 宿主 SoD 纯 deny-only 路径，行为不变；
 /// - ORG 判定但 `PolicyContext` 缺失租户/用户/卡/身份卡任一事实 →
 ///   `sod_gate_error("org_scope_sod_context_missing")`（fail-closed）；
 /// - fresh 准入证据读取返回业务 Pending → `sod_gate_error`（稳定前缀
@@ -1008,8 +1225,8 @@ async fn try_check_sod_conflict_from_memory(
 ///
 /// 语义与组织准入一致：本函数不产生任何授权事实，只把 `PolicyEngine` 已确认
 /// ALLOW 的 provenance 与 fresh publication/membership evidence 重新装配，交给
-/// [`check_sod_conflict_with_org`] 做 deny-only 的 STATIC 互斥复核；provenance
-/// 或 publication 对牌失败沿错误返回，由调用方拒绝请求（503/fail-closed）。
+/// context-aware ORG 宿主检查做 deny-only 的 STATIC 互斥复核；provenance 或
+/// publication 对牌失败沿错误返回，由调用方拒绝请求（503/fail-closed）。
 pub async fn load_org_sod_admission(
     pool: &MySqlPool,
     ctx: &PolicyContext,
@@ -1042,8 +1259,7 @@ pub async fn load_org_sod_admission(
 /// `load_org_authorization`——与 `PolicyEngine.evaluate()` 完全同一 strict
 /// read contract（hub 健康门、single-flight、3s deadline、纪元栅栏、有界
 /// 回填），warm 命中零 DB；`Ready` 证据进入与 fresh DB 读**完全相同**的
-/// [`check_sod_conflict_with_org`] provenance 对牌解析器，不产生任何新授权
-/// 事实。
+/// context-aware ORG provenance 对牌解析器，不产生任何新授权事实。
 ///
 /// 映射（fail-closed，与 `org_sod_admission_outcome` 同向）：
 /// - 镜像 `Ready(evidence)` → 与 fresh DB 读同源的 `OrgSodAdmission`；
@@ -1155,7 +1371,7 @@ fn org_sod_admission_outcome(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn check_sod_conflict_inner(
+async fn check_published_sod_conflict(
     pool: &MySqlPool,
     card_id: i64,
     user_id: Option<i64>,
@@ -1163,7 +1379,6 @@ async fn check_sod_conflict_inner(
     action_code: &str,
     resource_owner_id: Option<i64>,
     org_input: Option<OrgSodInput<'_>>,
-    read_path: SodReadPath,
 ) -> Result<SodCheckResult, sqlx::Error> {
     let perm_key = format!("{resource_type}:{action_code}");
 
@@ -1241,18 +1456,15 @@ async fn check_sod_conflict_inner(
     //   `type:id`），旧实现把 partner 的 plain type（parts[0]）直接绑定到
     //   scoped key 比较，形状错位导致永不命中；现在经
     //   [`sod_partner_matches_grant`] 先归一为 plain type 再比较。
-    // - raw `permission_rule` 分支由 `read_path` 决定（legacy 诊断入口保留；
-    //   canonical 宿主路径冷/热均不执行，见模块文档 BREAKING CHANGE 登记）。
+    // - raw `permission_rule` 不属于发布过的持有授权，不作为 SoD 输入；
+    //   Static 冲突只按 evidence.effective_grants 和组织已发布贡献判断。
     // 全量 ACTIVE 策略快照（composite：hub 严格读 token 绑定缓存，warm 零 DB；
     // 非 composite：TTL 30s；miss/DB 错误回源有界 single-flight 直查，fail-closed
     // 不变，错误绝不入缓存）。STATIC 与 DYNAMIC 两个检查段共用同一快照。
     let snapshot = load_sod_policy_snapshot(pool).await?;
 
-    // 冲突评估（shared 纯评估段：durable 回退与 warm 记忆路径按 `read_path`
-    // 复用同一函数，冷/热合同一致）。
+    // 冲突判定只依赖已发布 evidence 和纯动态条件检查，无额外 source 查询。
     evaluate_sod_conflicts(
-        pool,
-        card_id,
         &perm_key,
         &evidence,
         &snapshot,
@@ -1261,40 +1473,18 @@ async fn check_sod_conflict_inner(
         action_code,
         user_id,
         resource_owner_id,
-        read_path,
+        None,
     )
-    .await
 }
 
-/// 冲突评估读路径（canonical 冷/热一致性合同的核心）：
-/// - `PublishedEvidenceOnly` = canonical 宿主路径（cold durable 回退与 warm
-///   记忆路径共用）：持有授权只认已发布 evidence（与
-///   `sod_repository::card_permissions` 同一 effective-grant contract），
-///   raw `permission_rule` 不构成持有授权，冷/热均不执行其扫描；
-/// - `DurableRawDiagnostic` = 旧公开诊断入口（[`check_sod_conflict`]）：
-///   保留 raw deny-biased 扫描的历史行为。
+/// STATIC + DYNAMIC 冲突评估（pure，无 I/O）。
 ///
-/// 两入口的差异（canonical 移除 raw 扫描）由主域规范登记为 BREAKING
-/// CHANGE/语义修正，见模块文档。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SodReadPath {
-    PublishedEvidenceOnly,
-    DurableRawDiagnostic,
-}
-
-/// STATIC + DYNAMIC 冲突评估（shared：canonical 冷/热路径与旧诊断入口共用
-/// 同一纯判定，消除重复实现；I/O 只有 `DurableRawDiagnostic` 路径的 raw
-/// `permission_rule` deny-biased 诊断查询——canonical 宿主路径零 SQL）。
-///
-/// - STATIC: 全量 ACTIVE 策略快照；持有判定来自已发布 evidence 的
-///   `effective_grants`（resource_key 归一化后匹配）与 org contributions
-///   （deny-only 复核产物）；
-/// - DYNAMIC: 请求侧内存过滤 + 条件脚本求值（不读授权证据；入口 evidence
-///   门禁已保证该卡的已发布授权证据可读）。
+/// STATIC 持有判定来自已发布 evidence 的 `effective_grants`
+/// （resource_key 归一化后匹配）与已发布组织贡献；DYNAMIC 只按请求维度过滤
+/// 策略并执行支持的精确脚本。缺失 authoritative facts 或 unsupported 脚本
+/// 由既有 dynamic evaluator fail-closed。
 #[allow(clippy::too_many_arguments)]
-async fn evaluate_sod_conflicts(
-    pool: &MySqlPool,
-    card_id: i64,
+fn evaluate_sod_conflicts(
     perm_key: &str,
     evidence: &PublishedCardAuthorization,
     snapshot: &SodPolicySnapshot,
@@ -1303,7 +1493,7 @@ async fn evaluate_sod_conflicts(
     action_code: &str,
     user_id: Option<i64>,
     resource_owner_id: Option<i64>,
-    read_path: SodReadPath,
+    self_excluded_grant: Option<astral_types::GrantId>,
 ) -> Result<SodCheckResult, sqlx::Error> {
     let mut conflict: Option<SodCheckResult> = None;
     {
@@ -1331,7 +1521,8 @@ async fn evaluate_sod_conflicts(
 
             // 生效授权匹配（in-memory，零额外 I/O）：任一生效 grant 命中即冲突。
             let mut has_conflict = evidence.effective_grants.iter().any(|grant| {
-                sod_partner_matches_grant(&grant.resource, &grant.action, parts[0], parts[1])
+                Some(grant.grant_id) != self_excluded_grant
+                    && sod_partner_matches_grant(&grant.resource, &grant.action, parts[0], parts[1])
             });
             if !has_conflict {
                 has_conflict = org_contributions.is_some_and(|contributions| {
@@ -1340,17 +1531,6 @@ async fn evaluate_sod_conflicts(
                     })
                 });
             }
-            if !has_conflict && read_path == SodReadPath::DurableRawDiagnostic {
-                // raw 分支：deny-biased 诊断，命中同样只增冲突（→ 拒绝）。
-                // warm 记忆路径不进入本分支（零 SQL，见模块文档残余风险记录）。
-                has_conflict = sqlx::query_scalar(SOD_RAW_RULE_CONFLICT_SQL)
-                    .bind(card_id)
-                    .bind(parts[0])
-                    .bind(parts[1])
-                    .fetch_one(pool)
-                    .await?;
-            }
-
             if has_conflict {
                 conflict = Some(SodCheckResult {
                     has_conflict: true,
@@ -1401,20 +1581,6 @@ async fn evaluate_sod_conflicts(
         conflict_type: None,
     }))
 }
-
-/// STATIC 冲突判定的 raw `permission_rule` 诊断 SQL。
-///
-/// **仅作为 deny-biased 诊断保留**（旧 UNION 的 raw 分支原样提取）：它命中只会
-/// 把 `has_conflict` 变为 true（→ 拒绝），永不参与放行语义；正式授权事实只来自
-/// 上方的已发布 evidence 匹配。raw 表存 plain `resource_type`，与 partner 绑定
-/// 形状一致（legacy 快照分支的形状错位不存在于此）。入口 evidence 门禁失败时
-/// 本 SQL 不会被执行（先 Err 上抛）。
-const SOD_RAW_RULE_CONFLICT_SQL: &str = "SELECT EXISTS ( \
- SELECT 1 FROM permission_rule WHERE card_id=? AND enabled=1 \
-   AND (valid_from IS NULL OR valid_from <= UTC_TIMESTAMP()) \
-   AND (valid_to IS NULL OR valid_to >= UTC_TIMESTAMP()) \
-   AND resource_type=? AND action_code=? \
- LIMIT 1)";
 
 /// STATIC 策略行
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1535,7 +1701,13 @@ mod tests {
         OrgManifestDigestMaterial, OrgMembership, OrgNode, OrgPendingCode, OrgProvenance,
         OrgPublication, OrgRootActivation, OrgScope, OrgScopeKey, OrgSegmentContent, OrgSubject,
     };
-    use astral_types::ValidityWindow;
+    use astral_types::{
+        BindingLayer, CanonicalGrant, GrantEffect, GrantId, GrantIdentityKey, GrantProvenance,
+        GrantRevision, GrantSourceKind, GrantState, PublicationSeal,
+        PublishedAggregateManifestSummary, PublishedCardAuthorization,
+        PublishedCardAuthorizationGate, PublishedEvidenceGateStatus, TenantScope, ValidityWindow,
+        VerifiedPublishedGrantRecord,
+    };
 
     // ===== resource_key 归一化（scoped key → plain type） =====
 
@@ -1560,6 +1732,374 @@ mod tests {
     }
 
     // ===== STATIC partner 归一匹配 =====
+
+    fn published_sod_grant(resource: &str, action: &str, seed: u32) -> CanonicalGrant {
+        CanonicalGrant {
+            grant_id: GrantId::parse(&format!("00000000-0000-4000-8000-{seed:012}"))
+                .expect("valid fixture grant id"),
+            revision: GrantRevision::initial(),
+            state: GrantState::Active,
+            source_kind: GrantSourceKind::Direct,
+            binding_layer: BindingLayer::None,
+            tenant: TenantScope::new(7, None).expect("valid fixture tenant"),
+            card_id: 17,
+            user_id: 42,
+            resource: resource.to_owned(),
+            action: action.to_owned(),
+            effect: GrantEffect::Allow,
+            validity: ValidityWindow::perpetual(),
+            provenance: GrantProvenance {
+                source_id: "card-17".to_owned(),
+                source_entry: Some(format!("entry-{seed}")),
+                binding_id: None,
+                delegation_id: None,
+                operation_id: "sod-fixture-operation".to_owned(),
+                event_id: Some("sod-fixture-event".to_owned()),
+                actor_user_id: None,
+            },
+        }
+    }
+
+    fn published_sod_evidence(grants: Vec<CanonicalGrant>) -> PublishedCardAuthorization {
+        let record_count = grants.len();
+        let records = grants
+            .iter()
+            .enumerate()
+            .map(|(index, grant)| VerifiedPublishedGrantRecord {
+                aggregate_type: "USER_CARD".to_owned(),
+                aggregate_id: 17,
+                publication_generation: 1,
+                revoke_fence: 0,
+                manifest_id: 101,
+                event_id: "sod-fixture-event".to_owned(),
+                operation_id: "sod-fixture-operation".to_owned(),
+                semantic_hash_hex: "a".repeat(64),
+                dependency_hash_hex: "b".repeat(64),
+                compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
+                segment_ordinal: 0,
+                position_in_segment: index as u64,
+                grant: grant.clone(),
+                accepted_into_effective_set: true,
+                unaccepted_reason: None,
+            })
+            .collect();
+        let manifest = PublishedAggregateManifestSummary {
+            seal: PublicationSeal::from_unix_seconds(1_700_000_000).expect("valid fixture seal"),
+            tenant_id: 7,
+            card_id: 17,
+            aggregate_type: "USER_CARD".to_owned(),
+            aggregate_id: 17,
+            manifest_id: 101,
+            generation: 1,
+            source_generation: 1,
+            projected_generation: 1,
+            revoke_fence: 0,
+            cas_version: 1,
+            semantic_hash_hex: "a".repeat(64),
+            dependency_hash_hex: "b".repeat(64),
+            manifest_digest_hex: "c".repeat(64),
+            compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
+            event_id: "sod-fixture-event".to_owned(),
+            operation_id: "sod-fixture-operation".to_owned(),
+            parent_manifest_id: None,
+            segment_count: 1,
+            declared_grant_row_count: record_count as u64,
+        };
+        PublishedCardAuthorization {
+            tenant_id: 7,
+            card_id: 17,
+            read_unix_seconds: 1_700_000_000,
+            gate: PublishedCardAuthorizationGate {
+                status: PublishedEvidenceGateStatus::Ready,
+                aggregate_manifest_count: 1,
+                verified_record_count: record_count,
+                effective_grant_count: record_count,
+                not_in_effective_count: 0,
+                equivalent_duplicate_collapsed_count: 0,
+            },
+            manifests: vec![manifest],
+            records,
+            effective_grants: grants,
+        }
+    }
+
+    fn direct_update_before_image(rule_id: i64) -> DirectGrantSodUpdateBeforeImage<'static> {
+        DirectGrantSodUpdateBeforeImage {
+            rule_tenant_id: Some(7),
+            source_card_tenant_id: Some(7),
+            domain_id: None,
+            card_id: 17,
+            user_id: 42,
+            rule_id,
+            source_type: "MANUAL",
+            enabled: Some(1),
+            effect: "ALLOW",
+            resource_type: "approval",
+            resource_id: None,
+            action_code: "approve",
+            condition_json: None,
+            valid_from: None,
+            valid_to: None,
+        }
+    }
+
+    fn locked_sod_card_scope() -> LockedSodCardScope {
+        LockedSodCardScope {
+            card_id: 17,
+            tenant_id: Some(7),
+            domain_id: None,
+            user_id: Some(42),
+        }
+    }
+
+    fn direct_grant_for_rule(rule_id: i64, resource: &str, action: &str) -> CanonicalGrant {
+        let grant_id = GrantIdentityKey::direct(
+            TenantScope::new(7, None).unwrap(),
+            "17",
+            &rule_id.to_string(),
+        )
+        .unwrap()
+        .derive_grant_id()
+        .unwrap();
+        CanonicalGrant {
+            grant_id,
+            revision: GrantRevision::initial(),
+            state: GrantState::Active,
+            source_kind: GrantSourceKind::Direct,
+            binding_layer: BindingLayer::None,
+            tenant: TenantScope::new(7, None).unwrap(),
+            card_id: 17,
+            user_id: 42,
+            resource: astral_types::build_resource_key(resource, None),
+            action: action.to_owned(),
+            effect: GrantEffect::Allow,
+            validity: ValidityWindow::perpetual(),
+            provenance: GrantProvenance {
+                source_id: "17".to_owned(),
+                source_entry: Some(rule_id.to_string()),
+                binding_id: None,
+                delegation_id: None,
+                operation_id: "sod-fixture-operation".to_owned(),
+                event_id: Some("sod-fixture-event".to_owned()),
+                actor_user_id: None,
+            },
+        }
+    }
+
+    fn sod_static_policy(permission_a: &str, permission_b: &str) -> StaticPolicy {
+        StaticPolicy {
+            policy_name: "exclusive-review-submit".to_owned(),
+            permission_a: Some(permission_a.to_owned()),
+            permission_b: Some(permission_b.to_owned()),
+        }
+    }
+
+    #[test]
+    fn direct_update_excludes_only_exact_self_grant_and_keeps_second_conflicting_grant() {
+        let before = direct_update_before_image(101);
+        let self_grant = direct_grant_for_rule(101, "approval", "approve");
+        let second_grant = direct_grant_for_rule(102, "approval", "approve");
+        let identity = prove_direct_update_self_exclusion(
+            &published_sod_evidence(vec![self_grant.clone()]),
+            &before,
+            locked_sod_card_scope(),
+            17,
+        )
+        .expect("the exact published direct before-image must be provable");
+        assert_eq!(identity, self_grant.grant_id);
+
+        let policies = SodPolicySnapshot {
+            static_policies: vec![sod_static_policy("approval:submit", "approval:approve")],
+            dynamic_policies: Vec::new(),
+        };
+        let only_self = published_sod_evidence(vec![self_grant.clone()]);
+        only_self
+            .validate()
+            .expect("valid current published before-image");
+        let create_conflict = evaluate_sod_conflicts(
+            "approval:submit",
+            &only_self,
+            &policies,
+            None,
+            "approval",
+            "submit",
+            None,
+            None,
+            None,
+        )
+        .expect("CREATE retains every held grant");
+        assert!(create_conflict.has_conflict);
+        let no_self_conflict = evaluate_sod_conflicts(
+            "approval:submit",
+            &only_self,
+            &policies,
+            None,
+            "approval",
+            "submit",
+            None,
+            None,
+            Some(identity),
+        )
+        .expect("the proven self identity alone is omitted from STATIC matching");
+        assert!(!no_self_conflict.has_conflict);
+
+        let self_and_second = published_sod_evidence(vec![self_grant, second_grant]);
+        let remaining_conflict = evaluate_sod_conflicts(
+            "approval:submit",
+            &self_and_second,
+            &policies,
+            None,
+            "approval",
+            "submit",
+            None,
+            None,
+            Some(identity),
+        )
+        .expect("other published grants must remain in STATIC matching");
+        assert!(remaining_conflict.has_conflict);
+    }
+
+    #[test]
+    fn direct_update_scope_and_wrong_exclusion_fail_closed() {
+        let before = direct_update_before_image(101);
+        assert!(validate_direct_update_scope(&before, locked_sod_card_scope(), 17).is_ok());
+        assert!(validate_direct_update_scope(&before, locked_sod_card_scope(), 18).is_err());
+
+        let mismatched_rule_tenant = DirectGrantSodUpdateBeforeImage {
+            rule_tenant_id: Some(8),
+            ..before
+        };
+        assert!(
+            validate_direct_update_scope(&mismatched_rule_tenant, locked_sod_card_scope(), 17)
+                .is_err()
+        );
+        let mismatched_card_tenant = DirectGrantSodUpdateBeforeImage {
+            source_card_tenant_id: Some(8),
+            ..before
+        };
+        assert!(
+            validate_direct_update_scope(&mismatched_card_tenant, locked_sod_card_scope(), 17)
+                .is_err()
+        );
+        let mismatched_domain = DirectGrantSodUpdateBeforeImage {
+            domain_id: Some(88),
+            ..before
+        };
+        assert!(
+            validate_direct_update_scope(&mismatched_domain, locked_sod_card_scope(), 17).is_err()
+        );
+
+        let mut wrong_grant = direct_grant_for_rule(101, "approval", "review");
+        let wrong_id = wrong_grant.grant_id;
+        wrong_grant.provenance.source_entry = Some("102".to_owned());
+        let mut wrong_evidence = published_sod_evidence(vec![wrong_grant]);
+        wrong_evidence.records[0].grant.grant_id = wrong_id;
+        assert!(prove_direct_update_self_exclusion(
+            &wrong_evidence,
+            &before,
+            locked_sod_card_scope(),
+            17
+        )
+        .is_err());
+
+        let other_grant = direct_grant_for_rule(102, "approval", "approve");
+        assert!(prove_direct_update_self_exclusion(
+            &published_sod_evidence(vec![other_grant]),
+            &before,
+            locked_sod_card_scope(),
+            17
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn published_static_grant_conflict_is_detected_from_valid_card_evidence() {
+        let evidence =
+            published_sod_evidence(vec![published_sod_grant("approval:*", "approve", 1)]);
+        evidence
+            .validate()
+            .expect("fixture is valid published evidence");
+        let snapshot = SodPolicySnapshot {
+            static_policies: vec![sod_static_policy("approval:submit", "approval:approve")],
+            dynamic_policies: Vec::new(),
+        };
+
+        let result = evaluate_sod_conflicts(
+            "approval:submit",
+            &evidence,
+            &snapshot,
+            None,
+            "approval",
+            "submit",
+            None,
+            None,
+            None,
+        )
+        .expect("published STATIC policy evaluation succeeds");
+        assert!(result.has_conflict);
+        assert_eq!(
+            result.conflict_policy.as_deref(),
+            Some("exclusive-review-submit")
+        );
+        assert_eq!(
+            result.conflict_permission.as_deref(),
+            Some("approval:approve")
+        );
+        assert_eq!(result.conflict_type.as_deref(), Some("STATIC"));
+    }
+
+    #[test]
+    fn empty_published_evidence_has_no_static_conflict() {
+        let evidence = published_sod_evidence(Vec::new());
+        evidence
+            .validate()
+            .expect("empty published evidence is valid");
+        let snapshot = SodPolicySnapshot {
+            static_policies: vec![sod_static_policy("approval:submit", "approval:approve")],
+            dynamic_policies: Vec::new(),
+        };
+        let result = evaluate_sod_conflicts(
+            "approval:submit",
+            &evidence,
+            &snapshot,
+            None,
+            "approval",
+            "submit",
+            None,
+            None,
+            None,
+        )
+        .expect("published-only evaluation succeeds");
+        assert!(!result.has_conflict);
+    }
+
+    #[test]
+    fn grant_dynamic_policy_with_missing_user_or_owner_facts_fails_closed() {
+        let evidence = published_sod_evidence(Vec::new());
+        let snapshot = SodPolicySnapshot {
+            static_policies: Vec::new(),
+            dynamic_policies: vec![DynamicPolicy {
+                policy_name: "owner-only".to_owned(),
+                condition_script: Some("resourceOwnerId == currentUserId".to_owned()),
+                resource_type: Some("approval".to_owned()),
+                action_code: Some("submit".to_owned()),
+            }],
+        };
+        for (user_id, owner_id) in [(None, None), (Some(42), None), (None, Some(42))] {
+            assert!(evaluate_sod_conflicts(
+                "approval:submit",
+                &evidence,
+                &snapshot,
+                None,
+                "approval",
+                "submit",
+                user_id,
+                owner_id,
+                None,
+            )
+            .is_err());
+        }
+    }
 
     #[test]
     fn partner_matching_uses_normalized_resource_type_and_exact_action() {
@@ -1661,26 +2201,13 @@ mod tests {
 
     // ===== 形状守卫（evidence 调用顺序 + 旧链读取清除） =====
 
-    /// 形状守卫：`check_sod_conflict` 必须先解析租户并构造卡级 evidence scope，
-    /// 经严格 reader 读取已发布证据后才允许做冲突判定（归一匹配 → raw 诊断）；
-    /// evidence 之前不得构造任何检查结果，也不得触碰 legacy 快照/旧链 head——
-    /// 不可读只能报错，绝不能以"无冲突"（放行）收场。
-    ///
-    /// 读取调用必须是缓存感知入口（进程内 evidence 缓存 + 指针对牌，miss 回源
-    /// 严格 reader；见 `crate::evidence_cache`）——对牌失败同样只能报错回源，
-    /// 不会把旧缓存伪装成可读证据。
+    /// Shape guard: the pre-grant and host paths derive the card tenant and pass
+    /// through the strict cache-aware published-evidence reader before policy
+    /// evaluation; unreadable evidence cannot become a conflict-free result.
     #[test]
-    fn check_sod_conflict_reads_evidence_before_any_conflict_decision() {
+    fn sod_paths_require_published_evidence_before_evaluation() {
         let source = include_str!("sod_check.rs");
-        // 锚定 check_sod_conflict_inner 的完整流程体（check_sod_conflict 与
-        // check_sod_conflict_with_org 都收敛到它；此前锚定
-        // "pub async fn check_sod_conflict" 会因 with_org 变体落在两个签名
-        // 之间的窄段上而失明）。
-        let body = source
-            .split("async fn check_sod_conflict_inner")
-            .nth(1)
-            .expect("check_sod_conflict_inner flow must exist");
-
+        let body = fn_body_after(source, "async fn check_published_sod_conflict(");
         let tenant = body
             .find("sod_load_card_tenant(pool, card_id)")
             .expect("tenant resolution must exist");
@@ -1688,41 +2215,21 @@ mod tests {
             .find("PublishedCardEvidenceScope {")
             .expect("card-level evidence scope construction must exist");
         let reader = body
-            .find("load_published_card_grant_evidence(pool, &scope)")
-            .expect("strict evidence reader call must exist");
-        let cached_reader = body
             .find("cached_load_published_card_grant_evidence(pool, &scope)")
-            .expect("evidence reads must go through the pointer-fenced cache entry");
-        assert_eq!(
-            reader,
-            cached_reader + "cached_".len(),
-            "the evidence reader call must be the cache-aware wrapper"
-        );
-        let matcher = body
-            .find("sod_partner_matches_grant")
-            .expect("normalized partner matching must exist");
-        let raw = body
-            .find("SOD_RAW_RULE_CONFLICT_SQL")
-            .expect("raw deny-biased diagnostic must exist");
-
-        assert!(
-            tenant < scope && scope < reader && reader < matcher && matcher < raw,
-            "order must be tenant -> scope -> reader -> normalized match -> raw diagnostic"
-        );
-
-        let prefix = &body[..reader];
-        assert!(
-            !prefix.contains("permission_rule_snapshot"),
-            "no legacy snapshot read may happen before the evidence reader"
-        );
-        assert!(
-            !prefix.contains("has_conflict"),
-            "no check result may be produced before the evidence reader"
-        );
+            .expect("evidence reads must use the pointer-fenced cache entry");
+        let validate = body
+            .find("evidence.validate()")
+            .expect("evidence must be revalidated");
+        let evaluate = body
+            .find("evaluate_sod_conflicts(")
+            .expect("published evidence must feed the pure evaluator");
+        assert!(tenant < scope && scope < reader && reader < validate && validate < evaluate);
+        assert!(!body.contains("permission_rule_snapshot"));
+        assert!(!body.contains("FROM permission_rule WHERE"));
     }
 
-    /// 全文件守卫（生产代码段）：旧链 CARD head 门禁函数与 legacy 快照读取
-    /// 已从本模块清除；raw `permission_rule` 仅作为 deny-biased 诊断保留。
+    /// Full production-source guard: obsolete CARD-head and legacy snapshot
+    /// reads are absent; published evidence is the only SoD grant source.
     #[test]
     fn legacy_head_gate_and_snapshot_reads_are_gone_from_sod_check() {
         let source = include_str!("sod_check.rs");
@@ -1742,10 +2249,15 @@ mod tests {
         assert!(!production.contains("ensure_sod_card_gate_readable"));
         assert!(!production.contains("ensure_sod_card_gate_unchanged"));
         assert!(!production.contains("SOD_STATIC_CONFLICT_SQL"));
+        assert!(!production.contains("SOD_RAW_RULE_CONFLICT_SQL"));
+        assert!(!production.contains("FROM permission_rule"));
+        assert!(!production.contains("pub async fn check_sod_conflict("));
+        assert!(!production.contains("pub async fn check_sod_conflict_with_org("));
+        assert!(!production.contains("SodReadPath"));
 
-        // raw permission_rule 诊断保留（deny-biased）
-        assert!(production.contains("FROM permission_rule WHERE"));
-        assert!(production.contains("enabled=1"));
+        // Native pre-grant and post-ALLOW paths retain strict published evidence.
+        assert!(production.contains("pub async fn check_grant_sod_conflict("));
+        assert!(production.contains("check_published_sod_conflict("));
         // 新链数据通路在位（经指针对牌的进程内 evidence 缓存入口回源严格 reader）
         assert!(production.contains("cached_load_published_card_grant_evidence"));
         assert!(production.contains("sod_load_card_tenant"));
@@ -2071,15 +2583,18 @@ mod tests {
             "defer must fall back to the durable path, never to a no-conflict result"
         );
         assert!(body.contains("load_sod_policy_snapshot(pool)"));
-        assert!(
-            body.contains("SodReadPath::PublishedEvidenceOnly"),
-            "memory path must select the canonical published-evidence-only read path"
-        );
+        assert!(body.contains("evaluate_sod_conflicts("));
+        assert!(body.contains("&evidence"));
+        assert!(body.contains("evidence.validate()"));
         // 栅栏由 context 入口捕获一次并传入（本函数零采样）；返回前只比较
         // 传入栅栏（绝不重采 token 覆盖旧读）。
         assert!(
             body.contains("fence: AuxiliaryReadToken"),
             "the memory path must receive the single-captured fence from the context entry"
+        );
+        assert!(
+            body.contains("if evidence.tenant_id != tenant_id || evidence.card_id != card_id"),
+            "card evidence returned by the memory index must match the requested scope"
         );
         assert!(
             !body.contains("strict_read_token()"),
@@ -2103,57 +2618,30 @@ mod tests {
         }
     }
 
-    /// 形状守卫：raw `permission_rule` 扫描只允许在旧公开诊断入口
-    /// （`check_sod_conflict`）执行；canonical 宿主路径（cold durable 回退与
-    /// warm 记忆路径）冷/热一致地不执行——持有授权 = 已发布 evidence
-    /// effective-grant 合同，未发布 raw 行不构成持有授权。冲突评估共享同一
-    /// 纯判定段（无重复实现）。
+    /// SoD source contract guard: scoring uses published-only evidence;
+    /// removed raw-source APIs and SQL must stay absent.
     #[test]
-    fn raw_diagnostic_is_legacy_entry_only_and_canonical_contract_is_cold_warm_consistent() {
+    fn sod_paths_are_published_only_and_legacy_raw_api_is_absent() {
         let source = include_str!("sod_check.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-        let eval = fn_body_after(production, "async fn evaluate_sod_conflicts");
-        assert!(eval.contains("SodReadPath::DurableRawDiagnostic"));
-        assert!(eval.contains("SOD_RAW_RULE_CONFLICT_SQL"));
-        assert!(eval.contains("sod_partner_matches_grant"));
-
-        // 旧诊断入口调用点（plain + with_org）携带 raw 扫描；canonical 两个
-        // 调用点（cold durable 回退 + warm 记忆路径）冷/热一致地选择
-        // PublishedEvidenceOnly。
-        let legacy = fn_body_after(production, "pub async fn check_sod_conflict(");
-        assert!(
-            legacy.contains("SodReadPath::DurableRawDiagnostic"),
-            "the legacy public diagnostic entry must keep the raw deny-biased scan"
-        );
-        let legacy_org = fn_body_after(production, "pub async fn check_sod_conflict_with_org(");
-        assert!(
-            legacy_org.contains("SodReadPath::DurableRawDiagnostic"),
-            "the legacy with_org diagnostic entry must keep the raw deny-biased scan"
-        );
-        let canonical_inner =
-            fn_body_after(production, "async fn check_sod_conflict_with_context_inner");
-        assert!(
-            canonical_inner.contains("SodReadPath::PublishedEvidenceOnly"),
-            "the canonical durable fallback must share the warm path contract"
-        );
-        assert_eq!(
-            production
-                .matches("SodReadPath::DurableRawDiagnostic")
-                .count(),
-            3,
-            "raw scan must be reachable only from the two legacy entry call sites and the gate"
-        );
-        assert_eq!(
-            production
-                .matches("SodReadPath::PublishedEvidenceOnly")
-                .count(),
-            3,
-            "every canonical call site (warm memory + composite cold fallback + non-composite tail) must be published-evidence-only"
-        );
-        assert!(
-            !production.contains("SodReadPath::MemoryZeroSql"),
-            "the warm-only raw-skip variant must not survive: cold and warm share one contract"
-        );
+        let evaluator = fn_body_after(production, "fn evaluate_sod_conflicts(");
+        let evaluator = evaluator
+            .split_once('{')
+            .expect("evaluator must have a body")
+            .1
+            .split("\n}")
+            .next()
+            .unwrap();
+        assert!(evaluator.contains("sod_partner_matches_grant"));
+        assert!(!evaluator.contains("FROM permission_rule"));
+        assert!(!evaluator.contains("sqlx::"));
+        assert!(!production.contains("SOD_RAW_RULE_CONFLICT_SQL"));
+        assert!(!production.contains("FROM permission_rule"));
+        assert!(!production.contains("SodReadPath"));
+        assert!(!production.contains("pub async fn check_sod_conflict("));
+        assert!(!production.contains("pub async fn check_sod_conflict_with_org("));
+        assert!(production.contains("pub async fn check_grant_sod_conflict("));
+        assert!(production.contains("check_published_sod_conflict("));
     }
 
     /// 形状守卫：策略快照回源必须有界——`LIMIT cap+1` 探针、3s 查询
@@ -2267,12 +2755,10 @@ mod tests {
         assert!(body.contains("org_scope_sod_source_state_unavailable"));
     }
 
-    /// 形状守卫：context-aware 宿主入口顺序与栅栏——hub 已装时单次采样
-    /// （不可读 → 直接 Err，不回落 durable），记忆路径先行、cold durable
-    /// 回退在同一栅栏终检之内；legacy `check_sod_conflict` 保持 SQL strict
-    /// scope（无记忆路径、无栅栏）。
+    /// Context-aware host and grant-time entries share fail-closed strict
+    /// published-evidence semantics; each composite read uses its original token.
     #[test]
-    fn context_entry_tries_memory_then_durable_and_legacy_stays_sql_strict() {
+    fn context_and_grant_entries_retain_original_token_fences() {
         let source = include_str!("sod_check.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or(source);
         let entry = fn_body_after(production, "async fn check_sod_conflict_with_context_inner");
@@ -2286,7 +2772,7 @@ mod tests {
             .find("try_check_sod_conflict_from_memory(")
             .expect("context entry must try the warm memory path first");
         let durable = entry
-            .find("check_sod_conflict_inner(")
+            .find("check_published_sod_conflict(")
             .expect("context entry must keep the durable strict fallback");
         let cold_guard = entry
             .find("sod_context_source_mutation_raced_read")
@@ -2301,20 +2787,50 @@ mod tests {
             "exactly one token sample; all checks are comparisons of the captured fence"
         );
 
-        // legacy 入口（check_sod_conflict）不得接入记忆路径/栅栏。
-        let legacy = production
-            .split("pub async fn check_sod_conflict(")
-            .nth(1)
-            .expect("legacy entry must exist");
-        let legacy = legacy.split("\npub async fn ").next().unwrap();
-        assert!(
-            !legacy.contains("try_check_sod_conflict_from_memory"),
-            "the legacy SQL-strict scope entry must stay durable-only"
-        );
-        assert!(
-            !legacy.contains("strict_read_token"),
-            "the legacy diagnostic entry must stay outside the composite fence contract"
-        );
+        // The native pre-grant API captures and rechecks exactly one original token.
+        let grant_entry = fn_body_after(production, "pub async fn check_grant_sod_conflict(");
+        assert_eq!(grant_entry.matches("strict_read_token()").count(), 1);
+        let capture = grant_entry
+            .find("strict_read_token()")
+            .expect("grant check must capture its source token");
+        let read = grant_entry
+            .find("check_published_sod_conflict(")
+            .expect("grant check must use the published-only strict reader");
+        let verify = grant_entry
+            .rfind("strict_read_matches(fence)")
+            .expect("grant check must recheck its original fence");
+        assert!(capture < read && read < verify);
+        assert!(grant_entry.contains("writer_active_or_unknown"));
+        assert!(grant_entry.contains("sod_grant_source_mutation_raced_read"));
+    }
+
+    #[test]
+    fn transactional_grant_sod_blocks_unpublished_adds_without_pool_or_cache_reads() {
+        let source = include_str!("sod_check.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let body = fn_body_after(production, "pub async fn check_grant_sod_conflict_in_tx(");
+        let card = body.find("FROM user_card").unwrap();
+        let pending = body
+            .find("sqlx::query_scalar(GRANT_SOD_PENDING_SQL)")
+            .unwrap();
+        let published = body
+            .find("load_published_card_grant_evidence_in_tx(tx, &scope)")
+            .unwrap();
+        let policy = body
+            .find("SELECT policy_name, permission_a, permission_b")
+            .unwrap();
+        let evaluate = body.find("evaluate_sod_conflicts(").unwrap();
+        assert!(card < pending && pending < published && published < policy && policy < evaluate);
+        assert!(GRANT_SOD_PENDING_SQL.contains("(card_id = ? OR card_id IS NULL)"));
+        assert!(GRANT_SOD_PENDING_SQL.contains("status <> 'SUCCEEDED'"));
+        assert!(GRANT_SOD_PENDING_SQL.contains("('ADD', 'UPDATE', 'REMOVE', 'REVOKE')"));
+        assert!(GRANT_SOD_PENDING_SQL.contains("LIMIT 1 FOR UPDATE"));
+        assert!(body.contains("FOR SHARE"));
+        assert!(body.contains("bounded_sod_policy_snapshot"));
+        assert!(!body.contains("fetch_all(pool)"));
+        assert!(!body.contains("cached_load_published"));
+        assert!(!body.contains("strict_read_token"));
+        assert!(!body.contains("permission_rule"));
     }
 
     // ===== ORG_SCOPE 复核：权威 target-resource 事实（跨租户贡献/provenance） =====
@@ -2392,7 +2908,7 @@ mod tests {
             revoke_fence: 1,
             dependencies: &no_dependencies,
             segments: std::slice::from_ref(&segment),
-            compiler_version: "sod-check-test",
+            compiler_version: astral_types::AUTHORIZATION_ORG_COMPILER_VERSION,
             operation_id: "op-org-sod-publication",
         })
         .unwrap();
@@ -2404,7 +2920,7 @@ mod tests {
             revoke_fence: 1,
             dependencies: no_dependencies,
             manifest_digest_hex,
-            compiler_version: "sod-check-test".to_owned(),
+            compiler_version: astral_types::AUTHORIZATION_ORG_COMPILER_VERSION.to_owned(),
             segments: vec![segment],
             operation_id: "op-org-sod-publication".to_owned(),
         };
@@ -2720,7 +3236,7 @@ mod tests {
     #[tokio::test]
     async fn load_org_sod_admission_short_circuits_without_provenance() {
         // 非 ORG 判定（无 provenance）→ Ok(None)：即使 context 事实缺失也先
-        // 短路，调用方对本次请求走既有 check_sod_conflict 纯 deny-only 路径。
+        // 短路，调用方对本次请求走普通 context-aware 宿主 SoD 纯 deny-only 路径。
         let pool = org_sod_lazy_pool();
         let context = org_sod_context(
             ResourceOwnershipScope::TenantScoped,

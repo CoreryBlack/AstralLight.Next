@@ -8,7 +8,8 @@ use super::{
     MirrorRowProvenance, PublicationContext, ScopeKey, ScopePlanMirror, WorkerLivenessCell,
 };
 use crate::service::authorization_projector::{
-    AuthorizationProjectorRuntime, ProjectorCancellationToken, RuntimeAccessError, WorkerRunSummary,
+    AuthorizationProjectorRuntime, DispatchedClaimOutcome, OwnedTransitionProof,
+    ProjectorCancellationToken, RuntimeAccessError, WorkerRunSummary,
 };
 use astral_db::{
     AuthorizationArchiveIntentOutcome, AuthorizationCurrentPointerRecord,
@@ -79,7 +80,7 @@ fn ledger_row_for(grant: &CanonicalGrant, event_id: &str, revision: u64) -> RawL
         dependency_hash: vec![2u8; 32],
         operation_id: format!("op-{event_id}"),
         event_id: event_id.to_owned(),
-        compiler_version: "test-compiler".to_owned(),
+        compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
     }
 }
 
@@ -103,7 +104,7 @@ fn claimed_for(event_id: &str, target_version: i64) -> ClaimedDeltaEvent {
         delta_json: r#"{"op":"UPDATE"}"#.to_owned(),
         semantic_hash: Sha256Digest::from_bytes(vec![1u8; 32]).expect("semantic"),
         dependency_hash: Sha256Digest::from_bytes(vec![2u8; 32]).expect("dependency"),
-        compiler_version: "test-compiler".to_owned(),
+        compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
         attempts: 1,
         cas_version: 5,
         lease_owner: "local-projection:test".to_owned(),
@@ -129,7 +130,7 @@ fn pointer(generation: u64, manifest_id: i64, event_id: &str) -> AuthorizationCu
         operation_id: format!("op-{event_id}"),
         semantic_hash: digest(1),
         dependency_hash: digest(2),
-        compiler_version: "test-compiler".to_owned(),
+        compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
         revoke_fence: 0,
         revoke_fence_proven: true,
         cas_version: 4,
@@ -153,7 +154,7 @@ fn summary_for(generation: u64, manifest_id: i64, event_id: &str) -> PublishedGe
         operation_id: format!("op-{event_id}"),
         semantic_hash: digest(1),
         dependency_hash: digest(2),
-        compiler_version: "test-compiler".to_owned(),
+        compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
         manifest_digest: digest(3),
         parent_manifest_id: None,
         revoke_fence: 0,
@@ -173,7 +174,7 @@ fn published_state(grant: &CanonicalGrant) -> AuthorizationPublishedState {
         operation_id: "op-evt-2".to_owned(),
         semantic_hash: digest(1),
         dependency_hash: digest(2),
-        compiler_version: "test-compiler".to_owned(),
+        compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
         manifest_digest: digest(3),
         parent_manifest_id: Some(11),
         revoke_fence: 0,
@@ -184,8 +185,8 @@ fn published_state(grant: &CanonicalGrant) -> AuthorizationPublishedState {
             content_digest: digest(4),
             semantic_hash: digest(1),
             dependency_hash: digest(2),
-            compiler_version: "test-compiler".to_owned(),
-            format: "v1".to_owned(),
+            compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
+            format: astral_types::AUTHORIZATION_SEGMENT_FORMAT.to_owned(),
             row_count: 1,
             byte_size: 64,
             grants: vec![grant.clone()],
@@ -559,68 +560,21 @@ fn publish_failure_poisons_exact_aggregate_and_pending_halves() {
 }
 
 #[test]
-fn claim_commit_unknown_resolves_in_doubt_and_keeps_lease() {
-    use super::resolve_claim_commit;
-    use astral_db::ClaimedStableEventOutcome as Outcome;
+fn dispatched_terminal_status_keeps_the_exact_durable_value() {
+    use crate::service::authorization_projector::DispatchedClaimOutcome;
 
-    // A claimed lease whose commit failed: UNRESOLVABLE — never assume
-    // rollback success. InDoubt carries no replay and the durable lease is
-    // left for server-side expiry reclaim.
-    let claimed = Outcome::Claimed {
-        claim: Box::new(astral_db::DeltaEventClaim {
-            delta_event_id: 1,
-            event_id: "evt-1".to_owned(),
-            operation_id: "op-evt-1".to_owned(),
-            event_type: astral_db::DeltaEventType::Add,
-            tenant_id: 7,
-            card_id: Some(11),
-            aggregate_type: "card".to_owned(),
-            aggregate_id: 42,
-            grant_id: GrantId::parse(GRANT_UUID).expect("grant id"),
-            base_version: 0,
-            target_version: 1,
-            source_generation: 5,
-            revoke_fence: 0,
-            before_image_json: None,
-            before_digest: None,
-            delta_json: "{}".to_owned(),
-            semantic_hash: digest(1),
-            dependency_hash: digest(2),
-            compiler_version: "test-compiler".to_owned(),
-            attempts: 1,
-            cas_version: 2,
-            lease_owner: "local-projection:test".to_owned(),
-            lease_token: astral_db::DeltaLeaseToken::new_run_scoped(),
-            lease_expires_at: time::PrimitiveDateTime::new(
-                time::Date::from_calendar_date(2026, time::Month::January, 1).expect("date"),
-                time::Time::MIDNIGHT,
-            ),
-        }),
-        event: Box::new(claimed_for("evt-1", 1)),
+    let durable_status = "QUARANTINED_RECONCILIATION_REQUIRED".to_owned();
+    let outcome = DispatchedClaimOutcome::TerminalGated {
+        event_id: "evt-1".to_owned(),
+        status: durable_status.clone(),
     };
-    let resolved = resolve_claim_commit(claimed, "connection reset during commit", "evt-1")
-        .expect("commit-unknown must not surface as a hard error");
-    match resolved {
-        Outcome::InDoubt { event_id, reason } => {
+    match outcome {
+        DispatchedClaimOutcome::TerminalGated { event_id, status } => {
             assert_eq!(event_id, "evt-1");
-            assert!(
-                reason.contains("claim_commit_unknown"),
-                "reason must carry the stable commit-unknown token: {reason}"
-            );
-            assert!(
-                reason.contains("durable_lease=left_for_expiry_reclaim"),
-                "the durable-lease disposition must be explicit: {reason}"
-            );
+            assert_eq!(status, durable_status);
         }
-        other => panic!("commit-unknown must resolve InDoubt, got {other:?}"),
+        other => panic!("expected terminal gate, got {other:?}"),
     }
-
-    // Read-only arms (no mutation) pass through: no fake unknown.
-    let busy = Outcome::Busy {
-        event_id: "evt-2".to_owned(),
-    };
-    let resolved = resolve_claim_commit(busy, "connection reset", "evt-2").expect("passthrough");
-    assert!(matches!(resolved, Outcome::Busy { .. }));
 }
 
 #[test]
@@ -1040,12 +994,15 @@ impl BlockingLocalRuntime {
 
 #[async_trait::async_trait]
 impl AuthorizationProjectorRuntime for BlockingLocalRuntime {
-    fn worker_owned_execution(&self) -> bool {
-        true
-    }
-
     fn event_execution_failures(&self, _identity: &astral_db::DeltaLeaseIdentity) -> Option<u32> {
         Some(0)
+    }
+
+    async fn begin_event_execution(
+        &self,
+        _identity: &astral_db::DeltaLeaseIdentity,
+    ) -> Result<u32, RuntimeAccessError> {
+        Ok(0)
     }
 
     async fn owned_fail_transition(
@@ -1054,9 +1011,17 @@ impl AuthorizationProjectorRuntime for BlockingLocalRuntime {
         _backoff_seconds: i64,
         _message: &str,
         _count_failure: bool,
-    ) -> crate::service::authorization_projector::OwnedTransitionProof {
+    ) -> OwnedTransitionProof {
         self.fail_calls.fetch_add(1, Ordering::AcqRel);
-        crate::service::authorization_projector::OwnedTransitionProof::Unknown
+        OwnedTransitionProof::Unknown
+    }
+
+    async fn owned_release_transition(
+        &self,
+        _identity: &astral_db::DeltaLeaseIdentity,
+    ) -> OwnedTransitionProof {
+        self.release_calls.fetch_add(1, Ordering::AcqRel);
+        OwnedTransitionProof::Unknown
     }
 
     async fn claim_event_by_dispatch(
@@ -1064,17 +1029,17 @@ impl AuthorizationProjectorRuntime for BlockingLocalRuntime {
         _request: &DeltaEventAppendRequest,
         _lease_owner: &str,
         _lease_seconds: i64,
-    ) -> Result<astral_db::ClaimedStableEventOutcome, RuntimeAccessError> {
+    ) -> Result<DispatchedClaimOutcome, RuntimeAccessError> {
         if self.phase == BlockingPhase::DirectClaim {
             return self.wait_forever().await;
         }
         if self.phase == BlockingPhase::DirectInDoubt {
-            return Ok(astral_db::ClaimedStableEventOutcome::InDoubt {
+            return Ok(DispatchedClaimOutcome::InDoubt {
                 event_id: "evt-blocking".to_owned(),
                 reason: "code=test.claim_in_doubt".to_owned(),
             });
         }
-        Ok(astral_db::ClaimedStableEventOutcome::Claimed {
+        Ok(DispatchedClaimOutcome::Claimed {
             claim: Box::new(self.claim()),
             event: Box::new(self.event()),
         })
@@ -1141,19 +1106,6 @@ impl AuthorizationProjectorRuntime for BlockingLocalRuntime {
         Err(RuntimeAccessError::Database(
             "test publish must not run".to_owned(),
         ))
-    }
-
-    async fn fail_event(
-        &self,
-        _identity: &astral_db::DeltaLeaseIdentity,
-        _backoff_seconds: i64,
-        _message: &str,
-    ) {
-        self.fail_calls.fetch_add(1, Ordering::AcqRel);
-    }
-
-    async fn release_event(&self, _identity: &astral_db::DeltaLeaseIdentity) {
-        self.release_calls.fetch_add(1, Ordering::AcqRel);
     }
 
     async fn mark_event_quarantined(

@@ -2187,6 +2187,11 @@ impl VerifiedPublishedGrantRecord {
         ensure_identifier(&self.event_id, "record.event_id")?;
         ensure_identifier(&self.operation_id, "record.operation_id")?;
         ensure_identifier(&self.compiler_version, "record.compiler_version")?;
+        if self.compiler_version != crate::AUTHORIZATION_COMPILER_VERSION {
+            return Err(GrantContractError::InvalidProvenance(
+                "published record compiler is not the current authorization edition".to_owned(),
+            ));
+        }
         validate_positive_id(self.aggregate_id, "record.aggregate_id")?;
         if self.accepted_into_effective_set && self.unaccepted_reason.is_some() {
             return Err(GrantContractError::InvalidProvenance(
@@ -2206,7 +2211,7 @@ impl VerifiedPublishedGrantRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublishedAggregateManifestSummary {
-    /// v3-only publication sealing metadata; never inferred from the local clock.
+    /// Current publication sealing metadata; never inferred from the local clock.
     pub seal: crate::PublicationSeal,
     pub tenant_id: i64,
     pub card_id: i64,
@@ -2232,6 +2237,11 @@ pub struct PublishedAggregateManifestSummary {
 
 impl PublishedAggregateManifestSummary {
     pub fn publication_stamp(&self) -> GrantContractResult<crate::PublicationStamp> {
+        if self.compiler_version != crate::AUTHORIZATION_COMPILER_VERSION {
+            return Err(GrantContractError::InvalidProvenance(
+                "published manifest compiler is not the current authorization edition".to_owned(),
+            ));
+        }
         crate::PublicationStamp::new(self.generation, self.manifest_digest_hex.clone(), self.seal)
             .map_err(|error| {
                 GrantContractError::InvalidProvenance(format!(
@@ -2264,10 +2274,9 @@ pub struct PublishedCardAuthorizationGate {
 ///   raw source / cache fallback 或任何 partial segment 回退。
 /// - `effective_grants` 中每条 grant 都满足：ACTIVE + ALLOW + 统一 UTC now
 ///   下 validity 通过 + tenant/card 完整性验证 + 调用方 user/domain lens。
-/// - 本类型是只读 strict evidence，也是正式授权输入：repository 侧声明
-///   `requires_published_card_evidence == true` 时（Sqlx 生产实现即如此），
-///   `PolicyEngine.evaluate()` 直接消费本类型并跳过 L1/L2/L2.5 读取器；
-///   CACHE 包装层对同一端口透明转发，MQ 侧不消费该端口。
+/// - 本类型是正式授权的唯一卡级输入；`PolicyEngine.evaluate()` 必须读取
+///   当前 V6 evidence，并在 ALLOW 前复读。缓存装饰器保留同一严格端口和
+///   完整栅栏，MQ 侧不直接消费该读取端口。
 /// - 真实 MySQL integration 属后续门禁，当前仅纯测试覆盖。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3908,8 +3917,7 @@ mod tests {
         .narrows(&sample));
     }
 
-    #[test]
-    fn card_authorization_validate_locks_gate_counter_agreement() {
+    fn published_card_authorization() -> PublishedCardAuthorization {
         let base_grant = grant();
         let record = VerifiedPublishedGrantRecord {
             aggregate_type: "USER_CARD".to_owned(),
@@ -3921,7 +3929,7 @@ mod tests {
             operation_id: "op-1".to_owned(),
             semantic_hash_hex: "a".repeat(64),
             dependency_hash_hex: "b".repeat(64),
-            compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+            compiler_version: crate::AUTHORIZATION_COMPILER_VERSION.to_owned(),
             segment_ordinal: 0,
             position_in_segment: 0,
             grant: base_grant.clone(),
@@ -3943,14 +3951,14 @@ mod tests {
             semantic_hash_hex: "a".repeat(64),
             dependency_hash_hex: "b".repeat(64),
             manifest_digest_hex: "c".repeat(64),
-            compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+            compiler_version: crate::AUTHORIZATION_COMPILER_VERSION.to_owned(),
             event_id: "event-1".to_owned(),
             operation_id: "op-1".to_owned(),
             parent_manifest_id: None,
             segment_count: 1,
             declared_grant_row_count: 1,
         };
-        let authorization = PublishedCardAuthorization {
+        PublishedCardAuthorization {
             tenant_id: 7,
             card_id: 17,
             read_unix_seconds: 100,
@@ -3963,9 +3971,40 @@ mod tests {
                 equivalent_duplicate_collapsed_count: 0,
             },
             manifests: vec![manifest],
-            records: vec![record.clone()],
+            records: vec![record],
             effective_grants: vec![base_grant],
-        };
+        }
+    }
+
+    #[test]
+    fn card_authorization_rejects_other_compiler_editions() {
+        let authorization = published_card_authorization();
+        authorization.validate().unwrap();
+        let compilers = (1..=crate::AUTHORIZATION_EDITION + 1)
+            .filter(|edition| *edition != crate::AUTHORIZATION_EDITION)
+            .map(|edition| format!("astral-authorization-v{edition}"))
+            .chain(std::iter::once("foreign-compiler".to_owned()));
+        for compiler in compilers {
+            let mut manifest_changed = authorization.clone();
+            manifest_changed.manifests[0].compiler_version = compiler.clone();
+            assert!(manifest_changed.manifests[0].publication_stamp().is_err());
+            assert!(manifest_changed.validate().is_err());
+
+            let mut record_changed = authorization.clone();
+            record_changed.records[0].compiler_version = compiler;
+            assert!(record_changed.records[0].validate_fields().is_err());
+            assert!(record_changed.validate().is_err());
+
+            record_changed.manifests = manifest_changed.manifests;
+            assert!(record_changed.validate().is_err());
+            let shared = std::sync::Arc::new(record_changed);
+            assert!(PublishedCardAuthorization::validate_shared(&shared).is_err());
+        }
+    }
+
+    #[test]
+    fn card_authorization_validate_locks_gate_counter_agreement() {
+        let authorization = published_card_authorization();
         authorization.validate().unwrap();
 
         assert!(authorization.manifests[0].seal.validate().is_ok());
@@ -4000,7 +4039,7 @@ mod tests {
         // Accepted-with-reason pairing is contractual, not cosmetic.
         assert!(VerifiedPublishedGrantRecord {
             accepted_into_effective_set: false,
-            ..record.clone()
+            ..authorization.records[0].clone()
         }
         .validate_fields()
         .is_err());
@@ -4035,7 +4074,7 @@ mod tests {
             semantic_hash_hex: "a".repeat(64),
             dependency_hash_hex: "b".repeat(64),
             manifest_digest_hex: "c".repeat(64),
-            compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+            compiler_version: crate::AUTHORIZATION_COMPILER_VERSION.to_owned(),
             event_id: "event-1".to_owned(),
             operation_id: "op-1".to_owned(),
             parent_manifest_id: None,
@@ -4052,7 +4091,7 @@ mod tests {
             operation_id: "op-1".to_owned(),
             semantic_hash_hex: "a".repeat(64),
             dependency_hash_hex: "b".repeat(64),
-            compiler_version: "phase2-authorization-kernel-v1".to_owned(),
+            compiler_version: crate::AUTHORIZATION_COMPILER_VERSION.to_owned(),
             segment_ordinal: 0,
             position_in_segment: 0,
             grant,

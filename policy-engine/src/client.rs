@@ -199,133 +199,67 @@ impl From<PolicyError> for ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{PermissionRule, RuleSetEntry, RuleSetSnapshot};
-    use crate::SnapshotWinner;
-    use astral_types::Effect;
+    use crate::org_admission::OrgAuthorityRead;
 
-    // 模拟仓库：返回指定结果
+    /// The client facade must preserve the strict evaluator's fail-closed behavior.
     struct MockRepo {
-        snapshots: Vec<RuleSetSnapshot>,
-        rules: Vec<PermissionRule>,
-    }
-
-    impl MockRepo {
-        fn with_snapshot(resource: &str, effect: Effect) -> Self {
-            Self {
-                snapshots: vec![RuleSetSnapshot {
-                    rule_set_id: 1,
-                    ref_type: "BASE".into(),
-                    entries: vec![RuleSetEntry {
-                        effect,
-                        resource: Some(resource.to_string()),
-                        action: Some("read".to_string()),
-                        condition: None,
-                    }],
-                }],
-                rules: vec![],
-            }
-        }
+        card_active: bool,
     }
 
     #[async_trait::async_trait]
     impl RuleRepository for MockRepo {
-        async fn load_rule_set_snapshots(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-            Ok(self.snapshots.clone())
+        async fn check_card_active(&self, _ctx: &PolicyContext) -> Result<bool, PolicyError> {
+            Ok(self.card_active)
         }
-        async fn load_snapshot_winners(
-            &self,
-            _card_id: i64,
-        ) -> Result<Vec<SnapshotWinner>, PolicyError> {
-            // 从源表条目编译胜者（对齐投影器语义）：跳过带运行时条件的条目，
-            // 裸资源名视为类型级 `type:*`，同 (resource_key, action) DENY 优先。
-            let mut winners: Vec<SnapshotWinner> = Vec::new();
-            for snapshot in &self.snapshots {
-                for entry in &snapshot.entries {
-                    if entry.condition.is_some() {
-                        continue;
-                    }
-                    let resource = entry.resource.clone().unwrap_or_default();
-                    // 已含 `:` 的是完整 key（`type:*` 或 `type:id`）原样保留；
-                    // 裸类型名视为类型级 `type:*`。
-                    let resource_key = if resource.contains(':') {
-                        resource
-                    } else {
-                        format!("{resource}:*")
-                    };
-                    let action = entry.action.clone().unwrap_or_default();
-                    if let Some(existing) = winners.iter_mut().find(|w: &&mut SnapshotWinner| {
-                        w.rule_set_id == snapshot.rule_set_id
-                            && w.resource_key == resource_key
-                            && w.action_code == action
-                    }) {
-                        if entry.effect == Effect::Deny {
-                            existing.final_effect = "DENY".into();
-                        }
-                    } else {
-                        winners.push(SnapshotWinner {
-                            ref_type: snapshot.ref_type.clone(),
-                            rule_set_id: snapshot.rule_set_id,
-                            resource_key,
-                            action_code: action,
-                            final_effect: match entry.effect {
-                                Effect::Allow => "ALLOW".into(),
-                                _ => "DENY".into(),
-                            },
-                        });
-                    }
-                }
-            }
-            Ok(winners)
+
+        async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
+            Ok(false)
         }
-        async fn load_permission_rules(
+
+        async fn load_published_card_authorization(
             &self,
-            _card_id: i64,
-        ) -> Result<Vec<PermissionRule>, PolicyError> {
-            Ok(self.rules.clone())
+            _scope: &astral_types::PublishedCardEvidenceScope,
+        ) -> Result<Option<Arc<astral_types::PublishedCardAuthorization>>, PolicyError> {
+            Ok(None)
+        }
+
+        async fn load_org_authorization(
+            &self,
+            _ctx: &PolicyContext,
+        ) -> Result<OrgAuthorityRead, PolicyError> {
+            Ok(OrgAuthorityRead::Unmanaged)
         }
     }
 
-    #[tokio::test]
-    async fn test_check_allowed() {
-        let repo = MockRepo::with_snapshot("learn_subject", Effect::Allow);
-        let client = PermissionClient::new(repo);
-
-        let ctx = PolicyContext::builder()
+    fn valid_context() -> PolicyContext {
+        PolicyContext::builder()
             .user_id(Some(1))
             .card_id(Some(1))
+            .tenant_id(Some(7))
             .action("read".into())
             .resource(Some("learn_subject".into()))
-            .build();
-
-        let decision = client.check(ctx).await.unwrap();
-        assert!(decision.allowed);
+            .build()
     }
 
     #[tokio::test]
-    async fn test_check_denied() {
-        let repo = MockRepo::with_snapshot("learn_subject", Effect::Deny);
-        let client = PermissionClient::new(repo);
-
-        let ctx = PolicyContext::builder()
-            .user_id(Some(1))
-            .card_id(Some(1))
-            .action("read".into())
-            .resource(Some("learn_subject".into()))
-            .build();
-
-        let decision = client.check(ctx).await.unwrap();
+    async fn check_without_current_published_evidence_fails_closed() {
+        let client = PermissionClient::new(MockRepo { card_active: true });
+        let decision = client.check(valid_context()).await.unwrap();
         assert!(!decision.allowed);
+        assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
+    }
+
+    #[tokio::test]
+    async fn check_denies_inactive_card_before_reading_evidence() {
+        let client = PermissionClient::new(MockRepo { card_active: false });
+        let decision = client.check(valid_context()).await.unwrap();
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason, "CARD_DISABLED");
     }
 
     #[tokio::test]
     async fn test_check_invalid_context() {
-        let repo = MockRepo::with_snapshot("learn_subject", Effect::Allow);
-        let client = PermissionClient::new(repo);
-
-        // action 为空 → 校验失败
+        let client = PermissionClient::new(MockRepo { card_active: true });
         let ctx = PolicyContext::builder().action(String::new()).build();
 
         let result = client.check(ctx).await;
@@ -337,67 +271,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_batch_check() {
-        let repo = MockRepo {
-            snapshots: vec![RuleSetSnapshot {
-                rule_set_id: 1,
-                ref_type: "BASE".into(),
-                entries: vec![
-                    RuleSetEntry {
-                        effect: Effect::Allow,
-                        resource: Some("learn_subject:*".into()),
-                        action: Some("read".into()),
-                        condition: None,
-                    },
-                    RuleSetEntry {
-                        effect: Effect::Allow,
-                        resource: Some("learn_exam:*".into()),
-                        action: Some("write".into()),
-                        condition: None,
-                    },
-                    RuleSetEntry {
-                        effect: Effect::Allow,
-                        resource: Some("audit:*".into()),
-                        action: Some("export".into()),
-                        condition: None,
-                    },
-                ],
-            }],
-            rules: vec![],
-        };
-        let client = PermissionClient::new(repo);
-
-        let ctx = PolicyContext::builder()
-            .user_id(Some(1))
-            .card_id(Some(1))
-            .action("read".into())
-            .build();
-
+    async fn batch_check_keeps_missing_evidence_fail_closed() {
+        let client = PermissionClient::new(MockRepo { card_active: true });
         let requests = vec![
             ("learn_subject".into(), "read".into()),
             ("learn_exam".into(), "write".into()),
             ("audit".into(), "export".into()),
         ];
 
-        let result = client.batch_check(ctx, &requests).await.unwrap();
+        let result = client
+            .batch_check(valid_context(), &requests)
+            .await
+            .unwrap();
         assert_eq!(result.total, 3);
-        assert_eq!(result.allowed, 3);
+        assert_eq!(result.allowed, 0);
+        assert_eq!(result.denied, 3);
         assert!(result.elapsed_us > 0);
     }
 
     #[tokio::test]
-    async fn test_simple_is_allowed() {
-        let repo = MockRepo::with_snapshot("learn_subject", Effect::Allow);
-        let client = PermissionClient::new(repo);
-
-        let ctx = PolicyContext::builder()
-            .user_id(Some(1))
-            .card_id(Some(1))
-            .action("read".into())
-            .build();
-
-        assert!(client
-            .is_allowed("learn_subject", "read", ctx)
+    async fn simple_check_fails_closed_without_published_evidence() {
+        let client = PermissionClient::new(MockRepo { card_active: true });
+        assert!(!client
+            .is_allowed("learn_subject", "read", valid_context())
             .await
             .unwrap());
     }

@@ -17,7 +17,7 @@
 //! ## 镜像与权威边界（与 memory_projection_hub 同源的不变式）
 //!
 //! - **只缓存严格 verified evidence**：org 侧缓存 `Ready` 证据、`Disabled`
-//!   与 `TenantUnmanaged`（未纳入行政治理的权威 legacy 路由事实）三种可信
+//!   与 `TenantUnmanaged`（未纳入行政治理的当前路由事实）三种可信
 //!   值，GA 侧缓存 ACTIVE 布尔事实；`SchemaUnmanaged`（schema 归属由未栅栏
 //!   的 migration/DDL 控制，不在 org 纪元语义内）与 `Pending` /
 //!   `Unavailable` / 任何基础设施失败**永不缓存**，逐次回源既有 DB 链。
@@ -148,7 +148,7 @@ pub(crate) enum OrgMirrorValue {
     /// 租户受管但启动期冻结旗标关闭 → Disabled。
     Disabled,
     /// 租户未被纳入行政治理（`org_scope_node` 表存在且无 node 行）：权威
-    /// legacy 路由事实（引擎按 Unmanaged 走 legacy 评估，绝非 deny）。仅在
+    /// 当前路由事实（引擎按 Unmanaged 继续 V6 卡级评估）。仅在
     /// 严格 gate 读取成功时缓存；node 行唯一生产写点是受栅栏的 org
     /// authority 事务，Unmanaged→Managed 转换必然推进纪元使本条目失效。
     Unmanaged,
@@ -229,7 +229,7 @@ pub(crate) enum OrgServeDecision {
     ServeReady(Box<OrgAdmissionEvidence>),
     /// 命中静态事实（Disabled / Unmanaged）：直接转发权威判定，绝不改写
     /// （Disabled = 受管但旗标关闭；Unmanaged = 未纳入行政治理，由引擎
-    /// legacy 路由 —— 两者都不是 deny 偏置）。
+    /// V6 卡级评估 —— 两者都不是 deny 偏置）。
     ServeStatic(OrgAuthorityRead),
     /// 纪元变更/TTL 过期/重验失败：绝不 serve 旧条目，转入严格回填。
     Stale,
@@ -509,7 +509,7 @@ impl AuxiliaryAuthorizationMirror {
         card_id: i64,
     ) -> Option<OrgRefillRead> {
         match probe_org_scope_gate(&self.inner.pool, tenant_id).await {
-            // 严格 gate 读取的权威 legacy 路由事实（表存在且无 node 行，
+            // 严格 gate 读取的权威 当前 org 路由事实（表存在且无 node 行，
             // 本模块零构造）：与 Ready 共用同一纪元/容量/single-flight 协议
             // 缓存。node 行的生产唯一写点是受栅栏的 org authority 事务
             // （begin/drop 双向推进纪元），Unmanaged→Managed 转换必然使旧
@@ -886,7 +886,7 @@ mod tests {
             revoke_fence: 1,
             dependencies: Vec::new(),
             manifest_digest_hex: String::new(),
-            compiler_version: "org-compiler-v1".to_owned(),
+            compiler_version: astral_types::AUTHORIZATION_ORG_COMPILER_VERSION.to_owned(),
             segments: vec![segment],
             operation_id: "op-publish-1".to_owned(),
         };
@@ -1536,8 +1536,8 @@ mod tests {
                 let counter = counter.clone();
                 async move {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    // 严格 gate 读取的权威 legacy 路由事实（表存在且无 node
-                    // 行）：与 Ready 同协议缓存，供引擎 Unmanaged→legacy。
+                    // 严格 gate 读取的权威 当前 org 路由事实（表存在且无 node
+                    // 行）：与 Ready 同协议缓存，供引擎 Unmanaged 后继续 V6 卡级评估。
                     Some(OrgRefillRead::Cacheable(OrgMirrorValue::Unmanaged))
                 }
             }
@@ -1580,7 +1580,7 @@ mod tests {
         assert_pending_code(read, "invalidation_raced_refill");
         assert_eq!(mirror.org_entry_count(), 0);
         assert!(hub.auxiliary_org_epoch() > epoch_before);
-        // 新鲜 token 读取也不 serve（未安装）：legacy 路由事实同样受纪元
+        // 新鲜 token 读取也不 serve（未安装）：当前 org 路由事实同样受纪元
         // 栅栏约束（Unmanaged→Managed 转换只可能经栅栏事务发生）。
         assert!(matches!(
             mirror.load_org_authorization(&hub, &ctx_value(CARD)).await,

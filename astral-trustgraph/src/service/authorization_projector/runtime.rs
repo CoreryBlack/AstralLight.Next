@@ -1,26 +1,21 @@
 //! Projector runtime seam：所有 DB 事务边界经由本 trait，决策分支可在无
 //! MySQL 环境下单测；生产实现 `SqlxAuthorizationProjectorRuntime` 直连
-//! astral-db durable 原语，提交后镜像安装与 L2 推送保持既有顺序。
+//! astral-db durable 原语；提交后只安装已证明的本地镜像。
 
 use std::sync::Arc;
 
+use super::CLAIM_LEASE_SECS;
 #[cfg(feature = "e3-observability")]
 use super::{log_e3_attempt_event, log_e3_identity_event};
-use super::{reconcile_lease_mutation_loss, CLAIM_LEASE_SECS};
-
 use async_trait::async_trait;
 use sqlx::MySqlPool;
 
 use astral_db::{
-    claim_delta_event_by_stable_event_in_tx, claim_next_delta_event_in_partition_tx,
-    claim_next_delta_event_in_tx, extend_delta_event_lease, fail_delta_event,
-    load_claimed_delta_event_for_update_in_tx, load_grant_ledger_rows,
-    load_published_aggregate_frontier_in_tx, load_published_parent_reference_views_in_tx,
-    mark_delta_event_quarantined, project_authorization_delta_in_tx, release_delta_event_lease,
-    AuthorizationProjectionError, ClaimedDeltaEvent, ClaimedStableEventOutcome,
+    load_grant_ledger_rows, load_published_aggregate_frontier_in_tx,
+    load_published_parent_reference_views_in_tx, AuthorizationProjectionError, ClaimedDeltaEvent,
     DeltaEventAppendRequest, DeltaEventClaim, DeltaEventClaimScope, DeltaLeaseIdentity,
-    DeltaProjectorPublishCommand, DeltaProjectorPublishOutcome, ParentReferenceView,
-    PartitionLeaseHandle, ProjectionAggregateIdentity, PublishedAggregateFrontier, RawLedgerRow,
+    DeltaProjectorPublishCommand, DeltaProjectorPublishOutcome, OwnedStableEventOutcome,
+    ParentReferenceView, ProjectionAggregateIdentity, PublishedAggregateFrontier, RawLedgerRow,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -109,19 +104,40 @@ pub enum OwnedTransitionProof {
     Unknown,
 }
 
+/// Direct-dispatch result after the DB adapter has installed its opaque owned capability.
+/// The terminal status is the durable DB value and must not be normalized or flattened.
+#[derive(Debug)]
+pub enum DispatchedClaimOutcome {
+    Claimed {
+        claim: Box<DeltaEventClaim>,
+        event: Box<ClaimedDeltaEvent>,
+    },
+    AlreadyProcessed {
+        event_id: String,
+    },
+    TerminalGated {
+        event_id: String,
+        status: String,
+    },
+    Busy {
+        event_id: String,
+    },
+    InDoubt {
+        event_id: String,
+        reason: String,
+    },
+}
+
 #[async_trait]
 pub trait AuthorizationProjectorRuntime: Send + Sync + 'static {
-    /// Whether claims carry an aggregate execution capability rather than an event lease alone.
-    fn worker_owned_execution(&self) -> bool {
-        false
-    }
-
-    /// Record actual execution once per live episode; compatibility runtimes do not account it.
+    /// Record actual execution once per live episode.
     async fn begin_event_execution(
         &self,
         _identity: &DeltaLeaseIdentity,
     ) -> Result<u32, RuntimeAccessError> {
-        Ok(0)
+        Err(RuntimeAccessError::Repository(RepositoryRejection::Other(
+            "code=auth_projector.owned_execution_unsupported".to_owned(),
+        )))
     }
 
     /// Authoritative failure budget; claim statistics must never substitute for it.
@@ -129,9 +145,7 @@ pub trait AuthorizationProjectorRuntime: Send + Sync + 'static {
         None
     }
 
-    /// Typed proof port for owned retry/defer transitions. The default is
-    /// deliberately UNKNOWN: compatibility implementations must not fabricate
-    /// an Applied proof from the legacy void seam.
+    /// Typed proof port for owned retry/defer transitions.
     async fn owned_fail_transition(
         &self,
         _identity: &DeltaLeaseIdentity,
@@ -142,8 +156,7 @@ pub trait AuthorizationProjectorRuntime: Send + Sync + 'static {
         OwnedTransitionProof::Unknown
     }
 
-    /// Typed proof port for relinquishing an owned episode. The default is
-    /// deliberately UNKNOWN for the same fail-closed compatibility reason.
+    /// Typed proof port for relinquishing an owned episode.
     async fn owned_release_transition(
         &self,
         _identity: &DeltaLeaseIdentity,
@@ -151,35 +164,27 @@ pub trait AuthorizationProjectorRuntime: Send + Sync + 'static {
         OwnedTransitionProof::Unknown
     }
 
-    /// Defer without charging a failed execution. Legacy runtimes retain their existing policy.
-    async fn defer_event(&self, identity: &DeltaLeaseIdentity, backoff_seconds: i64, reason: &str) {
-        self.fail_event(identity, backoff_seconds, reason).await;
-    }
-
-    /// One short-lived claim transaction: installs LEASED + owner + fresh
-    /// run-scoped token. Commit happens inside (also for `Ok(None)`).
+    /// Claim the next candidate using the owned aggregate capability protocol.
     async fn claim_next_event(
         &self,
-        scope: &DeltaEventClaimScope,
-        lease_owner: &str,
-        lease_seconds: i64,
-    ) -> Result<Option<DeltaEventClaim>, RuntimeAccessError>;
+        _scope: &DeltaEventClaimScope,
+        _lease_owner: &str,
+        _lease_seconds: i64,
+    ) -> Result<Option<DeltaEventClaim>, RuntimeAccessError> {
+        Err(RuntimeAccessError::Repository(RepositoryRejection::Other(
+            "code=auth_projector.owned_claim_unsupported".to_owned(),
+        )))
+    }
 
-    /// Direct-dispatch claim port (local in-process projector path): claim
-    /// ONE event by its stable event identity inside ONE transaction,
-    /// re-binding the commit-proven [`DeltaEventAppendRequest`] payload
-    /// field-by-field against the durable row. The transaction commits inside
-    /// (both for `Claimed` and for the no-mutation outcomes). Default fails
-    /// closed: runtimes that have not opted into the direct-dispatch path
-    /// never claim by dispatch.
+    /// Claim one exact commit-proven receipt using the owned capability protocol.
     async fn claim_event_by_dispatch(
         &self,
         _request: &DeltaEventAppendRequest,
         _lease_owner: &str,
         _lease_seconds: i64,
-    ) -> Result<ClaimedStableEventOutcome, RuntimeAccessError> {
+    ) -> Result<DispatchedClaimOutcome, RuntimeAccessError> {
         Err(RuntimeAccessError::Repository(RepositoryRejection::Other(
-            "code=auth_projector.claim_by_dispatch_unsupported".to_owned(),
+            "code=auth_projector.owned_dispatch_unsupported".to_owned(),
         )))
     }
 
@@ -237,13 +242,6 @@ pub trait AuthorizationProjectorRuntime: Send + Sync + 'static {
         command: &DeltaProjectorPublishCommand,
     ) -> Result<DeltaProjectorPublishOutcome, RuntimeAccessError>;
 
-    /// Record a durable failure + bounded backoff. Loss of the lease CAS is
-    /// reconciled (logged) instead of retried blindly.
-    async fn fail_event(&self, identity: &DeltaLeaseIdentity, backoff_seconds: i64, message: &str);
-
-    /// Relinquish the lease without recording failure.
-    async fn release_event(&self, identity: &DeltaLeaseIdentity);
-
     /// Durable terminal quarantine of one leased event via the live-lease
     /// guarded repository boundary.
     ///
@@ -269,64 +267,23 @@ pub trait AuthorizationProjectorRuntime: Send + Sync + 'static {
         false
     }
 
-    // ── Partition scheduling ports (multi-tenant redesign Phase 1). Defaults
-    // fail closed: a runtime that has not opted into partitioned scheduling
-    // must never be silently scheduled as if it had. The production sqlx
-    // runtime and partition-mode test fakes override all four; TenantSerial
-    // mode never calls them.
+    // ── Topology-only scheduling ports. WorkerOwned aggregate ownership is
+    // acquired atomically with every claim; topology must not add a second
+    // partition lease protocol.
 
-    /// Discover partitions (inside the validated tenant allowlist) that hold
-    /// at least one claimable event right now, oldest due first. The ledger
-    /// query mirrors the claim eligibility + sibling-ordering gate verbatim.
+    /// Discover claimable aggregate scopes within the validated tenant allowlist.
     async fn discover_partitions(
         &self,
         _tenants: &[i64],
         _limit: i64,
     ) -> Result<Vec<ProjectionAggregateIdentity>, RuntimeAccessError> {
         Err(RuntimeAccessError::Repository(RepositoryRejection::Other(
-            "code=auth_projector.partition_ports_unsupported".to_owned(),
+            "code=auth_projector.partition_discovery_unsupported".to_owned(),
         )))
     }
 
-    /// Acquire (or self-renew / expired-takeover) the exclusive scheduling
-    /// lease for one partition. `Ok(None)` = live lease held by another worker
-    /// (Busy): skip, never wait.
-    async fn acquire_partition_lease(
-        &self,
-        _identity: &ProjectionAggregateIdentity,
-        _lease_owner: &str,
-        _lease_seconds: i64,
-    ) -> Result<Option<PartitionLeaseHandle>, RuntimeAccessError> {
-        Err(RuntimeAccessError::Repository(RepositoryRejection::Other(
-            "code=auth_projector.partition_ports_unsupported".to_owned(),
-        )))
-    }
-
-    /// Heartbeat the partition lease before each claim iteration. An error
-    /// means the lease was lost (another worker took over after expiry): the
-    /// worker must stop touching the partition immediately.
-    async fn renew_partition_lease(
-        &self,
-        _handle: &PartitionLeaseHandle,
-        _lease_seconds: i64,
-    ) -> Result<(), RuntimeAccessError> {
-        Err(RuntimeAccessError::Repository(RepositoryRejection::Other(
-            "code=auth_projector.partition_ports_unsupported".to_owned(),
-        )))
-    }
-
-    /// Best-effort release; expiry is the crash safety net.
-    async fn release_partition_lease(
-        &self,
-        _handle: &PartitionLeaseHandle,
-    ) -> Result<(), RuntimeAccessError> {
-        Err(RuntimeAccessError::Repository(RepositoryRejection::Other(
-            "code=auth_projector.partition_ports_unsupported".to_owned(),
-        )))
-    }
-
-    /// Claim the next claimable event of ONE partition (identical contract to
-    /// [`Self::claim_next_event`], narrowed to the partition identity).
+    /// Claim the next claimable event of ONE discovered aggregate using the
+    /// same owned lane capability as TenantSerial scheduling.
     async fn claim_next_event_in_partition(
         &self,
         _identity: &ProjectionAggregateIdentity,
@@ -335,7 +292,7 @@ pub trait AuthorizationProjectorRuntime: Send + Sync + 'static {
         _lease_seconds: i64,
     ) -> Result<Option<DeltaEventClaim>, RuntimeAccessError> {
         Err(RuntimeAccessError::Repository(RepositoryRejection::Other(
-            "code=auth_projector.partition_ports_unsupported".to_owned(),
+            "code=auth_projector.partition_claim_unsupported".to_owned(),
         )))
     }
 
@@ -376,7 +333,7 @@ pub struct SqlxAuthorizationProjectorRuntime {
 /// Watchdog diagnostics probe (F5 修复 1d): "does this tenant scope hold any
 /// event the claim path could serve right now?" — same shape as the claim
 /// candidate statements, INCLUDING the per-grant sibling-ordering gate (pinned
-/// byte-equal to [`astral_db::DELTA_CLAIM_SIBLING_ORDER_GATE`] by
+/// byte-equal to [`astral_db::OWNED_DELTA_CLAIM_SIBLING_ORDER_GATE`] by
 /// `watchdog_probe_carries_the_claim_sibling_order_gate`). A gate-free probe
 /// would report a backlog that the claim can never serve while one chain
 /// serializes behind a backoff'd predecessor, and the stall detector would
@@ -475,17 +432,10 @@ impl SqlxAuthorizationProjectorRuntime {
 
 #[async_trait]
 impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
-    fn worker_owned_execution(&self) -> bool {
-        astral_db::projection_execution_mode() == astral_db::ProjectionExecutionMode::WorkerOwned
-    }
-
     async fn begin_event_execution(
         &self,
         identity: &DeltaLeaseIdentity,
     ) -> Result<u32, RuntimeAccessError> {
-        if !self.worker_owned_execution() {
-            return Ok(0);
-        }
         let lease = self.owned.get(identity)?;
         Ok(astral_db::begin_owned_delta_execution(&self.pool, &lease).await?)
     }
@@ -504,45 +454,15 @@ impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
         message: &str,
         count_failure: bool,
     ) -> OwnedTransitionProof {
-        if self.worker_owned_execution() {
-            self.finish_owned_event(identity, backoff_seconds, message, count_failure)
-                .await
-        } else {
-            match fail_delta_event(&self.pool, identity, backoff_seconds, message).await {
-                Ok(()) => OwnedTransitionProof::Applied,
-                Err(error) => {
-                    reconcile_lease_mutation_loss(identity, "fail", &error);
-                    OwnedTransitionProof::Unknown
-                }
-            }
-        }
+        self.finish_owned_event(identity, backoff_seconds, message, count_failure)
+            .await
     }
 
     async fn owned_release_transition(
         &self,
         identity: &DeltaLeaseIdentity,
     ) -> OwnedTransitionProof {
-        if self.worker_owned_execution() {
-            self.finish_owned_release(identity).await
-        } else {
-            match release_delta_event_lease(&self.pool, identity).await {
-                Ok(()) => OwnedTransitionProof::Applied,
-                Err(error) => {
-                    reconcile_lease_mutation_loss(identity, "release", &error);
-                    OwnedTransitionProof::Unknown
-                }
-            }
-        }
-    }
-
-    async fn defer_event(&self, identity: &DeltaLeaseIdentity, backoff_seconds: i64, reason: &str) {
-        if self.worker_owned_execution() {
-            let _ = self
-                .owned_fail_transition(identity, backoff_seconds, reason, false)
-                .await;
-        } else {
-            self.fail_event(identity, backoff_seconds, reason).await;
-        }
+        self.finish_owned_release(identity).await
     }
 
     async fn claim_event_by_dispatch(
@@ -550,72 +470,59 @@ impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
         request: &DeltaEventAppendRequest,
         lease_owner: &str,
         lease_seconds: i64,
-    ) -> Result<ClaimedStableEventOutcome, RuntimeAccessError> {
-        if self.worker_owned_execution() {
-            let reservation = self.owned_claim_reservation().await?;
-            let owned = match astral_db::claim_owned_delta_event_by_stable_event(
-                &self.pool,
-                request,
-                lease_owner,
-                lease_seconds,
-            )
-            .await
-            .map_err(RuntimeAccessError::from)
-            {
-                Ok(owned) => owned,
-                Err(error) => {
-                    if matches!(&error, RuntimeAccessError::PublicationUnknown(_)) {
-                        tracing::warn!(
-                            event_id = %request.event_id,
-                            operation_id = %request.operation_id,
-                            "owned direct claim commit unknown; no release or replay"
-                        );
-                    }
+    ) -> Result<DispatchedClaimOutcome, RuntimeAccessError> {
+        let reservation = self.owned_claim_reservation().await?;
+        let outcome = match astral_db::claim_owned_delta_event_by_stable_event(
+            &self.pool,
+            request,
+            lease_owner,
+            lease_seconds,
+        )
+        .await
+        .map_err(RuntimeAccessError::from)
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if matches!(&error, RuntimeAccessError::PublicationUnknown(_)) {
+                    tracing::warn!(
+                        event_id = %request.event_id,
+                        operation_id = %request.operation_id,
+                        "owned direct claim commit unknown; no release or replay"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        match outcome {
+            OwnedStableEventOutcome::Claimed(owned) => {
+                let owned = *owned;
+                if let Err(error) = self.owned.insert_reserved(reservation, owned.lease) {
+                    tracing::error!(
+                        event_id = %request.event_id,
+                        operation_id = %request.operation_id,
+                        %error,
+                        "owned direct claim committed but capability registration is unknown; no release"
+                    );
                     return Err(error);
                 }
-            };
-            return match owned {
-                astral_db::OwnedStableEventOutcome::Claimed(owned) => {
-                    let owned = *owned;
-                    if let Err(error) = self.owned.insert_reserved(reservation, owned.lease) {
-                        tracing::error!(
-                            event_id = %request.event_id,
-                            operation_id = %request.operation_id,
-                            %error,
-                            "owned direct claim committed but capability registration is unknown; no release"
-                        );
-                        return Err(error);
-                    }
-                    Ok(ClaimedStableEventOutcome::Claimed {
-                        claim: Box::new(owned.claim),
-                        event: Box::new(owned.event),
-                    })
-                }
-                astral_db::OwnedStableEventOutcome::AlreadyProcessed { event_id } => {
-                    Ok(ClaimedStableEventOutcome::AlreadyProcessed { event_id })
-                }
-                astral_db::OwnedStableEventOutcome::Busy { event_id } => {
-                    Ok(ClaimedStableEventOutcome::Busy { event_id })
-                }
-                astral_db::OwnedStableEventOutcome::TerminalGated { event_id, .. } => {
-                    Ok(ClaimedStableEventOutcome::TerminalGated {
-                        event_id,
-                        status: "QUARANTINED",
-                    })
-                }
-                astral_db::OwnedStableEventOutcome::InDoubt { event_id, reason } => {
-                    Ok(ClaimedStableEventOutcome::InDoubt { event_id, reason })
-                }
-            };
+                Ok(DispatchedClaimOutcome::Claimed {
+                    claim: Box::new(owned.claim),
+                    event: Box::new(owned.event),
+                })
+            }
+            OwnedStableEventOutcome::AlreadyProcessed { event_id } => {
+                Ok(DispatchedClaimOutcome::AlreadyProcessed { event_id })
+            }
+            OwnedStableEventOutcome::Busy { event_id } => {
+                Ok(DispatchedClaimOutcome::Busy { event_id })
+            }
+            OwnedStableEventOutcome::TerminalGated { event_id, status } => {
+                Ok(DispatchedClaimOutcome::TerminalGated { event_id, status })
+            }
+            OwnedStableEventOutcome::InDoubt { event_id, reason } => {
+                Ok(DispatchedClaimOutcome::InDoubt { event_id, reason })
+            }
         }
-        let mut tx = self.pool.begin().await?;
-        let outcome =
-            claim_delta_event_by_stable_event_in_tx(&mut tx, request, lease_owner, lease_seconds)
-                .await?;
-        // Commit every arm: Claimed installs the lease; AlreadyProcessed /
-        // Busy / InDoubt made no mutation (read-only lock released by commit).
-        tx.commit().await?;
-        Ok(outcome)
     }
 
     async fn claim_next_event(
@@ -624,53 +531,28 @@ impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
         lease_owner: &str,
         lease_seconds: i64,
     ) -> Result<Option<DeltaEventClaim>, RuntimeAccessError> {
-        if self.worker_owned_execution() {
-            let reservation = self.owned_claim_reservation().await?;
-            let owned = match astral_db::claim_next_owned_delta_event(
-                &self.pool,
-                *scope,
-                lease_owner,
-                lease_seconds,
-            )
-            .await
-            .map_err(RuntimeAccessError::from)
-            {
-                Ok(owned) => owned,
-                Err(error) => {
-                    if matches!(&error, RuntimeAccessError::PublicationUnknown(_)) {
-                        tracing::warn!(
-                            tenant_id = scope.tenant_id,
-                            "owned polling claim commit unknown; no release or replay"
-                        );
-                    }
-                    return Err(error);
-                }
-            };
-            return match owned {
-                Some(owned) => {
-                    if let Err(error) = self.owned.insert_reserved(reservation, owned.lease) {
-                        tracing::error!(
-                            tenant_id = scope.tenant_id,
-                            %error,
-                            "owned polling claim committed but capability registration is unknown; no release"
-                        );
-                        return Err(error);
-                    }
+        let reservation = self.owned_claim_reservation().await?;
+        let owned =
+            astral_db::claim_next_owned_delta_event(&self.pool, *scope, lease_owner, lease_seconds)
+                .await
+                .map_err(RuntimeAccessError::from)?;
+        match owned {
+            Some(owned) => {
+                if let Err(error) = self.owned.insert_reserved(reservation, owned.lease) {
+                    tracing::error!(
+                        tenant_id = scope.tenant_id,
+                        %error,
+                        "owned polling claim committed but capability registration is unknown; no release"
+                    );
+                    Err(error)
+                } else {
+                    #[cfg(feature = "e3-observability")]
+                    log_e3_attempt_event("claim_committed", &owned.claim, "leased", true, None);
                     Ok(Some(owned.claim))
                 }
-                None => Ok(None),
-            };
+            }
+            None => Ok(None),
         }
-        let mut tx = self.pool.begin().await?;
-        let claim =
-            claim_next_delta_event_in_tx(&mut tx, *scope, lease_owner, lease_seconds).await?;
-        // Commit both arms: Some(installed lease) and None(read-only snapshot).
-        tx.commit().await?;
-        #[cfg(feature = "e3-observability")]
-        if let Some(claimed) = claim.as_ref() {
-            log_e3_attempt_event("claim_committed", claimed, "leased", true, None);
-        }
-        Ok(claim)
     }
 
     async fn discover_partitions(
@@ -690,36 +572,6 @@ impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
         Ok(identities)
     }
 
-    async fn acquire_partition_lease(
-        &self,
-        identity: &ProjectionAggregateIdentity,
-        lease_owner: &str,
-        lease_seconds: i64,
-    ) -> Result<Option<PartitionLeaseHandle>, RuntimeAccessError> {
-        astral_db::acquire_partition_lease(&self.pool, identity, lease_owner, lease_seconds)
-            .await
-            .map_err(RuntimeAccessError::from)
-    }
-
-    async fn renew_partition_lease(
-        &self,
-        handle: &PartitionLeaseHandle,
-        lease_seconds: i64,
-    ) -> Result<(), RuntimeAccessError> {
-        astral_db::renew_partition_lease(&self.pool, handle, lease_seconds)
-            .await
-            .map_err(RuntimeAccessError::from)
-    }
-
-    async fn release_partition_lease(
-        &self,
-        handle: &PartitionLeaseHandle,
-    ) -> Result<(), RuntimeAccessError> {
-        astral_db::release_partition_lease(&self.pool, handle)
-            .await
-            .map_err(RuntimeAccessError::from)
-    }
-
     async fn claim_next_event_in_partition(
         &self,
         identity: &ProjectionAggregateIdentity,
@@ -727,64 +579,35 @@ impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
         lease_owner: &str,
         lease_seconds: i64,
     ) -> Result<Option<DeltaEventClaim>, RuntimeAccessError> {
-        if self.worker_owned_execution() {
-            let reservation = self.owned_claim_reservation().await?;
-            let owned = match astral_db::claim_next_owned_delta_event_in_partition(
-                &self.pool,
-                *scope,
-                identity,
-                lease_owner,
-                lease_seconds,
-            )
-            .await
-            .map_err(RuntimeAccessError::from)
-            {
-                Ok(owned) => owned,
-                Err(error) => {
-                    if matches!(&error, RuntimeAccessError::PublicationUnknown(_)) {
-                        tracing::warn!(
-                            tenant_id = identity.tenant_id,
-                            aggregate_type = %identity.aggregate_type,
-                            aggregate_id = identity.aggregate_id,
-                            "owned partition claim commit unknown; no release or replay"
-                        );
-                    }
-                    return Err(error);
-                }
-            };
-            return match owned {
-                Some(owned) => {
-                    if let Err(error) = self.owned.insert_reserved(reservation, owned.lease) {
-                        tracing::error!(
-                            tenant_id = identity.tenant_id,
-                            aggregate_type = %identity.aggregate_type,
-                            aggregate_id = identity.aggregate_id,
-                            %error,
-                            "owned partition claim committed but capability registration is unknown; no release"
-                        );
-                        return Err(error);
-                    }
-                    Ok(Some(owned.claim))
-                }
-                None => Ok(None),
-            };
-        }
-        let mut tx = self.pool.begin().await?;
-        let claim = claim_next_delta_event_in_partition_tx(
-            &mut tx,
+        let reservation = self.owned_claim_reservation().await?;
+        let owned = astral_db::claim_next_owned_delta_event_in_partition(
+            &self.pool,
             *scope,
             identity,
             lease_owner,
             lease_seconds,
         )
-        .await?;
-        // Commit both arms: Some(installed lease) and None (read-only snapshot).
-        tx.commit().await?;
-        #[cfg(feature = "e3-observability")]
-        if let Some(claimed) = claim.as_ref() {
-            log_e3_attempt_event("claim_committed", claimed, "leased", true, None);
+        .await
+        .map_err(RuntimeAccessError::from)?;
+        match owned {
+            Some(owned) => {
+                if let Err(error) = self.owned.insert_reserved(reservation, owned.lease) {
+                    tracing::error!(
+                        tenant_id = identity.tenant_id,
+                        aggregate_type = %identity.aggregate_type,
+                        aggregate_id = identity.aggregate_id,
+                        %error,
+                        "owned partition claim committed but capability registration is unknown; no release"
+                    );
+                    Err(error)
+                } else {
+                    #[cfg(feature = "e3-observability")]
+                    log_e3_attempt_event("claim_committed", &owned.claim, "leased", true, None);
+                    Ok(Some(owned.claim))
+                }
+            }
+            None => Ok(None),
         }
-        Ok(claim)
     }
 
     async fn reclaim_budget_exhausted_events(
@@ -800,14 +623,8 @@ impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
         &self,
         identity: &DeltaLeaseIdentity,
     ) -> Result<ClaimedDeltaEvent, RuntimeAccessError> {
-        if self.worker_owned_execution() {
-            let lease = self.owned.get(identity)?;
-            return Ok(astral_db::load_owned_claimed_delta_event(&self.pool, &lease).await?);
-        }
-        let mut tx = self.pool.begin().await?;
-        let claimed = load_claimed_delta_event_for_update_in_tx(&mut tx, identity).await?;
-        tx.commit().await?;
-        Ok(claimed)
+        let lease = self.owned.get(identity)?;
+        Ok(astral_db::load_owned_claimed_delta_event(&self.pool, &lease).await?)
     }
 
     async fn observe_publication_context(
@@ -864,38 +681,28 @@ impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
         &self,
         command: &DeltaProjectorPublishCommand,
     ) -> Result<DeltaProjectorPublishOutcome, RuntimeAccessError> {
+        // The separate bounded renewal transaction refreshes both worker-owned
+        // fences before the publication transaction checks their live expiry.
+        let lease = self.owned.get(&command.delta_lease_identity)?;
+        if !astral_db::extend_owned_delta_execution_lease(&self.pool, &lease, CLAIM_LEASE_SECS)
+            .await?
+        {
+            return Err(RuntimeAccessError::Repository(RepositoryRejection::Grant(
+                astral_db::GrantRepositoryError::LeaseCasFailed(
+                    "code=projection_execution.publish_lease_renewal_lost".to_owned(),
+                ),
+            )));
+        }
         let mut tx = self.pool.begin().await?;
-        // Lease heartbeat INSIDE the publish transaction (H2): the claim
-        // window can elapse while pure planning/compile work runs before this
-        // transaction even starts, and a large transaction can outlast the
-        // remaining window; without a renewal the in-transaction completion's
-        // live-expiry guard would roll back an otherwise valid publication
-        // merely because the original 120s elapsed. The owner+token+status
-        // CAS renews from SERVER time for one more full claim window
-        // ([`CLAIM_LEASE_SECS`]) and fails closed on any real takeover. A CAS
-        // loss surfaces as `LeaseCasFailed` → LeaseLost/UNKNOWN with zero
-        // writes (the transaction holds no locks yet — nothing to roll back).
-        let owned_lease = if self.worker_owned_execution() {
-            Some(self.owned.get(&command.delta_lease_identity)?)
-        } else {
-            None
-        };
-        let outcome = if let Some(lease) = owned_lease.as_ref() {
-            astral_db::project_owned_authorization_delta_in_tx(&mut tx, command, lease).await?
-        } else {
-            extend_delta_event_lease(&mut *tx, &command.delta_lease_identity, CLAIM_LEASE_SECS)
-                .await?;
-            project_authorization_delta_in_tx(&mut tx, command).await?
-        };
+        let outcome =
+            astral_db::project_owned_authorization_delta_in_tx(&mut tx, command, &lease).await?;
         tx.commit().await.map_err(|error| {
             RuntimeAccessError::PublicationUnknown(format!(
                 "code=auth_projector.publish_commit_unknown;event={};error={error}",
                 command.expectation.event_id
             ))
         })?;
-        if owned_lease.is_some() {
-            self.owned.remove(&command.delta_lease_identity);
-        }
+        self.owned.remove(&command.delta_lease_identity);
         #[cfg(feature = "e3-observability")]
         log_e3_identity_event(
             "publish_committed",
@@ -912,66 +719,7 @@ impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
                     ))
                 })?;
         }
-        // L2 is optional distribution; it cannot delay installation of the
-        // committed local state or act as its completion proof.
-        push_published_evidence_to_l2_after_commit(&self.pool, command).await;
         Ok(outcome)
-    }
-
-    async fn fail_event(&self, identity: &DeltaLeaseIdentity, backoff_seconds: i64, message: &str) {
-        if self.worker_owned_execution() {
-            let _ = self
-                .owned_fail_transition(identity, backoff_seconds, message, true)
-                .await;
-            return;
-        }
-        match fail_delta_event(&self.pool, identity, backoff_seconds, message).await {
-            Ok(()) => {
-                #[cfg(feature = "e3-observability")]
-                log_e3_identity_event(
-                    "backoff_committed",
-                    identity,
-                    "pending",
-                    true,
-                    Some(backoff_seconds),
-                );
-            }
-            Err(error) => {
-                #[cfg(feature = "e3-observability")]
-                log_e3_identity_event(
-                    "terminal_unknown",
-                    identity,
-                    "backoff_cas_unknown",
-                    false,
-                    Some(backoff_seconds),
-                );
-                reconcile_lease_mutation_loss(identity, "fail", &error);
-            }
-        }
-    }
-
-    async fn release_event(&self, identity: &DeltaLeaseIdentity) {
-        if self.worker_owned_execution() {
-            let _ = self.owned_release_transition(identity).await;
-            return;
-        }
-        match release_delta_event_lease(&self.pool, identity).await {
-            Ok(()) => {
-                #[cfg(feature = "e3-observability")]
-                log_e3_identity_event("release_committed", identity, "pending", true, None);
-            }
-            Err(error) => {
-                #[cfg(feature = "e3-observability")]
-                log_e3_identity_event(
-                    "terminal_unknown",
-                    identity,
-                    "release_cas_unknown",
-                    false,
-                    None,
-                );
-                reconcile_lease_mutation_loss(identity, "release", &error);
-            }
-        }
     }
 
     async fn has_claimable_work(&self, scope: &DeltaEventClaimScope) -> bool {
@@ -995,28 +743,24 @@ impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
         reason_code: &str,
         reason_detail: &str,
     ) -> Result<(), RuntimeAccessError> {
-        if self.worker_owned_execution() {
-            let capability = self.owned.get(lease)?;
-            return match astral_db::quarantine_owned_delta_event(
-                &self.pool,
-                &capability,
-                reason_code,
-                Some(reason_detail),
-            )
-            .await?
-            {
-                true => {
-                    self.owned.remove(lease);
-                    Ok(())
-                }
-                false => Err(RuntimeAccessError::PublicationUnknown(
-                    "code=auth_projector.owned_quarantine_not_proven".to_owned(),
-                )),
-            };
-        }
-        let result = mark_delta_event_quarantined(&self.pool, lease, reason_code, reason_detail)
-            .await
-            .map_err(RuntimeAccessError::from);
+        let capability = self.owned.get(lease)?;
+        let result = match astral_db::quarantine_owned_delta_event(
+            &self.pool,
+            &capability,
+            reason_code,
+            Some(reason_detail),
+        )
+        .await
+        {
+            Ok(true) => {
+                self.owned.remove(lease);
+                Ok(())
+            }
+            Ok(false) => Err(RuntimeAccessError::PublicationUnknown(
+                "code=auth_projector.owned_quarantine_not_proven".to_owned(),
+            )),
+            Err(error) => Err(RuntimeAccessError::from(error)),
+        };
         #[cfg(feature = "e3-observability")]
         match &result {
             Ok(()) => {
@@ -1031,24 +775,5 @@ impl AuthorizationProjectorRuntime for SqlxAuthorizationProjectorRuntime {
             ),
         }
         result
-    }
-}
-
-/// 发布事务提交后的 L2 evidence 推送（读链规模化 Batch D）。
-///
-/// 受影响卡由发布命令的卡作用域得出：仅 CARD 聚合且携带卡作用域的事件推送
-/// （ELIGIBILITY/RULE_SET 等其它聚合不推 —— L2 只承载 CARD 聚合的评估
-/// evidence）；卡作用域缺失（None）无法定位卡级 evidence 键，同样不推。
-/// 内容来源 = 发布后自读严格 reader（pool 版，与 miss 回源同源同实现，天然
-/// parity）；推送到内嵌当前时代的 L2 键（TTL 300s）。任何失败一律静默 warn。
-async fn push_published_evidence_to_l2_after_commit(
-    pool: &MySqlPool,
-    command: &DeltaProjectorPublishCommand,
-) {
-    if let Some((tenant_id, card_id)) = astral_db::publish_affected_card_scope(
-        &command.expectation.identity,
-        command.expectation.card_id,
-    ) {
-        astral_db::push_published_card_evidence_to_l2(pool, tenant_id, card_id).await;
     }
 }

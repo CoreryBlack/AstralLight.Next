@@ -58,14 +58,11 @@ pub const TRUSTGRAPH_PATH_RESOURCE_MAP: &[(&str, &str)] = &[
     ("/platform-packages", "platform_package"),
     ("/departments", "platform_dept"),
     ("/users", "user"),
-    ("/consistency", "monitor"),
-    ("/arbiter", "monitor"),
     // 内部测试控制面（api::test_control）：复用已注册资源 monitor 的 read 动作，
     // 走正常 PolicyEngine 链路；路由本身默认关闭，启用后另有常量时间 token 校验。
     ("/internal/test-control", "monitor"),
     ("/inheritance", "permission_inheritance"),
     ("/cross-org-grants", "cross_org_grant"),
-    ("/compliance", "audit"),
     ("/operations", "domain"),
     ("/domains", "domain"),
     ("/resource-types", "domain_resource_type"),
@@ -112,11 +109,6 @@ fn resolve_trustgraph_permission_action(
     }
     if resource == "audit_quarantine" && method == "POST" && path.ends_with("/replay") {
         return Some("replay");
-    }
-    // Arbitration has a distinct registered action; ordinary monitor mutations
-    // must not acquire arbitration permission from the generic POST mapping.
-    if resource == "monitor" && method == "POST" && path == "/arbiter/arbitrate" {
-        return Some("arbitrate");
     }
     resolve_permission_action(resource, path, method)
 }
@@ -731,11 +723,8 @@ mod tests {
                 "POST",
                 "replay",
             ),
-            ("/arbiter/arbitrate", "monitor", "POST", "arbitrate"),
-            ("/arbiter/stats", "monitor", "GET", "read"),
             ("/stats", "monitor", "GET", "read"),
             ("/stats/projector", "monitor", "GET", "read"),
-            ("/consistency/report", "monitor", "GET", "read"),
             ("/domains", "domain", "GET", "read"),
             (
                 "/resource-types/scan",
@@ -792,14 +781,9 @@ mod tests {
     fn every_registered_main_api_route_has_a_resource_mapping() {
         let route_sources = [
             ("approval", include_str!("approval.rs")),
-            ("arbiter", include_str!("arbiter.rs")),
             ("audit", include_str!("audit.rs")),
             ("audit_replay", include_str!("audit_replay.rs")),
             ("card_templates", include_str!("card_templates.rs")),
-            (
-                "consistency_monitor",
-                include_str!("consistency_monitor.rs"),
-            ),
             ("cross_org_grants", include_str!("cross_org_grants.rs")),
             ("delegation", include_str!("delegation.rs")),
             ("departments", include_str!("departments.rs")),

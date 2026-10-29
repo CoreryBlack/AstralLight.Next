@@ -2,7 +2,7 @@
 
 AstralLight Rust is a Rust backend for **centralized, tenant-scoped authorization across API services**. It brings identity and session handling, gateway authentication, policy evaluation, durable authorization evidence, governance, messaging, and audit into one workspace. Instead of letting each application invent its own role checks or read permission tables directly, services use a shared authorization decision path.
 
-The project is for teams building multi-tenant services where access depends on **who is acting, which authorization card they use, which tenant owns the data, and what resource/action is requested**. It is not a frontend application or a drop-in, preconfigured production deployment: this repository provides the Rust implementation, integration SDKs, schemas, tests, and technical documentation. It does not include credentials or private infrastructure, and published test assets do not mean every live integration or deployment has been accepted.
+The project is for teams building multi-tenant services where access depends on **who is acting, which authorization card they use, which tenant owns the data, and what resource/action is requested**. It is not a frontend application or a drop-in, preconfigured production deployment: this repository provides the Rust implementation, integration SDKs, schemas, Rust tests, and technical documentation. It does not include credentials or private infrastructure, and published test assets do not mean every live integration or deployment has been accepted. Project tests, harness assertions, test helpers, and result evaluation are implemented in Rust; retained Python files are historical or independent mathematical/statistical references. They are not current runtime tools, test gates or acceptance evidence; current validation uses Rust `test-campaign` and `tests-suite/MANIFEST.toml`.
 
 ## Project overview
 
@@ -38,7 +38,7 @@ User / application
 - **Gateway boundary:** external request authentication and signed context propagation to backend services. Downstream services verify the signature instead of trusting client-provided internal headers.
 - **Policy evaluation:** shared resource/action validation and authorization decisions with tenant and card scope. Missing or inconsistent facts do not silently widen access.
 - **Authorization projection:** database-backed source records, versioned published evidence, and workers that materialize approved permission changes. This separates a durable permission change from the read model used to make fast decisions.
-- **Governance and operations:** TrustGraph services for authorization administration and governance, with audit and monitoring support. Arbiter is a consistency/conflict-analysis component, not an alternate path for granting normal requests.
+- **Governance and operations:** TrustGraph services for authorization administration and governance, with audit and monitoring support. Published diagnostics and simulation remain non-authorizing; neither is an alternate path for granting normal requests.
 - **Application integration:** Rust SDK contract, client, and Axum helper crates for services that need to request signed authorization decisions. SDK integration uses explicitly approved application scope and identity mapping; it does not automatically import an application's roles as platform permissions.
 - **Development and validation:** workspace crates, schemas, test harnesses, validation tools, and benchmark sources for inspecting and checking the implementation. Their presence is not a claim that every real database, message-broker, migration, or deployment scenario has passed acceptance.
 
@@ -87,7 +87,7 @@ materials, production deployment state, credentials, private keys, generated
 logs, frozen evidence archives, host routes, binaries, and build output.
 
 `astral-chat` and `astral-learn` are retained as frozen Rust source for migration
-and compatibility review, but remain excluded from the default workspace. The
+review and remain excluded from the default workspace. The
 active members and dependency policy are defined in [`Cargo.toml`](Cargo.toml).
 
 ## Quick start
@@ -96,8 +96,8 @@ Requirements for the local workspace checks:
 
 - Rust toolchain compatible with the checked-in workspace and `Cargo.lock`;
 - a working Cargo registry/cache; and
-- no database, Redis, RabbitMQ, Docker, or external service for the default
-  unit/check commands.
+- no database, RabbitMQ, Docker, or external service for the default
+  unit/check commands. Redis is not part of the CURRENT V6 runtime contract.
 
 Run the default workspace gate from the repository root:
 
@@ -135,9 +135,11 @@ Real integration requires an approved, already migrated loopback database on por
 `RUST_INTEGRATION_REQUIRED=1`. Ordinary MySQL suites require a run-scoped
 `astral_rehearsal_<suffix>` database whose exact name is also supplied through
 `ASTRAL_TEST_DATABASE_NAME`; source and shared rehearsal databases are rejected.
-Native transport is local; Redis is disabled.
-Rabbit requires loopback port 5673 and an explicit vhost; compatibility Redis requires
-loopback port 6380. The dedicated identity-mapping suite uses
+Native transport is local; Rabbit transport is an explicit profile and requires
+loopback port 5673 with an explicit vhost. Redis compatibility is not a current
+AstralLight runtime profile; any retained comparative Redis fixture is isolated from
+the V6 runtime and does not supply equivalent cross-instance performance or metrics.
+The dedicated identity-mapping suite uses
 `INTEGRATION_IDENTITY_MAPPING_DATABASE_URL` and a matching
 `INTEGRATION_IDENTITY_MAPPING_TEST_DATABASE` with the `sdk_identity_mapping_test_*`
 prefix. Provisioning and destructive migration approval remain separate operations.
@@ -159,14 +161,16 @@ bash scripts/run-tests.sh --campaign --run --profile native-single-node --suite 
 
 It never provisions or migrates, and uses only approved,
 already migrated isolated dependencies (`TEST_USE_EXISTING=1`). Native integration
-uses only MySQL and in-process buses; Rabbit transport and Redis compatibility
-remain explicit profiles. Each indexed command carries its owner, dependency
+uses only MySQL and in-process buses; Rabbit transport remains an explicit
+profile. Each indexed command carries its owner, dependency
 contract, source snapshot, assertion count and proof boundary. Empty, ignored,
 skipped or interrupted checks are not silently promoted to `PASS`. Local component
 coverage and offline models never stand in for a full RQ, live E1-E4, or HTTP
-performance campaign. Legacy Redis/OPA distributed harnesses remain non-dispatched
-`BLOCKED` entries until adapted; frozen/excluded crates are not covered by the root
-workspace gate. See [tests-suite](tests-suite/README.md) for the exact matrix.
+performance campaign. Historical Redis/OPA comparative harnesses and fixtures, where
+retained, are not current AstralLight runtime dependencies or authorization gates;
+their status remains whatever the historical evidence records. Frozen/excluded crates
+are not covered by the root workspace gate. See [tests-suite](tests-suite/README.md)
+for the exact matrix.
 
 For organization-scope migration inspection, set `ORG_MYSQL_URL` to a TCP MySQL
 URI for the isolated test database, then run the read-only preflight:
@@ -186,7 +190,6 @@ of the default test commands.
 - `astral-types/`: shared domain and wire types.
 - `astral-common/`: configuration, errors, middleware, audit, signatures, and observability.
 - `astral-db/`: SQLx repositories, migrations, projection persistence, evidence, and tenant-scoped access.
-- `astral-cache/`: excluded, self-contained Redis compatibility archive; not a native dependency.
 - `astral-mq/`: messaging contracts, delivery, DLX, and idempotency helpers.
 - `astral-gateway/`: gateway authentication and request forwarding.
 - `astral-identity/`: identity and session lifecycle.
@@ -207,12 +210,12 @@ campaign has passed:
 
 - crate unit and integration tests, including tenant isolation, organization
   scope, projection, cache, identity, trustgraph, and audit coverage;
-- compiler/oracle tests and policy-engine benchmarks;
+- authorization compiler contracts and policy-engine benchmarks;
 - `scripts/run-tests.sh`, `scripts/org_scope_preflight.sh`, and
   `scripts/verify-excluded-services.ps1`;
-- Rust E5 single-mutation bounded model and exact Python 2.1.0 baseline fixture
-  under `test-harness`; retained E1-E5 migration tools and unmigrated offline
-  checks remain under [`Docs/authorization-validation/tools/`](Docs/authorization-validation/tools/);
+- Rust E1–E5 runner contracts and bounded models under `test-harness`; historical
+  algorithm inputs retained under [`Docs/authorization-validation/tools/`](Docs/authorization-validation/tools/)
+  are reference material and do not provide runtime compatibility or test entrypoints;
 - bounded authorization safety-model inputs under [`Docs/authorization-validation/formal/`](Docs/authorization-validation/formal/),
   currently marked `BLOCKED` until a pinned TLC run exists;
 - distributed validation harness source under

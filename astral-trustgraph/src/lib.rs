@@ -35,7 +35,6 @@ use repository::template_repository::TemplateRepository;
 use repository::tenant_repository::TenantRepository;
 use repository::user_card_repository::UserCardRepository;
 use service::approval_service::ApprovalService;
-use service::arbiter::ArbiterService;
 use service::audit_replay_worker::AuditReplayProducerSlot;
 use service::delegation_service::DelegationWriteService;
 use service::level_template_service::LevelTemplateService;
@@ -102,8 +101,6 @@ pub struct AppState {
     /// 写入一次；未启动（配置拒绝）时保持为空，stats 端点如实返回 None。
     pub projector_health:
         Arc<std::sync::OnceLock<Arc<service::authorization_projector::ProjectorHealthShared>>>,
-    /// 执剑人运行侧服务（冲突信号统计 + 跨节点证据仲裁）
-    pub arbiter_service: Arc<ArbiterService>,
     /// Owned audit replay producer hand-off. The worker JoinHandle is retained
     /// by TrustGraph main rather than placed in cloneable request state.
     pub audit_replay_producer: AuditReplayProducerSlot,

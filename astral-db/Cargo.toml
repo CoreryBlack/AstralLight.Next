@@ -7,10 +7,6 @@ license.workspace = true
 
 [features]
 test-support = []
-# Redis 编译层退役（redis-layer-retirement-20261002）：默认构建零 redis 编译
-# 链接；compat 适配路径（L2 evidence、perm:card:* 缓存、资格缓存、连接池、
-# 共享 cache epoch）统一收敛到本显式 feature（default-off）。
-redis-compat = ["dep:redis"]
 e1-observability = ["policy-engine/e1-observability"]
 e3-observability = ["astral-common/e3-observability"]
 e4-observability = ["astral-common/e4-observability"]
@@ -29,11 +25,9 @@ metrics = { workspace = true }
 tokio = { workspace = true }
 moka = { workspace = true }
 async-trait = "0.1"
-redis = { workspace = true, optional = true }
 time = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
-hmac = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]

@@ -1,8 +1,8 @@
 //! 消息数据访问 — MessageRepository
 //!
 //! 对齐 Java `ChatMessageMapper` 边界（chat_message + chat_message_delivery 表）。
-//! 会话最后消息更新在 `ConversationRepository::update_last_message`；
-//! 投递记录批量写入由 service 编排（非关键路径，逐条容错）。
+//! 会话最后消息更新、投递快照和 MQ intent 均在 durable send-intent transaction 内提交；
+//! relay 在事务外发布已提交 intent 并进行 best-effort 实时推送。
 
 use astral_mq::producer::{ChatMessagePayload, MqMessage};
 use async_trait::async_trait;
@@ -84,22 +84,8 @@ pub struct MessageRecord {
 
 #[async_trait]
 pub trait MessageRepository: Send + Sync {
-    async fn insert_message_scoped(
-        &self,
-        scope: &ChatScope,
-        _conversation_id: i64,
-        _sender_id: i64,
-        _message_type: &str,
-        _content: &str,
-    ) -> Result<i64, AstralError> {
-        let _ = scope;
-        Err(AstralError::Permission(
-            "physical chat scope required".into(),
-        ))
-    }
-
-    /// Persists the message, idempotency reservation, recipient snapshot,
-    /// PENDING delivery rows, conversation watermark, and MQ intent atomically.
+    /// Atomically persist the message, idempotency reservation, recipient snapshot,
+    /// PENDING delivery rows, conversation watermark, and exact MQ intent.
     async fn persist_send_intent_scoped(
         &self,
         scope: &ChatScope,
@@ -107,87 +93,47 @@ pub trait MessageRepository: Send + Sync {
         message_type: &str,
         content: &str,
         client_msg_id: &str,
-    ) -> Result<PersistedSendIntent, AstralError> {
-        let _ = (scope, conversation_id, message_type, content, client_msg_id);
-        Err(AstralError::Permission(
-            "durable Chat send intent required".into(),
-        ))
-    }
+    ) -> Result<PersistedSendIntent, AstralError>;
 
+    /// Claim a bounded batch of durable send intents under a fenced lease.
     async fn claim_send_intents(
         &self,
-        _owner: &str,
-        _limit: u32,
-    ) -> Result<Vec<SendIntentClaim>, AstralError> {
-        Err(AstralError::NotImplemented(
-            "Chat send intent relay not configured".into(),
-        ))
-    }
-
-    async fn reconcile_send_intents(&self, _limit: u32) -> Result<u32, AstralError> {
-        Err(AstralError::NotImplemented(
-            "Chat send intent reconciliation not configured".into(),
-        ))
-    }
+        owner: &str,
+        limit: u32,
+    ) -> Result<Vec<SendIntentClaim>, AstralError>;
 
     async fn send_intent_recipients(
         &self,
-        _claim: &SendIntentClaim,
-    ) -> Result<Vec<SendIntentRecipient>, AstralError> {
-        Err(AstralError::NotImplemented(
-            "Chat send intent recipient reader not configured".into(),
-        ))
-    }
+        claim: &SendIntentClaim,
+    ) -> Result<Vec<SendIntentRecipient>, AstralError>;
 
-    async fn complete_send_intent(&self, _claim: &SendIntentClaim) -> Result<(), AstralError> {
-        Err(AstralError::NotImplemented(
-            "Chat send intent settlement not configured".into(),
-        ))
-    }
+    async fn complete_send_intent(&self, claim: &SendIntentClaim) -> Result<(), AstralError>;
 
     /// Release only a publisher outcome proven not admitted without side effects.
     async fn retry_known_not_admitted(
         &self,
-        _claim: &SendIntentClaim,
-        _error: &str,
-    ) -> Result<(), AstralError> {
-        Err(AstralError::NotImplemented(
-            "Chat send intent settlement not configured".into(),
-        ))
-    }
+        claim: &SendIntentClaim,
+        error: &str,
+    ) -> Result<(), AstralError>;
 
     /// Fence an ambiguous publish/settlement outcome as IN_DOUBT; never requeue it.
     async fn mark_send_intent_in_doubt(
         &self,
-        _claim: &SendIntentClaim,
-        _error: &str,
-    ) -> Result<(), AstralError> {
-        Err(AstralError::NotImplemented(
-            "Chat send intent settlement not configured".into(),
-        ))
-    }
+        claim: &SendIntentClaim,
+        error: &str,
+    ) -> Result<(), AstralError>;
 
     async fn get_message_scoped(
         &self,
         scope: &ChatScope,
         id: i64,
-    ) -> Result<Option<MessageRecord>, AstralError> {
-        let _ = (scope, id);
-        Err(AstralError::Permission(
-            "physical chat scope required".into(),
-        ))
-    }
+    ) -> Result<Option<MessageRecord>, AstralError>;
 
     async fn count_by_session_scoped(
         &self,
         scope: &ChatScope,
         conversation_id: i64,
-    ) -> Result<i64, AstralError> {
-        let _ = (scope, conversation_id);
-        Err(AstralError::Permission(
-            "physical chat scope required".into(),
-        ))
-    }
+    ) -> Result<i64, AstralError>;
 
     async fn list_by_session_scoped(
         &self,
@@ -195,63 +141,17 @@ pub trait MessageRepository: Send + Sync {
         conversation_id: i64,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<MessageRecord>, AstralError> {
-        let _ = (scope, conversation_id, limit, offset);
-        Err(AstralError::Permission(
-            "physical chat scope required".into(),
-        ))
-    }
+    ) -> Result<Vec<MessageRecord>, AstralError>;
 
     async fn count_unread_scoped(
         &self,
         scope: &ChatScope,
         conversation_id: i64,
         last_read_message_id: i64,
-    ) -> Result<i64, AstralError> {
-        let _ = (scope, conversation_id, last_read_message_id);
-        Err(AstralError::Permission(
-            "physical chat scope required".into(),
-        ))
-    }
+    ) -> Result<i64, AstralError>;
 
-    /// 插入消息（message_id 由 UUID() 生成），返回自增 id
-    async fn insert_message(
-        &self,
-        _conversation_id: i64,
-        _sender_id: i64,
-        _message_type: &str,
-        _content: &str,
-    ) -> Result<i64, AstralError>;
-    /// 单条消息
-    async fn get_message(&self, id: i64) -> Result<Option<MessageRecord>, AstralError>;
-    /// 消息发送者（delete_message 前校验）
-    async fn get_sender_id(&self, id: i64) -> Result<Option<i64>, AstralError>;
-    /// 会话消息总数
-    async fn count_by_session(&self, conversation_id: i64) -> Result<i64, AstralError>;
-    /// 会话消息分页（id DESC）
-    async fn list_by_session(
-        &self,
-        conversation_id: i64,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<MessageRecord>, AstralError>;
-    /// 软撤回消息（仅 SENT 状态可撤回，对齐 recall 语义）
-    async fn recall_message(&self, id: i64) -> Result<(), AstralError>;
-    /// 在当前物理双卡作用域内软撤回消息。
-    async fn recall_message_scoped(&self, scope: &ChatScope, id: i64) -> Result<(), AstralError> {
-        let _ = (scope, id);
-        Err(AstralError::Permission(
-            "physical chat scope required".into(),
-        ))
-    }
-    /// 未读数（id > last_read）
-    async fn count_unread(
-        &self,
-        conversation_id: i64,
-        last_read_message_id: i64,
-    ) -> Result<i64, AstralError>;
-    /// 创建单条投递记录（send 非关键路径，失败仅告警）
-    async fn insert_delivery(&self, message_id: i64, recipient_id: i64) -> Result<(), AstralError>;
+    /// Soft-recall a message only within the current physical card scope.
+    async fn recall_message_scoped(&self, scope: &ChatScope, id: i64) -> Result<(), AstralError>;
 }
 
 pub struct SqlxMessageRepository {
@@ -299,22 +199,6 @@ const COUNT_BY_SESSION_SCOPED_SQL: &str =
                      AND (uc.valid_from IS NULL OR uc.valid_from <= UTC_TIMESTAMP()) \
                      AND (uc.valid_until IS NULL OR uc.valid_until >= UTC_TIMESTAMP()))";
 
-const INSERT_MESSAGE_SCOPED_SQL: &str =
-    "INSERT INTO chat_message (message_id, conversation_id, sender_id, message_type, content, domain_id) \
-     SELECT UUID(), ?, ?, ?, ?, c.domain_id \
-     FROM chat_conversation c \
-     INNER JOIN platform_user pu ON pu.user_id = ? AND pu.status = 'ACTIVE' AND pu.deleted_at IS NULL \
-     INNER JOIN identity_card ic ON ic.user_id = pu.user_id AND ic.card_id = ? AND ic.status = 'ACTIVE' \
-       AND (ic.expires_at IS NULL OR ic.expires_at >= UTC_TIMESTAMP()) \
-     INNER JOIN user_card uc ON uc.user_id = pu.user_id AND uc.card_id = ? AND uc.card_status = 'ACTIVE' \
-       AND uc.tenant_id = ? AND uc.domain_id = c.domain_id \
-       AND (uc.valid_from IS NULL OR uc.valid_from <= UTC_TIMESTAMP()) \
-       AND (uc.valid_until IS NULL OR uc.valid_until >= UTC_TIMESTAMP()) \
-     INNER JOIN tenant t ON t.tenant_id = uc.tenant_id AND t.status = 'ACTIVE' \
-     INNER JOIN tenant_domain_map tdm ON tdm.tenant_id = uc.tenant_id AND tdm.domain_id = uc.domain_id AND tdm.status = 'ACTIVE' \
-     INNER JOIN chat_conversation_member m ON m.conversation_id = c.id AND m.user_id = pu.user_id AND m.left_at IS NULL \
-     WHERE c.id = ? AND c.domain_id = ? AND c.status = 'ACTIVE' AND c.is_deleted = 0";
-
 const LIST_BY_SESSION_SCOPED_SQL: &str =
     "SELECT msg.id, msg.sender_id, msg.conversation_id AS conversation_id, msg.content, \
      msg.message_type AS message_type, msg.created_at FROM chat_message msg \
@@ -335,41 +219,6 @@ const LIST_BY_SESSION_SCOPED_SQL: &str =
 
 #[async_trait]
 impl MessageRepository for SqlxMessageRepository {
-    async fn insert_message_scoped(
-        &self,
-        scope: &ChatScope,
-        conversation_id: i64,
-        sender_id: i64,
-        message_type: &str,
-        content: &str,
-    ) -> Result<i64, AstralError> {
-        if sender_id != scope.user_id {
-            return Err(AstralError::Permission(
-                "sender does not match authenticated scope".into(),
-            ));
-        }
-        let result = sqlx::query(INSERT_MESSAGE_SCOPED_SQL)
-            .bind(conversation_id)
-            .bind(sender_id)
-            .bind(message_type)
-            .bind(content)
-            .bind(sender_id)
-            .bind(scope.identity_card_id)
-            .bind(scope.user_card_id)
-            .bind(scope.user_card_tenant_id)
-            .bind(conversation_id)
-            .bind(scope.user_card_domain_id)
-            .execute(&self.db)
-            .await
-            .map_err(db_error)?;
-        if result.rows_affected() != 1 {
-            return Err(AstralError::Permission(
-                "physical chat scope required".into(),
-            ));
-        }
-        Ok(result.last_insert_id() as i64)
-    }
-
     async fn persist_send_intent_scoped(
         &self,
         scope: &ChatScope,
@@ -1006,47 +855,6 @@ impl MessageRepository for SqlxMessageRepository {
         })
     }
 
-    async fn insert_message(
-        &self,
-        _conversation_id: i64,
-        _sender_id: i64,
-        _message_type: &str,
-        _content: &str,
-    ) -> Result<i64, AstralError> {
-        Err(AstralError::Permission(
-            "physical chat scope required".into(),
-        ))
-    }
-
-    async fn get_message(&self, _id: i64) -> Result<Option<MessageRecord>, AstralError> {
-        Err(AstralError::Permission(
-            "physical chat scope required".into(),
-        ))
-    }
-
-    async fn get_sender_id(&self, _id: i64) -> Result<Option<i64>, AstralError> {
-        Err(AstralError::Permission(
-            "physical chat scope required".into(),
-        ))
-    }
-
-    async fn count_by_session(&self, _conversation_id: i64) -> Result<i64, AstralError> {
-        Err(AstralError::Permission(
-            "physical chat scope required".into(),
-        ))
-    }
-
-    async fn list_by_session(
-        &self,
-        _conversation_id: i64,
-        _limit: i64,
-        _offset: i64,
-    ) -> Result<Vec<MessageRecord>, AstralError> {
-        Err(AstralError::Permission(
-            "physical chat scope required".into(),
-        ))
-    }
-
     async fn recall_message_scoped(&self, scope: &ChatScope, id: i64) -> Result<(), AstralError> {
         sqlx::query(
             "UPDATE chat_message msg \
@@ -1071,37 +879,6 @@ impl MessageRepository for SqlxMessageRepository {
         .bind(scope.identity_card_id)
         .bind(scope.user_card_id)
         .bind(scope.user_card_tenant_id)
-        .execute(&self.db)
-        .await
-        .map_err(db_error)?;
-        Ok(())
-    }
-
-    async fn recall_message(&self, id: i64) -> Result<(), AstralError> {
-        sqlx::query("UPDATE chat_message SET status = 'RECALLED' WHERE id = ? AND status = 'SENT'")
-            .bind(id)
-            .execute(&self.db)
-            .await
-            .map_err(db_error)?;
-        Ok(())
-    }
-
-    async fn count_unread(
-        &self,
-        _conversation_id: i64,
-        _last_read_message_id: i64,
-    ) -> Result<i64, AstralError> {
-        Err(AstralError::Permission(
-            "physical chat scope required".into(),
-        ))
-    }
-
-    async fn insert_delivery(&self, message_id: i64, recipient_id: i64) -> Result<(), AstralError> {
-        sqlx::query(
-            "INSERT INTO chat_message_delivery (message_id, recipient_id, status) VALUES (?, ?, 'PENDING')",
-        )
-        .bind(message_id)
-        .bind(recipient_id)
         .execute(&self.db)
         .await
         .map_err(db_error)?;

@@ -423,7 +423,7 @@ mod tests {
     use super::*;
 
     const RUN: &str = "authz-validation-e4-test";
-    const FAULTS: [&str; 2] = ["redis_unavailable", "unknown_ack"];
+    const FAULTS: [&str; 2] = ["source_commit_unknown", "current_pointer_movement"];
 
     fn auth<'a>() -> Authorization<'a> {
         Authorization {
@@ -447,19 +447,19 @@ mod tests {
 
     #[test]
     fn authorization_is_run_scoped_distinct_allowlisted_and_token_free() {
-        let validation = validate_authorization(&auth(), "redis_unavailable", &FAULTS);
+        let validation = validate_authorization(&auth(), "source_commit_unknown", &FAULTS);
         assert!(validation.problems.is_empty());
         assert!(!validation.token_values_recorded);
 
         let mut bad = auth();
         bad.approval_token = "approve-other-run";
-        let invalid = validate_authorization(&bad, "redis_unavailable", &FAULTS);
+        let invalid = validate_authorization(&bad, "source_commit_unknown", &FAULTS);
         assert!(invalid.problems.contains(&"not_run_scoped:approval_token"));
 
         let mut missing = auth();
         missing.approval_token = "";
         assert!(
-            validate_authorization(&missing, "redis_unavailable", &FAULTS)
+            validate_authorization(&missing, "source_commit_unknown", &FAULTS)
                 .problems
                 .contains(&"invalid:approval_token")
         );
@@ -473,14 +473,14 @@ mod tests {
         let authorization = auth();
         let original = authorization.clone();
 
-        let valid = validate_authorization(&authorization, "redis_unavailable", &FAULTS);
+        let valid = validate_authorization(&authorization, "source_commit_unknown", &FAULTS);
         assert!(valid.problems.is_empty());
         assert_eq!(authorization, original);
 
         let mut invalid = auth();
         invalid.approval_token = "approve-other-run";
         let original_invalid = invalid.clone();
-        let rejected = validate_authorization(&invalid, "redis_unavailable", &FAULTS);
+        let rejected = validate_authorization(&invalid, "source_commit_unknown", &FAULTS);
         assert!(rejected.problems.contains(&"not_run_scoped:approval_token"));
         assert_eq!(invalid, original_invalid);
     }
@@ -494,7 +494,12 @@ mod tests {
             read_only_preflight: true,
         };
         assert_eq!(
-            preflight_allowed("redis_unavailable", caps.clone(), Some(true), Some(true)),
+            preflight_allowed(
+                "source_commit_unknown",
+                caps.clone(),
+                Some(true),
+                Some(true)
+            ),
             Ok(())
         );
         assert_eq!(
@@ -503,7 +508,7 @@ mod tests {
         );
         assert_eq!(
             preflight_allowed(
-                "redis_unavailable",
+                "source_commit_unknown",
                 ControllerCapabilities {
                     read_only_preflight: false,
                     ..caps.clone()
@@ -515,7 +520,7 @@ mod tests {
         );
         assert_eq!(
             preflight_allowed(
-                "redis_unavailable",
+                "source_commit_unknown",
                 ControllerCapabilities {
                     isolation: "isolate-other-run",
                     ..caps
@@ -584,12 +589,14 @@ mod tests {
             Status::Pass,
         );
         assert_eq!(recovered.status, Status::Unknown);
+        assert_eq!(recovered.status.as_str(), "UNKNOWN");
         assert_eq!(recovered.apply_calls, 1);
         assert_eq!(recovered.observe_calls, 0);
         assert_eq!(recovered.restore_calls, 1);
         assert_eq!(recovered.reconcile_calls, 1);
         assert_eq!(recovered.postcondition_calls, 1);
         assert!(recovered.retry_permitted);
+        assert_eq!(recovered.apply_calls, MAX_ATTEMPTS);
 
         let unknown = execute_recovery_protocol(
             ApplyOutcome::Timeout,

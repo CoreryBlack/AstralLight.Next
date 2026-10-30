@@ -5,6 +5,13 @@
 > 被测二进制：`astral-trustgraph` release（快照 `~/astral-rust3n-20260830`，与归档 commit `928efe0e` 世代一致）
 > 对标文档：[`Docs/实验/分布式测试/README.md`](../README.md)（Java RemoteClusterAuthorizationTest S1..S15 场景注册表，不变量 I1..I13）
 
+> 历史证据边界（CURRENT V6）：本报告完整保留 2026-08-31 的三节点、共享 MySQL/Redis/Rabbit
+> 实验事实及 `PASS`/`FAIL`/`N/A` 结果；这些结果只用于历史比较、故障分析和测量方法回溯，
+> 不代表当前 Rust runtime、当前 Redis 依赖或真实集成 `PASS`。Redis 相关夹具、停机注入和
+> 旧 worker 结论属于 retired compatibility evidence；当前 native 验收不得复用本报告数值。
+> 未经完整 receipt、canonical generation/published-evidence barrier 和独立对账，任何
+> `UNKNOWN`/`PENDING` 仍不是完成或成功。
+
 ## 1. 结论摘要
 
 **一致性（S1–S15，2 轮，95 条断言）：79 PASS / 10 FAIL / 6 N/A。**

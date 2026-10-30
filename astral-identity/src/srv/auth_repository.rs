@@ -421,6 +421,7 @@ pub(crate) async fn update_password_transaction_in_tx(
         "v": 2,
         "userId": user_id,
         "jtis": revoked_jtis.clone(),
+        "typedShards": true,
         "reason": reason,
     });
     sqlx::query(
@@ -428,12 +429,20 @@ pub(crate) async fn update_password_transaction_in_tx(
          (operation_id, session_id, event_type, sequence_number, projection_key, payload_json, status, created_at) \
          VALUES (?, NULL, 'REVOKE', 1, ?, ?, 'PENDING', UTC_TIMESTAMP())",
     )
-    .bind(operation_id)
+    .bind(&operation_id)
     .bind(format!("user:{user_id}"))
     .bind(payload.to_string())
     .execute(&mut **tx)
     .await
     .map_err(|e| AstralError::Database(format!("Write password revocation outbox failed: {e}")))?;
+    astral_mq::invalidation::append_session_revocation_shards_in_tx(
+        tx,
+        user_id,
+        &revoked_jtis,
+        &operation_id,
+    )
+    .await
+    .map_err(|e| AstralError::Database(format!("Write password revocation shards failed: {e}")))?;
 
     Ok(revoked_jtis)
 }

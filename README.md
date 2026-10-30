@@ -46,6 +46,27 @@ User / application
 
 Permission changes follow a durable lifecycle: the source change and its audit/outbox correlation are recorded first; projection workers then publish versioned authorization evidence; the decision path checks that the evidence is current, complete, and ready. This helps keep permission updates, revocation, and authorization reads aligned even when asynchronous work is delayed or fails. If required evidence is missing, stale, failed, or unproven, the result is `PENDING` or `DENY`. The normal production decision path does not fall back to raw source rows, an old snapshot, or a cache entry to grant access.
 
+### CURRENT V6 cleanup boundary
+
+The former Chat/Learn runtime paths and service crates are historical baseline
+material only. They are retired, physically absent from this checkout, and not
+current Rust Gateway routes, supported APIs, or runtime dependencies. The
+independent SDK consumer samples under `integrations/` do not restore those
+services. Retained Redis fixtures and reports are historical comparisons or
+retired compatibility evidence only; they are not current runtime dependencies,
+authorization gates, or real-integration `PASS` evidence.
+
+Monitor health has two distinct contracts: service-direct health probes are
+operational observations, while the protected Monitor routes remain the signed
+and permission-checked monitor contract. A direct health response does not prove
+authorization, deployment readiness, or end-to-end acceptance. Resource
+retirement remains fail-closed until canonical revoke, generation, and
+published-evidence barriers are proven. Password-reset token creation does not
+prove password delivery; delivery is unavailable or `PENDING` unless a notifier
+handoff is proven. `UNKNOWN` and `PENDING` are never success states, and
+cross-aggregate completion requires a complete owned receipt/evidence barrier,
+not an ACK, status row, latest pointer, or partial aggregate observation.
+
 ### Where to explore next
 
 - [Architecture index](Docs/架构/Rust架构设计/README.md) for service responsibilities and design boundaries.

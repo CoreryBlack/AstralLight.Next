@@ -1,6 +1,8 @@
 # Python unittest 到 Rust 原生测试逐方法 crosswalk
 
 > 状态：迁移审查账本（2026-10-24 建立，CURRENT V6 删除任务同步）。此表保留 25 个历史 unittest 模块的 622 个 `test_*` 方法来源，并登记保留的 Rust 行为合同或明确退役的能力。Python unittest/归档 Python 测试不运行。`EQUIVALENT` 仅指列出的离线行为断言等价；`PARTIAL` 指仍有关键断言差异；`BLOCKED` 指依赖或执行证据缺失；`RETIRED` 指 CURRENT V6 已物理删除原正向能力，所列 Rust 目标仅验证替代入口或拒绝旧配置，不计等价覆盖，也不表示测试 PASS。
+>
+> 证据状态补充：保留的 Chat/Learn runtime 记录和 Redis fixtures/reports 仅是历史基线、比较或退役兼容证据；不属于当前 runtime、当前 gate 或真实集成 `PASS`。直接 Monitor health 是服务直连观察，不等同受保护 Monitor contract。资源退役必须等待 canonical revoke、generation 和 published-evidence barriers；密码投递无 notifier handoff 时为 unavailable/`PENDING`；`UNKNOWN`/`PENDING` 及跨 aggregate completion 均须先完成完整 receipt/evidence 对账。
 
 ## 总体结论
 

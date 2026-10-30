@@ -81,6 +81,29 @@ pub(crate) async fn load_active_refresh_session(
     .map_err(|e| AstralError::Database(format!("Query session failed: {e}")))
 }
 
+/// 按已签名的 session/user/family 上下文加载当前活跃会话。
+///
+/// 该查询用于区分“refresh hash 已轮换”的重放与无法证明归属的输入；
+/// 不按客户端提供的 refresh hash 定位，避免旧 refresh 在切换幂等键后绕过复用检测。
+pub(crate) async fn load_active_session_context(
+    db: &MySqlPool,
+    session_id: i64,
+    user_id: i64,
+    family_id: i64,
+) -> Result<Option<DeviceSessionRow>, AstralError> {
+    sqlx::query_as::<_, DeviceSessionRow>(&format!(
+        "SELECT {DEVICE_SESSION_COLUMNS} FROM auth_device_session \
+         WHERE session_id = ? AND user_id = ? AND family_id = ? \
+           AND status = 'ACTIVE' AND session_state = 'ACTIVE' LIMIT 1"
+    ))
+    .bind(session_id)
+    .bind(user_id)
+    .bind(family_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AstralError::Database(format!("Query session context failed: {e}")))
+}
+
 /// 按 BIGINT family_id 加载 token family 行。
 pub(crate) async fn load_family_row(
     db: &MySqlPool,
@@ -130,150 +153,10 @@ pub(crate) async fn create_token_family_with_expiry(
     Ok(result.last_insert_id() as i64)
 }
 
-/// 撤销单个会话（单语句，由调用方编排投影 fan-out 顺序）。
-pub(crate) async fn revoke_session(
-    db: &MySqlPool,
-    id: i64,
-    reason: &str,
-) -> Result<(), AstralError> {
-    let result = sqlx::query(
-        "UPDATE auth_device_session SET status = 'REVOKED', session_state = 'REVOKED', \
-         session_version = session_version + 1, session_epoch = session_epoch + 1, \
-         revoked_at = UTC_TIMESTAMP(), revoked_reason = ?, updated_at = UTC_TIMESTAMP() \
-         WHERE session_id = ? AND status = 'ACTIVE' AND session_state = 'ACTIVE'",
-    )
-    .bind(reason)
-    .bind(id)
-    .execute(db)
-    .await
-    .map_err(|e| AstralError::Database(format!("Revoke session failed: {e}")))?;
-    if result.rows_affected() > 1 {
-        return Err(AstralError::Database(
-            "Revoke session CAS affected multiple rows".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// 列出 family 下全部 session_id（供撤销编排 fan-out）。
-pub(crate) async fn list_session_ids_by_family(
-    db: &MySqlPool,
-    family_id: i64,
-) -> Result<Vec<i64>, AstralError> {
-    let rows: Vec<(i64,)> =
-        sqlx::query_as("SELECT session_id FROM auth_device_session WHERE family_id = ?")
-            .bind(family_id)
-            .fetch_all(db)
-            .await
-            .map_err(|e| AstralError::Database(format!("Load family sessions failed: {e}")))?;
-    Ok(rows.into_iter().map(|(id,)| id).collect())
-}
-
-/// 列出用户全部活跃 session_id（供 revokeAllForUser 编排 fan-out）。
-pub(crate) async fn list_active_session_ids_by_user(
-    db: &MySqlPool,
-    user_id: i64,
-) -> Result<Vec<i64>, AstralError> {
-    let rows: Vec<(i64,)> = sqlx::query_as(
-        "SELECT session_id FROM auth_device_session \
-         WHERE user_id = ? AND status = 'ACTIVE' AND session_state = 'ACTIVE'",
-    )
-    .bind(user_id)
-    .fetch_all(db)
-    .await
-    .map_err(|e| AstralError::Database(format!("Load user sessions failed: {e}")))?;
-    Ok(rows.into_iter().map(|(id,)| id).collect())
-}
-
-/// 按 user 批量关闭活跃会话（单语句，revokeAllForUser 编排调用）。
-pub(crate) async fn revoke_user_sessions(
-    db: &MySqlPool,
-    user_id: i64,
-    reason: &str,
-) -> Result<(), AstralError> {
-    sqlx::query(
-        "UPDATE auth_device_session SET status = 'REVOKED', session_state = 'REVOKED', \
-         session_version = session_version + 1, session_epoch = session_epoch + 1, \
-         revoked_at = UTC_TIMESTAMP(), revoked_reason = ?, updated_at = UTC_TIMESTAMP() \
-         WHERE user_id = ? AND status = 'ACTIVE' AND session_state = 'ACTIVE'",
-    )
-    .bind(reason)
-    .bind(user_id)
-    .execute(db)
-    .await
-    .map_err(|e| AstralError::Database(format!("Revoke user sessions failed: {e}")))?;
-    Ok(())
-}
-
-/// 按 user 批量撤销活跃 token family（单语句，revokeAllForUser 编排调用）。
-pub(crate) async fn revoke_user_token_families(
-    db: &MySqlPool,
-    user_id: i64,
-    reason: &str,
-) -> Result<(), AstralError> {
-    sqlx::query(
-        "UPDATE auth_token_family SET status = 'REVOKED', revoked_at = UTC_TIMESTAMP(), \
-         revoked_reason = ? WHERE user_id = ? AND status = 'ACTIVE'",
-    )
-    .bind(reason)
-    .bind(user_id)
-    .execute(db)
-    .await
-    .map_err(|e| AstralError::Database(format!("Revoke user token families failed: {e}")))?;
-    Ok(())
-}
-
-/// family CAS 撤销（单语句，revoke_token_family 编排调用）。
-pub(crate) async fn revoke_family_cas(
-    db: &MySqlPool,
-    family_id: i64,
-    reason: &str,
-) -> Result<(), AstralError> {
-    let result = sqlx::query(
-        "UPDATE auth_token_family SET status = 'REVOKED', revoked_at = UTC_TIMESTAMP(), \
-         revoked_reason = ? WHERE family_id = ? AND status = 'ACTIVE'",
-    )
-    .bind(reason)
-    .bind(family_id)
-    .execute(db)
-    .await
-    .map_err(|e| AstralError::Database(format!("Revoke family failed: {e}")))?;
-    if result.rows_affected() > 1 {
-        return Err(AstralError::Database(
-            "Revoke family CAS affected multiple rows".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// 级联撤销 family 下全部活跃会话（单语句，revoke_token_family 编排调用）。
-pub(crate) async fn revoke_family_sessions(
-    db: &MySqlPool,
-    family_id: i64,
-    reason: &str,
-) -> Result<(), AstralError> {
-    sqlx::query(
-        "UPDATE auth_device_session SET status = 'REVOKED', session_state = 'REVOKED', \
-         session_version = session_version + 1, session_epoch = session_epoch + 1, \
-         revoked_at = UTC_TIMESTAMP(), revoked_reason = ?, updated_at = UTC_TIMESTAMP() \
-         WHERE family_id = ? AND status = 'ACTIVE' AND session_state = 'ACTIVE'",
-    )
-    .bind(reason)
-    .bind(family_id)
-    .execute(db)
-    .await
-    .map_err(|e| AstralError::Database(format!("Cascade revoke sessions failed: {e}")))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    /// Family 创建 source 栅栏形状回归（源形状，无 IO）：
-    /// create_token_family_with_expiry 必须经 begin_source_write +
-    /// fenced_source_write 自围；revoke 系列保持裸 SQL，由调用方集群栅栏统一持有，
-    /// 绝不双重围栏。
     #[test]
-    fn issuance_leaves_are_self_fenced_and_revoke_leaves_stay_outer_fenced() {
+    fn issuance_leaves_are_self_fenced() {
         let source = include_str!("session_repository.rs");
         let impl_source = &source[..source
             .find("#[cfg(test)]")
@@ -289,24 +172,22 @@ mod tests {
                 && body.contains("source_writer_guard::fenced_source_write("),
             "{leaf} must be self-fenced via the shared source writer helper"
         );
-
-        for outer_fenced in [
-            "async fn revoke_session(",
-            "async fn revoke_user_sessions(",
-            "async fn revoke_user_token_families(",
-            "async fn revoke_family_cas(",
-            "async fn revoke_family_sessions(",
+        assert!(
+            impl_source.contains("load_active_session_context(")
+                && impl_source.contains("session_id = ? AND user_id = ? AND family_id = ?")
+        );
+        for removed in [
+            "revoke_session(",
+            "list_session_ids_by_family(",
+            "list_active_session_ids_by_user(",
+            "revoke_user_sessions(",
+            "revoke_user_token_families(",
+            "revoke_family_cas(",
+            "revoke_family_sessions(",
         ] {
-            let body = impl_source
-                .split(outer_fenced)
-                .nth(1)
-                .unwrap_or_else(|| panic!("{outer_fenced} must stay in session_repository.rs"));
-            // 截到下一个函数文档注释（下一函数起始）之前，即本函数体。
-            let body_end = body.find("/// ").unwrap_or(body.len());
-            let body = &body[..body_end];
             assert!(
-                !body.contains("fenced_source_write"),
-                "{outer_fenced} must stay bare SQL: its callers' cluster/call-site fence owns it"
+                !impl_source.contains(removed),
+                "legacy raw revoke helper {removed} must stay physically removed"
             );
         }
     }

@@ -3,6 +3,7 @@
 //! 对应 Java `UsersController`。编排在 `UserService`。
 
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 
@@ -25,6 +26,19 @@ pub fn user_routes() -> Router<AppState> {
         .route("/users/{id}", delete(delete_user))
         .route("/users/{id}/cards", get(list_user_cards))
         .route("/users/{id}/password", post(set_password))
+}
+
+fn validated_request_operation_id(headers: &HeaderMap) -> Result<Option<String>, AppError> {
+    let raw = headers
+        .get("x-request-id")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| astral_types::AstralError::Validation("invalid x-request-id".into()))
+        })
+        .transpose()
+        .map_err(AppError::from)?;
+    astral_db::grant_ledger::validated_request_operation_id(raw).map_err(AppError::from)
 }
 
 async fn list_users(
@@ -57,20 +71,27 @@ async fn get_user(
 async fn update_user(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    headers: HeaderMap,
     Json(req): Json<UpdateUserRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.user_service.update_user(&state, id, &req).await?;
+    let request_operation_id = validated_request_operation_id(&headers)?;
+    state
+        .user_service
+        .update_user(&state, id, &req, request_operation_id.as_deref())
+        .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 
 async fn update_user_status(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    headers: HeaderMap,
     Json(req): Json<UpdateStatusRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
+    let request_operation_id = validated_request_operation_id(&headers)?;
     state
         .user_service
-        .update_user_status(&state, id, &req)
+        .update_user_status(&state, id, &req, request_operation_id.as_deref())
         .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
@@ -78,8 +99,13 @@ async fn update_user_status(
 async fn delete_user(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    headers: HeaderMap,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.user_service.delete_user(&state, id).await?;
+    let request_operation_id = validated_request_operation_id(&headers)?;
+    state
+        .user_service
+        .delete_user(&state, id, request_operation_id.as_deref())
+        .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 

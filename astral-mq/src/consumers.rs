@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use astral_common::token_contract::normalize_revocation_reason;
 use astral_db::{
     insert_or_increment_terminal, AuditQuarantineInput, AuditQuarantineStatus, LocalMessageError,
     LocalMessageExactClaim, LocalMessageRepository, LOCAL_MESSAGE_MAX_ATTEMPTS,
@@ -2746,13 +2747,12 @@ async fn handle_auth_session_revocation(
         )));
     };
     let operation_id = revocation_operation_id(envelope_message_id, msg)?;
-    let reason = msg.reason.trim();
-    if reason.is_empty() {
-        return Err(box_err(std::io::Error::new(
+    let reason = normalize_revocation_reason(msg.reason.as_str()).map_err(|error| {
+        box_err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "auth session revocation reason is empty",
-        )));
-    }
+            format!("auth session revocation reason is invalid: {error}"),
+        ))
+    })?;
     // Revocation source transaction hub writer fence: acquired before begin
     // (fail-closed and refuses to process when the fence is unavailable; no hub installed means
     // no-op), writer-active keeps the auxiliary read side fail-closed for the entire
@@ -2776,49 +2776,101 @@ async fn handle_auth_session_revocation(
     .await
     .map_err(box_err)?;
     let expected_projection_key = format!("user:{}", msg.user_id);
-    let (jti_keys, is_new_operation) = if let Some((projection_key, payload_json)) = existing {
-        if projection_key != expected_projection_key {
-            return Err(box_err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "auth session revocation operation id is bound to another user",
-            )));
-        }
-        let payload = payload_json.ok_or_else(|| {
-            box_err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "auth session revocation outbox payload is missing",
-            ))
-        })?;
-        (revocation_jtis_from_payload(&payload, msg.user_id)?, false)
-    } else {
-        // Finite fact boundary: one operation's notification snapshot is
-        // bounded. Beyond the capacity the command fails closed BEFORE any
-        // source mutation (this transaction rolls back, so nothing can commit
-        // without a fully representable, sharded notification intent). The
-        // system does not promise an unbounded single-operation snapshot;
-        // larger populations need upstream chunked operations.
-        let snapshot: Vec<(String,)> = sqlx::query_as(
-            "SELECT jti FROM auth_session_jti_index \
-             WHERE user_id = ? AND status = 'ACTIVE' \
-             ORDER BY jti LIMIT ? FOR UPDATE",
+    let (jti_keys, is_new_operation, require_typed_shards) =
+        if let Some((projection_key, payload_json)) = existing {
+            if projection_key != expected_projection_key {
+                return Err(box_err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "auth session revocation operation id is bound to another user",
+                )));
+            }
+            let payload = payload_json.ok_or_else(|| {
+                box_err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "auth session revocation outbox payload is missing",
+                ))
+            })?;
+            let require_typed_shards =
+                revocation_payload_requires_typed_shards(&payload, msg.user_id)?;
+            (
+                revocation_jtis_from_payload(&payload, msg.user_id)?,
+                false,
+                require_typed_shards,
+            )
+        } else {
+            // Finite fact boundary: one operation's notification snapshot is
+            // bounded. Beyond the capacity the command fails closed BEFORE any
+            // source mutation (this transaction rolls back, so nothing can commit
+            // without a fully representable, sharded notification intent). The
+            // system does not promise an unbounded single-operation snapshot;
+            // larger populations need upstream chunked operations.
+            let user: Option<(i64,)> = sqlx::query_as(
+            "SELECT user_id FROM platform_user WHERE user_id = ? AND deleted_at IS NULL FOR UPDATE",
         )
         .bind(msg.user_id)
-        .bind(i64::try_from(MAX_REVOCATION_SNAPSHOT_JTIS + 1).unwrap_or(i64::MAX))
-        .fetch_all(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(box_err)?;
-        if snapshot.len() > MAX_REVOCATION_SNAPSHOT_JTIS {
-            return Err(box_err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "auth session revocation snapshot exceeds the bounded capacity \
+            if user.is_none() {
+                return Err(box_err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "auth session revocation user not found",
+                )));
+            }
+            let _family_ids: Vec<(i64,)> = sqlx::query_as(
+                "SELECT family_id FROM auth_token_family WHERE user_id = ? AND status = 'ACTIVE' \
+                 ORDER BY family_id FOR UPDATE",
+            )
+            .bind(msg.user_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(box_err)?;
+            let _session_ids: Vec<(i64,)> = sqlx::query_as(
+                "SELECT session_id FROM auth_device_session WHERE user_id = ? \
+                 AND status IN ('ACTIVE', 'PENDING') AND session_state IN ('ACTIVE', 'PENDING') \
+                 ORDER BY session_id FOR UPDATE",
+            )
+            .bind(msg.user_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(box_err)?;
+            let snapshot: Vec<(String,)> = sqlx::query_as(
+                "SELECT jti FROM auth_session_jti_index \
+             WHERE user_id = ? AND status = 'ACTIVE' \
+             ORDER BY jti LIMIT ? FOR UPDATE",
+            )
+            .bind(msg.user_id)
+            .bind(i64::try_from(MAX_REVOCATION_SNAPSHOT_JTIS + 1).unwrap_or(i64::MAX))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(box_err)?;
+            if snapshot.len() > MAX_REVOCATION_SNAPSHOT_JTIS {
+                return Err(box_err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "auth session revocation snapshot exceeds the bounded capacity \
                      {MAX_REVOCATION_SNAPSHOT_JTIS}; nothing was mutated and the \
                      command is not acknowledged"
-                ),
-            )));
-        }
-        (snapshot.into_iter().map(|(jti,)| jti).collect(), true)
-    };
+                    ),
+                )));
+            }
+            for (jti,) in &snapshot {
+                if jti.trim().is_empty() || jti.len() > MAX_REVOCATION_JTI_BYTES {
+                    return Err(box_err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "auth session revocation snapshot contains an invalid JTI",
+                    )));
+                }
+            }
+            let jti_keys = snapshot.into_iter().map(|(jti,)| jti).collect::<Vec<_>>();
+            if jti_keys.iter().collect::<HashSet<_>>().len() != jti_keys.len() {
+                return Err(box_err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "auth session revocation snapshot contains duplicate JTIs",
+                )));
+            }
+            (jti_keys, true, true)
+        };
 
     if is_new_operation {
         // Keep session state, version and epoch in lockstep with the local
@@ -2830,7 +2882,7 @@ async fn handle_auth_session_revocation(
              WHERE user_id = ? AND status IN ('ACTIVE', 'PENDING') \
                AND session_state IN ('ACTIVE', 'PENDING')",
         )
-        .bind(reason)
+        .bind(&reason)
         .bind(msg.user_id)
         .execute(&mut *tx)
         .await
@@ -2840,7 +2892,7 @@ async fn handle_auth_session_revocation(
              revoked_reason = ?, updated_at = UTC_TIMESTAMP() \
              WHERE user_id = ? AND status = 'ACTIVE'",
         )
-        .bind(reason)
+        .bind(&reason)
         .bind(msg.user_id)
         .execute(&mut *tx)
         .await
@@ -2859,6 +2911,7 @@ async fn handle_auth_session_revocation(
             "reason": reason,
             "userId": msg.user_id,
             "jtis": jti_keys,
+            "typedShards": true,
         })
         .to_string();
         sqlx::query(
@@ -2926,7 +2979,14 @@ async fn handle_auth_session_revocation(
     // durable outbox in the same operation identity so the caller can distinguish
     // business completion from LocalBus/Rabbit admission. A lost CAS is unknown;
     // do not acknowledge it as success until the status is reconciled.
-    mark_revocation_outbox_processed(pool, &operation_id).await?;
+    mark_revocation_outbox_processed(
+        pool,
+        &operation_id,
+        msg.user_id,
+        &jti_keys,
+        require_typed_shards,
+    )
+    .await?;
 
     tracing::warn!(
         user_id = msg.user_id,
@@ -2947,6 +3007,7 @@ async fn handle_auth_session_revocation(
 /// shard rows (~140KB payload each) — comfortably inside one short source
 /// transaction and the MEDIUMTEXT outbox columns.
 const MAX_REVOCATION_SNAPSHOT_JTIS: usize = 32_768;
+const MAX_REVOCATION_JTI_BYTES: usize = 128;
 
 /// Post-commit direct delivery of the committed typed SESSION_REVOKED shards.
 ///
@@ -2956,7 +3017,7 @@ const MAX_REVOCATION_SNAPSHOT_JTIS: usize = 32_768;
 /// completion (per-scope FIFO, idempotent re-application). This function runs
 /// strictly after `tx.commit()` returned Ok, so an unknown commit outcome can
 /// never reach it: zero dispatch, no source replay.
-async fn deliver_committed_session_shards(envelopes: &[crate::envelope::MessageEnvelope]) {
+pub async fn deliver_committed_session_shards(envelopes: &[crate::envelope::MessageEnvelope]) {
     if envelopes.is_empty() {
         return;
     }
@@ -3010,6 +3071,10 @@ async fn deliver_committed_session_shards(envelopes: &[crate::envelope::MessageE
     }
 }
 
+#[cfg(test)]
+const REVOCATION_SHARD_RECEIPT_PROOF_SQL: &str =
+    crate::invalidation::SESSION_REVOCATION_SHARD_RECEIPT_PROOF_SQL;
+
 const REVOCATION_OUTBOX_COMPLETE_SQL: &str =
     "UPDATE auth_session_outbox SET status = 'PROCESSED', \
     processed_at = UTC_TIMESTAMP(), processed_by = 'revocation-handler', \
@@ -3020,10 +3085,66 @@ fn revocation_completion_is_proven(affected: u64, status: Option<&str>) -> bool 
     affected == 1 || (affected == 0 && status == Some("PROCESSED"))
 }
 
+#[cfg(test)]
+fn revocation_shard_message_ids(
+    user_id: i64,
+    jti_keys: &[String],
+    operation_id: &str,
+) -> Result<HashSet<String>, Box<dyn std::error::Error + Send>> {
+    crate::invalidation::plan_session_revocation_shards(user_id, jti_keys, operation_id)
+        .map(|plans| plans.into_iter().map(|plan| plan.message_id).collect())
+        .map_err(box_err)
+}
+
+#[cfg(test)]
+fn revocation_shard_receipts_are_proven(
+    rows: &[(String, String, String, String, String)],
+    expected_message_ids: &HashSet<String>,
+    expected_operation_id: &str,
+) -> bool {
+    let expected_payload_sha256_by_message_id = expected_message_ids
+        .iter()
+        .map(|message_id| (message_id.clone(), "0".repeat(64)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let rows_with_digest = rows
+        .iter()
+        .map(
+            |(message_id, operation_id, message_type, queue_name, status)| {
+                (
+                    message_id.clone(),
+                    operation_id.clone(),
+                    message_type.clone(),
+                    queue_name.clone(),
+                    "0".repeat(64),
+                    status.clone(),
+                )
+            },
+        )
+        .collect::<Vec<_>>();
+    crate::invalidation::session_revocation_shard_receipts_are_proven(
+        &rows_with_digest,
+        &expected_payload_sha256_by_message_id,
+        expected_operation_id,
+    )
+}
+
 async fn mark_revocation_outbox_processed(
     pool: &MySqlPool,
     operation_id: &str,
+    user_id: i64,
+    jti_keys: &[String],
+    require_typed_shards: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send>> {
+    crate::invalidation::prove_session_revocation_shards_processed(
+        pool,
+        user_id,
+        jti_keys,
+        operation_id,
+        require_typed_shards,
+    )
+    .await
+    .map_err(box_err)?;
+
     let result = sqlx::query(REVOCATION_OUTBOX_COMPLETE_SQL)
         .bind(operation_id)
         .execute(pool)
@@ -3052,6 +3173,29 @@ async fn mark_revocation_outbox_processed(
         }
     }
     Ok(())
+}
+
+fn revocation_payload_requires_typed_shards(
+    payload: &str,
+    user_id: i64,
+) -> Result<bool, Box<dyn std::error::Error + Send>> {
+    let value: Value = serde_json::from_str(payload).map_err(box_err)?;
+    if value.get("v").and_then(Value::as_i64) != Some(2)
+        || value.get("userId").and_then(Value::as_i64) != Some(user_id)
+    {
+        return Err(box_err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth session revocation outbox payload is incompatible",
+        )));
+    }
+    match value.get("typedShards") {
+        None => Ok(false),
+        Some(Value::Bool(required)) => Ok(*required),
+        Some(_) => Err(box_err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth session revocation typedShards marker is invalid",
+        ))),
+    }
 }
 
 fn revocation_operation_id(
@@ -3099,15 +3243,27 @@ fn revocation_jtis_from_payload(
             "auth session revocation JTI snapshot is missing",
         )));
     };
+    if jtis.len() > MAX_REVOCATION_SNAPSHOT_JTIS {
+        return Err(box_err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "auth session revocation snapshot exceeds the bounded capacity \
+                 {MAX_REVOCATION_SNAPSHOT_JTIS}"
+            ),
+        )));
+    }
+    let mut seen = HashSet::with_capacity(jtis.len());
     jtis.iter()
         .map(|jti| {
             jti.as_str()
                 .filter(|value| !value.trim().is_empty())
+                .filter(|value| value.len() <= MAX_REVOCATION_JTI_BYTES)
+                .filter(|value| seen.insert(*value))
                 .map(ToOwned::to_owned)
                 .ok_or_else(|| {
                     box_err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "auth session revocation JTI snapshot is invalid",
+                        "auth session revocation JTI snapshot is invalid, oversized, or duplicated",
                     ))
                 })
         })
@@ -3815,10 +3971,238 @@ mod tests {
     }
 
     #[test]
+    fn revocation_lock_order_is_outbox_then_user_family_session_jti() {
+        let source = include_str!("consumers.rs");
+        let handler = source
+            .split("async fn handle_auth_session_revocation(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("const MAX_REVOCATION_SNAPSHOT_JTIS: usize")
+                    .next()
+            })
+            .expect("revocation handler must remain bounded");
+        let outbox = handler
+            .find("WHERE operation_id = ? AND sequence_number = 1 FOR UPDATE")
+            .expect("idempotency outbox row must be locked first");
+        let user = handler
+            .find("SELECT user_id FROM platform_user")
+            .expect("user aggregate must be locked");
+        let family = handler
+            .find("SELECT family_id FROM auth_token_family")
+            .expect("token families must be locked");
+        let sessions = handler
+            .find("SELECT session_id FROM auth_device_session")
+            .expect("device sessions must be locked");
+        let jtis = handler
+            .find("SELECT jti FROM auth_session_jti_index")
+            .expect("JTI snapshot must be locked");
+        assert!(outbox < user && user < family && family < sessions && sessions < jtis);
+        assert!(handler.contains("snapshot.len() > MAX_REVOCATION_SNAPSHOT_JTIS"));
+        assert!(handler.contains("MAX_REVOCATION_JTI_BYTES"));
+        assert!(handler.contains("duplicate JTIs"));
+    }
+
+    #[test]
+    fn revocation_caps_are_explicitly_split_by_ingress_contract() {
+        assert_eq!(MAX_REVOCATION_SNAPSHOT_JTIS, 32_768);
+        assert_eq!(MAX_REVOCATION_JTI_BYTES, 128);
+        let identity_source = include_str!("../../astral-identity/src/srv/session.rs");
+        assert!(identity_source.contains("const MAX_REVOCATION_SNAPSHOT_JTIS: usize = 4096;"));
+        let worker_source =
+            include_str!("../../astral-identity/src/srv/session_projection_worker.rs");
+        assert!(worker_source.contains("const MAX_REVOCATION_SNAPSHOT_JTIS: usize = 4096;"));
+        assert!(worker_source.contains("const MAX_REVOCATION_JTI_BYTES: usize = 128;"));
+    }
+
+    #[test]
+    fn revocation_payload_parser_rejects_oversized_and_duplicate_jtis() {
+        let oversized = serde_json::json!({
+            "v": 2,
+            "userId": 17,
+            "jtis": ["x".repeat(MAX_REVOCATION_JTI_BYTES + 1)],
+        });
+        assert!(revocation_jtis_from_payload(&oversized.to_string(), 17).is_err());
+
+        let duplicate = serde_json::json!({
+            "v": 2,
+            "userId": 17,
+            "jtis": ["same", "same"],
+        });
+        assert!(revocation_jtis_from_payload(&duplicate.to_string(), 17).is_err());
+    }
+
+    #[test]
+    fn revocation_payload_parser_preserves_the_finite_snapshot_bound() {
+        let boundary = serde_json::json!({
+            "v": 2,
+            "userId": 17,
+            "jtis": (0..MAX_REVOCATION_SNAPSHOT_JTIS)
+                .map(|index| format!("jti-{index}"))
+                .collect::<Vec<_>>(),
+        });
+        let parsed = revocation_jtis_from_payload(&boundary.to_string(), 17).unwrap();
+        assert_eq!(parsed.len(), MAX_REVOCATION_SNAPSHOT_JTIS);
+
+        let over_bound = serde_json::json!({
+            "v": 2,
+            "userId": 17,
+            "jtis": (0..=MAX_REVOCATION_SNAPSHOT_JTIS)
+                .map(|index| format!("jti-{index}"))
+                .collect::<Vec<_>>(),
+        });
+        let error = revocation_jtis_from_payload(&over_bound.to_string(), 17).unwrap_err();
+        assert!(error.to_string().contains("bounded capacity"));
+    }
+    #[test]
+    fn revocation_shard_receipt_barrier_requires_the_complete_owned_set() {
+        let operation_id = "operation-1";
+        let user_id = 17;
+        let jti_keys = vec!["jti-1".to_owned(), "jti-2".to_owned()];
+        let expected = revocation_shard_message_ids(user_id, &jti_keys, operation_id).unwrap();
+        let message_id = expected.iter().next().unwrap().clone();
+        let complete = vec![(
+            message_id.clone(),
+            operation_id.to_owned(),
+            crate::invalidation::SESSION_REVOKED.to_owned(),
+            crate::invalidation::INVALIDATION_QUEUE.to_owned(),
+            "PROCESSED".to_owned(),
+        )];
+        assert!(revocation_shard_receipts_are_proven(
+            &complete,
+            &expected,
+            operation_id
+        ));
+
+        let pending = vec![(
+            message_id.clone(),
+            operation_id.to_owned(),
+            crate::invalidation::SESSION_REVOKED.to_owned(),
+            crate::invalidation::INVALIDATION_QUEUE.to_owned(),
+            "PENDING".to_owned(),
+        )];
+        assert!(!revocation_shard_receipts_are_proven(
+            &pending,
+            &expected,
+            operation_id
+        ));
+
+        let wrong_operation = vec![(
+            message_id.clone(),
+            "other-operation".to_owned(),
+            crate::invalidation::SESSION_REVOKED.to_owned(),
+            crate::invalidation::INVALIDATION_QUEUE.to_owned(),
+            "PROCESSED".to_owned(),
+        )];
+        assert!(!revocation_shard_receipts_are_proven(
+            &wrong_operation,
+            &expected,
+            operation_id
+        ));
+
+        let wrong_type = vec![(
+            message_id.clone(),
+            operation_id.to_owned(),
+            crate::invalidation::EVIDENCE_INVALIDATED.to_owned(),
+            crate::invalidation::INVALIDATION_QUEUE.to_owned(),
+            "PROCESSED".to_owned(),
+        )];
+        assert!(!revocation_shard_receipts_are_proven(
+            &wrong_type,
+            &expected,
+            operation_id
+        ));
+
+        let wrong_queue = vec![(
+            message_id.clone(),
+            operation_id.to_owned(),
+            crate::invalidation::SESSION_REVOKED.to_owned(),
+            crate::config::QUEUE_AUTH_SESSION_REVOCATION.to_owned(),
+            "PROCESSED".to_owned(),
+        )];
+        assert!(!revocation_shard_receipts_are_proven(
+            &wrong_queue,
+            &expected,
+            operation_id
+        ));
+
+        let extra = vec![
+            complete[0].clone(),
+            (
+                "unexpected-shard".to_owned(),
+                operation_id.to_owned(),
+                crate::invalidation::SESSION_REVOKED.to_owned(),
+                crate::invalidation::INVALIDATION_QUEUE.to_owned(),
+                "PROCESSED".to_owned(),
+            ),
+        ];
+        assert!(!revocation_shard_receipts_are_proven(
+            &extra,
+            &expected,
+            operation_id
+        ));
+    }
+
+    #[test]
+    fn revocation_shard_receipt_barrier_rejects_missing_or_duplicate_rows() {
+        let operation_id = "operation-2";
+        let jti_keys = vec!["jti-1".to_owned(), "jti-2".to_owned()];
+        let expected = revocation_shard_message_ids(17, &jti_keys, operation_id).unwrap();
+        let message_id = expected.iter().next().unwrap().clone();
+        let row = (
+            message_id.clone(),
+            operation_id.to_owned(),
+            crate::invalidation::SESSION_REVOKED.to_owned(),
+            crate::invalidation::INVALIDATION_QUEUE.to_owned(),
+            "PROCESSED".to_owned(),
+        );
+        assert!(!revocation_shard_receipts_are_proven(
+            &[],
+            &expected,
+            operation_id
+        ));
+        assert!(!revocation_shard_receipts_are_proven(
+            &[row.clone(), row],
+            &expected,
+            operation_id
+        ));
+    }
+    #[test]
+    fn revocation_shard_receipt_barrier_proves_every_planned_shard() {
+        let operation_id = "operation-multi-shard";
+        let jti_keys = (0..=crate::invalidation::MAX_REVOKED_JTIS)
+            .map(|index| format!("jti-{index:04}"))
+            .collect::<Vec<_>>();
+        let expected = revocation_shard_message_ids(17, &jti_keys, operation_id).unwrap();
+        assert_eq!(expected.len(), 2);
+        let rows = expected
+            .iter()
+            .map(|message_id| {
+                (
+                    message_id.clone(),
+                    operation_id.to_owned(),
+                    crate::invalidation::SESSION_REVOKED.to_owned(),
+                    crate::invalidation::INVALIDATION_QUEUE.to_owned(),
+                    "PROCESSED".to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(revocation_shard_receipts_are_proven(
+            &rows,
+            &expected,
+            operation_id
+        ));
+    }
+
+    #[test]
     fn inline_revocation_completion_never_steals_worker_owned_rows() {
         assert!(REVOCATION_OUTBOX_COMPLETE_SQL.contains("operation_id = ? AND sequence_number = 1"));
         assert!(REVOCATION_OUTBOX_COMPLETE_SQL.contains("AND status = 'PENDING'"));
         assert!(!REVOCATION_OUTBOX_COMPLETE_SQL.contains("PROCESSING"));
+        assert!(REVOCATION_SHARD_RECEIPT_PROOF_SQL.contains("WHERE operation_id = ?"));
+        assert!(!REVOCATION_SHARD_RECEIPT_PROOF_SQL.contains("message_type = ?"));
+        assert!(!REVOCATION_SHARD_RECEIPT_PROOF_SQL.contains("queue_name = ?"));
+        assert!(REVOCATION_SHARD_RECEIPT_PROOF_SQL.contains("LIMIT ?"));
+        assert_eq!(REVOCATION_SHARD_RECEIPT_PROOF_SQL.matches('?').count(), 2);
         assert!(revocation_completion_is_proven(1, None));
         assert!(revocation_completion_is_proven(0, Some("PROCESSED")));
         for status in [None, Some("PENDING"), Some("PROCESSING"), Some("FAILED")] {
@@ -3839,7 +4223,7 @@ mod tests {
             .unwrap();
         let commit = body.find("tx.commit()").unwrap();
         let strict_db = body.find("apply_revocation_projection_mysql(pool").unwrap();
-        let complete = body.find("mark_revocation_outbox_processed(pool").unwrap();
+        let complete = body.find("mark_revocation_outbox_processed(").unwrap();
         // Source commit → strict DB projection → durable outbox completion proof.
         assert!(commit < strict_db && strict_db < complete);
         assert!(body.contains("astral_db::apply_revocation_projection_mysql(pool, &jti_keys)"));

@@ -11,8 +11,10 @@
 //! 收口"handler 中途失败/进程崩溃"遗留的 outbox 行，不再参与任何主处理
 //! 路径；轮询周期相应放宽以消除空闲 DB 轮询开销。
 
+use std::collections::HashSet;
 use std::time::Duration;
 
+use astral_common::token_contract::normalize_revocation_reason;
 use serde_json::Value;
 use sqlx::MySqlPool;
 use time::PrimitiveDateTime;
@@ -20,12 +22,19 @@ use uuid::Uuid;
 
 use astral_types::AstralError;
 
+use crate::AppState;
+
 const LEASE_SECONDS: i64 = 30;
 /// 恢复兜底轮询周期（毫秒）：纯恢复角色（见模块文档），主路径是进程内
 /// LocalBus 撤销 handler 的同步完成；放宽周期只影响崩溃遗留行的收口延迟，
 /// 不影响任何正确性（outbox 幂等 + 撤销完成证明以 durable 状态为准）。
 const POLL_MILLIS: u64 = 5000;
 const MAX_BACKOFF_SECONDS: i64 = 300;
+const MAX_OUTBOX_ATTEMPTS: i32 = 8;
+const MAX_REVOCATION_SNAPSHOT_JTIS: usize = 4096;
+const MAX_REVOCATION_JTI_BYTES: usize = 128;
+const SWITCH_RESPONSE_CLEANUP_LIMIT: i64 = 100;
+const SWITCH_RECOVERY_SCAN_LIMIT: i64 = 25;
 
 #[allow(dead_code)]
 #[derive(Debug, sqlx::FromRow)]
@@ -210,11 +219,11 @@ fn supervise_session_worker(
 
 /// Spawn the required recovery loop with explicit lifecycle ownership.
 /// The same native MySQL recovery path is used by every Identity runtime.
-pub fn spawn_owned(pool: MySqlPool) -> SessionProjectionWorkerHandle {
+pub fn spawn_owned(state: AppState) -> SessionProjectionWorkerHandle {
     let worker_id = format!("identity-{}", Uuid::new_v4());
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let (death_tx, death_rx) = tokio::sync::watch::channel(None::<String>);
-    let inner = tokio::spawn(run_recovery_loop(pool, worker_id, stop_rx.clone()));
+    let inner = tokio::spawn(run_recovery_loop(state, worker_id, stop_rx.clone()));
     let join = tokio::spawn(supervise_session_worker(inner, stop_rx, death_tx));
     SessionProjectionWorkerHandle {
         stop: stop_tx,
@@ -229,11 +238,11 @@ pub fn spawn_owned(pool: MySqlPool) -> SessionProjectionWorkerHandle {
 /// top and interrupting both sleeps (a stop never tears down a mid-flight
 /// `process_one` row settlement; it only prevents the NEXT claim).
 async fn run_recovery_loop(
-    pool: MySqlPool,
+    state: AppState,
     worker_id: String,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
-    // Bounded stop-aware sleep: returns true when a stop was requested.
+    let pool = state.db.clone();
     loop {
         if *stop.borrow() {
             tracing::info!(
@@ -241,6 +250,18 @@ async fn run_recovery_loop(
                 "auth session recovery worker stopped cooperatively"
             );
             return;
+        }
+        if let Err(error) = cleanup_expired_switch_responses(&pool).await {
+            tracing::warn!(worker_id = %worker_id, %error, "expired switch response cleanup failed");
+        }
+        match recover_switch_operations(&state, &worker_id).await {
+            Ok(recovered) if recovered > 0 => {
+                tracing::debug!(worker_id = %worker_id, recovered, "switch operations reconciled");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(worker_id = %worker_id, %error, "switch operation recovery scan failed");
+            }
         }
         match claim_one(&pool, &worker_id).await {
             Ok(Some(row)) => {
@@ -287,6 +308,61 @@ async fn stop_sleep(
     }
 }
 
+async fn recover_switch_operations(
+    state: &AppState,
+    worker_id: &str,
+) -> Result<usize, AstralError> {
+    let operation_ids = sqlx::query_scalar::<_, String>(
+        "SELECT operation_id FROM auth_session_operation \
+         WHERE status IN (?, ?) \
+           AND recovery_attempts <= ? \
+           AND recovery_expires_at IS NOT NULL \
+           AND (recovery_claim_owner IS NULL OR recovery_claim_expires_at <= UTC_TIMESTAMP()) \
+         ORDER BY updated_at ASC, operation_id ASC LIMIT ?",
+    )
+    .bind(crate::srv::session::SWITCH_OPERATION_STATUS_CAS_PENDING)
+    .bind(crate::srv::session::SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION)
+    .bind(crate::srv::session::SWITCH_OPERATION_RECOVERY_ATTEMPT_LIMIT)
+    .bind(SWITCH_RECOVERY_SCAN_LIMIT)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|error| AstralError::Database(format!("Scan switch operations failed: {error}")))?;
+
+    let mut recovered = 0;
+    for operation_id in operation_ids {
+        match crate::srv::session::recover_switch_operation_from_worker(state, &operation_id).await
+        {
+            Ok(()) => recovered += 1,
+            Err(error) => {
+                tracing::warn!(
+                    worker_id,
+                    operation_id = %operation_id,
+                    %error,
+                    "switch operation recovery deferred"
+                );
+            }
+        }
+    }
+    Ok(recovered)
+}
+
+async fn cleanup_expired_switch_responses(pool: &MySqlPool) -> Result<(), AstralError> {
+    sqlx::query(
+        "UPDATE auth_session_operation SET response_ciphertext = NULL, updated_at = UTC_TIMESTAMP() \
+         WHERE status IN ('COMPLETED', 'FAILED', 'UNKNOWN') \
+           AND response_ciphertext IS NOT NULL \
+           AND (response_expires_at IS NULL OR response_expires_at <= UTC_TIMESTAMP()) \
+         ORDER BY (response_expires_at IS NULL) ASC, response_expires_at ASC, operation_id ASC LIMIT ?",
+    )
+    .bind(SWITCH_RESPONSE_CLEANUP_LIMIT)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        AstralError::Database(format!("Clean expired switch responses failed: {error}"))
+    })
+}
+
 async fn claim_one(pool: &MySqlPool, worker_id: &str) -> Result<Option<OutboxRow>, AstralError> {
     let mut tx = pool
         .begin()
@@ -296,13 +372,29 @@ async fn claim_one(pool: &MySqlPool, worker_id: &str) -> Result<Option<OutboxRow
         "SELECT outbox_id, operation_id, event_type, projection_key, payload_json, created_at, attempts \
          FROM auth_session_outbox \
          WHERE (status = 'PENDING' OR (status = 'PROCESSING' AND lease_expires_at < UTC_TIMESTAMP())) \
+           AND attempts < ? \
            AND (next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP()) \
          ORDER BY created_at ASC, outbox_id ASC LIMIT 1 FOR UPDATE SKIP LOCKED",
     )
+    .bind(MAX_OUTBOX_ATTEMPTS)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|error| AstralError::Database(format!("Load outbox item failed: {error}")))?;
     let Some(row) = row else {
+        sqlx::query(
+            "UPDATE auth_session_outbox SET status = 'QUARANTINED', next_attempt_at = NULL, \
+             lease_owner = NULL, lease_expires_at = NULL, \
+             last_error = 'outbox attempt ceiling reached', \
+             terminal_transitions = terminal_transitions + 1, updated_at = UTC_TIMESTAMP() \
+             WHERE (status = 'PENDING' OR (status = 'PROCESSING' AND lease_expires_at < UTC_TIMESTAMP()))
+               AND attempts >= ?",
+        )
+        .bind(MAX_OUTBOX_ATTEMPTS)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            AstralError::Database(format!("Quarantine exhausted outbox items failed: {error}"))
+        })?;
         tx.commit().await.map_err(|error| {
             AstralError::Database(format!("Commit empty outbox claim failed: {error}"))
         })?;
@@ -330,6 +422,13 @@ async fn claim_one(pool: &MySqlPool, worker_id: &str) -> Result<Option<OutboxRow
     Ok(Some(row))
 }
 
+fn projection_error_is_terminal(error: &AstralError) -> bool {
+    matches!(
+        error,
+        AstralError::Validation(_) | AstralError::NotFound(_) | AstralError::NotImplemented(_)
+    )
+}
+
 async fn process_one(pool: &MySqlPool, worker_id: &str, row: OutboxRow) -> Result<(), AstralError> {
     let projection_result = apply_revocation_projection(pool, &row).await;
     match projection_result {
@@ -355,19 +454,47 @@ async fn process_one(pool: &MySqlPool, worker_id: &str, row: OutboxRow) -> Resul
             Ok(())
         }
         Err(error) => {
-            let delay = (2_i64.pow((row.attempts.max(0) as u32).min(8))).min(MAX_BACKOFF_SECONDS);
-            sqlx::query(
+            let terminal = row.attempts.saturating_add(1) >= MAX_OUTBOX_ATTEMPTS
+                || projection_error_is_terminal(&error);
+            let query = if terminal {
+                "UPDATE auth_session_outbox SET status = 'QUARANTINED', next_attempt_at = NULL, \
+                 lease_owner = NULL, lease_expires_at = NULL, last_error = ?, \
+                 terminal_transitions = terminal_transitions + 1, updated_at = UTC_TIMESTAMP() \
+                 WHERE outbox_id = ? AND status = 'PROCESSING' AND lease_owner = ?"
+            } else {
                 "UPDATE auth_session_outbox SET status = 'PENDING', next_attempt_at = DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? SECOND), \
                  lease_owner = NULL, lease_expires_at = NULL, last_error = ?, updated_at = UTC_TIMESTAMP() \
-                 WHERE outbox_id = ? AND status = 'PROCESSING' AND lease_owner = ?",
-            )
-            .bind(delay)
-            .bind(error.to_string())
-            .bind(row.outbox_id)
-            .bind(worker_id)
-            .execute(pool)
-            .await
-            .map_err(|db_error| AstralError::Database(format!("Release outbox lease failed: {db_error}")))?;
+                 WHERE outbox_id = ? AND status = 'PROCESSING' AND lease_owner = ?"
+            };
+            let mut statement = sqlx::query(query);
+            if terminal {
+                statement = statement.bind(error.to_string());
+            } else {
+                let delay =
+                    (2_i64.pow((row.attempts.max(0) as u32).min(8))).min(MAX_BACKOFF_SECONDS);
+                statement = statement.bind(delay).bind(error.to_string());
+            }
+            let settlement = statement
+                .bind(row.outbox_id)
+                .bind(worker_id)
+                .execute(pool)
+                .await
+                .map_err(|db_error| {
+                    AstralError::Database(format!("Release outbox lease failed: {db_error}"))
+                })?;
+            if settlement.rows_affected() != 1 {
+                return Err(AstralError::Internal(
+                    "outbox settlement lease was lost; reconciliation required".into(),
+                ));
+            }
+            if terminal {
+                tracing::error!(
+                    outbox_id = row.outbox_id,
+                    attempts = row.attempts,
+                    status = "QUARANTINED",
+                    "auth session outbox moved to terminal quarantine"
+                );
+            }
             Err(error)
         }
     }
@@ -375,15 +502,32 @@ async fn process_one(pool: &MySqlPool, worker_id: &str, row: OutboxRow) -> Resul
 
 async fn apply_revocation_projection(pool: &MySqlPool, row: &OutboxRow) -> Result<(), AstralError> {
     const REVOKED_TTL_SECS: u64 = 7 * 24 * 3600;
+    let revocation_provenance = revocation_payload_provenance(row)?;
     let indexed_jtis = load_projection_jtis(pool, row).await?;
-    if indexed_jtis.is_empty() {
-        if !(row.event_type == "REVOKE"
-            && row
-                .payload_json
-                .as_deref()
-                .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
-                .is_some_and(|payload| payload.get("v").and_then(Value::as_i64) == Some(2)))
+    if let Some(provenance) = revocation_provenance {
+        let proof = astral_mq::prove_session_revocation_shards_processed(
+            pool,
+            provenance.user_id,
+            &indexed_jtis,
+            &row.operation_id,
+            provenance.require_typed_shards,
+        )
+        .await
+        .map_err(|error| {
+            AstralError::Database(format!(
+                "session revocation shard receipt proof failed: {error}"
+            ))
+        })?;
+        if provenance.require_typed_shards
+            && matches!(proof, astral_mq::SessionRevocationShardProof::NoTypedShards)
         {
+            return Err(AstralError::Database(
+                "current V6 revocation is missing typed shard provenance".into(),
+            ));
+        }
+    }
+    if indexed_jtis.is_empty() {
+        if revocation_provenance.is_none() {
             return Err(AstralError::Internal(
                 "auth revocation projection has no proven JTI snapshot".into(),
             ));
@@ -395,6 +539,63 @@ async fn apply_revocation_projection(pool: &MySqlPool, row: &OutboxRow) -> Resul
     // 恢复路径与主撤销路径同点登记进程内加速面（镜像 + 既有注册表）。
     astral_db::note_revocations_in_process(&indexed_jtis, REVOKED_TTL_SECS);
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RevocationPayloadProvenance {
+    user_id: i64,
+    require_typed_shards: bool,
+}
+
+fn revocation_payload_provenance(
+    row: &OutboxRow,
+) -> Result<Option<RevocationPayloadProvenance>, AstralError> {
+    if row.event_type != "REVOKE" {
+        return Err(AstralError::Validation(format!(
+            "Unsupported auth projection event type: {}",
+            row.event_type
+        )));
+    }
+    let Some(payload) = row.payload_json.as_deref() else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_str(payload).map_err(|_| {
+        AstralError::Validation("Auth revocation outbox payload is malformed".into())
+    })?;
+    match value.get("v") {
+        Some(Value::Number(version)) if version.as_i64() == Some(2) => {
+            let expected_user = row
+                .projection_key
+                .strip_prefix("user:")
+                .and_then(|id| id.parse::<i64>().ok())
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    AstralError::Validation("Auth revocation snapshot has invalid scope".into())
+                })?;
+            if value.get("userId").and_then(Value::as_i64) != Some(expected_user) {
+                return Err(AstralError::Validation(
+                    "Auth revocation snapshot user does not match projection key".into(),
+                ));
+            }
+            let require_typed_shards = match value.get("typedShards") {
+                None => false,
+                Some(Value::Bool(required)) => *required,
+                Some(_) => {
+                    return Err(AstralError::Validation(
+                        "Auth revocation typedShards marker is invalid".into(),
+                    ))
+                }
+            };
+            Ok(Some(RevocationPayloadProvenance {
+                user_id: expected_user,
+                require_typed_shards,
+            }))
+        }
+        Some(_) => Err(AstralError::Validation(
+            "Unsupported auth revocation outbox version".into(),
+        )),
+        None => Ok(None),
+    }
 }
 
 async fn load_projection_jtis(
@@ -426,23 +627,41 @@ async fn load_projection_jtis(
                         "Auth revocation snapshot user does not match projection key".into(),
                     ));
                 }
-                let jtis = value
-                    .get("jtis")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| {
-                        AstralError::Validation("Auth revocation snapshot is missing jtis".into())
-                    })?
+                let reason = value.get("reason").and_then(Value::as_str).ok_or_else(|| {
+                    AstralError::Validation("Auth revocation snapshot reason is missing".into())
+                })?;
+                normalize_revocation_reason(reason).map_err(|error| {
+                    AstralError::Validation(format!(
+                        "Auth revocation snapshot reason is invalid: {error}"
+                    ))
+                })?;
+                let jtis = value.get("jtis").and_then(Value::as_array).ok_or_else(|| {
+                    AstralError::Validation("Auth revocation snapshot is missing jtis".into())
+                })?;
+                if jtis.len() > MAX_REVOCATION_SNAPSHOT_JTIS {
+                    return Err(AstralError::Validation(
+                        "Auth revocation snapshot exceeds its bounded JTI count".into(),
+                    ));
+                }
+                let mut seen = HashSet::with_capacity(jtis.len());
+                let jtis = jtis
                     .iter()
                     .map(|value| {
-                        value
+                        let jti = value
                             .as_str()
                             .filter(|jti| !jti.trim().is_empty())
-                            .map(ToOwned::to_owned)
                             .ok_or_else(|| {
                                 AstralError::Validation(
                                     "Auth revocation snapshot contains invalid jti".into(),
                                 )
-                            })
+                            })?;
+                        if jti.len() > MAX_REVOCATION_JTI_BYTES || !seen.insert(jti) {
+                            return Err(AstralError::Validation(
+                                "Auth revocation snapshot contains an oversized or duplicate jti"
+                                    .into(),
+                            ));
+                        }
+                        Ok(jti.to_owned())
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 return Ok(jtis);
@@ -456,6 +675,8 @@ async fn load_projection_jtis(
         }
     }
 
+    let limit = i64::try_from(MAX_REVOCATION_SNAPSHOT_JTIS + 1)
+        .map_err(|_| AstralError::Internal("revocation snapshot cap overflow".into()))?;
     let (kind, value) = row
         .projection_key
         .split_once(':')
@@ -470,10 +691,12 @@ async fn load_projection_jtis(
             sqlx::query_scalar::<_, String>(
                 "SELECT jti FROM auth_session_jti_index \
              WHERE session_id = ? AND issued_at <= ? \
-               AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP())",
+               AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()) \
+             ORDER BY jti LIMIT ?",
             )
             .bind(id)
             .bind(row.created_at)
+            .bind(limit)
             .fetch_all(pool)
             .await
         }
@@ -482,10 +705,12 @@ async fn load_projection_jtis(
                 "SELECT i.jti FROM auth_session_jti_index i \
              INNER JOIN auth_device_session s ON s.session_id = i.session_id \
              WHERE s.family_id = ? AND i.issued_at <= ? \
-               AND (i.expires_at IS NULL OR i.expires_at > UTC_TIMESTAMP())",
+               AND (i.expires_at IS NULL OR i.expires_at > UTC_TIMESTAMP()) \
+             ORDER BY i.jti LIMIT ?",
             )
             .bind(id)
             .bind(row.created_at)
+            .bind(limit)
             .fetch_all(pool)
             .await
         }
@@ -493,10 +718,12 @@ async fn load_projection_jtis(
             sqlx::query_scalar::<_, String>(
                 "SELECT i.jti FROM auth_session_jti_index i \
              WHERE i.user_id = ? AND i.issued_at <= ? \
-               AND (i.expires_at IS NULL OR i.expires_at > UTC_TIMESTAMP())",
+               AND (i.expires_at IS NULL OR i.expires_at > UTC_TIMESTAMP()) \
+             ORDER BY i.jti LIMIT ?",
             )
             .bind(id)
             .bind(row.created_at)
+            .bind(limit)
             .fetch_all(pool)
             .await
         }
@@ -509,12 +736,225 @@ async fn load_projection_jtis(
     rows.map_err(|error| {
         AstralError::Database(format!("Load auth projection JTIs failed: {error}"))
     })
+    .and_then(|rows| {
+        if rows.len() > MAX_REVOCATION_SNAPSHOT_JTIS {
+            return Err(AstralError::Validation(
+                "Auth revocation historical snapshot exceeds its bounded JTI count".into(),
+            ));
+        }
+        let mut seen = HashSet::with_capacity(rows.len());
+        rows.into_iter()
+            .map(|jti| {
+                if jti.len() > MAX_REVOCATION_JTI_BYTES || !seen.insert(jti.clone()) {
+                    return Err(AstralError::Validation(
+                        "Auth revocation historical snapshot contains an oversized or duplicate jti".into(),
+                    ));
+                }
+                Ok(jti)
+            })
+            .collect()
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{load_projection_jtis, OutboxRow};
+    #[test]
+    fn typed_shard_proof_precedes_parent_completion_cas() {
+        let source = include_str!("session_projection_worker.rs");
+        let process_body = source
+            .split("async fn process_one(")
+            .nth(1)
+            .expect("process_one source must exist");
+        let projection = process_body
+            .find("apply_revocation_projection(pool, &row)")
+            .expect("worker must apply the revocation projection");
+        let parent_cas = process_body
+            .find("UPDATE auth_session_outbox SET status = 'PROCESSED'")
+            .expect("worker must own the parent completion CAS");
+        assert!(projection < parent_cas);
+    }
+
+    use super::{
+        load_projection_jtis, projection_error_is_terminal, revocation_payload_provenance,
+        OutboxRow, RevocationPayloadProvenance,
+    };
+    use astral_types::AstralError;
     use time::{Date, Month, PrimitiveDateTime, Time};
+
+    #[test]
+    fn terminal_projection_errors_are_typed_and_retryable_errors_are_not_quarantined() {
+        assert!(projection_error_is_terminal(&AstralError::Validation(
+            "bad payload".into()
+        )));
+        assert!(projection_error_is_terminal(&AstralError::NotFound(
+            "missing row".into()
+        )));
+        assert!(!projection_error_is_terminal(&AstralError::Database(
+            "temporary outage".into()
+        )));
+        assert!(!projection_error_is_terminal(&AstralError::Internal(
+            "unknown outcome".into()
+        )));
+    }
+
+    #[test]
+    fn exhausted_claim_cleanup_includes_expired_processing_rows_and_is_fenced() {
+        let source = include_str!("session_projection_worker.rs");
+        let claim = source
+            .split("async fn claim_one(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn projection_error_is_terminal").next())
+            .expect("claim helper must stay bounded");
+        assert!(claim.contains("status = 'PROCESSING' AND lease_expires_at < UTC_TIMESTAMP()"));
+        assert!(claim.contains("attempts >= ?"));
+        assert!(claim.contains("UPDATE auth_session_outbox SET status = 'QUARANTINED'"));
+        assert!(claim.contains("terminal_transitions = terminal_transitions + 1"));
+    }
+
+    #[test]
+    fn projection_error_settlement_requires_the_same_lease_owner() {
+        let source = include_str!("session_projection_worker.rs");
+        let process = source
+            .split("async fn process_one(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn apply_revocation_projection").next())
+            .expect("process_one helper must remain bounded");
+        assert!(process.contains("status = 'QUARANTINED'"));
+        assert!(process.contains("status = 'PROCESSING' AND lease_owner = ?"));
+        assert!(process.contains("settlement.rows_affected() != 1"));
+        assert!(process.contains("outbox settlement lease was lost; reconciliation required"));
+        assert!(process.contains("Err(error)"));
+    }
+    #[test]
+    fn revocation_provenance_distinguishes_current_historical_and_empty_markers() {
+        let row = |payload_json| OutboxRow {
+            outbox_id: 1,
+            operation_id: "op".into(),
+            event_type: "REVOKE".into(),
+            projection_key: "user:17".into(),
+            payload_json,
+            created_at: PrimitiveDateTime::MIN,
+            attempts: 0,
+        };
+
+        assert_eq!(
+            revocation_payload_provenance(&row(Some(
+                serde_json::json!({
+                    "v": 2,
+                    "userId": 17,
+                    "jtis": ["jti-1"],
+                })
+                .to_string(),
+            )))
+            .unwrap(),
+            Some(RevocationPayloadProvenance {
+                user_id: 17,
+                require_typed_shards: false,
+            })
+        );
+        assert_eq!(
+            revocation_payload_provenance(&row(Some(
+                serde_json::json!({
+                    "v": 2,
+                    "userId": 17,
+                    "jtis": ["jti-1"],
+                    "typedShards": true,
+                })
+                .to_string(),
+            )))
+            .unwrap(),
+            Some(RevocationPayloadProvenance {
+                user_id: 17,
+                require_typed_shards: true,
+            })
+        );
+        assert_eq!(revocation_payload_provenance(&row(None)).unwrap(), None);
+    }
+
+    #[test]
+    fn switch_recovery_scan_is_bounded_and_rechecks_claim_state() {
+        let source = include_str!("session_projection_worker.rs");
+        let scan = source
+            .split("async fn recover_switch_operations(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("async fn cleanup_expired_switch_responses")
+                    .next()
+            })
+            .expect("switch recovery scan must exist");
+        assert!(scan.contains("status IN (?, ?)"));
+        assert!(scan.contains("recovery_attempts <= ?"));
+        assert!(scan.contains("recovery_expires_at IS NOT NULL"));
+        assert!(scan.contains(
+            "recovery_claim_owner IS NULL OR recovery_claim_expires_at <= UTC_TIMESTAMP()"
+        ));
+        assert!(scan.contains("SWITCH_OPERATION_RECOVERY_ATTEMPT_LIMIT"));
+        assert!(scan.contains("ORDER BY updated_at ASC, operation_id ASC LIMIT ?"));
+        assert!(scan.contains("SWITCH_RECOVERY_SCAN_LIMIT"));
+        assert!(scan.contains("recover_switch_operation_from_worker"));
+        let loop_body = source
+            .split("async fn run_recovery_loop(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn stop_sleep(").next())
+            .expect("recovery loop body must exist");
+        assert!(loop_body.contains("recover_switch_operations(&state, &worker_id)"));
+        assert!(loop_body.contains("cleanup_expired_switch_responses(&pool)"));
+    }
+
+    #[test]
+    fn in_flight_response_cleanup_remains_terminal_only() {
+        let source = include_str!("session_projection_worker.rs");
+        let cleanup = source
+            .split("async fn cleanup_expired_switch_responses")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn recover_switch_operations").next())
+            .or_else(|| {
+                source
+                    .split("async fn cleanup_expired_switch_responses")
+                    .nth(1)
+                    .and_then(|tail| tail.split("async fn claim_one").next())
+            })
+            .expect("cleanup helper body must exist");
+        assert!(cleanup.contains("status IN ('COMPLETED', 'FAILED', 'UNKNOWN')"));
+        assert!(!cleanup.contains("CAS_PENDING"));
+        assert!(!cleanup.contains("COMMITTED_PENDING_PROJECTION"));
+    }
+
+    #[test]
+    fn expired_response_cleanup_is_terminal_and_bounded() {
+        let source = include_str!("session_projection_worker.rs");
+        let cleanup = source
+            .split("async fn cleanup_expired_switch_responses")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn claim_one").next())
+            .expect("cleanup helper body must exist");
+        assert!(cleanup.contains("response_ciphertext = NULL"));
+        assert!(cleanup.contains("status IN ('COMPLETED', 'FAILED', 'UNKNOWN')"));
+        assert!(cleanup
+            .contains("response_expires_at IS NULL OR response_expires_at <= UTC_TIMESTAMP()"));
+        assert!(cleanup.contains(
+            "ORDER BY (response_expires_at IS NULL) ASC, response_expires_at ASC, operation_id ASC LIMIT ?"
+        ));
+        assert!(!cleanup.contains("CAS_PENDING"));
+        assert!(!cleanup.contains("COMMITTED_PENDING_PROJECTION"));
+    }
+
+    #[test]
+    fn expired_response_cleanup_runs_before_each_outbox_claim() {
+        let source = include_str!("session_projection_worker.rs");
+        let recovery_loop = source
+            .split("async fn run_recovery_loop(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn stop_sleep(").next())
+            .expect("recovery loop body must exist");
+        let cleanup = recovery_loop
+            .find("cleanup_expired_switch_responses(&pool)")
+            .expect("recovery loop must run response cleanup");
+        let claim = recovery_loop
+            .find("match claim_one(&pool, &worker_id)")
+            .expect("recovery loop must claim outbox work");
+        assert!(cleanup < claim);
+    }
 
     #[tokio::test]
     async fn projection_key_validation_fails_before_database_access() {

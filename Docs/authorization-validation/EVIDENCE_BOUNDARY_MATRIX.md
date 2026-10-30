@@ -2,6 +2,16 @@
 
 > This matrix records what each validation target can establish and when a result
 > must be downgraded. It is an engineering control, not a publication-results table.
+>
+> CURRENT V6 provenance boundary: retained Chat/Learn paths and Redis-backed
+> fixtures/reports are historical baseline/comparison or retired compatibility
+> evidence only. They are not current runtime dependencies, current gates, or
+> real-integration `PASS` evidence. Direct Monitor health probes are operational
+> observations, distinct from the protected Monitor contract. Resource retirement
+> remains fail-closed until canonical revoke, generation, and published-evidence
+> barriers are proven. Password delivery is unavailable/`PENDING` unless a
+> notifier handoff is proven. `UNKNOWN` and `PENDING` require reconciliation;
+> cross-aggregate completion requires complete owned receipt and evidence barriers.
 
 Allowed states are `BASELINE`, `PLANNED`, `PASS`, `FAIL`, `BLOCKED`, `UNKNOWN`,
 `PENDING`, and `SKIP`. `PLANNED` is not an execution result, and `UNKNOWN` must not

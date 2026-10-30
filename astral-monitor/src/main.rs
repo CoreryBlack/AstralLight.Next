@@ -74,6 +74,11 @@ async fn dashboard_summary(
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
+    astral_common::middleware::permission_check_shared::validate_path_map(
+        middleware::MONITOR_PATH_MAP,
+        "monitor",
+    )?;
+
     // Prometheus 指标暴露：默认 loopback 抓取端口；
     // METRICS_LISTEN_ADDR 覆盖，置空显式禁用。观测失败不影响主服务。
     if let Some(metrics_addr) =
@@ -102,10 +107,6 @@ async fn main() -> anyhow::Result<()> {
         db.clone(),
     ))));
 
-    astral_common::middleware::permission_check_shared::validate_path_map(
-        middleware::MONITOR_PATH_MAP,
-        "monitor",
-    );
     let state = AppState {
         config,
         db,
@@ -116,33 +117,7 @@ async fn main() -> anyhow::Result<()> {
     // 启动定时采集（系统/服务指标、告警评估、每日清理）；持有所有权直到有界停机。
     let mut collector = collector::spawn_collector(state.clone());
 
-    let api_routes = Router::new()
-        .merge(alerts::alert_routes())
-        .merge(notifications::notification_routes())
-        .merge(dashboard::dashboard_routes())
-        .route("/metrics", get(metrics_summary))
-        .route("/system-info", get(system_info))
-        .route("/dashboard", get(dashboard_summary))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            middleware::monitor_permission_middleware,
-        ));
-
-    let frontend_health_routes = Router::new()
-        .route("/health", get(endpoints::frontend_health_check))
-        .route("/health/metrics", get(endpoints::frontend_metrics));
-
-    let app = Router::new()
-        .nest("/actuator", endpoints::monitor_routes())
-        .nest("/api/v1/monitor", api_routes)
-        .nest("/api", frontend_health_routes)
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            gateway_signature_middleware,
-        ))
-        .layer(axum::middleware::from_fn(global_exception_handler))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
-        .with_state(state);
+    let app = build_router(state.clone());
 
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:9006".into());
     tracing::info!(addr = %addr, "monitor service starting");
@@ -219,6 +194,105 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     } else {
         Err(anyhow::anyhow!(shutdown_errors.join("; ")))
+    }
+}
+
+fn build_router(state: AppState) -> Router {
+    let api_routes = Router::new()
+        .merge(alerts::alert_routes())
+        .merge(notifications::notification_routes())
+        .merge(dashboard::dashboard_routes())
+        .route("/metrics", get(metrics_summary))
+        .route("/system-info", get(system_info))
+        .route("/dashboard", get(dashboard_summary))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::monitor_permission_middleware,
+        ));
+
+    let direct_health_routes = Router::new()
+        .nest("/api", endpoints::frontend_health_routes())
+        .nest("/actuator", endpoints::actuator_health_routes());
+
+    let protected_monitor_routes = Router::new()
+        .nest("/actuator", endpoints::monitor_routes())
+        .nest("/api/v1/monitor", api_routes)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            gateway_signature_middleware,
+        ));
+
+    direct_health_routes
+        .merge(protected_monitor_routes)
+        .layer(axum::middleware::from_fn(global_exception_handler))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        let db = sqlx::MySqlPool::connect_lazy("mysql://localhost:1/astral_test").unwrap();
+        AppState {
+            config: Arc::new(AppConfig {
+                gateway: astral_common::config::GatewayCfg {
+                    hmac_secret: "test-gateway-secret-0123456789abcdef".into(),
+                    timestamp_tolerance_secs: 30,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            db: db.clone(),
+            engine: Arc::new(PolicyEngine::new()),
+            monitor_service: Arc::new(MonitorService::new(Arc::new(SqlxMonitorRepository::new(
+                db,
+            )))),
+        }
+    }
+
+    async fn response_for(app: Router, method: &str, path: &str) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn direct_health_routes_bypass_gateway_signature() {
+        for path in ["/api/health", "/api/health/metrics", "/actuator/health"] {
+            assert_eq!(
+                response_for(build_router(test_state()), "OPTIONS", path).await,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "registered direct health route must bypass gateway signature: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_monitor_routes_require_gateway_signature() {
+        for path in [
+            "/api/v1/monitor/system-info",
+            "/actuator/health/detailed",
+            "/actuator/metrics",
+            "/actuator/status",
+        ] {
+            assert_eq!(
+                response_for(build_router(test_state()), "GET", path).await,
+                StatusCode::FORBIDDEN,
+                "protected monitor route must require gateway signature: {path}"
+            );
+        }
     }
 }
 

@@ -2,6 +2,17 @@ use super::*;
 
 mod archive_indexes;
 
+const SWITCH_OPERATION_RECOVERY_CONTRACT_VERSION: i64 = 20261029000001;
+const SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION: i64 = 20261029000002;
+const SWITCH_OPERATION_RECOVERY_CONTRACT_MIGRATION_SQL: &str =
+    include_str!("../../migrations/20261029000001_switch_operation_recovery_contract.sql");
+const SWITCH_OPERATION_RECOVERY_DEADLINE_MIGRATION_SQL: &str =
+    include_str!("../../migrations/20261029000002_switch_operation_recovery_deadline.sql");
+const SWITCH_OPERATION_RECOVERY_CONTRACT_SQL_SHA384: &str =
+    "124805aff0fae52ce077b2ac02d0765a9839470ff2f1b526cf85c2c71f36c4cec90d60895e28282be58336113b11b3e6";
+const SWITCH_OPERATION_RECOVERY_DEADLINE_SQL_SHA384: &str =
+    "9652243c3634055309a253505722d701b21fdea0af4f333331c727ca8470c57e93fd0068a3f94a694a4f7af497c09688";
+
 fn normalize_schema_source_default_contracts() -> bool {
     [
         (Some("unix_timestamp()"), Some("(UNIX_TIMESTAMP())")),
@@ -1659,6 +1670,72 @@ fn compatibility_rewrite_does_not_change_sqlx_source_checksum() {
 }
 
 #[test]
+fn switch_operation_recovery_migrations_have_exact_preflight_artifact_contracts() {
+    let expected = [
+        (
+            SWITCH_OPERATION_RECOVERY_CONTRACT_VERSION,
+            SWITCH_OPERATION_RECOVERY_CONTRACT_MIGRATION_SQL,
+            SWITCH_OPERATION_RECOVERY_CONTRACT_SQL_SHA384,
+        ),
+        (
+            SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION,
+            SWITCH_OPERATION_RECOVERY_DEADLINE_MIGRATION_SQL,
+            SWITCH_OPERATION_RECOVERY_DEADLINE_SQL_SHA384,
+        ),
+    ];
+
+    for (version, source, sha384) in expected {
+        let migration = MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == version)
+            .unwrap_or_else(|| panic!("migration {version} must remain embedded"));
+        let contract = EXACT_MIGRATION_ARTIFACT_CONTRACTS
+            .iter()
+            .find(|contract| contract.version == version)
+            .unwrap_or_else(|| panic!("migration {version} needs exact artifact contract"));
+
+        assert_eq!(canonical_sha384_hex(source.as_bytes()), sha384);
+        assert_eq!(canonical_sha384_hex(migration.sql.as_bytes()), sha384);
+        assert_eq!(contract.source_sha384, sha384);
+        assert!(migration_matches_known_source(migration));
+        assert!(exact_migration_artifact_contract(migration).is_some());
+        assert!(!is_java_baseline_era(version));
+
+        for (table, column) in contract.columns {
+            assert!(
+                migration_defines_column(migration, table, column),
+                "{version} must own declared column {table}.{column}"
+            );
+            assert!(
+                pending_migration_defines_column(migration, table, column),
+                "{version} must satisfy pending preflight for {table}.{column}"
+            );
+        }
+        for (table, index, columns, unique) in contract.indexes {
+            assert!(
+                migration_defines_index(migration, table, index, columns, *unique),
+                "{version} must own declared index {table}.{index}"
+            );
+            assert!(
+                pending_migration_defines_index(migration, table, index, columns, *unique),
+                "{version} must satisfy pending preflight for {table}.{index}"
+            );
+        }
+    }
+
+    assert!(SWITCH_OPERATION_RECOVERY_CONTRACT_MIGRATION_SQL.contains(
+        "ALTER TABLE auth_session_operation ADD COLUMN recovery_attempts INT NOT NULL DEFAULT 0"
+    ));
+    assert!(SWITCH_OPERATION_RECOVERY_CONTRACT_MIGRATION_SQL.contains(
+        "CREATE INDEX idx_aso_recovery_status ON auth_session_operation (status, updated_at, recovery_attempts)"
+    ));
+    assert!(SWITCH_OPERATION_RECOVERY_DEADLINE_MIGRATION_SQL.contains(
+        "ALTER TABLE auth_session_operation ADD COLUMN recovery_expires_at DATETIME DEFAULT NULL AFTER response_expires_at"
+    ));
+}
+
+#[test]
 fn five_chain_migrations_are_pinned_and_own_only_declared_artifacts() {
     let expected: [(i64, &str, &str); 5] = [
         (
@@ -2220,10 +2297,20 @@ fn record_verified_baseline_is_default_deny_for_post_baseline_migrations() {
             .iter()
             .map(|migration| migration.version)
             .max(),
-        Some(AUTHORIZATION_PROJECTION_MANIFEST_V3_VERSION),
-        "the v3 manifest seal migration is the current chain tail"
+        Some(SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION),
+        "the switch-operation recovery deadline migration is the current chain tail"
     );
-    assert!(!is_java_baseline_era(20261005000001));
+    assert!(MIGRATOR
+        .migrations
+        .iter()
+        .any(|migration| migration.version == SWITCH_OPERATION_RECOVERY_CONTRACT_VERSION));
+    assert!(MIGRATOR
+        .migrations
+        .iter()
+        .any(|migration| migration.version == SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION));
+    assert!(!is_java_baseline_era(
+        SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION
+    ));
     assert!(MIGRATOR
         .migrations
         .iter()

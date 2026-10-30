@@ -170,6 +170,7 @@ impl UserService {
         state: &AppState,
         user_id: i64,
         req: &UpdateUserRequest,
+        request_operation_id: Option<&str>,
     ) -> Result<(), AppError> {
         // 对齐 Java `PlatformUserLifecycleServiceImpl.update()`：状态变更为非 ACTIVE
         // （DISABLED 等）时先撤销全部会话，保持 fail-closed 顺序（与 update_user_status 一致）。
@@ -178,7 +179,7 @@ impl UserService {
             .as_deref()
             .is_some_and(|status| status.to_uppercase() != "ACTIVE")
         {
-            revoke_all_sessions_for_user(state, user_id, "USER_DISABLED")
+            revoke_all_sessions_for_user(state, user_id, "USER_DISABLED", request_operation_id)
                 .await
                 .map_err(AppError)?;
         }
@@ -200,10 +201,11 @@ impl UserService {
         state: &AppState,
         user_id: i64,
         req: &UpdateStatusRequest,
+        request_operation_id: Option<&str>,
     ) -> Result<(), AppError> {
         // Java `PlatformUserLifecycleService` 在禁用账号时撤销全部会话。
         if req.status != "ACTIVE" {
-            revoke_all_sessions_for_user(state, user_id, "USER_DISABLED")
+            revoke_all_sessions_for_user(state, user_id, "USER_DISABLED", request_operation_id)
                 .await
                 .map_err(AppError)?;
         }
@@ -212,9 +214,14 @@ impl UserService {
         Ok(())
     }
 
-    pub async fn delete_user(&self, state: &AppState, user_id: i64) -> Result<(), AppError> {
+    pub async fn delete_user(
+        &self,
+        state: &AppState,
+        user_id: i64,
+        request_operation_id: Option<&str>,
+    ) -> Result<(), AppError> {
         // Java `PlatformUserLifecycleService.delete` 在软删前撤销全部会话。
-        revoke_all_sessions_for_user(state, user_id, "USER_DELETED")
+        revoke_all_sessions_for_user(state, user_id, "USER_DELETED", request_operation_id)
             .await
             .map_err(AppError)?;
         self.users.soft_delete_user(user_id).await?;
@@ -599,6 +606,9 @@ mod tests {
                     sqlx::MySqlPool::connect_lazy("mysql://localhost:1/identity").unwrap(),
                 ),
             ))),
+            password_reset_notifier: Arc::new(
+                crate::srv::password::UnavailablePasswordResetNotifier,
+            ),
             org_scope_enabled: false,
         }
     }

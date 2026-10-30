@@ -7,6 +7,7 @@
 > 格式：每条 = **问题陈述 → 核实记录 → 修正决策**（言简意赅）。
 > 规则：先核实后记录；核实必须基于代码/schema 只读事实；本文档是本目录的修正记录与证据索引，不替代 `Docs/规范/`；代码实施后更新状态。
 > 关联：评估与处置细节见《物理双卡权限链路评估与设计_V1.0.md》；目标态见《物理双卡权限链路设计_V1.0.md》。
+> CURRENT V6 provenance boundary：本文继续保留各问题的历史 schema、源码、迁移、ledger、revocation、audit 与决策事实；其中 Chat/Learn runtime、Redis compatibility、旧 reader 或解冻计划若出现在条目中，均按历史 baseline、目标态或 retired compatibility evidence 解读，不是当前 runtime、当前 gate 或真实集成 `PASS`。当前正式授权以 `PolicyEngine::evaluate()` 与 canonical published-evidence barrier 为准；`UNKNOWN`/`PENDING` 必须先独立对账。
 
 ---
 

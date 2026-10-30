@@ -6,6 +6,12 @@
 
 ---
 
+> 历史证据边界（CURRENT V6）：本文件是基于 2026-08-31 历史实验和当时源码快照的
+> 诊断/修复计划，保留 Redis 故障根因、worker 行为和修复顺序作为历史证据；不构成当前
+> Redis runtime、当前部署指导或真实集成 `PASS`。Redis adapter/L2 相关建议属于 retired
+> compatibility context；当前软件合同以 bounded process-local L1、strict DB reader、
+> canonical publication barrier 和 fail-closed `PENDING`/`DENY` 为准。
+
 ## 修复 1（最高优先级）：F5 —— delta worker 在负载/Redis 故障下永久挂起
 
 ### 根因定位

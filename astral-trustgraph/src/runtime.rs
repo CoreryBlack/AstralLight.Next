@@ -230,6 +230,11 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
     D: std::future::Future<Output = ()> + Send + 'static,
 {
+    astral_common::middleware::permission_check_shared::validate_path_map(
+        crate::api::permission_check::TRUSTGRAPH_PATH_RESOURCE_MAP,
+        "trustgraph",
+    )?;
+
     // Prometheus 指标独立绑定 loopback，避免进入 Gateway 签名与授权 Router。
     // recorder 或监听失败只禁用观测，绝不改变 TrustGraph 的启动或 fail-closed 语义。
     if let Some(metrics_addr) =
@@ -521,6 +526,15 @@ where
     crate::api::tenants::register_trustgraph_data_scope_rules();
 
     let message_transport = config.message_transport().map_err(anyhow::Error::msg)?;
+    if matches!(
+        message_transport,
+        astral_common::config::MessageTransport::Rabbit
+    ) && !invalidation_fanout_enabled
+    {
+        return Err(anyhow::anyhow!(
+            "Rabbit transport requires ASTRAL_INVALIDATION_FANOUT_ENABLED=true; typed authorization invalidation has no supported consumer when fanout is disabled"
+        ));
+    }
     let rabbitmq_url = config.rabbitmq_url.clone();
     let dlq_quarantine_db = db.clone();
 
@@ -620,12 +634,7 @@ where
         org_scope_tenant_allowlist,
     };
 
-    // 启动期注册校验（对齐 Java @PostConstruct 校验）
-    astral_common::middleware::permission_check_shared::validate_path_map(
-        crate::api::permission_check::TRUSTGRAPH_PATH_RESOURCE_MAP,
-        "trustgraph",
-    );
-
+    // 共享 route-map 启动校验已在 metrics、worker、consumer 和 router 装配前完成。
     // Pure config gates must run before the first background worker starts, so
     // an invalid tenant/topology/budget value cannot return with work still live.
     // The old eligibility projection worker remains first in startup order after

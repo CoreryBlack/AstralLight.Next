@@ -18,9 +18,20 @@ It includes executable Rust tests, authorization validation tools and formal inp
 `astral-chat` and `astral-learn` crates, which were excluded from the default Cargo
 workspace. This is a provenance fact, not their current runtime status: those
 production crates, Gateway route registrations/proxies, and API contracts are now
-retired and physically removed from this checkout. The independent public SDK
-consumer samples under `integrations/` are separate reference/test applications,
-not replacements for or deployments of the production services.
+historical baseline material only, retired and physically removed from this checkout.
+The independent public SDK consumer samples under `integrations/` are separate
+reference/test applications, not replacements for or deployments of the retired
+production services. Retained Redis fixtures and reports are historical comparison
+or retired compatibility evidence only; they are not current runtime dependencies,
+current authorization gates, or real-integration `PASS` evidence. Current health
+semantics distinguish direct Monitor service health probes from the protected
+Monitor contract; a health response alone is not an authorization or deployment
+acceptance proof. Resource retirement remains fail-closed until canonical revoke,
+generation, and published-evidence barriers are proven. Password delivery is
+unavailable/pending unless a notifier handoff is proven. `UNKNOWN` and `PENDING`
+remain non-success states, and cross-aggregate completion requires the complete
+owned receipt/evidence barrier rather than an ACK, status row, latest pointer, or
+partial aggregate observation.
 
 ## Licensing and rights-control boundary
 

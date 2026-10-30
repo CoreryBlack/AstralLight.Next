@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use astral_common::contract::{ApiResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
-use astral_types::{AstralError, CustomResourceRegistration, ResourceRegistry};
+use astral_types::{
+    AstralError, CustomResourceRegistration, ResourceRegistry,
+    RESOURCE_RETIREMENT_REQUIRES_PUBLISHED_REVOKE,
+};
 
 use crate::api::async_tracker::AsyncTask;
 use crate::api::require_platform_admin;
@@ -238,35 +241,18 @@ async fn unregister_resource_type(
     Path(resource_type): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_platform_admin(&state, &headers).await?;
-    let current_registry = ResourceRegistry::global();
-    if current_registry.is_builtin_resource(&resource_type) {
-        return Err(AppError(AstralError::Validation(
-            "built-in resource types cannot be unregistered".into(),
-        )));
-    }
-    let deleted = state
-        .resource_type_repository
-        .delete_registry(&resource_type)
-        .await?;
-    if !deleted {
-        return Err(AppError(AstralError::NotFound(format!(
-            "resource_type '{resource_type}'"
-        ))));
-    }
-    current_registry
-        .unregister_custom_resource(&resource_type)
-        .map_err(|error| {
-            tracing::error!(resource_type = %resource_type, %error, "persisted resource registry delete requires restart to reconcile");
-            AppError(AstralError::Internal(
-                "resource registry changed durably but runtime unregistration failed; restart required".into(),
-            ))
-        })?;
+    Err(resource_retirement_requires_published_revoke(
+        &resource_type,
+    ))
+}
 
-    tracing::warn!(resource_type = %resource_type, "resource type unregistered");
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "resource_type": resource_type,
-        "unregistered": true,
-    }))))
+/// Retiring a resource is unavailable until the canonical revoke, generation,
+/// and published-evidence barriers are proven. Keeping this guard before any
+/// repository or runtime-registry operation makes the endpoint fail closed.
+fn resource_retirement_requires_published_revoke(resource_type: &str) -> AppError {
+    AppError(AstralError::Validation(format!(
+        "{RESOURCE_RETIREMENT_REQUIRES_PUBLISHED_REVOKE}: resource type '{resource_type}' cannot be unregistered until canonical revoke, generation, and published evidence barriers are closed"
+    )))
 }
 
 /// GET /main/api/v1/resource-types/scan — 同步扫描所有 @RequirePermission 资源
@@ -292,4 +278,58 @@ async fn scan_resource_types_async(
         "resource type async scan is not implemented: Rust has no runtime annotation scanner"
             .into(),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        resource_retirement_requires_published_revoke,
+        RESOURCE_RETIREMENT_REQUIRES_PUBLISHED_REVOKE,
+    };
+    use astral_common::error::AppError;
+    use astral_types::{AstralError, CustomResourceRegistration, ResourceRegistry};
+
+    #[test]
+    fn unregister_guard_returns_stable_fail_closed_error_without_runtime_mutation() {
+        let resource_type = format!("contract_retirement_{}", std::process::id());
+        let registry = ResourceRegistry::global();
+        registry
+            .register_custom_resources([CustomResourceRegistration {
+                resource_type: resource_type.clone(),
+                actions: vec!["read".into()],
+            }])
+            .expect("contract resource must be registered for the test");
+        let before = registry.list_actions(&resource_type);
+
+        let error = resource_retirement_requires_published_revoke(&resource_type);
+        assert!(matches!(
+            error,
+            AppError(AstralError::Validation(message))
+                if message.starts_with(RESOURCE_RETIREMENT_REQUIRES_PUBLISHED_REVOKE)
+        ));
+        assert_eq!(
+            registry.list_actions(&resource_type),
+            before,
+            "fail-closed retirement must not mutate the runtime registry"
+        );
+    }
+
+    #[test]
+    fn unregister_handler_has_no_registry_side_effect_before_barriers_close() {
+        let production = include_str!("resource_types.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source must precede contract tests");
+        let handler = production
+            .split("async fn unregister_resource_type")
+            .nth(1)
+            .expect("resource unregister handler must exist")
+            .split("/// GET /main/api/v1/resource-types/scan")
+            .next()
+            .expect("resource unregister handler must end before scan handler");
+
+        assert!(handler.contains("resource_retirement_requires_published_revoke"));
+        assert!(!handler.contains("delete_registry"));
+        assert!(!handler.contains("unregister_custom_resource"));
+    }
 }

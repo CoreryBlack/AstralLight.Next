@@ -897,6 +897,103 @@ pub async fn mark_card_bind_item_running(
     Ok(Some(operation_item_scope(row)))
 }
 
+/// Complete one CARD_BIND child only after the caller has proven every source
+/// projection and invalidation receipt. The parent row is locked first, then the
+/// exact RUNNING child, so the child transition and parent counter increment are
+/// one tracker transaction with a stable lock order.
+pub async fn complete_card_bind_item(
+    pool: &MySqlPool,
+    task_id: &str,
+    card_id: i64,
+    operation_id: &str,
+    tenant_id: i64,
+    domain_id: i64,
+) -> Result<(), AstralError> {
+    validate_task_id(task_id)?;
+    if card_id <= 0
+        || tenant_id <= 0
+        || domain_id <= 0
+        || operation_id.trim().is_empty()
+        || operation_id.len() > 64
+    {
+        return Err(AstralError::Validation(
+            "card bind completion requires a verified item tuple".into(),
+        ));
+    }
+    let mut tx = pool.begin().await.map_err(database_error)?;
+    let parent: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT task_type, status, owner_instance_id FROM async_operation \
+         WHERE task_id = ? FOR UPDATE",
+    )
+    .bind(task_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    let Some((task_type, status, owner)) = parent else {
+        return Err(AstralError::Database(
+            "card bind parent disappeared before completion".into(),
+        ));
+    };
+    if task_type != BATCH_BIND_TASK_TYPE || status != "RUNNING" || owner != current_instance_id() {
+        return Err(AstralError::Database(
+            "card bind parent is not owned and RUNNING for completion".into(),
+        ));
+    }
+    let child: Option<String> = sqlx::query_scalar(
+        "SELECT operation_id FROM async_operation_item \
+         WHERE task_id = ? AND card_id = ? AND tenant_id = ? AND domain_id = ? \
+           AND status = 'RUNNING' FOR UPDATE",
+    )
+    .bind(task_id)
+    .bind(card_id)
+    .bind(tenant_id)
+    .bind(domain_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    if child.as_deref() != Some(operation_id) {
+        return Err(AstralError::Database(
+            "card bind child completion tuple or RUNNING state could not be proven".into(),
+        ));
+    }
+    let item = sqlx::query(
+        "UPDATE async_operation_item SET status = 'COMPLETED', error_message = NULL, \
+                updated_at = UNIX_TIMESTAMP() \
+         WHERE task_id = ? AND card_id = ? AND operation_id = ? \
+           AND tenant_id = ? AND domain_id = ? AND status = 'RUNNING'",
+    )
+    .bind(task_id)
+    .bind(card_id)
+    .bind(operation_id)
+    .bind(tenant_id)
+    .bind(domain_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    if item.rows_affected() != 1 {
+        return Err(AstralError::Database(
+            "card bind child completion could not be proven".into(),
+        ));
+    }
+    let parent_update = sqlx::query(
+        "UPDATE async_operation SET completed_items = completed_items + 1, \
+                updated_at = UNIX_TIMESTAMP() \
+         WHERE task_id = ? AND task_type = 'CARD_BIND' AND status = 'RUNNING' \
+           AND owner_instance_id = ?",
+    )
+    .bind(task_id)
+    .bind(current_instance_id())
+    .execute(&mut *tx)
+    .await
+    .map_err(database_error)?;
+    if parent_update.rows_affected() != 1 {
+        return Err(AstralError::Database(
+            "card bind parent completion counter could not be proven".into(),
+        ));
+    }
+    tx.commit().await.map_err(database_error)
+}
+
 pub async fn fail_card_bind_item(
     pool: &MySqlPool,
     task_id: &str,

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use astral_types::AstralError;
 
+use crate::repository::authorization_source_transaction::CommittedProjectionReceipts;
 use crate::repository::user_card_repository::{
     DeleteCascadeResult, NewUserCard, UserCardPatch, UserCardRecord, UserCardRepository,
 };
@@ -121,8 +122,8 @@ impl UserCardService {
         operation_id: &str,
         expected_tenant_id: i64,
         expected_domain_id: i64,
-    ) -> Result<(), AstralError> {
-        let bound = self
+    ) -> Result<CommittedProjectionReceipts, AstralError> {
+        let receipts = self
             .repo
             .bind_card_async_batch_item(
                 card_id,
@@ -136,12 +137,12 @@ impl UserCardService {
                 expected_tenant_id,
                 expected_domain_id,
             )
-            .await?;
-        if !bound {
-            return Err(AstralError::NotFound(format!(
-                "user card {card_id} is not in a bindable state (PENDING/INACTIVE)"
-            )));
-        }
-        Ok(())
+            .await?
+            .ok_or_else(|| {
+                AstralError::NotFound(format!(
+                    "user card {card_id} is not in a bindable state (PENDING/INACTIVE)"
+                ))
+            })?;
+        Ok(receipts)
     }
 }

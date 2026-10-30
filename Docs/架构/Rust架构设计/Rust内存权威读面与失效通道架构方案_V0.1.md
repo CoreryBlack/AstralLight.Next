@@ -3,6 +3,7 @@
 > 状态：P0–P5 主体已接线；2026-10-03 五链审查发现的源码缺口已修补并冻结，默认 workspace、显式 Redis 兼容、冻结 Chat/Learn 与离线工具的本地门禁已执行，结果及跳过项见第 10 节。真实基础设施、迁移、并发/崩溃及部署验收仍 BLOCKED，本文不构成整体 PASS 或部署/生产验收证明。
 > 更新日期：2026-10-03
 > 规范入口：[Rust 后端编码规范](../../规范/Rust后端编码规范_V1.0.md)。本文记录架构、实现边界和恢复语义，不覆盖仓库执行门禁。
+> CURRENT V6 证据边界：本文的显式 Redis compatibility、冻结 Chat/Learn、离线 harness 和历史验证结果均是比较/退役兼容材料，不是当前 Redis runtime、Chat/Learn production route、当前 gate 或真实集成 `PASS`。当前正式授权只消费 strict published evidence；进程本地 L1 仍须有 TTL、容量和 GC，失配或故障转为 strict DB read、`PENDING` 或 `DENY`。`UNKNOWN`/`PENDING` 及跨 aggregate completion 必须先完成完整 receipt/evidence reconciliation。
 
 ## 1. 目标与边界
 

@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use sqlx::MySqlPool;
 
 use crate::observability::{record_sync_publish, SyncPublishMetricOutcome};
-use crate::repository::authorization_source_transaction::CommittedProjectionReceipts;
+use crate::repository::authorization_source_transaction::{
+    CommittedProjectionReceipts, InvalidationReceipt, SourceProjectionReceipt,
+};
 
 /// Overall wall-clock budget for observing one complete source receipt batch.
 const PROJECTION_COMPLETION_WAIT_BUDGET: Duration = Duration::from_secs(5);
@@ -32,23 +34,29 @@ enum CompletionWaitOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone)]
+enum CompletionProbe {
+    Delta(astral_db::DeltaEventAppendRequest),
+    Source(SourceProjectionReceipt),
+    Invalidation(InvalidationReceipt),
+}
+
 /// Wait, within a fixed budget, for full durable completion proofs for every
-/// commit-proven receipt. Timeout and oversized batches are delegated intact to
-/// the worker. This function is deliberately observation-only.
+/// commit-proven receipt family. Timeout and oversized batches are delegated
+/// intact to the worker. This function is deliberately observation-only.
 pub(crate) async fn after_commit_wait_for_projection(
     pool: &MySqlPool,
     receipts: &CommittedProjectionReceipts,
-) {
+) -> bool {
     let started = Instant::now();
-    let count = receipts.requests.len();
+    let count = receipt_count(receipts);
     if count == 0 {
         record_sync_publish(SyncPublishMetricOutcome::SkippedEmpty, started.elapsed());
-        return;
+        return false;
     }
 
     let outcome =
-        wait_for_owned_completion(pool, &receipts.requests, PROJECTION_COMPLETION_WAIT_BUDGET)
-            .await;
+        wait_for_committed_completion(pool, receipts, PROJECTION_COMPLETION_WAIT_BUDGET).await;
     record_sync_publish(
         match outcome {
             CompletionWaitOutcome::Published => SyncPublishMetricOutcome::Published,
@@ -61,43 +69,242 @@ pub(crate) async fn after_commit_wait_for_projection(
     match outcome {
         CompletionWaitOutcome::Published => tracing::debug!(
             receipts = count,
-            "worker-owned projection completion proven for the entire source receipt batch"
+            "worker-owned completion proven for every source receipt family"
         ),
         CompletionWaitOutcome::Delegated => tracing::debug!(
             receipts = count,
-            "worker-owned projection completion remains delegated to the durable worker"
+            "worker-owned completion remains delegated to the durable workers"
         ),
         CompletionWaitOutcome::Failed => tracing::warn!(
             receipts = count,
-            "worker-owned completion proof read failed; durable worker retains ownership"
+            "worker-owned completion proof read failed; durable workers retain ownership"
         ),
     }
+    matches!(outcome, CompletionWaitOutcome::Published)
 }
 
-/// Bounded read-only waiter. `Some` is accepted only from astral-db's exact
-/// request-bound historical completion proof; no bus admission or ACK is proof.
-async fn wait_for_owned_completion(
+/// Wait for exact durable completion and fail closed when a non-empty batch is
+/// not proven within the bounded observation window. A proven source commit is
+/// never rolled back or replayed; callers receive `PENDING` while WorkerOwned
+/// processing remains the recovery path.
+pub(crate) async fn require_committed_receipts(
     pool: &MySqlPool,
-    requests: &[astral_db::DeltaEventAppendRequest],
+    receipts: &CommittedProjectionReceipts,
+) -> Result<(), astral_types::AstralError> {
+    if receipt_count(receipts) == 0 || after_commit_wait_for_projection(pool, receipts).await {
+        return Ok(());
+    }
+    Err(astral_types::AstralError::Pending(
+        "source committed; projection completion remains pending".into(),
+    ))
+}
+
+/// Public(crate) completion result for asynchronous mutation owners that must
+/// persist `IN_DOUBT` instead of claiming tracker completion.
+pub(crate) async fn wait_for_committed_receipts(
+    pool: &MySqlPool,
+    receipts: &CommittedProjectionReceipts,
+) -> bool {
+    if receipt_count(receipts) == 0 {
+        return false;
+    }
+    matches!(
+        wait_for_committed_completion(pool, receipts, PROJECTION_COMPLETION_WAIT_BUDGET).await,
+        CompletionWaitOutcome::Published
+    )
+}
+
+fn receipt_count(receipts: &CommittedProjectionReceipts) -> usize {
+    receipts.requests.len()
+        + receipts.source_projection_receipts.len()
+        + receipts.invalidation_receipts.len()
+}
+
+fn completion_probes(receipts: &CommittedProjectionReceipts) -> Vec<CompletionProbe> {
+    receipts
+        .requests
+        .iter()
+        .cloned()
+        .map(CompletionProbe::Delta)
+        .chain(
+            receipts
+                .source_projection_receipts
+                .iter()
+                .cloned()
+                .map(CompletionProbe::Source),
+        )
+        .chain(
+            receipts
+                .invalidation_receipts
+                .iter()
+                .cloned()
+                .map(CompletionProbe::Invalidation),
+        )
+        .collect()
+}
+
+fn affected_card_count(probes: &[CompletionProbe]) -> usize {
+    probes
+        .iter()
+        .filter_map(|probe| match probe {
+            CompletionProbe::Delta(request) => {
+                request.card_id.map(|card_id| (request.tenant_id, card_id))
+            }
+            CompletionProbe::Source(receipt)
+                if receipt.aggregate_type == astral_types::ProjectionAggregate::CARD
+                    || receipt.aggregate_type == astral_types::ProjectionAggregate::ELIGIBILITY =>
+            {
+                Some((receipt.tenant_id.unwrap_or_default(), receipt.aggregate_id))
+            }
+            CompletionProbe::Source(_) | CompletionProbe::Invalidation(_) => None,
+        })
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn invalidation_completion_identity(
+    receipt: &InvalidationReceipt,
+) -> Option<astral_db::LocalMessageCompletionIdentity<'_>> {
+    if receipt.event_id != receipt.envelope.message_id
+        || receipt.operation_id != receipt.envelope.operation_id
+    {
+        return None;
+    }
+    Some(astral_db::LocalMessageCompletionIdentity {
+        message_id: &receipt.event_id,
+        operation_id: &receipt.operation_id,
+        message_type: &receipt.envelope.message_type,
+        queue_name: astral_mq::invalidation::INVALIDATION_QUEUE,
+        payload_sha256: &receipt.envelope.payload_sha256,
+    })
+}
+
+/// Bounded read-only waiter. Every family is checked against its own exact
+/// durable identity; no ACK, bus admission, source head, or latest pointer is
+/// accepted as a substitute for the matching row's terminal proof.
+async fn wait_for_committed_completion(
+    pool: &MySqlPool,
+    receipts: &CommittedProjectionReceipts,
     budget: Duration,
 ) -> CompletionWaitOutcome {
-    wait_for_owned_completion_with(requests, budget, |request| async move {
-        match astral_db::load_owned_delta_completion(pool, &request).await {
-            Ok(proof) => Ok(proof.is_some()),
-            Err(error) => {
-                tracing::warn!(event_id = %request.event_id, error = %error,
-                    "exact projection completion proof unavailable; worker ownership unchanged");
-                Err(())
+    let probes = completion_probes(receipts);
+    if probes.is_empty() {
+        return CompletionWaitOutcome::Delegated;
+    }
+    if probes.len() > PROJECTION_COMPLETION_MAX_EVENTS {
+        return CompletionWaitOutcome::Delegated;
+    }
+    if affected_card_count(&probes) > PROJECTION_COMPLETION_MAX_CARDS {
+        return CompletionWaitOutcome::Delegated;
+    }
+
+    wait_for_completion_probes_with(&probes, budget, |probe| async move {
+        match probe {
+            CompletionProbe::Delta(request) => {
+                match astral_db::load_owned_delta_completion(pool, &request).await {
+                    Ok(proof) => Ok(proof.is_some()),
+                    Err(error) => {
+                        tracing::warn!(event_id = %request.event_id, error = %error,
+                            "exact projection completion proof unavailable; worker ownership unchanged");
+                        Err(())
+                    }
+                }
+            }
+            CompletionProbe::Source(receipt) => {
+                let identity = astral_db::SourceProjectionCompletionIdentity {
+                    event_id: &receipt.event_id,
+                    aggregate_type: &receipt.aggregate_type,
+                    aggregate_id: receipt.aggregate_id,
+                    tenant_id: receipt.tenant_id,
+                    source_generation: receipt.source_generation,
+                    revoke_fence: receipt.revoke_fence,
+                };
+                match astral_db::load_exact_processed_source_projection(pool, &identity).await {
+                    Ok(proven) => Ok(proven),
+                    Err(error) => {
+                        tracing::warn!(event_id = %receipt.event_id, error = %error,
+                            "exact source projection completion proof unavailable");
+                        Err(())
+                    }
+                }
+            }
+            CompletionProbe::Invalidation(receipt) => {
+                let Some(identity) = invalidation_completion_identity(&receipt) else {
+                    return Ok(false);
+                };
+                match astral_db::load_exact_processed_local_message(pool, &identity).await {
+                    Ok(proven) => Ok(proven),
+                    Err(error) => {
+                        tracing::warn!(event_id = %receipt.event_id, error = %error,
+                            "exact invalidation completion proof unavailable");
+                        Err(())
+                    }
+                }
             }
         }
     })
     .await
 }
 
+async fn wait_for_completion_probes_with<F, Fut>(
+    probes: &[CompletionProbe],
+    budget: Duration,
+    exact_completion: F,
+) -> CompletionWaitOutcome
+where
+    F: FnMut(CompletionProbe) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, ()>>,
+{
+    wait_for_family(
+        probes,
+        tokio::time::Instant::now() + budget,
+        exact_completion,
+    )
+    .await
+}
+async fn wait_for_family<T, F, Fut>(
+    receipts: &[T],
+    deadline: tokio::time::Instant,
+    mut exact_completion: F,
+) -> CompletionWaitOutcome
+where
+    T: Clone,
+    F: FnMut(T) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, ()>>,
+{
+    if receipts.is_empty() {
+        return CompletionWaitOutcome::Published;
+    }
+    let mut proven = vec![false; receipts.len()];
+    loop {
+        for (index, receipt) in receipts.iter().enumerate() {
+            if proven[index] {
+                continue;
+            }
+            match tokio::time::timeout_at(deadline, exact_completion(receipt.clone())).await {
+                Ok(Ok(true)) => proven[index] = true,
+                Ok(Ok(false)) => {}
+                Ok(Err(())) => return CompletionWaitOutcome::Failed,
+                Err(_) => return CompletionWaitOutcome::Delegated,
+            }
+        }
+        if proven.iter().all(|is_proven| *is_proven) {
+            return CompletionWaitOutcome::Published;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return CompletionWaitOutcome::Delegated;
+        }
+        tokio::time::sleep(OWNED_COMPLETION_POLL_INTERVAL.min(deadline - now)).await;
+    }
+}
+
+/// Compatibility wrapper used by the focused delta-only unit tests below.
+#[cfg(test)]
 async fn wait_for_owned_completion_with<F, Fut>(
     requests: &[astral_db::DeltaEventAppendRequest],
     budget: Duration,
-    mut exact_completion: F,
+    exact_completion: F,
 ) -> CompletionWaitOutcome
 where
     F: FnMut(astral_db::DeltaEventAppendRequest) -> Fut,
@@ -114,30 +321,12 @@ where
     if affected_cards > PROJECTION_COMPLETION_MAX_CARDS {
         return CompletionWaitOutcome::Delegated;
     }
-
-    let deadline = tokio::time::Instant::now() + budget;
-    let mut proven = vec![false; requests.len()];
-    loop {
-        for (index, request) in requests.iter().enumerate() {
-            if proven[index] {
-                continue;
-            }
-            match tokio::time::timeout_at(deadline, exact_completion(request.clone())).await {
-                Ok(Ok(true)) => proven[index] = true,
-                Ok(Ok(false)) => {}
-                Ok(Err(())) => return CompletionWaitOutcome::Failed,
-                Err(_) => return CompletionWaitOutcome::Delegated,
-            }
-        }
-        if proven.iter().all(|is_proven| *is_proven) {
-            return CompletionWaitOutcome::Published;
-        }
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return CompletionWaitOutcome::Delegated;
-        }
-        tokio::time::sleep(OWNED_COMPLETION_POLL_INTERVAL.min(deadline - now)).await;
-    }
+    wait_for_family(
+        requests,
+        tokio::time::Instant::now() + budget,
+        exact_completion,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -184,6 +373,112 @@ mod tests {
             completion_request("evt-a", 1),
             completion_request("evt-b", 2),
         ]
+    }
+
+    fn source_receipt(event_id: &str, aggregate_type: &str) -> SourceProjectionReceipt {
+        SourceProjectionReceipt {
+            event_id: event_id.to_owned(),
+            aggregate_type: aggregate_type.to_owned(),
+            aggregate_id: CARD_A,
+            tenant_id: Some(TENANT),
+            source_generation: 2,
+            revoke_fence: 0,
+        }
+    }
+
+    fn invalidation_receipt(event_id: &str, operation_id: &str) -> InvalidationReceipt {
+        let envelope = astral_mq::envelope::MessageEnvelope::new(
+            event_id,
+            operation_id,
+            astral_mq::invalidation::ELIGIBILITY_INVALIDATED,
+            1,
+            "city-a",
+            serde_json::json!({"cardId": CARD_A}),
+        )
+        .expect("valid invalidation envelope");
+        InvalidationReceipt {
+            event_id: event_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            envelope,
+        }
+    }
+
+    fn complete_receipt_batch() -> CommittedProjectionReceipts {
+        CommittedProjectionReceipts {
+            requests: same_operation_requests(),
+            source_projection_receipts: vec![source_receipt(
+                "source-card",
+                astral_types::ProjectionAggregate::CARD,
+            )],
+            invalidation_receipts: vec![invalidation_receipt("invalidate-1", "op-shared")],
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_multi_receipt_batch_proves_every_family() {
+        let receipts = complete_receipt_batch();
+        let probes = completion_probes(&receipts);
+        let outcome = wait_for_completion_probes_with(&probes, Duration::from_secs(1), |_| {
+            std::future::ready(Ok(true))
+        })
+        .await;
+        assert_eq!(outcome, CompletionWaitOutcome::Published);
+        assert_eq!(receipt_count(&receipts), 4);
+    }
+
+    #[tokio::test]
+    async fn missing_invalidation_delegates_without_publishing() {
+        let receipts = complete_receipt_batch();
+        let probes = completion_probes(&receipts);
+        let outcome =
+            wait_for_completion_probes_with(&probes, Duration::from_millis(20), |probe| {
+                std::future::ready(match probe {
+                    CompletionProbe::Invalidation(_) => Ok(false),
+                    _ => Ok(true),
+                })
+            })
+            .await;
+        assert_eq!(outcome, CompletionWaitOutcome::Delegated);
+    }
+
+    #[tokio::test]
+    async fn mismatched_or_pending_invalidation_never_publishes() {
+        let mut receipts = complete_receipt_batch();
+        receipts.invalidation_receipts[0].event_id = "wrong-event".to_owned();
+        assert!(invalidation_completion_identity(&receipts.invalidation_receipts[0]).is_none());
+
+        let probes = completion_probes(&receipts);
+        let mismatch =
+            wait_for_completion_probes_with(&probes, Duration::from_millis(20), |probe| {
+                std::future::ready(match probe {
+                    CompletionProbe::Invalidation(receipt) => {
+                        Ok(invalidation_completion_identity(&receipt).is_some())
+                    }
+                    _ => Ok(true),
+                })
+            })
+            .await;
+        assert_eq!(mismatch, CompletionWaitOutcome::Delegated);
+
+        receipts.invalidation_receipts[0] = invalidation_receipt("invalidate-1", "op-shared");
+        let probes = completion_probes(&receipts);
+        let pending =
+            wait_for_completion_probes_with(&probes, Duration::from_millis(20), |probe| {
+                std::future::ready(match probe {
+                    CompletionProbe::Invalidation(_) => Ok(false),
+                    _ => Ok(true),
+                })
+            })
+            .await;
+        assert_eq!(pending, CompletionWaitOutcome::Delegated);
+    }
+
+    #[tokio::test]
+    async fn empty_committed_receipts_are_not_completion() {
+        let receipts = CommittedProjectionReceipts::default();
+        let pool = sqlx::MySqlPool::connect_lazy("mysql://invalid").expect("lazy pool");
+        assert!(!wait_for_committed_receipts(&pool, &receipts).await);
+        assert_eq!(receipt_count(&receipts), 0);
     }
 
     #[tokio::test]

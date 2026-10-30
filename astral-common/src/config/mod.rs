@@ -320,10 +320,6 @@ fn default_public_paths() -> Vec<String> {
         "/api/v1/auth/password/reset/*".into(),
         "/api/v1/auth/verification/send".into(),
         "/api/v1/auth/verification/verify".into(),
-        "/api/health".into(),
-        "/api/health/metrics".into(),
-        "/api/health/**".into(),
-        "/actuator/health".into(),
     ]
 }
 
@@ -792,7 +788,7 @@ impl AppConfig {
         // 远程部署目录没有 application.yml 时由该契约提供全部启动字段。
         apply_flat_env_overrides(&mut cfg)?;
         // An explicit YAML list must not accidentally remove the mandatory
-        // Java-compatible login, refresh, verification, and health routes.
+        // Java-compatible login, refresh, and verification routes.
         ensure_required_public_paths(&mut cfg.public_paths);
         cfg.validate_secrets_for(role)
             .map_err(ConfigValidationError::into_config_error)?;
@@ -1368,12 +1364,20 @@ mod tests {
 
     #[test]
     fn v2_public_path_contract_contains_sessions_only() {
-        assert!(default_public_paths()
-            .iter()
-            .any(|path| path == "/api/v1/auth/sessions"));
-        assert!(!default_public_paths()
-            .iter()
-            .any(|path| path == "/api/v1/auth/refresh"));
+        let paths = default_public_paths();
+        assert!(paths.iter().any(|path| path == "/api/v1/auth/sessions"));
+        assert!(!paths.iter().any(|path| path == "/api/v1/auth/refresh"));
+        for health_path in [
+            "/api/health",
+            "/api/health/metrics",
+            "/api/health/**",
+            "/actuator/health",
+        ] {
+            assert!(
+                !paths.iter().any(|path| path == health_path),
+                "service-direct health route must not be a Gateway public path: {health_path}"
+            );
+        }
     }
 
     #[test]
@@ -1386,11 +1390,10 @@ mod tests {
             .any(|path| path == "/api/v1/auth/password/reset/*"));
     }
     #[test]
-    fn loaded_public_paths_keep_v2_login_and_health_routes() {
+    fn loaded_public_paths_keep_v2_login_routes() {
         let mut paths = vec!["/custom".to_string()];
         ensure_required_public_paths(&mut paths);
         assert!(paths.iter().any(|path| path == "/api/v1/auth/sessions"));
-        assert!(paths.iter().any(|path| path == "/api/health/**"));
         assert!(paths.iter().any(|path| path == "/custom"));
     }
 

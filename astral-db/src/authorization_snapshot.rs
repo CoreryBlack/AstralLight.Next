@@ -10,8 +10,8 @@
 //!   card reader: deterministic SQL-bounded pointer enumeration, then each
 //!   aggregate's full manifest chain under
 //!   [`read_published_authorization_state_in_tx`]), verifies every
-//!   aggregate state strictly, and returns only after the commit proved the
-//!   read. It never writes a source row.
+//!   aggregate state strictly (including its current-edition seal), and returns
+//!   only after the commit proved the read. It never writes a source row.
 //! - [`save_projection_snapshot`] frames the captured typed document through
 //!   the frozen [`crate::local_projection_snapshot`] container (canonical JSON
 //!   envelope, magic + schema version + SHA-256 trailer, 256 MiB bound,
@@ -19,12 +19,11 @@
 //!   ONLY — it is never treated as evidence.
 //! - [`load_projection_snapshot_hint`] reads such a file, re-derives every
 //!   state through [`validate_published_state_snapshot`] (full payload
-//!   re-encoding + the ONE assembly contract), re-reads the SQL-bounded
-//!   durable pointer token set and all pending delta rows from the database,
-//!   and returns a conservative [`ProjectionSnapshotHint`]: only aggregates
-//!   whose exact durable pointer token still matches are offered via
-//!   [`ProjectionSnapshotHint::states`]; every divergence is reported, never
-//!   silently dropped or forgiven.
+//!   re-encoding + the ONE assembly contract), then in the same bounded,
+//!   pointer-first durable read transaction re-reads every complete published
+//!   state and pending delta row. Only an exact token (pointer + publication
+//!   seal + manifest digest) is offered via [`ProjectionSnapshotHint::states`];
+//!   every divergence is reported, never silently dropped or forgiven.
 //!
 //! The hint is a WARM HINT, not an authorization fact and not a freshness
 //! proof. Structural validation (this module) proves "these bytes are one
@@ -45,16 +44,17 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use astral_types::PublicationStamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::authorization_projection_repository::{
     assemble_verified_published_state, decode_segment_payload, encode_segment_payload,
-    lock_all_current_pointer_records_in_tx_bounded, read_all_current_pointer_records_in_tx_bounded,
-    read_published_authorization_state_in_tx, verify_segment_local_seal,
-    AuthorizationCurrentPointerRecord, AuthorizationProjectionError, AuthorizationPublishedState,
-    ManifestRawSqlRow, ProjectionAggregateIdentity, SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1,
+    lock_all_current_pointer_records_in_tx_bounded, read_published_authorization_state_in_tx,
+    verify_segment_local_seal, AuthorizationCurrentPointerRecord, AuthorizationProjectionError,
+    AuthorizationPublishedState, ManifestRawSqlRow, ProjectionAggregateIdentity,
+    SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON,
 };
 use crate::grant_repository::Sha256Digest;
 use crate::local_projection_snapshot::{
@@ -66,9 +66,11 @@ use crate::local_projection_snapshot::{
 // Bounds and format version
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Payload schema version of [`ProjectionSnapshotDocument`]; readers refuse
-/// any other version instead of guessing forward compatibility.
-pub const SNAPSHOT_PAYLOAD_VERSION_V1: u32 = 1;
+/// Retired payload version retained as a public identifier for rejection diagnostics.
+/// Runtime readers and writers use [`SNAPSHOT_PAYLOAD_VERSION`] exclusively.
+pub const SNAPSHOT_PAYLOAD_VERSION_V2: u32 = 2;
+/// Current payload schema version, shared with the authorization edition.
+pub const SNAPSHOT_PAYLOAD_VERSION: u32 = astral_types::AUTHORIZATION_EDITION as u32;
 
 /// Hard cap on the number of published states one capture may carry
 /// (`authorization_projection_current` rows). A larger durable scope fails
@@ -199,7 +201,7 @@ pub fn authorization_aggregate_key(identity: &ProjectionAggregateIdentity) -> St
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectionSnapshotDocument {
-    /// Must equal [`SNAPSHOT_PAYLOAD_VERSION_V1`].
+    /// Must equal [`SNAPSHOT_PAYLOAD_VERSION`].
     pub snapshot_version: u32,
     /// Verified published states, in capture order (durable pointer order).
     pub states: Vec<AuthorizationPublishedState>,
@@ -221,7 +223,7 @@ pub fn decode_projection_snapshot_payload(
                 "code=authorization_snapshot.payload_unparsable;detail={error}"
             ))
         })?;
-    if document.snapshot_version != SNAPSHOT_PAYLOAD_VERSION_V1 {
+    if document.snapshot_version != SNAPSHOT_PAYLOAD_VERSION {
         return Err(ProjectionSnapshotError::Invalid(format!(
             "code=authorization_snapshot.unsupported_payload_version;found={}",
             document.snapshot_version
@@ -254,7 +256,7 @@ pub fn decode_projection_snapshot_payload(
 ///    and the snapshot must agree on `row_count`, `byte_size`, the SHA-256
 ///    `content_digest` over those exact bytes, a canonical
 ///    decode→re-serialize round trip, the pinned
-///    [`SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1`] format and the
+///    [`SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON`] format and the
 ///    segment-local semantic/dependency seals
 ///    ([`verify_segment_local_seal`]).
 /// 2. **The one assembly contract** — the manifest row is rebuilt from the
@@ -277,8 +279,13 @@ pub fn validate_published_state_snapshot(
             "code=authorization_snapshot.invalid_state_identity;detail={error}"
         ))
     })?;
+    state.publication_stamp().map_err(|error| {
+        ProjectionSnapshotError::Invalid(format!(
+            "code=authorization_snapshot.invalid_publication_stamp;detail={error}"
+        ))
+    })?;
     for segment in &state.segments {
-        if segment.format != SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1 {
+        if segment.format != SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON {
             return Err(ProjectionSnapshotError::Invalid(format!(
                 "code=authorization_snapshot.unknown_segment_format;segment={};value={}",
                 segment.segment_id, segment.format
@@ -432,10 +439,7 @@ pub async fn capture_projection_snapshot(
     let mut aggregates = BTreeMap::new();
     for state in &states {
         let key = authorization_aggregate_key(&state.pointer.identity);
-        if aggregates
-            .insert(key, state.pointer.current_generation)
-            .is_some()
-        {
+        if aggregates.insert(key, state.publication_stamp()?).is_some() {
             return Err(ProjectionSnapshotError::Invalid(
                 "code=authorization_snapshot.capture_duplicate_aggregate".to_owned(),
             ));
@@ -450,7 +454,7 @@ pub async fn capture_projection_snapshot(
     Ok(ProjectionSnapshotCapture {
         created_at: OffsetDateTime::now_utc(),
         document: ProjectionSnapshotDocument {
-            snapshot_version: SNAPSHOT_PAYLOAD_VERSION_V1,
+            snapshot_version: SNAPSHOT_PAYLOAD_VERSION,
             states,
         },
         source_frontier,
@@ -597,7 +601,7 @@ async fn read_pending_delta_snapshots_in_tx(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Hint classification (exact durable pointer tokens, never generation-only)
+// Hint classification (complete durable publication tokens, never generation-only)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Why one aggregate's snapshot state may not seed the warm mirror.
@@ -615,10 +619,9 @@ pub enum SnapshotHintDivergenceKind {
     /// The durable generation moved past the snapshot generation; the state
     /// is stale.
     SnapshotBehindDurable,
-    /// Same generation, but the exact durable pointer token disagrees on at
-    /// least one field (manifest id, event/operation ids, semantic or
-    /// dependency hash, compiler stamp, fence, fence proof, CAS version,
-    /// pointer id, card scope). Only full token equality may warm.
+    /// Same generation, but the exact durable token disagrees on at least one
+    /// pointer field, publication seal, or manifest digest. Only full token
+    /// equality may warm.
     TokenMismatch,
 }
 
@@ -629,10 +632,32 @@ pub struct SnapshotAggregateDivergence {
     pub kind: SnapshotHintDivergenceKind,
 }
 
+/// Exact publication evidence compared during snapshot recovery.
+///
+/// Pointer provenance alone does not bind the wall-clock publication seal or
+/// the manifest's current-edition digest. Keep this token private so snapshots can only
+/// gain it after the strict durable reader has verified the manifest chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublishedStateToken {
+    pointer: AuthorizationCurrentPointerRecord,
+    stamp: PublicationStamp,
+}
+
+impl TryFrom<&AuthorizationPublishedState> for PublishedStateToken {
+    type Error = ProjectionSnapshotError;
+
+    fn try_from(state: &AuthorizationPublishedState) -> Result<Self, Self::Error> {
+        Ok(Self {
+            pointer: state.pointer.clone(),
+            stamp: state.publication_stamp()?,
+        })
+    }
+}
+
 /// Conservative warm hint produced by [`load_projection_snapshot_hint`].
 ///
-/// `states` contains ONLY aggregates whose exact durable pointer token
-/// matched the file state at load time; every other aggregate is listed in
+/// `states` contains ONLY aggregates whose complete durable publication token
+/// (pointer + seal + manifest digest) matched the file state at load time; every other aggregate is listed in
 /// `divergences` (deterministic key order). This is a warm-up input for the
 /// Warming state only — it never substitutes the mandatory
 /// `warm_from_durable` second strict load, and nothing here is a freshness
@@ -652,14 +677,14 @@ impl ProjectionSnapshotHint {
         self.created_at
     }
 
-    /// The file's per-aggregate generation frontier (already cross-checked
-    /// against the carried states during classification).
+    /// The file's per-aggregate complete publication-stamp frontier (already
+    /// cross-checked against the carried states during classification).
     pub fn source_frontier(&self) -> &SnapshotFrontier {
         &self.source_frontier
     }
 
-    /// Fully validated states whose exact durable pointer token matched at
-    /// load time. Safe to install ONLY into a warming (non-serviceable)
+    /// Fully validated states whose exact durable publication token matched
+    /// at load time. Safe to install ONLY into a warming (non-serviceable)
     /// mirror state; `warm_from_durable` remains mandatory afterwards.
     pub fn states(&self) -> &[AuthorizationPublishedState] {
         &self.states
@@ -705,10 +730,10 @@ pub fn check_projection_snapshot_freshness(
 /// scope consistency proof (duplicate aggregates, frontier/state split in any
 /// direction — missing, extra or generation-disagreeing entries) and the
 /// exact-token durable comparison, then hands back the conservative hint.
-pub(crate) fn classify_projection_snapshot_hint(
+fn classify_projection_snapshot_hint(
     document: ProjectionSnapshotDocument,
     source_frontier: SnapshotFrontier,
-    durable_pointers: BTreeMap<String, AuthorizationCurrentPointerRecord>,
+    durable_tokens: BTreeMap<String, PublishedStateToken>,
     pending_deltas: Vec<PendingDeltaSnapshot>,
     created_at: OffsetDateTime,
     now: OffsetDateTime,
@@ -735,15 +760,15 @@ pub(crate) fn classify_projection_snapshot_hint(
         )));
     }
     for (key, state) in &state_by_key {
-        let frontier_generation = source_frontier.aggregates.get(key).ok_or_else(|| {
+        let frontier_stamp = source_frontier.stamp_for(key).ok_or_else(|| {
             ProjectionSnapshotError::Invalid(format!(
                 "code=authorization_snapshot.frontier_missing_state_scope;aggregate_key={key}"
             ))
         })?;
-        if *frontier_generation != state.pointer.current_generation {
+        let state_stamp = state.publication_stamp()?;
+        if frontier_stamp != &state_stamp {
             return Err(ProjectionSnapshotError::Invalid(format!(
-                "code=authorization_snapshot.frontier_generation_split;aggregate_key={key};frontier={frontier_generation};state={}",
-                state.pointer.current_generation
+                "code=authorization_snapshot.frontier_publication_stamp_split;aggregate_key={key}"
             )));
         }
     }
@@ -753,16 +778,17 @@ pub(crate) fn classify_projection_snapshot_hint(
     let mut states = Vec::new();
     let mut divergences = Vec::new();
     for (key, state) in &state_by_key {
-        match durable_pointers.get(key) {
+        match durable_tokens.get(key) {
             None => divergences.push(SnapshotAggregateDivergence {
                 aggregate_key: key.clone(),
                 kind: SnapshotHintDivergenceKind::MissingFromDurable,
             }),
             Some(durable) => {
-                if *durable == state.pointer {
+                if *durable == PublishedStateToken::try_from(*state)? {
                     states.push((*state).clone());
                 } else {
                     let kind = match durable
+                        .pointer
                         .current_generation
                         .cmp(&state.pointer.current_generation)
                     {
@@ -782,7 +808,7 @@ pub(crate) fn classify_projection_snapshot_hint(
             }
         }
     }
-    for key in durable_pointers.keys() {
+    for key in durable_tokens.keys() {
         if !state_by_key.contains_key(key) {
             divergences.push(SnapshotAggregateDivergence {
                 aggregate_key: key.clone(),
@@ -812,18 +838,15 @@ pub(crate) fn classify_projection_snapshot_hint(
 /// Pipeline: bounded framed read ([`read_local_snapshot`]) → age gate →
 /// typed payload decode with FULL structural re-validation per state
 /// ([`decode_projection_snapshot_payload`]) → one short database transaction
-/// reading the durable pointer token set (non-locking, deterministic order,
-/// SQL-bounded at [`MAX_CAPTURE_PUBLISHED_STATES`] + 1 rows — an over-cap
-/// durable scope fails closed because it can never be classified as a whole)
-/// and ALL pending delta rows (bounded) → pure exact-token classification
+/// taking bounded current-pointer locks in deterministic order and re-reading
+/// each complete manifest chain through [`read_published_authorization_state_in_tx`],
+/// followed by all pending delta rows (bounded) → pure exact-token classification
 /// (`classify_projection_snapshot_hint`).
 ///
 /// Generation alone is never accepted as the durable comparison: the token
-/// covers pointer id, identity, card scope, generation, manifest id,
-/// event/operation ids, semantic/dependency hashes, compiler stamp, revoke
-/// fence, fence proof and CAS version. A file in any error state yields an
-/// error (treat as absent); a diverging aggregate yields a divergence report,
-/// never a silently stale state.
+/// includes the complete pointer, publication seal, and manifest digest. A
+/// file in any error state yields an error (treat as absent); a diverging
+/// aggregate yields a divergence report, never a silently stale state.
 pub async fn load_projection_snapshot_hint(
     path: &Path,
     pool: &sqlx::MySqlPool,
@@ -836,23 +859,40 @@ pub async fn load_projection_snapshot_hint(
     // Same SQL-level cap as capture: a durable scope beyond one capture's
     // hard cap cannot be compared as a whole and must win nothing — the
     // durable warm path rebuilds instead of a partially comparable hint.
-    let pointers = read_all_current_pointer_records_in_tx_bounded(
+    let pointers = lock_all_current_pointer_records_in_tx_bounded(
         &mut tx,
         pointer_scan_bind_limit(MAX_CAPTURE_PUBLISHED_STATES),
     )
     .await?;
     enforce_hint_durable_pointer_capacity(pointers.len())?;
+    // Reuse the strict public-evidence validator inside this same transaction:
+    // the token is only minted from a committed, fully re-read manifest chain,
+    // not from pointer equality or a separate transaction's observation.
+    let mut durable_tokens = BTreeMap::new();
+    for pointer in pointers {
+        let state = read_published_authorization_state_in_tx(&mut tx, &pointer.identity).await?;
+        if state.pointer != pointer {
+            return Err(ProjectionSnapshotError::Invalid(
+                "code=authorization_snapshot.durable_pointer_moved_under_read".to_owned(),
+            ));
+        }
+        let key = authorization_aggregate_key(&pointer.identity);
+        if durable_tokens
+            .insert(key, PublishedStateToken::try_from(&state)?)
+            .is_some()
+        {
+            return Err(ProjectionSnapshotError::Invalid(
+                "code=authorization_snapshot.duplicate_durable_aggregate".to_owned(),
+            ));
+        }
+    }
     let pending_deltas = read_pending_delta_snapshots_in_tx(&mut tx).await?;
     tx.commit().await?;
 
-    let durable_pointers: BTreeMap<String, AuthorizationCurrentPointerRecord> = pointers
-        .into_iter()
-        .map(|pointer| (authorization_aggregate_key(&pointer.identity), pointer))
-        .collect();
     classify_projection_snapshot_hint(
         document,
         envelope.source_frontier,
-        durable_pointers,
+        durable_tokens,
         pending_deltas,
         envelope.created_at,
         now,
@@ -870,19 +910,18 @@ mod tests {
         compute_manifest_digest, compute_segment_dependency_hash, compute_segment_semantic_hash,
         AuthorizationSegmentReferenceRecord, AuthorizationSegmentSnapshot, ManifestDigestInput,
         PublishedCardStateBundle, SegmentLocalSealInput, POINTER_ROWS_ALL_LOCKED_BOUNDED_TAIL,
-        POINTER_ROWS_ALL_ORDERED_BOUNDED_TAIL,
     };
     use crate::local_projection_snapshot::write_local_snapshot_atomic;
     use astral_types::{
         BindingLayer, CanonicalGrant, DomainScopeRequirement, GrantEffect, GrantId,
-        GrantProvenance, GrantRevision, GrantSourceKind, GrantState, PublishedCardEvidenceScope,
-        TenantScope, ValidityWindow,
+        GrantProvenance, GrantRevision, GrantSourceKind, GrantState, PublicationSeal,
+        PublishedCardEvidenceScope, TenantScope, ValidityWindow,
     };
     use std::fs;
 
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const FIXTURE_COMPILER: &str = "phase2-authorization-kernel-v1";
+    const FIXTURE_COMPILER: &str = astral_types::AUTHORIZATION_COMPILER_VERSION;
     const FIXTURE_EVENT_ID: &str = "event-snap";
     const FIXTURE_OPERATION_ID: &str = "op-snap";
 
@@ -929,7 +968,7 @@ mod tests {
             identity: &identity,
             card_id: Some(card_id),
             compiler_version: FIXTURE_COMPILER,
-            segment_format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1,
+            segment_format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON,
             row_count: grant_count,
             content_digest: &content_digest,
         };
@@ -941,7 +980,7 @@ mod tests {
             semantic_hash: compute_segment_semantic_hash(&seal_input).unwrap(),
             dependency_hash: compute_segment_dependency_hash(&seal_input).unwrap(),
             compiler_version: FIXTURE_COMPILER.to_owned(),
-            format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON_V1.to_owned(),
+            format: SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON.to_owned(),
             row_count: grant_count,
             byte_size: payload.len() as u64,
             grants,
@@ -958,6 +997,7 @@ mod tests {
             event_id: FIXTURE_EVENT_ID.to_owned(),
             operation_id: FIXTURE_OPERATION_ID.to_owned(),
         };
+        let seal = PublicationSeal::from_unix_seconds(1_700_000_000).unwrap();
         let manifest_digest = compute_manifest_digest(&ManifestDigestInput {
             tenant_id: 7,
             aggregate_type: "USER_CARD",
@@ -973,6 +1013,7 @@ mod tests {
             compiler_version: FIXTURE_COMPILER,
             parent_manifest_id: None,
             revoke_fence: 1,
+            seal,
             segment_content_digests_hex: vec![content_digest.as_hex()],
         })
         .unwrap();
@@ -992,6 +1033,7 @@ mod tests {
             cas_version: 4,
         };
         AuthorizationPublishedState {
+            seal,
             pointer,
             manifest_id: 700 + aggregate_id,
             generation,
@@ -1011,9 +1053,39 @@ mod tests {
         }
     }
 
+    fn rebind_fixture_manifest_seal(
+        state: &mut AuthorizationPublishedState,
+        seal: PublicationSeal,
+    ) {
+        state.seal = seal;
+        state.manifest_digest = compute_manifest_digest(&ManifestDigestInput {
+            tenant_id: state.pointer.identity.tenant_id,
+            aggregate_type: &state.pointer.identity.aggregate_type,
+            aggregate_id: state.pointer.identity.aggregate_id,
+            card_id: state.pointer.card_id,
+            generation: state.generation,
+            source_generation: state.source_generation,
+            projected_generation: state.projected_generation,
+            event_id: &state.event_id,
+            operation_id: &state.operation_id,
+            semantic_hash_hex: &state.semantic_hash.as_hex(),
+            dependency_hash_hex: &state.dependency_hash.as_hex(),
+            compiler_version: &state.compiler_version,
+            parent_manifest_id: state.parent_manifest_id,
+            revoke_fence: state.revoke_fence,
+            seal,
+            segment_content_digests_hex: state
+                .segments
+                .iter()
+                .map(|segment| segment.content_digest.as_hex())
+                .collect(),
+        })
+        .unwrap();
+    }
+
     fn fixture_document(states: Vec<AuthorizationPublishedState>) -> ProjectionSnapshotDocument {
         ProjectionSnapshotDocument {
-            snapshot_version: SNAPSHOT_PAYLOAD_VERSION_V1,
+            snapshot_version: SNAPSHOT_PAYLOAD_VERSION,
             states,
         }
     }
@@ -1025,7 +1097,9 @@ mod tests {
                 .map(|state| {
                     (
                         authorization_aggregate_key(&state.pointer.identity),
-                        state.pointer.current_generation,
+                        state
+                            .publication_stamp()
+                            .expect("fixture publication stamp"),
                     )
                 })
                 .collect(),
@@ -1034,13 +1108,13 @@ mod tests {
 
     fn durable_from(
         states: &[AuthorizationPublishedState],
-    ) -> BTreeMap<String, AuthorizationCurrentPointerRecord> {
+    ) -> BTreeMap<String, PublishedStateToken> {
         states
             .iter()
             .map(|state| {
                 (
                     authorization_aggregate_key(&state.pointer.identity),
-                    state.pointer.clone(),
+                    PublishedStateToken::try_from(state).expect("fixture publication token"),
                 )
             })
             .collect()
@@ -1115,6 +1189,24 @@ mod tests {
         state.manifest_digest = Sha256Digest::from_hex(HASH_B).unwrap();
         assert!(validate_published_state_snapshot(&state).is_err());
 
+        // The timestamp is part of the v3 manifest digest: changing only the
+        // seal must invalidate the stored commitment.
+        let mut state = verified_state_fixture(1, 17);
+        state.seal = PublicationSeal::from_unix_seconds(1_700_000_001).unwrap();
+        assert!(validate_published_state_snapshot(&state).is_err());
+
+        // Recomputing against a different persisted time is still valid in
+        // isolation; the durable comparison must distinguish the new seal.
+        let content_digest = state.segments[0].content_digest;
+        let original_manifest_digest = state.manifest_digest;
+        rebind_fixture_manifest_seal(
+            &mut state,
+            PublicationSeal::from_unix_seconds(1_700_000_001).unwrap(),
+        );
+        validate_published_state_snapshot(&state).unwrap();
+        assert_ne!(state.manifest_digest, original_manifest_digest);
+        assert_eq!(state.segments[0].content_digest, content_digest);
+
         // Reference ordinal / pairing drift.
         let mut state = verified_state_fixture(1, 17);
         state.references[0].ordinal = 4;
@@ -1138,7 +1230,7 @@ mod tests {
     // ── Payload decode (serde is not a trust boundary) ──────────────────────
 
     #[test]
-    fn payload_decode_rejects_unknown_fields_wrong_versions_and_tampered_states() {
+    fn payload_decode_rejects_unknown_fields_wrong_versions_missing_seal_and_tampered_states() {
         let state = verified_state_fixture(1, 17);
         let document = fixture_document(vec![state.clone()]);
         let payload = serde_json::to_value(&document).unwrap();
@@ -1153,13 +1245,28 @@ mod tests {
             .insert("extra".to_owned(), serde_json::json!(1));
         assert!(decode_projection_snapshot_payload(&extra).is_err());
 
-        // Wrong payload version.
-        let mut versioned = payload.clone();
-        versioned
+        // Retired payload versions are never implicitly upgraded.
+        for retired_version in
+            (0..SNAPSHOT_PAYLOAD_VERSION).chain(std::iter::once(SNAPSHOT_PAYLOAD_VERSION + 1))
+        {
+            let mut legacy = payload.clone();
+            legacy.as_object_mut().unwrap().insert(
+                "snapshot_version".to_owned(),
+                serde_json::json!(retired_version),
+            );
+            assert!(
+                decode_projection_snapshot_payload(&legacy).is_err(),
+                "retired payload version {retired_version} must be rejected"
+            );
+        }
+
+        // A current-edition payload without its publication seal is not trusted.
+        let mut missing_seal = payload.clone();
+        missing_seal["states"][0]
             .as_object_mut()
             .unwrap()
-            .insert("snapshot_version".to_owned(), serde_json::json!(2));
-        assert!(decode_projection_snapshot_payload(&versioned).is_err());
+            .remove("seal");
+        assert!(decode_projection_snapshot_payload(&missing_seal).is_err());
 
         // A tampered state (payload lie) inside a well-framed envelope is
         // refused: the frame digest never substitutes for the contract.
@@ -1206,7 +1313,16 @@ mod tests {
 
         // Extra frontier scope: a cross-scope key with no backing state.
         let extra_frontier = SnapshotFrontier {
-            aggregates: BTreeMap::from([(key.clone(), 1), ("9:RULE_SET:88".to_owned(), 2)]),
+            aggregates: BTreeMap::from([
+                (
+                    key.clone(),
+                    state.publication_stamp().expect("fixture stamp"),
+                ),
+                (
+                    "9:RULE_SET:88".to_owned(),
+                    PublicationStamp::new(2, "a".repeat(64), state.seal).unwrap(),
+                ),
+            ]),
         };
         assert!(classify_projection_snapshot_hint(
             fixture_document(vec![state.clone()]),
@@ -1218,9 +1334,28 @@ mod tests {
         )
         .is_err());
 
+        let wrong_stamp_frontier = SnapshotFrontier {
+            aggregates: BTreeMap::from([(
+                key.clone(),
+                PublicationStamp::new(state.generation, "b".repeat(64), state.seal).unwrap(),
+            )]),
+        };
+        assert!(classify_projection_snapshot_hint(
+            fixture_document(vec![state.clone()]),
+            wrong_stamp_frontier,
+            durable_from(std::slice::from_ref(&state)),
+            Vec::new(),
+            now,
+            now,
+        )
+        .is_err());
+
         // Frontier generation disagreeing with the state it names.
         let wrong_generation_frontier = SnapshotFrontier {
-            aggregates: BTreeMap::from([(key, 2)]),
+            aggregates: BTreeMap::from([(
+                key,
+                PublicationStamp::new(2, state.manifest_digest.as_hex(), state.seal).unwrap(),
+            )]),
         };
         assert!(classify_projection_snapshot_hint(
             fixture_document(vec![state.clone()]),
@@ -1248,6 +1383,7 @@ mod tests {
         durable
             .get_mut(&authorization_aggregate_key(&stale.pointer.identity))
             .unwrap()
+            .pointer
             .current_generation = 3;
         let hint = classify_projection_snapshot_hint(
             document.clone(),
@@ -1265,16 +1401,43 @@ mod tests {
             SnapshotHintDivergenceKind::SnapshotBehindDurable
         );
 
-        // Same generation but a moved durable token field: never warm.
+        // Same generation but a moved durable pointer field: never warm.
         let mut durable = durable_from(&[matching.clone(), stale.clone()]);
         durable
             .get_mut(&authorization_aggregate_key(&stale.pointer.identity))
             .unwrap()
+            .pointer
             .cas_version += 1;
         let hint = classify_projection_snapshot_hint(
             document.clone(),
             frontier.clone(),
             durable,
+            Vec::new(),
+            now,
+            now,
+        )
+        .unwrap();
+        assert_eq!(hint.states(), std::slice::from_ref(&matching));
+        assert_eq!(
+            hint.divergences()[0].kind,
+            SnapshotHintDivergenceKind::TokenMismatch
+        );
+
+        // A self-consistent re-sealed snapshot is still refused when its
+        // durable publication token (same pointer, original seal and digest)
+        // does not match.
+        let mut resealed_snapshot = stale.clone();
+        rebind_fixture_manifest_seal(
+            &mut resealed_snapshot,
+            PublicationSeal::from_unix_seconds(1_700_000_001).unwrap(),
+        );
+        validate_published_state_snapshot(&resealed_snapshot).unwrap();
+        let resealed_states = vec![matching.clone(), resealed_snapshot];
+        let resealed_frontier = frontier_from(&resealed_states);
+        let hint = classify_projection_snapshot_hint(
+            fixture_document(resealed_states),
+            resealed_frontier,
+            durable_from(&[matching.clone(), stale.clone()]),
             Vec::new(),
             now,
             now,
@@ -1292,6 +1455,7 @@ mod tests {
         behind_durable
             .get_mut(&authorization_aggregate_key(&stale.pointer.identity))
             .unwrap()
+            .pointer
             .current_generation = 1;
         let hint = classify_projection_snapshot_hint(
             document.clone(),
@@ -1335,9 +1499,13 @@ mod tests {
         durable
             .get_mut(&authorization_aggregate_key(&stale.pointer.identity))
             .unwrap()
+            .pointer
             .current_generation = 3;
         durable.remove(&extra_key);
-        durable.insert(extra_key, extra_durable.pointer.clone());
+        durable.insert(
+            extra_key,
+            PublishedStateToken::try_from(&extra_durable).unwrap(),
+        );
         let hint =
             classify_projection_snapshot_hint(document, frontier, durable, Vec::new(), now, now)
                 .unwrap();
@@ -1419,6 +1587,7 @@ mod tests {
                 &extra_durable.pointer.identity,
             ))
             .unwrap()
+            .pointer
             .current_generation = 3;
         let hint = classify_projection_snapshot_hint(
             decoded,
@@ -1454,9 +1623,9 @@ mod tests {
     fn published_card_reader_and_bundle_share_one_strict_load_path() {
         let source = include_str!("authorization_projection_repository.rs").replace("\r\n", "\n");
         let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production region must exist");
+            .split_once("\n#[cfg(test)]\nmod tests;")
+            .expect("repository test module boundary must exist")
+            .0;
 
         // The legacy evidence reader delegates to the shared bundle loader and
         // no longer duplicates the strict sequence itself. The split anchor is
@@ -1569,18 +1738,35 @@ mod tests {
         // have no snapshot caller at all.
         let source = include_str!("authorization_snapshot.rs");
         let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production region must exist");
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("test module boundary must exist")
+            .0;
 
         assert!(
             production.contains("lock_all_current_pointer_records_in_tx_bounded("),
-            "capture must call the SQL-bounded locked pointer scan"
+            "capture and hint must use the SQL-bounded locked pointer scan"
+        );
+        let hint_body = production
+            .split("pub async fn load_projection_snapshot_hint(")
+            .nth(1)
+            .expect("snapshot hint loader must exist");
+        assert!(
+            hint_body.contains("lock_all_current_pointer_records_in_tx_bounded("),
+            "hint load must lock bounded pointers before strict manifest reads"
         );
         assert!(
-            production.contains("read_all_current_pointer_records_in_tx_bounded("),
-            "hint load must call the SQL-bounded non-locking pointer scan"
+            hint_body
+                .contains("read_published_authorization_state_in_tx(&mut tx, &pointer.identity)"),
+            "hint load must mint complete durable tokens via the strict reader"
         );
+        let token = production
+            .split("struct PublishedStateToken {")
+            .nth(1)
+            .and_then(|body| body.split_once("\n}").map(|(fields, _)| fields))
+            .expect("complete publication token must exist");
+        assert!(token.contains("pointer: AuthorizationCurrentPointerRecord"));
+        assert!(token.contains("stamp: PublicationStamp"));
+        assert!(hint_body.contains("PublishedStateToken::try_from(&state)?"));
         // The bounded names END in `_bounded(`, so a bare `_tx(` call can
         // only be the unbounded variant.
         assert!(
@@ -1596,25 +1782,23 @@ mod tests {
                 .matches("pointer_scan_bind_limit(MAX_CAPTURE_PUBLISHED_STATES)")
                 .count(),
             2,
-            "both pointer scans must bind the same cap + 1 over-limit probe"
+            "capture and hint durable scans must bind the same cap + 1 over-limit probe"
         );
         assert!(production.contains("enforce_capture_pointer_capacity(pointers.len())?"));
         assert!(production.contains("enforce_hint_durable_pointer_capacity(pointers.len())?"));
 
-        // Repository production region: the bounded pair exists, decodes
-        // through the strict shared path, and actually binds the limit.
+        // Repository scan preserves SQL bounds, strict decoding and binding.
         let repo_source = include_str!("authorization_projection_repository.rs");
         let repo_production = repo_source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("repository production region must exist");
+            .split_once("\n#[cfg(test)]\nmod tests;")
+            .expect("repository test module boundary must exist")
+            .0;
         assert!(repo_production.contains("const POINTER_ROWS_ALL_LOCKED_BOUNDED_TAIL"));
-        assert!(repo_production.contains("const POINTER_ROWS_ALL_ORDERED_BOUNDED_TAIL"));
 
         let locked_body = repo_production
             .split("pub(crate) async fn lock_all_current_pointer_records_in_tx_bounded(")
             .nth(1)
-            .and_then(|body| body.split("/// Non-locking SQL-bounded counterpart").next())
+            .and_then(|body| body.split("\nasync fn fetch_manifest_for_update").next())
             .expect("bounded locked pointer scan must exist");
         assert!(
             locked_body.contains("positive_i64(limit"),
@@ -1628,15 +1812,6 @@ mod tests {
             locked_body.contains(".bind(limit)"),
             "bounded locked scan must actually bind the SQL LIMIT"
         );
-
-        let ordered_body = repo_production
-            .split("pub(crate) async fn read_all_current_pointer_records_in_tx_bounded(")
-            .nth(1)
-            .and_then(|body| body.split("\nasync fn fetch_manifest_for_update").next())
-            .expect("bounded non-locking pointer scan must exist");
-        assert!(ordered_body.contains("positive_i64(limit"));
-        assert!(ordered_body.contains("POINTER_ROWS_ALL_ORDERED_BOUNDED_TAIL"));
-        assert!(ordered_body.contains(".bind(limit)"));
 
         // The bounded tails cut the SQL at `LIMIT ?` (= cap + 1) and keep the
         // deterministic global order; the locked variant keeps FOR UPDATE
@@ -1656,9 +1831,6 @@ mod tests {
             !locked_tail[..limit].contains("FOR UPDATE"),
             "no lock clause may precede the LIMIT cut: {locked_tail}"
         );
-        let ordered_tail = format!("SELECT {POINTER_ROWS_ALL_ORDERED_BOUNDED_TAIL}");
-        assert!(ordered_tail.ends_with("LIMIT ?"));
-        assert!(!ordered_tail.contains("FOR UPDATE"));
     }
 
     // ── Bundle semantics (opaque construction, evidence assembly) ───────────

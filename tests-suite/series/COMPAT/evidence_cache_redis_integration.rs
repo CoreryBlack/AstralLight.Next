@@ -78,7 +78,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use astral_db::{
@@ -96,7 +96,7 @@ use astral_db::{
 };
 use astral_types::{
     BindingLayer, CanonicalGrant, DomainScopeRequirement, GrantEffect, GrantId, GrantProvenance,
-    GrantRevision, GrantSourceKind, GrantState, PublishedAggregateManifestSummary,
+    GrantRevision, GrantSourceKind, GrantState, PublicationSeal, PublishedAggregateManifestSummary,
     PublishedCardAuthorization, PublishedCardAuthorizationGate, PublishedCardEvidenceScope,
     PublishedEvidenceGateStatus, TenantScope, UnacceptedGrantReason, ValidityWindow,
     VerifiedPublishedGrantRecord,
@@ -535,14 +535,11 @@ impl EvidenceReadDeps for FixtureDeps {
     async fn strict_read(
         &self,
         _scope: &PublishedCardEvidenceScope,
-    ) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
+    ) -> Result<Arc<PublishedCardAuthorization>, AuthorizationEvidenceError> {
         self.strict_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self
-            .strict
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("fixture strict queue must not be exhausted (test bug)"))
+        Ok(Arc::new(self.strict.lock().unwrap().pop_front().expect(
+            "fixture strict queue must not be exhausted (test bug)",
+        )))
     }
 
     async fn current_epoch(&self) -> Option<String> {
@@ -598,9 +595,11 @@ impl EvidenceReadDeps for DbBackedDeps {
     async fn strict_read(
         &self,
         scope: &PublishedCardEvidenceScope,
-    ) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
+    ) -> Result<Arc<PublishedCardAuthorization>, AuthorizationEvidenceError> {
         self.strict_calls.fetch_add(1, Ordering::SeqCst);
-        load_published_card_grant_evidence(&self.pool, scope).await
+        load_published_card_grant_evidence(&self.pool, scope)
+            .await
+            .map(Arc::new)
     }
 
     async fn current_epoch(&self) -> Option<String> {
@@ -629,7 +628,9 @@ async fn load_through<D: EvidenceReadDeps>(
     l2: Option<&dyn L2EvidenceStore>,
     namespace: &TestNamespace,
 ) -> Result<PublishedCardAuthorization, AuthorizationEvidenceError> {
-    load_evidence_through_cache(deps, cache, l2, &namespace.card_level_scope()).await
+    load_evidence_through_cache(deps, cache, l2, &namespace.card_level_scope())
+        .await
+        .map(Arc::unwrap_or_clone)
 }
 
 /// L2 条目的测试侧镜像（与写侧 serde 契约同形同序；仅断言/播种用）。
@@ -774,9 +775,9 @@ fn mirror_entry_mac_with_secret(
         payload: &'a PublishedCardAuthorization,
     }
     let cover = Cover {
-        domain: "astral:l2-evidence:v4:hmac-sha256",
+        domain: astral_types::AUTHORIZATION_L2_MAC_DOMAIN,
         redis_key,
-        schema_version: 4,
+        schema_version: astral_types::AUTHORIZATION_EDITION as i64,
         manifest_versions,
         card_source_pending: false,
         content_hash,
@@ -788,7 +789,7 @@ fn mirror_entry_mac_with_secret(
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// v3 因子化镜像（镜像写侧 `l2_factored_storage_form`）：返回条目 payload 与
+/// 当前 edition 因子化镜像（镜像写侧 `l2_factored_storage_form`）：返回条目 payload 与
 /// 去重后的共享单元集合（digest → 内容）。
 fn mirror_factored_storage_form(
     evidence: &PublishedCardAuthorization,
@@ -945,7 +946,11 @@ async fn reconstruct_entry_from_redis(
             .await
             .expect("referenced shared unit must exist in Redis");
         let unit: L2SharedUnitMirror = serde_json::from_str(&raw).expect("unit json");
-        assert_eq!(unit.unit_schema_version, 1, "unit schema must match");
+        assert_eq!(
+            unit.unit_schema_version,
+            astral_types::AUTHORIZATION_EDITION as i64,
+            "unit schema must match"
+        );
         assert_eq!(unit.digest, *digest, "unit digest must match the reference");
         units.insert(digest.clone(), unit.content);
     }
@@ -964,6 +969,9 @@ fn versions_of(evidence: &PublishedCardAuthorization) -> Vec<PermissionCacheMani
             manifest_id: manifest.manifest_id,
             generation: manifest.generation,
             revoke_fence: manifest.revoke_fence,
+            publication_stamp: manifest
+                .publication_stamp()
+                .expect("valid fixture publication"),
         })
         .collect();
     versions.sort_by(|left, right| {
@@ -1033,7 +1041,7 @@ fn fixture_record(
         operation_id: "op-1".to_string(),
         semantic_hash_hex: "a".repeat(64),
         dependency_hash_hex: "b".repeat(64),
-        compiler_version: "test".to_string(),
+        compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
         segment_ordinal: 0,
         position_in_segment: 0,
         grant,
@@ -1057,6 +1065,7 @@ fn fixture_evidence(
         });
         if !present {
             manifests.push(PublishedAggregateManifestSummary {
+                seal: PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
                 tenant_id: namespace.tenant_id,
                 card_id: namespace.card_id,
                 aggregate_type: record.aggregate_type.clone(),
@@ -1070,7 +1079,7 @@ fn fixture_evidence(
                 semantic_hash_hex: "a".repeat(64),
                 dependency_hash_hex: "b".repeat(64),
                 manifest_digest_hex: "c".repeat(64),
-                compiler_version: "test".to_string(),
+                compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
                 event_id: "event-1".to_string(),
                 operation_id: "op-1".to_string(),
                 parent_manifest_id: None,
@@ -1197,7 +1206,7 @@ async fn stage_and_finalize_manifest(
     let semantic_hash_hex = sha256_hex(&format!("itest/{}/semantic/{tag}", namespace.tenant_id));
     let dependency_hash_hex =
         sha256_hex(&format!("itest/{}/dependency/{tag}", namespace.tenant_id));
-    let compiler_version = "itest-compiler-v1".to_owned();
+    let compiler_version = astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned();
 
     // 与载荷 provenance 保持一致：grant 的 operation/event 与 manifest 对齐。
     let mut payload_grants = grants.to_vec();
@@ -1374,12 +1383,15 @@ async fn redis_ci1_cold_miss_strict_once_then_l1_hit_and_l2_entry_shape() {
     assert_eq!(l2.set_calls(), 1, "refill must backfill L2");
     assert_eq!(first, evidence);
 
-    // L2 条目形状：schema 4、版本组与栅栏组一致（pending 位恒 false）、
+    // L2 条目形状：当前 edition、版本组与栅栏组一致（pending 位恒 false）、
     // content_hash 绑定完整载荷、因子化存储（USER_CARD 内联、零共享单元）+
     // 重建 parity、TTL 满额 300s。
     let raw = redis.get(&key).await.expect("L2 entry must exist in Redis");
     let entry = parse_l2_entry(&raw);
-    assert_eq!(entry.schema_version, 4);
+    assert_eq!(
+        entry.schema_version,
+        astral_types::AUTHORIZATION_EDITION as i64
+    );
     assert_eq!(entry.manifest_versions, fence.manifest_versions);
     assert!(!entry.card_source_pending);
     assert!(
@@ -1388,7 +1400,7 @@ async fn redis_ci1_cold_miss_strict_once_then_l1_hit_and_l2_entry_shape() {
             .records
             .iter()
             .all(|slot| matches!(slot, L2RecordSlotMirror::Inline(_))),
-        "v3 storage: USER_CARD records stay inline"
+        "factored storage: USER_CARD records stay inline"
     );
     assert_eq!(
         reconstruct_entry_from_redis(&redis, &epoch, ns.tenant_id, &entry).await,
@@ -1529,7 +1541,7 @@ async fn redis_content_hash_pollution_purges_and_self_heals() {
 }
 
 /// 新链加深：真实 Redis 条目的 schema_version 被篡改（payload/hash 均合法）
-/// → schema 栅栏拒绝 → 删键回源重写为 schema 3。
+/// → schema 栅栏拒绝 → 删键回源重写为当前 edition。
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_schema_version_mismatch_purges_and_refills() {
@@ -1800,7 +1812,7 @@ async fn redis_contract_violating_payload_with_valid_hash_purges() {
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let evidence = perpetual_single_record_evidence(&ns, now);
 
-    // 篡改 gate 计数后以写侧同构协议播种（schema 3 + 合法 MAC）：content_hash
+    // 篡改 gate 计数后以写侧同构协议播种（当前 edition + 合法 MAC）：content_hash
     // 与篡改 payload 精确绑定（重建后哈希重验必然通过），MAC 对篡改载荷合法
     // ——只有 payload.validate() 合同校验能拦下。
     let mut tampered = evidence.clone();
@@ -1811,7 +1823,7 @@ async fn redis_contract_violating_payload_with_valid_hash_purges() {
     );
     let (tampered_payload, _) = mirror_factored_storage_form(&tampered);
     let entry = L2EntryMirror {
-        schema_version: 4,
+        schema_version: astral_types::AUTHORIZATION_EDITION as i64,
         card_source_pending: false,
         manifest_versions: versions_of(&evidence),
         content_hash: mirror_content_hash(&tampered),
@@ -1990,7 +2002,10 @@ async fn db_ci7_double_miss_full_chain_backfills_l1_and_l2() {
     assert_eq!(entry.manifest_versions, live_fence.manifest_versions);
     assert!(!entry.card_source_pending);
     assert!(!live_fence.card_source_pending);
-    assert_eq!(entry.schema_version, 4);
+    assert_eq!(
+        entry.schema_version,
+        astral_types::AUTHORIZATION_EDITION as i64
+    );
     assert_eq!(
         reconstruct_entry_from_redis(&redis, &epoch, ns.tenant_id, &entry).await,
         evidence,
@@ -2628,7 +2643,7 @@ async fn redis_v3_mac_wrong_secret_purges() {
     let attacker_secret = b"attacker-held-l2-secret-value-0123456789abcdef";
     let (payload, _) = mirror_factored_storage_form(&evidence);
     let forged = L2EntryMirror {
-        schema_version: 4,
+        schema_version: astral_types::AUTHORIZATION_EDITION as i64,
         card_source_pending: false,
         manifest_versions: versions_of(&evidence),
         content_hash: mirror_content_hash(&evidence),
@@ -2757,7 +2772,7 @@ async fn redis_v3_record_level_scope_poison_purges() {
     );
     let (poison_payload, _) = mirror_factored_storage_form(&cross_card);
     let poisoned = L2EntryMirror {
-        schema_version: 4,
+        schema_version: astral_types::AUTHORIZATION_EDITION as i64,
         card_source_pending: false,
         manifest_versions: versions_of(&evidence),
         content_hash: mirror_content_hash(&cross_card),
@@ -2797,7 +2812,7 @@ async fn redis_v3_record_level_scope_poison_purges() {
     cross_tenant.effective_grants[0].tenant.tenant_id = ns.tenant_id + 1;
     let (tenant_poison_payload, _) = mirror_factored_storage_form(&cross_tenant);
     let tenant_poisoned = L2EntryMirror {
-        schema_version: 4,
+        schema_version: astral_types::AUTHORIZATION_EDITION as i64,
         card_source_pending: false,
         manifest_versions: versions_of(&evidence),
         content_hash: mirror_content_hash(&cross_tenant),
@@ -2835,7 +2850,7 @@ async fn redis_v3_record_level_scope_poison_purges() {
 }
 
 /// v2 退役条目（真实 Redis）：schema 2 完整载荷形状 → schema 栅栏拒绝 →
-/// 删键回源重写为 schema 3（自愈），无需人工清理。
+/// 删键回源重写为当前 edition（自愈），无需人工清理。
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_v2_entry_purges_and_self_heals() {
@@ -2918,7 +2933,7 @@ async fn redis_v3_secret_unavailable_bypasses_l2_read_and_write() {
     );
     assert_eq!(l2.get_calls(), 0, "no-secret reads must not touch L2");
     assert_eq!(l2.set_calls(), 0, "no-secret refills must not write L2");
-    assert_eq!(next, evidence);
+    assert_eq!(next.as_ref(), &evidence);
     assert!(
         redis.get(&key).await.is_none(),
         "no-secret flow must leave no card entry in Redis"

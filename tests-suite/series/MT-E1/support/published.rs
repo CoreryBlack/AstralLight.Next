@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use astral_types::{
     BindingLayer, CanonicalGrant, DomainScopeRequirement, Effect, GrantEffect, GrantId,
     GrantProvenance, GrantRevision, GrantSourceKind, GrantState, PolicyContext, PolicyDecision,
-    PolicyError, PublishedAggregateManifestSummary, PublishedCardAuthorization,
+    PolicyError, PublicationSeal, PublishedAggregateManifestSummary, PublishedCardAuthorization,
     PublishedCardAuthorizationGate, PublishedCardEvidenceScope, PublishedEvidenceGateStatus,
     TenantScope, ValidityWindow, VerifiedPublishedGrantRecord,
 };
@@ -347,6 +347,7 @@ pub fn ready_evidence(
 ) -> PublishedCardAuthorization {
     let record_count = grants.len();
     let manifest = PublishedAggregateManifestSummary {
+        seal: PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
         tenant_id,
         card_id,
         aggregate_type: "CARD".to_owned(),

@@ -1,6 +1,11 @@
 use sha2::{Digest, Sha256};
 use sqlx::{MySql, Transaction};
 
+use astral_types::{
+    AUTHORIZATION_COMPLETION_AUDIT_DOMAIN, AUTHORIZATION_COMPLETION_ITEMS_DOMAIN,
+    AUTHORIZATION_EDITION,
+};
+
 use super::super::{
     normalize_impact_items, AuthorizationImpactItemInput, AuthorizationImpactPlanRecord,
     AuthorizationProjectionError, NormalizedImpactItem, Sha256Digest,
@@ -48,7 +53,7 @@ struct PlanCommitment<'a> {
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompletionSeal {
-    version: u32,
+    version: u16,
     event_id: String,
     operation_id: String,
     plan_id: i64,
@@ -59,7 +64,7 @@ struct CompletionSeal {
 
 fn seal_request_id(plan: &AuthorizationImpactPlanRecord, manifest_id: i64) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"astral-owned-completion-audit-v1");
+    digest.update(AUTHORIZATION_COMPLETION_AUDIT_DOMAIN);
     digest.update(plan.identity.tenant_id.to_be_bytes());
     for value in [&plan.event_id, &plan.operation_id] {
         digest.update((value.len() as u64).to_be_bytes());
@@ -94,7 +99,7 @@ fn completion_seal(
     items: &[NormalizedImpactItem],
 ) -> Result<CompletionSeal, AuthorizationProjectionError> {
     let commitment = PlanCommitment {
-        domain: "astral-owned-completion-item-set-v1",
+        domain: AUTHORIZATION_COMPLETION_ITEMS_DOMAIN,
         tenant_id: plan.identity.tenant_id,
         aggregate_type: &plan.identity.aggregate_type,
         aggregate_id: plan.identity.aggregate_id,
@@ -129,7 +134,7 @@ fn completion_seal(
         )
     })?;
     Ok(CompletionSeal {
-        version: 1,
+        version: AUTHORIZATION_EDITION,
         event_id: plan.event_id.clone(),
         operation_id: plan.operation_id.clone(),
         plan_id: plan.plan_id,
@@ -223,6 +228,9 @@ pub(super) async fn verify_in_tx(
             "code=projection_execution.completion_seal_corrupt".to_owned(),
         )
     })?;
+    if stored.version != AUTHORIZATION_EDITION {
+        return Ok(false);
+    }
     let items = normalized_stored_items(plan)?;
     Ok(stored
         == completion_seal(
@@ -260,6 +268,39 @@ mod tests {
             cas_version: 0,
             items: Vec::new(),
         }
+    }
+
+    #[test]
+    fn completion_commitment_binds_current_manifest_seal_time() {
+        use crate::authorization_projection_repository::{
+            compute_manifest_digest, ManifestDigestInput,
+        };
+        let mut input = ManifestDigestInput {
+            tenant_id: 7,
+            aggregate_type: "USER_CARD",
+            aggregate_id: 11,
+            card_id: Some(11),
+            generation: 1,
+            source_generation: 9,
+            projected_generation: 9,
+            event_id: "completion-seal-event",
+            operation_id: "completion-seal-operation",
+            semantic_hash_hex: &"11".repeat(32),
+            dependency_hash_hex: &"22".repeat(32),
+            compiler_version: "seal-test",
+            parent_manifest_id: None,
+            revoke_fence: 0,
+            seal: astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+            segment_content_digests_hex: vec![],
+        };
+        let before = compute_manifest_digest(&input).unwrap();
+        input.seal = astral_types::PublicationSeal::from_unix_seconds(1_700_000_001).unwrap();
+        let after = compute_manifest_digest(&input).unwrap();
+        assert_ne!(before, after);
+        assert_ne!(
+            completion_seal(&plan(), 9, 17, &before, &[]).unwrap(),
+            completion_seal(&plan(), 9, 17, &after, &[]).unwrap(),
+        );
     }
 
     #[test]

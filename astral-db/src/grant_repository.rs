@@ -5871,6 +5871,12 @@ mod tests {
                 cas_version: 3,
             };
         let manifest = PublishedGenerationSummary {
+            stamp: astral_types::PublicationStamp {
+                generation,
+                manifest_digest_hex: hex::encode(sha256_digest_bytes(b"manifest")),
+                seal: astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+            },
+            seal: astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
             manifest_id: pointer.manifest_id,
             generation,
             source_generation: 9,
@@ -5904,6 +5910,7 @@ mod tests {
             })
             .collect();
         PublishedAggregateFrontier {
+            stamp: manifest.stamp.clone(),
             identity,
             card_id: Some(17),
             pointer,

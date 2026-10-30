@@ -844,7 +844,7 @@ struct OrgDependencyDigestInput<'a> {
     dependencies: Vec<&'a OrgDependency>,
 }
 
-const ORG_DEPENDENCY_DIGEST_DOMAIN: &str = "astral-org-dependencies-v1";
+const ORG_DEPENDENCY_DIGEST_DOMAIN: &str = crate::AUTHORIZATION_ORG_DEPENDENCY_DOMAIN;
 
 /// 依赖向量摘要：排序后的依赖栅栏列表的 sha256（确定性，与输入顺序无关）。
 pub fn org_dependency_digest_hex(dependencies: &[OrgDependency]) -> OrgResult<String> {
@@ -1102,7 +1102,7 @@ struct OrgSegmentDigestInput<'a> {
     contributions: &'a [OrgContribution],
 }
 
-const ORG_SEGMENT_DIGEST_DOMAIN: &str = "astral-org-segment-v1";
+const ORG_SEGMENT_DIGEST_DOMAIN: &str = crate::AUTHORIZATION_ORG_SEGMENT_DOMAIN;
 
 /// 段内容摘要：typed 规范 JSON 的 sha256（对 Value 形态不直接摘要——必须经 typed 解码）。
 pub fn org_segment_digest_hex(content: &OrgSegmentContent) -> OrgResult<String> {
@@ -1197,7 +1197,7 @@ struct OrgManifestDigestInput<'a> {
     operation_id: &'a str,
 }
 
-const ORG_MANIFEST_DIGEST_DOMAIN: &str = "astral-org-publication-v1";
+const ORG_MANIFEST_DIGEST_DOMAIN: &str = crate::AUTHORIZATION_ORG_MANIFEST_DOMAIN;
 
 /// manifest 摘要材料（依赖/段引用必须已经按合同排序）。
 pub struct OrgManifestDigestMaterial<'a> {

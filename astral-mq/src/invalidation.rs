@@ -12,11 +12,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use astral_types::PublishedEvidenceAggregate;
+use astral_types::{PublicationStamp, PublishedEvidenceAggregate, AUTHORIZATION_EDITION};
 
 use crate::envelope::MessageEnvelope;
 
-pub const INVALIDATION_SCHEMA_VERSION: i32 = 1;
+/// All typed authorization invalidations use the shared authorization release
+/// edition. The `i32` representation matches the transport envelope contract.
+pub const INVALIDATION_SCHEMA_VERSION: i32 = AUTHORIZATION_EDITION as i32;
+/// Compatibility alias retained for callers that name the evidence contract;
+/// it intentionally derives from the same shared edition as every other typed
+/// invalidation family.
+pub const EVIDENCE_INVALIDATION_SCHEMA_VERSION: i32 = INVALIDATION_SCHEMA_VERSION;
 pub const INVALIDATION_QUEUE: &str = "astral.authorization.invalidation";
 pub const INVALIDATION_ROUTING_KEY: &str = "authorization.invalidation";
 pub const EVIDENCE_INVALIDATED: &str = "EVIDENCE_INVALIDATED";
@@ -40,6 +46,15 @@ pub enum InvalidationContractError {
     InvalidAggregateScope(String),
     #[error("evidence invalidation revoke fence exceeds source generation")]
     RevokeFenceExceedsSourceGeneration,
+    #[error("evidence invalidation publication stamp is invalid: {0}")]
+    InvalidPublicationStamp(String),
+    #[error(
+        "evidence invalidation publication stamp generation {stamp_generation} does not match published generation {published_generation}"
+    )]
+    PublicationStampGenerationMismatch {
+        stamp_generation: u64,
+        published_generation: u64,
+    },
     #[error("session revocation must provide at least one revoked JTI")]
     EmptySessionRevocation,
     #[error("session revocation contains a blank JTI")]
@@ -72,6 +87,9 @@ pub struct EvidenceInvalidated {
     pub aggregate_type: PublishedEvidenceAggregate,
     pub aggregate_id: i64,
     pub published_generation: u64,
+    /// Identity of the already-published baseline being invalidated. This is
+    /// not a claim that the source mutation has itself been published.
+    pub stamp: PublicationStamp,
     pub source_generation: u64,
     /// Zero is a valid initial revoke-fence value for a proven publication.
     pub revoke_fence: u64,
@@ -85,6 +103,17 @@ impl EvidenceInvalidated {
         }
         validate_positive(self.aggregate_id, "aggregate_id")?;
         validate_positive(self.published_generation, "published_generation")?;
+        self.stamp.validate().map_err(|error| {
+            InvalidationContractError::InvalidPublicationStamp(error.to_string())
+        })?;
+        if self.stamp.generation != self.published_generation {
+            return Err(
+                InvalidationContractError::PublicationStampGenerationMismatch {
+                    stamp_generation: self.stamp.generation,
+                    published_generation: self.published_generation,
+                },
+            );
+        }
         validate_positive(self.source_generation, "source_generation")?;
         if self.revoke_fence > self.source_generation {
             return Err(InvalidationContractError::RevokeFenceExceedsSourceGeneration);
@@ -173,6 +202,11 @@ impl InvalidationEvent {
         }
     }
 
+    /// Return the shared schema version for every typed invalidation family.
+    pub fn schema_version(&self) -> i32 {
+        INVALIDATION_SCHEMA_VERSION
+    }
+
     /// Tenant metadata belongs in the common envelope where it exists in the
     /// contract. Session and eligibility IDs are globally scoped in this first
     /// contract revision and therefore do not invent a tenant fallback.
@@ -242,7 +276,7 @@ impl InvalidationEvent {
             message_id,
             operation_id,
             self.message_type(),
-            INVALIDATION_SCHEMA_VERSION,
+            self.schema_version(),
             origin_region,
             self.payload()?,
         )
@@ -264,8 +298,8 @@ impl InvalidationEvent {
             .map_err(InvalidationContractError::InvalidEnvelope)?;
         if envelope.schema_version != INVALIDATION_SCHEMA_VERSION {
             return Err(InvalidationContractError::InvalidEnvelope(format!(
-                "unsupported schemaVersion {}",
-                envelope.schema_version
+                "unsupported schemaVersion {} for {} (expected {})",
+                envelope.schema_version, envelope.message_type, INVALIDATION_SCHEMA_VERSION
             )));
         }
 
@@ -624,6 +658,15 @@ mod tests {
     use super::*;
     use crate::envelope::payload_digest;
 
+    fn publication_stamp(generation: u64) -> PublicationStamp {
+        PublicationStamp::new(
+            generation,
+            "ab".repeat(32),
+            astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+        )
+        .unwrap()
+    }
+
     fn evidence() -> InvalidationEvent {
         InvalidationEvent::EvidenceInvalidated(EvidenceInvalidated {
             tenant_id: 7,
@@ -631,6 +674,7 @@ mod tests {
             aggregate_type: PublishedEvidenceAggregate::UserCard,
             aggregate_id: 42,
             published_generation: 10,
+            stamp: publication_stamp(10),
             source_generation: 10,
             revoke_fence: 0,
         })
@@ -651,7 +695,10 @@ mod tests {
             .expect("valid invalidation envelope");
 
         assert_eq!(envelope.message_type, EVIDENCE_INVALIDATED);
-        assert_eq!(envelope.schema_version, INVALIDATION_SCHEMA_VERSION);
+        assert_eq!(
+            envelope.schema_version,
+            EVIDENCE_INVALIDATION_SCHEMA_VERSION
+        );
         assert_eq!(envelope.tenant_id, Some(7));
         assert_eq!(envelope.ordering_key, Some(event.ordering_key()));
         assert_eq!(InvalidationEvent::from_envelope(&envelope), Ok(event));
@@ -689,6 +736,7 @@ mod tests {
             aggregate_type: PublishedEvidenceAggregate::RuleSet,
             aggregate_id: 6001,
             published_generation: 11,
+            stamp: publication_stamp(11),
             source_generation: 11,
             revoke_fence: 0,
         });
@@ -709,6 +757,7 @@ mod tests {
             aggregate_type: PublishedEvidenceAggregate::UserCard,
             aggregate_id: 43,
             published_generation: 10,
+            stamp: publication_stamp(10),
             source_generation: 10,
             revoke_fence: 0,
         });
@@ -723,6 +772,7 @@ mod tests {
             aggregate_type: PublishedEvidenceAggregate::UserCard,
             aggregate_id: 42,
             published_generation: 10,
+            stamp: publication_stamp(10),
             source_generation: 10,
             revoke_fence: 11,
         });
@@ -737,6 +787,7 @@ mod tests {
             aggregate_type: PublishedEvidenceAggregate::UserCard,
             aggregate_id: 42,
             published_generation: 11,
+            stamp: publication_stamp(11),
             source_generation: 10,
             revoke_fence: 0,
         });
@@ -772,6 +823,7 @@ mod tests {
             aggregate_type: PublishedEvidenceAggregate::UserCard,
             aggregate_id: 42,
             published_generation: 10,
+            stamp: publication_stamp(10),
             source_generation: 10,
             revoke_fence: 0,
         });
@@ -793,6 +845,7 @@ mod tests {
             aggregate_type: PublishedEvidenceAggregate::UserCard,
             aggregate_id: 42,
             published_generation: 0,
+            stamp: publication_stamp(1),
             source_generation: 1,
             revoke_fence: 0,
         });
@@ -802,6 +855,88 @@ mod tests {
                 "published_generation"
             ))
         );
+    }
+
+    #[test]
+    fn typed_invalidation_families_share_v6_and_reject_retired_versions() {
+        assert_eq!(
+            INVALIDATION_SCHEMA_VERSION,
+            astral_types::AUTHORIZATION_EDITION as i32
+        );
+        assert_eq!(
+            EVIDENCE_INVALIDATION_SCHEMA_VERSION,
+            astral_types::AUTHORIZATION_EDITION as i32
+        );
+
+        let events = [
+            evidence(),
+            InvalidationEvent::EligibilityInvalidated(EligibilityInvalidated { card_id: 9 }),
+            session(),
+        ];
+        for (index, event) in events.into_iter().enumerate() {
+            let mut current = event
+                .to_envelope(
+                    format!("event-current-{index}"),
+                    format!("operation-current-{index}"),
+                    "city-a",
+                )
+                .expect("current typed invalidation must encode");
+            assert_eq!(current.schema_version, INVALIDATION_SCHEMA_VERSION);
+            assert!(InvalidationEvent::from_envelope(&current).is_ok());
+
+            let edition = astral_types::AUTHORIZATION_EDITION as i32;
+            let retired_versions = (1..edition).chain(std::iter::once(edition + 1));
+            for retired_version in retired_versions {
+                current.schema_version = retired_version;
+                assert!(
+                    matches!(
+                        InvalidationEvent::from_envelope(&current),
+                        Err(InvalidationContractError::InvalidEnvelope(reason))
+                            if reason.contains("unsupported schemaVersion")
+                                && reason.contains(&format!(
+                                    "expected {INVALIDATION_SCHEMA_VERSION}"
+                                ))
+                    ),
+                    "retired schema version {retired_version} must be rejected for {}",
+                    event.message_type()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_missing_stamp_is_rejected_at_current_version() {
+        let mut missing_stamp = evidence()
+            .to_envelope("event-missing", "operation-missing", "city-a")
+            .unwrap();
+        missing_stamp
+            .payload
+            .as_object_mut()
+            .unwrap()
+            .remove("stamp");
+        missing_stamp.payload_sha256 = payload_digest(&missing_stamp.payload).unwrap();
+        assert!(matches!(
+            InvalidationEvent::from_envelope(&missing_stamp),
+            Err(InvalidationContractError::InvalidPayload(_))
+        ));
+    }
+
+    #[test]
+    fn evidence_stamp_generation_must_match_published_generation() {
+        let mut event = evidence();
+        let InvalidationEvent::EvidenceInvalidated(value) = &mut event else {
+            unreachable!();
+        };
+        value.published_generation += 1;
+        assert!(matches!(
+            event.validate(),
+            Err(
+                InvalidationContractError::PublicationStampGenerationMismatch {
+                    stamp_generation: 10,
+                    published_generation: 11,
+                }
+            )
+        ));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 use astral_types::{
-    PublishedCardAuthorization, PublishedCardEvidenceScope, PublishedEvidenceAggregate,
+    PublicationSeal, PublicationStamp, PublishedCardAuthorization, PublishedCardEvidenceScope,
 };
 use sqlx::MySqlPool;
 
@@ -27,8 +27,10 @@ use crate::grant_repository::{
 };
 
 mod assembly_cache;
+mod invalidation;
 
 use assembly_cache::{AssemblyCache, AssemblyStamp};
+pub use invalidation::EvidenceInvalidationRequest;
 
 static GLOBAL_MEMORY_PROJECTION_HUB: OnceLock<MemoryProjectionHub> = OnceLock::new();
 
@@ -142,13 +144,21 @@ struct CurrentFrontierRow {
     revoke_fence: i64,
     revoke_fence_proven: bool,
     cas_version: i64,
+    manifest_digest: Option<Vec<u8>>,
+    manifest_digest_version: Option<u16>,
+    sealed_at: Option<time::PrimitiveDateTime>,
 }
 
-const LIST_CURRENT_FRONTIER_SQL: &str = "SELECT tenant_id, card_id, aggregate_type, aggregate_id, \
-    current_generation, manifest_id, event_id, operation_id, semantic_hash, dependency_hash, \
-    compiler_version, revoke_fence, revoke_fence_proven, cas_version \
-    FROM authorization_projection_current \
-    ORDER BY tenant_id, aggregate_type, aggregate_id LIMIT 131073";
+const LIST_CURRENT_FRONTIER_SQL: &str = "SELECT p.tenant_id, p.card_id, p.aggregate_type, p.aggregate_id, \
+    p.current_generation, p.manifest_id, p.event_id, p.operation_id, p.semantic_hash, p.dependency_hash, \
+    p.compiler_version, p.revoke_fence, p.revoke_fence_proven, p.cas_version, \
+    m.manifest_digest, m.manifest_digest_version, m.sealed_at \
+    FROM authorization_projection_current p \
+    LEFT JOIN authorization_projection_manifest m ON m.manifest_id = p.manifest_id \
+      AND m.tenant_id = p.tenant_id AND m.aggregate_type = p.aggregate_type \
+      AND m.aggregate_id = p.aggregate_id AND m.card_id <=> p.card_id \
+      AND m.generation = p.current_generation AND m.status = 'COMMITTED' \
+    ORDER BY p.tenant_id, p.aggregate_type, p.aggregate_id LIMIT 131073";
 
 impl CurrentFrontierRow {
     fn identity(&self) -> Result<ProjectionAggregateIdentity, String> {
@@ -156,9 +166,37 @@ impl CurrentFrontierRow {
             .map_err(|error| error.to_string())
     }
 
+    fn publication_stamp(&self) -> Result<PublicationStamp, String> {
+        if self.manifest_digest_version != Some(PublicationSeal::DIGEST_VERSION) {
+            return Err("durable frontier has no supported publication seal".to_owned());
+        }
+        let digest = self
+            .manifest_digest
+            .as_deref()
+            .filter(|digest| digest.len() == 32)
+            .ok_or("durable frontier has no manifest digest")?;
+        let seal = PublicationSeal::new(
+            self.sealed_at
+                .ok_or("durable frontier has no sealing time")?
+                .assume_utc(),
+        )
+        .map_err(|error| error.to_string())?;
+        PublicationStamp::new(
+            u64::try_from(self.current_generation)
+                .map_err(|_| "durable frontier has an invalid generation")?,
+            hex::encode(digest),
+            seal,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     fn matches(&self, state: &AuthorizationPublishedState) -> bool {
         let pointer = &state.pointer;
-        self.tenant_id == pointer.identity.tenant_id
+        self.publication_stamp()
+            .ok()
+            .zip(state.publication_stamp().ok())
+            .is_some_and(|(observed, installed)| observed == installed)
+            && self.tenant_id == pointer.identity.tenant_id
             && self.aggregate_type == pointer.identity.aggregate_type
             && self.aggregate_id == pointer.identity.aggregate_id
             && self.card_id == pointer.card_id
@@ -224,7 +262,7 @@ impl PendingInvalidationRow {
                 event_id: self.event_id,
                 operation_id: self.operation_id,
                 source_generation,
-                published_generation: None,
+                published_stamp: None,
                 revoke_class,
                 revoke_fence,
             },
@@ -360,7 +398,7 @@ struct PendingDeltaEntry {
     /// For a post-commit invalidation notification, the published frontier
     /// observed by the sender. This is a same-aggregate publication fence;
     /// it is never compared numerically with `source_generation`.
-    published_generation: Option<u64>,
+    published_stamp: Option<PublicationStamp>,
     revoke_class: bool,
     revoke_fence: u64,
 }
@@ -415,7 +453,7 @@ struct CompletionIdentity {
 }
 
 struct CompletionReceipt {
-    generation: u64,
+    stamp: PublicationStamp,
     revoke_fence: u64,
     installed_at: Instant,
 }
@@ -426,7 +464,7 @@ struct HubMaps {
     /// Channel health is deliberately unmonitored until a supervisor opts in.
     channel: ChannelHealth,
     last_transport_heartbeat: Option<Instant>,
-    notification_watermarks: HashMap<ProjectionAggregateIdentity, u64>,
+    notification_watermarks: HashMap<ProjectionAggregateIdentity, PublicationStamp>,
     completed: HashMap<CompletionIdentity, CompletionReceipt>,
     installed_at: HashMap<ProjectionAggregateIdentity, Instant>,
     mirror_bytes: u64,
@@ -651,8 +689,9 @@ impl TenantPending {
                 && entry.operation_id == state.operation_id
                 && entry.source_generation == state.source_generation
                 && entry
-                    .published_generation
-                    .is_none_or(|generation| state.generation > generation)
+                    .published_stamp
+                    .as_ref()
+                    .is_none_or(|stamp| state.generation > stamp.generation)
                 && entry.revoke_fence <= state.revoke_fence
         };
         self.aggregate_wide.retain(|entry| !completed(entry));
@@ -692,22 +731,6 @@ impl TenantPending {
             .chain(self.per_card.get(&card_id).into_iter().flatten())
             .any(|entry| entry_blocks(entry, states))
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct EvidenceInvalidationRequest {
-    pub tenant_id: i64,
-    pub card_id: Option<i64>,
-    pub aggregate_type: PublishedEvidenceAggregate,
-    pub aggregate_id: i64,
-    pub event_id: String,
-    pub operation_id: String,
-    pub source_generation: u64,
-    pub revoke_fence: u64,
-    /// Published frontier observed by the notification producer. This is
-    /// provenance only and is compared only with the same aggregate's
-    /// installed publication generation.
-    pub published_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -886,6 +909,21 @@ impl HubMaps {
 
     fn install(&mut self, state: Arc<AuthorizationPublishedState>) {
         let identity = &state.pointer.identity;
+        let Ok(stamp) = state.publication_stamp() else {
+            self.suspect("invalid installed publication stamp");
+            return;
+        };
+        if self
+            .notification_watermarks
+            .get(identity)
+            .is_some_and(|observed| {
+                observed.generation > stamp.generation
+                    || observed.generation == stamp.generation && *observed != stamp
+            })
+        {
+            self.suspect("installed publication conflicts with notification stamp");
+            return;
+        }
         if let Some(existing) = self.states.get(identity) {
             if existing.generation > state.generation {
                 return;
@@ -1220,18 +1258,6 @@ impl MemoryProjectionHub {
         maps.states.get(identity).cloned()
     }
 
-    /// Highest notification frontier applied for this exact aggregate; not a state proof.
-    #[must_use]
-    pub fn applied_generation_watermark(
-        &self,
-        identity: &ProjectionAggregateIdentity,
-    ) -> Option<u64> {
-        self.maps
-            .read()
-            .ok()
-            .and_then(|maps| maps.notification_watermarks.get(identity).copied())
-    }
-
     /// Generation of the installed state, independent of notification delivery.
     #[must_use]
     pub fn installed_generation(&self, identity: &ProjectionAggregateIdentity) -> Option<u64> {
@@ -1296,82 +1322,11 @@ impl MemoryProjectionHub {
             event_id: request.event_id.clone(),
             operation_id: request.operation_id.clone(),
             source_generation: request.source_generation,
-            published_generation: None,
+            published_stamp: None,
             revoke_class,
             revoke_fence: request.revoke_fence,
         };
         let _ = self.record_pending_entry(request.tenant_id, request.card_id, entry);
-    }
-
-    /// Apply a typed post-commit evidence invalidation notification. The
-    /// notification is only a freshness fence: it never installs or removes
-    /// authorization state. Missing hub or malformed provenance fails closed.
-    pub fn apply_evidence_invalidation(
-        &self,
-        request: EvidenceInvalidationRequest,
-    ) -> Result<(), String> {
-        if request.tenant_id <= 0
-            || request.card_id.is_some_and(|value| value <= 0)
-            || request.event_id.len() > 128
-            || request.operation_id.len() > 128
-            || request.event_id.trim().is_empty()
-            || request.operation_id.trim().is_empty()
-            || request.source_generation == 0
-            || request.published_generation == 0
-            || request.revoke_fence > request.source_generation
-        {
-            return Err("invalid evidence invalidation provenance".to_owned());
-        }
-        if request.card_id.is_some()
-            && request.aggregate_type == PublishedEvidenceAggregate::UserCard
-            && Some(request.aggregate_id) != request.card_id
-        {
-            return Err("published USER_CARD aggregate id does not match card scope".to_owned());
-        }
-        let aggregate = ProjectionAggregateIdentity::new(
-            request.tenant_id,
-            request.aggregate_type.as_str(),
-            request.aggregate_id,
-        )
-        .map_err(|error| error.to_string())?;
-        let mut maps = self
-            .maps
-            .write()
-            .map_err(|_| "memory projection hub lock poisoned".to_owned())?;
-        let completed = maps
-            .completed
-            .get(&CompletionIdentity {
-                aggregate: aggregate.clone(),
-                event_id: request.event_id.clone(),
-                operation_id: request.operation_id.clone(),
-                source_generation: request.source_generation,
-            })
-            .is_some_and(|receipt| {
-                receipt.generation > request.published_generation
-                    && receipt.revoke_fence >= request.revoke_fence
-                    && receipt.installed_at.elapsed() <= MIRROR_TTL
-            });
-        if !completed {
-            maps.record_pending(
-                request.tenant_id,
-                request.card_id,
-                PendingDeltaEntry {
-                    aggregate: Some(aggregate.clone()),
-                    event_id: request.event_id,
-                    operation_id: request.operation_id,
-                    source_generation: request.source_generation,
-                    published_generation: Some(request.published_generation),
-                    revoke_class: true,
-                    revoke_fence: request.revoke_fence,
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        maps.notification_watermarks
-            .entry(aggregate)
-            .and_modify(|generation| *generation = (*generation).max(request.published_generation))
-            .or_insert(request.published_generation);
-        Ok(())
     }
 
     /// 安装严格 reader 装载的状态；不把读取成功当作未完成 delta 的终态证明。
@@ -1388,6 +1343,9 @@ impl MemoryProjectionHub {
         outcome: &DeltaProjectorPublishOutcome,
     ) -> Result<(), String> {
         let state = &outcome.publish.published_state;
+        let stamp = state
+            .publication_stamp()
+            .map_err(|error| error.to_string())?;
         if state.pointer != outcome.publish.pointer
             || state.pointer.current_generation != state.generation
             || state.pointer.manifest_id != state.manifest_id
@@ -1398,6 +1356,7 @@ impl MemoryProjectionHub {
             || state.manifest_id != outcome.publish.published_manifest_id
             || state.manifest_id != outcome.stage.manifest_id
             || state.generation != outcome.stage.target_generation
+            || state.seal != outcome.stage.seal
             || state.manifest_digest != outcome.stage.manifest_digest
             || state.total_grant_count != outcome.stage.total_grant_count
         {
@@ -1414,6 +1373,7 @@ impl MemoryProjectionHub {
             .is_some_and(|current| {
                 current.generation > state.generation
                     || (current.generation == state.generation
+                        && current.seal == state.seal
                         && current.manifest_id == state.manifest_id
                         && current.manifest_digest == state.manifest_digest)
             });
@@ -1457,7 +1417,7 @@ impl MemoryProjectionHub {
                 source_generation: state.source_generation,
             },
             CompletionReceipt {
-                generation: state.generation,
+                stamp,
                 revoke_fence: state.revoke_fence,
                 installed_at: Instant::now(),
             },
@@ -1649,6 +1609,8 @@ impl MemoryProjectionHub {
             .retain(|identity, _| expected.contains(identity));
         maps.installed_at
             .retain(|identity, _| expected.contains(identity));
+        maps.notification_watermarks
+            .retain(|identity, _| expected.contains(identity));
         for identity in expected {
             maps.installed_at.insert(identity, Instant::now());
         }
@@ -1826,7 +1788,9 @@ impl MemoryProjectionHub {
             (ReadToken::for_scope(&maps, scope), states)
         };
         let now_unix_seconds = read_clock();
-        let stamp = AssemblyStamp::new(token, now_unix_seconds, &states);
+        let Ok(stamp) = AssemblyStamp::new(token, now_unix_seconds, &states) else {
+            return MemoryEvidenceOutcome::DeferToDurable;
+        };
         let cached = self.assemblies.get(scope, &stamp, Instant::now());
         let cache_hit = cached.is_some();
         // 装配缓存命中即零拷贝：整份 typed 证据以 Arc 传递，不再每读深拷贝。
@@ -2084,7 +2048,8 @@ mod tests {
     use astral_types::{
         BindingLayer, CanonicalGrant, DependencyVector, DependencyVersion, DomainScopeRequirement,
         GrantDelta, GrantEffect, GrantId, GrantProvenance, GrantRevision, GrantSourceKind,
-        GrantState, PublishedCardEvidenceScope, TenantScope, ValidityWindow,
+        GrantState, PublicationSeal, PublishedCardEvidenceScope, PublishedEvidenceAggregate,
+        TenantScope, ValidityWindow,
     };
     use sha2::{Digest, Sha256};
 
@@ -2239,7 +2204,9 @@ mod tests {
                 operation_id: operation_id.clone(),
             });
         }
+        let seal = PublicationSeal::from_unix_seconds(1_700_000_000).unwrap();
         let manifest_digest = compute_manifest_digest(&ManifestDigestInput {
+            seal,
             tenant_id: identity.tenant_id,
             aggregate_type: &identity.aggregate_type,
             aggregate_id: identity.aggregate_id,
@@ -2261,6 +2228,7 @@ mod tests {
         })
         .unwrap();
         AuthorizationPublishedState {
+            seal,
             pointer: AuthorizationCurrentPointerRecord {
                 pointer_id: generation as i64,
                 identity: identity.clone(),
@@ -2322,6 +2290,7 @@ mod tests {
                 item_count: 1,
             },
             stage: crate::AuthorizationStageOutcome {
+                seal: state.seal,
                 manifest_id: state.manifest_id,
                 manifest_digest: state.manifest_digest,
                 target_generation: state.generation,
@@ -2358,6 +2327,20 @@ mod tests {
         assert!(matches!(outcome, MemoryEvidenceOutcome::DeferToDurable));
     }
 
+    fn notification_stamp(hub: &MemoryProjectionHub, generation: u64) -> PublicationStamp {
+        hub.installed_published_state(&card_identity())
+            .filter(|state| state.generation == generation)
+            .map(|state| state.publication_stamp().unwrap())
+            .unwrap_or_else(|| {
+                PublicationStamp::new(
+                    generation,
+                    "ab".repeat(32),
+                    PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+                )
+                .unwrap()
+            })
+    }
+
     #[test]
     fn typed_evidence_notification_marks_only_its_card_pending_and_fails_closed_on_bad_provenance()
     {
@@ -2381,6 +2364,7 @@ mod tests {
                 operation_id: "operation-2".to_owned(),
                 source_generation: 2,
                 published_generation: 1,
+                stamp: notification_stamp(&hub, 1),
                 revoke_fence: 0,
             })
             .is_ok());
@@ -2396,6 +2380,7 @@ mod tests {
                 operation_id: "operation-3".to_owned(),
                 source_generation: 3,
                 published_generation: 1,
+                stamp: notification_stamp(&hub, 1),
                 revoke_fence: 0,
             })
             .is_err());
@@ -2409,6 +2394,7 @@ mod tests {
                 operation_id: "operation-4".to_owned(),
                 source_generation: 2,
                 published_generation: 1,
+                stamp: notification_stamp(&hub, 1),
                 revoke_fence: 3,
             })
             .is_err());
@@ -2427,6 +2413,7 @@ mod tests {
                 operation_id: "operation-tenant".to_owned(),
                 source_generation: 2,
                 published_generation: 1,
+                stamp: notification_stamp(&hub, 1),
                 revoke_fence: 0,
             })
             .is_ok());
@@ -2434,6 +2421,36 @@ mod tests {
         assert!(maps.pending.contains_key(&7));
         assert!(!maps.pending.contains_key(&8));
     }
+    #[test]
+    fn older_publication_cannot_install_below_a_notified_baseline() {
+        let hub = MemoryProjectionHub::default();
+        let identity = card_identity();
+        hub.apply_evidence_invalidation(EvidenceInvalidationRequest {
+            tenant_id: 7,
+            card_id: Some(17),
+            aggregate_type: PublishedEvidenceAggregate::UserCard,
+            aggregate_id: 17,
+            event_id: "event-3".to_owned(),
+            operation_id: "operation-3".to_owned(),
+            source_generation: 3,
+            revoke_fence: 0,
+            published_generation: 2,
+            stamp: notification_stamp(&hub, 2),
+        })
+        .unwrap();
+        let hot = policy_engine::HotState::from_grants(
+            tenant(),
+            1,
+            vec![grant(0x21)],
+            dependency_vector(),
+        )
+        .unwrap();
+        hub.install_published_state(seal_state(&identity, 17, 1, hot, None, 0));
+        assert!(hub.channel_is_suspect());
+        assert_eq!(hub.installed_generation(&identity), None);
+        defer(hub.try_memory_evidence(&scope()));
+    }
+
     #[test]
     fn first_publication_is_served_from_memory_with_provenance() {
         let hub = MemoryProjectionHub::default();
@@ -2674,6 +2691,7 @@ mod tests {
             compiler_version: &state.compiler_version,
             parent_manifest_id: state.parent_manifest_id,
             revoke_fence: state.revoke_fence,
+            seal: state.seal,
             segment_content_digests_hex: state
                 .segments
                 .iter()
@@ -3099,6 +3117,57 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_frontier_checks_hash_and_seal_even_when_pointer_is_unchanged() {
+        let hot =
+            policy_engine::HotState::from_grants(tenant(), 1, vec![grant(1)], dependency_vector())
+                .unwrap();
+        let state = seal_state(&card_identity(), 17, 1, hot, None, 0);
+        let pointer = &state.pointer;
+        let row = CurrentFrontierRow {
+            tenant_id: pointer.identity.tenant_id,
+            card_id: pointer.card_id,
+            aggregate_type: pointer.identity.aggregate_type.clone(),
+            aggregate_id: pointer.identity.aggregate_id,
+            current_generation: pointer.current_generation as i64,
+            manifest_id: pointer.manifest_id,
+            event_id: pointer.event_id.clone(),
+            operation_id: pointer.operation_id.clone(),
+            semantic_hash: pointer.semantic_hash.as_bytes().to_vec(),
+            dependency_hash: pointer.dependency_hash.as_bytes().to_vec(),
+            compiler_version: pointer.compiler_version.clone(),
+            revoke_fence: pointer.revoke_fence as i64,
+            revoke_fence_proven: true,
+            cas_version: pointer.cas_version,
+            manifest_digest: Some(state.manifest_digest.as_bytes().to_vec()),
+            manifest_digest_version: Some(state.seal.digest_version()),
+            sealed_at: Some(time::PrimitiveDateTime::new(
+                state.seal.sealed_at().date(),
+                state.seal.sealed_at().time(),
+            )),
+        };
+        assert!(row.matches(&state));
+        for field in 0..5 {
+            let mut changed = row.clone();
+            match field {
+                0 => changed.manifest_digest = Some(vec![0xff; 32]),
+                1 => {
+                    changed.sealed_at = changed
+                        .sealed_at
+                        .map(|time| time + time::Duration::seconds(1))
+                }
+                2 => changed.manifest_digest_version = Some(2),
+                3 => changed.manifest_digest = None,
+                4 => changed.sealed_at = None,
+                _ => unreachable!(),
+            }
+            assert!(!changed.matches(&state));
+        }
+        assert!(LIST_CURRENT_FRONTIER_SQL.contains("LEFT JOIN authorization_projection_manifest"));
+        assert!(LIST_CURRENT_FRONTIER_SQL.contains("m.card_id <=> p.card_id"));
+        assert!(LIST_CURRENT_FRONTIER_SQL.contains("m.status = 'COMMITTED'"));
+    }
+
+    #[test]
     fn notification_watermark_never_proves_an_installed_state() {
         let hub = MemoryProjectionHub::default();
         let identity = card_identity();
@@ -3117,6 +3186,7 @@ mod tests {
             source_generation: 2,
             revoke_fence: 2,
             published_generation: 1,
+            stamp: notification_stamp(&hub, 1),
         };
         hub.apply_evidence_invalidation(request.clone()).unwrap();
         hub.apply_evidence_invalidation(request).unwrap();
@@ -3147,6 +3217,7 @@ mod tests {
             source_generation: 2,
             revoke_fence: 2,
             published_generation: 1,
+            stamp: notification_stamp(&hub, 1),
         };
         hub.apply_evidence_invalidation(request.clone()).unwrap();
         assert_eq!(hub.maps.read().unwrap().pending_count, 0);
@@ -3221,6 +3292,45 @@ mod tests {
         assert!(hub.begin_source_transaction().is_none());
         assert_eq!(hub.maps.read().unwrap().active_source_writers, 0);
         assert!(hub.maps.read().unwrap().runtime_owner_failed);
+    }
+
+    #[test]
+    fn committed_install_rejects_a_stage_seal_mismatch() {
+        let hub = MemoryProjectionHub::default();
+        let hot =
+            policy_engine::HotState::from_grants(tenant(), 1, vec![grant(1)], dependency_vector())
+                .unwrap();
+        let state = seal_state(&card_identity(), 17, 1, hot, None, 0);
+        let mut outcome = committed_outcome(state);
+        outcome.stage.seal = PublicationSeal::from_unix_seconds(1_700_000_001).unwrap();
+
+        assert!(hub.install_committed_publication(&outcome).is_err());
+        assert!(hub.maps.read().unwrap().states.is_empty());
+    }
+
+    #[test]
+    fn same_generation_different_publication_seal_marks_channel_suspect() {
+        let hub = MemoryProjectionHub::default();
+        let identity = card_identity();
+        let hot =
+            policy_engine::HotState::from_grants(tenant(), 1, vec![grant(1)], dependency_vector())
+                .unwrap();
+        let state = seal_state(&identity, 17, 1, hot, None, 0);
+        hub.install_published_state(state.clone());
+
+        let mut divergent = state;
+        divergent.seal = PublicationSeal::from_unix_seconds(1_700_000_001).unwrap();
+        hub.install_published_state(divergent);
+
+        assert!(hub.channel_is_suspect());
+        defer(hub.try_memory_evidence(&scope()));
+        assert_eq!(
+            hub.maps.read().unwrap().states[&identity]
+                .seal
+                .unix_seconds(),
+            1_700_000_000,
+            "a conflicting seal must not replace the installed generation"
+        );
     }
 
     #[test]
@@ -4174,6 +4284,7 @@ mod tests {
                     operation_id: format!("operation-{generation}"),
                     source_generation: generation,
                     published_generation: published_frontier,
+                    stamp: notification_stamp(&hub, published_frontier),
                     revoke_fence: 0,
                 })
                 .expect("invalidation must apply");
@@ -4192,6 +4303,7 @@ mod tests {
                             },
                         stage:
                             crate::authorization_projection_repository::AuthorizationStageOutcome {
+                                seal: state.seal,
                                 manifest_id,
                                 manifest_digest: state.manifest_digest,
                                 target_generation: generation,

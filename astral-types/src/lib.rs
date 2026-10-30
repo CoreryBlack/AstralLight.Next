@@ -6,6 +6,7 @@
 mod context;
 mod cross_city;
 mod decision;
+mod edition;
 mod eligibility;
 mod entities;
 mod error;
@@ -13,14 +14,19 @@ mod grant;
 /// 组织范围（ORG_SCOPE）共享类型合同 — Phase 2 default-off（types owner 维护）。
 pub mod org_scope;
 mod projection;
+mod publication;
 pub mod registry;
+mod rule_set;
 
 pub use context::*;
 pub use cross_city::*;
 pub use decision::*;
+pub use edition::*;
 pub use eligibility::*;
 pub use entities::*;
 pub use error::*;
 pub use grant::*;
 pub use projection::*;
+pub use publication::*;
 pub use registry::*;
+pub use rule_set::*;

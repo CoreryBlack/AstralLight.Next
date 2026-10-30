@@ -1473,7 +1473,7 @@ pub async fn jwt_auth_middleware(
                 )
                 .await
                 {
-                    Ok(Ok(value)) => Ok(value.as_deref()),
+                    Ok(Ok(value)) => Ok(value),
                     _ => Err(()),
                 };
                 let mode = config.session_grant_claims_mode.to_uppercase();
@@ -1494,7 +1494,10 @@ pub async fn jwt_auth_middleware(
                 };
                 match redis_session_gate(
                     revoked,
-                    scalar,
+                    scalar
+                        .as_ref()
+                        .map(|value| value.as_deref())
+                        .map_err(|_| ()),
                     claims.sub.as_str(),
                     grant_read,
                     &config.session_grant_claims_mode,

@@ -442,7 +442,7 @@ pub async fn publish_card_manifest(
     let operation_id = format!("op-ts-{salt:032x}-{tag}");
     let semantic_hash_hex = sha256_hex(&format!("ts/{tenant_id}/semantic/{tag}"));
     let dependency_hash_hex = sha256_hex(&format!("ts/{tenant_id}/dependency/{tag}"));
-    let compiler_version = "testsuite-v1".to_owned();
+    let compiler_version = astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned();
 
     let mut payload_grants = grants;
     for grant in &mut payload_grants {
@@ -613,4 +613,41 @@ pub async fn cleanup_suite_rows(
         "fixture cleanup must remove all published pointers"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod edition_contract {
+    #[test]
+    fn authorization_publication_and_delivery_use_one_release_edition() {
+        let edition = astral_types::AUTHORIZATION_EDITION;
+        assert_eq!(astral_types::PublicationSeal::DIGEST_VERSION, edition);
+        assert_eq!(astral_mq::INVALIDATION_SCHEMA_VERSION, i32::from(edition));
+        assert_eq!(
+            astral_mq::EVIDENCE_INVALIDATION_SCHEMA_VERSION,
+            i32::from(edition)
+        );
+        assert_eq!(astral_db::L2_EVIDENCE_SCHEMA_VERSION, i64::from(edition));
+        assert_eq!(astral_db::SNAPSHOT_SCHEMA_VERSION, u32::from(edition));
+        assert_eq!(astral_db::SNAPSHOT_PAYLOAD_VERSION, u32::from(edition));
+        assert_eq!(
+            policy_engine::COMPILER_VERSION,
+            astral_types::AUTHORIZATION_COMPILER_VERSION
+        );
+        assert_eq!(
+            policy_engine::ORG_COMPILER_VERSION,
+            astral_types::AUTHORIZATION_ORG_COMPILER_VERSION
+        );
+        assert_eq!(
+            astral_db::SEGMENT_FORMAT_AUTHORIZATION_GRANTS_JSON,
+            astral_types::AUTHORIZATION_SEGMENT_FORMAT
+        );
+        assert_eq!(
+            astral_db::SEGMENT_SEAL_DOMAIN_SEMANTIC,
+            astral_types::AUTHORIZATION_SEGMENT_SEMANTIC_DOMAIN
+        );
+        assert_eq!(
+            astral_db::SEGMENT_SEAL_DOMAIN_DEPENDENCY,
+            astral_types::AUTHORIZATION_SEGMENT_DEPENDENCY_DOMAIN
+        );
+    }
 }

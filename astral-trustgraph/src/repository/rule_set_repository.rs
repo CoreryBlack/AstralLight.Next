@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use sqlx::{MySqlPool, QueryBuilder};
 
 use astral_types::{
-    AstralError, ProjectionAggregate, EVENT_TYPE_REVOKE, EVENT_TYPE_RULE_SET_UPDATE,
-    SYSTEM_ACTOR_ID,
+    AstralError, CardRuleSetBinding, ProjectionAggregate, RuleSetDefinition,
+    RuleSetEntryDefinition, EVENT_TYPE_REVOKE, EVENT_TYPE_RULE_SET_UPDATE, SYSTEM_ACTOR_ID,
 };
 
 use crate::repository::audit_log_repository::{
@@ -28,9 +28,10 @@ use crate::repository::projection_repository::{
 };
 use crate::service::rule_set_write_service::validate_entry_fields;
 
-/// 规则集摘要（列表/详情用，含条目数与绑定卡数）
+/// 规则集摘要（列表/详情用，含 canonical source 与派生计数）。
 #[derive(Debug, Clone)]
 pub struct RuleSetSummary {
+    pub definition: RuleSetDefinition,
     pub id: i64,
     pub name: String,
     pub ref_type: String,
@@ -39,7 +40,8 @@ pub struct RuleSetSummary {
     pub bound_card_count: i64,
 }
 
-/// 规则集基础行（rule_set，通过 SQL 别名映射）
+/// Legacy SQL row shape retained for callers that still import this repository type.
+/// Production reads use the private complete row and `RuleSetDefinition` instead.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RuleSetRow {
     pub id: i64,
@@ -48,7 +50,8 @@ pub struct RuleSetRow {
     pub description: Option<String>,
 }
 
-/// 规则集条目（rule_set_entry）
+/// Legacy entry row shape retained for compatibility; production reads return the
+/// complete shared `RuleSetEntryDefinition`.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RuleSetEntryRow {
     pub entry_id: i64,
@@ -60,7 +63,8 @@ pub struct RuleSetEntryRow {
     pub priority: i32,
 }
 
-/// 卡片规则集绑定（card_rule_set_ref + rule_set 展示字段）
+/// Legacy binding join row retained for stable repository callers.
+/// Production reads use `CardRuleSetBindingView` with its complete canonical binding.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CardRuleSetBindingRow {
     pub rule_set_id: i64,
@@ -68,6 +72,19 @@ pub struct CardRuleSetBindingRow {
     pub rule_set_code: String,
     pub ref_type: String,
 }
+
+/// Complete binding read view: canonical source binding plus joined display fields.
+#[derive(Debug, Clone)]
+pub struct CardRuleSetBindingView {
+    pub binding: CardRuleSetBinding,
+    pub rule_set_name: String,
+    pub rule_set_code: String,
+}
+
+mod read_model;
+use read_model::{
+    CardRuleSetBindingSqlRow, RuleSetEntrySqlRow, RuleSetSqlRow, ENTRY_SELECT, RULE_SET_SELECT,
+};
 
 /// 新建规则集参数
 ///
@@ -83,8 +100,8 @@ pub struct NewRuleSet {
 /// 规则集更新补丁（generic update 只允许变更 name/description）
 ///
 /// source_type 是所有权判别器，generic update 不可变：本结构体刻意不携带
-/// ref_type/source_type 字段，使所有权改写在类型层面不可表达。wire DTO 仍接受
-/// `refType`，但 HTTP adapter 不再把它转发为变更字段。
+/// ref_type/source_type 字段，使所有权改写在类型层面不可表达。wire DTO 可提供
+/// `refType` 作为当前 source_type 的一致性断言；HTTP adapter 不把它转发为变更字段。
 #[derive(Debug)]
 pub struct RuleSetPatch {
     pub name: String,
@@ -112,10 +129,6 @@ pub struct RuleSetEntryPatch {
     pub condition_json: Option<String>,
     pub priority: i32,
 }
-
-const RULE_SET_SELECT: &str = "rule_set_id as id, name, source_type as ref_type, description";
-const ENTRY_SELECT: &str =
-    "entry_id, effect, resource_type, resource_id, action_code, condition_json, priority";
 
 #[async_trait]
 pub trait RuleSetRepository: Send + Sync {
@@ -151,8 +164,17 @@ pub trait RuleSetRepository: Send + Sync {
         rule_set_id: i64,
         context: &RuleSetMutationContext,
     ) -> Result<bool, AstralError>;
-    /// 规则集条目列表（ORDER BY priority）
-    async fn list_entries(&self, rule_set_id: i64) -> Result<Vec<RuleSetEntryRow>, AstralError>;
+    /// 规则集条目列表（ORDER BY priority），返回完整 canonical source rows。
+    async fn list_entries(
+        &self,
+        rule_set_id: i64,
+    ) -> Result<Vec<RuleSetEntryDefinition>, AstralError>;
+    /// 读取单个完整 canonical source entry，供 mutation 成功响应回读。
+    async fn get_entry(
+        &self,
+        rule_set_id: i64,
+        entry_id: i64,
+    ) -> Result<Option<RuleSetEntryDefinition>, AstralError>;
     /// 新建条目，返回新 entry_id
     async fn add_entry(
         &self,
@@ -183,11 +205,11 @@ pub trait RuleSetRepository: Send + Sync {
         entries: &[NewRuleSetEntry],
         context: &RuleSetMutationContext,
     ) -> Result<(), AstralError>;
-    /// 查询卡片绑定的规则集。
+    /// 查询卡片绑定的完整 canonical source 与规则集展示字段。
     async fn list_card_bindings(
         &self,
         card_id: i64,
-    ) -> Result<Vec<CardRuleSetBindingRow>, AstralError>;
+    ) -> Result<Vec<CardRuleSetBindingView>, AstralError>;
     /// 绑定卡（card_rule_set_ref）
     async fn bind_card(
         &self,
@@ -240,12 +262,12 @@ impl SqlxRuleSetRepository {
 /// 对 id 列表批量取 COUNT（GROUP BY ... IN (...)），消除 N+1。
 async fn summarize(
     db: &MySqlPool,
-    rows: Vec<RuleSetRow>,
+    rows: Vec<RuleSetDefinition>,
 ) -> Result<Vec<RuleSetSummary>, AstralError> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    let ids: Vec<i64> = rows.iter().map(|r| r.rule_set_id).collect();
 
     let mut entry_builder = QueryBuilder::<sqlx::MySql>::new(
         "SELECT rule_set_id, COUNT(*) FROM rule_set_entry WHERE rule_set_id IN (",
@@ -282,13 +304,17 @@ async fn summarize(
 
     Ok(rows
         .into_iter()
-        .map(|r| RuleSetSummary {
-            id: r.id,
-            name: r.name,
-            ref_type: r.ref_type,
-            description: r.description,
-            entry_count: entry_map.get(&r.id).copied().unwrap_or(0),
-            bound_card_count: ref_map.get(&r.id).copied().unwrap_or(0),
+        .map(|definition| {
+            let rule_set_id = definition.rule_set_id;
+            RuleSetSummary {
+                id: rule_set_id,
+                name: definition.name.clone(),
+                ref_type: definition.source_type.clone(),
+                description: definition.description.clone(),
+                definition,
+                entry_count: entry_map.get(&rule_set_id).copied().unwrap_or(0),
+                bound_card_count: ref_map.get(&rule_set_id).copied().unwrap_or(0),
+            }
         })
         .collect())
 }
@@ -2284,19 +2310,22 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<RuleSetSummary>, AstralError> {
-        let rows = sqlx::query_as::<_, RuleSetRow>(&format!(
+        let rows = sqlx::query_as::<_, RuleSetSqlRow>(&format!(
             "SELECT {RULE_SET_SELECT} FROM rule_set ORDER BY rule_set_id LIMIT ? OFFSET ?"
         ))
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.db)
         .await
-        .map_err(db_error)?;
+        .map_err(db_error)?
+        .into_iter()
+        .map(RuleSetDefinition::from)
+        .collect();
         summarize(&self.db, rows).await
     }
 
     async fn get_rule_set(&self, rule_set_id: i64) -> Result<Option<RuleSetSummary>, AstralError> {
-        let row = sqlx::query_as::<_, RuleSetRow>(&format!(
+        let row = sqlx::query_as::<_, RuleSetSqlRow>(&format!(
             "SELECT {RULE_SET_SELECT} FROM rule_set WHERE rule_set_id=?"
         ))
         .bind(rule_set_id)
@@ -2306,7 +2335,10 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         let Some(row) = row else {
             return Ok(None);
         };
-        Ok(summarize(&self.db, vec![row]).await?.into_iter().next())
+        Ok(summarize(&self.db, vec![row.into()])
+            .await?
+            .into_iter()
+            .next())
     }
 
     async fn create_rule_set(
@@ -2597,13 +2629,33 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         Ok(true)
     }
 
-    async fn list_entries(&self, rule_set_id: i64) -> Result<Vec<RuleSetEntryRow>, AstralError> {
-        sqlx::query_as::<_, RuleSetEntryRow>(&format!(
+    async fn list_entries(
+        &self,
+        rule_set_id: i64,
+    ) -> Result<Vec<RuleSetEntryDefinition>, AstralError> {
+        sqlx::query_as::<_, RuleSetEntrySqlRow>(&format!(
             "SELECT {ENTRY_SELECT} FROM rule_set_entry WHERE rule_set_id=? ORDER BY priority"
         ))
         .bind(rule_set_id)
         .fetch_all(&self.db)
         .await
+        .map(|rows| rows.into_iter().map(RuleSetEntryDefinition::from).collect())
+        .map_err(db_error)
+    }
+
+    async fn get_entry(
+        &self,
+        rule_set_id: i64,
+        entry_id: i64,
+    ) -> Result<Option<RuleSetEntryDefinition>, AstralError> {
+        sqlx::query_as::<_, RuleSetEntrySqlRow>(&format!(
+            "SELECT {ENTRY_SELECT} FROM rule_set_entry WHERE rule_set_id=? AND entry_id=?"
+        ))
+        .bind(rule_set_id)
+        .bind(entry_id)
+        .fetch_optional(&self.db)
+        .await
+        .map(|row| row.map(RuleSetEntryDefinition::from))
         .map_err(db_error)
     }
 
@@ -3029,9 +3081,10 @@ impl RuleSetRepository for SqlxRuleSetRepository {
     async fn list_card_bindings(
         &self,
         card_id: i64,
-    ) -> Result<Vec<CardRuleSetBindingRow>, AstralError> {
-        sqlx::query_as::<_, CardRuleSetBindingRow>(
-            "SELECT ref.rule_set_id, rs.name AS rule_set_name, rs.code AS rule_set_code, ref.ref_type \
+    ) -> Result<Vec<CardRuleSetBindingView>, AstralError> {
+        sqlx::query_as::<_, CardRuleSetBindingSqlRow>(
+            "SELECT ref.id, ref.card_id, ref.rule_set_id, ref.ref_type, ref.created_at, ref.tenant_id, \
+             rs.name AS rule_set_name, rs.code AS rule_set_code \
              FROM card_rule_set_ref ref \
              INNER JOIN rule_set rs ON rs.rule_set_id = ref.rule_set_id \
              WHERE ref.card_id = ? ORDER BY ref.ref_type, ref.rule_set_id",
@@ -3039,6 +3092,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         .bind(card_id)
         .fetch_all(&self.db)
         .await
+        .map(|rows| rows.into_iter().map(CardRuleSetBindingView::from).collect())
         .map_err(db_error)
     }
 
@@ -3338,7 +3392,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<RuleSetSummary>, AstralError> {
-        let rows = sqlx::query_as::<_, RuleSetRow>(&format!(
+        let rows = sqlx::query_as::<_, RuleSetSqlRow>(&format!(
             "SELECT {RULE_SET_SELECT} FROM rule_set WHERE name LIKE '%admin%' OR name LIKE '%Template%' \
              ORDER BY rule_set_id LIMIT ? OFFSET ?"
         ))
@@ -3346,7 +3400,10 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         .bind(offset)
         .fetch_all(&self.db)
         .await
-        .map_err(db_error)?;
+        .map_err(db_error)?
+        .into_iter()
+        .map(RuleSetDefinition::from)
+        .collect();
         summarize(&self.db, rows).await
     }
 
@@ -3527,6 +3584,53 @@ async fn commit_sync_publish(pool: &sqlx::MySqlPool, surfaces: Vec<RuleSetSyncSu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_rule_set_select_contains_every_source_column() {
+        for column in [
+            "rule_set_id",
+            "name",
+            "code",
+            "description",
+            "source_type",
+            "source_id",
+            "enabled",
+            "created_at",
+            "updated_at",
+            "tenant_id",
+        ] {
+            assert!(
+                RULE_SET_SELECT.contains(column),
+                "missing rule_set column {column}"
+            );
+        }
+        assert!(!RULE_SET_SELECT.contains("source_type as ref_type"));
+    }
+
+    #[test]
+    fn complete_entry_select_contains_validity_and_tenant_columns() {
+        for column in [
+            "entry_id",
+            "rule_set_id",
+            "resource_type",
+            "resource_id",
+            "action_code",
+            "effect",
+            "condition_json",
+            "priority",
+            "enabled",
+            "valid_from",
+            "valid_to",
+            "created_at",
+            "updated_at",
+            "tenant_id",
+        ] {
+            assert!(
+                ENTRY_SELECT.contains(column),
+                "missing entry column {column}"
+            );
+        }
+    }
 
     #[test]
     fn generic_create_source_type_reservation_is_fail_closed() {

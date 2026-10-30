@@ -568,6 +568,17 @@ impl ScopePlanMirror {
             return MirrorAdvanceReport::default();
         };
         let state = &published.publish.published_state;
+        let stamp = match state.publication_stamp() {
+            Ok(stamp) => stamp,
+            Err(_) => {
+                self.poison(&identity);
+                return MirrorAdvanceReport {
+                    frontier_advanced: false,
+                    ledger_row_appended: false,
+                    scope_poisoned: true,
+                };
+            }
+        };
 
         // ── Frontier event: provenance from the payload-bound claim ──
         let frontier_event = PublishedFrontierEvent {
@@ -621,6 +632,7 @@ impl ScopePlanMirror {
         let mut events = publication.frontier.events.clone();
         events.push(frontier_event);
         publication.frontier = PublishedAggregateFrontier {
+            stamp: stamp.clone(),
             identity: publication.frontier.identity,
             card_id: publication.frontier.card_id,
             pointer: AuthorizationCurrentPointerRecord {
@@ -639,6 +651,8 @@ impl ScopePlanMirror {
                 cas_version: state.pointer.cas_version,
             },
             manifest: PublishedGenerationSummary {
+                stamp,
+                seal: state.seal,
                 manifest_id: state.manifest_id,
                 generation: state.generation,
                 source_generation: state.source_generation,
@@ -655,6 +669,14 @@ impl ScopePlanMirror {
             },
             events,
         };
+        if publication.frontier.validate_publication_stamp().is_err() {
+            self.poison(&identity);
+            return MirrorAdvanceReport {
+                frontier_advanced: false,
+                ledger_row_appended: false,
+                scope_poisoned: true,
+            };
+        }
         // Parent reference hints are dropped on advance: staging then plans
         // every segment as New (the documented production reality), which can
         // never falsely reuse a parent row. Digest-based reuse remains

@@ -7,7 +7,9 @@
 //!   `20260825000002_incremental_projection_archive.sql` 与
 //!   `20260827000001_authorization_projection_lineage_fence.sql` 建立的
 //!   `authorization_projection_*` / `authorization_archive_*` 表及
-//!   lineage/revoke-fence 列。
+//!   lineage/revoke-fence 列，以及
+//!   `20261027000001_authorization_projection_manifest_v3.sql` 的必填 v3
+//!   摘要版本和封存时间列。
 //! - 连接与 schema 契约通过 `astral_db::connect_and_validate_schema` 做只读
 //!   预检（不执行任何 DDL）；本文件再显式检查六张投影表存在。表缺失时按
 //!   迁移未应用处理：默认显式 `[SKIP]`；`RUST_INTEGRATION_REQUIRED=1` 时
@@ -396,6 +398,31 @@ async fn stage_and_finalize_manifest(
     assert_eq!(stage_outcome.reused_segment_count, 0);
     assert_eq!(stage_outcome.total_grant_count, grants.len() as u64);
     assert_eq!(stage_outcome.target_generation, generation);
+    assert_eq!(
+        stage_outcome.seal.digest_version(),
+        astral_types::PublicationSeal::DIGEST_VERSION
+    );
+    {
+        let mut retry_tx = pool.begin().await.unwrap();
+        let resumed = stage_authorization_manifest_in_tx(&mut retry_tx, &stage_request)
+            .await
+            .expect("the same candidate must resume its durable seal");
+        retry_tx.commit().await.unwrap();
+        assert!(resumed.resumed_existing_manifest);
+        assert_eq!(resumed.manifest_id, stage_outcome.manifest_id);
+        assert_eq!(resumed.seal, stage_outcome.seal);
+        assert_eq!(resumed.manifest_digest, stage_outcome.manifest_digest);
+
+        let mut conflicting = stage_request.clone();
+        conflicting.operation_id.push_str("-conflict");
+        let mut conflict_tx = pool.begin().await.unwrap();
+        assert!(
+            stage_authorization_manifest_in_tx(&mut conflict_tx, &conflicting)
+                .await
+                .is_err()
+        );
+        conflict_tx.rollback().await.unwrap();
+    }
     if generation == 1 {
         assert!(
             stage_outcome.base_pointer.is_none(),
@@ -739,6 +766,17 @@ async fn stage_finalize_publish_round_trip_yields_strict_card_evidence() {
         assert_eq!(state.segments.len(), 1);
         assert_eq!(state.segments[0].grants, gen1.payload_grants);
         assert_eq!(state.total_grant_count, 2);
+        assert_eq!(state.seal, outcome1.published_state.seal);
+        assert_eq!(state.manifest_digest, gen1.manifest_digest);
+    }
+    for mutation in [
+        "UPDATE authorization_projection_manifest SET sealed_at = TIMESTAMPADD(SECOND, 1, sealed_at) WHERE manifest_id = ?",
+        "UPDATE authorization_projection_manifest SET manifest_digest_version = 2 WHERE manifest_id = ?",
+    ] {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(mutation).bind(gen1.manifest_id).execute(&mut *tx).await.unwrap();
+        assert!(read_published_authorization_state_in_tx(&mut tx, &identity).await.is_err());
+        tx.rollback().await.unwrap();
     }
 
     // ── 第二代：真实增量（新内容），lineage 必须指向第一代 ──
@@ -792,6 +830,7 @@ async fn stage_finalize_publish_round_trip_yields_strict_card_evidence() {
     assert_eq!(evidence.manifests.len(), 1);
     assert_eq!(evidence.manifests[0].generation, 2);
     assert_eq!(evidence.manifests[0].manifest_id, gen2.manifest_id);
+    assert_eq!(evidence.manifests[0].seal, outcome2.published_state.seal);
     assert_eq!(
         evidence.manifests[0].parent_manifest_id,
         Some(gen1.manifest_id)

@@ -8,17 +8,18 @@
 //!
 //! - **命中前提是"指针对牌"**：`authorization_projection_current` 卡作用域
 //!   **全部**指针行的版本组（`aggregate_type`/`aggregate_id`/`manifest_id`/
-//!   `current_generation`/`revoke_fence`，含集合形状）与填充时刻逐项相等
+//!   `current_generation`/`revoke_fence` 和完整 publication stamp，含集合形状）
+//!   与填充时刻逐项相等
 //!   （基准组来自 `crate::permission_query::evidence_manifest_versions`，
-//!   现场组来自 `crate::permission_query::load_pointer_fence_versions`，
+//!   现场组来自 `crate::permission_query::load_card_scope_fence_snapshot`，
 //!   两者同源同形），且共享缓存时代（`crate::cache_epoch`）严格一致。
 //! - **正确性论证（pointer 未变 ⇒ evidence 未变）**：published evidence 是
 //!   content-addressed 的 —— segment 载荷 sha256 重算比对、seal 校验、
 //!   manifest digest 重算、pointer↔manifest 一致性全部由严格 reader 在读取
 //!   时刻封死（任何篡改 = `Corrupt` fail-closed）。reader 产物完全由
 //!   `(聚合身份, manifest)` 集合决定；manifest 身份由指针行
-//!   `(current_generation, manifest_id, revoke_fence)` 唯一确定。因此指针
-//!   版本组逐项相等 ⇒ 指针仍指向同一批 COMMITTED manifest ⇒ 严格 reader
+//!   `(current_generation, manifest_id, revoke_fence, publication_stamp)` 共同
+//!   约束。因此完整版本组逐项相等 ⇒ 指针仍指向同一批 COMMITTED manifest ⇒ 严格 reader
 //!   在本进程任何时刻重读都会产出**同一份**证据（`read_unix_seconds` 除外，
 //!   见下节）。对牌是对"证据内容未变"的等价判定，不是对缓存字节的信任。
 //! - **复读交互（engine ALLOW 前复读的等价替换）**：命中路径的复读
@@ -88,7 +89,7 @@
 //!   - 共享内容单元键 `L2_EVIDENCE_SHARED_KEY_PREFIX`
 //!     `astral:auth:l2sh:{cache_epoch}:{tenant_id}:{digest}` —— **tenant+时代
 //!     限定**的内容寻址 RULE_SET 存储单元（见"去重边界"）。
-//! - **值 JSON（schema 3 因子化存储形态）**：`L2EvidenceEntry` `{
+//! - **值 JSON（当前授权 edition，沿用因子化存储形态）**：`L2EvidenceEntry` `{
 //!   schema_version, manifest_versions（与 L1 基准组同结构
 //!   [`PermissionCacheManifestVersion`]，逐卡 envelope）, content_hash, mac,
 //!   payload }`。`payload` 是**因子化存储形态**
@@ -101,8 +102,8 @@
 //!   同序同内容）展开，**身份字段全部来自逐卡 envelope，读侧绝不改写、补盖
 //!   或重定戳任何身份**。`content_hash` = **重建后完整 payload** 序列化 JSON
 //!   的 sha256（独立于 MAC 的全载荷完整性校验：不匹配即污染/部分写/重建偏差，
-//!   删除该卡键并回源）。schema 1/2 旧条目在升级后按 schema 失配自然 purge
-//!   自愈（与 permission_query v4 envelope 的既有先例同一模式）。
+//!   删除该卡键并回源）。非当前 edition 条目按版本失配 purge 后严格回源，
+//!   不补造缺失的 publication stamp。
 //! - **HMAC 认证（强制，fail-closed）**：每张卡证据条目携带
 //!   `mac = HMAC-SHA256(ASTRAL_L2_EVIDENCE_HMAC_SECRET, 规范序列化 cover)`，
 //!   cover 绑定：域分隔符（`L2_MAC_DOMAIN`）+ **精确 Redis 键**（防键间
@@ -156,9 +157,9 @@
 //!   一次并推入 L2（方案 a：与 miss 回源同源同实现，天然 parity，无需另建
 //!   candidate→evidence 构造函数）。推送失败静默：L2 miss 的自然回源保证
 //!   正确性，推送只是跨实例共享优化，不构成 durable 义务。
-//! - **范围边界（本切片外）**：Java 侧缓存家族（`perm:card:status` 等）、
-//!   permission_query v4 envelope 与其它无关键族不在本变更内；本模块只触碰
-//!   `astral:auth:l2ev:*` 与 `astral:auth:l2sh:*` 两个 Rust 专属键族。
+//! - **范围边界**：Java 侧缓存家族（`perm:card:status` 等）、
+//!   permission_query v6 envelope 与其它键族不在本模块的 L2 HMAC 范围内；
+//!   本模块只触碰 `astral:auth:l2ev:*` 与 `astral:auth:l2sh:*` 两个 Rust 专属键族。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -314,12 +315,12 @@ impl EvidenceReadDeps for MySqlEvidenceReadDeps {
 ///   冗余副本）；
 /// - v2（已退役）：存储形态折叠 `effective_grants`（读侧由合同定理唯一重建）
 ///   + 卡作用域绑定校验；
-/// - v3（已退役）：因子化存储形态 + HMAC-SHA256 条目认证 + 记录级作用域绑定；
-/// - v4（现行）：在 v3 基础上新增**卡作用域未发布 delta 位**
-///   `card_source_pending`（source 提交未发布的越权窗口内条目整体失配 →
-///   purge 回源撞 source-freshness 门）。旧 v1/v2/v3 条目按 schema 失配自然
-///   purge 自愈，无需人工清理。
-pub const L2_EVIDENCE_SCHEMA_VERSION: i64 = 4;
+/// - v3（已退役）：因子化存储形态 + HMAC-SHA256 和记录级作用域绑定；
+/// - v4（已退役）：新增卡作用域未发布 delta 位 `card_source_pending`；
+/// - 当前授权 edition：完整 `PublicationStamp` 加入版本组、对牌和 MAC cover，
+///   同代 hash/time 漂移失配。旧 edition 1–5 条目按 schema 失配 purge 回源，
+///   不以当前时间或旧字段补造 stamp。
+pub const L2_EVIDENCE_SCHEMA_VERSION: i64 = astral_types::AUTHORIZATION_EDITION as i64;
 
 /// L2 条目 TTL（300s）：L1 的 30s 封顶内存驻留之上，"冷实例少一次 DB 读"的
 /// 共享驻留上限；内容时效由 L1 的时钟重验 + 本层 L2 命中时的时钟重验与双读
@@ -349,7 +350,7 @@ pub(crate) const L2_HMAC_SECRET_MIN_LENGTH: usize = 32;
 /// MAC 域分隔符：把密钥用途钉死在"L2 evidence 条目认证"，杜绝同一密钥被
 /// （有意或无意）复用到其它协议时的跨协议重放。域分隔进入 MAC cover 的
 /// 规范序列化首字段。
-pub(crate) const L2_MAC_DOMAIN: &str = "astral:l2-evidence:v4:hmac-sha256";
+pub(crate) const L2_MAC_DOMAIN: &str = astral_types::AUTHORIZATION_L2_MAC_DOMAIN;
 
 /// 共享内容单元键前缀（Rust 专属命名空间）：完整键为
 /// `{前缀}{cache_epoch}:{tenant_id}:{digest}` —— tenant+时代限定、内容寻址。
@@ -359,8 +360,8 @@ pub(crate) const L2_EVIDENCE_SHARED_KEY_PREFIX: &str = "astral:auth:l2sh:";
 /// 因子化；其它聚合（USER_CARD/CARD/APPROVAL/DELEGATION）完整内联。
 pub(crate) const L2_SHARED_UNIT_AGGREGATE_TYPE: &str = "RULE_SET";
 
-/// 共享内容单元自身 schema 版本（独立于卡条目 schema；自校验字段之一）。
-pub(crate) const L2_SHARED_UNIT_SCHEMA_VERSION: i64 = 1;
+/// 共享内容单元自身 schema 版本（与卡条目共同随授权 edition 发布）。
+pub(crate) const L2_SHARED_UNIT_SCHEMA_VERSION: i64 = astral_types::AUTHORIZATION_EDITION as i64;
 
 /// 已知的占位符/示例密钥标记（大小写不敏感子串匹配）：环境变量携带这些
 /// 标记视为占位符配置 → fail-closed 旁路，绝不以占位符密钥认证授权证据。
@@ -591,7 +592,7 @@ pub fn l2_evidence_key(cache_epoch: &str, tenant_id: i64, card_id: i64) -> Strin
     format!("{L2_EVIDENCE_KEY_PREFIX}{cache_epoch}:{tenant_id}:{card_id}")
 }
 
-/// L2 条目（JSON 载荷，schema 3 因子化存储形态）：`manifest_versions` 与 L1
+/// L2 条目（JSON 载荷，当前 edition 因子化存储形态）：`manifest_versions` 与 L1
 /// 基准组同结构同源（[`PermissionCacheManifestVersion`]）且**逐卡私有**；
 /// `content_hash` 绑定**重建后完整 payload** 的序列化字节（写侧对完整证据
 /// 计算、读侧对重建结果重验，独立于 MAC 的全载荷完整性校验）；`mac` 为强制
@@ -990,7 +991,7 @@ async fn try_l2_evidence_hit(
     let Some(raw) = raw else {
         return L2Lookup::Bypass;
     };
-    // schema 探针先行：旧 v1/v2 条目按精确原因 purge 自愈。
+    // schema 探针先行：任何旧授权 edition 条目按精确原因 purge 自愈。
     let probe: L2EntrySchemaProbe = match serde_json::from_str(&raw) {
         Ok(probe) => probe,
         Err(error) => {
@@ -1008,7 +1009,9 @@ async fn try_l2_evidence_hit(
             return L2Lookup::Purge("undecodable");
         }
     };
-    if entry.manifest_versions != pre_fence.manifest_versions
+    if !pre_fence.is_valid()
+        || pre_fence.card_source_pending
+        || entry.manifest_versions != pre_fence.manifest_versions
         || entry.card_source_pending != pre_fence.card_source_pending
     {
         return L2Lookup::Purge("fence_mismatch");
@@ -1079,7 +1082,10 @@ async fn try_l2_evidence_hit(
     // 载荷与版本组的绑定一致性：payload 自身推导的版本组必须与随条目携带
     // （且已通过对牌）的版本组一致，防止条目内部"版本组与内容"被拼接。
     // （pending 位是作用域级标志，不派生自 payload，绑定校验只针对版本组。）
-    if evidence_manifest_versions(&payload) != pre_fence.manifest_versions {
+    let Ok(payload_versions) = evidence_manifest_versions(&payload) else {
+        return L2Lookup::Purge("payload_fence_binding");
+    };
+    if payload_versions != pre_fence.manifest_versions {
         return L2Lookup::Purge("payload_fence_binding");
     }
     if !cached_evidence_is_clock_fresh(&payload, now_unix_seconds) {
@@ -1130,7 +1136,7 @@ async fn fetch_verified_shared_units(
     L2UnitFetch::Verified(units)
 }
 
-/// 写入/刷新一条 L2 条目（schema 3 因子化存储形态 + content_hash + 强制
+/// 写入/刷新一条 L2 条目（当前 edition 因子化存储形态 + content_hash + 强制
 /// MAC；失败静默 warn —— L2 miss 的自然回源保证正确性，写侧不构成 durable
 /// 义务）。`mac_secret` 为 `None`（HMAC 密钥不可用）→ 整体跳过（fail-closed：
 /// 绝不写入未认证条目）。
@@ -1155,6 +1161,14 @@ async fn write_l2_evidence(
             card_id = evidence.card_id,
             "l2 hmac secret unavailable; skipping L2 write (fail-closed)"
         );
+        return;
+    };
+    if let Err(error) = evidence.validate() {
+        tracing::warn!(%error, "invalid evidence cannot enter L2");
+        return;
+    }
+    let Ok(manifest_versions) = evidence_manifest_versions(evidence) else {
+        tracing::warn!("invalid publication identity cannot enter L2");
         return;
     };
     let Ok(full_json) = serde_json::to_string(evidence) else {
@@ -1185,7 +1199,6 @@ async fn write_l2_evidence(
         );
         return;
     }
-    let manifest_versions = evidence_manifest_versions(evidence);
     let content_hash = l2_content_hash(&full_json);
     let key = l2_evidence_key(cache_epoch, evidence.tenant_id, evidence.card_id);
     let mac = l2_entry_mac_hex(
@@ -1428,7 +1441,7 @@ pub async fn load_evidence_through_cache_with_mac<D: EvidenceReadDeps>(
                 .card_scope_fence_snapshot(scope.tenant_id, scope.card_id)
                 .await
             {
-                if fence == entry.baseline {
+                if fence.is_valid() && !fence.card_source_pending && fence == entry.baseline {
                     // 读后复读对牌：发布落在两次栅栏读之间 → 不放行旧条目。
                     if let Ok(recheck) = deps
                         .card_scope_fence_snapshot(scope.tenant_id, scope.card_id)
@@ -1507,7 +1520,7 @@ pub async fn load_evidence_through_cache_with_mac<D: EvidenceReadDeps>(
                                     key,
                                     EvidenceCacheEntry {
                                         evidence: std::sync::Arc::clone(&evidence),
-                                        baseline: evidence_fence_baseline(&evidence),
+                                        baseline: pre_fence,
                                         cache_epoch: cache_epoch.to_owned(),
                                     },
                                 )
@@ -1571,6 +1584,7 @@ pub async fn load_evidence_through_cache_with_mac<D: EvidenceReadDeps>(
             "code=evidence_cache.fill_contract_rejected;detail={contract_error}"
         )));
     }
+    let baseline = evidence_fence_baseline(&evidence)?;
     if let Some(epoch) = current_epoch.as_deref() {
         // 当前时代未知（Redis 降级）→ 不填充：严格 current 语义下该条目永远
         // 无法命中，写入即死代码，还会掩盖降级窗口。
@@ -1579,7 +1593,7 @@ pub async fn load_evidence_through_cache_with_mac<D: EvidenceReadDeps>(
                 key,
                 EvidenceCacheEntry {
                     evidence: Arc::clone(&evidence),
-                    baseline: evidence_fence_baseline(&evidence),
+                    baseline,
                     cache_epoch: epoch.to_owned(),
                 },
             )
@@ -1928,7 +1942,7 @@ mod tests {
     use super::*;
     use astral_types::{
         BindingLayer, CanonicalGrant, GrantEffect, GrantId, GrantProvenance, GrantRevision,
-        GrantSourceKind, GrantState, PublishedAggregateManifestSummary,
+        GrantSourceKind, GrantState, PublicationSeal, PublishedAggregateManifestSummary,
         PublishedCardAuthorizationGate, PublishedEvidenceGateStatus, TenantScope, ValidityWindow,
         VerifiedPublishedGrantRecord,
     };
@@ -2020,7 +2034,7 @@ mod tests {
                 None,
             )],
         );
-        let baseline = evidence_fence_baseline(&evidence);
+        let baseline = evidence_fence_baseline(&evidence).unwrap();
         assert!(!baseline.card_source_pending);
         let invalidated = CardScopeFenceSnapshot {
             manifest_versions: baseline.manifest_versions.clone(),
@@ -2134,7 +2148,7 @@ mod tests {
             operation_id: "op-1".to_string(),
             semantic_hash_hex: "a".repeat(64),
             dependency_hash_hex: "b".repeat(64),
-            compiler_version: "test".to_string(),
+            compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
             segment_ordinal: 0,
             position_in_segment: 0,
             grant,
@@ -2167,6 +2181,7 @@ mod tests {
             });
             if !present {
                 manifests.push(PublishedAggregateManifestSummary {
+                    seal: PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
                     tenant_id,
                     card_id,
                     aggregate_type: record.aggregate_type.clone(),
@@ -2180,7 +2195,7 @@ mod tests {
                     semantic_hash_hex: "a".repeat(64),
                     dependency_hash_hex: "b".repeat(64),
                     manifest_digest_hex: "c".repeat(64),
-                    compiler_version: "test".to_string(),
+                    compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
                     event_id: "event-1".to_string(),
                     operation_id: "op-1".to_string(),
                     parent_manifest_id: None,
@@ -2330,7 +2345,7 @@ mod tests {
     }
 
     fn fence_of(evidence: &PublishedCardAuthorization) -> CardScopeFenceSnapshot {
-        evidence_fence_baseline(evidence)
+        evidence_fence_baseline(evidence).unwrap()
     }
 
     fn unsafe_cached_value_omitting_pending_probe(
@@ -2520,6 +2535,7 @@ mod tests {
             manifest_id: 1,
             generation: 1,
             revoke_fence: 0,
+            publication_stamp: rewritten.manifests[0].publication_stamp().unwrap(),
         };
         let mut shaped = fence_of(&rewritten);
         shaped.manifest_versions.push(extra_row);
@@ -3257,7 +3273,7 @@ mod tests {
         l2_evidence_key(epoch, TENANT, CARD)
     }
 
-    /// 经被测写入路径播种：把 evidence 以写侧协议（schema 3/版本组/content_hash/
+    /// 经被测写入路径播种：把 evidence 以写侧协议（当前 edition/版本组/content_hash/
     /// MAC/共享单元先写/TTL）写入内存 L2。
     async fn seed_valid_entry(
         store: &MemoryL2Store,
@@ -3350,6 +3366,157 @@ mod tests {
             units.insert(digest, unit.content);
         }
         l2_reconstruct_full_payload(&entry.payload, &units).expect("full reconstruction")
+    }
+
+    #[tokio::test]
+    async fn same_generation_hash_or_seal_drift_misses_both_cache_layers() {
+        for dimension in 0..2 {
+            let original = single_record_evidence(1_000, 0, 2_000);
+            let mut changed = original.clone();
+            if dimension == 0 {
+                changed.manifests[0].manifest_digest_hex = "cd".repeat(32);
+            } else {
+                changed.manifests[0].seal =
+                    PublicationSeal::from_unix_seconds(1_700_000_001).unwrap();
+            }
+            for use_l2 in [false, true] {
+                let cache = fresh_cache();
+                let l2 = MemoryL2Store::new();
+                if use_l2 {
+                    seed_valid_entry(&l2, EPOCH, &original).await;
+                } else {
+                    let deps = FixtureDeps::new(
+                        vec![Some(EPOCH.into())],
+                        vec![],
+                        vec![Ok(Arc::new(original.clone()))],
+                        1_050,
+                    );
+                    load_with(&deps, &cache).await.unwrap();
+                }
+                let deps = FixtureDeps::new(
+                    vec![Some(EPOCH.into())],
+                    vec![fence_of(&changed)],
+                    vec![Ok(Arc::new(changed.clone()))],
+                    1_050,
+                );
+                let result = if use_l2 {
+                    load_with_l2(&deps, &cache, &l2).await
+                } else {
+                    load_with(&deps, &cache).await
+                }
+                .unwrap();
+                assert_eq!(*result, changed);
+                assert_eq!(deps.strict_calls(), 1, "dimension={dimension};l2={use_l2}");
+                if use_l2 {
+                    assert_eq!(l2.del_calls(), 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn old_cache_schema_and_missing_stamp_are_rejected_without_upgrade() {
+        let evidence = single_record_evidence(1_000, 0, 2_000);
+        let l2 = MemoryL2Store::new();
+        let fence = fence_of(&evidence);
+        let key = l2_key_of(EPOCH);
+        for schema in [1, 2, 3, 4, 5] {
+            l2.seed(
+                &key,
+                &serde_json::json!({"schemaVersion":schema}).to_string(),
+                L2_EVIDENCE_TTL_SECONDS,
+            );
+            assert!(matches!(
+                try_l2_evidence_hit(&l2, TEST_MAC_SECRET, EPOCH, &fence, TENANT, CARD, 1_050).await,
+                L2Lookup::Purge("schema_version")
+            ));
+        }
+        seed_valid_entry(&l2, EPOCH, &evidence).await;
+        let raw = l2.get(&key).await.unwrap().unwrap();
+        let mut missing: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        missing["manifestVersions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("publication_stamp");
+        l2.seed(&key, &missing.to_string(), L2_EVIDENCE_TTL_SECONDS);
+        assert!(matches!(
+            try_l2_evidence_hit(&l2, TEST_MAC_SECRET, EPOCH, &fence, TENANT, CARD, 1_050).await,
+            L2Lookup::Purge("undecodable")
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_publication_is_rejected_without_cache_fill_or_panic() {
+        let mut invalid = single_record_evidence(1_000, 0, 2_000);
+        invalid.manifests[0].manifest_digest_hex = "invalid".to_owned();
+        assert!(evidence_fence_baseline(&invalid).is_err());
+        let l2 = MemoryL2Store::new();
+        write_l2_evidence(&l2, Some(TEST_MAC_SECRET), EPOCH, &invalid).await;
+        assert_eq!(l2.set_calls(), 0);
+        let cache = fresh_cache();
+        let deps = FixtureDeps::new(
+            vec![Some(EPOCH.into())],
+            vec![],
+            vec![Ok(Arc::new(invalid))],
+            1_050,
+        );
+        assert!(matches!(
+            load_with(&deps, &cache).await,
+            Err(AuthorizationEvidenceError::Corrupt(_))
+        ));
+        assert!(cache.get(&(TENANT, CARD)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stamp_tampering_with_matching_fence_still_fails_mac_or_payload_binding() {
+        let evidence = single_record_evidence(1_000, 0, 2_000);
+        for dimension in 0..2 {
+            let l2 = MemoryL2Store::new();
+            seed_valid_entry(&l2, EPOCH, &evidence).await;
+            let key = l2_key_of(EPOCH);
+            let raw = l2.get(&key).await.unwrap().unwrap();
+            let mut entry: L2EvidenceEntry = serde_json::from_str(&raw).unwrap();
+            let stamp = &mut entry.manifest_versions[0].publication_stamp;
+            if dimension == 0 {
+                stamp.manifest_digest_hex = "cd".repeat(32);
+            } else {
+                stamp.seal = PublicationSeal::from_unix_seconds(1_700_000_001).unwrap();
+            }
+            let fence = CardScopeFenceSnapshot {
+                manifest_versions: entry.manifest_versions.clone(),
+                card_source_pending: false,
+            };
+            l2.seed(
+                &key,
+                &serde_json::to_string(&entry).unwrap(),
+                L2_EVIDENCE_TTL_SECONDS,
+            );
+            assert!(matches!(
+                try_l2_evidence_hit(&l2, TEST_MAC_SECRET, EPOCH, &fence, TENANT, CARD, 1_050).await,
+                L2Lookup::Purge("mac")
+            ));
+            entry.mac = l2_entry_mac_hex(
+                TEST_MAC_SECRET,
+                &L2MacCover {
+                    domain: L2_MAC_DOMAIN,
+                    redis_key: &key,
+                    schema_version: L2_EVIDENCE_SCHEMA_VERSION,
+                    manifest_versions: &entry.manifest_versions,
+                    card_source_pending: false,
+                    content_hash: &entry.content_hash,
+                    payload: &evidence,
+                },
+            );
+            l2.seed(
+                &key,
+                &serde_json::to_string(&entry).unwrap(),
+                L2_EVIDENCE_TTL_SECONDS,
+            );
+            assert!(matches!(
+                try_l2_evidence_hit(&l2, TEST_MAC_SECRET, EPOCH, &fence, TENANT, CARD, 1_050).await,
+                L2Lookup::Purge("payload_fence_binding")
+            ));
+        }
     }
 
     /// L2 命中：零严格读 + 零 L2 写；回填 L1 后第二次 load 完全走 L1 命中
@@ -3632,7 +3799,7 @@ mod tests {
         assert_eq!(*next, evidence);
     }
 
-    /// 推送形状：严格读一次 → 以内嵌当前时代的键、schema 3、TTL 300s、
+    /// 推送形状：严格读一次 → 以内嵌当前时代的键、当前 edition、TTL 300s、
     /// content_hash + MAC 与版本组写入（与读侧协议逐字段对齐）。
     #[tokio::test]
     async fn push_writes_epoch_embedded_key_with_hash_and_ttl() {
@@ -3664,7 +3831,7 @@ mod tests {
             fence_of(&evidence).manifest_versions
         );
         assert!(!entry.card_source_pending);
-        // v3 存储形态：USER_CARD 记录内联；重建后与完整证据逐字段 parity；
+        // 当前存储形态：USER_CARD 记录内联；重建后与完整证据逐字段 parity；
         // content_hash 绑定完整证据的序列化字节。
         assert!(
             entry
@@ -3747,10 +3914,8 @@ mod tests {
     }
 
     /// 键族与 TTL/(schema) 常量钉死：epoch 内嵌键形状、L2 TTL 300s 严格大于
-    /// L1 的 30s（取舍见模块文档）、schema 版本 4（v3 因子化存储 + HMAC +
-    /// 记录级作用域绑定的基础上新增卡作用域未发布 delta 位 `card_source_pending`；
-    /// v1 完整直存 / v2 折叠存储 / v3 无 pending 位均已退役，旧条目自然 purge
-    /// 自愈）、共享单元键族形状与专用 HMAC 环境变量名。
+    /// L1 的 30s（取舍见模块文档）、当前授权 edition 由共享常量驱动、
+    /// 共享单元与卡条目使用同一 edition、共享单元键族形状与专用 HMAC 环境变量名。
     #[test]
     fn l2_key_shape_ttl_and_schema_constants_stay_bounded() {
         assert_eq!(
@@ -3761,8 +3926,16 @@ mod tests {
             l2_shared_unit_key("epoch-x", 7, "digest"),
             "astral:auth:l2sh:epoch-x:7:digest"
         );
-        assert_eq!(L2_EVIDENCE_SCHEMA_VERSION, 4);
-        assert_eq!(L2_SHARED_UNIT_SCHEMA_VERSION, 1);
+        assert_eq!(
+            L2_EVIDENCE_SCHEMA_VERSION,
+            astral_types::AUTHORIZATION_EDITION as i64
+        );
+        assert_eq!(
+            L2_SHARED_UNIT_SCHEMA_VERSION,
+            astral_types::AUTHORIZATION_EDITION as i64
+        );
+        assert_eq!(L2_EVIDENCE_SCHEMA_VERSION, L2_SHARED_UNIT_SCHEMA_VERSION);
+        assert_eq!(L2_MAC_DOMAIN, astral_types::AUTHORIZATION_L2_MAC_DOMAIN);
         assert_eq!(L2_EVIDENCE_TTL_SECONDS, 300);
         assert!(L2_EVIDENCE_TTL_SECONDS > EVIDENCE_CACHE_TTL.as_secs());
         assert_eq!(L2_EVIDENCE_CARD_AGGREGATE_TYPE, "CARD");
@@ -3816,7 +3989,7 @@ mod tests {
     }
 
     // =====================================================================
-    // L2 条目合同 v3 回归矩阵：因子化存储 + 共享单元 + HMAC + 记录级作用域
+    // L2 条目当前合同回归矩阵：因子化存储 + 共享单元 + HMAC + 记录级作用域
     // =====================================================================
 
     /// v3 因子化往返（真实写路径）：混合 USER_CARD/RULE_SET、accepted/排除
@@ -4170,7 +4343,91 @@ mod tests {
         assert_eq!(*next, evidence);
     }
 
-    /// 跨卡投毒：卡 B 的完整证据（哈希对 B 一致、条目栅栏伪造为卡 A 的当前
+    /// 共享单元非当前授权 edition → 自校验版本门禁拒绝并 purge 卡条目；
+    /// 严格 reader 回源后由当前 edition 重填。
+    #[tokio::test]
+    async fn l2_shared_unit_retired_schema_rejected_and_refilled() {
+        for schema in (1..L2_SHARED_UNIT_SCHEMA_VERSION)
+            .chain(std::iter::once(L2_SHARED_UNIT_SCHEMA_VERSION + 1))
+        {
+            let evidence = fixture_evidence(
+                1_000,
+                vec![fixture_record(
+                    "RULE_SET",
+                    5,
+                    10,
+                    fixture_grant(2, ValidityWindow::between(0, 2_000)),
+                    true,
+                    None,
+                )],
+            );
+            let cache = fresh_cache();
+            let l2 = MemoryL2Store::new();
+            seed_valid_entry(&l2, EPOCH, &evidence).await;
+            let digest = {
+                let entry: L2EvidenceEntry = serde_json::from_str(
+                    &l2.entries
+                        .lock()
+                        .unwrap()
+                        .get(&l2_key_of(EPOCH))
+                        .expect("entry")
+                        .0,
+                )
+                .expect("entry json");
+                l2_referenced_unit_digests(&entry.payload)
+                    .into_iter()
+                    .next()
+                    .expect("digest")
+            };
+            let unit_key = l2_shared_unit_key(EPOCH, TENANT, &digest);
+            let mut unit: L2SharedUnit =
+                serde_json::from_str(&l2.entries.lock().unwrap().get(&unit_key).expect("unit").0)
+                    .expect("unit json");
+            unit.unit_schema_version = schema;
+            l2.seed(
+                &unit_key,
+                &serde_json::to_string(&unit).expect("retired unit json"),
+                L2_EVIDENCE_TTL_SECONDS,
+            );
+
+            let deps = FixtureDeps::new(
+                vec![Some(EPOCH.into())],
+                vec![fence_of(&evidence)],
+                vec![Ok(std::sync::Arc::new(evidence.clone()))],
+                1_050,
+            );
+            let reloaded = load_with_l2(&deps, &cache, &l2)
+                .await
+                .expect("retired shared unit must fall back to strict reader");
+            assert_eq!(deps.strict_calls(), 1, "retired unit must never serve");
+            assert_eq!(l2.del_calls(), 1, "retired unit must purge the card entry");
+            assert_eq!(*reloaded, evidence);
+            let refilled: L2EvidenceEntry = serde_json::from_str(
+                &l2.entries
+                    .lock()
+                    .unwrap()
+                    .get(&l2_key_of(EPOCH))
+                    .expect("refilled entry")
+                    .0,
+            )
+            .expect("refilled entry json");
+            assert_eq!(refilled.schema_version, L2_EVIDENCE_SCHEMA_VERSION);
+            let refilled_unit: L2SharedUnit = serde_json::from_str(
+                &l2.entries
+                    .lock()
+                    .unwrap()
+                    .get(&unit_key)
+                    .expect("refilled unit")
+                    .0,
+            )
+            .expect("refilled unit json");
+            assert_eq!(
+                refilled_unit.unit_schema_version,
+                L2_SHARED_UNIT_SCHEMA_VERSION
+            );
+        }
+    }
+
     /// 栅栏）挂在卡 A 的键下 → 卡作用域绑定失败 → 删键回源；A 只能收到 A 的
     /// 严格证据，绝不放行 B 的授权，也绝不把 B 的身份改写成 A。
     #[tokio::test]
@@ -4346,14 +4603,14 @@ mod tests {
         assert_eq!(*next, evidence);
     }
 
-    /// v3 形状违约：payload 携带旧 v2 完整载荷形状（records 无槽位标签、
+    /// 当前形状违约：payload 携带旧 v2 完整载荷形状（records 无槽位标签、
     /// 含 effectiveGrants）→ 解码失败 → 删键回源；非因子化载荷绝不被信任。
     #[tokio::test]
     async fn l2_non_factored_payload_undecodable_purges() {
         let evidence = single_record_evidence(1_000, 0, 2_000);
         let cache = fresh_cache();
         let l2 = MemoryL2Store::new();
-        // 手工把 v2 完整 payload 塞进 schema 3 条目（哈希对完整形式一致、
+        // 手工把 v2 完整 payload 塞进当前 edition 条目（哈希对完整形式一致、
         // MAC 合法）—— 只有因子化形状门槛能拦下。
         let stuffed = serde_json::json!({
             "schemaVersion": L2_EVIDENCE_SCHEMA_VERSION,

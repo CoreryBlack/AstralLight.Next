@@ -2191,8 +2191,8 @@ fn record_verified_baseline_is_default_deny_for_post_baseline_migrations() {
             .iter()
             .map(|migration| migration.version)
             .max(),
-        Some(PROJECTION_OWNED_EXECUTION_VERSION),
-        "the aggregate-owned execution migration is the current chain tail"
+        Some(AUTHORIZATION_PROJECTION_MANIFEST_V3_VERSION),
+        "the v3 manifest seal migration is the current chain tail"
     );
     assert!(!is_java_baseline_era(20261005000001));
     assert!(MIGRATOR
@@ -3654,6 +3654,7 @@ fn resolved_runtime_contract_layers_lineage_columns_after_creator_tail() {
                 .iter()
                 .chain(DELTA_EVENT_PUBLISHED_EVIDENCE_INVALIDATION_COLUMN_CONTRACTS.iter())
                 .chain(PROJECTION_OWNED_EXECUTION_DELTA_COLUMN_CONTRACTS.iter())
+                .chain(AUTHORIZATION_PROJECTION_MANIFEST_V3_COLUMN_CONTRACTS.iter())
                 .filter(|expected| expected.table == *table)
                 .copied()
                 .collect();
@@ -3673,9 +3674,11 @@ fn resolved_runtime_contract_layers_lineage_columns_after_creator_tail() {
         // Declared order inside the manifest table keeps parent before the
         // fence so byte-for-byte replay checks have a stable layout.
         if *table == "authorization_projection_manifest" {
-            assert_eq!(declared_tail.len(), 2);
+            assert_eq!(declared_tail.len(), 4);
             assert_eq!(declared_tail[0].name, "parent_manifest_id");
             assert_eq!(declared_tail[1].name, "revoke_fence");
+            assert_eq!(declared_tail[2].name, "manifest_digest_version");
+            assert_eq!(declared_tail[3].name, "sealed_at");
         }
         if *table == "authorization_delta_event" {
             assert_eq!(declared_tail.len(), 6);
@@ -3721,6 +3724,7 @@ fn owned_execution_archive_tail_is_exact_and_history_gated() {
             &names[..present],
             Some(true),
             Some(true),
+            Some(false),
             Some(false)
         )
         .is_ok());
@@ -3731,7 +3735,8 @@ fn owned_execution_archive_tail_is_exact_and_history_gated() {
                 &names[..present],
                 Some(true),
                 Some(true),
-                Some(true)
+                Some(true),
+                Some(false)
             )
             .is_ok(),
             present == names.len()
@@ -3743,6 +3748,7 @@ fn owned_execution_archive_tail_is_exact_and_history_gated() {
         &names[..base.len()],
         Some(true),
         Some(true),
+        Some(false),
         Some(false)
     )
     .is_err());
@@ -3754,7 +3760,8 @@ fn owned_execution_archive_tail_is_exact_and_history_gated() {
         &reordered,
         Some(true),
         Some(true),
-        Some(true)
+        Some(true),
+        Some(false)
     )
     .is_err());
     let mut unknown = names.clone();
@@ -3765,7 +3772,8 @@ fn owned_execution_archive_tail_is_exact_and_history_gated() {
         &unknown,
         Some(true),
         Some(true),
-        Some(true)
+        Some(true),
+        Some(false)
     )
     .is_err());
     for expected in PROJECTION_OWNED_EXECUTION_DELTA_COLUMN_CONTRACTS {

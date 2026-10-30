@@ -2206,6 +2206,8 @@ impl VerifiedPublishedGrantRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublishedAggregateManifestSummary {
+    /// v3-only publication sealing metadata; never inferred from the local clock.
+    pub seal: crate::PublicationSeal,
     pub tenant_id: i64,
     pub card_id: i64,
     pub aggregate_type: String,
@@ -2226,6 +2228,17 @@ pub struct PublishedAggregateManifestSummary {
     pub segment_count: u64,
     /// 各 segment 声明 row_count 之和（DB loader 已核对过与解码载荷一致）。
     pub declared_grant_row_count: u64,
+}
+
+impl PublishedAggregateManifestSummary {
+    pub fn publication_stamp(&self) -> GrantContractResult<crate::PublicationStamp> {
+        crate::PublicationStamp::new(self.generation, self.manifest_digest_hex.clone(), self.seal)
+            .map_err(|error| {
+                GrantContractError::InvalidProvenance(format!(
+                    "published manifest carries an invalid publication stamp: {error}"
+                ))
+            })
+    }
 }
 
 /// 整体 read gate 摘要（成功路径恒为 `Ready`，但结构上保留三态词汇）。
@@ -2308,6 +2321,9 @@ impl PublishedCardAuthorization {
             return Err(GrantContractError::InvalidProvenance(
                 "published card authorization must carry a Ready gate".to_owned(),
             ));
+        }
+        for manifest in &self.manifests {
+            manifest.publication_stamp()?;
         }
         for record in &self.records {
             record.validate_fields()?;
@@ -3913,6 +3929,7 @@ mod tests {
             unaccepted_reason: None,
         };
         let manifest = PublishedAggregateManifestSummary {
+            seal: crate::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
             tenant_id: 7,
             card_id: 17,
             aggregate_type: "USER_CARD".to_owned(),
@@ -3951,6 +3968,35 @@ mod tests {
         };
         authorization.validate().unwrap();
 
+        assert!(authorization.manifests[0].seal.validate().is_ok());
+        let stamp = authorization.manifests[0].publication_stamp().unwrap();
+        assert_eq!(stamp.generation, 4);
+        assert_eq!(stamp.manifest_digest_hex, "c".repeat(64));
+        assert_eq!(stamp.seal, authorization.manifests[0].seal);
+        for invalid_digest in ["C".repeat(64), "g".repeat(64), String::new()] {
+            let mut malformed = authorization.clone();
+            malformed.manifests[0].manifest_digest_hex = invalid_digest;
+            assert!(malformed.validate().is_err());
+        }
+        for invalid_generation in [0, i64::MAX as u64 + 1] {
+            let mut malformed = authorization.clone();
+            malformed.manifests[0].generation = invalid_generation;
+            assert!(malformed.validate().is_err());
+        }
+        let summary_json = serde_json::to_value(&authorization.manifests[0]).unwrap();
+        let mut summary_without_seal = summary_json.clone();
+        summary_without_seal.as_object_mut().unwrap().remove("seal");
+        assert!(
+            serde_json::from_value::<PublishedAggregateManifestSummary>(summary_without_seal)
+                .is_err()
+        );
+        let mut summary_with_old_seal_version = summary_json;
+        summary_with_old_seal_version["seal"]["digestVersion"] = serde_json::json!(2);
+        assert!(serde_json::from_value::<PublishedAggregateManifestSummary>(
+            summary_with_old_seal_version
+        )
+        .is_err());
+
         // Accepted-with-reason pairing is contractual, not cosmetic.
         assert!(VerifiedPublishedGrantRecord {
             accepted_into_effective_set: false,
@@ -3975,6 +4021,7 @@ mod tests {
         let mut excluded_grant = grant();
         excluded_grant.resource = " learn_course ".to_owned();
         let manifest = PublishedAggregateManifestSummary {
+            seal: crate::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
             tenant_id: 7,
             card_id: 17,
             aggregate_type: "USER_CARD".to_owned(),

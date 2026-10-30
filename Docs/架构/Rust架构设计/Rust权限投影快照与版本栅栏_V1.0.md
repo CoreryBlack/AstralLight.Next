@@ -67,6 +67,24 @@ source transaction 不访问 Redis 或 RabbitMQ；发布后的缓存推送、归
 
 **缺口（2026-08-26 增补同步：strict gate 代码层已实现，真实集成与切流验收未完成）**：该新链与旧 `authorization_projection_head`/outbox、两张旧快照表、Redis 缓存与 MQ 互不读写（双链并存）。读侧已实现的代码层边界：生产 [`SqlxRuleRepository`](../../../astral-db/src/repository.rs#L342-L351) 声明 capability marker `requires_published_card_evidence() == true`，[`PolicyEngine::evaluate()`](../../../policy-engine/src/engine.rs#L460-L471) 据此在 AUTHN/CARD_CONTEXT 之后进入严格 published-evidence strict gate（缺 current 指针 ⇒ NotReady、无 empty-ALLOW 形态；`Ok(None)`/`Err`/非 Ready/证据畸形/scope 不符一律 fail-closed `AUTHORIZATION_PENDING`；无旧快照/raw source/cache 回退；ALLOW 返回前复读证据并校验 gate 计数、manifest 摘要与命中 grant 一致），L1/L2/L2.5 union 不消费该端口；`evaluate_realtime()` 仍仅作一致性/oracle 路径，不消费该端口。新链 source 侧已由 `grant_ledger_adapter` 把 direct/approval/delegation/rule-set typed 贡献在 source transaction 内写入授权账本并追加 delta event，projector 按 aggregate 消费新 delta 队列，不限于 RULE_SET 源。上述边界当前由 typed 测试覆盖；尚未完成：既有数据 backfill/rehearsal、缓存与权限摘要读侧迁移、真实 MySQL 集成验收与正式切流验收——真实集成未完成前不得宣称生产验收或完整授权覆盖。迁移注释明确“不 backfill、不改删既有 source/projection 数据”，不得把已建表写成已完成迁移。
 
+### 2.3 历史 v3 代际封存 artifact 与 CURRENT V6 edition（2026-10-27/28）
+
+2026-10-27 的 v3 是历史代际封存请求及其不可变 schema artifact，不是当前授权 release number。当前授权 edition 为 V6，由共享 `astral-types/src/edition.rs` 的单一 `authorization_edition!(6)` 定义；manifest digest/seal、compiler、segment semantic/dependency、archive/completion、四类 invalidation、permission/L2/shared content、snapshot schema/payload 和 MAC 均随该 edition 成套派生。具体合同以[规范 §15.6 的历史锚点](../../规范/Rust后端编码规范_V1.0.md#156-授权代际-v3-封存合同2026-10-27)和 CURRENT V6 的[规范 §15.7](../../规范/Rust后端编码规范_V1.0.md#157-规则集完整结构与轻量发布栅栏标准2026-10-28)为准。
+
+`sealed_at` 仍记录候选首次成功持久化封存时间；重试按 aggregate＋target generation 找到并验证同一候选，复用存储时间，COMMIT 未知先对账。服务器 NTP 校时后应用读取系统 UTC，编译器仍无 IO；时间不取代 generation、CAS、lease 或撤销栅栏，也不单独证明发布者和 source mutation 合法。CURRENT V6 的 digest/seal/compiler、segment semantic/dependency、archive/completion domain 均由共享 edition 宏派生，不能由调用方另造数字或字符串。
+
+内存、严格读取、父代/恢复、归档和 completion 必须统一核验 CURRENT V6。快照 frame/schema 与授权 payload 均只接受 CURRENT V6，先重算完整内容证据，再与同一 durable 读取事务取得的 pointer＋stamp＋最终摘要对牌；文件自洽不能代替 durable current 证明。旧 V1/V2 快照、旧 v3 seal 或缺少 CURRENT V6 edition 的数据拒绝，不补造时间、不原地重标。MQ 失效消息继续只传播 metadata 并触发严格重读，四类 invalidation event family 全部属于 V6 bundle。
+
+新迁移 `20261027000001_authorization_projection_manifest_v3.sql` 及其历史 SQL/checksum、migration ID 和文件字节保持不变；它只提供历史 v3 schema artifact。当前 schema gate/runtime 只接受共享 edition 对应的 CURRENT V6 seal/digest/compiler/domain；现有 v3 rows 或旧开发 manifest 缺少 V6 证明时保持 BLOCKED，必须通过另行批准的 derived-state rebuild 从 source/ledger、撤销和审计事实重建，不能自动重写或重置 generation。运行时不自动 DDL，数据重建/真实迁移/部署另行批准，操作边界见[迁移决策 §2.5](../../迁移/Rust后端迁移架构决策_V1.0.md#25-仅-v3-的代际封存切换2026-10-27)。本节登记源码结构，不宣称真实 MySQL、崩溃恢复或多节点验收已完成。
+
+### 2.4 完整规则集与轻量发布身份（2026-10-28）
+
+规则集 source 由本体、条目和卡片绑定组成；生产读视图采用完整源模型，命令只接受显式允许的可变字段。具体字段、UTC 表达、公开兼容面及写入拒绝规则统一见[规范 §15.7](../../规范/Rust后端编码规范_V1.0.md#157-规则集完整结构与轻量发布栅栏标准2026-10-28)，不以旧简化 `RuleSet` 结构冒充实际 schema。
+
+发布后拦截与传播使用 `PublicationStamp { generation, manifest_digest_hex, seal }`，seal 当前必须为 V6 edition。它不携带规则条目，scope 由外层 tenant/card/aggregate identity 持有；完整内容仍在 references/segments。发布摘要、失效 metadata、缓存身份和快照 frontier/token 统一比较版本、最终 hash 和封存时间；同代分歧不能凭较新时间覆盖。source pending、lease、ELIGIBILITY 和进程内 token 不是 publication，不制造封存证明。
+
+失效事件可标记它观察并将失效的已提交发布基线，该 stamp 不证明同事务 source mutation 已物化。读取必须继续检查 pending/revoke fence 与完成证明，不能把消息到达、ACK 或 baseline stamp 当成新授权。CURRENT V6 wire/domain 与本地 snapshot schema/payload 是同一切换单元；旧消息/文件拒绝而非补造 hash/time、自动协商或降级。真实数据库、消息和切换验收仍须独立证据。
+
 ## 3. Source mutation 与 legacy writer-correlation 通道
 
 本节记录仍存在于兼容代码和迁移材料中的旧 `authorization_projection_head/outbox` 写侧形状。它可以承载历史 writer-correlation、ELIGIBILITY 资格缓存失效所需的事件以及迁移/对账信息，但不再证明 CARD/RULE_SET 的生产授权已经发布。生产授权发布只由 §2.2 的 grant ledger、delta event、manifest/segment/current 链证明。

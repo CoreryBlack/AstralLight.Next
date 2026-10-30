@@ -25,9 +25,10 @@
 
 ## Canonical 投影、缓存与恢复
 
-- [Rust 权限投影快照与版本栅栏](Rust权限投影快照与版本栅栏_V1.0.md)：解析 source mutation、grant/delta、manifest/segment/current、generation/revoke fence 与 legacy snapshot 的证据职责。**当前代码事实、缺口和目标决策分层记录；迁移/切流另行验收。**
+- [Rust 权限投影快照与版本栅栏](Rust权限投影快照与版本栅栏_V1.0.md)：解析 source mutation、grant/delta、manifest/segment/current、generation/revoke fence 与 legacy snapshot 的证据职责；§2.4 对接 **CURRENT V6** 完整规则集与轻量发布身份的[规范 §15.7](../../规范/Rust后端编码规范_V1.0.md#157-规则集完整结构与轻量发布栅栏标准2026-10-28)，并区分历史 v3 migration artifact。**当前代码事实、缺口和目标决策分层记录；迁移/切流另行验收。**
 - [Rust 增量重建与实时授权边界](Rust增量重建与实时授权边界_V1.0.md)：分析 compiler、projector、严格读者、realtime 诊断、规则时间窗及资格到期边界；说明 ACK 和旧快照为何不能替代 canonical 证据。**边界说明；包含未闭合项。**
 - [Rust 内存权威读面与失效通道架构方案](Rust内存权威读面与失效通道架构方案_V0.1.md)：逐层说明单机 owner、LocalBus、MySQL durable intent、memory hub/read token、失效传播与 UNKNOWN 恢复。**P0–P5 主体已有代码接线和本地门禁；真实 DB/MQ、迁移、并发/崩溃及部署验收未完成。**
+- [多云、半区权威与攻击恢复设计 QA](多云半区权威与攻击恢复设计_QA.md)：以 Q01–Q18 记录攻击场景、用户设定、此前回复、待澄清点和逐项回答，覆盖历史 v3 请求、CURRENT V6 代际栅栏、NTP、恢复与等保目标。**持续讨论稿；不构成完整协议批准、实现或测评证明。**
 - [FactoredHotState 设计](FactoredHotState设计_V1.0.md)：详解 HotState 中 RuleSet 共享内容、绑定关系、per-grant lifecycle 与卡私有层的事实化表示及语义等价性。**内存编译内核基线已实施；durable 跨卡段共享、RuleSet 级 delta、ID 池化仍属后续路线。**
 - [内存镜像读面巨卡优化储备](Rust内存镜像读面巨卡优化技术储备_V0.1.md)：解析大卡完整证据装配的成本、stamp 对牌与容量/TTL 缓存、单卡规模护栏和 evidence-contract 候选。**路线一 assembly cache 已在当前 checkout 接线；规模护栏与证据合同改造未完成；性能收益尚未重测验收。**
 

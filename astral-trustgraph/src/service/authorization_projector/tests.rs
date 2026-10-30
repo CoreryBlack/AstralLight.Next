@@ -1679,6 +1679,12 @@ fn frontier_fixture(card_id: Option<i64>, deltas: &[FixtureDelta]) -> PublishedA
         cas_version: 4,
     };
     let manifest = PublishedGenerationSummary {
+        stamp: astral_types::PublicationStamp {
+            generation: pointer.current_generation,
+            manifest_digest_hex: HASH_B.to_owned(),
+            seal: astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+        },
+        seal: astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
         manifest_id: pointer.manifest_id,
         generation: pointer.current_generation,
         source_generation: 5,
@@ -1716,6 +1722,7 @@ fn frontier_fixture(card_id: Option<i64>, deltas: &[FixtureDelta]) -> PublishedA
         })
         .collect();
     PublishedAggregateFrontier {
+        stamp: manifest.stamp.clone(),
         identity,
         card_id,
         pointer,
@@ -3354,6 +3361,7 @@ fn replan_success() -> DeltaProjectorPublishOutcome {
         cas_version: 1,
     };
     let published_state = Arc::new(astral_db::AuthorizationPublishedState {
+        seal: astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
         pointer: pointer.clone(),
         manifest_id: pointer.manifest_id,
         generation: pointer.current_generation,
@@ -3378,6 +3386,7 @@ fn replan_success() -> DeltaProjectorPublishOutcome {
             item_count: 1,
         },
         stage: astral_db::AuthorizationStageOutcome {
+            seal: published_state.seal,
             manifest_id: 1,
             manifest_digest: Sha256Digest::from_hex(HASH_A).unwrap(),
             target_generation: 1,

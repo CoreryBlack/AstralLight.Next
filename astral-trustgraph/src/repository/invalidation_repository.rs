@@ -6,7 +6,10 @@
 //! post-commit receipt on the transaction; commit and the direct LocalBus
 //! fanout remain owned by `authorization_source_transaction`.
 
-use astral_db::{lock_current_pointer_in_tx, ProjectionAggregateIdentity};
+use astral_db::{
+    lock_current_pointer_in_tx, read_published_authorization_state_in_tx,
+    ProjectionAggregateIdentity,
+};
 use astral_types::{AstralError, PublishedEvidenceAggregate};
 
 use crate::repository::authorization_source_transaction::{
@@ -74,17 +77,34 @@ pub(crate) async fn append_evidence_invalidation_if_published(
     else {
         return Ok(());
     };
+    if pointer.card_id != request.card_id {
+        return Err(AstralError::Database(
+            "published evidence pointer disagrees with invalidation card scope".into(),
+        ));
+    }
     if !pointer.revoke_fence_proven {
         return Err(AstralError::Database(
             "published evidence pointer lacks revoke-fence proof".into(),
         ));
     }
+    let state = read_published_authorization_state_in_tx(tx, &identity)
+        .await
+        .map_err(|error| AstralError::Database(error.to_string()))?;
+    if state.generation != pointer.current_generation || state.pointer != pointer {
+        return Err(AstralError::Database(
+            "strict published baseline disagrees with locked pointer or invalidation fence".into(),
+        ));
+    }
+    let stamp = state
+        .publication_stamp()
+        .map_err(|error| AstralError::Database(error.to_string()))?;
     let event = astral_mq::InvalidationEvent::EvidenceInvalidated(astral_mq::EvidenceInvalidated {
         tenant_id: request.tenant_id,
         card_id: request.card_id,
         aggregate_type: request.aggregate_type,
         aggregate_id: request.aggregate_id,
         published_generation: pointer.current_generation,
+        stamp,
         source_generation: request.source_generation,
         revoke_fence: request.revoke_fence,
     });

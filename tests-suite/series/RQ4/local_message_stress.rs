@@ -127,7 +127,7 @@ impl TestMessage {
         let envelope_json = serde_json::to_string(&json!({
             "messageId": message_id,
             "operationId": operation_id,
-            "messageType": "EVIDENCE_INVALIDATED",
+            "messageType": "LOCAL_OUTBOX_STRESS",
             "schemaVersion": 1,
             "tenantId": null,
             "originRegion": "integration",
@@ -153,7 +153,7 @@ impl TestMessage {
         LocalMessageInput {
             message_id: &self.message_id,
             operation_id: &self.operation_id,
-            message_type: "EVIDENCE_INVALIDATED",
+            message_type: "LOCAL_OUTBOX_STRESS",
             queue_name: QUEUE,
             ordering_key: Some(&self.ordering_key),
             tenant_id: None,

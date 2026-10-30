@@ -19,9 +19,9 @@ use super::types::*;
 use super::PolicyEngine;
 use astral_types::{
     BindingLayer, CanonicalGrant, GrantEffect, GrantId, GrantProvenance, GrantRevision,
-    GrantSourceKind, GrantState, PublishedAggregateManifestSummary, PublishedCardAuthorization,
-    PublishedCardAuthorizationGate, PublishedEvidenceGateStatus, TenantScope, ValidityWindow,
-    VerifiedPublishedGrantRecord,
+    GrantSourceKind, GrantState, PublicationSeal, PublishedAggregateManifestSummary,
+    PublishedCardAuthorization, PublishedCardAuthorizationGate, PublishedEvidenceGateStatus,
+    TenantScope, ValidityWindow, VerifiedPublishedGrantRecord,
 };
 use astral_types::{PolicyContext, PolicyError, PublishedCardEvidenceScope};
 
@@ -145,6 +145,7 @@ fn matching_grant() -> CanonicalGrant {
 fn evidence(grants: Vec<CanonicalGrant>) -> PublishedCardAuthorization {
     let record_count = grants.len();
     let manifest = PublishedAggregateManifestSummary {
+        seal: PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
         tenant_id: 7,
         card_id: 1,
         aggregate_type: "CARD".to_string(),

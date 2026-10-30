@@ -1299,6 +1299,12 @@ mod tests {
                 aggregate_type: astral_types::PublishedEvidenceAggregate::UserCard,
                 aggregate_id: 42,
                 published_generation: 10,
+                stamp: astral_types::PublicationStamp::new(
+                    10,
+                    "ab".repeat(32),
+                    astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+                )
+                .unwrap(),
                 source_generation: 10,
                 revoke_fence: 0,
             },

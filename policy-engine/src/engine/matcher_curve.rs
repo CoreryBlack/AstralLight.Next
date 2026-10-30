@@ -11,7 +11,7 @@ use super::{
 use astral_types::registry::parse_resource_key;
 use astral_types::{
     BindingLayer, CanonicalGrant, GrantEffect, GrantId, GrantProvenance, GrantRevision,
-    GrantSourceKind, GrantState, PolicyContext, PublishedAggregateManifestSummary,
+    GrantSourceKind, GrantState, PolicyContext, PublicationSeal, PublishedAggregateManifestSummary,
     PublishedCardAuthorization, PublishedCardAuthorizationGate, PublishedEvidenceGateStatus,
     ResourceOwnershipScope, TenantScope, ValidityWindow, VerifiedPublishedGrantRecord,
 };
@@ -71,6 +71,7 @@ fn probe_grant(index: usize, resource: &str) -> CanonicalGrant {
 fn evidence_from(grants: Vec<CanonicalGrant>) -> PublishedCardAuthorization {
     let record_count = grants.len();
     let manifest = PublishedAggregateManifestSummary {
+        seal: PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
         tenant_id: 7,
         card_id: 1,
         aggregate_type: "CARD".to_owned(),

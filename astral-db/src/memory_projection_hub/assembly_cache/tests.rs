@@ -23,6 +23,7 @@ fn stamp() -> AssemblyStamp {
         100,
         &[],
     )
+    .unwrap()
 }
 
 fn evidence() -> Arc<PublishedCardAuthorization> {
@@ -153,7 +154,7 @@ fn cache_rejects_changed_publication_identity_and_frontiers() {
     use crate::authorization_projection_repository::ProjectionAggregateIdentity;
 
     let mut original = stamp();
-    original.publications.push(PublicationStamp {
+    original.publications.push(AssemblyPublicationIdentity {
         pointer: AuthorizationCurrentPointerRecord {
             pointer_id: 1,
             identity: ProjectionAggregateIdentity::new(7, "CARD", 17).unwrap(),
@@ -169,29 +170,37 @@ fn cache_rejects_changed_publication_identity_and_frontiers() {
             revoke_fence_proven: true,
             cas_version: 1,
         },
+        stamp: PublicationStamp::new(
+            1,
+            "03".repeat(32),
+            astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+        )
+        .unwrap(),
         manifest_id: 1,
-        generation: 1,
         source_generation: 1,
         projected_generation: 1,
         revoke_fence: 1,
-        manifest_digest: Sha256Digest::from_raw_bytes([3; 32]),
     });
     let cache = AssemblyCache::default();
     let now = Instant::now();
-    for component in 0..9 {
+    for component in 0..10 {
         cache.insert(&scope(17), original.clone(), evidence(), now);
         let mut changed = original.clone();
         let publication = &mut changed.publications[0];
         match component {
             0 => publication.pointer.identity.aggregate_id += 1,
             1 => publication.manifest_id += 1,
-            2 => publication.generation += 1,
+            2 => publication.stamp.generation += 1,
             3 => publication.source_generation += 1,
             4 => publication.projected_generation += 1,
             5 => publication.revoke_fence += 1,
-            6 => publication.manifest_digest = Sha256Digest::from_raw_bytes([4; 32]),
+            6 => publication.stamp.manifest_digest_hex = "04".repeat(32),
             7 => publication.pointer.cas_version += 1,
             8 => publication.pointer.revoke_fence_proven = false,
+            9 => {
+                publication.stamp.seal =
+                    astral_types::PublicationSeal::from_unix_seconds(1_700_000_001).unwrap()
+            }
             _ => unreachable!(),
         }
         assert!(cache.get(&scope(17), &changed, now).is_none());

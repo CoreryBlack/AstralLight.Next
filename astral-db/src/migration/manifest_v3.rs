@@ -27,6 +27,9 @@ fn check_manifest_v3_state(
     has_rows: bool,
 ) -> Result<bool, MigrationError> {
     match (version_present, timestamp_present) {
+        (true, true) if !recorded && has_rows => Err(MigrationError::Failed(
+            "authorization manifest v3 has rows but no successful migration history; explicit recovery is required before migration".to_owned(),
+        )),
         (true, true) => Ok(true),
         (false, false) if !recorded && !has_rows => Ok(false),
         (false, false) if !recorded => Err(MigrationError::Failed(
@@ -149,12 +152,12 @@ mod tests {
     fn v3_state_accepts_only_empty_legacy_schema_or_complete_seals() {
         assert!(!check_manifest_v3_state(false, false, false, false).unwrap());
         assert!(check_manifest_v3_state(false, false, false, true).is_err());
+        assert!(check_manifest_v3_state(false, true, true, true).is_err());
+        assert!(check_manifest_v3_state(false, true, true, false).unwrap());
         for has_rows in [false, true] {
-            for recorded in [false, true] {
-                assert!(check_manifest_v3_state(recorded, true, true, has_rows).unwrap());
-                assert!(check_manifest_v3_state(recorded, true, false, has_rows).is_err());
-                assert!(check_manifest_v3_state(recorded, false, true, has_rows).is_err());
-            }
+            assert!(check_manifest_v3_state(true, true, true, has_rows).unwrap());
+            assert!(check_manifest_v3_state(true, true, false, has_rows).is_err());
+            assert!(check_manifest_v3_state(true, false, true, has_rows).is_err());
             assert!(check_manifest_v3_state(true, false, false, has_rows).is_err());
         }
     }

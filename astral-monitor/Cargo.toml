@@ -35,3 +35,4 @@ policy-engine = { path = "../policy-engine" }
 sqlx = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 time = { workspace = true }
+tower = { workspace = true }

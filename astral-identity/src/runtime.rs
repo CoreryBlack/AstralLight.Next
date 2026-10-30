@@ -237,6 +237,10 @@ pub struct AppState {
     pub user_service: Arc<UserService>,
     pub card_repository: Arc<dyn srv::card_repository::CardRepository>,
     pub org_service: Arc<OrgService>,
+    /// Password-reset delivery is an explicit Identity-owned port. The default
+    /// runtime implementation is unavailable until a safe provider or encrypted
+    /// outbox worker is approved and wired here.
+    pub password_reset_notifier: Arc<dyn srv::password::PasswordResetNotifier>,
     /// ORG_SCOPE 部署旗标（default-off）：启动期由共享 AppConfig 经
     /// astral-common 严格解析器一次性解析并冻结（`config.org_scope_enabled`），
     /// 本字段只是同一冻结值的 AppState 侧副本；授权中间件构造正式
@@ -358,6 +362,11 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
     D: std::future::Future<Output = ()> + Send + 'static,
 {
+    astral_common::middleware::permission_check_shared::validate_path_map(
+        middleware::IDENTITY_PATH_MAP,
+        "identity",
+    )?;
+
     if let Some(metrics_addr) =
         astral_common::metrics_runtime::metrics_listen_addr("127.0.0.1:9103")
     {
@@ -413,6 +422,7 @@ where
         user_service,
         card_repository,
         org_service,
+        password_reset_notifier: Arc::new(srv::password::UnavailablePasswordResetNotifier),
         org_scope_enabled,
     };
 
@@ -424,7 +434,7 @@ where
     // OWNED handle flavor — RAII (Drop aborts the supervisor), bounded
     // shutdown, and an observable death signal. Startup gates above are
     // unchanged.
-    let session_projection_worker = srv::session_projection_worker::spawn_owned(db.clone());
+    let session_projection_worker = srv::session_projection_worker::spawn_owned(state.clone());
 
     // Inject Identity-owned durable handlers before either transport starts.
     astral_mq::consumers::set_session_revocation_db(db.clone());
@@ -508,12 +518,7 @@ where
         }
     }
 
-    // 启动期注册校验（对齐 Java @PostConstruct 校验）
-    astral_common::middleware::permission_check_shared::validate_path_map(
-        middleware::IDENTITY_PATH_MAP,
-        "identity",
-    );
-
+    // 启动期注册校验已在所有 worker、consumer、metrics 和 router 装配前完成。
     let identity_mapping_routes = if identity_mapping_enabled {
         integration_mappings::routes()
     } else {

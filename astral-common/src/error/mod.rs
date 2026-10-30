@@ -81,6 +81,12 @@ impl IntoResponse for AppError {
                 "DATABASE_ERROR",
                 None,
             ),
+            AstralError::Pending(_) => (
+                StatusCode::ACCEPTED,
+                202,
+                "PENDING",
+                Some("PROJECTION_COMPLETION_PENDING"),
+            ),
             AstralError::NotImplemented(_) => (
                 StatusCode::NOT_IMPLEMENTED,
                 501,
@@ -121,7 +127,6 @@ impl From<AstralError> for AppError {
     }
 }
 
-/// 全局异常处理中间件（对应 Java `@ControllerAdvice` + `BaseGlobalExceptionHandler`）
 ///
 /// 捕获请求处理过程中产生的 panic，统一返回 500 JSON 响应，避免连接挂死。
 pub async fn global_exception_handler(
@@ -162,5 +167,20 @@ pub async fn global_exception_handler(
 
             (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn pending_errors_are_accepted_and_fail_closed() {
+        let response = AppError(AstralError::Pending(
+            "source committed; projection completion remains pending".into(),
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 }

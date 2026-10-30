@@ -166,6 +166,10 @@ pub const MAX_CUSTOM_RESOURCE_REGISTRY_BYTES: usize = 64 * 1024;
 pub const MAX_RESOURCE_TYPE_NAME_BYTES: usize = 128;
 /// Maximum byte length accepted for an action identifier.
 pub const MAX_ACTION_NAME_BYTES: usize = 64;
+/// Stable fail-closed code for resource retirement before the canonical revoke
+/// generation and published-evidence barriers have closed.
+pub const RESOURCE_RETIREMENT_REQUIRES_PUBLISHED_REVOKE: &str =
+    "RESOURCE_RETIREMENT_REQUIRES_PUBLISHED_REVOKE";
 
 fn valid_registry_identifier(value: &str) -> bool {
     let mut bytes = value.bytes();
@@ -357,8 +361,12 @@ impl ResourceRegistry {
         Ok(())
     }
 
-    /// Remove an already-registered custom resource after its persistence delete
-    /// succeeds. Compiled-in resources cannot be removed.
+    /// Remove an already-registered custom resource after the canonical revoke,
+    /// generation, and published-evidence barriers have closed and its durable
+    /// persistence delete succeeds. Compiled-in resources cannot be removed.
+    ///
+    /// The current resource-type API intentionally does not call this primitive;
+    /// retirement remains fail-closed until that complete workflow exists.
     pub fn unregister_custom_resource(
         &self,
         resource_type: &str,

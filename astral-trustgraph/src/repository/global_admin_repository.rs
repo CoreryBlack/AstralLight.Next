@@ -907,7 +907,7 @@ fn rule_set_projection_event_status_is_acceptable(status: &str) -> bool {
 
 /// Append the initial RuleSet proof event and its source audit marker.
 async fn append_initial_rule_set_projection_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     expected_tenant_id: i64,
     actor_id: i64,
@@ -961,7 +961,7 @@ fn rule_set_projection_evidence_is_valid(event_is_valid: bool, source_audit_coun
 /// 与 REBUILD_SNAPSHOT 复核随迁移 20260831000001 退役)。返回值语义为
 /// "证据已完备、无需补写"。
 async fn ensure_rule_set_projection_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     expected_tenant_id: i64,
     actor_id: i64,
@@ -973,7 +973,7 @@ async fn ensure_rule_set_projection_in_tx(
          WHERE aggregate_type = 'RULE_SET' AND aggregate_id = ? FOR UPDATE",
     )
     .bind(rule_set_id)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut ***tx)
     .await
     .map_err(|error| {
         AstralError::Database(format!("Resolve RuleSet projection head failed: {error}"))
@@ -1019,7 +1019,7 @@ async fn ensure_rule_set_projection_in_tx(
     )
     .bind(rule_set_id)
     .bind(event_id)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut ***tx)
     .await
     .map_err(|error| {
         AstralError::Database(format!("Resolve RuleSet projection event failed: {error}"))
@@ -1054,7 +1054,7 @@ async fn ensure_rule_set_projection_in_tx(
     .bind(event_id)
     .bind(source_generation)
     .bind(expected_tenant_id)
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut ***tx)
     .await
     .map_err(|error| {
         AstralError::Database(format!("Verify RuleSet source audit failed: {error}"))

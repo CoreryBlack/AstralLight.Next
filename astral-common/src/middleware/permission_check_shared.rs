@@ -3,11 +3,9 @@
 //! 各服务必须先解析目标 owner，再自行调用 `PolicyEngine.evaluate()`；本模块
 //! 仅提供路径/动作解析、目标 ID 提取和身份上下文构造，不提供通用授权入口。
 
-use std::collections::HashSet;
-
 use crate::token_contract::{PrincipalKind, PRINCIPAL_KIND_HEADER};
 use astral_types::ResourceRegistry;
-use astral_types::{PolicyContext, ResourceOwnershipScope};
+use astral_types::{AstralError, PolicyContext, ResourceOwnershipScope};
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -279,15 +277,14 @@ pub fn resolve_permission_action(resource: &str, path: &str, method: &str) -> Op
     }
 }
 
-/// 启动期注册校验：验证 PATH_RESOURCE_MAP 中所有资源类型已在 ResourceRegistry 注册
-///
-/// 对齐 Java `@PostConstruct` 全项目扫描 `@RequirePermission` 的交叉校验。
-/// 在每个 crate 的 main.rs 启动后调用。发现未注册的资源类型时输出 ERROR 日志（不阻塞启动）。
-pub fn validate_path_map(path_map: PathResourceMap, service_name: &str) {
+/// 在每个服务启动期调用。发现未注册的资源类型时记录错误并拒绝启动。
+pub fn validate_path_map(path_map: PathResourceMap, service_name: &str) -> Result<(), AstralError> {
     let reg = ResourceRegistry::global();
-    let mut found_unregistered = false;
+    let mut resources: Vec<&str> = path_map.iter().map(|(_, resource)| *resource).collect();
+    resources.sort_unstable();
+    resources.dedup();
+    let mut invalid_resources = Vec::new();
 
-    let resources: HashSet<&str> = path_map.iter().map(|(_, r)| *r).collect();
     for resource in &resources {
         if let Err(e) = reg.validate(resource, "read") {
             // 使用 "read" 动作测试注册——只要资源存在即可
@@ -297,29 +294,65 @@ pub fn validate_path_map(path_map: PathResourceMap, service_name: &str) {
                 error = %e,
                 "Route permission mapping references unregistered resource type"
             );
-            found_unregistered = true;
+            invalid_resources.push((*resource, e.to_string()));
         }
     }
 
-    if found_unregistered {
+    if !invalid_resources.is_empty() {
+        invalid_resources.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        let details = invalid_resources
+            .iter()
+            .map(|(resource, error)| format!("{resource}: {error}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         tracing::warn!(
             service = service_name,
-            unregistered = resources.len(),
-            "ResourceRegistry validation found unregistered resource types (non-blocking)"
+            unregistered = invalid_resources.len(),
+            "ResourceRegistry validation rejected route resource mappings"
         );
-    } else {
-        tracing::info!(
-            service = service_name,
-            registered = resources.len(),
-            "All route resource types validated against ResourceRegistry"
-        );
+        return Err(AstralError::Validation(format!(
+            "route permission mapping validation failed for service '{service_name}': {details}"
+        )));
     }
+
+    tracing::info!(
+        service = service_name,
+        registered = resources.len(),
+        "All route resource types validated against ResourceRegistry"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{request_target_id, resolve_permission_action};
-    use astral_types::ResourceOwnershipScope;
+    use super::{request_target_id, resolve_permission_action, validate_path_map, PathResourceMap};
+    use astral_types::{AstralError, ResourceOwnershipScope};
+
+    #[test]
+    fn path_map_validation_propagates_unregistered_resource_errors() {
+        const PATH_MAP: PathResourceMap = &[
+            ("/known", "permission_rule"),
+            ("/unknown", "route_map_missing_resource"),
+            ("/unknown-again", "route_map_missing_resource"),
+        ];
+
+        let error = validate_path_map(PATH_MAP, "test-service")
+            .expect_err("an unregistered route resource must reject startup");
+        assert!(matches!(
+            error,
+            AstralError::Validation(message)
+                if message.contains("test-service")
+                    && message.contains("route_map_missing_resource")
+        ));
+    }
+
+    #[test]
+    fn path_map_validation_accepts_registered_resources() {
+        const PATH_MAP: PathResourceMap = &[("/rules", "permission_rule")];
+
+        validate_path_map(PATH_MAP, "test-service")
+            .expect("registered route resources must pass startup validation");
+    }
 
     #[test]
     fn maps_java_special_actions_before_http_defaults() {

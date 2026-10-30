@@ -612,7 +612,7 @@ impl RuleRepository for SqlxRuleRepository {
         append_direct_grant_delta_in_tx(&mut tx, &draft, base_version, target_version).await?;
 
         let receipts = tx.commit_consuming_with_receipts().await?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
         Ok(rule_id)
     }
 
@@ -820,7 +820,7 @@ impl RuleRepository for SqlxRuleRepository {
         append_direct_grant_delta_in_tx(&mut tx, &draft, base_version, target_version).await?;
 
         let receipts = tx.commit_consuming_with_receipts().await?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
         Ok(())
     }
 
@@ -941,7 +941,7 @@ impl RuleRepository for SqlxRuleRepository {
         append_direct_grant_delta_in_tx(&mut tx, &draft, base_version, target_version).await?;
 
         let receipts = tx.commit_consuming_with_receipts().await?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
         Ok(true)
     }
 

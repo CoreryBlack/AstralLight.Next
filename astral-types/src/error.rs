@@ -15,6 +15,9 @@ pub enum AstralError {
     #[error("Database error: {0}")]
     Database(String),
 
+    #[error("Pending operation: {0}")]
+    Pending(String),
+
     #[error("Not implemented: {0}")]
     NotImplemented(String),
 

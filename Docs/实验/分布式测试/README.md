@@ -3,6 +3,15 @@
 > 继承说明：本目录及 `rust-s15/`、`pipeline/`、`archives/` 资产来自私有仓库 S15 提交
 > `b38aaa7680f6c80e6841d05a17e08cd0e50627b1`。历史报告/JSON 已继承并对节点地址脱敏；
 > 它们只用于回溯历史实验，不代表当前 `AstralLight.Next` 代码、当前部署或当前运行结果。
+>
+> CURRENT V6 证据边界：本目录的 Chat/Learn、Redis、旧 OPA 和三节点 runtime
+> 叙述均为历史 baseline/comparison 或 retired compatibility evidence。即使历史
+> 报告保留 `PASS` 场景数，也不得将其解释为当前 runtime、当前 Redis 依赖或真实
+> 集成 `PASS`；当前 native profile 不使用 Redis。Direct Monitor health 只表示
+> 服务直连运维观察，不能替代受保护 Monitor contract。资源退役须等待 canonical
+> revoke、generation、published-evidence barrier；密码 delivery 只有在 notifier
+> handoff 被证明时才可从 unavailable/`PENDING` 升级。`UNKNOWN`/`PENDING` 和跨
+> aggregate completion 必须先按完整 receipt/evidence 对账。
 
 把 `AuthorizationProjectionThreeNodeIntegrationTest` 从"同一 JVM 三 context + Testcontainers"升级为**真实的分布式架构测试**：
 三个独立的 TrustGraph 进程（真实网络、真实共享 MySQL/Redis/RabbitMQ、真实消息投递）作为节点，测试协调器通过 HTTP 控制平面驱动场景。

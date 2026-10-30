@@ -63,9 +63,11 @@ astral-mq → astral-common
     ↑
 astral-gateway → astral-common
 astral-identity → astral-common + astral-db
-astral-learn → astral-common + astral-db
+# Historical dependency edge only: astral-learn production runtime is retired and removed.
+# astral-learn → astral-common + astral-db
 astral-trustgraph → astral-common + astral-db + policy-engine
-astral-chat → astral-common + astral-db
+# Historical dependency edge only: astral-chat production runtime is retired and removed.
+# astral-chat → astral-common + astral-db
 astral-monitor → astral-common + astral-db
 astral-single-node → astral-common + astral-db + astral-gateway + astral-identity + astral-mq + astral-trustgraph
 e2e-bootstrap → astral-types + astral-db

@@ -121,6 +121,55 @@ fn identity_session_routes() -> Router<AppConfig> {
         )
 }
 
+fn gateway_routes() -> Router<AppConfig> {
+    Router::new()
+        .merge(identity_user_routes())
+        .merge(identity_me_routes())
+        .merge(identity_session_routes())
+        .route(
+            "/api/v1/auth/register",
+            any(proxy::forward_to_identity_static),
+        )
+        .route(
+            "/api/v1/auth/profile",
+            any(proxy::forward_to_identity_static),
+        )
+        .route(
+            "/api/v1/auth/change-password",
+            any(proxy::forward_to_identity_static),
+        )
+        .route(
+            "/api/v1/auth/providers",
+            any(proxy::forward_to_identity_static),
+        )
+        .route(
+            "/api/v1/auth/password/forgot",
+            any(proxy::forward_to_identity_static),
+        )
+        .route(
+            "/api/v1/auth/password/reset/{token}",
+            any(proxy::forward_to_identity_password_reset),
+        )
+        .route(
+            "/api/v1/auth/verification/send",
+            any(proxy::forward_to_identity_static),
+        )
+        .route(
+            "/api/v1/auth/verification/verify",
+            any(proxy::forward_to_identity_static),
+        )
+        .route(
+            "/api/v1/auth/mfa/status",
+            any(proxy::forward_to_identity_static),
+        )
+        .route(
+            "/api/v1/auth/mfa/verify",
+            any(proxy::forward_to_identity_static),
+        )
+        .route("/main/api/v1/{*path}", any(proxy::forward_to_trustgraph))
+        .route("/api/v1/monitor/{*path}", any(proxy::forward_to_monitor))
+}
+
 pub async fn run() -> anyhow::Result<()> {
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:9001".to_string());
     run_with_listen_addr(&addr).await
@@ -237,52 +286,7 @@ where
         .allow_headers(Any)
         .allow_credentials(config.cors.allow_credentials);
 
-    let app = Router::new()
-        .merge(identity_user_routes())
-        .merge(identity_me_routes())
-        .merge(identity_session_routes())
-        .route(
-            "/api/v1/auth/register",
-            any(proxy::forward_to_identity_static),
-        )
-        .route(
-            "/api/v1/auth/profile",
-            any(proxy::forward_to_identity_static),
-        )
-        .route(
-            "/api/v1/auth/change-password",
-            any(proxy::forward_to_identity_static),
-        )
-        .route(
-            "/api/v1/auth/providers",
-            any(proxy::forward_to_identity_static),
-        )
-        .route(
-            "/api/v1/auth/password/forgot",
-            any(proxy::forward_to_identity_static),
-        )
-        .route(
-            "/api/v1/auth/password/reset/{token}",
-            any(proxy::forward_to_identity_password_reset),
-        )
-        .route(
-            "/api/v1/auth/verification/send",
-            any(proxy::forward_to_identity_static),
-        )
-        .route(
-            "/api/v1/auth/verification/verify",
-            any(proxy::forward_to_identity_static),
-        )
-        .route(
-            "/api/v1/auth/mfa/status",
-            any(proxy::forward_to_identity_static),
-        )
-        .route(
-            "/api/v1/auth/mfa/verify",
-            any(proxy::forward_to_identity_static),
-        )
-        .route("/main/api/v1/{*path}", any(proxy::forward_to_trustgraph))
-        .route("/api/v1/monitor/{*path}", any(proxy::forward_to_monitor))
+    let app = gateway_routes()
         // JWT 中间件（公共路径放行 + strict MySQL 会话判定（可选已证明镜像）+
         // 租户状态严格校验 + 身份头注入）
         .route_layer(axum_middleware::from_fn_with_state(
@@ -352,6 +356,53 @@ mod tests {
         let check = wrapper.find("anyhow::ensure!(").unwrap();
         assert!(cleanup < check);
         assert!(wrapper.contains("gateway Ctrl-C handler failed during shutdown"));
+    }
+
+    #[tokio::test]
+    async fn gateway_route_contract_excludes_service_direct_health_paths() {
+        let app = super::gateway_routes().with_state(AppConfig::default());
+        for path in [
+            "/api/health",
+            "/api/health/metrics",
+            "/actuator/health",
+            "/actuator/health/detailed",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                404,
+                "service-direct health path must not be proxied by Gateway: {path}"
+            );
+        }
+
+        for path in ["/api/v1/monitor/system-info", "/api/v1/monitor/metrics"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                404,
+                "protected monitor path must remain a Gateway proxy route: {path}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ use crate::repository::audit_log_repository::{
 };
 use crate::repository::authorization_source_transaction::{
     append_eligibility_projection_with_invalidation_in_tx, AuthorizationSourceTransaction,
+    CommittedProjectionReceipts,
 };
 use crate::repository::delegation_repository::{
     require_provable_expiry, DelegationRecord, DELEGATION_SELECT,
@@ -1183,8 +1184,8 @@ pub trait UserCardRepository: Send + Sync {
     /// 与 [`Self::bind_card`] 共享同一受守卫核心；异步批量入口没有任何绕过
     /// 归属/贡献守卫的旁路。
     async fn bind_card_async_one(&self, card_id: i64, user_id: i64) -> Result<bool, AstralError>;
-    /// Bind one batch item and atomically commit source, projections, audit, and
-    /// its durable item completion under the existing source transaction fence.
+    /// Bind one batch item and atomically commit its source mutation, projection
+    /// receipts, and audit correlation. The caller owns post-commit completion.
     #[allow(clippy::too_many_arguments)]
     async fn bind_card_async_batch_item(
         &self,
@@ -1198,7 +1199,7 @@ pub trait UserCardRepository: Send + Sync {
         operation_id: &str,
         expected_tenant_id: i64,
         expected_domain_id: i64,
-    ) -> Result<bool, AstralError>;
+    ) -> Result<Option<CommittedProjectionReceipts>, AstralError>;
     /// 冲突检测：同一用户下同 card_type 不同 template_id 的 ACTIVE 卡（限定管理范围）
     async fn find_conflicts(
         &self,
@@ -2690,7 +2691,7 @@ impl UserCardRepository for SqlxUserCardRepository {
         operation_id: &str,
         expected_tenant_id: i64,
         expected_domain_id: i64,
-    ) -> Result<bool, AstralError> {
+    ) -> Result<Option<CommittedProjectionReceipts>, AstralError> {
         bind_card_batch_item_with_audit(
             &self.db,
             card_id,
@@ -2758,7 +2759,7 @@ async fn bind_card_batch_item_with_audit(
     operation_id: &str,
     expected_tenant_id: i64,
     expected_domain_id: i64,
-) -> Result<bool, AstralError> {
+) -> Result<Option<CommittedProjectionReceipts>, AstralError> {
     if card_id <= 0
         || user_id <= 0
         || actor_id <= 0
@@ -2791,7 +2792,7 @@ async fn bind_card_batch_item_with_audit(
         domain_id,
     }) = locked
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if tenant_id != Some(expected_tenant_id) || domain_id != Some(expected_domain_id) {
         return Err(AstralError::Validation(
@@ -2823,7 +2824,7 @@ async fn bind_card_batch_item_with_audit(
         ));
     }
     if card_status != "PENDING" && card_status != "INACTIVE" {
-        return Ok(false);
+        return Ok(None);
     }
     ensure_bind_card_no_stale_user_evidence_in_tx(&mut tx, card_id, user_id, current_owner).await?;
     let result = sqlx::query(
@@ -2839,7 +2840,7 @@ async fn bind_card_batch_item_with_audit(
     .await
     .map_err(db_error)?;
     if result.rows_affected() != 1 {
-        return Ok(false);
+        return Ok(None);
     }
 
     let operation_id = operation_id.to_owned();
@@ -2907,39 +2908,8 @@ async fn bind_card_batch_item_with_audit(
     .await
     .map_err(db_error)?;
 
-    let item = sqlx::query(
-        "UPDATE async_operation_item SET status = 'COMPLETED', error_message = NULL, \
-                updated_at = UNIX_TIMESTAMP() WHERE task_id = ? AND card_id = ? \
-                  AND operation_id = ? AND status = 'RUNNING' AND tenant_id = ? AND domain_id = ?",
-    )
-    .bind(&task_id)
-    .bind(card_id)
-    .bind(&operation_id)
-    .bind(expected_tenant_id)
-    .bind(expected_domain_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(db_error)?;
-    if item.rows_affected() != 1 {
-        return Err(AstralError::Database(
-            "durable card bind item completion could not be proven".into(),
-        ));
-    }
-    let task = sqlx::query(
-        "UPDATE async_operation SET completed_items = completed_items + 1, updated_at = UNIX_TIMESTAMP() \
-         WHERE task_id = ? AND task_type = 'CARD_BIND' AND status = 'RUNNING'",
-    )
-    .bind(&task_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(db_error)?;
-    if task.rows_affected() != 1 {
-        return Err(AstralError::Database(
-            "durable card bind task completion could not be proven".into(),
-        ));
-    }
-    tx.commit_consuming().await?;
-    Ok(true)
+    let receipts = tx.commit_consuming_with_receipts().await?;
+    Ok(Some(receipts))
 }
 
 /// bind 换主归属守卫（fail-closed）：拒绝任何会随卡易主却仍归属旧用户（或归属

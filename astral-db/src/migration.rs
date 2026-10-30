@@ -762,6 +762,35 @@ const CHAT_DELIVERY_INTENT_SQL_SHA384: &str =
     "9e54275dbd398508eb4daac9dcbb4c5f1a75902b66757e9110410d9e85e9abce82bbbb372a25c6591d0be2464f7620c7";
 const LEARN_SYSTEM_ASSIGNMENT_SQL_SHA384: &str =
     "102705f5df0183e0bcd4fc4d39fe1c8e8ff994c66d198d0c7d738a992a3469cc9b453d9b52c7721d4bd48591ca2905de";
+const SWITCH_OPERATION_RECOVERY_CONTRACT_VERSION: i64 = 20261029000001;
+const SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION: i64 = 20261029000002;
+const SWITCH_OPERATION_RECOVERY_CONTRACT_SQL_SHA384: &str =
+    "124805aff0fae52ce077b2ac02d0765a9839470ff2f1b526cf85c2c71f36c4cec90d60895e28282be58336113b11b3e6";
+const SWITCH_OPERATION_RECOVERY_DEADLINE_SQL_SHA384: &str =
+    "9652243c3634055309a253505722d701b21fdea0af4f333331c727ca8470c57e93fd0068a3f94a694a4f7af497c09688";
+const SWITCH_OPERATION_RECOVERY_CONTRACT_COLUMNS: &[(&str, &str)] = &[
+    ("auth_session_operation", "selected_identity_card_id"),
+    ("auth_session_operation", "source_card_id"),
+    ("auth_session_operation", "previous_session_version"),
+    ("auth_session_operation", "previous_session_epoch"),
+    ("auth_session_operation", "expected_session_version"),
+    ("auth_session_operation", "expected_session_epoch"),
+    ("auth_session_operation", "device_id"),
+    ("auth_session_operation", "new_refresh_token_hash"),
+    ("auth_session_operation", "new_refresh_expires_at"),
+    ("auth_session_operation", "recovery_attempts"),
+    ("auth_session_operation", "recovery_claim_owner"),
+    ("auth_session_operation", "recovery_claim_expires_at"),
+    ("auth_session_operation", "last_error"),
+];
+const SWITCH_OPERATION_RECOVERY_CONTRACT_INDEXES: &[(&str, &str, &[&str], bool)] = &[(
+    "auth_session_operation",
+    "idx_aso_recovery_status",
+    &["status", "updated_at", "recovery_attempts"],
+    false,
+)];
+const SWITCH_OPERATION_RECOVERY_DEADLINE_COLUMNS: &[(&str, &str)] =
+    &[("auth_session_operation", "recovery_expires_at")];
 const REVIEW_SLICE_MIGRATION_VERSIONS: &[i64] = &[
     IDENTITY_CREDENTIAL_FENCE_VERSION,
     ASYNC_OPERATION_CORRELATION_VERSION,
@@ -769,6 +798,14 @@ const REVIEW_SLICE_MIGRATION_VERSIONS: &[i64] = &[
     CHAT_DELIVERY_INTENT_VERSION,
     LEARN_SYSTEM_ASSIGNMENT_VERSION,
 ];
+
+fn migration_requires_exact_artifact_parse(version: i64) -> bool {
+    REVIEW_SLICE_MIGRATION_VERSIONS.contains(&version)
+        || matches!(
+            version,
+            SWITCH_OPERATION_RECOVERY_CONTRACT_VERSION | SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION
+        )
+}
 const LOCAL_SCOPE_SEQUENCE_MIGRATION_SQL: &str =
     include_str!("../migrations/20261001000005_invalidation_scope_sequence.sql");
 
@@ -1899,9 +1936,23 @@ const REQUIRED_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
             "request_hash",
             "refresh_token_hash",
             "target_card_id",
+            "selected_identity_card_id",
+            "source_card_id",
+            "previous_session_version",
+            "previous_session_epoch",
+            "expected_session_version",
+            "expected_session_epoch",
+            "device_id",
+            "new_refresh_token_hash",
+            "new_refresh_expires_at",
+            "recovery_attempts",
+            "recovery_claim_owner",
+            "recovery_claim_expires_at",
+            "last_error",
             "status",
             "response_ciphertext",
             "response_expires_at",
+            "recovery_expires_at",
             "completed_at",
             "created_at",
             "updated_at",
@@ -5598,7 +5649,7 @@ fn migration_matches_known_source(migration: &Migration) -> bool {
         return false;
     }
     if migration.sql.as_ref() == known.sql.as_ref() {
-        if REVIEW_SLICE_MIGRATION_VERSIONS.contains(&migration.version) {
+        if migration_requires_exact_artifact_parse(migration.version) {
             return EXACT_MIGRATION_ARTIFACT_CONTRACTS
                 .iter()
                 .find(|contract| contract.version == migration.version)
@@ -10621,6 +10672,22 @@ const EXACT_MIGRATION_ARTIFACT_CONTRACTS: &[ExactMigrationArtifactContract] = &[
         columns: LEARN_SYSTEM_ASSIGNMENT_COLUMNS_ARTIFACTS,
         indexes: LEARN_SYSTEM_ASSIGNMENT_INDEXES,
     },
+    ExactMigrationArtifactContract {
+        version: SWITCH_OPERATION_RECOVERY_CONTRACT_VERSION,
+        source_sha384: SWITCH_OPERATION_RECOVERY_CONTRACT_SQL_SHA384,
+        supports_existing_artifacts: true,
+        tables: &[],
+        columns: SWITCH_OPERATION_RECOVERY_CONTRACT_COLUMNS,
+        indexes: SWITCH_OPERATION_RECOVERY_CONTRACT_INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION,
+        source_sha384: SWITCH_OPERATION_RECOVERY_DEADLINE_SQL_SHA384,
+        supports_existing_artifacts: true,
+        tables: &[],
+        columns: SWITCH_OPERATION_RECOVERY_DEADLINE_COLUMNS,
+        indexes: &[],
+    },
 ];
 
 fn character_indices(value: &str, character_index: usize) -> usize {
@@ -10768,6 +10835,26 @@ fn parse_create_table(statement: &str) -> Option<Vec<MigrationArtifact>> {
     Some(artifacts)
 }
 
+fn parse_create_index(statement: &str) -> Option<MigrationArtifact> {
+    let statement = normalized_sql_fragment(statement);
+    let (prefix, unique) = if statement.starts_with("CREATE UNIQUE INDEX ") {
+        ("CREATE UNIQUE INDEX ", true)
+    } else {
+        ("CREATE INDEX ", false)
+    };
+    let remainder = statement.strip_prefix(prefix)?;
+    let (name, remainder) = first_sql_word(remainder)?;
+    let remainder = remainder.trim_start().strip_prefix("ON ")?;
+    let (table, _) = first_sql_word(remainder)?;
+    Some(MigrationArtifact {
+        kind: MigrationArtifactKind::CreateIndex,
+        table: normalized_identifier(table),
+        name: normalized_identifier(name),
+        columns: index_columns(remainder)?,
+        unique,
+    })
+}
+
 fn parse_alter_table(statement: &str) -> Option<Vec<MigrationArtifact>> {
     let statement = normalized_sql_fragment(statement);
     let remainder = statement.strip_prefix("ALTER TABLE ")?;
@@ -10879,7 +10966,7 @@ fn exact_migration_artifact_contract(
     {
         return None;
     }
-    if REVIEW_SLICE_MIGRATION_VERSIONS.contains(&migration.version) {
+    if migration_requires_exact_artifact_parse(migration.version) {
         let artifacts = parsed_migration_artifacts(migration)?;
         if !exact_contract_artifacts_match_source(contract, &artifacts) {
             return None;
@@ -11007,9 +11094,16 @@ fn parsed_migration_artifacts(migration: &Migration) -> Option<Vec<MigrationArti
             }
         } else if normalized.starts_with("SET ") && normalized.contains("IF") {
             for literal in sql_string_literals(&statement)? {
-                if normalized_sql_fragment(&literal).starts_with("ALTER TABLE ") {
+                let literal_normalized = normalized_sql_fragment(&literal);
+                if literal_normalized.starts_with("ALTER TABLE ") {
                     if let Some(parsed) = parse_alter_table(&literal) {
                         artifacts.extend(parsed);
+                    }
+                } else if literal_normalized.starts_with("CREATE INDEX ")
+                    || literal_normalized.starts_with("CREATE UNIQUE INDEX ")
+                {
+                    if let Some(parsed) = parse_create_index(&literal) {
+                        artifacts.push(parsed);
                     }
                 }
             }

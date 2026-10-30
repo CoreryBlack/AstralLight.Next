@@ -362,7 +362,7 @@ fn rule_set_projection_evidence_is_valid(event_is_valid: bool, source_audit_coun
 }
 
 async fn append_initial_rule_set_projection_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     expected_tenant_id: Option<i64>,
     actor_id: i64,
@@ -417,7 +417,7 @@ async fn append_initial_rule_set_projection_in_tx(
 /// 旧链 head READY 语义已随迁移 20260831000001 退役：有效当前事件 + source
 /// 审计关联即足以证明初始投影，返回值语义为"证据已完备、无需补写"。
 pub(crate) async fn ensure_rule_set_projection_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     expected_tenant_id: Option<i64>,
     actor_id: i64,
@@ -429,7 +429,7 @@ pub(crate) async fn ensure_rule_set_projection_in_tx(
          WHERE aggregate_type = 'RULE_SET' AND aggregate_id = ? FOR UPDATE",
     )
     .bind(rule_set_id)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut ***tx)
     .await
     .map_err(|error| {
         AstralError::Database(format!("Resolve RuleSet projection head failed: {error}"))
@@ -474,7 +474,7 @@ pub(crate) async fn ensure_rule_set_projection_in_tx(
     )
     .bind(rule_set_id)
     .bind(event_id)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut ***tx)
     .await
     .map_err(|error| {
         AstralError::Database(format!("Resolve RuleSet projection event failed: {error}"))
@@ -509,7 +509,7 @@ pub(crate) async fn ensure_rule_set_projection_in_tx(
     .bind(event_id)
     .bind(source_generation)
     .bind(expected_tenant_id)
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut ***tx)
     .await
     .map_err(|error| {
         AstralError::Database(format!("Verify RuleSet source audit failed: {error}"))
@@ -532,7 +532,7 @@ pub(crate) async fn ensure_rule_set_projection_in_tx(
 }
 
 async fn append_bound_card_projections_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     event_type: &str,
 ) -> Result<(), AstralError> {
@@ -540,7 +540,7 @@ async fn append_bound_card_projections_in_tx(
         "SELECT DISTINCT card_id FROM card_rule_set_ref WHERE rule_set_id = ? FOR UPDATE",
     )
     .bind(rule_set_id)
-    .fetch_all(&mut **tx)
+    .fetch_all(&mut ***tx)
     .await
     .map_err(db_error)?;
     for card_id in card_ids {
@@ -2341,7 +2341,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         )
         .await?;
         let receipts = tx.commit_consuming_with_receipts().await?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
         Ok(rule_set_id)
     }
 
@@ -2371,8 +2371,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             // 幂等更新：没有任何可变字段实际变化 ⇒ 无 source mutation、无投影、
             // 无审计（审计只记录实际变更的字段；空变更集没有可审计内容）。
             let receipts = tx.commit_consuming_with_receipts().await?;
-            crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts)
-                .await;
+            crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
             return Ok(());
         }
         // Operation identity 前置：source UPDATE 与任何 projection/audit durable
@@ -2437,7 +2436,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         append_bound_card_projections_in_tx(&mut tx, rule_set_id, EVENT_TYPE_RULE_SET_UPDATE)
             .await?;
         let receipts = tx.commit_consuming_with_receipts().await?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
         Ok(())
     }
 
@@ -2456,8 +2455,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         .map_err(db_error)?;
         let Some((_, source_tenant_id)) = source else {
             let receipts = tx.commit_consuming_with_receipts().await?;
-            crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts)
-                .await;
+            crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
             return Ok(false);
         };
         // Operation identity 前置：capture-before-delete 与任何 durable 写入之前
@@ -2545,7 +2543,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             )));
         }
         let receipts = tx.commit_consuming_with_receipts().await?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
         Ok(true)
     }
 
@@ -2680,7 +2678,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         )
         .await?;
         let receipts = tx.commit_consuming_with_receipts().await?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
         Ok(entry_id)
     }
     async fn update_entry(
@@ -2828,7 +2826,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             );
         }
         let receipts = commit_result?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
         Ok(())
     }
 
@@ -2940,7 +2938,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             );
         }
         let receipts = commit_result?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
         Ok(true)
     }
 
@@ -2988,7 +2986,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         )
         .await?;
         let receipts = tx.commit_consuming_with_receipts().await?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
         Ok(())
     }
 
@@ -3096,7 +3094,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         )
         .await?;
         let receipts = tx.commit_consuming_with_receipts().await?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
         Ok(())
     }
 
@@ -3159,8 +3157,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             // No source mutation and no projection/audit events for a missing
             // binding, including when the RuleSet source is already gone.
             let receipts = tx.commit_consuming_with_receipts().await?;
-            crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts)
-                .await;
+            crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
             return Ok(false);
         };
 
@@ -3272,7 +3269,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
             return Ok(false);
         }
         let receipts = tx.commit_consuming_with_receipts().await?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
         Ok(true)
     }
 
@@ -3449,7 +3446,7 @@ impl RuleSetRepository for SqlxRuleSetRepository {
         .await?;
 
         let receipts = tx.commit_consuming_with_receipts().await?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&self.db, &receipts).await?;
         tracing::info!(
             rule_set_id,
             template_id,

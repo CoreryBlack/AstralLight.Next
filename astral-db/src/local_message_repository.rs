@@ -120,9 +120,9 @@ pub struct LocalMessageRepository {
     pool: MySqlPool,
 }
 
-/// Provenance a reconciliation decision must match against the exact durable
-/// row before any transition is applied. A mismatch fails closed: the row
-/// stays IN_DOUBT and no state is changed.
+/// Exact durable identity used by a reconciliation decision must match against
+/// the exact durable row before any transition is applied. A mismatch fails
+/// closed: the row stays IN_DOUBT and no state is changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InDoubtReconciliation<'a> {
     pub message_id: &'a str,
@@ -130,6 +130,31 @@ pub struct InDoubtReconciliation<'a> {
     pub message_type: &'a str,
     pub queue_name: &'a str,
     pub payload_sha256: &'a str,
+}
+
+/// Exact durable identity used by a read-only completion proof for a local
+/// message. Every field is bound independently; an operation-only lookup is
+/// never sufficient to prove that one invalidation was processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalMessageCompletionIdentity<'a> {
+    pub message_id: &'a str,
+    pub operation_id: &'a str,
+    pub message_type: &'a str,
+    pub queue_name: &'a str,
+    pub payload_sha256: &'a str,
+}
+
+/// Exact durable identity used by a read-only completion proof for one legacy
+/// source projection event. The nullable tenant is compared with MySQL's
+/// null-safe equality operator so `NULL` remains part of the identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceProjectionCompletionIdentity<'a> {
+    pub event_id: &'a str,
+    pub aggregate_type: &'a str,
+    pub aggregate_id: i64,
+    pub tenant_id: Option<i64>,
+    pub source_generation: i64,
+    pub revoke_fence: i64,
 }
 
 /// Explicit IN_DOUBT settlement decision. There is no time-based path: IN_DOUBT
@@ -718,6 +743,74 @@ impl LocalMessageRepository {
             InDoubtDecision::Quarantine => InDoubtReconcileOutcome::Quarantined,
         })
     }
+}
+
+/// Read-only exact completion proof for one typed invalidation receipt.
+///
+/// Missing, mismatched, or non-`PROCESSED` rows return `false`; database
+/// failures are returned so callers can distinguish an unavailable proof from
+/// an ordinary pending row without ever inferring completion.
+pub async fn load_exact_processed_local_message(
+    pool: &MySqlPool,
+    identity: &LocalMessageCompletionIdentity<'_>,
+) -> Result<bool, LocalMessageError> {
+    if identity.message_id.trim().is_empty()
+        || identity.operation_id.trim().is_empty()
+        || identity.message_type.trim().is_empty()
+        || identity.queue_name.trim().is_empty()
+        || identity.payload_sha256.trim().is_empty()
+    {
+        return Ok(false);
+    }
+    let matched: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM al_message_outbox \
+         WHERE message_id = ? AND operation_id = ? AND message_type = ? \
+           AND queue_name = ? AND payload_sha256 = ? AND status = 'PROCESSED' LIMIT 1",
+    )
+    .bind(identity.message_id)
+    .bind(identity.operation_id)
+    .bind(identity.message_type)
+    .bind(identity.queue_name)
+    .bind(identity.payload_sha256)
+    .fetch_optional(pool)
+    .await?;
+    Ok(matched.is_some())
+}
+
+/// Read-only exact completion proof for one legacy source projection event.
+///
+/// The nullable tenant is compared with MySQL's null-safe equality operator so
+/// `NULL` remains part of the identity. Every source identity field must match
+/// and the row must be exactly `PROCESSED`.
+pub async fn load_exact_processed_source_projection(
+    pool: &MySqlPool,
+    identity: &SourceProjectionCompletionIdentity<'_>,
+) -> Result<bool, LocalMessageError> {
+    if identity.event_id.trim().is_empty()
+        || identity.aggregate_type.trim().is_empty()
+        || identity.aggregate_id <= 0
+        || identity.tenant_id.is_some_and(|tenant_id| tenant_id <= 0)
+        || identity.source_generation <= 0
+        || identity.revoke_fence < 0
+        || identity.revoke_fence > identity.source_generation
+    {
+        return Ok(false);
+    }
+    let matched: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM authorization_projection_outbox \
+         WHERE event_id = ? AND aggregate_type = ? AND aggregate_id = ? \
+           AND tenant_id <=> ? AND source_generation = ? AND revoke_fence = ? \
+           AND status = 'PROCESSED' LIMIT 1",
+    )
+    .bind(identity.event_id)
+    .bind(identity.aggregate_type)
+    .bind(identity.aggregate_id)
+    .bind(identity.tenant_id)
+    .bind(identity.source_generation)
+    .bind(identity.revoke_fence)
+    .fetch_optional(pool)
+    .await?;
+    Ok(matched.is_some())
 }
 
 fn is_retryable_deadlock(error: &LocalMessageError) -> bool {

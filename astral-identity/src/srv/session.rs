@@ -11,12 +11,13 @@ use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
+use sqlx::{MySql, QueryBuilder, Transaction};
 use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 
 use astral_common::contract::{ApiResponse, EmptyResponse};
 use astral_common::error::AppError;
 use astral_common::middleware::decode_v2_token;
-use astral_common::token_contract::{PrincipalKind, TokenUse};
+use astral_common::token_contract::{normalize_revocation_reason, PrincipalKind, TokenUse};
 use astral_types::AstralError;
 
 use super::session_repository::{self as session_repo, DeviceSessionRow};
@@ -86,7 +87,7 @@ async fn refresh_token(
             "PRINCIPAL_KIND_INVALID".into(),
         )));
     }
-    let session = session_repo::load_active_refresh_session(&state.db, &refresh_hash)
+    let session = match session_repo::load_active_refresh_session(&state.db, &refresh_hash)
         .await?
         .filter(|row| {
             row.session_id == session_id
@@ -94,8 +95,35 @@ async fn refresh_token(
                 && row.user_id == user_id
                 && row.session_version == claims.session_version.unwrap_or_default()
                 && row.session_epoch == claims.sev.unwrap_or_default()
-        })
-        .ok_or_else(|| AstralError::Auth("Invalid refresh session".into()))?;
+        }) {
+        Some(session) => session,
+        None => {
+            // A validly signed refresh token that still names an active session
+            // but no longer matches its durable hash is a reuse signal. Revoke
+            // the family before returning the failure so a stolen rotated token
+            // cannot leave the replacement credential usable.
+            if let Some(current) =
+                session_repo::load_active_session_context(&state.db, session_id, user_id, family_id)
+                    .await?
+            {
+                if current.refresh_token_hash != refresh_hash {
+                    if let Err(error) =
+                        revoke_token_family(&state, current.family_id, "TOKEN_REUSE_DETECTED").await
+                    {
+                        return Err(AppError::from(AstralError::Auth(format!(
+                            "TOKEN_REUSE_DETECTED; failed to revoke family: {error}"
+                        ))));
+                    }
+                    return Err(AppError::from(AstralError::Auth(
+                        "Token reuse detected. All sessions have been revoked.".into(),
+                    )));
+                }
+            }
+            return Err(AppError::from(AstralError::Auth(
+                "Invalid refresh session".into(),
+            )));
+        }
+    };
     if session
         .credential_version
         .is_none_or(|version| version <= 0)
@@ -363,14 +391,6 @@ async fn refresh_token_from_session(
     let new_access_token = token_result.token.clone();
     let expires_in = token_result.expires_in;
 
-    // Session epoch fencing first closes every prior durable JTI proof and installs
-    // bounded deny accelerators before a replacement credential can be returned.
-    delete_session_projections_before_epoch(state, session.session_id, next_session_epoch)
-        .await
-        .map_err(AppError::from)?;
-
-    // The durable JTI proof is written only after the refresh-token CAS succeeds.
-
     // Step 6: 原子轮换 refresh token。旧 hash 必须仍是当前值；并发请求中只有一个
     // UPDATE 能影响一行，失败者按 token reuse 处理并撤销整个 family。
     // 会话轮换的 autocommit source 栅栏：hub 已装则 fail-closed 取得（不可得即
@@ -419,6 +439,13 @@ async fn refresh_token_from_session(
             "Token reuse detected. All sessions have been revoked.".into(),
         )));
     }
+
+    // The old access proof is closed only after the refresh-session CAS is
+    // proven successful. A failed or unknown CAS therefore cannot partially
+    // revoke the still-current credential.
+    delete_session_projections_before_epoch(state, session.session_id, next_session_epoch)
+        .await
+        .map_err(AppError::from)?;
 
     // Credential tracking is security-critical: durable JTI proof in
     // auth_session_jti_index is authoritative. Failure revokes the durable family
@@ -499,21 +526,63 @@ async fn revoke_session(
             "PRINCIPAL_KIND_INVALID".into(),
         )));
     }
-    let reason = req.reason.as_deref().unwrap_or("USER_REVOKED");
+    let reason = normalize_revocation_reason(req.reason.as_deref().unwrap_or("USER_REVOKED"))
+        .map_err(|error| AppError::from(AstralError::Validation(error.into())))?;
+    let user_id = claims
+        .sub
+        .parse::<i64>()
+        .map_err(|_| AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into())))?;
     match token_use {
         TokenUse::Access => {
-            delete_access_projections(&state, &claims.jti).await?;
-            mark_jti_revoked_at(&claims.jti, state.config.jwt.access.expiry_seconds).await?;
+            let session_id = claims.sid.ok_or_else(|| {
+                AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into()))
+            })?;
+            revoke_access_jti_transaction(&state, user_id, session_id, &claims.jti, &reason)
+                .await
+                .map_err(AppError::from)?;
         }
         TokenUse::Refresh => {
             let refresh_hash = sha256_hash(raw);
-            let session = session_repo::load_active_refresh_session(&state.db, &refresh_hash)
-                .await?
-                .ok_or_else(|| AstralError::Auth("Invalid refresh session".into()))?;
-            delete_session_projections(&state, session.session_id).await?;
-            db_revoke_session(&state.db, session.session_id, reason).await?;
-            delete_session_projections(&state, session.session_id).await?;
-            write_session_revocation_outbox(&state, session.session_id, reason).await?;
+            let session_id = claims.sid.ok_or_else(|| {
+                AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into()))
+            })?;
+            let family_id = claims.family_id.ok_or_else(|| {
+                AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into()))
+            })?;
+            let session_version = claims.session_version.ok_or_else(|| {
+                AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into()))
+            })?;
+            let session_epoch = claims.sev.ok_or_else(|| {
+                AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into()))
+            })?;
+            let session_context = RefreshSessionContext {
+                session_id,
+                user_id,
+                family_id,
+                session_version,
+                session_epoch,
+            };
+            let session = load_current_refresh_session_or_revoke_reuse(
+                &state,
+                session_context,
+                &refresh_hash,
+                "Invalid refresh session",
+            )
+            .await?;
+            let operation_id = stable_revocation_operation_id(
+                "session",
+                &format!("{}:{refresh_hash}", session.session_id),
+                &reason,
+            );
+            revoke_session_transaction(
+                &state,
+                session.session_id,
+                &refresh_hash,
+                operation_id,
+                &reason,
+            )
+            .await
+            .map_err(AppError::from)?;
         }
     }
     Ok(Json(ApiResponse::success(EmptyResponse)))
@@ -533,14 +602,103 @@ async fn logout(
     }
     match token_use {
         TokenUse::Access => {
-            delete_access_projections(&state, &claims.jti).await?;
-            mark_jti_revoked_at(&claims.jti, state.config.jwt.access.expiry_seconds).await?;
+            let user_id = claims
+                .sub
+                .parse::<i64>()
+                .map_err(|_| AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into())))?;
+            let session_id = claims.sid.ok_or_else(|| {
+                AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into()))
+            })?;
+            revoke_access_jti_transaction(&state, user_id, session_id, &claims.jti, "LOGOUT")
+                .await
+                .map_err(AppError::from)?;
         }
         TokenUse::Refresh => {
-            revoke_logout_refresh(&state, raw, &claims.jti).await?;
+            let user_id = claims
+                .sub
+                .parse::<i64>()
+                .map_err(|_| AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into())))?;
+            let session_id = claims.sid.ok_or_else(|| {
+                AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into()))
+            })?;
+            let family_id = claims.family_id.ok_or_else(|| {
+                AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into()))
+            })?;
+            let session_version = claims.session_version.ok_or_else(|| {
+                AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into()))
+            })?;
+            let session_epoch = claims.sev.ok_or_else(|| {
+                AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into()))
+            })?;
+            let session_context = RefreshSessionContext {
+                session_id,
+                user_id,
+                family_id,
+                session_version,
+                session_epoch,
+            };
+            revoke_logout_refresh(&state, raw, session_context).await?;
         }
     }
     Ok(Json(ApiResponse::success("Logged out".into())))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RefreshSessionContext {
+    session_id: i64,
+    user_id: i64,
+    family_id: i64,
+    session_version: i64,
+    session_epoch: i64,
+}
+
+async fn load_current_refresh_session_or_revoke_reuse(
+    state: &AppState,
+    context: RefreshSessionContext,
+    refresh_hash: &str,
+    invalid_message: &'static str,
+) -> Result<DeviceSessionRow, AppError> {
+    if let Some(session) = session_repo::load_active_refresh_session(&state.db, refresh_hash)
+        .await?
+        .filter(|row| {
+            row.session_id == context.session_id
+                && row.user_id == context.user_id
+                && row.family_id == context.family_id
+                && row.session_version == context.session_version
+                && row.session_epoch == context.session_epoch
+        })
+    {
+        return Ok(session);
+    }
+
+    if let Some(current) = session_repo::load_active_session_context(
+        &state.db,
+        context.session_id,
+        context.user_id,
+        context.family_id,
+    )
+    .await?
+    {
+        if current.session_version != context.session_version
+            || current.session_epoch != context.session_epoch
+        {
+            return Err(AppError::from(AstralError::Auth(invalid_message.into())));
+        }
+        if current.refresh_token_hash != refresh_hash {
+            if let Err(error) =
+                revoke_token_family(state, current.family_id, "TOKEN_REUSE_DETECTED").await
+            {
+                return Err(AppError::from(AstralError::Auth(format!(
+                    "TOKEN_REUSE_DETECTED; failed to revoke family: {error}"
+                ))));
+            }
+            return Err(AppError::from(AstralError::Auth(
+                "Token reuse detected. All sessions have been revoked.".into(),
+            )));
+        }
+    }
+
+    Err(AppError::from(AstralError::Auth(invalid_message.into())))
 }
 
 /// logout/revoke 共用的凭证前置门：Authorization 头缺失或非 Bearer 形态
@@ -561,72 +719,649 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 async fn revoke_logout_refresh(
     state: &AppState,
     refresh_token: &str,
-    refresh_jti: &str,
+    context: RefreshSessionContext,
 ) -> Result<(), AppError> {
     let refresh_hash = sha256_hash(refresh_token);
-    let session = sqlx::query_as::<_, DeviceSessionRow>(
-        "SELECT session_id, family_id, user_id, device_id, device_type, client_app_id, channel_code, \
-         current_user_card_id, session_state, session_version, session_epoch, refresh_token_hash, refresh_expires_at, status, ip_address, user_agent, \
-         last_seen_at, revoked_at, revoked_reason, created_at, updated_at \
-         FROM auth_device_session \
-         WHERE refresh_token_hash = ? AND status = 'ACTIVE' AND session_state = 'ACTIVE'",
+    let session = load_current_refresh_session_or_revoke_reuse(
+        state,
+        context,
+        &refresh_hash,
+        "Invalid refresh token",
     )
-    .bind(&refresh_hash)
-    .fetch_optional(&state.db)
+    .await?;
+    let operation_id = stable_revocation_operation_id(
+        "session",
+        &format!("{}:{refresh_hash}", session.session_id),
+        "LOGOUT",
+    );
+    revoke_session_transaction(
+        state,
+        session.session_id,
+        &refresh_hash,
+        operation_id,
+        "LOGOUT",
+    )
     .await
-    .map_err(|e| {
-        AppError::from(AstralError::Database(format!(
-            "Logout session lookup failed: {e}"
-        )))
-    })?
-    .ok_or_else(|| AppError::from(AstralError::Auth("Invalid refresh token".into())))?;
+    .map_err(AppError::from)
+}
 
-    // Close the durable session grant proofs before completing revocation; a
-    // failure cannot leave a Gateway-live credential behind a closed session.
-    delete_session_projections(state, session.session_id)
-        .await
-        .map_err(AppError::from)?;
-    db_revoke_session(&state.db, session.session_id, "LOGOUT")
-        .await
-        .map_err(AppError::from)?;
-    // 记录会话撤销 outbox（对齐 Java durable 补偿路径），登出同样留 durable 轨迹。
-    write_session_revocation_outbox(state, session.session_id, "LOGOUT")
-        .await
-        .map_err(AppError::from)?;
-    mark_jti_revoked_at(refresh_jti, state.config.jwt.refresh.expiry_seconds * 2)
-        .await
-        .map_err(AppError::from)?;
+const MAX_REVOCATION_SNAPSHOT_JTIS: usize = 4096;
+
+#[derive(Debug, Clone, Copy)]
+enum RevocationTarget<'a> {
+    Access {
+        session_id: i64,
+        user_id: i64,
+        jti: &'a str,
+    },
+    Session {
+        session_id: i64,
+        refresh_hash: &'a str,
+    },
+    Family {
+        family_id: i64,
+    },
+    User {
+        user_id: i64,
+    },
+}
+
+fn stable_revocation_operation_id(scope: &str, key: &str, reason: &str) -> String {
+    let operation_key = format!("{key}\u{1f}{reason}");
+    let operation_hash = sha256_hash(&operation_key);
+    format!(
+        "identity:{scope}:{}",
+        &operation_hash[..32.min(operation_hash.len())]
+    )
+}
+
+async fn revoke_access_jti_transaction(
+    state: &AppState,
+    user_id: i64,
+    session_id: i64,
+    jti: &str,
+    reason: &str,
+) -> Result<(), AstralError> {
+    if jti.trim().is_empty() {
+        return Err(AstralError::Auth("TOKEN_ID_REQUIRED".into()));
+    }
+    let operation_id =
+        stable_revocation_operation_id("access", &format!("{session_id}:{jti}"), reason);
+    revoke_transaction(
+        state,
+        RevocationTarget::Access {
+            session_id,
+            user_id,
+            jti,
+        },
+        operation_id,
+        reason,
+    )
+    .await
+}
+
+async fn revoke_session_transaction(
+    state: &AppState,
+    session_id: i64,
+    refresh_hash: &str,
+    operation_id: String,
+    reason: &str,
+) -> Result<(), AstralError> {
+    revoke_transaction(
+        state,
+        RevocationTarget::Session {
+            session_id,
+            refresh_hash,
+        },
+        operation_id,
+        reason,
+    )
+    .await
+}
+
+async fn revoke_transaction(
+    state: &AppState,
+    target: RevocationTarget<'_>,
+    operation_id: String,
+    reason: &str,
+) -> Result<(), AstralError> {
+    let reason = normalize_revocation_reason(reason)
+        .map_err(|error| AstralError::Validation(error.into()))?;
+    let source_guard = source_writer_guard::begin_source_write()?;
+    let mut tx = state.db.begin().await.map_err(|error| {
+        AstralError::Database(format!("Begin revocation transaction failed: {error}"))
+    })?;
+
+    let existing_payload = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT payload_json FROM auth_session_outbox \
+         WHERE operation_id = ? AND sequence_number = 1 FOR UPDATE",
+    )
+    .bind(&operation_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| AstralError::Database(format!("Load revocation operation failed: {error}")))?;
+    let expected_user_id = match target {
+        RevocationTarget::Access { user_id, .. } | RevocationTarget::User { user_id } => user_id,
+        RevocationTarget::Session { .. } | RevocationTarget::Family { .. } => 0,
+    };
+    if let Some(payload) = existing_payload.flatten() {
+        let snapshot = parse_current_revocation_snapshot(Some(&payload))?;
+        if snapshot.reason != reason
+            || (expected_user_id > 0 && snapshot.user_id != expected_user_id)
+        {
+            tx.rollback().await.map_err(|error| {
+                AstralError::Database(format!(
+                    "Rollback conflicting revocation operation failed: {error}"
+                ))
+            })?;
+            return Err(AstralError::Auth(
+                "SESSION_REVOCATION_IDEMPOTENCY_CONFLICT".into(),
+            ));
+        }
+        if matches!(target, RevocationTarget::User { .. }) {
+            let (_, current_session_ids, current_jtis, _, _) =
+                lock_revocation_snapshot(&mut tx, target).await?;
+            if !current_session_ids.is_empty() || !current_jtis.is_empty() {
+                tx.rollback().await.map_err(|error| {
+                    AstralError::Database(format!(
+                        "Rollback conflicting revocation operation failed: {error}"
+                    ))
+                })?;
+                return Err(AstralError::Auth(
+                    "SESSION_REVOCATION_IDEMPOTENCY_CONFLICT".into(),
+                ));
+            }
+        }
+        tx.rollback().await.map_err(|error| {
+            AstralError::Database(format!(
+                "Rollback duplicate revocation operation failed: {error}"
+            ))
+        })?;
+        astral_db::note_revocations_in_process(
+            &snapshot.jtis,
+            astral_db::REVOCATION_MIRROR_TTL_SECS,
+        );
+        for jti in &snapshot.jtis {
+            mark_registry_revoked(jti, REVOKED_TTL_SECS);
+        }
+        return Ok(());
+    }
+
+    let (user_id, session_ids, revoked_jtis, session_id, family_ids) =
+        lock_revocation_snapshot(&mut tx, target).await?;
+
+    match target {
+        RevocationTarget::Access {
+            session_id,
+            user_id,
+            jti,
+        } => {
+            let result = sqlx::query(
+                "UPDATE auth_session_jti_index SET status = 'DELETED', updated_at = UTC_TIMESTAMP() \
+                 WHERE session_id = ? AND user_id = ? AND jti = ? AND status = 'ACTIVE'",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .bind(jti)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| AstralError::Database(format!("Revoke access JTI failed: {error}")))?;
+            if result.rows_affected() != 1 {
+                return Err(AstralError::Auth(
+                    "ACCESS_PROOF_REVOCATION_NOT_APPLIED".into(),
+                ));
+            }
+        }
+        RevocationTarget::Session { session_id, .. } => {
+            let result = sqlx::query(
+                "UPDATE auth_device_session SET status = 'REVOKED', session_state = 'REVOKED', \
+                 session_version = session_version + 1, session_epoch = session_epoch + 1, \
+                 revoked_at = UTC_TIMESTAMP(), revoked_reason = ?, updated_at = UTC_TIMESTAMP() \
+                 WHERE session_id = ? AND status = 'ACTIVE' AND session_state = 'ACTIVE'",
+            )
+            .bind(&reason)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| AstralError::Database(format!("Revoke session failed: {error}")))?;
+            if result.rows_affected() != 1 {
+                return Err(AstralError::Auth("SESSION_REVOCATION_NOT_APPLIED".into()));
+            }
+            close_revocation_jtis_in_tx(&mut tx, user_id, &revoked_jtis).await?;
+        }
+        RevocationTarget::Family { family_id } => {
+            let family = sqlx::query(
+                "UPDATE auth_token_family SET status = 'REVOKED', revoked_at = UTC_TIMESTAMP(), \
+                 revoked_reason = ? WHERE family_id = ? AND status = 'ACTIVE'",
+            )
+            .bind(&reason)
+            .bind(family_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| AstralError::Database(format!("Revoke family failed: {error}")))?;
+            if family.rows_affected() != 1 {
+                return Err(AstralError::Auth(
+                    "TOKEN_FAMILY_REVOCATION_NOT_APPLIED".into(),
+                ));
+            }
+            let sessions = sqlx::query(
+                "UPDATE auth_device_session SET status = 'REVOKED', session_state = 'REVOKED', \
+                 session_version = session_version + 1, session_epoch = session_epoch + 1, \
+                 revoked_at = UTC_TIMESTAMP(), revoked_reason = ?, updated_at = UTC_TIMESTAMP() \
+                 WHERE family_id = ? AND status = 'ACTIVE' AND session_state = 'ACTIVE'",
+            )
+            .bind(&reason)
+            .bind(family_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                AstralError::Database(format!("Revoke family sessions failed: {error}"))
+            })?;
+            if sessions.rows_affected() != session_ids.len() as u64 {
+                return Err(AstralError::Auth(
+                    "TOKEN_FAMILY_SESSION_SNAPSHOT_CHANGED".into(),
+                ));
+            }
+            close_revocation_jtis_in_tx(&mut tx, user_id, &revoked_jtis).await?;
+        }
+        RevocationTarget::User { user_id } => {
+            let sessions = sqlx::query(
+                "UPDATE auth_device_session SET status = 'REVOKED', session_state = 'REVOKED', \
+                 session_version = session_version + 1, session_epoch = session_epoch + 1, \
+                 revoked_at = UTC_TIMESTAMP(), revoked_reason = ?, updated_at = UTC_TIMESTAMP() \
+                 WHERE user_id = ? AND status = 'ACTIVE' AND session_state = 'ACTIVE'",
+            )
+            .bind(&reason)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                AstralError::Database(format!("Revoke user sessions failed: {error}"))
+            })?;
+            if sessions.rows_affected() != session_ids.len() as u64 {
+                return Err(AstralError::Auth("USER_SESSION_SNAPSHOT_CHANGED".into()));
+            }
+            if family_ids.is_empty() {
+                // The empty aggregate set is a valid no-op after the user row and
+                // session snapshot are locked; never emit `IN ()` SQL.
+            } else {
+                let mut families_query = QueryBuilder::<MySql>::new(
+                    "UPDATE auth_token_family SET status = 'REVOKED', revoked_at = UTC_TIMESTAMP(), revoked_reason = ? WHERE family_id IN (",
+                );
+                families_query.push_bind(&reason);
+                let mut family_ids_bind = families_query.separated(", ");
+                for family_id in &family_ids {
+                    family_ids_bind.push_bind(family_id);
+                }
+                family_ids_bind.push_unseparated(") AND status = 'ACTIVE'");
+                let families = families_query
+                    .build()
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| {
+                        AstralError::Database(format!("Revoke user families failed: {error}"))
+                    })?;
+                if families.rows_affected() != family_ids.len() as u64 {
+                    return Err(AstralError::Auth("USER_FAMILY_SNAPSHOT_CHANGED".into()));
+                }
+            }
+            close_revocation_jtis_in_tx(&mut tx, user_id, &revoked_jtis).await?;
+        }
+    }
+
+    let payload = serde_json::json!({
+        "v": 2,
+        "reason": reason,
+        "userId": user_id,
+        "jtis": revoked_jtis,
+        "typedShards": true,
+    })
+    .to_string();
+    let audit_resource = match target {
+        RevocationTarget::Access { session_id, .. }
+        | RevocationTarget::Session { session_id, .. } => format!("session:{session_id}"),
+        RevocationTarget::Family { family_id } => format!("token-family:{family_id}"),
+        RevocationTarget::User { user_id } => format!("user:{user_id}"),
+    };
+    astral_db::insert_audit_log_in_tx(
+        &mut tx,
+        &astral_common::audit::AuditEntry {
+            user_id: Some(user_id),
+            card_id: None,
+            action: "REVOKE_SESSION".into(),
+            resource: audit_resource,
+            decision: "PENDING".into(),
+            reason: Some(reason.clone()),
+            event_type: astral_common::audit::AuditEventType::TokenRevocation,
+            category: Some(astral_common::audit::AuditCategory::IdentityEvent),
+            source_ip: None,
+            request_id: Some(operation_id.clone()),
+            domain_id: None,
+            tenant_id: None,
+            detail: Some(format!(
+                "operation_id={operation_id};jti_count={};typed_shards=true",
+                revoked_jtis.len()
+            )),
+        },
+    )
+    .await
+    .map_err(|error| AstralError::Database(format!("Write revocation audit failed: {error}")))?;
+    sqlx::query(
+        "INSERT INTO auth_session_outbox \
+         (operation_id, session_id, event_type, sequence_number, projection_key, payload_json, status, created_at) \
+         VALUES (?, ?, 'REVOKE', 1, ?, ?, 'PENDING', UTC_TIMESTAMP())",
+    )
+    .bind(&operation_id)
+    .bind(session_id)
+    .bind(format!("user:{user_id}"))
+    .bind(payload)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| AstralError::Database(format!("Write revocation outbox failed: {error}")))?;
+
+    let committed_shards = astral_mq::invalidation::append_session_revocation_shards_in_tx(
+        &mut tx,
+        user_id,
+        &revoked_jtis,
+        &operation_id,
+    )
+    .await
+    .map_err(|error| AstralError::Database(format!("Write revocation shards failed: {error}")))?;
+
+    source_writer_guard::arm_commit_fence(&source_guard);
+    tx.commit().await.map_err(|error| {
+        AstralError::Database(format!("Commit revocation transaction failed: {error}"))
+    })?;
+    source_writer_guard::settle_commit_fence(&source_guard, true);
+    drop(source_guard);
+
+    astral_mq::consumers::deliver_committed_session_shards(&committed_shards).await;
+    astral_db::note_revocations_in_process(&revoked_jtis, astral_db::REVOCATION_MIRROR_TTL_SECS);
+    for jti in &revoked_jtis {
+        mark_registry_revoked(jti, REVOKED_TTL_SECS);
+    }
     Ok(())
 }
 
-/// 记录单会话撤销 outbox（对齐 Java durable 补偿路径；列契约见 20260728000001 DDL）
-///
-/// 单会话撤销（token revoke / logout）同样留 durable 轨迹：补偿 worker 可按
-/// `session:{session_id}` 重建已提交的撤销拒绝镜像，避免只依赖进程内 marker。
-/// autocommit INSERT 带 source 栅栏（hub 未装 no-op；await 窗口武装取消栅栏）。
-async fn write_session_revocation_outbox(
-    state: &AppState,
-    session_id: i64,
-    reason: &str,
+async fn lock_revocation_snapshot(
+    tx: &mut Transaction<'_, MySql>,
+    target: RevocationTarget<'_>,
+) -> Result<(i64, Vec<i64>, Vec<String>, Option<i64>, Vec<i64>), AstralError> {
+    let limit = i64::try_from(MAX_REVOCATION_SNAPSHOT_JTIS + 1)
+        .map_err(|_| AstralError::Internal("revocation snapshot cap overflow".into()))?;
+    match target {
+        RevocationTarget::Access {
+            session_id,
+            user_id,
+            jti,
+        } => {
+            let session: Option<(i64,)> = sqlx::query_as(
+                "SELECT session_id FROM auth_device_session WHERE session_id = ? AND user_id = ? FOR UPDATE",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| AstralError::Database(format!("Lock access session failed: {error}")))?;
+            if session.is_none() {
+                return Err(AstralError::Auth("SESSION_NOT_FOUND".into()));
+            }
+            let row: Option<(String, String)> = sqlx::query_as(
+                "SELECT jti, status FROM auth_session_jti_index \
+                 WHERE session_id = ? AND user_id = ? AND jti = ? LIMIT 1 FOR UPDATE",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .bind(jti)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| AstralError::Database(format!("Lock access JTI failed: {error}")))?;
+            let Some((jti, status)) = row else {
+                return Err(AstralError::Auth("ACCESS_PROOF_NOT_FOUND".into()));
+            };
+            if status != "ACTIVE" {
+                return Err(AstralError::Auth("ACCESS_PROOF_ALREADY_REVOKED".into()));
+            }
+            Ok((
+                user_id,
+                vec![session_id],
+                vec![jti],
+                Some(session_id),
+                Vec::new(),
+            ))
+        }
+        RevocationTarget::Session {
+            session_id,
+            refresh_hash,
+        } => {
+            let row: Option<(i64, i64, String)> = sqlx::query_as(
+                "SELECT session_id, user_id, status FROM auth_device_session \
+                 WHERE session_id = ? AND refresh_token_hash = ? FOR UPDATE",
+            )
+            .bind(session_id)
+            .bind(refresh_hash)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| {
+                AstralError::Database(format!("Lock refresh session failed: {error}"))
+            })?;
+            let Some((session_id, user_id, status)) = row else {
+                return Err(AstralError::Auth("SESSION_NOT_FOUND".into()));
+            };
+            if status != "ACTIVE" {
+                return Err(AstralError::Auth("SESSION_ALREADY_REVOKED".into()));
+            }
+            let jtis: Vec<(String,)> = sqlx::query_as(
+                "SELECT jti FROM auth_session_jti_index WHERE session_id = ? AND status = 'ACTIVE' \
+                 ORDER BY jti LIMIT ? FOR UPDATE",
+            )
+            .bind(session_id)
+            .bind(limit)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|error| AstralError::Database(format!("Snapshot session JTIs failed: {error}")))?;
+            let jtis = bounded_revocation_jtis(jtis)?;
+            Ok((
+                user_id,
+                vec![session_id],
+                jtis,
+                Some(session_id),
+                Vec::new(),
+            ))
+        }
+        RevocationTarget::Family { family_id } => {
+            let family: Option<(i64, i64, String)> = sqlx::query_as(
+                "SELECT family_id, user_id, status FROM auth_token_family WHERE family_id = ? FOR UPDATE",
+            )
+            .bind(family_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| AstralError::Database(format!("Lock token family failed: {error}")))?;
+            let Some((_, user_id, status)) = family else {
+                return Err(AstralError::Auth("TOKEN_FAMILY_NOT_FOUND".into()));
+            };
+            if status != "ACTIVE" {
+                return Err(AstralError::Auth("TOKEN_FAMILY_ALREADY_REVOKED".into()));
+            }
+            let sessions: Vec<(i64,)> = sqlx::query_as(
+                "SELECT session_id FROM auth_device_session WHERE family_id = ? AND status = 'ACTIVE' \
+                 AND session_state = 'ACTIVE' ORDER BY session_id FOR UPDATE",
+            )
+            .bind(family_id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|error| AstralError::Database(format!("Lock family sessions failed: {error}")))?;
+            let jtis: Vec<(String,)> = sqlx::query_as(
+                "SELECT i.jti FROM auth_session_jti_index i \
+                 INNER JOIN auth_device_session s ON s.session_id = i.session_id \
+                 WHERE s.family_id = ? AND i.status = 'ACTIVE' ORDER BY i.jti LIMIT ? FOR UPDATE",
+            )
+            .bind(family_id)
+            .bind(limit)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|error| {
+                AstralError::Database(format!("Snapshot family JTIs failed: {error}"))
+            })?;
+            Ok((
+                user_id,
+                sessions.into_iter().map(|(id,)| id).collect(),
+                bounded_revocation_jtis(jtis)?,
+                None,
+                vec![family_id],
+            ))
+        }
+        RevocationTarget::User { user_id } => {
+            let user: Option<(i64,)> = sqlx::query_as(
+                "SELECT user_id FROM platform_user WHERE user_id = ? AND deleted_at IS NULL FOR UPDATE",
+            )
+            .bind(user_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| AstralError::Database(format!("Lock user for revocation failed: {error}")))?;
+            if user.is_none() {
+                return Err(AstralError::Auth("USER_NOT_FOUND".into()));
+            }
+            let family_ids: Vec<(i64,)> = sqlx::query_as(
+                "SELECT family_id FROM auth_token_family WHERE user_id = ? AND status = 'ACTIVE' \
+                 ORDER BY family_id FOR UPDATE",
+            )
+            .bind(user_id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|error| {
+                AstralError::Database(format!("Lock user families failed: {error}"))
+            })?;
+            let sessions: Vec<(i64,)> = sqlx::query_as(
+                "SELECT session_id FROM auth_device_session WHERE user_id = ? AND status = 'ACTIVE' \
+                 AND session_state = 'ACTIVE' ORDER BY session_id FOR UPDATE",
+            )
+            .bind(user_id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|error| AstralError::Database(format!("Lock user sessions failed: {error}")))?;
+            let jtis: Vec<(String,)> = sqlx::query_as(
+                "SELECT jti FROM auth_session_jti_index WHERE user_id = ? AND status = 'ACTIVE' \
+                 ORDER BY jti LIMIT ? FOR UPDATE",
+            )
+            .bind(user_id)
+            .bind(limit)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|error| {
+                AstralError::Database(format!("Snapshot user JTIs failed: {error}"))
+            })?;
+            Ok((
+                user_id,
+                sessions.into_iter().map(|(id,)| id).collect(),
+                bounded_revocation_jtis(jtis)?,
+                None,
+                family_ids.into_iter().map(|(id,)| id).collect(),
+            ))
+        }
+    }
+}
+
+fn bounded_revocation_jtis(rows: Vec<(String,)>) -> Result<Vec<String>, AstralError> {
+    if rows.len() > MAX_REVOCATION_SNAPSHOT_JTIS {
+        return Err(AstralError::Validation(
+            "Too many active credentials to revoke atomically; support is required".into(),
+        ));
+    }
+    Ok(rows.into_iter().map(|(jti,)| jti).collect())
+}
+
+async fn close_revocation_jtis_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    user_id: i64,
+    jtis: &[String],
 ) -> Result<(), AstralError> {
-    let operation_id = uuid::Uuid::new_v4().to_string();
-    let outbox_guard = source_writer_guard::begin_source_write()?;
-    source_writer_guard::fenced_source_write(
-        outbox_guard,
-        sqlx::query(
-            "INSERT INTO auth_session_outbox \
-             (operation_id, session_id, event_type, sequence_number, projection_key, payload_json, status, created_at) \
-             VALUES (?, ?, 'REVOKE', 1, ?, ?, 'PENDING', NOW())",
-        )
-        .bind(&operation_id)
-        .bind(session_id)
-        .bind(format!("session:{session_id}"))
-        .bind(serde_json::json!({ "reason": reason }).to_string())
-        .execute(&state.db),
-    )
-    .await
-    .map_err(|e| AstralError::Database(format!("Write session outbox failed: {e}")))?;
+    if jtis.is_empty() {
+        return Ok(());
+    }
+    let mut query = QueryBuilder::<MySql>::new(
+        "UPDATE auth_session_jti_index SET status = 'DELETED', updated_at = UTC_TIMESTAMP() WHERE user_id = ",
+    );
+    query.push_bind(user_id);
+    query.push(" AND status = 'ACTIVE' AND jti IN (");
+    let mut separated = query.separated(", ");
+    for jti in jtis {
+        separated.push_bind(jti);
+    }
+    separated.push_unseparated(")");
+    let result = query.build().execute(&mut **tx).await.map_err(|error| {
+        AstralError::Database(format!("Close revocation JTI snapshot failed: {error}"))
+    })?;
+    if result.rows_affected() != jtis.len() as u64 {
+        return Err(AstralError::Auth(
+            "Revocation JTI snapshot changed during transaction".into(),
+        ));
+    }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RevocationSnapshot {
+    user_id: i64,
+    reason: String,
+    jtis: Vec<String>,
+}
+
+fn parse_current_revocation_snapshot(
+    payload: Option<&str>,
+) -> Result<RevocationSnapshot, AstralError> {
+    let payload = payload
+        .ok_or_else(|| AstralError::Auth("SESSION_REVOCATION_RECONCILIATION_REQUIRED".into()))?;
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|_| AstralError::Auth("SESSION_REVOCATION_RECONCILIATION_REQUIRED".into()))?;
+    if value.get("v").and_then(serde_json::Value::as_i64) != Some(2)
+        || value
+            .get("typedShards")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return Err(AstralError::Auth(
+            "SESSION_REVOCATION_RECONCILIATION_REQUIRED".into(),
+        ));
+    }
+    let user_id = value
+        .get("userId")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| AstralError::Auth("SESSION_REVOCATION_RECONCILIATION_REQUIRED".into()))?;
+    let reason = normalize_revocation_reason(
+        value
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                AstralError::Auth("SESSION_REVOCATION_RECONCILIATION_REQUIRED".into())
+            })?,
+    )
+    .map_err(|_| AstralError::Auth("SESSION_REVOCATION_RECONCILIATION_REQUIRED".into()))?;
+    let jtis = value
+        .get("jtis")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| AstralError::Auth("SESSION_REVOCATION_RECONCILIATION_REQUIRED".into()))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|jti| !jti.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    AstralError::Auth("SESSION_REVOCATION_RECONCILIATION_REQUIRED".into())
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if jtis.len() > MAX_REVOCATION_SNAPSHOT_JTIS {
+        return Err(AstralError::Auth(
+            "SESSION_REVOCATION_RECONCILIATION_REQUIRED".into(),
+        ));
+    }
+    Ok(RevocationSnapshot {
+        user_id,
+        reason,
+        jtis,
+    })
 }
 
 // ===== Token Family 管理函数 =====
@@ -695,100 +1430,42 @@ async fn revoke_token_family(
     family_id: i64,
     reason: &str,
 ) -> Result<(), AstralError> {
-    let session_ids = session_repo::list_session_ids_by_family(&state.db, family_id).await?;
-
-    for session_id in &session_ids {
-        delete_session_projections(state, *session_id).await?;
-    }
-
-    // Revoke after the projection fan-out. If the durable transition fails, the
-    // credential is conservatively unavailable instead of remaining Gateway-live.
-    // 撤销集群 source 栅栏：family CAS、级联撤销与 outbox 追加是连续 autocommit
-    // 语句（零网络段），统一持有一份 writer 栅栏——begin 前取得、首语句 await 前
-    // 武装、outbox 落盘后 proven 释放。中途任何失败/取消以已武装 Drop 保持
-    // sticky uncertain_source（部分 autocommit 效果已存在，属未知结果）。栅栏
-    // 绝不覆盖其前后的本地拒绝加速登记。
-    let source_guard = source_writer_guard::begin_source_write()?;
-    source_writer_guard::arm_commit_fence(&source_guard);
-    session_repo::revoke_family_cas(&state.db, family_id, reason).await?;
-
-    // 级联撤销该 family 下所有活跃会话. session_state/version/epoch are
-    // updated together so Java's grant verifier observes the same durable fence.
-    session_repo::revoke_family_sessions(&state.db, family_id, reason).await?;
-
-    // 记录会话撤销 outbox（对齐 Java durable 补偿路径；列契约见 20260728000001 DDL）
-    let operation_id = uuid::Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO auth_session_outbox \
-         (operation_id, session_id, event_type, sequence_number, projection_key, payload_json, status, created_at) \
-         VALUES (?, NULL, 'REVOKE', 1, ?, ?, 'PENDING', NOW())",
+    let operation_id = stable_revocation_operation_id("family", &family_id.to_string(), reason);
+    revoke_transaction(
+        state,
+        RevocationTarget::Family { family_id },
+        operation_id,
+        reason,
     )
-    .bind(&operation_id)
-    .bind(format!("family:{family_id}"))
-    .bind(serde_json::json!({ "reason": reason }).to_string())
-    .execute(&state.db)
     .await
-    .map_err(|e| AstralError::Database(format!("Write session outbox failed: {e}")))?;
-    source_writer_guard::settle_commit_fence(&source_guard, true);
-    drop(source_guard);
-
-    for session_id in &session_ids {
-        delete_session_projections(state, *session_id).await?;
-    }
-
-    tracing::warn!(family_id = %family_id, reason = %reason, "token family revoked with cascade");
-    Ok(())
 }
 
 /// Revoke every active session and token family for a user.
 ///
-/// Java's `AuthDeviceSessionService.revokeAllForUser()` closes the durable
-/// session/family state and records a durable recovery event. Verified local
-/// deny markers are installed from indexed JTIs before source mutation; a miss
-/// or eviction always falls back to the authoritative MySQL state.
+/// The source rows, exact JTI snapshot, v2 parent outbox row, and typed
+/// SESSION_REVOKED intents commit as one durable transaction. Process-local
+/// deny acceleration is installed only after that commit is proven.
 pub(crate) async fn revoke_all_sessions_for_user(
     state: &AppState,
     user_id: i64,
     reason: &str,
+    request_operation_id: Option<&str>,
 ) -> Result<(), AstralError> {
-    let session_ids = session_repo::list_active_session_ids_by_user(&state.db, user_id).await?;
-
-    for session_id in &session_ids {
-        delete_session_projections(state, *session_id).await?;
-    }
-
-    // 撤销集群 source 栅栏：两批 autocommit UPDATE 与 outbox 追加是连续语句
-    // （零网络段），统一持有 writer 栅栏——首语句 await 前武装、outbox 落盘后
-    // proven 释放；中途失败/取消以已武装 Drop 保持 sticky uncertain_source
-    // （部分 autocommit 效果已存在，属未知结果，先对账再重试）。
-    let source_guard = source_writer_guard::begin_source_write()?;
-    source_writer_guard::arm_commit_fence(&source_guard);
-    session_repo::revoke_user_sessions(&state.db, user_id, reason).await?;
-    session_repo::revoke_user_token_families(&state.db, user_id, reason).await?;
-
-    // 记录会话撤销 outbox（对齐 Java durable 补偿路径；列契约见 20260728000001 DDL）
-    let operation_id = uuid::Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO auth_session_outbox \
-         (operation_id, session_id, event_type, sequence_number, projection_key, payload_json, status, created_at) \
-         VALUES (?, NULL, 'REVOKE', 1, ?, ?, 'PENDING', NOW())",
-    )
-    .bind(&operation_id)
-    .bind(format!("user:{user_id}"))
-    .bind(serde_json::json!({ "reason": reason }).to_string())
-    .execute(&state.db)
-    .await
-    .map_err(|e| AstralError::Database(format!("Write session outbox failed: {e}")))?;
-    source_writer_guard::settle_commit_fence(&source_guard, true);
-    drop(source_guard);
-
-    tracing::warn!(
-        user_id,
+    let request_operation_id =
+        astral_db::grant_ledger::validated_request_operation_id(request_operation_id)?
+            .ok_or_else(|| AstralError::Auth("REVOCATION_REQUEST_ID_REQUIRED".into()))?;
+    let operation_id = stable_revocation_operation_id(
+        "user",
+        &format!("{user_id}:{}", request_operation_id),
         reason,
-        sessions = session_ids.len(),
-        "all user sessions revoked"
     );
-    Ok(())
+    revoke_transaction(
+        state,
+        RevocationTarget::User { user_id },
+        operation_id,
+        reason,
+    )
+    .await
 }
 
 /// Create a family with the same UTC DATETIME expiry used by its sessions.
@@ -799,19 +1476,6 @@ pub async fn create_token_family_with_expiry(
     expires_at: PrimitiveDateTime,
 ) -> Result<i64, AstralError> {
     session_repo::create_token_family_with_expiry(db, family_key, user_id, expires_at).await
-}
-
-/// 撤销单个会话
-///
-/// Canonical platform_v4: WHERE session_id = ?（非 legacy id）
-/// 单语句 autocommit 撤销带 source 栅栏（hub 已装则 fail-closed；await 窗口
-/// 武装取消栅栏，CAS 未命中 0 行未发生 mutation，同样 proven 释放）。
-async fn db_revoke_session(db: &sqlx::MySqlPool, id: i64, reason: &str) -> Result<(), AstralError> {
-    let source_guard = source_writer_guard::begin_source_write()?;
-    source_writer_guard::fenced_source_write(source_guard, async {
-        session_repo::revoke_session(db, id, reason).await
-    })
-    .await
 }
 
 /// Store the durable access proof for a newly issued credential.
@@ -979,60 +1643,118 @@ pub(crate) async fn project_password_revocation(
     Ok(())
 }
 
-async fn delete_session_projections(state: &AppState, session_id: i64) -> Result<(), AstralError> {
-    let indexed_jtis = astral_db::load_active_jtis_by_session(&state.db, session_id).await?;
-    delete_indexed_session_projections(
-        &indexed_jtis
-            .iter()
-            .map(|jti| (jti.clone(),))
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-    astral_db::close_jti_proofs_by_session(&state.db, session_id).await?;
-    Ok(())
-}
-
-async fn delete_access_projections(state: &AppState, jti: &str) -> Result<(), AstralError> {
-    // Durable proof closure is authoritative; the local marker only accelerates deny.
-    mark_registry_revoked(jti, REVOKED_TTL_SECS);
-    astral_db::close_jti_proof(&state.db, jti).await?;
-    Ok(())
-}
-
-/// Mark an access JTI revoked in bounded local acceleration surfaces after its
-/// caller has established the durable close/outbox source mutation.
-async fn mark_jti_revoked_at(jti: &str, ttl_seconds: i64) -> Result<(), AstralError> {
-    if jti.trim().is_empty() {
-        return Err(AstralError::Auth("TOKEN_ID_REQUIRED".into()));
-    }
-    let ttl = ttl_seconds.max(60) as u64;
-    mark_registry_revoked(jti, ttl);
-    Ok(())
-}
-
 const REVOKED_TTL_SECS: u64 = 7 * 24 * 3600;
 
-/// Durable operation status emitted before the session/JTI grant mirror step.
-/// Existing rows may still carry the pre-V6 status; those rows are recoverable
-/// only after `reproject_switch_response` proves the current MySQL session and JTI.
-const LEGACY_SWITCH_OPERATION_STATUS_COMMITTED_PENDING_REDIS: &str = "COMMITTED_PENDING_REDIS";
-const SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION: &str = "COMMITTED_PENDING_PROJECTION";
-const SWITCH_OPERATION_STATUS_NAMES: [&str; 2] = [
-    LEGACY_SWITCH_OPERATION_STATUS_COMMITTED_PENDING_REDIS,
+/// Durable operation states for the CURRENT V6 switch-card state machine.
+/// Only the two in-flight states below are eligible for recovery. `UNKNOWN`
+/// and every historical state are reconciliation-only and are never replayed.
+pub(crate) const SWITCH_OPERATION_STATUS_CAS_PENDING: &str = "CAS_PENDING";
+pub(crate) const SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION: &str =
+    "COMMITTED_PENDING_PROJECTION";
+const SWITCH_OPERATION_STATUS_COMPLETED: &str = "COMPLETED";
+const SWITCH_OPERATION_STATUS_FAILED: &str = "FAILED";
+const SWITCH_OPERATION_STATUS_UNKNOWN: &str = "UNKNOWN";
+const SWITCH_OPERATION_STATUS_NAMES: [&str; 5] = [
+    SWITCH_OPERATION_STATUS_CAS_PENDING,
     SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION,
+    SWITCH_OPERATION_STATUS_COMPLETED,
+    SWITCH_OPERATION_STATUS_FAILED,
+    SWITCH_OPERATION_STATUS_UNKNOWN,
 ];
+pub(crate) const SWITCH_OPERATION_RECOVERY_ATTEMPT_LIMIT: i32 = 5;
+const SWITCH_OPERATION_RECOVERY_LEASE_SECONDS: i64 = 30;
+
 fn is_recoverable_switch_operation_status(status: &str) -> bool {
-    SWITCH_OPERATION_STATUS_NAMES.contains(&status)
+    matches!(
+        status,
+        SWITCH_OPERATION_STATUS_CAS_PENDING | SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION
+    )
+}
+
+struct SwitchCardPrepared {
+    response: LoginResponse,
+    access_token: TokenResult,
+    user_id: i64,
+    session_id: i64,
+    family_id: i64,
+    source_card_id: i64,
+    target_card_id: i64,
+    identity_card_id: i64,
+    previous_session_version: i64,
+    previous_session_epoch: i64,
+    expected_session_version: i64,
+    expected_session_epoch: i64,
+    old_refresh_hash: String,
+    new_refresh_hash: String,
+    new_refresh_expires_at: PrimitiveDateTime,
+    effective_device_id: String,
+    ip_address: Option<String>,
+    user_agent: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
 struct SwitchOperationRow {
     operation_id: String,
+    user_id: i64,
     request_hash: String,
     refresh_token_hash: String,
+    source_card_id: Option<i64>,
+    target_card_id: Option<i64>,
+    session_id: Option<i64>,
+    selected_identity_card_id: Option<i64>,
+    previous_session_version: Option<i64>,
+    previous_session_epoch: Option<i64>,
+    expected_session_version: Option<i64>,
+    expected_session_epoch: Option<i64>,
+    device_id: Option<String>,
+    new_refresh_token_hash: Option<String>,
+    new_refresh_expires_at: Option<PrimitiveDateTime>,
     status: String,
     response_ciphertext: Option<String>,
     response_expires_at: Option<PrimitiveDateTime>,
+    recovery_expires_at: Option<PrimitiveDateTime>,
+    recovery_attempts: i32,
+    recovery_claim_owner: Option<String>,
+    recovery_claim_expires_at: Option<PrimitiveDateTime>,
+    last_error: Option<String>,
+}
+
+struct SwitchOperationInsert<'a> {
+    operation_id: &'a str,
+    user_id: i64,
+    idempotency_key: &'a str,
+    request_hash: &'a str,
+    refresh_hash: &'a str,
+    prepared: &'a SwitchCardPrepared,
+    response_ciphertext: &'a str,
+    response_expires_at: PrimitiveDateTime,
+    recovery_expires_at: PrimitiveDateTime,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SwitchDurableSessionRow {
+    session_id: i64,
+    user_id: i64,
+    family_id: i64,
+    current_user_card_id: Option<i64>,
+    session_state: String,
+    session_version: i64,
+    session_epoch: i64,
+    refresh_token_hash: String,
+    status: String,
+}
+
+struct SwitchResponseProof {
+    access_token: TokenResult,
+    user_id: i64,
+    session_id: i64,
+    family_id: i64,
+    identity_card_id: i64,
+    target_card_id: i64,
+    tenant_id: i64,
+    domain_id: i64,
+    session_version: i64,
+    session_epoch: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1070,7 +1792,8 @@ struct SwitchUserRow {
 /// Rotate the authenticated durable session onto a user-owned active card.
 ///
 /// The refresh JWT is the only credential. Its session context is checked against
-/// the durable row before the idempotent operation is created.
+/// the durable row before the idempotent operation is created. Recovery is keyed
+/// only by `(user_id, operation_type, idempotency_key_hash)` after that lookup.
 pub(crate) async fn switch_card_session(
     state: &AppState,
     headers: &HeaderMap,
@@ -1089,6 +1812,11 @@ pub(crate) async fn switch_card_session(
             "REFRESH_TOKEN_REQUIRED".into(),
         )));
     }
+    if !is_platform_user(&claims.principal_kind) {
+        return Err(AppError::from(AstralError::Auth(
+            "SWITCH_CARD_PLATFORM_USER_REQUIRED".into(),
+        )));
+    }
     let session_id = claims
         .sid
         .ok_or_else(|| AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into())))?;
@@ -1100,12 +1828,40 @@ pub(crate) async fn switch_card_session(
         .parse::<i64>()
         .map_err(|_| AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into())))?;
     let refresh_hash = sha256_hash(refresh_token);
-    if !is_platform_user(&claims.principal_kind) {
-        return Err(AppError::from(AstralError::Auth(
-            "SWITCH_CARD_PLATFORM_USER_REQUIRED".into(),
+    let idempotency_key = required_idempotency_key(headers)?;
+    if target_card_id <= 0 {
+        return Err(AppError::from(AstralError::Validation(
+            "targetUserCardId required".into(),
         )));
     }
-    let session = session_repo::load_active_refresh_session(&state.db, &refresh_hash)
+
+    let normalized_device_id = device_id.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(operation) = load_switch_operation(state, user_id, idempotency_key).await? {
+        validate_switch_recovery_context(state, &operation, session_id, family_id, target_card_id)
+            .await?;
+        if operation.status != SWITCH_OPERATION_STATUS_COMPLETED {
+            let expected_request_hash = switch_request_hash(
+                user_id,
+                operation.source_card_id.ok_or_else(|| {
+                    AppError::from(AstralError::Auth(
+                        "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+                    ))
+                })?,
+                target_card_id,
+                &claims.jti,
+                &refresh_hash,
+                normalized_device_id,
+            );
+            if operation.request_hash != expected_request_hash {
+                return Err(AppError::from(AstralError::Validation(
+                    "IDEMPOTENCY_KEY_REUSED".into(),
+                )));
+            }
+        }
+        return replay_or_recover_switch_operation(state, operation, &refresh_hash).await;
+    }
+
+    let session = match session_repo::load_active_refresh_session(&state.db, &refresh_hash)
         .await?
         .filter(|row| {
             row.session_id == session_id
@@ -1115,17 +1871,41 @@ pub(crate) async fn switch_card_session(
                 && row.credential_version.is_some_and(|version| version > 0)
                 && row.session_version == claims.session_version.unwrap_or_default()
                 && row.session_epoch == claims.sev.unwrap_or_default()
-        })
-        .ok_or_else(|| AstralError::Auth("Invalid refresh session".into()))?;
+        }) {
+        Some(session) => session,
+        None => {
+            // A validly signed refresh token that still names this active session
+            // but no longer matches its durable hash is a reuse signal, including
+            // requests that changed the idempotency key after a completed switch.
+            if let Some(current) =
+                session_repo::load_active_session_context(&state.db, session_id, user_id, family_id)
+                    .await?
+            {
+                if current.refresh_token_hash != refresh_hash {
+                    if let Err(error) =
+                        revoke_token_family(state, current.family_id, "TOKEN_REUSE_DETECTED").await
+                    {
+                        return Err(AppError::from(AstralError::Auth(format!(
+                            "TOKEN_REUSE_DETECTED; failed to revoke token family: {error}"
+                        ))));
+                    }
+                    return Err(AppError::from(AstralError::Auth(
+                        "Token reuse detected. All sessions have been revoked.".into(),
+                    )));
+                }
+            }
+            return Err(AppError::from(AstralError::Auth(
+                "Invalid refresh session".into(),
+            )));
+        }
+    };
     if target_card_id <= 0 {
         return Err(AppError::from(AstralError::Validation(
             "targetUserCardId required".into(),
         )));
     }
-    // Refuse before the durable CAS when credentials cannot be encrypted for retry.
     let _ = session_response_key()?;
 
-    let normalized_device_id = device_id.map(str::trim).filter(|value| !value.is_empty());
     let from_card_id = session
         .current_user_card_id
         .ok_or_else(|| AppError::from(AstralError::Auth("CARD_SELECTION_REQUIRED".into())))?;
@@ -1137,24 +1917,7 @@ pub(crate) async fn switch_card_session(
         &refresh_hash,
         normalized_device_id,
     );
-    let operation = begin_switch_operation(
-        state,
-        user_id,
-        required_idempotency_key(headers)?,
-        &request_hash,
-        &refresh_hash,
-        target_card_id,
-    )
-    .await?;
-
-    if let Some(existing) = operation {
-        return replay_or_recover_switch_operation(state, existing, &request_hash, &refresh_hash)
-            .await;
-    }
-
-    let operation_id =
-        operation_id_for_request(state, user_id, required_idempotency_key(headers)?).await?;
-    let result = switch_card_once(
+    let prepared = prepare_switch_card(
         state,
         headers,
         user_id,
@@ -1163,127 +1926,56 @@ pub(crate) async fn switch_card_session(
         refresh_token,
         normalized_device_id,
     )
-    .await;
-    match result {
-        Ok((response, token, session, card_id)) => {
-            let ciphertext = match encrypt_operation_response(&operation_id, &response) {
-                Ok(value) => value,
-                Err(error) => {
-                    revoke_token_family(
-                        state,
-                        session.family_id,
-                        "SESSION_OPERATION_RESPONSE_UNAVAILABLE",
-                    )
-                    .await
-                    .map_err(AppError::from)?;
-                    return Err(error);
-                }
-            };
-            let response_expires_at = response_expiry()?;
-            let persisted = sqlx::query(
-                "UPDATE auth_session_operation SET session_id = ?, status = ?, \
-                 response_ciphertext = ?, response_expires_at = ?, updated_at = UTC_TIMESTAMP() \
-                 WHERE operation_id = ? AND status = 'PENDING'",
-            )
-            .bind(session.session_id)
-            .bind(SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION)
-            .bind(ciphertext)
-            .bind(response_expires_at)
-            .bind(&operation_id)
-            .execute(&state.db)
-            .await
-            .map_err(|error| {
-                AstralError::Database(format!("Persist switch operation failed: {error}"))
-            })?;
-            if persisted.rows_affected() != 1 {
-                revoke_token_family(
-                    state,
-                    session.family_id,
-                    "SESSION_OPERATION_PERSISTENCE_FAILED",
-                )
-                .await
-                .map_err(AppError::from)?;
-                return Err(AppError::from(AstralError::Auth(
-                    "Session operation could not be persisted".into(),
+    .await?;
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let ciphertext = encrypt_operation_response(&operation_id, &prepared.response)?;
+    let response_expires_at = response_expiry()?;
+    let recovery_expires_at = recovery_expiry()?;
+
+    // The encrypted response and every CAS input are durable before the source
+    // mutation. This is the only path that creates a new switch operation.
+    let operation = begin_switch_operation(
+        state,
+        SwitchOperationInsert {
+            operation_id: &operation_id,
+            user_id,
+            idempotency_key,
+            request_hash: &request_hash,
+            refresh_hash: &refresh_hash,
+            prepared: &prepared,
+            response_ciphertext: &ciphertext,
+            response_expires_at,
+            recovery_expires_at,
+        },
+    )
+    .await?;
+    let operation = match operation {
+        Some(existing) => {
+            if existing.request_hash != request_hash {
+                return Err(AppError::from(AstralError::Validation(
+                    "IDEMPOTENCY_KEY_REUSED".into(),
                 )));
             }
-
-            if let Err(error) = record_platform_session_jti_proof(
+            validate_switch_recovery_context(
                 state,
-                &token,
-                user_id,
-                session.session_id,
-                session.session_epoch,
-                claims
-                    .identity_card_id
-                    .ok_or_else(|| AstralError::Auth("IDENTITY_CARD_CONTEXT_REQUIRED".into()))?,
+                &existing,
+                session_id,
+                family_id,
+                target_card_id,
             )
-            .await
-            {
-                revoke_token_family(state, session.family_id, "ACCESS_TRACKING_UNAVAILABLE")
-                    .await
-                    .map_err(AppError::from)?;
-                return Err(AppError::from(error));
-            }
-
-            if let Err(error) = restore_session_grant_projection(state, &token, {
-                let (claims, _) = decode_v2_token(&token.token, &state.config).map_err(|_| {
-                    AppError::from(AstralError::Auth(
-                        "SESSION_OPERATION_RESPONSE_UNAVAILABLE".into(),
-                    ))
-                })?;
-                SessionGrant::active(
-                    &token,
-                    user_id,
-                    session.session_id,
-                    claims.identity_card_id,
-                    Some(card_id),
-                    claims.user_card_tenant_id,
-                    claims.user_card_domain_id,
-                    session.session_version,
-                    session.session_epoch,
-                    session.family_id,
-                )
-            })
-            .await
-            {
-                tracing::error!(operation_id = %operation_id, error = %error, "card switch projection pending");
-                return Err(AppError::from(error));
-            }
-
-            let completed = sqlx::query(
-                "UPDATE auth_session_operation SET status = 'COMPLETED', completed_at = UTC_TIMESTAMP(), \
-                 updated_at = UTC_TIMESTAMP() WHERE operation_id = ? AND status = ?",
-            )
-            .bind(&operation_id)
-            .bind(SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION)
-            .execute(&state.db)
-            .await
-            .map_err(|error| AstralError::Database(format!("Complete switch operation failed: {error}")))?;
-            if completed.rows_affected() != 1 {
-                revoke_token_family(
-                    state,
-                    session.family_id,
-                    "SESSION_OPERATION_COMPLETION_FAILED",
-                )
-                .await
-                .map_err(AppError::from)?;
-                return Err(AppError::from(AstralError::Auth(
-                    "Session operation completion could not be confirmed".into(),
-                )));
-            }
-            Ok(response)
+            .await?;
+            return replay_or_recover_switch_operation(state, existing, &refresh_hash).await;
         }
-        Err(error) => {
-            let _ = sqlx::query(
-                "DELETE FROM auth_session_operation WHERE operation_id = ? AND status = 'PENDING'",
-            )
-            .bind(&operation_id)
-            .execute(&state.db)
-            .await;
-            Err(error)
-        }
-    }
+        None => load_switch_operation_by_id(state, &operation_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::from(AstralError::Auth(
+                    "SESSION_OPERATION_PENDING_RECONCILIATION".into(),
+                ))
+            })?,
+    };
+
+    replay_or_recover_switch_operation(state, operation, &refresh_hash).await
 }
 
 fn required_idempotency_key(headers: &HeaderMap) -> Result<&str, AppError> {
@@ -1298,118 +1990,283 @@ fn required_idempotency_key(headers: &HeaderMap) -> Result<&str, AppError> {
     Ok(key)
 }
 
-async fn begin_switch_operation(
+const SWITCH_OPERATION_SELECT: &str =
+    "SELECT operation_id, user_id, request_hash, refresh_token_hash, source_card_id, target_card_id, session_id, \
+     selected_identity_card_id, previous_session_version, previous_session_epoch, \
+     expected_session_version, expected_session_epoch, device_id, new_refresh_token_hash, new_refresh_expires_at, \
+     status, response_ciphertext, response_expires_at, recovery_expires_at, recovery_attempts, recovery_claim_owner, recovery_claim_expires_at, last_error \
+     FROM auth_session_operation";
+
+async fn validate_switch_recovery_context(
+    state: &AppState,
+    operation: &SwitchOperationRow,
+    session_id: i64,
+    family_id: i64,
+    target_card_id: i64,
+) -> Result<(), AppError> {
+    if operation.session_id != Some(session_id) || operation.target_card_id != Some(target_card_id)
+    {
+        return Err(AppError::from(AstralError::Validation(
+            "IDEMPOTENCY_KEY_REUSED".into(),
+        )));
+    }
+    let operation_family_id = load_switch_operation_family_id(operation, state).await?;
+    if operation_family_id != family_id {
+        return Err(AppError::from(AstralError::Validation(
+            "IDEMPOTENCY_KEY_REUSED".into(),
+        )));
+    }
+    Ok(())
+}
+
+async fn load_switch_operation(
     state: &AppState,
     user_id: i64,
     idempotency_key: &str,
-    request_hash: &str,
-    refresh_hash: &str,
-    target_card_id: i64,
 ) -> Result<Option<SwitchOperationRow>, AppError> {
-    let idempotency_hash = sha256_hash(idempotency_key);
-    let operation_id = uuid::Uuid::new_v4().to_string();
+    let query = format!(
+        "{SWITCH_OPERATION_SELECT} WHERE user_id = ? AND operation_type = 'SWITCH_CARD' \
+         AND idempotency_key_hash = ? LIMIT 1"
+    );
+    sqlx::query_as::<_, SwitchOperationRow>(&query)
+        .bind(user_id)
+        .bind(sha256_hash(idempotency_key))
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|error| AstralError::Database(format!("Load switch operation failed: {error}")))
+        .map_err(AppError::from)
+}
+
+async fn load_switch_operation_by_id(
+    state: &AppState,
+    operation_id: &str,
+) -> Result<Option<SwitchOperationRow>, AppError> {
+    let query = format!("{SWITCH_OPERATION_SELECT} WHERE operation_id = ? LIMIT 1");
+    sqlx::query_as::<_, SwitchOperationRow>(&query)
+        .bind(operation_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|error| AstralError::Database(format!("Load switch operation failed: {error}")))
+        .map_err(AppError::from)
+}
+
+async fn begin_switch_operation(
+    state: &AppState,
+    input: SwitchOperationInsert<'_>,
+) -> Result<Option<SwitchOperationRow>, AppError> {
     let insert = sqlx::query(
         "INSERT INTO auth_session_operation \
-         (operation_id, user_id, operation_type, idempotency_key_hash, request_hash, refresh_token_hash, target_card_id, status) \
-         VALUES (?, ?, 'SWITCH_CARD', ?, ?, ?, ?, 'PENDING')",
+         (operation_id, user_id, operation_type, idempotency_key_hash, request_hash, refresh_token_hash, \
+          session_id, source_card_id, target_card_id, selected_identity_card_id, previous_session_version, \
+          previous_session_epoch, expected_session_version, expected_session_epoch, device_id, new_refresh_token_hash, \
+          new_refresh_expires_at, status, response_ciphertext, response_expires_at, recovery_expires_at) \
+         VALUES (?, ?, 'SWITCH_CARD', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CAS_PENDING', ?, ?, ?)"
     )
-    .bind(&operation_id)
-    .bind(user_id)
-    .bind(&idempotency_hash)
-    .bind(request_hash)
-    .bind(refresh_hash)
-    .bind(target_card_id)
+    .bind(input.operation_id)
+    .bind(input.user_id)
+    .bind(sha256_hash(input.idempotency_key))
+    .bind(input.request_hash)
+    .bind(input.refresh_hash)
+    .bind(input.prepared.session_id)
+    .bind(input.prepared.source_card_id)
+    .bind(input.prepared.target_card_id)
+    .bind(input.prepared.identity_card_id)
+    .bind(input.prepared.previous_session_version)
+    .bind(input.prepared.previous_session_epoch)
+    .bind(input.prepared.expected_session_version)
+    .bind(input.prepared.expected_session_epoch)
+    .bind(&input.prepared.effective_device_id)
+    .bind(&input.prepared.new_refresh_hash)
+    .bind(input.prepared.new_refresh_expires_at)
+    .bind(input.response_ciphertext)
+    .bind(input.response_expires_at)
+    .bind(input.recovery_expires_at)
     .execute(&state.db)
     .await;
+
     match insert {
         Ok(result) if result.rows_affected() == 1 => Ok(None),
         Ok(_) => Err(AppError::from(AstralError::Database(
             "Switch operation insert affected an unexpected row count".into(),
         ))),
-        Err(insert_error) => sqlx::query_as::<_, SwitchOperationRow>(
-            "SELECT operation_id, request_hash, refresh_token_hash, status, response_ciphertext, response_expires_at \
-             FROM auth_session_operation WHERE user_id = ? AND operation_type = 'SWITCH_CARD' \
-             AND idempotency_key_hash = ? LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(idempotency_hash)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|error| AstralError::Database(format!("Load switch operation failed: {error}")))?
-        .map(Some)
-        .ok_or_else(|| {
-            AppError::from(AstralError::Database(format!(
-                "Create switch operation failed: {insert_error}"
-            )))
-        }),
+        Err(insert_error) => load_switch_operation(state, input.user_id, input.idempotency_key)
+            .await?
+            .map(Some)
+            .ok_or_else(|| {
+                AppError::from(AstralError::Database(format!(
+                    "Create switch operation failed: {insert_error}"
+                )))
+            }),
     }
 }
 
-async fn operation_id_for_request(
-    state: &AppState,
-    user_id: i64,
-    idempotency_key: &str,
-) -> Result<String, AppError> {
-    sqlx::query_scalar(
-        "SELECT operation_id FROM auth_session_operation WHERE user_id = ? AND operation_type = 'SWITCH_CARD' \
-         AND idempotency_key_hash = ? LIMIT 1",
-    )
-    .bind(user_id)
-    .bind(sha256_hash(idempotency_key))
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|error| AstralError::Database(format!("Load switch operation id failed: {error}")))?
-    .ok_or_else(|| AppError::from(AstralError::Auth("Session operation unavailable".into())))
+fn switch_recovery_claimant(operation_id: &str) -> String {
+    let attempt = format!("{operation_id}:{}", uuid::Uuid::new_v4());
+    let digest = sha256_hash(&attempt);
+    format!("switch-recovery-{}", &digest[..48.min(digest.len())])
 }
 
-async fn replay_or_recover_switch_operation(
+async fn claim_switch_operation(
     state: &AppState,
-    operation: SwitchOperationRow,
-    request_hash: &str,
-    refresh_hash: &str,
-) -> Result<LoginResponse, AppError> {
-    if operation.request_hash != request_hash || operation.refresh_token_hash != refresh_hash {
-        return Err(AppError::from(AstralError::Validation(
-            "IDEMPOTENCY_KEY_REUSED".into(),
-        )));
-    }
-    let response = decrypt_switch_operation_response(&operation)?;
-    if operation.status == "COMPLETED" {
-        return Ok(response);
-    }
-    if !is_recoverable_switch_operation_status(&operation.status) {
-        return Err(AppError::from(AstralError::Auth(
-            "SESSION_OPERATION_IN_PROGRESS".into(),
-        )));
-    }
-
-    reproject_switch_response(state, &response).await?;
-    // Accept only the two known durable in-flight labels. The legacy label is
-    // retained for rows created before V6; the recovered response is still
-    // revalidated against durable session and JTI proof before completion.
-    let updated = sqlx::query(
-        "UPDATE auth_session_operation SET status = 'COMPLETED', completed_at = UTC_TIMESTAMP(), \
-         updated_at = UTC_TIMESTAMP() WHERE operation_id = ? AND status IN (?, ?)",
+    operation_id: &str,
+    claimant: &str,
+) -> Result<bool, AppError> {
+    let result = sqlx::query(
+        "UPDATE auth_session_operation SET recovery_claim_owner = ?, \
+         recovery_claim_expires_at = DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? SECOND), \
+         recovery_attempts = recovery_attempts + CASE WHEN recovery_attempts < ? THEN 1 ELSE 0 END, \
+         updated_at = UTC_TIMESTAMP() \
+         WHERE operation_id = ? AND status IN (?, ?) AND recovery_attempts <= ? \
+           AND recovery_expires_at IS NOT NULL \
+           AND (recovery_claim_expires_at IS NULL OR recovery_claim_expires_at <= UTC_TIMESTAMP())",
     )
-    .bind(&operation.operation_id)
-    .bind(LEGACY_SWITCH_OPERATION_STATUS_COMMITTED_PENDING_REDIS)
+    .bind(claimant)
+    .bind(SWITCH_OPERATION_RECOVERY_LEASE_SECONDS)
+    .bind(SWITCH_OPERATION_RECOVERY_ATTEMPT_LIMIT)
+    .bind(operation_id)
+    .bind(SWITCH_OPERATION_STATUS_CAS_PENDING)
     .bind(SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION)
+    .bind(SWITCH_OPERATION_RECOVERY_ATTEMPT_LIMIT)
+    .execute(&state.db)
+    .await
+    .map_err(|error| AstralError::Database(format!("Claim switch operation failed: {error}")))?;
+    Ok(result.rows_affected() == 1)
+}
+
+async fn claim_switch_operation_for_recovery(
+    state: &AppState,
+    operation_id: &str,
+) -> Result<Option<(SwitchOperationRow, String)>, AppError> {
+    let claimant = switch_recovery_claimant(operation_id);
+    if !claim_switch_operation(state, operation_id, &claimant).await? {
+        return Ok(None);
+    }
+    let operation = load_switch_operation_by_id(state, operation_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::from(AstralError::Auth(
+                "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+            ))
+        })?;
+    if operation.recovery_claim_owner.as_deref() != Some(claimant.as_str()) {
+        return Err(AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        )));
+    }
+    Ok(Some((operation, claimant)))
+}
+
+async fn release_switch_operation_claim(
+    state: &AppState,
+    operation_id: &str,
+    claimant: &str,
+) -> Result<(), AppError> {
+    let result = sqlx::query(
+        "UPDATE auth_session_operation SET recovery_claim_owner = NULL, \
+         recovery_claim_expires_at = NULL, updated_at = UTC_TIMESTAMP() \
+         WHERE operation_id = ? AND recovery_claim_owner = ? \
+           AND recovery_claim_expires_at > UTC_TIMESTAMP()",
+    )
+    .bind(operation_id)
+    .bind(claimant)
     .execute(&state.db)
     .await
     .map_err(|error| {
-        AstralError::Database(format!(
-            "Complete recovered switch operation failed: {error}"
-        ))
+        AstralError::Database(format!("Release switch operation claim failed: {error}"))
     })?;
-    if updated.rows_affected() != 1 {
-        return Err(AppError::from(AstralError::Auth(
-            "Session operation completion could not be confirmed".into(),
-        )));
+    if result.rows_affected() == 1 {
+        return Ok(());
     }
-    Ok(response)
+    Err(AppError::from(AstralError::Auth(
+        "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+    )))
 }
 
-async fn switch_card_once(
+async fn mark_switch_operation_failed(
+    state: &AppState,
+    operation: &SwitchOperationRow,
+    claimant: &str,
+    reason: &str,
+) -> Result<(), AppError> {
+    let result = sqlx::query(
+        "UPDATE auth_session_operation AS operation SET status = ?, last_error = ?, \
+         recovery_claim_owner = NULL, recovery_claim_expires_at = NULL, updated_at = UTC_TIMESTAMP() \
+         WHERE operation_id = ? AND status IN (?, ?) AND recovery_claim_owner = ? \
+           AND recovery_claim_expires_at > UTC_TIMESTAMP() \
+           AND EXISTS (SELECT 1 FROM auth_device_session AS session \
+             WHERE session.session_id = operation.session_id \
+               AND session.user_id = operation.user_id \
+               AND session.current_user_card_id = operation.source_card_id \
+               AND session.refresh_token_hash = operation.refresh_token_hash \
+               AND session.status = 'ACTIVE' AND session.session_state = 'ACTIVE' \
+               AND session.session_version = operation.previous_session_version \
+               AND session.session_epoch = operation.previous_session_epoch)",
+    )
+    .bind(SWITCH_OPERATION_STATUS_FAILED)
+    .bind(reason.chars().take(255).collect::<String>())
+    .bind(&operation.operation_id)
+    .bind(SWITCH_OPERATION_STATUS_CAS_PENDING)
+    .bind(SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION)
+    .bind(claimant)
+    .execute(&state.db)
+    .await
+    .map_err(|error| AstralError::Database(format!("Mark switch operation failed: {error}")))?;
+    if result.rows_affected() == 1 {
+        Ok(())
+    } else {
+        let current = load_switch_operation_by_id(state, &operation.operation_id).await?;
+        if current
+            .as_ref()
+            .is_some_and(|row| row.status == SWITCH_OPERATION_STATUS_FAILED)
+        {
+            Ok(())
+        } else {
+            Err(AppError::from(AstralError::Auth(
+                "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+            )))
+        }
+    }
+}
+
+async fn mark_switch_operation_unknown(
+    state: &AppState,
+    operation_id: &str,
+    reason: &str,
+    claimant: &str,
+) -> Result<(), AppError> {
+    let result = sqlx::query(
+        "UPDATE auth_session_operation SET status = ?, last_error = ?, \
+         recovery_claim_owner = NULL, recovery_claim_expires_at = NULL, updated_at = UTC_TIMESTAMP() \
+         WHERE operation_id = ? AND status IN (?, ?) AND recovery_claim_owner = ? \
+           AND recovery_claim_expires_at > UTC_TIMESTAMP()",
+    )
+    .bind(SWITCH_OPERATION_STATUS_UNKNOWN)
+    .bind(reason.chars().take(255).collect::<String>())
+    .bind(operation_id)
+    .bind(SWITCH_OPERATION_STATUS_CAS_PENDING)
+    .bind(SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION)
+    .bind(claimant)
+    .execute(&state.db)
+    .await
+    .map_err(|error| AstralError::Database(format!("Mark switch operation unknown: {error}")))?;
+    if result.rows_affected() == 1 {
+        Ok(())
+    } else {
+        let current = load_switch_operation_by_id(state, operation_id).await?;
+        if current
+            .as_ref()
+            .is_some_and(|row| row.status == SWITCH_OPERATION_STATUS_UNKNOWN)
+        {
+            Ok(())
+        } else {
+            Err(AppError::from(AstralError::Auth(
+                "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+            )))
+        }
+    }
+}
+
+async fn prepare_switch_card(
     state: &AppState,
     headers: &HeaderMap,
     user_id: i64,
@@ -1417,7 +2274,7 @@ async fn switch_card_once(
     target_card_id: i64,
     refresh_token: &str,
     requested_device_id: Option<&str>,
-) -> Result<(LoginResponse, TokenResult, DeviceSessionRow, i64), AppError> {
+) -> Result<SwitchCardPrepared, AppError> {
     let refresh_hash = sha256_hash(refresh_token);
     let session = load_active_refresh_session(&state.db, &refresh_hash).await?;
     if session.user_id != user_id || session.current_user_card_id != Some(from_card_id) {
@@ -1580,55 +2437,354 @@ async fn switch_card_once(
         })),
     };
 
-    delete_session_projections_before_epoch(state, session.session_id, next_session_epoch).await?;
-    let effective_device_id = requested_device_id.unwrap_or(&session.device_id);
-    // 卡切换轮换的 autocommit source 栅栏：hub 已装则 fail-closed 取得，await
-    // 窗口前武装取消栅栏，结果判定后 proven 释放（CAS 未命中未发生 mutation）。
+    // Preparation has no durable side effects. The old projection is closed only
+    // after the session CAS is proven, immediately before the new JTI proof.
+    let effective_device_id = requested_device_id
+        .unwrap_or(&session.device_id)
+        .to_string();
+    Ok(SwitchCardPrepared {
+        response,
+        access_token: token,
+        user_id,
+        session_id: session.session_id,
+        family_id: session.family_id,
+        source_card_id: from_card_id,
+        target_card_id,
+        identity_card_id: identity.0,
+        previous_session_version: session.session_version,
+        previous_session_epoch: session.session_epoch,
+        expected_session_version: next_session_version,
+        expected_session_epoch: next_session_epoch,
+        old_refresh_hash: sha256_hash(refresh_token),
+        new_refresh_hash: refresh_hash,
+        new_refresh_expires_at: refresh_expires_at,
+        effective_device_id,
+        ip_address: request_header_text(headers, "x-forwarded-for"),
+        user_agent: request_header_text(headers, "user-agent"),
+    })
+}
+
+async fn reconcile_capped_switch_operation(
+    state: &AppState,
+    operation: &SwitchOperationRow,
+    claimant: &str,
+) -> Result<(), AppError> {
+    let durable = load_switch_durable_session(state, operation).await?;
+    match durable {
+        Some(row) if switch_session_is_expected(&row, operation) => {
+            transition_switch_operation_to_projection(state, operation, claimant).await
+        }
+        Some(row) if switch_session_is_previous(&row, operation) => {
+            mark_switch_operation_failed(
+                state,
+                operation,
+                claimant,
+                "RECOVERY_ATTEMPT_LIMIT_REACHED",
+            )
+            .await?;
+            Err(AppError::from(AstralError::Auth(
+                "SESSION_OPERATION_FAILED".into(),
+            )))
+        }
+        Some(_) | None => {
+            mark_switch_operation_unknown(
+                state,
+                &operation.operation_id,
+                "RECOVERY_ATTEMPT_LIMIT_STATE_UNPROVABLE",
+                claimant,
+            )
+            .await?;
+            Err(AppError::from(AstralError::Auth(
+                "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+            )))
+        }
+    }
+}
+
+async fn apply_switch_cas(
+    state: &AppState,
+    operation: &SwitchOperationRow,
+    claimant: &str,
+) -> Result<(), AppError> {
+    if operation.status != SWITCH_OPERATION_STATUS_CAS_PENDING {
+        return Ok(());
+    }
+    if operation.recovery_attempts >= SWITCH_OPERATION_RECOVERY_ATTEMPT_LIMIT {
+        return reconcile_capped_switch_operation(state, operation, claimant).await;
+    }
+    let session_id = operation.session_id.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    let user_id = operation.user_id;
+    let family_id = load_switch_operation_family_id(operation, state).await?;
+    let source_card_id = operation.source_card_id.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    let target_card_id = operation.target_card_id.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    let previous_session_version = operation.previous_session_version.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    let previous_session_epoch = operation.previous_session_epoch.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    let expected_session_version = operation.expected_session_version.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    let expected_session_epoch = operation.expected_session_epoch.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    let new_refresh_hash = operation.new_refresh_token_hash.as_deref().ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    let old_refresh_hash = operation.refresh_token_hash.as_str();
+    let device_id = match operation.device_id.as_deref() {
+        Some(device_id) => Some(device_id.to_owned()),
+        None => load_switch_session_device_id(state, operation).await?,
+    };
     let rotation_guard = source_writer_guard::begin_source_write()?;
     let rotation = source_writer_guard::fenced_source_write(
         rotation_guard,
         sqlx::query(
-            "UPDATE auth_device_session SET device_id = ?, current_user_card_id = ?, session_state = 'ACTIVE', \
-             session_version = ?, session_epoch = ?, refresh_token_hash = ?, refresh_expires_at = ?, \
-             ip_address = COALESCE(?, ip_address), user_agent = COALESCE(?, user_agent), status = 'ACTIVE', \
-             revoked_at = NULL, revoked_reason = NULL, last_seen_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() \
-             WHERE session_id = ? AND user_id = ? AND family_id = ? AND refresh_token_hash = ? \
-             AND status = 'ACTIVE' AND session_state = 'ACTIVE' AND session_version = ? AND session_epoch = ?",
+            "UPDATE auth_device_session SET device_id = COALESCE(?, device_id), \
+             current_user_card_id = ?, session_state = 'ACTIVE', session_version = ?, session_epoch = ?, \
+             refresh_token_hash = ?, refresh_expires_at = ?, status = 'ACTIVE', revoked_at = NULL, \
+             revoked_reason = NULL, last_seen_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() \
+             WHERE session_id = ? AND user_id = ? AND family_id = ? AND current_user_card_id = ? \
+             AND refresh_token_hash = ? AND status = 'ACTIVE' AND session_state = 'ACTIVE' \
+             AND session_version = ? AND session_epoch = ? \
+             AND EXISTS (SELECT 1 FROM auth_session_operation operation \
+               WHERE operation.operation_id = ? AND operation.status = ? \
+                 AND operation.recovery_claim_owner = ? \
+                 AND operation.recovery_claim_expires_at > UTC_TIMESTAMP())",
         )
-        .bind(effective_device_id)
+        .bind(device_id.as_deref())
         .bind(target_card_id)
-        .bind(next_session_version)
-        .bind(next_session_epoch)
-        .bind(&refresh_hash)
-        .bind(refresh_expires_at)
-        .bind(request_header_text(headers, "x-forwarded-for"))
-        .bind(request_header_text(headers, "user-agent"))
-        .bind(session.session_id)
+        .bind(expected_session_version)
+        .bind(expected_session_epoch)
+        .bind(new_refresh_hash)
+        .bind(operation.new_refresh_expires_at)
+        .bind(session_id)
         .bind(user_id)
-        .bind(session.family_id)
-        .bind(sha256_hash(refresh_token))
-        .bind(session.session_version)
-        .bind(session.session_epoch)
+        .bind(family_id)
+        .bind(source_card_id)
+        .bind(old_refresh_hash)
+        .bind(previous_session_version)
+        .bind(previous_session_epoch)
+        .bind(&operation.operation_id)
+        .bind(SWITCH_OPERATION_STATUS_CAS_PENDING)
+        .bind(claimant)
         .execute(&state.db),
     )
-    .await
-    .map_err(|error| AstralError::Database(format!("Rotate switch session failed: {error}")))?;
-    if !rotation_succeeded(rotation.rows_affected()) {
-        return Err(AppError::from(AstralError::Auth(
-            "SESSION_VERSION_CONFLICT".into(),
-        )));
-    }
+    .await;
 
-    let rotated_session = DeviceSessionRow {
-        session_version: next_session_version,
-        session_epoch: next_session_epoch,
-        current_user_card_id: Some(target_card_id),
-        refresh_token_hash: refresh_hash,
-        refresh_expires_at: Some(refresh_expires_at),
-        device_id: effective_device_id.to_string(),
-        ..session
+    let rotation = match rotation {
+        Ok(value) => value,
+        Err(_error) => {
+            let durable = load_switch_durable_session(state, operation).await?;
+            match durable {
+                Some(row) if switch_session_is_expected(&row, operation) => {
+                    transition_switch_operation_to_projection(state, operation, claimant).await?;
+                    return Ok(());
+                }
+                Some(row) if switch_session_is_previous(&row, operation) => {
+                    mark_switch_operation_failed(state, operation, claimant, "CAS_NOT_APPLIED")
+                        .await?;
+                    return Err(AppError::from(AstralError::Auth(
+                        "SESSION_VERSION_CONFLICT".into(),
+                    )));
+                }
+                Some(_) | None => {
+                    mark_switch_operation_unknown(
+                        state,
+                        &operation.operation_id,
+                        "CAS_OUTCOME_UNPROVABLE",
+                        claimant,
+                    )
+                    .await?;
+                    return Err(AppError::from(AstralError::Auth(
+                        "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+                    )));
+                }
+            }
+        }
     };
-    Ok((response, token, rotated_session, target_card_id))
+    if rotation.rows_affected() != 1 {
+        let durable = load_switch_durable_session(state, operation).await?;
+        match durable {
+            Some(row) if switch_session_is_expected(&row, operation) => {
+                transition_switch_operation_to_projection(state, operation, claimant).await
+            }
+            Some(row) if switch_session_is_previous(&row, operation) => {
+                let _ = mark_switch_operation_failed(state, operation, claimant, "CAS_NOT_APPLIED")
+                    .await;
+                Err(AppError::from(AstralError::Auth(
+                    "SESSION_VERSION_CONFLICT".into(),
+                )))
+            }
+            _ => {
+                let _ = mark_switch_operation_unknown(
+                    state,
+                    &operation.operation_id,
+                    "CAS_STATE_UNPROVABLE",
+                    claimant,
+                )
+                .await;
+                Err(AppError::from(AstralError::Auth(
+                    "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+                )))
+            }
+        }
+    } else {
+        transition_switch_operation_to_projection(state, operation, claimant).await
+    }
+}
+
+async fn load_switch_session_device_id(
+    state: &AppState,
+    operation: &SwitchOperationRow,
+) -> Result<Option<String>, AppError> {
+    let session_id = operation.session_id.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    sqlx::query_scalar::<_, String>(
+        "SELECT device_id FROM auth_device_session WHERE session_id = ? AND user_id = ? LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(operation.user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|error| AstralError::Database(format!("Load switch device id failed: {error}")))
+    .map_err(AppError::from)
+}
+
+async fn load_switch_operation_family_id(
+    operation: &SwitchOperationRow,
+    state: &AppState,
+) -> Result<i64, AppError> {
+    let session_id = operation.session_id.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    sqlx::query_scalar::<_, i64>(
+        "SELECT family_id FROM auth_device_session WHERE session_id = ? LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|error| AstralError::Database(format!("Load switch session family failed: {error}")))?
+    .ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })
+}
+
+async fn transition_switch_operation_to_projection(
+    state: &AppState,
+    operation: &SwitchOperationRow,
+    claimant: &str,
+) -> Result<(), AppError> {
+    let result = sqlx::query(
+        "UPDATE auth_session_operation SET status = ?, updated_at = UTC_TIMESTAMP() \
+         WHERE operation_id = ? AND status = ? AND recovery_claim_owner = ? \
+           AND recovery_claim_expires_at > UTC_TIMESTAMP()",
+    )
+    .bind(SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION)
+    .bind(&operation.operation_id)
+    .bind(SWITCH_OPERATION_STATUS_CAS_PENDING)
+    .bind(claimant)
+    .execute(&state.db)
+    .await
+    .map_err(|error| {
+        AstralError::Database(format!("Record switch CAS completion failed: {error}"))
+    })?;
+    if result.rows_affected() == 1 {
+        Ok(())
+    } else {
+        let current = load_switch_operation_by_id(state, &operation.operation_id).await?;
+        if current.as_ref().is_some_and(|row| {
+            row.status == SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION
+                || row.status == SWITCH_OPERATION_STATUS_COMPLETED
+        }) {
+            Ok(())
+        } else {
+            let _ = mark_switch_operation_unknown(
+                state,
+                &operation.operation_id,
+                "CAS_STATUS_TRANSITION_UNKNOWN",
+                claimant,
+            )
+            .await;
+            Err(AppError::from(AstralError::Auth(
+                "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+            )))
+        }
+    }
+}
+
+async fn load_switch_durable_session(
+    state: &AppState,
+    operation: &SwitchOperationRow,
+) -> Result<Option<SwitchDurableSessionRow>, AppError> {
+    sqlx::query_as::<_, SwitchDurableSessionRow>(
+        "SELECT session_id, user_id, family_id, current_user_card_id, session_state, \
+         session_version, session_epoch, refresh_token_hash, status \
+         FROM auth_device_session WHERE session_id = ? AND user_id = ? LIMIT 1",
+    )
+    .bind(operation.session_id)
+    .bind(operation.user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|error| AstralError::Database(format!("Load switch durable session failed: {error}")))
+    .map_err(AppError::from)
+}
+
+fn switch_session_is_expected(
+    session: &SwitchDurableSessionRow,
+    operation: &SwitchOperationRow,
+) -> bool {
+    session.current_user_card_id == operation.target_card_id
+        && session.session_version == operation.expected_session_version.unwrap_or_default()
+        && session.session_epoch == operation.expected_session_epoch.unwrap_or_default()
+        && operation
+            .new_refresh_token_hash
+            .as_deref()
+            .is_some_and(|hash| hash == session.refresh_token_hash)
+        && session.status == "ACTIVE"
+        && session.session_state == "ACTIVE"
+}
+
+fn switch_session_is_previous(
+    session: &SwitchDurableSessionRow,
+    operation: &SwitchOperationRow,
+) -> bool {
+    session.current_user_card_id == operation.source_card_id
+        && session.session_version == operation.previous_session_version.unwrap_or_default()
+        && session.session_epoch == operation.previous_session_epoch.unwrap_or_default()
+        && session.refresh_token_hash == operation.refresh_token_hash
+        && session.status == "ACTIVE"
+        && session.session_state == "ACTIVE"
 }
 
 async fn load_active_refresh_session(
@@ -1769,6 +2925,14 @@ fn response_expiry() -> Result<PrimitiveDateTime, AppError> {
         .ok_or_else(|| AppError::from(AstralError::Auth("Session response expiry overflow".into())))
 }
 
+fn recovery_expiry() -> Result<PrimitiveDateTime, AppError> {
+    let response_seconds = session_response_ttl_seconds().clamp(1, 3600);
+    let recovery_seconds = session_recovery_ttl_seconds().clamp(response_seconds, 86_400);
+    utc_db_now()
+        .checked_add(Duration::seconds(recovery_seconds))
+        .ok_or_else(|| AppError::from(AstralError::Auth("Session recovery expiry overflow".into())))
+}
+
 fn session_response_aes_gcm_key() -> String {
     std::env::var("IDENTITY_SESSION_RESPONSE_AES_GCM_KEY")
         .unwrap_or_default()
@@ -1781,6 +2945,13 @@ fn session_response_ttl_seconds() -> i64 {
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(300)
+}
+
+fn session_recovery_ttl_seconds() -> i64 {
+    std::env::var("IDENTITY_SESSION_RECOVERY_TTL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(3600)
 }
 
 fn session_response_key() -> Result<[u8; 32], AppError> {
@@ -1843,15 +3014,17 @@ fn encrypt_operation_response(
 
 fn decrypt_switch_operation_response(
     operation: &SwitchOperationRow,
+    allow_expired_response: bool,
 ) -> Result<LoginResponse, AppError> {
     use aes_gcm::aead::{Aead, Payload};
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use base64::Engine;
 
-    if operation
-        .response_expires_at
-        .map(|expires_at| expires_at <= utc_db_now())
-        .unwrap_or(true)
+    if !allow_expired_response
+        && operation
+            .response_expires_at
+            .map(|expires_at| expires_at <= utc_db_now())
+            .unwrap_or(true)
     {
         return Err(AppError::from(AstralError::Auth(
             "IDEMPOTENCY_RESPONSE_EXPIRED".into(),
@@ -1914,133 +3087,518 @@ fn decrypt_switch_operation_response(
     })
 }
 
-async fn reproject_switch_response(
+async fn replay_or_recover_switch_operation(
     state: &AppState,
-    response: &LoginResponse,
-) -> Result<(), AppError> {
-    let session = response.session.as_ref().ok_or_else(|| {
-        AppError::from(AstralError::Auth(
-            "SESSION_OPERATION_RESPONSE_UNAVAILABLE".into(),
-        ))
-    })?;
-    let session_id = session
-        .get("sessionId")
-        .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| {
-            AppError::from(AstralError::Auth(
-                "SESSION_OPERATION_RESPONSE_UNAVAILABLE".into(),
-            ))
-        })?;
-    let family_id = session
-        .get("familyId")
-        .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| {
-            AppError::from(AstralError::Auth(
-                "SESSION_OPERATION_RESPONSE_UNAVAILABLE".into(),
-            ))
-        })?;
-    let session_version = session
-        .get("sessionVersion")
-        .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| {
-            AppError::from(AstralError::Auth(
-                "SESSION_OPERATION_RESPONSE_UNAVAILABLE".into(),
-            ))
-        })?;
-    let session_epoch = session
-        .get("sessionEpoch")
-        .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| {
-            AppError::from(AstralError::Auth(
-                "SESSION_OPERATION_RESPONSE_UNAVAILABLE".into(),
-            ))
-        })?;
-    let card_id = session
-        .get("currentUserCardId")
-        .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| {
-            AppError::from(AstralError::Auth(
-                "SESSION_OPERATION_RESPONSE_UNAVAILABLE".into(),
-            ))
-        })?;
-    let (claims, token_use) =
-        decode_v2_token(&response.access_token, &state.config).map_err(|_| {
-            AppError::from(AstralError::Auth(
-                "SESSION_OPERATION_RESPONSE_UNAVAILABLE".into(),
-            ))
-        })?;
-    if token_use != TokenUse::Access {
-        return Err(AppError::from(AstralError::Auth(
-            "SESSION_OPERATION_RESPONSE_UNAVAILABLE".into(),
-        )));
+    operation: SwitchOperationRow,
+    presented_refresh_hash: &str,
+) -> Result<LoginResponse, AppError> {
+    match operation.status.as_str() {
+        SWITCH_OPERATION_STATUS_COMPLETED => {
+            validate_completed_switch_replay(state, &operation, presented_refresh_hash).await?;
+            let response = decrypt_switch_operation_response(&operation, false)?;
+            verify_switch_completion(state, &operation, &response, None).await?;
+            Ok(response)
+        }
+        SWITCH_OPERATION_STATUS_FAILED => Err(AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_FAILED".into(),
+        ))),
+        SWITCH_OPERATION_STATUS_UNKNOWN => Err(AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))),
+        SWITCH_OPERATION_STATUS_CAS_PENDING
+        | SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION => {
+            recover_switch_operation(state, operation, false, Some(presented_refresh_hash)).await
+        }
+        _ => Err(AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))),
     }
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-    if claims.exp as i64 <= now
-        || claims.sub.parse::<i64>().ok().is_none()
-        || claims.user_card_id != Some(card_id)
-    {
-        return Err(AppError::from(AstralError::Auth(
-            "SESSION_OPERATION_RESPONSE_UNAVAILABLE".into(),
-        )));
-    }
-    let token = TokenResult {
-        token: response.access_token.clone(),
-        jti: claims.jti,
-        expires_in: claims.exp as i64 - now,
-        issued_at_epoch_second: claims.iat as i64,
-        expires_at_epoch_second: claims.exp as i64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CompletedSwitchReplayDecision {
+    Allow,
+    RevokeFamily { family_id: i64 },
+    ReconciliationRequired,
+}
+
+fn classify_completed_switch_replay(
+    operation: &SwitchOperationRow,
+    durable: Option<&SwitchDurableSessionRow>,
+    presented_refresh_hash: &str,
+) -> CompletedSwitchReplayDecision {
+    let Some(durable) = durable else {
+        return CompletedSwitchReplayDecision::ReconciliationRequired;
     };
-    let durable = sqlx::query_as::<_, (i64, i64, i64, i64, Option<i64>, String, String)>(
-        "SELECT session_id, user_id, family_id, session_epoch, current_user_card_id, status, session_state \
-         FROM auth_device_session WHERE session_id = ? AND user_id = ? AND family_id = ? \
-         AND session_version = ? AND session_epoch = ? LIMIT 1",
-    )
-    .bind(session_id)
-    .bind(claims.sub.parse::<i64>().map_err(|_| {
-        AstralError::Auth("SESSION_OPERATION_RESPONSE_UNAVAILABLE".into())
-    })?)
-    .bind(family_id)
-    .bind(session_version)
-    .bind(session_epoch)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|error| AstralError::Database(format!("Verify switch replay session failed: {error}")))?
-    .filter(|row| row.4 == Some(card_id) && row.5 == "ACTIVE" && row.6 == "ACTIVE")
-    .ok_or_else(|| AppError::from(AstralError::Auth("SESSION_OPERATION_RESPONSE_UNAVAILABLE".into())))?;
-    let indexed: Option<(i64,)> = sqlx::query_as(
-        "SELECT jti_id FROM auth_session_jti_index WHERE session_id = ? AND user_id = ? AND jti = ? \
-         AND session_epoch = ? AND status = 'ACTIVE' LIMIT 1",
-    )
-    .bind(durable.0)
-    .bind(durable.1)
-    .bind(&token.jti)
-    .bind(session_epoch)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|error| AstralError::Database(format!("Verify switch replay JTI failed: {error}")))?;
-    if indexed.is_none() {
+    if !switch_session_is_expected(durable, operation) {
+        return CompletedSwitchReplayDecision::ReconciliationRequired;
+    }
+    if durable.refresh_token_hash == presented_refresh_hash {
+        CompletedSwitchReplayDecision::Allow
+    } else {
+        CompletedSwitchReplayDecision::RevokeFamily {
+            family_id: durable.family_id,
+        }
+    }
+}
+
+async fn validate_completed_switch_replay(
+    state: &AppState,
+    operation: &SwitchOperationRow,
+    presented_refresh_hash: &str,
+) -> Result<(), AppError> {
+    let durable = load_switch_durable_session(state, operation).await?;
+    match classify_completed_switch_replay(operation, durable.as_ref(), presented_refresh_hash) {
+        CompletedSwitchReplayDecision::Allow => Ok(()),
+        CompletedSwitchReplayDecision::ReconciliationRequired => Err(AppError::from(
+            AstralError::Auth("SESSION_OPERATION_RECONCILIATION_REQUIRED".into()),
+        )),
+        CompletedSwitchReplayDecision::RevokeFamily { family_id } => {
+            if let Err(error) = revoke_token_family(state, family_id, "TOKEN_REUSE_DETECTED").await
+            {
+                return Err(AppError::from(AstralError::Auth(format!(
+                    "TOKEN_REUSE_DETECTED; failed to revoke token family: {error}"
+                ))));
+            }
+            Err(AppError::from(AstralError::Auth(
+                "Token reuse detected. All sessions have been revoked.".into(),
+            )))
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InFlightSwitchRecoveryDecision {
+    AllowOriginalRequest,
+    AllowWorkerReconciliation,
+    ReconciliationRequired,
+}
+
+fn classify_in_flight_switch_recovery(
+    operation: &SwitchOperationRow,
+    presented_refresh_hash: Option<&str>,
+) -> InFlightSwitchRecoveryDecision {
+    match presented_refresh_hash {
+        Some(hash) if hash == operation.refresh_token_hash => {
+            InFlightSwitchRecoveryDecision::AllowOriginalRequest
+        }
+        Some(_) => InFlightSwitchRecoveryDecision::ReconciliationRequired,
+        None => InFlightSwitchRecoveryDecision::AllowWorkerReconciliation,
+    }
+}
+
+async fn recover_switch_operation(
+    state: &AppState,
+    mut operation: SwitchOperationRow,
+    allow_recovery_expired_response: bool,
+    presented_refresh_hash: Option<&str>,
+) -> Result<LoginResponse, AppError> {
+    if matches!(
+        classify_in_flight_switch_recovery(&operation, presented_refresh_hash),
+        InFlightSwitchRecoveryDecision::ReconciliationRequired
+    ) {
         return Err(AppError::from(AstralError::Auth(
-            "SESSION_OPERATION_RESPONSE_UNAVAILABLE".into(),
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
         )));
     }
+    let Some((claimed, claimant)) =
+        claim_switch_operation_for_recovery(state, &operation.operation_id).await?
+    else {
+        return Err(AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        )));
+    };
+    operation = claimed;
+    let durable = load_switch_durable_session(state, &operation).await?;
+    if operation.recovery_expires_at.is_none() {
+        release_switch_operation_claim(state, &operation.operation_id, &claimant).await?;
+        return Err(AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        )));
+    }
+    if operation
+        .recovery_expires_at
+        .is_some_and(|expires_at| expires_at <= utc_db_now())
+    {
+        match durable {
+            Some(ref row) if switch_session_is_expected(row, &operation) => {
+                transition_switch_operation_to_projection(state, &operation, &claimant).await?;
+                operation = load_switch_operation_by_id(state, &operation.operation_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::from(AstralError::Auth(
+                            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+                        ))
+                    })?;
+            }
+            Some(row) if switch_session_is_previous(&row, &operation) => {
+                mark_switch_operation_failed(
+                    state,
+                    &operation,
+                    &claimant,
+                    "SESSION_RECOVERY_DEADLINE_EXPIRED",
+                )
+                .await?;
+                return Err(AppError::from(AstralError::Auth(
+                    "SESSION_OPERATION_FAILED".into(),
+                )));
+            }
+            Some(_) | None => {
+                mark_switch_operation_unknown(
+                    state,
+                    &operation.operation_id,
+                    "SESSION_RECOVERY_DEADLINE_STATE_UNPROVABLE",
+                    &claimant,
+                )
+                .await?;
+                return Err(AppError::from(AstralError::Auth(
+                    "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+                )));
+            }
+        }
+    }
+    if operation.status == SWITCH_OPERATION_STATUS_CAS_PENDING {
+        match durable {
+            Some(ref row) if switch_session_is_expected(row, &operation) => {
+                transition_switch_operation_to_projection(state, &operation, &claimant).await?;
+            }
+            Some(row) if switch_session_is_previous(&row, &operation) => {
+                if operation.recovery_attempts >= SWITCH_OPERATION_RECOVERY_ATTEMPT_LIMIT {
+                    reconcile_capped_switch_operation(state, &operation, &claimant).await?;
+                } else {
+                    apply_switch_cas(state, &operation, &claimant).await?;
+                }
+            }
+            Some(_) | None => {
+                let _ = mark_switch_operation_unknown(
+                    state,
+                    &operation.operation_id,
+                    "CAS_STATE_UNPROVABLE",
+                    &claimant,
+                )
+                .await;
+                return Err(AppError::from(AstralError::Auth(
+                    "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+                )));
+            }
+        }
+    } else if durable
+        .as_ref()
+        .is_none_or(|row| !switch_session_is_expected(row, &operation))
+    {
+        let _ = mark_switch_operation_unknown(
+            state,
+            &operation.operation_id,
+            "PROJECTION_STATE_UNPROVABLE",
+            &claimant,
+        )
+        .await;
+        return Err(AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        )));
+    }
+    let response =
+        match decrypt_switch_operation_response(&operation, allow_recovery_expired_response) {
+            Ok(response) => response,
+            Err(error) => {
+                if operation.recovery_attempts >= SWITCH_OPERATION_RECOVERY_ATTEMPT_LIMIT {
+                    let _ = mark_switch_operation_unknown(
+                        state,
+                        &operation.operation_id,
+                        "RECOVERY_RESPONSE_UNPROVABLE",
+                        &claimant,
+                    )
+                    .await;
+                } else {
+                    let _ =
+                        release_switch_operation_claim(state, &operation.operation_id, &claimant)
+                            .await;
+                }
+                return Err(error);
+            }
+        };
+    operation = load_switch_operation_by_id(state, &operation.operation_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::from(AstralError::Auth(
+                "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+            ))
+        })?;
+    complete_switch_operation(state, operation, response, &claimant).await
+}
+
+/// Durable recovery entry point owned by the session worker. It intentionally
+/// returns no response: the worker may only reconcile the durable state machine,
+/// never create a second source mutation or expose a token to a caller.
+pub(crate) async fn recover_switch_operation_from_worker(
+    state: &AppState,
+    operation_id: &str,
+) -> Result<(), AppError> {
+    let Some(operation) = load_switch_operation_by_id(state, operation_id).await? else {
+        return Ok(());
+    };
+    if !is_recoverable_switch_operation_status(&operation.status) {
+        return Ok(());
+    }
+    recover_switch_operation(state, operation, true, None)
+        .await
+        .map(|_| ())
+}
+
+async fn complete_switch_operation(
+    state: &AppState,
+    operation: SwitchOperationRow,
+    response: LoginResponse,
+    claimant: &str,
+) -> Result<LoginResponse, AppError> {
+    let proof = ensure_switch_jti_proof(state, &operation, &response, Some(claimant)).await?;
     restore_session_grant_projection(
         state,
-        &token,
+        &proof.access_token,
         SessionGrant::active(
-            &token,
-            durable.1,
-            durable.0,
-            claims.identity_card_id,
-            Some(card_id),
-            claims.user_card_tenant_id,
-            claims.user_card_domain_id,
-            session_version,
-            session_epoch,
-            durable.2,
+            &proof.access_token,
+            proof.user_id,
+            proof.session_id,
+            Some(proof.identity_card_id),
+            Some(proof.target_card_id),
+            Some(proof.tenant_id),
+            Some(proof.domain_id),
+            proof.session_version,
+            proof.session_epoch,
+            proof.family_id,
         ),
     )
     .await
-    .map_err(AppError::from)
+    .map_err(AppError::from)?;
+
+    let updated = sqlx::query(
+        "UPDATE auth_session_operation SET status = ?, completed_at = UTC_TIMESTAMP(), \
+         recovery_claim_owner = NULL, recovery_claim_expires_at = NULL, \
+         updated_at = UTC_TIMESTAMP() \
+         WHERE operation_id = ? AND status = ? AND recovery_claim_owner = ? \
+           AND recovery_claim_expires_at > UTC_TIMESTAMP()",
+    )
+    .bind(SWITCH_OPERATION_STATUS_COMPLETED)
+    .bind(&operation.operation_id)
+    .bind(SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION)
+    .bind(claimant)
+    .execute(&state.db)
+    .await;
+    match updated {
+        Ok(result) if result.rows_affected() == 1 => Ok(response),
+        Ok(_) => {
+            let current = load_switch_operation_by_id(state, &operation.operation_id).await?;
+            if current
+                .as_ref()
+                .is_some_and(|row| row.status == SWITCH_OPERATION_STATUS_COMPLETED)
+            {
+                verify_switch_completion(
+                    state,
+                    current.as_ref().unwrap(),
+                    &response,
+                    Some(claimant),
+                )
+                .await?;
+                Ok(response)
+            } else {
+                let _ = mark_switch_operation_unknown(
+                    state,
+                    &operation.operation_id,
+                    "OPERATION_COMPLETION_UNKNOWN",
+                    claimant,
+                )
+                .await;
+                Err(AppError::from(AstralError::Auth(
+                    "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+                )))
+            }
+        }
+        Err(error) => {
+            let _ = mark_switch_operation_unknown(
+                state,
+                &operation.operation_id,
+                "OPERATION_COMPLETION_UNKNOWN",
+                claimant,
+            )
+            .await;
+            Err(AppError::from(AstralError::Database(format!(
+                "Complete switch operation failed: {error}"
+            ))))
+        }
+    }
+}
+
+async fn ensure_switch_jti_proof(
+    state: &AppState,
+    operation: &SwitchOperationRow,
+    response: &LoginResponse,
+    claimant: Option<&str>,
+) -> Result<SwitchResponseProof, AppError> {
+    let (claims, token_use) =
+        decode_v2_token(&response.access_token, &state.config).map_err(|_| {
+            AppError::from(AstralError::Auth(
+                "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+            ))
+        })?;
+    let operation_family_id = load_switch_operation_family_id(operation, state).await?;
+    if token_use != TokenUse::Access
+        || claims.principal_kind != PrincipalKind::PlatformUser.as_str()
+        || claims.sub.parse::<i64>().ok() != Some(operation.user_id)
+        || claims.sid != operation.session_id
+        || claims.family_id != Some(operation_family_id)
+        || claims.identity_card_id != operation.selected_identity_card_id
+        || claims.user_card_id != operation.target_card_id
+        || claims.session_version != operation.expected_session_version
+        || claims.sev != operation.expected_session_epoch
+    {
+        let _ = mark_switch_operation_unknown(
+            state,
+            &operation.operation_id,
+            "ACCESS_PROOF_BINDING_MISMATCH",
+            claimant.unwrap_or_default(),
+        )
+        .await;
+        return Err(AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        )));
+    }
+    let identity_card_id = operation.selected_identity_card_id.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    let target_card_id = operation.target_card_id.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    let session_id = operation.session_id.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    let expected_session_epoch = operation.expected_session_epoch.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    let session = load_switch_durable_session(state, operation)
+        .await?
+        .filter(|row| switch_session_is_expected(row, operation))
+        .ok_or_else(|| {
+            AppError::from(AstralError::Auth(
+                "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+            ))
+        })?;
+    delete_session_projections_before_epoch(state, session.session_id, expected_session_epoch)
+        .await
+        .map_err(AppError::from)?;
+
+    let token = TokenResult {
+        token: response.access_token.clone(),
+        jti: claims.jti.clone(),
+        expires_in: claims.exp as i64 - OffsetDateTime::now_utc().unix_timestamp(),
+        issued_at_epoch_second: claims.iat as i64,
+        expires_at_epoch_second: claims.exp as i64,
+    };
+    if let Err(error) = record_platform_session_jti_proof(
+        state,
+        &token,
+        operation.user_id,
+        session_id,
+        expected_session_epoch,
+        identity_card_id,
+    )
+    .await
+    {
+        let existing: Option<(i64,)> = sqlx::query_as(
+            "SELECT jti_id FROM auth_session_jti_index WHERE session_id = ? AND user_id = ? \
+             AND jti = ? AND session_epoch = ? AND status = 'ACTIVE' LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(operation.user_id)
+        .bind(&claims.jti)
+        .bind(expected_session_epoch)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|query_error| {
+            AstralError::Database(format!(
+                "Verify switch JTI after proof error failed: {query_error}; original: {error}"
+            ))
+        })?;
+        if existing.is_none() {
+            let _ = mark_switch_operation_unknown(
+                state,
+                &operation.operation_id,
+                "ACCESS_PROOF_UNPROVABLE",
+                claimant.unwrap_or_default(),
+            )
+            .await;
+            return Err(AppError::from(AstralError::Auth(
+                "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+            )));
+        }
+    }
+
+    let tenant_domain: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT uc.tenant_id, uc.domain_id FROM user_card uc \
+         INNER JOIN tenant t ON t.tenant_id = uc.tenant_id AND t.status = 'ACTIVE' \
+         INNER JOIN tenant_domain_map tdm ON tdm.tenant_id = uc.tenant_id \
+           AND tdm.domain_id = uc.domain_id AND tdm.status = 'ACTIVE' \
+         WHERE uc.card_id = ? AND uc.user_id = ? AND uc.card_status = 'ACTIVE' \
+           AND uc.tenant_id > 0 AND uc.domain_id > 0 LIMIT 1",
+    )
+    .bind(target_card_id)
+    .bind(operation.user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|error| AstralError::Database(format!("Load switch card scope failed: {error}")))?;
+    let (tenant_id, domain_id) = tenant_domain.ok_or_else(|| {
+        AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        ))
+    })?;
+    if claims.user_card_tenant_id != Some(tenant_id)
+        || claims.user_card_domain_id != Some(domain_id)
+    {
+        let _ = mark_switch_operation_unknown(
+            state,
+            &operation.operation_id,
+            "ACCESS_SCOPE_BINDING_MISMATCH",
+            claimant.unwrap_or_default(),
+        )
+        .await;
+        return Err(AppError::from(AstralError::Auth(
+            "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+        )));
+    }
+
+    Ok(SwitchResponseProof {
+        access_token: token,
+        user_id: operation.user_id,
+        session_id,
+        family_id: session.family_id,
+        identity_card_id,
+        target_card_id,
+        tenant_id,
+        domain_id,
+        session_version: operation.expected_session_version.ok_or_else(|| {
+            AppError::from(AstralError::Auth(
+                "SESSION_OPERATION_RECONCILIATION_REQUIRED".into(),
+            ))
+        })?,
+        session_epoch: expected_session_epoch,
+    })
+}
+
+async fn verify_switch_completion(
+    state: &AppState,
+    operation: &SwitchOperationRow,
+    response: &LoginResponse,
+    claimant: Option<&str>,
+) -> Result<(), AppError> {
+    let _ = ensure_switch_jti_proof(state, operation, response, claimant).await?;
+    Ok(())
 }
 
 /// Re-project a previously proven access credential (switch-card recovery).
@@ -2105,22 +3663,180 @@ mod tests {
     }
 
     #[test]
-    fn switch_operation_recovers_only_known_projection_pending_statuses() {
+    fn switch_operation_recovery_state_set_is_v6_only() {
         assert_eq!(
             SWITCH_OPERATION_STATUS_NAMES,
-            ["COMMITTED_PENDING_REDIS", "COMMITTED_PENDING_PROJECTION"]
+            [
+                "CAS_PENDING",
+                "COMMITTED_PENDING_PROJECTION",
+                "COMPLETED",
+                "FAILED",
+                "UNKNOWN"
+            ]
         );
         assert!(is_recoverable_switch_operation_status(
-            LEGACY_SWITCH_OPERATION_STATUS_COMMITTED_PENDING_REDIS
+            SWITCH_OPERATION_STATUS_CAS_PENDING
         ));
         assert!(is_recoverable_switch_operation_status(
             SWITCH_OPERATION_STATUS_COMMITTED_PENDING_PROJECTION
         ));
-        for status in ["PENDING", "COMPLETED", "FAILED", "UNKNOWN"] {
+        for status in [
+            "PENDING",
+            "COMPLETED",
+            "FAILED",
+            "UNKNOWN",
+            "COMMITTED_PENDING_REDIS",
+        ] {
             assert!(!is_recoverable_switch_operation_status(status));
         }
     }
 
+    #[test]
+    fn completed_switch_replay_allows_only_the_current_refresh_hash() {
+        let operation = switch_operation_fixture("new-refresh");
+        let durable = switch_durable_session_fixture("new-refresh");
+        assert_eq!(
+            classify_completed_switch_replay(&operation, Some(&durable), "new-refresh"),
+            CompletedSwitchReplayDecision::Allow
+        );
+        assert_eq!(
+            classify_completed_switch_replay(&operation, Some(&durable), "old-refresh"),
+            CompletedSwitchReplayDecision::RevokeFamily { family_id: 77 }
+        );
+        assert_eq!(
+            classify_completed_switch_replay(&operation, None, "new-refresh"),
+            CompletedSwitchReplayDecision::ReconciliationRequired
+        );
+    }
+
+    #[test]
+    fn in_flight_switch_recovery_accepts_only_original_bearer_or_worker_proof() {
+        let operation = switch_operation_fixture("new-refresh");
+        assert_eq!(
+            classify_in_flight_switch_recovery(&operation, Some("old-refresh")),
+            InFlightSwitchRecoveryDecision::AllowOriginalRequest
+        );
+        assert_eq!(
+            classify_in_flight_switch_recovery(&operation, Some("new-refresh")),
+            InFlightSwitchRecoveryDecision::ReconciliationRequired
+        );
+        assert_eq!(
+            classify_in_flight_switch_recovery(&operation, None),
+            InFlightSwitchRecoveryDecision::AllowWorkerReconciliation
+        );
+    }
+
+    #[test]
+    fn switch_replay_source_checks_current_hash_and_recovery_fences() {
+        let source = include_str!("session.rs");
+        let switch_body = source
+            .split("pub(crate) async fn switch_card_session(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn required_idempotency_key").next())
+            .expect("switch session body must stay bounded");
+        assert!(switch_body.contains("load_active_session_context("));
+        assert!(switch_body.contains("TOKEN_REUSE_DETECTED"));
+        assert!(switch_body.contains("operation.status != SWITCH_OPERATION_STATUS_COMPLETED"));
+        assert!(switch_body.contains("validate_switch_recovery_context"));
+        let stale_refresh_body = source
+            .split("async fn load_current_refresh_session_or_revoke_reuse(")
+            .nth(1)
+            .and_then(|tail| tail.split("/// logout/revoke 共用的凭证前置门").next())
+            .expect("stale refresh helper must remain bounded");
+        assert!(stale_refresh_body.contains("session_version"));
+        assert!(stale_refresh_body.contains("session_epoch"));
+        assert!(stale_refresh_body.contains("current.refresh_token_hash != refresh_hash"));
+        assert!(stale_refresh_body.contains("TOKEN_REUSE_DETECTED"));
+        assert!(source.contains("revoke_logout_refresh(&state, raw"));
+        let replay_body = source
+            .split("async fn replay_or_recover_switch_operation(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("async fn validate_completed_switch_replay")
+                    .next()
+            })
+            .expect("replay helper must stay bounded");
+        assert!(replay_body.contains("presented_refresh_hash"));
+        assert!(replay_body.contains(
+            "recover_switch_operation(state, operation, false, Some(presented_refresh_hash))"
+        ));
+        let recovery_body = source
+            .split("async fn recover_switch_operation(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("/// Durable recovery entry point owned by the session worker")
+                    .next()
+            })
+            .expect("recovery helper must remain bounded");
+        assert!(recovery_body
+            .contains("classify_in_flight_switch_recovery(&operation, presented_refresh_hash)"));
+        assert!(recovery_body.contains("presented_refresh_hash: Option<&str>"));
+        assert!(source.contains("recover_switch_operation(state, operation, true, None)"));
+        let claim_body = source
+            .split("async fn claim_switch_operation(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("async fn claim_switch_operation_for_recovery")
+                    .next()
+            })
+            .expect("claim helper must stay bounded");
+        assert!(claim_body.contains("recovery_expires_at IS NOT NULL"));
+        let release_body = source
+            .split("async fn release_switch_operation_claim(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn mark_switch_operation_failed").next())
+            .expect("release helper must stay bounded");
+        assert!(release_body.contains("recovery_claim_owner = ?"));
+        assert!(release_body.contains("recovery_claim_expires_at > UTC_TIMESTAMP()"));
+        let failed_body = source
+            .split("async fn mark_switch_operation_failed(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn mark_switch_operation_unknown").next())
+            .expect("failed transition must stay bounded");
+        assert!(failed_body.contains("status IN (?, ?)"));
+    }
+
+    fn switch_operation_fixture(refresh_hash: &str) -> SwitchOperationRow {
+        SwitchOperationRow {
+            operation_id: "operation-a".into(),
+            user_id: 7,
+            request_hash: "request".into(),
+            refresh_token_hash: "old-refresh".into(),
+            source_card_id: Some(11),
+            target_card_id: Some(13),
+            session_id: Some(55),
+            selected_identity_card_id: Some(66),
+            previous_session_version: Some(1),
+            previous_session_epoch: Some(1),
+            expected_session_version: Some(2),
+            expected_session_epoch: Some(2),
+            device_id: Some("device".into()),
+            new_refresh_token_hash: Some(refresh_hash.into()),
+            new_refresh_expires_at: None,
+            status: SWITCH_OPERATION_STATUS_COMPLETED.into(),
+            response_ciphertext: None,
+            response_expires_at: None,
+            recovery_expires_at: None,
+            recovery_attempts: 0,
+            recovery_claim_owner: None,
+            recovery_claim_expires_at: None,
+            last_error: None,
+        }
+    }
+
+    fn switch_durable_session_fixture(refresh_hash: &str) -> SwitchDurableSessionRow {
+        SwitchDurableSessionRow {
+            session_id: 55,
+            user_id: 7,
+            family_id: 77,
+            current_user_card_id: Some(13),
+            session_state: "ACTIVE".into(),
+            session_version: 2,
+            session_epoch: 2,
+            refresh_token_hash: refresh_hash.into(),
+            status: "ACTIVE".into(),
+        }
+    }
     #[test]
     fn session_response_key_requires_base64_encoded_256_bit_key() {
         let _guard = session_response_env_lock().lock().unwrap();
@@ -2171,14 +3887,31 @@ mod tests {
         let ciphertext = encrypt_operation_response("operation-a", &response).unwrap();
         let operation = SwitchOperationRow {
             operation_id: "operation-a".into(),
+            user_id: 7,
             request_hash: "request".into(),
             refresh_token_hash: "refresh".into(),
+            source_card_id: Some(1),
+            target_card_id: Some(5),
+            session_id: Some(1),
+            selected_identity_card_id: Some(2),
+            previous_session_version: Some(2),
+            previous_session_epoch: Some(3),
+            expected_session_version: Some(3),
+            expected_session_epoch: Some(4),
+            device_id: None,
+            new_refresh_token_hash: Some("new-refresh".into()),
+            new_refresh_expires_at: response_expiry().ok(),
             status: "COMPLETED".into(),
             response_ciphertext: Some(ciphertext),
             response_expires_at: response_expiry().ok(),
+            recovery_expires_at: response_expiry().ok(),
+            recovery_attempts: 0,
+            recovery_claim_owner: None,
+            recovery_claim_expires_at: None,
+            last_error: None,
         };
         assert_eq!(
-            decrypt_switch_operation_response(&operation)
+            decrypt_switch_operation_response(&operation, false)
                 .unwrap()
                 .access_token,
             "access"
@@ -2187,7 +3920,7 @@ mod tests {
             operation_id: "operation-b".into(),
             ..operation
         };
-        assert!(decrypt_switch_operation_response(&wrong_operation).is_err());
+        assert!(decrypt_switch_operation_response(&wrong_operation, false).is_err());
         unsafe { std::env::remove_var("IDENTITY_SESSION_RESPONSE_AES_GCM_KEY") };
     }
 
@@ -2254,147 +3987,135 @@ mod tests {
         assert!(matches!(result, Err(AstralError::Database(_))));
     }
 
-    /// 撤销/轮换集群 source 栅栏形状回归（源形状，无 IO）：
-    /// 1. family 撤销集群（CAS + 级联 + outbox）持有一份栅栏，武装先于首条
-    ///    await，settle 在 outbox 落盘后，本地拒绝 marker 段在栅栏之外；
-    /// 2. user 撤销集群同形状；
-    /// 3. refresh 轮换与单会话撤销、撤销 outbox 均经 fenced_source_write。
+    /// 通过同一个 V6 source transaction 完成会话撤销、JTI proof 关闭、父 outbox 和 typed shard intent；
+    /// commit 被证明后才安装本地 deny 加速。
     #[test]
-    fn revocation_clusters_and_rotations_hold_the_source_writer_fence() {
+    fn revocation_transaction_source_shape_holds_fence_and_durable_order() {
         let source = include_str!("session.rs");
-
-        let family_body = source
-            .split("async fn revoke_token_family(")
+        let body = source
+            .split("async fn revoke_transaction(")
             .nth(1)
-            .expect("revoke_token_family must stay")
-            .split("/// Revoke every active session")
+            .expect("revoke_transaction must stay")
+            .split("async fn lock_revocation_snapshot(")
             .next()
-            .expect("revoke_all doc comment must follow");
-        let guard = family_body
-            .find("source_writer_guard::begin_source_write()")
-            .expect("the family revocation cluster must hold the writer fence");
-        let arm = family_body
-            .find("source_writer_guard::arm_commit_fence(&source_guard)")
-            .expect("the cluster must arm before the first statement await");
-        let cas = family_body
-            .find("revoke_family_cas(")
-            .expect("family CAS must stay");
-        let cascade = family_body
-            .find("revoke_family_sessions(")
-            .expect("cascade revoke must stay");
-        let outbox = family_body
-            .find("INSERT INTO auth_session_outbox")
-            .expect("the family outbox append must stay");
-        let settle = family_body
-            .find("source_writer_guard::settle_commit_fence(&source_guard, true)")
-            .expect("the cluster fence must settle after the outbox append");
-        assert!(guard < arm && arm < cas && cas < cascade && cascade < outbox && outbox < settle);
-        // 本地拒绝加速登记在栅栏之外（marker 循环位于集群前/后）。
-        assert!(
-            family_body
-                .find("delete_session_projections(state")
-                .unwrap()
-                < guard
-                && family_body
-                    .rfind("delete_session_projections(state")
-                    .unwrap()
-                    > settle,
-            "projection fan-out stays outside the fenced SQL cluster"
-        );
-
-        let user_body = source
-            .split("pub(crate) async fn revoke_all_sessions_for_user(")
-            .nth(1)
-            .expect("revoke_all_sessions_for_user must stay")
-            .split("/// Create a family with the same UTC DATETIME expiry")
-            .next()
-            .expect("create family helper must follow");
-        let guard = user_body
-            .find("source_writer_guard::begin_source_write()")
-            .expect("the user revocation cluster must hold the writer fence");
-        let arm = user_body
-            .find("source_writer_guard::arm_commit_fence(&source_guard)")
-            .expect("the cluster must arm before the first statement await");
-        let sessions = user_body
-            .find("revoke_user_sessions(")
-            .expect("user session revoke must stay");
-        let families = user_body
-            .find("revoke_user_token_families(")
-            .expect("user family revoke must stay");
-        let outbox = user_body
-            .find("INSERT INTO auth_session_outbox")
-            .expect("the user outbox append must stay");
-        let settle = user_body
-            .find("source_writer_guard::settle_commit_fence(&source_guard, true)")
-            .expect("the cluster fence must settle after the outbox append");
-        assert!(
-            guard < arm
-                && arm < sessions
-                && sessions < families
-                && families < outbox
-                && outbox < settle
-        );
-
-        // refresh 轮换与卡切换轮换：栅栏取得先于轮换 UPDATE，经围栏执行。
-        let refresh_body = source
-            .split("async fn refresh_token_from_session(")
-            .nth(1)
-            .expect("refresh flow must stay")
-            .split("async fn revoke_session(")
-            .next()
-            .expect("revoke route must follow the refresh flow");
-        assert!(
-            refresh_body
-                .find("let rotation_guard = source_writer_guard::begin_source_write()")
-                .unwrap()
-                < refresh_body
-                    .find("UPDATE auth_device_session SET refresh_token_hash")
-                    .unwrap(),
-            "refresh rotation must acquire the fence before its UPDATE"
-        );
-        assert!(refresh_body.contains("fenced_source_write("));
-        for route in ["async fn revoke_session(", "async fn logout("] {
-            let route_body = source
-                .split(route)
-                .nth(1)
-                .expect("credential revocation route must stay")
-                .split("async fn ")
-                .next()
-                .expect("route body must be bounded by the next async function");
+            .expect("revocation transaction body must be bounded");
+        let ordered = [
+            "source_writer_guard::begin_source_write()",
+            "state.db.begin()",
+            "lock_revocation_snapshot(&mut tx, target)",
+            "INSERT INTO auth_session_outbox",
+            "append_session_revocation_shards_in_tx(",
+            "source_writer_guard::arm_commit_fence(&source_guard)",
+            "tx.commit().await",
+            "source_writer_guard::settle_commit_fence(&source_guard, true)",
+            "astral_db::note_revocations_in_process(",
+        ];
+        let positions = ordered
+            .iter()
+            .map(|needle| {
+                body.find(needle)
+                    .unwrap_or_else(|| panic!("missing {needle}"))
+            })
+            .collect::<Vec<_>>();
+        let mirror = body
+            .rfind("astral_db::note_revocations_in_process(")
+            .expect("post-commit mirror installation must stay after the commit fence");
+        assert!(positions[..positions.len() - 1]
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
+        assert!(positions[positions.len() - 2] < mirror);
+        for mutation in [
+            "UPDATE auth_session_jti_index SET status = 'DELETED'",
+            "UPDATE auth_device_session SET status = 'REVOKED'",
+            "UPDATE auth_token_family SET status = 'REVOKED'",
+        ] {
             assert!(
-                route_body.contains("is_platform_user(&claims.principal_kind)"),
-                "{route} must reject stale non-PlatformUser credentials"
+                body.contains(mutation),
+                "missing durable mutation {mutation}"
             );
         }
+        assert!(body.contains("typedShards"));
+        assert!(body.contains("WHERE operation_id = ? AND sequence_number = 1 FOR UPDATE"));
+        assert!(body.contains("SESSION_REVOCATION_IDEMPOTENCY_CONFLICT"));
+        assert!(!body.contains("session_repo::revoke_"));
+    }
 
-        let revoke_body: String = source
-            .split("async fn db_revoke_session(")
+    #[test]
+    fn revocation_lock_order_is_outbox_then_user_family_session_jti() {
+        let source = include_str!("session.rs");
+        let transaction = source
+            .split("async fn revoke_transaction(")
             .nth(1)
-            .expect("single-session revocation helper must stay")
-            .split("pub(crate) async fn store_session_grant_projection(")
-            .next()
-            .unwrap()
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        assert!(
-            revoke_body
-                .contains("fenced_source_write(source_guard,async{session_repo::revoke_session("),
-            "single-session revocation must run under the fenced writer"
-        );
-        let outbox_body: String = source
-            .split("async fn write_session_revocation_outbox(")
+            .and_then(|tail| tail.split("async fn lock_revocation_snapshot(").next())
+            .expect("revocation transaction body must remain bounded");
+        let outbox = transaction
+            .find("WHERE operation_id = ? AND sequence_number = 1 FOR UPDATE")
+            .expect("idempotency outbox row must be locked first");
+        let snapshot_call = transaction
+            .find("lock_revocation_snapshot(&mut tx, target)")
+            .expect("revocation transaction must use the shared lock helper");
+        assert!(outbox < snapshot_call);
+
+        let snapshot_start = source
+            .find("async fn lock_revocation_snapshot(")
+            .expect("revocation snapshot helper must remain");
+        let snapshot_end = source[snapshot_start..]
+            .find("\nfn bounded_revocation_jtis")
+            .map(|offset| snapshot_start + offset)
+            .expect("revocation snapshot helper must remain bounded");
+        let snapshot = &source[snapshot_start..snapshot_end];
+        let user_branch = snapshot
+            .find("RevocationTarget::User { user_id } => {")
+            .map(|offset| &snapshot[offset..])
+            .expect("user revocation snapshot branch must remain");
+        let user = user_branch
+            .find("SELECT user_id FROM platform_user")
+            .expect("user aggregate must be locked");
+        let family = user_branch
+            .find("SELECT family_id FROM auth_token_family")
+            .expect("token families must be locked");
+        let sessions = user_branch
+            .find("SELECT session_id FROM auth_device_session")
+            .expect("device sessions must be locked");
+        let jtis = user_branch
+            .find("SELECT jti FROM auth_session_jti_index")
+            .expect("JTI snapshot must be locked");
+        assert!(user < family && family < sessions && sessions < jtis);
+    }
+
+    #[test]
+    fn switch_completion_closes_prior_epoch_proofs_before_new_proof() {
+        let source = include_str!("session.rs");
+        let body = source
+            .split("async fn ensure_switch_jti_proof(")
             .nth(1)
-            .expect("single-session outbox helper must stay")
-            .split("// ===== Token Family")
+            .expect("switch proof helper must stay")
+            .split("async fn verify_switch_completion(")
             .next()
-            .unwrap()
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        assert!(
-            outbox_body.contains("fenced_source_write(outbox_guard,"),
-            "the revocation outbox append must run under the fenced writer"
-        );
+            .expect("switch proof body must be bounded");
+        let close = body
+        .find("delete_session_projections_before_epoch(state, session.session_id, expected_session_epoch)")
+        .expect("switch proof must close prior epoch proofs");
+        let record = body
+            .find("record_platform_session_jti_proof(")
+            .expect("switch proof must record the new durable proof");
+        assert!(close < record);
+    }
+
+    #[test]
+    fn switch_unknown_cas_reconciles_durable_session_before_unknown() {
+        let source = include_str!("session.rs");
+        let body = source
+            .split("let rotation = match rotation {")
+            .nth(1)
+            .expect("switch CAS result branch must stay")
+            .split("if rotation.rows_affected() != 1")
+            .next()
+            .expect("switch CAS result branch must be bounded");
+        assert!(body.contains("load_switch_durable_session(state, operation).await?"));
+        assert!(body.contains("switch_session_is_expected(&row, operation)"));
+        assert!(body.contains("switch_session_is_previous(&row, operation)"));
+        assert!(body.contains("CAS_OUTCOME_UNPROVABLE"));
+        assert!(!body.contains("CAS_OUTCOME_UNKNOWN"));
     }
 }

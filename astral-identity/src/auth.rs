@@ -308,6 +308,7 @@ pub fn derive_roles_from_action_codes(action_codes: &[String]) -> Vec<String> {
 }
 
 /// JWT 签发结果
+#[derive(Debug)]
 pub struct TokenResult {
     pub token: String,
     pub jti: String,

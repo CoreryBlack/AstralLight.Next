@@ -5,6 +5,7 @@
 //! （对齐 Java `HealthController` + `DashboardMonitoringService`）。
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
@@ -37,12 +38,25 @@ pub struct ServiceStatus {
     pub local_message_store: String,
 }
 
+/// Direct health probe exposed by the Monitor service port.
+pub fn actuator_health_routes() -> Router<AppState> {
+    Router::new().route("/health", get(health_check))
+}
+
+/// Actuator routes that remain behind Gateway signature verification.
 pub fn monitor_routes() -> Router<AppState> {
     Router::new()
-        .route("/health", get(health_check))
         .route("/health/detailed", get(detailed_health))
         .route("/metrics", get(metrics))
         .route("/status", get(service_status))
+}
+
+/// Frontend health routes are direct Monitor service endpoints and are not
+/// Gateway proxy routes.
+pub fn frontend_health_routes() -> Router<AppState> {
+    Router::new()
+        .route("/health", get(frontend_health_check))
+        .route("/health/metrics", get(frontend_metrics))
 }
 
 /// 实时 DB probe：`SELECT 1`（2s 超时）。
@@ -144,14 +158,26 @@ async fn gateway_status(state: &AppState) -> String {
     query_service_status(state, "gateway").await
 }
 
-async fn health_check(State(state): State<AppState>) -> Json<HealthStatus> {
+async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<HealthStatus>) {
     let status = check_db_health(&state).await;
-    Json(HealthStatus {
-        service: "astral-monitor".into(),
-        status,
-        uptime_seconds: 0,
-        version: env!("CARGO_PKG_VERSION").into(),
-    })
+    let http_status = health_http_status(&status);
+    (
+        http_status,
+        Json(HealthStatus {
+            service: "astral-monitor".into(),
+            status,
+            uptime_seconds: 0,
+            version: env!("CARGO_PKG_VERSION").into(),
+        }),
+    )
+}
+
+fn health_http_status(status: &str) -> StatusCode {
+    if status == "UP" {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 async fn query_service_status(state: &AppState, service_name: &str) -> String {
@@ -215,42 +241,48 @@ async fn metrics(State(state): State<AppState>) -> String {
 
 pub async fn frontend_health_check(
     State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> (StatusCode, Json<serde_json::Value>) {
     let db_status = check_db_health(&state).await;
+    let healthy = db_status == "UP";
+    let http_status = health_http_status(&db_status);
+    let response_code = http_status.as_u16();
     let permission_checks = state
         .monitor_service
         .recent_metric_count()
         .await
         .unwrap_or(0);
     let metrics_available = permission_checks > 0;
-    Ok(Json(serde_json::json!({
-        "code": 200,
-        "success": true,
-        "message": "操作成功",
-        "data": {
-            "application": "astral-monitor",
-            "timestamp": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-            "uptimeMs": 0,
-            "path": "/api/health",
-            "database": {
-                "healthy": db_status == "UP",
-                "status": db_status,
-                "driver": "mysql",
+    (
+        http_status,
+        Json(serde_json::json!({
+            "code": response_code,
+            "success": healthy,
+            "message": if healthy { "操作成功" } else { "依赖不可用" },
+            "data": {
+                "application": "astral-monitor",
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+                "uptimeMs": 0,
+                "path": "/api/health",
+                "database": {
+                    "healthy": healthy,
+                    "status": db_status,
+                    "driver": "mysql",
+                },
+                "metrics": {
+                    "ordersCreated": 0,
+                    "paymentSuccess": 0,
+                    "paymentFailure": 0,
+                    "permissionDenied": 0,
+                    "permissionChecksTotal": permission_checks,
+                    "metricsAvailable": metrics_available,
+                },
+                "status": if healthy { "UP" } else { "DOWN" },
             },
-            "metrics": {
-                "ordersCreated": 0,
-                "paymentSuccess": 0,
-                "paymentFailure": 0,
-                "permissionDenied": 0,
-                "permissionChecksTotal": permission_checks,
-                "metricsAvailable": metrics_available,
-            },
-            "status": db_status,
-        },
-    })))
+        })),
+    )
 }
 
 pub async fn frontend_metrics(
@@ -301,6 +333,14 @@ async fn service_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_status_maps_only_up_to_success() {
+        assert_eq!(health_http_status("UP"), StatusCode::OK);
+        for status in ["DOWN", "UNKNOWN", "NOT_CONFIGURED"] {
+            assert_eq!(health_http_status(status), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
 
     #[test]
     fn local_message_store_reports_not_configured_outside_local_mode() {

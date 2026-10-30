@@ -7,6 +7,8 @@
 > 文档性质：**2026-08-11 当前态历史快照 + 解耦目标对照**。本文档记录该日期代码边界内的链路与耦合；目标态一律显式标注"目标态，非当前实现"，不代表 2026-08-22 已对全文重新核验。
 >
 > **现状更新（2026-10-29）**：本文中 Chat/Learn 运行时、Gateway 转发、WebSocket 桥、路由、内部会话和相关耦合均是 2026-08-11 的历史源码证据，不是现行服务或 API 声明。Rust `astral-chat`、`astral-learn` 生产 runtime crates 及其 Gateway routes/proxies 已退役并已从本 checkout 物理移除。`integrations/` 下独立 SDK consumer samples 仅供示例/测试，不是生产服务替代品。
+>
+> **CURRENT V6 证据边界**：本文中的 Chat/Learn、Redis session/cache、WS bridge 和旧 route/proxy 叙述均为历史 baseline 或 retired compatibility evidence；保留的路径、key、依赖和阶段门禁不属于当前 Rust runtime、当前 API 或真实集成 `PASS`。CURRENT V6 不恢复这些生产 crate/routes，也不以历史源码存在、旧报告或局部静态测试证明解冻。资源退役仍须 canonical revoke、generation 与 published-evidence barriers；密码 delivery 无 proven notifier handoff 时保持 unavailable/`PENDING`，`UNKNOWN`/`PENDING` 需先独立对账。
 
 ---
 
@@ -442,8 +444,9 @@ AppUser 不注入 user-card 三头（claims 校验已强制其为空）。
 - **验收标准**：各服务启动配置面收敛；代码审计确认无跨服务密钥泄漏；配置校验测试（`ConfigValidationError` 各分支）全绿。
 - **回滚点**：配置结构带版本字段兼容读取旧 key，旧 YAML 可直接启动。
 
-### 阶段 F — Learn / Chat 解冻前置条件（门禁清单）
+### 阶段 F — Learn / Chat 解冻前置条件（历史目标态门禁，已退役）
 
+> 本节保留 2026-08-11 计划中的解冻条件，供迁移与决策回溯；CURRENT V6 已将 `astral-learn`、`astral-chat` 生产 runtime crates、Gateway routes/proxies 退役并从 checkout 物理移除。本节不构成当前解冻任务、当前 runtime 入口或真实集成验收要求。
 - **做什么**（解冻前必须全部满足）：
   1. internal 会话当前已经经 Gateway 两跳完成（Learn→Gateway→Identity）；解冻前仍需把 `astral-internal-v1` 的 producer/consumer、密钥边界和 wire contract 纳入正式 contract crate，并完成对应契约测试（§10 决策 6）。
   2. internal 会话协议（`astral-internal-v1` 两跳 assertion；Learn→Gateway 与 Gateway→Identity 使用各自 caller/route/key-id，Gateway 不透传 Learn assertion）正式纳入阶段 B 的 contract crate。

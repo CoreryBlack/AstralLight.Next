@@ -3,7 +3,7 @@
 //! The V6 authorization adapter has its own module and explicit exports. Source
 //! management queries remain separate from formal published-evidence reads.
 
-use sqlx::MySqlPool;
+use sqlx::{MySql, MySqlPool, Transaction};
 use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 
 mod authorization;
@@ -102,17 +102,37 @@ pub async fn create_token_family(
     Ok(result.last_insert_id() as i64)
 }
 
-/// 撤销整个 token family（按 BIGINT family_id 主键定位）。
-pub async fn revoke_token_family(
-    pool: &MySqlPool,
-    family_id: i64,
-    reason: &str,
+/// Insert a security-sensitive audit entry inside the caller's source transaction.
+/// The transaction owner retains the commit fence and therefore controls whether
+/// the mutation and its audit correlation become durable together.
+pub async fn insert_audit_log_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    entry: &astral_common::audit::AuditEntry,
 ) -> Result<(), DbError> {
-    sqlx::query("UPDATE auth_token_family SET status = 'REVOKED', revoked_at = CURRENT_TIMESTAMP, revoked_reason = ? WHERE family_id = ? AND status = 'ACTIVE'")
-        .bind(reason).bind(family_id).execute(pool).await?;
+    let event_type_str = serde_json::to_value(&entry.event_type)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    sqlx::query(
+        "INSERT INTO audit_log (user_id, card_id, action, resource, decision, reason, event_type, source_ip, request_id, domain_id, tenant_id, detail) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(entry.user_id)
+    .bind(entry.card_id)
+    .bind(&entry.action)
+    .bind(&entry.resource)
+    .bind(&entry.decision)
+    .bind(&entry.reason)
+    .bind(&event_type_str)
+    .bind(&entry.source_ip)
+    .bind(&entry.request_id)
+    .bind(entry.domain_id)
+    .bind(entry.tenant_id)
+    .bind(&entry.detail)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
-
 // 插入审计日志到 DB
 pub async fn insert_audit_log(
     pool: &MySqlPool,
@@ -494,6 +514,27 @@ pub async fn insert_password_reset_token(
         .bind(expires_at)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// 作废指定密码重置令牌（按用户 + SHA-256 哈希 CAS）。
+///
+/// `used_at IS NULL` 使清理幂等：更新 0 行表示令牌不存在或已经不可用，
+/// 两种结果都不能留下一个仍可消费的令牌。调用方不得把原始令牌传入日志、
+/// durable payload 或响应。
+pub async fn invalidate_password_reset_token(
+    pool: &MySqlPool,
+    user_id: i64,
+    token_hash: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE password_reset_token SET used_at = UTC_TIMESTAMP() \
+         WHERE user_id = ? AND token = ? AND used_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(token_hash)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

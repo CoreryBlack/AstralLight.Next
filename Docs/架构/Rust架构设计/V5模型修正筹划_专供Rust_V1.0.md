@@ -5,6 +5,7 @@
 > 范围：基于 **v4 canonical 表架构**（`Docs/sql/full_schema_v4.sql`）筹划 **v5 模型修正**——未来专供 Rust 使用（Rust 独立演进，不要求 Java 同步）。
 > 依据：《Rust架构模型设计修正记录.md》问题 1-8、问题 14。
 > 状态：**部分实施/筹划中**；本文保留各项决策/待定/前置条件。**历史状态记录（2026-08-11）**：公共资格服务（D1）与当时记载的 CARD/ELIGIBILITY 接线已落地；后续代码将旧 `ProjectionWorker` 的 CARD/RULE_SET 重建职责退役，并将正式授权读面迁至 `AuthorizationProjector` + strict published evidence，详见当前源码校准后的架构设计与修正记录。身份组织列的 guarded-drop migration 文件现已存在于当前仓库，但本次未连接/检查任何目标数据库，数据库应用状态未知；代码接线不代表迁移或部署验收。
+> CURRENT V6 证据边界：本文的 v5 schema、Chat scope、Redis key/拓扑和解冻阶段均属于历史目标态筹划或迁移证据。保留的表结构、迁移 artifact、source/ledger/revocation/audit 事实不因本标注改写；artifact、代码接线或旧报告不证明目标数据库已迁移、Chat/Learn runtime/API 或 Redis 依赖仍是当前，也不构成真实集成 `PASS`。当前正式授权以 canonical generation/published-evidence gate 为准，`UNKNOWN`/`PENDING` 需先对账。
 
 ---
 

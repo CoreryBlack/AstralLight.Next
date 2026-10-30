@@ -640,7 +640,57 @@ async fn bind_card_async(
                         )
                         .await
                     {
-                        Ok(()) => {}
+                        Ok(receipts) => {
+                            if !crate::service::sync_publish::wait_for_committed_receipts(
+                                &db, &receipts,
+                            )
+                            .await
+                            {
+                                let message =
+                                    "post-commit CARD/ELIGIBILITY/invalidation completion was not proven";
+                                if let Err(persist) = async_tracker::fail_card_bind_item(
+                                    &db,
+                                    &tid,
+                                    item.card_id,
+                                    "IN_DOUBT",
+                                    message,
+                                )
+                                .await
+                                {
+                                    return Err(format!(
+                                        "{message}; could not persist IN_DOUBT: {persist}"
+                                    ));
+                                }
+                                continue;
+                            }
+                            if let Err(error) = async_tracker::complete_card_bind_item(
+                                &db,
+                                &tid,
+                                item.card_id,
+                                &item.operation_id,
+                                item.tenant_id,
+                                item.domain_id,
+                            )
+                            .await
+                            {
+                                let message = format!(
+                                    "card bind tracker completion is unknown after source commit: {error}"
+                                );
+                                if let Err(persist) = async_tracker::fail_card_bind_item(
+                                    &db,
+                                    &tid,
+                                    item.card_id,
+                                    "IN_DOUBT",
+                                    &message,
+                                )
+                                .await
+                                {
+                                    return Err(format!(
+                                        "{message}; could not persist IN_DOUBT: {persist}"
+                                    ));
+                                }
+                            }
+                        }
                         Err(error) => {
                             let message = error.to_string();
                             tracing::warn!(task_id = %tid, card_id = item.card_id, error = %message, "failed to bind card");

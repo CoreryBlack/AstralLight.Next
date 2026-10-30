@@ -5,16 +5,18 @@
 //! through the strict reader instead of treating this payload as authorization
 //! data. Durable fanout, watermarks, and reconciliation are separate stages.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::MySqlPool;
 use thiserror::Error;
 
 use astral_types::{PublicationStamp, PublishedEvidenceAggregate, AUTHORIZATION_EDITION};
 
 use crate::envelope::MessageEnvelope;
+use crate::error::MqError;
 
 /// All typed authorization invalidations use the shared authorization release
 /// edition. The `i32` representation matches the transport envelope contract.
@@ -597,6 +599,126 @@ pub fn origin_region() -> Result<String, InvalidationContractError> {
 
 static ORIGIN_REGION: OnceLock<String> = OnceLock::new();
 
+pub const SESSION_REVOCATION_SHARD_RECEIPT_PROOF_SQL: &str =
+    "SELECT message_id, operation_id, message_type, queue_name, payload_sha256, status \
+     FROM al_message_outbox \
+     WHERE operation_id = ? \
+     ORDER BY message_id \
+     LIMIT ?";
+
+pub fn session_revocation_shard_receipts_are_proven(
+    rows: &[(String, String, String, String, String, String)],
+    expected_payload_sha256_by_message_id: &HashMap<String, String>,
+    expected_operation_id: &str,
+) -> bool {
+    rows.len() == expected_payload_sha256_by_message_id.len()
+        && rows.iter().all(
+            |(message_id, operation_id, message_type, queue_name, payload_sha256, status)| {
+                expected_payload_sha256_by_message_id
+                    .get(message_id)
+                    .is_some_and(|expected_payload_sha256| {
+                        expected_payload_sha256 == payload_sha256
+                    })
+                    && operation_id == expected_operation_id
+                    && message_type == SESSION_REVOKED
+                    && queue_name == INVALIDATION_QUEUE
+                    && status == "PROCESSED"
+            },
+        )
+        && rows
+            .iter()
+            .map(|row| row.0.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+            == expected_payload_sha256_by_message_id.len()
+}
+
+fn canonical_session_revocation_shard_payload_sha256(
+    plan: &SessionRevocationShardPlan,
+) -> Result<String, InvalidationContractError> {
+    // The envelope digest is intentionally derived from the typed payload.
+    // Envelope metadata and the full envelope serialization are not hashed.
+    plan.event
+        .to_envelope(
+            &plan.message_id,
+            &plan.operation_id,
+            "session-revocation-receipt-proof",
+        )
+        .map(|envelope| envelope.payload_sha256)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRevocationShardProof {
+    /// The source snapshot was empty, so no typed shard was expected.
+    EmptySnapshot,
+    /// A historical v2 source row predates typed shard provenance.
+    NoTypedShards,
+    /// Every expected current typed shard is durably processed.
+    Proven,
+}
+
+pub async fn prove_session_revocation_shards_processed(
+    pool: &MySqlPool,
+    user_id: i64,
+    revoked_jtis: &[String],
+    base_operation_id: &str,
+    require_typed_shards: bool,
+) -> Result<SessionRevocationShardProof, MqError> {
+    let expected_payload_sha256_by_message_id =
+        plan_session_revocation_shards(user_id, revoked_jtis, base_operation_id)
+            .map_err(|error| MqError::Invalidation(error.to_string()))?
+            .into_iter()
+            .map(|plan| {
+                let message_id = plan.message_id.clone();
+                let payload_sha256 = canonical_session_revocation_shard_payload_sha256(&plan)
+                    .map_err(|error| MqError::Invalidation(error.to_string()))?;
+                Ok((message_id, payload_sha256))
+            })
+            .collect::<Result<HashMap<_, _>, MqError>>()?;
+    let receipt_limit = i64::try_from(
+        expected_payload_sha256_by_message_id
+            .len()
+            .saturating_add(1),
+    )
+    .map_err(|_| MqError::Invalidation("session revocation shard count overflowed".into()))?;
+    let rows: Vec<(String, String, String, String, String, String)> =
+        sqlx::query_as(SESSION_REVOCATION_SHARD_RECEIPT_PROOF_SQL)
+            .bind(base_operation_id)
+            .bind(receipt_limit)
+            .fetch_all(pool)
+            .await
+            .map_err(|error| {
+                MqError::Invalidation(format!(
+                    "session revocation shard receipt lookup failed: {error}"
+                ))
+            })?;
+    if rows.is_empty() {
+        // An empty planned set is the only valid zero-row result. A current
+        // v2 operation with one or more JTIs must have one durable PROCESSED
+        // row per planned shard; treating missing rows as legacy would hide a
+        // source-to-invalidation data-chain gap.
+        if expected_payload_sha256_by_message_id.is_empty() {
+            return Ok(SessionRevocationShardProof::EmptySnapshot);
+        }
+        if !require_typed_shards {
+            return Ok(SessionRevocationShardProof::NoTypedShards);
+        }
+        return Err(MqError::Invalidation(
+            "session revocation shard receipt barrier is missing all typed rows".into(),
+        ));
+    }
+    if session_revocation_shard_receipts_are_proven(
+        &rows,
+        &expected_payload_sha256_by_message_id,
+        base_operation_id,
+    ) {
+        return Ok(SessionRevocationShardProof::Proven);
+    }
+    Err(MqError::Invalidation(
+        "session revocation shard receipt barrier is not proven".into(),
+    ))
+}
+
 /// Append the bounded stable SESSION_REVOKED shard rows to the caller's
 /// existing source transaction.
 ///
@@ -685,6 +807,203 @@ mod tests {
             user_id: 9,
             revoked_jtis: vec!["jti-1".into()],
         })
+    }
+
+    #[test]
+    fn empty_snapshot_proof_is_distinct_from_historical_missing_shards() {
+        assert_eq!(
+            SessionRevocationShardProof::EmptySnapshot,
+            SessionRevocationShardProof::EmptySnapshot
+        );
+        assert_ne!(
+            SessionRevocationShardProof::EmptySnapshot,
+            SessionRevocationShardProof::NoTypedShards
+        );
+        assert_ne!(
+            SessionRevocationShardProof::NoTypedShards,
+            SessionRevocationShardProof::Proven
+        );
+    }
+
+    #[test]
+    fn session_revocation_receipt_proof_binds_each_message_to_inner_payload_digest() {
+        let operation_id = "receipt-proof-operation";
+        let revoked_jtis = vec!["jti-a".to_owned(), "jti-b".to_owned()];
+        let plans = plan_session_revocation_shards(9, &revoked_jtis, operation_id)
+            .expect("valid shard plan");
+        let expected = plans
+            .iter()
+            .map(|plan| {
+                let envelope = plan
+                    .event
+                    .to_envelope(&plan.message_id, &plan.operation_id, "test-region")
+                    .expect("valid shard envelope");
+                (plan.message_id.clone(), envelope.payload_sha256)
+            })
+            .collect::<HashMap<_, _>>();
+        let rows = plans
+            .iter()
+            .map(|plan| {
+                (
+                    plan.message_id.clone(),
+                    operation_id.to_owned(),
+                    SESSION_REVOKED.to_owned(),
+                    INVALIDATION_QUEUE.to_owned(),
+                    expected[&plan.message_id].clone(),
+                    "PROCESSED".to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(session_revocation_shard_receipts_are_proven(
+            &rows,
+            &expected,
+            operation_id
+        ));
+
+        let envelope = plans[0]
+            .event
+            .to_envelope(&plans[0].message_id, operation_id, "different-region")
+            .expect("valid shard envelope");
+        assert_eq!(envelope.payload_sha256, expected[&plans[0].message_id]);
+        assert_eq!(
+            envelope.payload_sha256,
+            payload_digest(&envelope.payload).expect("inner payload digest")
+        );
+        let full_envelope_digest = format!(
+            "{:x}",
+            Sha256::digest(envelope.envelope_json().expect("envelope JSON").as_bytes())
+        );
+        assert_ne!(
+            envelope.payload_sha256, full_envelope_digest,
+            "receipt proof must not hash the serialized full envelope"
+        );
+    }
+
+    #[test]
+    fn session_revocation_receipt_proof_rejects_wrong_digest() {
+        let operation_id = "receipt-wrong-digest";
+        let revoked_jtis = vec!["jti-a".to_owned()];
+        let plans = plan_session_revocation_shards(9, &revoked_jtis, operation_id)
+            .expect("valid shard plan");
+        let plan = &plans[0];
+        let envelope = plan
+            .event
+            .to_envelope(&plan.message_id, operation_id, "test-region")
+            .expect("valid shard envelope");
+        let expected = HashMap::from([(plan.message_id.clone(), envelope.payload_sha256)]);
+        let rows = vec![(
+            plan.message_id.clone(),
+            operation_id.to_owned(),
+            SESSION_REVOKED.to_owned(),
+            INVALIDATION_QUEUE.to_owned(),
+            "0".repeat(64),
+            "PROCESSED".to_owned(),
+        )];
+
+        assert!(!session_revocation_shard_receipts_are_proven(
+            &rows,
+            &expected,
+            operation_id
+        ));
+    }
+
+    #[test]
+    fn session_revocation_receipt_proof_rejects_wrong_jti_shard_content_and_digest() {
+        let operation_id = "receipt-wrong-content";
+        let revoked_jtis = vec!["jti-a".to_owned()];
+        let plans = plan_session_revocation_shards(9, &revoked_jtis, operation_id)
+            .expect("valid shard plan");
+        let plan = &plans[0];
+        let expected_envelope = plan
+            .event
+            .to_envelope(&plan.message_id, operation_id, "test-region")
+            .expect("valid shard envelope");
+        let expected = HashMap::from([(plan.message_id.clone(), expected_envelope.payload_sha256)]);
+        let wrong_event = InvalidationEvent::SessionRevoked(SessionRevoked {
+            user_id: 9,
+            revoked_jtis: vec!["jti-not-in-the-planned-shard".to_owned()],
+        });
+        let wrong_envelope = wrong_event
+            .to_envelope(&plan.message_id, operation_id, "test-region")
+            .expect("valid altered shard envelope");
+        let rows = vec![(
+            plan.message_id.clone(),
+            operation_id.to_owned(),
+            SESSION_REVOKED.to_owned(),
+            INVALIDATION_QUEUE.to_owned(),
+            wrong_envelope.payload_sha256,
+            "PROCESSED".to_owned(),
+        )];
+
+        assert_ne!(rows[0].4, expected[&plan.message_id]);
+        assert!(!session_revocation_shard_receipts_are_proven(
+            &rows,
+            &expected,
+            operation_id
+        ));
+    }
+
+    #[test]
+    fn session_revocation_receipt_proof_rejects_duplicate_extra_and_missing_rows() {
+        let operation_id = "receipt-row-set";
+        let revoked_jtis = (0..=MAX_REVOKED_JTIS)
+            .map(|index| format!("jti-{index:04}"))
+            .collect::<Vec<_>>();
+        let plans = plan_session_revocation_shards(9, &revoked_jtis, operation_id)
+            .expect("valid multi-shard plan");
+        let expected = plans
+            .iter()
+            .map(|plan| {
+                let envelope = plan
+                    .event
+                    .to_envelope(&plan.message_id, operation_id, "test-region")
+                    .expect("valid shard envelope");
+                (plan.message_id.clone(), envelope.payload_sha256)
+            })
+            .collect::<HashMap<_, _>>();
+        let rows = plans
+            .iter()
+            .map(|plan| {
+                (
+                    plan.message_id.clone(),
+                    operation_id.to_owned(),
+                    SESSION_REVOKED.to_owned(),
+                    INVALIDATION_QUEUE.to_owned(),
+                    expected[&plan.message_id].clone(),
+                    "PROCESSED".to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let duplicate = vec![rows[0].clone(), rows[0].clone()];
+        assert!(!session_revocation_shard_receipts_are_proven(
+            &duplicate,
+            &expected,
+            operation_id
+        ));
+
+        let missing = vec![rows[0].clone()];
+        assert!(!session_revocation_shard_receipts_are_proven(
+            &missing,
+            &expected,
+            operation_id
+        ));
+
+        let mut extra = rows.clone();
+        extra.push((
+            "unexpected-shard".to_owned(),
+            operation_id.to_owned(),
+            SESSION_REVOKED.to_owned(),
+            INVALIDATION_QUEUE.to_owned(),
+            "0".repeat(64),
+            "PROCESSED".to_owned(),
+        ));
+        assert!(!session_revocation_shard_receipts_are_proven(
+            &extra,
+            &expected,
+            operation_id
+        ));
     }
 
     #[test]

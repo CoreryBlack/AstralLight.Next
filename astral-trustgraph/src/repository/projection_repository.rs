@@ -11,6 +11,8 @@ use sqlx::MySqlPool;
 use astral_types::AstralError;
 use astral_types::ProjectionAggregate;
 
+use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
+
 // 事件类型常量唯一事实源在 astral-types；此处 re-export 保持既有调用方导入不变。
 pub use astral_types::{
     EVENT_TYPE_CARD_UPDATE, EVENT_TYPE_ELIGIBILITY_UPDATE, EVENT_TYPE_REVOKE,
@@ -137,8 +139,8 @@ impl SqlxProjectionRepository {
 
 /// Append a RuleSet source-correlation event with trusted actor and operation metadata.
 /// The caller owns the source transaction and the matching ledger/audit writes.
-pub async fn append_rule_set_projection_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+pub(crate) async fn append_rule_set_projection_in_tx(
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     event_type: &str,
     metadata: astral_db::ProjectionEventMetadata<'_>,
@@ -150,14 +152,14 @@ pub async fn append_rule_set_projection_in_tx(
 ///
 /// `tenant_id` is only used when the RuleSet source row has already been deleted;
 /// otherwise the shared database writer resolves the tenant from the source row.
-pub async fn append_rule_set_projection_with_tenant_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+pub(crate) async fn append_rule_set_projection_with_tenant_in_tx(
+    tx: &mut AuthorizationSourceTransaction,
     rule_set_id: i64,
     event_type: &str,
     metadata: astral_db::ProjectionEventMetadata<'_>,
     tenant_id: Option<i64>,
 ) -> Result<astral_db::ProjectionEventIdentity, AstralError> {
-    astral_db::append_projection_event_with_metadata_and_tenant_in_tx(
+    let identity = astral_db::append_projection_event_with_metadata_and_tenant_in_tx(
         tx,
         ProjectionAggregate::RuleSet,
         rule_set_id,
@@ -165,17 +167,31 @@ pub async fn append_rule_set_projection_with_tenant_in_tx(
         Some(metadata),
         tenant_id,
     )
-    .await
+    .await?;
+    tx.record_source_projection_identity(
+        ProjectionAggregate::RuleSet,
+        rule_set_id,
+        identity.clone(),
+    )?;
+    Ok(identity)
 }
 
 /// Append CARD source correlation in the caller's existing source transaction.
-pub async fn append_card_projection_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+pub(crate) async fn append_card_projection_in_tx(
+    tx: &mut AuthorizationSourceTransaction,
     card_id: i64,
     event_type: &str,
-) -> Result<(), AstralError> {
-    astral_db::append_projection_event_in_tx(tx, ProjectionAggregate::Card, card_id, event_type)
-        .await
+) -> Result<astral_db::ProjectionEventIdentity, AstralError> {
+    let identity = astral_db::append_projection_event_with_metadata_in_tx(
+        tx,
+        ProjectionAggregate::Card,
+        card_id,
+        event_type,
+        None,
+    )
+    .await?;
+    tx.record_source_projection_identity(ProjectionAggregate::Card, card_id, identity.clone())?;
+    Ok(identity)
 }
 
 /// 追加携带可信 actor/operation 元数据的 CARD 投影事件，返回 durable 事件身份。
@@ -183,20 +199,22 @@ pub async fn append_card_projection_in_tx(
 /// 审批事务把返回的 `ProjectionEventIdentity`（event/generation/fence）绑定进
 /// 授权账本 delta 必须使用返回的 ProjectionEventIdentity 绑定 event/generation/fence。
 /// 本函数不 commit，也不触发网络或物化；调用方负责事务提交或回滚。
-pub async fn append_card_projection_with_metadata_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+pub(crate) async fn append_card_projection_with_metadata_in_tx(
+    tx: &mut AuthorizationSourceTransaction,
     card_id: i64,
     event_type: &str,
     metadata: astral_db::ProjectionEventMetadata<'_>,
 ) -> Result<astral_db::ProjectionEventIdentity, AstralError> {
-    astral_db::append_projection_event_with_metadata_in_tx(
+    let identity = astral_db::append_projection_event_with_metadata_in_tx(
         tx,
         ProjectionAggregate::Card,
         card_id,
         event_type,
         Some(metadata),
     )
-    .await
+    .await?;
+    tx.record_source_projection_identity(ProjectionAggregate::Card, card_id, identity.clone())?;
+    Ok(identity)
 }
 
 #[async_trait]

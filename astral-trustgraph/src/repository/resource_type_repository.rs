@@ -110,8 +110,6 @@ pub trait ResourceTypeRepository: Send + Sync {
         actions_json: &str,
         description: Option<&str>,
     ) -> Result<bool, AstralError>;
-    /// 注销（DELETE），返回是否命中
-    async fn delete_registry(&self, resource_type: &str) -> Result<bool, AstralError>;
     /// 异步扫描用：INSERT ... ON DUPLICATE KEY UPDATE
     async fn upsert_registry(
         &self,
@@ -205,15 +203,6 @@ impl ResourceTypeRepository for SqlxResourceTypeRepository {
         .execute(&self.db)
         .await
         .map_err(db_error)?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    async fn delete_registry(&self, resource_type: &str) -> Result<bool, AstralError> {
-        let result = sqlx::query("DELETE FROM resource_type_registry WHERE resource_type = ?")
-            .bind(resource_type)
-            .execute(&self.db)
-            .await
-            .map_err(db_error)?;
         Ok(result.rows_affected() > 0)
     }
 

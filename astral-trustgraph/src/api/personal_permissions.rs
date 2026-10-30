@@ -337,6 +337,7 @@ async fn revoke_user_permission(
 mod tests {
     use super::*;
 
+    use crate::repository::authorization_source_transaction::CommittedProjectionReceipts;
     use crate::repository::global_admin_repository::{
         DisableOutcome, GlobalAdminGrantOutcome, GlobalAdminRecord,
     };
@@ -586,12 +587,12 @@ mod tests {
             _operation_id: &str,
             _expected_tenant_id: i64,
             _expected_domain_id: i64,
-        ) -> Result<bool, AstralError> {
+        ) -> Result<Option<CommittedProjectionReceipts>, AstralError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push("bind_card_async_batch_item".into());
-            Ok(false)
+            Ok(None)
         }
 
         async fn find_conflicts(

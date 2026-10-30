@@ -2,6 +2,12 @@
 
 本目录公开 final9/S15 的可执行 harness 源码、历史报告/结果副本和安全边界。历史资产继承自私有仓库 S15 提交 `b38aaa7680f6c80e6841d05a17e08cd0e50627b1`，节点地址已脱敏；历史结果只用于回溯场景与测量方法，不代表当前仓库代码或当前部署的验证结果。
 
+> CURRENT V6 证据边界：本目录的三节点、Redis、OPA 和 Chat/Learn 相关叙述均属于历史
+> baseline/comparison 或 retired compatibility evidence。历史报告中的 `PASS`、Redis
+> 故障注入和真实网络数字保持原样，但不是当前 runtime、当前 Redis 依赖或真实集成
+> `PASS`。当前 native profile 不以本 harness 的旧部署合同作为验收入口；`UNKNOWN`/
+> `PENDING` 仍需完整 receipt/evidence 对账，不能由旧日志或 ACK 晋级。
+
 **入口：** `run_cs_evidence.py`（可执行编排器）。本目录代码只能在显式提供的受保护三节点环境中运行，不能把源仓库历史结果当作当前仓库验证。
 
 ## 当前架构边界

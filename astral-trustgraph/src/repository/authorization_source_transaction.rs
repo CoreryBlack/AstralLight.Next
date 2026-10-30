@@ -63,6 +63,20 @@ pub(crate) struct InvalidationReceipt {
     pub envelope: MessageEnvelope,
 }
 
+/// Exact legacy source projection event receipt staged in one source transaction.
+///
+/// This is the identity of the row in `authorization_projection_outbox`, not a
+/// completion proof. The waiter proves the same row reached `PROCESSED`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceProjectionReceipt {
+    pub event_id: String,
+    pub aggregate_type: String,
+    pub aggregate_id: i64,
+    pub tenant_id: Option<i64>,
+    pub source_generation: i64,
+    pub revoke_fence: i64,
+}
+
 /// Post-commit invalidation dispatch result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvalidationDispatchOutcome {
@@ -76,8 +90,10 @@ pub(crate) enum InvalidationDispatchOutcome {
 /// Exact projection requests staged in one source transaction and returned only
 /// after COMMIT was proven. This is a correlation batch, not a completion proof.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct CommittedProjectionReceipts {
-    pub requests: Vec<astral_db::DeltaEventAppendRequest>,
+pub struct CommittedProjectionReceipts {
+    pub(crate) requests: Vec<astral_db::DeltaEventAppendRequest>,
+    pub(crate) source_projection_receipts: Vec<SourceProjectionReceipt>,
+    pub(crate) invalidation_receipts: Vec<InvalidationReceipt>,
 }
 
 /// Post-commit invalidation dispatcher.
@@ -322,7 +338,23 @@ fn stage_projection_receipt_into(
     Ok(())
 }
 
-/// 授权源事务的进程内活动栅栏。
+fn append_unique_source_projection_receipt(
+    receipts: &mut Vec<SourceProjectionReceipt>,
+    receipt: SourceProjectionReceipt,
+) -> Result<(), AstralError> {
+    if receipts
+        .iter()
+        .any(|existing| existing.event_id == receipt.event_id)
+    {
+        return Err(AstralError::Validation(format!(
+            "duplicate source projection receipt event id: {}",
+            receipt.event_id
+        )));
+    }
+    receipts.push(receipt);
+    Ok(())
+}
+
 ///
 /// 直接持有 hub 的 owned RAII `SourceTransactionGuard`（begin 先增
 /// `active_source_writers` + `mutation_revision`，Drop 减计数并 bump
@@ -359,6 +391,8 @@ pub(crate) struct AuthorizationSourceTransaction {
     pool: sqlx::MySqlPool,
     /// typed invalidation envelopes appended to the durable outbox in-tx.
     receipts: Vec<InvalidationReceipt>,
+    /// exact legacy source projection identities appended in the same tx.
+    source_projection_receipts: Vec<SourceProjectionReceipt>,
     /// 完整 projection delta requests 已在事务内 append 成 durable 行，
     /// commit 证明后直接发送；与 durable 行同一请求，commit 后不 reload。
     projection_receipts: Vec<astral_db::DeltaEventAppendRequest>,
@@ -396,9 +430,32 @@ impl AuthorizationSourceTransaction {
             tx,
             pool: pool.clone(),
             receipts: Vec::new(),
+            source_projection_receipts: Vec::new(),
             projection_receipts: Vec::new(),
             _activity_fence,
         })
+    }
+
+    /// 登记一条已在**本事务内** append 成 durable source projection outbox 行的
+    /// exact identity。调用方可在 commit 后等待这条 legacy source event 达到
+    /// `PROCESSED`，从而把 CARD/ELIGIBILITY source correlation 纳入同一 barrier。
+    pub(crate) fn record_source_projection_receipt(
+        &mut self,
+        receipt: SourceProjectionReceipt,
+    ) -> Result<(), AstralError> {
+        if receipt.event_id.trim().is_empty()
+            || receipt.aggregate_type.trim().is_empty()
+            || receipt.aggregate_id <= 0
+            || receipt.tenant_id.is_some_and(|tenant_id| tenant_id <= 0)
+            || receipt.source_generation <= 0
+            || receipt.revoke_fence < 0
+            || receipt.revoke_fence > receipt.source_generation
+        {
+            return Err(AstralError::Validation(
+                "source projection receipt identity is invalid".into(),
+            ));
+        }
+        append_unique_source_projection_receipt(&mut self.source_projection_receipts, receipt)
     }
 
     /// 登记一条已在**本事务内** append 进 durable outbox 的 invalidation receipt。
@@ -407,6 +464,25 @@ impl AuthorizationSourceTransaction {
     /// pointer 的路径不产生 receipt。
     pub(crate) fn record_invalidation_receipt(&mut self, receipt: InvalidationReceipt) {
         self.receipts.push(receipt);
+    }
+
+    /// Register an exact source projection identity returned by the shared
+    /// append helper. This keeps source correlation in the same commit batch as
+    /// deltas and invalidation receipts.
+    pub(crate) fn record_source_projection_identity(
+        &mut self,
+        aggregate: ProjectionAggregate,
+        aggregate_id: i64,
+        identity: astral_db::ProjectionEventIdentity,
+    ) -> Result<(), AstralError> {
+        self.record_source_projection_receipt(SourceProjectionReceipt {
+            event_id: identity.event_id,
+            aggregate_type: aggregate.as_str().to_owned(),
+            aggregate_id,
+            tenant_id: identity.tenant_id,
+            source_generation: identity.source_generation,
+            revoke_fence: identity.revoke_fence,
+        })
     }
 
     /// 登记一条已在**本事务内** append 成 durable 行的完整 projection delta
@@ -467,7 +543,7 @@ impl AuthorizationSourceTransaction {
                 invalidation_dispatcher,
             )
             .await?;
-        crate::service::sync_publish::after_commit_wait_for_projection(&pool, &receipts).await;
+        crate::service::sync_publish::require_committed_receipts(&pool, &receipts).await?;
         Ok(())
     }
 
@@ -489,10 +565,16 @@ impl AuthorizationSourceTransaction {
         }
         let commit_result = self.tx.commit().await;
         let commit_elapsed = commit_started.elapsed();
-        // 唯一发送决策点：commit 未知/失败 ⇒ 两类 receipts 都是空集，绝不发送。
+        // 唯一发送决策点：commit 未知/失败 ⇒ 三类 receipts 都是空集，绝不发送。
         let deltas = receipts_for_proven_commit(&mut self.projection_receipts, &commit_result);
+        let source_projection_receipts =
+            receipts_for_proven_commit(&mut self.source_projection_receipts, &commit_result);
         let invalidations = receipts_for_proven_commit(&mut self.receipts, &commit_result);
-        let (delta_count, invalidation_count) = (deltas.len(), invalidations.len());
+        let (delta_count, source_projection_count, invalidation_count) = (
+            deltas.len(),
+            source_projection_receipts.len(),
+            invalidations.len(),
+        );
         if let Err(error) = commit_result {
             // SQL commit Err 无法证明回滚（真实结果可能已提交）：保守把 hub 标记为
             // uncertain（sticky），在线 reconcile 不得清理与本 writer 相关的 pending；
@@ -504,6 +586,8 @@ impl AuthorizationSourceTransaction {
         }
         let committed_projection_receipts = CommittedProjectionReceipts {
             requests: deltas.clone(),
+            source_projection_receipts: source_projection_receipts.clone(),
+            invalidation_receipts: invalidations.clone(),
         };
         // 只有 Ok 证明才 disarm：disarm 只复位本 guard 自身的 unproven 标志，
         // 另一 writer 造成的 hub uncertain 是 sticky 的，绝不在本 writer 的
@@ -513,6 +597,7 @@ impl AuthorizationSourceTransaction {
         }
         tracing::debug!(
             projection_receipts = delta_count,
+            source_projection_receipts = source_projection_count,
             invalidation_receipts = invalidation_count,
             commit_elapsed_ms = commit_elapsed.as_millis() as u64,
             "authorization source commit proven; dispatching projection deltas and invalidation receipts"
@@ -602,6 +687,11 @@ pub(crate) async fn append_eligibility_projection_with_invalidation_in_tx(
         None,
     )
     .await?;
+    tx.record_source_projection_identity(
+        ProjectionAggregate::Eligibility,
+        card_id,
+        identity.clone(),
+    )?;
     // 2) durable invalidation intent：同一 envelope 实例落 outbox + receipt。
     let origin_region = crate::repository::invalidation_repository::origin_region()?;
     let (event, envelope) = eligibility_invalidation_envelope(
@@ -875,6 +965,25 @@ mod tests {
             compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.into(),
             next_attempt_at: None,
         }
+    }
+
+    #[test]
+    fn duplicate_source_projection_receipts_fail_closed() {
+        let receipt = SourceProjectionReceipt {
+            event_id: "source-event-1".into(),
+            aggregate_type: ProjectionAggregate::CARD.to_owned(),
+            aggregate_id: 42,
+            tenant_id: Some(7),
+            source_generation: 1,
+            revoke_fence: 0,
+        };
+        let mut receipts = vec![receipt.clone()];
+        assert!(matches!(
+            append_unique_source_projection_receipt(&mut receipts, receipt),
+            Err(AstralError::Validation(message))
+                if message.contains("duplicate source projection receipt")
+        ));
+        assert_eq!(receipts.len(), 1);
     }
 
     #[test]

@@ -21,6 +21,9 @@ pub enum MqError {
 
     #[error("Idempotent check failed: {0}")]
     Idempotent(String),
+
+    #[error("Invalidation contract failed: {0}")]
+    Invalidation(String),
 }
 
 impl From<LapinError> for MqError {

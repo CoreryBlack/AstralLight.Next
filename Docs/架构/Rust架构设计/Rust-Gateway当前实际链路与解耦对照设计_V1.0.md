@@ -2,9 +2,11 @@
 
 > 版本：V1.0
 > 日期：2026-08-11
-> 适用：AstralLight-Rust（`` workspace）Gateway 层，以及与其相连的下游服务（Identity / Learn / Chat / TrustGraph / Monitor）。
+> 适用：AstralLight-Rust（`` workspace）Gateway 层及其在 2026-08-11 历史快照中的下游服务链路（Identity / Learn / Chat / TrustGraph / Monitor）；Learn/Chat 相关描述不是当前生产服务或 API。
 > 读者：负责 Rust 服务边界重构、网关解耦的开发者与架构评审。
 > 文档性质：**2026-08-11 当前态历史快照 + 解耦目标对照**。本文档记录该日期代码边界内的链路与耦合；目标态一律显式标注"目标态，非当前实现"，不代表 2026-08-22 已对全文重新核验。
+>
+> **现状更新（2026-10-29）**：本文中 Chat/Learn 运行时、Gateway 转发、WebSocket 桥、路由、内部会话和相关耦合均是 2026-08-11 的历史源码证据，不是现行服务或 API 声明。Rust `astral-chat`、`astral-learn` 生产 runtime crates 及其 Gateway routes/proxies 已退役并已从本 checkout 物理移除。`integrations/` 下独立 SDK consumer samples 仅供示例/测试，不是生产服务替代品。
 
 ---
 
@@ -35,9 +37,9 @@
 
 ## 2. 当前 Rust workspace 状态
 
-### 2.1 workspace 成员与 exclude
+### 2.1 2026-08-11 workspace 成员与 exclude（历史快照）
 
-来源：`Cargo.toml`（顶部注释原文：`# Learn/Chat 源码暂存但冻结：默认 workspace 不纳入这两个服务，待新规范建立后再恢复。`）。
+以下 workspace 清单与 `Cargo.toml` 注释只记录当时的源码边界，不描述当前生产 crate 状态。来源：当时的 `Cargo.toml`（顶部注释原文：`# Learn/Chat 源码暂存但冻结：默认 workspace 不纳入这两个服务，待新规范建立后再恢复。`）。
 
 ```toml
 members = [
@@ -59,16 +61,16 @@ resolver = "2"
 - **保留在 workspace 并参与编译**：`astral-gateway`、`astral-identity`、`astral-trustgraph`、`astral-monitor`、`astral-common`、`astral-db`、`astral-cache`、`astral-mq`、`astral-types`、`policy-engine`。
 - **源码保留但已 exclude（编译冻结）**：`astral-learn`、`astral-chat`。两者源码仍在 `astral-learn/`、`astral-chat/` 下（各自含 `src/main.rs`、`src/service/`、`src/repository/`、`src/srv/` 等），但不参与 `cargo build` / `cargo test` 的 workspace 编译。
 
-### 2.2 exclude 只表示编译冻结，不等于 HTTP 解耦
+### 2.2 历史快照（2026-08-11）：exclude 只表示编译冻结，不等于当时的 HTTP 解耦
 
-需要明确的事实（均有代码佐证）：
+以下是 2026-08-11 代码快照中记录的历史事实（当时有代码佐证；不代表当前服务或路由存在）：
 
-1. **Learn 仍依赖 Gateway 转发路径**：`astral-gateway/src/main.rs` 中硬编码注册 `/v1/admin/learn/{*path}`、`/v1/app/learn/{*path}`、`/v1/app/users/{*path}`、`/duo/v1/**`（learn 兼容）等路由，转发目标仍为 `config.learn_service_uri`（`astral-gateway/src/proxy.rs` 的 `forward_to_learn_admin` / `forward_to_learn_app` / `forward_to_learn_app_users` 等）。
-2. **Chat 仍依赖 Gateway 转发与 WS 桥**：`forward_to_chat`（HTTP）与 `forward_chat_ws`（WebSocket 双向桥）均在 `astral-gateway/src/proxy.rs`。
-3. **Learn 的内部会话请求经过 Gateway**：`astral-learn/src/service/app_user_service.rs::HmacAppSessionIssuer` 使用 `gateway_service_uri`，向 Gateway `POST /api/v1/auth/internal/sessions` 发送 `astral-internal-v1` 的 Learn→Gateway 断言（[app_user_service.rs:42](../../../astral-learn/src/service/app_user_service.rs#L42)、[app_user_service.rs:72-L103](../../../astral-learn/src/service/app_user_service.rs#L72-L103)）。Gateway 在 [main.rs:205-L221](../../../astral-gateway/src/main.rs#L205-L221) 注册该路由，在 [middleware.rs:680-L680](../../../astral-gateway/src/middleware.rs#L680) 及 [middleware.rs:789-L827](../../../astral-gateway/src/middleware.rs#L789-L827) 校验 Learn→Gateway 断言；随后 [proxy.rs:257-L383](../../../astral-gateway/src/proxy.rs#L257-L383) 以 Gateway→Identity 内部断言转发。Identity 在 [internal.rs:341-L365](../../../astral-identity/src/srv/internal.rs#L341-L365) 验证该内部请求，并在 [internal.rs:389-L400](../../../astral-identity/src/srv/internal.rs#L389-L400) 确保身份卡后，通过 [auth.rs:251-L293](../../../astral-identity/src/auth.rs#L251-L293) 的 identity-only 签发路径创建 AppUser 会话。该链路不等于 PlatformUser 的完整双卡策略链，但仍是已认证的内部控制流。
-4. **Learn / Chat 仍引用 `astral-common` 的共享中间件**：`astral-learn/src/main.rs` 与 `astral-chat/src/main.rs` 均使用 `astral_common::middleware::gateway_signature::gateway_signature_middleware`、`astral_common::audit`、`astral_common::service`（MQ producer 抽象）等；exclude 仅使它们不再被 workspace 编译，源码层面的共享依赖原样保留。
+1. **Learn 在该快照中依赖 Gateway 转发路径**：当时 `astral-gateway/src/main.rs` 硬编码注册 `/v1/admin/learn/{*path}`、`/v1/app/learn/{*path}`、`/v1/app/users/{*path}`、`/duo/v1/**`（learn 兼容）等路由，转发目标为 `config.learn_service_uri`（`astral-gateway/src/proxy.rs` 的 `forward_to_learn_admin` / `forward_to_learn_app` / `forward_to_learn_app_users` 等）。
+2. **Chat 在该快照中依赖 Gateway 转发与 WS 桥**：当时 `forward_to_chat`（HTTP）与 `forward_chat_ws`（WebSocket 双向桥）位于 `astral-gateway/src/proxy.rs`。
+3. **Learn 的内部会话请求在该快照中经过 Gateway**：当时 `astral-learn/src/service/app_user_service.rs::HmacAppSessionIssuer` 使用 `gateway_service_uri`，向 Gateway `POST /api/v1/auth/internal/sessions` 发送 `astral-internal-v1` 的 Learn→Gateway 断言（[app_user_service.rs:42](../../../astral-learn/src/service/app_user_service.rs#L42)、[app_user_service.rs:72-L103](../../../astral-learn/src/service/app_user_service.rs#L72-L103)）。Gateway 当时在 [main.rs:205-L221](../../../astral-gateway/src/main.rs#L205-L221) 注册该路由，在 [middleware.rs:680-L680](../../../astral-gateway/src/middleware.rs#L680) 及 [middleware.rs:789-L827](../../../astral-gateway/src/middleware.rs#L789-L827) 校验 Learn→Gateway 断言；随后 [proxy.rs:257-L383](../../../astral-gateway/src/proxy.rs#L257-L383) 以 Gateway→Identity 内部断言转发。Identity 当时在 [internal.rs:341-L365](../../../astral-identity/src/srv/internal.rs#L341-L365) 验证该内部请求，并在 [internal.rs:389-L400](../../../astral-identity/src/srv/internal.rs#L389-L400) 确保身份卡后，通过 [auth.rs:251-L293](../../../astral-identity/src/auth.rs#L251-L293) 的 identity-only 签发路径创建 AppUser 会话。该快照中的链路不等于 PlatformUser 的完整双卡策略链，但属于已认证的内部控制流。
+4. **Learn / Chat 源码在该快照中引用 `astral-common` 共享中间件**：当时 `astral-learn/src/main.rs` 与 `astral-chat/src/main.rs` 使用 `astral_common::middleware::gateway_signature::gateway_signature_middleware`、`astral_common::audit`、`astral_common::service`（MQ producer 抽象）等；exclude 仅使它们不参与 workspace 编译，源码层面的共享依赖当时仍保留。
 
-因此：**exclude = 编译冻结；HTTP 解耦尚未开始**。后续解冻 Learn/Chat 时，共享依赖与内部会话 wire contract 必须先按第 7 章门禁处理。
+因此：**在 2026-08-11 快照中，exclude = 编译冻结，HTTP 解耦尚未开始**。该历史结论不描述当前服务或路由状态；下文的解耦路线也只保留为历史目标记录。
 
 ### 2.3 workspace 级依赖（仅列与 Gateway 相关的关键项）
 
@@ -386,7 +388,7 @@ AppUser 不注入 user-card 三头（claims 校验已强制其为空）。
 - 没有独立的"纯 wire contract"crate：Gateway 运行时（redis/jsonwebtoken）与下游权限运行时（policy-engine/astral-db）在同一 crate 内，无法独立演进与复用（例如未来 Java/其他语言的 wire 消费者）。
 - **收敛说明（当前态）**：Gateway 专属运行时已部分收敛（`astral-gateway/src/middleware.rs` / `src/rate_limit.rs`），纯 wire contract crate 仍未建立，`SessionGrant` 仍双声明。
 
-### 6.7 Learn→Gateway→Identity 内部会话两跳（冻结源码仍在 workspace 外）
+### 6.7 Learn→Gateway→Identity 内部会话两跳（历史源码快照）
 
 - `astral-learn/src/service/app_user_service.rs::HmacAppSessionIssuer` 使用 `gateway_service_uri`，向 Gateway `POST /api/v1/auth/internal/sessions` 发送 `astral-internal-v1` Learn→Gateway assertion（[app_user_service.rs:42](../../../astral-learn/src/service/app_user_service.rs#L42)）。
 - Gateway 在 [main.rs:205](../../../astral-gateway/src/main.rs#L205) 注册该 exact route；[middleware.rs:680](../../../astral-gateway/src/middleware.rs#L680) 的专用 middleware 校验请求，且 [middleware.rs:755](../../../astral-gateway/src/middleware.rs#L755) 起读取并验证用户、协议、route、timestamp、nonce、request-id、幂等键和签名上下文。

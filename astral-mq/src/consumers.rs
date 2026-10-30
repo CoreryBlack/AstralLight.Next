@@ -976,8 +976,8 @@ fn classify_relay_bus_failure(error: LocalBusError) -> LocalInvalidationRelayOut
 
 /// DLQ 消费归属。
 ///
-/// `start_dlq_consumers` 只接受这两个当前有明确 owner 的值；没有 owner 的
-/// Learn/Chat/Duo 队列仍保留在 topology，但不会被任何当前服务消费。
+/// `start_dlq_consumers` 只接受这两个当前有明确 owner 的值；其他队列不会被
+/// Identity 或 TrustGraph 的 DLQ consumer 领取。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DlqOwner {
     Identity,
@@ -1811,8 +1811,8 @@ struct DlqOwnerMapping {
     owner: Option<DlqOwner>,
 }
 
-/// Complete static classification of all topology queues. `None` is an explicit
-/// no-current-owner classification, not permission for either service to consume.
+/// Complete static classification of all active topology queues. `None` is an
+/// explicit no-current-owner classification, not permission to consume.
 const DLQ_OWNER_MAP: &[DlqOwnerMapping] = &[
     DlqOwnerMapping {
         queue_name: QUEUE_AUDIT_LOG,
@@ -1823,44 +1823,12 @@ const DLQ_OWNER_MAP: &[DlqOwnerMapping] = &[
         owner: None,
     },
     DlqOwnerMapping {
-        queue_name: crate::config::QUEUE_LEARNING_PROGRESS,
-        owner: None,
-    },
-    DlqOwnerMapping {
         queue_name: QUEUE_LOGIN_EVENT,
         owner: Some(DlqOwner::Identity),
     },
     DlqOwnerMapping {
-        queue_name: crate::config::QUEUE_SUBJECT_DELETE,
-        owner: None,
-    },
-    DlqOwnerMapping {
         queue_name: QUEUE_AUTH_SESSION_REVOCATION,
         owner: Some(DlqOwner::Identity),
-    },
-    DlqOwnerMapping {
-        queue_name: crate::config::QUEUE_CHAT_MESSAGE,
-        owner: None,
-    },
-    DlqOwnerMapping {
-        queue_name: crate::config::QUEUE_BUSINESS_CHAT,
-        owner: None,
-    },
-    DlqOwnerMapping {
-        queue_name: crate::config::QUEUE_DELIVERY_ACK,
-        owner: None,
-    },
-    DlqOwnerMapping {
-        queue_name: crate::config::QUEUE_READ_RECEIPT,
-        owner: None,
-    },
-    DlqOwnerMapping {
-        queue_name: crate::config::QUEUE_QUESTION_COMMENT,
-        owner: None,
-    },
-    DlqOwnerMapping {
-        queue_name: crate::config::QUEUE_QUESTION_SHARE,
-        owner: None,
     },
 ];
 
@@ -3773,7 +3741,7 @@ mod tests {
             false
         )));
         assert!(!terminal_capture_selected(&test_context(
-            crate::config::QUEUE_SUBJECT_DELETE,
+            crate::config::QUEUE_NOTIFICATION,
             true
         )));
     }
@@ -3782,7 +3750,7 @@ mod tests {
     fn terminal_capture_success_acks_only_after_capture() {
         let audit = test_context(QUEUE_AUDIT_LOG, true);
         let login = test_context(QUEUE_LOGIN_EVENT, true);
-        let ordinary = test_context(crate::config::QUEUE_SUBJECT_DELETE, false);
+        let ordinary = test_context(crate::config::QUEUE_NOTIFICATION, false);
         assert_eq!(
             terminal_capture_action(
                 &audit,
@@ -4048,8 +4016,7 @@ mod tests {
             &[QUEUE_LOGIN_EVENT, QUEUE_AUTH_SESSION_REVOCATION]
         );
         assert_eq!(TRUSTGRAPH_DLQ_QUEUES, &[QUEUE_AUDIT_LOG]);
-        assert!(!IDENTITY_DLQ_QUEUES.contains(&crate::config::QUEUE_CHAT_MESSAGE));
-        assert!(!TRUSTGRAPH_DLQ_QUEUES.contains(&crate::config::QUEUE_LEARNING_PROGRESS));
+        assert_eq!(crate::config::QUEUES.len(), DLQ_OWNER_MAP.len());
     }
 
     #[test]

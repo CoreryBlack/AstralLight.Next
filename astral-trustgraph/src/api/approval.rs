@@ -402,16 +402,16 @@ mod tests {
     #[test]
     fn canonical_rule_content_is_normalized_and_preserved() {
         let (content, value) = normalize_rule_content(&serde_json::json!({
-            "resourceType": "  learn_course ",
+            "resourceType": "  permission_rule ",
             "actionCode": " read ",
             "cardId": 7
         }))
         .expect("canonical RULE content should be valid");
 
-        assert_eq!(content.resource_type, "learn_course");
+        assert_eq!(content.resource_type, "permission_rule");
         assert_eq!(content.action_code, "read");
         assert_eq!(content.card_id, Some(7));
-        assert_eq!(value["resourceType"], "learn_course");
+        assert_eq!(value["resourceType"], "permission_rule");
         assert_eq!(value["actionCode"], "read");
         assert_eq!(value["cardId"], 7);
     }
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn rule_submission_effect_is_allow_only() {
         let (content, value) = normalize_rule_content(&serde_json::json!({
-            "resourceType": "learn_course",
+            "resourceType": "permission_rule",
             "actionCode": "read",
             "cardId": 7,
             "effect": " allow "
@@ -430,7 +430,7 @@ mod tests {
 
         for rejected in ["DENY", "deny", "GRANT", "", "   "] {
             let error = normalize_rule_content(&serde_json::json!({
-                "resourceType": "learn_course",
+                "resourceType": "permission_rule",
                 "actionCode": "read",
                 "cardId": 7,
                 "effect": rejected
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn legacy_rule_aliases_are_rejected() {
         let error = normalize_rule_content(&serde_json::json!({
-            "resource": "learn_course",
+            "resource": "permission_rule",
             "action": "read",
             "card_id": 7
         }))
@@ -472,7 +472,7 @@ mod tests {
         let error = serde_json::from_value::<PermissionRequestSubmit>(serde_json::json!({
             "requestType": "RULE",
             "requestContent": {
-                "resourceType": "learn_course",
+                "resourceType": "permission_rule",
                 "actionCode": "read"
             },
             "reason": "test",

@@ -43,12 +43,12 @@ fn client() -> Arc<SdkClient> {
 
 fn binding() -> Arc<ApplicationBinding> {
     use ed25519_dalek::SigningKey;
-    let mut builder = ManifestBuilder::new("chat_app", "manifest-1");
+    let mut builder = ManifestBuilder::new("messaging_app", "manifest-1");
     builder
         .ordinary(
             "GET",
             "/messages/{id}",
-            "chat_message",
+            "message_record",
             None,
             ResourceOperation::ScopedCollection,
             ResourceResolver::ScopedCollection {
@@ -57,7 +57,7 @@ fn binding() -> Arc<ApplicationBinding> {
         )
         .unwrap();
     Arc::new(ApplicationBinding {
-        app_id: "chat_app".into(),
+        app_id: "messaging_app".into(),
         key_id: "client_key".into(),
         manifest: Arc::new(builder.build().unwrap()),
         signing_key: SigningKey::from_bytes(&[7; 32]),
@@ -101,12 +101,12 @@ async fn undeclared_route_is_denied_before_actor_or_handler() {
 
 #[test]
 fn manifest_builder_fails_closed_and_requires_explicit_special_actions() {
-    let mut missing_special = ManifestBuilder::new("chat_app", "manifest-1");
+    let mut missing_special = ManifestBuilder::new("messaging_app", "manifest-1");
     assert!(missing_special
         .ordinary(
             "TRACE",
             "/messages/{id}",
-            "chat_message",
+            "message_record",
             None,
             ResourceOperation::Object,
             ResourceResolver::Object {
@@ -115,12 +115,12 @@ fn manifest_builder_fails_closed_and_requires_explicit_special_actions() {
         )
         .is_err());
 
-    let mut duplicates = ManifestBuilder::new("chat_app", "manifest-1");
+    let mut duplicates = ManifestBuilder::new("messaging_app", "manifest-1");
     duplicates
         .ordinary(
             "GET",
             "/messages/{id}",
-            "chat_message",
+            "message_record",
             None,
             ResourceOperation::ScopedCollection,
             ResourceResolver::ScopedCollection {
@@ -132,7 +132,7 @@ fn manifest_builder_fails_closed_and_requires_explicit_special_actions() {
         .special(
             "GET",
             "/messages/{id}",
-            "chat_message",
+            "message_record",
             "export",
             ResourceOperation::ScopedCollection,
             ResourceResolver::ScopedCollection {
@@ -140,7 +140,19 @@ fn manifest_builder_fails_closed_and_requires_explicit_special_actions() {
             },
         )
         .is_err());
-    assert!(ManifestBuilder::new("chat_app", "manifest-1")
+    assert!(ManifestBuilder::new("messaging_app", "manifest-1")
         .build()
         .is_err());
+}
+
+#[test]
+fn public_head_cannot_shadow_protected_get_route() {
+    let layer = AuthorizationLayer::new(
+        client(),
+        binding(),
+        Arc::new(NeverResolve),
+        Arc::new(NeverFacts),
+    )
+    .unwrap();
+    assert!(layer.public_route("HEAD", "/messages/123").is_err());
 }

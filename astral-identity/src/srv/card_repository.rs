@@ -52,40 +52,10 @@ pub struct CardFilter {
     pub status: Option<String>,
 }
 
-/// identity_card 基础行（app 会话签发读取；对应 internal.rs 原局部 struct）
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct IdentityCardRow {
-    pub card_id: Option<i64>,
-    pub user_id: i64,
-    pub status: String,
-    pub token_version: Option<i64>,
-    pub expires_at: Option<String>,
-}
-
 #[async_trait]
 pub trait CardRepository: Send + Sync {
     /// 校验用户存在 ACTIVE 的 identity_card，返回其 card_id。
     async fn find_active_identity_card(&self, user_id: i64) -> Result<Option<i64>, AstralError>;
-
-    /// 查询用户 ACTIVE 的 identity_card 完整行（app 会话签发用，按 card_id 升序取首条）。
-    async fn find_active_identity_card_row(
-        &self,
-        user_id: i64,
-    ) -> Result<Option<IdentityCardRow>, AstralError>;
-
-    /// Ensure an APP_USER identity-only card exists without creating a user card.
-    /// The boolean reports whether this call created the card for compensation.
-    async fn ensure_active_identity_card(
-        &self,
-        user_id: i64,
-    ) -> Result<(IdentityCardRow, bool), AstralError>;
-
-    /// Remove only a card created by the current app-session attempt.
-    async fn delete_created_identity_card(
-        &self,
-        user_id: i64,
-        card_id: i64,
-    ) -> Result<(), AstralError>;
 
     /// 创建模板绑定用户卡（授权 source mutation）。
     ///
@@ -161,127 +131,6 @@ impl CardRepository for SqlxCardRepository {
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AstralError::Database(format!("Query identity_card failed: {e}")))
-    }
-
-    async fn find_active_identity_card_row(
-        &self,
-        user_id: i64,
-    ) -> Result<Option<IdentityCardRow>, AstralError> {
-        sqlx::query_as::<_, IdentityCardRow>(
-            "SELECT card_id, user_id, status, token_version, \
-             DATE_FORMAT(expires_at, '%Y-%m-%dT%H:%i:%sZ') AS expires_at \
-             FROM identity_card WHERE user_id = ? AND status = 'ACTIVE' \
-               AND (expires_at IS NULL OR expires_at >= UTC_TIMESTAMP()) \
-             ORDER BY card_id LIMIT 1",
-        )
-        .bind(user_id)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AstralError::Database(format!("Query identity_card failed: {e}")))
-    }
-
-    async fn ensure_active_identity_card(
-        &self,
-        user_id: i64,
-    ) -> Result<(IdentityCardRow, bool), AstralError> {
-        // hub 已装时先登记卡事实写者（writer-active 期间辅助读面 fail-closed）。
-        let source_guard = begin_card_source_transaction()?;
-        let mut tx = self.db.begin().await.map_err(|e| {
-            AstralError::Database(format!("Begin identity card ensure tx failed: {e}"))
-        })?;
-        let existing_user: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM app_user WHERE id = ? AND status = 'ACTIVE' FOR UPDATE")
-                .bind(user_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| AstralError::Database(format!("Query app_user failed: {e}")))?;
-        if existing_user.is_none() {
-            return Err(AstralError::NotFound("app user not found".into()));
-        }
-        let existing_platform_user: Option<(i64,)> = sqlx::query_as(
-            "SELECT user_id FROM platform_user \
-             WHERE user_id = ? AND status = 'ACTIVE' AND deleted_at IS NULL FOR UPDATE",
-        )
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| AstralError::Database(format!("Query platform user mapping failed: {e}")))?;
-        if existing_platform_user.is_none() {
-            return Err(AstralError::Permission(
-                "App user has no mapped active platform identity".into(),
-            ));
-        }
-
-        let existing = sqlx::query_as::<_, IdentityCardRow>(
-            "SELECT card_id, user_id, status, token_version, \
-             DATE_FORMAT(expires_at, '%Y-%m-%dT%H:%i:%sZ') AS expires_at \
-             FROM identity_card WHERE user_id = ? AND status = 'ACTIVE' \
-               AND (expires_at IS NULL OR expires_at >= UTC_TIMESTAMP()) \
-             ORDER BY card_id LIMIT 1 FOR UPDATE",
-        )
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| AstralError::Database(format!("Query identity_card failed: {e}")))?;
-        if let Some(card) = existing {
-            arm_card_commit_fence(&source_guard);
-            let commit_result = tx.commit().await;
-            settle_card_commit_fence(&source_guard, &commit_result);
-            commit_result.map_err(|e| {
-                AstralError::Database(format!("Commit identity card ensure failed: {e}"))
-            })?;
-            return Ok((card, false));
-        }
-
-        let result = sqlx::query(
-            "INSERT INTO identity_card (user_id, status, token_version) VALUES (?, 'ACTIVE', 1)",
-        )
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AstralError::Database(format!("Create identity_card failed: {e}")))?;
-        let card_id = result.last_insert_id() as i64;
-        let card = IdentityCardRow {
-            card_id: Some(card_id),
-            user_id,
-            status: "ACTIVE".into(),
-            token_version: Some(1),
-            expires_at: None,
-        };
-        arm_card_commit_fence(&source_guard);
-        let commit_result = tx.commit().await;
-        settle_card_commit_fence(&source_guard, &commit_result);
-        commit_result.map_err(|e| {
-            AstralError::Database(format!("Commit identity card ensure failed: {e}"))
-        })?;
-        Ok((card, true))
-    }
-
-    async fn delete_created_identity_card(
-        &self,
-        user_id: i64,
-        card_id: i64,
-    ) -> Result<(), AstralError> {
-        // autocommit 写点同样必须持栅栏（不能因无 pool.begin 省略）：hub 已装
-        // 则取不到 guard 直接拒绝；单语句 autocommit 的 Err 视为未知结果
-        // （连接中断后语句可能已提交）→ 先 mark_uncertain 再上抛。
-        let source_guard = begin_card_source_transaction()?;
-        // autocommit 语句同样先武装取消栅栏（execute await 窗口内取消/掉线 →
-        // Drop → sticky uncertain），结果判定后统一 settle。
-        arm_card_commit_fence(&source_guard);
-        let result: Result<(), sqlx::Error> = sqlx::query(
-            "DELETE FROM identity_card WHERE card_id = ? AND user_id = ? AND status = 'ACTIVE'",
-        )
-        .bind(card_id)
-        .bind(user_id)
-        .execute(&self.db)
-        .await
-        .map(|_| ());
-        settle_card_commit_fence(&source_guard, &result);
-        result.map_err(|e| {
-            AstralError::Database(format!("Delete created identity_card failed: {e}"))
-        })?;
-        Ok(())
     }
 
     async fn create_user_card(
@@ -2436,10 +2285,8 @@ mod tests {
 
     #[test]
     fn card_fact_writers_hold_hub_guard_across_the_whole_transaction() {
-        // 辅助镜像激活前置条件回归（源形状，无 IO）：四个卡事实写事务都必须
-        // 先于 pool.begin 获取 hub 写者栅栏，每个 commit await 前武装取消栅栏
-        //（mark_commit_started），结果判定后统一 settle（Ok → proven 清私有
-        // atomic；Err → mark_uncertain 保持既有语义）。
+        // 授权卡事实写事务必须先于 pool.begin 获取 hub 写者栅栏，每个
+        // commit await 前武装取消栅栏，结果判定后统一 settle。
         let source = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/srv/card_repository.rs"
@@ -2449,11 +2296,6 @@ mod tests {
             .find("impl CardRepository for SqlxCardRepository")
             .expect("CardRepository impl must stay in card_repository.rs")..];
         for (anchor, next_anchor, label) in [
-            (
-                "async fn ensure_active_identity_card(",
-                "async fn delete_created_identity_card(",
-                "ensure_active_identity_card",
-            ),
             (
                 "async fn create_user_card(",
                 "async fn list_user_cards(",
@@ -2506,55 +2348,10 @@ mod tests {
     }
 
     #[test]
-    fn autocommit_identity_card_delete_holds_guard_and_marks_unknown() {
-        // 第 5 个写点（无 pool.begin 的 autocommit DELETE）同样必须先取栅栏、
-        // execute await 前武装取消栅栏，且 Err 视为未知结果 settle 为
-        // mark_uncertain——不能因无事务省略。
-        let source = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/srv/card_repository.rs"
-        ));
-        let impl_source = &source[source
-            .find("impl CardRepository for SqlxCardRepository")
-            .expect("CardRepository impl must stay in card_repository.rs")..];
-        let start = impl_source
-            .find("async fn delete_created_identity_card(")
-            .expect("delete_created_identity_card implementation must stay in this file");
-        let end = impl_source[start..]
-            .find("async fn create_user_card(")
-            .expect("create_user_card must follow delete_created_identity_card");
-        let body = &impl_source[start..start + end];
-        let guard = body
-            .find("let source_guard = begin_card_source_transaction()?;")
-            .expect("autocommit write point must acquire the guard with ? (fail-closed)");
-        let arm = body
-            .find("arm_card_commit_fence(&source_guard);")
-            .expect("autocommit await must be armed before execute");
-        let settle = body
-            .find("settle_card_commit_fence(&source_guard, &result)")
-            .expect("autocommit result must be settled (proven on Ok / uncertain on Err)");
-        let execute = body
-            .find(".execute(&self.db)")
-            .expect("the DELETE must execute in this file");
-        assert!(
-            guard < execute,
-            "guard must be held before the autocommit write"
-        );
-        assert!(
-            arm < execute,
-            "the cancellation fence must be armed before the autocommit await"
-        );
-        assert!(
-            settle > execute,
-            "fence settlement must follow the write result"
-        );
-    }
-
-    #[test]
     fn guard_acquisition_fails_closed_when_hub_is_installed() {
         // begin_card_source_transaction 语义钉（源形状）：hub 已装 + 栅栏不可得
         // 必须返回 Err（写点 `?` 拒绝），只有 hub 未安装才 Ok(None)——
-        // 不允许"已装但失败"被吞成 no-op。全部 5 个写点都带 `?`。
+        // 不允许"已装但失败"被吞成 no-op。
         let source = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/srv/card_repository.rs"
@@ -2581,8 +2378,8 @@ mod tests {
             impl_source
                 .matches("let source_guard = begin_card_source_transaction()?;")
                 .count(),
-            5,
-            "exactly the five card-fact write points acquire the guard fail-closed"
+            3,
+            "exactly the three user-card write points acquire the guard fail-closed"
         );
     }
 }

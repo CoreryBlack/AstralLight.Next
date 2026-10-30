@@ -1,8 +1,7 @@
 //! Offline gate/static contracts for the remaining external or unimplemented
 //! suites. These tests do not execute live deployments, external comparators,
-//! TLC, Valgrind or excluded service binaries; they pin the prerequisites,
-//! source inventories and explicit non-claims so no suite can silently pass
-//! without its required environment.
+//! TLC or Valgrind; they pin the prerequisites, source inventories and explicit
+//! non-claims so no suite can silently pass without its required environment.
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LivePrerequisites {
@@ -208,22 +207,6 @@ mod tests {
         assert!(source.contains("Cedar(rust)"));
         assert!(source.contains("OPA"));
         assert!(source.contains("SpiceDB"));
-    }
-
-    #[test]
-    fn excluded_service_sources_are_outside_the_workspace_gate() {
-        let root = include_str!("../../Cargo.toml");
-        for excluded in ["\"astral-learn\"", "\"astral-chat\"", "\"integrations\""] {
-            assert!(root.contains(excluded), "{excluded}");
-        }
-        let chat_tests = include_str!("../../astral-chat/tests/integration.rs");
-        let learn_tests = include_str!("../../astral-learn/tests/integration.rs");
-        assert!(chat_tests.contains("#["));
-        assert!(learn_tests.contains("#["));
-        let verifier = include_str!("../../scripts/verify-excluded-services.ps1");
-        assert!(verifier.contains("astral-chat"));
-        assert!(verifier.contains("astral-learn"));
-        assert!(verifier.contains("cargo test"));
     }
 
     #[test]

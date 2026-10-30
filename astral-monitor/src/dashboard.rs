@@ -93,7 +93,7 @@ pub fn dashboard_routes() -> Router<AppState> {
 async fn get_service_latencies(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<Vec<ServiceLatency>>>, AppError> {
-    let services = ["gateway", "identity", "learn", "chat"];
+    let services = ["gateway", "identity"];
     let mut latencies = Vec::with_capacity(services.len());
     for name in services {
         let latency = state
@@ -173,12 +173,7 @@ async fn get_request_trend(
 async fn get_service_health(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<Vec<ServiceHealth>>>, AppError> {
-    let services = [
-        ("gateway", "API 网关"),
-        ("identity", "认证服务"),
-        ("learn", "学习服务"),
-        ("chat", "聊天服务"),
-    ];
+    let services = [("gateway", "API 网关"), ("identity", "认证服务")];
     let mut result = Vec::with_capacity(services.len());
     for (name, domain) in services {
         result.push(build_service_health(&state, name, domain).await?);

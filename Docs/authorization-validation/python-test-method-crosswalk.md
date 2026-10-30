@@ -20,7 +20,7 @@
 | `test_instrumented_e_series_are_not_lost_by_consolidation` | `selection_uses_registered_profiles_and_series_families` | EQUIVALENT：E1/E3/E4 observability argv 与 service。 |
 | `test_explicit_all_profiles_retains_blocked_and_live_suites` | `selection_uses_registered_profiles_and_series_families` | EQUIVALENT：全 profile 保留 blocked 与有服务项。 |
 | `test_m_family_does_not_include_mt_or_compat` | `selection_uses_registered_profiles_and_series_families` | EQUIVALENT：M 系列边界。 |
-| `test_e_family_does_not_include_excluded_or_mt` | `selection_uses_registered_profiles_and_series_families` | EQUIVALENT：E 系列边界。 |
+| `test_e_family_does_not_include_excluded_or_mt` | `selection_uses_registered_profiles_and_series_families` | EQUIVALENT：E 系列不包含 historical excluded suite 与 MT。 |
 | `test_exact_e2_has_five_runtime_targets` | `selection_uses_registered_profiles_and_series_families` | EQUIVALENT：5 项、精确过滤和期望数量。 |
 | `test_explicit_suite_overrides_default_profiles` | `selection_uses_registered_profiles_and_series_families` | EQUIVALENT：显式 suite 选择。 |
 | `test_owned_projection_suites_keep_their_execution_and_evidence_scope` | `selection_uses_registered_profiles_and_series_families` | EQUIVALENT：worker-owned、service/scope、ignored argv、source 与 model boundary。 |
@@ -34,7 +34,7 @@
 | `test_projection_execution_mode_is_selected_by_suite_not_parent` | `campaign.rs::tests::native_profiles_select_only_declared_services_and_scrub_retired_selectors` | RETIRED：执行协议 selector 已删除；当前只有 WorkerOwned，Rust 断言仅验证继承 selector 被清除。 |
 | `test_native_uses_only_mysql` | `campaign.rs::tests::native_profiles_select_only_declared_services_and_scrub_retired_selectors`; `preflight_requires_an_exact_isolated_database_and_loopback_service` | EQUIVALENT：service selection 和 MySQL 配置。 |
 | `test_rabbit_uses_mysql_and_explicit_vhost_only` | `campaign.rs::tests::native_profiles_select_only_declared_services_and_scrub_retired_selectors` | EQUIVALENT：Rabbit profile 与显式 vhost。 |
-| `test_redis_is_explicit_compat_only` | `campaign.rs::tests::native_profiles_select_only_declared_services_and_scrub_retired_selectors`; `dependency_profiles.rs::tests::unknown_profiles_and_retired_redis_faults_fail_closed` | RETIRED：Redis profile 已删除；替代断言拒绝退役 profile 并清除继承变量，不再启用 Redis。 |
+| `test_native_environment_scrubs_retired_redis_inputs` | `campaign.rs::tests::native_environment_clears_live_credentials`; `campaign.rs::tests::native_profiles_select_only_declared_services_and_scrub_retired_selectors`; `dependency_profiles.rs::tests::unknown_profiles_and_retired_redis_faults_fail_closed` | RETIRED：Redis runtime/profile 已物理删除；当前断言清理继承的 Redis 输入并拒绝退役 profile，不再启用 Redis。 |
 | `test_absent_live_prerequisite_is_blocked` | `campaign.rs::tests::preflight_requires_an_exact_isolated_database_and_loopback_service`; `campaign/run_tests.rs::tests::run_selected_collection_preflight_blocks_every_suite_for_missing_database` | EQUIVALENT：blocked preflight 全量 fail-before-dispatch。 |
 | `test_nonisolated_database_and_extra_options_are_rejected` | `campaign.rs::tests::preflight_requires_an_exact_isolated_database_and_loopback_service` | EQUIVALENT：host/库名/端口/query fail-closed；Rust 额外也检查 fragment。 |
 | `test_run_scoped_database_requires_exact_name_environment` | `campaign.rs::tests::preflight_requires_an_exact_isolated_database_and_loopback_service` | EQUIVALENT：run-scoped 名称前缀、匹配及格式。 |

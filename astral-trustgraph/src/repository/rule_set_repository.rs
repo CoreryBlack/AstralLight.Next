@@ -3822,7 +3822,7 @@ mod tests {
         LockedRuleSetEntryRow {
             entry_id: 5077,
             effect: effect.to_owned(),
-            resource_type: Some("learn_course".to_owned()),
+            resource_type: Some("permission_rule".to_owned()),
             resource_id: Some(3),
             action_code: Some("read".to_owned()),
             condition_json: None,
@@ -3859,7 +3859,7 @@ mod tests {
             canonical_entry_grant_fields(&row),
             Err(AstralError::Validation(_))
         ));
-        row.resource_type = Some("learn_course".to_owned());
+        row.resource_type = Some("permission_rule".to_owned());
         row.action_code = Some("   ".to_owned());
         assert!(matches!(
             canonical_entry_grant_fields(&row),
@@ -4229,7 +4229,7 @@ mod tests {
             entry_id,
             ref_id,
             ref_type,
-            resource: "learn_course",
+            resource: "permission_rule",
             resource_id: None,
             action: "read",
             condition_json: None,
@@ -4340,7 +4340,7 @@ mod tests {
                 entry_id: 301,
                 ref_id: 100,
                 ref_type: "BASE",
-                resource: "learn_course",
+                resource: "permission_rule",
                 resource_id: None,
                 action: "read",
                 condition_json: None,
@@ -4451,7 +4451,7 @@ mod tests {
             entry_id,
             ref_id,
             ref_type,
-            resource: "learn_course",
+            resource: "permission_rule",
             resource_id: None,
             action: "read",
             condition_json: None,
@@ -4584,7 +4584,7 @@ mod tests {
             }
         }
         fn requested_entry(effect: &str) -> NewRuleSetEntry {
-            requested_entry_with(effect, Some("learn_course"), 5, None)
+            requested_entry_with(effect, Some("permission_rule"), 5, None)
         }
 
         let allow = [entry_row("ALLOW", 1)];
@@ -4616,15 +4616,15 @@ mod tests {
         ));
 
         // 非克隆字段级差异：优先级或资源文本的任何字节漂移都不得冒充等价。
-        let shifted = requested_entry_with("ALLOW", Some("learn_course"), 6, None);
+        let shifted = requested_entry_with("ALLOW", Some("permission_rule"), 6, None);
         assert!(!batch_replacement_is_fully_equal(&allow, &[shifted]));
 
-        let spaced = requested_entry_with("ALLOW", Some("learn_course "), 5, None);
+        let spaced = requested_entry_with("ALLOW", Some("permission_rule "), 5, None);
         assert!(!batch_replacement_is_fully_equal(&allow, &[spaced]));
 
         let with_condition = requested_entry_with(
             "ALLOW",
-            Some("learn_course"),
+            Some("permission_rule"),
             5,
             Some("{\"timeRange\":{\"from\":\"09:00\",\"to\":\"17:00\"}}".to_owned()),
         );

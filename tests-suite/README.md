@@ -206,7 +206,7 @@ published-evidence 夹具、禁止 legacy/raw ports，并在计时前检查 ALLO
 这些边界不是本次测量结果，避免把身份校验失败当作授权性能。
 
 历史 RQ/S15 Redis/OPA 编排、真实 HTTP 负载、native live fault controller、TLC、
-Linux/Valgrind IAI 与 frozen/excluded 项有各自记录的边界或阻塞状态，统一入口不会为了
+Linux/Valgrind IAI 与归档项有各自记录的边界或阻塞状态，统一入口不会为了
 复跑它们而给当前 native 架构添加中间件。独立历史报告与结果保持原样；本地局部/离线结果
 不能升级其状态，也不构成推荐执行入口。
 

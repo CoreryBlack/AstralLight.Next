@@ -348,7 +348,7 @@ mod tests {
             Ok(astral_db::SodCheckResult {
                 has_conflict: self.has_conflict,
                 conflict_policy: Some("separation".into()),
-                conflict_permission: Some("learn_course:delete".into()),
+                conflict_permission: Some("permission_rule:delete".into()),
                 conflict_type: Some("STATIC".into()),
             })
         }
@@ -552,7 +552,7 @@ mod tests {
             rule_id: id,
             card_id: 7,
             tenant_id: None,
-            resource_type: "learn_course".into(),
+            resource_type: "permission_rule".into(),
             resource_id: None,
             action_code: "read".into(),
             effect: "ALLOW".into(),
@@ -597,7 +597,7 @@ mod tests {
         CreateRuleRequest {
             card_id: 7,
             effect: "ALLOW".into(),
-            resource_type: "learn_course".into(),
+            resource_type: "permission_rule".into(),
             action_code: "read".into(),
             priority: None,
             condition_json: None,
@@ -613,7 +613,7 @@ mod tests {
         UpdateRuleRequest {
             card_id: 7,
             effect: "ALLOW".into(),
-            resource_type: "learn_course".into(),
+            resource_type: "permission_rule".into(),
             action_code: "read".into(),
             priority: None,
             condition_json: None,
@@ -655,7 +655,7 @@ mod tests {
             }
             assert_eq!(fake.calls(), vec!["get:9", "update:9:priority=100"]);
             assert!(fake.last_patch.lock().unwrap().is_none());
-            assert_eq!(sod.events(), vec![(7, "learn_course:read".into())]);
+            assert_eq!(sod.events(), vec![(7, "permission_rule:read".into())]);
         }
     }
 
@@ -718,7 +718,7 @@ mod tests {
                 &CreateRuleRequest {
                     card_id: 7,
                     effect: "ALLOW".into(),
-                    resource_type: "learn_course".into(),
+                    resource_type: "permission_rule".into(),
                     action_code: "read".into(),
                     priority: None,
                     condition_json: None,
@@ -737,7 +737,7 @@ mod tests {
         assert_eq!(calls[0], "create:43");
         assert_eq!(calls[1], "get:43");
         assert_eq!(row.rule_id, 43);
-        assert_eq!(sod.events(), vec![(7, "learn_course:read".to_string())]);
+        assert_eq!(sod.events(), vec![(7, "permission_rule:read".to_string())]);
     }
 
     #[tokio::test]
@@ -750,7 +750,7 @@ mod tests {
             &CreateRuleRequest {
                 card_id: 7,
                 effect: " allow ".into(),
-                resource_type: "learn_course".into(),
+                resource_type: "permission_rule".into(),
                 action_code: "read".into(),
                 priority: None,
                 condition_json: None,
@@ -781,7 +781,7 @@ mod tests {
                     &CreateRuleRequest {
                         card_id: 7,
                         effect: rejected.into(),
-                        resource_type: "learn_course".into(),
+                        resource_type: "permission_rule".into(),
                         action_code: "read".into(),
                         priority: None,
                         condition_json: None,
@@ -853,7 +853,7 @@ mod tests {
                     &CreateRuleRequest {
                         card_id: 7,
                         effect: "ALLOW".into(),
-                        resource_type: "learn_course".into(),
+                        resource_type: "permission_rule".into(),
                         action_code: action.into(),
                         priority: None,
                         condition_json: None,
@@ -925,7 +925,7 @@ mod tests {
             &CreateRuleRequest {
                 card_id: 7,
                 effect: "ALLOW".into(),
-                resource_type: "  learn_course  ".into(),
+                resource_type: "  permission_rule  ".into(),
                 action_code: " read ".into(),
                 priority: None,
                 condition_json: None,
@@ -942,7 +942,7 @@ mod tests {
 
         // 写入 source 的必须是归一化（trim）后的二元组，而不是原始入参
         let persisted = fake.last_new();
-        assert_eq!(persisted.resource_type, "learn_course");
+        assert_eq!(persisted.resource_type, "permission_rule");
         assert_eq!(persisted.action_code, "read");
         assert_eq!(persisted.effect, "ALLOW");
     }
@@ -961,7 +961,7 @@ mod tests {
             &UpdateRuleRequest {
                 card_id: 7,
                 effect: "ALLOW".into(),
-                resource_type: "learn_course".into(),
+                resource_type: "permission_rule".into(),
                 action_code: "read".into(),
                 priority: None,
                 condition_json: None,
@@ -994,7 +994,7 @@ mod tests {
                 &UpdateRuleRequest {
                     card_id: 7,
                     effect: "DENY".into(),
-                    resource_type: "learn_course".into(),
+                    resource_type: "permission_rule".into(),
                     action_code: "read".into(),
                     priority: None,
                     condition_json: None,
@@ -1016,9 +1016,9 @@ mod tests {
     async fn update_rule_rejects_unregistered_resource_or_action_before_any_transaction() {
         for (resource, action) in [
             ("no_such_resource", "read"),
-            ("learn_course", "no_such_action"),
+            ("permission_rule", "no_such_action"),
             ("  ", "read"),
-            ("learn_course", ""),
+            ("permission_rule", ""),
         ] {
             let fake = Arc::new(FakeRuleRepository::new(Some(sample_rule(11))));
             let sod = Arc::new(RecordingGrantSodValidator::new());
@@ -1070,7 +1070,7 @@ mod tests {
             &UpdateRuleRequest {
                 card_id: 7,
                 effect: " allow ".into(),
-                resource_type: "  learn_course ".into(),
+                resource_type: "  permission_rule ".into(),
                 action_code: " read ".into(),
                 priority: None,
                 condition_json: None,
@@ -1084,7 +1084,7 @@ mod tests {
 
         // 写入 patch 的必须是归一化（trim）后的值；effect 同样归一为 ALLOW
         let patch = fake.last_patch();
-        assert_eq!(patch.resource_type.as_deref(), Some("learn_course"));
+        assert_eq!(patch.resource_type.as_deref(), Some("permission_rule"));
         assert_eq!(patch.action_code.as_deref(), Some("read"));
         assert_eq!(patch.effect.as_deref(), Some("ALLOW"));
         assert!(sod.events().is_empty());

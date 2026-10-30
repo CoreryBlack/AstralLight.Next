@@ -94,7 +94,6 @@ pub(crate) fn message_type_for_queue(queue_name: &str) -> &'static str {
         "astral.audit.log" => "AUDIT_LOG",
         "astral.auth.session.revocation" => "AUTH_SESSION_REVOCATION",
         QUEUE_LOGIN_EVENT => "LOGIN_EVENT",
-        "astral.chat.message" => "CHAT_MESSAGE",
         _ => "BUSINESS_MESSAGE",
     }
 }
@@ -967,7 +966,7 @@ mod tests {
         );
         assert_eq!(
             message_type_for_queue("astral.chat.message"),
-            "CHAT_MESSAGE"
+            "BUSINESS_MESSAGE"
         );
     }
 

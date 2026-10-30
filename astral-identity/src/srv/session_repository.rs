@@ -4,11 +4,11 @@
 //! **纯单语句原子 SQL**。CAS 轮换顺序、session grant mirror、jti fan-out 和 family
 //! 级联撤销编排保留在 `srv::session`，不允许把编排函数下沉到本文件。
 //!
-//! source writer 栅栏边界：仅**无外部调用方栅栏兜底**的两个签发叶子
-//! （[`create_token_family_with_expiry`] / [`insert_app_device_session`]）在本
-//! 文件内经 `fenced_source_write` 自围（autocommit await 窗口武装取消栅栏，
-//! Ok → proven；Err/取消 → sticky uncertain）。其余 mutation（revoke/cleanup
-//! 系列）由调用方集群栅栏统一持有，本文件保持裸 SQL，绝不双重围栏。
+//! source writer 栅栏边界：无外部调用方栅栏兜底的 family 创建叶子
+//! （[`create_token_family_with_expiry`]）在本文件内经 `fenced_source_write`
+//! 自围（autocommit await 窗口武装取消栅栏，Ok → proven；Err/取消 → sticky
+//! uncertain）。其余 mutation（revoke 系列）由调用方集群栅栏统一持有，本文件
+//! 保持裸 SQL，绝不双重围栏。
 
 use sqlx::MySqlPool;
 use time::PrimitiveDateTime;
@@ -266,72 +266,12 @@ pub(crate) async fn revoke_family_sessions(
     Ok(())
 }
 
-/// App 会话签发：插入 auth_device_session 行（app 设备，绑定 family + refresh 哈希），
-/// 返回 session_id。失败时由调用方编排 family 补偿清理。
-///
-/// 签发叶子自围 source writer 栅栏（internal.rs 调用点保持裸调用，避免双重
-/// 围栏）：hub 已装则 fail-closed 取得，INSERT await 窗口前武装取消栅栏，
-/// 结果判定后 settle（Ok → proven；Err/取消 → sticky uncertain）。
-pub(crate) async fn insert_app_device_session(
-    db: &MySqlPool,
-    family_id: i64,
-    user_id: i64,
-    refresh_token_hash: &str,
-    refresh_expires_at: PrimitiveDateTime,
-) -> Result<i64, AstralError> {
-    let source_guard = source_writer_guard::begin_source_write()?;
-    let result = source_writer_guard::fenced_source_write(
-        source_guard,
-        sqlx::query(
-            "INSERT INTO auth_device_session (family_id, user_id, device_id, current_user_card_id, session_state, session_version, session_epoch, refresh_token_hash, refresh_expires_at, status) \
-             VALUES (?, ?, 'app', ?, 'ACTIVE', 1, 1, ?, ?, 'ACTIVE')",
-        )
-        .bind(family_id)
-        .bind(user_id)
-        // identity_card.card_id 不是 user_card.card_id；不跨写
-        .bind(None::<i64>)
-        .bind(refresh_token_hash)
-        .bind(refresh_expires_at)
-        .execute(db),
-    )
-    .await
-    .map_err(|e| AstralError::Database(format!("Insert app device session failed: {e}")))?;
-    if result.rows_affected() == 1 && result.last_insert_id() > 0 {
-        Ok(result.last_insert_id() as i64)
-    } else {
-        Err(AstralError::Database(
-            "Session issuance failed: no durable session id".into(),
-        ))
-    }
-}
-
-/// 清理指定用户 ACTIVE 的 token family（app 会话失败补偿；幂等）。
-pub(crate) async fn cleanup_active_family(
-    db: &MySqlPool,
-    family_id: i64,
-    user_id: i64,
-) -> Result<(), AstralError> {
-    sqlx::query(
-        "DELETE FROM auth_token_family WHERE family_id = ? AND user_id = ? AND status = 'ACTIVE'",
-    )
-    .bind(family_id)
-    .bind(user_id)
-    .execute(db)
-    .await
-    .map_err(|e| AstralError::Database(format!("Cleanup token family failed: {e}")))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    /// 签发叶子 source 栅栏形状回归（源形状，无 IO）：
-    /// 1. `create_token_family_with_expiry` / `insert_app_device_session` 两个
-    ///    签发叶子必须经 `begin_source_write` + `fenced_source_write` 自围
-    ///    （autocommit await 窗口武装取消栅栏；Ok → proven；Err/取消 → sticky
-    ///    uncertain——取消缝语义由 `source_writer_guard` 的通用真实
-    ///    pending-future 取消测试在本地 hub 上涵盖，本测试做结构固定）；
-    /// 2. revoke/cleanup 系列保持裸 SQL——由调用方集群/调用点栅栏统一持有
-    ///    （session.rs 集群、internal.rs 补偿点），绝不双重围栏。
+    /// Family 创建 source 栅栏形状回归（源形状，无 IO）：
+    /// create_token_family_with_expiry 必须经 begin_source_write +
+    /// fenced_source_write 自围；revoke 系列保持裸 SQL，由调用方集群栅栏统一持有，
+    /// 绝不双重围栏。
     #[test]
     fn issuance_leaves_are_self_fenced_and_revoke_leaves_stay_outer_fenced() {
         let source = include_str!("session_repository.rs");
@@ -339,20 +279,16 @@ mod tests {
             .find("#[cfg(test)]")
             .expect("tests module must stay at the end of session_repository.rs")];
 
-        for leaf in [
-            "async fn create_token_family_with_expiry(",
-            "async fn insert_app_device_session(",
-        ] {
-            let body = impl_source
-                .split(leaf)
-                .nth(1)
-                .unwrap_or_else(|| panic!("{leaf} must stay in session_repository.rs"));
-            assert!(
-                body.contains("source_writer_guard::begin_source_write()")
-                    && body.contains("source_writer_guard::fenced_source_write("),
-                "{leaf} must be self-fenced via the shared source writer helper"
-            );
-        }
+        let leaf = "async fn create_token_family_with_expiry(";
+        let body = impl_source
+            .split(leaf)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{leaf} must stay in session_repository.rs"));
+        assert!(
+            body.contains("source_writer_guard::begin_source_write()")
+                && body.contains("source_writer_guard::fenced_source_write("),
+            "{leaf} must be self-fenced via the shared source writer helper"
+        );
 
         for outer_fenced in [
             "async fn revoke_session(",
@@ -360,7 +296,6 @@ mod tests {
             "async fn revoke_user_token_families(",
             "async fn revoke_family_cas(",
             "async fn revoke_family_sessions(",
-            "async fn cleanup_active_family(",
         ] {
             let body = impl_source
                 .split(outer_fenced)

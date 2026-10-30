@@ -1,6 +1,8 @@
 # Independent SDK Consumers
 
-This nested workspace consumes only the public SDK crates and standard business libraries. It does not depend on platform database, PolicyEngine, shared middleware, MQ or internal entity crates. Existing `astral-chat` / `astral-learn` remain excluded and unchanged.
+This nested workspace contains independent `chat` and `learn` public-SDK consumer samples, not the production `astral-chat` / `astral-learn` services. The production runtime crates, Gateway route registrations/proxies, and API contracts are retired and physically removed from this checkout. These samples remain as reference/test applications; they do not provide production service routes or deployments.
+
+The samples consume only the public SDK crates and standard business libraries. They do not depend on platform database, PolicyEngine, shared middleware, MQ or internal entity crates.
 
 - `learn`: bounded course/scope store, parent revision, exact collection filtering, stable business-operation digest, and local commit receipts.
 - `chat`: bounded membership/message store, per-target inbound/outbound proof, handshake separation, deduplication, backpressure, and local receipts.

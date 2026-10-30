@@ -48,8 +48,8 @@ pub fn get_alias_sources(action: &str) -> Vec<&'static str> {
 /// 构建 resourceKey = `resourceType:targetId`
 ///
 /// 如果 target_id 为 None，附加 `:*` 表示类型级通配。
-/// 例如 `build_resource_key("learn_subject", Some(42))` → `"learn_subject:42"`
-/// `build_resource_key("learn_subject", None)` → `"learn_subject:*"`
+/// 例如 `build_resource_key("domain_object", Some(42))` → `"domain_object:42"`
+/// `build_resource_key("domain_object", None)` → `"domain_object:*"`
 pub fn build_resource_key(resource: &str, target_id: Option<i64>) -> String {
     match target_id {
         Some(id) => format!("{resource}:{id}"),
@@ -59,8 +59,8 @@ pub fn build_resource_key(resource: &str, target_id: Option<i64>) -> String {
 
 /// 从 resourceKey 中提取 resource type 和 resource ID 字符串
 ///
-/// 例如 `parse_resource_key("learn_subject:42")` → `("learn_subject", Some("42"))`
-/// `parse_resource_key("learn_subject:*")` → `("learn_subject", Some("*"))`
+/// 例如 `parse_resource_key("domain_object:42")` → `("domain_object", Some("42"))`
+/// `parse_resource_key("domain_object:*")` → `("domain_object", Some("*"))`
 pub fn parse_resource_key(key: &str) -> (&str, Option<&str>) {
     if let Some(colon) = key.rfind(':') {
         let resource_type = &key[..colon];
@@ -83,7 +83,7 @@ pub fn is_wildcard_key(key: &str) -> bool {
 
 /// 将 specific resourceKey 转为通配 key（forward wildcard）
 ///
-/// 例如 `"learn_subject:42"` → `Some("learn_subject:*")`
+/// 例如 `to_wildcard_key("domain_object:42")` → `Some("domain_object:*")`
 /// 已经是通配的 key 返回 None。
 pub fn to_wildcard_key(key: &str) -> Option<String> {
     if is_wildcard_key(key) {
@@ -474,103 +474,6 @@ impl ResourceRegistry {
     }
 
     fn register_builtin_types(&mut self) {
-        // Learn 模块
-        self.register_with_conditions(
-            "learn_subject",
-            &["read", "create", "update", "delete", "import", "export"],
-            &[
-                "scope:SELF",
-                "ownerOnly",
-                "belongsToTenant",
-                "resourceProperty",
-            ],
-        );
-        self.register_with_conditions(
-            "learn_question",
-            &["read", "create", "update", "delete", "import", "export"],
-            &["scope:SELF", "ownerOnly", "resourceProperty"],
-        );
-        self.register_with_conditions(
-            "learn_exam",
-            &["read", "create", "update", "delete", "publish"],
-            &["scope:SELF", "rateLimit"],
-        );
-        self.register_with_conditions(
-            "learn_level",
-            &["read", "create", "update", "delete"],
-            &[
-                "scope:SELF",
-                "ownerOnly",
-                "belongsToTenant",
-                "resourceProperty",
-            ],
-        );
-        self.register_with_conditions(
-            "learn_solution",
-            &["read", "create", "update", "delete"],
-            &["scope:SELF", "ownerOnly", "resourceProperty"],
-        );
-        self.register_with_conditions("learn_wrong_question", &["read", "write"], &["scope:SELF"]);
-        self.register_with_conditions("learn_statistics", &["read"], &["rateLimit"]);
-        self.register_with_conditions(
-            "learn_school",
-            &["read", "create", "update", "delete"],
-            &["belongsToTenant", "resourceProperty"],
-        );
-        self.register_with_conditions(
-            "learn_course",
-            &["read", "create", "update", "delete"],
-            &["scope:SELF", "timeRange", "resourceProperty"],
-        );
-        self.register_with_conditions(
-            "learn_checkin",
-            &["read", "create", "update", "delete"],
-            &["scope:SELF", "timeRange"],
-        );
-        // App Learn resources use explicit resource types for policy matching.
-        self.register_with_conditions("learn_progress", &["read", "create"], &["scope:SELF"]);
-        self.register_with_conditions("learn_user_answer", &["read", "create"], &["scope:SELF"]);
-        self.register_with_conditions(
-            "learn_user_subject",
-            &["read", "create", "delete"],
-            &["scope:SELF"],
-        );
-        self.register_with_conditions(
-            "learn_question_first_attempt",
-            &["read", "create"],
-            &["scope:SELF"],
-        );
-        self.register_with_conditions(
-            "learn_chapter",
-            &["read", "create", "update", "delete"],
-            &[
-                "scope:SELF",
-                "ownerOnly",
-                "belongsToTenant",
-                "resourceProperty",
-            ],
-        );
-        self.register_with_conditions(
-            "learn_level_play",
-            &["play"],
-            &["timeRange", "deviceType", "rateLimit"],
-        );
-        self.register("learn_device", &["read"]);
-        self.register_with_conditions(
-            "learn_document",
-            &["read", "create", "update", "delete"],
-            &["scope:SELF", "belongsToTenant"],
-        );
-        self.register_with_conditions(
-            "learn_system_setting",
-            &["read", "update"],
-            &["belongsToTenant"],
-        );
-        self.register_with_conditions(
-            "learn_webhook",
-            &["read", "create", "update", "delete"],
-            &["belongsToTenant"],
-        );
         self.register("user_profile", &["read"]);
         // TrustGraph 模块
         self.register(
@@ -672,10 +575,6 @@ impl ResourceRegistry {
         );
         self.register("org_unit_card", &["read", "create", "update"]);
         self.register("org_membership", &["read", "create", "update"]);
-        // Chat 模块
-        self.register("chat_message", &["read", "create", "update", "delete"]);
-        self.register("chat_conversation", &["read", "create", "update", "delete"]);
-        self.register("chat_offline_message", &["read", "create"]);
         // 通知
         self.register("notification", &["read", "create", "update", "test"]);
         // 组织
@@ -793,8 +692,9 @@ mod tests {
     #[test]
     fn test_registry_validate() {
         let reg = ResourceRegistry::global();
-        assert!(reg.validate("learn_subject", "read").is_ok());
-        assert!(reg.validate("learn_subject", "write").is_err());
+        assert!(reg.validate("permission_rule", "read").is_ok());
+        assert!(reg.validate("permission_rule", "write").is_err());
+        assert!(reg.validate("learn_subject", "read").is_err());
         assert!(reg.validate("nonexistent", "read").is_err());
     }
 
@@ -802,7 +702,8 @@ mod tests {
     fn test_registry_list_resources() {
         let reg = ResourceRegistry::global();
         let resources = reg.list_resources();
-        assert!(resources.contains(&"learn_subject".to_string()));
+        assert!(!resources.contains(&"learn_subject".to_string()));
+        assert!(!resources.contains(&"chat_message".to_string()));
         assert!(resources.contains(&"audit".to_string()));
         assert!(resources.contains(&"audit_quarantine".to_string()));
     }
@@ -900,7 +801,7 @@ mod tests {
         assert!(registry.validate(&unique, "read").is_ok());
         assert!(registry.validate(&unique, "approve").is_ok());
         assert!(registry.validate(&unique, "delete").is_err());
-        assert!(registry.validate("learn_wrong_question", "write").is_ok());
+        assert!(registry.validate("permission_action", "write").is_err());
 
         assert!(registry
             .register_custom_resources([CustomResourceRegistration {
@@ -933,7 +834,7 @@ mod tests {
     #[test]
     fn test_registry_list_actions() {
         let reg = ResourceRegistry::global();
-        let actions = reg.list_actions("learn_subject").unwrap();
+        let actions = reg.list_actions("migration").unwrap();
         assert!(actions.contains(&"import".to_string()));
     }
 
@@ -972,51 +873,51 @@ mod tests {
     #[test]
     fn test_build_resource_key_with_id() {
         assert_eq!(
-            build_resource_key("learn_subject", Some(42)),
-            "learn_subject:42"
+            build_resource_key("domain_object", Some(42)),
+            "domain_object:42"
         );
     }
 
     #[test]
     fn test_build_resource_key_without_id() {
-        assert_eq!(build_resource_key("learn_subject", None), "learn_subject:*");
+        assert_eq!(build_resource_key("domain_object", None), "domain_object:*");
     }
 
     #[test]
     fn test_parse_resource_key() {
-        let (rt, id) = parse_resource_key("learn_subject:42");
-        assert_eq!(rt, "learn_subject");
+        let (rt, id) = parse_resource_key("domain_object:42");
+        assert_eq!(rt, "domain_object");
         assert_eq!(id, Some("42"));
     }
 
     #[test]
     fn test_parse_resource_key_wildcard() {
-        let (rt, id) = parse_resource_key("learn_subject:*");
-        assert_eq!(rt, "learn_subject");
+        let (rt, id) = parse_resource_key("domain_object:*");
+        assert_eq!(rt, "domain_object");
         assert_eq!(id, None);
     }
 
     #[test]
     fn test_parse_resource_key_no_id() {
-        let (rt, id) = parse_resource_key("learn_subject");
-        assert_eq!(rt, "learn_subject");
+        let (rt, id) = parse_resource_key("domain_object");
+        assert_eq!(rt, "domain_object");
         assert_eq!(id, None);
     }
 
     #[test]
     fn test_is_wildcard_key() {
-        assert!(is_wildcard_key("learn_subject:*"));
-        assert!(!is_wildcard_key("learn_subject:42"));
-        assert!(!is_wildcard_key("learn_subject"));
+        assert!(is_wildcard_key("domain_object:*"));
+        assert!(!is_wildcard_key("domain_object:42"));
+        assert!(!is_wildcard_key("domain_object"));
     }
 
     #[test]
     fn test_to_wildcard_key() {
         assert_eq!(
-            to_wildcard_key("learn_subject:42"),
-            Some("learn_subject:*".into())
+            to_wildcard_key("domain_object:42"),
+            Some("domain_object:*".into())
         );
-        assert_eq!(to_wildcard_key("learn_subject:*"), None);
+        assert_eq!(to_wildcard_key("domain_object:*"), None);
         assert_eq!(to_wildcard_key("nosep"), None);
     }
 }

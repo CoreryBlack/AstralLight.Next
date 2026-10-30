@@ -1,13 +1,13 @@
 //! RabbitMQ 交换机、队列、绑定声明
 //!
-//! 与 Java Spring AMQP 配置（MQConfig.java / MQConstants.java）完全对齐。
+//! Active Rust runtime RabbitMQ topology.
 //!
 //! 交换机：3 个共享交换机
 //! - `astral.direct` (Direct) — 大部分业务队列绑定
-//! - `astral.topic`  (Topic)  — notification、business.chat 绑定
+//! - `astral.topic`  (Topic)  — notification 绑定
 //! - `astral.dlx`    (Direct) — 死信交换机
 //!
-//! 队列：12 个业务队列 + 12 个死信队列
+//! 队列：4 个业务队列 + 4 个死信队列
 //! - 业务队列 DLX routing key = `astral.dlx.<suffix>`（每队列独立）
 //! - 死信队列名 = DLX routing key，绑定到 `astral.dlx`
 //!
@@ -28,18 +28,10 @@ pub const EXCHANGE_DLX: &str = "astral.dlx";
 
 pub const QUEUE_AUDIT_LOG: &str = "astral.audit.log";
 pub const QUEUE_NOTIFICATION: &str = "astral.notification";
-pub const QUEUE_LEARNING_PROGRESS: &str = "astral.learning.progress";
 pub const QUEUE_LOGIN_EVENT: &str = "astral.login.event";
-pub const QUEUE_SUBJECT_DELETE: &str = "astral.subject.delete";
 pub const QUEUE_AUTH_SESSION_REVOCATION: &str = "astral.auth.session.revocation";
 pub const QUEUE_AUTHORIZATION_INVALIDATION: &str = "astral.authorization.invalidation";
 pub const ROUTING_KEY_AUTHORIZATION_INVALIDATION: &str = "authorization.invalidation";
-pub const QUEUE_CHAT_MESSAGE: &str = "astral.chat.message";
-pub const QUEUE_BUSINESS_CHAT: &str = "astral.business.chat";
-pub const QUEUE_DELIVERY_ACK: &str = "astral.delivery.ack";
-pub const QUEUE_READ_RECEIPT: &str = "astral.read.receipt";
-pub const QUEUE_QUESTION_COMMENT: &str = "astral.question.comment";
-pub const QUEUE_QUESTION_SHARE: &str = "astral.question.share";
 
 // ===== 通用常量 =====
 
@@ -71,10 +63,7 @@ pub struct QueueDef {
     pub exchange_name: &'static str,
 }
 
-/// 12 个业务队列定义（对齐 Java MQConfig；`astral.permission.refresh` 已移除）
-///
-/// - 大部分队列绑定到 `astral.direct`
-/// - `astral.notification` 和 `astral.business.chat` 绑定到 `astral.topic`
+/// Active runtime business queues.
 pub const QUEUES: &[QueueDef] = &[
     QueueDef {
         name: QUEUE_AUDIT_LOG,
@@ -87,53 +76,13 @@ pub const QUEUES: &[QueueDef] = &[
         exchange_name: EXCHANGE_TOPIC,
     },
     QueueDef {
-        name: QUEUE_LEARNING_PROGRESS,
-        routing_key: "learning.progress",
-        exchange_name: EXCHANGE_DIRECT,
-    },
-    QueueDef {
         name: QUEUE_LOGIN_EVENT,
         routing_key: "login.event",
         exchange_name: EXCHANGE_DIRECT,
     },
     QueueDef {
-        name: QUEUE_SUBJECT_DELETE,
-        routing_key: "subject.delete",
-        exchange_name: EXCHANGE_DIRECT,
-    },
-    QueueDef {
         name: QUEUE_AUTH_SESSION_REVOCATION,
         routing_key: "auth.session.revocation",
-        exchange_name: EXCHANGE_DIRECT,
-    },
-    QueueDef {
-        name: QUEUE_CHAT_MESSAGE,
-        routing_key: "chat.message",
-        exchange_name: EXCHANGE_DIRECT,
-    },
-    QueueDef {
-        name: QUEUE_BUSINESS_CHAT,
-        routing_key: "business.chat.#",
-        exchange_name: EXCHANGE_TOPIC,
-    },
-    QueueDef {
-        name: QUEUE_DELIVERY_ACK,
-        routing_key: "delivery.ack",
-        exchange_name: EXCHANGE_DIRECT,
-    },
-    QueueDef {
-        name: QUEUE_READ_RECEIPT,
-        routing_key: "read.receipt",
-        exchange_name: EXCHANGE_DIRECT,
-    },
-    QueueDef {
-        name: QUEUE_QUESTION_COMMENT,
-        routing_key: "question.comment",
-        exchange_name: EXCHANGE_DIRECT,
-    },
-    QueueDef {
-        name: QUEUE_QUESTION_SHARE,
-        routing_key: "question.share",
         exchange_name: EXCHANGE_DIRECT,
     },
 ];

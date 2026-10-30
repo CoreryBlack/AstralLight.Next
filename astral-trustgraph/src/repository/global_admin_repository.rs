@@ -1885,16 +1885,16 @@ mod tests {
 
     #[test]
     fn superadmin_canonical_fields_require_nonempty_resource_and_action() {
-        let entry = superadmin_entry("ALLOW", Some(" learn_course "), Some("read"));
+        let entry = superadmin_entry("ALLOW", Some(" permission_rule "), Some("read"));
         let (resource, action) = superadmin_entry_canonical_fields(&entry).unwrap();
-        assert_eq!(resource, "learn_course");
+        assert_eq!(resource, "permission_rule");
         assert_eq!(action, "read");
 
         for invalid in [
             superadmin_entry("ALLOW", Some("  "), Some("read")),
             superadmin_entry("ALLOW", None, Some("read")),
-            superadmin_entry("ALLOW", Some("learn_course"), Some(" ")),
-            superadmin_entry("ALLOW", Some("learn_course"), None),
+            superadmin_entry("ALLOW", Some("permission_rule"), Some(" ")),
+            superadmin_entry("ALLOW", Some("permission_rule"), None),
         ] {
             let error = superadmin_entry_canonical_fields(&invalid).unwrap_err();
             assert!(
@@ -1906,7 +1906,7 @@ mod tests {
 
     #[test]
     fn superadmin_entry_facts_bind_identity_and_base_layer() {
-        let entry = superadmin_entry("ALLOW", Some("learn_course"), Some("read"));
+        let entry = superadmin_entry("ALLOW", Some("permission_rule"), Some("read"));
         let facts = superadmin_entry_facts(9, 7, Some(11), 21, 42, 5, &entry).unwrap();
         assert_eq!(facts.tenant_id, 7);
         assert_eq!(facts.domain_id, Some(11));
@@ -1916,7 +1916,7 @@ mod tests {
         assert_eq!(facts.entry_id, 31);
         assert_eq!(facts.ref_id, 5);
         assert_eq!(facts.ref_type, "BASE");
-        assert_eq!(facts.resource, "learn_course");
+        assert_eq!(facts.resource, "permission_rule");
         assert_eq!(facts.resource_id, Some(77));
         assert_eq!(facts.action, "read");
         assert!(facts.condition_json.is_none());

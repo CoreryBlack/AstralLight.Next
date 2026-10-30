@@ -259,12 +259,12 @@ mod tests {
     #[test]
     fn create_request_parses_camel_case_payload() {
         let request: CreateCrossOrgGrantRequest = serde_json::from_str(
-            r#"{"fromOrgId":1,"toOrgId":2,"resource":"learn_course","action":"read"}"#,
+            r#"{"fromOrgId":1,"toOrgId":2,"resource":"permission_rule","action":"read"}"#,
         )
         .expect("camelCase payload must parse");
         assert_eq!(request.from_org_id, 1);
         assert_eq!(request.to_org_id, 2);
-        assert_eq!(request.resource, "learn_course");
+        assert_eq!(request.resource, "permission_rule");
         assert_eq!(request.action, "read");
         assert_eq!(request.expires_at, None);
     }

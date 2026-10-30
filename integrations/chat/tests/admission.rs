@@ -31,9 +31,9 @@ fn store() -> ChatStore {
     store
 }
 fn request(facts: ResourceFacts, action: &str) -> AuthorizationRequest {
-    let socket = facts.resource_type == "chat_conversation";
+    let socket = facts.resource_type == "conversation_record";
     AuthorizationRequest {
-        app_id: "astral-chat".into(),
+        app_id: "messaging-app".into(),
         key_id: "test-app".into(),
         manifest_digest: manifest().digest().unwrap(),
         revision: "1".into(),

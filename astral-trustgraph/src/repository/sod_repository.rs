@@ -539,21 +539,21 @@ mod tests {
     #[test]
     fn sod_permission_pairs_normalize_scoped_keys_dedup_and_sort() {
         let pairs = normalize_sod_permission_pairs([
-            ("learn_subject:*".to_string(), "read".to_string()),
+            ("permission_rule:*".to_string(), "read".to_string()),
             ("user".to_string(), "read".to_string()),
-            ("learn_subject:42".to_string(), "read".to_string()),
+            ("permission_rule:42".to_string(), "read".to_string()),
             ("user".to_string(), "read".to_string()),
-            ("learn_exam".to_string(), "publish".to_string()),
-            ("learn_question".to_string(), "delete".to_string()),
+            ("permission_rule".to_string(), "delete".to_string()),
+            ("permission_rule".to_string(), "create".to_string()),
         ]);
         // scoped key 归一化为 plain type；多来源等价授权去重为单条目；
         // 升序输出保证确定性（detect_conflicts 的持有面语义）。
         assert_eq!(
             pairs,
             vec![
-                ("learn_exam".to_string(), "publish".to_string()),
-                ("learn_question".to_string(), "delete".to_string()),
-                ("learn_subject".to_string(), "read".to_string()),
+                ("permission_rule".to_string(), "create".to_string()),
+                ("permission_rule".to_string(), "delete".to_string()),
+                ("permission_rule".to_string(), "read".to_string()),
                 ("user".to_string(), "read".to_string()),
             ]
         );

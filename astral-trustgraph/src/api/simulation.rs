@@ -384,18 +384,24 @@ mod tests {
 
     #[test]
     fn proposed_type_level_rule_matches_object_and_type_requests() {
-        let rule = overlay("ALLOW", "learn_subject:*", "read");
-        assert!(rule.matches("learn_subject:42", "read"));
-        assert!(rule.matches("learn_subject", "read"));
-        assert!(rule.matches("learn_subject:*", "read"));
+        let rule = overlay("ALLOW", "permission_rule:*", "read");
+        assert!(rule.matches("permission_rule:42", "read"));
+        assert!(rule.matches("permission_rule", "read"));
+        assert!(rule.matches("permission_rule:*", "read"));
         // 其它类型不命中。
         assert!(!rule.matches("approval:1", "read"));
         // 类型级请求绝不命中对象级规则。
-        assert!(!overlay("ALLOW", "learn_subject:42", "read").matches("learn_subject", "read"));
-        assert!(!overlay("ALLOW", "learn_subject:42", "read").matches("learn_subject:*", "read"));
+        assert!(!overlay("ALLOW", "permission_rule:42", "read").matches("permission_rule", "read"));
+        assert!(
+            !overlay("ALLOW", "permission_rule:42", "read").matches("permission_rule:*", "read")
+        );
         // 对象级规则只命中同一对象。
-        assert!(overlay("ALLOW", "learn_subject:42", "read").matches("learn_subject:42", "read"));
-        assert!(!overlay("ALLOW", "learn_subject:42", "read").matches("learn_subject:43", "read"));
+        assert!(
+            overlay("ALLOW", "permission_rule:42", "read").matches("permission_rule:42", "read")
+        );
+        assert!(
+            !overlay("ALLOW", "permission_rule:42", "read").matches("permission_rule:43", "read")
+        );
         // 全局通配。
         assert!(overlay("DENY", "*", "read").matches("anything:1", "read"));
     }
@@ -403,14 +409,14 @@ mod tests {
     #[test]
     fn proposed_action_matching_supports_exact_alias_and_wildcard() {
         // write 别名展开：create/update/delete 请求可命中 write 规则。
-        let rule = overlay("ALLOW", "learn_subject:*", "write");
-        assert!(rule.matches("learn_subject:1", "create"));
-        assert!(rule.matches("learn_subject:1", "update"));
-        assert!(rule.matches("learn_subject:1", "delete"));
-        assert!(!rule.matches("learn_subject:1", "read"));
+        let rule = overlay("ALLOW", "permission_rule:*", "write");
+        assert!(rule.matches("permission_rule:1", "create"));
+        assert!(rule.matches("permission_rule:1", "update"));
+        assert!(rule.matches("permission_rule:1", "delete"));
+        assert!(!rule.matches("permission_rule:1", "read"));
         // 通配动作命中任意请求动作；exact 照常命中。
-        assert!(overlay("ALLOW", "learn_subject:*", "*").matches("learn_subject:1", "read"));
-        assert!(overlay("ALLOW", "learn_subject:*", "read").matches("learn_subject:1", "read"));
+        assert!(overlay("ALLOW", "permission_rule:*", "*").matches("permission_rule:1", "read"));
+        assert!(overlay("ALLOW", "permission_rule:*", "read").matches("permission_rule:1", "read"));
     }
 
     #[test]

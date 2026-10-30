@@ -56,9 +56,9 @@ def environment():
         "REDIS_URL": "redis://127.0.0.1:6380/0",
         "RABBITMQ_URL": "amqp://fixture@127.0.0.1:5673/%2f",
         "ASTRAL_MIGRATION_ENV": "isolated", "RUST_INTEGRATION_REQUIRED": "1",
-        "TEST_USE_EXISTING": "1", "ASTRAL_REDIS_PROJECTION_COMPAT": "true",
+        "TEST_USE_EXISTING": "1",
         "ASTRAL_MESSAGE_TRANSPORT": "rabbit", "ASTRAL_TARGET_REGION": "foreign-region",
-        "ASTRAL_PERF_CASE": "one-filtered-case", "COMPOSE_PROFILES": "rabbit,redis-compat",
+        "ASTRAL_PERF_CASE": "one-filtered-case", "COMPOSE_PROFILES": "rabbit",
     }
 
 
@@ -99,7 +99,6 @@ class SelectionTests(unittest.TestCase):
 
     def test_e_family_does_not_include_excluded_or_mt(self):
         selected = campaign.select_suites(self.manifest, series=["E"])
-        self.assertNotIn("excluded-service-checks", [item["id"] for item in selected])
         self.assertNotIn("mt-capacity", [item["id"] for item in selected])
 
     def test_exact_e2_has_five_runtime_targets(self):
@@ -203,12 +202,11 @@ class EnvironmentTests(unittest.TestCase):
         bad["RABBITMQ_URL"] = "amqp://fixture@127.0.0.1:5673/"
         self.assertIsNotNone(campaign.prepare_environment(suite("standalone-rabbit"), bad)[1])
 
-    def test_redis_is_explicit_compat_only(self):
-        env, problem = campaign.prepare_environment(suite("redis-compat"), environment())
+    def test_native_environment_scrubs_retired_redis_inputs(self):
+        env, problem = campaign.prepare_environment(suite(), environment())
         self.assertIsNone(problem)
-        self.assertIn("REDIS_URL", env)
-        self.assertNotIn("RABBITMQ_URL", env)
-        self.assertEqual(env["ASTRAL_REDIS_PROJECTION_COMPAT"], "true")
+        self.assertNotIn("REDIS_URL", env)
+        self.assertNotIn("ASTRAL_REDIS_PROJECTION_COMPAT", env)
 
     def test_absent_live_prerequisite_is_blocked(self):
         for key in ("TEST_USE_EXISTING", "ASTRAL_MIGRATION_ENV", "RUST_INTEGRATION_REQUIRED",

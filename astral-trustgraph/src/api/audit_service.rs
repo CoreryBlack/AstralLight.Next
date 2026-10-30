@@ -410,7 +410,7 @@ mod tests {
             user_id: Some(42),
             card_id: Some(7),
             action: "permission-check".into(),
-            resource: "learn_subject".into(),
+            resource: "user_profile".into(),
             decision: "ALLOW".into(),
             reason: None,
             event_type: AuditEventType::PermissionCheck,

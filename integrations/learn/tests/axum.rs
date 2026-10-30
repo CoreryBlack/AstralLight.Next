@@ -119,7 +119,7 @@ async fn central_adapter_consumes_http_proof_and_blocks_undeclared_methods() {
         .unwrap();
     let store = Arc::new(Mutex::new(store));
     let binding = Arc::new(ApplicationBinding {
-        app_id: "astral-learn".into(),
+        app_id: "course-app".into(),
         key_id: "test-app".into(),
         manifest: Arc::new(manifest()),
         signing_key: server.app_key.as_ref().clone(),

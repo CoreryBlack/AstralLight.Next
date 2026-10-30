@@ -25,7 +25,7 @@ fn complete_stage_plan_no_regression_matrix() {
         let grants: Vec<_> = (0..size)
             .map(|id| {
                 let mut grant = grant(id, 1, GrantState::Active);
-                grant.resource = format!("learn_subject:{id}");
+                grant.resource = format!("permission_rule:{id}");
                 grant
             })
             .collect();
@@ -136,7 +136,7 @@ fn segment_digest_hint_scheduling_curve() {
         let grants: Vec<_> = (0..size)
             .map(|id| {
                 let mut grant = grant(id as u16, 1, GrantState::Active);
-                grant.resource = format!("learn_subject:{id}");
+                grant.resource = format!("permission_rule:{id}");
                 grant.provenance.operation_id = format!("operation-{round}");
                 grant
             })
@@ -164,7 +164,7 @@ fn segment_digest_hint_scheduling_curve() {
             if index < mutated {
                 let mut grants = segment.grants.clone();
                 for g in &mut grants {
-                    g.resource = format!("learn_subject:changed-{index}");
+                    g.resource = format!("permission_rule:changed-{index}");
                 }
                 let content_hash = hex_lower(&Sha256::digest(serde_json::to_vec(&grants).unwrap()));
                 let content = policy_engine::SegmentContent {
@@ -259,7 +259,7 @@ fn segment_digest_hint_capacity_pressure_curve() {
     let now = std::time::Instant::now();
     let keys: Vec<_> = (1..=capacity as i64 + 1)
         .map(|id| {
-            policy_engine::ProjectionKey::new(id, 42, format!("learn_subject:{id}"), "read")
+            policy_engine::ProjectionKey::new(id, 42, format!("permission_rule:{id}"), "read")
                 .unwrap()
         })
         .collect();

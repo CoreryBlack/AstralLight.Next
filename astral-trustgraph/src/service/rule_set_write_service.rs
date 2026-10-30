@@ -427,8 +427,8 @@ mod tests {
 
     #[test]
     fn rejects_invalid_effect_before_mutation() {
-        let error =
-            validate_entry_fields("GRANT", Some("learn_course"), Some("read"), None).unwrap_err();
+        let error = validate_entry_fields("GRANT", Some("permission_rule"), Some("read"), None)
+            .unwrap_err();
         assert!(matches!(error, AstralError::Validation(message) if message.contains("effect")));
     }
 
@@ -436,8 +436,9 @@ mod tests {
     fn entry_effect_is_allow_only() {
         // canonical grant 只接受 ALLOW：DENY/未知值/空值全部拒绝
         for rejected in ["DENY", "deny", "REVOKE", "", "   "] {
-            let error = validate_entry_fields(rejected, Some("learn_course"), Some("read"), None)
-                .expect_err("non-ALLOW entry effect must be rejected");
+            let error =
+                validate_entry_fields(rejected, Some("permission_rule"), Some("read"), None)
+                    .expect_err("non-ALLOW entry effect must be rejected");
             assert!(
                 matches!(&error, AstralError::Validation(message) if message.contains("ALLOW")),
                 "rejected={rejected:?} unexpected={error:?}"
@@ -448,20 +449,20 @@ mod tests {
     #[test]
     fn allow_is_normalized_for_source_write() {
         // 大小写/空白归一后返回 canonical effect，供写入方使用
-        let effect = validate_entry_fields(" allow ", Some("learn_course"), Some("read"), None)
+        let effect = validate_entry_fields(" allow ", Some("permission_rule"), Some("read"), None)
             .expect("case-insensitive ALLOW must be accepted");
         assert_eq!(effect, "ALLOW");
     }
 
     #[test]
     fn accepts_allow_entry_before_mutation() {
-        validate_entry_fields("ALLOW", Some("learn_course"), Some("read"), None)
+        validate_entry_fields("ALLOW", Some("permission_rule"), Some("read"), None)
             .expect("valid ALLOW entry should pass validation");
     }
 
     #[test]
     fn rejects_unregistered_action_before_mutation() {
-        let error = validate_entry_fields("ALLOW", Some("learn_course"), Some("approve"), None)
+        let error = validate_entry_fields("ALLOW", Some("permission_rule"), Some("approve"), None)
             .unwrap_err();
         assert!(
             matches!(error, AstralError::Validation(message) if message.contains("Invalid action"))
@@ -470,17 +471,17 @@ mod tests {
 
     #[test]
     fn accepts_alias_action_whose_expansion_is_registered() {
-        // write → create/update/delete：learn_subject 三者全部注册，别名载荷
+        // write → create/update/delete：permission_rule 三者全部注册，别名载荷
         // 合法（引擎读侧别名展开以存储别名规则为前提）。
-        validate_entry_fields("ALLOW", Some("learn_subject"), Some("write"), None)
+        validate_entry_fields("ALLOW", Some("permission_rule"), Some("write"), None)
             .expect("registered alias expansion must be accepted");
     }
 
     #[test]
     fn rejects_alias_action_with_unregistered_expansion() {
-        // learn_device only registers read; a write alias cannot partially grant.
+        // user_profile only registers read; a write alias cannot partially grant.
         let error =
-            validate_entry_fields("ALLOW", Some("learn_device"), Some("write"), None).unwrap_err();
+            validate_entry_fields("ALLOW", Some("user_profile"), Some("write"), None).unwrap_err();
         assert!(matches!(error, AstralError::Validation(_)));
     }
 
@@ -488,7 +489,7 @@ mod tests {
     fn rejects_malformed_condition_before_mutation() {
         let error = validate_entry_fields(
             "ALLOW",
-            Some("learn_course"),
+            Some("permission_rule"),
             Some("read"),
             Some("{malformed"),
         )
@@ -499,15 +500,20 @@ mod tests {
     }
 
     #[test]
-    fn accepts_native_pascal_case_condition_for_registered_resource() {
+    fn rejects_native_pascal_case_condition_for_unconditioned_resource() {
         let condition =
             r#"{"conditionType":"TimeRangeCondition","params":{"start":"09:00","end":"18:00"}}"#;
-        validate_entry_fields("ALLOW", Some("learn_course"), Some("read"), Some(condition))
-            .expect("native conditionType/params form must be accepted");
+        validate_entry_fields(
+            "ALLOW",
+            Some("permission_rule"),
+            Some("read"),
+            Some(condition),
+        )
+        .expect_err("current registry resources reject unsupported conditions");
 
         let group = r#"{"allOf":[{"conditionType":"TimeRangeCondition","params":{"start":"09:00","end":"18:00"}}]}"#;
-        validate_entry_fields("ALLOW", Some("learn_course"), Some("read"), Some(group))
-            .expect("native allOf group must be accepted");
+        validate_entry_fields("ALLOW", Some("permission_rule"), Some("read"), Some(group))
+            .expect_err("current registry resources reject unsupported condition groups");
     }
 
     #[test]
@@ -517,9 +523,13 @@ mod tests {
             r#"{"conditionGroup":{"allOf":[{"ownerOnly":true}]}}"#,
             r#"{"timeRange":{"start":"09:00","end":"18:00"}}"#,
         ] {
-            let error =
-                validate_entry_fields("ALLOW", Some("learn_course"), Some("read"), Some(condition))
-                    .expect_err("legacy Java condition shape must fail closed");
+            let error = validate_entry_fields(
+                "ALLOW",
+                Some("permission_rule"),
+                Some("read"),
+                Some(condition),
+            )
+            .expect_err("legacy Java condition shape must fail closed");
             assert!(
                 matches!(&error, AstralError::Validation(message) if message.contains("condition_json")),
                 "condition={condition:?} unexpected={error:?}"
@@ -531,7 +541,7 @@ mod tests {
     fn rejects_native_condition_not_registered_for_resource() {
         let error = validate_entry_fields(
             "ALLOW",
-            Some("learn_device"),
+            Some("user_profile"),
             Some("read"),
             Some(r#"{"conditionType":"OwnerOnlyCondition","params":{}}"#),
         )

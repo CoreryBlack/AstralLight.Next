@@ -355,7 +355,7 @@ mod tests {
             user_id: 7,
             request_type: "RULE".into(),
             request_content: Some(
-                r#"{"resourceType":"learn_course","actionCode":"read","cardId":3}"#.into(),
+                r#"{"resourceType":"permission_rule","actionCode":"read","cardId":3}"#.into(),
             ),
             reason: None,
             status: "PENDING".into(),
@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn rule_metadata_is_parsed_without_loss() {
         let content = parse_rule_content(
-            r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"effect":"allow","priority":9,"conditionJson":{"conditionType":"OwnerOnlyCondition","params":{}},"validFrom":"2026-01-01","validTo":"2026-12-31"}"#,
+            r#"{"resourceType":"permission_rule","actionCode":"read","cardId":3,"effect":"allow","priority":9,"conditionJson":{"conditionType":"OwnerOnlyCondition","params":{}},"validFrom":"2026-01-01","validTo":"2026-12-31"}"#,
         )
         .expect("metadata should parse");
         // canonical grant 只接受 ALLOW；入参大小写归一后回写
@@ -386,7 +386,7 @@ mod tests {
     fn rule_content_effect_is_allow_only() {
         for rejected in ["DENY", "deny", "GRANT", "", "   "] {
             let value = serde_json::json!({
-                "resourceType": "learn_course",
+                "resourceType": "permission_rule",
                 "actionCode": "read",
                 "cardId": 3,
                 "effect": rejected
@@ -404,7 +404,7 @@ mod tests {
     fn rule_content_resource_action_must_be_registered() {
         for (resource, action) in [
             ("no_such_resource", "read"),
-            ("learn_course", "no_such_action"),
+            ("permission_rule", "no_such_action"),
         ] {
             let value = serde_json::json!({
                 "resourceType": resource,
@@ -426,8 +426,8 @@ mod tests {
         for (resource, action) in [
             ("", "read"),
             ("   ", "read"),
-            ("learn_course", ""),
-            ("learn_course", " \t "),
+            ("permission_rule", ""),
+            ("permission_rule", " \t "),
         ] {
             let value = serde_json::json!({
                 "resourceType": resource,
@@ -446,11 +446,11 @@ mod tests {
     #[test]
     fn rule_content_resource_action_is_trimmed() {
         let content = parse_rule_content(
-            r#"{"resourceType":"  learn_course ","actionCode":" read ","cardId":3}"#,
+            r#"{"resourceType":"  permission_rule ","actionCode":" read ","cardId":3}"#,
         )
         .expect("registered resource/action with whitespace must be accepted");
         // 归一化（trim）值回写 content：approve 转发到事务写入的与解析层同源
-        assert_eq!(content.resource_type, "learn_course");
+        assert_eq!(content.resource_type, "permission_rule");
         assert_eq!(content.action_code, "read");
     }
     #[tokio::test]
@@ -481,7 +481,7 @@ mod tests {
         assert_eq!(tx.reviewer_id, 1);
         assert_eq!(tx.comment.as_deref(), Some("ok"));
         assert_eq!(tx.card_id, 3);
-        assert_eq!(tx.resource, "learn_course");
+        assert_eq!(tx.resource, "permission_rule");
         assert_eq!(tx.action, "read");
         // 请求未带 effect → 默认 ALLOW 写入
         assert_eq!(tx.effect, "ALLOW");
@@ -527,34 +527,34 @@ mod tests {
         ] {
             let value = match legacy_field {
                 "resource" => serde_json::json!({
-                    "resource": "learn_course",
+                    "resource": "permission_rule",
                     "actionCode": "read",
                     "cardId": 3
                 }),
                 "action" => serde_json::json!({
-                    "resourceType": "learn_course",
+                    "resourceType": "permission_rule",
                     "action": "read",
                     "cardId": 3
                 }),
                 "card_id" => serde_json::json!({
-                    "resourceType": "learn_course",
+                    "resourceType": "permission_rule",
                     "actionCode": "read",
                     "card_id": 3
                 }),
                 "condition_json" => serde_json::json!({
-                    "resourceType": "learn_course",
+                    "resourceType": "permission_rule",
                     "actionCode": "read",
                     "cardId": 3,
                     "condition_json": {"conditionType": "OwnerOnlyCondition", "params": {}}
                 }),
                 "valid_from" => serde_json::json!({
-                    "resourceType": "learn_course",
+                    "resourceType": "permission_rule",
                     "actionCode": "read",
                     "cardId": 3,
                     "valid_from": "2026-01-01"
                 }),
                 "valid_to" => serde_json::json!({
-                    "resourceType": "learn_course",
+                    "resourceType": "permission_rule",
                     "actionCode": "read",
                     "cardId": 3,
                     "valid_to": "2026-12-31"
@@ -574,12 +574,12 @@ mod tests {
     #[tokio::test]
     async fn approve_rejects_legacy_rule_fields() {
         for legacy_content in [
-            r#"{"resource":"learn_course","actionCode":"read","cardId":3}"#,
-            r#"{"resourceType":"learn_course","action":"read","cardId":3}"#,
-            r#"{"resourceType":"learn_course","actionCode":"read","card_id":3}"#,
-            r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"condition_json":{"conditionType":"OwnerOnlyCondition","params":{}}}"#,
-            r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"valid_from":"2026-01-01"}"#,
-            r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"valid_to":"2026-12-31"}"#,
+            r#"{"resource":"permission_rule","actionCode":"read","cardId":3}"#,
+            r#"{"resourceType":"permission_rule","action":"read","cardId":3}"#,
+            r#"{"resourceType":"permission_rule","actionCode":"read","card_id":3}"#,
+            r#"{"resourceType":"permission_rule","actionCode":"read","cardId":3,"condition_json":{"conditionType":"OwnerOnlyCondition","params":{}}}"#,
+            r#"{"resourceType":"permission_rule","actionCode":"read","cardId":3,"valid_from":"2026-01-01"}"#,
+            r#"{"resourceType":"permission_rule","actionCode":"read","cardId":3,"valid_to":"2026-12-31"}"#,
         ] {
             let mut record = pending_record();
             record.request_content = Some(legacy_content.into());
@@ -599,7 +599,7 @@ mod tests {
     async fn approve_rejects_deny_effect_without_writing_source() {
         let mut rec = pending_record();
         rec.request_content = Some(
-            r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"effect":"DENY"}"#
+            r#"{"resourceType":"permission_rule","actionCode":"read","cardId":3,"effect":"DENY"}"#
                 .into(),
         );
         let repo = Arc::new(FakeRequestRepository::new(Some(rec)));
@@ -618,7 +618,7 @@ mod tests {
     async fn approve_rejects_unregistered_resource_without_writing_source() {
         for (resource, action) in [
             ("no_such_resource", "read"),
-            ("learn_course", "no_such_action"),
+            ("permission_rule", "no_such_action"),
         ] {
             let mut rec = pending_record();
             rec.request_content = Some(
@@ -646,7 +646,7 @@ mod tests {
     async fn approve_trims_and_forwards_normalized_resource_action() {
         let repo = Arc::new(FakeRequestRepository::new(Some(PermissionRequestRecord {
             request_content: Some(
-                r#"{"resourceType":"  learn_course ","actionCode":" read ","cardId":3}"#.into(),
+                r#"{"resourceType":"  permission_rule ","actionCode":" read ","cardId":3}"#.into(),
             ),
             ..pending_record()
         })));
@@ -657,7 +657,7 @@ mod tests {
             .expect("registered resource/action with whitespace must be approved");
         let tx = repo.approve_tx.lock().unwrap().clone().unwrap();
         // 事务写入参数为归一化（trim）后的二元组，permission_rule 与 ledger ADD 同源
-        assert_eq!(tx.resource, "learn_course");
+        assert_eq!(tx.resource, "permission_rule");
         assert_eq!(tx.action, "read");
         assert_eq!(tx.effect, "ALLOW");
     }
@@ -666,7 +666,7 @@ mod tests {
     async fn approve_preserves_canonical_rule_metadata() {
         let repo = Arc::new(FakeRequestRepository::new(Some(PermissionRequestRecord {
             request_content: Some(
-                r#"{"resourceType":"learn_course","actionCode":"read","cardId":3,"effect":"allow","conditionJson":{"conditionType":"OwnerOnlyCondition","params":{}},"validFrom":"2026-01-01","validTo":"2026-12-31"}"#.into(),
+                r#"{"resourceType":"permission_rule","actionCode":"read","cardId":3,"effect":"allow","conditionJson":{"conditionType":"OwnerOnlyCondition","params":{}},"validFrom":"2026-01-01","validTo":"2026-12-31"}"#.into(),
             ),
             ..pending_record()
         })));
@@ -677,7 +677,7 @@ mod tests {
             .expect("canonical metadata should be accepted");
         let tx = repo.approve_tx.lock().unwrap().clone().unwrap();
         assert_eq!(tx.card_id, 3);
-        assert_eq!(tx.resource, "learn_course");
+        assert_eq!(tx.resource, "permission_rule");
         assert_eq!(tx.action, "read");
         // 归一化后的 ALLOW 传入审批事务，而不是原始入参
         assert_eq!(tx.effect, "ALLOW");
@@ -687,7 +687,7 @@ mod tests {
     async fn approve_without_card_rejects_request() {
         let mut rec = pending_record();
         rec.request_content =
-            Some(r#"{"resourceType":"learn_course","actionCode":"read","cardId":null}"#.into());
+            Some(r#"{"resourceType":"permission_rule","actionCode":"read","cardId":null}"#.into());
         let repo = Arc::new(FakeRequestRepository::new(Some(rec)));
         let svc = ApprovalService::new(repo.clone());
 

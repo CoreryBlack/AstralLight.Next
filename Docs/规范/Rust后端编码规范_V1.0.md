@@ -7,7 +7,7 @@
 >
 > CURRENT V6 合同：正式授权只经 `PolicyEngine::evaluate()` 和 published-evidence strict gate；`RuleRepository` 是四个无默认实现的 required read port（§7.2），projection 唯一执行协议为 `WorkerOwned`（§15.5）。Redis runtime/compatibility surface 已从当前合同移除；进程本地 L1 必须有 TTL、容量和清理边界，cache miss/failure 只回到严格 DB reader 或 `PENDING`/`DENY`，不声称等价替代跨实例性能或 Redis 指标。`astral-cache` crate/source/standalone manifest/lock/test surface 已退出当前软件合同；不得将其视为保留的 archive，也不得据此声称数据库表或外部环境已清理。旧 head/outbox 不再作为授权完成证明，仍用于 source correlation、revoke / RuleSet 初始化关联、ELIGIBILITY L1 invalidation 等明确职责；不据此声明数据库表已删除或任何环境已迁移。CURRENT V6 的完整授权 bundle 与采用、迁移和回退边界见 §§15.7–15.8。本文为工程规范；架构解释和证据索引见 [Rust访问控制总览与调整路线](../架构/Rust架构设计/Rust访问控制总览与调整路线_V1.0.md) 与 [Rust权限投影快照与版本栅栏](../架构/Rust架构设计/Rust权限投影快照与版本栅栏_V1.0.md)。
 >
-> 源码、历史迁移与验收状态须分别举证。`astral-learn` 与 `astral-chat` 仍位于 workspace 外；历史 v3 migration 文件名、字节、migration ID、SQLx checksum 与既有经验报告保持原样。文档中的 V6 adoption notice 不表示目标数据库、Redis/MQ 资源或任何部署环境已经修改。
+> 源码、历史迁移与验收状态须分别举证。`astral-chat` 与 `astral-learn` 生产 runtime crates 已退役并从 checkout 物理移除；历史 v3 migration 文件名、字节、migration ID、SQLx checksum 与既有经验报告保持原样。文档中的 V6 adoption notice 不表示目标数据库、Redis/MQ 资源或任何部署环境已经修改。
 
 ## CURRENT V6 验收边界
 
@@ -42,9 +42,7 @@
 | `astral-mq` | 库 | 消息队列层：RabbitMQ 队列声明、Producer/Consumer |
 | `astral-gateway` | 二进制 | API 网关：JWT 验证、路由转发、限流、断路器 |
 | `astral-identity` | 二进制 | 身份认证服务：登录/注册/JWT 签发/用户管理/卡片管理/MFA |
-| `astral-learn` | 库+二进制（源码冻结，workspace exclude） | 教育业务服务源码；不参加默认 workspace 编译/测试，解冻前不得宣称默认 gate 覆盖 |
 | `astral-trustgraph` | 库+二进制 | 权限治理中心：规则管理/规则集/审批/审计/新授权投影 |
-| `astral-chat` | 库+二进制（源码冻结，workspace exclude） | 即时通讯服务源码；不参加默认 workspace 编译/测试，解冻前不得宣称默认 gate 覆盖 |
 | `astral-monitor` | 库+二进制 | 监控与告警服务：健康检查/指标/告警规则 |
 | `astral-single-node` | 二进制 | 单机组合进程运行时：同进程装配 Gateway/Identity/MQ/TrustGraph（单机降级形态） |
 | `e2e-bootstrap` | 二进制 | e2e 实验隔离启动入口 |
@@ -1116,6 +1114,8 @@ pub async fn evaluate<R: RuleRepository>(&self, ctx: &PolicyContext, repo: &R) -
 
 ### 15.2 Crate 元信息
 
+该示例保留历史 crate 元信息格式；`astral-learn` 生产 runtime crate 已从当前 checkout 物理移除，不属于当前 workspace 或可解冻的运行时入口。
+
 ```toml
 [package]
 name = "astral-learn"
@@ -1128,7 +1128,7 @@ name = "astral-learn"
 path = "src/main.rs"
 ```
 
-> 注：`astral-learn` 当前位于默认 workspace 之外（根 `Cargo.toml` 的 `exclude`），解冻前不计入默认 `cargo --workspace` 检查/测试边界；此处仅作 crate 元信息示例。
+> 注：以上仅为历史迁移资料示例，不代表 crate 当前存在或参与 Cargo 检查/测试。
 
 
 ### 15.3 Redis compatibility 退役（CURRENT V6）

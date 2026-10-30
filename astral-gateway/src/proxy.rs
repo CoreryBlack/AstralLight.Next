@@ -10,29 +10,13 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use axum::body::Body;
-use axum::extract::{Path, Request, State, WebSocketUpgrade};
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
-use futures_util::{SinkExt, Stream, StreamExt};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::time::timeout;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::http::Request as WsRequest;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
+use futures_util::{Stream, StreamExt};
 
-use crate::middleware::{complete_internal_idempotency, release_internal_idempotency};
 use astral_common::config::AppConfig;
 use astral_common::middleware::gateway_signature::compute_hmac_signature_v3;
-use astral_common::middleware::internal_signature::{
-    compute_internal_signature, normalize_query, sha256_hex, InternalSignatureInput,
-    INTERNAL_BODY_SHA256_HEADER, INTERNAL_CALLER_GATEWAY, INTERNAL_CALLER_LEARN,
-    INTERNAL_IDEMPOTENCY_HEADER, INTERNAL_KEY_ID_HEADER, INTERNAL_NONCE_HEADER,
-    INTERNAL_PROTOCOL_HEADER, INTERNAL_PROTOCOL_VERSION, INTERNAL_REQUEST_ID_HEADER,
-    INTERNAL_ROUTE_HEADER, INTERNAL_SERVICE_HEADER, INTERNAL_SESSION_PATH,
-    INTERNAL_SIGNATURE_HEADER, INTERNAL_TIMESTAMP_HEADER, KEY_ID_GATEWAY_TO_IDENTITY,
-    ROUTE_GATEWAY_TO_IDENTITY,
-};
-use astral_common::token_contract::CHAT_WS_SUBPROTOCOL;
 
 /// HTTP 客户端（连接池复用）
 static CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
@@ -44,7 +28,6 @@ static CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::n
         .expect("reqwest Client")
 });
 
-const UPSTREAM_WS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// Bounded collection cap for JSON/HTTP upstream responses. Large media and
 /// streaming endpoints need an explicit streaming proxy contract before widening.
 const MAX_UPSTREAM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -72,7 +55,6 @@ fn is_public_identity_empty_bootstrap(method: &axum::http::Method, path: &str) -
                 | "/api/v1/auth/password/reset/token"
                 | "/api/v1/auth/verification/send"
                 | "/api/v1/auth/verification/verify"
-                | "/v1/app/users/login"
         ) || path
             .strip_prefix("/api/v1/auth/password/reset/")
             .is_some_and(|token| !token.is_empty() && !token.contains('/')))
@@ -82,19 +64,6 @@ fn is_non_empty_bearer(value: &str) -> bool {
     value
         .strip_prefix("Bearer ")
         .is_some_and(|token| !token.trim().is_empty())
-}
-
-fn configured_service_uri_from_values(env_value: Option<&str>, configured: &str) -> String {
-    env_value
-        .filter(|value| !value.trim().is_empty())
-        .map(str::trim)
-        .unwrap_or_else(|| configured.trim())
-        .to_string()
-}
-
-fn configured_service_uri(env_name: &str, configured: &str) -> String {
-    let env_value = std::env::var(env_name).ok();
-    configured_service_uri_from_values(env_value.as_deref(), configured)
 }
 
 async fn collect_bounded_response_body<S, E>(
@@ -254,67 +223,9 @@ impl CircuitBreaker {
     }
 }
 
-static CB_LEARN: CircuitBreaker = CircuitBreaker::new();
 static CB_IDENTITY: CircuitBreaker = CircuitBreaker::new();
 static CB_TRUSTGRAPH: CircuitBreaker = CircuitBreaker::new();
 static CB_MONITOR: CircuitBreaker = CircuitBreaker::new();
-static CB_CHAT: CircuitBreaker = CircuitBreaker::new();
-
-/// 转发到 Learn 管理端
-pub async fn forward_to_learn_admin(
-    State(config): State<AppConfig>,
-    Path(path): Path<String>,
-    req: Request,
-) -> Response {
-    if CB_LEARN.is_open() {
-        tracing::warn!("circuit breaker open for learn service");
-        return json_error(
-            req.method().as_str(),
-            req.uri().path(),
-            request_trace_id(&req),
-            503,
-            "Learn service unavailable (circuit breaker)",
-            "SERVICE_UNAVAILABLE",
-        );
-    }
-    let full_path = format!("/v1/admin/learn/{path}");
-    let learn_uri = config.learn_service_uri.as_str();
-    let response = forward(&config, learn_uri, &full_path, req).await;
-    if dependency_failure(response.status()) {
-        CB_LEARN.record_failure();
-    } else {
-        CB_LEARN.record_success();
-    }
-    response
-}
-
-/// 转发到 Learn 应用端
-pub async fn forward_to_learn_app(
-    State(config): State<AppConfig>,
-    Path(path): Path<String>,
-    req: Request,
-) -> Response {
-    if CB_LEARN.is_open() {
-        tracing::warn!("circuit breaker open for learn service");
-        return json_error(
-            req.method().as_str(),
-            req.uri().path(),
-            request_trace_id(&req),
-            503,
-            "Learn service unavailable (circuit breaker)",
-            "SERVICE_UNAVAILABLE",
-        );
-    }
-    let full_path = format!("/v1/app/learn/{path}");
-    let learn_uri = config.learn_service_uri.as_str();
-    let response = forward(&config, learn_uri, &full_path, req).await;
-    if dependency_failure(response.status()) {
-        CB_LEARN.record_failure();
-    } else {
-        CB_LEARN.record_success();
-    }
-    response
-}
 
 /// 转发到 Identity 服务（静态路径由调用方路由保证已注册）。
 pub async fn forward_to_identity_static(State(config): State<AppConfig>, req: Request) -> Response {
@@ -362,202 +273,6 @@ async fn forward_identity_path(config: AppConfig, full_path: String, req: Reques
     response
 }
 
-pub async fn forward_internal_session(State(config): State<AppConfig>, req: Request) -> Response {
-    if CB_IDENTITY.is_open() {
-        return json_error(
-            req.method().as_str(),
-            req.uri().path(),
-            request_trace_id(&req),
-            503,
-            "Identity service unavailable (circuit breaker)",
-            "SERVICE_UNAVAILABLE",
-        );
-    }
-    let (parts, body) = req.into_parts();
-    let external_path = parts.uri.path().to_string();
-    let request_id = parts
-        .headers
-        .get("x-internal-request-id")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let idempotency_key = parts
-        .headers
-        .get(INTERNAL_IDEMPOTENCY_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let body = match axum::body::to_bytes(body, 1024 * 1024).await {
-        Ok(body) => body,
-        Err(_) => {
-            return json_error(
-                "POST",
-                &external_path,
-                Some(&request_id),
-                400,
-                "Failed to read internal request body",
-                "BAD_REQUEST",
-            )
-        }
-    };
-    let body_hash = sha256_hex(&body);
-    let target_user_id = match serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|value| value.get("userId").and_then(serde_json::Value::as_i64))
-        .filter(|value| *value > 0)
-    {
-        Some(value) => value.to_string(),
-        None => {
-            return json_error(
-                "POST",
-                &external_path,
-                Some(&request_id),
-                400,
-                "Invalid internal session body",
-                "BAD_REQUEST",
-            )
-        }
-    };
-    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
-    let timestamp = timestamp.to_string();
-    let nonce = format!(
-        "nonce-{}-{}",
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-        std::process::id()
-    );
-    if parts.uri.query().is_some() {
-        return json_error(
-            "POST",
-            &external_path,
-            Some(&request_id),
-            401,
-            "Internal session query parameters are forbidden",
-            "UNAUTHORIZED",
-        );
-    }
-    let normalized_query = normalize_query(parts.uri.query());
-    let input = InternalSignatureInput {
-        protocol_version: INTERNAL_PROTOCOL_VERSION,
-        key_id: KEY_ID_GATEWAY_TO_IDENTITY,
-        caller_service: INTERNAL_CALLER_GATEWAY,
-        method: "POST",
-        path: INTERNAL_SESSION_PATH,
-        normalized_query: &normalized_query,
-        body_sha256: &body_hash,
-        target_user_id: &target_user_id,
-        timestamp: &timestamp,
-        nonce: &nonce,
-        request_id: &request_id,
-        idempotency_key: &idempotency_key,
-        route: ROUTE_GATEWAY_TO_IDENTITY,
-    };
-    let signature = compute_internal_signature(&config.gateway.internal_service_secret, &input);
-    let identity_service_uri = config.identity_service_uri.as_str();
-    let uri = format!(
-        "{}{}",
-        identity_service_uri.trim_end_matches('/'),
-        INTERNAL_SESSION_PATH
-    );
-    if identity_service_uri.trim().is_empty() || config.gateway.internal_service_secret.len() < 32 {
-        return json_error(
-            "POST",
-            &external_path,
-            Some(&request_id),
-            503,
-            "Internal identity route is not configured",
-            "SERVICE_UNAVAILABLE",
-        );
-    }
-    let response = CLIENT
-        .post(uri)
-        .header("content-type", "application/json")
-        .header(INTERNAL_PROTOCOL_HEADER, INTERNAL_PROTOCOL_VERSION)
-        .header(INTERNAL_SERVICE_HEADER, INTERNAL_CALLER_GATEWAY)
-        .header("x-internal-caller", INTERNAL_CALLER_GATEWAY)
-        .header(INTERNAL_TIMESTAMP_HEADER, &timestamp)
-        .header(INTERNAL_NONCE_HEADER, &nonce)
-        .header(INTERNAL_REQUEST_ID_HEADER, &request_id)
-        .header(INTERNAL_IDEMPOTENCY_HEADER, &idempotency_key)
-        .header(INTERNAL_BODY_SHA256_HEADER, &body_hash)
-        .header(INTERNAL_SIGNATURE_HEADER, &signature)
-        .header(INTERNAL_KEY_ID_HEADER, KEY_ID_GATEWAY_TO_IDENTITY)
-        .header(INTERNAL_ROUTE_HEADER, ROUTE_GATEWAY_TO_IDENTITY)
-        .body(body.to_vec())
-        .send()
-        .await;
-    let response = match response {
-        Ok(response) => response,
-        Err(error) => {
-            // Delivery outcome is unknown once the request is sent. Leave the
-            // in-flight guard in place so a caller cannot duplicate a session.
-            CB_IDENTITY.record_failure();
-            tracing::warn!(error_kind = %error.without_url(), "internal Identity request failed");
-            return json_error(
-                "POST",
-                &external_path,
-                Some(&request_id),
-                502,
-                "Identity service request failed",
-                "BAD_GATEWAY",
-            );
-        }
-    };
-    let status = response.status();
-    let headers = response.headers().clone();
-    let response_body = match collect_upstream_response_body(response).await {
-        Ok(body) => body,
-        Err(_) => {
-            CB_IDENTITY.record_failure();
-            // A truncated/oversized response does not prove that Identity
-            // failed before creating a session. Preserve the in-flight guard.
-            return json_error(
-                "POST",
-                &external_path,
-                Some(&request_id),
-                502,
-                "Identity response read failed or exceeded the configured size limit",
-                "BAD_GATEWAY",
-            );
-        }
-    };
-
-    if status.is_server_error() {
-        CB_IDENTITY.record_failure();
-        let _ = release_internal_idempotency(
-            &config,
-            INTERNAL_CALLER_LEARN,
-            "learn-to-gateway",
-            &idempotency_key,
-        )
-        .await;
-    } else {
-        CB_IDENTITY.record_success();
-        let _ = complete_internal_idempotency(
-            &config,
-            INTERNAL_CALLER_LEARN,
-            "learn-to-gateway",
-            &idempotency_key,
-            &body_hash,
-        )
-        .await;
-    }
-    let mut builder = Response::builder().status(status);
-    for (name, value) in headers {
-        if let Some(name) = name {
-            if name != "connection" && name != "transfer-encoding" {
-                builder = builder.header(name, value);
-            }
-        }
-    }
-    builder
-        .body(Body::from(response_body))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-}
 pub async fn forward_to_trustgraph(
     State(config): State<AppConfig>,
     Path(path): Path<String>,
@@ -613,358 +328,6 @@ pub async fn forward_to_monitor(
     response
 }
 
-/// 转发到 Chat 服务
-pub async fn forward_to_chat(
-    State(config): State<AppConfig>,
-    Path(path): Path<String>,
-    req: Request,
-) -> Response {
-    if CB_CHAT.is_open() {
-        tracing::warn!("circuit breaker open for chat service");
-        return json_error(
-            req.method().as_str(),
-            req.uri().path(),
-            request_trace_id(&req),
-            503,
-            "Chat service unavailable (circuit breaker)",
-            "SERVICE_UNAVAILABLE",
-        );
-    }
-    let full_path = format!("/v1/chat/{path}");
-    let chat_uri = configured_service_uri("CHAT_SERVICE_URI", &config.chat_service_uri);
-    if chat_uri.trim().is_empty() {
-        return json_error(
-            req.method().as_str(),
-            req.uri().path(),
-            request_trace_id(&req),
-            503,
-            "Chat service URI is not configured",
-            "SERVICE_UNAVAILABLE",
-        );
-    }
-    let response = forward(&config, &chat_uri, &full_path, req).await;
-    if dependency_failure(response.status()) {
-        CB_CHAT.record_failure();
-    } else {
-        CB_CHAT.record_success();
-    }
-    response
-}
-
-/// 转发到 Learn 服务（/v1/app/users 路径，对齐 Java AppUserController）
-pub async fn forward_to_learn_app_users(
-    State(config): State<AppConfig>,
-    Path(path): Path<String>,
-    req: Request,
-) -> Response {
-    if CB_LEARN.is_open() {
-        return json_error(
-            req.method().as_str(),
-            req.uri().path(),
-            request_trace_id(&req),
-            503,
-            "Learn service unavailable (circuit breaker)",
-            "SERVICE_UNAVAILABLE",
-        );
-    }
-    let full_path = format!("/v1/app/users/{path}");
-    let learn_uri = config.learn_service_uri.as_str();
-    let response = forward(&config, learn_uri, &full_path, req).await;
-    if dependency_failure(response.status()) {
-        CB_LEARN.record_failure();
-    } else {
-        CB_LEARN.record_success();
-    }
-    response
-}
-
-/// 转发到 Learn 服务（/v1/app/users 根路径）
-pub async fn forward_to_learn_app_users_root(
-    State(config): State<AppConfig>,
-    req: Request,
-) -> Response {
-    if CB_LEARN.is_open() {
-        return json_error(
-            req.method().as_str(),
-            req.uri().path(),
-            request_trace_id(&req),
-            503,
-            "Learn service unavailable (circuit breaker)",
-            "SERVICE_UNAVAILABLE",
-        );
-    }
-    let learn_uri = config.learn_service_uri.as_str();
-    let response = forward(&config, learn_uri, "/v1/app/users", req).await;
-    if dependency_failure(response.status()) {
-        CB_LEARN.record_failure();
-    } else {
-        CB_LEARN.record_success();
-    }
-    response
-}
-
-/// 转发 Chat WebSocket（真正的双向 upgrade 隧道）。
-pub async fn forward_chat_ws(
-    State(config): State<AppConfig>,
-    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
-    Path(path): Path<String>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    if !path.parse::<i64>().is_ok_and(|user_id| user_id > 0) {
-        return json_error(
-            "GET",
-            original_uri.path(),
-            None,
-            404,
-            "Chat WebSocket route not found",
-            "NOT_FOUND",
-        );
-    }
-    if CB_CHAT.is_open() {
-        return json_error(
-            "GET",
-            original_uri.path(),
-            None,
-            503,
-            "Chat service unavailable (circuit breaker)",
-            "SERVICE_UNAVAILABLE",
-        );
-    }
-    let target_path = format!("/v1/chat/ws/{path}");
-    // 外部 canonical path 必须使用客户端请求路径；上游 URL 使用 rewrite 后的内部路径。
-    let external_path = original_uri.path().to_string();
-    let chat_uri = configured_service_uri("CHAT_SERVICE_URI", &config.chat_service_uri);
-    let upstream_url = match websocket_upstream_url(&chat_uri, &target_path) {
-        Ok(url) => url,
-        Err(message) => {
-            return json_error(
-                "GET",
-                original_uri.path(),
-                None,
-                503,
-                message,
-                "SERVICE_UNAVAILABLE",
-            )
-        }
-    };
-
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .to_string();
-    let value = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|header| header.to_str().ok())
-            .unwrap_or("")
-            .trim()
-            .to_string()
-    };
-    let user_id = value("x-user-id");
-    let token_id = value("x-token-id");
-    let identity_card_id = value("x-identity-card-id");
-    let principal_kind = value("x-principal-kind");
-    let user_card_id = value("x-user-card-id");
-    let user_card_domain_id = value("x-user-card-domain-id");
-    let user_card_tenant_id = value("x-user-card-tenant-id");
-    let token_use = value("x-token-use");
-    let claims_version = value("x-claims-version");
-    let action_codes = value("x-action-codes");
-    let user_roles = value("x-user-roles");
-    let template_id = value("x-template-id");
-    let tenant_status = value("x-tenant-status");
-    let perms_ref = value("x-perms-ref");
-    let permissions_truncated = value("x-permissions-truncated");
-    // v3 签名（问题 1 修正：identity_card 不承担组织归属，payload 移除身份侧租户）
-    let signature = compute_hmac_signature_v3(
-        &config.gateway.hmac_secret,
-        "GET",
-        &external_path,
-        &user_id,
-        &principal_kind,
-        &token_id,
-        &identity_card_id,
-        &user_card_id,
-        &user_card_domain_id,
-        &user_card_tenant_id,
-        &token_use,
-        &claims_version,
-        &action_codes,
-        &user_roles,
-        &timestamp,
-    );
-
-    let mut builder = WsRequest::builder().uri(upstream_url);
-    builder = builder.header("sec-websocket-protocol", CHAT_WS_SUBPROTOCOL);
-    for (name, header) in headers.iter() {
-        let key = name.as_str().to_ascii_lowercase();
-        if crate::middleware::is_proxy_forbidden_header(&key) {
-            continue;
-        }
-        if let Ok(text) = header.to_str() {
-            builder = builder.header(name.as_str(), text);
-        }
-    }
-    for (name, value) in [
-        ("x-user-id", user_id.as_str()),
-        ("x-token-id", token_id.as_str()),
-        ("x-identity-card-id", identity_card_id.as_str()),
-        ("x-principal-kind", principal_kind.as_str()),
-        ("x-user-card-id", user_card_id.as_str()),
-        ("x-user-card-domain-id", user_card_domain_id.as_str()),
-        ("x-user-card-tenant-id", user_card_tenant_id.as_str()),
-        ("x-token-use", token_use.as_str()),
-        ("x-claims-version", claims_version.as_str()),
-        ("x-action-codes", action_codes.as_str()),
-        ("x-user-roles", user_roles.as_str()),
-        ("x-template-id", template_id.as_str()),
-        ("x-tenant-status", tenant_status.as_str()),
-        ("x-perms-ref", perms_ref.as_str()),
-        ("x-permissions-truncated", permissions_truncated.as_str()),
-    ] {
-        if !value.is_empty() {
-            builder = builder.header(name, value);
-        }
-    }
-    let request = match builder
-        .header("x-gateway-auth", "verified")
-        .header("x-gateway-ts", &timestamp)
-        .header("x-gateway-signature", &signature)
-        .header("x-original-path", &external_path)
-        .body(())
-    {
-        Ok(request) => request,
-        Err(error) => {
-            tracing::error!(error = %error, "failed to build Chat WebSocket request");
-            return json_error(
-                "GET",
-                original_uri.path(),
-                None,
-                502,
-                "Invalid Chat WebSocket request",
-                "BAD_GATEWAY",
-            );
-        }
-    };
-
-    let (upstream, _response) =
-        match timeout(UPSTREAM_WS_CONNECT_TIMEOUT, connect_async(request)).await {
-            Ok(Ok(result)) => {
-                CB_CHAT.record_success();
-                result
-            }
-            Ok(Err(error)) => {
-                CB_CHAT.record_failure();
-                tracing::warn!(error = %error, "Chat WebSocket upstream handshake failed");
-                return json_error(
-                    "GET",
-                    original_uri.path(),
-                    None,
-                    502,
-                    "Chat WebSocket upstream handshake failed",
-                    "BAD_GATEWAY",
-                );
-            }
-            Err(_) => {
-                CB_CHAT.record_failure();
-                tracing::warn!("Chat WebSocket upstream handshake timed out");
-                return json_error(
-                    "GET",
-                    original_uri.path(),
-                    None,
-                    503,
-                    "Chat WebSocket upstream handshake timed out",
-                    "SERVICE_UNAVAILABLE",
-                );
-            }
-        };
-
-    let upgrade = ws
-        .protocols([CHAT_WS_SUBPROTOCOL])
-        .on_upgrade(move |socket| async move {
-            bridge_websocket(socket, upstream).await;
-        });
-    upgrade.into_response()
-}
-
-fn websocket_upstream_url(base_uri: &str, target_path: &str) -> Result<String, &'static str> {
-    let base_uri = base_uri.trim();
-    if base_uri.is_empty() {
-        return Err("Chat service URI is not configured");
-    }
-    let mut url = reqwest::Url::parse(base_uri).map_err(|_| "Chat service URI is invalid")?;
-    let websocket_scheme = match url.scheme() {
-        "http" => "ws",
-        "https" => "wss",
-        _ => return Err("Chat service URI must use http or https"),
-    };
-    url.set_scheme(websocket_scheme)
-        .map_err(|_| "Chat service URI scheme is invalid")?;
-
-    let base_path = url.path().trim_end_matches('/');
-    let path = format!("{base_path}{target_path}");
-    url.set_path(&path);
-    url.set_query(None);
-    Ok(url.to_string())
-}
-
-async fn bridge_websocket<S>(
-    socket: axum::extract::ws::WebSocket,
-    upstream: tokio_tungstenite::WebSocketStream<S>,
-) where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut client_sink, mut client_stream) = socket.split();
-    let (mut upstream_sink, mut upstream_stream) = upstream.split();
-    let client_to_upstream = async {
-        while let Some(result) = client_stream.next().await {
-            let message = match result {
-                Ok(message) => message,
-                Err(error) => return Err(error.to_string()),
-            };
-            let converted = match message {
-                axum::extract::ws::Message::Text(text) => WsMessage::Text(text.to_string().into()),
-                axum::extract::ws::Message::Binary(bytes) => WsMessage::Binary(bytes),
-                axum::extract::ws::Message::Ping(bytes) => WsMessage::Ping(bytes),
-                axum::extract::ws::Message::Pong(bytes) => WsMessage::Pong(bytes),
-                axum::extract::ws::Message::Close(_) => break,
-            };
-            upstream_sink
-                .send(converted)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        Ok::<(), String>(())
-    };
-    let upstream_to_client = async {
-        while let Some(result) = upstream_stream.next().await {
-            let message = match result {
-                Ok(message) => message,
-                Err(error) => return Err(error.to_string()),
-            };
-            let converted = match message {
-                WsMessage::Text(text) => axum::extract::ws::Message::Text(text.to_string().into()),
-                WsMessage::Binary(bytes) => axum::extract::ws::Message::Binary(bytes),
-                WsMessage::Ping(bytes) => axum::extract::ws::Message::Ping(bytes),
-                WsMessage::Pong(bytes) => axum::extract::ws::Message::Pong(bytes),
-                WsMessage::Close(_) => break,
-                WsMessage::Frame(_) => continue,
-            };
-            client_sink
-                .send(converted)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        Ok::<(), String>(())
-    };
-    tokio::select! {
-        result = client_to_upstream => result,
-        result = upstream_to_client => result,
-    }
-    .unwrap_or_else(|error| tracing::debug!(error = %error, "Chat WebSocket bridge closed"));
-}
 async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let external_path = parts.uri.path().to_string();
@@ -1249,7 +612,7 @@ mod circuit_breaker_tests {
 #[cfg(test)]
 mod client_header_policy_tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderMap, HeaderValue};
 
     #[tokio::test]
     async fn gateway_proxy_and_identity_v3_verifier_share_empty_refresh_contract() {
@@ -1407,22 +770,6 @@ mod client_header_policy_tests {
     }
 
     #[test]
-    fn chat_service_uri_keeps_env_precedence_and_ignores_blank_env() {
-        assert_eq!(
-            configured_service_uri_from_values(Some(" http://env.invalid "), "http://yaml.invalid"),
-            "http://env.invalid"
-        );
-        assert_eq!(
-            configured_service_uri_from_values(Some("  "), " http://yaml.invalid "),
-            "http://yaml.invalid"
-        );
-        assert_eq!(
-            configured_service_uri_from_values(None, " http://yaml.invalid "),
-            "http://yaml.invalid"
-        );
-    }
-
-    #[test]
     fn canonical_session_routes_retain_bearer_only_for_post() {
         let bearer = HeaderValue::from_static("Bearer refresh-token");
         for path in [
@@ -1472,30 +819,6 @@ mod client_header_policy_tests {
         ));
         assert!(crate::middleware::is_proxy_forbidden_header(
             "authorization"
-        ));
-    }
-
-    #[test]
-    fn websocket_upstream_url_drops_query_credentials() {
-        let upstream =
-            websocket_upstream_url("http://chat.example.test/base", "/v1/chat/ws/42").unwrap();
-        assert_eq!(upstream, "ws://chat.example.test/base/v1/chat/ws/42");
-    }
-
-    #[test]
-    fn websocket_client_headers_forbid_subprotocol_and_authorization_forwarding() {
-        let stable = HeaderValue::from_static("astral-chat-v1");
-        assert!(!should_forward_client_header(
-            &axum::http::Method::GET,
-            "/v1/chat/ws/42",
-            "sec-websocket-protocol",
-            &stable,
-        ));
-        assert!(!should_forward_client_header(
-            &axum::http::Method::GET,
-            "/v1/chat/ws/42",
-            "authorization",
-            &HeaderValue::from_static("Bearer jwt-token"),
         ));
     }
 

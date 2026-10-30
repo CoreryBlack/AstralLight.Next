@@ -86,9 +86,14 @@ It intentionally excludes Java application services, web clients, patent
 materials, production deployment state, credentials, private keys, generated
 logs, frozen evidence archives, host routes, binaries, and build output.
 
-`astral-chat` and `astral-learn` are retained as frozen Rust source for migration
-review and remain excluded from the default workspace. The
-active members and dependency policy are defined in [`Cargo.toml`](Cargo.toml).
+The production Rust runtime crates `astral-chat` and `astral-learn`, their
+Gateway route registrations/proxies, and their production API contracts are
+retired and physically removed from this checkout. They are not current
+supported services or API contracts. Independent public SDK consumer samples
+under [`integrations/`](integrations/README.md) remain available for reference
+and testing; they are not replacements for or deployments of those production
+services. The active members and dependency policy are defined in
+[`Cargo.toml`](Cargo.toml).
 
 ## Quick start
 
@@ -168,8 +173,8 @@ skipped or interrupted checks are not silently promoted to `PASS`. Local compone
 coverage and offline models never stand in for a full RQ, live E1-E4, or HTTP
 performance campaign. Historical Redis/OPA comparative harnesses and fixtures, where
 retained, are not current AstralLight runtime dependencies or authorization gates;
-their status remains whatever the historical evidence records. Frozen/excluded crates
-are not covered by the root workspace gate. See [tests-suite](tests-suite/README.md)
+their status remains whatever the historical evidence records. Remaining excluded
+crates are not covered by the root workspace gate. See [tests-suite](tests-suite/README.md)
 for the exact matrix.
 
 For organization-scope migration inspection, set `ORG_MYSQL_URL` to a TCP MySQL
@@ -211,8 +216,7 @@ campaign has passed:
 - crate unit and integration tests, including tenant isolation, organization
   scope, projection, cache, identity, trustgraph, and audit coverage;
 - authorization compiler contracts and policy-engine benchmarks;
-- `scripts/run-tests.sh`, `scripts/org_scope_preflight.sh`, and
-  `scripts/verify-excluded-services.ps1`;
+- `scripts/run-tests.sh` and `scripts/org_scope_preflight.sh`;
 - Rust E1–E5 runner contracts and bounded models under `test-harness`; historical
   algorithm inputs retained under [`Docs/authorization-validation/tools/`](Docs/authorization-validation/tools/)
   are reference material and do not provide runtime compatibility or test entrypoints;

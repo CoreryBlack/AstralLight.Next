@@ -601,21 +601,21 @@ mod tests {
     fn canonical_entry_inputs_accept_resource_type_and_action_code_only() {
         let request = serde_json::from_value::<RuleSetEntryRequestDto>(serde_json::json!({
             "effect": "ALLOW",
-            "resourceType": "learn_course",
+            "resourceType": "permission_rule",
             "resourceId": 17,
             "actionCode": "read",
             "conditionJson": null,
             "priority": 0
         }))
         .expect("entry command must accept canonical names");
-        assert_eq!(request.resource_type.as_deref(), Some("learn_course"));
+        assert_eq!(request.resource_type.as_deref(), Some("permission_rule"));
         assert_eq!(request.resource_id, Some(17));
         assert_eq!(request.action_code.as_deref(), Some("read"));
 
         for field in ["resource", "action"] {
             let mut legacy = serde_json::json!({
                 "effect":"ALLOW",
-                "resourceType":"learn_course",
+                "resourceType":"permission_rule",
                 "actionCode":"read",
                 "priority":0
             });
@@ -627,7 +627,7 @@ mod tests {
         }
 
         let error = serde_json::from_str::<RuleSetEntryRequestDto>(
-            r#"{"effect":"ALLOW","resourceType":"learn_course","actionCode":"read",
+            r#"{"effect":"ALLOW","resourceType":"permission_rule","actionCode":"read",
                 "conditionJson":null,"priority":0,"validFrom":"2026-12-23T04:26:40Z"}"#,
         )
         .expect_err("validity is a canonical read-only field");
@@ -678,7 +678,7 @@ mod tests {
         ] {
             let mut request = serde_json::json!({
                 "effect":"ALLOW",
-                "resourceType":"learn_course",
+                "resourceType":"permission_rule",
                 "actionCode":"read",
                 "priority":0
             });
@@ -739,7 +739,7 @@ mod tests {
         let entry = RuleSetEntryDto::from(RuleSetEntryDefinition {
             entry_id: 3,
             rule_set_id: 7,
-            resource_type: "learn_course".into(),
+            resource_type: "permission_rule".into(),
             resource_id: Some(17),
             action_code: "read".into(),
             effect: "ALLOW".into(),
@@ -755,7 +755,7 @@ mod tests {
         let value = serde_json::to_value(entry).expect("complete entry view serializes");
         assert_eq!(value["entryId"], 3);
         assert_eq!(value["ruleSetId"], 7);
-        assert_eq!(value["resourceType"], "learn_course");
+        assert_eq!(value["resourceType"], "permission_rule");
         assert_eq!(value["resourceId"], 17);
         assert_eq!(value["actionCode"], "read");
         assert_eq!(value["enabled"], true);

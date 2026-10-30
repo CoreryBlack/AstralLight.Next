@@ -13,7 +13,7 @@ fn keypair(seed: u8) -> SigningKey {
 
 fn request() -> AuthorizationRequest {
     AuthorizationRequest {
-        app_id: "chat_app".into(),
+        app_id: "messaging_app".into(),
         key_id: "client_key_1".into(),
         manifest_digest: "a".repeat(64),
         revision: "mapping-17".into(),
@@ -26,11 +26,11 @@ fn request() -> AuthorizationRequest {
             subject: "subject-9".into(),
         },
         method: "POST".into(),
-        path: "/chat/messages/7".into(),
+        path: "/messages/7".into(),
         action: "create".into(),
         operation_id: "operation-20261005-01".into(),
         facts: ResourceFacts {
-            resource_type: "chat_message".into(),
+            resource_type: "message_record".into(),
             target_id: "7".into(),
             external_tenant_id: "tenant-a".into(),
             external_domain_id: "domain-a".into(),
@@ -46,12 +46,12 @@ fn request() -> AuthorizationRequest {
 
 fn manifest() -> ApplicationManifest {
     ApplicationManifest {
-        app_id: "chat_app".into(),
+        app_id: "messaging_app".into(),
         revision: "manifest-2".into(),
         routes: vec![ManifestRoute {
             method: "POST".into(),
-            path: "/chat/messages/{id}".into(),
-            resource_type: "chat_message".into(),
+            path: "/messages/{id}".into(),
+            resource_type: "message_record".into(),
             action: "create".into(),
             operation: ResourceOperation::Object,
             resolver: ResourceResolver::Object {
@@ -63,7 +63,7 @@ fn manifest() -> ApplicationManifest {
 
 #[test]
 fn identifiers_and_manifest_mapping_are_strict() {
-    assert!(identifier("chat_message").is_ok());
+    assert!(identifier("message_record").is_ok());
     assert!(identifier("Bad:resource").is_err());
     assert!(identifier("resource.*").is_err());
     assert!(identifier("_resource").is_err());
@@ -179,35 +179,35 @@ fn manifest_rejects_duplicates_and_undeclared_or_mismatched_routes() {
     let declared = manifest();
     declared.validate().unwrap();
     assert!(declared.permits(
-        "chat_message",
+        "message_record",
         "create",
         "POST",
-        "/chat/messages/7",
+        "/messages/7",
         ResourceOperation::Object
     ));
     assert!(!declared.permits(
         "user_card",
         "create",
         "POST",
-        "/chat/messages/7",
+        "/messages/7",
         ResourceOperation::Object
     ));
     assert!(!declared.permits(
-        "chat_message",
+        "message_record",
         "delete",
         "POST",
-        "/chat/messages/7",
+        "/messages/7",
         ResourceOperation::Object
     ));
     assert!(!declared.permits(
-        "chat_message",
+        "message_record",
         "create",
         "GET",
-        "/chat/messages/7",
+        "/messages/7",
         ResourceOperation::Object
     ));
     assert!(!declared.permits(
-        "chat_message",
+        "message_record",
         "create",
         "POST",
         "/chat/other",
@@ -217,10 +217,10 @@ fn manifest_rejects_duplicates_and_undeclared_or_mismatched_routes() {
     mismatched_target.facts.target_id = "9".into();
     assert!(!declared.permits_request(&mismatched_target));
     let mut matching_request = request();
-    matching_request.facts.resource_type = "chat_message".into();
+    matching_request.facts.resource_type = "message_record".into();
     matching_request.action = "create".into();
     matching_request.method = "POST".into();
-    matching_request.path = "/chat/messages/7".into();
+    matching_request.path = "/messages/7".into();
     matching_request.facts.target_id = "7".into();
     assert!(declared.permits_request(&matching_request));
 
@@ -245,7 +245,7 @@ fn request_timestamp_uses_fixed_clock_skew_window() {
 fn overlapping_manifest_routes_and_expiry_boundary_are_refused() {
     let mut manifest = manifest();
     let mut other = manifest.routes[0].clone();
-    other.path = "/chat/messages/{other}".into();
+    other.path = "/messages/{other}".into();
     other.resolver = ResourceResolver::Object {
         target_id_path: "/{other}".into(),
     };

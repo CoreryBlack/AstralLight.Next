@@ -178,28 +178,6 @@ requires = ["DATABASE_URL"]
 arch_status = "current"
 note = "不含租户隔离场景(MANIFEST 记录该缺口)"
 
-# ═══════════════ excluded / 冻结 crate(编目但不进 workspace gate)═══════════════
-
-[[entry]]
-id = "astral-learn/integration"
-category = "integration"
-owner_crate = "astral-learn"
-path = "astral-learn/tests/integration.rs"
-kind = "integration-ignored"
-requires = ["DATABASE_URL"]
-arch_status = "archived"
-note = "冻结源码,workspace exclude;独立验证路径见 verify-excluded-services.ps1"
-
-[[entry]]
-id = "astral-chat/integration"
-category = "integration"
-owner_crate = "astral-chat"
-path = "astral-chat/tests/integration.rs"
-kind = "integration-ignored"
-requires = ["DATABASE_URL"]
-arch_status = "archived"
-note = "冻结源码,workspace exclude"
-
 [[entry]]
 id = "integrations/learn+chat"
 category = "e2e"
@@ -2495,21 +2473,6 @@ scope = "component"
 boundary = "historical comparator inventory/provenance contract over the Rust harness; no live comparator run"
 sources = ["test-harness/src/remaining_contracts.rs", "bench/engine-comparison"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "remaining_contracts::tests::historical_engine_comparison_inventory_is_explicit", "--", "--exact", "--test-threads=1"]
-acceptance = "rust"
-minimum_tests = 1
-expected_tests = 1
-timeout_seconds = 600
-
-[[suite]]
-id = "excluded-service-checks"
-owner = "astral-chat + astral-learn"
-profile = "offline-validation"
-test_services = []
-series = ["CORE", "EXCLUDED", "COMPAT"]
-scope = "component"
-boundary = "frozen chat/learn source and isolated-verification inventory contract; excluded workspace build is not executed"
-sources = ["test-harness/src/remaining_contracts.rs", "scripts/verify-excluded-services.ps1"]
-argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "remaining_contracts::tests::excluded_service_sources_are_outside_the_workspace_gate", "--", "--exact", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 expected_tests = 1

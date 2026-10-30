@@ -3477,7 +3477,7 @@ mod tests {
                 entry_id,
                 ref_id,
                 ref_type: "BASE",
-                resource: "learn_course",
+                resource: "permission_rule",
                 resource_id: None,
                 action: "read",
                 condition_json: None,
@@ -3533,7 +3533,7 @@ mod tests {
             tenant_id: Some(7),
             card_tenant_id: Some(7),
             domain_id: Some(11),
-            resource_type: "learn_course".into(),
+            resource_type: "permission_rule".into(),
             resource_id: None,
             action_code: "read".into(),
             effect: "ALLOW".into(),
@@ -3762,7 +3762,7 @@ mod tests {
             delegation_id,
             delegator_card_id,
             delegate_card_id,
-            resource_type: "learn_course".into(),
+            resource_type: "permission_rule".into(),
             action_code: "read".into(),
             effective_from_ts: 1_760_000_000,
             effective_until_ts: Some(1_770_000_000),
@@ -3816,7 +3816,7 @@ mod tests {
         let residue = resolve_delegation_pairing(&remote_rule, &revoked, 21).unwrap_err();
         assert!(residue.to_string().contains("lifecycle residue"));
         let mut drifted_resource = remote_rule.clone();
-        drifted_resource.resource_type = "learn_quiz".into();
+        drifted_resource.resource_type = "user_profile".into();
         let drift = resolve_delegation_pairing(&drifted_resource, &delegator_side, 21).unwrap_err();
         assert!(drift.to_string().contains("drift"));
 
@@ -4248,7 +4248,7 @@ mod tests {
         summaries.insert(
             1,
             astral_db::CardPermissionSummary {
-                action_codes: Some("learn_course:read,learn_course:write".into()),
+                action_codes: Some("permission_rule:read,permission_rule:write".into()),
                 base_rule_set_ids: Some("9".into()),
                 overlay_rule_set_ids: None,
             },
@@ -4257,7 +4257,7 @@ mod tests {
         apply_card_permission_summaries(&mut records, &summaries);
         assert_eq!(
             records[0].action_codes.as_deref(),
-            Some("learn_course:read,learn_course:write"),
+            Some("permission_rule:read,permission_rule:write"),
             "gated-in cards receive their snapshot summary"
         );
         assert!(

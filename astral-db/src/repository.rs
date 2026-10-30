@@ -200,36 +200,6 @@ pub async fn record_permission_hit(
     }
 }
 
-/// 查询会话成员 ID 列表（对齐 platform_v4：chat_conversation_member）
-pub async fn find_session_member_ids(
-    pool: &MySqlPool,
-    conversation_id: i64,
-) -> Result<Vec<i64>, DbError> {
-    let rows = sqlx::query_as::<_, (i64,)>(
-        "SELECT user_id FROM chat_conversation_member WHERE conversation_id = ?",
-    )
-    .bind(conversation_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(|r| r.0).collect())
-}
-
-/// 更新会话最后消息（对齐 platform_v4：chat_conversation，last_message_time）
-pub async fn update_session_last_message(
-    pool: &MySqlPool,
-    conversation_id: i64,
-    message_id: i64,
-) -> Result<(), DbError> {
-    sqlx::query(
-        "UPDATE chat_conversation SET last_message_id = ?, last_message_time = NOW() WHERE id = ?",
-    )
-    .bind(message_id)
-    .bind(conversation_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// 用户 MFA 配置行
 #[derive(Debug, sqlx::FromRow)]
 pub struct UserMfaRow {

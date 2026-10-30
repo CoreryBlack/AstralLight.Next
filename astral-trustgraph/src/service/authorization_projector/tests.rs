@@ -364,7 +364,7 @@ fn grant(unique_tail: u16, revision: u64, state: GrantState) -> astral_types::Ca
         tenant: tenant_of(17),
         card_id: 17,
         user_id: 42,
-        resource: "learn_subject:1".to_owned(),
+        resource: "permission_rule:1".to_owned(),
         action: "read".to_owned(),
         effect: GrantEffect::Allow,
         validity: ValidityWindow::perpetual(),
@@ -726,7 +726,7 @@ fn stage_planning_matches_legacy_output_for_mixed_references() {
         let grants: Vec<_> = (0..size)
             .map(|id| {
                 let mut grant = grant(id, 1, GrantState::Active);
-                grant.resource = format!("learn_subject:{id}");
+                grant.resource = format!("permission_rule:{id}");
                 grant
             })
             .collect();
@@ -1925,7 +1925,7 @@ fn wildcard_grant(
     state: GrantState,
 ) -> astral_types::CanonicalGrant {
     let mut wildcarded = grant(unique_tail, revision, state);
-    wildcarded.resource = "learn_subject:*".to_owned();
+    wildcarded.resource = "permission_rule:*".to_owned();
     wildcarded
 }
 
@@ -1982,7 +1982,10 @@ fn decide_continuation_remove_of_only_wildcard_publishes_segment_remove() {
             assert_eq!(command.impact_plan.items.len(), 1);
             let item = &command.impact_plan.items[0];
             assert_eq!(item.item_type, AuthorizationImpactItemType::SegmentRemove);
-            assert!(item.projection_key.contains("learn_subject:*"), "{item:?}");
+            assert!(
+                item.projection_key.contains("permission_rule:*"),
+                "{item:?}"
+            );
             assert!(item.before_digest_hex.is_some());
             assert!(item.after_digest_hex.is_none());
             // Nothing stays Active: the removal-only manifest stages no
@@ -2104,7 +2107,10 @@ fn decide_continuation_remove_wildcard_publishes_and_keeps_object_level_segment(
             assert_eq!(command.impact_plan.items.len(), 1);
             let item = &command.impact_plan.items[0];
             assert_eq!(item.item_type, AuthorizationImpactItemType::SegmentRemove);
-            assert!(item.projection_key.contains("learn_subject:*"), "{item:?}");
+            assert!(
+                item.projection_key.contains("permission_rule:*"),
+                "{item:?}"
+            );
             // The object-level segment is still staged into the new
             // generation, so published evidence keeps authorizing it.
             assert_eq!(command.stage.segments.len(), 1);
@@ -2636,17 +2642,17 @@ fn plan_ledger_builds_base_only_from_frontier_proven_heads() {
 fn decide_reuses_parent_segments_by_digest_and_keeps_changes_new() {
     let rev_a1 = {
         let mut image = grant(1, 1, GrantState::Active);
-        image.resource = "learn_subject:a".to_owned();
+        image.resource = "permission_rule:a".to_owned();
         image
     };
     let rev_b1 = {
         let mut image = grant(9, 1, GrantState::Active);
-        image.resource = "learn_subject:b".to_owned();
+        image.resource = "permission_rule:b".to_owned();
         image
     };
     let mut rev_a2 = rev_a1.clone();
     rev_a2.revision = GrantRevision::new(2).unwrap();
-    rev_a2.resource = "learn_subject:a-changed".to_owned(); // distinct new key
+    rev_a2.resource = "permission_rule:a-changed".to_owned(); // distinct new key
     let (_, dep_hash) = active_card_dependency_hash(5, 0);
 
     // Build the PRE-state exactly like the assembler does (both proven
@@ -2669,7 +2675,7 @@ fn decide_reuses_parent_segments_by_digest_and_keeps_changes_new() {
         &base_state
             .segments
             .iter()
-            .find(|(key, _)| key.resource == "learn_subject:b")
+            .find(|(key, _)| key.resource == "permission_rule:b")
             .map(|(_, segment)| segment.grants.clone())
             .expect("B-key base segment exists"),
     )
@@ -4051,7 +4057,7 @@ fn digest_hint_cache_reuses_unchanged_segments_and_never_mismatches_content() {
     let grants: Vec<_> = (0..4)
         .map(|id| {
             let mut grant = grant(id, 1, GrantState::Active);
-            grant.resource = format!("learn_subject:{id}");
+            grant.resource = format!("permission_rule:{id}");
             grant
         })
         .collect();
@@ -4098,7 +4104,7 @@ fn digest_hint_cache_content_change_falls_back_to_real_encode() {
     let old_grants: Vec<_> = (0..2)
         .map(|id| {
             let mut grant = grant(id, 1, GrantState::Active);
-            grant.resource = format!("learn_subject:{id}");
+            grant.resource = format!("permission_rule:{id}");
             grant
         })
         .collect();
@@ -4109,7 +4115,7 @@ fn digest_hint_cache_content_change_falls_back_to_real_encode() {
     let new_grants: Vec<_> = (0..2)
         .map(|id| {
             let mut grant = grant(id, 2, GrantState::Active);
-            grant.resource = format!("learn_subject:{id}");
+            grant.resource = format!("permission_rule:{id}");
             grant
         })
         .collect();
@@ -4152,7 +4158,7 @@ fn digest_hint_cache_plans_match_real_encoding_after_hit_eviction_and_expiry() {
     let grants: Vec<_> = (0..3)
         .map(|id| {
             let mut grant = grant(id, 1, GrantState::Active);
-            grant.resource = format!("learn_subject:{id}");
+            grant.resource = format!("permission_rule:{id}");
             grant
         })
         .collect();
@@ -4210,8 +4216,9 @@ fn digest_hint_cache_capacity_pressure_remains_bounded_and_correct() {
     let mut cache = DigestHintCache::new_for_test(capacity, Duration::from_secs(600));
     let mut keys = Vec::with_capacity(capacity + 1);
     for id in 1..=(capacity as i64 + 1) {
-        let key = policy_engine::ProjectionKey::new(id, 42, format!("learn_subject:{id}"), "read")
-            .unwrap();
+        let key =
+            policy_engine::ProjectionKey::new(id, 42, format!("permission_rule:{id}"), "read")
+                .unwrap();
         cache.remember_at_for_test(
             key.clone(),
             format!("content-{id}"),

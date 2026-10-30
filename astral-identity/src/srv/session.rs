@@ -22,8 +22,8 @@ use astral_types::AstralError;
 use super::session_repository::{self as session_repo, DeviceSessionRow};
 use super::source_writer_guard;
 use crate::auth::{
-    issue_access_token, issue_access_token_for_identity_only, issue_refresh_token,
-    map_eligibility_error, sha256_hash, LoginResponse, SessionContext, SessionGrant, TokenResult,
+    issue_access_token, issue_refresh_token, map_eligibility_error, sha256_hash, LoginResponse,
+    SessionContext, SessionGrant, TokenResult,
 };
 use crate::AppState;
 
@@ -48,6 +48,10 @@ pub fn session_routes() -> Router<AppState> {
 ///
 /// 对齐 Java TokenServiceImpl.resolveRefreshSession()：
 /// 1. 查找设备会话 → 2. 检查 family 有效性 → 3. 检查过期 → 4. 签发新 token → 5. 更新会话
+fn is_platform_user(principal_kind: &str) -> bool {
+    principal_kind == PrincipalKind::PlatformUser.as_str()
+}
+
 async fn refresh_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -75,10 +79,13 @@ async fn refresh_token(
         .parse::<i64>()
         .map_err(|_| AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into())))?;
     let refresh_hash = sha256_hash(raw_refresh);
-    // The signed REFRESH claim, not missing card data, owns the session kind.
-    // Reject mismatched principal/session shapes before any rotation can occur.
-    let principal_kind = PrincipalKind::parse(&claims.principal_kind)
-        .ok_or_else(|| AppError::from(AstralError::Auth("PRINCIPAL_KIND_INVALID".into())))?;
+    // Reject stale APP_USER and other non-platform principals before any refresh
+    // lookup or rotation can occur.
+    if !is_platform_user(&claims.principal_kind) {
+        return Err(AppError::from(AstralError::Auth(
+            "PRINCIPAL_KIND_INVALID".into(),
+        )));
+    }
     let session = session_repo::load_active_refresh_session(&state.db, &refresh_hash)
         .await?
         .filter(|row| {
@@ -89,31 +96,21 @@ async fn refresh_token(
                 && row.session_epoch == claims.sev.unwrap_or_default()
         })
         .ok_or_else(|| AstralError::Auth("Invalid refresh session".into()))?;
-    match principal_kind {
-        PrincipalKind::PlatformUser
-            if session
-                .credential_version
-                .is_none_or(|version| version <= 0) =>
-        {
-            return Err(AppError::from(AstralError::Auth(
-                "CREDENTIAL_REVISION_REQUIRED".into(),
-            )));
-        }
-        PrincipalKind::AppUser if session.current_user_card_id.is_some() => {
-            return Err(AppError::from(AstralError::Auth(
-                "APP_USER_CARD_CONTEXT_FORBIDDEN".into(),
-            )));
-        }
-        _ => {}
+    if session
+        .credential_version
+        .is_none_or(|version| version <= 0)
+    {
+        return Err(AppError::from(AstralError::Auth(
+            "CREDENTIAL_REVISION_REQUIRED".into(),
+        )));
     }
-    refresh_token_from_session(&state, session, raw_refresh, principal_kind).await
+    refresh_token_from_session(&state, session, raw_refresh).await
 }
 
 async fn refresh_token_from_session(
     state: &AppState,
     session: DeviceSessionRow,
     raw_refresh: &str,
-    principal_kind: PrincipalKind,
 ) -> Result<Json<ApiResponse<LoginResponse>>, AppError> {
     let now = utc_db_now();
     let refresh_hash = sha256_hash(raw_refresh);
@@ -209,15 +206,24 @@ async fn refresh_token_from_session(
         updated_at: None,
     };
 
-    // Platform sessions require the persisted user card. App sessions deliberately
-    // have no user-card binding and renew an identity-only access credential.
-    let user_card_for_jwt = match principal_kind {
-        PrincipalKind::PlatformUser => {
-            // 身份卡只提供认证事实；PlatformUser 的组织 scope 必须来自选中的 user_card。
-            match session.current_user_card_id {
-                Some(target_card_id) => {
-                    let uc = sqlx::query_as::<_, (i64, Option<i64>, String, Option<i64>, Option<i64>, Option<i32>, Option<bool>, Option<i64>)>(
-                        "SELECT uc.card_id, uc.domain_id, uc.card_type, uc.template_id, uc.tenant_id, \
+    // Platform sessions require the persisted user card. Identity and organization
+    // scope are reloaded and validated before rotating any credential.
+    let user_card_for_jwt = match session.current_user_card_id {
+        Some(target_card_id) => {
+            let uc = sqlx::query_as::<
+                _,
+                (
+                    i64,
+                    Option<i64>,
+                    String,
+                    Option<i64>,
+                    Option<i64>,
+                    Option<i32>,
+                    Option<bool>,
+                    Option<i64>,
+                ),
+            >(
+                "SELECT uc.card_id, uc.domain_id, uc.card_type, uc.template_id, uc.tenant_id, \
                                 uc.priority, uc.is_primary, uc.level_id \
                          FROM user_card uc \
                          INNER JOIN tenant t ON t.tenant_id = uc.tenant_id AND t.status = 'ACTIVE' \
@@ -228,92 +234,88 @@ async fn refresh_token_from_session(
                            AND uc.card_type != 'LEVEL_TEMPLATE_CARD' \
                            AND (uc.valid_from IS NULL OR uc.valid_from <= UTC_TIMESTAMP()) \
                            AND (uc.valid_until IS NULL OR uc.valid_until >= UTC_TIMESTAMP())",
-                    )
-                .bind(target_card_id)
-                .bind(session.user_id)
-                .fetch_optional(&state.db)
-                .await
-                .map_err(|e| AstralError::Database(format!("Query user_card failed: {e}")))?;
-                    match uc {
-                        Some((
-                            card_id,
-                            domain_id,
-                            card_type,
-                            template_id,
-                            tenant_id,
-                            priority,
-                            is_primary,
-                            level_id,
-                        )) => {
-                            // 签发资格权威校验：identity / user_card 重读后统一走资格服务，
-                            // tenant/domain ACTIVE 与时间窗口在签发前强制校验（fail-closed）。
-                            // 组织事实仍来自 user_card 行本身（JWT claims 不变），资格结果仅作门禁。
-                            if let Err(error) =
-                                astral_db::CardEligibilityService::verify_platform_card_pair(
-                                    &state.db,
-                                    &astral_types::PlatformCardPairRequest {
-                                        user_id: session.user_id,
-                                        identity_card_id: user.0,
-                                        user_card_id: card_id,
-                                    },
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    session_id = %session.session_id,
-                                    target_card_id,
-                                    user_id = %session.user_id,
-                                    error = %error,
-                                    "refresh refused: platform card pair not eligible"
-                                );
-                                return Err(AppError::from(map_eligibility_error(error, |_| {
-                                    AstralError::Auth("USER_CARD_SCOPE_REQUIRED".into())
-                                })));
-                            }
-                            Some(astral_types::UserCard {
-                                card_id: Some(card_id),
-                                user_id: Some(user.1),
-                                domain_id,
-                                card_type,
-                                card_status: "ACTIVE".to_string(),
-                                template_id,
-                                level_id,
-                                priority,
-                                is_primary,
-                                valid_from: None,
-                                valid_until: None,
-                                created_at: None,
-                                updated_at: None,
-                                tenant_id,
-                            })
-                        }
-                        None => {
-                            tracing::warn!(
-                                session_id = %session.session_id,
-                                target_card_id,
-                                user_id = %session.user_id,
-                                "refresh refused: persisted user card no longer available"
-                            );
-                            return Err(AppError::from(AstralError::Auth(
-                                "CARD_SELECTION_REQUIRED: persisted user card no longer available"
-                                    .into(),
-                            )));
-                        }
+            )
+            .bind(target_card_id)
+            .bind(session.user_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AstralError::Database(format!("Query user_card failed: {e}")))?;
+            match uc {
+                Some((
+                    card_id,
+                    domain_id,
+                    card_type,
+                    template_id,
+                    tenant_id,
+                    priority,
+                    is_primary,
+                    level_id,
+                )) => {
+                    // 签发资格权威校验：identity / user_card 重读后统一走资格服务，
+                    // tenant/domain ACTIVE 与时间窗口在签发前强制校验（fail-closed）。
+                    // 组织事实仍来自 user_card 行本身（JWT claims 不变），资格结果仅作门禁。
+                    if let Err(error) =
+                        astral_db::CardEligibilityService::verify_platform_card_pair(
+                            &state.db,
+                            &astral_types::PlatformCardPairRequest {
+                                user_id: session.user_id,
+                                identity_card_id: user.0,
+                                user_card_id: card_id,
+                            },
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            session_id = %session.session_id,
+                            target_card_id,
+                            user_id = %session.user_id,
+                            error = %error,
+                            "refresh refused: platform card pair not eligible"
+                        );
+                        return Err(AppError::from(map_eligibility_error(error, |_| {
+                            AstralError::Auth("USER_CARD_SCOPE_REQUIRED".into())
+                        })));
                     }
+                    Some(astral_types::UserCard {
+                        card_id: Some(card_id),
+                        user_id: Some(user.1),
+                        domain_id,
+                        card_type,
+                        card_status: "ACTIVE".to_string(),
+                        template_id,
+                        level_id,
+                        priority,
+                        is_primary,
+                        valid_from: None,
+                        valid_until: None,
+                        created_at: None,
+                        updated_at: None,
+                        tenant_id,
+                    })
                 }
                 None => {
                     tracing::warn!(
                         session_id = %session.session_id,
+                        target_card_id,
                         user_id = %session.user_id,
-                        "refresh refused: no user card bound to platform session"
+                        "refresh refused: persisted user card no longer available"
                     );
                     return Err(AppError::from(AstralError::Auth(
-                        "CARD_SELECTION_REQUIRED: no user card bound to session".into(),
+                        "CARD_SELECTION_REQUIRED: persisted user card no longer available".into(),
                     )));
                 }
             }
         }
-        PrincipalKind::AppUser => None,
+        None => {
+            tracing::warn!(
+                session_id = %session.session_id,
+                user_id = %session.user_id,
+                "refresh refused: no user card bound to platform session"
+            );
+            return Err(AppError::from(AstralError::Auth(
+                "CARD_SELECTION_REQUIRED: no user card bound to session".into(),
+            )));
+        }
     };
 
     let next_session_version = session.session_version.checked_add(1).ok_or_else(|| {
@@ -323,21 +325,19 @@ async fn refresh_token_from_session(
         .session_epoch
         .checked_add(1)
         .ok_or_else(|| AstralError::Auth("Session epoch exhausted. Please login again.".into()))?;
-    if principal_kind == PrincipalKind::PlatformUser {
-        let current_credential_version: Option<i64> = sqlx::query_scalar(
-            "SELECT credential_version FROM user_local_credential WHERE user_id = ? AND status = 'ACTIVE' LIMIT 1",
-        )
-        .bind(session.user_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|error| AstralError::Database(format!("Verify refresh credential revision failed: {error}")))?;
-        if current_credential_version
-            .is_none_or(|version| version <= 0 || session.credential_version != Some(version))
-        {
-            return Err(AppError::from(AstralError::Auth(
-                "CREDENTIAL_REVISION_MISMATCH".into(),
-            )));
-        }
+    let current_credential_version: Option<i64> = sqlx::query_scalar(
+        "SELECT credential_version FROM user_local_credential WHERE user_id = ? AND status = 'ACTIVE' LIMIT 1",
+    )
+    .bind(session.user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|error| AstralError::Database(format!("Verify refresh credential revision failed: {error}")))?;
+    if current_credential_version
+        .is_none_or(|version| version <= 0 || session.credential_version != Some(version))
+    {
+        return Err(AppError::from(AstralError::Auth(
+            "CREDENTIAL_REVISION_MISMATCH".into(),
+        )));
     }
 
     let new_expiry = now + Duration::seconds(state.config.jwt.refresh.expiry_seconds);
@@ -347,29 +347,18 @@ async fn refresh_token_from_session(
         session_epoch: next_session_epoch,
         family_id: session.family_id,
     };
-    let token_result = match principal_kind {
-        PrincipalKind::PlatformUser => {
-            let access_card = user_card_for_jwt.as_ref().ok_or_else(|| {
-                AppError::from(AstralError::Auth("USER_CARD_CONTEXT_REQUIRED".into()))
-            })?;
-            issue_access_token(
-                &state.config.jwt,
-                &id_card,
-                access_card,
-                session_context,
-                None,
-            )?
-        }
-        PrincipalKind::AppUser => {
-            issue_access_token_for_identity_only(&state.config.jwt, &id_card, session_context)?
-        }
-    };
-    let new_refresh_result = issue_refresh_token(
+    let access_card = user_card_for_jwt
+        .as_ref()
+        .ok_or_else(|| AppError::from(AstralError::Auth("USER_CARD_CONTEXT_REQUIRED".into())))?;
+    let token_result = issue_access_token(
         &state.config.jwt,
-        session.user_id,
-        principal_kind,
+        &id_card,
+        access_card,
         session_context,
+        None,
     )?;
+    let new_refresh_result =
+        issue_refresh_token(&state.config.jwt, session.user_id, session_context)?;
     let new_refresh_hash = sha256_hash(&new_refresh_result.token);
     let new_access_token = token_result.token.clone();
     let expires_in = token_result.expires_in;
@@ -439,7 +428,6 @@ async fn refresh_token_from_session(
         &token_result,
         SessionGrant::active(
             &token_result,
-            principal_kind,
             session.user_id,
             session.session_id,
             id_card.card_id,
@@ -506,6 +494,11 @@ async fn revoke_session(
     let raw = logout_bearer_credential(&headers)?;
     let (claims, token_use) = decode_v2_token(raw, &state.config)
         .map_err(|reason| AppError::from(AstralError::Auth(reason.into())))?;
+    if !is_platform_user(&claims.principal_kind) {
+        return Err(AppError::from(AstralError::Auth(
+            "PRINCIPAL_KIND_INVALID".into(),
+        )));
+    }
     let reason = req.reason.as_deref().unwrap_or("USER_REVOKED");
     match token_use {
         TokenUse::Access => {
@@ -533,6 +526,11 @@ async fn logout(
     let raw = logout_bearer_credential(&headers)?;
     let (claims, token_use) = decode_v2_token(raw, &state.config)
         .map_err(|reason| AppError::from(AstralError::Auth(reason.into())))?;
+    if !is_platform_user(&claims.principal_kind) {
+        return Err(AppError::from(AstralError::Auth(
+            "PRINCIPAL_KIND_INVALID".into(),
+        )));
+    }
     match token_use {
         TokenUse::Access => {
             delete_access_projections(&state, &claims.jti).await?;
@@ -828,31 +826,20 @@ pub(crate) async fn store_session_grant_projection(
     token: &TokenResult,
     grant: SessionGrant,
 ) -> Result<(), AstralError> {
-    let principal_kind = PrincipalKind::parse(&grant.principal_kind)
-        .ok_or_else(|| AstralError::Auth("PRINCIPAL_KIND_INVALID".into()))?;
-    if principal_kind == PrincipalKind::PlatformUser {
-        record_platform_session_jti_proof(
-            state,
-            token,
-            grant.user_id,
-            grant.session_id,
-            grant.session_epoch,
-            grant
-                .identity_card_id
-                .ok_or_else(|| AstralError::Auth("IDENTITY_CARD_CONTEXT_REQUIRED".into()))?,
-        )
-        .await?;
-    } else {
-        astral_db::record_session_jti_proof(
-            &state.db,
-            grant.session_id,
-            &token.jti,
-            grant.user_id,
-            grant.session_epoch,
-            token.expires_at_epoch_second,
-        )
-        .await?;
+    if !is_platform_user(&grant.principal_kind) {
+        return Err(AstralError::Auth("PRINCIPAL_KIND_INVALID".into()));
     }
+    record_platform_session_jti_proof(
+        state,
+        token,
+        grant.user_id,
+        grant.session_id,
+        grant.session_epoch,
+        grant
+            .identity_card_id
+            .ok_or_else(|| AstralError::Auth("IDENTITY_CARD_CONTEXT_REQUIRED".into()))?,
+    )
+    .await?;
 
     install_verified_session_grant_mirror(state, token, &grant);
     Ok(())
@@ -865,16 +852,16 @@ fn install_verified_session_grant_mirror(
     token: &TokenResult,
     grant: &SessionGrant,
 ) {
-    let Some(principal_kind) = PrincipalKind::parse(&grant.principal_kind) else {
+    if grant.principal_kind != "PLATFORM_USER" {
         return;
-    };
+    }
     let bind = astral_common::session_projection_store::SessionBindContext {
         user_id: grant.user_id,
         session_id: grant.session_id,
         session_version: grant.session_version,
         session_epoch: grant.session_epoch,
         token_family_id: grant.token_family_id,
-        principal_kind: principal_kind.as_str(),
+        principal_kind: "PLATFORM_USER",
         identity_card_id: grant.identity_card_id,
         user_card_id: grant.user_card_id,
         user_card_tenant_id: grant.user_card_tenant_id,
@@ -892,7 +879,7 @@ fn install_verified_session_grant_mirror(
         user_card_id: grant.user_card_id,
         user_card_tenant_id: grant.user_card_tenant_id,
         user_card_domain_id: grant.user_card_domain_id,
-        principal_kind: principal_kind.as_str(),
+        principal_kind: "PLATFORM_USER",
         expires_at_epoch_second: token.expires_at_epoch_second,
     };
     let pool = state.db.clone();
@@ -930,43 +917,6 @@ async fn record_platform_session_jti_proof(
         identity_card_id,
     )
     .await
-}
-
-/// Record a session JTI proof using the authenticated refresh principal kind.
-async fn record_session_jti_proof(
-    state: &AppState,
-    token: &TokenResult,
-    user_id: i64,
-    session_id: i64,
-    session_epoch: i64,
-    principal_kind: PrincipalKind,
-    identity_card_id: Option<i64>,
-) -> Result<(), AstralError> {
-    match principal_kind {
-        PrincipalKind::PlatformUser => {
-            record_platform_session_jti_proof(
-                state,
-                token,
-                user_id,
-                session_id,
-                session_epoch,
-                identity_card_id
-                    .ok_or_else(|| AstralError::Auth("IDENTITY_CARD_CONTEXT_REQUIRED".into()))?,
-            )
-            .await
-        }
-        PrincipalKind::AppUser => {
-            astral_db::record_session_jti_proof(
-                &state.db,
-                session_id,
-                &token.jti,
-                user_id,
-                session_epoch,
-                token.expires_at_epoch_second,
-            )
-            .await
-        }
-    }
 }
 
 async fn delete_session_projections_before_epoch(
@@ -1150,9 +1100,7 @@ pub(crate) async fn switch_card_session(
         .parse::<i64>()
         .map_err(|_| AppError::from(AstralError::Auth("SESSION_CONTEXT_INVALID".into())))?;
     let refresh_hash = sha256_hash(refresh_token);
-    let principal_kind = PrincipalKind::parse(&claims.principal_kind)
-        .ok_or_else(|| AppError::from(AstralError::Auth("PRINCIPAL_KIND_INVALID".into())))?;
-    if principal_kind != PrincipalKind::PlatformUser {
+    if !is_platform_user(&claims.principal_kind) {
         return Err(AppError::from(AstralError::Auth(
             "SWITCH_CARD_PLATFORM_USER_REQUIRED".into(),
         )));
@@ -1260,14 +1208,15 @@ pub(crate) async fn switch_card_session(
                 )));
             }
 
-            if let Err(error) = record_session_jti_proof(
+            if let Err(error) = record_platform_session_jti_proof(
                 state,
                 &token,
                 user_id,
                 session.session_id,
                 session.session_epoch,
-                PrincipalKind::PlatformUser,
-                claims.identity_card_id,
+                claims
+                    .identity_card_id
+                    .ok_or_else(|| AstralError::Auth("IDENTITY_CARD_CONTEXT_REQUIRED".into()))?,
             )
             .await
             {
@@ -1285,7 +1234,6 @@ pub(crate) async fn switch_card_session(
                 })?;
                 SessionGrant::active(
                     &token,
-                    PrincipalKind::PlatformUser,
                     user_id,
                     session.session_id,
                     claims.identity_card_id,
@@ -1598,12 +1546,7 @@ async fn switch_card_once(
         session_context,
         None,
     )?;
-    let refresh_result = issue_refresh_token(
-        &state.config.jwt,
-        user_id,
-        PrincipalKind::PlatformUser,
-        session_context,
-    )?;
+    let refresh_result = issue_refresh_token(&state.config.jwt, user_id, session_context)?;
     let refresh_hash = sha256_hash(&refresh_result.token);
     let response = LoginResponse {
         access_token: token.token.clone(),
@@ -2085,7 +2028,6 @@ async fn reproject_switch_response(
         &token,
         SessionGrant::active(
             &token,
-            PrincipalKind::PlatformUser,
             durable.1,
             durable.0,
             claims.identity_card_id,
@@ -2411,6 +2353,19 @@ mod tests {
             "refresh rotation must acquire the fence before its UPDATE"
         );
         assert!(refresh_body.contains("fenced_source_write("));
+        for route in ["async fn revoke_session(", "async fn logout("] {
+            let route_body = source
+                .split(route)
+                .nth(1)
+                .expect("credential revocation route must stay")
+                .split("async fn ")
+                .next()
+                .expect("route body must be bounded by the next async function");
+            assert!(
+                route_body.contains("is_platform_user(&claims.principal_kind)"),
+                "{route} must reject stale non-PlatformUser credentials"
+            );
+        }
 
         let revoke_body: String = source
             .split("async fn db_revoke_session(")

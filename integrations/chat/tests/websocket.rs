@@ -38,7 +38,7 @@ fn request(state: &SocketState, handshake: bool) -> AuthorizationRequest {
     }
     .unwrap();
     AuthorizationRequest {
-        app_id: "astral-chat".into(),
+        app_id: "messaging-app".into(),
         key_id: "test-app".into(),
         manifest_digest: manifest().digest().unwrap(),
         revision: "1".into(),

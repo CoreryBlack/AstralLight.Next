@@ -12,8 +12,6 @@ pub const ACCESS_TYP: &str = "astral-access+jwt";
 pub const REFRESH_TYP: &str = "astral-refresh+jwt";
 pub const ACCESS_AUDIENCE: &str = "astral-api";
 pub const REFRESH_AUDIENCE: &str = "astral-session";
-pub const CHAT_WS_SUBPROTOCOL: &str = "astral-chat-v1";
-pub const CHAT_WS_BEARER_SUBPROTOCOL_PREFIX: &str = "bearer.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenUse {

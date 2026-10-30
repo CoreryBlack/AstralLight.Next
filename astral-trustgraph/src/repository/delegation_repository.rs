@@ -2353,7 +2353,7 @@ mod tests {
             delegation_id: 7001,
             delegator_card_id: 101,
             delegate_card_id: 310,
-            resource_type: "learn_course".into(),
+            resource_type: "permission_rule".into(),
             action_code: "read".into(),
             effective_from_ts: 1_760_000_000,
             effective_until_ts: Some(1_770_000_000),
@@ -2366,7 +2366,7 @@ mod tests {
         LockedDelegationRuleRow {
             rule_id: 9001,
             card_id: 310,
-            resource_type: "learn_course".into(),
+            resource_type: "permission_rule".into(),
             action_code: "read".into(),
             effect: "ALLOW".into(),
             valid_from_ts: Some(1_760_000_000),
@@ -2463,7 +2463,7 @@ mod tests {
         let mut new = NewDelegation {
             delegator_card_id: 101,
             delegate_card_id: 310,
-            resource_type: "learn_course".into(),
+            resource_type: "permission_rule".into(),
             action_code: "read".into(),
             effective_until_ts: 1_770_000_000,
         };
@@ -2740,23 +2740,23 @@ mod tests {
 
     #[test]
     fn hold_proof_passes_on_exact_type_level_grant_within_window() {
-        let grants = [evidence_grant("learn_question", "read", Some(2_000))];
+        let grants = [evidence_grant("permission_rule", "read", Some(2_000))];
         // 两侧均为排他上界：相等即窗口完全一致，允许通过。
-        let proof = prove_delegator_hold(&grants, "learn_question", "read", 2_000).unwrap();
+        let proof = prove_delegator_hold(&grants, "permission_rule", "read", 2_000).unwrap();
         assert_eq!(proof.evidence_expires_at, Some(2_000));
-        let proof = prove_delegator_hold(&grants, "learn_question", "read", 1_000).unwrap();
+        let proof = prove_delegator_hold(&grants, "permission_rule", "read", 1_000).unwrap();
         assert_eq!(proof.evidence_expires_at, Some(2_000));
     }
 
     #[test]
     fn hold_proof_fails_closed_without_a_matching_published_allow() {
         let grants = [
-            evidence_grant("learn_question", "read", Some(2_000)),
-            evidence_grant("learn_course:*", "delete", Some(3_000)),
+            evidence_grant("permission_rule", "read", Some(2_000)),
+            evidence_grant("permission_rule:*", "delete", Some(3_000)),
         ];
         for (resource, action) in [
-            ("learn_question", "create"), // 动作不匹配
-            ("learn_exam", "read"),       // 类型不匹配
+            ("permission_rule", "create"), // 动作不匹配
+            ("user_profile", "read"),      // 类型不匹配
         ] {
             let error = hold_error(prove_delegator_hold(&grants, resource, action, 1_000));
             assert!(
@@ -2765,33 +2765,33 @@ mod tests {
             );
         }
         // 空证据集合（evidence Ready 但有效授权面为空）同样拒绝。
-        let error = hold_error(prove_delegator_hold(&[], "learn_question", "read", 1_000));
+        let error = hold_error(prove_delegator_hold(&[], "permission_rule", "read", 1_000));
         assert!(error.contains("does not hold"), "{error}");
     }
 
     #[test]
     fn hold_proof_honors_wildcard_semantics_of_published_evidence() {
         // 类型级通配资源（`type:*`）+ `*` 动作按引擎语义覆盖该类型全部动作。
-        let type_wildcard = [evidence_grant("learn_question:*", "*", Some(2_000))];
-        assert!(prove_delegator_hold(&type_wildcard, "learn_question", "read", 1_000).is_ok());
-        assert!(prove_delegator_hold(&type_wildcard, "learn_question", "delete", 2_000).is_ok());
+        let type_wildcard = [evidence_grant("permission_rule:*", "*", Some(2_000))];
+        assert!(prove_delegator_hold(&type_wildcard, "permission_rule", "read", 1_000).is_ok());
+        assert!(prove_delegator_hold(&type_wildcard, "permission_rule", "delete", 2_000).is_ok());
         // 裸类型（无冒号）同样是类型级 grant；永续授权允许任意委托有效期。
-        let bare_type = [evidence_grant("learn_question", "read", None)];
-        let proof = prove_delegator_hold(&bare_type, "learn_question", "read", 9_999).unwrap();
+        let bare_type = [evidence_grant("permission_rule", "read", None)];
+        let proof = prove_delegator_hold(&bare_type, "permission_rule", "read", 9_999).unwrap();
         assert_eq!(proof.evidence_expires_at, None);
         // 全局 `*` 资源通配覆盖任意被委托类型。
         let global = [evidence_grant("*", "read", Some(2_000))];
-        assert!(prove_delegator_hold(&global, "learn_exam", "read", 1_000).is_ok());
+        assert!(prove_delegator_hold(&global, "user_profile", "read", 1_000).is_ok());
     }
 
     #[test]
     fn hold_proof_never_lets_object_level_grants_back_type_level_delegations() {
         // 委托写入的规则恒为 resource_id=NULL 的类型级 ALLOW；对象级 grant
         // 绝不支撑类型级委托（否则被委托方获得委托人从未有效持有的权限面）。
-        let grants = [evidence_grant("learn_question:42", "read", Some(2_000))];
+        let grants = [evidence_grant("permission_rule:42", "read", Some(2_000))];
         let error = hold_error(prove_delegator_hold(
             &grants,
-            "learn_question",
+            "permission_rule",
             "read",
             1_000,
         ));
@@ -2800,14 +2800,14 @@ mod tests {
 
     #[test]
     fn hold_proof_rejects_conditioned_evidence_fail_closed() {
-        let mut grants = [evidence_grant("learn_question", "read", Some(2_000))];
+        let mut grants = [evidence_grant("permission_rule", "read", Some(2_000))];
         grants[0].conditioned = true;
         // 即使精确命中：条件化授权不得被委托成无条件类型级 ALLOW（默认拒绝，
         // 保守优先）。当前 CanonicalGrant 合同无 condition 字段，该钩子面向
         // 未来 evidence 合同演进保持 fail-closed。
         let error = hold_error(prove_delegator_hold(
             &grants,
-            "learn_question",
+            "permission_rule",
             "read",
             1_000,
         ));
@@ -2816,10 +2816,10 @@ mod tests {
 
     #[test]
     fn hold_proof_rejects_delegation_expiry_beyond_the_proven_bound() {
-        let grants = [evidence_grant("learn_question", "read", Some(1_000))];
+        let grants = [evidence_grant("permission_rule", "read", Some(1_000))];
         let error = hold_error(prove_delegator_hold(
             &grants,
-            "learn_question",
+            "permission_rule",
             "read",
             1_001,
         ));
@@ -2832,14 +2832,14 @@ mod tests {
     #[test]
     fn hold_proof_uses_the_latest_bound_and_prefers_perpetual_among_matching_grants() {
         let grants = [
-            evidence_grant("learn_question", "read", Some(1_000)),
-            evidence_grant("learn_question:*", "read", Some(5_000)),
+            evidence_grant("permission_rule", "read", Some(1_000)),
+            evidence_grant("permission_rule:*", "read", Some(5_000)),
         ];
         // 委托人真实可证明的持有上界是命中集合的最晚上界（5_000）。
-        assert!(prove_delegator_hold(&grants, "learn_question", "read", 3_000).is_ok());
+        assert!(prove_delegator_hold(&grants, "permission_rule", "read", 3_000).is_ok());
         let error = hold_error(prove_delegator_hold(
             &grants,
-            "learn_question",
+            "permission_rule",
             "read",
             5_001,
         ));
@@ -2847,11 +2847,11 @@ mod tests {
 
         // 任一命中授权永续 → evidence 侧无上界（不因另一条较早到期而收紧）。
         let with_perpetual = [
-            evidence_grant("learn_question", "read", Some(1_000)),
-            evidence_grant("learn_question", "read", None),
+            evidence_grant("permission_rule", "read", Some(1_000)),
+            evidence_grant("permission_rule", "read", None),
         ];
         let proof =
-            prove_delegator_hold(&with_perpetual, "learn_question", "read", i64::MAX).unwrap();
+            prove_delegator_hold(&with_perpetual, "permission_rule", "read", i64::MAX).unwrap();
         assert_eq!(proof.evidence_expires_at, None);
     }
 
@@ -2859,15 +2859,15 @@ mod tests {
     fn hold_proof_matches_action_aliases_like_the_policy_engine() {
         // 持有聚合动作 `write` 可支撑其展开动作（create/update/delete）的委托，
         // 与引擎读侧别名语义一致。
-        let writer = [evidence_grant("learn_question", "write", Some(2_000))];
-        assert!(prove_delegator_hold(&writer, "learn_question", "create", 1_000).is_ok());
-        assert!(prove_delegator_hold(&writer, "learn_question", "delete", 1_000).is_ok());
+        let writer = [evidence_grant("permission_rule", "write", Some(2_000))];
+        assert!(prove_delegator_hold(&writer, "permission_rule", "create", 1_000).is_ok());
+        assert!(prove_delegator_hold(&writer, "permission_rule", "delete", 1_000).is_ok());
         // 反向不成立：仅持有 `create` 不能委托出聚合动作 `write`（持有者在
         // 引擎读侧同样无法直接通过 `write` 评估）。
-        let creator = [evidence_grant("learn_question", "create", Some(2_000))];
+        let creator = [evidence_grant("permission_rule", "create", Some(2_000))];
         let error = hold_error(prove_delegator_hold(
             &creator,
-            "learn_question",
+            "permission_rule",
             "write",
             1_000,
         ));
@@ -2879,14 +2879,14 @@ mod tests {
         let mut new = NewDelegation {
             delegator_card_id: 1,
             delegate_card_id: 3,
-            resource_type: "learn_question".into(),
+            resource_type: "permission_rule".into(),
             action_code: "read".into(),
             effective_until_ts: 1_700_000_000,
         };
-        new.resource_type = " learn_question ".into();
+        new.resource_type = " permission_rule ".into();
         new.action_code = " read ".into();
         let normalized = normalize_new_delegation(&new).unwrap();
-        assert_eq!(normalized.resource_type, "learn_question");
+        assert_eq!(normalized.resource_type, "permission_rule");
         assert_eq!(normalized.action_code, "read");
         assert_eq!(normalized.delegator_card_id, 1);
         assert_eq!(normalized.delegate_card_id, 3);
@@ -2895,7 +2895,7 @@ mod tests {
         // 未注册资源 / 未注册动作 / 空白一律 Validation fail-closed。
         for (resource, action) in [
             ("no_such_resource", "read"),
-            ("learn_question", "no_such_action"),
+            ("permission_rule", "no_such_action"),
             ("   ", "read"),
         ] {
             new.resource_type = resource.into();

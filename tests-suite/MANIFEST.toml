@@ -1126,8 +1126,8 @@ boundary = "native E1 settings validation, UUIDv5 operation/request identity, of
 sources = ["test-harness/src/e1_runner_contract.rs", "Docs/authorization-validation/archive/python-tests/test_e1_runner.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e1_runner_contract::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
-minimum_tests = 14
-expected_tests = 14
+minimum_tests = 20
+expected_tests = 20
 timeout_seconds = 600
 
 [[suite]]
@@ -1141,8 +1141,8 @@ boundary = "E1 durable reconciliation and reader classification over supplied ev
 sources = ["test-harness/src/e1_durable_contract.rs", "Docs/authorization-validation/archive/python-tests/test_e1_runner.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e1_durable_contract::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
-minimum_tests = 20
-expected_tests = 20
+minimum_tests = 22
+expected_tests = 22
 timeout_seconds = 600
 
 [[suite]]
@@ -1333,8 +1333,8 @@ boundary = "native E3 phase orchestration over injected controller/probe/collect
 sources = ["test-harness/src/e3_runner_native.rs", "test-harness/src/e3_runner_contract.rs", "test-harness/src/e3_campaign_model.rs", "test-harness/src/e3_e4_events.rs", "test-harness/src/e3_reconciliation.rs", "test-harness/src/e3_report.rs", "test-harness/src/lifecycle.rs", "Docs/authorization-validation/archive/python-tests/test_e3_runner.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e3_runner_native::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
-minimum_tests = 10
-expected_tests = 10
+minimum_tests = 13
+expected_tests = 13
 timeout_seconds = 1800
 
 [[suite]]
@@ -1473,8 +1473,8 @@ boundary = "native read-only E3/E4 probe over injected NodeAdapter/HttpTransport
 sources = ["test-harness/src/e3_e4_probe_native.rs", "test-harness/src/node_adapter_native.rs", "test-harness/src/node_adapter_contract.rs", "test-harness/src/e3_e4_events.rs", "test-harness/src/e3_report.rs", "test-harness/src/e3_reconciliation.rs", "test-harness/src/e4_protocol.rs", "test-harness/src/e4_preconditions.rs", "test-harness/src/dependency_profiles.rs", "Docs/authorization-validation/archive/python-tests/test_e3_e4.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e3_e4_probe_native::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
-minimum_tests = 4
-expected_tests = 4
+minimum_tests = 6
+expected_tests = 6
 timeout_seconds = 1800
 
 [[suite]]
@@ -1488,8 +1488,8 @@ boundary = "native E4 fake-controller invocation over an injected controller por
 sources = ["test-harness/src/e4_fault_runner_native.rs", "test-harness/src/e4_fault_driver_contract.rs", "test-harness/src/e4_fault_lifecycle.rs", "test-harness/src/e4_protocol.rs", "test-harness/src/dependency_profiles.rs", "test-harness/src/experiment_register.rs", "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e4_fault_", "--", "--test-threads=1"]
 acceptance = "rust"
-minimum_tests = 28
-expected_tests = 28
+minimum_tests = 31
+expected_tests = 31
 timeout_seconds = 1800
 
 [[suite]]
@@ -1621,8 +1621,8 @@ boundary = "shared offline contracts for Python-compatible UUIDv5 stable ids, at
 sources = ["test-harness/src/experiment_common_contract.rs", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "experiment_common_contract::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
-minimum_tests = 26
-expected_tests = 26
+minimum_tests = 28
+expected_tests = 28
 timeout_seconds = 600
 
 [[suite]]

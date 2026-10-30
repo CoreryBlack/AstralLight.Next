@@ -1,7 +1,7 @@
 //! AstralLight 数据库访问层
 //!
-//! 提供 `policy-engine` 的 `RuleRepository` 的 sqlx 实现。
-//! 查询 MySQL 中的 `rule_set_snapshot`、`permission_rule`、`card_rule_set_ref` 表。
+//! Provides the strict V6 [`policy_engine::RuleRepository`] implementation and
+//! durable source, projection, session and audit repositories.
 //!
 //! # 数据库迁移
 //!
@@ -74,7 +74,6 @@ pub use authorization_snapshot::{
     ProjectionSnapshotDocument, ProjectionSnapshotError, ProjectionSnapshotHint,
     SnapshotAggregateDivergence, SnapshotHintDivergenceKind, MAX_CAPTURE_PUBLISHED_STATES,
     MAX_PENDING_DELTA_ROWS, MAX_PROJECTION_SNAPSHOT_HINT_AGE_SECONDS, SNAPSHOT_PAYLOAD_VERSION,
-    SNAPSHOT_PAYLOAD_VERSION_V2,
 };
 pub use auxiliary_authorization_mirror::{
     auxiliary_authorization_mirror, install_auxiliary_authorization_mirror,
@@ -122,13 +121,11 @@ pub use projection::*;
 pub use projection_execution::{
     begin_owned_delta_execution, claim_next_owned_delta_event,
     claim_next_owned_delta_event_in_partition, claim_owned_delta_event_by_stable_event,
-    extend_owned_delta_execution_lease, fail_owned_delta_event, freeze_projection_execution_mode,
-    freeze_projection_execution_mode_from_env, load_owned_claimed_delta_event,
+    extend_owned_delta_execution_lease, fail_owned_delta_event, load_owned_claimed_delta_event,
     load_owned_delta_completion, owned_delta_lease_is_retired, owned_execution_outcome_is_unknown,
-    project_owned_authorization_delta_in_tx, projection_execution_mode,
-    quarantine_owned_delta_event, release_owned_delta_event, validate_projection_owned_schema,
-    OwnedCompletionIdentity, OwnedDeltaClaim, OwnedDeltaCompletionProof, OwnedDeltaLease,
-    OwnedStableEventOutcome, ProjectionExecutionMode, ProjectionExecutionModeError,
+    project_owned_authorization_delta_in_tx, quarantine_owned_delta_event,
+    release_owned_delta_event, validate_projection_owned_schema, OwnedCompletionIdentity,
+    OwnedDeltaClaim, OwnedDeltaCompletionProof, OwnedDeltaLease, OwnedStableEventOutcome,
 };
 pub use quarantine::*;
 pub use repository::*;
@@ -237,9 +234,6 @@ pub async fn connect_and_validate_schema_with_pool_options(
             "service pool acquire_timeout must be positive".into(),
         ));
     }
-
-    freeze_projection_execution_mode_from_env()
-        .map_err(|error| MigrationError::Failed(error.to_string()))?;
 
     // 服务池会话契约与 mysql_pool_options 一致：schema charset/collation 的
     // 物理连接级契约 + UTC 会话时区（字面量经测试锚定与 migration.rs 同源）。

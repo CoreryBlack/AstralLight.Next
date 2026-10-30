@@ -14,10 +14,8 @@
 //!    issuance-only，无授权读侧消费者；TEMPLATE RuleSet 授权内容归
 //!    `permission_rule_template` 同步路径）；审计关联为同事务 `audit_log`
 //!    （actor/operation/实际变更字段 old/new）。
-//! 6. `update_template_with_context` 要求已验证正数 actor（审计落 exact HTTP
-//!    身份）；未证明 operation id 在事务内以锁定 durable 事实确定性派生一次，
-//!    绝不随机 fallback。`update_template` 为显式兼容路径（派生 system 身份，
-//!    行为不变）。
+//! 6. `update_template_with_context` requires a verified positive actor and
+//!    stabilizes missing operation identity from locked durable facts before audit.
 
 use async_trait::async_trait;
 use sqlx::{MySqlPool, QueryBuilder, Transaction};
@@ -386,33 +384,14 @@ pub trait CardTemplateRepository: Send + Sync {
     async fn get_template(&self, id: i64) -> Result<Option<CardTemplateRecord>, AstralError>;
     /// 新建模板；若 scope=SYSTEM 先在同一事务内清除同类型其他 SYSTEM 标记
     async fn create_template(&self, new: &NewCardTemplate) -> Result<i64, AstralError>;
-    /// 部分更新（显式兼容路径）：守卫/变更检测/同事务 audit_log 语义与
-    /// `update_template_with_context` 一致；审计落派生 system 身份（行为不变）。
-    /// 不追加 legacy 投影事件，不产生账本 delta（模块头约束 5）。
-    async fn update_template(&self, id: i64, patch: &CardTemplatePatch) -> Result<(), AstralError>;
-    /// 带可信调用方身份的部分更新（additive；source 语义与 `update_template`
-    /// 完全一致，审计关联改用 exact 调用方身份）。
-    ///
-    /// `context.actor_id()` 必须为已验证正数（非正数 Auth fail-closed）；
-    /// `context` 为已证明 operation id 时原样复用，未证明（request id 缺失）
-    /// 时在事务内以锁定 durable 事实确定性派生一次——同一 durable 状态重放
-    /// 得到同一 id，绝不随机 fallback。
-    ///
-    /// 默认实现 fail-closed：测试替身按需覆写；任何实现都不得静默降级为
-    /// 派生 system 身份（生产 exact actor 合同）。
+    /// Update using the verified actor and a stable operation identity.
+    /// Missing request identity is derived once from locked durable facts.
     async fn update_template_with_context(
         &self,
         id: i64,
         patch: &CardTemplatePatch,
         context: &RuleSetMutationContext,
-    ) -> Result<(), AstralError> {
-        let _ = (id, patch, context);
-        Err(AstralError::Internal(
-            "update_template_with_context requires an implementation carrying the \
-             verified caller identity"
-                .into(),
-        ))
-    }
+    ) -> Result<(), AstralError>;
     /// Transactionally delete only when no observable schema reference exists.
     async fn delete_template_if_unreferenced(&self, id: i64) -> Result<bool, AstralError>;
 }
@@ -501,29 +480,13 @@ impl SqlxCardTemplateRepository {
         Ok(source_generation)
     }
 
-    /// 兼容路径身份（`update_template` 显式保留）：system 上下文，operation id
-    /// 以事务内锁定的 RULE_SET head 代次确定性派生（对 head 的 FOR UPDATE 读
-    /// 与既有锁序一致，不引入新的锁序倒置）。
-    async fn stabilize_card_template_operation_context(
-        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        template_id: i64,
-        rule_set_id: Option<i64>,
-    ) -> Result<RuleSetMutationContext, AstralError> {
-        let source_generation = Self::locked_rule_set_head_generation(tx, rule_set_id).await?;
-        RuleSetMutationContext::system(&derive_card_template_update_operation_id(
-            template_id,
-            source_generation,
-        ))
-    }
-
-    /// update 共同实现：`caller` 为 `None` 时走兼容派生 system 路径；
-    /// `Some(ctx)` 时审计关联使用 exact 调用方身份。
     async fn apply_template_update(
         &self,
         id: i64,
         patch: &CardTemplatePatch,
-        caller: Option<&RuleSetMutationContext>,
+        caller: &RuleSetMutationContext,
     ) -> Result<(), AstralError> {
+        guard_card_template_update_actor(caller.actor_id())?;
         // 空补丁：无字段更新（对齐原语义，不产生 SQL 与事务）
         if patch.is_empty() {
             return Ok(());
@@ -599,34 +562,23 @@ impl SqlxCardTemplateRepository {
             .clone()
             .or(current.template_scope.clone());
 
+        let context =
+            if caller.has_proven_operation_identity() {
+                caller.clone()
+            } else {
+                let source_generation =
+                    Self::locked_rule_set_head_generation(&mut tx, rule_set_id).await?;
+                caller.clone().with_derived_operation_id(
+                    derive_card_template_update_operation_id(id, source_generation),
+                )?
+            };
+
         // SYSTEM 清理与本次 UPDATE 同事务/同一连接：UPDATE 失败即整体回滚。
         if effective_scope.as_deref() == Some(TEMPLATE_SCOPE_SYSTEM) {
             if let Some(card_type) = &effective_card_type {
                 Self::clear_system_scope_in_tx(&mut tx, card_type).await?;
             }
         }
-
-        // Operation identity 前置：任何 audit durable 写入之前确定可证明身份。
-        // None → 兼容路径：system 身份由锁定的 RULE_SET head 代次确定性派生。
-        // Some(ctx) → 已验证 actor；已证明 operation id 原样复用，未证明
-        // （request id 缺失）以同一锁定事实确定性派生一次，绝不随机 fallback。
-        let context = match caller {
-            None => {
-                Self::stabilize_card_template_operation_context(&mut tx, id, rule_set_id).await?
-            }
-            Some(ctx) => {
-                guard_card_template_update_actor(ctx.actor_id())?;
-                if ctx.has_proven_operation_identity() {
-                    ctx.clone()
-                } else {
-                    let source_generation =
-                        Self::locked_rule_set_head_generation(&mut tx, rule_set_id).await?;
-                    ctx.clone().with_derived_operation_id(
-                        derive_card_template_update_operation_id(id, source_generation),
-                    )?
-                }
-            }
-        };
 
         let mut builder = QueryBuilder::<sqlx::MySql>::new("UPDATE user_card_template SET ");
         let mut first = true;
@@ -782,19 +734,13 @@ impl CardTemplateRepository for SqlxCardTemplateRepository {
         Ok(new_id)
     }
 
-    async fn update_template(&self, id: i64, patch: &CardTemplatePatch) -> Result<(), AstralError> {
-        // 显式兼容路径：无调用方身份，审计落派生 system 身份（行为不变）。
-        self.apply_template_update(id, patch, None).await
-    }
-
     async fn update_template_with_context(
         &self,
         id: i64,
         patch: &CardTemplatePatch,
         context: &RuleSetMutationContext,
     ) -> Result<(), AstralError> {
-        guard_card_template_update_actor(context.actor_id())?;
-        self.apply_template_update(id, patch, Some(context)).await
+        self.apply_template_update(id, patch, context).await
     }
 
     async fn delete_template_if_unreferenced(&self, id: i64) -> Result<bool, AstralError> {
@@ -1177,7 +1123,8 @@ mod tests {
     #[test]
     fn update_tx_orders_locks_guards_changes_audit_and_commit() {
         let source = include_str!("card_template_repository.rs");
-        let update_body = source
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let update_body = production
             .split("async fn apply_template_update")
             // 该字面量在实现中唯一（两个 delegate 调用点不带 "async fn" 前缀）；
             // nth(1) 从实现体起，再以 impl delete 声明截断。
@@ -1206,8 +1153,11 @@ mod tests {
             .find("if !changes.any()")
             .expect("update must short-commit on no actual change");
         let stabilize = update_body
-            .find("stabilize_card_template_operation_context")
+            .find("caller.has_proven_operation_identity()")
             .expect("update must stabilize operation identity before durable writes");
+        let scope_update = update_body
+            .find("Self::clear_system_scope_in_tx(&mut tx, card_type)")
+            .expect("SYSTEM cleanup must share the stabilized source transaction");
         let source_update = update_body
             .find("builder.build().execute(&mut **tx)")
             .expect("update must mutate the template row on the wrapper connection");
@@ -1224,7 +1174,8 @@ mod tests {
                 && guard < changes
                 && changes < no_change
                 && no_change < stabilize
-                && stabilize < source_update
+                && stabilize < scope_update
+                && scope_update < source_update
                 && source_update < audit
                 && audit < commit,
             "update must order: wrapper begin -> rule_set owner lock -> template lock -> \
@@ -1247,7 +1198,8 @@ mod tests {
     #[test]
     fn update_produces_no_legacy_projection_ledger_or_invalidation_writes() {
         let source = include_str!("card_template_repository.rs");
-        let update_body = source
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let update_body = production
             .split("async fn apply_template_update")
             .nth(1)
             .and_then(|body| {
@@ -1280,7 +1232,8 @@ mod tests {
     #[test]
     fn audit_correlation_is_same_transaction_audit_log_for_every_template() {
         let source = include_str!("card_template_repository.rs");
-        let update_body = source
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let update_body = production
             .split("async fn apply_template_update")
             .nth(1)
             .and_then(|body| {
@@ -1310,13 +1263,8 @@ mod tests {
         );
     }
 
-    /// 身份合同：`update_template_with_context` 要求已验证正数 actor（审计落
-    /// exact HTTP 身份，system/负值 Auth 拒绝）；已证明 operation id 原样复用，
-    /// 未证明以锁定 durable 事实确定性派生一次（绝不随机 fallback，也绝不
-    /// 逐重试漂移）；兼容路径 `update_template` 显式保留并委托 None。
     #[test]
-    fn context_update_identity_contract_and_legacy_compat() {
-        // actor 守卫（纯函数）：非正一律 Auth 拒绝，正数放行。
+    fn context_update_requires_verified_actor_and_stable_operation() {
         assert!(matches!(
             guard_card_template_update_actor(0),
             Err(AstralError::Auth(_))
@@ -1328,73 +1276,30 @@ mod tests {
         assert!(guard_card_template_update_actor(42).is_ok());
 
         let source = include_str!("card_template_repository.rs");
-        // additive trait 入口存在（trait 声明与 impl 均为多行签名，只锚定名）。
-        assert!(
-            source.contains(concat!("async fn update_template_", "with_context")),
-            "the additive with-context entry must exist"
-        );
-        // 两个入口的委托关系：legacy → None，with_context → Some(context)。
-        // token 以 concat 构造，避免本测试字面量混入 matches 计数。
-        let legacy_token = concat!("self.apply_template_update(id, patch, ", "None).await");
-        let context_token = concat!(
-            "self.apply_template_update(id, patch, ",
-            "Some(context)).await"
-        );
-        assert!(
-            source.matches(legacy_token).count() == 1,
-            "exactly the legacy path must delegate with None"
-        );
-        assert!(
-            source.matches(context_token).count() == 1,
-            "exactly the with-context path must delegate with Some(context)"
-        );
-        let with_context_body = source
-            .split("async fn update_template_with_context")
-            .nth(2)
-            .and_then(|body| body.split("async fn apply_template_update").next())
-            .expect("with_context implementation must be delimited");
-        assert!(
-            with_context_body.contains("guard_card_template_update_actor(context.actor_id())"),
-            "with_context must fail closed on unverified actors before any transaction"
-        );
-
-        // 共同实现内的身份分派：已证明原样复用；未证明确定性派生一次；
-        // 兼容 arm 保持派生 system 身份。随机 fallback 任何位置都不得出现。
-        let update_body = source
-            .split("async fn apply_template_update")
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("async fn update_template("));
+        let update = production
+            .split("async fn apply_template_update(")
             .nth(1)
-            .and_then(|body| {
-                body.split("async fn delete_template_if_unreferenced")
-                    .next()
-            })
-            .expect("apply_template_update implementation must be delimited");
-        assert!(
-            update_body.contains("ctx.has_proven_operation_identity()"),
-            "a proven operation identity must be reused verbatim"
-        );
-        let derivation = update_body
-            .find("ctx.clone().with_derived_operation_id(")
-            .expect("an unproven context must derive once from locked durable facts");
-        let derived_id = update_body
-            .find("derive_card_template_update_operation_id(id, source_generation)")
-            .expect("the derivation must reuse the existing deterministic helper");
-        assert!(
-            derivation < derived_id,
-            "the derived id must feed with_derived_operation_id (derive once, before SQL)"
-        );
-        // 兼容 arm：update_template 无上下文时仍派生 system 身份（stabilize fn）。
-        let system_token = concat!(
-            "RuleSetMutationContext::",
-            "system(&derive_card_template_update_operation_id("
-        );
-        assert!(
-            source.contains(system_token),
-            "the legacy arm must keep the derived system identity"
-        );
-        assert!(
-            !update_body.contains("uuid::Uuid") && !update_body.contains("ruleset:"),
-            "no random fallback (uuid or ruleset: prefix) may reach the audit correlation"
-        );
+            .unwrap();
+        let actor = update
+            .find("guard_card_template_update_actor(caller.actor_id())?")
+            .unwrap();
+        let transaction = update
+            .find("AuthorizationSourceTransaction::begin")
+            .unwrap();
+        assert!(actor < transaction);
+        assert!(update.contains("caller.has_proven_operation_identity()"));
+        assert!(update.contains("caller.clone().with_derived_operation_id("));
+        let compact: String = update.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains("derive_card_template_update_operation_id(id,source_generation)"));
+        assert!(!update.contains("RuleSetMutationContext::system"));
+        assert!(!update.contains("uuid::Uuid"));
+        let delegated = production
+            .split("async fn update_template_with_context(")
+            .nth(2)
+            .unwrap();
+        assert!(delegated.contains("self.apply_template_update(id, patch, context).await"));
     }
 
     /// 审计 SQL 只用绑定参数 + 固定常量，绝不拼接请求输入；event_type/

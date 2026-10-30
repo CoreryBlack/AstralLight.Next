@@ -10,7 +10,6 @@ use crate::e4_protocol::{self, Authorization};
 use serde_json::{json, Value};
 
 pub const DEFAULT_PROFILE: &str = "native-single-node";
-pub const LEGACY_PROFILE: &str = "redis-compat";
 pub const MAX_ATTEMPTS: u8 = 1;
 pub const LIVE_FAULT_MATRIX_INTEGRATION: &str = "BLOCKED";
 pub const LIVE_INTEGRATION_REASON: &str = "No platform-specific fault controller exists in this repository: the TrustGraph test-control plane (astral-trustgraph/src/api/test_control.rs) exposes a read-only /internal/test-control/worker-id probe only, and no generic safe fault primitive exists. Live fault injection is Exec-L3 and requires a future user-approved campaign to inject a FaultController satisfying the documented contract; this module never applies faults.";
@@ -273,6 +272,7 @@ mod tests {
         assert_eq!(outcome.exit_code, 0);
         assert!(outcome.stdout.contains("BLOCKED"));
         assert!(outcome.stdout.contains("memory_channel_suspect"));
+        assert!(outcome.stdout.contains("writer_lease_loss"));
         assert!(!outcome.stdout.contains("redis_unavailable"));
         let plan: Value =
             serde_json::from_str(&outcome.stdout[outcome.stdout.find('{').unwrap()..]).unwrap();
@@ -282,10 +282,11 @@ mod tests {
 
     #[test]
     fn plan_flag_prints_the_same_plan() {
-        let outcome = cli(&["--plan", "--profile", LEGACY_PROFILE]);
+        let outcome = cli(&["--plan", "--profile", DEFAULT_PROFILE]);
         assert_eq!(outcome.exit_code, 0);
         assert!(outcome.stdout.contains("live_fault_matrix_integration"));
         assert!(outcome.stdout.contains("\"status\": \"BLOCKED\""));
+        assert!(profile_faults("redis-compat").is_err());
     }
 
     #[test]

@@ -8,11 +8,9 @@ use std::sync::Arc;
 use astral_common::contract::PageResponse;
 use astral_types::AstralError;
 
-use crate::repository::conversation_repository::ConversationRepository;
 use crate::repository::member_repository::MemberRepository;
 use crate::repository::message_repository::{MessageRepository, SendIntentEffect};
 use crate::scope::ChatScope;
-use crate::service::side_effect::MessageSideEffects;
 use crate::srv::messages::Message;
 
 fn send_effect_name(effect: SendIntentEffect) -> &'static str {
@@ -40,17 +38,6 @@ pub struct MessageService {
 }
 
 impl MessageService {
-    /// Compatibility constructor retained for the former repository/side-effect API.
-    /// Legacy transports are intentionally not used for durable message acceptance.
-    pub fn new(
-        _conversations: Arc<dyn ConversationRepository>,
-        members: Arc<dyn MemberRepository>,
-        messages: Arc<dyn MessageRepository>,
-        _side_effects: Arc<dyn MessageSideEffects>,
-    ) -> Self {
-        Self { members, messages }
-    }
-
     /// Construct the durable-intent service used by the Chat runtime.
     pub fn new_durable(
         members: Arc<dyn MemberRepository>,
@@ -192,7 +179,7 @@ mod tests {
     use super::*;
     use crate::repository::member_repository::{GroupMemberRecord, MemberRepository};
     use crate::repository::message_repository::{
-        MessageRecord, PersistedSendIntent, SendIntentEffect,
+        MessageRecord, PersistedSendIntent, SendIntentClaim, SendIntentEffect, SendIntentRecipient,
     };
     use crate::scope::{ChatScope, ChatScopeKey};
     use astral_common::token_contract::PrincipalKind;
@@ -296,57 +283,98 @@ mod tests {
             Ok(persisted)
         }
 
-        async fn insert_message(
+        async fn claim_send_intents(
             &self,
-            _conversation_id: i64,
-            _sender_id: i64,
-            _message_type: &str,
-            _content: &str,
-        ) -> Result<i64, AstralError> {
+            _owner: &str,
+            _limit: u32,
+        ) -> Result<Vec<SendIntentClaim>, AstralError> {
             Err(AstralError::NotImplemented(
-                "legacy insert must not be used".into(),
+                "unused in message service test".into(),
             ))
         }
 
-        async fn get_message(&self, _id: i64) -> Result<Option<MessageRecord>, AstralError> {
-            Ok(None)
-        }
-
-        async fn get_sender_id(&self, _id: i64) -> Result<Option<i64>, AstralError> {
-            Ok(None)
-        }
-
-        async fn count_by_session(&self, _conversation_id: i64) -> Result<i64, AstralError> {
-            Ok(0)
-        }
-
-        async fn list_by_session(
+        async fn send_intent_recipients(
             &self,
+            _claim: &SendIntentClaim,
+        ) -> Result<Vec<SendIntentRecipient>, AstralError> {
+            Err(AstralError::NotImplemented(
+                "unused in message service test".into(),
+            ))
+        }
+
+        async fn complete_send_intent(&self, _claim: &SendIntentClaim) -> Result<(), AstralError> {
+            Err(AstralError::NotImplemented(
+                "unused in message service test".into(),
+            ))
+        }
+
+        async fn retry_known_not_admitted(
+            &self,
+            _claim: &SendIntentClaim,
+            _error: &str,
+        ) -> Result<(), AstralError> {
+            Err(AstralError::NotImplemented(
+                "unused in message service test".into(),
+            ))
+        }
+
+        async fn mark_send_intent_in_doubt(
+            &self,
+            _claim: &SendIntentClaim,
+            _error: &str,
+        ) -> Result<(), AstralError> {
+            Err(AstralError::NotImplemented(
+                "unused in message service test".into(),
+            ))
+        }
+
+        async fn get_message_scoped(
+            &self,
+            _scope: &ChatScope,
+            _id: i64,
+        ) -> Result<Option<MessageRecord>, AstralError> {
+            Err(AstralError::Permission(
+                "unused in message service test".into(),
+            ))
+        }
+
+        async fn count_by_session_scoped(
+            &self,
+            _scope: &ChatScope,
+            _conversation_id: i64,
+        ) -> Result<i64, AstralError> {
+            Err(AstralError::Permission(
+                "unused in message service test".into(),
+            ))
+        }
+
+        async fn list_by_session_scoped(
+            &self,
+            _scope: &ChatScope,
             _conversation_id: i64,
             _limit: i64,
             _offset: i64,
         ) -> Result<Vec<MessageRecord>, AstralError> {
-            Ok(vec![])
+            Err(AstralError::Permission(
+                "unused in message service test".into(),
+            ))
         }
 
-        async fn recall_message(&self, _id: i64) -> Result<(), AstralError> {
+        async fn recall_message_scoped(
+            &self,
+            _scope: &ChatScope,
+            _id: i64,
+        ) -> Result<(), AstralError> {
             Ok(())
         }
 
-        async fn count_unread(
+        async fn count_unread_scoped(
             &self,
+            _scope: &ChatScope,
             _conversation_id: i64,
             _last_read_message_id: i64,
         ) -> Result<i64, AstralError> {
             Ok(0)
-        }
-
-        async fn insert_delivery(
-            &self,
-            _message_id: i64,
-            _recipient_id: i64,
-        ) -> Result<(), AstralError> {
-            Ok(())
         }
     }
 

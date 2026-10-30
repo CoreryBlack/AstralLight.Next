@@ -235,7 +235,6 @@ impl UserService {
 
     pub async fn set_password(
         &self,
-        state: &AppState,
         user_id: i64,
         req: &SetPasswordRequest,
     ) -> Result<(), AppError> {
@@ -247,31 +246,17 @@ impl UserService {
         let password_hash = hash_password(&req.password)
             .map_err(|e| AppError(AstralError::Internal(e.to_string())))?;
         // Password hash, credential revision, sessions/families/JTIs, and the
-        // durable v2 projection outbox commit together before external projection.
+        // durable revocation outbox commit together before local deny acceleration.
         let revoked_jtis = self
             .auth
             .update_password_hash_with_revocation(user_id, &password_hash, "PASSWORD_CHANGED", None)
             .await
             .map_err(AppError)?;
-        #[cfg(feature = "redis-compat")]
-        let redis = state.redis.as_ref();
-        #[cfg(not(feature = "redis-compat"))]
-        let redis: Option<&()> = None;
-        crate::srv::session::project_password_revocation(state, &revoked_jtis, redis)
+        crate::srv::session::project_password_revocation(&revoked_jtis)
             .await
             .map_err(AppError)?;
         tracing::info!(user_id, "password set");
         Ok(())
-    }
-
-    /// 更新本地凭证密码哈希（password reset 用；透传 AuthRepository，对齐
-    /// Java `PasswordResetService` 的 ARGON2ID 更新语义）。
-    pub async fn update_password_hash(
-        &self,
-        user_id: i64,
-        password_hash: &str,
-    ) -> Result<(), AstralError> {
-        self.auth.update_password_hash(user_id, password_hash).await
     }
 }
 
@@ -380,14 +365,6 @@ mod tests {
             _user_id: i64,
         ) -> Result<Option<crate::auth::PasswordCredential>, AstralError> {
             Ok(None)
-        }
-
-        async fn update_password_hash(
-            &self,
-            _user_id: i64,
-            _new_hash: &str,
-        ) -> Result<(), AstralError> {
-            Ok(())
         }
 
         async fn update_password_hash_with_revocation(
@@ -595,10 +572,6 @@ mod tests {
         AppState {
             config: Arc::new(astral_common::config::AppConfig::default()),
             db,
-            // Redis-free 默认路径：兼容 adapter 未安装（None）。仅 redis-compat
-            // feature 编译（feature-off 构建中该字段不存在）。
-            #[cfg(feature = "redis-compat")]
-            redis: None,
             engine: Arc::new(policy_engine::PolicyEngine::new()),
             me_service: Arc::new(crate::srv::me_service::MeService::new(Arc::new(
                 SqlxMeRepositoryLazy,

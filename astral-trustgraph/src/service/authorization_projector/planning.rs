@@ -30,20 +30,6 @@ use policy_engine::{
 };
 
 use super::*;
-pub(crate) fn reconcile_lease_mutation_loss(
-    identity: &DeltaLeaseIdentity,
-    mutation: &str,
-    error: &astral_db::GrantRepositoryError,
-) {
-    tracing::warn!(
-        event_id = %identity.event_id,
-        delta_event_id = identity.delta_event_id,
-        mutation,
-        error = %error,
-        "delta lease mutation matched zero rows; treating as UNKNOWN, \
-         reconciliation required before any retry"
-    );
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure decision pipeline (unit-tested without MySQL)

@@ -103,12 +103,11 @@ const RULE_SELECT_COLUMNS: &str = "rule_id, card_id, tenant_id, resource_type, r
 
 /// 锁定读取使用的列集：有效期用可证明的 UTC 串（去 Z 后仍由适配器按 UTC 解析，
 /// 与写入约定一致）；JOIN user_card 补齐授权账本组装所需的属主/租户/域事实。
-/// 锁定读取使用的列集：有效期用可证明的 UTC 串（去 Z 后仍由适配器按 UTC 解析，
-/// 与写入约定一致）；JOIN user_card 补齐授权账本组装所需的属主/租户/域事实。
 /// 卡级联删除路径（user_card_repository 的远端 DELEGATION 规则锁定）经本常量
 /// 引用同一列清单，避免两处 SQL 漂移。
 pub(crate) const LOCKED_RULE_SELECT: &str = "pr.rule_id AS rule_id, pr.card_id AS card_id, \
-     uc.user_id AS user_id, pr.tenant_id AS tenant_id, uc.domain_id AS domain_id, \
+     uc.user_id AS user_id, pr.tenant_id AS tenant_id, uc.tenant_id AS card_tenant_id, \
+     uc.domain_id AS domain_id, \
      pr.resource_type AS resource_type, pr.resource_id AS resource_id, \
      pr.action_code AS action_code, pr.effect AS effect, \
      pr.condition_json AS condition_json, pr.priority AS priority, \
@@ -136,6 +135,7 @@ pub(crate) struct LockedRuleRow {
     pub(crate) card_id: i64,
     pub(crate) user_id: i64,
     pub(crate) tenant_id: Option<i64>,
+    pub(crate) card_tenant_id: Option<i64>,
     pub(crate) domain_id: Option<i64>,
     #[allow(dead_code)]
     pub(crate) resource_type: String,
@@ -176,6 +176,37 @@ fn patch_is_empty(patch: &RulePatch) -> bool {
         && patch.condition_json.is_none()
         && patch.valid_from.is_none()
         && patch.valid_to.is_none()
+}
+
+/// Rule row tenant must be a positive exact match for its joined user-card tenant.
+/// Both sides are read under the caller's existing FOR UPDATE lock; no legacy
+/// NULL fallback or cross-tenant source write is accepted.
+fn validate_locked_rule_tenant_scope(
+    card_id: i64,
+    rule_tenant_id: Option<i64>,
+    card_tenant_id: Option<i64>,
+) -> Result<i64, AstralError> {
+    if card_id <= 0 {
+        return Err(AstralError::Validation(
+            "permission rule requires a positive card id".into(),
+        ));
+    }
+    let Some(rule_tenant_id) = rule_tenant_id.filter(|tenant| *tenant > 0) else {
+        return Err(AstralError::Validation(
+            "permission rule tenant_id is missing or non-positive".into(),
+        ));
+    };
+    let Some(card_tenant_id) = card_tenant_id.filter(|tenant| *tenant > 0) else {
+        return Err(AstralError::Validation(
+            "user card tenant_id is missing or non-positive".into(),
+        ));
+    };
+    if rule_tenant_id != card_tenant_id {
+        return Err(AstralError::Validation(
+            "permission rule tenant_id does not match its user card tenant_id".into(),
+        ));
+    }
+    Ok(rule_tenant_id)
 }
 
 /// identity 专用 facts（REMOVE/tombstone 与 UPDATE-head 定位共用）：resource/
@@ -269,11 +300,6 @@ pub trait RuleRepository: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<RuleRecord>, AstralError>;
-    /// 是否由 repository 在 source mutation 事务内追加 projection head/outbox。
-    /// 纯测试替身默认返回 false，service 会保留兼容副作用路径。
-    fn writes_projection_in_transaction(&self) -> bool {
-        false
-    }
 }
 
 pub struct SqlxRuleRepository {
@@ -401,10 +427,6 @@ impl SqlxRuleRepository {
 
 #[async_trait]
 impl RuleRepository for SqlxRuleRepository {
-    fn writes_projection_in_transaction(&self) -> bool {
-        true
-    }
-
     async fn count_rules(&self) -> Result<i64, AstralError> {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM permission_rule \
@@ -459,6 +481,12 @@ impl RuleRepository for SqlxRuleRepository {
         // 校验先于任何事务副作用。canonical 合同无 condition 槽位：非空条件授权
         // 无法被无条件 ALLOW 忠实表达，任何副作用开始前 Validation fail-closed。
         let effect = crate::service::validate_canonical_grant_effect(&new.effect)?;
+        if new.source_type != "MANUAL" {
+            return Err(AstralError::Validation(
+                "new permission-rule rows must use MANUAL source_type; CARD_ONLY is legacy read/delete-only"
+                    .into(),
+            ));
+        }
         require_canonical_direct_enabled(Some(new.enabled))?;
         reject_unrepresentable_condition(new.condition_json.as_deref(), "direct rule create")?;
         let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
@@ -480,6 +508,22 @@ impl RuleRepository for SqlxRuleRepository {
                 "rule target card does not exist or is not ACTIVE/currently valid".into(),
             ));
         };
+        let sod = astral_db::check_grant_sod_conflict_in_tx(
+            &mut tx,
+            new.card_id,
+            &new.resource_type,
+            &new.action_code,
+            None,
+        )
+        .await
+        .map_err(db_error)?;
+        crate::service::rule_write_service::reject_sod_conflict(
+            sod,
+            &new.resource_type,
+            &new.action_code,
+        )?;
+
+        let card_tenant_id = validate_locked_rule_tenant_scope(new.card_id, tenant_id, tenant_id)?;
 
         let result = sqlx::query(
             "INSERT INTO permission_rule (card_id, tenant_id, resource_type, resource_id, action_code, effect, \
@@ -487,7 +531,7 @@ impl RuleRepository for SqlxRuleRepository {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
         )
         .bind(new.card_id)
-        .bind(tenant_id)
+        .bind(card_tenant_id)
         .bind(&new.resource_type)
         .bind(new.resource_id)
         .bind(&new.action_code)
@@ -561,9 +605,6 @@ impl RuleRepository for SqlxRuleRepository {
             valid_from: new.valid_from.as_deref(),
             valid_to: new.valid_to.as_deref(),
         };
-        // 影响面与事件目标只供 LegacyHybrid 的请求侧尝试；WorkerOwned 只消费
-        // source COMMIT 已证明返回的完整 receipt 批次做有界只读 completion 等待。
-        let sync_tenant_id = resolve_direct_tenant_id(&facts)?;
         let draft =
             build_direct_add_draft(&facts, &operation_id, context.actor_user_id, &projection)?;
         let (base_version, target_version) =
@@ -571,18 +612,7 @@ impl RuleRepository for SqlxRuleRepository {
         append_direct_grant_delta_in_tx(&mut tx, &draft, base_version, target_version).await?;
 
         let receipts = tx.commit_consuming_with_receipts().await?;
-        // source COMMIT 已证明后，LegacyHybrid 可按目标尝试请求侧发布；WorkerOwned
-        // 仅验证完整 receipt 批次的历史 durable completion，失败仍由 worker 收敛。
-        crate::service::sync_publish::after_commit_sync_publish_with_receipts(
-            &self.db,
-            vec![crate::service::sync_publish::SyncPublishTarget::single(
-                sync_tenant_id,
-                new.card_id,
-                projection.event_id.clone(),
-            )],
-            receipts,
-        )
-        .await;
+        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
         Ok(rule_id)
     }
 
@@ -611,7 +641,15 @@ impl RuleRepository for SqlxRuleRepository {
         let row = Self::lock_rule_for_mutation(&mut **tx, rule_id)
             .await?
             .ok_or_else(|| AstralError::NotFound(format!("rule {rule_id} not found")))?;
+        if row.source_type != "MANUAL" {
+            return Err(AstralError::Validation(
+                "permission-rule updates require MANUAL source_type; historical CARD_ONLY rows are read/delete-only"
+                    .into(),
+            ));
+        }
         require_canonical_direct_enabled(row.enabled)?;
+        let tenant_id =
+            validate_locked_rule_tenant_scope(row.card_id, row.tenant_id, row.card_tenant_id)?;
 
         // 合并 patch 得到最终字段值（None 表示沿用 DB 既有值）。
         let final_effect = match &validated_effect {
@@ -631,6 +669,37 @@ impl RuleRepository for SqlxRuleRepository {
         let final_condition = patch.condition_json.clone();
         let final_valid_from = patch.valid_from.clone().or_else(|| row.valid_from.clone());
         let final_valid_to = patch.valid_to.clone().or_else(|| row.valid_to.clone());
+
+        let sod = astral_db::check_grant_sod_conflict_in_tx(
+            &mut tx,
+            row.card_id,
+            &final_resource,
+            &final_action,
+            Some(astral_db::DirectGrantSodUpdateBeforeImage {
+                rule_tenant_id: row.tenant_id,
+                source_card_tenant_id: row.card_tenant_id,
+                domain_id: row.domain_id,
+                card_id: row.card_id,
+                user_id: row.user_id,
+                rule_id: row.rule_id,
+                source_type: &row.source_type,
+                enabled: row.enabled,
+                effect: &row.effect,
+                resource_type: &row.resource_type,
+                resource_id: row.resource_id,
+                action_code: &row.action_code,
+                condition_json: row.condition_json.as_deref(),
+                valid_from: row.valid_from.as_deref(),
+                valid_to: row.valid_to.as_deref(),
+            }),
+        )
+        .await
+        .map_err(db_error)?;
+        crate::service::rule_write_service::reject_sod_conflict(
+            sod,
+            &final_resource,
+            &final_action,
+        )?;
 
         let result = sqlx::query(
             "UPDATE permission_rule SET effect = ?, resource_type = ?, action_code = ?, \
@@ -662,7 +731,7 @@ impl RuleRepository for SqlxRuleRepository {
         // 父投影事件落库 —— 收窄 UPDATE 的 stale-ALLOW 闭合需要先拿到
         // before-image（head.payload）才能决定父事件语义。
         let facts = DirectRuleLedgerFacts {
-            tenant_id: row.tenant_id,
+            tenant_id: Some(tenant_id),
             domain_id: row.domain_id,
             card_id: row.card_id,
             user_id: row.user_id,
@@ -751,18 +820,7 @@ impl RuleRepository for SqlxRuleRepository {
         append_direct_grant_delta_in_tx(&mut tx, &draft, base_version, target_version).await?;
 
         let receipts = tx.commit_consuming_with_receipts().await?;
-        // source COMMIT 已证明后交给模式分流；WorkerOwned 不认领、不发布、不释放，
-        // 只对完整 receipts 做有界只读 completion 等待。
-        crate::service::sync_publish::after_commit_sync_publish_with_receipts(
-            &self.db,
-            vec![crate::service::sync_publish::SyncPublishTarget::single(
-                tenant_scope_for_read,
-                row.card_id,
-                projection.event_id.clone(),
-            )],
-            receipts,
-        )
-        .await;
+        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
         Ok(())
     }
 
@@ -883,18 +941,7 @@ impl RuleRepository for SqlxRuleRepository {
         append_direct_grant_delta_in_tx(&mut tx, &draft, base_version, target_version).await?;
 
         let receipts = tx.commit_consuming_with_receipts().await?;
-        // source COMMIT 已证明后交给模式分流；REMOVE 仍由 strict pending-invalidates
-        // gate 保持 fail-closed。WorkerOwned 仅等待完整 receipts 的只读完成证明。
-        crate::service::sync_publish::after_commit_sync_publish_with_receipts(
-            &self.db,
-            vec![crate::service::sync_publish::SyncPublishTarget::single(
-                tenant_id,
-                row.card_id,
-                projection.event_id.clone(),
-            )],
-            receipts,
-        )
-        .await;
+        crate::service::sync_publish::after_commit_wait_for_projection(&self.db, &receipts).await;
         Ok(true)
     }
 
@@ -1330,6 +1377,24 @@ mod direct_ledger_shape_tests {
     const CREATE_SIG: &str = "async fn create_rule(";
     const UPDATE_SIG: &str = "async fn update_rule(";
     const DELETE_SIG: &str = "async fn delete_rule(";
+
+    #[test]
+    fn source_create_and_update_revalidate_sod_before_mutating_rows() {
+        let source = include_str!("rule_repository.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for (start, end, mutation) in [
+            (CREATE_SIG, UPDATE_SIG, "INSERT INTO permission_rule"),
+            (UPDATE_SIG, DELETE_SIG, "UPDATE permission_rule SET"),
+        ] {
+            let body = method_body(production, start, end, "transactional SoD");
+            let begin = body.find("AuthorizationSourceTransaction::begin").unwrap();
+            let check = body.find("check_grant_sod_conflict_in_tx(").unwrap();
+            let refuse = body.find("reject_sod_conflict(").unwrap();
+            let write = body.find(mutation).unwrap();
+            assert!(begin < check && check < refuse && refuse < write);
+            assert!(!body.contains("check_grant_sod_conflict(&self.db"));
+        }
+    }
 
     /// create：锁卡验证 → INSERT（rows/last_insert_id 守卫）→ derive op →
     /// 带 metadata 投影 → audit → ADD 草稿 → version 链 → revision+delta 同 tx。

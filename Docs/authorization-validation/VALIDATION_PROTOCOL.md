@@ -1,8 +1,10 @@
 # Authorization Validation Protocol
 
-> Updated 2026-10-07. This document defines reusable validation entry points and
-> record formats. It does not authorize execution; every live run still follows the
-> execution, preflight, scope, and durable-postcondition gates in `AGENTS.md`.
+> Updated 2026-10-28. This document defines reusable validation entry points and
+> record formats. The current executable inventory and exact suite commands are the
+> Rust `test-campaign` runner and [`tests-suite/MANIFEST.toml`](../../tests-suite/MANIFEST.toml).
+> This document does not authorize execution; every live run still follows the
+> execution, preflight, scope, and durable-postcondition gates in `../../AGENTS.md`.
 
 ## Common constraints
 
@@ -12,11 +14,14 @@
 - Durable reconciliation is scoped by canonical aggregate identity
   `(tenant_id, aggregate_type, aggregate_id)`. Cross-tenant rows, old head/outbox
   records, or unscoped source reads cannot prove the current run's postcondition.
-- Use only an isolated test deployment and test database. Redis is required only for
-  compat-enabled validation runs (the `redis-compat` feature plus
-  `ASTRAL_REDIS_PROJECTION_COMPAT=true`); the single-node composite is a strict Redis-free
-  deployment and its validation must not depend on Redis. Do not
-  touch production data, secrets, or externally visible services.
+- Use only an isolated test deployment and test database. The current Rust profile
+  inventory is `native-kernel`, `offline-validation`, `native-single-node`,
+  `standalone-rabbit`, `distributed`, `performance-kernel`, and `performance-native`,
+  as registered in `tests-suite/MANIFEST.toml` and the Rust harness. Current native
+  profiles do not use Redis; there is no current Redis compatibility feature, profile,
+  or Cargo test target. Historical Redis/compatibility results remain historical evidence
+  and are not current gates or fallback paths. Do not touch production data, secrets, or
+  externally visible services.
 - Each phase records a manifest, configuration and binary hashes, command, cwd,
   environment summary, start/end time, exit code, stdout/stderr artifacts, and cleanup.
 - A timeout, stream break, killed process, incomplete log, or unproven durable
@@ -94,16 +99,23 @@ weaker boundary supported by the available data.
 For each live run, record the selected production profile, MySQL isolation and
 primary routing, UTC session/time source, clock offset, integrity key rotation,
 pointer movement, worker/receiver ownership, lease expiry and unknown completion.
-The offline `dependency_profiles.py`, experiment register and `e4_fault_driver.py
---plan --profile ...` select only faults belonging to that deployment:
+The Rust `test-harness` contracts in `dependency_profiles` and `experiment_register`,
+together with the MANIFEST profile/suite declarations, define the current dependency
+and fault taxonomy. Use the Rust `test-campaign` runner to list/select registered suites;
+these declarations do not launch live fault injection:
 
 - `native-single-node`: MySQL, memory hub freshness/TTL/capacity, local projection
   admission/overflow/receiver ownership, source-commit uncertainty, sticky worker
   death, pointer/integrity fences, single-writer session and unknown local completion.
 - `standalone-rabbit` and `distributed`: MySQL plus Rabbit transport and durable
-  consumer/lease evidence. Redis is not a dependency of these current profiles.
-- `redis-compat`: Redis generation/unavailability only in the explicit adapter window;
-  never inject or provision Redis merely to execute a native fault case.
+  consumer/lease evidence; these are the only current profiles with RabbitMQ.
+- `performance-kernel`: no external service dependency.
+- `performance-native`: MySQL; HTTP/load evidence still requires its separately approved
+  deployment and complete terminal evidence.
+
+There is no current `redis-compat` profile or Redis-backed target. Historical Redis
+campaigns and results stay unchanged as history and must not be re-run through retired
+runners or treated as current evidence.
 
 Every unproven failure path must terminate in `PENDING` or `DENY` with a reason code.
 Plans and fake-controller tests are offline contracts, not executed native faults.
@@ -120,7 +132,8 @@ checks only the abstract protocol; runtime tests check implementation behavior. 
 is a complete proof of every deployment.
 
 Architectural premises added 2026-10 (runtime tests under `tests-suite/series/E4/`,
-dependency classes registered in `experiment_register.py`):
+dependency classes registered by Rust `test-harness` contracts and indexed in
+`tests-suite/MANIFEST.toml`):
 
 - `memory_projection_hub` -> the invalidation notification is the load-bearing freshness
   fence: without it the hub serves the previous generation; with it the hub defers to
@@ -131,20 +144,26 @@ dependency classes registered in `experiment_register.py`):
 - `single_writer_lease` -> a second composite writer is refused immediately while the
   lease is held, and the lease is re-acquirable after the holder's session closes
   (`premise_single_writer_lease`).
-- redis-free configuration -> a compat-enabled configuration on a build without the
-  `redis-compat` adapter is refused by the AppConfig capability gate
-  (`premise_redis_free_composite`). This fixture is not a full composite startup;
-  the native composite itself does not provide a `redis-compat` feature.
+- Current profile configuration -> native/current suites use the registered strict
+  profiles; there is no Redis compatibility adapter/profile or Redis-enabled Cargo
+  target to configure. Historical redis-free configuration assertions are not a current
+  Redis compatibility test surface.
 
-`native_projection_lifecycle` separately exercises a real TrustGraph source
-repository add/revoke, committed local dispatch, durable delta/audit correlation,
-publication pipeline, published pointer/fence and strict PolicyEngine read with a
-production local projector owner. Source APIs can also publish synchronously after
-COMMIT; this test does not attribute every publication exclusively to the async
-worker. It is one MySQL-backed ignored test per binary because process-global bus
-ownership is not resettable, and it is not a signed HTTP host race campaign.
+The registered `native_projection_lifecycle` suite is intended to exercise a real
+TrustGraph source repository add/revoke, committed local dispatch, durable delta/audit
+correlation, publication pipeline, published pointer/fence and strict PolicyEngine read
+with a production local projector owner. Source APIs dispatch the full immutable receipt
+batch only after proven COMMIT; the WorkerOwned owner alone performs publication. Request
+code only performs bounded read-only exact-completion observation under Rust norm §15.5.
+It is one MySQL-backed ignored test per binary because process-global bus ownership is not
+resettable, and it is not a signed HTTP host race campaign. No real integration is executed
+by this documentation update; consult the run's own evidence before reporting a result.
 
-The bounded model and controlled omission tests share these stable premise names:
+The current Rust campaign entry point is `test-campaign`; inspect registered profiles and
+suites through its list options, then use only the exact commands in
+[`tests-suite/MANIFEST.toml`](../../tests-suite/MANIFEST.toml). The shell script
+[`scripts/run-tests.sh`](../../scripts/run-tests.sh) only forwards arguments to that Rust
+runner. The bounded model and controlled omission suites share these stable premise names:
 
 - `pending_probe` -> `e2-pending-probe-omission`
 - `post_recheck` -> `e2-cache-post-recheck-omission`
@@ -155,53 +174,50 @@ The bounded model and controlled omission tests share these stable premise names
 
 The classifier vocabulary (`strictly_before`, `overlap_unknown`,
 `after_final_observation`, `not_stale`) is locked by the current Rust E1 contract.
-Archived Python tests remain migration references only; any contract without a Rust
-replacement is explicitly `BLOCKED` in `tests-suite/MANIFEST.toml`.
+Archived Python source/results remain historical only, not current gates, PASS evidence,
+fallbacks, or runnable entry points. Any runtime evidence boundary remains at its
+registered status in `tests-suite/MANIFEST.toml`; this protocol does not rewrite prior
+reports.
 
 ## Offline suites and lifecycle observations
 
-The production-profile/series index is in `tests-suite/MANIFEST.toml`; its current
-runner is the Rust `test-harness` crate. RQ components, authorization assumptions M1-M5,
-E1-E5, MT-E and performance attribution are separate. The runner executes explicit
-argv against a frozen source hash and existing approved dependencies only, requires
-nonempty assertions, retains ignored/internal skips, and records `PASS`, `FAIL`,
-`BLOCKED`, `SKIP`, `UNKNOWN` or `PENDING`. Per-series summaries describe only the
-selected evidence scope, not a full live campaign. The E5 single-mutation model and
-the strict complete-bound portion of the two-mutation Rust model have offline
-contracts; finite bracket omission counterexamples explicitly remain incomplete,
-and worker/shard parity remains BLOCKED. The U1-U10 evaluator has fixture-driven
-reducer contracts, but complete enumeration over both models has not been validated
-and remains BLOCKED; the previous Python tools are retained as migration references. The historical two-mutation model partitions independent,
-non-overlapping event prefixes across at most twelve owned processes (the CLI default
-remains one). Its reducer requires the exact complete shard set and preserves serial
-state/trace counts, diagnostic counters and minimal counterexamples; no model bound or
-premise is removed. On POSIX, the campaign runner waits for the entire command process
-group to exit before freezing stdout/stderr hashes, including late child output. Isolated
-runner tests cover descendant output, timeout termination and bounded shared stdout/stderr
-artifacts. A terminated exploration remains `UNKNOWN` and is never upgraded by cleanup or
-a later run.
+The production-profile/series index is in `tests-suite/MANIFEST.toml`; its runner is the
+Rust `test-harness` crate's `test-campaign` binary. RQ components, authorization assumptions
+M1-M5, E1-E5, MT-E and performance attribution are separate. On an actual run, the runner
+executes registered argv against a frozen source hash and existing approved dependencies,
+requires nonempty assertions, retains ignored/internal skips, and records `PASS`, `FAIL`,
+`BLOCKED`, `SKIP`, `UNKNOWN` or `PENDING`. Per-series summaries describe only the selected
+evidence scope, not a full live campaign. A registration or offline contract alone is not
+proof that a suite ran. Finite bracket omission counterexamples explicitly remain
+incomplete; current worker/shard suite coverage and the complete two-model U1-U10 release
+suite are scoped as described by MANIFEST. Archived Python runner/probe implementations
+are retired and are not executable recommendations or fallbacks; independent historical
+reports/results remain unchanged. Inspect the current Rust suite contract for exact
+execution boundaries; do not use retired Python commands.
 
 The local Rust suites cover strict final reload/error classification, gateway identity
 contracts, path/resource registration, and observation wiring. They remain in-process
-checks. Native real integration requires MySQL only; Rabbit is specific to standalone
-transport and Redis to compatibility. Docker, ignored integration, remote-node and
-live fault scenarios require their own approved environment and remain `BLOCKED`
-until independently reconciled.
+checks. Current native real integration requires MySQL; RabbitMQ is specific to the
+`standalone-rabbit` and `distributed` profiles, and current profiles do not depend on
+Redis. Docker, ignored integration, remote-node and live fault scenarios require their
+own approved environment and remain `BLOCKED` until independently reconciled.
 
 ## Complete policy evaluation benefit
 
-`policy-evaluate-benefit` measures the actual production `PolicyEngine.evaluate()`
-call through the returned `PolicyDecision`, not only a hub read. Its strict local
-adapter checks fixture PLATFORM_USER identity/card/tenant/domain, uses a classified
-same-tenant target and an explicit Unmanaged ORG port, then calls the actual hub.
+The registered `policy-evaluate-benefit` suite is defined to measure the actual
+production `PolicyEngine.evaluate()` call through the returned `PolicyDecision`, not only
+a hub read. Its strict local adapter checks fixture PLATFORM_USER identity/card/tenant/domain,
+uses a classified same-tenant target and an explicit Unmanaged ORG port, then calls the
+actual hub. Registration or fixture contracts alone are not measured execution evidence.
 The published evidence port remains owned: Arc reuse is internal to assembly caching,
 not an Arc evidence/decision API through the engine. The normal validation, matching,
 mandatory ALLOW final reload, statistics and circuit-breaker work remain enabled.
 
-Freeze all 45 cases before execution: grant sizes 1/8/128/512/2048, threads 1/4/8,
-and first/last matching ALLOW plus nonmatching DEFAULT_DENY. Each case has 18 paired
-batches, rotating all six permutations of fixed-second cache hits, unique-second
-forced assembly and real production-clock reads three times. Perpetual scoped grants
+The registered suite contract freezes 45 cases before execution: grant sizes
+1/8/128/512/2048, threads 1/4/8, and first/last matching ALLOW plus nonmatching
+DEFAULT_DENY. Each case has 18 paired batches, rotating all six permutations of
+fixed-second cache hits, unique-second forced assembly and real production-clock reads
+three times. The contract does not itself assert that this measurement has run. Perpetual scoped grants
 keep synthetic clock changes decision-equivalent. Forced assembly retains production
 miss/refill costs, not an invented no-cache implementation. Actual cache TTL remains
 active: the ideal warm arm must prove every read hit, and the production-clock arm
@@ -216,11 +232,11 @@ per-decision positive ns, wall ns, fixture calls, read scope/grant/cache counts,
 initial/final port timing, correct decisions, and joined workers. Missing/filtered,
 debug, duplicate or malformed evidence is FAIL; interruption remains UNKNOWN.
 
-Preserve the raw observations in the canonical campaign result. Calculate pooled
-p50/p99, median batch throughput, paired mean-decision-time and throughput ratios,
-and reproducible bootstrap intervals over paired batches. These intervals are
-exploratory, unadjusted across cases and conditional on one machine/run; PASS
-certifies correct complete collection even when there is no measured improvement.
+For a completed measured run, preserve the raw observations in its canonical campaign
+result. Calculate pooled p50/p99, median batch throughput, paired mean-decision-time and
+throughput ratios, and reproducible bootstrap intervals over paired batches. These
+intervals are exploratory, unadjusted across cases and conditional on one machine/run;
+PASS certifies correct complete collection even when there is no measured improvement.
 Latency excludes post-return assertions/destruction; throughput includes wake,
 result verification/storage/destruction and joins, but excludes runtime/thread
 construction and prewarm. Separate those units from repository phase timings.
@@ -241,7 +257,8 @@ unique, and sortable; it is not a live publication proof.
 
 ## TLA+ input status
 
-The independent TLA+ safety model is currently `BLOCKED`: this checkout has no pinned,
-checksum-verified TLC tool. Do not download tools or start containers as part of the
-offline suite. Until a verified run exists, the module remains a draft test input and
-does not change any E1/E3/E4 status.
+The independent TLA+ safety model is registered as `BLOCKED` in the current inventory:
+this checkout has no pinned, checksum-verified TLC tool. Do not download tools or start
+containers as part of the offline suite. Until an independently verified run exists, the
+module remains a draft test input and does not change any E1/E3/E4 status. This document
+update did not execute the model or any database-backed/live integration suite.

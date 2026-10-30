@@ -1,7 +1,7 @@
 //! PolicyEngine published-evidence strict gate 与 ALLOW 前复检。
 //!
-//! 仅当 repository 声明 `requires_published_card_evidence` 时可达；证据缺失、
-//! 读取失败、gate 非 Ready 或复检漂移一律 PENDING，绝不回退 raw/source/cache。
+//! The only ordinary card-evidence route. Missing evidence, read failures,
+//! non-Ready gates, malformed scope, or ALLOW-time drift always deny/PENDING.
 
 use crate::hit_stats::TimingBreakdown;
 use astral_types::registry::{get_alias_sources, parse_resource_key};
@@ -13,7 +13,6 @@ use astral_types::{
 
 use super::decision::*;
 use super::ports::RuleRepository;
-use super::types::*;
 use super::PolicyEngine;
 
 #[cfg(test)]
@@ -23,24 +22,21 @@ mod matcher_curve;
 impl PolicyEngine {
     // ==================== 正式已发布证据路径（strict gate） ====================
 
-    /// Published-evidence formal evaluation（strict gate）。
+    /// CURRENT V6 published-evidence formal evaluation.
     ///
-    /// 仅当 repository 声明
-    /// [`RuleRepository::requires_published_card_evidence`] == true 时可达。
-    /// 链路：AUTHN/CARD_CONTEXT（`evaluate` 已强制）→ published evidence 读取
-    /// → 统一 ALLOW-only 匹配器 → ALLOW 返回前复读。
+    /// The caller has already enforced AUTHN/CARD_CONTEXT and ownership gates;
+    /// this method loads published evidence, applies the ALLOW-only matcher, and
+    /// performs mandatory evidence and GlobalAdmin rereads before ALLOW.
     ///
     /// Fail-closed 契约：
     /// - 请求缺 tenant scope → AUTHORIZATION_PENDING；
-    /// - `Ok(None)`（legacy/test unavailable 标记）、`Err(_)`、非 Ready gate、
+    /// - `Ok(None)` (evidence unavailable), `Err(_)`, non-Ready gates,
     ///   证据畸形（合同校验失败）或证据 tenant/card 与请求不符 →
     ///   AUTHORIZATION_PENDING；
-    /// - 无命中的 effective grant → DEFAULT_DENY（绝不回退 L1/L2/L2.5 读取器、
-    ///   raw/source 表或 cache）；
+    /// - 无命中的 effective grant → DEFAULT_DENY; no legacy, raw-source, or cache fallback;
     /// - 任何有效 ALLOW 返回前必须复读证据，且 tenant/card 身份、gate 计数、
     ///   manifest 摘要、被命中 grant 必须与评估起点及本次请求完全一致，否则
     ///   AUTHORIZATION_PENDING。
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn evaluate_published_card_evidence<R: RuleRepository>(
         &self,
         ctx: &PolicyContext,
@@ -49,10 +45,8 @@ impl PolicyEngine {
         start: std::time::Instant,
         steps: &mut Vec<EvaluationStep>,
         timing: &mut TimingBreakdown,
-        repo_had_error: &mut bool,
     ) -> PolicyDecision {
         let card_id = ctx.card_id.unwrap_or(0);
-
         // 请求租户边界必须存在；卡片边界已由 AUTHN 保证。缺 tenant scope 属于
         // 授权边界缺失 → fail-closed（生产上下文由 Gateway 强制携带 tenant）。
         let Some(tenant_id) = ctx.tenant_id else {
@@ -62,7 +56,7 @@ impl PolicyEngine {
                 "missing tenant scope",
                 None,
             ));
-            finish_published_evaluation(self, timing, start, "L3", false, ctx.resource.as_deref());
+            self.finish_evaluation(false, timing, start, false, ctx.resource.as_deref());
             return deny(
                 "AUTHORIZATION_PENDING",
                 "published:missing-tenant-scope",
@@ -86,7 +80,7 @@ impl PolicyEngine {
                 "invalid evidence scope",
                 None,
             ));
-            finish_published_evaluation(self, timing, start, "L3", false, ctx.resource.as_deref());
+            self.finish_evaluation(false, timing, start, false, ctx.resource.as_deref());
             return deny(
                 "AUTHORIZATION_PENDING",
                 "published:invalid-scope",
@@ -98,26 +92,18 @@ impl PolicyEngine {
         let read = repo.load_published_card_authorization(&scope).await;
         let initial_evidence_load_ns = t_evidence.elapsed().as_nanos() as u64;
         timing.initial_evidence_load_ns = initial_evidence_load_ns;
-        timing.refs_load_ns = initial_evidence_load_ns;
 
         let evidence = match read {
             Ok(Some(evidence)) => evidence,
             Ok(None) => {
-                // Legacy/test unavailable 标记在 strict gate 下同样绝不放行。
+                // An explicit unavailable repository result never authorizes.
                 steps.push(step(
                     "PUBLISHED_EVIDENCE",
                     "DENY",
                     "published evidence unavailable",
                     None,
                 ));
-                finish_published_evaluation(
-                    self,
-                    timing,
-                    start,
-                    "L3",
-                    false,
-                    ctx.resource.as_deref(),
-                );
+                self.finish_evaluation(false, timing, start, false, ctx.resource.as_deref());
                 return deny(
                     "AUTHORIZATION_PENDING",
                     "published:unavailable",
@@ -128,7 +114,6 @@ impl PolicyEngine {
                 let business_pending = published_evidence_error_is_business_pending(&e);
                 tracing::warn!(card_id, error = %e, business_pending,
                     "published card evidence read failed");
-                *repo_had_error = !business_pending;
                 steps.push(step(
                     "PUBLISHED_EVIDENCE",
                     "DENY",
@@ -139,12 +124,11 @@ impl PolicyEngine {
                     },
                     None,
                 ));
-                finish_published_evaluation(
-                    self,
+                self.finish_evaluation(
+                    false,
                     timing,
                     start,
-                    "L3",
-                    *repo_had_error,
+                    !business_pending,
                     ctx.resource.as_deref(),
                 );
                 return deny(
@@ -163,7 +147,7 @@ impl PolicyEngine {
                 "published evidence malformed",
                 None,
             ));
-            finish_published_evaluation(self, timing, start, "L3", false, ctx.resource.as_deref());
+            self.finish_evaluation(false, timing, start, false, ctx.resource.as_deref());
             return deny(
                 "AUTHORIZATION_PENDING",
                 "published:malformed",
@@ -182,7 +166,7 @@ impl PolicyEngine {
                 ),
                 None,
             ));
-            finish_published_evaluation(self, timing, start, "L3", false, ctx.resource.as_deref());
+            self.finish_evaluation(false, timing, start, false, ctx.resource.as_deref());
             return deny(
                 "AUTHORIZATION_PENDING",
                 "published:not-ready",
@@ -198,7 +182,7 @@ impl PolicyEngine {
                 "published evidence scope mismatch",
                 None,
             ));
-            finish_published_evaluation(self, timing, start, "L3", false, ctx.resource.as_deref());
+            self.finish_evaluation(false, timing, start, false, ctx.resource.as_deref());
             return deny(
                 "AUTHORIZATION_PENDING",
                 "published:scope-mismatch",
@@ -220,14 +204,17 @@ impl PolicyEngine {
 
         // 统一 ALLOW-only 匹配器：effective_grants 即完整有效授权集合，
         // 无命中即 DEFAULT_DENY，不存在任何回退层。
-        let Some(matched) = match_published_effective_grant(ctx, &evidence, resource_key) else {
+        let match_start = std::time::Instant::now();
+        let matched = match_published_effective_grant(ctx, &evidence, resource_key);
+        timing.evidence_match_ns += match_start.elapsed().as_nanos() as u64;
+        let Some(matched) = matched else {
             steps.push(step(
                 "DEFAULT",
                 "DENY",
                 &format!("no published grant for {resource_key}:{}", ctx.action),
                 None,
             ));
-            finish_published_evaluation(self, timing, start, "L1", false, ctx.resource.as_deref());
+            self.finish_evaluation(false, timing, start, false, ctx.resource.as_deref());
             return deny(
                 "DEFAULT_DENY",
                 &format!("published:{resource_key}:{}:cardId={card_id}", ctx.action),
@@ -287,25 +274,24 @@ impl PolicyEngine {
         let recheck = repo.load_published_card_authorization(&scope).await;
         let final_evidence_reload_ns = t_recheck.elapsed().as_nanos() as u64;
         timing.final_evidence_reload_ns = final_evidence_reload_ns;
-        timing.refs_load_ns += final_evidence_reload_ns;
-        let recheck_outcome = match recheck {
+        let (recheck_outcome, recheck_had_error) = match recheck {
             Ok(Some(next))
                 if published_recheck_identity_stable(
                     &evidence, &next, tenant_id, card_id, matched,
                 ) =>
             {
-                None
+                (None, false)
             }
-            Ok(Some(_)) | Ok(None) => Some(false),
-            Err(e) => {
-                let business_pending = published_evidence_error_is_business_pending(&e);
+            Ok(Some(_)) | Ok(None) => (Some(false), false),
+            Err(error) => {
+                let business_pending = published_evidence_error_is_business_pending(&error);
                 tracing::warn!(
                     card_id,
-                    error = %e,
+                    error = %error,
                     business_pending,
                     "published card evidence recheck read failed"
                 );
-                Some(!business_pending)
+                (Some(!business_pending), !business_pending)
             }
         };
         #[cfg(feature = "e1-observability")]
@@ -327,22 +313,18 @@ impl PolicyEngine {
                 "e1 authorization observation"
             );
         }
-        if let Some(is_error) = recheck_outcome {
-            if is_error {
-                *repo_had_error = true;
-            }
+        if recheck_outcome.is_some() {
             steps.push(step(
                 "PUBLISHED_EVIDENCE",
                 "DENY",
                 "published evidence changed during evaluation (stale ALLOW rejected)",
                 None,
             ));
-            finish_published_evaluation(
-                self,
+            self.finish_evaluation(
+                false,
                 timing,
                 start,
-                "L3",
-                *repo_had_error,
+                recheck_had_error,
                 ctx.resource.as_deref(),
             );
             return deny(
@@ -375,14 +357,7 @@ impl PolicyEngine {
                         "global administrator changed during evaluation",
                         None,
                     ));
-                    finish_published_evaluation(
-                        self,
-                        timing,
-                        start,
-                        "L3",
-                        false,
-                        ctx.resource.as_deref(),
-                    );
+                    self.finish_evaluation(false, timing, start, false, ctx.resource.as_deref());
                     return deny(
                         "GLOBAL_ADMIN_REQUIRED",
                         "global_admin:stale-allow",
@@ -392,21 +367,13 @@ impl PolicyEngine {
                 Err(error) => {
                     tracing::warn!(user_id, error = %error,
                         "global administrator final gate unavailable; denying");
-                    *repo_had_error = true;
                     steps.push(step(
                         "GLOBAL_ADMIN",
                         "DENY",
                         "global administrator gate unavailable at ALLOW recheck",
                         None,
                     ));
-                    finish_published_evaluation(
-                        self,
-                        timing,
-                        start,
-                        "L3",
-                        true,
-                        ctx.resource.as_deref(),
-                    );
+                    self.finish_evaluation(false, timing, start, true, ctx.resource.as_deref());
                     return deny(
                         "AUTHORIZATION_PENDING",
                         "global_admin:recheck_unavailable",
@@ -416,72 +383,21 @@ impl PolicyEngine {
             }
         }
 
-        finish_published_evaluation(self, timing, start, "L1", false, ctx.resource.as_deref());
+        self.finish_evaluation(true, timing, start, false, ctx.resource.as_deref());
         allow(
             "PUBLISHED_EVIDENCE_ALLOW",
             &format!("published:{resource_key}:{}:cardId={card_id}", ctx.action),
             steps.clone(),
         )
     }
-
-    // ==================== 一致性检查：实时评估路径 ====================
-
-    /// ALLOW 返回前投影复检（对齐 Java：规则读取期间投影推进或 revoke-fence 变化
-    /// → 旧 ALLOW 转 AUTHORIZATION_PENDING，且不增加 L1/L2 命中统计）。
-    ///
-    /// 若 repository 未提供 durable gate，复检时仍返回 `None` 才视为稳定；生产 SQLx
-    /// repository 会将缺失 head 表达为 `ready=false`，因此不会走该默认兼容语义。
-    /// head 新出现、版本变化、未 READY 或读取失败都保守拒绝。
-    ///
-    /// 返回三态：`Valid`（投影稳定）/ `Stale`（版本推进，旧 ALLOW 拒绝）/
-    /// `Error`（gate 读取失败，fail-closed 且应计入断路器失败）。
-    pub(crate) async fn projection_still_valid<R: RuleRepository>(
-        &self,
-        repo: &R,
-        card_id: i64,
-        baseline: &Option<ProjectionGate>,
-    ) -> ProjectionCheck {
-        match repo.get_projection_gate(card_id).await {
-            Ok(None) => {
-                if baseline.is_none() {
-                    ProjectionCheck::Valid
-                } else {
-                    ProjectionCheck::Stale
-                }
-            }
-            Ok(Some(current)) => {
-                let Some(expected) = baseline else {
-                    return ProjectionCheck::Stale;
-                };
-                if current.ready
-                    && current.source_generation == expected.source_generation
-                    && current.revoke_fence == expected.revoke_fence
-                {
-                    ProjectionCheck::Valid
-                } else {
-                    ProjectionCheck::Stale
-                }
-            }
-            Err(_) => ProjectionCheck::Error,
-        }
-    }
 }
 
 // ==================== ORG_SCOPE 准入门禁记账 ====================
 
-/// ORG_SCOPE 准入决策在 [`PolicyEngine::record_evaluation`] 中的稳定记账类别。
-///
-/// 不冒领 legacy L1/L2/L3 层命中：该串与评估步 phase、
-/// [`PolicyEngine::allow_source_phase`] 命中来源使用的 `ORG_AUTHORITY` 同名。
-/// `HitStats` 公共 schema（l1/l2/l3 命中计数）没有专属 ORG 桶，
-/// `record_evaluation` 将其保守映射进终局 fail-closed 层 `l3_hits`
-/// （与未知 layer 的既有兜底一致）；timing 明细照常累计。
-pub(crate) const ORG_AUTHORITY_EVAL_LAYER: &str = "ORG_AUTHORITY";
-
 /// ORG_SCOPE Ready 分支返回决策的断路器归类。
 ///
 /// `org_admission::evaluate` 对引擎只暴露 `PolicyDecision`，引擎无法直接区分
-/// 仓库 Err 与确定性拒绝，因此依据 reason 与终步 detail 的稳定常量归类：
+/// repository errors from deterministic denials, so it classifies stable detail codes:
 /// - 确定性授权结果（ALLOW、`DEFAULT_DENY`、`CARD_DISABLED`，以及证据畸形 /
 ///   身份漂移 / provenance 畸形等业务 PENDING）→ 成功（对齐引擎既有约定：
 ///   业务拒绝与复检状态变化不计依赖故障，正常 `DEFAULT_DENY` 不是依赖失败）；
@@ -489,8 +405,8 @@ pub(crate) const ORG_AUTHORITY_EVAL_LAYER: &str = "ORG_AUTHORITY";
 ///   失败/非 Ready；`org_scope.final_card_context_unavailable`：终局卡片
 ///   上下文读取失败）→ 失败，累计断路器失败。注意 `org_admission` 把复读
 ///   `Err` 与管理态翻转并入 `final_read_unavailable`，保守按失败计；
-/// - 未知 PENDING detail 保守按成功处理（与 `repo_had_error` 默认 false 的
-///   既有取向一致），避免把未来新增的确定性拒绝误计为依赖故障。
+/// - Unknown PENDING details conservatively count as completed outcomes; new
+///   deterministic denials must not be misclassified as dependency failures.
 pub(crate) fn org_admission_decision_is_dependency_failure(decision: &PolicyDecision) -> bool {
     if decision.reason != "AUTHORIZATION_PENDING" {
         return false;
@@ -503,7 +419,7 @@ pub(crate) fn org_admission_decision_is_dependency_failure(decision: &PolicyDeci
 
 // ==================== 已发布证据 strict gate 辅助函数 ====================
 
-/// strict gate 收尾：统一计时/统计/断路器记账（对齐 evaluate 其余分支的记账语义）。
+/// Repository errors that represent a completed business `PENDING` outcome.
 pub(crate) fn published_evidence_error_is_business_pending(error: &PolicyError) -> bool {
     matches!(error, PolicyError::Repository(message)
         if message.starts_with("published_card_evidence_not_ready;"))
@@ -512,35 +428,15 @@ pub(crate) fn published_evidence_error_is_business_pending(error: &PolicyError) 
 pub(crate) fn record_policy_phase_metrics(timing: &TimingBreakdown) {
     for (phase, nanos) in [
         ("total", timing.total_ns),
-        ("card_active", timing.card_active_check_ns),
+        ("card_context_check", timing.card_context_check_ns),
         ("initial_evidence_load", timing.initial_evidence_load_ns),
         ("final_evidence_reload", timing.final_evidence_reload_ns),
-        ("overlay", timing.overlay_eval_ns),
-        ("base", timing.base_eval_ns),
-        ("permission_rule", timing.perm_rule_eval_ns),
+        ("evidence_match", timing.evidence_match_ns),
     ] {
         if nanos > 0 {
             metrics::histogram!("astral_authz_policy_phase_duration_seconds", "phase" => phase)
                 .record(std::time::Duration::from_nanos(nanos).as_secs_f64());
         }
-    }
-}
-
-pub(crate) fn finish_published_evaluation(
-    engine: &PolicyEngine,
-    timing: &mut TimingBreakdown,
-    start: std::time::Instant,
-    layer: &str,
-    repo_had_error: bool,
-    resource: Option<&str>,
-) {
-    timing.total_ns = start.elapsed().as_nanos() as u64;
-    record_policy_phase_metrics(timing);
-    engine.record_evaluation(layer, timing);
-    if repo_had_error {
-        engine.record_failure_on_evaluate(resource);
-    } else {
-        engine.record_success_on_evaluate(resource);
     }
 }
 

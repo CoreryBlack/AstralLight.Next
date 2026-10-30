@@ -8,13 +8,28 @@
 //! 运行:`cargo test -p testsuite --test mt_extreme_failclosed -- --ignored`
 
 use astral_db::load_published_card_grant_evidence;
+#[path = "../MT-E1/support/source_identity.rs"]
+mod source_identity;
+
+use astral_trustgraph::service::rule_set_write_service::AddEntryRequest;
 use astral_types::{
     DomainScopeRequirement, PublishedCardEvidenceScope, PublishedEvidenceGateStatus,
 };
 use testsuite::{
-    allow_rule_set_grant, cleanup_suite_rows, connect_suite, publish_card_manifest,
-    seed_all_tenants, SuiteFixture, TenantRole,
+    cleanup_suite_rows, connect_suite, publish_card_manifest, seed_all_tenants, SuiteFixture,
+    TenantRole,
 };
+
+fn allow_entry(priority: i32) -> AddEntryRequest {
+    AddEntryRequest {
+        effect: "ALLOW".to_owned(),
+        resource_type: Some("learn_subject".to_owned()),
+        resource_id: None,
+        action_code: Some("read".to_owned()),
+        condition_json: None,
+        priority,
+    }
+}
 
 #[tokio::test]
 #[ignore = "requires isolated MySQL via DATABASE_URL (multi-tenant extreme)"]
@@ -31,53 +46,38 @@ async fn mt_e6_mixed_state_fail_closed_landscape() {
     seed_all_tenants(&pool, &fixture).await.unwrap();
 
     let unpublished = [8usize, 9];
-    let mut pointers = std::collections::HashMap::new();
     for tenant in &fixture.tenants {
         if unpublished.contains(&(tenant.ordinal as usize - 1)) {
             continue; // 保持未发布形态
         }
-        let grants = if tenant.role.has_allow_rule() {
-            vec![allow_rule_set_grant(
-                fixture.salt,
-                tenant.tenant_id,
-                tenant.domain_id,
-                tenant.card_id,
-                tenant.user_id,
-                "learn_subject:*",
-                tenant.entry_id,
-                tenant.card_rule_set_ref_id,
-                1,
-            )]
-        } else {
-            Vec::new()
-        };
+        let tag = format!("g1-{}", tenant.ordinal);
         let outcome = publish_card_manifest(
             &pool,
             tenant.tenant_id,
             tenant.card_id,
-            grants,
-            &format!("g1-{}", tenant.ordinal),
-            fixture.salt,
-            1,
-            None,
+            tenant.rule_set_id,
+            tenant.user_id,
+            vec![allow_entry(2)],
+            (&tag, fixture.salt),
         )
         .await;
-        pointers.insert(tenant.card_id, outcome.pointer);
+        assert_eq!(outcome.published_state.total_grant_count, 1);
     }
 
-    // 4-5 号租户:gen2 撤销(零有效授权)。
+    // 4-5 号租户:真实 source REMOVE episode 撤销(零有效授权)。
     for tenant in fixture.tenants.iter().take(6).skip(4) {
-        publish_card_manifest(
+        let tag = format!("revoke-{}", tenant.ordinal);
+        let revoked = publish_card_manifest(
             &pool,
             tenant.tenant_id,
             tenant.card_id,
+            tenant.rule_set_id,
+            tenant.user_id,
             Vec::new(),
-            &format!("revoke-{}", tenant.ordinal),
-            fixture.salt,
-            2,
-            Some(pointers[&tenant.card_id].as_view()),
+            (&tag, fixture.salt),
         )
         .await;
+        assert_eq!(revoked.published_state.total_grant_count, 0);
     }
 
     // ── 全景断言 ──
@@ -110,6 +110,16 @@ async fn mt_e6_mixed_state_fail_closed_landscape() {
             .effective_grants
             .iter()
             .all(|grant| grant.tenant.tenant_id == tenant.tenant_id));
+        for grant in &evidence.effective_grants {
+            source_identity::assert_ruleset_source_binding(
+                &pool,
+                grant,
+                tenant.tenant_id,
+                tenant.card_id,
+                tenant.rule_set_id,
+            )
+            .await;
+        }
     }
 
     // 跨租户读取全景:每个正常租户的卡,被其余每个租户的 scope 读取,
@@ -142,10 +152,14 @@ async fn mt_e6_mixed_state_fail_closed_landscape() {
         .await
         .unwrap();
     assert_eq!(evidence.gate.effective_grant_count, 1);
-    assert_eq!(
-        evidence.effective_grants[0].provenance.source_id,
-        format!("rule-set-entry:{}", normal.entry_id)
-    );
+    source_identity::assert_ruleset_source_binding(
+        &pool,
+        &evidence.effective_grants[0],
+        normal.tenant_id,
+        normal.card_id,
+        normal.rule_set_id,
+    )
+    .await;
 
     cleanup_suite_rows(&pool, &fixture).await.unwrap();
 }

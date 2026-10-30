@@ -722,7 +722,6 @@ _MANIFEST_SOURCES = (
     "e5_model_check_two_mutations.py",
     "bounded_model_execution.py",
     "universal_hypotheses_check.py",
-    "experiment_common.py",
     "../archive/python-tests/test_universal_hypotheses_check.py",
     "../archive/python-tests/test_classify_e1_properties.py",
     "../archive/python-tests/test_experiment_common.py",

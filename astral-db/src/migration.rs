@@ -4046,8 +4046,6 @@ async fn preflight_before_baseline_adoption(pool: &MySqlPool) -> Result<(), Migr
 /// This is intentionally the normal application-startup path. Missing tables
 /// or columns are a deployment error and must be corrected by `astral-migrate`.
 pub async fn connect_and_validate_schema(database_url: &str) -> Result<MySqlPool, MigrationError> {
-    crate::freeze_projection_execution_mode_from_env()
-        .map_err(|error| MigrationError::Failed(error.to_string()))?;
     let pool = mysql_pool_options()
         .connect_with(mysql_connection_options(database_url)?)
         .await
@@ -12590,15 +12588,9 @@ pub async fn validate_schema_contract(pool: &MySqlPool) -> Result<(), MigrationE
         .await
         .map_err(MigrationError::Failed)?;
     validate_review_runtime_schema(pool).await?;
-    if crate::projection_execution_mode() == crate::ProjectionExecutionMode::WorkerOwned
-        || recorded_successful_versions(pool)
-            .await?
-            .contains(&PROJECTION_OWNED_EXECUTION_VERSION)
-    {
-        crate::validate_projection_owned_schema(pool)
-            .await
-            .map_err(|error| MigrationError::Failed(error.to_string()))?;
-    }
+    crate::validate_projection_owned_schema(pool)
+        .await
+        .map_err(|error| MigrationError::Failed(error.to_string()))?;
     validate_indexes(pool, REQUIRED_SCHEMA_INDEXES).await?;
     // Archive tables validate over the RESOLVED index contract: post-creator
     // additions (10.D-2 claim-gate support index) are required once recorded

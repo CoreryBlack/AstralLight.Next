@@ -190,12 +190,6 @@ impl ConnectionPool {
         Ok(())
     }
 
-    /// Legacy unbounded registrations are rejected; use the bounded owner API.
-    pub async fn register(&self, _scope: &WsScope, tx: tokio::sync::mpsc::UnboundedSender<String>) {
-        drop(tx);
-        tracing::warn!("unbounded Chat registration rejected; use register_bounded");
-    }
-
     pub async fn register_bounded(&self, scope: &WsScope, tx: tokio::sync::mpsc::Sender<String>) {
         let (cancel, _) = tokio::sync::watch::channel(false);
         self.register_with_cancel(scope, tx, cancel).await;
@@ -231,13 +225,6 @@ impl ConnectionPool {
             let _ = connection.cancel.send(true);
         }
         connections.clear();
-    }
-
-    pub async fn unregister(
-        &self,
-        _scope: &WsScope,
-        _tx: &tokio::sync::mpsc::UnboundedSender<String>,
-    ) {
     }
 
     pub async fn unregister_bounded(
@@ -981,18 +968,6 @@ mod tests {
             principal_kind: PrincipalKind::PlatformUser,
             token_id: format!("token-{user_card_id}"),
         }
-    }
-
-    #[tokio::test]
-    async fn legacy_unbounded_registration_is_retained_but_not_admitted() {
-        let pool = ConnectionPool::new();
-        let card = scope(701, 20);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        pool.register(&card, tx.clone()).await;
-        pool.send_to_scope(&card.chat_scope(), "legacy").await;
-        assert!(rx.try_recv().is_err());
-        assert!(pool.connections.read().await.is_empty());
-        pool.unregister(&card, &tx).await;
     }
 
     #[tokio::test]

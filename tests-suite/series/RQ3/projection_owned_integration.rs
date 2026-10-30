@@ -1,95 +1,60 @@
-//! Real-MySQL contract tests for worker-owned projection execution.
+//! Source-backed real-MySQL contract tests for WorkerOwned projection execution.
 //!
-//! This binary has one ignored tokio test because execution mode is process-global
-//! and frozen through `OnceLock`. It accepts only the approved run-scoped
-//! loopback:3308 clone and never runs DDL or migrations. Every source row uses
-//! UUID-derived tenant, aggregate, event, operation and grant identity. Cleanup
-//! is reached only after all assertions and a final quiescence proof; any panic,
-//! timeout or uncertain result leaves the fixture intact for reconciliation.
+//! This ignored target accepts only the approved run-scoped loopback:3308 clone.
+//! RuleSet source writers create every delta receipt; claims and completion proofs
+//! are always bound to the exact immutable rows those writers committed. A failure
+//! or uncertain result leaves the fixture for reconciliation.
 //!
 //! Required environment: `RUST_INTEGRATION_REQUIRED=1`, `TEST_USE_EXISTING=1`,
 //! `ASTRAL_MIGRATION_ENV=isolated`, `ASTRAL_TEST_DATABASE_NAME`, and `DATABASE_URL`.
 
+use std::{
+    env,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{anyhow, Context, Result};
 use astral_db::{
-    acquire_partition_lease, append_delta_event, begin_owned_delta_execution,
-    claim_delta_event_by_stable_event_in_tx, claim_next_delta_event_in_tx,
-    claim_next_owned_delta_event, claim_owned_delta_event_by_stable_event, complete_delta_event,
-    extend_delta_event_lease, extend_owned_delta_execution_lease, fail_delta_event,
-    fail_owned_delta_event, freeze_projection_execution_mode, mark_delta_event_quarantined,
-    project_owned_authorization_delta_in_tx, publish_current_pointer_in_tx,
-    quarantine_owned_delta_event, release_delta_event_lease, release_owned_delta_event,
-    validate_projection_owned_schema, AuthorizationImpactPlanAppendRequest,
-    AuthorizationPublishRequest, AuthorizationStageRequest, CompileModeEvidence,
-    DeltaEventAppendRequest, DeltaEventClaimScope, DeltaEventType, DeltaLeaseIdentity,
-    DeltaLeaseToken, DeltaProjectorExpectation, DeltaProjectorPublishCommand, GrantRepositoryError,
-    OwnedStableEventOutcome, ProjectionAggregateIdentity, ProjectionExecutionMode,
-    PublishRevokeFenceEvidence,
+    begin_owned_delta_execution, claim_next_owned_delta_event,
+    claim_owned_delta_event_by_stable_event, fail_owned_delta_event, load_owned_delta_completion,
+    load_published_card_grant_evidence, release_owned_delta_event,
+    validate_projection_owned_schema, AuthorizationEvidenceError, DeltaEventAppendRequest,
+    DeltaEventClaimScope, DeltaEventType, OwnedCompletionIdentity, OwnedDeltaClaim,
+    OwnedStableEventOutcome, Sha256Digest,
 };
-use astral_types::{
-    BindingLayer, CanonicalGrant, GrantDelta, GrantEffect, GrantId, GrantProvenance, GrantRevision,
-    GrantSourceKind, GrantState, ProjectionCompileMode, TenantScope, ValidityWindow,
+use astral_mq::invalidation::install_origin_region;
+use astral_trustgraph::{
+    repository::{
+        audit_log_repository::RuleSetMutationContext, rule_set_repository::SqlxRuleSetRepository,
+    },
+    service::{
+        authorization_projector::{
+            shutdown_authorization_projector, start_authorization_projector_with_runtime,
+            AuthorizationProjectorConfig,
+        },
+        rule_set_write_service::{AddEntryRequest, RuleSetWriteService, UpdateEntryRequest},
+    },
 };
-use sha2::Digest;
+use astral_types::PublishedEvidenceGateStatus;
 use sqlx::{
     mysql::{MySqlConnectOptions, MySqlPoolOptions},
-    FromRow, MySqlPool,
+    FromRow, MySqlPool, Row,
 };
-use std::{env, str::FromStr, sync::Arc, time::Duration};
+use testsuite::{
+    cleanup_suite_rows, publish_card_manifest, seed_all_tenants, SuiteFixture, SuiteTenant,
+    TenantRole,
+};
 use time::PrimitiveDateTime;
 use tokio::sync::Barrier;
-use uuid::Uuid;
 
 const REQUIRED_MIGRATION_VERSION: i64 = 20261015000001;
 const REQUIRED_DATABASE_PREFIX: &str = "astral_rehearsal_";
-const TEST_DEADLINE: Duration = Duration::from_secs(110);
+const TEST_DEADLINE: Duration = Duration::from_secs(180);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const CLAIM_LEASE_SECONDS: i64 = 90;
-
-#[derive(Clone)]
-struct Namespace {
-    salt: u128,
-    tenant_id: i64,
-    card_id: i64,
-    aggregate_id: i64,
-    user_id: i64,
-}
-
-impl Namespace {
-    fn new() -> Self {
-        let salt = Uuid::new_v4().as_u128();
-        let base = 8_000_000_000_000_i64 + ((salt % 1_000_000_000) as i64) * 1_000;
-        Self {
-            salt,
-            tenant_id: base,
-            card_id: base + 1,
-            aggregate_id: base + 2,
-            user_id: base + 3,
-        }
-    }
-
-    fn identity(&self) -> ProjectionAggregateIdentity {
-        ProjectionAggregateIdentity::new(self.tenant_id, "USER_CARD", self.aggregate_id)
-            .expect("run-owned aggregate identity is valid")
-    }
-
-    fn event_id(&self, tag: &str) -> String {
-        format!("evt-po-{:032x}-{tag}", self.salt)
-    }
-
-    fn operation_id(&self, tag: &str) -> String {
-        format!("op-po-{:032x}-{tag}", self.salt)
-    }
-
-    fn owner(&self, tag: &str) -> String {
-        format!("worker-po-{:032x}-{tag}", self.salt)
-    }
-
-    fn grant_id(&self, ordinal: u64) -> GrantId {
-        let tail = ((self.salt as u64).wrapping_add(ordinal)) & 0x0000_ffff_ffff_ffff;
-        GrantId::parse(&format!("550e8400-e29b-41d4-a716-{tail:012x}"))
-            .expect("fixture grant id is a valid UUID")
-    }
-}
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 struct EventState {
@@ -111,128 +76,6 @@ struct LaneState {
     lease_expires_at: PrimitiveDateTime,
     active_delta_event_id: Option<i64>,
     active_delta_token_hash: Option<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
-struct PointerState {
-    pointer_id: i64,
-    current_generation: i64,
-    manifest_id: i64,
-    event_id: String,
-    operation_id: String,
-    cas_version: i64,
-}
-
-struct RequestFields {
-    grant_id: GrantId,
-    event_type: DeltaEventType,
-    base_version: i64,
-    target_version: i64,
-    source_generation: u64,
-    delta: GrantDelta,
-}
-
-fn request_for(namespace: &Namespace, tag: &str, fields: RequestFields) -> DeltaEventAppendRequest {
-    let RequestFields {
-        grant_id,
-        event_type,
-        base_version,
-        target_version,
-        source_generation,
-        delta,
-    } = fields;
-    DeltaEventAppendRequest {
-        tenant_id: namespace.tenant_id,
-        card_id: Some(namespace.card_id),
-        aggregate_type: "USER_CARD".to_owned(),
-        aggregate_id: namespace.aggregate_id,
-        grant_id,
-        event_id: namespace.event_id(tag),
-        operation_id: namespace.operation_id(tag),
-        event_type,
-        base_version,
-        target_version,
-        source_generation,
-        revoke_fence: 0,
-        invalidates_published_evidence: false,
-        before_image_json: None,
-        before_digest_hex: None,
-        delta_json: serde_json::to_string(&delta).expect("typed delta serializes"),
-        semantic_hash_hex: format!("{:x}", sha2::Sha256::digest(namespace.event_id(tag))),
-        dependency_hash_hex: format!("{:x}", sha2::Sha256::digest(namespace.operation_id(tag))),
-        compiler_version: "owned-contract-test-v1".to_owned(),
-        next_attempt_at: None,
-    }
-}
-
-fn add_request(namespace: &Namespace, tag: &str, ordinal: u64) -> DeltaEventAppendRequest {
-    let grant_id = namespace.grant_id(ordinal);
-    let operation_id = namespace.operation_id(tag);
-    let event_id = namespace.event_id(tag);
-    let grant = CanonicalGrant {
-        grant_id,
-        revision: GrantRevision::initial(),
-        state: GrantState::Active,
-        source_kind: GrantSourceKind::RuleSet,
-        binding_layer: BindingLayer::Base,
-        tenant: TenantScope::new(namespace.tenant_id, None).expect("fixture tenant scope"),
-        card_id: namespace.card_id,
-        user_id: namespace.user_id,
-        resource: format!("owned_contract_resource_{ordinal}"),
-        action: "read".to_owned(),
-        effect: GrantEffect::Allow,
-        validity: ValidityWindow::perpetual(),
-        provenance: GrantProvenance {
-            source_id: format!("owned-contract-source-{ordinal}"),
-            source_entry: Some(format!("owned-contract-entry-{ordinal}")),
-            binding_id: Some(format!("owned-contract-binding-{}", namespace.card_id)),
-            delegation_id: None,
-            operation_id,
-            event_id: Some(event_id),
-            actor_user_id: Some(namespace.user_id),
-        },
-    };
-    request_for(
-        namespace,
-        tag,
-        RequestFields {
-            grant_id,
-            event_type: DeltaEventType::Add,
-            base_version: 0,
-            target_version: 1,
-            source_generation: 1,
-            delta: GrantDelta::add(grant),
-        },
-    )
-}
-
-fn successor_request(
-    namespace: &Namespace,
-    predecessor: &DeltaEventAppendRequest,
-) -> DeltaEventAppendRequest {
-    let tag = "first-successor";
-    let GrantDelta::Add { mut grant } =
-        serde_json::from_str(&predecessor.delta_json).expect("predecessor is a typed ADD")
-    else {
-        panic!("predecessor fixture must remain an ADD");
-    };
-    grant.revision = GrantRevision::initial()
-        .next()
-        .expect("successor revision exists");
-    grant.provenance.operation_id = namespace.operation_id(tag);
-    grant.provenance.event_id = Some(namespace.event_id(tag));
-    request_for(
-        namespace,
-        tag,
-        RequestFields {
-            grant_id: predecessor.grant_id,
-            event_type: DeltaEventType::Update,
-            base_version: 1,
-            target_version: 2,
-            source_generation: 2,
-            delta: GrantDelta::update(grant, GrantRevision::initial()),
-        },
-    )
 }
 
 async fn required_pool() -> MySqlPool {
@@ -295,7 +138,7 @@ async fn required_pool() -> MySqlPool {
     );
 
     let pool = MySqlPoolOptions::new()
-        .max_connections(6)
+        .max_connections(8)
         .acquire_timeout(CONNECT_TIMEOUT)
         .connect_with(options)
         .await
@@ -318,6 +161,143 @@ async fn required_pool() -> MySqlPool {
     pool
 }
 
+fn operation_id(salt: u128, tag: &str) -> String {
+    format!("po-{salt:032x}-{tag}")
+}
+
+fn owner_id(salt: u128, tag: &str) -> String {
+    format!("worker-po-{salt:032x}-{tag}")
+}
+
+fn source_entry(action: &str, priority: i32) -> AddEntryRequest {
+    AddEntryRequest {
+        effect: "ALLOW".to_owned(),
+        resource_type: Some("learn_subject".to_owned()),
+        resource_id: None,
+        action_code: Some(action.to_owned()),
+        condition_json: None,
+        priority,
+    }
+}
+
+fn source_entry_update(action: &str, priority: i32) -> UpdateEntryRequest {
+    UpdateEntryRequest {
+        effect: "ALLOW".to_owned(),
+        resource_type: Some("learn_subject".to_owned()),
+        resource_id: None,
+        action_code: Some(action.to_owned()),
+        condition_json: None,
+        priority,
+    }
+}
+
+async fn source_update(
+    service: &RuleSetWriteService,
+    suite: &SuiteFixture,
+    tenant: SuiteTenant,
+    entry_id: i64,
+    tag: &str,
+    action: &str,
+) -> String {
+    let operation_id = operation_id(suite.salt, tag);
+    let context = RuleSetMutationContext::user(tenant.user_id, Some(&operation_id))
+        .expect("source mutation has a verified fixture actor and stable operation id");
+    service
+        .update_entry(
+            tenant.rule_set_id,
+            entry_id,
+            &source_entry_update(action, 100),
+            &context,
+        )
+        .await
+        .expect("RuleSet source mutation must commit through the production writer");
+    operation_id
+}
+
+/// Read the exact immutable receipt columns written by the source transaction.
+async fn load_source_receipts(
+    pool: &MySqlPool,
+    tenant_id: i64,
+    operation_id: &str,
+) -> Result<Vec<DeltaEventAppendRequest>> {
+    let rows = sqlx::query(
+        "SELECT tenant_id, card_id, aggregate_type, aggregate_id, grant_id, event_id, operation_id, \
+         event_type, base_version, target_version, source_generation, revoke_fence, \
+         invalidates_published_evidence, \
+         CAST(before_image_json AS CHAR CHARACTER SET utf8mb4) AS before_image_json, \
+         before_digest, CAST(delta_json AS CHAR CHARACTER SET utf8mb4) AS delta_json, \
+         semantic_hash, dependency_hash, compiler_version, next_attempt_at \
+         FROM authorization_delta_event WHERE tenant_id = ? AND operation_id = ? \
+         ORDER BY delta_event_id LIMIT 1025",
+    )
+    .bind(tenant_id)
+    .bind(operation_id)
+    .fetch_all(pool)
+    .await
+    .context("read source-committed delta receipts")?;
+    if rows.len() > 1024 {
+        return Err(anyhow!(
+            "source receipt batch exceeds the bounded test capacity"
+        ));
+    }
+
+    rows.into_iter()
+        .map(|row| {
+            let event_type: String = row.try_get("event_type")?;
+            let event_type = match event_type.as_str() {
+                "ADD" => DeltaEventType::Add,
+                "UPDATE" => DeltaEventType::Update,
+                "REMOVE" => DeltaEventType::Remove,
+                "REVOKE" => DeltaEventType::Revoke,
+                other => return Err(anyhow!("unknown durable event type {other}")),
+            };
+            let before_digest: Option<Vec<u8>> = row.try_get("before_digest")?;
+            let semantic_hash: Vec<u8> = row.try_get("semantic_hash")?;
+            let dependency_hash: Vec<u8> = row.try_get("dependency_hash")?;
+            let request = DeltaEventAppendRequest {
+                tenant_id: row.try_get("tenant_id")?,
+                card_id: row.try_get("card_id")?,
+                aggregate_type: row.try_get("aggregate_type")?,
+                aggregate_id: row.try_get("aggregate_id")?,
+                grant_id: astral_db::decode_grant_id_sql(row.try_get::<&str, _>("grant_id")?)?,
+                event_id: row.try_get("event_id")?,
+                operation_id: row.try_get("operation_id")?,
+                event_type,
+                base_version: row.try_get("base_version")?,
+                target_version: row.try_get("target_version")?,
+                source_generation: u64::try_from(row.try_get::<i64, _>("source_generation")?)?,
+                revoke_fence: u64::try_from(row.try_get::<i64, _>("revoke_fence")?)?,
+                invalidates_published_evidence: row
+                    .try_get::<i8, _>("invalidates_published_evidence")?
+                    != 0,
+                before_image_json: row.try_get("before_image_json")?,
+                before_digest_hex: before_digest
+                    .map(Sha256Digest::from_bytes)
+                    .transpose()?
+                    .map(|digest| digest.as_hex()),
+                delta_json: row.try_get("delta_json")?,
+                semantic_hash_hex: Sha256Digest::from_bytes(semantic_hash)?.as_hex(),
+                dependency_hash_hex: Sha256Digest::from_bytes(dependency_hash)?.as_hex(),
+                compiler_version: row.try_get("compiler_version")?,
+                next_attempt_at: row.try_get("next_attempt_at")?,
+            };
+            if request.tenant_id != tenant_id || request.operation_id != operation_id {
+                return Err(anyhow!(
+                    "source receipt escaped its requested operation scope"
+                ));
+            }
+            if request.compiler_version != astral_types::AUTHORIZATION_COMPILER_VERSION {
+                return Err(anyhow!(
+                    "source receipt does not use the current compiler stamp"
+                ));
+            }
+            OwnedCompletionIdentity::from_request(&request)
+                .context("validate the complete source-owned receipt")?;
+            Ok(request)
+        })
+        .collect()
+}
+
 async fn event_state(pool: &MySqlPool, request: &DeltaEventAppendRequest) -> EventState {
     sqlx::query_as(
         "SELECT attempts, execution_attempts, execution_failures, execution_accounting_version, \
@@ -331,30 +311,31 @@ async fn event_state(pool: &MySqlPool, request: &DeltaEventAppendRequest) -> Eve
     .bind(&request.event_id)
     .fetch_one(pool)
     .await
-    .expect("read exact run-owned delta state")
+    .expect("read exact source-owned delta state")
 }
 
-async fn lane_state(pool: &MySqlPool, namespace: &Namespace) -> Option<LaneState> {
+async fn lane_state(pool: &MySqlPool, request: &DeltaEventAppendRequest) -> Option<LaneState> {
     sqlx::query_as(
         "SELECT execution_epoch, lease_owner, lease_token_hash, lease_expires_at, \
          active_delta_event_id, active_delta_token_hash \
          FROM authorization_projection_partition_lease \
-         WHERE tenant_id = ? AND aggregate_type = 'USER_CARD' AND aggregate_id = ?",
+         WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ?",
     )
-    .bind(namespace.tenant_id)
-    .bind(namespace.aggregate_id)
+    .bind(request.tenant_id)
+    .bind(&request.aggregate_type)
+    .bind(request.aggregate_id)
     .fetch_optional(pool)
     .await
-    .expect("read exact run-owned aggregate lane")
+    .expect("read exact source aggregate's owned lane")
 }
 
-async fn assert_lane_inactive(pool: &MySqlPool, namespace: &Namespace, epoch: i64) {
-    let lane = lane_state(pool, namespace)
+async fn assert_lane_inactive(pool: &MySqlPool, request: &DeltaEventAppendRequest, epoch: i64) {
+    let lane = lane_state(pool, request)
         .await
         .expect("released lane row must be preserved, not deleted");
     assert_eq!(
         lane.execution_epoch, epoch,
-        "release must preserve ownership epoch"
+        "release preserves the owner epoch"
     );
     assert_eq!(lane.lease_owner, "");
     assert_eq!(lane.lease_token_hash, vec![0_u8; 32]);
@@ -363,101 +344,38 @@ async fn assert_lane_inactive(pool: &MySqlPool, namespace: &Namespace, epoch: i6
     let expired: i64 = sqlx::query_scalar(
         "SELECT CAST(lease_expires_at <= UTC_TIMESTAMP(6) AS SIGNED) \
          FROM authorization_projection_partition_lease \
-         WHERE tenant_id = ? AND aggregate_type = 'USER_CARD' AND aggregate_id = ?",
+         WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ?",
     )
-    .bind(namespace.tenant_id)
-    .bind(namespace.aggregate_id)
+    .bind(request.tenant_id)
+    .bind(&request.aggregate_type)
+    .bind(request.aggregate_id)
     .fetch_one(pool)
     .await
-    .expect("check inactive lease expiry");
+    .expect("check the inactive lane's durable lease expiry");
     assert_eq!(expired, 1, "released lane expiry must be in the past");
 }
 
-async fn append_fixture_events(pool: &MySqlPool, requests: &[DeltaEventAppendRequest]) -> Vec<i64> {
-    let mut ids = Vec::with_capacity(requests.len());
-    for request in requests {
-        let appended = append_delta_event(pool, request)
-            .await
-            .expect("canonical typed delta append must succeed");
-        ids.push(appended.delta_event_id);
+fn expect_claimed(outcome: OwnedStableEventOutcome, message: &str) -> OwnedDeltaClaim {
+    match outcome {
+        OwnedStableEventOutcome::Claimed(claimed) => *claimed,
+        other => panic!("{message}; got {other:?}"),
     }
-    ids
 }
 
-async fn pointer_state(pool: &MySqlPool, namespace: &Namespace) -> Option<PointerState> {
-    let pointer = sqlx::query_as(
-        "SELECT pointer_id, current_generation, manifest_id, event_id, operation_id, \
-         cas_version FROM authorization_projection_current \
-         WHERE tenant_id = ? AND aggregate_type = 'USER_CARD' AND aggregate_id = ?",
-    );
-    pointer
-        .bind(namespace.tenant_id)
-        .bind(namespace.aggregate_id)
-        .fetch_optional(pool)
-        .await
-        .expect("read exact run-owned current pointer")
-}
-
-fn set_before_image(request: &mut DeltaEventAppendRequest, image: &str) {
-    request.before_image_json = Some(image.to_owned());
-    request.before_digest_hex = Some(format!("{:x}", sha2::Sha256::digest(image.as_bytes())));
-}
-
-struct ReceiptDriftExpectation<'a> {
-    event_before: &'a EventState,
-    lane_before: &'a Option<LaneState>,
-    owner_tag: &'a str,
-    expected_code: &'a str,
-}
-
-async fn assert_receipt_drift_rejected(
+async fn assert_same_receipt_claim_race(
     pool: &MySqlPool,
-    namespace: &Namespace,
-    stored: &DeltaEventAppendRequest,
-    drift: DeltaEventAppendRequest,
-    expectation: ReceiptDriftExpectation<'_>,
-) {
-    let ReceiptDriftExpectation {
-        event_before,
-        lane_before,
-        owner_tag,
-        expected_code,
-    } = expectation;
-    let error = claim_owned_delta_event_by_stable_event(
-        pool,
-        &drift,
-        &namespace.owner(owner_tag),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect_err("immutable receipt drift must be rejected");
-    assert!(
-        error.to_string().contains(expected_code),
-        "expected {expected_code} rejection, got {error}"
-    );
-    assert_eq!(event_state(pool, stored).await, *event_before);
-    assert_eq!(lane_state(pool, namespace).await, *lane_before);
-}
-
-async fn simultaneous_same_aggregate_claims(
-    pool: &MySqlPool,
-    earliest: &DeltaEventAppendRequest,
-    later: &DeltaEventAppendRequest,
-    earliest_owner: &str,
-    later_owner: &str,
-) -> (
-    Result<OwnedStableEventOutcome, GrantRepositoryError>,
-    Result<OwnedStableEventOutcome, GrantRepositoryError>,
+    suite: &SuiteFixture,
+    request: &DeltaEventAppendRequest,
 ) {
     let barrier = Arc::new(Barrier::new(3));
     let left_barrier = barrier.clone();
     let right_barrier = barrier.clone();
     let left_pool = pool.clone();
     let right_pool = pool.clone();
-    let left_request = earliest.clone();
-    let right_request = later.clone();
-    let left_owner = earliest_owner.to_owned();
-    let right_owner = later_owner.to_owned();
+    let left_request = request.clone();
+    let right_request = request.clone();
+    let left_owner = owner_id(suite.salt, "same-receipt-left");
+    let right_owner = owner_id(suite.salt, "same-receipt-right");
     let left = tokio::spawn(async move {
         left_barrier.wait().await;
         claim_owned_delta_event_by_stable_event(
@@ -480,298 +398,113 @@ async fn simultaneous_same_aggregate_claims(
     });
     barrier.wait().await;
     let (left, right) = tokio::join!(left, right);
-    (
-        left.expect("earliest claim task must not panic"),
-        right.expect("later claim task must not panic"),
-    )
-}
-
-async fn assert_simultaneous_same_aggregate_claim(
-    pool: &MySqlPool,
-    namespace: &Namespace,
-    earliest: &DeltaEventAppendRequest,
-    later: &DeltaEventAppendRequest,
-    earliest_owner: &str,
-    later_owner: &str,
-) {
-    let (left, right) =
-        simultaneous_same_aggregate_claims(pool, earliest, later, earliest_owner, later_owner)
-            .await;
     let mut winner = None;
-    for outcome in [left, right] {
-        match outcome.expect("simultaneous exact claim must reach a protocol outcome") {
+    let mut busy = 0;
+    for outcome in [
+        left.expect("left exact-claim task must not panic")
+            .expect("left exact claim must return a protocol outcome"),
+        right
+            .expect("right exact-claim task must not panic")
+            .expect("right exact claim must return a protocol outcome"),
+    ] {
+        match outcome {
             OwnedStableEventOutcome::Claimed(claimed) => {
-                assert!(winner.is_none(), "same aggregate admitted two live claims");
+                assert!(
+                    winner.is_none(),
+                    "one source receipt acquired two live capabilities"
+                );
                 winner = Some(*claimed);
             }
             OwnedStableEventOutcome::Busy { event_id } => {
-                assert_eq!(
-                    event_id, later.event_id,
-                    "only the later receipt may be Busy"
-                );
+                assert_eq!(event_id, request.event_id);
+                busy += 1;
             }
-            other => panic!("same aggregate race must be Claimed/Busy, got {other:?}"),
+            other => panic!("exact source receipt race must be Claimed/Busy, got {other:?}"),
         }
     }
-    let winner = winner.expect("same aggregate race must have one winner");
-    assert_eq!(winner.claim.event_id, earliest.event_id);
-    let loser_state = event_state(pool, later).await;
-    assert_eq!(loser_state.attempts, 0);
-    assert_eq!(loser_state.execution_attempts, 0);
-    assert_eq!(loser_state.execution_failures, 0);
-    assert_eq!(loser_state.execution_accounting_version, 1);
+    assert_eq!(busy, 1, "exactly one contender must observe the live lane");
+    let winner = winner.expect("one contender must own the source receipt");
+    assert_eq!(winner.claim.event_id, request.event_id);
+    assert_eq!(event_state(pool, request).await.attempts, 1);
     assert!(release_owned_delta_event(pool, &winner.lease)
         .await
-        .expect("winner must release its exact aggregate capability"));
-    let winner_state = event_state(pool, earliest).await;
-    assert_eq!(winner_state.attempts, 1);
-    assert_eq!(winner_state.execution_attempts, 0);
-    assert_eq!(winner_state.execution_failures, 0);
-    assert_lane_inactive(pool, namespace, winner.lease.ownership_epoch()).await;
+        .expect("winner must release its exact owned capability"));
+    assert_lane_inactive(pool, request, winner.lease.ownership_epoch()).await;
 }
 
-async fn assert_simultaneous_independent_claims(
+async fn assert_independent_aggregate_claims(
     pool: &MySqlPool,
-    left_namespace: &Namespace,
-    left_request: &DeltaEventAppendRequest,
-    right_namespace: &Namespace,
-    right_request: &DeltaEventAppendRequest,
+    suite: &SuiteFixture,
+    left: &DeltaEventAppendRequest,
+    right: &DeltaEventAppendRequest,
 ) {
+    assert_ne!(
+        (
+            left.tenant_id,
+            left.aggregate_type.as_str(),
+            left.aggregate_id
+        ),
+        (
+            right.tenant_id,
+            right.aggregate_type.as_str(),
+            right.aggregate_id
+        ),
+        "independent claims must come from distinct source aggregates"
+    );
     let barrier = Arc::new(Barrier::new(3));
     let left_barrier = barrier.clone();
     let right_barrier = barrier.clone();
     let left_pool = pool.clone();
     let right_pool = pool.clone();
-    let left_request_owned = left_request.clone();
-    let right_request_owned = right_request.clone();
-    let left = tokio::spawn(async move {
+    let left_request = left;
+    let right_request = right;
+    let left_task_request = left.clone();
+    let right_task_request = right.clone();
+    let left_owner = owner_id(suite.salt, "independent-left");
+    let right_owner = owner_id(suite.salt, "independent-right");
+    let left_task = tokio::spawn(async move {
         left_barrier.wait().await;
         claim_owned_delta_event_by_stable_event(
             &left_pool,
-            &left_request_owned,
-            "worker-po-independent-left",
+            &left_task_request,
+            &left_owner,
             CLAIM_LEASE_SECONDS,
         )
         .await
     });
-    let right = tokio::spawn(async move {
+    let right_task = tokio::spawn(async move {
         right_barrier.wait().await;
         claim_owned_delta_event_by_stable_event(
             &right_pool,
-            &right_request_owned,
-            "worker-po-independent-right",
+            &right_task_request,
+            &right_owner,
             CLAIM_LEASE_SECONDS,
         )
         .await
     });
     barrier.wait().await;
-    let (left, right) = tokio::join!(left, right);
-    let left = left.expect("independent left claim task must not panic");
-    let right = right.expect("independent right claim task must not panic");
-    let left_claim = left
-        .expect("independent left claim must reach a protocol outcome")
-        .expect_claimed("independent left aggregate must claim");
-    let right_claim = right
-        .expect("independent right claim must reach a protocol outcome")
-        .expect_claimed("independent right aggregate must claim");
-    assert_eq!(left_claim.claim.event_id, left_request.event_id);
-    assert_eq!(right_claim.claim.event_id, right_request.event_id);
-    assert!(release_owned_delta_event(pool, &left_claim.lease)
+    let (left, right) = tokio::join!(left_task, right_task);
+    let left = expect_claimed(
+        left.expect("independent left task must not panic")
+            .expect("independent left claim must succeed"),
+        "independent left source aggregate must claim",
+    );
+    let right = expect_claimed(
+        right
+            .expect("independent right task must not panic")
+            .expect("independent right claim must succeed"),
+        "independent right source aggregate must claim",
+    );
+    assert_eq!(left.claim.event_id, left_request.event_id);
+    assert_eq!(right.claim.event_id, right_request.event_id);
+    assert!(release_owned_delta_event(pool, &left.lease)
         .await
-        .expect("left independent capability releases exactly"));
-    assert!(release_owned_delta_event(pool, &right_claim.lease)
+        .expect("left source capability releases exactly"));
+    assert!(release_owned_delta_event(pool, &right.lease)
         .await
-        .expect("right independent capability releases exactly"));
-    assert_eq!(event_state(pool, left_request).await.attempts, 1);
-    assert_eq!(event_state(pool, right_request).await.attempts, 1);
-    assert_lane_inactive(pool, left_namespace, left_claim.lease.ownership_epoch()).await;
-    assert_lane_inactive(pool, right_namespace, right_claim.lease.ownership_epoch()).await;
-}
-
-trait OwnedStableEventOutcomeExt {
-    fn expect_claimed(self, message: &str) -> Box<astral_db::OwnedDeltaClaim>;
-}
-
-impl OwnedStableEventOutcomeExt for OwnedStableEventOutcome {
-    fn expect_claimed(self, message: &str) -> Box<astral_db::OwnedDeltaClaim> {
-        match self {
-            OwnedStableEventOutcome::Claimed(claimed) => claimed,
-            other => panic!("{message}, got {other:?}"),
-        }
-    }
-}
-
-fn stale_publication_command(claim: &astral_db::OwnedDeltaClaim) -> DeltaProjectorPublishCommand {
-    let identity = claim.lease.aggregate_identity().clone();
-    let event = &claim.event;
-    let semantic_hash_hex = event.semantic_hash.as_hex();
-    let dependency_hash_hex = event.dependency_hash.as_hex();
-    DeltaProjectorPublishCommand {
-        delta_lease_identity: claim.lease.identity().clone(),
-        expectation: DeltaProjectorExpectation {
-            identity: identity.clone(),
-            card_id: event.card_id,
-            event_id: event.event_id.clone(),
-            operation_id: event.operation_id.clone(),
-            base_version: event.base_version,
-            target_version: event.target_version,
-            source_generation: event.source_generation,
-            semantic_hash_hex: semantic_hash_hex.clone(),
-            dependency_hash_hex: dependency_hash_hex.clone(),
-            compiler_version: event.compiler_version.clone(),
-        },
-        fences: PublishRevokeFenceEvidence {
-            previous_revoke_fence: event.revoke_fence,
-            new_revoke_fence: event.revoke_fence,
-        },
-        mode: CompileModeEvidence {
-            compile_mode: ProjectionCompileMode::Incremental,
-            full_rebuild_reason: None,
-        },
-        stage: AuthorizationStageRequest {
-            identity: identity.clone(),
-            card_id: event.card_id,
-            target_generation: 1,
-            source_generation: event.source_generation,
-            projected_generation: event.source_generation,
-            event_id: event.event_id.clone(),
-            operation_id: event.operation_id.clone(),
-            semantic_hash_hex: semantic_hash_hex.clone(),
-            dependency_hash_hex: dependency_hash_hex.clone(),
-            compiler_version: event.compiler_version.clone(),
-            revoke_fence: event.revoke_fence,
-            segments: Vec::new(),
-        },
-        finalize_expected_reference_count: None,
-        impact_plan: AuthorizationImpactPlanAppendRequest {
-            identity,
-            card_id: event.card_id,
-            event_id: event.event_id.clone(),
-            operation_id: event.operation_id.clone(),
-            base_generation: 0,
-            target_generation: 1,
-            base_version: event.base_version,
-            target_version: event.target_version,
-            semantic_hash_hex,
-            dependency_hash_hex,
-            compiler_version: event.compiler_version.clone(),
-            items: Vec::new(),
-        },
-        manifest_lease_owner: event.lease_owner.clone(),
-        manifest_lease_seconds: CLAIM_LEASE_SECONDS,
-    }
-}
-
-fn grant_repository_error_contains<T: std::fmt::Debug>(
-    result: Result<T, GrantRepositoryError>,
-    code: &str,
-) {
-    let error = result.expect_err("operation must be rejected");
-    assert!(
-        error.to_string().contains(code),
-        "expected {code} rejection, got {error}"
-    );
-}
-
-async fn assert_legacy_bypass_is_denied(
-    pool: &MySqlPool,
-    namespace: &Namespace,
-    sample_request: &DeltaEventAppendRequest,
-) {
-    let owner = namespace.owner("legacy-bypass");
-    let identity = namespace.identity();
-    grant_repository_error_contains(
-        acquire_partition_lease(pool, &identity, &owner, CLAIM_LEASE_SECONDS).await,
-        "legacy_execution_refused",
-    );
-
-    let fake_identity = DeltaLeaseIdentity {
-        delta_event_id: 1,
-        event_id: namespace.event_id("not-present-legacy-probe"),
-        lease_owner: owner.clone(),
-        lease_token: DeltaLeaseToken::new_run_scoped(),
-    };
-    grant_repository_error_contains(
-        complete_delta_event(pool, &fake_identity).await,
-        "legacy_execution_refused",
-    );
-    grant_repository_error_contains(
-        fail_delta_event(pool, &fake_identity, 0, "legacy probe").await,
-        "legacy_execution_refused",
-    );
-    grant_repository_error_contains(
-        release_delta_event_lease(pool, &fake_identity).await,
-        "legacy_execution_refused",
-    );
-    grant_repository_error_contains(
-        extend_delta_event_lease(pool, &fake_identity, CLAIM_LEASE_SECONDS).await,
-        "legacy_execution_refused",
-    );
-    grant_repository_error_contains(
-        mark_delta_event_quarantined(pool, &fake_identity, "legacy-probe", "probe").await,
-        "legacy_execution_refused",
-    );
-
-    let mut tx = pool.begin().await.expect("legacy claim guard transaction");
-    let claim_result = claim_next_delta_event_in_tx(
-        &mut tx,
-        DeltaEventClaimScope {
-            tenant_id: namespace.tenant_id,
-            card_id: Some(namespace.card_id),
-        },
-        &owner,
-        CLAIM_LEASE_SECONDS,
-    )
-    .await;
-    tx.rollback()
-        .await
-        .expect("rollback guard-only transaction");
-    grant_repository_error_contains(claim_result, "legacy_execution_refused");
-
-    let mut tx = pool
-        .begin()
-        .await
-        .expect("legacy stable-claim guard transaction");
-    let stable_claim = claim_delta_event_by_stable_event_in_tx(
-        &mut tx,
-        sample_request,
-        &owner,
-        CLAIM_LEASE_SECONDS,
-    )
-    .await;
-    tx.rollback()
-        .await
-        .expect("rollback stable-claim guard-only transaction");
-    grant_repository_error_contains(stable_claim, "legacy_execution_refused");
-
-    let legacy_publish_request = AuthorizationPublishRequest {
-        identity,
-        card_id: Some(namespace.card_id),
-        target_manifest_id: 9_000_000_000_001,
-        target_generation: 1,
-        current_pointer: None,
-        expected_target_semantic_hash_hex: "aa".repeat(32),
-        expected_target_dependency_hash_hex: "bb".repeat(32),
-        expected_target_compiler_version: "owned-contract-test-v1".to_owned(),
-        fences: PublishRevokeFenceEvidence {
-            previous_revoke_fence: 0,
-            new_revoke_fence: 0,
-        },
-    };
-    let mut tx = pool
-        .begin()
-        .await
-        .expect("legacy publish guard transaction");
-    let publish_result = publish_current_pointer_in_tx(&mut tx, &legacy_publish_request).await;
-    tx.rollback().await.expect("rollback legacy publish probe");
-    let publish_error =
-        publish_result.expect_err("legacy publication must be denied in WorkerOwned");
-    assert!(
-        publish_error
-            .to_string()
-            .contains("legacy_execution_refused"),
-        "legacy publication must stop at the mode guard, got {publish_error}"
-    );
+        .expect("right source capability releases exactly"));
+    assert_lane_inactive(pool, left_request, left.lease.ownership_epoch()).await;
+    assert_lane_inactive(pool, right_request, right.lease.ownership_epoch()).await;
 }
 
 async fn wait_until_due(pool: &MySqlPool, request: &DeltaEventAppendRequest) {
@@ -779,13 +512,16 @@ async fn wait_until_due(pool: &MySqlPool, request: &DeltaEventAppendRequest) {
         loop {
             let due: i64 = sqlx::query_scalar(
                 "SELECT CAST(next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP(6) AS SIGNED) \
-                 FROM authorization_delta_event WHERE tenant_id = ? AND event_id = ?",
+                 FROM authorization_delta_event WHERE tenant_id = ? AND aggregate_type = ? \
+                   AND aggregate_id = ? AND event_id = ?",
             )
             .bind(request.tenant_id)
+            .bind(&request.aggregate_type)
+            .bind(request.aggregate_id)
             .bind(&request.event_id)
             .fetch_one(pool)
             .await
-            .expect("read the exact fixture event retry deadline");
+            .expect("read the exact source event's retry deadline");
             if due == 1 {
                 return;
             }
@@ -793,870 +529,430 @@ async fn wait_until_due(pool: &MySqlPool, request: &DeltaEventAppendRequest) {
         }
     })
     .await
-    .expect("zero-backoff fixture must become due within its stored timestamp precision");
+    .expect("zero-backoff source event must become due within the stored precision");
 }
 
-async fn expire_owned_episode(
+async fn wait_for_exact_completion(
     pool: &MySqlPool,
-    namespace: &Namespace,
-    request: &DeltaEventAppendRequest,
-) {
-    let lane = sqlx::query(
-        "UPDATE authorization_projection_partition_lease \
-         SET lease_expires_at = TIMESTAMPADD(SECOND, -1, UTC_TIMESTAMP(6)) \
-         WHERE tenant_id = ? AND aggregate_type = 'USER_CARD' AND aggregate_id = ? \
-           AND active_delta_event_id = (SELECT delta_event_id FROM authorization_delta_event \
-             WHERE tenant_id = ? AND aggregate_type = 'USER_CARD' AND aggregate_id = ? AND event_id = ?) \
-           AND lease_expires_at > UTC_TIMESTAMP(6)",
-    )
-    .bind(namespace.tenant_id)
-    .bind(namespace.aggregate_id)
-    .bind(request.tenant_id)
-    .bind(request.aggregate_id)
-    .bind(&request.event_id)
-    .execute(pool)
-    .await
-    .expect("expire only this run-owned active lane");
-    assert_eq!(lane.rows_affected(), 1, "exact active lane must expire");
-    let event = sqlx::query(
-        "UPDATE authorization_delta_event \
-         SET lease_expires_at = TIMESTAMPADD(SECOND, -1, UTC_TIMESTAMP(6)) \
-         WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ? AND event_id = ? \
-           AND status = 'LEASED' AND lease_owner IS NOT NULL \
-           AND lease_expires_at > UTC_TIMESTAMP(6)",
-    )
-    .bind(request.tenant_id)
-    .bind(&request.aggregate_type)
-    .bind(request.aggregate_id)
-    .bind(&request.event_id)
-    .execute(pool)
-    .await
-    .expect("expire only this run-owned event lease");
-    assert_eq!(
-        event.rows_affected(),
-        1,
-        "exact active event lease must expire"
-    );
-}
-
-async fn cleanup_after_proven_success(
-    pool: &MySqlPool,
-    namespace: &Namespace,
     requests: &[DeltaEventAppendRequest],
-) {
-    let lane = lane_state(pool, namespace)
-        .await
-        .expect("run-owned lane exists before cleanup");
-    assert!(lane.execution_epoch > 0);
-    assert_eq!(lane.lease_owner, "");
-    assert_eq!(lane.lease_token_hash, vec![0_u8; 32]);
-    assert!(lane.active_delta_event_id.is_none());
-    assert!(lane.active_delta_token_hash.is_none());
-    for request in requests {
-        let state = event_state(pool, request).await;
-        assert_eq!(
-            state.status, "PENDING",
-            "all fixture events must be quiescent"
-        );
-        assert!(state.lease_owner.is_none());
-        assert!(state.lease_token_hash.is_none());
-        assert!(state.lease_expires_at.is_none());
+) -> Result<()> {
+    let started = Instant::now();
+    let mut complete = vec![false; requests.len()];
+    while complete.iter().any(|is_complete| !*is_complete) {
+        if started.elapsed() >= COMPLETION_TIMEOUT {
+            let pending = requests
+                .iter()
+                .zip(&complete)
+                .filter_map(|(request, complete)| (!complete).then_some(&request.event_id))
+                .collect::<Vec<_>>();
+            return Err(anyhow!(
+                "exact owned completion deadline; unresolved events={pending:?}"
+            ));
+        }
+        for (index, request) in requests.iter().enumerate() {
+            if !complete[index] {
+                complete[index] = load_owned_delta_completion(pool, request)
+                    .await
+                    .with_context(|| format!("read exact completion for {}", request.event_id))?
+                    .is_some();
+            }
+        }
+        if complete.iter().any(|is_complete| !*is_complete) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
-
-    let placeholders = vec!["?"; requests.len()].join(",");
-    let mut tx = pool.begin().await.expect("begin exact fixture cleanup");
-    let audit_sql = format!(
-        "DELETE FROM audit_log WHERE tenant_id = ? AND event_type = 'AUTHZ_OWNED_PROJECTION_LANE' \
-         AND resource = 'authorization_projection_owned_lane' \
-         AND JSON_UNQUOTE(JSON_EXTRACT(detail, '$.eventId')) IN ({placeholders})"
-    );
-    let mut audit = sqlx::query(&audit_sql).bind(namespace.tenant_id);
-    for request in requests {
-        audit = audit.bind(&request.event_id);
-    }
-    audit
-        .execute(&mut *tx)
-        .await
-        .expect("delete only audit rows correlated to fixture event ids");
-
-    let events_sql = format!(
-        "DELETE FROM authorization_delta_event WHERE tenant_id = ? AND aggregate_type = 'USER_CARD' \
-         AND aggregate_id = ? AND event_id IN ({placeholders})"
-    );
-    let mut events = sqlx::query(&events_sql)
-        .bind(namespace.tenant_id)
-        .bind(namespace.aggregate_id);
-    for request in requests {
-        events = events.bind(&request.event_id);
-    }
-    let deleted_events = events
-        .execute(&mut *tx)
-        .await
-        .expect("delete only the proven run-owned fixture events");
-    assert_eq!(
-        deleted_events.rows_affected(),
-        requests.len() as u64,
-        "cleanup must match exactly the fixture events"
-    );
-    let deleted_lane = sqlx::query(
-        "DELETE FROM authorization_projection_partition_lease \
-         WHERE tenant_id = ? AND aggregate_type = 'USER_CARD' AND aggregate_id = ? \
-           AND execution_epoch = ? AND lease_owner = '' AND lease_token_hash = ? \
-           AND active_delta_event_id IS NULL AND active_delta_token_hash IS NULL \
-           AND lease_expires_at <= UTC_TIMESTAMP(6)",
-    )
-    .bind(namespace.tenant_id)
-    .bind(namespace.aggregate_id)
-    .bind(lane.execution_epoch)
-    .bind(vec![0_u8; 32])
-    .execute(&mut *tx)
-    .await
-    .expect("delete only this proven inactive run-owned lane during final cleanup");
-    assert_eq!(deleted_lane.rows_affected(), 1);
-    tx.commit()
-        .await
-        .expect("commit exact successful-fixture cleanup");
+    Ok(())
 }
 
-async fn run_contract() {
-    assert_eq!(
-        freeze_projection_execution_mode(ProjectionExecutionMode::WorkerOwned),
-        Ok(ProjectionExecutionMode::WorkerOwned),
-        "this binary freezes exactly one process-wide execution mode"
-    );
+async fn run_contract() -> Result<()> {
     let pool = required_pool().await;
-    let namespace = Namespace::new();
-    let sibling_namespace = Namespace::new();
-    let concurrency_namespace = Namespace::new();
-    let same_owner_namespace = Namespace::new();
-    let ordering_namespace = Namespace::new();
-    let independent_left_namespace = Namespace::new();
-    let independent_right_namespace = Namespace::new();
-    let binding_namespace = Namespace::new();
-    let normalized_namespace = Namespace::new();
-    let first = add_request(&namespace, "first", 1);
-    let sibling = add_request(&sibling_namespace, "independent-sibling", 2);
-    let successor = successor_request(&namespace, &first);
-    let concurrent_earliest = add_request(&concurrency_namespace, "concurrent-earliest", 4);
-    let concurrent_later = add_request(&concurrency_namespace, "concurrent-later", 5);
-    let same_owner_earliest = add_request(&same_owner_namespace, "same-owner-earliest", 6);
-    let same_owner_later = add_request(&same_owner_namespace, "same-owner-later", 7);
-    let mut ordering_earliest = add_request(&ordering_namespace, "ordering-earliest", 8);
-    ordering_earliest.source_generation = 7;
-    let mut ordering_later = add_request(&ordering_namespace, "ordering-later", 9);
-    ordering_later.source_generation = 64;
-    let independent_left = add_request(&independent_left_namespace, "independent-left", 10);
-    let independent_right = add_request(&independent_right_namespace, "independent-right", 11);
-    let mut binding = add_request(&binding_namespace, "binding", 12);
-    set_before_image(&mut binding, r#"{"before":true,"ordinal":12}"#);
-    let mut normalized = add_request(&normalized_namespace, "normalized", 13);
-    set_before_image(&mut normalized, r#"{"before":true,"ordinal":13}"#);
-    assert_legacy_bypass_is_denied(&pool, &namespace, &first).await;
+    let suite = SuiteFixture::new(
+        "projection-owned-source-contract",
+        &[TenantRole::AllowActive, TenantRole::AllowActive],
+    );
+    install_origin_region(format!("projection-owned-{:x}", suite.salt))
+        .expect("fixture source invalidation origin must be installed before source writes");
+    seed_all_tenants(&pool, &suite)
+        .await
+        .context("seed source-owned tenant and RuleSet rows")?;
 
-    let event_ids = append_fixture_events(&pool, &[first.clone(), successor.clone()]).await;
-    assert_eq!(event_ids.len(), 2);
-    append_fixture_events(&pool, std::slice::from_ref(&sibling)).await;
-    append_fixture_events(
+    let main = suite.tenants[0];
+    let independent = suite.tenants[1];
+    publish_card_manifest(
         &pool,
-        &[concurrent_earliest.clone(), concurrent_later.clone()],
+        main.tenant_id,
+        main.card_id,
+        main.rule_set_id,
+        main.user_id,
+        vec![source_entry("read", 100)],
+        ("projection-owned-main-baseline", suite.salt),
     )
     .await;
-    append_fixture_events(
+    publish_card_manifest(
         &pool,
-        &[same_owner_earliest.clone(), same_owner_later.clone()],
+        independent.tenant_id,
+        independent.card_id,
+        independent.rule_set_id,
+        independent.user_id,
+        vec![source_entry("read", 100)],
+        ("projection-owned-independent-baseline", suite.salt),
     )
     .await;
-    append_fixture_events(&pool, &[ordering_later.clone(), ordering_earliest.clone()]).await;
-    append_fixture_events(&pool, std::slice::from_ref(&independent_left)).await;
-    append_fixture_events(&pool, std::slice::from_ref(&independent_right)).await;
-    append_fixture_events(&pool, &[binding.clone()]).await;
-    append_fixture_events(&pool, &[normalized.clone()]).await;
-    let first_before = event_state(&pool, &first).await;
-    assert_eq!(first_before.attempts, 0);
-    assert_eq!(first_before.execution_attempts, 0);
-    assert_eq!(first_before.execution_failures, 0);
-    assert_eq!(first_before.execution_accounting_version, 1);
-    assert!(lane_state(&pool, &namespace).await.is_none());
+    for tenant in [main, independent] {
+        let evidence = load_published_card_grant_evidence(&pool, &tenant.card_scope())
+            .await
+            .expect("real source publication must satisfy the strict card reader");
+        assert_eq!(evidence.gate.status, PublishedEvidenceGateStatus::Ready);
+    }
 
-    // Every immutable source field is rebound before lane insertion. Neither a
-    // same-aggregate payload mismatch nor forged tenant/aggregate scope can
-    // touch claim counters or create an owner slot.
-    let mut mismatched = first.clone();
-    mismatched.operation_id.push_str("-forged");
+    let service = RuleSetWriteService::new(Arc::new(SqlxRuleSetRepository::new(pool.clone())));
+    let main_entry_id: i64 = sqlx::query_scalar(
+        "SELECT entry_id FROM rule_set_entry WHERE rule_set_id = ? AND enabled = 1 \
+         ORDER BY entry_id DESC LIMIT 1",
+    )
+    .bind(main.rule_set_id)
+    .fetch_one(&pool)
+    .await
+    .context("read the actual enabled source entry id")?;
+    let independent_entry_id: i64 = sqlx::query_scalar(
+        "SELECT entry_id FROM rule_set_entry WHERE rule_set_id = ? AND enabled = 1 \
+         ORDER BY entry_id DESC LIMIT 1",
+    )
+    .bind(independent.rule_set_id)
+    .fetch_one(&pool)
+    .await
+    .context("read the independent actual source entry id")?;
+
+    // Three committed source mutations produce two ordered receipts on one grant
+    // chain and one independent receipt on another real RuleSet aggregate.
+    let main_first_operation = source_update(
+        &service,
+        &suite,
+        main,
+        main_entry_id,
+        "main-update-create",
+        "create",
+    )
+    .await;
+    let main_second_operation = source_update(
+        &service,
+        &suite,
+        main,
+        main_entry_id,
+        "main-update-update",
+        "update",
+    )
+    .await;
+    let independent_operation = source_update(
+        &service,
+        &suite,
+        independent,
+        independent_entry_id,
+        "independent-update-create",
+        "create",
+    )
+    .await;
+
+    let main_first = load_source_receipts(&pool, main.tenant_id, &main_first_operation)
+        .await?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let main_second = load_source_receipts(&pool, main.tenant_id, &main_second_operation)
+        .await?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let independent_receipts =
+        load_source_receipts(&pool, independent.tenant_id, &independent_operation).await?;
+    assert_eq!(
+        main_first.len(),
+        1,
+        "one bound source entry yields one delta receipt"
+    );
+    assert_eq!(
+        main_second.len(),
+        1,
+        "one bound source entry yields one successor receipt"
+    );
+    assert_eq!(
+        independent_receipts.len(),
+        1,
+        "independent source write yields one receipt"
+    );
+    let first = &main_first[0];
+    let second = &main_second[0];
+    let independent_request = &independent_receipts[0];
+    for request in [first, second, independent_request] {
+        assert_eq!(request.event_type, DeltaEventType::Update);
+        assert_eq!(
+            request.card_id,
+            Some(if request.tenant_id == main.tenant_id {
+                main.card_id
+            } else {
+                independent.card_id
+            })
+        );
+        assert_eq!(request.aggregate_type, "RULE_SET");
+        assert!(request.invalidates_published_evidence);
+        assert!(request.source_generation > 0);
+        assert!(request.compiler_version == astral_types::AUTHORIZATION_COMPILER_VERSION);
+        assert!(load_owned_delta_completion(&pool, request)
+            .await
+            .context("read pre-publication completion proof")?
+            .is_none());
+    }
+    assert_eq!(
+        first.grant_id, second.grant_id,
+        "UPDATE receipts retain source grant identity"
+    );
+    assert_eq!(first.target_version, second.base_version);
+    assert!(first.source_generation < second.source_generation);
+
+    // Source freshness is fail-closed until every invalidating source receipt has
+    // a historical exact completion proof; old Ready evidence is not a fallback.
+    let pending = load_published_card_grant_evidence(&pool, &main.card_scope())
+        .await
+        .expect_err("unpublished source UPDATE must gate old card evidence");
+    assert!(matches!(
+        pending,
+        AuthorizationEvidenceError::NotReady(ref message)
+            if message.contains("source_freshness_pending")
+    ));
+    assert_eq!(
+        pending.as_gate_status(),
+        PublishedEvidenceGateStatus::Pending
+    );
+
+    // A forged operation binding is rejected before claim counters or lane state move.
+    let first_before_mismatch = event_state(&pool, first).await;
+    let first_lane_before_mismatch = lane_state(&pool, first).await;
+    let mut forged = first.clone();
+    forged.operation_id.push_str("-forged");
     let mismatch = claim_owned_delta_event_by_stable_event(
         &pool,
-        &mismatched,
-        &namespace.owner("mismatch"),
+        &forged,
+        &owner_id(suite.salt, "receipt-mismatch"),
         CLAIM_LEASE_SECONDS,
     )
     .await
-    .expect_err("complete operation binding drift must fail closed");
+    .expect_err("receipt identity drift must fail closed");
     assert!(mismatch
         .to_string()
-        .contains("claim_by_event_payload_mismatch"));
-    assert_eq!(event_state(&pool, &first).await, first_before);
-    assert!(lane_state(&pool, &namespace).await.is_none());
+        .contains("grant_repository.owned_event_payload_mismatch"));
+    assert_eq!(event_state(&pool, first).await, first_before_mismatch);
+    assert_eq!(lane_state(&pool, first).await, first_lane_before_mismatch);
 
-    for (index, mut forged) in [first.clone(), first.clone()].into_iter().enumerate() {
-        if index == 0 {
-            forged.tenant_id += 1;
-        } else {
-            forged.aggregate_id += 1;
-        }
-        assert!(claim_owned_delta_event_by_stable_event(
+    // Exact same-event contenders cannot install two owned capabilities.
+    assert_same_receipt_claim_race(&pool, &suite, first).await;
+
+    // Distinct source aggregates can hold independent capabilities concurrently.
+    assert_independent_aggregate_claims(&pool, &suite, first, independent_request).await;
+
+    // A real successor from the same source grant stays Busy until its predecessor
+    // is terminal; this refusal consumes no claim attempt and does not alter the lane.
+    let second_before = event_state(&pool, second).await;
+    let second_lane_before = lane_state(&pool, second).await;
+    let successor_busy = claim_owned_delta_event_by_stable_event(
+        &pool,
+        second,
+        &owner_id(suite.salt, "successor-before-predecessor"),
+        CLAIM_LEASE_SECONDS,
+    )
+    .await
+    .context("successor claim must return an explicit protocol outcome")?;
+    assert!(matches!(
+        successor_busy,
+        OwnedStableEventOutcome::Busy { .. }
+    ));
+    assert_eq!(event_state(&pool, second).await, second_before);
+    assert_eq!(lane_state(&pool, second).await, second_lane_before);
+
+    // The database recovery scan must select the real earliest pending receipt.
+    let queue_claim = claim_next_owned_delta_event(
+        &pool,
+        DeltaEventClaimScope {
+            tenant_id: main.tenant_id,
+            card_id: Some(main.card_id),
+        },
+        &owner_id(suite.salt, "queue-claim"),
+        CLAIM_LEASE_SECONDS,
+    )
+    .await
+    .context("owned queue claim must reach its durable scan")?
+    .expect("the source-written predecessor must be available to the worker");
+    assert_eq!(queue_claim.claim.event_id, first.event_id);
+    assert!(release_owned_delta_event(&pool, &queue_claim.lease)
+        .await
+        .context("release queue-scan capability")?);
+
+    // Exercise idempotent begin/release and one charged failure on the source
+    // receipt before allowing its exact worker-owned retry.
+    let first_claim = expect_claimed(
+        claim_owned_delta_event_by_stable_event(
             &pool,
-            &forged,
-            &namespace.owner("scope-mismatch"),
+            first,
+            &owner_id(suite.salt, "begin-and-release"),
             CLAIM_LEASE_SECONDS,
         )
         .await
-        .is_err());
-        assert_eq!(event_state(&pool, &first).await, first_before);
-        assert!(lane_state(&pool, &namespace).await.is_none());
-    }
-    assert!(claim_next_owned_delta_event(
-        &pool,
-        DeltaEventClaimScope {
-            tenant_id: namespace.tenant_id + 1,
-            card_id: Some(namespace.card_id),
-        },
-        &namespace.owner("foreign-tenant"),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect("foreign tenant scope is a safe empty scan")
-    .is_none());
-
-    let first_claim = match claim_owned_delta_event_by_stable_event(
-        &pool,
-        &first,
-        &namespace.owner("primary"),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect("exact source receipt claim")
-    {
-        OwnedStableEventOutcome::Claimed(claimed) => *claimed,
-        other => panic!("fresh canonical source event must claim, got {other:?}"),
-    };
-    assert_eq!(first_claim.claim.event_id, first.event_id);
-    assert_eq!(first_claim.event.event_id, first.event_id);
-    assert_eq!(first_claim.claim.attempts, 1);
-    assert_eq!(first_claim.lease.ownership_epoch(), 1);
-    assert_eq!(
-        first_claim.lease.aggregate_identity(),
-        &namespace.identity()
-    );
-    assert_eq!(first_claim.lease.execution_failures(), 0);
-    let first_claimed_state = event_state(&pool, &first).await;
-    assert_eq!(first_claimed_state.attempts, first_before.attempts + 1);
-    assert_eq!(first_claimed_state.execution_attempts, 0);
-    assert_eq!(first_claimed_state.execution_failures, 0);
-    assert_eq!(first_claimed_state.execution_accounting_version, 2);
-    let active_lane = lane_state(&pool, &namespace)
-        .await
-        .expect("successful event claim installs its aggregate lane");
-    assert_eq!(
-        active_lane.execution_epoch,
-        first_claim.lease.ownership_epoch()
-    );
-    assert_eq!(active_lane.lease_owner, namespace.owner("primary"));
-    assert_eq!(
-        active_lane.active_delta_event_id,
-        Some(first_claim.claim.delta_event_id)
-    );
-    assert!(active_lane.active_delta_token_hash.is_some());
-
-    assert_simultaneous_same_aggregate_claim(
-        &pool,
-        &concurrency_namespace,
-        &concurrent_earliest,
-        &concurrent_later,
-        &concurrency_namespace.owner("same-aggregate-earliest"),
-        &concurrency_namespace.owner("same-aggregate-later"),
-    )
-    .await;
-    assert_simultaneous_same_aggregate_claim(
-        &pool,
-        &same_owner_namespace,
-        &same_owner_earliest,
-        &same_owner_later,
-        &same_owner_namespace.owner("same-owner"),
-        &same_owner_namespace.owner("same-owner"),
-    )
-    .await;
-    assert_simultaneous_independent_claims(
-        &pool,
-        &independent_left_namespace,
-        &independent_left,
-        &independent_right_namespace,
-        &independent_right,
-    )
-    .await;
-    let ordering_later_before = event_state(&pool, &ordering_later).await;
-    let ordering_lane_before = lane_state(&pool, &ordering_namespace).await;
-    let ordering_busy = claim_owned_delta_event_by_stable_event(
-        &pool,
-        &ordering_later,
-        &ordering_namespace.owner("ordering-later"),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect("out-of-order aggregate predecessor must return Busy");
-    assert!(matches!(
-        ordering_busy,
-        OwnedStableEventOutcome::Busy { .. }
-    ));
-    assert_eq!(
-        event_state(&pool, &ordering_later).await,
-        ordering_later_before
+        .context("claim exact source predecessor")?,
+        "source predecessor must claim",
     );
     assert_eq!(
-        lane_state(&pool, &ordering_namespace).await,
-        ordering_lane_before
-    );
-    let ordering_claim = match claim_owned_delta_event_by_stable_event(
-        &pool,
-        &ordering_earliest,
-        &ordering_namespace.owner("ordering-earliest"),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect("aggregate predecessor earliest receipt must claim")
-    {
-        OwnedStableEventOutcome::Claimed(claimed) => *claimed,
-        other => panic!("earliest ordering receipt must claim, got {other:?}"),
-    };
-    assert!(release_owned_delta_event(&pool, &ordering_claim.lease)
-        .await
-        .expect("ordering winner releases exactly"));
-
-    let predecessor_busy = claim_owned_delta_event_by_stable_event(
-        &pool,
-        &successor,
-        &namespace.owner("successor"),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect("predecessor check returns an explicit non-claim outcome");
-    assert!(matches!(
-        predecessor_busy,
-        OwnedStableEventOutcome::Busy { .. }
-    ));
-    let successor_before = event_state(&pool, &successor).await;
-    assert_eq!(successor_before.attempts, 0);
-    assert_eq!(successor_before.execution_attempts, 0);
-    assert_eq!(successor_before.execution_failures, 0);
-
-    assert_eq!(
-        begin_owned_delta_execution(&pool, &first_claim.lease)
-            .await
-            .expect("first execution episode begins"),
+        begin_owned_delta_execution(&pool, &first_claim.lease).await?,
         0
     );
     assert_eq!(
-        begin_owned_delta_execution(&pool, &first_claim.lease)
-            .await
-            .expect("same-token begin is idempotent"),
+        begin_owned_delta_execution(&pool, &first_claim.lease).await?,
         0
     );
-    assert_eq!(event_state(&pool, &first).await.execution_attempts, 1);
-    assert_eq!(event_state(&pool, &first).await.execution_failures, 0);
-    assert!(release_owned_delta_event(&pool, &first_claim.lease)
-        .await
-        .expect("yield an unfailed execution episode"));
-    assert!(!release_owned_delta_event(&pool, &first_claim.lease)
-        .await
-        .expect("a stale release is a fenced no-op"));
-    let after_release = event_state(&pool, &first).await;
-    assert_eq!(after_release.status, "PENDING");
-    assert_eq!(after_release.attempts, 1);
-    assert_eq!(after_release.execution_attempts, 1);
-    assert_eq!(after_release.execution_failures, 0);
-    assert_lane_inactive(&pool, &namespace, first_claim.lease.ownership_epoch()).await;
+    assert!(release_owned_delta_event(&pool, &first_claim.lease).await?);
+    assert!(!release_owned_delta_event(&pool, &first_claim.lease).await?);
+    assert_lane_inactive(&pool, first, first_claim.lease.ownership_epoch()).await;
 
-    let predecessor_still_pending = claim_owned_delta_event_by_stable_event(
-        &pool,
-        &successor,
-        &namespace.owner("successor-after-release"),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect("pending predecessor leaves successor explicitly gated");
-    assert!(matches!(
-        predecessor_still_pending,
-        OwnedStableEventOutcome::Busy { .. }
-    ));
-    assert_eq!(event_state(&pool, &successor).await, successor_before);
-
-    let sibling_claim = match claim_owned_delta_event_by_stable_event(
-        &pool,
-        &sibling,
-        &sibling_namespace.owner("defer"),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect("independent aggregate claim is a protocol outcome")
-    {
-        OwnedStableEventOutcome::Claimed(claimed) => *claimed,
-        other => panic!("released lane must admit independent event, got {other:?}"),
-    };
-    assert_eq!(sibling_claim.claim.attempts, 1);
-    assert_eq!(
-        begin_owned_delta_execution(&pool, &sibling_claim.lease)
-            .await
-            .expect("sibling episode begins"),
-        0
-    );
-    assert!(fail_owned_delta_event(
-        &pool,
-        &sibling_claim.lease,
-        "owned.defer_without_failure",
-        0,
-        false,
-    )
-    .await
-    .expect("defer is distinct from a proven execution failure"));
-    let deferred_state = event_state(&pool, &sibling).await;
-    assert_eq!(deferred_state.status, "PENDING");
-    assert_eq!(deferred_state.attempts, 1);
-    assert_eq!(deferred_state.execution_attempts, 1);
-    assert_eq!(deferred_state.execution_failures, 0);
-
-    let failed_claim = match claim_owned_delta_event_by_stable_event(
-        &pool,
-        &first,
-        &namespace.owner("transient-failure"),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect("released first event is claimable again")
-    {
-        OwnedStableEventOutcome::Claimed(claimed) => *claimed,
-        other => panic!("released first event must be claimable, got {other:?}"),
-    };
-    assert_eq!(failed_claim.claim.attempts, 2);
-    assert_eq!(
-        begin_owned_delta_execution(&pool, &failed_claim.lease)
-            .await
-            .expect("transient attempt begins"),
-        0
-    );
-    assert!(fail_owned_delta_event(
-        &pool,
-        &failed_claim.lease,
-        "owned.transient_failure",
-        0,
-        true,
-    )
-    .await
-    .expect("proven transient failure is charged once"));
-    assert!(!fail_owned_delta_event(
-        &pool,
-        &failed_claim.lease,
-        "owned.transient_failure.replay",
-        0,
-        true,
-    )
-    .await
-    .expect("stale/repeated failure is fenced without a second charge"));
-    let transient_state = event_state(&pool, &first).await;
-    assert_eq!(transient_state.status, "PENDING");
-    assert_eq!(transient_state.attempts, 2);
-    assert_eq!(transient_state.execution_attempts, 2);
-    assert_eq!(transient_state.execution_failures, 1);
-    assert_lane_inactive(&pool, &namespace, failed_claim.lease.ownership_epoch()).await;
-
-    wait_until_due(&pool, &first).await;
-    let expiring_claim = match claim_owned_delta_event_by_stable_event(
-        &pool,
-        &first,
-        &namespace.owner("abandoned"),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect("event with immediate retry schedule can be claimed")
-    {
-        OwnedStableEventOutcome::Claimed(claimed) => *claimed,
-        other => panic!("due event must be claimable, got {other:?}"),
-    };
-    assert_eq!(expiring_claim.claim.attempts, 3);
-    assert_eq!(
-        begin_owned_delta_execution(&pool, &expiring_claim.lease)
-            .await
-            .expect("abandoned attempt begins"),
-        1
-    );
-    let epoch_before_takeover = expiring_claim.lease.ownership_epoch();
-    expire_owned_episode(&pool, &namespace, &first).await;
-
-    let takeover = match claim_owned_delta_event_by_stable_event(
-        &pool,
-        &first,
-        &namespace.owner("takeover"),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect("expired unknown episode is reconciled before takeover")
-    {
-        OwnedStableEventOutcome::Claimed(claimed) => *claimed,
-        other => panic!("unpublished expired event must be safely reclaimable, got {other:?}"),
-    };
-    assert!(takeover.lease.ownership_epoch() > epoch_before_takeover);
-    assert_eq!(takeover.claim.attempts, 4);
-    assert_eq!(takeover.lease.execution_failures(), 1);
-    assert!(
-        !extend_owned_delta_execution_lease(&pool, &expiring_claim.lease, 30)
-            .await
-            .expect("stale renewal is a fenced no-op")
-    );
-    assert!(!release_owned_delta_event(&pool, &expiring_claim.lease)
-        .await
-        .expect("stale release is a fenced no-op"));
-    assert!(
-        !fail_owned_delta_event(&pool, &expiring_claim.lease, "owned.stale_failure", 0, true,)
-            .await
-            .expect("stale failure is a fenced no-op")
-    );
-    assert!(!quarantine_owned_delta_event(
-        &pool,
-        &expiring_claim.lease,
-        "owned.stale_quarantine",
-        None,
-    )
-    .await
-    .expect("stale quarantine is a fenced no-op"));
-    let event_before_stale_publish = event_state(&pool, &first).await;
-    let lane_before_stale_publish = lane_state(&pool, &namespace).await;
-    let pointer_before_stale_publish = pointer_state(&pool, &namespace).await;
-    let stale_command = stale_publication_command(&expiring_claim);
-    let mut stale_tx = pool.begin().await.expect("begin stale publication probe");
-    let stale_publish = project_owned_authorization_delta_in_tx(
-        &mut stale_tx,
-        &stale_command,
-        &expiring_claim.lease,
-    )
-    .await
-    .expect_err("superseded capability must not enter the publication transaction");
-    assert!(
-        stale_publish.to_string().contains("publication_lane_lost"),
-        "stale publication must stop at the capability guard: {stale_publish}"
-    );
-    stale_tx
-        .rollback()
-        .await
-        .expect("rollback stale publication probe");
-    assert_eq!(event_state(&pool, &first).await, event_before_stale_publish);
-    assert_eq!(
-        lane_state(&pool, &namespace).await,
-        lane_before_stale_publish
-    );
-    assert_eq!(
-        pointer_state(&pool, &namespace).await,
-        pointer_before_stale_publish
-    );
-    let after_stale_calls = event_state(&pool, &first).await;
-    assert_eq!(after_stale_calls.status, "LEASED");
-    assert_eq!(after_stale_calls.attempts, 4);
-    assert_eq!(after_stale_calls.execution_attempts, 3);
-    assert_eq!(after_stale_calls.execution_failures, 1);
-    let takeover_lane = lane_state(&pool, &namespace)
-        .await
-        .expect("takeover lane row remains durable");
-    assert_eq!(
-        takeover_lane.execution_epoch,
-        takeover.lease.ownership_epoch()
-    );
-    assert_eq!(
-        takeover_lane.active_delta_event_id,
-        Some(takeover.claim.delta_event_id)
-    );
-    assert_eq!(
-        begin_owned_delta_execution(&pool, &takeover.lease)
-            .await
-            .expect("takeover starts a new actual execution episode"),
-        1
-    );
-    assert_eq!(
-        begin_owned_delta_execution(&pool, &takeover.lease)
-            .await
-            .expect("same takeover token is idempotent"),
-        1
-    );
-    assert_eq!(event_state(&pool, &first).await.execution_attempts, 4);
-    assert_eq!(event_state(&pool, &first).await.execution_failures, 1);
-    assert!(release_owned_delta_event(&pool, &takeover.lease)
-        .await
-        .expect("takeover owner releases its live episode"));
-    assert_lane_inactive(&pool, &namespace, takeover.lease.ownership_epoch()).await;
-
-    let binding_before = event_state(&pool, &binding).await;
-    let binding_lane_before = lane_state(&pool, &binding_namespace).await;
-    for (index, (drift, expected_field)) in [
-        {
-            let mut value = binding.clone();
-            value.event_id.push_str("-drift");
-            (value, "event_id")
-        },
-        {
-            let mut value = binding.clone();
-            value.operation_id.push_str("-drift");
-            (value, "operation_id")
-        },
-        {
-            let mut value = binding.clone();
-            value.event_type = DeltaEventType::Update;
-            (value, "event_type")
-        },
-        {
-            let mut value = binding.clone();
-            value.tenant_id += 1;
-            (value, "tenant_id")
-        },
-        {
-            let mut value = binding.clone();
-            value.card_id = None;
-            (value, "card_id")
-        },
-        {
-            let mut value = binding.clone();
-            value.aggregate_type = "ORG".to_owned();
-            (value, "aggregate_identity")
-        },
-        {
-            let mut value = binding.clone();
-            value.aggregate_id += 1;
-            (value, "aggregate_identity")
-        },
-        {
-            let mut value = binding.clone();
-            value.grant_id = binding_namespace.grant_id(99);
-            (value, "grant_id")
-        },
-        {
-            let mut value = binding.clone();
-            value.base_version = 1;
-            (value, "base_version")
-        },
-        {
-            let mut value = binding.clone();
-            value.target_version = 2;
-            (value, "target_version")
-        },
-        {
-            let mut value = binding.clone();
-            value.source_generation = 2;
-            (value, "source_generation")
-        },
-        {
-            let mut value = binding.clone();
-            value.revoke_fence = 1;
-            (value, "revoke_fence")
-        },
-        {
-            let mut value = binding.clone();
-            value.invalidates_published_evidence = true;
-            (value, "invalidates_published_evidence")
-        },
-        {
-            let mut value = binding.clone();
-            value.before_image_json = Some(r#"{"before":true,"ordinal":99}"#.to_owned());
-            (value, "before_image_json")
-        },
-        {
-            let mut value = binding.clone();
-            value.before_digest_hex = Some("00".repeat(32));
-            (value, "before_digest")
-        },
-        {
-            let mut value = binding.clone();
-            value.delta_json = r#"{"kind":"ADD","grant":null}"#.to_owned();
-            (value, "delta_json")
-        },
-        {
-            let mut value = binding.clone();
-            value.semantic_hash_hex = "00".repeat(32);
-            (value, "semantic_hash")
-        },
-        {
-            let mut value = binding.clone();
-            value.dependency_hash_hex = "00".repeat(32);
-            (value, "dependency_hash")
-        },
-        {
-            let mut value = binding.clone();
-            value.compiler_version.push_str("-drift");
-            (value, "compiler_version")
-        },
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let expected_code = if matches!(expected_field, "event_id" | "tenant_id") {
-            "stable_event_missing"
-        } else {
-            "claim_by_event_payload_mismatch"
-        };
-        assert_receipt_drift_rejected(
+    let failed_claim = expect_claimed(
+        claim_owned_delta_event_by_stable_event(
             &pool,
-            &binding_namespace,
-            &binding,
-            drift,
-            ReceiptDriftExpectation {
-                event_before: &binding_before,
-                lane_before: &binding_lane_before,
-                owner_tag: &format!("binding-drift-{index}-{expected_field}"),
-                expected_code,
-            },
+            first,
+            &owner_id(suite.salt, "charged-failure"),
+            CLAIM_LEASE_SECONDS,
         )
-        .await;
-    }
-    let mut whitespace_only = normalized.clone();
-    whitespace_only.before_image_json =
-        Some("  {\n  \"ordinal\": 13, \"before\": true\n}  ".to_owned());
-    let delta_value: serde_json::Value = serde_json::from_str(&normalized.delta_json).unwrap();
-    let reordered_fields: Vec<String> = delta_value
-        .as_object()
-        .expect("typed delta is an object")
-        .iter()
-        .rev()
-        .map(|(key, value)| format!(" {} : {} ", serde_json::to_string(key).unwrap(), value))
-        .collect();
-    whitespace_only.delta_json = format!("{{ {} }}", reordered_fields.join(",\n"));
-    assert_ne!(whitespace_only.delta_json, normalized.delta_json);
-    let whitespace_outcome = claim_owned_delta_event_by_stable_event(
-        &pool,
-        &whitespace_only,
-        &normalized_namespace.owner("binding-whitespace"),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect("JSON key order and whitespace must preserve immutable receipt binding");
-    let whitespace_claim = match whitespace_outcome {
-        OwnedStableEventOutcome::Claimed(claimed) => *claimed,
-        other => panic!("normalized JSON receipt must claim, got {other:?}"),
-    };
-    assert!(release_owned_delta_event(&pool, &whitespace_claim.lease)
         .await
-        .expect("normalized JSON claim releases exactly"));
-    let sibling_before_corruption = event_state(&pool, &sibling).await;
-    let corrupted = sqlx::query(
-        "UPDATE authorization_projection_partition_lease \
-         SET active_delta_event_id = ?, active_delta_token_hash = ?, \
-             lease_owner = '', lease_token_hash = ?, \
-             lease_expires_at = TIMESTAMPADD(SECOND, -1, UTC_TIMESTAMP(6)) \
-         WHERE tenant_id = ? AND aggregate_type = 'USER_CARD' AND aggregate_id = ? \
-           AND active_delta_event_id IS NULL AND lease_owner = '' \
-           AND execution_epoch = ?",
-    )
-    .bind(sibling_claim.claim.delta_event_id)
-    .bind(vec![0xA5_u8; 32])
-    .bind(vec![0_u8; 32])
-    .bind(sibling_namespace.tenant_id)
-    .bind(sibling_namespace.aggregate_id)
-    .bind(sibling_claim.lease.ownership_epoch())
-    .execute(&pool)
-    .await
-    .expect("inject one run-owned corrupt active-slot association");
-    assert_eq!(corrupted.rows_affected(), 1);
-    let in_doubt = claim_owned_delta_event_by_stable_event(
-        &pool,
-        &sibling,
-        &sibling_namespace.owner("in-doubt-probe"),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect("corrupt ownership is a durable gated result");
-    assert!(matches!(
-        in_doubt,
-        OwnedStableEventOutcome::InDoubt { ref event_id, .. } if event_id == &sibling.event_id
-    ));
-    assert_eq!(
-        event_state(&pool, &sibling).await,
-        sibling_before_corruption
+        .context("reclaim exact source predecessor")?,
+        "released source predecessor must be reclaimable",
     );
-    let restore = sqlx::query(
-        "UPDATE authorization_projection_partition_lease \
-         SET active_delta_event_id = NULL, active_delta_token_hash = NULL, \
-             lease_owner = '', lease_token_hash = ?, \
-             lease_expires_at = TIMESTAMPADD(SECOND, -1, UTC_TIMESTAMP(6)) \
-         WHERE tenant_id = ? AND aggregate_type = 'USER_CARD' AND aggregate_id = ? \
-           AND active_delta_event_id = ? AND active_delta_token_hash = ? \
-           AND lease_owner = ''",
-    )
-    .bind(vec![0_u8; 32])
-    .bind(sibling_namespace.tenant_id)
-    .bind(sibling_namespace.aggregate_id)
-    .bind(sibling_claim.claim.delta_event_id)
-    .bind(vec![0xA5_u8; 32])
-    .execute(&pool)
-    .await
-    .expect("restore only the just-injected fixture lane corruption");
-    assert_eq!(restore.rows_affected(), 1);
-    assert_lane_inactive(
-        &pool,
-        &sibling_namespace,
-        sibling_claim.lease.ownership_epoch(),
-    )
-    .await;
+    assert_eq!(
+        begin_owned_delta_execution(&pool, &failed_claim.lease).await?,
+        0
+    );
+    assert!(
+        fail_owned_delta_event(
+            &pool,
+            &failed_claim.lease,
+            "owned.source_fixture.transient_failure",
+            0,
+            true,
+        )
+        .await?
+    );
+    assert!(
+        !fail_owned_delta_event(
+            &pool,
+            &failed_claim.lease,
+            "owned.source_fixture.stale_failure",
+            0,
+            true,
+        )
+        .await?
+    );
+    let failed_state = event_state(&pool, first).await;
+    assert_eq!(failed_state.status, "PENDING");
+    assert_eq!(failed_state.execution_failures, 1);
+    assert_eq!(failed_state.execution_attempts, 2);
+    assert_lane_inactive(&pool, first, failed_claim.lease.ownership_epoch()).await;
 
-    let next_claim = claim_next_owned_delta_event(
-        &pool,
-        DeltaEventClaimScope {
-            tenant_id: namespace.tenant_id,
-            card_id: Some(namespace.card_id),
+    wait_until_due(&pool, first).await;
+    let retry_claim = expect_claimed(
+        claim_owned_delta_event_by_stable_event(
+            &pool,
+            first,
+            &owner_id(suite.salt, "retry-after-proven-failure"),
+            CLAIM_LEASE_SECONDS,
+        )
+        .await
+        .context("claim source receipt after its recorded failure backoff is due")?,
+        "source receipt with a proven failure must remain retryable",
+    );
+    assert_eq!(retry_claim.lease.execution_failures(), 1);
+    assert_eq!(
+        begin_owned_delta_execution(&pool, &retry_claim.lease).await?,
+        1
+    );
+    assert_eq!(
+        begin_owned_delta_execution(&pool, &retry_claim.lease).await?,
+        1
+    );
+    assert!(release_owned_delta_event(&pool, &retry_claim.lease).await?);
+    assert_lane_inactive(&pool, first, retry_claim.lease.ownership_epoch()).await;
+
+    // Only the production WorkerOwned projector may finish the real source rows.
+    let projector = start_authorization_projector_with_runtime(
+        Arc::new(astral_trustgraph::service::authorization_projector::SqlxAuthorizationProjectorRuntime::new(
+            pool.clone(),
+        )),
+        AuthorizationProjectorConfig {
+            tenants: vec![main.tenant_id, independent.tenant_id],
+            poll_interval_secs: 1,
+            ..AuthorizationProjectorConfig::default()
         },
-        &namespace.owner("queue-claim"),
-        CLAIM_LEASE_SECONDS,
-    )
-    .await
-    .expect("scoped worker-owned queue claim")
-    .expect("an independent due event is available after lane restoration");
-    assert_eq!(next_claim.claim.event_id, first.event_id);
-    assert!(release_owned_delta_event(&pool, &next_claim.lease)
-        .await
-        .expect("queue claim releases cleanly"));
-    assert_lane_inactive(&pool, &namespace, next_claim.lease.ownership_epoch()).await;
-
-    let binding_claim = claim_owned_delta_event_by_stable_event(
+    );
+    wait_for_exact_completion(
         &pool,
-        &binding,
-        &binding_namespace.owner("binding-valid"),
-        CLAIM_LEASE_SECONDS,
+        &[first.clone(), second.clone(), independent_request.clone()],
+    )
+    .await?;
+    let shutdown = tokio::time::timeout(
+        Duration::from_secs(12),
+        shutdown_authorization_projector(projector, Duration::from_secs(10)),
     )
     .await
-    .expect("original immutable receipt remains claimable after all rejected drifts")
-    .expect_claimed("valid binding receipt must claim");
-    assert!(release_owned_delta_event(&pool, &binding_claim.lease)
-        .await
-        .expect("valid binding claim releases exactly"));
+    .context("owned projector shutdown outer timeout")?;
+    let summary = shutdown
+        .summary
+        .map_err(|error| anyhow!("owned projector shutdown failed: {error}"))?;
+    assert_eq!(summary.events_publication_unknown, 0);
+    assert_eq!(summary.events_quarantine_unknown, 0);
+    assert_eq!(summary.events_lease_lost, 0);
 
-    for (scope, requests) in [
-        (&namespace, vec![first, successor]),
-        (&sibling_namespace, vec![sibling]),
-        (
-            &concurrency_namespace,
-            vec![concurrent_earliest, concurrent_later],
-        ),
-        (
-            &same_owner_namespace,
-            vec![same_owner_earliest, same_owner_later],
-        ),
-        (&ordering_namespace, vec![ordering_earliest, ordering_later]),
-        (&independent_left_namespace, vec![independent_left]),
-        (&independent_right_namespace, vec![independent_right]),
-        (&binding_namespace, vec![binding]),
-        (&normalized_namespace, vec![normalized]),
-    ] {
-        cleanup_after_proven_success(&pool, scope, &requests).await;
+    for request in [first, second, independent_request] {
+        assert!(load_owned_delta_completion(&pool, request)
+            .await
+            .context("verify historical exact source completion")?
+            .is_some());
+        let state = event_state(&pool, request).await;
+        assert_eq!(state.status, "SUCCEEDED");
+        assert!(state.lease_owner.is_none());
+        assert!(state.lease_token_hash.is_none());
+        assert!(state.lease_expires_at.is_none());
+        if let Some(lane) = lane_state(&pool, request).await {
+            assert_lane_inactive(&pool, request, lane.execution_epoch).await;
+        }
     }
+    let main_evidence = load_published_card_grant_evidence(&pool, &main.card_scope())
+        .await
+        .expect("both ordered source updates must restore strict card evidence");
+    assert_eq!(
+        main_evidence.gate.status,
+        PublishedEvidenceGateStatus::Ready
+    );
+    assert_eq!(main_evidence.effective_grants.len(), 1);
+    assert!(main_evidence
+        .effective_grants
+        .iter()
+        .any(|grant| grant.action == "update"));
+    assert!(!main_evidence
+        .effective_grants
+        .iter()
+        .any(|grant| grant.action == "create"));
+    let independent_evidence = load_published_card_grant_evidence(&pool, &independent.card_scope())
+        .await
+        .expect("independent source update must also pass strict evidence reading");
+    assert_eq!(
+        independent_evidence.gate.status,
+        PublishedEvidenceGateStatus::Ready
+    );
+
+    cleanup_suite_rows(&pool, &suite)
+        .await
+        .context("cleanup after exact source completion proofs and owner shutdown")?;
     pool.close().await;
+    Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real MySQL; run-owned loopback:3308 clone required; RUST_INTEGRATION_REQUIRED=1"]
 async fn worker_owned_projection_sql_contract() {
     tokio::time::timeout(TEST_DEADLINE, run_contract())
         .await
-        .expect("projection-owned SQL contract exceeded its 110-second deadline");
+        .expect("projection-owned SQL contract exceeded its 180-second deadline")
+        .expect("source-backed WorkerOwned contract must complete with durable proof");
 }

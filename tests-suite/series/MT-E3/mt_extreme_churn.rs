@@ -8,11 +8,26 @@
 //! 运行:`cargo test -p testsuite --test mt_extreme_churn -- --ignored`
 
 use astral_db::load_published_card_grant_evidence;
+#[path = "../MT-E1/support/source_identity.rs"]
+mod source_identity;
+
+use astral_trustgraph::service::rule_set_write_service::AddEntryRequest;
 use astral_types::PublishedEvidenceGateStatus;
 use testsuite::{
-    allow_rule_set_grant, cleanup_suite_rows, connect_suite, publish_card_manifest,
-    seed_all_tenants, SuiteFixture, TenantRole,
+    cleanup_suite_rows, connect_suite, publish_card_manifest, seed_all_tenants, SuiteFixture,
+    TenantRole,
 };
+
+fn allow_entry(priority: i32) -> AddEntryRequest {
+    AddEntryRequest {
+        effect: "ALLOW".to_owned(),
+        resource_type: Some("learn_subject".to_owned()),
+        resource_id: None,
+        action_code: Some("read".to_owned()),
+        condition_json: None,
+        priority,
+    }
+}
 
 const TENANTS: usize = 8;
 const ROUNDS: u64 = 4;
@@ -27,39 +42,26 @@ async fn mt_e3_tenant_grant_churn() {
     let fixture = SuiteFixture::new("mt-e3", &roles);
     seed_all_tenants(&pool, &fixture).await.unwrap();
 
-    // gen1:全部发布 1 条 ALLOW(tail 1)。
-    let mut pointers = Vec::new();
+    // gen1:每租户生产 writer 新建真实 BASE source entry 并发布 1 条 ALLOW。
     for tenant in &fixture.tenants {
-        let grants = vec![allow_rule_set_grant(
-            fixture.salt,
-            tenant.tenant_id,
-            tenant.domain_id,
-            tenant.card_id,
-            tenant.user_id,
-            "learn_subject:*",
-            tenant.entry_id,
-            tenant.card_rule_set_ref_id,
-            1,
-        )];
+        let tag = format!("g1-{}", tenant.ordinal);
         let outcome = publish_card_manifest(
             &pool,
             tenant.tenant_id,
             tenant.card_id,
-            grants,
-            &format!("g1-{}", tenant.ordinal),
-            fixture.salt,
-            1,
-            None,
+            tenant.rule_set_id,
+            tenant.user_id,
+            vec![allow_entry(2)],
+            (&tag, fixture.salt),
         )
         .await;
-        pointers.push(outcome.pointer);
+        assert_eq!(outcome.published_state.total_grant_count, 1);
     }
 
     let pool = std::sync::Arc::new(pool);
     let fixture = std::sync::Arc::new(fixture);
 
     for round in 1..=ROUNDS {
-        let generation = round + 1;
         let revoked = round % 2 == 1; // gen2/gen4 撤销,gen3/gen5 恢复
 
         // 并发读者:writers 翻转期间,读者断言"仅当前代或上一代语义"。
@@ -84,39 +86,42 @@ async fn mt_e3_tenant_grant_churn() {
                         .effective_grants
                         .iter()
                         .all(|grant| grant.tenant.tenant_id == tenant.tenant_id));
+                    for grant in &evidence.effective_grants {
+                        source_identity::assert_ruleset_source_binding(
+                            &pool,
+                            grant,
+                            tenant.tenant_id,
+                            tenant.card_id,
+                            tenant.rule_set_id,
+                        )
+                        .await;
+                    }
                 }
             }));
         }
 
         // 写者:全租户推进到 generation。
         for tenant in &fixture.tenants {
-            let grants = if revoked {
+            let entries = if revoked {
                 Vec::new()
             } else {
-                vec![allow_rule_set_grant(
-                    fixture.salt,
-                    tenant.tenant_id,
-                    tenant.domain_id,
-                    tenant.card_id,
-                    tenant.user_id,
-                    "learn_subject:*",
-                    tenant.entry_id,
-                    tenant.card_rule_set_ref_id,
-                    (round + 2) as u16,
-                )]
+                vec![allow_entry((round + 2) as i32)]
             };
+            let tag = format!("churn-r{round}-{}", tenant.ordinal);
             let outcome = publish_card_manifest(
                 &pool,
                 tenant.tenant_id,
                 tenant.card_id,
-                grants,
-                &format!("churn-r{round}-{}", tenant.ordinal),
-                fixture.salt,
-                generation,
-                Some(pointers[tenant.ordinal as usize - 1].as_view()),
+                tenant.rule_set_id,
+                tenant.user_id,
+                entries,
+                (&tag, fixture.salt),
             )
             .await;
-            pointers[tenant.ordinal as usize - 1] = outcome.pointer;
+            assert_eq!(
+                outcome.published_state.total_grant_count,
+                if revoked { 0 } else { 1 }
+            );
         }
         for reader in readers {
             reader.await.unwrap();

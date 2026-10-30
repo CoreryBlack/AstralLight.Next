@@ -7,11 +7,9 @@ use astral_types::{
     GrantProvenance, GrantRevision, GrantSourceKind, GrantState, PolicyContext, PolicyDecision,
     PolicyError, PublicationSeal, PublishedAggregateManifestSummary, PublishedCardAuthorization,
     PublishedCardAuthorizationGate, PublishedCardEvidenceScope, PublishedEvidenceGateStatus,
-    TenantScope, ValidityWindow, VerifiedPublishedGrantRecord,
+    TenantScope, ValidityWindow, VerifiedPublishedGrantRecord, AUTHORIZATION_COMPILER_VERSION,
 };
-use policy_engine::{
-    PermissionRule, ProjectionGate, RuleRepository, RuleSetSnapshot, SnapshotWinner,
-};
+use policy_engine::{OrgAuthorityRead, RuleRepository};
 
 #[derive(Clone, Copy)]
 enum ReadMode {
@@ -25,7 +23,6 @@ struct RepoState {
     mode: ReadMode,
     card_active: AtomicBool,
     published_reads: AtomicUsize,
-    legacy_reads: AtomicUsize,
     scope_samples: Mutex<Vec<PublishedCardEvidenceScope>>,
     scope_record_limit: usize,
 }
@@ -154,7 +151,6 @@ impl PublishedRepo {
                 mode,
                 card_active: AtomicBool::new(card_active),
                 published_reads: AtomicUsize::new(0),
-                legacy_reads: AtomicUsize::new(0),
                 scope_samples: Mutex::new(Vec::new()),
                 scope_record_limit,
             }),
@@ -173,40 +169,18 @@ impl PublishedRepo {
         self.state.published_reads.load(Ordering::SeqCst)
     }
 
-    pub fn legacy_reads(&self) -> usize {
-        self.state.legacy_reads.load(Ordering::SeqCst)
-    }
-
     pub fn scopes(&self) -> Vec<PublishedCardEvidenceScope> {
         self.state.scope_samples.lock().unwrap().clone()
     }
 
-    pub fn assert_no_legacy_reads(&self) {
-        assert_eq!(
-            self.legacy_reads(),
-            0,
-            "strict published-evidence evaluation must not read legacy/raw ports"
-        );
-    }
-
     pub fn reset_counters(&self) {
         self.state.published_reads.store(0, Ordering::SeqCst);
-        self.state.legacy_reads.store(0, Ordering::SeqCst);
         self.state.scope_samples.lock().unwrap().clear();
-    }
-
-    fn abort_legacy_read(&self, port: &str) -> ! {
-        self.state.legacy_reads.fetch_add(1, Ordering::SeqCst);
-        panic!("strict published-evidence path called legacy/raw port: {port}");
     }
 }
 
 #[async_trait::async_trait]
 impl RuleRepository for PublishedRepo {
-    fn requires_published_card_evidence(&self) -> bool {
-        true
-    }
-
     async fn load_published_card_authorization(
         &self,
         scope: &PublishedCardEvidenceScope,
@@ -241,64 +215,15 @@ impl RuleRepository for PublishedRepo {
         Ok(self.state.card_active.load(Ordering::SeqCst))
     }
 
-    async fn load_rule_set_snapshots(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-        self.abort_legacy_read("load_rule_set_snapshots")
+    async fn is_active_global_admin(&self, _user_id: i64) -> Result<bool, PolicyError> {
+        Ok(false)
     }
 
-    async fn load_snapshot_winners(
+    async fn load_org_authorization(
         &self,
-        _card_id: i64,
-    ) -> Result<Vec<SnapshotWinner>, PolicyError> {
-        self.abort_legacy_read("load_snapshot_winners")
-    }
-
-    async fn load_permission_rules(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        self.abort_legacy_read("load_permission_rules")
-    }
-
-    async fn load_rule_set_entries_raw(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<RuleSetSnapshot>, PolicyError> {
-        self.abort_legacy_read("load_rule_set_entries_raw")
-    }
-
-    async fn load_permission_rules_raw(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        self.abort_legacy_read("load_permission_rules_raw")
-    }
-
-    async fn load_delegated_rules(
-        &self,
-        _delegate_id: i64,
-        _resource: &str,
-        _action: &str,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        self.abort_legacy_read("load_delegated_rules")
-    }
-
-    async fn load_projected_delegated_rules(
-        &self,
-        _delegate_id: i64,
-        _resource: &str,
-        _action: &str,
-    ) -> Result<Vec<PermissionRule>, PolicyError> {
-        self.abort_legacy_read("load_projected_delegated_rules")
-    }
-
-    async fn get_projection_gate(
-        &self,
-        _card_id: i64,
-    ) -> Result<Option<ProjectionGate>, PolicyError> {
-        self.abort_legacy_read("get_projection_gate")
+        _ctx: &PolicyContext,
+    ) -> Result<OrgAuthorityRead, PolicyError> {
+        Ok(OrgAuthorityRead::Unmanaged)
     }
 }
 
@@ -361,7 +286,7 @@ pub fn ready_evidence(
         semantic_hash_hex: "a".repeat(64),
         dependency_hash_hex: "b".repeat(64),
         manifest_digest_hex: "c".repeat(64),
-        compiler_version: "test".to_owned(),
+        compiler_version: AUTHORIZATION_COMPILER_VERSION.to_owned(),
         event_id: format!("manifest-event-{card_id}"),
         operation_id: format!("manifest-operation-{card_id}"),
         parent_manifest_id: None,
@@ -381,7 +306,7 @@ pub fn ready_evidence(
             operation_id: format!("manifest-operation-{card_id}"),
             semantic_hash_hex: "a".repeat(64),
             dependency_hash_hex: "b".repeat(64),
-            compiler_version: "test".to_owned(),
+            compiler_version: AUTHORIZATION_COMPILER_VERSION.to_owned(),
             segment_ordinal: 0,
             position_in_segment: position as u64,
             grant: grant.clone(),

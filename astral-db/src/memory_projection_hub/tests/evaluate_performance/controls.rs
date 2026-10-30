@@ -134,6 +134,13 @@ struct RevokeBeforeFinal<'a> {
 
 #[async_trait::async_trait]
 impl RuleRepository for RevokeBeforeFinal<'_> {
+    async fn is_active_global_admin(
+        &self,
+        user_id: i64,
+    ) -> Result<bool, astral_types::PolicyError> {
+        self.inner.is_active_global_admin(user_id).await
+    }
+
     async fn check_card_active(
         &self,
         ctx: &astral_types::PolicyContext,
@@ -146,17 +153,6 @@ impl RuleRepository for RevokeBeforeFinal<'_> {
         ctx: &astral_types::PolicyContext,
     ) -> Result<policy_engine::org_admission::OrgAuthorityRead, astral_types::PolicyError> {
         self.inner.load_org_authorization(ctx).await
-    }
-
-    async fn load_permission_rules(
-        &self,
-        _card_id: i64,
-    ) -> Result<Vec<policy_engine::PermissionRule>, astral_types::PolicyError> {
-        panic!("revoke control must not read legacy rules")
-    }
-
-    fn requires_published_card_evidence(&self) -> bool {
-        true
     }
 
     async fn load_published_card_authorization(

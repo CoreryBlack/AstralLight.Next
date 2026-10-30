@@ -19,14 +19,11 @@
 //! DataScopeRuleProvider    →   DataScopeRuleProvider (trait)
 //! (各模块 @Component 实现)  →   TrustGraphDataScopeRuleProvider 等 impl
 //! CardDataPermissionHandler →   DataScopeRegistry (全局表→规则映射)
-//! DataScopeBypassHolder    →   data_scope_bypass (thread-local / task-local)
+//! DataScopeBypassHolder    →   with_bypass (task-local async scope)
 //! ```
 
 use astral_types::PolicyContext;
 use std::collections::HashMap;
-use std::marker::PhantomData;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 // ============================================================================
@@ -205,21 +202,15 @@ impl Default for DataScopeRegistry {
 // DataScopeBypass — 对齐 Java DataScopeBypassHolder
 // ============================================================================
 
-/// 数据范围绕过开关。
+/// 数据范围维护 scope 的任务局部状态。
 ///
-/// A bypass is a task-local async scope, never a thread-local flag. Prefer
-/// [`with_bypass`] around the complete trusted maintenance future. The legacy
-/// synchronous `open`/`close` methods only affect an already active `with_bypass`
-/// scope; outside one they are no-ops and cannot affect another task.
+/// Use [`with_bypass`] around the complete trusted maintenance future. The
+/// state follows that future across awaits and is not inherited by spawned tasks.
 pub struct DataScopeBypass;
 
 tokio::task_local! {
-    static BYPASS_DEPTH: std::cell::Cell<usize>;
-    static BYPASS_BASE_DEPTH: usize;
-    static BYPASS_SCOPE_ID: u64;
+    static BYPASS_ACTIVE: bool;
 }
-
-static NEXT_BYPASS_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Run a trusted maintenance future with data-scope bypass enabled.
 ///
@@ -227,83 +218,13 @@ static NEXT_BYPASS_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 /// restored by task-local scoping when the future completes, errors, is cancelled,
 /// or unwinds. It is not inherited by a separately spawned Tokio task.
 pub async fn with_bypass<F: std::future::Future>(future: F) -> F::Output {
-    let parent_depth = BYPASS_DEPTH.try_with(|depth| depth.get()).unwrap_or(0);
-    let inherited_floor = BYPASS_BASE_DEPTH.try_with(|depth| *depth).unwrap_or(0);
-    let base_depth = inherited_floor.saturating_add(1);
-    let scope_id = NEXT_BYPASS_SCOPE_ID.fetch_add(1, Ordering::Relaxed);
-    let scoped = BYPASS_DEPTH.scope(std::cell::Cell::new(parent_depth.max(base_depth)), future);
-    BYPASS_SCOPE_ID
-        .scope(scope_id, BYPASS_BASE_DEPTH.scope(base_depth, scoped))
-        .await
+    BYPASS_ACTIVE.scope(true, future).await
 }
 
 impl DataScopeBypass {
-    /// Legacy synchronous opener; effective only inside [`with_bypass`].
-    #[deprecated(note = "use with_bypass(future) to scope bypass across awaits")]
-    pub fn open() {
-        let _ = BYPASS_DEPTH.try_with(|depth| depth.set(depth.get().saturating_add(1)));
-    }
-
-    /// Legacy synchronous closer; never drops below the active scoped base.
-    #[deprecated(note = "use with_bypass(future) to scope bypass across awaits")]
-    pub fn close() {
-        let floor = BYPASS_BASE_DEPTH.try_with(|depth| *depth).unwrap_or(0);
-        let _ = BYPASS_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1).max(floor)));
-    }
-
     /// Whether the current async task is inside a bypass scope.
     pub fn is_bypassed() -> bool {
-        BYPASS_DEPTH
-            .try_with(|depth| depth.get() > 0)
-            .unwrap_or(false)
-    }
-}
-
-/// Legacy RAII guard, !Send so it cannot be transferred across async tasks.
-///
-/// It only adjusts a `with_bypass` scope active at construction; creating it
-/// outside such a scope or dropping it after its originating nested scope has
-/// ended is a no-op.
-pub struct DataScopeBypassGuard {
-    scope_id: Option<u64>,
-    floor: usize,
-    _not_send: PhantomData<Rc<()>>,
-}
-
-impl DataScopeBypassGuard {
-    pub fn new() -> Self {
-        let scope_id = BYPASS_SCOPE_ID.try_with(|scope_id| *scope_id).ok();
-        let floor = BYPASS_BASE_DEPTH.try_with(|depth| *depth).unwrap_or(0);
-        #[allow(deprecated)]
-        DataScopeBypass::open();
-        Self {
-            scope_id,
-            floor,
-            _not_send: PhantomData,
-        }
-    }
-}
-
-#[allow(deprecated)]
-impl Default for DataScopeBypassGuard {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for DataScopeBypassGuard {
-    #[allow(deprecated)]
-    fn drop(&mut self) {
-        let Some(scope_id) = self.scope_id else {
-            return;
-        };
-        let is_originating_scope = BYPASS_SCOPE_ID
-            .try_with(|current_scope| *current_scope == scope_id)
-            .unwrap_or(false);
-        if is_originating_scope {
-            let _ = BYPASS_DEPTH
-                .try_with(|depth| depth.set(depth.get().saturating_sub(1).max(self.floor)));
-        }
+        BYPASS_ACTIVE.try_with(|active| *active).unwrap_or(false)
     }
 }
 
@@ -610,34 +531,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_bypass_guard_cannot_enable_a_global_thread_bypass() {
-        assert!(!DataScopeBypass::is_bypassed());
-        #[allow(deprecated)]
-        {
-            #[allow(deprecated)]
-            let _guard = DataScopeBypassGuard::new();
-            assert!(!DataScopeBypass::is_bypassed());
-        }
+    async fn bypass_is_cleared_on_error() {
+        let result: Result<(), &str> = with_bypass(async {
+            assert!(DataScopeBypass::is_bypassed());
+            tokio::task::yield_now().await;
+            Err("maintenance failed")
+        })
+        .await;
+        assert_eq!(result, Err("maintenance failed"));
         assert!(!DataScopeBypass::is_bypassed());
     }
 
     #[tokio::test]
-    async fn legacy_guard_adjusts_only_its_originating_nested_scope() {
-        with_bypass(async {
+    async fn bypass_is_not_inherited_after_a_scoped_task_panics() {
+        let task = tokio::spawn(with_bypass(async {
             assert!(DataScopeBypass::is_bypassed());
-            {
-                #[allow(deprecated)]
-                let _outer_guard = DataScopeBypassGuard::new();
-                with_bypass(async {
-                    assert!(DataScopeBypass::is_bypassed());
-                })
-                .await;
-                assert!(DataScopeBypass::is_bypassed());
-            }
-            assert!(DataScopeBypass::is_bypassed());
-        })
-        .await;
+            panic!("maintenance panic");
+        }));
+        assert!(task.await.unwrap_err().is_panic());
         assert!(!DataScopeBypass::is_bypassed());
+        assert!(!tokio::spawn(async { DataScopeBypass::is_bypassed() })
+            .await
+            .unwrap());
     }
 
     // --- DataScopeFilterResolver 测试 ---

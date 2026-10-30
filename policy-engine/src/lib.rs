@@ -1,41 +1,33 @@
-//! AstralLight 权限策略评估引擎核心
+//! AstralLight authorization policy engine.
 //!
-//! PolicyEngine 是权限控制系统的决策核心，实现三层评估模型：
+//! `PolicyEngine::evaluate()` is the only formal authorization entry point. It
+//! applies identity and target-ownership gates, then requires CURRENT V6 published
+//! ORG_SCOPE or CARD evidence; missing, stale, malformed, or unavailable proof
+//! fails closed. This crate contains no database, cache, or message transport
+//! implementation; authoritative reads are injected through `RuleRepository`.
 //!
-//! - **L1**: RuleSet 匹配（先 OVERLAY 后 BASE）—— 规则集共享模式
-//! - **L2**: PermissionRule 回退 —— 旧路径兼容 + CARD_ONLY 特例
-//! - **L3**: DEFAULT_DENY —— 未匹配时默认拒绝（fail-closed）
-//!
-//! `policy-engine` crate 只承载纯规则评估逻辑，不直接依赖 MySQL、Redis
-//! 或 RabbitMQ。数据库访问通过 `RuleRepository` trait 注入。
-//!
-//! Phase 2 additionally exposes a Rust-native, no-I/O authorization hot-state compiler
-//! kernel. Its versioned candidate and full-rebuild oracle are deliberately not production
-//! projection wiring; SQL/Redis/MQ/worker integration remains a later boundary.
+//! The crate also exposes Rust-native authorization compiler kernels. Their
+//! candidate and rebuild APIs are separate from the formal authorization read path.
 
-mod arbiter;
 mod authorization_compiler;
 mod circuit_breaker;
 mod client;
 mod condition;
-mod consistency;
 mod cross_city_conflict;
 mod data_scope;
 #[cfg(any(feature = "e1-observability", test))]
 pub mod e1_observation;
 mod engine;
 mod hit_stats;
-/// 组织范围（ORG_SCOPE）准入读取合同（main/admission owner 维护的实现）。
+/// ORG_SCOPE admission contract and evidence validation.
 pub mod org_admission;
-/// 组织范围（ORG_SCOPE）纯编译器内核（types/compiler owner 维护；Phase 2 default-off）。
+/// ORG_SCOPE pure compiler kernel.
 mod org_compiler;
 
-pub use arbiter::*;
 pub use authorization_compiler::*;
 pub use circuit_breaker::*;
 pub use client::*;
 pub use condition::*;
-pub use consistency::*;
 pub use cross_city_conflict::*;
 pub use data_scope::*;
 pub use engine::*;

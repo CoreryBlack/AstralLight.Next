@@ -1,10 +1,9 @@
-//! Pure (no-DB) tests for the stable-event claim payload binding
-//! (`grant_repository::verify_stable_event_request_binding` and its outcome
-//! vocabulary). Durable SQL behavior is covered by the integration suites;
-//! these tests pin the fail-closed field-by-field contract without a database.
+//! Pure (no-DB) tests for the WorkerOwned stable-receipt payload binding.
+//! Durable SQL behavior is covered by the integration suites; these tests pin
+//! the fail-closed field-by-field contract without a database.
 
-use super::verify_stable_event_request_binding;
-use super::{StableEventClaimRow, DELTA_STATUS_PENDING};
+use super::verify_owned_stable_event_request_binding;
+use super::{OwnedStableEventRow, DELTA_STATUS_PENDING};
 use crate::grant_repository::DeltaEventAppendRequest;
 use astral_types::GrantId;
 
@@ -31,13 +30,13 @@ fn request() -> DeltaEventAppendRequest {
         delta_json: r#"{"op":"ADD"}"#.to_owned(),
         semantic_hash_hex: "aa".repeat(32),
         dependency_hash_hex: "bb".repeat(32),
-        compiler_version: "test-compiler".to_owned(),
+        compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
         next_attempt_at: None,
     }
 }
 
-fn row_for(request: &DeltaEventAppendRequest) -> StableEventClaimRow {
-    StableEventClaimRow {
+fn row_for(request: &DeltaEventAppendRequest) -> OwnedStableEventRow {
+    OwnedStableEventRow {
         delta_event_id: 101,
         event_id: request.event_id.clone(),
         operation_id: request.operation_id.clone(),
@@ -83,15 +82,15 @@ fn row_for(request: &DeltaEventAppendRequest) -> StableEventClaimRow {
 fn binding_accepts_fully_matching_row() {
     let request = request();
     let row = row_for(&request);
-    verify_stable_event_request_binding(&request, &row).expect("matching row must bind");
+    verify_owned_stable_event_request_binding(&request, &row).expect("matching row must bind");
 }
 
-fn assert_mismatch(request: &DeltaEventAppendRequest, row: &StableEventClaimRow, field: &str) {
-    let error =
-        verify_stable_event_request_binding(request, row).expect_err("drift must fail closed");
+fn assert_mismatch(request: &DeltaEventAppendRequest, row: &OwnedStableEventRow, field: &str) {
+    let error = verify_owned_stable_event_request_binding(request, row)
+        .expect_err("drift must fail closed");
     let message = error.to_string();
     assert!(
-        message.contains("claim_by_event_payload_mismatch"),
+        message.contains("owned_event_payload_mismatch"),
         "unexpected error: {message}"
     );
     assert!(
@@ -173,6 +172,20 @@ fn binding_rejects_every_drifting_field() {
 }
 
 #[test]
+fn matching_old_or_future_receipt_and_row_still_fail_closed() {
+    for compiler in [
+        "astral-authorization-v5",
+        "astral-authorization-v7",
+        "foreign-v6",
+    ] {
+        let mut request = request();
+        request.compiler_version = compiler.to_owned();
+        let row = row_for(&request);
+        assert_mismatch(&request, &row, "compiler_version");
+    }
+}
+
+#[test]
 fn binding_rejects_unexpected_before_image() {
     let request = request();
     let mut drift = row_for(&request);
@@ -188,7 +201,7 @@ fn binding_accepts_paired_before_image() {
     request.before_image_json = Some(image.to_owned());
     request.before_digest_hex = Some(digest.as_hex().to_owned());
     let row = row_for(&request);
-    verify_stable_event_request_binding(&request, &row).expect("paired before image binds");
+    verify_owned_stable_event_request_binding(&request, &row).expect("paired before image binds");
 
     let mut drift = row_for(&request);
     drift.before_digest = Some(vec![0u8; 32]);

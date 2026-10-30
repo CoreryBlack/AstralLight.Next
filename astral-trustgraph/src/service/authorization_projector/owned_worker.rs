@@ -3,9 +3,9 @@ use std::sync::Arc;
 use astral_db::DeltaLeaseIdentity;
 
 use super::{
-    worker::{budget_exhausted_error, clamp_backoff, event_backoff_secs},
+    worker::{budget_exhausted_error, plan_retry_schedule, RetrySchedule},
     AuthorizationProjectorRuntime, DispositionKind, OwnedTransitionProof, WorkerRunSummary,
-    BACKOFF_CAP_SECS, MAX_EVENT_ATTEMPTS,
+    MAX_EVENT_ATTEMPTS,
 };
 use crate::observability::{record_projector_event, ProjectorEventOutcome};
 
@@ -24,11 +24,9 @@ pub(super) async fn schedule_owned_retry(
         return;
     };
     let next_failures = i64::from(failures) + i64::from(count_failure);
-    let exhausted = next_failures >= MAX_EVENT_ATTEMPTS;
-    let backoff = if exhausted {
-        clamp_backoff(BACKOFF_CAP_SECS)
-    } else {
-        event_backoff_secs(next_failures.max(1)).max(clamp_backoff(minimum_backoff_secs))
+    let (backoff, exhausted) = match plan_retry_schedule(next_failures, minimum_backoff_secs) {
+        RetrySchedule::Continue { backoff_secs } => (backoff_secs, false),
+        RetrySchedule::AttemptBudgetExhausted { backoff_secs } => (backoff_secs, true),
     };
     let reason = if exhausted {
         budget_exhausted_error(reason, next_failures)
@@ -81,7 +79,9 @@ mod tests {
     };
     use async_trait::async_trait;
 
-    use super::super::{PublicationContext, RuntimeAccessError};
+    use super::super::{
+        worker::clamp_backoff, PublicationContext, RuntimeAccessError, BACKOFF_CAP_SECS,
+    };
     use super::*;
 
     struct TransitionRuntime {
@@ -92,10 +92,6 @@ mod tests {
 
     #[async_trait]
     impl AuthorizationProjectorRuntime for TransitionRuntime {
-        fn worker_owned_execution(&self) -> bool {
-            true
-        }
-
         fn event_execution_failures(&self, _identity: &DeltaLeaseIdentity) -> Option<u32> {
             Some(self.failures.load(Ordering::SeqCst))
         }
@@ -158,12 +154,11 @@ mod tests {
             unreachable!()
         }
 
-        async fn fail_event(&self, _identity: &DeltaLeaseIdentity, _backoff: i64, _message: &str) {
-            panic!("owned scheduling must not use the void transition port")
-        }
-
-        async fn release_event(&self, _identity: &DeltaLeaseIdentity) {
-            panic!("owned scheduling must not use the void release port")
+        async fn owned_release_transition(
+            &self,
+            _identity: &DeltaLeaseIdentity,
+        ) -> OwnedTransitionProof {
+            panic!("owned scheduling must not use a release transition")
         }
 
         async fn mark_event_quarantined(

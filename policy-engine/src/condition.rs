@@ -24,7 +24,7 @@ pub trait ConditionEvaluator: Send + Sync {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct Condition {
-    #[serde(rename = "conditionType", alias = "condition_type")]
+    #[serde(rename = "conditionType")]
     pub condition_type: String,
     /// 条件参数，例如 `{ "start": "08:00", "end": "18:00" }`
     pub params: serde_json::Value,
@@ -68,6 +68,13 @@ impl ConditionEvaluator for TimeRangeCondition {
         condition: &Condition,
         _ctx: &PolicyContext,
     ) -> Result<bool, ConditionError> {
+        if condition.params.get("timeZone").is_some() {
+            return Err(ConditionError::InvalidParams(
+                "unsupported legacy parameter 'timeZone'; use 'timezone'".into(),
+            ));
+        }
+
+        // 按 HH:mm 分钟精度比较，支持跨午夜（start > end 回绕）。
         let start = condition
             .params
             .get("start")
@@ -78,12 +85,9 @@ impl ConditionEvaluator for TimeRangeCondition {
             .get("end")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ConditionError::InvalidParams("missing 'end'".into()))?;
-
-        // 对齐 Java `isInTimeRange`：按 HH:mm 分钟精度比较，支持跨午夜（start > end 回绕）。
         let offset = condition
             .params
             .get("timezone")
-            .or_else(|| condition.params.get("timeZone"))
             .map(parse_fixed_offset)
             .transpose()?;
         let now = time::OffsetDateTime::now_utc().to_offset(offset.unwrap_or(time::UtcOffset::UTC));
@@ -190,7 +194,7 @@ impl ConditionEvaluator for IpRangeCondition {
                 if ip == client_ip {
                     return Ok(true);
                 }
-                // 对齐 Java `ipMatchesCidr`：支持 1.2.3.0/24 形式
+                // 支持 1.2.3.0/24 形式
                 if let Some((prefix, prefix_len)) = ip.split_once('/') {
                     if let Ok(mask_bits) = prefix_len.parse::<u8>() {
                         if (1..=32).contains(&mask_bits)
@@ -207,7 +211,7 @@ impl ConditionEvaluator for IpRangeCondition {
     }
 }
 
-/// IPv4 CIDR 匹配（对齐 Java `ipToLong` + `ipMatchesCidr`）；非法输入返回 false（fail-closed）
+/// IPv4 CIDR 匹配；非法输入返回 false（fail-closed）
 fn ip_matches_cidr(ip: &str, prefix: &str, mask_bits: u8) -> bool {
     let (Some(ip_long), Some(prefix_long)) = (ipv4_to_u32(ip), ipv4_to_u32(prefix)) else {
         return false;
@@ -236,10 +240,11 @@ fn ipv4_to_u32(ip: &str) -> Option<u32> {
     Some(result)
 }
 
-/// 速率限制条件：检查请求频率是否在阈值内
+/// 速率限制条件：使用调用方提供的当前窗口计数校验规则阈值。
 ///
-/// 参数示例：`{ "max_requests": 100, "window_seconds": 60 }`
-/// 实际限流由 governor + Redis 实现，此处仅做上下文校验
+/// 参数示例：`{ "max_requests": 100, "window_seconds": 60 }`。调用方必须将
+/// 服务端可信的当前窗口计数放入 context；缺少计数时 fail-closed。本评估器不
+/// 创建计数器，也不把 Gateway 的全局限流视为规则窗口计数。
 pub struct RateLimitCondition;
 
 #[async_trait::async_trait]
@@ -251,7 +256,7 @@ impl ConditionEvaluator for RateLimitCondition {
     async fn evaluate(
         &self,
         condition: &Condition,
-        _ctx: &PolicyContext,
+        ctx: &PolicyContext,
     ) -> Result<bool, ConditionError> {
         let max_requests = condition
             .params
@@ -263,9 +268,9 @@ impl ConditionEvaluator for RateLimitCondition {
             return Ok(false); // 阈值为 0 直接拒绝
         }
 
-        // 条件求值必须拿到当前窗口计数；Gateway 的全局 IP 限流并不等价于
-        // 规则自己的 max_requests/window_seconds。未知计数不能按 ALLOW 处理。
-        let current_count = _ctx
+        // 条件求值必须拿到可信调用方提供的当前窗口计数；Gateway 的全局 IP
+        // 限流并不等价于规则自己的 max_requests/window_seconds。未知计数不能 ALLOW。
+        let current_count = ctx
             .request
             .as_ref()
             .and_then(|request| request.get("rateLimitCount"))
@@ -345,7 +350,7 @@ fn detect_device_type(user_agent: &str) -> Option<&'static str> {
 /// 资源属性条件：检查资源的特定属性是否满足条件
 ///
 /// 参数示例：`{ "attribute": "sensitivity", "operator": "lte", "value": 2 }`。
-/// Java `resourceProperty` 数组会归一化为 `conditions`，要求每一项都满足。
+/// 多个原生属性谓词可放在 `conditions` 中，所有谓词都必须满足。
 pub struct ResourcePropertyCondition;
 
 impl ResourcePropertyCondition {
@@ -479,25 +484,10 @@ impl ConditionEvaluator for BelongsToTenantCondition {
         condition: &Condition,
         ctx: &PolicyContext,
     ) -> Result<bool, ConditionError> {
-        // Java-compatible `belongsToTenant` remains a caller-context predicate
-        // only for in-process typed compatibility calls. External HTTP requests
-        // must compare the resolver's target tenant instead of treating the
-        // actor tenant itself as resource ownership.
-        if condition
-            .params
-            .get("java_semantics")
-            .and_then(|v| v.as_bool())
-            == Some(true)
-        {
-            return match ctx.resource_ownership_scope {
-                ResourceOwnershipScope::TenantScoped => Ok(ctx
-                    .tenant_id
-                    .is_some_and(|tenant_id| Some(tenant_id) == ctx.resource_tenant_id)),
-                ResourceOwnershipScope::Internal => Ok(ctx.tenant_id.is_some()),
-                ResourceOwnershipScope::Global
-                | ResourceOwnershipScope::Unresolved
-                | ResourceOwnershipScope::Unavailable => Ok(false),
-            };
+        if condition.params.get("java_semantics").is_some() {
+            return Err(ConditionError::InvalidParams(
+                "unsupported legacy parameter 'java_semantics'".into(),
+            ));
         }
 
         let user_tenant_id = ctx
@@ -553,15 +543,10 @@ impl ConditionEvaluator for ScopeCondition {
         condition: &Condition,
         ctx: &PolicyContext,
     ) -> Result<bool, ConditionError> {
-        // Java 格式 `{"scope":"SELF"}` / `{"scope":"TENANT"}` 归一化后的语义：
-        // SELF → 调用方已认证（有 userId）；TENANT → 调用方有 tenantId
-        // （对齐 Java ConditionEvaluator）。Rust 原生 required_scopes 不受影响。
-        if let Some(java_scope) = condition.params.get("java_scope").and_then(|v| v.as_str()) {
-            return Ok(match java_scope.to_uppercase().as_str() {
-                "SELF" => ctx.user_id.is_some(),
-                "TENANT" => ctx.tenant_id.is_some(),
-                _ => false, // 未知 scope 值 → deny（对齐 Java 默认 deny）
-            });
+        if condition.params.get("java_scope").is_some() {
+            return Err(ConditionError::InvalidParams(
+                "unsupported legacy parameter 'java_scope'".into(),
+            ));
         }
 
         let required = condition
@@ -594,26 +579,9 @@ impl ConditionEvaluator for ScopeCondition {
     }
 }
 
-/// 条件注册表：根据条件类型名创建评估器实例
-///
-/// 同时支持 PascalCase（Rust 原生）和小写别名（Java 兼容）：
-/// - `"timeRange"` / `"TimeRangeCondition"` → TimeRangeCondition
-/// - `"ownerOnly"` / `"OwnerOnlyCondition"` → OwnerOnlyCondition
+/// 条件注册表：根据原生 PascalCase 条件类型创建评估器；未知类型 fail-closed。
 pub fn evaluator_for(condition_type: &str) -> Result<Box<dyn ConditionEvaluator>, ConditionError> {
-    // 小写别名 → PascalCase 映射
-    let normalized = match condition_type {
-        "timeRange" | "TimeRangeCondition" => "TimeRangeCondition",
-        "ipRange" | "IpRangeCondition" => "IpRangeCondition",
-        "rateLimit" | "RateLimitCondition" => "RateLimitCondition",
-        "deviceType" | "DeviceTypeCondition" => "DeviceTypeCondition",
-        "resourceProperty" | "ResourcePropertyCondition" => "ResourcePropertyCondition",
-        "ownerOnly" | "OwnerOnlyCondition" => "OwnerOnlyCondition",
-        "belongsToTenant" | "BelongsToTenantCondition" => "BelongsToTenantCondition",
-        "scope" | "ScopeCondition" => "ScopeCondition",
-        _ => return Err(ConditionError::UnknownType(condition_type.to_string())),
-    };
-
-    match normalized {
+    match condition_type {
         "TimeRangeCondition" => Ok(Box::new(TimeRangeCondition)),
         "IpRangeCondition" => Ok(Box::new(IpRangeCondition)),
         "RateLimitCondition" => Ok(Box::new(RateLimitCondition)),
@@ -622,233 +590,68 @@ pub fn evaluator_for(condition_type: &str) -> Result<Box<dyn ConditionEvaluator>
         "OwnerOnlyCondition" => Ok(Box::new(OwnerOnlyCondition)),
         "BelongsToTenantCondition" => Ok(Box::new(BelongsToTenantCondition)),
         "ScopeCondition" => Ok(Box::new(ScopeCondition)),
-        _ => unreachable!(),
+        _ => Err(ConditionError::UnknownType(condition_type.to_string())),
     }
 }
 
-/// 条件 JSON 归一化（Java 顶层键格式 → Rust 内部格式）
+fn is_canonical_condition(condition: &Condition) -> bool {
+    if evaluator_for(&condition.condition_type).is_err() {
+        return false;
+    }
+    let Some(params) = condition.params.as_object() else {
+        return true;
+    };
+    let retired_parameter = match condition.condition_type.as_str() {
+        "TimeRangeCondition" => params.contains_key("timeZone"),
+        "ScopeCondition" => params.contains_key("java_scope"),
+        "BelongsToTenantCondition" => params.contains_key("java_semantics"),
+        _ => false,
+    };
+    !retired_parameter
+}
+
+/// Validate and normalize the canonical Rust condition JSON shape.
 ///
-/// Java 权威基线（`ConditionEvaluator.matches`）以**顶层键**存储条件 JSON：
-/// - `{"timeRange":{"start":"09:00","end":"18:00"}}`
-/// - `{"ownerOnly":true}`
-/// - `{"ipRange":["1.2.3.4","10.0.0.0/8"]}`
-/// - `{"deviceType":["mobile","desktop"]}`
-/// - `{"rateLimit":{"maxRequests":100,"windowSeconds":60}}`
-/// - `{"resourceProperty":[{"attribute":"sensitivity","operator":"lte","value":2}]}`
-/// - `{"belongsToTenant":true}` / `{"scope":"SELF"}`
-/// - `{"conditionGroup":{"allOf":[{"ownerOnly":true},...]}}`
-///
-/// Rust 内部格式为 `{"conditionType":"...","params":{...}}`。本函数把 Java 顶层键
-/// 格式归一化为 Rust `ConditionGroup`，供 `evaluate_entry_condition_raw` /
-/// `has_runtime_condition` 统一消费。无法识别时返回 `None`（fail-closed）。
+/// Accepts one `conditionType`/`params` condition or a one-key `allOf`, `anyOf`,
+/// or `not` group. All aliases and legacy wrappers are rejected.
 pub fn normalize_condition_json(json: &serde_json::Value) -> Option<ConditionGroup> {
     let object = json.as_object()?;
 
-    // Rust 内部单条件格式，必须只包含 conditionType/condition_type + params。
-    if object.contains_key("conditionType") || object.contains_key("condition_type") {
-        let allowed = ["conditionType", "condition_type", "params"];
-        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+    let group = if object.contains_key("conditionType") {
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "conditionType" | "params"))
+        {
             return None;
         }
-        return serde_json::from_value::<Condition>(json.clone())
-            .ok()
-            .map(|cond| ConditionGroup::AllOf(vec![cond]));
-    }
-
-    // Rust 内部条件组格式：只接受恰好一个操作键。
-    if object
-        .keys()
-        .any(|key| matches!(key.as_str(), "allOf" | "anyOf" | "not"))
-    {
-        return normalize_rust_group(json);
-    }
-
-    // Java `conditionGroup` 顶层键：{"allOf":[...]} / {"anyOf":[...]} / {"not":{...}}
-    if let Some(group) = json.get("conditionGroup") {
+        let condition = serde_json::from_value::<Condition>(json.clone()).ok()?;
+        ConditionGroup::AllOf(vec![condition])
+    } else {
         if object.len() != 1 {
             return None;
         }
-        return normalize_java_group(group);
-    }
-
-    let known_keys = [
-        "timeRange",
-        "ipRange",
-        "rateLimit",
-        "deviceType",
-        "resourceProperty",
-        "ownerOnly",
-        "belongsToTenant",
-        "scope",
-    ];
-    // Java 顶层键格式：任何未知键都使整个条件无效，不能命中首项后丢弃其余约束。
-    if object.keys().any(|key| !known_keys.contains(&key.as_str())) {
-        return None;
-    }
-
-    // 多个已知顶层键按 Java 语义 AND。
-    let mut conditions = Vec::new();
-    for key in known_keys {
-        if let Some(value) = json.get(key) {
-            conditions.push(normalize_java_single(key, value)?);
-        }
-    }
-    if !conditions.is_empty() {
-        return Some(ConditionGroup::AllOf(conditions));
-    }
-
-    None
-}
-
-/// Java `conditionGroup` 内部：`{"allOf":[...]}` / `{"anyOf":[...]}` / `{"not":{...}}`
-fn normalize_java_group(group: &serde_json::Value) -> Option<ConditionGroup> {
-    let object = group.as_object()?;
-    if object.len() != 1
-        || object
-            .keys()
-            .any(|key| !matches!(key.as_str(), "allOf" | "anyOf" | "not"))
-    {
-        return None;
-    }
-    if let Some(items) = group.get("allOf").and_then(|v| v.as_array()) {
-        if items.is_empty() {
+        let operation = object.keys().next()?.as_str();
+        if !matches!(operation, "allOf" | "anyOf" | "not") {
             return None;
         }
-        let conds = items
-            .iter()
-            .map(normalize_java_condition_item)
-            .collect::<Option<Vec<Condition>>>()?;
-        return Some(ConditionGroup::AllOf(conds));
-    }
-    if let Some(items) = group.get("anyOf").and_then(|v| v.as_array()) {
-        if items.is_empty() {
+        if matches!(operation, "allOf" | "anyOf")
+            && object
+                .get(operation)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty)
+        {
             return None;
         }
-        let conds = items
-            .iter()
-            .map(normalize_java_condition_item)
-            .collect::<Option<Vec<Condition>>>()?;
-        return Some(ConditionGroup::AnyOf(conds));
-    }
-    if let Some(item) = group.get("not") {
-        let cond = normalize_java_condition_item(item)?;
-        return Some(ConditionGroup::Not(Box::new(cond)));
-    }
-    None
-}
-
-fn normalize_rust_group(group: &serde_json::Value) -> Option<ConditionGroup> {
-    let object = group.as_object()?;
-    if object.len() != 1 {
-        return None;
-    }
-    if object
-        .get("allOf")
-        .or_else(|| object.get("anyOf"))
-        .and_then(|value| value.as_array())
-        .is_some_and(Vec::is_empty)
-    {
-        return None;
-    }
-    serde_json::from_value(group.clone()).ok()
-}
-
-/// Java 组内单个条件条目（可能仍是顶层键形式，也可能是嵌套 conditionGroup）
-fn normalize_java_condition_item(item: &serde_json::Value) -> Option<Condition> {
-    let object = item.as_object()?;
-    let known_keys = [
-        "timeRange",
-        "ipRange",
-        "rateLimit",
-        "deviceType",
-        "resourceProperty",
-        "ownerOnly",
-        "belongsToTenant",
-        "scope",
-    ];
-    // 当前内部 ConditionGroup 只能承载单条件；嵌套组和混合键必须拒绝。
-    if object.len() != 1 {
-        return None;
-    }
-    let (key, value) = object.iter().next()?;
-    if !known_keys.contains(&key.as_str()) {
-        return None;
-    }
-    normalize_java_single(key, value)
-}
-
-/// 单个 Java 顶层键条件 → Rust `Condition`
-fn normalize_java_single(key: &str, value: &serde_json::Value) -> Option<Condition> {
-    let (condition_type, params) = match key {
-        "timeRange" => {
-            let start = value.get("start").and_then(|v| v.as_str())?;
-            let end = value.get("end").and_then(|v| v.as_str())?;
-            (
-                "TimeRangeCondition",
-                serde_json::json!({ "start": start, "end": end }),
-            )
-        }
-        "ownerOnly" => {
-            if value.as_bool() != Some(true) {
-                return None;
-            }
-            ("OwnerOnlyCondition", serde_json::json!({}))
-        }
-        "ipRange" => {
-            let ranges = value.as_array()?;
-            ("IpRangeCondition", serde_json::json!({ "ranges": ranges }))
-        }
-        "rateLimit" => {
-            let max_requests = value.get("maxRequests").and_then(|v| v.as_u64())?;
-            let window_seconds = value.get("windowSeconds").and_then(|v| v.as_u64())?;
-            (
-                "RateLimitCondition",
-                serde_json::json!({ "max_requests": max_requests, "window_seconds": window_seconds }),
-            )
-        }
-        "deviceType" => {
-            let allowed = value.as_array()?;
-            (
-                "DeviceTypeCondition",
-                serde_json::json!({ "allowed_devices": allowed }),
-            )
-        }
-        "resourceProperty" => {
-            // Java payload: [{"field":"status","op":"eq","value":"PUBLISHED"}].
-            // 全部属性约束必须保留，并由 ResourcePropertyCondition 逐项 AND。
-            let conditions = value.as_array()?;
-            if conditions.is_empty() {
-                return None;
-            }
-            (
-                "ResourcePropertyCondition",
-                serde_json::json!({ "conditions": conditions }),
-            )
-        }
-        "belongsToTenant" => {
-            if value.as_bool() != Some(true) {
-                return None;
-            }
-            // Java 语义：仅要求调用方有 tenantId（java_semantics 标记短路精确比对）
-            (
-                "BelongsToTenantCondition",
-                serde_json::json!({ "java_semantics": true }),
-            )
-        }
-        "scope" => {
-            let scope = value.as_str()?;
-            // Java 语义：SELF → 有 userId；TENANT → 有 tenantId
-            (
-                "ScopeCondition",
-                serde_json::json!({ "java_scope": scope.to_uppercase() }),
-            )
-        }
-        _ => return None,
+        serde_json::from_value::<ConditionGroup>(json.clone()).ok()?
     };
-    Some(Condition {
-        condition_type: condition_type.to_string(),
-        params,
-    })
+
+    let has_only_canonical_conditions = match &group {
+        ConditionGroup::AllOf(conditions) | ConditionGroup::AnyOf(conditions) => {
+            conditions.iter().all(is_canonical_condition)
+        }
+        ConditionGroup::Not(condition) => is_canonical_condition(condition),
+    };
+    has_only_canonical_conditions.then_some(group)
 }
 
 #[cfg(test)]
@@ -1033,7 +836,7 @@ mod tests {
             condition_type: "OwnerOnlyCondition".into(),
             params: serde_json::json!({}),
         };
-        // 对齐 Java ConditionEvaluator.ownerOnly：resourceOwnerId == currentUserId → allow
+        // 目标资源属主与当前用户匹配时允许。
         let ctx = PolicyContext::builder()
             .action("read".into())
             .user_id(Some(42))
@@ -1229,127 +1032,137 @@ mod tests {
         assert!(evaluator_for("UnknownCondition").is_err());
     }
 
-    #[tokio::test]
-    async fn test_evaluator_lowercase_aliases() {
-        // Java 兼容的小写别名
-        assert!(evaluator_for("timeRange").is_ok());
-        assert!(evaluator_for("ipRange").is_ok());
-        assert!(evaluator_for("rateLimit").is_ok());
-        assert!(evaluator_for("deviceType").is_ok());
-        assert!(evaluator_for("resourceProperty").is_ok());
-        assert!(evaluator_for("ownerOnly").is_ok());
-        assert!(evaluator_for("belongsToTenant").is_ok());
-        assert!(evaluator_for("scope").is_ok());
-    }
-
-    // ===== Java 顶层键格式归一化 =====
-
     #[test]
-    fn normalize_java_time_range() {
-        let json = serde_json::json!({"timeRange": {"start": "09:00", "end": "18:00"}});
-        let group = normalize_condition_json(&json).expect("Java timeRange must normalize");
-        match group {
-            ConditionGroup::AllOf(conds) => {
-                assert_eq!(conds.len(), 1);
-                assert_eq!(conds[0].condition_type, "TimeRangeCondition");
-                assert_eq!(conds[0].params["start"], "09:00");
-                assert_eq!(conds[0].params["end"], "18:00");
-            }
-            _ => panic!("expected AllOf"),
+    fn evaluator_rejects_legacy_lowercase_aliases() {
+        for legacy_name in [
+            "timeRange",
+            "ipRange",
+            "rateLimit",
+            "deviceType",
+            "resourceProperty",
+            "ownerOnly",
+            "belongsToTenant",
+            "scope",
+            "TimeRangeCondition ",
+            "timerangecondition",
+        ] {
+            assert!(
+                evaluator_for(legacy_name).is_err(),
+                "legacy_name={legacy_name}"
+            );
         }
     }
 
     #[test]
-    fn normalize_java_owner_only() {
-        let json = serde_json::json!({"ownerOnly": true});
-        let group = normalize_condition_json(&json).expect("Java ownerOnly must normalize");
-        match group {
-            ConditionGroup::AllOf(conds) => {
-                assert_eq!(conds[0].condition_type, "OwnerOnlyCondition");
-            }
-            _ => panic!("expected AllOf"),
-        }
-    }
-
-    #[test]
-    fn normalize_java_owner_only_false_is_none() {
-        let json = serde_json::json!({"ownerOnly": false});
-        assert!(normalize_condition_json(&json).is_none());
-    }
-
-    #[test]
-    fn normalize_java_condition_group_all_of() {
-        let json = serde_json::json!({
-            "conditionGroup": {
-                "allOf": [
-                    {"ownerOnly": true},
-                    {"timeRange": {"start": "00:00", "end": "23:59"}}
-                ]
-            }
+    fn normalize_native_single_condition_and_groups() {
+        let condition = serde_json::json!({
+            "conditionType": "TimeRangeCondition",
+            "params": {"start": "09:00", "end": "18:00"}
         });
-        let group = normalize_condition_json(&json).expect("Java conditionGroup must normalize");
-        match group {
-            ConditionGroup::AllOf(conds) => {
-                assert_eq!(conds.len(), 2);
-                assert_eq!(conds[0].condition_type, "OwnerOnlyCondition");
-                assert_eq!(conds[1].condition_type, "TimeRangeCondition");
+        let native_case_alias = serde_json::json!({
+            "conditionType": "TimeRangeCondition",
+            "params": {"start": "09:00", "end": "18:00", "timeZone": "+08:00"}
+        });
+        assert!(normalize_condition_json(&native_case_alias).is_none());
+
+        match normalize_condition_json(&condition).expect("native condition must normalize") {
+            ConditionGroup::AllOf(conditions) => {
+                assert_eq!(conditions.len(), 1);
+                assert_eq!(conditions[0].condition_type, "TimeRangeCondition");
+                assert_eq!(conditions[0].params["start"], "09:00");
+                assert_eq!(conditions[0].params["end"], "18:00");
             }
-            _ => panic!("expected AllOf"),
+            _ => panic!("single condition must normalize to AllOf"),
+        }
+
+        let all_of = serde_json::json!({"allOf": [condition.clone(), condition.clone()]});
+        assert!(matches!(
+            normalize_condition_json(&all_of),
+            Some(ConditionGroup::AllOf(conditions)) if conditions.len() == 2
+        ));
+
+        let any_of = serde_json::json!({"anyOf": [condition.clone(), condition.clone()]});
+        assert!(matches!(
+            normalize_condition_json(&any_of),
+            Some(ConditionGroup::AnyOf(conditions)) if conditions.len() == 2
+        ));
+
+        let not = serde_json::json!({"not": condition});
+        assert!(matches!(
+            normalize_condition_json(&not),
+            Some(ConditionGroup::Not(_))
+        ));
+    }
+
+    #[test]
+    fn normalize_rejects_legacy_aliases_wrappers_and_mixed_forms() {
+        for retired in [
+            serde_json::json!({"condition_type": "OwnerOnlyCondition", "params": {}}),
+            serde_json::json!({"conditionGroup": {"allOf": []}}),
+            serde_json::json!({"ownerOnly": true}),
+            serde_json::json!({"timeRange": {"start": "09:00", "end": "18:00"}}),
+            serde_json::json!({"conditionType": "ownerOnly", "params": {}}),
+            serde_json::json!({"conditionType": "UnknownCondition", "params": {}}),
+            serde_json::json!({
+                "conditionType": "TimeRangeCondition",
+                "params": {"start": "09:00", "end": "18:00", "timeZone": "+08:00"}
+            }),
+            serde_json::json!({
+                "conditionType": "OwnerOnlyCondition",
+                "params": {},
+                "ownerOnly": true
+            }),
+            serde_json::json!({
+                "allOf": [{"conditionType": "OwnerOnlyCondition", "params": {}}],
+                "anyOf": [{"conditionType": "OwnerOnlyCondition", "params": {}}]
+            }),
+        ] {
+            assert!(
+                normalize_condition_json(&retired).is_none(),
+                "retired or mixed form accepted: {retired}"
+            );
         }
     }
 
     #[test]
-    fn normalize_java_ip_range_cidr() {
-        let json = serde_json::json!({"ipRange": ["10.0.0.0/8", "1.2.3.4"]});
-        let group = normalize_condition_json(&json).expect("Java ipRange must normalize");
-        match group {
-            ConditionGroup::AllOf(conds) => {
-                assert_eq!(conds[0].condition_type, "IpRangeCondition");
-                assert_eq!(conds[0].params["ranges"][0], "10.0.0.0/8");
-            }
-            _ => panic!("expected AllOf"),
+    fn normalize_rejects_invalid_legacy_and_unknown_conditions_inside_not() {
+        for invalid in [
+            serde_json::json!({"not": {"ownerOnly": true}}),
+            serde_json::json!({
+                "not": {"condition_type": "OwnerOnlyCondition", "params": {}}
+            }),
+            serde_json::json!({"not": {"conditionType": "ownerOnly", "params": {}}}),
+            serde_json::json!({"not": {"conditionType": "UnknownCondition", "params": {}}}),
+            serde_json::json!({
+                "not": {
+                    "conditionType": "OwnerOnlyCondition",
+                    "params": {},
+                    "ownerOnly": true
+                }
+            }),
+            serde_json::json!({
+                "not": {
+                    "conditionType": "BelongsToTenantCondition",
+                    "params": {"java_semantics": true}
+                }
+            }),
+        ] {
+            assert!(
+                normalize_condition_json(&invalid).is_none(),
+                "invalid negated condition accepted: {invalid}"
+            );
         }
     }
 
     #[test]
-    fn normalize_known_and_unknown_top_level_keys_is_none() {
+    fn normalize_rejects_unknown_condition_types_and_empty_groups() {
         assert!(normalize_condition_json(&serde_json::json!({
-            "timeRange": {"start": "09:00", "end": "18:00"},
-            "unknownCondition": true
-        }))
-        .is_none());
-    }
-
-    #[test]
-    fn normalize_condition_group_unknown_key_is_none() {
-        assert!(normalize_condition_json(&serde_json::json!({
-            "conditionGroup": {
-                "allOf": [{"ownerOnly": true}],
-                "unknownGroupKey": []
-            }
-        }))
-        .is_none());
-    }
-
-    #[test]
-    fn normalize_nested_condition_group_is_none() {
-        assert!(normalize_condition_json(&serde_json::json!({
-            "conditionGroup": {
-                "allOf": [
-                    {"conditionGroup": {"allOf": [{"ownerOnly": true}]}}
-                ]
-            }
-        }))
-        .is_none());
-    }
-
-    #[test]
-    fn normalize_empty_condition_groups_is_none() {
-        assert!(normalize_condition_json(&serde_json::json!({
-            "conditionGroup": {"allOf": []}
+            "conditionType": "UnknownCondition",
+            "params": {}
         }))
         .is_none());
         assert!(normalize_condition_json(&serde_json::json!({"allOf": []})).is_none());
+        assert!(normalize_condition_json(&serde_json::json!({"anyOf": []})).is_none());
     }
 
     #[tokio::test]
@@ -1418,94 +1231,51 @@ mod tests {
         assert!(!ip_matches_cidr("not-an-ip", "10.0.0.0", 8));
     }
 
-    // ===== Java 语义 scope / belongsToTenant =====
+    // ===== Native scope / tenant semantics =====
 
     #[tokio::test]
-    async fn java_scope_self_requires_user_id() {
+    async fn native_scope_uses_registered_action_codes() {
         let evaluator = ScopeCondition;
-        let cond = Condition {
+        let condition = Condition {
             condition_type: "ScopeCondition".into(),
-            params: serde_json::json!({ "java_scope": "SELF" }),
-        };
-        let with_user = PolicyContext::builder()
-            .user_id(Some(1))
-            .action("read".into())
-            .build();
-        assert!(evaluator.evaluate(&cond, &with_user).await.unwrap());
-        let no_user = PolicyContext::builder().action("read".into()).build();
-        assert!(!evaluator.evaluate(&cond, &no_user).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn java_scope_tenant_requires_tenant_id() {
-        let evaluator = ScopeCondition;
-        let cond = Condition {
-            condition_type: "ScopeCondition".into(),
-            params: serde_json::json!({ "java_scope": "TENANT" }),
-        };
-        let with_tenant = PolicyContext::builder()
-            .tenant_id(Some(9))
-            .action("read".into())
-            .build();
-        assert!(evaluator.evaluate(&cond, &with_tenant).await.unwrap());
-        let no_tenant = PolicyContext::builder().action("read".into()).build();
-        assert!(!evaluator.evaluate(&cond, &no_tenant).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn java_scope_unknown_value_denies() {
-        let evaluator = ScopeCondition;
-        let cond = Condition {
-            condition_type: "ScopeCondition".into(),
-            params: serde_json::json!({ "java_scope": "ORG" }),
+            params: serde_json::json!({ "required_scopes": ["learn:read"] }),
         };
         let ctx = PolicyContext::builder()
             .user_id(Some(1))
-            .tenant_id(Some(9))
             .action("read".into())
+            .action_codes(vec!["learn:read".into()])
             .build();
-        assert!(!evaluator.evaluate(&cond, &ctx).await.unwrap());
+        assert!(evaluator.evaluate(&condition, &ctx).await.unwrap());
     }
 
     #[tokio::test]
-    async fn java_belongs_to_tenant_requires_tenant_id() {
-        let evaluator = BelongsToTenantCondition;
-        let cond = Condition {
-            condition_type: "BelongsToTenantCondition".into(),
-            params: serde_json::json!({ "java_semantics": true }),
-        };
-        let with_tenant = PolicyContext::builder()
-            .tenant_id(Some(9))
-            .action("read".into())
-            .build();
-        assert!(evaluator.evaluate(&cond, &with_tenant).await.unwrap());
-        let no_tenant = PolicyContext::builder().action("read".into()).build();
-        assert!(!evaluator.evaluate(&cond, &no_tenant).await.unwrap());
-    }
+    async fn retired_parameters_do_not_bypass_native_checks() {
+        let scope = ScopeCondition
+            .evaluate(
+                &Condition {
+                    condition_type: "ScopeCondition".into(),
+                    params: serde_json::json!({ "java_scope": "SELF" }),
+                },
+                &PolicyContext::builder()
+                    .user_id(Some(1))
+                    .action("read".into())
+                    .build(),
+            )
+            .await;
+        assert!(scope.is_err());
 
-    #[test]
-    fn normalize_java_scope_emits_java_semantics() {
-        let json = serde_json::json!({"scope": "SELF"});
-        let group = normalize_condition_json(&json).expect("scope must normalize");
-        match group {
-            ConditionGroup::AllOf(conds) => {
-                assert_eq!(conds[0].condition_type, "ScopeCondition");
-                assert_eq!(conds[0].params["java_scope"], "SELF");
-            }
-            _ => panic!("expected AllOf"),
-        }
-    }
-
-    #[test]
-    fn normalize_java_belongs_to_tenant_emits_java_semantics() {
-        let json = serde_json::json!({"belongsToTenant": true});
-        let group = normalize_condition_json(&json).expect("belongsToTenant must normalize");
-        match group {
-            ConditionGroup::AllOf(conds) => {
-                assert_eq!(conds[0].condition_type, "BelongsToTenantCondition");
-                assert_eq!(conds[0].params["java_semantics"], true);
-            }
-            _ => panic!("expected AllOf"),
-        }
+        let tenant = BelongsToTenantCondition
+            .evaluate(
+                &Condition {
+                    condition_type: "BelongsToTenantCondition".into(),
+                    params: serde_json::json!({ "java_semantics": true }),
+                },
+                &PolicyContext::builder()
+                    .tenant_id(Some(9))
+                    .action("read".into())
+                    .build(),
+            )
+            .await;
+        assert!(tenant.is_err());
     }
 }

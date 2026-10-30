@@ -34,10 +34,10 @@ pub(crate) fn clamp_backoff(secs: i64) -> i64 {
     secs.clamp(1, BACKOFF_CAP_SECS.min(MAX_BACKOFF_SECONDS))
 }
 
-/// Bounded exponential backoff for an event whose attempts counter reached
-/// `n` (first failure n=1 → 1s, doubling). Attempt exhaustion switches to the
-/// maximal backoff instead of looping hot. Primitive schedule used ONLY by
-/// [`plan_retry_schedule`] (plus its tests) — never by handlers directly.
+/// Bounded exponential backoff for an event whose owned execution failure
+/// counter reached `n` (first failure n=1 → 1s, doubling). Exhaustion switches
+/// to the maximal backoff instead of looping hot. Primitive schedule used ONLY
+/// by [`plan_retry_schedule`] (plus its tests) — never by handlers directly.
 pub(crate) fn event_backoff_secs(attempts: i64) -> i64 {
     let floor = if attempts < 1 { 1 } else { attempts };
     if floor >= MAX_EVENT_ATTEMPTS {
@@ -52,8 +52,8 @@ pub(crate) fn event_backoff_secs(attempts: i64) -> i64 {
 /// Disposition of the unified attempt-budget policy for one failing path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetrySchedule {
-    /// Within budget: keep the row PENDING and schedule the next attempt after
-    /// this bounded backoff.
+    /// Within budget: keep the row PENDING and schedule the next execution
+    /// episode after this bounded backoff.
     Continue { backoff_secs: i64 },
     /// Budget exhausted (`current_attempts >= MAX_EVENT_ATTEMPTS`): the event
     /// stays PENDING under the maximal `BACKOFF_CAP_SECS` backoff, carrying the
@@ -66,12 +66,11 @@ pub(crate) enum RetrySchedule {
 /// THE single retry/backoff policy for every non-publish-success failure path
 /// (`Retry`, `Blocked`, `PointerMoved`, `GenericRetry`, infra failures).
 ///
-/// `attempts_current` MUST be the durable CURRENT row value — the post-install
-/// counter surfaced by the claim readback / strict re-read; pre-increment views
-/// are forbidden here because they would overpay one extra short backoff step.
-/// `minimum_backoff_secs` lets conservative paths (immutable divergence)
-/// request a longer cool-down; it can never exceed the clamp and it can never
-/// rescue an exhausted budget.
+/// `attempts_current` MUST be the durable owned execution-failure count
+/// associated with the live capability; the DB adapter separately determines
+/// whether this episode itself has a proven execution failure. Queue claim
+/// attempts are not substituted here. `minimum_backoff_secs` lets conservative
+/// paths request a longer cool-down; it cannot rescue an exhausted budget.
 pub(crate) fn plan_retry_schedule(
     attempts_current: i64,
     minimum_backoff_secs: i64,
@@ -138,10 +137,10 @@ pub struct WorkerRunSummary {
     /// Number of publish races replanned in-place while retaining the live
     /// lease. This is distinct from claim attempts and ordinary retries.
     pub events_pointer_moved_replanned: u64,
-    /// Events whose failure ran into the attempt budget. Orthogonal to the
-    /// causal counters above: a blocked event can ALSO hit the budget, in which
-    /// case both counters advance. Exhausted events stay PENDING with the
-    /// maximal backoff + stable `last_error` marker (no fake terminal state).
+    /// Events whose proven owned execution failure ran into the attempt budget.
+    /// Orthogonal to the causal counters above: a blocked event can ALSO hit the
+    /// budget, in which case both counters advance. Exhausted events stay PENDING
+    /// with maximal backoff + stable `last_error` marker (no fake terminal state).
     pub events_budget_exhausted: u64,
     /// Terminal quarantine writes whose durable outcome could NOT be proven
     /// (lease CAS loss / query failure). UNKNOWN by definition: no further
@@ -150,9 +149,9 @@ pub struct WorkerRunSummary {
     /// Total wall time spent in the pure decide/compile phase across events.
     pub decide_phase_micros: u64,
     /// Events whose processing exceeded
-    /// [`AuthorizationProjectorConfig::event_deadline`]. Worker-owned episodes
-    /// remain UNKNOWN without a follow-up mutation; legacy processing retains
-    /// its bounded best-effort release. Orthogonal to the causal counters above.
+    /// [`AuthorizationProjectorConfig::event_deadline`]. WorkerOwned episodes
+    /// remain UNKNOWN without follow-up mutation; reconciliation owns recovery.
+    /// Orthogonal to the causal counters above.
     pub events_deadline_exceeded: u64,
 }
 
@@ -451,10 +450,11 @@ async fn supervisor_backlog_exists(
     false
 }
 
-/// 监督循环（F5 修复 1d）：worker 退出/panic → error 日志 + 退避重启（每代
-/// 新 run_id/owner，租约天然隔离，旧 120s 租约到期后被新代 reclaim）；连续
-/// `watchdog_stall_threshold` 无进展且 runtime 报告有可 claim 积压 → 看门狗
-/// 强制重建当前代。shutdown 取消 → 取消当前代并在有界宽限内聚合返回。
+/// 监督循环（F5 修复 1d）：worker 退出/panic → error 日志 + 退避重启，每代
+/// 分配新 owner；连续 `watchdog_stall_threshold` 无进展且 runtime 报告有可 claim
+/// 积压 → 看门狗重建当前代。旧 owner 不直接 reclaim lane；exact WorkerOwned
+/// claim 对 active slot、事件绑定和发布证据完成对账后，才可能以新 epoch/token 接管。
+/// shutdown 取消 → 取消当前代并在有界宽限内聚合返回。
 async fn supervise_projector(
     runtime: Arc<dyn AuthorizationProjectorRuntime>,
     config: AuthorizationProjectorConfig,
@@ -529,8 +529,9 @@ async fn supervise_projector(
                         );
                         health.record_restart();
                         child_cancel.cancel();
-                        // 卡死的子任务无法被 join 收回：有界等待后弃置；其
-                        // 租约到期后由新代 reclaim，绝不产生重复发布。
+                        // 卡死的子任务无法被 join 收回：有界等待后弃置；新代不会
+                        // 盲目 replay。exact WorkerOwned claim 对账 active slot 与发布证据，
+                        // 仅证明安全后才以新的 epoch/token 接管。
                         let _ = tokio::time::timeout(Duration::from_secs(1), &mut child).await;
                         break;
                     }
@@ -576,8 +577,9 @@ async fn supervise_projector(
 /// Partitioned supervision loop (multi-tenant redesign Phase 1): mirrors the
 /// F5 supervisor contract (panic/exit restart, stall + backlog watchdog,
 /// generation rebuild, bounded shutdown grace) across `config.worker_count`
-/// parallel partition workers. Every child owns its lease identity; a stalled
-/// child's partitions are reclaimed by lease expiry, never by double publish.
+/// parallel partition workers. Each child routes claims through the shared
+/// WorkerOwned lane protocol; a stalled child does not grant the supervisor
+/// authority to bypass exact-event reconciliation or its epoch/token fence.
 async fn supervise_partition_projector(
     runtime: Arc<dyn AuthorizationProjectorRuntime>,
     config: AuthorizationProjectorConfig,
@@ -668,8 +670,8 @@ async fn supervise_partition_projector(
                         );
                         health.record_restart();
                         child_cancel.cancel();
-                        // 卡死的子任务无法被 join 收回：有界等待后弃置；其
-                        // 事件/分区租约到期后由新代 reclaim，绝不产生重复发布。
+                        // 卡死的子任务无法被 join 收回：有界等待后弃置；新代仅
+                        // 经 exact WorkerOwned claim 对账后，凭新的 epoch/token 接管。
                         for child in children.iter_mut() {
                             let _ = tokio::time::timeout(Duration::from_secs(1), child).await;
                         }
@@ -714,12 +716,10 @@ async fn supervise_partition_projector(
     }
 }
 
-/// One partition worker (partitioned scheduling mode). Per round: discover
-/// claimable partitions inside the tenant allowlist, acquire each partition's
-/// exclusive lease (Busy -> skip, never wait), drain up to
-/// [`MAX_EVENTS_PER_PARTITION_PER_BATCH`] events with a lease heartbeat before
-/// every claim, then release. The per-event processing path
-/// ([`process_one_event`]) is byte-identical to TenantSerial mode.
+/// One partition worker (partitioned scheduling mode). Discovery selects
+/// aggregates inside the tenant allowlist. Each event claim atomically acquires
+/// the WorkerOwned aggregate lane, so topology never adds a second lease
+/// protocol. Event processing is shared with TenantSerial mode.
 pub(crate) async fn run_partition_worker(
     runtime: Arc<dyn AuthorizationProjectorRuntime>,
     config: AuthorizationProjectorConfig,
@@ -734,7 +734,6 @@ pub(crate) async fn run_partition_worker(
         tenants = ?config.tenants,
         poll_interval_secs = config.poll_interval_secs,
         claim_lease_seconds = config.claim_lease_seconds,
-        partition_lease_secs = PARTITION_LEASE_SECS,
         "authorization partition worker loop started"
     );
     loop {
@@ -766,46 +765,11 @@ pub(crate) async fn run_partition_worker(
             if cancellation.is_cancelled() {
                 break;
             }
-            // 2) 分区租约：拿到才认领；Busy（他人持有）直接跳过，不等待。
-            let handle = if runtime.worker_owned_execution() {
-                None
-            } else {
-                match runtime
-                    .acquire_partition_lease(&candidate, &lease_owner, PARTITION_LEASE_SECS)
-                    .await
-                {
-                    Ok(Some(handle)) => Some(handle),
-                    Ok(None) => continue,
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            aggregate_type = %candidate.aggregate_type,
-                            aggregate_id = candidate.aggregate_id,
-                            "partition lease acquire failed; skipping partition"
-                        );
-                        continue;
-                    }
-                }
-            };
-            // 3) 批内逐事件：续租（排他心跳）→ 分区认领 → 与 TenantSerial
-            //    完全相同的单事件处理路径。租约丢失立即弃置该分区。
+            // Every claim acquires WorkerOwned lane ownership atomically;
+            // Partitioned changes discovery only, not execution ownership.
             for _ in 0..MAX_EVENTS_PER_PARTITION_PER_BATCH {
                 if cancellation.is_cancelled() {
                     break;
-                }
-                if let Some(handle) = handle.as_ref() {
-                    if let Err(error) = runtime
-                        .renew_partition_lease(handle, PARTITION_LEASE_SECS)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %error,
-                            aggregate_type = %candidate.aggregate_type,
-                            aggregate_id = candidate.aggregate_id,
-                            "partition lease lost mid-batch; abandoning partition"
-                        );
-                        break;
-                    }
                 }
                 let claim_started = Instant::now();
                 let scope = DeltaEventClaimScope {
@@ -874,23 +838,14 @@ pub(crate) async fn run_partition_worker(
                         event_id = %claimed.event_id,
                         operation_id = %claimed.operation_id,
                         deadline_secs = config.event_deadline.as_secs(),
-                        "delta event processing deadline exceeded; lease left to expire-reclaim"
+                        "delta event deadline exceeded; WorkerOwned capability retained for reconciliation"
                     );
                 }
                 // F5 修复 1d 看门狗：事件处理完成（无论结果）即进展。
                 progress.touch();
             }
-            // 4) 尽力释放；崩溃路径由租约到期 reclaim 兜底（释放失败不是错误）。
-            if let Some(handle) = handle.as_ref() {
-                if let Err(error) = runtime.release_partition_lease(handle).await {
-                    tracing::warn!(
-                        error = %error,
-                        aggregate_type = %candidate.aggregate_type,
-                        aggregate_id = candidate.aggregate_id,
-                        "partition lease release failed; expiry will reclaim"
-                    );
-                }
-            }
+            // No partition-specific lease is held. Individual lane leases
+            // remain owned until a proof-bearing transition or reconciliation.
         }
     }
 }
@@ -995,7 +950,7 @@ async fn run_worker(
                         event_id = %claimed.event_id,
                         operation_id = %claimed.operation_id,
                         deadline_secs = config.event_deadline.as_secs(),
-                        "delta event processing deadline exceeded; lease left to expire-reclaim"
+                        "delta event deadline exceeded; WorkerOwned capability retained for reconciliation"
                     );
                     // A cancelled COMMIT may already be durable. Do not release
                     // or replay here; recovery must reconcile the exact event,
@@ -1104,11 +1059,11 @@ pub(crate) async fn process_one_event(
     record_projector_phase(ProjectorPhase::Readback, readback_started.elapsed());
 
     if cancellation.is_cancelled() {
-        // Leave the short lease to expire server-side rather than racing a
-        // mutation during shutdown (UNKNOWN avoidance beats busywork).
+        // Retain the owned capability for exact reconciliation rather than
+        // racing a mutation during shutdown (UNKNOWN avoidance beats busywork).
         #[cfg(feature = "e3-observability")]
         log_e3_attempt_event(
-            "lease_left_to_expire",
+            "owned_capability_retained",
             claimed,
             "shutdown_after_claim",
             false,
@@ -1181,7 +1136,7 @@ pub(crate) async fn process_verified_claim(
             // mutation during shutdown (UNKNOWN avoidance beats busywork).
             #[cfg(feature = "e3-observability")]
             log_e3_attempt_event(
-                "lease_left_to_expire",
+                "owned_capability_retained",
                 claimed,
                 "shutdown_before_attempt",
                 false,
@@ -1275,7 +1230,7 @@ pub(crate) async fn process_verified_claim(
         if cancellation.is_cancelled() {
             #[cfg(feature = "e3-observability")]
             log_e3_attempt_event(
-                "lease_left_to_expire",
+                "owned_capability_retained",
                 claimed,
                 "shutdown_after_planning",
                 false,
@@ -1319,13 +1274,13 @@ pub(crate) async fn process_verified_claim(
                 reason = %reason,
                 "pointer-moved replan allowance exhausted; entering ordinary retry budget"
             );
-            fail_with_budget(
+            super::owned_worker::schedule_owned_retry(
                 runtime,
                 &delta_lease_identity,
-                claimed,
-                DispositionKind::ReleasedRetry,
                 0,
                 &reason,
+                true,
+                DispositionKind::ReleasedRetry,
                 summary,
             )
             .await;
@@ -1481,8 +1436,8 @@ pub(crate) async fn quarantine_event_terminal(
                 attempts = claimed.attempts,
                 elapsed_us = started.elapsed().as_micros() as u64,
                 error = %query_failure,
-                "quarantine query failed; result UNKNOWN, the live lease \
-                 expires server-side and self-heals"
+                "quarantine query failed; result UNKNOWN, retain the owned capability \
+                 until exact reconciliation proves a terminal or takeover outcome"
             );
         }
     }
@@ -1491,15 +1446,15 @@ pub(crate) async fn quarantine_event_terminal(
 /// THE single funnel every failing-but-retryable path flows through
 /// (`Retry`, `Blocked`, `PointerMoved`, `GenericRetry` and infra failures).
 ///
-/// - Reads the durable CURRENT attempts (post-install claim value), never a
-///   pre-increment counter.
+/// - Reads the durable owned execution-failure count for the live capability;
+///   claim attempts are never used as a substitute.
 /// - Plans the backoff exclusively via [`plan_retry_schedule`]; exhausted
 ///   budgets produce PENDING + maximal cap backoff + the stable exhaustion
 ///   marker instead of any fake terminal state.
 /// - Records the causal summary kind exactly once, advancing the orthogonal
 ///   budget-exhausted counter when applicable.
-/// - Issues EXACTLY ONE `fail_delta_event` mutation. LeaseLost/UNKNOWN paths
-///   never enter this funnel at all, so they stay zero-write by construction.
+/// - Issues EXACTLY ONE proof-bearing WorkerOwned transition. LeaseLost/UNKNOWN
+///   paths never enter this funnel again, so they stay zero-follow-up-write by construction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fail_with_budget(
     runtime: &Arc<dyn AuthorizationProjectorRuntime>,
@@ -1510,64 +1465,17 @@ pub(crate) async fn fail_with_budget(
     reason: &str,
     summary: &mut WorkerRunSummary,
 ) {
-    if runtime.worker_owned_execution() {
-        super::owned_worker::schedule_owned_retry(
-            runtime,
-            identity,
-            minimum_backoff_secs,
-            reason,
-            false,
-            kind_for_summary,
-            summary,
-        )
-        .await;
-        return;
-    }
-    let schedule = plan_retry_schedule(claimed.attempts, minimum_backoff_secs);
-    summary.record(kind_for_summary);
-    match schedule {
-        RetrySchedule::Continue { backoff_secs } => {
-            #[cfg(feature = "e3-observability")]
-            log_e3_attempt_event(
-                "retry_scheduled",
-                claimed,
-                "pending",
-                false,
-                Some(backoff_secs),
-            );
-            tracing::debug!(
-                event_id = %claimed.event_id,
-                attempts = claimed.attempts,
-                backoff_secs,
-                "unified retry budget scheduled the next attempt"
-            );
-            runtime.fail_event(identity, backoff_secs, reason).await;
-        }
-        RetrySchedule::AttemptBudgetExhausted { backoff_secs } => {
-            summary.events_budget_exhausted += 1;
-            record_projector_event(ProjectorEventOutcome::BudgetExhausted);
-            #[cfg(feature = "e3-observability")]
-            log_e3_attempt_event(
-                "retry_budget_exhausted",
-                claimed,
-                "pending",
-                false,
-                Some(backoff_secs),
-            );
-            let marked_error = budget_exhausted_error(reason, claimed.attempts);
-            tracing::warn!(
-                event_id = %claimed.event_id,
-                attempts = claimed.attempts,
-                backoff_secs,
-                marked_error = %marked_error,
-                "attempt budget exhausted; holding PENDING under the maximal \
-                 backoff until a real terminal state exists (never faked)"
-            );
-            runtime
-                .fail_event(identity, backoff_secs, &marked_error)
-                .await;
-        }
-    }
+    let _ = claimed; // Queue claim attempts do not substitute for owned execution accounting.
+    super::owned_worker::schedule_owned_retry(
+        runtime,
+        identity,
+        minimum_backoff_secs,
+        reason,
+        false,
+        kind_for_summary,
+        summary,
+    )
+    .await;
 }
 
 /// Shared execution context for one cycle; groups collaborators so handlers
@@ -1598,30 +1506,33 @@ async fn act_on_disposition(
             command.delta_lease_identity.lease_owner = claimed.lease_owner.clone();
             command.manifest_lease_owner = ctx.lease_owner.to_owned();
             command.manifest_lease_seconds = config.manifest_lease_seconds;
-            if runtime.worker_owned_execution() {
-                let failures = runtime.event_execution_failures(delta_lease_identity);
-                if failures.is_none() {
-                    summary.events_publication_unknown += 1;
-                    return None;
-                }
-                if i64::from(failures.unwrap_or(u32::MAX)) >= MAX_EVENT_ATTEMPTS {
-                    fail_with_budget(
-                        runtime,
-                        delta_lease_identity,
-                        claimed,
-                        DispositionKind::ReleasedRetry,
-                        BACKOFF_CAP_SECS,
-                        "code=auth_projector.execution_failure_budget_exhausted",
-                        summary,
-                    )
-                    .await;
-                    return None;
-                }
-                if let Err(error) = runtime.begin_event_execution(delta_lease_identity).await {
-                    summary.events_publication_unknown += 1;
-                    tracing::warn!(event_id = %claimed.event_id, %error, "begin execution not proven; no publication or release");
-                    return None;
-                }
+            let Some(failures) = runtime.event_execution_failures(delta_lease_identity) else {
+                summary.events_publication_unknown += 1;
+                record_projector_event(ProjectorEventOutcome::PublicationUnknown);
+                tracing::warn!(
+                    event_id = %claimed.event_id,
+                    "owned execution accounting unavailable; no publication or transition"
+                );
+                return None;
+            };
+            if i64::from(failures) >= MAX_EVENT_ATTEMPTS {
+                fail_with_budget(
+                    runtime,
+                    delta_lease_identity,
+                    claimed,
+                    DispositionKind::ReleasedRetry,
+                    BACKOFF_CAP_SECS,
+                    "code=auth_projector.execution_failure_budget_exhausted",
+                    summary,
+                )
+                .await;
+                return None;
+            }
+            if let Err(error) = runtime.begin_event_execution(delta_lease_identity).await {
+                summary.events_publication_unknown += 1;
+                record_projector_event(ProjectorEventOutcome::PublicationUnknown);
+                tracing::warn!(event_id = %claimed.event_id, %error, "begin owned execution not proven; no publication or follow-up transition");
+                return None;
             }
             let publish_started = Instant::now();
             match runtime.execute_projection_publish(&command).await {
@@ -1823,29 +1734,16 @@ async fn act_on_disposition(
                                 reason = %reason,
                                 "publish failed generically; scheduling retry"
                             );
-                            if runtime.worker_owned_execution() {
-                                super::owned_worker::schedule_owned_retry(
-                                    runtime,
-                                    delta_lease_identity,
-                                    0,
-                                    &reason,
-                                    true,
-                                    DispositionKind::ReleasedRetry,
-                                    summary,
-                                )
-                                .await;
-                            } else {
-                                fail_with_budget(
-                                    runtime,
-                                    delta_lease_identity,
-                                    claimed,
-                                    DispositionKind::ReleasedRetry,
-                                    0,
-                                    &reason,
-                                    summary,
-                                )
-                                .await;
-                            }
+                            super::owned_worker::schedule_owned_retry(
+                                runtime,
+                                delta_lease_identity,
+                                0,
+                                &reason,
+                                true,
+                                DispositionKind::ReleasedRetry,
+                                summary,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1913,26 +1811,21 @@ async fn act_on_disposition(
                 reason = %reason,
                 "delta event superseded by newer projection chain; releasing"
             );
-            if runtime.worker_owned_execution() {
-                match runtime.owned_release_transition(delta_lease_identity).await {
-                    OwnedTransitionProof::Applied => {
-                        summary.record(DispositionKind::SupersededRelease);
-                    }
-                    OwnedTransitionProof::LeaseLost => {
-                        summary.record(DispositionKind::LeaseLost);
-                    }
-                    OwnedTransitionProof::Unknown => {
-                        summary.events_publication_unknown += 1;
-                        record_projector_event(ProjectorEventOutcome::PublicationUnknown);
-                        tracing::warn!(
-                            event_id = %claimed.event_id,
-                            "owned superseded release unknown; no success disposition recorded"
-                        );
-                    }
+            match runtime.owned_release_transition(delta_lease_identity).await {
+                OwnedTransitionProof::Applied => {
+                    summary.record(DispositionKind::SupersededRelease);
                 }
-            } else {
-                summary.record(DispositionKind::SupersededRelease);
-                runtime.release_event(delta_lease_identity).await;
+                OwnedTransitionProof::LeaseLost => {
+                    summary.record(DispositionKind::LeaseLost);
+                }
+                OwnedTransitionProof::Unknown => {
+                    summary.events_publication_unknown += 1;
+                    record_projector_event(ProjectorEventOutcome::PublicationUnknown);
+                    tracing::warn!(
+                        event_id = %claimed.event_id,
+                        "owned superseded transition unknown; no success disposition recorded"
+                    );
+                }
             }
         }
     }

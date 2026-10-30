@@ -151,7 +151,7 @@ async fn run_collector(state: AppState, mut stop: watch::Receiver<bool>) -> Resu
                 run_probe_and_evaluate(&state, &mut dispatch_tasks, &mut dispatch_failed).await;
             }
             _ = slow.tick() => {
-                run_system_and_redis(&state).await;
+                run_system_collection(&state).await;
                 maybe_cleanup(&state).await;
             }
         }
@@ -266,11 +266,9 @@ async fn spawn_bounded_dispatch<F>(
     dispatch_tasks.spawn(future);
 }
 
-async fn run_system_and_redis(state: &AppState) {
+async fn run_system_collection(state: &AppState) {
     let cycle_start = Instant::now();
     collect_system(state).await;
-    #[cfg(feature = "redis-compat")]
-    collect_redis(state).await;
     metrics::histogram!("astral_monitor_collect_cycle_seconds", "kind" => "system")
         .record(cycle_start.elapsed().as_secs_f64());
 }
@@ -384,109 +382,6 @@ async fn collect_system(state: &AppState) {
     {
         tracing::warn!(error = %error, "system metric collection failed");
     }
-}
-
-/// 采集 Redis 指标（INFO memory/stats/clients + DBSIZE；仅 redis-compat feature
-/// 编译）。**runtime 门**：feature 已编译但部署未显式启用 compat（旗标关闭或
-/// URL 为空）时不做任何 Redis 网络尝试——compat-on build + env off 仍零网络。
-#[cfg(feature = "redis-compat")]
-async fn collect_redis(state: &AppState) {
-    if !state.config.redis_projection_compat_enabled || state.config.redis_url.trim().is_empty() {
-        return;
-    }
-    let redis_url = state.config.redis_url.clone();
-    let client = match redis::Client::open(redis_url.as_str()) {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::warn!(error = %error, "redis metric collection skipped: open client failed");
-            return;
-        }
-    };
-    let mut conn = match client.get_connection_manager().await {
-        Ok(conn) => conn,
-        Err(error) => {
-            tracing::warn!(error = %error, "redis metric collection skipped: connect failed");
-            return;
-        }
-    };
-
-    let memory_info: Result<String, _> = redis::cmd("INFO")
-        .arg("memory")
-        .query_async(&mut conn)
-        .await;
-    let stats_info: Result<String, _> =
-        redis::cmd("INFO").arg("stats").query_async(&mut conn).await;
-    let clients_info: Result<String, _> = redis::cmd("INFO")
-        .arg("clients")
-        .query_async(&mut conn)
-        .await;
-    let db_size: Result<i64, _> = redis::cmd("DBSIZE").query_async(&mut conn).await;
-
-    let memory_info = match memory_info {
-        Ok(info) => info,
-        Err(error) => {
-            tracing::warn!(error = %error, "redis INFO memory failed");
-            return;
-        }
-    };
-    let stats_info = match stats_info {
-        Ok(info) => info,
-        Err(error) => {
-            tracing::warn!(error = %error, "redis INFO stats failed");
-            return;
-        }
-    };
-    let clients_info = match clients_info {
-        Ok(info) => info,
-        Err(error) => {
-            tracing::warn!(error = %error, "redis INFO clients failed");
-            return;
-        }
-    };
-    let key_count = db_size.unwrap_or(0);
-
-    let used_memory = parse_info_field(&memory_info, "used_memory").unwrap_or(0);
-    let max_memory = parse_info_field(&memory_info, "maxmemory").unwrap_or(0);
-    let hits = parse_info_field(&stats_info, "keyspace_hits").unwrap_or(0);
-    let misses = parse_info_field(&stats_info, "keyspace_misses").unwrap_or(0);
-    let connected_clients = parse_info_field(&clients_info, "connected_clients").unwrap_or(0);
-
-    let hit_rate = if hits + misses > 0 {
-        hits as f64 * 100.0 / (hits + misses) as f64
-    } else {
-        0.0
-    };
-    let used_memory_mb = used_memory as f64 / (1024.0 * 1024.0);
-    // Java 默认回退 2GB（maxmemory=0 时）。
-    let max_memory_effective = if max_memory > 0 {
-        max_memory
-    } else {
-        2_147_483_648
-    };
-    let max_memory_mb = max_memory_effective as f64 / (1024.0 * 1024.0);
-
-    if let Err(error) = state
-        .monitor_service
-        .collect_redis_metrics(
-            hit_rate,
-            connected_clients,
-            used_memory_mb,
-            max_memory_mb,
-            key_count,
-        )
-        .await
-    {
-        tracing::warn!(error = %error, "redis metric persistence failed");
-    }
-}
-
-/// 解析 `INFO` 输出中的 `key:value` 字段（整数值）。
-#[cfg(feature = "redis-compat")]
-fn parse_info_field(info: &str, key: &str) -> Option<i64> {
-    info.lines()
-        .find_map(|line| line.strip_prefix(&format!("{key}:")))
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value >= 0)
 }
 
 #[cfg(test)]

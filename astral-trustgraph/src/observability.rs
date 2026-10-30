@@ -236,7 +236,6 @@ pub(crate) enum SyncPublishMetricOutcome {
     Delegated,
     Failed,
     SkippedEmpty,
-    SkippedImpactThreshold,
 }
 
 impl SyncPublishMetricOutcome {
@@ -246,7 +245,6 @@ impl SyncPublishMetricOutcome {
             Self::Delegated => "delegated",
             Self::Failed => "failed",
             Self::SkippedEmpty => "skipped_empty",
-            Self::SkippedImpactThreshold => "skipped_impact_threshold",
         }
     }
 }
@@ -470,10 +468,9 @@ mod tests {
             SyncPublishMetricOutcome::Delegated,
             SyncPublishMetricOutcome::Failed,
             SyncPublishMetricOutcome::SkippedEmpty,
-            SyncPublishMetricOutcome::SkippedImpactThreshold,
         ];
         assert_closed_vocabulary(&sync.map(SyncPublishMetricOutcome::label));
-        assert_eq!(sync.len(), 5);
+        assert_eq!(sync.len(), 4);
 
         let digest_hints = [
             SegmentDigestHintCacheOutcome::Hit,

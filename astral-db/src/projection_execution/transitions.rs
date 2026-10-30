@@ -3,8 +3,8 @@ use sha2::{Digest, Sha256};
 use sqlx::{MySql, MySqlPool, Transaction};
 
 use crate::{
-    GrantRepositoryError, OwnedDeltaLease, ProjectionExecutionMode, MAX_BACKOFF_SECONDS,
-    MAX_DELTA_LEASE_SECONDS, MAX_LAST_ERROR_LENGTH,
+    GrantRepositoryError, OwnedDeltaLease, MAX_BACKOFF_SECONDS, MAX_DELTA_LEASE_SECONDS,
+    MAX_LAST_ERROR_LENGTH,
 };
 
 #[derive(sqlx::FromRow)]
@@ -40,15 +40,6 @@ const OWNED_AUDIT_INSERT_SQL: &str = "INSERT INTO audit_log \
     VALUES (?, NULL, ?, 'authorization_projection_owned_lane', 'INTERNAL', ?, \
             'AUTHZ_OWNED_PROJECTION_LANE', ?, ?, ?)";
 
-fn require_owned_mode() -> Result<(), GrantRepositoryError> {
-    if super::projection_execution_mode() != ProjectionExecutionMode::WorkerOwned {
-        return Err(GrantRepositoryError::ScopeViolation(
-            "code=projection_execution.worker_owned_mode_required".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 fn lane_guard_matches(row: &OwnedLaneRow, lease: &OwnedDeltaLease) -> bool {
     row.lease_live == 1
         && row.execution_epoch == lease.lane_epoch
@@ -68,11 +59,14 @@ fn lane_guard_matches(row: &OwnedLaneRow, lease: &OwnedDeltaLease) -> bool {
         && lease.lane_owner == lease.event_identity.lease_owner
 }
 
+fn truncate_last_error(value: &str) -> String {
+    value.chars().take(MAX_LAST_ERROR_LENGTH).collect()
+}
+
 pub(super) async fn lock_owned_lane_in_tx(
     tx: &mut Transaction<'_, MySql>,
     lease: &OwnedDeltaLease,
 ) -> Result<bool, GrantRepositoryError> {
-    require_owned_mode()?;
     let identity = &lease.lane_identity;
     if identity.tenant_id <= 0 || identity.aggregate_id <= 0 || lease.lane_epoch <= 0 {
         return Ok(false);
@@ -92,7 +86,6 @@ pub(super) async fn clear_owned_lane_in_tx(
     tx: &mut Transaction<'_, MySql>,
     lease: &OwnedDeltaLease,
 ) -> Result<bool, GrantRepositoryError> {
-    require_owned_mode()?;
     let result = sqlx::query(OWNED_LANE_CLEAR_SQL)
         .bind([0_u8; 32].as_slice())
         .bind(lease.lane_identity.tenant_id)
@@ -183,7 +176,6 @@ pub async fn owned_delta_lease_is_retired(
     pool: &MySqlPool,
     lease: &OwnedDeltaLease,
 ) -> Result<bool, GrantRepositoryError> {
-    require_owned_mode()?;
     let mut tx = pool.begin().await?;
     let row: Option<OwnedLaneRow> = sqlx::query_as(OWNED_LANE_FOR_UPDATE_SQL)
         .bind(lease.lane_identity.tenant_id)
@@ -267,6 +259,16 @@ impl OwnedEventAccountingRow {
             )
         })
     }
+}
+
+fn can_record_owned_episode_failure(
+    accounting: &OwnedEventAccountingRow,
+    token_hash: &[u8],
+) -> bool {
+    accounting.execution_episode_token_hash.as_deref() == Some(token_hash)
+        && accounting.failure_recorded_token_hash.as_deref() != Some(token_hash)
+        && accounting.execution_failures < accounting.execution_attempts
+        && accounting.execution_failures < i64::from(u32::MAX)
 }
 
 async fn lock_owned_event_accounting(
@@ -471,13 +473,7 @@ async fn finish_owned_event(
             count_failure: true,
             ..
         } => {
-            if accounting.execution_episode_token_hash.as_deref()
-                != Some(token_hash.as_bytes().as_slice())
-                || accounting.failure_recorded_token_hash.as_deref()
-                    == Some(token_hash.as_bytes().as_slice())
-                || accounting.execution_failures >= accounting.execution_attempts
-                || accounting.execution_failures >= i64::from(u32::MAX)
-            {
+            if !can_record_owned_episode_failure(&accounting, token_hash.as_bytes().as_slice()) {
                 tx.rollback().await?;
                 return Ok(false);
             }
@@ -512,9 +508,7 @@ async fn finish_owned_event(
             backoff_seconds,
             count_failure,
         } => {
-            query = query
-                .bind(backoff_seconds)
-                .bind(code.chars().take(MAX_LAST_ERROR_LENGTH).collect::<String>());
+            query = query.bind(backoff_seconds).bind(truncate_last_error(code));
             if count_failure {
                 query = query.bind(token_hash.as_bytes().to_vec());
             }
@@ -527,12 +521,7 @@ async fn finish_owned_event(
                 || format!("code={reason_code}"),
                 |detail| format!("code={reason_code};detail={detail}"),
             );
-            query = query.bind(
-                detail
-                    .chars()
-                    .take(MAX_LAST_ERROR_LENGTH)
-                    .collect::<String>(),
-            );
+            query = query.bind(truncate_last_error(&detail));
         }
         OwnedReleaseKind::Release => {}
     }
@@ -601,6 +590,247 @@ pub async fn quarantine_owned_delta_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn owned_lease() -> OwnedDeltaLease {
+        let lease_owner = "projection-worker:synthetic-run".to_owned();
+        let event_id = "synthetic-event-91".to_owned();
+        OwnedDeltaLease {
+            lane_identity: crate::ProjectionAggregateIdentity::new(7, "CARD", 17)
+                .expect("valid synthetic aggregate identity"),
+            lane_epoch: 3,
+            lane_owner: lease_owner.clone(),
+            lane_token: crate::DeltaLeaseToken::for_test("synthetic-lane-token"),
+            active_event_id: event_id.clone(),
+            operation_id: "synthetic-operation-91".to_owned(),
+            event_identity: crate::DeltaLeaseIdentity {
+                delta_event_id: 91,
+                event_id,
+                lease_owner,
+                lease_token: crate::DeltaLeaseToken::for_test("synthetic-event-token"),
+            },
+            execution_failures: 2,
+        }
+    }
+
+    fn owned_lane_row(lease: &OwnedDeltaLease) -> OwnedLaneRow {
+        OwnedLaneRow {
+            execution_epoch: lease.lane_epoch,
+            lease_owner: lease.lane_owner.clone(),
+            lease_token_hash: lease.lane_token.token_hash().as_bytes().to_vec(),
+            lease_live: 1,
+            active_delta_event_id: Some(lease.event_identity.delta_event_id),
+            active_delta_token_hash: Some(
+                lease
+                    .event_identity
+                    .lease_token
+                    .token_hash()
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        }
+    }
+
+    fn accounting_row(
+        execution_accounting_version: i32,
+        execution_attempts: i64,
+        execution_failures: i64,
+        execution_episode_token_hash: Option<Vec<u8>>,
+        failure_recorded_token_hash: Option<Vec<u8>>,
+    ) -> OwnedEventAccountingRow {
+        OwnedEventAccountingRow {
+            execution_attempts,
+            execution_failures,
+            execution_episode_token_hash,
+            failure_recorded_token_hash,
+            execution_accounting_version,
+        }
+    }
+
+    #[test]
+    fn owned_lane_guard_requires_live_epoch_owner_tokens_and_active_event_match() {
+        let lease = owned_lease();
+        assert!(lane_guard_matches(&owned_lane_row(&lease), &lease));
+
+        let mut row = owned_lane_row(&lease);
+        row.lease_live = 0;
+        assert!(
+            !lane_guard_matches(&row, &lease),
+            "expired lane is not live"
+        );
+
+        let mut row = owned_lane_row(&lease);
+        row.execution_epoch += 1;
+        assert!(
+            !lane_guard_matches(&row, &lease),
+            "stale epoch must not match"
+        );
+
+        let mut row = owned_lane_row(&lease);
+        row.lease_owner.push_str("-different");
+        assert!(!lane_guard_matches(&row, &lease), "lane owner must match");
+
+        let mut row = owned_lane_row(&lease);
+        row.lease_token_hash[0] ^= 1;
+        assert!(
+            !lane_guard_matches(&row, &lease),
+            "lane token hash must match"
+        );
+
+        let mut row = owned_lane_row(&lease);
+        row.active_delta_event_id = Some(lease.event_identity.delta_event_id + 1);
+        assert!(!lane_guard_matches(&row, &lease), "active delta must match");
+
+        let mut row = owned_lane_row(&lease);
+        row.active_delta_token_hash
+            .as_mut()
+            .expect("active event token")[0] ^= 1;
+        assert!(
+            !lane_guard_matches(&row, &lease),
+            "active event token must match"
+        );
+
+        let mut inconsistent_lease = lease.clone();
+        inconsistent_lease.active_event_id.push_str("-different");
+        assert!(!lane_guard_matches(
+            &owned_lane_row(&inconsistent_lease),
+            &inconsistent_lease
+        ));
+
+        let mut inconsistent_lease = lease.clone();
+        inconsistent_lease.lane_owner.push_str("-different");
+        assert!(!lane_guard_matches(
+            &owned_lane_row(&inconsistent_lease),
+            &inconsistent_lease
+        ));
+    }
+
+    #[test]
+    fn owned_event_accounting_enforces_v2_counter_bounds_and_u32_width() {
+        assert_eq!(
+            accounting_row(2, 4, 3, None, None)
+                .validate()
+                .expect("valid v2 accounting"),
+            3
+        );
+        assert_eq!(
+            accounting_row(2, i64::from(u32::MAX), i64::from(u32::MAX), None, None)
+                .validate()
+                .expect("maximum representable failure count"),
+            u32::MAX
+        );
+
+        let invalid_rows = [
+            accounting_row(1, 1, 0, None, None),
+            accounting_row(2, -1, 0, None, None),
+            accounting_row(2, 1, -1, None, None),
+            accounting_row(2, 1, 2, None, None),
+        ];
+        for row in invalid_rows {
+            assert!(matches!(
+                row.validate(),
+                Err(GrantRepositoryError::Mapping(message))
+                    if message == "code=projection_execution.invalid_execution_accounting"
+            ));
+        }
+
+        let overflow = accounting_row(
+            2,
+            i64::from(u32::MAX) + 1,
+            i64::from(u32::MAX) + 1,
+            None,
+            None,
+        );
+        assert!(matches!(
+            overflow.validate(),
+            Err(GrantRepositoryError::Mapping(message))
+                if message == "code=projection_execution.execution_failures_overflow"
+        ));
+    }
+
+    #[test]
+    fn owned_episode_failure_is_counted_once_only_within_its_bounded_episode() {
+        let token_hash = [0x5a; 32];
+        let other_token_hash = [0xa5; 32];
+        let eligible = accounting_row(2, 4, 2, Some(token_hash.to_vec()), None);
+        assert!(can_record_owned_episode_failure(&eligible, &token_hash));
+
+        let already_recorded = accounting_row(
+            2,
+            4,
+            2,
+            Some(token_hash.to_vec()),
+            Some(token_hash.to_vec()),
+        );
+        assert!(!can_record_owned_episode_failure(
+            &already_recorded,
+            &token_hash
+        ));
+
+        let different_episode = accounting_row(2, 4, 2, Some(other_token_hash.to_vec()), None);
+        assert!(!can_record_owned_episode_failure(
+            &different_episode,
+            &token_hash
+        ));
+
+        let attempts_exhausted = accounting_row(2, 2, 2, Some(token_hash.to_vec()), None);
+        assert!(!can_record_owned_episode_failure(
+            &attempts_exhausted,
+            &token_hash
+        ));
+
+        let failure_width_exhausted = accounting_row(
+            2,
+            i64::from(u32::MAX) + 1,
+            i64::from(u32::MAX),
+            Some(token_hash.to_vec()),
+            None,
+        );
+        assert!(!can_record_owned_episode_failure(
+            &failure_width_exhausted,
+            &token_hash
+        ));
+    }
+
+    #[test]
+    fn owned_lane_audit_request_id_is_stable_and_binds_transition_dimensions() {
+        let lease = owned_lease();
+        let request_id = audit_request_id(&lease, "BEGIN");
+        assert_eq!(request_id.len(), 64, "SHA-256 hex fits audit request_id");
+        assert!(request_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(request_id, audit_request_id(&lease, "BEGIN"));
+        assert_ne!(request_id, lease.lane_token.as_str());
+        assert_ne!(request_id, lease.event_identity.lease_token.as_str());
+
+        let mut changed = lease.clone();
+        changed.operation_id.push_str("-other");
+        assert_ne!(request_id, audit_request_id(&changed, "BEGIN"));
+
+        let mut changed = lease.clone();
+        changed.active_event_id.push_str("-other");
+        assert_ne!(request_id, audit_request_id(&changed, "BEGIN"));
+
+        let mut changed = lease.clone();
+        changed.lane_owner.push_str("-other");
+        assert_ne!(request_id, audit_request_id(&changed, "BEGIN"));
+
+        let mut changed = lease.clone();
+        changed.lane_epoch += 1;
+        assert_ne!(request_id, audit_request_id(&changed, "BEGIN"));
+        assert_ne!(request_id, audit_request_id(&lease, "FAIL"));
+    }
+
+    #[test]
+    fn last_error_truncation_preserves_code_and_unicode_character_limit() {
+        let code = "code=projection_execution.synthetic_failure;detail=";
+        let value = format!("{code}{}", "界".repeat(MAX_LAST_ERROR_LENGTH));
+        let truncated = truncate_last_error(&value);
+
+        assert!(truncated.starts_with(code));
+        assert_eq!(truncated.chars().count(), MAX_LAST_ERROR_LENGTH);
+        assert!(truncated.len() > MAX_LAST_ERROR_LENGTH);
+        assert!(truncated.ends_with('界'));
+        assert_eq!(truncate_last_error("短错误"), "短错误");
+    }
 
     #[test]
     fn commit_unknown_is_distinct_from_precommit_query_failure() {

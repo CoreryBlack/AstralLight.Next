@@ -30,8 +30,6 @@ macro_rules! authorization_edition {
             concat!("astral-owned-completion-audit-v", stringify!($edition)).as_bytes();
         pub const AUTHORIZATION_COMPLETION_ITEMS_DOMAIN: &str =
             concat!("astral-owned-completion-item-set-v", stringify!($edition));
-        pub const AUTHORIZATION_L2_MAC_DOMAIN: &str =
-            concat!("astral:l2-evidence:v", stringify!($edition), ":hmac-sha256");
         pub const AUTHORIZATION_SNAPSHOT_DIGEST_DOMAIN: &[u8] =
             concat!("astral-auth-snapshot-v", stringify!($edition)).as_bytes();
         pub const AUTHORIZATION_SEGMENT_FORMAT: &str =
@@ -92,10 +90,6 @@ mod tests {
         assert_eq!(
             AUTHORIZATION_COMPLETION_ITEMS_DOMAIN,
             format!("astral-owned-completion-item-set-v{edition}")
-        );
-        assert_eq!(
-            AUTHORIZATION_L2_MAC_DOMAIN,
-            format!("astral:l2-evidence:v{edition}:hmac-sha256")
         );
         for (value, expected) in [
             (

@@ -21,7 +21,7 @@ use crate::AppState;
 
 // ===== DTO =====
 
-/// 域响应 DTO（对齐 Java Domain 实体 camelCase 序列化，orgId 为前端兼容恒为 None）
+/// Domain response follows the persisted domain fields.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DomainDto {
@@ -29,7 +29,6 @@ pub struct DomainDto {
     pub name: String,
     pub code: Option<String>,
     pub description: Option<String>,
-    pub org_id: Option<i64>,
     pub status: String,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
@@ -42,7 +41,6 @@ impl From<DomainRecord> for DomainDto {
             name: r.name,
             code: r.code,
             description: r.description,
-            org_id: r.org_id,
             status: r.status,
             created_at: r.created_at,
             updated_at: r.updated_at,

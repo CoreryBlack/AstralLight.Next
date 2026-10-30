@@ -16,7 +16,7 @@
 //!   commit 证明成功后 proven；pre-commit 错误（已知回滚）不武装、随 Drop 干净
 //!   释放；commit await 窗口内取消/掉线 → Drop 见 atomic=true → sticky
 //!   `uncertain_source`（只有独立 durable 对账可清除）。
-//! - 栅栏只围 tx/SQL：绝不跨 Redis/MQ/LocalBus 网络段持有；嵌套栅栏允许。
+//! - 栅栏只围 tx/SQL：绝不跨 cache/MQ/LocalBus 网络段持有；嵌套栅栏允许。
 
 use std::time::{Duration, Instant};
 

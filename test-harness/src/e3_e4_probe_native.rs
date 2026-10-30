@@ -35,9 +35,9 @@ pub fn sample_decision<T: HttpTransport>(
     })
 }
 
-/// Mirrors `tools/e3_e4.py::_decision_fields`: the legacy flat `allowed` is the
-/// fallback and `data.effect` overrides it; `effect` values outside
-/// ALLOW/DENY leave `allowed` unknown rather than defaulting to false.
+/// Reads the native API envelope: `data.effect` overrides the legacy flat
+/// `allowed` field, and unrecognized effects stay unknown rather than defaulting
+/// to false.
 fn decision_fields(body: &Value) -> (Option<bool>, String) {
     let data = body.get("data").unwrap_or(&Value::Null);
     let mut allowed = body.get("allowed").and_then(Value::as_bool);
@@ -61,12 +61,11 @@ fn decision_fields(body: &Value) -> (Option<bool>, String) {
     (allowed, reason)
 }
 
-/// Mirrors `tools/e3_e4.py::_classify_decision`: an AUTHORIZATION_PENDING
-/// reason outranks every other signal (fail-safe), matching is
-/// case-insensitive, and 401/403/503 keep a pending/DENY classification
-/// instead of collapsing to UNKNOWN. `decision_status` above stays the
-/// transport-level PASS/BLOCKED view, so a non-200 sample still blocks the
-/// probe report even when its classification is PENDING or DENY.
+/// An AUTHORIZATION_PENDING reason outranks every other signal (fail-safe),
+/// matching is case-insensitive, and 401/403/503 keep a pending/DENY
+/// classification instead of collapsing to UNKNOWN. `decision_status` above
+/// stays the transport-level PASS/BLOCKED view, so a non-200 sample still
+/// blocks the probe report even when its classification is PENDING or DENY.
 pub fn classify_decision(status: u16, body: &Value) -> &'static str {
     let (allowed, reason) = decision_fields(body);
     let pending = reason
@@ -181,10 +180,8 @@ mod tests {
             "base_dir": "~/authz-validation-20260919-single-node-002",
             "db": "astral_bench",
             "mysql_container": "astral_bench_mysql",
-            "redis_container": "astral_bench_redis",
             "hmac_secret_file": "/run/secrets/hmac.txt",
             "mysql_root": "mysql-secret",
-            "redis_password": "redis-secret",
             "binary_sha256": "a".repeat(64),
             "source_snapshot_sha256": "b".repeat(64),
             "source_git_rev": "c".repeat(40),
@@ -454,6 +451,5 @@ mod tests {
         let text = report.to_string();
         assert!(!text.contains("example.invalid"));
         assert!(!text.contains("mysql-secret"));
-        assert!(!text.contains("redis-secret"));
     }
 }

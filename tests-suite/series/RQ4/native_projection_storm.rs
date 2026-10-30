@@ -1,8 +1,8 @@
 //! Same-card repository-to-worker projection storm on the native profile.
 //!
-//! Run only against a migrated, run-scoped MySQL test database. Separate processes
-//! select `ASTRAL_PROJECTION_EXECUTION_MODE=legacy-hybrid` or `worker-owned` with
-//! identical workload limits. This is not a signed HTTP or cross-node campaign.
+//! Run only against a migrated, run-scoped MySQL test database. Every run uses the
+//! WorkerOwned protocol and requires owned execution accounting plus exact durable
+//! completion proofs. This is not a signed HTTP or cross-node campaign.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -15,10 +15,9 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use astral_db::{
-    freeze_projection_execution_mode_from_env, install_local_projection_bus,
-    install_memory_projection_hub, load_owned_delta_completion, load_published_card_grant_evidence,
-    projection_execution_mode, warm_from_durable, DeltaEventAppendRequest, DeltaEventType,
-    LocalProjectionBus, LocalProjectionBusConfig, ProjectionExecutionMode, Sha256Digest,
+    install_local_projection_bus, install_memory_projection_hub, load_owned_delta_completion,
+    load_published_card_grant_evidence, warm_from_durable, DeltaEventAppendRequest, DeltaEventType,
+    LocalProjectionBus, LocalProjectionBusConfig, Sha256Digest,
     LOCAL_PROJECTION_BUS_MAX_PAYLOAD_BYTES, LOCAL_PROJECTION_BUS_MAX_TOTAL_BYTES,
 };
 use astral_mq::{
@@ -245,12 +244,10 @@ impl Drop for RuntimeOwners {
 #[ignore = "requires migrated run-scoped MySQL and the native single-node projection path"]
 async fn native_projection_same_card_write_storm_drains_durably() {
     astral_common::tracing::init_tracing();
-    freeze_projection_execution_mode_from_env().expect("projection execution mode must be valid");
     let workload = StormWorkload::from_env().expect("storm workload must stay within its budget");
     let Some(pool) = connect_suite().await else {
         return;
     };
-    let mode = projection_execution_mode();
     let fixture = SuiteFixture::new("native-projection-storm", &[TenantRole::DenyActive]);
     let tenant = fixture.tenants[0];
     let operation_prefix = format!("nps{:032x}", fixture.salt);
@@ -311,9 +308,7 @@ async fn native_projection_same_card_write_storm_drains_durably() {
         let storm_drain_ms = drain_started.elapsed().as_millis();
         let storm_attempts_total = durable.iter().map(|delta| delta.attempts as u64).sum::<u64>();
         let storm_max_attempts = durable.iter().map(|delta| delta.attempts).max().unwrap_or_default();
-        if mode == ProjectionExecutionMode::WorkerOwned {
-            assert_owned_execution_accounting(&pool, tenant.tenant_id, &durable).await?;
-        }
+        assert_owned_execution_accounting(&pool, tenant.tenant_id, &durable).await?;
 
         let cleanup_operation_id = format!("npsc{:032x}", fixture.salt);
         cleanup_operation = Some(cleanup_operation_id.clone());
@@ -343,16 +338,14 @@ async fn native_projection_same_card_write_storm_drains_durably() {
         .await?;
         cleanup_event_ids = cleanup_deltas.iter().map(|delta| delta.event_id.clone()).collect();
         let cleanup_drain_ms = cleanup_started.elapsed().as_millis();
-        if mode == ProjectionExecutionMode::WorkerOwned {
-            assert_owned_execution_accounting(&pool, tenant.tenant_id, &cleanup_deltas).await?;
-        }
+        assert_owned_execution_accounting(&pool, tenant.tenant_id, &cleanup_deltas).await?;
 
         // Durable event, manifest and audit assertions are the acceptance proof;
         // worker counters only explain which path performed the work.
         let worker_summary = owners.shutdown().await?;
-        report_durable_workload(&pool, tenant.tenant_id, mode, &worker_summary).await?;
+        report_durable_workload(&pool, tenant.tenant_id, &worker_summary).await?;
         println!(
-            "[NATIVE_STORM] execution_mode={mode:?} path=SqlxRuleRepository+local_worker trials={} producers={} burst_window_s={} per_trial_cap={} drain_window_s={} storm_drain_ms={} cleanup_drain_ms={} writes={} attempts_total={} max_attempts={} cleanup_rules={} cleanup_deltas={} worker_published={} worker_claimed={} worker_released_retry={} worker_budget_exhausted={}",
+            "[NATIVE_STORM] path=SqlxRuleRepository+local_worker protocol=WorkerOwned trials={} producers={} burst_window_s={} per_trial_cap={} drain_window_s={} storm_drain_ms={} cleanup_drain_ms={} writes={} attempts_total={} max_attempts={} cleanup_rules={} cleanup_deltas={} worker_published={} worker_claimed={} worker_released_retry={} worker_budget_exhausted={}",
             trials.len(),
             PRODUCERS,
             BURST_WINDOW.as_secs(),
@@ -1249,7 +1242,6 @@ async fn load_completion_receipt(
 async fn report_durable_workload(
     pool: &MySqlPool,
     tenant_id: i64,
-    mode: ProjectionExecutionMode,
     worker: &WorkerRunSummary,
 ) -> Result<()> {
     let (claims, executions, failures, max_execution_failures): (i64, i64, i64, i64) =
@@ -1301,12 +1293,11 @@ async fn report_durable_workload(
     .await
     .map_err(|_| anyhow!("durable event timing summary timed out"))??;
     println!(
-        "[NATIVE_STORM_COST] execution_mode={mode:?} claims={claims} executions={executions} failures={failures} max_execution_failures={max_execution_failures} historical_manifests={manifests} reference_rows={reference_rows} cumulative_segment_rows={segment_rows} cumulative_segment_bytes={segment_bytes} source_append_to_plan_complete_samples={samples} source_append_to_plan_complete_max_s={max_elapsed_seconds} db_timestamp_resolution_s=1 worker_pointer_replans={} worker_dependency_blocks={} worker_lease_lost={} worker_decide_phase_micros={} execution_counters_authoritative={}",
+        "[NATIVE_STORM_COST] protocol=WorkerOwned claims={claims} executions={executions} failures={failures} max_execution_failures={max_execution_failures} historical_manifests={manifests} reference_rows={reference_rows} cumulative_segment_rows={segment_rows} cumulative_segment_bytes={segment_bytes} source_append_to_plan_complete_samples={samples} source_append_to_plan_complete_max_s={max_elapsed_seconds} db_timestamp_resolution_s=1 worker_pointer_replans={} worker_dependency_blocks={} worker_lease_lost={} worker_decide_phase_micros={} execution_counters_authoritative=true",
         worker.events_pointer_moved_replanned,
         worker.events_blocked,
         worker.events_lease_lost,
         worker.decide_phase_micros,
-        mode == ProjectionExecutionMode::WorkerOwned,
     );
     Ok(())
 }

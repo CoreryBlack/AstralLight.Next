@@ -93,10 +93,7 @@ async fn change_password(
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     let user_id = require_user_id(&headers)?;
-    state
-        .auth_service
-        .change_password(&state, user_id, &req)
-        .await?;
+    state.auth_service.change_password(user_id, &req).await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 

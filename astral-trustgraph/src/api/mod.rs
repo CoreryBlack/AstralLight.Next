@@ -46,8 +46,7 @@ pub(crate) async fn require_platform_admin(
 
 // ===== 诊断端点共享：卡级已发布证据读取 + 统一 ALLOW-only 匹配器 =====
 //
-// consistency_monitor（一致性巡检）与 simulation（what-if 仿真）共用同一数据
-// 源与匹配语义，避免两份实现漂移：
+// simulation（what-if 仿真）使用同一数据源与匹配语义，避免实现漂移：
 // - 数据源：Rust-owned published card evidence（读取经
 //   `astral_db::cached_load_published_card_grant_evidence`：进程内 evidence
 //   缓存 + 指针对牌，miss/漂移回源严格 reader——后者在单个短事务内 FOR
@@ -67,13 +66,6 @@ pub(crate) struct PublishedEvidenceUnavailable {
     pub code: &'static str,
     /// reader 返回的原始 detail（已含 `code=published_card_evidence.*` 细分）。
     pub detail: String,
-}
-
-impl PublishedEvidenceUnavailable {
-    /// 组装为可写入观测字段/响应 reason 的稳定字符串。
-    pub(crate) fn observation(&self) -> String {
-        format!("{};detail={}", self.code, self.detail)
-    }
 }
 
 /// 按 [`AuthorizationEvidenceError`] 族映射稳定状态码。
@@ -226,11 +218,9 @@ pub(crate) fn match_published_effective_grant<'a>(
 }
 
 pub mod approval;
-pub mod arbiter;
 pub mod audit;
 pub mod audit_replay;
 pub mod audit_service;
-pub mod consistency_monitor;
 pub mod cross_org_grants;
 pub mod delegation;
 pub mod departments;

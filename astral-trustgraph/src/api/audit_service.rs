@@ -286,11 +286,7 @@ pub(crate) async fn dispatch_audit_dual_write<M: AuditMqSink + Sync, D: AuditDbS
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_default();
 
-    // Step 1: MQ 主路径。message_id 必须唯一：audit consumer 以它为
-    // mq_idempotent_log 幂等键，恒 None 会回退派生键，导致相同
-    // user+resource+action 的真实审计行被 INSERT IGNORE 丢弃。
     let payload = producer::AuditLogPayload {
-        message_id: Some(uuid::Uuid::new_v4().to_string()),
         user_id: entry.user_id,
         card_id: entry.card_id,
         action: entry.action.clone(),

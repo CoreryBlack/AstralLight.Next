@@ -18,9 +18,7 @@ members = [
     "tests-suite",
     "test-harness",
 ]
-# Redis 缓存归档库保留源码，使用自包含 manifest；不参与默认 workspace。
-# 需要归档验证时从 astral-cache/Cargo.toml 单独执行。
-exclude = ["astral-learn", "astral-chat", "astral-cache", "integrations"]
+exclude = ["astral-learn", "astral-chat", "integrations"]
 resolver = "2"
 
 [workspace.package]
@@ -42,12 +40,8 @@ serde_json = "1"
 # 数据库
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "time", "migrate"] }
 
-# 缓存
-# Redis 仅服务于各 crate 显式 `redis-compat` feature（compat 路径）与 exclude 的
-# 冻结/归档 crate（astral-chat/learn/astral-cache）。默认 workspace 构建（不带
-# redis-compat）零 redis 编译与链接（redis-layer-retirement-20261002）。
-redis = { version = "1", features = ["tokio-comp", "connection-manager", "json"] }
-# 进程内 evidence 缓存（astral-db evidence_cache：TTL/容量/并发驱逐内建）
+# 进程内缓存
+# evidence 缓存的 TTL、容量与并发驱逐由 moka 管理。
 moka = { version = "0.12", features = ["future"] }
 
 # 消息队列

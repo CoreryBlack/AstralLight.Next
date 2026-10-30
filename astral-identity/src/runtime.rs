@@ -22,8 +22,6 @@ use axum::extract::FromRef;
 use axum::Router;
 use lapin::Connection;
 use policy_engine::PolicyEngine;
-#[cfg(feature = "redis-compat")]
-use redis::aio::ConnectionManager;
 use sqlx::MySqlPool;
 
 use astral_common::audit::{register_audit_db_writer, AuditDbWriter, AuditEntry};
@@ -233,9 +231,6 @@ async fn consume_local_until_stopped(
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub db: MySqlPool,
-    /// Redis adapter is available only with the explicit compatibility feature.
-    #[cfg(feature = "redis-compat")]
-    pub redis: Option<ConnectionManager>,
     pub engine: Arc<PolicyEngine>,
     pub me_service: Arc<MeService>,
     pub auth_service: Arc<AuthService>,
@@ -287,8 +282,6 @@ struct IdentityMqProducer {
 impl MqProducerRef for IdentityMqProducer {
     async fn publish_audit_log(&self, event: AuditLogEvent) -> Result<(), String> {
         let payload = astral_mq::producer::AuditLogPayload {
-            // UUID 幂等键：防 audit consumer 派生键重复 → INSERT IGNORE 丢审计行
-            message_id: Some(uuid::Uuid::new_v4().to_string()),
             user_id: event.user_id,
             card_id: event.card_id,
             action: event.action,
@@ -318,8 +311,6 @@ impl MqProducerRef for IdentityMqProducer {
         success: bool,
     ) -> Result<(), String> {
         let payload = astral_mq::producer::LoginEventPayload {
-            // UUID 幂等键：防 login.event consumer 无幂等时 DLX 重投重复审计行
-            message_id: Some(uuid::Uuid::new_v4().to_string()),
             user_id,
             card_id: None,
             login_type: login_type.to_string(),
@@ -384,20 +375,6 @@ where
         "application",
         JwtValidationRole::Identity,
     )?);
-    config.validate_identity_session_grant_compatibility()?;
-    // Redis 编译层退役收口（redis-layer-retirement-20261002）：宿主能力门 +
-    // 已校验旗标一次性冻结。astral-common 的零依赖 marker 会被 workspace
-    // feature 统一放大——任何其他 crate 打开 redis-compat 都会让集中校验的
-    // cfg 通过，即便本宿主并未编译自己的 compat adapter。能力断言以**本
-    // crate** 的 cfg! 为准：旗标开启但 adapter 未编译时，在任何 DB 连接 /
-    // 服务装配之前显式拒绝启动（fail-closed，非 log-only）；随后把已校验
-    // 旗标冻结进进程级共享源（first-wins、同值幂等、异值冲突拒绝）。
-    // canonical origin 安装点与下方 cfg adapter 装配保持不变。
-    config
-        .validate_redis_adapter_support(cfg!(feature = "redis-compat"))
-        .map_err(anyhow::Error::msg)?;
-    astral_common::config::install_redis_projection_compat(config.redis_projection_compat_enabled)
-        .map_err(anyhow::Error::msg)?;
     // 进程级 origin region 唯一安装点：配置校验后、DB/worker/router 装配前
     // 安装一次。durable invalidation intent 在未安装时拒绝 append（fail-closed），
     // 因此必须在任何可能触发租户资格变更的路径之前完成。
@@ -406,39 +383,10 @@ where
     let identity_mapping_enabled =
         integration_mappings::enabled_from_env().map_err(anyhow::Error::msg)?;
     let db = connect_and_validate_schema(&config.database_url).await?;
+    astral_db::validate_projection_owned_schema(&db).await?;
     if identity_mapping_enabled {
         astral_db::validate_integration_mapping_schema(&db).await?;
     }
-    // Redis 兼容 adapter（default-off）：仅当显式开启 compat 旗标时连接
-    // （失败即启动失败，显式配置的 adapter 不允许静默降级）；默认 Redis-free
-    // 路径完全不连接 Redis，登录/refresh/switch 以 MySQL durable proof 为准。
-    // 仅 redis-compat feature 编译；feature-off + 旗标开启由 astral-common
-    // 启动期集中校验拒绝（RedisCompatRequiresFeatureBuild，fail-closed）。
-    #[cfg(feature = "redis-compat")]
-    let redis = match config.redis_projection_compat_enabled {
-        true => {
-            let redis_client = redis::Client::open(config.redis_url.as_str())?;
-            let redis_config = redis::aio::ConnectionManagerConfig::new()
-                .set_connection_timeout(Some(std::time::Duration::from_secs(1)))
-                .set_response_timeout(Some(std::time::Duration::from_millis(500)))
-                .set_number_of_retries(0);
-            let connection = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                ConnectionManager::new_with_config(redis_client, redis_config),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("Redis connection timed out"))??;
-            tracing::info!("redis projection compat adapter enabled");
-            Some(connection)
-        }
-        false => {
-            tracing::info!(
-                transport = "mysql",
-                "redis projection disabled; session auth uses strict MySQL durable facts"
-            );
-            None
-        }
-    };
     let engine = Arc::new(PolicyEngine::new());
     register_audit_db_writer(Arc::new(IdentityAuditDbWriter { pool: db.clone() }));
     let me_service = Arc::new(MeService::new(Arc::new(SqlxMeRepository::new(db.clone()))));
@@ -459,8 +407,6 @@ where
     let state = AppState {
         config,
         db: db.clone(),
-        #[cfg(feature = "redis-compat")]
-        redis: redis.clone(),
         engine,
         me_service,
         auth_service,
@@ -471,26 +417,17 @@ where
     };
 
     // Every Identity replica runs the same leased recovery loop. MySQL owns
-    // coordination and is the authority; Redis (when the compat adapter is
-    // explicitly enabled) remains an idempotent projection store.
+    // coordination and durable authority; the worker reconciles process-local
+    // acceleration only after verifying the committed revocation snapshot.
     //
     // worker-supervision-20261002: the required recovery leg runs on the
     // OWNED handle flavor — RAII (Drop aborts the supervisor), bounded
     // shutdown, and an observable death signal. Startup gates above are
     // unchanged.
-    #[cfg(feature = "redis-compat")]
-    let session_projection_worker =
-        srv::session_projection_worker::spawn_owned(db.clone(), redis.clone());
-    #[cfg(not(feature = "redis-compat"))]
-    let session_projection_worker =
-        srv::session_projection_worker::spawn_without_redis_owned(db.clone());
+    let session_projection_worker = srv::session_projection_worker::spawn_owned(db.clone());
 
     // Inject Identity-owned durable handlers before either transport starts.
     astral_mq::consumers::set_session_revocation_db(db.clone());
-    #[cfg(feature = "redis-compat")]
-    if let Some(redis) = redis.clone() {
-        astral_mq::consumers::set_session_revocation_redis(redis);
-    }
     astral_mq::consumers::set_login_event_db(db.clone());
     // worker-supervision-20261002: RAII handles for the local owner consumer
     // loops; declared at function scope so they live until the serve tail and

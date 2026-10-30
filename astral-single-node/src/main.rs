@@ -91,14 +91,6 @@ fn validate_composite_config(
     identity_addr: &str,
     trustgraph_addr: &str,
 ) -> anyhow::Result<()> {
-    // Redis compatibility is refused BEFORE anything else (pure config check,
-    // no DB, no I/O): the composite runtime is a strict Redis-free deployment
-    // regardless of whether the astral-common build compiled the adapter, and
-    // a flagged configuration must fail before the database preflight instead
-    // of after a warm-up.
-    config
-        .validate_redis_adapter_support(false)
-        .map_err(|error| anyhow!("composite redis adapter configuration rejected: {error}"))?;
     if config.message_transport()? != MessageTransport::Local {
         return Err(anyhow!(
             "astral-single-node requires ASTRAL_MESSAGE_TRANSPORT=local"
@@ -1015,35 +1007,6 @@ mod tests {
         assert!(
             source.contains("LocalProjectionWorkerLiveness::Dead"),
             "the gate must match the exported sticky Dead state"
-        );
-    }
-
-    /// Composite Redis compatibility is refused by the FIRST pure config
-    /// check (before the DB preflight), with the adapter capability pinned to
-    /// `false` for the composite host regardless of the astral-common build.
-    #[test]
-    fn composite_config_refuses_redis_adapter_before_any_database_work() {
-        let source = include_str!("main.rs");
-        let fn_start = source
-            .find("fn validate_composite_config(")
-            .expect("the composite validator must exist");
-        let body = &source[fn_start..];
-        let redis_check = body
-            .find("validate_redis_adapter_support(false)")
-            .expect("the composite must pin the adapter capability to false");
-        let transport_check = body
-            .find("config.message_transport()")
-            .expect("the transport check must remain");
-        let db_check = source
-            .find("connect_and_validate_schema(&config.database_url)")
-            .expect("the DB preflight must remain on the startup path");
-        assert!(
-            redis_check < transport_check,
-            "the redis refusal must be the first config check"
-        );
-        assert!(
-            redis_check < db_check,
-            "the redis refusal must precede the database preflight"
         );
     }
 

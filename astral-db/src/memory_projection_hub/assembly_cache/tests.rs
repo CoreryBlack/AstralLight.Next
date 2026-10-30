@@ -165,7 +165,7 @@ fn cache_rejects_changed_publication_identity_and_frontiers() {
             operation_id: "operation-1".to_owned(),
             semantic_hash: Sha256Digest::from_raw_bytes([1; 32]),
             dependency_hash: Sha256Digest::from_raw_bytes([2; 32]),
-            compiler_version: "compiler-1".to_owned(),
+            compiler_version: astral_types::AUTHORIZATION_COMPILER_VERSION.to_owned(),
             revoke_fence: 1,
             revoke_fence_proven: true,
             cas_version: 1,

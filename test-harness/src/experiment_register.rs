@@ -96,23 +96,14 @@ pub const MODEL_ONLY_PREMISES: [&str; 1] = ["host_mediation"];
 pub const CANARY_SCENARIOS: [&str; 2] = ["suppressed_revocation_delta", "revision_confused_grant"];
 pub const CAPTURE_EXPERIMENTS: [&str; 4] = ["E1", "E2", "E3", "E4"];
 pub const ACCEPTANCE_EXPERIMENTS: [&str; 6] = ["E1", "E2", "E3", "E4", "E7", "E8"];
-pub const DEPENDENCY_PROFILES: [&str; 8] = dependency_profiles::PROFILE_IDS;
+pub const DEPENDENCY_PROFILES: [&str; 7] = dependency_profiles::PROFILE_IDS;
 pub const FAULT_TIMINGS: [&str; 2] = dependency_profiles::FAULT_TIMINGS;
-pub const LEGACY_REDIS_COMPAT_FAULTS: [&str; 6] = [
-    "redis_unavailable",
-    "stale_hmac",
-    "pointer_movement",
-    "worker_restart",
-    "lease_expiry",
-    "unknown_ack",
-];
-pub const PROFILE_SERVICE_DEPENDENCIES: [(&str, &[&str]); 8] = [
+pub const PROFILE_SERVICE_DEPENDENCIES: [(&str, &[&str]); 7] = [
     ("native-kernel", &[]),
     ("offline-validation", &[]),
     ("native-single-node", &["mysql"]),
     ("standalone-rabbit", &["mysql", "rabbitmq"]),
     ("distributed", &["mysql", "rabbitmq"]),
-    ("redis-compat", &["mysql", "redis"]),
     ("performance-kernel", &[]),
     ("performance-native", &["mysql"]),
 ];
@@ -127,7 +118,7 @@ pub const NATIVE_SINGLE_NODE_DEPENDENCIES: [&str; 9] = [
     "gateway_integrity",
     "single_writer_lease",
 ];
-pub const PROFILE_DEPENDENCY_CLASSES: [(&str, &[&str]); 8] = [
+pub const PROFILE_DEPENDENCY_CLASSES: [(&str, &[&str]); 7] = [
     ("native-kernel", &[]),
     ("offline-validation", &[]),
     ("native-single-node", &NATIVE_SINGLE_NODE_DEPENDENCIES),
@@ -153,24 +144,13 @@ pub const PROFILE_DEPENDENCY_CLASSES: [(&str, &[&str]); 8] = [
             "gateway_integrity",
         ],
     ),
-    (
-        "redis-compat",
-        &[
-            "cache",
-            "redis",
-            "publication_worker_or_mq",
-            "authoritative_database",
-            "identity_mapping",
-            "gateway_integrity",
-        ],
-    ),
     ("performance-kernel", &[]),
     (
         "performance-native",
         &["cache", "authoritative_database", "gateway_integrity"],
     ),
 ];
-pub const PROFILE_FAULTS: [(&str, &[&str]); 8] = [
+pub const PROFILE_FAULTS: [(&str, &[&str]); 7] = [
     ("native-kernel", &[]),
     ("offline-validation", &[]),
     (
@@ -211,7 +191,6 @@ pub const PROFILE_FAULTS: [(&str, &[&str]); 8] = [
             "mysql_unavailable",
         ],
     ),
-    ("redis-compat", &LEGACY_REDIS_COMPAT_FAULTS),
     ("performance-kernel", &[]),
     (
         "performance-native",
@@ -449,18 +428,10 @@ pub fn validate_register() -> Result<(), Vec<String>> {
     if native_dependencies != Some(NATIVE_SINGLE_NODE_DEPENDENCIES.into_iter().collect()) {
         problems.push("native_dependency_registry_mismatch".to_owned());
     }
-    if dependency_profiles::fault_dependencies_for("native-kernel", "unknown_ack")
+    if dependency_profiles::fault_dependencies_for("native-kernel", "memory_channel_suspect")
         .is_ok_and(|dependencies| !dependencies.is_empty())
-        || LEGACY_REDIS_COMPAT_FAULTS.iter().any(|fault| {
-            !dependency_profiles::profile_faults("redis-compat")
-                .is_some_and(|faults| faults.contains(fault))
-                || dependency_profiles::profile_faults("native-single-node")
-                    .is_some_and(|faults| faults.contains(fault))
-                || dependency_profiles::profile_faults("standalone-rabbit")
-                    .is_some_and(|faults| faults.contains(fault))
-        })
     {
-        problems.push("legacy_fault_profile_boundary_mismatch".to_owned());
+        problems.push("offline_profile_fault_dependency_mismatch".to_owned());
     }
     let matrices = dependency_fault_matrices();
     match matrices {
@@ -495,10 +466,8 @@ pub fn validate_register() -> Result<(), Vec<String>> {
                     problems.push(format!("{profile}:invalid_fault_matrix"));
                 }
             }
-            if matrices.get("native-single-node") != dependency_fault_matrix().ok().as_ref()
-                || matrices.get("redis-compat").map(BTreeMap::len) != Some(12)
-            {
-                problems.push("default_or_redis_fault_matrix_mismatch".to_owned());
+            if matrices.get("native-single-node") != dependency_fault_matrix().ok().as_ref() {
+                problems.push("default_fault_matrix_mismatch".to_owned());
             }
         }
         Err(_) => problems.push("dependency_fault_matrix_generation_failed".to_owned()),
@@ -571,7 +540,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_links_every_runtime_e2_premise_to_a_readiness_test() {
+    fn registry_links_every_runtime_e2_premise_to_a_native_rust_test() {
         assert_eq!(E2_RUST_TESTS.len(), E2_RUNTIME_PREMISES.len());
         for (control, expected) in E2_CONTROLS.iter().zip(E2_RUNTIME_PREMISES) {
             assert_eq!(control.premise, expected);
@@ -582,10 +551,6 @@ mod tests {
             );
             assert!(!control.hazard.is_empty());
             assert_eq!(control.expected_finding, "counterexample_found");
-            assert!(include_str!(
-                "../../Docs/authorization-validation/tools/run_single_node_campaign.py"
-            )
-            .contains(control.rust_test));
         }
         assert!(validate_register().is_ok());
 
@@ -614,17 +579,27 @@ mod tests {
             .all(|(premise, test)| !premise.contains("host") && !test.contains("host")));
 
         let rust_sources = [
-            include_str!("../../astral-db/src/evidence_cache.rs"),
-            include_str!("../../policy-engine/src/engine/tests.rs"),
+            (
+                "astral-db",
+                include_str!("../../astral-db/src/evidence_cache.rs"),
+            ),
+            (
+                "policy-engine",
+                include_str!("../../policy-engine/src/engine/tests.rs"),
+            ),
         ];
         for control in E2_CONTROLS {
             let test_name = control.rust_test.rsplit("::").next().unwrap();
+            let source = rust_sources
+                .iter()
+                .find(|(crate_name, _)| *crate_name == control.crate_name)
+                .map(|(_, source)| *source)
+                .expect("E2 control crate has a native Rust source");
             assert!(
-                rust_sources
-                    .iter()
-                    .any(|source| source.contains(&format!("fn {test_name}"))),
-                "{} does not resolve to a Rust test",
-                control.rust_test
+                source.contains(&format!("fn {test_name}")),
+                "{} does not resolve to a Rust test in {}",
+                control.rust_test,
+                control.crate_name
             );
         }
     }
@@ -655,12 +630,16 @@ mod tests {
             item.expected_detection_rate_basis_points == 10_000
                 && item.expected_false_block_rate_basis_points == 0
         }));
-        assert_eq!(DEPENDENCY_PROFILES.len(), 8);
+        assert_eq!(DEPENDENCY_PROFILES.len(), 7);
         assert_eq!(NATIVE_SINGLE_NODE_DEPENDENCIES.len(), 9);
         assert_eq!(FAULT_TIMINGS, ["steady_state", "in_flight_revocation"]);
         let matrices = dependency_fault_matrices().unwrap();
+        assert_eq!(matrices.len(), DEPENDENCY_PROFILES.len());
+        assert_eq!(
+            matrices.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            DEPENDENCY_PROFILES.into_iter().collect()
+        );
         assert_eq!(matrices["native-single-node"].len(), 18);
-        assert_eq!(matrices["redis-compat"].len(), 12);
         assert_eq!(
             matrices["native-single-node"],
             dependency_fault_matrix().unwrap()

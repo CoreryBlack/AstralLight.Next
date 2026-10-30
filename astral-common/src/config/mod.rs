@@ -7,7 +7,6 @@ use axum::http::Uri;
 use serde::Deserialize;
 use std::fs;
 use std::net::IpAddr;
-use std::sync::OnceLock;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -45,12 +44,8 @@ pub enum ConfigValidationError {
     GatewayInternalServiceSecretPlaceholder,
     #[error("GATEWAY timestamp tolerance must be positive")]
     GatewayTimestampToleranceInvalid,
-    #[error("SESSION_GRANT_CLAIMS_MODE must be one of OFF, EMIT, REQUIRE (got: {0})")]
-    InvalidSessionGrantClaimsMode(String),
     #[error("DATABASE_URL is required outside the test profile")]
     DatabaseUrlMissing,
-    #[error("REDIS_URL is required outside the test profile")]
-    RedisUrlMissing,
     #[error("RABBITMQ_URL is required outside the test profile")]
     RabbitmqUrlMissing,
     #[error("{0} must not point to localhost or a loopback address outside the test profile")]
@@ -77,18 +72,6 @@ pub enum ConfigValidationError {
     InvalidTargetRegion,
     #[error("ASTRAL_ORG_SCOPE_ENABLED must be exactly \"true\" or \"false\" (default off)")]
     InvalidOrgScopeEnabled,
-    #[error("redis projection compat requires a non-empty REDIS_URL")]
-    RedisCompatRequiresUrl,
-    #[error(
-        "redis projection compat is enabled but this binary was built without the `redis-compat` feature; rebuild with --features redis-compat or disable the compat flag (fail-closed)"
-    )]
-    RedisCompatRequiresFeatureBuild,
-    #[error("ASTRAL_REDIS_PROJECTION_COMPAT must be exactly \"true\" or \"false\" (default off)")]
-    InvalidRedisProjectionCompat,
-    #[error(
-        "redis projection compat freeze conflict: process startup already froze the opposite value; every runtime installer must agree on the same validated flag (fail-closed)"
-    )]
-    RedisCompatFreezeConflict,
 }
 
 impl ConfigValidationError {
@@ -126,9 +109,6 @@ impl MessageTransport {
 /// ORG_SCOPE 部署旗标的唯一 env 名（严格 bool，default-off）。
 pub const ORG_SCOPE_ENABLED_ENV: &str = "ASTRAL_ORG_SCOPE_ENABLED";
 
-/// Redis 会话投影兼容 adapter 的唯一 env 名（严格 bool，default-off）。
-pub const REDIS_PROJECTION_COMPAT_ENV: &str = "ASTRAL_REDIS_PROJECTION_COMPAT";
-
 /// 单机组合进程会话镜像加速器的唯一 env 名（严格 bool，default-off）。
 pub const SESSION_GRANT_MIRROR_ENV: &str = "ASTRAL_SESSION_GRANT_MIRROR_ENABLED";
 
@@ -157,113 +137,6 @@ pub fn parse_org_scope_enabled(raw: Option<&str>) -> Result<bool, ConfigValidati
 pub fn org_scope_enabled_from_env() -> Result<bool, ConfigValidationError> {
     let raw = std::env::var(ORG_SCOPE_ENABLED_ENV).ok();
     parse_org_scope_enabled(raw.as_deref())
-}
-
-// ===== Redis 会话投影兼容旗标（default-off，跨宿主/跨 crate 共享契约） =====
-//
-// redis-layer-retirement-20261002 收口：compat 是显式 opt-in 的**编译期**能力。
-// 零依赖 marker feature 会被 workspace feature 统一放大——任何 crate 打开
-// `redis-compat` 都会让 astral-common 的集中 cfg 校验通过，即便某个具体宿主
-// 并未编译自己的 compat adapter（历史上只留下 info log 静默 Redis-free 化）。
-// 因此本节提供三层共享契约：
-// 1. [`AppConfig::validate_redis_adapter_support`]：纯函数能力断言，每个宿主
-//    以**自身 crate** 的 `cfg!(feature = "redis-compat")` 在配置校验后、任何
-//    DB 连接 / 服务装配之前调用（显式拒绝，不是 log-only）。
-// 2. [`install_redis_projection_compat`]：宿主把已校验旗标一次性冻结进进程级
-//    **唯一冻结槽**（同值幂等、对槽内任何先到异值冻结冲突拒绝），同进程的
-//    组合成员必须一致。
-// 3. [`parse_redis_projection_compat`] / [`redis_projection_compat_frozen`] /
-//    [`redis_projection_compat_from_env_frozen`]：libs 的中心解析器与单槽冻结
-//    读，替代各自重复读 env 的 OnceLock（非法 env 一律 false fail-closed，
-//    无网络；env 回落读填充同一槽，保证 getter 答案自首次读取起稳定）。
-
-/// 严格解析 Redis 会话投影兼容旗标（唯一共享实现，宿主与 libs 共用）。
-///
-/// 契约：unset/空白/`"false"`（trim + ASCII 大小写不敏感）→ `Ok(false)`；
-/// `"true"`（trim + ASCII 大小写不敏感）→ `Ok(true)`；其他任何非空值 →
-/// `Err`（fail-closed）。大小写不敏感刻意对齐 `apply_flat_env_overrides`
-/// 对本 env 名的既有契约（与 ORG_SCOPE 的精确小写契约区分，各自文档已注明）。
-/// 与配置加载路径的空白差异：apply 前的 `optional_env` 先把空白 env 过滤为
-/// "未配置"（保留 YAML/默认值，同为 default-off），本解析器把空白直接视为
-/// `Ok(false)`——两种机制取值一致（false），服务对象不同（libs 直接读 env）。
-/// 错误信息只含变量名与期望格式，不回显值。
-pub fn parse_redis_projection_compat(raw: Option<&str>) -> Result<bool, ConfigValidationError> {
-    match raw
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        None | Some("") | Some("false") => Ok(false),
-        Some("true") => Ok(true),
-        Some(_) => Err(ConfigValidationError::InvalidRedisProjectionCompat),
-    }
-}
-
-/// 进程级冻结的 Redis 兼容旗标——**唯一冻结槽**（单源真相）。
-///
-/// 三个写入方共享本槽：宿主安装器 [`install_redis_projection_compat`]（已
-/// 校验值）与 legacy/lib 的 env 回落读 [`redis_projection_compat_frozen`]。
-/// 先到者冻结（env 回落读也算冻结），后到安装器必须同值幂等、异值冲突拒绝
-/// ——否则 legacy 先冻结后安装异值会把 getter 的答案在读方背后改掉
-/// （TOCTOU：生产宿主保证 install 先于任何 worker，测试/legacy 无此保证）。
-static REDIS_PROJECTION_COMPAT_FROZEN: OnceLock<bool> = OnceLock::new();
-
-/// 把**已通过校验**的 Redis 兼容旗标一次性冻结进进程级唯一槽。
-///
-/// 每个宿主 runtime 在 [`AppConfig::validate_redis_adapter_support`]（以及配置
-/// 加载期集中校验）通过后、任何 DB 连接 / 服务 / worker 装配之前调用恰好一次；
-/// 组合进程内多个成员宿主必须装同一份已校验值。冲突语义覆盖**同一槽内的全部
-/// 先到冻结**（不限于其他安装器）：槽为空 → 本值生效；槽内同值 → 幂等
-/// `Ok`；槽内异值（其他宿主安装器或 legacy env 回落读先到且不同）→ 拒绝启动
-/// （fail-closed，绝不静默采纳后来者，也绝不在读方背后改写已发布答案）。
-/// 调用前必须先完成宿主能力断言——本函数不做任何编译期能力检查。
-pub fn install_redis_projection_compat(value: bool) -> Result<(), ConfigValidationError> {
-    match REDIS_PROJECTION_COMPAT_FROZEN.set(value) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            let frozen = *REDIS_PROJECTION_COMPAT_FROZEN
-                .get()
-                .expect("OnceLock::set failed but the slot must hold the winner");
-            if frozen == value {
-                Ok(())
-            } else {
-                Err(ConfigValidationError::RedisCompatFreezeConflict)
-            }
-        }
-    }
-}
-
-/// 读取进程级冻结的 Redis 兼容旗标（default-off，单源真相）。
-///
-/// 槽已冻结（宿主安装值或先到的 env 回落值）→ 返回冻结值；槽为空（legacy/lib
-/// 场景，宿主未走新 API）→ 用 env 视图填充**同一个槽**后返回：此后宿主安装器
-/// 必须与该 env 派生值同值（幂等）否则冲突拒绝，保证 getter 的答案自首次读取
-/// 起稳定，绝不静默切换。生产路径要求宿主在任何读取方 spawn 之前完成安装，
-/// env 回落仅用于无 config 的历史库。
-pub fn redis_projection_compat_frozen() -> bool {
-    if let Some(value) = REDIS_PROJECTION_COMPAT_FROZEN.get() {
-        return *value;
-    }
-    // legacy env 视图：非法值一律 false（fail-closed 默认关闭，绝不静默开启；
-    // 配置加载路径的非法值仍由 apply_flat_env_overrides 严格拒绝启动）。
-    let env_value =
-        parse_redis_projection_compat(std::env::var(REDIS_PROJECTION_COMPAT_ENV).ok().as_deref())
-            .unwrap_or(false);
-    match REDIS_PROJECTION_COMPAT_FROZEN.set(env_value) {
-        Ok(()) => env_value,
-        // 并发竞争：以槽内赢家为准（与 install 的同值幂等/异值冲突同源）。
-        Err(_) => *REDIS_PROJECTION_COMPAT_FROZEN
-            .get()
-            .expect("OnceLock::set failed but the slot must hold the winner"),
-    }
-}
-
-/// Legacy/lib 兼容别名：读取进程级唯一冻结源（签名与默认 false 语义保持
-/// 稳定）。槽为空时经 env 视图填充同一槽（见
-/// [`redis_projection_compat_frozen`]），与宿主安装器共享同一冲突语义；
-/// 不再是独立的第二 env 槽，杜绝"legacy 先冻结 false、install 后改 true"
-/// 的读方背后翻转。无网络。
-pub fn redis_projection_compat_from_env_frozen() -> bool {
-    redis_projection_compat_frozen()
 }
 
 fn is_placeholder_secret(secret: &str) -> bool {
@@ -335,14 +208,6 @@ pub struct AppConfig {
     #[serde(default = "default_public_paths")]
     pub public_paths: Vec<String>,
 
-    /// Session grant claims 发布模式。
-    ///
-    /// Token v2 always requires a versioned grant. The field remains a
-    /// deployment switch for the existing projector rollout, but `REQUIRE`
-    /// is the only mode accepted by the new session issuer.
-    #[serde(default = "default_session_grant_claims_mode")]
-    pub session_grant_claims_mode: String,
-
     #[serde(default = "default_max_permission_header_length")]
     pub max_permission_header_length: usize,
 
@@ -360,9 +225,6 @@ pub struct AppConfig {
 
     #[serde(default = "default_database_url")]
     pub database_url: String,
-
-    #[serde(default = "default_redis_url")]
-    pub redis_url: String,
 
     #[serde(default = "default_rabbitmq_url")]
     pub rabbitmq_url: String,
@@ -407,20 +269,8 @@ pub struct AppConfig {
     #[serde(skip)]
     pub org_scope_enabled: bool,
 
-    /// Redis 会话投影兼容 adapter（**default-off**）。
-    ///
-    /// `false`（默认）：登录/refresh/switch 只写 MySQL durable proof
-    /// （`auth_session_jti_index`），Gateway 走 strict MySQL 会话判定，
-    /// 运行路径 Redis-free。
-    /// `true`：在 durable proof 之外**追加**历史 Redis 投影写入
-    /// （`access:jti`/`access:grant`/`jwt:revoked`），失败语义与历史一致
-    /// （签发失败回滚家族、撤销失败报错）。必须同时配置非空 `redis_url`，
-    /// 否则启动失败（[`ConfigValidationError::RedisCompatRequiresUrl`]）。
-    #[serde(default)]
-    pub redis_projection_compat_enabled: bool,
-
     /// 单机组合进程镜像加速器（**default-on**，composite 正常会话 zero-DB
-    /// 目标的默认闭合；redis-layer-retirement-20261002 同批收口）：安装有界
+    /// 目标的默认闭合）：安装有界
     /// 进程内会话镜像（TTL/容量/GC/suspect 栅栏）。镜像命中 Allow 仍逐项绑定
     /// durable proof（签发侧经 strict DB 复核登记）；未命中/suspect 一律回退
     /// strict DB。
@@ -459,14 +309,12 @@ impl Default for AppConfig {
             monitor_service_uri: String::new(),
             internal_service_secret: String::new(),
             public_paths: default_public_paths(),
-            session_grant_claims_mode: default_session_grant_claims_mode(),
             max_permission_header_length: default_max_permission_header_length(),
             cors: CorsConfig::default(),
             jwt: JwtConfig::default(),
             gateway: GatewayCfg::default(),
             rate_limit: RateLimitCfg::default(),
             database_url: default_database_url(),
-            redis_url: default_redis_url(),
             rabbitmq_url: default_rabbitmq_url(),
             target_region: None,
             region_id: default_region_id(),
@@ -475,7 +323,6 @@ impl Default for AppConfig {
             db_max_connections: default_db_max_connections(),
             db_acquire_timeout_seconds: default_db_acquire_timeout_seconds(),
             org_scope_enabled: false,
-            redis_projection_compat_enabled: false,
             session_grant_mirror_enabled: default_session_grant_mirror_enabled(),
             session_grant_mirror_positive_disabled: false,
             wechat: WeChatConfig::default(),
@@ -499,9 +346,6 @@ fn default_public_paths() -> Vec<String> {
     ]
 }
 
-fn default_session_grant_claims_mode() -> String {
-    "REQUIRE".into()
-}
 /// 组合进程 zero-DB 目标的默认闭合：镜像加速器字段默认 true（运行期仍有
 /// composite+hub+lease 强门与 DenyOnly 降级，见字段文档）。显式 env/YAML
 /// `false` 必须保持生效——serde 标量 default fn 保证"未配置才默认"。
@@ -512,9 +356,6 @@ fn default_max_permission_header_length() -> usize {
     16000
 }
 fn default_database_url() -> String {
-    String::new()
-}
-fn default_redis_url() -> String {
     String::new()
 }
 fn default_rabbitmq_url() -> String {
@@ -839,9 +680,6 @@ fn apply_flat_env_overrides(cfg: &mut AppConfig) -> Result<(), config::ConfigErr
     if let Some(value) = optional_env("DATABASE_URL") {
         cfg.database_url = value.trim().to_string();
     }
-    if let Some(value) = optional_env("REDIS_URL") {
-        cfg.redis_url = value.trim().to_string();
-    }
     if let Some(value) = optional_env("RABBITMQ_URL") {
         cfg.rabbitmq_url = value.trim().to_string();
     }
@@ -894,10 +732,6 @@ fn apply_flat_env_overrides(cfg: &mut AppConfig) -> Result<(), config::ConfigErr
     if let Some(value) = optional_env("GATEWAY_INTERNAL_SERVICE_SECRET") {
         cfg.gateway.internal_service_secret = value;
     }
-    // 非法取值由 validate_secrets_for 的 InvalidSessionGrantClaimsMode 拒绝。
-    if let Some(value) = optional_env("SESSION_GRANT_CLAIMS_MODE") {
-        cfg.session_grant_claims_mode = value.trim().to_string();
-    }
     // ORG_SCOPE 部署旗标（default-off）：所有 PolicyEngine 宿主（trustgraph /
     // identity / monitor）经共享严格解析器在启动期一次解析并冻结到本字段，
     // 中间件 / 检查端点构造正式 SqlxRuleRepository 时统一传入，防止跨宿主
@@ -905,14 +739,6 @@ fn apply_flat_env_overrides(cfg: &mut AppConfig) -> Result<(), config::ConfigErr
     // 绝不静默降级）；env 缺失/空白保留默认 false。
     if let Some(value) = optional_env(ORG_SCOPE_ENABLED_ENV) {
         cfg.org_scope_enabled = parse_org_scope_enabled(Some(&value))
-            .map_err(ConfigValidationError::into_config_error)?;
-    }
-    // Redis 会话投影兼容 adapter（default-off）：env 存在即覆盖，严格 bool，
-    // 非法值启动失败。开启时 validate_runtime_safety 强制 redis_url 非空。
-    // 解析走共享中心解析器（parse_redis_projection_compat），与 libs 冻结读
-    // 同一契约，绝不复制第二份解析语义。
-    if let Some(value) = optional_env(REDIS_PROJECTION_COMPAT_ENV) {
-        cfg.redis_projection_compat_enabled = parse_redis_projection_compat(Some(&value))
             .map_err(ConfigValidationError::into_config_error)?;
     }
     // 单机镜像加速器（default-off）：严格 bool；语义边界见字段文档
@@ -1005,32 +831,11 @@ impl AppConfig {
             .map_err(ConfigValidationError::into_config_error)?;
         cfg.validate_runtime_safety(Self::is_test_profile())
             .map_err(ConfigValidationError::into_config_error)?;
-        // 将 redis_url 同步到 REDIS_URL 环境变量，供 MQ consumer 等非 AppConfig
-        // 场景使用。Redis-free 部署（redis_url 为空）不写 env：下游 Redis 依赖
-        // 方（MQ 幂等/兼容 adapter）按各自的可选契约显式处理空值，绝不把空串
-        // 误当成可连接地址。
-        if !cfg.redis_url.trim().is_empty() && std::env::var("REDIS_URL").is_err() {
-            std::env::set_var("REDIS_URL", &cfg.redis_url);
-        }
         Ok(cfg)
     }
 
     pub fn message_transport(&self) -> Result<MessageTransport, ConfigValidationError> {
         MessageTransport::parse(&self.message_transport)
-    }
-
-    pub fn validate_identity_session_grant_compatibility(
-        &self,
-    ) -> Result<(), ConfigValidationError> {
-        if !self
-            .session_grant_claims_mode
-            .eq_ignore_ascii_case("REQUIRE")
-        {
-            return Err(ConfigValidationError::InvalidSessionGrantClaimsMode(
-                "token v2 requires REQUIRE".into(),
-            ));
-        }
-        Ok(())
     }
 
     /// 解析 MySQL 服务池最大连接数：env `ASTRAL_DB_MAX_CONNECTIONS` >
@@ -1080,51 +885,9 @@ impl AppConfig {
         }
     }
 
-    /// 宿主能力断言（**纯函数**，redis-layer-retirement-20261002 收口）：
-    /// `redis_projection_compat_enabled` 开启时，本宿主二进制必须真的编译了
-    /// 自己的 `redis-compat` adapter。
-    ///
-    /// 每个宿主 runtime（gateway / identity / trustgraph / monitor）在配置校验
-    /// 之后、任何 DB 连接 / 服务 / worker 装配之前，以**自身 crate** 的
-    /// `cfg!(feature = "redis-compat")` 作为 `adapter_compiled` 调用一次。
-    /// 纯函数是刻意设计：workspace feature 统一会让 astral-common 的零依赖
-    /// marker 在"本宿主没编译 adapter"时也为真，只有宿主自身的 cfg! 才是
-    /// 可信的能力事实；旗标开启 + adapter 未编译 → 显式拒绝启动
-    /// （[`ConfigValidationError::RedisCompatRequiresFeatureBuild`]，fail-closed，
-    /// 绝不 log-only 静默 Redis-free 化）。旗标关闭（Redis-free 默认）恒放行。
-    pub fn validate_redis_adapter_support(
-        &self,
-        adapter_compiled: bool,
-    ) -> Result<(), ConfigValidationError> {
-        if self.redis_projection_compat_enabled && !adapter_compiled {
-            return Err(ConfigValidationError::RedisCompatRequiresFeatureBuild);
-        }
-        Ok(())
-    }
-
     fn validate_runtime_safety(&self, test_profile: bool) -> Result<(), ConfigValidationError> {
         let transport = MessageTransport::parse(&self.message_transport)?;
         validate_connection_url("DATABASE_URL", &self.database_url, &["mysql"], test_profile)?;
-        // Redis-free 默认路径：redis_url 允许为空（会话判定走 strict MySQL，
-        // 见 astral-db::session_state_repository）。Redis 退化为显式兼容
-        // adapter：开启 redis_projection_compat_enabled 时必须提供非空且
-        // scheme 合法的 redis_url（fail-closed，禁止半开配置）。
-        if self.redis_url.trim().is_empty() {
-            if self.redis_projection_compat_enabled {
-                return Err(ConfigValidationError::RedisCompatRequiresUrl);
-            }
-        } else {
-            validate_connection_url("REDIS_URL", &self.redis_url, &["redis"], test_profile)?;
-        }
-        // Redis 编译层退役收口（redis-layer-retirement-20261002）：compat 是
-        // 显式 opt-in 的**编译期**能力——旗标开启但二进制未编译 `redis-compat`
-        // feature 时启动必须明确失败，绝不静默 Redis-free 化（fail-closed）。
-        // 这里的 cfg 断言只覆盖 astral-common 自身的 marker（feature 由各
-        // runtime 的 redis-compat 传播），是对宿主能力门的纵深防御：workspace
-        // feature 统一下 marker 可被任意其他 crate 点亮，因此每个宿主还必须
-        // 以**自身 crate** 的 `cfg!(feature = "redis-compat")` 调用
-        // [`AppConfig::validate_redis_adapter_support`]。
-        self.validate_redis_adapter_support(cfg!(feature = "redis-compat"))?;
         validate_transport_identity(
             &self.region_id,
             &self.node_id,
@@ -1199,17 +962,6 @@ impl AppConfig {
                 return Err(ConfigValidationError::GatewayInternalServiceSecretPlaceholder);
             }
         }
-        // session_grant_claims_mode 取值校验：非法值若静默按 OFF（fail-open）处理
-        // 会关闭 SessionGrant 校验，对齐 Java `SessionGrantClaimsMode.parse` 拒绝语义。
-        // 空串视为未配置（serde default 为 OFF）；显式配置为非法值则启动失败。
-        match self.session_grant_claims_mode.to_uppercase().as_str() {
-            "" | "OFF" | "EMIT" | "REQUIRE" => {}
-            other => {
-                return Err(ConfigValidationError::InvalidSessionGrantClaimsMode(
-                    other.to_string(),
-                ))
-            }
-        }
         Ok(())
     }
 }
@@ -1262,7 +1014,6 @@ fn validate_connection_url(
         }
         return Err(match name {
             "DATABASE_URL" => ConfigValidationError::DatabaseUrlMissing,
-            "REDIS_URL" => ConfigValidationError::RedisUrlMissing,
             "RABBITMQ_URL" => ConfigValidationError::RabbitmqUrlMissing,
             _ => ConfigValidationError::ConnectionUrlInvalid(name.into()),
         });
@@ -1418,7 +1169,6 @@ mod tests {
         "TRUST_GRAPH_URI",
         "MONITOR_SERVICE_URI",
         "DATABASE_URL",
-        "REDIS_URL",
         "RABBITMQ_URL",
         "ASTRAL_MESSAGE_TRANSPORT",
         "ASTRAL_REGION_ID",
@@ -1433,13 +1183,10 @@ mod tests {
         "GATEWAY_HMAC_SECRET",
         "INTERNAL_SERVICE_SECRET",
         "GATEWAY_INTERNAL_SERVICE_SECRET",
-        "SESSION_GRANT_CLAIMS_MODE",
         "CORS_ALLOWED_ORIGINS",
         "CORS_ALLOW_CREDENTIALS",
         // ORG_SCOPE 部署旗标（parse_org_scope_enabled 契约）。
         ORG_SCOPE_ENABLED_ENV,
-        // Redis 会话投影兼容旗标（parse_redis_projection_compat 契约）。
-        REDIS_PROJECTION_COMPAT_ENV,
         // 单机镜像加速器（default-on）与 positive cache 旁路（default-off）。
         SESSION_GRANT_MIRROR_ENV,
         SESSION_GRANT_MIRROR_POSITIVE_DISABLED_ENV,
@@ -1561,26 +1308,6 @@ mod tests {
         assert!(config
             .validate_secrets_for(JwtValidationRole::Identity)
             .is_ok());
-    }
-
-    #[test]
-    fn require_mode_is_the_only_supported_session_grant_mode() {
-        let require = AppConfig {
-            session_grant_claims_mode: "REQUIRE".into(),
-            ..Default::default()
-        };
-        assert!(require
-            .validate_identity_session_grant_compatibility()
-            .is_ok());
-        for mode in ["OFF", "EMIT"] {
-            let config = AppConfig {
-                session_grant_claims_mode: mode.into(),
-                ..Default::default()
-            };
-            assert!(config
-                .validate_identity_session_grant_compatibility()
-                .is_err());
-        }
     }
 
     #[test]
@@ -1957,7 +1684,6 @@ mod tests {
     fn valid_runtime_config() -> AppConfig {
         AppConfig {
             database_url: "mysql://db.example.invalid:3306/astral_test".into(),
-            redis_url: "redis://cache.example.invalid:6379/0".into(),
             rabbitmq_url: "amqps://mq.example.invalid:5671/%2f".into(),
             cors: CorsConfig {
                 allowed_origins: vec!["https://console.example.invalid".into()],
@@ -1977,16 +1703,6 @@ mod tests {
         assert!(matches!(
             config.validate_secrets_for(JwtValidationRole::Gateway),
             Err(ConfigValidationError::InternalServiceSecretTooShort)
-        ));
-    }
-
-    #[test]
-    fn runtime_validation_rejects_localhost_connection_outside_test_profile() {
-        let mut config = valid_runtime_config();
-        config.redis_url = "redis://localhost:6379/0".into();
-        assert!(matches!(
-            config.validate_runtime_safety(false),
-            Err(ConfigValidationError::LocalhostConnection(name)) if name == "REDIS_URL"
         ));
     }
 
@@ -2012,89 +1728,10 @@ mod tests {
         assert!(config.validate_runtime_safety(false).is_ok());
     }
 
-    /// Redis-free 默认路径：redis_url 允许为空（strict MySQL 会话判定），
-    /// 兼容 adapter 保持 default-off。
-    #[test]
-    fn runtime_validation_allows_empty_redis_url_when_compat_disabled() {
-        let mut config = valid_runtime_config();
-        config.redis_url.clear();
-        config.redis_projection_compat_enabled = false;
-        assert!(config.validate_runtime_safety(false).is_ok());
-    }
-
-    /// Redis 兼容 adapter 是显式 opt-in：开启时 redis_url 为空必须启动失败
-    /// （fail-closed，禁止"半开"配置在签发/撤销路径悄悄跳过投影）。
-    #[test]
-    fn runtime_validation_rejects_compat_enabled_without_redis_url() {
-        let mut config = valid_runtime_config();
-        config.redis_url.clear();
-        config.redis_projection_compat_enabled = true;
-        assert!(matches!(
-            config.validate_runtime_safety(false),
-            Err(ConfigValidationError::RedisCompatRequiresUrl)
-        ));
-        // 配齐 redis_url 后：仅当二进制编译了 `redis-compat` feature 才合法
-        // （feature-off 构建命中集中 refusal，见
-        // `runtime_validation_rejects_compat_enabled_without_redis_compat_feature`）。
-        config.redis_url = "redis://cache.example.invalid:6379/0".into();
-        #[cfg(feature = "redis-compat")]
-        assert!(config.validate_runtime_safety(false).is_ok());
-        #[cfg(not(feature = "redis-compat"))]
-        assert!(matches!(
-            config.validate_runtime_safety(false),
-            Err(ConfigValidationError::RedisCompatRequiresFeatureBuild)
-        ));
-    }
-
-    /// redis 编译层退役收口（redis-layer-retirement-20261002）：compat 旗标
-    /// 开启 + redis_url 配齐，但二进制未编译 `redis-compat` feature → 启动
-    /// 必须明确拒绝，绝不静默 Redis-free 化（fail-closed）。
-    #[test]
-    fn runtime_validation_rejects_compat_enabled_without_redis_compat_feature() {
-        let mut config = valid_runtime_config();
-        config.redis_url = "redis://cache.example.invalid:6379/0".into();
-        config.redis_projection_compat_enabled = true;
-        #[cfg(not(feature = "redis-compat"))]
-        assert!(matches!(
-            config.validate_runtime_safety(false),
-            Err(ConfigValidationError::RedisCompatRequiresFeatureBuild)
-        ));
-        #[cfg(feature = "redis-compat")]
-        assert!(config.validate_runtime_safety(false).is_ok());
-    }
-
-    /// 宿主能力门（混合 feature 收口）：`validate_redis_adapter_support` 是
-    /// 纯函数，宿主以**自身 crate** 的 `cfg!(feature = "redis-compat")` 断言
-    /// adapter 编译能力。workspace feature 统一会让 astral-common 的零依赖
-    /// marker 在宿主未编译 adapter 时也为真——本测试二进制本身可能带
-    /// redis-compat 编译（marker on），`adapter_compiled=false` 也必须被拒绝；
-    /// `adapter_compiled=true`（marker 支持）放行；旗标关闭（Redis-free 默认）
-    /// 恒放行。断言不依赖任何 cfg 分支，双模式（marker on/off）语义一致。
-    #[test]
-    fn redis_adapter_support_is_pure_and_mixed_feature_safe() {
-        let mut config = valid_runtime_config();
-        config.redis_url = "redis://cache.example.invalid:6379/0".into();
-        config.redis_projection_compat_enabled = true;
-
-        // 旗标开启 + 宿主 adapter 未编译 → 显式拒绝（fail-closed，非 log-only）。
-        assert!(matches!(
-            config.validate_redis_adapter_support(false),
-            Err(ConfigValidationError::RedisCompatRequiresFeatureBuild)
-        ));
-        // 旗标开启 + 宿主 adapter 已编译（marker 支持）→ 放行。
-        assert!(config.validate_redis_adapter_support(true).is_ok());
-
-        // 旗标关闭（Redis-free 默认）→ 编译与否都放行。
-        config.redis_projection_compat_enabled = false;
-        assert!(config.validate_redis_adapter_support(false).is_ok());
-        assert!(config.validate_redis_adapter_support(true).is_ok());
-    }
-
     #[test]
     fn runtime_validation_allows_local_test_fixture_only_in_test_profile() {
         let mut config = valid_runtime_config();
         config.database_url = "mysql://localhost:3306/astral_test".into();
-        config.redis_url = "redis://localhost:6379/0".into();
         config.rabbitmq_url = "amqp://localhost:5672/%2f".into();
         config.cors.allowed_origins = vec!["http://localhost:5173".into()];
         config.cors.allow_credentials = true;
@@ -2204,121 +1841,6 @@ mod tests {
         std::env::remove_var(ORG_SCOPE_ENABLED_ENV);
     }
 
-    // ---- Redis 会话投影兼容旗标共享契约（中心解析器 + 冻结安装） ------------
-
-    /// 中心解析器（libs 与 env 覆盖共用一份语义）：unset/空白/false → false
-    /// （default-off）；"true" → true（trim + ASCII 大小写不敏感，对齐
-    /// `apply_flat_env_overrides` 的既有契约）；其他任何非空值 fail-closed
-    /// Err，错误信息只含变量名与期望格式，不回显值。
-    #[test]
-    fn redis_projection_compat_flag_parser_is_strict_and_default_off() {
-        assert!(!parse_redis_projection_compat(None).unwrap());
-        assert!(!parse_redis_projection_compat(Some("")).unwrap());
-        assert!(!parse_redis_projection_compat(Some("   ")).unwrap());
-        assert!(!parse_redis_projection_compat(Some("false")).unwrap());
-        assert!(!parse_redis_projection_compat(Some(" False ")).unwrap());
-        assert!(parse_redis_projection_compat(Some("true")).unwrap());
-        assert!(parse_redis_projection_compat(Some(" TRUE ")).unwrap());
-        for garbage in ["1", "0", "yes", "on", "enabled"] {
-            assert!(
-                parse_redis_projection_compat(Some(garbage)).is_err(),
-                "invalid value {garbage:?} must fail closed"
-            );
-        }
-        let error = parse_redis_projection_compat(Some("maybe")).unwrap_err();
-        assert!(matches!(
-            error,
-            ConfigValidationError::InvalidRedisProjectionCompat
-        ));
-        let rendered = error.to_string();
-        assert!(rendered.contains("ASTRAL_REDIS_PROJECTION_COMPAT"));
-        assert!(!rendered.contains("maybe"));
-    }
-
-    /// 进程级唯一冻结槽契约：first-wins、同值幂等、对槽内任何先到异值冻结
-    /// （其他安装器或 legacy env 回落读）冲突拒绝（fail-closed，组合进程内
-    /// 所有宿主安装器必须一致，且不得在读方背后改写已发布答案）。OnceLock
-    /// 是进程全局的：本测试是该二进制内唯一安装方，以 false 先冻结（若 env
-    /// 回落读测试先运行，冻结值同为 false，断言在两种顺序下均成立），在
-    /// 同一序列内覆盖三分支。
-    #[test]
-    fn redis_projection_compat_install_is_first_wins_identical_idempotent_and_conflict_refusing() {
-        // first-wins / 同值幂等：首次冻结 false（Redis-free 默认值）后，
-        // 同值重复安装幂等（组合进程成员宿主逐个安装同一份已校验值）。
-        assert!(install_redis_projection_compat(false).is_ok());
-        assert!(install_redis_projection_compat(false).is_ok());
-        // 异值冲突拒绝启动，绝不静默采纳后来者。
-        assert!(matches!(
-            install_redis_projection_compat(true),
-            Err(ConfigValidationError::RedisCompatFreezeConflict)
-        ));
-        // 冻结读返回首次冻结值（即便 env 声称相反值也不回落）。
-        assert!(!redis_projection_compat_frozen());
-    }
-
-    /// legacy/lib 的单槽 env 回落读：unset → false（default-off），非法值一律
-    /// false（fail-closed，绝不静默开启，无网络），并填充唯一冻结槽（此后
-    /// 安装器异值必冲突，见安装契约测试）。OnceLock 进程全局：本测试在锁内
-    /// 清空 env 后读取，env 派生值确定为 false；若安装测试先运行，槽内同为
-    /// false，断言在两种顺序下均成立。
-    #[test]
-    fn redis_projection_compat_env_frozen_read_defaults_closed_on_invalid_env() {
-        let _env_lock = env_contract_test_lock();
-        std::env::remove_var(REDIS_PROJECTION_COMPAT_ENV);
-        assert!(!redis_projection_compat_from_env_frozen());
-        // 与配置加载路径互补：本冻结读对非法值降级 false（libs 无启动失败
-        // 通道），宿主配置校验仍以 fail-fast 拒绝（见 flat env 契约测试）。
-    }
-
-    /// 宿主启动期把已校验旗标冻结进配置：env 缺失 → false；env "true" →
-    /// true；env 非法 → 配置加载失败（启动拒绝，fail-fast，错误只含变量名，
-    /// 不回显值）。这条 env 契约经中心解析器与 libs 冻结读共享同一语义。
-    #[test]
-    fn app_config_freezes_redis_projection_compat_flag_parsed_once_at_startup() {
-        let guard = FlatEnvGuard::acquire();
-        guard.set(
-            "DATABASE_URL",
-            "mysql://db.example.invalid:3306/astral_test",
-        );
-        guard.set("RABBITMQ_URL", "amqps://mq.example.invalid:5671/%2f");
-        guard.set(
-            "JWT_ACCESS_SECRET",
-            "dist-access-override-secret-0123456789abcdef",
-        );
-        guard.set(
-            "JWT_REFRESH_SECRET",
-            "dist-refresh-override-secret-0123456789abcdef",
-        );
-        guard.set("JWT_ACCESS_ISSUER", "dist-test-access-issuer");
-        guard.set("JWT_REFRESH_ISSUER", "dist-test-refresh-issuer");
-        guard.set("JWT_ACCESS_AUDIENCE", "dist-test-astral-api");
-        guard.set("JWT_REFRESH_AUDIENCE", "dist-test-astral-session");
-        guard.set(
-            "INTERNAL_SERVICE_SECRET",
-            "internal-lg-override-secret-0123456789",
-        );
-        guard.set("CORS_ALLOWED_ORIGINS", "https://console.example.invalid");
-
-        // env 缺失 → default-off（redis_url 允许为空，Redis-free 默认路径）。
-        let config = AppConfig::from_files_for(
-            "astral-common-redis-compat-contract-no-such-file",
-            JwtValidationRole::Learn,
-        )
-        .expect("file-less node without the compat flag must pass validation");
-        assert!(!config.redis_projection_compat_enabled);
-
-        // env 非法 → fail-fast（启动拒绝），且错误不得回显覆盖值。
-        guard.set(REDIS_PROJECTION_COMPAT_ENV, "maybe");
-        let error = AppConfig::from_files_for(
-            "astral-common-redis-compat-contract-no-such-file",
-            JwtValidationRole::Learn,
-        )
-        .expect_err("invalid compat flag must fail closed");
-        let rendered = error.to_string();
-        assert!(rendered.contains("ASTRAL_REDIS_PROJECTION_COMPAT"));
-        assert!(!rendered.contains("maybe"), "错误信息不得回显覆盖值");
-    }
-
     // ---- 单机镜像加速器默认语义（composite zero-DB 目标闭合） --------------
 
     /// 字段默认 true（serde 标量 default fn + Default impl 同源）：未配置即
@@ -2401,7 +1923,6 @@ mod tests {
         fs::write(
             &yaml_path,
             r#"session_grant_mirror_enabled: false
-redis_url: "redis://yaml-fallback.example.invalid:6379/0"
 jwt:
   access:
     issuer: "yaml-access-issuer"
@@ -2453,7 +1974,6 @@ cors:
             "DATABASE_URL",
             "mysql://db.example.invalid:3306/astral_test",
         );
-        guard.set("REDIS_URL", "redis://cache.example.invalid:6379/0");
         guard.set("RABBITMQ_URL", "amqps://mq.example.invalid:5671/%2f");
         guard.set(
             "JWT_ACCESS_SECRET",
@@ -2523,7 +2043,6 @@ cors:
         fs::write(
             &yaml_path,
             r#"org_scope_enabled: true
-redis_url: "redis://yaml-fallback.example.invalid:6379/0"
 jwt:
   access:
     issuer: "yaml-access-issuer"
@@ -2590,7 +2109,6 @@ cors:
             "DATABASE_URL",
             "mysql://db.example.invalid:3306/astral_test",
         );
-        guard.set("REDIS_URL", "redis://cache.example.invalid:6379/0");
         guard.set("RABBITMQ_URL", "amqps://mq.example.invalid:5671/%2f");
         guard.set(
             "JWT_ACCESS_SECRET",
@@ -2616,7 +2134,6 @@ cors:
             "GATEWAY_INTERNAL_SERVICE_SECRET",
             "gateway-internal-gi-override-secret-0123456",
         );
-        guard.set("SESSION_GRANT_CLAIMS_MODE", "REQUIRE");
         guard.set(
             "CORS_ALLOWED_ORIGINS",
             "https://console.example.invalid, https://admin.example.invalid",
@@ -2633,7 +2150,6 @@ cors:
             config.database_url,
             "mysql://db.example.invalid:3306/astral_test"
         );
-        assert_eq!(config.redis_url, "redis://cache.example.invalid:6379/0");
         assert_eq!(config.rabbitmq_url, "amqps://mq.example.invalid:5671/%2f");
         assert_eq!(
             config.learn_service_uri,
@@ -2679,7 +2195,6 @@ cors:
             config.gateway.internal_service_secret,
             "gateway-internal-gi-override-secret-0123456"
         );
-        assert_eq!(config.session_grant_claims_mode, "REQUIRE");
         assert_eq!(
             config.cors.allowed_origins,
             vec![
@@ -2731,8 +2246,7 @@ cors:
         ));
         fs::write(
             &yaml_path,
-            r#"redis_url: "redis://yaml-fallback.example.invalid:6379/0"
-learn_service_uri: "http://yaml-learn.example.invalid:9002"
+            r#"learn_service_uri: "http://yaml-learn.example.invalid:9002"
 identity_service_uri: "http://yaml-identity.example.invalid:9004"
 trust_graph_uri: "http://yaml-trustgraph.example.invalid:9005"
 monitor_service_uri: "http://yaml-monitor.example.invalid:9006"
@@ -2775,10 +2289,6 @@ cors:
         let _ = fs::remove_file(&yaml_path);
 
         // env 未覆盖的字段保留 YAML 值。
-        assert_eq!(
-            config.redis_url,
-            "redis://yaml-fallback.example.invalid:6379/0"
-        );
         assert_eq!(config.jwt.access.issuer, "yaml-access-issuer");
         assert_eq!(config.jwt.refresh.issuer, "yaml-refresh-issuer");
         assert_eq!(config.jwt.access.audience, "yaml-access-audience");
@@ -2830,7 +2340,6 @@ cors:
             "DATABASE_URL",
             "mysql://db.example.invalid:3306/astral_test",
         );
-        guard.set("REDIS_URL", "redis://cache.example.invalid:6379/0");
         guard.set("LEARN_SERVICE_URI", "http://env-learn.example.invalid:9002");
         guard.set(
             "IDENTITY_SERVICE_URI",

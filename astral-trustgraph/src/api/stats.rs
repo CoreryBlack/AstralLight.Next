@@ -1,6 +1,6 @@
 //! 统计与监控 API — HTTP adapter
 //!
-//! 暴露 PolicyEngine 的命中计数（L1/L2/L3）和纳秒级时序分解（纯内存）。
+//! Exposes PolicyEngine evaluation and decision counts with nanosecond timing breakdowns (in-memory).
 //! DB 级命中统计查询（summary / top-resources / zero-hit / by-card）数据访问
 //! 在 `repository::hit_stat_repository`；top-resources 走 `astral_db` 共享读。
 
@@ -20,7 +20,7 @@ use crate::AppState;
 
 pub fn stats_routes() -> Router<AppState> {
     Router::new()
-        // 内存级统计（PolicyEngine L1/L2/L3 命中 + 时序分解）
+        // In-memory evaluation/decision counts and timing breakdowns
         .route("/stats", get(get_stats))
         .route("/stats/reset", post(reset_stats))
         // 投影 worker 监督健康快照（F5 修复 1d）

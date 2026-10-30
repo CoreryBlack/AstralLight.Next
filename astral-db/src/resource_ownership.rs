@@ -122,7 +122,7 @@ pub async fn resolve_resource_ownership(
         actor_user_id,
     ) {
         ResolvePlan::Pure(outcome) => outcome,
-        ResolvePlan::LegacyStrictOnly => {
+        ResolvePlan::StrictDbOnly => {
             resolve_resource_ownership_strict(
                 pool,
                 resource,
@@ -250,7 +250,7 @@ enum ResolvePlan {
     Pure(ResourceOwnershipResolution),
     /// 完全不走记忆路径：chat 冻结表 lookup（写者不受 hub 栅栏保护）与
     /// 超界键，保持既有严格 DB 显式限制。
-    LegacyStrictOnly,
+    StrictDbOnly,
     /// 正常受保护目标：允许在复合激活门下走记忆读面。
     MemoryEligible(memory::OwnershipMemoryKey),
 }
@@ -309,14 +309,14 @@ fn resolve_plan(
                     actor_user_id,
                 )
             } else {
-                ResolvePlan::LegacyStrictOnly
+                ResolvePlan::StrictDbOnly
             }
         }
     }
 }
 
 /// 记忆路径支持的 lookup kind **闭合清单**（穷尽 match、无通配臂）：新增
-/// lookup kind 必须先在此分类 —— 默认落入 `false`（LegacyStrictOnly，闭合
+/// lookup kind 必须先在此分类 —— 默认落入 `false`（StrictDbOnly，闭合
 /// 门），只有其事实面全部写点完成 hub 栅栏覆盖并更新
 /// `memory_writer_coverage_inventory` 后才允许开启 `true`。
 ///
@@ -362,7 +362,7 @@ fn memory_plan(
         actor_user_id,
     ) {
         Some(key) => ResolvePlan::MemoryEligible(key),
-        None => ResolvePlan::LegacyStrictOnly,
+        None => ResolvePlan::StrictDbOnly,
     }
 }
 
@@ -758,16 +758,10 @@ fn global_access_requirement(
             "/stats"
                 | "/stats/reset"
                 | "/stats/projector"
-                | "/consistency/check"
-                | "/consistency/check/stats"
-                | "/consistency/check/violations"
-                | "/arbiter/arbitrate"
-                | "/arbiter/stats"
                 | "/alerts"
                 | "/alert-rules"
                 | "/alert-history"
                 | "/rules"
-                | "/cache"
                 | "/latency"
                 | "/resources"
                 | "/trend"
@@ -778,7 +772,6 @@ fn global_access_requirement(
                 | "/audit-logs"
                 | "/system-info"
                 | "/dashboard"
-                | "/consistency-check"
         ) || path.starts_with("/alerts/")
             || path.starts_with("/alert-rules/")
             || path.starts_with("/alert-history/")
@@ -2090,6 +2083,29 @@ mod tests {
     }
 
     #[test]
+    fn retired_monitor_routes_have_no_global_ownership_contract() {
+        for path in [
+            "/consistency/check",
+            "/consistency/check/stats",
+            "/consistency/check/violations",
+            "/arbiter/arbitrate",
+            "/arbiter/stats",
+            "/cache",
+            "/consistency-check",
+        ] {
+            for method in ["GET", "POST"] {
+                assert_eq!(
+                    route_ownership_contract("monitor", path, method, None),
+                    RouteOwnershipContract::Unresolved {
+                        code: "resource_ownership.target_missing",
+                    },
+                    "retired route must have no authorization target: {method} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn assisted_password_reset_preserves_authoritative_user_target_scope() {
         assert_eq!(
             route_ownership_contract("identity_users", "/users/7/password", "POST", None),
@@ -2645,11 +2661,9 @@ mod tests {
             "trustgraph",
             &[
                 include_str!("../../astral-trustgraph/src/api/approval.rs"),
-                include_str!("../../astral-trustgraph/src/api/arbiter.rs"),
                 include_str!("../../astral-trustgraph/src/api/audit.rs"),
                 include_str!("../../astral-trustgraph/src/api/audit_replay.rs"),
                 include_str!("../../astral-trustgraph/src/api/card_templates.rs"),
-                include_str!("../../astral-trustgraph/src/api/consistency_monitor.rs"),
                 include_str!("../../astral-trustgraph/src/api/cross_org_grants.rs"),
                 include_str!("../../astral-trustgraph/src/api/delegation.rs"),
                 include_str!("../../astral-trustgraph/src/api/departments.rs"),
@@ -2701,9 +2715,9 @@ mod tests {
             monitor_middleware,
             "pub const MONITOR_PATH_MAP:",
         );
-        assert!(
-            monitor_count >= 35,
-            "monitor route scan unexpectedly incomplete"
+        assert_eq!(
+            monitor_count, 33,
+            "reviewed monitor inventory: 18 alert, 5 notification, 7 dashboard and 3 root methods"
         );
 
         let chat_main = include_str!("../../astral-chat/src/main.rs");
@@ -3069,7 +3083,7 @@ mod tests {
             assert!(
                 matches!(
                     resolve_plan(resource, path, method, None, Some(1), Some(2)),
-                    ResolvePlan::LegacyStrictOnly
+                    ResolvePlan::StrictDbOnly
                 ),
                 "frozen chat table lookups must stay strictly DB: {resource} {path} {method}"
             );
@@ -3439,7 +3453,7 @@ mod tests {
             );
             assert!(matches!(
                 resolve_plan(resource, path, "GET", None, Some(1), Some(2)),
-                ResolvePlan::LegacyStrictOnly
+                ResolvePlan::StrictDbOnly
             ));
         }
     }

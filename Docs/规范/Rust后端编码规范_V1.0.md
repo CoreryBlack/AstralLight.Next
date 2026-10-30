@@ -2,12 +2,16 @@
 
 > 版本：1.4.0
 > 日期：2026-10-28
-> 状态：当前实现同步版（规则集完整结构与轻量发布凭证见 §15.7；运行时验收单列）
-> 适用范围：`` 工作区所有 Rust crate
+> 状态：当前软件合同；运行时验收单列
+> 适用范围：AstralLight Rust workspace 中所有 Rust crate
 >
-> 本版同步当前授权投影边界：canonical grant revision/delta/manifest/segment/current 链、`AuthorizationCompiler`、`AuthorizationProjector`、`AuthorizationArchiveWorker` 与生产 `SqlxRuleRepository` 的 published-evidence strict gate；旧 `authorization_projection_head/outbox`、`permission_rule_snapshot`、`rule_set_snapshot` 和旧 CARD/RULE_SET worker 仅作为兼容、迁移、对账或测试材料。本文是工程规范；架构解释和证据索引见 [Rust访问控制总览与调整路线](../架构/Rust架构设计/Rust访问控制总览与调整路线_V1.0.md) 与 [Rust权限投影快照与版本栅栏](../架构/Rust架构设计/Rust权限投影快照与版本栅栏_V1.0.md)。
+> CURRENT V6 合同：正式授权只经 `PolicyEngine::evaluate()` 和 published-evidence strict gate；`RuleRepository` 是四个无默认实现的 required read port（§7.2），projection 唯一执行协议为 `WorkerOwned`（§15.5）。Redis runtime/compatibility surface 已从当前合同移除；进程本地 L1 必须有 TTL、容量和清理边界，cache miss/failure 只回到严格 DB reader 或 `PENDING`/`DENY`，不声称等价替代跨实例性能或 Redis 指标。`astral-cache` crate/source/standalone manifest/lock/test surface 已退出当前软件合同；不得将其视为保留的 archive，也不得据此声称数据库表或外部环境已清理。旧 head/outbox 不再作为授权完成证明，仍用于 source correlation、revoke / RuleSet 初始化关联、ELIGIBILITY L1 invalidation 等明确职责；不据此声明数据库表已删除或任何环境已迁移。CURRENT V6 的完整授权 bundle 与采用、迁移和回退边界见 §§15.7–15.8。本文为工程规范；架构解释和证据索引见 [Rust访问控制总览与调整路线](../架构/Rust架构设计/Rust访问控制总览与调整路线_V1.0.md) 与 [Rust权限投影快照与版本栅栏](../架构/Rust架构设计/Rust权限投影快照与版本栅栏_V1.0.md)。
 >
-> 2026-10-01 实现同步：workspace 当前成员为 `policy-engine`、`astral-types`、`astral-common`、`astral-db`、`astral-mq`、`astral-gateway`、`astral-identity`、`astral-trustgraph`、`astral-monitor`、`astral-single-node`、`e2e-bootstrap`；`astral-learn` 与 `astral-chat` 源码仍在仓库但由 `Cargo.toml` 的 `exclude` 明确冻结，`astral-cache` 随 Redis 编译层退役（`redis-layer-retirement-20261002`，BREAKING CHANGE 登记与兼容窗见 15.3）以同样的 `exclude` 方式退出 workspace，三者均不属于默认 workspace 编译/测试边界（`astral-cache` 源码零删除，manifest 已改为自包含 archive crate）。默认构建（不带 `redis-compat`）零 Redis 编译与链接；Redis 兼容路径收敛到各 runtime 显式 `redis-compat` feature 与 `ASTRAL_REDIS_PROJECTION_COMPAT` 运行时门。正式生产授权由 `SqlxRuleRepository` 的 published-evidence strict gate 驱动；`AuthorizationCompiler`/`AuthorizationProjector` 是当前新链实现，旧 `snapshot.rs`、旧快照表读写和旧 CARD/RULE_SET 重建通道属于退役/兼容材料。迁移 `20260830000001`、`20260831000001`、`20260831000002`、`20260903000001` 已存在于源码，但目标数据库是否应用仍须由显式 migration 与部署验收证明。
+> 源码、历史迁移与验收状态须分别举证。`astral-learn` 与 `astral-chat` 仍位于 workspace 外；历史 v3 migration 文件名、字节、migration ID、SQLx checksum 与既有经验报告保持原样。文档中的 V6 adoption notice 不表示目标数据库、Redis/MQ 资源或任何部署环境已经修改。
+
+## CURRENT V6 验收边界
+
+源码检查、Rust 单元/契约、真实 MySQL/RabbitMQ、迁移与部署分别记录。本规范不保存阶段性测试计数；最终命令、快照、退出码、ignored/SKIP/BLOCKED 和日志以同一份任务证据为准。未执行的真实依赖、切流、迁移或外部环境操作不能由本规范或离线测试证明通过。
 
 ---
 
@@ -31,10 +35,10 @@
 | Crate | 类型 | 职责 |
 |-------|------|------|
 | `astral-types` | 库 | 共享类型、实体、错误模型、资源注册表。不依赖任何外部基础设施 |
-| `policy-engine` | 库 | 权限评估引擎核心。不直接依赖 MySQL/Redis/RabbitMQ，通过 trait 注入 |
+| `policy-engine` | 库 | 权限评估引擎核心。不直接依赖 MySQL/RabbitMQ，通过 trait 注入 |
 | `astral-common` | 库 | 公共基础设施：配置、错误处理、API 契约、日志、中间件、公共服务 |
 | `astral-db` | 库 | 数据库访问层：sqlx Repository 实现、迁移管理 |
-| `astral-cache` | 库（workspace exclude，自包含 archive） | Redis 缓存层：缓存装饰器、消息幂等；随 Redis 编译层退役退出 workspace（源码零删除，不参加默认编译/测试，恢复方式见 15.3） |
+| `astral-cache` | 已从 CURRENT V6 workspace 与运行时合同退役，当前仓库 tracked crate/source/standalone manifest/lock/test surfaces 已删除 | 不作为 archive 保留；不意味着数据库表、Redis 实例或部署环境已清理 |
 | `astral-mq` | 库 | 消息队列层：RabbitMQ 队列声明、Producer/Consumer |
 | `astral-gateway` | 二进制 | API 网关：JWT 验证、路由转发、限流、断路器 |
 | `astral-identity` | 二进制 | 身份认证服务：登录/注册/JWT 签发/用户管理/卡片管理/MFA |
@@ -56,7 +60,7 @@ policy-engine → astral-types
 astral-common → astral-types
     ↑
 astral-db → policy-engine + astral-common
-astral-cache → policy-engine + astral-common      # workspace exclude（自包含 archive，默认不编译）
+# astral-cache is outside the CURRENT V6 runtime and workspace contract
 astral-mq → astral-common
     ↑
 astral-gateway → astral-common
@@ -100,11 +104,10 @@ e2e-bootstrap → astral-types + astral-db
 src/
 ├── lib.rs              # 库根（crate 入口）
 ├── main.rs             # 二进制根
-├── engine.rs           # 核心引擎
+├── engine/              # PolicyEngine 正式评估与 strict gate
 ├── condition.rs        # 条件评估器
 ├── client.rs           # 客户端 API
 ├── authorization_compiler.rs # 版本化授权热状态编译内核
-├── engine.rs              # PolicyEngine 正式评估与 strict gate
 ├── service/            # 业务服务
 │   ├── mod.rs          # 子模块声明
 │   ├── users.rs        # 用户服务
@@ -151,23 +154,20 @@ impl RuleSetWriteService {
 // 3. 数据访问层（通过 trait + astral-db）：仅数据访问
 #[async_trait]
 pub trait RuleRepository: Send + Sync {
-    async fn load_rule_set_snapshots(&self, card_id: i64) -> Result<Vec<RuleSetSnapshot>, PolicyError>;
-    async fn load_permission_rules(&self, card_id: i64) -> Result<Vec<PermissionRule>, PolicyError>;
-    async fn load_rule_set_dependency_statuses(
+    async fn check_card_active(&self, ctx: &PolicyContext) -> Result<bool, PolicyError>;
+    async fn is_active_global_admin(&self, user_id: i64) -> Result<bool, PolicyError>;
+    async fn load_published_card_authorization(
         &self,
-        card_id: i64,
-    ) -> Result<Option<Vec<RuleSetDependencyStatus>>, PolicyError>;
-    async fn load_projected_delegated_rules(
+        scope: &PublishedCardEvidenceScope,
+    ) -> Result<Option<Arc<PublishedCardAuthorization>>, PolicyError>;
+    async fn load_org_authorization(
         &self,
-        card_id: i64,
-        resource: &str,
-        action: &str,
-    ) -> Result<Vec<PermissionRule>, PolicyError>;
+        ctx: &PolicyContext,
+    ) -> Result<OrgAuthorityRead, PolicyError>;
 }
-
-> 注意：旧 `PermissionRuleService`、`RuleRepositoryExt` 和 `SqlxRuleRepositoryExt` 已从 Rust 0.x workspace 内部实现移除。不得重新引入旧 owner；`load_rule_set_snapshots`、`load_permission_rules` 和 `load_projected_delegated_rules` 只供未声明 strict capability 的 legacy/test、迁移或诊断路径；生产 `SqlxRuleRepository` 唯一授权读端口是 `load_published_card_authorization`，raw/source reader 仅用于 realtime/一致性巡检。
 ```
 
+`RuleRepository` 的四个方法均为 required methods，无默认实现、capability marker 或兼容分发层：`check_card_active`、`is_active_global_admin`、`load_published_card_authorization`、`load_org_authorization`。缺少身份、GlobalAdmin、published evidence 或组织权威证明时，各 owner 必须返回明确的 fail-closed 结果；正式授权没有 snapshot、permission-rule、raw-source、realtime、oracle 或 Arbiter 兼容 reader。published diagnostics 与 simulation（若保留）是分离的非授权用途，不作为正式授权读口。
 
 ### 4.2 禁止事项
 
@@ -272,25 +272,18 @@ let sql = format!("SELECT * FROM rule_set WHERE name = '{}'", name);
 
 ### 7.2 Repository 模式
 
-正式权限读取由 `policy_engine::RuleRepository` trait 约束，生产实现位于 `astral-db::SqlxRuleRepository`。当前生产实现通过 `requires_published_card_evidence() == true` 进入 Rust-owned published-evidence strict gate；授权账本、delta 队列、manifest/segment/current 指针和归档证明分别由 `astral-db`/`astral-trustgraph` 的对应 owner 管理。旧 `authorization_projection_head/outbox` 仍可作为 writer-correlation 与 ELIGIBILITY 资格缓存失效表面存在，但不再是 CARD/RULE_SET 授权投影的生产完成证明。
+正式权限读取由 `policy_engine::RuleRepository` 的四个无默认实现方法约束，生产实现位于 `astral-db::SqlxRuleRepository`。它们分别校验卡上下文、读取活动 GlobalAdmin 事实、加载完整 published card authorization 和读取 ORG_SCOPE 权威状态；正式 `PolicyEngine::evaluate()` 无 capability marker、fallback 阶段或兼容 reader。缺少 current pointer、V6 manifest/segment seal、scope、lineage、generation、revoke-fence proof、最终复读或组织授权证明时只能 `PENDING`/`DENY`。旧 `authorization_projection_head/outbox` 不构成 canonical publication proof，仍可能用于 source correlation、revoke / RuleSet 初始化关联及 ELIGIBILITY L1 invalidation；本文不主张数据库表已删除。
 
-`RuleRepository` 中的 L1/L2/L2.5 读取方法仍为 legacy/test 或诊断兼容合同，必须明确与生产 strict gate 隔离：
+旧 snapshot、raw-source、consistency-oracle 和 realtime Arbiter 入口不再属于当前 formal authorization surface。Published diagnostics 与 simulation 若存在，仅作非授权用途并须与 formal evaluate 隔离；不得作为读取端口注入 `RuleRepository` 或提供 ALLOW。
 
-- `load_rule_set_snapshots` / `load_snapshot_winners`：仅供未声明 strict capability 的 legacy/test 路径读取旧 RuleSet snapshot；不能成为生产 `SqlxRuleRepository` 的授权入口；
-- `load_permission_rules`：仅供 legacy/test 路径读取旧 `permission_rule_snapshot`；空结果不回读 source；
-- `load_projected_delegated_rules`：仅供 legacy/test 的 generation-gated delegation 路径；raw/source reader 只用于 realtime/一致性巡检；
-- `load_published_card_authorization`：生产正式入口使用的唯一 published-evidence 读端口，缺 current、证明闩、scope 或完整性证据时只能 PENDING/DENY。
-
-旧 `PermissionRuleService`、`RuleRepositoryExt`、`SqlxRuleRepositoryExt` 和直接 `rebuild_snapshot` owner 不再是有效实现入口。Rust 0.x workspace 内部接口的删除必须同一变更迁移全部仓内调用方、测试和文档，并在提交/PR 中标注 `BREAKING CHANGE`，列出删除清单、替代入口、影响范围、生效时间、迁移方案和回滚方案；稳定 `pub` API、外部 HTTP、消息和数据库协议不适用该内部例外。
-
-2026-09-09 同步：生产 `SqlxRuleRepository` 的 strict gate 由 `PolicyEngine::evaluate()` 在 AUTHN/CARD_CONTEXT 与 resource/action 校验之后调用；`Ok(None)`、`Err`、非 Ready、证据畸形或 scope 不符均 fail-closed，禁止旧快照、raw source 或缓存回退。真实 MySQL/Redis/RabbitMQ 集成与正式切流仍需独立验收。
+Rust 0.x 内部 API 下线须同步仓内调用方、测试和文档，并在变更登记 `BREAKING CHANGE`，逐项列出删除面、替代入口、影响范围、生效时间、离线迁移/rebuild/preflight 与安全回退；不得在 source transaction 外制造未经批准的授权事实。
 
 
 ### 7.3 事务规范
 
 - 使用 `sqlx::Transaction` 或 `pool.begin().await?`
-- source mutation 的必要 source 写入、grant revision/delta event（或 legacy writer-correlation head/outbox）与 audit correlation 必须在同一短事务提交；事务内不访问 Redis/MQ
-- canonical manifest/segment/current 发布由 `AuthorizationProjector` 在提交后事务外编译、发布事务内 CAS 完成；旧 snapshot rebuild、cache eviction、MQ publish 与旧 head READY 只属于 legacy/迁移对照通道
+- source mutation 的必要 source 写入、grant revision/delta event、需要的 source-correlation head/outbox（含 revoke / RuleSet 初始化关联、ELIGIBILITY L1 invalidation）与 audit correlation 必须在同一短事务提交；事务内不访问网络/MQ/缓存。此描述不代表旧表删除
+- canonical manifest/segment/current 发布由唯一 `WorkerOwned` projector 在提交后处理；旧 snapshot rebuild、raw-source read、consistency oracle 与实时授权旁路不属于当前 formal gate。缓存失效只针对有界进程本地缓存；Redis adapter、Redis L2/MAC/shared-unit protocol 已退出当前 V6 contract
 - 写入失败、schema/migration/backfill 未完成、current/manifest/segment proof 不足、lease/CAS 未知或审计证据失败必须保持 PENDING/DENY、Blocked/Quarantine/Unknown 或 fail-closed；禁止通过旧 snapshot/source fallback 放行
 - 禁止在 handler 中直接管理事务
 
@@ -496,8 +489,7 @@ let config = AppConfig::from_files("app.yml")?;  // YAML + 环境变量覆盖
 ```rust
 LEARN_SERVICE_URI=http://localhost:9002
 DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
-# REDIS_URL 仅被显式启用 redis-compat 的部署消费（须同时 ASTRAL_REDIS_PROJECTION_COMPAT=true，见 15.3）；默认构建零 Redis 依赖。
-REDIS_URL=redis://localhost:6379
+# Redis is not a CURRENT V6 runtime dependency or configuration surface.
 RABBITMQ_URL=${RABBITMQ_URL:?RABBITMQ_URL is required}
 JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
 GATEWAY_HMAC_SECRET=${GATEWAY_HMAC_SECRET:?GATEWAY_HMAC_SECRET is required}
@@ -545,9 +537,9 @@ mod tests {
 ### 10.2 集成测试
 
 - 在 `tests/` 目录下创建集成测试文件
-- 使用 `testcontainers` crate 管理 MySQL/Redis/RabbitMQ 容器
-- Redis 集成示例/测试仅在显式 `redis-compat` feature 下编译（`required-features = ["redis-compat"]`）；feature 关闭时 cargo 将其整体 SKIP 且不计入通过数——SKIP 与 `#[ignore]` 统计必须与退出码分开记录，`exit 0` 不得折算为集成 PASS
-- 标记需要 Docker 的测试为 `#[ignore = "Requires Docker"]`；外部依赖（MySQL/Redis/RabbitMQ）集成必须用显式 ignored 命令在真实依赖上执行，未执行不得宣称 PASS
+- 对实际使用的 MySQL/RabbitMQ 集成可使用 Rust `testcontainers` crate；CURRENT V6 没有 Redis runtime adapter/profile
+- 历史 COMPAT25 real-Redis tests 曾编译为 no-run、未执行；它们不是当前 V6 gate，implementation change 删除其测试入口时不得重写历史报告或将未运行结果改为 PASS
+- 标记需要 Docker 的测试为 `#[ignore = "Requires Docker"]`；外部依赖（MySQL/RabbitMQ）集成必须用显式 ignored 命令在真实依赖上执行，未执行不得宣称 PASS
 
 
 ### 10.3 基准测试
@@ -662,17 +654,16 @@ pub struct PolicyContext {              // ✅ 使用 String 而非 &str
 ### 12.3 Trait 设计
 
 ```rust
-// ✅ 正确：trait 边界清晰，方法最少化
+// ✅ 正确：通用数据访问 trait 的边界清晰、方法最少化
 #[async_trait]
-pub trait RuleRepository: Send + Sync {
-    async fn load_rule_set_snapshots(&self, card_id: i64) -> Result<Vec<RuleSetSnapshot>, PolicyError>;
-    async fn check_card_active(&self, card_id: i64) -> bool { true }  // 默认实现
+pub trait ItemRepository: Send + Sync {
+    async fn find_by_id(&self, id: i64) -> Result<Option<Item>, RepositoryError>;
 }
 
 // ✅ 正确：使用 supertrait 表达层次关系
-pub trait WriteRepository: RuleRepository {
-    async fn insert_rule(&self, rule: RuleDto) -> Result<i64, RuleServiceError>;
-    async fn delete_rule(&self, id: i64) -> Result<(), RuleServiceError>;
+pub trait WritableItemRepository: ItemRepository {
+    async fn insert(&self, item: Item) -> Result<i64, RepositoryError>;
+    async fn delete(&self, id: i64) -> Result<(), RepositoryError>;
 }
 
 // ❌ 违反：trait 过大（违反接口隔离原则）
@@ -681,11 +672,13 @@ pub trait MegaRepository {              // ❌ 不要包含 20+ 方法
 }
 ```
 
+正式授权 `RuleRepository` 的唯一方法集与无默认实现要求见 §§4.1、7.2；通用 trait 示例不定义该安全边界。
+
 **Trait 设计原则**：
 
 | 原则 | 说明 |
 |------|------|
-| **最小接口** | trait 只包含该抽象的最小方法集，默认方法提供扩展 |
+| **最小接口** | trait 只包含该抽象的最小方法集；仅在默认行为语义安全且不削弱 required security checks 时使用默认方法 |
 | **单一职责** | 一个 trait 只做一件事（如 `RuleRepository` 只做规则查询） |
 | **Send + Sync** | trait 对象若跨线程必须标注 |
 | **#[async_trait]** | 异步 trait 必须使用该宏（稳定前） |
@@ -1059,11 +1052,10 @@ source mutation 的必要 source、grant revision/delta 和 audit correlation �
 
 #### 14.8.3 正式授权 fail-closed
 
-- 生产 `SqlxRuleRepository` 的 strict capability 为 true；`PolicyEngine::evaluate()` 在 AUTHN/CARD_CONTEXT 与 resource/action 校验后只读取 `load_published_card_authorization` 返回的 canonical evidence。
-- current pointer 缺失、`revoke_fence_proven` 未证明、manifest/segment 缺失或摘要失配、scope/lineage/generation 不一致、证据读取失败或有效 ALLOW 前复读失败 → `AUTHORIZATION_PENDING`/DENY。
-- 不得回退 `permission_rule_snapshot`、`rule_set_snapshot`、旧 head、raw source、`evaluate_realtime()` 或未认证缓存。
-- 未声明 strict capability 的 legacy/test repository 可保留旧 L1/L2/L2.5 阶段；旧 L2 repository error 在旧 L2.5 前 `DEPENDENCY_UNAVAILABLE`，但该兼容行为不能扩大生产路径。
-- 生产 evidence cache 只能缓存已认证的 current/manifest/segment 证据；MAC、content hash、TTL、scope 或 cache epoch 失配时回 strict reader，不能授权。
+- `PolicyEngine::evaluate()` 只通过四个 required `RuleRepository` methods 完成 active card、active GlobalAdmin、complete published card evidence 和 ORG_SCOPE authority checks；正式授权没有 capability marker、staged L1/L2/L2.5 fallback 或兼容读口。
+- current pointer 缺失、V6 seal/proof、`revoke_fence_proven`、manifest/segment、scope/lineage/generation 不一致、证据读取失败或有效 ALLOW 前最终复读失败 → `AUTHORIZATION_PENDING`/DENY。
+- 不得回退 `permission_rule_snapshot`、`rule_set_snapshot`、旧 head、raw source、realtime/oracle 或 cache-to-source fallback。Published diagnostics 与 simulation 若保留，只能作为非授权用途。
+- 进程本地 L1 evidence cache 必须严格有 TTL、容量与 GC；仅可缓存已认证完整的当前证据。miss、expiry、corruption 或 cache unavailable 必须回 strict DB reader 或 PENDING/DENY，不能授权。
 
 
 #### 14.8.4 授权投影 lineage fence、归档意图与 projector 失败处置（2026-08-27 同步）
@@ -1076,15 +1068,9 @@ Rust-owned `20260827000001_authorization_projection_lineage_fence.sql` 为授权
 - **NotReady backfill 与损坏分开处置**：projector 对 `backfill_or_rehearsal_required`（unproven history）按 `Blocked` 处理——事件保持 PENDING、在有界尝试预算内退避（预算耗尽后 max-cap），不是终态 quarantine，也不得用立即重试自愈，由 operator backfill/rehearsal 解决；确定性分歧或损坏（hash 漂移、immutable divergence、compiler stamp divergence、不可读 payload 等）按终态 quarantine 经 live-lease CAS 持久标记，quarantine 写入结果未知时停止后续 mutation 并单独计数（`events_quarantine_unknown`）。任何 unproven/unknown 状态都不得在任何一层扩大授权。
 
 
-#### 14.8.5 L2 evidence 缓存 CURRENT V6 认证契约（2026-10-28 同步）
+#### 14.8.5 V6 published evidence 的进程本地 L1 缓存
 
-published card evidence 的 L2 Redis 分发层（[`astral-db/src/evidence_cache.rs`](../../astral-db/src/evidence_cache.rs)，键族 `astral:auth:l2ev:*`/`astral:auth:l2sh:*`；`RedisL2EvidenceStore` 仅在显式 `redis-compat` feature 下编译，default-off，见 15.3）是可认证缓存而非默认可信存储，当前 V6 契约如下（stamp 语义见 §15.7）：
-
-- **专用密钥强制，fail-closed 旁路**：L2 读、写与发布后推送一律要求专用环境变量 `ASTRAL_L2_EVIDENCE_HMAC_SECRET`（仅接受非占位符且 ≥32 字节/字符的值；绝不复用网关/内部签名密钥，绝不硬编码）。未设置或无效时 L2 读/写/推送整体旁路，直接回源严格 reader `load_published_card_grant_evidence`（fail-closed）——绝不在未认证缓存字节上授权，进程内 warn 一次。
-- **HMAC-SHA256 绑定**：每张卡证据条目携带 `mac = HMAC-SHA256(专用密钥, 规范 cover)`，cover 绑定域分隔符 `astral:l2-evidence:v6:hmac-sha256`、精确 Redis 键（防键间重放）、V6 schema 版本、包含完整 stamp 的 manifest 版本组、`card_source_pending`、重建后完整 payload 及其 content_hash；读侧常数时间重验，缺失/失配/污染 → purge 回源，绝无“部分条目被接受”的路径。
-- **共享单元 storage-only**：跨卡共享仅限 RULE_SET 内容寻址存储单元（`astral:auth:l2sh:{cache_epoch}:{tenant_id}:{digest}`，tenant+时代限定）——只是存储字节，永远不是授权来源；身份字段全部来自逐卡 envelope，单元缺失/摘要失配 = miss 回源，绝不降级放行。
-- **单密钥语义与轮换**：每进程只解析一次密钥，不接受双密钥并存。轮换 = 更换 `ASTRAL_L2_EVIDENCE_HMAC_SECRET` 并轮换共享时代键 `astral:auth:cache_epoch`（Exec-L3 运维动作）；旧密钥条目在新密钥下 MAC 失配自然 purge 自愈。密钥泄露等同获得缓存伪造能力，轮换完成前属于 TCB 风险，须按敏感事件处置（撤销/轮换优先）。
-- **范围与验收现状**：本契约只覆盖 `astral:auth:l2ev:*`/`astral:auth:l2sh:*` 两个 Rust 专属键族；Java 缓存家族（`perm:card:status` 等）与 permission_query CURRENT V6 envelope 不在本节的 L2 HMAC 范围内，但同样须满足 §15.7 的完整 stamp 栅栏。共享内容单元当前 schema/标识为 V6，属于授权 bundle，不改变稳定业务 grant/delta identity。当前以 typed 单元测试与 `#[ignore]` 真实 Redis 集成测试（`required-features = ["redis-compat"]` 编译门 + `REDIS_URL`/`DATABASE_URL` 环境门禁；feature 关闭时整组 SKIP，环境未设置时显式 `[SKIP]`，二者均不得计为 PASS）覆盖；真实 Redis/MySQL 集成验收与生产切流仍是待办门禁，不得据此宣称生产验收。
+CURRENT V6 不定义 Redis L2 分发、HMAC/MAC cache protocol 或跨卡共享 Redis storage unit。published evidence 的进程本地 L1 只能作为性能提示，必须有有限 TTL、容量上限与 GC；entry 必须绑定完整 scope、generation/dependency/fence、V6 stamp 与 content integrity。缓存 miss、expired、malformed、corrupt、scope mismatch 或不可用时只回 strict DB reader，或保持 PENDING/DENY，不得回退旧 snapshot/raw source 或扩大授权。进程本地缓存不是 durable proof，也不等价替代 Redis 的跨实例性能和指标。历史 Redis/MAC/共享单元实现与 COMPAT25 结果只作历史参考，不能作为当前 V6 gate 或验收；COMPAT25 ignored real-Redis tests 是 compiled/no-run、not executed，不得报告 PASS。
 
 
 ### 14.9 文档注释
@@ -1092,8 +1078,8 @@ published card evidence 的 L2 Redis 分发层（[`astral-db/src/evidence_cache.
 ```rust
 /// PolicyEngine 生产授权入口
 ///
-/// AUTHN/CARD_CONTEXT 与 resource/action 校验后，生产 SqlxRuleRepository
-/// 进入 published-evidence strict gate；旧 L1/L2/L2.5 仅为 legacy/test 兼容阶段。
+/// AUTHN/CARD_CONTEXT 与 resource/action 校验后，唯一授权读口加载完整
+/// CURRENT V6 published evidence；不存在旧 L1/L2/L2.5 兼容阶段。
 /// current/manifest/segment proof 不足时返回 PENDING/DENY。
 ///
 /// # 参数
@@ -1107,8 +1093,8 @@ pub async fn evaluate<R: RuleRepository>(&self, ctx: &PolicyContext, repo: &R) -
 // 模块级文档
 //! 权限策略评估引擎核心
 //!
-//! 生产路径消费 canonical published evidence；
-//! legacy/test 路径才使用 L1/L2/L2.5 规则阶段；所有失败默认 fail-closed。
+//! 正式路径仅消费 canonical CURRENT V6 published evidence；所有失败默认 fail-closed。
+//! Published diagnostics / simulation 如存在，不构成授权读口或 fallback。
 ```
 
 - 所有 `pub` 项必须有 doc 注释
@@ -1145,62 +1131,45 @@ path = "src/main.rs"
 > 注：`astral-learn` 当前位于默认 workspace 之外（根 `Cargo.toml` 的 `exclude`），解冻前不计入默认 `cargo --workspace` 检查/测试边界；此处仅作 crate 元信息示例。
 
 
-### 15.3 Redis 编译层退役与 `redis-compat` 兼容窗（2026-10-01 同步）
+### 15.3 Redis compatibility 退役（CURRENT V6）
 
-> 变更登记：`redis-layer-retirement-20261002`。本节按根 `Cargo.toml`、各 crate manifest 与 `astral-common` 启动校验源码核对；**BREAKING CHANGE 自本次变更部署起生效**（本文描述的是源码/manifest 当前状态，不代表任何环境已完成安装）。
+**BREAKING CHANGE：CURRENT V6 software adoption retires Redis as an AstralLight runtime dependency and removes the current Redis compatibility contract.** This is a software/API contract notice, not evidence that a database, Redis instance, deployment, or other environment has been changed. The tracked `astral-cache` crate/source/standalone manifest/lock/tests are removed from this checkout; this does not imply that database tables, Redis instances, or external runtime resources were removed. This documentation change itself does not modify source, manifests, locks, or external infrastructure.
 
-**Workspace 边界（BREAKING CHANGE）**：
+Retired from the current contract are Redis dependencies and feature flags; Redis configuration/environment inputs including `REDIS_URL` and `ASTRAL_REDIS_PROJECTION_COMPAT`; Redis adapters and `Noop`/injection compatibility; Redis L2 evidence/MAC and shared-unit protocols; Redis-backed cache pools and projection/session adapters; and Redis health/metrics in Monitor. Do not add a hot mixed mode or startup selector for old/new Redis behavior.
 
-- `astral-cache` 从 workspace `members` 移入 `exclude`，源码保留，manifest 使用自包含依赖声明。归档验证从其 manifest 单独执行；恢复 workspace 成员前核对依赖版本和兼容调用方。
-- 默认构建（不带 `redis-compat`）的编译/链接树为零 Redis；`Cargo.lock` 仍保留 optional `redis` 条目，但它不属于默认编译树。
+The replacement is bounded process-local L1 caching with explicit TTL, capacity, and cleanup/GC policy, plus strict authoritative DB reads. Cache miss, expiry, corruption, or unavailability must never widen authorization and must fall back only to the strict DB reader or `PENDING`/`DENY`. MySQL session/JTI/replay and MQ lease durability are unchanged; Local and Rabbit transports remain. This replacement does **not** claim Redis-equivalent cross-instance performance, shared cache semantics, or metrics. Monitor Redis health and metrics are removed from the current contract.
 
-**Feature 模型**：`astral-db`、`astral-mq`、Gateway、Identity、TrustGraph、Monitor 显式声明 default-off 的 `redis-compat`，Redis 依赖为 optional。`astral-common/redis-compat` 是零依赖 marker，不能证明某个宿主编译了 adapter；每个宿主必须在 DB/worker 启动前以自身 `cfg!(feature = "redis-compat")` 调用 `validate_redis_adapter_support`。组合 `astral-single-node` 不提供 Redis adapter。
+Historical comparative Redis fixtures and empirical reports may remain if isolated from current AstralLight runtime and gates; report their actual status unchanged. COMPAT25 ignored real-Redis tests were compiled with `--no-run` and were not executed; implementation removes those test surfaces, but this history must never be reported as PASS. No database table deletion or environment cleanup is implied by this section.
 
-**BREAKING CHANGE 清单与替代路径**（默认路径均已切换；下列兼容 API 未删除，仅收敛到 feature 门内）：
+旧 Python campaign、profile、adapter、E1/E3/E4 runner 及通用运行胶水与当前 Rust 入口重复，已物理删除；`scripts/run-tests.sh` 仅转发到 Rust `test-campaign`。保留的 Python 数学/统计参考与历史 unittest 方法源不执行、不参与成功判定；Python unittest summary 不再生成 `PASS`。历史方法 crosswalk 对删除的正向能力使用 `RETIRED`，不能将其计为等价迁移。`RETIRED`、`PARTIAL`、`BLOCKED` 与实际 Rust 执行结果分别记录。
 
-| 受影响消费方 | 默认替代路径 | 保留的兼容入口（未删除） |
-|--------------|--------------|--------------------------|
-| `astral-mq` consumer 消息幂等 | durable DB 幂等 `init_idempotency_db` 为默认要求 | `init_idempotency_redis`、`shared_idempotency_redis` |
-| `astral-mq` consumers 会话撤销投影 | 进程内 LocalBus 撤销 handler + durable outbox | `set_session_revocation_redis` |
-| `astral-gateway` 网关 Redis 初始化 | redis-free 默认路径 | `init_gateway_redis` |
-| `astral-identity` 会话加速面 | MySQL durable proof 与进程内撤销面；默认构建没有 Redis 字段 | `AppState.redis` 字段仅 feature 开启时存在，类型仍为 `Option` |
-| Identity 会话投影 worker | `spawn_without_redis_owned` 为默认装配入口，持有死亡信号和有界关闭句柄 | `spawn_without_redis` 与 feature 门内 `spawn(pool, redis)` 保留 detached 兼容合同，`spawn_owned` 提供兼容 adapter 的 owned 入口 |
-| `astral-trustgraph` 缓存逐出 | 默认路径不触达 Redis | `delete_redis_keys` eviction compat 路径 |
-| `astral-db` evidence L2 与缓存适配 | 进程内 TTL/容量 evidence 缓存 + strict DB 回源 | `RedisL2EvidenceStore`、perm/资格缓存、连接池、共享 cache epoch 适配 |
+### 15.4 单机内存读写生命周期、SoD 与审计边界
 
-**迁移与运行时门**：需要 Redis 兼容路径的部署必须在构建期启用 `--features redis-compat`（含 feature 传播），并在运行期显式设置 `ASTRAL_REDIS_PROJECTION_COMPAT=true`（严格 bool，default-off，`astral-common::config` 唯一共享实现；开启时启动校验强制 `redis_url` 非空，`RedisCompatRequiresUrl`）。**未编译 redis-compat 的二进制在 env 置 true 时必须在启动期 fail-closed 拒绝**（`RedisCompatRequiresFeatureBuild`），不得静默 Redis-free 化或回退 raw/source 读取。
+本节记录需要保留的安全语义，不声称真实环境已完成验收。
 
-**回滚**：回滚 = 重新构建并部署兼容变体（`--features redis-compat` + `ASTRAL_REDIS_PROJECTION_COMPAT=true`）沿原链路恢复服务；**不得以删除 durable 事实（outbox/幂等行/投影/审计）作为回滚手段**。
-
-**兼容窗到期**：显式 adapter 的当前登记期限为 **2026-12-31**。到期前核对剩余调用方、真实验收和切换批准；到期日不会自动删除 API 或改变部署配置。未完成验收前不得宣称生产迁移完成。
-
-### 15.4 单机内存读写生命周期（2026-10-01 实现登记）
-
-本节登记 R1–R4 的代码语义与兼容边界；架构、容量和恢复入口见[内存权威读面与失效通道方案](../架构/Rust架构设计/Rust内存权威读面与失效通道架构方案_V0.1.md)。真实环境未据此完成验收。
-
-- **R1 失效传播**：单机使用有界 LocalBus/LocalProjectionBus 直发，低频 DB worker 仅恢复已提交意图。健康本地 supervisor 不执行周期全量 DB scan。多机保留 Rabbit durable 节点队列、exact inbox、application proof、confirm/ACK、DLX、水位和粘性 suspect；跨节点 δ 未实测，不宣称异常回退等于已证明的跨节点零窗口。
-- **R2 正式 evidence 内存化**：只复用完整严格校验的 published 状态；卡片全部 aggregate、generation/dependency/fence/read-gate、source/health token 与有效期均须满足。source guard 在 begin 前取得，COMMIT/autocommit await 前 arm，仅已证明成功 disarm；取消或未知结果关闭 authority 读取，不用普通投影对账替代 writer 结果证明。宿主在 ownership/authority 读取前捕获 opaque fence，在 SoD 后最终复检；hub 已安装但 token 不可得即拒绝。容量、GC 或版本耗尽不得把缺失状态变成完整证据。
-- **R3 资格及辅助镜像**：只缓存严格来源、完整物理绑定和期限的事实；每卡纪元 GC 不复用旧身份。组织 TenantUnmanaged 可缓存严格的“表存在且无 node”事实，SchemaUnmanaged 不缓存。资源归属仅支持已登记并覆盖 source writer 的类型，Chat 冻结表排除。SoD 仍为 deny-only 复核，策略收紧、provenance/context 或 read token 失配必须拒绝。
-- **R4 Redis 退役**：保留 §15.3 的编译兼容 API；宿主和 legacy 环境回落共用同一冻结值，同值幂等、异值拒绝。`session_grant_mirror_enabled` 默认 true，显式 false 和 positive-disabled 保留；只有组合进程强门下安装 VerifiedPositive，独立 Gateway 保持严格 DB/DenyOnly。
-- **SoD 持有语义（BREAKING CHANGE，随本次代码部署生效）**：context-aware 宿主路径以已经发布且当前有效的 `effective_grants` 与经过 provenance 对牌的组织贡献判断持有权限，冷/热同一合同；它不再把未经发布的 raw `permission_rule` 行当作额外拒绝依据。旧公开 `check_sod_conflict` 诊断入口保留 raw deny-biased 扫描。该变更可能使只有 raw 行、没有对应 published 授权的历史请求从拒绝变为放行，不能称为逐字节等同优化。替代入口为 `check_sod_conflict_with_context` 与 additive `check_sod_conflict_with_context_and_org`，旧 `check_sod_conflict_with_org` 保留诊断合同，影响 TrustGraph/Identity 的 SoD 宿主；部署前须对账依赖 raw 拒绝的历史规则并核验已发布贡献，回滚可恢复原诊断读取模式，不能删除 source、published 或审计事实。
-- **生命周期与恢复**：运行期监督单写者锁身份与必需 owner。owner 失败设置独立粘性故障门，心跳或 pointer 对账不清除此门；不以虚构 source writer 表达任务死亡，不自动重放未知副作用。快照仅作 warm hint，当前 pointer/manifest/reference/segment 重验失败从账本恢复，不能作为授权证明。
-- **source metadata**：卡/level template metadata 属于发行或治理事实，不制造无效果的授权 delta；保留 source fence 和同事务治理审计，实际管理员操作传播验证后的 actor/operation。受影响卡审计/资格扇出采用 SQL cap+1 和变更前拒绝，不能截断后报告成功。
-- **兼容与验收**：既有公开 strict/诊断接口及消息 wire 保留，新增 context-aware/有界/owned 接口以 additive 方式装配。默认 workspace 编译、lint、非 ignored 测试和范围格式须从最终冻结快照执行；真实 DB/MQ/兼容 Redis、migration、crash、跨节点和跨城验收单独记录，未执行不得报 PASS。
+- **失效传播**：单机使用有界 LocalBus/LocalProjectionBus；多机可使用 Rabbit durable transport、exact inbox、application proof、confirm/ACK、DLX、水位和 suspect 门。不得宣称异常回退等于跨实例零窗口或测试通过等于部署验收。
+- **正式 evidence 内存化**：只复用完整严格校验的 published 状态；aggregate、generation/dependency/fence/read-gate、source/health token 与有效期均须满足。DB/source guard、COMMIT 证明、opaque fence 与最终复读保持原有边界；取消或 UNKNOWN 关闭 authority read，必须先对账。缓存只能是有界进程本地 L1，TTL/容量/GC 耗尽不得将缺失状态转成完整证据。
+- **资格与组织状态**：ELIGIBILITY L1 只缓存严格来源、完整物理绑定和期限事实；组织 `TenantUnmanaged` 只在严格证明后可缓存，`SchemaUnmanaged` 不缓存。SoD 使用 context-aware published-only grants、经 provenance 对牌的组织贡献及 mandatory grant-time published-only port；旧 raw diagnostic SoD path 不再是当前授权/兼容 contract。策略、provenance/context 或 read token 失配必须拒绝。
+- **ELIGIBILITY L1 正命中栅栏**：缓存只优化物理双卡资格，不构成授权 evidence。每个可能返回正缓存的请求都在返回前后严格读取 ELIGIBILITY head，要求 `source_generation`/`revoke_fence` 与缓存条目相符且前后稳定；hub 路径还必须复核同一请求开始时捕获的 token。该闭合竞态的行为会在正缓存命中时增加两次 durable head DB 读取及相应延迟；任何 head 读取失败或栅栏/token 漂移均 fail-closed。
+- **SoD breaking behavior**：发布 SoD validation 仅以当前有效的 `effective_grants` 与可验证组织贡献判断授权冲突，不把 unpublished raw `permission_rule` 行作为正式授权语义。直接 `MANUAL` CREATE/UPDATE 在 source transaction 内强制执行 `check_grant_sod_conflict_in_tx`：锁定 ACTIVE/current 卡，校验 tenant/domain/user，拒绝未完成的 ADD/UPDATE/REMOVE/REVOKE（包括 NULL-card aggregate-wide 贡献），严格读取当前 published evidence，并以 `FOR SHARE` 读取 ACTIVE policies 后才允许 source 写入。CREATE 的显式注入 validator 早检不能替代该事务门；UPDATE 使用完整锁定 before-image，必须核对 source-rule tenant、joined source-card tenant 与新锁定卡一致。只有 published DIRECT grant 的唯一稳定 `GrantId`、`USER_CARD` aggregate、scope/content/provenance 全部与 before-image 一致时，才能从 STATIC held-grant 比较排除该项自身；其他 grant 和全部 DYNAMIC 检查仍保留。缺少动态 owner facts、冲突、证明不足或读取失败均阻止写入。策略上限 4096 行、evidence 上限 4MiB、总时限 3 秒；事务内不得访问缓存/hub、重新取 pool 连接或等待 projection。新的直接权限 grant 使用 enabled `MANUAL`；历史 `CARD_ONLY` 行只读/删除，不被自动改写。调用方须迁移到 context-aware Monitor SoD 和 mandatory grant-time port。上述 source 合同不证明真实 MySQL isolation、gap/next-key 锁、并发等待及 deadline 回滚已验证，也不扩展为全部 RuleSet/delegation/approval source 的 SoD 覆盖。
+- **生命周期与审计**：运行期监督单写者锁身份与必需 owner；owner 失败触发独立粘性故障门，心跳或 pointer 对账不清除此门；UNKNOWN 不自动重放。权限/授权变更按稳定 operation/message identity 关联审计，审计与 publication proof 分开验证。
+- **session revocation compensation**：仅补偿已提交的 `AUTH_SESSION_REVOCATION` intent，沿用稳定 operation identity；`retry_count` 同时作为单调 claim generation/CAS fence，lease 60 秒、最多 10 次、批次上限 100。只有匹配 user/event/payload 的精确 processed outbox proof 才能 `COMPLETED`；unsupported/retired 操作终止为 `FAILED` 并人工对账。未知结果须先 reconcile，不能通用重放或误报完成。
+- **source metadata**：卡/level template metadata 属于发行或治理事实，不制造无效果授权 delta；保留 source fence 和同事务治理审计，受影响卡 fan-out 须 bounded 且不能截断后报告成功。
+- **验证边界**：默认 workspace 检查与真实 DB/MQ、migration、crash、跨节点和部署验收分别记录；未执行不得报 PASS。Redis compatibility 不再是当前验收 profile。
 
 ---
 
 
-### 15.5 聚合发布 ownership 与请求完成等待（2026-10-15，default-off）
+### 15.5 聚合发布 ownership 与请求完成等待（唯一 `WorkerOwned` 协议）
 
-`ASTRAL_PROJECTION_EXECUTION_MODE` 只接受 `legacy-hybrid`（缺省）或 `worker-owned`；启动时冻结，同值幂等、异值或未知值拒绝。配置冻结不执行 SQL；连接后必须先验证对应 schema，再启动 worker 和请求。调度拓扑 `TenantSerial` / `Partitioned` 与执行协议是不同维度，不得按是否安装 LocalBus 临时切换协议。
+`WorkerOwned` 是唯一 projection execution protocol。`ASTRAL_PROJECTION_EXECUTION_MODE` selector、`legacy-hybrid` mode、hybrid fallback、request-side claim/release、synchronous publisher targets 和其 configuration/API surfaces 均移除；不得新增 hot mixed mode。`TenantSerial` 与 `Partitioned` 是独立 topology choices，并保留各自既有默认值；ORG_SCOPE 的 default-off 状态与租户范围不因 topology 改变。配置/拓扑不是 source authorization mutation，也不执行 migration。
 
-- **请求边界**：source transaction 保持短事务。只有已证明 COMMIT 成功才交付事务中保存的完整 `DeltaEventAppendRequest` 批次；commit 未知时不投递、不重放 source。`worker-owned` 请求只对完整 receipt 做有界 durable completion 等待，不 claim、编译、发布、release 或取消 worker lease。批次超过等待上限整体交回 worker，不能只完成前缀就报告全部完成。
-- **执行边界**：本地通知、DB polling 和恢复共用 `(tenant_id, aggregate_type, aggregate_id)` 聚合能力、持久单调 epoch、fresh token 和唯一 active-event slot。event lease、operation id、通知 admission 或 ACK 都不能替代聚合能力。互斥不替代发布顺序：同 aggregate 按 `(source_generation, delta_event_id)` 推进，存在更早的未成功贡献时，在安装 event lease 前返回 `Busy`；轮询发现使用相同前驱门。前驱退避、隔离或未知不能由后继越过，且等待不增加认领、execution 或 failure 计数。worker 只物化已批准 source mutation，不产生新的授权事实。
-- **发布与完成**：发布事务保持 lane → active delta → pointer → plan/manifest；只读完成观察使用 lane → pointer → exact delta → plan/manifest，并且仅接受 `SUCCEEDED` delta。完成观察不得先持历史 delta 再等待 pointer，否则会与 pointer-first 的规划读取形成锁环；lane 互斥保证它不会与同 aggregate 的 owned 发布并行持锁。规划 frontier 只纳入当前 generation 以内的已成功贡献，不把 active 未完成事件当作历史完成。impact plan、完整 manifest/segment/current CAS、delta `SUCCEEDED`、完成 seal 与 active slot 清理必须在同一事务。完成观察按精确不可变绑定验证历史发布，并验证目标 plan 的完整 item-set commitment、当前指针和保留历史的连续 parent/reference/segment seal；后继 pointer 不否定已证明的历史完成，但单看最新 pointer、status 或 join count 也不能证明完成。完整保留且通过校验的 `SUPERSEDED` manifest 必须有同一发布事务写入的 archive intent，可以证明历史发布，不能证明归档完成；已标记 `SUCCEEDED` 的 archive intent 必须匹配完整 terminal archive proof。历史被移除、损坏、缺 intent 或缺完成 seal 时不返回完成证明，也不从剩余行静默回填。
-- **完成 commitment 与保留**：owned 发布将规范化 impact item 集合及 plan 身份、版本、generation、目标 manifest/digest 的 SHA-256 commitment 写入既有 `audit_log` 的 `owned_lane_COMPLETION_SEAL` 事件，严格要求唯一匹配。该记录与对应 delta/plan/manifest 历史共同保留；审计清理不得独立删除它后仍承诺历史完成。目标故障是部分 item 删除、字段漂移、重复/缺失 seal 和历史链破坏；阻断点是原子发布或只读完成验证，证据不足只会延迟/拒绝完成，不扩大授权。此 commitment 检测存储损坏或越界写入，不防御同时可任意重写事实与 seal 的数据库管理员；数据库和审计写入权限仍属可信计算基。保留历史验证成本随历史及载荷增长，不是常数时间；请求等待超时只交回 worker，不释放或重放未知执行。
-- **预算与失败**：旧 `attempts` 保留为认领统计；真实执行次数与已证明执行失败分别计数。绑定校验、前驱等待、调度让行、dependency 和 pointer-moved replan 不污染 failure budget。历史计数不能无证据归零；切换前 drain/对账，首次加入 owned accounting 保守继承旧预算。UNKNOWN 先对账，不自动释放、失败标记或重放；已提交但镜像不可用只恢复镜像。
-- **切换与回退**：新迁移 `20261015000001` 只增加 owned lane 与 execution accounting 列，release 保留 epoch 墓碑。启用前停止所有旧执行者并对账 source、delta、lane、manifest/current 和审计；不支持旧二进制与新协议混跑。回退先停新执行者并证明无 active/unknown episode，保留新增列和所有 durable 事实，按兼容模式重新启动；再次启用必须重新对账预算，不靠改 env 热切换。
-- **读安全和证据边界**：撤销/收窄 pending-invalidates gate 与最终严格复读保持；普通新增不作为全卡阻塞。模型、单元测试、进程内签名 HTTP、真实 MySQL 与部署验收分别记录，未执行或缺 durable proof 不计 `PASS`。精确索引点查仍是 B-tree 查找，统一 owner 不消除全 manifest 物化成本。
+- **请求边界**：source transaction 保持短事务。只有 COMMIT 已证明成功才向 worker 交付完整不可变 receipt/batch；COMMIT UNKNOWN 时不投递、不重放 source，须先以 stable operation/event identity 对账。request-side 只可在 COMMIT proof 后对精确完整 receipt 做有界等待 durable completion；不得 claim、compile、publish、release 或取消 worker lease。等待预算为 5 秒、25 毫秒轮询，至多 64 个 event 与 50 个 distinct card scopes；超过边界时将完整 batch 交还 worker，不截断或只确认前缀。等待超时只表示尚未取得完成 proof，完整 batch 仍由唯一 worker owner 负责。
+- **执行边界**：通知、DB polling 与 recovery 共用 `(tenant_id, aggregate_type, aggregate_id)` lane、持久单调 epoch、fresh token 和唯一 active-event slot。event lease、operation ID、通知 admission 或 ACK 均不能替代 lane ownership。同 aggregate 按 `(source_generation, delta_event_id)` 前驱顺序推进；更早的未成功/未知贡献不能由后继越过。等待不增加 claim/execution/failure 预算。WorkerOwned 只物化已批准的 source mutation，不创造新授权事实。
+- **发布与完成**：发布与只读完成观察遵循固定 lane/active delta/pointer/plan/manifest 锁序；manifest/segment/current CAS、delta `SUCCEEDED`、完整 completion seal 与 active slot 清理须在一个事务提交。每个 source receipt 必须取得精确 durable completion proof；精确完成读取验证不可变绑定、目标 plan 完整 item-set commitment、当前 pointer 和保留历史链。status、ACK、join count 或单看 latest pointer 都不是 durable completion proof。Archive intent 的完整性与 terminal archive proof 分别验证。证据缺失、截断、历史破坏或 UNKNOWN 时不报告完成、不静默补证。
+- **预算与恢复**：区分认领次数、实际执行和已证明失败；调度等待、前驱阻塞、dependency 状态，以及额度内的原地 replan 不消耗执行失败预算。pointer-moved 原地重规划最多 3 次，加首次最多 4 次发布尝试；每次都先证明 owned execution episode，仍失败后通过同一 owned transition 只计一次执行失败并进入有界退避。UNKNOWN 先对账，不自动 release、失败标记或 replay；有限重试仅在稳定 id + CAS/lease/idempotency 保护且未知状态已 reconciled 时允许。ACK 前证明 durable state 已落盘。
+- **采用与回退**：BREAKING CHANGE 自采用新分支软件起生效。新旧执行协议/二进制不能混跑；采用前 offline preflight、停止旧执行者、drain 并 reconcile source commit、delta、lane、active slot、manifest/current、audit 和所有 UNKNOWN，确认 schema/worker ownership/postcondition。若新软件不能继续，必须停新写/执行者、对账所有已启动及未知 episode，再恢复到基线 `62b4349`；不得只改环境变量、切回 hybrid、丢弃 durable facts、DROP 列、重置 generation/fence 或用旧快照恢复放行。再启用前重做 preflight/reconcile。本文不宣称上述迁移或恢复已执行。
+- **读安全与证据边界**：撤销/收窄 pending-invalidates gate 与最终严格复读保持。模型、unit、进程内传输和真实 MySQL/MQ/部署证据分层记录；未执行或缺 durable proof 不计 `PASS`。
 
 <a id="156-授权代际-v3-封存合同2026-10-27"></a>
 
@@ -1213,9 +1182,9 @@ path = "src/main.rs"
 - **时间职责**：`sealed_at` 是候选首次成功持久化封存时间，不是精确 COMMIT 时刻、请求时间、缓存读取时间、消息时间或快照捕获时间。NTP 由服务器保证；应用读取系统 UTC，编译器不读时钟、不访问网络。时间限制为 MySQL DATETIME 年份 1000–9999 的整秒，JSON 使用规范 RFC 3339 UTC 字符串。允许同秒或时钟小幅回调，排序和并发由 generation/CAS/fence 维持，不用时间单独授权。
 - **稳定重试**：staging 在 pointer、父 manifest、目标 manifest 的锁序内按 aggregate＋target generation 查找候选，核对全部不可变维度及内容后复用原时间和摘要；仅首次插入采样时间。同代冲突不覆写。已证明回滚的尝试没有形成持久封存；COMMIT 未知先按 event/operation 对账，不重新取时间自动重放。
 - **内容与读门（历史 v3 记录）**：时间仅进入代际 manifest 摘要，不进入 segment 内容地址。parent、finalize、publish、strict read、recovery、completion 和 archive 共用历史 v3 验证；内存安装核对 stage 与已提交状态的封存证据，同代分歧进入 suspect/PENDING。快照 payload 仅接受 CURRENT V6 payload，完整内容通过公共验证器，并在同一 durable 读取事务对照 pointer＋seal＋最终 manifest 摘要；旧 V1/V2 及缺字段或失配拒绝，不补造时间。MQ invalidation 只传 metadata，由严格读取获取完整证据；其 wire、segment/archive/completion domain 和快照 digest domain 均随 CURRENT V6 edition 成套升级。
-- **schema 和替代路径（历史 v3 artifact）**：不可变 migration `20261027000001_authorization_projection_manifest_v3.sql` 增加必填无默认值的 `manifest_digest_version` 与 `sealed_at`；文件名、migration ID、SQLx checksum 和历史 SQL 内容保持原样。运行时 CURRENT V6 只接受共享 edition 对应的 seal/digest；旧开发 manifest 或现有 v3 rows 不得由新 reader 自动改写，缺少 CURRENT V6 证明时必须 BLOCKED，按批准的 derived-state rebuild 从保留 source/ledger、撤销和审计事实重建。仅供旧快照内部使用且已无调用方的旧锁定入口是否移除由代码变更另行记录；本节不把文件版本名当作 release number。
+- **schema 和替代路径（历史 v3 artifact）**：不可变 migration `20261027000001_authorization_projection_manifest_v3.sql` 增加必填无默认值的 `manifest_digest_version` 与 `sealed_at`；文件名、migration ID、SQLx checksum 和历史 SQL 内容保持原样。运行时 CURRENT V6 只接受共享 edition 对应的 seal/digest；旧开发 manifest 或现有 v3 rows 不得由新 reader 自动改写，缺少 CURRENT V6 证明时必须 BLOCKED，按批准的 derived-state rebuild 从保留 source/ledger、撤销和审计事实重建。Redis/MAC cache history is outside the current V6 contract (see §15.3); this section does not treat a filename version as a release number.
 - **威胁与故障边界**：针对时间字段漂移、同代候选分歧、旧格式降级解释及快照文件自洽但与 durable 不同的故障，在 schema、封存摘要、严格读取和安装处拒绝。误放行代价是接受不一致授权证据，故默认 PENDING/DENY；误拒绝会延迟服务，需对账/重建恢复。普通 SHA-256 不认证发布者，数据库与审计权限仍属于既有可信计算基；本轮不实现恶意管理员防御、多云共识或自动覆盖数据库。
-- **迁移和回退（历史 v3 记录，CURRENT V6 适用）**：停旧执行者并对账 UNKNOWN 后才可显式迁移；运行时不自动 DDL。V6 是代码、digest/seal、compiler、manifest/segment/archive/completion、invalidation、cache/MAC、snapshot schema/payload 与 reader gate 的原子 bundle，升级或回退都必须停止、reconcile、validate 后执行经批准的环境操作。不得把旧 v3 durable proof/MAC 原地重标为 V6，不得自动协商或接受低版本；不得重置 generation、恢复 revoked access、删除 pending 或用旧 snapshot/source fallback 放行。真实迁移/清理/部署另走批准、备份/恢复或 forward-fix、postcondition 和人工终审。
+- **迁移和回退（历史 v3 记录，CURRENT V6 适用）**：停旧执行者并对账 UNKNOWN 后才可显式迁移；运行时不自动 DDL。V6 是代码、digest/seal、compiler、manifest/segment/archive/completion、invalidation、snapshot schema/payload 与 reader gate 的原子授权 bundle；缓存只有有界进程本地 L1，不包含 Redis/MAC 协议。升级或回退都必须停止、reconcile、validate 后执行经批准的环境操作。不得把旧 v3 durable proof 原地重标为 V6，不得自动协商或接受低版本；不得重置 generation、恢复 revoked access、删除 pending 或用旧 snapshot/source fallback 放行。真实迁移/清理/部署另走批准、备份/恢复或 forward-fix、postcondition 和人工终审。
 
 <a id="157-规则集完整结构与轻量发布栅栏标准2026-10-28"></a>
 
@@ -1225,7 +1194,7 @@ path = "src/main.rs"
 
 #### 15.7.0 CURRENT V6 单一授权 edition 与派生标识
 
-`AUTHORIZATION_EDITION=6` 是当前授权发布号的唯一 live numeric source；选择 V6 是因为当前 permission envelope 的最高现行版本为 V6。该值定义于共享 `astral-types/src/edition.rs` 的单一 `authorization_edition!(6)` 宏。所有当前数字和字符串标识必须由该宏派生；跨 crate Rust contract test 必须验证各 crate 使用同一 edition，禁止在 policy-engine、DB、MQ、cache、snapshot、ORG_SCOPE 或文档中另造 release-number 常量。以下标识属于同一 CURRENT V6 bundle：
+`AUTHORIZATION_EDITION=6` 是当前授权发布号的唯一 live numeric source，由共享 `astral-types/src/edition.rs` 的单一 `authorization_edition!(6)` 宏定义。所有当前数字和字符串标识必须由该宏派生；跨 crate Rust contract test 必须验证各 crate 使用同一 edition，禁止在 policy-engine、DB、MQ、cache、snapshot、ORG_SCOPE 或文档中另造 release-number 常量。选择 V6 是统一本次完整授权 bundle 的切换标识，不表示 generic permission envelope、L2 evidence 或 Redis shared-unit 存在当前 V6 cache protocol。以下标识属于同一 CURRENT V6 bundle：
 
 | 语义 | CURRENT V6 标识 |
 |---|---|
@@ -1239,13 +1208,13 @@ path = "src/main.rs"
 | ORG_SCOPE publication compiler | `astral-org-authorization-v6` (default-off) |
 | ORG_SCOPE dependency/segment/manifest proof domains | `astral-org-dependencies-v6`、`astral-org-segment-v6`、`astral-org-publication-v6` (default-off) |
 | invalidation event families | `EVIDENCE_INVALIDATED`、`ELIGIBILITY_INVALIDATED`、`SESSION_REVOKED`、`INVALIDATION_HEARTBEAT` all V6 |
-| permission/L2 evidence/shared content unit | permission envelope V6; L2 evidence V6; shared content unit V6 |
-| L2 MAC | `astral:l2-evidence:v6:hmac-sha256` |
+| retired compatibility surface | No CURRENT V6 permission-envelope cache, Redis L2 evidence, shared content-unit, or Redis MAC protocol; only bounded process-local L1 plus strict DB reads |
+| cache | bounded process-local L1 with TTL/capacity/GC; no Redis L2/MAC/shared-unit protocol |
 | snapshot | CURRENT frame/schema V6 and authorization payload V6; old V1/V2 names retained only for rejection diagnostics |
 
 上述 release labels 不改变稳定业务 grant/delta identity encoding、UUIDv5 algorithm、generation/revoke/lease 语义、HTTP API routes、Cargo semver、schema migration IDs、历史 SQL/checksums 或文档文件名版本。版本一致性也不等于权限或 generation downgrade，不以 NTP 时间排序取代 generation/CAS/fence/lease。
 
-旧 V1/V2/V3/V5 constants 如因公共 API、历史数据或错误诊断保留，必须明确标为 retired/rejection-only；新 reader/runtime 不接受旧 proof、旧 MAC、旧 wire、旧 cache 或旧 snapshot，且不自动协商、补字段、重标 durable proof 或降级放行。
+旧 V1/V2/V3/V5 constants 如因公共 API、历史数据或错误诊断保留，必须明确标为 retired/rejection-only；新 reader/runtime 不接受旧 proof、旧 wire 或旧 snapshot，且不自动协商、补字段、重标 durable proof 或降级放行。V6 不再定义 Redis MAC、Redis L2 或共享缓存单元，不能把其历史版本号写成当前协议。
 
 
 
@@ -1267,10 +1236,12 @@ path = "src/main.rs"
 
 #### 15.7.2 命令、读视图与公开兼容面
 
-- 生产 repository/API 读视图必须从上述完整源模型生成。响应保留既有 `id`、`refType`、`resource`、`action` 等公开键，并补齐 canonical 字段；别名必须从同一源字段生成，不得独立写入。`refType` 在规则集摘要中是历史 `source_type` 别名，在 binding 中才是 `BASE`/`OVERLAY`。
+- 生产 repository/API 读视图必须从上述完整源模型生成。CURRENT V6 RuleSet HTTP DTO 只输出 canonical `ruleSetId`、`sourceType`、`entryId`、`resourceType`、`actionCode`；规则集摘要不输出历史 `id`/`refType` 别名，entry 不输出 `resource`/`action` 别名。RuleSet create/update/entry commands 使用 canonical 字段并拒绝未知字段；binding `refType` 仍是 `BASE`/`OVERLAY`，不等同摘要的 `sourceType`。
 - 写命令是受限输入，不能直接反序列化完整 source response。生成 ID、tenant、source owner、服务器时间及其他未开放字段不能由客户端覆盖；未知或未支持字段必须显式拒绝，不能接受后忽略。既有 immutable 字段若作为兼容输入保留，只能作为与现值一致的断言，不能改写 ownership。
-- 稳定公开的旧 `RuleSet`、`RuleSetEntry`、`CardRuleSetRef` 保留原 Rust 字段和 serde 形状，仅作为 legacy 兼容模型；生产路径改用完整模型。不得用 type alias 或伪造缺失字段把旧实体解释为完整规则集。HTTP 兼容键、共享 public API 和数据库协议不得因仓内接口升级被隐式删除。
+- 旧 Rust `RuleSet`、`RuleSetEntry`、`CardRuleSetRef` 简化实体及其兼容导出已删除；仓内调用方使用完整源模型 `RuleSetDefinition`、`RuleSetEntryDefinition`、`CardRuleSetBinding`。不得用 type alias 或伪造缺失字段恢复旧模型。
 - `CanonicalGrant` 仍保存 grant identity、revision/state、source/binding、tenant/domain/card/user、resource/action/effect、validity 和 provenance；RULE_SET 贡献必须保留 binding 与 source entry。source revision 与 source/publication generation 分属不同版本域。
+
+条件 `condition_json` 仅接受原生 `conditionType` + `params`，或 one-key `allOf`/`anyOf`/`not` group；条件名为 native PascalCase。legacy key/wrapper、lower-camel alias、混合结构与未知条件均拒绝；`TimeRangeCondition` 使用小写 `timezone` 参数，旧 `timeZone` 不能归一化。具体 parser gate 见 `policy-engine::normalize_condition_json`。
 
 #### 15.7.3 轻量发布身份：版本号＋哈希＋时间戳
 
@@ -1300,17 +1271,17 @@ source 短事务仍只写必要 source、ledger/delta 和审计关联；source C
 
 失效消息只传 scope/provenance/fence 和轻量 stamp，不传规则条目，也不独立批准新授权。source mutation 的失效 metadata 可携带同一 source 事务严格读取的已提交发布基线；它表示被观察/即将失效的旧发布，并不证明该 source mutation 已物化。没有已发布 pointer 时不造 stamp，原 pending/source generation/revoke fence 仍独立拦截。consumer 在 typed wire、durable receipt、内存应用和后续严格读取中保持同一 stamp；缺失/旧 wire 和冲突进入失败隔离或 PENDING，不能凭 ACK 当作完成。消息 envelope 的发送时间不替代 seal。当前 `EVIDENCE_INVALIDATED`、`ELIGIBILITY_INVALIDATED`、`SESSION_REVOKED` 与 `INVALIDATION_HEARTBEAT` 全部使用 CURRENT V6 wire/domain；旧 V1/V2 仅作拒绝诊断。
 
-缓存的逐聚合身份从同 scope 的 COMMITTED manifest 派生完整 stamp。轻读以 LEFT JOIN 保留损坏 pointer 行，再校验 READY、撤销 proof、scope、generation、revoke fence 和 provenance；缺失 manifest、重复聚合、旧格式或非法时间一律拒绝，不能以 INNER JOIN 漏行或哨兵值制造相等。permission envelope、L2 evidence 与共享内容单元当前均为 V6；L2 MAC 域为 `astral:l2-evidence:v6:hmac-sha256`，cover 包含完整 stamp、pending 位和完整 evidence。旧 permission V1–V5、L2 V1–V5 及更早条目 miss/purge 后严格回源，不补字段。permission envelope 在统一前已使用数字 6：非空旧条目中的 seal 旧版会拒绝，但空 manifest 元数据可能仍能按当前形状解码，不能声称 schema gate 能区分全部旧 V6 字节。切换需按批准的缓存清理/时代轮换方案处理旧条目；空集也不能替代 pending、完整 fence、epoch 与 strict read-gate。TTL、容量、GC 和 source pending 防线继续独立生效。
+曾设计的 Redis permission envelope、L2 evidence、共享内容单元与 MAC 读缓存协议均已退出 CURRENT V6；相关旧 serializer、版本字段、MAC-domain 和跨实例缓存轮换不是当前读路径或当前切换面。正式读取只消费经过校验的完整 published evidence：逐聚合身份来自同 scope 的 COMMITTED manifest，轻读以 LEFT JOIN 保留损坏 pointer 行，并校验 READY、撤销 proof、scope、generation、revoke fence 和 provenance；缺失 manifest、重复聚合、格式错误或非法时间一律拒绝，不能以 INNER JOIN 漏行或哨兵值制造相等。有限进程内 L1 必须有 TTL、容量与 GC；失配时只严格回源或 PENDING/DENY，不得成为 durable proof。
 
-本地快照当前只接受 `CURRENT` frame/schema V6（`SNAPSHOT_SCHEMA_VERSION = 6`），内层授权 payload 当前只接受同一 CURRENT V6 edition（`SNAPSHOT_PAYLOAD_VERSION = 6`）；外层 frame 与内层 payload 是两个字段/校验层，但共同消费同一个授权 edition，不能各自协商、混用或独立回退。旧 V1/V2 常量如保留只用于拒绝诊断。快照保留完整发布状态，frontier 只保存 compact stamp。恢复先验证文件完整性，再在同一有界 pointer-first durable 事务严格读取链并核对 pointer＋stamp；generation-only 或 pointer-only 相等不足以取得信任。hint 只进入 Warming，`warm_from_durable` 与通道实活/对账门仍适用。PolicyEngine 正式 ALLOW 前复读比较完整 manifest 身份，hash/time 漂移均拒绝。
+若启用本地 snapshot/recovery 面，它只能消费同一 CURRENT V6 edition 的完整发布状态；外层 frame/schema 与内层授权 payload 是不同校验层，不能各自协商、混用或独立回退。旧 V1/V2 常量如保留只用于拒绝诊断。frontier 只保存 compact stamp。恢复先验证文件完整性，再在同一有界 pointer-first durable 事务严格读取链并核对 pointer＋stamp；generation-only 或 pointer-only 相等不足以取得信任。hint 只进入 Warming，`warm_from_durable` 与通道实活/对账门仍适用。PolicyEngine 正式 ALLOW 前复读比较完整 manifest 身份，hash/time 漂移均拒绝。
 
 #### 15.7.5 验证、切换和回退
 
-本次新增 `PublicationStamp` 和完整源模型为 additive 公共入口；生产内部 repository read view、post-publication invalidation wire 和本地 snapshot frontier 是登记的切换单元（**BREAKING CHANGE 自采用新代码起生效**）。仓内生产者、消费者、fixture 和 Rust 测试须同步，不能新旧混跑；稳定旧 HTTP 键和共享兼容实体继续保留。相关公共语义、影响和替代入口见本节，不删除数据库事实或改历史 migration checksum。
+本次新增 `PublicationStamp` 和完整源模型，同时删除旧简化 Rust 实体；production repository read view、post-publication invalidation wire 和本地 snapshot frontier 是登记的切换单元（**BREAKING CHANGE 自采用新代码起生效**）。仓内生产者、消费者、fixture 和 Rust 测试须同步，不能新旧混跑；RuleSet Rust source 模型与 HTTP summary/entry aliases 一并按 §15.8 迁移。相关公共语义、影响和替代入口见本节及 §15.8；不删除数据库事实或改历史 migration checksum。
 
-验证至少覆盖完整字段往返、UTC wire、客户端生成字段/所有权改写拒绝、stamp 缺失/非法/旧版本、同代 hash/time 分歧、V6 producer/consumer 一致、四类 invalidation family 的版本一致、内存/缓存失配、快照 CURRENT V6 frontier/payload/token 与 durable 失配、source pending 与已发布身份隔离，以及共享 edition 的跨 crate contract test。所有测试与判定使用 Rust/Cargo；最终冻结快照执行 workspace gate。真实 MySQL/MQ/Redis、旧队列/inbox drain、migration、崩溃/UNKNOWN、多节点和部署须单列，当前验证仍 pending，未执行不得以单测或 exit 0 计 PASS。
+验证至少覆盖完整字段往返、UTC wire、客户端生成字段/所有权改写拒绝、stamp 缺失/非法/旧版本、同代 hash/time 分歧、V6 producer/consumer 一致、四类 invalidation family 的版本一致、内存缓存失配、可用 snapshot frontier/token 与 durable 失配、source pending 与已发布身份隔离，以及共享 edition 的跨 crate contract test。所有项目测试、harness、断言和结果判定使用 Rust/Cargo；最终冻结快照执行 workspace gate。真实 MySQL/MQ、旧队列/inbox drain、migration、崩溃/UNKNOWN、多节点和部署须单列，当前验证仍 pending，未执行不得以单测或 exit 0 计 PASS。
 
-切换前停止旧执行者，对账 UNKNOWN 与未完成 source/撤权/投影；消息旧版本和 snapshot 旧文件不能补造 stamp。旧 durable 消息需按原 operation/message identity 对账并在批准后处理；代码不自动删行或把旧消息伪装成 CURRENT V6 新证明。升级或回退必须以 digest/seal、compiler、segment/archive/completion、invalidation、cache/MAC、snapshot schema/payload 和 reader gate 为一个原子 bundle，完成 stop/reconcile/validate 后才执行批准的环境操作；不得把旧 proof/MAC 原地重标、自动协商、在当前 reader 中接受其他 edition、重置 generation、恢复 revoked access、删除 pending 或降低 read-gate。后续从统一 edition Vn 回退至 Vm 时，上述组件必须全部采用 Vm，并按获批方案核验或重建 Vm 派生证据；Vm reader 不得直接消费 Vn 证明。本次统一前各自编号的旧二进制不构成可混用的回退组合；必要时使用理解当前 edition 的修复版本或经批准 forward-fix。
+切换前停止旧执行者，对账 UNKNOWN 与未完成 source/撤权/投影；消息旧版本和 snapshot 旧文件不能补造 stamp。旧 durable 消息需按原 operation/message identity 对账并在批准后处理；代码不自动删行或把旧消息伪装成 CURRENT V6 新证明。升级或回退必须以 digest/seal、compiler、segment/archive/completion、invalidation、可用 snapshot schema/payload 和 reader gate 为一个原子 bundle，完成 stop/reconcile/validate 后才执行批准的环境操作；不得把旧 proof 原地重标、自动协商、在当前 reader 中接受其他 edition、重置 generation、恢复 revoked access、删除 pending 或降低 read-gate。后续从统一 edition Vn 回退至 Vm 时，上述组件必须全部采用 Vm，并按获批方案核验或重建 Vm 派生证据；Vm reader 不得直接消费 Vn 证明。本次统一前各自编号的旧二进制不构成可混用的回退组合；必要时使用理解当前 edition 的修复版本或经批准 forward-fix。
 
 威胁/故障模型是存储/传输漂移、同代分歧、缺字段和旧格式错误解释；阻断点为类型解析、严格读取、安装、缓存身份、传输及最终复读。误放行可能接受不一致授权，因此默认拒绝；误拒绝会延迟可用性，须通过严格对账恢复。普通 SHA-256、NTP 和进程内 fence 不认证恶意数据库管理员或构成多云共识，本次不新增跨云批准或自动数据库纠偏。
 
@@ -1318,10 +1289,43 @@ source 短事务仍只写必要 source、ledger/delta 和审计关联；source C
 
 ORG_SCOPE 的组织级 publication compiler、dependency proof、segment proof 与 manifest proof 也属于 CURRENT V6 版本一致性合同，但本条不启用 ORG_SCOPE default-off feature，也不改变稳定 grant/delta identity encoding、UUIDv5 algorithm、事务边界、generation/revoke/lease 或 owner 解析语义。它们统一由 `astral-types/src/edition.rs` 的同一 `authorization_edition!(6)` 宏派生：`astral-org-authorization-v6`、`astral-org-dependencies-v6`、`astral-org-segment-v6` 与 `astral-org-publication-v6`。组织 payload 保持自身 `OrgSegment { index, digestHex, content }` 合同，不与 canonical `authorization_grants_json_v6` segment 格式合并；组织证明只能在其显式启用且通过同一 strict publication/read gate 时生效。
 
-ORG_SCOPE proof 与 canonical card/rule-set proof 必须作为同一 V6 bundle 做 producer/consumer、缓存、快照、失效和回退一致性检查。default-off 路径不得因 edition 对齐而自动放行、自动迁移、改变组织范围或绕过 PolicyEngine；旧组织 proof、缺失 edition、同代 digest/time/provenance 分歧只能拒绝、隔离或保持 PENDING。升级/回退仍须 stop、reconcile、validate 后进行批准的完整 bundle 操作，不得部分接受组织 proof 或用旧 proof/MAC/snapshot 补字段。
+ORG_SCOPE proof 与 canonical card/rule-set proof 必须作为同一 V6 bundle 做 producer/consumer、process-local cache、snapshot、invalidation 和 rollback consistency checks。default-off 路径不得因 edition 对齐而自动放行、自动迁移、改变组织范围或绕过 PolicyEngine；旧组织 proof、缺失 edition、同代 digest/time/provenance 分歧只能拒绝、隔离或保持 PENDING。升级/回退仍须 stop、reconcile、validate 后进行批准的完整 bundle 操作，不得部分接受组织 proof 或用旧 proof/snapshot 补字段。ORG_SCOPE 的 topology defaults 不因 `TenantSerial`/`Partitioned` 拓扑选择或执行协议变化而改变。
 
 验证至少覆盖 organization compiler、dependency/segment/manifest domains 与共享 edition 的跨 crate contract test 一致；当前 ORG_SCOPE 真实迁移、owner resolver、跨云部署和 feature 启用验收仍不在本轮源码与文档变更范围内。
 
+### 15.8 CURRENT V6 breaking-change inventory 与 adoption notice
+
+**BREAKING CHANGE `v6-only-docs-20261028`**：以下删除与替代约束自采用包含该 contract 的新分支软件时生效；这是软件兼容声明，不是“已部署/已迁移”事实。旧软件与新软件不能热混跑。上线前必须执行 offline inventory/preflight、调用方与数据形状核对、必要的离线 rebuild，并验证停机切换 postcondition。不得自动改写 source rows 或历史 hash；revocation、fence、grant/source/audit facts 必须保留。已批准的 rollback path 为停止新执行/写入、reconcile 所有已启动与 UNKNOWN 操作，再恢复到基线 `62b4349`；不得用 hot mode、数据删除、generation reset 或旧 snapshot/raw fallback 回退。恢复后同样须重新核对运行中操作与当前 source state。
+
+| Removed surface | Required replacement / migration | Scope and consumer impact |
+|---|---|---|
+| `RuleRepository` capability marker、默认实现、兼容 dispatch，以及 snapshot/permission/raw/realtime-consistency reader 作为正式授权读面 | 唯一正式入口 `PolicyEngine::evaluate()`；四个无默认实现方法 `check_card_active`, `is_active_global_admin`, `load_published_card_authorization`, `load_org_authorization`；published diagnostics/simulation 如有保留，必须与授权读口分离 | 所有 repository implementers 与 engine caller；正式调用链不再有 Arbiter/oracle 决策阶段，不以其结果授权。缺证据 fail-closed；native `CARD_ONLY` 输入移除，新 `permission_rule` source 写入仅接受 `MANUAL`，RuleSet/template materialization 走 RuleSet；旧 source rows 不自动改写 |
+| `ProjectionExecutionMode`/`ASTRAL_PROJECTION_EXECUTION_MODE` (`legacy-hybrid`/`worker-owned`) selector/config freeze、request-side claim/release/compile/publish/release、synchronous publisher execution targets | 唯一 `WorkerOwned` execution protocol；COMMIT proof 后请求只可等待精确完整 receipt 的 durable completion proof | Source writers, projector runtime, config and tests; preserve lane, active-slot, epoch/token fence, predecessor order, CAS, UNKNOWN reconciliation and audit. Exact target calls may remain as receipt dispatch/wait helpers only; `TenantSerial`/`Partitioned` topology and independent defaults remain separate |
+| Redis dependencies/features/config (`REDIS_URL`, `ASTRAL_REDIS_PROJECTION_COMPAT`), adapters, `Noop`/injection compatibility, Redis L2/MAC/shared-unit, Redis health/metrics and `astral-cache` crate | bounded process-local L1 TTL/capacity/GC + strict DB reads; MySQL session/JTI/replay and MQ lease durability; Local/Rabbit transport | Current Redis profiles and Monitor Redis metrics are removed; no claim of equivalent cross-instance performance/metrics. Tracked crate/source/manifest/lock/test surfaces are absent from this checkout; this does not assert database-table or external-runtime cleanup |
+| Old Python campaign/profile/adapter/E1/E3/E4 executable tools and Python unittest success acceptance | Rust `test-campaign`, native dependency registry/adapters and Rust summary acceptance; shell only forwards standard commands | Remove current executable implementations and catalog source references. Retain historical method inventory and independent mathematical/statistical references without executing them; retired positive behavior is `RETIRED`, not equivalent coverage or PASS |
+| Nested-payload, numeric-timestamp, missing-`messageId`, and login-normalization MQ business-message compatibility | Flat business-root JSON, with required nonempty `messageId` and RFC3339 timestamp envelope fields | MQ business `MqMessage` consumers/producers; generic durable transport `schemaVersion` remains unchanged |
+| Deprecated `spawn_local_message_worker` / private database-polling dispatcher, unused `GenericMessage` and no-op `start_all_consumers` | Explicit typed owner consumers on LocalBus/Rabbit, with the bounded typed invalidation outbox recovery relay | No current caller uses the removed entry points. Preserve durable outbox rows, exact identities, leases, completion/audit proof and reconciliation; deleting these APIs does not execute queue or data cleanup |
+| RuleSet HTTP summary/entry aliases `id`、summary `refType`、`resource`、`action`，以及简化 Rust `RuleSet`/`RuleSetEntry`/`CardRuleSetRef` | HTTP 使用 `ruleSetId`/`sourceType`、`entryId`/`resourceType`/`actionCode`；Rust 使用 `RuleSetDefinition`/`RuleSetEntryDefinition`/`CardRuleSetBinding` | 所有仓内调用方、fixture、API 与导出同步迁移；旧输入拒绝。Binding `refType` 保持 `BASE`/`OVERLAY`，不恢复旧实体别名或伪造缺失字段 |
+| Legacy condition aliases/wrappers or non-native casing | `conditionType` + `params`, or one-key `allOf`/`anyOf`/`not` group using native PascalCase condition names; time-range key is `timezone` | Reject `condition_type`, `conditionGroup`, `timeRange`, `ownerOnly`, lower-camel names, `timeZone` and mixed/unknown forms before mutation |
+| Request-side synchronous projection execution/ambiguous completion inference | 5s observation-only wait, 25ms polling, maximum 64 events and 50 distinct card scopes; every receipt needs exact durable completion proof | Source transaction dispatches the full immutable receipt/batch only after proven COMMIT. ACK/status/latest pointer alone is insufficient; timeout/oversize leaves the whole batch with the WorkerOwned owner |
+| `ELIGIBILITY` positive L1 cache hit without durable fence recheck | Pre/post authoritative head reads match cached `source_generation`/`revoke_fence`, plus same original hub token | Physical eligibility only, never authorization proof; positive L1 hit incurs two durable head DB reads and added latency. Failure/drift rejects |
+| Grant-time SoD validation based on raw/unpublished source rows or without a required published-only port | Direct enabled `MANUAL` CREATE/UPDATE requires the locked repository transaction gate in §15.4; CREATE also retains the explicitly injected early validator | Lock current card and verify tenant/user/domain; reject unfinished contributions and missing/invalid evidence. UPDATE must prove the unique exact published before-image before excluding only its own `GrantId` from STATIC held grants; all other grants and DYNAMIC checks remain. Error/timeout fails closed. Historical `CARD_ONLY` rows remain read/delete-only; real MySQL concurrency/rollback evidence is separate |
+| Unbounded/ambiguous pending-compensation execution | Only committed `AUTH_SESSION_REVOCATION` intents; stable operation ID; `retry_count` CAS claim generation, 60-second lease, at most 10 attempts, batches capped at 100; exact processed user/event/payload outbox proof | Unsupported or retired work ends `FAILED` for manual reconciliation, never false `COMPLETED`; retry only after reconciling unknown outcome |
+| Current-runtime interpretation of historical `COMMITTED_PENDING_REDIS` | Retain only as a legacy MySQL session/JTI exact-reconciliation status | Not a Redis runtime mode and not a value to purge wholesale; recover only after current MySQL session and JTI proof |
+| Blanket/scheduled legacy projection fence-latch repair | Explicit `rehearse_legacy_fence_proof_in_tx` per-pointer operator rehearsal with locked evidence and same-transaction audit/CAS | No blanket/startup/scheduled update; preserve historical rows and fail-closed read behavior |
+| V6 applied to generic transport, JWT, or HTTP version numbers | V6 is authorization edition only | Do not renumber `MessageEnvelope.schemaVersion`, JWT v2/session/family/JTI contract, or HTTP `/v1` routes |
+| `CARD_ONLY` native source input; old raw diagnostic SoD path; grant validation without published-only grant-time SoD port | `MANUAL`/direct-delta; context-aware Monitor SoD and mandatory grant-time published-only validator | No automatic rewrite of old source rows; SoD uses published/current evidence and remains fail-closed |
+| Old public snapshot-version constants and global-`MAX(version_no)` fallback; retired template-apply and compliance aliases | CURRENT V6 scope/stamp and durable pointer manifest; keep template sync/materialization/bind | New formal reader rejects old versions; unrelated frozen routes and HTTP `/main/api/v1/**` remain unchanged |
+| `HitStats` L1/L2/L3 layer counters and legacy aliases from `GET /main/api/v1/stats` data | camelCase `evaluationCount`, `allowCount`, `denyCount`, and `timingNs.cardContextCheckNs`, `initialEvidenceLoadNs`, `finalEvidenceReloadNs`, `evidenceMatchNs`, `totalNs` | API consumers must use the new exact shape; database-backed `/main/api/v1/hit-stats/*` routes are a separate surface |
+| BCrypt/MD5 password-hash verification and automatic hash upgrade | Argon2id only; native password reset for older hashes | Existing credentials are not automatically rewritten; confirm account recovery/reset path before adoption |
+| Legacy `JwtClaims.roles` string/null normalization | `roles` is an array of strings (`Vec<String>`); an absent claim defaults to `[]`, but legacy scalar or null shapes reject during decode | Role/display metadata shape only; permissions and role claims are not a Rust authorization entry. Keep `X-Action-Codes` HMACv3 signed fields unchanged; the deprecated `permissions` decode slot exists only so refresh validation can reject injected authorization context |
+| Actorless card-template repository update wrapper/default-error compatibility path | Required `CardTemplateRepository::update_template_with_context`; require verified positive actor before source transaction and audit that exact actor | Repository callers must pass a user mutation context; if a direct repository caller lacks proven operation identity, derive deterministically from locked durable facts. HTTP missing `x-request-id` gets one UUID at the request boundary and reuses it through that request operation's source retries; a separate HTTP retry is a new request and is not promised cross-request idempotency. No HTTP route change |
+| Fabricated domain relationship DTO fields: Identity `Domain.org_id`, `Tenant.org_id`/`Tenant.domain_id`; TrustGraph synthetic `DomainRecord`/`DomainDto.org_id` | Return only persisted/domain-owned fields; `tenant_domain_map` remains the real tenant/domain association source | Identity DTOs reject unknown legacy keys. This does not remove real tenant/domain mappings or authoritative organization/domain fields |
+| Infallible `TenantScopedQuery` `build`/`build_sql`/`params` and infallible `apply_tenant_scope` wrappers | `try_build`, `try_build_sql`, `try_params`, `try_apply_tenant_scope` return `Result` and preserve SQL grammar, tenant/global authorization, alias and ID checks | No production callers of removed infallible wrappers; migrate callers to explicit error handling; do not treat tests/examples as production callers |
+| Synchronous `DataScopeBypass::open` / `close` and `DataScopeBypassGuard` compatibility API | `with_bypass(future)` for a complete trusted maintenance future, with task-local state and `DataScopeBypass::is_bypassed` inspection | No production callers of the removed APIs. Nested scopes restore on completion/error/cancellation/unwind and do not pass their state to spawned tasks; this maintenance scope does not replace formal `PolicyEngine::evaluate()` |
+| Unused `AuthRepository::update_password_hash` and `UserService` forwarding that discarded committed JTIs | `update_password_hash_with_revocation(...)` returns the exact committed revoked-JTI snapshot; `project_password_revocation(&revoked_jtis)` projects only that snapshot. Retain atomic `auth.rs` free/transaction writer functions | Password paths must keep durable source/outbox commit and exact JTI projection sequencing; no broader snapshot reload or automatic verifier migration |
+
+V6 does not renumber generic MQ `schemaVersion`, JWT signature/version fields, HTTP API v1 routes, Cargo versions, migration IDs, or historical SQL/checksum filenames. Source head/outbox remains for source correlation, revoke/RuleSet initialization and ELIGIBILITY L1 invalidation; this notice does not include database table drops, production data deletion, test-environment cleanup, deployment, or rollback execution. Historical migration SQL/checksum and empirical test reports remain immutable and truthful. External comparative Redis fixtures may remain if isolated from current runtime and authorization gates. COMPAT25 real-Redis ignored tests were compiled/no-run and never executed; no PASS is claimed.
 
 ## 16. 安全规范
 

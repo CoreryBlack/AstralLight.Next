@@ -41,7 +41,6 @@ async fn client_supplied_roles_do_not_authorize_without_published_grant() {
         repo.published_reads() >= 1,
         "strict evaluation must read published evidence"
     );
-    repo.assert_no_legacy_reads();
 }
 
 #[tokio::test]
@@ -86,7 +85,4 @@ async fn foreign_tenant_or_other_action_grant_does_not_authorize() {
         .evaluate(&other_action_ctx, &other_action)
         .await;
     assert_deny(&other_action_decision, "DEFAULT_DENY");
-
-    cross_tenant.assert_no_legacy_reads();
-    other_action.assert_no_legacy_reads();
 }

@@ -1,44 +1,16 @@
-//! 权限投影 durable worker — ProjectionWorker（ELIGIBILITY-only，纯恢复角色）
+//! Source-correlation and physical-eligibility outbox recovery worker.
 //!
-//! 【读写分离降级】ELIGIBILITY 资格缓存失效的主路径是各写点在 source
-//! mutation 提交后的同步资格缓存 evict 家族（覆盖全部同进程变更点，符号见
-//! side_effects 模块）；CARD/RULE_SET 投影的权威消费者是新链
-//! authorization_projector delta 队列。本循环因此降级为纯恢复/对账角色：
-//! 兜底同步失效遗漏的 ELIGIBILITY 事件、终结已退役通道的 outbox 行、并按轮
-//! 驱动补偿重试——热路径零参与，轮询周期相应放宽。
+//! CARD/RULE_SET events record source generation, revoke fences and audit
+//! correlation. Marking those events processed never proves V6 publication;
+//! owned authorization deltas have their own publisher and completion proof.
+//! ELIGIBILITY events invalidate native process-local entries after checking
+//! the current source head. The read path compares head generations and revoke
+//! fences independently of consumer progress.
 //!
-//! 周期轮询 `authorization_projection_outbox`（claim/lease 形态；周期从对齐
-//! Java @Scheduled 5s 放宽至 15s，属记录在案的刻意偏离：主路径同步化后本
-//! 循环只承担恢复职责，放宽只增加兜底延迟、不影响任何 fail-closed 语义），
-//! 对每条 PENDING 事件执行：
-//!
-//! ```text
-//! claim（租约 30s，batch 100）→ 按 aggregate_type 解析
-//!   → CARD / RULE_SET: 直接 mark_processed（终态跳过，不重建快照、不 evict、
-//!                      不 fail_event 退避）——旧链快照重建职责已在读链切换
-//!                      批次 3 下线，新链 authorization_projector delta 队列
-//!                      是 CARD/RULE_SET 投影的唯一权威消费者（决策见
-//!                      Docs/架构/Rust架构设计/Rust增量重建与实时授权边界_V1.0.md §3.4）；
-//!                      writer correlation 仍会继续写入这两类 outbox 事件，
-//!                      本 worker 只负责把它们终结，避免永久滞留 PENDING。
-//!   → ELIGIBILITY:   旧代校验（supersede → mark_obsolete 终态）→ only evict
-//!                      `perm:card:active:{id}` → markProcessed（不发 MQ；
-//!                      ELIGIBILITY gate 版本栅栏控制缓存读取）。
-//!                      【存续职责】ELIGIBILITY head/outbox 通道与本分支不随
-//!                      旧读链下线（决策与替代方案否决记录见 §3.4）；
-//!                      旧链 READY 推进已随迁移 20260831000001 退役——
-//!                      source mutation 与 head 代次/围栏在同一 source 事务
-//!                      提交，栅栏失配即缓存 miss 回权威 SQL，无需 worker
-//!                      消费证明即可保持 fail-closed。
-//! 失败 → release_failed（attempts+1 + next_attempt_at 指数退避 2^(n-1) 截断 `[1,300]`s）
-//! ```
-//!
-//! 未知 `aggregate_type` 必须 fail-closed（release_failed 重试），绝不 mark processed 成功，
-//! 以阻止未注册通道的事件被静默吞掉。CARD/RULE_SET 是已注册但已退役重建的通道：
-//! 终态 mark_processed 不是授权放行，也不产生任何快照/缓存副作用。保持单一
-//! TrustGraph worker owner，不新增第二个 worker。
-//!
-//! 单次周期失败只记 warning 不中断后续周期（对齐 monitor collector 的 interval 模式）。
+//! Claims and terminal updates retain their lease checks. Unknown aggregates
+//! fail closed and retry with bounded backoff. Shutdown retains cancellation,
+//! bounded join and reaping ownership. Compensation redelivers only existing
+//! session-revocation intents; retired operations require manual reconciliation.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,7 +23,6 @@ use tokio::time::interval;
 
 use astral_types::ProjectionAggregate;
 
-use crate::api::side_effects;
 use crate::repository::projection_repository::{
     is_projection_lease_lost, OutboxEventRecord, ProjectionRepository,
 };
@@ -155,7 +126,7 @@ impl Drop for ProjectionWorkerShutdownGuard {
     }
 }
 
-/// Cancel the legacy projection worker and await termination within a bounded
+/// Cancel the source-correlation worker and await termination within a bounded
 /// timeout.
 ///
 /// `Err(summary)` covers worker panic/join failure and timeout. A dying or
@@ -190,7 +161,7 @@ pub async fn shutdown_projection_worker(
                 ownership.release_join();
             }
             Err(format!(
-                "legacy projection worker did not stop within {timeout:?}; aborted; possibly \
+                "source-correlation worker did not stop within {timeout:?}; aborted; possibly \
                  wedged inside a projection/compensation cycle"
             ))
         }
@@ -198,7 +169,7 @@ pub async fn shutdown_projection_worker(
     tracing::info!(
         join_elapsed_ms = started.elapsed().as_millis() as u64,
         clean = summary.is_ok(),
-        "legacy projection worker shutdown completed"
+        "source-correlation worker shutdown completed"
     );
     ProjectionWorkerShutdownReport {
         summary,
@@ -206,9 +177,8 @@ pub async fn shutdown_projection_worker(
     }
 }
 
-/// 启动旧代投影 worker 后台任务。`main` 必须持有返回的 handle 并在关闭时调用
-/// [`shutdown_projection_worker`]（cancel → bounded join）；handle 绝不能被
-/// 丢弃，否则旧 worker 将脱离关闭序列管理。
+/// 启动 source correlation、资格失效与撤权补偿 recovery worker。`main` 必须
+/// 持有返回的 handle 并在关闭时调用 [`shutdown_projection_worker`]。
 pub fn spawn_worker(db: MySqlPool, repo: Arc<dyn ProjectionRepository>) -> ProjectionWorkerHandle {
     let cancellation = ProjectionWorkerCancellationToken::default();
     let worker_cancellation = cancellation.clone();
@@ -230,7 +200,7 @@ pub fn spawn_worker(db: MySqlPool, repo: Arc<dyn ProjectionRepository>) -> Proje
                 tracing::warn!(error = %error, "compensation retry cycle failed");
             }
         }
-        tracing::info!(worker_id, "legacy projection worker stopped");
+        tracing::info!(worker_id, "source-correlation worker stopped");
     });
     ProjectionWorkerHandle { cancellation, join }
 }
@@ -283,18 +253,14 @@ async fn project_one(repo: &dyn ProjectionRepository, worker_id: &str, event: &O
     };
 
     match aggregate {
-        // 已退役的旧链快照重建通道：writer correlation 仍会继续写入 CARD/RULE_SET
-        // outbox 事件，但其投影的权威消费者是新链 authorization_projector delta
-        // 队列（决策见 Rust增量重建与实时授权边界_V1.0.md §3.4）。本 worker 对
-        // 这两类事件只做终态 mark_processed，绝不重建快照、绝不 evict、也绝不
-        // fail_event 退避（否则无人重建的旧通道事件会永远重试）；不读 head、
-        // 不比较代次——退役通道的处置与 head 状态无关。
+        // Correlation completion acknowledges source/audit delivery only. The
+        // independently owned delta queue must prove V6 publication completion.
         ProjectionAggregate::Card | ProjectionAggregate::RuleSet => {
             tracing::info!(
                 aggregate_type = %event.aggregate_type,
                 aggregate_id = event.aggregate_id,
                 outbox_id = event.outbox_id,
-                "legacy snapshot rebuild retired, ownership moved to authorization_projector delta queue"
+                "source correlation consumed; authorization publication remains owned by authorization_projector delta queue"
             );
             mark_event_processed(repo, worker_id, event).await;
         }
@@ -334,15 +300,9 @@ async fn project_eligibility(
         }
     }
 
-    // Production always supplies the real Redis eviction operation. Tests use the
-    // same worker state machine through `project_eligibility_with_eviction` with a
-    // deterministic no-op, so they never depend on an external Redis endpoint.
-    project_eligibility_with_eviction(
-        repo,
-        worker_id,
-        event,
-        side_effects::evict_eligibility_gate_cache,
-    )
+    project_eligibility_with_eviction(repo, worker_id, event, |card_id| async move {
+        astral_db::evict_l1_card_active_cache(card_id);
+    })
     .await;
 }
 
@@ -357,21 +317,7 @@ async fn project_eligibility_with_eviction<E, F>(
 {
     let card_id = event.aggregate_id;
 
-    // 1. 仅失效 `perm:card:active:{card_id}` 资格缓存（fire-and-forget）
     evict_cache(card_id).await;
-
-    // 1b.【P3 拆线接缝】进程内失效绑定 astral-db 失效事件语义：直接调用
-    // `astral_db::evict_l1_card_active_cache`（同进程 L1 卡正缓存 + L1
-    // ELIGIBILITY head 条目删除 + per-card 失效纪元推进），使 L1 资格头随
-    // 失效事件失效（R3），且独立于 api::side_effects 的 Redis compat 失效
-    // 路径（default 无 Redis 时本调用即完整进程内失效）。幂等、无网络、
-    // 锁中毒静默（条目由 TTL 兜底），重复调用无害。
-    astral_db::evict_l1_card_active_cache(card_id);
-
-    // 2. 标记 PROCESSED（仅持有租约的 worker 生效）。旧"head READY 推进"已随
-    //    迁移 20260831000001 退役：读侧安全由 (source_generation, revoke_fence)
-    //    版本栅栏 + 时代栅栏保证，不依赖 worker 消费证明。
-    //    不发 MQ：资格读侧经 ELIGIBILITY gate 版本检查放行。
     mark_event_processed(repo, worker_id, event).await;
 }
 
@@ -537,15 +483,6 @@ mod tests {
 
     #[async_trait]
     impl ProjectionRepository for MockProjectionRepository {
-        async fn request_aggregate_projection(
-            &self,
-            _aggregate: ProjectionAggregate,
-            _aggregate_id: i64,
-            _event_type: &str,
-        ) -> Result<(), AstralError> {
-            Ok(())
-        }
-
         async fn claim_pending_events(
             &self,
             _batch: i64,
@@ -823,7 +760,10 @@ mod tests {
     /// （禁用符号用 concat! 拼接，避免 include_str 扫描命中测试自身的字面量。）
     #[test]
     fn retired_card_rule_set_channels_have_no_rebuild_surface() {
-        let worker_src = include_str!("projection_worker.rs");
+        let worker_src = include_str!("projection_worker.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
         for retired in [
             concat!("project_", "card"),
             concat!("project_", "rule_set"),
@@ -839,7 +779,9 @@ mod tests {
         }
         // 终态跳过路径必须保留其可观测日志锚点（退役原因可追溯）。
         assert!(
-            worker_src.contains("ownership moved to authorization_projector delta queue"),
+            worker_src.contains(
+                "authorization publication remains owned by authorization_projector delta queue"
+            ),
             "retired-channel skip must keep its audit log anchor"
         );
     }
@@ -904,30 +846,21 @@ mod tests {
         assert!(failed.is_empty());
     }
 
-    /// 【存续职责结构锁定】读链切换批次 2 正式决策（方案 b）：ELIGIBILITY head/outbox
-    /// 通道与 worker 的 ELIGIBILITY 分支是 ProjectionWorker 的存续职责；CARD/RULE_SET
-    /// 分支在批次 3 下线后 worker 收敛为 ELIGIBILITY-only，但不得误删 ELIGIBILITY 分支。
-    /// 决策依据、替代方案（a/c'）否决理由与 c' 后续切片前置条件见
-    /// Docs/架构/Rust架构设计/Rust增量重建与实时授权边界_V1.0.md §3.4。
-    ///
-    /// 锁定层次：
-    /// - 行为锁定：project_eligibility 流程测试（正常 / 同代重放 / Superseded）
-    ///   锁定 旧代校验 → evict → mark_processed 状态机；
-    /// - 编译期锁定：`project_one` 对 `ProjectionAggregate` 三变体的 match 必须穷尽，
-    ///   删除 ELIGIBILITY 分派臂即无法编译；
-    /// - 源码结构锁定（本测试）：断言 worker 源码仍保留 ELIGIBILITY 分派与生产
-    ///   Redis 失效绑定，防止批次 3 重构时静默移除（同
-    ///   `rule_set_worker_keeps_rebuild_audit_out_of_post_commit_flow` 的源码锁定模式）。
+    /// ELIGIBILITY recovery must retain its production native L1 invalidation
+    /// binding; the behavioral tests separately cover replay and supersession.
     #[test]
     fn eligibility_branch_is_survival_responsibility_of_worker() {
-        let worker_src = include_str!("projection_worker.rs");
+        let worker_src = include_str!("projection_worker.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
         assert!(
             worker_src.contains("ProjectionAggregate::Eligibility => project_eligibility"),
             "project_one 必须保留 ELIGIBILITY 分派臂（决策见 Rust增量重建与实时授权边界_V1.0.md §3.4）"
         );
         assert!(
-            worker_src.contains("side_effects::evict_eligibility_gate_cache"),
-            "project_eligibility 生产路径必须绑定 perm:card:active 资格缓存失效（决策见 §3.4）"
+            worker_src.contains("astral_db::evict_l1_card_active_cache(card_id)"),
+            "ELIGIBILITY must bind native L1 invalidation"
         );
         assert!(
             worker_src.contains("fn project_eligibility("),
@@ -935,14 +868,14 @@ mod tests {
         );
     }
 
-    /// 【P3 拆线接缝锁定】project_eligibility 的 ELIGIBILITY 通道必须直接绑定
-    /// `astral_db::evict_l1_card_active_cache`：失效事件在进程内驱动 L1 卡正
-    /// 缓存 + L1 ELIGIBILITY head 条目删除 + per-card 失效纪元推进（R3"资格头
-    /// 随失效事件"），且独立于 api::side_effects 的 Redis compat 失效路径
-    /// （默认 Redis-free 路径下这就是完整的进程内失效面）。
+    /// Native invalidation removes positive card entries and the eligibility-head
+    /// cache, and advances the per-card invalidation epoch.
     #[test]
     fn eligibility_channel_binds_the_in_process_invalidation_seam() {
-        let worker_src = include_str!("projection_worker.rs");
+        let worker_src = include_str!("projection_worker.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
         assert!(
             worker_src.contains("astral_db::evict_l1_card_active_cache(card_id);"),
             "ELIGIBILITY channel must bind astral_db::evict_l1_card_active_cache \

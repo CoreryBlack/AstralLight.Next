@@ -26,26 +26,21 @@ use crate::service::rule_set_write_service::{
 };
 use crate::AppState;
 
-/// 完整规则集 source 的 HTTP 读视图。
-///
-/// `id`/`refType` 保留旧 wire 键；canonical `ruleSetId`/`sourceType` 与其来自
-/// 同一 source row。旧键不参与 source_type 的 mutation。
-#[derive(Debug, Serialize, Deserialize)]
+/// 完整规则集 source 的 HTTP 读视图，字段直接来自 canonical source model。
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleSetDto {
-    pub id: Option<i64>,
-    pub rule_set_id: Option<i64>,
+    pub rule_set_id: i64,
     pub name: String,
-    pub code: Option<String>,
-    pub ref_type: String,
-    pub source_type: Option<String>,
+    pub code: String,
+    pub source_type: String,
     pub source_id: Option<i64>,
     pub description: Option<String>,
-    pub enabled: Option<bool>,
-    #[serde(default, with = "astral_types::utc_rfc3339::option")]
-    pub created_at: Option<OffsetDateTime>,
-    #[serde(default, with = "astral_types::utc_rfc3339::option")]
-    pub updated_at: Option<OffsetDateTime>,
+    pub enabled: bool,
+    #[serde(with = "astral_types::utc_rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "astral_types::utc_rfc3339")]
+    pub updated_at: OffsetDateTime,
     pub tenant_id: Option<i64>,
     pub entry_count: i32,
     pub bound_card_count: i32,
@@ -55,17 +50,15 @@ impl From<RuleSetSummary> for RuleSetDto {
     fn from(s: RuleSetSummary) -> Self {
         let definition: RuleSetDefinition = s.definition;
         Self {
-            id: Some(definition.rule_set_id),
-            rule_set_id: Some(definition.rule_set_id),
+            rule_set_id: definition.rule_set_id,
             name: definition.name,
-            code: Some(definition.code),
-            ref_type: definition.source_type.clone(),
-            source_type: Some(definition.source_type),
+            code: definition.code,
+            source_type: definition.source_type,
             source_id: definition.source_id,
             description: definition.description,
-            enabled: Some(definition.enabled),
-            created_at: Some(definition.created_at),
-            updated_at: Some(definition.updated_at),
+            enabled: definition.enabled,
+            created_at: definition.created_at,
+            updated_at: definition.updated_at,
             tenant_id: definition.tenant_id,
             entry_count: s.entry_count as i32,
             bound_card_count: s.bound_card_count as i32,
@@ -102,52 +95,46 @@ impl From<CardRuleSetBindingView> for CardRuleSetBindingDto {
     }
 }
 
-/// 完整规则集条目的 HTTP 读视图。`resource`/`action`/`id` 保留旧键。
-#[derive(Debug, Serialize, Deserialize)]
+/// 完整规则集条目的 HTTP 读视图，字段直接来自 canonical source model。
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleSetEntryDto {
-    pub id: Option<i64>,
-    pub entry_id: Option<i64>,
-    pub rule_set_id: Option<i64>,
+    pub entry_id: i64,
+    pub rule_set_id: i64,
     pub effect: String,
-    pub resource: Option<String>,
-    pub resource_type: Option<String>,
+    pub resource_type: String,
     pub resource_id: Option<i64>,
-    pub action: Option<String>,
-    pub action_code: Option<String>,
+    pub action_code: String,
     pub condition_json: Option<String>,
     pub priority: i32,
-    pub enabled: Option<bool>,
-    #[serde(default, with = "astral_types::utc_rfc3339::option")]
+    pub enabled: bool,
+    #[serde(with = "astral_types::utc_rfc3339::option")]
     pub valid_from: Option<OffsetDateTime>,
-    #[serde(default, with = "astral_types::utc_rfc3339::option")]
+    #[serde(with = "astral_types::utc_rfc3339::option")]
     pub valid_to: Option<OffsetDateTime>,
-    #[serde(default, with = "astral_types::utc_rfc3339::option")]
-    pub created_at: Option<OffsetDateTime>,
-    #[serde(default, with = "astral_types::utc_rfc3339::option")]
-    pub updated_at: Option<OffsetDateTime>,
+    #[serde(with = "astral_types::utc_rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "astral_types::utc_rfc3339")]
+    pub updated_at: OffsetDateTime,
     pub tenant_id: Option<i64>,
 }
 
 impl From<RuleSetEntryDefinition> for RuleSetEntryDto {
     fn from(entry: RuleSetEntryDefinition) -> Self {
         Self {
-            id: Some(entry.entry_id),
-            entry_id: Some(entry.entry_id),
-            rule_set_id: Some(entry.rule_set_id),
+            entry_id: entry.entry_id,
+            rule_set_id: entry.rule_set_id,
             effect: entry.effect,
-            resource: Some(entry.resource_type.clone()),
-            resource_type: Some(entry.resource_type),
+            resource_type: entry.resource_type,
             resource_id: entry.resource_id,
-            action: Some(entry.action_code.clone()),
-            action_code: Some(entry.action_code),
+            action_code: entry.action_code,
             condition_json: entry.condition_json,
             priority: entry.priority,
-            enabled: Some(entry.enabled),
+            enabled: entry.enabled,
             valid_from: entry.valid_from,
             valid_to: entry.valid_to,
-            created_at: Some(entry.created_at),
-            updated_at: Some(entry.updated_at),
+            created_at: entry.created_at,
+            updated_at: entry.updated_at,
             tenant_id: entry.tenant_id,
         }
     }
@@ -157,7 +144,7 @@ impl From<RuleSetEntryDefinition> for RuleSetEntryDto {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateRuleSetRequestDto {
     name: String,
-    ref_type: String,
+    source_type: String,
     description: Option<String>,
 }
 
@@ -166,16 +153,16 @@ struct CreateRuleSetRequestDto {
 struct UpdateRuleSetRequestDto {
     name: String,
     description: Option<String>,
-    ref_type: Option<String>,
+    source_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RuleSetEntryRequestDto {
     effect: String,
-    resource: Option<String>,
+    resource_type: Option<String>,
     resource_id: Option<i64>,
-    action: Option<String>,
+    action_code: Option<String>,
     condition_json: Option<String>,
     priority: i32,
 }
@@ -272,7 +259,7 @@ async fn create_rule_set(
         .create_rule_set(
             &CreateRuleSetRequest {
                 name: req.name,
-                ref_type: req.ref_type,
+                source_type: req.source_type,
                 description: req.description,
             },
             &context,
@@ -318,16 +305,15 @@ async fn update_rule_set(
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     require_platform_admin(&state, &headers).await?;
     let context = mutation_context(&headers)?;
-    if let Some(requested_ref_type) = req.ref_type.as_deref() {
+    if let Some(requested_source_type) = req.source_type.as_deref() {
         let current = state
             .rule_set_repository
             .get_rule_set(id)
             .await?
             .ok_or_else(|| AppError(AstralError::NotFound("rule set not found".into())))?;
-        let current_ref_type = current.definition.source_type;
-        if requested_ref_type != current_ref_type {
+        if requested_source_type != current.definition.source_type {
             return Err(AppError(AstralError::Validation(
-                "refType is immutable and must match the existing sourceType".into(),
+                "sourceType is immutable and must match the existing sourceType".into(),
             )));
         }
     }
@@ -371,9 +357,9 @@ async fn replace_entries(
         .into_iter()
         .map(|entry| AddEntryRequest {
             effect: entry.effect,
-            resource: entry.resource,
+            resource_type: entry.resource_type,
             resource_id: entry.resource_id,
-            action: entry.action,
+            action_code: entry.action_code,
             condition_json: entry.condition_json,
             priority: entry.priority,
         })
@@ -477,9 +463,9 @@ async fn add_entry(
             rs_id,
             &AddEntryRequest {
                 effect: req.effect,
-                resource: req.resource,
+                resource_type: req.resource_type,
                 resource_id: req.resource_id,
-                action: req.action,
+                action_code: req.action_code,
                 condition_json: req.condition_json,
                 priority: req.priority,
             },
@@ -513,9 +499,9 @@ async fn update_entry(
             eid,
             &UpdateEntryRequest {
                 effect: req.effect,
-                resource: req.resource,
+                resource_type: req.resource_type,
                 resource_id: req.resource_id,
-                action: req.action,
+                action_code: req.action_code,
                 condition_json: req.condition_json,
                 priority: req.priority,
             },
@@ -579,18 +565,69 @@ mod tests {
     }
 
     #[test]
-    fn generated_rule_set_mutation_fields_are_rejected_by_narrow_dto() {
-        let error = serde_json::from_str::<CreateRuleSetRequestDto>(
-            r#"{"name":"rules","refType":"BASE","description":null,"code":"client-code"}"#,
-        )
-        .expect_err("database-owned code must be rejected as an unknown command field");
-        assert!(error.to_string().contains("unknown field"));
+    fn canonical_rule_set_inputs_accept_source_type_and_reject_ref_type_alias() {
+        let create = serde_json::from_value::<CreateRuleSetRequestDto>(serde_json::json!({
+            "name": "rules",
+            "sourceType": "CUSTOM",
+            "description": null
+        }))
+        .expect("create must accept canonical sourceType");
+        assert_eq!(create.source_type, "CUSTOM");
+
+        let update = serde_json::from_value::<UpdateRuleSetRequestDto>(serde_json::json!({
+            "name": "rules",
+            "description": null,
+            "sourceType": "CUSTOM"
+        }))
+        .expect("update may assert the immutable canonical sourceType");
+        assert_eq!(update.source_type.as_deref(), Some("CUSTOM"));
+
+        for request in [
+            serde_json::json!({"name":"rules","refType":"CUSTOM","description":null}),
+            serde_json::json!({"name":"rules","description":null,"refType":"CUSTOM"}),
+        ] {
+            assert!(
+                serde_json::from_value::<CreateRuleSetRequestDto>(request.clone()).is_err(),
+                "create must reject legacy refType input"
+            );
+            assert!(
+                serde_json::from_value::<UpdateRuleSetRequestDto>(request).is_err(),
+                "update must reject legacy refType input"
+            );
+        }
     }
 
     #[test]
-    fn generated_entry_mutation_fields_are_rejected_by_narrow_dto() {
+    fn canonical_entry_inputs_accept_resource_type_and_action_code_only() {
+        let request = serde_json::from_value::<RuleSetEntryRequestDto>(serde_json::json!({
+            "effect": "ALLOW",
+            "resourceType": "learn_course",
+            "resourceId": 17,
+            "actionCode": "read",
+            "conditionJson": null,
+            "priority": 0
+        }))
+        .expect("entry command must accept canonical names");
+        assert_eq!(request.resource_type.as_deref(), Some("learn_course"));
+        assert_eq!(request.resource_id, Some(17));
+        assert_eq!(request.action_code.as_deref(), Some("read"));
+
+        for field in ["resource", "action"] {
+            let mut legacy = serde_json::json!({
+                "effect":"ALLOW",
+                "resourceType":"learn_course",
+                "actionCode":"read",
+                "priority":0
+            });
+            legacy[field] = serde_json::Value::String("legacy-value".into());
+            assert!(
+                serde_json::from_value::<RuleSetEntryRequestDto>(legacy).is_err(),
+                "legacy entry field {field} must be rejected"
+            );
+        }
+
         let error = serde_json::from_str::<RuleSetEntryRequestDto>(
-            r#"{"effect":"ALLOW","resource":"learn_course","action":"read",
+            r#"{"effect":"ALLOW","resourceType":"learn_course","actionCode":"read",
                 "conditionJson":null,"priority":0,"validFrom":"2026-12-23T04:26:40Z"}"#,
         )
         .expect_err("validity is a canonical read-only field");
@@ -598,40 +635,33 @@ mod tests {
     }
 
     #[test]
-    fn rule_set_dto_wire_contract_still_accepts_ref_type() {
-        // refType remains a public read key and the update ownership assertion input.
-        let dto: RuleSetDto = serde_json::from_str(
-            r#"{"id":1,"name":"n","refType":"BASE","description":null,
-                "entryCount":0,"boundCardCount":0}"#,
-        )
-        .expect("refType must remain part of the public wire contract");
-        assert_eq!(dto.ref_type, "BASE");
-        let serialized = serde_json::to_string(&dto).expect("dto must serialize");
-        assert!(serialized.contains("\"refType\":\"BASE\""));
-    }
-
-    #[test]
-    fn read_only_fields_are_rejected_even_when_null() {
+    fn generated_command_fields_are_rejected_even_when_null() {
         for field in [
             "id",
             "ruleSetId",
             "code",
-            "sourceType",
             "sourceId",
             "enabled",
             "tenantId",
             "createdAt",
             "updatedAt",
         ] {
-            let mut request =
-                serde_json::json!({"name":"rules","refType":"CUSTOM","description":null});
-            request[field] = Value::Null;
+            let mut create = serde_json::json!({
+                "name":"rules",
+                "sourceType":"CUSTOM",
+                "description":null
+            });
+            create[field] = Value::Null;
             assert!(
-                serde_json::from_value::<CreateRuleSetRequestDto>(request.clone()).is_err(),
+                serde_json::from_value::<CreateRuleSetRequestDto>(create).is_err(),
                 "create {field}"
             );
+
+            let mut update = serde_json::json!({"name":"rules","description":null});
+            update["sourceType"] = Value::String("CUSTOM".into());
+            update[field] = Value::Null;
             assert!(
-                serde_json::from_value::<UpdateRuleSetRequestDto>(request).is_err(),
+                serde_json::from_value::<UpdateRuleSetRequestDto>(update).is_err(),
                 "update {field}"
             );
         }
@@ -639,8 +669,6 @@ mod tests {
             "id",
             "entryId",
             "ruleSetId",
-            "resourceType",
-            "actionCode",
             "enabled",
             "validFrom",
             "validTo",
@@ -648,7 +676,12 @@ mod tests {
             "createdAt",
             "updatedAt",
         ] {
-            let mut request = serde_json::json!({"effect":"ALLOW","resource":"learn_course","action":"read","priority":0});
+            let mut request = serde_json::json!({
+                "effect":"ALLOW",
+                "resourceType":"learn_course",
+                "actionCode":"read",
+                "priority":0
+            });
             request[field] = Value::Null;
             assert!(
                 serde_json::from_value::<RuleSetEntryRequestDto>(request).is_err(),
@@ -667,12 +700,12 @@ mod tests {
             serde_json::json!({"name":"rules","description":null})
         )
         .unwrap()
-        .ref_type
+        .source_type
         .is_none());
     }
 
     #[test]
-    fn canonical_read_aliases_are_derived_from_the_same_source_values() {
+    fn read_views_serialize_canonical_fields_without_legacy_aliases() {
         let created_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let dto = RuleSetDto::from(RuleSetSummary {
             definition: RuleSetDefinition {
@@ -687,20 +720,22 @@ mod tests {
                 updated_at: created_at,
                 tenant_id: Some(11),
             },
-            id: 99,
-            name: "stale alias".into(),
-            ref_type: "stale alias".into(),
-            description: None,
             entry_count: 2,
             bound_card_count: 3,
         });
-        let value = serde_json::to_value(dto).unwrap();
-        assert_eq!(value["id"], value["ruleSetId"]);
-        assert_eq!(value["id"], 7);
-        assert_eq!(value["refType"], value["sourceType"]);
+        let value = serde_json::to_value(dto).expect("complete rule-set view serializes");
+        assert_eq!(value["ruleSetId"], 7);
+        assert_eq!(value["sourceType"], "CUSTOM");
+        assert_eq!(value["sourceId"], 13);
         assert_eq!(value["name"], "source");
         assert_eq!(value["code"], "source-code");
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["entryCount"], 2);
+        assert_eq!(value["boundCardCount"], 3);
         assert_eq!(value["createdAt"], "2023-11-14T22:13:20Z");
+        assert!(value.get("id").is_none());
+        assert!(value.get("refType").is_none());
+
         let entry = RuleSetEntryDto::from(RuleSetEntryDefinition {
             entry_id: 3,
             rule_set_id: 7,
@@ -717,12 +752,18 @@ mod tests {
             updated_at: created_at,
             tenant_id: Some(11),
         });
-        let value = serde_json::to_value(entry).unwrap();
-        assert_eq!(value["id"], value["entryId"]);
-        assert_eq!(value["resource"], value["resourceType"]);
-        assert_eq!(value["action"], value["actionCode"]);
+        let value = serde_json::to_value(entry).expect("complete entry view serializes");
+        assert_eq!(value["entryId"], 3);
         assert_eq!(value["ruleSetId"], 7);
+        assert_eq!(value["resourceType"], "learn_course");
+        assert_eq!(value["resourceId"], 17);
+        assert_eq!(value["actionCode"], "read");
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["createdAt"], "2023-11-14T22:13:20Z");
         assert_eq!(value["tenantId"], 11);
+        assert!(value.get("id").is_none());
+        assert!(value.get("resource").is_none());
+        assert!(value.get("action").is_none());
     }
 
     #[test]

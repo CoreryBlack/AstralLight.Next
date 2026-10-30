@@ -10,16 +10,6 @@ use astral_common::contract::ApiResponse;
 use astral_common::error::AppError;
 
 #[derive(Debug, Serialize)]
-pub struct CacheStatus {
-    pub hit_rate: f64,
-    pub connected_clients: i64,
-    pub max_clients: i64,
-    pub used_memory: String,
-    pub used_memory_percent: f64,
-    pub key_count: i64,
-}
-
-#[derive(Debug, Serialize)]
 pub struct ServiceLatency {
     pub name: String,
     pub latency_ms: i64,
@@ -91,7 +81,6 @@ pub struct MetricsHistoryFilter {
 
 pub fn dashboard_routes() -> Router<AppState> {
     Router::new()
-        .route("/cache", get(get_cache_status))
         .route("/latency", get(get_service_latencies))
         .route("/resources", get(get_system_resources))
         .route("/trend", get(get_request_trend))
@@ -99,35 +88,6 @@ pub fn dashboard_routes() -> Router<AppState> {
         .route("/alerts-summary", get(get_dashboard_alerts))
         .route("/activities", get(get_dashboard_activities))
         .route("/metrics/history", get(get_metrics_history))
-}
-
-async fn get_cache_status(
-    State(state): State<AppState>,
-) -> Result<Json<ApiResponse<Option<CacheStatus>>>, AppError> {
-    let (hit_rate, connected, mem_percent, mem_mb, key_count) = tokio::try_join!(
-        state.monitor_service.latest_metric("redis", "hit_rate"),
-        state
-            .monitor_service
-            .latest_metric("redis", "connected_clients"),
-        state.monitor_service.latest_metric("redis", "memory_usage"),
-        state
-            .monitor_service
-            .latest_metric("redis", "used_memory_mb"),
-        state.monitor_service.latest_metric("redis", "key_count"),
-    )?;
-
-    let Some(hit_rate) = hit_rate else {
-        return Ok(Json(ApiResponse::success(None)));
-    };
-    let connected = connected.unwrap_or_default() as i64;
-    Ok(Json(ApiResponse::success(Some(CacheStatus {
-        hit_rate,
-        connected_clients: connected,
-        max_clients: 16,
-        used_memory: format!("{:.1}MB", mem_mb.unwrap_or_default()),
-        used_memory_percent: mem_percent.unwrap_or_default(),
-        key_count: key_count.unwrap_or_default() as i64,
-    }))))
 }
 
 async fn get_service_latencies(

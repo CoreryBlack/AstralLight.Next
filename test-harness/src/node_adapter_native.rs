@@ -1,14 +1,14 @@
 //! Native NodeAdapter runtime composed over injected CommandRunner and
-//! HttpTransport ports. It executes SQL/Redis/log-slice commands and signed
-//! GETs without opening sockets, SSH or subprocesses itself.
+//! HttpTransport ports. It executes SQL/raw-log collection and signed HTTP
+//! requests without opening sockets, SSH or subprocesses itself.
 
 use crate::e3_e4_events::{
     events_for_request, parse_e1_events, validate_request_terminal, ReaderClassification,
 };
 use crate::node_adapter_contract::{
-    actor_from_mapping, execute_log_slice_with_detail, execute_redis_with_detail,
-    execute_signed_request, execute_sql_with_detail, Actor, CommandRunner, ContractError,
-    HttpTransport, NodeAdapterConfig, RunnerError, SignedRequestSpec,
+    actor_from_mapping, execute_log_slice_with_detail, execute_signed_request,
+    execute_sql_with_detail, Actor, CommandRunner, ContractError, HttpTransport, NodeAdapterConfig,
+    RunnerError, SignedRequestSpec,
 };
 use serde_json::Value;
 use std::fmt;
@@ -59,15 +59,6 @@ impl NodeAdapter {
         query: &str,
     ) -> Result<Vec<Vec<String>>, RunnerError> {
         execute_sql_with_detail(&self.config, runner, query, 60_000)
-    }
-
-    pub fn redis<R: CommandRunner>(
-        &self,
-        runner: &mut R,
-        verb: &str,
-        args: &[&str],
-    ) -> Result<String, RunnerError> {
-        execute_redis_with_detail(&self.config, runner, verb, args, 30_000)
     }
 
     pub fn read_log_lines<R: CommandRunner>(
@@ -127,7 +118,6 @@ mod tests {
     use serde_json::json;
 
     const MYSQL_SECRET: &str = "mysql-root-secret-xyzzy";
-    const REDIS_SECRET: &str = "redis-pass-secret-abcdef";
     const SIGNING_KEY: &[u8] = b"super-secret-signing-key";
 
     fn raw_config() -> Value {
@@ -145,10 +135,8 @@ mod tests {
             "base_dir": "~/authz-validation-20260919-single-node-002",
             "db": "astral_bench",
             "mysql_container": "astral_bench_mysql",
-            "redis_container": "astral_bench_redis",
             "hmac_secret_file": "/run/secrets/hmac.txt",
             "mysql_root": MYSQL_SECRET,
-            "redis_password": REDIS_SECRET,
             "binary_sha256": "a".repeat(64),
             "source_snapshot_sha256": "b".repeat(64),
             "source_git_rev": "c".repeat(40),
@@ -208,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn sql_redis_and_log_slice_use_injected_fixed_commands() {
+    fn sql_and_raw_logs_use_injected_fixed_commands_then_rust_filtering() {
         let adapter = adapter();
         let mut runner = FakeRunner {
             calls: Vec::new(),
@@ -220,12 +208,7 @@ mod tests {
                 },
                 CommandResult {
                     exit_code: 0,
-                    stdout: "PONG\n".to_owned(),
-                    stderr: String::new(),
-                },
-                CommandResult {
-                    exit_code: 0,
-                    stdout: "line1\nline2\n".to_owned(),
+                    stdout: "unrelated\nreq-1 line\nreq-1 password=private-value\n".to_owned(),
                     stderr: String::new(),
                 },
             ],
@@ -234,20 +217,23 @@ mod tests {
             adapter.sql(&mut runner, "SELECT a, b FROM t").unwrap(),
             vec![vec!["a".to_owned(), "b".to_owned()]]
         );
-        assert_eq!(adapter.redis(&mut runner, "PING", &[]).unwrap(), "PONG");
         assert_eq!(
             adapter
                 .read_log_lines(&mut runner, "node-a", &["req-1"], "/home/ops")
                 .unwrap(),
-            ["line1".to_owned(), "line2".to_owned()]
+            [
+                "req-1 line".to_owned(),
+                "req-1 password=[redacted]".to_owned()
+            ]
         );
-        assert_eq!(runner.calls.len(), 3);
+        assert_eq!(runner.calls.len(), 2);
         assert_eq!(runner.calls[0].argv[0], "docker");
         assert!(runner.calls[0].stdin_is(MYSQL_SECRET));
-        assert_eq!(runner.calls[1].argv[0], "docker");
-        assert!(runner.calls[1].stdin_is(REDIS_SECRET));
-        assert_eq!(runner.calls[2].argv[0], "ssh");
-        assert!(runner.calls[2].stdin_is(crate::node_adapter_contract::LOG_GREP_SCRIPT));
+        assert_eq!(runner.calls[1].argv[0], "ssh");
+        assert!(runner.calls[1].stdin_is(""));
+        assert!(runner.calls[1].argv[6].contains("head -c"));
+        assert!(!runner.calls[1].argv[6].contains("req-1"));
+        assert!(!runner.calls[1].argv[6].contains("python"));
     }
 
     #[test]
@@ -355,6 +341,5 @@ mod tests {
         assert!(text.contains("NodeAdapter"));
         assert!(!text.contains("super-secret-signing-key"));
         assert!(!text.contains(MYSQL_SECRET));
-        assert!(!text.contains(REDIS_SECRET));
     }
 }

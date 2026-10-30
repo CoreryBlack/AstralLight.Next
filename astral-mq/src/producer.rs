@@ -109,6 +109,14 @@ pub enum RawReplayError {
     },
     #[error("raw replay message id is empty")]
     EmptyMessageId,
+    #[error("raw replay message id contains invalid whitespace or control characters")]
+    InvalidMessageId,
+    #[error("raw replay AMQP message id conflicts with the canonical body id")]
+    ConflictingMessageId,
+    #[error("raw replay body is not a canonical flat MQ business message")]
+    NonCanonicalMessage,
+    #[error("raw replay body messageId does not match the replay identity")]
+    BodyMessageIdMismatch,
     #[error("raw replay payload exceeds {limit} bytes: {actual}")]
     PayloadTooLarge { limit: usize, actual: usize },
     #[error("raw replay publish failed: code={code}, text={text}")]
@@ -178,6 +186,95 @@ fn sanitize_replay_properties(properties: &BasicProperties, message_id: &str) ->
     }
 }
 
+fn validate_raw_replay_transport_message_id(
+    properties: &BasicProperties,
+    message_id: &str,
+) -> Result<(), RawReplayError> {
+    if matches!(
+        properties.message_id().as_ref(),
+        Some(property_id) if property_id.as_str() != message_id
+    ) {
+        return Err(RawReplayError::ConflictingMessageId);
+    }
+    Ok(())
+}
+
+fn validate_raw_replay_business_message(
+    route: RawReplayRoute,
+    body: &[u8],
+    message_id: &str,
+) -> Result<(), RawReplayError> {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|_| RawReplayError::NonCanonicalMessage)?;
+    let object = value
+        .as_object()
+        .ok_or(RawReplayError::NonCanonicalMessage)?;
+    if object.contains_key("payload") {
+        return Err(RawReplayError::NonCanonicalMessage);
+    }
+    let allowed_fields: &[&str] = match route {
+        RawReplayRoute::TrustGraphAudit => &[
+            "messageId",
+            "timestamp",
+            "userId",
+            "cardId",
+            "action",
+            "resource",
+            "decision",
+            "reason",
+            "eventType",
+            "sourceIp",
+            "requestId",
+            "domainId",
+            "tenantId",
+            "detail",
+        ],
+        RawReplayRoute::IdentityLogin => &[
+            "messageId",
+            "timestamp",
+            "userId",
+            "cardId",
+            "loginType",
+            "ipAddress",
+            "userAgent",
+            "success",
+        ],
+    };
+    if object
+        .keys()
+        .any(|key| !allowed_fields.contains(&key.as_str()))
+    {
+        return Err(RawReplayError::NonCanonicalMessage);
+    }
+    let canonical_id = object
+        .get("messageId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(RawReplayError::NonCanonicalMessage)?;
+    if canonical_id != message_id {
+        return Err(RawReplayError::BodyMessageIdMismatch);
+    }
+    let timestamp = object
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(RawReplayError::NonCanonicalMessage)?;
+    time::OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| RawReplayError::NonCanonicalMessage)?;
+    let mut business_fields = object.clone();
+    business_fields.remove("messageId");
+    business_fields.remove("timestamp");
+    let payload = match route {
+        RawReplayRoute::TrustGraphAudit => {
+            serde_json::from_value::<AuditLogPayload>(Value::Object(business_fields)).map(|_| ())
+        }
+        RawReplayRoute::IdentityLogin => {
+            serde_json::from_value::<LoginEventPayload>(Value::Object(business_fields)).map(|_| ())
+        }
+    };
+    payload.map_err(|_| RawReplayError::NonCanonicalMessage)
+}
+
 fn confirmation_error(code: &'static str, returned: BasicReturnMessage) -> RawReplayError {
     let mut hasher = Sha256::new();
     hasher.update(&returned.data);
@@ -198,7 +295,7 @@ fn confirmation_error(code: &'static str, returned: BasicReturnMessage) -> RawRe
 
 // ===== 类型化 DTO =====
 
-/// Java `LocalDateTime` 兼容的消息时间戳。
+/// UTC RFC3339 消息时间戳。
 pub fn now_timestamp() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -209,7 +306,6 @@ pub fn now_timestamp() -> String {
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditLogPayload {
-    pub message_id: Option<String>,
     pub user_id: Option<i64>,
     pub card_id: Option<i64>,
     pub action: String,
@@ -222,37 +318,30 @@ pub struct AuditLogPayload {
     pub domain_id: Option<i64>,
     pub tenant_id: Option<i64>,
     /// producer 提供的有界审计明细（例如 ORG_SCOPE ALLOW 的结构化 JSON
-    /// provenance detail）。`serde(default)` 保证旧 wire 消息（无 `detail` 键）
-    /// 仍可反序列化；`skip_serializing_if` 保证未携带 detail 的新消息与旧格式
-    /// 字节等价。consumer 侧仅在 producer 提供非空白 detail 时落库该值，
-    /// 否则回退既有 messageId 关联文本。旧 consumer 对新消息的未知键按 serde
-    /// 默认忽略，不破坏向后兼容。
+    /// provenance detail）。未提供时 consumer 使用根级 messageId 关联审计；
+    /// 空白明细同样不替代这项关联。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
-/// 会话撤销命令消息（对齐 Java `AuthSessionRevocationCommandService`）
+/// 会话撤销命令 payload（对齐 Java `AuthSessionRevocationCommandService`）。
 ///
-/// 由 TrustGraph GlobalAdmin 生命周期等跨服务撤销场景发布到
-/// `astral.auth.session.revocation`，Identity consumer 幂等消费后执行
-/// `revokeAllForUser`（DB 撤销 + session outbox + Redis 投影删除）。
+/// `messageId` 和 `timestamp` 由根级 MQ envelope 提供；`operationId` 是
+/// durable outbox 的稳定幂等键。Identity consumer 幂等消费后执行 DB 撤销与
+/// session outbox 投影。
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthSessionRevocationPayload {
-    pub message_id: Option<String>,
     /// Stable command id used by the consumer's durable outbox idempotency key.
-    #[serde(default)]
-    pub operation_id: Option<String>,
+    pub operation_id: String,
     pub user_id: i64,
     pub reason: String,
-    pub timestamp: String,
 }
 
 /// 登录事件消息
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginEventPayload {
-    pub message_id: Option<String>,
     pub user_id: i64,
     pub card_id: Option<i64>,
     pub login_type: String,
@@ -300,8 +389,7 @@ pub struct SubjectDeletePayload {
 
 // ===== 通用消息包装 =====
 
-/// 通用消息包装。新消息把业务字段展平到根对象，兼容 Java DTO；读取旧消息时
-/// 仍接受历史 `payload` 嵌套结构。
+/// 通用消息包装。业务字段与 envelope 字段展平到同一根对象；解码只接受此结构。
 #[derive(Debug, Clone)]
 pub struct MqMessage<T> {
     pub message_id: String,
@@ -314,6 +402,16 @@ impl<T: Serialize> Serialize for MqMessage<T> {
     where
         S: serde::Serializer,
     {
+        if self.message_id.trim().is_empty() {
+            return Err(serde::ser::Error::custom(
+                "messageId must be a non-empty string",
+            ));
+        }
+        time::OffsetDateTime::parse(
+            &self.timestamp,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(serde::ser::Error::custom)?;
         let payload = serde_json::to_value(&self.payload).map_err(serde::ser::Error::custom)?;
         let mut object = match payload {
             Value::Object(object) => object,
@@ -323,6 +421,16 @@ impl<T: Serialize> Serialize for MqMessage<T> {
                 ))
             }
         };
+        if object.contains_key("payload") {
+            return Err(serde::ser::Error::custom(
+                "nested payload is not a canonical MQ message",
+            ));
+        }
+        if object.contains_key("messageId") || object.contains_key("timestamp") {
+            return Err(serde::ser::Error::custom(
+                "MQ envelope fields must not be repeated inside the business payload",
+            ));
+        }
         object.insert("messageId".into(), Value::String(self.message_id.clone()));
         object.insert("timestamp".into(), Value::String(self.timestamp.clone()));
         object.serialize(serializer)
@@ -337,26 +445,34 @@ where
     where
         D: serde::Deserializer<'de>,
     {
-        let mut value = Value::deserialize(deserializer)?;
+        let value = Value::deserialize(deserializer)?;
         let object = value
-            .as_object_mut()
+            .as_object()
             .ok_or_else(|| serde::de::Error::custom("MQ message must be a JSON object"))?;
         let message_id = object
-            .remove("messageId")
-            .and_then(|value| value.as_str().map(ToOwned::to_owned))
-            .ok_or_else(|| serde::de::Error::missing_field("messageId"))?;
+            .get("messageId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| serde::de::Error::custom("messageId must be a non-empty string"))?;
         let timestamp = object
-            .remove("timestamp")
-            .and_then(|value| match value {
-                Value::String(value) => Some(value),
-                Value::Number(value) => Some(value.to_string()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let payload_value = object
-            .remove("payload")
-            .unwrap_or_else(|| Value::Object(object.clone()));
-        let payload = serde_json::from_value(payload_value).map_err(serde::de::Error::custom)?;
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| serde::de::Error::custom("timestamp must be an RFC3339 string"))?;
+        time::OffsetDateTime::parse(&timestamp, &time::format_description::well_known::Rfc3339)
+            .map_err(serde::de::Error::custom)?;
+        if object.contains_key("payload") {
+            return Err(serde::de::Error::custom(
+                "nested payload is not a canonical MQ message",
+            ));
+        }
+        let mut business_fields = object.clone();
+        business_fields.remove("messageId");
+        business_fields.remove("timestamp");
+        let payload = serde_json::from_value(Value::Object(business_fields))
+            .map_err(serde::de::Error::custom)?;
         Ok(Self {
             message_id,
             timestamp,
@@ -373,6 +489,22 @@ impl<T: Serialize> MqMessage<T> {
             payload,
         }
     }
+}
+
+fn stable_revocation_operation_id(
+    payload: &AuthSessionRevocationPayload,
+) -> Result<String, MqError> {
+    let operation_id = payload.operation_id.as_str();
+    if operation_id.trim().is_empty()
+        || operation_id.trim() != operation_id
+        || operation_id.len() > 64
+        || operation_id.chars().any(char::is_control)
+    {
+        return Err(MqError::Publish(
+            "invalid auth session revocation operationId".into(),
+        ));
+    }
+    Ok(operation_id.to_owned())
 }
 
 fn local_message_type(queue_name: &str) -> &'static str {
@@ -458,11 +590,17 @@ impl Producer {
         if request.message_id.trim().is_empty() {
             return Err(RawReplayError::EmptyMessageId);
         }
+        if request.message_id.trim() != request.message_id
+            || request.message_id.chars().any(char::is_control)
+        {
+            return Err(RawReplayError::InvalidMessageId);
+        }
         if request.message_id.len() > u8::MAX as usize {
             return Err(RawReplayError::MessageIdTooLong {
                 actual: request.message_id.len(),
             });
         }
+        validate_raw_replay_transport_message_id(&request.properties, &request.message_id)?;
         if request.payload.len() > MAX_RAW_REPLAY_PAYLOAD_BYTES {
             return Err(RawReplayError::PayloadTooLarge {
                 limit: MAX_RAW_REPLAY_PAYLOAD_BYTES,
@@ -476,6 +614,7 @@ impl Producer {
             &request.source_exchange,
             &request.source_routing_key,
         )?;
+        validate_raw_replay_business_message(route, &request.payload, &request.message_id)?;
         let (destination_exchange, destination_routing_key) = route.destination();
         let properties = sanitize_replay_properties(&request.properties, &request.message_id);
         let ProducerTransport::Rabbit(channel) = &self.transport else {
@@ -677,28 +816,14 @@ impl Producer {
 
     /// 发布审计日志消息
     pub async fn publish_audit_log(&self, payload: AuditLogPayload) -> Result<(), MqError> {
-        let message_id = payload.message_id.clone();
-        self.publish_to_queue_with_message_id(
-            crate::config::QUEUE_AUDIT_LOG,
-            "audit.log",
-            message_id,
-            None,
-            payload,
-        )
-        .await
+        self.publish_to_queue(crate::config::QUEUE_AUDIT_LOG, "audit.log", payload)
+            .await
     }
 
     /// 发布登录事件消息
     pub async fn publish_login_event(&self, payload: LoginEventPayload) -> Result<(), MqError> {
-        let message_id = payload.message_id.clone();
-        self.publish_to_queue_with_message_id(
-            crate::config::QUEUE_LOGIN_EVENT,
-            "login.event",
-            message_id,
-            None,
-            payload,
-        )
-        .await
+        self.publish_to_queue(crate::config::QUEUE_LOGIN_EVENT, "login.event", payload)
+            .await
     }
 
     /// 发布聊天消息通知。
@@ -820,12 +945,13 @@ impl Producer {
         &self,
         payload: AuthSessionRevocationPayload,
     ) -> Result<(), MqError> {
-        let message_id = payload.message_id.clone();
+        let operation_id = stable_revocation_operation_id(&payload)?;
+        let message_id = operation_id.clone();
         self.publish_to_queue_with_message_id(
             crate::config::QUEUE_AUTH_SESSION_REVOCATION,
             "auth.session.revocation",
-            message_id,
-            payload.operation_id.clone(),
+            Some(message_id),
+            Some(operation_id),
             payload,
         )
         .await
@@ -842,16 +968,8 @@ impl Producer {
         payload: AuthSessionRevocationPayload,
         deadline: std::time::Duration,
     ) -> Result<(), MqError> {
-        let message_id = payload
-            .message_id
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let operation_id = payload
-            .operation_id
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| message_id.clone());
+        let operation_id = stable_revocation_operation_id(&payload)?;
+        let message_id = operation_id.clone();
         let msg = MqMessage {
             message_id,
             timestamp: now_timestamp(),
@@ -918,6 +1036,32 @@ mod tests {
     use crate::config::QUEUE_AUTH_SESSION_REVOCATION;
     use crate::local_bus::{LocalBus, LocalBusLimits, LocalOwner, LocalReceiver};
 
+    fn login_replay_request() -> RawReplayRequest {
+        let payload = serde_json::to_vec(&json!({
+            "messageId": "login-message-1",
+            "timestamp": "2026-10-28T00:00:00Z",
+            "userId": 7,
+            "cardId": 70,
+            "loginType": "PASSWORD",
+            "ipAddress": "127.0.0.1",
+            "userAgent": null,
+            "success": true
+        }))
+        .unwrap();
+        RawReplayRequest::new(
+            "identity",
+            QUEUE_LOGIN_EVENT,
+            EXCHANGE_DIRECT,
+            "login.event",
+            payload,
+            BasicProperties::default()
+                .with_content_type(ShortString::from("application/json"))
+                .with_delivery_mode(2)
+                .with_message_id(ShortString::from("login-message-1")),
+            "login-message-1",
+        )
+    }
+
     fn replay_request() -> RawReplayRequest {
         let mut headers = FieldTable::default();
         headers.insert(
@@ -936,15 +1080,32 @@ mod tests {
             ShortString::from(HEADER_RETRY_COUNT),
             AMQPValue::LongLongInt(9),
         );
+        let payload = serde_json::to_vec(&json!({
+            "messageId": "audit-message-1",
+            "timestamp": "2026-10-28T00:00:00Z",
+            "userId": 7,
+            "cardId": 70,
+            "action": "read",
+            "resource": "card",
+            "decision": "ALLOW",
+            "reason": "ok",
+            "eventType": "PERMISSION_CHECK",
+            "sourceIp": "127.0.0.1",
+            "requestId": "req-1",
+            "domainId": 2,
+            "tenantId": 1
+        }))
+        .unwrap();
         RawReplayRequest::new(
             "trustgraph",
             QUEUE_AUDIT_LOG,
             EXCHANGE_DIRECT,
             "audit.log",
-            b"raw-secret-payload".to_vec(),
+            payload,
             BasicProperties::default()
                 .with_content_type(ShortString::from("application/json"))
                 .with_delivery_mode(2)
+                .with_message_id(ShortString::from("audit-message-1"))
                 .with_headers(headers),
             "audit-message-1",
         )
@@ -992,6 +1153,64 @@ mod tests {
     }
 
     #[test]
+    fn raw_replay_enforces_flat_typed_payload_and_transport_identity() {
+        let canonical = replay_request();
+        let route = RawReplayRoute::TrustGraphAudit;
+        assert!(
+            validate_raw_replay_business_message(route, &canonical.payload, "audit-message-1")
+                .is_ok()
+        );
+        assert!(
+            validate_raw_replay_transport_message_id(&canonical.properties, "audit-message-1")
+                .is_ok()
+        );
+        let properties_without_id = BasicProperties::default();
+        assert!(validate_raw_replay_transport_message_id(
+            &properties_without_id,
+            "audit-message-1"
+        )
+        .is_ok());
+        assert_eq!(
+            validate_raw_replay_transport_message_id(&canonical.properties, "wrong-id"),
+            Err(RawReplayError::ConflictingMessageId)
+        );
+        assert_eq!(
+            validate_raw_replay_business_message(route, &canonical.payload, "different-id"),
+            Err(RawReplayError::BodyMessageIdMismatch)
+        );
+
+        let mut nested: Value = serde_json::from_slice(&canonical.payload).unwrap();
+        let object = nested.as_object_mut().unwrap();
+        object.insert("payload".into(), json!({"userId": 7}));
+        assert_eq!(
+            validate_raw_replay_business_message(
+                route,
+                &serde_json::to_vec(&nested).unwrap(),
+                "audit-message-1"
+            ),
+            Err(RawReplayError::NonCanonicalMessage)
+        );
+        assert_eq!(
+            validate_raw_replay_business_message(
+                route,
+                br#"{"messageId":"audit-message-1","timestamp":1798156800,"userId":7,"action":"read","resource":"card","decision":"ALLOW","eventType":"PERMISSION_CHECK"}"#,
+                "audit-message-1"
+            ),
+            Err(RawReplayError::NonCanonicalMessage)
+        );
+        let login = login_replay_request();
+        assert!(validate_raw_replay_business_message(
+            RawReplayRoute::IdentityLogin,
+            &login.payload,
+            "login-message-1"
+        )
+        .is_ok());
+        assert!(
+            validate_raw_replay_transport_message_id(&login.properties, "login-message-1").is_ok()
+        );
+    }
+
+    #[test]
     fn raw_replay_properties_preserve_business_fields_and_reset_retry_headers() {
         let request = replay_request();
         let properties = sanitize_replay_properties(&request.properties, &request.message_id);
@@ -1021,13 +1240,13 @@ mod tests {
     #[test]
     fn raw_replay_payload_and_return_summary_do_not_expose_body() {
         let request = replay_request();
-        assert_eq!(request.payload, b"raw-secret-payload");
+        assert!(request.payload.starts_with(b"{"));
         let returned = lapin::message::Delivery::mock(
             1,
             ShortString::from(EXCHANGE_DIRECT),
             ShortString::from("audit.log"),
             false,
-            b"raw-secret-payload".to_vec(),
+            request.payload.clone(),
         );
         let returned = BasicReturnMessage {
             delivery: returned,
@@ -1043,8 +1262,11 @@ mod tests {
             panic!("expected structured returned-message error");
         };
         assert_eq!(summary.payload_bytes, request.payload.len());
-        assert!(!summary.payload_sha256.contains("raw-secret-payload"));
-        assert!(!summary.to_string().contains("raw-secret-payload"));
+        assert_eq!(
+            summary.payload_sha256,
+            format!("{:x}", Sha256::digest(&request.payload))
+        );
+        assert!(!summary.to_string().contains("userId"));
     }
 
     #[test]
@@ -1078,10 +1300,11 @@ mod tests {
     }
 
     #[test]
-    fn audit_payload_detail_is_optional_and_wire_backward_compatible() {
-        // 旧 wire 消息（无 detail 键）必须仍可反序列化，detail 落 None。
-        let legacy = json!({
-            "messageId": "legacy-message",
+    fn audit_payload_detail_is_optional_within_a_canonical_flat_message() {
+        // `detail` is optional business data; envelope identity remains root-level.
+        let flat = json!({
+            "messageId": "audit-message-1",
+            "timestamp": "2026-10-28T00:00:00Z",
             "userId": 7,
             "cardId": 70,
             "action": "read",
@@ -1094,25 +1317,129 @@ mod tests {
             "domainId": 2,
             "tenantId": 1
         });
-        let decoded: AuditLogPayload = serde_json::from_value(legacy).unwrap();
-        assert_eq!(decoded.detail, None);
+        let decoded: MqMessage<AuditLogPayload> = serde_json::from_value(flat).unwrap();
+        assert_eq!(decoded.message_id, "audit-message-1");
+        assert_eq!(decoded.payload.detail, None);
 
-        // 新消息带 detail 时按 camelCase wire 名序列化，并可完整回读。
-        let mut payload = sample_json_audit_payload();
-        payload.detail = Some("{\"path\":\"/stats\"}".into());
-        let value = serde_json::to_value(&payload).unwrap();
+        let mut message = MqMessage {
+            message_id: "audit-message-2".into(),
+            timestamp: "2026-10-28T00:00:00Z".into(),
+            payload: sample_json_audit_payload(),
+        };
+        message.payload.detail = Some("{\"path\":\"/stats\"}".into());
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["messageId"], "audit-message-2");
         assert_eq!(value["detail"], "{\"path\":\"/stats\"}");
-        let decoded: AuditLogPayload = serde_json::from_value(value).unwrap();
-        assert_eq!(decoded.detail.as_deref(), Some("{\"path\":\"/stats\"}"));
+        assert_eq!(value["timestamp"], "2026-10-28T00:00:00Z");
+        let decoded: MqMessage<AuditLogPayload> = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            decoded.payload.detail.as_deref(),
+            Some("{\"path\":\"/stats\"}")
+        );
 
-        // detail 缺省为 None 时不得出现在 wire 上（向后兼容的紧凑消息）。
-        let value = serde_json::to_value(sample_json_audit_payload()).unwrap();
+        let value = serde_json::to_value(MqMessage {
+            message_id: "audit-message-3".into(),
+            timestamp: "2026-10-28T00:00:00Z".into(),
+            payload: sample_json_audit_payload(),
+        })
+        .unwrap();
         assert!(value.get("detail").is_none());
+        assert_eq!(value["messageId"], "audit-message-3");
+    }
+
+    #[test]
+    fn mq_message_rejects_noncanonical_identity_and_nested_payload_shape() {
+        let valid = json!({
+            "messageId": "chat-message-1",
+            "timestamp": "2026-10-28T00:00:00Z",
+            "id": 42,
+            "conversationId": 10,
+            "senderId": 1,
+            "content": "hello",
+            "messageType": "TEXT"
+        });
+        let decoded: MqMessage<ChatMessagePayload> = serde_json::from_value(valid).unwrap();
+        assert_eq!(decoded.message_id, "chat-message-1");
+
+        let invalid_messages = [
+            json!({
+                "timestamp": "2026-10-28T00:00:00Z",
+                "id": 42,
+                "conversationId": 10,
+                "senderId": 1,
+                "content": "hello",
+                "messageType": "TEXT"
+            }),
+            json!({
+                "messageId": 7,
+                "timestamp": "2026-10-28T00:00:00Z",
+                "id": 42,
+                "conversationId": 10,
+                "senderId": 1,
+                "content": "hello",
+                "messageType": "TEXT"
+            }),
+            json!({
+                "messageId": "chat-message-1",
+                "timestamp": 1_798_156_800,
+                "id": 42,
+                "conversationId": 10,
+                "senderId": 1,
+                "content": "hello",
+                "messageType": "TEXT"
+            }),
+            json!({
+                "messageId": "chat-message-1",
+                "timestamp": "not-a-time",
+                "id": 42,
+                "conversationId": 10,
+                "senderId": 1,
+                "content": "hello",
+                "messageType": "TEXT"
+            }),
+            json!({
+                "messageId": "chat-message-1",
+                "timestamp": "2026-10-28T00:00:00Z",
+                "payload": {
+                    "id": 42,
+                    "conversationId": 10,
+                    "senderId": 1,
+                    "content": "hello",
+                    "messageType": "TEXT"
+                }
+            }),
+        ];
+        for message in invalid_messages {
+            assert!(serde_json::from_value::<MqMessage<ChatMessagePayload>>(message).is_err());
+        }
+    }
+
+    #[test]
+    fn mq_message_serialization_rejects_blank_id_invalid_timestamp_and_nested_payload() {
+        let blank_id = MqMessage {
+            message_id: "  ".into(),
+            timestamp: "2026-10-28T00:00:00Z".into(),
+            payload: chat_payload(),
+        };
+        assert!(serde_json::to_value(blank_id).is_err());
+
+        let invalid_timestamp = MqMessage {
+            message_id: "chat-message-1".into(),
+            timestamp: "invalid".into(),
+            payload: chat_payload(),
+        };
+        assert!(serde_json::to_value(invalid_timestamp).is_err());
+
+        let nested = MqMessage {
+            message_id: "chat-message-1".into(),
+            timestamp: "2026-10-28T00:00:00Z".into(),
+            payload: json!({"payload": {"id": 42}}),
+        };
+        assert!(serde_json::to_value(nested).is_err());
     }
 
     fn sample_json_audit_payload() -> AuditLogPayload {
         AuditLogPayload {
-            message_id: None,
             user_id: Some(7),
             card_id: Some(70),
             action: "read".into(),
@@ -1355,16 +1682,11 @@ mod tests {
 
     // ===== 本地撤销等待路径（publish_auth_session_revocation_and_wait）=====
 
-    fn revocation_payload(
-        message_id: Option<&str>,
-        operation_id: Option<&str>,
-    ) -> AuthSessionRevocationPayload {
+    fn revocation_payload(operation_id: &str) -> AuthSessionRevocationPayload {
         AuthSessionRevocationPayload {
-            message_id: message_id.map(ToOwned::to_owned),
-            operation_id: operation_id.map(ToOwned::to_owned),
+            operation_id: operation_id.to_owned(),
             user_id: 7,
             reason: "admin-reset".into(),
-            timestamp: now_timestamp(),
         }
     }
 
@@ -1392,7 +1714,7 @@ mod tests {
             async move {
                 producer
                     .publish_auth_session_revocation_and_wait(
-                        revocation_payload(Some("rev-wait"), Some("rev-op")),
+                        revocation_payload("rev-wait"),
                         Duration::from_secs(5),
                     )
                     .await
@@ -1422,14 +1744,14 @@ mod tests {
             async move {
                 producer
                     .publish_auth_session_revocation_and_wait(
-                        revocation_payload(Some("rev-msg-1"), Some("rev-op-1")),
+                        revocation_payload("rev-op-1"),
                         Duration::from_secs(5),
                     )
                     .await
             }
         });
         let delivery = receiver.recv().await.unwrap();
-        assert_eq!(delivery.envelope.message_id, "rev-msg-1");
+        assert_eq!(delivery.envelope.message_id, "rev-op-1");
         assert_eq!(delivery.envelope.operation_id, "rev-op-1");
         assert_eq!(delivery.envelope.message_type, "AUTH_SESSION_REVOCATION");
         assert_eq!(delivery.envelope.origin_region, "local");
@@ -1438,46 +1760,44 @@ mod tests {
         waiter.await.unwrap().unwrap();
     }
 
-    /// id 回退：operation_id 缺省回退到 message_id 且不写入业务 payload；
-    /// message_id 也缺省时生成 UUID 并保持 message_id == operation_id。
     #[tokio::test]
-    async fn local_revocation_wait_falls_back_operation_id_to_message_id() {
+    async fn revocation_publish_requires_a_stable_operation_id() {
+        let bus = LocalBus::new(LocalBusLimits::default()).unwrap();
+        let producer = Producer::new_local(bus, "local");
+        let payload = AuthSessionRevocationPayload {
+            operation_id: "  ".into(),
+            user_id: 7,
+            reason: "admin-reset".into(),
+        };
+        let result = producer
+            .publish_auth_session_revocation_and_wait(payload, Duration::from_secs(1))
+            .await;
+        assert!(matches!(
+            result,
+            Err(MqError::Publish(reason)) if reason == "invalid auth session revocation operationId"
+        ));
+    }
+
+    /// The durable command operation ID is also the canonical MQ envelope ID;
+    /// neither identity is synthesized on a replay or malformed request.
+    #[tokio::test]
+    async fn local_revocation_wait_uses_required_stable_operation_id() {
         let (producer, mut receiver, _bus) = local_revocation_fixture(4);
         let waiter = tokio::spawn({
             let producer = producer.clone();
             async move {
                 producer
                     .publish_auth_session_revocation_and_wait(
-                        revocation_payload(Some("rev-msg-2"), None),
+                        revocation_payload("rev-op-2"),
                         Duration::from_secs(5),
                     )
                     .await
             }
         });
         let delivery = receiver.recv().await.unwrap();
-        assert_eq!(delivery.envelope.message_id, "rev-msg-2");
-        assert_eq!(delivery.envelope.operation_id, "rev-msg-2");
-        assert_eq!(
-            delivery.envelope.payload["operationId"],
-            serde_json::Value::Null
-        );
-        delivery.complete(Ok(()));
-        waiter.await.unwrap().unwrap();
-
-        let waiter = tokio::spawn({
-            let producer = producer.clone();
-            async move {
-                producer
-                    .publish_auth_session_revocation_and_wait(
-                        revocation_payload(None, None),
-                        Duration::from_secs(5),
-                    )
-                    .await
-            }
-        });
-        let delivery = receiver.recv().await.unwrap();
-        assert!(!delivery.envelope.message_id.is_empty());
-        assert_eq!(delivery.envelope.operation_id, delivery.envelope.message_id);
+        assert_eq!(delivery.envelope.message_id, "rev-op-2");
+        assert_eq!(delivery.envelope.operation_id, "rev-op-2");
+        assert_eq!(delivery.envelope.payload["operationId"], "rev-op-2");
         delivery.complete(Ok(()));
         waiter.await.unwrap().unwrap();
     }
@@ -1494,7 +1814,7 @@ mod tests {
             async move {
                 producer
                     .publish_auth_session_revocation_and_wait(
-                        revocation_payload(Some("rev-deadline"), None),
+                        revocation_payload("rev-deadline"),
                         Duration::ZERO,
                     )
                     .await
@@ -1516,7 +1836,7 @@ mod tests {
             async move {
                 producer
                     .publish_auth_session_revocation_and_wait(
-                        revocation_payload(Some("rev-dropped"), None),
+                        revocation_payload("rev-dropped"),
                         Duration::from_secs(5),
                     )
                     .await
@@ -1541,7 +1861,7 @@ mod tests {
         let producer = Producer::new_local(bus, "local");
         match producer
             .publish_auth_session_revocation_and_wait(
-                revocation_payload(Some("rev-no-owner"), None),
+                revocation_payload("rev-no-owner"),
                 Duration::from_secs(5),
             )
             .await
@@ -1574,7 +1894,7 @@ mod tests {
         .unwrap();
         match producer
             .publish_auth_session_revocation_and_wait(
-                revocation_payload(Some("rev-full"), None),
+                revocation_payload("rev-full"),
                 Duration::from_secs(5),
             )
             .await

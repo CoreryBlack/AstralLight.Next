@@ -1483,13 +1483,13 @@ impl CrossCityAgreementCertificate {
 /// Exactly two variants exist, and neither is an approval: `REJECT` records a
 /// definite, machine-provable conflict; `DEFER` records that no definite conflict
 /// is provable right now (the operation stays pending and fail-closed). This type
-/// is deliberately NOT `policy_engine::ArbitrationVerdict` (which contains
-/// `Allow`) and must never be widened to carry an allow variant: approving
-/// cross-city operations is out of this component's authority forever.
+/// is deliberately limited to conflict detection and must never be widened to
+/// carry an allow variant: approving cross-city operations is out of this
+/// component's authority.
 ///
 /// This is the shared contract type, owned here in `astral-types` so audit
-/// records can bind it; the policy-engine conflict module re-exports it
-/// unchanged for API compatibility.
+/// records bind it directly; the policy-engine conflict module exposes the same
+/// current contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CrossCityConflictOutcome {
@@ -1522,8 +1522,8 @@ impl fmt::Display for CrossCityConflictOutcome {
 /// embedded caller input, suitable for audit records and metrics labels.
 ///
 /// This is the shared contract type, owned here in `astral-types` so audit
-/// records can bind it; the policy-engine conflict module re-exports it
-/// unchanged for API compatibility.
+/// records bind it directly; the policy-engine conflict module exposes the same
+/// current contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CrossCityConflictReason {

@@ -308,10 +308,6 @@ pub trait DelegationRepository: Send + Sync {
         &self,
         batch_limit: i64,
     ) -> Result<Vec<i64>, AstralError>;
-    /// source mutation 事务是否已追加卡片投影。
-    fn writes_projection_in_transaction(&self) -> bool {
-        false
-    }
 }
 
 /// 委托展示行（list_delegations 用；platform_v4 列名别名映射）
@@ -1225,10 +1221,6 @@ async fn insert_delegation_audit_in_tx(
 
 #[async_trait]
 impl DelegationRepository for SqlxDelegationRepository {
-    fn writes_projection_in_transaction(&self) -> bool {
-        true
-    }
-
     async fn create_with_rule(
         &self,
         new: &NewDelegation,

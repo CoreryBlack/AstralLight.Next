@@ -1,9 +1,7 @@
 use sqlx::{MySql, Transaction};
 
-use super::{
-    transitions::{clear_owned_lane_in_tx, lock_owned_lane_in_tx},
-    OwnedDeltaLease, ProjectionExecutionMode,
-};
+use super::transitions::{clear_owned_lane_in_tx, lock_owned_lane_in_tx};
+use super::OwnedDeltaLease;
 use crate::{
     AuthorizationProjectionError, DeltaProjectorPublishCommand, DeltaProjectorPublishOutcome,
 };
@@ -14,11 +12,6 @@ pub async fn project_owned_authorization_delta_in_tx(
     command: &DeltaProjectorPublishCommand,
     lease: &OwnedDeltaLease,
 ) -> Result<DeltaProjectorPublishOutcome, AuthorizationProjectionError> {
-    if super::projection_execution_mode() != ProjectionExecutionMode::WorkerOwned {
-        return Err(AuthorizationProjectionError::ScopeViolation(
-            "code=projection_execution.worker_owned_mode_required".to_owned(),
-        ));
-    }
     if lease.identity() != &command.delta_lease_identity
         || lease.aggregate_identity() != &command.expectation.identity
         || lease.operation_id() != command.expectation.operation_id
@@ -33,12 +26,9 @@ pub async fn project_owned_authorization_delta_in_tx(
             "code=projection_execution.publication_lane_lost".to_owned(),
         ));
     }
-    let outcome = crate::authorization_projection_repository::project_delta_core_in_tx(
-        tx,
-        command,
-        Some(lease),
-    )
-    .await?;
+    let outcome =
+        crate::authorization_projection_repository::project_delta_core_in_tx(tx, command, lease)
+            .await?;
     if !clear_owned_lane_in_tx(tx, lease).await? {
         return Err(AuthorizationProjectionError::LeaseCasFailed(
             "code=projection_execution.publication_slot_clear_failed".to_owned(),

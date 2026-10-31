@@ -704,11 +704,13 @@ mod tests {
     use super::*;
     use crate::service::org_authorities::{org_authorities_config_from_env, OrgAuthoritiesConfig};
 
-    fn production_source() -> &'static str {
+    fn production_source() -> String {
         include_str!("org_authorities.rs")
+            .replace("\r\n", "\n")
             .split("#[cfg(test)]")
             .next()
             .unwrap()
+            .to_owned()
     }
 
     /// 提交体 kind/字段严格对应（多带字段拒绝；少带字段拒绝）。

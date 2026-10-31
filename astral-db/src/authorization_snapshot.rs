@@ -1733,7 +1733,7 @@ mod tests {
         // the SQL-bounded repository pair with the cap + 1 binding and the
         // whole-scope capacity refusals; the unbounded contract variants must
         // have no snapshot caller at all.
-        let source = include_str!("authorization_snapshot.rs");
+        let source = include_str!("authorization_snapshot.rs").replace("\r\n", "\n");
         let production = source
             .split_once("\n#[cfg(test)]\nmod tests {")
             .expect("test module boundary must exist")
@@ -1785,7 +1785,8 @@ mod tests {
         assert!(production.contains("enforce_hint_durable_pointer_capacity(pointers.len())?"));
 
         // Repository scan preserves SQL bounds, strict decoding and binding.
-        let repo_source = include_str!("authorization_projection_repository.rs");
+        let repo_source =
+            include_str!("authorization_projection_repository.rs").replace("\r\n", "\n");
         let repo_production = repo_source
             .split_once("\n#[cfg(test)]\nmod tests;")
             .expect("repository test module boundary must exist")

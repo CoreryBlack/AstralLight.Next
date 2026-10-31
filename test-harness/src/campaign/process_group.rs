@@ -148,7 +148,7 @@ mod imp {
 
     pub(super) fn spawn(command: &mut Command) -> Result<OwnedProcess, String> {
         use std::os::unix::process::CommandExt;
-        let mut child = command
+        let child = command
             .process_group(0)
             .spawn()
             .map_err(|error| format!("spawn suite: {error}"))?;

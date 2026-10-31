@@ -2085,7 +2085,9 @@ mod tests {
 
     #[test]
     fn e5_source_documents_abstract_evidence_boundary() {
-        let source = include_str!("../../Docs/authorization-validation/tools/e5_model_check.py");
+        // 检出端可能配置 autocrlf，断言前把 CRLF 归一为 LF。
+        let source = include_str!("../../Docs/authorization-validation/tools/e5_model_check.py")
+            .replace("\r\n", "\n");
         assert!(source.starts_with("#!/usr/bin/env python3\n\"\"\""));
         let module_doc = source
             .split_once("\"\"\"")

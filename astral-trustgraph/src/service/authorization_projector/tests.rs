@@ -1200,7 +1200,8 @@ fn worker_source_has_no_legacy_channel_symbols() {
     let config_source = include_str!("../authorization_projector/config.rs");
     let runtime_source = include_str!("../authorization_projector/runtime.rs");
     let worker_source = include_str!("../authorization_projector/worker.rs");
-    let planning_source = include_str!("../authorization_projector/planning.rs");
+    let planning_source =
+        include_str!("../authorization_projector/planning.rs").replace("\r\n", "\n");
     let ordinal_source = production_source_slice(include_str!(
         "../authorization_projector/planning/parent_ordinals.rs"
     ));
@@ -1256,7 +1257,7 @@ fn worker_source_has_no_legacy_channel_symbols() {
         ("worker.rs", worker_source),
         ("local_projection_worker.rs", local_worker_source),
         ("sync_publish.rs", sync_publish_source),
-        ("planning.rs", planning_source),
+        ("planning.rs", planning_source.as_str()),
         ("parent_ordinals.rs", ordinal_source.as_str()),
         ("digest_hints.rs", digest_hint_source.as_str()),
     ] {

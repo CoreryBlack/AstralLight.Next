@@ -5,29 +5,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
-#[cfg(any(unix, test))]
 use std::io::Read;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-#[cfg(unix)]
-use std::process::{Child, ExitStatus, Stdio};
-#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(unix)]
 use std::sync::{Arc, Mutex};
-#[cfg(unix)]
 use std::thread;
-#[cfg(unix)]
 use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use toml::Value as TomlValue;
 use url::Url;
 
+#[path = "campaign/process_group.rs"]
+mod process_group;
+
+use process_group::{wait_child, OwnedProcess};
+
 pub const STATUSES: [&str; 6] = ["FAIL", "UNKNOWN", "BLOCKED", "PENDING", "SKIP", "PASS"];
-#[cfg(unix)]
 const LOG_LIMIT: u64 = 64 * 1024 * 1024;
 const DEFAULT_PROFILES: [&str; 3] = ["native-kernel", "offline-validation", "performance-kernel"];
 const CLEAR_ENV: [&str; 19] = [
@@ -827,7 +824,6 @@ pub fn snapshot_hash(root: &Path) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-#[cfg(any(unix, test))]
 fn read_limited_to<R: Read>(reader: R, limit: u64) -> Result<(Vec<u8>, bool), std::io::Error> {
     let mut output = Vec::new();
     reader
@@ -840,7 +836,6 @@ fn read_limited_to<R: Read>(reader: R, limit: u64) -> Result<(Vec<u8>, bool), st
     Ok((output, truncated))
 }
 
-#[cfg(unix)]
 fn read_bounded_logs(
     stdout_path: &Path,
     stderr_path: &Path,
@@ -869,107 +864,6 @@ fn read_bounded_logs(
     Ok((stdout, stderr, truncated))
 }
 
-#[cfg(unix)]
-fn signal_group(pid: u32, signal: i32) -> Result<(), String> {
-    let result = unsafe { libc::kill(-(pid as i32), signal) };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(format!("signal owned process group: {error}"))
-    }
-}
-
-#[cfg(unix)]
-fn process_group_exists(pid: u32) -> Result<bool, String> {
-    let result = unsafe { libc::kill(-(pid as i32), 0) };
-    if result == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ESRCH) => Ok(false),
-        Some(libc::EPERM) => Ok(true),
-        _ => Err(format!("inspect owned process group: {error}")),
-    }
-}
-
-#[cfg(unix)]
-fn wait_process_group(pid: u32, timeout: Duration) -> Result<bool, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if !process_group_exists(pid)? {
-            return Ok(true);
-        }
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-#[cfg(unix)]
-fn stop_process_group(child: &mut Child, pid: u32) -> Result<(ExitStatus, bool), String> {
-    signal_group(pid, libc::SIGTERM)?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut child_status = None;
-    let group_stopped = loop {
-        if child_status.is_none() {
-            child_status = child
-                .try_wait()
-                .map_err(|error| format!("wait terminated child: {error}"))?;
-        }
-        let stopped = !process_group_exists(pid)?;
-        if child_status.is_some() && stopped {
-            break stopped;
-        }
-        if Instant::now() >= deadline {
-            break stopped;
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-    if !group_stopped {
-        signal_group(pid, libc::SIGKILL)?;
-    }
-    if child_status.is_none() {
-        child_status = Some(
-            child
-                .wait()
-                .map_err(|error| format!("wait terminated child: {error}"))?,
-        );
-    }
-    let group_stopped = if group_stopped {
-        true
-    } else {
-        wait_process_group(pid, Duration::from_secs(15))?
-    };
-    Ok((
-        child_status.expect("child status is reconciled"),
-        group_stopped,
-    ))
-}
-
-#[cfg(unix)]
-fn wait_child(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("wait child: {error}"))?
-        {
-            return Ok(Some(status));
-        }
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-#[cfg(unix)]
 fn copy_bounded<R: Read, W: Write>(
     mut reader: R,
     writer: &mut W,
@@ -1013,27 +907,16 @@ pub fn execute(
     root: &Path,
     directory: &Path,
 ) -> Result<Value, String> {
-    #[cfg(unix)]
-    {
-        execute_posix(suite, env, root, directory, LOG_LIMIT)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (suite, env, root, directory);
-        Err("campaign execution requires POSIX process-group log capture".into())
-    }
+    execute_native(suite, env, root, directory, LOG_LIMIT)
 }
 
-#[cfg(unix)]
-fn execute_posix(
+fn execute_native(
     suite: &TomlValue,
     env: &BTreeMap<OsString, OsString>,
     root: &Path,
     directory: &Path,
     log_limit: u64,
 ) -> Result<Value, String> {
-    use std::os::unix::process::CommandExt;
-
     let argv = string_array(suite, "argv")?;
     let stdout_path = directory.join(format!("{}.stdout.log", suite_id(suite)));
     let stderr_path = directory.join(format!("{}.stderr.log", suite_id(suite)));
@@ -1053,16 +936,20 @@ fn execute_posix(
         .current_dir(root)
         .env_clear()
         .envs(env)
-        .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let started = Instant::now();
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("spawn suite: {error}"))?;
-    let pid = child.id();
-    let stdout_reader = child.stdout.take().ok_or("stdout pipe was not created")?;
-    let stderr_reader = child.stderr.take().ok_or("stderr pipe was not created")?;
+    let mut owned = OwnedProcess::spawn(&mut command)?;
+    let stdout_reader = owned
+        .child()
+        .stdout
+        .take()
+        .ok_or("stdout pipe was not created")?;
+    let stderr_reader = owned
+        .child()
+        .stderr
+        .take()
+        .ok_or("stderr pipe was not created")?;
     let budget = Arc::new(AtomicU64::new(0));
     let overflow = Arc::new(AtomicBool::new(false));
     let output_error = Arc::new(Mutex::new(None::<String>));
@@ -1106,10 +993,10 @@ fn execute_posix(
     );
     let mut interrupted = false;
     let mut status = loop {
-        let child_status = wait_child(&mut child, Duration::from_millis(50))?;
+        let child_status = wait_child(owned.child(), Duration::from_millis(50))?;
         if overflow.load(Ordering::Acquire) || started.elapsed() >= timeout {
             interrupted = true;
-            let (status, group_stopped) = stop_process_group(&mut child, pid)?;
+            let (status, group_stopped) = owned.stop_group()?;
             if !group_stopped {
                 return Err("owned process group did not exit; log integrity is unknown".into());
             }
@@ -1124,19 +1011,19 @@ fn execute_posix(
         loop {
             if overflow.load(Ordering::Acquire) {
                 interrupted = true;
-                let (group_status, group_stopped) = stop_process_group(&mut child, pid)?;
+                let (group_status, group_stopped) = owned.stop_group()?;
                 if !group_stopped {
                     return Err("owned process group did not exit; log integrity is unknown".into());
                 }
                 status = group_status;
                 break;
             }
-            if !process_group_exists(pid)? {
+            if !owned.group_alive()? {
                 break;
             }
             if Instant::now() >= deadline {
                 interrupted = true;
-                let (group_status, group_stopped) = stop_process_group(&mut child, pid)?;
+                let (group_status, group_stopped) = owned.stop_group()?;
                 if !group_stopped {
                     return Err("owned process group did not exit; log integrity is unknown".into());
                 }
@@ -1167,10 +1054,15 @@ fn execute_posix(
         .map_err(|error| format!("scrub stdout artifact: {error}"))?;
     fs::write(&stderr_path, stderr.as_bytes())
         .map_err(|error| format!("scrub stderr artifact: {error}"))?;
-    File::open(&stdout_path)
+    // Windows 的 FlushFileBuffers 拒绝只读句柄，fsync 用写句柄打开。
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&stdout_path)
         .and_then(|file| file.sync_all())
         .map_err(|error| format!("sync stdout artifact: {error}"))?;
-    File::open(&stderr_path)
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&stderr_path)
         .and_then(|file| file.sync_all())
         .map_err(|error| format!("sync stderr artifact: {error}"))?;
     let exit_code = status.code().unwrap_or(-1);
@@ -1451,18 +1343,12 @@ where
             .and_then(TomlValue::as_str)
             .map(str::to_owned);
         if problem.is_none() {
-            if !cfg!(unix) {
-                problem =
-                    Some("campaign execution requires POSIX process-group log capture".into());
-            } else {
-                let (_, environment_problem) = prepare_environment(suite, environment);
-                problem = environment_problem;
-                if problem.is_none() {
-                    let argv = string_array(suite, "argv")?;
-                    if resolve_executable(&argv[0], &env::var("PATH").unwrap_or_default()).is_none()
-                    {
-                        problem = Some(format!("required tool unavailable: {}", argv[0]));
-                    }
+            let (_, environment_problem) = prepare_environment(suite, environment);
+            problem = environment_problem;
+            if problem.is_none() {
+                let argv = string_array(suite, "argv")?;
+                if resolve_executable(&argv[0], &env::var("PATH").unwrap_or_default()).is_none() {
+                    problem = Some(format!("required tool unavailable: {}", argv[0]));
                 }
             }
         }
@@ -1643,12 +1529,24 @@ where
 }
 
 fn resolve_executable(command: &str, path: &str) -> Option<PathBuf> {
-    if command.contains('/') {
+    if command.contains('/') || command.contains('\\') {
         return Path::new(command).exists().then(|| PathBuf::from(command));
     }
-    env::split_paths(path)
-        .map(|directory| directory.join(command))
-        .find(|candidate| candidate.is_file())
+    env::split_paths(path).find_map(|directory| {
+        let candidate = directory.join(command);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        // Windows 下无扩展名命令按 .exe 解析（与 std spawn 的行为一致）。
+        #[cfg(windows)]
+        {
+            let candidate = candidate.with_extension("exe");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    })
 }
 
 #[cfg(test)]
@@ -1658,16 +1556,12 @@ mod run_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    #[cfg(unix)]
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    #[cfg(unix)]
     struct TestDirectory(PathBuf);
 
-    #[cfg(unix)]
     impl TestDirectory {
         fn new() -> Self {
             let nonce = SystemTime::now()
@@ -1690,14 +1584,12 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
 
-    #[cfg(unix)]
     fn command_suite(argv: &[&str], timeout_seconds: i64) -> TomlValue {
         let mut table = toml::map::Map::new();
         table.insert(
@@ -1797,10 +1689,7 @@ mod tests {
         .collect()
     }
 
-    #[cfg(unix)]
     fn write_fake_cargo(directory: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         let cargo = directory.join("cargo");
         fs::write(
             &cargo,
@@ -1811,13 +1700,17 @@ exit "${FAKE_CARGO_EXIT:-0}"
 "##,
         )
         .unwrap();
-        let mut permissions = fs::metadata(&cargo).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&cargo, permissions).unwrap();
+        // Windows 没有 POSIX 权限位；MSYS2 bash 对带 shebang 的脚本可直接执行。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&cargo).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&cargo, permissions).unwrap();
+        }
         cargo
     }
 
-    #[cfg(unix)]
     fn invoke_shell_script(
         root: &Path,
         directory: &Path,
@@ -1826,8 +1719,16 @@ exit "${FAKE_CARGO_EXIT:-0}"
         cargo_exit: i32,
     ) -> std::process::Output {
         let log = directory.join("cargo.log");
+        #[cfg(unix)]
         let path = format!(
             "{}:{}",
+            directory.display(),
+            env::var("PATH").unwrap_or_default()
+        );
+        // Windows 交给 MSYS2 bash 的 PATH 用本机 ';' 分隔。
+        #[cfg(windows)]
+        let path = format!(
+            "{};{}",
             directory.display(),
             env::var("PATH").unwrap_or_default()
         );
@@ -1842,7 +1743,6 @@ exit "${FAKE_CARGO_EXIT:-0}"
             .unwrap()
     }
 
-    #[cfg(unix)]
     #[test]
     fn shell_entrypoints_forward_selection_to_the_rust_cli() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -1942,7 +1842,6 @@ exit "${FAKE_CARGO_EXIT:-0}"
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn shell_entrypoints_propagate_cargo_failures_and_reject_before_dispatch() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -3466,10 +3365,10 @@ exit "${FAKE_CARGO_EXIT:-0}"
         assert!(relative.is_absolute());
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_waits_for_descendants_before_freezing_logs() {
         let directory = TestDirectory::new();
+        #[cfg(unix)]
         let suite = command_suite(
             &[
                 "/bin/sh",
@@ -3478,8 +3377,30 @@ exit "${FAKE_CARGO_EXIT:-0}"
             ],
             5,
         );
+        #[cfg(windows)]
+        let suite = {
+            let child = directory.0.join("late-child.cmd");
+            fs::write(&child, "@ping -n 2 127.0.0.1 >nul\r\n@echo late\r\n").unwrap();
+            let parent = directory.0.join("early-parent.cmd");
+            fs::write(
+                &parent,
+                "@start /b cmd /d /c %~dp0late-child.cmd\r\n@echo early\r\n",
+            )
+            .unwrap();
+            command_suite(&[parent.to_str().unwrap()], 5)
+        };
+        #[cfg(unix)]
         let result =
-            execute_posix(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
+            execute_native(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
+        #[cfg(windows)]
+        let result = execute_native(
+            &suite,
+            &windows_minimal_environment([]),
+            &directory.0,
+            &directory.0,
+            1024,
+        )
+        .unwrap();
         assert_eq!(result["status"], "PASS", "{result}");
         let stdout = fs::read_to_string(result["stdout"].as_str().unwrap()).unwrap();
         assert!(stdout.contains("early"));
@@ -3487,10 +3408,10 @@ exit "${FAKE_CARGO_EXIT:-0}"
         assert_eq!(result["log_integrity"], "complete");
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_waits_for_descendant_stderr_and_hashes_the_frozen_bytes() {
         let directory = TestDirectory::new();
+        #[cfg(unix)]
         let suite = command_suite(
             &[
                 "/bin/sh",
@@ -3499,8 +3420,34 @@ exit "${FAKE_CARGO_EXIT:-0}"
             ],
             5,
         );
+        #[cfg(windows)]
+        let suite = {
+            let child = directory.0.join("stderr-child.cmd");
+            fs::write(
+                &child,
+                "@ping -n 2 127.0.0.1 >nul\r\n@echo descendant complete 1>&2\r\n",
+            )
+            .unwrap();
+            let parent = directory.0.join("stderr-parent.cmd");
+            fs::write(
+                &parent,
+                "@start /b cmd /d /c %~dp0stderr-child.cmd\r\n@echo parent complete\r\n",
+            )
+            .unwrap();
+            command_suite(&[parent.to_str().unwrap()], 5)
+        };
+        #[cfg(unix)]
         let result =
-            execute_posix(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
+            execute_native(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
+        #[cfg(windows)]
+        let result = execute_native(
+            &suite,
+            &windows_minimal_environment([]),
+            &directory.0,
+            &directory.0,
+            1024,
+        )
+        .unwrap();
         assert_eq!(result["status"], "PASS", "{result}");
         assert_eq!(result["log_integrity"], "complete");
         let stderr_path = result["stderr"].as_str().unwrap();
@@ -3514,27 +3461,59 @@ exit "${FAKE_CARGO_EXIT:-0}"
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_timeout_waits_for_delayed_descendant_stderr_before_hashing() {
         let directory = TestDirectory::new();
-        use std::os::unix::fs::PermissionsExt;
-        let child = directory.0.join("delayed-child.sh");
-        fs::write(
-            &child,
-            "#!/bin/sh\ntrap 'sleep 0.25; printf \"descendant shutdown\\n\" >&2; exit 0' TERM\nwhile :; do /bin/sleep 0.1; done\n",
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let child = directory.0.join("delayed-child.sh");
+            fs::write(
+                &child,
+                "#!/bin/sh\ntrap 'sleep 0.25; printf \"descendant shutdown\\n\" >&2; exit 0' TERM\nwhile :; do /bin/sleep 0.1; done\n",
+            )
+            .unwrap();
+            let parent = directory.0.join("parent.sh");
+            fs::write(&parent, format!("#!/bin/sh\n{} &\nwait\n", child.display())).unwrap();
+            for script in [&child, &parent] {
+                let mut permissions = fs::metadata(script).unwrap().permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(script, permissions).unwrap();
+            }
+        }
+        // Windows 没有进程级温和信号：后代先把 shutdown 写入 stderr 再长眠，
+        // 验证超时整树终止后已写入的后代 stderr 仍被完整捕获并冻结。
+        #[cfg(windows)]
+        {
+            let child = directory.0.join("delayed-child.cmd");
+            fs::write(
+                &child,
+                "@echo descendant shutdown 1>&2\r\n@ping -n 30 127.0.0.1 >nul\r\n",
+            )
+            .unwrap();
+            let parent = directory.0.join("parent.cmd");
+            fs::write(
+                &parent,
+                "@start /b cmd /d /c %~dp0delayed-child.cmd\r\n@ping -n 30 127.0.0.1 >nul\r\n",
+            )
+            .unwrap();
+        }
+        #[cfg(unix)]
+        let suite = command_suite(&[directory.0.join("parent.sh").to_str().unwrap()], 3);
+        #[cfg(windows)]
+        let suite = command_suite(&[directory.0.join("parent.cmd").to_str().unwrap()], 3);
+        #[cfg(unix)]
+        let result =
+            execute_native(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
+        #[cfg(windows)]
+        let result = execute_native(
+            &suite,
+            &windows_minimal_environment([]),
+            &directory.0,
+            &directory.0,
+            1024,
         )
         .unwrap();
-        let parent = directory.0.join("parent.sh");
-        fs::write(&parent, format!("#!/bin/sh\n{} &\nwait\n", child.display())).unwrap();
-        for script in [&child, &parent] {
-            let mut permissions = fs::metadata(script).unwrap().permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(script, permissions).unwrap();
-        }
-        let suite = command_suite(&[parent.to_str().unwrap()], 3);
-        let result =
-            execute_posix(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
         assert_eq!(result["status"], "UNKNOWN", "{result}");
         assert_eq!(result["stream_disconnect"], true);
         let stderr_path = result["stderr"].as_str().unwrap();
@@ -3548,10 +3527,10 @@ exit "${FAKE_CARGO_EXIT:-0}"
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_redacts_short_secrets_normalizes_newlines_and_hashes_exact_artifacts() {
         let directory = TestDirectory::new();
+        #[cfg(unix)]
         let suite = command_suite(
             &[
                 "/bin/sh",
@@ -3560,6 +3539,27 @@ exit "${FAKE_CARGO_EXIT:-0}"
             ],
             5,
         );
+        #[cfg(windows)]
+        let suite = command_suite(
+            &[
+                "cmd",
+                "/d",
+                "/c",
+                "echo",
+                "abc123",
+                "key-value",
+                "mixed-case",
+                "private-value",
+                "visible",
+                "mysql://fixture@localhost/db",
+                "&",
+                "echo",
+                "private-value",
+                "1>&2",
+            ],
+            5,
+        );
+        #[cfg(unix)]
         let environment = BTreeMap::from([
             (OsString::from("API_KEY"), OsString::from("abc123")),
             (OsString::from("ACCESS_KEY"), OsString::from("key-value")),
@@ -3570,7 +3570,16 @@ exit "${FAKE_CARGO_EXIT:-0}"
             ),
             (OsString::from("ORDINARY"), OsString::from("visible")),
         ]);
-        let result = execute_posix(&suite, &environment, &directory.0, &directory.0, 1024).unwrap();
+        #[cfg(windows)]
+        let environment = windows_minimal_environment([
+            ("API_KEY", "abc123"),
+            ("ACCESS_KEY", "key-value"),
+            ("apiKey", "mixed-case"),
+            ("PRIVATE_KEY", "private-value"),
+            ("ORDINARY", "visible"),
+        ]);
+        let result =
+            execute_native(&suite, &environment, &directory.0, &directory.0, 1024).unwrap();
         assert_eq!(result["status"], "PASS", "{result}");
         for stream in ["stdout", "stderr"] {
             let bytes = fs::read(result[stream].as_str().unwrap()).unwrap();
@@ -3591,13 +3600,25 @@ exit "${FAKE_CARGO_EXIT:-0}"
             .contains("visible"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_marks_fast_oversized_logs_unknown_and_keeps_bounded_prefix() {
         let directory = TestDirectory::new();
+        #[cfg(unix)]
         let suite = command_suite(&["/bin/sh", "-c", "printf 12345; printf abcde >&2"], 5);
+        #[cfg(windows)]
+        let suite = command_suite(&["cmd", "/d", "/c", "echo", "abcdefghij"], 5);
+        #[cfg(unix)]
         let result =
-            execute_posix(&suite, &BTreeMap::new(), &directory.0, &directory.0, 8).unwrap();
+            execute_native(&suite, &BTreeMap::new(), &directory.0, &directory.0, 8).unwrap();
+        #[cfg(windows)]
+        let result = execute_native(
+            &suite,
+            &windows_minimal_environment([]),
+            &directory.0,
+            &directory.0,
+            8,
+        )
+        .unwrap();
         assert_eq!(result["status"], "UNKNOWN", "{result}");
         assert_eq!(result["stream_disconnect"], true);
         assert!(result["log_integrity"]
@@ -3609,11 +3630,13 @@ exit "${FAKE_CARGO_EXIT:-0}"
         assert!(stdout.len() + stderr.len() <= 8);
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_terminates_timed_out_process_group_and_returns_unknown() {
         let directory = TestDirectory::new();
+        #[cfg(unix)]
         let mut suite = command_suite(&["/bin/sh", "-c", "/bin/sleep 30"], 1);
+        #[cfg(windows)]
+        let mut suite = command_suite(&["cmd", "/d", "/c", "ping", "-n", "30", "127.0.0.1"], 1);
         suite["acceptance"] = TomlValue::String("rust".into());
         suite
             .as_table_mut()
@@ -3623,8 +3646,18 @@ exit "${FAKE_CARGO_EXIT:-0}"
             "evidence_contract".into(),
             TomlValue::String("policy-evaluate-benefit".into()),
         );
+        #[cfg(unix)]
         let result =
-            execute_posix(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
+            execute_native(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
+        #[cfg(windows)]
+        let result = execute_native(
+            &suite,
+            &windows_minimal_environment([]),
+            &directory.0,
+            &directory.0,
+            1024,
+        )
+        .unwrap();
         assert_eq!(result["status"], "UNKNOWN", "{result}");
         assert_eq!(result["stream_disconnect"], true);
     }
@@ -3875,5 +3908,22 @@ exit "${FAKE_CARGO_EXIT:-0}"
         let (bytes, truncated) = read_limited_to(&b"1234"[..], 4).unwrap();
         assert_eq!(bytes, b"1234");
         assert!(!truncated);
+    }
+
+    #[cfg(windows)]
+    /// Windows 子进程没有 PATH/SystemRoot 时无法定位或初始化外部程序
+    /// （unix 空环境可行，Windows 不行）；测试传生产同等的最小父环境。
+    fn windows_minimal_environment(
+        extra: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> BTreeMap<OsString, OsString> {
+        let mut result: BTreeMap<OsString, OsString> =
+            ["SystemRoot", "SystemDrive", "ComSpec", "PATH", "PATHEXT"]
+                .iter()
+                .filter_map(|name| env::var_os(name).map(|value| (OsString::from(*name), value)))
+                .collect();
+        for (name, value) in extra {
+            result.insert(OsString::from(name), OsString::from(value));
+        }
+        result
     }
 }

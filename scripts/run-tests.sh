@@ -19,8 +19,11 @@ case "$MODE" in
     --bench) ARGS=(--run --profile performance-kernel) ;;
     *) printf '[BLOCKED] unknown test mode: %s\n' "$MODE" >&2; exit 2 ;;
 esac
+# Runner 使用 release 产物：workspace 套件会重建 target/debug 里的
+# test-campaign.exe，Windows 拒绝替换正在运行的二进制（os error 5），
+# 与运行中的 release 副本互不阻塞。
 if [ "${#ARGS[@]}" -gt 0 ]; then
-    exec cargo run --quiet --locked --manifest-path "$SCRIPT_DIR/../Cargo.toml" -p test-harness --bin test-campaign -- "${ARGS[@]}" "$@"
+    exec cargo run --quiet --locked --release --manifest-path "$SCRIPT_DIR/../Cargo.toml" -p test-harness --bin test-campaign -- "${ARGS[@]}" "$@"
 else
-    exec cargo run --quiet --locked --manifest-path "$SCRIPT_DIR/../Cargo.toml" -p test-harness --bin test-campaign -- "$@"
+    exec cargo run --quiet --locked --release --manifest-path "$SCRIPT_DIR/../Cargo.toml" -p test-harness --bin test-campaign -- "$@"
 fi

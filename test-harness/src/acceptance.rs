@@ -111,7 +111,8 @@ fn parse_finite_number(value: &str) -> Option<f64> {
 }
 
 fn valid_allocation_stat(value: &str, require_unit: bool) -> bool {
-    let units = ["B", "KB", "MB", "GB", "TB", "KiB", "MiB", "GiB"];
+    // 必须从最长单位开始匹配："B" 排在前会把 "KB"/"MiB" 截成 "…K" 导致拒绝。
+    let units = ["GiB", "MiB", "KiB", "TB", "GB", "MB", "KB", "B"];
     let trimmed = value.trim();
     if require_unit {
         let Some((number, unit)) = units.iter().find_map(|unit| {

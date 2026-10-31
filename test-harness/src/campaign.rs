@@ -3358,10 +3358,10 @@ exit "${FAKE_CARGO_EXIT:-0}"
         assert!(relative.is_absolute());
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_waits_for_descendants_before_freezing_logs() {
         let directory = TestDirectory::new();
+        #[cfg(unix)]
         let suite = command_suite(
             &[
                 "/bin/sh",
@@ -3370,8 +3370,30 @@ exit "${FAKE_CARGO_EXIT:-0}"
             ],
             5,
         );
+        #[cfg(windows)]
+        let suite = {
+            let child = directory.0.join("late-child.cmd");
+            fs::write(&child, "@ping -n 2 127.0.0.1 >nul\r\n@echo late\r\n").unwrap();
+            let parent = directory.0.join("early-parent.cmd");
+            fs::write(
+                &parent,
+                "@start /b cmd /d /c %~dp0late-child.cmd\r\n@echo early\r\n",
+            )
+            .unwrap();
+            command_suite(&[parent.to_str().unwrap()], 5)
+        };
+        #[cfg(unix)]
         let result =
             execute_native(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
+        #[cfg(windows)]
+        let result = execute_native(
+            &suite,
+            &windows_minimal_environment([]),
+            &directory.0,
+            &directory.0,
+            1024,
+        )
+        .unwrap();
         assert_eq!(result["status"], "PASS", "{result}");
         let stdout = fs::read_to_string(result["stdout"].as_str().unwrap()).unwrap();
         assert!(stdout.contains("early"));
@@ -3379,10 +3401,10 @@ exit "${FAKE_CARGO_EXIT:-0}"
         assert_eq!(result["log_integrity"], "complete");
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_waits_for_descendant_stderr_and_hashes_the_frozen_bytes() {
         let directory = TestDirectory::new();
+        #[cfg(unix)]
         let suite = command_suite(
             &[
                 "/bin/sh",
@@ -3391,8 +3413,34 @@ exit "${FAKE_CARGO_EXIT:-0}"
             ],
             5,
         );
+        #[cfg(windows)]
+        let suite = {
+            let child = directory.0.join("stderr-child.cmd");
+            fs::write(
+                &child,
+                "@ping -n 2 127.0.0.1 >nul\r\n@echo descendant complete 1>&2\r\n",
+            )
+            .unwrap();
+            let parent = directory.0.join("stderr-parent.cmd");
+            fs::write(
+                &parent,
+                "@start /b cmd /d /c %~dp0stderr-child.cmd\r\n@echo parent complete\r\n",
+            )
+            .unwrap();
+            command_suite(&[parent.to_str().unwrap()], 5)
+        };
+        #[cfg(unix)]
         let result =
             execute_native(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
+        #[cfg(windows)]
+        let result = execute_native(
+            &suite,
+            &windows_minimal_environment([]),
+            &directory.0,
+            &directory.0,
+            1024,
+        )
+        .unwrap();
         assert_eq!(result["status"], "PASS", "{result}");
         assert_eq!(result["log_integrity"], "complete");
         let stderr_path = result["stderr"].as_str().unwrap();
@@ -3406,27 +3454,59 @@ exit "${FAKE_CARGO_EXIT:-0}"
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_timeout_waits_for_delayed_descendant_stderr_before_hashing() {
         let directory = TestDirectory::new();
-        use std::os::unix::fs::PermissionsExt;
-        let child = directory.0.join("delayed-child.sh");
-        fs::write(
-            &child,
-            "#!/bin/sh\ntrap 'sleep 0.25; printf \"descendant shutdown\\n\" >&2; exit 0' TERM\nwhile :; do /bin/sleep 0.1; done\n",
-        )
-        .unwrap();
-        let parent = directory.0.join("parent.sh");
-        fs::write(&parent, format!("#!/bin/sh\n{} &\nwait\n", child.display())).unwrap();
-        for script in [&child, &parent] {
-            let mut permissions = fs::metadata(script).unwrap().permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(script, permissions).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let child = directory.0.join("delayed-child.sh");
+            fs::write(
+                &child,
+                "#!/bin/sh\ntrap 'sleep 0.25; printf \"descendant shutdown\\n\" >&2; exit 0' TERM\nwhile :; do /bin/sleep 0.1; done\n",
+            )
+            .unwrap();
+            let parent = directory.0.join("parent.sh");
+            fs::write(&parent, format!("#!/bin/sh\n{} &\nwait\n", child.display())).unwrap();
+            for script in [&child, &parent] {
+                let mut permissions = fs::metadata(script).unwrap().permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(script, permissions).unwrap();
+            }
         }
-        let suite = command_suite(&[parent.to_str().unwrap()], 3);
+        // Windows 没有进程级温和信号：后代先把 shutdown 写入 stderr 再长眠，
+        // 验证超时整树终止后已写入的后代 stderr 仍被完整捕获并冻结。
+        #[cfg(windows)]
+        {
+            let child = directory.0.join("delayed-child.cmd");
+            fs::write(
+                &child,
+                "@echo descendant shutdown 1>&2\r\n@ping -n 30 127.0.0.1 >nul\r\n",
+            )
+            .unwrap();
+            let parent = directory.0.join("parent.cmd");
+            fs::write(
+                &parent,
+                "@start /b cmd /d /c %~dp0delayed-child.cmd\r\n@ping -n 30 127.0.0.1 >nul\r\n",
+            )
+            .unwrap();
+        }
+        #[cfg(unix)]
+        let suite = command_suite(&[directory.0.join("parent.sh").to_str().unwrap()], 3);
+        #[cfg(windows)]
+        let suite = command_suite(&[directory.0.join("parent.cmd").to_str().unwrap()], 3);
+        #[cfg(unix)]
         let result =
             execute_native(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
+        #[cfg(windows)]
+        let result = execute_native(
+            &suite,
+            &windows_minimal_environment([]),
+            &directory.0,
+            &directory.0,
+            1024,
+        )
+        .unwrap();
         assert_eq!(result["status"], "UNKNOWN", "{result}");
         assert_eq!(result["stream_disconnect"], true);
         let stderr_path = result["stderr"].as_str().unwrap();
@@ -3440,10 +3520,10 @@ exit "${FAKE_CARGO_EXIT:-0}"
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_redacts_short_secrets_normalizes_newlines_and_hashes_exact_artifacts() {
         let directory = TestDirectory::new();
+        #[cfg(unix)]
         let suite = command_suite(
             &[
                 "/bin/sh",
@@ -3452,6 +3532,27 @@ exit "${FAKE_CARGO_EXIT:-0}"
             ],
             5,
         );
+        #[cfg(windows)]
+        let suite = command_suite(
+            &[
+                "cmd",
+                "/d",
+                "/c",
+                "echo",
+                "abc123",
+                "key-value",
+                "mixed-case",
+                "private-value",
+                "visible",
+                "mysql://fixture@localhost/db",
+                "&",
+                "echo",
+                "private-value",
+                "1>&2",
+            ],
+            5,
+        );
+        #[cfg(unix)]
         let environment = BTreeMap::from([
             (OsString::from("API_KEY"), OsString::from("abc123")),
             (OsString::from("ACCESS_KEY"), OsString::from("key-value")),
@@ -3461,6 +3562,14 @@ exit "${FAKE_CARGO_EXIT:-0}"
                 OsString::from("private-value"),
             ),
             (OsString::from("ORDINARY"), OsString::from("visible")),
+        ]);
+        #[cfg(windows)]
+        let environment = windows_minimal_environment([
+            ("API_KEY", "abc123"),
+            ("ACCESS_KEY", "key-value"),
+            ("apiKey", "mixed-case"),
+            ("PRIVATE_KEY", "private-value"),
+            ("ORDINARY", "visible"),
         ]);
         let result =
             execute_native(&suite, &environment, &directory.0, &directory.0, 1024).unwrap();
@@ -3484,13 +3593,25 @@ exit "${FAKE_CARGO_EXIT:-0}"
             .contains("visible"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_marks_fast_oversized_logs_unknown_and_keeps_bounded_prefix() {
         let directory = TestDirectory::new();
+        #[cfg(unix)]
         let suite = command_suite(&["/bin/sh", "-c", "printf 12345; printf abcde >&2"], 5);
+        #[cfg(windows)]
+        let suite = command_suite(&["cmd", "/d", "/c", "echo", "abcdefghij"], 5);
+        #[cfg(unix)]
         let result =
             execute_native(&suite, &BTreeMap::new(), &directory.0, &directory.0, 8).unwrap();
+        #[cfg(windows)]
+        let result = execute_native(
+            &suite,
+            &windows_minimal_environment([]),
+            &directory.0,
+            &directory.0,
+            8,
+        )
+        .unwrap();
         assert_eq!(result["status"], "UNKNOWN", "{result}");
         assert_eq!(result["stream_disconnect"], true);
         assert!(result["log_integrity"]
@@ -3502,11 +3623,13 @@ exit "${FAKE_CARGO_EXIT:-0}"
         assert!(stdout.len() + stderr.len() <= 8);
     }
 
-    #[cfg(unix)]
     #[test]
     fn execute_terminates_timed_out_process_group_and_returns_unknown() {
         let directory = TestDirectory::new();
+        #[cfg(unix)]
         let mut suite = command_suite(&["/bin/sh", "-c", "/bin/sleep 30"], 1);
+        #[cfg(windows)]
+        let mut suite = command_suite(&["cmd", "/d", "/c", "ping", "-n", "30", "127.0.0.1"], 1);
         suite["acceptance"] = TomlValue::String("rust".into());
         suite
             .as_table_mut()
@@ -3516,8 +3639,18 @@ exit "${FAKE_CARGO_EXIT:-0}"
             "evidence_contract".into(),
             TomlValue::String("policy-evaluate-benefit".into()),
         );
+        #[cfg(unix)]
         let result =
             execute_native(&suite, &BTreeMap::new(), &directory.0, &directory.0, 1024).unwrap();
+        #[cfg(windows)]
+        let result = execute_native(
+            &suite,
+            &windows_minimal_environment([]),
+            &directory.0,
+            &directory.0,
+            1024,
+        )
+        .unwrap();
         assert_eq!(result["status"], "UNKNOWN", "{result}");
         assert_eq!(result["stream_disconnect"], true);
     }
@@ -3785,88 +3918,5 @@ exit "${FAKE_CARGO_EXIT:-0}"
             result.insert(OsString::from(name), OsString::from(value));
         }
         result
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn execute_native_windows_hashes_and_normalizes_echo_output() {
-        let directory = TestDirectory::new();
-        let suite = command_suite(&["cmd", "/d", "/c", "echo hello"], 5);
-        let result = execute_native(
-            &suite,
-            &windows_minimal_environment([]),
-            &directory.0,
-            &directory.0,
-            1024,
-        )
-        .unwrap();
-        assert_eq!(result["status"], "PASS", "{result}");
-        assert_eq!(result["log_integrity"], "complete");
-        let stdout = fs::read(result["stdout"].as_str().unwrap()).unwrap();
-        assert!(!stdout.windows(2).any(|pair| pair == b"\r\n"));
-        assert!(String::from_utf8_lossy(&stdout).contains("hello"));
-        assert_eq!(
-            result["stdout_sha256"],
-            format!("{:x}", Sha256::digest(&stdout))
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn execute_native_windows_redacts_short_secrets() {
-        let directory = TestDirectory::new();
-        let suite = command_suite(
-            &[
-                "cmd",
-                "/d",
-                "/c",
-                "echo abc123 key-value private-value visible mysql://fixture@localhost/db",
-            ],
-            5,
-        );
-        let environment = windows_minimal_environment([
-            ("API_KEY", "abc123"),
-            ("ACCESS_KEY", "key-value"),
-            ("PRIVATE_KEY", "private-value"),
-        ]);
-        let result =
-            execute_native(&suite, &environment, &directory.0, &directory.0, 1024).unwrap();
-        assert_eq!(result["status"], "PASS", "{result}");
-        let stdout = fs::read_to_string(result["stdout"].as_str().unwrap()).unwrap();
-        for secret in ["abc123", "key-value", "private-value", "mysql://"] {
-            assert!(!stdout.contains(secret), "{secret}");
-        }
-        assert!(stdout.contains("visible"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn execute_native_windows_terminates_timed_out_process_tree() {
-        let directory = TestDirectory::new();
-        let mut suite = command_suite(
-            // cmd 内含 > 重定向时 /c 不会剥离外层引号，这里避免重定向语法；
-            // ping 是 cmd 的子进程，整树终止语义仍被覆盖。
-            &["cmd", "/d", "/c", "ping", "-n", "30", "127.0.0.1"],
-            1,
-        );
-        suite["acceptance"] = TomlValue::String("rust".into());
-        suite
-            .as_table_mut()
-            .unwrap()
-            .insert("minimum_tests".into(), TomlValue::Integer(1));
-        suite.as_table_mut().unwrap().insert(
-            "evidence_contract".into(),
-            TomlValue::String("policy-evaluate-benefit".into()),
-        );
-        let result = execute_native(
-            &suite,
-            &windows_minimal_environment([]),
-            &directory.0,
-            &directory.0,
-            1024,
-        )
-        .unwrap();
-        assert_eq!(result["status"], "UNKNOWN", "{result}");
-        assert_eq!(result["stream_disconnect"], true);
     }
 }

@@ -47,6 +47,36 @@ fn synthetic_manifest(root: &Path) -> Manifest {
     }
 }
 
+/// 平台原生的 proof 夹具命令：POSIX 用 /bin/sh printf，Windows 用 cmd echo。
+fn proof_argv() -> Vec<&'static str> {
+    #[cfg(unix)]
+    let argv = vec!["/bin/sh", "-c", "printf proof"];
+    #[cfg(windows)]
+    let argv = vec!["cmd", "/d", "/c", "echo proof"];
+    argv
+}
+
+/// proof 夹具的完整标准输出：printf 无尾随换行，cmd echo 有一个。
+fn proof_stdout() -> &'static str {
+    #[cfg(unix)]
+    {
+        "proof"
+    }
+    #[cfg(windows)]
+    {
+        "proof\n"
+    }
+}
+
+/// 输出 [PENDING] 状态标记的夹具命令（verify-items 语义验证用）。
+fn pending_argv() -> Vec<&'static str> {
+    #[cfg(unix)]
+    let argv = vec!["/bin/sh", "-c", "printf '[PENDING] result not proven\\n'"];
+    #[cfg(windows)]
+    let argv = vec!["cmd", "/d", "/c", "echo [PENDING] result not proven"];
+    argv
+}
+
 fn synthetic_suite(id: &str, argv: &[&str], required_output: &str) -> TomlValue {
     let argv = argv
         .iter()
@@ -81,8 +111,13 @@ where
 }
 
 fn integration_suite(id: &str) -> TomlValue {
+    let argv = proof_argv()
+        .iter()
+        .map(|argument| format!("\"{argument}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     toml::from_str(&format!(
-        "id = \"{id}\"\nprofile = \"native-single-node\"\ntest_services = [\"mysql\"]\nseries = [\"E4\"]\nscope = \"integration\"\nowner = \"campaign-contract-tests\"\nboundary = \"preflight contract only; no database access\"\nsources = []\nargv = [\"/bin/sh\", \"-c\", \"printf proof\"]\nacceptance = \"command\"\nrequired_output = \"proof\"\ntimeout_seconds = 5\n"
+        "id = \"{id}\"\nprofile = \"native-single-node\"\ntest_services = [\"mysql\"]\nseries = [\"E4\"]\nscope = \"integration\"\nowner = \"campaign-contract-tests\"\nboundary = \"preflight contract only; no database access\"\nsources = []\nargv = [{argv}]\nacceptance = \"command\"\nrequired_output = \"proof\"\ntimeout_seconds = 5\n"
     ))
     .unwrap()
 }
@@ -92,7 +127,7 @@ fn run_selected_publishes_owned_report_and_executes_only_local_contract_commands
     let artifacts = RunDirectory::new();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let manifest = synthetic_manifest(root);
-    let suite = synthetic_suite("local", &["/bin/sh", "-c", "printf proof"], "proof");
+    let suite = synthetic_suite("local", &proof_argv(), "proof");
 
     assert_eq!(
         run_selected(
@@ -122,7 +157,7 @@ fn run_selected_publishes_owned_report_and_executes_only_local_contract_commands
     assert_eq!(report["results"][0]["exit_code"], 0);
     assert_eq!(
         fs::read_to_string(report["results"][0]["stdout"].as_str().unwrap()).unwrap(),
-        "proof"
+        proof_stdout()
     );
     assert!(report["finished_at"].as_str().unwrap().starts_with("unix:"));
     assert!(report["phase_timing_seconds"][0]["finished_at_monotonic_offset"].is_number());
@@ -143,7 +178,7 @@ fn run_selected_preflight_blocks_every_suite_before_any_dispatch() {
         &["astrallight-command-that-does-not-exist"],
         "proof",
     );
-    let later = synthetic_suite("later", &["/bin/sh", "-c", "printf proof"], "proof");
+    let later = synthetic_suite("later", &proof_argv(), "proof");
 
     assert_eq!(
         run_selected(
@@ -169,17 +204,22 @@ fn run_selected_preflight_blocks_every_suite_before_any_dispatch() {
         .exists());
 }
 
+/// 非零退出且缺 required_output 的夹具命令（fail-stop 语义验证用）。
+fn failing_argv() -> Vec<&'static str> {
+    #[cfg(unix)]
+    let argv = vec!["/bin/sh", "-c", "printf no-proof; exit 3"];
+    #[cfg(windows)]
+    let argv = vec!["cmd", "/d", "/c", "exit", "3"];
+    argv
+}
+
 #[test]
 fn run_selected_stops_after_nonpass_and_records_the_stopped_phase() {
     let artifacts = RunDirectory::new();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let manifest = synthetic_manifest(root);
-    let first = synthetic_suite(
-        "first",
-        &["/bin/sh", "-c", "printf no-proof; exit 3"],
-        "proof",
-    );
-    let later = synthetic_suite("later", &["/bin/sh", "-c", "printf proof"], "proof");
+    let first = synthetic_suite("first", &failing_argv(), "proof");
+    let later = synthetic_suite("later", &proof_argv(), "proof");
 
     assert_eq!(
         run_selected(
@@ -211,8 +251,8 @@ fn run_selected_verify_items_reexecutes_in_fresh_phase_directories() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let manifest = synthetic_manifest(root);
     let suites = vec![
-        synthetic_suite("one", &["/bin/sh", "-c", "printf proof"], "proof"),
-        synthetic_suite("two", &["/bin/sh", "-c", "printf proof"], "proof"),
+        synthetic_suite("one", &proof_argv(), "proof"),
+        synthetic_suite("two", &proof_argv(), "proof"),
     ];
 
     assert_eq!(
@@ -254,7 +294,7 @@ fn run_selected_collection_preflight_blocks_every_suite_for_missing_database() {
     let artifacts = RunDirectory::new();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let manifest = synthetic_manifest(root);
-    let offline = synthetic_suite("offline", &["/bin/sh", "-c", "printf proof"], "proof");
+    let offline = synthetic_suite("offline", &proof_argv(), "proof");
     let integration = integration_suite("integration");
     let calls = std::cell::Cell::new(0usize);
 
@@ -287,7 +327,7 @@ fn run_selected_collection_preflight_blocks_every_suite_for_missing_database() {
 fn run_selected_marks_source_changes_before_or_during_dispatch_unknown() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let manifest = synthetic_manifest(root);
-    let suite = synthetic_suite("local", &["/bin/sh", "-c", "printf proof"], "proof");
+    let suite = synthetic_suite("local", &proof_argv(), "proof");
 
     for (run_id, snapshots, expected_calls) in [
         ("changed-before-dispatch", vec!["initial", "changed"], 0),
@@ -331,8 +371,8 @@ fn run_selected_keeps_report_pending_until_every_phase_finishes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let manifest = synthetic_manifest(root);
     let suites = vec![
-        synthetic_suite("one", &["/bin/sh", "-c", "printf proof"], "proof"),
-        synthetic_suite("two", &["/bin/sh", "-c", "printf proof"], "proof"),
+        synthetic_suite("one", &proof_argv(), "proof"),
+        synthetic_suite("two", &proof_argv(), "proof"),
     ];
     let dispatch_snapshots = std::cell::RefCell::new(Vec::new());
 
@@ -390,8 +430,8 @@ fn run_selected_fail_stops_on_every_nonpass_in_either_phase() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let manifest = synthetic_manifest(root);
     let suites = vec![
-        synthetic_suite("one", &["/bin/sh", "-c", "printf proof"], "proof"),
-        synthetic_suite("two", &["/bin/sh", "-c", "printf proof"], "proof"),
+        synthetic_suite("one", &proof_argv(), "proof"),
+        synthetic_suite("two", &proof_argv(), "proof"),
     ];
 
     for status in ["FAIL", "UNKNOWN", "BLOCKED", "PENDING", "SKIP"] {
@@ -440,12 +480,8 @@ fn run_selected_pending_output_stops_both_phases_without_retry() {
     let artifacts = RunDirectory::new();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let manifest = synthetic_manifest(root);
-    let pending = synthetic_suite(
-        "pending",
-        &["/bin/sh", "-c", "printf '[PENDING] result not proven\\n'"],
-        "proof",
-    );
-    let later = synthetic_suite("later", &["/bin/sh", "-c", "printf proof"], "proof");
+    let pending = synthetic_suite("pending", &pending_argv(), "proof");
+    let later = synthetic_suite("later", &proof_argv(), "proof");
 
     assert_eq!(
         run_selected(
@@ -474,8 +510,8 @@ fn run_selected_collection_failure_blocks_later_targets_after_items_pass() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let manifest = synthetic_manifest(root);
     let suites = vec![
-        synthetic_suite("one", &["/bin/sh", "-c", "printf proof"], "proof"),
-        synthetic_suite("two", &["/bin/sh", "-c", "printf proof"], "proof"),
+        synthetic_suite("one", &proof_argv(), "proof"),
+        synthetic_suite("two", &proof_argv(), "proof"),
     ];
     let calls = std::cell::Cell::new(0usize);
 
@@ -515,8 +551,8 @@ fn run_selected_fresh_run_reexecutes_the_original_full_selection() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let manifest = synthetic_manifest(root);
     let suites = vec![
-        synthetic_suite("one", &["/bin/sh", "-c", "printf proof"], "proof"),
-        synthetic_suite("two", &["/bin/sh", "-c", "printf proof"], "proof"),
+        synthetic_suite("one", &proof_argv(), "proof"),
+        synthetic_suite("two", &proof_argv(), "proof"),
     ];
     let first_calls = std::cell::Cell::new(0usize);
     assert_eq!(
@@ -579,7 +615,7 @@ fn run_selected_refuses_run_id_collision_and_invalid_artifact_scope() {
     let artifacts = RunDirectory::new();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let manifest = synthetic_manifest(root);
-    let suite = synthetic_suite("local", &["/bin/sh", "-c", "printf proof"], "proof");
+    let suite = synthetic_suite("local", &proof_argv(), "proof");
     fs::create_dir(artifacts.0.join("existing-run")).unwrap();
     assert!(run_selected(
         &manifest,

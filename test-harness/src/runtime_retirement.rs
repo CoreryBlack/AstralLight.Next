@@ -743,7 +743,8 @@ fn display_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
-        .into_owned()
+        // 证据文本统一正斜杠，findings 跨平台可比。
+        .replace('\\', "/")
 }
 
 #[cfg(test)]

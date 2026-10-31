@@ -1689,10 +1689,7 @@ mod tests {
         .collect()
     }
 
-    #[cfg(unix)]
     fn write_fake_cargo(directory: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         let cargo = directory.join("cargo");
         fs::write(
             &cargo,
@@ -1703,13 +1700,17 @@ exit "${FAKE_CARGO_EXIT:-0}"
 "##,
         )
         .unwrap();
-        let mut permissions = fs::metadata(&cargo).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&cargo, permissions).unwrap();
+        // Windows 没有 POSIX 权限位；MSYS2 bash 对带 shebang 的脚本可直接执行。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&cargo).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&cargo, permissions).unwrap();
+        }
         cargo
     }
 
-    #[cfg(unix)]
     fn invoke_shell_script(
         root: &Path,
         directory: &Path,
@@ -1718,8 +1719,16 @@ exit "${FAKE_CARGO_EXIT:-0}"
         cargo_exit: i32,
     ) -> std::process::Output {
         let log = directory.join("cargo.log");
+        #[cfg(unix)]
         let path = format!(
             "{}:{}",
+            directory.display(),
+            env::var("PATH").unwrap_or_default()
+        );
+        // Windows 交给 MSYS2 bash 的 PATH 用本机 ';' 分隔。
+        #[cfg(windows)]
+        let path = format!(
+            "{};{}",
             directory.display(),
             env::var("PATH").unwrap_or_default()
         );
@@ -1734,7 +1743,6 @@ exit "${FAKE_CARGO_EXIT:-0}"
             .unwrap()
     }
 
-    #[cfg(unix)]
     #[test]
     fn shell_entrypoints_forward_selection_to_the_rust_cli() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -1834,7 +1842,6 @@ exit "${FAKE_CARGO_EXIT:-0}"
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn shell_entrypoints_propagate_cargo_failures_and_reject_before_dispatch() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();

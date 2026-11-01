@@ -140,7 +140,15 @@ impl PolicyEngine {
         };
 
         // 畸形证据（合同校验失败）→ fail-closed，不区分内部形态。
-        if PublishedCardAuthorization::validate_shared(&evidence).is_err() {
+        #[cfg(feature = "performance-attribution")]
+        let validation_started = std::time::Instant::now();
+        let validation = PublishedCardAuthorization::validate_shared(&evidence);
+        #[cfg(feature = "performance-attribution")]
+        {
+            timing.attribution.initial_validation_ns +=
+                validation_started.elapsed().as_nanos() as u64;
+        }
+        if validation.is_err() {
             steps.push(step(
                 "PUBLISHED_EVIDENCE",
                 "DENY",
@@ -275,14 +283,37 @@ impl PolicyEngine {
         let final_evidence_reload_ns = t_recheck.elapsed().as_nanos() as u64;
         timing.final_evidence_reload_ns = final_evidence_reload_ns;
         let (recheck_outcome, recheck_had_error) = match recheck {
-            Ok(Some(next))
-                if published_recheck_identity_stable(
+            Ok(Some(next)) => {
+                #[cfg(feature = "performance-attribution")]
+                let stable = {
+                    let validation_started = std::time::Instant::now();
+                    let validation = next.validate();
+                    timing.attribution.final_recheck_validation_ns +=
+                        validation_started.elapsed().as_nanos() as u64;
+                    let scan_started = std::time::Instant::now();
+                    let stable = validation.is_ok()
+                        && next.tenant_id == evidence.tenant_id
+                        && next.card_id == evidence.card_id
+                        && next.tenant_id == tenant_id
+                        && next.card_id == card_id
+                        && evidence.gate == next.gate
+                        && evidence.manifests == next.manifests
+                        && next.effective_grants.iter().any(|grant| grant == matched);
+                    timing.attribution.final_recheck_scan_ns +=
+                        scan_started.elapsed().as_nanos() as u64;
+                    stable
+                };
+                #[cfg(not(feature = "performance-attribution"))]
+                let stable = published_recheck_identity_stable(
                     &evidence, &next, tenant_id, card_id, matched,
-                ) =>
-            {
-                (None, false)
+                );
+                if stable {
+                    (None, false)
+                } else {
+                    (Some(false), false)
+                }
             }
-            Ok(Some(_)) | Ok(None) => (Some(false), false),
+            Ok(None) => (Some(false), false),
             Err(error) => {
                 let business_pending = published_evidence_error_is_business_pending(&error);
                 tracing::warn!(
@@ -496,6 +527,16 @@ fn record_matcher_evidence_size(grant_count: usize) {
     metrics::histogram!("astral_authz_matcher_effective_grants").record(grant_count as f64);
 }
 
+fn record_matcher_candidate_telemetry(telemetry: MatcherCandidateTelemetry) {
+    metrics::counter!(
+        "astral_authz_matcher_candidate_routes_total",
+        "route" => telemetry.route.label()
+    )
+    .increment(1);
+    metrics::histogram!("astral_authz_matcher_candidate_count")
+        .record(telemetry.candidate_count as f64);
+}
+
 fn build_matcher_index(evidence: &PublishedCardAuthorization) -> MatcherIndex {
     let mut by_type: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
@@ -511,14 +552,92 @@ fn build_matcher_index(evidence: &PublishedCardAuthorization) -> MatcherIndex {
                 .push(index);
         }
     }
+    let by_type = by_type
+        .into_iter()
+        .map(|(grant_type, positions)| {
+            let secondary = (positions.len() > SECONDARY_INDEX_THRESHOLD).then(|| {
+                let mut by_resource_id = std::collections::HashMap::new();
+                let mut type_level = Vec::new();
+                for &position in &positions {
+                    let (_, resource_id) =
+                        parse_resource_key(&evidence.effective_grants[position].resource);
+                    if let Some(resource_id) = resource_id {
+                        by_resource_id
+                            .entry(resource_id.to_owned())
+                            .or_insert_with(Vec::new)
+                            .push(position);
+                    } else {
+                        type_level.push(position);
+                    }
+                }
+                TypeBucketSecondary {
+                    by_resource_id,
+                    type_level,
+                }
+            });
+            (
+                grant_type,
+                MatcherTypeBucket {
+                    positions,
+                    secondary,
+                },
+            )
+        })
+        .collect();
     MatcherIndex { by_type, wildcard }
 }
 
+pub(crate) const SECONDARY_INDEX_THRESHOLD: usize = 128;
+
 struct MatcherIndex {
     /// 解析后的类型段 → 该类型全部 grant 的下标（含对象级与类型级）。
-    by_type: std::collections::HashMap<String, Vec<usize>>,
+    by_type: std::collections::HashMap<String, MatcherTypeBucket>,
     /// `*` 全局通配段下标（可命中任何请求类型）。
     wildcard: Vec<usize>,
+}
+
+struct MatcherTypeBucket {
+    positions: Vec<usize>,
+    secondary: Option<TypeBucketSecondary>,
+}
+
+struct TypeBucketSecondary {
+    by_resource_id: std::collections::HashMap<String, Vec<usize>>,
+    type_level: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MatcherCandidateRoute {
+    Linear,
+    TypeBucket,
+    SecondaryExact,
+    SecondaryFallback,
+}
+
+impl MatcherCandidateRoute {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::TypeBucket => "type_bucket",
+            Self::SecondaryExact => "secondary_exact",
+            Self::SecondaryFallback => "secondary_fallback",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MatcherCandidateTelemetry {
+    pub(crate) route: MatcherCandidateRoute,
+    pub(crate) candidate_count: usize,
+}
+
+impl MatcherCandidateTelemetry {
+    fn linear(candidate_count: usize) -> Self {
+        Self {
+            route: MatcherCandidateRoute::Linear,
+            candidate_count,
+        }
+    }
 }
 
 impl MatcherIndex {
@@ -526,6 +645,103 @@ impl MatcherIndex {
     /// 随作用域结束（匹配器在返回前只读下标，不持有槽引用）。
     fn borrow_index(&self) -> &Self {
         self
+    }
+
+    fn select_candidates(
+        &self,
+        request_type: &str,
+        request_id: Option<&str>,
+    ) -> (MatcherCandidates<'_>, MatcherCandidateTelemetry) {
+        let Some(bucket) = self.by_type.get(request_type) else {
+            let candidates = MatcherCandidates::new([&[], &self.wildcard, &[]]);
+            return (
+                candidates,
+                MatcherCandidateTelemetry {
+                    route: MatcherCandidateRoute::TypeBucket,
+                    candidate_count: self.wildcard.len(),
+                },
+            );
+        };
+        let Some(request_id) = request_id else {
+            let candidates =
+                MatcherCandidates::new([bucket.positions.as_slice(), &self.wildcard, &[]]);
+            return (
+                candidates,
+                MatcherCandidateTelemetry {
+                    route: MatcherCandidateRoute::TypeBucket,
+                    candidate_count: bucket.positions.len() + self.wildcard.len(),
+                },
+            );
+        };
+        let Some(secondary) = bucket.secondary.as_ref() else {
+            let candidates =
+                MatcherCandidates::new([bucket.positions.as_slice(), &self.wildcard, &[]]);
+            return (
+                candidates,
+                MatcherCandidateTelemetry {
+                    route: MatcherCandidateRoute::TypeBucket,
+                    candidate_count: bucket.positions.len() + self.wildcard.len(),
+                },
+            );
+        };
+        let exact = secondary
+            .by_resource_id
+            .get(request_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let route = if exact.is_empty() {
+            MatcherCandidateRoute::SecondaryFallback
+        } else {
+            MatcherCandidateRoute::SecondaryExact
+        };
+        let candidates = MatcherCandidates::new([exact, &secondary.type_level, &self.wildcard]);
+        (
+            candidates,
+            MatcherCandidateTelemetry {
+                route,
+                candidate_count: exact.len() + secondary.type_level.len() + self.wildcard.len(),
+            },
+        )
+    }
+}
+
+struct MatcherCandidates<'a> {
+    buckets: [&'a [usize]; 3],
+    offsets: [usize; 3],
+}
+
+impl<'a> MatcherCandidates<'a> {
+    fn new(buckets: [&'a [usize]; 3]) -> Self {
+        Self {
+            buckets,
+            offsets: [0; 3],
+        }
+    }
+}
+
+impl Iterator for MatcherCandidates<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut selected: Option<usize> = None;
+        for bucket in 0..self.buckets.len() {
+            if self.buckets[bucket]
+                .get(self.offsets[bucket])
+                .is_some_and(|candidate| {
+                    selected
+                        .and_then(|selected| {
+                            self.buckets[selected].get(self.offsets[selected]).copied()
+                        })
+                        .is_none_or(|current| *candidate < current)
+                })
+            {
+                selected = Some(bucket);
+            }
+        }
+        let bucket = selected?;
+        let position = self.buckets[bucket][self.offsets[bucket]];
+        self.offsets[bucket] += 1;
+        Some(position)
     }
 }
 
@@ -596,26 +812,9 @@ impl MatcherCacheState {
     }
 }
 
-/// Candidate indices are the request-type bucket plus global wildcard bucket.
-/// Sorting restores evidence order so the indexed path preserves first-match semantics.
-fn matcher_candidates(
-    state: &mut MatcherCacheState,
-    evidence: &std::sync::Arc<PublishedCardAuthorization>,
-    request_type: &str,
-) -> (Option<Vec<usize>>, MatcherPath) {
-    let (index, path) = state.lookup_or_build(evidence);
-    let Some(index) = index else {
-        return (None, path);
-    };
-    let mut candidates = Vec::with_capacity(index.wildcard.len() + 64);
-    if let Some(bucket) = index.by_type.get(request_type) {
-        candidates.extend_from_slice(bucket);
-    }
-    candidates.extend_from_slice(&index.wildcard);
-    candidates.sort_unstable();
-    (Some(candidates), path)
-}
-
+// The indexed path combines the request-type bucket and global wildcard bucket.
+// Both buckets are kept in evidence order and merged without allocation, so
+// first-match semantics are preserved at O(bucket + wildcard).
 fn find_linear_published_grant<'a>(
     ctx: &PolicyContext,
     evidence: &'a PublishedCardAuthorization,
@@ -704,6 +903,7 @@ fn grant_matches_request(
         || get_alias_sources(action).contains(&grant.action.as_str())
 }
 
+#[cfg(test)]
 fn match_indexed_with_state<'a>(
     ctx: &PolicyContext,
     evidence: &'a std::sync::Arc<PublishedCardAuthorization>,
@@ -711,15 +911,33 @@ fn match_indexed_with_state<'a>(
     request_id: Option<&str>,
     state: &mut MatcherCacheState,
 ) -> (Option<&'a CanonicalGrant>, MatcherPath) {
-    let (candidates, path) = matcher_candidates(state, evidence, request_type);
-    let Some(candidates) = candidates else {
+    let (matched, path, _) =
+        match_indexed_with_state_detailed(ctx, evidence, request_type, request_id, state);
+    (matched, path)
+}
+
+fn match_indexed_with_state_detailed<'a>(
+    ctx: &PolicyContext,
+    evidence: &'a std::sync::Arc<PublishedCardAuthorization>,
+    request_type: &str,
+    request_id: Option<&str>,
+    state: &mut MatcherCacheState,
+) -> (
+    Option<&'a CanonicalGrant>,
+    MatcherPath,
+    MatcherCandidateTelemetry,
+) {
+    let (index, path) = state.lookup_or_build(evidence);
+    let Some(index) = index else {
         return (
             find_linear_published_grant(ctx, evidence, request_type, request_id),
             path,
+            MatcherCandidateTelemetry::linear(evidence.effective_grants.len()),
         );
     };
-    for index in candidates {
-        let grant = &evidence.effective_grants[index];
+    let (candidates, telemetry) = index.select_candidates(request_type, request_id);
+    for position in candidates {
+        let grant = &evidence.effective_grants[position];
         if grant_matches_request(
             ctx,
             request_type,
@@ -728,10 +946,10 @@ fn match_indexed_with_state<'a>(
             evidence.read_unix_seconds,
             grant,
         ) {
-            return (Some(grant), path);
+            return (Some(grant), path, telemetry);
         }
     }
-    (None, path)
+    (None, path, telemetry)
 }
 
 pub(crate) fn match_published_effective_grant<'a>(
@@ -739,23 +957,61 @@ pub(crate) fn match_published_effective_grant<'a>(
     evidence: &'a std::sync::Arc<PublishedCardAuthorization>,
     resource_key: &str,
 ) -> Option<&'a CanonicalGrant> {
+    match_published_effective_grant_with_path(ctx, evidence, resource_key).0
+}
+
+fn match_published_effective_grant_with_path<'a>(
+    ctx: &PolicyContext,
+    evidence: &'a std::sync::Arc<PublishedCardAuthorization>,
+    resource_key: &str,
+) -> (Option<&'a CanonicalGrant>, MatcherPath) {
+    let matched = match_published_effective_grant_with_telemetry(ctx, evidence, resource_key);
+    record_matcher_candidate_telemetry(matched.telemetry);
+    matched.map_path()
+}
+
+fn match_published_effective_grant_with_telemetry<'a>(
+    ctx: &PolicyContext,
+    evidence: &'a std::sync::Arc<PublishedCardAuthorization>,
+    resource_key: &str,
+) -> MatcherMatch<'a> {
     let (request_type, request_id) = parse_resource_key(resource_key);
     record_matcher_evidence_size(evidence.effective_grants.len());
 
     // 接力：小 N 线性扫描（技术 A，零构建成本）；大 N 走类型索引（技术
-    // B，构建 O(N) 一次、跨判定摊销，每判定 O(桶 + 通配桶)）。索引桶是匹
-    // 配的必要候选集合，两路径共用同一谓词——语义等价由结构保证。
+    // B，构建 O(N) 一次、跨判定摊销。大桶在有具体对象 ID 时再走二级
+    // resource-ID 索引，仍通过完整谓词确认，无法安全窄化时回到类型桶。
     if evidence.effective_grants.len() <= MATCHER_INDEX_THRESHOLD {
         record_matcher_path(MatcherPath::LinearThreshold);
-        return find_linear_published_grant(ctx, evidence, request_type, request_id);
+        return MatcherMatch {
+            matched: find_linear_published_grant(ctx, evidence, request_type, request_id),
+            path: MatcherPath::LinearThreshold,
+            telemetry: MatcherCandidateTelemetry::linear(evidence.effective_grants.len()),
+        };
     }
-    MATCHER_INDEX_CACHE.with(|cache| -> Option<&'a CanonicalGrant> {
+    MATCHER_INDEX_CACHE.with(|cache| {
         let mut state = cache.borrow_mut();
-        let (matched, path) =
-            match_indexed_with_state(ctx, evidence, request_type, request_id, &mut state);
+        let (matched, path, telemetry) =
+            match_indexed_with_state_detailed(ctx, evidence, request_type, request_id, &mut state);
         record_matcher_path(path);
-        matched
+        MatcherMatch {
+            matched,
+            path,
+            telemetry,
+        }
     })
+}
+
+struct MatcherMatch<'a> {
+    matched: Option<&'a CanonicalGrant>,
+    path: MatcherPath,
+    telemetry: MatcherCandidateTelemetry,
+}
+
+impl<'a> MatcherMatch<'a> {
+    fn map_path(self) -> (Option<&'a CanonicalGrant>, MatcherPath) {
+        (self.matched, self.path)
+    }
 }
 
 /// 已发布 grant 的来源标签：区分 RULE_SET BASE/OVERLAY、DIRECT、APPROVAL、
@@ -777,6 +1033,7 @@ pub(crate) fn published_source_label(grant: &CanonicalGrant) -> &'static str {
 /// `read_unix_seconds` 是逐次变化的读取时钟，不参与身份比较；但新证据必须
 /// 先通过合同校验，且被命中 grant 必须仍在新证据的 effective 集合中
 /// （含有效期在新读取时钟下仍然有效）。
+#[cfg(any(not(feature = "performance-attribution"), test))]
 pub(crate) fn published_recheck_identity_stable(
     baseline: &PublishedCardAuthorization,
     next: &PublishedCardAuthorization,

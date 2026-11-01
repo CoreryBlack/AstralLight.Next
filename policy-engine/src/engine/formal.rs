@@ -30,7 +30,11 @@ impl PolicyEngine {
         let mut steps = Vec::new();
         let mut timing = TimingBreakdown::default();
 
-        if let Some(fallback) = self.check_circuit_breaker(ctx) {
+        #[cfg(feature = "performance-attribution")]
+        let breaker_fallback = self.check_circuit_breaker_attributed(ctx);
+        #[cfg(not(feature = "performance-attribution"))]
+        let breaker_fallback = self.check_circuit_breaker(ctx);
+        if let Some(fallback) = breaker_fallback {
             return fallback;
         }
 
@@ -449,13 +453,24 @@ impl PolicyEngine {
         resource: Option<&str>,
     ) {
         timing.total_ns = start.elapsed().as_nanos() as u64;
-        record_policy_phase_metrics(timing);
+        #[cfg(feature = "performance-attribution")]
+        let stats_started = std::time::Instant::now();
+        #[cfg(feature = "performance-attribution")]
+        crate::hit_stats::publish_evaluation_attribution(timing);
         self.record_evaluation(allowed, timing);
         if repo_had_error {
             self.record_failure_on_evaluate(resource);
         } else {
             self.record_success_on_evaluate(resource);
         }
+        #[cfg(feature = "performance-attribution")]
+        {
+            let stats_and_breaker_ns = stats_started.elapsed().as_nanos() as u64;
+            crate::hit_stats::add_evaluation_stats_and_breaker(stats_and_breaker_ns);
+            timing.total_ns = timing.total_ns.saturating_add(stats_and_breaker_ns);
+            crate::hit_stats::publish_evaluation_attribution(timing);
+        }
+        record_policy_phase_metrics(timing);
     }
 
     /// Return the stable source category for an ALLOW decision.

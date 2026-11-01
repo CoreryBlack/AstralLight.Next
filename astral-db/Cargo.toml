@@ -10,6 +10,7 @@ test-support = []
 e1-observability = ["policy-engine/e1-observability"]
 e3-observability = ["astral-common/e3-observability"]
 e4-observability = ["astral-common/e4-observability"]
+performance-attribution = ["policy-engine/performance-attribution"]
 
 [dependencies]
 policy-engine = { path = "../policy-engine" }

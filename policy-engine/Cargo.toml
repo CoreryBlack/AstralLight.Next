@@ -34,6 +34,7 @@ divan = { workspace = true }
 [features]
 iai = ["dep:iai-callgrind"]
 e1-observability = ["dep:uuid"]
+performance-attribution = []
 
 [[bench]]
 name = "policy_bench"

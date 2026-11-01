@@ -1852,7 +1852,8 @@ pub async fn refresh_from_durable(pool: &MySqlPool, identity: &ProjectionAggrega
 #[cfg(test)]
 mod tests {
     mod assembly_cache;
-    mod evaluate_performance;
+    mod evaluate_experimental;
+    pub(crate) mod evaluate_performance;
     mod performance;
 
     use super::*;

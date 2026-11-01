@@ -24,6 +24,8 @@ pub mod e4_preconditions;
 pub mod e4_protocol;
 pub mod e5_model;
 pub mod evaluate_acceptance;
+pub mod evaluate_sharing_acceptance;
+pub mod evaluate_sharing_v2_acceptance;
 pub mod experiment_common_contract;
 pub mod experiment_register;
 pub mod legacy_campaign_contract;

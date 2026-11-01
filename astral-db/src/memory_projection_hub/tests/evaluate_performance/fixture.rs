@@ -3,10 +3,10 @@ use astral_types::{PolicyContext, PolicyDecision, PolicyError, ResourceOwnership
 use policy_engine::{org_admission::OrgAuthorityRead, PolicyEngine, RuleRepository};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
-pub(super) const FIXED_SECOND: i64 = 1_000_000_000;
+pub(crate) const FIXED_SECOND: i64 = 1_000_000_000;
 
 #[derive(Clone, Copy)]
-pub(super) enum EvidenceClock {
+pub(crate) enum EvidenceClock {
     Cached,
     Forced,
     Production,
@@ -16,7 +16,7 @@ pub(super) enum EvidenceClock {
 
 #[derive(Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ReadCounts {
+pub(crate) struct ReadCounts {
     pub card_checks: usize,
     pub org_reads: usize,
     pub evidence_reads: usize,
@@ -38,7 +38,7 @@ impl ReadCounts {
     }
 }
 
-pub(super) struct EvaluationProbe<'a> {
+pub(crate) struct EvaluationProbe<'a> {
     hub: &'a MemoryProjectionHub,
     clock: EvidenceClock,
     ticks: &'a AtomicI64,
@@ -165,14 +165,14 @@ impl RuleRepository for EvaluationProbe<'_> {
     }
 }
 
-pub(super) fn evidence_scope() -> PublishedCardEvidenceScope {
+pub(crate) fn evidence_scope() -> PublishedCardEvidenceScope {
     PublishedCardEvidenceScope {
         domain: DomainScopeRequirement::ExactlySome(11),
         ..scope()
     }
 }
 
-pub(super) fn context(target_id: i64) -> PolicyContext {
+pub(crate) fn context(target_id: i64) -> PolicyContext {
     PolicyContext::builder()
         .user_id(Some(42))
         .principal_kind(Some("PLATFORM_USER".into()))
@@ -189,7 +189,7 @@ pub(super) fn context(target_id: i64) -> PolicyContext {
         .build()
 }
 
-pub(super) fn fixture(grants: u16) -> (MemoryProjectionHub, [i64; 2]) {
+pub(crate) fn fixture(grants: u16) -> (MemoryProjectionHub, [i64; 2]) {
     let values = (0..grants)
         .map(|index| CanonicalGrant {
             resource: format!("learn_subject:{}", 10_000 + i64::from(index)),
@@ -209,7 +209,7 @@ pub(super) fn fixture(grants: u16) -> (MemoryProjectionHub, [i64; 2]) {
     (hub, targets)
 }
 
-pub(super) fn hub_from_grants(values: Vec<CanonicalGrant>) -> MemoryProjectionHub {
+pub(crate) fn hub_from_grants(values: Vec<CanonicalGrant>) -> MemoryProjectionHub {
     let hub = MemoryProjectionHub::default();
     let hot =
         policy_engine::HotState::from_grants(tenant(), 1, values, dependency_vector()).unwrap();
@@ -217,13 +217,13 @@ pub(super) fn hub_from_grants(values: Vec<CanonicalGrant>) -> MemoryProjectionHu
     hub
 }
 
-pub(super) fn publish_revoke(hub: &MemoryProjectionHub) {
+pub(crate) fn publish_revoke(hub: &MemoryProjectionHub) {
     let hot =
         policy_engine::HotState::from_grants(tenant(), 2, vec![], dependency_vector()).unwrap();
     install_committed(hub, seal_state(&card_identity(), 17, 2, hot, Some(1), 2));
 }
 
-pub(super) async fn checked_decision(
+pub(crate) async fn checked_decision(
     engine: &PolicyEngine,
     hub: &MemoryProjectionHub,
     clock: EvidenceClock,
@@ -236,7 +236,7 @@ pub(super) async fn checked_decision(
     (decision, repo.counts())
 }
 
-pub(super) fn decisions_match(actual: &PolicyDecision, expected: &PolicyDecision) -> bool {
+pub(crate) fn decisions_match(actual: &PolicyDecision, expected: &PolicyDecision) -> bool {
     actual.allowed == expected.allowed
         && actual.reason == expected.reason
         && actual.matched_rule == expected.matched_rule

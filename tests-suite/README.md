@@ -138,21 +138,19 @@ MT-E1/E3/E4/E5/E6
 对应真实 MySQL suites；本次未运行这些真实集成。MT-E2 尚无实现，MANIFEST 只保留显式的 unimplemented
 占位合同，不补造成功编号，也不把占位合同当作 MT-E2 已覆盖。
 
-CPU-only 的三组 `PERF_MATRIX` acceptance 定义要求分别输出完整 82/15/40 个唯一 case、
-每项至少 15 个有效样本，原始指标进入同一份 result.json；只有运行时满足该验收才构成性能证据；只执行一个 Rust
-函数、被 `ASTRAL_PERF_CASE` 过滤或没有测量输出都不能计完整性能 PASS。
-这些矩阵验证组件结果等价和采集完整性，比较数据没有额外性能阈值时不宣称
-统计上“无回退”。独立现有吞吐下限仍由原测试严格断言，runner 不降低它们。
+CPU-only 的六组性能证据分别登记独立 acceptance 边界：generic `PERF_MATRIX` 保留既有 82/15/40/16 个 case 矩阵；正式 evaluate benefit 为 45 cases × 18 samples × 3 arms；attribution 仍是独立的 45-case 插桩协议；新增 owner-sharing experiment 为 72 cases × 15 samples × 2 fresh-owner arms。attribution 和 sharing 都使用 dedicated markers，不与 generic `PERF_MATRIX` 合并。只有运行时满足对应验收才构成性能证据；只执行一个 Rust 函数、被 `ASTRAL_PERF_CASE` 过滤或没有测量输出都不能计完整性能 PASS。
+这些矩阵验证组件结果等价和采集完整性，比较数据没有额外性能阈值时不宣称统计上“无回退”。独立现有吞吐下限仍由原测试严格断言，runner 不降低它们。
+
+`policy-evaluate-benefit`、`policy-evaluate-attribution` 与 `policy-matcher-relay-performance` 是三个既有独立边界；`policy-evaluate-sharing-experiment` 是 v1 历史 baseline，`policy-evaluate-sharing-experiment-v2` 是不改写 v1 的独立归因 contract。前者测量完整 `PolicyEngine.evaluate()` 调用、证据读计数与决策等价；attribution suite 在相同 45×18×3 workload 上输出 engine phase、assembly cache 和 process-global allocator observation，插桩 wall/latency 只用于归因，不能作为正式 throughput；matcher suite 测量 matcher 接力的 `FirstSeenLinear → IndexBuild → IndexHit` 状态、mixed/single resource bucket、same-Arc 稳态、fresh-Arc probation，以及每个 worker 的 thread-local 预热；v1 sharing suite 覆盖 shared/private cache 与 engine owner、cached/forced assembly、128/1001/2048 grants 和 t1/t4/t8；v2 在同一 topology 上额外闭合 AssemblyCache stripe wait/hold、GC/eviction、AtomicHitStats owner aggregation、breaker map/state wait 与 warmup/join postconditions。四者都只是 CPU 组件证据，不宣称 HTTP、数据库、部署或分布式容量。`performance-attribution` 插桩结果只用于 v2 阶段归因，不等同于正式无插桩 throughput。
 
 登记的 `policy-evaluate-benefit` suite acceptance 定义为测量实际
 `PolicyEngine.evaluate()` 调用直到完整 `PolicyDecision` 返回，而非只测 hub 热读；协议保留
 AUTHN、卡片上下文、资源 ownership、ORG 端口分类、初始证据校验/匹配、ALLOW 最终复读、统计和断路器开销。注册和契约本身不证明该基准本次已运行。
 卡片/ORG/资源归属仍是明确的本地夹具，不是数据库身份或 managed ORG_SCOPE 查询。
-当前 repository 返回 owned evidence，Arc 只在装配缓存内部共享，两次 ALLOW 读取仍深拷贝。
-不能把此结果表述为共享 Arc 穿过评估器或签名 HTTP 的端到端收益。
+当前 repository 返回 `Arc<PublishedCardAuthorization>`；assembly/mirror/cache 命中可以复用同一不可变 Arc，forced assembly 会产生 fresh Arc；matcher index 是 thread-local，不能把 forced 结果或父线程预热解释成全局稳态，也不能把此结果表述为签名 HTTP 的端到端收益。
 
 ```bash
-bash scripts/run-tests.sh --campaign --run --suite policy-evaluate-benefit-controls --suite policy-evaluate-evidence-contracts --suite policy-evaluate-benefit
+bash scripts/run-tests.sh --campaign --run --suite policy-evaluate-benefit-controls --suite policy-evaluate-evidence-contracts --suite policy-evaluate-benefit --suite policy-evaluate-attribution --suite policy-matcher-relay-performance --suite policy-evaluate-sharing-experiment --suite policy-evaluate-sharing-experiment-v2
 ```
 
 suite acceptance 定义固定 45 个 case（1/8/128/512/2048 grants × 1/4/8 threads × 首/尾命中 ALLOW 与无匹配 DENY），

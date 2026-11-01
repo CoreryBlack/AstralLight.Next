@@ -244,7 +244,13 @@ pub fn read_manifest(root: &Path) -> Result<Manifest, String> {
         }
         if suite.get("evidence_contract").is_some() {
             let contract = str_field(suite, "evidence_contract")?;
-            if !["policy-evaluate-benefit"].contains(&contract)
+            if ![
+                "policy-evaluate-benefit",
+                "policy-evaluate-attribution",
+                "policy-evaluate-sharing-experiment",
+                "policy-evaluate-sharing-experiment-v2",
+            ]
+            .contains(&contract)
                 || suite.get("acceptance").and_then(TomlValue::as_str) != Some("rust")
             {
                 return Err(format!("unknown or incompatible evidence contract: {id}"));
@@ -596,10 +602,14 @@ pub fn classify_output(
         let result = acceptance::check_rust_output_with_policy(acceptance::RustOutputPolicy {
             expected_tests: expected,
             minimum_tests: minimum,
-            performance_cases: suite
-                .get("performance_cases")
-                .and_then(TomlValue::as_integer)
-                .map(|value| value as usize),
+            performance_cases: if suite.get("evidence_contract").is_some() {
+                None
+            } else {
+                suite
+                    .get("performance_cases")
+                    .and_then(TomlValue::as_integer)
+                    .map(|value| value as usize)
+            },
             stdout,
             stderr,
             exit_code,
@@ -613,6 +623,15 @@ pub fn classify_output(
             let mut evidence = match contract {
                 "policy-evaluate-benefit" => {
                     crate::evaluate_acceptance::check_evaluate_performance(stdout)
+                }
+                "policy-evaluate-attribution" => {
+                    crate::evaluate_acceptance::check_evaluate_attribution(stdout)
+                }
+                "policy-evaluate-sharing-experiment" => {
+                    crate::evaluate_sharing_acceptance::check_evaluate_sharing(stdout)
+                }
+                "policy-evaluate-sharing-experiment-v2" => {
+                    crate::evaluate_sharing_v2_acceptance::check_evaluate_sharing_v2(stdout)
                 }
                 _ => {
                     return json!({"status":"FAIL", "reason":"unregistered Rust evidence contract"})
@@ -2616,7 +2635,7 @@ exit "${FAKE_CARGO_EXIT:-0}"
                 evaluate_acceptance
                     .get(field)
                     .and_then(TomlValue::as_integer),
-                Some(11)
+                Some(13)
             );
         }
 
@@ -3059,6 +3078,141 @@ exit "${FAKE_CARGO_EXIT:-0}"
                 "test-harness/src/evaluate_acceptance.rs",
             ]
         );
+        let sharing = manifest
+            .suites
+            .iter()
+            .find(|suite| suite_id(suite) == "policy-evaluate-sharing-experiment")
+            .expect("sharing experiment suite is registered");
+        assert_eq!(str_field(sharing, "owner").unwrap(), "astral-db");
+        assert_eq!(str_field(sharing, "profile").unwrap(), "performance-kernel");
+        assert_eq!(str_field(sharing, "acceptance").unwrap(), "rust");
+        assert_eq!(
+            str_field(sharing, "evidence_contract").unwrap(),
+            "policy-evaluate-sharing-experiment"
+        );
+        assert_eq!(
+            string_array(sharing, "test_services").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(str_field(sharing, "scope").unwrap(), "component");
+        assert!(str_field(sharing, "boundary")
+            .unwrap()
+            .contains("owner-sharing causal experiment"));
+        assert!(str_field(sharing, "boundary")
+            .unwrap()
+            .contains("128/1001/2048"));
+        assert_eq!(
+            string_array(sharing, "sources").unwrap(),
+            vec![
+                "astral-db/src/memory_projection_hub/tests/evaluate_experimental.rs",
+                "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs",
+                "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs",
+                "astral-db/src/memory_projection_hub/assembly_cache.rs",
+                "test-harness/src/evaluate_sharing_acceptance.rs",
+                "test-harness/src/campaign.rs",
+            ]
+        );
+        assert_eq!(
+            string_array(sharing, "argv").unwrap(),
+            vec![
+                "cargo",
+                "test",
+                "--release",
+                "-p",
+                "astral-db",
+                "--lib",
+                "memory_projection_hub::tests::evaluate_experimental::policy_evaluate_sharing_experiment",
+                "--locked",
+                "--",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]
+        );
+        assert_eq!(
+            sharing.get("minimum_tests").and_then(TomlValue::as_integer),
+            Some(1)
+        );
+        assert_eq!(
+            sharing
+                .get("expected_tests")
+                .and_then(TomlValue::as_integer),
+            Some(1)
+        );
+
+        let sharing_v2 = manifest
+            .suites
+            .iter()
+            .find(|suite| suite_id(suite) == "policy-evaluate-sharing-experiment-v2")
+            .expect("v2 sharing experiment suite is registered");
+        assert_eq!(str_field(sharing_v2, "owner").unwrap(), "astral-db");
+        assert_eq!(
+            str_field(sharing_v2, "profile").unwrap(),
+            "performance-kernel"
+        );
+        assert_eq!(str_field(sharing_v2, "acceptance").unwrap(), "rust");
+        assert_eq!(
+            str_field(sharing_v2, "evidence_contract").unwrap(),
+            "policy-evaluate-sharing-experiment-v2"
+        );
+        assert_eq!(
+            string_array(sharing_v2, "test_services").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(str_field(sharing_v2, "scope").unwrap(), "component");
+        assert!(str_field(sharing_v2, "boundary")
+            .unwrap()
+            .contains("v1 remains the immutable historical baseline"));
+        assert!(str_field(sharing_v2, "boundary")
+            .unwrap()
+            .contains("AssemblyCache stripe wait/hold"));
+        assert_eq!(
+            string_array(sharing_v2, "sources").unwrap(),
+            vec![
+                "astral-db/src/memory_projection_hub/tests/evaluate_experimental.rs",
+                "astral-db/src/memory_projection_hub/assembly_cache.rs",
+                "policy-engine/src/engine.rs",
+                "policy-engine/src/engine/formal.rs",
+                "policy-engine/src/hit_stats.rs",
+                "policy-engine/src/circuit_breaker.rs",
+                "test-harness/src/evaluate_sharing_v2_acceptance.rs",
+                "test-harness/src/campaign.rs",
+            ]
+        );
+        assert_eq!(
+            string_array(sharing_v2, "argv").unwrap(),
+            vec![
+                "cargo",
+                "test",
+                "--release",
+                "-p",
+                "astral-db",
+                "--features",
+                "performance-attribution",
+                "--lib",
+                "memory_projection_hub::tests::evaluate_experimental::policy_evaluate_sharing_experiment",
+                "--locked",
+                "--",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]
+        );
+        assert_eq!(
+            sharing_v2
+                .get("minimum_tests")
+                .and_then(TomlValue::as_integer),
+            Some(1)
+        );
+        assert_eq!(
+            sharing_v2
+                .get("expected_tests")
+                .and_then(TomlValue::as_integer),
+            Some(1)
+        );
+
         let shell = manifest
             .suites
             .iter()

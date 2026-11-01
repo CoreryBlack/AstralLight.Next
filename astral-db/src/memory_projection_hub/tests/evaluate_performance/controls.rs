@@ -3,7 +3,7 @@ use super::fixture::*;
 use policy_engine::{PolicyEngine, RuleRepository};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
-pub(super) async fn verify_controls() {
+pub(crate) async fn verify_controls() {
     let engine = PolicyEngine::new();
     let (mut hub, targets) = fixture(8);
     hub.assemblies = Arc::new(AssemblyCache::default());

@@ -26,6 +26,34 @@ fn stamp() -> AssemblyStamp {
     .unwrap()
 }
 
+fn cache_summary(cache: &AssemblyCache) -> (usize, usize) {
+    cache
+        .stripes
+        .iter()
+        .filter_map(|stripe| {
+            stripe
+                .lock()
+                .ok()
+                .map(|entries| (entries.values.len(), entries.bytes))
+        })
+        .fold((0, 0), |(count, bytes), (next_count, next_bytes)| {
+            (count + next_count, bytes + next_bytes)
+        })
+}
+
+fn stripe_summary(cache: &AssemblyCache, index: usize) -> (usize, usize) {
+    let entries = cache.stripes[index].lock().unwrap();
+    (entries.values.len(), entries.bytes)
+}
+
+fn same_stripe_cards(first: i64, count: usize) -> Vec<i64> {
+    let stripe = AssemblyCache::stripe_index(&scope(first));
+    (first..)
+        .filter(|card| AssemblyCache::stripe_index(&scope(*card)) == stripe)
+        .take(count)
+        .collect()
+}
+
 fn evidence() -> Arc<PublishedCardAuthorization> {
     Arc::new(PublishedCardAuthorization {
         tenant_id: 7,
@@ -62,7 +90,8 @@ fn cache_reuses_only_the_same_scope_stamp_and_time_bucket() {
     let mut changed = stamp();
     changed.read_unix_seconds += 1;
     assert!(cache.get(&scope(17), &changed, now).is_none());
-    assert!(cache.entries.lock().unwrap().values.is_empty());
+    let (count, _) = cache_summary(&cache);
+    assert_eq!(count, 0);
 }
 
 #[test]
@@ -72,13 +101,19 @@ fn cache_expiry_and_hard_entry_capacity_are_enforced() {
     for card in 1..=(MAX_ENTRIES + 1) as i64 {
         cache.insert(&scope(card), stamp(), evidence(), now);
     }
-    assert_eq!(cache.entries.lock().unwrap().values.len(), MAX_ENTRIES);
+    let (count, bytes) = cache_summary(&cache);
+    assert!(count <= MAX_ENTRIES);
+    assert!(bytes <= MAX_BYTES);
     assert!(cache.get(&scope(1), &stamp(), now).is_none());
     assert!(cache.get(&scope(2), &stamp(), now + TTL).is_none());
     cache.insert(&scope(1), stamp(), evidence(), now + TTL);
-    let entries = cache.entries.lock().unwrap();
-    assert_eq!(entries.values.len(), 1);
-    assert!(entries.bytes <= MAX_BYTES);
+    let target_stripe = AssemblyCache::stripe_index(&scope(1));
+    let (target_count, target_bytes) = stripe_summary(&cache, target_stripe);
+    assert_eq!(target_count, 1);
+    assert!(target_bytes <= MAX_BYTES);
+    let (count, bytes) = cache_summary(&cache);
+    assert!(count <= MAX_ENTRIES);
+    assert!(bytes <= MAX_BYTES);
 }
 
 #[test]
@@ -91,7 +126,8 @@ fn cache_byte_budget_and_oversize_bypass_are_enforced() {
     );
     assert!(!AssemblyCache::can_store(&stamp(), &large));
     cache.insert(&scope(17), stamp(), Arc::new(large), now);
-    assert!(cache.entries.lock().unwrap().values.is_empty());
+    let (count, _) = cache_summary(&cache);
+    assert_eq!(count, 0);
     for card in 1..=32 {
         let mut large = (*evidence()).clone();
         large.records = Vec::with_capacity(
@@ -99,34 +135,46 @@ fn cache_byte_budget_and_oversize_bypass_are_enforced() {
         );
         cache.insert(&scope(card), stamp(), Arc::new(large), now);
     }
-    let entries = cache.entries.lock().unwrap();
-    assert!(entries.values.len() < 32);
-    assert!(entries.bytes <= MAX_BYTES);
+    let (count, bytes) = cache_summary(&cache);
+    assert!(count < 32);
+    assert!(bytes <= MAX_BYTES);
 }
 
 #[test]
 fn cache_hit_promotion_preserves_order_and_accounting_on_eviction() {
     let cache = AssemblyCache::default();
     let now = Instant::now();
-    for card in 1..=MAX_ENTRIES as i64 {
-        cache.insert(&scope(card), stamp(), evidence(), now);
+    let cards = same_stripe_cards(1, STRIPE_MAX_ENTRIES + 1);
+    for card in &cards[..STRIPE_MAX_ENTRIES] {
+        cache.insert(&scope(*card), stamp(), evidence(), now);
     }
-    assert!(cache.get(&scope(1), &stamp(), now).is_some());
-    cache.insert(&scope(MAX_ENTRIES as i64 + 1), stamp(), evidence(), now);
-    assert!(cache.get(&scope(1), &stamp(), now).is_some());
-    assert!(cache.get(&scope(2), &stamp(), now).is_none());
-    let entries = cache.entries.lock().unwrap();
-    assert_eq!(entries.values.len(), entries.order.len());
-    assert_eq!(
-        entries.bytes,
-        entries
-            .values
-            .values()
-            .map(|entry| entry.bytes)
-            .sum::<usize>()
-    );
-    for (order, key) in &entries.order {
-        assert_eq!(*order, entries.values[key].last_used);
+    let hot = cards[0];
+    let cold = cards[1];
+    assert!(cache.get(&scope(hot), &stamp(), now).is_some());
+    cache.insert(&scope(cards[STRIPE_MAX_ENTRIES]), stamp(), evidence(), now);
+    assert!(cache.get(&scope(hot), &stamp(), now).is_some());
+    assert!(cache.get(&scope(cold), &stamp(), now).is_none());
+    let stripe = AssemblyCache::stripe_index(&scope(hot));
+    let (stripe_count, stripe_bytes) = stripe_summary(&cache, stripe);
+    assert_eq!(stripe_count, STRIPE_MAX_ENTRIES);
+    assert!(stripe_bytes <= MAX_BYTES);
+    let (count, bytes) = cache_summary(&cache);
+    assert!(count <= MAX_ENTRIES);
+    assert!(bytes <= MAX_BYTES);
+    for stripe in &cache.stripes {
+        let entries = stripe.lock().unwrap();
+        assert_eq!(entries.values.len(), entries.order.len());
+        assert_eq!(
+            entries.bytes,
+            entries
+                .values
+                .values()
+                .map(|entry| entry.bytes)
+                .sum::<usize>()
+        );
+        for (order, key) in &entries.order {
+            assert_eq!(*order, entries.values[key].last_used);
+        }
     }
 }
 
@@ -226,25 +274,29 @@ fn concurrent_cache_reads_and_fills_preserve_internal_bounds() {
             });
         }
     });
-    let entries = cache.entries.lock().unwrap();
-    assert_eq!(entries.values.len(), entries.order.len());
-    assert!(entries.values.len() <= MAX_ENTRIES);
-    assert!(entries.bytes <= MAX_BYTES);
-    assert_eq!(
-        entries.bytes,
-        entries
-            .values
-            .values()
-            .map(|entry| entry.bytes)
-            .sum::<usize>()
-    );
+    let (count, bytes) = cache_summary(&cache);
+    assert!(count <= MAX_ENTRIES);
+    assert!(bytes <= MAX_BYTES);
+    for stripe in &cache.stripes {
+        let entries = stripe.lock().unwrap();
+        assert_eq!(entries.values.len(), entries.order.len());
+        assert_eq!(
+            entries.bytes,
+            entries
+                .values
+                .values()
+                .map(|entry| entry.bytes)
+                .sum::<usize>()
+        );
+    }
 }
 
 #[test]
 fn poisoned_cache_is_only_a_miss() {
     let cache = AssemblyCache::default();
+    let stripe = cache.stripe(&scope(17));
     let _ = std::panic::catch_unwind(|| {
-        let _guard = cache.entries.lock().unwrap();
+        let _guard = stripe.lock().unwrap();
         panic!("poison cache lock");
     });
     assert!(cache.get(&scope(17), &stamp(), Instant::now()).is_none());

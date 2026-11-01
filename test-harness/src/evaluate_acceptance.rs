@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 const SCHEMA: &str = "policy-evaluate-benefit-v1";
+const ATTRIBUTION_SCHEMA: &str = "policy-evaluate-attribution-v1";
 const SCOPE: &str = "policy-engine-evaluate-cpu";
 const SAMPLES_PER_CASE: usize = 18;
 const GRANT_SIZES: [u64; 5] = [1, 8, 128, 512, 2048];
@@ -29,7 +30,7 @@ const CONTROL_NAMES: [&str; 8] = [
     "finalRevokeRefusal",
     "noLegacyReads",
 ];
-const PREMISE_NAMES: [&str; 15] = [
+const PREMISE_NAMES: [&str; 16] = [
     "entry",
     "evidencePort",
     "fixture",
@@ -37,6 +38,7 @@ const PREMISE_NAMES: [&str; 15] = [
     "resourceOwnership",
     "orgPort",
     "engine",
+    "matcher",
     "cached",
     "forced",
     "production",
@@ -64,15 +66,49 @@ const MEASUREMENT_FIELDS: [&str; 16] = [
     "mismatches",
     "legacyReads",
 ];
-const SCOPE_BOUNDARIES: [&str; 8] = [
-    "CPU-only whole PolicyEngine.evaluate call benchmark; owned evidence is still cloned.",
+const ATTRIBUTION_ENGINE_FIELDS: [&str; 9] = [
+    "cardContextCheckNs",
+    "initialEvidenceLoadNs",
+    "initialValidationNs",
+    "evidenceMatchNs",
+    "finalEvidenceReloadNs",
+    "finalRecheckValidationNs",
+    "finalRecheckScanNs",
+    "statsAndBreakerNs",
+    "totalNs",
+];
+const ATTRIBUTION_CACHE_FIELDS: [&str; 5] = [
+    "hits",
+    "misses",
+    "arcClones",
+    "getLockWaitNs",
+    "insertLockWaitNs",
+];
+const ATTRIBUTION_ALLOCATION_FIELDS: [&str; 3] = ["allocationCount", "allocationBytes", "scope"];
+const ATTRIBUTION_CONTROL_NAMES: [&str; 11] = [
+    "ownedEvidenceParity",
+    "decisionParity",
+    "allowTwoReads",
+    "denyOneRead",
+    "pendingOneRead",
+    "crossSecondExpiry",
+    "finalRevokeRefusal",
+    "noLegacyReads",
+    "phaseAttribution",
+    "assemblyCacheAttribution",
+    "allocatorObservation",
+];
+
+const SCOPE_BOUNDARIES: [&str; 9] = [
+    "CPU-only whole PolicyEngine.evaluate call benchmark; evidence is Arc-backed and may be reused by assembly/mirror caches, while forced assembly creates fresh Arc values.",
     "All arms use the same engine and fixture map data; independent cache stores prevent cross-arm contamination.",
     "Synthetic perpetual grants/card state and ORG checks are supplied by fixture ports, not production persistence.",
     "Fixture identity assertions cover PLATFORM_USER, identity_card 18/card 17/user 42/tenant 7/domain 11, and TenantScoped authoritative target 7/11.",
     "Per-decision latency covers the complete evaluate call through awaited return.",
     "Wall throughput includes barrier wake, in-loop result verification/storage/destruction, and worker joins; it excludes runtime/thread construction and cache prewarm.",
-    "Forced assembly uses a unique synthetic second per read and no production hook; phase timers are fixture read-port totals, not engine ArcSwap statistics.",
+    "Forced assembly uses a unique synthetic second per read and produces fresh Arc evidence; it is warm-mirror plus assembly-miss, not a cold end-to-end benchmark.",
     "Not a signed HTTP, database, session, SDK, business-admission, allocation, or deployment-capacity benchmark.",
+    "Phase timers are fixture read-port totals; large-evidence matcher index state is thread-local and each worker must warm independently.",
 ];
 const BOOTSTRAP_RESAMPLES: usize = 2000;
 const BOOTSTRAP_SEED: u32 = 20261010;
@@ -260,6 +296,21 @@ fn validate_meta(meta: &Value) -> Result<(), String> {
             || premises.values().any(|value| !nonempty_string(value))
         {
             return Err("benchmark explanatory premises are incomplete".into());
+        }
+        let evidence_port = premises["evidencePort"].as_str().unwrap_or_default();
+        let matcher = premises["matcher"].as_str().unwrap_or_default();
+        let forced = premises["forced"].as_str().unwrap_or_default();
+        if !evidence_port.contains("Arc<PublishedCardAuthorization>")
+            || evidence_port.contains("owned PublishedCardAuthorization")
+            || !matcher.contains("thread-local")
+            || !matcher.contains("worker")
+            || !forced.contains("fresh Arc")
+            || !forced.to_ascii_lowercase().contains("warm mirror")
+        {
+            return Err(
+                "benchmark explanatory premises do not describe Arc and matcher relay semantics"
+                    .into(),
+            );
         }
     } else if PREMISE_NAMES.iter().any(|name| !object.contains_key(*name)) {
         return Err("benchmark explanatory premises are incomplete".into());
@@ -825,6 +876,429 @@ fn median(values: &[f64]) -> f64 {
     }
 }
 
+fn validate_attribution_measurement(
+    measurement: &Value,
+    arm: &str,
+    grants: u64,
+    threads: u64,
+    outcome: &str,
+    decisions: u64,
+) -> Result<(), String> {
+    let mut expected_fields = MEASUREMENT_FIELDS.to_vec();
+    expected_fields.push("attribution");
+    if !keys_exact(measurement, &expected_fields) {
+        return Err("attribution measurement fields differ from the exact protocol".into());
+    }
+    validate_measurement(
+        &Value::Object(
+            measurement
+                .as_object()
+                .ok_or("attribution measurement must be an object")?
+                .iter()
+                .filter(|(key, _)| key.as_str() != "attribution")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        arm,
+        grants,
+        threads,
+        outcome,
+        decisions,
+    )?;
+    let attribution = measurement
+        .get("attribution")
+        .and_then(Value::as_object)
+        .ok_or("attribution object is missing")?;
+    if !keys_exact(
+        &Value::Object(attribution.clone()),
+        &["engineTimingNs", "assemblyCache", "allocation"],
+    ) {
+        return Err("attribution sections differ from the exact protocol".into());
+    }
+    let engine = &attribution["engineTimingNs"];
+    if !keys_exact(engine, &ATTRIBUTION_ENGINE_FIELDS) {
+        return Err("engine attribution fields differ from the exact protocol".into());
+    }
+    let phase = ATTRIBUTION_ENGINE_FIELDS
+        .iter()
+        .map(|field| uint(&engine[field], field, Some(0)))
+        .collect::<Result<Vec<_>, _>>()?;
+    if phase[8] == 0 || phase[2] == 0 || phase[0] == 0 || phase[1] == 0 {
+        return Err("engine attribution required phases must be positive".into());
+    }
+    if outcome == "deny" {
+        if phase[4] != 0 || phase[5] != 0 || phase[6] != 0 {
+            return Err("deny attribution must not report final recheck phases".into());
+        }
+    } else if phase[4] == 0 || phase[5] == 0 || phase[6] == 0 {
+        return Err("allow attribution must report final recheck phases".into());
+    }
+    let phase_sum = phase[..8].iter().try_fold(0u64, |sum, value| {
+        sum.checked_add(*value)
+            .ok_or("engine attribution phase sum overflow")
+    })?;
+    if phase_sum > phase[8] {
+        return Err("engine attribution phases exceed attributed total".into());
+    }
+    let latency_sum = measurement["latencyNs"]
+        .as_array()
+        .ok_or("attribution measurement latencyNs is missing")?
+        .iter()
+        .try_fold(0u64, |sum, value| {
+            let latency = uint(value, "latencyNs", Some(1))?;
+            sum.checked_add(latency)
+                .ok_or_else(|| "attribution latency sum overflow".to_owned())
+        })?;
+    if phase[8] == 0 || phase[8] > latency_sum {
+        return Err("engine attribution total is outside measured latency".into());
+    }
+    let cache = &attribution["assemblyCache"];
+    if !keys_exact(cache, &ATTRIBUTION_CACHE_FIELDS) {
+        return Err("assembly cache attribution fields differ from the exact protocol".into());
+    }
+    let cache_hits = uint(&cache["hits"], "hits", Some(0))?;
+    let cache_misses = uint(&cache["misses"], "misses", Some(0))?;
+    let arc_clones = uint(&cache["arcClones"], "arcClones", Some(0))?;
+    let reads = uint(&measurement["evidenceReads"], "evidenceReads", Some(0))?;
+    let reconciled_reads = cache_hits
+        .checked_add(cache_misses)
+        .ok_or("assembly cache attribution count overflow")?;
+    if reconciled_reads != reads || arc_clones != cache_hits {
+        return Err("assembly cache attribution does not reconcile with evidence reads".into());
+    }
+    if arm == "cached-fixed-second" && cache_hits != reads {
+        return Err("attribution cached arm did not record all cache hits".into());
+    }
+    if arm == "forced-assembly" && cache_hits != 0 {
+        return Err("attribution forced arm unexpectedly recorded cache hits".into());
+    }
+    let allocation = &attribution["allocation"];
+    if !keys_exact(allocation, &ATTRIBUTION_ALLOCATION_FIELDS) {
+        return Err("allocator attribution fields differ from the exact protocol".into());
+    }
+    uint(&allocation["allocationCount"], "allocationCount", Some(0))?;
+    uint(&allocation["allocationBytes"], "allocationBytes", Some(0))?;
+    if !allocation["scope"]
+        .as_str()
+        .is_some_and(|scope| scope.contains("process-global measured loop"))
+    {
+        return Err(
+            "allocator scope must identify process-global measured-loop observation".into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_attribution_meta(meta: &Value) -> Result<(), String> {
+    validate_meta_shape(
+        meta,
+        ATTRIBUTION_SCHEMA,
+        "evaluate-call-return-with-attribution",
+    )?;
+    if !keys_exact(
+        meta,
+        &[
+            "schema",
+            "scope",
+            "samplesPerCase",
+            "grantSizes",
+            "threads",
+            "outcomes",
+            "arms",
+            "timing",
+            "debugAssertions",
+            "controls",
+            "premises",
+        ],
+    ) {
+        return Err("attribution meta fields differ from the exact protocol".into());
+    }
+    let controls = meta
+        .get("controls")
+        .and_then(Value::as_object)
+        .ok_or("attribution controls are missing")?;
+    if controls.len() != ATTRIBUTION_CONTROL_NAMES.len()
+        || ATTRIBUTION_CONTROL_NAMES
+            .iter()
+            .any(|name| controls.get(*name).and_then(Value::as_bool) != Some(true))
+    {
+        return Err("attribution controls are missing or not all asserted true".into());
+    }
+    let premises = meta
+        .get("premises")
+        .and_then(Value::as_object)
+        .ok_or("attribution premises are missing")?;
+    if premises.len() != PREMISE_NAMES.len()
+        || PREMISE_NAMES.iter().any(|name| {
+            premises
+                .get(*name)
+                .is_none_or(|value| !nonempty_string(value))
+        })
+    {
+        return Err("attribution premises are incomplete".into());
+    }
+    let exclusions = premises
+        .get("scopeExclusions")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !exclusions.contains("process-global")
+        || !exclusions.contains("evidence-copy")
+        || !exclusions.contains("Arc-drop")
+    {
+        return Err("attribution premises do not state allocator observation limits".into());
+    }
+    let throughput = premises
+        .get("throughput")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !throughput.contains("not the formal throughput") {
+        return Err("attribution throughput premise must exclude formal throughput use".into());
+    }
+    Ok(())
+}
+
+fn validate_meta_shape(meta: &Value, schema: &str, timing: &str) -> Result<(), String> {
+    let object = meta
+        .as_object()
+        .ok_or("benchmark meta must be a JSON object")?;
+    for (key, expected) in [
+        ("schema", json!(schema)),
+        ("scope", json!(SCOPE)),
+        ("samplesPerCase", json!(SAMPLES_PER_CASE)),
+        ("grantSizes", json!(GRANT_SIZES)),
+        ("threads", json!(THREAD_COUNTS)),
+        ("outcomes", json!(OUTCOMES)),
+        ("arms", json!(ARMS)),
+        ("timing", json!(timing)),
+        ("debugAssertions", json!(false)),
+    ] {
+        if object.get(key) != Some(&expected) {
+            return Err("benchmark meta differs from the exact protocol or topology".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn check_evaluate_attribution(stdout: &str) -> Value {
+    match check_evaluate_attribution_inner(stdout) {
+        Ok(value) => value,
+        Err(reason) => fail(reason),
+    }
+}
+
+fn check_evaluate_attribution_inner(stdout: &str) -> Result<Value, String> {
+    let prefixes = [
+        "EVALUATE_ATTRIBUTION_META",
+        "EVALUATE_ATTRIBUTION_CASE",
+        "EVALUATE_ATTRIBUTION_END",
+    ];
+    let mut records: BTreeMap<&str, Vec<Value>> = prefixes
+        .iter()
+        .map(|prefix| (*prefix, Vec::new()))
+        .collect();
+    let mut sequence = Vec::new();
+    let mut footer_seen = false;
+    let footer_re = regex::Regex::new(r"^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in \d+(?:\.\d+)?s$").unwrap();
+    for line in stdout.lines() {
+        if line.to_ascii_lowercase().contains("filtered out") {
+            if !footer_seen
+                && footer_re.is_match(line)
+                && sequence.last().copied() == Some("EVALUATE_ATTRIBUTION_END")
+            {
+                footer_seen = true;
+                continue;
+            }
+            return Err("filtered attribution benchmark output is not accepted".into());
+        }
+        let Some(prefix) = prefixes
+            .iter()
+            .copied()
+            .find(|prefix| line.starts_with(prefix))
+        else {
+            if line.contains("EVALUATE_ATTRIBUTION_") {
+                return Err("attribution protocol marker is not at the start of its line".into());
+            }
+            continue;
+        };
+        if !line.starts_with(&format!("{prefix} ")) || footer_seen {
+            return Err("malformed or late attribution protocol line".into());
+        }
+        let payload = line[prefix.len() + 1..].trim();
+        if payload.is_empty() {
+            return Err("empty attribution benchmark protocol record".into());
+        }
+        records.get_mut(prefix).unwrap().push(decode_json(payload)?);
+        sequence.push(prefix);
+    }
+    let mut expected_sequence = vec!["EVALUATE_ATTRIBUTION_META"];
+    expected_sequence.extend(std::iter::repeat_n("EVALUATE_ATTRIBUTION_CASE", 45));
+    expected_sequence.push("EVALUATE_ATTRIBUTION_END");
+    if sequence != expected_sequence {
+        return Err("attribution benchmark records are incomplete or out of order".into());
+    }
+    if !footer_seen {
+        return Err("attribution benchmark is missing the complete Rust test footer".into());
+    }
+    let meta = &records["EVALUATE_ATTRIBUTION_META"][0];
+    validate_attribution_meta(meta)?;
+    let mut cases = BTreeMap::<String, Value>::new();
+    for row in &records["EVALUATE_ATTRIBUTION_CASE"] {
+        validate_case_with_measurement(row, validate_attribution_measurement)?;
+        let name = row["case"]
+            .as_str()
+            .ok_or("attribution case name missing")?
+            .to_owned();
+        if cases.insert(name, row.clone()).is_some() {
+            return Err("duplicate attribution benchmark case".into());
+        }
+    }
+    let expected = expected_cases();
+    let expected_set = expected
+        .iter()
+        .map(|(name, _, _, _)| name.as_str())
+        .collect::<BTreeSet<_>>();
+    if cases.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_set {
+        return Err(
+            "attribution benchmark case set differs from the exact Cartesian product".into(),
+        );
+    }
+    let end = &records["EVALUATE_ATTRIBUTION_END"][0];
+    if !keys_exact(
+        end,
+        &[
+            "schema",
+            "status",
+            "cases",
+            "samples",
+            "measurements",
+            "postconditions",
+        ],
+    ) || end["schema"].as_str() != Some(ATTRIBUTION_SCHEMA)
+        || end["status"].as_str() != Some("PASS")
+        || uint(&end["cases"], "cases", Some(0))? != 45
+        || uint(&end["samples"], "samples", Some(0))? != 810
+        || uint(&end["measurements"], "measurements", Some(0))? != 2430
+        || !keys_exact(
+            &end["postconditions"],
+            &[
+                "workersJoined",
+                "allDecisionsChecked",
+                "allReadCountsChecked",
+                "allAttributionCaptured",
+            ],
+        )
+        || [
+            "workersJoined",
+            "allDecisionsChecked",
+            "allReadCountsChecked",
+            "allAttributionCaptured",
+        ]
+        .iter()
+        .any(|field| end["postconditions"][field].as_bool() != Some(true))
+    {
+        return Err("attribution end counts or postconditions are incomplete".into());
+    }
+    let ordered_rows = expected
+        .iter()
+        .map(|(name, _, _, _)| cases[name].clone())
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "status": "PASS",
+        "reason": "complete strict CPU PolicyEngine.evaluate attribution protocol; instrumented values are diagnostic only",
+        "performance": {
+            "scope": SCOPE,
+            "cases": 45,
+            "samples_per_case": SAMPLES_PER_CASE,
+            "measurements": 2430,
+            "raw": {"meta": meta, "cases": ordered_rows, "end": end},
+            "interpretation": "attribution protocol only; instrumented timing is not formal throughput",
+        },
+        "verified_postcondition": {"complete": true, "schema": ATTRIBUTION_SCHEMA, "cases": 45, "samples": 810, "measurements": 2430, "workersJoined": true, "allDecisionsChecked": true, "allReadCountsChecked": true, "allAttributionCaptured": true}
+    }))
+}
+
+type MeasurementValidator = fn(&Value, &str, u64, u64, &str, u64) -> Result<(), String>;
+
+fn validate_case_with_measurement(
+    row: &Value,
+    validator: MeasurementValidator,
+) -> Result<(), String> {
+    if !keys_exact(
+        row,
+        &[
+            "case",
+            "grants",
+            "threads",
+            "outcome",
+            "decisionsPerThread",
+            "samples",
+        ],
+    ) {
+        return Err("attribution case fields differ from the exact protocol".into());
+    }
+    let grants = uint(&row["grants"], "grants", Some(1))?;
+    let threads = uint(&row["threads"], "threads", Some(1))?;
+    let outcome = row["outcome"]
+        .as_str()
+        .ok_or("attribution case outcome is invalid")?;
+    if !GRANT_SIZES.contains(&grants)
+        || !THREAD_COUNTS.contains(&threads)
+        || !OUTCOMES.contains(&outcome)
+    {
+        return Err("attribution case is outside the exact benchmark topology".into());
+    }
+    let expected_name = format!("evaluate/{grants}/threads-{threads}/{outcome}");
+    if row["case"].as_str() != Some(&expected_name) {
+        return Err("attribution case string does not encode its exact workload".into());
+    }
+    let per_thread = decisions_per_thread(grants).ok_or("unknown attribution grant workload")?;
+    if uint(&row["decisionsPerThread"], "decisionsPerThread", Some(0))? != per_thread {
+        return Err(
+            "attribution decisionsPerThread differs from the registered workload map".into(),
+        );
+    }
+    let decisions = threads * per_thread;
+    let samples = row["samples"]
+        .as_array()
+        .ok_or("attribution case samples missing")?;
+    if samples.len() != SAMPLES_PER_CASE {
+        return Err("attribution case does not contain exactly 18 samples".into());
+    }
+    for (index, sample) in samples.iter().enumerate() {
+        if !keys_exact(sample, &["index", "order", "measurements"])
+            || uint(&sample["index"], "sample.index", Some(0))? != index as u64
+        {
+            return Err("attribution sample topology is invalid".into());
+        }
+        let expected_order = ORDERS[index % ORDERS.len()]
+            .iter()
+            .map(|arm| ARMS[*arm])
+            .collect::<Vec<_>>();
+        let order = sample["order"]
+            .as_array()
+            .ok_or("attribution sample order missing")?;
+        if order.len() != 3
+            || order
+                .iter()
+                .zip(expected_order)
+                .any(|(actual, expected)| actual.as_str() != Some(expected))
+        {
+            return Err("attribution sample arm order differs from the six-step rotation".into());
+        }
+        let measurements = sample["measurements"]
+            .as_object()
+            .ok_or("attribution sample measurements missing")?;
+        if measurements.len() != ARMS.len()
+            || ARMS.iter().any(|arm| !measurements.contains_key(*arm))
+        {
+            return Err("attribution sample must contain exactly the three benchmark arms".into());
+        }
+        for arm in ARMS {
+            validator(&measurements[arm], arm, grants, threads, outcome, decisions)?;
+        }
+    }
+    Ok(())
+}
 pub fn check_evaluate_performance(stdout: &str) -> Value {
     check_evaluate_performance_value(&Value::String(stdout.to_owned()))
 }
@@ -957,10 +1431,17 @@ mod tests {
         }
         let mut premises = Map::new();
         for name in PREMISE_NAMES {
-            premises.insert(
-                name.to_owned(),
-                json!(format!("fixture premise for {name}")),
-            );
+            let value = match name {
+                "evidencePort" => {
+                    "Arc<PublishedCardAuthorization>; cache hits reuse immutable evidence"
+                }
+                "matcher" => {
+                    "large evidence uses a thread-local index; each worker warms independently"
+                }
+                "forced" => "warm mirror with forced assembly miss produces fresh Arc evidence",
+                _ => "fixture premise",
+            };
+            premises.insert(name.to_owned(), json!(value));
         }
         json!({"schema":SCHEMA,"scope":SCOPE,"samplesPerCase":18,"grantSizes":GRANT_SIZES,"threads":THREAD_COUNTS,"outcomes":OUTCOMES,"arms":ARMS,"timing":"evaluate-call-return","debugAssertions":false,"controls":controls,"premises":premises})
     }
@@ -971,9 +1452,149 @@ mod tests {
         json!({"decisions":decisions,"wallNs":decisions*200,"latencyNs":vec![200;decisions as usize],"cardChecks":decisions,"orgReads":decisions,"evidenceReads":reads,"scopedReads":reads,"evidenceGrants":reads*grants,"cacheHits":if arm=="cached-fixed-second"{reads}else{0},"initialEvidenceNs":10,"finalEvidenceNs":if allow{10}else{0},"allowed":if allow{decisions}else{0},"denied":if allow{0}else{decisions},"pending":0,"mismatches":0,"legacyReads":0})
     }
     fn row(grants: u64, threads: u64, outcome: &str) -> Value {
-        let samples=(0..SAMPLES_PER_CASE).map(|index|json!({"index":index,"order":ORDERS[index%ORDERS.len()].iter().map(|arm|ARMS[*arm]).collect::<Vec<_>>(),"measurements":ARMS.iter().map(|arm|((*arm).to_owned(),measurement(arm,grants,threads,outcome))).collect::<Map<_,_>>() })).collect::<Vec<_>>();
-        json!({"case":format!("evaluate/{grants}/threads-{threads}/{outcome}"),"grants":grants,"threads":threads,"outcome":outcome,"decisionsPerThread":decisions_per_thread(grants).unwrap(),"samples":samples})
+        let samples = (0..SAMPLES_PER_CASE)
+            .map(|index| {
+                json!({
+                    "index": index,
+                    "order": ORDERS[index % ORDERS.len()]
+                        .iter()
+                        .map(|arm| ARMS[*arm])
+                        .collect::<Vec<_>>(),
+                    "measurements": ARMS
+                        .iter()
+                        .map(|arm| {
+                            ((*arm).to_owned(), measurement(arm, grants, threads, outcome))
+                        })
+                        .collect::<Map<_, _>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "case": format!("evaluate/{grants}/threads-{threads}/{outcome}"),
+            "grants": grants,
+            "threads": threads,
+            "outcome": outcome,
+            "decisionsPerThread": decisions_per_thread(grants).unwrap(),
+            "samples": samples,
+        })
     }
+
+    fn attribution_meta() -> Value {
+        let mut value = meta();
+        value["schema"] = json!(ATTRIBUTION_SCHEMA);
+        value["timing"] = json!("evaluate-call-return-with-attribution");
+        let mut controls = Map::new();
+        for name in ATTRIBUTION_CONTROL_NAMES {
+            controls.insert(name.to_owned(), json!(true));
+        }
+        value["controls"] = Value::Object(controls);
+        value["premises"]["throughput"] =
+            json!("instrumented wall includes barriers; it is not the formal throughput");
+        value["premises"]["scopeExclusions"] = json!(
+            "allocator data is process-global measured-loop observation, not evidence-copy or Arc-drop count"
+        );
+        value
+    }
+
+    fn attribution_measurement(arm: &str, grants: u64, threads: u64, outcome: &str) -> Value {
+        let mut value = measurement(arm, grants, threads, outcome);
+        let decisions = threads * decisions_per_thread(grants).unwrap();
+        let allow = outcome != "deny";
+        let reads = decisions * if allow { 2 } else { 1 };
+        let hits = if arm == "cached-fixed-second" {
+            reads
+        } else {
+            0
+        };
+        let final_values = if allow { 7 } else { 0 };
+        value["attribution"] = json!({
+            "engineTimingNs": {
+                "cardContextCheckNs": 5,
+                "initialEvidenceLoadNs": 11,
+                "initialValidationNs": 13,
+                "evidenceMatchNs": 17,
+                "finalEvidenceReloadNs": final_values,
+                "finalRecheckValidationNs": final_values,
+                "finalRecheckScanNs": final_values,
+                "statsAndBreakerNs": 3,
+                "totalNs": 100,
+            },
+            "assemblyCache": {
+                "hits": hits,
+                "misses": reads - hits,
+                "arcClones": hits,
+                "getLockWaitNs": 2,
+                "insertLockWaitNs": 4,
+            },
+            "allocation": {
+                "allocationCount": 9,
+                "allocationBytes": 128,
+                "scope": "process-global measured loop; not evidence-copy or Arc-drop count",
+            },
+        });
+        value
+    }
+
+    fn attribution_row(grants: u64, threads: u64, outcome: &str) -> Value {
+        let samples = (0..SAMPLES_PER_CASE)
+            .map(|index| {
+                json!({
+                    "index": index,
+                    "order": ORDERS[index % ORDERS.len()]
+                        .iter()
+                        .map(|arm| ARMS[*arm])
+                        .collect::<Vec<_>>(),
+                    "measurements": ARMS
+                        .iter()
+                        .map(|arm| {
+                            (
+                                (*arm).to_owned(),
+                                attribution_measurement(arm, grants, threads, outcome),
+                            )
+                        })
+                        .collect::<Map<_, _>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "case": format!("evaluate/{grants}/threads-{threads}/{outcome}"),
+            "grants": grants,
+            "threads": threads,
+            "outcome": outcome,
+            "decisionsPerThread": decisions_per_thread(grants).unwrap(),
+            "samples": samples,
+        })
+    }
+
+    fn attribution_end() -> Value {
+        json!({
+            "schema": ATTRIBUTION_SCHEMA,
+            "status": "PASS",
+            "cases": 45,
+            "samples": 810,
+            "measurements": 2430,
+            "postconditions": {
+                "workersJoined": true,
+                "allDecisionsChecked": true,
+                "allReadCountsChecked": true,
+                "allAttributionCaptured": true,
+            },
+        })
+    }
+
+    fn valid_attribution_stdout() -> String {
+        let mut lines = vec![format!("EVALUATE_ATTRIBUTION_META {}", attribution_meta())];
+        for (_name, grants, threads, outcome) in expected_cases() {
+            lines.push(format!(
+                "EVALUATE_ATTRIBUTION_CASE {}",
+                attribution_row(grants, threads, outcome)
+            ));
+        }
+        lines.push(format!("EVALUATE_ATTRIBUTION_END {}", attribution_end()));
+        lines.push("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 864 filtered out; finished in 12.34s".to_owned());
+        lines.join("\n") + "\n"
+    }
+
     fn end() -> Value {
         json!({"schema":SCHEMA,"status":"PASS","cases":45,"samples":810,"measurements":2430,"postconditions":{"workersJoined":true,"allDecisionsChecked":true,"allReadCountsChecked":true}})
     }
@@ -1015,6 +1636,37 @@ mod tests {
         lines.join("\n") + "\n"
     }
     #[test]
+    fn complete_policy_evaluate_attribution_protocol_is_accepted() {
+        let output = valid_attribution_stdout();
+        let accepted = check_evaluate_attribution(&output);
+        assert_eq!(accepted["status"], "PASS", "{}", accepted["reason"]);
+        assert_eq!(accepted["verified_postcondition"]["measurements"], 2430);
+        assert_eq!(
+            accepted["performance"]["interpretation"],
+            "attribution protocol only; instrumented timing is not formal throughput"
+        );
+    }
+
+    #[test]
+    fn attribution_phase_cache_and_allocator_mutations_fail_closed() {
+        let good = valid_attribution_stdout();
+        let invalid_initial = mutate_record(&good, "EVALUATE_ATTRIBUTION_CASE", |row| {
+            row["samples"][0]["measurements"]["cached-fixed-second"]["attribution"]
+                ["engineTimingNs"]["initialValidationNs"] = json!(0);
+        });
+        let invalid_cache = mutate_record(&good, "EVALUATE_ATTRIBUTION_CASE", |row| {
+            row["samples"][0]["measurements"]["cached-fixed-second"]["attribution"]
+                ["assemblyCache"]["arcClones"] = json!(0);
+        });
+        let invalid_scope = mutate_record(&good, "EVALUATE_ATTRIBUTION_CASE", |row| {
+            row["samples"][0]["measurements"]["cached-fixed-second"]["attribution"]["allocation"]
+                ["scope"] = json!("exact evidence-copy count");
+        });
+        for invalid in [invalid_initial, invalid_cache, invalid_scope] {
+            assert_eq!(check_evaluate_attribution(&invalid)["status"], "FAIL");
+        }
+    }
+    #[test]
     fn public_acceptance_rejects_non_string_stdout_without_panicking() {
         let result = check_evaluate_performance_value(&Value::Null);
         assert_eq!(result["status"], "FAIL");
@@ -1041,10 +1693,12 @@ mod tests {
                 ["geometric_mean_forced_over_cached_decision_time_ratio"],
             1.0
         );
-        assert!(accepted["performance"]["scope_boundaries"][7]
-            .as_str()
+        assert!(accepted["performance"]["scope_boundaries"]
+            .as_array()
             .unwrap()
-            .contains("Not a signed HTTP"));
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|boundary| boundary.contains("Not a signed HTTP")));
     }
     #[test]
     fn paired_statistics_match_python_seeded_reference_and_report_regressions() {

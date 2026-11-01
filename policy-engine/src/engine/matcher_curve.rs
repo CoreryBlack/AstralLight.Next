@@ -5,8 +5,10 @@
 
 use super::{
     build_matcher_index, find_linear_published_grant, match_indexed_with_state,
-    match_published_effective_grant, record_matcher_evidence_size, record_matcher_path,
-    MatcherCacheState, MatcherPath, MATCHER_INDEX_THRESHOLD,
+    match_indexed_with_state_detailed, match_published_effective_grant,
+    match_published_effective_grant_with_path, match_published_effective_grant_with_telemetry,
+    record_matcher_evidence_size, record_matcher_path, MatcherCacheState, MatcherCandidateRoute,
+    MatcherPath, MATCHER_INDEX_THRESHOLD, SECONDARY_INDEX_THRESHOLD,
 };
 use astral_types::registry::parse_resource_key;
 use astral_types::{
@@ -16,7 +18,7 @@ use astral_types::{
     ResourceOwnershipScope, TenantScope, ValidityWindow, VerifiedPublishedGrantRecord,
 };
 use std::hint::black_box;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Barrier, OnceLock};
 use std::time::Instant;
 
 static PROBE_METRICS_HANDLE: OnceLock<
@@ -171,14 +173,65 @@ fn assert_index_matches_linear(
         "index build diverged for {key}"
     );
 
-    let (indexed_again, hit_path) =
-        match_indexed_with_state(ctx, evidence, request_type, request_id, &mut state);
+    let (indexed_again, hit_path, telemetry) =
+        match_indexed_with_state_detailed(ctx, evidence, request_type, request_id, &mut state);
     assert_eq!(hit_path, MatcherPath::IndexHit);
     assert_eq!(
         indexed_again.map(|grant| grant.grant_id),
         linear,
         "index hit diverged for {key}"
     );
+    assert!(telemetry.candidate_count > 0 || linear.is_none());
+}
+
+#[test]
+fn secondary_resource_index_routes_large_type_buckets_without_changing_results() {
+    let size = SECONDARY_INDEX_THRESHOLD + 2;
+    let mut grants = (0..size)
+        .map(|index| probe_grant(index, &format!("monitor:{index}")))
+        .collect::<Vec<_>>();
+    grants[0] = probe_grant(0, "monitor");
+    grants[1] = probe_grant(1, "*");
+    let evidence = Arc::new(evidence_from(grants));
+    let index = build_matcher_index(&evidence);
+
+    let (mut exact, exact_telemetry) = index.select_candidates("monitor", Some("777"));
+    assert_eq!(
+        exact_telemetry.route,
+        MatcherCandidateRoute::SecondaryFallback
+    );
+    assert_eq!(
+        exact_telemetry.candidate_count, 2,
+        "fallback should retain the type-level and global wildcard candidates"
+    );
+    assert_eq!(exact.next(), Some(0));
+    assert_eq!(exact.next(), Some(1));
+    assert_eq!(exact.next(), None);
+
+    let (_, hit_telemetry) = index.select_candidates("monitor", Some("10"));
+    assert_eq!(hit_telemetry.route, MatcherCandidateRoute::SecondaryExact);
+    assert_eq!(hit_telemetry.candidate_count, 3);
+
+    let (_, type_telemetry) = index.select_candidates("monitor", None);
+    assert_eq!(type_telemetry.route, MatcherCandidateRoute::TypeBucket);
+    assert_eq!(type_telemetry.candidate_count, size);
+}
+
+#[test]
+fn secondary_resource_index_threshold_is_strictly_greater_than_128() {
+    for size in [SECONDARY_INDEX_THRESHOLD, SECONDARY_INDEX_THRESHOLD + 1] {
+        let grants = (0..size)
+            .map(|index| probe_grant(index, &format!("monitor:{index}")))
+            .collect::<Vec<_>>();
+        let evidence = evidence_from(grants);
+        let index = build_matcher_index(&evidence);
+        let bucket = index.by_type.get("monitor").unwrap();
+        assert_eq!(
+            bucket.secondary.is_some(),
+            size > SECONDARY_INDEX_THRESHOLD,
+            "secondary index threshold mismatch for {size} grants"
+        );
+    }
 }
 
 #[test]
@@ -745,13 +798,8 @@ fn match_index<'a>(
     request_id: Option<&str>,
     index: &super::MatcherIndex,
 ) -> Option<&'a CanonicalGrant> {
-    let mut candidates = Vec::with_capacity(index.wildcard.len() + 64);
-    if let Some(bucket) = index.by_type.get(request_type) {
-        candidates.extend_from_slice(bucket);
-    }
-    candidates.extend_from_slice(&index.wildcard);
-    candidates.sort_unstable();
-    candidates.into_iter().find_map(|position| {
+    let (mut candidates, _) = index.select_candidates(request_type, request_id);
+    candidates.find_map(|position| {
         let grant = &evidence.effective_grants[position];
         super::grant_matches_request(
             ctx,
@@ -1063,6 +1111,286 @@ fn interleave_candidate_sample(
             }
         },
     )
+}
+
+fn matcher_path_slot(path: MatcherPath) -> usize {
+    match path {
+        MatcherPath::LinearThreshold => 0,
+        MatcherPath::FirstSeenLinear => 1,
+        MatcherPath::IndexBuild => 2,
+        MatcherPath::IndexHit => 3,
+    }
+}
+
+fn record_matcher_path_count(counts: &mut [usize; 4], path: MatcherPath) {
+    counts[matcher_path_slot(path)] += 1;
+}
+
+fn stable_matcher_sample(
+    evidence: Arc<PublishedCardAuthorization>,
+    ctx: PolicyContext,
+    resource_key: &'static str,
+    expected_match: bool,
+    threads: usize,
+    iterations: usize,
+) -> [u64; 7] {
+    let barrier = Barrier::new(threads + 1);
+    let wall_ns = std::thread::scope(|workers| {
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let evidence = Arc::clone(&evidence);
+            let ctx = ctx.clone();
+            handles.push(workers.spawn({
+                let barrier = &barrier;
+                move || {
+                    let (first, first_path) =
+                        match_published_effective_grant_with_path(&ctx, &evidence, resource_key);
+                    assert_eq!(first_path, MatcherPath::FirstSeenLinear);
+                    black_box(first.map(|grant| grant.grant_id));
+                    let (built, build_path) =
+                        match_published_effective_grant_with_path(&ctx, &evidence, resource_key);
+                    assert_eq!(build_path, MatcherPath::IndexBuild);
+                    black_box(built.map(|grant| grant.grant_id));
+                    let (hit, hit_path) =
+                        match_published_effective_grant_with_path(&ctx, &evidence, resource_key);
+                    assert_eq!(hit_path, MatcherPath::IndexHit);
+                    black_box(hit.map(|grant| grant.grant_id));
+                    barrier.wait();
+
+                    let started = Instant::now();
+                    let mut counts = [0usize; 4];
+                    let mut route = None;
+                    let mut candidate_count = None;
+                    for _ in 0..iterations {
+                        let result = match_published_effective_grant_with_telemetry(
+                            &ctx,
+                            &evidence,
+                            resource_key,
+                        );
+                        record_matcher_path_count(&mut counts, result.path);
+                        if let Some(previous) = route {
+                            assert_eq!(previous, result.telemetry.route);
+                        } else {
+                            route = Some(result.telemetry.route);
+                        }
+                        if let Some(previous) = candidate_count {
+                            assert_eq!(previous, result.telemetry.candidate_count);
+                        } else {
+                            candidate_count = Some(result.telemetry.candidate_count);
+                        }
+                        assert_eq!(result.matched.is_some(), expected_match);
+                        black_box(result.matched.map(|grant| grant.grant_id));
+                    }
+                    (
+                        started.elapsed().as_nanos() as u64,
+                        counts,
+                        route.expect("matcher route must be recorded"),
+                        candidate_count.expect("candidate count must be recorded"),
+                    )
+                }
+            }));
+        }
+        let started = Instant::now();
+        barrier.wait();
+        let mut counts = [0usize; 4];
+        let mut route = None;
+        let mut candidate_count = None;
+        for handle in handles {
+            let (_, worker_counts, worker_route, worker_candidate_count) =
+                handle.join().expect("matcher worker should complete");
+            if let Some(previous) = route {
+                assert_eq!(previous, worker_route);
+            } else {
+                route = Some(worker_route);
+            }
+            if let Some(previous) = candidate_count {
+                assert_eq!(previous, worker_candidate_count);
+            } else {
+                candidate_count = Some(worker_candidate_count);
+            }
+            for (total, worker) in counts.iter_mut().zip(worker_counts) {
+                *total += worker;
+            }
+        }
+        let elapsed = started.elapsed().as_nanos() as u64;
+        (elapsed, counts, route.unwrap(), candidate_count.unwrap())
+    });
+    let (elapsed, counts, route, candidate_count) = wall_ns;
+    let decisions = (threads * iterations) as u64;
+    [
+        elapsed / decisions,
+        counts[0] as u64,
+        counts[1] as u64,
+        counts[2] as u64,
+        counts[3] as u64,
+        candidate_count as u64,
+        match route {
+            MatcherCandidateRoute::Linear => 0,
+            MatcherCandidateRoute::TypeBucket => 1,
+            MatcherCandidateRoute::SecondaryExact => 2,
+            MatcherCandidateRoute::SecondaryFallback => 3,
+        },
+    ]
+}
+
+fn fresh_arc_matcher_sample(
+    distribution: Distribution,
+    position: Option<usize>,
+    ctx: &PolicyContext,
+    resource_key: &'static str,
+    expected_match: bool,
+    iterations: usize,
+) -> [u64; 7] {
+    let evidences = (0..iterations)
+        .map(|_| benchmark_evidence(MATCHER_INDEX_THRESHOLD + 1, distribution, position))
+        .collect::<Vec<_>>();
+    let started = Instant::now();
+    let mut counts = [0usize; 4];
+    let mut route = None;
+    let mut candidate_count = None;
+    for evidence in evidences {
+        let result = match_published_effective_grant_with_telemetry(ctx, &evidence, resource_key);
+        record_matcher_path_count(&mut counts, result.path);
+        if let Some(previous) = route {
+            assert_eq!(previous, result.telemetry.route);
+        } else {
+            route = Some(result.telemetry.route);
+        }
+        if let Some(previous) = candidate_count {
+            assert_eq!(previous, result.telemetry.candidate_count);
+        } else {
+            candidate_count = Some(result.telemetry.candidate_count);
+        }
+        assert_eq!(result.matched.is_some(), expected_match);
+        black_box(result.matched.map(|grant| grant.grant_id));
+    }
+    let elapsed = started.elapsed().as_nanos() as u64;
+    [
+        elapsed / iterations as u64,
+        counts[0] as u64,
+        counts[1] as u64,
+        counts[2] as u64,
+        counts[3] as u64,
+        candidate_count.unwrap() as u64,
+        match route.unwrap() {
+            MatcherCandidateRoute::Linear => 0,
+            MatcherCandidateRoute::TypeBucket => 1,
+            MatcherCandidateRoute::SecondaryExact => 2,
+            MatcherCandidateRoute::SecondaryFallback => 3,
+        },
+    ]
+}
+
+#[ignore = "release-only composed matcher relay matrix; run with --release -- --ignored --nocapture"]
+#[test]
+fn matcher_relay_composed_matrix() {
+    if cfg!(debug_assertions) {
+        panic!("composed matcher measurements require --release");
+    }
+    let _metrics_handle = ensure_probe_metrics();
+    const SAMPLES: usize = 15;
+    const STABLE_ITERATIONS: usize = 128;
+    const FRESH_ITERATIONS: usize = 32;
+    const THREADS: [usize; 3] = [1, 4, 8];
+    let resource_key = "monitor:777";
+    let ctx = probe_ctx();
+    let mut cases = 0;
+
+    for distribution in [Distribution::Mixed, Distribution::SingleType] {
+        for (position_label, position) in [
+            ("last", Some(MATCHER_INDEX_THRESHOLD + 1 - 1)),
+            ("absent", None),
+        ] {
+            let evidence = benchmark_evidence(MATCHER_INDEX_THRESHOLD + 1, distribution, position);
+            let expected =
+                find_linear_published_grant(&ctx, &evidence, "monitor", Some("777")).is_some();
+            assert_eq!(expected, position.is_some());
+            for threads in THREADS {
+                let samples = (0..SAMPLES)
+                    .map(|_| {
+                        let sample = stable_matcher_sample(
+                            Arc::clone(&evidence),
+                            ctx.clone(),
+                            resource_key,
+                            expected,
+                            threads,
+                            STABLE_ITERATIONS,
+                        );
+                        assert!(sample[0] > 0);
+                        assert_eq!(sample[1], 0);
+                        assert_eq!(sample[2], 0);
+                        assert_eq!(sample[3], 0);
+                        assert_eq!(sample[4], (threads * STABLE_ITERATIONS) as u64);
+                        assert_eq!(
+                            sample[5],
+                            if position.is_some() { 1 } else { 0 },
+                            "stable matcher candidate count must reflect the secondary route"
+                        );
+                        assert_eq!(
+                            sample[6],
+                            if position.is_some() { 2 } else { 3 },
+                            "stable matcher route must be exact or fallback"
+                        );
+                        sample
+                    })
+                    .collect::<Vec<_>>();
+                cases += 1;
+                println!(
+                    "PERF_MATRIX {}",
+                    serde_json::json!({
+                        "case": format!("matcher/composed/{}/{position_label}/stable-arc/threads-{threads}", distribution.label()),
+                        "metric": "ns-per-decision-and-matcher-path-counts",
+                        "sampleFields": ["nsPerDecision", "linearThreshold", "firstSeenLinear", "indexBuild", "indexHit", "candidateCount", "candidateRoute"],
+                        "grants": MATCHER_INDEX_THRESHOLD + 1,
+                        "distribution": distribution.label(),
+                        "position": position_label,
+                        "arcMode": "stable-arc",
+                        "threadLocalWarmup": "per-worker-first-seen-build-hit",
+                        "expectedMatch": expected,
+                        "samples": samples,
+                    })
+                );
+            }
+
+            let samples = (0..SAMPLES)
+                .map(|_| {
+                    let sample = fresh_arc_matcher_sample(
+                        distribution,
+                        position,
+                        &ctx,
+                        resource_key,
+                        expected,
+                        FRESH_ITERATIONS,
+                    );
+                    assert!(sample[0] > 0);
+                    assert_eq!(sample[1], 0);
+                    assert_eq!(sample[2], FRESH_ITERATIONS as u64);
+                    assert_eq!(sample[3], 0);
+                    assert_eq!(sample[4], 0);
+                    assert_eq!(sample[5], (MATCHER_INDEX_THRESHOLD + 1) as u64);
+                    assert_eq!(sample[6], 0, "fresh Arc must use the linear route");
+                    sample
+                })
+                .collect::<Vec<_>>();
+            cases += 1;
+            println!(
+                "PERF_MATRIX {}",
+                serde_json::json!({
+                    "case": format!("matcher/composed/{}/{position_label}/fresh-arc/threads-1", distribution.label()),
+                    "metric": "ns-per-decision-and-matcher-path-counts",
+                    "sampleFields": ["nsPerDecision", "linearThreshold", "firstSeenLinear", "indexBuild", "indexHit", "candidateCount", "candidateRoute"],
+                    "grants": MATCHER_INDEX_THRESHOLD + 1,
+                    "distribution": distribution.label(),
+                    "position": position_label,
+                    "arcMode": "fresh-arc",
+                    "threadLocalWarmup": "none; each Arc is new",
+                    "expectedMatch": expected,
+                    "samples": samples,
+                })
+            );
+        }
+    }
+    assert_eq!(cases, 16);
 }
 
 #[ignore = "release-only matcher candidate comparison; run with --release -- --ignored --nocapture"]

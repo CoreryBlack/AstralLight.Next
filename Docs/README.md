@@ -20,6 +20,7 @@ This directory contains documentation selected for the standalone Rust backend r
 
 - [技术专题解析与架构取舍（2026-10-25）](技术专题解析与架构取舍_2026-10-25.md): Java-to-Rust migration boundaries, framework/data/MQ choices, authorization-engine topology, and canonical-vs-legacy projection roles. Design records and current implementation evidence are distinguished.
 - [授权执行期能力曲线（2026-10-25）](实验/基准测试/授权执行期能力曲线_20261025.md): a local release-mode `PolicyEngine::evaluate()` CPU matrix with an explicitly limited historical comparison; not HTTP QPS, live integration, or production capacity.
+- [授权执行期能力曲线与优化演进（2026-11-01）](实验/基准测试/授权执行期能力曲线_20261101.md): historical ceiling, V1–V4 optimization evolution, measured gains/regressions, owner-sharing attribution, and current architectural limits; CPU-only evidence, not production capacity.
 
 ## Architecture
 

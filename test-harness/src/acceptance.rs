@@ -2,8 +2,25 @@ use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-fn verdict(status: &str, reason: &str) -> Value {
-    json!({"status": status, "reason": reason})
+fn keys_exact(value: &Value, expected: &[&str]) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+}
+
+fn uint(value: &Value, name: &str, minimum: Option<u64>) -> Result<u64, String> {
+    let value = value
+        .as_u64()
+        .ok_or_else(|| format!("invalid integer field: {name}"))?;
+    if minimum.is_some_and(|minimum| value < minimum) {
+        return Err(format!("invalid integer field: {name}"));
+    }
+    Ok(value)
+}
+
+fn verdict(status: &str, reason: impl Into<String>) -> Value {
+    json!({"status": status, "reason": reason.into()})
 }
 
 fn time_to_ns(value: &str, unit: &str) -> Option<f64> {
@@ -240,6 +257,127 @@ pub fn check_divan(cases: &[String], allocation_cases: &[String], output: &str) 
     json!({"status":"PASS","reason":"complete CPU allocation benchmark; no service-capacity claim","performance":{"scope":"CPU/allocation component only; instrumented timing","cases":seen.len(),"measurements":seen,"allocations":allocations}})
 }
 
+fn validate_matcher_matrix_row(row: &Value) -> Result<(), String> {
+    let case = row["case"]
+        .as_str()
+        .ok_or("matcher performance case name is missing")?;
+    let suffix = case
+        .strip_prefix("matcher/composed/")
+        .ok_or("matcher performance case has an invalid prefix")?;
+    let parts = suffix.split('/').collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return Err("matcher performance case does not encode its exact topology".into());
+    }
+    let distribution = parts[0];
+    let position = parts[1];
+    let arc_mode = parts[2];
+    let threads = parts[3]
+        .strip_prefix("threads-")
+        .ok_or("matcher performance case thread count is missing")?
+        .parse::<u64>()
+        .map_err(|_| "matcher performance case thread count is invalid")?;
+    if !["mixed", "single_type"].contains(&distribution)
+        || !["last", "absent"].contains(&position)
+        || !["stable-arc", "fresh-arc"].contains(&arc_mode)
+        || ![1, 4, 8].contains(&threads)
+        || (arc_mode == "fresh-arc" && threads != 1)
+    {
+        return Err("matcher performance case is outside the exact topology".into());
+    }
+    if !keys_exact(
+        row,
+        &[
+            "case",
+            "metric",
+            "sampleFields",
+            "grants",
+            "distribution",
+            "position",
+            "arcMode",
+            "threadLocalWarmup",
+            "expectedMatch",
+            "samples",
+        ],
+    ) {
+        return Err("matcher performance row fields differ from the exact protocol".into());
+    }
+    if row["metric"] != json!("ns-per-decision-and-matcher-path-counts")
+        || row["sampleFields"]
+            != json!([
+                "nsPerDecision",
+                "linearThreshold",
+                "firstSeenLinear",
+                "indexBuild",
+                "indexHit",
+                "candidateCount",
+                "candidateRoute"
+            ])
+        || uint(&row["grants"], "matcher.grants", Some(0))? != 1001
+        || row["distribution"].as_str() != Some(distribution)
+        || row["position"].as_str() != Some(position)
+        || row["arcMode"].as_str() != Some(arc_mode)
+    {
+        return Err("matcher performance metadata differs from the exact protocol".into());
+    }
+    let expected_match = position == "last";
+    if row["expectedMatch"].as_bool() != Some(expected_match) {
+        return Err("matcher expectedMatch disagrees with the target position".into());
+    }
+    let expected_warmup = if arc_mode == "stable-arc" {
+        "per-worker-first-seen-build-hit"
+    } else {
+        "none; each Arc is new"
+    };
+    if row["threadLocalWarmup"].as_str() != Some(expected_warmup) {
+        return Err("matcher thread-local warmup metadata is invalid".into());
+    }
+    let samples = row["samples"]
+        .as_array()
+        .ok_or("matcher performance samples are missing")?;
+    if samples.len() != 15 {
+        return Err("matcher performance case must contain exactly 15 samples".into());
+    }
+    let expected_candidate_count = if arc_mode == "fresh-arc" {
+        1001
+    } else if position == "last" {
+        1
+    } else {
+        0
+    };
+    let expected_route = if arc_mode == "fresh-arc" {
+        0
+    } else if position == "last" {
+        2
+    } else {
+        3
+    };
+    for sample in samples {
+        let values = sample
+            .as_array()
+            .ok_or("matcher performance sample must be an array")?;
+        if values.len() != 7 {
+            return Err("matcher performance sample must contain exactly seven fields".into());
+        }
+        if uint(&values[0], "matcher.nsPerDecision", Some(1))? == 0
+            || uint(&values[5], "matcher.candidateCount", Some(0))? != expected_candidate_count
+            || uint(&values[6], "matcher.candidateRoute", Some(0))? != expected_route
+        {
+            return Err("matcher performance candidate attribution is inconsistent".into());
+        }
+        let expected_paths = if arc_mode == "fresh-arc" {
+            [0, 32, 0, 0]
+        } else {
+            [0, 0, 0, threads * 128]
+        };
+        for (index, expected) in expected_paths.into_iter().enumerate() {
+            if uint(&values[index + 1], "matcher.pathCount", Some(0))? != expected {
+                return Err("matcher performance path counts are inconsistent".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn check_performance_matrix(expected_cases: usize, stdout: &str) -> Value {
     let rows_re = Regex::new(r"PERF_MATRIX (\{[^\n]+\})").expect("constant regex");
     let mut rows = Vec::new();
@@ -267,6 +405,18 @@ pub fn check_performance_matrix(expected_cases: usize, stdout: &str) -> Value {
                 return verdict(
                     "FAIL",
                     "performance matrix contains invalid or insufficient samples",
+                );
+            }
+        }
+        if row
+            .get("case")
+            .and_then(Value::as_str)
+            .is_some_and(|case| case.starts_with("matcher/composed/"))
+        {
+            if let Err(error) = validate_matcher_matrix_row(&row) {
+                return verdict(
+                    "FAIL",
+                    format!("matcher performance matrix violates its exact protocol: {error}"),
                 );
             }
         }

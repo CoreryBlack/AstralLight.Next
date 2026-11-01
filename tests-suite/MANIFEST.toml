@@ -2282,6 +2282,55 @@ expected_tests = 1
 timeout_seconds = 1800
 
 [[suite]]
+id = "policy-evaluate-attribution"
+performance_cases = 45
+owner = "astral-db"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ5"]
+scope = "component"
+boundary = "instrumented CPU PolicyEngine.evaluate phase/cache/allocator attribution; process-global allocator observation only, not formal throughput or evidence-copy/Arc-drop counts; no signed HTTP/MySQL/SDK/deployment claim"
+sources = ["astral-db/src/memory_projection_hub/tests/evaluate_performance.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs", "policy-engine/src/engine/formal.rs", "policy-engine/src/engine/published.rs", "policy-engine/src/hit_stats.rs", "astral-db/src/memory_projection_hub/assembly_cache.rs", "test-harness/src/evaluate_acceptance.rs"]
+argv = ["cargo", "test", "--release", "-p", "astral-db", "--features", "performance-attribution", "--lib", "memory_projection_hub::tests::evaluate_performance::policy_evaluate_attribution_matrix", "--locked", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+evidence_contract = "policy-evaluate-attribution"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 1800
+
+[[suite]]
+id = "policy-evaluate-sharing-experiment"
+owner = "astral-db"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ5"]
+scope = "component"
+boundary = "CPU-only owner-sharing causal experiment: shared/private AssemblyCache and PolicyEngine, cached/forced assembly, 128/1001/2048 grants, t1/t4/t8; no HTTP/MySQL/RabbitMQ/signed transport/deployment/production QPS/distributed capacity claim"
+sources = ["astral-db/src/memory_projection_hub/tests/evaluate_experimental.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs", "astral-db/src/memory_projection_hub/assembly_cache.rs", "test-harness/src/evaluate_sharing_acceptance.rs", "test-harness/src/campaign.rs"]
+argv = ["cargo", "test", "--release", "-p", "astral-db", "--lib", "memory_projection_hub::tests::evaluate_experimental::policy_evaluate_sharing_experiment", "--locked", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+evidence_contract = "policy-evaluate-sharing-experiment"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 1800
+
+[[suite]]
+id = "policy-evaluate-sharing-experiment-v2"
+owner = "astral-db"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ5"]
+scope = "component"
+boundary = "CPU-only owner-sharing attribution contract: v1 remains the immutable historical baseline; v2 reconciles AssemblyCache stripe wait/hold, GC/eviction, atomic PolicyEngine owner stats, and breaker map/state attribution across shared/private owners; no HTTP/MySQL/RabbitMQ/signed transport/deployment/production QPS/distributed capacity claim"
+sources = ["astral-db/src/memory_projection_hub/tests/evaluate_experimental.rs", "astral-db/src/memory_projection_hub/assembly_cache.rs", "policy-engine/src/engine.rs", "policy-engine/src/engine/formal.rs", "policy-engine/src/hit_stats.rs", "policy-engine/src/circuit_breaker.rs", "test-harness/src/evaluate_sharing_v2_acceptance.rs", "test-harness/src/campaign.rs"]
+argv = ["cargo", "test", "--release", "-p", "astral-db", "--features", "performance-attribution", "--lib", "memory_projection_hub::tests::evaluate_experimental::policy_evaluate_sharing_experiment", "--locked", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+evidence_contract = "policy-evaluate-sharing-experiment-v2"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 1800
+
+[[suite]]
 id = "performance-acceptance-parser-contracts"
 owner = "test-harness"
 profile = "offline-validation"
@@ -2297,6 +2346,22 @@ expected_tests = 8
 timeout_seconds = 600
 
 [[suite]]
+id = "policy-matcher-relay-performance"
+performance_cases = 16
+owner = "policy-engine"
+profile = "performance-kernel"
+test_services = []
+series = ["PERF", "RQ5"]
+scope = "component"
+boundary = "CPU matcher relay warm steady-state, mixed and single resource buckets, stable/fresh Arc paths, and per-worker thread-local warmup; no HTTP/DB/deployment/distributed capacity claim"
+sources = ["policy-engine/src/engine/published.rs", "policy-engine/src/engine/matcher_curve.rs"]
+argv = ["cargo", "test", "--release", "-p", "policy-engine", "--lib", "engine::published::matcher_curve::matcher_relay_composed_matrix", "--locked", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 1800
+
+[[suite]]
 id = "policy-evaluate-evidence-contracts"
 owner = "test-harness"
 profile = "offline-validation"
@@ -2307,8 +2372,8 @@ boundary = "Rust strict 45-case/18-sample/3-arm evaluate-evidence validator with
 sources = ["test-harness/src/evaluate_acceptance.rs", "scripts/evaluate_performance_acceptance.py", "scripts/tests/test_evaluate_performance_acceptance.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "evaluate_acceptance::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
-minimum_tests = 11
-expected_tests = 11
+minimum_tests = 13
+expected_tests = 13
 timeout_seconds = 600
 
 [[suite]]

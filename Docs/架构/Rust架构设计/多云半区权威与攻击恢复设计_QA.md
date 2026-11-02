@@ -1,9 +1,9 @@
 # 多云、半区权威与攻击恢复设计 QA
 
 > 创建日期：2026-10-27
-> 更新日期：2026-11-02
+> 更新日期：2026-11-03
 > 状态：逐项讨论中；本文记录设计设想、既有回答和待明确问题，不构成已批准的完整协议、实现证明、部署批准或等保测评结论。
-> 2026-11-02 的“本轮实现记录”只说明已批准约束在源码中的接线、本轮补齐的 fail-closed 推导和本地验证范围。它不把仍标为待澄清的协议改写成已批准结论，也不等于迁移、多节点部署或等保验收。
+> 2026-11-03 的“本轮实现记录”只说明已批准约束在源码中的接线、本轮补齐的 fail-closed 推导和本地验证范围。它不把仍标为待澄清的协议改写成已批准结论，也不等于迁移、多节点部署或等保验收。
 > 来源：2026-10-27 关于攻击场景、多云、双数据库、半区内存权威、代际栅栏和 NTP 授时的对话。
 
 ## 1. 使用方式与记录边界
@@ -235,7 +235,7 @@
 
 **当前设计结论：** 已明确状态变更入口与参与组件：只有经过引擎校验的合法请求，配合投影器物化和消息通道，才能改变内存权威；不能把一条消息或一次数据库校验相符直接等同于完成合法变更。各阶段的关联、完成证明和失败处理仍待细化。可信 AL 持有的摘要可作为数据库完整性比较基准；普通哈希本身不证明新状态发布者身份，认证及提交证明的具体合同尚未定案。关联 Q03、Q09、Q13、Q14、Q15。
 
-**本轮实现记录（2026-11-02，含推导）：** 核对当前发布链后，授权内容进入内存仍来自已证明的投影提交（`MemoryProjectionHub::install_committed_publication`）、严格读取回填，以及预热/对账装载；`apply_evidence_invalidation` 只登记失效水位和 pending，不写入 grant。本轮补齐的缺口是：水位若仍覆盖已安装代际，即使对账把 pending 桶替换为空，`try_memory_evidence` 也继续 `DeferToDurable`。心跳只刷新通道活性，不能清除 suspect，也不能安装或替换授权。单独更大的 `sealed_at` 或单独的 generation 数字不构成可服务状态。这是按已定入口做的 fail-closed 推导：消息不成为新授权，被点名的旧基线也不因 pending 桶丢失而在内存中恢复服务。该水位不扩展为 strict DB 的新拒绝协议；消息认证、解除条件和跨库核验仍是上面的待澄清点。实现位置：`astral-db/src/memory_projection_hub.rs`。本地测试见更新记录。这不等于多节点部署验收。
+**本轮实现记录（2026-11-03，含推导）：** 核对当前发布链后，授权内容进入内存仍来自已证明的投影提交（`MemoryProjectionHub::install_committed_publication`）、严格读取回填，以及预热/对账装载；`apply_evidence_invalidation` 只登记失效水位和 pending，不写入 grant。本轮补齐的缺口是：水位若仍覆盖已安装代际，即使对账把 pending 桶替换为空，`try_memory_evidence` 也继续 `DeferToDurable`。心跳只刷新通道活性，不能清除 suspect，也不能安装或替换授权。单独更大的 `sealed_at` 或单独的 generation 数字不构成可服务状态。这是按已定入口做的 fail-closed 推导：消息不成为新授权，被点名的旧基线也不因 pending 桶丢失而在内存中恢复服务。该水位不扩展为 strict DB 的新拒绝协议；消息认证、解除条件和跨库核验仍是上面的待澄清点。实现位置：`astral-db/src/memory_projection_hub.rs`。本地测试见更新记录。这不等于多节点部署验收。
 
 <a id="q09"></a>
 ### Q09｜两个半区相互冲突，谁有权确定正确状态和下一代？
@@ -306,7 +306,7 @@
 
 **当前设计结论：** 已明确示例数量不是实际城市规模；故障隔离与服务保全应按多节点、多供应商部署分析，不能把可用性问题限定为固定六台机器。“保全一半”仍是原示例中的待证明目标，实际保障范围和比例需结合故障域、证明依赖及容量明确。关联 Q09、Q10、Q15、Q16。
 
-**本轮实现记录（2026-11-02）：** 失效 fanout 的队列名由调用方给出的 region/node 派生，代码里没有 4 台 AL 或 2 台数据库的成员名单，也没有这个名额上限。`astral-mq` 的 `fanout_membership_is_not_a_fixed_half_zone_roster` 用 6 个不同供应商标签得到互异队列。分组、共享依赖、容量和“低可用”允许的行为仍待澄清，本轮没有把“保全一半”写成比例常量。default-off 的跨城合同仍要求两座城市、每城两份证据；那是另一份未启用合同，本轮不修改，也不把它当成城市内部署拓扑。
+**本轮实现记录（2026-11-03）：** 失效 fanout 的队列名由调用方给出的 region/node 派生，代码里没有 4 台 AL 或 2 台数据库的成员名单，也没有这个名额上限。`astral-mq` 的 `fanout_membership_is_not_a_fixed_half_zone_roster` 用 6 个不同供应商标签得到互异队列。分组、共享依赖、容量和“低可用”允许的行为仍待澄清，本轮没有把“保全一半”写成比例常量。default-off 的跨城合同仍要求两座城市、每城两份证据；那是另一份未启用合同，本轮不修改，也不把它当成城市内部署拓扑。
 
 <a id="q12"></a>
 ### Q12｜较旧内存能否作为安全恢复蓝本？
@@ -365,7 +365,7 @@
 
 **用户补充（2026-10-28）：** 将完整规则集结构作为标准写入文档并升级系统；代际栅栏因拦截职责不携带完整规则条目，但必须包含版本号、hash 和时间戳。当前 release edition 为 V6，由共享 `authorization_edition!(6)` 宏派生；2026-10-27 的 v3 generation/seal 仅为历史请求及不可变 artifact。规范源为 [Rust 规范 §15.7](../../规范/Rust后端编码规范_V1.0.md#157-规则集完整结构与轻量发布栅栏标准2026-10-28)：完整 source/read view 与轻量 `PublicationStamp` 分离，stamp 绑定同一 CURRENT V6 generation、最终 manifest 摘要和当前 seal；source pending、lease、资格及进程内 token 不伪造发布证明。此结构决定不补全跨云共识或恢复批准协议。
 
-**本轮实现记录（2026-11-02）：** 下列结构在当前 main 已经存在，本轮不重做，也不改 migration 文件字节。`astral-types/src/edition.rs` 的 `authorization_edition!(6)` 派生 `astral-auth-manifest-v6`、seal/compiler、segment、archive、completion 与 snapshot 标识。`PublicationSeal` / `PublicationStamp` 在 `astral-types/src/publication.rs`。新 reader 拒绝非当前 edition，因此旧 v1/v2/v3/v5 proof、wire 和 snapshot 不能被补字段后放行。历史 migration `astral-db/migrations/20261027000001_authorization_projection_manifest_v3.sql` 的 SHA-384 仍是 `cb26222047cef5ac7c35b4e8185b075a367310b9ed3393c08c9f1f48483ca91e31603e23b05e613725211f4b59cafec9`，SQL 里的历史探针仍写 `manifest_digest_version <> 3`。运行时巡检绑定的是 `AUTHORIZATION_EDITION`，现有行缺少 V6 证明时 BLOCKED，不回填。workspace `Cargo.toml` 没有 redis 依赖，也没有 `astral-cache` 成员；资格 L1 保留 5 秒 TTL 和 65536 条上限，miss 回严格读取。新版本由谁分配、恢复发布如何单独批准，以及版本 100 允许、101 撤销后再以旧内容生成 102 时如何保证不重新允许，仍是待澄清点。本轮没有执行真实迁移或删除数据。
+**本轮实现记录（2026-11-03）：** 下列结构在当前 main 已经存在，本轮不重做，也不改 migration 文件字节。`astral-types/src/edition.rs` 的 `authorization_edition!(6)` 派生 `astral-auth-manifest-v6`、seal/compiler、segment、archive、completion 与 snapshot 标识。`PublicationSeal` / `PublicationStamp` 在 `astral-types/src/publication.rs`。新 reader 拒绝非当前 edition，因此旧 v1/v2/v3/v5 proof、wire 和 snapshot 不能被补字段后放行。历史 migration `astral-db/migrations/20261027000001_authorization_projection_manifest_v3.sql` 的 SHA-384 仍是 `cb26222047cef5ac7c35b4e8185b075a367310b9ed3393c08c9f1f48483ca91e31603e23b05e613725211f4b59cafec9`，SQL 里的历史探针仍写 `manifest_digest_version <> 3`。运行时巡检绑定的是 `AUTHORIZATION_EDITION`，现有行缺少 V6 证明时 BLOCKED，不回填。workspace `Cargo.toml` 没有 redis 依赖，也没有 `astral-cache` 成员；资格 L1 保留 5 秒 TTL 和 65536 条上限，miss 回严格读取。新版本由谁分配、恢复发布如何单独批准，以及版本 100 允许、101 撤销后再以旧内容生成 102 时如何保证不重新允许，仍是待澄清点。本轮没有执行真实迁移或删除数据。
 
 <a id="q14"></a>
 ### Q14｜NTP 时间在版本校验中承担什么责任？
@@ -388,7 +388,7 @@
 
 **当前设计结论：** NTP 稳定授时由服务器部署保证，应用读取校时后的系统 UTC，无需在每次授权或编译时进行 NTP 网络访问。CURRENT V6 的 `sealed_at` 为首次成功持久化封存时间，采用 UTC 整秒及规范 RFC 3339 表示，重试复用持久值；它不等同 COMMIT 完成、缓存读取、消息创建或快照捕获时间。同秒与小幅时钟回调不改变 generation/CAS/fence 的排序责任。授时机制不替代发布者认证、edition 一致性或提交证明；版本一致性也不等于权限或 generation downgrade，跨节点接受窗口等传输规则仍待独立明确。关联 Q03、Q08、Q09、Q13。
 
-**本轮实现记录（2026-11-02）：** `PublicationSeal` 拒绝亚秒和非规范 RFC 3339。staging 找到同一 aggregate 与 target generation 的候选后，经 `verify_staged_candidate` 复用已持久化的 seal，不重新读取时钟。manifest 摘要函数没有时钟或 IO。同代 seal 时间漂移在发布复读时拒绝。本轮水位比较只看 generation，测试明确使用更晚的 `sealed_at` 也不能越过更新的 generation。跨节点接受窗口仍待澄清，本轮没有用 NTP 偏移实现排序。
+**本轮实现记录（2026-11-03）：** `PublicationSeal` 拒绝亚秒和非规范 RFC 3339。staging 找到同一 aggregate 与 target generation 的候选后，经 `verify_staged_candidate` 复用已持久化的 seal，不重新读取时钟。manifest 摘要函数没有时钟或 IO。同代 seal 时间漂移在发布复读时拒绝。本轮水位比较只看 generation，测试明确使用更晚的 `sealed_at` 也不能越过更新的 generation。跨节点接受窗口仍待澄清，本轮没有用 NTP 偏移实现排序。
 
 <a id="q15"></a>
 ### Q15｜PENDING 和代际变化如何跨 AL 通知，避免校验风暴？
@@ -414,7 +414,7 @@
 
 **当前设计结论：** 消息通道参与合法状态变更，但通知或消息单独到达不构成授权状态变更依据。当前 `EVIDENCE_INVALIDATED`、`ELIGIBILITY_INVALIDATED`、`SESSION_REVOKED` 和 `INVALIDATION_HEARTBEAT` 统一为 V6 contract，且与 published permission、snapshot schema/payload 和恢复读取一并切换；Redis L2/MAC/shared-content cache 已退出当前合同，旧 wire、旧 cache 或旧 proof 不自动协商、补字段或重放。通知协议需面向城市级多节点、多供应商部署设计，不能按固定四台 AL 作为规模前提；传播和校验的具体合同尚未形成。关联 Q01、Q08、Q10、Q11、Q12、Q16。
 
-**本轮实现记录（2026-11-02）：** 四类 family 的 schema version 都来自 `AUTHORIZATION_EDITION`。前三类走 typed invalidation 合同，心跳只携带节点身份和发送时间，不写授权内容，也不清除 suspect 或水位。旧 schema version 在解码时拒绝。本轮没有新增代表节点、Leader 或固定四台扇出。谁接收通知、如何认证、如何区分“已收到 / 已校验 / 已修复 / 已解除 PENDING”，以及并行修复如何合并，仍是待澄清点。Q08 的水位只让内存读面回退，不把一条未认证消息升级成持续拒绝 strict DB 的新协议，以免在认证合同未定前扩大 Q01 所述的不可用面。
+**本轮实现记录（2026-11-03）：** 四类 family 的 schema version 都来自 `AUTHORIZATION_EDITION`。前三类走 typed invalidation 合同，心跳只携带节点身份和发送时间，不写授权内容，也不清除 suspect 或水位。旧 schema version 在解码时拒绝。本轮没有新增代表节点、Leader 或固定四台扇出。谁接收通知、如何认证、如何区分“已收到 / 已校验 / 已修复 / 已解除 PENDING”，以及并行修复如何合并，仍是待澄清点。Q08 的水位只让内存读面回退，不把一条未认证消息升级成持续拒绝 strict DB 的新协议，以免在认证合同未定前扩大 Q01 所述的不可用面。
 
 ## 7. 多云、物理安全与合规目标
 
@@ -441,7 +441,7 @@
 
 **当前设计结论：** 城市级部署已明确采用多服务器、多个本地和云供应商共同承担；“双区”“4 台 AL＋2 DB”描述隔离与核验关系，不是固定物理拓扑或节点数量。具体分组、供应商组合和存储角色仍待讨论；故障域独立性需按实际共享依赖核对。关联 Q07、Q09、Q11、Q14、Q15。
 
-**本轮实现记录（2026-11-02）：** 节点身份来自配置里的 region/node 字符串，fanout 只为该节点声明自己的 durable 队列。本轮没有新增供应商清单、固定配对或部署文件。账号、密钥、管理面、分区时允许的操作和重连后的冲突历史仍待澄清。跨城两城两证据合同保持 default-off，见 Q11 的实现记录。
+**本轮实现记录（2026-11-03）：** 节点身份来自配置里的 region/node 字符串，fanout 只为该节点声明自己的 durable 队列。本轮没有新增供应商清单、固定配对或部署文件。账号、密钥、管理面、分区时允许的操作和重连后的冲突历史仍待澄清。跨城两城两证据合同保持 default-off，见 Q11 的实现记录。
 
 <a id="q17"></a>
 ### Q17｜断电、断网和极端基础设施破坏时，系统如何进入安全态？
@@ -506,4 +506,4 @@
 - 2026-10-27：根据用户澄清，明确内存权威变更须通过引擎校验后的合法请求，配合投影器物化与消息通道；修正固定六台机器的误读，将双区与配对关系标为示意，城市部署改按多服务器、多个本地与云供应商记录。更新 Q08、Q11、Q15、Q16 的回答与状态，调整 Q09 的问题范围；其余协议细节继续讨论。
 - 2026-10-27：用户要求结构改进直接接入发布链，并明确此前“只用 v3”的历史请求；批准对应 v3 artifact 记录。Q13/Q14 更新为历史封存字段、稳定 UTC 整秒时间、旧证据拒绝及真实操作的独立批准边界，取代前轮 v2 兼容建议。当前 release edition 后续统一为 V6；代码验证与部署验收分开记录。
 - 2026-10-28：用户要求完整规则集标准化并升级系统，当前迭代统一命名为 V6，明确代际栅栏只需版本、hash 和时间，不携带规则条目；Q13 记录 V6 edition、历史 v3 artifact、共享宏派生和 source/发布/恢复授权职责边界，Q14 记录 NTP 不替代提交/排序，Q15 记录四类 invalidation family 与其他 V6 bundle 同步切换。
-- 2026-11-02：在开发分支核对 Q08、Q11、Q13、Q14、Q15、Q16 的已批准约束。V6 edition、`PublicationSeal`/`PublicationStamp`、旧证据拒绝、v3 migration 字节与 SHA-384、Redis/`astral-cache` 退出、有界进程内 L1，以及四类 invalidation 的 V6 wire，确认已在源码中，不重做。本轮只补内存读面：通知水位覆盖已安装代际时，pending 桶丢失后仍 `DeferToDurable`；心跳和 `sealed_at` 不能恢复或排序该服务。fanout 测试锁定成员数不固定为示例里的四台或两台。未改 default-off 跨城合同，未执行迁移、删除数据或部署。Q01–Q07、Q09、Q10、Q12、Q17、Q18 以及各条仍列出的待澄清点保持未决。本地验证：`cargo fmt --all -- --check` 通过；`cargo clippy -p astral-db -p astral-mq --all-targets -- -D warnings` 通过；`cargo test -p astral-db --lib memory_projection_hub::tests::` 为 64 passed、2 ignored；`cargo test -p astral-mq --lib fanout_membership_is_not_a_fixed_half_zone_roster` 通过。未跑全 workspace，未跑需要真实 MySQL/MQ 的 ignored 集成。这些结果不等于部署或等保验收。
+- 2026-11-03：在开发分支核对 Q08、Q11、Q13、Q14、Q15、Q16 的已批准约束。V6 edition、`PublicationSeal`/`PublicationStamp`、旧证据拒绝、v3 migration 字节与 SHA-384、Redis/`astral-cache` 退出、有界进程内 L1，以及四类 invalidation 的 V6 wire，确认已在源码中，不重做。本轮只补内存读面：通知水位覆盖已安装代际时，pending 桶丢失后仍 `DeferToDurable`；心跳和 `sealed_at` 不能恢复或排序该服务。fanout 测试锁定成员数不固定为示例里的四台或两台。未改 default-off 跨城合同，未执行迁移、删除数据或部署。Q01–Q07、Q09、Q10、Q12、Q17、Q18 以及各条仍列出的待澄清点保持未决。本地验证：`cargo fmt --all -- --check` 通过；`cargo clippy -p astral-db -p astral-mq --all-targets -- -D warnings` 通过；`cargo test -p astral-db --lib memory_projection_hub::tests::` 为 64 passed、2 ignored；`cargo test -p astral-mq --lib fanout_membership_is_not_a_fixed_half_zone_roster` 通过。未跑全 workspace，未跑需要真实 MySQL/MQ 的 ignored 集成。这些结果不等于部署或等保验收。

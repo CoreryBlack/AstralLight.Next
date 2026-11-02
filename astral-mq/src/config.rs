@@ -375,6 +375,34 @@ mod invalidation_fanout_topology_tests {
     }
 
     #[test]
+    fn fanout_membership_is_not_a_fixed_half_zone_roster() {
+        let vendors = [
+            "local-dc",
+            "aliyun",
+            "cloudflare",
+            "azure",
+            "aws",
+            "tencent",
+        ];
+        let queues: Vec<String> = vendors
+            .iter()
+            .enumerate()
+            .map(|(index, vendor)| {
+                let identity =
+                    NodeIdentity::try_from_parts(*vendor, format!("al-{index}")).unwrap();
+                invalidation_fanout_queue_name(&identity)
+            })
+            .collect();
+        let distinct = queues.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(distinct.len(), vendors.len());
+        assert!(
+            vendors.len() > 4,
+            "illustrative four-node example is not a cap"
+        );
+        assert!(queues.iter().all(|queue| queue.len() < 255));
+    }
+
+    #[test]
     fn per_node_queue_names_are_deterministic_and_distinct() {
         let first = identity();
         let second = NodeIdentity::try_from_parts("city-b", "node-1").unwrap();

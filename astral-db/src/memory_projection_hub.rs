@@ -447,6 +447,34 @@ pub fn watermark_lags(durable_frontier: u64, applied: Option<u64>, max_lag: u64)
     durable_frontier.saturating_sub(applied.unwrap_or(0)) > max_lag
 }
 
+/// A notification names the publication baseline it makes unsafe to serve.
+///
+/// The watermark is not a new grant and is not ordered by `sealed_at`. Covering
+/// the installed generation (equal or newer) keeps that baseline off the memory
+/// read path even if a later reconciliation drops the pending bucket. A strictly
+/// older watermark does not fence a later committed publication. Clearing this
+/// fence without a newer committed publication is intentionally not defined here.
+fn notification_fences_installed_publication(
+    watermark: &PublicationStamp,
+    installed: &PublicationStamp,
+) -> bool {
+    watermark.generation >= installed.generation
+}
+
+fn notification_still_fences_installed(
+    watermark: Option<&PublicationStamp>,
+    installed: Option<&AuthorizationPublishedState>,
+) -> bool {
+    match (watermark, installed) {
+        (Some(watermark), Some(state)) => state
+            .publication_stamp()
+            .map(|installed| notification_fences_installed_publication(watermark, &installed))
+            .unwrap_or(true),
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CompletionIdentity {
     aggregate: ProjectionAggregateIdentity,
@@ -1773,6 +1801,15 @@ impl MemoryProjectionHub {
             {
                 return MemoryEvidenceOutcome::DeferToDurable;
             }
+            // 消息只点名被失效的已发布基线，不能在 pending 桶被替换后恢复该基线的内存服务。
+            if identities.iter().any(|identity| {
+                notification_still_fences_installed(
+                    maps.notification_watermarks.get(identity),
+                    maps.states.get(identity).map(Arc::as_ref),
+                )
+            }) {
+                return MemoryEvidenceOutcome::DeferToDurable;
+            }
             let now = Instant::now();
             if identities.iter().any(|identity| {
                 maps.installed_at
@@ -3010,6 +3047,93 @@ mod tests {
         let other_aggregate = ProjectionAggregateIdentity::new(7, "RULE_SET", 17).unwrap();
         assert_eq!(hub.applied_generation_watermark(&other_tenant), None);
         assert_eq!(hub.applied_generation_watermark(&other_aggregate), None);
+    }
+
+    #[test]
+    fn lost_pending_bucket_cannot_serve_a_notification_named_baseline() {
+        let hub = MemoryProjectionHub::default();
+        let identity = card_identity();
+        let hot = policy_engine::HotState::from_grants(
+            tenant(),
+            1,
+            vec![grant(0x21)],
+            dependency_vector(),
+        )
+        .unwrap();
+        hub.install_published_state(seal_state(&identity, 17, 1, hot, None, 0));
+        let before = serve(hub.try_memory_evidence(&scope()));
+        hub.apply_evidence_invalidation(EvidenceInvalidationRequest {
+            tenant_id: 7,
+            card_id: Some(17),
+            aggregate_type: PublishedEvidenceAggregate::UserCard,
+            aggregate_id: 17,
+            event_id: "event-fence".into(),
+            operation_id: "operation-fence".into(),
+            source_generation: 2,
+            revoke_fence: 0,
+            published_generation: 1,
+            stamp: notification_stamp(&hub, 1),
+        })
+        .unwrap();
+        assert_eq!(hub.installed_generation(&identity), Some(1));
+        assert_eq!(
+            hub.installed_published_state(&identity)
+                .unwrap()
+                .publication_stamp()
+                .unwrap(),
+            before.manifests[0].publication_stamp().unwrap()
+        );
+        {
+            let mut maps = hub.maps.write().unwrap();
+            maps.pending.clear();
+            maps.pending_count = 0;
+        }
+        defer(hub.try_memory_evidence(&scope()));
+        hub.record_channel_heartbeat();
+        assert!(!hub.channel_is_suspect());
+        defer(hub.try_memory_evidence(&scope()));
+        assert_eq!(hub.installed_generation(&identity), Some(1));
+
+        let newer = policy_engine::HotState::from_grants(
+            tenant(),
+            2,
+            vec![grant(0x22)],
+            dependency_vector(),
+        )
+        .unwrap();
+        install_committed(&hub, seal_state(&identity, 17, 2, newer, Some(1), 0));
+        let served = serve(hub.try_memory_evidence(&scope()));
+        assert_eq!(served.manifests[0].generation, 2);
+        assert_ne!(
+            served.manifests[0].publication_stamp().unwrap(),
+            before.manifests[0].publication_stamp().unwrap()
+        );
+    }
+
+    #[test]
+    fn notification_fence_ignores_seal_time_and_does_not_install_from_generation_alone() {
+        let older = PublicationStamp::new(
+            1,
+            "ab".repeat(32),
+            PublicationSeal::from_unix_seconds(1_700_000_100).unwrap(),
+        )
+        .unwrap();
+        let installed = PublicationStamp::new(
+            2,
+            "cd".repeat(32),
+            PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+        )
+        .unwrap();
+        assert!(installed.seal.unix_seconds() < older.seal.unix_seconds());
+        assert!(!notification_fences_installed_publication(
+            &older, &installed
+        ));
+        assert!(notification_fences_installed_publication(
+            &installed, &older
+        ));
+        let hub = MemoryProjectionHub::default();
+        assert_eq!(hub.installed_generation(&card_identity()), None);
+        defer(hub.try_memory_evidence(&scope()));
     }
 
     #[test]

@@ -107,6 +107,8 @@ mod tests {
             engine: Arc::new(policy_engine::PolicyEngine::new()),
             config: crate::service::integration_authorization::IntegrationConfig::test_config(),
             org_scope_enabled: false,
+            authority_provider: None,
+            authority_required: true,
         });
         let app = routes(service);
         for (content_type, body, expected) in [

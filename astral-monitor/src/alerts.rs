@@ -1,6 +1,7 @@
 //! 告警规则管理 — Java AlertRuleService 的 HTTP adapter。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
+use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -119,11 +120,24 @@ async fn list_rules(
 
 async fn create_rule(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy): Extension<astral_types::PolicyContext>,
+    Extension(admission): Extension<astral_types::AuthorizationAdmission>,
     Json(request): Json<CreateAlertReq>,
 ) -> Result<Json<ApiResponse<AlertRule>>, AppError> {
-    Ok(Json(ApiResponse::success(
-        state.monitor_service.create_rule(request).await?,
-    )))
+    let context =
+        crate::mutation::context(&headers, &policy, admission, "monitor", "create", None)?;
+    let mutation = crate::repository::MonitorMutation::CreateRule(rule_update(0, request));
+    match state
+        .monitor_service
+        .protected_mutation(&context, mutation)
+        .await?
+    {
+        crate::repository::MonitorMutationResult::Rule(rule) => {
+            Ok(Json(ApiResponse::success(rule.into())))
+        }
+        _ => Err(crate::mutation::unexpected_result()),
+    }
 }
 
 async fn get_rule(
@@ -135,30 +149,73 @@ async fn get_rule(
     )))
 }
 
+fn rule_update(id: i64, request: CreateAlertReq) -> crate::repository::AlertRuleUpdate {
+    crate::repository::AlertRuleUpdate {
+        id,
+        name: request.name,
+        metric: request.metric,
+        condition_op: request.condition_op.unwrap_or_else(|| ">=".into()),
+        threshold: request.threshold,
+        duration_seconds: request.duration_seconds.unwrap_or(60),
+        severity: request.severity.unwrap_or_else(|| "WARNING".into()),
+    }
+}
+
 async fn update_rule(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy): Extension<astral_types::PolicyContext>,
+    Extension(admission): Extension<astral_types::AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(request): Json<CreateAlertReq>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.monitor_service.update_rule(id, request).await?;
+    let context =
+        crate::mutation::context(&headers, &policy, admission, "monitor", "update", Some(id))?;
+    state
+        .monitor_service
+        .protected_mutation(
+            &context,
+            crate::repository::MonitorMutation::UpdateRule(rule_update(id, request)),
+        )
+        .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 
 async fn delete_rule(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy): Extension<astral_types::PolicyContext>,
+    Extension(admission): Extension<astral_types::AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.monitor_service.delete_rule(id).await?;
+    let context =
+        crate::mutation::context(&headers, &policy, admission, "monitor", "delete", Some(id))?;
+    state
+        .monitor_service
+        .protected_mutation(&context, crate::repository::MonitorMutation::DeleteRule(id))
+        .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 
 async fn toggle_rule(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy): Extension<astral_types::PolicyContext>,
+    Extension(admission): Extension<astral_types::AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<AlertRule>>, AppError> {
-    Ok(Json(ApiResponse::success(
-        state.monitor_service.toggle_rule(id).await?,
-    )))
+    let context =
+        crate::mutation::context(&headers, &policy, admission, "monitor", "update", Some(id))?;
+    match state
+        .monitor_service
+        .protected_mutation(&context, crate::repository::MonitorMutation::ToggleRule(id))
+        .await?
+    {
+        crate::repository::MonitorMutationResult::Rule(rule) => {
+            Ok(Json(ApiResponse::success(rule.into())))
+        }
+        _ => Err(crate::mutation::unexpected_result()),
+    }
 }
 
 async fn list_alert_history(
@@ -172,9 +229,20 @@ async fn list_alert_history(
 
 async fn acknowledge_alert(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy): Extension<astral_types::PolicyContext>,
+    Extension(admission): Extension<astral_types::AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.monitor_service.acknowledge_alert(id).await?;
+    let context =
+        crate::mutation::context(&headers, &policy, admission, "monitor", "update", Some(id))?;
+    state
+        .monitor_service
+        .protected_mutation(
+            &context,
+            crate::repository::MonitorMutation::Acknowledge(id),
+        )
+        .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 

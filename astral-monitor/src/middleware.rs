@@ -12,7 +12,8 @@ use astral_common::middleware::permission_check_shared::{
 };
 use astral_db::{
     check_sod_conflict_with_context, check_sod_conflict_with_context_and_org,
-    load_org_sod_admission, resolve_resource_ownership, SqlxRuleRepository,
+    load_org_sod_admission, resolve_resource_ownership, MemoryMirroredRuleRepository,
+    SqlxRuleRepository,
 };
 
 use crate::AppState;
@@ -41,10 +42,11 @@ pub const MONITOR_PATH_MAP: PathResourceMap = &[
 
 pub async fn monitor_permission_middleware(
     State(state): State<AppState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, BoxedResponse> {
-    let path = req.uri().path();
+    let request_path = req.uri().path().to_owned();
+    let path = request_path.as_str();
     let method = req.method().clone();
 
     let resource = match MONITOR_PATH_MAP
@@ -66,12 +68,50 @@ pub async fn monitor_permission_middleware(
 
     let action = match resolve_permission_action(resource, path, method.as_str()) {
         Some(action) => action,
-        None => return Ok(next.run(req).await),
+        None => {
+            tracing::warn!(path, method = %method, "no permission action for protected route, denying");
+            return Err(BoxedResponse::new(
+                (
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    format!(
+                        "No permission action for method {} on path {}",
+                        method, path
+                    ),
+                )
+                    .into_response(),
+            ));
+        }
+    };
+
+    let admission_fence = match astral_db::memory_projection_hub() {
+        None => None,
+        Some(hub) => match hub.capture_authority_fence() {
+            Some(fence) => Some(fence),
+            None => {
+                tracing::error!("monitor admission fence unavailable; denying request");
+                return Err(BoxedResponse::new(
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "admission fence unavailable; request denied",
+                    )
+                        .into_response(),
+                ));
+            }
+        },
     };
 
     let query_target_id = request_target_id(&req);
     let mut ctx = physical_policy_context(req.headers(), resource, action, query_target_id)
         .map_err(|status| BoxedResponse::new(status.into_response()))?;
+    ctx.request_operation_id = Some(
+        astral_common::middleware::request_binding::request_operation_id(&req)
+            .map_err(|status| BoxedResponse::new(status.into_response()))?,
+    );
+    ctx.request_fingerprint = Some(
+        astral_common::middleware::request_binding::bind_http_request(&mut req)
+            .await
+            .map_err(|status| BoxedResponse::new(status.into_response()))?,
+    );
     let resolution = resolve_resource_ownership(
         &state.db,
         resource,
@@ -92,9 +132,19 @@ pub async fn monitor_permission_middleware(
     // 共享 AppConfig，与 identity/trustgraph 同一严格解析器与默认关闭语义），
     // 避免同一受管租户在不同宿主间出现 org_scope 准入 split-brain。
     // 绝不逐请求读 env。
-    let repo = SqlxRuleRepository::new(state.db.clone())
-        .with_org_scope_enabled(state.config.org_scope_enabled);
-    let decision = state.engine.evaluate(&ctx, &repo).await;
+    let repo =
+        MemoryMirroredRuleRepository::new(
+            SqlxRuleRepository::new(state.db.clone())
+                .with_org_scope_enabled(state.config.org_scope_enabled)
+                .with_authority_provider_opt(state.authorization_fence_provider.clone())
+                .with_authority_required(state.config.authority_runtime_mode.requires_authority()),
+        )
+        .with_authority_provider_opt(state.authorization_fence_provider.clone().map(|provider| {
+            provider as std::sync::Arc<dyn policy_engine::AuthorizationFenceProvider>
+        }))
+        .with_durable_refill(state.db.clone());
+    let evaluation = state.engine.evaluate_with_admission(&ctx, &repo).await;
+    let (decision, authorization_admission) = evaluation.into_parts();
 
     // 权限决策审计（MQ-first，DB fallback；故障不影响权限决策）。
     // ORG_SCOPE 判定携带 provenance 时，detail 升级为有界结构化 JSON
@@ -206,7 +256,48 @@ pub async fn monitor_permission_middleware(
         }
     }
 
-    Ok(next.run(req).await)
+    if let Some(fence) = admission_fence {
+        if !astral_db::memory_projection_hub().is_some_and(|hub| hub.authority_fence_matches(fence))
+        {
+            tracing::error!("monitor admission fence mismatch; denying request");
+            return Err(BoxedResponse::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "admission fence mismatch; request denied",
+                )
+                    .into_response(),
+            ));
+        }
+    }
+
+    let source_abort = if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        let provider = state
+            .authorization_fence_provider
+            .as_ref()
+            .ok_or_else(|| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+        let admission = authorization_admission
+            .as_ref()
+            .ok_or_else(|| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+        let abort = provider
+            .reserve_mutation_with_abort(&ctx, admission)
+            .await
+            .map_err(|_| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+        Some((provider.clone(), abort))
+    } else {
+        None
+    };
+    req.extensions_mut().insert(ctx);
+    if let Some(authorization_admission) = authorization_admission {
+        req.extensions_mut().insert(authorization_admission);
+    }
+
+    let response = next.run(req).await;
+    if let Some((provider, abort)) = source_abort {
+        if let Err(error) = provider.abort_source_reservation(&abort).await {
+            tracing::warn!(operation_id = %abort.operation_id, reservation_id = %abort.reservation_id, error = %error, "monitor post-handler source abort remains unknown; stable identity recovery required");
+        }
+    }
+    Ok(response)
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use serde::Deserialize;
 use time::{Duration, OffsetDateTime, PrimitiveDateTime};
 
 use astral_common::error::AppError;
-use astral_types::{AstralError, IdentityCard};
+use astral_types::{AstralError, AuthorizationAdmission, IdentityCard};
 
 use crate::auth::{
     derive_roles_from_action_codes, derive_roles_from_cards, hash_password, issue_access_token,
@@ -69,6 +69,12 @@ pub struct RegisterRequest {
     pub username: String,
     pub password: String,
     pub real_name: Option<String>,
+    /// 可选注册验证 proof（`/verification/verify` 签发的 durable one-shot
+    /// 凭据）。与 verificationTarget 必须成对出现；在注册用户插入的同一事务
+    /// 内 one-shot CAS 消费——无效/过期/目标不匹配 → 注册失败（fail-closed，
+    /// 绝不静默降级为无验证路径）。缺省 = 既有无验证注册路径不变。
+    pub verification_target: Option<String>,
+    pub verification_proof: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -564,8 +570,31 @@ impl AuthService {
             )));
         }
         let hash = hash_password(&req.password)?;
+        // 注册验证 proof 成对性：只给其一 → 校验错误（绝不静默丢弃证明意图，
+        // 也不把部分输入当无验证路径）。
+        let verification = match (&req.verification_target, &req.verification_proof) {
+            (Some(target), Some(proof)) => {
+                Some(crate::srv::auth_repository::RegisterVerification {
+                    target: target.as_str(),
+                    proof_token: proof.as_str(),
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(AppError::from(AstralError::Validation(
+                    "verificationTarget and verificationProof must be provided together".into(),
+                )))
+            }
+        };
         self.repository
-            .insert_register_user(&req.username, &hash, req.real_name.as_deref(), None, None)
+            .insert_register_user_verified(
+                &req.username,
+                &hash,
+                req.real_name.as_deref(),
+                None,
+                None,
+                verification,
+            )
             .await?;
         tracing::info!(username = %req.username, "user registered");
         Ok(())
@@ -600,6 +629,7 @@ impl AuthService {
         _state: &AppState,
         user_id: i64,
         req: &UpdateProfileRequest,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AppError> {
         let display_name = req.display_name.clone().or(req.real_name.clone());
         for (field, value, max_len) in [
@@ -652,6 +682,7 @@ impl AuthService {
                 req.email.as_deref(),
                 normalized_phone.as_deref(),
                 req.avatar_url.as_deref(),
+                admission,
             )
             .await?;
         tracing::info!(user_id, "profile updated");
@@ -662,6 +693,7 @@ impl AuthService {
         &self,
         user_id: i64,
         req: &ChangePasswordRequest,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AppError> {
         if req.new_password.len() < 8 {
             return Err(AppError::from(AstralError::Validation(
@@ -696,6 +728,7 @@ impl AuthService {
                 &credential.password_hash,
                 credential.credential_version,
                 &new_hash,
+                admission,
             )
             .await
             .map_err(AppError::from)?;

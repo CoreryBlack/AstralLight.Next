@@ -7,6 +7,7 @@ pub mod config;
 pub mod contract;
 pub mod cross_city_runtime;
 pub mod cross_city_signature;
+pub mod delivery;
 pub mod error;
 #[cfg(any(feature = "e3-observability", feature = "e4-observability", test))]
 pub mod experiment_observation;

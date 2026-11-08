@@ -15,6 +15,7 @@
 //! scope (legacy or no ordering key) keep NULL and the claim guard falls back
 //! to the conservative (created_at, message_id) comparison.
 
+use astral_types::AuthorizationMessageMetadata;
 use sha2::{Digest, Sha256};
 use sqlx::mysql::MySqlPool;
 use sqlx::FromRow;
@@ -87,6 +88,7 @@ pub struct LocalMessageRow {
     pub schema_version: i32,
     pub payload_json: String,
     pub headers_json: Option<String>,
+    pub authority_metadata_json: Option<String>,
     pub payload_sha256: String,
     pub status: String,
     pub attempts: i32,
@@ -112,6 +114,7 @@ pub struct LocalMessageInput<'a> {
     pub schema_version: i32,
     pub payload_json: &'a str,
     pub headers_json: Option<&'a str>,
+    pub authority_metadata_json: Option<&'a str>,
     pub payload_sha256: &'a str,
 }
 
@@ -130,6 +133,20 @@ pub struct InDoubtReconciliation<'a> {
     pub message_type: &'a str,
     pub queue_name: &'a str,
     pub payload_sha256: &'a str,
+}
+
+/// Authenticated operator capability for settling one IN_DOUBT row.
+///
+/// The database repository cannot authenticate this capability. The caller
+/// must mint it only after a PolicyEngine decision (or an equivalent protected
+/// administrative boundary) has authorized the recovery action. The repository
+/// validates shape and binds the capability to the same transaction as the
+/// audit record and state CAS; it never treats the run id as authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InDoubtRecoveryAuthorization {
+    pub operator_user_id: i64,
+    pub authorization_reference: String,
+    pub run_id: String,
 }
 
 /// Exact durable identity used by a read-only completion proof for a local
@@ -167,6 +184,29 @@ pub enum InDoubtDecision {
     Requeue,
     /// Terminal quarantine (e.g. tampered/malformed envelope proven).
     Quarantine,
+}
+
+impl InDoubtDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Requeue => "requeue",
+            Self::Quarantine => "quarantine",
+        }
+    }
+
+    fn audit_decision(self) -> &'static str {
+        match self {
+            Self::Requeue => "REQUEUE",
+            Self::Quarantine => "QUARANTINE",
+        }
+    }
+
+    fn audit_reason(self) -> &'static str {
+        match self {
+            Self::Requeue => "operator reconciled IN_DOUBT as not applied",
+            Self::Quarantine => "operator quarantined unresolved IN_DOUBT delivery",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,7 +247,7 @@ pub(crate) const SCOPE_SEQUENCE_ATTACH_SQL: &str =
 pub(crate) const CLAIM_CANDIDATES_SQL: &str =
     "SELECT message_id, operation_id, message_type, queue_name, ordering_key, tenant_id, \
             origin_region, target_region, schema_version, payload_json, headers_json, \
-            payload_sha256, status, attempts, next_attempt_at, lease_owner, \
+            authority_metadata_json, payload_sha256, status, attempts, next_attempt_at, lease_owner, \
             lease_expires_at, processed_at, last_error, created_at, updated_at \
      FROM al_message_outbox AS current_message \
      WHERE current_message.queue_name = ? \
@@ -254,7 +294,7 @@ pub(crate) const MARK_UNOWNED_PROCESSING_IN_DOUBT_SQL: &str =
 pub(crate) const IN_DOUBT_LOAD_SQL: &str =
     "SELECT message_id, operation_id, message_type, queue_name, ordering_key, tenant_id, \
             origin_region, target_region, schema_version, payload_json, headers_json, \
-            payload_sha256, status, attempts, next_attempt_at, lease_owner, \
+            authority_metadata_json, payload_sha256, status, attempts, next_attempt_at, lease_owner, \
             lease_expires_at, processed_at, last_error, created_at, updated_at \
      FROM al_message_outbox WHERE message_id = ? AND status = 'IN_DOUBT'";
 
@@ -341,7 +381,7 @@ impl LocalMessageRepository {
         let candidate = sqlx::query_as::<_, LocalMessageRow>(
             "SELECT message_id, operation_id, message_type, queue_name, ordering_key, tenant_id, \
                     origin_region, target_region, schema_version, payload_json, headers_json, \
-                    payload_sha256, status, attempts, next_attempt_at, lease_owner, \
+                    authority_metadata_json, payload_sha256, status, attempts, next_attempt_at, lease_owner, \
                     lease_expires_at, processed_at, last_error, created_at, updated_at \
              FROM al_message_outbox WHERE message_id = ? AND queue_name = ? FOR UPDATE",
         )
@@ -666,7 +706,7 @@ impl LocalMessageRepository {
         Ok(sqlx::query_as::<_, LocalMessageRow>(
             "SELECT message_id, operation_id, message_type, queue_name, ordering_key, tenant_id, \
                     origin_region, target_region, schema_version, payload_json, headers_json, \
-                    payload_sha256, status, attempts, next_attempt_at, lease_owner, \
+                    authority_metadata_json, payload_sha256, status, attempts, next_attempt_at, lease_owner, \
                     lease_expires_at, processed_at, last_error, created_at, updated_at \
              FROM al_message_outbox WHERE message_id = ?",
         )
@@ -686,6 +726,94 @@ impl LocalMessageRepository {
             .bind(message_id)
             .fetch_optional(&self.pool)
             .await?)
+    }
+
+    /// Explicit IN_DOUBT reconciliation with an authenticated operator
+    /// capability. The audit row and the outbox CAS share one transaction;
+    /// either both become durable or neither does. A DB/commit error leaves
+    /// the caller with an unknown outcome and must not be retried blindly.
+    pub async fn reconcile_in_doubt_authorized(
+        &self,
+        reconciliation: &InDoubtReconciliation<'_>,
+        decision: InDoubtDecision,
+        authorization: &InDoubtRecoveryAuthorization,
+    ) -> Result<InDoubtReconcileOutcome, LocalMessageError> {
+        validate_recovery_authorization(authorization)?;
+        let mut tx = self.pool.begin().await?;
+        let exact: Option<(String, String, String, String, String, Option<i64>)> = sqlx::query_as(
+            "SELECT operation_id, message_type, queue_name, payload_sha256, status, tenant_id \
+             FROM al_message_outbox WHERE message_id = ? FOR UPDATE",
+        )
+        .bind(reconciliation.message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((operation_id, message_type, queue_name, payload_sha256, status, tenant_id)) =
+            exact
+        else {
+            tx.rollback().await?;
+            return Ok(InDoubtReconcileOutcome::NotFound);
+        };
+        if operation_id != reconciliation.operation_id
+            || message_type != reconciliation.message_type
+            || queue_name != reconciliation.queue_name
+            || payload_sha256 != reconciliation.payload_sha256
+        {
+            tx.rollback().await?;
+            return Ok(InDoubtReconcileOutcome::ProvenanceConflict);
+        }
+        if status != IN_DOUBT_STATUS {
+            tx.rollback().await?;
+            return Ok(InDoubtReconcileOutcome::NotInDoubt);
+        }
+
+        let target_status = match decision {
+            InDoubtDecision::Requeue => PENDING_STATUS,
+            InDoubtDecision::Quarantine => QUARANTINED_STATUS,
+        };
+        let audit_detail = serde_json::to_string(&serde_json::json!({
+            "messageId": reconciliation.message_id,
+            "operationId": reconciliation.operation_id,
+            "messageType": reconciliation.message_type,
+            "queueName": reconciliation.queue_name,
+            "payloadSha256": reconciliation.payload_sha256,
+            "decision": decision.as_str(),
+            "runId": authorization.run_id,
+            "authorizationReference": authorization.authorization_reference,
+            "previousStatus": IN_DOUBT_STATUS,
+            "targetStatus": target_status,
+        }))
+        .map_err(|error| {
+            LocalMessageError::Validation(format!("recovery audit serialization failed: {error}"))
+        })?;
+        sqlx::query(
+            "INSERT INTO audit_log \
+             (user_id, action, resource, decision, reason, event_type, request_id, tenant_id, detail) \
+             VALUES (?, 'settle_in_doubt', 'al_message_outbox', ?, ?, \
+                     'MESSAGE_RECOVERY_SETTLEMENT', ?, ?, ?)",
+        )
+        .bind(authorization.operator_user_id)
+        .bind(decision.audit_decision())
+        .bind(decision.audit_reason())
+        .bind(&authorization.run_id)
+        .bind(tenant_id)
+        .bind(audit_detail)
+        .execute(&mut *tx)
+        .await?;
+
+        let result = sqlx::query(IN_DOUBT_SETTLE_SQL)
+            .bind(target_status)
+            .bind(reconciliation.message_id)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(InDoubtReconcileOutcome::NotInDoubt);
+        }
+        tx.commit().await?;
+        Ok(match decision {
+            InDoubtDecision::Requeue => InDoubtReconcileOutcome::Requeued,
+            InDoubtDecision::Quarantine => InDoubtReconcileOutcome::Quarantined,
+        })
     }
 
     /// Explicit IN_DOUBT reconciliation: exact row load under lock, full
@@ -832,8 +960,8 @@ pub async fn append_in_tx(
         "INSERT INTO al_message_outbox \
          (message_id, operation_id, message_type, queue_name, ordering_key, tenant_id, \
           origin_region, target_region, schema_version, payload_json, headers_json, \
-          payload_sha256, status, attempts) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0)",
+          authority_metadata_json, payload_sha256, status, attempts) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0)",
     )
     .bind(input.message_id)
     .bind(input.operation_id)
@@ -846,6 +974,7 @@ pub async fn append_in_tx(
     .bind(input.schema_version)
     .bind(input.payload_json)
     .bind(input.headers_json)
+    .bind(input.authority_metadata_json)
     .bind(input.payload_sha256)
     .execute(&mut **tx)
     .await;
@@ -866,11 +995,11 @@ pub async fn append_in_tx(
     };
 
     let existing = sqlx::query_as::<_, LocalMessageRow>(
-        "SELECT message_id, operation_id, message_type, queue_name, ordering_key, tenant_id, \
-                origin_region, target_region, schema_version, payload_json, headers_json, \
-                payload_sha256, status, attempts, next_attempt_at, lease_owner, \
-                lease_expires_at, processed_at, last_error, created_at, updated_at \
-         FROM al_message_outbox WHERE message_id = ? FOR UPDATE",
+            "SELECT message_id, operation_id, message_type, queue_name, ordering_key, tenant_id, \
+                    origin_region, target_region, schema_version, payload_json, headers_json, \
+                    authority_metadata_json, payload_sha256, status, attempts, next_attempt_at, lease_owner, \
+                    lease_expires_at, processed_at, last_error, created_at, updated_at \
+             FROM al_message_outbox WHERE message_id = ? FOR UPDATE",
     )
     .bind(input.message_id)
     .fetch_optional(&mut **tx)
@@ -887,7 +1016,8 @@ pub async fn append_in_tx(
                 && row.target_region.as_deref() == input.target_region
                 && row.schema_version == input.schema_version
                 && row.payload_json == input.payload_json
-                && row.headers_json.as_deref() == input.headers_json =>
+                && row.headers_json.as_deref() == input.headers_json
+                && row.authority_metadata_json.as_deref() == input.authority_metadata_json =>
         {
             // Idempotent re-append: the committed row keeps its original
             // scope_sequence; a duplicate never allocates a new one.
@@ -939,7 +1069,36 @@ pub(crate) fn scope_counter_key(queue_name: &str, ordering_key: &str) -> Option<
     Some(format!("{queue_name}{SCOPE_KEY_SEPARATOR}{ordering_key}"))
 }
 
+fn validate_authority_metadata_json(metadata_json: Option<&str>) -> Result<(), LocalMessageError> {
+    let Some(metadata_json) = metadata_json else {
+        return Ok(());
+    };
+    let metadata: AuthorizationMessageMetadata =
+        serde_json::from_str(metadata_json).map_err(|error| {
+            LocalMessageError::Validation(format!(
+                "authority_metadata_json is not valid authorization metadata: {error}"
+            ))
+        })?;
+    metadata.validate().map_err(|error| {
+        LocalMessageError::Validation(format!(
+            "authority_metadata_json failed authority validation: {error}"
+        ))
+    })?;
+    let canonical = serde_json::to_string(&metadata).map_err(|error| {
+        LocalMessageError::Validation(format!(
+            "authority_metadata_json canonical serialization failed: {error}"
+        ))
+    })?;
+    if canonical != metadata_json {
+        return Err(LocalMessageError::Validation(
+            "authority_metadata_json must use canonical serialization".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_input(input: &LocalMessageInput<'_>) -> Result<(), LocalMessageError> {
+    validate_authority_metadata_json(input.authority_metadata_json)?;
     for (name, value) in [
         ("message_id", input.message_id),
         ("operation_id", input.operation_id),
@@ -1003,6 +1162,35 @@ fn validate_input(input: &LocalMessageInput<'_>) -> Result<(), LocalMessageError
     Ok(())
 }
 
+fn validate_recovery_authorization(
+    authorization: &InDoubtRecoveryAuthorization,
+) -> Result<(), LocalMessageError> {
+    if authorization.operator_user_id <= 0 {
+        return Err(LocalMessageError::Validation(
+            "recovery operator user id must be positive".into(),
+        ));
+    }
+    validate_recovery_text(
+        "authorization reference",
+        &authorization.authorization_reference,
+        128,
+    )?;
+    validate_recovery_text("recovery run id", &authorization.run_id, 128)
+}
+
+fn validate_recovery_text(
+    field: &str,
+    value: &str,
+    max_len: usize,
+) -> Result<(), LocalMessageError> {
+    if value.trim().is_empty() || value.len() > max_len || value.chars().any(char::is_control) {
+        return Err(LocalMessageError::Validation(format!(
+            "{field} is blank, oversized, or contains control characters"
+        )));
+    }
+    Ok(())
+}
+
 fn require_one(rows_affected: u64) -> Result<(), LocalMessageError> {
     if rows_affected == 1 {
         Ok(())
@@ -1014,6 +1202,65 @@ fn require_one(rows_affected: u64) -> Result<(), LocalMessageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authority_metadata_input_requires_canonical_validated_json() {
+        let metadata = astral_types::AuthorizationMessageMetadata {
+            authorization_edition: astral_types::AUTHORIZATION_EDITION,
+            authority_id: "authority-1".into(),
+            authority_term: 4,
+            global_fence_sequence: 9,
+            key_id: "key-1".into(),
+            key_epoch: 2,
+            proof_id: "proof-1".into(),
+            scope_generation: 12,
+            revoke_watermark: 8,
+            snapshot_hash: "aa".repeat(32),
+        };
+        let metadata_json = serde_json::to_string(&metadata).unwrap();
+        let payload = serde_json::json!({"value": 1});
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&payload).unwrap())
+        );
+        let payload_json = serde_json::to_string(&payload).unwrap();
+        let base = |authority_metadata_json| LocalMessageInput {
+            message_id: "event-1",
+            operation_id: "operation-1",
+            message_type: "EVIDENCE_INVALIDATED",
+            queue_name: "astral.authorization.invalidation",
+            ordering_key: None,
+            tenant_id: Some(7),
+            origin_region: "local",
+            target_region: None,
+            schema_version: 1,
+            payload_json: &payload_json,
+            headers_json: None,
+            authority_metadata_json,
+            payload_sha256: &digest,
+        };
+
+        assert!(validate_input(&base(Some(&metadata_json))).is_ok());
+        assert!(validate_input(&base(None)).is_ok());
+
+        let noncanonical = format!(" {metadata_json} ");
+        assert!(matches!(
+            validate_input(&base(Some(noncanonical.as_str()))),
+            Err(LocalMessageError::Validation(message))
+                if message.contains("canonical serialization")
+        ));
+
+        let unknown = format!(
+            "{}{}",
+            metadata_json.trim_end_matches('}'),
+            ",\"extra\":true}"
+        );
+        assert!(matches!(
+            validate_input(&base(Some(unknown.as_str()))),
+            Err(LocalMessageError::Validation(message))
+                if message.contains("not valid authorization metadata")
+        ));
+    }
 
     #[test]
     fn input_contract_rejects_empty_and_bad_digest() {
@@ -1029,6 +1276,7 @@ mod tests {
             schema_version: 1,
             payload_json: "{}",
             headers_json: None,
+            authority_metadata_json: None,
             payload_sha256: "bad",
         };
         assert!(matches!(
@@ -1064,6 +1312,7 @@ mod tests {
                 schema_version: 1,
                 payload_json,
                 headers_json: None,
+                authority_metadata_json: None,
                 payload_sha256: digest,
             }
         }
@@ -1121,6 +1370,7 @@ mod tests {
             schema_version: 1,
             payload_json: &payload_json,
             headers_json: None,
+            authority_metadata_json: None,
             payload_sha256: envelope
                 .get("payloadSha256")
                 .and_then(serde_json::Value::as_str)

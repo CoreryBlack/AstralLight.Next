@@ -4,7 +4,7 @@
 //! 行推进到 `REPLAY_REQUESTED`，不会读取 raw body、租约 secret、AMQP properties，
 //! 也不会发布 RabbitMQ 消息。真正的 raw claim/publish 仍属于后续 worker 边界。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -14,8 +14,8 @@ use astral_common::config::MessageTransport;
 use astral_common::contract::ApiResponse;
 use astral_common::error::AppError;
 use astral_db::{
-    request_replay_with_context, AuditQuarantineMetadata, AuditQuarantineStatus,
-    ReplayAuditContext, MAX_CANONICAL_REQUEST_ID_LENGTH, MAX_LIST_LIMIT,
+    request_replay_with_admission, AuditQuarantineMetadata, AuditQuarantineStatus,
+    MAX_CANONICAL_REQUEST_ID_LENGTH, MAX_LIST_LIMIT,
 };
 use astral_types::AstralError;
 
@@ -163,6 +163,8 @@ async fn get_quarantine(
 async fn request_quarantine_replay(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(policy): Extension<astral_types::PolicyContext>,
+    Extension(admission): Extension<astral_types::AuthorizationAdmission>,
     Path(id): Path<i64>,
     _body: Option<Json<ReplayRequest>>,
 ) -> Result<Json<ApiResponse<ReplayRequestResponse>>, AppError> {
@@ -191,41 +193,22 @@ async fn request_quarantine_replay(
     validate_replay_route(&metadata)?;
 
     let operation_id = resolve_operation_id(&headers)?;
-    let actor_card_id = headers
-        .get("x-user-card-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            AppError(AstralError::Auth(
-                "verified user-card context required".into(),
-            ))
-        })?;
-    let tenant_id = headers
-        .get("x-user-card-tenant-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value > 0)
-        .ok_or_else(|| AppError(AstralError::Auth("verified tenant context required".into())))?;
-    let domain_id = headers
-        .get("x-user-card-domain-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value > 0)
-        .ok_or_else(|| AppError(AstralError::Auth("verified domain context required".into())))?;
-    let accepted = request_replay_with_context(
-        &state.db,
-        id,
-        &operation_id,
-        &operator_id.to_string(),
-        ReplayAuditContext {
-            actor_card_id: Some(actor_card_id),
-            tenant_id: Some(tenant_id),
-            domain_id: Some(domain_id),
-        },
-    )
-    .await
-    .map_err(database_error)?;
+    if policy.user_id != Some(operator_id) {
+        return Err(AppError(AstralError::Permission(
+            "replay operator does not match verified context".into(),
+        )));
+    }
+    let context = astral_db::ProtectedMutationContext::from_policy_context(
+        &policy,
+        admission,
+        Some(&operation_id),
+        "audit_quarantine",
+        "replay",
+        Some(id),
+    )?;
+    let accepted = request_replay_with_admission(&state.db, id, &context)
+        .await
+        .map_err(database_error)?;
     if !accepted {
         return Err(AppError(AstralError::Validation(
             "audit quarantine replay is not requestable in its current state or its request identity conflicts".into(),

@@ -17,7 +17,7 @@
 //! - granted_by 绑定调用者身份（从 X-User-Id 头提取）
 //! - disable 使用派生表绕过 MySQL 1093 限制（并发保护依赖 UNIQUE KEY uk_identity_global_admin_user_id）
 
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use astral_common::contract::ApiResponse;
 use astral_common::error::AppError;
-use astral_types::AstralError;
+use astral_types::{AstralError, AuthorizationAdmission};
 
 use crate::repository::global_admin_repository::{DisableOutcome, GlobalAdminRecord};
 use crate::AppState;
@@ -155,14 +155,16 @@ async fn resolve_superadmin_prerequisites(db: &sqlx::MySqlPool) -> Result<(i64, 
 async fn grant(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(body): Json<GlobalAdminOperateRequest>,
 ) -> Result<Json<ApiResponse<GlobalAdminDto>>, AppError> {
-    grant_or_enable(state, headers, body, false).await
+    grant_or_enable(state, headers, admission, body, false).await
 }
 
 async fn grant_or_enable(
     state: AppState,
     headers: HeaderMap,
+    admission: AuthorizationAdmission,
     body: GlobalAdminOperateRequest,
     enabling: bool,
 ) -> Result<Json<ApiResponse<GlobalAdminDto>>, AppError> {
@@ -180,6 +182,7 @@ async fn grant_or_enable(
             reason.as_deref(),
             template_id,
             rule_set_id,
+            admission,
         )
         .await?;
 
@@ -229,15 +232,17 @@ async fn grant_or_enable(
 async fn enable(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(body): Json<GlobalAdminOperateRequest>,
 ) -> Result<Json<ApiResponse<GlobalAdminDto>>, AppError> {
-    grant_or_enable(state, headers, body, true).await
+    grant_or_enable(state, headers, admission, body, true).await
 }
 
 /// POST /global-admins/disable — 禁用
 async fn disable(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(body): Json<GlobalAdminOperateRequest>,
 ) -> Result<Json<ApiResponse<GlobalAdminDto>>, AppError> {
     let caller_id = extract_caller_id(&headers)
@@ -260,7 +265,13 @@ async fn disable(
     // 原子保护：repository 内部封装派生表子查询 + 最后活跃回查
     let outcome = state
         .global_admin_repository
-        .disable_protected(existing.id, user_id, caller_id, reason.as_deref())
+        .disable_protected(
+            existing.id,
+            user_id,
+            caller_id,
+            reason.as_deref(),
+            admission,
+        )
         .await?;
     let revocation_status = match outcome {
         DisableOutcome::DisabledWithIntent { operation_id } => {

@@ -33,6 +33,15 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions};
 
+pub mod authority_config_completion;
+mod authority_config_source;
+pub mod authority_eligibility_completion;
+mod authority_publication;
+pub mod authority_source_bootstrap;
+pub mod authority_source_outcome;
+pub mod authority_source_runtime;
+mod authorization_admission_repository;
+mod authorization_fence_repository;
 mod authorization_projection_repository;
 mod authorization_snapshot;
 mod auxiliary_authorization_mirror;
@@ -45,6 +54,7 @@ pub mod evidence_cache;
 pub mod grant_ledger;
 mod grant_repository;
 mod integration_identity_mapping;
+pub mod invalidation_delivery;
 pub mod invalidation_inbox_repository;
 pub mod local_message_repository;
 pub mod local_projection_bus;
@@ -60,12 +70,38 @@ pub mod org_scope_repository;
 mod permission_query;
 mod projection;
 mod projection_execution;
+mod protected_mutation;
 mod quarantine;
 mod repository;
 mod resource_ownership;
 mod session_state_repository;
 mod sod_check;
+pub mod verification_durable_repository;
 
+pub use authority_config_source::{
+    read_typed_source_row_image_in_tx, read_typed_source_row_image_in_tx_typed,
+    seal_typed_source_row_capture_tx, typed_source_absent_image, TypedRowOperation,
+    TypedSourceAuditReceipt, TypedSourceReadError, TypedSourceRowCapture,
+    TypedSourceRowImageReceipt, TypedSourceRowLookup, TypedSourceTable,
+};
+pub use authority_publication::empty_card_origin::{
+    complete_empty_card_origin_in_tx, stage_empty_card_origin_in_tx,
+};
+pub use authority_publication::{
+    identity_image_digests, CardCreateRuleSetCapture, CardCreateRuleSetCaptureSpec,
+    CardCreateRuleSetReceipt, IdentityAffectedCard, IdentityPresence, IdentityReceipt,
+    IdentityStagedEvidence, IdentityTargetImage,
+};
+pub use authorization_admission_repository::consume_authorization_admission_in_tx;
+pub use authorization_fence_repository::{
+    authority_provider_from_env, diagnostic_authority_provider_from_env,
+    stage_admitted_source_outcome_in_tx, stage_admitted_source_outcome_with_coverage_in_tx,
+    validate_authorization_admission_in_tx, validate_diagnostic_admission_in_tx,
+    AuthorityFrontierIdentity, AuthorizationArbiterTrustRoot, AuthorizationTrustRoot,
+    IssuanceLeaseReconciliation, SourceAbortOutcome, SourceAbortReport, SourceReservationAbort,
+    SourceReservationAbortGateway, SqlxAuthorizationAuthorityIssuer,
+    SqlxAuthorizationFenceProvider, MAX_AUTHORITY_PROOF_WINDOW_SECONDS,
+};
 pub use authorization_projection_repository::*;
 pub use authorization_snapshot::{
     authorization_aggregate_key, capture_projection_snapshot, check_projection_snapshot_freshness,
@@ -124,8 +160,15 @@ pub use projection_execution::{
     extend_owned_delta_execution_lease, fail_owned_delta_event, load_owned_claimed_delta_event,
     load_owned_delta_completion, owned_delta_lease_is_retired, owned_execution_outcome_is_unknown,
     project_owned_authorization_delta_in_tx, quarantine_owned_delta_event,
-    release_owned_delta_event, validate_projection_owned_schema, OwnedCompletionIdentity,
-    OwnedDeltaClaim, OwnedDeltaCompletionProof, OwnedDeltaLease, OwnedStableEventOutcome,
+    reconcile_owned_delta_completion, release_owned_delta_event, validate_projection_owned_schema,
+    OwnedCompletionIdentity, OwnedCompletionReconciliation, OwnedDeltaClaim,
+    OwnedDeltaCompletionProof, OwnedDeltaLease, OwnedStableEventOutcome,
+};
+pub use protected_mutation::{
+    begin_protected_mutation_in_tx, core_evidence, fingerprint_secret,
+    finish_protected_mutation_in_tx, redact_secrets, source_commit_digest, EvidenceError,
+    ProtectedMutationContext, ProtectedMutationStart, ProtectedSourceEvidence, RowPresence,
+    SourceReceipt, TargetRowEvidence, WriteKind,
 };
 pub use quarantine::*;
 pub use repository::*;

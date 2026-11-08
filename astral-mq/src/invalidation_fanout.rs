@@ -232,6 +232,9 @@ impl CommittedInvalidationEnvelope {
 
         // Option equality preserves None == None: a field absent on both
         // sides matches, a field present only on one side diverges.
+        let authority_metadata_json = envelope
+            .authority_metadata_json()
+            .map_err(InvalidationFanoutContractError::Serialization)?;
         let mismatched_field = [
             ("messageId", envelope.message_id != row.message_id),
             ("operationId", envelope.operation_id != row.operation_id),
@@ -248,6 +251,10 @@ impl CommittedInvalidationEnvelope {
                 "payloadSha256",
                 envelope.payload_sha256 != row.payload_sha256,
             ),
+            (
+                "authorityMetadataJson",
+                authority_metadata_json != row.authority_metadata_json,
+            ),
         ]
         .into_iter()
         .find(|(_, mismatched)| *mismatched)
@@ -259,6 +266,14 @@ impl CommittedInvalidationEnvelope {
         }
 
         InvalidationEvent::from_envelope(&envelope)?;
+        let canonical_json = envelope
+            .envelope_json()
+            .map_err(InvalidationFanoutContractError::Serialization)?;
+        if canonical_json.as_bytes() != row.payload_json.as_bytes() {
+            return Err(InvalidationFanoutContractError::EnvelopeMismatch(
+                "payload_json is not the canonical envelope serialization".into(),
+            ));
+        }
         let canonical_bytes = row.payload_json.clone().into_bytes();
         Ok(Self {
             envelope,
@@ -710,6 +725,10 @@ impl InvalidationInboxAdapter for MySqlInvalidationInbox {
         let payload_json = record
             .payload_json()
             .map_err(InvalidationInboxFailure::Storage)?;
+        let authority_metadata_json = record
+            .envelope
+            .authority_metadata_json()
+            .map_err(InvalidationInboxFailure::Storage)?;
         let input = astral_db::InvalidationInboxInput {
             node_region: &record.node_region,
             node_id: &record.node_id,
@@ -721,6 +740,7 @@ impl InvalidationInboxAdapter for MySqlInvalidationInbox {
             origin_region: &record.envelope.origin_region,
             schema_version: record.envelope.schema_version,
             payload_json: &payload_json,
+            authority_metadata_json: authority_metadata_json.as_deref(),
             payload_sha256: &record.envelope.payload_sha256,
             envelope_created_at: parse_envelope_created_at(&record.envelope.created_at)?,
         };
@@ -1073,6 +1093,9 @@ mod tests {
             schema_version: envelope.schema_version,
             payload_json: payload_json.clone(),
             headers_json: None,
+            authority_metadata_json: envelope
+                .authority_metadata_json()
+                .expect("metadata serialization"),
             payload_sha256: envelope.payload_sha256.clone(),
             status: "PENDING".into(),
             attempts: 0,
@@ -1113,6 +1136,9 @@ mod tests {
             schema_version: envelope.schema_version,
             payload_json: payload_json.clone(),
             headers_json: None,
+            authority_metadata_json: envelope
+                .authority_metadata_json()
+                .expect("metadata serialization"),
             payload_sha256: envelope.payload_sha256.clone(),
             status: "PENDING".into(),
             attempts: 0,
@@ -1151,7 +1177,14 @@ mod tests {
         ));
 
         row.payload_sha256 = envelope.payload_sha256.clone();
-        row.payload_json = row.payload_json.replace("\"createdAt\"", "\"createdAtX\"");
+        row.payload_json = serde_json::to_string_pretty(&envelope).unwrap();
+        assert!(matches!(
+            CommittedInvalidationEnvelope::from_durable_row(&row),
+            Err(InvalidationFanoutContractError::EnvelopeMismatch(reason))
+                if reason.contains("canonical envelope serialization")
+        ));
+
+        row.payload_json = row.payload_json.replace("createdAt", "createdAtX");
         assert!(
             CommittedInvalidationEnvelope::from_durable_row(&row).is_err(),
             "a row whose payload no longer parses as a valid envelope must be rejected"

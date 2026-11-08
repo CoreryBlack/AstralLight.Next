@@ -179,6 +179,7 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 - source transaction 只覆盖必要的 source、durable correlation/outbox 和 audit correlation 写入；不得把网络、MQ、缓存操作、快照构建、重试、安装或验收放进事务。提交后由 projector/worker 处理 durable projection、进程内缓存失效、消息和审计。缓存有界 TTL/容量；缓存失败、过期或不一致不得绕过 strict DB read gate。
 - `CARD` refresh 与 `ELIGIBILITY` cache eviction 是不同语义，必须分别记录、分别失效和分别验证，不得用一个事件代替另一个。
 - 正式授权路径必须同时满足 generation、dependency、`READY` 和 read-gate；任一不足、unknown、failed 或 stale 时只能 `PENDING`/`DENY`，禁止使用旧快照、source/raw 读取或缓存回退放行，不得以 ACK 代替 durable proof。
+- V7 authority 合同以 [Rust 规范 §15.9](Docs/规范/Rust后端编码规范_V1.0.md#159-v7-authority-生产协议与采用合同2026-11-07) 为准：全局 quorum、逐 scope 证书和每次 F0/F1 proof 分开；业务数据库不得独立发号，敏感 source 提交要求全局 reservation 与同事务 durable admission-use。未决提交不能因 lease 过期而重放或恢复 ALLOW；资格/配置的独立完成与已证明 rollback 的 abort 必须遵循该节的精确 durable 证据、同事务排他及历史 receipt 恢复合同，不以伪造 delta、旧 snapshot 或 HTTP 状态关闭 barrier；规范登记不代表实现或环境验收已通过。
 - CURRENT V6 不接受 native `CARD_ONLY` 输入；保留 `MANUAL`/direct-delta 的明示语义。不得自动改写旧 source 数据；如需迁移，必须使用单独批准的 offline preflight/rebuild，并保留 revoke/fence 与审计事实。正式授权仍必须经过 `PolicyEngine.evaluate()` 与 published-evidence strict gate。
 
 ### 3.3 规则、资源与路径
@@ -295,7 +296,7 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 | 规则集完整结构、命令/读视图与轻量发布栅栏 | [`Rust后端编码规范_V1.0.md` §15.7](Docs/规范/Rust后端编码规范_V1.0.md#157-规则集完整结构与轻量发布栅栏标准2026-10-28) |
 | 规则模式与权限模型 | [`Docs/架构/Rust架构设计/Rust权限判定与规则集语义_V1.0.md`](Docs/架构/Rust架构设计/Rust权限判定与规则集语义_V1.0.md) |
 | 规则模型分析与规则集 DDL | [`Docs/sql/full_schema_v4.sql`](Docs/sql/full_schema_v4.sql) 与 Rust 架构文档 |
-| 分布式授权集群测试 | 测试源码与 harness 已公开于 [`Docs/实验/分布式测试/`](Docs/实验/分布式测试/) 和 [`Docs/authorization-validation/`](Docs/authorization-validation/)；历史报告/JSON/证据归档已继承并脱敏，节点路由、二进制和部署状态未继承，真实三节点集成需受保护环境、审批和状态证据。 |
+| 分布式授权集群测试 | 测试源码与 harness 已公开于 [`Docs/实验/分布式测试/`](Docs/实验/分布式测试/) 和 [`Docs/authorization-validation/`](Docs/authorization-validation/)；历史三节点报告/JSON/证据归档已继承并脱敏，节点路由、二进制和部署状态未继承；当前 S15 采用四服务器两半区测试 profile（AL1/AL2→DB1、AL3/AL4→DB2），同库自研通道与跨库 RabbitMQ 的真实部署仍需受保护环境、审批和状态证据。 |
 
 ---
 

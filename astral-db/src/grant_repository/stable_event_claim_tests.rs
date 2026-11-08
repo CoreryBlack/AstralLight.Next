@@ -174,8 +174,8 @@ fn binding_rejects_every_drifting_field() {
 #[test]
 fn matching_old_or_future_receipt_and_row_still_fail_closed() {
     for compiler in [
-        "astral-authorization-v5",
-        "astral-authorization-v7",
+        "astral-authorization-v6",
+        "astral-authorization-v8",
         "foreign-v6",
     ] {
         let mut request = request();

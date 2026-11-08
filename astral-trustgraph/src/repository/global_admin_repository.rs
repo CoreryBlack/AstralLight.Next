@@ -44,16 +44,18 @@
 //!   撤销敏感的管理边界状态）。
 
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+
+use astral_db::invalidation_delivery::InvalidationDeliveryContext;
 
 use async_trait::async_trait;
 use sqlx::MySqlPool;
 
 use astral_types::{
-    AstralError, DependencyVector, DependencyVersion, GrantContractError, GrantDelta,
-    GrantEvidence, GrantState, ProjectionAggregate, EVENT_TYPE_REVOKE, EVENT_TYPE_RULE_SET_UPDATE,
-    SYSTEM_ACTOR_ID,
+    AstralError, AuthorizationAdmission, DependencyVector, DependencyVersion, GrantContractError,
+    GrantDelta, GrantEvidence, GrantState, ProjectionAggregate, EVENT_TYPE_REVOKE,
+    EVENT_TYPE_RULE_SET_UPDATE, SYSTEM_ACTOR_ID,
 };
 use policy_engine::COMPILER_VERSION;
 
@@ -61,7 +63,9 @@ use crate::repository::audit_log_repository::{
     insert_rule_set_projection_audit_in_tx, RuleSetProjectionAuditEntry,
 };
 use crate::repository::authorization_source_transaction::{
-    append_eligibility_projection_with_invalidation_in_tx, AuthorizationSourceTransaction,
+    append_eligibility_projection_with_invalidation_in_tx,
+    begin_source_transaction_with_capability_and_optional_delivery_context,
+    AuthorizationSourceTransaction, SourceMutationCapability,
 };
 use crate::repository::grant_ledger_adapter::{
     append_ruleset_grant_delta_in_tx, build_ruleset_add_draft, build_ruleset_remove_draft,
@@ -1106,6 +1110,7 @@ pub trait GlobalAdminRepository: Send + Sync {
         reason: Option<&str>,
         template_id: i64,
         rule_set_id: i64,
+        admission: AuthorizationAdmission,
     ) -> Result<GlobalAdminGrantOutcome, AstralError>;
     /// 原子禁用：仅当该用户为 ACTIVE 且库中存在其他 ACTIVE 管理员时成功。
     /// 受影响的 SUPER_ADMIN 卡 `__SUPERADMIN__` BASE 账本贡献必须在提交前获得
@@ -1116,16 +1121,31 @@ pub trait GlobalAdminRepository: Send + Sync {
         user_id: i64,
         granted_by: i64,
         reason: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<DisableOutcome, AstralError>;
 }
 
 pub struct SqlxGlobalAdminRepository {
     db: MySqlPool,
+    delivery_context: Option<Arc<InvalidationDeliveryContext>>,
 }
 
 impl SqlxGlobalAdminRepository {
     pub fn new(db: MySqlPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            delivery_context: None,
+        }
+    }
+
+    pub fn new_with_delivery_context(
+        db: MySqlPool,
+        delivery_context: Arc<InvalidationDeliveryContext>,
+    ) -> Self {
+        Self {
+            db,
+            delivery_context: Some(delivery_context),
+        }
     }
 }
 
@@ -1210,8 +1230,15 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
         reason: Option<&str>,
         template_id: i64,
         rule_set_id: i64,
+        admission: AuthorizationAdmission,
     ) -> Result<GlobalAdminGrantOutcome, AstralError> {
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let capability = SourceMutationCapability::user(admission);
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )
+        .await?;
 
         let template_scope: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
             "SELECT domain_id, tenant_id FROM user_card_template \
@@ -1575,8 +1602,15 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
         user_id: i64,
         granted_by: i64,
         reason: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<DisableOutcome, AstralError> {
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let capability = SourceMutationCapability::user(admission);
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )
+        .await?;
         // 锁定全部活跃管理员行（对齐 Java `IdentityGlobalAdminMapper.selectActiveForUpdate()`）。
         // FOR UPDATE 是当前读：并发 disable A/B 时，后到事务阻塞在先到事务提交后重读最新
         // 状态，消除原 EXISTS 派生表快照读的 TOCTOU（双方各见对方活跃 → 双双通过 → 零活跃）。

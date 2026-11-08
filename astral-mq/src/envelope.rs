@@ -4,6 +4,7 @@
 //! stay outside this type. The envelope carries the fields needed to validate
 //! scope, deduplicate effects, and reconcile an unknown transport result.
 
+use astral_types::AuthorizationMessageMetadata;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -24,6 +25,11 @@ pub struct MessageEnvelope {
     pub created_at: String,
     pub expires_at: Option<String>,
     pub payload_sha256: String,
+    /// Verified authority provenance, when this message is bound to an
+    /// authorization proof. This is independent of the business payload and
+    /// never derived from transport liveness or broker acknowledgements.
+    #[serde(default)]
+    pub authority_metadata: Option<AuthorizationMessageMetadata>,
     pub payload: Value,
 }
 
@@ -50,8 +56,21 @@ impl MessageEnvelope {
             created_at: astral_mq_timestamp(),
             expires_at: None,
             payload_sha256,
+            authority_metadata: None,
             payload,
         })
+    }
+
+    /// Attach provenance projected from a proof that has already passed the
+    /// authority contract. This method performs no local-state lookup.
+    pub fn with_authority_metadata(
+        mut self,
+        metadata: AuthorizationMessageMetadata,
+    ) -> Result<Self, String> {
+        metadata.validate().map_err(|error| error.to_string())?;
+        self.authority_metadata = Some(metadata);
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -77,10 +96,21 @@ impl MessageEnvelope {
                 return Err("targetRegion must not be blank when present".into());
             }
         }
+        if let Some(metadata) = &self.authority_metadata {
+            metadata.validate().map_err(|error| error.to_string())?;
+        }
         if self.payload_sha256 != payload_digest(&self.payload)? {
             return Err("payload digest mismatch".into());
         }
         Ok(())
+    }
+
+    /// Serialize the independent durable authority provenance column.
+    pub fn authority_metadata_json(&self) -> Result<Option<String>, String> {
+        self.authority_metadata
+            .as_ref()
+            .map(|metadata| serde_json::to_string(metadata).map_err(|error| error.to_string()))
+            .transpose()
     }
 
     pub fn payload_json(&self) -> Result<String, String> {
@@ -162,6 +192,53 @@ mod tests {
             envelope.envelope_json().unwrap(),
             envelope.payload_json().unwrap()
         );
+    }
+
+    #[test]
+    fn envelope_preserves_independent_authority_metadata() {
+        let metadata = AuthorizationMessageMetadata {
+            authorization_edition: astral_types::AUTHORIZATION_EDITION,
+            authority_id: "authority-1".into(),
+            authority_term: 4,
+            global_fence_sequence: 9,
+            key_id: "key-1".into(),
+            key_epoch: 2,
+            proof_id: "proof-1".into(),
+            scope_generation: 12,
+            revoke_watermark: 8,
+            snapshot_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+        };
+        let envelope = MessageEnvelope::new(
+            "message-1",
+            "operation-1",
+            "EVIDENCE_INVALIDATED",
+            1,
+            "local",
+            json!({"tenantId": 7}),
+        )
+        .unwrap()
+        .with_authority_metadata(metadata.clone())
+        .unwrap();
+
+        assert_eq!(
+            envelope.authority_metadata_json().unwrap(),
+            Some(serde_json::to_string(&metadata).unwrap())
+        );
+        assert_eq!(
+            envelope.payload_sha256,
+            payload_digest(&json!({"tenantId": 7})).unwrap()
+        );
+        assert!(envelope
+            .envelope_json()
+            .unwrap()
+            .contains("authorityMetadata"));
+    }
+
+    #[test]
+    fn envelope_rejects_unknown_authority_metadata_fields() {
+        let json = r#"{"authorizationEdition":1,"authorityId":"authority-1","authorityTerm":4,"globalFenceSequence":9,"keyId":"key-1","keyEpoch":2,"proofId":"proof-1","scopeGeneration":12,"revokeWatermark":8,"snapshotHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","extra":true}"#;
+        assert!(serde_json::from_str::<AuthorizationMessageMetadata>(json).is_err());
     }
 
     #[test]

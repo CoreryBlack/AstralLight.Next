@@ -14,7 +14,9 @@
 > aggregate completion 必须先按完整 receipt/evidence 对账。
 
 把 `AuthorizationProjectionThreeNodeIntegrationTest` 从"同一 JVM 三 context + Testcontainers"升级为**真实的分布式架构测试**：
-三个独立的 TrustGraph 进程（真实网络、真实共享 MySQL/Redis/RabbitMQ、真实消息投递）作为节点，测试协调器通过 HTTP 控制平面驱动场景。
+## 当前 S15 四服务器两半区 profile
+
+当前 S15 不再使用本目录历史三节点共享 MySQL/Redis/Rabbit 部署作为验收入口。本次测试固定为两个半区：`AL1`、`AL2` 配对 `DB1`，`AL3`、`AL4` 配对 `DB2`。同库两台服务器之间只允许待实现的 `custom_same_db_channel`；跨库消息只允许 RabbitMQ durable outbox/inbox。现有 `LocalBus`/`LocalProjectionBus` 是进程内通道，不能满足同库跨机要求；历史 `deploy_dist.sh`、`s15_coordinator.py` 和 Redis 故障场景仅作 compatibility 复现。四节点部署、同库自研通道、半区 fence/接管和分区控制尚未形成可执行批准协议，当前 S15 live campaign 保持 `BLOCKED`。
 
 ## 一致性声明（security-preserving eventual consistency）
 

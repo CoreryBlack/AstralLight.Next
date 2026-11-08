@@ -1,11 +1,17 @@
 //! Strict V6 authorization repository and physical-card validation bridge.
 
+use std::sync::Arc;
+
 use astral_types::org_scope::OrgAdmissionResult;
-use astral_types::{PolicyContext, PublishedCardAuthorization, PublishedCardEvidenceScope};
-use policy_engine::{OrgAuthorityRead, RuleRepository};
+use astral_types::{
+    AuthorizationFenceProof, CertifiedAuthorizationState, PolicyContext,
+    PublishedCardAuthorization, PublishedCardEvidenceScope,
+};
+use policy_engine::{AuthorizationFenceProvider, OrgAuthorityRead, RuleRepository};
 use sqlx::MySqlPool;
 use time::OffsetDateTime;
 
+use crate::authorization_fence_repository::SqlxAuthorizationFenceProvider;
 use crate::eligibility::CardEligibilityService;
 use crate::org_scope_repository::{
     probe_org_scope_gate, OrgAdmissionQuery, OrgScopeGateState, OrgScopeRepository,
@@ -18,6 +24,13 @@ pub struct SqlxRuleRepository {
     /// Default-off ORG_SCOPE admission switch, frozen by the process that constructs
     /// this repository. A managed tenant remains fail-closed when this is false.
     org_scope_enabled: bool,
+    /// Optional authority proof adapter. None keeps the durable evidence read
+    /// mode, but Strict readiness still rejects positive authorization until a
+    /// verified provider is present.
+    authority_provider: Option<Arc<SqlxAuthorizationFenceProvider>>,
+    /// Strict deployments cannot silently turn a missing authority provider into
+    /// a positive durable-only authorization result.
+    authority_required: bool,
 }
 
 impl SqlxRuleRepository {
@@ -31,7 +44,16 @@ impl SqlxRuleRepository {
         Self {
             pool,
             org_scope_enabled: false,
+            authority_provider: None,
+            authority_required: true,
         }
+    }
+
+    /// Freeze whether this repository requires a verified external authority
+    /// provider before positive authorization can be returned.
+    pub fn with_authority_required(mut self, required: bool) -> Self {
+        self.authority_required = required;
+        self
     }
 
     /// Freezes the deployment-approved ORG_SCOPE admission state into this
@@ -42,7 +64,30 @@ impl SqlxRuleRepository {
         self
     }
 
-    /// 从环境变量 `DATABASE_URL` 创建连接池
+    /// Explicitly inject the verifier for the externally issued global authority
+    /// proof. This does not create an issuer and is intentionally absent from
+    /// `new`, so certified memory remains opt-in.
+    pub fn with_authority_provider(
+        mut self,
+        provider: Arc<SqlxAuthorizationFenceProvider>,
+    ) -> Self {
+        self.authority_provider = Some(provider);
+        self
+    }
+
+    /// Optional runtime wiring for the explicitly selected durable-only
+    /// compatibility mode. In Strict mode, `None` remains not-ready for
+    /// positive authorization; this setter does not create a provider.
+    pub fn with_authority_provider_opt(
+        self,
+        provider: Option<Arc<SqlxAuthorizationFenceProvider>>,
+    ) -> Self {
+        match provider {
+            Some(provider) => self.with_authority_provider(provider),
+            None => self,
+        }
+    }
+
     pub async fn from_env() -> Result<Self, sqlx::Error> {
         let url = std::env::var("DATABASE_URL").map_err(|_| {
             sqlx::Error::Configuration(Box::new(std::io::Error::new(
@@ -260,7 +305,84 @@ impl RuleRepository for SqlxRuleRepository {
             })
     }
 
-    /// Loads one complete, strictly verified V6 card-evidence object.
+    fn published_evidence_read_mode(&self) -> policy_engine::PublishedEvidenceReadMode {
+        self.authority_provider.as_ref().map_or(
+            policy_engine::PublishedEvidenceReadMode::DurableOnly,
+            |_| policy_engine::PublishedEvidenceReadMode::CertifiedMemory,
+        )
+    }
+
+    fn positive_authorization_ready(&self) -> bool {
+        if !self.authority_required {
+            return true;
+        }
+        self.authority_provider.is_some()
+            && crate::memory_projection_hub::memory_projection_hub()
+                .is_some_and(|hub| hub.positive_authorization_ready())
+    }
+
+    async fn read_authorization_fence(
+        &self,
+        scope: &PublishedCardEvidenceScope,
+        request_nonce: &str,
+    ) -> Result<AuthorizationFenceProof, astral_types::PolicyError> {
+        let Some(provider) = &self.authority_provider else {
+            return Err(astral_types::PolicyError::Repository(
+                "global authorization fence provider is unavailable".to_owned(),
+            ));
+        };
+        provider
+            .read_authorization_fence(scope, request_nonce)
+            .await
+    }
+
+    async fn read_request_authorization_fence(
+        &self,
+        context: &PolicyContext,
+        scope: &PublishedCardEvidenceScope,
+        request_nonce: &str,
+    ) -> Result<AuthorizationFenceProof, astral_types::PolicyError> {
+        let provider = self.authority_provider.as_ref().ok_or_else(|| {
+            astral_types::PolicyError::Repository(
+                "request authority provider is unavailable".into(),
+            )
+        })?;
+        provider
+            .read_request_authorization_fence(context, scope, request_nonce)
+            .await
+    }
+
+    async fn read_org_authorization_fence(
+        &self,
+        context: &PolicyContext,
+        evidence: &astral_types::org_scope::OrgAdmissionEvidence,
+        request_nonce: &str,
+    ) -> Result<AuthorizationFenceProof, astral_types::PolicyError> {
+        let provider = self.authority_provider.as_ref().ok_or_else(|| {
+            astral_types::PolicyError::Repository(
+                "organization authorization fence provider is unavailable".to_owned(),
+            )
+        })?;
+        provider
+            .read_org_authorization_fence(context, evidence, request_nonce)
+            .await
+    }
+
+    fn certify_authorization_evidence(
+        &self,
+        proof: AuthorizationFenceProof,
+        evidence: Arc<PublishedCardAuthorization>,
+        scope: &PublishedCardEvidenceScope,
+        now_seconds: i64,
+    ) -> Result<CertifiedAuthorizationState, astral_types::PolicyError> {
+        let Some(provider) = &self.authority_provider else {
+            return Err(astral_types::PolicyError::Repository(
+                "authorization evidence certifier is unavailable".to_owned(),
+            ));
+        };
+        provider.certify_authorization_evidence(proof, evidence, scope, now_seconds)
+    }
+
     async fn load_published_card_authorization(
         &self,
         scope: &PublishedCardEvidenceScope,
@@ -278,6 +400,29 @@ impl RuleRepository for SqlxRuleRepository {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn strict_repository_with_missing_provider_cannot_serve_positive_authorization() {
+        let pool = MySqlPool::connect_lazy("mysql://unused@localhost/unused").unwrap();
+        let repository = SqlxRuleRepository::new(pool);
+
+        assert_eq!(
+            RuleRepository::published_evidence_read_mode(&repository),
+            policy_engine::PublishedEvidenceReadMode::DurableOnly
+        );
+        assert!(!RuleRepository::positive_authorization_ready(&repository));
+    }
+
+    #[tokio::test]
+    async fn durable_only_readiness_requires_explicit_opt_in() {
+        let pool = MySqlPool::connect_lazy("mysql://unused@localhost/unused").unwrap();
+        let repository = SqlxRuleRepository::new(pool).with_authority_required(false);
+
+        assert_eq!(
+            RuleRepository::published_evidence_read_mode(&repository),
+            policy_engine::PublishedEvidenceReadMode::DurableOnly
+        );
+        assert!(RuleRepository::positive_authorization_ready(&repository));
+    }
     #[test]
     fn published_card_evidence_errors_map_to_explicit_policy_errors() {
         use crate::authorization_projection_repository::AuthorizationEvidenceError;

@@ -3,7 +3,7 @@
 //! 支持 TOTP（RFC 6238）和恢复码两种方式。
 //! 所有数据持久化到 DB，暴力破解防护通过 mfa_attempt_log 计数实现。
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -19,7 +19,7 @@ use astral_db::{
     count_recent_mfa_failures, find_enabled_mfa_for_user, reserve_mfa_attempt,
     resolve_mfa_attempt_for_actor,
 };
-use astral_types::AstralError;
+use astral_types::{AstralError, AuthorizationAdmission, AuthorizationDomainScope};
 use sqlx::{MySql, Transaction};
 
 use crate::AppState;
@@ -458,10 +458,18 @@ struct MfaMutationContext {
     tenant_id: i64,
     domain_id: i64,
     operation_id: String,
+    /// Proof-bound capability produced by the same request's certified F1 ALLOW
+    /// (inserted into request extensions by the permission middleware). Required
+    /// for every MFA management mutation; consumed exactly once inside the
+    /// source transaction before the commit fence is armed.
+    admission: AuthorizationAdmission,
 }
 
 impl MfaMutationContext {
-    fn from_headers(headers: &HeaderMap) -> Result<Self, AppError> {
+    fn from_headers(
+        headers: &HeaderMap,
+        admission: AuthorizationAdmission,
+    ) -> Result<Self, AppError> {
         let positive_id = |name| {
             headers
                 .get(name)
@@ -497,7 +505,37 @@ impl MfaMutationContext {
             tenant_id: positive_id("x-user-card-tenant-id")?,
             domain_id: positive_id("x-user-card-domain-id")?,
             operation_id,
+            admission,
         })
+    }
+
+    fn admission(&self) -> &AuthorizationAdmission {
+        &self.admission
+    }
+
+    /// Bind the carried admission's proof scope to the MFA actor identity that
+    /// the in-transaction pair lock just verified against
+    /// platform_user/identity_card/user_card/tenant/tenant_domain_map. An MFA
+    /// mutation always carries a concrete user-card domain, so an unconstrained
+    /// (`Any`) or domain-less (`NoDomain`) proof scope can never authorize it —
+    /// same strict binding as the org/tenant mutation context.
+    fn verify_admission_scope(&self) -> Result<(), AppError> {
+        let scope = &self.admission.proof().scope;
+        let domain_matches = matches!(
+            scope.domain,
+            AuthorizationDomainScope::Exact(domain_id) if domain_id == self.domain_id
+        );
+        if scope.card_id != self.card_id
+            || scope.tenant_id != self.tenant_id
+            || scope.user_id != Some(self.user_id)
+            || !domain_matches
+        {
+            return Err(AstralError::Permission(
+                "authorization admission scope does not match the locked MFA actor card".into(),
+            )
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -610,6 +648,13 @@ async fn mutate_mfa(
     if pair != Some((context.card_id,)) {
         return Err(AstralError::Auth("MFA actor card pair is no longer active".into()).into());
     }
+    // Admission binding happens only after credential, identity_card, user_card
+    // and tenant/domain rows are locked and verified: the proof scope must match
+    // the locked actor rows, and the caller-card lock re-checks the durable
+    // user_card row against the admission scope (canonical user_card lock order).
+    context.verify_admission_scope()?;
+    crate::srv::source_writer_guard::validate_admission_caller_card(&mut tx, context.admission())
+        .await?;
     let rows = sqlx::query_as::<_, astral_db::UserMfaRow>(
         "SELECT id, user_id, mfa_type, secret_enc, phone, email, is_enabled, is_primary, \
          backup_codes_hash, backup_codes_used, verified_at, last_used_at, last_totp_counter \
@@ -746,6 +791,11 @@ async fn mutate_mfa(
     .execute(&mut *tx)
     .await
     .map_err(|error| AstralError::Database(format!("Write MFA mutation audit failed: {error}")))?;
+    // COMMIT await 前：durable authority 复核 + admission 一次性消费（校验失败
+    // 不消费，事务回滚零写入；消费后失败随事务回滚，重试需新 admission），
+    // 消费必须先于 arm_commit_fence。
+    crate::srv::source_writer_guard::validate_and_consume_admission(&mut tx, context.admission())
+        .await?;
     crate::srv::source_writer_guard::arm_commit_fence(&source_guard);
     tx.commit()
         .await
@@ -816,9 +866,10 @@ async fn get_mfa_status(
 async fn enable_mfa(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<EnableMfaRequest>,
 ) -> Result<Json<ApiResponse<MfaConfig>>, AppError> {
-    let context = MfaMutationContext::from_headers(&headers)?;
+    let context = MfaMutationContext::from_headers(&headers, admission)?;
     if !matches!(req.method.as_str(), "RECOVERY_CODES" | "TOTP") {
         return Err(AstralError::Validation("method must be TOTP or RECOVERY_CODES".into()).into());
     }
@@ -865,9 +916,10 @@ async fn enable_mfa(
 async fn disable_mfa(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<DisableMfaRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    let context = MfaMutationContext::from_headers(&headers)?;
+    let context = MfaMutationContext::from_headers(&headers, admission)?;
     let method = req.method.as_deref().unwrap_or("ALL");
     if !matches!(method, "ALL" | "TOTP" | "RECOVERY_CODES") {
         return Err(
@@ -909,9 +961,10 @@ struct DisableMfaRequest {
 async fn verify_mfa(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<VerifyMfaRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    let context = MfaMutationContext::from_headers(&headers)?;
+    let context = MfaMutationContext::from_headers(&headers, admission)?;
     let method = req.method.as_deref().unwrap_or("TOTP");
     if !matches!(method, "TOTP" | "RECOVERY_CODES") {
         return Err(AstralError::Validation("method must be TOTP or RECOVERY_CODES".into()).into());
@@ -957,9 +1010,10 @@ struct RegenerateRecoveryCodesRequest {
 async fn regenerate_recovery_codes(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<RegenerateRecoveryCodesRequest>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, AppError> {
-    let context = MfaMutationContext::from_headers(&headers)?;
+    let context = MfaMutationContext::from_headers(&headers, admission)?;
     let credential = verify_management_password(&state.db, context.user_id, &req.password).await?;
     let (plain_codes, hashes) = generate_recovery_codes();
     if !mutate_mfa(
@@ -984,6 +1038,67 @@ async fn regenerate_recovery_codes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 结构合法的 fixture admission（`from_verified_proof` 只做结构校验，与
+    /// org_repository / user_service 测试同做法；不做任何 IO、不校验签名）。
+    fn structural_admission(
+        scope: astral_types::AuthorizationAuthorityScope,
+    ) -> AuthorizationAdmission {
+        AuthorizationAdmission::from_verified_proof(astral_types::AuthorizationFenceProof {
+            authorization_edition: astral_types::AUTHORIZATION_EDITION,
+            authority_id: "authority-a".to_owned(),
+            authority_term: 1,
+            global_fence_sequence: 2,
+            scope,
+            scope_generation: 2,
+            revoke_watermark: 1,
+            snapshot_hash: "ab".repeat(32),
+            parent_hash: None,
+            operation_id: "operation-1".to_owned(),
+            event_id: "event-1".to_owned(),
+            key_id: "key-1".to_owned(),
+            key_epoch: 1,
+            issued_at: 100,
+            not_before: 99,
+            expires_at: 110,
+            request_nonce: "nonce-1".to_owned(),
+            request_binding_digest: None,
+            scope_certificate_hash: None,
+            proof_id: "proof-1".to_owned(),
+            signature: "00".repeat(64),
+        })
+        .expect("structural fixture proof")
+    }
+
+    fn fixture_mfa_scope(
+        user_id: i64,
+        card_id: i64,
+        tenant_id: i64,
+        domain_id: i64,
+    ) -> astral_types::AuthorizationAuthorityScope {
+        astral_types::AuthorizationAuthorityScope {
+            tenant_id,
+            card_id,
+            user_id: Some(user_id),
+            domain: AuthorizationDomainScope::Exact(domain_id),
+        }
+    }
+
+    fn management_fixture_context(admission: AuthorizationAdmission) -> MfaMutationContext {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-principal-kind", "PLATFORM_USER"),
+            ("x-user-id", "42"),
+            ("x-identity-card-id", "100"),
+            ("x-user-card-id", "101"),
+            ("x-user-card-tenant-id", "7"),
+            ("x-user-card-domain-id", "8"),
+            ("x-request-id", "mfa-request-42"),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+        MfaMutationContext::from_headers(&headers, admission).expect("verified fixture context")
+    }
 
     #[test]
     fn factor_sql_has_no_literal_line_continuations() {
@@ -1036,7 +1151,11 @@ mod tests {
     #[test]
     fn management_context_requires_platform_pair_and_request_identity() {
         let mut headers = HeaderMap::new();
-        assert!(MfaMutationContext::from_headers(&headers).is_err());
+        assert!(MfaMutationContext::from_headers(
+            &headers,
+            structural_admission(fixture_mfa_scope(42, 101, 7, 8))
+        )
+        .is_err());
         for (name, value) in [
             ("x-principal-kind", "PLATFORM_USER"),
             ("x-user-id", "42"),
@@ -1048,15 +1167,182 @@ mod tests {
         ] {
             headers.insert(name, value.parse().unwrap());
         }
-        assert!(MfaMutationContext::from_headers(&headers).is_ok());
+        assert!(MfaMutationContext::from_headers(
+            &headers,
+            structural_admission(fixture_mfa_scope(42, 101, 7, 8))
+        )
+        .is_ok());
         headers.remove("x-request-id");
-        assert!(MfaMutationContext::from_headers(&headers).is_err());
+        assert!(MfaMutationContext::from_headers(
+            &headers,
+            structural_admission(fixture_mfa_scope(42, 101, 7, 8))
+        )
+        .is_err());
         headers.insert("x-request-id", "mfa-request-42".parse().unwrap());
         headers.insert("x-user-card-tenant-id", "0".parse().unwrap());
-        assert!(MfaMutationContext::from_headers(&headers).is_err());
+        assert!(MfaMutationContext::from_headers(
+            &headers,
+            structural_admission(fixture_mfa_scope(42, 101, 7, 8))
+        )
+        .is_err());
         headers.insert("x-user-card-tenant-id", "7".parse().unwrap());
         headers.insert("x-principal-kind", "APP_USER".parse().unwrap());
-        assert!(MfaMutationContext::from_headers(&headers).is_err());
+        assert!(MfaMutationContext::from_headers(
+            &headers,
+            structural_admission(fixture_mfa_scope(42, 101, 7, 8))
+        )
+        .is_err());
+    }
+
+    /// admission 不丢失：四个 MFA 管理 handler 全部必选提取（缺失即请求被
+    /// axum 拒绝，绝不静默丢弃 middleware admission）并转发进 mutation context。
+    #[test]
+    fn mfa_mutation_handlers_require_and_forward_request_admission() {
+        let source = include_str!("mfa.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !source.contains("Option<Extension<AuthorizationAdmission>>"),
+            "MFA management mutations must never treat the admission as optional"
+        );
+        for (handler, next_anchor) in [
+            ("async fn enable_mfa(", Some("async fn disable_mfa(")),
+            (
+                "async fn disable_mfa(",
+                Some("#[derive(Debug, Deserialize)]"),
+            ),
+            (
+                "async fn verify_mfa(",
+                Some("#[derive(Debug, Deserialize)]"),
+            ),
+            // regenerate_recovery_codes 是测试模块前的最后一个 handler。
+            ("async fn regenerate_recovery_codes(", None),
+        ] {
+            let start = source
+                .find(handler)
+                .unwrap_or_else(|| panic!("{handler} handler must stay in mfa.rs"));
+            let end = next_anchor
+                .and_then(|anchor| source[start..].find(anchor))
+                .unwrap_or(source.len() - start);
+            let body = &source[start..start + end];
+            assert!(
+                body.contains("Extension(admission): Extension<AuthorizationAdmission>"),
+                "{handler} must keep the required admission extraction"
+            );
+            assert!(
+                body.contains("MfaMutationContext::from_headers(&headers, admission)"),
+                "{handler} must forward the admission into the mutation context"
+            );
+        }
+    }
+
+    /// proof scope user/card/tenant/domain 必须与锁定行一致：scope 与锁定
+    /// actor 身份完全一致（card/tenant/user + Exact domain）才放行；任一不符
+    /// 以及 Any/NoDomain 松 scope 一律 fail-closed（Permission）。
+    #[test]
+    fn mfa_admission_scope_binds_only_to_the_locked_actor_card() {
+        let context =
+            management_fixture_context(structural_admission(fixture_mfa_scope(42, 101, 7, 8)));
+        assert!(context.verify_admission_scope().is_ok());
+
+        let wrong_scopes = [
+            fixture_mfa_scope(43, 101, 7, 8),
+            fixture_mfa_scope(42, 102, 7, 8),
+            fixture_mfa_scope(42, 101, 9, 8),
+            fixture_mfa_scope(42, 101, 7, 11),
+        ];
+        for scope in wrong_scopes {
+            let context = management_fixture_context(structural_admission(scope));
+            let error = context
+                .verify_admission_scope()
+                .expect_err("a mismatched admission must fail closed");
+            assert!(
+                matches!(error.0, AstralError::Permission(_)),
+                "scope mismatch is a permission error, not a fallback: {error}"
+            );
+        }
+
+        for domain in [
+            AuthorizationDomainScope::Any,
+            AuthorizationDomainScope::NoDomain,
+        ] {
+            let scope = astral_types::AuthorizationAuthorityScope {
+                tenant_id: 7,
+                card_id: 101,
+                user_id: Some(42),
+                domain,
+            };
+            let context = management_fixture_context(structural_admission(scope));
+            assert!(
+                context.verify_admission_scope().is_err(),
+                "unconstrained or domain-less proof scopes cannot authorize an MFA mutation"
+            );
+        }
+    }
+
+    /// consume-before-arm：admission 在 credential/card/tenant 锁定与 pair 校验
+    /// 之后绑定、在 factor mutation 与 audit 之后、arm_commit_fence 之前恰好
+    /// 消费一次；login/bootstrap 因子验证路径不接触 admission（语义不变）。
+    #[test]
+    fn mfa_source_transaction_binds_and_consumes_admission_before_the_commit_fence() {
+        let source = include_str!("mfa.rs").split("#[cfg(test)]").next().unwrap();
+        let body = source
+            .split("async fn mutate_mfa(")
+            .nth(1)
+            .unwrap()
+            .split("async fn check_brute_force_protection(")
+            .next()
+            .unwrap();
+        let pair_lock = body
+            .find("pair != Some((context.card_id,))")
+            .expect("actor card pair check must stay");
+        let scope_bind = body
+            .find("context.verify_admission_scope()")
+            .expect("admission scope binding must stay");
+        let caller_card = body
+            .find("source_writer_guard::validate_admission_caller_card(")
+            .expect("caller card admission validation must stay");
+        let factor_lock = body
+            .find("FROM user_mfa WHERE user_id = ? ORDER BY mfa_type LIMIT 3 FOR UPDATE")
+            .expect("management factor lock must stay");
+        let stage = body
+            .find("sqlx::query(STAGE_FACTOR_SQL)")
+            .expect("source mutation must stay");
+        let audit = body.find("INSERT INTO audit_log").expect("audit must stay");
+        let consume = body
+            .find("source_writer_guard::validate_and_consume_admission(")
+            .expect("admission consumption must stay");
+        let arm = body
+            .find("arm_commit_fence(&source_guard)")
+            .expect("commit fence arming must stay");
+        let commit = body.find("tx.commit()").expect("commit must stay");
+        assert!(
+            pair_lock < scope_bind
+                && scope_bind < caller_card
+                && caller_card < factor_lock
+                && factor_lock < stage
+                && stage < audit
+                && audit < consume
+                && consume < arm
+                && arm < commit,
+            "admission must bind after the credential/card/tenant locks, survive the \
+             factor mutation and audit, and be consumed before the commit fence"
+        );
+        assert_eq!(
+            body.matches("validate_and_consume_admission").count(),
+            1,
+            "the admission must be consumed exactly once per MFA source transaction"
+        );
+
+        let login = source
+            .split("pub(crate) async fn consume_login_factor_in_tx(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) async fn resolve_mfa_attempt_in_tx(")
+            .next()
+            .unwrap();
+        assert!(
+            !login.contains("admission"),
+            "login/bootstrap factor verification must stay admission-free"
+        );
     }
 
     #[test]

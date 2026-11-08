@@ -12,29 +12,39 @@
 //! 校验）；不存在 legacy 快照 / 旧链 head / raw source 回退——对牌失败与
 //! 读取失败同样报错，绝不降级为空证据。
 //!
-//! ## sod_policy 写路径 source writer 栅栏
+//! ## sod_policy 写路径：proof-bound source transaction
 //!
 //! `create_policy` / `update_policy` / `delete_policy` 是 SoD 判定输入表的
-//! source mutation：hub 已安装时必须先经 canonical
-//! `astral_db::memory_projection_hub::acquire_source_guard` 取得栅栏再执行
-//! autocommit 语句（武装 → await → settle；取消/未知 Drop → sticky
-//! uncertain），使 writer-active 期间辅助读面与 token 绑定策略缓存
-//! fail-closed。`insert_violation` 仅为 bookkeeping 记录（非授权输入），
-//! 不需要栅栏。
+//! source mutation，且是**用户面 HTTP 授权面变更**（新增/修改/删除 deny-only
+//! 判定输入会改变后续请求的准入结论）。三者必须以
+//! `AuthorizationSourceTransaction::begin_with_admission` 打开携带 F1
+//! proof-bound admission 的源事务：
+//! - 与既有写点同一 canonical source-activity 栅栏（`acquire_source_guard`，
+//!   由源事务包装器统一获取）；
+//! - COMMIT await 之前在**同一事务内**对牌 durable
+//!   `authorization_authority_frontier`/`authorization_authority_proof` 行并
+//!   `consume_once` 一次性消费 admission（`validate_authorization_admission_in_tx`）；
+//!   drift/缺失/重复消费一律 fail-closed 回滚；
+//! - commit 未知/失败绝不投递 receipts（本路径不 stage receipts），取消安全
+//!   arm/uncertain/proven 语义由源事务包装器承担。
+//!
+//! `insert_violation` 仅为 bookkeeping 记录（非授权输入），不需要 admission
+//! 或栅栏。
 
 use async_trait::async_trait;
 use sqlx::MySqlPool;
 
-use astral_db::memory_projection_hub::SourceTransactionGuard;
+use super::authorization_source_transaction::AuthorizationSourceTransaction;
 use astral_db::{
     cached_load_published_card_grant_evidence, sod_load_card_tenant, sod_partner_matches_grant,
-    sod_resource_type_from_scoped_key, AuthorizationEvidenceError,
+    sod_resource_type_from_scoped_key, AuthorizationEvidenceError, TypedRowOperation,
+    TypedSourceRowLookup, TypedSourceTable,
 };
 use astral_db::{validate_dynamic_sod_condition_script, MAX_DYNAMIC_CONDITION_SCRIPT_BYTES};
 use astral_types::{
-    AstralError, DomainScopeRequirement, PublishedCardAuthorization, PublishedCardEvidenceScope,
+    AstralError, AuthorizationAdmission, DomainScopeRequirement, PublishedCardAuthorization,
+    PublishedCardEvidenceScope,
 };
-use std::future::Future;
 use time::OffsetDateTime;
 
 /// SoD 策略记录（sod_policy）
@@ -86,15 +96,28 @@ pub trait SodRepository: Send + Sync {
         offset: i64,
     ) -> Result<Vec<SodPolicyRecord>, AstralError>;
     async fn get_policy(&self, policy_id: i64) -> Result<Option<SodPolicyRecord>, AstralError>;
-    /// 新建策略，返回 policy_id
-    async fn create_policy(&self, policy: &SodPolicyRecord) -> Result<i64, AstralError>;
-    /// 全量更新策略
+    /// 新建策略，返回 policy_id。
+    ///
+    /// `admission` 必填：SoD 策略是授权判定的 deny-only 输入表，写路径必须
+    /// 携带本次请求的 F1 proof-bound admission 并在 COMMIT 前同事务对牌消费。
+    async fn create_policy(
+        &self,
+        policy: &SodPolicyRecord,
+        admission: AuthorizationAdmission,
+    ) -> Result<i64, AstralError>;
+    /// 全量更新策略（admission 合同同 [`SodRepository::create_policy`]）。
     async fn update_policy(
         &self,
         policy_id: i64,
         policy: &SodPolicyRecord,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AstralError>;
-    async fn delete_policy(&self, policy_id: i64) -> Result<(), AstralError>;
+    /// 删除策略（expanding：移除 deny 约束；admission 合同同 create_policy）。
+    async fn delete_policy(
+        &self,
+        policy_id: i64,
+        admission: AuthorizationAdmission,
+    ) -> Result<(), AstralError>;
     /// 活跃策略列表（冲突检测/授权校验用）
     async fn list_active_policies(&self) -> Result<Vec<SodPolicyRecord>, AstralError>;
     /// 违规总数（按 policy_id 可选过滤）
@@ -129,20 +152,6 @@ pub trait SodRepository: Send + Sync {
 
 pub struct SqlxSodRepository {
     db: MySqlPool,
-}
-
-/// 取得 sod_policy source writer 栅栏（sod_policy 是 SoD 判定的授权**输入**
-/// source 表）。委托 canonical
-/// `astral_db::memory_projection_hub::acquire_source_guard`（本文件不留第二份
-/// begin 语义）：
-/// - hub 未安装（Rabbit 模式/纯测试/离线工具）→ `Ok(None)`，行为不变；
-/// - hub 已安装而栅栏不可得 → `Err`（写点 `?` 拒绝写入，绝不静默 no-op 写）。
-///
-/// begin 即推进 hub mutation/source revision 与辅助纪元：writer-active 期间
-/// 辅助镜像与 token 绑定的 sod_policy 策略缓存一并 fail-closed，读面绝不以
-/// 并发 source 状态放行；Drop 统一失效正向读缓存并再次推进 revision。
-fn begin_sod_policy_source_write() -> Result<Option<SourceTransactionGuard>, AstralError> {
-    astral_db::memory_projection_hub::acquire_source_guard()
 }
 
 /// Validate persisted SoD source rows at the repository boundary as well as the
@@ -181,39 +190,12 @@ fn validate_sod_policy_source(policy: &SodPolicyRecord) -> Result<(), AstralErro
     Ok(())
 }
 
-/// 单条 autocommit source 语句的围栏执行（与 Identity/card 写点同一合同）：
-/// await 窗口前武装（`mark_commit_started`），结果判定后 settle——Ok →
-/// `mark_commit_proven` 清私有 atomic（Drop 正常释放）；Err → `mark_uncertain`
-/// （sticky，独立 durable 对账前读面 fail-closed）。write pending 时任务被
-/// 取消 → 本 future 连同已武装栅栏一起 Drop → sticky uncertain，覆盖"语句
-/// 可能已提交但结果未知"的窗口（drop cancel = unknown）。`None` 栅栏（hub
-/// 未装）为纯透传。
-async fn fenced_sod_policy_write<T, F>(
-    guard: Option<SourceTransactionGuard>,
-    write: F,
-) -> Result<T, sqlx::Error>
-where
-    F: Future<Output = Result<T, sqlx::Error>>,
-{
-    if let Some(guard) = &guard {
-        guard.mark_commit_started();
-    }
-    let result = write.await;
-    match &result {
-        Ok(_) => {
-            if let Some(guard) = &guard {
-                guard.mark_commit_proven();
-            }
-        }
-        Err(_) => {
-            if let Some(guard) = &guard {
-                guard.mark_uncertain();
-            }
-        }
-    }
-    result
-}
-
+// 单条 sod_policy source 语句的 proof-bound 执行合同（由下方三个方法承担）：
+// `AuthorizationSourceTransaction::begin_with_admission` 先取 canonical
+// source-activity 栅栏再 `pool.begin()`；语句在事务内执行；COMMIT await 前
+// 先对牌 durable authority frontier/proof 行并 `consume_once` 消费 admission
+// （`commit_consuming` 内建），arm → await → Ok proven / Err sticky uncertain
+// / 取消 Drop → unknown，与 Identity/card 写点同一合同。
 impl SqlxSodRepository {
     pub fn new(db: MySqlPool) -> Self {
         Self { db }
@@ -295,89 +277,180 @@ impl SodRepository for SqlxSodRepository {
         .map_err(db_error)
     }
 
-    async fn create_policy(&self, policy: &SodPolicyRecord) -> Result<i64, AstralError> {
+    async fn create_policy(
+        &self,
+        policy: &SodPolicyRecord,
+        admission: AuthorizationAdmission,
+    ) -> Result<i64, AstralError> {
         validate_sod_policy_source(policy)?;
-        // source writer 栅栏在 autocommit 语句之前取得（见
-        // begin_sod_policy_source_write：writer-active 期间读面 fail-closed）。
-        let guard = begin_sod_policy_source_write()?;
-        let result = fenced_sod_policy_write(
-            guard,
-            sqlx::query(
-                r#"INSERT INTO sod_policy (policy_name, description, conflict_type, resource_type, action_code,
-                   permission_a, permission_b, condition_script, status, limit_count, limit_window)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-            )
-            .bind(&policy.policy_name)
-            .bind(&policy.description)
-            .bind(&policy.conflict_type)
-            .bind(&policy.resource_type)
-            .bind(&policy.action_code)
-            .bind(&policy.permission_a)
-            .bind(&policy.permission_b)
-            .bind(&policy.condition_script)
-            .bind("ACTIVE")
-            .bind(policy.limit_count)
-            .bind(&policy.limit_window)
-            .execute(&self.db),
+        // proof-bound source transaction（见模块文档）：canonical activity 栅栏
+        // 由 begin 取得；COMMIT 前同事务对牌并一次性消费 F1 admission。
+        let audit_admission = admission.clone();
+        let mut tx =
+            AuthorizationSourceTransaction::begin_with_admission(&self.db, admission).await?;
+        let mut capture =
+            tx.typed_row_capture(TypedSourceTable::SodPolicy, TypedRowOperation::Insert);
+        let policy_name = policy.policy_name.clone();
+        capture
+            .capture_before_in_tx(&TypedSourceRowLookup::SodPolicyName {
+                name: policy_name.clone(),
+            })
+            .await?;
+        let result = capture
+            .with_tx_mut(move |tx| {
+                let policy = policy.clone();
+                Box::pin(async move {
+                    sqlx::query(
+                        r#"INSERT INTO sod_policy (policy_name, description, conflict_type, resource_type, action_code,
+                           permission_a, permission_b, condition_script, status, limit_count, limit_window)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                    )
+                    .bind(&policy.policy_name)
+                    .bind(&policy.description)
+                    .bind(&policy.conflict_type)
+                    .bind(&policy.resource_type)
+                    .bind(&policy.action_code)
+                    .bind(&policy.permission_a)
+                    .bind(&policy.permission_b)
+                    .bind(&policy.condition_script)
+                    .bind("ACTIVE")
+                    .bind(policy.limit_count)
+                    .bind(&policy.limit_window)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| AstralError::Database(format!("SoD policy insert failed: {error}")))
+                })
+            })
+            .await?;
+        require_one_row(result.rows_affected(), "SoD policy insert")?;
+        let policy_id = i64::try_from(result.last_insert_id())
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| AstralError::Pending("SoD policy insert returned invalid id".into()))?;
+        capture
+            .capture_after_in_tx(&TypedSourceRowLookup::SodPolicyName {
+                name: policy.policy_name.clone(),
+            })
+            .await?;
+        let image = astral_db::seal_typed_source_row_capture_tx(capture)?;
+        tx.stage_typed_source_image(image)?;
+        let audit_id = insert_sod_policy_audit(
+            &mut tx,
+            &audit_admission,
+            policy_id,
+            "CREATE",
+            serde_json::json!({"policyName": policy.policy_name}),
         )
-        .await
-        .map_err(db_error)?;
-        // sod_policy 写路径 evict 钩子：进程级策略缓存（astral_db::sod_check）
-        // 本进程立即失效；composite 模式另有 source writer 栅栏推进 token 的
-        // 精确失效（双保险）；跨实例无广播，由 TTL 兜底（≤30s 失效窗口取舍
-        // 见 astral_db::sod_check 模块文档）。
+        .await?;
+        tx.stage_typed_source_audit_insert_id(audit_id)?;
+        tx.commit_consuming().await?;
         astral_db::evict_sod_policy_cache();
-        Ok(result.last_insert_id() as i64)
+        Ok(policy_id)
     }
 
     async fn update_policy(
         &self,
         policy_id: i64,
         policy: &SodPolicyRecord,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AstralError> {
         validate_sod_policy_source(policy)?;
-        // source writer 栅栏（同 create_policy）。
-        let guard = begin_sod_policy_source_write()?;
-        fenced_sod_policy_write(
-            guard,
-            sqlx::query(
-                r#"UPDATE sod_policy SET policy_name=?, description=?, conflict_type=?, resource_type=?,
-                   action_code=?, permission_a=?, permission_b=?, condition_script=?, status=?
-                   WHERE policy_id=?"#,
-            )
-            .bind(&policy.policy_name)
-            .bind(&policy.description)
-            .bind(&policy.conflict_type)
-            .bind(&policy.resource_type)
-            .bind(&policy.action_code)
-            .bind(&policy.permission_a)
-            .bind(&policy.permission_b)
-            .bind(&policy.condition_script)
-            .bind(&policy.status)
-            .bind(policy_id)
-            .execute(&self.db),
+        // proof-bound source transaction（同 create_policy）。
+        let audit_admission = admission.clone();
+        let mut tx =
+            AuthorizationSourceTransaction::begin_with_admission(&self.db, admission).await?;
+        let lookup = TypedSourceRowLookup::PrimaryId { id: policy_id };
+        let mut capture =
+            tx.typed_row_capture(TypedSourceTable::SodPolicy, TypedRowOperation::Update);
+        capture.capture_before_in_tx(&lookup).await?;
+        let update_policy = policy.clone();
+        let result = capture
+            .with_tx_mut(move |tx| {
+                Box::pin(async move {
+                    sqlx::query(
+                        r#"UPDATE sod_policy SET policy_name=?, description=?, conflict_type=?, resource_type=?,
+                           action_code=?, permission_a=?, permission_b=?, condition_script=?, status=?
+                           WHERE policy_id=?"#,
+                    )
+                    .bind(&update_policy.policy_name)
+                    .bind(&update_policy.description)
+                    .bind(&update_policy.conflict_type)
+                    .bind(&update_policy.resource_type)
+                    .bind(&update_policy.action_code)
+                    .bind(&update_policy.permission_a)
+                    .bind(&update_policy.permission_b)
+                    .bind(&update_policy.condition_script)
+                    .bind(&update_policy.status)
+                    .bind(policy_id)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| AstralError::Database(format!("SoD policy update failed: {error}")))
+                })
+            })
+            .await?;
+        require_one_row(result.rows_affected(), "SoD policy update")?;
+        capture.capture_after_in_tx(&lookup).await?;
+        let image = astral_db::seal_typed_source_row_capture_tx(capture)?;
+        tx.stage_typed_source_image(image)?;
+        let audit_id = insert_sod_policy_audit(
+            &mut tx,
+            &audit_admission,
+            policy_id,
+            "UPDATE",
+            serde_json::json!({"policyName": policy.policy_name}),
         )
-        .await
-        .map_err(db_error)?;
+        .await?;
+        tx.stage_typed_source_audit_insert_id(audit_id)?;
+        tx.commit_consuming().await?;
         // sod_policy 写路径 evict 钩子（同 create_policy：本进程立即失效，
-        // composite 另有 token 精确失效，跨实例 ≤TTL 兜底）。
+        // composite 另有 token 精确失效，跨实例 ≤TTL 兜底；仅 proven commit）。
         astral_db::evict_sod_policy_cache();
         Ok(())
     }
 
-    async fn delete_policy(&self, policy_id: i64) -> Result<(), AstralError> {
-        // source writer 栅栏（同 create_policy）。
-        let guard = begin_sod_policy_source_write()?;
-        fenced_sod_policy_write(
-            guard,
-            sqlx::query("DELETE FROM sod_policy WHERE policy_id=?")
-                .bind(policy_id)
-                .execute(&self.db),
+    async fn delete_policy(
+        &self,
+        policy_id: i64,
+        admission: AuthorizationAdmission,
+    ) -> Result<(), AstralError> {
+        // proof-bound source transaction（同 create_policy；删除移除 deny 约束，
+        // 属扩大授权面的用户面 mutation，admission 不可省略）。
+        let audit_admission = admission.clone();
+        let mut tx =
+            AuthorizationSourceTransaction::begin_with_admission(&self.db, admission).await?;
+        let lookup = TypedSourceRowLookup::PrimaryId { id: policy_id };
+        let mut capture =
+            tx.typed_row_capture(TypedSourceTable::SodPolicy, TypedRowOperation::Delete);
+        capture.capture_before_in_tx(&lookup).await?;
+        let result = capture
+            .with_tx_mut(move |tx| {
+                Box::pin(async move {
+                    sqlx::query("DELETE FROM sod_policy WHERE policy_id=?")
+                        .bind(policy_id)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|error| {
+                            AstralError::Database(format!("SoD policy delete failed: {error}"))
+                        })
+                })
+            })
+            .await?;
+        require_one_row(result.rows_affected(), "SoD policy delete")?;
+        capture.capture_after_in_tx(&lookup).await?;
+        let image = astral_db::seal_typed_source_row_capture_tx(capture)?;
+        tx.stage_typed_source_image(image)?;
+        let audit_id = insert_sod_policy_audit(
+            &mut tx,
+            &audit_admission,
+            policy_id,
+            "DELETE",
+            serde_json::json!({"status": "deleted"}),
         )
-        .await
-        .map_err(db_error)?;
+        .await?;
+        tx.stage_typed_source_audit_insert_id(audit_id)?;
+        tx.commit_consuming().await?;
         // sod_policy 写路径 evict 钩子（同 create_policy：本进程立即失效，
-        // composite 另有 token 精确失效，跨实例 ≤TTL 兜底）。
+        // composite 另有 token 精确失效，跨实例 ≤TTL 兜底；仅 proven commit）。
         astral_db::evict_sod_policy_cache();
         Ok(())
     }
@@ -523,6 +596,65 @@ fn sod_evidence_db_error(card_id: i64, error: AuthorizationEvidenceError) -> Ast
             astral_db::sod_evidence_error_message(card_id, &other)
         )),
     }
+}
+
+async fn insert_sod_policy_audit(
+    tx: &mut AuthorizationSourceTransaction,
+    admission: &AuthorizationAdmission,
+    policy_id: i64,
+    action: &str,
+    details: serde_json::Value,
+) -> Result<i64, AstralError> {
+    let actor_id = admission
+        .proof()
+        .scope
+        .user_id
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            AstralError::Permission("SoD policy audit requires a user-bound admission".into())
+        })?;
+    if policy_id <= 0 || action.trim().is_empty() {
+        return Err(AstralError::Validation(
+            "SoD policy audit identity is invalid".into(),
+        ));
+    }
+    let detail = serde_json::to_string(&serde_json::json!({
+        "operationId": admission.proof().operation_id.as_str(),
+        "policyId": policy_id,
+        "mutation": details,
+    }))
+    .map_err(|error| {
+        AstralError::Validation(format!("SoD policy audit serialization failed: {error}"))
+    })?;
+    let result = sqlx::query(
+        "INSERT INTO audit_log (user_id, action, resource, decision, event_type, request_id, detail) \
+         VALUES (?, ?, 'sod_policy', 'ALLOW', 'SOD_POLICY_MUTATION', ?, ?)",
+    )
+    .bind(actor_id)
+    .bind(action)
+    .bind(admission.proof().operation_id.as_str())
+    .bind(detail)
+    .execute(&mut ***tx)
+    .await
+    .map_err(|error| AstralError::Database(format!("SoD policy audit insert failed: {error}")))?;
+    if result.rows_affected() != 1 {
+        return Err(AstralError::Pending(
+            "SoD policy audit insert affected an unexpected row count".into(),
+        ));
+    }
+    i64::try_from(result.last_insert_id())
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| AstralError::Pending("SoD policy audit insert returned invalid id".into()))
+}
+
+fn require_one_row(affected: u64, operation: &str) -> Result<(), AstralError> {
+    if affected != 1 {
+        return Err(AstralError::Validation(format!(
+            "{operation} affected {affected} rows; refusing an unproven mutation"
+        )));
+    }
+    Ok(())
 }
 
 fn db_error(error: sqlx::Error) -> AstralError {
@@ -720,10 +852,11 @@ mod tests {
     // ===== sod_policy 写路径 source writer 栅栏（形状守卫，无 IO/无 hub 全局态） =====
 
     /// 形状守卫：create/update/delete 三条 sod_policy source mutation 必须
-    /// 先经 canonical `acquire_source_guard` 取栅栏（hub 已装而不可得 → Err
-    /// 拒写），再进入 fenced write（await 前武装，Ok → proven；Err → sticky
-    /// uncertain；取消 Drop → unknown），最后 evict 进程缓存。写点不得以
-    /// "无栅栏 no-op"静默降级。
+    /// 以 `AuthorizationSourceTransaction::begin_with_admission` 携带 F1
+    /// proof-bound admission（canonical source-activity 栅栏由该 begin 统一
+    /// 取得），语句在事务内执行，`commit_consuming` 在 COMMIT 前对牌并一次性
+    /// 消费 admission，最后 evict 进程缓存。写点不得回退为无 admission 的
+    /// autocommit。
     #[test]
     fn dynamic_policy_source_write_rejects_unrecognized_operator() {
         let policy = SodPolicyRecord {
@@ -746,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn sod_policy_mutations_hold_the_source_writer_fence() {
+    fn sod_policy_mutations_carry_and_consume_proof_bound_admission() {
         let source = include_str!("sod_repository.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or(source);
         // 锚定 impl 块（trait 声明与方法同名，先切出 impl 再取方法体）。
@@ -765,58 +898,52 @@ mod tests {
                 .nth(1)
                 .unwrap_or_else(|| panic!("{method} must exist"));
             let body = body.split("\n    async fn ").next().unwrap();
-            let acquire = body
-                .find("begin_sod_policy_source_write()")
-                .unwrap_or_else(|| panic!("{method} must acquire the source writer guard"));
-            let fenced = body
-                .find("fenced_sod_policy_write(")
-                .unwrap_or_else(|| panic!("{method} must write inside the commit fence"));
+            let admission_param = body
+                .find("admission: AuthorizationAdmission")
+                .unwrap_or_else(|| {
+                    panic!("{method} must require the proof-bound admission by value")
+                });
+            let begin = body
+                .find("AuthorizationSourceTransaction::begin_with_admission(&self.db, admission)")
+                .unwrap_or_else(|| panic!("{method} must open an admission-carrying source tx"));
             let evict = body
                 .find("evict_sod_policy_cache()")
                 .unwrap_or_else(|| panic!("{method} must evict the process cache after write"));
+            let commit = body
+                .find("tx.commit_consuming()")
+                .unwrap_or_else(|| panic!("{method} must commit through the source tx wrapper"));
             assert!(
-                acquire < fenced && fenced < evict,
-                "{method} order must be guard acquire -> fenced write -> cache evict"
+                admission_param < begin && begin < commit && commit < evict,
+                "{method} order must be admission param -> begin_with_admission -> \
+                 commit_consuming -> cache evict"
             );
-            // execute 必须在 fenced write 内部（不得绕开栅栏裸执行）。
+            // 语句必须在源事务内执行，不得回退为 autocommit（`&self.db` executor）。
             assert!(
-                !body[..fenced].contains(".execute(&self.db)"),
-                "{method} must not execute the source statement outside the fence"
+                !body.contains(".execute(&self.db)"),
+                "{method} must not execute the source statement outside the source transaction"
+            );
+            assert!(
+                body.contains(".execute(&mut **tx)"),
+                "{method} must execute the statement inside the source transaction"
             );
         }
 
-        // 栅栏 helper：委托 canonical acquire；武装先于 await；Ok → proven，
-        // Err → sticky uncertain（与 identity/card 写点同一合同）。
-        let acquire_helper = production
-            .split("fn begin_sod_policy_source_write()")
-            .nth(1)
-            .expect("guard acquire helper must exist");
-        assert!(acquire_helper.contains("acquire_source_guard()"));
-        let fenced_helper = production
-            .split("async fn fenced_sod_policy_write")
-            .nth(1)
-            .expect("fenced write helper must exist");
-        let armed = fenced_helper
-            .find("guard.mark_commit_started()")
-            .expect("fence must arm before the await window");
-        let awaited = fenced_helper
-            .find("write.await")
-            .expect("fenced helper must await the write");
-        assert!(
-            armed < awaited,
-            "the commit fence must be armed before awaiting the statement"
-        );
-        let settled = fenced_helper
-            .find("guard.mark_commit_proven()")
-            .expect("proven success must disarm the fence");
-        let uncertain = fenced_helper
-            .find("guard.mark_uncertain()")
-            .expect("failed outcome must mark the hub sticky uncertain");
-        assert!(awaited < settled && awaited < uncertain);
+        // trait 契约：三个写方法签名都要求 admission（缺失即编译失败）。
+        for trait_method in [
+            "async fn create_policy(\n        &self,\n        policy: &SodPolicyRecord,\n        admission: AuthorizationAdmission,\n    )",
+            "async fn update_policy(\n        &self,\n        policy_id: i64,\n        policy: &SodPolicyRecord,\n        admission: AuthorizationAdmission,\n    )",
+            "async fn delete_policy(\n        &self,\n        policy_id: i64,\n        admission: AuthorizationAdmission,\n    )",
+        ] {
+            assert!(
+                production.contains(trait_method),
+                "trait signature must require admission: {trait_method}"
+            );
+        }
     }
 
     /// 形状守卫：`insert_violation` 只是 bookkeeping 记录（非授权输入），
-    /// 不取 source writer 栅栏——栅栏语义只属于 sod_policy source mutation。
+    /// 不携带 admission/源事务——admission 语义只属于 sod_policy source
+    /// mutation。
     #[test]
     fn violation_insert_is_bookkeeping_without_source_guard() {
         let source = include_str!("sod_repository.rs");
@@ -831,8 +958,8 @@ mod tests {
             .expect("insert_violation impl must exist");
         let body = body.split("\n    async fn ").next().unwrap();
         assert!(
-            !body.contains("begin_sod_policy_source_write()"),
-            "violation bookkeeping must not take the source writer guard"
+            !body.contains("begin_with_admission"),
+            "violation bookkeeping must not open an admission-carrying source transaction"
         );
         assert!(body.contains("INSERT INTO sod_violation"));
     }

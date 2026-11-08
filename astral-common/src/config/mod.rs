@@ -62,8 +62,24 @@ pub enum ConfigValidationError {
     InvalidNodeId,
     #[error("ASTRAL_TARGET_REGION must be non-empty and at most 64 characters when present")]
     InvalidTargetRegion,
+    #[error("invalidation delivery source database identity is required when enabled")]
+    InvalidInvalidationDeliverySourceDatabase,
+    #[error("invalidation delivery roster version is required when enabled")]
+    InvalidInvalidationDeliveryRosterVersion,
+    #[error("invalidation delivery recipients JSON is required when enabled")]
+    InvalidInvalidationDeliveryRecipients,
+    #[error("invalidation delivery recipients JSON is not valid JSON")]
+    InvalidInvalidationDeliveryRecipientsJson,
+    #[error("invalidation delivery receiver configuration is invalid")]
+    InvalidInvalidationDeliveryReceiver,
+    #[error("invalidation delivery flag must be exactly \"true\" or \"false\" (default off)")]
+    InvalidInvalidationDeliveryEnabled,
     #[error("ASTRAL_ORG_SCOPE_ENABLED must be exactly \"true\" or \"false\" (default off)")]
     InvalidOrgScopeEnabled,
+    #[error("ASTRAL_AUTHORITY_RUNTIME_MODE must be exactly \"strict\" or \"durable-only\"")]
+    InvalidAuthorityRuntimeMode,
+    #[error("durable-only authority mode is offline diagnostics only; a production listener requires strict authority")]
+    OfflineAuthorityModeForListener,
 }
 
 impl ConfigValidationError {
@@ -87,6 +103,48 @@ impl MessageTransport {
             _ => Err(ConfigValidationError::InvalidMessageTransport),
         }
     }
+}
+
+/// Authorization runtime mode frozen during startup.
+///
+/// `Strict` is the secure default: a missing external authority provider or an
+/// unsynchronized authority frontier cannot produce a positive authorization.
+/// `DurableOnly` is an explicit compatibility/offline mode and must never be
+/// selected implicitly by missing trust-root variables.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AuthorityRuntimeMode {
+    #[default]
+    Strict,
+    DurableOnly,
+}
+
+impl AuthorityRuntimeMode {
+    pub fn parse(raw: Option<&str>) -> Result<Self, ConfigValidationError> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("strict") => Ok(Self::Strict),
+            Some("durable-only") => Ok(Self::DurableOnly),
+            Some(_) => Err(ConfigValidationError::InvalidAuthorityRuntimeMode),
+        }
+    }
+
+    pub const fn requires_authority(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+
+    pub fn validate_listener(self) -> Result<(), ConfigValidationError> {
+        if self.requires_authority() {
+            Ok(())
+        } else {
+            Err(ConfigValidationError::OfflineAuthorityModeForListener)
+        }
+    }
+}
+
+pub const AUTHORITY_RUNTIME_MODE_ENV: &str = "ASTRAL_AUTHORITY_RUNTIME_MODE";
+
+pub fn authority_runtime_mode_from_env() -> Result<AuthorityRuntimeMode, ConfigValidationError> {
+    let raw = std::env::var(AUTHORITY_RUNTIME_MODE_ENV).ok();
+    AuthorityRuntimeMode::parse(raw.as_deref())
 }
 
 // ===== ORG_SCOPE 部署旗标（default-off，跨宿主共享契约） =====
@@ -177,6 +235,201 @@ fn is_placeholder_secret(secret: &str) -> bool {
             .is_some_and(|first| normalized.chars().all(|value| value == first))
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InvalidationReceiverPeerConfig {
+    pub database_id: String,
+    pub region_id: String,
+    pub node_id: String,
+    pub certificate_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct InvalidationDeliveryConfig {
+    /// Explicit immutable source database identity. It is not derived from the
+    /// MySQL URL, host name, region, or node id.
+    #[serde(default)]
+    pub source_database_id: String,
+    /// Deployment-controlled roster revision. A changed roster must use a new
+    /// version and be frozen before any source writer starts.
+    #[serde(default)]
+    pub roster_version: String,
+    /// Canonical JSON array of `astral_db::InvalidationDeliveryRecipient` values.
+    /// Kept as JSON in common config to avoid a common->db dependency cycle.
+    #[serde(default)]
+    pub recipients_json: String,
+    /// Explicit JSON array of source database identities accepted by this
+    /// receiver's Rabbit recipient queue. It is an independent trust boundary,
+    /// never inferred from the outbound recipient roster.
+    #[serde(default)]
+    pub rabbit_allowed_source_database_ids_json: String,
+    /// PEM path for the same-DB mTLS client identity. Required when a frozen
+    /// recipient uses `same_db_mtls`; never read by source writers.
+    #[serde(default)]
+    pub mtls_client_identity_pem_path: Option<String>,
+    /// PEM path for the trusted same-DB mTLS server CA.
+    #[serde(default)]
+    pub mtls_server_ca_pem_path: Option<String>,
+    /// Explicit mTLS receiver bind address; required when receiver is enabled.
+    #[serde(default)]
+    pub mtls_receiver_bind_address: Option<String>,
+    /// Receiver server certificate PEM path.
+    #[serde(default)]
+    pub mtls_receiver_server_cert_pem_path: Option<String>,
+    /// Receiver server private key PEM path.
+    #[serde(default)]
+    pub mtls_receiver_server_key_pem_path: Option<String>,
+    /// Receiver client CA PEM path.
+    #[serde(default)]
+    pub mtls_receiver_client_ca_pem_path: Option<String>,
+    /// JSON array of exact `sha256:<64 lowercase hex>` source peer fingerprints.
+    #[serde(default)]
+    pub mtls_receiver_allowed_peer_fingerprints_json: String,
+    /// Receiver local database identity, never inferred from DATABASE_URL.
+    #[serde(default)]
+    pub mtls_receiver_database_id: String,
+    /// Receiver local node region.
+    #[serde(default)]
+    pub mtls_receiver_region_id: String,
+    /// Receiver local node id.
+    #[serde(default)]
+    pub mtls_receiver_node_id: String,
+    /// Bounded concurrent mTLS receiver connections.
+    #[serde(default = "default_invalidation_mtls_receiver_max_connections")]
+    pub mtls_receiver_max_connections: usize,
+    /// Explicit opt-in. Missing/false keeps delivery journal producers disabled.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for InvalidationDeliveryConfig {
+    fn default() -> Self {
+        Self {
+            source_database_id: String::new(),
+            roster_version: String::new(),
+            recipients_json: String::new(),
+            rabbit_allowed_source_database_ids_json: String::new(),
+            mtls_client_identity_pem_path: None,
+            mtls_server_ca_pem_path: None,
+            mtls_receiver_bind_address: None,
+            mtls_receiver_server_cert_pem_path: None,
+            mtls_receiver_server_key_pem_path: None,
+            mtls_receiver_client_ca_pem_path: None,
+            mtls_receiver_allowed_peer_fingerprints_json: String::new(),
+            mtls_receiver_database_id: String::new(),
+            mtls_receiver_region_id: String::new(),
+            mtls_receiver_node_id: String::new(),
+            mtls_receiver_max_connections: default_invalidation_mtls_receiver_max_connections(),
+            enabled: false,
+        }
+    }
+}
+
+impl InvalidationDeliveryConfig {
+    pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.source_database_id.trim().is_empty() {
+            return Err(ConfigValidationError::InvalidInvalidationDeliverySourceDatabase);
+        }
+        if self.roster_version.trim().is_empty() {
+            return Err(ConfigValidationError::InvalidInvalidationDeliveryRosterVersion);
+        }
+        let value: serde_json::Value = serde_json::from_str(&self.recipients_json)
+            .map_err(|_| ConfigValidationError::InvalidInvalidationDeliveryRecipientsJson)?;
+        let recipients = value
+            .as_array()
+            .ok_or(ConfigValidationError::InvalidInvalidationDeliveryRecipients)?;
+        let needs_mtls = recipients.iter().any(|recipient| {
+            recipient
+                .get("transport")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|transport| transport == "same_db_mtls")
+        });
+        if needs_mtls
+            && (self
+                .mtls_client_identity_pem_path
+                .as_deref()
+                .is_none_or(str::is_empty)
+                || self
+                    .mtls_server_ca_pem_path
+                    .as_deref()
+                    .is_none_or(str::is_empty))
+        {
+            return Err(ConfigValidationError::InvalidInvalidationDeliveryRecipients);
+        }
+        if self.mtls_receiver_max_connections == 0 || self.mtls_receiver_max_connections > 4096 {
+            return Err(ConfigValidationError::InvalidInvalidationDeliveryReceiver);
+        }
+        let receiver_fields = [
+            self.mtls_receiver_bind_address.as_deref(),
+            self.mtls_receiver_server_cert_pem_path.as_deref(),
+            self.mtls_receiver_server_key_pem_path.as_deref(),
+            self.mtls_receiver_client_ca_pem_path.as_deref(),
+        ];
+        if receiver_fields
+            .iter()
+            .any(|value| value.is_none_or(str::is_empty))
+            || self.mtls_receiver_database_id.trim().is_empty()
+            || self.mtls_receiver_region_id.trim().is_empty()
+            || self.mtls_receiver_node_id.trim().is_empty()
+            || self.mtls_receiver_database_id != self.source_database_id
+        {
+            return Err(ConfigValidationError::InvalidInvalidationDeliveryReceiver);
+        }
+        let rabbit_sources =
+            serde_json::from_str::<Vec<String>>(&self.rabbit_allowed_source_database_ids_json)
+                .map_err(|_| ConfigValidationError::InvalidInvalidationDeliveryReceiver)?;
+        if rabbit_sources.is_empty() || rabbit_sources.len() > 64 {
+            return Err(ConfigValidationError::InvalidInvalidationDeliveryReceiver);
+        }
+        let mut seen_rabbit_sources =
+            std::collections::HashSet::with_capacity(rabbit_sources.len());
+        if rabbit_sources.iter().any(|source| {
+            let source = source.trim();
+            source.is_empty()
+                || source.len() > 128
+                || !source
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+                || !seen_rabbit_sources.insert(source.to_owned())
+        }) {
+            return Err(ConfigValidationError::InvalidInvalidationDeliveryReceiver);
+        }
+        let peers = serde_json::from_str::<Vec<InvalidationReceiverPeerConfig>>(
+            &self.mtls_receiver_allowed_peer_fingerprints_json,
+        )
+        .map_err(|_| ConfigValidationError::InvalidInvalidationDeliveryReceiver)?;
+        if peers.is_empty()
+            || peers.iter().any(|peer| {
+                peer.database_id.trim().is_empty()
+                    || peer.region_id.trim().is_empty()
+                    || peer.node_id.trim().is_empty()
+                    || peer.certificate_sha256.len() != 64
+                    || !peer
+                        .certificate_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        {
+            return Err(ConfigValidationError::InvalidInvalidationDeliveryReceiver);
+        }
+        Ok(())
+    }
+
+    pub fn validate_receiver_identity(
+        &self,
+        region_id: &str,
+        node_id: &str,
+    ) -> Result<(), ConfigValidationError> {
+        if self.mtls_receiver_region_id != region_id || self.mtls_receiver_node_id != node_id {
+            return Err(ConfigValidationError::InvalidInvalidationDeliveryReceiver);
+        }
+        Ok(())
+    }
+}
+
 /// 全局应用配置
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -254,6 +507,11 @@ pub struct AppConfig {
     #[serde(skip)]
     pub org_scope_enabled: bool,
 
+    /// Authority proof runtime mode, frozen at startup. Strict is the secure
+    /// default; durable-only requires an explicit deployment opt-in.
+    #[serde(skip)]
+    pub authority_runtime_mode: AuthorityRuntimeMode,
+
     /// 单机组合进程镜像加速器（**default-on**，composite 正常会话 zero-DB
     /// 目标的默认闭合）：安装有界
     /// 进程内会话镜像（TTL/容量/GC/suspect 栅栏）。镜像命中 Allow 仍逐项绑定
@@ -281,6 +539,11 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub wechat: WeChatConfig,
+
+    /// Explicit startup-frozen recipient delivery configuration. No source
+    /// database or roster value is inferred from other AppConfig fields.
+    #[serde(default)]
+    pub invalidation_delivery: InvalidationDeliveryConfig,
 }
 
 impl Default for AppConfig {
@@ -305,9 +568,11 @@ impl Default for AppConfig {
             db_max_connections: default_db_max_connections(),
             db_acquire_timeout_seconds: default_db_acquire_timeout_seconds(),
             org_scope_enabled: false,
+            authority_runtime_mode: AuthorityRuntimeMode::Strict,
             session_grant_mirror_enabled: default_session_grant_mirror_enabled(),
             session_grant_mirror_positive_disabled: false,
             wechat: WeChatConfig::default(),
+            invalidation_delivery: InvalidationDeliveryConfig::default(),
         }
     }
 }
@@ -352,6 +617,9 @@ fn default_db_max_connections() -> u32 {
 }
 fn default_db_acquire_timeout_seconds() -> u64 {
     5
+}
+fn default_invalidation_mtls_receiver_max_connections() -> usize {
+    128
 }
 
 /// CORS 配置
@@ -668,6 +936,65 @@ fn apply_flat_env_overrides(cfg: &mut AppConfig) -> Result<(), config::ConfigErr
             Some(value.trim().to_string())
         };
     }
+    // Invalidation recipient routing is an explicit startup contract. The
+    // roster is supplied as JSON and never assembled from region/node fields.
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_DELIVERY_ENABLED") {
+        cfg.invalidation_delivery.enabled =
+            parse_bool_strict("ASTRAL_INVALIDATION_DELIVERY_ENABLED", &value)?;
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_SOURCE_DATABASE_ID") {
+        cfg.invalidation_delivery.source_database_id = value.trim().to_owned();
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_ROSTER_VERSION") {
+        cfg.invalidation_delivery.roster_version = value.trim().to_owned();
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_RECIPIENTS_JSON") {
+        cfg.invalidation_delivery.recipients_json = value;
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_RABBIT_ALLOWED_SOURCE_DATABASE_IDS_JSON")
+    {
+        cfg.invalidation_delivery
+            .rabbit_allowed_source_database_ids_json = value;
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_MTLS_CLIENT_IDENTITY_PEM") {
+        cfg.invalidation_delivery.mtls_client_identity_pem_path = Some(value.trim().to_owned());
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_MTLS_SERVER_CA_PEM") {
+        cfg.invalidation_delivery.mtls_server_ca_pem_path = Some(value.trim().to_owned());
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_MTLS_RECEIVER_BIND") {
+        cfg.invalidation_delivery.mtls_receiver_bind_address = Some(value.trim().to_owned());
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_MTLS_RECEIVER_SERVER_CERT_PEM") {
+        cfg.invalidation_delivery.mtls_receiver_server_cert_pem_path =
+            Some(value.trim().to_owned());
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_MTLS_RECEIVER_SERVER_KEY_PEM") {
+        cfg.invalidation_delivery.mtls_receiver_server_key_pem_path = Some(value.trim().to_owned());
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_MTLS_RECEIVER_CLIENT_CA_PEM") {
+        cfg.invalidation_delivery.mtls_receiver_client_ca_pem_path = Some(value.trim().to_owned());
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_MTLS_RECEIVER_ALLOWED_PEERS_JSON") {
+        cfg.invalidation_delivery
+            .mtls_receiver_allowed_peer_fingerprints_json = value;
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_MTLS_RECEIVER_DATABASE_ID") {
+        cfg.invalidation_delivery.mtls_receiver_database_id = value.trim().to_owned();
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_MTLS_RECEIVER_REGION_ID") {
+        cfg.invalidation_delivery.mtls_receiver_region_id = value.trim().to_owned();
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_MTLS_RECEIVER_NODE_ID") {
+        cfg.invalidation_delivery.mtls_receiver_node_id = value.trim().to_owned();
+    }
+    if let Some(value) = optional_env("ASTRAL_INVALIDATION_MTLS_RECEIVER_MAX_CONNECTIONS") {
+        cfg.invalidation_delivery.mtls_receiver_max_connections = value
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| ConfigValidationError::InvalidInvalidationDeliveryReceiver)
+            .map_err(ConfigValidationError::into_config_error)?;
+    }
     // JWT 双 profile：access 与 refresh 的签名材料必须相互独立（见 JwtConfig
     // 注释），因此不提供共享的 `JWT_SECRET` 名，避免静默复用。issuer/audience
     // 必须显式提供：只要 env 或 YAML 中存在任一 `jwt.<profile>` 子键，serde
@@ -702,6 +1029,10 @@ fn apply_flat_env_overrides(cfg: &mut AppConfig) -> Result<(), config::ConfigErr
     // 绝不静默降级）；env 缺失/空白保留默认 false。
     if let Some(value) = optional_env(ORG_SCOPE_ENABLED_ENV) {
         cfg.org_scope_enabled = parse_org_scope_enabled(Some(&value))
+            .map_err(ConfigValidationError::into_config_error)?;
+    }
+    if let Some(value) = optional_env(AUTHORITY_RUNTIME_MODE_ENV) {
+        cfg.authority_runtime_mode = AuthorityRuntimeMode::parse(Some(&value))
             .map_err(ConfigValidationError::into_config_error)?;
     }
     // 单机镜像加速器（default-off）：严格 bool；语义边界见字段文档
@@ -758,6 +1089,9 @@ impl AppConfig {
         // 校验之前应用，env 存在即覆盖，缺失保留默认值。
         apply_flat_env_overrides(&mut cfg)?;
         ensure_required_public_paths(&mut cfg.public_paths);
+        cfg.authority_runtime_mode
+            .validate_listener()
+            .map_err(ConfigValidationError::into_config_error)?;
         cfg.validate_secrets_for(role)
             .map_err(ConfigValidationError::into_config_error)?;
         cfg.validate_runtime_safety(Self::is_test_profile())
@@ -790,11 +1124,25 @@ impl AppConfig {
         // An explicit YAML list must not accidentally remove the mandatory
         // Java-compatible login, refresh, and verification routes.
         ensure_required_public_paths(&mut cfg.public_paths);
+        cfg.authority_runtime_mode
+            .validate_listener()
+            .map_err(ConfigValidationError::into_config_error)?;
         cfg.validate_secrets_for(role)
             .map_err(ConfigValidationError::into_config_error)?;
         cfg.validate_runtime_safety(Self::is_test_profile())
             .map_err(ConfigValidationError::into_config_error)?;
         Ok(cfg)
+    }
+
+    /// Validate an already frozen production listener configuration without
+    /// loading files or environment values again.
+    pub fn validate_listener_for(
+        &self,
+        role: JwtValidationRole,
+    ) -> Result<(), ConfigValidationError> {
+        self.authority_runtime_mode.validate_listener()?;
+        self.validate_secrets_for(role)?;
+        self.validate_runtime_safety(false)
     }
 
     pub fn message_transport(&self) -> Result<MessageTransport, ConfigValidationError> {
@@ -857,6 +1205,11 @@ impl AppConfig {
             self.target_region.as_deref(),
             transport,
         )?;
+        self.invalidation_delivery.validate()?;
+        if self.invalidation_delivery.enabled {
+            self.invalidation_delivery
+                .validate_receiver_identity(&self.region_id, &self.node_id)?;
+        }
         if matches!(transport, MessageTransport::Rabbit) {
             if self.rabbitmq_url.trim().is_empty() && !test_profile {
                 return Err(ConfigValidationError::RabbitmqUrlRequiredForTransport);
@@ -1127,6 +1480,9 @@ mod tests {
         "CORS_ALLOW_CREDENTIALS",
         // ORG_SCOPE 部署旗标（parse_org_scope_enabled 契约）。
         ORG_SCOPE_ENABLED_ENV,
+        // Authority runtime mode is process-frozen and isolated from the shell
+        // environment during flat-env tests.
+        AUTHORITY_RUNTIME_MODE_ENV,
         // 单机镜像加速器（default-on）与 positive cache 旁路（default-off）。
         SESSION_GRANT_MIRROR_ENV,
         SESSION_GRANT_MIRROR_POSITIVE_DISABLED_ENV,
@@ -1171,6 +1527,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn authority_runtime_mode_is_strict_by_default_and_requires_explicit_compatibility_opt_in() {
+        assert_eq!(
+            AuthorityRuntimeMode::default(),
+            AuthorityRuntimeMode::Strict
+        );
+        assert_eq!(
+            AuthorityRuntimeMode::parse(None).unwrap(),
+            AuthorityRuntimeMode::Strict
+        );
+        assert_eq!(
+            AuthorityRuntimeMode::parse(Some("")).unwrap(),
+            AuthorityRuntimeMode::Strict
+        );
+        assert_eq!(
+            AuthorityRuntimeMode::parse(Some(" strict ")).unwrap(),
+            AuthorityRuntimeMode::Strict
+        );
+        assert_eq!(
+            AuthorityRuntimeMode::parse(Some("durable-only")).unwrap(),
+            AuthorityRuntimeMode::DurableOnly
+        );
+        assert!(AuthorityRuntimeMode::Strict.requires_authority());
+        assert!(!AuthorityRuntimeMode::DurableOnly.requires_authority());
+        assert!(AuthorityRuntimeMode::Strict.validate_listener().is_ok());
+        assert_eq!(
+            AuthorityRuntimeMode::DurableOnly
+                .validate_listener()
+                .unwrap_err(),
+            ConfigValidationError::OfflineAuthorityModeForListener
+        );
+        assert_eq!(
+            AuthorityRuntimeMode::parse(Some("DURABLE-ONLY")).unwrap_err(),
+            ConfigValidationError::InvalidAuthorityRuntimeMode
+        );
+        assert_eq!(
+            AuthorityRuntimeMode::parse(Some("legacy")).unwrap_err(),
+            ConfigValidationError::InvalidAuthorityRuntimeMode
+        );
     }
 
     #[test]
@@ -1633,6 +2030,43 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn frozen_listener_validation_keeps_authority_secret_and_runtime_gates() {
+        let mut config = valid_runtime_config();
+        config.jwt = valid_jwt_config();
+        config.gateway = valid_gateway();
+        config
+            .validate_listener_for(JwtValidationRole::Gateway)
+            .unwrap();
+        config
+            .validate_listener_for(JwtValidationRole::Identity)
+            .unwrap();
+
+        let mut changed = config.clone();
+        changed.authority_runtime_mode = AuthorityRuntimeMode::DurableOnly;
+        assert_eq!(
+            changed.validate_listener_for(JwtValidationRole::Gateway),
+            Err(ConfigValidationError::OfflineAuthorityModeForListener)
+        );
+        let mut changed = config.clone();
+        changed.gateway.hmac_secret.clear();
+        assert_eq!(
+            changed.validate_listener_for(JwtValidationRole::Gateway),
+            Err(ConfigValidationError::GatewayHmacSecretTooShort)
+        );
+        let mut changed = config.clone();
+        changed.cors.allowed_origins = vec!["*".into()];
+        assert_eq!(
+            changed.validate_listener_for(JwtValidationRole::Gateway),
+            Err(ConfigValidationError::CorsWildcard)
+        );
+        let mut changed = config;
+        changed.database_url = "postgres://db.example.invalid/app".into();
+        assert!(changed
+            .validate_listener_for(JwtValidationRole::Gateway)
+            .is_err());
     }
 
     #[test]

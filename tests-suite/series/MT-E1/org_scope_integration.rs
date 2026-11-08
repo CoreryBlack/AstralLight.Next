@@ -69,6 +69,7 @@ use astral_types::org_scope::{
     OrgPublication, OrgReadRequest, OrgRequestPayload, OrgScope, OrgScopeKey, OrgSegmentContent,
     OrgSubtreePropagatePayload,
 };
+use astral_types::AuthorizationAdmission;
 use astral_types::ValidityWindow;
 
 const OWNER: &str = "org-e2e-worker-1";
@@ -343,6 +344,104 @@ fn unique_operation(seed: &str) -> String {
         .map(|duration| duration.subsec_nanos())
         .unwrap_or(0);
     format!("e2e-{pid}-{nanos}-{seed}")
+}
+
+// ── proof-bound admission fixture（有效授权 mutation 的 commit 门）──────────
+//
+// 有效授权 mutation（approve / grant revoke / mask / membership）在 astral-db
+// commit 前同事务对牌 durable `authorization_authority_frontier`（SERVING）与
+// `authorization_authority_proof`（ACTIVE）并一次性消费 admission（见
+// `consume_org_authority_admission`）。本 fixture 每次调用铸造一个结构合法的
+// 新 proof（唯一 proof_id/request_nonce），并 seed 其 durable 行；生产路径的
+// 签名对牌在 F1 读取时完成，commit 门只做 durable 行等值对牌，因此测试
+// fixture 的占位签名（64 字节 0x00，仅满足结构校验）足以走通对牌合同。
+//
+// frontier 行是全局单例（frontier_id=1 且 authority_id 唯一）：各套件以
+// 相同内容 upsert 收敛，无跨套件语义冲突；proof 行按 uuid 唯一、过期后
+// 结构上不可再被消费（时间窗 + 等值对牌），不做清理也不会放大任何授权。
+const ORG_TEST_FRONTIER_ID: i64 = 1;
+const ORG_TEST_AUTHORITY_ID: &str = "testsuite-org-authority";
+const ORG_TEST_KEY_ID: &str = "testsuite-key-1";
+const ORG_TEST_SNAPSHOT_HASH_HEX: &str = "ab";
+
+async fn org_authority_admission(pool: &sqlx::MySqlPool) -> AuthorizationAdmission {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let proof_id = format!("org-proof-{token}");
+    let request_nonce = format!("org-nonce-{token}");
+    let snapshot_hash = ORG_TEST_SNAPSHOT_HASH_HEX.repeat(32);
+    let proof = astral_types::AuthorizationFenceProof {
+        authorization_edition: astral_types::AUTHORIZATION_EDITION,
+        authority_id: ORG_TEST_AUTHORITY_ID.to_owned(),
+        authority_term: 1,
+        global_fence_sequence: 1,
+        scope: astral_types::AuthorizationAuthorityScope {
+            tenant_id: 1,
+            card_id: 1,
+            user_id: Some(1),
+            domain: astral_types::AuthorizationDomainScope::Any,
+        },
+        scope_generation: 1,
+        revoke_watermark: 1,
+        snapshot_hash: snapshot_hash.clone(),
+        parent_hash: None,
+        operation_id: format!("org-op-{token}"),
+        event_id: format!("org-event-{token}"),
+        key_id: ORG_TEST_KEY_ID.to_owned(),
+        key_epoch: 1,
+        issued_at: now,
+        not_before: now - 60,
+        expires_at: now + 3_600,
+        request_nonce: request_nonce.clone(),
+        request_binding_digest: None,
+        scope_certificate_hash: None,
+        proof_id: proof_id.clone(),
+        signature: "00".repeat(64),
+    };
+    sqlx::query(
+        "INSERT INTO authorization_authority_frontier \
+         (frontier_id, authority_id, authority_term, global_fence_sequence, key_id, key_epoch, \
+          status, snapshot_hash) \
+         VALUES (?, ?, 1, 1, ?, 1, 'SERVING', UNHEX(REPEAT(?, 32))) \
+         ON DUPLICATE KEY UPDATE authority_id = VALUES(authority_id), \
+             authority_term = VALUES(authority_term), \
+             global_fence_sequence = VALUES(global_fence_sequence), \
+             key_id = VALUES(key_id), key_epoch = VALUES(key_epoch), \
+             status = VALUES(status), snapshot_hash = VALUES(snapshot_hash)",
+    )
+    .bind(ORG_TEST_FRONTIER_ID)
+    .bind(ORG_TEST_AUTHORITY_ID)
+    .bind(ORG_TEST_KEY_ID)
+    .bind(ORG_TEST_SNAPSHOT_HASH_HEX)
+    .execute(pool)
+    .await
+    .expect("seed serving authority frontier fixture");
+    sqlx::query(
+        "INSERT INTO authorization_authority_proof \
+         (proof_id, request_nonce, authorization_edition, authority_id, authority_term, \
+          global_fence_sequence, tenant_id, card_id, scope_user_id, scope_domain_kind, \
+          scope_domain_id, scope_generation, revoke_watermark, snapshot_hash, parent_hash, \
+          operation_id, event_id, key_id, key_epoch, issued_at, not_before, expires_at, \
+          signature, status) \
+         VALUES (?, ?, ?, ?, 1, 1, 1, 1, 1, 'ANY', NULL, 1, 1, UNHEX(REPEAT(?, 32)), NULL, \
+                 ?, ?, ?, 1, ?, ?, ?, UNHEX(REPEAT('00', 64)), 'ACTIVE')",
+    )
+    .bind(&proof_id)
+    .bind(&request_nonce)
+    .bind(astral_types::AUTHORIZATION_EDITION)
+    .bind(ORG_TEST_AUTHORITY_ID)
+    .bind(ORG_TEST_SNAPSHOT_HASH_HEX)
+    .bind(&proof.operation_id)
+    .bind(&proof.event_id)
+    .bind(ORG_TEST_KEY_ID)
+    .bind(proof.issued_at)
+    .bind(proof.not_before)
+    .bind(proof.expires_at)
+    .execute(pool)
+    .await
+    .expect("seed active authority proof fixture");
+    AuthorizationAdmission::from_verified_proof(proof)
+        .expect("fixture proof must be structurally valid")
 }
 
 fn scope_for(resource_tenant_id: i64, resource: &str, action: &str) -> OrgScope {
@@ -1137,6 +1236,9 @@ async fn org_scope_authority_end_to_end() {
         operation_id: unique_operation("apr-root-init"),
         note: None,
         governance_proof: Some(root_governance_proof(ROOT_TENANT, "root-init")),
+        // commit gate for an effective authorization mutation:
+        // proof-bound admission (see the org_authority_admission fixture docs).
+        admission: org_authority_admission(&pool).await,
     })
     .await
     .expect("root init approval");
@@ -1182,6 +1284,9 @@ async fn org_scope_authority_end_to_end() {
             operation_id: unique_operation("apr-root-grant-no-proof"),
             note: None,
             governance_proof: None,
+            // commit gate for an effective authorization mutation:
+            // proof-bound admission (see the org_authority_admission fixture docs).
+            admission: org_authority_admission(&pool).await,
         })
         .await
         .expect_err("root grant without governance proof must fail closed");
@@ -1208,6 +1313,9 @@ async fn org_scope_authority_end_to_end() {
         operation_id: unique_operation("apr-attach"),
         note: None,
         governance_proof: None,
+        // commit gate for an effective authorization mutation:
+        // proof-bound admission (see the org_authority_admission fixture docs).
+        admission: org_authority_admission(&pool).await,
     })
     .await
     .expect("attach approval");
@@ -1243,6 +1351,9 @@ async fn org_scope_authority_end_to_end() {
         operation_id: unique_operation("apr-grant"),
         note: None,
         governance_proof: None,
+        // commit gate for an effective authorization mutation:
+        // proof-bound admission (see the org_authority_admission fixture docs).
+        admission: org_authority_admission(&pool).await,
     })
     .await
     .expect("grant approval");
@@ -1269,6 +1380,9 @@ async fn org_scope_authority_end_to_end() {
         operation_id: unique_operation("apr-attach-grandchild"),
         note: None,
         governance_proof: None,
+        // commit gate for an effective authorization mutation:
+        // proof-bound admission (see the org_authority_admission fixture docs).
+        admission: org_authority_admission(&pool).await,
     })
     .await
     .expect("grandchild attach approval");
@@ -1300,6 +1414,9 @@ async fn org_scope_authority_end_to_end() {
         operation_id: unique_operation("apr-grant-grandchild"),
         note: None,
         governance_proof: None,
+        // commit gate for an effective authorization mutation:
+        // proof-bound admission (see the org_authority_admission fixture docs).
+        admission: org_authority_admission(&pool).await,
     })
     .await
     .expect("grandchild grant approval");
@@ -1314,6 +1431,9 @@ async fn org_scope_authority_end_to_end() {
         identity_card_id: FIXTURE_IDENTITY_CARD_ID,
         card_id: FIXTURE_CARD_ID,
         validity: ValidityWindow::perpetual(),
+        // commit gate for an effective authorization mutation:
+        // proof-bound admission (see the org_authority_admission fixture docs).
+        admission: org_authority_admission(&pool).await,
     })
     .await
     .expect("membership create");
@@ -1404,6 +1524,9 @@ async fn org_scope_authority_end_to_end() {
         tenant_id: CHILD_TENANT,
         membership_id: membership_id.clone(),
         expected_revision: membership_revision as u64,
+        // commit gate for an effective authorization mutation:
+        // proof-bound admission (see the org_authority_admission fixture docs).
+        admission: org_authority_admission(&pool).await,
     })
     .await
     .expect("membership revoke");
@@ -1434,6 +1557,9 @@ async fn org_scope_authority_end_to_end() {
         identity_card_id: FIXTURE_IDENTITY_CARD_ID,
         card_id: FIXTURE_CARD_ID,
         validity: ValidityWindow::perpetual(),
+        // commit gate for an effective authorization mutation:
+        // proof-bound admission (see the org_authority_admission fixture docs).
+        admission: org_authority_admission(&pool).await,
     })
     .await
     .expect("membership re-create");
@@ -1455,6 +1581,9 @@ async fn org_scope_authority_end_to_end() {
         },
         expected_unit_generation: child_unit_generation,
         reason: Some("e2e exact-source mask".into()),
+        // commit gate for an effective authorization mutation:
+        // proof-bound admission (see the org_authority_admission fixture docs).
+        admission: org_authority_admission(&pool).await,
     })
     .await
     .expect("mask apply");
@@ -1490,6 +1619,9 @@ async fn org_scope_authority_end_to_end() {
         grant_id: root_grant_id.clone(),
         expected_revision: root_grant_revision,
         reason: Some("e2e revocation".into()),
+        // commit gate for an effective authorization mutation:
+        // proof-bound admission (see the org_authority_admission fixture docs).
+        admission: org_authority_admission(&pool).await,
     })
     .await
     .expect("root grant revoke");
@@ -1532,6 +1664,9 @@ async fn org_scope_authority_end_to_end() {
             operation_id: unique_operation("apr-detach"),
             note: None,
             governance_proof: None,
+            // commit gate for an effective authorization mutation:
+            // proof-bound admission (see the org_authority_admission fixture docs).
+            admission: org_authority_admission(&pool).await,
         })
         .await
         .expect("detach approval");
@@ -1574,6 +1709,7 @@ async fn org_scope_membership_cap_is_global_fail_closed_and_revoke_frees_capacit
     for (index, tenant_id) in MEMBERSHIP_CAP_TENANTS.into_iter().enumerate() {
         submit_and_approve(
             &repo,
+            &pool,
             OrgRequestPayload::RootInit {
                 root_tenant_id: tenant_id,
                 initial_grants: Vec::new(),
@@ -1609,6 +1745,9 @@ async fn org_scope_membership_cap_is_global_fail_closed_and_revoke_frees_capacit
                 } else {
                     ValidityWindow::perpetual()
                 },
+                // commit gate for an effective authorization mutation:
+                // proof-bound admission (see the org_authority_admission fixture docs).
+                admission: org_authority_admission(&pool).await,
             })
             .await
             .expect("membership below cap must be created");
@@ -1641,6 +1780,9 @@ async fn org_scope_membership_cap_is_global_fail_closed_and_revoke_frees_capacit
             identity_card_id: MEMBERSHIP_CAP_IDENTITY_CARD_ID,
             card_id: rejected_card_id,
             validity: ValidityWindow::perpetual(),
+            // commit gate for an effective authorization mutation:
+            // proof-bound admission (see the org_authority_admission fixture docs).
+            admission: org_authority_admission(&pool).await,
         })
         .await
         .expect_err("global membership cap must reject another root/card");
@@ -1679,6 +1821,9 @@ async fn org_scope_membership_cap_is_global_fail_closed_and_revoke_frees_capacit
         tenant_id: MEMBERSHIP_CAP_ROOT_A,
         membership_id: revoked_membership_id,
         expected_revision: u64::try_from(revision).expect("membership revision is non-negative"),
+        // commit gate for an effective authorization mutation:
+        // proof-bound admission (see the org_authority_admission fixture docs).
+        admission: org_authority_admission(&pool).await,
     })
     .await
     .expect("revoke before replacement frees capacity");
@@ -1692,6 +1837,9 @@ async fn org_scope_membership_cap_is_global_fail_closed_and_revoke_frees_capacit
         identity_card_id: MEMBERSHIP_CAP_IDENTITY_CARD_ID,
         card_id: rejected_card_id,
         validity: ValidityWindow::perpetual(),
+        // commit gate for an effective authorization mutation:
+        // proof-bound admission (see the org_authority_admission fixture docs).
+        admission: org_authority_admission(&pool).await,
     })
     .await
     .expect("revoke-then-create must restore exactly one available slot");
@@ -1750,6 +1898,7 @@ async fn org_scope_membership_cap_serializes_concurrent_distinct_cards() {
     for (index, tenant_id) in MEMBERSHIP_CAP_RACE_TENANTS.into_iter().enumerate() {
         submit_and_approve(
             &setup_repo,
+            &pool,
             OrgRequestPayload::RootInit {
                 root_tenant_id: tenant_id,
                 initial_grants: Vec::new(),
@@ -1779,6 +1928,9 @@ async fn org_scope_membership_cap_serializes_concurrent_distinct_cards() {
                 card_id: MEMBERSHIP_CAP_RACE_CARD_BASE
                     + i64::try_from(offset).expect("offset fits i64"),
                 validity: ValidityWindow::perpetual(),
+                // commit gate for an effective authorization mutation:
+                // proof-bound admission (see the org_authority_admission fixture docs).
+                admission: org_authority_admission(&pool).await,
             })
             .await
             .expect("pre-cap membership must be created");
@@ -1789,7 +1941,9 @@ async fn org_scope_membership_cap_serializes_concurrent_distinct_cards() {
     let first_barrier = barrier.clone();
     let first = tokio::spawn(async move {
         first_barrier.wait().await;
-        let repo = SqlxOrgScopeRepository::new(first_pool);
+        let repo = SqlxOrgScopeRepository::new(first_pool.clone());
+        // 每个竞态任务一枚独立 admission（consume-once 不可跨任务复用）。
+        let spawned_admission = org_authority_admission(&first_pool).await;
         let cmd = OrgMembershipCreateCommand {
             operation_id: unique_operation("membership-cap-race-a"),
             actor_user_id: 1,
@@ -1803,6 +1957,9 @@ async fn org_scope_membership_cap_serializes_concurrent_distinct_cards() {
             card_id: MEMBERSHIP_CAP_RACE_CARD_BASE
                 + i64::try_from(ORG_MAX_ACTIVE_MEMBERSHIPS_PER_USER).expect("cap fits i64"),
             validity: ValidityWindow::perpetual(),
+            // commit gate for an effective authorization mutation:
+            // proof-bound admission（见 org_authority_admission fixture 文档）。
+            admission: spawned_admission,
         };
         create_membership_retrying_deadlock(&repo, &cmd).await
     });
@@ -1810,7 +1967,9 @@ async fn org_scope_membership_cap_serializes_concurrent_distinct_cards() {
     let second_barrier = barrier.clone();
     let second = tokio::spawn(async move {
         second_barrier.wait().await;
-        let repo = SqlxOrgScopeRepository::new(second_pool);
+        let repo = SqlxOrgScopeRepository::new(second_pool.clone());
+        // 每个竞态任务一枚独立 admission（consume-once 不可跨任务复用）。
+        let spawned_admission = org_authority_admission(&second_pool).await;
         let cmd = OrgMembershipCreateCommand {
             operation_id: unique_operation("membership-cap-race-b"),
             actor_user_id: 1,
@@ -1822,6 +1981,9 @@ async fn org_scope_membership_cap_serializes_concurrent_distinct_cards() {
             card_id: MEMBERSHIP_CAP_RACE_CARD_BASE
                 + i64::try_from(ORG_MAX_ACTIVE_MEMBERSHIPS_PER_USER - 1).expect("cap fits i64"),
             validity: ValidityWindow::perpetual(),
+            // commit gate for an effective authorization mutation:
+            // proof-bound admission（见 org_authority_admission fixture 文档）。
+            admission: spawned_admission,
         };
         create_membership_retrying_deadlock(&repo, &cmd).await
     });
@@ -1897,6 +2059,7 @@ async fn org_scope_membership_cap_serializes_boundary_race_at_read_committed() {
     for (index, tenant_id) in MEMBERSHIP_CAP_RC_TENANTS.into_iter().enumerate() {
         submit_and_approve(
             &setup_repo,
+            &pool,
             OrgRequestPayload::RootInit {
                 root_tenant_id: tenant_id,
                 initial_grants: Vec::new(),
@@ -1925,6 +2088,9 @@ async fn org_scope_membership_cap_serializes_boundary_race_at_read_committed() {
                 card_id: MEMBERSHIP_CAP_RC_CARD_BASE
                     + i64::try_from(offset).expect("offset fits i64"),
                 validity: ValidityWindow::perpetual(),
+                // commit gate for an effective authorization mutation:
+                // proof-bound admission (see the org_authority_admission fixture docs).
+                admission: org_authority_admission(&pool).await,
             })
             .await
             .expect("READ COMMITTED pre-cap membership must be created");
@@ -1935,7 +2101,9 @@ async fn org_scope_membership_cap_serializes_boundary_race_at_read_committed() {
     let first_barrier = barrier.clone();
     let first = tokio::spawn(async move {
         first_barrier.wait().await;
-        let repo = SqlxOrgScopeRepository::new(first_pool);
+        let repo = SqlxOrgScopeRepository::new(first_pool.clone());
+        // 每个竞态任务一枚独立 admission（consume-once 不可跨任务复用）。
+        let spawned_admission = org_authority_admission(&first_pool).await;
         let cmd = OrgMembershipCreateCommand {
             operation_id: unique_operation("membership-cap-rc-a"),
             actor_user_id: 1,
@@ -1947,6 +2115,9 @@ async fn org_scope_membership_cap_serializes_boundary_race_at_read_committed() {
             card_id: MEMBERSHIP_CAP_RC_CARD_BASE
                 + i64::try_from(ORG_MAX_ACTIVE_MEMBERSHIPS_PER_USER).expect("cap fits i64"),
             validity: ValidityWindow::perpetual(),
+            // commit gate for an effective authorization mutation:
+            // proof-bound admission（见 org_authority_admission fixture 文档）。
+            admission: spawned_admission,
         };
         create_membership_retrying_deadlock(&repo, &cmd).await
     });
@@ -1954,7 +2125,9 @@ async fn org_scope_membership_cap_serializes_boundary_race_at_read_committed() {
     let second_barrier = barrier.clone();
     let second = tokio::spawn(async move {
         second_barrier.wait().await;
-        let repo = SqlxOrgScopeRepository::new(second_pool);
+        let repo = SqlxOrgScopeRepository::new(second_pool.clone());
+        // 每个竞态任务一枚独立 admission（consume-once 不可跨任务复用）。
+        let spawned_admission = org_authority_admission(&second_pool).await;
         let cmd = OrgMembershipCreateCommand {
             operation_id: unique_operation("membership-cap-rc-b"),
             actor_user_id: 1,
@@ -1966,6 +2139,9 @@ async fn org_scope_membership_cap_serializes_boundary_race_at_read_committed() {
             card_id: MEMBERSHIP_CAP_RC_CARD_BASE
                 + i64::try_from(ORG_MAX_ACTIVE_MEMBERSHIPS_PER_USER - 1).expect("cap fits i64"),
             validity: ValidityWindow::perpetual(),
+            // commit gate for an effective authorization mutation:
+            // proof-bound admission（见 org_authority_admission fixture 文档）。
+            admission: spawned_admission,
         };
         create_membership_retrying_deadlock(&repo, &cmd).await
     });
@@ -2019,6 +2195,7 @@ async fn org_scope_membership_cap_serializes_boundary_race_at_read_committed() {
 /// 意图关联 id（意图绑定的权威关联键）。
 async fn submit_and_approve(
     repo: &SqlxOrgScopeRepository,
+    pool: &sqlx::MySqlPool,
     payload: OrgRequestPayload,
     actor_tenant_id: i64,
     approver_tenant_id: Option<i64>,
@@ -2042,6 +2219,9 @@ async fn submit_and_approve(
         operation_id: unique_operation(&format!("apr-{seed}")),
         note: None,
         governance_proof,
+        // 审批是有效授权写点：commit 门要求 proof-bound admission（见
+        // org_authority_admission fixture 文档）。每次审批铸造独立 proof。
+        admission: org_authority_admission(pool).await,
     })
     .await
     .expect("request approval")
@@ -2213,6 +2393,7 @@ async fn create_root_event(
     let repo = SqlxOrgScopeRepository::new(pool.clone());
     let outcome = submit_and_approve(
         &repo,
+        pool,
         OrgRequestPayload::RootInit {
             root_tenant_id: tenant_id,
             initial_grants: Vec::new(),
@@ -2370,6 +2551,7 @@ async fn org_scope_complete_outbox_event_kind_scoped_membership_contract() {
     // 拓扑：root-init R（无种子 grant）→ attach CHILD。
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::RootInit {
             root_tenant_id: COMPLETE_ROOT_TENANT,
             initial_grants: Vec::new(),
@@ -2382,6 +2564,7 @@ async fn org_scope_complete_outbox_event_kind_scoped_membership_contract() {
     .await;
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: COMPLETE_CHILD_TENANT,
             parent_tenant_id: COMPLETE_ROOT_TENANT,
@@ -2404,6 +2587,9 @@ async fn org_scope_complete_outbox_event_kind_scoped_membership_contract() {
         identity_card_id: COMPLETE_FIXTURE.identity_card_id,
         card_id: COMPLETE_FIXTURE.card_id,
         validity: ValidityWindow::perpetual(),
+        // commit gate for an effective authorization mutation:
+        // proof-bound admission (see the org_authority_admission fixture docs).
+        admission: org_authority_admission(&pool).await,
     })
     .await
     .expect("membership create");
@@ -2582,6 +2768,7 @@ async fn org_scope_propagate_subtree_drains_wide_siblings_before_completion() {
     // 传播意图推进，兄弟各自 attach 的 op 与 MOVE op 不同 ⇒ 全部未被标记）。
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::RootInit {
             root_tenant_id: DRAIN_ROOT_TENANT,
             initial_grants: Vec::new(),
@@ -2594,6 +2781,7 @@ async fn org_scope_propagate_subtree_drains_wide_siblings_before_completion() {
     .await;
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::RootInit {
             root_tenant_id: DRAIN_NEW_ROOT_TENANT,
             initial_grants: Vec::new(),
@@ -2606,6 +2794,7 @@ async fn org_scope_propagate_subtree_drains_wide_siblings_before_completion() {
     .await;
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: DRAIN_ANCHOR_TENANT,
             parent_tenant_id: DRAIN_ROOT_TENANT,
@@ -2623,6 +2812,7 @@ async fn org_scope_propagate_subtree_drains_wide_siblings_before_completion() {
     ] {
         submit_and_approve(
             &repo,
+            &pool,
             OrgRequestPayload::Attach {
                 child_tenant_id: sibling,
                 parent_tenant_id: DRAIN_ANCHOR_TENANT,
@@ -2636,6 +2826,7 @@ async fn org_scope_propagate_subtree_drains_wide_siblings_before_completion() {
     }
     let move_outcome = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Move {
             child_tenant_id: DRAIN_ANCHOR_TENANT,
             new_parent_tenant_id: DRAIN_NEW_ROOT_TENANT,
@@ -2808,6 +2999,7 @@ async fn org_scope_propagate_superseded_intent_and_same_root_invalidation() {
     // 拓扑：R ← {P1, P2}；M 挂 P1；X 挂 M。
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::RootInit {
             root_tenant_id: SUPER_ROOT_TENANT,
             initial_grants: Vec::new(),
@@ -2820,6 +3012,7 @@ async fn org_scope_propagate_superseded_intent_and_same_root_invalidation() {
     .await;
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: SUPER_PARENT_OLD,
             parent_tenant_id: SUPER_ROOT_TENANT,
@@ -2832,6 +3025,7 @@ async fn org_scope_propagate_superseded_intent_and_same_root_invalidation() {
     .await;
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: SUPER_PARENT_NEW,
             parent_tenant_id: SUPER_ROOT_TENANT,
@@ -2844,6 +3038,7 @@ async fn org_scope_propagate_superseded_intent_and_same_root_invalidation() {
     .await;
     let attach_anchor = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: SUPER_ANCHOR_TENANT,
             parent_tenant_id: SUPER_PARENT_OLD,
@@ -2856,6 +3051,7 @@ async fn org_scope_propagate_superseded_intent_and_same_root_invalidation() {
     .await;
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: SUPER_LEAF_TENANT,
             parent_tenant_id: SUPER_ANCHOR_TENANT,
@@ -2874,6 +3070,7 @@ async fn org_scope_propagate_superseded_intent_and_same_root_invalidation() {
     // root 不变；其 attach 意图 I1 由此被取代。
     let move_outcome = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Move {
             child_tenant_id: SUPER_ANCHOR_TENANT,
             new_parent_tenant_id: SUPER_PARENT_NEW,
@@ -3198,6 +3395,7 @@ async fn org_scope_dependency_propagate_root_grant_wave_child_then_grandchild_af
     // 拓扑：R → C → G（grant-less；publication 零 segment 合法）。
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::RootInit {
             root_tenant_id: DEP_ROOT_TENANT,
             initial_grants: Vec::new(),
@@ -3210,6 +3408,7 @@ async fn org_scope_dependency_propagate_root_grant_wave_child_then_grandchild_af
     .await;
     let attach_child = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: DEP_CHILD_TENANT,
             parent_tenant_id: DEP_ROOT_TENANT,
@@ -3222,6 +3421,7 @@ async fn org_scope_dependency_propagate_root_grant_wave_child_then_grandchild_af
     .await;
     let attach_grandchild = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: DEP_GRANDCHILD_TENANT,
             parent_tenant_id: DEP_CHILD_TENANT,
@@ -3254,6 +3454,7 @@ async fn org_scope_dependency_propagate_root_grant_wave_child_then_grandchild_af
     // ── 根 grant X：R head +1，落 GRANT_ISSUED(X) + DEPENDENCY_PROPAGATE(X)──
     let grant_x = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::RootGrant {
             root_tenant_id: DEP_ROOT_TENANT,
             scope: scope_for(DEP_ROOT_TENANT, "learn_subject", "write"),
@@ -3337,6 +3538,7 @@ async fn org_scope_dependency_propagate_root_grant_wave_child_then_grandchild_af
     // ── 二次根 grant Y：R head 再 +1；重发布后 X 意图被取代（免写安全完成）──
     let grant_y = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::RootGrant {
             root_tenant_id: DEP_ROOT_TENANT,
             scope: scope_for(DEP_ROOT_TENANT, "learn_subject", "delete"),
@@ -3583,6 +3785,7 @@ async fn org_scope_dependency_propagate_mask_remove_revoke_waves_coalesce_and_ad
     // grant G ← C；发布 R → C → G。
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::RootInit {
             root_tenant_id: DEP_MASK_ROOT_TENANT,
             initial_grants: vec![OrgGrantSeed {
@@ -3598,6 +3801,7 @@ async fn org_scope_dependency_propagate_mask_remove_revoke_waves_coalesce_and_ad
     .await;
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: DEP_MASK_CHILD_TENANT,
             parent_tenant_id: DEP_MASK_ROOT_TENANT,
@@ -3611,6 +3815,7 @@ async fn org_scope_dependency_propagate_mask_remove_revoke_waves_coalesce_and_ad
     let (root_grant_id, root_grant_revision) = parent_grant_of(&pool, DEP_MASK_ROOT_TENANT).await;
     let grant_child = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Grant {
             receiving_tenant_id: DEP_MASK_CHILD_TENANT,
             parent_grant: OrgGrantRef {
@@ -3630,6 +3835,7 @@ async fn org_scope_dependency_propagate_mask_remove_revoke_waves_coalesce_and_ad
     .await;
     let attach_grandchild = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: DEP_MASK_GRANDCHILD_TENANT,
             parent_tenant_id: DEP_MASK_CHILD_TENANT,
@@ -3644,6 +3850,7 @@ async fn org_scope_dependency_propagate_mask_remove_revoke_waves_coalesce_and_ad
         parent_grant_of(&pool, DEP_MASK_CHILD_TENANT).await;
     let grant_grandchild = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Grant {
             receiving_tenant_id: DEP_MASK_GRANDCHILD_TENANT,
             parent_grant: OrgGrantRef {
@@ -3697,6 +3904,9 @@ async fn org_scope_dependency_propagate_mask_remove_revoke_waves_coalesce_and_ad
             },
             expected_unit_generation: mask_generation,
             reason: Some("e2e dependency wave mask".into()),
+            // commit gate for an effective authorization mutation:
+            // proof-bound admission (see the org_authority_admission fixture docs).
+            admission: org_authority_admission(&pool).await,
         })
         .await
         .expect("mask apply");
@@ -3716,6 +3926,9 @@ async fn org_scope_dependency_propagate_mask_remove_revoke_waves_coalesce_and_ad
             tenant_id: DEP_MASK_CHILD_TENANT,
             mask_id,
             expected_revision: 1,
+            // commit gate for an effective authorization mutation:
+            // proof-bound admission (see the org_authority_admission fixture docs).
+            admission: org_authority_admission(&pool).await,
         })
         .await
         .expect("mask remove");
@@ -3846,6 +4059,9 @@ async fn org_scope_dependency_propagate_mask_remove_revoke_waves_coalesce_and_ad
             grant_id: child_grant_id.clone(),
             expected_revision: child_grant_revision,
             reason: Some("e2e dependency wave revoke".into()),
+            // commit gate for an effective authorization mutation:
+            // proof-bound admission (see the org_authority_admission fixture docs).
+            admission: org_authority_admission(&pool).await,
         })
         .await
         .expect("grant revoke");
@@ -3890,6 +4106,7 @@ async fn org_scope_dependency_propagate_reparenting_old_and_new_parent_waves() {
     // 拓扑：R ← {P1, P2}；M、L 挂 P1；K 挂 P2（grant-less；零 segment 合法）。
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::RootInit {
             root_tenant_id: DEP_MV_ROOT_TENANT,
             initial_grants: Vec::new(),
@@ -3902,6 +4119,7 @@ async fn org_scope_dependency_propagate_reparenting_old_and_new_parent_waves() {
     .await;
     let attach_p1 = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: DEP_MV_PARENT_OLD,
             parent_tenant_id: DEP_MV_ROOT_TENANT,
@@ -3914,6 +4132,7 @@ async fn org_scope_dependency_propagate_reparenting_old_and_new_parent_waves() {
     .await;
     let attach_p2 = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: DEP_MV_PARENT_NEW,
             parent_tenant_id: DEP_MV_ROOT_TENANT,
@@ -3926,6 +4145,7 @@ async fn org_scope_dependency_propagate_reparenting_old_and_new_parent_waves() {
     .await;
     let attach_m = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: DEP_MV_MOVED,
             parent_tenant_id: DEP_MV_PARENT_OLD,
@@ -3938,6 +4158,7 @@ async fn org_scope_dependency_propagate_reparenting_old_and_new_parent_waves() {
     .await;
     let attach_l = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: DEP_MV_OLD_SIBLING,
             parent_tenant_id: DEP_MV_PARENT_OLD,
@@ -3950,6 +4171,7 @@ async fn org_scope_dependency_propagate_reparenting_old_and_new_parent_waves() {
     .await;
     let attach_k = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: DEP_MV_NEW_CHILD,
             parent_tenant_id: DEP_MV_PARENT_NEW,
@@ -3991,6 +4213,7 @@ async fn org_scope_dependency_propagate_reparenting_old_and_new_parent_waves() {
     // ── MOVE M：P1 → P2（同根）。M 三计数同步 +1；两父头各 +1 并各落 intent。
     let move_outcome = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Move {
             child_tenant_id: DEP_MV_MOVED,
             new_parent_tenant_id: DEP_MV_PARENT_NEW,
@@ -4140,6 +4363,7 @@ async fn org_scope_dependency_propagate_reparenting_old_and_new_parent_waves() {
     //    与 K 的钉一同失配 → 有界批推进；完成门前先被排空门拒绝 ─────────────
     let attach_k2 = submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::Attach {
             child_tenant_id: DEP_MV_LATE_CHILD,
             parent_tenant_id: DEP_MV_PARENT_NEW,
@@ -4523,7 +4747,7 @@ async fn org_scope_outbox_concurrent_claim_has_one_winner() {
     let first_pool = pool.clone();
     let first_barrier = barrier.clone();
     let first = tokio::spawn(async move {
-        let repo = SqlxOrgScopeRepository::new(first_pool);
+        let repo = SqlxOrgScopeRepository::new(first_pool.clone());
         first_barrier.wait().await;
         claim_outbox_retrying_deadlock(
             &repo,
@@ -4540,7 +4764,7 @@ async fn org_scope_outbox_concurrent_claim_has_one_winner() {
     let second_pool = pool.clone();
     let second_barrier = barrier.clone();
     let second = tokio::spawn(async move {
-        let repo = SqlxOrgScopeRepository::new(second_pool);
+        let repo = SqlxOrgScopeRepository::new(second_pool.clone());
         second_barrier.wait().await;
         claim_outbox_retrying_deadlock(
             &repo,
@@ -4653,6 +4877,7 @@ async fn org_scope_attach_approval_rejects_non_parent_counterparty() {
     let repo = SqlxOrgScopeRepository::new(pool.clone());
     submit_and_approve(
         &repo,
+        &pool,
         OrgRequestPayload::RootInit {
             root_tenant_id: GATE_ATTACH_PARENT_TENANT,
             initial_grants: Vec::new(),
@@ -4687,6 +4912,9 @@ async fn org_scope_attach_approval_rejects_non_parent_counterparty() {
             operation_id: unique_operation("boundary-attach-unauthorized"),
             note: None,
             governance_proof: None,
+            // commit gate for an effective authorization mutation:
+            // proof-bound admission (see the org_authority_admission fixture docs).
+            admission: org_authority_admission(&pool).await,
         })
         .await
         .expect_err("non-parent counterparty must not approve attach");

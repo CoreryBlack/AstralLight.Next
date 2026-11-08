@@ -313,7 +313,7 @@ async fn physical_membership_binding_is_current(
 /// publication **逐项相等**。任一字段漂移（部分写、陈旧覆盖、字节损坏）返回
 /// `Some(明细)`，调用方据此返回 `Pending(PublicationMissing)`；完全一致返回
 /// `None`。绝不放宽为成功路径。
-fn pointer_publication_mismatch(
+pub(crate) fn pointer_publication_mismatch(
     pointer_generation: u64,
     pointer_revoke_fence: u64,
     pointer_manifest_hex: &str,
@@ -395,16 +395,20 @@ async fn dependency_is_stale(
     Ok(None)
 }
 
-/// 行 → 类型化 publication（含全部 sealed segments）。
-async fn read_publication(
+/// 行 → 类型化 publication（含全部 sealed segments）。executor 泛化：pool 读取
+/// 与事务内 certification 读取复用同一段装配逻辑。
+async fn read_publication<'a, E>(
     row: &sqlx::mysql::MySqlRow,
-    pool: &MySqlPool,
-) -> Result<OrgPublication, AstralError> {
+    executor: E,
+) -> Result<OrgPublication, AstralError>
+where
+    E: sqlx::Executor<'a, Database = sqlx::MySql>,
+{
     let publication_id: i64 = row.try_get("publication_id").map_err(db_err)?;
     let dependencies_json: String = row.try_get("dependencies_json").map_err(db_err)?;
     let segment_rows = sqlx::query(READER_SEGMENTS_SQL)
         .bind(publication_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await
         .map_err(db_err)?;
     let mut segments = Vec::with_capacity(segment_rows.len());
@@ -461,6 +465,68 @@ async fn read_publication(
         segments,
         operation_id: row.try_get("operation_id").map_err(db_err)?,
     })
+}
+
+/// 事务内读取当前**可证明**的 sealed publication（certification owner 路径）：
+/// current 指针存在、解析到 SEALED 状态的 publication 行、且指针身份三字段
+/// 与封存载荷逐项相等。任一前提不满足返回 `None`（调用方一律 pending），
+/// 绝不把漂移指针当作可证明 publication。
+pub(crate) async fn load_sealed_publication_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    tenant_id: i64,
+) -> Result<Option<OrgPublication>, AstralError> {
+    let current = sqlx::query(READER_CURRENT_SQL)
+        .bind(tenant_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    let Some(current) = current else {
+        return Ok(None);
+    };
+    let publication_id: i64 = current.try_get("publication_id").map_err(db_err)?;
+    let pointer_generation = match row_generation(
+        current.try_get::<i64, _>("generation").map_err(db_err)?,
+        "current.generation",
+    ) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let pointer_revoke_fence = match row_generation(
+        current.try_get::<i64, _>("revoke_fence").map_err(db_err)?,
+        "current.revoke_fence",
+    ) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let pointer_manifest_hex = hex::encode(
+        current
+            .try_get::<Vec<u8>, _>("manifest_digest")
+            .map_err(db_err)?,
+    );
+    let publication_row = sqlx::query(READER_PUBLICATION_SQL)
+        .bind(publication_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    let Some(publication_row) = publication_row else {
+        return Ok(None);
+    };
+    let status: String = publication_row.try_get("status").map_err(db_err)?;
+    if status != "SEALED" {
+        return Ok(None);
+    }
+    let publication = read_publication(&publication_row, &mut **tx).await?;
+    if pointer_publication_mismatch(
+        pointer_generation,
+        pointer_revoke_fence,
+        &pointer_manifest_hex,
+        &publication,
+    )
+    .is_some()
+    {
+        return Ok(None);
+    }
+    Ok(Some(publication))
 }
 
 #[cfg(test)]

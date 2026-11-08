@@ -63,7 +63,10 @@ async fn require_active_global_admin(
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value > 0)
         .ok_or_else(|| refused(StatusCode::UNAUTHORIZED, "IDENTITY_REQUIRED", None, false))?;
-    let repository = astral_db::SqlxRuleRepository::new(state.db.clone());
+    let repository = astral_db::SqlxRuleRepository::new(state.db.clone())
+        .with_org_scope_enabled(state.org_scope_enabled)
+        .with_authority_provider_opt(state.authorization_fence_provider.clone())
+        .with_authority_required(state.config.authority_runtime_mode.requires_authority());
     let active = policy_engine::RuleRepository::is_active_global_admin(&repository, user_id)
         .await
         .map_err(|_| {

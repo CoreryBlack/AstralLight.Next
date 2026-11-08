@@ -198,10 +198,27 @@ pub async fn run_with_listen_addr_and_shutdown<F>(addr: &str, shutdown: F) -> an
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    run_with_listen_addr_and_shutdown_inner(addr, shutdown).await
+    let config = AppConfig::from_files_for("application", JwtValidationRole::Gateway)?;
+    run_with_config_and_listen_addr_and_shutdown(config, addr, shutdown).await
 }
 
-async fn run_with_listen_addr_and_shutdown_inner<F>(addr: &str, shutdown: F) -> anyhow::Result<()>
+pub async fn run_with_config_and_listen_addr_and_shutdown<F>(
+    config: AppConfig,
+    addr: &str,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    config.validate_listener_for(JwtValidationRole::Gateway)?;
+    run_with_listen_addr_and_shutdown_inner(config, addr, shutdown).await
+}
+
+async fn run_with_listen_addr_and_shutdown_inner<F>(
+    config: AppConfig,
+    addr: &str,
+    shutdown: F,
+) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -220,7 +237,6 @@ where
         }
     }
 
-    let config = AppConfig::from_files_for("application", JwtValidationRole::Gateway)?;
     let session_db = astral_db::connect_and_validate_schema(&config.database_url)
         .await
         .map_err(|error| anyhow::Error::msg(error.to_string()))?;

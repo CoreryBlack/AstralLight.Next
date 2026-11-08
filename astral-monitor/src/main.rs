@@ -99,6 +99,20 @@ async fn main() -> anyhow::Result<()> {
         JwtValidationRole::Gateway,
     )?);
     let db = connect_and_validate_schema(&config.database_url).await?;
+    let authorization_fence_provider = astral_db::authority_provider_from_env(db.clone())
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("authorization authority trust-root configuration invalid: {error}")
+        })?;
+    // Authority source outcome reconciliation runtime（V7）：provider 存在时
+    // 运行与 TrustGraph/Identity 相同的共享生命周期任务；先于 collector 启动，
+    // 因此按严格逆序在关闭尾段（HTTP drain、collector 停止与 owned audit
+    // drain 之后）最后停止。provider 缺席时保持既有 fail-closed 行为：不启动、
+    // 不产生正向就绪信号。Monitor 不持有 authority 私有材料，也不重复持有
+    // provider/quorum 的批次与 allowlist 配置。
+    let mut authority_source_outcome_runtime = authorization_fence_provider
+        .clone()
+        .map(astral_db::authority_source_runtime::spawn_authority_source_outcome_runtime);
     let engine = Arc::new(PolicyEngine::new());
     astral_common::audit::register_audit_db_writer(Arc::new(MonitorAuditDbWriter {
         pool: db.clone(),
@@ -111,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
         config,
         db,
         engine,
+        authorization_fence_provider,
         monitor_service,
     };
 
@@ -170,13 +185,46 @@ async fn main() -> anyhow::Result<()> {
             };
             (Err(anyhow::anyhow!(failure)), true)
         }
+        death = async {
+            match authority_source_outcome_runtime.as_mut() {
+                Some(handle) => handle.wait_for_death().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            let _ = shutdown_tx.send(());
+            let failure = match tokio::time::timeout(Duration::from_secs(30), &mut serve).await {
+                Ok(Ok(())) => format!("required authority source outcome runtime exited: {death}"),
+                Ok(Err(error)) => format!(
+                    "required authority source outcome runtime exited: {death}; HTTP drain failed: {error}"
+                ),
+                Err(_) => format!(
+                    "required authority source outcome runtime exited: {death}; HTTP drain timed out; request outcomes unknown"
+                ),
+            };
+            (Err(anyhow::anyhow!(failure)), true)
+        }
     };
     if !graceful_shutdown {
         collector.request_shutdown();
+        if let Some(handle) = authority_source_outcome_runtime.as_ref() {
+            handle.request_shutdown();
+        }
     }
 
     let collector_result = collector.shutdown(Duration::from_secs(10)).await;
     let audit_result = astral_common::audit::drain_owned_audit_tasks(Duration::from_secs(5)).await;
+    // Authority source outcome runtime：先于 collector 启动 → 严格逆序在
+    // collector 停止与 owned audit drain 之后最后停止。在途 cycle 受 <=10s
+    // deadline 约束；未知取消只留下 durable lease pending，绝不重放 source。
+    // 失败与 panic 转为进程错误，绝不静默。
+    let source_outcome_result = match authority_source_outcome_runtime.take() {
+        Some(handle) => {
+            handle
+                .shutdown(astral_db::authority_source_runtime::SOURCE_OUTCOME_SHUTDOWN_JOIN_TIMEOUT)
+                .await
+        }
+        None => Ok(()),
+    };
     let mut shutdown_errors = Vec::new();
     if let Err(error) = serve_result {
         tracing::error!(error = %error, "monitor HTTP server stopped with error");
@@ -189,6 +237,10 @@ async fn main() -> anyhow::Result<()> {
     if let Err(error) = audit_result {
         tracing::error!(error = %error, "owned audit drain failed");
         shutdown_errors.push(format!("owned audit drain: {error}"));
+    }
+    if let Err(error) = source_outcome_result {
+        tracing::error!(error = %error, "authority source outcome runtime shutdown failed");
+        shutdown_errors.push(format!("authority source outcome runtime: {error}"));
     }
     if shutdown_errors.is_empty() {
         Ok(())
@@ -249,6 +301,7 @@ mod router_tests {
             }),
             db: db.clone(),
             engine: Arc::new(PolicyEngine::new()),
+            authorization_fence_provider: None,
             monitor_service: Arc::new(MonitorService::new(Arc::new(SqlxMonitorRepository::new(
                 db,
             )))),

@@ -2775,7 +2775,7 @@ fn decide_quarantines_dependency_drift_and_unsupported_compilers() {
 
     for compiler in [
         "astral-authorization-v5",
-        "astral-authorization-v7",
+        "astral-authorization-v6",
         "foreign-v6",
     ] {
         let mut foreign_compiler = claimed_event(&own, &delta, 5, 1, "evt-cv", "op-cv", &dep_hash);
@@ -2800,6 +2800,28 @@ fn decide_quarantines_dependency_drift_and_unsupported_compilers() {
             other => panic!("expected quarantine on {compiler}, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn decide_accepts_the_current_compiler() {
+    let fx = fixture();
+    let own = fx.grant_rev1;
+    let (_, dep_hash) = active_card_dependency_hash(5, 1);
+    let delta = astral_types::GrantDelta::add(own.clone());
+    let claimed = claimed_event(&own, &delta, 5, 1, "evt-current", "op-current", &dep_hash);
+    let rows = vec![raw_row(&own, "evt-current", "op-current", 1)];
+    assert_eq!(claimed.compiler_version, policy_engine::COMPILER_VERSION);
+    assert_eq!(rows[0].compiler_version, policy_engine::COMPILER_VERSION);
+    let input = EventDecisionInput {
+        claimed: &claimed,
+        publication: None,
+        ledger_rows: &rows,
+        identity: ProjectionAggregateIdentity::new(7, "CARD", 17).unwrap(),
+    };
+    assert!(matches!(
+        decide_event_disposition(&input),
+        EventDisposition::Publish(_)
+    ));
 }
 
 #[test]

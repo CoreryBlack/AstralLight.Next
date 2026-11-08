@@ -28,6 +28,7 @@ astral-common = { path = "../astral-common" }
 astral-types = { path = "../astral-types" }
 policy-engine = { path = "../policy-engine" }
 astral-db = { path = "../astral-db" }
+astral-authority = { path = "../astral-authority", default-features = false }
 astral-sdk-contracts = { path = "../astral-sdk-contracts" }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }

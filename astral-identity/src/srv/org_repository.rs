@@ -9,6 +9,10 @@
 //!   ELIGIBILITY 投影事件 + `ELIGIBILITY_INVALIDATED` typed invalidation
 //!   intent（`al_message_outbox`），receipt 事务内先注册；扇出上限 512
 //!   （与 trustgraph 对等），超限在任何 mutation 之前拒绝；
+//! - 影响有效资格的变更（tenant/org 状态迁移与删除）必须携带 proof-bound
+//!   `AuthorizationAdmission`：actor 卡范围绑定在 `FOR UPDATE` 校验阶段完成，
+//!   durable authority 复核与一次性消费在 COMMIT await 前完成；缺失 admission
+//!   → 安全 Pending（零写入拒绝），绝不以平台管理员/角色判定充当证明；
 //! - 只有被证明成功的 commit 才按序直投 LocalBus（整批共享一个 5s 总预算，
 //!   预算耗尽后剩余 receipts 保持 durable pending，失败仅记录，unknown 绝不
 //!   重放）；
@@ -18,10 +22,16 @@
 //! - 每张受影响卡在提交前进程内 evict 正向 L1 资格缓存并推进 per-card 纪元
 //!   （`evict_l1_card_active_cache`）；evict 单调，commit 未知绝不恢复旧条目。
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sqlx::{MySql, MySqlPool, Transaction};
+
+use astral_db::authority_eligibility_completion::{
+    EligibilitySourceCapture, EligibilitySourceEvidenceReceipt, EligibilitySourceSubject,
+};
+use astral_db::invalidation_delivery::InvalidationDeliveryContext;
 
 use astral_db::grant_ledger::validated_request_operation_id;
 use astral_db::memory_projection_hub::SourceTransactionGuard;
@@ -34,9 +44,19 @@ use astral_mq::invalidation::{
     EligibilityInvalidated, InvalidationEvent, ELIGIBILITY_INVALIDATED, INVALIDATION_QUEUE,
 };
 use astral_mq::{local_bus, MessageEnvelope};
-use astral_types::{AstralError, ProjectionAggregate, EVENT_TYPE_ELIGIBILITY_UPDATE};
+use astral_types::{
+    AstralError, AuthorizationAdmission, AuthorizationDomainScope, ProjectionAggregate,
+    EVENT_TYPE_ELIGIBILITY_UPDATE,
+};
+
+use crate::srv::source_writer_guard;
 
 /// Gateway-verified identity and scope captured for one Identity org mutation.
+///
+/// `admission` 是同一请求经权限中间件认证后插入的 proof-bound 能力：纯
+/// metadata 变更可以不带；影响有效资格的写路径（tenant/org 状态迁移与删除）
+/// 在 source 事务内 fail-closed 地要求并消费它（见
+/// [`OrgMutationContext::require_admission`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgMutationContext {
     actor_id: i64,
@@ -44,6 +64,7 @@ pub struct OrgMutationContext {
     actor_tenant_id: i64,
     actor_domain_id: i64,
     request_id: String,
+    admission: Option<AuthorizationAdmission>,
 }
 
 impl OrgMutationContext {
@@ -68,6 +89,31 @@ impl OrgMutationContext {
             actor_tenant_id,
             actor_domain_id,
             request_id,
+            admission: None,
+        })
+    }
+
+    /// Attach the proof-bound admission extracted from the same verified
+    /// request. Absence stays visible to eligibility-affecting writers, which
+    /// fail closed on it; metadata-only writers ignore it.
+    pub(crate) fn with_admission(mut self, admission: Option<AuthorizationAdmission>) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    fn admission(&self) -> Option<&AuthorizationAdmission> {
+        self.admission.as_ref()
+    }
+
+    /// Fail-closed accessor for eligibility-affecting org mutations: a missing
+    /// proof-bound admission is a safe PENDING (zero writes), never an implicit
+    /// allow, and platform-admin/role state never substitutes for it.
+    fn require_admission(&self) -> Result<&AuthorizationAdmission, AstralError> {
+        self.admission.as_ref().ok_or_else(|| {
+            AstralError::Pending(
+                "eligibility-affecting org mutation requires a proof-bound authorization admission"
+                    .into(),
+            )
         })
     }
 
@@ -102,12 +148,47 @@ async fn verify_org_mutation_actor_in_tx(
                 && domain_id == context.actor_domain_id
                 && status == "ACTIVE" =>
         {
-            Ok(())
+            // 携带 admission 时把 proof scope 绑定到刚 `FOR UPDATE` 锁定的
+            // actor 卡行（card/tenant/user + Exact domain）：不加第二次读，
+            // 锁与绑定之间没有窗口；范围不符 fail-closed（Permission）。
+            verify_org_mutation_admission_scope(context, user_id, tenant_id, domain_id)
         }
         _ => Err(AstralError::Auth(
             "Gateway org mutation card context no longer matches an active user_card".into(),
         )),
     }
+}
+
+/// Bind a carried admission's proof scope to the already-locked actor card row
+/// (user/tenant/domain identity and ACTIVE status were verified by the caller).
+/// Unconstrained or domain-less proof scopes cannot authorize a mutation whose
+/// actor card carries a concrete domain — same strict binding as the TrustGraph
+/// tenant mutation context.
+fn verify_org_mutation_admission_scope(
+    context: &OrgMutationContext,
+    user_id: i64,
+    tenant_id: i64,
+    domain_id: i64,
+) -> Result<(), AstralError> {
+    let Some(admission) = context.admission() else {
+        return Ok(());
+    };
+    let scope = &admission.proof().scope;
+    let domain_matches = matches!(
+        scope.domain,
+        AuthorizationDomainScope::Exact(value) if value == domain_id
+    );
+    if scope.card_id != context.actor_card_id
+        || scope.tenant_id != tenant_id
+        || scope.user_id != Some(user_id)
+        || !domain_matches
+    {
+        return Err(AstralError::Permission(
+            "authorization admission scope does not match the locked org mutation actor card"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn insert_org_mutation_audit_in_tx(
@@ -118,7 +199,7 @@ async fn insert_org_mutation_audit_in_tx(
     target_id: i64,
     operation_id: &str,
     detail: serde_json::Value,
-) -> Result<String, AstralError> {
+) -> Result<i64, AstralError> {
     if context.actor_id <= 0
         || context.actor_card_id <= 0
         || context.actor_tenant_id <= 0
@@ -154,7 +235,7 @@ async fn insert_org_mutation_audit_in_tx(
             "org mutation audit detail serialization failed: {error}"
         ))
     })?;
-    sqlx::query(ORG_MUTATION_AUDIT_INSERT_SQL)
+    let result = sqlx::query(ORG_MUTATION_AUDIT_INSERT_SQL)
         .bind(context.actor_id)
         .bind(context.actor_card_id)
         .bind(action)
@@ -168,7 +249,13 @@ async fn insert_org_mutation_audit_in_tx(
         .map_err(|error| {
             AstralError::Database(format!("org mutation audit insert failed: {error}"))
         })?;
-    Ok(operation_id)
+    // 实际 audit_log 主键是 source outcome 真实语句 receipt 的 durable id。
+    i64::try_from(result.last_insert_id())
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            AstralError::Internal("org mutation audit insert returned an unusable id".into())
+        })
 }
 
 async fn commit_org_mutation_tx(
@@ -185,6 +272,122 @@ async fn commit_org_mutation_tx(
             Err(db_error(error))
         }
     }
+}
+
+/// 已 admitted org/tenant source 事务的 stage/promote 闭合（COMMIT await 前调用）。
+///
+/// 目标镜像与 receipt 全部来自本事务**实际**读取/写入：before 为 `FOR UPDATE`
+/// 锁定行镜像，after 为写后同事务回读（硬 DELETE 后 `Absent` 是真实探针）；
+/// receipt 覆盖 tenant UPDATE/DELETE、audit_log INSERT 与本事务写入的
+/// ELIGIBILITY 投影/typed intent 行（`FOR UPDATE` 读回验证）。扇出超过确定性
+/// 窗口时溢出量以显式 total 进入 staged artifact。随后委托共享
+/// `stage_identity_source_outcome_in_tx`（AuthorizationSource，coverage None；
+/// canonical hash / finite coverage 由共享 API 负责）。
+#[allow(clippy::too_many_arguments)]
+async fn stage_tenant_source_outcome(
+    tx: &mut Transaction<'_, MySql>,
+    admission: &AuthorizationAdmission,
+    target_tenant_id: i64,
+    before_row: &TenantRowImage,
+    after_row: Option<TenantRowImage>,
+    operation_id: &str,
+    mutation_rows: u64,
+    mutation_kind: astral_db::WriteKind,
+    audit_id: i64,
+    receipts: &[InvalidationReceipt],
+    affected_cards: &[(i64, Option<i64>)],
+    eligibility_receipt: Option<EligibilitySourceEvidenceReceipt>,
+) -> Result<(), AstralError> {
+    let event_ids: Vec<String> = receipts
+        .iter()
+        .map(|receipt| receipt.event_id.clone())
+        .collect();
+    let (window, total) = source_writer_guard::bounded_receipt_window(
+        event_ids,
+        source_writer_guard::SOURCE_OUTCOME_RECEIPT_WINDOW,
+    );
+    let confirmed_events =
+        source_writer_guard::read_back_projection_outbox_in_tx(tx, &window).await?;
+    let confirmed_intents =
+        source_writer_guard::read_back_message_outbox_in_tx(tx, &window, operation_id).await?;
+    let target = eligibility_receipt
+        .as_ref()
+        .map(source_writer_guard::source_target_from_eligibility_receipt)
+        .unwrap_or_else(|| source_writer_guard::SourceTargetImage {
+            entity: "tenant",
+            key: serde_json::json!({ "tenantId": target_tenant_id }),
+            before: source_writer_guard::SourceRowPresence::present(before_row.to_row_json()),
+            after: match after_row {
+                Some(row) => source_writer_guard::SourceRowPresence::present(row.to_row_json()),
+                None => source_writer_guard::SourceRowPresence::Absent,
+            },
+        });
+
+    let mut outcome = source_writer_guard::IdentitySourceOutcome::new()
+        .target(target)
+        .receipt(source_writer_guard::SourceStatementReceipt {
+            entity: "tenant",
+            key: serde_json::json!({ "tenantId": target_tenant_id }),
+            kind: mutation_kind,
+            rows_affected: mutation_rows,
+            durable_id: target_tenant_id.to_string(),
+        })
+        .receipt(source_writer_guard::SourceStatementReceipt {
+            entity: "audit_log",
+            key: serde_json::json!({ "id": audit_id }),
+            kind: astral_db::WriteKind::Insert,
+            rows_affected: 1,
+            durable_id: audit_id.to_string(),
+        });
+    for event_id in &confirmed_events {
+        outcome = outcome.receipt(source_writer_guard::SourceStatementReceipt {
+            entity: "authorization_projection_outbox",
+            key: serde_json::json!({ "eventId": event_id }),
+            kind: astral_db::WriteKind::Insert,
+            rows_affected: 1,
+            durable_id: event_id.clone(),
+        });
+    }
+    for message_id in &confirmed_intents {
+        outcome = outcome.receipt(source_writer_guard::SourceStatementReceipt {
+            entity: "al_message_outbox",
+            key: serde_json::json!({ "messageId": message_id, "operationId": operation_id }),
+            kind: astral_db::WriteKind::Insert,
+            rows_affected: 1,
+            durable_id: message_id.clone(),
+        });
+    }
+    let result = serde_json::json!({
+        "operationId": operation_id,
+        "targetTenantId": target_tenant_id,
+        "fromStatus": before_row.status,
+        "rowsAffected": mutation_rows,
+        "fanout": {
+            "eligibilityEvents": total,
+            "projectionReceipts": confirmed_events.len(),
+            "intentReceipts": confirmed_intents.len(),
+            // 实际完整受影响卡 owner 集合（事务内 FOR UPDATE 锁定扫描的真集，
+            // 绝不猜测）：finite coverage 的 raw material，由共享 publication
+            // candidate 装配层消费（scope 上限 256 由该层裁决）。
+            "affectedCards": affected_cards
+                .iter()
+                .map(|(card_id, tenant_id)| serde_json::json!({
+                    "cardId": card_id,
+                    "tenantId": tenant_id,
+                }))
+                .collect::<Vec<_>>(),
+        },
+    });
+    let outcome = if let Some(receipt) = eligibility_receipt {
+        outcome.with_eligibility_receipt(receipt)
+    } else if !affected_cards.is_empty() {
+        return Err(AstralError::Pending(
+            "tenant eligibility source mutation lacks its opaque completion receipt".into(),
+        ));
+    } else {
+        outcome
+    };
+    source_writer_guard::stage_identity_source_outcome_in_tx(tx, admission, outcome, &result).await
 }
 
 /// 组织行（tenant_type='ENTERPRISE' 的租户）。
@@ -238,12 +441,52 @@ const ORG_MUTATION_AUDIT_INSERT_SQL: &str = "INSERT INTO audit_log (user_id, car
 const DOMAIN_MAPPING_REFERENCE_LOCK_SQL: &str = "SELECT tenant_id FROM tenant_domain_map WHERE domain_id = ? ORDER BY tenant_id LIMIT 1 FOR UPDATE";
 const DOMAIN_USER_CARD_REFERENCE_LOCK_SQL: &str =
     "SELECT card_id FROM user_card WHERE domain_id = ? ORDER BY card_id LIMIT 1 FOR UPDATE";
-const TENANT_STATUS_LOCK_SQL: &str = "SELECT status FROM tenant WHERE tenant_id = ? FOR UPDATE";
-const TENANT_ID_LOCK_SQL: &str = "SELECT tenant_id FROM tenant WHERE tenant_id = ? FOR UPDATE";
-const ENTERPRISE_STATUS_LOCK_SQL: &str =
-    "SELECT status FROM tenant WHERE tenant_id = ? AND tenant_type = 'ENTERPRISE' FOR UPDATE";
-const ENTERPRISE_ID_LOCK_SQL: &str =
-    "SELECT tenant_id FROM tenant WHERE tenant_id = ? AND tenant_type = 'ENTERPRISE' FOR UPDATE";
+const TENANT_STATUS_LOCK_SQL: &str = "SELECT tenant_id, tenant_name, tenant_code, status \
+     FROM tenant WHERE tenant_id = ? FOR UPDATE";
+const TENANT_ID_LOCK_SQL: &str = "SELECT tenant_id, tenant_name, tenant_code, status \
+     FROM tenant WHERE tenant_id = ? FOR UPDATE";
+const ENTERPRISE_STATUS_LOCK_SQL: &str = "SELECT tenant_id, tenant_name, tenant_code, status \
+     FROM tenant WHERE tenant_id = ? AND tenant_type = 'ENTERPRISE' FOR UPDATE";
+const ENTERPRISE_ID_LOCK_SQL: &str = "SELECT tenant_id, tenant_name, tenant_code, status \
+     FROM tenant WHERE tenant_id = ? AND tenant_type = 'ENTERPRISE' FOR UPDATE";
+
+/// tenant 行镜像（mutation 实际触及的列 + 身份列）：before 侧来自 `FOR UPDATE`
+/// 锁定读（谓词不变、行锁不变，只扩展返回列集），after 侧来自同事务写后回读
+/// ——两侧都是真实探针，绝不以 actor 快照或 operation id 替代目标证据。
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct TenantRowImage {
+    tenant_id: i64,
+    tenant_name: String,
+    tenant_code: String,
+    status: String,
+}
+
+impl TenantRowImage {
+    fn to_row_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tenantId": self.tenant_id,
+            "name": self.tenant_name,
+            "code": self.tenant_code,
+            "status": self.status,
+        })
+    }
+}
+
+const TENANT_ROW_IMAGE_SQL: &str =
+    "SELECT tenant_id, tenant_name, tenant_code, status FROM tenant WHERE tenant_id = ?";
+
+/// 写后同事务回读（无状态谓词）：硬 DELETE 后 `None` 是真实探针结果（delete
+/// 真值），更新后携带实际写入的新状态。
+async fn read_back_tenant_row_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    tenant_id: i64,
+) -> Result<Option<TenantRowImage>, AstralError> {
+    sqlx::query_as::<_, TenantRowImage>(TENANT_ROW_IMAGE_SQL)
+        .bind(tenant_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| AstralError::Database(format!("Read back tenant row failed: {error}")))
+}
 /// `delete_tenant`/`delete_org` 共用的 user_card 引用守卫：`user_card.tenant_id`
 /// 无外键约束（运行时 schema 契约见 `astral-db::migration`，既有索引不含
 /// `tenant_id`），不限 card_status（含 DISABLED 等非 ACTIVE 卡），任何引用行都
@@ -275,7 +518,12 @@ const TENANT_CARD_REFERENCE_LOCK_SQL: &str =
 #[derive(Debug, Clone)]
 struct InvalidationReceipt {
     event_id: String,
+    projection_event_id: String,
     operation_id: String,
+    card_id: i64,
+    tenant_id: Option<i64>,
+    generation: u64,
+    revoke_watermark: u64,
     envelope: MessageEnvelope,
 }
 
@@ -450,6 +698,7 @@ fn tenant_delete_operation_id(tenant_id: i64) -> String {
 /// append 的 mutation 与事件对；evict 单调，回滚只是保守多失效一次）。
 async fn append_tenant_eligibility_with_invalidation_in_tx(
     tx: &mut Transaction<'_, MySql>,
+    delivery_context: &InvalidationDeliveryContext,
     tenant_id: i64,
     operation_id: &str,
     cards: Vec<(i64, Option<i64>)>,
@@ -504,14 +753,37 @@ async fn append_tenant_eligibility_with_invalidation_in_tx(
             schema_version: envelope.schema_version,
             payload_json: &payload_json,
             headers_json: None,
+            authority_metadata_json: None,
             payload_sha256: &envelope.payload_sha256,
         };
         append_in_tx(tx, &input)
             .await
             .map_err(|error| AstralError::Database(error.to_string()))?;
+        astral_db::invalidation_delivery::stage_invalidation_delivery_with_context_in_tx(
+            tx,
+            delivery_context,
+            &envelope.message_id,
+        )
+        .await
+        .map_err(|error| {
+            AstralError::Pending(format!("stage invalidation delivery failed: {error}"))
+        })?;
         receipts.push(InvalidationReceipt {
             event_id: envelope.message_id.clone(),
+            projection_event_id: identity.event_id.clone(),
             operation_id: envelope.operation_id.clone(),
+            card_id,
+            tenant_id: card_tenant_id,
+            generation: u64::try_from(identity.source_generation).map_err(|_| {
+                AstralError::Internal(
+                    "eligibility generation is outside the supported range".into(),
+                )
+            })?,
+            revoke_watermark: u64::try_from(identity.revoke_fence).map_err(|_| {
+                AstralError::Internal(
+                    "eligibility revoke watermark is outside the supported range".into(),
+                )
+            })?,
             envelope,
         });
     }
@@ -773,11 +1045,33 @@ pub trait OrgRepository: Send + Sync {
 
 pub struct SqlxOrgRepository {
     db: MySqlPool,
+    delivery_context: Option<Arc<InvalidationDeliveryContext>>,
 }
 
 impl SqlxOrgRepository {
     pub fn new(db: MySqlPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            delivery_context: None,
+        }
+    }
+
+    pub fn new_with_delivery_context(
+        db: MySqlPool,
+        delivery_context: Arc<InvalidationDeliveryContext>,
+    ) -> Self {
+        Self {
+            db,
+            delivery_context: Some(delivery_context),
+        }
+    }
+
+    fn require_delivery_context(&self) -> Result<&InvalidationDeliveryContext, AstralError> {
+        self.delivery_context.as_deref().ok_or_else(|| {
+            AstralError::Pending(
+                "eligibility mutation requires an injected invalidation delivery context".into(),
+            )
+        })
     }
 }
 
@@ -862,63 +1156,130 @@ impl OrgRepository for SqlxOrgRepository {
             .begin()
             .await
             .map_err(|e| AstralError::Database(format!("Begin update org tx failed: {e}")))?;
-        let current: Option<(String,)> = sqlx::query_as(ENTERPRISE_STATUS_LOCK_SQL)
+        let current: Option<TenantRowImage> = sqlx::query_as(ENTERPRISE_STATUS_LOCK_SQL)
             .bind(id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_error)?;
-        let Some((current_status,)) = current else {
+        let Some(before_row) = current else {
             return Err(AstralError::NotFound(format!("organization {id}")));
         };
         verify_org_mutation_actor_in_tx(&mut tx, context).await?;
-        let mut invalidation_receipts = Vec::new();
-        let fanout = if status_changed(&current_status, status) {
-            Some(scan_tenant_eligibility_cards_in_tx(&mut tx, id).await?)
+        let metadata_only = !status_changed(&before_row.status, status);
+        if metadata_only {
+            require_metadata_only_org_update(&before_row, status)?;
+        }
+        let mut eligibility_capture = if !metadata_only {
+            source_writer_guard::EligibilityTransaction::Captured(Box::new(
+                EligibilitySourceCapture::begin_in_tx(
+                    &mut tx,
+                    context.require_admission()?,
+                    EligibilitySourceSubject::TenantStatus { tenant_id: id },
+                )
+                .await
+                .map_err(|error| AstralError::Pending(error.to_string()))?,
+            ))
+        } else {
+            source_writer_guard::EligibilityTransaction::Direct(&mut tx)
+        };
+        let admission = if !metadata_only {
+            Some(context.require_admission()?.clone())
         } else {
             None
         };
-
-        sqlx::query(
-            "UPDATE tenant SET tenant_name = ?, tenant_code = ?, status = ? \
-             WHERE tenant_id = ? AND tenant_type = 'ENTERPRISE'",
-        )
-        .bind(name)
-        .bind(code)
-        .bind(status)
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_error)?;
-        let operation_id = if status_changed(&current_status, status) {
-            tenant_status_operation_id(id, &current_status, status)
+        let affected_cards = eligibility_capture.selected_cards().to_vec();
+        let delivery_context = if admission.is_some() {
+            Some(self.require_delivery_context()?)
         } else {
-            format!("org:tenant-update:{id}")
+            None
         };
-        if let Some(cards) = fanout {
+        let operation_id = if metadata_only {
+            context.request_id.clone()
+        } else {
+            admission
+                .as_ref()
+                .map(|value| value.operation_id().to_owned())
+                .ok_or_else(|| {
+                    AstralError::Pending(
+                        "eligibility-affecting organization update lacks its admission operation id"
+                            .into(),
+                    )
+                })?
+        };
+
+        let update_result = if metadata_only {
+            sqlx::query(
+                "UPDATE tenant SET tenant_name = ?, tenant_code = ? \
+                 WHERE tenant_id = ? AND tenant_type = 'ENTERPRISE'",
+            )
+            .bind(name)
+            .bind(code)
+            .bind(id)
+            .execute(&mut **eligibility_capture.with_tx_mut())
+            .await
+        } else {
+            sqlx::query(
+                "UPDATE tenant SET tenant_name = ?, tenant_code = ?, status = ? \
+                 WHERE tenant_id = ? AND tenant_type = 'ENTERPRISE'",
+            )
+            .bind(name)
+            .bind(code)
+            .bind(status)
+            .bind(id)
+            .execute(&mut **eligibility_capture.with_tx_mut())
+            .await
+        }
+        .map_err(db_error)?;
+        let after_row = read_back_tenant_row_in_tx(eligibility_capture.with_tx_mut(), id).await?;
+        let mut invalidation_receipts = Vec::new();
+        if let Some(delivery_context) = delivery_context {
             append_tenant_eligibility_with_invalidation_in_tx(
-                &mut tx,
+                eligibility_capture.with_tx_mut(),
+                delivery_context,
                 id,
                 &operation_id,
-                cards,
+                affected_cards.clone(),
                 &mut invalidation_receipts,
             )
             .await?;
         }
-        insert_org_mutation_audit_in_tx(
-            &mut tx,
+        let audit_id = insert_org_mutation_audit_in_tx(
+            eligibility_capture.with_tx_mut(),
             context,
             "update",
-            "organization",
+            "tenant",
             id,
             &operation_id,
             serde_json::json!({
                 "name": name,
                 "code": code,
-                "fromStatus": current_status,
+                "fromStatus": before_row.status,
                 "toStatus": status,
             }),
         )
         .await?;
+        let eligibility_receipt = eligibility_capture.finish_in_tx().await?;
+        // COMMIT await 前：durable authority 复核 + admission 一次性消费
+        // （校验失败不消费；消费后失败绝不重置，随事务回滚，重试需新 admission）。
+        // 已 admitted 路径同事务完成真实 source outcome stage/promote。
+        if let Some(admission) = &admission {
+            source_writer_guard::validate_and_consume_admission(&mut tx, admission).await?;
+            stage_tenant_source_outcome(
+                &mut tx,
+                admission,
+                id,
+                &before_row,
+                after_row,
+                &operation_id,
+                update_result.rows_affected(),
+                astral_db::WriteKind::Update,
+                audit_id,
+                &invalidation_receipts,
+                &affected_cards,
+                eligibility_receipt,
+            )
+            .await?;
+        }
         arm_org_commit_fence(&source_guard);
         let commit_result = tx.commit().await;
         let proven_receipts =
@@ -955,16 +1316,19 @@ impl OrgRepository for SqlxOrgRepository {
             .begin()
             .await
             .map_err(|e| AstralError::Database(format!("Begin delete org tx failed: {e}")))?;
-        let existing: Option<(i64,)> = sqlx::query_as(ENTERPRISE_ID_LOCK_SQL)
+        let existing: Option<TenantRowImage> = sqlx::query_as(ENTERPRISE_ID_LOCK_SQL)
             .bind(id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_error)?;
-        if existing.is_none() {
+        let Some(before_row) = existing else {
             tx.rollback().await.map_err(db_error)?;
             return Err(AstralError::NotFound(format!("organization {id}")));
-        }
+        };
         verify_org_mutation_actor_in_tx(&mut tx, context).await?;
+        // 删除企业租户必然移除其全部 ACTIVE 卡的有效资格基础：无条件 fail-closed
+        // 要求 proof-bound admission（缺失 → 安全 Pending，零写入拒绝）。
+        let admission = context.require_admission()?.clone();
 
         // 与 delete_tenant 同一引用守卫（共用 SQL 与纯 helper）：企业租户行同属
         // `tenant`，user_card 引用未守卫会留下第二条旁路。守卫先于 eligibility
@@ -981,40 +1345,88 @@ impl OrgRepository for SqlxOrgRepository {
             return Err(error);
         }
 
-        // cap 扫描与资格成对捕获都必须先于硬 DELETE（capture-before-delete；
-        // 超限在零写入时拒绝）。receipt 事务内先注册。
+        // capture-before-delete：闭合 capture 在硬 DELETE 前锁定真实 before image
+        // 与完整 ACTIVE fanout；超限或租户归属异常时整体零写入拒绝。
+        let delivery_context = self.require_delivery_context()?;
+        let operation_id = admission.operation_id().to_owned();
+        let mut eligibility_capture = Some(
+            EligibilitySourceCapture::begin_in_tx(
+                &mut tx,
+                &admission,
+                EligibilitySourceSubject::TenantDelete { tenant_id: id },
+            )
+            .await
+            .map_err(|error| AstralError::Pending(error.to_string()))?,
+        );
+        let affected_cards = eligibility_capture
+            .as_ref()
+            .map(|capture| capture.selected_cards().to_vec())
+            .unwrap_or_default();
         let mut invalidation_receipts = Vec::new();
-        let cards = scan_tenant_eligibility_cards_in_tx(&mut tx, id).await?;
-        let operation_id = tenant_delete_operation_id(id);
         append_tenant_eligibility_with_invalidation_in_tx(
-            &mut tx,
+            eligibility_capture
+                .as_mut()
+                .expect("tenant delete capture is present")
+                .with_tx_mut(),
+            delivery_context,
             id,
             &operation_id,
-            cards,
+            affected_cards.clone(),
             &mut invalidation_receipts,
         )
         .await?;
         let result =
             sqlx::query("DELETE FROM tenant WHERE tenant_id = ? AND tenant_type = 'ENTERPRISE'")
                 .bind(id)
-                .execute(&mut *tx)
+                .execute(
+                    &mut **eligibility_capture
+                        .as_mut()
+                        .expect("tenant delete capture is present")
+                        .with_tx_mut(),
+                )
                 .await
                 .map_err(db_error)?;
         if result.rows_affected() != 1 {
-            // 行在锁定期间消失属于持久层不变量破坏：tx drop 即回滚，receipts
-            // 随之丢弃，绝不投递。
             return Err(AstralError::Database(format!(
                 "enterprise tenant {id} disappeared during locked delete"
             )));
         }
-        insert_org_mutation_audit_in_tx(
-            &mut tx,
+        let audit_id = insert_org_mutation_audit_in_tx(
+            eligibility_capture
+                .as_mut()
+                .expect("tenant delete capture is present")
+                .with_tx_mut(),
             context,
             "delete",
-            "organization",
+            "tenant",
             id,
             &operation_id,
             serde_json::json!({ "status": "deleted" }),
+        )
+        .await?;
+        let eligibility_receipt = eligibility_capture
+            .take()
+            .expect("tenant delete capture is present")
+            .finish_in_tx()
+            .await
+            .map_err(|error| AstralError::Pending(error.to_string()))?;
+        // COMMIT await 前：durable authority 复核 + admission 一次性消费。
+        // 已 admitted 路径同事务完成真实 source outcome stage/promote
+        //（AuthorizationSource，coverage None）。
+        source_writer_guard::validate_and_consume_admission(&mut tx, &admission).await?;
+        stage_tenant_source_outcome(
+            &mut tx,
+            &admission,
+            id,
+            &before_row,
+            None,
+            &operation_id,
+            result.rows_affected(),
+            astral_db::WriteKind::Delete,
+            audit_id,
+            &invalidation_receipts,
+            &affected_cards,
+            Some(eligibility_receipt),
         )
         .await?;
         arm_org_commit_fence(&source_guard);
@@ -1338,50 +1750,95 @@ impl OrgRepository for SqlxOrgRepository {
             self.db.begin().await.map_err(|e| {
                 AstralError::Database(format!("Begin update tenant tx failed: {e}"))
             })?;
-        let current: Option<(String,)> = sqlx::query_as(TENANT_STATUS_LOCK_SQL)
+        let current: Option<TenantRowImage> = sqlx::query_as(TENANT_STATUS_LOCK_SQL)
             .bind(id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_error)?;
-        let Some((current_status,)) = current else {
+        let Some(before_row) = current else {
             return Err(AstralError::NotFound(format!("tenant {id}")));
         };
         verify_org_mutation_actor_in_tx(&mut tx, context).await?;
-        let mut invalidation_receipts = Vec::new();
-        let fanout = if status_changed(&current_status, status) {
-            // cap 扫描先于任何 mutation：超限即拒绝（此时仅锁读，零写入）。
-            Some(scan_tenant_eligibility_cards_in_tx(&mut tx, id).await?)
+        let metadata_only = !status_changed(&before_row.status, status);
+        if metadata_only {
+            require_metadata_only_org_update(&before_row, status)?;
+        }
+        let admission = if !metadata_only {
+            Some(context.require_admission()?.clone())
         } else {
             None
         };
-
-        sqlx::query(
-            "UPDATE tenant SET tenant_name = ?, tenant_code = ?, status = ? WHERE tenant_id = ?",
-        )
-        .bind(name)
-        .bind(code)
-        .bind(status)
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_error)?;
-        let operation_id = if status_changed(&current_status, status) {
-            tenant_status_operation_id(id, &current_status, status)
+        let mut eligibility_capture = if let Some(admission) = admission.as_ref() {
+            source_writer_guard::EligibilityTransaction::Captured(Box::new(
+                EligibilitySourceCapture::begin_in_tx(
+                    &mut tx,
+                    admission,
+                    EligibilitySourceSubject::TenantStatus { tenant_id: id },
+                )
+                .await
+                .map_err(|error| AstralError::Pending(error.to_string()))?,
+            ))
         } else {
-            format!("org:tenant-update:{id}")
+            source_writer_guard::EligibilityTransaction::Direct(&mut tx)
         };
-        if let Some(cards) = fanout {
+        let affected_cards = eligibility_capture.selected_cards().to_vec();
+        let delivery_context = if admission.is_some() {
+            Some(self.require_delivery_context()?)
+        } else {
+            None
+        };
+        let operation_id = if metadata_only {
+            context.request_id.clone()
+        } else {
+            admission
+                .as_ref()
+                .map(|value| value.operation_id().to_owned())
+                .ok_or_else(|| {
+                    AstralError::Pending(
+                        "eligibility-affecting organization update lacks its admission operation id"
+                            .into(),
+                    )
+                })?
+        };
+
+        let update_result = if metadata_only {
+            sqlx::query(
+                "UPDATE tenant SET tenant_name = ?, tenant_code = ? \
+                 WHERE tenant_id = ? AND tenant_type = 'ENTERPRISE'",
+            )
+            .bind(name)
+            .bind(code)
+            .bind(id)
+            .execute(&mut **eligibility_capture.with_tx_mut())
+            .await
+        } else {
+            sqlx::query(
+                "UPDATE tenant SET tenant_name = ?, tenant_code = ?, status = ? \
+                 WHERE tenant_id = ? AND tenant_type = 'ENTERPRISE'",
+            )
+            .bind(name)
+            .bind(code)
+            .bind(status)
+            .bind(id)
+            .execute(&mut **eligibility_capture.with_tx_mut())
+            .await
+        }
+        .map_err(db_error)?;
+        let after_row = read_back_tenant_row_in_tx(eligibility_capture.with_tx_mut(), id).await?;
+        let mut invalidation_receipts = Vec::new();
+        if let Some(delivery_context) = delivery_context {
             append_tenant_eligibility_with_invalidation_in_tx(
-                &mut tx,
+                eligibility_capture.with_tx_mut(),
+                delivery_context,
                 id,
                 &operation_id,
-                cards,
+                affected_cards.clone(),
                 &mut invalidation_receipts,
             )
             .await?;
         }
-        insert_org_mutation_audit_in_tx(
-            &mut tx,
+        let audit_id = insert_org_mutation_audit_in_tx(
+            eligibility_capture.with_tx_mut(),
             context,
             "update",
             "tenant",
@@ -1390,11 +1847,33 @@ impl OrgRepository for SqlxOrgRepository {
             serde_json::json!({
                 "name": name,
                 "code": code,
-                "fromStatus": current_status,
+                "fromStatus": before_row.status,
                 "toStatus": status,
             }),
         )
         .await?;
+        let eligibility_receipt = eligibility_capture.finish_in_tx().await?;
+        // COMMIT await 前：durable authority 复核 + admission 一次性消费
+        // （校验失败不消费；消费后失败绝不重置，随事务回滚，重试需新 admission）。
+        // 已 admitted 路径同事务完成真实 source outcome stage/promote。
+        if let Some(admission) = &admission {
+            source_writer_guard::validate_and_consume_admission(&mut tx, admission).await?;
+            stage_tenant_source_outcome(
+                &mut tx,
+                admission,
+                id,
+                &before_row,
+                after_row,
+                &operation_id,
+                update_result.rows_affected(),
+                astral_db::WriteKind::Update,
+                audit_id,
+                &invalidation_receipts,
+                &affected_cards,
+                eligibility_receipt,
+            )
+            .await?;
+        }
         arm_org_commit_fence(&source_guard);
         let commit_result = tx.commit().await;
         let proven_receipts =
@@ -1429,18 +1908,21 @@ impl OrgRepository for SqlxOrgRepository {
             self.db.begin().await.map_err(|e| {
                 AstralError::Database(format!("Begin delete tenant tx failed: {e}"))
             })?;
-        let existing: Option<(i64,)> = sqlx::query_as(TENANT_ID_LOCK_SQL)
+        let existing: Option<TenantRowImage> = sqlx::query_as(TENANT_ID_LOCK_SQL)
             .bind(id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_error)?;
-        if existing.is_none() {
+        let Some(before_row) = existing else {
             // 无写早退提交：仅锁读零写，不 arm 取消栅栏（无 durable mutation
             // 可被取消中断）。
             tx.commit().await.map_err(db_error)?;
             return Err(AstralError::NotFound(format!("tenant {id}")));
-        }
+        };
         verify_org_mutation_actor_in_tx(&mut tx, context).await?;
+        // 删除租户必然移除其全部 ACTIVE 卡的有效资格基础：无条件 fail-closed
+        // 要求 proof-bound admission（缺失 → 安全 Pending，零写入拒绝）。
+        let admission = context.require_admission()?.clone();
 
         // 引用守卫先于 eligibility 捕获与 DELETE：任何 user_card（不限
         // card_status）仍引用该租户时，在持有租户行锁的同一事务内锁定引用行
@@ -1457,21 +1939,56 @@ impl OrgRepository for SqlxOrgRepository {
             return Err(error);
         }
 
-        // cap 扫描与资格成对捕获都必须先于硬 DELETE（capture-before-delete；
-        // 超限在零写入时拒绝）。receipt 事务内先注册。
+        // capture-before-delete：闭合 capture 在硬 DELETE 前锁定真实 before image
+        // 与完整 ACTIVE fanout；超限或租户归属异常时整体零写入拒绝。
+        let delivery_context = self.require_delivery_context()?;
+        let operation_id = admission.operation_id().to_owned();
+        let mut eligibility_capture = Some(
+            EligibilitySourceCapture::begin_in_tx(
+                &mut tx,
+                &admission,
+                EligibilitySourceSubject::TenantDelete { tenant_id: id },
+            )
+            .await
+            .map_err(|error| AstralError::Pending(error.to_string()))?,
+        );
+        let affected_cards = eligibility_capture
+            .as_ref()
+            .map(|capture| capture.selected_cards().to_vec())
+            .unwrap_or_default();
         let mut invalidation_receipts = Vec::new();
-        let cards = scan_tenant_eligibility_cards_in_tx(&mut tx, id).await?;
-        let operation_id = tenant_delete_operation_id(id);
         append_tenant_eligibility_with_invalidation_in_tx(
-            &mut tx,
+            eligibility_capture
+                .as_mut()
+                .expect("tenant delete capture is present")
+                .with_tx_mut(),
+            delivery_context,
             id,
             &operation_id,
-            cards,
+            affected_cards.clone(),
             &mut invalidation_receipts,
         )
         .await?;
-        insert_org_mutation_audit_in_tx(
-            &mut tx,
+        let result = sqlx::query("DELETE FROM tenant WHERE tenant_id = ?")
+            .bind(id)
+            .execute(
+                &mut **eligibility_capture
+                    .as_mut()
+                    .expect("tenant delete capture is present")
+                    .with_tx_mut(),
+            )
+            .await
+            .map_err(db_error)?;
+        if result.rows_affected() != 1 {
+            return Err(AstralError::Database(format!(
+                "tenant {id} disappeared during locked delete"
+            )));
+        }
+        let audit_id = insert_org_mutation_audit_in_tx(
+            eligibility_capture
+                .as_mut()
+                .expect("tenant delete capture is present")
+                .with_tx_mut(),
             context,
             "delete",
             "tenant",
@@ -1480,18 +1997,31 @@ impl OrgRepository for SqlxOrgRepository {
             serde_json::json!({ "status": "deleted" }),
         )
         .await?;
-        let result = sqlx::query("DELETE FROM tenant WHERE tenant_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
+        let eligibility_receipt = eligibility_capture
+            .take()
+            .expect("tenant delete capture is present")
+            .finish_in_tx()
             .await
-            .map_err(db_error)?;
-        if result.rows_affected() != 1 {
-            // 行在锁定期间消失属于持久层不变量破坏：tx drop 即回滚，receipts
-            // 随之丢弃，绝不投递。
-            return Err(AstralError::Database(format!(
-                "tenant {id} disappeared during locked delete"
-            )));
-        }
+            .map_err(|error| AstralError::Pending(error.to_string()))?;
+        // COMMIT await 前：durable authority 复核 + admission 一次性消费。
+        // 已 admitted 路径同事务完成真实 source outcome stage/promote
+        //（AuthorizationSource，coverage None）。
+        source_writer_guard::validate_and_consume_admission(&mut tx, &admission).await?;
+        stage_tenant_source_outcome(
+            &mut tx,
+            &admission,
+            id,
+            &before_row,
+            None,
+            &operation_id,
+            result.rows_affected(),
+            astral_db::WriteKind::Delete,
+            audit_id,
+            &invalidation_receipts,
+            &affected_cards,
+            Some(eligibility_receipt),
+        )
+        .await?;
         arm_org_commit_fence(&source_guard);
         let commit_result = tx.commit().await;
         let proven_receipts =
@@ -1528,6 +2058,18 @@ fn card_reference_guard_error(
              revoke or reassign cards first (fail-closed)"
         ))
     })
+}
+
+fn require_metadata_only_org_update(
+    before_row: &TenantRowImage,
+    requested_status: &str,
+) -> Result<(), AstralError> {
+    if before_row.status != requested_status {
+        return Err(AstralError::Pending(
+            "organization metadata update cannot change tenant status without an admission".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn db_error(error: sqlx::Error) -> AstralError {
@@ -1577,7 +2119,31 @@ mod tests {
     }
 
     #[test]
-    fn tenant_mutations_lock_source_rows_before_fanout() {
+    fn metadata_only_org_update_preserves_status_and_uses_request_identity() {
+        let before = TenantRowImage {
+            tenant_id: 11,
+            tenant_name: "before".into(),
+            tenant_code: "BEFORE".into(),
+            status: "ACTIVE".into(),
+        };
+        assert!(require_metadata_only_org_update(&before, "ACTIVE").is_ok());
+        assert!(require_metadata_only_org_update(&before, "DISABLED").is_err());
+
+        let source = org_impl_source();
+        let body_start = source
+            .find("async fn update_org_with_context(")
+            .expect("organization update implementation must exist");
+        let body = &source[body_start
+            ..source[body_start..]
+                .find("\n    async fn ")
+                .map(|end| body_start + end)
+                .unwrap_or(source.len())];
+        assert!(body.contains("context.request_id.clone()"));
+        assert!(body.contains("UPDATE tenant SET tenant_name = ?, tenant_code = ?"));
+        assert!(!body.contains("org:tenant-update:{id}"));
+    }
+    #[test]
+    fn tenant_status_and_delete_queries_lock_the_tenant_boundary() {
         for query in [
             TENANT_STATUS_LOCK_SQL,
             TENANT_ID_LOCK_SQL,
@@ -1722,24 +2288,58 @@ mod tests {
 
     #[test]
     fn tenant_eligibility_selector_locks_active_cards_in_card_id_order() {
-        // 选择器必须与 astral-db 公共批量 helper 的 ByTenantId 语义一致：
-        // ACTIVE 卡、card_id 升序、事务内 FOR UPDATE、参数化 tenant_id，
-        // 并以 LIMIT ? 绑定 cap+1 窗口（超限在任何 mutation 前拒绝）。
-        assert!(ELIGIBILITY_CARDS_BY_TENANT_SQL.contains("FROM user_card"));
-        assert!(ELIGIBILITY_CARDS_BY_TENANT_SQL.contains("tenant_id = ?"));
-        assert!(ELIGIBILITY_CARDS_BY_TENANT_SQL.contains("card_status = 'ACTIVE'"));
-        assert!(ELIGIBILITY_CARDS_BY_TENANT_SQL.contains("ORDER BY card_id LIMIT ? FOR UPDATE"));
+        // The selector is DB-owned now. Keep the lock/order/cap contract tied to
+        // the capture production source rather than a duplicated Identity SQL.
+        let capture_source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../astral-db/src/authority_eligibility_completion.rs"
+        ));
+        let capture_production = &capture_source[..capture_source
+            .find("#[cfg(test)]")
+            .expect("eligibility capture tests must follow production source")];
+        assert!(
+            capture_production.contains("SELECT card_id, tenant_id FROM user_card")
+                && capture_production.contains("card_status = 'ACTIVE'")
+                && capture_production.contains("ORDER BY card_id LIMIT ? FOR UPDATE"),
+            "tenant capture must lock active cards in card-id order"
+        );
+        assert!(
+            capture_production.contains("ELIGIBILITY_COMPLETION_MAX_CARDS + 1")
+                && capture_production.contains("eligibility selector returned more than"),
+            "tenant capture must use a bounded cap+1 selector and reject overflow"
+        );
+        assert!(
+            capture_production.contains("eligibility selector crossed tenant ownership"),
+            "tenant capture must verify every selected card belongs to the subject tenant"
+        );
     }
 
     #[test]
-    fn eligibility_fanout_cap_matches_trustgraph_and_bounds_receipts() {
-        // cap 与 trustgraph 对等（512）；扫描窗口为 cap+1（用多出的一行判定
-        // 超限），receipts 上限与扫描 cap 对等。
-        assert_eq!(ELIGIBILITY_FANOUT_CAP, 512);
-        assert!(eligibility_receipts_cap_ok(0));
-        assert!(eligibility_receipts_cap_ok(ELIGIBILITY_FANOUT_CAP - 1));
-        assert!(!eligibility_receipts_cap_ok(ELIGIBILITY_FANOUT_CAP));
-        assert!(!eligibility_receipts_cap_ok(ELIGIBILITY_FANOUT_CAP + 1));
+    fn eligibility_fanout_cap_matches_the_shared_capture_and_bounds_receipts() {
+        let capture_source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../astral-db/src/authority_eligibility_completion.rs"
+        ));
+        let capture_production = &capture_source[..capture_source
+            .find("#[cfg(test)]")
+            .expect("eligibility capture tests must follow production source")];
+        assert!(
+            capture_production.contains("pub const ELIGIBILITY_COMPLETION_MAX_CARDS: usize = 256;"),
+            "Identity must use the shared 256-card eligibility completion cap"
+        );
+        assert!(
+            capture_production.contains("rows.len() > ELIGIBILITY_COMPLETION_MAX_CARDS")
+                && capture_production
+                    .contains("card eligibility mutation cannot prove an empty selector"),
+            "overflow and unsupported empty selection must remain fail-closed"
+        );
+        assert!(
+            capture_production
+                .contains("AuthorityEligibilityEmptySelectionSubjectKind::TenantStatus")
+                && capture_production
+                    .contains("AuthorityEligibilityEmptySelectionSubjectKind::TenantDelete"),
+            "typed zero-selection evidence must remain limited to tenant status/delete subjects"
+        );
     }
 
     #[test]
@@ -1825,28 +2425,71 @@ mod tests {
     }
 
     #[test]
-    fn eligibility_cap_scan_precedes_every_mutation() {
-        // 超限拒绝必须发生在任何写入之前：update 路径先扫描后 UPDATE tenant，
-        // delete 路径先扫描（且在引用守卫之后）后 DELETE。
-        for (impl_anchor, mutation_sql, label) in [
+    fn eligibility_capture_selector_precedes_every_org_mutation() {
+        // Selector ownership moved to the DB capture. Keep the bounded lock/read
+        // contract anchored to the capture's production source, not to a stale
+        // caller helper or to this test module's own string literals.
+        let capture_source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../astral-db/src/authority_eligibility_completion.rs"
+        ));
+        let capture_production = &capture_source[..capture_source
+            .find("#[cfg(test)]")
+            .expect("eligibility capture tests must follow production source")];
+        assert!(
+            capture_production.contains("pub const ELIGIBILITY_COMPLETION_MAX_CARDS: usize = 256;"),
+            "the DB capture must retain the bounded eligibility capacity"
+        );
+        assert!(
+            capture_production.contains("ELIGIBILITY_COMPLETION_MAX_CARDS + 1")
+                && capture_production.contains("LIMIT ? FOR UPDATE"),
+            "the DB capture must lock a bounded cap+1 selector"
+        );
+        assert!(
+            capture_production.contains("eligibility selector returned more than")
+                && capture_production.contains("eligibility selector crossed tenant ownership"),
+            "the DB capture must reject overflow and cross-tenant selector rows"
+        );
+        assert!(
+            capture_production.contains("EligibilitySourceSubject::TenantStatus")
+                && capture_production.contains("EligibilitySourceSubject::TenantDelete"),
+            "tenant status and delete must have typed capture subjects"
+        );
+        assert!(
+            capture_production.contains(
+                "EligibilitySourceOperation::CardStatus | EligibilitySourceOperation::CardRebind => None"
+            ) && capture_production.contains("EligibilitySourceOperation::CardCreate => None"),
+            "CardStatus, CardRebind, and CardCreate must not claim typed zero-selection completion"
+        );
+        assert!(
+            capture_production.contains("pub async fn finish_in_tx(")
+                && capture_production.contains("EligibilitySourceEvidenceReceipt"),
+            "the capture must seal an opaque evidence receipt"
+        );
+
+        for (impl_anchor, mutation_sql, subject, label) in [
             (
                 "async fn update_tenant_with_context(",
                 "UPDATE tenant SET",
+                "EligibilitySourceSubject::TenantStatus { tenant_id: id }",
                 "update_tenant",
             ),
             (
                 "async fn update_org_with_context(",
                 "UPDATE tenant SET",
+                "EligibilitySourceSubject::TenantStatus { tenant_id: id }",
                 "update_org",
             ),
             (
                 "async fn delete_tenant_with_context(",
                 "DELETE FROM tenant",
+                "EligibilitySourceSubject::TenantDelete { tenant_id: id }",
                 "delete_tenant",
             ),
             (
                 "async fn delete_org_with_context(",
                 "DELETE FROM tenant",
+                "EligibilitySourceSubject::TenantDelete { tenant_id: id }",
                 "delete_org",
             ),
         ] {
@@ -1855,15 +2498,75 @@ mod tests {
                 .find(impl_anchor)
                 .unwrap_or_else(|| panic!("{label} implementation must stay in org_repository.rs"));
             let body = &impl_source[body_start..];
-            let scan = body
-                .find("scan_tenant_eligibility_cards_in_tx")
-                .unwrap_or_else(|| panic!("{label} must cap-scan its eligibility fanout"));
+            let body_end = body.find("\n    async fn ").unwrap_or(body.len());
+            let body = &body[..body_end];
+            let capture = body
+                .find("EligibilitySourceCapture::begin_in_tx")
+                .unwrap_or_else(|| panic!("{label} must use the DB-owned eligibility capture"));
+            let subject_at = body
+                .find(subject)
+                .unwrap_or_else(|| panic!("{label} must use its typed tenant capture subject"));
+            let selected = body
+                .find("capture.selected_cards()")
+                .unwrap_or_else(|| panic!("{label} must derive fanout from the capture selector"));
             let mutation = body
                 .find(mutation_sql)
                 .unwrap_or_else(|| panic!("{label} must mutate tenant in this file"));
+            let mutation_statement = &body[mutation
+                ..body[mutation..]
+                    .find(".await")
+                    .map(|offset| mutation + offset)
+                    .expect("source statement must be awaited")];
+            let mutation_executor: String = mutation_statement.split_whitespace().collect();
             assert!(
-                scan < mutation,
-                "{label}: eligibility cap scan must reject before any mutation"
+                mutation_executor.contains(".execute(&mut**eligibility_capture")
+                    && mutation_executor.contains(".with_tx_mut()"),
+                "{label}: the source statement must execute on the capture-owned transaction"
+            );
+            let fanout = body
+                .find("append_tenant_eligibility_with_invalidation_in_tx")
+                .unwrap_or_else(|| panic!("{label} must append typed eligibility fanout"));
+            let audit = body
+                .find("insert_org_mutation_audit_in_tx")
+                .unwrap_or_else(|| panic!("{label} must write same-transaction audit correlation"));
+            let finish = body
+                .find("finish_in_tx()")
+                .unwrap_or_else(|| panic!("{label} must finish the opaque capture receipt"));
+            let consume = body
+                .find("source_writer_guard::validate_and_consume_admission(&mut tx")
+                .unwrap_or_else(|| panic!("{label} must revalidate and consume its admission"));
+            let stage = body
+                .find("stage_tenant_source_outcome(")
+                .unwrap_or_else(|| panic!("{label} must stage its real source outcome"));
+            let arm = body
+                .find("arm_org_commit_fence(&source_guard);")
+                .unwrap_or_else(|| panic!("{label} must arm its commit fence"));
+            assert!(
+                capture < subject_at && subject_at < selected && selected < mutation,
+                "{label}: capture subject and bounded selection must precede mutation"
+            );
+            assert!(
+                fanout < audit && mutation < audit,
+                "{label}: source mutation and fanout must precede the same-transaction audit"
+            );
+            if mutation_sql.starts_with("DELETE") {
+                assert!(
+                    selected < fanout && fanout < mutation,
+                    "{label}: deletion must retain the captured fanout before deleting its source"
+                );
+            } else {
+                assert!(
+                    mutation < fanout,
+                    "{label}: update fanout must follow the source statement"
+                );
+            }
+            assert!(
+                audit < finish && finish < consume && consume < stage && stage < arm,
+                "{label}: finish, admission consumption, stage, and commit fence order must remain closed"
+            );
+            assert!(
+                body.contains("operation_id()") && body.contains("&operation_id"),
+                "{label}: the proof admission operation identity must reach its source evidence"
             );
         }
     }
@@ -2000,7 +2703,12 @@ mod tests {
             eligibility_invalidation_envelope(9, "op-1", "evt-1", "region-a").expect("envelope");
         let mut receipts = vec![InvalidationReceipt {
             event_id: envelope.message_id.clone(),
+            projection_event_id: "evt-1".into(),
             operation_id: envelope.operation_id.clone(),
+            card_id: 9,
+            tenant_id: Some(3),
+            generation: 1,
+            revoke_watermark: 0,
             envelope,
         }];
         let handed = receipts_for_proven_commit(&mut receipts, &Ok(()));
@@ -2011,7 +2719,12 @@ mod tests {
             eligibility_invalidation_envelope(9, "op-1", "evt-2", "region-a").expect("envelope");
         let mut receipts = vec![InvalidationReceipt {
             event_id: envelope.message_id.clone(),
+            projection_event_id: "evt-1".into(),
             operation_id: envelope.operation_id.clone(),
+            card_id: 9,
+            tenant_id: Some(3),
+            generation: 1,
+            revoke_watermark: 0,
             envelope,
         }];
         // 连接中断/提交失败都表现为 Err：未知结果按未知处理，绝不发送。
@@ -2021,21 +2734,53 @@ mod tests {
     }
 
     #[test]
-    fn operation_ids_are_deterministic_and_scope_bound() {
-        assert_eq!(
-            tenant_status_operation_id(7, "ACTIVE", "DISABLED"),
-            "org:tenant-status:7:ACTIVE->DISABLED"
+    fn org_mutations_propagate_admission_operation_identity() {
+        let impl_source = org_impl_source();
+        for (impl_anchor, label) in [
+            ("async fn update_tenant_with_context(", "update_tenant"),
+            ("async fn update_org_with_context(", "update_org"),
+            ("async fn delete_tenant_with_context(", "delete_tenant"),
+            ("async fn delete_org_with_context(", "delete_org"),
+        ] {
+            let body_start = impl_source
+                .find(impl_anchor)
+                .unwrap_or_else(|| panic!("{label} implementation must stay in org_repository.rs"));
+            let body = &impl_source[body_start..];
+            let body_end = body.find("\n    async fn ").unwrap_or(body.len());
+            let body = &body[..body_end];
+            let admission_identity = body
+                .find("operation_id()")
+                .unwrap_or_else(|| panic!("{label} must derive operation identity from admission"));
+            let fanout = body.find("&operation_id").unwrap_or_else(|| {
+                panic!("{label} must bind operation identity to source side effects")
+            });
+            let audit = body
+                .find("insert_org_mutation_audit_in_tx")
+                .unwrap_or_else(|| panic!("{label} must bind operation identity to audit"));
+            let stage = body
+                .find("stage_tenant_source_outcome(")
+                .unwrap_or_else(|| panic!("{label} must stage a source outcome"));
+            assert!(
+                admission_identity < fanout
+                    && admission_identity < audit
+                    && admission_identity < stage,
+                "{label}: admission operation identity must flow into fanout, audit, and stage"
+            );
+            assert!(
+                body.contains("finish_in_tx()"),
+                "{label}: source completion must be represented by the opaque capture receipt"
+            );
+        }
+        let delete_org_start = impl_source
+            .find("async fn delete_org_with_context(")
+            .expect("delete_org implementation must stay in org_repository.rs");
+        let delete_org = &impl_source[delete_org_start..];
+        assert!(
+            delete_org.contains("operation_id()")
+                && delete_org.contains("finish_in_tx()")
+                && delete_org.contains("stage_tenant_source_outcome("),
+            "delete_org: admission identity, opaque receipt, and stage must remain connected"
         );
-        assert_eq!(
-            tenant_status_operation_id(7, "ACTIVE", "DISABLED"),
-            tenant_status_operation_id(7, "ACTIVE", "DISABLED"),
-            "same mutation semantics share the correlation id"
-        );
-        assert_ne!(
-            tenant_status_operation_id(7, "ACTIVE", "DISABLED"),
-            tenant_status_operation_id(8, "ACTIVE", "DISABLED")
-        );
-        assert_eq!(tenant_delete_operation_id(7), "org:tenant-delete:7");
     }
 
     #[test]
@@ -2077,7 +2822,12 @@ mod tests {
             .expect("envelope");
         let receipt = InvalidationReceipt {
             event_id: envelope.message_id.clone(),
+            projection_event_id: "evt-dispatch-1".into(),
             operation_id: envelope.operation_id.clone(),
+            card_id: 9,
+            tenant_id: Some(3),
+            generation: 1,
+            revoke_watermark: 0,
             envelope,
         };
         let result =
@@ -2105,12 +2855,368 @@ mod tests {
             .expect("envelope");
         let receipt = InvalidationReceipt {
             event_id: envelope.message_id.clone(),
+            projection_event_id: "evt-dispatch-2".into(),
             operation_id: envelope.operation_id.clone(),
+            card_id: 9,
+            tenant_id: Some(3),
+            generation: 1,
+            revoke_watermark: 0,
             envelope,
         };
         let result =
             dispatch_invalidation_receipt_with_deadline(&bus, receipt, Duration::from_millis(80))
                 .await;
         assert!(result.is_err(), "deadline expiry must surface as unknown");
+    }
+
+    // ===== proof-bound admission 接线回归（与 user/card 源事务同契约） =====
+
+    /// 结构合法的 fixture admission（`from_verified_proof` 只做结构校验，
+    /// 与 trustgraph org_authorities/grant_ledger 测试同做法；不做任何 IO）。
+    fn structural_admission(
+        scope: astral_types::AuthorizationAuthorityScope,
+    ) -> AuthorizationAdmission {
+        AuthorizationAdmission::from_verified_proof(astral_types::AuthorizationFenceProof {
+            authorization_edition: astral_types::AUTHORIZATION_EDITION,
+            authority_id: "authority-a".to_owned(),
+            authority_term: 1,
+            global_fence_sequence: 2,
+            scope,
+            scope_generation: 2,
+            revoke_watermark: 1,
+            snapshot_hash: "ab".repeat(32),
+            parent_hash: None,
+            operation_id: "operation-1".to_owned(),
+            event_id: "event-1".to_owned(),
+            key_id: "key-1".to_owned(),
+            key_epoch: 1,
+            issued_at: 100,
+            not_before: 99,
+            expires_at: 110,
+            request_nonce: "nonce-1".to_owned(),
+            request_binding_digest: None,
+            scope_certificate_hash: None,
+            proof_id: "proof-1".to_owned(),
+            signature: "00".repeat(64),
+        })
+        .expect("structural fixture proof")
+    }
+
+    fn fixture_context(admission: Option<AuthorizationAdmission>) -> OrgMutationContext {
+        OrgMutationContext::new(1, 2, 3, 4, Some("req-op-1"))
+            .expect("verified fixture context")
+            .with_admission(admission)
+    }
+
+    #[test]
+    fn org_mutation_context_fails_closed_without_admission_for_eligibility_changes() {
+        let context = fixture_context(None);
+        assert!(context.admission().is_none());
+        let error = context
+            .require_admission()
+            .expect_err("a missing admission must fail closed");
+        assert!(
+            matches!(error, AstralError::Pending(_)),
+            "missing admission is a safe PENDING, not an implicit allow: {error}"
+        );
+    }
+
+    #[test]
+    fn org_actor_admission_binding_matches_only_the_locked_actor_card() {
+        // scope 与锁定 actor 卡完全一致（card/tenant/user + Exact domain）才绑定。
+        let matching = structural_admission(astral_types::AuthorizationAuthorityScope {
+            tenant_id: 3,
+            card_id: 2,
+            user_id: Some(1),
+            domain: astral_types::AuthorizationDomainScope::Exact(4),
+        });
+        let context = fixture_context(Some(matching));
+        assert!(verify_org_mutation_admission_scope(&context, 1, 3, 4).is_ok());
+
+        // 域/租户/用户/卡任一不符，以及 Any/NoDomain 松 scope，一律 fail-closed。
+        let wrong_scopes = [
+            astral_types::AuthorizationAuthorityScope {
+                tenant_id: 3,
+                card_id: 2,
+                user_id: Some(1),
+                domain: astral_types::AuthorizationDomainScope::Exact(5),
+            },
+            astral_types::AuthorizationAuthorityScope {
+                tenant_id: 9,
+                card_id: 2,
+                user_id: Some(1),
+                domain: astral_types::AuthorizationDomainScope::Exact(4),
+            },
+            astral_types::AuthorizationAuthorityScope {
+                tenant_id: 3,
+                card_id: 2,
+                user_id: Some(7),
+                domain: astral_types::AuthorizationDomainScope::Exact(4),
+            },
+            astral_types::AuthorizationAuthorityScope {
+                tenant_id: 3,
+                card_id: 8,
+                user_id: Some(1),
+                domain: astral_types::AuthorizationDomainScope::Exact(4),
+            },
+            astral_types::AuthorizationAuthorityScope {
+                tenant_id: 3,
+                card_id: 2,
+                user_id: Some(1),
+                domain: astral_types::AuthorizationDomainScope::Any,
+            },
+            astral_types::AuthorizationAuthorityScope {
+                tenant_id: 3,
+                card_id: 2,
+                user_id: Some(1),
+                domain: astral_types::AuthorizationDomainScope::NoDomain,
+            },
+        ];
+        for wrong in wrong_scopes {
+            let context = fixture_context(Some(structural_admission(wrong)));
+            let error = verify_org_mutation_admission_scope(&context, 1, 3, 4)
+                .expect_err("scope mismatch must fail closed");
+            assert!(
+                matches!(error, AstralError::Permission(_)),
+                "scope mismatch is a permission failure: {error}"
+            );
+        }
+
+        // 未携带 admission 时绑定是 no-op；资格变更写路径仍会另外 fail-closed
+        // 地要求 admission（require_admission），不在这里放行任何变更。
+        let context = fixture_context(None);
+        assert!(verify_org_mutation_admission_scope(&context, 1, 3, 4).is_ok());
+    }
+
+    #[test]
+    fn org_actor_verification_binds_carried_admission_scope_to_the_locked_card() {
+        // 源形状：actor 锁定 helper 必须在验证通过的分支内把 proof scope 绑定到
+        // 已 FOR UPDATE 锁定的 actor 卡行；绑定在行锁之后，不引入第二次读。
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/srv/org_repository.rs"
+        ));
+        let helper_start = source
+            .find("async fn verify_org_mutation_actor_in_tx(")
+            .expect("actor verification helper must stay in org_repository.rs");
+        let helper_end = source[helper_start..]
+            .find("async fn insert_org_mutation_audit_in_tx(")
+            .expect("audit helper must follow the actor verification helpers");
+        let body = &source[helper_start..helper_start + helper_end];
+        let lock = body
+            .find("fetch_optional")
+            .expect("actor verification must lock the card row");
+        let binding = body
+            .find("verify_org_mutation_admission_scope(context,")
+            .expect("the verified match arm must bind the admission scope");
+        assert!(
+            lock < binding,
+            "the admission scope binding must follow the FOR UPDATE actor lock"
+        );
+        assert!(
+            body.contains("AuthorizationDomainScope::Exact"),
+            "only an exact-domain proof scope can bind to a concrete actor card domain"
+        );
+        assert!(
+            body.contains("scope.card_id != context.actor_card_id"),
+            "the binding must compare the proof card with the locked actor card"
+        );
+    }
+
+    #[test]
+    fn eligibility_affecting_org_mutations_require_and_consume_admission_before_commit() {
+        // 四条影响有效资格的 source 事务：actor 校验之后、任何 mutation 之前
+        // fail-closed 解析 admission 要求；全部 mutation 之后、COMMIT await
+        // （arm 取消栅栏）之前完成 durable authority 复核与一次性消费。
+        for (impl_anchor, mutation_sql, label) in [
+            (
+                "async fn update_tenant_with_context(",
+                "UPDATE tenant SET",
+                "update_tenant",
+            ),
+            (
+                "async fn update_org_with_context(",
+                "UPDATE tenant SET",
+                "update_org",
+            ),
+            (
+                "async fn delete_tenant_with_context(",
+                "DELETE FROM tenant",
+                "delete_tenant",
+            ),
+            (
+                "async fn delete_org_with_context(",
+                "DELETE FROM tenant",
+                "delete_org",
+            ),
+        ] {
+            let impl_source = org_impl_source();
+            let body_start = impl_source
+                .find(impl_anchor)
+                .unwrap_or_else(|| panic!("{label} implementation must stay in org_repository.rs"));
+            let body = &impl_source[body_start..];
+            let body_end = body.find("\n    async fn ").unwrap_or(body.len());
+            let body = &body[..body_end];
+            let require = body.find("context.require_admission()").unwrap_or_else(|| {
+                panic!("{label} must fail closed without a proof-bound admission")
+            });
+            let mutation = body
+                .find(mutation_sql)
+                .unwrap_or_else(|| panic!("{label} must mutate tenant in this file"));
+            let consume = body
+                .find("source_writer_guard::validate_and_consume_admission(&mut tx")
+                .unwrap_or_else(|| panic!("{label} must revalidate and consume its admission"));
+            let arm = body
+                .find("arm_org_commit_fence(&source_guard);")
+                .unwrap_or_else(|| panic!("{label} must arm its commit fence"));
+            assert!(
+                require < mutation,
+                "{label}: the admission requirement must be resolved before any source mutation"
+            );
+            assert!(
+                mutation < consume,
+                "{label}: admission consumption must follow the source mutations"
+            );
+            assert!(
+                consume < arm,
+                "{label}: admission consumption must precede the commit fence"
+            );
+        }
+
+        // metadata-only create/domain 路径不影响任何卡的有效资格：不要求、
+        // 不消费 admission（与 user profile-only 分支同语义）。
+        for (impl_anchor, next_anchor, label) in [
+            (
+                "async fn create_org_with_context(",
+                "async fn get_org(",
+                "create_org",
+            ),
+            (
+                "async fn create_tenant_with_context(",
+                "async fn get_tenant(",
+                "create_tenant",
+            ),
+            (
+                "async fn create_domain_with_context(",
+                "async fn get_domain(",
+                "create_domain",
+            ),
+            (
+                "async fn update_domain_with_context(",
+                "async fn delete_domain(",
+                "update_domain",
+            ),
+            (
+                "async fn delete_domain_with_context(",
+                "async fn list_domain_tenants(",
+                "delete_domain",
+            ),
+        ] {
+            let impl_source = org_impl_source();
+            let body_start = impl_source
+                .find(impl_anchor)
+                .unwrap_or_else(|| panic!("{label} implementation must stay in org_repository.rs"));
+            let body = &impl_source[body_start..];
+            let end = body
+                .find(next_anchor)
+                .unwrap_or_else(|| panic!("{label} body boundary must exist"));
+            let body = &body[..end];
+            assert!(
+                !body.contains("validate_and_consume_admission"),
+                "{label} must not consume an authorization admission"
+            );
+            assert!(
+                !body.contains("require_admission"),
+                "{label} must not require an authorization admission"
+            );
+        }
+    }
+
+    /// 已 admitted org/tenant source 事务的真实 source outcome 契约钉（源形状）：
+    /// admission 消费之后、COMMIT await（arm 取消栅栏）之前同事务完成
+    /// stage/promote；metadata-only/create/domain 无 admission 可绑，不 stage。
+    #[test]
+    fn org_mutations_stage_real_source_outcomes_on_admitted_paths_before_commit() {
+        for (impl_anchor, mutation_sql, label) in [
+            (
+                "async fn update_tenant_with_context(",
+                "UPDATE tenant SET",
+                "update_tenant",
+            ),
+            (
+                "async fn update_org_with_context(",
+                "UPDATE tenant SET",
+                "update_org",
+            ),
+            (
+                "async fn delete_tenant_with_context(",
+                "DELETE FROM tenant",
+                "delete_tenant",
+            ),
+            (
+                "async fn delete_org_with_context(",
+                "DELETE FROM tenant",
+                "delete_org",
+            ),
+        ] {
+            let impl_source = org_impl_source();
+            let body_start = impl_source
+                .find(impl_anchor)
+                .unwrap_or_else(|| panic!("{label} implementation must stay in org_repository.rs"));
+            let body = &impl_source[body_start..];
+            let body_end = body.find("\n    async fn ").unwrap_or(body.len());
+            let body = &body[..body_end];
+            let mutation = body
+                .find(mutation_sql)
+                .unwrap_or_else(|| panic!("{label} must mutate tenant in this file"));
+            let read_back = body.find("read_back_tenant_row_in_tx(");
+            if label.starts_with("update") {
+                let read_back =
+                    read_back.unwrap_or_else(|| panic!("{label} must read back its after image"));
+                assert!(
+                    mutation < read_back,
+                    "{label}: the after-image readback must follow the source mutation"
+                );
+            }
+            let consume = body
+                .find("source_writer_guard::validate_and_consume_admission(&mut tx")
+                .unwrap_or_else(|| panic!("{label} must revalidate and consume its admission"));
+            let stage = body
+                .find("stage_tenant_source_outcome(")
+                .unwrap_or_else(|| panic!("{label} must stage its real source outcome"));
+            let arm = body
+                .find("arm_org_commit_fence(&source_guard);")
+                .unwrap_or_else(|| panic!("{label} must arm its commit fence"));
+            assert!(
+                consume < stage,
+                "{label}: staging must follow the same-transaction admission consumption"
+            );
+            assert!(
+                stage < arm,
+                "{label}: staging must precede the commit fence"
+            );
+        }
+        // 目标证据钉：before 镜像来自 `FOR UPDATE` 锁定行，硬 DELETE 后回读
+        // `None` 进入 Absent after 镜像；审计行以实际主键成为真实 receipt。
+        // （stage helper 位于模块级 helper 区，不在 impl 块内。）
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/srv/org_repository.rs"
+        ));
+        let helper_start = source
+            .find("async fn stage_tenant_source_outcome(")
+            .expect("the org stage helper must stay in org_repository.rs");
+        let helper = &source[helper_start..];
+        assert!(
+            helper.contains("entity: \"tenant\"")
+                && helper.contains("entity: \"audit_log\"")
+                && helper.contains("SourceRowPresence::Absent"),
+            "the tenant target image and audit receipt must be real"
+        );
+        assert!(
+            helper.contains("read_back_projection_outbox_in_tx")
+                && helper.contains("read_back_message_outbox_in_tx"),
+            "outbox receipts must be verified by in-transaction readback"
+        );
     }
 }

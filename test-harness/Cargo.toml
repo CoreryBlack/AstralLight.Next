@@ -15,6 +15,14 @@ url = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
 hmac = { workspace = true }
+# Client-only authority adapter verifies the production mTLS owner path without
+# compiling the authority service, signer, or etcd server features.
+astral-authority = { path = "../astral-authority", default-features = false }
+astral-types = { path = "../astral-types" }
+tokio = { workspace = true }
+# s15_probe_executor TLS transport: blocking client over the workspace
+# rustls stack; GET-only, used exclusively by the s15-probe executor.
+reqwest = { workspace = true, features = ["blocking"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

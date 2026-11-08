@@ -3,7 +3,7 @@
 //! 对应 Java `CardController`。卡片 CRUD 在 `CardRepository`，
 //! 切卡会话旋转保留在 `session::switch_card_session`。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -15,7 +15,7 @@ use astral_common::audit::{
 use astral_common::contract::{ApiResponse, EmptyResponse};
 use astral_common::error::AppError;
 use astral_common::middleware::permission::extract_user_id;
-use astral_types::UserCard;
+use astral_types::{AuthorizationAdmission, UserCard};
 
 use crate::auth::LoginResponse;
 use crate::srv::card_repository::CardFilter;
@@ -111,6 +111,7 @@ pub fn card_routes() -> Router<AppState> {
 async fn create_card(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<CreateCardRequest>,
 ) -> Result<Json<ApiResponse<UserCard>>, AppError> {
     let user_id = require_user_id(&headers)?;
@@ -151,6 +152,7 @@ async fn create_card(
                 req.template_id,
                 user_id,
                 request_operation_id(&headers),
+                admission,
             )
             .await?,
     )))
@@ -187,6 +189,7 @@ async fn get_card(
 async fn update_card_status(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<CardStatusRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
@@ -194,7 +197,13 @@ async fn update_card_status(
     let _ = owned_card(&state, id, user_id, &headers).await?;
     state
         .card_repository
-        .update_user_card_status(id, &req.status, user_id, request_operation_id(&headers))
+        .update_user_card_status(
+            id,
+            &req.status,
+            user_id,
+            request_operation_id(&headers),
+            admission,
+        )
         .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
@@ -220,6 +229,7 @@ async fn switch_card(
 async fn update_card(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<CreateCardRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
@@ -239,6 +249,7 @@ async fn update_card(
             req.tenant_id,
             user_id,
             request_operation_id(&headers),
+            admission,
         )
         .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))

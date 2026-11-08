@@ -1,6 +1,7 @@
 //! 通知渠道管理 — HTTP adapter + transport test dispatch。
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
+use axum::http::HeaderMap;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -30,12 +31,13 @@ pub struct CreateChannelReq {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TestResult {
-    /// True only when the configured transport returned a real successful delivery.
+    /// True only when the transport produced explicit end-delivery proof.
+    /// Provider acceptance (2xx without receipt, SMTP 250) is NOT success.
     pub success: bool,
     pub message: String,
     pub channel_type: String,
-    /// Explicit delivery truth: DELIVERED, FAILED, NOT_ATTEMPTED, UNSUPPORTED,
-    /// or SIMULATED_NOT_DELIVERED.
+    /// Typed delivery truth: DELIVERED, ACCEPTED, FAILED, IN_DOUBT,
+    /// RETRY_SCHEDULED, NOT_ATTEMPTED, or UNSUPPORTED.
     pub delivery_status: &'static str,
 }
 
@@ -58,35 +60,89 @@ async fn list_channels(
 
 async fn create_channel(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy): Extension<astral_types::PolicyContext>,
+    Extension(admission): Extension<astral_types::AuthorizationAdmission>,
     Json(request): Json<CreateChannelReq>,
 ) -> Result<Json<ApiResponse<NotificationChannel>>, AppError> {
-    let config = request.config.as_ref().map(ToString::to_string);
-    Ok(Json(ApiResponse::success(
-        state
-            .monitor_service
-            .create_notification_channel(&request.name, &request.channel_type, config.as_deref())
-            .await?,
-    )))
+    let context =
+        crate::mutation::context(&headers, &policy, admission, "notification", "create", None)?;
+    let mutation = crate::repository::MonitorMutation::CreateChannel {
+        name: request.name,
+        channel_type: request.channel_type,
+        config: request.config.as_ref().map(ToString::to_string),
+    };
+    match state
+        .monitor_service
+        .protected_mutation(&context, mutation)
+        .await?
+    {
+        crate::repository::MonitorMutationResult::Channel(channel) => {
+            Ok(Json(ApiResponse::success(channel.into())))
+        }
+        _ => Err(crate::mutation::unexpected_result()),
+    }
 }
 
 async fn update_channel(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy): Extension<astral_types::PolicyContext>,
+    Extension(admission): Extension<astral_types::AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(request): Json<CreateChannelReq>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    let config = request.config.as_ref().map(ToString::to_string);
+    let context = crate::mutation::context(
+        &headers,
+        &policy,
+        admission,
+        "notification",
+        "update",
+        Some(id),
+    )?;
     state
         .monitor_service
-        .update_notification_channel(id, &request.name, &request.channel_type, config.as_deref())
+        .protected_mutation(
+            &context,
+            crate::repository::MonitorMutation::UpdateChannel {
+                id,
+                name: request.name,
+                channel_type: request.channel_type,
+                config: request.config.as_ref().map(ToString::to_string),
+            },
+        )
         .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 
 async fn test_channel(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy): Extension<astral_types::PolicyContext>,
+    Extension(admission): Extension<astral_types::AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<TestResult>>, AppError> {
-    let channel = state.monitor_service.get_notification_channel(id).await?;
+    let context = crate::mutation::context(
+        &headers,
+        &policy,
+        admission,
+        "notification",
+        "test",
+        Some(id),
+    )?;
+    let channel = match state
+        .monitor_service
+        .protected_mutation(
+            &context,
+            crate::repository::MonitorMutation::TestChannel(id),
+        )
+        .await?
+    {
+        crate::repository::MonitorMutationResult::Channel(channel) => {
+            NotificationChannel::from(channel)
+        }
+        _ => return Err(crate::mutation::unexpected_result()),
+    };
     if channel.enabled == 0 {
         return Ok(Json(ApiResponse::success(TestResult {
             success: false,
@@ -96,19 +152,13 @@ async fn test_channel(
         })));
     }
 
-    let result = match channel.channel_type.as_str() {
-        "EMAIL" => send_test_email(&channel).await,
-        "SMS" => send_test_sms(&channel).await,
-        "WEBHOOK" => send_test_webhook(&channel).await,
-        "DINGTALK" => send_test_dingtalk(&channel).await,
-        "WECHAT" => send_test_wechat(&channel).await,
-        _ => TestResult {
-            success: false,
-            message: format!("不支持的渠道类型: {}", channel.channel_type),
-            channel_type: channel.channel_type.clone(),
-            delivery_status: "UNSUPPORTED",
-        },
-    };
+    // Unified real-delivery dispatcher: durable intent store from the shared
+    // pool; the stable caller operation comes from the protected mutation
+    // context, so repeated invocations of the same operation never re-send.
+    let store: std::sync::Arc<dyn astral_common::delivery::DeliveryStore> = std::sync::Arc::new(
+        astral_common::delivery::SqlxDeliveryIntentRepository::new(state.db.clone()),
+    );
+    let result = dispatch_test_notification(&channel, store, context.operation_id()).await;
 
     let detail = serde_json::json!({
         "channel_id": channel.id,
@@ -132,91 +182,63 @@ async fn test_channel(
     Ok(Json(ApiResponse::success(result)))
 }
 
-async fn send_test_email(_channel: &NotificationChannel) -> TestResult {
-    TestResult {
-        success: false,
-        message: "SMTP 传输未实现；未发送邮件".into(),
-        channel_type: "EMAIL".into(),
-        delivery_status: "SIMULATED_NOT_DELIVERED",
-    }
-}
-
-async fn send_test_sms(_channel: &NotificationChannel) -> TestResult {
-    TestResult {
-        success: false,
-        message: "短信传输未实现；未发送短信".into(),
-        channel_type: "SMS".into(),
-        delivery_status: "SIMULATED_NOT_DELIVERED",
-    }
-}
-
-async fn send_test_webhook(channel: &NotificationChannel) -> TestResult {
-    let config: serde_json::Value = channel
-        .config
-        .as_deref()
-        .and_then(|value| serde_json::from_str(value).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let url = config
-        .get("url")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    if url.is_empty() {
-        return TestResult {
-            success: false,
-            message: "Webhook URL 未配置".into(),
-            channel_type: "WEBHOOK".into(),
-            delivery_status: "NOT_ATTEMPTED",
-        };
-    }
-
-    let payload = serde_json::json!({
-        "event": "test",
-        "channel": channel.name,
-        "message": "This is a test notification from AstralMonitor",
-        "timestamp": time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default(),
-    });
-    match reqwest::Client::new()
-        .post(url)
-        .json(&payload)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(response) => {
-            let success = response.status().is_success();
-            TestResult {
-                success,
-                message: format!("Webhook 响应状态: {}", response.status()),
-                channel_type: "WEBHOOK".into(),
-                delivery_status: if success { "DELIVERED" } else { "FAILED" },
+/// 统一测试派发入口（替代原 send_test_* 模拟分支）。
+///
+/// 调用方（`test_channel`）先完成 durable admission/use/audit，然后携带
+/// 冻结的渠道行与受保护操作 id 调用本函数；外部投递由此开始：
+/// - message id 由稳定 operation id 确定性派生：同一 operation 重复调用
+///   不会重复外发，直接返回已终结的 durable truth；
+/// - 上一次尝试 IN_DOUBT 时返回 IN_DOUBT（PENDING 对账语义），绝不盲目重发；
+/// - 真值：服务商 2xx / SMTP 250 最多 ACCEPTED；DELIVERED 需要显式回执
+///   （同步 webhook 2xx 或中继回执字段）。
+pub(crate) async fn dispatch_test_notification(
+    channel: &NotificationChannel,
+    store: std::sync::Arc<dyn astral_common::delivery::DeliveryStore>,
+    operation_id: &str,
+) -> TestResult {
+    let kind = match astral_common::delivery::ChannelKind::parse(&channel.channel_type) {
+        Some(kind) => kind,
+        None => {
+            return TestResult {
+                success: false,
+                message: format!("不支持的渠道类型: {}", channel.channel_type),
+                channel_type: channel.channel_type.clone(),
+                delivery_status: "UNSUPPORTED",
             }
         }
-        Err(error) => TestResult {
-            success: false,
-            message: format!("Webhook 发送失败: {error}"),
-            channel_type: "WEBHOOK".into(),
-            delivery_status: "FAILED",
-        },
-    }
+    };
+    let caller_operation = format!("monitor:notification-test:{operation_id}");
+    let truth = astral_common::delivery::dispatch_channel_test(
+        store,
+        &caller_operation,
+        kind,
+        &channel.name,
+        channel.config.as_deref(),
+        "This is a test notification from AstralMonitor",
+    )
+    .await;
+    test_result_from_truth(&channel.channel_type, truth)
 }
 
-async fn send_test_dingtalk(_channel: &NotificationChannel) -> TestResult {
+/// Typed truth → API contract. `success` is true ONLY for DELIVERED.
+fn test_result_from_truth(
+    channel_type: &str,
+    truth: astral_common::delivery::DeliveryTruth,
+) -> TestResult {
+    use astral_common::delivery::DeliveryState;
+    let (success, delivery_status): (bool, &'static str) = match truth.state {
+        DeliveryState::Delivered => (true, "DELIVERED"),
+        DeliveryState::Accepted => (false, "ACCEPTED"),
+        DeliveryState::InDoubt => (false, "IN_DOUBT"),
+        DeliveryState::Queued => (false, "RETRY_SCHEDULED"),
+        DeliveryState::NotAttempted => (false, "NOT_ATTEMPTED"),
+        DeliveryState::Failed | DeliveryState::Expired => (false, "FAILED"),
+    };
     TestResult {
-        success: false,
-        message: "钉钉传输未实现；未发送通知".into(),
-        channel_type: "DINGTALK".into(),
-        delivery_status: "SIMULATED_NOT_DELIVERED",
-    }
-}
-
-async fn send_test_wechat(_channel: &NotificationChannel) -> TestResult {
-    TestResult {
-        success: false,
-        message: "企业微信传输未实现；未发送通知".into(),
-        channel_type: "WECHAT".into(),
-        delivery_status: "SIMULATED_NOT_DELIVERED",
+        success,
+        message: truth.detail,
+        channel_type: channel_type.to_owned(),
+        delivery_status,
     }
 }
 
@@ -224,30 +246,94 @@ async fn send_test_wechat(_channel: &NotificationChannel) -> TestResult {
 mod tests {
     use super::*;
 
-    fn channel(channel_type: &str) -> NotificationChannel {
+    fn channel(channel_type: &str, config: Option<&str>) -> NotificationChannel {
         NotificationChannel {
             id: 1,
             name: "test-channel".into(),
             channel_type: channel_type.into(),
-            config: None,
+            config: config.map(str::to_string),
             enabled: 1,
         }
     }
 
-    #[tokio::test]
-    async fn simulated_transports_never_report_delivery_success() {
-        let email = send_test_email(&channel("EMAIL")).await;
-        let sms = send_test_sms(&channel("SMS")).await;
-        let dingtalk = send_test_dingtalk(&channel("DINGTALK")).await;
-        let wechat = send_test_wechat(&channel("WECHAT")).await;
+    fn store() -> std::sync::Arc<dyn astral_common::delivery::DeliveryStore> {
+        std::sync::Arc::new(astral_common::delivery::InMemoryDeliveryStore::new())
+    }
 
-        for result in [email, sms, dingtalk, wechat] {
-            assert!(
-                !result.success,
-                "{} must not report successful delivery",
-                result.channel_type
-            );
-            assert_eq!(result.delivery_status, "SIMULATED_NOT_DELIVERED");
+    #[tokio::test]
+    async fn unconfigured_channels_are_typed_not_attempted_never_simulated() {
+        for channel_type in ["EMAIL", "SMS", "DINGTALK", "WECHAT"] {
+            let result =
+                dispatch_test_notification(&channel(channel_type, None), store(), "op-1").await;
+            assert!(!result.success, "{channel_type} must not claim success");
+            assert_eq!(result.delivery_status, "NOT_ATTEMPTED", "{channel_type}");
         }
+    }
+
+    #[tokio::test]
+    async fn inline_secret_config_is_rejected_before_dispatch() {
+        let result = dispatch_test_notification(
+            &channel(
+                "EMAIL",
+                Some(r#"{"host":"smtp.example.com","from":"a@b.c","password":"inline"}"#),
+            ),
+            store(),
+            "op-secret",
+        )
+        .await;
+        assert!(!result.success);
+        assert_eq!(result.delivery_status, "NOT_ATTEMPTED");
+        assert!(
+            result.message.contains("env ref") || result.message.contains("secret"),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_channel_kind_is_typed() {
+        let result = dispatch_test_notification(&channel("FAX", None), store(), "op-2").await;
+        assert!(!result.success);
+        assert_eq!(result.delivery_status, "UNSUPPORTED");
+    }
+
+    #[tokio::test]
+    async fn blocked_endpoint_is_not_attempted() {
+        let result = dispatch_test_notification(
+            &channel("WEBHOOK", Some(r#"{"url":"http://169.254.169.254/x"}"#)),
+            store(),
+            "op-3",
+        )
+        .await;
+        assert!(!result.success);
+        assert_eq!(result.delivery_status, "NOT_ATTEMPTED");
+    }
+
+    #[test]
+    fn truth_mapping_caps_acceptance_below_success() {
+        use astral_common::delivery::DeliveryTruth;
+        let delivered =
+            test_result_from_truth("WEBHOOK", DeliveryTruth::delivered(Some("p"), "ok"));
+        assert!(delivered.success);
+        assert_eq!(delivered.delivery_status, "DELIVERED");
+
+        let accepted = test_result_from_truth("EMAIL", DeliveryTruth::accepted(None, "mta queued"));
+        assert!(!accepted.success, "SMTP/relay acceptance is not delivery");
+        assert_eq!(accepted.delivery_status, "ACCEPTED");
+
+        let in_doubt = test_result_from_truth("SMS", DeliveryTruth::in_doubt("lost reply"));
+        assert!(!in_doubt.success);
+        assert_eq!(in_doubt.delivery_status, "IN_DOUBT");
+
+        let retry = test_result_from_truth("SMS", DeliveryTruth::retry_scheduled("451"));
+        assert!(!retry.success);
+        assert_eq!(retry.delivery_status, "RETRY_SCHEDULED");
+
+        let failed = test_result_from_truth("SMS", DeliveryTruth::failed("550"));
+        assert!(!failed.success);
+        assert_eq!(failed.delivery_status, "FAILED");
+
+        let refused = test_result_from_truth("SMS", DeliveryTruth::not_attempted("no recipient"));
+        assert!(!refused.success);
+        assert_eq!(refused.delivery_status, "NOT_ATTEMPTED");
     }
 }

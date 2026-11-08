@@ -62,6 +62,8 @@ pub(super) struct CompletionEvidence {
     pub(super) manifest_id: i64,
     pub(super) generation: u64,
     pub(super) manifest_digest: Sha256Digest,
+    pub(super) parent_manifest_digest: Option<Sha256Digest>,
+    pub(super) revoke_fence: u64,
     pub(super) plan_id: i64,
 }
 
@@ -163,6 +165,7 @@ pub(super) async fn load_in_tx(
     {
         return Ok(None);
     }
+    let mut parent_manifest_digest = None;
     if generation == 1 {
         if manifest.decode_parent_manifest_id()?.is_some() || plan.base_generation != 0 {
             return Ok(None);
@@ -183,6 +186,7 @@ pub(super) async fn load_in_tx(
         {
             return Ok(None);
         }
+        parent_manifest_digest = Some(parent.decode_hashes()?.2);
     }
     if !seal::verify_in_tx(
         tx,
@@ -210,6 +214,8 @@ pub(super) async fn load_in_tx(
         manifest_id: manifest.manifest_id,
         generation,
         manifest_digest,
+        parent_manifest_digest,
+        revoke_fence: manifest.decode_revoke_fence()?,
         plan_id: plan.plan_id,
     }))
 }

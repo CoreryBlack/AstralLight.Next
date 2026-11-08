@@ -2,13 +2,17 @@
 //!
 //! - `decode_v2_token` / `JwtClaims` — v2 JWT 解码与 claims 结构（Identity 与 Gateway 共享）
 //! - `tenant_filter` — SQLx 自动 tenant_id 过滤工具（SQL 重写 + TenantScopedQuery）
+//! - `ip_rate_limit` — 进程内 per-IP 固定窗口限流器（Gateway 与 Identity 共享的本地防护原语）
 //!
 //! Gateway 专属运行时（`sanitize_internal_auth_headers`、`jwt_auth_middleware`、
-//! 速率限制、路由凭证策略）已迁移至 `astral-gateway`。
+//! 路由凭证策略、限流 HTTP 装配）位于 `astral-gateway`；限流计数核心、受信代理
+//! 匹配与客户端 IP 解析由 `ip_rate_limit` 统一提供。
 
 pub mod gateway_signature;
+pub mod ip_rate_limit;
 pub mod permission;
 pub mod permission_check_shared;
+pub mod request_binding;
 pub mod tenant_context;
 pub mod tenant_filter;
 

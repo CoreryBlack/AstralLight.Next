@@ -2,7 +2,7 @@
 //!
 //! 对应 Java `AuthController`。登录、注册、资料、改密编排在 `AuthService`。
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use astral_common::contract::{ApiResponse, EmptyResponse};
 use astral_common::error::AppError;
 use astral_common::middleware::permission::extract_user_id;
-use astral_types::AstralError;
+use astral_types::{AstralError, AuthorizationAdmission};
 
 use crate::auth::LoginResponse;
 use crate::srv::auth_service::{ChangePasswordRequest, RegisterRequest, UpdateProfileRequest};
@@ -76,12 +76,13 @@ async fn get_profile(
 async fn update_profile(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<UpdateProfileRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     let user_id = require_user_id(&headers)?;
     state
         .auth_service
-        .update_profile(&state, user_id, &req)
+        .update_profile(&state, user_id, &req, admission)
         .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
@@ -90,10 +91,14 @@ async fn update_profile(
 async fn change_password(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     let user_id = require_user_id(&headers)?;
-    state.auth_service.change_password(user_id, &req).await?;
+    state
+        .auth_service
+        .change_password(user_id, &req, admission)
+        .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 

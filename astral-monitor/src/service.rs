@@ -28,6 +28,14 @@ impl MonitorService {
         Self { repository }
     }
 
+    pub async fn protected_mutation(
+        &self,
+        context: &astral_db::ProtectedMutationContext,
+        mutation: crate::repository::MonitorMutation,
+    ) -> Result<crate::repository::MonitorMutationResult, AstralError> {
+        self.repository.protected_mutation(context, mutation).await
+    }
+
     pub async fn list_rules(&self, filter: AlertRuleFilter) -> Result<Vec<AlertRule>, AstralError> {
         Ok(self
             .repository

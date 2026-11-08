@@ -1,15 +1,26 @@
 //! 告警通知派发 — 告警触发后向启用的通知渠道投递。
 //!
 //! 与 `notifications.rs` 的测试派发（`/test` 端点）互补：本模块是
-//! `evaluate_alert_rules` 触发真实告警后的派发路径。WEBHOOK 渠道真实
-//! 外发 HTTP；EMAIL/SMS/DINGTALK/WECHAT 保持显式模拟（与测试端点一致），
-//! 仅计数不投递。
+//! `evaluate_alert_rules` 触发真实告警后的派发路径。所有渠道（WEBHOOK/
+//! EMAIL/SMS/DINGTALK/WECHAT）都通过共享的
+//! `astral_common::delivery::DeliveryOwner` 真实外发；不再存在模拟分支。
+//!
+//! 真值语义：服务商 2xx / SMTP 250 最多记为 ACCEPTED；DELIVERED 必须有
+//! 显式回执证明（同步 webhook 2xx 或中继回执字段）；IN_DOUBT 表示投递已
+//! 开始但结果未知，只能显式对账，绝不自动重试。活动日志只记录 typed
+//! truth，不得从日志反推“已成功投递”。
 //!
 //! 失败语义（事故链）：派发失败只记录日志与指标，绝不向上传播——
 //! 告警持久化与采集循环不得因通知通道故障中断。
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
+use astral_common::delivery::{
+    resolve_channel, ChannelKind, DeliveryMessage, DeliveryOwner, DeliveryState, DeliveryStore,
+    DeliveryTruth, PayloadClass,
+};
 use astral_types::AstralError;
 
 use crate::notifications::NotificationChannel;
@@ -27,8 +38,8 @@ pub struct AlertNotification {
     pub triggered_at: String,
 }
 
-/// 派发依赖的最小端口：查询通知渠道 + 记录活动日志。
-/// 独立于 `MonitorRepository`，测试用小型 fake 即可。
+/// 派发依赖的最小端口：查询通知渠道 + 记录活动日志 + 可选的 durable
+/// intent store。独立于 `MonitorRepository`，测试用小型 fake 即可。
 #[async_trait]
 pub trait AlertNotificationSink: Send + Sync {
     async fn notification_channels(&self) -> Result<Vec<NotificationChannel>, AstralError>;
@@ -38,6 +49,13 @@ pub trait AlertNotificationSink: Send + Sync {
         detail: &str,
         level: &str,
     ) -> Result<(), AstralError>;
+
+    /// Durable delivery intent store. `None` means the runtime has not wired
+    /// the store yet: real delivery is refused fail-closed (typed
+    /// NOT_ATTEMPTED) — never simulated, never silently dropped.
+    async fn delivery_store(&self) -> Option<Arc<dyn DeliveryStore>> {
+        None
+    }
 }
 
 #[async_trait]
@@ -55,13 +73,64 @@ impl AlertNotificationSink for MonitorService {
         self.record_activity("alert_notification", title, detail, level, "astral-monitor")
             .await
     }
+
+    // delivery_store(): default None. The runtime composition (main) wires
+    // the SQL store when the AppState carries it; until then alert delivery
+    // is refused with a typed NOT_ATTEMPTED instead of being simulated.
 }
 
-/// 派发单条告警：对启用的 WEBHOOK 渠道逐一真实外发，并写一条活动日志汇总。
+/// Ready-made sink for runtime composition: wraps `MonitorService` with the
+/// SQL-backed durable intent store built from the shared DB pool.
+pub struct DbBackedAlertSink {
+    inner: Arc<MonitorService>,
+    store: Arc<dyn DeliveryStore>,
+}
+
+impl DbBackedAlertSink {
+    pub fn new(inner: Arc<MonitorService>, store: Arc<dyn DeliveryStore>) -> Self {
+        Self { inner, store }
+    }
+}
+
+#[async_trait]
+impl AlertNotificationSink for DbBackedAlertSink {
+    async fn notification_channels(&self) -> Result<Vec<NotificationChannel>, AstralError> {
+        self.inner.list_notification_channels().await
+    }
+
+    async fn record_dispatch_activity(
+        &self,
+        title: &str,
+        detail: &str,
+        level: &str,
+    ) -> Result<(), AstralError> {
+        self.inner
+            .record_activity("alert_notification", title, detail, level, "astral-monitor")
+            .await
+    }
+
+    async fn delivery_store(&self) -> Option<Arc<dyn DeliveryStore>> {
+        Some(self.store.clone())
+    }
+}
+
+/// 派发单条告警：对启用的渠道逐一真实外发，并写一条活动日志汇总。
 ///
-/// 无任何 WEBHOOK 渠道时不写活动日志（避免每个告警周期产生噪音行）。
+/// 无任何可识别的启用渠道时不写活动日志（避免每个告警周期产生噪音行）。
 pub async fn dispatch_alert<S: AlertNotificationSink + ?Sized>(
     sink: &S,
+    alert: &AlertNotification,
+) {
+    let store = sink.delivery_store().await;
+    let owner = DeliveryOwner::builder(store).build();
+    dispatch_alert_with_owner(sink, &owner, alert).await;
+}
+
+/// Owner-injecting variant (tests inject a fake transport; production uses
+/// the shared real transports).
+pub async fn dispatch_alert_with_owner<S: AlertNotificationSink + ?Sized>(
+    sink: &S,
+    owner: &DeliveryOwner,
     alert: &AlertNotification,
 ) {
     let channels = match sink.notification_channels().await {
@@ -72,59 +141,180 @@ pub async fn dispatch_alert<S: AlertNotificationSink + ?Sized>(
         }
     };
 
-    let webhooks: Vec<&NotificationChannel> = channels
+    let enabled: Vec<&NotificationChannel> = channels
         .iter()
         .filter(|channel| {
-            channel.enabled == 1 && channel.channel_type.eq_ignore_ascii_case("WEBHOOK")
+            channel.enabled == 1 && ChannelKind::parse(&channel.channel_type).is_some()
         })
         .collect();
-    let simulated = channels
+    let unknown: Vec<&NotificationChannel> = channels
         .iter()
         .filter(|channel| {
-            channel.enabled == 1 && !channel.channel_type.eq_ignore_ascii_case("WEBHOOK")
+            channel.enabled == 1 && ChannelKind::parse(&channel.channel_type).is_none()
         })
-        .count();
-    if simulated > 0 {
+        .collect();
+    for channel in &unknown {
         tracing::debug!(
-            simulated,
-            "non-webhook channels are simulated; skipped on real alert"
+            channel = %channel.name,
+            channel_type = %channel.channel_type,
+            "unknown channel type skipped on real alert"
         );
     }
-    if webhooks.is_empty() {
+    if enabled.is_empty() {
         return;
     }
 
-    let mut sent = 0usize;
+    let mut summary: Vec<String> = Vec::with_capacity(enabled.len());
+    let mut delivered = 0usize;
+    let mut accepted = 0usize;
+    let mut refused = 0usize;
     let mut failed = 0usize;
-    for channel in &webhooks {
-        match send_webhook_alert(channel, alert).await {
-            Ok(status) => {
-                sent += 1;
-                metrics::counter!("astral_monitor_notifications_sent_total", "channel_type" => "WEBHOOK")
-                    .increment(1);
-                tracing::info!(channel = %channel.name, status = %status, "webhook alert delivered");
+    let mut in_doubt = 0usize;
+
+    for channel in &enabled {
+        let kind = ChannelKind::parse(&channel.channel_type).unwrap_or(ChannelKind::Webhook);
+        let truth = deliver_alert_to_channel(owner, channel, kind, alert).await;
+        metrics::counter!(
+            "astral_delivery_outcome_total",
+            "channel" => kind.as_str(),
+            "state" => truth.state.as_str()
+        )
+        .increment(1);
+        match truth.state {
+            DeliveryState::Delivered => {
+                delivered += 1;
+                metrics::counter!(
+                    "astral_monitor_notifications_sent_total",
+                    "channel_type" => kind.as_str()
+                )
+                .increment(1);
             }
-            Err(error) => {
-                failed += 1;
-                metrics::counter!("astral_monitor_notifications_failed_total", "channel_type" => "WEBHOOK")
-                    .increment(1);
-                tracing::warn!(channel = %channel.name, error = %error, "webhook alert delivery failed");
-            }
+            DeliveryState::Accepted => accepted += 1,
+            DeliveryState::InDoubt => in_doubt += 1,
+            DeliveryState::Failed | DeliveryState::Expired => failed += 1,
+            DeliveryState::NotAttempted | DeliveryState::Queued => refused += 1,
         }
+        tracing::info!(
+            channel = %channel.name,
+            state = %truth.state,
+            detail = %truth.detail,
+            "alert notification attempt settled"
+        );
+        summary.push(format!(
+            "{}[{}]={}",
+            kind.as_str(),
+            channel.name,
+            truth.state.as_str()
+        ));
     }
 
     let title = format!("告警通知 [{}]", alert.rule_name);
-    let detail = format!(
-        "{} 触发告警 {} = {:.2}（严重级别 {}）；WEBHOOK 成功 {} / 失败 {}",
-        alert.triggered_at, alert.metric, alert.actual_value, alert.severity, sent, failed
+    let mut detail = format!(
+        "{} 触发告警 {} = {:.2}（严重级别 {}）；DELIVERED {delivered} / ACCEPTED {accepted} / FAILED {failed} / IN_DOUBT {in_doubt} / NOT_ATTEMPTED {refused}；",
+        alert.triggered_at, alert.metric, alert.actual_value, alert.severity
     );
-    let level = if failed > 0 { "warn" } else { "info" };
+    detail.push_str(&summary.join("; "));
+    if detail.len() > 512 {
+        detail.truncate(512);
+    }
+    let level = if failed > 0 || in_doubt > 0 {
+        "warn"
+    } else {
+        "info"
+    };
     if let Err(error) = sink.record_dispatch_activity(&title, &detail, level).await {
         tracing::warn!(error = %error, "alert dispatch activity recording failed");
     }
 }
 
-/// 构造告警 webhook payload（与测试端点 payload 风格一致的 camelCase 契约）。
+/// 通过共享 DeliveryOwner 向单个渠道真实投递一条告警。
+async fn deliver_alert_to_channel(
+    owner: &DeliveryOwner,
+    channel: &NotificationChannel,
+    kind: ChannelKind,
+    alert: &AlertNotification,
+) -> DeliveryTruth {
+    let resolved = match resolve_channel(kind, channel.config.as_deref()) {
+        Ok(resolved) => resolved,
+        Err(error) => return DeliveryTruth::not_attempted(error.to_string()),
+    };
+    let recipient = match alert_recipient(&resolved, channel) {
+        Ok(recipient) => recipient,
+        Err(truth) => return truth,
+    };
+    // Stable operation per firing: re-dispatching the same alert firing is
+    // idempotent at the durable-intent layer (same message id).
+    let operation = format!(
+        "monitor:alert:{}:{}:{}",
+        alert.rule_id, alert.metric, alert.triggered_at
+    );
+    let message = match kind {
+        ChannelKind::Webhook => DeliveryMessage::compose(
+            kind,
+            &operation,
+            Some(&DeliveryOwner::message_id_for_operation(&operation)),
+            &recipient,
+            Some(&alert_subject(alert)),
+            &alert_payload(alert).to_string(),
+            PayloadClass::Standard,
+        ),
+        _ => DeliveryMessage::compose(
+            kind,
+            &operation,
+            Some(&DeliveryOwner::message_id_for_operation(&operation)),
+            &recipient,
+            Some(&alert_subject(alert)),
+            &alert_body(alert),
+            PayloadClass::Standard,
+        ),
+    };
+    let message = match message {
+        Ok(message) => message,
+        Err(error) => return DeliveryTruth::not_attempted(error.to_string()),
+    };
+    owner.deliver(&message, &resolved).await
+}
+
+fn alert_subject(alert: &AlertNotification) -> String {
+    format!("告警 [{}] {}", alert.severity, alert.rule_name)
+}
+
+fn alert_body(alert: &AlertNotification) -> String {
+    format!(
+        "触发告警: {} = {:.2}（严重级别 {}，时间 {}）",
+        alert.metric, alert.actual_value, alert.severity, alert.triggered_at
+    )
+}
+
+/// 渠道收件人：EMAIL 用配置的 `recipient`（缺失即拒发）；其余渠道用
+/// 端点 URL 作为意图记录的收件标识。
+fn alert_recipient(
+    resolved: &astral_common::delivery::ResolvedChannel,
+    channel: &NotificationChannel,
+) -> Result<String, DeliveryTruth> {
+    match resolved {
+        astral_common::delivery::ResolvedChannel::Smtp(_) => {
+            let config: serde_json::Value = channel
+                .config
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let recipient = config
+                .get("recipient")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            recipient.ok_or_else(|| {
+                DeliveryTruth::not_attempted("email recipient (config recipient) not configured")
+            })
+        }
+        astral_common::delivery::ResolvedChannel::Relay(config)
+        | astral_common::delivery::ResolvedChannel::Webhook(config) => Ok(config.url.clone()),
+    }
+}
+
+/// 构造告警 webhook payload（camelCase 契约）。
 fn alert_payload(alert: &AlertNotification) -> serde_json::Value {
     serde_json::json!({
         "event": "alert",
@@ -138,50 +328,47 @@ fn alert_payload(alert: &AlertNotification) -> serde_json::Value {
     })
 }
 
-/// 从渠道 config JSON 提取 `url`（缺失/为空返回错误）。
-fn webhook_url(channel: &NotificationChannel) -> Result<String, String> {
-    let config: serde_json::Value = channel
-        .config
-        .as_deref()
-        .and_then(|value| serde_json::from_str(value).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let url = config
-        .get("url")
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if url.is_empty() {
-        return Err("Webhook URL 未配置".into());
-    }
-    Ok(url)
-}
-
-/// 真实外发告警 webhook：POST JSON，5s 超时，2xx 视为成功。
-async fn send_webhook_alert(
-    channel: &NotificationChannel,
-    alert: &AlertNotification,
-) -> Result<String, String> {
-    let url = webhook_url(channel)?;
-    let response = reqwest::Client::new()
-        .post(&url)
-        .json(&alert_payload(alert))
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-        .map_err(|error| format!("Webhook 发送失败: {error}"))?;
-    let status = response.status();
-    if status.is_success() {
-        Ok(status.to_string())
-    } else {
-        Err(format!("Webhook 响应状态: {status}"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astral_common::delivery::InMemoryDeliveryStore;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    fn fake_store() -> Arc<dyn DeliveryStore> {
+        Arc::new(InMemoryDeliveryStore::new())
+    }
+
+    /// Static-truth transport for owner-level dispatch tests.
+    struct StaticTransport {
+        calls: AtomicUsize,
+        truth: DeliveryTruth,
+    }
+
+    impl StaticTransport {
+        fn delivered() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                truth: DeliveryTruth::delivered(Some("prov-1"), "receipt"),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl astral_common::delivery::ChannelTransport for StaticTransport {
+        async fn dispatch(
+            &self,
+            _message: &DeliveryMessage,
+            _channel: &astral_common::delivery::ResolvedChannel,
+        ) -> DeliveryTruth {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.truth.clone()
+        }
+    }
 
     fn alert() -> AlertNotification {
         AlertNotification {
@@ -213,6 +400,7 @@ mod tests {
         channels: Vec<NotificationChannel>,
         activities: Mutex<Vec<String>>,
         channels_error: bool,
+        store: Option<Arc<dyn DeliveryStore>>,
     }
 
     impl FakeSink {
@@ -221,7 +409,13 @@ mod tests {
                 channels,
                 activities: Mutex::new(Vec::new()),
                 channels_error: false,
+                store: None,
             }
+        }
+
+        fn with_store(mut self, store: Arc<dyn DeliveryStore>) -> Self {
+            self.store = Some(store);
+            self
         }
 
         fn activities(&self) -> Vec<String> {
@@ -250,6 +444,10 @@ mod tests {
                 .push(format!("{title}|{detail}|{level}"));
             Ok(())
         }
+
+        async fn delivery_store(&self) -> Option<Arc<dyn DeliveryStore>> {
+            self.store.clone()
+        }
     }
 
     #[test]
@@ -263,88 +461,12 @@ mod tests {
         assert!(payload["message"].as_str().unwrap().contains("91.5"));
     }
 
-    #[test]
-    fn webhook_url_requires_configured_url() {
-        assert_eq!(
-            webhook_url(&channel(1, "WEBHOOK", 1, None)).unwrap_err(),
-            "Webhook URL 未配置"
-        );
-        assert_eq!(
-            webhook_url(&channel(1, "WEBHOOK", 1, Some(r#"{"url":"  "#))).unwrap_err(),
-            "Webhook URL 未配置"
-        );
-        assert_eq!(
-            webhook_url(&channel(
-                1,
-                "WEBHOOK",
-                1,
-                Some(r#"{"url":"http://h/hook"}"#)
-            ))
-            .unwrap(),
-            "http://h/hook"
-        );
-    }
-
     #[tokio::test]
-    async fn webhook_delivery_posts_alert_payload() {
-        let captured: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-        let seen = captured.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let app = axum::Router::new().route(
-                "/hook",
-                axum::routing::post(move |body: axum::body::Bytes| {
-                    let seen = seen.clone();
-                    async move {
-                        seen.lock()
-                            .unwrap()
-                            .push(String::from_utf8_lossy(&body).to_string());
-                        axum::http::StatusCode::OK
-                    }
-                }),
-            );
-            axum::serve(listener, app).await.unwrap();
-        });
-        let target = format!("http://{addr}/hook");
-        let result = send_webhook_alert(
-            &channel(1, "WEBHOOK", 1, Some(&format!(r#"{{"url":"{target}"}}"#))),
-            &alert(),
-        )
-        .await;
-        server.abort();
-        assert!(result.is_ok(), "delivery should succeed: {result:?}");
-        let bodies = captured.lock().unwrap();
-        assert_eq!(bodies.len(), 1, "exactly one delivery");
-        let body = &bodies[0];
-        assert!(body.contains("\"event\":\"alert\""), "captured: {body}");
-        assert!(
-            body.contains("\"ruleName\":\"CPU high\""),
-            "captured: {body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn webhook_delivery_fails_on_unreachable_url() {
-        // 端口 1 上无监听，连接应快速被拒。
-        let result = send_webhook_alert(
-            &channel(
-                1,
-                "WEBHOOK",
-                1,
-                Some(r#"{"url":"http://127.0.0.1:1/hook"}"#),
-            ),
-            &alert(),
-        )
-        .await;
-        assert!(result.is_err(), "unreachable webhook must fail: {result:?}");
-    }
-
-    #[tokio::test]
-    async fn dispatch_without_webhook_channels_writes_no_activity() {
+    async fn dispatch_without_enabled_channels_writes_no_activity() {
         let sink = FakeSink::new(vec![
-            channel(2, "EMAIL", 1, None),
+            channel(2, "EMAIL", 0, None),
             channel(3, "WEBHOOK", 0, None),
+            channel(4, "FAX", 1, None),
         ]);
         dispatch_alert(&sink, &alert()).await;
         assert!(sink.activities().is_empty());
@@ -359,59 +481,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_records_activity_summary_with_failures() {
+    async fn missing_durable_store_refuses_dispatch_fail_closed() {
+        // No store wired: delivery is refused with typed truth, never simulated.
         let sink = FakeSink::new(vec![channel(
             4,
             "WEBHOOK",
             1,
-            Some(r#"{"url":"http://127.0.0.1:1/hook"}"#),
+            Some(r#"{"url":"https://hooks.example.com/x"}"#),
         )]);
         dispatch_alert(&sink, &alert()).await;
         let activities = sink.activities();
-        assert_eq!(activities.len(), 1, "one summary activity row");
+        assert_eq!(activities.len(), 1, "{activities:?}");
         assert!(
-            activities[0].contains("WEBHOOK 成功 0 / 失败 1"),
+            activities[0].contains("WEBHOOK[channel-4]=NOT_ATTEMPTED"),
             "{activities:?}"
         );
-        assert!(activities[0].ends_with("|warn"), "{activities:?}");
+        assert!(activities[0].ends_with("|info"), "{activities:?}");
     }
 
     #[tokio::test]
-    async fn dispatch_success_activity_is_info_level() {
-        let captured: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-        let seen = captured.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let app = axum::Router::new().route(
-                "/hook",
-                axum::routing::post(move |body: axum::body::Bytes| {
-                    let seen = seen.clone();
-                    async move {
-                        seen.lock()
-                            .unwrap()
-                            .push(String::from_utf8_lossy(&body).to_string());
-                        axum::http::StatusCode::OK
-                    }
-                }),
-            );
-            axum::serve(listener, app).await.unwrap();
-        });
+    async fn real_owner_composition_records_typed_truth_in_activity() {
+        // Store wired + fake transport truth via the owner-injecting variant:
+        // activity must carry the typed state, never an inferred success.
         let sink = FakeSink::new(vec![channel(
             5,
             "WEBHOOK",
             1,
-            Some(&format!(r#"{{"url":"http://{addr}/hook"}}"#)),
-        )]);
-        dispatch_alert(&sink, &alert()).await;
-        server.abort();
-        assert_eq!(captured.lock().unwrap().len(), 1, "delivery must land");
+            Some(r#"{"url":"https://hooks.example.com/x"}"#),
+        )])
+        .with_store(fake_store());
+        let transport = StaticTransport::delivered();
+        let owner = DeliveryOwner::builder(Some(fake_store()))
+            .transport(Arc::new(transport))
+            .build();
+        dispatch_alert_with_owner(&sink, &owner, &alert()).await;
         let activities = sink.activities();
         assert_eq!(activities.len(), 1, "{activities:?}");
         assert!(
-            activities[0].contains("WEBHOOK 成功 1 / 失败 0"),
+            activities[0].contains("WEBHOOK[channel-5]=DELIVERED"),
             "{activities:?}"
         );
         assert!(activities[0].ends_with("|info"), "{activities:?}");
+    }
+
+    #[tokio::test]
+    async fn email_without_recipient_is_not_attempted() {
+        let sink = FakeSink::new(vec![channel(
+            6,
+            "EMAIL",
+            1,
+            Some(r#"{"host":"smtp.example.com","from":"noreply@example.com"}"#),
+        )])
+        .with_store(fake_store());
+        dispatch_alert(&sink, &alert()).await;
+        let activities = sink.activities();
+        assert!(
+            activities[0].contains("EMAIL[channel-6]=NOT_ATTEMPTED"),
+            "{activities:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_config_is_contained_per_channel() {
+        let sink = FakeSink::new(vec![
+            channel(7, "SMS", 1, Some(r#"{"url":"http://169.254.169.254/x"}"#)),
+            channel(
+                8,
+                "WEBHOOK",
+                1,
+                Some(r#"{"url":"https://hooks.example.com/x"}"#),
+            ),
+        ])
+        .with_store(fake_store());
+        let transport = StaticTransport::delivered();
+        let owner = DeliveryOwner::builder(Some(fake_store()))
+            .transport(Arc::new(transport))
+            .build();
+        dispatch_alert_with_owner(&sink, &owner, &alert()).await;
+        let activities = sink.activities();
+        assert!(
+            activities[0].contains("SMS[channel-7]=NOT_ATTEMPTED"),
+            "{activities:?}"
+        );
+        assert!(
+            activities[0].contains("WEBHOOK[channel-8]=DELIVERED"),
+            "{activities:?}"
+        );
+        assert!(activities[0].ends_with("|info"), "{activities:?}");
+    }
+
+    #[tokio::test]
+    async fn same_alert_firing_does_not_redispatch_after_terminal_truth() {
+        let sink = FakeSink::new(vec![channel(
+            9,
+            "WEBHOOK",
+            1,
+            Some(r#"{"url":"https://hooks.example.com/x"}"#),
+        )])
+        .with_store(fake_store());
+        let transport = Arc::new(StaticTransport::delivered());
+        let owner = DeliveryOwner::builder(Some(fake_store()))
+            .transport(transport.clone())
+            .build();
+        dispatch_alert_with_owner(&sink, &owner, &alert()).await;
+        dispatch_alert_with_owner(&sink, &owner, &alert()).await;
+        assert_eq!(
+            transport.calls(),
+            1,
+            "same firing must not re-dispatch after terminal truth"
+        );
     }
 }

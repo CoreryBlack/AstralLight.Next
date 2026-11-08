@@ -2081,7 +2081,15 @@ pub struct OrgAdmissionEvidence {
 }
 
 impl OrgAdmissionEvidence {
-    pub fn validate(&self) -> OrgResult<()> {
+    /// Structural binding of one admission evidence, the SINGLE owner shared
+    /// by the positive admission path and the revocation-evidence path:
+    /// tenant/root identity of node and membership, node head fences and
+    /// dependency pinning. Deliberately EXCLUDES the liveness and validity
+    /// conditions (`node.active`, `membership.active`, membership validity at
+    /// the read clock) so the revocation path can bind the exact structural
+    /// content of an inactive node or membership without inheriting the
+    /// positive gate.
+    pub(crate) fn validate_structure(&self) -> OrgResult<()> {
         self.publication.validate()?;
         self.node.validate()?;
         self.membership.validate()?;
@@ -2091,12 +2099,6 @@ impl OrgAdmissionEvidence {
             return Err(OrgError::new(
                 OrgErrorCode::TenantMismatch,
                 "evidence node must belong to the publication unit",
-            ));
-        }
-        if !self.node.active {
-            return Err(OrgError::new(
-                OrgErrorCode::MembershipInactive,
-                "evidence node is inactive",
             ));
         }
         // 节点头栅栏必须与 publication 逐项相等（generation/fence/relationship）。
@@ -2136,6 +2138,22 @@ impl OrgAdmissionEvidence {
             return Err(OrgError::new(
                 OrgErrorCode::TenantMismatch,
                 "evidence membership must belong to the publication unit",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Positive admission gate: the full structural binding PLUS every
+    /// original liveness/validity condition (active node, active membership,
+    /// membership validity at the read clock). Inactive evidence is rejected
+    /// here exactly as before — the revocation path is the only consumer
+    /// allowed to see inactive structure.
+    pub fn validate(&self) -> OrgResult<()> {
+        self.validate_structure()?;
+        if !self.node.active {
+            return Err(OrgError::new(
+                OrgErrorCode::MembershipInactive,
+                "evidence node is inactive",
             ));
         }
         if !self.membership.active {
@@ -3319,6 +3337,52 @@ mod tests {
         let mut next = evidence.clone();
         next.checked_at_unix = 2_500; // 越过 validity(1000..2000) 上界
         assert!(!org_admission_recheck_stable(&evidence, &next, &winner));
+    }
+
+    #[test]
+    fn admission_structure_binding_ignores_liveness_and_clock() {
+        let evidence = OrgAdmissionEvidence {
+            publication: single_segment_publication(),
+            node: root_node(),
+            membership: membership(ROOT_TENANT),
+            checked_at_unix: 1_500,
+        };
+        assert!(evidence.validate_structure().is_ok());
+        assert!(evidence.validate().is_ok());
+
+        // 节点/成员双双 inactive 且成员过期：结构绑定仍然成立（撤销路径的
+        // 输入），正向 validate 继续按原条件拒绝。
+        let mut revoked = evidence.clone();
+        revoked.node.active = false;
+        revoked.membership.active = false;
+        revoked.checked_at_unix = 9_999;
+        assert!(revoked.validate_structure().is_ok());
+        assert_eq!(
+            revoked.validate().unwrap_err().code,
+            OrgErrorCode::MembershipInactive
+        );
+        // 只撤成员（节点仍活跃）同样通过结构绑定。
+        let mut member_only = evidence.clone();
+        member_only.membership.active = false;
+        assert!(member_only.validate_structure().is_ok());
+        assert_eq!(
+            member_only.validate().unwrap_err().code,
+            OrgErrorCode::MembershipInactive
+        );
+
+        // 结构绑定本身不放松：跨租户 membership、节点头栅栏漂移在结构层拒绝。
+        let mut cross_tenant = revoked.clone();
+        cross_tenant.membership.tenant_id = CHILD_TENANT;
+        assert_eq!(
+            cross_tenant.validate_structure().unwrap_err().code,
+            OrgErrorCode::TenantMismatch
+        );
+        let mut fence_drift = revoked.clone();
+        fence_drift.node.generation += 1;
+        assert_eq!(
+            fence_drift.validate_structure().unwrap_err().code,
+            OrgErrorCode::DependencyMismatch
+        );
     }
 
     #[test]

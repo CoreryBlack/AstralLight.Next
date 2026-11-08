@@ -7,7 +7,9 @@ use sqlx::{MySql, MySqlPool, QueryBuilder, Transaction};
 use time::{format_description, Date, OffsetDateTime, PrimitiveDateTime, Time};
 
 use astral_db::USER_VISIBLE_AUDIT_PREDICATE;
-use astral_types::{AstralError, SYSTEM_ACTOR_ID};
+use astral_types::{AstralError, AuthorizationAdmission, SYSTEM_ACTOR_ID};
+
+use super::authorization_source_transaction::SourceMutationCapability;
 
 /// Documented actor used only for genuinely system-initiated work such as
 /// startup template synchronization and an explicit migration backfill.
@@ -25,6 +27,7 @@ pub struct RuleSetMutationContext {
     /// identity 种子；随机 fallback 只保留给 legacy 投影/审计 correlation，
     /// 一旦进入账本事件就会破坏重放稳定身份与显式冲突语义。
     proven_operation_identity: bool,
+    source_capability: SourceMutationCapability,
 }
 
 impl RuleSetMutationContext {
@@ -46,6 +49,7 @@ impl RuleSetMutationContext {
             // 该值永远不是可证明身份（proven=false）。
             operation_id: validated.unwrap_or_else(|| format!("ruleset:{}", uuid::Uuid::new_v4())),
             proven_operation_identity,
+            source_capability: SourceMutationCapability::UserPending,
         })
     }
 
@@ -59,7 +63,23 @@ impl RuleSetMutationContext {
             actor_id: SYSTEM_RULE_SET_ACTOR_ID,
             operation_id: operation_id.trim().to_owned(),
             proven_operation_identity: true,
+            source_capability: SourceMutationCapability::System,
         })
+    }
+
+    /// Construct a user mutation context from a verified policy admission.
+    pub fn user_with_admission(
+        actor_id: i64,
+        operation_id: Option<&str>,
+        admission: AuthorizationAdmission,
+    ) -> Result<Self, AstralError> {
+        let mut context = Self::user(actor_id, operation_id)?;
+        context.source_capability = SourceMutationCapability::user(admission);
+        Ok(context)
+    }
+
+    pub(crate) fn source_capability(&self) -> &SourceMutationCapability {
+        &self.source_capability
     }
 
     /// 用调用方事务内从已锁定 durable 事实确定性派生的操作身份替换本上下文。
@@ -80,6 +100,7 @@ impl RuleSetMutationContext {
             actor_id: self.actor_id,
             operation_id: trimmed.to_owned(),
             proven_operation_identity: true,
+            source_capability: self.source_capability.clone(),
         })
     }
 

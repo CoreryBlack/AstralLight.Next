@@ -174,8 +174,7 @@ async fn wait_for_bus_owners(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(anyhow!(
-                "local bus owners, the projection worker liveness, or the memory channel \
-                 health did not become ready within 30 seconds"
+                "local bus owners, the projection worker liveness, or the memory channel health did not become ready within 30 seconds"
             ));
         }
         let retry = tokio::time::sleep(Duration::from_millis(100));
@@ -561,6 +560,9 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
     let config = AppConfig::from_files_for("application", JwtValidationRole::Gateway)
         .context("load single-node configuration")?;
+    config.validate_listener_for(JwtValidationRole::Gateway)?;
+    config.validate_listener_for(JwtValidationRole::Identity)?;
+    let config = Arc::new(config);
     let gateway_addr = env_or("SINGLE_NODE_GATEWAY_ADDR", DEFAULT_GATEWAY_ADDR);
     let identity_addr = env_or("SINGLE_NODE_IDENTITY_ADDR", DEFAULT_IDENTITY_ADDR);
     let trustgraph_addr = env_or("SINGLE_NODE_TRUSTGRAPH_ADDR", DEFAULT_TRUSTGRAPH_ADDR);
@@ -636,8 +638,10 @@ async fn main() -> anyhow::Result<()> {
     let identity_barrier = Arc::clone(&producer_drain_barrier);
     let trustgraph_barrier = Arc::clone(&producer_drain_barrier);
     let identity_task_addr = identity_addr.clone();
+    let identity_config = (*config).clone();
     let mut identity = tokio::spawn(async move {
-        astral_identity::run_with_listen_addr_and_shutdown_and_drain(
+        astral_identity::run_with_config_and_listen_addr_and_shutdown_and_drain(
+            identity_config,
             &identity_task_addr,
             async move {
                 let _ = identity_shutdown_rx.await;
@@ -649,8 +653,10 @@ async fn main() -> anyhow::Result<()> {
         .await
     });
     let trustgraph_task_addr = trustgraph_addr.clone();
+    let trustgraph_config = (*config).clone();
     let mut trustgraph = tokio::spawn(async move {
-        astral_trustgraph::run_with_listen_addr_and_shutdown_and_drain(
+        astral_trustgraph::run_with_config_and_listen_addr_and_shutdown_and_drain(
+            trustgraph_config,
             &trustgraph_task_addr,
             async move {
                 let _ = trustgraph_shutdown_rx.await;
@@ -724,10 +730,15 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("single-node service listeners and message owners ready; starting gateway");
     let (gateway_shutdown_tx, gateway_shutdown_rx) = tokio::sync::oneshot::channel();
+    let gateway_config = (*config).clone();
     let mut gateway = tokio::spawn(async move {
-        astral_gateway::run_with_listen_addr_and_shutdown(&gateway_addr, async move {
-            let _ = gateway_shutdown_rx.await;
-        })
+        astral_gateway::run_with_config_and_listen_addr_and_shutdown(
+            gateway_config,
+            &gateway_addr,
+            async move {
+                let _ = gateway_shutdown_rx.await;
+            },
+        )
         .await
     });
     let mut gateway_shutdown_tx = Some(gateway_shutdown_tx);
@@ -915,6 +926,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_composite_passes_one_frozen_config_to_each_runtime() {
+        let source = include_str!("main.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            production.matches("AppConfig::from_files_for(").count(),
+            1,
+            "single-node must load AppConfig exactly once"
+        );
+        assert!(production
+            .contains("astral_identity::run_with_config_and_listen_addr_and_shutdown_and_drain"));
+        assert!(production
+            .contains("astral_trustgraph::run_with_config_and_listen_addr_and_shutdown_and_drain"));
+        assert!(production.contains("astral_gateway::run_with_config_and_listen_addr_and_shutdown"));
+        assert!(!production.contains("reloaded_config"));
+        assert!(!production.contains("validate_reloaded_config"));
+        assert!(!production.contains("invalidation_delivery == second.invalidation_delivery"));
+        assert!(
+            !production.contains("start_invalidation_transport("),
+            "single-node must leave the sole network invalidation owner in TrustGraph"
+        );
+    }
+
     /// 启动门禁顺序锁定（shape）：单写者租约获取 → 运行期租约监督启动 →
     /// 内存镜像预热 → 服务 spawn。监督必须从拿到租约的第一刻起生效，
     /// 保证丢失立即被检测并 fail-closed，绝不误声明 READINESS。
@@ -968,7 +1002,8 @@ mod tests {
     /// worker as fatal (stop all services), the probe must read the exported
     /// trustgraph liveness cell — never a LocalBus-only heuristic — and
     /// readiness must require the full conjunction (owners ready AND worker
-    /// Alive AND memory channel healthy).
+    /// Alive AND memory channel healthy). Positive authorization remains a
+    /// separate authority `SERVING` gate in the PolicyEngine repository.
     #[test]
     fn projection_owner_liveness_gate_is_wired_into_readiness_and_run_loop() {
         let source = include_str!("main.rs");
@@ -992,7 +1027,7 @@ mod tests {
                 && readiness_window.contains("channel_is_healthy()")
                 && readiness_window.contains("bus.owners_ready()"),
             "readiness must require the full conjunction: owners ready + worker Alive + \
-             memory channel healthy"
+             memory channel healthy; positive authorization has a separate authority gate"
         );
         let run_loop_window = &source[tick_pos..];
         assert!(

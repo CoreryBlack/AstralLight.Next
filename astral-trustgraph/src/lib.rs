@@ -46,8 +46,8 @@ use service::tenant_service::TenantService;
 use service::user_card_service::UserCardService;
 
 pub use runtime::{
-    run, run_with_listen_addr, run_with_listen_addr_and_shutdown,
-    run_with_listen_addr_and_shutdown_and_drain,
+    run, run_with_config_and_listen_addr_and_shutdown_and_drain, run_with_listen_addr,
+    run_with_listen_addr_and_shutdown, run_with_listen_addr_and_shutdown_and_drain,
 };
 
 pub mod runtime;
@@ -97,6 +97,10 @@ pub struct AppState {
     pub level_template_service: Arc<LevelTemplateService>,
     pub user_card_service: Arc<UserCardService>,
     pub personal_permission_service: Arc<PersonalPermissionService>,
+    /// Fixed trust-root verifier for request-bound authorization fences. A
+    /// missing provider is not-ready in Strict mode; DurableOnly is an explicit
+    /// compatibility profile and never enables memory by accident.
+    pub authorization_fence_provider: Option<Arc<astral_db::SqlxAuthorizationFenceProvider>>,
     /// 投影 worker 监督健康共享态（F5 修复 1d）：main 在启动 projector 后
     /// 写入一次；未启动（配置拒绝）时保持为空，stats 端点如实返回 None。
     pub projector_health:
@@ -114,6 +118,18 @@ pub struct AppState {
     /// create/alter its durable authority state, otherwise its outbox could not
     /// be consumed by the owned projector. Empty only while ORG_SCOPE is off.
     pub org_scope_tenant_allowlist: Vec<i64>,
+}
+
+impl AppState {
+    /// Construct the only supported TrustGraph policy repository shape. The
+    /// authority mode and verifier are frozen at startup and must not vary by
+    /// handler or service call site.
+    pub fn rule_repository(&self) -> astral_db::SqlxRuleRepository {
+        astral_db::SqlxRuleRepository::new(self.db.clone())
+            .with_org_scope_enabled(self.org_scope_enabled)
+            .with_authority_provider_opt(self.authorization_fence_provider.clone())
+            .with_authority_required(self.config.authority_runtime_mode.requires_authority())
+    }
 }
 
 impl FromRef<AppState> for MySqlPool {

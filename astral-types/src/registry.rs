@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn custom_registration_is_validated_bounded_and_idempotent() {
-        let registry = ResourceRegistry::global();
+        let registry = ResourceRegistry::new_with_builtins();
         let unique = format!("test_custom_resource_{}", std::process::id());
         let actions = vec!["read".to_owned(), "approve".to_owned()];
         let registration = CustomResourceRegistration {

@@ -221,6 +221,7 @@ pub mod approval;
 pub mod audit;
 pub mod audit_replay;
 pub mod audit_service;
+pub mod authorization_observations;
 pub mod cross_org_grants;
 pub mod delegation;
 pub mod departments;

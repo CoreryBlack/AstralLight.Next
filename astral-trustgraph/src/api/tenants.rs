@@ -12,8 +12,8 @@ use serde::Deserialize;
 use astral_common::contract::{ApiResponse, PageResponse};
 use astral_common::error::AppError;
 use astral_types::{
-    AstralError, PolicyContext, Tenant, TenantAuditLog, TenantDomainMap, TenantInvitation,
-    TenantMember, TenantPurchase,
+    AstralError, AuthorizationAdmission, PolicyContext, Tenant, TenantAuditLog, TenantDomainMap,
+    TenantInvitation, TenantMember, TenantPurchase,
 };
 
 use crate::repository::tenant_repository::{
@@ -362,9 +362,10 @@ async fn create_tenant(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<CreateTenantRequest>,
 ) -> Result<Json<ApiResponse<Tenant>>, AppError> {
-    let context = tenant_mutation_context(&headers, &policy_context)?;
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let outcome = state
         .tenant_service
         .create_tenant_with_context(&req.name, req.parent_tenant_id, &context)
@@ -388,10 +389,16 @@ async fn update_tenant(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateTenantRequest>,
 ) -> Result<Json<ApiResponse<Tenant>>, AppError> {
-    let context = tenant_mutation_context(&headers, &policy_context)?;
+    if req.name.is_some() && req.status.is_some() {
+        return Err(AppError(astral_types::AstralError::Validation(
+            "tenant name and status updates require separate requests".into(),
+        )));
+    }
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     if let Some(ref name) = req.name {
         state
             .tenant_repository
@@ -425,9 +432,10 @@ async fn delete_tenant(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    let context = tenant_mutation_context(&headers, &policy_context)?;
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let deleted = state
         .tenant_repository
         .delete_tenant_with_context(id, &context)
@@ -446,9 +454,10 @@ async fn suspend_tenant(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<Tenant>>, AppError> {
-    let context = tenant_mutation_context(&headers, &policy_context)?;
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let transitioned = state
         .tenant_repository
         .transition_tenant_status_with_context(id, "ACTIVE", "SUSPENDED", &context)
@@ -473,9 +482,10 @@ async fn activate_tenant(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<Tenant>>, AppError> {
-    let context = tenant_mutation_context(&headers, &policy_context)?;
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let transitioned = state
         .tenant_repository
         .transition_tenant_status_with_context(id, "SUSPENDED", "ACTIVE", &context)
@@ -515,10 +525,11 @@ async fn create_sub_tenant(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<CreateTenantRequest>,
 ) -> Result<Json<ApiResponse<Tenant>>, AppError> {
-    let context = tenant_mutation_context(&headers, &policy_context)?;
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let outcome = state
         .tenant_service
         .create_sub_tenant_with_context(id, &req.name, &context)
@@ -572,6 +583,9 @@ async fn list_members(
 /// 添加租户成员
 async fn add_member(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(tenant_id): Path<i64>,
     Json(req): Json<InviteMemberRequest>,
 ) -> Result<Json<ApiResponse<TenantMember>>, AppError> {
@@ -588,9 +602,10 @@ async fn add_member(
         )));
     }
 
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     state
         .tenant_repository
-        .upsert_member(tenant_id, user_id, &role_upper)
+        .upsert_member_with_context(tenant_id, user_id, &role_upper, &context)
         .await?;
     let member: TenantMember = state
         .tenant_repository
@@ -603,11 +618,15 @@ async fn add_member(
 /// 移除租户成员
 async fn remove_member(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path((tenant_id, user_id)): Path<(i64, i64)>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let removed = state
         .tenant_repository
-        .remove_member(tenant_id, user_id)
+        .remove_member_with_context(tenant_id, user_id, &context)
         .await?;
     if !removed {
         return Err(AppError(astral_types::AstralError::NotFound(format!(
@@ -621,13 +640,23 @@ async fn remove_member(
 /// PUT /{id}/members/{user_id}/admin-level — 修改成员管理等级
 async fn update_member_admin_level(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path((tenant_id, user_id)): Path<(i64, i64)>,
     Json(req): Json<UpdateMemberFieldRequest>,
 ) -> Result<Json<ApiResponse<TenantMember>>, AppError> {
     let admin_level: i32 = req.value.parse().unwrap_or(0);
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let updated = state
         .tenant_repository
-        .update_member_field(tenant_id, user_id, "admin_level", admin_level.to_string())
+        .update_member_field_with_context(
+            tenant_id,
+            user_id,
+            "admin_level",
+            admin_level.to_string(),
+            &context,
+        )
         .await?;
     if !updated {
         return Err(AppError(astral_types::AstralError::NotFound(format!(
@@ -645,13 +674,23 @@ async fn update_member_admin_level(
 /// PUT /{id}/members/{user_id}/department — 修改成员部门
 async fn update_member_department(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path((tenant_id, user_id)): Path<(i64, i64)>,
     Json(req): Json<UpdateMemberFieldRequest>,
 ) -> Result<Json<ApiResponse<TenantMember>>, AppError> {
     let dept_id: i64 = req.value.parse().unwrap_or(0);
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let updated = state
         .tenant_repository
-        .update_member_field(tenant_id, user_id, "dept_id", dept_id.to_string())
+        .update_member_field_with_context(
+            tenant_id,
+            user_id,
+            "dept_id",
+            dept_id.to_string(),
+            &context,
+        )
         .await?;
     if !updated {
         return Err(AppError(astral_types::AstralError::NotFound(format!(
@@ -669,6 +708,9 @@ async fn update_member_department(
 /// PUT /{id}/members/{user_id}/role — 修改成员角色
 async fn update_member_role(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path((tenant_id, user_id)): Path<(i64, i64)>,
     Json(req): Json<UpdateMemberFieldRequest>,
 ) -> Result<Json<ApiResponse<TenantMember>>, AppError> {
@@ -678,9 +720,10 @@ async fn update_member_role(
             "role must be OWNER/ADMIN/MEMBER/GUEST".into(),
         )));
     }
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let updated = state
         .tenant_repository
-        .update_member_field(tenant_id, user_id, "role_type", role)
+        .update_member_field_with_context(tenant_id, user_id, "role_type", role, &context)
         .await?;
     if !updated {
         return Err(AppError(astral_types::AstralError::NotFound(format!(
@@ -715,12 +758,16 @@ async fn list_invitations(
 /// 创建租户邀请
 async fn create_invitation(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(tenant_id): Path<i64>,
     Json(req): Json<InviteMemberRequest>,
 ) -> Result<Json<ApiResponse<TenantInvitation>>, AppError> {
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let invitation: TenantInvitation = state
         .tenant_service
-        .create_invitation(tenant_id, &req.role)
+        .create_invitation_with_context(tenant_id, &req.role, &context)
         .await?
         .into();
     Ok(Json(ApiResponse::success(invitation)))
@@ -729,11 +776,15 @@ async fn create_invitation(
 /// DELETE /{id}/invitations/{invitation_id} — 撤销邀请
 async fn cancel_invitation(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path((tenant_id, invitation_id)): Path<(i64, i64)>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let canceled = state
         .tenant_repository
-        .cancel_invitation(tenant_id, invitation_id)
+        .cancel_invitation_with_context(tenant_id, invitation_id, &context)
         .await?;
     if !canceled {
         return Err(AppError(astral_types::AstralError::NotFound(format!(
@@ -765,9 +816,16 @@ async fn get_invitation_by_code(
 }
 
 /// POST /invitations/{code}/use — 使用邀请码加入租户
+///
+/// 入会是用户面治理 mutation：与租户 CRUD 同一 proof-bound admission 入口。
+/// 裸 `X-User-Id` 仅用于提交后的成员读回，且必须在 `tenant_mutation_context`
+/// 与验证过的 PolicyContext 完全一致后才可用；入会成员由源事务锁定的 actor
+/// 卡片派生，绝不信任客户端声明的身份。
 async fn use_invitation_code(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(code): Path<String>,
 ) -> Result<Json<ApiResponse<TenantMember>>, AppError> {
     let user_id: i64 = headers
@@ -776,9 +834,10 @@ async fn use_invitation_code(
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| AppError(astral_types::AstralError::Auth("X-User-Id required".into())))?;
 
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let outcome = state
         .tenant_service
-        .use_invitation_code(&code, user_id)
+        .use_invitation_code_with_context(&code, &context)
         .await?;
     let member: TenantMember = state
         .tenant_repository
@@ -808,12 +867,30 @@ async fn list_purchases(
 /// POST /{id}/purchases — 购买套餐
 async fn purchase_package(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(tenant_id): Path<i64>,
     Json(req): Json<PurchasePackageRequest>,
 ) -> Result<Json<ApiResponse<TenantPurchase>>, AppError> {
+    let context = astral_db::ProtectedMutationContext::from_policy_context(
+        &policy,
+        admission,
+        headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        "platform_tenant",
+        "create",
+        Some(tenant_id),
+    )?;
     let outcome = state
         .tenant_service
-        .purchase_package(tenant_id, req.plan_id, req.billing_cycle.as_deref())
+        .purchase_package_with_context(
+            tenant_id,
+            req.plan_id,
+            req.billing_cycle.as_deref(),
+            &context,
+        )
         .await?;
     let row = state
         .tenant_repository
@@ -845,10 +922,11 @@ async fn add_tenant_domain(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(tenant_id): Path<i64>,
     Json(req): Json<AddDomainRequest>,
 ) -> Result<Json<ApiResponse<TenantDomainMap>>, AppError> {
-    let context = tenant_mutation_context(&headers, &policy_context)?;
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let mapping_type = req.mapping_type.unwrap_or_else(|| "OWNED".into());
     let valid_types = ["OWNED", "SHARED", "ISOLATED"];
     if !valid_types.contains(&mapping_type.as_str()) {
@@ -875,9 +953,10 @@ async fn remove_tenant_domain(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path((tenant_id, domain_id)): Path<(i64, i64)>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    let context = tenant_mutation_context(&headers, &policy_context)?;
+    let context = tenant_mutation_context(&headers, &policy_context)?.with_admission(admission);
     let removed = state
         .tenant_repository
         .remove_tenant_domain_with_context(tenant_id, domain_id, &context)
@@ -941,4 +1020,88 @@ pub fn register_trustgraph_data_scope_rules() {
     }
 
     tracing::info!("registered {} trustgraph data scope rules", count);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn platform_policy_context(
+        user_id: i64,
+        card_id: i64,
+        tenant_id: i64,
+        domain_id: i64,
+    ) -> PolicyContext {
+        PolicyContext::builder()
+            .user_id(Some(user_id))
+            .principal_kind(Some("PLATFORM_USER".into()))
+            .card_id(Some(card_id))
+            .tenant_id(Some(tenant_id))
+            .domain_id(Some(domain_id))
+            .action("manage".into())
+            .build()
+    }
+
+    fn verified_headers(
+        user_id: i64,
+        card_id: i64,
+        tenant_id: i64,
+        domain_id: i64,
+        request_id: &str,
+    ) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-user-id", user_id.to_string()),
+            ("x-user-card-id", card_id.to_string()),
+            ("x-user-card-tenant-id", tenant_id.to_string()),
+            ("x-user-card-domain-id", domain_id.to_string()),
+            ("x-request-id", request_id.to_string()),
+        ] {
+            headers.insert(
+                name,
+                HeaderValue::from_str(&value).expect("valid header value"),
+            );
+        }
+        headers
+    }
+
+    /// 成员/邀请 mutation 与租户 CRUD 共用同一装配合同：Gateway 头必须与
+    /// 验证过的 PolicyContext 完全一致，缺头/不一致/非平台身份一律拒绝。
+    #[test]
+    fn tenant_mutation_context_requires_header_policy_agreement() {
+        let policy = platform_policy_context(10, 20, 30, 40);
+        let agreed = tenant_mutation_context(&verified_headers(10, 20, 30, 40, "req-7"), &policy);
+        assert!(agreed.is_ok(), "agreed headers must build the context");
+
+        for tampered in [
+            verified_headers(11, 20, 30, 40, "req-7"),
+            verified_headers(10, 21, 30, 40, "req-7"),
+            verified_headers(10, 20, 31, 40, "req-7"),
+            verified_headers(10, 20, 30, 41, "req-7"),
+        ] {
+            assert!(
+                tenant_mutation_context(&tampered, &policy).is_err(),
+                "any header disagreeing with the verified PolicyContext must be rejected"
+            );
+        }
+        assert!(
+            tenant_mutation_context(&HeaderMap::new(), &policy).is_err(),
+            "missing Gateway headers must be rejected"
+        );
+
+        let non_platform = PolicyContext::builder()
+            .user_id(Some(10))
+            .principal_kind(Some("END_USER".into()))
+            .card_id(Some(20))
+            .tenant_id(Some(30))
+            .domain_id(Some(40))
+            .action("manage".into())
+            .build();
+        assert!(
+            tenant_mutation_context(&verified_headers(10, 20, 30, 40, "req-7"), &non_platform)
+                .is_err(),
+            "non-platform principal must be rejected"
+        );
+    }
 }

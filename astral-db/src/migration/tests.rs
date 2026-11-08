@@ -1,6 +1,7 @@
 use super::*;
 
 mod archive_indexes;
+mod constraints;
 
 const SWITCH_OPERATION_RECOVERY_CONTRACT_VERSION: i64 = 20261029000001;
 const SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION: i64 = 20261029000002;
@@ -1736,6 +1737,218 @@ fn switch_operation_recovery_migrations_have_exact_preflight_artifact_contracts(
 }
 
 #[test]
+fn authorization_authority_proof_migration_and_contract_are_exact() {
+    let migration = MIGRATOR
+        .migrations
+        .iter()
+        .find(|migration| migration.version == AUTHORIZATION_AUTHORITY_PROOF_VERSION)
+        .expect("authorization authority proof migration must remain embedded");
+    let contract = EXACT_MIGRATION_ARTIFACT_CONTRACTS
+        .iter()
+        .find(|contract| contract.version == AUTHORIZATION_AUTHORITY_PROOF_VERSION)
+        .expect("authorization authority proof artifact contract must remain registered");
+
+    assert!(!contract.supports_existing_artifacts);
+    assert_eq!(
+        canonical_sha384_hex(AUTHORIZATION_AUTHORITY_PROOF_MIGRATION_SQL.as_bytes()),
+        AUTHORIZATION_AUTHORITY_PROOF_SQL_SHA384
+    );
+    assert_eq!(
+        canonical_sha384_hex(migration.sql.as_bytes()),
+        AUTHORIZATION_AUTHORITY_PROOF_SQL_SHA384
+    );
+    assert_eq!(
+        contract.tables,
+        &[
+            "authorization_authority_frontier",
+            "authorization_authority_proof",
+            "authorization_authority_issuance_lease",
+        ]
+    );
+    assert_eq!(contract.columns, AUTHORIZATION_AUTHORITY_PROOF_COLUMNS);
+    assert_eq!(contract.indexes, AUTHORIZATION_AUTHORITY_PROOF_INDEXES);
+    assert_eq!(
+        AUTHORIZATION_AUTHORITY_PROOF_COLUMN_CONTRACTS.len(),
+        AUTHORIZATION_AUTHORITY_PROOF_COLUMNS.len()
+    );
+    assert_eq!(AUTHORIZATION_AUTHORITY_PROOF_INDEXES.len(), 14);
+    assert!(migration_matches_known_source(migration));
+    assert!(exact_migration_artifact_contract(migration).is_some());
+    assert!(!is_java_baseline_era(AUTHORIZATION_AUTHORITY_PROOF_VERSION));
+
+    for table in contract.tables {
+        assert!(migration_defines_table(migration, table));
+        assert!(!migration_defines_existing_column(
+            migration, table, "missing"
+        ));
+    }
+    for (table, column) in contract.columns {
+        assert!(
+            migration_defines_column(migration, table, column),
+            "authority migration must own declared column {table}.{column}"
+        );
+        assert!(
+            pending_migration_defines_column(migration, table, column),
+            "authority migration must satisfy pending preflight for {table}.{column}"
+        );
+    }
+    for (table, index, columns, unique) in contract.indexes {
+        assert!(
+            migration_defines_index(migration, table, index, columns, *unique),
+            "authority migration must own declared index {table}.{index}"
+        );
+        assert!(
+            pending_migration_defines_index(migration, table, index, columns, *unique),
+            "authority migration must satisfy pending preflight for {table}.{index}"
+        );
+    }
+
+    let statements = sql_statements(AUTHORIZATION_AUTHORITY_PROOF_MIGRATION_SQL)
+        .expect("authority migration must lex cleanly");
+    assert_eq!(
+        statements
+            .iter()
+            .filter(|statement| normalized_sql_fragment(statement).starts_with("CREATE TABLE "))
+            .count(),
+        contract.tables.len()
+    );
+    assert!(!AUTHORIZATION_AUTHORITY_PROOF_MIGRATION_SQL.contains("ALTER TABLE"));
+    assert!(!AUTHORIZATION_AUTHORITY_PROOF_MIGRATION_SQL.contains("DROP TABLE"));
+    assert!(!AUTHORIZATION_AUTHORITY_PROOF_MIGRATION_SQL.contains("DROP COLUMN"));
+}
+
+#[test]
+fn authorization_authority_additive_migrations_are_pinned_and_additive() {
+    let expected = [
+        (
+            AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_VERSION,
+            AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_SQL_SHA384,
+            AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_MIGRATION_SQL,
+            AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_COLUMNS,
+        ),
+        (
+            AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_VERSION,
+            AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_SQL_SHA384,
+            AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_MIGRATION_SQL,
+            AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_COLUMNS,
+        ),
+    ];
+
+    for (version, sha384, source, columns) in expected {
+        let migration = MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == version)
+            .unwrap_or_else(|| panic!("migration {version} must remain embedded"));
+        let contract = EXACT_MIGRATION_ARTIFACT_CONTRACTS
+            .iter()
+            .find(|contract| contract.version == version)
+            .unwrap_or_else(|| panic!("migration {version} needs exact artifact contract"));
+
+        assert!(contract.supports_existing_artifacts);
+        assert!(contract.tables.is_empty());
+        assert!(contract.indexes.is_empty());
+        assert_eq!(contract.columns, columns);
+        assert_eq!(canonical_sha384_hex(source.as_bytes()), sha384);
+        assert_eq!(canonical_sha384_hex(migration.sql.as_bytes()), sha384);
+        assert!(migration_matches_known_source(migration));
+        assert!(exact_migration_artifact_contract(migration).is_some());
+        assert!(!is_java_baseline_era(version));
+
+        for (table, column) in columns {
+            assert!(migration_defines_column(migration, table, column));
+            assert!(pending_migration_defines_column(migration, table, column));
+        }
+        let sql = source.to_ascii_uppercase();
+        assert!(!sql.contains("DROP TABLE"));
+        assert!(!sql.contains("DROP COLUMN"));
+        assert!(!sql.contains("DELETE FROM"));
+    }
+
+    assert!(!AUTHORIZATION_AUTHORITY_PROOF_COLUMNS
+        .contains(&("authorization_authority_frontier", "snapshot_hash")));
+    assert!(!AUTHORIZATION_AUTHORITY_PROOF_COLUMNS.contains(&(
+        "authorization_authority_issuance_lease",
+        "publication_completion_hash"
+    )));
+}
+
+#[test]
+fn authority_message_metadata_migration_is_pinned_and_additive() {
+    let migration = MIGRATOR
+        .migrations
+        .iter()
+        .find(|migration| migration.version == AUTHORITY_MESSAGE_METADATA_VERSION)
+        .expect("authority message metadata migration must remain embedded");
+    let contract = EXACT_MIGRATION_ARTIFACT_CONTRACTS
+        .iter()
+        .find(|contract| contract.version == AUTHORITY_MESSAGE_METADATA_VERSION)
+        .expect("authority message metadata artifact contract must remain registered");
+
+    assert!(contract.supports_existing_artifacts);
+    assert!(contract.tables.is_empty());
+    assert!(contract.indexes.is_empty());
+    assert_eq!(contract.columns, AUTHORITY_MESSAGE_METADATA_COLUMNS);
+    assert_eq!(
+        AUTHORITY_MESSAGE_METADATA_COLUMN_CONTRACTS.len(),
+        AUTHORITY_MESSAGE_METADATA_COLUMNS.len()
+    );
+    assert_eq!(
+        canonical_sha384_hex(AUTHORITY_MESSAGE_METADATA_MIGRATION_SQL.as_bytes()),
+        AUTHORITY_MESSAGE_METADATA_SQL_SHA384
+    );
+    assert_eq!(
+        canonical_sha384_hex(migration.sql.as_bytes()),
+        AUTHORITY_MESSAGE_METADATA_SQL_SHA384
+    );
+    assert!(migration_matches_known_source(migration));
+    assert!(exact_migration_artifact_contract(migration).is_some());
+    assert!(!is_java_baseline_era(AUTHORITY_MESSAGE_METADATA_VERSION));
+
+    for (table, column) in contract.columns {
+        assert!(migration_defines_column(migration, table, column));
+        assert!(pending_migration_defines_column(migration, table, column));
+    }
+    let statements = sql_statements(AUTHORITY_MESSAGE_METADATA_MIGRATION_SQL)
+        .expect("authority message metadata migration must lex cleanly");
+    assert_eq!(
+        statements
+            .iter()
+            .filter(|statement| normalized_sql_fragment(statement).starts_with("SET "))
+            .count(),
+        5
+    );
+    let sql = AUTHORITY_MESSAGE_METADATA_MIGRATION_SQL.to_ascii_uppercase();
+    assert!(!sql.contains("DROP TABLE"));
+    assert!(!sql.contains("DROP COLUMN"));
+    assert!(!sql.contains("DELETE FROM"));
+    assert!(sql.contains("ADD COLUMN AUTHORITY_METADATA_JSON MEDIUMTEXT NULL"));
+}
+
+#[test]
+fn authority_message_metadata_columns_are_nullable_and_textual() {
+    assert_eq!(
+        AUTHORITY_MESSAGE_METADATA_COLUMN_CONTRACTS,
+        &[
+            incremental_text_column(
+                "al_message_outbox",
+                "authority_metadata_json",
+                "MEDIUMTEXT",
+                false,
+                None,
+            ),
+            incremental_text_column(
+                "authorization_invalidation_inbox",
+                "authority_metadata_json",
+                "MEDIUMTEXT",
+                false,
+                None,
+            ),
+        ]
+    );
+}
+
+#[test]
 fn five_chain_migrations_are_pinned_and_own_only_declared_artifacts() {
     let expected: [(i64, &str, &str); 5] = [
         (
@@ -2291,15 +2504,33 @@ fn record_verified_baseline_is_default_deny_for_post_baseline_migrations() {
         AL_MESSAGE_OUTBOX_MIGRATION_SQL.contains("CREATE TABLE IF NOT EXISTS al_message_outbox")
     );
     assert!(AL_MESSAGE_OUTBOX_MIGRATION_SQL.contains("uk_al_message_queue_message"));
-    assert_eq!(
-        MIGRATOR
+    // 20261105000003 remains part of the authority chain; the new metadata
+    // migration is the current tail.
+    for version in [
+        AUTHORIZATION_AUTHORITY_PROOF_VERSION,
+        AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_VERSION,
+        AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_VERSION,
+    ] {
+        assert!(MIGRATOR
             .migrations
             .iter()
-            .map(|migration| migration.version)
-            .max(),
-        Some(SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION),
-        "the switch-operation recovery deadline migration is the current chain tail"
-    );
+            .any(|migration| migration.version == version));
+        assert!(!is_java_baseline_era(version));
+    }
+
+    // Later additive production migrations must preserve the provenance migration.
+    assert!(MIGRATOR
+        .migrations
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .is_some_and(|tail| tail >= authority_v7::VERSION));
+    assert!(MIGRATOR
+        .migrations
+        .iter()
+        .any(|migration| migration.version == AUTHORITY_MESSAGE_METADATA_VERSION));
+    assert!(!is_java_baseline_era(AUTHORITY_MESSAGE_METADATA_VERSION));
+
     assert!(MIGRATOR
         .migrations
         .iter()
@@ -2309,8 +2540,12 @@ fn record_verified_baseline_is_default_deny_for_post_baseline_migrations() {
         .iter()
         .any(|migration| migration.version == SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION));
     assert!(!is_java_baseline_era(
+        SWITCH_OPERATION_RECOVERY_CONTRACT_VERSION
+    ));
+    assert!(!is_java_baseline_era(
         SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION
     ));
+
     assert!(MIGRATOR
         .migrations
         .iter()
@@ -4915,6 +5150,98 @@ fn runtime_repair_is_conditional_and_covers_all_required_columns_and_indexes() {
     assert!(!RUNTIME_REPAIR_MIGRATION_SQL.contains("UPDATE audit_log"));
 }
 
+#[test]
+fn operation_width_migration_is_exact_and_owns_only_existing_columns() {
+    let migration = MIGRATOR
+        .migrations
+        .iter()
+        .find(|migration| migration.version == authority_operation_width::VERSION)
+        .expect("operation width migration must remain embedded");
+    assert!(migration_requires_exact_artifact_parse(
+        authority_operation_width::VERSION
+    ));
+    assert_eq!(
+        canonical_sha384_hex(migration.sql.as_bytes()),
+        authority_operation_width::SOURCE_SHA384
+    );
+    let contract = exact_migration_artifact_contract(migration)
+        .expect("operation width migration must have an exact artifact contract");
+    assert!(contract.supports_existing_artifacts);
+    assert!(contract.tables.is_empty());
+    assert_eq!(contract.columns, authority_operation_width::COLUMNS);
+    assert!(contract.indexes.is_empty());
+    for (table, column) in authority_operation_width::COLUMNS {
+        assert!(migration_defines_existing_column(migration, table, column));
+        assert!(!migration_defines_table(migration, table));
+    }
+    assert!(migration.sql.contains("MODIFY COLUMN"));
+    assert!(migration.sql.contains("SELECT * FROM"));
+    assert!(!migration.sql.contains("CREATE TABLE"));
+    assert!(!migration.sql.contains("DROP INDEX"));
+    assert!(!migration.sql.contains("DROP COLUMN"));
+}
+
+#[test]
+fn operation_width_parser_rejects_unowned_modify_and_corrupted_source() {
+    let migration = MIGRATOR
+        .migrations
+        .iter()
+        .find(|migration| migration.version == authority_operation_width::VERSION)
+        .expect("operation width migration must remain embedded");
+    assert!(!migration_defines_existing_column(
+        migration,
+        "verification_challenge",
+        "not_operation_id"
+    ));
+    assert!(!migration_defines_existing_column(
+        migration,
+        "not_a_v7_table",
+        "operation_id"
+    ));
+    let mut changed = migration.clone();
+    changed.sql = format!("{}\nSELECT 1;", changed.sql).into();
+    assert!(!migration_matches_known_source(&changed));
+    assert!(exact_migration_artifact_contract(&changed).is_none());
+}
+
+#[test]
+fn operation_width_runtime_contract_keeps_creator_contracts_at_64() {
+    assert!(authority_operation_width::BASELINE_COLUMN_CONTRACTS
+        .iter()
+        .all(|contract| contract.column_type == "VARCHAR(64)"));
+    assert!(authority_operation_width::RUNTIME_COLUMN_CONTRACTS
+        .iter()
+        .all(|contract| contract.column_type == "VARCHAR(128)"));
+    assert_eq!(
+        authority_operation_width::BASELINE_COLUMN_CONTRACTS[5].table,
+        "async_operation_item"
+    );
+    assert_eq!(
+        authority_operation_width::RUNTIME_COLUMN_CONTRACTS[5].charset,
+        Some("utf8mb4")
+    );
+    assert_eq!(
+        authority_operation_width::RUNTIME_COLUMN_CONTRACTS[5].collation,
+        Some("utf8mb4_unicode_ci")
+    );
+}
+
+#[test]
+fn operation_width_runtime_and_preflight_wiring_are_fail_closed() {
+    let source = include_str!("../migration.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("production source must precede tests");
+    assert!(production.contains(
+        "authority_operation_width::preflight(pool, applied_versions, migrations).await?"
+    ));
+    assert!(production.contains("authority_operation_width::validate_runtime_columns"));
+    assert!(production.contains("MigrationArtifactKind::ModifyColumn"));
+    assert!(production.contains("operation_width_complete"));
+    assert!(production.contains("async_operation_item"));
+    assert!(production.contains("operation_id"));
+}
 #[test]
 fn repair_migration_is_rust_only_and_previous_sql_is_not_mutated() {
     assert!(!is_java_baseline_era(20260818000002));

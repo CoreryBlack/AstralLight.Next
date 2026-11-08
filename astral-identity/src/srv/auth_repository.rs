@@ -8,10 +8,19 @@ use async_trait::async_trait;
 use sqlx::{MySql, MySqlPool, QueryBuilder};
 use time::PrimitiveDateTime;
 
-use astral_types::AstralError;
+use astral_types::{AstralError, AuthorizationAdmission};
 
 use crate::auth::{LoginAggregateRow, PasswordCredential};
 use crate::srv::source_writer_guard;
+
+/// 注册验证 proof 的 same-transaction 消费载荷（`/verification/verify` 签发
+/// 的 durable one-shot 凭据）。明文 token 只经内存传递、绝不入日志；HMAC
+/// 摘要在消费点以受保护环境密钥计算后交仓储层 CAS。
+#[derive(Debug, Clone, Copy)]
+pub struct RegisterVerification<'a> {
+    pub target: &'a str,
+    pub proof_token: &'a str,
+}
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PlatformUserRecord {
@@ -130,6 +139,48 @@ pub trait AuthRepository: Send + Sync {
         phone: Option<&str>,
     ) -> Result<(i64, i64), AstralError>;
 
+    /// 注册 + 可选验证 proof 的 same-transaction one-shot CAS 消费（proof
+    /// 绑定 (register, target)，消费失败 → 注册事务回滚）。默认实现
+    /// fail-closed：不支持 proof 消费的仓储实现（如测试 mock）必须拒绝，
+    /// 绝不静默忽略 proof 降级为无验证注册。
+    async fn insert_register_user_verified(
+        &self,
+        _username: &str,
+        _password_hash: &str,
+        _real_name: Option<&str>,
+        _email: Option<&str>,
+        _phone: Option<&str>,
+        _verification: Option<RegisterVerification<'_>>,
+    ) -> Result<(i64, i64), AstralError> {
+        Err(AstralError::Database(
+            "register with verification proof is not supported by this repository".into(),
+        ))
+    }
+
+    /// 注册 source 事务单写点（含 identity 三表 + 可选 proof 消费）。默认
+    /// fail-closed（见 `insert_register_user_verified`）；真实仓储覆盖。
+    async fn insert_register_user_tx(
+        &self,
+        username: &str,
+        password_hash: &str,
+        real_name: Option<&str>,
+        email: Option<&str>,
+        phone: Option<&str>,
+        verification: Option<RegisterVerification<'_>>,
+    ) -> Result<(i64, i64), AstralError> {
+        let _ = (
+            username,
+            password_hash,
+            real_name,
+            email,
+            phone,
+            verification,
+        );
+        Err(AstralError::Database(
+            "register source transaction is not supported by this repository".into(),
+        ))
+    }
+
     async fn load_password_credential(
         &self,
         user_id: i64,
@@ -142,6 +193,7 @@ pub trait AuthRepository: Send + Sync {
         new_hash: &str,
         reason: &str,
         reset_token: Option<i64>,
+        admission: Option<AuthorizationAdmission>,
     ) -> Result<Vec<String>, AstralError>;
 
     async fn update_password_hash_if_current(
@@ -150,8 +202,12 @@ pub trait AuthRepository: Send + Sync {
         expected_hash: &str,
         expected_version: i64,
         new_hash: &str,
+        admission: AuthorizationAdmission,
     ) -> Result<Vec<String>, AstralError>;
 
+    /// `user_local_credential.last_login_at` 的唯一写点：autocommit source 写
+    /// 必须经 source writer 栅栏（hub 未装 no-op）。调用方保持非阻塞语义——
+    /// 失败仅告警，不阻断登录主链。
     async fn update_last_login_at(&self, user_id: i64) -> Result<(), AstralError>;
 
     async fn check_login_name_exists(&self, login_name: &str) -> Result<bool, AstralError>;
@@ -213,6 +269,7 @@ pub trait AuthRepository: Send + Sync {
         email: Option<&str>,
         phone: Option<&str>,
         avatar_url: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AstralError>;
 
     /// 登录/第三方登录时创建 auth_device_session，返回新 session_id。
@@ -246,6 +303,7 @@ impl SqlxAuthRepository {
         Self { db }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn update_password_transaction(
         &self,
         user_id: i64,
@@ -254,6 +312,7 @@ impl SqlxAuthRepository {
         new_hash: &str,
         reason: &str,
         reset_token_id: Option<i64>,
+        admission: Option<AuthorizationAdmission>,
     ) -> Result<Vec<String>, AstralError> {
         let source_guard = source_writer_guard::begin_source_write()?;
         let mut tx =
@@ -268,8 +327,13 @@ impl SqlxAuthRepository {
             new_hash,
             reason,
             reset_token_id,
+            admission.as_ref(),
         )
         .await?;
+
+        if let Some(admission) = admission.as_ref() {
+            source_writer_guard::validate_and_consume_admission(&mut tx, admission).await?;
+        }
 
         source_writer_guard::arm_commit_fence(&source_guard);
         tx.commit()
@@ -285,6 +349,7 @@ impl SqlxAuthRepository {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn update_password_transaction_in_tx(
     tx: &mut sqlx::Transaction<'_, MySql>,
     user_id: i64,
@@ -293,7 +358,23 @@ pub(crate) async fn update_password_transaction_in_tx(
     new_hash: &str,
     reason: &str,
     reset_token_id: Option<i64>,
+    admission: Option<&AuthorizationAdmission>,
 ) -> Result<Vec<String>, AstralError> {
+    if let Some(admission) = admission {
+        let target: Option<(i64,)> = sqlx::query_as(
+            "SELECT user_id FROM platform_user WHERE user_id = ? AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| {
+            AstralError::Database(format!("Lock password target user failed: {error}"))
+        })?;
+        if target.is_none() {
+            return Err(AstralError::NotFound("user not found".into()));
+        }
+        source_writer_guard::validate_admission_caller_card(tx, admission).await?;
+    }
     let credential: Option<(String, i64)> = sqlx::query_as(
         "SELECT password_hash, credential_version FROM user_local_credential \
          WHERE user_id = ? AND status = 'ACTIVE' FOR UPDATE",
@@ -334,9 +415,25 @@ pub(crate) async fn update_password_transaction_in_tx(
     }
     let revoked_jtis: Vec<String> = jti_rows.into_iter().map(|(jti,)| jti).collect();
     if let Some(token_id) = reset_token_id {
+        // Consumption gate (taskId authority-v7-peripheral-20261107): the
+        // token is only consumable inside this same transaction when its
+        // bound delivery intent is durably DELIVERED and BOTH bindings
+        // (message_id + operation_id) are byte-exact equal. The natural-join
+        // ON clause keeps the uq_delivery_intent_message index probe; the
+        // CAST(... AS BINARY) WHERE predicates force binary equality (the
+        // two columns carry different collations: utf8mb4_unicode_ci vs
+        // ascii_bin, so raw `=` would coerce to case/pad-insensitive
+        // matching). NULL bindings never satisfy the predicates and are
+        // refused — no automatic backfill.
         let consumed = sqlx::query(
-            "UPDATE password_reset_token SET used_at = UTC_TIMESTAMP() \
-             WHERE id = ? AND user_id = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()",
+            "UPDATE password_reset_token prt \
+             JOIN al_delivery_intent adi ON adi.message_id = prt.delivery_message_id \
+             SET prt.used_at = UTC_TIMESTAMP() \
+             WHERE prt.id = ? AND prt.user_id = ? AND prt.used_at IS NULL \
+               AND prt.expires_at > UTC_TIMESTAMP() \
+               AND adi.state = 'DELIVERED' \
+               AND CAST(adi.message_id AS BINARY) = CAST(prt.delivery_message_id AS BINARY) \
+               AND CAST(adi.operation_id AS BINARY) = CAST(prt.operation_id AS BINARY)",
         )
         .bind(token_id)
         .bind(user_id)
@@ -501,6 +598,41 @@ impl AuthRepository for SqlxAuthRepository {
         email: Option<&str>,
         phone: Option<&str>,
     ) -> Result<(i64, i64), AstralError> {
+        self.insert_register_user_tx(username, password_hash, real_name, email, phone, None)
+            .await
+    }
+
+    async fn insert_register_user_verified(
+        &self,
+        username: &str,
+        password_hash: &str,
+        real_name: Option<&str>,
+        email: Option<&str>,
+        phone: Option<&str>,
+        verification: Option<RegisterVerification<'_>>,
+    ) -> Result<(i64, i64), AstralError> {
+        self.insert_register_user_tx(
+            username,
+            password_hash,
+            real_name,
+            email,
+            phone,
+            verification,
+        )
+        .await
+    }
+
+    /// 注册 source 事务主体（platform_user / user_local_credential /
+    /// identity_card；可选验证 proof 在同一事务内 one-shot CAS 消费）。
+    async fn insert_register_user_tx(
+        &self,
+        username: &str,
+        password_hash: &str,
+        real_name: Option<&str>,
+        email: Option<&str>,
+        phone: Option<&str>,
+        verification: Option<RegisterVerification<'_>>,
+    ) -> Result<(i64, i64), AstralError> {
         // 注册 source 事务（platform_user / user_local_credential / identity_card）
         // 的 hub writer 栅栏：begin 前取得（hub 已装则必须可得，不可得即拒绝
         // 注册），COMMIT await 前武装取消栅栏，commit 证明成功后 proven 释放；
@@ -579,6 +711,42 @@ impl AuthRepository for SqlxAuthRepository {
                          identity card/credential only"
                     );
                 }
+            }
+        }
+
+        // 注册验证 proof 的 same-transaction one-shot CAS 消费：无效/过期/
+        // 已消费/目标不匹配 → 校验错误 → 整个注册事务回滚（含 identity 写入），
+        // 绝不静默降级为无验证路径。proof 明文不入日志（摘要只在消费点计算）。
+        if let Some(verification) = verification {
+            let Some(key) = crate::srv::verification::durable::hmac_key() else {
+                return Err(AstralError::Database(format!(
+                    "verification HMAC key unavailable (env {})",
+                    crate::srv::verification::durable::HMAC_ENV_KEY
+                )));
+            };
+            let target_hash =
+                crate::srv::verification::durable::target_hash(key, verification.target);
+            let proof_hash = crate::srv::verification::durable::proof_hash(
+                key,
+                crate::srv::verification::durable::PURPOSE_REGISTER,
+                &target_hash,
+                verification.proof_token,
+            );
+            let consumed = astral_db::verification_durable_repository::consume_proof(
+                &mut *tx,
+                &proof_hash,
+                crate::srv::verification::durable::PURPOSE_REGISTER,
+                &target_hash,
+                Some(username),
+            )
+            .await
+            .map_err(|e| {
+                AstralError::Database(format!("Consume verification proof failed: {e}"))
+            })?;
+            if !consumed {
+                return Err(AstralError::Validation(
+                    "verification proof invalid or expired".into(),
+                ));
             }
         }
 
@@ -816,9 +984,18 @@ impl AuthRepository for SqlxAuthRepository {
         new_hash: &str,
         reason: &str,
         reset_token: Option<i64>,
+        admission: Option<AuthorizationAdmission>,
     ) -> Result<Vec<String>, AstralError> {
-        self.update_password_transaction(user_id, None, None, new_hash, reason, reset_token)
-            .await
+        self.update_password_transaction(
+            user_id,
+            None,
+            None,
+            new_hash,
+            reason,
+            reset_token,
+            admission,
+        )
+        .await
     }
 
     async fn update_password_hash_if_current(
@@ -827,6 +1004,7 @@ impl AuthRepository for SqlxAuthRepository {
         expected_hash: &str,
         expected_version: i64,
         new_hash: &str,
+        admission: AuthorizationAdmission,
     ) -> Result<Vec<String>, AstralError> {
         self.update_password_transaction(
             user_id,
@@ -835,16 +1013,26 @@ impl AuthRepository for SqlxAuthRepository {
             new_hash,
             "PASSWORD_CHANGED",
             None,
+            Some(admission),
         )
         .await
     }
 
     async fn update_last_login_at(&self, user_id: i64) -> Result<(), AstralError> {
-        sqlx::query(
-            "UPDATE user_local_credential SET last_login_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+        // user_local_credential.last_login_at 唯一写点：autocommit source 写经
+        // 共享栅栏 helper（arm → await → settle），hub 未装为纯透传。栅栏在
+        // future 内：写 pending 时任务被取消 → sticky uncertain 覆盖未知窗口。
+        // 失败由调用方告警并继续（登录主链非阻塞语义不变）。
+        let source_guard = source_writer_guard::begin_source_write()?;
+        source_writer_guard::fenced_source_write(
+            source_guard,
+            sqlx::query(
+                "UPDATE user_local_credential SET last_login_at = CURRENT_TIMESTAMP \
+                 WHERE user_id = ?",
+            )
+            .bind(user_id)
+            .execute(&self.db),
         )
-        .bind(user_id)
-        .execute(&self.db)
         .await
         .map_err(|e| AstralError::Database(format!("Update last_login_at failed: {e}")))?;
         Ok(())
@@ -1045,7 +1233,26 @@ impl AuthRepository for SqlxAuthRepository {
         email: Option<&str>,
         phone: Option<&str>,
         avatar_url: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AstralError> {
+        let source_guard = source_writer_guard::begin_source_write()?;
+        let mut tx =
+            self.db.begin().await.map_err(|e| {
+                AstralError::Database(format!("Begin profile update tx failed: {e}"))
+            })?;
+        let target: Option<(i64,)> = sqlx::query_as(
+            "SELECT user_id FROM platform_user WHERE user_id = ? AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| {
+            AstralError::Database(format!("Lock profile target user failed: {error}"))
+        })?;
+        if target.is_none() {
+            return Err(AstralError::NotFound("user not found".into()));
+        }
+        source_writer_guard::validate_admission_caller_card(&mut tx, &admission).await?;
         let result = sqlx::query(
             "UPDATE platform_user SET \
              display_name = COALESCE(?, display_name), \
@@ -1060,12 +1267,19 @@ impl AuthRepository for SqlxAuthRepository {
         .bind(phone.map(str::trim))
         .bind(avatar_url.map(str::trim))
         .bind(user_id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AstralError::Database(format!("Update profile failed: {e}")))?;
         if result.rows_affected() != 1 {
             return Err(AstralError::NotFound("user not found".into()));
         }
+        source_writer_guard::validate_and_consume_admission(&mut tx, &admission).await?;
+        source_writer_guard::arm_commit_fence(&source_guard);
+        let commit_result = tx.commit().await;
+        source_writer_guard::settle_commit_fence(&source_guard, commit_result.is_ok());
+        commit_result
+            .map_err(|e| AstralError::Database(format!("Commit profile update tx failed: {e}")))?;
+        drop(source_guard);
         Ok(())
     }
 
@@ -1162,9 +1376,10 @@ mod tests {
     use super::*;
 
     /// 会话/凭证写点 source 栅栏形状回归（源形状，无 IO）：注册事务在 begin 前
-    /// 取得栅栏、COMMIT await 前武装、commit 后 settle；五个单语句写点
-    /// （insert_login_session / update_initial_refresh_token / update_password_hash
-    /// / insert_identity / delete_active_family）均经 fenced_source_write 围栏。
+    /// 取得栅栏、COMMIT await 前武装、commit 后 settle；单语句写点
+    /// （insert_login_session / update_initial_refresh_token / update_last_login_at
+    /// / update_password_hash / insert_identity / delete_active_family）均经
+    /// fenced_source_write 围栏。
     #[test]
     fn register_transaction_and_credential_writers_hold_the_source_writer_fence() {
         let source = include_str!("auth_repository.rs");
@@ -1229,6 +1444,41 @@ mod tests {
                 "{method} must run under the fenced source writer"
             );
         }
+
+        // last_login_at 唯一写点（order/fence）：栅栏在 autocommit 写之前取得，
+        // 写语句整体交给共享 fenced_source_write helper（arm → await → settle
+        // 顺序由 helper 契约与 source_writer_guard 行为测试保证）。
+        let last_login_body = body_between(
+            "async fn update_last_login_at(",
+            "async fn check_login_name_exists(",
+        );
+        assert!(
+            last_login_body
+                .find("source_writer_guard::begin_source_write()?")
+                .expect("last_login_at writer must acquire the hub source writer guard")
+                < last_login_body
+                    .find("source_writer_guard::fenced_source_write(")
+                    .expect("last_login_at autocommit write must use the shared fence helper"),
+            "the last_login_at guard must be acquired before the fenced write"
+        );
+        assert!(
+            last_login_body.contains("UPDATE user_local_credential")
+                && last_login_body.contains("last_login_at = CURRENT_TIMESTAMP")
+                && last_login_body.contains(".bind(user_id)"),
+            "the fenced write must stay the user_local_credential.last_login_at update"
+        );
+        // 单写点不变式：生产区只允许一处 last_login_at 更新 SQL，且必须位于
+        // 上述栅栏方法体内（零旁路写点；计数范围排除测试模块，避免测试自引用
+        // 字面量造成假阳性/假阴性）。
+        let production_source = &source[..source
+            .find("#[cfg(test)]")
+            .expect("tests module must stay at the end of auth_repository.rs")];
+        assert!(
+            production_source.match_indices("SET last_login_at").count() == 1
+                && last_login_body.contains("SET last_login_at"),
+            "user_local_credential.last_login_at must keep exactly one writer, \
+             inside the fenced update_last_login_at"
+        );
 
         let password_body = body_between(
             "async fn update_password_hash_with_revocation(",

@@ -1329,6 +1329,77 @@ ORG_SCOPE proof 与 canonical card/rule-set proof 必须作为同一 V6 bundle �
 
 V6 does not renumber generic MQ `schemaVersion`, JWT signature/version fields, HTTP API v1 routes, Cargo versions, migration IDs, or historical SQL/checksum filenames. Source head/outbox remains for source correlation, revoke/RuleSet initialization and ELIGIBILITY L1 invalidation; this notice does not include database table drops, production data deletion, test-environment cleanup, deployment, or rollback execution. Historical migration SQL/checksum and empirical test reports remain immutable and truthful. External comparative Redis fixtures may remain if isolated from current runtime and authorization gates. COMPAT25 real-Redis ignored tests were compiled/no-run and never executed; no PASS is claimed.
 
+### 15.9 V7 authority 生产协议与采用合同（2026-11-07）
+
+本节是 V7 新的软件合同，替代 §§15.7–15.8 中 CURRENT V6 的 edition 和正向授权前提；V6 的历史变更清单、数据库事实、migration ID/checksum 和运行报告保留。本节不表示实现、迁移、部署或真实依赖验收已经通过，状态以同一份任务证据为准。普通 HTTP `/v1`、JWT 和 generic MQ schemaVersion 不随授权 edition 重编号。
+
+#### 15.9.1 authority ownership 与威胁边界
+
+唯一 logical authority 运行于独立 Rust `astral-authority` 服务；etcd quorum 的 linearizable read 和 transaction compare/CAS 是全局排序点。leader key 必须附加真实 etcd lease，每次签发、reservation、COMMIT、certify、close、rotation 与 bootstrap 的最终 quorum 事务同时核对当前 leadership token/lease ownership；进程内 leader flag 和 frontier CAS 不能单独替代该 fence。lease 失效或 ownership 未知即拒绝新写入，已发起但结果未知的操作先按稳定 ID 对账。生产 quorum 至少三个成员，分布在独立故障域。DB1/DB2、本地内存、RabbitMQ ACK、节点心跳与进程 lease 均不能独立分配 authority term/fence 或清除未决 source operation。签名私钥仅由 authority owner 从受保护部署加载，不传播到业务请求状态、业务数据库、仓库或日志。
+
+该合同防范业务数据库回滚、存储/消息漂移、节点崩溃与网络分区，不声称在 quorum、受信任业务执行者或固定信任根已被攻破时仍安全。quorum 的破坏性恢复须停服核对受保护恢复记录并更换 term；恢复旧 etcd 快照本身不是 anti-rollback proof。没有 quorum 的半区保持 PENDING/DENY，不提供独立发号或强制接管旁路。
+
+#### 15.9.2 三种证据与读取
+
+- 全局 frontier 只绑定 authority/cluster identity、term、global fence、key epoch 和未决 operation，不使用某张卡的 snapshot hash 代表全局内容。
+- scope publication certificate 绑定完整 scope、manifest/segment/dependency 向量、generation、revoke watermark、内容 hash、parent certificate，以及已批准 source intent、operation/event 和 durable completion identity。worker 只能物化已批准变更；不能将当前任意 source/DB 内容重新签成合法权限。Card 的发布身份统一为同一 `(tenant_id, card_id)` 的 `user_id=None/domain=Any`；用户与 domain lens 保留在每次 request proof 中，同卡任意 lens 的 reservation 均阻断该卡，ORG 仍按自身精确 scope 隔离。
+- Card 内容 hash 使用 `ASTRAL_AUTHORIZATION_EVIDENCE_CONTENT_V7` 域和有长度边界的 canonical JSON，包含完整 manifests、record 不可变 provenance 与 grant 全量内容（包括 state/validity），不包含读取时钟、gate 计数、effective-set 成员或派生接受标记。不同 lens 或时间产生的派生有效集不能改变同一发布内容身份；所有证据结构校验仍须执行。
+- request proof 绑定独立 nonce/proof ID、当前全局 frontier 和 scope certificate identity。每次 F0/F1 必须向 authority 获取 fresh proof；取证不推进 publication fence。F0 与 F1 的 nonce/proof ID 不同，而 scope、term、fence、key、generation/revoke、内容及 dependency identity 相同。
+
+正式入口仍为 `PolicyEngine::evaluate()`。TrustGraph、Identity、Monitor 使用同一严格证据合同；provider 缺失、超时、过期、时钟异常、scope/内容分歧或 host fence 漂移关闭 ALLOW。`DurableOnly` 只允许离线诊断，不能作为生产 listener 的正向授权模式。ORG_SCOPE 默认关闭保持不变；显式启用时也须经过相应 publication certificate、F0/F1 和 mutation admission。
+
+#### 15.9.3 source reservation、消费与发布
+
+敏感 mutation 在 DB begin 前以稳定 operation ID、verified admission、actor/resource/action/target 请求摘要向 authority reserve。未能证明受影响 scope 覆盖时使用保守的全局 pending barrier，不能猜测 fanout 并继续服务旧授权。网络调用不进入 source 短事务。事务中保留 actor/target 锁序、source/delta/outbox/audit correlation，并在 commit 前核对本地 durable authority projection、proof 和 reservation；同事务插入唯一 admission-use 记录。本地 AtomicBool 只作附加限制，重建 handle 不能恢复消费预算。
+
+operation identity 按实际协议的最长 128 字节贯穿 source、reservation、outcome、终态与历史关联，不能靠数据库截断或改写 operation 适配旧列。既有 64 字节 creator SQL/checksum 保留，通过单独 additive 扩列迁移及精确 preflight/runtime 合同采用；旧 64 形状仅在对应未应用且 source-pinned 的扩列路径中允许进入 SQLx，已应用仍为旧形状或其他 metadata 漂移拒绝。已有更宽 message/delivery identity 不机械缩短。长度、字符集、collation、null/default 和相关唯一/索引约束分别验证，扩列本身不等于真实迁移验收。
+
+COMMIT proven 后才交付完整 receipt；UNKNOWN 按稳定 operation ID 独立对账，禁止重放 source。authority reservation 不因 lease 到期而解除未知结果：未决 source、旧半区不可核验或 publication 未完成时保持不可服务。批量任务绑定不可变 item-set 和逐 item operation，每项使用独立、当前策略评估的 admission，不能从同一 proof 无界派生预算。
+
+发布顺序为：approved intent → proven source COMMIT → WorkerOwned durable publication → authority 验证证书 → 本地证书/消息关联落盘 → immutable certified root 安装 → exact reconciliation → ACTIVE/SERVING。请求只能有界观察 exact receipt completion，不能 claim/compile/publish。证书、source commit、projection commit、memory install、MQ confirm、inbox APPLIED、consumer ACK 与 HTTP result 分开举证；没有完整证据不扩大权限。
+
+V7 completion digest 同时绑定完整 scope evidence 的 `snapshot_hash`、source outcome 和 manifest/dependency/semantic 向量。按 reservation 对账返回其不可变逐 scope 历史证书集合，即使 scope current 已推进也按原索引恢复；该集合只证明历史签发，不替代 fresh F0/F1。本地保留证书历史与 current pointer 的职责分离，恢复旧证书不得回退 current。GLOBAL 的完整阻断范围持续到所有发布闭合，不得在 COMMIT 后缩窄原 intent。source owner 可在同一 source 事务中从实际 immutable delta、source/outbox 和 invalidation receipts 证明完整有限集合，并将其纳入 staged evidence；authority 在同一 quorum CAS 中保存该声明及完整 source/request/outcome/staged binding。只有 `exact_scope_coverage_enabled` 已启用、该 source 显式登记 `commit_finite_coverage` 能力、且获准数据库身份一致时，才可在全部声明 scope 均有 exact immutable certificate 后自动进入 CERTIFIED；该能力在 COMMIT 与最终关闭时均须核验。coverage 未知、未获准、部分完成或绑定分歧仍为 GLOBAL PENDING/PUBLISHED，按 operator close 合同处理，不猜 fanout、截断集合或以 lease 到期解除 barrier。签发响应附带的 proof 绑定签发 CAS 后的全局 frontier，证书仍绑定 immutable prepare frontier。
+
+本地 source outcome 的 `COMMITTED` 对 `ProtectedBusiness` 是终态，表示 source 提交及 authority commit 已精确确认；该 kind 不产生授权 publication barrier，不进入授权 publication worker，也不以伪造证书转换成 `CERTIFIED`。`AuthorizationSource` 的相同本地状态表示提交已确认，仍须按其实际变更完成 scope certification 或下述独立完成协议，不能以 HTTP 成功关闭 reservation。
+
+`ELIGIBILITY_COMPLETION` 与 `CONFIG_COMPLETION` 是两条明确登记、互斥于 grant publication 的完成路径。两者仅接受 `AuthorizationSource` 的 exact `COMMITTED` reservation、完整存储 commit binding、由该 binding 固定摘要的 retained staged envelope，以及注册 source/database 的显式 completion capability。envelope 的 coverage 必须为 `None`；receipt、reservation 的 `COMPLETED`、frontier 与 read-gate epoch 在同一 leadership-fenced quorum CAS 落盘，不写 grant certificate、scope current、manifest 或 certified scope。不能以未改变的 grant snapshot、伪造 delta、任意 JSON 或 `ProtectedBusiness` 改分类替代该证明。
+
+资格完成须保留实际 source targets、receipts、audit/fanout，绑定完整有限 canonical Card 集合的 exact ELIGIBILITY generation/revoke、outbox event 和 message identity；`CARD` 发布与 `ELIGIBILITY` 失效仍分别证明。配置完成只接受 closed table/operation/lookup 合同中的真实 before/after canonical row images及其摘要、同事务实际 audit correlation，并以 `DURABLE_CONFIG_V7` 约束严格 durable 消费。capture 必须拥有 source transaction 的可变借用；自动主键由封闭 INSERT 的实际结果及同事务读回证明，不能猜测主键、用非唯一名称代替身份或让 writer 自报 receipt。typed ABSENT 标记绑定 table 与 lookup，不使用空字符串。该路径拒绝非空 delta/projection/invalidation；影响有效 grant 或资格的变更仍走对应发布/资格路径。完成 worker 在有界短读事务核对当前行或准确 ABSENT、审计与原 operation，结束事务后才调用 authority。SoD 等限制性策略的生产读取必须获取当前有界 durable 事实，不能在旧缓存可能遗漏新限制时解除 barrier。
+
+不同模板的 self-service `CardRebind` 若实际完整 RuleSet 集合没有 enabled ALLOW 贡献，且当前锁定的完整 grant revision history 不含相关 live BASE/RuleSet grant，可以进入专用资格完成路径；存在贡献时保留真实 delta 发布路径。相同模板必须显式 rollback，不能消费 admission 或制造更新事件。专用 capture 持有 transaction 借用，保留完整卡 before/after（仅 template 改变）、新模板完整 typed 镜像及 ACTIVE/tenant/domain/card-type 校验、旧/新 BASE refs（含实际生成 ID 与 created_at）、完整 RuleSet root/entries/bindings union；各侧 refs 与 aggregate bindings 逐字段相等，非目标 binding、root 和 entries 不得改变。按 user_card → 升序 RuleSet owner → refs/entries → ledger 的方向取锁，owner discovery 仅作预读，锁内重新核完整 selector；不以旧 RR snapshot 证明无 grant。CARD_UPDATE parent 独立绑定 actor/operation/card/tenant/generation/fence，ELIGIBILITY 另有 exact head/outbox/message；实际用户卡审计记录 parent 与完整 ref 差分，receipt 精确核 entity/key/INSERT/DELETE/UPDATE/rows/id，不伪造空 grant delta 或证书。worker 在有界短读事务独立核实际 after、完整集合、CARD/audit、无 delta 与 ELIGIBILITY delivery，临时 SQL 错误保持 PENDING，schema/证据冲突进入隔离；结束读事务后才调用 authority。该专用协议只证明获准 rebind 的独立完成，不替代新请求的 fresh F0/F1 或新内容发布。
+
+资格零集合只允许实际 USER_STATUS、USER_DELETE、TENANT_STATUS 或 TENANT_DELETE 的类型化证明，裸空数组拒绝。source 在变更前锁定完整 ACTIVE-card selector 集合，最多 256 卡；读取 257 条即整体拒绝，不截断。User selector 为 `user_id = ? AND card_status = 'ACTIVE'`，Tenant selector 为 `tenant_id = ? AND card_status = 'ACTIVE'`，均按 card_id 排序并锁定，严格核实际 tenant ownership。空集合 receipt 的 schemaVersion=1，closed selector kind 为 `ACTIVE_CARDS_BY_USER_V1` / `ACTIVE_CARDS_BY_TENANT_V1`，version=1、completeness=`EXACT_FULL_FANOUT`；subject kind 必须匹配 selector，User tenantId 为 NULL，Tenant tenantId 必须等于正值 subjectId，selectedCount 必须为 0。selectionDigest 为 SHA-256，输入为 `ASTRAL_ELIGIBILITY_EMPTY_SELECTION_V1\0`，随后按顺序用 u32 big-endian UTF-8 字节长度加实际 UTF-8 编码 subjectKind、subjectId 十进制、tenantId 十进制或 `-`、schemaVersion 十进制、selector kind、selector version 十进制、completeness、selectedCount 十进制、sourceBeforeImageDigest、sourceAfterImageDigest；输出小写 hex64。source 的 opaque capture 绑定实际 before/after canonical 镜像，worker 在短读事务核对原 receipt 和相同版本 selector 的零结果，不得由 mutation 后过滤、删除后 ABSENT 或缺少 outbox 猜测原完整集合为空。
+
+配置的 canonical 镜像必须覆盖本次实际变更的完整 aggregate，包括按稳定主键排序的子映射、binding 和 provenance；不能只留父行而遗漏同事务级联或批量修改。非唯一或可空自然键的 INSERT 由封闭 capturer 执行绑定参数 SQL，从实际 `last_insert_id` 形成最终 lookup，并将同一 lookup 固定到 typed ABSENT 与实际读回镜像；不得用最大 ID、预测 ID 或 writer 自报结果替代。连续修改同一行时，仅在前一 after 等于后一 before 的情况下合并为初始 before/最终 after，并按 `(table,key)` 唯一排序。
+
+租户镜像中的 `license_key`、`contact_person`、`contact_phone`、`contact_email` 不进入 retained evidence 原文。NULL 保持 NULL；非 NULL 值的 commitment 为 SHA-256，输入依次为 `ASTRAL_CONFIG_SENSITIVE_FIELD_V7\0`、正值 tenant ID 的 i64 big-endian、字段 UTF-8 字节长度 u32 big-endian 与原字段名、实际值 UTF-8 字节长度 u64 big-endian 与实际值。字段名为上述闭集，输出小写 64 位 hex；capture 与短事务当前读回使用同一共享 helper。该摘要只绑定实际字段事实，不是授权 capability 或秘密保护方案；受信任 source 仍须保护原始值与读取权限。
+
+真正 no-op、验证失败或已证明 rollback 的 reservation 通过显式 abort 收口：source admission consume/stage 与 abort 锁同一 `authorization_source_reservation` 行，abort 在锁内证明仍为 `RESERVED` 且无 admission-use/outcome，提交不可复活的 `ABORTED` tombstone 后才请求 quorum 的 `Reserved → Aborted`。source 先提交则 abort 拒绝；abort 先提交则后续消费/stage 拒绝。HTTP 状态、lease 过期、未找到 outcome 或 remote NotFound 均不是 rollback/abort proof。UNKNOWN source COMMIT 必须先按稳定身份对账，不能 abort 或重放；后台恢复只扫描已 durable 的 ABORTED tombstone，不按“过期且无 outcome”自动清理。abort receipt 固定稳定 abort ID、完整 binding、reason 和 tombstone digest，exact retry 读回原结果。
+
+完成、abort 与 operator close 的历史 receipt 重放须重新验证原 binding、retained evidence/coverage 及对应终态历史，返回原 post-transition frontier且不再次推进。历史 frontier 的 authority/root、key/epoch/trust-root digest 必须匹配固定 genesis 与已验证 rotation chain 中的一个真实身份，并受当前 term/fence 上界约束；不能强制等于当前或 genesis signer，也不能仅凭不大于当前 fence 就接受未知 signer。同一当前 fence 的 frontier 必须逐字段一致。此校验不替代缺失的 durable receipt，也不声称重建了未保留的完整 transition log。
+
+本地独立完成通过 additive migration `20261107000012` 保留 exact terminal kind、完整验证后的 typed response 和 SHA-256，在相同 source outcome 的 owner/generation/live-lease CAS 中写入；kind 为 `CONFIG_COMPLETION` 或 `ELIGIBILITY_COMPLETION`。摘要使用 typed response 的 `serde_json::to_vec` 字节；MySQL JSON 读回须重新反序列化为同一类型、执行完整 binding/receipt 校验并按相同编码重算，不对数据库 JSON 文本排版求 hash。旧 `COMPLETED` 行缺完整 response 不自动回填，也不能以 `last_error`、状态字样或单个 receipt ID 当作完整终态证明。该本地证据仍不能取代当前 authority 的 fresh proof 或对账，业务库 rollback 不得恢复 ALLOW。
+
+多笔 source 先后改变同一 aggregate 而投影先于认证推进时，不得把较晚 reservation 的未批准内容签入较早 reservation；缺少精确历史 bundle 或等价的完整批准链时保持 PENDING，不能以 generation 连续或历史 completion 存在代替当前内容批准。
+
+#### 15.9.4 bootstrap、rotation、恢复与采用
+
+genesis 必须是受固定根签署的显式 preflight 产物，不能依赖普通 admission，也不能自动信任空库或当前数据库。首次 scope bootstrap 使用 ROOT registry key 签署的显式有限集合 artifact，绑定 authority/root、当前 term/fence/key/chain、稳定 operation/event/nonce/有效期及每个 canonical scope 的完整 manifest/snapshot；安装验证注册表内的根角色，不接受调用者提供的验证材料。新安装要求无未决 barrier、精确 frontier/gate CAS、空 scope pointer 和 leadership fence；不得以配置开关自动签当前 DB。相同 operation 与 artifact digest 幂等读回；相同 operation 不同内容拒绝。UNKNOWN 按稳定 operation 对账历史 receipt 和逐字节 certificate digest，current 已合法推进不应破坏历史恢复；已安装 artifact 的幂等读回先于新安装 barrier 检查。离线签名输出采用独占新建，不能覆盖既有 signed artifact。
+
+key registry 固定启动 trust root；rotation 由受信任根授权，新 signer 必须为 Signer 角色、使用历史未占用 key ID 且 epoch 严格高于当前 active signer。保留全部历史 key，Root authorizer epoch 不替代 active signer epoch。rotation 的最终 quorum CAS 使用当前 leadership fence 并单调推进 term；旧进程失去 active signer 身份后不得继续新签。旧 key 仅验证允许的历史证据，撤销阻止新签发。
+
+冷恢复遵守 COLD → WARMING → FENCE_SYNCING → SERVING。DB/snapshot 仅为 cold hint；attestation owner 有界扫描并向 authority 对牌，核对 certificate/dependency chain 和未决 operation。非空 root、liveness 或 transport heartbeat 不代表全 scope 认证。gap、同代内容/key/parent 分歧、rollback 和 UNKNOWN sticky 隔离，只能通过独立 durable reconciliation 恢复。
+
+业务 listener 启动只校验已采用的超管 template/RuleSet 完整 source aggregate，包括实际映射、owner、租户边界、完整条目与 binding 及已登记资源/动作覆盖，不执行模板补写、规则同步或无 admission 的 RuleSet materialization。缺失或漂移阻止 readiness，并要求先通过明确批准的初始化或 source mutation 修复；不得自动改名、自动采用当前 DB 或静默跳过。该校验只证明 source 采用前置，不能作为授权 ALLOW、scope bootstrap 或 publication 完成证据。显式初始化仍须具备该阶段适用的受信任 bootstrap/source capability、实际 before/after、同事务审计和 durable commit 证明。
+
+首次业务 source 初始化使用独立 ROOT 签名产物，不能复用 scope certificate artifact 代替 source 批准。签名必须绑定完整 template/RuleSet source bundle、实际资源/动作覆盖、authority/root/trust-root 身份、目标 service/database、稳定 operation/event/nonce 和有效期；template code 来自签名 payload，不由启动逻辑猜测固定自然键。authority 生成可认证的 bootstrap origin，使用同一 quorum reservation/一次消费协议；普通请求 admission 不能伪造该 origin。单个 composite source 短事务核对目标 ABSENT、执行实际 INSERT 并从真实生成 ID 读回完整 aggregate、同事务 audit/source receipts/outcome；不得顺序调用各自开事务的三个 writer、以 System capability 绕过或制造空 grant delta。COMMIT proven 后才通知 authority；UNKNOWN 只按 operation/产物摘要独立对账，不能重发或自动 abort。operator 是独立显式入口，不在 listener startup 或普通业务 HTTP 中自动初始化；source 完成仍不等于 scope publication/certificate 或正向授权 readiness。该合同的登记不表示 operator/bridge 已实现或验收。
+
+**BREAKING CHANGE `authority-v7-20261107`**：自采用完整 V7 bundle 时生效。切换面包括授权 edition 派生的 compiler/manifest/segment/archive/completion/snapshot/invalidation、authority request proof/certificate、所有 repository/host/writer、ORG proof 和 SDK consumer。Card canonical 内容 hash 域改变使旧 snapshot/completion/certificate 派生身份失效，须重新批准并发布，不能混用旧域与新 proof。quorum source-coverage 记录从单独 optional coverage 改为绑定完整 commit identity 与能力许可的内部记录；旧格式读回失败关闭，须在 cutover 前按稳定 operation 显式对账或采用批准的修复，不自动重写。仓内调用方及测试同步迁移，V6 输入明确拒绝，不自动重标、补造证书、重置 generation 或删除撤权事实。新增 schema 只用 additive migration，历史 SQL/hash 不改。部署前 stop/drain 旧 writer/worker，按原 operation/message ID reconcile UNKNOWN，离线核对并 rebuild 派生证据，通过新 bundle preflight/postcondition 后整体切换；不热混跑。回退须停止新执行、对账所有未决 source/publication，再使用理解当前 durable 状态的修复版本或获批 forward-fix，不能恢复旧快照或绕过 read gate。
+
+密码重置凭证通过 additive migration `20261107000008` 绑定独立随机 operation 与 delivery message。签发行和审计关联同事务提交，凭证消费与密码更新同事务核对 exact delivery binding 及 durable `DELIVERED`；取消、SQL 清理失败、未配置渠道、`ACCEPTED` 或 `IN_DOUBT` 不产生可消费凭证。旧绑定为 NULL 的 token 不自动回填。SMTP 接受只证明 `ACCEPTED`，没有明确接收回执不能激活重置凭证；迁移、真实发送和接收验收分别举证。
+
+验证使用 Rust/Cargo，覆盖 independent F0/F1、跨 DB 竞争、durable one-use、源提交/发布/ACK UNKNOWN、key rotation、rollback/restore、quorum 分区、启动容量与同代冲突。误放行会接受陈旧授权，误拒绝只降低可用性，因此故障默认 PENDING/DENY。真实 MySQL/etcd/RabbitMQ、迁移恢复与四节点 S15 必须单列执行证据；unit、mock、reducer 或 exit 0 不替代这些 postcondition。
+
 ## 16. 安全规范
 
 

@@ -9,6 +9,10 @@
 use astral_trustgraph::repository::audit_log_repository::{
     insert_approval_audit_in_tx, ApprovalAuditContext, ApprovalAuditEntry,
 };
+use astral_types::{
+    AuthorizationAdmission, AuthorizationAuthorityScope, AuthorizationDomainScope,
+    AuthorizationFenceProof,
+};
 use sqlx::MySqlPool;
 use time::OffsetDateTime;
 
@@ -40,7 +44,49 @@ async fn connect() -> Option<MySqlPool> {
     }
 }
 
-// ===== Test 1: permission_rule CRUD =====
+fn protected_delete_admission(
+    env_name: &str,
+    card_id: i64,
+    user_id: i64,
+    domain_id: i64,
+    tenant_id: i64,
+) -> Option<AuthorizationAdmission> {
+    let raw = match std::env::var(env_name) {
+        Ok(raw) if !raw.trim().is_empty() => raw,
+        _ => {
+            eprintln!("[BLOCKED] {env_name} is required for a durable UserCard source mutation");
+            return None;
+        }
+    };
+    let proof: AuthorizationFenceProof = match serde_json::from_str(&raw) {
+        Ok(proof) => proof,
+        Err(error) => {
+            eprintln!("[BLOCKED] supplied authorization admission proof is invalid JSON: {error}");
+            return None;
+        }
+    };
+    let expected_scope = AuthorizationAuthorityScope {
+        tenant_id,
+        card_id,
+        user_id: Some(user_id),
+        domain: AuthorizationDomainScope::Exact(domain_id),
+    };
+    if proof.scope != expected_scope {
+        eprintln!(
+            "[BLOCKED] supplied authorization admission scope does not match the locked test card"
+        );
+        return None;
+    }
+    match AuthorizationAdmission::from_verified_proof(proof) {
+        Ok(admission) => Some(admission),
+        Err(error) => {
+            eprintln!(
+                "[BLOCKED] supplied authorization admission is not structurally valid: {error}"
+            );
+            None
+        }
+    }
+}
 
 #[derive(Debug, sqlx::FromRow)]
 struct RuleRow {
@@ -956,10 +1002,20 @@ async fn test_delete_with_cascade_call_through_empty_card() {
         .ok();
     setup.commit().await.expect("commit fixture");
 
+    let Some(admission) = protected_delete_admission(
+        "ASTRAL_TEST_AUTHORIZATION_ADMISSION_JSON",
+        card_id,
+        91881,
+        91882,
+        91885,
+    ) else {
+        return;
+    };
+
     // 主路径：ACTIVE 空卡（无规则/委托/绑定）首次删除 —— 走完整生产级联：
     // 父 CARD REVOKE 事件（head correlation）+ ELIGIBILITY 事件 + 软禁用。
     let result = repo
-        .delete_with_cascade(card_id)
+        .delete_with_cascade(card_id, admission)
         .await
         .expect("cascade delete must succeed on a decommissioned-schema database");
     assert!(result.exists);
@@ -996,8 +1052,17 @@ async fn test_delete_with_cascade_call_through_empty_card() {
     assert_eq!(eligibility_head_gen, 1);
 
     // 幂等短路：重复删除直接返回既有结果，不追加任何新事件（head 代次不推进）。
+    let Some(replay_admission) = protected_delete_admission(
+        "ASTRAL_TEST_AUTHORIZATION_REPLAY_ADMISSION_JSON",
+        card_id,
+        91881,
+        91882,
+        91885,
+    ) else {
+        return;
+    };
     let again = repo
-        .delete_with_cascade(card_id)
+        .delete_with_cascade(card_id, replay_admission)
         .await
         .expect("repeat cascade delete must short-circuit");
     assert!(again.exists);

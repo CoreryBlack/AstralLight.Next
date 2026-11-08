@@ -34,7 +34,7 @@ use serde::{Deserialize, Deserializer};
 use astral_common::contract::ApiResponse;
 use astral_common::error::AppError;
 use astral_types::org_scope::{OrgGrantRef, OrgSubject};
-use astral_types::{AstralError, PolicyContext};
+use astral_types::{AstralError, AuthorizationAdmission, PolicyContext};
 
 use crate::service::org_authorities::{
     MaskApplyInput, MembershipCreateInput, OrgActorContext, OrgAuthoritiesService,
@@ -50,6 +50,8 @@ fn org_service(state: &AppState) -> OrgAuthoritiesService {
         state.db.clone(),
         state.engine.clone(),
         state.org_scope_enabled,
+        state.authorization_fence_provider.clone(),
+        state.config.authority_runtime_mode.requires_authority(),
         state.org_scope_tenant_allowlist.clone(),
     )
 }
@@ -513,24 +515,37 @@ async fn submit_detach(
 }
 
 /// POST /main/api/v1/org-unit-cards/{tenant_id}/grants/{grant_id}/revoke
+///
+/// proof-bound admission：本端点是有效授权变更（grant 失效），必须携带
+/// permission_check 中间件签发的 F1 admission（缺失即 fail-closed）。
 async fn revoke_org_grant(
     State(state): State<AppState>,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path((tenant_id, grant_id)): Path<(i64, String)>,
     Json(body): Json<RevokeGrantRequestBody>,
 ) -> Result<Json<ApiResponse<astral_db::org_scope_repository::OrgMutationOutcome>>, AppError> {
     let actor = mutation_actor(&policy_context, &body.operation_id)?;
     let outcome = org_service(&state)
-        .revoke_grant(&actor, tenant_id, &grant_id, body.expected_revision)
+        .revoke_grant(
+            &actor,
+            tenant_id,
+            &grant_id,
+            body.expected_revision,
+            admission,
+        )
         .await
         .map_err(AppError::from)?;
     Ok(Json(ApiResponse::success(outcome)))
 }
 
 /// POST /main/api/v1/org-unit-cards/{tenant_id}/masks — 本级精确来源剪裁。
+///
+/// proof-bound admission：有效授权变更（贡献剪裁），合同同 revoke。
 async fn apply_org_mask(
     State(state): State<AppState>,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(tenant_id): Path<i64>,
     Json(body): Json<ApplyMaskRequestBody>,
 ) -> Result<Json<ApiResponse<astral_db::org_scope_repository::OrgMutationOutcome>>, AppError> {
@@ -546,6 +561,7 @@ async fn apply_org_mask(
                 expected_unit_generation: body.expected_unit_generation,
                 reason: body.reason,
             },
+            admission,
         )
         .await
         .map_err(AppError::from)?;
@@ -554,24 +570,37 @@ async fn apply_org_mask(
 
 /// POST /main/api/v1/org-unit-cards/{tenant_id}/masks/{mask_id}/revoke
 /// mask 主键是 DB 生成的规范 UUID 文本（service 层 canonical 校验）。
+///
+/// proof-bound admission：本端点恢复被剪裁贡献（扩大有效授权面），合同同 revoke。
 async fn remove_org_mask(
     State(state): State<AppState>,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path((tenant_id, mask_id)): Path<(i64, String)>,
     Json(body): Json<RemoveMaskRequestBody>,
 ) -> Result<Json<ApiResponse<astral_db::org_scope_repository::OrgMutationOutcome>>, AppError> {
     let actor = mutation_actor(&policy_context, &body.operation_id)?;
     let outcome = org_service(&state)
-        .remove_mask(&actor, tenant_id, &mask_id, body.expected_revision)
+        .remove_mask(
+            &actor,
+            tenant_id,
+            &mask_id,
+            body.expected_revision,
+            admission,
+        )
         .await
         .map_err(AppError::from)?;
     Ok(Json(ApiResponse::success(outcome)))
 }
 
 /// POST /main/api/v1/org-memberships — 登记本单元成员（双卡复核在仓储）。
+///
+/// proof-bound admission：membership 变更进入 org admission 编译输入（影响
+/// 有效授权/资格推导），合同同 revoke。
 async fn create_org_membership(
     State(state): State<AppState>,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(body): Json<MembershipCreateRequestBody>,
 ) -> Result<Json<ApiResponse<astral_db::org_scope_repository::OrgMutationOutcome>>, AppError> {
     let actor = mutation_actor(&policy_context, &body.operation_id)?;
@@ -586,6 +615,7 @@ async fn create_org_membership(
                 not_before: body.not_before,
                 expires_at: body.expires_at,
             },
+            admission,
         )
         .await
         .map_err(AppError::from)?;
@@ -594,9 +624,12 @@ async fn create_org_membership(
 
 /// POST /main/api/v1/org-memberships/{membership_id}/revoke
 /// membership 主键是 DB 生成的规范 UUID 文本（service 层 canonical 校验）。
+///
+/// proof-bound admission：合同同 create_org_membership。
 async fn revoke_org_membership(
     State(state): State<AppState>,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(membership_id): Path<String>,
     Json(body): Json<MembershipRevokeRequestBody>,
 ) -> Result<Json<ApiResponse<astral_db::org_scope_repository::OrgMutationOutcome>>, AppError> {
@@ -607,6 +640,7 @@ async fn revoke_org_membership(
             actor.tenant_id,
             &membership_id,
             body.expected_revision,
+            admission,
         )
         .await
         .map_err(AppError::from)?;
@@ -645,9 +679,14 @@ async fn get_org_scope_request(
 /// POST /main/api/v1/permission-requests/org-scopes/{request_id}/approve
 /// 批准 actor 只来自签名 ctx；ROOT_INIT/ROOT_GRANT 另要求
 /// `org_authority_edge:bootstrap` 元能力 + scope 上限证明（service 层）。
+///
+/// proof-bound admission：审批是把 PENDING 请求落成有效授权的唯一写点，
+/// 必须携带本次请求的 F1 admission（缺失即 fail-closed）；仓储在 commit 前
+/// 同事务对牌 durable authority 行并一次性消费。
 async fn approve_org_scope_request(
     State(state): State<AppState>,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(request_id): Path<i64>,
     Json(body): Json<DecisionRequestBody>,
 ) -> Result<Json<ApiResponse<astral_db::org_scope_repository::OrgApproveOutcome>>, AppError> {
@@ -658,6 +697,7 @@ async fn approve_org_scope_request(
             request_id,
             body.expected_revision,
             body.note.as_deref(),
+            admission,
         )
         .await
         .map_err(AppError::from)?;
@@ -921,10 +961,60 @@ mod tests {
         assert!(source.contains("Path((tenant_id, mask_id)): Path<(i64, String)>"));
         assert!(source.contains("Path(membership_id): Path<String>"));
         assert!(source.contains("body.target_tenant_id,"));
-        assert!(
-            source.contains(".remove_mask(&actor, tenant_id, &mask_id, body.expected_revision)")
-        );
-        assert!(source.contains(".revoke_membership(\n            &actor,\n            actor.tenant_id,\n            &membership_id,\n            body.expected_revision,\n        )"));
+        assert!(source.contains(
+            ".remove_mask(\n            &actor,\n            tenant_id,\n            &mask_id,\n            body.expected_revision,\n            admission,\n        )"
+        ));
+        assert!(source.contains(".revoke_membership(\n            &actor,\n            actor.tenant_id,\n            &membership_id,\n            body.expected_revision,\n            admission,\n        )"));
+    }
+
+    /// proof-bound admission 守卫：六个有效授权变更端点（grant revoke、mask
+    /// apply/remove、membership create/revoke、request approve）必须以
+    /// `Extension<AuthorizationAdmission>` 提取 admission 并透传 service；
+    /// 提交/驳回/撤销（workflow-only，不改变有效授权）不得注入 admission。
+    #[test]
+    fn effective_authorization_mutations_require_extension_admission() {
+        let source = production_source();
+        for handler in [
+            "async fn revoke_org_grant(",
+            "async fn apply_org_mask(",
+            "async fn remove_org_mask(",
+            "async fn create_org_membership(",
+            "async fn revoke_org_membership(",
+            "async fn approve_org_scope_request(",
+        ] {
+            let start = source
+                .find(handler)
+                .unwrap_or_else(|| panic!("{handler} must exist"));
+            let end = source[start..]
+                .find(") -> Result<")
+                .map(|value| start + value)
+                .unwrap_or_else(|| panic!("{handler} signature must close"));
+            let signature = &source[start..end];
+            assert!(
+                signature.contains("Extension(admission): Extension<AuthorizationAdmission>"),
+                "{handler} must require the proof-bound admission extension"
+            );
+        }
+        for workflow_handler in [
+            "async fn submit_attach(",
+            "async fn submit_move(",
+            "async fn submit_detach(",
+            "async fn submit_org_scope_request(",
+            "async fn reject_org_scope_request(",
+            "async fn cancel_org_scope_request(",
+        ] {
+            let start = source
+                .find(workflow_handler)
+                .unwrap_or_else(|| panic!("{workflow_handler} must exist"));
+            let end = source[start..]
+                .find(") -> Result<")
+                .map(|value| start + value)
+                .unwrap_or_else(|| panic!("{workflow_handler} signature must close"));
+            assert!(
+                !source[start..end].contains("AuthorizationAdmission"),
+                "{workflow_handler} is workflow-only and must not inject an admission"
+            );
+        }
     }
 
     /// 路由形状守卫：仅暴露四个 allowlist 前缀内的路由，且全部落在

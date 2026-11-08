@@ -137,6 +137,21 @@ pub enum AuditEventType {
     CardSwitch,
     /// 对应 Java DATA_SCOPE_DENY — 数据范围拒绝
     DataScopeDeny,
+    /// 验证码签发（Rust 侧契约扩展，非 Java 6 种基线；wire 值
+    /// `VERIFICATION_CODE_ISSUED`）。在 durable 签发（仓储层 supersede 事务
+    /// 返回行 id）之后记录，detail 携带稳定 `codeId` 关联；验证码明文永不入审计。
+    VerificationCodeIssued,
+    /// 验证码校验成功消费（Rust 侧契约扩展；wire 值
+    /// `VERIFICATION_CODE_VERIFIED`）。仅在 one-shot CAS 消费成功后记录，
+    /// 与同码的签发事件通过同一 `codeId` 关联；验证码明文永不入审计。
+    VerificationCodeVerified,
+    /// 密码重置凭证敏感投递尝试（Rust 侧契约扩展；wire 值
+    /// `PASSWORD_RESET_ISSUED`）。在 durable 发送预算判定 + 凭证签发 +
+    /// delivery typed truth 齐备后记录；detail 只携带稳定 operation/message
+    /// id 与预算/签发/投递真值，绝不携带 token/login/email 明文。
+    /// （taskId authority-v7-peripheral-20261107 主审后修复，additive 契约
+    /// 扩展，无 schema 变更。）
+    PasswordResetIssued,
 }
 
 /// 审计日志分类（对齐 Java `sendViaMQ(message, category)` 的 category 参数）
@@ -649,6 +664,31 @@ mod tests {
             audit_event_type_name(&AuditEventType::PermissionCheck),
             "AUTHZ_CHECK"
         );
+    }
+
+    #[test]
+    fn verification_code_events_use_stable_wire_contract() {
+        // SCREAMING_SNAKE_CASE 契约：签发与消费是稳定 wire 值，供 MQ/DB 双写
+        // 与后续查询关联；两个方向（serialize/deserialize）都必须保持一致。
+        for (event_type, wire) in [
+            (
+                AuditEventType::VerificationCodeIssued,
+                "VERIFICATION_CODE_ISSUED",
+            ),
+            (
+                AuditEventType::VerificationCodeVerified,
+                "VERIFICATION_CODE_VERIFIED",
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_value(&event_type).unwrap().as_str(),
+                Some(wire)
+            );
+            assert_eq!(audit_event_type_name(&event_type), wire);
+            let round_trip: AuditEventType = serde_json::from_value(serde_json::json!(wire))
+                .unwrap_or_else(|error| panic!("{wire} must deserialize: {error}"));
+            assert_eq!(round_trip, event_type);
+        }
     }
 
     #[test]

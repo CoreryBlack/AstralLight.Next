@@ -68,7 +68,7 @@ use astral_types::org_scope::{
     OrgAdmissionResult, OrgError, OrgGrantRef, OrgNode, OrgPendingCode, OrgRootActivation,
     OrgScope, OrgSubject, MAX_ORG_ID_TEXT_LEN,
 };
-use astral_types::AstralError;
+use astral_types::{AstralError, AuthorizationAdmission};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{MySql, MySqlPool, Row, Transaction};
@@ -82,17 +82,29 @@ pub use astral_types::org_scope::{
 use astral_types::ValidityWindow;
 
 mod mutations;
+pub(crate) mod org_authority_capture;
 mod reader;
 mod requests;
 mod worker;
 
+/// 行/成员视图与 sealed publication 事务内读取的 crate 内出口（certification
+/// owner 复用同一装配逻辑，不复制第二套读取）。
+pub(crate) use mutations::{membership_from_row, typed_membership, OrgMembershipRow};
 pub use mutations::{
     OrgGrantRevokeCommand, OrgMaskApplyCommand, OrgMaskRemoveCommand, OrgMembershipCreateCommand,
     OrgMembershipRevokeCommand,
 };
+/// ORG source-outcome capture 与 certification owner 共享的最小出口（同 crate
+/// 内 `authority_publication::org` 复用同一摘要/证据形状，不复制第二套定义）。
+pub(crate) use org_authority_capture::{
+    org_source_commit_digest, org_source_image_digest, OrgMembershipCreateReceiptEvidence,
+    OrgSourceAuditReceiptEvidence, OrgSourceFactEvidence, OrgSourceOutboxReceiptEvidence,
+    OrgSourceOutcomeEvidenceV1, ORG_SOURCE_AFTER_IMAGE_DOMAIN, ORG_SOURCE_BEFORE_IMAGE_DOMAIN,
+};
 /// 准入证据严格 reader 的 crate 内直通出口（辅助授权镜像回填复用同一读取，
 /// 不复制第二套装配逻辑）。
 pub(crate) use reader::load_admission_evidence_in_pool;
+pub(crate) use reader::load_sealed_publication_in_tx;
 pub use requests::{
     OrgApproveCommand, OrgCancelCommand, OrgCreateRequestCommand, OrgGovernanceProof,
     OrgRejectCommand, OrgRequestOutcome, OrgRequestView,
@@ -591,7 +603,7 @@ pub(crate) async fn load_node_in_pool(
 }
 
 pub(crate) async fn load_node_in_tx(
-    tx: &mut Transaction<'static, MySql>,
+    tx: &mut Transaction<'_, MySql>,
     tenant_id: i64,
 ) -> Result<Option<OrgNodeRow>, AstralError> {
     let sql = format!("SELECT {NODE_SELECT_COLUMNS} FROM org_scope_node WHERE tenant_id = ?");
@@ -1137,6 +1149,32 @@ pub(crate) async fn commit_authority_tx(
     commit_result
 }
 
+/// 用户面 authority mutation 的 proof-bound admission 消费点（commit 前）。
+///
+/// 合同（与 trustgraph `AuthorizationSourceTransaction` 的 commit 门一致）：
+/// - 在**同一 source 事务内**、`COMMIT` await 之前，锁定 durable
+///   `authorization_authority_frontier`（SERVING）与 `authorization_authority_proof`
+///   （ACTIVE）两行并逐字段对牌请求能力；漂移/缺失/非当前一律 fail-closed，
+///   整个 mutation 回滚。
+/// - 通过对牌后 `consume_once` 一次性消费请求能力；重复消费（replay/concurrent
+///   reuse）即 `Pending` 错误，绝不放大授权。
+/// - 锁序保持既有方向：org 聚合行锁（request/grant/node/membership）在前，
+///   authority frontier/proof 行锁最后、紧贴 COMMIT —— 与已迁移 writer
+///   （user_card/rule/tenant）相同的取锁次序。
+pub(crate) async fn consume_org_authority_admission(
+    tx: &mut Transaction<'static, MySql>,
+    admission: &AuthorizationAdmission,
+) -> Result<(), AstralError> {
+    // `validate_authorization_admission_in_tx` 接收 `&mut Transaction`：
+    // 直接 reborrow 事务，不得双重解引用到连接（`&mut **tx` 类型不匹配）。
+    crate::consume_authorization_admission_in_tx(&mut *tx, admission)
+        .await
+        .map_err(AstralError::from)?;
+    admission
+        .consume_once()
+        .map_err(|error| AstralError::Pending(error.to_string()))
+}
+
 /// 事务内确认受影响行数恰为 1，否则失败（CAS 语义兜底）。
 pub(crate) fn require_affected_one(
     result: &sqlx::mysql::MySqlQueryResult,
@@ -1487,5 +1525,80 @@ mod tests {
             result.is_err(),
             "unreachable db must fail the authority begin"
         );
+    }
+
+    /// 用户面 authority mutation 的 proof-bound admission 合同：mutations×5
+    /// （revoke_grant / apply_mask / remove_mask / create_membership /
+    /// revoke_membership，replay+fresh 两个分支各一次 = 10）与 approve_request
+    /// （replay+fresh = 2）必须在各自 `commit_authority_tx` 之前同事务调用
+    /// [`consume_org_authority_admission`]；命令结构体以 `#[serde(skip)]
+    /// pub admission: AuthorizationAdmission` 必填携带（幂等 digest 不含
+    /// admission）。簿记事务（create/reject/cancel）与 worker 内部 projector
+    /// 路径不经 HTTP，保持无 admission（显式内部路径）。
+    #[test]
+    fn user_facing_authority_mutations_consume_admission_before_commit() {
+        let mutations = include_str!("mutations.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("mutations production section must precede its test module");
+        let requests = include_str!("requests.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("requests production section must precede its test module");
+        for (source, expected_consumes, expected_fields) in [(mutations, 10, 5), (requests, 2, 1)] {
+            assert_eq!(
+                source
+                    .matches("consume_org_authority_admission(&mut tx, &cmd.admission)")
+                    .count(),
+                expected_consumes,
+                "every user-facing authority commit branch must consume the admission in-tx"
+            );
+            assert_eq!(
+                source
+                    .matches("#[serde(skip)]\n    pub admission: AuthorizationAdmission")
+                    .count(),
+                expected_fields,
+                "command structs must require the proof-bound admission field"
+            );
+            // 每一次 consume 必须先于其后最近的 commit_authority_tx（同分支内
+            // 对牌+消费紧贴 COMMIT，绝不延后）。
+            let mut cursor = 0usize;
+            let mut consume_count = 0usize;
+            while let Some(offset) = source[cursor..].find("consume_org_authority_admission(") {
+                let consume = cursor + offset;
+                let commit = source[consume..]
+                    .find("commit_authority_tx(")
+                    .map(|value| consume + value)
+                    .unwrap_or_else(|| {
+                        panic!("admission consume at byte {consume} must precede its commit")
+                    });
+                assert!(
+                    commit > consume,
+                    "consume must be ordered before the commit marker"
+                );
+                cursor = commit;
+                consume_count += 1;
+            }
+            assert_eq!(consume_count, expected_consumes);
+        }
+        // 簿记命令（workflow-only：create/reject/cancel 不改变有效授权）与
+        // worker 内部路径不得携带 admission（显式内部/簿记路径，不经 HTTP）。
+        for workflow_marker in [
+            "pub struct OrgCreateRequestCommand",
+            "pub struct OrgRejectCommand",
+            "pub struct OrgCancelCommand",
+        ] {
+            let start = requests
+                .find(workflow_marker)
+                .unwrap_or_else(|| panic!("{workflow_marker} must exist"));
+            let end = requests[start..]
+                .find("}")
+                .map(|value| start + value)
+                .expect("struct body must close");
+            assert!(
+                !requests[start..end].contains("admission"),
+                "{workflow_marker} is a workflow-only command and must not carry an admission"
+            );
+        }
     }
 }

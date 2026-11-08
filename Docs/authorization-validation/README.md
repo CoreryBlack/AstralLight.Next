@@ -37,6 +37,12 @@ or multi-node deployment.
   checker is implemented in Rust under `test-harness` with a retained baseline fixture.
 - [`IMPLEMENTATION_MAP.md`](IMPLEMENTATION_MAP.md): M1-M5 authorization assumptions
   mapped to Rust implementation and test surfaces.
+- [V7 completion results and review](认证内存授权状态机计划完成度审查报告_2026-11-06.md):
+  current local completion, five-chain review, final validation summary, and blocked
+  external acceptance. The original filename is retained for existing references.
+- [V7 implementation process](认证内存授权状态机实施过程报告_2026-11-08.md):
+  canonical attempt records, handoffs, failures and fixes, exact commands, raw-log
+  references, final freeze, and historical V6/intermediate review excerpts.
 
 Generated `evidence/`, `artifact/`, result, log, credential, and private deployment
 folders are intentionally excluded. A live run requires an isolated environment,

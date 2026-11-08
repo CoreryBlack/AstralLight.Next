@@ -74,8 +74,8 @@
       <section class="validation-section" id="packages">
         <div class="validation-wrap">
           <p class="section-label">00 <span>Evidence Packages</span></p>
-          <h2>Three evidence packages, three distinct conclusions.</h2>
-          <p class="section-lead">These three evidence packages come from different dates and environments and are presented separately. r3 is a Linux Cargo test run; the single-machine evidence uses real MySQL / Redis / RabbitMQ; the SDK results are from local macOS gates.</p>
+          <h2>Single-machine stage acceptance and evidence scope.</h2>
+          <p class="section-lead">The single-machine stage is accepted on the historical evidence below, with failures and unrun items retained. Runs have different dates, source revisions and scopes; their counts are not combined and do not establish a retest of the current revision. The distributed deployment remains unverified.</p>
           <div class="package-grid">
             <article class="package-card">
               <div class="package-head"><span>2026-10-07 · r3</span><span class="result is-fail">FAIL</span></div>
@@ -90,13 +90,19 @@
               <a href="#performance">View performance and failures <span aria-hidden="true">→</span></a>
             </article>
             <article class="package-card">
+              <div class="package-head"><span>2026-10-09 · E5 a11</span><span class="result is-pass">SELECTED PASS</span></div>
+              <h3>Selected suites after fixes</h3>
+              <p>Commit 674792e: 60/60 stages passed in item verification and 60/60 in an independent rerun. Includes real MySQL, RabbitMQ and historical Redis compatibility suites; it does not establish a complete deployment or pass for every scenario.</p>
+              <a href="Docs/实验/e5-all-20261008/e5-all-20261008-a11-evidence-bundle-20261010.tar.gz">View raw evidence bundle <span aria-hidden="true">→</span></a>
+            </article>
+            <article class="package-card">
               <div class="package-head"><span>2026-10-05 · Local</span><span class="result is-pass">LOCAL PASS</span></div>
               <h3>SDK Integration V1</h3>
               <p>2,765 workspace PASS · 0 FAIL · 86 ignored; 12 sample PASS; 9/9 local gate commands exited 0. Production integration remains BLOCKED.</p>
               <a href="#sdk">View SDK results <span aria-hidden="true">→</span></a>
             </article>
           </div>
-          <p class="section-note">Each package conclusion applies to its own test scope: SDK production integration remains BLOCKED, and the single-machine gate still has 5 failures.</p>
+          <p class="section-note">The 2026-10-06 single-machine gate had 5 test failures and other gate failures; the 2026-10-07 r3 result was FAIL. The later E5 result covers selected suites only; SDK production integration remains BLOCKED.</p>
         </div>
       </section>
 
@@ -317,7 +323,7 @@
               <h3>Identity mapping create</h3>
               <p>Missing-mapping detection passed; create failed while decoding operation-ledger status. Subsequent positive resolve and cross-app isolation assertions were not run.</p>
               <code class="failure-code">Database("lock integration mapping operation: error occurred while decoding column status: mismatched types; Rust String/VARCHAR is not compatible with SQL BINARY")</code>
-              <p class="failure-impact">Impact: the SDK mapping creation path remains unverified.</p>
+              <p class="failure-impact">The later E5 a11 identity-mapping suite passed 2/2 on real MySQL; this does not establish SDK production integration acceptance.</p>
             </article>
             <article class="failure-card">
               <div class="failure-head"><span>r3 · E5</span><span class="result is-fail">FAIL</span></div>
@@ -357,7 +363,7 @@ concurrent p99.9 504.843µs · max 1,007.968µs</code>
               <h3>Out of Scope</h3>
               <ul>
                 <li>A fully green integration gate (both r3 and the single-machine gate are FAIL).</li>
-                <li>SDK mapping-creation compatibility and successful SDK production integration.</li>
+                <li>Successful SDK production integration; the later identity-mapping retest is not production integration acceptance.</li>
                 <li>E5 performance meeting the sanity floor, and 512 being the capacity limit.</li>
                 <li>Business HTTP end-to-end coverage for a real single-node composite.</li>
                 <li>Cross-node / cross-region recovery, the full E1–E5 protocol, TLA+/TLC, production migration, and authorization cutover.</li>
@@ -373,6 +379,8 @@ concurrent p99.9 504.843µs · max 1,007.968µs</code>
           <h2>See the public materials.</h2>
           <p class="section-lead">This page references redacted test summaries and public repository documents; the original runner / unit logs are kept in the local evidence package.</p>
           <ul class="source-list">
+            <li><a href="test-report.md">2026-10-07 r3 test report <span aria-hidden="true">→</span></a></li>
+            <li><a href="Docs/实验/e5-all-20261008/e5-all-20261008-a11-evidence-bundle-20261010.tar.gz">2026-10-09 E5 a11 raw evidence bundle <span aria-hidden="true">→</span></a></li>
             <li><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/authorization-validation/README.md" target="_blank" rel="noreferrer">Authorization Validation Protocol and Tools <span aria-hidden="true">↗</span></a></li>
             <li><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/authorization-validation/EVIDENCE_BOUNDARY_MATRIX.md" target="_blank" rel="noreferrer">Evidence Boundary Matrix <span aria-hidden="true">↗</span></a></li>
             <li><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/authorization-validation/VALIDATION_PROTOCOL.md" target="_blank" rel="noreferrer">Validation Protocol <span aria-hidden="true">↗</span></a></li>
@@ -606,7 +614,7 @@ concurrent p99.9 504.843µs · max 1,007.968µs</code>
 
     <footer class="site-footer">
       <a class="brand footer-brand" href="index.en.html"><img class="brand-mark" src="assets/astral-mark.png" alt="" width="24" height="24">AstralLight<span class="brand-period">.</span><span class="brand-next">Next</span></a>
-      <span>Experimental project; not deployed in production and not guaranteed to be suitable for every environment or use case.</span>
+      <span>Single-machine stage accepted on historical evidence; distributed deployment is unverified and production deployment requires separate acceptance.</span>
       <div class="footer-links"><a href="index.en.html">Home</a><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/LICENSE" target="_blank" rel="noreferrer">AGPL-3.0-or-later</a><a href="#top">Back to top ↑</a></div>
     </footer>
     <button class="back-to-top" type="button" aria-label="Back to top">↑</button>

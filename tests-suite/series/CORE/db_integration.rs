@@ -441,6 +441,7 @@ async fn local_message_exact_claim_is_concurrent_fifo_and_token_fenced() {
         schema_version: 1,
         payload_json: &payload_jsons[index],
         headers_json: None,
+        authority_metadata_json: None,
         payload_sha256: &payload_sha256,
     };
     for index in 0..message_ids.len() {

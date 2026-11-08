@@ -5,11 +5,17 @@
 
 use async_trait::async_trait;
 use sqlx::MySqlPool;
+use std::sync::Arc;
 
-use astral_types::{AstralError, GrantState};
+use astral_db::invalidation_delivery::InvalidationDeliveryContext;
+use astral_db::ProtectedMutationContext;
+
+use astral_types::{AstralError, AuthorizationAdmission, GrantState};
 
 use crate::repository::audit_log_repository::validated_request_operation_id;
 use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
+
+mod protected_business;
 use crate::repository::grant_ledger_adapter::{
     append_approval_grant_in_tx, append_approval_remove_in_tx, build_approval_remove_draft,
     derive_approval_contribution_event_id, derive_approval_identity, derive_approval_operation_id,
@@ -48,7 +54,11 @@ const PR_SELECT: &str =
 #[async_trait]
 pub trait PermissionRequestRepository: Send + Sync {
     /// 新建（request_type='RULE', status='PENDING'），返回 request_id
-    async fn create_request(&self, new: &NewRequest) -> Result<i64, AstralError>;
+    async fn create_request(
+        &self,
+        new: &NewRequest,
+        context: ProtectedMutationContext,
+    ) -> Result<i64, AstralError>;
     /// Verify the requester owns an ACTIVE, currently valid card before a request is inserted.
     async fn validate_card_for_user(&self, user_id: i64, card_id: i64) -> Result<(), AstralError>;
     async fn count_all(&self) -> Result<i64, AstralError>;
@@ -80,6 +90,7 @@ pub trait PermissionRequestRepository: Send + Sync {
         user_id: i64,
         comment: Option<&str>,
         request_id_header: Option<&str>,
+        context: ProtectedMutationContext,
     ) -> Result<(), AstralError>;
     async fn count_pending(&self) -> Result<i64, AstralError>;
     /// 分页 pending 列表
@@ -104,6 +115,7 @@ pub trait PermissionRequestRepository: Send + Sync {
         valid_from: Option<&str>,
         valid_to: Option<&str>,
         request_id_header: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AstralError>;
     /// 驳回（REJECTED）
     async fn reject_request(
@@ -112,6 +124,7 @@ pub trait PermissionRequestRepository: Send + Sync {
         reviewer_id: i64,
         comment: Option<&str>,
         request_id_header: Option<&str>,
+        context: ProtectedMutationContext,
     ) -> Result<(), AstralError>;
     /// 单条 APPROVAL 贡献的审批后撤销（post-approval revoke）。
     ///
@@ -133,8 +146,16 @@ pub trait PermissionRequestRepository: Send + Sync {
         reviewer_id: i64,
         comment: Option<&str>,
         request_id_header: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<bool, AstralError> {
-        let _ = (request_id, rule_id, reviewer_id, comment, request_id_header);
+        let _ = (
+            request_id,
+            rule_id,
+            reviewer_id,
+            comment,
+            request_id_header,
+            admission,
+        );
         Err(AstralError::NotImplemented(
             "approval contribution revoke is not implemented by this repository".into(),
         ))
@@ -143,11 +164,41 @@ pub trait PermissionRequestRepository: Send + Sync {
 
 pub struct SqlxPermissionRequestRepository {
     db: MySqlPool,
+    delivery_context: Option<Arc<InvalidationDeliveryContext>>,
 }
 
 impl SqlxPermissionRequestRepository {
     pub fn new(db: MySqlPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            delivery_context: None,
+        }
+    }
+
+    pub fn new_with_delivery_context(
+        db: MySqlPool,
+        delivery_context: Arc<InvalidationDeliveryContext>,
+    ) -> Self {
+        Self {
+            db,
+            delivery_context: Some(delivery_context),
+        }
+    }
+
+    async fn begin_admitted_source(
+        &self,
+        admission: AuthorizationAdmission,
+    ) -> Result<AuthorizationSourceTransaction, AstralError> {
+        let context = self.delivery_context.clone().ok_or_else(|| {
+            AstralError::Pending(
+                "approval source mutation requires an injected invalidation delivery context"
+                    .into(),
+            )
+        })?;
+        AuthorizationSourceTransaction::begin_with_admission_and_delivery_context(
+            &self.db, admission, context,
+        )
+        .await
     }
 }
 
@@ -190,8 +241,64 @@ async fn lock_contribution_card_in_tx(
     .map_err(db_error)
 }
 
-/// 单条审批贡献撤销的稳定 operation id（纯派生）：安全 request-id 头优先原样
-/// 复用（与 approve/direct/delegation 同一门禁：仅 ASCII 安全集、≤ 64 字节），
+/// Lock the current actor card represented by the admission. Reviewer mutations
+/// use this check for the actor scope, while the request's target card is locked
+/// separately as the source subject.
+async fn lock_actor_card_for_admission(
+    tx: &mut AuthorizationSourceTransaction,
+    actor_id: i64,
+    admission: &AuthorizationAdmission,
+) -> Result<(), AstralError> {
+    if actor_id <= 0 {
+        return Err(AstralError::Auth(
+            "permission request mutation requires a positive actor id".into(),
+        ));
+    }
+    let proof_scope = &admission.proof().scope;
+    if proof_scope.user_id != Some(actor_id) {
+        return Err(AstralError::Permission(
+            "authorization admission actor does not match the verified reviewer".into(),
+        ));
+    }
+    let domain_id = match proof_scope.domain {
+        astral_types::AuthorizationDomainScope::Exact(domain_id) if domain_id > 0 => domain_id,
+        _ => {
+            return Err(AstralError::Permission(
+                "permission request mutation requires an exact domain-bound admission".into(),
+            ));
+        }
+    };
+    if proof_scope.tenant_id <= 0 || proof_scope.card_id <= 0 {
+        return Err(AstralError::Permission(
+            "permission request mutation requires a positive card and tenant scope".into(),
+        ));
+    }
+    let row: Option<(i64, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT user_id, tenant_id, domain_id FROM user_card \
+         WHERE card_id = ? AND card_status = 'ACTIVE' \
+           AND (valid_from IS NULL OR valid_from <= NOW()) \
+           AND (valid_until IS NULL OR valid_until >= NOW()) FOR UPDATE",
+    )
+    .bind(proof_scope.card_id)
+    .fetch_optional(&mut ***tx)
+    .await
+    .map_err(db_error)?;
+    let Some((locked_user_id, locked_tenant_id, locked_domain_id)) = row else {
+        return Err(AstralError::Permission(
+            "authorization admission actor card is not active or no longer exists".into(),
+        ));
+    };
+    if locked_user_id != actor_id
+        || locked_tenant_id != Some(proof_scope.tenant_id)
+        || locked_domain_id != Some(domain_id)
+    {
+        return Err(AstralError::Permission(
+            "authorization admission does not match the locked actor card".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// 缺失/空白时从 `{request_id}:{rule_id}` 确定性派生
 /// `approval:revoke:{request_id}:rule:{rule_id}`，与 approve 的
 /// `approval:{request_id}` fallback 域分离，绝不做随机或截断回退。
@@ -232,19 +339,17 @@ fn derive_approval_revoke_operation_id(
 
 #[async_trait]
 impl PermissionRequestRepository for SqlxPermissionRequestRepository {
-    async fn create_request(&self, new: &NewRequest) -> Result<i64, AstralError> {
-        let result = sqlx::query(
-            "INSERT INTO permission_request (user_id, request_type, request_content, reason, status) \
-             VALUES (?, ?, ?, ?, 'PENDING')",
-        )
-        .bind(new.user_id)
-        .bind(&new.request_type)
-        .bind(&new.request_content)
-        .bind(&new.reason)
-        .execute(&self.db)
-        .await
-        .map_err(db_error)?;
-        Ok(result.last_insert_id() as i64)
+    async fn create_request(
+        &self,
+        new: &NewRequest,
+        context: ProtectedMutationContext,
+    ) -> Result<i64, AstralError> {
+        if new.user_id <= 0 {
+            return Err(AstralError::Auth(
+                "permission request requires a positive requester id".into(),
+            ));
+        }
+        protected_business::create_request(&self.db, new, &context).await
     }
 
     async fn validate_card_for_user(&self, user_id: i64, card_id: i64) -> Result<(), AstralError> {
@@ -347,71 +452,10 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         request_id: i64,
         user_id: i64,
         comment: Option<&str>,
-        request_id_header: Option<&str>,
+        _request_id_header: Option<&str>,
+        context: ProtectedMutationContext,
     ) -> Result<(), AstralError> {
-        use crate::repository::audit_log_repository::{
-            insert_approval_audit_in_tx, ApprovalAuditContext, ApprovalAuditEntry,
-        };
-
-        // 统一 request-id 合同门禁：显式携带但超长/含不安全字节的 header 在任何
-        // 事务副作用之前 Validation fail-closed —— 绝不允许 65+ 字节值进入
-        // `audit_log.request_id` VARCHAR(64) 造成截断或写失败，也绝不静默替换。
-        // 缺失/空白 header 维持既有稳定 fallback（approval:{request_id}），
-        // 不产生随机或超长审计关联值。失败时事务未开始，无任何副作用。
-        let request_id_header = validated_request_operation_id(request_id_header)?;
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
-        let request: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT user_id, request_content, reason FROM permission_request \
-             WHERE request_id=? AND user_id=? AND status='PENDING' FOR UPDATE",
-        )
-        .bind(request_id)
-        .bind(user_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(db_error)?;
-        let Some((target_user_id, request_content, request_reason)) = request else {
-            return Err(AstralError::Validation(
-                "permission request is not pending or does not belong to requester".into(),
-            ));
-        };
-        let target_card_id = request_content
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-            .and_then(|value| value.get("cardId").and_then(serde_json::Value::as_i64));
-
-        let result = sqlx::query(
-            "UPDATE permission_request SET status='CANCELLED', approve_comment=?, updated_at=NOW() \
-             WHERE request_id=? AND user_id=? AND status='PENDING'",
-        )
-        .bind(comment)
-        .bind(request_id)
-        .bind(user_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(db_error)?;
-        if result.rows_affected() != 1 {
-            return Err(AstralError::Validation(
-                "permission request is no longer pending or does not belong to requester".into(),
-            ));
-        }
-
-        let context = ApprovalAuditContext::new(request_id_header.as_deref(), request_id);
-        insert_approval_audit_in_tx(
-            &mut tx,
-            &ApprovalAuditEntry {
-                actor_id: user_id,
-                reviewer_id: None,
-                target_user_id,
-                target_card_id,
-                action: "cancel",
-                decision: "CANCELLED",
-                request_reason: request_reason.as_deref(),
-                reviewer_comment: comment,
-                context: &context,
-            },
-        )
-        .await?;
-        tx.commit_consuming().await
+        protected_business::cancel_request(&self.db, request_id, user_id, comment, &context).await
     }
 
     async fn count_pending(&self) -> Result<i64, AstralError> {
@@ -445,6 +489,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         reviewer_id: i64,
         comment: Option<&str>,
         request_id_header: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<bool, AstralError> {
         use crate::repository::audit_log_repository::{
             insert_approval_audit_in_tx, ApprovalAuditContext, ApprovalAuditEntry,
@@ -470,7 +515,8 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         let operation_id =
             derive_approval_revoke_operation_id(request_id, rule_id, request_id_header.as_deref())?;
 
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let mut tx = self.begin_admitted_source(admission.clone()).await?;
+        lock_actor_card_for_admission(&mut tx, reviewer_id, &admission).await?;
 
         // ── 锁 1：请求行 —— 只有 APPROVED 请求的贡献可以撤销 ────────────────────
         let request: Option<(i64, Option<String>, Option<String>, String)> = sqlx::query_as(
@@ -519,7 +565,12 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
                         "permission rule does not belong to the given permission request".into(),
                     ));
                 }
-                if rule.enabled.unwrap_or(1) != 1 {
+                let enabled = rule.enabled.ok_or_else(|| {
+                    AstralError::Validation(format!(
+                        "approval contribution rule {rule_id} has NULL enabled state; refusing to revoke an ambiguous contribution"
+                    ))
+                })?;
+                if enabled != 1 {
                     return Err(AstralError::Validation(format!(
                         "approval contribution rule {rule_id} is disabled; refusing to revoke a non-active contribution"
                     )));
@@ -570,9 +621,14 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
                     rule_id,
                 };
                 let probe_grant_id = derive_approval_identity(&probe_facts)?;
+                let probe_tenant_id = probe_facts.tenant_id.ok_or_else(|| {
+                    AstralError::Validation(format!(
+                        "approved request {request_id} contribution card has NULL tenant_id; refusing to probe an unscoped ledger head"
+                    ))
+                })?;
                 let probe_head = astral_db::read_grant_head_for_update_in_tx(
                     &mut tx,
-                    probe_facts.tenant_id.unwrap_or_default(),
+                    probe_tenant_id,
                     APPROVAL_AGGREGATE_TYPE,
                     request_id,
                     probe_grant_id,
@@ -642,9 +698,14 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
 
         // ── 锁 4：授权账本 grant head FOR UPDATE —— before-image 锚点。缺失即
         // 未入账授权，拒绝撤销（与 cascade 同一门禁），不做 raw source 假撤销。──
+        let tenant_id = facts.tenant_id.ok_or_else(|| {
+            AstralError::Validation(format!(
+                "approval request {request_id} contribution card has NULL tenant_id; refusing to read an unscoped ledger head"
+            ))
+        })?;
         let head = astral_db::read_grant_head_for_update_in_tx(
             &mut tx,
-            facts.tenant_id.unwrap_or_default(),
+            tenant_id,
             APPROVAL_AGGREGATE_TYPE,
             request_id,
             grant_id,
@@ -661,7 +722,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         // ── 锁 5：delta 版本链尾 FOR UPDATE → base/target 严格推进 ─────────────
         let last_target_version = astral_db::read_latest_delta_target_version_for_update_in_tx(
             &mut tx,
-            facts.tenant_id.unwrap_or_default(),
+            tenant_id,
             APPROVAL_AGGREGATE_TYPE,
             request_id,
             head.grant_id,
@@ -754,6 +815,7 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         valid_from: Option<&str>,
         valid_to: Option<&str>,
         request_id_header: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AstralError> {
         // 防御加固：repository 不是校验旁路。审批落库的 canonical grant 只接受
         // ALLOW，校验先于任何事务副作用（失败即无 source/outbox/audit 写入）。
@@ -771,7 +833,8 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         // 业务身份从稳定 request context 派生一次（不生成随机业务 identity）；
         // 失败发生在任何事务副作用之前。
         let operation_id = derive_approval_operation_id(request_id_header, request_id)?;
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let mut tx = self.begin_admitted_source(admission.clone()).await?;
+        lock_actor_card_for_admission(&mut tx, reviewer_id, &admission).await?;
 
         let target_card: Option<(i64,)> = sqlx::query_as(
             "SELECT uc.card_id FROM user_card uc \
@@ -929,71 +992,11 @@ impl PermissionRequestRepository for SqlxPermissionRequestRepository {
         request_id: i64,
         reviewer_id: i64,
         comment: Option<&str>,
-        request_id_header: Option<&str>,
+        _request_id_header: Option<&str>,
+        context: ProtectedMutationContext,
     ) -> Result<(), AstralError> {
-        // PENDING 守卫：已 approve（规则已插入、projection 已落）的请求不得再被
-        // reject 翻状态，否则请求状态与权限规则不一致（对齐 approve 的并发防护）。
-        // 统一 request-id 合同门禁：显式携带但超长/含不安全字节的 header 在任何
-        // 事务副作用之前 Validation fail-closed —— 绝不允许 65+ 字节值进入
-        // `audit_log.request_id` VARCHAR(64) 造成截断或写失败，也绝不静默替换。
-        // 缺失/空白 header 维持既有稳定 fallback（approval:{request_id}），
-        // 不产生随机或超长审计关联值。失败时事务未开始，无任何副作用。
-        let request_id_header = validated_request_operation_id(request_id_header)?;
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
-        let request: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT user_id, request_content, reason FROM permission_request \
-             WHERE request_id=? AND status='PENDING' FOR UPDATE",
-        )
-        .bind(request_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(db_error)?;
-        let Some((target_user_id, request_content, request_reason)) = request else {
-            return Err(AstralError::Validation(
-                "permission request is no longer pending".into(),
-            ));
-        };
-        let target_card_id = request_content
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-            .and_then(|value| value.get("cardId").and_then(serde_json::Value::as_i64));
-
-        let result = sqlx::query(
-            "UPDATE permission_request SET status='REJECTED', approver_id=?, approve_comment=? \
-             WHERE request_id=? AND status='PENDING'",
-        )
-        .bind(reviewer_id)
-        .bind(comment)
-        .bind(request_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(db_error)?;
-        if result.rows_affected() != 1 {
-            return Err(AstralError::Validation(
-                "permission request is no longer pending".into(),
-            ));
-        }
-
-        let context = crate::repository::audit_log_repository::ApprovalAuditContext::new(
-            request_id_header.as_deref(),
-            request_id,
-        );
-        crate::repository::audit_log_repository::insert_approval_audit_in_tx(
-            &mut tx,
-            &crate::repository::audit_log_repository::ApprovalAuditEntry {
-                actor_id: reviewer_id,
-                reviewer_id: Some(reviewer_id),
-                target_user_id,
-                target_card_id,
-                action: "reject",
-                decision: "REJECTED",
-                request_reason: request_reason.as_deref(),
-                reviewer_comment: comment,
-                context: &context,
-            },
-        )
-        .await?;
-        tx.commit_consuming().await
+        protected_business::reject_request(&self.db, request_id, reviewer_id, comment, &context)
+            .await
     }
 }
 
@@ -1006,6 +1009,29 @@ fn db_error(error: sqlx::Error) -> AstralError {
 #[cfg(test)]
 mod approval_ledger_shape_tests {
     use crate::repository::audit_log_repository::validated_request_operation_id;
+
+    #[test]
+    fn approval_source_mutations_retain_the_frozen_delivery_context() {
+        let source = include_str!("permission_request_repository.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let begin = production
+            .split("async fn begin_admitted_source(")
+            .nth(1)
+            .unwrap()
+            .split("/// FOR UPDATE")
+            .next()
+            .unwrap();
+        assert!(begin.contains("self.delivery_context.clone().ok_or_else"));
+        assert!(begin.contains("begin_with_admission_and_delivery_context"));
+        let implementation = production.split(IMPL_ANCHOR).nth(1).unwrap();
+        assert_eq!(
+            implementation
+                .matches("self.begin_admitted_source(admission.clone())")
+                .count(),
+            2
+        );
+        assert!(!implementation.contains("AuthorizationSourceTransaction::begin"));
+    }
     use crate::repository::grant_ledger_adapter::{
         derive_approval_operation_id, MAX_HEADER_OPERATION_ID_LENGTH,
     };
@@ -1030,8 +1056,74 @@ mod approval_ledger_shape_tests {
         &rest[..end]
     }
 
-    /// 审批事务内的写入顺序与护栏（include_str! 结构断言，不连 DB）：
-    /// 锁卡 → CAS APPROVED → 规则 INSERT（affected_rows + last_insert_id 校验）
+    /// 取消/驳回只委托给 ProtectedBusiness child：它们不进入授权源事务、账本或投影路径。
+    #[test]
+    fn protected_business_workflows_are_delegated_without_source_side_effects() {
+        let source = include_str!("permission_request_repository.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let implementation = production.split(IMPL_ANCHOR).nth(1).unwrap();
+        for (method, delegate, terminator) in [
+            (
+                "async fn create_request(",
+                "protected_business::create_request",
+                "async fn validate_card_for_user(",
+            ),
+            (
+                "async fn cancel_request(",
+                "protected_business::cancel_request",
+                "async fn count_pending(",
+            ),
+            (
+                "async fn reject_request(",
+                "protected_business::reject_request",
+                "fn db_error",
+            ),
+        ] {
+            let body = method_body(source, method, terminator, method);
+            assert!(
+                body.contains(delegate),
+                "{method} must use its PB child delegate"
+            );
+            assert!(
+                !body.contains("begin_admitted_source")
+                    && !body.contains("append_approval_grant_in_tx")
+                    && !body.contains("append_card_projection"),
+                "{method} must not enter the authorization-source lane"
+            );
+        }
+        assert!(implementation.contains("protected_business::create_request"));
+        assert!(implementation.contains("protected_business::cancel_request"));
+        assert!(implementation.contains("protected_business::reject_request"));
+    }
+
+    /// PB child must retain same-transaction audit, actual evidence and durable result before commit.
+    #[test]
+    fn protected_business_child_pins_evidence_audit_and_commit_order() {
+        let child = include_str!("permission_request_repository/protected_business.rs");
+        for workflow in ["create_request", "cancel_request", "reject_request"] {
+            let start = child
+                .find(&format!("pub(crate) async fn {workflow}("))
+                .unwrap_or_else(|| panic!("{workflow} child implementation must exist"));
+            let body = &child[start..];
+            let audit = body
+                .find("insert_approval_audit_in_tx(")
+                .unwrap_or_else(|| panic!("{workflow} must write same-transaction approval audit"));
+            let evidence = body
+                .find("let source_evidence = evidence(")
+                .unwrap_or_else(|| panic!("{workflow} must build typed source evidence"));
+            let readback = body
+                .find("read_request_for_update(")
+                .unwrap_or_else(|| panic!("{workflow} must read the actual target row back"));
+            let finish = body
+                .find("finish_protected_mutation_in_tx(")
+                .unwrap_or_else(|| panic!("{workflow} must consume admission and stage result"));
+            let commit = body
+                .find("tx.commit()")
+                .unwrap_or_else(|| panic!("{workflow} must commit the short business transaction"));
+            assert!(readback < audit && audit < evidence && evidence < finish && finish < commit);
+        }
+    }
+
     /// → CARD APPROVED 投影事件（真实 reviewer actor + 稳定 operation_id）
     /// → 审批 audit → 授权账本追加 → commit。
     #[test]
@@ -1117,8 +1209,8 @@ mod approval_ledger_shape_tests {
             .find("validate_registry_resource_action(")
             .expect("approve must gate resource/action through the shared registry validator");
         let begin = body
-            .find("AuthorizationSourceTransaction::begin(&self.db)")
-            .expect("transaction begin must exist");
+            .find("self.begin_admitted_source(admission.clone())")
+            .expect("admission-bound transaction begin must exist");
         assert!(
             validation < begin,
             "registry validation must fail closed before opening the transaction"
@@ -1185,58 +1277,31 @@ mod approval_ledger_shape_tests {
         }
     }
 
-    /// 取消/驳回必须先过统一 request-id 合同门禁再开事务：显式超长/不安全
-    /// header 在任何副作用之前 Validation fail-closed；审计上下文只接收已校验值
-    /// （或既有稳定 fallback 输入），且全程不允许出现任何截断手段。
+    /// ProtectedBusiness child uses the middleware-bound operation id through its context and
+    /// performs admission/use, audit and source-evidence handling before the normal commit.
     #[test]
-    fn cancel_and_reject_validate_request_header_before_the_transaction() {
-        let source = include_str!("permission_request_repository.rs");
-        let bodies = [
-            (
-                method_body(
-                    source,
-                    "async fn cancel_request(",
-                    "async fn count_pending(",
-                    "cancel_request",
-                ),
-                "cancel",
-            ),
-            (
-                method_body(
-                    source,
-                    "async fn reject_request(",
-                    "fn db_error",
-                    "reject_request",
-                ),
-                "reject",
-            ),
-        ];
-        for (body, label) in bodies {
-            let validation = body
-                .find("validated_request_operation_id(request_id_header)")
-                .unwrap_or_else(|| {
-                    panic!("{label} must gate its header through the shared request-id contract")
-                });
-            let begin = body
-                .find("AuthorizationSourceTransaction::begin(&self.db)")
-                .expect("transaction begin must exist");
+    fn protected_business_child_uses_bound_operation_and_durable_finish() {
+        let child = include_str!("permission_request_repository/protected_business.rs");
+        for workflow in ["create_request", "cancel_request", "reject_request"] {
+            let start = child
+                .find(&format!("pub(crate) async fn {workflow}("))
+                .unwrap_or_else(|| panic!("{workflow} child implementation must exist"));
+            let body = &child[start..];
             assert!(
-                validation < begin,
-                "{label} must fail closed on unsafe/oversized headers before opening the transaction"
+                body.contains("context.operation_id()"),
+                "{workflow} must derive audit/commit identity from the bound context"
             );
-            let context_feed = body
-                .find("request_id_header.as_deref()")
-                .unwrap_or_else(|| {
-                    panic!("{label} must feed the validated header into the audit context")
-                });
-            assert!(validation < context_feed);
-            // 统一 64 字节合同禁止截断消化：不允许任何截断/切片手段。
-            for forbidden in [".truncate(", "&header[..64]", "chars().take("] {
-                assert!(
-                    !body.contains(forbidden),
-                    "{label} must never truncate the request-id header ({forbidden})"
-                );
-            }
+            assert!(
+                body.contains("begin_protected_mutation_in_tx(")
+                    && body.contains("finish_protected_mutation_in_tx("),
+                "{workflow} must use the protected mutation lifecycle"
+            );
+            assert!(
+                !body.contains("AuthorizationSourceTransaction")
+                    && !body.contains("append_approval_grant_in_tx")
+                    && !body.contains("append_card_projection"),
+                "{workflow} must not enter the authorization-source lane"
+            );
         }
     }
 
@@ -1291,7 +1356,7 @@ mod approval_ledger_shape_tests {
                 "provenance guard",
                 "source_type.trim() != \"PERMISSION_REQUEST\"",
             ),
-            ("active guard", "enabled.unwrap_or(1) != 1"),
+            ("active guard", "let enabled = rule.enabled.ok_or_else("),
             ("allow-only guard", "eq_ignore_ascii_case(\"ALLOW\")"),
             (
                 "card ownership lock",
@@ -1423,8 +1488,8 @@ mod approval_ledger_shape_tests {
             "revoke_approved_contribution",
         );
         let begin = body
-            .find("AuthorizationSourceTransaction::begin(&self.db)")
-            .expect("transaction begin must exist");
+            .find("self.begin_admitted_source(admission.clone())")
+            .expect("admission-bound transaction begin must exist");
         for gate in [
             "reviewer_id <= 0",
             "request_id <= 0 || rule_id <= 0",

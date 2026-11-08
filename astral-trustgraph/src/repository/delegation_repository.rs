@@ -6,6 +6,9 @@
 
 use async_trait::async_trait;
 use sqlx::MySqlPool;
+use std::sync::Arc;
+
+use astral_db::invalidation_delivery::InvalidationDeliveryContext;
 
 use astral_types::{
     get_alias_sources, parse_resource_key, AstralError, DomainScopeRequirement, GrantState,
@@ -13,7 +16,10 @@ use astral_types::{
     SYSTEM_ACTOR_ID,
 };
 
-use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
+use crate::repository::authorization_source_transaction::{
+    begin_source_transaction_with_capability_and_optional_delivery_context,
+    SourceMutationCapability,
+};
 use crate::repository::grant_ledger_adapter::{
     append_delegation_grant_delta_in_tx, build_delegation_add_draft, build_delegation_revoke_draft,
     build_delegation_update_draft, delegation_update_authorization_content_changed,
@@ -54,6 +60,7 @@ pub struct DelegationMutationContext {
     tenant_id: i64,
     domain_id: i64,
     request_id_header: Option<String>,
+    source_capability: SourceMutationCapability,
 }
 
 impl DelegationMutationContext {
@@ -95,6 +102,7 @@ impl DelegationMutationContext {
             tenant_id,
             domain_id,
             request_id_header,
+            source_capability: SourceMutationCapability::UserPending,
         })
     }
 
@@ -117,6 +125,15 @@ impl DelegationMutationContext {
     /// 原始 x-request-id 头（None = 由 repository 按委托主键确定性派生）。
     pub fn request_id_header(&self) -> Option<&str> {
         self.request_id_header.as_deref()
+    }
+
+    pub fn with_admission(mut self, admission: astral_types::AuthorizationAdmission) -> Self {
+        self.source_capability = SourceMutationCapability::user(admission);
+        self
+    }
+
+    pub(crate) fn source_capability(&self) -> &SourceMutationCapability {
+        &self.source_capability
     }
 }
 
@@ -325,11 +342,25 @@ pub struct DelegationViewRecord {
 
 pub struct SqlxDelegationRepository {
     db: MySqlPool,
+    delivery_context: Option<Arc<InvalidationDeliveryContext>>,
 }
 
 impl SqlxDelegationRepository {
     pub fn new(db: MySqlPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            delivery_context: None,
+        }
+    }
+
+    pub fn new_with_delivery_context(
+        db: MySqlPool,
+        delivery_context: Arc<InvalidationDeliveryContext>,
+    ) -> Self {
+        Self {
+            db,
+            delivery_context: Some(delivery_context),
+        }
     }
 }
 
@@ -1103,10 +1134,6 @@ fn assert_head_matches_locked_source(
     Ok(())
 }
 
-fn rule_ids_of(rows: &[LockedDelegationRuleRow]) -> Vec<i64> {
-    rows.iter().map(|row| row.rule_id).collect()
-}
-
 #[derive(Debug, Clone, Copy)]
 struct DelegationAudit<'a> {
     delegation_id: i64,
@@ -1226,7 +1253,12 @@ impl DelegationRepository for SqlxDelegationRepository {
         new: &NewDelegation,
         context: &DelegationMutationContext,
     ) -> Result<DelegationCreateResult, AstralError> {
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            context.source_capability(),
+            self.delivery_context.as_ref(),
+        )
+        .await?;
         let now_ts = db_now_in_tx(&mut tx).await?;
         require_future_expiry(now_ts, new.effective_until_ts)?;
         // 同卡自委显式拒绝：先于任何锁/durable 写入的纯判定。
@@ -1357,37 +1389,12 @@ impl DelegationRepository for SqlxDelegationRepository {
                     record.delegation_id
                 )));
             };
-            let head_revision = head
-                .as_ref()
-                .map(|snapshot| snapshot.entry.revision.value());
-            let rule_ids_vec = rule_ids_of(&rules);
-            insert_delegation_audit_in_tx(
-                &mut tx,
-                &DelegationAuditActor::from(context),
-                DelegationAudit {
-                    delegation_id: record.delegation_id,
-                    delegator_card_id: record.delegator_card_id,
-                    delegate_card_id: record.delegate_card_id,
-                    resource_type: &record.resource_type,
-                    action_code: &record.action_code,
-                    effective_until_ts: record.effective_until_ts,
-                    event_type: "DELEGATION_IDEMPOTENT",
-                    operation_id: &derive_delegation_operation_id(
-                        DelegationMutationKind::Create,
-                        record.delegation_id,
-                        context.request_id_header(),
-                        None,
-                    )?,
-                    parent_event_id: None,
-                    contribution_event_id: None,
-                    rule_ids: &rule_ids_vec,
-                    grant_id: Some(&grant_id.as_str()),
-                    before_image_digest_hex: None,
-                    ledger_revision: head_revision,
-                },
-            )
-            .await?;
-            tx.commit_consuming().await?;
+            // A duplicate reuses an already-proven ACTIVE source row; it creates
+            // no source mutation, projection, or grant delta. Roll back this
+            // read/lock transaction instead of staging an empty AuthorizationSource
+            // commit (which cannot close the new reservation). The admission owner
+            // must close that reservation through its safe abort path.
+            tx.rollback_consuming().await?;
             return Ok(DelegationCreateResult {
                 delegation_id: record.delegation_id,
                 created: false,
@@ -1534,11 +1541,16 @@ impl DelegationRepository for SqlxDelegationRepository {
         delegation_id: i64,
         context: &DelegationMutationContext,
     ) -> Result<DelegationMutationResult, AstralError> {
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            context.source_capability(),
+            self.delivery_context.as_ref(),
+        )
+        .await?;
         // 无锁预读：仅为在卡锁之前发现 delegator/delegate 端点；最终事实以
         // FOR UPDATE 复读为准，端点漂移整体 fail-closed。
         let Some(probe) = probe_delegation_in_tx(&mut tx, delegation_id).await? else {
-            tx.commit_consuming().await?;
+            tx.rollback_consuming().await?;
             return Ok(DelegationMutationResult {
                 changed: false,
                 delegate_card_id: None,
@@ -1559,14 +1571,14 @@ impl DelegationRepository for SqlxDelegationRepository {
         // 锁序第 2 步：delegation 行。缺失或非 ACTIVE 一律显式 no-op（重复撤销
         // 不生成新身份、不追加第二条 tombstone）。
         let Some(record) = lock_delegation_in_tx(&mut tx, delegation_id).await? else {
-            tx.commit_consuming().await?;
+            tx.rollback_consuming().await?;
             return Ok(DelegationMutationResult {
                 changed: false,
                 delegate_card_id: None,
             });
         };
         if record.status != "ACTIVE" {
-            tx.commit_consuming().await?;
+            tx.rollback_consuming().await?;
             return Ok(DelegationMutationResult {
                 changed: false,
                 delegate_card_id: None,
@@ -1738,7 +1750,12 @@ impl DelegationRepository for SqlxDelegationRepository {
         effective_until_ts: i64,
         context: &DelegationMutationContext,
     ) -> Result<DelegationMutationResult, AstralError> {
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            context.source_capability(),
+            self.delivery_context.as_ref(),
+        )
+        .await?;
         let now_ts = db_now_in_tx(&mut tx).await?;
         require_future_expiry(now_ts, effective_until_ts)?;
 
@@ -1758,7 +1775,7 @@ impl DelegationRepository for SqlxDelegationRepository {
         // 无锁预读：仅为在卡锁之前发现 delegator/delegate 端点；事实以 FOR UPDATE
         // 复读为准，端点漂移整体 fail-closed。
         let Some(probe) = probe_delegation_in_tx(&mut tx, delegation_id).await? else {
-            tx.commit_consuming().await?;
+            tx.rollback_consuming().await?;
             return Ok(DelegationMutationResult {
                 changed: false,
                 delegate_card_id: None,
@@ -1777,14 +1794,14 @@ impl DelegationRepository for SqlxDelegationRepository {
         }
         // 锁序第 2 步：delegation 行；缺失或非 ACTIVE 显式 no-op。
         let Some(record) = lock_delegation_in_tx(&mut tx, delegation_id).await? else {
-            tx.commit_consuming().await?;
+            tx.rollback_consuming().await?;
             return Ok(DelegationMutationResult {
                 changed: false,
                 delegate_card_id: None,
             });
         };
         if record.status != "ACTIVE" {
-            tx.commit_consuming().await?;
+            tx.rollback_consuming().await?;
             return Ok(DelegationMutationResult {
                 changed: false,
                 delegate_card_id: None,
@@ -2073,7 +2090,13 @@ impl DelegationRepository for SqlxDelegationRepository {
                 "delegation expiry reconciliation requires a positive delegation id, got {delegation_id}"
             )));
         }
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let capability = SourceMutationCapability::System;
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )
+        .await?;
         // 无锁预读：仅为在卡锁之前发现 delegator/delegate 端点（全局锁序要求
         // user_card 先于 permission_delegation 锁）；事实以 FOR UPDATE 复读为准，
         // 端点漂移整体 fail-closed。
@@ -2714,6 +2737,23 @@ mod tests {
         assert!(create_body.contains("classify_idempotent_consistency"));
         assert!(create_body.contains("repair required"));
         assert!(create_body.contains("next_delta_version(None)"));
+
+        // A consistent duplicate creates no source evidence. It must preserve
+        // created=false while rolling back, never empty-committing the fresh
+        // AuthorizationSource reservation or appending a fake delta/audit write.
+        let duplicate_branch = create_body
+            .split("if let Some(record) = existing_delegation")
+            .nth(1)
+            .and_then(|body| {
+                body.split("// 锁序第 3 步：INSERT permission_delegation")
+                    .next()
+            })
+            .expect("duplicate branch must remain bounded before source insertion");
+        assert!(duplicate_branch.contains("tx.rollback_consuming().await?"));
+        assert!(duplicate_branch.contains("created: false"));
+        assert!(!duplicate_branch.contains("tx.commit_consuming()"));
+        assert!(!duplicate_branch.contains("append_delegation_grant_delta_in_tx"));
+        assert!(!duplicate_branch.contains("insert_delegation_audit_in_tx"));
     }
 
     // ── 委托人持有权证明（V2 修复）纯判定测试 ──────────────────────────────

@@ -8,12 +8,16 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+use astral_db::invalidation_delivery as delivery;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::MySqlPool;
 use thiserror::Error;
 
-use astral_types::{PublicationStamp, PublishedEvidenceAggregate, AUTHORIZATION_EDITION};
+use astral_types::{
+    AuthorizationMessageMetadata, PublicationStamp, PublishedEvidenceAggregate,
+    AUTHORIZATION_EDITION,
+};
 
 use crate::envelope::MessageEnvelope;
 use crate::error::MqError;
@@ -270,6 +274,19 @@ impl InvalidationEvent {
         operation_id: impl Into<String>,
         origin_region: impl Into<String>,
     ) -> Result<MessageEnvelope, InvalidationContractError> {
+        self.to_envelope_with_authority_metadata(message_id, operation_id, origin_region, None)
+    }
+
+    /// Build an envelope with independently serialized, proof-derived authority
+    /// provenance. The metadata is optional only for invalidation families that
+    /// are not sourced from a verified authorization admission.
+    pub fn to_envelope_with_authority_metadata(
+        &self,
+        message_id: impl Into<String>,
+        operation_id: impl Into<String>,
+        origin_region: impl Into<String>,
+        authority_metadata: Option<AuthorizationMessageMetadata>,
+    ) -> Result<MessageEnvelope, InvalidationContractError> {
         self.validate()?;
         let message_id = message_id.into();
         let operation_id = operation_id.into();
@@ -285,6 +302,9 @@ impl InvalidationEvent {
         .map_err(InvalidationContractError::InvalidEnvelope)?;
         envelope.tenant_id = self.tenant_id();
         envelope.ordering_key = Some(self.ordering_key());
+        if let Some(metadata) = authority_metadata {
+            envelope.authority_metadata = Some(metadata);
+        }
         envelope
             .validate()
             .map_err(InvalidationContractError::InvalidEnvelope)?;
@@ -360,12 +380,33 @@ pub enum InvalidationAppendError {
     Contract(#[from] InvalidationContractError),
     #[error("invalid invalidation outbox append: {0}")]
     Database(#[from] astral_db::LocalMessageError),
+    #[error("invalid invalidation delivery staging: {0}")]
+    Delivery(#[from] delivery::InvalidationDeliveryError),
+}
+
+/// Append an invalidation and its recipient-specific immutable journal in the
+/// caller's existing source transaction. The context is startup-frozen; no
+/// environment, mutable roster, network, or broker access occurs here.
+pub async fn append_invalidation_with_delivery_context_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    event: &InvalidationEvent,
+    message_id: &str,
+    operation_id: &str,
+    origin_region: &str,
+    delivery: &delivery::InvalidationDeliveryContext,
+) -> Result<astral_db::LocalMessageAppend, InvalidationAppendError> {
+    let appended =
+        append_invalidation_in_tx(tx, event, message_id, operation_id, origin_region).await?;
+    delivery::stage_invalidation_delivery_with_context_in_tx(tx, delivery, message_id).await?;
+    Ok(appended)
 }
 
 /// Append an invalidation envelope to the caller's existing source
 /// transaction. The function never commits or publishes to a broker; the caller
 /// owns the transaction boundary and must send any fanout only after a proven
-/// commit.
+/// commit. New source writers should use
+/// [`append_invalidation_with_delivery_context_in_tx`] so the immutable delivery
+/// journal is staged in the same transaction.
 pub async fn append_invalidation_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     event: &InvalidationEvent,
@@ -376,6 +417,9 @@ pub async fn append_invalidation_in_tx(
     let envelope = event.to_envelope(message_id, operation_id, origin_region)?;
     let payload_json = envelope
         .envelope_json()
+        .map_err(InvalidationContractError::Serialization)?;
+    let authority_metadata_json = envelope
+        .authority_metadata_json()
         .map_err(InvalidationContractError::Serialization)?;
     let input = astral_db::LocalMessageInput {
         message_id: &envelope.message_id,
@@ -389,6 +433,7 @@ pub async fn append_invalidation_in_tx(
         schema_version: envelope.schema_version,
         payload_json: &payload_json,
         headers_json: None,
+        authority_metadata_json: authority_metadata_json.as_deref(),
         payload_sha256: &envelope.payload_sha256,
     };
     Ok(astral_db::append_in_tx(tx, &input).await?)
@@ -738,6 +783,37 @@ pub async fn append_session_revocation_shards_in_tx(
     revoked_jtis: &[String],
     base_operation_id: &str,
 ) -> Result<Vec<MessageEnvelope>, InvalidationAppendError> {
+    append_session_revocation_shards_inner_in_tx(tx, user_id, revoked_jtis, base_operation_id, None)
+        .await
+}
+
+/// Append bounded SESSION_REVOKED shards and stage every recipient leg in the
+/// same source transaction. The returned envelopes are the exact committed
+/// bytes used by the post-commit acceleration path.
+pub async fn append_session_revocation_shards_with_delivery_context_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: i64,
+    revoked_jtis: &[String],
+    base_operation_id: &str,
+    delivery: &delivery::InvalidationDeliveryContext,
+) -> Result<Vec<MessageEnvelope>, InvalidationAppendError> {
+    append_session_revocation_shards_inner_in_tx(
+        tx,
+        user_id,
+        revoked_jtis,
+        base_operation_id,
+        Some(delivery),
+    )
+    .await
+}
+
+async fn append_session_revocation_shards_inner_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: i64,
+    revoked_jtis: &[String],
+    base_operation_id: &str,
+    delivery: Option<&delivery::InvalidationDeliveryContext>,
+) -> Result<Vec<MessageEnvelope>, InvalidationAppendError> {
     let origin_region = origin_region()?;
     let shards = plan_session_revocation_shards(user_id, revoked_jtis, base_operation_id)?;
     let mut envelopes = Vec::with_capacity(shards.len());
@@ -753,6 +829,9 @@ pub async fn append_session_revocation_shards_in_tx(
         let payload_json = envelope
             .envelope_json()
             .map_err(InvalidationContractError::Serialization)?;
+        let authority_metadata_json = envelope
+            .authority_metadata_json()
+            .map_err(InvalidationContractError::Serialization)?;
         let input = astral_db::LocalMessageInput {
             message_id: &envelope.message_id,
             operation_id: &envelope.operation_id,
@@ -765,9 +844,18 @@ pub async fn append_session_revocation_shards_in_tx(
             schema_version: envelope.schema_version,
             payload_json: &payload_json,
             headers_json: None,
+            authority_metadata_json: authority_metadata_json.as_deref(),
             payload_sha256: &envelope.payload_sha256,
         };
         astral_db::append_in_tx(tx, &input).await?;
+        if let Some(delivery) = delivery {
+            delivery::stage_invalidation_delivery_with_context_in_tx(
+                tx,
+                delivery,
+                &envelope.message_id,
+            )
+            .await?;
+        }
         envelopes.push(envelope);
     }
     Ok(envelopes)

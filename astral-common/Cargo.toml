@@ -37,6 +37,15 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 uuid = { workspace = true }
 
+# 生产投递（delivery）：durable intent 存储、SMTP 传输与 HTTPS 中继传输。
+# 全部依赖已在 workspace Cargo.lock 中锁定（reqwest rustls 链路），仅新增直接边。
+sqlx = { workspace = true }
+base64 = "0.22"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = "0.26"
+rustls-native-certs = "0.8"
+ring = "0.17"
+
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }

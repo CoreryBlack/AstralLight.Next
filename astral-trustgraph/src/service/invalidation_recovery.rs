@@ -1,12 +1,11 @@
-//! IN_DOUBT 失效恢复运维闭环（当前阶段：只读 inspect + 写路径显式拒绝）。
+//! IN_DOUBT 失效恢复运维闭环。
 //!
 //! 背景：[`astral_db::LocalMessageRepository`] 的 `load_in_doubt` /
-//! `reconcile_in_doubt` 目前没有 production caller。IN_DOUBT 行在
-//! per-scope FIFO 中属于未终态行（claim guard 只放行 prior 状态为
-//! `PROCESSED`/`QUARANTINED` 之外的阻塞语义），会持续阻断同一
-//! `(queue_name, ordering_key)` scope 的后续 notify 投递，需要一条
-//! 安全的运维闭环。本模块就是这条闭环的 service 层，配套 CLI 见
-//! `astral-trustgraph/src/bin/invalidation_recovery.rs`。
+//! `reconcile_in_doubt` 负责 durable row 的 exact identity/CAS。读路径由
+//! 本模块提供 bounded inspect；写路径只通过
+//! [`reconcile_in_doubt_authorized`] 暴露，并要求上游已认证边界铸造的
+//! operator capability。standalone CLI 没有该 capability，因此仍保持
+//! settle BLOCKED，不形成匿名数据库写入口。
 //!
 //! 模块边界（对齐 AGENTS §0C/§3.4 与 §7.1 状态词汇）：
 //!
@@ -38,7 +37,10 @@
 //! - **无自由文本 reason 通道**：CLI 不接受 `--reason` 之类自由文本
 //!   （secret 泄露面），所有输出 reason 使用稳定机器 code。
 
-use astral_db::{LocalMessageError, LocalMessageRepository, LocalMessageRow};
+use astral_db::{
+    InDoubtDecision, InDoubtReconcileOutcome, InDoubtReconciliation, InDoubtRecoveryAuthorization,
+    LocalMessageError, LocalMessageRepository, LocalMessageRow,
+};
 use serde_json::{json, Value};
 use time::PrimitiveDateTime;
 
@@ -50,8 +52,8 @@ pub const MAX_MESSAGE_ID_LEN: usize = 128;
 pub const MAX_OPERATION_ID_LEN: usize = 128;
 pub const MAX_MESSAGE_TYPE_LEN: usize = 64;
 pub const MAX_QUEUE_NAME_LEN: usize = 128;
-/// operator 审批 run 引用的上限（runbook 语义由主 Agent 登记）。
-pub const MAX_RUN_ID_LEN: usize = 128;
+/// operator 审批 run 引用的上限；与 `audit_log.request_id VARCHAR(64)` 一致。
+pub const MAX_RUN_ID_LEN: usize = 64;
 
 /// 稳定机器 reason code（对外输出唯一事实，禁止自由文本）。
 pub const REASON_INVALID_ARGUMENTS: &str = "INVALID_ARGUMENTS";
@@ -211,7 +213,19 @@ impl SettleDecision {
     }
 }
 
-/// 一次 settle 请求（shape 合法）；策略门在零 I/O 下拒绝它。
+/// Authenticated operator recovery request. The caller must have already
+/// established the administrative authorization; this service only enforces
+/// that the CLI/request provenance and capability refer to the same run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedSettleRequest {
+    pub decision: SettleDecision,
+    pub provenance: QuarantineProvenance,
+    pub run_id: String,
+    pub authorization: InDoubtRecoveryAuthorization,
+}
+
+/// One settle request (shape-valid); the standalone CLI strategy gate rejects
+/// it because it cannot mint [`InDoubtRecoveryAuthorization`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettleRequest {
     pub decision: SettleDecision,
@@ -356,6 +370,40 @@ fn validate_sha256_hex(name: &str, value: &str) -> Result<(), RecoveryOpError> {
         )));
     }
     Ok(())
+}
+
+/// Reconcile an IN_DOUBT row after the caller's authenticated boundary has
+/// authorized the explicit decision. The repository performs exact provenance
+/// matching, same-transaction audit insertion and status CAS. This function
+/// does not retry unknown outcomes and never dispatches a message.
+pub async fn reconcile_in_doubt_authorized(
+    repo: &LocalMessageRepository,
+    request: AuthorizedSettleRequest,
+) -> Result<InDoubtReconcileOutcome, LocalMessageError> {
+    if request.run_id != request.authorization.run_id {
+        return Err(LocalMessageError::Validation(
+            "recovery request and operator capability use different run ids".into(),
+        ));
+    }
+    request.provenance.validate_shape().map_err(|error| {
+        LocalMessageError::Validation(format!("recovery provenance shape invalid: {error}"))
+    })?;
+    let reconciliation = InDoubtReconciliation {
+        message_id: &request.provenance.message_id,
+        operation_id: &request.provenance.operation_id,
+        message_type: &request.provenance.message_type,
+        queue_name: &request.provenance.queue_name,
+        payload_sha256: &request.provenance.payload_sha256,
+    };
+    repo.reconcile_in_doubt_authorized(
+        &reconciliation,
+        match request.decision {
+            SettleDecision::Requeue => InDoubtDecision::Requeue,
+            SettleDecision::Quarantine => InDoubtDecision::Quarantine,
+        },
+        &request.authorization,
+    )
+    .await
 }
 
 /// 只读 exact IN_DOUBT load：本模块唯一的 DB 访问面，实际调用
@@ -589,6 +637,7 @@ mod tests {
             schema_version: 1,
             payload_json: "{}".into(),
             headers_json: None,
+            authority_metadata_json: None,
             payload_sha256: "0".repeat(64),
             status: IN_DOUBT_STATUS.into(),
             attempts: 2,

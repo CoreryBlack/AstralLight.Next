@@ -12,8 +12,14 @@
 
 use async_trait::async_trait;
 use sqlx::{MySqlPool, QueryBuilder};
+use std::sync::Arc;
 
-use astral_types::{AstralError, ProjectionAggregate, EVENT_TYPE_RULE_SET_UPDATE, SYSTEM_ACTOR_ID};
+use astral_db::invalidation_delivery::InvalidationDeliveryContext;
+
+use astral_types::{
+    AstralError, AuthorizationAdmission, ProjectionAggregate, EVENT_TYPE_RULE_SET_UPDATE,
+    SYSTEM_ACTOR_ID,
+};
 
 use crate::repository::audit_log_repository::{
     insert_rule_set_projection_audit_in_tx, insert_user_card_cascade_audit_in_tx,
@@ -21,8 +27,9 @@ use crate::repository::audit_log_repository::{
     UserCardCascadeAuditEntry, UserCardCascadeRulesetAudit,
 };
 use crate::repository::authorization_source_transaction::{
-    append_eligibility_projection_with_invalidation_in_tx, AuthorizationSourceTransaction,
-    CommittedProjectionReceipts,
+    append_eligibility_projection_with_invalidation_in_tx,
+    begin_source_transaction_with_capability_and_optional_delivery_context,
+    CommittedProjectionReceipts, SourceMutationCapability,
 };
 use crate::repository::delegation_repository::{
     require_provable_expiry, DelegationRecord, DELEGATION_SELECT,
@@ -47,6 +54,8 @@ use crate::repository::rule_set_repository::{
     append_card_cascade_ruleset_removals_in_tx, append_card_create_ruleset_entry_adds_in_tx,
     ensure_rule_set_projection_in_tx, validate_binding_tenants,
 };
+
+mod create;
 
 /// 用户卡记录（含 LEFT JOIN 展示字段 + action_codes 摘要）
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -99,10 +108,9 @@ pub struct NewUserCard {
     /// 可选的请求级 operation id（Gateway `x-request-id`）。
     ///
     /// 显式携带时先通过统一持久化安全校验（不安全 header Validation fail-closed），
-    /// 通过后作为本次创建全部账本/投影/审计事件的 stable operation id；缺失或空白
-    /// 时以锁定中的 durable 代次确定性派生（见
-    /// `derive_create_card_template_operation_id`），随机 fallback 永不允许进入
-    /// 账本事件链。identity starter 的无模板路径只用它做 legacy correlation。
+    /// 通过后作为本次创建全部账本/投影/审计事件的 stable operation id；缺失时沿用
+    /// proof-bound admission 的 operation id，随机 fallback 永不允许进入账本事件链。
+    /// identity starter 的无模板路径只用它做 legacy correlation。
     pub request_operation_id: Option<String>,
 }
 
@@ -556,6 +564,7 @@ async fn insert_user_card_restore_audit_in_tx(
 /// head 的最大 source_generation（缺失 head 按 0 计）；事务回滚后重试时 source 插入
 /// 与 head 代次一并还原，派生值逐字节一致，重放得到同一身份；提交成功后不可能为
 /// 同一 card 再次执行，AUTO_INCREMENT 回滚不复用保证不同请求必然分叉。
+#[cfg(test)]
 fn derive_create_card_template_operation_id(
     card_id: i64,
     template_id: i64,
@@ -567,6 +576,7 @@ fn derive_create_card_template_operation_id(
 /// 无模板绑定路径的稳定 operation id（纯函数）：`user-card:create:{card_id}`。
 /// 该路径不物化任何账本贡献，id 只用于 CARD_CREATED / ELIGIBILITY outbox 元数据
 /// 与后续审计 correlation。
+#[cfg(test)]
 fn derive_create_card_plain_operation_id(card_id: i64) -> String {
     format!("user-card:create:{card_id}")
 }
@@ -574,7 +584,7 @@ fn derive_create_card_plain_operation_id(card_id: i64) -> String {
 /// restore 路径的稳定 operation id（纯函数）：`user-card:restore:{card_id}`。
 /// 该路径不物化任何账本贡献（恢复绝不隐式复活授权，语义见 `restore_card`），
 /// id 只用于 CARD_RESTORED / ELIGIBILITY outbox 元数据与后续审计 correlation，
-/// 与 [`derive_create_card_plain_operation_id`] 同一契约。
+/// 与创建卡 operation identity 使用同一 `user-card:create:{card_id}` 命名空间。
 fn derive_restore_card_operation_id(card_id: i64) -> String {
     format!("user-card:restore:{card_id}")
 }
@@ -1154,7 +1164,11 @@ pub trait UserCardRepository: Send + Sync {
     ) -> Result<Vec<UserCardRecord>, AstralError>;
     async fn get_card(&self, card_id: i64) -> Result<Option<UserCardRecord>, AstralError>;
     /// 新建卡 + 绑定模板规则集（BASE），返回新 card_id
-    async fn create_card(&self, new: &NewUserCard) -> Result<i64, AstralError>;
+    async fn create_card(
+        &self,
+        new: &NewUserCard,
+        admission: AuthorizationAdmission,
+    ) -> Result<i64, AstralError>;
     /// 部分更新（card_status / priority / is_primary / level_id）
     ///
     /// 状态变更是授权 source mutation：补丁必须携带 Gateway 已验证的正数
@@ -1163,29 +1177,59 @@ pub trait UserCardRepository: Send + Sync {
     /// 任何把卡送回 ACTIVE 的迁移、未知状态或不可归属的调用者一律
     /// fail-closed 拒绝；离开 ACTIVE 时同事务落带元数据的 CARD REVOKE 投影
     /// 与审计关联行。
-    async fn update_card(&self, card_id: i64, patch: &UserCardPatch) -> Result<(), AstralError>;
+    async fn update_card(
+        &self,
+        card_id: i64,
+        patch: &UserCardPatch,
+        admission: AuthorizationAdmission,
+    ) -> Result<(), AstralError>;
     /// 级联删除（事务：清理规则/快照/规则集引用 + 软删卡）
-    async fn delete_with_cascade(&self, card_id: i64) -> Result<DeleteCascadeResult, AstralError>;
+    async fn delete_with_cascade(
+        &self,
+        card_id: i64,
+        admission: AuthorizationAdmission,
+    ) -> Result<DeleteCascadeResult, AstralError>;
     /// 恢复已删除卡（DISABLED → ACTIVE），返回是否命中
     ///
     /// 恢复是资格恢复而非授权恢复：级联删除时该卡全部授权贡献已版本化 REMOVE，
     /// restore 绝不隐式复活任何 grant（ALLOW-only，重新授权需要显式的新
     /// revision/mutation）；同事务落带 metadata 的 CARD_RESTORED 投影、
     /// ELIGIBILITY 事件与恢复审计关联行。
-    async fn restore_card(&self, card_id: i64) -> Result<bool, AstralError>;
+    async fn restore_card(
+        &self,
+        card_id: i64,
+        admission: AuthorizationAdmission,
+    ) -> Result<bool, AstralError>;
     /// 绑定单卡（PENDING/INACTIVE → ACTIVE + user_id），返回是否命中。
     ///
     /// 与 [`Self::bind_card_async_one`] 共享 `bind_card_with_reassignment_guard`
     /// 同一受守卫核心：正目标用户校验、锁卡证明候选状态、归属/贡献 fail-closed
     /// 守卫全部先于换主 UPDATE（详见核心函数文档）。
-    async fn bind_card(&self, card_id: i64, user_id: i64) -> Result<bool, AstralError>;
+    async fn bind_card(
+        &self,
+        card_id: i64,
+        user_id: i64,
+        admission: AuthorizationAdmission,
+    ) -> Result<bool, AstralError>;
     /// 异步绑定单卡（PENDING/INACTIVE → ACTIVE + user_id），返回是否命中。
     ///
     /// 与 [`Self::bind_card`] 共享同一受守卫核心；异步批量入口没有任何绕过
     /// 归属/贡献守卫的旁路。
-    async fn bind_card_async_one(&self, card_id: i64, user_id: i64) -> Result<bool, AstralError>;
+    async fn bind_card_async_one(
+        &self,
+        card_id: i64,
+        user_id: i64,
+        admission: AuthorizationAdmission,
+    ) -> Result<bool, AstralError>;
     /// Bind one batch item and atomically commit its source mutation, projection
     /// receipts, and audit correlation. The caller owns post-commit completion.
+    ///
+    /// `admission` is the per-item proof-bound capability: one fresh
+    /// [`AuthorizationAdmission`] handle per item, derived by the service from
+    /// the verified request proof. The item's own source transaction revalidates
+    /// the durable authority frontier and `authorization_authority_proof` row
+    /// before COMMIT and consumes the handle exactly once — an expired or
+    /// rotated authority fails that item closed (no UserPending shortcut).
     #[allow(clippy::too_many_arguments)]
     async fn bind_card_async_batch_item(
         &self,
@@ -1199,6 +1243,7 @@ pub trait UserCardRepository: Send + Sync {
         operation_id: &str,
         expected_tenant_id: i64,
         expected_domain_id: i64,
+        admission: AuthorizationAdmission,
     ) -> Result<Option<CommittedProjectionReceipts>, AstralError>;
     /// 冲突检测：同一用户下同 card_type 不同 template_id 的 ACTIVE 卡（限定管理范围）
     async fn find_conflicts(
@@ -1222,11 +1267,25 @@ struct LockedUpdateCardRow {
 
 pub struct SqlxUserCardRepository {
     db: MySqlPool,
+    delivery_context: Option<Arc<InvalidationDeliveryContext>>,
 }
 
 impl SqlxUserCardRepository {
     pub fn new(db: MySqlPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            delivery_context: None,
+        }
+    }
+
+    pub fn new_with_delivery_context(
+        db: MySqlPool,
+        delivery_context: Arc<InvalidationDeliveryContext>,
+    ) -> Self {
+        Self {
+            db,
+            delivery_context: Some(delivery_context),
+        }
     }
 
     /// 行加载后的 action_codes 批量回填（页内一次 `IN (...)` 查询，无 N+1）。
@@ -1336,276 +1395,20 @@ impl UserCardRepository for SqlxUserCardRepository {
         Ok(record)
     }
 
-    async fn create_card(&self, new: &NewUserCard) -> Result<i64, AstralError> {
-        // ── Phase 0: 纯校验先于任何 durable 写入 ─────────────────────────────
-        // 可选 x-request-id 复用为 durable operation id：不安全 header fail-closed
-        // （与审批/direct 规则路径同一条统一门禁），缺失/空白走确定性派生。
-        let request_operation_id =
-            validated_request_operation_id(new.request_operation_id.as_deref())?;
-        validate_create_card_ledger_scope(new)?;
-        // 租户绑定纯门禁（正数）先于事务：任一创建路径绑定非正数租户一律拒绝。
-        if let Some(tenant_id) = new.tenant_id {
-            validate_create_card_tenant_binding(tenant_id)?;
-        }
-
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
-
-        // 租户绑定存在性证明（fail-closed，先于任何 source 写入）：tenant 行
-        // FOR UPDATE 缺失即 Validation 整体回滚，绝不把 user_card.tenant_id 绑到
-        // 不存在的租户上，也绝不与 delete_tenant 的守卫产生孤儿卡竞态（锁序
-        // tenant 行 → user_card source 行，与 tenant_repository 同向）。
-        if let Some(tenant_id) = new.tenant_id {
-            let locked_tenant: Option<(i64,)> = sqlx::query_as(CREATE_CARD_TENANT_LOCK_SQL)
-                .bind(tenant_id)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(db_error)?;
-            if locked_tenant.is_none() {
-                return Err(AstralError::Validation(format!(
-                    "create card requires an existing tenant: tenant {tenant_id} not found; \
-                     refusing to bind user_card.tenant_id to a missing tenant"
-                )));
-            }
-        }
-        let result = sqlx::query(
-            "INSERT INTO user_card \
-             (user_id, domain_id, card_type, card_status, template_id, level_id, priority, is_primary, tenant_id) \
-             VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?)",
-        )
-        .bind(new.user_id)
-        .bind(new.domain_id)
-        .bind(&new.card_type)
-        .bind(new.template_id)
-        .bind(new.level_id)
-        .bind(new.priority)
-        .bind(new.is_primary)
-        .bind(new.tenant_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(db_error)?;
-        // 新建卡主键是本事务拥有的 source 身份事实；不可用即持久层异常，整体拒绝。
-        if result.last_insert_id() == 0 {
-            return Err(AstralError::Internal(
-                "user_card insert returned an unusable id".into(),
-            ));
-        }
-        let new_id = result.last_insert_id() as i64;
-
-        // 模板绑定失败必须回滚创建，避免卡片处于无授权规则集的半完成状态。
-        // 模板路径贯穿账本/审计的 operation id 捕获到外层变量，供同事务的
-        // ELIGIBILITY durable invalidation intent 复用同一源 mutation 身份。
-        let mut template_path_operation_id: Option<String> = None;
-        if let Some(template_id) = new.template_id {
-            // 锁定集合与代次捕获（单语句，rule_set_id 升序）：source 行与其投影 head
-            // 一并 FOR UPDATE —— 与后续 ensure/rebuild 写入同一取锁方向，binding-side
-            // 家族（user_card → rule_set/head → refs/entries）之间无反向锁序。
-            let locked_rule_sets: Vec<LockedTemplateRuleSetRow> = sqlx::query_as(
-                "SELECT rs.rule_set_id AS rule_set_id, rs.tenant_id AS tenant_id, \
-                 h.source_generation AS source_generation \
-                 FROM rule_set rs \
-                 LEFT JOIN authorization_projection_head h \
-                   ON h.aggregate_type = 'RULE_SET' AND h.aggregate_id = rs.rule_set_id \
-                 WHERE rs.source_type = 'TEMPLATE' AND rs.source_id = ? AND rs.enabled = 1 \
-                 ORDER BY rs.rule_set_id ASC FOR UPDATE",
-            )
-            .bind(template_id)
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(db_error)?;
-            ensure_unique_template_rule_set_ids(&locked_rule_sets)?;
-            for row in &locked_rule_sets {
-                // Reject one-sided tenant scopes before any durable write; the
-                // enclosing transaction rolls back the new card if any template
-                // RuleSet is not in the same scope.
-                validate_binding_tenants(row.tenant_id, new.tenant_id)?;
-            }
-            // Operation identity（首个 ledger/outbox/audit 写之前确定）：显式请求
-            // id 原样贯穿，否则以锁定的最大 RULE_SET 代次确定性派生。
-            let operation_id = request_operation_id.unwrap_or_else(|| {
-                let locked_ruleset_generation = locked_rule_sets
-                    .iter()
-                    .filter_map(|row| row.source_generation)
-                    .max()
-                    .unwrap_or(0);
-                derive_create_card_template_operation_id(
-                    new_id,
-                    template_id,
-                    locked_ruleset_generation,
-                )
-            });
-            template_path_operation_id = Some(operation_id.clone());
-            let context = RuleSetMutationContext::system(&operation_id)?;
-
-            // ── CARD parent：单张带 actor/operation 元数据的 CARD_CREATED 事件 ──
-            // 其 durable 身份作为本卡全部模板绑定 ADD 贡献的 generation/fence 锚点；
-            // 不再逐绑定追加 RULE_SET_BOUND 父事件（避免旧 worker 额外重建）。
-            let parent_projection = append_card_projection_with_metadata_in_tx(
-                &mut tx,
-                new_id,
-                "CARD_CREATED",
-                astral_db::ProjectionEventMetadata {
-                    actor_id: SYSTEM_ACTOR_ID,
-                    operation_id: &operation_id,
-                },
-            )
-            .await?;
-
-            for row in &locked_rule_sets {
-                // Sources are locked by RuleSet id; prove each RuleSet before its reference.
-                ensure_rule_set_projection_in_tx(
-                    &mut tx,
-                    row.rule_set_id,
-                    row.tenant_id,
-                    SYSTEM_ACTOR_ID,
-                    &operation_id,
-                )
-                .await?;
-                // 严格 ref 主键捕获：普通 INSERT（非 IGNORE）。新卡在本事务内不可能
-                // 已有 ref —— IGNORE 命中旧行或拿不到可用主键都说明不变量已被破坏，
-                // 必须整体失败而不是猜测 ref_id=0 或静默复用未知旧绑定。
-                let inserted_ref = sqlx::query(
-                    "INSERT INTO card_rule_set_ref \
-                     (card_id, rule_set_id, ref_type, tenant_id) VALUES (?, ?, 'BASE', ?)",
-                )
-                .bind(new_id)
-                .bind(row.rule_set_id)
-                .bind(new.tenant_id)
-                .execute(&mut **tx)
-                .await
-                .map_err(db_error)?;
-                let ref_id = i64::try_from(inserted_ref.last_insert_id())
-                    .ok()
-                    .filter(|id| *id > 0)
-                    .ok_or_else(|| {
-                        AstralError::Internal(
-                            "card_rule_set_ref insert returned an unusable id".into(),
-                        )
-                    })?;
-                // 绑定本身是一次 RuleSet 授权语义变更：RULE_SET 投影事件 + BIND_CARD
-                // 审计与标准 bind_card 同语义（缓存失效/快照重建契约一致）。
-                let rule_projection = append_rule_set_projection_in_tx(
-                    &mut tx,
-                    row.rule_set_id,
-                    EVENT_TYPE_RULE_SET_UPDATE,
-                    astral_db::ProjectionEventMetadata {
-                        actor_id: SYSTEM_ACTOR_ID,
-                        operation_id: &operation_id,
-                    },
-                )
-                .await?;
-                // enabled+ALLOW 条目的标准 ADD 物化（rev1 base0→target1）；空 RuleSet
-                // 合法返回空贡献集。贡献以 entry×card×ref 维度派生独立稳定事件号，
-                // 不复用父事件号触发 uk_ade_event。
-                let addition = append_card_create_ruleset_entry_adds_in_tx(
-                    &mut tx,
-                    row.rule_set_id,
-                    &parent_projection,
-                    &context,
-                    ref_id,
-                    new_id,
-                    new.user_id.unwrap_or_default(),
-                    new.tenant_id.unwrap_or_default(),
-                    new.domain_id,
-                    "BASE",
-                )
-                .await?;
-
-                // BIND_CARD 审计关联面（同事务、序列化/DB 错误一律上抛回滚）：
-                // parent CARD 事件、模板/租户/卡/ref 维度与全部贡献事件号可追溯。
-                let addition_detail = serde_json::json!({
-                    "cardId": new_id,
-                    "tenantId": new.tenant_id,
-                    "templateId": template_id,
-                    "refId": ref_id,
-                    "refType": "BASE",
-                    "parentSourceEventId": parent_projection.event_id,
-                    "contributionEventIds": addition
-                        .added_entries
-                        .iter()
-                        .map(|entry| entry.event_id.as_str())
-                        .collect::<Vec<_>>(),
-                    "ruleSetEntryIds": addition
-                        .added_entries
-                        .iter()
-                        .map(|entry| entry.entry_id)
-                        .collect::<Vec<_>>(),
-                    "boundCardIds": [new_id],
-                    "bindingRefIds": [ref_id],
-                });
-                insert_rule_set_projection_audit_in_tx(
-                    &mut tx,
-                    &RuleSetProjectionAuditEntry {
-                        rule_set_id: row.rule_set_id,
-                        entry_id: None,
-                        aggregate_type: ProjectionAggregate::RuleSet.as_str(),
-                        aggregate_id: row.rule_set_id,
-                        event_id: &rule_projection.event_id,
-                        source_generation: rule_projection.source_generation,
-                        operation_id: &operation_id,
-                        actor_id: SYSTEM_ACTOR_ID,
-                        change_type: "BIND_CARD",
-                        old_value_json: None,
-                        new_value_json: Some(&addition_detail.to_string()),
-                        tenant_id: rule_projection.tenant_id,
-                    },
-                )
-                .await?;
-            }
-        }
-
-        // 无模板路径：不物化任何账本贡献，但仍写一张带 operation 元数据的
-        // CARD_CREATED 父事件（outbox correlation 契约对全部创建路径一致）。
-        // 模板路径的 CARD_CREATED 已在上方绑定循环前写入，这里不再重复。
-        if new.template_id.is_none() {
-            let plain_operation_id = derive_create_card_plain_operation_id(new_id);
-            append_card_projection_with_metadata_in_tx(
-                &mut tx,
-                new_id,
-                "CARD_CREATED",
-                astral_db::ProjectionEventMetadata {
-                    actor_id: SYSTEM_ACTOR_ID,
-                    operation_id: &plain_operation_id,
-                },
-            )
-            .await?;
-        }
-        // 既有 ELIGIBILITY 语义保持：独立轻量资格通道（推进 ELIGIBILITY head，
-        // 不重建规则快照、不发 CARD refresh）与其 durable invalidation intent
-        // （ELIGIBILITY_INVALIDATED 同事务落 al_message_outbox）成对落库；
-        // commit 证明后直投失效通知，commit 未知绝不发送。失效身份与其所属
-        // create 路径贯穿同一稳定 operation id（模板路径 = 账本/审计身份，
-        // 无模板路径 = plain 派生），确定性派生，随机 fallback 绝不进入事件链。
-        let eligibility_operation_id = template_path_operation_id
-            .unwrap_or_else(|| derive_create_card_plain_operation_id(new_id));
-        append_eligibility_projection_with_invalidation_in_tx(
-            &mut tx,
-            new_id,
-            &eligibility_operation_id,
-        )
-        .await?;
-        tx.commit_consuming().await?;
-        Ok(new_id)
+    async fn create_card(
+        &self,
+        new: &NewUserCard,
+        admission: AuthorizationAdmission,
+    ) -> Result<i64, AstralError> {
+        create::create_card(self, new, admission).await
     }
 
-    /// 部分更新（card_status / priority / is_primary / level_id）。
-    ///
-    /// 加固契约（授权 source mutation，五链审查见模块内状态机文档）：
-    /// - Phase 0 纯校验先于任何 durable 写入：目标状态 canonical 字母表、显式
-    ///   `x-request-id` 统一安全门禁、携带状态的补丁必须带正数 actor
-    ///   （Gateway 已验证的 `x-user-id`，由 handler 传播；缺失/非正数整体拒绝，
-    ///   绝不以系统身份冒充人类操作者）；
-    /// - 状态迁移只认事务内 `FOR UPDATE` 锁定行的当前状态，经
-    ///   `validate_card_status_transition` 状态机判定 —— 本入口只能离开
-    ///   ACTIVE，任何把卡送回 ACTIVE 的请求整体拒绝（restore/bind 专用入口
-    ///   之外的授权恢复旁路不存在）；
-    /// - 离开 ACTIVE 的迁移（停用/吊销/挂起）走加固路径：以锁定 CARD head
-    ///   代次确定性派生（或复用已校验的显式）稳定 operation id，CARD REVOKE
-    ///   投影事件带 actor/operation 元数据落库，ELIGIBILITY 资格事件同事务，
-    ///   审计关联行（`audit_log`，event_type `USER_CARD_MUTATION`）同事务落库
-    ///   —— 任一失败整体回滚，绝不只写旧链或只写审计；
-    /// - 非状态字段更新保持既有语义：legacy `CARD_UPDATE` 投影 +
-    ///   条件性 ELIGIBILITY 事件，同一事务。
-    async fn update_card(&self, card_id: i64, patch: &UserCardPatch) -> Result<(), AstralError> {
+    async fn update_card(
+        &self,
+        card_id: i64,
+        patch: &UserCardPatch,
+        admission: AuthorizationAdmission,
+    ) -> Result<(), AstralError> {
         // ── Phase 0: 纯校验先于任何 durable 写入 ─────────────────────────────
         // 目标状态字母表（不信任 handler 白名单：本 trait 为 pub 入口，自包含
         // fail-closed，未知字符串绝不进入 SQL 绑定值）。
@@ -1635,7 +1438,13 @@ impl UserCardRepository for SqlxUserCardRepository {
             return Ok(());
         }
 
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let capability = SourceMutationCapability::user(admission);
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )
+        .await?;
 
         // ── Phase 1: 锁定行身份事实（迁移判定只认锁定状态，不信任请求旧读）──
         let locked: Option<LockedUpdateCardRow> = sqlx::query_as(
@@ -1785,8 +1594,18 @@ impl UserCardRepository for SqlxUserCardRepository {
         Ok(())
     }
 
-    async fn delete_with_cascade(&self, card_id: i64) -> Result<DeleteCascadeResult, AstralError> {
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+    async fn delete_with_cascade(
+        &self,
+        card_id: i64,
+        admission: AuthorizationAdmission,
+    ) -> Result<DeleteCascadeResult, AstralError> {
+        let capability = SourceMutationCapability::user(admission);
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )
+        .await?;
 
         // ── Phase 1: capture/lock（锁序见模块头注释）──────────────────────────
         // 0) 完整参与卡集合 plain 预读（同连接、不带锁）：{被删卡} ∪ 受影响委托行
@@ -2607,8 +2426,18 @@ impl UserCardRepository for SqlxUserCardRepository {
         })
     }
 
-    async fn restore_card(&self, card_id: i64) -> Result<bool, AstralError> {
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+    async fn restore_card(
+        &self,
+        card_id: i64,
+        admission: AuthorizationAdmission,
+    ) -> Result<bool, AstralError> {
+        let capability = SourceMutationCapability::user(admission);
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )
+        .await?;
         let result = sqlx::query(
             "UPDATE user_card SET card_status = 'ACTIVE' WHERE card_id = ? AND card_status = 'DISABLED'",
         )
@@ -2666,16 +2495,40 @@ impl UserCardRepository for SqlxUserCardRepository {
         Ok(true)
     }
 
-    async fn bind_card(&self, card_id: i64, user_id: i64) -> Result<bool, AstralError> {
+    async fn bind_card(
+        &self,
+        card_id: i64,
+        user_id: i64,
+        admission: AuthorizationAdmission,
+    ) -> Result<bool, AstralError> {
         // 与 bind_card_async_one 共享同一受守卫绑定核心：锁卡证明 PENDING/INACTIVE
         // 候选状态、正目标用户校验、归属/贡献 fail-closed 守卫全部先于换主 UPDATE。
-        bind_card_with_reassignment_guard(&self.db, card_id, user_id).await
+        bind_card_with_reassignment_guard(
+            &self.db,
+            card_id,
+            user_id,
+            admission,
+            self.delivery_context.as_ref(),
+        )
+        .await
     }
 
-    async fn bind_card_async_one(&self, card_id: i64, user_id: i64) -> Result<bool, AstralError> {
+    async fn bind_card_async_one(
+        &self,
+        card_id: i64,
+        user_id: i64,
+        admission: AuthorizationAdmission,
+    ) -> Result<bool, AstralError> {
         // 共享核心与 bind_card 完全一致 —— 异步批量绑定没有任何绕过归属/贡献
         // 守卫的旁路。
-        bind_card_with_reassignment_guard(&self.db, card_id, user_id).await
+        bind_card_with_reassignment_guard(
+            &self.db,
+            card_id,
+            user_id,
+            admission,
+            self.delivery_context.as_ref(),
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2691,6 +2544,7 @@ impl UserCardRepository for SqlxUserCardRepository {
         operation_id: &str,
         expected_tenant_id: i64,
         expected_domain_id: i64,
+        admission: AuthorizationAdmission,
     ) -> Result<Option<CommittedProjectionReceipts>, AstralError> {
         bind_card_batch_item_with_audit(
             &self.db,
@@ -2704,6 +2558,8 @@ impl UserCardRepository for SqlxUserCardRepository {
             operation_id,
             expected_tenant_id,
             expected_domain_id,
+            admission,
+            self.delivery_context.as_ref(),
         )
         .await
     }
@@ -2746,6 +2602,18 @@ impl UserCardRepository for SqlxUserCardRepository {
 
 /// Bind one async batch item with the task/card correlation committed atomically
 /// beside the card source mutation and the existing CARD/ELIGIBILITY side effects.
+///
+/// `admission` is the item's OWN proof-bound capability, freshly evaluated and
+/// reserved per item by `service::user_card_batch_admission::admit_item`
+/// (independent policy + SoD + host fence + reserve; each item is its own
+/// AuthorizationSource). It is taken by value: this transaction consumes the
+/// handle exactly once at commit, and no caller may reconstruct or clone it
+/// into another item's budget. The item's source transaction is opened through
+/// the standard capability dispatcher, and its commit revalidates the durable
+/// authority frontier + `authorization_authority_proof` row before COMMIT.
+/// There is deliberately no `UserPending` fallback: an item whose admission
+/// cannot be proven fails closed before any write, and the async tracker
+/// records the conservative outcome.
 #[allow(clippy::too_many_arguments)]
 async fn bind_card_batch_item_with_audit(
     db: &MySqlPool,
@@ -2759,6 +2627,8 @@ async fn bind_card_batch_item_with_audit(
     operation_id: &str,
     expected_tenant_id: i64,
     expected_domain_id: i64,
+    admission: AuthorizationAdmission,
+    delivery_context: Option<&Arc<InvalidationDeliveryContext>>,
 ) -> Result<Option<CommittedProjectionReceipts>, AstralError> {
     if card_id <= 0
         || user_id <= 0
@@ -2776,7 +2646,13 @@ async fn bind_card_batch_item_with_audit(
             "card bind batch audit requires verified positive ids and bounded correlation".into(),
         ));
     }
-    let mut tx = AuthorizationSourceTransaction::begin(db).await?;
+    let capability = SourceMutationCapability::user(admission);
+    let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+        db,
+        &capability,
+        delivery_context,
+    )
+    .await?;
     let locked: Option<LockedUpdateCardRow> = sqlx::query_as(
         "SELECT card_status, user_id, tenant_id, domain_id \
          FROM user_card WHERE card_id = ? FOR UPDATE",
@@ -3006,6 +2882,8 @@ async fn bind_card_with_reassignment_guard(
     db: &MySqlPool,
     card_id: i64,
     user_id: i64,
+    admission: AuthorizationAdmission,
+    delivery_context: Option<&Arc<InvalidationDeliveryContext>>,
 ) -> Result<bool, AstralError> {
     // 1) 正目标用户：绑定语义是“把卡授予某用户”，非正 id 不是合法归属。
     if user_id <= 0 {
@@ -3013,7 +2891,13 @@ async fn bind_card_with_reassignment_guard(
             "bind_card target user id must be positive, got {user_id}"
         )));
     }
-    let mut tx = AuthorizationSourceTransaction::begin(db).await?;
+    let capability = SourceMutationCapability::user(admission);
+    let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+        db,
+        &capability,
+        delivery_context,
+    )
+    .await?;
     // 2) 锁读卡行：候选状态证明与后续换主 UPDATE 同事务持锁，杜绝并发绑定/
     //    状态翻转在守卫与 UPDATE 之间改写卡片归属的竞态窗口。
     let locked: Option<(String, Option<i64>)> =
@@ -3065,6 +2949,37 @@ mod tests {
     use super::*;
     use astral_types::EVENT_TYPE_ELIGIBILITY_UPDATE;
 
+    /// 结构守卫（回归）：异步批量 item 的 source 事务必须通过 proof-bound
+    /// capability dispatcher 开启，且实现区不得残留 `UserPending` 捷径 ——
+    /// `UserPending` 在 dispatcher 处即被拒（Pending），曾经导致每个批量 item
+    /// 直接 IN_DOUBT。逐 item admission 由 service 从已验证请求 proof 派生，
+    /// COMMIT 前在本事务内对牌 durable 权威状态。
+    #[test]
+    fn async_batch_item_opens_source_transaction_with_proof_bound_admission() {
+        let body = implementation_between(
+            "async fn bind_card_batch_item_with_audit",
+            "async fn ensure_bind_card_no_stale_user_evidence_in_tx",
+        );
+        let capability = body
+            .find("SourceMutationCapability::user(admission)")
+            .expect("batch item must open its transaction with the per-item proof-bound admission");
+        let tx_begin = body
+            .find("begin_source_transaction_with_capability_and_optional_delivery_context(")
+            .expect("batch item must use the standard capability dispatcher");
+        let dispatch: String = body[tx_begin..].split_whitespace().collect();
+        assert!(dispatch.starts_with(
+            "begin_source_transaction_with_capability_and_optional_delivery_context(db,&capability,delivery_context,)"
+        ));
+        assert!(
+            capability < tx_begin,
+            "the per-item admission must be loaded into the capability before the transaction"
+        );
+        assert!(
+            !body.contains("UserPending"),
+            "batch item path must not carry a UserPending fallback"
+        );
+    }
+
     /// 资格失效派生身份 fail-closed：非正 id 与非 canonical 状态拒绝，合法输入
     /// 确定性派生（随机 fallback 绝不进入事件链）。
     #[test]
@@ -3088,10 +3003,9 @@ mod tests {
         );
     }
 
-    /// 结构守卫：create_card 的租户绑定写点必须以"纯校验 → 事务开始 → tenant 行
-    /// FOR UPDATE → user_card source INSERT"的顺序落库。tenant 行锁与
-    /// tenant_repository（delete_tenant 的 tenant 行锁 → user_card 引用计数守卫）
-    /// 同向，闭合"create 在途未提交 → delete 守卫见 0 行 → 提交孤儿卡"竞态。
+    /// 结构守卫：create_card 的租户绑定写点必须以"纯校验 → proof-bound admission 事务开始
+    /// → tenant 行 FOR UPDATE → owner/domain 锁 → closed card capture/insert"的顺序落库。
+    /// tenant 行锁与 tenant_repository 的删除锁序同向，闭合 create 在途未提交时的孤儿卡竞态。
     #[test]
     fn create_card_tenant_binding_locks_tenant_row_before_source_write() {
         // SQL 形状：参数化 + FOR UPDATE，锁定 tenant 行。
@@ -3099,29 +3013,43 @@ mod tests {
         assert!(CREATE_CARD_TENANT_LOCK_SQL.contains("tenant_id = ?"));
         assert!(CREATE_CARD_TENANT_LOCK_SQL.ends_with("FOR UPDATE"));
 
-        let create_card = implementation_between("async fn create_card", "async fn update_card");
+        let create_card = create_card_implementation();
         let tenant_gate = create_card
-            .find("validate_create_card_tenant_binding")
+            .find("validate_create_card_tenant_binding(tenant_id)?")
             .expect("tenant binding must pass the pure positive-id gate");
+        let admission_operation = create_card
+            .find("let operation_id = admission.operation_id().to_owned()")
+            .expect("create must retain the verified admission operation identity");
         let tx_begin = create_card
-            .find("AuthorizationSourceTransaction::begin(&self.db)")
-            .expect("transaction begin");
+            .find("begin_source_transaction_with_capability_and_optional_delivery_context(")
+            .expect("transaction must use the proof-bound capability dispatcher");
         let tenant_lock = create_card
             .find("CREATE_CARD_TENANT_LOCK_SQL")
-            .expect("the tenant row must be locked FOR UPDATE in-tx before the source insert");
-        let card_insert = create_card
-            .find("INSERT INTO user_card")
-            .expect("the card source row insert");
+            .expect("the tenant row must be locked FOR UPDATE before the capture");
+        let owner_lock = create_card
+            .find("lock_target_user(&mut tx, user_id, tenant_id, new.domain_id)")
+            .expect("owner and optional domain scope must be locked before card capture");
+        let capture = create_card
+            .find("EligibilitySourceCapture::begin_card_create_in_tx(")
+            .expect("card source insert must use the closed capture API");
+        let card_id = create_card
+            .find("capture.created_card_id()")
+            .expect("capture must return the generated card id");
         assert!(
-            tenant_gate < tx_begin,
-            "pure tenant validation must precede the transaction"
+            tenant_gate < admission_operation
+                && admission_operation < tx_begin
+                && tx_begin < tenant_lock
+                && tenant_lock < owner_lock
+                && owner_lock < capture
+                && capture < card_id,
+            "tenant/admission/owner locks must precede the closed card source capture"
         );
         assert!(
-            tx_begin < tenant_lock && tenant_lock < card_insert,
-            "tenant row FOR UPDATE must sit between tx begin and the user_card insert \
-             (tenant -> user_card order, same direction as delete_tenant)"
+            create_card.contains("CardCreateInsertSpec")
+                && create_card.contains("user_id,")
+                && create_card.contains("tenant_id,"),
+            "the closed capture must receive the actual card identity and tenant facts"
         );
-        // 缺租户 fail-closed：锁定行缺失即 Validation 整体回滚，绝不静默绑定。
         assert!(
             create_card.contains("refusing to bind user_card.tenant_id to a missing tenant"),
             "a missing tenant row must fail the whole create closed"
@@ -3163,101 +3091,173 @@ mod tests {
         assert_ne!(EVENT_TYPE_ELIGIBILITY_UPDATE, "REVOKE");
     }
 
-    /// 结构守卫（保留并强化原门禁）：create_card 的模板 BASE 绑定必须复用标准
-    /// RuleSet ADD 物化链 —— 租户校验先于投影证明、证明先于严格 ref 插入、条目
-    /// 物化先于 BIND_CARD 审计；单张带元数据 CARD_CREATED 父事件贯穿全部贡献；
-    /// 任一失败整体回滚，绝不 INSERT IGNORE 后猜测主键或只写旧链。
+    /// 结构守卫：create child 的模板 BASE 绑定必须保持完整事务顺序：租户与规则集/条目锁定
+    /// → 单张 CARD_CREATED + ELIGIBILITY + user-card 审计 → capture finish → RuleSet proof
+    /// → 严格 ref → RULE_SET_UPDATE → 标准 ADD → BIND_CARD 审计 → commit。所有稳定
+    /// admission operation 与审计关联维度必须保留，绝不 INSERT IGNORE 或丢失实际失效。
     #[test]
     fn template_binding_requires_ruleset_proof_before_reference_insert() {
-        let create_card = implementation_between("async fn create_card", "async fn update_card");
+        let create_card = create_card_implementation();
 
-        // 原有门禁保持：租户校验 → RuleSet 投影证明 → card_rule_set_ref 插入。
+        let admission_operation = create_card
+            .find("let operation_id = admission.operation_id().to_owned()")
+            .expect("create must use the verified admission operation identity");
+        let capability = create_card
+            .find("SourceMutationCapability::user(admission.clone())")
+            .expect("source transaction must be bound to the verified admission");
+        let tx_begin = create_card
+            .find("begin_source_transaction_with_capability_and_optional_delivery_context(")
+            .expect("transaction must use the proof-bound capability dispatcher");
+        assert!(
+            admission_operation < capability && capability < tx_begin,
+            "stable admission operation must be selected before opening the source transaction"
+        );
+
+        // Capture-held phase: tenant/rule-set/entry facts are locked before CARD/ELIGIBILITY,
+        // and the closed capture remains the only source insert owner.
+        let tenant_lock = create_card
+            .find("CREATE_CARD_TENANT_LOCK_SQL")
+            .expect("tenant existence must be proven by the locked tenant row");
+        let owner_lock = create_card
+            .find("lock_target_user(&mut tx, user_id, tenant_id, new.domain_id)")
+            .expect("owner and domain membership must be locked before card creation");
+        let capture_begin = create_card
+            .find("EligibilitySourceCapture::begin_card_create_in_tx(")
+            .expect("card creation must use the closed source capture API");
+        let ruleset_lock = create_card
+            .find("ORDER BY rs.rule_set_id ASC LIMIT 1025 FOR UPDATE")
+            .expect("template RuleSets and heads must be locked in ascending order");
+        let entry_lock = create_card
+            .find("ORDER BY entry_id LIMIT 1025 FOR UPDATE")
+            .expect("enabled RuleSet entries must be locked before classification");
         let tenant_validation = create_card
-            .find("validate_binding_tenants")
+            .find("validate_binding_tenants(row.tenant_id, Some(tenant_id))?")
             .expect("template binding must validate RuleSet/card tenant scope");
+        let classification = create_card
+            .find("has_grants = true")
+            .expect("ALLOW/DENY classification must be proven under the entry locks");
+        assert!(
+            tenant_lock < owner_lock
+                && owner_lock < capture_begin
+                && capture_begin < ruleset_lock
+                && ruleset_lock < tenant_validation
+                && tenant_validation < entry_lock
+                && entry_lock < classification,
+            "tenant, owner, RuleSet, entry, and binding scope locks must precede classification"
+        );
+
+        // The capture-held source side has exactly one CARD parent, one independent
+        // ELIGIBILITY projection/invalidation pair, and one same-transaction audit.
+        let parent = create_card
+            .find("let parent = astral_db::append_projection_event_with_metadata_in_tx(")
+            .expect("one metadata-bound CARD_CREATED parent must anchor the create");
+        let eligibility = create_card
+            .find("append_eligibility_projection_with_invalidation_on_raw_tx(")
+            .expect("create must use the raw ELIGIBILITY projection/invalidation API");
+        let user_audit = create_card
+            .find("INSERT INTO audit_log")
+            .expect("user-card create audit must be written in the capture transaction");
+        let finish_publication = create_card
+            .find("capture.finish_publication_in_tx()")
+            .expect("grant-bearing captures must finish through the publication lane");
+        let finish_empty = create_card
+            .find("capture.finish_in_tx()")
+            .expect("empty captures must finish through the no-grant lane");
+        assert!(
+            classification < parent
+                && parent < eligibility
+                && eligibility < user_audit
+                && user_audit < finish_publication
+                && user_audit < finish_empty,
+            "CARD_CREATED, ELIGIBILITY, and audit must precede capture finish"
+        );
+        assert_eq!(
+            create_card.matches("\"CARD_CREATED\"").count(),
+            1,
+            "create child must append exactly one CARD_CREATED parent event"
+        );
+        assert_eq!(
+            create_card
+                .matches("append_eligibility_projection_with_invalidation_on_raw_tx(")
+                .count(),
+            1,
+            "create child must append exactly one ELIGIBILITY projection/invalidation pair"
+        );
+        assert!(create_card.contains("record_source_projection_identity"));
+        assert!(create_card.contains("record_source_projection_receipt(eligibility_projection)"));
+        assert!(create_card.contains("record_invalidation_receipt(eligibility_invalidation)"));
+        assert!(create_card.contains("&operation_id"));
+        for key in [
+            "targetCardId",
+            "targetUserId",
+            "actorId",
+            "tenantId",
+            "domainId",
+            "templateId",
+            "operationId",
+            "parentSourceEventId",
+        ] {
+            assert!(
+                create_card.contains(key),
+                "user-card create audit must retain its correlation dimension ({key})"
+            );
+        }
+        assert!(create_card.contains("USER_CARD_MUTATION"));
+        assert!(create_card.contains("audit.rows_affected() != 1"));
+        assert!(create_card.contains("audit.last_insert_id() == 0"));
+
+        // Capture borrow is returned before the RuleSet/ref/ADD phase. RuleSet proof is
+        // first, then strict reference insertion, RULE_SET_UPDATE, ADD materialization,
+        // and the full BIND_CARD audit correlation.
+        let finish_end = finish_publication.max(finish_empty);
+        let source_receipts = create_card
+            .find("tx.record_source_projection_identity")
+            .expect("finished capture must register the CARD source receipt");
+        let context = create_card
+            .find("RuleSetMutationContext::user_with_admission")
+            .expect("RuleSet phase must retain the verified admission context");
         let proof = create_card
             .find("ensure_rule_set_projection_in_tx")
             .expect("template binding must ensure RuleSet projection proof");
         let reference = create_card
             .find("INSERT INTO card_rule_set_ref")
             .expect("template binding must insert card_rule_set_ref");
+        let ref_id_check = create_card
+            .find("inserted_ref.rows_affected() == 1")
+            .expect("the captured ref must prove one real inserted row");
+        let rule_set_projection = create_card
+            .find("EVENT_TYPE_RULE_SET_UPDATE")
+            .expect("each binding appends its RULE_SET stream event");
+        let adds_materialization = create_card
+            .find("append_card_create_ruleset_entry_adds_in_tx(")
+            .expect("enabled ALLOW entries must use the shared ADD core");
+        let bind_audit = create_card
+            .find("change_type: \"BIND_CARD\"")
+            .expect("BIND_CARD audit must correlate the complete contribution evidence");
+        let classification_recheck = create_card
+            .find("actual_grants != has_grants")
+            .expect("locked classification must be rechecked before commit");
+        let commit = create_card
+            .find("tx.commit_consuming()")
+            .expect("create must commit only after all source evidence is staged");
         assert!(
-            tenant_validation < proof && proof < reference,
-            "tenant scope must be validated before RuleSet proof and reference insertion"
+            finish_end < source_receipts
+                && source_receipts < context
+                && context < proof
+                && proof < reference
+                && reference < ref_id_check
+                && ref_id_check < rule_set_projection
+                && rule_set_projection < adds_materialization
+                && adds_materialization < bind_audit
+                && bind_audit < classification_recheck
+                && classification_recheck < commit,
+            "capture finish and RuleSet/ref/ADD/audit phases must remain strictly ordered"
         );
-        assert!(create_card.contains("SYSTEM_ACTOR_ID"));
-        assert!(create_card.contains("CARD_CREATED"));
-        assert!(create_card.contains("append_eligibility_projection_with_invalidation_in_tx"));
-
-        // 严格 ref 主键：新卡事务内不存在旧 ref —— 普通INSERT、无 IGNORE，
-        // 且必须显式校验真实主键 > 0，不猜 last_insert_id=0、不复用未知旧 ref。
         assert!(
             !create_card.contains("INSERT IGNORE INTO card_rule_set_ref"),
             "strict insert is mandatory; IGNORE would silently reuse an unknown old ref"
         );
-        assert!(
-            create_card.contains("card_rule_set_ref insert returned an unusable id"),
-            "the captured ref primary key must be validated before materialization"
-        );
-
-        // 请求级 operation id：先过统一安全校验且早于任何 durable 写入（含开事务）。
-        let request_id_gate = create_card
-            .find("validated_request_operation_id")
-            .expect("explicit x-request-id must pass the shared safety gate");
-        let tx_begin = create_card
-            .find("AuthorizationSourceTransaction::begin(&self.db)")
-            .expect("transaction begin");
-        assert!(
-            request_id_gate < tx_begin,
-            "request id validation must precede any durable write"
-        );
-
-        // 锁序/身份顺序：scope 校验 → 单语句升序锁定 + 代次捕获 → 重复映射守卫 →
-        // operation id 派生 → proven context → CARD_CREATED 父事件 → 绑定循环。
-        let scope_validation = create_card
-            .find("validate_create_card_ledger_scope(new)")
-            .expect("ledger scope validation must gate the whole creation");
-        let ordered_lock = create_card
-            .find("ORDER BY rs.rule_set_id ASC FOR UPDATE")
-            .expect("rule_set rows and projection heads must lock in one ascending statement");
-        let duplicate_guard = create_card
-            .find("ensure_unique_template_rule_set_ids(&locked_rule_sets)")
-            .expect("duplicate template rule_set mappings must fail closed");
-        let operation_derive = create_card
-            .find("derive_create_card_template_operation_id(")
-            .expect("operation identity must be deterministically derived from locked facts");
-        let system_context = create_card
-            .find("RuleSetMutationContext::system(&operation_id)")
-            .expect("binding context must be a proven stable identity");
-        let parent_event = create_card
-            .find("let parent_projection")
-            .expect("a single CARD_CREATED parent projection must anchor all contributions");
-        assert!(
-            scope_validation < tx_begin
-                && tx_begin < ordered_lock
-                && ordered_lock < duplicate_guard
-                && duplicate_guard < operation_derive
-                && operation_derive < system_context
-                && system_context < parent_event,
-            "identity must stabilize before any ledger/outbox/audit write"
-        );
-
-        // 绑定循环内：ref → RULE_SET_UPDATE 投影 → 标准 ADD 物化 → BIND_CARD 审计。
-        let rule_set_projection = create_card
-            .find("EVENT_TYPE_RULE_SET_UPDATE")
-            .expect("each binding appends its RULE_SET stream event (bind_card parity)");
-        let adds_materialization = create_card
-            .find("append_card_create_ruleset_entry_adds_in_tx(")
-            .expect("enabled+ALLOW entries must go through the shared ADD core");
-        let bind_audit = create_card
-            .find("\"BIND_CARD\"")
-            .expect("the binding audit must correlate the whole contribution evidence surface");
-        assert!(
-            reference < rule_set_projection
-                && rule_set_projection < adds_materialization
-                && adds_materialization < bind_audit,
-            "standard RuleSet ADD materialization sits between source binding and audit"
-        );
+        assert!(create_card.contains("card_rule_set_ref insert returned an unusable id"));
         for key in [
             "parentSourceEventId",
             "contributionEventIds",
@@ -3271,32 +3271,10 @@ mod tests {
                 "BIND_CARD audit JSON must remain traceable ({key})"
             );
         }
-
-        // 单张父事件语义：模板路径与无模板路径各恰好一次带元数据 CARD_CREATED，
-        // 不再逐绑定追加重复的 CARD 父事件（旧 worker 额外重建被禁止）。
-        assert_eq!(
-            create_card.matches("\"CARD_CREATED\"").count(),
-            2,
-            "exactly one metadata-bound CARD_CREATED per path (template / plain)"
-        );
-        assert_eq!(
-            create_card.matches("let parent_projection").count(),
-            1,
-            "one durable parent identity anchors every binding contribution"
-        );
-        assert!(!create_card.contains("\"RULE_SET_BOUND\""));
-        // ELIGIBILITY 必须仍走独立轻量资格通道 helper（CARD 流除外），且与其
-        // durable invalidation intent 成对落库；create 路径身份贯穿同一
-        // operation id（模板路径账本身份 / 无模板路径 plain 派生）。
-        assert!(
-            create_card.contains("append_eligibility_projection_with_invalidation_in_tx"),
-            "legacy ELIGIBILITY aggregate semantics must stay on its own channel"
-        );
-        assert!(
-            create_card.contains("&eligibility_operation_id,"),
-            "create-path eligibility invalidation must reuse the resolved create operation id"
-        );
-        // 随机 fallback 与旧的临时 correlation 格式绝不允许回流。
+        assert!(create_card.contains("stage_card_publication_origin(origin)"));
+        assert!(create_card.contains("stage_eligibility_source(origin)"));
+        assert!(!create_card.contains("RuleSetMutationContext::system"));
+        assert!(!create_card.contains("derive_create_card_template_operation_id"));
         assert!(!create_card.contains("uuid::Uuid"));
         assert!(!create_card.contains("card:create:"));
     }
@@ -3628,10 +3606,7 @@ mod tests {
     /// 不允许字符串拼接 IN 列表，也不按其他顺序逐张补锁。
     #[test]
     fn cascade_participants_lock_once_in_a_single_bound_ascending_statement() {
-        let production = include_str!("user_card_repository.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("tests module must be last");
+        let production = production_source();
         let lock_helper = production
             .split("async fn lock_cascade_participant_cards_in_tx")
             .nth(1)
@@ -3868,15 +3843,33 @@ mod tests {
         assert_ne!(event_a, grant.as_str());
     }
 
-    /// 从测试源码切出 SQL 实现块内 `[start_marker, end_marker)` 的方法体区间
-    /// （锚定实现块并在 `#[cfg(test)]` 前截断，跳过 trait 声明与本测试模块，
+    /// Read only the extracted create child production function. The parent implementation
+    /// keeps the trait dispatch, while create-specific guards must inspect the real child body.
+    fn create_card_implementation() -> &'static str {
+        let source = include_str!("user_card_repository/create.rs");
+        let start = source
+            .find("pub(super) async fn create_card(")
+            .expect("extracted create implementation must exist");
+        let body = &source[start..];
+        let end = body
+            .find("\nasync fn lock_target_user(")
+            .expect("create implementation must end before its private lock helper");
+        &body[..end]
+    }
+
+    fn production_source() -> &'static str {
+        include_str!("user_card_repository.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production must precede the tests module")
+    }
+
+    /// （锚定实现块并在测试模块前截断，跳过 trait 声明与本测试模块，
     /// 避免 include_str 自引用切片污染）。
     fn implementation_between(start_marker: &str, end_marker: &str) -> &'static str {
-        let source = include_str!("user_card_repository.rs");
-        let implementation = source
+        let implementation = production_source()
             .split("impl UserCardRepository for SqlxUserCardRepository")
             .nth(1)
-            .and_then(|rest| rest.split("#[cfg(test)]").next())
             .expect("sqlx user card repository implementation must exist");
         let start = implementation
             .find(start_marker)
@@ -4080,10 +4073,11 @@ mod tests {
             "orphan-ACTIVE-delegation gate must be present"
         );
         assert!(
-            include_str!("user_card_repository.rs")
-                .split("#[cfg(test)]")
-                .next()
-                .expect("tests module must be last")
+            production_source()
+                .split("fn classify_permission_rule_for_ledger(")
+                .nth(1)
+                .and_then(|rest| rest.split("fn classify_allow_only(").next())
+                .expect("production classifier must precede its ALLOW helper")
                 .contains("\"DELEGATION\" => {"),
             "delegation rules map through an explicit classifier arm"
         );
@@ -4255,10 +4249,7 @@ mod tests {
     /// count_cards 保持纯 COUNT。
     #[test]
     fn card_read_queries_use_shared_batch_summary_backfill() {
-        let production = include_str!("user_card_repository.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("tests module must be last");
+        let production = production_source();
 
         // FROM/JOIN 形状：不再 JOIN permission_rule_snapshot，元数据 JOIN 保留。
         let from_joins = production
@@ -4327,8 +4318,11 @@ mod tests {
             ("bind_card", bind_body),
             ("bind_card_async_one", async_one_body),
         ] {
+            let normalized: String = body.split_whitespace().collect();
             assert!(
-                body.contains("bind_card_with_reassignment_guard(&self.db, card_id, user_id)"),
+                normalized.contains(
+                    "bind_card_with_reassignment_guard(&self.db,card_id,user_id,admission,self.delivery_context.as_ref(),)",
+                ),
                 "{method} must delegate to the shared guarded binding core"
             );
             assert!(
@@ -4345,8 +4339,12 @@ mod tests {
             .find("must be positive")
             .expect("target user id must be validated positive");
         let tx_begin = core
-            .find("AuthorizationSourceTransaction::begin(db)")
-            .expect("guarded core must open its own transaction");
+            .find("begin_source_transaction_with_capability_and_optional_delivery_context(")
+            .expect("guarded core must use the proof-bound capability dispatcher");
+        let dispatch: String = core[tx_begin..].split_whitespace().collect();
+        assert!(dispatch.starts_with(
+            "begin_source_transaction_with_capability_and_optional_delivery_context(db,&capability,delivery_context,)"
+        ));
         assert!(
             positive_user < tx_begin,
             "positive target user validation must precede the transaction"
@@ -4636,8 +4634,14 @@ mod tests {
             .find("requires a verified positive actor id")
             .expect("status-bearing patches must fail closed without a verified actor");
         let tx_begin = body
-            .find("AuthorizationSourceTransaction::begin(&self.db)")
-            .expect("transaction begin");
+            .find(
+                "begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )",
+            )
+            .expect("transaction must use the proof-bound capability dispatcher");
         assert!(
             status_alphabet < tx_begin && request_id_gate < tx_begin && actor_gate < tx_begin,
             "pure validation must precede the transaction"
@@ -4708,10 +4712,7 @@ mod tests {
     /// 语义和父 CARD REVOKE 对齐。
     #[test]
     fn user_card_status_audit_is_parameterized_same_tx_correlation() {
-        let production = include_str!("user_card_repository.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("tests module must be last");
+        let production = production_source();
         let helper = production
             .split("async fn insert_user_card_status_audit_in_tx")
             .nth(1)

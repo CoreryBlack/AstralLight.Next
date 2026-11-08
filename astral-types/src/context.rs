@@ -133,6 +133,24 @@ pub struct PolicyContext {
     #[builder(default)]
     pub user_agent: Option<String>,
 
+    /// Digest of the exact HTTP method, URI and bounded raw request body, set by
+    /// the trusted permission middleware before authority proof issuance.
+    #[builder(default)]
+    #[serde(default)]
+    pub request_fingerprint: Option<String>,
+
+    /// Stable source operation selected by the trusted HTTP ingress.
+    #[builder(default)]
+    #[serde(default)]
+    pub request_operation_id: Option<String>,
+
+    /// Trusted ingress classification, included in the signed request digest.
+    /// A queued task registration is business state; each authorization item is
+    /// evaluated separately as an authorization source mutation.
+    #[builder(default)]
+    #[serde(default)]
+    pub request_mutation_kind: Option<crate::AuthorityMutationKind>,
+
     /// 请求体附加数据（传递给条件评估器）
     #[builder(default)]
     pub request: Option<serde_json::Value>,

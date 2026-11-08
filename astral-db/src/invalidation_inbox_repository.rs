@@ -22,6 +22,7 @@
 //! or write paths with [`crate::LocalMessageRepository`] (`al_message_outbox`),
 //! which remains the sole owner of the sender-side outbox state machine.
 
+use astral_types::AuthorizationMessageMetadata;
 use sqlx::mysql::MySqlPool;
 use sqlx::FromRow;
 use time::PrimitiveDateTime;
@@ -86,6 +87,7 @@ pub struct InvalidationInboxInput<'a> {
     pub origin_region: &'a str,
     pub schema_version: i32,
     pub payload_json: &'a str,
+    pub authority_metadata_json: Option<&'a str>,
     pub payload_sha256: &'a str,
     /// The sender envelope's `createdAt` (UTC), used for per-scope watermark
     /// gap detection. Parsed/normalized by the caller before this boundary.
@@ -104,6 +106,7 @@ pub struct InvalidationInboxRow {
     pub origin_region: String,
     pub schema_version: i32,
     pub payload_json: String,
+    pub authority_metadata_json: Option<String>,
     pub payload_sha256: String,
     pub envelope_created_at: PrimitiveDateTime,
     pub status: String,
@@ -135,9 +138,9 @@ impl InvalidationInboxRepository {
         let result = sqlx::query(
             "INSERT INTO authorization_invalidation_inbox \
              (node_region, node_id, message_id, operation_id, message_type, ordering_key, \
-              tenant_id, origin_region, schema_version, payload_json, payload_sha256, \
-              envelope_created_at, status) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING') \
+              tenant_id, origin_region, schema_version, payload_json, authority_metadata_json, \
+              payload_sha256, envelope_created_at, status) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING') \
              ON DUPLICATE KEY UPDATE node_region = node_region",
         )
         .bind(input.node_region)
@@ -150,6 +153,7 @@ impl InvalidationInboxRepository {
         .bind(input.origin_region)
         .bind(input.schema_version)
         .bind(input.payload_json)
+        .bind(input.authority_metadata_json)
         .bind(input.payload_sha256)
         .bind(input.envelope_created_at)
         .execute(&self.pool)
@@ -171,6 +175,7 @@ impl InvalidationInboxRepository {
                     && row.origin_region == input.origin_region
                     && row.schema_version == input.schema_version
                     && row.payload_json == input.payload_json
+                    && row.authority_metadata_json.as_deref() == input.authority_metadata_json
                     && row.envelope_created_at == input.envelope_created_at =>
             {
                 if row.status == "APPLIED" {
@@ -236,8 +241,8 @@ impl InvalidationInboxRepository {
     ) -> Result<Option<InvalidationInboxRow>, InvalidationInboxError> {
         Ok(sqlx::query_as::<_, InvalidationInboxRow>(
             "SELECT node_region, node_id, message_id, operation_id, message_type, ordering_key, \
-                    tenant_id, origin_region, schema_version, payload_json, payload_sha256, \
-                    envelope_created_at, status, applied_at, created_at, updated_at \
+                    tenant_id, origin_region, schema_version, payload_json, authority_metadata_json, \
+                    payload_sha256, envelope_created_at, status, applied_at, created_at, updated_at \
              FROM authorization_invalidation_inbox \
              WHERE node_region = ? AND node_id = ? AND message_id = ?",
         )
@@ -299,7 +304,38 @@ fn validate_identity(node_region: &str, node_id: &str) -> Result<(), Invalidatio
     Ok(())
 }
 
+fn validate_authority_metadata_json(
+    metadata_json: Option<&str>,
+) -> Result<(), InvalidationInboxError> {
+    let Some(metadata_json) = metadata_json else {
+        return Ok(());
+    };
+    let metadata: AuthorizationMessageMetadata =
+        serde_json::from_str(metadata_json).map_err(|error| {
+            InvalidationInboxError::Validation(format!(
+                "authority_metadata_json is not valid authorization metadata: {error}"
+            ))
+        })?;
+    metadata.validate().map_err(|error| {
+        InvalidationInboxError::Validation(format!(
+            "authority_metadata_json failed authority validation: {error}"
+        ))
+    })?;
+    let canonical = serde_json::to_string(&metadata).map_err(|error| {
+        InvalidationInboxError::Validation(format!(
+            "authority_metadata_json canonical serialization failed: {error}"
+        ))
+    })?;
+    if canonical != metadata_json {
+        return Err(InvalidationInboxError::Validation(
+            "authority_metadata_json must use canonical serialization".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_input(input: &InvalidationInboxInput<'_>) -> Result<(), InvalidationInboxError> {
+    validate_authority_metadata_json(input.authority_metadata_json)?;
     validate_identity(input.node_region, input.node_id)?;
     for (name, value) in [
         ("message_id", input.message_id),
@@ -371,6 +407,7 @@ mod tests {
             origin_region: "city-a",
             schema_version: 1,
             payload_json: "{}",
+            authority_metadata_json: None,
             payload_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             envelope_created_at: PrimitiveDateTime::new(
                 time::Date::from_calendar_date(2026, time::Month::October, 1).unwrap(),
@@ -379,6 +416,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn authority_metadata_input_requires_canonical_validated_json() {
+        let metadata = astral_types::AuthorizationMessageMetadata {
+            authorization_edition: astral_types::AUTHORIZATION_EDITION,
+            authority_id: "authority-1".into(),
+            authority_term: 4,
+            global_fence_sequence: 9,
+            key_id: "key-1".into(),
+            key_epoch: 2,
+            proof_id: "proof-1".into(),
+            scope_generation: 12,
+            revoke_watermark: 8,
+            snapshot_hash: "aa".repeat(32),
+        };
+        let metadata_json = serde_json::to_string(&metadata).unwrap();
+
+        let mut valid = input("msg-1");
+        valid.authority_metadata_json = Some(&metadata_json);
+        assert!(validate_input(&valid).is_ok());
+
+        let mut noncanonical = input("msg-2");
+        let noncanonical_json = format!(" {metadata_json} ");
+        noncanonical.authority_metadata_json = Some(&noncanonical_json);
+        assert!(matches!(
+            validate_input(&noncanonical),
+            Err(InvalidationInboxError::Validation(message))
+                if message.contains("canonical serialization")
+        ));
+
+        let mut unknown = input("msg-3");
+        let unknown_json = format!(
+            "{}{}",
+            metadata_json.trim_end_matches('}'),
+            ",\"extra\":true}"
+        );
+        unknown.authority_metadata_json = Some(&unknown_json);
+        assert!(matches!(
+            validate_input(&unknown),
+            Err(InvalidationInboxError::Validation(message))
+                if message.contains("not valid authorization metadata")
+        ));
+    }
     #[test]
     fn input_contract_rejects_missing_fields_and_bad_digest() {
         let mut bad = input("msg-1");

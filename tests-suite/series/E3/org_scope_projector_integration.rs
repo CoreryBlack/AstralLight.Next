@@ -18,6 +18,7 @@ use astral_trustgraph::service::org_scope_projector::{
     OrgScopeProjectorConfig,
 };
 use astral_types::org_scope::{OrgRequestPayload, OrgScope};
+use astral_types::AuthorizationAdmission;
 use astral_types::ValidityWindow;
 use sqlx::mysql::MySqlPool;
 use sqlx::Row;
@@ -117,7 +118,100 @@ fn governance_proof() -> OrgGovernanceProof {
     }
 }
 
-async fn seed_root_event(repo: &SqlxOrgScopeRepository) -> String {
+// ── proof-bound admission fixture（有效授权 mutation 的 commit 门）──────────
+//
+// 审批在 astral-db commit 前同事务对牌 durable `authorization_authority_frontier`
+// （SERVING）与 `authorization_authority_proof`（ACTIVE）并一次性消费 admission
+// （见 `consume_org_authority_admission`）。本 fixture 每次调用铸造一个结构
+// 合法的新 proof（唯一 proof_id/request_nonce）并 seed 其 durable 行；生产
+// 签名对牌在 F1 读取时完成，commit 门只做 durable 行等值对牌。frontier 行是
+// 全局单例：各套件以相同内容 upsert 收敛；proof 行过期后不可再被消费。
+const ORG_TEST_FRONTIER_ID: i64 = 1;
+const ORG_TEST_AUTHORITY_ID: &str = "testsuite-org-authority";
+const ORG_TEST_KEY_ID: &str = "testsuite-key-1";
+const ORG_TEST_SNAPSHOT_HASH_HEX: &str = "ab";
+
+async fn org_authority_admission(pool: &MySqlPool) -> AuthorizationAdmission {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let proof_id = format!("org-proof-{token}");
+    let request_nonce = format!("org-nonce-{token}");
+    let snapshot_hash = ORG_TEST_SNAPSHOT_HASH_HEX.repeat(32);
+    let proof = astral_types::AuthorizationFenceProof {
+        authorization_edition: astral_types::AUTHORIZATION_EDITION,
+        authority_id: ORG_TEST_AUTHORITY_ID.to_owned(),
+        authority_term: 1,
+        global_fence_sequence: 1,
+        scope: astral_types::AuthorizationAuthorityScope {
+            tenant_id: 1,
+            card_id: 1,
+            user_id: Some(1),
+            domain: astral_types::AuthorizationDomainScope::Any,
+        },
+        scope_generation: 1,
+        revoke_watermark: 1,
+        snapshot_hash: snapshot_hash.clone(),
+        parent_hash: None,
+        operation_id: format!("org-op-{token}"),
+        event_id: format!("org-event-{token}"),
+        key_id: ORG_TEST_KEY_ID.to_owned(),
+        key_epoch: 1,
+        issued_at: now,
+        not_before: now - 60,
+        expires_at: now + 3_600,
+        request_nonce: request_nonce.clone(),
+        request_binding_digest: None,
+        scope_certificate_hash: None,
+        proof_id: proof_id.clone(),
+        signature: "00".repeat(64),
+    };
+    sqlx::query(
+        "INSERT INTO authorization_authority_frontier \
+         (frontier_id, authority_id, authority_term, global_fence_sequence, key_id, key_epoch, \
+          status, snapshot_hash) \
+         VALUES (?, ?, 1, 1, ?, 1, 'SERVING', UNHEX(REPEAT(?, 32))) \
+         ON DUPLICATE KEY UPDATE authority_id = VALUES(authority_id), \
+             authority_term = VALUES(authority_term), \
+             global_fence_sequence = VALUES(global_fence_sequence), \
+             key_id = VALUES(key_id), key_epoch = VALUES(key_epoch), \
+             status = VALUES(status), snapshot_hash = VALUES(snapshot_hash)",
+    )
+    .bind(ORG_TEST_FRONTIER_ID)
+    .bind(ORG_TEST_AUTHORITY_ID)
+    .bind(ORG_TEST_KEY_ID)
+    .bind(ORG_TEST_SNAPSHOT_HASH_HEX)
+    .execute(pool)
+    .await
+    .expect("seed serving authority frontier fixture");
+    sqlx::query(
+        "INSERT INTO authorization_authority_proof \
+         (proof_id, request_nonce, authorization_edition, authority_id, authority_term, \
+          global_fence_sequence, tenant_id, card_id, scope_user_id, scope_domain_kind, \
+          scope_domain_id, scope_generation, revoke_watermark, snapshot_hash, parent_hash, \
+          operation_id, event_id, key_id, key_epoch, issued_at, not_before, expires_at, \
+          signature, status) \
+         VALUES (?, ?, ?, ?, 1, 1, 1, 1, 1, 'ANY', NULL, 1, 1, UNHEX(REPEAT(?, 32)), NULL, \
+                 ?, ?, ?, 1, ?, ?, ?, UNHEX(REPEAT('00', 64)), 'ACTIVE')",
+    )
+    .bind(&proof_id)
+    .bind(&request_nonce)
+    .bind(astral_types::AUTHORIZATION_EDITION)
+    .bind(ORG_TEST_AUTHORITY_ID)
+    .bind(ORG_TEST_SNAPSHOT_HASH_HEX)
+    .bind(&proof.operation_id)
+    .bind(&proof.event_id)
+    .bind(ORG_TEST_KEY_ID)
+    .bind(proof.issued_at)
+    .bind(proof.not_before)
+    .bind(proof.expires_at)
+    .execute(pool)
+    .await
+    .expect("seed active authority proof fixture");
+    AuthorizationAdmission::from_verified_proof(proof)
+        .expect("fixture proof must be structurally valid")
+}
+
+async fn seed_root_event(repo: &SqlxOrgScopeRepository, pool: &MySqlPool) -> String {
     let request = repo
         .create_request(&OrgCreateRequestCommand {
             operation_id: operation_id("root-request"),
@@ -139,6 +233,8 @@ async fn seed_root_event(repo: &SqlxOrgScopeRepository) -> String {
             operation_id: operation_id("root-approval"),
             note: None,
             governance_proof: Some(governance_proof()),
+            // 审批是有效授权写点：commit 门要求 proof-bound admission。
+            admission: org_authority_admission(pool).await,
         })
         .await
         .expect("approve root-init request");
@@ -215,7 +311,7 @@ async fn production_org_scope_projector_publishes_and_two_workers_do_not_duplica
         .expect("ORG_SCOPE schema prerequisites");
     cleanup(&pool).await;
     let repo = Arc::new(SqlxOrgScopeRepository::new(pool.clone()));
-    let operation_id = seed_root_event(&repo).await;
+    let operation_id = seed_root_event(&repo, &pool).await;
     let config = OrgScopeProjectorConfig {
         tenants: vec![PROJECTOR_TENANT],
         poll_interval_secs: PROJECTOR_POLL_SECS,

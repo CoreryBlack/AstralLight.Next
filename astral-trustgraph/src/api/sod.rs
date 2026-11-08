@@ -3,7 +3,7 @@
 //! 对齐 Java `SodService` + `SodController`。
 //! 数据访问在 `repository::sod_repository`；冲突比对（内存循环）保留在 handler。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 use astral_common::contract::{ApiResponse, EmptyResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
 use astral_db::validate_dynamic_sod_condition_script;
-use astral_types::AstralError;
+use astral_types::{AstralError, AuthorizationAdmission};
 
 use crate::repository::sod_repository::{SodPolicyRecord, SodViolationRecord};
 use crate::AppState;
@@ -204,8 +204,14 @@ async fn list_policies(
     ))))
 }
 
+/// POST /main/api/v1/sod-policies — 新建 SoD 策略。
+///
+/// proof-bound admission：SoD 策略是授权判定的 deny-only 输入，写路径必须
+/// 携带 permission_check 中间件签发的 F1 admission（缺失即 fail-closed）；
+/// 仓储在 COMMIT 前同事务对牌 durable authority 行并一次性消费。
 async fn create_policy(
     State(state): State<AppState>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<SodPolicy>,
 ) -> Result<Json<ApiResponse<SodPolicy>>, AppError> {
     // 校验必填字段
@@ -222,7 +228,10 @@ async fn create_policy(
     validate_sod_policy(&req)?;
 
     let record = SodPolicyRecord::from(&req);
-    let id = state.sod_repository.create_policy(&record).await?;
+    let id = state
+        .sod_repository
+        .create_policy(&record, admission)
+        .await?;
     tracing::info!(policy_id = id, policy_name = %req.policy_name, "SoD policy created");
     Ok(Json(ApiResponse::success(SodPolicy {
         policy_id: Some(id),
@@ -244,22 +253,34 @@ async fn get_policy(
     Ok(Json(ApiResponse::success(row)))
 }
 
+/// PUT /main/api/v1/sod-policies/{id} — 全量更新 SoD 策略。
+///
+/// proof-bound admission：合同同 create_policy（deny-only 输入变更）。
 async fn update_policy(
     State(state): State<AppState>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<SodPolicy>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     validate_sod_policy(&req)?;
     let record = SodPolicyRecord::from(&req);
-    state.sod_repository.update_policy(id, &record).await?;
+    state
+        .sod_repository
+        .update_policy(id, &record, admission)
+        .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 
+/// DELETE /main/api/v1/sod-policies/{id} — 删除 SoD 策略。
+///
+/// proof-bound admission：删除移除 deny 约束（扩大授权面），admission 不可
+/// 省略；合同同 create_policy。
 async fn delete_policy(
     State(state): State<AppState>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.sod_repository.delete_policy(id).await?;
+    state.sod_repository.delete_policy(id, admission).await?;
     tracing::warn!(policy_id = id, "SoD policy deleted");
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use astral_common::contract::{ApiResponse, EmptyResponse};
 use astral_common::error::AppError;
-use astral_types::{AstralError, PolicyContext};
+use astral_types::{AstralError, AuthorizationAdmission, PolicyContext};
 
 use crate::repository::delegation_repository::DelegationMutationContext;
 use crate::service::delegation_service::{
@@ -149,12 +149,13 @@ async fn list_groups(
 /// POST /main/api/v1/admin-groups
 async fn create_group(
     State(state): State<AppState>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<CreateGroupRequest>,
 ) -> Result<Json<ApiResponse<AdminGroup>>, AppError> {
     let scope = req.scope.unwrap_or_else(|| "GLOBAL".into());
     let id = state
         .admin_group_repository
-        .create(&req.name, req.description.as_deref(), &scope)
+        .create(&req.name, req.description.as_deref(), &scope, admission)
         .await?;
     tracing::info!(name = %req.name, "admin group created");
     Ok(Json(ApiResponse::success(AdminGroup {
@@ -187,13 +188,14 @@ async fn get_group(
 /// PUT /main/api/v1/admin-groups/{id}
 async fn update_group(
     State(state): State<AppState>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<CreateGroupRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     let scope = req.scope.unwrap_or_else(|| "GLOBAL".into());
     state
         .admin_group_repository
-        .update(id, &req.name, req.description.as_deref(), &scope)
+        .update(id, &req.name, req.description.as_deref(), &scope, admission)
         .await?;
     tracing::info!(id, "admin group updated");
     Ok(Json(ApiResponse::success(EmptyResponse)))
@@ -202,9 +204,10 @@ async fn update_group(
 /// DELETE /main/api/v1/admin-groups/{id} — 级联删除成员 + 组（单事务）
 async fn delete_group(
     State(state): State<AppState>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.admin_group_repository.delete(id).await?;
+    state.admin_group_repository.delete(id, admission).await?;
     tracing::warn!(id, "admin group deleted");
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
@@ -221,12 +224,13 @@ async fn list_group_members(
 /// POST /main/api/v1/admin-groups/{id}/members — INSERT IGNORE 幂等
 async fn add_group_member(
     State(state): State<AppState>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<AddMemberRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     state
         .admin_group_repository
-        .add_member(id, req.user_id)
+        .add_member(id, req.user_id, admission)
         .await?;
     tracing::info!(group_id = id, user_id = %req.user_id, "member added");
     Ok(Json(ApiResponse::success(EmptyResponse)))
@@ -235,9 +239,13 @@ async fn add_group_member(
 /// DELETE /main/api/v1/admin-groups/{id}/members/{uid}
 async fn remove_group_member(
     State(state): State<AppState>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path((id, uid)): Path<(i64, i64)>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    state.admin_group_repository.remove_member(id, uid).await?;
+    state
+        .admin_group_repository
+        .remove_member(id, uid, admission)
+        .await?;
     tracing::info!(group_id = id, user_id = uid, "member removed");
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
@@ -340,9 +348,10 @@ async fn create_delegation(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<CreateDelegationRequest>,
 ) -> Result<Json<ApiResponse<Delegation>>, AppError> {
-    let context = delegation_context(&headers, &policy_context)?;
+    let context = delegation_context(&headers, &policy_context)?.with_admission(admission);
     if req.delegator_id != context.caller_card_id() {
         return Err(AppError(AstralError::Permission(
             "delegator_id must match the verified caller card".into(),
@@ -387,10 +396,11 @@ async fn update_delegation(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateDelegationRequest>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    let context = delegation_context(&headers, &policy_context)?;
+    let context = delegation_context(&headers, &policy_context)?.with_admission(admission);
     state
         .delegation_service
         .update_delegation(
@@ -420,9 +430,10 @@ async fn revoke_delegation(
     State(state): State<AppState>,
     headers: HeaderMap,
     Extension(policy_context): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
-    let context = delegation_context(&headers, &policy_context)?;
+    let context = delegation_context(&headers, &policy_context)?.with_admission(admission);
     state
         .delegation_service
         .revoke_delegation(id, &context)

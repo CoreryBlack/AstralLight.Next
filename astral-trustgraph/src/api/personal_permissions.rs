@@ -14,7 +14,7 @@
 //! - revoke 解析 MANUAL 规则**实际承载卡**后再做范围校验，
 //!   禁止退化成"只看用户第一张活跃卡"。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use astral_common::contract::{ApiResponse, EmptyResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
-use astral_types::AstralError;
+use astral_types::{AstralError, AuthorizationAdmission};
 
 use crate::repository::global_admin_repository::GlobalAdminRepository;
 use crate::repository::grant_ledger_adapter::DirectRuleMutationContext;
@@ -31,7 +31,7 @@ use crate::repository::user_card_repository::{UserCardFilter, UserCardRepository
 use crate::AppState;
 
 /// 从 Gateway 已验证身份头构造 direct 规则 mutation 上下文（actor 必须为正）。
-fn mutation_context(headers: &HeaderMap) -> Result<DirectRuleMutationContext, AppError> {
+fn actor_context(headers: &HeaderMap) -> Result<(i64, Option<&str>), AppError> {
     let actor_id = headers
         .get("x-user-id")
         .and_then(|value| value.to_str().ok())
@@ -42,8 +42,19 @@ fn mutation_context(headers: &HeaderMap) -> Result<DirectRuleMutationContext, Ap
                 "verified user context is required".into(),
             ))
         })?;
-    let request_id_header = headers.get("x-request-id").and_then(|v| v.to_str().ok());
-    DirectRuleMutationContext::user(actor_id, request_id_header).map_err(AppError::from)
+    Ok((
+        actor_id,
+        headers.get("x-request-id").and_then(|v| v.to_str().ok()),
+    ))
+}
+
+fn mutation_context(
+    headers: &HeaderMap,
+    admission: AuthorizationAdmission,
+) -> Result<DirectRuleMutationContext, AppError> {
+    let (actor_id, request_id_header) = actor_context(headers)?;
+    DirectRuleMutationContext::user_with_admission(actor_id, request_id_header, admission)
+        .map_err(AppError::from)
 }
 
 // ===== 管理范围门禁（对齐 rules.rs / user_cards.rs 的既有模式） =====
@@ -264,6 +275,7 @@ async fn list_user_permissions(
 async fn grant_user_permission(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(user_id): Path<i64>,
     Json(req): Json<GrantPermissionRequest>,
 ) -> Result<Json<ApiResponse<UserPermission>>, AppError> {
@@ -293,7 +305,7 @@ async fn grant_user_permission(
             &req.action_code,
             req.effect.as_deref().unwrap_or("ALLOW"),
             req.priority,
-            &mutation_context(&headers)?,
+            &mutation_context(&headers, admission)?,
         )
         .await?;
 
@@ -313,6 +325,7 @@ async fn grant_user_permission(
 async fn revoke_user_permission(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path((user_id, rule_id)): Path<(i64, i64)>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     // 对齐 rules.rs `require_rule_scope`：先解析规则**实际承载卡**
@@ -328,7 +341,7 @@ async fn revoke_user_permission(
 
     state
         .personal_permission_service
-        .revoke(user_id, rule_id, &mutation_context(&headers)?)
+        .revoke(user_id, rule_id, &mutation_context(&headers, admission)?)
         .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
@@ -415,15 +428,15 @@ mod tests {
 
     #[test]
     fn mutation_context_requires_positive_verified_actor() {
-        let ok = mutation_context(&headers_with(Some(17), Some(10), Some(20)))
-            .expect("positive actor must be accepted");
-        assert_eq!(ok.actor_user_id, 17);
+        let ok_headers = headers_with(Some(17), Some(10), Some(20));
+        let ok = actor_context(&ok_headers).expect("positive actor must be accepted");
+        assert_eq!(ok.0, 17);
 
-        let missing = mutation_context(&headers_with(None, Some(10), Some(20)))
+        let missing = actor_context(&headers_with(None, Some(10), Some(20)))
             .expect_err("missing actor must be rejected");
         assert!(matches!(missing, AppError(AstralError::Permission(_))));
 
-        let zero = mutation_context(&headers_with(Some(0), Some(10), Some(20)))
+        let zero = actor_context(&headers_with(Some(0), Some(10), Some(20)))
             .expect_err("non-positive actor must be rejected");
         assert!(matches!(zero, AppError(AstralError::Permission(_))));
     }
@@ -523,7 +536,11 @@ mod tests {
             Ok(self.cards.iter().find(|c| c.card_id == card_id).cloned())
         }
 
-        async fn create_card(&self, _new: &NewUserCard) -> Result<i64, AstralError> {
+        async fn create_card(
+            &self,
+            _new: &NewUserCard,
+            _admission: astral_types::AuthorizationAdmission,
+        ) -> Result<i64, AstralError> {
             self.calls.lock().unwrap().push("create_card".into());
             Ok(0)
         }
@@ -532,6 +549,7 @@ mod tests {
             &self,
             _card_id: i64,
             _patch: &UserCardPatch,
+            _admission: astral_types::AuthorizationAdmission,
         ) -> Result<(), AstralError> {
             self.calls.lock().unwrap().push("update_card".into());
             Ok(())
@@ -540,6 +558,7 @@ mod tests {
         async fn delete_with_cascade(
             &self,
             _card_id: i64,
+            _admission: astral_types::AuthorizationAdmission,
         ) -> Result<DeleteCascadeResult, AstralError> {
             self.calls
                 .lock()
@@ -553,12 +572,21 @@ mod tests {
             })
         }
 
-        async fn restore_card(&self, _card_id: i64) -> Result<bool, AstralError> {
+        async fn restore_card(
+            &self,
+            _card_id: i64,
+            _admission: astral_types::AuthorizationAdmission,
+        ) -> Result<bool, AstralError> {
             self.calls.lock().unwrap().push("restore_card".into());
             Ok(false)
         }
 
-        async fn bind_card(&self, _card_id: i64, _user_id: i64) -> Result<bool, AstralError> {
+        async fn bind_card(
+            &self,
+            _card_id: i64,
+            _user_id: i64,
+            _admission: astral_types::AuthorizationAdmission,
+        ) -> Result<bool, AstralError> {
             self.calls.lock().unwrap().push("bind_card".into());
             Ok(false)
         }
@@ -567,6 +595,7 @@ mod tests {
             &self,
             _card_id: i64,
             _user_id: i64,
+            _admission: astral_types::AuthorizationAdmission,
         ) -> Result<bool, AstralError> {
             self.calls
                 .lock()
@@ -587,6 +616,7 @@ mod tests {
             _operation_id: &str,
             _expected_tenant_id: i64,
             _expected_domain_id: i64,
+            _admission: astral_types::AuthorizationAdmission,
         ) -> Result<Option<CommittedProjectionReceipts>, AstralError> {
             self.calls
                 .lock()
@@ -682,6 +712,7 @@ mod tests {
             _reason: Option<&str>,
             _template_id: i64,
             _rule_set_id: i64,
+            _admission: astral_types::AuthorizationAdmission,
         ) -> Result<GlobalAdminGrantOutcome, AstralError> {
             self.calls
                 .lock()
@@ -701,6 +732,7 @@ mod tests {
             _user_id: i64,
             _granted_by: i64,
             _reason: Option<&str>,
+            _admission: astral_types::AuthorizationAdmission,
         ) -> Result<DisableOutcome, AstralError> {
             self.calls.lock().unwrap().push("disable_protected".into());
             Ok(DisableOutcome::UpdateFailed)

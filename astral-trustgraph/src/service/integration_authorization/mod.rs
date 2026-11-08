@@ -9,7 +9,7 @@ use std::sync::Arc;
 use astral_common::middleware::permission_check_shared::physical_policy_context;
 use astral_db::{
     claim_replay_guard, read_integration_identity_mapping, GuardClaim, IntegrationIdentityKey,
-    SqlxRuleRepository,
+    SqlxAuthorizationFenceProvider, SqlxRuleRepository,
 };
 use astral_sdk_contracts::{
     sign_decision, verify_request, AuthorizationDecision, AuthorizationRequest, DecisionOutcome,
@@ -34,6 +34,8 @@ pub(crate) struct IntegrationAuthorizationService {
     pub engine: Arc<PolicyEngine>,
     pub config: Arc<IntegrationConfig>,
     pub org_scope_enabled: bool,
+    pub authority_provider: Option<Arc<SqlxAuthorizationFenceProvider>>,
+    pub authority_required: bool,
 }
 
 fn same_policy(
@@ -211,8 +213,10 @@ impl IntegrationAuthorizationService {
         } else {
             None
         };
-        let repo =
-            SqlxRuleRepository::new(self.db.clone()).with_org_scope_enabled(self.org_scope_enabled);
+        let repo = SqlxRuleRepository::new(self.db.clone())
+            .with_org_scope_enabled(self.org_scope_enabled)
+            .with_authority_provider_opt(self.authority_provider.clone())
+            .with_authority_required(self.authority_required);
         let policy = self.engine.evaluate(&ctx, &repo).await;
         let (mut outcome, mut reason) = if policy.allowed {
             (DecisionOutcome::Allow, "ADMITTED")

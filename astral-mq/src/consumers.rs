@@ -4,10 +4,11 @@
 //! 每个消费者在独立的 tokio 任务中运行，互不阻塞。
 
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use astral_common::token_contract::normalize_revocation_reason;
+use astral_db::invalidation_delivery as delivery;
 use astral_db::{
     insert_or_increment_terminal, AuditQuarantineInput, AuditQuarantineStatus, LocalMessageError,
     LocalMessageExactClaim, LocalMessageRepository, LOCAL_MESSAGE_MAX_ATTEMPTS,
@@ -53,6 +54,46 @@ static AUDIT_LOG_DB: OnceLock<MySqlPool> = OnceLock::new();
 /// 注入会话撤销 consumer 使用的 DB pool（仅 identity main.rs 调用一次）
 pub fn set_session_revocation_db(pool: MySqlPool) {
     let _ = SESSION_REVOCATION_DB.set(pool);
+}
+
+/// Startup-frozen recipient routing for the MQ-owned revocation producer.
+///
+/// This is an owned immutable handle, not a mutable process roster. Repeated
+/// installation with an equivalent context is idempotent; a conflicting context
+/// is rejected so source writers cannot silently diverge in one process.
+static SESSION_REVOCATION_DELIVERY: OnceLock<Arc<delivery::InvalidationDeliveryContext>> =
+    OnceLock::new();
+
+pub fn set_session_revocation_delivery(
+    context: delivery::InvalidationDeliveryContext,
+) -> Result<(), String> {
+    let context = Arc::new(context);
+    match SESSION_REVOCATION_DELIVERY.set(context.clone()) {
+        Ok(()) => Ok(()),
+        Err(context) => {
+            let Some(existing) = SESSION_REVOCATION_DELIVERY.get() else {
+                return Err(
+                    "session revocation delivery context install raced without an existing value"
+                        .into(),
+                );
+            };
+            if existing.as_ref() == context.as_ref() {
+                Ok(())
+            } else {
+                Err(
+                    "session revocation delivery context was already installed; conflicting re-install refused"
+                        .into(),
+                )
+            }
+        }
+    }
+}
+
+fn session_revocation_delivery() -> Result<Arc<delivery::InvalidationDeliveryContext>, String> {
+    SESSION_REVOCATION_DELIVERY.get().cloned().ok_or_else(|| {
+        "session revocation delivery context is not installed; refusing unjournaled source mutation"
+            .into()
+    })
 }
 
 /// 注入登录事件 consumer 使用的 DB pool（仅 identity main.rs 调用一次）
@@ -2932,14 +2973,19 @@ async fn handle_auth_session_revocation(
         // by the post-commit direct dispatch below plus the relay/fanout
         // recovery leg; a retry of this command reuses the committed
         // operation snapshot and never re-appends (is_new_operation=false).
-        committed_shards = crate::invalidation::append_session_revocation_shards_in_tx(
-            &mut tx,
-            msg.user_id,
-            &jti_keys,
-            &operation_id,
-        )
-        .await
-        .map_err(box_err)?;
+        let delivery = session_revocation_delivery().map_err(|error| {
+            box_err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })?;
+        committed_shards =
+            crate::invalidation::append_session_revocation_shards_with_delivery_context_in_tx(
+                &mut tx,
+                msg.user_id,
+                &jti_keys,
+                &operation_id,
+                delivery.as_ref(),
+            )
+            .await
+            .map_err(box_err)?;
     }
 
     // Arm the cancellation fence: a task cancellation/connection drop within the COMMIT await window is witnessed by Drop
@@ -3316,6 +3362,9 @@ mod tests {
             schema_version: envelope.schema_version,
             payload_json: envelope.envelope_json().unwrap(),
             headers_json: None,
+            authority_metadata_json: envelope
+                .authority_metadata_json()
+                .expect("metadata serialization"),
             payload_sha256: envelope.payload_sha256.clone(),
             status: "PROCESSING".into(),
             attempts: 1,
@@ -4504,7 +4553,7 @@ mod tests {
             .find("snapshot.len() > MAX_REVOCATION_SNAPSHOT_JTIS")
             .expect("over-capacity must fail closed before any mutation");
         let append = handler
-            .find("append_session_revocation_shards_in_tx(")
+            .find("append_session_revocation_shards_with_delivery_context_in_tx(")
             .expect("same-transaction typed shard append must remain");
         let commit = handler
             .find("tx.commit().await.map_err(box_err)?;")

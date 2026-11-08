@@ -3,7 +3,7 @@
 //! 数据访问在 `repository::level_template_repository`，delete 的级联清理 + 逐卡
 //! rebuild 编排在 `service::level_template_service`。HTTP 层仅解析参数并包装响应。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use astral_common::contract::{ApiResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
-use astral_types::AstralError;
+use astral_types::{AstralError, AuthorizationAdmission};
 
 use crate::api::require_platform_admin;
 use crate::repository::level_template_repository::{
@@ -117,6 +117,7 @@ pub fn level_template_routes() -> Router<AppState> {
 fn mutation_context(
     actor_id: i64,
     headers: &HeaderMap,
+    admission: AuthorizationAdmission,
 ) -> Result<LevelTemplateMutationContext, AppError> {
     let operation_id = headers
         .get("x-request-id")
@@ -126,7 +127,9 @@ fn mutation_context(
                 "level template mutation requires x-request-id".into(),
             ))
         })?;
-    LevelTemplateMutationContext::new(actor_id, operation_id).map_err(AppError::from)
+    LevelTemplateMutationContext::new(actor_id, operation_id)
+        .map(|context| context.with_admission(admission))
+        .map_err(AppError::from)
 }
 
 /// GET /main/api/v1/level-templates — 列表（支持 domainId/levelNo 过滤，分页）
@@ -180,9 +183,11 @@ async fn get_level_template(
 async fn create_level_template(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<CreateLevelTemplateRequest>,
 ) -> Result<Json<ApiResponse<LevelTemplateRow>>, AppError> {
-    require_platform_admin(&state, &headers).await?;
+    let actor_id = require_platform_admin(&state, &headers).await?;
+    let context = mutation_context(actor_id, &headers, admission)?;
     if req.template_name.is_empty() {
         return Err(AppError(AstralError::Validation(
             "template_name must not be empty".into(),
@@ -196,18 +201,21 @@ async fn create_level_template(
 
     let new_id = state
         .level_template_repository
-        .create_template(&NewLevelTemplate {
-            template_code: req.template_code.clone(),
-            template_name: req.template_name.clone(),
-            domain_id: req.domain_id,
-            principal_type: req.principal_type.clone(),
-            grant_type: req.grant_type.clone(),
-            level_no: req.level_no,
-            user_card_template_id: req.user_card_template_id,
-            version_no: req.version_no.unwrap_or(1),
-            force_cover: req.force_cover.unwrap_or(true),
-            description: req.description.clone(),
-        })
+        .create_template(
+            &NewLevelTemplate {
+                template_code: req.template_code.clone(),
+                template_name: req.template_name.clone(),
+                domain_id: req.domain_id,
+                principal_type: req.principal_type.clone(),
+                grant_type: req.grant_type.clone(),
+                level_no: req.level_no,
+                user_card_template_id: req.user_card_template_id,
+                version_no: req.version_no.unwrap_or(1),
+                force_cover: req.force_cover.unwrap_or(true),
+                description: req.description.clone(),
+            },
+            &context,
+        )
         .await?;
     let row = state
         .level_template_repository
@@ -228,6 +236,7 @@ async fn create_level_template(
 async fn update_level_template(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateLevelTemplateRequest>,
 ) -> Result<Json<ApiResponse<LevelTemplateRow>>, AppError> {
@@ -257,7 +266,7 @@ async fn update_level_template(
         force_cover: req.force_cover,
         description: req.description,
     };
-    let context = mutation_context(actor_id, &headers)?;
+    let context = mutation_context(actor_id, &headers, admission)?;
     state
         .level_template_repository
         .update_template(id, &patch, &context)
@@ -278,10 +287,11 @@ async fn update_level_template(
 async fn delete_level_template(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let actor_id = require_platform_admin(&state, &headers).await?;
-    let context = mutation_context(actor_id, &headers)?;
+    let context = mutation_context(actor_id, &headers, admission)?;
     let result = state.level_template_service.delete(id, &context).await?;
     if !result.deleted {
         return Err(AppError(AstralError::NotFound(format!(

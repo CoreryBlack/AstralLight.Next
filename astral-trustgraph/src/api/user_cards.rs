@@ -3,7 +3,7 @@
 //! 数据访问在 `repository::user_card_repository`，写路径 rebuild/evict 副作用
 //! 编排在 `service::user_card_service`。HTTP 层仅解析参数、组装 DTO、包装响应。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use astral_common::contract::{ApiResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
-use astral_types::AstralError;
+use astral_types::{AstralError, AuthorizationAdmission, PolicyContext};
 
 use crate::api::async_tracker::{self, AsyncTask};
 use crate::repository::user_card_repository::{
@@ -348,6 +348,7 @@ async fn get_user_card(
 async fn create_user_card(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<CreateUserCardRequest>,
 ) -> Result<Json<ApiResponse<UserCardDto>>, AppError> {
     let target_tenant_id = req.tenant_id.ok_or_else(scope_denied)?;
@@ -361,22 +362,25 @@ async fn create_user_card(
 
     let row = state
         .user_card_service
-        .create_card(&NewUserCard {
-            user_id: req.user_id,
-            domain_id: Some(target_domain_id),
-            card_type: req.card_type.unwrap_or_else(|| "STANDARD".into()),
-            template_id: req.template_id,
-            level_id: req.level_id,
-            priority: req.priority.unwrap_or(100),
-            is_primary: req.is_primary.unwrap_or(false),
-            tenant_id: Some(target_tenant_id),
-            // 显式携带时先过统一安全校验再复用为 durable operation id；
-            // 缺失/空白由 repository 以锁定代次确定性派生，无随机 fallback。
-            request_operation_id: headers
-                .get("x-request-id")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned),
-        })
+        .create_card(
+            &NewUserCard {
+                user_id: req.user_id,
+                domain_id: Some(target_domain_id),
+                card_type: req.card_type.unwrap_or_else(|| "STANDARD".into()),
+                template_id: req.template_id,
+                level_id: req.level_id,
+                priority: req.priority.unwrap_or(100),
+                is_primary: req.is_primary.unwrap_or(false),
+                tenant_id: Some(target_tenant_id),
+                // 显式携带时先过统一安全校验再复用为 durable operation id；
+                // 缺失/空白由 repository 以锁定代次确定性派生，无随机 fallback。
+                request_operation_id: headers
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+            },
+            admission,
+        )
         .await?;
     Ok(Json(ApiResponse::success(UserCardDto::from(row))))
 }
@@ -385,6 +389,7 @@ async fn create_user_card(
 async fn update_user_card(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateUserCardRequest>,
 ) -> Result<Json<ApiResponse<UserCardDto>>, AppError> {
@@ -431,7 +436,10 @@ async fn update_user_card(
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
     };
-    state.user_card_service.update_card(id, &patch).await?;
+    state
+        .user_card_service
+        .update_card(id, &patch, admission)
+        .await?;
 
     let row = state
         .user_card_repository
@@ -448,6 +456,7 @@ async fn update_user_card(
 async fn delete_user_card(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let existing = state
@@ -457,7 +466,7 @@ async fn delete_user_card(
         .ok_or_else(|| AppError(AstralError::NotFound(format!("user_card {id}"))))?;
     require_card_scope(&state, &headers, &existing).await?;
 
-    let result = state.user_card_service.delete_card(id).await?;
+    let result = state.user_card_service.delete_card(id, admission).await?;
     if !result.exists {
         return Err(AppError(AstralError::NotFound(format!("user_card {id}"))));
     }
@@ -477,6 +486,7 @@ async fn delete_user_card(
 async fn restore_user_card(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<UserCardDto>>, AppError> {
     let existing = state
@@ -486,7 +496,7 @@ async fn restore_user_card(
         .ok_or_else(|| AppError(AstralError::NotFound(format!("user_card {id}"))))?;
     require_card_scope(&state, &headers, &existing).await?;
 
-    let row = state.user_card_service.restore_card(id).await?;
+    let row = state.user_card_service.restore_card(id, admission).await?;
     Ok(Json(ApiResponse::success(UserCardDto::from(row))))
 }
 
@@ -494,6 +504,7 @@ async fn restore_user_card(
 async fn bind_card(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<BindCardRequest>,
 ) -> Result<Json<ApiResponse<UserCardDto>>, AppError> {
@@ -512,71 +523,104 @@ async fn bind_card(
     let target_domain_id = existing.domain_id.ok_or_else(scope_denied)?;
     require_target_user(&state, req.user_id, target_tenant_id, target_domain_id).await?;
 
-    let row = state.user_card_service.bind_card(id, req.user_id).await?;
+    let row = state
+        .user_card_service
+        .bind_card(id, req.user_id, admission)
+        .await?;
     Ok(Json(ApiResponse::success(UserCardDto::from(row))))
 }
 
 /// POST /main/api/v1/user-cards/{id}/bind/async — 异步批量绑定
+///
+/// 注册即受保护业务变更：中间件为该精确路由签发的 ProtectedBusiness
+/// admission 在 tracker 拥有的**同一事务**内被消费（protected ledger/result/
+/// audit），其 durable result_json 绑定冻结的精确有序 item 集。此后 worker
+/// 对每个 item 独立执行 fresh 策略 + SoD + host fence + reserve —— 每个
+/// item 各自是 AuthorizationSource、各自持有 operation_id 与一次性消费
+/// 预算；请求级 proof 绝不被重建、克隆或拆分为多个 item 预算。请求者身份
+/// 一律取自中间件验证过的 PolicyContext，绝不读伪造头。
 async fn bind_card_async(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(policy): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<BatchBindCardRequest>,
 ) -> Result<Json<ApiResponse<AsyncTask>>, AppError> {
-    if !req.card_ids.contains(&id) {
-        return Err(AppError(AstralError::Validation(
-            "path id must be included in card_ids".into(),
-        )));
-    }
     if req.card_ids.is_empty() || req.card_ids.len() > async_tracker::MAX_CARD_BIND_ITEMS {
         return Err(AppError(AstralError::Validation(format!(
             "card bind batch must contain between 1 and {} cards",
             async_tracker::MAX_CARD_BIND_ITEMS,
         ))));
     }
-    // 绑定是异步执行：在注册任务前先同步校验所有目标卡的管理范围，
-    // 避免把无权操作排入后台队列（对齐 Java 在 service 层强制 scope）。
-    require_management_context(&headers)?;
-    let mut prechecked = Vec::with_capacity(req.card_ids.len());
+    if !req.card_ids.contains(&id) {
+        return Err(AppError(AstralError::Validation(
+            "path id must be included in card_ids".into(),
+        )));
+    }
+    if req.user_id <= 0 {
+        return Err(AppError(AstralError::Validation(
+            "target user_id must be positive".into(),
+        )));
+    }
+
+    // 冻结精确有序 item 集：tenant/domain 快照来自服务端卡行（非客户端可控
+    // 事实），tracker 校验强制唯一并按 card_id 排序。此处**不做**授权判定 ——
+    // 每个 item 的真实授权由 worker 的 fresh 评估独立完成。
+    let mut items = Vec::with_capacity(req.card_ids.len());
     for card_id in &req.card_ids {
         let card = state
             .user_card_repository
             .get_card(*card_id)
             .await?
             .ok_or_else(|| AppError(AstralError::NotFound(format!("user_card {card_id}"))))?;
-        require_card_scope(&state, &headers, &card).await?;
-        let target_tenant_id = card.tenant_id.ok_or_else(scope_denied)?;
-        let target_domain_id = card.domain_id.ok_or_else(scope_denied)?;
-        require_target_user(&state, req.user_id, target_tenant_id, target_domain_id).await?;
-        prechecked.push(async_tracker::CardBindItemInput {
+        let tenant_id = card.tenant_id.ok_or_else(scope_denied)?;
+        let domain_id = card.domain_id.ok_or_else(scope_denied)?;
+        items.push(async_tracker::CardBindItemInput {
             card_id: *card_id,
-            tenant_id: target_tenant_id,
-            domain_id: target_domain_id,
+            tenant_id,
+            domain_id,
         });
     }
-    // The caller's signed card tuple is persisted separately from the target
-    // cards. An active GlobalAdmin may legitimately submit a cross-tenant batch.
-    let requester_user_id = parse_header_id(&headers, "x-user-id").ok_or_else(scope_denied)?;
-    let requester_card_id = parse_header_id(&headers, "x-user-card-id").ok_or_else(scope_denied)?;
-    let requester_tenant_id =
-        parse_header_id(&headers, "x-user-card-tenant-id").ok_or_else(scope_denied)?;
-    let requester_domain_id =
-        parse_header_id(&headers, "x-user-card-domain-id").ok_or_else(scope_denied)?;
+    items.sort_by_key(|item| item.card_id);
+
+    // authorization anchor 快照同样来自服务端卡行；活跃 GlobalAdmin 可以
+    // 合法提交跨租户批量 —— 锚点元组随注册持久化并在 item 事务中复核。
     let anchor = state
         .user_card_repository
         .get_card(id)
         .await?
         .ok_or_else(|| AppError(AstralError::NotFound(format!("user_card {id}"))))?;
-    require_card_scope(&state, &headers, &anchor).await?;
     let authorization_target_tenant_id = anchor.tenant_id.ok_or_else(scope_denied)?;
     let authorization_target_domain_id = anchor.domain_id.ok_or_else(scope_denied)?;
 
-    let admission = async_tracker::tracker()
+    // 验证过的请求者身份来自 PolicyContext（Gateway 验签链），绝不来自可
+    // 伪造的 x-user-* 头。
+    let requester_user_id = policy.user_id.ok_or_else(scope_denied)?;
+    let requester_card_id = policy.card_id.ok_or_else(scope_denied)?;
+    let requester_tenant_id = policy.tenant_id.ok_or_else(scope_denied)?;
+    let requester_domain_id = policy.domain_id.ok_or_else(scope_denied)?;
+
+    // 父级受保护变更上下文：把中间件验证的请求与它的 ProtectedBusiness
+    // admission 绑定为一个可消费边界（digest 含 request_mutation_kind）。
+    // 该上下文进入 tracker 拥有的注册未来，在冻结 item 集的同一事务内被
+    // begin/finish 消费 —— HTTP 栈上不再保留可克隆的 admission 句柄。
+    let parent = astral_db::ProtectedMutationContext::from_policy_context(
+        &policy,
+        admission,
+        policy.request_operation_id.as_deref(),
+        "domain",
+        "update",
+        policy.target_id,
+    )
+    .map_err(AppError::from)?;
+
+    // tracker 并发准许（BatchAdmissionPermit）仍是纯业务门：只限制在途
+    // owned 任务数。它不是授权能力；逐 item 授权在 worker 中 fresh 评估。
+    let batch_permit = async_tracker::tracker()
         .reserve_admission()
         .await
         .map_err(AppError::from)?;
     let task_id = async_tracker::generate_task_id("uc_bind");
-    let items = prechecked;
     let total = items.len();
     let registration = async_tracker::CardBindRegistration {
         task_id: task_id.clone(),
@@ -591,16 +635,16 @@ async fn bind_card_async(
         items,
     };
     let service = state.user_card_service.clone();
+    let app = state.clone();
     let db = state.db.clone();
     let tid = task_id.clone();
-    let actor_id = requester_user_id;
-    let actor_card_id = requester_card_id;
-    let actor_tenant_id = requester_tenant_id;
-    let actor_domain_id = requester_domain_id;
+    // item 上下文锚：注册验证过的父 PolicyContext（仅承载不可变注册事实与
+    // 请求 digest；不承载任何可克隆授权句柄）。
+    let parent_context = policy.clone();
     let user_id = req.user_id;
     let stop_requested = async_tracker::tracker().stop_requested().await;
     let task = async_tracker::tracker()
-        .register_card_bind_and_spawn(&state.db, admission, registration, async move {
+        .register_card_bind_and_spawn(&state.db, batch_permit, registration, parent, async move {
             let work_result: Result<(), String> = async {
                 async_tracker::start_card_bind(&db, &tid)
                     .await
@@ -625,18 +669,80 @@ async fn bind_card_async(
                     else {
                         continue;
                     };
+                    // FRESH per-item admission：独立策略 + SoD + host fence +
+                    // reserve。每项各自 AuthorizationSource、各自 operation_id
+                    //（durable 冻结集派生），失败分类与既有合同一致。
+                    let admission = match crate::service::user_card_batch_admission::admit_item(
+                        &app,
+                        &parent_context,
+                        &tid,
+                        &item.operation_id,
+                        item.card_id,
+                        user_id,
+                        item.tenant_id,
+                        item.domain_id,
+                    )
+                    .await
+                    {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            let message = error.to_string();
+                            tracing::warn!(task_id = %tid, card_id = item.card_id, error = %message, "batch item fresh admission refused");
+                            let outcome = if matches!(
+                                error,
+                                AstralError::Validation(_)
+                                    | AstralError::Auth(_)
+                                    | AstralError::Permission(_)
+                                    | AstralError::NotFound(_)
+                            ) {
+                                "FAILED"
+                            } else {
+                                "IN_DOUBT"
+                            };
+                            let mut completion_proven = false;
+                            if let Err(persist) = async_tracker::fail_card_bind_item(
+                                &db,
+                                &tid,
+                                item.card_id,
+                                outcome,
+                                &message,
+                            )
+                            .await
+                            {
+                                let item_state = async_tracker::get_task(&db, &tid)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|task| task.items.into_iter().find(|child| child.card_id == item.card_id));
+                                completion_proven = item_state
+                                    .is_some_and(|child| child.status == "COMPLETED");
+                                if !completion_proven {
+                                    return Err(format!("{message}; could not prove child outcome: {persist}"));
+                                }
+                            }
+                            if outcome == "IN_DOUBT" && !completion_proven {
+                                return Err(format!("batch child outcome is unknown: {message}"));
+                            }
+                            continue;
+                        }
+                    };
                     match service
                         .bind_card_async_batch_item(
                             item.card_id,
                             user_id,
-                            actor_id,
-                            actor_card_id,
-                            actor_tenant_id,
-                            actor_domain_id,
+                            requester_user_id,
+                            requester_card_id,
+                            requester_tenant_id,
+                            requester_domain_id,
                             &tid,
                             &item.operation_id,
                             item.tenant_id,
                             item.domain_id,
+                            // 该 item 自己 fresh 评估并 reserve 的一次性
+                            // admission（AuthorizationSource）：按值移交，
+                            // 由 item 的 source 事务在 COMMIT 前对牌并恰好
+                            // 消费一次。
+                            admission,
                         )
                         .await
                     {
@@ -663,6 +769,10 @@ async fn bind_card_async(
                                 }
                                 continue;
                             }
+                            // 集成点（main 的 source-outcome agent）：如需
+                            // stage/finalize API，在“COMMIT 回执已证明”与
+                            // complete_card_bind_item 之间接入；在 API 落地
+                            // 前不得伪造任何完成证明。
                             if let Err(error) = async_tracker::complete_card_bind_item(
                                 &db,
                                 &tid,
@@ -942,11 +1052,64 @@ mod tests {
             .find("request_operation_id: headers")
             .expect("optional x-request-id must be propagated for operation identity");
         let service_call = handler
-            .find("user_card_service.update_card")
-            .expect("the patch must flow through the service to the repository");
+            .find(".update_card(id, &patch, admission)")
+            .expect("the patch and proof-bound admission must flow through the service");
         assert!(
             whitelist < actor && actor < request_id && request_id < service_call,
             "identity propagation must accompany the validated patch into the service call"
+        );
+    }
+
+    /// 结构守卫（回归）：异步批量绑定**不得**把请求级 proof admission 线程
+    /// 化进 worker 或按 item 重建预算。注册必须走 ProtectedMutationContext
+    /// （ProtectedBusiness admission 在 tracker 拥有的同一事务内消费），worker
+    /// 对每个 item 调用 fresh 的 `admit_item`（独立策略+SoD+fence+reserve），
+    /// 并把该项自己的 admission 按值移交给 source 事务。曾回归为把一个
+    /// admission 克隆成 N 个 item 预算 —— 正是本守卫禁止的重建形态。
+    #[test]
+    fn async_bind_handler_registers_protected_and_evaluates_items_fresh() {
+        let handler = include_str!("user_cards.rs")
+            .split("async fn bind_card_async(")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn conflict_detection").next())
+            .expect("bind_card_async handler body must exist");
+        assert!(
+            handler.contains("Extension(policy): Extension<PolicyContext>"),
+            "handler must bind the middleware-verified policy context"
+        );
+        assert!(
+            handler.contains("ProtectedMutationContext::from_policy_context"),
+            "registration must build the protected mutation boundary from the verified context"
+        );
+        assert!(
+            handler.contains("register_card_bind_and_spawn(&state.db, batch_permit, registration, parent,"),
+            "the protected registration (with its parent context) must run in the tracker-owned future"
+        );
+        assert!(
+            handler.contains("user_card_batch_admission::admit_item("),
+            "each batch item must be freshly admitted (policy + SoD + fence + reserve)"
+        );
+        // 请求级 admission 只作为注册边界的输入进入受保护上下文；worker 循环
+        // 内不得出现对它的引用、克隆或线程化。
+        let loop_body = handler
+            .rsplit("for candidate in pending")
+            .next()
+            .expect("worker loop must exist");
+        assert!(
+            !loop_body.contains("&admission"),
+            "the request admission must never be threaded into items"
+        );
+        assert!(
+            !loop_body.contains("admission.clone()"),
+            "cloning an admission would forge a new one-shot budget: forbidden reconstruction"
+        );
+        assert!(
+            !handler.contains("UserPending"),
+            "handler must not construct a UserPending capability fallback"
+        );
+        assert!(
+            !handler.contains("parse_header_id"),
+            "requester identity must come from the verified policy context, not spoofable headers"
         );
     }
 }

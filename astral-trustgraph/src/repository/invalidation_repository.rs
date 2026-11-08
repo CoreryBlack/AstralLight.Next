@@ -98,6 +98,8 @@ pub(crate) async fn append_evidence_invalidation_if_published(
     let stamp = state
         .publication_stamp()
         .map_err(|error| AstralError::Database(error.to_string()))?;
+    let authority_metadata =
+        tx.authority_message_metadata(&request.operation_id, &request.event_id)?;
     let event = astral_mq::InvalidationEvent::EvidenceInvalidated(astral_mq::EvidenceInvalidated {
         tenant_id: request.tenant_id,
         card_id: request.card_id,
@@ -110,9 +112,17 @@ pub(crate) async fn append_evidence_invalidation_if_published(
     });
     // 构造一次：同一个 envelope 实例既落 durable outbox，也留在事务 receipts。
     let envelope = event
-        .to_envelope(&request.event_id, &request.operation_id, &origin_region)
+        .to_envelope_with_authority_metadata(
+            &request.event_id,
+            &request.operation_id,
+            &origin_region,
+            Some(authority_metadata),
+        )
         .map_err(|error| AstralError::Validation(error.to_string()))?;
     let payload_json = envelope.envelope_json().map_err(AstralError::Internal)?;
+    let authority_metadata_json = envelope
+        .authority_metadata_json()
+        .map_err(AstralError::Internal)?;
     let input = astral_db::LocalMessageInput {
         message_id: &envelope.message_id,
         operation_id: &envelope.operation_id,
@@ -125,6 +135,7 @@ pub(crate) async fn append_evidence_invalidation_if_published(
         schema_version: envelope.schema_version,
         payload_json: &payload_json,
         headers_json: None,
+        authority_metadata_json: authority_metadata_json.as_deref(),
         payload_sha256: &envelope.payload_sha256,
     };
     astral_db::append_in_tx(tx, &input)

@@ -5,7 +5,7 @@
 //! （快照重建 + 缓存清除）编排在 `service::rule_write_service`。
 //! HTTP 层仅解析参数、组装 DTO、包装响应。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use astral_common::contract::{ApiResponse, EmptyResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
 use astral_db::resolve_resource_ownership;
-use astral_types::{AstralError, ResourceRegistry};
+use astral_types::{AstralError, AuthorizationAdmission, ResourceRegistry};
 
 fn current_card_id(headers: &HeaderMap) -> Result<i64, AppError> {
     headers
@@ -129,10 +129,14 @@ use crate::AppState;
 
 /// 从 Gateway 已验证身份头构造 direct 规则 mutation 上下文：
 /// actor 必须存在且为正；可选 `x-request-id` 头透传为 operation 关联。
-fn mutation_context(headers: &HeaderMap) -> Result<DirectRuleMutationContext, AppError> {
+fn mutation_context(
+    headers: &HeaderMap,
+    admission: AuthorizationAdmission,
+) -> Result<DirectRuleMutationContext, AppError> {
     let actor_id = parse_header_id(headers, "x-user-id").ok_or_else(scope_denied)?;
     let request_id_header = headers.get("x-request-id").and_then(|v| v.to_str().ok());
-    DirectRuleMutationContext::user(actor_id, request_id_header).map_err(AppError::from)
+    DirectRuleMutationContext::user_with_admission(actor_id, request_id_header, admission)
+        .map_err(AppError::from)
 }
 
 /// 规则响应 DTO（对齐前端 PermissionRuleItem camelCase 序列化）
@@ -239,13 +243,14 @@ async fn list_rules_by_card(
 async fn delete_rules_by_card(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(card_id): Path<i64>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     require_current_card(&headers, card_id)?;
     require_card_scope(&state, &headers, card_id).await?;
     state
         .rule_write_service
-        .delete_rules_by_card(card_id, &mutation_context(&headers)?)
+        .delete_rules_by_card(card_id, &mutation_context(&headers, admission)?)
         .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
@@ -302,8 +307,7 @@ async fn check_permission(
     // 与 permission_check 中间件同一份启动期冻结旗标：正式授权仓储必须携带
     // org_scope 准入状态（default-off），避免同进程内构造出无旗标仓储造成
     // 与策略引擎宿主不一致的 ORG_AUTHORITY_DISABLED 判定（split-brain）。
-    let repo = astral_db::SqlxRuleRepository::new(state.db.clone())
-        .with_org_scope_enabled(state.org_scope_enabled);
+    let repo = state.rule_repository();
     let decision = state.engine.evaluate(&ctx, &repo).await;
     let result = if decision.allowed {
         "ALLOW"
@@ -348,6 +352,7 @@ async fn list_rules(
 async fn create_rule(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<RuleRequest>,
 ) -> Result<Json<ApiResponse<RuleDto>>, AppError> {
     require_current_card(&headers, req.card_id)?;
@@ -374,7 +379,7 @@ async fn create_rule(
                 resource_id: req.resource_id,
                 enabled: req.enabled,
             },
-            &mutation_context(&headers)?,
+            &mutation_context(&headers, admission)?,
         )
         .await?;
     Ok(Json(ApiResponse::success(row.into())))
@@ -401,6 +406,7 @@ async fn get_rule(
 async fn update_rule(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<RuleRequest>,
 ) -> Result<Json<ApiResponse<RuleDto>>, AppError> {
@@ -424,7 +430,7 @@ async fn update_rule(
                 valid_from: req.valid_from,
                 valid_to: req.valid_to,
             },
-            &mutation_context(&headers)?,
+            &mutation_context(&headers, admission)?,
         )
         .await?;
     Ok(Json(ApiResponse::success(row.into())))
@@ -433,6 +439,7 @@ async fn update_rule(
 async fn delete_rule(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     let current_card_id = current_card_id(&headers)?;
@@ -450,7 +457,7 @@ async fn delete_rule(
     }
     state
         .rule_write_service
-        .delete_rule(id, &mutation_context(&headers)?)
+        .delete_rule(id, &mutation_context(&headers, admission)?)
         .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }

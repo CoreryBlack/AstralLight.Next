@@ -13,6 +13,7 @@ pub mod collector;
 pub mod dashboard;
 pub mod dispatch;
 pub mod endpoints;
+pub mod mutation;
 pub mod notifications;
 pub mod repository;
 pub mod service;
@@ -22,6 +23,10 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub db: MySqlPool,
     pub engine: Arc<PolicyEngine>,
+    /// Fixed trust-root verifier for request-bound authorization fences. A
+    /// missing provider is not-ready in Strict mode; DurableOnly is an explicit
+    /// compatibility profile.
+    pub authorization_fence_provider: Option<Arc<astral_db::SqlxAuthorizationFenceProvider>>,
     pub monitor_service: Arc<service::MonitorService>,
 }
 

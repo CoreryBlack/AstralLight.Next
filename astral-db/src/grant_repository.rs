@@ -131,6 +131,15 @@ pub const MAX_DELTA_STATUS_LIST_ROWS: i64 = 500;
 use std::collections::{BTreeMap, HashSet};
 
 mod owned_execution;
+mod source_outcome;
+
+pub(crate) use source_outcome::load_source_receipts_in_tx;
+
+pub use source_outcome::{
+    capture_delta_source_outcome_in_tx, DeltaSourceEventEvidence, DeltaSourceOutcomeEvidence,
+    DeltaSourceReceipt, MAX_DELTA_EVIDENCE_EVENTS, MAX_DELTA_EVIDENCE_JSON_BYTES,
+    MAX_DELTA_EVIDENCE_RECEIPTS,
+};
 
 pub(super) async fn claim_owned_exact_in_tx(
     tx: &mut Transaction<'_, MySql>,
@@ -4625,7 +4634,7 @@ mod tests {
             entry.semantic_hash.as_hex(),
             Sha256Digest::from_bytes(vec![1; 32]).unwrap().as_hex()
         );
-        assert_eq!(entry.compiler_version, "astral-authorization-v6");
+        assert_eq!(entry.compiler_version, AUTHORIZATION_COMPILER_VERSION);
         assert_eq!(entry.operation_id, "op-1");
     }
 
@@ -4904,7 +4913,7 @@ mod tests {
         assert!(decoded.before_image_json.is_none() && decoded.before_digest.is_none());
         assert_eq!(decoded.semantic_hash.as_bytes(), [9u8; 32]);
         assert_eq!(decoded.dependency_hash.as_bytes(), [8u8; 32]);
-        assert_eq!(decoded.compiler_version, "astral-authorization-v6");
+        assert_eq!(decoded.compiler_version, AUTHORIZATION_COMPILER_VERSION);
         assert_eq!(decoded.attempts, 3);
         assert_eq!(decoded.cas_version, 5);
         assert_eq!(decoded.lease_owner, "worker-a");
@@ -4938,8 +4947,8 @@ mod tests {
         };
         crate::OwnedCompletionIdentity::from_request(&receipt).unwrap();
         for compiler in [
-            "astral-authorization-v5",
-            "astral-authorization-v7",
+            "astral-authorization-v6",
+            "astral-authorization-v8",
             "foreign-v6",
         ] {
             let mut claimed = row.clone();

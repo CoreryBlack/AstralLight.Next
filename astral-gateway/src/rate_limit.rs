@@ -1,177 +1,62 @@
-//! 基于 IP 的速率限制中间件（Gateway 专属运行时）
+//! 基于 IP 的速率限制中间件（Gateway 运行时装配）。
 //!
-//! 配置从 `AppConfig.rate_limit` 注入（对齐 Java `RateLimitConfig`）；
-//! 客户端 IP 只信任来自配置代理的 `X-Forwarded-For` / `X-Real-IP`，否则回退
-//! TCP 对端地址（`ConnectInfo`）。bucket 带最后访问时间，周期清理防内存无限增长。
+//! 计数核心、受信代理匹配与客户端 IP 解析由
+//! `astral_common::middleware::ip_rate_limit` 统一提供（与 Identity verification
+//! 路由限流同源；taskId `global-authority-20261107-limiter` 抽取），本模块只负责
+//! Gateway 侧的配置注入、单例装配、拒绝指标与 429 响应出口。
+//!
+//! 配置从 `AppConfig.rate_limit` 注入（对齐 Java `RateLimitConfig`）；客户端 IP
+//! 只信任来自 `gateway.trusted_proxy_ips` 配置代理的 `X-Forwarded-For` /
+//! `X-Real-IP`，否则回退 TCP 对端地址（`ConnectInfo`）。桶带最后访问时间，
+//! TTL+GC 与硬容量双边界由共享 limiter 保证（容量耗尽时新 key fail-closed）。
+//! 本中间件是**进程内本地限流**：不提供跨副本全局配额，各副本预算独立。
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::OnceLock;
 
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::StatusCode;
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 
-use astral_common::config::{AppConfig, RateLimitCfg};
+use astral_common::config::AppConfig;
+use astral_common::middleware::ip_rate_limit::{
+    rate_limit_response, resolve_client_ip, IpRateLimiter, TrustedProxySet,
+};
 
-/// 全局速率限制器实例（跨请求共享；配置来自首个请求，启动期确定）
-static RATE_LIMITER: std::sync::OnceLock<RateLimiter> = std::sync::OnceLock::new();
-
-/// bucket 空闲清理阈值：超过该时长未访问的 key 移除（防长运行内存增长）
-const BUCKET_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// 基于 IP 的滑动窗口计数器
-struct WindowCounter {
-    count: u64,
-    window_start: Instant,
-    last_seen: Instant,
+/// Gateway 侧共享实例（跨请求；配置来自首个请求的启动期冻结 AppConfig，
+/// 每请求重建会导致 bucket 恒空、限流恒不生效）。
+struct GatewayRateLimit {
+    limiter: IpRateLimiter,
+    trusted: TrustedProxySet,
 }
 
-/// 速率限制器
-pub struct RateLimiter {
-    config: RateLimitCfg,
-    buckets: Mutex<HashMap<String, WindowCounter>>,
-}
+static GATEWAY_RATE_LIMIT: OnceLock<GatewayRateLimit> = OnceLock::new();
 
-impl RateLimiter {
-    pub fn new(config: RateLimitCfg) -> Self {
-        Self {
-            config,
-            buckets: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn check(&self, key: &str) -> bool {
-        if !self.config.enabled {
-            return true;
-        }
-        let mut buckets = self.buckets.lock().unwrap();
-        let now = Instant::now();
-        let window = std::time::Duration::from_secs(1);
-
-        // 周期性清理空闲 bucket（仅在达到一定规模时执行，避免每次请求全扫）
-        if buckets.len() > 1024 {
-            buckets.retain(|_, counter| now.duration_since(counter.last_seen) < BUCKET_TTL);
-        }
-
-        let counter = buckets.entry(key.to_string()).or_insert(WindowCounter {
-            count: 0,
-            window_start: now,
-            last_seen: now,
-        });
-        counter.last_seen = now;
-        if now.duration_since(counter.window_start) > window {
-            counter.count = 0;
-            counter.window_start = now;
-        }
-        // 突发余量：burst_size 允许单个 1s 窗口内短时超过稳态速率
-        // （cap = requests_per_second + burst_size），窗口重置后回到稳态
-        // 预算；此前该配置项被静默忽略。
-        let cap = self.config.requests_per_second as u64 + self.config.burst_size as u64;
-        if counter.count >= cap {
-            false
-        } else {
-            counter.count += 1;
-            true
-        }
-    }
-}
-
-/// Resolve a trusted proxy setting as an exact address or simple CIDR prefix.
-fn trusted_proxy(remote: Option<&SocketAddr>, configured: &[String]) -> bool {
-    let Some(remote) = remote else { return false };
-    configured.iter().any(|value| {
-        let value = value.trim();
-        value == remote.ip().to_string()
-            || value
-                .strip_suffix("/32")
-                .or_else(|| value.strip_suffix("/128"))
-                .is_some_and(|network| network == remote.ip().to_string())
-            || value
-                .strip_suffix(".")
-                .is_some_and(|prefix| remote.ip().to_string().starts_with(prefix))
-    })
-}
-
-/// 解析客户端 IP。Forwarded headers are ignored unless the TCP peer is trusted.
-fn client_ip(
-    headers: &axum::http::HeaderMap,
-    connect_info: Option<&SocketAddr>,
-    trusted_proxy_ips: &[String],
-) -> String {
-    if trusted_proxy(connect_info, trusted_proxy_ips) {
-        if let Some(first) = headers
-            .get("X-Forwarded-For")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|xff| xff.split(',').next())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            return first.to_string();
-        }
-        if let Some(real) = headers
-            .get("X-Real-IP")
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            return real.to_string();
-        }
-    }
-    connect_info
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn rate_limit_error(req: &Request) -> Response {
-    let trace_id = req
-        .headers()
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("rate-limit-error");
-    let body = serde_json::json!({
-        "code": 429,
-        "message": "Rate limit exceeded",
-        "traceId": trace_id,
-        "requestPath": req.uri().path(),
-        "requestMethod": req.method().as_str(),
-        "errorType": "TOO_MANY_REQUESTS",
-        "decision": "RATE_LIMIT_EXCEEDED",
-        "reasonCode": "RATE_LIMIT_EXCEEDED",
-    });
-    let mut response = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
-    response
-        .headers_mut()
-        .insert("Retry-After", axum::http::HeaderValue::from_static("1"));
-    if let Ok(value) = trace_id.parse() {
-        response.headers_mut().insert("X-Trace-Id", value);
-    }
-    response
-}
-
-///
-/// limiter 必须是跨请求共享的单例：每请求重建会导致 bucket 恒空、限流恒不生效。
-/// 配置取自首个请求的 `AppConfig.rate_limit`（启动期确定，不随请求变化）。
 pub async fn rate_limit_middleware(
     State(config): State<AppConfig>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request,
     next: Next,
 ) -> Response {
-    let limiter = RATE_LIMITER.get_or_init(|| RateLimiter::new(config.rate_limit.clone()));
-    let ip = client_ip(
-        req.headers(),
-        Some(&addr),
-        &config.gateway.trusted_proxy_ips,
-    );
+    let shared = GATEWAY_RATE_LIMIT.get_or_init(|| {
+        let trusted = TrustedProxySet::compile(&config.gateway.trusted_proxy_ips);
+        for entry in trusted.invalid_entries() {
+            tracing::warn!(
+                entry = %entry,
+                "invalid gateway.trusted_proxy_ips entry; ignored (fail closed to peer address)"
+            );
+        }
+        GatewayRateLimit {
+            limiter: IpRateLimiter::new(config.rate_limit.clone()),
+            trusted,
+        }
+    });
+    let client = resolve_client_ip(req.headers(), Some(addr.ip()), &shared.trusted);
 
-    if !limiter.check(&ip) {
-        tracing::warn!(ip = %ip, "rate limit exceeded");
+    if !shared.limiter.check(client) {
+        tracing::warn!(client = ?client, "rate limit exceeded");
         metrics::counter!("astral_gateway_rate_limit_rejected_total").increment(1);
-        return rate_limit_error(&req);
+        return rate_limit_response(&req, "rate-limit-error");
     }
 
     next.run(req).await
@@ -180,100 +65,114 @@ pub async fn rate_limit_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use std::net::IpAddr;
 
-    fn test_config() -> RateLimitCfg {
-        RateLimitCfg {
+    use astral_common::config::RateLimitCfg;
+
+    fn key(value: &str) -> Option<IpAddr> {
+        Some(value.parse().unwrap())
+    }
+
+    fn compile(entries: &[&str]) -> TrustedProxySet {
+        let owned: Vec<String> = entries.iter().map(|entry| (*entry).to_string()).collect();
+        TrustedProxySet::compile(&owned)
+    }
+
+    #[test]
+    fn gateway_limiter_caps_per_key_and_isolates_buckets() {
+        let limiter = IpRateLimiter::new(RateLimitCfg {
+            enabled: true,
+            requests_per_second: 2,
+            burst_size: 0,
+        });
+        assert!(limiter.check(key("10.0.0.1")));
+        assert!(limiter.check(key("10.0.0.1")));
+        assert!(!limiter.check(key("10.0.0.1")), "第 3 个超限");
+        assert!(
+            limiter.check(key("10.0.0.2")),
+            "budget must be isolated per client"
+        );
+    }
+
+    #[test]
+    fn gateway_limiter_burst_adds_in_window_headroom() {
+        // rps=2 + burst=4：单窗口内允许 6 次，第 7 次拒绝。
+        let limiter = IpRateLimiter::new(RateLimitCfg {
             enabled: true,
             requests_per_second: 2,
             burst_size: 4,
-        }
-    }
-
-    #[test]
-    fn strict_cap_applies_when_burst_is_zero() {
-        let config = RateLimitCfg {
-            enabled: true,
-            requests_per_second: 2,
-            burst_size: 0,
-        };
-        let limiter = RateLimiter::new(config);
-        assert!(limiter.check("a"));
-        assert!(limiter.check("a"));
-        assert!(!limiter.check("a")); // 第 3 个超限
-    }
-
-    #[test]
-    fn burst_size_adds_in_window_headroom() {
-        // rps=2 + burst=4：单窗口内允许 6 次，第 7 次拒绝。
-        let limiter = RateLimiter::new(test_config());
+        });
         for _ in 0..6 {
-            assert!(limiter.check("a"));
+            assert!(limiter.check(key("10.0.0.1")));
         }
-        assert!(!limiter.check("a"));
-        // 突发余量按 key 隔离，不影响其他客户端。
-        assert!(limiter.check("b"));
+        assert!(!limiter.check(key("10.0.0.1")));
+        assert!(limiter.check(key("10.0.0.2")));
     }
 
     #[test]
-    fn test_rate_limiter_disabled() {
-        let config = RateLimitCfg {
+    fn gateway_limiter_disabled_admits_all() {
+        let limiter = IpRateLimiter::new(RateLimitCfg {
             enabled: false,
             requests_per_second: 0,
             burst_size: 0,
-        };
-        let limiter = RateLimiter::new(config);
+        });
         for _ in 0..1000 {
-            assert!(limiter.check("test"));
+            assert!(limiter.check(key("10.0.0.1")));
         }
     }
 
     #[test]
-    fn test_xff_first_hop_is_used() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("X-Forwarded-For", "1.2.3.4, 5.6.7.8".parse().unwrap());
-        let addr: SocketAddr = "9.9.9.9:1234".parse().unwrap();
-        assert_eq!(
-            client_ip(&headers, Some(&addr), &["9.9.9.9".into()]),
-            "1.2.3.4"
-        );
-    }
-
-    #[test]
-    fn untrusted_forwarded_headers_fall_back_to_peer() {
+    fn gateway_trusted_proxy_resolution_ignores_untrusted_headers() {
+        let trusted = compile(&["9.9.9.9"]);
+        let peer: IpAddr = "7.7.7.7".parse().unwrap();
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("X-Forwarded-For", "1.2.3.4".parse().unwrap());
         headers.insert("X-Real-IP", "8.8.8.8".parse().unwrap());
-        let addr: SocketAddr = "9.9.9.9:1234".parse().unwrap();
-        assert_eq!(client_ip(&headers, Some(&addr), &[]), "9.9.9.9");
-    }
-
-    #[test]
-    fn trusted_proxy_accepts_x_real_ip_fallback() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("X-Real-IP", "8.8.8.8".parse().unwrap());
-        let addr: SocketAddr = "9.9.9.9:1234".parse().unwrap();
+        // 非受信对端：伪造转发头不能换桶，回退对端地址。
         assert_eq!(
-            client_ip(&headers, Some(&addr), &["9.9.9.9".into()]),
-            "8.8.8.8"
+            resolve_client_ip(&headers, Some(peer), &trusted),
+            Some(peer)
         );
     }
 
     #[test]
-    fn test_xff_absent_falls_back_to_peer() {
-        let headers = axum::http::HeaderMap::new();
-        let addr: SocketAddr = "9.9.9.9:1234".parse().unwrap();
-        assert_eq!(client_ip(&headers, Some(&addr), &[]), "9.9.9.9");
+    fn gateway_trusted_proxy_resolves_rightmost_untrusted_hop() {
+        let trusted = compile(&["9.9.9.9"]);
+        let peer: IpAddr = "9.9.9.9".parse().unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("X-Forwarded-For", "1.2.3.4, 5.6.7.8".parse().unwrap());
+        assert_eq!(
+            resolve_client_ip(&headers, Some(peer), &trusted),
+            key("5.6.7.8"),
+            "the proxy-appended rightmost untrusted hop is the client"
+        );
     }
 
     #[test]
-    fn rate_limit_response_has_retry_after() {
+    fn gateway_cidr_and_legacy_prefix_compat() {
+        // CIDR 按位匹配。
+        let cidr = compile(&["10.1.2.0/24"]);
+        assert!(cidr.matches_peer(key("10.1.2.77")));
+        assert!(!cidr.matches_peer(key("10.1.3.77")));
+        // 遗留点分前缀兼容（`10.1.` 继续命中 10.1.2.3）。
+        let legacy = compile(&["10.1."]);
+        assert!(legacy.matches_peer(key("10.1.2.3")));
+        assert!(!legacy.matches_peer(key("10.2.0.1")));
+        // 非法条目 fail-closed（回退对端，不静默放宽）。
+        let invalid = compile(&["not-an-ip"]);
+        assert_eq!(invalid.invalid_entries().len(), 1);
+        assert!(!invalid.matches_peer(key("10.0.0.1")));
+    }
+
+    #[test]
+    fn gateway_rate_limit_response_keeps_contract() {
         let request = Request::builder()
             .uri("/api/v1/auth/login")
-            .body(Body::empty())
+            .body(axum::body::Body::empty())
             .unwrap();
-        let response = rate_limit_error(&request);
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let response = rate_limit_response(&request, "rate-limit-error");
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()["Retry-After"], "1");
+        assert_eq!(response.headers()["X-Trace-Id"], "rate-limit-error");
     }
 }

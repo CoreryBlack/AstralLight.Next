@@ -10,8 +10,18 @@ pub struct LivePrerequisites {
     pub readiness: bool,
     pub controller: bool,
     pub three_node_state: bool,
+    pub four_node_state: bool,
+    pub two_half_state: bool,
+    pub two_database_state: bool,
+    pub same_db_custom_channel: bool,
+    pub cross_db_rabbitmq: bool,
     pub current_transport: bool,
     pub durable_evidence: bool,
+    pub run_scoped_provenance: bool,
+    pub tenant_isolation: bool,
+    pub audit_correlation: bool,
+    pub half_authority_fence: bool,
+    pub split_brain_fail_closed: bool,
 }
 
 impl LivePrerequisites {
@@ -22,8 +32,18 @@ impl LivePrerequisites {
             readiness: false,
             controller: false,
             three_node_state: false,
+            four_node_state: false,
+            two_half_state: false,
+            two_database_state: false,
+            same_db_custom_channel: false,
+            cross_db_rabbitmq: false,
             current_transport: false,
             durable_evidence: false,
+            run_scoped_provenance: false,
+            tenant_isolation: false,
+            audit_correlation: false,
+            half_authority_fence: false,
+            split_brain_fail_closed: false,
         }
     }
 
@@ -34,8 +54,18 @@ impl LivePrerequisites {
             readiness: true,
             controller: true,
             three_node_state: true,
+            four_node_state: true,
+            two_half_state: true,
+            two_database_state: true,
+            same_db_custom_channel: true,
+            cross_db_rabbitmq: true,
             current_transport: true,
             durable_evidence: true,
+            run_scoped_provenance: true,
+            tenant_isolation: true,
+            audit_correlation: true,
+            half_authority_fence: true,
+            split_brain_fail_closed: true,
         }
     }
 
@@ -46,8 +76,18 @@ impl LivePrerequisites {
             "readiness" => self.readiness,
             "controller" => self.controller,
             "three_node_state" => self.three_node_state,
+            "four_node_state" => self.four_node_state,
+            "two_half_state" => self.two_half_state,
+            "two_database_state" => self.two_database_state,
+            "same_db_custom_channel" => self.same_db_custom_channel,
+            "cross_db_rabbitmq" => self.cross_db_rabbitmq,
             "current_transport" => self.current_transport,
             "durable_evidence" => self.durable_evidence,
+            "run_scoped_provenance" => self.run_scoped_provenance,
+            "tenant_isolation" => self.tenant_isolation,
+            "audit_correlation" => self.audit_correlation,
+            "half_authority_fence" => self.half_authority_fence,
+            "split_brain_fail_closed" => self.split_brain_fail_closed,
             _ => false,
         }
     }
@@ -142,6 +182,11 @@ mod tests {
             "three_node_state",
             "durable_evidence",
         ]);
+    }
+
+    #[test]
+    fn s15_v6_distributed_campaign_requires_current_durable_prerequisites() {
+        assert_live_gate(crate::s15_validation::CURRENT_S15_LIVE_REQUIREMENTS);
     }
 
     #[test]

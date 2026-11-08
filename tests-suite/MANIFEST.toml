@@ -224,6 +224,25 @@ kind = "script"
 arch_status = "current"
 note = "手工 OPA index/bindings(deny/priority)实验;不是自动测试,结果不可当作当前 OPA comparator PASS"
 
+[[entry]]
+id = "astral-authority/authority-contracts"
+category = "security"
+owner_crate = "astral-authority"
+path = "astral-authority/tests/store_contract.rs astral-authority/tests/bootstrap_contract.rs astral-authority/tests/source_bootstrap_contract.rs"
+kind = "unit"
+arch_status = "current"
+note = "V7 authority 控制面内存存储 CAS/Txn、canonical lens、finite coverage、trust-root scope/bootstrap 及 ROOT source-bootstrap 合同;纯进程内,无 etcd/网络;service 特性构建需要系统 protoc;etcd 网关集成单独 ignored 登记"
+
+[[entry]]
+id = "astral-authority/etcd-gateway-integration"
+category = "integration"
+owner_crate = "astral-authority"
+path = "astral-authority/tests/etcd_gateway_integration.rs"
+kind = "integration-ignored"
+requires = ["ASTRAL_AUTHORITY_ETCD_ENDPOINTS(真实 etcd quorum + v3 JSON 网关)", "RUST_INTEGRATION_REQUIRED=1"]
+arch_status = "current"
+note = "默认 #[ignore] 不计 PASS;RUST_INTEGRATION_REQUIRED=1 而环境缺失时显式 FAIL,无环境且未要求时报告 [SKIP];当前宿主机无 etcd,保持 BLOCKED"
+
 # ═══════════════ 内联单元测试(#[cfg(test)];物理上属于属主 crate)═══════════════
 
 [[entry]]
@@ -242,7 +261,16 @@ owner_crate = "astral-db"
 kind = "unit-inline"
 modules = 42
 arch_status = "current"
-note = "migration/tests.rs 4799 行(退役迁移 pin)、authorization_projection_repository/tests.rs 5714 行(no-legacy-fallback 守卫)、memory_projection_hub 测试与性能矩阵(吞吐探针 #[ignore] 门控)"
+note = "migration/tests.rs 4799 行(退役迁移 pin)、authorization_projection_repository/tests.rs 5714 行(no-legacy-fallback 守卫)、memory_projection_hub 测试与性能矩阵(吞吐探针 #[ignore] 门控)、authorization_fence_repository.rs 的 CURRENT V6 authority issuance 纯合同(Phase E local/unit)"
+
+[[entry]]
+id = "inline/astral-authority"
+category = "unit-inline"
+owner_crate = "astral-authority"
+kind = "unit-inline"
+modules = 4
+arch_status = "current"
+note = "runtime 生命周期监督、client 契约、protected signer 与 config 解析的进程内纯合同"
 
 [[entry]]
 id = "inline/astral-trustgraph"
@@ -251,7 +279,7 @@ owner_crate = "astral-trustgraph"
 kind = "unit-inline"
 modules = 70
 arch_status = "current"
-note = "authorization_projector/tests.rs 3940 行 + 完整阶段规划/父查找性能矩阵;多处 legacy_snapshot_reads_are_gone 守卫"
+note = "authorization_projector/tests.rs 3940 行 + 完整阶段规划/父查找性能矩阵;多处 legacy_snapshot_reads_are_gone 守卫;authorization_authority_runtime.rs 的 authority runtime disposition reducer 纯合同(Phase E local/unit)"
 
 [[entry]]
 id = "inline/astral-common"
@@ -417,6 +445,16 @@ kind = "campaign"
 requires = ["fresh protected three-node deployment", "MySQL", "RabbitMQ", "Redis", "OPA/image identity", "run_config and source hashes"]
 arch_status = "compat"
 note = "历史三节点 S15 harness;其 Redis/Rabbit/OPA 依赖不属于 native single-node;历史报告/JSON/证据归档已继承并脱敏,但节点路由、二进制和部署状态未继承;当前 checkout 无受保护节点,因此保持 BLOCKED, 不作为当前架构 PASS"
+
+[[entry]]
+id = "e2e/distributed-s15-v6"
+category = "e2e"
+owner_crate = "test-harness + testsuite"
+path = "test-harness/src/s15_validation.rs"
+kind = "campaign-gate"
+requires = ["four protected AL servers", "two isolated MySQL databases", "half-A AL1+AL2 -> DB1", "half-B AL3+AL4 -> DB2", "RabbitMQ cross-database transport", "custom same-database channel", "half membership and database ownership", "partition/fault controller", "current V6 signed identity", "WorkerOwned durable receipt", "published-evidence read-gate", "run-scoped provenance", "tenant isolation", "audit correlation", "half-authority fence", "split-brain fail-closed"]
+arch_status = "current"
+note = "CURRENT V6 S15 四服务器两半区设计入口：AL1/AL2 配对 DB1，AL3/AL4 配对 DB2；同库仅走 custom_same_db_channel，跨库仅走 RabbitMQ。当前仓库尚无网络化同库自研通道、四节点部署或批准的半区接管协议，因此离线 Rust contract 只验证拓扑/覆盖/前置门，live campaign 保持 BLOCKED。S15 live 身份探测执行器与 coordinator 的进程内离线合同另行登记为 s15-live-coordinator-contracts 与 s15-probe-executor-contracts suite（s15-probe CLI 在缺少完整受保护配置与批准值时网络惰性并返回 BLOCKED）"
 
 [[entry]]
 id = "mt-extreme/testsuite"
@@ -1000,6 +1038,512 @@ argv = ["cargo", "test", "-p", "astral-db", "--lib", "evidence_cache::tests::e2_
 acceptance = "rust"
 minimum_tests = 1
 expected_tests = 1
+
+[[suite]]
+id = "authority-v7-protocol-contracts"
+owner = "astral-types"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M3"]
+scope = "component"
+boundary = "V7 wire, signature, completion content, reservation coverage, genesis/rotation frontier chain, bootstrap artifact provenance, ROOT source-bootstrap payload and fail-closed read-gate contracts; pure Rust values only, no live quorum, database, migration or deployment evidence"
+sources = ["astral-types/src/authority_protocol.rs", "astral-types/src/authority_protocol/abort.rs", "astral-types/src/authority_protocol/bootstrap.rs", "astral-types/src/authority_protocol/certificate.rs", "astral-types/src/authority_protocol/frontier.rs", "astral-types/src/authority_protocol/reservation.rs", "astral-types/src/authority_protocol/wire.rs", "astral-types/src/authority_protocol/source_bootstrap.rs", "astral-types/src/authority_protocol/eligibility_completion.rs", "astral-types/src/authority_protocol/config_completion.rs", "astral-types/src/authority_protocol/config_completion/metadata.rs", "astral-types/src/authority_protocol/config_completion/tests.rs"]
+argv = ["cargo", "test", "-p", "astral-types", "--locked", "--lib", "authority_protocol", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 70
+expected_tests = 70
+note = "Main workspace Cargo run 2026-11-08 executed seventy authority_protocol contracts, including four source-bootstrap contracts; no live quorum or database acceptance."
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-authorization-types-contracts"
+owner = "astral-types"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M2", "M3"]
+scope = "component"
+boundary = "V7 authority-side value contracts in astral-types: publication lineage separate from request frontier, certificates binding every manifest field and canonical card scope only, admission consumed once across clones, strict signature/frontier binding, exact evidence frontiers, canonical message metadata and unsafe state-machine edge refusal, lens/time-invariant evidence content hash; pure in-process values only, no live quorum, database, transport or deployment evidence"
+sources = ["astral-types/src/authorization_authority.rs"]
+argv = ["cargo", "test", "-p", "astral-types", "--locked", "--lib", "authorization_authority::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 17
+expected_tests = 17
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-source-unknown-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M3"]
+scope = "component"
+boundary = "Production resolve_commit control flow via queued gateway ports: reconcile before reclaimed writes, exact RESERVED permits one internal commit, known commits never write, mismatches quarantine and UNKNOWN remains pending; no SQL lease/CAS, live authority or complete signed-publication evidence"
+sources = ["astral-db/src/authority_source_outcome.rs", "astral-db/src/authority_source_outcome/reconciliation.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "authority_source_outcome::reconciliation", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 11
+expected_tests = 11
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-publication-transition-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M3"]
+scope = "component"
+boundary = "Exact approved publication transition matcher: contiguous generation with exact parent digest and nondecreasing revoke fence, unchanged certified identities, missing bootstrap and unapproved successor rejection; V7 commit binding of staged scope coverage to canonical outcome digests; publication history runtime contracts; test-only opaque completion fixtures do not prove MySQL WorkerOwned completion or a live publication lifecycle"
+sources = ["astral-db/src/authority_publication.rs", "astral-db/src/authority_publication/tests.rs", "astral-db/src/authority_publication/runtime.rs", "astral-db/src/authority_publication/runtime/history.rs", "astral-db/src/projection_execution/completion.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "--", "authority_publication::tests", "authority_publication::runtime", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 17
+expected_tests = 17
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-card-create-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M3"]
+scope = "component"
+boundary = "CardCreate publication candidate contracts across parent, capture and grants: exact actor/operation/card binding, typed RuleSet image, new-card baseline, exact after-row capture, complete allow-set and provenance reconstruction; in-process fixtures only, no MySQL WorkerOwned completion, live authority or deployment evidence"
+sources = ["astral-db/src/authority_publication.rs", "astral-db/src/authority_publication/card_create.rs", "astral-db/src/authority_publication/card_create/capture.rs", "astral-db/src/authority_publication/card_create/grants.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "authority_publication::card_create", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 8
+expected_tests = 8
+note = "Main local DB library run 2026-11-08 executed all eight CardCreate contracts; no MySQL, live quorum or publication acceptance."
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-identity-first-publication-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M3"]
+scope = "component"
+boundary = "Identity CARD first-publication contracts: exact card scope, before/after image and statement binding, and shared DTO shape; pure in-process contracts only, no MySQL WorkerOwned completion, live authority or deployment evidence"
+sources = ["astral-db/src/authority_publication.rs", "astral-db/src/authority_publication/identity.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "authority_publication::identity::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 3
+expected_tests = 3
+note = "Main local DB library run 2026-11-08 executed all three Identity first-publication contracts; no MySQL, live authority or deployment acceptance."
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-org-first-publication-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M3"]
+scope = "component"
+boundary = "ORG first-publication and membership source-owner contracts: sealed manifest identity, semantic hash/order, baseline generation, empty baseline and historical publication proof, membership freshness, primary receipt and delta-free candidate; in-process fixtures only, no MySQL, live authority or deployment evidence"
+sources = ["astral-db/src/authority_publication.rs", "astral-db/src/authority_publication/org.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "authority_publication::org::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 8
+expected_tests = 8
+note = "Main local DB library run 2026-11-08 executed all eight ORG first-publication contracts; source guards retain their stated boundaries and do not prove live publication."
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-eligibility-rebind-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M3"]
+scope = "component"
+boundary = "Durable ELIGIBILITY completion and private CARD rebind contracts: exact captured identity/card images, complete head/outbox/intent evidence, zero canonical grant delta, fail-closed terminal reconciliation and dedicated card-rebind artifact; current static tests exclude the ignored live MySQL/mTLS case, and production integration remains unproven"
+sources = ["astral-db/src/authority_eligibility_completion.rs", "astral-db/src/authority_eligibility_completion/verification.rs", "astral-db/src/authority_eligibility_completion/card_rebind.rs", "astral-db/src/authority_eligibility_completion/card_rebind/tests.rs", "astral-db/src/authority_eligibility_completion/tests.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "--", "authority_eligibility_completion::tests::", "authority_eligibility_completion::card_rebind::tests::", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 30
+expected_tests = 30
+note = "Main local Cargo run 2026-11-08: 30 passed and one live MySQL/mTLS test ignored; includes eight private CardRebind fixture/tamper contracts. No live dependency or transaction acceptance."
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-root-db-bootstrap-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M3"]
+scope = "component"
+boundary = "ROOT source-bootstrap DB bridge contracts: complete typed bundle ticket/payload, generated-id collision tolerance, signed-image tamper rejection, permit identity boundaries, canonical retained JSON and audit/digest binding; production bridge source guards only, no live database or authority deployment evidence"
+sources = ["astral-db/src/authority_source_bootstrap.rs", "astral-db/src/authority_source_bootstrap/tests.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "authority_source_bootstrap::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 7
+expected_tests = 7
+note = "Main local DB library run 2026-11-08 executed all seven ROOT DB contracts; no actual database mutation, preflight or authority deployment acceptance."
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-root-operator-contracts"
+owner = "astral-trustgraph"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M3"]
+scope = "component"
+boundary = "ROOT source-bootstrap operator contracts: typed preflight/input errors, apply-actor parsing, bounded paths/options, unknown commit reconciliation, exact durable completion and readiness distinction; local binary contracts only, no source mutation, live authority or deployment evidence"
+sources = ["astral-trustgraph/src/bin/astral-source-bootstrap.rs", "astral-trustgraph/src/bin/astral-source-bootstrap/operator.rs"]
+argv = ["cargo", "test", "-p", "astral-trustgraph", "--locked", "--bin", "astral-source-bootstrap", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 14
+expected_tests = 14
+note = "Main local Cargo run 2026-11-08: fourteen operator contracts passed; no source mutation, live database/quorum, initialization or readiness acceptance."
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-runtime-host-contracts"
+owner = "astral-trustgraph"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "E3", "E4"]
+scope = "component"
+boundary = "TrustGraph runtime host lifecycle contracts: configuration gates precede worker spawn, owned recovery tasks shut down, admission closes before HTTP stop, reverse ownership order is preserved, invalidation transport readiness is supervised and credential sources stay redacted; runtime-host unit/source contracts only, no MySQL, RabbitMQ or deployment evidence"
+sources = ["astral-trustgraph/src/runtime.rs", "astral-trustgraph/src/runtime/invalidation_transport.rs", "astral-trustgraph/src/runtime/superadmin_template.rs"]
+argv = ["cargo", "test", "-p", "astral-trustgraph", "--locked", "--lib", "--", "runtime::tests::", "runtime::config_role_tests::", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 19
+expected_tests = 19
+note = "Main local TrustGraph library run 2026-11-08 executed nineteen runtime and config-role contracts; child production sources are registered for ownership context, without deployment acceptance."
+timeout_seconds = 600
+
+[[suite]]
+id = "mq-invalidation-transport-lifecycle-contracts"
+owner = "astral-mq"
+profile = "native-kernel"
+test_services = []
+series = ["M2", "E4", "RQ4"]
+scope = "component"
+boundary = "Invalidation delivery transport lifecycle contracts: owner initialization, ready/failure observation, supervisor panic/cancellation failure, bounded join/abort cleanup, certificate pin and node-specific routing; injected local contracts only, no broker connection or deployment evidence"
+sources = ["astral-mq/src/invalidation_delivery_transport.rs", "astral-mq/src/invalidation_delivery_transport/lifecycle.rs", "astral-mq/src/invalidation_delivery_transport/lifecycle/tests.rs"]
+argv = ["cargo", "test", "-p", "astral-mq", "--locked", "--lib", "invalidation_delivery_transport::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 15
+expected_tests = 15
+note = "Static candidate: fifteen transport and retained-ownership tests including sticky shutdown failure; Main must reconcile expected_tests with Cargo output; no live delivery evidence"
+timeout_seconds = 600
+
+[[suite]]
+id = "mq-invalidation-fanout-contracts"
+owner = "astral-mq"
+profile = "native-kernel"
+test_services = []
+series = ["M2", "E4", "RQ4"]
+scope = "component"
+boundary = "Invalidation fanout lifecycle and routing contracts over local/injected ports; ACK and ownership semantics remain separate from broker delivery; no broker connection, MySQL or deployment evidence"
+sources = ["astral-mq/src/invalidation_fanout.rs"]
+argv = ["cargo", "test", "-p", "astral-mq", "--locked", "--lib", "invalidation_fanout::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 9
+expected_tests = 9
+note = "Static candidate: nine fanout tests; Main must reconcile expected_tests with Cargo output; no execution evidence"
+timeout_seconds = 600
+
+[[suite]]
+id = "mq-invalidation-fanout-worker-contracts"
+owner = "astral-mq"
+profile = "native-kernel"
+test_services = []
+series = ["M2", "E4", "RQ4"]
+scope = "component"
+boundary = "Invalidation fanout worker contracts: inbox ownership, relay/apply ACK ordering, duplicate/malformed/gap handling, bounded shutdown, subscriber and backoff behavior; injected local contracts only, no broker connection, MySQL or deployment evidence"
+sources = ["astral-mq/src/invalidation_fanout_worker.rs"]
+argv = ["cargo", "test", "-p", "astral-mq", "--locked", "--lib", "invalidation_fanout_worker::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 19
+expected_tests = 19
+note = "Static candidate: nineteen worker tests; Main must reconcile expected_tests with Cargo output; no execution evidence"
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-runtime-reducer-contracts"
+owner = "astral-trustgraph"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4"]
+scope = "component"
+boundary = "CURRENT V6 authority runtime ingress disposition reducer: verified IssuanceLeaseReconciliation is projected to Pending/Ready/Consumed/Unknown, only Ready permits proof consumption, Unknown requires readback by stable lease id before any retry, and the runtime port exposes no cloneable signer owner, frontier creation or background retry loop; local/unit in-process contracts only and not MySQL, RabbitMQ, four-node, dual-database, external arbiter, TLC or deployment evidence"
+sources = ["astral-trustgraph/src/service/authorization_authority_runtime.rs", "astral-db/src/authorization_fence_repository.rs", "astral-types/src/authorization_authority.rs"]
+argv = ["cargo", "test", "-p", "astral-trustgraph", "--locked", "--lib", "authorization_authority_runtime::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 2
+expected_tests = 2
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-issuance-frontier-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4"]
+scope = "component"
+boundary = "CURRENT V6 authority issuance pure contracts: the replay key binds the signed proof identity, the issuer frontier accepts only a strictly new generation with an exact parent hash, rejects the same or older global fence, and allows a zero parent only for the bootstrap frontier; in-process pure functions only and not durable MySQL issuer persistence, RabbitMQ, external arbiter/quorum, four-node or deployment evidence"
+sources = ["astral-db/src/authorization_fence_repository.rs", "astral-types/src/authorization_authority.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "authorization_fence_repository::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 4
+expected_tests = 4
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-quorum-scope-read-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M3", "MT-E1"]
+scope = "component"
+boundary = "V7 global-quorum fence provider scope-read contracts: card reads normalize the publication scope to the canonical card, org source scopes pass through unchanged, and card reads without a card scope fail closed; in-process provider contracts only, no etcd quorum, MySQL, RabbitMQ, four-node or deployment evidence"
+sources = ["astral-db/src/authorization_fence_repository.rs", "astral-db/src/authorization_fence_repository/quorum.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "authorization_fence_repository::quorum::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 3
+expected_tests = 3
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-source-runtime-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "E3", "E4"]
+scope = "component"
+boundary = "V7 authority source-side runtime loop contracts over injected providers: lifecycle bounds stay bounded, cycle errors never kill the loop and shutdown drains cleanly, and wait-for-death surfaces unexpected clean termination instead of masking it; in-process runtime contracts only, no MySQL, etcd quorum, RabbitMQ or deployment evidence"
+sources = ["astral-db/src/authority_source_runtime.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "authority_source_runtime::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 3
+expected_tests = 3
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-admission-durable-identity-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M2", "M3"]
+scope = "component"
+boundary = "V7 admission-use durable identity contracts: reconstructed handles carry the same durable identity and the identity binds nonce, operation, scope and signature so a reservation cannot be replayed or widened; pure in-process value contracts only, no MySQL, etcd quorum or deployment evidence"
+sources = ["astral-db/src/authorization_admission_repository.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "authorization_admission_repository::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 2
+expected_tests = 2
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-v7-migration-pin-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["CORE", "M1", "M2", "M3"]
+scope = "component"
+boundary = "Embedded V7 authority migration registration pins: each authority migration (production consumption, quorum projections, source outcome, publication history) matches its tracked SQL byte-for-byte with a stable SHA-384 consumption identity and exact table/column/index artifact contract; source-text and MIGRATOR inspection only, no database migration is executed"
+sources = ["astral-db/src/migration/authority_v7.rs", "astral-db/src/migration/authority_projections.rs", "astral-db/src/migration/authority_source_outcome.rs", "astral-db/src/migration/authority_publication_history.rs", "astral-db/migrations/20261107000001_authority_production.sql", "astral-db/migrations/20261107000005_authority_projections.sql", "astral-db/migrations/20261107000006_authority_source_outcome.sql", "astral-db/migrations/20261107000007_authority_publication_history.sql"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "migration::authority", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 4
+expected_tests = 4
+timeout_seconds = 600
+
+[[suite]]
+id = "authority-attestation-partition-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["M3", "E3", "E4"]
+scope = "component"
+boundary = "Authority attestation partition-seal contracts on the in-process hub: a nonempty root cannot replace explicit partition coverage, partitions install atomically and exactly with expiry without a request, duplicate mixed-frontier and local-race seals are rejected, and a request-installed scope invalidates the previous partition seal; MemoryProjectionHub fixtures only, not MySQL, etcd quorum, RabbitMQ, four-node or deployment evidence, and not the ignored memory-hub performance matrix"
+sources = ["astral-db/src/memory_projection_hub.rs", "astral-db/src/memory_projection_hub/authority_attestation.rs", "astral-db/src/memory_projection_hub/tests/authority_attestation.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "memory_projection_hub::tests::authority_attestation::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 5
+expected_tests = 5
+timeout_seconds = 600
+
+[[suite]]
+id = "astral-authority-store-contracts"
+owner = "astral-authority"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M2", "M3"]
+scope = "component"
+boundary = "In-process authority control-plane store contracts over MemoryAuthorityStore with the protected in-process signer: fence/reservation/publication state CAS/Txn semantics, canonical lens reads and finite card coverage derivation; no etcd, no network listener, no real signer key material and no deployment evidence; building the service feature requires system protoc, and a host without protoc keeps this suite BLOCKED rather than PASS"
+sources = ["astral-authority/tests/store_contract.rs", "astral-authority/tests/store_contract/canonical_lens.rs", "astral-authority/tests/store_contract/finite_coverage.rs", "astral-authority/tests/store_contract/close_history.rs", "astral-authority/tests/store_contract/rotation_fence.rs", "astral-authority/tests/store_contract/config_completion_contract.rs", "astral-authority/tests/store_contract/eligibility_completion_contract.rs", "astral-authority/tests/store_contract/abort_contract.rs", "astral-authority/src/store", "astral-authority/src/service/coverage.rs", "astral-authority/src/service/abort.rs"]
+argv = ["cargo", "test", "-p", "astral-authority", "--locked", "--test", "store_contract", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 36
+expected_tests = 36
+ timeout_seconds = 1800
+
+[[suite]]
+id = "astral-authority-bootstrap-contracts"
+owner = "astral-authority"
+profile = "native-kernel"
+test_services = []
+series = ["M2", "M3", "M5"]
+scope = "component"
+boundary = "In-process authority bootstrap contracts: trust-root genesis/rotation gating against the V7 protocol bootstrap artifact, exact config surface and protected-signer handling; no etcd quorum, no network listener, no real key material and no deployment evidence; building the service feature requires system protoc, and a host without protoc keeps this suite BLOCKED rather than PASS"
+sources = ["astral-authority/tests/bootstrap_contract.rs", "astral-authority/src/bootstrap.rs", "astral-authority/src/config.rs", "astral-authority/src/signing.rs"]
+argv = ["cargo", "test", "-p", "astral-authority", "--locked", "--test", "bootstrap_contract", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 12
+expected_tests = 12
+timeout_seconds = 1800
+
+[[suite]]
+id = "astral-authority-source-bootstrap-contracts"
+owner = "astral-authority"
+profile = "native-kernel"
+test_services = []
+series = ["M2", "M3", "M5", "RQ3", "RQ4"]
+scope = "component"
+boundary = "Actual AuthorityService and MemoryAuthorityStore ROOT source bootstrap prepare/finalize/reconcile, immutable ticket and completion binding, GLOBAL mutual exclusion, CAS, durable reservation state and historical receipt replay; no real etcd, MySQL source transaction, network UNKNOWN, initialization or deployment evidence"
+sources = ["astral-authority/tests/source_bootstrap_contract.rs", "astral-authority/src/service/source_bootstrap.rs", "astral-types/src/authority_protocol/source_bootstrap.rs"]
+argv = ["cargo", "test", "-p", "astral-authority", "--locked", "--test", "source_bootstrap_contract", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 5
+expected_tests = 5
+timeout_seconds = 1800
+
+[[suite]]
+id = "trustgraph-source-outcome-finite-coverage-contracts"
+owner = "astral-trustgraph"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "M3"]
+scope = "component"
+boundary = "Pure finite card coverage derivation over the real source-outcome channels: delta events are published aggregates with independent event ids while projection rows are head/outbox channel rows, single-owner batches declare complete coverage, cross-tenant batches declare every proven owner, projection rows never join by delta event identity, owner-set contradictions fail closed and non-card channel rows stay global; pure derivation fixtures only, no MySQL, RabbitMQ, live authority or deployment evidence"
+sources = ["astral-trustgraph/src/repository/authorization_source_transaction.rs", "astral-trustgraph/src/repository/authorization_source_transaction/source_outcome.rs", "astral-trustgraph/src/repository/authorization_source_transaction/source_outcome/tests.rs"]
+argv = ["cargo", "test", "-p", "astral-trustgraph", "--locked", "--lib", "repository::authorization_source_transaction::source_outcome::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 15
+expected_tests = 15
+timeout_seconds = 600
+
+[[suite]]
+id = "invalidation-recovery-reducer-contracts"
+owner = "test-harness"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4"]
+scope = "component"
+boundary = "CURRENT V6 pure Rust invalidation recovery reducer: broker admission is not inbox application, UNKNOWN and lease expiry remain IN_DOUBT without blind retry, exact provenance is required for settlement, duplicate/reorder/gap and watermark regression fail closed per scope, ACK follows durable APPLIED proof, heartbeat cannot clear SUSPECT, and SERVING requires durable reconciliation plus fresh transport; local/unit in-process contract only and not MySQL, RabbitMQ, four-node, dual-database, external arbiter, TLC or deployment evidence"
+sources = ["test-harness/src/phase_e_invalidation_contract.rs"]
+argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "phase_e_invalidation_contract", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 9
+expected_tests = 9
+timeout_seconds = 600
+
+[[suite]]
+id = "trustgraph-invalidation-recovery-op-contracts"
+owner = "astral-trustgraph"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "E3", "E4"]
+scope = "component"
+boundary = "CURRENT V6 production-crate recovery-op contract: inspect/settle argument parsing, bounded message-id and SHA-256 provenance shape, total distinct exit codes, PENDING modeled but never emitted, settle refusing both decisions with stable codes and non-APPLIED output, provenance matching precedence mirroring the repository, inspect JSON covering durable fields with secret redaction, and inspect timeout reporting UNKNOWN without retry; local/unit in-process only and distinct from the test-harness pure reducer suite; not MySQL, RabbitMQ, four-node, dual-database, external arbiter, TLC or deployment evidence"
+sources = ["astral-trustgraph/src/service/invalidation_recovery.rs"]
+argv = ["cargo", "test", "-p", "astral-trustgraph", "--locked", "--lib", "service::invalidation_recovery::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 15
+expected_tests = 15
+timeout_seconds = 600
+
+[[suite]]
+id = "trustgraph-invalidation-runtime-supervisor-contracts"
+owner = "astral-trustgraph"
+profile = "native-kernel"
+test_services = []
+series = ["RQ3", "RQ4", "E3", "E4"]
+scope = "component"
+boundary = "CURRENT V6 LocalBus/rabbit invalidation runtime supervisor contract: close-owner and cancelled-shutdown ownership, bounded bootstrap backoff never leaking owned connections, channel liveness tracking the checked connection, SUSPECT raised by listener and never cleared by heartbeat, scope gap as strict SUSPECT signal, reconcile deferral limited to hub transient deferrals, and frozen fanout flag/gated install/rollback source-shape pins; local/unit in-process and source-text assertions only; not MySQL, RabbitMQ, four-node, dual-database, external arbiter, TLC or deployment evidence"
+sources = ["astral-trustgraph/src/service/invalidation_runtime.rs"]
+argv = ["cargo", "test", "-p", "astral-trustgraph", "--locked", "--lib", "service::invalidation_runtime::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 19
+expected_tests = 19
+timeout_seconds = 600
+
+[[suite]]
+id = "hub-readiness-negative-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["M3", "E3", "E4"]
+scope = "component"
+boundary = "Hub readiness negative contracts selected by the two libtest prefix filters: fence sync never serves before an explicit durable reconcile with a certified root, authority pending invalidates certified roots and requires recovery; in-process MemoryProjectionHub fixtures only; not MySQL, RabbitMQ, four-node, dual-database, external arbiter, TLC or deployment evidence, and not the ignored memory-hub performance matrix"
+sources = ["astral-db/src/memory_projection_hub.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "--", "memory_projection_hub::tests::fence_sync_", "memory_projection_hub::tests::authority_pending_", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 4
+expected_tests = 4
+timeout_seconds = 600
+
+[[suite]]
+id = "db-authorization-readiness-contracts"
+owner = "astral-db"
+profile = "native-kernel"
+test_services = []
+series = ["M3", "M5", "RQ5"]
+scope = "component"
+boundary = "Strict/durable-only repository readiness contract: a strict repository without an explicit provider cannot serve positive authorization, durable-only readiness requires explicit opt-in, published-card evidence errors map to explicit policy errors without legacy fallback, the sqlx published-card port delegates to the strict reader, and the strict pool reader commits explicitly and never returns empty success; in-process repository contracts only; not MySQL, RabbitMQ, four-node, dual-database, external arbiter, TLC or deployment evidence"
+sources = ["astral-db/src/repository/authorization.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--locked", "--lib", "repository::authorization::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 5
+expected_tests = 5
+timeout_seconds = 600
+
+[[suite]]
+id = "single-node-readiness-liveness-contracts"
+owner = "astral-single-node"
+profile = "native-kernel"
+test_services = []
+series = ["M2", "E3", "E4"]
+scope = "component"
+boundary = "Single-node binary readiness/liveness ordering contract: required-service or owner loss closes admission before abort, writer-lease supervision precedes warm-up and service spawn, projection-owner liveness gate is wired into readiness and the run loop, lease loss is watched during readiness, terminal service errors are recorded and never polled again, bounded abort joins with detach classification, and writer-lease probe mismatch/unknown classifications are fatal; in-process and source-shape assertions only; liveness is never an authorization proof; not MySQL, RabbitMQ, four-node, dual-database, external arbiter, TLC or deployment evidence"
+sources = ["astral-single-node/src/main.rs", "astral-single-node/src/writer_lease.rs"]
+argv = ["cargo", "test", "-p", "astral-single-node", "--locked", "--bin", "astral-single-node", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 18
+expected_tests = 18
+timeout_seconds = 600
+
+[[suite]]
+id = "mq-consumer-unknown-transition-contracts"
+owner = "astral-mq"
+profile = "native-kernel"
+test_services = []
+series = ["M2", "E4", "RQ4"]
+scope = "component"
+boundary = "Rabbit consumer transition contract over injected ports: relay binding rejects divergent transport/payload/committed bytes, bus failures classify admission refusal separately from UNKNOWN, malformed messages quarantine immediately while UNKNOWN always quarantines, known failures are bounded by the attempt ceiling, handler duplicate/UNKNOWN delivery outcomes and join-error paths mark SUSPECT, DLQ terminal capture acks only after capture, revocation shard receipt barriers require the complete owned set and completion follows strict source-commit DB proof before outbox, plus idempotency namespace, lock order, SQL placeholder/escape and queue-owner inventories; local/unit in-process contracts only and no broker connection; not MySQL, RabbitMQ, four-node, dual-database, external arbiter, TLC or deployment evidence"
+sources = ["astral-mq/src/consumers.rs"]
+argv = ["cargo", "test", "-p", "astral-mq", "--locked", "--lib", "consumers::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 47
+expected_tests = 47
+timeout_seconds = 600
+
+[[suite]]
+id = "mq-invalidation-envelope-fail-closed-contracts"
+owner = "astral-mq"
+profile = "native-kernel"
+test_services = []
+series = ["M2", "M3", "E4"]
+scope = "component"
+boundary = "Invalidation envelope/proof/shard-planning fail-closed contract: snapshot proof distinctness, session revocation receipt proof binding and rejecting wrong/duplicate/missing rows, envelope scope metadata round-trip and tamper rejection, cross-domain scope rejection, retired-version rejection, publication stamp/generation binding, fixed queue and global ordering keys not caller selectable, bounded shard planning with stable one-based operation-correlated shard ids and byte-stable plans, and frozen origin-region install point; pure in-process contracts only and no broker connection; not MySQL, RabbitMQ, four-node, dual-database, external arbiter, TLC or deployment evidence"
+sources = ["astral-mq/src/invalidation.rs"]
+argv = ["cargo", "test", "-p", "astral-mq", "--locked", "--lib", "invalidation::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 29
+expected_tests = 29
+timeout_seconds = 600
 
 [[suite]]
 id = "observability-feature-check"
@@ -1852,6 +2396,21 @@ minimum_tests = 7
 expected_tests = 7
 
 [[suite]]
+id = "sod-fresh-policy-real-mysql"
+owner = "astral-db"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["M2", "M3", "E3", "E4", "MT-E1"]
+scope = "integration"
+boundary = "Ignored real MySQL fresh SoD policy reads, STATIC/DYNAMIC changes, cap+1 rejection and table-lock query deadline; requires an approved run-owned migrated loopback database, RUST_INTEGRATION_REQUIRED=1, TEST_USE_EXISTING=1 and ASTRAL_MIGRATION_ENV=isolated; no authority quorum, HTTP, RabbitMQ or deployed authorization evidence"
+sources = ["astral-db/src/sod_check.rs"]
+argv = ["cargo", "test", "-p", "astral-db", "--lib", "sod_policy_fresh_read_capacity_and_timeout_real_mysql", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 180
+
+[[suite]]
 id = "db-quarantine"
 owner = "astral-db"
 profile = "native-single-node"
@@ -2398,12 +2957,12 @@ profile = "offline-validation"
 test_services = []
 series = ["PERF", "RQ5"]
 scope = "component"
-boundary = "Rust offline equivalents for S15 run-selection, required-case and coverage predicates; not the protected three-node distributed campaign"
-sources = ["test-harness/src/s15_validation.rs", "Docs/实验/分布式测试/rust-s15/test_s15_validation.py", "Docs/实验/分布式测试/rust-s15/s15_validation.py"]
+boundary = "Rust offline equivalents for CURRENT V6 S15 run-selection, required-case and coverage predicates; S15 requires the four-server/two-half topology (AL1+AL2 -> DB1, AL3+AL4 -> DB2), custom same-database channel, RabbitMQ cross-database transport, exact durable receipt, canonical message identity, duplicate single-terminal completion, UNKNOWN reconciliation, no stale ALLOW during recovery, and final published-evidence READY; not the protected live campaign"
+sources = ["test-harness/src/s15_validation.rs", "test-harness/src/remaining_contracts.rs", "astral-mq/src/local_bus.rs", "astral-db/src/local_projection_bus.rs", "astral-mq/src/consumer.rs", "astral-mq/src/invalidation_fanout.rs", "astral-db/src/projection_execution/completion.rs", "astral-db/src/authorization_projection_repository.rs", "policy-engine/src/engine/published.rs", "Docs/实验/分布式测试/rust-s15/test_s15_validation.py", "Docs/实验/分布式测试/rust-s15/s15_validation.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "s15_validation::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
-minimum_tests = 6
-expected_tests = 6
+minimum_tests = 8
+expected_tests = 8
 timeout_seconds = 600
 
 [[suite]]
@@ -2445,12 +3004,57 @@ profile = "offline-validation"
 test_services = []
 series = ["RQ1", "RQ2", "RQ3", "RQ4", "RQ5", "PERF"]
 scope = "live-campaign"
-boundary = "current distributed campaign prerequisite gate: approved deployment, current transport, three-node state and durable evidence are required; offline contract only"
+boundary = "current distributed campaign prerequisite gate: approved deployment, current transport, durable evidence and an explicitly declared topology are required; offline contract only; generic distributed profile does not imply the S15 four-server/two-half campaign"
 sources = ["test-harness/src/remaining_contracts.rs", "Docs/实验/分布式测试/rust-s15"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "remaining_contracts::tests::rq_current_distributed_campaign_requires_live_prerequisites", "--", "--exact", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
 expected_tests = 1
+timeout_seconds = 600
+
+[[suite]]
+id = "s15-v6-distributed-campaign"
+owner = "test-harness + testsuite"
+profile = "offline-validation"
+test_services = []
+series = ["RQ4", "RQ5", "PERF"]
+scope = "live-campaign"
+boundary = "CURRENT V6 S15 four-server/two-half prerequisite gate: AL1+AL2 share DB1, AL3+AL4 share DB2; same-DB links require custom_same_db_channel, cross-DB links require RabbitMQ, and exact durable publication evidence, half-authority fencing and split-brain fail-closed are required; offline contract only and no Redis/OPA dispatch"
+sources = ["test-harness/src/s15_validation.rs", "test-harness/src/remaining_contracts.rs", "astral-mq/src/local_bus.rs", "astral-db/src/local_projection_bus.rs", "astral-mq/src/consumer.rs", "astral-mq/src/invalidation_fanout.rs", "astral-db/src/projection_execution/completion.rs", "astral-db/src/authorization_projection_repository.rs", "policy-engine/src/engine/published.rs", "tests-suite/series/RQ3/native_projection_lifecycle.rs", "Docs/实验/分布式测试/rust-s15"]
+argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "remaining_contracts::tests::s15_v6_distributed_campaign_requires_current_durable_prerequisites", "--", "--exact", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 600
+
+[[suite]]
+id = "s15-live-coordinator-contracts"
+owner = "test-harness"
+profile = "native-kernel"
+test_services = []
+series = ["RQ4", "RQ5", "E3", "E4"]
+scope = "component"
+boundary = "In-process S15 live-probe coordinator contracts over injected transports: probe allowlist is exactly AL1-AL4 with half/database metadata; request ids are run-scoped and signing-safe; Gateway v3 headers, bounded retries and distinct identities are required. Production authorization-observation requests bind exactly run/operation/reservation/message/tenant/card, and the typed response decoder rejects foreign or duplicate correlation fields while preserving UNKNOWN planes. Owner evidence is immutable after parsing, requires opaque authenticated transport proof bound to the raw response SHA-256, and binds nonempty outer/inner operation ids even without an expected operation. Self-reported owner identity and all-true attestations cannot prove durable requirements. No production owner-proof constructor or protected node contact is exercised; the four-server/two-half campaign, RabbitMQ cross-DB, custom same-DB channel, authority fencing and fault recovery remain BLOCKED, so PASS here is never a live S15 PASS"
+sources = ["test-harness/src/s15_live_coordinator.rs", "test-harness/src/s15_validation.rs", "test-harness/src/remaining_contracts.rs", "test-harness/src/node_adapter_contract.rs", "test-harness/src/readiness_contract.rs", "test-harness/src/bin/s15-probe.rs"]
+argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "s15_live_coordinator::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 30
+expected_tests = 30
+timeout_seconds = 600
+
+[[suite]]
+id = "s15-probe-executor-contracts"
+owner = "test-harness"
+profile = "native-kernel"
+test_services = []
+series = ["RQ4", "RQ5", "M5", "E4"]
+scope = "component"
+boundary = "Offline S15 protected-probe executor contracts: configuration loads only from the complete protected settings surface with bounded budget overrides and fail-closed naming of missing variables, gateway key files enforce unix mode 0600, attestation requires every prerequisite as an explicit bool and rejects unknown fields, execution requires the exact approval value, run artifacts refuse to overwrite an existing directory, unattested runs record blockers and can never yield PASS, and the TLS transport maps offline requests exactly; the s15-probe CLI is network-inert without the full protected configuration plus approval and only talks to the frozen read-only test-control probe on AL1-AL4; no etcd/MySQL/RabbitMQ, no protected node contact, no real secret material, and PASS here is never a live S15 PASS"
+sources = ["test-harness/src/s15_probe_executor.rs", "test-harness/src/bin/s15-probe.rs", "test-harness/src/remaining_contracts.rs", "test-harness/src/readiness_contract.rs", "test-harness/src/node_adapter_contract.rs"]
+argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "s15_probe_executor::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 12
+expected_tests = 12
 timeout_seconds = 600
 
 [[suite]]

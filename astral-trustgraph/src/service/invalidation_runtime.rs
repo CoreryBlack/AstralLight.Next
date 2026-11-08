@@ -37,11 +37,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use astral_db::invalidation_delivery::{
+    InvalidationDeliveryContext, InvalidationDeliveryRecipient,
+};
 use astral_db::MemoryProjectionHub;
 
 use astral_mq::config::declare_invalidation_fanout_topology;
 use astral_mq::envelope::MessageEnvelope;
 use astral_mq::invalidation::InvalidationEvent;
+use astral_mq::invalidation_delivery_transport::{
+    InvalidationTransportStartSpec, OwnedInvalidationTransportHandles,
+};
 use astral_mq::invalidation_fanout::{HeartbeatScope, ScopeGapReport};
 use astral_mq::invalidation_fanout_worker::{
     spawn_invalidation_fanout_inbox_worker, spawn_invalidation_fanout_relay,
@@ -216,8 +222,9 @@ fn supervisor_tick_for_transport(
     liveness_ok: bool,
     suspect: bool,
     local: bool,
+    authority_ready: bool,
 ) -> SupervisorAction {
-    if local && liveness_ok && !suspect {
+    if local && liveness_ok && !suspect && authority_ready {
         SupervisorAction::Observe
     } else {
         supervisor_tick(liveness_ok, suspect)
@@ -244,6 +251,7 @@ pub fn spawn_reconcile_supervisor(
     hub: MemoryProjectionHub,
     probe: LivenessProbe,
     worker_id: String,
+    authority: Option<Arc<astral_db::SqlxAuthorizationFenceProvider>>,
 ) -> RuntimeTaskHandle {
     let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
     RuntimeTaskHandle::spawn_with_shutdown(
@@ -264,10 +272,41 @@ pub fn spawn_reconcile_supervisor(
                 let now_ms = monotonic_millis();
                 let suspect = hub.channel_is_suspect();
                 let alive = probe.is_alive(now_ms);
+                if hub.positive_authorization_ready() {
+                    let Some(authority) = authority.as_ref() else {
+                        hub.mark_authority_pending("serving authority provider missing");
+                        continue;
+                    };
+                    match tokio::time::timeout(
+                        RECONCILE_DEADLINE,
+                        authority.observe_memory_partition(&hub),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            hub.mark_authority_pending(
+                                "current authority no longer proves the serving partition",
+                            );
+                            tracing::warn!(worker_id = %worker_id, reason = %error,
+                                "authority observation failed; authorization remains pending");
+                            continue;
+                        }
+                        Err(_) => {
+                            hub.mark_authority_pending(
+                                "current authority observation deadline exceeded",
+                            );
+                            tracing::warn!(worker_id = %worker_id,
+                                "authority observation timed out; authorization remains pending");
+                            continue;
+                        }
+                    }
+                }
                 match supervisor_tick_for_transport(
                     alive,
                     suspect,
                     matches!(probe, LivenessProbe::LocalBus(_)),
+                    hub.positive_authorization_ready(),
                 ) {
                     SupervisorAction::Observe => hub.record_channel_heartbeat(),
                     SupervisorAction::HoldSuspect => {}
@@ -277,6 +316,18 @@ pub fn spawn_reconcile_supervisor(
                     );
                     }
                     SupervisorAction::Reconcile => {
+                        if hub.positive_authorization_ready() {
+                            hub.record_channel_heartbeat();
+                            continue;
+                        }
+                        if let Err(error) = hub.begin_authority_fence_sync() {
+                            tracing::debug!(
+                                worker_id = %worker_id,
+                                reason = %error,
+                                "authority fence sync could not begin; retrying next tick"
+                            );
+                            continue;
+                        }
                         hub.record_channel_heartbeat();
                         match tokio::time::timeout(
                             RECONCILE_DEADLINE,
@@ -284,12 +335,61 @@ pub fn spawn_reconcile_supervisor(
                         )
                         .await
                         {
-                            Ok(Ok(report)) => tracing::info!(
-                                worker_id = %worker_id,
-                                identities = report.identities,
-                                pending_restored = report.pending_restored,
-                                "invalidation fanout hub proved against durable reconcile; suspect gate cleared"
-                            ),
+                            Ok(Ok(report)) => {
+                                let Some(authority) = authority.as_ref() else {
+                                    hub.mark_authority_pending(
+                                        "startup authority provider missing",
+                                    );
+                                    continue;
+                                };
+                                match tokio::time::timeout(
+                                    RECONCILE_DEADLINE,
+                                    authority.attest_memory_partition(&hub),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(scopes)) => tracing::debug!(
+                                        worker_id = %worker_id, scopes,
+                                        "authority certified the bounded serving partition"
+                                    ),
+                                    Ok(Err(error)) => {
+                                        hub.mark_authority_pending(
+                                            "scope attestation did not prove serving coverage",
+                                        );
+                                        tracing::warn!(worker_id = %worker_id, reason = %error,
+                                            "scope attestation failed; authorization remains pending");
+                                        continue;
+                                    }
+                                    Err(_) => {
+                                        hub.mark_authority_pending(
+                                            "scope attestation deadline exceeded",
+                                        );
+                                        tracing::warn!(worker_id = %worker_id,
+                                            "scope attestation timed out; authorization remains pending");
+                                        continue;
+                                    }
+                                }
+                                if let Err(error) = hub.mark_authority_reconcile_ready() {
+                                    tracing::debug!(
+                                        worker_id = %worker_id,
+                                        reason = %error,
+                                        "durable reconcile completed but authority ready gate is not proven"
+                                    );
+                                } else if let Err(error) = hub.complete_authority_fence_sync() {
+                                    tracing::debug!(
+                                        worker_id = %worker_id,
+                                        reason = %error,
+                                        "authority ready gate completed but serving transition is not proven"
+                                    );
+                                }
+                                tracing::info!(
+                                    worker_id = %worker_id,
+                                    identities = report.identities,
+                                    pending_restored = report.pending_restored,
+                                    authority_state = ?hub.authority_state(),
+                                    "invalidation fanout hub proved against durable reconcile; suspect gate cleared"
+                                );
+                            }
                             Ok(Err(error)) => {
                                 if is_reconcile_deferral(&error) {
                                     tracing::debug!(
@@ -749,6 +849,161 @@ pub enum FanoutWiring {
     },
 }
 
+/// Startup-frozen recipient routing shared by source writers and the owned
+/// invalidation runtime. Construction validates and canonicalizes the roster
+/// exactly once; no producer may consult env or a mutable global roster.
+#[derive(Debug, Clone)]
+pub struct FrozenInvalidationDeliveryConfig {
+    context: Arc<InvalidationDeliveryContext>,
+}
+
+impl FrozenInvalidationDeliveryConfig {
+    pub fn try_new(
+        source_database_id: impl Into<String>,
+        roster_version: impl Into<String>,
+        recipients: Vec<InvalidationDeliveryRecipient>,
+    ) -> Result<Self, String> {
+        let context =
+            InvalidationDeliveryContext::try_new(source_database_id, roster_version, recipients)
+                .map_err(|error| error.to_string())?;
+        Ok(Self {
+            context: Arc::new(context),
+        })
+    }
+
+    /// Convert the explicit common startup config. Source DB identity and the
+    /// recipient roster are required inputs; no AppConfig transport field is
+    /// inferred or substituted.
+    pub fn from_app_config(
+        config: &astral_common::config::AppConfig,
+    ) -> Result<Option<Self>, String> {
+        let delivery = &config.invalidation_delivery;
+        if !delivery.enabled {
+            return Ok(None);
+        }
+        let recipients =
+            serde_json::from_str::<Vec<InvalidationDeliveryRecipient>>(&delivery.recipients_json)
+                .map_err(|error| format!("invalidation delivery recipients JSON: {error}"))?;
+        Self::try_new(
+            delivery.source_database_id.clone(),
+            delivery.roster_version.clone(),
+            recipients,
+        )
+        .map(Some)
+    }
+
+    /// The only producer injection value. It is Arc-backed and immutable after
+    /// construction, so every source writer sees the same frozen roster.
+    pub fn delivery_context(&self) -> Arc<InvalidationDeliveryContext> {
+        Arc::clone(&self.context)
+    }
+
+    pub fn source_database_id(&self) -> &str {
+        self.context.source_database_id()
+    }
+
+    pub fn roster_version(&self) -> &str {
+        self.context.roster_version()
+    }
+}
+
+pub struct OwnedInvalidationFanoutRuntime {
+    runtime: InvalidationFanoutRuntime,
+    delivery: FrozenInvalidationDeliveryConfig,
+    transport: Option<OwnedInvalidationTransportHandles>,
+}
+
+impl OwnedInvalidationFanoutRuntime {
+    pub fn delivery_context(&self) -> Arc<InvalidationDeliveryContext> {
+        self.delivery.delivery_context()
+    }
+
+    pub fn delivery_config(&self) -> &FrozenInvalidationDeliveryConfig {
+        &self.delivery
+    }
+
+    /// Install the exact frozen context into the MQ-owned revocation producer.
+    /// This is the root-composition call: the producer receives the runtime's
+    /// immutable context and cannot construct a second roster or read env.
+    pub fn install_mq_session_revocation_producer(&self) -> Result<(), String> {
+        astral_mq::consumers::set_session_revocation_delivery((*self.delivery_context()).clone())
+    }
+
+    pub fn install_transport_handles(
+        &mut self,
+        handles: OwnedInvalidationTransportHandles,
+    ) -> Result<(), String> {
+        if self.transport.is_some() {
+            return Err("invalidation transport handles already installed".into());
+        }
+        self.transport = Some(handles);
+        Ok(())
+    }
+
+    pub async fn start_transport_handles(
+        config: &astral_common::config::AppConfig,
+        delivery: &FrozenInvalidationDeliveryConfig,
+        pool: sqlx::MySqlPool,
+        rabbit_connection: Arc<lapin::Connection>,
+        owner: String,
+        poll_interval: Duration,
+    ) -> Result<OwnedInvalidationTransportHandles, String> {
+        let delivery_context = delivery.delivery_context();
+        let apply: Arc<dyn InvalidationApply> = Arc::new(ConsumerDispatchInvalidationApply);
+        astral_mq::invalidation_delivery_transport::start_invalidation_transport(
+            InvalidationTransportStartSpec {
+                config,
+                delivery: delivery_context.as_ref(),
+                pool,
+                rabbit_connection,
+                owner,
+                poll_interval,
+                apply,
+            },
+        )
+        .await
+    }
+
+    pub fn status(&self, now_ms: u64) -> InvalidationFanoutStatus {
+        self.runtime.status(now_ms)
+    }
+
+    pub async fn shutdown(mut self, timeout: Duration) -> Result<(), String> {
+        let mut failures = Vec::new();
+        if let Some(transport) = self.transport.take() {
+            if let Err(error) = transport.shutdown(timeout).await {
+                failures.push(error);
+            }
+        }
+        if let Err(error) = self.runtime.shutdown(timeout).await {
+            failures.push(error);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+}
+
+/// Construct the owned runtime seam. `delivery` must be built from startup
+/// configuration before any source writer begins; the returned object retains
+/// that same immutable context for injection into MQ/Identity/TrustGraph owners.
+pub async fn start_owned_invalidation_fanout_runtime(
+    pool: sqlx::MySqlPool,
+    wiring: FanoutWiring,
+    identity: NodeIdentity,
+    delivery: FrozenInvalidationDeliveryConfig,
+    authority: Option<Arc<astral_db::SqlxAuthorizationFenceProvider>>,
+) -> Result<OwnedInvalidationFanoutRuntime, String> {
+    let runtime = start_invalidation_fanout_runtime(pool, wiring, identity, authority).await?;
+    Ok(OwnedInvalidationFanoutRuntime {
+        runtime,
+        delivery,
+        transport: None,
+    })
+}
+
 /// 运行期状态快照（runtime-facing status；纯读取，无副作用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidationFanoutStatus {
@@ -979,6 +1234,7 @@ pub fn start_local_projection_supervisor(
     pool: sqlx::MySqlPool,
     bus: astral_mq::local_bus::LocalBus,
     identity: NodeIdentity,
+    authority: Option<Arc<astral_db::SqlxAuthorizationFenceProvider>>,
 ) -> Result<InvalidationFanoutRuntime, String> {
     let hub = astral_db::memory_projection_hub()
         .cloned()
@@ -992,6 +1248,7 @@ pub fn start_local_projection_supervisor(
             identity.region(),
             identity.node()
         ),
+        authority,
     );
     Ok(InvalidationFanoutRuntime {
         members: Some(InvalidationFanoutMembers {
@@ -1024,6 +1281,7 @@ pub async fn start_invalidation_fanout_runtime(
     pool: sqlx::MySqlPool,
     wiring: FanoutWiring,
     identity: NodeIdentity,
+    authority: Option<Arc<astral_db::SqlxAuthorizationFenceProvider>>,
 ) -> Result<InvalidationFanoutRuntime, String> {
     // 单写者 ownership 是部署预条件（见 InvalidationFanoutRuntime 文档），不
     // 以单节点锁强制：多节点共库 fanout 与 composite 已持租约都会被
@@ -1157,6 +1415,7 @@ pub async fn start_invalidation_fanout_runtime(
             identity.region(),
             identity.node()
         ),
+        authority,
     );
     Ok(InvalidationFanoutRuntime {
         members: Some(InvalidationFanoutMembers {
@@ -1558,24 +1817,24 @@ mod tests {
     #[test]
     fn healthy_local_owners_observe_without_database_reconciliation() {
         assert_eq!(
-            supervisor_tick_for_transport(true, false, true),
+            supervisor_tick_for_transport(true, false, true, true),
             SupervisorAction::Observe
         );
         assert_eq!(
-            supervisor_tick_for_transport(true, true, true),
+            supervisor_tick_for_transport(true, false, true, false),
             SupervisorAction::Reconcile
         );
         assert_eq!(
-            supervisor_tick_for_transport(false, false, true),
+            supervisor_tick_for_transport(false, false, true, true),
             SupervisorAction::MarkSuspect
         );
         assert_eq!(
-            supervisor_tick_for_transport(false, true, true),
+            supervisor_tick_for_transport(false, true, true, true),
             SupervisorAction::HoldSuspect
         );
         for suspect in [false, true] {
             assert_eq!(
-                supervisor_tick_for_transport(true, suspect, false),
+                supervisor_tick_for_transport(true, suspect, false, true),
                 SupervisorAction::Reconcile
             );
         }

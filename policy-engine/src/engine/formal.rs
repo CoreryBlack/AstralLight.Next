@@ -21,11 +21,34 @@ impl PolicyEngine {
     /// The ordered gates are AUTHN → CARD_CONTEXT → target ownership →
     /// GlobalAdmin (when required) → ORG_SCOPE admission (when managed) →
     /// published CARD evidence. Every failed or unavailable authority proof denies.
+    /// Positive ALLOWs additionally require the repository's node-level
+    /// `positive_authorization_ready` reconciliation proof; a not-serving node
+    /// fails closed to `AUTHORIZATION_PENDING` on both the ORG_SCOPE and the
+    /// published CARD evidence path.
     pub async fn evaluate<R: RuleRepository>(
         &self,
         ctx: &PolicyContext,
         repo: &R,
     ) -> PolicyDecision {
+        self.evaluate_with_admission(ctx, repo).await.decision
+    }
+
+    /// Evaluate a request and retain the final certified F1 capability when the
+    /// selected path can produce one. Existing `evaluate` callers intentionally
+    /// continue to receive only the serializable decision.
+    pub async fn evaluate_with_admission<R: RuleRepository>(
+        &self,
+        ctx: &PolicyContext,
+        repo: &R,
+    ) -> crate::engine::PolicyEvaluation {
+        self.evaluate_internal(ctx, repo).await
+    }
+
+    async fn evaluate_internal<R: RuleRepository>(
+        &self,
+        ctx: &PolicyContext,
+        repo: &R,
+    ) -> crate::engine::PolicyEvaluation {
         let start = std::time::Instant::now();
         let mut steps = Vec::new();
         let mut timing = TimingBreakdown::default();
@@ -35,9 +58,10 @@ impl PolicyEngine {
         #[cfg(not(feature = "performance-attribution"))]
         let breaker_fallback = self.check_circuit_breaker(ctx);
         if let Some(fallback) = breaker_fallback {
-            return fallback;
+            return crate::engine::PolicyEvaluation::without_admission(fallback);
         }
 
+        let mut admission = None;
         let decision: PolicyDecision = 'evaluation: {
             if ctx.user_id.is_none() {
                 steps.push(step("AUTHN", "DENY", "no user context", None));
@@ -346,9 +370,170 @@ impl PolicyEngine {
                             );
                         }
                     }
-                    Ok(crate::org_admission::OrgAuthorityRead::Ready(evidence)) => {
-                        let decision =
+                    Ok(crate::org_admission::OrgAuthorityRead::Ready(mut evidence)) => {
+                        let certified = matches!(
+                            repo.published_evidence_read_mode(),
+                            super::ports::PublishedEvidenceReadMode::CertifiedMemory
+                        );
+                        let initial_proof = if certified {
+                            let nonce = super::published::next_authority_nonce("org-f0");
+                            match repo
+                                .read_org_authorization_fence(ctx, &evidence, &nonce)
+                                .await
+                            {
+                                Ok(proof)
+                                    if astral_types::validate_org_authority_proof(
+                                        &proof,
+                                        ctx,
+                                        &evidence,
+                                        &nonce,
+                                        time::OffsetDateTime::now_utc().unix_timestamp(),
+                                    )
+                                    .is_ok() =>
+                                {
+                                    Some(proof)
+                                }
+                                _ => {
+                                    self.finish_evaluation(
+                                        false,
+                                        &mut timing,
+                                        start,
+                                        true,
+                                        ctx.resource.as_deref(),
+                                    );
+                                    break 'evaluation deny(
+                                        "AUTHORIZATION_PENDING",
+                                        "org_scope.initial_authority_unavailable",
+                                        steps,
+                                    );
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(proof) = initial_proof.as_ref() {
+                            let current = repo.load_org_authorization(ctx).await;
+                            match current {
+                                Ok(crate::org_admission::OrgAuthorityRead::Ready(current))
+                                    if astral_types::validate_org_authority_proof(
+                                        proof,
+                                        ctx,
+                                        &current,
+                                        &proof.request_nonce,
+                                        time::OffsetDateTime::now_utc().unix_timestamp(),
+                                    )
+                                    .is_ok() =>
+                                {
+                                    evidence = current
+                                }
+                                _ => {
+                                    steps.push(step(
+                                        "ORG_AUTHORITY",
+                                        "DENY",
+                                        "org_scope.initial_evidence_changed",
+                                        None,
+                                    ));
+                                    self.finish_evaluation(
+                                        false,
+                                        &mut timing,
+                                        start,
+                                        true,
+                                        ctx.resource.as_deref(),
+                                    );
+                                    break 'evaluation deny(
+                                        "AUTHORIZATION_PENDING",
+                                        "org_scope.initial_evidence_changed",
+                                        steps,
+                                    );
+                                }
+                            }
+                        }
+                        let mut decision =
                             crate::org_admission::evaluate(ctx, repo, &evidence, steps).await;
+                        if decision.allowed && certified {
+                            let nonce = super::published::next_authority_nonce("org-f1");
+                            let next = match repo.load_org_authorization(ctx).await {
+                                Ok(crate::org_admission::OrgAuthorityRead::Ready(next)) => {
+                                    Some(next)
+                                }
+                                _ => None,
+                            };
+                            let final_proof = match next.as_deref() {
+                                Some(next) => repo
+                                    .read_org_authorization_fence(ctx, next, &nonce)
+                                    .await
+                                    .ok(),
+                                None => None,
+                            };
+                            let stable = match (
+                                initial_proof.as_ref(),
+                                final_proof.as_ref(),
+                                next.as_deref(),
+                            ) {
+                                (Some(initial), Some(final_proof), Some(next)) => {
+                                    initial.request_nonce != final_proof.request_nonce
+                                        && initial.proof_id != final_proof.proof_id
+                                        && initial.same_frontier_as(final_proof).is_ok()
+                                        && astral_types::validate_org_authority_proof(
+                                            final_proof,
+                                            ctx,
+                                            next,
+                                            &nonce,
+                                            time::OffsetDateTime::now_utc().unix_timestamp(),
+                                        )
+                                        .is_ok()
+                                }
+                                _ => false,
+                            };
+                            if stable {
+                                admission = final_proof.and_then(|proof| {
+                                    astral_types::AuthorizationAdmission::from_verified_proof(proof)
+                                        .ok()
+                                });
+                            }
+                            if !stable || admission.is_none() {
+                                let mut pending_steps = decision.evaluation_path;
+                                pending_steps.push(step(
+                                    "ORG_AUTHORITY",
+                                    "DENY",
+                                    "org_scope.final_authority_changed",
+                                    None,
+                                ));
+                                decision = deny(
+                                    "AUTHORIZATION_PENDING",
+                                    "org_scope.final_authority_changed",
+                                    pending_steps,
+                                );
+                            }
+                        }
+                        // Node-level readiness gate: ORG_SCOPE published authority is a
+                        // positive authorization input, so an ALLOW may only be returned
+                        // while the repository's authority reconciliation is serving —
+                        // the same contract as the published-evidence ALLOW gate. A
+                        // not-serving node fails closed to AUTHORIZATION_PENDING and is
+                        // recorded as a dependency failure; deterministic DENY/PENDING
+                        // outcomes and the final evidence reread above stay unchanged.
+                        if decision.allowed && !repo.positive_authorization_ready() {
+                            let mut pending_steps = decision.evaluation_path;
+                            pending_steps.push(step(
+                                "ORG_AUTHORITY",
+                                "DENY",
+                                "authority fence reconciliation is not serving",
+                                None,
+                            ));
+                            self.finish_evaluation(
+                                false,
+                                &mut timing,
+                                start,
+                                true,
+                                ctx.resource.as_deref(),
+                            );
+                            break 'evaluation deny(
+                                "AUTHORIZATION_PENDING",
+                                "org_scope:authority-not-serving",
+                                pending_steps,
+                            );
+                        }
                         self.finish_evaluation(
                             decision.allowed,
                             &mut timing,
@@ -436,11 +621,12 @@ impl PolicyEngine {
                     start,
                     &mut steps,
                     &mut timing,
+                    &mut admission,
                 )
                 .await;
         };
 
-        decision
+        crate::engine::PolicyEvaluation::from_parts(decision, admission)
     }
 
     /// Record a completed V6/ORG evaluation and update the dependency circuit breaker.

@@ -4,7 +4,7 @@
 //! （事务 + 异步副作用链）在 `service::approval_service`。
 //! HTTP 层仅解析参数、组装前端兼容 DTO、包装响应。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use astral_common::contract::{ApiResponse, EmptyResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
+use astral_db::ProtectedMutationContext;
+use astral_types::{AstralError, AuthorityMutationKind, AuthorizationAdmission, PolicyContext};
 
 use crate::api::require_platform_admin;
 use crate::repository::permission_request_repository::{NewRequest, PermissionRequestRecord};
@@ -165,6 +167,38 @@ fn request_id_header(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
 }
+
+fn protected_workflow_context(
+    policy: &PolicyContext,
+    admission: AuthorizationAdmission,
+    action: &str,
+    target_id: Option<i64>,
+) -> Result<ProtectedMutationContext, AppError> {
+    if policy.request_mutation_kind != Some(AuthorityMutationKind::ProtectedBusiness)
+        || policy.resource.as_deref() != Some("permission_request")
+        || policy.action != action
+        || policy.target_id != target_id
+    {
+        return Err(AppError(AstralError::Permission(
+            "permission request route is not admitted as the expected ProtectedBusiness mutation"
+                .into(),
+        )));
+    }
+    let operation_id = policy.request_operation_id.as_deref().ok_or_else(|| {
+        AppError(AstralError::Validation(
+            "permission request mutation requires a middleware-bound operation id".into(),
+        ))
+    })?;
+    ProtectedMutationContext::from_policy_context(
+        policy,
+        admission,
+        Some(operation_id),
+        "permission_request",
+        action,
+        target_id,
+    )
+    .map_err(AppError::from)
+}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApprovalAction {
@@ -186,6 +220,8 @@ pub fn approval_routes() -> Router<AppState> {
 async fn create_request(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(policy): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<PermissionRequestSubmit>,
 ) -> Result<Json<ApiResponse<PermissionRequest>>, AppError> {
     let requester_id = headers
@@ -199,6 +235,7 @@ async fn create_request(
             ))
         })?;
     let request_type = normalize_request_type(&req.request_type)?;
+    let mutation_context = protected_workflow_context(&policy, admission, "create", None)?;
     if request_type != "RULE" {
         return Err(AppError(astral_types::AstralError::NotImplemented(
             format!("permission request type {request_type} approval is not implemented"),
@@ -212,12 +249,15 @@ async fn create_request(
     })?;
     let request_id = state
         .approval_service
-        .create_request(&NewRequest {
-            user_id: requester_id,
-            request_type: request_type.clone(),
-            request_content: content.clone(),
-            reason: req.reason.clone(),
-        })
+        .create_request(
+            &NewRequest {
+                user_id: requester_id,
+                request_type: request_type.clone(),
+                request_content: content.clone(),
+                reason: req.reason.clone(),
+            },
+            mutation_context,
+        )
         .await?;
     Ok(Json(ApiResponse::success(PermissionRequest {
         id: Some(request_id),
@@ -273,10 +313,13 @@ async fn list_my_requests(
 async fn cancel_request(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(policy): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     body: Option<Json<ApprovalAction>>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     let user_id = verified_reviewer_id(&headers)?;
+    let mutation_context = protected_workflow_context(&policy, admission, "update", Some(id))?;
     state
         .permission_request_repository
         .cancel_request(
@@ -285,6 +328,7 @@ async fn cancel_request(
             body.as_ref()
                 .and_then(|Json(action)| action.comment.as_deref()),
             request_id_header(&headers),
+            mutation_context,
         )
         .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
@@ -335,6 +379,7 @@ async fn get_request(
 async fn approve_request(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     body: Option<Json<ApprovalAction>>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
@@ -347,6 +392,7 @@ async fn approve_request(
             body.as_ref()
                 .and_then(|Json(action)| action.comment.as_deref()),
             request_id_header(&headers),
+            admission,
         )
         .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))
@@ -355,10 +401,13 @@ async fn approve_request(
 async fn reject_request(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(policy): Extension<PolicyContext>,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     body: Option<Json<ApprovalAction>>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     let reviewer_id = verified_reviewer_id(&headers)?;
+    let mutation_context = protected_workflow_context(&policy, admission, "approve", Some(id))?;
     state
         .approval_service
         .reject(
@@ -367,6 +416,7 @@ async fn reject_request(
             body.as_ref()
                 .and_then(|Json(action)| action.comment.as_deref()),
             request_id_header(&headers),
+            mutation_context,
         )
         .await?;
     Ok(Json(ApiResponse::success(EmptyResponse)))

@@ -7,32 +7,41 @@
 //! writer 栅栏同时失效资格和会话正向条目，撤销 marker 保留作为拒绝加速器。
 //! 单写者租约必须由组合 runtime 持续监督；咨询锁无法约束非合作的外部写者。
 
+use astral_types::{
+    AuthorizationAuthorityState, AuthorizationFenceProof, CertifiedAuthorizationState,
+    PublicationSeal, PublicationStamp, PublishedCardAuthorization, PublishedCardEvidenceScope,
+};
+use sqlx::MySqlPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
-use astral_types::{
-    PublicationSeal, PublicationStamp, PublishedCardAuthorization, PublishedCardEvidenceScope,
-};
-use sqlx::MySqlPool;
-
+#[cfg(any(test, feature = "test-support"))]
+use crate::authorization_projection_repository::assemble_published_card_evidence;
 use crate::authorization_projection_repository::{
-    assemble_published_card_evidence, read_published_authorization_state_in_tx,
-    AuthorizationPublishedState, DeltaProjectorPublishOutcome, ProjectionAggregateIdentity,
+    read_published_authorization_state_in_tx, AuthorizationPublishedState,
+    DeltaProjectorPublishOutcome, ProjectionAggregateIdentity,
 };
 use crate::grant_repository::{
     validate_delta_fence_relation, DeltaEventAppendRequest, DeltaEventType,
 };
 
+#[cfg(any(test, feature = "test-support"))]
 mod assembly_cache;
+mod authority_attestation;
 mod invalidation;
 mod repository;
 
+pub use authority_attestation::CertifiedPartitionToken;
+
 pub use repository::MemoryMirroredRuleRepository;
 
-use assembly_cache::{AssemblyCache, AssemblyStamp};
+#[cfg(any(test, feature = "test-support"))]
+use assembly_cache::AssemblyCache;
+#[cfg(any(test, feature = "test-support"))]
+use assembly_cache::AssemblyStamp;
 pub use invalidation::EvidenceInvalidationRequest;
 
 static GLOBAL_MEMORY_PROJECTION_HUB: OnceLock<MemoryProjectionHub> = OnceLock::new();
@@ -461,6 +470,53 @@ struct CompletionReceipt {
     installed_at: Instant,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthorityFrontier {
+    authority_id: String,
+    authority_term: u64,
+    global_fence_sequence: u64,
+    key_id: String,
+    key_epoch: u64,
+}
+
+impl AuthorityFrontier {
+    fn from_proof(proof: &AuthorizationFenceProof) -> Self {
+        Self {
+            authority_id: proof.authority_id.clone(),
+            authority_term: proof.authority_term,
+            global_fence_sequence: proof.global_fence_sequence,
+            key_id: proof.key_id.clone(),
+            key_epoch: proof.key_epoch,
+        }
+    }
+
+    fn validate_successor(&self, next: &Self) -> Result<bool, &'static str> {
+        if self.authority_id != next.authority_id {
+            return Err("authorization authority identity changed");
+        }
+        if next.authority_term < self.authority_term
+            || next.global_fence_sequence < self.global_fence_sequence
+            || next.key_epoch < self.key_epoch
+        {
+            return Err("authorization authority frontier regressed");
+        }
+        if next.authority_term == self.authority_term
+            && next.global_fence_sequence == self.global_fence_sequence
+            && (next.key_id != self.key_id || next.key_epoch != self.key_epoch)
+        {
+            return Err("authorization authority key changed at the same frontier");
+        }
+        if next.key_id != self.key_id && next.key_epoch <= self.key_epoch {
+            return Err("authorization authority key changed without a newer key epoch");
+        }
+        Ok(next != self)
+    }
+
+    fn matches_proof(&self, proof: &AuthorizationFenceProof) -> bool {
+        self == &Self::from_proof(proof)
+    }
+}
+
 #[derive(Default)]
 struct HubMaps {
     warming_up: bool,
@@ -475,8 +531,26 @@ struct HubMaps {
     health_revision: u64,
     tenant_epochs: HashMap<i64, u64>,
     card_epochs: HashMap<(i64, i64), u64>,
-    /// 每聚合当前已验证 durable 发布状态镜像（不可变快照，安装即整体替换）。
+    /// 每聚合当前已验证 durable 发布状态镜像（仅用于冷恢复、pending 判定和对账；
+    /// raw state 不得直接成为正向授权服务根）。
     states: HashMap<ProjectionAggregateIdentity, Arc<AuthorizationPublishedState>>,
+    /// 请求 scope 的认证授权根；只有该状态可以产生 `MemoryEvidenceOutcome::Serve`。
+    certified_states: HashMap<RefillScope, Arc<CertifiedAuthorizationState>>,
+    certified_installed_at: HashMap<RefillScope, Instant>,
+    /// 全局 authority 状态；默认 Cold，未完成 authority 对牌时禁止内存正向服务。
+    authority_state: AuthorizationAuthorityState,
+    /// The node-wide authority frontier shared by every certified scope.
+    authority_frontier: Option<AuthorityFrontier>,
+    /// Monotonic evidence for the last completed durable reconciliation. The
+    /// epoch is only advanced after the final frontier/pending/mirror checks
+    /// succeed; warm-up and local mutations invalidate the associated revision.
+    durable_reconcile_epoch: u64,
+    durable_reconcile_mutation_revision: Option<u64>,
+    /// Set only by the explicit reconciliation supervisor after it has checked
+    /// the durable evidence, certified root, and transport gates for the same
+    /// reconciliation epoch. A request-side certificate never sets this bit.
+    authority_reconcile_ready_epoch: Option<u64>,
+    certified_partition: Option<authority_attestation::CertifiedPartitionCoverage>,
     /// (tenant, card) → 参与该卡的聚合集合（与 `states` 同锁维护）。
     card_index: HashMap<(i64, i64), HashSet<ProjectionAggregateIdentity>>,
     card_index_entries: usize,
@@ -563,6 +637,12 @@ impl HubMaps {
     fn bump_auxiliary_epochs(&mut self) {
         self.auxiliary_org_epoch = self.auxiliary_org_epoch.saturating_add(1);
         self.auxiliary_global_admin_epoch = self.auxiliary_global_admin_epoch.saturating_add(1);
+    }
+
+    fn invalidate_durable_reconcile_evidence(&mut self) {
+        self.durable_reconcile_mutation_revision = None;
+        self.authority_reconcile_ready_epoch = None;
+        self.certified_partition = None;
     }
 }
 
@@ -709,6 +789,7 @@ impl TenantPending {
     }
 
     /// 该卡是否被 pending 拦截（O(1) 定位 + 小集合扫描）。
+    #[cfg(any(test, feature = "test-support"))]
     fn blocks(
         &self,
         card_id: i64,
@@ -733,6 +814,27 @@ impl TenantPending {
             .iter()
             .chain(self.per_card.get(&card_id).into_iter().flatten())
             .any(|entry| entry_blocks(entry, states))
+    }
+
+    fn blocks_positive_authorization(
+        &self,
+        states: &HashMap<ProjectionAggregateIdentity, Arc<AuthorizationPublishedState>>,
+    ) -> bool {
+        self.aggregate_wide
+            .iter()
+            .chain(self.per_card.values().flatten())
+            .any(|entry| {
+                if entry.revoke_class {
+                    return true;
+                }
+                let installed_fence = entry
+                    .aggregate
+                    .as_ref()
+                    .and_then(|aggregate| states.get(aggregate))
+                    .map(|state| state.revoke_fence)
+                    .unwrap_or(0);
+                entry.revoke_fence > installed_fence
+            })
     }
 }
 
@@ -815,6 +917,7 @@ impl RefillCoordinator {
 pub struct MemoryProjectionHub {
     maps: Arc<RwLock<HubMaps>>,
     refills: Arc<RefillCoordinator>,
+    #[cfg(any(test, feature = "test-support"))]
     assemblies: Arc<AssemblyCache>,
 }
 
@@ -834,7 +937,24 @@ impl HubMaps {
             && !self.authority_fence_unavailable()
     }
 
+    fn invalidate_certified_scope(&mut self, tenant_id: i64, card_id: Option<i64>) {
+        self.certified_states.retain(|scope, _| {
+            scope.tenant_id != tenant_id || card_id.is_some_and(|card| scope.card_id != card)
+        });
+        self.certified_installed_at.retain(|scope, _| {
+            scope.tenant_id != tenant_id || card_id.is_some_and(|card| scope.card_id != card)
+        });
+    }
+
+    fn invalidate_all_certified(&mut self) {
+        self.certified_partition = None;
+        self.certified_states.clear();
+        self.certified_installed_at.clear();
+    }
+
     fn bump_scope(&mut self, tenant_id: i64, card_id: Option<i64>) {
+        self.invalidate_certified_scope(tenant_id, card_id);
+        self.invalidate_durable_reconcile_evidence();
         if self.card_epochs.len() >= MAX_MIRROR_STATES {
             self.card_epochs.clear();
             self.health_revision = self.health_revision.saturating_add(1);
@@ -852,10 +972,13 @@ impl HubMaps {
     }
 
     fn suspect(&mut self, reason: impl Into<String>) {
+        self.invalidate_durable_reconcile_evidence();
         self.last_transport_heartbeat = None;
         self.channel = ChannelHealth::Suspect {
             reason: reason.into().chars().take(256).collect(),
         };
+        self.authority_state = AuthorizationAuthorityState::Suspect;
+        self.invalidate_all_certified();
         self.health_revision = self.health_revision.saturating_add(1);
         self.mutation_revision = self.mutation_revision.saturating_add(1);
         self.bump_auxiliary_epochs();
@@ -883,6 +1006,16 @@ impl HubMaps {
         }
         self.completed
             .retain(|_, receipt| now.saturating_duration_since(receipt.installed_at) <= MIRROR_TTL);
+        let expired_certified: Vec<_> = self
+            .certified_installed_at
+            .iter()
+            .filter(|(_, at)| now.saturating_duration_since(**at) > MIRROR_TTL)
+            .map(|(scope, _)| scope.clone())
+            .collect();
+        for scope in expired_certified {
+            self.certified_installed_at.remove(&scope);
+            self.certified_states.remove(&scope);
+        }
     }
 
     fn index_aggregate(
@@ -1035,6 +1168,8 @@ impl MemoryProjectionHub {
             maps.mutation_revision = maps.mutation_revision.saturating_add(1);
             maps.source_revision = maps.source_revision.saturating_add(1);
             maps.bump_auxiliary_epochs();
+            maps.invalidate_durable_reconcile_evidence();
+            maps.invalidate_all_certified();
         }
         invalidate_positive_read_caches();
         Some(SourceTransactionGuard {
@@ -1055,12 +1190,282 @@ impl MemoryProjectionHub {
             maps.mutation_revision = maps.mutation_revision.saturating_add(1);
             maps.source_revision = maps.source_revision.saturating_add(1);
             maps.auxiliary_org_epoch = maps.auxiliary_org_epoch.saturating_add(1);
+            maps.invalidate_durable_reconcile_evidence();
+            maps.invalidate_all_certified();
         }
         invalidate_positive_read_caches();
         Some(OrgSourceTransactionGuard {
             hub: self.clone(),
             commit_unproven: AtomicBool::new(false),
         })
+    }
+
+    /// Start a provider-backed authority reconciliation. Durable warm-up alone
+    /// cannot establish the global frontier; this transition is the only
+    /// production entry into fence synchronization.
+    pub fn begin_authority_fence_sync(&self) -> Result<(), String> {
+        let mut maps = self
+            .maps
+            .write()
+            .map_err(|_| "memory projection hub lock poisoned".to_owned())?;
+        match maps.authority_state {
+            AuthorizationAuthorityState::FenceSyncing => return Ok(()),
+            AuthorizationAuthorityState::Serving
+                if maps.certified_partition_ready()
+                    && maps.durable_reconcile_mutation_revision.is_some()
+                    && maps.authority_reconcile_ready_epoch
+                        == Some(maps.durable_reconcile_epoch) =>
+            {
+                return Ok(())
+            }
+            AuthorizationAuthorityState::Serving => {
+                maps.authority_state = AuthorizationAuthorityState::Pending;
+                maps.invalidate_durable_reconcile_evidence();
+                maps.health_revision = maps.health_revision.saturating_add(1);
+                maps.authority_state = AuthorizationAuthorityState::Recovering;
+            }
+            AuthorizationAuthorityState::Warming => {}
+            AuthorizationAuthorityState::Recovering
+            | AuthorizationAuthorityState::Pending
+            | AuthorizationAuthorityState::Suspect
+            | AuthorizationAuthorityState::Quarantined => {
+                if maps.authority_state != AuthorizationAuthorityState::Recovering {
+                    if !maps
+                        .authority_state
+                        .can_transition_to(AuthorizationAuthorityState::Recovering)
+                    {
+                        return Err(format!(
+                            "authority state {:?} cannot enter recovery",
+                            maps.authority_state
+                        ));
+                    }
+                    maps.authority_state = AuthorizationAuthorityState::Recovering;
+                }
+                if !maps
+                    .authority_state
+                    .can_transition_to(AuthorizationAuthorityState::FenceSyncing)
+                {
+                    return Err("authority recovery cannot enter fence sync".to_owned());
+                }
+            }
+            state => {
+                return Err(format!(
+                    "authority state {:?} cannot begin fence sync",
+                    state
+                ));
+            }
+        }
+        if !maps
+            .authority_state
+            .can_transition_to(AuthorizationAuthorityState::FenceSyncing)
+        {
+            return Err(format!(
+                "authority state {:?} cannot enter fence sync",
+                maps.authority_state
+            ));
+        }
+        maps.authority_state = AuthorizationAuthorityState::FenceSyncing;
+        maps.invalidate_durable_reconcile_evidence();
+        maps.health_revision = maps.health_revision.saturating_add(1);
+        maps.mutation_revision = maps.mutation_revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// Mark the provider-backed transport and durable reconciliation gates as
+    /// ready. This is deliberately separate from a heartbeat: it only supplies
+    /// the health half of the final `FENCE_SYNCING -> SERVING` transition.
+    pub fn mark_authority_reconcile_ready(&self) -> Result<(), String> {
+        let mut maps = self
+            .maps
+            .write()
+            .map_err(|_| "memory projection hub lock poisoned".to_owned())?;
+        if maps.authority_state != AuthorizationAuthorityState::FenceSyncing {
+            return Err(format!(
+                "authority state {:?} is not fence syncing",
+                maps.authority_state
+            ));
+        }
+        let Some(reconcile_revision) = maps.durable_reconcile_mutation_revision else {
+            return Err(
+                "authority reconciliation has no completed durable evidence for this fence sync"
+                    .to_owned(),
+            );
+        };
+        if reconcile_revision != maps.mutation_revision {
+            return Err("durable reconciliation evidence is stale".to_owned());
+        }
+        if maps.warming_up
+            || maps.active_source_writers != 0
+            || maps.uncertain_source
+            || maps.runtime_owner_failed
+            || maps.authority_frontier.is_none()
+            || maps
+                .pending
+                .values()
+                .any(|pending| pending.blocks_positive_authorization(&maps.states))
+        {
+            return Err("authority reconciliation is raced by an unsafe local state".to_owned());
+        }
+        if !matches!(maps.channel, ChannelHealth::Healthy { .. })
+            || channel_blocks(&maps.channel, Instant::now())
+            || maps.last_transport_heartbeat.is_none_or(|last| {
+                heartbeat_silence_blocks(
+                    last,
+                    Instant::now(),
+                    Duration::from_millis(CHANNEL_MAX_HEARTBEAT_SILENCE_MS),
+                )
+            })
+        {
+            return Err("authority transport health is not freshly proven".to_owned());
+        }
+        if !maps.certified_partition_ready() {
+            return Err(
+                "authority reconciliation has no fresh certified partition coverage".to_owned(),
+            );
+        }
+        maps.authority_reconcile_ready_epoch = Some(maps.durable_reconcile_epoch);
+        maps.health_revision = maps.health_revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// Complete provider-backed fence synchronization only after a certified
+    /// root exists and the transport/durable reconciliation gates are healthy.
+    /// This method never creates authority state or clears a suspect condition.
+    pub fn complete_authority_fence_sync(&self) -> Result<(), String> {
+        let mut maps = self
+            .maps
+            .write()
+            .map_err(|_| "memory projection hub lock poisoned".to_owned())?;
+        if maps.authority_state == AuthorizationAuthorityState::Serving {
+            return Ok(());
+        }
+        if maps.authority_state != AuthorizationAuthorityState::FenceSyncing {
+            return Err(format!(
+                "authority state {:?} is not fence syncing",
+                maps.authority_state
+            ));
+        }
+        let Some(reconcile_epoch) = maps.authority_reconcile_ready_epoch else {
+            return Err("authority reconciliation ready evidence is not recorded".to_owned());
+        };
+        if maps.durable_reconcile_mutation_revision != Some(maps.mutation_revision)
+            || reconcile_epoch != maps.durable_reconcile_epoch
+        {
+            return Err("authority reconciliation ready evidence is stale".to_owned());
+        }
+        if maps.warming_up
+            || maps.active_source_writers != 0
+            || maps.uncertain_source
+            || maps.runtime_owner_failed
+            || !maps.certified_partition_ready()
+            || maps.authority_reconcile_ready_epoch.is_none()
+            || !matches!(maps.channel, ChannelHealth::Healthy { .. })
+            || channel_blocks(&maps.channel, Instant::now())
+            || maps.authority_frontier.is_none()
+        {
+            return Err(
+                "authority fence sync completion gates are not proven; authorization remains pending"
+                    .to_owned(),
+            );
+        }
+        if !maps
+            .authority_state
+            .can_transition_to(AuthorizationAuthorityState::Serving)
+        {
+            return Err("authority fence sync cannot enter serving".to_owned());
+        }
+        maps.authority_state = AuthorizationAuthorityState::Serving;
+        maps.health_revision = maps.health_revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// Provider failure is sticky for positive authorization. A later request
+    /// must perform a fresh authority reconciliation before re-entering sync.
+    pub fn mark_authority_pending(&self, reason: impl Into<String>) {
+        if let Ok(mut maps) = self.maps.write() {
+            maps.invalidate_all_certified();
+            if maps
+                .authority_state
+                .can_transition_to(AuthorizationAuthorityState::Pending)
+            {
+                maps.authority_state = AuthorizationAuthorityState::Pending;
+            } else if maps.authority_state != AuthorizationAuthorityState::Pending {
+                maps.authority_state = AuthorizationAuthorityState::Suspect;
+            }
+            maps.channel = ChannelHealth::Suspect {
+                reason: reason.into().chars().take(256).collect(),
+            };
+            maps.health_revision = maps.health_revision.saturating_add(1);
+            maps.mutation_revision = maps.mutation_revision.saturating_add(1);
+        }
+        invalidate_positive_read_caches();
+    }
+
+    /// Test-only authority transition hook. Production has no path to `Serving`
+    /// until a real global authority provider supplies the fence-sync result.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn transition_authority_state_for_tests(
+        &self,
+        next: AuthorizationAuthorityState,
+    ) -> Result<(), String> {
+        let mut maps = self
+            .maps
+            .write()
+            .map_err(|_| "memory projection hub lock poisoned".to_owned())?;
+        if !maps.authority_state.can_transition_to(next) {
+            return Err(format!(
+                "invalid authority state transition: {:?} -> {:?}",
+                maps.authority_state, next
+            ));
+        }
+        maps.authority_state = next;
+        if next == AuthorizationAuthorityState::Serving {
+            maps.warming_up = false;
+            maps.channel = ChannelHealth::Healthy {
+                last_heartbeat: Instant::now(),
+            };
+            maps.last_transport_heartbeat = Some(Instant::now());
+        } else if !next.may_serve_positive() {
+            maps.invalidate_all_certified();
+        }
+        maps.health_revision = maps.health_revision.saturating_add(1);
+        maps.mutation_revision = maps.mutation_revision.saturating_add(1);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn authority_state(&self) -> AuthorizationAuthorityState {
+        self.maps
+            .read()
+            .map(|maps| maps.authority_state)
+            .unwrap_or(AuthorizationAuthorityState::Quarantined)
+    }
+
+    /// Positive authorization is ready only when a certified root and fresh,
+    /// uninvalidated durable reconciliation evidence are both present. A healthy
+    /// channel or a `SERVING` label alone is not sufficient.
+    #[must_use]
+    pub fn positive_authorization_ready(&self) -> bool {
+        self.maps
+            .read()
+            .map(|maps| {
+                maps.authority_state == AuthorizationAuthorityState::Serving
+                    && !maps.warming_up
+                    && maps.active_source_writers == 0
+                    && !maps.uncertain_source
+                    && !maps.runtime_owner_failed
+                    && maps.certified_partition_ready()
+                    && maps.durable_reconcile_mutation_revision.is_some()
+                    && maps.authority_reconcile_ready_epoch == Some(maps.durable_reconcile_epoch)
+                    && maps.authority_frontier.is_some()
+                    && !maps
+                        .pending
+                        .values()
+                        .any(|pending| pending.blocks_positive_authorization(&maps.states))
+                    && matches!(maps.channel, ChannelHealth::Healthy { .. })
+                    && !channel_blocks(&maps.channel, Instant::now())
+            })
+            .unwrap_or(false)
     }
 
     pub(crate) fn auxiliary_read_gate(&self) -> AuxiliaryReadGate {
@@ -1102,7 +1507,88 @@ impl MemoryProjectionHub {
         self.auxiliary_read_gate() == AuxiliaryReadGate::Ready(token)
     }
 
-    /// 是否存在未闭合的 source writer（辅助镜像据此直接 fail-closed，
+    /// Install one complete, immutable, authority-certified request scope.
+    /// Raw aggregate states never enter this positive authorization map.
+    pub fn install_certified_authorization_state(
+        &self,
+        scope: &PublishedCardEvidenceScope,
+        certified: CertifiedAuthorizationState,
+    ) -> Result<(), String> {
+        scope.validate().map_err(|error| error.to_string())?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        certified
+            .validate_at(now, scope)
+            .map_err(|error| error.to_string())?;
+        let proof = certified.proof();
+        let candidate_frontier = AuthorityFrontier::from_proof(&proof);
+        let key = RefillScope::from(scope);
+        let mut maps = self
+            .maps
+            .write()
+            .map_err(|_| "memory projection hub lock poisoned".to_owned())?;
+        let fence_syncing = maps.authority_state == AuthorizationAuthorityState::FenceSyncing;
+        if (!maps.authority_state.may_serve_positive() && !fence_syncing)
+            || maps.warming_up
+            || maps.active_source_writers != 0
+            || maps.uncertain_source
+            || maps.authority_fence_unavailable()
+            || (!fence_syncing && channel_blocks(&maps.channel, Instant::now()))
+        {
+            return Err(format!(
+                "authority state {:?} or source/channel gate blocks certified memory",
+                maps.authority_state
+            ));
+        }
+
+        let frontier_advanced = match maps.authority_frontier.as_ref() {
+            None => false,
+            Some(current) => match current.validate_successor(&candidate_frontier) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    maps.suspect(error);
+                    return Err(error.to_owned());
+                }
+            },
+        };
+
+        if let Some(existing) = maps.certified_states.get(&key) {
+            let existing_proof = existing.proof();
+            if proof.scope_generation == existing_proof.scope_generation
+                && proof.snapshot_hash != existing_proof.snapshot_hash
+            {
+                maps.suspect("same-generation certified content divergence");
+                return Err("same-generation certified content divergence".to_owned());
+            }
+            if let Err(error) = certified.validate_successor_of(existing) {
+                maps.suspect("certified publication lineage or frontier diverged");
+                return Err(error.to_string());
+            }
+        } else if maps.certified_states.len() >= MAX_MIRROR_STATES {
+            maps.suspect("certified authorization scope capacity exhausted");
+            return Err("certified authorization scope capacity exhausted".to_owned());
+        }
+
+        // A newer node-wide frontier invalidates every older scope root. Keeping
+        // any other scope live here would let it serve at an authority frontier
+        // that was never certified for that scope.
+        if frontier_advanced {
+            maps.invalidate_all_certified();
+        }
+        if maps.certified_states.get(&key).is_none_or(|previous| {
+            previous.proof().scope_certificate_hash != proof.scope_certificate_hash
+        }) {
+            maps.certified_partition = None;
+        }
+        maps.authority_frontier = Some(candidate_frontier);
+        maps.certified_states
+            .insert(key.clone(), Arc::new(certified));
+        maps.certified_installed_at.insert(key, Instant::now());
+        if fence_syncing {
+            maps.health_revision = maps.health_revision.saturating_add(1);
+        }
+        Ok(())
+    }
+
     /// 绝不在 writer-active 期间回源旧状态放行）。
     #[must_use]
     pub fn has_active_source_writer(&self) -> bool {
@@ -1143,6 +1629,7 @@ impl MemoryProjectionHub {
             .write()
             .map_err(|_| sqlx::Error::Protocol("memory projection hub lock poisoned".to_owned()))?;
         maps.warming_up = true;
+        maps.invalidate_durable_reconcile_evidence();
         if !matches!(maps.channel, ChannelHealth::Unmonitored) {
             maps.suspect("memory mirror warm-up requires durable reconciliation");
         }
@@ -1155,6 +1642,9 @@ impl MemoryProjectionHub {
         maps.health_revision = maps.health_revision.saturating_add(1);
         maps.mutation_revision = maps.mutation_revision.saturating_add(1);
         maps.bump_auxiliary_epochs();
+        maps.certified_states.clear();
+        maps.certified_installed_at.clear();
+        maps.authority_state = AuthorizationAuthorityState::Warming;
         maps.states.clear();
         maps.card_index.clear();
         maps.card_index_entries = 0;
@@ -1168,6 +1658,7 @@ impl MemoryProjectionHub {
             .write()
             .map_err(|_| sqlx::Error::Protocol("memory projection hub lock poisoned".to_owned()))?;
         maps.warming_up = false;
+        maps.invalidate_durable_reconcile_evidence();
         maps.last_transport_heartbeat = None;
         maps.channel = ChannelHealth::Suspect {
             reason: "memory mirror warm-up completed; transport recovery not proven".to_owned(),
@@ -1442,9 +1933,6 @@ impl MemoryProjectionHub {
         let _guard = tokio::time::timeout(Duration::from_secs(3), lock.lock())
             .await
             .map_err(|_| repository_error("strict refill wait timed out".to_owned()))?;
-        if let MemoryEvidenceOutcome::Serve(evidence) = self.try_memory_evidence(scope) {
-            return Ok(evidence);
-        }
         let token = {
             let maps = self
                 .maps
@@ -1642,6 +2130,9 @@ impl MemoryProjectionHub {
         maps.health_revision = maps.health_revision.saturating_add(1);
         maps.mutation_revision = maps.mutation_revision.saturating_add(1);
         maps.bump_auxiliary_epochs();
+        maps.durable_reconcile_epoch = maps.durable_reconcile_epoch.saturating_add(1);
+        maps.durable_reconcile_mutation_revision = Some(maps.mutation_revision);
+        maps.authority_reconcile_ready_epoch = None;
         Ok(WarmReport {
             identities: frontier.len(),
             installed: frontier.len(),
@@ -1732,7 +2223,114 @@ impl MemoryProjectionHub {
         Ok((frontier, pending, states))
     }
 
-    /// 内存读面入口：pending 拦截面复刻 `FRESHNESS_GATE_PROBE`；命中即回退。
+    /// Only certified roots can serve positive authorization. The raw aggregate
+    /// mirror remains available to the legacy durable-refill/reconcile machinery.
+    pub fn try_certified_memory_evidence(
+        &self,
+        scope: &PublishedCardEvidenceScope,
+    ) -> MemoryEvidenceOutcome {
+        self.try_certified_memory_evidence_with_clock(
+            scope,
+            || OffsetDateTime::now_utc().unix_timestamp(),
+            || {},
+        )
+    }
+
+    fn try_certified_memory_evidence_with_clock(
+        &self,
+        scope: &PublishedCardEvidenceScope,
+        read_clock: impl FnOnce() -> i64,
+        before_recheck: impl FnOnce(),
+    ) -> MemoryEvidenceOutcome {
+        if scope.validate().is_err() {
+            return MemoryEvidenceOutcome::DeferToDurable;
+        }
+        let (token, certified) = {
+            let Ok(maps) = self.maps.read() else {
+                return MemoryEvidenceOutcome::DeferToDurable;
+            };
+            if !maps.authority_state.may_serve_positive()
+                || maps.warming_up
+                || maps.authority_fence_unavailable()
+                || maps.active_source_writers != 0
+                || maps.uncertain_source
+                || maps.runtime_owner_failed
+                || maps.durable_reconcile_mutation_revision.is_none()
+                || maps.authority_reconcile_ready_epoch != Some(maps.durable_reconcile_epoch)
+                || maps
+                    .pending
+                    .values()
+                    .any(|pending| pending.blocks_positive_authorization(&maps.states))
+                || channel_blocks(&maps.channel, Instant::now())
+            {
+                return MemoryEvidenceOutcome::DeferToDurable;
+            }
+            let key = RefillScope::from(scope);
+            if !maps.certified_partition_contains(&key) {
+                return MemoryEvidenceOutcome::DeferToDurable;
+            }
+            let Some(certified) = maps.certified_states.get(&key).cloned() else {
+                return MemoryEvidenceOutcome::DeferToDurable;
+            };
+            let proof = certified.proof();
+            if maps
+                .authority_frontier
+                .as_ref()
+                .is_none_or(|frontier| !frontier.matches_proof(&proof))
+            {
+                return MemoryEvidenceOutcome::DeferToDurable;
+            }
+            if maps
+                .certified_installed_at
+                .get(&key)
+                .is_none_or(|at| at.elapsed() > MIRROR_TTL)
+            {
+                return MemoryEvidenceOutcome::DeferToDurable;
+            }
+            (ReadToken::for_scope(&maps, scope), certified)
+        };
+        let now_unix_seconds = read_clock();
+        if certified.validate_at(now_unix_seconds, scope).is_err() {
+            return MemoryEvidenceOutcome::DeferToDurable;
+        }
+        let evidence = certified.evidence();
+        before_recheck();
+        let Ok(maps) = self.maps.read() else {
+            return MemoryEvidenceOutcome::DeferToDurable;
+        };
+        let key = RefillScope::from(scope);
+        if !maps.certified_partition_contains(&key)
+            || token != ReadToken::for_scope(&maps, scope)
+            || !maps.authority_state.may_serve_positive()
+            || maps.warming_up
+            || maps.authority_fence_unavailable()
+            || maps.active_source_writers != 0
+            || maps.uncertain_source
+            || maps.runtime_owner_failed
+            || maps.durable_reconcile_mutation_revision.is_none()
+            || maps.authority_reconcile_ready_epoch != Some(maps.durable_reconcile_epoch)
+            || maps
+                .pending
+                .values()
+                .any(|pending| pending.blocks_positive_authorization(&maps.states))
+            || channel_blocks(&maps.channel, Instant::now())
+            || maps
+                .authority_frontier
+                .as_ref()
+                .is_none_or(|frontier| !frontier.matches_proof(&certified.proof()))
+            || maps
+                .certified_states
+                .get(&key)
+                .is_none_or(|current| !Arc::ptr_eq(current, &certified))
+        {
+            return MemoryEvidenceOutcome::DeferToDurable;
+        }
+        MemoryEvidenceOutcome::Serve(evidence)
+    }
+
+    /// 内存读面入口：保留给本 crate 的 durable mirror 兼容测试与旧对账断言。
+    /// 正式授权仓储必须调用 `try_certified_memory_evidence`。
+    #[cfg(any(test, feature = "test-support"))]
     pub fn try_memory_evidence(&self, scope: &PublishedCardEvidenceScope) -> MemoryEvidenceOutcome {
         self.try_memory_evidence_with_clock(
             scope,
@@ -1741,6 +2339,7 @@ impl MemoryProjectionHub {
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn try_memory_evidence_with_clock(
         &self,
         scope: &PublishedCardEvidenceScope,
@@ -1852,17 +2451,20 @@ pub async fn refresh_from_durable(pool: &MySqlPool, identity: &ProjectionAggrega
 #[cfg(test)]
 mod tests {
     mod assembly_cache;
+    mod authority_attestation;
     mod evaluate_experimental;
     pub(crate) mod evaluate_performance;
     mod performance;
 
     use super::*;
     use astral_types::{
-        BindingLayer, CanonicalGrant, DependencyVector, DependencyVersion, DomainScopeRequirement,
-        GrantDelta, GrantEffect, GrantId, GrantProvenance, GrantRevision, GrantSourceKind,
-        GrantState, PublicationSeal, PublishedCardEvidenceScope, PublishedEvidenceAggregate,
-        TenantScope, ValidityWindow,
+        AuthorizationAuthorityScope, AuthorizationFenceProof, BindingLayer, CanonicalGrant,
+        DependencyVector, DependencyVersion, DomainScopeRequirement, GrantDelta, GrantEffect,
+        GrantId, GrantProvenance, GrantRevision, GrantSourceKind, GrantState, PublicationSeal,
+        PublishedCardEvidenceScope, PublishedEvidenceAggregate, TenantScope, ValidityWindow,
+        AUTHORIZATION_EDITION,
     };
+    use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
 
     use crate::authorization_projection_repository::{
@@ -2080,6 +2682,161 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn certified_state_for(
+        state: AuthorizationPublishedState,
+        request_scope: PublishedCardEvidenceScope,
+        authority_id: &str,
+        authority_term: u64,
+        global_fence_sequence: u64,
+        key_id: &str,
+        key_epoch: u64,
+        parent_hash: Option<String>,
+        nonce: &str,
+        proof_id: &str,
+    ) -> CertifiedAuthorizationState {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let evidence = assemble_published_card_evidence(&request_scope, now, &[state]).unwrap();
+        let (scope_generation, revoke_watermark) =
+            AuthorizationFenceProof::evidence_frontier(&evidence).unwrap();
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let operation_id = format!("operation-{proof_id}");
+        let event_id = format!("event-{proof_id}");
+        let user_id = request_scope
+            .user_filter
+            .expect("V7 authority fixture requires an actor request scope");
+        let domain_id = match request_scope.domain {
+            DomainScopeRequirement::ExactlySome(domain_id) => Some(domain_id),
+            DomainScopeRequirement::Unconstrained | DomainScopeRequirement::ExactlyNone => None,
+        };
+        let request_context = astral_types::PolicyContext::builder()
+            .principal_kind(Some("PLATFORM_USER".to_owned()))
+            .user_id(Some(user_id))
+            .identity_card_id(Some(1))
+            .card_id(Some(request_scope.card_id))
+            .tenant_id(Some(request_scope.tenant_id))
+            .domain_id(domain_id)
+            .resource(Some("memory_projection_hub".to_owned()))
+            .action("read".to_owned())
+            .target_id(Some(request_scope.card_id))
+            .request_fingerprint(Some(sha256_hex(
+                format!("http-fixture:{authority_id}:{proof_id}:{nonce}").as_bytes(),
+            )))
+            .request_operation_id(Some(operation_id.clone()))
+            .resource_ownership_scope(astral_types::ResourceOwnershipScope::TenantScoped)
+            .resource_tenant_id(Some(request_scope.tenant_id))
+            .resource_domain_id(domain_id)
+            .build();
+        let request_binding_digest =
+            astral_types::authorization_request_digest(&request_context).unwrap();
+        let mut proof = AuthorizationFenceProof {
+            authorization_edition: AUTHORIZATION_EDITION,
+            authority_id: authority_id.to_owned(),
+            authority_term,
+            global_fence_sequence,
+            scope: AuthorizationAuthorityScope::from_evidence_scope(&request_scope),
+            scope_generation,
+            revoke_watermark,
+            snapshot_hash: AuthorizationFenceProof::evidence_content_hash(&evidence).unwrap(),
+            parent_hash,
+            operation_id,
+            event_id,
+            key_id: key_id.to_owned(),
+            key_epoch,
+            issued_at: now,
+            not_before: now,
+            expires_at: now + 600,
+            request_nonce: nonce.to_owned(),
+            request_binding_digest: Some(request_binding_digest.clone()),
+            scope_certificate_hash: None,
+            proof_id: proof_id.to_owned(),
+            signature: String::new(),
+        };
+        let mut certificate = astral_types::AuthorityScopePublicationCertificate {
+            protocol_version: astral_types::AUTHORITY_PROTOCOL_VERSION,
+            authorization_edition: AUTHORIZATION_EDITION,
+            authority_id: authority_id.to_owned(),
+            authority_term,
+            global_fence_sequence,
+            certificate_id: format!("certificate-{proof_id}"),
+            intent_digest: "11".repeat(32),
+            reservation_id: "reservation-fixture".into(),
+            operation_id: proof.operation_id.clone(),
+            event_id: proof.event_id.clone(),
+            scope: astral_types::AuthorityProtocolScope::Card(proof.scope.clone())
+                .canonical_card_publication_scope()
+                .expect("card proof has a canonical publication scope"),
+            approved_request_digest: request_binding_digest,
+            before_image_digest: None,
+            after_image_digest: "33".repeat(32),
+            source_commit_digest: "44".repeat(32),
+            source_outcome_digest: "55".repeat(32),
+            completion_digest: "00".repeat(32),
+            snapshot_hash: proof.snapshot_hash.clone(),
+            parent_certificate_hash: proof.parent_hash.take(),
+            manifests: evidence
+                .manifests
+                .iter()
+                .map(|manifest| astral_types::AuthorityManifestIdentity {
+                    aggregate_type: manifest.aggregate_type.clone(),
+                    aggregate_id: manifest.aggregate_id,
+                    manifest_digest_hex: manifest.manifest_digest_hex.clone(),
+                    dependency_hash_hex: manifest.dependency_hash_hex.clone(),
+                    semantic_hash_hex: manifest.semantic_hash_hex.clone(),
+                    generation: manifest.generation,
+                    revoke_fence: manifest.revoke_fence,
+                    event_id: manifest.event_id.clone(),
+                    operation_id: manifest.operation_id.clone(),
+                })
+                .collect(),
+            key_id: key_id.to_owned(),
+            key_epoch,
+            issued_at: now,
+            not_before: now,
+            expires_at: None,
+            certificate_nonce: format!("certificate-nonce-{proof_id}"),
+            signature: String::new(),
+        };
+        certificate.completion_digest = certificate.recompute_completion_digest().unwrap();
+        certificate.sign(&signing_key).unwrap();
+        proof.scope_certificate_hash = Some(certificate.record_digest().unwrap());
+        proof.signature = hex::encode(signing_key.sign(&proof.signing_bytes().unwrap()).to_bytes());
+        CertifiedAuthorizationState::new_with_certificate(
+            proof,
+            Arc::new(evidence),
+            certificate,
+            &signing_key.verifying_key(),
+            &signing_key.verifying_key(),
+            now,
+            &request_scope,
+        )
+        .unwrap()
+    }
+
+    fn serving_hub() -> MemoryProjectionHub {
+        let hub = MemoryProjectionHub::default();
+        hub.transition_authority_state_for_tests(AuthorizationAuthorityState::Warming)
+            .unwrap();
+        hub.transition_authority_state_for_tests(AuthorizationAuthorityState::FenceSyncing)
+            .unwrap();
+        hub.transition_authority_state_for_tests(AuthorizationAuthorityState::Serving)
+            .unwrap();
+        {
+            let mut maps = hub.maps.write().unwrap();
+            maps.durable_reconcile_epoch = 1;
+            maps.durable_reconcile_mutation_revision = Some(maps.mutation_revision);
+            maps.authority_reconcile_ready_epoch = Some(1);
+        }
+        hub
+    }
+
+    fn alternate_scope() -> PublishedCardEvidenceScope {
+        PublishedCardEvidenceScope {
+            user_filter: Some(43),
+            ..scope()
+        }
+    }
+
     fn compile_incremental(
         base: &policy_engine::HotState,
         target: u64,
@@ -2151,6 +2908,549 @@ mod tests {
                 )
                 .unwrap()
             })
+    }
+
+    #[test]
+    fn fence_sync_accepts_certified_root_but_never_serves_before_reconcile() {
+        let hub = MemoryProjectionHub::default();
+        hub.transition_authority_state_for_tests(AuthorizationAuthorityState::Warming)
+            .unwrap();
+        hub.begin_authority_fence_sync().unwrap();
+        assert_eq!(
+            hub.authority_state(),
+            AuthorizationAuthorityState::FenceSyncing
+        );
+
+        let state = seal_state(
+            &card_identity(),
+            17,
+            1,
+            policy_engine::HotState::from_grants(
+                tenant(),
+                1,
+                vec![grant(0x34)],
+                dependency_vector(),
+            )
+            .unwrap(),
+            None,
+            0,
+        );
+        let certified = certified_state_for(
+            state,
+            scope(),
+            "authority-a",
+            1,
+            1,
+            "key-1",
+            1,
+            None,
+            "nonce-fence-sync",
+            "proof-fence-sync",
+        );
+        hub.install_certified_authorization_state(&scope(), certified)
+            .unwrap();
+        defer(hub.try_certified_memory_evidence(&scope()));
+        assert!(hub.complete_authority_fence_sync().is_err());
+        assert_eq!(
+            hub.authority_state(),
+            AuthorizationAuthorityState::FenceSyncing
+        );
+    }
+
+    #[test]
+    fn fence_sync_requires_explicit_durable_reconcile_evidence() {
+        let hub = MemoryProjectionHub::default();
+        hub.transition_authority_state_for_tests(AuthorizationAuthorityState::Warming)
+            .unwrap();
+        hub.begin_authority_fence_sync().unwrap();
+        hub.record_channel_heartbeat();
+        assert!(hub.mark_authority_reconcile_ready().is_err());
+        assert!(hub.complete_authority_fence_sync().is_err());
+        assert!(!hub.positive_authorization_ready());
+    }
+
+    #[test]
+    fn fence_sync_requires_certified_root_and_reconcile_before_serving() {
+        let hub = MemoryProjectionHub::default();
+        hub.transition_authority_state_for_tests(AuthorizationAuthorityState::Warming)
+            .unwrap();
+        hub.begin_authority_fence_sync().unwrap();
+        hub.record_channel_heartbeat();
+        assert!(hub.mark_authority_reconcile_ready().is_err());
+        assert!(hub.complete_authority_fence_sync().is_err());
+        assert_eq!(
+            hub.authority_state(),
+            AuthorizationAuthorityState::FenceSyncing
+        );
+
+        let state = seal_state(
+            &card_identity(),
+            17,
+            1,
+            policy_engine::HotState::from_grants(
+                tenant(),
+                1,
+                vec![grant(0x35)],
+                dependency_vector(),
+            )
+            .unwrap(),
+            None,
+            0,
+        );
+        let certified = certified_state_for(
+            state,
+            scope(),
+            "authority-a",
+            1,
+            1,
+            "key-1",
+            1,
+            None,
+            "nonce-fence-ready",
+            "proof-fence-ready",
+        );
+        hub.install_certified_authorization_state(&scope(), certified)
+            .unwrap();
+        assert!(hub.mark_authority_reconcile_ready().is_err());
+        assert!(hub.complete_authority_fence_sync().is_err());
+        assert_eq!(
+            hub.authority_state(),
+            AuthorizationAuthorityState::FenceSyncing
+        );
+        defer(hub.try_certified_memory_evidence(&scope()));
+    }
+
+    #[test]
+    fn authority_pending_invalidates_certified_roots_and_requires_recovery() {
+        let hub = serving_hub();
+        let state = seal_state(
+            &card_identity(),
+            17,
+            1,
+            policy_engine::HotState::from_grants(
+                tenant(),
+                1,
+                vec![grant(0x36)],
+                dependency_vector(),
+            )
+            .unwrap(),
+            None,
+            0,
+        );
+        let certified = certified_state_for(
+            state,
+            scope(),
+            "authority-a",
+            1,
+            1,
+            "key-1",
+            1,
+            None,
+            "nonce-authority-pending",
+            "proof-authority-pending",
+        );
+        hub.install_certified_authorization_state(&scope(), certified)
+            .unwrap();
+        hub.mark_authority_pending("authority timeout");
+        defer(hub.try_certified_memory_evidence(&scope()));
+        assert_eq!(hub.authority_state(), AuthorizationAuthorityState::Pending);
+        hub.begin_authority_fence_sync().unwrap();
+        assert_eq!(
+            hub.authority_state(),
+            AuthorizationAuthorityState::FenceSyncing
+        );
+    }
+
+    #[test]
+    fn certified_install_requires_serving_and_raw_state_cannot_certify_itself() {
+        let identity = card_identity();
+        let hot = policy_engine::HotState::from_grants(
+            tenant(),
+            1,
+            vec![grant(0x31)],
+            dependency_vector(),
+        )
+        .unwrap();
+        let state = seal_state(&identity, 17, 1, hot, None, 0);
+        let certified = certified_state_for(
+            state.clone(),
+            scope(),
+            "authority-a",
+            1,
+            1,
+            "key-1",
+            1,
+            None,
+            "nonce-serving",
+            "proof-serving",
+        );
+        let cold = MemoryProjectionHub::default();
+        assert!(cold
+            .install_certified_authorization_state(&scope(), certified)
+            .is_err());
+        cold.install_published_state(state);
+        defer(cold.try_certified_memory_evidence(&scope()));
+
+        let serving = serving_hub();
+        let state = seal_state(
+            &card_identity(),
+            17,
+            1,
+            policy_engine::HotState::from_grants(
+                tenant(),
+                1,
+                vec![grant(0x30)],
+                dependency_vector(),
+            )
+            .unwrap(),
+            None,
+            0,
+        );
+        let certified = certified_state_for(
+            state,
+            scope(),
+            "authority-a",
+            1,
+            1,
+            "key-1",
+            1,
+            None,
+            "nonce-writer",
+            "proof-writer",
+        );
+        let _writer = serving.begin_source_transaction().unwrap();
+        assert!(serving
+            .install_certified_authorization_state(&scope(), certified)
+            .is_err());
+        defer(serving.try_certified_memory_evidence(&scope()));
+
+        let serving = serving_hub();
+        let state = seal_state(
+            &card_identity(),
+            17,
+            1,
+            policy_engine::HotState::from_grants(
+                tenant(),
+                1,
+                vec![grant(0x31)],
+                dependency_vector(),
+            )
+            .unwrap(),
+            None,
+            0,
+        );
+        let certified = certified_state_for(
+            state,
+            scope(),
+            "authority-a",
+            1,
+            1,
+            "key-1",
+            1,
+            None,
+            "nonce-serving-2",
+            "proof-serving-2",
+        );
+        serving
+            .install_certified_authorization_state(&scope(), certified)
+            .unwrap();
+        authority_attestation::seal_existing_partition(&serving);
+        assert!(matches!(
+            serving.try_certified_memory_evidence(&scope()),
+            MemoryEvidenceOutcome::Serve(_)
+        ));
+    }
+
+    #[test]
+    fn node_frontier_rejects_authority_term_regression() {
+        let hub = serving_hub();
+        let first_state = seal_state(
+            &card_identity(),
+            17,
+            1,
+            policy_engine::HotState::from_grants(
+                tenant(),
+                1,
+                vec![grant(0x32)],
+                dependency_vector(),
+            )
+            .unwrap(),
+            None,
+            0,
+        );
+        let first = certified_state_for(
+            first_state,
+            scope(),
+            "authority-a",
+            2,
+            10,
+            "key-1",
+            1,
+            None,
+            "nonce-term-1",
+            "proof-term-1",
+        );
+        let parent_hash = first.proof().snapshot_hash.clone();
+        hub.install_certified_authorization_state(&scope(), first)
+            .unwrap();
+
+        let regressed_state = seal_state(
+            &card_identity(),
+            17,
+            2,
+            policy_engine::HotState::from_grants(
+                tenant(),
+                2,
+                vec![grant(0x33)],
+                dependency_vector(),
+            )
+            .unwrap(),
+            Some(1),
+            0,
+        );
+        let regressed = certified_state_for(
+            regressed_state,
+            scope(),
+            "authority-a",
+            1,
+            11,
+            "key-1",
+            1,
+            Some(parent_hash),
+            "nonce-term-2",
+            "proof-term-2",
+        );
+        assert!(hub
+            .install_certified_authorization_state(&scope(), regressed)
+            .is_err());
+        assert_eq!(hub.authority_state(), AuthorizationAuthorityState::Suspect);
+        defer(hub.try_certified_memory_evidence(&scope()));
+    }
+
+    #[test]
+    fn node_frontier_rejects_authority_identity_and_same_frontier_key_divergence() {
+        let hub = serving_hub();
+        let first_state = seal_state(
+            &card_identity(),
+            17,
+            1,
+            policy_engine::HotState::from_grants(
+                tenant(),
+                1,
+                vec![grant(0x34)],
+                dependency_vector(),
+            )
+            .unwrap(),
+            None,
+            0,
+        );
+        let first = certified_state_for(
+            first_state,
+            scope(),
+            "authority-a",
+            1,
+            20,
+            "key-1",
+            1,
+            None,
+            "nonce-identity-1",
+            "proof-identity-1",
+        );
+        let parent_hash = first.proof().snapshot_hash.clone();
+        hub.install_certified_authorization_state(&scope(), first)
+            .unwrap();
+
+        let identity_state = seal_state(
+            &card_identity(),
+            17,
+            2,
+            policy_engine::HotState::from_grants(
+                tenant(),
+                2,
+                vec![grant(0x35)],
+                dependency_vector(),
+            )
+            .unwrap(),
+            Some(1),
+            0,
+        );
+        let identity_divergence = certified_state_for(
+            identity_state,
+            scope(),
+            "authority-b",
+            1,
+            21,
+            "key-1",
+            1,
+            Some(parent_hash),
+            "nonce-identity-2",
+            "proof-identity-2",
+        );
+        assert!(hub
+            .install_certified_authorization_state(&scope(), identity_divergence)
+            .is_err());
+        assert_eq!(hub.authority_state(), AuthorizationAuthorityState::Suspect);
+
+        let hub = serving_hub();
+        let first_state = seal_state(
+            &card_identity(),
+            17,
+            1,
+            policy_engine::HotState::from_grants(
+                tenant(),
+                1,
+                vec![grant(0x36)],
+                dependency_vector(),
+            )
+            .unwrap(),
+            None,
+            0,
+        );
+        let first = certified_state_for(
+            first_state,
+            scope(),
+            "authority-a",
+            1,
+            30,
+            "key-1",
+            1,
+            None,
+            "nonce-key-1",
+            "proof-key-1",
+        );
+        let parent_hash = first.proof().snapshot_hash.clone();
+        hub.install_certified_authorization_state(&scope(), first)
+            .unwrap();
+        let key_state = seal_state(
+            &card_identity(),
+            17,
+            2,
+            policy_engine::HotState::from_grants(
+                tenant(),
+                2,
+                vec![grant(0x37)],
+                dependency_vector(),
+            )
+            .unwrap(),
+            Some(1),
+            0,
+        );
+        let key_divergence = certified_state_for(
+            key_state,
+            scope(),
+            "authority-a",
+            1,
+            30,
+            "key-2",
+            2,
+            Some(parent_hash),
+            "nonce-key-2",
+            "proof-key-2",
+        );
+        assert!(hub
+            .install_certified_authorization_state(&scope(), key_divergence)
+            .is_err());
+        assert_eq!(hub.authority_state(), AuthorizationAuthorityState::Suspect);
+    }
+
+    #[test]
+    fn newer_node_frontier_clears_other_scope_roots() {
+        let hub = serving_hub();
+        let first_state = seal_state(
+            &card_identity(),
+            17,
+            1,
+            policy_engine::HotState::from_grants(
+                tenant(),
+                1,
+                vec![grant(0x38)],
+                dependency_vector(),
+            )
+            .unwrap(),
+            None,
+            0,
+        );
+        let first = certified_state_for(
+            first_state.clone(),
+            scope(),
+            "authority-a",
+            1,
+            40,
+            "key-1",
+            1,
+            None,
+            "nonce-scope-1",
+            "proof-scope-1",
+        );
+        let alternate = certified_state_for(
+            first_state,
+            alternate_scope(),
+            "authority-a",
+            1,
+            40,
+            "key-1",
+            1,
+            None,
+            "nonce-scope-2",
+            "proof-scope-2",
+        );
+        hub.install_certified_authorization_state(&scope(), first)
+            .unwrap();
+        hub.install_certified_authorization_state(&alternate_scope(), alternate)
+            .unwrap();
+        authority_attestation::seal_existing_partition(&hub);
+        assert!(matches!(
+            hub.try_certified_memory_evidence(&alternate_scope()),
+            MemoryEvidenceOutcome::Serve(_)
+        ));
+        let parent_hash = hub
+            .maps
+            .read()
+            .unwrap()
+            .certified_states
+            .get(&RefillScope::from(&scope()))
+            .unwrap()
+            .certificate()
+            .unwrap()
+            .record_digest()
+            .unwrap();
+
+        let newer_state = seal_state(
+            &card_identity(),
+            17,
+            2,
+            policy_engine::HotState::from_grants(
+                tenant(),
+                2,
+                vec![grant(0x39)],
+                dependency_vector(),
+            )
+            .unwrap(),
+            Some(1),
+            0,
+        );
+        let newer = certified_state_for(
+            newer_state,
+            scope(),
+            "authority-a",
+            1,
+            41,
+            "key-1",
+            1,
+            Some(parent_hash),
+            "nonce-scope-3",
+            "proof-scope-3",
+        );
+        hub.install_certified_authorization_state(&scope(), newer)
+            .unwrap();
+        defer(hub.try_certified_memory_evidence(&alternate_scope()));
+        assert!(hub
+            .maps
+            .read()
+            .unwrap()
+            .authority_frontier
+            .as_ref()
+            .is_some_and(|frontier| frontier.global_fence_sequence == 41));
     }
 
     #[test]

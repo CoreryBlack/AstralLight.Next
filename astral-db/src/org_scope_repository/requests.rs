@@ -79,6 +79,12 @@ pub struct OrgApproveCommand {
     pub note: Option<String>,
     /// ROOT_INIT/ROOT_GRANT 必填；其他种类忽略（结构资格由内核复验）。
     pub governance_proof: Option<OrgGovernanceProof>,
+    /// F1 proof-bound admission，在 commit 前同事务对牌并一次性消费（审批是
+    /// 唯一把 PENDING 请求落成有效授权/行政事实的写点）。`#[serde(skip)]`
+    /// 使幂等 digest 保持只绑定授权输入；replay 携带的每请求新 admission
+    /// 不得改变 operation digest。
+    #[serde(skip)]
+    pub admission: AuthorizationAdmission,
 }
 
 /// 驳回命令。
@@ -699,6 +705,7 @@ pub(crate) async fn approve_request(
     .await?
     {
         OperationClaim::Replayed(mut value) => {
+            consume_org_authority_admission(&mut tx, &cmd.admission).await?;
             commit_authority_tx(tx, authority_guard)
                 .await
                 .map_err(db_err)?;
@@ -775,6 +782,17 @@ pub(crate) async fn approve_request(
                 records,
             };
             record_operation_outcome_in_tx(&mut tx, &cmd.operation_id, &outcome).await?;
+            // 审批是授权发放写点：commit 前同事务对牌并一次性消费 F1 admission
+            // （frontier/proof 行锁最后取得，紧贴 COMMIT，与已迁移 writer 同序）。
+            consume_org_authority_admission(&mut tx, &cmd.admission).await?;
+            org_authority_capture::capture_and_stage_in_tx(
+                &mut tx,
+                &cmd.admission,
+                &cmd.operation_id,
+                request.target_tenant_id,
+                None,
+            )
+            .await?;
             commit_authority_tx(tx, authority_guard)
                 .await
                 .map_err(db_err)?;
@@ -1999,6 +2017,41 @@ mod tests {
     use super::*;
     use astral_types::ValidityWindow;
 
+    /// 结构合法的 fixture admission（本模块纯测试不触 durable 对牌；
+    /// `from_verified_proof` 只做结构校验，签名对牌归 F1 读取、行等值对牌
+    /// 归 commit 门）。
+    fn fixture_admission() -> AuthorizationAdmission {
+        let proof = astral_types::AuthorizationFenceProof {
+            authorization_edition: astral_types::AUTHORIZATION_EDITION,
+            authority_id: "authority-test".into(),
+            authority_term: 1,
+            global_fence_sequence: 1,
+            scope: astral_types::AuthorizationAuthorityScope {
+                tenant_id: 20,
+                card_id: 1,
+                user_id: Some(1),
+                domain: astral_types::AuthorizationDomainScope::Any,
+            },
+            scope_generation: 1,
+            revoke_watermark: 1,
+            snapshot_hash: "ab".repeat(32),
+            parent_hash: None,
+            operation_id: "op-fixture".into(),
+            event_id: "event-fixture".into(),
+            key_id: "key-test".into(),
+            key_epoch: 1,
+            issued_at: 100,
+            not_before: 99,
+            expires_at: 110,
+            request_nonce: "nonce-fixture".into(),
+            request_binding_digest: None,
+            scope_certificate_hash: None,
+            proof_id: "proof-fixture".into(),
+            signature: "00".repeat(64),
+        };
+        AuthorizationAdmission::from_verified_proof(proof).expect("structural fixture proof")
+    }
+
     fn grant_payload() -> OrgRequestPayload {
         OrgRequestPayload::Grant {
             receiving_tenant_id: 20,
@@ -2136,6 +2189,7 @@ mod tests {
             operation_id: "op".into(),
             note: None,
             governance_proof: None,
+            admission: fixture_admission(),
         };
         let scope = OrgScope {
             resource_tenant_id: 20,
@@ -2166,6 +2220,7 @@ mod tests {
                     validity: ValidityWindow::perpetual(),
                 }],
             }),
+            admission: fixture_admission(),
         };
         assert!(require_governance_proof(proving_cmd.governance_proof.as_ref(), &scopes).is_ok());
 
@@ -2213,6 +2268,7 @@ mod tests {
                     validity: ValidityWindow::perpetual(),
                 }],
             }),
+            admission: fixture_admission(),
         };
         assert!(require_governance_proof(
             cmd_with("org_authority_edge", "bootstrap")

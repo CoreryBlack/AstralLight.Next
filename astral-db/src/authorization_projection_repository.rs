@@ -291,7 +291,10 @@ pub use manifest_seal::{compute_manifest_digest, ManifestDigestInput};
 pub(super) async fn load_owned_completion_in_tx(
     tx: &mut Transaction<'_, MySql>,
     request: &crate::DeltaEventAppendRequest,
-) -> Result<Option<(i64, u64, Sha256Digest, i64)>, AuthorizationProjectionError> {
+) -> Result<
+    Option<(i64, u64, Sha256Digest, i64, Option<Sha256Digest>, u64)>,
+    AuthorizationProjectionError,
+> {
     Ok(owned_completion::load_in_tx(tx, request)
         .await?
         .map(|proof| {
@@ -300,6 +303,8 @@ pub(super) async fn load_owned_completion_in_tx(
                 proof.generation,
                 proof.manifest_digest,
                 proof.plan_id,
+                proof.parent_manifest_digest,
+                proof.revoke_fence,
             )
         }))
 }

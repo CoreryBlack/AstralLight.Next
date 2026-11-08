@@ -525,8 +525,10 @@ async fn install_runtime(pool: &MySqlPool, tenant_id: i64) -> Result<RuntimeOwne
     let (invalidation_shutdown, invalidation_shutdown_rx) = watch::channel(false);
     let identity = NodeIdentity::try_from_parts("native-test", "projection-storm")
         .map_err(|error| anyhow!("node identity construction failed: {error}"))?;
-    let supervisor = start_local_projection_supervisor(pool.clone(), local_bus, identity)
-        .map_err(|error| anyhow!("invalidation supervisor start failed: {error}"))?;
+    let authority = astral_db::authority_provider_from_env(pool.clone()).await?;
+    let supervisor =
+        start_local_projection_supervisor(pool.clone(), local_bus, identity, authority)
+            .map_err(|error| anyhow!("invalidation supervisor start failed: {error}"))?;
     let invalidation_join = tokio::spawn(run_invalidation_consumer(
         invalidation_receiver,
         invalidation_shutdown_rx,

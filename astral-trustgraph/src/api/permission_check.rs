@@ -10,6 +10,7 @@
 //!   PUT / PATCH → "update"
 //!   DELETE → "delete"
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::{Request, State};
@@ -54,6 +55,7 @@ pub const TRUSTGRAPH_PATH_RESOURCE_MAP: &[(&str, &str)] = &[
     ("/sod-policies", "permission_rule"),
     ("/hit-stats", "audit"),
     ("/stats", "monitor"),
+    ("/authorization-observations", "monitor"),
     ("/tenants", "platform_tenant"),
     ("/platform-packages", "platform_package"),
     ("/departments", "platform_dept"),
@@ -78,8 +80,7 @@ pub const TRUSTGRAPH_PATH_RESOURCE_MAP: &[(&str, &str)] = &[
 /// 放行路径：TrustGraph 业务端点统一经过 PolicyEngine；健康检查在主路由外单独暴露。
 const SKIP_PATHS: &[&str] = &[];
 
-/// 对象级 target_id 只来自显式 query 键（对齐 Java `PermissionAspect.resolveResourceId`），
-/// 不从未知路径段推断，避免把分页/attempt 等无关数字误当授权资源。
+/// 资源映射只按已冻结前缀解析；审批 mutation 的目标另外由精确路由绑定。
 fn resource_for_path(path: &str) -> Option<&'static str> {
     TRUSTGRAPH_PATH_RESOURCE_MAP
         .iter()
@@ -111,6 +112,96 @@ fn resolve_trustgraph_permission_action(
         return Some("replay");
     }
     resolve_permission_action(resource, path, method)
+}
+
+fn canonical_positive_id(value: &str) -> Option<i64> {
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0 && id.to_string() == value)
+}
+
+fn permission_request_target<'a>(path: &'a str, method: &str) -> Option<(i64, &'a str)> {
+    if method != "POST" {
+        return None;
+    }
+    let (id, action) = path
+        .strip_prefix("/permission-requests/")?
+        .split_once('/')?;
+    if !matches!(action, "cancel" | "reject" | "approve") {
+        return None;
+    }
+    Some((canonical_positive_id(id)?, action))
+}
+
+fn trustgraph_request_target_id(
+    req: &Request,
+    resource: &str,
+    path: &str,
+    method: &str,
+) -> Result<Option<i64>, StatusCode> {
+    let path_target = (resource == "permission_request")
+        .then(|| permission_request_target(path, method))
+        .flatten();
+    let Some((path_id, _)) = path_target else {
+        return Ok(request_target_id(req));
+    };
+    if let Some(query) = req.uri().query() {
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            if matches!(
+                key,
+                "target_id"
+                    | "targetId"
+                    | "resource_id"
+                    | "resourceId"
+                    | "id"
+                    | "card_id"
+                    | "cardId"
+            ) && canonical_positive_id(value) != Some(path_id)
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+    Ok(Some(path_id))
+}
+
+fn request_mutation_kind(
+    resource: &str,
+    path: &str,
+    method: &str,
+) -> Option<astral_types::AuthorityMutationKind> {
+    if resource == "permission_request" && method == "POST" {
+        let exact_route = path == "/permission-requests"
+            || permission_request_target(path, method)
+                .is_some_and(|(_, action)| matches!(action, "cancel" | "reject"));
+        return exact_route.then_some(astral_types::AuthorityMutationKind::ProtectedBusiness);
+    }
+    if resource == "platform_package" {
+        let exact_route = (method == "POST" && path == "/platform-packages")
+            || (matches!(method, "PUT" | "DELETE")
+                && path.strip_prefix("/platform-packages/").is_some_and(|id| {
+                    id.parse::<i64>()
+                        .is_ok_and(|value| value > 0 && value.to_string() == id)
+                }));
+        return exact_route.then_some(astral_types::AuthorityMutationKind::ProtectedBusiness);
+    }
+    if method != "POST" {
+        return None;
+    }
+    let object_path = match resource {
+        "domain" => path
+            .strip_prefix("/user-cards/")
+            .and_then(|tail| tail.strip_suffix("/bind/async")),
+        "platform_tenant" => path
+            .strip_prefix("/tenants/")
+            .and_then(|tail| tail.strip_suffix("/purchases")),
+        _ => None,
+    };
+    object_path
+        .filter(|id| id.parse::<i64>().is_ok_and(|value| value > 0))
+        .map(|_| astral_types::AuthorityMutationKind::ProtectedBusiness)
 }
 
 fn operation_poll_scope_matches(
@@ -255,7 +346,8 @@ async fn permission_check_middleware_scoped(
     request_id: Option<String>,
 ) -> Result<Response, BoxedResponse> {
     let authorization_started = Instant::now();
-    let path = req.uri().path();
+    let request_path = req.uri().path().to_owned();
+    let path = request_path.as_str();
     let method = req.method().clone();
 
     // 放行路径
@@ -333,7 +425,8 @@ async fn permission_check_middleware_scoped(
         },
     };
 
-    let query_target_id = request_target_id(&req);
+    let query_target_id = trustgraph_request_target_id(&req, resource, path, method.as_str())
+        .map_err(|status| BoxedResponse::new(status.into_response()))?;
     let mut ctx = match physical_policy_context(req.headers(), resource, action, query_target_id) {
         Ok(ctx) => ctx,
         Err(status) => {
@@ -344,6 +437,16 @@ async fn permission_check_middleware_scoped(
             return Err(BoxedResponse::new(status.into_response()));
         }
     };
+    ctx.request_mutation_kind = request_mutation_kind(resource, path, method.as_str());
+    ctx.request_operation_id = Some(
+        astral_common::middleware::request_binding::request_operation_id(&req)
+            .map_err(|status| BoxedResponse::new(status.into_response()))?,
+    );
+    ctx.request_fingerprint = Some(
+        astral_common::middleware::request_binding::bind_http_request(&mut req)
+            .await
+            .map_err(|status| BoxedResponse::new(status.into_response()))?,
+    );
     let resolution = if path_matches_prefix(path, "/operations") && method == "GET" {
         resolve_operation_poll_ownership(&state.db, path, &ctx).await
     } else {
@@ -392,24 +495,37 @@ async fn permission_check_middleware_scoped(
     // 单机内存镜像读面（default-off）：组合进程安装
     // astral_db::memory_projection_hub 后，命中镜像的直接返回与 durable 同源
     // 的已验证证据（同一纯装配函数），pending/未预热一律回退既有链路。
-    let decision = if astral_db::memory_mirror_is_installed() {
+    let evaluation = if astral_db::memory_mirror_is_installed() {
         let repo = astral_db::MemoryMirroredRuleRepository::new(
             CachedPublishedEvidenceRuleRepository::new(
                 SqlxRuleRepository::new(state.db.clone())
-                    .with_org_scope_enabled(state.org_scope_enabled),
+                    .with_org_scope_enabled(state.org_scope_enabled)
+                    .with_authority_provider_opt(state.authorization_fence_provider.clone())
+                    .with_authority_required(
+                        state.config.authority_runtime_mode.requires_authority(),
+                    ),
                 state.db.clone(),
             ),
         )
+        .with_authority_provider_opt(
+            state
+                .authorization_fence_provider
+                .clone()
+                .map(|provider| provider as Arc<dyn policy_engine::AuthorizationFenceProvider>),
+        )
         .with_durable_refill(state.db.clone());
-        state.engine.evaluate(&ctx, &repo).await
+        state.engine.evaluate_with_admission(&ctx, &repo).await
     } else {
         let repo = CachedPublishedEvidenceRuleRepository::new(
             SqlxRuleRepository::new(state.db.clone())
-                .with_org_scope_enabled(state.org_scope_enabled),
+                .with_org_scope_enabled(state.org_scope_enabled)
+                .with_authority_provider_opt(state.authorization_fence_provider.clone())
+                .with_authority_required(state.config.authority_runtime_mode.requires_authority()),
             state.db.clone(),
         );
-        state.engine.evaluate(&ctx, &repo).await
+        state.engine.evaluate_with_admission(&ctx, &repo).await
     };
+    let (decision, authorization_admission) = evaluation.into_parts();
     record_authorization_decision(classify_policy_decision(&decision));
     #[cfg(feature = "e1-observability")]
     {
@@ -628,9 +744,45 @@ async fn permission_check_middleware_scoped(
         authorization_started.elapsed(),
     );
 
+    let source_abort = if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        let provider = state
+            .authorization_fence_provider
+            .as_ref()
+            .ok_or_else(|| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+        let admission = authorization_admission
+            .as_ref()
+            .ok_or_else(|| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+        let abort = provider
+            .reserve_mutation_with_abort(&ctx, admission)
+            .await
+            .map_err(|error| {
+                BoxedResponse::new(
+                    AppError(AstralError::Pending(error.to_string())).into_response(),
+                )
+            })?;
+        Some((provider.clone(), abort))
+    } else {
+        None
+    };
     // 将校验后的上下文注入请求扩展，供下游 handler 使用
     req.extensions_mut().insert(ctx);
-    Ok(next.run(req).await)
+    if let Some(authorization_admission) = authorization_admission {
+        req.extensions_mut().insert(authorization_admission);
+    }
+    let response = next.run(req).await;
+    if let Some((provider, abort)) = source_abort {
+        // HTTP status does not prove source rollback. The DB owner attempts a
+        // same-row durable abort and refuses it if admission use/outcome exists.
+        if let Err(error) = provider.abort_source_reservation(&abort).await {
+            tracing::warn!(
+                operation_id = %abort.operation_id,
+                reservation_id = %abort.reservation_id,
+                error = %error,
+                "post-handler source abort remains unknown; stable identity recovery required"
+            );
+        }
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -641,6 +793,132 @@ mod tests {
     };
     use axum::extract::Request;
     use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn business_mutation_classification_requires_an_exact_trusted_route() {
+        use astral_types::AuthorityMutationKind::ProtectedBusiness;
+        for (resource, path) in [
+            ("platform_tenant", "/tenants/17/purchases"),
+            ("domain", "/user-cards/23/bind/async"),
+        ] {
+            assert_eq!(
+                super::request_mutation_kind(resource, path, "POST"),
+                Some(ProtectedBusiness)
+            );
+            assert_eq!(super::request_mutation_kind(resource, path, "PUT"), None);
+        }
+        for (resource, path) in [
+            ("platform_tenant", "/tenants"),
+            ("platform_tenant", "/tenants/17"),
+            ("platform_tenant", "/tenants/0/purchases"),
+            ("platform_tenant", "/tenants/-1/purchases"),
+            ("platform_tenant", "/tenants/17/purchases/extra"),
+            ("platform_tenant", "/tenants/17/domains"),
+            ("domain", "/user-cards/23/bind"),
+            ("domain", "/user-cards/23/bind/async/extra"),
+            ("permission_rule", "/tenants/17/purchases"),
+        ] {
+            assert_eq!(super::request_mutation_kind(resource, path, "POST"), None);
+        }
+    }
+
+    #[test]
+    fn approval_workflow_business_kind_and_target_require_exact_routes() {
+        use astral_types::AuthorityMutationKind::ProtectedBusiness;
+        for path in [
+            "/permission-requests",
+            "/permission-requests/17/cancel",
+            "/permission-requests/17/reject",
+        ] {
+            assert_eq!(
+                super::request_mutation_kind("permission_request", path, "POST"),
+                Some(ProtectedBusiness)
+            );
+        }
+        for path in [
+            "/permission-requests/17/approve",
+            "/permission-requests/017/cancel",
+            "/permission-requests/0/reject",
+            "/permission-requests/17/reject/extra",
+            "/permission-requests/17/",
+        ] {
+            assert_eq!(
+                super::request_mutation_kind("permission_request", path, "POST"),
+                None
+            );
+        }
+        let request = |query: &str| {
+            Request::builder()
+                .uri(format!("/permission-requests/17/reject{query}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        for query in ["", "?id=17", "?id=17&target_id=17"] {
+            assert_eq!(
+                super::trustgraph_request_target_id(
+                    &request(query),
+                    "permission_request",
+                    "/permission-requests/17/reject",
+                    "POST"
+                ),
+                Ok(Some(17))
+            );
+        }
+        for query in ["?id=18", "?id=17&id=18", "?id=017", "?target_id=abc", "?id"] {
+            assert_eq!(
+                super::trustgraph_request_target_id(
+                    &request(query),
+                    "permission_request",
+                    "/permission-requests/17/reject",
+                    "POST"
+                ),
+                Err(axum::http::StatusCode::BAD_REQUEST)
+            );
+        }
+        assert_eq!(
+            super::request_mutation_kind(
+                "permission_request",
+                "/permission-requests/17/reject",
+                "PUT"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn package_business_mutations_require_registered_exact_routes() {
+        use astral_types::AuthorityMutationKind::ProtectedBusiness;
+        for (path, method) in [
+            ("/platform-packages", "POST"),
+            ("/platform-packages/17", "PUT"),
+            ("/platform-packages/17", "DELETE"),
+        ] {
+            assert_eq!(
+                super::request_mutation_kind("platform_package", path, method),
+                Some(ProtectedBusiness)
+            );
+        }
+        for (path, method) in [
+            ("/platform-packages", "GET"),
+            ("/platform-packages", "PUT"),
+            ("/platform-packages/17", "POST"),
+            ("/platform-packages/17", "PATCH"),
+            ("/platform-packages/0", "PUT"),
+            ("/platform-packages/-1", "DELETE"),
+            ("/platform-packages/017", "PUT"),
+            ("/platform-packages/17/extra", "DELETE"),
+            ("/platform-packages/17/", "PUT"),
+        ] {
+            assert_eq!(
+                super::request_mutation_kind("platform_package", path, method),
+                None
+            );
+        }
+        assert_eq!(
+            super::request_mutation_kind("permission_rule", "/platform-packages", "POST"),
+            None
+        );
+    }
 
     #[test]
     fn operation_poll_requires_original_requester_and_exact_authorization_anchor() {

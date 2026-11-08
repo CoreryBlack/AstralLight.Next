@@ -45,6 +45,7 @@ pub mod authorization_projector;
 // 证明被取代的旧 sealed chain 并落 durable proof + SUCCEEDED；绝不发布当前版本、
 // 不做 GC、不触碰 MQ/cache 与旧快照职责。
 pub mod authorization_archive_worker;
+pub mod authorization_authority_runtime;
 // 跨城授权 coordinator（P4 runtime slice，DEFAULT-OFF）：库服务（无 HTTP 路由、
 // 无自启动 worker），把「纯验签 → durable replay reservation + verified vote
 // 同事务、证据推导 agreement seal、持久 commit receipt、双城 durable completion
@@ -99,6 +100,7 @@ pub mod rule_write_service;
 pub mod sync_publish;
 pub mod template_service;
 pub mod tenant_service;
+pub(crate) mod user_card_batch_admission;
 pub mod user_card_service;
 
 #[cfg(test)]

@@ -45,7 +45,7 @@ macro_rules! authorization_edition {
     };
 }
 
-authorization_edition!(6);
+authorization_edition!(7);
 
 #[cfg(test)]
 mod tests {

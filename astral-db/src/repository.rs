@@ -491,29 +491,47 @@ pub struct PasswordResetTokenRow {
     pub id: i64,
     pub user_id: i64,
     pub card_number: String,
+    /// 稳定调用方 operation id（与 `al_delivery_intent.operation_id` 关联；
+    /// 旧行/未绑定为 NULL → 不可消费）。
+    pub operation_id: Option<String>,
+    /// 本凭证外发所用的稳定 delivery intent 身份
+    /// （`al_delivery_intent.message_id`；旧行/未绑定为 NULL → 不可消费）。
+    pub delivery_message_id: Option<String>,
     pub token: String,
     pub expires_at: time::PrimitiveDateTime,
     pub used_at: Option<time::PrimitiveDateTime>,
     pub created_at: Option<time::PrimitiveDateTime>,
 }
 
-/// 插入密码重置令牌
-pub async fn insert_password_reset_token(
-    pool: &MySqlPool,
+/// 插入密码重置令牌（taskId `authority-v7-peripheral-20261107`：同时绑定
+/// 稳定 operation id 与 delivery intent message id；凭证出生即
+/// PENDING-by-construction，只有 durable DELIVERED 证据可使其可消费）。
+/// `executor` 接受连接池或调用方事务（签发 + 审计关联同事务由调用方组合）。
+pub async fn insert_password_reset_token<'e, E>(
+    executor: E,
     user_id: i64,
     card_number: &str,
     token_hash: &str,
+    operation_id: &str,
+    delivery_message_id: &str,
     expires_at: &time::PrimitiveDateTime,
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    E: sqlx::Executor<'e, Database = MySql>,
+{
     sqlx::query(
-        "INSERT INTO password_reset_token (user_id, card_number, token, expires_at) VALUES (?, ?, ?, ?)"
+        "INSERT INTO password_reset_token \
+         (user_id, card_number, token, operation_id, delivery_message_id, expires_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
-        .bind(user_id)
-        .bind(card_number)
-        .bind(token_hash)
-        .bind(expires_at)
-        .execute(pool)
-        .await?;
+    .bind(user_id)
+    .bind(card_number)
+    .bind(token_hash)
+    .bind(operation_id)
+    .bind(delivery_message_id)
+    .bind(expires_at)
+    .execute(executor)
+    .await?;
     Ok(())
 }
 
@@ -538,13 +556,14 @@ pub async fn invalidate_password_reset_token(
     Ok(())
 }
 
-/// 查找未使用的密码重置令牌（按 token hash）
+/// 查找未使用的密码重置令牌（按 token hash）。可消费性不由此查询决定：
+/// 消费必须经 join `al_delivery_intent.state='DELIVERED'` 的同事务门。
 pub async fn find_valid_password_reset_token(
     pool: &MySqlPool,
     token_hash: &str,
 ) -> Result<Option<PasswordResetTokenRow>, DbError> {
     let row = sqlx::query_as::<_, PasswordResetTokenRow>(
-        "SELECT id, user_id, card_number, token, expires_at, used_at, created_at \
+        "SELECT id, user_id, card_number, operation_id, delivery_message_id, token, expires_at, used_at, created_at \
          FROM password_reset_token \
          WHERE token = ? AND used_at IS NULL AND expires_at > NOW() \
          ORDER BY created_at DESC LIMIT 1",
@@ -555,10 +574,18 @@ pub async fn find_valid_password_reset_token(
     Ok(row)
 }
 
-/// 原子消费密码重置令牌。返回 1 表示本次消费成功，0 表示令牌已被其他请求消费。
+/// 原子消费密码重置令牌。返回 1 表示本次消费成功，0 表示令牌已被其他请求
+/// 消费、投递证据未达 durable DELIVERED，或 operation/message 绑定缺失或
+/// 不匹配。
 pub async fn mark_password_reset_token_used(pool: &MySqlPool, id: i64) -> Result<bool, DbError> {
     let result = sqlx::query(
-        "UPDATE password_reset_token SET used_at = NOW() WHERE id = ? AND used_at IS NULL AND expires_at > NOW()",
+        "UPDATE password_reset_token prt \
+         JOIN al_delivery_intent adi ON adi.message_id = prt.delivery_message_id \
+         SET prt.used_at = NOW() \
+         WHERE prt.id = ? AND prt.used_at IS NULL AND prt.expires_at > NOW() \
+           AND adi.state = 'DELIVERED' \
+           AND CAST(adi.message_id AS BINARY) = CAST(prt.delivery_message_id AS BINARY) \
+           AND CAST(adi.operation_id AS BINARY) = CAST(prt.operation_id AS BINARY)",
     )
     .bind(id)
     .execute(pool)
@@ -567,13 +594,27 @@ pub async fn mark_password_reset_token_used(pool: &MySqlPool, id: i64) -> Result
 }
 
 /// 事务内原子消费密码重置令牌（与密码哈希更新同一事务）。
-/// `used_at IS NULL` 条件即 replay 边界：并发请求中仅一个能成功消费。
+///
+/// 双绑定消费门：`delivery_message_id` 与 `operation_id` 都必须与 intent 行
+/// **二进制精确相等**（两侧列 collation 不同：utf8mb4_unicode_ci vs
+/// ascii_bin——自然等值会被 coerc 到 unicode_ci 产生大小写/尾空格等价，故
+/// ON 用自然等值保住 `uq_delivery_intent_message` 索引探活，WHERE 以
+/// `CAST(... AS BINARY)` 强制字节级精确），state 必须为 durable
+/// `DELIVERED`。任一绑定缺失（旧行 NULL；CAST(NULL)=NULL，谓词不真）或
+/// 不匹配 → 0 行 → 拒绝消费，fail-closed。`used_at IS NULL` 即 replay
+/// 边界：并发请求中仅一个能成功消费。
 pub async fn mark_password_reset_token_used_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     id: i64,
 ) -> Result<bool, DbError> {
     let result = sqlx::query(
-        "UPDATE password_reset_token SET used_at = NOW() WHERE id = ? AND used_at IS NULL AND expires_at > NOW()",
+        "UPDATE password_reset_token prt \
+         JOIN al_delivery_intent adi ON adi.message_id = prt.delivery_message_id \
+         SET prt.used_at = NOW() \
+         WHERE prt.id = ? AND prt.used_at IS NULL AND prt.expires_at > NOW() \
+           AND adi.state = 'DELIVERED' \
+           AND CAST(adi.message_id AS BINARY) = CAST(prt.delivery_message_id AS BINARY) \
+           AND CAST(adi.operation_id AS BINARY) = CAST(prt.operation_id AS BINARY)",
     )
     .bind(id)
     .execute(&mut **tx)
@@ -596,6 +637,15 @@ pub async fn invalidate_user_password_reset_tokens(
 }
 
 // ===== Phase 2a: Identity — 验证码 =====
+//
+// TTL/GC ownership（所有权边界）：
+// - 行 TTL 由调用方（astral-identity）计算 `expires_at` 时拥有；本模块只存储
+//   与按 TTL 过滤，不自造有效期。
+// - Supersession：同一 (target, purpose) 至多存在一个未消费验证码；签发在新
+//   短事务内先删除同 key 未消费行再插入，禁止旧码与新码并行有效。
+// - GC：已消费/已过期死行由两条有界路径清理——签发时的同 key 删除，以及
+//   `cleanup_expired_verification_codes` 的有界扫描（索引 idx_vc_expires）。
+//   本模块不启动后台 worker；GC 由调用方在签发路径上机会式触发且不阻塞签发。
 
 /// 验证码行
 #[derive(Debug, sqlx::FromRow)]
@@ -609,27 +659,72 @@ pub struct VerificationCodeRow {
     pub created_at: Option<time::PrimitiveDateTime>,
 }
 
-/// 插入验证码
-pub async fn insert_verification_code(
+/// 签发验证码：在同一短事务内先作废同 (target, purpose) 的全部未消费旧码，
+/// 再插入新码。返回新码的 durable 行 id，作为 send/verify 之间稳定的
+/// operation/audit correlation id（验证码明文不入日志）。
+///
+/// 调用方拥有 TTL（`expires_at`）；本函数只保证"同 key 至多一个活跃码"。
+/// 并发校验在签发事务提交前后要么看到旧码（随后 CAS 因行被删而失败，fail-closed），
+/// 要么看到新码，不存在双活窗口。
+pub async fn issue_verification_code(
     pool: &MySqlPool,
     target: &str,
     purpose: &str,
     code: &str,
     expires_at: &time::PrimitiveDateTime,
-) -> Result<(), DbError> {
+) -> Result<i64, DbError> {
+    let mut tx = pool.begin().await?;
+    // Supersede：未消费旧码（含已过期未清理的）从此不可再被校验；
+    // `verified_at IS NULL` 保持"活跃码"语义不与"已消费"混淆。
     sqlx::query(
+        "DELETE FROM verification_code \
+         WHERE target = ? AND purpose = ? AND verified_at IS NULL",
+    )
+    .bind(target)
+    .bind(purpose)
+    .execute(&mut *tx)
+    .await?;
+    let result = sqlx::query(
         "INSERT INTO verification_code (target, purpose, code, expires_at) VALUES (?, ?, ?, ?)",
     )
     .bind(target)
     .bind(purpose)
     .bind(code)
     .bind(expires_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(())
+    if result.rows_affected() != 1 || result.last_insert_id() == 0 {
+        tx.rollback().await?;
+        return Err(DbError::Mapping(
+            "verification code was not durably issued".into(),
+        ));
+    }
+    let code_id = result.last_insert_id() as i64;
+    tx.commit().await?;
+    Ok(code_id)
 }
 
-/// 查找指定 target + purpose 未使用、未过期的验证码（按创建时间倒序取最新）
+/// 有界机会式 GC：删除过期时间早于 `retention` 之前（已过期，无论是否消费）
+/// 的死行，单次最多 `limit` 行。走 idx_vc_expires 索引，扫描量有界；
+/// GC 失败只影响存储膨胀，不影响验证码正确性，调用方应记录失败但不阻塞签发。
+pub async fn cleanup_expired_verification_codes(
+    pool: &MySqlPool,
+    retention: Duration,
+    limit: u64,
+) -> Result<u64, DbError> {
+    let cutoff = OffsetDateTime::now_utc() - retention;
+    let cutoff_prim = PrimitiveDateTime::new(cutoff.date(), cutoff.time());
+    let result = sqlx::query("DELETE FROM verification_code WHERE expires_at < ? LIMIT ?")
+        .bind(cutoff_prim)
+        .bind(limit)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// 查找指定 target + purpose 未使用、未过期的验证码（按创建时间倒序取最新）。
+/// 签发侧 supersede 保证同 key 至多一个活跃码；本查询只做候选选择，
+/// 消费必须经 `mark_verification_code_verified` 的 CAS。
 pub async fn find_valid_verification_code(
     pool: &MySqlPool,
     target: &str,
@@ -648,7 +743,9 @@ pub async fn find_valid_verification_code(
     Ok(row)
 }
 
-/// 原子消费验证码：verified_at 仍为 NULL、未过期且身份字段完全匹配时只有一个并发校验成功。
+/// 一次性消费验证码（one-shot CAS/replay 边界）：仅当 `verified_at` 仍为 NULL、
+/// 未过期且 id + target + purpose + code 完全匹配时置 `verified_at`；
+/// 并发校验中只有一个成功，其余得到 false（调用方必须 fail-closed 拒绝）。
 pub async fn mark_verification_code_verified(
     pool: &MySqlPool,
     id: i64,
@@ -974,6 +1071,315 @@ mod tests {
                 "{function_name} must exclude INTERNAL audit rows"
             );
         }
+    }
+
+    /// 密码重置消费门契约（source-shape，taskId
+    /// `authority-v7-peripheral-20261107`）：两个消费 helper 的 UPDATE 必须
+    /// 同时对 message_id 与 operation_id 双绑定做**二进制精确**比对
+    /// （CAST AS BINARY——两侧列 collation 不同，自然等值会被 coerc 到
+    /// unicode_ci 产生大小写/尾空格等价）并要求 durable `DELIVERED`——缺一
+    /// 即为可被 NULL 绑定/错绑定绕过的消费门。（作废 helper 的无门 used_at
+    /// 直写是刻意的 housekeeping，不在本契约内。）
+    #[test]
+    fn password_reset_consumption_gate_binds_both_columns() {
+        let source = include_str!("repository.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert_eq!(
+            production.matches("JOIN al_delivery_intent adi").count(),
+            2,
+            "both pool and tx consume helpers must gate via the join"
+        );
+        for anchor in [
+            "CAST(adi.message_id AS BINARY) = CAST(prt.delivery_message_id AS BINARY)",
+            "CAST(adi.operation_id AS BINARY) = CAST(prt.operation_id AS BINARY)",
+            "adi.state = 'DELIVERED'",
+            "prt.used_at IS NULL",
+        ] {
+            assert_eq!(
+                production.matches(anchor).count(),
+                2,
+                "both consume helpers must carry {anchor}"
+            );
+        }
+    }
+
+    /// 消费门负例/正例（显式 ignored integration；AGENTS §10.0：无真实 DB
+    /// 只登记，不折算 PASS）。需要 ASTRAL_PASSWORD_RESET_TEST_MYSQL_URL 且已
+    /// 应用 migration 20261107000008。覆盖：operation NULL 拒绝、operation
+    /// 错绑定拒绝、message 错绑定拒绝、QUEUED/ACCEPTED 拒绝、DELIVERED 消费
+    /// 一次成功 + 重放拒绝。
+    #[tokio::test]
+    #[ignore = "requires ASTRAL_PASSWORD_RESET_TEST_MYSQL_URL with migration 20261107000008 applied"]
+    async fn password_reset_delivery_binding_gate_negatives_and_positives() {
+        let Some(url) = std::env::var("ASTRAL_PASSWORD_RESET_TEST_MYSQL_URL")
+            .ok()
+            .map(|url| url.trim().to_owned())
+            .filter(|url| !url.is_empty())
+        else {
+            eprintln!("[SKIP] ASTRAL_PASSWORD_RESET_TEST_MYSQL_URL not set");
+            return;
+        };
+        let pool = MySqlPool::connect(&url).await.expect("connect test mysql");
+
+        async fn insert_intent(
+            pool: &MySqlPool,
+            message_id: &str,
+            operation_id: &str,
+            state: &str,
+        ) -> i64 {
+            sqlx::query(
+                "INSERT INTO al_delivery_intent \
+                 (message_id, operation_id, channel_kind, recipient, payload_class, state) \
+                 VALUES (?, ?, 'EMAIL', 'gate-test@example.com', 'EPHEMERAL_SECRET', ?)",
+            )
+            .bind(message_id)
+            .bind(operation_id)
+            .bind(state)
+            .execute(pool)
+            .await
+            .expect("insert intent fixture")
+            .last_insert_id() as i64
+        }
+
+        async fn insert_token(
+            pool: &MySqlPool,
+            token_hash: &str,
+            operation_id: Option<&str>,
+            delivery_message_id: Option<&str>,
+        ) -> i64 {
+            sqlx::query(
+                "INSERT INTO password_reset_token \
+                 (user_id, card_number, token, operation_id, delivery_message_id, expires_at) \
+                 VALUES (42, 'gate-test', ?, ?, ?, DATE_ADD(NOW(), INTERVAL 30 MINUTE))",
+            )
+            .bind(token_hash)
+            .bind(operation_id)
+            .bind(delivery_message_id)
+            .execute(pool)
+            .await
+            .expect("insert token fixture")
+            .last_insert_id() as i64
+        }
+
+        async fn cleanup(pool: &MySqlPool, token_id: i64, intent_id: i64) {
+            let _ = sqlx::query("DELETE FROM password_reset_token WHERE id = ?")
+                .bind(token_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM al_delivery_intent WHERE id = ?")
+                .bind(intent_id)
+                .execute(pool)
+                .await;
+        }
+
+        let run = uuid::Uuid::now_v7().simple().to_string();
+
+        // 负例 1：operation 绑定 NULL（部分绑定旧行形态）→ 拒绝。
+        let intent = insert_intent(
+            &pool,
+            &format!("msg-null-{run}"),
+            &format!("op-null-{run}"),
+            "DELIVERED",
+        )
+        .await;
+        let token = insert_token(
+            &pool,
+            &format!("tok-null-{run}"),
+            None,
+            Some(&format!("msg-null-{run}")),
+        )
+        .await;
+        assert!(
+            !mark_password_reset_token_used(&pool, token).await.unwrap(),
+            "NULL operation binding must be refused"
+        );
+        cleanup(&pool, token, intent).await;
+
+        // 负例 2：operation 错绑定（message 匹配但 operation 不一致）→ 拒绝。
+        let intent = insert_intent(
+            &pool,
+            &format!("msg-x-{run}"),
+            &format!("op-real-{run}"),
+            "DELIVERED",
+        )
+        .await;
+        let token = insert_token(
+            &pool,
+            &format!("tok-x-{run}"),
+            Some(&format!("op-wrong-{run}")),
+            Some(&format!("msg-x-{run}")),
+        )
+        .await;
+        assert!(
+            !mark_password_reset_token_used(&pool, token).await.unwrap(),
+            "mismatched operation binding must be refused"
+        );
+        cleanup(&pool, token, intent).await;
+
+        // 负例 3：message 错绑定（operation 匹配但 message 指向其他 intent）→ 拒绝。
+        let intent = insert_intent(
+            &pool,
+            &format!("msg-m-{run}"),
+            &format!("op-m-{run}"),
+            "DELIVERED",
+        )
+        .await;
+        let token = insert_token(
+            &pool,
+            &format!("tok-m-{run}"),
+            Some(&format!("op-m-{run}")),
+            Some(&format!("msg-other-{run}")),
+        )
+        .await;
+        assert!(
+            !mark_password_reset_token_used(&pool, token).await.unwrap(),
+            "mismatched message binding must be refused"
+        );
+        cleanup(&pool, token, intent).await;
+
+        // 负例 4：投递未证明（QUEUED / ACCEPTED）→ 拒绝。
+        for state in ["QUEUED", "ACCEPTED"] {
+            let intent = insert_intent(
+                &pool,
+                &format!("msg-{state}-{run}"),
+                &format!("op-{state}-{run}"),
+                state,
+            )
+            .await;
+            let token = insert_token(
+                &pool,
+                &format!("tok-{state}-{run}"),
+                Some(&format!("op-{state}-{run}")),
+                Some(&format!("msg-{state}-{run}")),
+            )
+            .await;
+            assert!(
+                !mark_password_reset_token_used(&pool, token).await.unwrap(),
+                "state {state} must not satisfy the delivery gate"
+            );
+            cleanup(&pool, token, intent).await;
+        }
+
+        // 负例 5：collation 等价必须被拒绝（intent 列 utf8mb4_unicode_ci 对
+        // ascii 内容本会大小写不敏感匹配；CAST AS BINARY 门要求字节级精确）。
+        let intent = insert_intent(
+            &pool,
+            &format!("msg-case-{run}"),
+            &format!("op-case-{run}"),
+            "DELIVERED",
+        )
+        .await;
+        let token = insert_token(
+            &pool,
+            &format!("tok-case-{run}"),
+            Some(&format!("OP-CASE-{run}")),
+            Some(&format!("MSG-CASE-{run}")),
+        )
+        .await;
+        assert!(
+            !mark_password_reset_token_used(&pool, token).await.unwrap(),
+            "case-variant bindings must not satisfy the binary gate"
+        );
+        cleanup(&pool, token, intent).await;
+
+        // 正例：完整绑定 + DELIVERED → 消费一次成功；重放（CAS）拒绝。
+        let intent = insert_intent(
+            &pool,
+            &format!("msg-ok-{run}"),
+            &format!("op-ok-{run}"),
+            "DELIVERED",
+        )
+        .await;
+        let token = insert_token(
+            &pool,
+            &format!("tok-ok-{run}"),
+            Some(&format!("op-ok-{run}")),
+            Some(&format!("msg-ok-{run}")),
+        )
+        .await;
+        assert!(
+            mark_password_reset_token_used(&pool, token).await.unwrap(),
+            "fully bound DELIVERED credential must be consumable"
+        );
+        assert!(
+            !mark_password_reset_token_used(&pool, token).await.unwrap(),
+            "consumed credential must not be consumable twice (CAS)"
+        );
+        cleanup(&pool, token, intent).await;
+
+        pool.close().await;
+    }
+
+    /// 验证码仓储契约（source-shape）：签发必须先 supersede 同 key 未消费旧码，
+    /// GC 必须有界，消费必须保持 one-shot CAS。行为验证需要真实 MySQL
+    /// integration（本测试只锁 SQL 形状与失败安全语义）。
+    #[test]
+    fn verification_code_repository_contract() {
+        let source = include_str!("repository.rs");
+
+        // 旧的无 supersede 直插入口必须退役，唯一调用方已迁移到签发事务。
+        // 检索锚点动态拼接，避免 include_str! 自引用假阳性。
+        let legacy_insert = concat!("pub async fn ", "insert_", "verification_code");
+        assert!(
+            !source.contains(legacy_insert),
+            "legacy direct insert entry point must not be reintroduced; use issue_verification_code"
+        );
+
+        let issue_body = source
+            .split("pub async fn issue_verification_code")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn ").next())
+            .expect("issue_verification_code must exist");
+        assert!(
+            issue_body.contains("pool.begin()"),
+            "issuance must run supersede + insert in one short transaction"
+        );
+        assert!(
+            issue_body.contains("verified_at IS NULL"),
+            "supersede must only delete unconsumed prior codes (consumed rows are GC-owned)"
+        );
+        assert!(
+            issue_body.contains("DELETE FROM verification_code"),
+            "issuance must supersede prior active codes for the same key"
+        );
+        assert!(
+            issue_body.contains("rows_affected() != 1 || result.last_insert_id() == 0"),
+            "issuance must prove durable insert before returning the correlation id"
+        );
+
+        let gc_body = source
+            .split("pub async fn cleanup_expired_verification_codes")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn ").next())
+            .expect("cleanup_expired_verification_codes must exist");
+        assert!(
+            gc_body.contains("LIMIT ?"),
+            "GC must be bounded per call, not an unbounded sweep"
+        );
+
+        let find_body = source
+            .split("pub async fn find_valid_verification_code")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn ").next())
+            .expect("find_valid_verification_code must exist");
+        assert!(
+            find_body.contains("verified_at IS NULL AND expires_at > NOW()"),
+            "candidate selection must respect TTL and consumption state"
+        );
+
+        let mark_body = source
+            .split("pub async fn mark_verification_code_verified")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn ").next())
+            .expect("mark_verification_code_verified must exist");
+        assert!(
+            mark_body.contains("verified_at IS NULL AND expires_at > NOW()"),
+            "one-shot CAS must keep the replay boundary (unconsumed + unexpired)"
+        );
+        assert!(
+            mark_body.contains("id = ? AND target = ? AND purpose = ? AND code = ?"),
+            "CAS must bind the full identity, not just the row id"
+        );
     }
 }
 

@@ -6,14 +6,80 @@
 use crate::hit_stats::TimingBreakdown;
 use astral_types::registry::{get_alias_sources, parse_resource_key};
 use astral_types::{
-    BindingLayer, CanonicalGrant, DomainScopeRequirement, EvaluationStep, GlobalAccessRequirement,
-    GrantEffect, GrantSourceKind, GrantState, PolicyContext, PolicyDecision, PolicyError,
-    PublishedCardAuthorization, PublishedCardEvidenceScope, ResourceOwnershipScope,
+    AuthorizationAdmission, AuthorizationFenceProof, BindingLayer, CanonicalGrant,
+    DomainScopeRequirement, EvaluationStep, GlobalAccessRequirement, GrantEffect, GrantSourceKind,
+    GrantState, PolicyContext, PolicyDecision, PolicyError, PublishedCardAuthorization,
+    PublishedCardEvidenceScope, ResourceOwnershipScope,
 };
+use time::OffsetDateTime;
 
 use super::decision::*;
-use super::ports::RuleRepository;
+use super::ports::{PublishedEvidenceReadMode, RuleRepository};
 use super::PolicyEngine;
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+static AUTHORITY_NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_authority_nonce(phase: &str) -> String {
+    let sequence = AUTHORITY_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "policy-{phase}-{}-{sequence}-{}",
+        std::process::id(),
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    )
+}
+
+fn validate_authority_proof_response(
+    proof: &AuthorizationFenceProof,
+    expected_nonce: &str,
+    phase: &str,
+) -> Result<(), PolicyError> {
+    if proof.request_nonce != expected_nonce {
+        return Err(PolicyError::Repository(format!(
+            "authorization fence {phase} nonce mismatch"
+        )));
+    }
+    proof.validate().map_err(|error| {
+        PolicyError::Repository(format!("authorization fence {phase} is malformed: {error}"))
+    })
+}
+
+async fn read_fenced_evidence<R: RuleRepository>(
+    repo: &R,
+    context: &PolicyContext,
+    scope: &PublishedCardEvidenceScope,
+    phase: &str,
+) -> Result<
+    Option<(
+        Arc<PublishedCardAuthorization>,
+        Arc<AuthorizationFenceProof>,
+    )>,
+    PolicyError,
+> {
+    let nonce = next_authority_nonce(phase);
+    let proof = repo
+        .read_request_authorization_fence(context, scope, &nonce)
+        .await?;
+    validate_authority_proof_response(&proof, &nonce, phase)?;
+    let Some(evidence) = repo.load_published_card_authorization(scope).await? else {
+        return Ok(None);
+    };
+    let certified = repo.certify_authorization_evidence(
+        proof,
+        evidence,
+        scope,
+        OffsetDateTime::now_utc().unix_timestamp(),
+    )?;
+    let certified_proof = certified.proof();
+    if certified_proof.request_nonce != nonce {
+        return Err(PolicyError::Repository(format!(
+            "authorization fence {phase} certifier changed request nonce"
+        )));
+    }
+    Ok(Some((certified.evidence(), certified_proof)))
+}
 
 #[cfg(test)]
 #[path = "matcher_curve.rs"]
@@ -37,6 +103,7 @@ impl PolicyEngine {
     /// - 任何有效 ALLOW 返回前必须复读证据，且 tenant/card 身份、gate 计数、
     ///   manifest 摘要、被命中 grant 必须与评估起点及本次请求完全一致，否则
     ///   AUTHORIZATION_PENDING。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn evaluate_published_card_evidence<R: RuleRepository>(
         &self,
         ctx: &PolicyContext,
@@ -45,6 +112,7 @@ impl PolicyEngine {
         start: std::time::Instant,
         steps: &mut Vec<EvaluationStep>,
         timing: &mut TimingBreakdown,
+        admission: &mut Option<AuthorizationAdmission>,
     ) -> PolicyDecision {
         let card_id = ctx.card_id.unwrap_or(0);
         // 请求租户边界必须存在；卡片边界已由 AUTHN 保证。缺 tenant scope 属于
@@ -88,13 +156,25 @@ impl PolicyEngine {
             );
         }
 
+        let certified_memory = matches!(
+            repo.published_evidence_read_mode(),
+            PublishedEvidenceReadMode::CertifiedMemory
+        );
         let t_evidence = std::time::Instant::now();
-        let read = repo.load_published_card_authorization(&scope).await;
+        let initial_read = if certified_memory {
+            read_fenced_evidence(repo, ctx, &scope, "f0")
+                .await
+                .map(|result| result.map(|(evidence, proof)| (evidence, Some(proof))))
+        } else {
+            repo.load_published_card_authorization(&scope)
+                .await
+                .map(|result| result.map(|evidence| (evidence, None)))
+        };
         let initial_evidence_load_ns = t_evidence.elapsed().as_nanos() as u64;
         timing.initial_evidence_load_ns = initial_evidence_load_ns;
 
-        let evidence = match read {
-            Ok(Some(evidence)) => evidence,
+        let (evidence, initial_proof) = match initial_read {
+            Ok(Some((evidence, proof))) => (evidence, proof),
             Ok(None) => {
                 // An explicit unavailable repository result never authorizes.
                 steps.push(step(
@@ -113,6 +193,7 @@ impl PolicyEngine {
             Err(e) => {
                 let business_pending = published_evidence_error_is_business_pending(&e);
                 tracing::warn!(card_id, error = %e, business_pending,
+                    certified_memory,
                     "published card evidence read failed");
                 steps.push(step(
                     "PUBLISHED_EVIDENCE",
@@ -279,11 +360,20 @@ impl PolicyEngine {
             );
         }
         let t_recheck = std::time::Instant::now();
-        let recheck = repo.load_published_card_authorization(&scope).await;
+        let mut final_proof: Option<Arc<AuthorizationFenceProof>> = None;
+        let recheck = if certified_memory {
+            read_fenced_evidence(repo, ctx, &scope, "f1")
+                .await
+                .map(|result| result.map(|(next, proof)| (next, Some(proof))))
+        } else {
+            repo.load_published_card_authorization(&scope)
+                .await
+                .map(|result| result.map(|next| (next, None)))
+        };
         let final_evidence_reload_ns = t_recheck.elapsed().as_nanos() as u64;
         timing.final_evidence_reload_ns = final_evidence_reload_ns;
         let (recheck_outcome, recheck_had_error) = match recheck {
-            Ok(Some(next)) => {
+            Ok(Some((next, next_proof))) => {
                 #[cfg(feature = "performance-attribution")]
                 let stable = {
                     let validation_started = std::time::Instant::now();
@@ -298,7 +388,12 @@ impl PolicyEngine {
                         && next.card_id == card_id
                         && evidence.gate == next.gate
                         && evidence.manifests == next.manifests
-                        && next.effective_grants.iter().any(|grant| grant == matched);
+                        && next.effective_grants.iter().any(|grant| grant == matched)
+                        && certified_frontier_stable(
+                            certified_memory,
+                            initial_proof.as_deref(),
+                            next_proof.as_deref(),
+                        );
                     timing.attribution.final_recheck_scan_ns +=
                         scan_started.elapsed().as_nanos() as u64;
                     stable
@@ -306,8 +401,13 @@ impl PolicyEngine {
                 #[cfg(not(feature = "performance-attribution"))]
                 let stable = published_recheck_identity_stable(
                     &evidence, &next, tenant_id, card_id, matched,
+                ) && certified_frontier_stable(
+                    certified_memory,
+                    initial_proof.as_deref(),
+                    next_proof.as_deref(),
                 );
                 if stable {
+                    final_proof = next_proof;
                     (None, false)
                 } else {
                     (Some(false), false)
@@ -320,6 +420,7 @@ impl PolicyEngine {
                     card_id,
                     error = %error,
                     business_pending,
+                    certified_memory,
                     "published card evidence recheck read failed"
                 );
                 (Some(!business_pending), !business_pending)
@@ -414,6 +515,46 @@ impl PolicyEngine {
             }
         }
 
+        if !repo.positive_authorization_ready() {
+            steps.push(step(
+                "PUBLISHED_EVIDENCE",
+                "DENY",
+                "authority fence reconciliation is not serving",
+                None,
+            ));
+            self.finish_evaluation(false, timing, start, true, ctx.resource.as_deref());
+            return deny(
+                "AUTHORIZATION_PENDING",
+                "published:authority-not-serving",
+                steps.clone(),
+            );
+        }
+        let verified_admission = if certified_memory {
+            let Some(proof) = final_proof else {
+                self.finish_evaluation(false, timing, start, true, ctx.resource.as_deref());
+                return deny(
+                    "AUTHORIZATION_PENDING",
+                    "published:f1-proof-missing",
+                    steps.clone(),
+                );
+            };
+            match AuthorizationAdmission::from_verified_proof((*proof).clone()) {
+                Ok(admission_value) => Some(admission_value),
+                Err(error) => {
+                    tracing::error!(%error, "final certified authority proof could not become admission");
+                    self.finish_evaluation(false, timing, start, true, ctx.resource.as_deref());
+                    return deny(
+                        "AUTHORIZATION_PENDING",
+                        "published:f1-proof-invalid",
+                        steps.clone(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        *admission = verified_admission;
+
         self.finish_evaluation(true, timing, start, false, ctx.resource.as_deref());
         allow(
             "PUBLISHED_EVIDENCE_ALLOW",
@@ -444,7 +585,11 @@ pub(crate) fn org_admission_decision_is_dependency_failure(decision: &PolicyDeci
     }
     matches!(
         decision.evaluation_path.last().map(|s| s.detail.as_str()),
-        Some("org_scope.final_read_unavailable" | "org_scope.final_card_context_unavailable")
+        Some(
+            "org_scope.final_read_unavailable"
+                | "org_scope.final_card_context_unavailable"
+                | "org_scope.final_authority_changed"
+        )
     )
 }
 
@@ -1028,7 +1173,25 @@ pub(crate) fn published_source_label(grant: &CanonicalGrant) -> &'static str {
     }
 }
 
-/// ALLOW 复读的身份等价判定：请求/baseline/next 三方的 tenant/card 身份、
+fn certified_frontier_stable(
+    certified_memory: bool,
+    initial: Option<&AuthorizationFenceProof>,
+    final_proof: Option<&AuthorizationFenceProof>,
+) -> bool {
+    if !certified_memory {
+        return true;
+    }
+    let (Some(initial), Some(final_proof)) = (initial, final_proof) else {
+        return false;
+    };
+    if initial.request_nonce == final_proof.request_nonce
+        || initial.proof_id == final_proof.proof_id
+    {
+        return false;
+    }
+    initial.same_frontier_as(final_proof).is_ok()
+}
+
 /// gate 计数、manifest 摘要与被命中 grant 必须与评估起点完全一致。
 /// `read_unix_seconds` 是逐次变化的读取时钟，不参与身份比较；但新证据必须
 /// 先通过合同校验，且被命中 grant 必须仍在新证据的 effective 集合中

@@ -4,7 +4,7 @@
 //! projection worker 处理。`service::template_service` 仅包装同步结果，HTTP 层解析参数、
 //! 组装 DTO 并包装响应。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use astral_common::contract::{ApiResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
-use astral_types::AstralError;
+use astral_types::{AstralError, AuthorizationAdmission};
 
 use crate::api::async_tracker::{self, AsyncTask};
 use crate::repository::audit_log_repository::RuleSetMutationContext;
@@ -26,7 +26,10 @@ async fn require_template_admin(state: &AppState, headers: &HeaderMap) -> Result
     crate::api::require_platform_admin(state, headers).await
 }
 
-fn mutation_context(headers: &HeaderMap) -> Result<RuleSetMutationContext, AppError> {
+fn mutation_context(
+    headers: &HeaderMap,
+    admission: AuthorizationAdmission,
+) -> Result<RuleSetMutationContext, AppError> {
     let actor_id = headers
         .get("x-user-id")
         .and_then(|value| value.to_str().ok())
@@ -36,7 +39,8 @@ fn mutation_context(headers: &HeaderMap) -> Result<RuleSetMutationContext, AppEr
     let operation_id = headers
         .get("x-request-id")
         .and_then(|value| value.to_str().ok());
-    RuleSetMutationContext::user(actor_id, operation_id).map_err(AppError::from)
+    RuleSetMutationContext::user_with_admission(actor_id, operation_id, admission)
+        .map_err(AppError::from)
 }
 
 fn parse_template_numeric_id(id: &str) -> Result<i64, AppError> {
@@ -186,6 +190,7 @@ async fn list_templates(
 async fn create_template(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<PolicyTemplate>>, AppError> {
     require_template_admin(&state, &headers).await?;
@@ -200,7 +205,7 @@ async fn create_template(
         })?;
     validate_template_id(template_id)?;
     parse_template_numeric_id(template_id)?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
 
     let rules = parse_template_rules(&req)?;
     state
@@ -239,13 +244,14 @@ async fn get_template(
 async fn update_template(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_template_admin(&state, &headers).await?;
     validate_template_id(&id)?;
     parse_template_numeric_id(&id)?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
 
     let rules = parse_template_rules(&req)?;
 
@@ -265,12 +271,13 @@ async fn update_template(
 async fn sync_template(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_template_admin(&state, &headers).await?;
     validate_template_id(&id)?;
     parse_template_numeric_id(&id)?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
     let outcome = state.template_service.sync_template(&id, &context).await?;
     Ok(Json(ApiResponse::success(serde_json::json!({
         "template_id": id,
@@ -302,6 +309,7 @@ async fn list_template_rules(
 async fn create_template_rule(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<String>,
     Json(req): Json<CreateTemplateRuleRequest>,
 ) -> Result<Json<ApiResponse<TemplateRuleRow>>, AppError> {
@@ -311,7 +319,7 @@ async fn create_template_rule(
     // fail-closed：canonical 模板规则只接受 ALLOW（大小写归一后写入 source）
     let effect =
         crate::service::validate_canonical_grant_effect(req.effect.as_deref().unwrap_or("ALLOW"))?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
     let rule_id = state
         .template_repository
         .create_template_rule(
@@ -339,6 +347,7 @@ async fn create_template_rule(
 async fn update_template_rule(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(rule_id): Path<i64>,
     Json(req): Json<UpdateTemplateRuleRequest>,
 ) -> Result<Json<ApiResponse<TemplateRuleRow>>, AppError> {
@@ -349,7 +358,7 @@ async fn update_template_rule(
         Some(raw) => Some(crate::service::validate_canonical_grant_effect(raw)?),
         None => None,
     };
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
     state
         .template_repository
         .update_template_rule(
@@ -392,10 +401,11 @@ async fn get_template_rule(
 async fn delete_template_rule(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(rule_id): Path<i64>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     require_template_admin(&state, &headers).await?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
 
     let deleted = state
         .template_repository

@@ -15,6 +15,7 @@ performance-attribution = ["policy-engine/performance-attribution"]
 [dependencies]
 policy-engine = { path = "../policy-engine" }
 astral-types = { path = "../astral-types" }
+astral-authority = { path = "../astral-authority", default-features = false }
 astral-common = { path = "../astral-common" }
 
 sqlx = { workspace = true }
@@ -29,7 +30,10 @@ async-trait = "0.1"
 time = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
 hex = { workspace = true }
+url = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

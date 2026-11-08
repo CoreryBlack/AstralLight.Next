@@ -15,10 +15,13 @@ pub mod middleware;
 pub mod srv;
 
 use std::future::IntoFuture;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use axum::extract::FromRef;
+use axum::extract::{ConnectInfo, FromRef, Request, State};
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::Router;
 use lapin::Connection;
 use policy_engine::PolicyEngine;
@@ -28,6 +31,9 @@ use astral_common::audit::{register_audit_db_writer, AuditDbWriter, AuditEntry};
 use astral_common::config::{AppConfig, JwtValidationRole};
 use astral_common::error::global_exception_handler;
 use astral_common::middleware::gateway_signature::gateway_signature_middleware;
+use astral_common::middleware::ip_rate_limit::{
+    rate_limit_response, resolve_client_ip, IpRateLimiter, TrustedProxySet,
+};
 use astral_common::service::{register_mq_producer, AuditLogEvent, MqProducerRef};
 use astral_db::connect_and_validate_schema;
 use srv::auth_repository::SqlxAuthRepository;
@@ -197,6 +203,59 @@ fn finish_after_signal_failure(
     }
 }
 
+/// Startup-failure cleanup for owners created before HTTP serving begins.
+///
+/// Startup order is authority runtime -> session recovery worker -> transport
+/// owners. Cleanup therefore runs in reverse order. Every owned resource is
+/// awaited within its existing bounded shutdown API; failures are accumulated
+/// and do not skip later owners, with authority stopped last.
+async fn shutdown_startup_owners(
+    session_projection_worker: srv::session_projection_worker::SessionProjectionWorkerHandle,
+    local_stop_tx: tokio::sync::watch::Sender<bool>,
+    local_owner_tasks: Vec<IdentityRuntimeTaskHandle>,
+    rabbit_connection: Option<IdentityRabbitConnectionGuard>,
+    authority_source_outcome_runtime: Option<
+        astral_db::authority_source_runtime::AuthoritySourceOutcomeRuntimeHandle,
+    >,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let _ = local_stop_tx.send(true);
+    for task in local_owner_tasks {
+        if let Err(failure) = task.shutdown_join(Duration::from_secs(5)).await {
+            failures.push(failure);
+        }
+    }
+    if let Some(connection) = rabbit_connection {
+        if let Err(failure) = connection.shutdown("identity startup rollback").await {
+            failures.push(failure);
+        }
+    }
+    if let Err(failure) = session_projection_worker.shutdown_join().await {
+        failures.push(failure);
+    }
+    if let Some(handle) = authority_source_outcome_runtime {
+        if let Err(failure) = handle
+            .shutdown(astral_db::authority_source_runtime::SOURCE_OUTCOME_SHUTDOWN_JOIN_TIMEOUT)
+            .await
+        {
+            failures.push(failure);
+        }
+    }
+    failures
+}
+
+fn identity_startup_error(message: impl Into<String>, failures: Vec<String>) -> anyhow::Error {
+    let message = message.into();
+    if failures.is_empty() {
+        anyhow::anyhow!(message)
+    } else {
+        anyhow::anyhow!(
+            "{message}; startup rollback failed: {}",
+            failures.join("; ")
+        )
+    }
+}
+
 async fn consume_local_until_stopped(
     mut receiver: astral_mq::local_bus::LocalReceiver,
     mut stop: tokio::sync::watch::Receiver<bool>,
@@ -237,10 +296,18 @@ pub struct AppState {
     pub user_service: Arc<UserService>,
     pub card_repository: Arc<dyn srv::card_repository::CardRepository>,
     pub org_service: Arc<OrgService>,
-    /// Password-reset delivery is an explicit Identity-owned port. The default
-    /// runtime implementation is unavailable until a safe provider or encrypted
-    /// outbox worker is approved and wired here.
+    /// Password-reset delivery is an explicit Identity-owned port. The runtime
+    /// resolves it once at startup via
+    /// `srv::password::password_reset_notifier_from_env`: real SMTP delivery
+    /// (durable delivery-intent store, secrets only via protected env NAMES)
+    /// when configured, otherwise the fail-closed `UnavailablePasswordResetNotifier`
+    /// that keeps the unified 503-before-lookup contract. This field never
+    /// falls back to returning reset tokens to the caller.
     pub password_reset_notifier: Arc<dyn srv::password::PasswordResetNotifier>,
+    /// Fixed trust-root verifier for request-bound authorization fences. A
+    /// missing provider is not-ready in Strict mode; DurableOnly is an explicit
+    /// compatibility profile.
+    pub authorization_fence_provider: Option<Arc<astral_db::SqlxAuthorizationFenceProvider>>,
     /// ORG_SCOPE 部署旗标（default-off）：启动期由共享 AppConfig 经
     /// astral-common 严格解析器一次性解析并冻结（`config.org_scope_enabled`），
     /// 本字段只是同一冻结值的 AppState 侧副本；授权中间件构造正式
@@ -329,6 +396,94 @@ impl MqProducerRef for IdentityMqProducer {
     }
 }
 
+/// `/password/forgot` 的进程内 per-IP 限流（Identity 直连监听器防护）。
+///
+/// ## 与 verification 限流同源同合同
+///
+/// 计数核心、受信代理匹配与客户端 IP 解析复用共享
+/// `astral_common::middleware::ip_rate_limit`（`IpRateLimiter` /
+/// `TrustedProxySet` / `resolve_client_ip` / `rate_limit_response`，与
+/// Gateway/verification 同源），沿用同一启动期冻结
+/// `RateLimitCfg`（`state.config.rate_limit`）与
+/// `gateway.trusted_proxy_ips` 可信代理合同；不重新实现桶计数。限流只做
+/// 可用性保护：不产生 `AuthorizationAdmission`、不读取/消费宿主准入栅栏，
+/// bootstrap 路由的 admission-free 语义不变。跨副本不预算（与 verification
+/// 相同的已知边界）；notifier 侧的 durable 交付预算由 notifier owner 单独
+/// 持有，本限流不代表交付预算。
+///
+/// ## 作用域（刻意收窄）
+///
+/// `password_reset_routes()` 子路由整体挂 `route_layer`，但仅 `/password/forgot`
+/// 消耗预算；`/password/reset/{token}` 直接放行——forgot 触发出站 notifier
+/// 交付并暴露账号探测面，reset 只按持有令牌兑换且无出站副作用，同一 IP 的
+/// 合法重置不应被 forgot 预算误伤。预算桶与 verification 限流相互独立
+/// （独立 `IpRateLimiter` 实例），两侧互不挤占。
+struct PasswordForgotRateLimit {
+    limiter: IpRateLimiter,
+    trusted: TrustedProxySet,
+}
+
+static PASSWORD_FORGOT_IP_LIMITER: OnceLock<PasswordForgotRateLimit> = OnceLock::new();
+
+/// Identity 直连监听器上 `/password/forgot` 的 per-IP 限流入口（仅该路径
+/// 计预算，见类型文档；对端地址缺失时聚合单桶，绝不 panic 或放行）。
+pub(crate) async fn password_forgot_ip_rate_limit(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // 仅 /password/forgot 计预算；同子路由的 reset/{token} 直通。
+    if !req.uri().path().ends_with("/password/forgot") {
+        return next.run(req).await;
+    }
+    // 配置来自首个请求的启动期冻结 AppConfig（对齐 verification/Gateway 注入模式）。
+    let shared = PASSWORD_FORGOT_IP_LIMITER.get_or_init(|| {
+        let trusted = TrustedProxySet::compile(&state.config.gateway.trusted_proxy_ips);
+        for entry in trusted.invalid_entries() {
+            tracing::warn!(
+                entry = %entry,
+                "invalid gateway.trusted_proxy_ips entry; ignored (fail closed to peer address)"
+            );
+        }
+        PasswordForgotRateLimit {
+            limiter: IpRateLimiter::new(state.config.rate_limit.clone()),
+            trusted,
+        }
+    });
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0.ip());
+    let client = resolve_client_ip(req.headers(), peer, &shared.trusted);
+    if !shared.limiter.check(client) {
+        tracing::warn!(
+            client = ?client,
+            path = req.uri().path(),
+            "password forgot rate limit exceeded"
+        );
+        return rate_limit_response(&req, "password-forgot-rate-limit-error");
+    }
+    next.run(req).await
+}
+
+fn source_delivery_context(
+    config: &AppConfig,
+) -> anyhow::Result<Option<Arc<astral_db::invalidation_delivery::InvalidationDeliveryContext>>> {
+    let delivery = &config.invalidation_delivery;
+    if !delivery.enabled {
+        return Ok(None);
+    }
+    let recipients = serde_json::from_str(&delivery.recipients_json)
+        .map_err(|error| anyhow::anyhow!("invalid invalidation delivery recipients: {error}"))?;
+    let context = astral_db::invalidation_delivery::InvalidationDeliveryContext::try_new(
+        delivery.source_database_id.clone(),
+        delivery.roster_version.clone(),
+        recipients,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid invalidation delivery context: {error}"))?;
+    Ok(Some(Arc::new(context)))
+}
+
 pub async fn run() -> anyhow::Result<()> {
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:9004".to_string());
     run_with_listen_addr(&addr).await
@@ -362,6 +517,50 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
     D: std::future::Future<Output = ()> + Send + 'static,
 {
+    let config = AppConfig::from_files_for("application", JwtValidationRole::Identity)?;
+    run_with_config_and_listen_addr_and_shutdown_and_drain(
+        config,
+        addr,
+        shutdown,
+        producers_drained,
+    )
+    .await
+}
+
+/// Run Identity with a caller-owned startup-frozen configuration.
+///
+/// Composite hosts load `AppConfig` once and pass a clone of that frozen value
+/// to each in-process runtime. Standalone callers retain the compatibility
+/// wrappers above, which load their own configuration once.
+pub async fn run_with_config_and_listen_addr_and_shutdown<F>(
+    config: AppConfig,
+    addr: &str,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    run_with_config_and_listen_addr_and_shutdown_and_drain(
+        config,
+        addr,
+        shutdown,
+        std::future::ready(()),
+    )
+    .await
+}
+
+pub async fn run_with_config_and_listen_addr_and_shutdown_and_drain<F, D>(
+    config: AppConfig,
+    addr: &str,
+    shutdown: F,
+    producers_drained: D,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+    D: std::future::Future<Output = ()> + Send + 'static,
+{
+    config.validate_listener_for(JwtValidationRole::Identity)?;
+    let config = Arc::new(config);
     astral_common::middleware::permission_check_shared::validate_path_map(
         middleware::IDENTITY_PATH_MAP,
         "identity",
@@ -380,10 +579,6 @@ where
         }
     }
 
-    let config = Arc::new(AppConfig::from_files_for(
-        "application",
-        JwtValidationRole::Identity,
-    )?);
     // 进程级 origin region 唯一安装点：配置校验后、DB/worker/router 装配前
     // 安装一次。durable invalidation intent 在未安装时拒绝 append（fail-closed），
     // 因此必须在任何可能触发租户资格变更的路径之前完成。
@@ -396,20 +591,51 @@ where
     if identity_mapping_enabled {
         astral_db::validate_integration_mapping_schema(&db).await?;
     }
+    // 纯配置门（message transport 解析）先于任何后台 worker/authority 装配：
+    // 非法传输值只在零后台任务时拒绝启动。
+    let message_transport = config.message_transport().map_err(anyhow::Error::msg)?;
+    let invalidation_delivery = source_delivery_context(&config)?;
+    if let Some(context) = &invalidation_delivery {
+        astral_mq::consumers::set_session_revocation_delivery((**context).clone())
+            .map_err(anyhow::Error::msg)?;
+    }
+    let authorization_fence_provider = astral_db::authority_provider_from_env(db.clone())
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("authorization authority trust-root configuration invalid: {error}")
+        })?;
+    // Authority source outcome reconciliation runtime（V7）：Identity 与
+    // TrustGraph/Monitor 运行同一共享生命周期任务。worker 序列中最先启动，
+    // 按严格逆序在关闭尾段最后停止——位于 HTTP/request drain、producers
+    // drain 与 owned transport 关闭之后。provider 缺席时保持既有 fail-closed
+    // 行为：不启动、不产生正向就绪信号。运行 UUID 每进程任务一个、全程稳定；
+    // 批次/lease/尝试上限与 allowlist 由 provider/quorum 配置持有，本装配不
+    // 引入第二套配置。
+    let mut authority_source_outcome_runtime = authorization_fence_provider
+        .clone()
+        .map(astral_db::authority_source_runtime::spawn_authority_source_outcome_runtime);
     let engine = Arc::new(PolicyEngine::new());
     register_audit_db_writer(Arc::new(IdentityAuditDbWriter { pool: db.clone() }));
     let me_service = Arc::new(MeService::new(Arc::new(SqlxMeRepository::new(db.clone()))));
     let auth_repository = Arc::new(SqlxAuthRepository::new(db.clone()));
     let auth_service = Arc::new(AuthService::new(auth_repository.clone()));
-    let user_service = Arc::new(UserService::new(
-        Arc::new(SqlxUserRepository::new(db.clone())),
-        auth_repository,
-    ));
+    let user_repository = match &invalidation_delivery {
+        Some(context) => SqlxUserRepository::new_with_delivery_context(db.clone(), context.clone()),
+        None => SqlxUserRepository::new(db.clone()),
+    };
+    let user_service = Arc::new(UserService::new(Arc::new(user_repository), auth_repository));
     let card_repository: Arc<dyn srv::card_repository::CardRepository> =
-        Arc::new(SqlxCardRepository::new(db.clone()));
-    let org_service = Arc::new(OrgService::new(Arc::new(SqlxOrgRepository::new(
-        db.clone(),
-    ))));
+        Arc::new(match &invalidation_delivery {
+            Some(context) => {
+                SqlxCardRepository::new_with_delivery_context(db.clone(), context.clone())
+            }
+            None => SqlxCardRepository::new(db.clone()),
+        });
+    let org_repository = match &invalidation_delivery {
+        Some(context) => SqlxOrgRepository::new_with_delivery_context(db.clone(), context.clone()),
+        None => SqlxOrgRepository::new(db.clone()),
+    };
+    let org_service = Arc::new(OrgService::new(Arc::new(org_repository)));
     // ORG_SCOPE 旗标已在配置加载处一次性解析并冻结（非法值启动即失败）；
     // 这里只复制冻结值，不再读取 env。default-off：未配置时保持 false。
     let org_scope_enabled = config.org_scope_enabled;
@@ -422,7 +648,8 @@ where
         user_service,
         card_repository,
         org_service,
-        password_reset_notifier: Arc::new(srv::password::UnavailablePasswordResetNotifier),
+        password_reset_notifier: srv::password::password_reset_notifier_from_env(db.clone()),
+        authorization_fence_provider,
         org_scope_enabled,
     };
 
@@ -446,30 +673,63 @@ where
     let mut rabbit_connection: Option<IdentityRabbitConnectionGuard> = None;
     let (local_stop_tx, local_stop_rx) = tokio::sync::watch::channel(false);
     if matches!(
-        state
-            .config
-            .message_transport()
-            .map_err(anyhow::Error::msg)?,
+        message_transport,
         astral_common::config::MessageTransport::Local
     ) {
-        let bus = astral_mq::local_bus::global_local_bus().ok_or_else(|| {
-            anyhow::anyhow!("local transport requires a composite runtime-installed LocalBus")
-        })?;
+        let bus = match astral_mq::local_bus::global_local_bus() {
+            Some(bus) => bus,
+            None => {
+                let failures = shutdown_startup_owners(
+                    session_projection_worker,
+                    local_stop_tx,
+                    local_owner_tasks,
+                    rabbit_connection,
+                    authority_source_outcome_runtime.take(),
+                )
+                .await;
+                return Err(identity_startup_error(
+                    "local transport requires a composite runtime-installed LocalBus",
+                    failures,
+                ));
+            }
+        };
         // worker-supervision-20261002: the local owner consumer loops are
         // RAII-owned (Drop abort; bounded shutdown at serve end) instead of
         // detached fire-and-forget — identical dispatch/complete semantics.
-        let revocation_receiver = bus
-            .register(
-                astral_mq::config::QUEUE_AUTH_SESSION_REVOCATION,
-                astral_mq::local_bus::LocalOwner::Identity,
-            )
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let login_receiver = bus
-            .register(
-                astral_mq::config::QUEUE_LOGIN_EVENT,
-                astral_mq::local_bus::LocalOwner::Identity,
-            )
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let revocation_receiver = match bus.register(
+            astral_mq::config::QUEUE_AUTH_SESSION_REVOCATION,
+            astral_mq::local_bus::LocalOwner::Identity,
+        ) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                let failures = shutdown_startup_owners(
+                    session_projection_worker,
+                    local_stop_tx,
+                    local_owner_tasks,
+                    rabbit_connection,
+                    authority_source_outcome_runtime.take(),
+                )
+                .await;
+                return Err(identity_startup_error(error.to_string(), failures));
+            }
+        };
+        let login_receiver = match bus.register(
+            astral_mq::config::QUEUE_LOGIN_EVENT,
+            astral_mq::local_bus::LocalOwner::Identity,
+        ) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                let failures = shutdown_startup_owners(
+                    session_projection_worker,
+                    local_stop_tx,
+                    local_owner_tasks,
+                    rabbit_connection,
+                    authority_source_outcome_runtime.take(),
+                )
+                .await;
+                return Err(identity_startup_error(error.to_string(), failures));
+            }
+        };
         let revocation_consumer = IdentityRuntimeTaskHandle::spawn(
             "identity-local-revocation-consumer",
             consume_local_until_stopped(revocation_receiver, local_stop_rx.clone()),
@@ -512,8 +772,17 @@ where
             }
         }
         if !connected {
-            return Err(anyhow::anyhow!(
-                "Identity MQ bootstrap exhausted its retry budget"
+            let failures = shutdown_startup_owners(
+                session_projection_worker,
+                local_stop_tx,
+                local_owner_tasks,
+                rabbit_connection,
+                authority_source_outcome_runtime.take(),
+            )
+            .await;
+            return Err(identity_startup_error(
+                "Identity MQ bootstrap exhausted its retry budget",
+                failures,
             ));
         }
     }
@@ -532,9 +801,29 @@ where
         .merge(srv::users::user_routes())
         .merge(srv::cards::card_routes())
         .merge(srv::session::session_routes())
-        .merge(srv::password::password_reset_routes())
+        .merge(
+            // /password/forgot 的进程内 per-IP 限流：route_layer 覆盖整个
+            // password 子路由，但中间件内部仅对 forgot 路径计预算
+            // （reset/{token} 直通，见 password_forgot_ip_rate_limit 文档）。
+            // 可用性保护而已：不产生 AuthorizationAdmission、不消费准入栅栏。
+            srv::password::password_reset_routes().route_layer(
+                axum::middleware::from_fn_with_state(state.clone(), password_forgot_ip_rate_limit),
+            ),
+        )
         .merge(srv::admin::admin_routes())
-        .merge(srv::verification::verification_routes())
+        .merge(
+            // Verification 路由的进程内 per-IP 限流（Identity 直连监听器防护；
+            // 语义复用共享 RateLimitCfg 合同，跨副本限制刻意保留，见
+            // middleware 模块文档）。可用性保护而已：不产生
+            // AuthorizationAdmission、不消费准入栅栏，bootstrap 路由的
+            // admission-free 语义不变。
+            srv::verification::verification_routes().route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    middleware::verification_ip_rate_limit,
+                ),
+            ),
+        )
         .merge(srv::mfa::mfa_routes())
         .merge(srv::orgs::org_routes())
         .merge(srv::orgs::domain_routes())
@@ -556,23 +845,45 @@ where
         .with_state(state);
 
     tracing::info!(addr = %addr, "identity service starting");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            let failures = shutdown_startup_owners(
+                session_projection_worker,
+                local_stop_tx,
+                local_owner_tasks,
+                rabbit_connection,
+                authority_source_outcome_runtime.take(),
+            )
+            .await;
+            return Err(identity_startup_error(
+                format!("Identity HTTP listener bind failed: {error}"),
+                failures,
+            ));
+        }
+    };
     // Required recovery-worker death closes admission before draining HTTP tasks.
     let mut session_death = session_projection_worker.death_signal();
     let (serve_stop_tx, serve_stop_rx) = tokio::sync::oneshot::channel();
     let (drain_started_tx, mut drain_started_rx) = tokio::sync::oneshot::channel();
-    let mut serve = std::pin::pin!(axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = shutdown => {}
-                _ = serve_stop_rx => {}
-            }
-            if let Some(hub) = astral_db::memory_projection_hub() {
-                hub.mark_runtime_owner_failed("identity runtime shutting down");
-            }
-            let _ = drain_started_tx.send(());
-        })
-        .into_future());
+    // into_make_service_with_connect_info：verification 路由的 per-IP 限流
+    // 需要在对端地址缺失时回退 TCP peer（trusted XFF 之外的回退源）；扩展
+    // 缺失时限流器聚合 unknown 单桶，不会 panic。
+    let mut serve = std::pin::pin!(axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>()
+    )
+    .with_graceful_shutdown(async move {
+        tokio::select! {
+            _ = shutdown => {}
+            _ = serve_stop_rx => {}
+        }
+        if let Some(hub) = astral_db::memory_projection_hub() {
+            hub.mark_runtime_owner_failed("identity runtime shutting down");
+        }
+        let _ = drain_started_tx.send(());
+    })
+    .into_future());
     let serve_result = tokio::select! {
         result = &mut serve => result
             .map_err(|error| anyhow::anyhow!("identity service serve failed: {error}")),
@@ -594,20 +905,38 @@ where
                 "required session recovery worker died: {reason}; HTTP drain outcome: {drain:?}"
             ))
         }
+        death = async {
+            match authority_source_outcome_runtime.as_mut() {
+                Some(handle) => handle.wait_for_death().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            // Required reconciliation runtime death fails readiness closed via
+            // the existing hub owner-failure API; no blanket clears, and the
+            // hub never returns to serving on this path.
+            if let Some(hub) = astral_db::memory_projection_hub() {
+                hub.mark_runtime_owner_failed(format!(
+                    "code=identity.authority_source_outcome_runtime_death;reason={death}"
+                ));
+            }
+            let _ = serve_stop_tx.send(());
+            let drain = tokio::time::timeout(std::time::Duration::from_secs(30), &mut serve).await;
+            Err(anyhow::anyhow!(
+                "required authority source outcome reconciliation runtime died: {death}; HTTP drain outcome: {drain:?}"
+            ))
+        }
     };
     let worker_result = session_projection_worker.shutdown_join().await;
     // ORG events may have a frozen deadline of almost one hour on the peer.
     let barrier_result =
         tokio::time::timeout(std::time::Duration::from_secs(4_200), producers_drained).await;
+    let mut failures = Vec::new();
     if barrier_result.is_err() {
-        return Err(anyhow::anyhow!(
-            "Identity producer drain barrier timed out; outcome unknown"
-        ));
+        failures.push("Identity producer drain barrier timed out; outcome unknown".into());
     }
     let audit_result =
         astral_common::audit::drain_owned_audit_tasks(std::time::Duration::from_secs(5)).await;
     let _ = local_stop_tx.send(true);
-    let mut failures = Vec::new();
     if let Err(failure) = audit_result {
         failures.push(failure);
     }
@@ -621,6 +950,19 @@ where
     }
     if let Some(connection) = rabbit_connection {
         if let Err(failure) = connection.shutdown("identity runtime shutdown").await {
+            failures.push(failure);
+        }
+    }
+    // Authority source outcome reconciliation runtime：worker 序列中最先启动，
+    // 按严格逆序最后停止——位于 HTTP/request drain、producers drain、owned
+    // audit drain 与本地 consumer/Rabbit 关闭之后。在途 cycle 受 <=10s deadline
+    // 约束；未知取消只留下 durable lease pending，绝不重放 source。失败与
+    // panic 一律转为进程错误，绝不静默。
+    if let Some(handle) = authority_source_outcome_runtime.take() {
+        if let Err(failure) = handle
+            .shutdown(astral_db::authority_source_runtime::SOURCE_OUTCOME_SHUTDOWN_JOIN_TIMEOUT)
+            .await
+        {
             failures.push(failure);
         }
     }
@@ -710,6 +1052,41 @@ async fn init_mq(
 mod tests {
     use std::sync::Arc;
 
+    #[test]
+    fn source_delivery_context_is_frozen_and_rejects_cross_database_routes() {
+        let mut config = astral_common::config::AppConfig::default();
+        assert!(super::source_delivery_context(&config).unwrap().is_none());
+        config.invalidation_delivery.enabled = true;
+        config.invalidation_delivery.source_database_id = "db-one".into();
+        config.invalidation_delivery.roster_version = "roster-one".into();
+        config.invalidation_delivery.recipients_json = serde_json::json!([{
+            "regionId": "region-two",
+            "nodeId": "node-two",
+            "databaseId": "db-two",
+            "transport": "cross_db_rabbit",
+            "endpoint": null,
+            "peerCertificateSha256": null
+        }])
+        .to_string();
+        let context = super::source_delivery_context(&config).unwrap().unwrap();
+        config.invalidation_delivery.roster_version = "roster-two".into();
+        assert_eq!(context.roster_version(), "roster-one");
+        assert_eq!(context.source_database_id(), "db-one");
+        assert_eq!(context.recipients()[0].database_id, "db-two");
+        config.invalidation_delivery.recipients_json = serde_json::json!([{
+            "regionId": "region-two",
+            "nodeId": "node-two",
+            "databaseId": "db-one",
+            "transport": "cross_db_rabbit",
+            "endpoint": null,
+            "peerCertificateSha256": null
+        }])
+        .to_string();
+        assert!(super::source_delivery_context(&config).is_err());
+        config.invalidation_delivery.recipients_json = "[]".into();
+        assert!(super::source_delivery_context(&config).is_err());
+    }
+
     #[tokio::test]
     async fn dropping_rabbit_guard_schedules_bounded_close_reaper() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -767,19 +1144,79 @@ mod tests {
     #[test]
     fn identity_rabbit_guard_precedes_global_producer_and_bind_error_paths() {
         let source = include_str!("runtime.rs");
-        let guard = source
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let guard = production
             .find("rabbit_connection = Some(IdentityRabbitConnectionGuard::new(connection))")
             .expect("successful bootstrap must immediately install its close owner");
-        let producer = source[guard..]
+        let producer = production[guard..]
             .find("register_mq_producer(Arc::new(producer))")
             .map(|offset| guard + offset)
             .expect("global producer registration must remain");
-        let bind = source[producer..]
-            .find("TcpListener::bind(addr).await?")
+        let bind = production[producer..]
+            .find("let listener = match tokio::net::TcpListener::bind(addr).await")
             .map(|offset| producer + offset)
-            .expect("HTTP bind error path must remain");
+            .expect("HTTP bind error path must remain explicit");
         assert!(guard < producer && producer < bind);
-        assert!(source.contains("spawn_identity_connection_close_reaper"));
+        assert!(production.contains("spawn_identity_connection_close_reaper"));
+    }
+
+    #[test]
+    fn identity_startup_failures_use_bounded_reverse_owner_cleanup() {
+        let source = include_str!("runtime.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let cleanup = production
+            .find("async fn shutdown_startup_owners(")
+            .expect("startup failures must have one bounded cleanup helper");
+        let local_tasks = production[cleanup..]
+            .find("for task in local_owner_tasks")
+            .map(|offset| cleanup + offset)
+            .expect("local tasks must be stopped by startup cleanup");
+        let rabbit = production[local_tasks..]
+            .find("if let Some(connection) = rabbit_connection")
+            .map(|offset| local_tasks + offset)
+            .expect("Rabbit connection must be stopped after local tasks");
+        let session = production[rabbit..]
+            .find("session_projection_worker.shutdown_join()")
+            .map(|offset| rabbit + offset)
+            .expect("session worker must be stopped after transport owners");
+        let authority = production[session..]
+            .find(
+                ".shutdown(astral_db::authority_source_runtime::SOURCE_OUTCOME_SHUTDOWN_JOIN_TIMEOUT)",
+            )
+            .map(|offset| session + offset)
+            .expect("authority runtime must be stopped last");
+        assert!(local_tasks < rabbit && rabbit < session && session < authority);
+        let failure_sites = [
+            "local transport requires a composite runtime-installed LocalBus",
+            "QUEUE_AUTH_SESSION_REVOCATION",
+            "QUEUE_LOGIN_EVENT",
+            "Identity MQ bootstrap exhausted its retry budget",
+            "Identity HTTP listener bind failed",
+        ];
+        for site in failure_sites {
+            assert!(
+                production.contains(site),
+                "missing startup failure site: {site}"
+            );
+        }
+        assert_eq!(
+            production.matches("shutdown_startup_owners(").count(),
+            6,
+            "one helper definition plus five startup failure cleanup calls must remain"
+        );
+        assert!(production.contains("failures.join(\"; \")"));
+    }
+
+    #[test]
+    fn identity_startup_error_preserves_all_cleanup_failures() {
+        let error = super::identity_startup_error(
+            "startup failed",
+            vec!["local consumer failed".into(), "authority failed".into()],
+        );
+        let text = error.to_string();
+        assert!(text.contains("startup failed"));
+        assert!(text.contains("local consumer failed"));
+        assert!(text.contains("authority failed"));
     }
 
     #[tokio::test]
@@ -895,5 +1332,172 @@ mod tests {
         }
         assert!(blocks[0].contains("Producer::new_local"));
         assert!(!blocks[0].contains("init_idempotency_redis"));
+    }
+
+    fn forgot_rate_limit_test_state() -> super::AppState {
+        use super::{
+            AppConfig, AppState, AuthService, MeService, OrgService, PolicyEngine,
+            SqlxAuthRepository, SqlxCardRepository, SqlxMeRepository, SqlxOrgRepository,
+            SqlxUserRepository, UserService,
+        };
+
+        let db = sqlx::MySqlPool::connect_lazy("mysql://localhost:1/astral_test")
+            .expect("lazy test pool must construct without connecting");
+        AppState {
+            config: Arc::new(AppConfig {
+                rate_limit: astral_common::config::RateLimitCfg {
+                    enabled: true,
+                    requests_per_second: 1,
+                    burst_size: 0,
+                },
+                gateway: astral_common::config::GatewayCfg {
+                    hmac_secret: "test-forgot-gateway-secret-0123456789abcdef".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            db: db.clone(),
+            engine: Arc::new(PolicyEngine::new()),
+            me_service: Arc::new(MeService::new(Arc::new(SqlxMeRepository::new(db.clone())))),
+            auth_service: Arc::new(AuthService::new(Arc::new(SqlxAuthRepository::new(
+                db.clone(),
+            )))),
+            user_service: Arc::new(UserService::new(
+                Arc::new(SqlxUserRepository::new(db.clone())),
+                Arc::new(SqlxAuthRepository::new(db.clone())),
+            )),
+            card_repository: Arc::new(SqlxCardRepository::new(db.clone())),
+            org_service: Arc::new(OrgService::new(Arc::new(SqlxOrgRepository::new(
+                db.clone(),
+            )))),
+            password_reset_notifier: Arc::new(
+                super::srv::password::UnavailablePasswordResetNotifier,
+            ),
+            authorization_fence_provider: None,
+            org_scope_enabled: false,
+        }
+    }
+
+    /// 路由层行为测试：/password/forgot 消耗 per-IP 预算（耗尽后 429 共享有界
+    /// 形状），/password/reset/{token} 不消耗也不受 forgot 预算影响（直通）。
+    /// handler 侧响应（503/422/500）由 DB/notifier 部署决定，断言只钉 429 语义。
+    #[tokio::test]
+    async fn forgot_route_consumes_per_ip_budget_while_reset_passes_through() {
+        use super::{password_forgot_ip_rate_limit, srv, Router};
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let state = forgot_rate_limit_test_state();
+        let app = Router::new()
+            .merge(srv::password::password_reset_routes().route_layer(
+                axum::middleware::from_fn_with_state(state.clone(), password_forgot_ip_rate_limit),
+            ))
+            .with_state(state);
+
+        let peer = SocketAddr::from(([10, 0, 0, 1], 40_000));
+        let send = |app: Router, path: &'static str| {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("x-operation-id", "forgot-test-20261108")
+                    .extension(ConnectInfo(peer))
+                    .body(Body::from(r#"{"email":"alice@example.com"}"#))
+                    .unwrap(),
+            )
+        };
+
+        // 预算内：穿过限流层到达 handler（未配置投递 → 统一 503 合同），绝不 429。
+        let first = send(app.clone(), "/password/forgot").await.unwrap();
+        assert_ne!(
+            first.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first forgot request must pass the per-IP limiter"
+        );
+        assert_eq!(
+            first.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unconfigured notifier must keep the unified 503 contract before account lookup"
+        );
+        // 预算耗尽（cap = rps+burst = 1）：同窗口第二笔 forgot 被限流拒绝。
+        let second = send(app.clone(), "/password/forgot").await.unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "forgot requests beyond the per-IP budget must be rejected with the shared 429 shape"
+        );
+        // reset/{token} 直通：不消耗 forgot 预算，也不被耗尽的 forgot 预算拒绝。
+        let reset = send(app, "/password/reset/some-token").await.unwrap();
+        assert_ne!(
+            reset.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "reset token route must not ride the forgot per-IP budget"
+        );
+    }
+
+    /// 装配形状守卫：forgot 限流必须挂 route_layer 在 password 子路由上并先于
+    /// 权限中间件 layer；语义必须复用共享 ip_rate_limit 实现（同
+    /// verification/Gateway 合同），本文件不得重新实现桶计数；作用域收窄到
+    /// forgot 路径；限流 admission-free；直连监听器注入对端地址扩展。
+    #[test]
+    fn forgot_ip_limit_wiring_contract() {
+        let source = include_str!("runtime.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let wiring = production
+            .find("password_reset_routes().route_layer(")
+            .expect("the runtime must wire the forgot limiter via route_layer");
+        let permission_layer = production[wiring..]
+            .find("identity_permission_middleware")
+            .map(|offset| wiring + offset)
+            .expect("auth routes must keep the permission middleware layer");
+        let limiter_ref = production[wiring..]
+            .find("password_forgot_ip_rate_limit")
+            .map(|offset| wiring + offset)
+            .expect("the forgot subrouter must be wired to password_forgot_ip_rate_limit");
+        assert!(limiter_ref < permission_layer);
+        assert!(
+            production.contains("IpRateLimiter::new(state.config.rate_limit.clone())"),
+            "the forgot limiter must reuse the frozen shared RateLimitCfg"
+        );
+        assert!(
+            production
+                .contains("TrustedProxySet::compile(&state.config.gateway.trusted_proxy_ips)"),
+            "the forgot limiter must reuse the trusted proxy contract"
+        );
+        assert!(
+            production.contains("resolve_client_ip(req.headers(), peer, &shared.trusted)"),
+            "client resolution must come from the shared implementation"
+        );
+        assert!(
+            production.contains("rate_limit_response(&req, \"password-forgot-rate-limit-error\")"),
+            "rejected requests must use the shared bounded 429 shape"
+        );
+        assert!(
+            !production.contains("buckets.lock()"),
+            "the runtime must not re-implement bucket counting (shared IpRateLimiter owns it)"
+        );
+        assert!(
+            production.contains("ends_with(\"/password/forgot\")"),
+            "only the forgot path may consume the budget; the reset token route passes through"
+        );
+        let limiter_start = production
+            .find("pub(crate) async fn password_forgot_ip_rate_limit(")
+            .expect("the forgot limiter entry point must remain");
+        let limiter_end = production[limiter_start..]
+            .find("pub async fn run()")
+            .map(|offset| limiter_start + offset)
+            .expect("the limiter must be bounded by the run entry");
+        assert!(
+            !production[limiter_start..limiter_end].contains("AuthorizationAdmission"),
+            "the forgot limiter is availability protection only and must stay admission-free"
+        );
+        assert!(
+            production.contains("into_make_service_with_connect_info::<std::net::SocketAddr>()"),
+            "the direct listener must provide ConnectInfo so the limiter can resolve the peer address"
+        );
     }
 }

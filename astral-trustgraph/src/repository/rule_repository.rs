@@ -27,13 +27,19 @@
 
 use async_trait::async_trait;
 use sqlx::MySqlPool;
+use std::sync::Arc;
+
+use astral_db::invalidation_delivery::InvalidationDeliveryContext;
 
 use astral_types::{AstralError, EVENT_TYPE_REVOKE};
 
 use crate::repository::audit_log_repository::{
     insert_direct_rule_audit_in_tx, DirectRuleAuditEntry,
 };
-use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
+use crate::repository::authorization_source_transaction::{
+    begin_source_transaction_with_capability_and_optional_delivery_context,
+    SourceMutationCapability,
+};
 use crate::repository::grant_ledger_adapter::{
     append_direct_grant_delta_in_tx, build_direct_add_draft, build_direct_remove_draft,
     build_direct_update_draft, derive_direct_contribution_event_id,
@@ -304,11 +310,25 @@ pub trait RuleRepository: Send + Sync {
 
 pub struct SqlxRuleRepository {
     db: MySqlPool,
+    delivery_context: Option<Arc<InvalidationDeliveryContext>>,
 }
 
 impl SqlxRuleRepository {
     pub fn new(db: MySqlPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            delivery_context: None,
+        }
+    }
+
+    pub fn new_with_delivery_context(
+        db: MySqlPool,
+        delivery_context: Arc<InvalidationDeliveryContext>,
+    ) -> Self {
+        Self {
+            db,
+            delivery_context: Some(delivery_context),
+        }
     }
 
     /// 锁定单条规则（含承载卡归属事实）；缺失或承载卡失效时 None。
@@ -489,7 +509,14 @@ impl RuleRepository for SqlxRuleRepository {
         }
         require_canonical_direct_enabled(Some(new.enabled))?;
         reject_unrepresentable_condition(new.condition_json.as_deref(), "direct rule create")?;
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let admission = context.authorization_admission()?;
+        let capability = SourceMutationCapability::user(admission.clone());
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )
+        .await?;
 
         // 先锁定并验证承载卡：不存在/非 ACTIVE/过期/租户 NULL 一律拒绝，
         // 不再允许静默写旧规则（对齐审批路径的归属闸门）。
@@ -508,6 +535,16 @@ impl RuleRepository for SqlxRuleRepository {
                 "rule target card does not exist or is not ACTIVE/currently valid".into(),
             ));
         };
+        context.validate_card_scope(
+            tenant_id.ok_or_else(|| {
+                AstralError::Permission("rule target card tenant is missing".into())
+            })?,
+            new.card_id,
+            user_id,
+            domain_id.ok_or_else(|| {
+                AstralError::Permission("rule target card domain is missing".into())
+            })?,
+        )?;
         let sod = astral_db::check_grant_sod_conflict_in_tx(
             &mut tx,
             new.card_id,
@@ -635,7 +672,14 @@ impl RuleRepository for SqlxRuleRepository {
             return Ok(());
         }
 
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let admission = context.authorization_admission()?;
+        let capability = SourceMutationCapability::user(admission.clone());
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )
+        .await?;
         // 写前 FOR UPDATE 读取完整旧规则行（card/user/tenant/domain/source/
         // effect/resource/action/validity/condition/priority/enabled 全量）。
         let row = Self::lock_rule_for_mutation(&mut **tx, rule_id)
@@ -650,6 +694,13 @@ impl RuleRepository for SqlxRuleRepository {
         require_canonical_direct_enabled(row.enabled)?;
         let tenant_id =
             validate_locked_rule_tenant_scope(row.card_id, row.tenant_id, row.card_tenant_id)?;
+        context.validate_card_scope(
+            tenant_id,
+            row.card_id,
+            row.user_id,
+            row.domain_id
+                .ok_or_else(|| AstralError::Permission("rule source domain is missing".into()))?,
+        )?;
 
         // 合并 patch 得到最终字段值（None 表示沿用 DB 既有值）。
         let final_effect = match &validated_effect {
@@ -857,11 +908,27 @@ impl RuleRepository for SqlxRuleRepository {
         rule_id: i64,
         context: &DirectRuleMutationContext,
     ) -> Result<bool, AstralError> {
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let admission = context.authorization_admission()?.clone();
+        let capability = SourceMutationCapability::user(admission);
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )
+        .await?;
         // 删除前锁定并读取完整旧规则行；找不到保持原有明确 NotFound 语义。
         let Some(row) = Self::lock_rule_for_mutation(&mut **tx, rule_id).await? else {
             return Ok(false);
         };
+        let tenant_id =
+            validate_locked_rule_tenant_scope(row.card_id, row.tenant_id, row.card_tenant_id)?;
+        context.validate_card_scope(
+            tenant_id,
+            row.card_id,
+            row.user_id,
+            row.domain_id
+                .ok_or_else(|| AstralError::Permission("rule source domain is missing".into()))?,
+        )?;
 
         let result = sqlx::query("DELETE FROM permission_rule WHERE rule_id=?")
             .bind(rule_id)
@@ -950,9 +1017,28 @@ impl RuleRepository for SqlxRuleRepository {
         card_id: i64,
         context: &DirectRuleMutationContext,
     ) -> Result<(), AstralError> {
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let admission = context.authorization_admission()?.clone();
+        let capability = SourceMutationCapability::user(admission);
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )
+        .await?;
         // 批量路径按确定性 rule_id 升序锁定/处理；任何一条失败整体回滚。
         let rows = Self::lock_rules_by_card(&mut **tx, card_id).await?;
+        for row in &rows {
+            let tenant_id =
+                validate_locked_rule_tenant_scope(row.card_id, row.tenant_id, row.card_tenant_id)?;
+            context.validate_card_scope(
+                tenant_id,
+                row.card_id,
+                row.user_id,
+                row.domain_id.ok_or_else(|| {
+                    AstralError::Permission("rule source domain is missing".into())
+                })?,
+            )?;
+        }
 
         let operation_id = derive_direct_rule_batch_operation_id(
             "remove-by-card",
@@ -1115,8 +1201,27 @@ impl RuleRepository for SqlxRuleRepository {
         }
         // 删除后无法回查受影响卡，因此必须在同一事务内先取卡再删并补投影，
         // 避免旧快照继续被读侧接受。
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let admission = context.authorization_admission()?.clone();
+        let capability = SourceMutationCapability::user(admission);
+        let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )
+        .await?;
         let rows = Self::lock_rules_by_source(&mut **tx, source_type, source_id).await?;
+        for row in &rows {
+            let tenant_id =
+                validate_locked_rule_tenant_scope(row.card_id, row.tenant_id, row.card_tenant_id)?;
+            context.validate_card_scope(
+                tenant_id,
+                row.card_id,
+                row.user_id,
+                row.domain_id.ok_or_else(|| {
+                    AstralError::Permission("rule source domain is missing".into())
+                })?,
+            )?;
+        }
 
         let operation_id = derive_direct_rule_batch_operation_id(
             "remove-by-source",
@@ -1387,7 +1492,15 @@ mod direct_ledger_shape_tests {
             (UPDATE_SIG, DELETE_SIG, "UPDATE permission_rule SET"),
         ] {
             let body = method_body(production, start, end, "transactional SoD");
-            let begin = body.find("AuthorizationSourceTransaction::begin").unwrap();
+            let begin = body
+                .find(
+                    "begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )",
+                )
+                .unwrap();
             let check = body.find("check_grant_sod_conflict_in_tx(").unwrap();
             let refuse = body.find("reject_sod_conflict(").unwrap();
             let write = body.find(mutation).unwrap();
@@ -1435,7 +1548,13 @@ mod direct_ledger_shape_tests {
         let body = method_body(source, UPDATE_SIG, DELETE_SIG, "update");
         let noop = body.find("patch_is_empty(patch)").expect("no-op guard");
         let begin = body
-            .find("AuthorizationSourceTransaction::begin(&self.db)")
+            .find(
+                "begin_source_transaction_with_capability_and_optional_delivery_context(
+            &self.db,
+            &capability,
+            self.delivery_context.as_ref(),
+        )",
+            )
             .expect("transaction begin");
         assert!(
             noop < begin,
@@ -1576,7 +1695,7 @@ mod direct_ledger_shape_tests {
         assert!(batch_body.contains("derive_direct_rule_batch_operation_id"));
         assert!(
             batch_body
-                .matches("AuthorizationSourceTransaction::begin")
+                .matches("begin_source_transaction_with_capability_and_optional_delivery_context")
                 .count()
                 == 1
         );
@@ -1593,7 +1712,7 @@ mod direct_ledger_shape_tests {
         assert!(source_batch.contains("only CARD_ONLY or MANUAL"));
         assert!(
             source_batch
-                .matches("AuthorizationSourceTransaction::begin")
+                .matches("begin_source_transaction_with_capability_and_optional_delivery_context")
                 .count()
                 == 1
         );

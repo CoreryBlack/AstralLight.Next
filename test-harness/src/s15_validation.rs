@@ -6,6 +6,132 @@ pub const SCENARIO_NAMES: [&str; 15] = [
 ];
 pub const MIN_FULL_ROUNDS: usize = 3;
 
+/// Current V6 S15 test topology: four servers form two database-backed halves.
+pub const S15_NODE_COUNT: usize = 4;
+pub const S15_HALF_COUNT: usize = 2;
+pub const S15_NODES_PER_HALF: usize = 2;
+pub const S15_DATABASE_COUNT: usize = 2;
+pub const S15_SAME_DATABASE_TRANSPORT: &str = "custom_same_db_channel";
+pub const S15_CROSS_DATABASE_TRANSPORT: &str = "rabbitmq";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum S15Half {
+    A,
+    B,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct S15NodePlacement {
+    pub node_id: &'static str,
+    pub half: S15Half,
+    pub database_id: &'static str,
+}
+
+pub const S15_NODE_PLACEMENTS: [S15NodePlacement; S15_NODE_COUNT] = [
+    S15NodePlacement {
+        node_id: "AL1",
+        half: S15Half::A,
+        database_id: "DB1",
+    },
+    S15NodePlacement {
+        node_id: "AL2",
+        half: S15Half::A,
+        database_id: "DB1",
+    },
+    S15NodePlacement {
+        node_id: "AL3",
+        half: S15Half::B,
+        database_id: "DB2",
+    },
+    S15NodePlacement {
+        node_id: "AL4",
+        half: S15Half::B,
+        database_id: "DB2",
+    },
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum S15TransportKind {
+    CustomSameDatabase,
+    RabbitCrossDatabase,
+}
+
+pub fn s15_transport_for(source: S15NodePlacement, target: S15NodePlacement) -> S15TransportKind {
+    if source.database_id == target.database_id {
+        S15TransportKind::CustomSameDatabase
+    } else {
+        S15TransportKind::RabbitCrossDatabase
+    }
+}
+
+pub fn s15_topology_is_valid() -> bool {
+    let unique_nodes = S15_NODE_PLACEMENTS
+        .iter()
+        .map(|placement| placement.node_id)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let half_a = S15_NODE_PLACEMENTS
+        .iter()
+        .filter(|placement| placement.half == S15Half::A)
+        .collect::<Vec<_>>();
+    let half_b = S15_NODE_PLACEMENTS
+        .iter()
+        .filter(|placement| placement.half == S15Half::B)
+        .collect::<Vec<_>>();
+    unique_nodes == S15_NODE_COUNT
+        && half_a.len() == S15_NODES_PER_HALF
+        && half_b.len() == S15_NODES_PER_HALF
+        && half_a
+            .iter()
+            .all(|placement| placement.database_id == "DB1")
+        && half_b
+            .iter()
+            .all(|placement| placement.database_id == "DB2")
+        && S15_NODE_PLACEMENTS
+            .iter()
+            .filter(|placement| placement.database_id == "DB1")
+            .count()
+            == S15_NODES_PER_HALF
+        && S15_NODE_PLACEMENTS
+            .iter()
+            .filter(|placement| placement.database_id == "DB2")
+            .count()
+            == S15_NODES_PER_HALF
+}
+
+pub const CURRENT_S15_LIVE_REQUIREMENTS: &[&str] = &[
+    "approved_deployment",
+    "signed_identity",
+    "readiness",
+    "controller",
+    "four_node_state",
+    "two_half_state",
+    "two_database_state",
+    "same_db_custom_channel",
+    "cross_db_rabbitmq",
+    "current_transport",
+    "durable_evidence",
+    "run_scoped_provenance",
+    "tenant_isolation",
+    "audit_correlation",
+    "half_authority_fence",
+    "split_brain_fail_closed",
+];
+
+pub const S15_V6_REQUIRED_CASES: &[&str] = &[
+    "S15_source_commit_exact_receipt",
+    "S15_transport_identity_matches_canonical_message",
+    "S15_duplicate_delivery_single_terminal",
+    "S15_unknown_outcome_reconciled_before_retry",
+    "S15_no_stale_allow_during_recovery",
+    "S15_published_evidence_ready_after_reconciliation",
+    "S15_four_nodes_two_database_halves",
+    "S15_same_database_pair_uses_custom_channel",
+    "S15_cross_database_uses_rabbitmq",
+    "S15_transport_scope_mismatch_fails_closed",
+    "S15_half_authority_fence_blocks_stale_writer",
+];
+
 pub const REQUIRED_CASES: &[(&str, &[&str])] = &[
     (
         "S1",
@@ -115,16 +241,7 @@ pub const REQUIRED_CASES: &[(&str, &[&str])] = &[
             "S14_all_nodes_deny_after_restart",
         ],
     ),
-    (
-        "S15",
-        &[
-            "S15_redis_stopped",
-            "S15_redis_recovered",
-            "S15_no_stale_allow_during_redis_down",
-            "S15_no_stale_allow_after_restart",
-            "S15_all_nodes_deny_final",
-        ],
-    ),
+    ("S15", S15_V6_REQUIRED_CASES),
 ];
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -398,6 +515,143 @@ mod tests {
             campaign_coverage(3, 3, None, &empty_missing_rounds(3), Some(&vec![failed; 3]));
         assert!(!failed.complete);
         assert!(!failed.required_case_passes);
+    }
+
+    #[test]
+    fn test_s15_required_cases_are_current_v6_durable_recovery_contract() {
+        assert_eq!(required_cases("S15"), Some(S15_V6_REQUIRED_CASES));
+        assert_eq!(S15_V6_REQUIRED_CASES.len(), 11);
+        assert!(S15_V6_REQUIRED_CASES
+            .iter()
+            .all(|case| !case.to_ascii_lowercase().contains("redis")));
+        assert!(S15_V6_REQUIRED_CASES
+            .iter()
+            .all(|case| case.starts_with("S15_")));
+    }
+
+    #[test]
+    fn test_current_s15_live_gate_requires_v6_and_durable_prerequisites() {
+        assert_eq!(S15_NODE_COUNT, 4);
+        assert_eq!(S15_HALF_COUNT, 2);
+        assert_eq!(S15_NODES_PER_HALF, 2);
+        assert_eq!(S15_DATABASE_COUNT, 2);
+        assert_eq!(S15_SAME_DATABASE_TRANSPORT, "custom_same_db_channel");
+        assert_eq!(S15_CROSS_DATABASE_TRANSPORT, "rabbitmq");
+        assert!(s15_topology_is_valid());
+        let db1_nodes = S15_NODE_PLACEMENTS
+            .iter()
+            .copied()
+            .filter(|placement| placement.database_id == "DB1")
+            .collect::<Vec<_>>();
+        let db2_nodes = S15_NODE_PLACEMENTS
+            .iter()
+            .copied()
+            .filter(|placement| placement.database_id == "DB2")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            s15_transport_for(db1_nodes[0], db1_nodes[1]),
+            S15TransportKind::CustomSameDatabase
+        );
+        assert_eq!(
+            s15_transport_for(db1_nodes[0], db2_nodes[0]),
+            S15TransportKind::RabbitCrossDatabase
+        );
+        assert_eq!(
+            s15_transport_for(db2_nodes[0], db2_nodes[1]),
+            S15TransportKind::CustomSameDatabase
+        );
+        for requirement in [
+            "four_node_state",
+            "two_half_state",
+            "two_database_state",
+            "same_db_custom_channel",
+            "cross_db_rabbitmq",
+            "half_authority_fence",
+            "split_brain_fail_closed",
+            "current_transport",
+            "durable_evidence",
+            "run_scoped_provenance",
+            "tenant_isolation",
+            "audit_correlation",
+        ] {
+            assert!(
+                CURRENT_S15_LIVE_REQUIREMENTS.contains(&requirement),
+                "missing S15 requirement: {requirement}"
+            );
+        }
+        assert!(!CURRENT_S15_LIVE_REQUIREMENTS.contains(&"three_node_state"));
+        assert!(!CURRENT_S15_LIVE_REQUIREMENTS.contains(&"redis"));
+        assert!(!CURRENT_S15_LIVE_REQUIREMENTS.contains(&"opa"));
+
+        let rabbit_consumer = include_str!("../../astral-mq/src/consumer.rs");
+        for anchor in [
+            "validate_delivery_message_id",
+            "payload_digest_hex",
+            "claim_message_with_digest",
+            "mq_consumer_lease",
+        ] {
+            assert!(
+                rabbit_consumer.contains(anchor),
+                "missing Rabbit anchor: {anchor}"
+            );
+        }
+
+        let local_bus = include_str!("../../astral-mq/src/local_bus.rs");
+        assert!(local_bus.contains("remote target requires Rabbit transport"));
+        assert!(local_bus.contains("publish_and_wait"));
+        let local_projection_bus = include_str!("../../astral-db/src/local_projection_bus.rs");
+        assert!(local_projection_bus.contains("LocalProjectionBus"));
+        assert!(local_projection_bus.contains("bounded"));
+
+        let owned_completion =
+            include_str!("../../astral-db/src/projection_execution/completion.rs");
+        for anchor in [
+            "OwnedCompletionIdentity",
+            "load_owned_delta_completion",
+            "load_owned_completion_in_tx",
+        ] {
+            assert!(
+                owned_completion.contains(anchor),
+                "missing WorkerOwned anchor: {anchor}"
+            );
+        }
+
+        let strict_reader =
+            include_str!("../../astral-db/src/authorization_projection_repository.rs");
+        for anchor in [
+            "load_published_card_grant_evidence_in_tx",
+            "PublishedEvidenceGateStatus::Ready",
+            "revoke_fence",
+        ] {
+            assert!(
+                strict_reader.contains(anchor),
+                "missing published-evidence anchor: {anchor}"
+            );
+        }
+
+        let policy_engine = include_str!("../../policy-engine/src/engine/published.rs");
+        for anchor in [
+            "evaluate_published_card_evidence",
+            "PublishedCardEvidenceScope",
+            "AUTHORIZATION_PENDING",
+        ] {
+            assert!(
+                policy_engine.contains(anchor),
+                "missing PolicyEngine anchor: {anchor}"
+            );
+        }
+
+        let lifecycle = include_str!("../../tests-suite/series/RQ3/native_projection_lifecycle.rs");
+        for anchor in [
+            "tenant_id",
+            "audit correlation",
+            "PublishedEvidenceGateStatus::Ready",
+        ] {
+            assert!(
+                lifecycle.contains(anchor),
+                "missing lifecycle evidence anchor: {anchor}"
+            );
+        }
     }
 
     #[test]

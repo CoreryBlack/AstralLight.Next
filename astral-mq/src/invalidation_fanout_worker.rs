@@ -1276,6 +1276,9 @@ mod tests {
             schema_version: envelope.schema_version,
             payload_json: envelope.envelope_json().unwrap(),
             headers_json: None,
+            authority_metadata_json: envelope
+                .authority_metadata_json()
+                .expect("metadata serialization"),
             payload_sha256: envelope.payload_sha256.clone(),
             status: status.to_owned(),
             attempts,

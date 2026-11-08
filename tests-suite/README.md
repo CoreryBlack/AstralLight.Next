@@ -51,7 +51,10 @@ MANIFEST 中单独标记的 `COMPAT`/历史 campaign 条目是历史分类或阻
 `native-kernel`、`offline-validation`、`native-single-node`、`standalone-rabbit`、
 `distributed`、`performance-kernel` 与 `performance-native` 是当前七个 profile，
 以 MANIFEST 为准；当前七个 profile 均不依赖 Redis，RabbitMQ 仅用于
-`standalone-rabbit` 与 `distributed`。历史 `COMPAT`、Java/Rust oracle、Redis 专项与已删除的 Cargo targets 不能按本节命令执行；既有历史结果保持原貌，仅按其历史边界引用，不重算或重写。
+`standalone-rabbit` 与通用 `distributed` profile。S15 四服务器两半区是独立的
+campaign topology contract：`AL1/AL2` 配对 `DB1`、`AL3/AL4` 配对 `DB2`，同库
+使用 `custom_same_db_channel`，跨库使用 RabbitMQ；它不由通用 `distributed`
+profile 自动提供。
 
 ## 运行前置(集成/多租户/安全真依赖类)
 
@@ -69,6 +72,10 @@ MANIFEST 中单独标记的 `COMPAT`/历史 campaign 条目是历史分类或阻
 
 脚本/矩阵别名不得替代 Rust `test-campaign` 与 MANIFEST 中的精确 suite/argv。纯组件回归可经 `scripts/run-tests.sh --campaign --run --profile native-kernel` 选择；真实依赖和多租户场景应按 MANIFEST 逐项选择，先通过适用的批准、环境和隔离数据库前置。当前统一入口不会启动容器/服务、执行迁移或 live fault；已批准资源不得由测试入口自动创建或删除。旧 Python runner/probe 不是当前入口，也不作为推荐迁移或复跑命令。
 
+CURRENT V6 Phase E 的 local/unit 合同已登记为 Rust suite：`authority-runtime-reducer-contracts` 与 `authority-issuance-frontier-contracts` 覆盖 authority ingress、frontier、`Ready`/`Unknown` disposition；`invalidation-recovery-reducer-contracts` 覆盖 outbox/inbox 状态、broker admission 与 apply/ACK 分离、UNKNOWN/IN_DOUBT、精确 provenance、duplicate/reorder/gap、watermark 和 `SUSPECT`/`SERVING` 门控。三者均为 `native-kernel` 进程内证据，不运行数据库或 broker，不构成 MySQL、RabbitMQ、四节点/双库、external arbiter、TLC 或部署证据；本 README 修订未运行这些 suite。
+
+同一状态的 production-crate recovery/readiness 契约已另行登记为七个独立 Rust suite（此前只由 `inline/*` unit-inline 条目与 `workspace-tests` 笼统覆盖，无逐簇 argv）：`trustgraph-invalidation-recovery-op-contracts`（recovery-op inspect/settle 解析、provenance 形状、稳定退出码与拒绝输出，15 例）、`trustgraph-invalidation-runtime-supervisor-contracts`（LocalBus/rabbit 运行时关闭归属、有界 bootstrap、SUSPECT/心跳与 reconcile deferral，19 例）、`hub-readiness-negative-contracts`（fence-sync 在 certified root + durable reconcile 前不 `SERVING`、authority pending 失效 certified root，4 例，双 libtest 前缀过滤）、`db-authorization-readiness-contracts`（strict 仓储缺 provider 不放行 positive authorization、durable-only 显式 opt-in，5 例）、`single-node-readiness-liveness-contracts`（admission 在 required service/lease 丢失时先行关闭、writer-lease 监督先于 warm-up、liveness 不等于授权证明，17 例）、`mq-consumer-unknown-transition-contracts`（consumer 绑定/UNKNOWN/quarantine/DLQ/revocation barrier 合同，47 例）、`mq-invalidation-envelope-fail-closed-contracts`（envelope/proof/shard 规划 fail-closed 合同，29 例）。登记时每个 argv 已在本地实际执行一次；最终 Rust 快照复跑合计 136 passed/0 failed/0 ignored，Hub 的两个 libtest 前缀拆为独立 Cargo 命令后合并为 4 例；该结果仅为 local/unit in-process 证据，不构成 MySQL、RabbitMQ、四节点/双库、external arbiter、TLC 或部署证据，也不改写任何外部 gate 或 ignored 集成的状态。
+
 ## 统一 Profile 与系列入口
 
 `MANIFEST.toml` 保留全量 `entry` 分类，并新增机器可读的 `profile`、`series`、
@@ -83,7 +90,7 @@ MANIFEST 中单独标记的 `COMPAT`/历史 campaign 条目是历史分类或阻
 | `offline-validation` | 无 | Rust 协议合约与有界模型（含 E5 单 mutation 报告差分）；归档 Python 方法/结果仅为历史记录，不运行、不作为当前 gate；未由 Rust suite 覆盖的运行证据缺口按 MANIFEST 保持 BLOCKED；形式模型/实装证据边界保持分离 |
 | `native-single-node` | MySQL | LocalBus/LocalProjectionBus/MemoryProjectionHub 真实本地链路 |
 | `standalone-rabbit` | MySQL + RabbitMQ | 独立服务传输与 durable consumer 证明；无 Redis |
-| `distributed` | MySQL + RabbitMQ | 当前多进程 profile；完整 live distributed campaign 仍按 MANIFEST 标记为 BLOCKED，未由本次文档更新执行；不含历史 Redis/OPA harness |
+| `distributed` | MySQL + RabbitMQ | 通用多进程 Rabbit profile；不代表 S15 四服务器/两半区 live proof。S15 另有固定 `AL1/AL2 -> DB1`、`AL3/AL4 -> DB2` 拓扑门：同库两台服务器走自研通道，跨库才走 RabbitMQ；同库跨机通道尚未在当前仓库实现，因此 live campaign 保持 BLOCKED |
 | `performance-kernel` | 无 | compiler/policy/hub CPU 与分配数据 |
 | `performance-native` | MySQL | native composite 签名 HTTP/收敛/负载；须有独立批准的部署、SUT 资源/积压采样和完整终态证据；loadgen 仅提供客户端测量 |
 

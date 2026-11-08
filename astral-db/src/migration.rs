@@ -20,7 +20,21 @@ use std::str::FromStr;
 
 use astral_types::{ProjectionAggregate, EVENT_TYPE_RULE_SET_UPDATE};
 
+mod authority_operation_width;
+mod authority_projections;
+mod authority_publication_history;
+mod authority_source_bootstrap_use;
+mod authority_source_outcome;
+mod authority_v7;
+mod commerce_billing_cycle;
+mod delivery_intent;
+mod empty_card_origin;
+mod invalidation_delivery;
 mod manifest_v3;
+mod password_reset_delivery_binding;
+mod protected_mutation;
+mod source_terminal_receipt;
+mod verification_durable;
 
 use manifest_v3::{
     authorization_projection_manifest_v3_recorded, preflight_manifest_v3,
@@ -764,6 +778,30 @@ const LEARN_SYSTEM_ASSIGNMENT_SQL_SHA384: &str =
     "102705f5df0183e0bcd4fc4d39fe1c8e8ff994c66d198d0c7d738a992a3469cc9b453d9b52c7721d4bd48591ca2905de";
 const SWITCH_OPERATION_RECOVERY_CONTRACT_VERSION: i64 = 20261029000001;
 const SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION: i64 = 20261029000002;
+const AUTHORIZATION_AUTHORITY_PROOF_VERSION: i64 = 20261105000001;
+#[allow(dead_code)]
+const AUTHORIZATION_AUTHORITY_PROOF_MIGRATION_SQL: &str =
+    include_str!("../migrations/20261105000001_authorization_authority_proof.sql");
+const AUTHORIZATION_AUTHORITY_PROOF_SQL_SHA384: &str =
+    "7b61bd2b11cd1d88adfcf59e407709f80ecae2fb2ec23fa83dff4a1bac886853c7c07bef4eeee016f1af3c0e34e843b1";
+const AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_VERSION: i64 = 20261105000002;
+#[allow(dead_code)]
+const AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_MIGRATION_SQL: &str =
+    include_str!("../migrations/20261105000002_authorization_issuance_completion.sql");
+const AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_SQL_SHA384: &str =
+    "6b7f5b7f4b723dcde1582f92fe5f319f138b26a2eda10f840c455672c7f94bfdee131ccd26294c1b496db5c0aad54da1";
+const AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_VERSION: i64 = 20261105000003;
+#[allow(dead_code)]
+const AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_MIGRATION_SQL: &str =
+    include_str!("../migrations/20261105000003_authorization_frontier_snapshot_hash.sql");
+const AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_SQL_SHA384: &str =
+    "d3958045cc0874981e23c9b142c6caea07aae4c0db9700b08620afdd27750b8824b2b9fa6b44ea90c5b29fcc1cb3144e";
+const AUTHORITY_MESSAGE_METADATA_VERSION: i64 = 20261106000001;
+#[allow(dead_code)]
+const AUTHORITY_MESSAGE_METADATA_MIGRATION_SQL: &str =
+    include_str!("../migrations/20261106000001_authority_message_metadata.sql");
+const AUTHORITY_MESSAGE_METADATA_SQL_SHA384: &str =
+    "2f4b7a2e8991d097bd91b3fc6c67fa5f27f9766a149c151b67cecd400db21305c3edb43eb57a32c627de0944c492d897";
 const SWITCH_OPERATION_RECOVERY_CONTRACT_SQL_SHA384: &str =
     "124805aff0fae52ce077b2ac02d0765a9839470ff2f1b526cf85c2c71f36c4cec90d60895e28282be58336113b11b3e6";
 const SWITCH_OPERATION_RECOVERY_DEADLINE_SQL_SHA384: &str =
@@ -791,6 +829,574 @@ const SWITCH_OPERATION_RECOVERY_CONTRACT_INDEXES: &[(&str, &str, &[&str], bool)]
 )];
 const SWITCH_OPERATION_RECOVERY_DEADLINE_COLUMNS: &[(&str, &str)] =
     &[("auth_session_operation", "recovery_expires_at")];
+const AUTHORIZATION_AUTHORITY_PROOF_COLUMN_CONTRACTS: &[SchemaColumnContract] = &[
+    SchemaColumnContract {
+        table: "authorization_authority_frontier",
+        name: "frontier_id",
+        column_type: "BIGINT",
+        not_null: true,
+        default: None,
+        charset: None,
+        collation: None,
+    },
+    incremental_text_column(
+        "authorization_authority_frontier",
+        "authority_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_frontier",
+        "authority_term",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_frontier",
+        "global_fence_sequence",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_frontier",
+        "key_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_frontier",
+        "key_epoch",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_frontier",
+        "status",
+        "VARCHAR(16)",
+        true,
+        None,
+    ),
+    SchemaColumnContract {
+        table: "authorization_authority_frontier",
+        name: "updated_at",
+        column_type: "DATETIME",
+        not_null: true,
+        default: Some("CURRENT_TIMESTAMP"),
+        charset: None,
+        collation: None,
+    },
+    SchemaColumnContract {
+        table: "authorization_authority_proof",
+        name: "proof_id",
+        column_type: "VARCHAR(128)",
+        not_null: true,
+        default: None,
+        charset: Some(MYSQL_SCHEMA_CHARSET),
+        collation: Some(MYSQL_SCHEMA_COLLATION),
+    },
+    SchemaColumnContract {
+        table: "authorization_authority_proof",
+        name: "request_nonce",
+        column_type: "VARCHAR(255)",
+        not_null: true,
+        default: None,
+        charset: Some(MYSQL_SCHEMA_CHARSET),
+        collation: Some(MYSQL_SCHEMA_COLLATION),
+    },
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "authorization_edition",
+        "SMALLINT UNSIGNED",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_proof",
+        "authority_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "authority_term",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "global_fence_sequence",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "tenant_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "card_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "scope_user_id",
+        "BIGINT",
+        false,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_proof",
+        "scope_domain_kind",
+        "VARCHAR(16)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "scope_domain_id",
+        "BIGINT",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "scope_generation",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "revoke_watermark",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "snapshot_hash",
+        "BINARY(32)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "parent_hash",
+        "BINARY(32)",
+        false,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_proof",
+        "operation_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_proof",
+        "event_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_proof",
+        "key_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "key_epoch",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "issued_at",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "not_before",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "expires_at",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_proof",
+        "signature",
+        "BINARY(64)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_proof",
+        "status",
+        "VARCHAR(16)",
+        true,
+        None,
+    ),
+    SchemaColumnContract {
+        table: "authorization_authority_proof",
+        name: "created_at",
+        column_type: "DATETIME",
+        not_null: true,
+        default: Some("CURRENT_TIMESTAMP"),
+        charset: None,
+        collation: None,
+    },
+    SchemaColumnContract {
+        table: "authorization_authority_issuance_lease",
+        name: "lease_id",
+        column_type: "VARCHAR(128)",
+        not_null: true,
+        default: None,
+        charset: Some(MYSQL_SCHEMA_CHARSET),
+        collation: Some(MYSQL_SCHEMA_COLLATION),
+    },
+    SchemaColumnContract {
+        table: "authorization_authority_issuance_lease",
+        name: "request_nonce",
+        column_type: "VARCHAR(255)",
+        not_null: true,
+        default: None,
+        charset: Some(MYSQL_SCHEMA_CHARSET),
+        collation: Some(MYSQL_SCHEMA_COLLATION),
+    },
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "authorization_edition",
+        "SMALLINT UNSIGNED",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_issuance_lease",
+        "authority_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "authority_term",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "global_fence_sequence",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "previous_authority_term",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "previous_global_fence_sequence",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_issuance_lease",
+        "previous_key_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "previous_key_epoch",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "tenant_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "card_id",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "scope_user_id",
+        "BIGINT",
+        false,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_issuance_lease",
+        "scope_domain_kind",
+        "VARCHAR(16)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "scope_domain_id",
+        "BIGINT",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "scope_generation",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "revoke_watermark",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "snapshot_hash",
+        "BINARY(32)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "parent_hash",
+        "BINARY(32)",
+        false,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_issuance_lease",
+        "operation_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_issuance_lease",
+        "event_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_issuance_lease",
+        "key_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "key_epoch",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "issued_at",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "not_before",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "expires_at",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_issuance_lease",
+        "arbiter_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_issuance_lease",
+        "arbiter_key_id",
+        "VARCHAR(128)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "arbiter_key_epoch",
+        "BIGINT",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "arbiter_signature",
+        "BINARY(64)",
+        true,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_authority_issuance_lease",
+        "status",
+        "VARCHAR(16)",
+        true,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "consumed_at",
+        "BIGINT",
+        false,
+        None,
+    ),
+    SchemaColumnContract {
+        table: "authorization_authority_issuance_lease",
+        name: "created_at",
+        column_type: "DATETIME",
+        not_null: true,
+        default: Some("CURRENT_TIMESTAMP"),
+        charset: None,
+        collation: None,
+    },
+];
+
+const AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_COLUMNS: &[(&str, &str)] = &[
+    (
+        "authorization_authority_issuance_lease",
+        "publication_completion_hash",
+    ),
+    (
+        "authorization_authority_issuance_lease",
+        "publication_completion_generation",
+    ),
+    (
+        "authorization_authority_issuance_lease",
+        "publication_completion_revoke_watermark",
+    ),
+    (
+        "authorization_authority_issuance_lease",
+        "publication_completion_at",
+    ),
+];
+
+const AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_COLUMN_CONTRACTS: &[SchemaColumnContract] = &[
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "publication_completion_hash",
+        "BINARY(32)",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "publication_completion_generation",
+        "BIGINT",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "publication_completion_revoke_watermark",
+        "BIGINT",
+        false,
+        None,
+    ),
+    incremental_scalar_column(
+        "authorization_authority_issuance_lease",
+        "publication_completion_at",
+        "BIGINT",
+        false,
+        None,
+    ),
+];
+
+const AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_COLUMNS: &[(&str, &str)] =
+    &[("authorization_authority_frontier", "snapshot_hash")];
+
+const AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_COLUMN_CONTRACTS: &[SchemaColumnContract] =
+    &[incremental_scalar_column(
+        "authorization_authority_frontier",
+        "snapshot_hash",
+        "BINARY(32)",
+        false,
+        None,
+    )];
+
+const AUTHORITY_MESSAGE_METADATA_COLUMNS: &[(&str, &str)] = &[
+    ("al_message_outbox", "authority_metadata_json"),
+    (
+        "authorization_invalidation_inbox",
+        "authority_metadata_json",
+    ),
+];
+
+const AUTHORITY_MESSAGE_METADATA_COLUMN_CONTRACTS: &[SchemaColumnContract] = &[
+    incremental_text_column(
+        "al_message_outbox",
+        "authority_metadata_json",
+        "MEDIUMTEXT",
+        false,
+        None,
+    ),
+    incremental_text_column(
+        "authorization_invalidation_inbox",
+        "authority_metadata_json",
+        "MEDIUMTEXT",
+        false,
+        None,
+    ),
+];
+
 const REVIEW_SLICE_MIGRATION_VERSIONS: &[i64] = &[
     IDENTITY_CREDENTIAL_FENCE_VERSION,
     ASYNC_OPERATION_CORRELATION_VERSION,
@@ -803,7 +1409,26 @@ fn migration_requires_exact_artifact_parse(version: i64) -> bool {
     REVIEW_SLICE_MIGRATION_VERSIONS.contains(&version)
         || matches!(
             version,
-            SWITCH_OPERATION_RECOVERY_CONTRACT_VERSION | SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION
+            SWITCH_OPERATION_RECOVERY_CONTRACT_VERSION
+                | SWITCH_OPERATION_RECOVERY_DEADLINE_VERSION
+                | AUTHORIZATION_AUTHORITY_PROOF_VERSION
+                | AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_VERSION
+                | AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_VERSION
+                | AUTHORITY_MESSAGE_METADATA_VERSION
+                | authority_v7::VERSION
+                | authority_projections::VERSION
+                | authority_publication_history::VERSION
+                | authority_source_outcome::VERSION
+                | protected_mutation::VERSION
+                | verification_durable::VERSION
+                | delivery_intent::VERSION
+                | empty_card_origin::VERSION
+                | invalidation_delivery::VERSION
+                | password_reset_delivery_binding::VERSION
+                | source_terminal_receipt::VERSION
+                | authority_operation_width::VERSION
+                | authority_source_bootstrap_use::VERSION
+                | commerce_billing_cycle::VERSION
         )
 }
 const LOCAL_SCOPE_SEQUENCE_MIGRATION_SQL: &str =
@@ -1627,6 +2252,92 @@ const VERIFIED_BASELINE_TABLES: &[BaselineTableContract] = &[
 ];
 
 const REQUIRED_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "authorization_authority_frontier",
+        &[
+            "frontier_id",
+            "authority_id",
+            "authority_term",
+            "global_fence_sequence",
+            "key_id",
+            "key_epoch",
+            "snapshot_hash",
+            "status",
+            "updated_at",
+        ],
+    ),
+    (
+        "authorization_authority_proof",
+        &[
+            "proof_id",
+            "request_nonce",
+            "authorization_edition",
+            "authority_id",
+            "authority_term",
+            "global_fence_sequence",
+            "tenant_id",
+            "card_id",
+            "scope_user_id",
+            "scope_domain_kind",
+            "scope_domain_id",
+            "scope_generation",
+            "revoke_watermark",
+            "snapshot_hash",
+            "parent_hash",
+            "operation_id",
+            "event_id",
+            "key_id",
+            "key_epoch",
+            "issued_at",
+            "not_before",
+            "expires_at",
+            "signature",
+            "status",
+            "created_at",
+        ],
+    ),
+    (
+        "authorization_authority_issuance_lease",
+        &[
+            "lease_id",
+            "request_nonce",
+            "authorization_edition",
+            "authority_id",
+            "authority_term",
+            "global_fence_sequence",
+            "previous_authority_term",
+            "previous_global_fence_sequence",
+            "previous_key_id",
+            "previous_key_epoch",
+            "tenant_id",
+            "card_id",
+            "scope_user_id",
+            "scope_domain_kind",
+            "scope_domain_id",
+            "scope_generation",
+            "revoke_watermark",
+            "snapshot_hash",
+            "parent_hash",
+            "operation_id",
+            "event_id",
+            "key_id",
+            "key_epoch",
+            "issued_at",
+            "not_before",
+            "expires_at",
+            "arbiter_id",
+            "arbiter_key_id",
+            "arbiter_key_epoch",
+            "arbiter_signature",
+            "status",
+            "consumed_at",
+            "created_at",
+            "publication_completion_hash",
+            "publication_completion_generation",
+            "publication_completion_revoke_watermark",
+            "publication_completion_at",
+        ],
+    ),
     ("platform_domain", &["domain_id", "status"]),
     (
         "tenant",
@@ -1750,6 +2461,7 @@ const REQUIRED_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
             "schema_version",
             "payload_json",
             "headers_json",
+            "authority_metadata_json",
             "payload_sha256",
             "status",
             "attempts",
@@ -2129,6 +2841,59 @@ const REQUIRED_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
 ];
 
 const REQUIRED_SCHEMA_INDEXES: &[(&str, &str, &[&str], bool)] = &[
+    (
+        "authorization_authority_frontier",
+        "PRIMARY",
+        &["frontier_id"],
+        true,
+    ),
+    (
+        "authorization_authority_frontier",
+        "uk_aaf_authority",
+        &["authority_id"],
+        true,
+    ),
+    (
+        "authorization_authority_frontier",
+        "idx_aaf_status",
+        &["status", "updated_at"],
+        false,
+    ),
+    (
+        "authorization_authority_proof",
+        "PRIMARY",
+        &["proof_id"],
+        true,
+    ),
+    (
+        "authorization_authority_proof",
+        "uk_aap_request_nonce",
+        &["request_nonce"],
+        true,
+    ),
+    (
+        "authorization_authority_proof",
+        "idx_aap_scope_frontier",
+        &[
+            "tenant_id",
+            "card_id",
+            "scope_generation",
+            "global_fence_sequence",
+        ],
+        false,
+    ),
+    (
+        "authorization_authority_proof",
+        "idx_aap_operation_event",
+        &["operation_id", "event_id"],
+        false,
+    ),
+    (
+        "authorization_authority_proof",
+        "idx_aap_expiry",
+        &["expires_at"],
+        false,
+    ),
     ("al_message_outbox", "PRIMARY", &["message_id"], true),
     (
         "al_message_outbox",
@@ -5513,6 +6278,10 @@ async fn preflight_schema_contract_before_sqlx(
 ) -> Result<(), MigrationError> {
     preflight_standby_migration_gate(pool, applied_versions, migrations).await?;
     let manifest_v3_complete = preflight_manifest_v3(pool, applied_versions, migrations).await?;
+    let operation_width_complete =
+        authority_operation_width::preflight(pool, applied_versions, migrations).await?;
+    let source_bootstrap_complete =
+        authority_source_bootstrap_use::preflight(pool, applied_versions, migrations).await?;
     let review_schema_complete =
         preflight_review_schema_contracts(pool, applied_versions, migrations).await?;
     preflight_monitor_schema_contract(pool, applied_versions, migrations).await?;
@@ -5524,6 +6293,10 @@ async fn preflight_schema_contract_before_sqlx(
     .await?;
     let cross_city_schema_complete =
         preflight_cross_city_schema_contract(pool, applied_versions, migrations).await?;
+    let terminal_receipt_complete =
+        source_terminal_receipt::preflight(pool, applied_versions, migrations).await?;
+    let commerce_billing_complete =
+        commerce_billing_cycle::preflight(pool, applied_versions, migrations).await?;
     let pending_migrations: Vec<&Migration> = migrations
         .iter()
         .filter(|migration| !applied_versions.contains(&migration.version))
@@ -5532,7 +6305,11 @@ async fn preflight_schema_contract_before_sqlx(
     let mut all_required_artifacts_present = incremental_archive_complete
         && cross_city_schema_complete
         && review_schema_complete
-        && manifest_v3_complete;
+        && manifest_v3_complete
+        && terminal_receipt_complete
+        && commerce_billing_complete
+        && operation_width_complete
+        && source_bootstrap_complete;
     let mut absent_tables = HashSet::new();
     for (table, columns) in REQUIRED_SCHEMA_COLUMNS {
         let table_exists = schema_table_exists(pool, table).await?;
@@ -5837,13 +6614,45 @@ fn split_top_level_items(fragment: &str) -> Option<Vec<&str>> {
     Some(items)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MigrationConstraint {
+    ForeignKey {
+        columns: Vec<String>,
+        referenced_table: String,
+        referenced_columns: Vec<String>,
+        on_delete: String,
+    },
+    Check {
+        expression: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExactMigrationConstraintContract {
+    ForeignKey {
+        table: &'static str,
+        name: &'static str,
+        columns: &'static [&'static str],
+        referenced_table: &'static str,
+        referenced_columns: &'static [&'static str],
+        on_delete: &'static str,
+    },
+    Check {
+        table: &'static str,
+        name: &'static str,
+        expression: &'static str,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MigrationArtifactKind {
     Table,
     CreateColumn,
     CreateIndex,
+    ModifyColumn,
     AddColumn,
     AddIndex,
+    Constraint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5853,6 +6662,7 @@ struct MigrationArtifact {
     name: String,
     columns: Vec<String>,
     unique: bool,
+    constraint: Option<MigrationConstraint>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -10311,7 +11121,343 @@ const PROJECTION_OWNED_EXECUTION_INDEXES: &[(&str, &str, &[&str], bool)] = &[(
     false,
 )];
 
+const AUTHORIZATION_AUTHORITY_PROOF_COLUMNS: &[(&str, &str)] = &[
+    ("authorization_authority_frontier", "frontier_id"),
+    ("authorization_authority_frontier", "authority_id"),
+    ("authorization_authority_frontier", "authority_term"),
+    ("authorization_authority_frontier", "global_fence_sequence"),
+    ("authorization_authority_frontier", "key_id"),
+    ("authorization_authority_frontier", "key_epoch"),
+    ("authorization_authority_frontier", "status"),
+    ("authorization_authority_frontier", "updated_at"),
+    ("authorization_authority_proof", "proof_id"),
+    ("authorization_authority_proof", "request_nonce"),
+    ("authorization_authority_proof", "authorization_edition"),
+    ("authorization_authority_proof", "authority_id"),
+    ("authorization_authority_proof", "authority_term"),
+    ("authorization_authority_proof", "global_fence_sequence"),
+    ("authorization_authority_proof", "tenant_id"),
+    ("authorization_authority_proof", "card_id"),
+    ("authorization_authority_proof", "scope_user_id"),
+    ("authorization_authority_proof", "scope_domain_kind"),
+    ("authorization_authority_proof", "scope_domain_id"),
+    ("authorization_authority_proof", "scope_generation"),
+    ("authorization_authority_proof", "revoke_watermark"),
+    ("authorization_authority_proof", "snapshot_hash"),
+    ("authorization_authority_proof", "parent_hash"),
+    ("authorization_authority_proof", "operation_id"),
+    ("authorization_authority_proof", "event_id"),
+    ("authorization_authority_proof", "key_id"),
+    ("authorization_authority_proof", "key_epoch"),
+    ("authorization_authority_proof", "issued_at"),
+    ("authorization_authority_proof", "not_before"),
+    ("authorization_authority_proof", "expires_at"),
+    ("authorization_authority_proof", "signature"),
+    ("authorization_authority_proof", "status"),
+    ("authorization_authority_proof", "created_at"),
+    ("authorization_authority_issuance_lease", "lease_id"),
+    ("authorization_authority_issuance_lease", "request_nonce"),
+    (
+        "authorization_authority_issuance_lease",
+        "authorization_edition",
+    ),
+    ("authorization_authority_issuance_lease", "authority_id"),
+    ("authorization_authority_issuance_lease", "authority_term"),
+    (
+        "authorization_authority_issuance_lease",
+        "global_fence_sequence",
+    ),
+    (
+        "authorization_authority_issuance_lease",
+        "previous_authority_term",
+    ),
+    (
+        "authorization_authority_issuance_lease",
+        "previous_global_fence_sequence",
+    ),
+    ("authorization_authority_issuance_lease", "previous_key_id"),
+    (
+        "authorization_authority_issuance_lease",
+        "previous_key_epoch",
+    ),
+    ("authorization_authority_issuance_lease", "tenant_id"),
+    ("authorization_authority_issuance_lease", "card_id"),
+    ("authorization_authority_issuance_lease", "scope_user_id"),
+    (
+        "authorization_authority_issuance_lease",
+        "scope_domain_kind",
+    ),
+    ("authorization_authority_issuance_lease", "scope_domain_id"),
+    ("authorization_authority_issuance_lease", "scope_generation"),
+    ("authorization_authority_issuance_lease", "revoke_watermark"),
+    ("authorization_authority_issuance_lease", "snapshot_hash"),
+    ("authorization_authority_issuance_lease", "parent_hash"),
+    ("authorization_authority_issuance_lease", "operation_id"),
+    ("authorization_authority_issuance_lease", "event_id"),
+    ("authorization_authority_issuance_lease", "key_id"),
+    ("authorization_authority_issuance_lease", "key_epoch"),
+    ("authorization_authority_issuance_lease", "issued_at"),
+    ("authorization_authority_issuance_lease", "not_before"),
+    ("authorization_authority_issuance_lease", "expires_at"),
+    ("authorization_authority_issuance_lease", "arbiter_id"),
+    ("authorization_authority_issuance_lease", "arbiter_key_id"),
+    (
+        "authorization_authority_issuance_lease",
+        "arbiter_key_epoch",
+    ),
+    (
+        "authorization_authority_issuance_lease",
+        "arbiter_signature",
+    ),
+    ("authorization_authority_issuance_lease", "status"),
+    ("authorization_authority_issuance_lease", "consumed_at"),
+    ("authorization_authority_issuance_lease", "created_at"),
+];
+
+const AUTHORIZATION_AUTHORITY_PROOF_INDEXES: &[(&str, &str, &[&str], bool)] = &[
+    (
+        "authorization_authority_frontier",
+        "PRIMARY",
+        &["frontier_id"],
+        true,
+    ),
+    (
+        "authorization_authority_frontier",
+        "uk_aaf_authority",
+        &["authority_id"],
+        true,
+    ),
+    (
+        "authorization_authority_frontier",
+        "idx_aaf_status",
+        &["status", "updated_at"],
+        false,
+    ),
+    (
+        "authorization_authority_proof",
+        "PRIMARY",
+        &["proof_id"],
+        true,
+    ),
+    (
+        "authorization_authority_proof",
+        "uk_aap_request_nonce",
+        &["request_nonce"],
+        true,
+    ),
+    (
+        "authorization_authority_proof",
+        "idx_aap_scope_frontier",
+        &[
+            "tenant_id",
+            "card_id",
+            "scope_generation",
+            "global_fence_sequence",
+        ],
+        false,
+    ),
+    (
+        "authorization_authority_proof",
+        "idx_aap_operation_event",
+        &["operation_id", "event_id"],
+        false,
+    ),
+    (
+        "authorization_authority_proof",
+        "idx_aap_expiry",
+        &["expires_at"],
+        false,
+    ),
+    (
+        "authorization_authority_issuance_lease",
+        "PRIMARY",
+        &["lease_id"],
+        true,
+    ),
+    (
+        "authorization_authority_issuance_lease",
+        "uk_aail_request_nonce",
+        &["request_nonce"],
+        true,
+    ),
+    (
+        "authorization_authority_issuance_lease",
+        "idx_aail_frontier",
+        &["authority_id", "authority_term", "global_fence_sequence"],
+        false,
+    ),
+    (
+        "authorization_authority_issuance_lease",
+        "idx_aail_operation_event",
+        &["operation_id", "event_id"],
+        false,
+    ),
+    (
+        "authorization_authority_issuance_lease",
+        "idx_aail_expiry",
+        &["expires_at"],
+        false,
+    ),
+    (
+        "authorization_authority_issuance_lease",
+        "idx_aail_status",
+        &["status", "expires_at"],
+        false,
+    ),
+];
+
 const EXACT_MIGRATION_ARTIFACT_CONTRACTS: &[ExactMigrationArtifactContract] = &[
+    ExactMigrationArtifactContract {
+        version: authority_source_bootstrap_use::VERSION,
+        source_sha384: authority_source_bootstrap_use::SOURCE_SHA384,
+        supports_existing_artifacts: false,
+        tables: authority_source_bootstrap_use::TABLES,
+        columns: authority_source_bootstrap_use::COLUMNS,
+        indexes: authority_source_bootstrap_use::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: authority_operation_width::VERSION,
+        source_sha384: authority_operation_width::SOURCE_SHA384,
+        supports_existing_artifacts: true,
+        tables: authority_operation_width::TABLES,
+        columns: authority_operation_width::COLUMNS,
+        indexes: authority_operation_width::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: commerce_billing_cycle::VERSION,
+        source_sha384: commerce_billing_cycle::SOURCE_SHA384,
+        supports_existing_artifacts: true,
+        tables: commerce_billing_cycle::TABLES,
+        columns: commerce_billing_cycle::COLUMNS,
+        indexes: commerce_billing_cycle::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: source_terminal_receipt::VERSION,
+        source_sha384: source_terminal_receipt::SOURCE_SHA384,
+        supports_existing_artifacts: true,
+        tables: source_terminal_receipt::TABLES,
+        columns: source_terminal_receipt::COLUMNS,
+        indexes: source_terminal_receipt::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: empty_card_origin::VERSION,
+        source_sha384: empty_card_origin::SOURCE_SHA384,
+        supports_existing_artifacts: false,
+        tables: empty_card_origin::TABLES,
+        columns: empty_card_origin::COLUMNS,
+        indexes: empty_card_origin::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: authority_source_outcome::VERSION,
+        source_sha384: authority_source_outcome::SOURCE_SHA384,
+        supports_existing_artifacts: false,
+        tables: authority_source_outcome::TABLES,
+        columns: authority_source_outcome::COLUMNS,
+        indexes: authority_source_outcome::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: delivery_intent::VERSION,
+        source_sha384: delivery_intent::SOURCE_SHA384,
+        supports_existing_artifacts: false,
+        tables: delivery_intent::TABLES,
+        columns: delivery_intent::COLUMNS,
+        indexes: delivery_intent::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: verification_durable::VERSION,
+        source_sha384: verification_durable::SOURCE_SHA384,
+        supports_existing_artifacts: false,
+        tables: verification_durable::TABLES,
+        columns: verification_durable::COLUMNS,
+        indexes: verification_durable::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: authority_projections::VERSION,
+        source_sha384: authority_projections::SOURCE_SHA384,
+        supports_existing_artifacts: false,
+        tables: authority_projections::TABLES,
+        columns: authority_projections::COLUMNS,
+        indexes: authority_projections::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: authority_publication_history::VERSION,
+        source_sha384: authority_publication_history::SOURCE_SHA384,
+        supports_existing_artifacts: false,
+        tables: authority_publication_history::TABLES,
+        columns: authority_publication_history::COLUMNS,
+        indexes: authority_publication_history::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: protected_mutation::VERSION,
+        source_sha384: protected_mutation::SOURCE_SHA384,
+        supports_existing_artifacts: false,
+        tables: protected_mutation::TABLES,
+        columns: protected_mutation::COLUMNS,
+        indexes: protected_mutation::INDEXES,
+    },
+    // Password-reset delivery binding: ALTER-type artifacts on an existing
+    // table, so preflight must accept the columns as existing artifacts
+    // (supports_existing_artifacts = true; see migration_defines_existing_column).
+    ExactMigrationArtifactContract {
+        version: password_reset_delivery_binding::VERSION,
+        source_sha384: password_reset_delivery_binding::SOURCE_SHA384,
+        supports_existing_artifacts: true,
+        tables: password_reset_delivery_binding::TABLES,
+        columns: password_reset_delivery_binding::COLUMNS,
+        indexes: password_reset_delivery_binding::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: authority_v7::VERSION,
+        source_sha384: authority_v7::SOURCE_SHA384,
+        supports_existing_artifacts: false,
+        tables: authority_v7::TABLES,
+        columns: authority_v7::COLUMNS,
+        indexes: authority_v7::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: invalidation_delivery::VERSION,
+        source_sha384: invalidation_delivery::SOURCE_SHA384,
+        supports_existing_artifacts: false,
+        tables: invalidation_delivery::TABLES,
+        columns: invalidation_delivery::COLUMNS,
+        indexes: invalidation_delivery::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: AUTHORIZATION_AUTHORITY_PROOF_VERSION,
+        source_sha384: AUTHORIZATION_AUTHORITY_PROOF_SQL_SHA384,
+        supports_existing_artifacts: false,
+        tables: &[
+            "authorization_authority_frontier",
+            "authorization_authority_proof",
+            "authorization_authority_issuance_lease",
+        ],
+        columns: AUTHORIZATION_AUTHORITY_PROOF_COLUMNS,
+        indexes: AUTHORIZATION_AUTHORITY_PROOF_INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_VERSION,
+        source_sha384: AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_SQL_SHA384,
+        supports_existing_artifacts: true,
+        tables: &[],
+        columns: AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_COLUMNS,
+        indexes: &[],
+    },
+    ExactMigrationArtifactContract {
+        version: AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_VERSION,
+        source_sha384: AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_SQL_SHA384,
+        supports_existing_artifacts: true,
+        tables: &[],
+        columns: AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_COLUMNS,
+        indexes: &[],
+    },
+    ExactMigrationArtifactContract {
+        version: AUTHORITY_MESSAGE_METADATA_VERSION,
+        source_sha384: AUTHORITY_MESSAGE_METADATA_SQL_SHA384,
+        supports_existing_artifacts: true,
+        tables: &[],
+        columns: AUTHORITY_MESSAGE_METADATA_COLUMNS,
+        indexes: &[],
+    },
     ExactMigrationArtifactContract {
         version: AUTHORIZATION_PROJECTION_MANIFEST_V3_VERSION,
         source_sha384: AUTHORIZATION_PROJECTION_MANIFEST_V3_SQL_SHA384,
@@ -10766,6 +11912,166 @@ fn index_columns(value: &str) -> Option<Vec<String>> {
     )
 }
 
+fn parse_constraint(item: &str) -> Option<(String, MigrationConstraint)> {
+    let remainder = item.strip_prefix("CONSTRAINT ")?;
+    let (name, definition) = first_sql_word(remainder)?;
+    let name = normalized_identifier(name);
+    let definition = definition.trim_start();
+    if let Some(foreign_key) = definition.strip_prefix("FOREIGN KEY ") {
+        let open = foreign_key.find('(')?;
+        if !foreign_key[..open].trim().is_empty() {
+            return None;
+        }
+        let close = matching_parenthesis(foreign_key, open)?;
+        let columns = index_columns(&foreign_key[..=close])?;
+        let references = foreign_key[close + 1..]
+            .trim_start()
+            .strip_prefix("REFERENCES ")?;
+        let (referenced_table, references_tail) = first_sql_word(references)?;
+        let open = references_tail.find('(')?;
+        if !references_tail[..open].trim().is_empty() {
+            return None;
+        }
+        let close = matching_parenthesis(references_tail, open)?;
+        let referenced_columns = index_columns(&references_tail[..=close])?;
+        if columns.is_empty()
+            || columns.iter().any(String::is_empty)
+            || columns.len() != referenced_columns.len()
+            || referenced_columns.iter().any(String::is_empty)
+        {
+            return None;
+        }
+        let actions = references_tail[close + 1..].trim();
+        let on_delete = if actions.is_empty() {
+            "RESTRICT"
+        } else {
+            match actions.strip_prefix("ON DELETE ")? {
+                action @ ("RESTRICT" | "CASCADE" | "SET NULL" | "NO ACTION") => action,
+                _ => return None,
+            }
+        };
+        return Some((
+            name,
+            MigrationConstraint::ForeignKey {
+                columns,
+                referenced_table: normalized_identifier(referenced_table),
+                referenced_columns,
+                on_delete: normalized_identifier(on_delete),
+            },
+        ));
+    }
+    if let Some(check) = definition.strip_prefix("CHECK ") {
+        let open = check.find('(')?;
+        let close = matching_parenthesis(check, open)?;
+        if !check[close + 1..].trim().is_empty() {
+            return None;
+        }
+        return Some((
+            name,
+            MigrationConstraint::Check {
+                expression: normalized_sql_fragment(&check[open + 1..close]),
+            },
+        ));
+    }
+    None
+}
+
+fn exact_contract_constraints(
+    contract: &ExactMigrationArtifactContract,
+) -> &'static [ExactMigrationConstraintContract] {
+    match contract.version {
+        empty_card_origin::VERSION => empty_card_origin::CONSTRAINTS,
+        invalidation_delivery::VERSION => invalidation_delivery::CONSTRAINTS,
+        _ => &[],
+    }
+}
+
+fn constraint_matches_contract(
+    contract: &ExactMigrationArtifactContract,
+    artifact: &MigrationArtifact,
+) -> bool {
+    let Some(constraint) = artifact.constraint.as_ref() else {
+        return false;
+    };
+    exact_contract_constraints(contract)
+        .iter()
+        .any(|expected| match (expected, constraint) {
+            (
+                ExactMigrationConstraintContract::ForeignKey {
+                    table,
+                    name,
+                    columns,
+                    referenced_table,
+                    referenced_columns,
+                    on_delete,
+                },
+                MigrationConstraint::ForeignKey {
+                    columns: actual_columns,
+                    referenced_table: actual_table,
+                    referenced_columns: actual_referenced_columns,
+                    on_delete: actual_on_delete,
+                },
+            ) => {
+                artifact.table.eq_ignore_ascii_case(table)
+                    && artifact.name.eq_ignore_ascii_case(name)
+                    && actual_columns.len() == columns.len()
+                    && actual_columns
+                        .iter()
+                        .zip(*columns)
+                        .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+                    && actual_table.eq_ignore_ascii_case(referenced_table)
+                    && actual_referenced_columns.len() == referenced_columns.len()
+                    && actual_referenced_columns
+                        .iter()
+                        .zip(*referenced_columns)
+                        .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+                    && actual_on_delete.eq_ignore_ascii_case(on_delete)
+            }
+            (
+                ExactMigrationConstraintContract::Check {
+                    table,
+                    name,
+                    expression,
+                },
+                MigrationConstraint::Check {
+                    expression: actual_expression,
+                },
+            ) => {
+                artifact.table.eq_ignore_ascii_case(table)
+                    && artifact.name.eq_ignore_ascii_case(name)
+                    && actual_expression.eq_ignore_ascii_case(expression)
+            }
+            _ => false,
+        })
+}
+
+fn exact_constraint_source_matches(
+    contract: &ExactMigrationArtifactContract,
+    artifacts: &[MigrationArtifact],
+) -> bool {
+    let expected = exact_contract_constraints(contract);
+    artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == MigrationArtifactKind::Constraint)
+        .all(|artifact| constraint_matches_contract(contract, artifact))
+        && expected.iter().all(|expected| {
+            artifacts.iter().any(|artifact| match expected {
+                ExactMigrationConstraintContract::ForeignKey { table, name, .. }
+                | ExactMigrationConstraintContract::Check { table, name, .. } => {
+                    artifact.kind == MigrationArtifactKind::Constraint
+                        && artifact.table.eq_ignore_ascii_case(table)
+                        && artifact.name.eq_ignore_ascii_case(name)
+                        && constraint_matches_contract(contract, artifact)
+                }
+            })
+        })
+        && artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == MigrationArtifactKind::Constraint)
+            .count()
+            == expected.len()
+}
+
 fn parse_create_table(statement: &str) -> Option<Vec<MigrationArtifact>> {
     let statement = normalized_sql_fragment(statement);
     let remainder = statement
@@ -10782,6 +12088,7 @@ fn parse_create_table(statement: &str) -> Option<Vec<MigrationArtifact>> {
         name: table.clone(),
         columns: Vec::new(),
         unique: false,
+        constraint: None,
     }];
     for item in split_top_level_items(body)? {
         let item = item.trim();
@@ -10796,6 +12103,7 @@ fn parse_create_table(statement: &str) -> Option<Vec<MigrationArtifact>> {
                 name: "PRIMARY".to_owned(),
                 columns: index_columns(item)?,
                 unique: true,
+                constraint: None,
             });
         } else if upper.starts_with("UNIQUE KEY ") || upper.starts_with("UNIQUE INDEX ") {
             let remainder = item
@@ -10808,6 +12116,7 @@ fn parse_create_table(statement: &str) -> Option<Vec<MigrationArtifact>> {
                 name: normalized_identifier(name),
                 columns: index_columns(item)?,
                 unique: true,
+                constraint: None,
             });
         } else if upper.starts_with("KEY ") || upper.starts_with("INDEX ") {
             let remainder = item
@@ -10820,6 +12129,17 @@ fn parse_create_table(statement: &str) -> Option<Vec<MigrationArtifact>> {
                 name: normalized_identifier(name),
                 columns: index_columns(item)?,
                 unique: false,
+                constraint: None,
+            });
+        } else if upper.starts_with("CONSTRAINT ") {
+            let (name, constraint) = parse_constraint(&upper)?;
+            artifacts.push(MigrationArtifact {
+                kind: MigrationArtifactKind::Constraint,
+                table: table.clone(),
+                name,
+                columns: Vec::new(),
+                unique: false,
+                constraint: Some(constraint),
             });
         } else {
             let (name, _) = first_sql_word(item)?;
@@ -10829,6 +12149,7 @@ fn parse_create_table(statement: &str) -> Option<Vec<MigrationArtifact>> {
                 name: normalized_identifier(name),
                 columns: Vec::new(),
                 unique: false,
+                constraint: None,
             });
         }
     }
@@ -10852,6 +12173,7 @@ fn parse_create_index(statement: &str) -> Option<MigrationArtifact> {
         name: normalized_identifier(name),
         columns: index_columns(remainder)?,
         unique,
+        constraint: None,
     })
 }
 
@@ -10863,6 +12185,20 @@ fn parse_alter_table(statement: &str) -> Option<Vec<MigrationArtifact>> {
     let mut artifacts = Vec::new();
     for action in split_top_level_items(actions)? {
         let action = action.trim();
+        let modify_column = action.strip_prefix("MODIFY COLUMN ");
+        if let Some(column) = modify_column {
+            let (name, _) = first_sql_word(column)?;
+            artifacts.push(MigrationArtifact {
+                kind: MigrationArtifactKind::ModifyColumn,
+                table: table.clone(),
+                name: normalized_identifier(name),
+                columns: Vec::new(),
+                unique: false,
+                constraint: None,
+            });
+            continue;
+        }
+
         let column = action
             .strip_prefix("ADD COLUMN IF NOT EXISTS ")
             .or_else(|| action.strip_prefix("ADD COLUMN "));
@@ -10874,6 +12210,7 @@ fn parse_alter_table(statement: &str) -> Option<Vec<MigrationArtifact>> {
                 name: normalized_identifier(name),
                 columns: Vec::new(),
                 unique: false,
+                constraint: None,
             });
             continue;
         }
@@ -10906,6 +12243,7 @@ fn parse_alter_table(statement: &str) -> Option<Vec<MigrationArtifact>> {
                 name: normalized_identifier(name),
                 columns: index_columns(index)?,
                 unique,
+                constraint: None,
             });
             continue;
         }
@@ -10989,7 +12327,9 @@ fn exact_contract_artifacts_match_source(
         artifacts.iter().any(|artifact| {
             matches!(
                 artifact.kind,
-                MigrationArtifactKind::CreateColumn | MigrationArtifactKind::AddColumn
+                MigrationArtifactKind::CreateColumn
+                    | MigrationArtifactKind::ModifyColumn
+                    | MigrationArtifactKind::AddColumn
             ) && artifact.table.eq_ignore_ascii_case(table)
                 && artifact.name.eq_ignore_ascii_case(column)
         })
@@ -11012,7 +12352,9 @@ fn exact_contract_artifacts_match_source(
     };
     let artifact_is_declared = |artifact: &MigrationArtifact| match artifact.kind {
         MigrationArtifactKind::Table => exact_contract_defines_table(contract, &artifact.name),
-        MigrationArtifactKind::CreateColumn | MigrationArtifactKind::AddColumn => {
+        MigrationArtifactKind::CreateColumn
+        | MigrationArtifactKind::ModifyColumn
+        | MigrationArtifactKind::AddColumn => {
             exact_contract_defines_column(contract, &artifact.table, &artifact.name)
         }
         MigrationArtifactKind::CreateIndex | MigrationArtifactKind::AddIndex => {
@@ -11025,8 +12367,10 @@ fn exact_contract_artifacts_match_source(
                 artifact.unique,
             )
         }
+        MigrationArtifactKind::Constraint => constraint_matches_contract(contract, artifact),
     };
     artifacts.iter().all(artifact_is_declared)
+        && exact_constraint_source_matches(contract, artifacts)
         && contract.tables.iter().all(|table| source_has_table(table))
         && contract
             .columns
@@ -11095,7 +12439,11 @@ fn parsed_migration_artifacts(migration: &Migration) -> Option<Vec<MigrationArti
         } else if normalized.starts_with("SET ") && normalized.contains("IF") {
             for literal in sql_string_literals(&statement)? {
                 let literal_normalized = normalized_sql_fragment(&literal);
-                if literal_normalized.starts_with("ALTER TABLE ") {
+                if literal_normalized.starts_with("CREATE TABLE ") {
+                    if let Some(parsed) = parse_create_table(&literal) {
+                        artifacts.extend(parsed);
+                    }
+                } else if literal_normalized.starts_with("ALTER TABLE ") {
                     if let Some(parsed) = parse_alter_table(&literal) {
                         artifacts.extend(parsed);
                     }
@@ -11144,7 +12492,9 @@ fn migration_defines_column(migration: &Migration, table: &str, column: &str) ->
         artifacts.iter().any(|artifact| {
             matches!(
                 artifact.kind,
-                MigrationArtifactKind::CreateColumn | MigrationArtifactKind::AddColumn
+                MigrationArtifactKind::CreateColumn
+                    | MigrationArtifactKind::ModifyColumn
+                    | MigrationArtifactKind::AddColumn
             ) && artifact.table == table
                 && artifact.name == column
         })
@@ -11230,8 +12580,10 @@ fn migration_defines_existing_column(migration: &Migration, table: &str, column:
             });
         declared
             && artifacts.iter().any(|artifact| {
-                artifact.kind == MigrationArtifactKind::AddColumn
-                    && artifact.table == table
+                matches!(
+                    artifact.kind,
+                    MigrationArtifactKind::ModifyColumn | MigrationArtifactKind::AddColumn
+                ) && artifact.table == table
                     && artifact.name == column
             })
     })
@@ -12272,7 +13624,7 @@ async fn validate_review_runtime_schema(pool: &MySqlPool) -> Result<(), Migratio
     validate_schema_columns(pool, LOCAL_SCOPE_COUNTER_COLUMNS).await?;
     validate_indexes(pool, LOCAL_SCOPE_COUNTER_INDEXES).await?;
     validate_indexes(pool, &REVIEW_SCHEMA_REPAIR_INDEXES[..1]).await?;
-    validate_schema_columns(pool, ASYNC_OPERATION_COLUMNS).await?;
+    authority_operation_width::validate_runtime_columns(pool, ASYNC_OPERATION_COLUMNS).await?;
     validate_indexes(pool, ASYNC_OPERATION_INDEXES).await?;
     let invalid: Option<(i32,)> =
         sqlx::query_as("SELECT 1 FROM user_local_credential WHERE credential_version <= 0 LIMIT 1")
@@ -12505,13 +13857,18 @@ async fn preflight_review_schema_contracts(
         )
         .await?;
     }
+    let async_operation_review_columns: Vec<SchemaColumnContract> = ASYNC_OPERATION_COLUMNS
+        .iter()
+        .copied()
+        .filter(|column| !(column.table == "async_operation_item" && column.name == "operation_id"))
+        .collect();
     for table in ASYNC_OPERATION_TABLES {
         complete &= preflight_review_table(
             pool,
             applied,
             migrations,
             table,
-            ASYNC_OPERATION_COLUMNS,
+            &async_operation_review_columns,
             ASYNC_OPERATION_INDEXES,
         )
         .await?;
@@ -12657,7 +14014,50 @@ pub async fn validate_schema_contract(pool: &MySqlPool) -> Result<(), MigrationE
         }
         MonitorSchemaState::Complete => validate_monitor_schema_contract(pool).await?,
     }
-    validate_contract(pool, REQUIRED_SCHEMA_COLUMNS).await?;
+    validate_schema_columns(pool, delivery_intent::COLUMN_CONTRACTS).await?;
+    validate_indexes(pool, delivery_intent::INDEXES).await?;
+    validate_schema_columns(pool, invalidation_delivery::COLUMN_CONTRACTS).await?;
+    validate_indexes(pool, invalidation_delivery::INDEXES).await?;
+    invalidation_delivery::validate_runtime_foreign_keys(pool).await?;
+    authority_operation_width::validate_runtime_columns(
+        pool,
+        verification_durable::COLUMN_CONTRACTS,
+    )
+    .await?;
+    validate_indexes(pool, verification_durable::INDEXES).await?;
+    authority_operation_width::validate_runtime_columns(
+        pool,
+        authority_projections::COLUMN_CONTRACTS,
+    )
+    .await?;
+    validate_indexes(pool, authority_projections::INDEXES).await?;
+    authority_operation_width::validate_runtime_columns(
+        pool,
+        authority_publication_history::COLUMN_CONTRACTS,
+    )
+    .await?;
+    validate_indexes(pool, authority_publication_history::INDEXES).await?;
+    authority_operation_width::validate_runtime_columns(
+        pool,
+        authority_source_outcome::COLUMN_CONTRACTS,
+    )
+    .await?;
+    validate_indexes(pool, authority_source_outcome::INDEXES).await?;
+    validate_schema_columns(pool, authority_source_bootstrap_use::COLUMN_CONTRACTS).await?;
+    validate_indexes(pool, authority_source_bootstrap_use::INDEXES).await?;
+    commerce_billing_cycle::validate_runtime(pool).await?;
+    validate_schema_columns(pool, source_terminal_receipt::COLUMN_CONTRACTS).await?;
+    validate_schema_columns(pool, empty_card_origin::COLUMN_CONTRACTS).await?;
+    validate_indexes(pool, empty_card_origin::INDEXES).await?;
+    authority_operation_width::validate_runtime_columns(pool, protected_mutation::COLUMN_CONTRACTS)
+        .await?;
+    validate_indexes(pool, protected_mutation::INDEXES).await?;
+    validate_schema_columns(pool, password_reset_delivery_binding::COLUMN_CONTRACTS).await?;
+    validate_indexes(pool, password_reset_delivery_binding::INDEXES).await?;
+    validate_schema_columns(pool, authority_v7::COLUMN_CONTRACTS).await?;
+    validate_indexes(pool, authority_v7::INDEXES).await?;
+    validate_schema_columns(pool, AUTHORIZATION_AUTHORITY_PROOF_COLUMN_CONTRACTS).await?;
+    validate_authorization_authority_additive_schema_contract(pool).await?;
     validate_schema_column_exact(pool, &AUDIT_QUARANTINE_REPLAY_LEASE_GENERATION_CONTRACT).await?;
     for expected in RULE_SET_PROJECTION_EVENT_KEY_COLUMN_CONTRACTS {
         validate_schema_column_exact(pool, expected).await?;
@@ -12695,6 +14095,36 @@ pub async fn validate_schema_contract(pool: &MySqlPool) -> Result<(), MigrationE
             &incremental_projection_resolved_index_contract(pool, table).await?,
         )
         .await?;
+    }
+    Ok(())
+}
+
+async fn validate_authorization_authority_additive_schema_contract(
+    pool: &MySqlPool,
+) -> Result<(), MigrationError> {
+    let recorded = recorded_successful_versions(pool).await?;
+    let additive_contracts = [
+        (
+            AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_VERSION,
+            AUTHORIZATION_AUTHORITY_ISSUANCE_COMPLETION_COLUMN_CONTRACTS,
+        ),
+        (
+            AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_VERSION,
+            AUTHORIZATION_AUTHORITY_FRONTIER_SNAPSHOT_HASH_COLUMN_CONTRACTS,
+        ),
+        (
+            AUTHORITY_MESSAGE_METADATA_VERSION,
+            AUTHORITY_MESSAGE_METADATA_COLUMN_CONTRACTS,
+        ),
+    ];
+    for (version, columns) in additive_contracts {
+        if recorded.contains(&version) {
+            validate_schema_columns(pool, columns).await.map_err(|error| {
+                MigrationError::Failed(format!(
+                    "recorded authorization authority migration {version} has incomplete additive schema: {error}"
+                ))
+            })?;
+        }
     }
     Ok(())
 }

@@ -15,8 +15,11 @@ pub use claims::{
     claim_next_owned_delta_event, claim_next_owned_delta_event_in_partition,
     claim_owned_delta_event_by_stable_event,
 };
+pub(crate) use completion::completion_in_tx;
+
 pub use completion::{
-    load_owned_delta_completion, OwnedCompletionIdentity, OwnedDeltaCompletionProof,
+    load_owned_delta_completion, reconcile_owned_delta_completion, OwnedCompletionIdentity,
+    OwnedCompletionReconciliation, OwnedDeltaCompletionProof,
 };
 pub use publication::project_owned_authorization_delta_in_tx;
 pub use schema::validate_projection_owned_schema;

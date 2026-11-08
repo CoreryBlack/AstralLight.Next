@@ -6,7 +6,7 @@
 //! status 写入在进入 repository 前按 ACTIVE/INACTIVE 白名单校验。
 //! 路径前缀：`/main/api/v1/card-templates`
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use astral_common::contract::{ApiResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
-use astral_types::AstralError;
+use astral_types::{AstralError, AuthorizationAdmission};
 
 use crate::api::require_platform_admin;
 use crate::repository::audit_log_repository::RuleSetMutationContext;
@@ -128,24 +128,32 @@ async fn list_card_templates(
 async fn create_card_template(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<CreateCardTemplateRequest>,
 ) -> Result<Json<ApiResponse<CardTemplateDto>>, AppError> {
-    require_platform_admin(&state, &headers).await?;
+    let actor_id = require_platform_admin(&state, &headers).await?;
+    let operation_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok());
+    let context = RuleSetMutationContext::user_with_admission(actor_id, operation_id, admission)?;
     let card_type = req.card_type.unwrap_or_else(|| "STANDARD".into());
     let template_scope = req.template_scope.unwrap_or_else(|| "TENANT".into());
 
     let new_id = state
         .card_template_repository
-        .create_template(&NewCardTemplate {
-            template_name: req.template_name,
-            template_code: req.template_code,
-            card_type,
-            domain_id: req.domain_id,
-            template_scope,
-            default_priority: req.default_priority,
-            default_roles_json: req.default_roles_json,
-            resource_scope_json: req.resource_scope_json,
-        })
+        .create_template(
+            &NewCardTemplate {
+                template_name: req.template_name,
+                template_code: req.template_code,
+                card_type,
+                domain_id: req.domain_id,
+                template_scope,
+                default_priority: req.default_priority,
+                default_roles_json: req.default_roles_json,
+                resource_scope_json: req.resource_scope_json,
+            },
+            &context,
+        )
         .await?;
 
     let row = state
@@ -187,6 +195,7 @@ fn operation_id_for_request(request_id: Option<&str>) -> Option<String> {
 async fn update_card_template(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateCardTemplateRequest>,
 ) -> Result<Json<ApiResponse<CardTemplateDto>>, AppError> {
@@ -213,7 +222,8 @@ async fn update_card_template(
         .get("x-request-id")
         .and_then(|value| value.to_str().ok());
     let operation_id = operation_id_for_request(request_id);
-    let context = RuleSetMutationContext::user(actor_id, operation_id.as_deref())?;
+    let context =
+        RuleSetMutationContext::user_with_admission(actor_id, operation_id.as_deref(), admission)?;
     state
         .card_template_repository
         .update_template_with_context(id, &patch, &context)
@@ -233,12 +243,17 @@ async fn update_card_template(
 async fn delete_card_template(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    require_platform_admin(&state, &headers).await?;
+    let actor_id = require_platform_admin(&state, &headers).await?;
+    let operation_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok());
+    let context = RuleSetMutationContext::user_with_admission(actor_id, operation_id, admission)?;
     let deleted = state
         .card_template_repository
-        .delete_template_if_unreferenced(id)
+        .delete_template_if_unreferenced(id, &context)
         .await?;
     if !deleted {
         return Err(AppError(AstralError::NotFound(format!(
@@ -275,21 +290,15 @@ mod tests {
             "handler must bind the gateway-verified platform admin actor"
         );
         assert!(
-            handler.contains(concat!(
-                "RuleSetMutationContext::",
-                "user(actor_id, operation_id.as_deref())"
-            )),
-            "handler must build the mutation context through the validated user constructor"
+            handler.contains("Extension(admission): Extension<AuthorizationAdmission>"),
+            "update handler must consume the policy admission"
         );
         assert!(
-            handler.contains(concat!("operation_id_", "for_request(request_id)")),
-            "handler must resolve the operation id through the request-scoped helper"
+            handler.contains("RuleSetMutationContext::user_with_admission"),
+            "update handler must bind the admission to the mutation context"
         );
         assert!(
-            handler.contains(concat!(
-                "update_template_",
-                "with_context(id, &patch, &context)"
-            )),
+            handler.contains("update_template_with_context(id, &patch, &context)"),
             "handler must call the additive with-context entry"
         );
         let legacy_call = concat!("update_template(", "id, &patch)");

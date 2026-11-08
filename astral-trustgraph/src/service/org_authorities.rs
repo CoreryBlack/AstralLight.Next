@@ -28,8 +28,12 @@
 
 use std::sync::Arc;
 
+use astral_db::SqlxAuthorizationFenceProvider;
 use astral_types::org_scope::{OrgGrantRef, OrgRequestKind, OrgRequestPayload, OrgSubject};
-use astral_types::{AstralError, PolicyContext, ResourceOwnershipScope};
+use astral_types::{
+    AstralError, AuthorizationAdmission, AuthorizationDomainScope, PolicyContext,
+    ResourceOwnershipScope,
+};
 use policy_engine::PolicyEngine;
 
 use crate::repository::audit_log_repository::validated_request_operation_id;
@@ -347,7 +351,7 @@ mod db_commands {
         OrgMembershipRevokeCommand, OrgRejectCommand, OrgRequestOutcome,
     };
     use astral_types::org_scope::{OrgGrantRef, OrgGrantSeed, OrgRequestPayload, OrgScope};
-    use astral_types::{AstralError, ValidityWindow};
+    use astral_types::{AstralError, AuthorizationAdmission, ValidityWindow};
 
     fn scope_from_seed(seed: &SeedInput) -> Result<OrgScope, AstralError> {
         Ok(OrgScope {
@@ -483,6 +487,7 @@ mod db_commands {
         expected_revision: u64,
         note: Option<String>,
         governance_proof: Option<astral_db::org_scope_repository::OrgGovernanceProof>,
+        admission: AuthorizationAdmission,
     ) -> OrgApproveCommand {
         OrgApproveCommand {
             request_id,
@@ -495,6 +500,7 @@ mod db_commands {
                 .to_owned(),
             note,
             governance_proof,
+            admission,
         }
     }
 
@@ -539,6 +545,7 @@ mod db_commands {
         receiving_tenant_id: i64,
         grant_id: &str,
         expected_revision: u64,
+        admission: AuthorizationAdmission,
     ) -> OrgGrantRevokeCommand {
         OrgGrantRevokeCommand {
             receiving_tenant_id,
@@ -548,6 +555,7 @@ mod db_commands {
             actor_user_id: actor.user_id,
             actor_tenant_id: Some(actor.tenant_id),
             reason: None,
+            admission,
         }
     }
 
@@ -557,6 +565,7 @@ mod db_commands {
         target: OrgGrantRef,
         expected_unit_generation: u64,
         reason: Option<String>,
+        admission: AuthorizationAdmission,
     ) -> OrgMaskApplyCommand {
         OrgMaskApplyCommand {
             tenant_id,
@@ -566,6 +575,7 @@ mod db_commands {
             operation_id: actor.require_operation_id().unwrap_or_default().to_owned(),
             actor_user_id: actor.user_id,
             actor_tenant_id: Some(actor.tenant_id),
+            admission,
         }
     }
 
@@ -574,6 +584,7 @@ mod db_commands {
         tenant_id: i64,
         mask_id: &str,
         expected_revision: u64,
+        admission: AuthorizationAdmission,
     ) -> OrgMaskRemoveCommand {
         OrgMaskRemoveCommand {
             tenant_id,
@@ -582,6 +593,7 @@ mod db_commands {
             operation_id: actor.require_operation_id().unwrap_or_default().to_owned(),
             actor_user_id: actor.user_id,
             actor_tenant_id: Some(actor.tenant_id),
+            admission,
         }
     }
 
@@ -589,6 +601,7 @@ mod db_commands {
         actor: &OrgActorContext,
         tenant_id: i64,
         input: &super::MembershipCreateInput,
+        admission: AuthorizationAdmission,
     ) -> OrgMembershipCreateCommand {
         OrgMembershipCreateCommand {
             tenant_id,
@@ -602,6 +615,7 @@ mod db_commands {
             operation_id: actor.require_operation_id().unwrap_or_default().to_owned(),
             actor_user_id: actor.user_id,
             actor_tenant_id: Some(actor.tenant_id),
+            admission,
         }
     }
 
@@ -610,6 +624,7 @@ mod db_commands {
         tenant_id: i64,
         membership_id: &str,
         expected_revision: u64,
+        admission: AuthorizationAdmission,
     ) -> OrgMembershipRevokeCommand {
         OrgMembershipRevokeCommand {
             tenant_id,
@@ -618,6 +633,7 @@ mod db_commands {
             operation_id: actor.require_operation_id().unwrap_or_default().to_owned(),
             actor_user_id: actor.user_id,
             actor_tenant_id: Some(actor.tenant_id),
+            admission,
         }
     }
 }
@@ -661,6 +677,8 @@ pub struct OrgAuthoritiesService {
     db: sqlx::MySqlPool,
     engine: Arc<PolicyEngine>,
     org_scope_enabled: bool,
+    authority_provider: Option<Arc<SqlxAuthorizationFenceProvider>>,
+    authority_required: bool,
     /// Frozen projector ownership boundary copied from startup configuration.
     /// It is never parsed from a request and is checked before a mutation can
     /// create or restore usable authority for a managed tenant. Safety-reducing
@@ -676,6 +694,8 @@ impl OrgAuthoritiesService {
         db: sqlx::MySqlPool,
         engine: Arc<PolicyEngine>,
         org_scope_enabled: bool,
+        authority_provider: Option<Arc<SqlxAuthorizationFenceProvider>>,
+        authority_required: bool,
         org_scope_tenant_allowlist: Vec<i64>,
     ) -> Self {
         Self {
@@ -683,6 +703,8 @@ impl OrgAuthoritiesService {
             db,
             engine,
             org_scope_enabled,
+            authority_provider,
+            authority_required,
             org_scope_tenant_allowlist,
         }
     }
@@ -738,6 +760,11 @@ impl OrgAuthoritiesService {
     // ---- 请求提交 ----
 
     /// 提交 org-scope 请求（六类 kind；requesting/root tenant 一律来自签名 ctx）。
+    ///
+    /// **workflow-only（非有效授权变更）**：本方法只落一行 PENDING 请求记录，
+    /// 不发放/收回任何 scope、边或 membership；有效授权在 approve 事务内
+    /// （必携 proof-bound admission）才产生，故提交路径不要求 admission，
+    /// 也绝不越过审批自行改变授权状态。
     pub async fn submit_request(
         &self,
         actor: &OrgActorContext,
@@ -762,6 +789,10 @@ impl OrgAuthoritiesService {
     /// - ROOT_INIT / ROOT_GRANT：`org_authority_edge:bootstrap` 元能力（PolicyEngine）
     ///   + actor 已持有每个被申请 scope 的 published 证据（上限证明）。
     ///
+    /// **proof-bound admission（必填）**：审批是把 PENDING 请求落成有效授权的
+    /// 唯一写点，必须携带本次请求 PolicyEngine 签发的 F1 admission；本层先做
+    /// actor 绑定复核（scope 必须精确等于签名 actor 的 tenant/card/user/domain），
+    /// 仓储在 commit 前同事务对牌 durable frontier/proof 行并一次性消费。
     /// 治理证明（admission operation id + 精确批准 scope 清单）随命令传入仓储复核。
     /// 结构性资格（边激活、parent grant delegable/revision/包含、环、CAS）由仓储在
     /// 事务内复验；本层结论不得替代仓储复核，仓储复核失败即整体失败。
@@ -771,8 +802,10 @@ impl OrgAuthoritiesService {
         request_id: i64,
         expected_revision: u64,
         note: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<OrgApproveOutcome, AstralError> {
         approver.require_operation_id()?;
+        require_actor_bound_admission(approver, &admission)?;
         positive_revision(expected_revision, "expectedRevision")?;
         let note = bounded_note(note)?;
         let view = self.load_pending_request(request_id).await?;
@@ -789,6 +822,7 @@ impl OrgAuthoritiesService {
                 expected_revision,
                 note,
                 governance_proof,
+                admission,
             ))
             .await
     }
@@ -799,6 +833,10 @@ impl OrgAuthoritiesService {
     /// 平台用户都能驳回根请求（拒绝服务面）。随命令传入仓储的治理证明由 DB
     /// 复核结构并 durable 落审计；驳回不发放 scope，故不做审批那样的逐 scope
     /// 上限评估，但证明能力清单精确绑定请求自身待发 scope。
+    ///
+    /// **workflow-only（非有效授权变更）**：驳回只把 PENDING 请求置为 REJECTED，
+    /// 不产生/收回任何有效授权或资格，因此不要求 proof-bound admission；
+    /// ROOT_* 的治理证明仍按上述同界合同强制。
     pub async fn reject_request(
         &self,
         decider: &OrgActorContext,
@@ -832,6 +870,10 @@ impl OrgAuthoritiesService {
     }
 
     /// 请求人撤销自己的 PENDING 请求。
+    ///
+    /// **workflow-only（非有效授权变更）**：撤销只关闭请求方自己的 PENDING
+    /// 请求行（tenant 归属校验 + revision CAS），不产生/收回任何有效授权，
+    /// 因此不要求 proof-bound admission。
     pub async fn cancel_request(
         &self,
         actor: &OrgActorContext,
@@ -903,14 +945,20 @@ impl OrgAuthoritiesService {
 
     /// 撤销本单元 grant（receiving 侧本地收窄；generation 立即推进，旧发布证据
     /// 因源失效不可准入；origin 侧生命周期由仓储治理）。
+    ///
+    /// **proof-bound admission（必填）**：本方法改变有效授权面（grant 失效），
+    /// 必须携带本次请求的 F1 admission 并通过 actor 绑定复核；仓储在 commit 前
+    /// 同事务对牌并一次性消费。
     pub async fn revoke_grant(
         &self,
         actor: &OrgActorContext,
         tenant_id: i64,
         grant_id: &str,
         expected_revision: u64,
+        admission: AuthorizationAdmission,
     ) -> Result<OrgMutationOutcome, AstralError> {
         actor.require_operation_id()?;
+        require_actor_bound_admission(actor, &admission)?;
         assert_local_scope(tenant_id, actor)?;
         positive_revision(expected_revision, "expectedRevision")?;
         // grant 主键是 DB 生成的规范 UUID 文本；非规范表示不得作为同一 durable
@@ -923,19 +971,25 @@ impl OrgAuthoritiesService {
                 tenant_id,
                 grant_id,
                 expected_revision,
+                admission,
             ))
             .await
     }
 
     /// 本级精确来源剪裁（target 必须指向祖先贡献，exact identity/revision；
     /// 本单元自己的 grant 撤销走 grant ledger，不适用 mask）。
+    ///
+    /// **proof-bound admission（必填）**：改变有效授权面（贡献剪裁生效），
+    /// 语义同 [`Self::revoke_grant`]。
     pub async fn apply_mask(
         &self,
         actor: &OrgActorContext,
         tenant_id: i64,
         input: MaskApplyInput,
+        admission: AuthorizationAdmission,
     ) -> Result<OrgMutationOutcome, AstralError> {
         actor.require_operation_id()?;
+        require_actor_bound_admission(actor, &admission)?;
         assert_local_scope(tenant_id, actor)?;
         positive_body_id(input.target_tenant_id, "targetTenantId")?;
         if input.target_tenant_id == tenant_id {
@@ -960,18 +1014,25 @@ impl OrgAuthoritiesService {
                 target,
                 input.expected_unit_generation,
                 reason,
+                admission,
             ))
             .await
     }
 
+    /// 撤除剪裁（expanding：恢复被剪裁贡献的生效面）。
+    ///
+    /// **proof-bound admission（必填）**：本方法扩大有效授权面，语义同
+    /// [`Self::revoke_grant`]。
     pub async fn remove_mask(
         &self,
         actor: &OrgActorContext,
         tenant_id: i64,
         mask_id: &str,
         expected_revision: u64,
+        admission: AuthorizationAdmission,
     ) -> Result<OrgMutationOutcome, AstralError> {
         actor.require_operation_id()?;
+        require_actor_bound_admission(actor, &admission)?;
         assert_local_scope(tenant_id, actor)?;
         self.require_projector_coverage(tenant_id)?;
         validate_stable_uuid(mask_id, "maskId")?;
@@ -982,6 +1043,7 @@ impl OrgAuthoritiesService {
                 tenant_id,
                 mask_id,
                 expected_revision,
+                admission,
             ))
             .await
     }
@@ -989,13 +1051,18 @@ impl OrgAuthoritiesService {
     // ---- 成员资格 ----
 
     /// 登记成员（本单元；双卡存在性与 tenant 匹配由仓储复核）。
+    ///
+    /// **proof-bound admission（必填）**：membership 变更进入 org admission
+    /// 编译输入（影响有效授权/资格推导），语义同 [`Self::revoke_grant`]。
     pub async fn create_membership(
         &self,
         actor: &OrgActorContext,
         tenant_id: i64,
         input: MembershipCreateInput,
+        admission: AuthorizationAdmission,
     ) -> Result<OrgMutationOutcome, AstralError> {
         actor.require_operation_id()?;
+        require_actor_bound_admission(actor, &admission)?;
         assert_local_scope(tenant_id, actor)?;
         self.require_projector_coverage(tenant_id)?;
         positive_body_id(input.user_id, "user_id")?;
@@ -1003,19 +1070,25 @@ impl OrgAuthoritiesService {
         positive_body_id(input.card_id, "cardId")?;
         validate_window(input.not_before, input.expires_at)?;
         self.repo
-            .create_membership(&db_commands::create_membership(actor, tenant_id, &input))
+            .create_membership(&db_commands::create_membership(
+                actor, tenant_id, &input, admission,
+            ))
             .await
     }
 
     /// 撤销成员资格（本单元；调岗 = 先 revoke 再由新单元管理员 create）。
+    ///
+    /// **proof-bound admission（必填）**：语义同 [`Self::create_membership`]。
     pub async fn revoke_membership(
         &self,
         actor: &OrgActorContext,
         tenant_id: i64,
         membership_id: &str,
         expected_revision: u64,
+        admission: AuthorizationAdmission,
     ) -> Result<OrgMutationOutcome, AstralError> {
         actor.require_operation_id()?;
+        require_actor_bound_admission(actor, &admission)?;
         assert_local_scope(tenant_id, actor)?;
         validate_stable_uuid(membership_id, "membershipId")?;
         positive_revision(expected_revision, "expectedRevision")?;
@@ -1025,6 +1098,7 @@ impl OrgAuthoritiesService {
                 tenant_id,
                 membership_id,
                 expected_revision,
+                admission,
             ))
             .await
     }
@@ -1201,7 +1275,10 @@ impl OrgAuthoritiesService {
             .action(action.to_owned())
             .build();
         let repo = CachedPublishedEvidenceRuleRepository::new(
-            SqlxRuleRepository::new(self.db.clone()).with_org_scope_enabled(self.org_scope_enabled),
+            SqlxRuleRepository::new(self.db.clone())
+                .with_org_scope_enabled(self.org_scope_enabled)
+                .with_authority_provider_opt(self.authority_provider.clone())
+                .with_authority_required(self.authority_required),
             self.db.clone(),
         );
         let decision = self.engine.evaluate(&ctx, &repo).await;
@@ -1242,6 +1319,35 @@ fn assert_local_scope(tenant_id: i64, actor: &OrgActorContext) -> Result<(), Ast
             "org scope operation on tenant {tenant_id} is restricted to the signed caller tenant {}",
             actor.tenant_id
         )));
+    }
+    Ok(())
+}
+
+/// Proof-bound admission 的 actor 绑定复核（纵深防御）。
+///
+/// 中间件只在本次请求的 `PolicyEngine.evaluate()` 产生 certified F1 ALLOW 时
+/// 注入 admission（缺失即 handler extension 失败，fail-closed），此处再把
+/// admission scope 与签名 actor context 精确对牌（tenant/card/user/domain
+/// 逐项相等，domain 仅接受 `Exact`）——确保被消费的能力确实证明的是**本
+/// actor** 的授权读取，而不是同请求内其他 scope 的能力。真正的 durable
+/// frontier/proof 对牌与一次性消费由 DB 仓储在 commit 前同事务完成。
+fn require_actor_bound_admission(
+    actor: &OrgActorContext,
+    admission: &AuthorizationAdmission,
+) -> Result<(), AstralError> {
+    let scope = &admission.proof().scope;
+    let domain_matches = matches!(
+        scope.domain,
+        AuthorizationDomainScope::Exact(value) if value == actor.domain_id
+    );
+    if scope.tenant_id != actor.tenant_id
+        || scope.card_id != actor.card_id
+        || scope.user_id != Some(actor.user_id)
+        || !domain_matches
+    {
+        return Err(AstralError::Permission(
+            "org governance mutation requires an authorization admission bound to the signed actor card".into(),
+        ));
     }
     Ok(())
 }
@@ -1541,6 +1647,109 @@ mod tests {
         assert!(validate_stable_uuid("{0f0e0d0c-0b0a-0908-0706-050403020100}", "grantId").is_err());
         assert!(validate_stable_uuid("00000000-0000-0000-0000-000000000000", "grantId").is_err());
         assert!(validate_stable_uuid("not-a-uuid", "grantId").is_err());
+    }
+
+    // ===== proof-bound admission：actor 绑定复核（纯函数，不触 DB） =====
+
+    /// 结构合法的 fixture proof（`from_verified_proof` 只做结构校验，签名
+    /// 对牌与 durable frontier/proof 对牌分别由 F1 读取与 DB commit 门承担）。
+    fn admission_for(
+        tenant_id: i64,
+        card_id: i64,
+        user_id: i64,
+        domain_id: i64,
+    ) -> AuthorizationAdmission {
+        let proof = astral_types::AuthorizationFenceProof {
+            authorization_edition: astral_types::AUTHORIZATION_EDITION,
+            authority_id: "authority-test".to_owned(),
+            authority_term: 1,
+            global_fence_sequence: 1,
+            scope: astral_types::AuthorizationAuthorityScope {
+                tenant_id,
+                card_id,
+                user_id: Some(user_id),
+                domain: astral_types::AuthorizationDomainScope::Exact(domain_id),
+            },
+            scope_generation: 2,
+            revoke_watermark: 1,
+            snapshot_hash: "ab".repeat(32),
+            parent_hash: None,
+            operation_id: "op-mt-0001".to_owned(),
+            event_id: "event-test".to_owned(),
+            key_id: "key-test".to_owned(),
+            key_epoch: 1,
+            issued_at: 100,
+            not_before: 99,
+            expires_at: 110,
+            request_nonce: "nonce-test".to_owned(),
+            request_binding_digest: None,
+            scope_certificate_hash: None,
+            proof_id: "proof-test".to_owned(),
+            signature: "00".repeat(64),
+        };
+        AuthorizationAdmission::from_verified_proof(proof).expect("structural fixture proof")
+    }
+
+    #[test]
+    fn admission_must_be_bound_to_the_signed_actor_scope() {
+        let actor = actor(20);
+        let bound = admission_for(20, actor.card_id, actor.user_id, actor.domain_id);
+        require_actor_bound_admission(&actor, &bound).expect("exact actor binding must pass");
+
+        for (tenant_id, card_id, user_id, domain_id) in [
+            (21, actor.card_id, actor.user_id, actor.domain_id), // 他租户 proof
+            (20, 999, actor.user_id, actor.domain_id),           // 他卡 proof
+            (20, actor.card_id, 999, actor.domain_id),           // 他用户 proof
+            (20, actor.card_id, actor.user_id, 9),               // 他 domain proof
+        ] {
+            let mismatched = admission_for(tenant_id, card_id, user_id, domain_id);
+            let error = require_actor_bound_admission(&actor, &mismatched).unwrap_err();
+            assert!(
+                matches!(error, AstralError::Permission(_)),
+                "scope {tenant_id}/{card_id}/{user_id}/{domain_id} must not bind to actor"
+            );
+        }
+    }
+
+    /// 非 Exact domain（ANY/NO_DOMAIN）的 admission 一律拒绝：org 治理 actor
+    /// 的签名 ctx 必有正 domain，middleware 签发的 proof scope 应为 Exact。
+    #[test]
+    fn admission_with_unpinned_domain_is_rejected() {
+        let actor = actor(20);
+        let mut proof_scope = astral_types::AuthorizationAuthorityScope {
+            tenant_id: 20,
+            card_id: actor.card_id,
+            user_id: Some(actor.user_id),
+            domain: astral_types::AuthorizationDomainScope::Exact(actor.domain_id),
+        };
+        proof_scope.domain = astral_types::AuthorizationDomainScope::Any;
+        let proof = astral_types::AuthorizationFenceProof {
+            authorization_edition: astral_types::AUTHORIZATION_EDITION,
+            authority_id: "authority-test".to_owned(),
+            authority_term: 1,
+            global_fence_sequence: 1,
+            scope: proof_scope,
+            scope_generation: 2,
+            revoke_watermark: 1,
+            snapshot_hash: "ab".repeat(32),
+            parent_hash: None,
+            operation_id: "op-mt-0001".to_owned(),
+            event_id: "event-test".to_owned(),
+            key_id: "key-test".to_owned(),
+            key_epoch: 1,
+            issued_at: 100,
+            not_before: 99,
+            expires_at: 110,
+            request_nonce: "nonce-any".to_owned(),
+            request_binding_digest: None,
+            scope_certificate_hash: None,
+            proof_id: "proof-any".to_owned(),
+            signature: "00".repeat(64),
+        };
+        let admission =
+            AuthorizationAdmission::from_verified_proof(proof).expect("structural fixture proof");
+        let error = require_actor_bound_admission(&actor, &admission).unwrap_err();
+        assert!(matches!(error, AstralError::Permission(_)));
     }
 
     // ===== 提交输入验证（纯函数，不触 DB） =====

@@ -8,7 +8,10 @@ use sqlx::{MySqlPool, QueryBuilder};
 
 use astral_types::AstralError;
 
-#[derive(Debug, Clone)]
+mod mutations;
+pub use mutations::{MonitorMutation, MonitorMutationResult};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NotificationChannelRecord {
     pub id: i64,
     pub name: String,
@@ -17,7 +20,7 @@ pub struct NotificationChannelRecord {
     pub enabled: i8,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AlertRuleRecord {
     pub id: i64,
     pub name: String,
@@ -68,7 +71,7 @@ pub struct AlertRuleQuery {
     pub enabled: Option<i8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AlertRuleUpdate {
     pub id: i64,
     pub name: String,
@@ -109,6 +112,15 @@ pub struct MetricHistoryQuery {
 
 #[async_trait]
 pub trait MonitorRepository: Send + Sync {
+    async fn protected_mutation(
+        &self,
+        _context: &astral_db::ProtectedMutationContext,
+        _mutation: MonitorMutation,
+    ) -> Result<MonitorMutationResult, AstralError> {
+        Err(AstralError::Permission(
+            "verified Monitor mutation is unavailable".into(),
+        ))
+    }
     async fn list_alert_rules(
         &self,
         query: AlertRuleQuery,
@@ -229,6 +241,13 @@ impl SqlxMonitorRepository {
 
 #[async_trait]
 impl MonitorRepository for SqlxMonitorRepository {
+    async fn protected_mutation(
+        &self,
+        context: &astral_db::ProtectedMutationContext,
+        mutation: MonitorMutation,
+    ) -> Result<MonitorMutationResult, AstralError> {
+        mutations::execute(&self.db, context, mutation).await
+    }
     async fn list_alert_rules(
         &self,
         query: AlertRuleQuery,

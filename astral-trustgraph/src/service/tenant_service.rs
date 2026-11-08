@@ -128,30 +128,58 @@ impl TenantService {
         Ok(CreateTenantOutcome { tenant_id })
     }
 
-    /// 创建邀请：token 生成 + 7 天过期 + role 校验
+    /// 创建邀请：token 生成 + 7 天过期 + role 校验。遗留无 context 入口一律
+    /// fail-closed：邀请创建是用户面治理 mutation，必须携带 proof-bound
+    /// admission。
     pub async fn create_invitation(
         &self,
         tenant_id: i64,
         role: &str,
     ) -> Result<crate::repository::tenant_repository::TenantInvitationRecord, AstralError> {
-        let role_upper = role.to_uppercase();
-        if !["ADMIN", "MEMBER", "GUEST"].contains(&role_upper.as_str()) {
-            return Err(AstralError::Validation(
-                "role must be ADMIN, MEMBER, or GUEST".into(),
-            ));
-        }
+        let _ = (tenant_id, role);
+        Err(AstralError::Auth(
+            "tenant invitation creation requires Gateway-verified mutation context".into(),
+        ))
+    }
+
+    /// 创建邀请的 proof-bound 入口：inviter 由 context 锁定 actor 卡片派生，
+    /// token/到期仍由服务层生成；权威范围与 admission 绑定在 repository
+    /// 源事务内复核。
+    pub async fn create_invitation_with_context(
+        &self,
+        tenant_id: i64,
+        role: &str,
+        context: &TenantMutationContext,
+    ) -> Result<crate::repository::tenant_repository::TenantInvitationRecord, AstralError> {
+        let role_upper = validate_invitation_role(role)?;
         let token = generate_invite_token();
         let expires_secs = now_secs() + 7 * 24 * 3600; // 7 天过期
         self.repo
-            .create_invitation(tenant_id, &token, &role_upper, 1, expires_secs)
+            .create_invitation_with_context(tenant_id, &token, &role_upper, expires_secs, context)
             .await
     }
 
-    /// 使用邀请码：校验 + 过期标记 + 事务接受
+    /// 使用邀请码：校验 + 过期标记 + 事务接受。遗留无 context 入口一律
+    /// fail-closed：入会是影响租户成员关系的治理 mutation，必须携带
+    /// proof-bound admission。
     pub async fn use_invitation_code(
         &self,
         code: &str,
         user_id: i64,
+    ) -> Result<UseInvitationOutcome, AstralError> {
+        let _ = (code, user_id);
+        Err(AstralError::Auth(
+            "invitation accept requires Gateway-verified mutation context".into(),
+        ))
+    }
+
+    /// 使用邀请码的 proof-bound 入口：入会成员即 context 锁定 actor。过期与
+    /// 失效的权威判定在 repository 接受事务的锁定邀请行上复核（过期分支在
+    /// 同一事务内置 EXPIRED 后 fail-closed），服务层不做无 context 的裸写。
+    pub async fn use_invitation_code_with_context(
+        &self,
+        code: &str,
+        context: &TenantMutationContext,
     ) -> Result<UseInvitationOutcome, AstralError> {
         let inv = self
             .repo
@@ -159,21 +187,12 @@ impl TenantService {
             .await?
             .ok_or_else(|| AstralError::Validation("invalid or expired invitation".into()))?;
 
-        // 检查过期
-        if let Some(expires) = inv.expires_at {
-            if now_secs() > expires {
-                self.repo.mark_invitation_expired(inv.id).await?;
-                return Err(AstralError::Validation("invitation expired".into()));
-            }
-        }
-
         self.repo
-            .accept_invitation(inv.id, inv.tenant_id, user_id, &inv.role)
+            .accept_invitation_with_context(inv.id, inv.tenant_id, &inv.role, context)
             .await?;
         tracing::info!(
             tenant_id = inv.tenant_id,
-            user_id,
-            "invitation used, member added"
+            "invitation accepted, member added"
         );
         Ok(UseInvitationOutcome {
             tenant_id: inv.tenant_id,
@@ -183,9 +202,21 @@ impl TenantService {
     /// 购买套餐：billing_cycle 校验 + 到期推算
     pub async fn purchase_package(
         &self,
+        _tenant_id: i64,
+        _plan_id: i64,
+        _billing_cycle: Option<&str>,
+    ) -> Result<PurchaseOutcome, AstralError> {
+        Err(AstralError::Permission(
+            "purchase requires verified mutation context".into(),
+        ))
+    }
+
+    pub async fn purchase_package_with_context(
+        &self,
         tenant_id: i64,
         plan_id: i64,
         billing_cycle: Option<&str>,
+        context: &astral_db::ProtectedMutationContext,
     ) -> Result<PurchaseOutcome, AstralError> {
         let billing_cycle = billing_cycle.unwrap_or("MONTHLY");
         let valid_cycles = ["MONTHLY", "QUARTERLY", "YEARLY", "ONETIME"];
@@ -198,15 +229,32 @@ impl TenantService {
         let expired_secs = compute_expiry_for_cycle(billing_cycle, now_secs());
         let purchase_id = self
             .repo
-            .create_purchase(&NewPurchase {
-                tenant_id,
-                plan_id,
-                expired_secs,
-            })
+            .create_purchase_with_context(
+                &NewPurchase {
+                    tenant_id,
+                    plan_id,
+                    expired_secs,
+                },
+                billing_cycle,
+                context,
+            )
             .await?;
         tracing::info!(tenant_id, plan_id, "purchase created");
         Ok(PurchaseOutcome { purchase_id })
     }
+}
+
+/// 邀请角色校验（纯函数，便于单元测试）：大写规范化后必须属于
+/// ADMIN/MEMBER/GUEST。这是输入白名单，不是授权证明；授权由 admission
+/// proof 承担。OWNER 不经邀请发放，只能走既有 owner 语义。
+fn validate_invitation_role(role: &str) -> Result<String, AstralError> {
+    let role_upper = role.to_uppercase();
+    if !["ADMIN", "MEMBER", "GUEST"].contains(&role_upper.as_str()) {
+        return Err(AstralError::Validation(
+            "role must be ADMIN, MEMBER, or GUEST".into(),
+        ));
+    }
+    Ok(role_upper)
 }
 
 /// 邀请 token 生成（密码学随机，防枚举预测）。
@@ -278,5 +326,31 @@ mod tests {
         assert!(parts[1].chars().all(|c| c.is_ascii_hexdigit()));
         assert!(parts[2].chars().all(|c| c.is_ascii_hexdigit()));
         assert!(parts[1].len() >= 8 && parts[2].len() >= 8);
+        // 生成的 token 必须通过 repository 侧的输入复核（非空、规范、有界）。
+        assert!(token.len() <= 64);
+    }
+
+    #[test]
+    fn invitation_role_whitelist_is_exact_and_case_normalized() {
+        for role in ["ADMIN", "MEMBER", "GUEST", "member", "Guest", "admin"] {
+            let normalized =
+                validate_invitation_role(role).expect("alphabet roles must normalize to uppercase");
+            assert_eq!(normalized, normalized.to_uppercase());
+        }
+        assert_eq!(validate_invitation_role("member").unwrap(), "MEMBER");
+        for role in [
+            "OWNER",
+            "TENANT_OWNER",
+            "",
+            "ADMIN ",
+            " ADMIN",
+            "ADMIN; DROP",
+            "guest\n",
+        ] {
+            assert!(
+                validate_invitation_role(role).is_err(),
+                "non-alphabet role must be rejected: {role:?}"
+            );
+        }
     }
 }

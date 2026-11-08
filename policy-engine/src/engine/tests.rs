@@ -18,6 +18,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+mod org_authority;
+
 // ===== CURRENT V6 strict published-evidence evaluator =====
 
 /// strict gate 上下文：PLATFORM 域完整身份（tenant/domain 与 fixture 对齐）。
@@ -2030,6 +2032,132 @@ async fn test_org_gate_ready_evidence_allows_via_public_entry() {
         "Ready requires initial + final ORG reads"
     );
     assert_eq!(repo.published_reads(), 0);
+}
+
+/// Node-level readiness 可控的 ORG_SCOPE 仓库：委托 `OrgGateSwitchRepo` 夹具，
+/// 仅覆写 `positive_authorization_ready`，用于证明节点 authority reconciliation
+/// 未就绪时 Ready 证据不能产生 ALLOW（与 published-evidence ALLOW 门禁同契约）。
+struct OrgGateReadinessRepo {
+    inner: OrgGateSwitchRepo,
+    node_ready: bool,
+}
+
+#[async_trait::async_trait]
+impl RuleRepository for OrgGateReadinessRepo {
+    async fn check_card_active(&self, ctx: &PolicyContext) -> Result<bool, PolicyError> {
+        self.inner.check_card_active(ctx).await
+    }
+
+    async fn is_active_global_admin(&self, user_id: i64) -> Result<bool, PolicyError> {
+        self.inner.is_active_global_admin(user_id).await
+    }
+
+    async fn load_published_card_authorization(
+        &self,
+        scope: &PublishedCardEvidenceScope,
+    ) -> Result<Option<std::sync::Arc<PublishedCardAuthorization>>, PolicyError> {
+        self.inner.load_published_card_authorization(scope).await
+    }
+
+    async fn load_org_authorization(
+        &self,
+        ctx: &PolicyContext,
+    ) -> Result<OrgAuthorityRead, PolicyError> {
+        self.inner.load_org_authorization(ctx).await
+    }
+
+    fn positive_authorization_ready(&self) -> bool {
+        self.node_ready
+    }
+}
+
+#[tokio::test]
+async fn test_org_gate_ready_positive_authorization_not_serving_fails_closed() {
+    // 节点级 authority reconciliation 未就绪（positive_authorization_ready=false）
+    // 时，完全匹配的 Ready ORG 证据也绝不能产生 ALLOW：与 published evidence
+    // 一致地 fail-closed 为 AUTHORIZATION_PENDING，并按依赖失败累计断路器；
+    // 既有 ALLOW 前复读（初始 + 终局 ORG 读取）仍执行。节点就绪（true）时
+    // 保留既有决策。
+    let engine = PolicyEngine::new();
+    let not_serving = OrgGateReadinessRepo {
+        inner: OrgGateSwitchRepo::new(OrgAuthorityRead::Ready(Box::new(
+            org_gate_admission_evidence(),
+        ))),
+        node_ready: false,
+    };
+    let decision = engine.evaluate(&org_gate_ctx(), &not_serving).await;
+    assert!(
+        !decision.allowed,
+        "not-serving node must never return ALLOW: {decision:?}"
+    );
+    assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
+    assert!(decision.org_provenance.is_none());
+    let last = org_gate_last_step(&decision);
+    assert_eq!(last.phase, "ORG_AUTHORITY");
+    assert_eq!(last.result, Effect::Deny);
+    assert_eq!(last.detail, "authority fence reconciliation is not serving");
+    let phases: Vec<&str> = decision
+        .evaluation_path
+        .iter()
+        .map(|s| s.phase.as_str())
+        .collect();
+    assert_eq!(
+        phases,
+        vec!["AUTHN", "CARD_CONTEXT", "ORG_AUTHORITY", "ORG_AUTHORITY"],
+        "not-serving must keep the ORG reread steps and append the readiness denial"
+    );
+    assert_eq!(
+        not_serving.inner.org_reads(),
+        2,
+        "existing ALLOW-time ORG evidence reread is preserved"
+    );
+    assert_eq!(
+        not_serving.inner.published_reads(),
+        0,
+        "not-serving Ready branch must not touch card evidence"
+    );
+
+    // 依赖失败记账：阈值-1 次既有失败 + 本次 not-serving 拦截 → __global__
+    // 断路器打开（若被记为成功或漏记，计数会被清零/不足，断路器保持 Closed）。
+    let engine = PolicyEngine::new();
+    seed_breaker_failures_below_threshold(&engine).await;
+    let failing_repo = OrgGateReadinessRepo {
+        inner: OrgGateSwitchRepo::new(OrgAuthorityRead::Ready(Box::new(
+            org_gate_admission_evidence(),
+        ))),
+        node_ready: false,
+    };
+    engine.evaluate(&org_gate_ctx(), &failing_repo).await;
+    assert_eq!(
+        engine.circuit_breaker_state(),
+        CircuitBreakerState::Open,
+        "not-serving ALLOW interception must be recorded as a dependency failure"
+    );
+    let stats = engine.get_stats();
+    assert_eq!(
+        stats.evaluation_count,
+        crate::circuit_breaker::CB_THRESHOLD as u64
+    );
+    assert_eq!(stats.allow_count, 0);
+
+    // 节点就绪（true，同一仓库类型仅 readiness 不同）：保留既有 ALLOW 决策。
+    let serving_engine = PolicyEngine::new();
+    let serving = OrgGateReadinessRepo {
+        inner: OrgGateSwitchRepo::new(OrgAuthorityRead::Ready(Box::new(
+            org_gate_admission_evidence(),
+        ))),
+        node_ready: true,
+    };
+    let allowed = serving_engine.evaluate(&org_gate_ctx(), &serving).await;
+    assert!(
+        allowed.allowed,
+        "serving node must preserve the existing ALLOW: {allowed:?}"
+    );
+    assert_eq!(allowed.reason, "ORG_PUBLISHED_EVIDENCE_ALLOW");
+    assert!(allowed.org_provenance.is_some());
+    let serving_last = org_gate_last_step(&allowed);
+    assert_eq!(serving_last.result, Effect::Allow);
+    assert_eq!(serving_last.source.as_deref(), Some("ORG_SHARED"));
 }
 
 // ===== ORG_SCOPE 门禁记账（stats/断路器，进程内 stub，不触碰数据库） =====

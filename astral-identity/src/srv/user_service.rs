@@ -2,6 +2,11 @@
 //!
 //! 写操作按 Java 契约：`setPassword`/禁用/删除 在同一编排内撤销该用户
 //! 全部会话（先撤会话后写库，保持 fail-closed）。
+//!
+//! status-bearing 更新（`update_user` 携带 status）影响有效资格：先要求并
+//! 验证 proof-bound `AuthorizationAdmission`（缺失 → PENDING，零 session
+//! revoke 副作用），通过后保持 先撤会话 → repository 资格/状态 mutation 的
+//! 顺序；纯 profile metadata 更新不要求 admission（非资格语义）。
 
 use std::sync::Arc;
 
@@ -9,7 +14,7 @@ use serde::Deserialize;
 
 use astral_common::contract::PageResponse;
 use astral_common::error::AppError;
-use astral_types::{AstralError, UserCard};
+use astral_types::{AstralError, AuthorizationAdmission, UserCard};
 
 use crate::auth::hash_password;
 use crate::srv::auth_repository::AuthRepository;
@@ -171,13 +176,38 @@ impl UserService {
         user_id: i64,
         req: &UpdateUserRequest,
         request_operation_id: Option<&str>,
+        admission: Option<AuthorizationAdmission>,
     ) -> Result<(), AppError> {
+        // 状态变更（status-bearing）影响有效资格：在产生任何 durable 副作用
+        // （session revoke）之前，先要求并验证 proof-bound admission。缺失或
+        // proof 契约非法时 fail-closed 返回 PENDING，绝不先撤销会话（durable
+        // 的 caller-card/frontier 复核与一次性消费仍在 repository source
+        // 事务内执行，见 `user_repository::update_user` 状态分支）。
+        // 纯 profile metadata 更新（status=None）保持明确非资格语义：不要求
+        // admission，不撤销会话。
+        let status_bearing = req.status.is_some();
+        let admission = if status_bearing {
+            let admission = admission.ok_or_else(|| {
+                AppError(AstralError::Pending(
+                    "status-bearing user update requires proof-bound authorization admission"
+                        .into(),
+                ))
+            })?;
+            admission
+                .proof()
+                .validate()
+                .map_err(|error| AppError(AstralError::Pending(error.to_string())))?;
+            Some(admission)
+        } else {
+            admission
+        };
         // 对齐 Java `PlatformUserLifecycleServiceImpl.update()`：状态变更为非 ACTIVE
         // （DISABLED 等）时先撤销全部会话，保持 fail-closed 顺序（与 update_user_status 一致）。
-        if req
-            .status
-            .as_deref()
-            .is_some_and(|status| status.to_uppercase() != "ACTIVE")
+        if status_bearing
+            && req
+                .status
+                .as_deref()
+                .is_some_and(|status| status.to_uppercase() != "ACTIVE")
         {
             revoke_all_sessions_for_user(state, user_id, "USER_DISABLED", request_operation_id)
                 .await
@@ -190,6 +220,7 @@ impl UserService {
                 req.email.as_deref(),
                 req.phone.as_deref(),
                 req.status.as_deref(),
+                admission,
             )
             .await?;
         tracing::info!(user_id, "user updated");
@@ -202,14 +233,25 @@ impl UserService {
         user_id: i64,
         req: &UpdateStatusRequest,
         request_operation_id: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AppError> {
+        // Validate the carried proof before the session revoke side effect. The
+        // repository repeats durable frontier/scope validation inside its source
+        // transaction; this early structural gate prevents malformed admissions
+        // from revoking sessions before that transaction can reject them.
+        admission
+            .proof()
+            .validate()
+            .map_err(|error| AppError(AstralError::Pending(error.to_string())))?;
         // Java `PlatformUserLifecycleService` 在禁用账号时撤销全部会话。
         if req.status != "ACTIVE" {
             revoke_all_sessions_for_user(state, user_id, "USER_DISABLED", request_operation_id)
                 .await
                 .map_err(AppError)?;
         }
-        self.users.update_user_status(user_id, &req.status).await?;
+        self.users
+            .update_user_status(user_id, &req.status, admission)
+            .await?;
         tracing::info!(user_id, status = %req.status, "user status updated");
         Ok(())
     }
@@ -219,12 +261,19 @@ impl UserService {
         state: &AppState,
         user_id: i64,
         request_operation_id: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AppError> {
+        // Keep the same pre-side-effect guard as status updates. Durable
+        // authority revalidation remains owned by the source repository.
+        admission
+            .proof()
+            .validate()
+            .map_err(|error| AppError(AstralError::Pending(error.to_string())))?;
         // Java `PlatformUserLifecycleService.delete` 在软删前撤销全部会话。
         revoke_all_sessions_for_user(state, user_id, "USER_DELETED", request_operation_id)
             .await
             .map_err(AppError)?;
-        self.users.soft_delete_user(user_id).await?;
+        self.users.soft_delete_user(user_id, admission).await?;
         tracing::warn!(user_id, "user deleted (soft)");
         Ok(())
     }
@@ -244,6 +293,7 @@ impl UserService {
         &self,
         user_id: i64,
         req: &SetPasswordRequest,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AppError> {
         if req.password.len() < 8 {
             return Err(AppError(AstralError::Validation(
@@ -256,7 +306,13 @@ impl UserService {
         // durable revocation outbox commit together before local deny acceleration.
         let revoked_jtis = self
             .auth
-            .update_password_hash_with_revocation(user_id, &password_hash, "PASSWORD_CHANGED", None)
+            .update_password_hash_with_revocation(
+                user_id,
+                &password_hash,
+                "PASSWORD_CHANGED",
+                None,
+                Some(admission),
+            )
             .await
             .map_err(AppError)?;
         crate::srv::session::project_password_revocation(&revoked_jtis)
@@ -277,10 +333,13 @@ mod tests {
     };
     use crate::srv::auth_service::AuthService;
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FakeUserRepository {
         count: i64,
         users: Vec<crate::srv::user_repository::UserListRecord>,
+        /// 记录 repository mutation 次数：断言 guard 拒绝路径零 mutation。
+        update_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -315,7 +374,9 @@ mod tests {
             _email: Option<&str>,
             _phone: Option<&str>,
             _status: Option<&str>,
+            _admission: Option<AuthorizationAdmission>,
         ) -> Result<(), AstralError> {
+            self.update_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -323,11 +384,16 @@ mod tests {
             &self,
             _user_id: i64,
             _status: &str,
+            _admission: AuthorizationAdmission,
         ) -> Result<(), AstralError> {
             Ok(())
         }
 
-        async fn soft_delete_user(&self, _user_id: i64) -> Result<(), AstralError> {
+        async fn soft_delete_user(
+            &self,
+            _user_id: i64,
+            _admission: AuthorizationAdmission,
+        ) -> Result<(), AstralError> {
             Ok(())
         }
 
@@ -380,6 +446,7 @@ mod tests {
             _new_hash: &str,
             _reason: &str,
             _reset_token: Option<i64>,
+            _admission: Option<AuthorizationAdmission>,
         ) -> Result<Vec<String>, AstralError> {
             Ok(vec![])
         }
@@ -390,6 +457,7 @@ mod tests {
             _expected_hash: &str,
             _expected_version: i64,
             _new_hash: &str,
+            _admission: AuthorizationAdmission,
         ) -> Result<Vec<String>, AstralError> {
             Ok(vec![])
         }
@@ -486,6 +554,7 @@ mod tests {
             _email: Option<&str>,
             _phone: Option<&str>,
             _avatar_url: Option<&str>,
+            _admission: AuthorizationAdmission,
         ) -> Result<(), AstralError> {
             Ok(())
         }
@@ -517,7 +586,13 @@ mod tests {
     }
 
     fn service() -> UserService {
-        UserService::new(
+        service_with_recorder().0
+    }
+
+    /// 带 mutation 计数的 service 构造：guard 拒绝路径断言零 repository mutation。
+    fn service_with_recorder() -> (UserService, Arc<AtomicUsize>) {
+        let update_calls = Arc::new(AtomicUsize::new(0));
+        let service = UserService::new(
             Arc::new(FakeUserRepository {
                 count: 2,
                 users: vec![crate::srv::user_repository::UserListRecord {
@@ -528,9 +603,11 @@ mod tests {
                     phone: None,
                     status: "ACTIVE".into(),
                 }],
+                update_calls: Arc::clone(&update_calls),
             }),
             Arc::new(FakeAuthRepository),
-        )
+        );
+        (service, update_calls)
     }
 
     #[tokio::test]
@@ -574,6 +651,163 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// 结构合法的 fixture admission（`from_verified_proof` 只做结构校验，
+    /// 与 org_repository/user_repository 测试同做法；不做任何 IO）。
+    fn admission_fixture() -> AuthorizationAdmission {
+        AuthorizationAdmission::from_verified_proof(astral_types::AuthorizationFenceProof {
+            authorization_edition: astral_types::AUTHORIZATION_EDITION,
+            authority_id: "authority-a".to_owned(),
+            authority_term: 1,
+            global_fence_sequence: 2,
+            scope: astral_types::AuthorizationAuthorityScope {
+                tenant_id: 1,
+                card_id: 1,
+                user_id: Some(1),
+                domain: astral_types::AuthorizationDomainScope::Any,
+            },
+            scope_generation: 2,
+            revoke_watermark: 1,
+            snapshot_hash: "ab".repeat(32),
+            parent_hash: None,
+            operation_id: "operation-1".to_owned(),
+            event_id: "event-1".to_owned(),
+            key_id: "key-1".to_owned(),
+            key_epoch: 1,
+            issued_at: 100,
+            not_before: 99,
+            expires_at: 110,
+            request_nonce: "nonce-1".to_owned(),
+            request_binding_digest: None,
+            scope_certificate_hash: None,
+            proof_id: "proof-1".to_owned(),
+            signature: "00".repeat(64),
+        })
+        .expect("structural fixture admission")
+    }
+
+    /// status-bearing 更新缺 admission → 在任何 durable 副作用（session
+    /// revoke / repository mutation）之前 fail-closed PENDING。
+    #[tokio::test]
+    async fn status_bearing_update_without_admission_is_pending_before_any_side_effect() {
+        let (service, update_calls) = service_with_recorder();
+        let error = service
+            .update_user(
+                &state(),
+                1,
+                &UpdateUserRequest {
+                    display_name: None,
+                    email: None,
+                    phone: None,
+                    status: Some("DISABLED".into()),
+                },
+                Some("req-op-1"),
+                None,
+            )
+            .await
+            .expect_err("missing admission must fail closed");
+        assert!(
+            matches!(error, AppError(AstralError::Pending(_))),
+            "missing admission is a safe PENDING, not an implicit allow: {error:?}"
+        );
+        assert_eq!(
+            update_calls.load(Ordering::SeqCst),
+            0,
+            "guard rejection must not reach the user repository mutation"
+        );
+    }
+
+    /// 携带结构合法 admission 的 status-bearing 更新通过 guard 到达 repository
+    ///（ACTIVE 状态不触发 session revoke，测试无需真实 DB）。
+    #[tokio::test]
+    async fn status_bearing_update_with_admission_passes_guard_to_repository() {
+        let (service, update_calls) = service_with_recorder();
+        service
+            .update_user(
+                &state(),
+                1,
+                &UpdateUserRequest {
+                    display_name: None,
+                    email: None,
+                    phone: None,
+                    status: Some("ACTIVE".into()),
+                },
+                Some("req-op-1"),
+                Some(admission_fixture()),
+            )
+            .await
+            .expect("admitted status-bearing update must pass the guard");
+        assert_eq!(
+            update_calls.load(Ordering::SeqCst),
+            1,
+            "admitted update must reach the repository exactly once"
+        );
+    }
+
+    /// 纯 profile metadata 更新（status=None）保持明确非资格语义：不要求
+    /// admission、不撤销会话、正常到达 repository。
+    #[tokio::test]
+    async fn profile_only_update_requires_no_admission() {
+        let (service, update_calls) = service_with_recorder();
+        service
+            .update_user(
+                &state(),
+                1,
+                &UpdateUserRequest {
+                    display_name: Some("Alice".into()),
+                    email: None,
+                    phone: None,
+                    status: None,
+                },
+                Some("req-op-1"),
+                None,
+            )
+            .await
+            .expect("profile-only update must not require an admission");
+        assert_eq!(
+            update_calls.load(Ordering::SeqCst),
+            1,
+            "profile-only update must still reach the repository"
+        );
+    }
+
+    /// 源形状/顺序守卫：status-bearing `update_user` 内 admission guard
+    /// （要求 + proof 契约验证）必须先于 `revoke_all_sessions_for_user`，
+    /// revoke 必须先于 repository mutation——缺 admission 时绝不先产生
+    /// session revoke durable 副作用。
+    #[test]
+    fn status_bearing_update_orders_admission_guard_before_revoke_before_repository_mutation() {
+        let source = include_str!("user_service.rs");
+        let body = source
+            .split("pub async fn update_user(")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn update_user_status(").next())
+            .expect("update_user body must stay delimited in user_service.rs");
+        let guard = body
+            .find("status-bearing user update requires proof-bound authorization admission")
+            .expect("status-bearing update must require a proof-bound admission");
+        let guard_proof = body
+            .find(".proof()")
+            .expect("guard must revalidate the proof contract");
+        let guard_validated = body
+            .find(".validate()")
+            .expect("guard must revalidate the proof contract");
+        let revoke = body
+            .find("revoke_all_sessions_for_user(state")
+            .expect("session revoke call must stay in update_user");
+        let mutation = body
+            .find(".update_user(")
+            .expect("repository mutation must stay in update_user");
+        assert!(
+            guard < guard_proof
+                && guard_proof < guard_validated
+                && guard_validated < revoke
+                && revoke < mutation,
+            "update_user must order admission guard < revoke call < repository mutation \
+             (guard at {guard}, proof at {guard_proof}, validated at {guard_validated}, \
+             revoke at {revoke}, mutate at {mutation})"
+        );
+    }
+
     fn state() -> AppState {
         let db = sqlx::MySqlPool::connect_lazy("mysql://localhost:1/identity").unwrap();
         AppState {
@@ -595,6 +829,7 @@ mod tests {
                         phone: None,
                         status: "ACTIVE".into(),
                     }],
+                    update_calls: Arc::new(AtomicUsize::new(0)),
                 }),
                 Arc::new(FakeAuthRepository),
             )),
@@ -609,6 +844,7 @@ mod tests {
             password_reset_notifier: Arc::new(
                 crate::srv::password::UnavailablePasswordResetNotifier,
             ),
+            authorization_fence_provider: None,
             org_scope_enabled: false,
         }
     }

@@ -19,6 +19,7 @@ pub mod consumers;
 pub mod envelope;
 pub mod error;
 pub mod invalidation;
+pub mod invalidation_delivery_transport;
 pub mod invalidation_fanout;
 pub mod invalidation_fanout_worker;
 pub mod local_bus;

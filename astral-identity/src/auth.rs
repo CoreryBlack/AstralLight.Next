@@ -632,6 +632,7 @@ pub async fn update_password_hash(
         new_hash,
         "PASSWORD_CHANGED",
         None,
+        None,
     )
     .await?;
 
@@ -664,20 +665,9 @@ pub async fn update_password_hash_tx(
         new_hash,
         "PASSWORD_CHANGED",
         None,
+        None,
     )
     .await?;
-    Ok(())
-}
-
-/// 更新最后登录时间（操作 user_local_credential 表）
-pub async fn update_last_login_at(db: &sqlx::MySqlPool, user_id: i64) -> Result<(), AstralError> {
-    sqlx::query(
-        "UPDATE user_local_credential SET last_login_at = CURRENT_TIMESTAMP WHERE user_id = ?",
-    )
-    .bind(user_id)
-    .execute(db)
-    .await
-    .map_err(|e| AstralError::Database(format!("Update last_login_at failed: {e}")))?;
     Ok(())
 }
 
@@ -1045,9 +1035,9 @@ mod tests {
             .split("pub async fn update_password_hash_tx(")
             .nth(1)
             .expect("tx variant must stay in auth.rs")
-            .split("pub async fn update_last_login_at(")
+            .split("pub async fn check_login_name_exists(")
             .next()
-            .expect("update_last_login_at must follow the tx variant");
+            .expect("check_login_name_exists must follow the tx variant");
         assert!(
             tx_body.contains("update_password_transaction_in_tx(")
                 && !tx_body.contains("begin_source_write")
@@ -1055,6 +1045,24 @@ mod tests {
                 && !tx_body.contains("tx.commit()")
                 && !tx_body.contains("note_revocations_in_process"),
             "the tx member must use shared atomic SQL only; its caller owns guard, commit, and post-commit work"
+        );
+    }
+
+    /// last_login_at 单写点回归（源形状，无 IO）：本文件生产区不得再包含
+    /// user_local_credential.last_login_at 写入——零调用方的重复写点已移除，
+    /// 唯一写点收敛到 `auth_repository::update_last_login_at`（autocommit
+    /// source 栅栏写，登录主链保持非阻塞语义）。计数范围排除测试模块，避免
+    /// 测试自引用字面量造成假阳性。
+    #[test]
+    fn auth_rs_keeps_no_last_login_at_writer() {
+        let source = include_str!("auth.rs");
+        let impl_source = &source[..source
+            .find("#[cfg(test)]")
+            .expect("tests module must stay at the end of auth.rs")];
+        assert!(
+            !impl_source.contains("last_login_at"),
+            "auth.rs must not write user_local_credential.last_login_at; \
+             the only writer is the source-fenced auth_repository::update_last_login_at"
         );
     }
 }

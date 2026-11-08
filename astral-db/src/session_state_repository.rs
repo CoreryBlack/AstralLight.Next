@@ -18,7 +18,7 @@
 //! `srv::session` / astral-mq consumers），本文件只承载单语句原子 SQL 与
 //! 纯评估函数。
 
-use sqlx::MySqlPool;
+use sqlx::{MySql, MySqlPool, Transaction};
 use time::PrimitiveDateTime;
 
 use astral_common::session_projection_store::{
@@ -639,6 +639,10 @@ pub const GUARD_SCOPE_GATEWAY_IDEMPOTENCY: &str = "gateway-idempotency";
 /// 防止跨服务同键互踩）。
 pub const GUARD_SCOPE_IDENTITY_REPLAY: &str = "identity-replay";
 pub const GUARD_SCOPE_IDENTITY_IDEMPOTENCY: &str = "identity-idempotency";
+/// Authority proof reservations are deliberately isolated from Gateway/Identity
+/// request guards. A claimed row means only that this exact signed proof was
+/// consumed once; it never proves an authority frontier or evidence freshness.
+pub const GUARD_SCOPE_AUTHORITY_PROOF_REPLAY: &str = "authorization-authority-proof-replay";
 
 /// guard 声明结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -661,6 +665,19 @@ pub enum GuardMarkerRejection {
 /// guard 输入校验（纯函数）：scope/key 非空且有界，防止超长键打满表。
 pub fn guard_input_is_valid(scope: &str, key: &str) -> bool {
     !scope.trim().is_empty() && scope.len() <= 64 && !key.trim().is_empty() && key.len() <= 255
+}
+
+/// Durable replay declaration inside a caller-owned MySQL transaction.
+///
+/// The caller must commit the transaction before treating `Claimed` as usable;
+/// a commit error is UNKNOWN and must not be retried with the same proof.
+pub async fn claim_replay_guard_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    scope: &str,
+    key: &str,
+    ttl_seconds: i64,
+) -> Result<GuardClaim, AstralError> {
+    insert_guard_row_in_tx(tx, scope, key, "1", ttl_seconds).await
 }
 
 /// durable nonce/replay 声明：purge 过期行 + UNIQUE INSERT。
@@ -797,6 +814,50 @@ async fn insert_guard_row(
     .bind(marker)
     .bind(ttl_seconds.max(1))
     .execute(pool)
+    .await;
+    match insert {
+        Ok(_) => Ok(GuardClaim::Claimed),
+        Err(sqlx::Error::Database(db_error)) if db_error.is_unique_violation() => {
+            Ok(GuardClaim::Duplicate)
+        }
+        Err(error) => Err(AstralError::Database(format!(
+            "Claim request guard failed: {error}"
+        ))),
+    }
+}
+
+async fn insert_guard_row_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    scope: &str,
+    key: &str,
+    marker: &str,
+    ttl_seconds: i64,
+) -> Result<GuardClaim, AstralError> {
+    if !guard_input_is_valid(scope, key) {
+        return Err(AstralError::Validation(
+            "Request guard key is invalid".into(),
+        ));
+    }
+    let purge = sqlx::query(
+        "DELETE FROM auth_internal_request_guard \
+         WHERE guard_scope = ? \
+           AND expires_at IS NOT NULL AND expires_at <= UTC_TIMESTAMP()",
+    )
+    .bind(scope)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| AstralError::Database(format!("Purge request guard failed: {e}")))?;
+    tracing::debug!(deleted = purge.rows_affected(), "request guard purge");
+    let insert = sqlx::query(
+        "INSERT INTO auth_internal_request_guard \
+         (guard_scope, guard_key, marker, expires_at) \
+         VALUES (?, ?, ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? SECOND))",
+    )
+    .bind(scope)
+    .bind(key)
+    .bind(marker)
+    .bind(ttl_seconds.max(1))
+    .execute(&mut **tx)
     .await;
     match insert {
         Ok(_) => Ok(GuardClaim::Claimed),

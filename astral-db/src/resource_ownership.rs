@@ -6,11 +6,13 @@
 //! explicit fail-closed outcome; it is never interpreted as the caller owning
 //! the target.
 
-use std::future::Future;
-
 use astral_types::{GlobalAccessRequirement, PolicyContext, ResourceOwnershipScope};
 use sqlx::MySqlPool;
 
+/// The legacy ownership memory adapter is retained only for isolated tests and
+/// a future adapter that can prove the same certified global authority contract
+/// as published card evidence. It is not reachable from the production entry.
+#[allow(dead_code)]
 mod memory;
 
 /// Result of resolving a protected route's target resource.
@@ -94,16 +96,15 @@ impl ResourceOwnershipResolution {
 /// query-addressed route; a create/action route cannot attach an arbitrary
 /// query object's tenant to itself. `actor_card_id` and `actor_user_id` are used
 /// only for a small set of explicitly actor-unit governance operations. The
-/// resolver re-reads the card from `user_card` and verifies its owner against the
-/// signed actor before deriving any target facts; it never copies signed
+/// resolver re-reads the card from `user_card` and verifies its owner against
+/// the signed actor before deriving any target facts; it never copies signed
 /// tenant/domain headers into the target scope.
 ///
-/// Public signature is frozen. The strict DB resolver below is the only
-/// authority; a process-local memory read face (see `memory`) may serve
-/// previously strict-verified positive `TenantScoped` outcomes for normal
-/// protected routes when the composite single-node gate is open (healthy hub +
-/// installed auxiliary authorization mirror). Negative outcomes always take the
-/// strict path.
+/// The public production entry is deliberately durable-only until ownership
+/// facts have the same certified global authority contract as published card
+/// evidence. The process-local ownership cache remains available to isolated
+/// tests and to a future certified adapter, but it cannot influence a request
+/// context in the current default assembly.
 pub async fn resolve_resource_ownership(
     pool: &MySqlPool,
     resource: &str,
@@ -134,22 +135,18 @@ pub async fn resolve_resource_ownership(
             )
             .await
         }
-        ResolvePlan::MemoryEligible(key) => {
-            resolve_memory_backed(
-                crate::memory_projection_hub().cloned(),
-                crate::auxiliary_authorization_mirror().is_some(),
-                key,
-                || {
-                    resolve_resource_ownership_strict(
-                        pool,
-                        resource,
-                        path,
-                        method,
-                        query_target_id,
-                        actor_card_id,
-                        actor_user_id,
-                    )
-                },
+        // Deliberately consume the legacy plan payload while keeping it out of
+        // the production authorization source. A future certified adapter can
+        // replace this branch only after its global proof contract is complete.
+        ResolvePlan::MemoryEligible(_key) => {
+            resolve_resource_ownership_strict(
+                pool,
+                resource,
+                path,
+                method,
+                query_target_id,
+                actor_card_id,
+                actor_user_id,
             )
             .await
         }
@@ -202,19 +199,10 @@ async fn resolve_resource_ownership_strict(
     }
 }
 
-/// 记忆读面的复合激活门：hub 已安装**且**单机辅助授权镜像已全局安装才
-/// 激活（复合标记 —— 独立 Rabbit hub、独立服务进程、纯测试一律回落既有
-/// 严格 DB 读）。协议：
-///
-/// - `strict_read_token()` 为 `None`（writer-active / uncertain）：fail-closed
-///   `Unavailable`，零 DB 查询，绝不回源旧状态放行；
-/// - 通道不健康（StrictRequired）：绕过缓存，有界严格读 + 返回前最终 token
-///   复验（健康不确定允许 —— source writer 证明必须当前）；
-/// - 健康 Ready：[`memory::OwnershipMemory::serve_or_refill`]（token 先于
-///   await 捕获、install/return 前复验、只缓存正向已验证 TenantScoped）。
-///
-/// `hub` 与 `strict` 均为注入缝：生产入口传进程级 hub 与既有严格 resolver，
-/// 同 crate 测试注入本地 hub 与受控 fake（仅私有可见）。
+/// Legacy memory-backed ownership adapter. This remains a private test seam and
+/// future certified-adapter seam; the public production resolver deliberately
+/// routes every non-pure plan through `resolve_resource_ownership_strict`.
+#[cfg(test)]
 async fn resolve_memory_backed<S, Fut>(
     hub: Option<crate::memory_projection_hub::MemoryProjectionHub>,
     auxiliary_mirror_installed: bool,
@@ -223,7 +211,7 @@ async fn resolve_memory_backed<S, Fut>(
 ) -> ResourceOwnershipResolution
 where
     S: FnOnce() -> Fut,
-    Fut: Future<Output = ResourceOwnershipResolution>,
+    Fut: std::future::Future<Output = ResourceOwnershipResolution>,
 {
     let (Some(hub), true) = (hub, auxiliary_mirror_installed) else {
         return strict().await;
@@ -250,7 +238,9 @@ enum ResolvePlan {
     Pure(ResourceOwnershipResolution),
     /// 超界键保持严格 DB 显式限制。
     StrictDbOnly,
-    /// 正常受保护目标：允许在复合激活门下走记忆读面。
+    /// Normal protected targets retain an explicit plan marker for the isolated
+    /// legacy adapter, but the current production entry always uses the strict
+    /// resolver until that adapter has a certified global authority proof.
     MemoryEligible(memory::OwnershipMemoryKey),
 }
 
@@ -314,10 +304,9 @@ fn resolve_plan(
     }
 }
 
-/// 记忆路径支持的 lookup kind **闭合清单**（穷尽 match、无通配臂）：新增
-/// lookup kind 必须先在此分类 —— 默认落入 `false`（StrictDbOnly，闭合
-/// 门），只有其事实面全部写点完成 hub 栅栏覆盖并更新
-/// `memory_writer_coverage_inventory` 后才允许开启 `true`。
+/// The route contract remains closed and testable even while the production
+/// resolver is durable-only. A future certified adapter must use this same
+/// classification before it can be enabled.
 fn memory_supported_kind(kind: TargetLookupKind) -> bool {
     match kind {
         TargetLookupKind::Tenant
@@ -497,6 +486,7 @@ fn target_lookup_kind(resource: &str, path: &str) -> Option<TargetLookupKind> {
             Some(TargetLookupKind::PermissionRequest)
         }
         "audit" if path == "/hit-stats/by-card" => Some(TargetLookupKind::UserCard),
+        "monitor" if path == "/authorization-observations/s15" => Some(TargetLookupKind::UserCard),
         "audit" => Some(TargetLookupKind::AuditRecord),
         "domain" if path.starts_with("/user-cards/") => Some(TargetLookupKind::UserCard),
         "domain" if path.starts_with("/card-templates/") => Some(TargetLookupKind::CardTemplate),
@@ -610,6 +600,7 @@ fn is_actor_unit_route(resource: &str, path: &str, method: &str) -> bool {
                 "/permission-requests/org-scopes",
                 "POST"
             )
+            | ("permission_request", "/permission-requests", "POST")
             | ("permission_rule", "/delegations", "GET")
             | ("permission_rule", "/delegations", "POST")
             | ("permission_rule", "/delegations/by-delegator", "GET")
@@ -619,6 +610,11 @@ fn is_actor_unit_route(resource: &str, path: &str, method: &str) -> bool {
             // management-scope check before any repository write/read.
             | ("permission_rule", "/permission-rules", "GET")
             | ("permission_rule", "/permission-rules", "POST")
+            // Identity self-service routes bind the operation to the verified
+            // actor card; they never resolve a caller-controlled target object.
+            | ("identity_users", "/profile", "GET")
+            | ("identity_users", "/profile", "PUT")
+            | ("identity_users", "/change-password", "POST")
     )
 }
 
@@ -685,11 +681,17 @@ fn global_access_requirement(
         return Some(PolicyEvidence);
     }
 
+    if resource == "platform_package" {
+        return platform_package_route_target(path, method)
+            .ok()
+            .filter(|expected_target| *expected_target == target_id)
+            .map(|_| ActiveGlobalAdmin);
+    }
+
     if matches!(
         resource,
         "domain_resource_type"
             | "permission_action"
-            | "platform_package"
             | "authorization"
             | "permission_inheritance"
             | "admin_group"
@@ -806,6 +808,19 @@ fn path_target_id(resource: &str, path: &str) -> Option<i64> {
             positive_path_segment(path, "/users/")
         }
         "organization" if path.starts_with("/orgs/") => positive_path_segment(path, "/orgs/"),
+        "audit_quarantine" if path.starts_with("/audit-quarantine/") => {
+            positive_path_segment(path, "/audit-quarantine/")
+        }
+        "monitor" if path.starts_with("/alerts/") => positive_path_segment(path, "/alerts/"),
+        "monitor" if path.starts_with("/alert-rules/") => {
+            positive_path_segment(path, "/alert-rules/")
+        }
+        "monitor" if path.starts_with("/alert-history/") => {
+            positive_path_segment(path, "/alert-history/")
+        }
+        "notification" if path.starts_with("/notifications/") => {
+            positive_path_segment(path, "/notifications/")
+        }
         "platform_tenant" if path.starts_with("/tenants/") => {
             positive_path_segment(path, "/tenants/")
         }
@@ -873,7 +888,28 @@ fn query_target_is_declared(resource: &str, path: &str, method: &str) -> bool {
         (resource, path, method),
         ("permission_rule", "/permission-rules/check", "GET")
             | ("audit", "/hit-stats/by-card", "GET")
+            | ("monitor", "/authorization-observations/s15", "GET")
     )
+}
+
+fn platform_package_route_target(path: &str, method: &str) -> Result<Option<i64>, &'static str> {
+    const UNMAPPED: &str = "resource_ownership.platform_package_route_unmapped";
+    if path == "/platform-packages" {
+        return if matches!(method, "GET" | "POST") {
+            Ok(None)
+        } else {
+            Err(UNMAPPED)
+        };
+    }
+    if !matches!(method, "GET" | "PUT" | "DELETE") {
+        return Err(UNMAPPED);
+    }
+    let segment = path.strip_prefix("/platform-packages/").ok_or(UNMAPPED)?;
+    let id = segment.parse::<i64>().map_err(|_| UNMAPPED)?;
+    if id <= 0 || id.to_string() != segment {
+        return Err(UNMAPPED);
+    }
+    Ok(Some(id))
 }
 
 fn resolved_target_id(
@@ -882,6 +918,17 @@ fn resolved_target_id(
     method: &str,
     query_target_id: Option<i64>,
 ) -> Result<Option<i64>, &'static str> {
+    if resource == "platform_package" {
+        let target = platform_package_route_target(path, method)?;
+        return match (target, query_target_id) {
+            (Some(id), Some(query_id)) if id != query_id => {
+                Err("resource_ownership.path_query_target_mismatch")
+            }
+            (Some(id), _) => Ok(Some(id)),
+            (None, Some(_)) => Err("resource_ownership.query_target_not_declared"),
+            (None, None) => Ok(None),
+        };
+    }
     let path_target_id = path_target_id(resource, path);
     match (path_target_id, query_target_id) {
         (Some(path_target_id), Some(query_target_id)) if path_target_id != query_target_id => {
@@ -1423,6 +1470,72 @@ mod tests {
     }
 
     #[test]
+    fn platform_package_targets_bind_only_exact_registered_routes() {
+        for method in ["GET", "POST"] {
+            assert_eq!(
+                route_ownership_contract("platform_package", "/platform-packages", method, None),
+                RouteOwnershipContract::Global {
+                    target_id: None,
+                    access_requirement: GlobalAccessRequirement::ActiveGlobalAdmin,
+                }
+            );
+            assert_eq!(
+                resolved_target_id("platform_package", "/platform-packages", method, Some(17)),
+                Err("resource_ownership.query_target_not_declared")
+            );
+        }
+        for method in ["GET", "PUT", "DELETE"] {
+            assert_eq!(
+                route_ownership_contract("platform_package", "/platform-packages/17", method, None),
+                RouteOwnershipContract::Global {
+                    target_id: Some(17),
+                    access_requirement: GlobalAccessRequirement::ActiveGlobalAdmin,
+                }
+            );
+            assert_eq!(
+                resolved_target_id(
+                    "platform_package",
+                    "/platform-packages/17",
+                    method,
+                    Some(17)
+                ),
+                Ok(Some(17))
+            );
+            assert_eq!(
+                resolved_target_id(
+                    "platform_package",
+                    "/platform-packages/17",
+                    method,
+                    Some(18)
+                ),
+                Err("resource_ownership.path_query_target_mismatch")
+            );
+        }
+        for (path, method) in [
+            ("/platform-packages", "PUT"),
+            ("/platform-packages", "DELETE"),
+            ("/platform-packages/17", "POST"),
+            ("/platform-packages/17", "PATCH"),
+            ("/platform-packages/0", "PUT"),
+            ("/platform-packages/-1", "DELETE"),
+            ("/platform-packages/017", "PUT"),
+            ("/platform-packages/+17", "PUT"),
+            ("/platform-packages/17/", "DELETE"),
+            ("/platform-packages/17/extra", "GET"),
+            ("/platform-packages/invalid", "PUT"),
+            ("/unknown/17", "PUT"),
+        ] {
+            assert_eq!(
+                route_ownership_contract("platform_package", path, method, None),
+                RouteOwnershipContract::Unresolved {
+                    code: "resource_ownership.platform_package_route_unmapped",
+                },
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
     fn hit_stats_by_card_query_resolves_to_server_owned_user_card() {
         assert!(query_target_is_declared(
             "audit",
@@ -1511,10 +1624,21 @@ mod tests {
             "/permission-rules",
             "POST"
         ));
-        assert!(!is_actor_unit_route(
+        assert!(is_actor_unit_route(
             "permission_request",
             "/permission-requests",
             "POST"
+        ));
+        for (resource, path, method) in [
+            ("permission_request", "/permission-requests", "GET"),
+            ("permission_request", "/permission-requests/", "POST"),
+            ("permission_rule", "/permission-requests", "POST"),
+        ] {
+            assert!(!is_actor_unit_route(resource, path, method));
+        }
+        assert!(matches!(
+            route_ownership_contract("permission_request", "/permission-requests", "POST", None,),
+            RouteOwnershipContract::ActorUnit
         ));
         assert!(!is_actor_unit_route(
             "permission_request",
@@ -1894,7 +2018,7 @@ mod tests {
         assert_eq!(
             route_ownership_contract("monitor", "/alert-rules/7", "DELETE", None),
             RouteOwnershipContract::Global {
-                target_id: None,
+                target_id: Some(7),
                 access_requirement: GlobalAccessRequirement::ActiveGlobalAdmin,
             }
         );
@@ -2171,12 +2295,6 @@ mod tests {
         matches!(
             (service, resource, path, method, code),
             (
-                "trustgraph",
-                "permission_request",
-                "/permission-requests",
-                "POST",
-                "resource_ownership.target_missing"
-            ) | (
                 "trustgraph",
                 "platform_tenant",
                 "/tenants/invitations/{code}",
@@ -2481,8 +2599,12 @@ mod tests {
                 "{service} HTTP middleware must apply the resolver result before evaluation"
             );
             assert!(
-                production.contains(".evaluate(&ctx"),
-                "{service} HTTP middleware must send the resolved context to PolicyEngine"
+                production.contains(".evaluate_with_admission(&ctx"),
+                "{service} HTTP middleware must send the resolved context to PolicyEngine through the admission-bearing evaluation entry"
+            );
+            assert!(
+                !production.contains(".evaluate(&ctx"),
+                "{service} HTTP middleware must not fall back to the legacy non-admission evaluate entry"
             );
             assert!(
                 !production.contains("PolicyContext::builder("),
@@ -2730,10 +2852,12 @@ mod tests {
         );
     }
 
-    /// 复合激活门的结构钉死：公共入口保持既有签名，唯一严格实现，门必须
-    /// 同时检查两个全局安装标记与 hub token/健康状态。
+    /// The public resolver deliberately keeps all non-pure production routes on
+    /// the strict server-side owner. The legacy memory plan remains available
+    /// only as an isolated test/future certified-adapter seam and must not alter
+    /// the request context today.
     #[test]
-    fn the_public_resolver_delegates_to_one_strict_source_behind_the_composite_gate() {
+    fn the_public_resolver_is_durable_only_until_certified_ownership_exists() {
         let source = include_str!("resource_ownership.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or(source);
         assert_eq!(
@@ -2750,24 +2874,12 @@ mod tests {
             .split("\n}")
             .next()
             .expect("the public resolver must close");
-        assert!(
-            wrapper.contains("crate::memory_projection_hub()")
-                && wrapper.contains("crate::auxiliary_authorization_mirror().is_some()"),
-            "the public resolver must consult both composite activation globals"
-        );
+        assert!(!wrapper.contains("crate::memory_projection_hub()"));
+        assert!(!wrapper.contains("crate::auxiliary_authorization_mirror"));
+        assert!(!wrapper.contains("resolve_memory_backed("));
+        assert!(wrapper.contains("ResolvePlan::StrictDbOnly"));
+        assert!(wrapper.contains("ResolvePlan::MemoryEligible(_key)"));
         assert!(wrapper.contains("resolve_resource_ownership_strict("));
-        assert!(wrapper.contains("resolve_memory_backed("));
-        let gate = production
-            .split("async fn resolve_memory_backed<")
-            .nth(1)
-            .expect("the composite gate must exist")
-            .split("\n}")
-            .next()
-            .expect("the gate function must close");
-        assert!(gate.contains("hub.strict_read_token()"));
-        assert!(gate.contains("hub.strict_read_matches(token)"));
-        assert!(gate.contains("hub.channel_is_healthy()"));
-        assert!(gate.contains("memory::global_ownership_memory()"));
     }
 
     /// 写面覆盖闭合清单：记忆路径支持的每个 lookup kind 的事实面表与唯一

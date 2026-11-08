@@ -27,24 +27,34 @@
 //! 全部账本/投影/审计写入；缺失时以**锁定中的 durable 代次**确定性派生，随机
 //! fallback 绝不进入账本事件链。
 
-use async_trait::async_trait;
-use sqlx::{MySqlPool, QueryBuilder};
+use std::sync::Arc;
 
+use async_trait::async_trait;
+use sqlx::{MySql, MySqlPool, QueryBuilder, Transaction};
+
+use astral_db::authority_eligibility_completion::{
+    CardCreateInsertSpec, EligibilitySourceCapture, EligibilitySourceEvidenceReceipt,
+    EligibilitySourceSubject,
+};
 use astral_db::grant_ledger::{
     append_ruleset_grant_delta_in_tx, build_ruleset_add_draft, build_ruleset_remove_draft,
     derive_ruleset_contribution_event_id, derive_ruleset_identity, map_grant_repository_error,
     validated_request_operation_id, RuleSetEntryLedgerFacts, RuleSetMutationKind,
     RULE_SET_AGGREGATE_TYPE,
 };
+use astral_db::invalidation_delivery::InvalidationDeliveryContext;
+use astral_db::CardCreateRuleSetCapture;
 use astral_db::{
     next_delta_version, read_grant_head_for_update_in_tx,
     read_latest_delta_target_version_for_update_in_tx, ProjectionEventIdentity,
     ProjectionEventMetadata,
 };
 use astral_types::{
-    AstralError, ProjectionAggregate, UserCard, EVENT_TYPE_ELIGIBILITY_UPDATE, EVENT_TYPE_REVOKE,
+    AstralError, AuthorizationAdmission, ProjectionAggregate, UserCard, EVENT_TYPE_REVOKE,
     EVENT_TYPE_RULE_SET_UPDATE, SYSTEM_ACTOR_ID,
 };
+
+use crate::srv::source_writer_guard;
 
 #[derive(Debug, Clone)]
 pub struct CardFilter {
@@ -63,6 +73,8 @@ pub trait CardRepository: Send + Sync {
     /// 非正数在进入任何 durable 写入前整体拒绝。`request_operation_id` 是可选的
     /// `x-request-id`；携带时先过统一安全校验（不安全 header fail-closed），缺失
     /// 或空白时以锁定中的 durable RULE_SET 代次确定性派生稳定 operation id。
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn create_user_card(
         &self,
         user_id: i64,
@@ -71,6 +83,7 @@ pub trait CardRepository: Send + Sync {
         template_id: i64,
         actor_id: i64,
         request_operation_id: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<UserCard, AstralError>;
 
     async fn list_user_cards(&self, filter: CardFilter) -> Result<Vec<UserCard>, AstralError>;
@@ -90,6 +103,7 @@ pub trait CardRepository: Send + Sync {
         status: &str,
         actor_id: i64,
         request_operation_id: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AstralError>;
 
     /// 变更用户卡模板（授权 source mutation）。
@@ -97,6 +111,8 @@ pub trait CardRepository: Send + Sync {
     /// 模板变化时在同一事务内先对旧模板绑定做版本化 REMOVE（head 缺失
     /// fail-closed）并删除 ref，再按 create 语义物化新模板绑定的 ADD 贡献；
     /// 投影/审计同事务落库，任一失败整体回滚。
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn update_user_card(
         &self,
         card_id: i64,
@@ -105,16 +121,39 @@ pub trait CardRepository: Send + Sync {
         tenant_id: Option<i64>,
         actor_id: i64,
         request_operation_id: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AstralError>;
 }
 
 pub struct SqlxCardRepository {
     db: MySqlPool,
+    delivery_context: Option<Arc<InvalidationDeliveryContext>>,
 }
 
 impl SqlxCardRepository {
     pub fn new(db: MySqlPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            delivery_context: None,
+        }
+    }
+
+    pub fn new_with_delivery_context(
+        db: MySqlPool,
+        delivery_context: Arc<InvalidationDeliveryContext>,
+    ) -> Self {
+        Self {
+            db,
+            delivery_context: Some(delivery_context),
+        }
+    }
+
+    fn require_delivery_context(&self) -> Result<&InvalidationDeliveryContext, AstralError> {
+        self.delivery_context.as_deref().ok_or_else(|| {
+            AstralError::Pending(
+                "eligibility mutation requires an injected invalidation delivery context".into(),
+            )
+        })
     }
 }
 
@@ -133,6 +172,8 @@ impl CardRepository for SqlxCardRepository {
         .map_err(|e| AstralError::Database(format!("Query identity_card failed: {e}")))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn create_user_card(
         &self,
         user_id: i64,
@@ -141,6 +182,7 @@ impl CardRepository for SqlxCardRepository {
         template_id: i64,
         actor_id: i64,
         request_operation_id: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<UserCard, AstralError> {
         // ── Phase 0: 纯校验先于任何 durable 写入 ─────────────────────────────
         // 操作者身份：本入口是用户自助创建，必须携带 Gateway 已验证的正数 actor；
@@ -149,7 +191,11 @@ impl CardRepository for SqlxCardRepository {
         // 模板绑定卡是账本 ALLOW 贡献的物化目标：tenant/user 正数、domain 携带时
         // 正数，任何无法证明的 scope 整卡创建失败，不降级只写旧链。
         validate_template_card_ledger_scope(user_id, tenant_id, domain_id, template_id)?;
-        let request_operation_id = validated_request_operation_id(request_operation_id)?;
+        let _request_operation_id = validated_request_operation_id(request_operation_id)?;
+
+        // Card creation always appends an ELIGIBILITY event, including an empty
+        // template, so its frozen delivery context is required before INSERT.
+        let delivery_context = self.require_delivery_context()?;
 
         // hub 已装时先登记卡事实写者（writer-active 期间辅助读面 fail-closed）。
         let source_guard = begin_card_source_transaction()?;
@@ -164,6 +210,7 @@ impl CardRepository for SqlxCardRepository {
         let identity_scope: Option<(i64,)> = sqlx::query_as(
             "SELECT card_id FROM identity_card \
              WHERE user_id = ? AND status = 'ACTIVE' \
+               AND (expires_at IS NULL OR expires_at >= UTC_TIMESTAMP()) \
              ORDER BY card_id LIMIT 1 FOR UPDATE",
         )
         .bind(user_id)
@@ -173,6 +220,40 @@ impl CardRepository for SqlxCardRepository {
         if identity_scope.is_none() || tenant_id.is_none() || domain_id.is_none() {
             return Err(AstralError::Permission(
                 "User card scope requires an active identity card".into(),
+            ));
+        }
+        // A card-creation proof must bind to an already-existing user_card. The
+        // new card id does not exist yet, and identity_card is not an authority
+        // source; silently substituting either id would widen the admission.
+        let source_card_id = admission.proof().scope.card_id;
+        let source_card: LockedCardRow = sqlx::query_as(
+            "SELECT card_status, user_id, tenant_id, domain_id, template_id \
+             FROM user_card WHERE card_id = ? FOR UPDATE",
+        )
+        .bind(source_card_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AstralError::Database(format!("Lock admission source card failed: {e}")))?
+        .ok_or_else(|| {
+            AstralError::Pending(
+                "authorization admission source card is unavailable; card creation is pending"
+                    .into(),
+            )
+        })?;
+        require_admission_card_scope(&admission, source_card_id, &source_card)?;
+        if source_card.user_id != Some(user_id) {
+            return Err(AstralError::Permission(
+                "authorization admission source card is not owned by the creating user".into(),
+            ));
+        }
+        if source_card.card_status != "ACTIVE" {
+            return Err(AstralError::Permission(
+                "authorization admission source card is not ACTIVE".into(),
+            ));
+        }
+        if source_card.tenant_id != tenant_id || source_card.domain_id != domain_id {
+            return Err(AstralError::Permission(
+                "new user card scope does not match the admission source card".into(),
             ));
         }
         // 发卡与 delete_tenant/delete_org 的并发边界闭合（统一锁序 tenant →
@@ -202,29 +283,38 @@ impl CardRepository for SqlxCardRepository {
                  against a missing tenant (fail-closed)"
             )));
         }
-        let result = sqlx::query(
-            "INSERT INTO user_card \
-             (user_id, domain_id, tenant_id, card_type, card_status, template_id, priority, is_primary) \
-             VALUES (?, ?, ?, 'STANDARD', 'ACTIVE', ?, 100, 0)",
-        )
-        .bind(user_id)
-        .bind(domain_id)
-        .bind(tenant_id)
-        .bind(template_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AstralError::Database(format!("Insert user_card failed: {e}")))?;
-        // 新建卡主键是本事务拥有的 source 身份事实；不可用即持久层异常，整体拒绝。
-        if result.last_insert_id() == 0 {
-            return Err(AstralError::Internal(
-                "user_card insert returned an unusable id".into(),
-            ));
-        }
-        let card_id = result.last_insert_id() as i64;
-
-        // 模板绑定失败必须回滚创建，避免卡片处于无授权规则集的半完成状态。
+        // Template sources are locked before the closed INSERT capture so the
+        // tenant -> card -> ruleset lock order remains unchanged.
         let locked_rule_sets = lock_template_rule_sets_in_tx(&mut tx, template_id).await?;
         ensure_unique_template_rule_set_ids(&locked_rule_sets)?;
+        let mut eligibility_capture = EligibilitySourceCapture::begin_card_create_in_tx(
+            &mut tx,
+            &admission,
+            CardCreateInsertSpec {
+                user_id,
+                tenant_id: tenant_id.ok_or_else(|| {
+                    AstralError::Validation("card create requires a tenant scope".into())
+                })?,
+                domain_id,
+                card_type: "STANDARD".to_owned(),
+                template_id: Some(template_id),
+                level_id: None,
+                priority: 100,
+                is_primary: false,
+            },
+        )
+        .await
+        .map_err(|error| AstralError::Pending(error.to_string()))?;
+        let card_id = eligibility_capture.created_card_id().ok_or_else(|| {
+            AstralError::Pending(
+                "closed card create capture did not return its durable card id".into(),
+            )
+        })?;
+        macro_rules! card_create_tx {
+            () => {{
+                eligibility_capture.with_tx_mut()
+            }};
+        }
         let card_tenant_id = tenant_id.unwrap_or_default();
         for row in &locked_rule_sets {
             // Reject one-sided tenant scopes before any durable write; the
@@ -232,26 +322,13 @@ impl CardRepository for SqlxCardRepository {
             // RuleSet is not in the same scope.
             validate_binding_tenants(row.tenant_id, tenant_id)?;
         }
-        // Operation identity（首个 ledger/outbox/audit 写之前确定）：显式请求
-        // id 原样贯穿，否则以锁定的最大 RULE_SET 代次确定性派生。
-        let operation_id = request_operation_id.unwrap_or_else(|| {
-            let locked_ruleset_generation = locked_rule_sets
-                .iter()
-                .filter_map(|row| row.source_generation)
-                .max()
-                .unwrap_or(0);
-            derive_create_card_template_operation_id(
-                card_id,
-                template_id,
-                locked_ruleset_generation,
-            )
-        });
+        let operation_id = admission.operation_id().to_owned();
 
         // ── CARD parent：单张带 actor/operation 元数据的 CARD_CREATED 事件 ──
         // 其 durable 身份作为本卡全部模板绑定 ADD 贡献的 generation/fence 锚点；
         // 与 trustgraph create_card 同一约定（不再逐绑定追加 RULE_SET_BOUND）。
         let parent_projection = append_projection_with_metadata(
-            &mut tx,
+            card_create_tx!(),
             ProjectionAggregate::Card,
             card_id,
             "CARD_CREATED",
@@ -260,10 +337,30 @@ impl CardRepository for SqlxCardRepository {
         )
         .await?;
 
+        // source outcome evidence 采集：本事务实际写入的 ref 主键、投影事件
+        // durable 身份与审计行数（有界窗口 + 显式 total，绝不伪造 receipt）。
+        let mut created_ref_ids: Vec<i64> = Vec::new();
+        let mut projection_event_ids: Vec<String> = Vec::new();
+        let mut rule_set_audit_count: usize = 0;
+        // 本事务真实写入的 grant delta append requests（canonical 证据原料）。
+        let mut delta_requests: Vec<astral_db::DeltaEventAppendRequest> = Vec::new();
+        let mut card_create_bindings: Vec<astral_db::CardCreateRuleSetReceipt> = Vec::new();
         for row in &locked_rule_sets {
+            let mut ruleset_capture = CardCreateRuleSetCapture::begin_in_tx(
+                card_create_tx!(),
+                astral_db::CardCreateRuleSetCaptureSpec {
+                    card_id,
+                    user_id,
+                    tenant_id: card_tenant_id,
+                    domain_id,
+                    operation_id: operation_id.clone(),
+                    rule_set_id: row.rule_set_id,
+                },
+            )
+            .await?;
             // Sources are locked by RuleSet id; prove each RuleSet before its reference.
             ensure_rule_set_projection_in_tx(
-                &mut tx,
+                ruleset_capture.with_tx_mut(),
                 row.rule_set_id,
                 row.tenant_id,
                 actor_id,
@@ -280,7 +377,7 @@ impl CardRepository for SqlxCardRepository {
             .bind(card_id)
             .bind(row.rule_set_id)
             .bind(tenant_id)
-            .execute(&mut *tx)
+            .execute(&mut **ruleset_capture.with_tx_mut())
             .await
             .map_err(|e| AstralError::Database(format!("Insert card_rule_set_ref failed: {e}")))?;
             let ref_id = i64::try_from(inserted_ref.last_insert_id())
@@ -289,10 +386,11 @@ impl CardRepository for SqlxCardRepository {
                 .ok_or_else(|| {
                     AstralError::Internal("card_rule_set_ref insert returned an unusable id".into())
                 })?;
+            created_ref_ids.push(ref_id);
             // 绑定本身是一次 RuleSet 授权语义变更：RULE_SET 投影事件 + BIND_CARD
             // 审计与标准 bind_card 同语义（缓存失效/快照重建契约一致）。
             let rule_projection = append_projection_with_metadata(
-                &mut tx,
+                ruleset_capture.with_tx_mut(),
                 ProjectionAggregate::RuleSet,
                 row.rule_set_id,
                 EVENT_TYPE_RULE_SET_UPDATE,
@@ -300,10 +398,11 @@ impl CardRepository for SqlxCardRepository {
                 &operation_id,
             )
             .await?;
+            projection_event_ids.push(rule_projection.event_id.clone());
             // enabled+ALLOW 条目的标准 ADD 物化（rev1 base0→target1）；空 RuleSet
             // 合法返回空贡献集。贡献以 entry×card×ref 维度派生独立稳定事件号。
-            let addition = materialize_template_adds_in_tx(
-                &mut tx,
+            let (addition, addition_delta_requests) = materialize_template_adds_in_tx(
+                ruleset_capture.with_tx_mut(),
                 row.rule_set_id,
                 &parent_projection,
                 actor_id,
@@ -316,6 +415,7 @@ impl CardRepository for SqlxCardRepository {
                 "BASE",
             )
             .await?;
+            delta_requests.extend(addition_delta_requests);
 
             // BIND_CARD 审计关联面（同事务、序列化/DB 错误一律上抛回滚）：
             // parent CARD 事件、模板/租户/卡/ref 维度与全部贡献事件号可追溯。
@@ -331,11 +431,11 @@ impl CardRepository for SqlxCardRepository {
                     .map(|entry| entry.event_id.as_str())
                     .collect::<Vec<_>>(),
                 "ruleSetEntryIds": addition.iter().map(|entry| entry.entry_id).collect::<Vec<_>>(),
-                "boundCardIds": [card_id],
-                "bindingRefIds": [ref_id],
+                "boundCardIds": addition.iter().map(|_| card_id).collect::<Vec<_>>(),
+                "bindingRefIds": addition.iter().map(|_| ref_id).collect::<Vec<_>>(),
             });
             insert_rule_set_projection_audit_in_tx(
-                &mut tx,
+                ruleset_capture.with_tx_mut(),
                 &RuleSetProjectionAuditEntry {
                     rule_set_id: row.rule_set_id,
                     entry_id: None,
@@ -352,15 +452,137 @@ impl CardRepository for SqlxCardRepository {
                 },
             )
             .await?;
+            let binding_receipt = ruleset_capture.finish_in_tx().await?;
+            card_create_bindings.push(binding_receipt);
+            rule_set_audit_count += 1;
         }
 
         // 新卡自 ACTIVE 起即影响资格缓存，同事务落 ELIGIBILITY 事件
         // （独立轻量资格通道：evict `perm:card:active` 缓存 + 推进 head）。
-        astral_db::append_projection_event_in_tx(
-            &mut tx,
-            ProjectionAggregate::Eligibility,
+        let eligibility_event =
+            source_writer_guard::append_card_eligibility_with_invalidation_in_tx(
+                card_create_tx!(),
+                delivery_context,
+                card_id,
+                tenant_id,
+                &operation_id,
+            )
+            .await?;
+        projection_event_ids.push(parent_projection.event_id.clone());
+        projection_event_ids.push(eligibility_event.projection_event_id.clone());
+        // CardCreate 审计必须在闭合 capture 结束前落同一事务，使 finish 能以
+        // operation_id 读回真实 audit correlation，而不是由调用方自造 receipt。
+        let create_audit_detail = serde_json::json!({
+            "actorId": actor_id,
+            "targetCardId": card_id,
+            "operationId": operation_id,
+            "templateId": template_id,
+            "tenantId": tenant_id,
+            "domainId": domain_id,
+            "action": "card_create",
+        })
+        .to_string();
+        let audit_id = insert_user_card_mutation_audit_in_tx(
+            card_create_tx!(),
+            actor_id,
             card_id,
-            EVENT_TYPE_ELIGIBILITY_UPDATE,
+            "card_create",
+            "CARD_CREATED",
+            &operation_id,
+            tenant_id,
+            domain_id,
+            &create_audit_detail,
+        )
+        .await?;
+        // caller 只在同一事务里继续准备真实 delta 原料，capture finish 放在 delta
+        // capture 之后，以便 publication-origin receipt 覆盖整个 source lane。
+        validate_and_consume_admission(card_create_tx!(), &admission).await?;
+        let (ref_window, ref_total) = source_writer_guard::bounded_receipt_window(
+            created_ref_ids.iter().map(|id| id.to_string()).collect(),
+            source_writer_guard::SOURCE_OUTCOME_RECEIPT_WINDOW,
+        );
+        let stage_result = serde_json::json!({
+            "operationId": operation_id,
+            "newCardId": card_id,
+            "templateId": template_id,
+            "tenantId": tenant_id,
+            "domainId": domain_id,
+        });
+        // canonical delta 证据在本事务内真实捕获（grant revision 链，首发的
+        // base0 链即空基线证明）；无可证明 delta（空模板）时保持 None ——
+        // 绝不伪造，也绝不在 publication 侧现读自签。
+        let delta_evidence = if delta_requests.is_empty() {
+            None
+        } else {
+            Some(
+                astral_db::capture_delta_source_outcome_in_tx(card_create_tx!(), &delta_requests)
+                    .await
+                    .map_err(map_grant_repository_error)?,
+            )
+        };
+        // finite coverage：create 的影响面就是本卡（同事务锁定派生，恒 ≤256）。
+        let coverage = delta_evidence
+            .as_ref()
+            .map(|_| card_coverage_scope(card_tenant_id, card_id, user_id, domain_id));
+        let eligibility_receipt = if delta_evidence.is_some() {
+            eligibility_capture
+                .finish_publication_in_tx()
+                .await
+                .map_err(|error| AstralError::Pending(error.to_string()))?
+        } else {
+            eligibility_capture
+                .finish_in_tx()
+                .await
+                .map_err(|error| AstralError::Pending(error.to_string()))?
+        };
+        let mut outcome = source_writer_guard::IdentitySourceOutcome::new()
+            .target(source_writer_guard::source_target_from_eligibility_receipt(
+                &eligibility_receipt,
+            ))
+            .receipt(source_writer_guard::SourceStatementReceipt {
+                entity: "user_card",
+                key: serde_json::json!({ "cardId": card_id }),
+                kind: astral_db::WriteKind::Insert,
+                rows_affected: 1,
+                durable_id: card_id.to_string(),
+            })
+            .receipt(source_writer_guard::SourceStatementReceipt {
+                entity: "audit_log",
+                key: serde_json::json!({ "id": audit_id, "eventType": "USER_CARD_MUTATION" }),
+                kind: astral_db::WriteKind::Insert,
+                rows_affected: 1,
+                durable_id: audit_id.to_string(),
+            });
+        for ref_id_text in &ref_window {
+            outcome = outcome.receipt(source_writer_guard::SourceStatementReceipt {
+                entity: "card_rule_set_ref",
+                key: serde_json::json!({ "id": ref_id_text, "cardId": card_id }),
+                kind: astral_db::WriteKind::Insert,
+                rows_affected: 1,
+                durable_id: ref_id_text.clone(),
+            });
+        }
+        let binding_evidence = card_create_bindings
+            .iter()
+            .map(|receipt| receipt.source_evidence().clone())
+            .collect::<Vec<_>>();
+        stage_card_source_outcome(
+            &mut tx,
+            &admission,
+            outcome,
+            projection_event_ids,
+            serde_json::json!({
+                "ruleSetRefs": ref_total,
+                "refReceipts": ref_window.len(),
+                "ruleSetAudits": rule_set_audit_count,
+                "cardCreateRuleSetBindings": binding_evidence,
+                "affectedCards": [{ "cardId": card_id, "tenantId": tenant_id }],
+            }),
+            &stage_result,
+            delta_evidence,
+            coverage,
+            Vec::new(),
+            Some(eligibility_receipt),
         )
         .await?;
         arm_card_commit_fence(&source_guard);
@@ -428,11 +650,17 @@ impl CardRepository for SqlxCardRepository {
         status: &str,
         actor_id: i64,
         request_operation_id: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AstralError> {
         // ── Phase 0: 纯校验先于任何 durable 写入 ─────────────────────────────
         // 目标状态字母表（不信任 handler 白名单：未知字符串绝不进入 SQL 绑定值）。
         let requested_status = normalize_requested_card_status(status)?;
         let request_operation_id = validated_request_operation_id(request_operation_id)?;
+        if request_operation_id.is_some_and(|value| value != admission.operation_id()) {
+            return Err(AstralError::Validation(
+                "card status operation differs from its admission".into(),
+            ));
+        }
         // 状态变更是授权 source mutation：必须携带 Gateway 已验证的正数 actor。
         require_positive_actor(actor_id, "user card status mutation")?;
 
@@ -454,6 +682,7 @@ impl CardRepository for SqlxCardRepository {
         .await
         .map_err(|e| AstralError::Database(format!("Lock user_card failed: {e}")))?;
         let locked = locked.ok_or_else(|| AstralError::NotFound("user card not found".into()))?;
+        require_admission_card_scope(&admission, card_id, &locked)?;
         let _owner_user_id =
             require_actor_owned_active_card(&locked, actor_id, card_id, "status mutation")?;
 
@@ -462,13 +691,33 @@ impl CardRepository for SqlxCardRepository {
         // ── Phase 2: 状态机判定（先于 UPDATE；迁移非法则零副作用回滚）────────
         validate_card_status_transition(&locked.card_status, &requested_status)?;
 
-        // 离开 ACTIVE 与同状态回显都以锁定 CARD head 代次确定性派生稳定
-        // operation id（capture-before-write；身份失败时不残留任何 source 变更）。
-        let locked_generation = lock_card_head_generation_in_tx(&mut tx, card_id).await?;
-        let operation_id = match request_operation_id {
-            Some(explicit) => explicit,
-            None => derive_update_card_operation_id(card_id, locked_generation)?,
-        };
+        // A same-status echo is a proven source no-op. The middleware owns the
+        // reservation's durable ABORTED tombstone after the handler returns; this
+        // repository must not consume/stage it or emit a synthetic CARD_UPDATE.
+        if !exits_active {
+            tx.rollback().await.map_err(|e| {
+                AstralError::Database(format!("Rollback card status no-op tx failed: {e}"))
+            })?;
+            return Ok(());
+        }
+
+        let operation_id = admission.operation_id().to_owned();
+        let mut eligibility_capture =
+            source_writer_guard::EligibilityTransaction::Captured(Box::new(
+                EligibilitySourceCapture::begin_in_tx(
+                    &mut tx,
+                    &admission,
+                    EligibilitySourceSubject::CardStatus { card_id },
+                )
+                .await
+                .map_err(|error| AstralError::Pending(error.to_string()))?,
+            ));
+        macro_rules! card_tx {
+            () => {{
+                eligibility_capture.with_tx_mut()
+            }};
+        }
+        let delivery_context = self.require_delivery_context()?;
 
         // ── Phase 3: source UPDATE（锁定状态下 status 谓词作为第二道防线）────
         let result =
@@ -476,7 +725,7 @@ impl CardRepository for SqlxCardRepository {
                 .bind(&requested_status)
                 .bind(card_id)
                 .bind(&locked.card_status)
-                .execute(&mut *tx)
+                .execute(&mut **card_tx!())
                 .await
                 .map_err(|e| {
                     AstralError::Database(format!("Update user_card status failed: {e}"))
@@ -486,55 +735,97 @@ impl CardRepository for SqlxCardRepository {
         }
 
         // ── Phase 4: 投影 + 审计（与 source UPDATE 同一事务）────────────────
-        if exits_active {
-            // 停用/吊销/挂起：带 actor/operation 元数据的 CARD REVOKE，ELIGIBILITY
-            // 资格事件同事务（状态变更必然影响 `perm:card:active`），审计关联行
-            // （`audit_log`，event_type `USER_CARD_MUTATION`）同事务落库。
-            let parent_projection = append_projection_with_metadata(
-                &mut tx,
-                ProjectionAggregate::Card,
+        // 投影事件的 durable 身份保留给 source outcome evidence（同事务读回）。
+        let parent_projection = append_projection_with_metadata(
+            &mut *card_tx!(),
+            ProjectionAggregate::Card,
+            card_id,
+            EVENT_TYPE_REVOKE,
+            actor_id,
+            &operation_id,
+        )
+        .await?;
+        let eligibility_event =
+            source_writer_guard::append_card_eligibility_with_invalidation_in_tx(
+                &mut *card_tx!(),
+                delivery_context,
                 card_id,
-                EVENT_TYPE_REVOKE,
-                actor_id,
+                locked.tenant_id,
                 &operation_id,
             )
             .await?;
-            astral_db::append_projection_event_in_tx(
-                &mut tx,
-                ProjectionAggregate::Eligibility,
-                card_id,
-                EVENT_TYPE_ELIGIBILITY_UPDATE,
-            )
-            .await?;
-            insert_user_card_status_audit_in_tx(
-                &mut tx,
-                &UserCardStatusAuditEntry {
-                    actor_id,
-                    owner_user_id: locked.user_id.unwrap_or_default(),
-                    target_card_id: card_id,
-                    operation_id: &operation_id,
-                    parent_event_id: &parent_projection.event_id,
-                    from_status: &locked.card_status,
-                    to_status: &requested_status,
-                    tenant_id: locked.tenant_id,
-                    domain_id: locked.domain_id,
-                },
-            )
-            .await?;
-        } else {
-            // 同状态回显不是吊销：legacy CARD_UPDATE 语义保持，但投影带上
-            // actor/operation 元数据（P0 审计/关联缺口修复），且不因回显失效
-            // `perm:card:active` 资格（无 ELIGIBILITY 事件）。
-            append_projection_with_metadata(
-                &mut tx,
-                ProjectionAggregate::Card,
-                card_id,
-                "CARD_UPDATE",
+        let status_audit_id = insert_user_card_status_audit_in_tx(
+            &mut *card_tx!(),
+            &UserCardStatusAuditEntry {
                 actor_id,
-                &operation_id,
+                owner_user_id: locked.user_id.unwrap_or_default(),
+                target_card_id: card_id,
+                operation_id: &operation_id,
+                parent_event_id: &parent_projection.event_id,
+                from_status: &locked.card_status,
+                to_status: &requested_status,
+                tenant_id: locked.tenant_id,
+                domain_id: locked.domain_id,
+            },
+        )
+        .await?;
+        let projection_event_ids = vec![
+            parent_projection.event_id.clone(),
+            eligibility_event.event_id.clone(),
+        ];
+        // 写后同事务回读与资格证明都由闭合 capture 读取，避免调用方自报
+        // before/after 或把 typed invalidation receipt 当作 completion proof。
+        let eligibility_receipt = eligibility_capture.finish_in_tx().await?.ok_or_else(|| {
+            AstralError::Pending(
+                "card status mutation did not return its opaque eligibility receipt".into(),
             )
-            .await?;
-        }
+        })?;
+        source_writer_guard::validate_and_consume_admission(&mut tx, &admission).await?;
+        // 已 admitted source outcome：保留真实 source statement/audit receipts；
+        // closed eligibility receipt 提供真实 user_card target 与 completion evidence。
+        let mut outcome = source_writer_guard::IdentitySourceOutcome::new().receipt(
+            source_writer_guard::SourceStatementReceipt {
+                entity: "user_card",
+                key: serde_json::json!({ "cardId": card_id }),
+                kind: astral_db::WriteKind::Update,
+                rows_affected: result.rows_affected(),
+                durable_id: card_id.to_string(),
+            },
+        );
+        outcome = outcome.receipt(source_writer_guard::SourceStatementReceipt {
+            entity: "audit_log",
+            key: serde_json::json!({ "id": status_audit_id, "eventType": "USER_CARD_MUTATION" }),
+            kind: astral_db::WriteKind::Insert,
+            rows_affected: 1,
+            durable_id: status_audit_id.to_string(),
+        });
+        let stage_result = serde_json::json!({
+            "operationId": operation_id,
+            "targetCardId": card_id,
+            "fromStatus": locked.card_status,
+            "toStatus": requested_status,
+            "rowsAffected": result.rows_affected(),
+        });
+        // 状态变更不写 canonical grant delta：走 eligibility provenance 路由的
+        // staged artifact（无 delta/无 coverage），绝不伪造 delta 或现读自签。
+        outcome = outcome.target(source_writer_guard::source_target_from_eligibility_receipt(
+            &eligibility_receipt,
+        ));
+        stage_card_source_outcome(
+            &mut tx,
+            &admission,
+            outcome,
+            projection_event_ids,
+            serde_json::json!({
+                "affectedCards": [{ "cardId": card_id, "tenantId": locked.tenant_id }],
+            }),
+            &stage_result,
+            None,
+            None,
+            Vec::new(),
+            Some(eligibility_receipt),
+        )
+        .await?;
         arm_card_commit_fence(&source_guard);
         let commit_result = tx.commit().await;
         settle_card_commit_fence(&source_guard, &commit_result);
@@ -543,6 +834,8 @@ impl CardRepository for SqlxCardRepository {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn update_user_card(
         &self,
         card_id: i64,
@@ -551,6 +844,7 @@ impl CardRepository for SqlxCardRepository {
         tenant_id: Option<i64>,
         actor_id: i64,
         request_operation_id: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<(), AstralError> {
         // ── Phase 0: 纯校验先于任何 durable 写入 ─────────────────────────────
         require_positive_actor(actor_id, "user card template mutation")?;
@@ -579,6 +873,7 @@ impl CardRepository for SqlxCardRepository {
         .await
         .map_err(|e| AstralError::Database(format!("Lock user_card failed: {e}")))?;
         let locked = locked.ok_or_else(|| AstralError::NotFound("user card not found".into()))?;
+        require_admission_card_scope(&admission, card_id, &locked)?;
         let owner_user_id =
             require_actor_owned_active_card(&locked, actor_id, card_id, "template mutation")?;
         if locked.tenant_id != tenant_id || locked.domain_id != domain_id {
@@ -597,53 +892,55 @@ impl CardRepository for SqlxCardRepository {
             ))
         })?;
 
-        // 稳定 operation id：显式请求 id 原样贯穿，否则以锁定 CARD head 代次派生。
-        let locked_generation = lock_card_head_generation_in_tx(&mut tx, card_id).await?;
-        let operation_id = match request_operation_id {
-            Some(explicit) => explicit,
-            None => derive_update_card_operation_id(card_id, locked_generation)?,
-        };
+        if request_operation_id
+            .as_deref()
+            .is_some_and(|value| value != admission.operation_id())
+        {
+            return Err(AstralError::Validation(
+                "card rebind operation differs from its admission".into(),
+            ));
+        }
+        let operation_id = admission.operation_id().to_owned();
 
         if locked.template_id == Some(template_id) {
-            // 同模板回显：无账本对账面，legacy CARD_UPDATE 投影带元数据 + 审计行。
-            let parent_projection = append_projection_with_metadata(
-                &mut tx,
-                ProjectionAggregate::Card,
-                card_id,
-                "CARD_UPDATE",
-                actor_id,
-                &operation_id,
-            )
-            .await?;
-            let detail = serde_json::json!({
-                "actorId": actor_id,
-                "ownerUserId": owner_user_id,
-                "targetCardId": card_id,
-                "operationId": operation_id,
-                "parentEventId": parent_projection.event_id,
-                "fromTemplateId": locked.template_id,
-                "toTemplateId": template_id,
-                "templateChanged": false,
-                "action": "card_template_change",
-            });
-            insert_user_card_mutation_audit_in_tx(
-                &mut tx,
-                actor_id,
-                card_id,
-                "card_template_change",
-                "CARD_UPDATED",
-                &operation_id,
-                locked.tenant_id,
-                locked.domain_id,
-                &detail.to_string(),
-            )
-            .await?;
-            arm_card_commit_fence(&source_guard);
-            let commit_result = tx.commit().await;
-            settle_card_commit_fence(&source_guard, &commit_result);
-            commit_result
-                .map_err(|e| AstralError::Database(format!("Commit card update tx failed: {e}")))?;
+            tx.rollback().await.map_err(|error| {
+                AstralError::Database(format!("Rollback card template no-op failed: {error}"))
+            })?;
             return Ok(());
+        }
+        if let Some(receipt) = try_empty_template_rebind_in_tx(
+            &mut tx,
+            &admission,
+            card_id,
+            template_id,
+            actor_id,
+            self.require_delivery_context()?,
+        )
+        .await?
+        {
+            validate_and_consume_admission(&mut tx, &admission).await?;
+            let outcome = source_writer_guard::IdentitySourceOutcome::new()
+                .target(source_writer_guard::source_target_from_eligibility_receipt(
+                    &receipt,
+                ))
+                .receipt(source_writer_guard::SourceStatementReceipt {
+                    entity: "user_card",
+                    key: serde_json::json!({"cardId": card_id}),
+                    kind: astral_db::WriteKind::Update,
+                    rows_affected: 1,
+                    durable_id: card_id.to_string(),
+                });
+            stage_card_source_outcome(
+                &mut tx, &admission, outcome, Vec::new(), serde_json::json!({}),
+                &serde_json::json!({"operationId": operation_id, "targetCardId": card_id, "templateChanged": true}),
+                None, None, Vec::new(), Some(receipt),
+            ).await?;
+            arm_card_commit_fence(&source_guard);
+            let committed = tx.commit().await;
+            settle_card_commit_fence(&source_guard, &committed);
+            return committed.map_err(|error| {
+                AstralError::Database(format!("Commit card rebind failed: {error}"))
+            });
         }
 
         // ── Phase 2: 模板绑定对账（REMOVE 旧模板 → ADD 新模板，同一事务）─────
@@ -665,6 +962,15 @@ impl CardRepository for SqlxCardRepository {
         .map_err(|e| AstralError::Database(format!("Probe old template rule sets failed: {e}")))?;
 
         let mut removed_event_ids: Vec<String> = Vec::new();
+        // source outcome evidence 采集（重绑定）：旧/新模板两侧实际写入的 ref
+        // 主键、DELETE 行数、投影事件 durable 身份与审计行数（有界窗口 + 显式
+        // total，绝不伪造 receipt）。
+        let mut removed_ref_rows: Vec<(i64, u64)> = Vec::new();
+        let mut created_ref_ids: Vec<i64> = Vec::new();
+        let mut projection_event_ids: Vec<String> = Vec::new();
+        let mut rule_set_audit_count: usize = 0;
+        // 本事务真实写入的 grant delta append requests（REMOVE + ADD 两侧）。
+        let mut delta_requests: Vec<astral_db::DeltaEventAppendRequest> = Vec::new();
         for rule_set_id in &old_rule_set_ids {
             // 规则集 source 行（FOR UPDATE；模板绑定缺失 source 行属于持久层
             // 不变式破坏 —— 无法证明绑定集合，fail-closed 拒绝而不是猜测）。
@@ -715,6 +1021,7 @@ impl CardRepository for SqlxCardRepository {
                 &operation_id,
             )
             .await?;
+            projection_event_ids.push(card_projection.event_id.clone());
 
             let mut contribution_event_ids: Vec<String> = Vec::new();
             let mut rule_set_entry_ids: Vec<i64> = Vec::new();
@@ -726,7 +1033,7 @@ impl CardRepository for SqlxCardRepository {
                             .into(),
                     ));
                 }
-                let removed = materialize_template_removes_in_tx(
+                let (removed, removed_delta_requests) = materialize_template_removes_in_tx(
                     &mut tx,
                     *rule_set_id,
                     &card_projection,
@@ -740,6 +1047,7 @@ impl CardRepository for SqlxCardRepository {
                     &allow_entries,
                 )
                 .await?;
+                delta_requests.extend(removed_delta_requests);
                 for contribution in removed {
                     contribution_event_ids.push(contribution.event_id);
                     rule_set_entry_ids.push(contribution.entry_id);
@@ -766,6 +1074,7 @@ impl CardRepository for SqlxCardRepository {
                     "RuleSet revoke projection tenant does not match binding scope".into(),
                 ));
             }
+            projection_event_ids.push(rule_projection.event_id.clone());
             // UNBIND_CARD 审计关联行：parent RULE_SET 事件号 + 全部贡献维度。
             let old_value = serde_json::json!({
                 "cardId": card_id,
@@ -798,14 +1107,16 @@ impl CardRepository for SqlxCardRepository {
 
             // Source 删除最后执行：全部 REMOVE、RULE_SET 投影/审计都已从锁定
             // 捕获写完，任何失败回滚整个 mutation（绝不只删 source 不撤授权）。
-            sqlx::query("DELETE FROM card_rule_set_ref WHERE card_id = ? AND rule_set_id = ?")
-                .bind(card_id)
-                .bind(rule_set_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    AstralError::Database(format!("Delete card_rule_set_ref failed: {e}"))
-                })?;
+            let deleted_refs =
+                sqlx::query("DELETE FROM card_rule_set_ref WHERE card_id = ? AND rule_set_id = ?")
+                    .bind(card_id)
+                    .bind(rule_set_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        AstralError::Database(format!("Delete card_rule_set_ref failed: {e}"))
+                    })?;
+            removed_ref_rows.push((*rule_set_id, deleted_refs.rows_affected()));
         }
 
         // ADD：新模板 RuleSet 绑定（与 create_card 同一物化核心）。
@@ -825,6 +1136,7 @@ impl CardRepository for SqlxCardRepository {
             &operation_id,
         )
         .await?;
+        projection_event_ids.push(add_anchor.event_id.clone());
 
         let mut added_event_ids: Vec<String> = Vec::new();
         for row in &locked_rule_sets {
@@ -861,7 +1173,7 @@ impl CardRepository for SqlxCardRepository {
                 &operation_id,
             )
             .await?;
-            let addition = materialize_template_adds_in_tx(
+            let (addition, addition_delta_requests) = materialize_template_adds_in_tx(
                 &mut tx,
                 row.rule_set_id,
                 &add_anchor,
@@ -875,6 +1187,8 @@ impl CardRepository for SqlxCardRepository {
                 "BASE",
             )
             .await?;
+            delta_requests.extend(addition_delta_requests);
+            created_ref_ids.push(ref_id);
 
             let addition_detail = serde_json::json!({
                 "cardId": card_id,
@@ -888,8 +1202,8 @@ impl CardRepository for SqlxCardRepository {
                     .map(|entry| entry.event_id.as_str())
                     .collect::<Vec<_>>(),
                 "ruleSetEntryIds": addition.iter().map(|entry| entry.entry_id).collect::<Vec<_>>(),
-                "boundCardIds": [card_id],
-                "bindingRefIds": [ref_id],
+                "boundCardIds": addition.iter().map(|_| card_id).collect::<Vec<_>>(),
+                "bindingRefIds": addition.iter().map(|_| ref_id).collect::<Vec<_>>(),
             });
             insert_rule_set_projection_audit_in_tx(
                 &mut tx,
@@ -915,6 +1229,7 @@ impl CardRepository for SqlxCardRepository {
                     .map(|entry| entry.event_id)
                     .collect::<Vec<_>>(),
             );
+            rule_set_audit_count += 1;
         }
 
         // ── Phase 3: source UPDATE（锁定状态下 template 谓词作为第二道防线）──
@@ -940,6 +1255,7 @@ impl CardRepository for SqlxCardRepository {
             &operation_id,
         )
         .await?;
+        projection_event_ids.push(parent_projection.event_id.clone());
         let detail = serde_json::json!({
             "actorId": actor_id,
             "ownerUserId": owner_user_id,
@@ -953,7 +1269,7 @@ impl CardRepository for SqlxCardRepository {
             "addedContributionEventIds": added_event_ids,
             "action": "card_template_change",
         });
-        insert_user_card_mutation_audit_in_tx(
+        let audit_id = insert_user_card_mutation_audit_in_tx(
             &mut tx,
             actor_id,
             card_id,
@@ -965,6 +1281,121 @@ impl CardRepository for SqlxCardRepository {
             &detail.to_string(),
         )
         .await?;
+        // 写后同事务回读：after 镜像来自本事务实际写入的行（真实探针）。
+        let after_row = read_back_card_row_in_tx(&mut tx, card_id).await?;
+        validate_and_consume_admission(&mut tx, &admission).await?;
+        // 已 admitted source outcome（rebind）：真实目标镜像 + 真实语句 receipt
+        //（user_card UPDATE、有界窗口 ref DELETE/INSERT、audit 行）+ 同事务
+        // 投影 outbox 读回；stage/promote 同事务闭合。
+        let (removed_window, removed_total) = source_writer_guard::bounded_receipt_window(
+            removed_ref_rows
+                .iter()
+                .map(|(rule_set_id, rows)| {
+                    serde_json::json!({ "ruleSetId": rule_set_id, "rows": rows }).to_string()
+                })
+                .collect(),
+            source_writer_guard::SOURCE_OUTCOME_RECEIPT_WINDOW,
+        );
+        let (ref_window, ref_total) = source_writer_guard::bounded_receipt_window(
+            created_ref_ids.iter().map(|id| id.to_string()).collect(),
+            source_writer_guard::SOURCE_OUTCOME_RECEIPT_WINDOW,
+        );
+        let mut outcome = source_writer_guard::IdentitySourceOutcome::new()
+            .target(source_writer_guard::SourceTargetImage {
+                entity: "user_card",
+                key: serde_json::json!({ "cardId": card_id }),
+                before: source_writer_guard::SourceRowPresence::present(card_row_image(
+                    card_id, &locked,
+                )),
+                after: match &after_row {
+                    Some(row) => source_writer_guard::SourceRowPresence::present(card_row_image(
+                        card_id, row,
+                    )),
+                    None => source_writer_guard::SourceRowPresence::Absent,
+                },
+            })
+            .receipt(source_writer_guard::SourceStatementReceipt {
+                entity: "user_card",
+                key: serde_json::json!({ "cardId": card_id }),
+                kind: astral_db::WriteKind::Update,
+                rows_affected: result.rows_affected(),
+                durable_id: card_id.to_string(),
+            })
+            .receipt(source_writer_guard::SourceStatementReceipt {
+                entity: "audit_log",
+                key: serde_json::json!({ "id": audit_id, "eventType": "USER_CARD_MUTATION" }),
+                kind: astral_db::WriteKind::Insert,
+                rows_affected: 1,
+                durable_id: audit_id.to_string(),
+            });
+        for removed in &removed_window {
+            let removed: serde_json::Value = serde_json::from_str(removed).map_err(|error| {
+                AstralError::Internal(format!(
+                    "removed rule set ref window decode failed: {error}"
+                ))
+            })?;
+            let rule_set_id = removed["ruleSetId"].as_i64().unwrap_or_default();
+            let rows = removed["rows"].as_u64().unwrap_or_default();
+            outcome = outcome.receipt(source_writer_guard::SourceStatementReceipt {
+                entity: "card_rule_set_ref",
+                key: serde_json::json!({ "cardId": card_id, "ruleSetId": rule_set_id }),
+                kind: astral_db::WriteKind::Delete,
+                rows_affected: rows,
+                durable_id: format!("{card_id}:{rule_set_id}"),
+            });
+        }
+        for ref_id_text in &ref_window {
+            outcome = outcome.receipt(source_writer_guard::SourceStatementReceipt {
+                entity: "card_rule_set_ref",
+                key: serde_json::json!({ "id": ref_id_text, "cardId": card_id }),
+                kind: astral_db::WriteKind::Insert,
+                rows_affected: 1,
+                durable_id: ref_id_text.clone(),
+            });
+        }
+        let stage_result = serde_json::json!({
+            "operationId": operation_id,
+            "targetCardId": card_id,
+            "fromTemplateId": locked.template_id,
+            "toTemplateId": template_id,
+            "templateChanged": true,
+            "rowsAffected": result.rows_affected(),
+        });
+        // canonical delta 证据在本事务内真实捕获（REMOVE + ADD 两侧 revision 链）；
+        // 两侧均无可证明 delta 时保持 None（绝不伪造）。
+        let delta_evidence = if delta_requests.is_empty() {
+            None
+        } else {
+            Some(
+                astral_db::capture_delta_source_outcome_in_tx(&mut tx, &delta_requests)
+                    .await
+                    .map_err(map_grant_repository_error)?,
+            )
+        };
+        // finite coverage：rebind 的影响面就是本卡（同事务锁定派生，恒 ≤256）。
+        let coverage = delta_evidence
+            .as_ref()
+            .map(|_| card_coverage_scope(card_tenant_id, card_id, owner_user_id, locked.domain_id));
+        stage_card_source_outcome(
+            &mut tx,
+            &admission,
+            outcome,
+            projection_event_ids,
+            serde_json::json!({
+                "removedRuleSetRefs": removed_total,
+                "removedRefReceipts": removed_window.len(),
+                "ruleSetRefs": ref_total,
+                "refReceipts": ref_window.len(),
+                "ruleSetAudits": rule_set_audit_count,
+                "affectedCards": [{ "cardId": card_id, "tenantId": locked.tenant_id }],
+            }),
+            &stage_result,
+            delta_evidence,
+            coverage,
+            Vec::new(),
+            None,
+        )
+        .await?;
         arm_card_commit_fence(&source_guard);
         let commit_result = tx.commit().await;
         settle_card_commit_fence(&source_guard, &commit_result);
@@ -972,6 +1403,53 @@ impl CardRepository for SqlxCardRepository {
             .map_err(|e| AstralError::Database(format!("Commit card update tx failed: {e}")))?;
         Ok(())
     }
+}
+
+/// Compare a proof scope with the locked user-card aggregate before any
+/// source mutation is committed. Broad or domain-less proof scopes cannot
+/// authorize a card-specific source write.
+fn require_admission_card_scope(
+    admission: &AuthorizationAdmission,
+    card_id: i64,
+    locked: &LockedCardRow,
+) -> Result<(), AstralError> {
+    let proof_scope = &admission.proof().scope;
+    let domain_matches = matches!(
+        proof_scope.domain,
+        astral_types::AuthorizationDomainScope::Exact(domain_id)
+            if Some(domain_id) == locked.domain_id
+    );
+    let locked_tenant_id = locked.tenant_id.ok_or_else(|| {
+        AstralError::Permission(
+            "authorization admission cannot authorize a user card without a tenant scope".into(),
+        )
+    })?;
+    if proof_scope.card_id != card_id
+        || proof_scope.tenant_id != locked_tenant_id
+        || proof_scope.user_id != locked.user_id
+        || !domain_matches
+    {
+        return Err(AstralError::Permission(
+            "authorization admission scope does not match the locked user card".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Revalidate the request capability against durable authority rows immediately
+/// before COMMIT, then consume the shared request slot. Validation failure does
+/// not consume the slot; a consumed slot is never reset after commit failure or
+/// an unknown commit outcome.
+async fn validate_and_consume_admission(
+    tx: &mut Transaction<'_, MySql>,
+    admission: &AuthorizationAdmission,
+) -> Result<(), AstralError> {
+    astral_db::consume_authorization_admission_in_tx(tx, admission)
+        .await
+        .map_err(|error| AstralError::Pending(error.to_string()))?;
+    admission
+        .consume_once()
+        .map_err(|error| AstralError::Pending(error.to_string()))
 }
 
 /// Require a locked card row to remain owned by the authenticated actor and ACTIVE.
@@ -1374,7 +1852,13 @@ async fn materialize_template_adds_in_tx(
     card_tenant_id: i64,
     card_domain_id: Option<i64>,
     ref_type: &str,
-) -> Result<Vec<ContributionEvidence>, AstralError> {
+) -> Result<
+    (
+        Vec<ContributionEvidence>,
+        Vec<astral_db::DeltaEventAppendRequest>,
+    ),
+    AstralError,
+> {
     if ref_id <= 0 || card_id <= 0 || rule_set_id <= 0 {
         return Err(AstralError::Internal(
             "template rule set binding requires positive card/rule-set/ref identifiers".into(),
@@ -1397,6 +1881,7 @@ async fn materialize_template_adds_in_tx(
     let entries = read_rule_set_entries_in_tx(tx, rule_set_id, true).await?;
     let allow_entries = materializable_allow_entries(&entries)?;
     let mut added = Vec::with_capacity(allow_entries.len());
+    let mut delta_requests = Vec::with_capacity(allow_entries.len());
     for entry in allow_entries {
         let (resource, action) = canonical_entry_grant_fields(entry)?;
         let facts = RuleSetEntryLedgerFacts {
@@ -1427,12 +1912,16 @@ async fn materialize_template_adds_in_tx(
         let (base_version, target_version) =
             next_delta_version(None).map_err(map_grant_repository_error)?;
         append_ruleset_grant_delta_in_tx(tx, &draft, base_version, target_version).await?;
+        // 真实 delta append request：与刚写入的 revision/delta 共享同一草稿
+        // 身份，供本事务内 capture_delta_source_outcome_in_tx 捕获 canonical
+        // 证据（绝不在 publication 侧猜测或现读自签）。
+        delta_requests.push(draft.delta_event_request(base_version, target_version)?);
         added.push(ContributionEvidence {
             entry_id: entry.entry_id,
             event_id: contribution_event_id,
         });
     }
-    Ok(added)
+    Ok((added, delta_requests))
 }
 
 /// 模板解绑 REMOVE 物化（对齐 trustgraph `materialize_ruleset_removals_for_card_in_tx`）：
@@ -1451,8 +1940,15 @@ async fn materialize_template_removes_in_tx(
     card_domain_id: Option<i64>,
     ref_type: &str,
     allow_entries: &[&LockedRuleSetEntryRow],
-) -> Result<Vec<ContributionEvidence>, AstralError> {
+) -> Result<
+    (
+        Vec<ContributionEvidence>,
+        Vec<astral_db::DeltaEventAppendRequest>,
+    ),
+    AstralError,
+> {
     let mut removed = Vec::with_capacity(allow_entries.len());
+    let mut delta_requests = Vec::with_capacity(allow_entries.len());
     for entry in allow_entries {
         let (resource, action) = canonical_entry_grant_fields(entry)?;
         let facts = RuleSetEntryLedgerFacts {
@@ -1512,12 +2008,14 @@ async fn materialize_template_removes_in_tx(
             &contribution_event_id,
         )?;
         append_ruleset_grant_delta_in_tx(tx, &draft, base_version, target_version).await?;
+        // 真实 delta append request：与刚写入的 revision/delta 共享同一草稿身份。
+        delta_requests.push(draft.delta_event_request(base_version, target_version)?);
         removed.push(ContributionEvidence {
             entry_id: entry.entry_id,
             event_id: contribution_event_id,
         });
     }
-    Ok(removed)
+    Ok((removed, delta_requests))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2000,11 +2498,12 @@ struct UserCardStatusAuditEntry<'a> {
 
 /// 把用户卡状态变更的审计关联写入同一事务（对齐 trustgraph
 /// `insert_user_card_status_audit_in_tx`：与 source UPDATE、CARD REVOKE
-/// head/outbox、ELIGIBILITY 事件共享同一稳定 operation_id）。
+/// head/outbox、ELIGIBILITY 事件共享同一稳定 operation_id）。返回实际
+/// audit_log 主键（source outcome 的真实语句 receipt 需要 durable id）。
 async fn insert_user_card_status_audit_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     entry: &UserCardStatusAuditEntry<'_>,
-) -> Result<(), AstralError> {
+) -> Result<i64, AstralError> {
     if entry.actor_id <= 0 || entry.target_card_id <= 0 {
         return Err(AstralError::Validation(
             "user card status audit requires a positive actor id and target card id".into(),
@@ -2033,7 +2532,7 @@ async fn insert_user_card_status_audit_in_tx(
         "action": "status_revoke",
     })
     .to_string();
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO audit_log \
          (user_id, card_id, action, resource, decision, reason, event_type, request_id, \
           domain_id, tenant_id, detail) \
@@ -2050,11 +2549,17 @@ async fn insert_user_card_status_audit_in_tx(
     .execute(&mut **tx)
     .await
     .map_err(|e| AstralError::Database(format!("user card status audit insert failed: {e}")))?;
-    Ok(())
+    i64::try_from(result.last_insert_id())
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            AstralError::Internal("user card status audit insert returned an unusable id".into())
+        })
 }
 
 /// 把用户卡模板变更的审计关联行写入同一事务（`audit_log` 表，事件族与状态
-/// 变更审计一致：`USER_CARD_MUTATION`）。
+/// 变更审计一致：`USER_CARD_MUTATION`）。返回实际 audit_log 主键（source
+/// outcome 的真实语句 receipt 需要 durable id）。
 #[allow(clippy::too_many_arguments)]
 async fn insert_user_card_mutation_audit_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
@@ -2066,14 +2571,14 @@ async fn insert_user_card_mutation_audit_in_tx(
     tenant_id: Option<i64>,
     domain_id: Option<i64>,
     detail: &str,
-) -> Result<(), AstralError> {
+) -> Result<i64, AstralError> {
     if actor_id <= 0 || target_card_id <= 0 || operation_id.trim().is_empty() {
         return Err(AstralError::Validation(
             "user card mutation audit requires a positive actor/target card and operation id"
                 .into(),
         ));
     }
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO audit_log \
          (user_id, card_id, action, resource, decision, reason, event_type, request_id, \
           domain_id, tenant_id, detail) \
@@ -2090,7 +2595,12 @@ async fn insert_user_card_mutation_audit_in_tx(
     .execute(&mut **tx)
     .await
     .map_err(|e| AstralError::Database(format!("user card mutation audit insert failed: {e}")))?;
-    Ok(())
+    i64::try_from(result.last_insert_id())
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            AstralError::Internal("user card mutation audit insert returned an unusable id".into())
+        })
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -2182,8 +2692,212 @@ fn settle_card_commit_fence(
     }
 }
 
+/// 锁定/回读卡行的真实镜像（只含身份列与本仓 mutation 实际触及的列；两侧都
+/// 是事务内真实探针，绝不以 actor 快照或 operation id 替代目标证据）。
+fn card_row_image(card_id: i64, row: &LockedCardRow) -> serde_json::Value {
+    serde_json::json!({
+        "cardId": card_id,
+        "cardStatus": row.card_status,
+        "userId": row.user_id,
+        "tenantId": row.tenant_id,
+        "domainId": row.domain_id,
+        "templateId": row.template_id,
+    })
+}
+
+/// 写后同事务回读卡行（与锁定读同列集）：`None` 是真实探针结果。
+async fn read_back_card_row_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    card_id: i64,
+) -> Result<Option<LockedCardRow>, AstralError> {
+    sqlx::query_as(
+        "SELECT card_status, user_id, tenant_id, domain_id, template_id \
+         FROM user_card WHERE card_id = ?",
+    )
+    .bind(card_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| AstralError::Database(format!("Read back user_card failed: {e}")))
+}
+
+/// 已 admitted 卡 source 事务的 stage/promote 闭合（COMMIT await 前调用）。
+///
+/// `outcome` 由调用方装配：真实目标 before/after 镜像 + 真实语句 receipt
+/// （实际主键/WriteKind/rows_affected/durable id）+ 同事务 audit 行 receipt；
+/// `projection_event_ids` 是本事务写入的 CARD/RULE_SET/ELIGIBILITY 投影事件
+/// durable 身份——经共享有界窗口 + `FOR UPDATE` 读回验证后作为 receipt 进入
+/// evidence（缺失/不匹配 PENDING fail-closed），溢出量以显式 total 计入
+/// staged artifact。`delta`/`coverage` 只接受本事务真实捕获/锁定派生的值
+/// （create/rebind；其余路径 None）。最终委托共享
+/// `stage_identity_source_outcome_in_tx`（AuthorizationSource）。
+#[allow(clippy::too_many_arguments)]
+async fn stage_card_source_outcome(
+    tx: &mut Transaction<'_, MySql>,
+    admission: &AuthorizationAdmission,
+    outcome: source_writer_guard::IdentitySourceOutcome,
+    projection_event_ids: Vec<String>,
+    fanout_totals: serde_json::Value,
+    result: &serde_json::Value,
+    delta: Option<astral_db::DeltaSourceOutcomeEvidence>,
+    coverage: Option<astral_types::AuthorityStagedScopeCoverage>,
+    eligibility_receipts: Vec<source_writer_guard::UserInvalidationReceipt>,
+    eligibility_receipt: Option<EligibilitySourceEvidenceReceipt>,
+) -> Result<(), AstralError> {
+    let (window, total) = source_writer_guard::bounded_receipt_window(
+        projection_event_ids,
+        source_writer_guard::SOURCE_OUTCOME_RECEIPT_WINDOW,
+    );
+    let confirmed = source_writer_guard::read_back_projection_outbox_in_tx(tx, &window).await?;
+    let mut totals = fanout_totals;
+    if let Some(fields) = totals.as_object_mut() {
+        fields.insert("projectionEvents".into(), serde_json::json!(total));
+        fields.insert(
+            "projectionReceipts".into(),
+            serde_json::json!(confirmed.len()),
+        );
+    }
+    let has_delta = delta.is_some();
+    let has_coverage = coverage.is_some();
+    if !eligibility_receipts.is_empty() {
+        return Err(AstralError::Pending(
+            "card staging requires the opaque eligibility capture receipt".into(),
+        ));
+    }
+    let mut outcome = outcome.fanout_totals(totals);
+    if let Some(delta) = delta {
+        outcome = outcome.with_delta(delta);
+    }
+    if let Some(coverage) = coverage {
+        outcome = outcome.with_coverage(coverage);
+    }
+    for event_id in &confirmed {
+        outcome = outcome.receipt(source_writer_guard::SourceStatementReceipt {
+            entity: "authorization_projection_outbox",
+            key: serde_json::json!({ "eventId": event_id }),
+            kind: astral_db::WriteKind::Insert,
+            rows_affected: 1,
+            durable_id: event_id.clone(),
+        });
+    }
+    if has_delta || has_coverage {
+        if let Some(receipt) = eligibility_receipt {
+            outcome = outcome.with_publication_receipt(receipt);
+        }
+    } else {
+        let receipt = eligibility_receipt.ok_or_else(|| {
+            AstralError::Pending(
+                "card eligibility source mutation lacks its opaque completion receipt".into(),
+            )
+        })?;
+        outcome = outcome.with_eligibility_receipt(receipt);
+    }
+    source_writer_guard::stage_identity_source_outcome_in_tx(tx, admission, outcome, result).await
+}
+
+async fn try_empty_template_rebind_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    admission: &AuthorizationAdmission,
+    card_id: i64,
+    template_id: i64,
+    actor_id: i64,
+    delivery: &InvalidationDeliveryContext,
+) -> Result<Option<EligibilitySourceEvidenceReceipt>, AstralError> {
+    let Some(mut capture) =
+        astral_db::authority_eligibility_completion::CardRebindCapture::try_begin_in_tx(
+            tx,
+            admission,
+            card_id,
+            template_id,
+        )
+        .await
+        .map_err(AstralError::from)?
+    else {
+        return Ok(None);
+    };
+    let old_template_id = capture.old_template_id();
+    let tenant_id = capture.tenant_id();
+    let domain_id = capture.domain_id();
+    let parent = append_projection_with_metadata(
+        capture.with_tx_mut(),
+        ProjectionAggregate::Card,
+        card_id,
+        "CARD_UPDATE",
+        actor_id,
+        admission.operation_id(),
+    )
+    .await?;
+    let base_refs = capture
+        .binding_audit_in_tx()
+        .await
+        .map_err(AstralError::from)?;
+    source_writer_guard::append_card_eligibility_with_invalidation_in_tx(
+        capture.with_tx_mut(),
+        delivery,
+        card_id,
+        Some(tenant_id),
+        admission.operation_id(),
+    )
+    .await?;
+    let detail = serde_json::json!({
+        "actorId": actor_id, "ownerUserId": actor_id, "targetCardId": card_id,
+        "operationId": admission.operation_id(), "fromTemplateId": old_template_id,
+        "toTemplateId": template_id, "templateChanged": true, "action": "card_template_change",
+        "parentEventId": parent.event_id, "baseRefs": base_refs,
+    });
+    insert_user_card_mutation_audit_in_tx(
+        capture.with_tx_mut(),
+        actor_id,
+        card_id,
+        "card_template_change",
+        "CARD_UPDATED",
+        admission.operation_id(),
+        Some(tenant_id),
+        domain_id,
+        &detail.to_string(),
+    )
+    .await?;
+    capture
+        .finish_in_tx()
+        .await
+        .map(Some)
+        .map_err(AstralError::from)
+}
+
+/// 卡路径的 finite coverage scope：由同事务锁定行派生（create/rebind 的影响面
+/// 就是本卡，恒 ≤256）；owner user 必须可证明，domain 缺失以 NoDomain 声明。
+fn card_coverage_scope(
+    tenant_id: i64,
+    card_id: i64,
+    _user_id: i64,
+    _domain_id: Option<i64>,
+) -> astral_types::AuthorityStagedScopeCoverage {
+    astral_types::AuthorityStagedScopeCoverage {
+        scopes: vec![astral_types::AuthorityProtocolScope::Card(
+            astral_types::AuthorizationAuthorityScope {
+                tenant_id,
+                card_id,
+                user_id: None,
+                domain: astral_types::AuthorizationDomainScope::Any,
+            },
+        )],
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn card_coverage_uses_canonical_publication_scope() {
+        let coverage = super::card_coverage_scope(3, 9, 7, Some(4));
+        let card = match &coverage.scopes[0] {
+            astral_types::AuthorityProtocolScope::Card(card) => card,
+            _ => panic!("card coverage must use a card scope"),
+        };
+        assert_eq!(card.tenant_id, 3);
+        assert_eq!(card.card_id, 9);
+        assert_eq!(card.user_id, None);
+        assert_eq!(card.domain, astral_types::AuthorizationDomainScope::Any);
+    }
+
     #[test]
     fn self_service_mutations_require_locked_active_owner() {
         let active = super::LockedCardRow {
@@ -2255,6 +2969,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/src/srv/card_repository.rs"
         ));
+        let source = source.split("#[cfg(test)]").next().unwrap_or(source);
         // 先切到 impl 块：trait 里也有同名方法声明，find 必须跳过 trait。
         let source = &source[source
             .find("impl CardRepository for SqlxCardRepository")
@@ -2270,17 +2985,128 @@ mod tests {
         let tenant_lock = body
             .find("SELECT tenant_id FROM tenant WHERE tenant_id = ? FOR UPDATE")
             .expect("card issue must lock the existing tenant row inside the tx");
-        let insert = body
-            .find("INSERT INTO user_card")
-            .expect("card issue must insert user_card in this file");
+        let capture = body
+            .find("EligibilitySourceCapture::begin_card_create_in_tx(")
+            .expect("card issue must use the closed card-create capture");
         assert!(
-            tenant_lock < insert,
-            "tenant row lock must be taken before the user_card INSERT"
+            tenant_lock < capture,
+            "tenant row lock must be taken before the closed card-create capture"
+        );
+        let capture_source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../astral-db/src/authority_eligibility_completion.rs"
+        ));
+        let capture_production = capture_source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(capture_source);
+        let insert = capture_production
+            .find("pub async fn begin_card_create_in_tx(")
+            .and_then(|start| capture_production[start..].find("INSERT INTO user_card"))
+            .map(|offset| {
+                capture_production
+                    .find("pub async fn begin_card_create_in_tx(")
+                    .expect("card-create capture function must exist")
+                    + offset
+            })
+            .expect("closed card-create capture must own the user_card INSERT");
+        let capture_start = capture_production
+            .find("pub async fn begin_card_create_in_tx(")
+            .expect("card-create capture function must exist");
+        assert!(
+            capture_start < insert,
+            "the closed card-create capture must contain the user_card INSERT"
         );
         assert!(
             body.contains("refusing to issue a user_card"),
             "a missing tenant must fail the issuance closed"
         );
+    }
+
+    #[test]
+    fn every_identity_card_commit_revalidates_and_consumes_admission() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/srv/card_repository.rs"
+        ));
+        let implementation = &source[source
+            .find("impl CardRepository for SqlxCardRepository")
+            .expect("CardRepository impl must stay in card_repository.rs")..];
+        for (anchor, next_anchor, label) in [
+            (
+                "async fn create_user_card(",
+                "async fn list_user_cards(",
+                "create_user_card",
+            ),
+            (
+                "async fn update_user_card_status(",
+                "async fn update_user_card(",
+                "update_user_card_status",
+            ),
+            (
+                "async fn update_user_card(",
+                "/// Compare a proof scope with the locked user-card aggregate",
+                "update_user_card",
+            ),
+        ] {
+            let start = implementation
+                .find(anchor)
+                .unwrap_or_else(|| panic!("{label} implementation must exist"));
+            let body = &implementation[start..];
+            let end = body
+                .find(next_anchor)
+                .unwrap_or_else(|| panic!("{label} body boundary must exist"));
+            let body = &body[..end];
+            let commits = body.matches("tx.commit()").count();
+            let gates = body.matches("validate_and_consume_admission(").count();
+            let arms = body
+                .matches("arm_card_commit_fence(&source_guard);")
+                .count();
+            assert_eq!(
+                commits, gates,
+                "{label}: every commit needs an admission gate"
+            );
+            assert_eq!(
+                commits, arms,
+                "{label}: every commit needs a cancellation fence"
+            );
+            assert!(
+                body.contains("require_admission_card_scope(&admission, card_id, &locked)")
+                    || label == "create_user_card",
+                "{label}: existing-card mutations must bind proof scope to the locked card"
+            );
+            let gate = body
+                .rfind("validate_and_consume_admission(")
+                .expect("admission gate must exist");
+            let arm = body
+                .rfind("arm_card_commit_fence(&source_guard);")
+                .expect("commit fence must exist");
+            assert!(
+                gate < arm,
+                "{label}: admission gate must precede commit fencing"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_card_handlers_extract_and_forward_admission() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/srv/cards.rs"));
+        assert_eq!(
+            source
+                .matches("Extension(admission): Extension<AuthorizationAdmission>")
+                .count(),
+            3,
+            "all three identity card mutation handlers require admission"
+        );
+        for call in [
+            "request_operation_id(&headers),\n                admission,",
+            "request_operation_id(&headers),\n            admission,",
+        ] {
+            assert!(
+                source.contains(call),
+                "handler must forward the extracted admission"
+            );
+        }
     }
 
     #[test]
@@ -2308,7 +3134,7 @@ mod tests {
             ),
             (
                 "async fn update_user_card(",
-                "impl UserCardRow",
+                "/// Compare a proof scope with the locked user-card aggregate",
                 "update_user_card",
             ),
         ] {
@@ -2345,6 +3171,215 @@ mod tests {
                 "{label}: every commit result must be settled (proven on Ok / uncertain on Err)"
             );
         }
+    }
+
+    /// 已 admitted 卡 source 事务的真实 source outcome 契约钉（源形状）：admission
+    /// 消费之后、COMMIT await（arm 取消栅栏）之前同事务完成 stage/promote；
+    /// 目标镜像来自锁定读 + 同事务回读，receipt 覆盖真实语句与投影 outbox 读回。
+    #[test]
+    fn identity_card_mutations_stage_real_source_outcomes_after_consume_before_commit() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/srv/card_repository.rs"
+        ));
+        let implementation = &source[source
+            .find("impl CardRepository for SqlxCardRepository")
+            .expect("CardRepository impl must stay in card_repository.rs")..];
+
+        // The closed DB capture owns selector, target images, generated ids, and
+        // opaque receipts. Keep these assertions pointed at production capture
+        // source, excluding that module's own tests.
+        let capture_source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../astral-db/src/authority_eligibility_completion.rs"
+        ));
+        let capture_production = &capture_source[..capture_source
+            .find("#[cfg(test)]")
+            .expect("eligibility capture tests must follow production source")];
+        let capture_production_normalized: String = capture_production.split_whitespace().collect();
+        let rebind_source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../astral-db/src/authority_eligibility_completion/card_rebind.rs"
+        ));
+        let rebind_production = rebind_source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(rebind_source);
+        let verification_source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../astral-db/src/authority_eligibility_completion/verification.rs"
+        ));
+        let verification_production = verification_source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(verification_source);
+        assert!(
+            capture_production.contains("LIMIT ? FOR UPDATE")
+                && capture_production.contains("ELIGIBILITY_COMPLETION_MAX_CARDS + 1"),
+            "eligibility capture must retain bounded locked selection"
+        );
+        assert!(
+            capture_production
+                .contains("closed card create insert did not produce exactly one durable id")
+                && capture_production
+                    .contains("closed card create did not prove before-absent and after-present"),
+            "CardCreate must prove its generated id and before/after images inside the capture"
+        );
+        assert!(
+            capture_production.contains("pub async fn finish_in_tx(")
+                && capture_production.contains("EligibilitySourceEvidenceReceipt"),
+            "capture completion must remain an opaque evidence receipt"
+        );
+        assert!(
+            capture_production_normalized.contains(
+                "EligibilitySourceOperation::CardStatus|EligibilitySourceOperation::CardRebind=>None",
+            ) && capture_production
+                .contains("card eligibility mutation cannot prove an empty selector"),
+            "CardStatus/CardRebind must not use a typed empty-selection completion"
+        );
+        assert!(
+            capture_production_normalized.contains("pubenumEligibilitySourceOperation")
+                && capture_production_normalized.contains("CardStatus")
+                && capture_production_normalized.contains("CardRebind"),
+            "eligibility capture must retain the typed CardStatus/CardRebind operation enum"
+        );
+        assert!(
+            rebind_production.contains("pub struct CardRebindCapture")
+                && rebind_production.contains("pub async fn try_begin_in_tx")
+                && rebind_production.contains("pub async fn finish_in_tx"),
+            "CardRebind capture must be scanned in its split production module"
+        );
+        assert!(
+            verification_production.contains("EligibilitySourceOperation::CardStatus")
+                && verification_production.contains("EligibilitySourceOperation::CardRebind"),
+            "eligibility verification must retain both typed card operation branches"
+        );
+
+        for (anchor, next_anchor, label) in [
+            (
+                "async fn create_user_card(",
+                "async fn list_user_cards(",
+                "create_user_card",
+            ),
+            (
+                "async fn update_user_card_status(",
+                "async fn update_user_card(",
+                "update_user_card_status",
+            ),
+            (
+                "async fn update_user_card(",
+                "/// Compare a proof scope with the locked user-card aggregate",
+                "update_user_card",
+            ),
+        ] {
+            let start = implementation
+                .find(anchor)
+                .unwrap_or_else(|| panic!("{label} implementation must exist"));
+            let body = &implementation[start..];
+            let end = body
+                .find(next_anchor)
+                .unwrap_or_else(|| panic!("{label} body boundary must exist"));
+            let body = &body[..end];
+            let consume = body
+                .find("validate_and_consume_admission(")
+                .unwrap_or_else(|| panic!("{label} must consume its admission"));
+            let stage = body
+                .find("stage_card_source_outcome(")
+                .unwrap_or_else(|| panic!("{label} must stage its real source outcome"));
+            let arm = body
+                .find("arm_card_commit_fence(&source_guard);")
+                .unwrap_or_else(|| panic!("{label} must arm its commit fence"));
+            assert!(
+                consume < stage,
+                "{label}: staging must follow same-transaction admission consumption"
+            );
+            assert!(
+                stage < arm,
+                "{label}: staging must precede the commit fence"
+            );
+            assert!(
+                body.contains("operation_id()") || label == "update_user_card",
+                "{label}: eligibility source identity must come from admission"
+            );
+        }
+
+        let create_body = {
+            let start = implementation
+                .find("async fn create_user_card(")
+                .expect("create_user_card implementation must exist");
+            let body = &implementation[start..];
+            &body[..body
+                .find("async fn list_user_cards(")
+                .expect("list_user_cards must follow create_user_card")]
+        };
+        let begin = create_body
+            .find("EligibilitySourceCapture::begin_card_create_in_tx(")
+            .expect("CardCreate must use the closed capture insert");
+        let tx_route = create_body
+            .find("card_create_tx!()")
+            .expect("CardCreate writes must use the capture-owned transaction");
+        let admission = create_body
+            .find("validate_and_consume_admission(card_create_tx!(), &admission)")
+            .expect("CardCreate must consume admission on the capture transaction");
+        let publication_finish = create_body
+            .find("finish_publication_in_tx()")
+            .expect("CardCreate publication path must use publication finish");
+        let stage = create_body
+            .find("stage_card_source_outcome(")
+            .expect("CardCreate must stage its source outcome");
+        assert!(
+            begin < tx_route
+                && tx_route < admission
+                && admission < publication_finish
+                && publication_finish < stage,
+            "CardCreate: closed insert, capture transaction, admission, publication receipt, and stage order must remain closed"
+        );
+        assert!(
+            create_body.contains("source_target_from_eligibility_receipt")
+                && create_body.contains("Some(eligibility_receipt)"),
+            "CardCreate target and receipt must come from the opaque capture"
+        );
+
+        let status_body = {
+            let start = implementation
+                .find("async fn update_user_card_status(")
+                .expect("card status implementation must exist");
+            let body = &implementation[start..];
+            &body[..body
+                .find("async fn update_user_card(")
+                .expect("update_user_card must follow card status")]
+        };
+        assert!(
+            status_body.contains("EligibilitySourceSubject::CardStatus { card_id }")
+                && status_body.contains("capture.with_tx_mut()")
+                && status_body.contains("finish_in_tx()"),
+            "CardStatus must use the typed capture subject, capture transaction, and opaque finish"
+        );
+
+        // Target images and durable projection receipts remain real same-tx
+        // probes; this guard deliberately scans only production helpers.
+        let toolkit = &source[source
+            .find("fn card_row_image(card_id: i64, row: &LockedCardRow)")
+            .expect("the card row image helper must stay")
+            ..source
+                .find("#[cfg(test)]")
+                .expect("production precedes tests")];
+        assert!(
+            toolkit.contains("async fn read_back_card_row_in_tx(")
+                && toolkit.contains("FROM user_card WHERE card_id = ?"),
+            "the after image must come from an in-transaction readback"
+        );
+        assert!(
+            toolkit.contains("read_back_projection_outbox_in_tx"),
+            "projection receipts must be verified by in-transaction readback"
+        );
+        assert!(
+            implementation[..implementation.find("#[cfg(test)]").unwrap()]
+                .contains("entity: \"user_card\"")
+                && implementation[..implementation.find("#[cfg(test)]").unwrap()]
+                    .contains("entity: \"audit_log\""),
+            "the target and audit rows must appear as real receipts"
+        );
     }
 
     #[test]

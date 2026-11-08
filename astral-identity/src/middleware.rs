@@ -2,12 +2,18 @@
 //!
 //! 对齐 TrustGraph 的 `permission_check.rs` 模式。
 
-use axum::extract::{Request, State};
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
+
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use astral_common::audit::org_provenance_audit_detail;
+use astral_common::middleware::ip_rate_limit::{
+    rate_limit_response, resolve_client_ip, IpRateLimiter, TrustedProxySet,
+};
 use astral_common::middleware::permission_check_shared::{
     physical_policy_context, request_target_id, resolve_permission_action, BoxedResponse,
     PathResourceMap,
@@ -34,6 +40,8 @@ pub const IDENTITY_PATH_MAP: PathResourceMap = &[
     ("/cards", "identity_users"),
     ("/identities", "identity_users"),
     ("/providers", "identity_users"),
+    ("/profile", "identity_users"),
+    ("/change-password", "identity_users"),
     ("/password", "identity_users"),
     ("/admin", "identity_users"),
     ("/verification", "identity_users"),
@@ -64,10 +72,11 @@ const IDENTITY_SKIP_PATHS: &[&str] = &[
 
 pub async fn identity_permission_middleware(
     State(state): State<AppState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, BoxedResponse> {
-    let path = req.uri().path();
+    let request_path = req.uri().path().to_owned();
+    let path = request_path.as_str();
     let method = req.method().clone();
 
     if is_identity_skip_path(path) {
@@ -138,6 +147,15 @@ pub async fn identity_permission_middleware(
     let mut ctx = physical_policy_context(req.headers(), resource, action, query_target_id)
         .map_err(|status| BoxedResponse::new(status.into_response()))?;
     require_platform_user(&ctx)?;
+    ctx.request_operation_id = Some(
+        astral_common::middleware::request_binding::request_operation_id(&req)
+            .map_err(|status| BoxedResponse::new(status.into_response()))?,
+    );
+    ctx.request_fingerprint = Some(
+        astral_common::middleware::request_binding::bind_http_request(&mut req)
+            .await
+            .map_err(|status| BoxedResponse::new(status.into_response()))?,
+    );
     let resolution = resolve_resource_ownership(
         &state.db,
         resource,
@@ -160,20 +178,33 @@ pub async fn identity_permission_middleware(
     //
     // 单机内存镜像读面（default-off）：组合进程安装
     // astral_db::memory_projection_hub 后命中镜像，pending/未预热回退 DB。
-    let decision = if astral_db::memory_mirror_is_installed() {
+    let evaluation = if astral_db::memory_mirror_is_installed() {
         let repo = astral_db::MemoryMirroredRuleRepository::new(
             SqlxRuleRepository::new(state.db.clone())
-                .with_org_scope_enabled(state.org_scope_enabled),
+                .with_org_scope_enabled(state.org_scope_enabled)
+                .with_authority_provider_opt(state.authorization_fence_provider.clone())
+                .with_authority_required(state.config.authority_runtime_mode.requires_authority()),
+        )
+        // Mirror hits are admissible only when the same configured trust-root
+        // verifier is present; otherwise this remains durable-only.
+        .with_authority_provider_opt(
+            state
+                .authorization_fence_provider
+                .clone()
+                .map(|provider| provider as Arc<dyn policy_engine::AuthorizationFenceProvider>),
         )
         // 镜像 miss 时回填 strict durable bundle（MySQL 直读），
         // 与 hub strict_refill 契约一致；读取失败按既有 pending/DB 回退语义处理。
         .with_durable_refill(state.db.clone());
-        state.engine.evaluate(&ctx, &repo).await
+        state.engine.evaluate_with_admission(&ctx, &repo).await
     } else {
         let repo = SqlxRuleRepository::new(state.db.clone())
-            .with_org_scope_enabled(state.org_scope_enabled);
-        state.engine.evaluate(&ctx, &repo).await
+            .with_org_scope_enabled(state.org_scope_enabled)
+            .with_authority_provider_opt(state.authorization_fence_provider.clone())
+            .with_authority_required(state.config.authority_runtime_mode.requires_authority());
+        state.engine.evaluate_with_admission(&ctx, &repo).await
     };
+    let (decision, authorization_admission) = evaluation.into_parts();
 
     // 权限决策审计（MQ-first，DB fallback；故障不影响权限决策）。
     // ORG_SCOPE 判定携带 provenance 时，detail 升级为有界结构化 JSON
@@ -307,7 +338,34 @@ pub async fn identity_permission_middleware(
     // 绝不重采新 token 覆盖旧读，绝不折算成放行。
     verify_identity_admission_fence(admission_fence)?;
 
-    Ok(next.run(req).await)
+    let source_abort = if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        let provider = state
+            .authorization_fence_provider
+            .as_ref()
+            .ok_or_else(|| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+        let admission = authorization_admission
+            .as_ref()
+            .ok_or_else(|| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+        let abort = provider
+            .reserve_mutation_with_abort(&ctx, admission)
+            .await
+            .map_err(|_| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+        Some((provider.clone(), abort))
+    } else {
+        None
+    };
+    req.extensions_mut().insert(ctx);
+    if let Some(authorization_admission) = authorization_admission {
+        req.extensions_mut().insert(authorization_admission);
+    }
+
+    let response = next.run(req).await;
+    if let Some((provider, abort)) = source_abort {
+        if let Err(error) = provider.abort_source_reservation(&abort).await {
+            tracing::warn!(operation_id = %abort.operation_id, reservation_id = %abort.reservation_id, error = %error, "identity post-handler source abort remains unknown; stable identity recovery required");
+        }
+    }
+    Ok(response)
 }
 
 /// Identity 宿主准入栅栏捕获：在**一切权威读取之前**调用（管理路由的
@@ -361,6 +419,74 @@ fn verify_identity_admission_fence(fence: Option<AuthorityReadFence>) -> Result<
     Ok(())
 }
 
+/// Verification 路由的进程内 per-IP 限流（Identity 直连监听器防护）。
+///
+/// ## 共享实现（本模块不重复实现计数器）
+///
+/// 计数核心、受信代理匹配与客户端 IP 解析复用
+/// `astral_common::middleware::ip_rate_limit`（`IpRateLimiter` /
+/// `TrustedProxySet` / `resolve_client_ip`），与 Gateway `rate_limit` 中间件
+/// 同源：共享 `astral_common::config::RateLimitCfg` 合同（1s 固定窗口，cap =
+/// `requests_per_second + burst_size` 饱和加法，enabled=false 时放行），bucket
+/// 携带 last_seen、TTL+GC 回收空闲桶并有硬容量上限（容量耗尽时新 key
+/// fail-closed，绝不静默接纳）；客户端 IP 只信任来自
+/// `config.gateway.trusted_proxy_ips` 配置代理的 `X-Forwarded-For` /
+/// `X-Real-IP`（XFF 链内取从右向左第一个非受信地址），否则回退 TCP 对端地址
+/// （`ConnectInfo` 扩展，由直连监听器 `into_make_service_with_connect_info`
+/// 注入；缺失时聚合到 `None` 单桶，绝不因缺扩展而 panic 或放行）。非法受信
+/// 代理条目解析期丢弃并告警（fail-closed），非法转发头不产出桶 key。
+///
+/// ## 已知边界（刻意保留，不发明跨副本限流）
+///
+/// 计数状态是单副本进程内的：跨副本不做强一致，攻击预算按副本数线性放大。
+/// 当前部署中没有任何组件提供跨副本全局预算——Gateway 的 `rate_limit` 中间件
+/// 同样是进程内本地限流，不构成全局预算；真正的跨副本持久化配额属独立任务
+/// （落地前不生效）。经 Gateway 转发的请求若 Gateway 对端不在
+/// trusted_proxy_ips（且 Gateway 未注入 XFF），将共享 Gateway 对端地址的
+/// 单个桶（聚合边界）；直连流量按真实对端 IP 分桶。本限流只做可用性保护：
+/// 不产生 `AuthorizationAdmission`、不读取/消费宿主准入栅栏，bootstrap 路由
+/// 保持 admission-free 语义不变。
+struct VerificationRateLimit {
+    limiter: IpRateLimiter,
+    trusted: TrustedProxySet,
+}
+
+static VERIFICATION_IP_LIMITER: OnceLock<VerificationRateLimit> = OnceLock::new();
+
+/// Identity 直连监听器上 verification 路由的 per-IP 限流入口（仅挂在
+/// `/verification/send` 与 `/verification/verify` 两个路由上，见 runtime
+/// 装配；不产生 AuthorizationAdmission、不消费准入栅栏）。
+pub async fn verification_ip_rate_limit(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // 配置来自首个请求的启动期冻结 AppConfig（对齐 Gateway 注入模式）。
+    let shared = VERIFICATION_IP_LIMITER.get_or_init(|| {
+        let trusted = TrustedProxySet::compile(&state.config.gateway.trusted_proxy_ips);
+        for entry in trusted.invalid_entries() {
+            tracing::warn!(
+                entry = %entry,
+                "invalid gateway.trusted_proxy_ips entry; ignored (fail closed to peer address)"
+            );
+        }
+        VerificationRateLimit {
+            limiter: IpRateLimiter::new(state.config.rate_limit.clone()),
+            trusted,
+        }
+    });
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0.ip());
+    let client = resolve_client_ip(req.headers(), peer, &shared.trusted);
+    if !shared.limiter.check(client) {
+        tracing::warn!(client = ?client, path = req.uri().path(), "verification rate limit exceeded");
+        return rate_limit_response(&req, "verification-rate-limit-error");
+    }
+    next.run(req).await
+}
+
 fn require_platform_user(ctx: &astral_types::PolicyContext) -> Result<(), BoxedResponse> {
     if ctx.principal_kind.as_deref().and_then(PrincipalKind::parse)
         == Some(PrincipalKind::PlatformUser)
@@ -378,13 +504,12 @@ fn require_platform_user(ctx: &astral_types::PolicyContext) -> Result<(), BoxedR
 }
 
 fn is_identity_skip_path(path: &str) -> bool {
-    matches!(path, "/profile" | "/change-password")
-        || IDENTITY_SKIP_PATHS.iter().any(|prefix| {
-            path == *prefix
-                || path
-                    .strip_prefix(prefix)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })
+    IDENTITY_SKIP_PATHS.iter().any(|prefix| {
+        path == *prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 fn is_credential_bootstrap_path(path: &str) -> bool {
@@ -500,8 +625,8 @@ mod tests {
 
     #[test]
     fn management_paths_do_not_skip_permission_evaluation() {
-        assert!(is_identity_skip_path("/profile"));
-        assert!(is_identity_skip_path("/change-password"));
+        assert!(!is_identity_skip_path("/profile"));
+        assert!(!is_identity_skip_path("/change-password"));
         assert!(!is_identity_skip_path("/profile/extra"));
         assert!(!is_identity_skip_path("/profile-extra"));
         assert!(!is_identity_skip_path("/change-password-extra"));
@@ -602,5 +727,92 @@ mod tests {
         );
         assert!(production.contains("org_provenance_audit_detail(path, provenance)"));
         assert!(production.contains("record_permission_audit_with_request_detail("));
+    }
+
+    /// Verification 路由 IP 限流的装配形状守卫：Identity 直连监听器必须给
+    /// verification 路由接线进程内 per-IP 限流，serve 必须注入 ConnectInfo
+    /// （对端地址回退）；限流语义必须复用共享
+    /// `astral_common::middleware::ip_rate_limit` 实现（与 Gateway 同源），
+    /// 本模块不得重新实现桶计数，且不得消费准入栅栏或产生
+    /// AuthorizationAdmission（bootstrap 路由保持 admission-free）。仅扫描
+    /// 生产区域，避免测试自引用。
+    #[test]
+    fn verification_ip_limit_wiring_contract() {
+        let middleware_source = include_str!("middleware.rs");
+        let runtime_source = include_str!("runtime.rs");
+        let middleware_production = middleware_source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(middleware_source);
+        let runtime_production = runtime_source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(runtime_source);
+
+        // 运行时装配：verification 子路由以 route_layer 挂 per-IP 限流中间件
+        // （仅命中路由时消耗预算）；直连监听器注入对端地址扩展。装配点必须
+        // 出现在限流入口引用之前。
+        let wiring_site = runtime_production
+            .find("verification_routes()")
+            .expect("the runtime must merge the verification routes");
+        assert!(
+            runtime_production.contains("verification_routes().route_layer("),
+            "the IP limiter must ride a route_layer on the verification subrouter"
+        );
+        assert!(
+            runtime_production[wiring_site..].contains("middleware::verification_ip_rate_limit"),
+            "the verification subrouter must be wired to middleware::verification_ip_rate_limit"
+        );
+        assert!(
+            runtime_production
+                .contains("into_make_service_with_connect_info::<std::net::SocketAddr>()"),
+            "the direct listener must provide ConnectInfo so the limiter can resolve the peer address"
+        );
+
+        // 语义复用：计数核心、受信代理匹配与客户端 IP 解析必须来自共享
+        // `astral_common::middleware::ip_rate_limit`（与 Gateway 同源），本模块
+        // 不得重新实现桶计数；进程内单例 + 共享有界 429 形状；跨副本限制
+        // 刻意保留（见模块文档）。
+        assert!(
+            middleware_production.contains("astral_common::middleware::ip_rate_limit"),
+            "the limiter must delegate to the shared ip_rate_limit implementation"
+        );
+        assert!(
+            middleware_production.contains("IpRateLimiter::new(")
+                && middleware_production.contains("TrustedProxySet::compile(")
+                && middleware_production.contains("resolve_client_ip("),
+            "the shared counter, trusted-proxy matching and client resolution must be wired"
+        );
+        assert!(middleware_production.contains("VERIFICATION_IP_LIMITER"));
+        assert!(
+            !middleware_production.contains("buckets.lock()"),
+            "the local middleware must not re-implement bucket counting (shared IpRateLimiter owns it)"
+        );
+
+        // 限流是可用性保护：不消费准入栅栏（全模块仍只有权限中间件那一处
+        // capture），不产生/插入 AuthorizationAdmission，429 走有界共享形状。
+        assert_eq!(
+            middleware_production
+                .matches(".capture_authority_fence()")
+                .count(),
+            1,
+            "the IP limiter must not capture the admission fence"
+        );
+        let limiter_start = middleware_production
+            .find("pub async fn verification_ip_rate_limit(")
+            .expect("the limiter entry point must remain");
+        let limiter_end = middleware_production[limiter_start..]
+            .find("fn require_platform_user(")
+            .map(|offset| limiter_start + offset)
+            .unwrap_or(middleware_production.len());
+        let limiter_body = &middleware_production[limiter_start..limiter_end];
+        assert!(
+            !limiter_body.contains("AuthorizationAdmission"),
+            "the IP limiter is availability protection only and must stay admission-free"
+        );
+        assert!(
+            limiter_body.contains("rate_limit_response(&req, \"verification-rate-limit-error\")"),
+            "rejected requests must use the shared bounded 429 shape with the verification trace prefix"
+        );
     }
 }

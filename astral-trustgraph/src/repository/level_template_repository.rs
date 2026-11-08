@@ -22,10 +22,14 @@
 use async_trait::async_trait;
 use sqlx::{MySqlPool, QueryBuilder, Transaction};
 
-use astral_types::AstralError;
+use astral_types::{AstralError, AuthorizationAdmission};
 
 use crate::repository::audit_log_repository::validated_request_operation_id;
-use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
+use crate::repository::authorization_source_transaction::{
+    begin_source_transaction_with_capability, AuthorizationSourceTransaction,
+    SourceMutationCapability,
+};
+use astral_db::{TypedRowOperation, TypedSourceRowLookup, TypedSourceTable};
 
 /// 等级模板记录（identity_level_template）
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -111,6 +115,7 @@ pub struct NewLevelTemplate {
 pub struct LevelTemplateMutationContext {
     actor_id: i64,
     operation_id: String,
+    source_capability: SourceMutationCapability,
 }
 
 impl LevelTemplateMutationContext {
@@ -132,7 +137,17 @@ impl LevelTemplateMutationContext {
         Ok(Self {
             actor_id,
             operation_id,
+            source_capability: SourceMutationCapability::UserPending,
         })
+    }
+
+    pub fn with_admission(mut self, admission: AuthorizationAdmission) -> Self {
+        self.source_capability = SourceMutationCapability::user(admission);
+        self
+    }
+
+    pub(crate) fn source_capability(&self) -> &SourceMutationCapability {
+        &self.source_capability
     }
 
     pub fn actor_id(&self) -> i64 {
@@ -249,10 +264,10 @@ impl LevelTemplateAuditEntry<'_> {
 async fn insert_level_template_audit_in_tx(
     tx: &mut Transaction<'_, sqlx::MySql>,
     entry: &LevelTemplateAuditEntry<'_>,
-) -> Result<(), AstralError> {
+) -> Result<astral_db::TypedSourceAuditReceipt, AstralError> {
     entry.validate()?;
     let detail = entry.detail_json()?;
-    sqlx::query(LEVEL_TEMPLATE_AUDIT_INSERT_SQL)
+    let result = sqlx::query(LEVEL_TEMPLATE_AUDIT_INSERT_SQL)
         .bind(entry.context.actor_id())
         .bind(entry.action)
         .bind(LEVEL_TEMPLATE_AUDIT_RESOURCE)
@@ -265,7 +280,7 @@ async fn insert_level_template_audit_in_tx(
         .map_err(|error| {
             AstralError::Database(format!("level template audit insert failed: {error}"))
         })?;
-    Ok(())
+    astral_db::TypedSourceAuditReceipt::from_same_tx_insert_id(result.last_insert_id() as i64)
 }
 
 /// update 审计详情中的实际应用字段（仅 Some 字段；键名对齐 DTO camelCase）。
@@ -316,7 +331,11 @@ pub trait LevelTemplateRepository: Send + Sync {
         offset: i64,
     ) -> Result<Vec<LevelTemplateRecord>, AstralError>;
     async fn get_template(&self, id: i64) -> Result<Option<LevelTemplateRecord>, AstralError>;
-    async fn create_template(&self, new: &NewLevelTemplate) -> Result<i64, AstralError>;
+    async fn create_template(
+        &self,
+        new: &NewLevelTemplate,
+        context: &LevelTemplateMutationContext,
+    ) -> Result<i64, AstralError>;
     /// 部分更新（空补丁 no-op）。
     ///
     /// governance mutation（不产生账本 delta、不追加 legacy 投影事件，见模块头
@@ -363,7 +382,94 @@ fn push_filter<'args>(
     }
 }
 
-/// 引用 ACTIVE 卡集合（audit 明细 scope 捕获，卡片 id 升序确定性）。
+async fn validate_level_template_admission(
+    tx: &mut AuthorizationSourceTransaction,
+    context: &LevelTemplateMutationContext,
+    domain_id: i64,
+) -> Result<(), AstralError> {
+    let SourceMutationCapability::User(admission) = context.source_capability() else {
+        return Err(AstralError::Pending(
+            "level template mutation requires proof-bound authorization admission".into(),
+        ));
+    };
+    if admission.proof().operation_id != context.operation_id() {
+        return Err(AstralError::Pending(
+            "level template config completion operation id differs from its admission proof".into(),
+        ));
+    }
+    let proof_scope = &admission.proof().scope;
+    let domain_matches = matches!(
+        proof_scope.domain,
+        astral_types::AuthorizationDomainScope::Exact(value) if value == domain_id
+    );
+    if proof_scope.user_id != Some(context.actor_id()) || !domain_matches {
+        return Err(AstralError::Permission(
+            "authorization admission does not match the level template actor/domain scope".into(),
+        ));
+    }
+    let actor_card: Option<(i64, Option<i64>, Option<i64>, String)> = sqlx::query_as(
+        "SELECT user_id, tenant_id, domain_id, card_status FROM user_card \
+         WHERE card_id = ? FOR UPDATE",
+    )
+    .bind(proof_scope.card_id)
+    .fetch_optional(&mut ***tx)
+    .await
+    .map_err(db_error)?;
+    let Some((user_id, tenant_id, card_domain_id, status)) = actor_card else {
+        return Err(AstralError::Permission(
+            "authorization admission actor card is not available".into(),
+        ));
+    };
+    if user_id != context.actor_id()
+        || tenant_id != Some(proof_scope.tenant_id)
+        || card_domain_id != Some(domain_id)
+        || status != "ACTIVE"
+    {
+        return Err(AstralError::Permission(
+            "authorization admission does not match the locked level template actor card".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn lock_level_template_domain_in_tx(
+    tx: &mut AuthorizationSourceTransaction,
+    id: i64,
+    context: &LevelTemplateMutationContext,
+) -> Result<Option<(String, String, i64)>, AstralError> {
+    let row: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT template_code, template_name, domain_id FROM identity_level_template \
+         WHERE template_id = ? FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut ***tx)
+    .await
+    .map_err(db_error)?;
+    let Some((code, name, domain_id)) = row else {
+        return Ok(None);
+    };
+    validate_level_template_admission(tx, context, domain_id).await?;
+    Ok(Some((code, name, domain_id)))
+}
+
+async fn verify_level_template_operation_id(
+    context: &LevelTemplateMutationContext,
+) -> Result<(), AstralError> {
+    match context.source_capability() {
+        SourceMutationCapability::User(admission)
+            if admission.proof().operation_id == context.operation_id() =>
+        {
+            Ok(())
+        }
+        SourceMutationCapability::User(_) => Err(AstralError::Pending(
+            "level template config completion operation id differs from its admission proof".into(),
+        )),
+        _ => Err(AstralError::Pending(
+            "level template config completion requires proof-bound user admission".into(),
+        )),
+    }
+}
+
 /// governance mutation 不改卡片授权（模块头范围结论），此读取**不加锁**、
 /// 不驱动任何扇出——仅为审计明细提供引用卡集合观测。行数以 `LIMIT ?` 约束
 /// （绑定值 = cap + 1，多取一行仅用于判定超限），绝不产生无界内存响应。
@@ -457,31 +563,100 @@ impl LevelTemplateRepository for SqlxLevelTemplateRepository {
         .map_err(db_error)
     }
 
-    async fn create_template(&self, new: &NewLevelTemplate) -> Result<i64, AstralError> {
+    async fn create_template(
+        &self,
+        new: &NewLevelTemplate,
+        context: &LevelTemplateMutationContext,
+    ) -> Result<i64, AstralError> {
         // 授权源事务宿主：等级模板（domain 绑定）是 owning-binding 存在性
         // source，resource_ownership resolver 缓存严格 server facts，源活动
-        // 栅栏保证 binding 更新的 epoch complete（见模块头范围结论）。
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
-        let result = sqlx::query(
-            "INSERT INTO identity_level_template \
-             (template_code, template_name, domain_id, principal_type, grant_type, level_no, \
-              user_card_template_id, status, version_no, force_cover, description) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)",
+        // 栅栏保证 binding 更新的 epoch complete。
+        verify_level_template_operation_id(context).await?;
+        let mut tx =
+            begin_source_transaction_with_capability(&self.db, context.source_capability()).await?;
+        validate_level_template_admission(&mut tx, context, new.domain_id).await?;
+        let lookup = TypedSourceRowLookup::LevelTemplateNatural {
+            domain_id: new.domain_id,
+            template_code: new.template_code.clone(),
+        };
+        let mut capture = tx.typed_row_capture(
+            TypedSourceTable::IdentityLevelTemplate,
+            TypedRowOperation::Insert,
+        );
+        capture.capture_before_in_tx(&lookup).await?;
+        let template_code = new.template_code.clone();
+        let template_name = new.template_name.clone();
+        let domain_id = new.domain_id;
+        let principal_type = new.principal_type.clone();
+        let grant_type = new.grant_type.clone();
+        let level_no = new.level_no;
+        let user_card_template_id = new.user_card_template_id;
+        let version_no = new.version_no;
+        let force_cover = new.force_cover;
+        let description = new.description.clone();
+        let result = capture
+            .with_tx_mut(move |tx| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "INSERT INTO identity_level_template \
+                         (template_code, template_name, domain_id, principal_type, grant_type, level_no, \
+                          user_card_template_id, status, version_no, force_cover, description) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)",
+                    )
+                    .bind(template_code)
+                    .bind(template_name)
+                    .bind(domain_id)
+                    .bind(principal_type)
+                    .bind(grant_type)
+                    .bind(level_no)
+                    .bind(user_card_template_id)
+                    .bind(version_no)
+                    .bind(force_cover)
+                    .bind(description)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(db_error)
+                })
+            })
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(AstralError::Pending(
+                "identity level template insert did not prove exactly one source row".into(),
+            ));
+        }
+        let new_id = i64::try_from(result.last_insert_id())
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| {
+                AstralError::Pending("identity level template insert returned invalid id".into())
+            })?;
+        capture.capture_after_in_tx(&lookup).await?;
+        let image = astral_db::seal_typed_source_row_capture_tx(capture)?;
+        let audit = insert_level_template_audit_in_tx(
+            &mut tx,
+            &LevelTemplateAuditEntry {
+                action: "level_template_create",
+                decision: "LEVEL_TEMPLATE_CREATED",
+                template_id: new_id,
+                template_code: Some(&new.template_code),
+                template_name: Some(&new.template_name),
+                affected_card_ids: &[],
+                applied_fields: serde_json::json!({
+                    "domainId": new.domain_id,
+                    "principalType": new.principal_type,
+                    "grantType": new.grant_type,
+                    "levelNo": new.level_no,
+                    "userCardTemplateId": new.user_card_template_id,
+                    "versionNo": new.version_no,
+                    "forceCover": new.force_cover,
+                    "description": new.description,
+                }),
+                context,
+            },
         )
-        .bind(&new.template_code)
-        .bind(&new.template_name)
-        .bind(new.domain_id)
-        .bind(&new.principal_type)
-        .bind(&new.grant_type)
-        .bind(new.level_no)
-        .bind(new.user_card_template_id)
-        .bind(new.version_no)
-        .bind(new.force_cover)
-        .bind(&new.description)
-        .execute(&mut **tx)
-        .await
-        .map_err(db_error)?;
-        let new_id = result.last_insert_id() as i64;
+        .await?;
+        tx.stage_typed_source_image(image)?;
+        tx.stage_typed_source_audit(audit)?;
         tx.commit_consuming().await?;
         Ok(new_id)
     }
@@ -570,19 +745,37 @@ impl LevelTemplateRepository for SqlxLevelTemplateRepository {
         // delta、不追加 legacy 投影事件。事务宿主为授权源事务（owning-binding
         // 存在性 source 的栅栏合同）；mutation 前捕获引用 ACTIVE 卡集合仅作
         // 审计明细 scope 观测（行数受限 + 容量守卫，超限在任何写入前拒绝）。
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
-        let affected_card_ids = capture_affected_card_scope_in_tx(&mut tx, id).await?;
-
-        let result = builder.build().execute(&mut **tx).await.map_err(db_error)?;
-        if result.rows_affected() == 0 {
-            // 模板不存在或补丁值与现值完全一致（MySQL 计变更行）：未发生
-            // mutation，无审计变更；保持既有 no-op 语义，由 handler 的
-            // get_template 决定 404。
-            tx.commit_consuming().await?;
+        verify_level_template_operation_id(context).await?;
+        let mut tx =
+            begin_source_transaction_with_capability(&self.db, context.source_capability()).await?;
+        let locked = lock_level_template_domain_in_tx(&mut tx, id, context).await?;
+        if locked.is_none() {
+            tx.rollback_consuming().await?;
             return Ok(());
         }
-
-        insert_level_template_audit_in_tx(
+        let affected_card_ids = capture_affected_card_scope_in_tx(&mut tx, id).await?;
+        let mut capture = tx.typed_row_capture(
+            TypedSourceTable::IdentityLevelTemplate,
+            TypedRowOperation::Update,
+        );
+        capture
+            .capture_before_in_tx(&TypedSourceRowLookup::PrimaryId { id })
+            .await?;
+        let result = capture
+            .with_tx_mut(move |tx| {
+                Box::pin(async move { builder.build().execute(&mut **tx).await.map_err(db_error) })
+            })
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(AstralError::Pending(
+                "identity level template update did not change source facts; config completion is not staged".into(),
+            ));
+        }
+        capture
+            .capture_after_in_tx(&TypedSourceRowLookup::PrimaryId { id })
+            .await?;
+        let image = astral_db::seal_typed_source_row_capture_tx(capture)?;
+        let audit = insert_level_template_audit_in_tx(
             &mut tx,
             &LevelTemplateAuditEntry {
                 action: LEVEL_TEMPLATE_AUDIT_ACTION_UPDATE,
@@ -596,6 +789,8 @@ impl LevelTemplateRepository for SqlxLevelTemplateRepository {
             },
         )
         .await?;
+        tx.stage_typed_source_image(image)?;
+        tx.stage_typed_source_audit(audit)?;
         tx.commit_consuming().await?;
         Ok(())
     }
@@ -606,48 +801,57 @@ impl LevelTemplateRepository for SqlxLevelTemplateRepository {
         context: &LevelTemplateMutationContext,
     ) -> Result<DeleteOutcome, AstralError> {
         // 授权源事务宿主（owning-binding 存在性 source，见模块头范围结论）。
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
-        // 引用 ACTIVE 卡集合（audit 明细 scope 观测）：删除前捕获，删除后
         // 模板行不存在无法重算；行数受限 + 容量守卫（超限在任何级联删除前
         // 拒绝回滚），不加锁、不驱动扇出。
-        let affected_card_ids = capture_affected_card_scope_in_tx(&mut tx, id).await?;
-
-        // 锁定读取模板身份用于删除后仍可追溯的审计 provenance。
-        let template: Option<(String, String)> = sqlx::query_as(
-            "SELECT template_code, template_name FROM identity_level_template \
-             WHERE template_id = ? FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(db_error)?;
-        let Some((template_code, template_name)) = template else {
-            // 模板不存在：保持既有 not-deleted 语义（事务内无 mutation，
-            // 不产生审计记录）。
-            tx.commit_consuming().await?;
+        verify_level_template_operation_id(context).await?;
+        let mut tx =
+            begin_source_transaction_with_capability(&self.db, context.source_capability()).await?;
+        let Some((template_code, template_name, _domain_id)) =
+            lock_level_template_domain_in_tx(&mut tx, id, context).await?
+        else {
+            tx.rollback_consuming().await?;
             return Ok(DeleteOutcome {
                 deleted: false,
                 affected_card_ids: Vec::new(),
             });
         };
+        let affected_card_ids = capture_affected_card_scope_in_tx(&mut tx, id).await?;
 
-        sqlx::query("DELETE FROM identity_level_template_resource_map WHERE template_id = ?")
-            .bind(id)
-            .execute(&mut **tx)
-            .await
-            .map_err(db_error)?;
+        // 模板父行与有界 ordered child maps 在同一 source transaction 内捕获；
+        // after parent 缺失标记绑定相同 lookup，表示完整 aggregate 已删除。
+        let mut capture = tx.typed_row_capture(
+            TypedSourceTable::IdentityLevelTemplate,
+            TypedRowOperation::Delete,
+        );
+        capture
+            .capture_before_in_tx(&TypedSourceRowLookup::PrimaryId { id })
+            .await?;
 
-        sqlx::query("DELETE FROM identity_level_template_action_map WHERE template_id = ?")
-            .bind(id)
-            .execute(&mut **tx)
-            .await
-            .map_err(db_error)?;
-
-        let result = sqlx::query("DELETE FROM identity_level_template WHERE template_id = ?")
-            .bind(id)
-            .execute(&mut **tx)
-            .await
-            .map_err(db_error)?;
+        let result = capture
+            .with_tx_mut(|inner| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "DELETE FROM identity_level_template_resource_map WHERE template_id = ?",
+                    )
+                    .bind(id)
+                    .execute(&mut **inner)
+                    .await
+                    .map_err(db_error)?;
+                    sqlx::query(
+                        "DELETE FROM identity_level_template_action_map WHERE template_id = ?",
+                    )
+                    .bind(id)
+                    .execute(&mut **inner)
+                    .await
+                    .map_err(db_error)?;
+                    sqlx::query("DELETE FROM identity_level_template WHERE template_id = ?")
+                        .bind(id)
+                        .execute(&mut **inner)
+                        .await
+                        .map_err(db_error)
+                })
+            })
+            .await?;
         if result.rows_affected() == 0 {
             // 锁定读已证明行存在，删除 0 行属于不可能状态：fail-closed 回滚，
             // 绝不静默报告 not-deleted 掩盖不一致。
@@ -656,7 +860,11 @@ impl LevelTemplateRepository for SqlxLevelTemplateRepository {
             ));
         }
 
-        insert_level_template_audit_in_tx(
+        capture
+            .capture_after_in_tx(&TypedSourceRowLookup::PrimaryId { id })
+            .await?;
+        let image = astral_db::seal_typed_source_row_capture_tx(capture)?;
+        let audit = insert_level_template_audit_in_tx(
             &mut tx,
             &LevelTemplateAuditEntry {
                 action: LEVEL_TEMPLATE_AUDIT_ACTION_DELETE,
@@ -670,6 +878,8 @@ impl LevelTemplateRepository for SqlxLevelTemplateRepository {
             },
         )
         .await?;
+        tx.stage_typed_source_image(image)?;
+        tx.stage_typed_source_audit(audit)?;
         tx.commit_consuming().await?;
 
         Ok(DeleteOutcome {
@@ -849,6 +1059,28 @@ mod tests {
         assert!(zero_card.validate().is_err());
     }
 
+    #[test]
+    fn absent_template_rolls_back_before_staging_update_or_delete() {
+        let source = include_str!("level_template_repository.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let update = source.split("if locked.is_none() {").nth(1).unwrap();
+        let update = update.split("let affected_card_ids").next().unwrap();
+        assert!(update.contains("tx.rollback_consuming().await?"));
+        assert!(update.contains("return Ok(())"));
+        assert!(!update.contains("commit_consuming"));
+        let delete = source
+            .rsplit("async fn delete_with_cascade")
+            .next()
+            .unwrap();
+        let absent = delete.split("else {").nth(1).unwrap();
+        let absent = absent.split("let affected_card_ids").next().unwrap();
+        assert!(absent.contains("tx.rollback_consuming().await?"));
+        assert!(absent.contains("deleted: false"));
+        assert!(!absent.contains("commit_consuming"));
+    }
+
     /// 源序守卫：update 事务内必须以授权源事务 begin 开场（owning-binding
     /// 存在性 source 栅栏合同），捕获引用卡 scope，执行 UPDATE，随后同事务
     /// 审计关联与 commit_consuming；绝不退回 legacy CARD REVOKE 扇出。
@@ -870,10 +1102,10 @@ mod tests {
             // 自引用防呆：拼接构造 joined token，避免本测试字面量污染
             // governance_row 测试的整文件出现次数统计。
             .find(concat!(
-                "AuthorizationSourceTransaction::",
-                "begin(&self.db)"
+                "begin_source_transaction_with_capability",
+                "(&self.db, context.source_capability())"
             ))
-            .expect("update must host the governance mutation in the source wrapper");
+            .expect("update must host the governance mutation in the proof-bound source wrapper");
         let scope = update_body
             .find("capture_affected_card_scope_in_tx")
             .expect("update must capture the referencing-card scope (bounded) for audit detail");
@@ -886,7 +1118,7 @@ mod tests {
         let audit = update_body
             .find("insert_level_template_audit_in_tx")
             .expect("update must write one audit correlation record");
-        // update 存在 no-op 分支的提前 commit；最终 commit 必须在审计之后。
+        // 最终提交必须在审计之后；未命中分支只回滚。
         let commit = update_body
             .rfind("tx.commit_consuming()")
             .expect("update must commit through the wrapper consuming commit");
@@ -919,16 +1151,16 @@ mod tests {
         let wrapper_begin = delete_body
             // 自引用防呆：拼接构造 joined token（同 update 测试注释）。
             .find(concat!(
-                "AuthorizationSourceTransaction::",
-                "begin(&self.db)"
+                "begin_source_transaction_with_capability",
+                "(&self.db, context.source_capability())"
             ))
-            .expect("delete must host the governance mutation in the source wrapper");
+            .expect("delete must host the governance mutation in the proof-bound source wrapper");
         let scope = delete_body
             .find("capture_affected_card_scope_in_tx")
             .expect("delete must capture the referencing-card scope (bounded) for audit detail");
         let provenance = delete_body
-            .find("SELECT template_code, template_name FROM identity_level_template")
-            .expect("delete must capture template provenance under lock");
+            .find("lock_level_template_domain_in_tx(&mut tx, id, context)")
+            .expect("delete must lock and validate template provenance before cascades");
         let map_delete = delete_body
             .find("DELETE FROM identity_level_template_resource_map WHERE template_id = ?")
             .expect("delete must cascade the resource map");
@@ -939,18 +1171,16 @@ mod tests {
             .find("insert_level_template_audit_in_tx")
             .expect("delete must write one audit correlation record");
         let commit = delete_body
-            // rfind：delete 实现内有两个 commit_consuming（not-found 短路分支 +
-            // 最终提交）；序守卫必须锚定最终提交。
             .rfind("tx.commit_consuming()")
             .expect("delete must commit through the wrapper consuming commit");
         assert!(
-            wrapper_begin < scope
-                && scope < provenance
-                && provenance < map_delete
+            wrapper_begin < provenance
+                && provenance < scope
+                && scope < map_delete
                 && map_delete < row_delete
                 && row_delete < audit
                 && audit < commit,
-            "delete must order: wrapper begin -> card scope read -> provenance -> cascades -> audit -> commit_consuming"
+            "delete must order: wrapper begin -> locked provenance/admission -> card scope read -> cascades -> audit -> commit_consuming"
         );
         assert!(
             !delete_body.contains("tx.commit()"),
@@ -985,13 +1215,15 @@ mod tests {
                 && !source.contains(event_type_revoke_token),
             "level template mutations must not emit legacy CARD projection/REVOKE events"
         );
-        // create/update/delete 全部以授权源事务为宿主（owning-binding 存在性
-        // source 的栅栏合同）。
-        let begin_token = concat!("AuthorizationSourceTransaction::", "begin(&self.db)");
+        // create/update/delete 全部以 proof-bound source transaction dispatcher 为宿主。
+        let begin_token = concat!(
+            "begin_source_transaction_with_capability",
+            "(&self.db, context.source_capability())"
+        );
         assert_eq!(
             source.matches(begin_token).count(),
             3,
-            "create/update/delete must each host their mutation in the source wrapper"
+            "create/update/delete must each use the proof-bound source wrapper"
         );
         // 全部可变输入走绑定参数；decision/resource/event_type 为固定常量按动作绑定。
         assert!(

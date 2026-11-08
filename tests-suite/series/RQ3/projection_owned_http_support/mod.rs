@@ -418,6 +418,7 @@ fn build_app_state(pool: MySqlPool, config: AppConfig) -> AppState {
         projector_health: Arc::new(OnceLock::new()),
         audit_replay_producer: AuditReplayProducerSlot::new(),
         test_control: None,
+        authorization_fence_provider: None,
         org_scope_enabled: false,
         org_scope_tenant_allowlist: Vec::new(),
     }

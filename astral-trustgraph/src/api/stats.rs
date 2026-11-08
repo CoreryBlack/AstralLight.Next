@@ -4,7 +4,8 @@
 //! DB 级命中统计查询（summary / top-resources / zero-hit / by-card）数据访问
 //! 在 `repository::hit_stat_repository`；top-resources 走 `astral_db` 共享读。
 
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
+use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -38,8 +39,100 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<ApiResponse<Hit
     Ok(Json(ApiResponse::success(stats)))
 }
 
-/// POST /main/api/v1/stats/reset — 重置命中计数与时序（仅开发/调试用途）
-async fn reset_stats(State(state): State<AppState>) -> Result<Json<ApiResponse<()>>, AppError> {
+/// POST /main/api/v1/stats/reset — auditable local observation boundary.
+async fn reset_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(policy): Extension<astral_types::PolicyContext>,
+    Extension(admission): Extension<astral_types::AuthorizationAdmission>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    let context = astral_db::ProtectedMutationContext::from_policy_context(
+        &policy,
+        admission,
+        headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        "monitor",
+        "reset",
+        None,
+    )?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|error| astral_types::AstralError::Database(error.to_string()))?;
+    match astral_db::begin_protected_mutation_in_tx(&mut tx, &context, &serde_json::json!({}))
+        .await?
+    {
+        astral_db::ProtectedMutationStart::Completed(_) => {
+            return Err(AppError(astral_types::AstralError::Pending(
+                "stats reset was already admitted; its process-local outcome cannot be replayed or proven after restart".into(),
+            )));
+        }
+        astral_db::ProtectedMutationStart::New => {
+            // The reset itself is a POSTCOMMIT in-memory side effect on this
+            // process. The durable artifact is the explicit request intent
+            // ONLY: the business result and the source evidence both record
+            // resetProven=false, and no SQL marker is ever claimed to prove
+            // the in-memory reset. The durable before/after of the intent row
+            // (result_json absent -> written) is the typed evidence.
+            let intent_before: Option<String> = sqlx::query_scalar(
+                "SELECT CAST(result_json AS CHAR) FROM protected_mutation_operation \
+                 WHERE operation_id = ? AND resource = ?",
+            )
+            .bind(context.operation_id())
+            .bind("monitor")
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| astral_types::AstralError::Database(error.to_string()))?;
+            let result = serde_json::json!({
+                "status": "RESET_INTENT_RECORDED",
+                "resetProven": false,
+                "resetEffect": "postcommit-in-memory",
+            });
+            let evidence = astral_db::ProtectedSourceEvidence::new()
+                .target_row(astral_db::TargetRowEvidence {
+                    entity: "protected_mutation_operation",
+                    key: serde_json::json!({
+                        "operationId": context.operation_id(),
+                        "resource": "monitor",
+                    }),
+                    before: astral_db::RowPresence::from_option(intent_before.map(|result_json| {
+                        serde_json::json!({
+                            "operationId": context.operation_id(),
+                            "resource": "monitor",
+                            "resultJson": result_json,
+                        })
+                    })),
+                    after: astral_db::RowPresence::Present(serde_json::json!({
+                        "operationId": context.operation_id(),
+                        "resource": "monitor",
+                        "resultJson": result,
+                    })),
+                })
+                .map_err(|error| astral_types::AstralError::Pending(error.to_string()))?
+                .receipt(
+                    "protected_mutation_operation",
+                    serde_json::json!({
+                        "operationId": context.operation_id(),
+                        "resource": "monitor",
+                    }),
+                    astral_db::WriteKind::Probe,
+                    1,
+                );
+            astral_db::finish_protected_mutation_in_tx(&mut tx, &context, &result, &evidence)
+                .await?;
+        }
+    }
+    tx.commit().await.map_err(|error| {
+        astral_types::AstralError::Pending(format!(
+            "stats reset admission COMMIT outcome unknown; reconcile operation {}: {error}",
+            context.operation_id(),
+        ))
+    })?;
+    // Postcommit in-memory effect. The HTTP response acknowledges the local
+    // reset attempt; the durable record above intentionally never claims an
+    // exactly-once reset.
     state.engine.reset_stats();
     Ok(Json(ApiResponse::success(())))
 }

@@ -6,7 +6,7 @@
 //! 失效和消息发布由 projection worker 处理。
 //! HTTP 层仅解析参数、组装 DTO、包装响应。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -15,7 +15,9 @@ use time::OffsetDateTime;
 
 use astral_common::contract::{ApiResponse, EmptyResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
-use astral_types::{AstralError, RuleSetDefinition, RuleSetEntryDefinition};
+use astral_types::{
+    AstralError, AuthorizationAdmission, RuleSetDefinition, RuleSetEntryDefinition,
+};
 
 use crate::api::require_platform_admin;
 use crate::repository::audit_log_repository::RuleSetMutationContext;
@@ -167,7 +169,10 @@ struct RuleSetEntryRequestDto {
     priority: i32,
 }
 
-fn mutation_context(headers: &HeaderMap) -> Result<RuleSetMutationContext, AppError> {
+fn mutation_context(
+    headers: &HeaderMap,
+    admission: AuthorizationAdmission,
+) -> Result<RuleSetMutationContext, AppError> {
     let actor_id = headers
         .get("x-user-id")
         .and_then(|value| value.to_str().ok())
@@ -177,7 +182,8 @@ fn mutation_context(headers: &HeaderMap) -> Result<RuleSetMutationContext, AppEr
     let operation_id = headers
         .get("x-request-id")
         .and_then(|value| value.to_str().ok());
-    RuleSetMutationContext::user(actor_id, operation_id).map_err(AppError::from)
+    RuleSetMutationContext::user_with_admission(actor_id, operation_id, admission)
+        .map_err(AppError::from)
 }
 
 fn require_card_context(headers: &HeaderMap, card_id: i64) -> Result<(), AppError> {
@@ -249,10 +255,11 @@ async fn list_rule_sets(
 async fn create_rule_set(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Json(req): Json<CreateRuleSetRequestDto>,
 ) -> Result<Json<ApiResponse<RuleSetDto>>, AppError> {
     require_platform_admin(&state, &headers).await?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
     // keeps the existing code=name behavior and only accepts the established fields.
     let new_id = state
         .rule_set_write_service
@@ -300,11 +307,12 @@ async fn get_rule_set(
 async fn update_rule_set(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateRuleSetRequestDto>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     require_platform_admin(&state, &headers).await?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
     if let Some(requested_source_type) = req.source_type.as_deref() {
         let current = state
             .rule_set_repository
@@ -334,10 +342,11 @@ async fn update_rule_set(
 async fn delete_rule_set(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     require_platform_admin(&state, &headers).await?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
     state
         .rule_set_write_service
         .delete_rule_set(id, &context)
@@ -348,11 +357,12 @@ async fn delete_rule_set(
 async fn replace_entries(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(rs_id): Path<i64>,
     Json(entries): Json<Vec<RuleSetEntryRequestDto>>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     require_platform_admin(&state, &headers).await?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
     let requests = entries
         .into_iter()
         .map(|entry| AddEntryRequest {
@@ -374,11 +384,12 @@ async fn replace_entries(
 async fn bind_card_canonical(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(card_id): Path<i64>,
     Json(req): Json<BindCardRequestDto>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     require_platform_admin(&state, &headers).await?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
     require_card_context(&headers, card_id)?;
     state
         .rule_set_write_service
@@ -397,10 +408,11 @@ async fn bind_card_canonical(
 async fn unbind_card_canonical(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path((card_id, rule_set_id)): Path<(i64, i64)>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     require_platform_admin(&state, &headers).await?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
     require_card_context(&headers, card_id)?;
     state
         .rule_set_write_service
@@ -452,11 +464,12 @@ async fn list_entries(
 async fn add_entry(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path(rs_id): Path<i64>,
     Json(req): Json<RuleSetEntryRequestDto>,
 ) -> Result<Json<ApiResponse<RuleSetEntryDto>>, AppError> {
     require_platform_admin(&state, &headers).await?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
     let entry_id = state
         .rule_set_write_service
         .add_entry(
@@ -487,11 +500,12 @@ async fn add_entry(
 async fn update_entry(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path((rs_id, eid)): Path<(i64, i64)>,
     Json(req): Json<RuleSetEntryRequestDto>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     require_platform_admin(&state, &headers).await?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
     state
         .rule_set_write_service
         .update_entry(
@@ -514,10 +528,11 @@ async fn update_entry(
 async fn delete_entry(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(admission): Extension<AuthorizationAdmission>,
     Path((rs_id, eid)): Path<(i64, i64)>,
 ) -> Result<Json<ApiResponse<EmptyResponse>>, AppError> {
     require_platform_admin(&state, &headers).await?;
-    let context = mutation_context(&headers)?;
+    let context = mutation_context(&headers, admission)?;
     state
         .rule_set_write_service
         .delete_entry(rs_id, eid, &context)

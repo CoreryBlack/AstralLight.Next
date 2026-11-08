@@ -17,10 +17,10 @@
 //!   （`AstralError::Validation` / `AstralError::Internal`），不填假值、不回退 raw source。
 
 use astral_types::{
-    AstralError, BindingLayer, CanonicalGrant, DeltaEventIdentity, DependencyVector,
-    DependencyVersion, GrantDelta, GrantEffect, GrantEvidence, GrantId, GrantIdentityKey,
-    GrantProvenance, GrantRevision, GrantSourceKind, GrantState, PublishedEvidenceAggregate,
-    TenantScope, ValidityWindow,
+    AstralError, AuthorizationAdmission, BindingLayer, CanonicalGrant, DeltaEventIdentity,
+    DependencyVector, DependencyVersion, GrantDelta, GrantEffect, GrantEvidence, GrantId,
+    GrantIdentityKey, GrantProvenance, GrantRevision, GrantSourceKind, GrantState,
+    PublishedEvidenceAggregate, TenantScope, ValidityWindow,
 };
 use policy_engine::COMPILER_VERSION;
 // ─────────────────────────────────────────────────────────────────────────────
@@ -526,6 +526,8 @@ pub struct DirectRuleMutationContext {
     pub actor_user_id: i64,
     /// 可选的 HTTP request-id 头（安全 ASCII 时复用为 durable operation id）。
     pub request_id_header: Option<String>,
+    /// F1 proof-bound admission consumed by the source transaction.
+    authorization_admission: Option<AuthorizationAdmission>,
 }
 
 impl DirectRuleMutationContext {
@@ -544,7 +546,49 @@ impl DirectRuleMutationContext {
         Ok(Self {
             actor_user_id,
             request_id_header: header,
+            authorization_admission: None,
         })
+    }
+
+    pub fn user_with_admission(
+        actor_user_id: i64,
+        request_id_header: Option<&str>,
+        authorization_admission: AuthorizationAdmission,
+    ) -> Result<Self, AstralError> {
+        let mut context = Self::user(actor_user_id, request_id_header)?;
+        context.authorization_admission = Some(authorization_admission);
+        Ok(context)
+    }
+
+    pub(crate) fn authorization_admission(&self) -> Result<&AuthorizationAdmission, AstralError> {
+        self.authorization_admission.as_ref().ok_or_else(|| {
+            AstralError::Pending(
+                "direct permission-rule mutation requires proof-bound authorization admission"
+                    .into(),
+            )
+        })
+    }
+
+    pub(crate) fn validate_card_scope(
+        &self,
+        tenant_id: i64,
+        card_id: i64,
+        user_id: i64,
+        domain_id: i64,
+    ) -> Result<(), AstralError> {
+        let proof = self.authorization_admission()?.proof();
+        let scope = &proof.scope;
+        let domain_matches = matches!(scope.domain, astral_types::AuthorizationDomainScope::Exact(value) if value == domain_id);
+        if scope.tenant_id != tenant_id
+            || scope.card_id != card_id
+            || scope.user_id != Some(user_id)
+            || !domain_matches
+        {
+            return Err(AstralError::Permission(
+                "authorization admission scope does not match the locked source card".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn header(&self) -> Option<&str> {
@@ -2822,6 +2866,108 @@ mod tests {
             "permission-rule:remove-by-source:MANUAL:8"
         );
         assert!(derive_direct_rule_batch_operation_id(" ", "21", None).is_err());
+    }
+
+    #[test]
+    fn direct_mutation_context_requires_a_verified_admission_before_scope_validation() {
+        let context = DirectRuleMutationContext::user(17, Some("req-1")).unwrap();
+        assert!(matches!(
+            context.authorization_admission(),
+            Err(AstralError::Pending(message)) if message.contains("proof-bound authorization admission")
+        ));
+        assert!(matches!(
+            context.validate_card_scope(7, 21, 42, 11),
+            Err(AstralError::Pending(message)) if message.contains("proof-bound authorization admission")
+        ));
+    }
+
+    #[test]
+    fn direct_mutation_context_rejects_widened_or_cross_card_scope() {
+        let evidence = astral_types::PublishedCardAuthorization {
+            tenant_id: 7,
+            card_id: 21,
+            read_unix_seconds: 100,
+            gate: astral_types::PublishedCardAuthorizationGate {
+                status: astral_types::PublishedEvidenceGateStatus::Ready,
+                aggregate_manifest_count: 1,
+                verified_record_count: 0,
+                effective_grant_count: 0,
+                not_in_effective_count: 0,
+                equivalent_duplicate_collapsed_count: 0,
+            },
+            manifests: vec![astral_types::PublishedAggregateManifestSummary {
+                seal: astral_types::PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
+                tenant_id: 7,
+                card_id: 21,
+                aggregate_type: "USER_CARD".into(),
+                aggregate_id: 21,
+                manifest_id: 1,
+                generation: 1,
+                source_generation: 1,
+                projected_generation: 1,
+                revoke_fence: 0,
+                cas_version: 1,
+                semantic_hash_hex: "aa".repeat(32),
+                dependency_hash_hex: "bb".repeat(32),
+                manifest_digest_hex: "cc".repeat(32),
+                compiler_version: policy_engine::COMPILER_VERSION.into(),
+                event_id: "event-direct-scope".into(),
+                operation_id: "operation-direct-scope".into(),
+                parent_manifest_id: None,
+                segment_count: 0,
+                declared_grant_row_count: 0,
+            }],
+            records: Vec::new(),
+            effective_grants: Vec::new(),
+        };
+        let key = ed25519_dalek::SigningKey::from_bytes(&[19u8; 32]);
+        let mut proof = astral_types::AuthorizationFenceProof {
+            authorization_edition: astral_types::AUTHORIZATION_EDITION,
+            authority_id: "authority-direct-scope".into(),
+            authority_term: 1,
+            global_fence_sequence: 1,
+            scope: astral_types::AuthorizationAuthorityScope {
+                tenant_id: 7,
+                card_id: 21,
+                user_id: Some(42),
+                domain: astral_types::AuthorizationDomainScope::Exact(11),
+            },
+            scope_generation: 1,
+            revoke_watermark: 0,
+            snapshot_hash: astral_types::AuthorizationFenceProof::evidence_content_hash(&evidence)
+                .unwrap(),
+            parent_hash: None,
+            operation_id: "operation-direct-scope".into(),
+            event_id: "event-direct-scope".into(),
+            key_id: "key-direct-scope".into(),
+            key_epoch: 1,
+            issued_at: 100,
+            not_before: 99,
+            expires_at: 110,
+            request_nonce: "nonce-direct-scope".into(),
+            request_binding_digest: None,
+            scope_certificate_hash: None,
+            proof_id: "proof-direct-scope".into(),
+            signature: String::new(),
+        };
+        proof.signature = hex::encode(
+            ed25519_dalek::Signer::sign(&key, &proof.signing_bytes().unwrap()).to_bytes(),
+        );
+        let admission = AuthorizationAdmission::from_verified_proof(proof).unwrap();
+        let context = DirectRuleMutationContext::user_with_admission(17, None, admission).unwrap();
+        assert!(context.validate_card_scope(7, 21, 42, 11).is_ok());
+        assert!(matches!(
+            context.validate_card_scope(7, 22, 42, 11),
+            Err(AstralError::Permission(_))
+        ));
+        assert!(matches!(
+            context.validate_card_scope(7, 21, 42, 12),
+            Err(AstralError::Permission(_))
+        ));
+        assert!(matches!(
+            context.validate_card_scope(8, 21, 42, 11),
+            Err(AstralError::Permission(_))
+        ));
     }
 
     #[test]

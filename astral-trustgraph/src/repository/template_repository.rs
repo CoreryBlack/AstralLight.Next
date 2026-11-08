@@ -3,15 +3,23 @@
 //! 对齐模板 source 仓储边界（permission_rule_template 表）。
 //! 事务性更新（delete-then-insert）收口为聚合方法。
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use sqlx::MySqlPool;
 
+use astral_db::invalidation_delivery::InvalidationDeliveryContext;
 use astral_types::{AstralError, EVENT_TYPE_REVOKE, EVENT_TYPE_RULE_SET_UPDATE};
 
 use crate::repository::audit_log_repository::RuleSetMutationContext;
-use crate::repository::authorization_source_transaction::AuthorizationSourceTransaction;
+use crate::repository::authorization_source_transaction::{
+    begin_source_transaction_with_capability,
+    begin_source_transaction_with_capability_and_delivery_context, AuthorizationSourceTransaction,
+    SourceMutationCapability,
+};
 use crate::repository::rule_set_repository::{
     replace_rule_set_entries_churn_with_ledger_in_tx, LedgerChurnAuditContext, NewRuleSetEntry,
+    RuleSetChurnOutcome,
 };
 use crate::service::rule_set_write_service::validate_entry_fields;
 
@@ -31,6 +39,85 @@ pub struct TemplateRuleRecord {
     pub effect: String,
     pub resource: String,
     pub action: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct LockedTemplateRuleSourceRow {
+    effect: String,
+    resource_type: String,
+    resource_id: Option<i64>,
+    action_code: String,
+    condition_json: Option<String>,
+    priority: i32,
+    enabled: i32,
+}
+
+/// The batch PUT request can reproduce only the four displayed fields. A no-op
+/// requires every persisted source row to match those fields and all omitted
+/// dimensions to be at their INSERT defaults; anything else must go through the
+/// full replacement path rather than being silently treated as equivalent.
+fn template_source_matches_request(
+    current: &[LockedTemplateRuleSourceRow],
+    requested: &[TemplateRuleInput],
+    effects: &[&'static str],
+) -> bool {
+    if current.len() != requested.len() || requested.len() != effects.len() {
+        return false;
+    }
+    type Key = (
+        String,
+        String,
+        Option<i64>,
+        String,
+        Option<String>,
+        i32,
+        i32,
+    );
+    let mut current_keys: Vec<Key> = current
+        .iter()
+        .map(|row| {
+            (
+                row.effect.clone(),
+                row.resource_type.clone(),
+                row.resource_id,
+                row.action_code.clone(),
+                row.condition_json.clone(),
+                row.priority,
+                row.enabled,
+            )
+        })
+        .collect();
+    let mut requested_keys: Vec<Key> = requested
+        .iter()
+        .zip(effects)
+        .map(|(row, effect)| {
+            (
+                (*effect).to_owned(),
+                row.resource.clone(),
+                None,
+                row.action.clone(),
+                None,
+                0,
+                1,
+            )
+        })
+        .collect();
+    current_keys.sort();
+    requested_keys.sort();
+    current_keys == requested_keys
+}
+
+fn template_rule_update_is_noop(
+    current_effect: &str,
+    current_resource: &str,
+    current_action: &str,
+    effect_update: Option<&str>,
+    resource: Option<&str>,
+    action: Option<&str>,
+) -> bool {
+    effect_update.unwrap_or(current_effect) == current_effect
+        && resource.unwrap_or(current_resource) == current_resource
+        && action.unwrap_or(current_action) == current_action
 }
 
 /// 模板规则请求（resource/action 必填，effect 默认 ALLOW）
@@ -111,11 +198,42 @@ pub trait TemplateRepository: Send + Sync {
 
 pub struct SqlxTemplateRepository {
     db: MySqlPool,
+    delivery_context: Option<Arc<InvalidationDeliveryContext>>,
 }
 
 impl SqlxTemplateRepository {
     pub fn new(db: MySqlPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            delivery_context: None,
+        }
+    }
+
+    pub fn new_with_delivery_context(
+        db: MySqlPool,
+        delivery_context: Arc<InvalidationDeliveryContext>,
+    ) -> Self {
+        Self {
+            db,
+            delivery_context: Some(delivery_context),
+        }
+    }
+
+    async fn begin_source_transaction(
+        &self,
+        capability: &SourceMutationCapability,
+    ) -> Result<AuthorizationSourceTransaction, AstralError> {
+        match &self.delivery_context {
+            Some(context) => {
+                begin_source_transaction_with_capability_and_delivery_context(
+                    &self.db,
+                    capability,
+                    Arc::clone(context),
+                )
+                .await
+            }
+            None => begin_source_transaction_with_capability(&self.db, capability).await,
+        }
     }
 }
 
@@ -214,7 +332,7 @@ fn validate_template_rule_update(
 async fn ensure_template_rule_set_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     template_id: &str,
-) -> Result<i64, AstralError> {
+) -> Result<(i64, bool), AstralError> {
     let template_id = template_numeric_id(template_id)?;
     let existing: Option<(i64, Option<i64>)> = sqlx::query_as(
         "SELECT rule_set_id, tenant_id FROM rule_set \
@@ -243,7 +361,7 @@ async fn ensure_template_rule_set_in_tx(
                 "template {template_id} RuleSet tenant_id does not match its template"
             )));
         }
-        return Ok(rule_set_id);
+        return Ok((rule_set_id, false));
     }
     if code.trim().is_empty() {
         return Err(AstralError::Validation(format!(
@@ -275,7 +393,7 @@ async fn ensure_template_rule_set_in_tx(
     .execute(&mut **tx)
     .await
     .map_err(db_error)?;
-    Ok(result.last_insert_id() as i64)
+    Ok((result.last_insert_id() as i64, true))
 }
 
 /// 模板同步专用的确定性 operation id（纯逻辑）：显式 request id 缺失时，
@@ -325,7 +443,7 @@ async fn stabilize_template_operation_context(
 /// 将锁定读回的模板行映射并校验为规则集条目请求行（纯逻辑）：归一化 effect
 /// （恒为 ALLOW），遗留 DENY/未注册资源/非法条件行整批拒绝（fail-closed）。
 #[allow(clippy::type_complexity)]
-fn template_rows_to_entry_requests(
+pub(crate) fn template_rows_to_entry_requests(
     fetched: Vec<(String, String, Option<i64>, String, Option<String>, i32)>,
 ) -> Result<Vec<NewRuleSetEntry>, AstralError> {
     fetched
@@ -356,8 +474,8 @@ async fn sync_template_rule_set_projection_in_tx(
     template_id: &str,
     forced_event_type: Option<&str>,
     context: Option<&RuleSetMutationContext>,
-) -> Result<usize, AstralError> {
-    let rule_set_id = ensure_template_rule_set_in_tx(tx, template_id).await?;
+) -> Result<RuleSetChurnOutcome, AstralError> {
+    let (rule_set_id, _) = ensure_template_rule_set_in_tx(tx, template_id).await?;
     let context = context.ok_or_else(|| {
         AstralError::Auth("RuleSet template projection requires an actor context".into())
     })?;
@@ -480,8 +598,26 @@ impl TemplateRepository for SqlxTemplateRepository {
             .iter()
             .map(validate_template_rule)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
-        ensure_template_rule_set_in_tx(&mut tx, template_id).await?;
+        let mut tx = self
+            .begin_source_transaction(context.source_capability())
+            .await?;
+        let (_rule_set_id, created_rule_set) =
+            ensure_template_rule_set_in_tx(&mut tx, template_id).await?;
+        if rules.is_empty() && !created_rule_set {
+            // A repeated empty create is a real no-op only when the complete
+            // permission-rule source is still empty and the RuleSet root existed.
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM permission_rule_template WHERE template_id = ? FOR UPDATE",
+            )
+            .bind(template_numeric_id(template_id)?)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(db_error)?;
+            if count == 0 {
+                tx.rollback_consuming().await?;
+                return Ok(());
+            }
+        }
         for (rule, effect) in rules.iter().zip(effects) {
             sqlx::query(
                 "INSERT INTO permission_rule_template (template_id, effect, resource_type, action_code) VALUES (?, ?, ?, ?)",
@@ -502,13 +638,27 @@ impl TemplateRepository for SqlxTemplateRepository {
         } else {
             EVENT_TYPE_RULE_SET_UPDATE
         };
-        sync_template_rule_set_projection_in_tx(
+        let churn = sync_template_rule_set_projection_in_tx(
             &mut tx,
             template_id,
             Some(event_type),
             Some(context),
         )
         .await?;
+        if !churn.source_changed {
+            // Creating a previously missing TEMPLATE RuleSet is a source change
+            // in its own right even when no entries or grants are materialized.
+            if created_rule_set {
+                // The churn helper only appended projections for changed entries;
+                // a root-only create cannot be committed with empty authorization evidence.
+                tx.rollback_consuming().await?;
+                return Err(AstralError::Pending(format!(
+                    "template {template_id} created a RuleSet root without a grant-changing source route"
+                )));
+            }
+            tx.rollback_consuming().await?;
+            return Ok(());
+        }
         tx.commit_consuming().await?;
         Ok(())
     }
@@ -523,8 +673,25 @@ impl TemplateRepository for SqlxTemplateRepository {
             .iter()
             .map(validate_template_rule)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let mut tx = self
+            .begin_source_transaction(context.source_capability())
+            .await?;
         ensure_template_rule_set_in_tx(&mut tx, template_id).await?;
+        let current_source: Vec<LockedTemplateRuleSourceRow> = sqlx::query_as(
+            "SELECT effect, resource_type, resource_id, action_code, \
+                    CAST(condition_json AS CHAR), priority, enabled \
+             FROM permission_rule_template WHERE template_id = ? ORDER BY template_rule_id FOR UPDATE",
+        )
+        .bind(template_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(db_error)?;
+        if template_source_matches_request(&current_source, rules, &effects) {
+            // The locked source already has the exact requested values and defaults;
+            // no source, derived projection, grant, or audit effect should be committed.
+            tx.rollback_consuming().await?;
+            return Ok(rules.len() as i64);
+        }
         let had_deny = !sqlx::query_scalar::<_, String>(
             "SELECT effect FROM permission_rule_template \
              WHERE template_id = ? AND effect = 'DENY' FOR UPDATE",
@@ -595,12 +762,18 @@ impl TemplateRepository for SqlxTemplateRepository {
         template_id: &str,
         context: &RuleSetMutationContext,
     ) -> Result<usize, AstralError> {
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let mut tx = self
+            .begin_source_transaction(context.source_capability())
+            .await?;
         let synced =
             sync_template_rule_set_projection_in_tx(&mut tx, template_id, None, Some(context))
                 .await?;
+        if !synced.source_changed {
+            tx.rollback_consuming().await?;
+            return Ok(0);
+        }
         tx.commit_consuming().await?;
-        Ok(synced)
+        Ok(synced.affected_cards)
     }
 
     async fn create_template_rule(
@@ -610,7 +783,9 @@ impl TemplateRepository for SqlxTemplateRepository {
         context: &RuleSetMutationContext,
     ) -> Result<i64, AstralError> {
         let effect = validate_template_rule(rule)?;
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let mut tx = self
+            .begin_source_transaction(context.source_capability())
+            .await?;
         ensure_template_rule_set_in_tx(&mut tx, template_id).await?;
         let result = sqlx::query(
             "INSERT INTO permission_rule_template (template_id, effect, resource_type, action_code) VALUES (?, ?, ?, ?)",
@@ -642,7 +817,9 @@ impl TemplateRepository for SqlxTemplateRepository {
         action: Option<&str>,
         context: &RuleSetMutationContext,
     ) -> Result<(), AstralError> {
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let mut tx = self
+            .begin_source_transaction(context.source_capability())
+            .await?;
         let current: Option<(String, String, String, String)> = sqlx::query_as(
             "SELECT template_id, effect, resource_type, action_code \
              FROM permission_rule_template WHERE template_rule_id = ? FOR UPDATE",
@@ -666,6 +843,18 @@ impl TemplateRepository for SqlxTemplateRepository {
             action,
         )?;
 
+        if template_rule_update_is_noop(
+            &current_effect,
+            &current_resource,
+            &current_action,
+            effect_update,
+            resource,
+            action,
+        ) {
+            tx.rollback_consuming().await?;
+            return Ok(());
+        }
+
         let mut builder =
             sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE permission_rule_template SET ");
         let mut separated = builder.separated(", ");
@@ -679,7 +868,7 @@ impl TemplateRepository for SqlxTemplateRepository {
             separated.push("action_code = ").push_bind(action);
         }
         if effect.is_none() && resource.is_none() && action.is_none() {
-            tx.commit_consuming().await?;
+            tx.rollback_consuming().await?;
             return Ok(());
         }
         builder
@@ -731,7 +920,9 @@ impl TemplateRepository for SqlxTemplateRepository {
         rule_id: i64,
         context: &RuleSetMutationContext,
     ) -> Result<bool, AstralError> {
-        let mut tx = AuthorizationSourceTransaction::begin(&self.db).await?;
+        let mut tx = self
+            .begin_source_transaction(context.source_capability())
+            .await?;
         let template_id: Option<String> = sqlx::query_scalar(
             "SELECT template_id FROM permission_rule_template WHERE template_rule_id = ? FOR UPDATE",
         )

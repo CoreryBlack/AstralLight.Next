@@ -1,0 +1,88 @@
+[package]
+name = "astral-authority"
+version = "0.1.0"
+edition = "2021"
+description = "Global authorization authority control plane (quorum-backed fence, reservations, publication certification)"
+license.workspace = true
+
+[lib]
+name = "astral_authority"
+path = "src/lib.rs"
+
+[[bin]]
+name = "astral-authority"
+path = "src/main.rs"
+required-features = ["service"]
+
+[features]
+# default builds the full authority service (etcd quorum, mTLS listener).
+# default-features=false builds the client-only library for source-side
+# integrators (astral-db): no etcd, no signing, no server code.
+default = ["service"]
+service = [
+    "dep:etcd-client",
+    "dep:axum",
+    "dep:tower",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:toml",
+    "dep:zeroize",
+    "dep:sha2",
+    "dep:hex",
+    "dep:async-trait",
+    "dep:tracing",
+    "tokio/full",
+]
+
+[dependencies]
+astral-types = { path = "../astral-types" }
+
+# 内部客户端（无数据库依赖；强制 https/rustls；无签名能力）
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 密码学（客户端只使用 VerifyingKey 做验证）
+ed25519-dalek = "2"
+
+# 工具
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+thiserror = "2"
+
+# ── service 特性：quorum 存储、mTLS 监听、受保护签名者、CLI ──
+# HTTP 服务（强制 TLS/mTLS 监听）
+axum = { version = "0.8", optional = true }
+tower = { version = "0.5", optional = true }
+hyper = { version = "1", features = ["http1", "http2"], optional = true }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+
+# Quorum 状态存储（mature etcd-client：linearizable reads + Txn Compare CAS +
+# lease/leader election）。构建需要系统 protoc（PROTOC 环境变量或 PATH）。
+etcd-client = { version = "0.21.1", features = ["tls"], optional = true }
+
+# TLS / mTLS（ring provider，与 etcd-client tls 特性一致）
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
+# 配置与摘要
+toml = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
+zeroize = { version = "1", optional = true }
+async-trait = { version = "0.1", optional = true }
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+# 测试仅使用 Rust；纯/存储契约测试不依赖外部环境（service 测试随默认特性构建）。
+tokio = { version = "1", features = ["full", "test-util"] }
+# 仅测试使用：为 http 传输生命周期行为测试生成本地 mTLS 测试 PKI；生产代码零新增依赖。
+rcgen = "0.13"

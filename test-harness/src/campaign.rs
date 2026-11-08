@@ -2744,7 +2744,7 @@ exit "${FAKE_CARGO_EXIT:-0}"
             (
                 "s15-validation-helper-contracts",
                 "Docs/实验/分布式测试/rust-s15/test_s15_validation.py",
-                6,
+                8,
                 "s15_validation::tests::",
             ),
         ] {
@@ -2763,6 +2763,20 @@ exit "${FAKE_CARGO_EXIT:-0}"
             assert_eq!(str_field(suite, "acceptance").unwrap(), "rust");
             let expected_sources = if id.starts_with("tdsc") {
                 vec!["test-harness/src/tdsc_performance.rs".to_owned()]
+            } else if id.starts_with("s15") {
+                vec![
+                    "test-harness/src/s15_validation.rs".to_owned(),
+                    "test-harness/src/remaining_contracts.rs".to_owned(),
+                    "astral-mq/src/local_bus.rs".to_owned(),
+                    "astral-db/src/local_projection_bus.rs".to_owned(),
+                    "astral-mq/src/consumer.rs".to_owned(),
+                    "astral-mq/src/invalidation_fanout.rs".to_owned(),
+                    "astral-db/src/projection_execution/completion.rs".to_owned(),
+                    "astral-db/src/authorization_projection_repository.rs".to_owned(),
+                    "policy-engine/src/engine/published.rs".to_owned(),
+                    module.to_owned(),
+                    "Docs/实验/分布式测试/rust-s15/s15_validation.py".to_owned(),
+                ]
             } else {
                 vec![
                     "test-harness/src/s15_validation.rs".to_owned(),

@@ -32,12 +32,25 @@
 
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use astral_mq::envelope::MessageEnvelope;
 use astral_mq::{EligibilityInvalidated, InvalidationEvent};
-use astral_types::{AstralError, ProjectionAggregate, EVENT_TYPE_ELIGIBILITY_UPDATE};
+use astral_types::{
+    AstralError, AuthorizationAdmission, AuthorizationMessageMetadata, ProjectionAggregate,
+    EVENT_TYPE_ELIGIBILITY_UPDATE,
+};
 use sqlx::{MySql, Transaction};
+
+use astral_db::authority_eligibility_completion::EligibilitySourceEvidenceReceipt;
+use astral_db::invalidation_delivery::InvalidationDeliveryContext;
+use astral_db::{
+    TypedRowOperation, TypedSourceAuditReceipt, TypedSourceRowImageReceipt, TypedSourceTable,
+};
+
+mod source_outcome;
+pub(crate) use source_outcome::card_create::CardCreateBindingStart;
 
 /// One direct invalidation dispatch budget, including exact DB claim and the shared
 /// LocalBus handler deadline. Projection completion is observed separately by the
@@ -355,6 +368,17 @@ fn append_unique_source_projection_receipt(
     Ok(())
 }
 
+/// typed receipt 与既有 receipt 家族共享同一有限事务容量：超过即 Validation
+/// fail-closed 回滚整个事务，绝不把任一 receipt 通道变成无界队列。
+fn ensure_typed_source_receipt_capacity(total: usize) -> Result<(), AstralError> {
+    if total >= PROJECTION_RECEIPT_CAP {
+        return Err(AstralError::Validation(format!(
+            "authorization source transaction exceeded its receipt cap ({PROJECTION_RECEIPT_CAP})"
+        )));
+    }
+    Ok(())
+}
+
 ///
 /// 直接持有 hub 的 owned RAII `SourceTransactionGuard`（begin 先增
 /// `active_source_writers` + `mutation_revision`，Drop 减计数并 bump
@@ -364,6 +388,108 @@ fn append_unique_source_projection_receipt(
 /// hub uncertain sticky。hub 未安装（纯测试、离线工具、Rabbit 模式）时为
 /// `None`，行为不变。
 pub(crate) type SourceTransactionActivityFence = Option<astral_db::SourceTransactionGuard>;
+
+/// Capability classification carried by mutation contexts.
+///
+/// `UserPending` is retained only for legacy/unit context construction and is
+/// rejected before a user source transaction opens. It must never be treated
+/// as equivalent to a verified admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum SourceMutationCapability {
+    UserPending,
+    User(AuthorizationAdmission),
+    System,
+}
+
+impl SourceMutationCapability {
+    pub(crate) fn user(admission: AuthorizationAdmission) -> Self {
+        Self::User(admission)
+    }
+}
+
+/// Open the source transaction appropriate for the explicit mutation capability.
+pub(crate) async fn begin_source_transaction_with_capability(
+    pool: &sqlx::MySqlPool,
+    capability: &SourceMutationCapability,
+) -> Result<AuthorizationSourceTransaction, AstralError> {
+    match capability {
+        SourceMutationCapability::User(admission) => {
+            AuthorizationSourceTransaction::begin_with_admission(pool, admission.clone()).await
+        }
+        SourceMutationCapability::System => AuthorizationSourceTransaction::begin(pool).await,
+        SourceMutationCapability::UserPending => Err(AstralError::Pending(
+            "authorization admission is required for user source mutation".into(),
+        )),
+    }
+}
+
+/// Open a source transaction with a startup-frozen delivery context.
+///
+/// The context is supplied by the composition root as an immutable `Arc`; this
+/// factory never reads environment/configuration and never consults a mutable
+/// recipient roster. Callers that can append invalidation intents must use this
+/// entry point. Config-only and delta-only owners may keep the context-free
+/// factory above because their source-outcome lanes do not stage delivery rows.
+pub(crate) async fn begin_source_transaction_with_capability_and_delivery_context(
+    pool: &sqlx::MySqlPool,
+    capability: &SourceMutationCapability,
+    delivery_context: Arc<InvalidationDeliveryContext>,
+) -> Result<AuthorizationSourceTransaction, AstralError> {
+    match capability {
+        SourceMutationCapability::User(admission) => {
+            AuthorizationSourceTransaction::begin_with_admission_and_delivery_context(
+                pool,
+                admission.clone(),
+                delivery_context,
+            )
+            .await
+        }
+        SourceMutationCapability::System => {
+            AuthorizationSourceTransaction::begin_with_delivery_context(pool, delivery_context)
+                .await
+        }
+        SourceMutationCapability::UserPending => Err(AstralError::Pending(
+            "authorization admission is required for user source mutation".into(),
+        )),
+    }
+}
+
+/// Open through the immutable context when the owner was constructed with one;
+/// otherwise retain the legacy context-free constructor and let any attempted
+/// delivery-dependent append fail closed inside the source transaction.
+pub(crate) async fn begin_source_transaction_with_capability_and_optional_delivery_context(
+    pool: &sqlx::MySqlPool,
+    capability: &SourceMutationCapability,
+    delivery_context: Option<&Arc<InvalidationDeliveryContext>>,
+) -> Result<AuthorizationSourceTransaction, AstralError> {
+    match delivery_context {
+        Some(context) => {
+            begin_source_transaction_with_capability_and_delivery_context(
+                pool,
+                capability,
+                Arc::clone(context),
+            )
+            .await
+        }
+        None => match capability {
+            // All request-bound source mutations in the expanded repository set
+            // can reach a delivery-producing path. Do not let the compatibility
+            // constructor silently commit a user mutation without its frozen
+            // journal context; the composition root must use the new constructor.
+            SourceMutationCapability::User(_) => Err(AstralError::Pending(
+                "user source mutation requires an injected immutable invalidation delivery context"
+                    .into(),
+            )),
+            SourceMutationCapability::System => {
+                begin_source_transaction_with_capability(pool, capability).await
+            }
+            SourceMutationCapability::UserPending => Err(AstralError::Pending(
+                "authorization admission is required for user source mutation".into(),
+            )),
+        },
+    }
+}
 
 /// 取得源事务活动栅栏：委托进程级中心入口
 /// `astral_db::memory_projection_hub::acquire_source_guard`（该 API 非 root
@@ -389,6 +515,10 @@ pub(crate) struct AuthorizationSourceTransaction {
     tx: Transaction<'static, MySql>,
     /// Pool retained only for the post-commit exact-row claim, after tx is consumed.
     pool: sqlx::MySqlPool,
+    /// Optional proof-bound capability. `begin` remains for controlled internal
+    /// system/projector paths; user-facing source mutations must use
+    /// `begin_with_admission`.
+    admission: Option<AuthorizationAdmission>,
     /// typed invalidation envelopes appended to the durable outbox in-tx.
     receipts: Vec<InvalidationReceipt>,
     /// exact legacy source projection identities appended in the same tx.
@@ -396,6 +526,22 @@ pub(crate) struct AuthorizationSourceTransaction {
     /// 完整 projection delta requests 已在事务内 append 成 durable 行，
     /// commit 证明后直接发送；与 durable 行同一请求，commit 后不 reload。
     projection_receipts: Vec<astral_db::DeltaEventAppendRequest>,
+    /// typed（config）owner 在本事务内密封的真实 before/after 行镜像
+    /// receipt（opaque，唯一构造点是 astral_db 的 capture delegate）。
+    typed_source_images: Vec<TypedSourceRowImageReceipt>,
+    /// typed（config）owner 的同事务 audit_log 关联 receipt（真实 id）。
+    typed_source_audits: Vec<TypedSourceAuditReceipt>,
+    /// Eligibility owner 的 opaque source evidence；只能由其同事务 capture
+    /// delegate 生成，不能由 config/delta writer 自行改写成资格完成。
+    eligibility_source: Option<EligibilitySourceEvidenceReceipt>,
+    /// Closed CardCreate INSERT origin retained for real grant publication.
+    publication_origin: Option<EligibilitySourceEvidenceReceipt>,
+    /// Closed new-card RuleSet binding receipts. These are constructed only by
+    /// the child after same-transaction before/after and correlation readback.
+    card_create_bindings: Vec<source_outcome::card_create::CardCreateBindingReceipt>,
+    /// Immutable startup-frozen delivery context. Writers never inspect env or
+    /// a mutable recipient roster while this source transaction is open.
+    delivery_context: Option<Arc<InvalidationDeliveryContext>>,
     _activity_fence: SourceTransactionActivityFence,
 }
 
@@ -421,6 +567,23 @@ impl AuthorizationSourceTransaction {
     /// 绝不留下无栅栏 source writer。栅栏随本包装器 drop（commit/rollback/
     /// dispatch 全程持有）。
     pub(crate) async fn begin(pool: &sqlx::MySqlPool) -> Result<Self, AstralError> {
+        Self::begin_with_context(pool, None).await
+    }
+
+    /// Open a source transaction with the startup-frozen delivery context. The
+    /// context is injected by the composition root and is immutable for the
+    /// whole source transaction.
+    pub(crate) async fn begin_with_delivery_context(
+        pool: &sqlx::MySqlPool,
+        delivery_context: Arc<InvalidationDeliveryContext>,
+    ) -> Result<Self, AstralError> {
+        Self::begin_with_context(pool, Some(delivery_context)).await
+    }
+
+    async fn begin_with_context(
+        pool: &sqlx::MySqlPool,
+        delivery_context: Option<Arc<InvalidationDeliveryContext>>,
+    ) -> Result<Self, AstralError> {
         let _activity_fence = acquire_source_transaction_activity_fence()?;
         let tx = pool
             .begin()
@@ -429,16 +592,134 @@ impl AuthorizationSourceTransaction {
         Ok(Self {
             tx,
             pool: pool.clone(),
+            admission: None,
             receipts: Vec::new(),
             source_projection_receipts: Vec::new(),
             projection_receipts: Vec::new(),
+            typed_source_images: Vec::new(),
+            typed_source_audits: Vec::new(),
+            eligibility_source: None,
+            card_create_bindings: Vec::new(),
+            publication_origin: None,
+            delivery_context,
             _activity_fence,
         })
     }
 
-    /// 登记一条已在**本事务内** append 成 durable source projection outbox 行的
-    /// exact identity。调用方可在 commit 后等待这条 legacy source event 达到
-    /// `PROCESSED`，从而把 CARD/ELIGIBILITY source correlation 纳入同一 barrier。
+    /// Open a source transaction carrying a request-bound authorization
+    /// capability. The capability is revalidated against the locked durable
+    /// authority frontier/proof immediately before COMMIT.
+    pub(crate) async fn begin_with_admission(
+        pool: &sqlx::MySqlPool,
+        admission: AuthorizationAdmission,
+    ) -> Result<Self, AstralError> {
+        let _activity_fence = acquire_source_transaction_activity_fence()?;
+        let tx = pool
+            .begin()
+            .await
+            .map_err(|error| AstralError::Database(error.to_string()))?;
+        Ok(Self {
+            tx,
+            pool: pool.clone(),
+            admission: Some(admission),
+            receipts: Vec::new(),
+            source_projection_receipts: Vec::new(),
+            projection_receipts: Vec::new(),
+            typed_source_images: Vec::new(),
+            typed_source_audits: Vec::new(),
+            eligibility_source: None,
+            card_create_bindings: Vec::new(),
+            publication_origin: None,
+            delivery_context: None,
+            _activity_fence,
+        })
+    }
+
+    /// Open an admission-bound source transaction with the immutable delivery
+    /// context supplied by the composition root.
+    pub(crate) async fn begin_with_admission_and_delivery_context(
+        pool: &sqlx::MySqlPool,
+        admission: AuthorizationAdmission,
+        delivery_context: Arc<InvalidationDeliveryContext>,
+    ) -> Result<Self, AstralError> {
+        let _activity_fence = acquire_source_transaction_activity_fence()?;
+        let tx = pool
+            .begin()
+            .await
+            .map_err(|error| AstralError::Database(error.to_string()))?;
+        Ok(Self {
+            tx,
+            pool: pool.clone(),
+            admission: Some(admission),
+            receipts: Vec::new(),
+            source_projection_receipts: Vec::new(),
+            projection_receipts: Vec::new(),
+            typed_source_images: Vec::new(),
+            typed_source_audits: Vec::new(),
+            eligibility_source: None,
+            card_create_bindings: Vec::new(),
+            publication_origin: None,
+            delivery_context: Some(delivery_context),
+            _activity_fence,
+        })
+    }
+
+    pub(crate) fn stage_card_create_binding(
+        &mut self,
+        receipt: source_outcome::card_create::CardCreateBindingReceipt,
+    ) -> Result<(), AstralError> {
+        if self.publication_origin.is_none() && self.eligibility_source.is_none() {
+            return Err(AstralError::Pending(
+                "CardCreate RuleSet binding evidence requires a captured card origin".into(),
+            ));
+        }
+        if self
+            .card_create_bindings
+            .iter()
+            .any(|existing| existing.rule_set_id() == receipt.rule_set_id())
+        {
+            return Err(AstralError::Validation(
+                "duplicate CardCreate RuleSet binding receipt".into(),
+            ));
+        }
+        if self.card_create_bindings.len() >= PROJECTION_RECEIPT_CAP {
+            return Err(AstralError::Validation(
+                "CardCreate RuleSet binding receipt capacity exceeded".into(),
+            ));
+        }
+        self.card_create_bindings.push(receipt);
+        Ok(())
+    }
+
+    pub(crate) async fn begin_card_create_binding(
+        &mut self,
+        start: source_outcome::card_create::CardCreateBindingStart,
+    ) -> Result<source_outcome::card_create::CardCreateBindingBefore, AstralError> {
+        source_outcome::card_create::begin_card_create_binding_in_raw_tx(&mut self.tx, start).await
+    }
+
+    pub(crate) async fn finish_card_create_binding(
+        &mut self,
+        before: source_outcome::card_create::CardCreateBindingBefore,
+        ref_id: i64,
+        rule_projection: &astral_db::ProjectionEventIdentity,
+        parent_projection: &astral_db::ProjectionEventIdentity,
+        addition: &crate::repository::rule_set_repository::CardCreateRulesetAddition,
+        actor_id: i64,
+    ) -> Result<(), AstralError> {
+        let receipt = source_outcome::card_create::finish_card_create_binding_in_tx(
+            self,
+            before,
+            ref_id,
+            rule_projection,
+            parent_projection,
+            addition,
+            actor_id,
+        )
+        .await?;
+        self.stage_card_create_binding(receipt)
+    }
+
     pub(crate) fn record_source_projection_receipt(
         &mut self,
         receipt: SourceProjectionReceipt,
@@ -458,8 +739,35 @@ impl AuthorizationSourceTransaction {
         append_unique_source_projection_receipt(&mut self.source_projection_receipts, receipt)
     }
 
-    /// 登记一条已在**本事务内** append 进 durable outbox 的 invalidation receipt。
-    ///
+    /// Return proof-derived message provenance for user-authorized source paths.
+    /// Internal/projector transactions have no user admission and therefore
+    /// cannot emit evidence invalidations that claim authorization provenance.
+    pub(crate) fn authority_message_metadata(
+        &self,
+        operation_id: &str,
+        event_id: &str,
+    ) -> Result<AuthorizationMessageMetadata, AstralError> {
+        let admission = self.admission.as_ref().ok_or_else(|| {
+            AstralError::Pending(
+                "evidence invalidation requires proof-bound authorization admission".into(),
+            )
+        })?;
+        let proof = admission.proof();
+        let staged = self
+            .projection_receipts
+            .iter()
+            .any(|receipt| receipt.operation_id == operation_id && receipt.event_id == event_id);
+        if !staged || operation_id.is_empty() || event_id.is_empty() {
+            return Err(AstralError::Pending(
+                "evidence invalidation has no exact delta receipt in this source transaction"
+                    .into(),
+            ));
+        }
+        AuthorizationMessageMetadata::from_verified_proof(proof)
+            .map_err(|error| AstralError::Pending(error.to_string()))
+    }
+
+    /// 登记一条已在**本事务内** append 进 durable outbox 的 invalidation receipt。    ///
     /// envelope 必须与 outbox 行逐字节同源（同一构造实例）；没有 published
     /// pointer 的路径不产生 receipt。
     pub(crate) fn record_invalidation_receipt(&mut self, receipt: InvalidationReceipt) {
@@ -495,6 +803,192 @@ impl AuthorizationSourceTransaction {
         request: astral_db::DeltaEventAppendRequest,
     ) -> Result<(), AstralError> {
         stage_projection_receipt_into(&mut self.projection_receipts, request)
+    }
+
+    /// 打开一个结构性绑定**本事务**的 typed config 行镜像捕获句柄。
+    ///
+    /// 捕获期间事务的独占可变借用归 delegate 所有；writer 的 mutation SQL
+    /// 只能经 `with_tx_mut` 在该事务上执行，before/after 捕获与 mutation
+    /// 不可能跨事务。seal 消费句柄后借用归还，audit 关联与登记随后进行。
+    pub(crate) fn typed_row_capture(
+        &mut self,
+        table: TypedSourceTable,
+        operation: TypedRowOperation,
+    ) -> astral_db::TypedSourceRowCapture<'_> {
+        astral_db::TypedSourceRowCapture::begin_in_tx(&mut self.tx, table, operation)
+    }
+
+    /// 登记一条本事务内密封的 typed config 行镜像 receipt（finite capacity）。
+    pub(crate) fn stage_typed_source_image(
+        &mut self,
+        receipt: TypedSourceRowImageReceipt,
+    ) -> Result<(), AstralError> {
+        ensure_typed_source_receipt_capacity(
+            self.projection_receipts.len()
+                + self.source_projection_receipts.len()
+                + self.receipts.len()
+                + self.typed_source_images.len()
+                + self.typed_source_audits.len(),
+        )?;
+        let identity = (receipt.table().as_str().to_owned(), receipt.key());
+        if self
+            .typed_source_images
+            .iter()
+            .any(|existing| (existing.table().as_str().to_owned(), existing.key()) == identity)
+        {
+            return Err(AstralError::Validation(
+                "duplicate typed source image receipt identity".into(),
+            ));
+        }
+        self.typed_source_images.push(receipt);
+        Ok(())
+    }
+
+    /// Record the actual source audit insert id as an opaque same-transaction receipt.
+    pub(crate) fn stage_typed_source_audit_insert_id(
+        &mut self,
+        audit_log_id: i64,
+    ) -> Result<(), AstralError> {
+        let receipt = astral_db::TypedSourceAuditReceipt::from_same_tx_insert_id(audit_log_id)?;
+        self.stage_typed_source_audit(receipt)
+    }
+
+    /// 登记一条同事务 audit_log 关联 receipt（真实 durable id）。
+    pub(crate) fn stage_typed_source_audit(
+        &mut self,
+        receipt: TypedSourceAuditReceipt,
+    ) -> Result<(), AstralError> {
+        ensure_typed_source_receipt_capacity(
+            self.projection_receipts.len()
+                + self.source_projection_receipts.len()
+                + self.receipts.len()
+                + self.typed_source_images.len()
+                + self.typed_source_audits.len(),
+        )?;
+        self.typed_source_audits.push(receipt);
+        Ok(())
+    }
+
+    /// Stage the opaque eligibility source evidence produced by the eligibility
+    /// owner. The parent only owns the single-slot boundary; construction and
+    /// validation remain in `authority_eligibility_completion`.
+    pub(crate) fn stage_eligibility_source(
+        &mut self,
+        receipt: EligibilitySourceEvidenceReceipt,
+    ) -> Result<(), AstralError> {
+        if self.eligibility_source.is_some()
+            || self.publication_origin.is_some()
+            || receipt.is_publication_origin()
+        {
+            return Err(AstralError::Validation(
+                "authorization source transaction requires one independent eligibility receipt"
+                    .into(),
+            ));
+        }
+        self.eligibility_source = Some(receipt);
+        Ok(())
+    }
+
+    pub(crate) fn stage_card_publication_origin(
+        &mut self,
+        receipt: EligibilitySourceEvidenceReceipt,
+    ) -> Result<(), AstralError> {
+        if self.eligibility_source.is_some()
+            || self.publication_origin.is_some()
+            || !receipt.is_publication_origin()
+        {
+            return Err(AstralError::Validation(
+                "card publication requires one closed publication origin".into(),
+            ));
+        }
+        self.publication_origin = Some(receipt);
+        Ok(())
+    }
+
+    /// Consume the staged eligibility evidence after the parent transaction has
+    /// handed it to the owner-specific source-outcome path.
+    pub(crate) fn take_eligibility_source(&mut self) -> Option<EligibilitySourceEvidenceReceipt> {
+        self.eligibility_source.take()
+    }
+
+    /// Validate that the eligibility owner's opaque receipt accounts for the
+    /// projection and invalidation rows already staged by the parent helper.
+    /// Those receipts remain in the parent for post-commit dispatch; the opaque
+    /// receipt is the separate source-outcome proof and must not be used to
+    /// replace or duplicate those dispatch vectors.
+    fn validate_eligibility_side_effect_receipts(
+        &self,
+        receipt: &EligibilitySourceEvidenceReceipt,
+    ) -> Result<(), AstralError> {
+        let expected_projection: std::collections::BTreeSet<&str> = self
+            .source_projection_receipts
+            .iter()
+            // An eligibility opaque receipt proves the eligibility projection
+            // identities only. Other source streams (for example CARD_REVOKE)
+            // remain parent-owned dispatch receipts and are intentionally kept
+            // outside this lane's exact-match set.
+            .filter(|entry| entry.aggregate_type == ProjectionAggregate::Eligibility.as_str())
+            .map(|entry| entry.event_id.as_str())
+            .collect();
+        if expected_projection.len()
+            != self
+                .source_projection_receipts
+                .iter()
+                .filter(|entry| entry.aggregate_type == ProjectionAggregate::Eligibility.as_str())
+                .count()
+        {
+            return Err(AstralError::Pending(
+                "parent eligibility projection receipts contain duplicate identities".into(),
+            ));
+        }
+        let expected_invalidation: std::collections::BTreeSet<&str> = self
+            .receipts
+            .iter()
+            .map(|entry| entry.event_id.as_str())
+            .collect();
+        if expected_invalidation.len() != self.receipts.len() {
+            return Err(AstralError::Pending(
+                "parent invalidation receipts contain duplicate identities".into(),
+            ));
+        }
+        let mut actual_projection = std::collections::BTreeSet::new();
+        let mut actual_invalidation = std::collections::BTreeSet::new();
+        for source in receipt.source_receipts() {
+            match source.entity.as_str() {
+                "authorization_projection_outbox" => {
+                    if !actual_projection.insert(source.durable_id.as_str()) {
+                        return Err(AstralError::Pending(
+                            "eligibility source receipt contains duplicate projection identity"
+                                .into(),
+                        ));
+                    }
+                }
+                "al_message_outbox" if !actual_invalidation.insert(source.durable_id.as_str()) => {
+                    return Err(AstralError::Pending(
+                        "eligibility source receipt contains duplicate invalidation identity"
+                            .into(),
+                    ));
+                }
+                "al_message_outbox" => {}
+                // audit_log and any other identity-owned source receipts belong
+                // to the opaque eligibility contract and are checked by its
+                // source-outcome owner, not by the parent dispatch vectors.
+                _ => {}
+            }
+        }
+        if actual_projection != expected_projection {
+            return Err(AstralError::Pending(
+                "eligibility source receipt does not exactly cover staged projection identities"
+                    .into(),
+            ));
+        }
+        if actual_invalidation != expected_invalidation {
+            return Err(AstralError::Pending(
+                "eligibility source receipt does not exactly cover staged invalidation identities"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// 提交源事务；仅在 commit 被证明成功后按序投递 receipts。
@@ -556,6 +1050,103 @@ impl AuthorizationSourceTransaction {
         projection_dispatcher: &P,
         invalidation_dispatcher: &D,
     ) -> Result<CommittedProjectionReceipts, AstralError> {
+        // Consume the opaque eligibility slot before entering the config/delta
+        // source-outcome lane. The two lanes are mutually exclusive: eligibility
+        // completion owns its identity/target/evidence contract, while config and
+        // delta completion must never reinterpret that receipt.
+        let eligibility_source = self.take_eligibility_source();
+        let publication_origin = self.publication_origin.take();
+        if let Some(receipt) = publication_origin.as_ref() {
+            self.validate_eligibility_side_effect_receipts(receipt)?;
+            if eligibility_source.is_some()
+                || self.projection_receipts.is_empty()
+                || !self.typed_source_images.is_empty()
+                || !self.typed_source_audits.is_empty()
+                || self.admission.is_none()
+            {
+                return Err(AstralError::Pending(
+                    "new-card publication origin requires an admitted real grant delta batch"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(receipt) = eligibility_source.as_ref() {
+            self.validate_eligibility_side_effect_receipts(receipt)?;
+            if !self.projection_receipts.is_empty()
+                || !self.typed_source_images.is_empty()
+                || !self.typed_source_audits.is_empty()
+            {
+                return Err(AstralError::Pending(
+                    "eligibility source evidence cannot mix with grant delta or config evidence"
+                        .into(),
+                ));
+            }
+        }
+        if eligibility_source.is_some() && self.admission.is_none() {
+            return Err(AstralError::Pending(
+                "eligibility source evidence requires a proof-bound admission".into(),
+            ));
+        }
+        if let Some(admission) = self.admission.as_ref() {
+            astral_db::consume_authorization_admission_in_tx(&mut self.tx, admission)
+                .await
+                .map_err(AstralError::from)?;
+            if let Some(receipt) = eligibility_source {
+                let empty_card = if receipt.operation()
+                    == astral_db::authority_eligibility_completion::EligibilitySourceOperation::CardCreate
+                {
+                    receipt.completion().cards.first().map(|card| &card.scope).and_then(|scope| {
+                        match scope {
+                            astral_types::AuthorityProtocolScope::Card(card) => {
+                                Some((card.tenant_id, card.card_id))
+                            }
+                            _ => None,
+                        }
+                    })
+                } else {
+                    None
+                };
+                source_outcome::stage_eligibility_source_outcome(
+                    &mut self.tx,
+                    admission,
+                    receipt,
+                    &self.card_create_bindings,
+                )
+                .await?;
+                if let Some((tenant_id, card_id)) = empty_card {
+                    astral_db::stage_empty_card_origin_in_tx(
+                        &mut self.tx,
+                        admission,
+                        tenant_id,
+                        card_id,
+                    )
+                    .await
+                    .map_err(AstralError::from)?;
+                }
+            } else {
+                source_outcome::stage_source_outcome(
+                    &mut self.tx,
+                    source_outcome::SourceOutcomeBatch {
+                        admission,
+                        deltas: &self.projection_receipts,
+                        sources: &self.source_projection_receipts,
+                        invalidations: &self.receipts,
+                        source_images: &self.typed_source_images,
+                        source_audits: &self.typed_source_audits,
+                        publication_origin: publication_origin.as_ref(),
+                        card_create_bindings: &self.card_create_bindings,
+                    },
+                )
+                .await?;
+            }
+            admission
+                .consume_once()
+                .map_err(|error| AstralError::Pending(error.to_string()))?;
+        } else if eligibility_source.is_some() {
+            return Err(AstralError::Pending(
+                "eligibility source evidence cannot be staged without admission".into(),
+            ));
+        }
         let commit_started = Instant::now();
         // 取消安全：在 await COMMIT **之前** arm 栅栏。COMMIT 等待期间本 future
         // 被取消时，guard 携带 unproven Drop，hub 置 sticky uncertain —— 提交
@@ -652,6 +1243,76 @@ fn eligibility_invalidation_envelope(
     Ok((event, envelope))
 }
 
+/// Append eligibility projection and invalidation while a DB-owned capture owns
+/// the raw transaction borrow. The caller registers both returned identities on
+/// the parent only after the capture is finished.
+pub(crate) async fn append_eligibility_projection_with_invalidation_on_raw_tx(
+    tx: &mut Transaction<'_, MySql>,
+    delivery_context: &InvalidationDeliveryContext,
+    card_id: i64,
+    operation_id: &str,
+) -> Result<(SourceProjectionReceipt, InvalidationReceipt), AstralError> {
+    let identity = astral_db::append_projection_event_with_metadata_in_tx(
+        tx,
+        ProjectionAggregate::Eligibility,
+        card_id,
+        EVENT_TYPE_ELIGIBILITY_UPDATE,
+        None,
+    )
+    .await?;
+    let source_projection = SourceProjectionReceipt {
+        event_id: identity.event_id.clone(),
+        aggregate_type: ProjectionAggregate::Eligibility.as_str().to_owned(),
+        aggregate_id: card_id,
+        tenant_id: identity.tenant_id,
+        source_generation: identity.source_generation,
+        revoke_fence: identity.revoke_fence,
+    };
+    let origin_region = crate::repository::invalidation_repository::origin_region()?;
+    let (event, envelope) = eligibility_invalidation_envelope(
+        card_id,
+        operation_id,
+        &identity.event_id,
+        &origin_region,
+    )?;
+    let payload_json = envelope.envelope_json().map_err(AstralError::Internal)?;
+    let input = astral_db::LocalMessageInput {
+        message_id: &envelope.message_id,
+        operation_id: &envelope.operation_id,
+        message_type: event.message_type(),
+        queue_name: astral_mq::invalidation::INVALIDATION_QUEUE,
+        ordering_key: envelope.ordering_key.as_deref(),
+        tenant_id: envelope.tenant_id,
+        origin_region: &envelope.origin_region,
+        target_region: envelope.target_region.as_deref(),
+        schema_version: envelope.schema_version,
+        payload_json: &payload_json,
+        headers_json: None,
+        authority_metadata_json: None,
+        payload_sha256: &envelope.payload_sha256,
+    };
+    astral_db::append_in_tx(tx, &input)
+        .await
+        .map_err(|error| AstralError::Database(error.to_string()))?;
+    astral_db::invalidation_delivery::stage_invalidation_delivery_with_context_in_tx(
+        tx,
+        delivery_context,
+        &envelope.message_id,
+    )
+    .await
+    .map_err(|error| {
+        AstralError::Pending(format!("invalidation delivery staging failed: {error}"))
+    })?;
+    Ok((
+        source_projection,
+        InvalidationReceipt {
+            event_id: envelope.message_id.clone(),
+            operation_id: envelope.operation_id.clone(),
+            envelope,
+        },
+    ))
+}
+
 /// ELIGIBILITY 资格失效的 durable invalidation source-transaction 接线。
 ///
 /// 影响资格的 user_card source mutation（create/delete/status/restore/bind/
@@ -677,52 +1338,21 @@ pub(crate) async fn append_eligibility_projection_with_invalidation_in_tx(
     card_id: i64,
     operation_id: &str,
 ) -> Result<(), AstralError> {
-    // 1) ELIGIBILITY 投影事件（durable head/outbox），取回事件身份。
-    //    reborrow + DerefMut 强制转换到 `&mut Transaction`。
-    let identity = astral_db::append_projection_event_with_metadata_in_tx(
-        &mut *tx,
-        ProjectionAggregate::Eligibility,
-        card_id,
-        EVENT_TYPE_ELIGIBILITY_UPDATE,
-        None,
-    )
-    .await?;
-    tx.record_source_projection_identity(
-        ProjectionAggregate::Eligibility,
-        card_id,
-        identity.clone(),
-    )?;
-    // 2) durable invalidation intent：同一 envelope 实例落 outbox + receipt。
-    let origin_region = crate::repository::invalidation_repository::origin_region()?;
-    let (event, envelope) = eligibility_invalidation_envelope(
-        card_id,
-        operation_id,
-        &identity.event_id,
-        &origin_region,
-    )?;
-    let payload_json = envelope.envelope_json().map_err(AstralError::Internal)?;
-    let input = astral_db::LocalMessageInput {
-        message_id: &envelope.message_id,
-        operation_id: &envelope.operation_id,
-        message_type: event.message_type(),
-        queue_name: astral_mq::invalidation::INVALIDATION_QUEUE,
-        ordering_key: envelope.ordering_key.as_deref(),
-        tenant_id: envelope.tenant_id,
-        origin_region: &envelope.origin_region,
-        target_region: envelope.target_region.as_deref(),
-        schema_version: envelope.schema_version,
-        payload_json: &payload_json,
-        headers_json: None,
-        payload_sha256: &envelope.payload_sha256,
-    };
-    astral_db::append_in_tx(&mut *tx, &input)
-        .await
-        .map_err(|error| AstralError::Database(error.to_string()))?;
-    tx.record_invalidation_receipt(InvalidationReceipt {
-        event_id: envelope.message_id.clone(),
-        operation_id: envelope.operation_id.clone(),
-        envelope,
-    });
+    let delivery_context = tx.delivery_context.clone().ok_or_else(|| {
+        AstralError::Pending(
+            "eligibility invalidation requires an injected immutable delivery context".into(),
+        )
+    })?;
+    let (source_projection, invalidation) =
+        append_eligibility_projection_with_invalidation_on_raw_tx(
+            &mut *tx,
+            &delivery_context,
+            card_id,
+            operation_id,
+        )
+        .await?;
+    tx.record_source_projection_receipt(source_projection)?;
+    tx.record_invalidation_receipt(invalidation);
     Ok(())
 }
 

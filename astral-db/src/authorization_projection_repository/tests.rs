@@ -3437,8 +3437,8 @@ fn published_frontier_assembles_contiguous_chain_with_event_mapping() {
 #[test]
 fn published_frontier_rejects_non_current_compilers_even_when_all_rows_agree() {
     for compiler in [
-        "astral-authorization-v5",
-        "astral-authorization-v7",
+        "astral-authorization-v6",
+        "astral-authorization-v8",
         "foreign-v6",
     ] {
         let (identity, mut pointer, mut manifest, mut plans, mut deltas) = happy_frontier_inputs();
@@ -4891,10 +4891,10 @@ fn archive_intent_pointer_proof_rejects_every_dimension_mismatch_fail_closed() {
 
 // ── Manifest current-edition digest regressions (pure known answer + sensitivity) ────
 
-const MANIFEST_V6_KNOWN_ANSWER: &str =
-    "144e5ea80b81787891e20c2a14ab56c4c675ce15af5d5b7c008c6e064de3f3a9";
+const MANIFEST_V7_KNOWN_ANSWER: &str =
+    "41982c075d862f9e144ea1d7d6fa9b122466e0c612a7b7658a47c4c3f198142f";
 
-fn digest_input_v6(segments: Vec<String>) -> ManifestDigestInput<'static> {
+fn digest_input_v7(segments: Vec<String>) -> ManifestDigestInput<'static> {
     ManifestDigestInput {
         seal: PublicationSeal::from_unix_seconds(1_700_000_000).unwrap(),
         tenant_id: 7,
@@ -4916,17 +4916,17 @@ fn digest_input_v6(segments: Vec<String>) -> ManifestDigestInput<'static> {
 }
 
 #[test]
-fn manifest_digest_v6_known_answer_pins_domain_encoding() {
+fn manifest_digest_v7_known_answer_pins_domain_encoding() {
     use sha2::Digest as _;
 
     assert_eq!(
         AUTHORIZATION_MANIFEST_DIGEST_DOMAIN,
-        b"astral-auth-manifest-v6"
+        b"astral-auth-manifest-v7"
     );
-    let mut material = b"astral-auth-manifest-v6".to_vec();
+    let mut material = b"astral-auth-manifest-v7".to_vec();
     material.extend(
         hex::decode(concat!(
-            "0006",
+            "0007",
             "000000006553f100",
             "0000000000000007",
             "0000000443415244",
@@ -4939,7 +4939,7 @@ fn manifest_digest_v6_known_answer_pins_domain_encoding() {
             "000000086f702d7374616765",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "0000001761737472616c2d617574686f72697a6174696f6e2d7636",
+            "0000001761737472616c2d617574686f72697a6174696f6e2d7637",
             "01",
             "0000000000000002",
             "0000000000000001",
@@ -4950,15 +4950,15 @@ fn manifest_digest_v6_known_answer_pins_domain_encoding() {
     );
     assert_eq!(
         hex::encode(sha2::Sha256::digest(material)),
-        MANIFEST_V6_KNOWN_ANSWER
+        MANIFEST_V7_KNOWN_ANSWER
     );
-    let digest = compute_manifest_digest(&digest_input_v6(vec![HASH_A.to_owned()])).unwrap();
-    assert_eq!(digest.as_hex(), MANIFEST_V6_KNOWN_ANSWER);
+    let digest = compute_manifest_digest(&digest_input_v7(vec![HASH_A.to_owned()])).unwrap();
+    assert_eq!(digest.as_hex(), MANIFEST_V7_KNOWN_ANSWER);
 }
 
 #[test]
 fn manifest_digest_changes_when_any_sealed_dimension_changes() {
-    let base = compute_manifest_digest(&digest_input_v6(vec![HASH_A.to_owned()])).unwrap();
+    let base = compute_manifest_digest(&digest_input_v7(vec![HASH_A.to_owned()])).unwrap();
     let mutations: [DimensionCase<'static, ManifestDigestInput<'static>>; 17] = [
         (
             "sealed_at",
@@ -5003,7 +5003,7 @@ fn manifest_digest_changes_when_any_sealed_dimension_changes() {
         ),
     ];
     for (dimension, mutate) in mutations {
-        let mut input = digest_input_v6(vec![HASH_A.to_owned()]);
+        let mut input = digest_input_v7(vec![HASH_A.to_owned()]);
         mutate(&mut input);
         let digest = compute_manifest_digest(&input).unwrap();
         assert_ne!(digest, base, "{dimension} must change the manifest digest");
@@ -5013,7 +5013,7 @@ fn manifest_digest_changes_when_any_sealed_dimension_changes() {
 #[test]
 fn manifest_digest_fails_closed_on_non_positive_parent_and_non_ascii_fields() {
     for parent in [0, -1] {
-        let mut input = digest_input_v6(vec![HASH_A.to_owned()]);
+        let mut input = digest_input_v7(vec![HASH_A.to_owned()]);
         input.parent_manifest_id = Some(parent);
         let error = compute_manifest_digest(&input).unwrap_err();
         assert!(
@@ -5024,7 +5024,7 @@ fn manifest_digest_fails_closed_on_non_positive_parent_and_non_ascii_fields() {
         );
     }
 
-    let mut input = digest_input_v6(vec![HASH_A.to_owned()]);
+    let mut input = digest_input_v7(vec![HASH_A.to_owned()]);
     input.event_id = "événement";
     let error = compute_manifest_digest(&input).unwrap_err();
     assert!(
@@ -5032,7 +5032,7 @@ fn manifest_digest_fails_closed_on_non_positive_parent_and_non_ascii_fields() {
             if message.contains("non_ascii_provenance_digest_field"))
     );
 
-    let mut input = digest_input_v6(vec![HASH_A.to_owned()]);
+    let mut input = digest_input_v7(vec![HASH_A.to_owned()]);
     input.compiler_version = "compilateur-vé2";
     let error = compute_manifest_digest(&input).unwrap_err();
     assert!(
@@ -5043,7 +5043,7 @@ fn manifest_digest_fails_closed_on_non_positive_parent_and_non_ascii_fields() {
 
 #[test]
 fn archive_commitment_changes_with_the_current_manifest_seal_time() {
-    let mut input = digest_input_v6(vec![HASH_A.to_owned()]);
+    let mut input = digest_input_v7(vec![HASH_A.to_owned()]);
     let before = compute_manifest_digest(&input).unwrap();
     input.seal = PublicationSeal::from_unix_seconds(1_700_000_001).unwrap();
     let after = compute_manifest_digest(&input).unwrap();

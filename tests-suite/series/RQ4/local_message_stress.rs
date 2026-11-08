@@ -162,6 +162,7 @@ impl TestMessage {
             schema_version: 1,
             payload_json: &self.envelope_json,
             headers_json: None,
+            authority_metadata_json: None,
             payload_sha256: &self.payload_sha256,
         }
     }

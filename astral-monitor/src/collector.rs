@@ -232,9 +232,16 @@ async fn run_probe_and_evaluate(
     match state.monitor_service.evaluate_alert_rules(60).await {
         Ok(alerts) => {
             for alert in alerts {
-                let monitor_service = state.monitor_service.clone();
+                let sink = dispatch::DbBackedAlertSink::new(
+                    state.monitor_service.clone(),
+                    std::sync::Arc::new(
+                        astral_common::delivery::SqlxDeliveryIntentRepository::new(
+                            state.db.clone(),
+                        ),
+                    ),
+                );
                 spawn_bounded_dispatch(dispatch_tasks, dispatch_failed, async move {
-                    dispatch::dispatch_alert(monitor_service.as_ref(), &alert).await;
+                    dispatch::dispatch_alert(&sink, &alert).await;
                 })
                 .await;
             }

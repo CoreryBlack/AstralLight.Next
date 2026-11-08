@@ -998,6 +998,42 @@ pub async fn request_replay_with_context(
     requested_by: &str,
     context: ReplayAuditContext,
 ) -> Result<bool, DbError> {
+    request_replay_internal(pool, id, operation_id, requested_by, context, None).await
+}
+
+/// HTTP mutations use the verified policy request and consume admission in the
+/// same transaction as the quarantine transition and its audit correlation.
+pub async fn request_replay_with_admission(
+    pool: &MySqlPool,
+    id: i64,
+    context: &crate::ProtectedMutationContext,
+) -> Result<bool, DbError> {
+    context
+        .require_request("audit_quarantine", "replay", Some(id))
+        .map_err(|error| DbError::Mapping(error.to_string()))?;
+    request_replay_internal(
+        pool,
+        id,
+        context.operation_id(),
+        &context.actor_id().to_string(),
+        ReplayAuditContext {
+            actor_card_id: Some(context.actor_card_id()),
+            tenant_id: Some(context.tenant_id()),
+            domain_id: context.domain_id(),
+        },
+        Some(context),
+    )
+    .await
+}
+
+async fn request_replay_internal(
+    pool: &MySqlPool,
+    id: i64,
+    operation_id: &str,
+    requested_by: &str,
+    context: ReplayAuditContext,
+    protected: Option<&crate::ProtectedMutationContext>,
+) -> Result<bool, DbError> {
     validate_id(id)?;
     validate_operation_id(operation_id)?;
     validate_lease_owner(requested_by)?;
@@ -1011,9 +1047,34 @@ pub async fn request_replay_with_context(
 
     validate_canonical_request_id(&replay_audit_request_id(operation_id))?;
     let mut transaction = pool.begin().await?;
+    if let Some(protected) = protected {
+        let start = crate::begin_protected_mutation_in_tx(
+            &mut transaction,
+            protected,
+            &serde_json::json!({"quarantineId": id}),
+        )
+        .await
+        .map_err(|error| DbError::Mapping(error.to_string()))?;
+        if let crate::ProtectedMutationStart::Completed(result) = start {
+            return Ok(result.get("accepted").and_then(serde_json::Value::as_bool) == Some(true));
+        }
+    }
     let Some(row) = fetch_raw_by_id_for_update(&mut transaction, id).await? else {
         transaction.commit().await?;
         return Ok(false);
+    };
+    // Typed before-state of the locked quarantine row, captured before any
+    // write consumes it (the evidence after-state is re-read post-update).
+    #[derive(serde::Serialize)]
+    struct QuarantineEvidence {
+        id: i64,
+        status: String,
+        replay_attempts: u32,
+    }
+    let before_evidence = QuarantineEvidence {
+        id,
+        status: row.status.clone(),
+        replay_attempts: row.replay_attempts,
     };
     let existing_operation_matches = row
         .replay_operation_id_hash
@@ -1027,21 +1088,26 @@ pub async fn request_replay_with_context(
     let audit_domain_id = context.domain_id;
     let metadata = row.into_raw_record()?.metadata;
 
-    let requested = match metadata.status {
+    // Real durable receipts captured from the executed statements below.
+    struct ReplayReceipts {
+        replay_rows_affected: u64,
+        audit_rows_affected: Option<u64>,
+        proof_rows: Option<u64>,
+    }
+    let (requested, receipts) = match metadata.status {
         AuditQuarantineStatus::Quarantined => {
             if metadata.replay_attempts >= MAX_REPLAY_ATTEMPTS {
-                false
+                (false, None)
             } else {
-                let updated = sqlx::query(REQUEST_REPLAY_SQL)
+                let replay_rows_affected = sqlx::query(REQUEST_REPLAY_SQL)
                     .bind(operation_hash.as_slice())
                     .bind(requested_by)
                     .bind(id)
                     .bind(MAX_REPLAY_ATTEMPTS)
                     .execute(&mut *transaction)
                     .await?
-                    .rows_affected()
-                    == 1;
-                if updated {
+                    .rows_affected();
+                if replay_rows_affected == 1 {
                     let detail = serde_json::to_string(&serde_json::json!({
                         "actorId": actor_id,
                         "actorCardId": actor_card_id,
@@ -1054,7 +1120,7 @@ pub async fn request_replay_with_context(
                     }))
                     .map_err(|_| validation_error("replay_audit_detail_serialization"))?;
                     validate_canonical_request_id(&audit_request_id)?;
-                    sqlx::query(REPLAY_REQUEST_AUDIT_SQL)
+                    let audit_rows_affected = sqlx::query(REPLAY_REQUEST_AUDIT_SQL)
                         .bind(actor_id)
                         .bind(actor_card_id)
                         .bind(&audit_request_id)
@@ -1062,16 +1128,24 @@ pub async fn request_replay_with_context(
                         .bind(audit_tenant_id)
                         .bind(detail)
                         .execute(&mut *transaction)
-                        .await?;
-                    true
+                        .await?
+                        .rows_affected();
+                    (
+                        true,
+                        Some(ReplayReceipts {
+                            replay_rows_affected,
+                            audit_rows_affected: Some(audit_rows_affected),
+                            proof_rows: None,
+                        }),
+                    )
                 } else {
-                    false
+                    (false, None)
                 }
             }
         }
         AuditQuarantineStatus::ReplayRequested => {
             if !existing_operation_matches {
-                false
+                (false, None)
             } else {
                 let proof: i64 = sqlx::query_scalar(REPLAY_AUDIT_PROOF_SQL)
                     .bind(actor_id)
@@ -1083,12 +1157,88 @@ pub async fn request_replay_with_context(
                     .bind(&operation_hash_hex)
                     .fetch_one(&mut *transaction)
                     .await?;
-                proof == 1
+                (
+                    proof == 1,
+                    Some(ReplayReceipts {
+                        replay_rows_affected: 0,
+                        audit_rows_affected: None,
+                        proof_rows: Some(u64::try_from(proof.max(0)).unwrap_or(0)),
+                    }),
+                )
             }
         }
-        AuditQuarantineStatus::Replaying | AuditQuarantineStatus::ReplayConfirmed => false,
+        AuditQuarantineStatus::Replaying | AuditQuarantineStatus::ReplayConfirmed => (false, None),
     };
-    transaction.commit().await?;
+    if let Some(protected) = protected {
+        if !requested {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        // Typed after-state: re-read the locked row post-update so the
+        // evidence carries the actual durable transition, plus the real
+        // receipt identities captured from the executed statements above.
+        let after: Option<(String, u32)> =
+            sqlx::query_as("SELECT status, replay_attempts FROM audit_quarantine WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        let receipts = receipts.expect("requested replay always carries receipts");
+        let mut evidence = crate::ProtectedSourceEvidence::new()
+            .target_row(crate::TargetRowEvidence {
+                entity: "audit_quarantine",
+                key: serde_json::json!({ "quarantineId": id }),
+                before: crate::RowPresence::Present(before_evidence),
+                after: crate::RowPresence::from_option(after.map(|(status, replay_attempts)| {
+                    QuarantineEvidence {
+                        id,
+                        status,
+                        replay_attempts,
+                    }
+                })),
+            })
+            .map_err(|error| DbError::Mapping(error.to_string()))?
+            .receipt(
+                "audit_quarantine",
+                serde_json::json!({ "quarantineId": id }),
+                if receipts.replay_rows_affected > 0 {
+                    crate::WriteKind::Update
+                } else {
+                    crate::WriteKind::Probe
+                },
+                receipts.replay_rows_affected,
+            );
+        match receipts.audit_rows_affected {
+            Some(audit_rows) => {
+                evidence = evidence.receipt(
+                    "audit_log",
+                    serde_json::json!({ "requestId": audit_request_id }),
+                    crate::WriteKind::Insert,
+                    audit_rows,
+                );
+            }
+            None => {
+                evidence = evidence.receipt(
+                    "audit_log",
+                    serde_json::json!({ "requestId": audit_request_id }),
+                    crate::WriteKind::Probe,
+                    receipts.proof_rows.unwrap_or(0),
+                );
+            }
+        }
+        crate::finish_protected_mutation_in_tx(
+            &mut transaction,
+            protected,
+            &serde_json::json!({"accepted": true}),
+            &evidence,
+        )
+        .await
+        .map_err(|error| DbError::Mapping(error.to_string()))?;
+    }
+    transaction.commit().await.map_err(|error| {
+        DbError::Mapping(format!(
+            "replay request COMMIT outcome unknown; reconcile operation {operation_id}: {error}",
+        ))
+    })?;
     Ok(requested)
 }
 

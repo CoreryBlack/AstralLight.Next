@@ -815,6 +815,11 @@ pub struct OrgGrantRevokeCommand {
     pub grant_id: String,
     pub expected_revision: u64,
     pub reason: Option<String>,
+    /// F1 proof-bound admission，在 commit 前同事务对牌并一次性消费；
+    /// `#[serde(skip)]` 使幂等 digest 保持只绑定授权输入（replay 携带的新
+    /// admission 不得改变 operation digest）。
+    #[serde(skip)]
+    pub admission: AuthorizationAdmission,
 }
 
 /// 本级精确来源屏蔽。`target` 必须是本单元某条已接收贡献
@@ -829,9 +834,12 @@ pub struct OrgMaskApplyCommand {
     pub target: OrgGrantRef,
     pub expected_unit_generation: u64,
     pub reason: Option<String>,
+    /// F1 proof-bound admission（同 [`OrgGrantRevokeCommand::admission`]）。
+    #[serde(skip)]
+    pub admission: AuthorizationAdmission,
 }
 
-/// 撤除屏蔽。
+/// 撤除屏蔽（expanding：恢复被剪裁贡献的生效面）。
 #[derive(Debug, Clone, Serialize)]
 pub struct OrgMaskRemoveCommand {
     pub operation_id: String,
@@ -840,6 +848,9 @@ pub struct OrgMaskRemoveCommand {
     pub tenant_id: i64,
     pub mask_id: String,
     pub expected_revision: u64,
+    /// F1 proof-bound admission（同 [`OrgGrantRevokeCommand::admission`]）。
+    #[serde(skip)]
+    pub admission: AuthorizationAdmission,
 }
 
 /// 创建成员资格。
@@ -853,6 +864,9 @@ pub struct OrgMembershipCreateCommand {
     pub identity_card_id: i64,
     pub card_id: i64,
     pub validity: ValidityWindow,
+    /// F1 proof-bound admission（同 [`OrgGrantRevokeCommand::admission`]）。
+    #[serde(skip)]
+    pub admission: AuthorizationAdmission,
 }
 
 /// 撤销成员资格。
@@ -864,6 +878,9 @@ pub struct OrgMembershipRevokeCommand {
     pub tenant_id: i64,
     pub membership_id: String,
     pub expected_revision: u64,
+    /// F1 proof-bound admission（同 [`OrgGrantRevokeCommand::admission`]）。
+    #[serde(skip)]
+    pub admission: AuthorizationAdmission,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1364,7 +1381,13 @@ pub(crate) async fn create_membership_in_tx(
     cmd: &OrgMembershipCreateCommand,
     valid_from: Option<i64>,
     valid_until: Option<i64>,
-) -> Result<Vec<OrgMutationRecord>, AstralError> {
+) -> Result<
+    (
+        Vec<OrgMutationRecord>,
+        org_authority_capture::OrgMembershipCreateReceiptEvidence,
+    ),
+    AstralError,
+> {
     let node = lock_node_in_tx(tx, cmd.tenant_id).await?.ok_or_else(|| {
         AstralError::NotFound(format!(
             "code=org_scope.node_missing;tenant_id={}",
@@ -1380,8 +1403,24 @@ pub(crate) async fn create_membership_in_tx(
     ensure_membership_card_binding_in_tx(tx, cmd).await?;
     ensure_card_is_not_actively_assigned_in_tx(tx, cmd.card_id).await?;
     ensure_user_membership_cap_in_tx(tx, cmd.user_id).await?;
+    // The normal create flow records an exact absent-before probe for the whole
+    // member tuple. Historical inactive rows do not erase history: their
+    // presence makes this ineligible for first-scope baseline establishment.
+    let prior_member: Option<String> = sqlx::query_scalar(
+        "SELECT membership_id FROM org_scope_membership \
+         WHERE tenant_id = ? AND user_id = ? AND identity_card_id = ? AND card_id = ? \
+         ORDER BY revision DESC LIMIT 1 FOR UPDATE",
+    )
+    .bind(cmd.tenant_id)
+    .bind(cmd.user_id)
+    .bind(cmd.identity_card_id)
+    .bind(cmd.card_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    let before_absent = prior_member.is_none();
     let membership_id = uuid_v4_string();
-    sqlx::query(MEMBERSHIP_INSERT_SQL)
+    let insert_result = sqlx::query(MEMBERSHIP_INSERT_SQL)
         .bind(&membership_id)
         .bind(cmd.tenant_id)
         .bind(node.root_tenant_id)
@@ -1394,6 +1433,12 @@ pub(crate) async fn create_membership_in_tx(
         .execute(&mut **tx)
         .await
         .map_err(db_err)?;
+    let insert_rows_affected = insert_result.rows_affected();
+    if insert_rows_affected != 1 {
+        return Err(AstralError::Database(
+            "code=org_scope.membership_insert_rows_affected".into(),
+        ));
+    }
     // 成员资格是独立证据对象：不推进 node generation，无需重编译；
     // 读侧逐请求 fresh 校验 membership，撤销即时生效。
     let membership_row = OrgMembershipRow {
@@ -1444,18 +1489,51 @@ pub(crate) async fn create_membership_in_tx(
         },
     )
     .await?;
-    Ok(vec![OrgMutationRecord {
-        record_kind: "MEMBERSHIP_CREATED".into(),
-        subject_kind: "MEMBERSHIP".into(),
-        subject_id: membership_id,
+    let receipt = org_authority_capture::OrgMembershipCreateReceiptEvidence {
         tenant_id: cmd.tenant_id,
-    }])
+        root_tenant_id: node.root_tenant_id,
+        user_id: cmd.user_id,
+        identity_card_id: cmd.identity_card_id,
+        card_id: cmd.card_id,
+        membership_id: membership_id.clone(),
+        operation_id: cmd.operation_id.clone(),
+        before_absent,
+        insert_rows_affected,
+        audit: org_authority_capture::read_operation_audit_receipt_in_tx(
+            tx,
+            &cmd.operation_id,
+            cmd.tenant_id,
+            "MEMBERSHIP_CREATE",
+            "MEMBERSHIP",
+            &membership_id,
+        )
+        .await?,
+    };
+    Ok((
+        vec![OrgMutationRecord {
+            record_kind: "MEMBERSHIP_CREATED".into(),
+            subject_kind: "MEMBERSHIP".into(),
+            subject_id: membership_id,
+            tenant_id: cmd.tenant_id,
+        }],
+        receipt,
+    ))
 }
 
 pub(crate) async fn revoke_membership_in_tx(
     tx: &mut Transaction<'static, MySql>,
     cmd: &OrgMembershipRevokeCommand,
 ) -> Result<Vec<OrgMutationRecord>, AstralError> {
+    // Unit node owner lock FIRST (same order as membership create): every
+    // membership mutation for one unit serializes on the same node row, so a
+    // concurrently captured EXACT member coverage set can neither miss this
+    // revoke nor race a create. Held until commit; no head advance.
+    lock_node_in_tx(tx, cmd.tenant_id).await?.ok_or_else(|| {
+        AstralError::NotFound(format!(
+            "code=org_scope.node_missing;tenant_id={}",
+            cmd.tenant_id
+        ))
+    })?;
     let membership = lock_membership_in_tx(tx, &cmd.membership_id)
         .await?
         .ok_or_else(|| {
@@ -1570,6 +1648,7 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         .await?
         {
             OperationClaim::Replayed(mut value) => {
+                consume_org_authority_admission(&mut tx, &cmd.admission).await?;
                 commit_authority_tx(tx, authority_guard)
                     .await
                     .map_err(db_err)?;
@@ -1589,6 +1668,15 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
                     records,
                 };
                 record_operation_outcome_in_tx(&mut tx, &cmd.operation_id, &outcome).await?;
+                consume_org_authority_admission(&mut tx, &cmd.admission).await?;
+                org_authority_capture::capture_and_stage_in_tx(
+                    &mut tx,
+                    &cmd.admission,
+                    &cmd.operation_id,
+                    cmd.receiving_tenant_id,
+                    None,
+                )
+                .await?;
                 commit_authority_tx(tx, authority_guard)
                     .await
                     .map_err(db_err)?;
@@ -1616,6 +1704,7 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         .await?
         {
             OperationClaim::Replayed(mut value) => {
+                consume_org_authority_admission(&mut tx, &cmd.admission).await?;
                 commit_authority_tx(tx, authority_guard)
                     .await
                     .map_err(db_err)?;
@@ -1635,6 +1724,15 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
                     records,
                 };
                 record_operation_outcome_in_tx(&mut tx, &cmd.operation_id, &outcome).await?;
+                consume_org_authority_admission(&mut tx, &cmd.admission).await?;
+                org_authority_capture::capture_and_stage_in_tx(
+                    &mut tx,
+                    &cmd.admission,
+                    &cmd.operation_id,
+                    cmd.tenant_id,
+                    None,
+                )
+                .await?;
                 commit_authority_tx(tx, authority_guard)
                     .await
                     .map_err(db_err)?;
@@ -1662,6 +1760,7 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         .await?
         {
             OperationClaim::Replayed(mut value) => {
+                consume_org_authority_admission(&mut tx, &cmd.admission).await?;
                 commit_authority_tx(tx, authority_guard)
                     .await
                     .map_err(db_err)?;
@@ -1681,6 +1780,15 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
                     records,
                 };
                 record_operation_outcome_in_tx(&mut tx, &cmd.operation_id, &outcome).await?;
+                consume_org_authority_admission(&mut tx, &cmd.admission).await?;
+                org_authority_capture::capture_and_stage_in_tx(
+                    &mut tx,
+                    &cmd.admission,
+                    &cmd.operation_id,
+                    cmd.tenant_id,
+                    None,
+                )
+                .await?;
                 commit_authority_tx(tx, authority_guard)
                     .await
                     .map_err(db_err)?;
@@ -1709,6 +1817,7 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         .await?
         {
             OperationClaim::Replayed(mut value) => {
+                consume_org_authority_admission(&mut tx, &cmd.admission).await?;
                 commit_authority_tx(tx, authority_guard)
                     .await
                     .map_err(db_err)?;
@@ -1721,7 +1830,7 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
                 })
             }
             OperationClaim::Fresh => {
-                let records =
+                let (records, membership_create_receipt) =
                     create_membership_in_tx(&mut tx, cmd, valid_from, valid_until).await?;
                 let outcome = OrgMutationOutcome {
                     operation_id: cmd.operation_id.clone(),
@@ -1729,6 +1838,15 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
                     records,
                 };
                 record_operation_outcome_in_tx(&mut tx, &cmd.operation_id, &outcome).await?;
+                consume_org_authority_admission(&mut tx, &cmd.admission).await?;
+                org_authority_capture::capture_and_stage_in_tx(
+                    &mut tx,
+                    &cmd.admission,
+                    &cmd.operation_id,
+                    cmd.tenant_id,
+                    Some(membership_create_receipt),
+                )
+                .await?;
                 commit_authority_tx(tx, authority_guard)
                     .await
                     .map_err(db_err)?;
@@ -1756,6 +1874,7 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
         .await?
         {
             OperationClaim::Replayed(mut value) => {
+                consume_org_authority_admission(&mut tx, &cmd.admission).await?;
                 commit_authority_tx(tx, authority_guard)
                     .await
                     .map_err(db_err)?;
@@ -1775,6 +1894,15 @@ impl OrgScopeRepository for SqlxOrgScopeRepository {
                     records,
                 };
                 record_operation_outcome_in_tx(&mut tx, &cmd.operation_id, &outcome).await?;
+                consume_org_authority_admission(&mut tx, &cmd.admission).await?;
+                org_authority_capture::capture_and_stage_in_tx(
+                    &mut tx,
+                    &cmd.admission,
+                    &cmd.operation_id,
+                    cmd.tenant_id,
+                    None,
+                )
+                .await?;
                 commit_authority_tx(tx, authority_guard)
                     .await
                     .map_err(db_err)?;
@@ -1886,6 +2014,41 @@ mod tests {
     const ORG_SCOPE_AUTHORITY_MIGRATION_SQL: &str =
         include_str!("../../migrations/20260922000001_org_scope_authority.sql");
 
+    /// 结构合法的 fixture admission（本模块 pre-flight 纯测试不触 durable
+    /// 对牌；`from_verified_proof` 只做结构校验，签名对牌归 F1 读取、行等值
+    /// 对牌归 commit 门）。
+    fn fixture_admission() -> AuthorizationAdmission {
+        let proof = astral_types::AuthorizationFenceProof {
+            authorization_edition: astral_types::AUTHORIZATION_EDITION,
+            authority_id: "authority-test".into(),
+            authority_term: 1,
+            global_fence_sequence: 1,
+            scope: astral_types::AuthorizationAuthorityScope {
+                tenant_id: ACTOR_TENANT_ID,
+                card_id: 424242,
+                user_id: Some(7),
+                domain: astral_types::AuthorizationDomainScope::Any,
+            },
+            scope_generation: 1,
+            revoke_watermark: 1,
+            snapshot_hash: "ab".repeat(32),
+            parent_hash: None,
+            operation_id: "op-fixture".into(),
+            event_id: "event-fixture".into(),
+            key_id: "key-test".into(),
+            key_epoch: 1,
+            issued_at: 100,
+            not_before: 99,
+            expires_at: 110,
+            request_nonce: "nonce-fixture".into(),
+            request_binding_digest: None,
+            scope_certificate_hash: None,
+            proof_id: "proof-fixture".into(),
+            signature: "00".repeat(64),
+        };
+        AuthorizationAdmission::from_verified_proof(proof).expect("structural fixture proof")
+    }
+
     fn assert_local_actor_tenant_mismatch(error: AstralError) {
         match error {
             AstralError::Permission(message) => assert_eq!(
@@ -1905,6 +2068,7 @@ mod tests {
             grant_id: GRANT_UUID.into(),
             expected_revision: 3,
             reason: Some("test".into()),
+            admission: fixture_admission(),
         }
     }
 
@@ -1921,6 +2085,7 @@ mod tests {
             },
             expected_unit_generation: 5,
             reason: None,
+            admission: fixture_admission(),
         }
     }
 
@@ -1932,6 +2097,7 @@ mod tests {
             tenant_id: ACTOR_TENANT_ID,
             mask_id: MASK_UUID.into(),
             expected_revision: 1,
+            admission: fixture_admission(),
         }
     }
 
@@ -1945,6 +2111,7 @@ mod tests {
             identity_card_id: 4242,
             card_id: 424242,
             validity: ValidityWindow::perpetual(),
+            admission: fixture_admission(),
         }
     }
 
@@ -1956,6 +2123,7 @@ mod tests {
             tenant_id: ACTOR_TENANT_ID,
             membership_id: MEMBERSHIP_UUID.into(),
             expected_revision: 1,
+            admission: fixture_admission(),
         }
     }
 
@@ -2219,7 +2387,50 @@ mod tests {
         );
     }
 
-    /// root activation 证明列的 SQL 漂移绊线（`typed_node`/`OrgNode::validate`
+    #[test]
+    fn membership_source_keeps_node_head_and_stages_after_admission_use() {
+        let source = include_str!("mutations.rs");
+        let create_body = source
+            .split("pub(crate) async fn create_membership_in_tx")
+            .nth(1)
+            .and_then(|body| {
+                body.split("pub(crate) async fn revoke_membership_in_tx")
+                    .next()
+            })
+            .expect("membership create kernel must exist");
+        assert!(
+            !create_body.contains("advance_node_in_tx"),
+            "membership eligibility is independent of the node content/topology generation"
+        );
+        assert!(
+            create_body.contains("let insert_rows_affected = insert_result.rows_affected()")
+                && create_body.contains("insert_rows_affected != 1")
+                && create_body.contains("OrgMembershipCreateReceiptEvidence")
+                && create_body.contains("read_operation_audit_receipt_in_tx"),
+            "membership create must preserve actual INSERT row-count and audit receipt evidence"
+        );
+
+        let trait_body = source
+            .split("async fn create_membership(")
+            .nth(1)
+            .and_then(|body| body.split("async fn revoke_membership(").next())
+            .expect("repository membership create entry point must exist");
+        let consumed = trait_body
+            .find("consume_org_authority_admission(&mut tx, &cmd.admission)")
+            .expect("membership admission must be consumed in the source transaction");
+        let staged = trait_body
+            .find("org_authority_capture::capture_and_stage_in_tx(")
+            .expect("membership source must use the unified capture entry point");
+        assert!(
+            consumed < staged,
+            "capture must follow admission consumption"
+        );
+        let capture_tail = &trait_body[staged..];
+        assert!(capture_tail.contains("&cmd.operation_id"));
+        assert!(capture_tail.contains("cmd.tenant_id"));
+        assert!(capture_tail.contains("Some(membership_create_receipt)"));
+    }
+
     /// 合同）：
     /// - ATTACH 改挂必须清空激活列——`root_activation` 仅行政根可持有，重挂
     ///   后保留旧证明会让节点引用一段已不存在的独立治理期；下次 detach 以

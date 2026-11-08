@@ -81,8 +81,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use astral_types::{
-    DomainScopeRequirement, PolicyContext, PolicyError, PublishedCardAuthorization,
-    PublishedCardEvidenceScope, UnacceptedGrantReason,
+    AuthorizationFenceProof, CertifiedAuthorizationState, DomainScopeRequirement, PolicyContext,
+    PolicyError, PublishedCardAuthorization, PublishedCardEvidenceScope, UnacceptedGrantReason,
 };
 use moka::future::Cache;
 use policy_engine::RuleRepository;
@@ -539,6 +539,65 @@ where
 
     async fn is_active_global_admin(&self, user_id: i64) -> Result<bool, PolicyError> {
         self.inner.is_active_global_admin(user_id).await
+    }
+
+    /// 显式透传 inner 的 positive-authorization 就绪结论，绝不沿用 trait 的
+    /// permissive default `true`：strict inner（`SqlxRuleRepository` 默认
+    /// authority-required 且未注入 provider）在包装之后仍必须保持不可就绪，
+    /// 否则 engine 的 `published:authority-not-serving` DENY 门禁会被本包装
+    /// 缺省的 `true` 静默绕过（生产装配 MemoryMirrored(Cached(Sqlx)) 的中间
+    /// 层正是本包装）。显式配置的 DurableOnly 兼容 inner
+    /// （`with_authority_required(false)`，既有契约）仍按 inner 的就绪结论
+    /// 保持 ready，不被误伤。
+    fn positive_authorization_ready(&self) -> bool {
+        self.inner.positive_authorization_ready()
+    }
+
+    fn published_evidence_read_mode(&self) -> policy_engine::PublishedEvidenceReadMode {
+        self.inner.published_evidence_read_mode()
+    }
+
+    async fn read_authorization_fence(
+        &self,
+        scope: &PublishedCardEvidenceScope,
+        request_nonce: &str,
+    ) -> Result<AuthorizationFenceProof, PolicyError> {
+        self.inner
+            .read_authorization_fence(scope, request_nonce)
+            .await
+    }
+
+    async fn read_request_authorization_fence(
+        &self,
+        context: &PolicyContext,
+        scope: &PublishedCardEvidenceScope,
+        request_nonce: &str,
+    ) -> Result<AuthorizationFenceProof, PolicyError> {
+        self.inner
+            .read_request_authorization_fence(context, scope, request_nonce)
+            .await
+    }
+
+    async fn read_org_authorization_fence(
+        &self,
+        context: &PolicyContext,
+        evidence: &astral_types::org_scope::OrgAdmissionEvidence,
+        request_nonce: &str,
+    ) -> Result<AuthorizationFenceProof, PolicyError> {
+        self.inner
+            .read_org_authorization_fence(context, evidence, request_nonce)
+            .await
+    }
+
+    fn certify_authorization_evidence(
+        &self,
+        proof: AuthorizationFenceProof,
+        evidence: std::sync::Arc<PublishedCardAuthorization>,
+        scope: &PublishedCardEvidenceScope,
+        now_seconds: i64,
+    ) -> Result<CertifiedAuthorizationState, PolicyError> {
+        self.inner
+            .certify_authorization_evidence(proof, evidence, scope, now_seconds)
     }
 
     async fn load_published_card_authorization(
@@ -1704,5 +1763,48 @@ mod tests {
             .expect("second load")
             .expect("cached evidence is Some");
         assert_eq!(*second, evidence, "recheck evidence must be identical");
+    }
+
+    // ===== positive_authorization_ready 透传门禁（strict inner 不得被包装放行） =====
+
+    /// 缓存包装必须显式透传 inner 的就绪结论：strict inner
+    /// （`SqlxRuleRepository` 默认 authority-required、无 provider）不得经由
+    /// 本包装获得 positive-authorization 就绪（否则 engine 的
+    /// `published:authority-not-serving` DENY 会被 trait 缺省 `true` 绕过）；
+    /// 显式配置的 DurableOnly 兼容 inner（`with_authority_required(false)`，
+    /// 既有契约）仍保持 ready，不被误伤。使用真实 `SqlxRuleRepository`
+    /// （connect_lazy，不建立连接、无外部服务）作为契约事实源。
+    #[tokio::test]
+    async fn cache_wrapper_readiness_follows_inner_authority_contract() {
+        let pool = sqlx::MySqlPool::connect_lazy("mysql://unused@localhost/unused").unwrap();
+
+        // strict（默认 authority-required、无 provider）：inner 不可就绪，
+        // 包装后仍不可就绪；读模式保持 DurableOnly。
+        let strict_inner = crate::repository::SqlxRuleRepository::new(pool.clone());
+        assert!(!RuleRepository::positive_authorization_ready(&strict_inner));
+        assert_eq!(
+            RuleRepository::published_evidence_read_mode(&strict_inner),
+            policy_engine::PublishedEvidenceReadMode::DurableOnly
+        );
+        let strict_wrapped = CachedPublishedEvidenceRuleRepository::new(strict_inner, pool.clone());
+        assert!(!strict_wrapped.positive_authorization_ready());
+        assert_eq!(
+            RuleRepository::published_evidence_read_mode(&strict_wrapped),
+            policy_engine::PublishedEvidenceReadMode::DurableOnly
+        );
+
+        // 显式 DurableOnly 兼容配置：inner 就绪，包装后保持就绪（既有契约）。
+        let durable_only_inner =
+            crate::repository::SqlxRuleRepository::new(pool.clone()).with_authority_required(false);
+        assert!(RuleRepository::positive_authorization_ready(
+            &durable_only_inner
+        ));
+        let durable_only_wrapped =
+            CachedPublishedEvidenceRuleRepository::new(durable_only_inner, pool);
+        assert!(durable_only_wrapped.positive_authorization_ready());
+        assert_eq!(
+            RuleRepository::published_evidence_read_mode(&durable_only_wrapped),
+            policy_engine::PublishedEvidenceReadMode::DurableOnly
+        );
     }
 }

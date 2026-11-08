@@ -5,7 +5,11 @@
 
 use std::sync::Arc;
 
-use astral_types::AstralError;
+#[cfg(test)]
+use astral_types::PolicyContext;
+use astral_types::{AstralError, AuthorizationAdmission};
+
+use astral_db::ProtectedMutationContext;
 
 use crate::repository::permission_request_repository::{NewRequest, PermissionRequestRepository};
 
@@ -26,7 +30,11 @@ impl ApprovalService {
     }
 
     /// 新建请求：在写入 PENDING 前验证请求者拥有目标卡，且卡片 ACTIVE、当前有效。
-    pub async fn create_request(&self, new: &NewRequest) -> Result<i64, AstralError> {
+    pub async fn create_request(
+        &self,
+        new: &NewRequest,
+        context: ProtectedMutationContext,
+    ) -> Result<i64, AstralError> {
         if new.request_type == "RULE" {
             let content: RequestContent = parse_rule_content(&new.request_content)?;
             let card_id = content.card_id.ok_or_else(|| {
@@ -36,7 +44,7 @@ impl ApprovalService {
                 .validate_card_for_user(new.user_id, card_id)
                 .await?;
         }
-        self.repo.create_request(new).await
+        self.repo.create_request(new, context).await
     }
 
     /// 审批：状态 PENDING 校验 → 同一事务完成 APPROVED + 规则 + projection
@@ -46,6 +54,7 @@ impl ApprovalService {
         reviewer_id: i64,
         comment: Option<&str>,
         request_id_header: Option<&str>,
+        admission: AuthorizationAdmission,
     ) -> Result<ApproveOutcome, AstralError> {
         // 1. 读取请求详情（需在 UPDATE 前获取 request_content 以解析 resourceType/actionCode/cardId）
         let req_row = self
@@ -102,6 +111,7 @@ impl ApprovalService {
                 content.valid_from.as_deref(),
                 content.valid_to.as_deref(),
                 request_id_header,
+                admission,
             )
             .await?;
 
@@ -119,9 +129,10 @@ impl ApprovalService {
         reviewer_id: i64,
         comment: Option<&str>,
         request_id_header: Option<&str>,
+        context: ProtectedMutationContext,
     ) -> Result<(), AstralError> {
         self.repo
-            .reject_request(request_id, reviewer_id, comment, request_id_header)
+            .reject_request(request_id, reviewer_id, comment, request_id_header, context)
             .await
     }
 }
@@ -172,6 +183,10 @@ fn parse_rule_content(value: &str) -> Result<RequestContent, AstralError> {
 mod tests {
     use super::*;
     use crate::repository::permission_request_repository::PermissionRequestRecord;
+    use astral_types::{
+        AuthorizationAuthorityScope, AuthorizationDomainScope, AuthorizationFenceProof,
+        AUTHORIZATION_EDITION,
+    };
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -224,7 +239,11 @@ mod tests {
 
     #[async_trait]
     impl PermissionRequestRepository for FakeRequestRepository {
-        async fn create_request(&self, _new: &NewRequest) -> Result<i64, AstralError> {
+        async fn create_request(
+            &self,
+            _new: &NewRequest,
+            _context: ProtectedMutationContext,
+        ) -> Result<i64, AstralError> {
             Ok(1)
         }
 
@@ -282,6 +301,7 @@ mod tests {
             user_id: i64,
             comment: Option<&str>,
             request_id_header: Option<&str>,
+            _context: ProtectedMutationContext,
         ) -> Result<(), AstralError> {
             *self.cancel_tx.lock().unwrap() = Some(CancelTxArgs {
                 request_id,
@@ -318,6 +338,7 @@ mod tests {
             _valid_from: Option<&str>,
             _valid_to: Option<&str>,
             request_id_header: Option<&str>,
+            _admission: AuthorizationAdmission,
         ) -> Result<(), AstralError> {
             *self.approve_tx.lock().unwrap() = Some(ApproveTxArgs {
                 request_id,
@@ -338,6 +359,7 @@ mod tests {
             reviewer_id: i64,
             comment: Option<&str>,
             request_id_header: Option<&str>,
+            _context: ProtectedMutationContext,
         ) -> Result<(), AstralError> {
             *self.reject_tx.lock().unwrap() = Some(DecisionTxArgs {
                 request_id,
@@ -363,6 +385,103 @@ mod tests {
             approve_comment: None,
             created_at: None,
         }
+    }
+
+    fn test_admission() -> AuthorizationAdmission {
+        AuthorizationAdmission::from_verified_proof(AuthorizationFenceProof {
+            authorization_edition: AUTHORIZATION_EDITION,
+            authority_id: "test-authority".into(),
+            authority_term: 1,
+            global_fence_sequence: 1,
+            scope: AuthorizationAuthorityScope {
+                tenant_id: 1,
+                card_id: 1,
+                user_id: Some(1),
+                domain: AuthorizationDomainScope::Any,
+            },
+            scope_generation: 1,
+            revoke_watermark: 0,
+            snapshot_hash: "00".repeat(32),
+            parent_hash: None,
+            operation_id: "test-operation".into(),
+            event_id: "test-event".into(),
+            key_id: "test-key".into(),
+            key_epoch: 1,
+            issued_at: 100,
+            not_before: 99,
+            expires_at: 200,
+            request_nonce: "test-nonce".into(),
+            request_binding_digest: None,
+            scope_certificate_hash: None,
+            proof_id: "test-proof".into(),
+            signature: "00".repeat(64),
+        })
+        .expect("test admission fields must be valid")
+    }
+
+    fn test_protected_context(
+        actor_id: i64,
+        operation_id: &str,
+        action: &str,
+        target_id: Option<i64>,
+    ) -> ProtectedMutationContext {
+        let policy = PolicyContext::builder()
+            .principal_kind(Some("PLATFORM_USER".into()))
+            .user_id(Some(actor_id))
+            .identity_card_id(Some(99))
+            .card_id(Some(1))
+            .tenant_id(Some(1))
+            .domain_id(Some(1))
+            .resource(Some("permission_request".into()))
+            .action(action.into())
+            .target_id(target_id)
+            .request_operation_id(Some(operation_id.into()))
+            .request_mutation_kind(Some(astral_types::AuthorityMutationKind::ProtectedBusiness))
+            .request_fingerprint(Some("ab".repeat(32)))
+            .resource_ownership_scope(astral_types::ResourceOwnershipScope::TenantScoped)
+            .resource_tenant_id(Some(1))
+            .resource_domain_id(Some(1))
+            .build();
+        let request_binding_digest = astral_types::authorization_request_digest(&policy)
+            .expect("protected test policy must have a valid request digest");
+        let admission = AuthorizationAdmission::from_verified_proof(AuthorizationFenceProof {
+            authorization_edition: AUTHORIZATION_EDITION,
+            authority_id: "test-protected-authority".into(),
+            authority_term: 1,
+            global_fence_sequence: 1,
+            scope: AuthorizationAuthorityScope {
+                tenant_id: 1,
+                card_id: 1,
+                user_id: Some(actor_id),
+                domain: AuthorizationDomainScope::Exact(1),
+            },
+            scope_generation: 1,
+            revoke_watermark: 0,
+            snapshot_hash: "11".repeat(32),
+            parent_hash: None,
+            operation_id: operation_id.into(),
+            event_id: format!("{operation_id}:event"),
+            key_id: "test-protected-key".into(),
+            key_epoch: 1,
+            issued_at: 100,
+            not_before: 99,
+            expires_at: 200,
+            request_nonce: format!("{operation_id}:nonce"),
+            request_binding_digest: Some(request_binding_digest),
+            scope_certificate_hash: Some("22".repeat(32)),
+            proof_id: format!("{operation_id}:proof"),
+            signature: "33".repeat(64),
+        })
+        .expect("protected test admission fields must be valid");
+        ProtectedMutationContext::from_policy_context(
+            &policy,
+            admission,
+            Some(operation_id),
+            "permission_request",
+            action,
+            target_id,
+        )
+        .expect("protected test context must bind policy and admission")
     }
 
     #[test]
@@ -460,7 +579,10 @@ mod tests {
         let repo = Arc::new(FakeRequestRepository::new(Some(rec)));
         let svc = ApprovalService::new(repo);
 
-        let err = svc.approve(5, 1, None, None).await.unwrap_err();
+        let err = svc
+            .approve(5, 1, None, None, test_admission())
+            .await
+            .unwrap_err();
         assert!(matches!(err, AstralError::Validation(_)));
     }
 
@@ -470,7 +592,7 @@ mod tests {
         let svc = ApprovalService::new(repo.clone());
 
         let outcome = svc
-            .approve(5, 1, Some("ok"), Some("request-5"))
+            .approve(5, 1, Some("ok"), Some("request-5"), test_admission())
             .await
             .unwrap();
         assert_eq!(outcome.card_id, Some(3));
@@ -494,9 +616,15 @@ mod tests {
         let repo = Arc::new(FakeRequestRepository::new(Some(pending_record())));
         let svc = ApprovalService::new(repo.clone());
 
-        svc.reject(5, 11, Some("not enough scope"), Some("req-reject"))
-            .await
-            .unwrap();
+        svc.reject(
+            5,
+            11,
+            Some("not enough scope"),
+            Some("req-reject"),
+            test_protected_context(11, "req-reject", "approve", Some(5)),
+        )
+        .await
+        .unwrap();
         let reject = repo.reject_tx.lock().unwrap().clone().unwrap();
         assert_eq!(reject.request_id, 5);
         assert_eq!(reject.reviewer_id, 11);
@@ -505,9 +633,15 @@ mod tests {
 
         repo.cancel_tx.lock().unwrap().take();
         repo.record.lock().unwrap().as_mut().unwrap().user_id = 7;
-        repo.cancel_request(5, 7, Some("changed my mind"), Some("req-cancel"))
-            .await
-            .unwrap();
+        repo.cancel_request(
+            5,
+            7,
+            Some("changed my mind"),
+            Some("req-cancel"),
+            test_protected_context(7, "req-cancel", "update", Some(5)),
+        )
+        .await
+        .unwrap();
         let cancel = repo.cancel_tx.lock().unwrap().clone().unwrap();
         assert_eq!(cancel.request_id, 5);
         assert_eq!(cancel.user_id, 7);
@@ -587,7 +721,7 @@ mod tests {
             let svc = ApprovalService::new(repo.clone());
 
             let error = svc
-                .approve(5, 1, None, None)
+                .approve(5, 1, None, None, test_admission())
                 .await
                 .expect_err("approval must reject legacy RULE fields");
             assert!(matches!(error, AstralError::Validation(_)));
@@ -606,7 +740,7 @@ mod tests {
         let svc = ApprovalService::new(repo.clone());
 
         let error = svc
-            .approve(5, 1, None, None)
+            .approve(5, 1, None, None, test_admission())
             .await
             .expect_err("DENY approval grant must be rejected");
         assert!(matches!(error, AstralError::Validation(message) if message.contains("ALLOW")));
@@ -629,7 +763,7 @@ mod tests {
             let svc = ApprovalService::new(repo.clone());
 
             let error = svc
-                .approve(5, 1, None, None)
+                .approve(5, 1, None, None, test_admission())
                 .await
                 .expect_err("unregistered resource/action approval must fail closed");
             assert!(
@@ -652,7 +786,7 @@ mod tests {
         })));
         let svc = ApprovalService::new(repo.clone());
 
-        svc.approve(5, 1, None, None)
+        svc.approve(5, 1, None, None, test_admission())
             .await
             .expect("registered resource/action with whitespace must be approved");
         let tx = repo.approve_tx.lock().unwrap().clone().unwrap();
@@ -672,7 +806,7 @@ mod tests {
         })));
         let svc = ApprovalService::new(repo.clone());
 
-        svc.approve(5, 1, None, None)
+        svc.approve(5, 1, None, None, test_admission())
             .await
             .expect("canonical metadata should be accepted");
         let tx = repo.approve_tx.lock().unwrap().clone().unwrap();
@@ -691,7 +825,10 @@ mod tests {
         let repo = Arc::new(FakeRequestRepository::new(Some(rec)));
         let svc = ApprovalService::new(repo.clone());
 
-        let err = svc.approve(5, 1, None, None).await.unwrap_err();
+        let err = svc
+            .approve(5, 1, None, None, test_admission())
+            .await
+            .unwrap_err();
         assert!(matches!(err, AstralError::Validation(_)));
         assert!(repo.approve_tx.lock().unwrap().is_none());
     }

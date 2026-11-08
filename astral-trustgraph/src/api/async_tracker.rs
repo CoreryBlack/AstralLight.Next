@@ -11,10 +11,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use astral_db::{
+    begin_protected_mutation_in_tx, finish_protected_mutation_in_tx, ProtectedMutationContext,
+    ProtectedMutationStart, ProtectedSourceEvidence, RowPresence, TargetRowEvidence, WriteKind,
+};
 use astral_types::AstralError;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::MySqlPool;
+use sqlx::{MySql, MySqlPool, Transaction};
 use tokio::sync::{oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
@@ -434,11 +439,12 @@ fn validate_card_bind_registration(registration: &CardBindRegistration) -> Resul
     Ok(())
 }
 
-/// Persist the accepted request and each child boundary before starting work.
-async fn register_card_bind(
-    pool: &MySqlPool,
+/// Freeze the exact sorted item set inside an EXISTING transaction so the
+/// caller can commit the protected-mutation boundary atomically beside it.
+async fn register_card_bind_in_tx(
+    tx: &mut Transaction<'_, MySql>,
     registration: &CardBindRegistration,
-) -> Result<AsyncTask, CardBindRegistrationError> {
+) -> Result<(AsyncTask, ProtectedSourceEvidence), AstralError> {
     let task_id = registration.task_id.as_str();
     let requester_user_id = registration.requester_user_id;
     let requester_card_id = registration.requester_card_id;
@@ -453,8 +459,22 @@ async fn register_card_bind(
     let total = u32::try_from(items.len())
         .map_err(|_| AstralError::Validation("card bind batch is too large".into()))?;
     let instance = current_instance_id();
-    let mut tx = pool.begin().await.map_err(database_error)?;
-    sqlx::query(
+    // Before probe: the frozen task identity must not exist yet (a real
+    // absence probe inside this transaction).
+    let before_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM async_operation WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(database_error)?;
+    let before_item_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM async_operation_item WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(database_error)?;
+
+    let task_insert = sqlx::query(
         "INSERT INTO async_operation \
          (task_id, task_type, status, requester_user_id, requester_card_id, requester_tenant_id, \
           requester_domain_id, authorization_target_card_id, authorization_target_tenant_id, \
@@ -474,7 +494,7 @@ async fn register_card_bind(
     .bind(target_user_id)
     .bind(total)
     .bind(instance)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(database_error)?;
 
@@ -484,8 +504,9 @@ async fn register_card_bind(
         .iter()
         .map(|item| Ok((item, batch_card_operation_id(task_id, item.card_id)?)))
         .collect::<Result<Vec<_>, AstralError>>()?;
+    let mut item_insert_rows: u64 = 0;
     for (item, operation_id) in &persisted_items {
-        sqlx::query(
+        item_insert_rows += sqlx::query(
             "INSERT INTO async_operation_item \
              (task_id, card_id, tenant_id, domain_id, operation_id, status, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, 'PENDING', UNIX_TIMESTAMP(), UNIX_TIMESTAMP())",
@@ -495,14 +516,74 @@ async fn register_card_bind(
         .bind(item.tenant_id)
         .bind(item.domain_id)
         .bind(operation_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
-        .map_err(database_error)?;
+        .map_err(database_error)?
+        .rows_affected();
     }
+    // After readback: the exact frozen operation row and the sorted item
+    // identities, read from the rows this transaction just wrote.
+    let readback: (i64, String, i64, i64) = sqlx::query_as(
+        "SELECT authorization_target_card_id, status, total_items, target_user_id \
+         FROM async_operation WHERE task_id = ?",
+    )
+    .bind(task_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    let item_operation_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT operation_id FROM async_operation_item WHERE task_id = ? ORDER BY card_id",
+    )
+    .bind(task_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    let evidence = ProtectedSourceEvidence::new()
+        .target_row(TargetRowEvidence {
+            entity: "async_operation",
+            key: serde_json::json!({ "taskId": task_id }),
+            before: RowPresence::from_option(
+                (before_rows > 0).then(|| serde_json::json!({ "taskId": task_id })),
+            ),
+            after: RowPresence::Present(serde_json::json!({
+                "taskId": task_id,
+                "taskType": BATCH_BIND_TASK_TYPE,
+                "status": readback.1,
+                "authorizationTargetCardId": readback.0,
+                "totalItems": readback.2,
+                "targetUserId": readback.3,
+            })),
+        })
+        .map_err(|error| AstralError::Pending(error.to_string()))?
+        .target_row(TargetRowEvidence {
+            entity: "async_operation_item",
+            key: serde_json::json!({ "taskId": task_id }),
+            before: RowPresence::from_option(
+                (before_item_rows > 0).then(|| serde_json::json!({ "taskId": task_id })),
+            ),
+            after: RowPresence::Present(serde_json::json!({
+                "taskId": task_id,
+                "itemCount": item_operation_ids.len(),
+                "operationIds": item_operation_ids,
+            })),
+        })
+        .map_err(|error| AstralError::Pending(error.to_string()))?
+        .receipt(
+            "async_operation",
+            serde_json::json!({ "taskId": task_id }),
+            WriteKind::Insert,
+            task_insert.rows_affected(),
+        )
+        .receipt(
+            "async_operation_item",
+            serde_json::json!({ "taskId": task_id }),
+            WriteKind::Insert,
+            item_insert_rows,
+        );
     let (created_at, updated_at): (i64, i64) =
         sqlx::query_as("SELECT created_at, updated_at FROM async_operation WHERE task_id = ?")
             .bind(task_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await
             .map_err(database_error)?;
     let task = AsyncTask {
@@ -528,11 +609,104 @@ async fn register_card_bind(
         created_at: epoch_seconds(created_at)?,
         updated_at: epoch_seconds(updated_at)?,
     };
-    // Registration's commit runs inside an already tracker-owned worker.
+    Ok((task, evidence))
+}
+
+/// Protected registration boundary: the verified ProtectedBusiness admission
+/// is validated, consumed, ledgered, audited, and its durable result binds the
+/// exact frozen item set — all inside the SAME transaction that persists the
+/// batch task and its sorted per-item operation identities. There is no
+/// reconstruction path: the worker later evaluates every item FRESH (see
+/// `service::user_card_batch_admission`); the parent admission is never split
+/// into per-item budgets.
+async fn register_card_bind_protected(
+    pool: &MySqlPool,
+    registration: &CardBindRegistration,
+    parent: &ProtectedMutationContext,
+) -> Result<AsyncTask, CardBindRegistrationError> {
+    validate_card_bind_registration(registration)?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| CardBindRegistrationError::BeforeCommit(database_error(error)))?;
+    let payload = registration_payload(registration)?;
+    match begin_protected_mutation_in_tx(&mut tx, parent, &payload)
+        .await
+        .map_err(CardBindRegistrationError::BeforeCommit)?
+    {
+        ProtectedMutationStart::New => {}
+        ProtectedMutationStart::Completed(existing) => {
+            // The same verified operation already committed this exact
+            // registration. Roll back (nothing new is written) and surface
+            // the durable task — never consume the admission twice.
+            drop(tx);
+            let task_id = existing
+                .get("taskId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    CardBindRegistrationError::BeforeCommit(AstralError::Database(
+                        "durable batch registration result is missing its task id".into(),
+                    ))
+                })?
+                .to_owned();
+            return get_task(pool, &task_id)
+                .await
+                .map_err(CardBindRegistrationError::BeforeCommit)?
+                .ok_or_else(|| {
+                    CardBindRegistrationError::BeforeCommit(AstralError::Database(format!(
+                        "durable batch registration {task_id} is missing its task snapshot"
+                    )))
+                });
+        }
+    }
+    let (task, evidence) = register_card_bind_in_tx(&mut tx, registration)
+        .await
+        .map_err(CardBindRegistrationError::BeforeCommit)?;
+    let result = registration_result(registration);
+    finish_protected_mutation_in_tx(&mut tx, parent, &result, &evidence)
+        .await
+        .map_err(CardBindRegistrationError::BeforeCommit)?;
     tx.commit()
         .await
         .map_err(|error| CardBindRegistrationError::CommitOutcomeUnknown(database_error(error)))?;
     Ok(task)
+}
+
+/// Digest-bound immutable registration request: the exact sorted item set,
+/// the anchor card, and the target user. Any drift fails the protected
+/// mutation identity check instead of silently rebinding the operation.
+fn registration_payload(registration: &CardBindRegistration) -> Result<Value, AstralError> {
+    let mut items = registration.items.clone();
+    items.sort_by_key(|item| item.card_id);
+    Ok(serde_json::json!({
+        "taskId": registration.task_id,
+        "anchorCardId": registration.authorization_target_card_id,
+        "targetUserId": registration.target_user_id,
+        "items": items
+            .iter()
+            .map(|item| serde_json::json!({
+                "cardId": item.card_id,
+                "tenantId": item.tenant_id,
+                "domainId": item.domain_id,
+            }))
+            .collect::<Vec<_>>(),
+        "total": items.len(),
+    }))
+}
+
+/// Durable protected result binding the frozen item set (existing schema, no
+/// migration): reconciliation and operator review read the registered set
+/// from `protected_mutation_operation.result_json`.
+fn registration_result(registration: &CardBindRegistration) -> Value {
+    let mut items = registration.items.clone();
+    items.sort_by_key(|item| item.card_id);
+    serde_json::json!({
+        "taskId": registration.task_id,
+        "total": items.len(),
+        "targetUserId": registration.target_user_id,
+        "anchorCardId": registration.authorization_target_card_id,
+        "itemCardIds": items.iter().map(|item| item.card_id).collect::<Vec<_>>(),
+    })
 }
 
 async fn fetch_operation_row(
@@ -1406,15 +1580,56 @@ mod tests {
             .find("let worker = async move")
             .expect("registration work must be captured by a tracker-owned future");
         let transaction = body
-            .find("register_card_bind(&task_pool, &registration).await")
-            .expect("registration transaction must run in the tracker-owned future");
+            .find("register_card_bind_protected(&task_pool, &registration, &parent).await")
+            .expect("the protected registration boundary must run in the tracker-owned future");
         let spawn = body
             .find("spawn_owned_reserved_with_card_bind(reservation, task_id, pool.clone(), worker)")
             .expect("registration worker must be installed in the owned JoinSet");
         assert!(worker < transaction && transaction < spawn);
+        assert!(
+            body.contains("ProtectedMutationContext"),
+            "the verified ProtectedBusiness admission travels as a protected mutation context, \
+             never as a threadable request admission"
+        );
         assert!(body.contains("result_rx.await"));
         assert!(body.contains("oneshot::channel()"));
         assert!(body.contains("reconcile_card_bind_after_owner_exit_bounded"));
+    }
+
+    /// 结构守卫：protected 注册边界必须在同一个事务里完成 begin（校验+幂等
+    /// 锁）、冻结 item 集注册、finish（消费 ProtectedBusiness admission +
+    /// result_json 绑定 item 集 + 审计），且任何分叉都不重建 per-item 预算。
+    #[test]
+    fn protected_registration_boundary_is_single_transaction() {
+        let source = include_str!("async_tracker.rs");
+        let protected = source
+            .split("async fn register_card_bind_protected(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nasync fn ").next())
+            .expect("protected registration boundary must exist");
+        let begin = protected
+            .find("begin_protected_mutation_in_tx(&mut tx, parent, &payload)")
+            .expect("boundary must open the protected mutation in the same tx");
+        let register = protected
+            .find("register_card_bind_in_tx(&mut tx, registration)")
+            .expect("the frozen item set must be registered in the same tx");
+        let finish = protected
+            .find("finish_protected_mutation_in_tx(&mut tx, parent, &result, &evidence)")
+            .expect(
+                "boundary must consume the admission and bind result + evidence in the same tx",
+            );
+        let commit = protected
+            .find("tx.commit()")
+            .expect("one commit covers registration + protected ledger/result/audit");
+        assert!(begin < register && register < finish && finish < commit);
+        assert!(
+            protected.contains("ProtectedMutationStart::Completed"),
+            "an identical committed registration must surface its durable task, never double-consume"
+        );
+        assert!(
+            protected.contains("registration_result(registration)"),
+            "the durable result must bind the exact frozen item set"
+        );
     }
 
     #[test]
@@ -1510,7 +1725,7 @@ mod tests {
             .find("spawn_owned_reserved_with_card_bind(reservation, task_id, pool.clone(), worker)")
             .unwrap();
         let register = registration
-            .find("register_card_bind(&task_pool, &registration).await")
+            .find("register_card_bind_protected(&task_pool, &registration, &parent).await")
             .unwrap();
         assert!(register < spawn);
         let shutdown_start = implementation
@@ -1787,14 +2002,19 @@ impl AsyncOperationTracker {
         Ok(())
     }
 
-    /// Install the registration transaction and worker inside a tracker-owned
-    /// future. Dropping the HTTP request cannot cancel this admission boundary.
+    /// Install the protected registration transaction and worker inside a
+    /// tracker-owned future. Dropping the HTTP request cannot cancel this
+    /// admission boundary: the verified ProtectedBusiness admission is
+    /// consumed inside the owned future (same transaction as the frozen item
+    /// set), and the worker evaluates every item FRESH afterwards — the
+    /// parent admission is never threaded into items or split into budgets.
     /// Shutdown reconciles any accepted row without replaying source mutations.
     pub(crate) async fn register_card_bind_and_spawn<F>(
         &'static self,
         pool: &MySqlPool,
         reservation: BatchAdmissionPermit,
         registration: CardBindRegistration,
+        parent: ProtectedMutationContext,
         task: F,
     ) -> Result<AsyncTask, AstralError>
     where
@@ -1807,7 +2027,8 @@ impl AsyncOperationTracker {
         let task_pool = pool.clone();
         let registration_task_id = registration.task_id.clone();
         let worker = async move {
-            let registration_result = register_card_bind(&task_pool, &registration).await;
+            let registration_result =
+                register_card_bind_protected(&task_pool, &registration, &parent).await;
             let accepted = match registration_result {
                 Ok(accepted) => accepted,
                 Err(CardBindRegistrationError::BeforeCommit(error)) => {

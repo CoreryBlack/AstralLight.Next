@@ -12,16 +12,52 @@ use crate::circuit_breaker::{AutoCircuitBreaker, CircuitBreakerState};
 #[cfg(feature = "performance-attribution")]
 use crate::hit_stats::AtomicBreakerAttribution;
 use crate::hit_stats::{AtomicHitStats, HitStats, TimingBreakdown};
-use astral_types::{PolicyContext, PolicyDecision};
+use astral_types::{AuthorizationAdmission, PolicyContext, PolicyDecision};
 
 mod decision;
 mod formal;
 mod ports;
 mod published;
 
-pub use ports::RuleRepository;
+pub use ports::{AuthorizationFenceProvider, PublishedEvidenceReadMode, RuleRepository};
 
-/// PolicyEngine（线程安全，统计采用原子快照，断路器按资源隔离）
+/// Result of a formal authorization evaluation plus an optional proof-bound
+/// capability. The capability is present only for a certified F1 ALLOW and is
+/// intentionally excluded from `PolicyDecision` serialization.
+#[derive(Debug)]
+pub struct PolicyEvaluation {
+    pub decision: PolicyDecision,
+    admission: Option<AuthorizationAdmission>,
+}
+
+impl PolicyEvaluation {
+    pub(crate) fn without_admission(decision: PolicyDecision) -> Self {
+        Self {
+            decision,
+            admission: None,
+        }
+    }
+
+    pub(crate) fn from_parts(
+        decision: PolicyDecision,
+        admission: Option<AuthorizationAdmission>,
+    ) -> Self {
+        let admission = if decision.allowed { admission } else { None };
+        Self {
+            decision,
+            admission,
+        }
+    }
+
+    pub fn admission(&self) -> Option<&AuthorizationAdmission> {
+        self.admission.as_ref()
+    }
+
+    pub fn into_parts(self) -> (PolicyDecision, Option<AuthorizationAdmission>) {
+        (self.decision, self.admission)
+    }
+}
+
 pub struct PolicyEngine {
     stats: AtomicHitStats,
     #[cfg(feature = "performance-attribution")]

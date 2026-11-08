@@ -74,8 +74,8 @@
       <section class="validation-section" id="packages">
         <div class="validation-wrap">
           <p class="section-label">00 <span>证据包</span></p>
-          <h2>三份证据，三个不同的结论。</h2>
-          <p class="section-lead">三份证据来自不同时间与环境，分别列出。r3 是 Linux Cargo 测试；单机证据使用真实 MySQL / Redis / RabbitMQ；SDK 是本地 macOS 门禁。</p>
+          <h2>单机阶段验收与证据范围。</h2>
+          <p class="section-lead">单机阶段基于以下历史证据验收，失败和未执行项仍然有效。各次运行的时间、源码和范围不同，不合并计数，也不代表当前版本已复验。分布式形态未验证。</p>
           <div class="package-grid">
             <article class="package-card">
               <div class="package-head"><span>2026-10-07 · r3</span><span class="result is-fail">FAIL</span></div>
@@ -90,13 +90,19 @@
               <a href="#performance">查看性能与失败 <span aria-hidden="true">→</span></a>
             </article>
             <article class="package-card">
+              <div class="package-head"><span>2026-10-09 · E5 a11</span><span class="result is-pass">SELECTED PASS</span></div>
+              <h3>修复后的选定测试集</h3>
+              <p>提交 674792e：逐项验证 60/60 PASS，独立重跑 60/60 PASS。包含真实 MySQL、RabbitMQ 和历史 Redis compatibility 专项；不代表完整部署或全部场景通过。</p>
+              <a href="Docs/实验/e5-all-20261008/e5-all-20261008-a11-evidence-bundle-20261010.tar.gz">查看原始证据包 <span aria-hidden="true">→</span></a>
+            </article>
+            <article class="package-card">
               <div class="package-head"><span>2026-10-05 · 本地</span><span class="result is-pass">LOCAL PASS</span></div>
               <h3>SDK 接入 V1</h3>
               <p>2,765 workspace PASS · 0 FAIL · 86 ignored；12 个 sample PASS；9/9 门禁退出码为 0。生产集成仍为 BLOCKED。</p>
               <a href="#sdk">查看 SDK 数据 <span aria-hidden="true">→</span></a>
             </article>
           </div>
-          <p class="section-note">各包结论对应各自的测试面：SDK 生产集成仍为 BLOCKED，单机 gate 仍有 5 个失败。</p>
+          <p class="section-note">2026-10-06 的单机 gate 有 5 个测试失败，另有其他门禁失败；2026-10-07 的 r3 为 FAIL。后续 E5 只证明其选定范围，SDK 生产集成仍为 BLOCKED。</p>
         </div>
       </section>
 
@@ -317,7 +323,7 @@
               <h3>Identity mapping create</h3>
               <p>缺失映射检测通过；create 在 operation-ledger status 解码失败。后续正向 resolve 与跨 app 隔离断言未执行。</p>
               <code class="failure-code">Database("lock integration mapping operation: error occurred while decoding column status: mismatched types; Rust String/VARCHAR is not compatible with SQL BINARY")</code>
-              <p class="failure-impact">影响：SDK mapping 创建路径仍未验证。</p>
+              <p class="failure-impact">后续 E5 a11 在真实 MySQL 上针对 identity mapping 的专项复验为 2/2 PASS；这不代表 SDK 生产集成已验收。</p>
             </article>
             <article class="failure-card">
               <div class="failure-head"><span>r3 · E5</span><span class="result is-fail">FAIL</span></div>
@@ -357,7 +363,7 @@ concurrent p99.9 504.843µs · max 1,007.968µs</code>
               <h3>范围外</h3>
               <ul>
                 <li>完整 integration gate 全绿（r3 与单机 gate 均 FAIL）。</li>
-                <li>SDK mapping 创建兼容、SDK 生产集成通过。</li>
+                <li>SDK 生产集成通过；后续 identity mapping 专项复验不等于生产集成验收。</li>
                 <li>E5 性能达到 sanity floor、512 为容量上限。</li>
                 <li>真实 single-node composite 的业务 HTTP 端到端。</li>
                 <li>跨节点 / 跨区恢复、E1–E5 全协议、TLA+/TLC、生产迁移与权限切流。</li>
@@ -373,6 +379,8 @@ concurrent p99.9 504.843µs · max 1,007.968µs</code>
           <h2>回到公开材料。</h2>
           <p class="section-lead">页面引用脱敏后的测试摘要与仓库公开文档；原始 runner / unit 日志保存在本地证据包。</p>
           <ul class="source-list">
+            <li><a href="test-report.md">2026-10-07 r3 测试报告 <span aria-hidden="true">→</span></a></li>
+            <li><a href="Docs/实验/e5-all-20261008/e5-all-20261008-a11-evidence-bundle-20261010.tar.gz">2026-10-09 E5 a11 原始证据包 <span aria-hidden="true">→</span></a></li>
             <li><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/authorization-validation/README.md" target="_blank" rel="noreferrer">授权验证协议与工具 <span aria-hidden="true">↗</span></a></li>
             <li><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/authorization-validation/EVIDENCE_BOUNDARY_MATRIX.md" target="_blank" rel="noreferrer">证据边界矩阵 <span aria-hidden="true">↗</span></a></li>
             <li><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/authorization-validation/VALIDATION_PROTOCOL.md" target="_blank" rel="noreferrer">验证协议 <span aria-hidden="true">↗</span></a></li>
@@ -606,7 +614,7 @@ concurrent p99.9 504.843µs · max 1,007.968µs</code>
 
     <footer class="site-footer">
       <a class="brand footer-brand" href="index.html"><img class="brand-mark" src="assets/astral-mark.png" alt="" width="24" height="24">AstralLight<span class="brand-period">.</span><span class="brand-next">Next</span></a>
-      <span>实验项目，未经过真实部署，不保证在所有环境和场景下适用。</span>
+      <span>单机阶段基于历史证据验收；分布式形态未验证，生产部署需另行验收。</span>
       <div class="footer-links"><a href="index.html">首页</a><a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/LICENSE" target="_blank" rel="noreferrer">AGPL-3.0-or-later</a><a href="#top">回到顶部 ↑</a></div>
     </footer>
     <button class="back-to-top" type="button" aria-label="回到顶部">↑</button>

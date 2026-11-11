@@ -28,7 +28,27 @@ gates, PASS evidence, fallback paths, or runnable recommendations. Rust coverage
 limited to the specified registered contracts, and remaining runtime/deployment gaps
 retain their status in the manifest; this map does not rewrite historical results.
 
-## Separate multi-tenant milestones
+## V7 current read-surface boundary (2026-11-09)
+
+The current checkout uses three explicit read surfaces and a separate authority-root contract:
+
+| Surface | Current owner | Positive-read rule | Evidence state |
+|---|---|---|---|
+| DB-primary | credentials, sessions/JWT/refresh, revocation, audit/ledger, management, cold/recovery | durable status or transaction proof is required | local code boundary; live DB/recovery not run |
+| DB-backed accelerator | `MemoryProjectionHub`, `AuxiliaryAuthorizationMirror`, verified-positive session mirror | hit may reduce DB work; miss/stale/suspect must strict-refill or deny by frozen profile | partial/local contracts |
+| Certified-memory authority | immutable certified snapshot, authority frontier, ownership/SoD and serving gate | only complete attested serving snapshot; no SQL fallback on miss | composition boundary implemented; current service runtimes pass no serving certified store |
+
+The V7 certified-memory root is now an additive authority contract: six fact families, explicit complete coverage, canonical root digest/signature, current/history continuity, operation idempotency, leader/token fencing, and client-side response verification. A durable completion ledger, strict row reader, six explicit ledger-backed family adapters, caller-owned proof-only completion sink, and operation-id width contract now exist locally; they consume only source-owner completion rows and do not infer empty coverage. The root contract and snapshot/runtime primitives have focused Rust evidence, but no source owner currently writes all six production completion families and the root and local snapshot have not been installed byte-for-byte.
+
+**Source and receipt review (2026-11-10):** No family yet has a complete production path from actual durable source through authority receipt to ledger. The ledger writer's field and payload-digest checks do not establish authority provenance; single-card or member reads do not prove a complete family inventory. The 4213/0/119 workspace result applies only to its earlier frozen snapshot, with ignored tests counted as SKIP. See [process evidence §0M](认证内存授权状态机实施过程报告_2026-11-08.md#0m-2026-11-10-冻结快照工作区验证).
+
+**Later security review (2026-11-10):** The 4193/0/119 result below predates subsequent authority changes and is not the final gate for the changed code. Family aggregate cannot automatically certify a GLOBAL reservation, and certified-memory root install/read fail closed until exact per-scope publication and snapshot proof are implemented. Production Serving remains unproven.
+
+The local coordinator validates the already-authoritative family bundle, canonical snapshot content digest, verified root record, attestation binding, generation/revoke and independent worker/frontier/transport readiness before reusing the existing runtime Serving transition. The 2026-11-10 current workspace snapshot passed `cargo check --workspace --offline --locked`, `cargo clippy --workspace --all-targets --offline --locked -- -D warnings`, `git diff --check`, and `cargo test --workspace --offline --locked` with **4193 passed, 0 failed, 119 ignored**. `cargo fmt --all -- --check` exited `1` because the inherited dirty worktree contains pre-existing formatting differences; the workspace formatter was not used to overwrite existing user changes. This is local Rust evidence only: the six adapters do not materialize source-owner completion rows, call the authority transport, or make `MemoryProjectionHub`, a DB mirror, a RabbitMQ ACK or a local heartbeat into root evidence. The durable builder remains `Pending/Unavailable` until source-owned completion, authority proof, and readiness are available.
+
+The durable snapshot builder deliberately returns `Pending`/`Unavailable` when it cannot prove complete six-family coverage, authority binding, or complete inventory. It does not convert strict published-evidence reads into a Serving root. Full certified authorization composition, F0/F1 signed integration equality, certified ORG/dynamic-owner projection, single-node Serving, MySQL/RabbitMQ/etcd/quorum/mTLS, migration, multi-node, S15/TLC, and deployment evidence remain `PARTIAL`, `BLOCKED`, or `UNKNOWN` as recorded in the validation reports.
+
+The local composition root is now explicit in `astral-db/src/certified_memory_runtime.rs`: it owns materializer/builder/installer lifecycle, exposes `require_serving()`, and provides an explicit durable-owner-context constructor that installs the six ledger adapters. `ensure_authorization_read_surface()` lets Identity, TrustGraph, and Monitor reuse the already-frozen profile and rejects profile split-brain; it does not create a CertifiedMemory candidate with an empty store. Focused Rust evidence covers 4 owner tests, 4 completion-ledger tests, and 3 composition-root tests. Host runtime checks passed locally. These results establish fail-closed composition only; the default startup path remains unavailable until source completion, authority/root transport, and readiness proofs are supplied.
 
 The architecture documentation uses M1-M3 for a different delivery plan. Its public
 Rust tests are:

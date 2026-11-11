@@ -346,7 +346,7 @@ fn eligibility_admission(
         SourceMutationCapability::UserPending => Err(AstralError::Pending(
             "tenant eligibility source capture requires authorization admission".into(),
         )),
-        SourceMutationCapability::System => Err(AstralError::Permission(
+        SourceMutationCapability::System(_) => Err(AstralError::Permission(
             "tenant eligibility source capture cannot use a system capability".into(),
         )),
     }

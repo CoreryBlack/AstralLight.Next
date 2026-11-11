@@ -1,0 +1,16 @@
+[package]
+name = "astral-authorization-root"
+version = "0.1.0"
+edition = "2021"
+license = { workspace = true }
+publish = false
+
+[dependencies]
+astral-types = { path = "../astral-types" }
+arc-swap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+im = { workspace = true }
+thiserror = { workspace = true }

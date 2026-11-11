@@ -335,6 +335,55 @@ impl AccessSessionSource for MySqlAccessSessionSource {
     }
 }
 
+/// `AccessSessionSource` implementation for the certified-memory-only seam.
+///
+/// The common store short-circuits this source for `MirrorPolicy::CertifiedMemoryOnly`.
+/// Keeping a non-MySQL source object satisfies the existing store shape while making any
+/// accidental source fallback fail closed instead of retaining a durable reader.
+struct CertifiedMemoryOnlySource;
+
+#[async_trait::async_trait]
+impl AccessSessionSource for CertifiedMemoryOnlySource {
+    async fn load_access_fact(
+        &self,
+        _jti: &str,
+        _bind: &SessionBindContext,
+    ) -> Result<Option<AccessSessionDurableFact>, String> {
+        Err("certified-memory-only session store has no durable source".to_owned())
+    }
+}
+
+/// Build an explicitly certified-memory-only session store.
+///
+/// This helper never accepts or constructs a MySQL source. The mirror is mandatory;
+/// an empty or stale mirror is handled by the store as `Unavailable`/`Deny`, never by
+/// falling back to a source read.
+fn new_certified_memory_only_session_projection_store(
+    mirror: astral_common::session_projection_store::SessionProjectionMirror,
+) -> std::sync::Arc<SessionProjectionStore> {
+    std::sync::Arc::new(SessionProjectionStore::new(
+        std::sync::Arc::new(CertifiedMemoryOnlySource),
+        Some(mirror),
+        astral_common::session_projection_store::MirrorPolicy::CertifiedMemoryOnly,
+    ))
+}
+
+/// Explicitly install the certified-memory-only session projection store.
+///
+/// This is a separate opt-in seam from [`install_global_mysql_session_projection_store`].
+/// It first-wins like the existing installer and returns an error if any global store is
+/// already installed. No MySQL pool is retained by this path.
+pub fn install_global_certified_memory_session_projection_store(
+    mirror: astral_common::session_projection_store::SessionProjectionMirror,
+) -> Result<(), String> {
+    let store = new_certified_memory_only_session_projection_store(mirror);
+    if astral_common::session_projection_store::install_global_session_projection_store(store) {
+        Ok(())
+    } else {
+        Err("session projection store already initialized".to_owned())
+    }
+}
+
 /// 便捷安装：以 MySQL source（可选镜像）安装进程级
 /// [`SessionProjectionStore`]。first-wins；重复安装返回 `false`。
 pub fn install_global_mysql_session_projection_store(
@@ -1310,6 +1359,57 @@ pub async fn verify_access_via_global_store(
 mod tests {
     use super::*;
     use time::{Date, Month, Time};
+
+    #[tokio::test]
+    async fn certified_memory_only_store_requires_mirror_and_never_falls_back_to_mysql() {
+        let store = new_certified_memory_only_session_projection_store(
+            astral_common::session_projection_store::SessionProjectionMirror::default(),
+        );
+        assert!(store.mirror_positive_allowed());
+        assert!(store.mirror().is_some());
+
+        let bind = SessionBindContext {
+            user_id: 42,
+            session_id: 7,
+            session_version: 2,
+            session_epoch: 3,
+            token_family_id: 11,
+            principal_kind: "PLATFORM_USER",
+            identity_card_id: Some(10),
+            user_card_id: Some(40),
+            user_card_tenant_id: Some(20),
+            user_card_domain_id: Some(30),
+            expires_at_epoch_second: 4_000_000_000,
+        };
+        assert_eq!(
+            store.verify_access("uncertified-jti", &bind).await,
+            SessionProjectionDecision::Unavailable,
+            "certified-memory miss must not consult or retain MySQL source"
+        );
+    }
+
+    #[test]
+    fn certified_memory_installer_is_explicit_and_does_not_use_mysql_installer() {
+        let source = include_str!("session_state_repository.rs");
+        let installer = source
+            .split("pub fn install_global_certified_memory_session_projection_store(")
+            .nth(1)
+            .unwrap()
+            .split("/// 便捷安装：以 MySQL source")
+            .next()
+            .unwrap();
+        let certified_builder = source
+            .split("fn new_certified_memory_only_session_projection_store(")
+            .nth(1)
+            .unwrap()
+            .split("/// Explicitly install the certified-memory-only session projection store.")
+            .next()
+            .unwrap();
+        assert!(certified_builder.contains("MirrorPolicy::CertifiedMemoryOnly"));
+        assert!(installer.contains("install_global_session_projection_store"));
+        assert!(!installer.contains("MySqlPool"));
+        assert!(!installer.contains("install_global_mysql_session_projection_store"));
+    }
 
     #[test]
     fn strict_platform_session_sql_requires_current_credential_and_epoch() {

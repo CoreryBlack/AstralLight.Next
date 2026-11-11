@@ -674,6 +674,36 @@ pub(crate) struct IdentitySourceOutcome {
     publication_receipt: Option<EligibilitySourceEvidenceReceipt>,
 }
 
+/// Preserve caller-captured fanout without replacing the eligibility capture's facts.
+fn merge_eligibility_fanout(
+    evidence: &mut serde_json::Value,
+    caller_fanout: &serde_json::Value,
+) -> Result<(), AstralError> {
+    let captured = evidence
+        .get_mut("sourceEvidence")
+        .and_then(|source| source.get_mut("fanout"))
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| AstralError::Pending("eligibility source fanout is malformed".into()))?;
+    if caller_fanout.is_null() {
+        return Ok(());
+    }
+    let caller = caller_fanout
+        .as_object()
+        .ok_or_else(|| AstralError::Pending("identity source fanout is malformed".into()))?;
+    for (key, value) in caller {
+        if let Some(existing) = captured.get(key) {
+            if existing != value {
+                return Err(AstralError::Pending(format!(
+                    "identity and eligibility source fanout disagree on {key}"
+                )));
+            }
+        } else {
+            captured.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(())
+}
+
 impl IdentitySourceOutcome {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -813,6 +843,7 @@ impl IdentitySourceOutcome {
                 .into_staged_envelope()
                 .map_err(|error| AstralError::Pending(error.to_string()))?
                 .evidence;
+            merge_eligibility_fanout(&mut evidence, &self.fanout)?;
             if let Some(object) = staged_value.as_object() {
                 if let Some(staged_receipts) =
                     object.get("receipts").and_then(serde_json::Value::as_array)
@@ -1018,6 +1049,83 @@ pub(crate) async fn stage_identity_source_outcome_in_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eligibility_fanout_retains_captured_facts_and_card_create_bindings() {
+        let mut evidence = serde_json::json!({
+            "kind": "ELIGIBILITY_COMPLETION",
+            "completion": {"cards": [{"generation": 4}]},
+            "sourceEvidence": {
+                "targets": [{"entity": "user_card"}],
+                "receipts": [{"durableId": "event-1"}],
+                "fanout": {
+                    "eligibilityEvents": 1,
+                    "affectedCards": [{"cardId": 7, "tenantId": 3}]
+                }
+            }
+        });
+        let caller = serde_json::json!({
+            "affectedCards": [{"cardId": 7, "tenantId": 3}],
+            "cardCreateRuleSetBindings": [{"ruleSetId": 12, "refId": 15}],
+            "ruleSetRefs": 1,
+            "projectionEvents": 2
+        });
+        merge_eligibility_fanout(&mut evidence, &caller).unwrap();
+        assert_eq!(
+            evidence["sourceEvidence"]["fanout"],
+            serde_json::json!({
+                "eligibilityEvents": 1,
+                "affectedCards": [{"cardId": 7, "tenantId": 3}],
+                "cardCreateRuleSetBindings": [{"ruleSetId": 12, "refId": 15}],
+                "ruleSetRefs": 1,
+                "projectionEvents": 2
+            })
+        );
+        assert_eq!(evidence["completion"]["cards"][0]["generation"], 4);
+        assert_eq!(
+            evidence["sourceEvidence"]["receipts"][0]["durableId"],
+            "event-1"
+        );
+    }
+
+    #[test]
+    fn eligibility_fanout_rejects_conflicting_captured_card_sets_and_counts() {
+        for caller in [
+            serde_json::json!({"affectedCards": [{"cardId": 8, "tenantId": 3}]}),
+            serde_json::json!({"affectedCards": [{"cardId": 7, "tenantId": 4}]}),
+            serde_json::json!({"eligibilityEvents": 0}),
+        ] {
+            let mut evidence = serde_json::json!({"sourceEvidence": {"fanout": {
+                "eligibilityEvents": 1,
+                "affectedCards": [{"cardId": 7, "tenantId": 3}]
+            }}});
+            assert!(matches!(
+                merge_eligibility_fanout(&mut evidence, &caller),
+                Err(AstralError::Pending(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn eligibility_fanout_accepts_empty_callers_and_rejects_malformed_values() {
+        let original = serde_json::json!({"sourceEvidence": {"fanout": {
+            "eligibilityEvents": 0, "affectedCards": []
+        }}});
+        for caller in [serde_json::Value::Null, serde_json::json!({})] {
+            let mut evidence = original.clone();
+            merge_eligibility_fanout(&mut evidence, &caller).unwrap();
+            assert_eq!(evidence, original);
+        }
+        let mut evidence = original;
+        assert!(matches!(
+            merge_eligibility_fanout(&mut evidence, &serde_json::json!([])),
+            Err(AstralError::Pending(_))
+        ));
+        assert!(matches!(
+            merge_eligibility_fanout(&mut serde_json::json!({}), &serde_json::json!({})),
+            Err(AstralError::Pending(_))
+        ));
+    }
 
     /// 生命周期（Ok）：autocommit 语句成功 → proven 清私有 atomic，Drop 干净
     /// 释放 writer gate，hub 不进入 sticky suspect。

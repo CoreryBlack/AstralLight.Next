@@ -1261,6 +1261,13 @@ impl OrgAuthoritiesService {
         resource_tenant_id: i64,
         resource_domain_id: Option<i64>,
     ) -> Result<(), AstralError> {
+        if astral_db::authorization_read_surface()
+            .is_some_and(|surface| surface.is_certified_memory())
+        {
+            return Err(AstralError::Pending(
+                "certified-memory org governance materialization unavailable".into(),
+            ));
+        }
         let ctx = PolicyContext::builder()
             .user_id(Some(actor.user_id))
             .principal_kind(Some("PLATFORM_USER".to_owned()))

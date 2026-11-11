@@ -14,6 +14,16 @@ use astral_types::{
 
 use crate::org_admission::OrgAuthorityRead;
 
+/// A request-bound ORG proof together with the exact durable publication
+/// certificate record verified for the same authority read. The record is
+/// deliberately carried as a value instead of reconstructing it from the
+/// proof's certificate digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgAuthorityFenceRead {
+    pub proof: AuthorizationFenceProof,
+    pub certificate: astral_types::AuthorityScopePublicationCertificate,
+}
+
 /// Published-evidence read mode selected by the repository owner.
 ///
 /// `DurableOnly` keeps the existing strict source/pointer double-read path. A
@@ -40,19 +50,18 @@ pub trait AuthorizationFenceProvider: Send + Sync {
         request_nonce: &str,
     ) -> Result<AuthorizationFenceProof, PolicyError>;
 
-    /// Authenticate an administrative publication and membership identity against
-    /// the same global authority. The conservative default never authorizes ORG
-    /// evidence through a card publication certificate.
-    /// Bind a fresh card proof to the immutable verified policy request. Existing
-    /// diagnostic providers retain their scope-only port; production providers
-    /// override this method and persist the request binding at the authority.
+    /// Bind a fresh card proof to the immutable verified policy request. A
+    /// scope-only provider cannot satisfy this contract, so the default fails
+    /// closed and production adapters must explicitly implement it.
     async fn read_request_authorization_fence(
         &self,
         _context: &PolicyContext,
-        scope: &PublishedCardEvidenceScope,
-        request_nonce: &str,
+        _scope: &PublishedCardEvidenceScope,
+        _request_nonce: &str,
     ) -> Result<AuthorizationFenceProof, PolicyError> {
-        self.read_authorization_fence(scope, request_nonce).await
+        Err(PolicyError::Repository(
+            "request-bound authorization fence provider is unavailable".to_owned(),
+        ))
     }
 
     async fn read_org_authorization_fence(
@@ -63,6 +72,20 @@ pub trait AuthorizationFenceProvider: Send + Sync {
     ) -> Result<AuthorizationFenceProof, PolicyError> {
         Err(PolicyError::Repository(
             "organization authorization fence provider is unavailable".to_owned(),
+        ))
+    }
+
+    /// Return an ORG proof together with the exact publication certificate
+    /// record authenticated for that same read. Providers that only expose a
+    /// proof must remain unavailable on CertifiedMemory's positive ORG path.
+    async fn read_org_authorization_fence_with_certificate(
+        &self,
+        _context: &PolicyContext,
+        _evidence: &astral_types::org_scope::OrgAdmissionEvidence,
+        _request_nonce: &str,
+    ) -> Result<OrgAuthorityFenceRead, PolicyError> {
+        Err(PolicyError::Repository(
+            "organization authorization fence certificate is unavailable".to_owned(),
         ))
     }
 
@@ -114,16 +137,18 @@ pub trait RuleRepository: Send + Sync {
         ))
     }
 
-    /// Bind a fresh card proof to the immutable verified policy request. Existing
-    /// diagnostic providers retain their scope-only port; production providers
-    /// override this method and persist the request binding at the authority.
+    /// Bind a fresh card proof to the immutable verified policy request. A
+    /// scope-only repository cannot satisfy this contract, so the default fails
+    /// closed and production adapters must explicitly implement it.
     async fn read_request_authorization_fence(
         &self,
         _context: &PolicyContext,
-        scope: &PublishedCardEvidenceScope,
-        request_nonce: &str,
+        _scope: &PublishedCardEvidenceScope,
+        _request_nonce: &str,
     ) -> Result<AuthorizationFenceProof, PolicyError> {
-        self.read_authorization_fence(scope, request_nonce).await
+        Err(PolicyError::Repository(
+            "request-bound authorization fence provider is unavailable".to_owned(),
+        ))
     }
 
     async fn read_org_authorization_fence(
@@ -134,6 +159,20 @@ pub trait RuleRepository: Send + Sync {
     ) -> Result<AuthorizationFenceProof, PolicyError> {
         Err(PolicyError::Repository(
             "organization authorization fence provider is unavailable".to_owned(),
+        ))
+    }
+
+    /// Return an ORG proof together with the exact publication certificate
+    /// record authenticated for that same read. Providers that only expose a
+    /// proof must remain unavailable on CertifiedMemory's positive ORG path.
+    async fn read_org_authorization_fence_with_certificate(
+        &self,
+        _context: &PolicyContext,
+        _evidence: &astral_types::org_scope::OrgAdmissionEvidence,
+        _request_nonce: &str,
+    ) -> Result<OrgAuthorityFenceRead, PolicyError> {
+        Err(PolicyError::Repository(
+            "organization authorization fence certificate is unavailable".to_owned(),
         ))
     }
 

@@ -268,6 +268,10 @@ impl AuthorityService {
 }
 
 impl StoredCommitCoverage {
+    pub(super) fn binding(&self) -> &AuthorityCommitBinding {
+        &self.binding
+    }
+
     /// The declared finite coverage the source recorded with this commit, if
     /// any. Read-only accessor for terminal-completeness checks on close and
     /// reconcile: `None` means the classic conservative GLOBAL commit without

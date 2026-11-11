@@ -1100,6 +1100,8 @@ pub async fn evaluate<R: RuleRepository>(&self, ctx: &PolicyContext, repo: &R) -
 - 所有 `pub` 项必须有 doc 注释
 - crate 根必须有模块级文档（`//!`）
 - 复杂逻辑必须注释说明意图
+- **单机内存权威实验 `memory—v1` 标记**：以 `main` 为旧基线；本实验每次新增或改造方法时，在该方法紧邻声明的注释中标注精确文本 `memory—v1`（使用 U+2014，Rust 公共方法可放在已有 `///` 文档注释中，内部方法可用 `// memory—v1`）。已有标记不重复添加；保留其他必要的文档、属性和说明。标记仅说明该方法已纳入实验基线，不证明实现完整、安全、接线或验收，也不代表整个文件已迁移。此前代码不因本条自动追溯标记，实际修改时再标记。
+- **实验与旧基线关系**：实验设计吸收适用的先进概念，按内存权威目标定义新方法，不以兼容旧方法、旧授权发布协议或旧内部实现为目标。需要迁移旧数据或变更已受保护的公开接口时，仍按适用数据合同、迁移和 API 门禁单独处理；本条不撤销 `AGENTS.md` 执行门禁、现行生产授权合同或适用规范的采用前置。
 
 ---
 
@@ -1152,7 +1154,7 @@ Historical comparative Redis fixtures and empirical reports may remain if isolat
 - **失效传播**：单机使用有界 LocalBus/LocalProjectionBus；多机可使用 Rabbit durable transport、exact inbox、application proof、confirm/ACK、DLX、水位和 suspect 门。不得宣称异常回退等于跨实例零窗口或测试通过等于部署验收。
 - **正式 evidence 内存化**：只复用完整严格校验的 published 状态；aggregate、generation/dependency/fence/read-gate、source/health token 与有效期均须满足。DB/source guard、COMMIT 证明、opaque fence 与最终复读保持原有边界；取消或 UNKNOWN 关闭 authority read，必须先对账。缓存只能是有界进程本地 L1，TTL/容量/GC 耗尽不得将缺失状态转成完整证据。
 - **资格与组织状态**：ELIGIBILITY L1 只缓存严格来源、完整物理绑定和期限事实；组织 `TenantUnmanaged` 只在严格证明后可缓存，`SchemaUnmanaged` 不缓存。SoD 使用 context-aware published-only grants、经 provenance 对牌的组织贡献及 mandatory grant-time published-only port；旧 raw diagnostic SoD path 不再是当前授权/兼容 contract。策略、provenance/context 或 read token 失配必须拒绝。
-- **ELIGIBILITY L1 正命中栅栏**：缓存只优化物理双卡资格，不构成授权 evidence。每个可能返回正缓存的请求都在返回前后严格读取 ELIGIBILITY head，要求 `source_generation`/`revoke_fence` 与缓存条目相符且前后稳定；hub 路径还必须复核同一请求开始时捕获的 token。该闭合竞态的行为会在正缓存命中时增加两次 durable head DB 读取及相应延迟；任何 head 读取失败或栅栏/token 漂移均 fail-closed。
+- **ELIGIBILITY L1 正命中栅栏**：缓存只优化物理双卡资格，不构成授权 evidence。每个可能返回正缓存的请求都在返回前后严格读取 ELIGIBILITY head，要求 `source_generation`/`revoke_fence` 与缓存条目相符且前后稳定；hub 路径还必须复核同一请求开始时捕获的 token。该闭合竞态的行为会在正缓存命中时增加两次 durable head DB 读取及相应延迟；任何 head 读取失败或栅栏/token 漂移均 fail-closed。仅在单机共享根 profile 完整满足 §15.9.5 时，其完整资格事实和本地 F0/F1 取代该 profile 正式读取中的 head 双读；其他路径保持本条。
 - **SoD breaking behavior**：发布 SoD validation 仅以当前有效的 `effective_grants` 与可验证组织贡献判断授权冲突，不把 unpublished raw `permission_rule` 行作为正式授权语义。直接 `MANUAL` CREATE/UPDATE 在 source transaction 内强制执行 `check_grant_sod_conflict_in_tx`：锁定 ACTIVE/current 卡，校验 tenant/domain/user，拒绝未完成的 ADD/UPDATE/REMOVE/REVOKE（包括 NULL-card aggregate-wide 贡献），严格读取当前 published evidence，并以 `FOR SHARE` 读取 ACTIVE policies 后才允许 source 写入。CREATE 的显式注入 validator 早检不能替代该事务门；UPDATE 使用完整锁定 before-image，必须核对 source-rule tenant、joined source-card tenant 与新锁定卡一致。只有 published DIRECT grant 的唯一稳定 `GrantId`、`USER_CARD` aggregate、scope/content/provenance 全部与 before-image 一致时，才能从 STATIC held-grant 比较排除该项自身；其他 grant 和全部 DYNAMIC 检查仍保留。缺少动态 owner facts、冲突、证明不足或读取失败均阻止写入。策略上限 4096 行、evidence 上限 4MiB、总时限 3 秒；事务内不得访问缓存/hub、重新取 pool 连接或等待 projection。新的直接权限 grant 使用 enabled `MANUAL`；历史 `CARD_ONLY` 行只读/删除，不被自动改写。调用方须迁移到 context-aware Monitor SoD 和 mandatory grant-time port。上述 source 合同不证明真实 MySQL isolation、gap/next-key 锁、并发等待及 deadline 回滚已验证，也不扩展为全部 RuleSet/delegation/approval source 的 SoD 覆盖。
 - **生命周期与审计**：运行期监督单写者锁身份与必需 owner；owner 失败触发独立粘性故障门，心跳或 pointer 对账不清除此门；UNKNOWN 不自动重放。权限/授权变更按稳定 operation/message identity 关联审计，审计与 publication proof 分开验证。
 - **session revocation compensation**：仅补偿已提交的 `AUTH_SESSION_REVOCATION` intent，沿用稳定 operation identity；`retry_count` 同时作为单调 claim generation/CAS fence，lease 60 秒、最多 10 次、批次上限 100。只有匹配 user/event/payload 的精确 processed outbox proof 才能 `COMPLETED`；unsupported/retired 操作终止为 `FAILED` 并人工对账。未知结果须先 reconcile，不能通用重放或误报完成。
@@ -1331,7 +1333,7 @@ V6 does not renumber generic MQ `schemaVersion`, JWT signature/version fields, H
 
 ### 15.9 V7 authority 生产协议与采用合同（2026-11-07）
 
-本节是 V7 新的软件合同，替代 §§15.7–15.8 中 CURRENT V6 的 edition 和正向授权前提；V6 的历史变更清单、数据库事实、migration ID/checksum 和运行报告保留。本节不表示实现、迁移、部署或真实依赖验收已经通过，状态以同一份任务证据为准。普通 HTTP `/v1`、JWT 和 generic MQ schemaVersion 不随授权 edition 重编号。
+本节是 V7 新的软件合同，替代 §§15.7–15.8 中 CURRENT V6 的 edition 和正向授权前提；V6 的历史变更清单、数据库事实、migration ID/checksum 和运行报告保留。本节不表示实现、迁移、部署或真实依赖验收已经通过，状态以同一份任务证据为准。普通 HTTP `/v1`、JWT 和 generic MQ schemaVersion 不随授权 edition 重编号。§§15.9.1–15.9.4 为分布式 V7 合同；单机组合进程仅在满足 §15.9.5 全部采用前置时，按该节替代逐请求读取的新鲜度合同，source mutation、发布与恢复中未明确替代的要求仍然适用。
 
 #### 15.9.1 authority ownership 与威胁边界
 
@@ -1399,6 +1401,18 @@ key registry 固定启动 trust root；rotation 由受信任根授权，新 sign
 密码重置凭证通过 additive migration `20261107000008` 绑定独立随机 operation 与 delivery message。签发行和审计关联同事务提交，凭证消费与密码更新同事务核对 exact delivery binding 及 durable `DELIVERED`；取消、SQL 清理失败、未配置渠道、`ACCEPTED` 或 `IN_DOUBT` 不产生可消费凭证。旧绑定为 NULL 的 token 不自动回填。SMTP 接受只证明 `ACCEPTED`，没有明确接收回执不能激活重置凭证；迁移、真实发送和接收验收分别举证。
 
 验证使用 Rust/Cargo，覆盖 independent F0/F1、跨 DB 竞争、durable one-use、源提交/发布/ACK UNKNOWN、key rotation、rollback/restore、quorum 分区、启动容量与同代冲突。误放行会接受陈旧授权，误拒绝只降低可用性，因此故障默认 PENDING/DENY。真实 MySQL/etcd/RabbitMQ、迁移恢复与四节点 S15 必须单列执行证据；unit、mock、reducer 或 exit 0 不替代这些 postcondition。
+
+<a id="1595-单机共享根与本地双次新鲜度合同2026-11-11"></a>
+
+#### 15.9.5 单机共享根与本地双次新鲜度合同（2026-11-11）
+
+本 profile 仅适用于 Identity、TrustGraph 与 PolicyEngine 在同一受监督进程中共享唯一 `astral-authorization-root` owner、且所有影响授权的写者均受该 owner 写前门约束的单机部署。它不提供跨进程、多机、数据库回滚或恶意数据库管理员的分布式一致性保证，也不把本地 hash 称作 quorum proof。不能证明唯一 owner、写者覆盖或环境假设时不得采用该 profile；§§15.9.1–15.9.4 的分布式合同保持不变。当前该 profile 尚未实现或验收，登记设计不能开启生产 listener。
+
+- **完整根与安装**：关闭读门，从单一 MySQL InnoDB 一致性快照有界采集完整身份、双卡、租户、CARD 发布链及 grant、ORG、资源归属、资格、SoD 和限制性配置，校验字段、租户关系、来源、有效期、条件及 scope 覆盖；空集合只有在完整范围已证明时才可表示不存在，未加载、未覆盖和不可验证均为 PENDING。保留 canonical durable publication 及 source/audit correlation，不以 source 原始行、候选 hash 或 ACK 代替发布证明。对账 source、未决 operation、撤权、发布指针、资格、配置及必需 owner；从对账至原子安装持有有效写入和健康栅栏。变化或 UNKNOWN 时保持关闭并重建，不以不同 scope generation 的最大值冒充根版本。
+- **F0 与 F1**：正式请求开始时从同一 owner 捕获完整且已安装的不可变根，绑定进程实例、根安装序号、规范化完整内容 hash、scope 与 gate epoch；使用该根的数据经 `PolicyEngine.evaluate()` 评估。根 hash 使用有版本、域分离且确定性的完整编码，绑定参与授权的全部事实、字段、关系和 scope 覆盖；CARD 各 scope 的 V7 内容 hash、manifest/dependency、generation 和撤权身份仍按各自合同验证并绑定，不能以派生有效集代替完整内容。最终 ALLOW 提交点重新读取同一 owner 的门状态和根身份，要求实例、安装序号、内容 hash、适用 epoch 均一致，scope 仍完整、有效且开放、必需 health/ownership fence 未失效，否则 PENDING/DENY。两个观测是本地根新鲜度检查，不伪称独立 authority proof；在本 profile 的正式读取路径上不要求逐请求 authority F0/F1、ELIGIBILITY head SQL 双读或 SoD 策略 SQL 复读。已发布身份、资格及限制性事实须在完整根和写前门内得到等价覆盖，不能只省略原检查。内容 hash 不证明来源、完整性或写者覆盖；进程重启身份更换，同一进程内安装序号不得复用，溢出时关闭，以避免 ABA。逐 scope generation、根安装序号和 authority frontier 分属不同版本域。
+- **时间与线性化**：最终检查必须与影响该 scope 的写前关门在同一互斥或等价原子协议下线性化；关门之后不得提交依赖旧根的新 ALLOW。有效期、条件和限制性策略需以决策时可信时间及请求上下文判断；等待期间跨越有效窗口、时钟异常或无法证明结果仍有效时重新评估或拒绝，版本/hash 相等不能冻结时间。决策线性化不自动保护之后的业务写入；受保护业务副作用继续遵循与实际事务提交绑定的一次消费 admission/fence 合同。
+- **写入和恢复**：所有影响授权、资格、资源归属和限制性配置的 HTTP、后台、批量、仓储及数据库写者，在 source COMMIT 前关闭完整影响范围；不能证明范围时关闭全局。以数据库身份和权限限制绕过者，异步审计/检测只用于发现和恢复，不能消除提交至发现间的陈旧窗口。source 短事务、已有 reservation/admission-use、审计关联、已证明 COMMIT、WorkerOwned durable publication 或资格/配置独立完成均继续适用；新根完成对账和原子安装后才开门。缺失上下文时受影响范围关闭，由 manager 在受控重建阶段读取 MySQL、补齐并验证；正式请求不得通过 SQL miss 补查直接 ALLOW。取消、UNKNOWN、owner 失效或崩溃保持关闭，按稳定 operation 对账，重启冷加载并告警检查可能尚未生效的近期变更。
+- **资源与验证**：对输入、根及候选、旧读者、并发构建、读取/构建时间和进程总内存设置可执行上限；预算耗尽不得截断后当作完整根。Rust 测试覆盖完整性与已证明不存在、租户及时间边界、F0/F1 与写门竞态、全部写者覆盖、取消/UNKNOWN、重建、资源预算与崩溃恢复。真实 MySQL 快照和并发、旁路写限制、消息/worker 与部署恢复需独立证据；未验证不计 PASS。
 
 ## 16. 安全规范
 

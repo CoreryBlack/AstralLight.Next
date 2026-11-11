@@ -3,7 +3,7 @@
 //! 对齐 TrustGraph 的 `permission_check.rs` 模式。
 
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::StatusCode;
@@ -19,11 +19,7 @@ use astral_common::middleware::permission_check_shared::{
     PathResourceMap,
 };
 use astral_common::token_contract::PrincipalKind;
-use astral_db::{
-    check_sod_conflict_with_context, check_sod_conflict_with_context_and_org,
-    load_org_sod_admission_mirrored, resolve_resource_ownership, AuthorityReadFence,
-    SqlxRuleRepository,
-};
+use astral_db::AuthorityReadFence;
 
 use crate::AppState;
 
@@ -53,7 +49,7 @@ pub const IDENTITY_PATH_MAP: PathResourceMap = &[
 ];
 
 const IDENTITY_SKIP_PATHS: &[&str] = &[
-    // 认证入口（无 JWT 时可访问，路径已剥离 /api/v1/auth 前缀）
+    // 认证入口（无 JWT 时可访问，路径已剥离 /api/v1/auth 前缀）。
     "/sessions",
     "/sessions/refresh",
     "/sessions/switch-card",
@@ -61,13 +57,8 @@ const IDENTITY_SKIP_PATHS: &[&str] = &[
     "/sessions/revoke",
     "/register",
     "/password/forgot",
-    "/password/reset",
     "/verification/send",
     "/verification/verify",
-    // 自服务路径（仅需有效 JWT，不需要权限规则检查）
-    "/me",
-    "/providers",
-    "/sessions/switch-card",
 ];
 
 pub async fn identity_permission_middleware(
@@ -79,37 +70,12 @@ pub async fn identity_permission_middleware(
     let path = request_path.as_str();
     let method = req.method().clone();
 
-    if is_identity_skip_path(path) {
-        if is_credential_bootstrap_path(path) {
-            // Scope exception：bootstrap/公开路径无 policy 判定、无授权读取
-            // 依赖，不取宿主准入栅栏。
-            return Ok(next.run(req).await);
-        }
-        // 自服务严格校验（活动身份/卡上下文验证 = 权威读取）同样持宿主准入
-        // 栅栏：读取之前捕获，验证窗口之后复核漂移。
-        let admission_fence = capture_identity_admission_fence()?;
-        let ctx = physical_policy_context(
-            req.headers(),
-            "identity_users",
-            "read",
-            request_target_id(&req),
-        )
-        .map_err(|status| BoxedResponse::new(status.into_response()))?;
-        require_platform_user(&ctx)?;
-        verify_active_identity_context(&state, &ctx).await?;
-        if ctx.principal_kind.as_deref().and_then(PrincipalKind::parse)
-            == Some(PrincipalKind::PlatformUser)
-        {
-            verify_active_card_context(
-                &state,
-                ctx.card_id,
-                ctx.user_id,
-                ctx.tenant_id,
-                ctx.domain_id,
-            )
-            .await?;
-        }
-        verify_identity_admission_fence(admission_fence)?;
+    if matches!(
+        identity_skip_kind(method.as_str(), path),
+        Some(IdentitySkipKind::CredentialBootstrap)
+    ) {
+        // Scope exception：bootstrap/公开路径无 policy 判定、无授权读取
+        // 依赖，不取宿主准入栅栏。
         return Ok(next.run(req).await);
     }
 
@@ -134,7 +100,15 @@ pub async fn identity_permission_middleware(
 
     let action = match resolve_permission_action(resource, path, method.as_str()) {
         Some(action) => action,
-        None => return Ok(next.run(req).await),
+        None => {
+            return Err(BoxedResponse::new(
+                (
+                    StatusCode::FORBIDDEN,
+                    format!("No permission action mapping for identity route: {method} {path}"),
+                )
+                    .into_response(),
+            ));
+        }
     };
 
     // 宿主准入栅栏：在**一切权威读取之前**（ownership 解析、引擎评估、SoD
@@ -156,54 +130,29 @@ pub async fn identity_permission_middleware(
             .await
             .map_err(|status| BoxedResponse::new(status.into_response()))?,
     );
-    let resolution = resolve_resource_ownership(
-        &state.db,
-        resource,
-        path,
-        method.as_str(),
-        query_target_id,
-        ctx.card_id,
-        ctx.user_id,
-    )
-    .await;
+    let read_surface = astral_db::authorization_read_surface()
+        .ok_or_else(|| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+    // Request handle 绑定同一个 startup-frozen read surface；CertifiedMemory 请求在此
+    // 取得单次 token，Durable/Mirror 保持无 token 语义。
+    let request = read_surface
+        .begin_request()
+        .map_err(|_| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+    let resolution = request
+        .resolve_ownership(
+            resource,
+            path,
+            method.as_str(),
+            query_target_id,
+            ctx.card_id,
+            ctx.user_id,
+        )
+        .await;
     resolution.apply_to(&mut ctx);
     let user_id = ctx.user_id;
     let card_id = ctx.card_id;
     let tenant_id = ctx.tenant_id;
-    let resource_owner_id = ctx.resource_owner_id;
 
-    // 正式授权仓储必须携带启动期冻结的 ORG_SCOPE 旗标（default-off；与
-    // TrustGraph 共享同一严格解析器与默认关闭语义），避免同一受管租户在
-    // 不同宿主间出现 org_scope 准入 split-brain。绝不逐请求读 env。
-    //
-    // 单机内存镜像读面（default-off）：组合进程安装
-    // astral_db::memory_projection_hub 后命中镜像，pending/未预热回退 DB。
-    let evaluation = if astral_db::memory_mirror_is_installed() {
-        let repo = astral_db::MemoryMirroredRuleRepository::new(
-            SqlxRuleRepository::new(state.db.clone())
-                .with_org_scope_enabled(state.org_scope_enabled)
-                .with_authority_provider_opt(state.authorization_fence_provider.clone())
-                .with_authority_required(state.config.authority_runtime_mode.requires_authority()),
-        )
-        // Mirror hits are admissible only when the same configured trust-root
-        // verifier is present; otherwise this remains durable-only.
-        .with_authority_provider_opt(
-            state
-                .authorization_fence_provider
-                .clone()
-                .map(|provider| provider as Arc<dyn policy_engine::AuthorizationFenceProvider>),
-        )
-        // 镜像 miss 时回填 strict durable bundle（MySQL 直读），
-        // 与 hub strict_refill 契约一致；读取失败按既有 pending/DB 回退语义处理。
-        .with_durable_refill(state.db.clone());
-        state.engine.evaluate_with_admission(&ctx, &repo).await
-    } else {
-        let repo = SqlxRuleRepository::new(state.db.clone())
-            .with_org_scope_enabled(state.org_scope_enabled)
-            .with_authority_provider_opt(state.authorization_fence_provider.clone())
-            .with_authority_required(state.config.authority_runtime_mode.requires_authority());
-        state.engine.evaluate_with_admission(&ctx, &repo).await
-    };
+    let evaluation = request.evaluate_with_admission(&state.engine, &ctx).await;
     let (decision, authorization_admission) = evaluation.into_parts();
 
     // 权限决策审计（MQ-first，DB fallback；故障不影响权限决策）。
@@ -286,19 +235,7 @@ pub async fn identity_permission_middleware(
         // unavailable 分支，绝不把组织持有权限折算为空集。非 ORG 判定走
         // context-aware 纯 deny-only 入口（warm 态零 DB；durable 回退与既有
         // 纯 deny-only 检查同语义）。
-        let sod_result = match load_org_sod_admission_mirrored(&state.db, &ctx, &decision).await {
-            Ok(Some(admission)) => {
-                check_sod_conflict_with_context_and_org(
-                    &state.db,
-                    &ctx,
-                    &admission,
-                    resource_owner_id,
-                )
-                .await
-            }
-            Ok(None) => check_sod_conflict_with_context(&state.db, &ctx, resource_owner_id).await,
-            Err(error) => Err(error),
-        };
+        let sod_result = request.check_sod(&ctx, &decision).await;
         match sod_result {
             Ok(result) if result.has_conflict => {
                 tracing::warn!(
@@ -336,9 +273,15 @@ pub async fn identity_permission_middleware(
     // ownership 解析与 SoD 的全部读取窗口。栅栏漂移 → 503 安全 Pending
     // （可重试：重试请求以新基线重新捕获并重新评估）；只比较已捕获栅栏，
     // 绝不重采新 token 覆盖旧读，绝不折算成放行。
+    request
+        .ensure_current()
+        .map_err(|_| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
     verify_identity_admission_fence(admission_fence)?;
 
     let source_abort = if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        request
+            .ensure_mutation_commit_fence()
+            .map_err(|_| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
         let provider = state
             .authorization_fence_provider
             .as_ref()
@@ -354,6 +297,23 @@ pub async fn identity_permission_middleware(
     } else {
         None
     };
+    if let Some((provider, abort)) = &source_abort {
+        if request.ensure_current().is_err()
+            || verify_identity_admission_fence(admission_fence).is_err()
+        {
+            match provider.abort_source_reservation(abort).await {
+                Ok(report) => {
+                    tracing::warn!(operation_id = %abort.operation_id, reservation_id = %abort.reservation_id, proof_id = %abort.proof_id, outcome = ?report.outcome, "identity pre-handler fence changed; source abort result")
+                }
+                Err(error) => {
+                    tracing::warn!(operation_id = %abort.operation_id, reservation_id = %abort.reservation_id, proof_id = %abort.proof_id, %error, "identity pre-handler fence changed; source abort remains unknown")
+                }
+            }
+            return Err(BoxedResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            ));
+        }
+    }
     req.extensions_mut().insert(ctx);
     if let Some(authorization_admission) = authorization_admission {
         req.extensions_mut().insert(authorization_admission);
@@ -503,125 +463,51 @@ fn require_platform_user(ctx: &astral_types::PolicyContext) -> Result<(), BoxedR
     ))
 }
 
+fn identity_skip_kind(method: &str, path: &str) -> Option<IdentitySkipKind> {
+    is_credential_bootstrap_path(path)
+        .then_some(())
+        .and_then(|()| (method == "POST").then_some(IdentitySkipKind::CredentialBootstrap))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentitySkipKind {
+    CredentialBootstrap,
+}
+
 fn is_identity_skip_path(path: &str) -> bool {
-    IDENTITY_SKIP_PATHS.iter().any(|prefix| {
-        path == *prefix
-            || path
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.starts_with('/'))
-    })
+    IDENTITY_SKIP_PATHS.contains(&path)
+        || path
+            .strip_prefix("/password/reset/")
+            .is_some_and(|token| !token.is_empty() && !token.contains('/'))
 }
 
 fn is_credential_bootstrap_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/sessions"
-            | "/sessions/switch-card"
-            | "/sessions/refresh"
-            | "/sessions/logout"
-            | "/sessions/revoke"
-            | "/register"
-            | "/password/forgot"
-            | "/verification/send"
-            | "/verification/verify"
-    ) || path
-        .strip_prefix("/password/reset/")
-        .is_some_and(|token| !token.is_empty() && !token.contains('/'))
-}
-
-async fn verify_active_identity_context(
-    state: &AppState,
-    ctx: &astral_types::PolicyContext,
-) -> Result<(), BoxedResponse> {
-    let identity_card_id = ctx
-        .identity_card_id
-        .filter(|value| *value > 0)
-        .ok_or_else(|| card_context_error("IDENTITY_CARD_REQUIRED"))?;
-    let user_id = ctx
-        .user_id
-        .filter(|value| *value > 0)
-        .ok_or_else(|| card_context_error("CARD_CONTEXT_USER_REQUIRED"))?;
-    let row = sqlx::query_as::<_, (i64, i64, String)>(
-        "SELECT card_id, user_id, status FROM identity_card \
-         WHERE card_id = ? AND user_id = ? \
-           AND (expires_at IS NULL OR expires_at >= UTC_TIMESTAMP()) \
-         LIMIT 1",
-    )
-    .bind(identity_card_id)
-    .bind(user_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|_| card_context_error("IDENTITY_CARD_CONTEXT_UNAVAILABLE"))?
-    .ok_or_else(|| card_context_error("IDENTITY_CARD_CONTEXT_NOT_FOUND"))?;
-    if row.2 != "ACTIVE" {
-        return Err(card_context_error("IDENTITY_CARD_CONTEXT_INVALID"));
-    }
-    Ok(())
-}
-
-async fn verify_active_card_context(
-    state: &AppState,
-    card_id: Option<i64>,
-    user_id: Option<i64>,
-    tenant_id: Option<i64>,
-    domain_id: Option<i64>,
-) -> Result<(), BoxedResponse> {
-    let Some(card_id) = card_id.filter(|value| *value > 0) else {
-        return Ok(());
-    };
-    let user_id = user_id
-        .filter(|value| *value > 0)
-        .ok_or_else(|| card_context_error("CARD_CONTEXT_USER_REQUIRED"))?;
-    let card = state
-        .card_repository
-        .get_user_card(card_id)
-        .await
-        .map_err(|_| card_context_error("CARD_CONTEXT_UNAVAILABLE"))?
-        .ok_or_else(|| card_context_error("CARD_CONTEXT_NOT_FOUND"))?;
-    if card.user_id != Some(user_id) || card.card_status != "ACTIVE" {
-        return Err(card_context_error("CARD_CONTEXT_INVALID"));
-    }
-    if tenant_id.is_some() && card.tenant_id != tenant_id {
-        return Err(card_context_error("CARD_CONTEXT_TENANT_MISMATCH"));
-    }
-    if domain_id.is_some() && card.domain_id != domain_id {
-        return Err(card_context_error("CARD_CONTEXT_DOMAIN_MISMATCH"));
-    }
-    let now = time::OffsetDateTime::now_utc();
-    if let Some(valid_from) = card.valid_from.as_deref() {
-        let parsed =
-            time::OffsetDateTime::parse(valid_from, &time::format_description::well_known::Rfc3339)
-                .map_err(|_| card_context_error("CARD_CONTEXT_VALIDITY_UNAVAILABLE"))?;
-        if parsed > now {
-            return Err(card_context_error("CARD_CONTEXT_NOT_YET_VALID"));
-        }
-    }
-    if let Some(valid_until) = card.valid_until.as_deref() {
-        let parsed = time::OffsetDateTime::parse(
-            valid_until,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .map_err(|_| card_context_error("CARD_CONTEXT_VALIDITY_UNAVAILABLE"))?;
-        if parsed < now {
-            return Err(card_context_error("CARD_CONTEXT_EXPIRED"));
-        }
-    }
-    Ok(())
-}
-
-fn card_context_error(reason: &str) -> BoxedResponse {
-    BoxedResponse::new(
-        (
-            StatusCode::FORBIDDEN,
-            format!("Card context denied: {reason}"),
-        )
-            .into_response(),
-    )
+    is_identity_skip_path(path)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_credential_bootstrap_path, is_identity_skip_path};
+    use super::{
+        identity_skip_kind, is_credential_bootstrap_path, is_identity_skip_path, IdentitySkipKind,
+    };
+    use astral_common::middleware::permission_check_shared::resolve_permission_action;
+
+    #[test]
+    fn skip_routes_require_registered_methods() {
+        assert_eq!(
+            identity_skip_kind("POST", "/sessions"),
+            Some(IdentitySkipKind::CredentialBootstrap)
+        );
+        assert_eq!(
+            identity_skip_kind("POST", "/password/reset/token"),
+            Some(IdentitySkipKind::CredentialBootstrap)
+        );
+        assert_eq!(identity_skip_kind("OPTIONS", "/sessions"), None);
+        assert_eq!(identity_skip_kind("GET", "/sessions"), None);
+        assert_eq!(identity_skip_kind("POST", "/providers"), None);
+        assert_eq!(identity_skip_kind("GET", "/providers"), None);
+        assert_eq!(identity_skip_kind("GET", "/me"), None);
+    }
 
     #[test]
     fn management_paths_do_not_skip_permission_evaluation() {
@@ -639,22 +525,55 @@ mod tests {
     }
 
     #[test]
-    fn credential_bootstrap_uses_reset_token_segment_boundary() {
+    fn unknown_identity_action_is_not_a_handler_bypass() {
+        assert_eq!(
+            resolve_permission_action("identity_users", "/users/7/password", "OPTIONS"),
+            None
+        );
+        let source = include_str!("middleware.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let action_branch = production
+            .split("let action = match resolve_permission_action")
+            .nth(1)
+            .expect("identity middleware must resolve an action before evaluation");
+        let action_branch = action_branch
+            .split("// 宿主准入栅栏")
+            .next()
+            .expect("identity action branch must precede the admission fence");
+        assert!(
+            action_branch.contains("StatusCode::FORBIDDEN"),
+            "unknown identity actions must return a stable refusal"
+        );
+        assert!(
+            !action_branch.contains("next.run(req).await"),
+            "unknown identity actions must not reach a handler"
+        );
+    }
+
+    #[test]
+    fn credential_bootstrap_paths_are_exact_or_single_token() {
         assert!(is_credential_bootstrap_path("/password/reset/token"));
         assert!(!is_credential_bootstrap_path("/password/reset"));
         assert!(!is_credential_bootstrap_path("/password/reset-extra"));
         assert!(!is_credential_bootstrap_path("/password/reset/token/extra"));
+        assert!(!is_credential_bootstrap_path("/register/status"));
+        assert!(!is_credential_bootstrap_path("/sessions/refresh/extra"));
+        assert!(!is_credential_bootstrap_path("/verification/send/extra"));
         assert!(!is_credential_bootstrap_path("/mfa/status"));
         assert!(!is_identity_skip_path("/mfa/status"));
     }
 
-    /// 宿主 SoD 分发形状守卫（对齐 TrustGraph/sod_check 的源文本守卫惯例）：
-    /// ORG provenance 判定必须先经 context-aware mirrored 准入装配
-    /// （`load_org_sod_admission_mirrored`）再进入 `check_sod_conflict_with_org`
-    /// deny-only 复核；无 provenance 时走 context-aware 纯 deny-only 入口
-    /// （`check_sod_conflict_with_context`）；审计 detail 必须经 shared 有界
-    /// provenance helper 并通过显式 detail 审计入口传播。本地不得重新引入
-    /// 任何重复 helper 定义。
+    #[test]
+    fn self_service_routes_do_not_bypass_policy_evaluation() {
+        assert!(!is_identity_skip_path("/me"));
+        assert!(!is_identity_skip_path("/me/cards"));
+        assert!(!is_identity_skip_path("/me/permissions"));
+        assert!(!is_identity_skip_path("/me/cards/7"));
+        assert!(!is_identity_skip_path("/providers"));
+        assert!(!is_identity_skip_path("/providers/oidc"));
+    }
+
+    /// 所有受保护路径共用请求句柄，ownership、规则评估和 SoD 后复核栅栏。
     #[test]
     fn sod_dispatch_wires_org_provenance_to_fresh_admission_recheck() {
         let source = include_str!("middleware.rs");
@@ -663,49 +582,34 @@ mod tests {
             .find("capture_identity_admission_fence()")
             .expect("host must capture the opaque admission fence before authority reads");
         let ownership = production
-            .find("resolve_resource_ownership(")
-            .expect("management-route ownership resolution must exist");
-        let self_verify = production
-            .find("verify_active_identity_context(&state, &ctx)")
-            .expect("self-service strict context verification must exist");
+            .find(".resolve_ownership(")
+            .expect("protected routes must resolve ownership");
+        let evaluation = production
+            .find(".evaluate_with_admission(&state.engine, &ctx)")
+            .expect("protected routes must evaluate the policy");
+        assert!(fence_capture < ownership && ownership < evaluation);
+        let sod_dispatch = production
+            .find("request.check_sod(&ctx, &decision)")
+            .expect("protected routes must use the request-bound SoD check");
         assert!(
-            fence_capture < self_verify,
-            "self-service strict checks must run after the fence capture"
+            !production.contains("load_org_sod_admission_mirrored(")
+                && !production.contains("check_sod_conflict_with_context_and_org(")
+                && !production.contains("check_sod_conflict_with_context(&state.db"),
+            "host middleware must not bypass the frozen read surface with durable SoD helpers"
         );
-        // 管理路由路径同样在 ownership 之前捕获（共享 helper 的第二次调用）。
-        let management_capture = production[fence_capture + 1..]
-            .find("capture_identity_admission_fence()")
-            .map_or(production.len(), |index| fence_capture + 1 + index);
-        assert!(
-            management_capture < ownership,
-            "management-route authority reads must run after the fence capture"
-        );
-        let loader = production
-            .find("load_org_sod_admission_mirrored(&state.db, &ctx, &decision)")
-            .expect("org dispatch must assemble admission via the mirrored context-aware helper");
-        let with_org = production
-            .find("check_sod_conflict_with_context_and_org(")
-            .expect("org admission must recheck via the canonical context-aware and_org entry");
-        let plain = production
-            .find("check_sod_conflict_with_context(&state.db, &ctx, resource_owner_id)")
-            .expect("non-org decisions must keep the context-aware deny-only SoD check");
-        // 两条受保护路径各有终检（自服务严格校验 + 管理路由 SoD 之后）；
-        // 管理路由的终检必须在整个 SoD 窗口之后。
-        assert!(loader < with_org && with_org < plain);
-        let recheck_calls: Vec<usize> = production
-            .match_indices("verify_identity_admission_fence(admission_fence)")
-            .map(|(index, _)| index)
-            .collect();
-        assert_eq!(
-            recheck_calls.len(),
-            2,
-            "both protected paths (self-service strict checks and management routes) must recheck the fence"
-        );
-        let fence_recheck = recheck_calls[1];
-        assert!(
-            plain < fence_recheck,
-            "the management-route fence recheck must run after the whole SoD window, before admission"
-        );
+        assert!(evaluation < sod_dispatch);
+        let token_recheck = production
+            .find(".ensure_current()")
+            .expect("the request token must be rechecked before admission");
+        let fence_recheck = production
+            .find("verify_identity_admission_fence(admission_fence)")
+            .expect("the captured admission fence must be rechecked");
+        assert!(sod_dispatch < token_recheck && token_recheck < fence_recheck);
+        let mutation_gate = production.find(".ensure_mutation_commit_fence()").unwrap();
+        let reservation = production
+            .find(".reserve_mutation_with_abort(&ctx, admission)")
+            .unwrap();
+        assert!(mutation_gate < reservation);
         // hub 已安装而栅栏不可得（capture None）→ 立即 503 fail-closed；
         // 漂移分支同样 503 安全 Pending——绝不折算成放行。
         assert!(

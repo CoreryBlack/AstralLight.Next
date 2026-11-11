@@ -2,6 +2,7 @@
 members = [
     "policy-engine",
     "astral-types",
+    "astral-authorization-root",
     "astral-authority",
     "astral-common",
     "astral-db",

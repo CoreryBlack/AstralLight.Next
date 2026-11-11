@@ -56,6 +56,55 @@ async fn etcd_gateway_store_contract() {
     // Linearizable get of a missing key.
     assert!(store.get(&key).await.unwrap().is_none());
 
+    // Missing records cannot satisfy an existing-record guard, even when
+    // etcd's missing mod_revision is zero or the requested value is empty.
+    for guard in [
+        StoreOp::ReplaceIfRevision {
+            key: key.clone(),
+            expected_revision: 0,
+            value: b"must-not-create".to_vec(),
+        },
+        StoreOp::DeleteIfRevision {
+            key: key.clone(),
+            expected_revision: 0,
+        },
+        StoreOp::RequireRevision {
+            key: key.clone(),
+            expected_revision: 0,
+        },
+        StoreOp::RequireValue {
+            key: key.clone(),
+            value: Vec::new(),
+        },
+        StoreOp::ReplaceIfRevision {
+            key: key.clone(),
+            expected_revision: u64::MAX,
+            value: b"must-not-create".to_vec(),
+        },
+        StoreOp::DeleteIfRevision {
+            key: key.clone(),
+            expected_revision: u64::MAX,
+        },
+        StoreOp::RequireRevision {
+            key: key.clone(),
+            expected_revision: u64::MAX,
+        },
+    ] {
+        let result = store
+            .execute(StoreTxn::new().with_op(guard).with_op(StoreOp::Put {
+                key: second.clone(),
+                value: b"must-not-write".to_vec(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            astral_authority::store::StoreTxnOutcome::PreconditionFailed { .. }
+        ));
+        assert!(store.get(&key).await.unwrap().is_none());
+        assert!(store.get(&second).await.unwrap().is_none());
+    }
+
     // Put-if-absent wins exactly once.
     let first = store
         .execute(StoreTxn::new().with_op(StoreOp::PutIfAbsent {
@@ -159,6 +208,65 @@ async fn etcd_gateway_store_contract() {
         .unwrap();
     assert!(!reacquired, "second acquire must lose the CAS");
     assert!(store.lease_keep_alive(lease_id).await.unwrap());
+
+    // Revision guards compare only, including for a lease-backed record.
+    let leader_record = store.get(&leader_key).await.unwrap().unwrap();
+    let guarded_write = format!("astral-authority-integration/{run_id}/guarded-write");
+    let missing = format!("astral-authority-integration/{run_id}/missing");
+    for (guard_key, revision) in [
+        (leader_key.clone(), leader_record.revision + 1),
+        (missing.clone(), 0),
+        (missing, leader_record.revision),
+    ] {
+        let outcome = store
+            .execute(
+                StoreTxn::new()
+                    .with_op(StoreOp::Put {
+                        key: guarded_write.clone(),
+                        value: b"must-not-write".to_vec(),
+                    })
+                    .with_op(StoreOp::RequireRevision {
+                        key: guard_key,
+                        expected_revision: revision,
+                    }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            astral_authority::store::StoreTxnOutcome::PreconditionFailed { .. }
+        ));
+        assert!(store.get(&guarded_write).await.unwrap().is_none());
+        assert_eq!(
+            store.get(&leader_key).await.unwrap(),
+            Some(leader_record.clone())
+        );
+    }
+    let applied = store
+        .execute(
+            StoreTxn::new()
+                .with_op(StoreOp::RequireRevision {
+                    key: leader_key.clone(),
+                    expected_revision: leader_record.revision,
+                })
+                .with_op(StoreOp::Put {
+                    key: guarded_write.clone(),
+                    value: b"applied".to_vec(),
+                }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        applied,
+        astral_authority::store::StoreTxnOutcome::Applied { ref revisions } if revisions.len() == 1
+    ));
+    assert_eq!(store.get(&leader_key).await.unwrap(), Some(leader_record));
+    assert_eq!(
+        store.get(&guarded_write).await.unwrap().unwrap().value,
+        b"applied"
+    );
+    store.lease_revoke(lease_id).await.unwrap();
+    assert!(store.get(&leader_key).await.unwrap().is_none());
 
     // Cleanup: the test owns only its run-scoped keys and deletes them.
     for (key, record) in store

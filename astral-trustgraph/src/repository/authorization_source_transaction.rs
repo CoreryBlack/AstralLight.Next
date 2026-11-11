@@ -295,6 +295,157 @@ pub(crate) fn dispatch_proven_projection_deltas<D: ProjectionDeltaDispatcher>(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Source-owner completion staging/reconciliation seam.
+//
+// 此 seam 只做两件事：把 commit 证明后交回的 receipt 批次转换成稳定关联身份
+// （`CommittedBatchIdentity`），以及提供显式的 pending/unknown/reconciliation
+// staging 入口。它绝不把 dispatch admission、ACK、current pointer 或有界等待
+// 当作 family completion 证明；terminal completion 只能由
+// astral_db::orchestrate_family_completion 在独立验证 authority receipt 之后
+// 产生，再经 proof-only ledger writer 以 exact idempotency 落库。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Convert a committed receipt batch (released only after a PROVEN COMMIT)
+/// into the stable correlation identity consumed by
+/// `astral_db::orchestrate_family_completion`.
+///
+/// `commit_proven` is hardcoded `true` at this call boundary because the
+/// compiler-visible type `CommittedProjectionReceipts` only leaves
+/// `commit_consuming_with_dispatchers_and_receipts` on the proven-Ok path.
+/// The identity is correlation only — it never proves projection dispatch,
+/// ACK, current pointer, or family completion.
+///
+/// Seam status: the only approved caller is the reconciliation staging entry
+/// below. Wiring an eager production caller would require authority-client
+/// injection into runtime/service owners outside this seam's approved scope,
+/// so until that injection lands the seam stays deliberately unwired
+/// (`dead_code` allowed with this rationale, never removed silently).
+#[allow(dead_code)]
+pub(crate) fn committed_batch_identity_from_receipts(
+    receipts: &CommittedProjectionReceipts,
+) -> astral_db::CommittedBatchIdentity {
+    // A completion correlation must describe one source operation. Reusing the
+    // first value from a mixed batch would silently bind evidence from different
+    // mutations, so every operation-bearing receipt must agree exactly.
+    let operation_ids: Vec<&str> = receipts
+        .requests
+        .iter()
+        .map(|request| request.operation_id.as_str())
+        .chain(
+            receipts
+                .invalidation_receipts
+                .iter()
+                .map(|receipt| receipt.operation_id.as_str()),
+        )
+        .collect();
+    let Some(operation_id) = operation_ids.first().copied().filter(|value| {
+        !value.is_empty() && operation_ids.iter().all(|candidate| *candidate == *value)
+    }) else {
+        return astral_db::CommittedBatchIdentity::default();
+    };
+
+    // A delta batch may contain several projection rows, but this seam carries
+    // one event identity. Refuse multiple delta/source identities instead of
+    // selecting whichever row happens to be first. Invalidation-only identity
+    // is accepted only when a durable source projection receipt supplies it.
+    let event_ids: Vec<&str> = if receipts.requests.is_empty() {
+        receipts
+            .source_projection_receipts
+            .iter()
+            .map(|receipt| receipt.event_id.as_str())
+            .collect()
+    } else {
+        receipts
+            .requests
+            .iter()
+            .map(|request| request.event_id.as_str())
+            .collect()
+    };
+    let Some(event_id) = event_ids.first().copied().filter(|value| {
+        !value.is_empty() && event_ids.iter().all(|candidate| *candidate == *value)
+    }) else {
+        return astral_db::CommittedBatchIdentity::default();
+    };
+
+    let mut message_id: Option<&str> = None;
+    for receipt in &receipts.invalidation_receipts {
+        let envelope_message_id = receipt.envelope.message_id.as_str();
+        if receipt.event_id != envelope_message_id
+            || envelope_message_id.is_empty()
+            || receipt.envelope.operation_id != operation_id
+            || envelope_message_id != event_id
+        {
+            return astral_db::CommittedBatchIdentity::default();
+        }
+        if message_id.is_some_and(|existing| existing != envelope_message_id) {
+            return astral_db::CommittedBatchIdentity::default();
+        }
+        message_id = Some(envelope_message_id);
+    }
+
+    astral_db::CommittedBatchIdentity::from_committed_receipt_batch(
+        operation_id,
+        event_id,
+        message_id.unwrap_or_default(),
+        // COMMIT was proven: this function is only reachable with a batch
+        // returned from the proven-Ok commit path.
+        true,
+    )
+}
+
+/// The explicit reconciliation seam outcome for one committed batch.
+///
+/// This mirrors `astral_db::FamilyCompletionOrchestrationOutcome`'s
+/// non-positive boundaries on the source-transaction side: a committed batch
+/// without an independently verified authority receipt stays PENDING and must
+/// never be promoted to a terminal family completion by this layer.
+///
+/// Seam status: consumed by the staging entry below and its tests; a broader
+/// production consumer requires authority-client injection outside this
+/// seam's approved scope.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FamilyCompletionSeamOutcome {
+    /// The batch carries only proven-commit correlation identities; family
+    /// completion remains owned by reconciliation.
+    PendingReconciliation {
+        batch: astral_db::CommittedBatchIdentity,
+    },
+    /// Identity construction or receipt verification failed; nothing was
+    /// staged. The stable identities are returned for reconciliation.
+    Unknown {
+        batch: astral_db::CommittedBatchIdentity,
+    },
+}
+
+/// Stage one committed batch at the reconciliation seam WITHOUT an authority
+/// receipt producer.
+///
+/// This is the only safe production path today: no authority client surface
+/// can independently verify a family-completion receipt inside this crate, so
+/// the seam refuses to fabricate evidence and returns the batch as
+/// PENDING/Unknown for reconciliation. The durable proof-only ledger writer
+/// (`astral_db::record_independently_proven_family_completion_in_tx`) remains
+/// the only write path, and only for a terminal completion produced by
+/// `astral_db::orchestrate_family_completion` behind a verified receipt.
+///
+/// Seam status: deliberately unwired in production callers — wiring requires
+/// authority-client injection into runtime/service owners outside this seam's
+/// approved scope; tests exercise the exact contract until then.
+#[allow(dead_code)]
+pub(crate) fn stage_family_completion_for_reconciliation(
+    receipts: &CommittedProjectionReceipts,
+) -> FamilyCompletionSeamOutcome {
+    let batch = committed_batch_identity_from_receipts(receipts);
+    if batch.operation_id.is_empty() && batch.event_id.is_empty() {
+        // An empty correlation identity cannot be reconciled; report Unknown
+        // rather than inventing an identity.
+        return FamilyCompletionSeamOutcome::Unknown { batch };
+    }
+    FamilyCompletionSeamOutcome::PendingReconciliation { batch }
+}
+
 /// typed validation for a staged projection delta receipt.
 /// 与 `astral_db` append 路径的合同一致：稳定身份、正租户、严格递增版本、
 /// fence 不超过 source generation、非空 delta 载荷。staged request 必须已经
@@ -389,22 +540,38 @@ fn ensure_typed_source_receipt_capacity(total: usize) -> Result<(), AstralError>
 /// `None`，行为不变。
 pub(crate) type SourceTransactionActivityFence = Option<astral_db::SourceTransactionGuard>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemMutationOwner {
+    DelegationExpiry,
+    AuditLog,
+}
+
 /// Capability classification carried by mutation contexts.
 ///
 /// `UserPending` is retained only for legacy/unit context construction and is
 /// rejected before a user source transaction opens. It must never be treated
-/// as equivalent to a verified admission.
+/// as equivalent to a verified admission. System capability is restricted to
+/// named internal owners so an advisory decision cannot be turned into an
+/// unqualified source transaction by ordinary request code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum SourceMutationCapability {
     UserPending,
     User(AuthorizationAdmission),
-    System,
+    System(SystemMutationOwner),
 }
 
 impl SourceMutationCapability {
     pub(crate) fn user(admission: AuthorizationAdmission) -> Self {
         Self::User(admission)
+    }
+
+    pub(crate) fn system_for_delegation_expiry() -> Self {
+        Self::System(SystemMutationOwner::DelegationExpiry)
+    }
+
+    pub(crate) fn system_for_audit_log() -> Self {
+        Self::System(SystemMutationOwner::AuditLog)
     }
 }
 
@@ -417,7 +584,7 @@ pub(crate) async fn begin_source_transaction_with_capability(
         SourceMutationCapability::User(admission) => {
             AuthorizationSourceTransaction::begin_with_admission(pool, admission.clone()).await
         }
-        SourceMutationCapability::System => AuthorizationSourceTransaction::begin(pool).await,
+        SourceMutationCapability::System(_) => AuthorizationSourceTransaction::begin(pool).await,
         SourceMutationCapability::UserPending => Err(AstralError::Pending(
             "authorization admission is required for user source mutation".into(),
         )),
@@ -445,7 +612,7 @@ pub(crate) async fn begin_source_transaction_with_capability_and_delivery_contex
             )
             .await
         }
-        SourceMutationCapability::System => {
+        SourceMutationCapability::System(_) => {
             AuthorizationSourceTransaction::begin_with_delivery_context(pool, delivery_context)
                 .await
         }
@@ -481,7 +648,7 @@ pub(crate) async fn begin_source_transaction_with_capability_and_optional_delive
                 "user source mutation requires an injected immutable invalidation delivery context"
                     .into(),
             )),
-            SourceMutationCapability::System => {
+            SourceMutationCapability::System(_) => {
                 begin_source_transaction_with_capability(pool, capability).await
             }
             SourceMutationCapability::UserPending => Err(AstralError::Pending(
@@ -1698,6 +1865,192 @@ mod tests {
         assert!(
             handed.is_empty(),
             "commit unknown: no projection delta may fire"
+        );
+    }
+
+    // ── source-owner completion staging/reconciliation seam（纯逻辑测试）──
+
+    #[test]
+    fn committed_batch_identity_carries_stable_frozen_identities() {
+        let receipts = CommittedProjectionReceipts {
+            requests: vec![delta_request("d-1", 1)],
+            source_projection_receipts: vec![SourceProjectionReceipt {
+                event_id: "src-event-1".into(),
+                aggregate_type: ProjectionAggregate::CARD.to_owned(),
+                aggregate_id: 42,
+                tenant_id: Some(7),
+                source_generation: 11,
+                revoke_fence: 0,
+            }],
+            invalidation_receipts: vec![],
+        };
+        let batch = committed_batch_identity_from_receipts(&receipts);
+        assert!(
+            batch.commit_proven,
+            "this conversion only runs on the proven-Ok commit path"
+        );
+        assert_eq!(batch.operation_id, OPERATION);
+        assert_eq!(batch.event_id, "d-1");
+        assert!(
+            batch.message_id.is_empty(),
+            "no invalidation staged: no message id is invented"
+        );
+    }
+
+    #[test]
+    fn committed_batch_identity_prefers_first_source_identity_when_no_deltas() {
+        // Build the invalidation receipt from the SAME frozen projection event
+        // id as the staged source receipt: the message id equals the
+        // projection event id by envelope construction contract.
+        let (_, envelope) =
+            eligibility_invalidation_envelope(42, OPERATION, "src-event-1", "city-a")
+                .expect("valid eligibility invalidation envelope");
+        let receipts = CommittedProjectionReceipts {
+            requests: vec![],
+            source_projection_receipts: vec![SourceProjectionReceipt {
+                event_id: "src-event-1".into(),
+                aggregate_type: ProjectionAggregate::CARD.to_owned(),
+                aggregate_id: 42,
+                tenant_id: Some(7),
+                source_generation: 11,
+                revoke_fence: 0,
+            }],
+            invalidation_receipts: vec![InvalidationReceipt {
+                event_id: envelope.message_id.clone(),
+                operation_id: envelope.operation_id.clone(),
+                envelope,
+            }],
+        };
+        let batch = committed_batch_identity_from_receipts(&receipts);
+        assert_eq!(batch.event_id, "src-event-1");
+        assert_eq!(
+            batch.message_id, "src-event-1",
+            "the invalidation message id is the same projection event id by contract"
+        );
+    }
+
+    #[test]
+    fn committed_batch_identity_rejects_mixed_operation_identities() {
+        let mut second = delta_request("d-2", 2);
+        second.operation_id = "different-operation".into();
+        let receipts = CommittedProjectionReceipts {
+            requests: vec![delta_request("d-1", 1), second],
+            source_projection_receipts: vec![],
+            invalidation_receipts: vec![],
+        };
+        assert_eq!(
+            committed_batch_identity_from_receipts(&receipts),
+            astral_db::CommittedBatchIdentity::default(),
+            "mixed source operations must remain unknown"
+        );
+    }
+
+    #[test]
+    fn committed_batch_identity_rejects_multiple_event_identities() {
+        let receipts = CommittedProjectionReceipts {
+            requests: vec![delta_request("d-1", 1), delta_request("d-2", 2)],
+            source_projection_receipts: vec![],
+            invalidation_receipts: vec![],
+        };
+        assert_eq!(
+            committed_batch_identity_from_receipts(&receipts),
+            astral_db::CommittedBatchIdentity::default(),
+            "a correlation seam must not select the first event from a multi-event batch"
+        );
+    }
+
+    #[test]
+    fn committed_batch_identity_rejects_invalidation_identity_drift() {
+        let mut invalidation = eligibility_receipt(42);
+        invalidation.envelope.operation_id = "different-operation".into();
+        let receipts = CommittedProjectionReceipts {
+            requests: vec![delta_request("elig-proj-event-1", 1)],
+            source_projection_receipts: vec![],
+            invalidation_receipts: vec![invalidation],
+        };
+        assert_eq!(
+            committed_batch_identity_from_receipts(&receipts),
+            astral_db::CommittedBatchIdentity::default(),
+            "invalidation drift must not be promoted to a reconciliable identity"
+        );
+    }
+
+    #[test]
+    fn committed_batch_identity_rejects_operationless_batches() {
+        let receipts = CommittedProjectionReceipts {
+            requests: vec![],
+            source_projection_receipts: vec![SourceProjectionReceipt {
+                event_id: "source-event".into(),
+                aggregate_type: ProjectionAggregate::CARD.to_owned(),
+                aggregate_id: 42,
+                tenant_id: Some(7),
+                source_generation: 11,
+                revoke_fence: 0,
+            }],
+            invalidation_receipts: vec![],
+        };
+        assert_eq!(
+            committed_batch_identity_from_receipts(&receipts),
+            astral_db::CommittedBatchIdentity::default(),
+            "a source event without a durable operation identity is unknown"
+        );
+    }
+
+    #[test]
+    fn seam_stages_a_committed_batch_as_pending_reconciliation() {
+        let receipts = CommittedProjectionReceipts {
+            requests: vec![delta_request("d-1", 1)],
+            source_projection_receipts: vec![],
+            invalidation_receipts: vec![],
+        };
+        match stage_family_completion_for_reconciliation(&receipts) {
+            FamilyCompletionSeamOutcome::PendingReconciliation { batch } => {
+                assert!(batch.commit_proven);
+                assert_eq!(batch.operation_id, OPERATION);
+                assert_eq!(batch.event_id, "d-1");
+            }
+            other => panic!("a committed batch stays reconcilable: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seam_refuses_to_invent_identities_for_an_empty_batch() {
+        let receipts = CommittedProjectionReceipts::default();
+        match stage_family_completion_for_reconciliation(&receipts) {
+            FamilyCompletionSeamOutcome::Unknown { batch } => {
+                assert!(batch.operation_id.is_empty() && batch.event_id.is_empty());
+            }
+            other => panic!("an empty batch must not produce a reconcilable identity: {other:?}"),
+        }
+    }
+
+    /// include_str! 结构断言：seam 只把批次转换成关联身份并显式 pending/unknown，
+    /// 绝不在 trustgraph 侧构造 terminal family completion 或持久化 PROVEN 行。
+    #[test]
+    fn seam_never_constructs_terminal_family_completion_in_this_crate() {
+        let source = include_str!("authorization_source_transaction.rs");
+        let seam_start = source
+            .find("Source-owner completion staging/reconciliation seam")
+            .expect("the seam section must exist");
+        let seam_end = source[seam_start..]
+            .find("fn validate_projection_receipt")
+            .expect("the seam section must end before the delta validator");
+        let seam = &source[seam_start..seam_start + seam_end];
+        assert!(
+            !seam.contains("AuthorityFamilyCompletionState::Complete"),
+            "the source transaction seam must never mint a terminal completion state"
+        );
+        assert!(
+            !seam.contains("record_proven_certified_memory_completion_in_tx"),
+            "the proof-only writer must not be called from this seam without a verified receipt"
+        );
+        assert!(
+            seam.contains("PendingReconciliation"),
+            "the seam must expose an explicit pending/reconciliation boundary"
+        );
+        assert!(
+            seam.contains("commit_proven"),
+            "the seam identity must carry the proven-commit flag explicitly"
         );
     }
 

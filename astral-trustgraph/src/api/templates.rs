@@ -95,11 +95,15 @@ fn parse_template_rules(req: &serde_json::Value) -> Result<Vec<TemplateRuleInput
                     )))
                 })?;
             // fail-closed：模板规则是 RuleSet 条目的 source 定义，同样是 canonical
-            // grant —— 只接受 ALLOW（大小写归一），缺省视为 ALLOW。
+            // grant —— 必须显式提供 ALLOW（大小写归一），缺省拒绝。
             let effect_input = object
                 .get("effect")
                 .and_then(|value| value.as_str())
-                .unwrap_or("ALLOW");
+                .ok_or_else(|| {
+                    AppError(AstralError::Validation(format!(
+                        "rules[{index}].effect must be explicitly ALLOW"
+                    )))
+                })?;
             let effect = crate::service::validate_canonical_grant_effect(effect_input)?;
             Ok(TemplateRuleInput {
                 effect,
@@ -316,9 +320,14 @@ async fn create_template_rule(
     require_template_admin(&state, &headers).await?;
     validate_template_id(&id)?;
     parse_template_numeric_id(&id)?;
-    // fail-closed：canonical 模板规则只接受 ALLOW（大小写归一后写入 source）
-    let effect =
-        crate::service::validate_canonical_grant_effect(req.effect.as_deref().unwrap_or("ALLOW"))?;
+    // fail-closed：canonical 模板规则必须显式提供 ALLOW（大小写归一后写入 source）。
+    let effect = crate::service::validate_canonical_grant_effect(
+        req.effect.as_deref().ok_or_else(|| {
+            AppError(AstralError::Validation(
+                "template rule effect must be explicitly ALLOW".into(),
+            ))
+        })?,
+    )?;
     let context = mutation_context(&headers, admission)?;
     let rule_id = state
         .template_repository
@@ -527,8 +536,8 @@ mod tests {
     fn malformed_template_rules_are_rejected_instead_of_dropped() {
         let request = serde_json::json!({
             "rules": [
-                {"resource": "permission_rule", "action": "read"},
-                {"resource": "permission_rule"}
+                {"resource": "permission_rule", "action": "read", "effect": "ALLOW"},
+                {"resource": "permission_rule", "effect": "ALLOW"}
             ]
         });
         let error = parse_template_rules(&request).unwrap_err();
@@ -549,11 +558,10 @@ mod tests {
 
     #[test]
     fn template_rule_effect_is_allow_only() {
-        // 缺省 effect 视为 ALLOW
         let rules = parse_template_rules(&serde_json::json!({
-            "rules": [{"resource": "permission_rule", "action": "read"}]
+            "rules": [{"resource": "permission_rule", "action": "read", "effect": "ALLOW"}]
         }))
-        .expect("missing effect defaults to ALLOW");
+        .expect("explicit ALLOW must be accepted");
         assert_eq!(rules[0].effect, "ALLOW");
 
         // 大小写/空白归一后写入 canonical ALLOW

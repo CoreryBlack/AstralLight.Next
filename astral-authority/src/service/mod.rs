@@ -27,7 +27,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use astral_types::{
-    AuthorityCallerIdentity, AuthorityCertifyRequest, AuthorityCertifyResponse,
+    AuthorityCallerIdentity, AuthorityCertifiedMemoryRoot,
+    AuthorityCertifiedMemoryRootInstallRequest, AuthorityCertifiedMemoryRootReadRequest,
+    AuthorityCertifiedMemoryRootResponse, AuthorityCertifyRequest, AuthorityCertifyResponse,
     AuthorityCloseReservationRequest, AuthorityCloseReservationResponse, AuthorityCommitRequest,
     AuthorityCommitResponse, AuthorityExpectedFrontier, AuthorityFenceReadRequest,
     AuthorityFenceReadResponse, AuthorityIntentAcceptance, AuthorityManifestIdentity,
@@ -52,6 +54,7 @@ mod certificate_records;
 mod config_completion;
 mod coverage;
 mod eligibility_completion;
+mod family_completion;
 mod historical_frontier;
 /// Durable leadership fence (lease-backed leader key + exact token compare).
 /// See [`leadership`] for the §15.9.1 contract and the only safe install path.
@@ -118,6 +121,22 @@ pub struct StoredScopeCurrent {
     pub certificate_id: String,
     pub key_epoch: u64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredCertifiedMemoryRootOperation {
+    operation_id: String,
+    proposal_digest: String,
+    root_id: String,
+    root_digest: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredCertifiedMemoryRootPointer {
+    root_id: String,
+    root_digest: String,
+    operation_id: String,
+    updated_at: i64,
 }
 
 /// Verified authority state returned by one linearizable pass.
@@ -539,6 +558,371 @@ impl AuthorityService {
         self.verify_signing_frontier(&attestation.global_frontier)
             .await?;
         Ok(attestation)
+    }
+
+    // A family bundle does not yet prove that the root snapshot covers the
+    // exact immutable publication history for every affected scope.
+    fn certified_memory_publication_proof_available() -> bool {
+        false
+    }
+
+    fn require_certified_memory_publication_proof() -> Result<(), AuthorityServiceError> {
+        if !Self::certified_memory_publication_proof_available() {
+            return Err(AuthorityServiceError::Protocol(
+                AuthorityProtocolError::NotFound {
+                    record: "certified_memory_publication_proof",
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Install one complete authority-owned certified-memory root. The source
+    /// proposal is never signed directly: the authority re-checks the durable
+    /// reservation and commit binding, derives the root id/frontier, then
+    /// persists root, operation idempotency, pointer, and frontier in one CAS.
+    pub async fn install_certified_memory_root(
+        &self,
+        request: &AuthorityCertifiedMemoryRootInstallRequest,
+    ) -> Result<AuthorityCertifiedMemoryRootResponse, AuthorityServiceError> {
+        self.authorize(&request.caller, "install_certified_memory")?;
+        request
+            .validate()
+            .map_err(AuthorityServiceError::Protocol)?;
+        let proof =
+            request
+                .proposal
+                .publication_proof
+                .as_ref()
+                .ok_or(AuthorityServiceError::Protocol(
+                    AuthorityProtocolError::NotFound {
+                        record: "certified_memory_publication_proof",
+                    },
+                ))?;
+        Self::require_certified_memory_publication_proof()?;
+        let state = self.load_verified_state().await?;
+        let publication_snapshot =
+            certificate_records::verify_certified_memory_publication_snapshot(
+                self.store.as_ref(),
+                &self.keys,
+                &state,
+                &request.proposal,
+                proof,
+            )
+            .await?;
+        if request.proposal.authority_id != self.config.identity.authority_id {
+            return Err(AuthorityServiceError::Protocol(
+                AuthorityProtocolError::CallerIdentityMismatch,
+            ));
+        }
+        self.require_leader()?;
+        let now = now_unix();
+        if now < request.proposal.not_before || now >= request.proposal.expires_at {
+            return Err(AuthorityServiceError::Protocol(
+                AuthorityProtocolError::NotCurrentlyValid,
+            ));
+        }
+        let proposal_digest = request
+            .proposal
+            .proposal_digest()
+            .map_err(AuthorityServiceError::Protocol)?;
+        let state = self.load_verified_state().await?;
+        self.require_active_signer(&state)?;
+
+        // Stable operation idempotency is checked before any new root is
+        // derived. A conflicting payload for the same operation is refused.
+        if let Some(record) = self
+            .store
+            .get(
+                &self
+                    .keys
+                    .certified_memory_root_operation(&request.proposal.operation_id),
+            )
+            .await?
+        {
+            let operation: StoredCertifiedMemoryRootOperation =
+                decode(&record.value, "certified memory root operation")?;
+            if operation.operation_id != request.proposal.operation_id
+                || operation.proposal_digest != proposal_digest
+            {
+                return Err(AuthorityServiceError::Protocol(
+                    AuthorityProtocolError::DigestMismatch {
+                        field: "operation_proposal",
+                    },
+                ));
+            }
+            let root_record = self
+                .store
+                .get(&self.keys.certified_memory_root(&operation.root_id))
+                .await?
+                .ok_or_else(|| {
+                    AuthorityServiceError::Store(AuthorityStoreError::Corrupt(
+                        "certified memory root idempotency record has no root".to_owned(),
+                    ))
+                })?;
+            let root: AuthorityCertifiedMemoryRoot =
+                decode(&root_record.value, "certified memory root")?;
+            certificate_records::verify_certified_memory_root(
+                &state,
+                &operation.root_id,
+                &operation.root_digest,
+                &root,
+                now,
+            )?;
+            return Ok(AuthorityCertifiedMemoryRootResponse {
+                root,
+                global_frontier: state.frontier,
+                read_gate: self.evaluate_read_gate().await?,
+            });
+        }
+
+        let reservation_record = self
+            .store
+            .get(&self.keys.reservation(&request.proposal.reservation_id))
+            .await?
+            .ok_or(AuthorityServiceError::Protocol(
+                AuthorityProtocolError::NotFound {
+                    record: "reservation",
+                },
+            ))?;
+        let reservation: AuthorityScopeReservation =
+            decode(&reservation_record.value, "reservation")?;
+        reservation
+            .validate()
+            .map_err(AuthorityServiceError::Protocol)?;
+        if reservation.state != AuthorityReservationState::Certified
+            || reservation.intent.service_id != request.caller.service_id
+            || reservation.intent.operation_id != request.proposal.operation_id
+            || reservation.intent.event_id != request.proposal.event_id
+            || reservation.source_commit_digest.as_deref()
+                != Some(request.proposal.source_commit_digest.as_str())
+            || reservation.source_outcome_digest.as_deref()
+                != Some(request.proposal.source_outcome_digest.as_str())
+        {
+            return Err(AuthorityServiceError::Protocol(
+                AuthorityProtocolError::StateConflict {
+                    record: "reservation",
+                    state: reservation.state.as_text().to_owned(),
+                },
+            ));
+        }
+        self.verify_family_aggregate_for_root(&reservation, &request.proposal, &state)
+            .await?;
+
+        let binding_record = self
+            .store
+            .get(&self.keys.commit_binding(&reservation.reservation_id))
+            .await?
+            .ok_or_else(|| {
+                AuthorityServiceError::Store(AuthorityStoreError::Corrupt(
+                    "certified memory root source binding is missing".to_owned(),
+                ))
+            })?;
+        let binding: astral_types::AuthorityCommitBinding =
+            decode(&binding_record.value, "source commit binding")?;
+        binding
+            .validate()
+            .map_err(AuthorityServiceError::Protocol)?;
+        if binding.reservation_id != reservation.reservation_id
+            || binding.operation_id != request.proposal.operation_id
+            || binding.event_id != request.proposal.event_id
+            || binding.source_commit_digest != request.proposal.source_commit_digest
+            || binding.source_outcome_digest != request.proposal.source_outcome_digest
+        {
+            return Err(AuthorityServiceError::Protocol(
+                AuthorityProtocolError::ScopeMismatch,
+            ));
+        }
+
+        let current_record = self
+            .store
+            .get(&self.keys.certified_memory_root_current())
+            .await?;
+        let parent_root_digest = match &current_record {
+            Some(record) => {
+                let pointer: StoredCertifiedMemoryRootPointer =
+                    decode(&record.value, "certified memory root pointer")?;
+                let root_record = self
+                    .store
+                    .get(&self.keys.certified_memory_root(&pointer.root_id))
+                    .await?
+                    .ok_or_else(|| {
+                        AuthorityServiceError::Store(AuthorityStoreError::Corrupt(
+                            "certified memory root pointer target is missing".to_owned(),
+                        ))
+                    })?;
+                let root: AuthorityCertifiedMemoryRoot =
+                    decode(&root_record.value, "certified memory root")?;
+                certificate_records::verify_certified_memory_root(
+                    &state,
+                    &pointer.root_id,
+                    &pointer.root_digest,
+                    &root,
+                    now,
+                )?;
+                if request.proposal.parent_root_digest.as_deref()
+                    != Some(pointer.root_digest.as_str())
+                {
+                    return Err(AuthorityServiceError::Protocol(
+                        AuthorityProtocolError::FrontierDiverged,
+                    ));
+                }
+                Some(pointer.root_digest)
+            }
+            None => {
+                if request.proposal.parent_root_digest.is_some() {
+                    return Err(AuthorityServiceError::Protocol(
+                        AuthorityProtocolError::FrontierDiverged,
+                    ));
+                }
+                None
+            }
+        };
+
+        let next_frontier = state
+            .frontier
+            .advance(&request.proposal.operation_id, &proposal_digest, now)
+            .map_err(AuthorityServiceError::Protocol)?;
+        let expires_at = request.proposal.expires_at.min(now.saturating_add(3_600));
+        let mut root = AuthorityCertifiedMemoryRoot {
+            protocol_version: request.proposal.protocol_version,
+            authorization_edition: request.proposal.authorization_edition,
+            authority_id: self.config.identity.authority_id.clone(),
+            authority_term: next_frontier.authority_term,
+            global_fence_sequence: next_frontier.global_fence_sequence,
+            root_id: fresh_id("cmr"),
+            reservation_id: request.proposal.reservation_id.clone(),
+            operation_id: request.proposal.operation_id.clone(),
+            event_id: request.proposal.event_id.clone(),
+            source_commit_digest: request.proposal.source_commit_digest.clone(),
+            source_outcome_digest: request.proposal.source_outcome_digest.clone(),
+            family_bundle_digest: request.proposal.family_bundle_digest.clone(),
+            snapshot_hash: request.proposal.snapshot_hash.clone(),
+            scope_generation: request.proposal.scope_generation,
+            revoke_watermark: request.proposal.revoke_watermark,
+            parent_root_digest,
+            coverage: request.proposal.coverage.clone(),
+            key_id: self.signer.key_id().to_owned(),
+            key_epoch: self.signer.key_epoch(),
+            issued_at: now,
+            not_before: now,
+            expires_at,
+            root_digest: String::new(),
+            signature: String::new(),
+        };
+        root.root_digest = root
+            .recompute_root_digest()
+            .map_err(AuthorityServiceError::Protocol)?;
+        let signing_bytes = root
+            .signing_bytes()
+            .map_err(AuthorityServiceError::Protocol)?;
+        root.signature = self.signer.sign_checked(&signing_bytes, true)?;
+        root.validate().map_err(AuthorityServiceError::Protocol)?;
+        let operation = StoredCertifiedMemoryRootOperation {
+            operation_id: request.proposal.operation_id.clone(),
+            proposal_digest,
+            root_id: root.root_id.clone(),
+            root_digest: root.root_digest.clone(),
+        };
+        let pointer = StoredCertifiedMemoryRootPointer {
+            root_id: root.root_id.clone(),
+            root_digest: root.root_digest.clone(),
+            operation_id: root.operation_id.clone(),
+            updated_at: now,
+        };
+        let mut txn = StoreTxn::new()
+            .with_op(StoreOp::PutIfAbsent {
+                key: self.keys.certified_memory_root(&root.root_id),
+                value: encode(&root)?,
+            })
+            .with_op(StoreOp::PutIfAbsent {
+                key: self
+                    .keys
+                    .certified_memory_root_operation(&root.operation_id),
+                value: encode(&operation)?,
+            })
+            .with_op(StoreOp::ReplaceIfRevision {
+                key: self.keys.frontier(),
+                expected_revision: state.frontier_revision,
+                value: encode(&next_frontier)?,
+            });
+        let pointer_op = match current_record {
+            Some(record) => StoreOp::ReplaceIfRevision {
+                key: self.keys.certified_memory_root_current(),
+                expected_revision: record.revision,
+                value: encode(&pointer)?,
+            },
+            None => StoreOp::PutIfAbsent {
+                key: self.keys.certified_memory_root_current(),
+                value: encode(&pointer)?,
+            },
+        };
+        txn = publication_snapshot.fence_observed_records(
+            txn.with_op(pointer_op)
+                .with_op(self.bump_gate_epoch_op(&state)?),
+        );
+        let outcome = self
+            .execute_leader_txn(txn)
+            .await
+            .map_err(|error| self.map_store_error(error, &root.operation_id))?;
+        match outcome {
+            StoreTxnOutcome::Applied { .. } => Ok(AuthorityCertifiedMemoryRootResponse {
+                root,
+                global_frontier: next_frontier,
+                read_gate: self.evaluate_read_gate().await?,
+            }),
+            StoreTxnOutcome::PreconditionFailed { key } => Err(AuthorityServiceError::Store(
+                AuthorityStoreError::PreconditionFailed { key },
+            )),
+        }
+    }
+
+    /// Read the authority-owned current certified-memory root. Pointer bytes,
+    /// immutable record, signature, digest, frontier and read gate are all
+    /// verified before a positive response is returned.
+    pub async fn read_certified_memory_root(
+        &self,
+        request: &AuthorityCertifiedMemoryRootReadRequest,
+    ) -> Result<AuthorityCertifiedMemoryRootResponse, AuthorityServiceError> {
+        self.authorize(&request.caller, "read_certified_memory")?;
+        request
+            .validate()
+            .map_err(AuthorityServiceError::Protocol)?;
+        Self::require_certified_memory_publication_proof()?;
+        let state = self.load_verified_state().await?;
+        let root = certificate_records::load_verified_certified_memory_root(
+            self.store.as_ref(),
+            &self.keys,
+            &state,
+            now_unix(),
+        )
+        .await?;
+        if request
+            .expected_root_digest
+            .as_deref()
+            .is_some_and(|expected| expected != root.root_digest)
+        {
+            return Err(AuthorityServiceError::Protocol(
+                AuthorityProtocolError::FrontierDiverged,
+            ));
+        }
+        let read_gate = self.evaluate_read_gate().await?;
+        if !read_gate.positive_reads_allowed {
+            return Err(AuthorityServiceError::Protocol(
+                AuthorityProtocolError::ReadsBlocked {
+                    reservation_id: read_gate
+                        .blocking_reservations
+                        .first()
+                        .map(|summary| summary.reservation_id.clone())
+                        .unwrap_or_default(),
+                },
+            ));
+        }
+        Ok(AuthorityCertifiedMemoryRootResponse {
+            root,
+            global_frontier: state.frontier,
+            read_gate,
+        })
     }
 
     /// Linearizable fence read. Never advances the frontier.

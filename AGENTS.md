@@ -176,10 +176,10 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 - `identity_card` 表示认证身份，每人一张；`user_card` 表示授权载体，每人可多张。两者不得混用，权限不得从旧角色映射旁路取得。
 - 所有有效授权读取和写入都必须带租户边界；跨租户数据、缓存键、projection 和审计关联不得相互污染。
 - **凡影响有效授权或资格的 source mutation**，必须按 aggregate contract 进入 durable source/evidence path；canonical 授权发布以 grant revision/delta、manifest/segment 与 current pointer 证明。保留的 head/outbox 只承担 source correlation、revoke / RuleSet 初始化关联及 ELIGIBILITY L1 资格缓存失效等已登记职责，不代表授权发布完成，也不意味着本次变更删除表。
-- source transaction 只覆盖必要的 source、durable correlation/outbox 和 audit correlation 写入；不得把网络、MQ、缓存操作、快照构建、重试、安装或验收放进事务。提交后由 projector/worker 处理 durable projection、进程内缓存失效、消息和审计。缓存有界 TTL/容量；缓存失败、过期或不一致不得绕过 strict DB read gate。
+- source transaction 只覆盖必要的 source、durable correlation/outbox 和 audit correlation 写入；不得把网络、MQ、缓存操作、快照构建、重试、安装或验收放进事务。提交后由 projector/worker 处理 durable projection、进程内缓存失效、消息和审计。缓存有界 TTL/容量；缓存失败、过期或不一致不得绕过适用的 strict read gate，单机共享根按 §15.9.5 使用本地门禁。
 - `CARD` refresh 与 `ELIGIBILITY` cache eviction 是不同语义，必须分别记录、分别失效和分别验证，不得用一个事件代替另一个。
 - 正式授权路径必须同时满足 generation、dependency、`READY` 和 read-gate；任一不足、unknown、failed 或 stale 时只能 `PENDING`/`DENY`，禁止使用旧快照、source/raw 读取或缓存回退放行，不得以 ACK 代替 durable proof。
-- V7 authority 合同以 [Rust 规范 §15.9](Docs/规范/Rust后端编码规范_V1.0.md#159-v7-authority-生产协议与采用合同2026-11-07) 为准：全局 quorum、逐 scope 证书和每次 F0/F1 proof 分开；业务数据库不得独立发号，敏感 source 提交要求全局 reservation 与同事务 durable admission-use。未决提交不能因 lease 过期而重放或恢复 ALLOW；资格/配置的独立完成与已证明 rollback 的 abort 必须遵循该节的精确 durable 证据、同事务排他及历史 receipt 恢复合同，不以伪造 delta、旧 snapshot 或 HTTP 状态关闭 barrier；规范登记不代表实现或环境验收已通过。
+- V7 authority 合同以 [Rust 规范 §15.9](Docs/规范/Rust后端编码规范_V1.0.md#159-v7-authority-生产协议与采用合同2026-11-07) 为准：分布式 profile 区分全局 quorum、逐 scope 证书和每次 F0/F1 proof；满足 §15.9.5 完整前置的单机共享根 profile 使用与写前关门线性化的本地版本和内容 hash 双次核对，正式请求不做 SQL miss 放行。敏感 source 提交与 durable admission、发布和恢复仍须遵循适用合同。未决提交不能因 lease 过期而重放或恢复 ALLOW；资格/配置的独立完成与已证明 rollback 的 abort 必须遵循该节的精确 durable 证据、同事务排他及历史 receipt 恢复合同，不以伪造 delta、旧 snapshot 或 HTTP 状态关闭 barrier；规范登记不代表实现或环境验收已通过。
 - CURRENT V6 不接受 native `CARD_ONLY` 输入；保留 `MANUAL`/direct-delta 的明示语义。不得自动改写旧 source 数据；如需迁移，必须使用单独批准的 offline preflight/rebuild，并保留 revoke/fence 与审计事实。正式授权仍必须经过 `PolicyEngine.evaluate()` 与 published-evidence strict gate。
 
 ### 3.3 规则、资源与路径

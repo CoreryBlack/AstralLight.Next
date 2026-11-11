@@ -78,6 +78,61 @@ async fn warm_projection_mirror(
         .context("memory mirror warm-up readiness gate")
 }
 
+fn require_complete_warm_report(report: &astral_db::WarmReport) -> anyhow::Result<()> {
+    if report.failed != 0 {
+        return Err(anyhow!(
+            "single-node authorization memory warm-up incomplete: {} published aggregates failed to load",
+            report.failed
+        ));
+    }
+    Ok(())
+}
+
+async fn record_runtime_lifecycle(
+    pool: &sqlx::MySqlPool,
+    run_id: &str,
+    event_type: &str,
+    detail: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO audit_log \
+         (user_id, action, resource, decision, reason, event_type, request_id, detail) \
+         VALUES (0, 'single_node_lifecycle', 'single_node', 'INFO', ?, ?, ?, ?)",
+    )
+    .bind(detail)
+    .bind(event_type)
+    .bind(run_id)
+    .bind(detail)
+    .execute(pool)
+    .await
+    .map_err(|error| anyhow!("record single-node lifecycle event: {error}"))?;
+    Ok(())
+}
+
+fn lifecycle_requires_recovery_review(last_event: Option<&str>) -> bool {
+    matches!(last_event, Some(event) if event != "CLEAN_SHUTDOWN")
+}
+
+fn single_node_run_id() -> String {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("single-node-{}-{timestamp}", std::process::id())
+}
+
+async fn previous_runtime_was_clean(pool: &sqlx::MySqlPool) -> anyhow::Result<Option<bool>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT event_type FROM audit_log \
+         WHERE action = 'single_node_lifecycle' AND resource = 'single_node' \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| anyhow!("read previous single-node lifecycle: {error}"))?;
+    Ok(row.map(|(event_type,)| !lifecycle_requires_recovery_review(Some(&event_type))))
+}
+
 async fn save_shutdown_snapshot(pool: &sqlx::MySqlPool, path: &Path) {
     match tokio::time::timeout(Duration::from_secs(30), astral_db::save_projection_snapshot(path, pool)).await {
         Ok(Ok(_)) => tracing::info!("local projection snapshot saved after service shutdown"),
@@ -555,6 +610,95 @@ fn mark_hub_suspect(reason: &str) {
     }
 }
 
+/// Owns the one provider and the root whose store will back the process-wide
+/// certified read surface. Dropping the owner closes that store before its
+/// dependencies are released, including on startup errors.
+struct CertifiedMemoryComposition {
+    provider: Arc<astral_db::SqlxAuthorizationFenceProvider>,
+    completion_coordinator: astral_db::CertifiedMemoryCompletionCoordinator,
+    root: astral_db::CertifiedMemoryCompositionRoot,
+}
+
+impl Drop for CertifiedMemoryComposition {
+    fn drop(&mut self) {
+        if let Err(error) = self.root.shutdown() {
+            tracing::error!(error = %error, "certified-memory shutdown could not be proven");
+        }
+    }
+}
+
+impl CertifiedMemoryComposition {
+    async fn new(db: &sqlx::MySqlPool) -> anyhow::Result<Self> {
+        let provider = astral_db::authority_provider_from_env(db.clone())
+            .await
+            .context("load certified-memory quorum authority provider")?
+            .ok_or_else(|| anyhow!("certified-memory requires a quorum authority provider"))?;
+        let owner_context = provider
+            .certified_memory_owner_context()
+            .context("bind certified-memory owners to the quorum provider")?;
+        let root = astral_db::CertifiedMemoryCompositionRoot::from_durable_owner_context(
+            Default::default(),
+            owner_context,
+        )?
+        .with_authority_provider(&provider)
+        .context("bind certified-memory root to the quorum provider")?;
+        let completion_coordinator = provider
+            .certified_memory_completion_coordinator()
+            .context("bind certified-memory completion coordinator to the quorum provider")?;
+        Ok(Self {
+            provider,
+            completion_coordinator,
+            root,
+        })
+    }
+
+    /// Second-stage listener gate: the same root and provider must already have
+    /// independently proven readiness before the surface can be installed.
+    fn install_serving_surface(
+        &self,
+        config: &AppConfig,
+        db: &sqlx::MySqlPool,
+    ) -> anyhow::Result<()> {
+        // Keep the post-commit coordinator attached to this exact provider. It
+        // is intentionally not invoked here: startup has no complete six-family
+        // candidate bundle, so no authority completion or ledger write is safe.
+        if self.completion_coordinator.database_id().is_empty() {
+            return Err(anyhow!(
+                "certified-memory completion coordinator has no database identity"
+            ));
+        }
+        certified_memory_startup_preflight(&self.root)?;
+        let surface = astral_db::build_authorization_read_surface(
+            config.authorization_read_profile,
+            db.clone(),
+            config.org_scope_enabled,
+            config.authority_runtime_mode.requires_authority(),
+            Some(Arc::clone(&self.provider)),
+            Some(self.root.certified_store()),
+        )
+        .map_err(|error| anyhow!("build certified-memory read surface: {error}"))?;
+        let installed = astral_db::install_authorization_read_surface(Arc::clone(&surface));
+        if !Arc::ptr_eq(&surface, &installed) {
+            return Err(anyhow!(
+                "a different authorization read surface is already installed"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn certified_memory_startup_preflight(
+    root: &astral_db::CertifiedMemoryCompositionRoot,
+) -> anyhow::Result<()> {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    root.require_serving(now_unix).map_err(|error| {
+        anyhow!("certified-memory profile requires complete root/runtime preflight: {error}")
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -562,6 +706,12 @@ async fn main() -> anyhow::Result<()> {
         .context("load single-node configuration")?;
     config.validate_listener_for(JwtValidationRole::Gateway)?;
     config.validate_listener_for(JwtValidationRole::Identity)?;
+    // Keep this zero-side-effect gate until worker-only startup and independently
+    // verified readiness can safely drive the real composition below.
+    if config.authorization_read_profile.uses_certified_memory() {
+        let root = astral_db::CertifiedMemoryCompositionRoot::pending(Default::default());
+        certified_memory_startup_preflight(&root)?;
+    }
     let config = Arc::new(config);
     let gateway_addr = env_or("SINGLE_NODE_GATEWAY_ADDR", DEFAULT_GATEWAY_ADDR);
     let identity_addr = env_or("SINGLE_NODE_IDENTITY_ADDR", DEFAULT_IDENTITY_ADDR);
@@ -596,11 +746,42 @@ async fn main() -> anyhow::Result<()> {
     let lease_connection = astral_db::memory_projection_hub::acquire_single_writer_lease(&db)
         .await
         .map_err(|error| anyhow!("acquire single-node writer lease: {error}"))?;
+    let previous_clean = previous_runtime_was_clean(&db).await?;
+    if previous_clean == Some(false) {
+        tracing::warn!(
+            "previous single-node run did not record a clean shutdown; authorization state was rebuilt from MySQL and recent changes require review"
+        );
+    }
+    let run_id = single_node_run_id();
+    record_runtime_lifecycle(&db, &run_id, "STARTED", "single-node startup began").await?;
     // Lease loss closes the sticky owner gate before shutdown is signalled.
     // The supervisor neither reconnects nor acquires a replacement lease.
     let mut lease_supervisor = writer_lease::start_writer_lease_supervisor(lease_connection)
         .await
         .map_err(|error| anyhow!("start writer lease supervision: {error}"))?;
+
+    // This scaffold is unreachable for CertifiedMemory while the early pending
+    // gate above is in place. Do not remove that gate until the worker-only and
+    // independently verified readiness interfaces are wired into this owner.
+    if config.authorization_read_profile.uses_certified_memory() {
+        let composition = tokio::select! {
+            result = CertifiedMemoryComposition::new(&db) => result?,
+            loss = lease_supervisor.wait_for_loss() => {
+                mark_hub_suspect(&loss);
+                return Err(anyhow!("single-node writer lease lost during certified-memory composition: {loss}"));
+            }
+        };
+        // Until independently verified worker readiness, completion receipts and
+        // attestation are available, this gate fails closed before any host is
+        // spawned. It must not be replaced with caller-supplied positive proofs.
+        composition.install_serving_surface(&config, &db)?;
+        // Existing host entry points independently construct providers and do
+        // not expose worker-only startup. They cannot safely consume this root.
+        // Keep the listener gate closed until the two-phase host API exists.
+        return Err(anyhow!(
+            "certified-memory host worker readiness and shared-provider injection are unavailable"
+        ));
+    }
 
     // 预热同样处于租约监督之下：租约在预热期间丢失时立即放弃启动，绝不
     // 等预热或 readiness 完成才承认丢失（不误声明 READINESS）。
@@ -613,6 +794,7 @@ async fn main() -> anyhow::Result<()> {
             return Err(anyhow!("single-node writer lease lost during warm-up: {loss}"));
         }
     };
+    require_complete_warm_report(&warm)?;
     if !astral_db::install_auxiliary_authorization_mirror(db.clone(), config.org_scope_enabled) {
         return Err(anyhow!("auxiliary authorization mirror already installed"));
     }
@@ -878,6 +1060,13 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(path) = local_snapshot_path.as_deref() {
                     save_shutdown_snapshot(&db, path).await;
                 }
+                record_runtime_lifecycle(
+                    &db,
+                    &run_id,
+                    "CLEAN_SHUTDOWN",
+                    "single-node services drained and source writers are quiet",
+                )
+                .await?;
             }
             Err(error) => {
                 tracing::error!(error = %error, "source writers were not proven quiet; skipping hint snapshot");
@@ -893,6 +1082,65 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn single_node_run_id_is_nonempty_and_process_scoped() {
+        let first = single_node_run_id();
+        let second = single_node_run_id();
+        assert!(first.starts_with("single-node-"));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn lifecycle_marker_requires_review_after_unclean_previous_run() {
+        assert!(!lifecycle_requires_recovery_review(None));
+        assert!(!lifecycle_requires_recovery_review(Some("CLEAN_SHUTDOWN")));
+        assert!(lifecycle_requires_recovery_review(Some("STARTED")));
+    }
+
+    #[test]
+    fn incomplete_warm_report_blocks_listener_startup() {
+        let report = astral_db::WarmReport {
+            identities: 3,
+            installed: 2,
+            failed: 1,
+            pending_restored: 0,
+        };
+        assert!(require_complete_warm_report(&report).is_err());
+    }
+
+    #[test]
+    fn complete_warm_report_allows_listener_startup() {
+        let report = astral_db::WarmReport {
+            identities: 3,
+            installed: 3,
+            failed: 0,
+            pending_restored: 0,
+        };
+        assert!(require_complete_warm_report(&report).is_ok());
+    }
+
+    /// 只有完整 root/runtime preflight 成功时才允许 CertifiedMemory profile
+    /// 启动；pending 占位组合根永远无法通过 preflight，且失败路径绝不回退
+    /// Durable/DbBackedMirror，而是整体启动失败（fail-closed）。
+    #[test]
+    fn certified_memory_preflight_fails_closed_without_serving_root() {
+        let root = astral_db::CertifiedMemoryCompositionRoot::pending(Default::default());
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let error = root
+            .require_serving(now_unix)
+            .expect_err("a pending composition root must never pass the listener gate");
+        assert!(matches!(
+            error,
+            astral_db::CertifiedMemoryCompositionError::NotServing
+        ));
+        assert!(certified_memory_startup_preflight(&root).is_err());
+        assert!(!root.status().positive_reads_ready());
+        assert!(!root.readiness(now_unix).positive_reads_ready);
+    }
 
     #[test]
     fn required_service_or_owner_loss_closes_admission_before_abort() {

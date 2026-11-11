@@ -384,6 +384,31 @@ async fn detect_conflicts(
     Ok(Json(ApiResponse::success(violations)))
 }
 
+fn validate_static_partner_permission<'a>(
+    policy_name: &str,
+    raw: Option<&'a str>,
+) -> Result<&'a str, AstralError> {
+    let value = raw.ok_or_else(|| {
+        AstralError::Pending(format!(
+            "SoD policy {policy_name} has no complete partner permission"
+        ))
+    })?;
+    let mut parts = value.split(':');
+    let resource = parts.next().filter(|value| !value.trim().is_empty());
+    let action = parts.next().filter(|value| !value.trim().is_empty());
+    if parts.next().is_some()
+        || resource.is_none()
+        || action.is_none()
+        || resource != Some(resource.unwrap().trim())
+        || action != Some(action.unwrap().trim())
+    {
+        return Err(AstralError::Pending(format!(
+            "SoD policy {policy_name} has malformed partner permission"
+        )));
+    }
+    Ok(value)
+}
+
 /// POST /main/api/v1/sod-policies/validate-grant — 校验授权是否会导致 SoD 冲突
 async fn validate_grant(
     State(state): State<AppState>,
@@ -400,36 +425,39 @@ async fn validate_grant(
     });
 
     if let Some(policy) = conflicting_policy {
-        // 找到候选策略，检查卡片是否持有冲突权限
-        let partner_perm = if policy.permission_a.as_deref() == Some(&perm_key) {
-            policy.permission_b.as_deref()
-        } else {
-            policy.permission_a.as_deref()
-        };
+        // 缺失或畸形 partner 不是“没有冲突”：advisory 也必须保持
+        // fail-closed，避免调用方把 incomplete policy 当作最终放行。
+        let partner = validate_static_partner_permission(
+            &policy.policy_name,
+            if policy.permission_a.as_deref() == Some(&perm_key) {
+                policy.permission_b.as_deref()
+            } else {
+                policy.permission_a.as_deref()
+            },
+        )
+        .map_err(AppError::from)?;
+        let (resource, action) = partner.split_once(':').ok_or_else(|| {
+            AppError::from(AstralError::Pending(
+                "SoD partner permission is incomplete".into(),
+            ))
+        })?;
+        let has_conflict = state
+            .sod_repository
+            .card_has_permission(req.card_id, resource, action)
+            .await?;
 
-        if let Some(partner) = partner_perm {
-            // 解析 resource:action
-            let parts: Vec<&str> = partner.splitn(2, ':').collect();
-            if parts.len() == 2 {
-                let has_conflict = state
-                    .sod_repository
-                    .card_has_permission(req.card_id, parts[0], parts[1])
-                    .await?;
-
-                if has_conflict {
-                    tracing::warn!(
-                        card_id = req.card_id,
-                        granted = %perm_key,
-                        conflicts_with = partner,
-                        "SoD grant validation failed"
-                    );
-                    return Ok(Json(ApiResponse::success(GrantValidationResult {
-                        allowed: false,
-                        conflict_policy: Some(policy.policy_name.clone()),
-                        conflict_permission: Some(partner.to_string()),
-                    })));
-                }
-            }
+        if has_conflict {
+            tracing::warn!(
+                card_id = req.card_id,
+                granted = %perm_key,
+                conflicts_with = partner,
+                "SoD grant validation failed"
+            );
+            return Ok(Json(ApiResponse::success(GrantValidationResult {
+                allowed: false,
+                conflict_policy: Some(policy.policy_name.clone()),
+                conflict_permission: Some(partner.to_owned()),
+            })));
         }
     }
 

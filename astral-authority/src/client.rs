@@ -23,26 +23,32 @@ use std::time::Duration;
 
 use astral_types::{
     AuthorityAbortRequest, AuthorityAbortResponse, AuthorityCallerIdentity,
-    AuthorityCertifyRequest, AuthorityCertifyResponse, AuthorityCloseReservationRequest,
-    AuthorityCloseReservationResponse, AuthorityCommitBinding, AuthorityCommitRequest,
-    AuthorityCommitResponse, AuthorityConfigCompletionEvidence, AuthorityConfigCompletionRequest,
-    AuthorityConfigCompletionResponse, AuthorityEligibilityCompletionEvidence,
-    AuthorityEligibilityCompletionRequest, AuthorityEligibilityCompletionResponse,
-    AuthorityFenceReadRequest, AuthorityFenceReadResponse, AuthorityPrepareRequest,
-    AuthorityPrepareResponse, AuthorityProtocolError, AuthorityReconcileRequest,
-    AuthorityReconcileResponse, AuthorityRetainedStagedEvidence,
-    AuthoritySourceBootstrapCompletion, AuthoritySourceBootstrapFinalizeRequest,
-    AuthoritySourceBootstrapFinalizeResponse, AuthoritySourceBootstrapPrepareRequest,
-    AuthoritySourceBootstrapPrepareResponse, AuthoritySourceBootstrapReconcileRequest,
-    AuthoritySourceBootstrapReconcileResponse, AuthoritySourceBootstrapTicket,
-    AuthoritySourceIntent, AuthorityStartupAttestation, AuthorityWireError,
-    GlobalAuthorityFrontier, AUTHORITY_PATH_ATTESTATION_STARTUP, AUTHORITY_PATH_CONFIG_COMPLETIONS,
-    AUTHORITY_PATH_ELIGIBILITY_COMPLETIONS, AUTHORITY_PATH_FENCE_CURRENT,
-    AUTHORITY_PATH_PUBLICATION_CERTIFICATIONS, AUTHORITY_PATH_RESERVATION_ABORTS,
-    AUTHORITY_PATH_RESERVATION_CLOSE, AUTHORITY_PATH_RESERVATION_RECONCILE,
-    AUTHORITY_PATH_SOURCE_BOOTSTRAP_FINALIZE, AUTHORITY_PATH_SOURCE_BOOTSTRAP_PREPARE,
-    AUTHORITY_PATH_SOURCE_BOOTSTRAP_RECONCILE, AUTHORITY_PATH_SOURCE_COMMITS,
-    AUTHORITY_PATH_SOURCE_INTENTS,
+    AuthorityCertifiedMemoryRootInstallRequest, AuthorityCertifiedMemoryRootOperation,
+    AuthorityCertifiedMemoryRootProposal, AuthorityCertifiedMemoryRootReadRequest,
+    AuthorityCertifiedMemoryRootResponse, AuthorityCertifyRequest, AuthorityCertifyResponse,
+    AuthorityCloseReservationRequest, AuthorityCloseReservationResponse, AuthorityCommitBinding,
+    AuthorityCommitRequest, AuthorityCommitResponse, AuthorityConfigCompletionEvidence,
+    AuthorityConfigCompletionRequest, AuthorityConfigCompletionResponse,
+    AuthorityEligibilityCompletionEvidence, AuthorityEligibilityCompletionRequest,
+    AuthorityEligibilityCompletionResponse, AuthorityFamilyCompletionCandidate,
+    AuthorityFamilyCompletionReconcileRequest, AuthorityFamilyCompletionReconcileResponse,
+    AuthorityFamilyCompletionRequest, AuthorityFamilyCompletionResponse, AuthorityFenceReadRequest,
+    AuthorityFenceReadResponse, AuthorityPrepareRequest, AuthorityPrepareResponse,
+    AuthorityProtocolError, AuthorityReconcileRequest, AuthorityReconcileResponse,
+    AuthorityRetainedStagedEvidence, AuthoritySourceBootstrapCompletion,
+    AuthoritySourceBootstrapFinalizeRequest, AuthoritySourceBootstrapFinalizeResponse,
+    AuthoritySourceBootstrapPrepareRequest, AuthoritySourceBootstrapPrepareResponse,
+    AuthoritySourceBootstrapReconcileRequest, AuthoritySourceBootstrapReconcileResponse,
+    AuthoritySourceBootstrapTicket, AuthoritySourceIntent, AuthorityStartupAttestation,
+    AuthorityWireError, GlobalAuthorityFrontier, AUTHORITY_PATH_ATTESTATION_STARTUP,
+    AUTHORITY_PATH_CERTIFIED_MEMORY_ROOT_CURRENT, AUTHORITY_PATH_CERTIFIED_MEMORY_ROOT_INSTALL,
+    AUTHORITY_PATH_CONFIG_COMPLETIONS, AUTHORITY_PATH_ELIGIBILITY_COMPLETIONS,
+    AUTHORITY_PATH_FAMILY_COMPLETIONS, AUTHORITY_PATH_FAMILY_COMPLETION_RECONCILE,
+    AUTHORITY_PATH_FENCE_CURRENT, AUTHORITY_PATH_PUBLICATION_CERTIFICATIONS,
+    AUTHORITY_PATH_RESERVATION_ABORTS, AUTHORITY_PATH_RESERVATION_CLOSE,
+    AUTHORITY_PATH_RESERVATION_RECONCILE, AUTHORITY_PATH_SOURCE_BOOTSTRAP_FINALIZE,
+    AUTHORITY_PATH_SOURCE_BOOTSTRAP_PREPARE, AUTHORITY_PATH_SOURCE_BOOTSTRAP_RECONCILE,
+    AUTHORITY_PATH_SOURCE_COMMITS, AUTHORITY_PATH_SOURCE_INTENTS,
 };
 use ed25519_dalek::VerifyingKey;
 use serde::de::DeserializeOwned;
@@ -107,6 +113,130 @@ pub struct AuthorityClient {
     service_id: String,
     pinned_genesis_trust_root_digest: String,
     session: Arc<RwLock<Option<CachedSession>>>,
+    provenance: Arc<()>,
+}
+
+/// An online root observation verified by one particular authority client.
+/// It is process-local and must be checked against the application's client
+/// immediately before installation; it does not prove snapshot completeness.
+#[derive(Debug, Clone)]
+pub struct VerifiedCertifiedMemoryRoot {
+    response: AuthorityCertifiedMemoryRootResponse,
+    session: CachedSession,
+    provenance: Arc<()>,
+}
+
+impl VerifiedCertifiedMemoryRoot {
+    pub fn verified_root_and_key(
+        &self,
+        client: &AuthorityClient,
+    ) -> Result<(&astral_types::AuthorityCertifiedMemoryRoot, VerifyingKey), AuthorityClientError>
+    {
+        if !Arc::ptr_eq(&self.provenance, &client.provenance) {
+            return Err(AuthorityClientError::Protocol(
+                "certified-memory root was verified by another client".to_owned(),
+            ));
+        }
+        let now = now_unix();
+        if self.session.attestation.expires_at - ATTESTATION_REFRESH_MARGIN_SECONDS <= now {
+            return Err(AuthorityClientError::Attestation(
+                "certified-memory root attestation is no longer fresh".to_owned(),
+            ));
+        }
+        self.session
+            .attestation
+            .verify_chain_at(&client.pinned_genesis_trust_root_digest, now)
+            .map_err(|error| AuthorityClientError::Attestation(error.to_string()))?;
+        AuthorityClient::verify_certified_memory_root_response(
+            &self.session,
+            &self.response,
+            None,
+            now,
+            true,
+        )?;
+        let root = &self.response.root;
+        let key =
+            AuthorityClient::registered_verifying_key(&self.session, &root.key_id, root.key_epoch)?;
+        Ok((root, key))
+    }
+}
+
+/// In-process evidence that this client verified an online family response.
+///
+/// The client configuration is caller-selected. Consumers must compare its
+/// identity against the application composition root before trusting this value.
+/// This does not prove source inventory, a DB commit, or authenticity after a
+/// restart; it is neither serializable nor reconstructible from persisted data.
+#[derive(Debug, Clone)]
+pub struct VerifiedFamilyReceipt {
+    candidate: AuthorityFamilyCompletionCandidate,
+    response: VerifiedFamilyResponse,
+    attestation: AuthorityStartupAttestation,
+    genesis_pin: String,
+    base_url: String,
+    service_id: String,
+    database_id: String,
+    provenance: Arc<()>,
+}
+
+#[derive(Debug, Clone)]
+enum VerifiedFamilyResponse {
+    Completion(AuthorityFamilyCompletionResponse),
+    Reconciliation(AuthorityFamilyCompletionReconcileResponse),
+}
+
+impl VerifiedFamilyReceipt {
+    pub fn candidate(&self) -> &AuthorityFamilyCompletionCandidate {
+        &self.candidate
+    }
+
+    pub fn receipt(&self) -> &astral_types::AuthorityFamilyCompletionReceipt {
+        match &self.response {
+            VerifiedFamilyResponse::Completion(response) => &response.receipt,
+            // Only the verified reconciliation path constructs this variant,
+            // after checking that a receipt is present.
+            VerifiedFamilyResponse::Reconciliation(response) => {
+                response.receipt.as_ref().expect("verified receipt")
+            }
+        }
+    }
+
+    pub fn completion_response(&self) -> Option<&AuthorityFamilyCompletionResponse> {
+        match &self.response {
+            VerifiedFamilyResponse::Completion(response) => Some(response),
+            VerifiedFamilyResponse::Reconciliation(_) => None,
+        }
+    }
+
+    pub fn reconciliation_response(&self) -> Option<&AuthorityFamilyCompletionReconcileResponse> {
+        match &self.response {
+            VerifiedFamilyResponse::Completion(_) => None,
+            VerifiedFamilyResponse::Reconciliation(response) => Some(response),
+        }
+    }
+
+    /// The chain-verified attestation observed after the response.
+    pub fn attestation(&self) -> &AuthorityStartupAttestation {
+        &self.attestation
+    }
+    pub fn genesis_pin(&self) -> &str {
+        &self.genesis_pin
+    }
+    pub fn endpoint(&self) -> &str {
+        &self.base_url
+    }
+    pub fn service_id(&self) -> &str {
+        &self.service_id
+    }
+    pub fn database_id(&self) -> &str {
+        &self.database_id
+    }
+
+    /// True only for the originating client or a clone, never a separately
+    /// constructed client even if its visible configuration is identical.
+    pub fn verified_by(&self, client: &AuthorityClient) -> bool {
+        Arc::ptr_eq(&self.provenance, &client.provenance)
+    }
 }
 
 impl std::fmt::Debug for AuthorityClient {
@@ -156,7 +286,13 @@ impl AuthorityClient {
             service_id: config.service_id,
             pinned_genesis_trust_root_digest: config.pinned_genesis_trust_root_digest,
             session: Arc::new(RwLock::new(None)),
+            provenance: Arc::new(()),
         })
+    }
+
+    /// The registered logical source identity carried by every authority request.
+    pub fn service_id(&self) -> &str {
+        &self.service_id
     }
 
     fn caller(&self) -> AuthorityCallerIdentity {
@@ -528,9 +664,141 @@ impl AuthorityClient {
         Ok(())
     }
 
+    /// Install an authority-owned certified-memory root. This method performs
+    /// exactly one HTTP attempt; uncertain transport results are never retried.
+    pub async fn install_certified_memory_root(
+        &self,
+        proposal: AuthorityCertifiedMemoryRootProposal,
+    ) -> Result<AuthorityCertifiedMemoryRootResponse, AuthorityClientError> {
+        proposal
+            .validate()
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?;
+        let body = AuthorityCertifiedMemoryRootInstallRequest {
+            caller: self.caller(),
+            operation: AuthorityCertifiedMemoryRootOperation::Install,
+            proposal,
+        };
+        body.validate()
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?;
+        self.attest_startup().await?;
+        let response: AuthorityCertifiedMemoryRootResponse = self
+            .post(AUTHORITY_PATH_CERTIFIED_MEMORY_ROOT_INSTALL, &body)
+            .await?;
+        response
+            .validate()
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?;
+        let session = self.refresh_verified_session().await?;
+        Self::verify_certified_memory_root_response(&session, &response, None, now_unix(), false)?;
+        let root = &response.root;
+        if root.operation_id != body.proposal.operation_id
+            || root.reservation_id != body.proposal.reservation_id
+            || root.event_id != body.proposal.event_id
+            || root.source_commit_digest != body.proposal.source_commit_digest
+            || root.source_outcome_digest != body.proposal.source_outcome_digest
+            || root.family_bundle_digest != body.proposal.family_bundle_digest
+            || root.snapshot_hash != body.proposal.snapshot_hash
+            || root.coverage != body.proposal.coverage
+        {
+            return Err(AuthorityClientError::Protocol(
+                "certified-memory install response does not bind the proposal".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Read the authority-owned current certified-memory root after verifying
+    /// the pointer target, canonical digest, registered signer, signature,
+    /// frontier bounds and positive read gate.
+    pub async fn read_certified_memory_root(
+        &self,
+        expected_root_digest: Option<String>,
+    ) -> Result<AuthorityCertifiedMemoryRootResponse, AuthorityClientError> {
+        Ok(self
+            .read_certified_memory_root_verified(expected_root_digest)
+            .await?
+            .response)
+    }
+
+    /// Preserve client provenance and the chain-verified signer for installation.
+    pub async fn read_certified_memory_root_verified(
+        &self,
+        expected_root_digest: Option<String>,
+    ) -> Result<VerifiedCertifiedMemoryRoot, AuthorityClientError> {
+        let body = AuthorityCertifiedMemoryRootReadRequest {
+            caller: self.caller(),
+            operation: AuthorityCertifiedMemoryRootOperation::Read,
+            expected_root_digest,
+        };
+        body.validate()
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?;
+        self.attest_startup().await?;
+        let response: AuthorityCertifiedMemoryRootResponse = self
+            .post(AUTHORITY_PATH_CERTIFIED_MEMORY_ROOT_CURRENT, &body)
+            .await?;
+        response
+            .validate()
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?;
+        let session = self.verified_session().await?;
+        Self::verify_certified_memory_root_response(
+            &session,
+            &response,
+            body.expected_root_digest.as_deref(),
+            now_unix(),
+            true,
+        )?;
+        Ok(VerifiedCertifiedMemoryRoot {
+            response,
+            session,
+            provenance: Arc::clone(&self.provenance),
+        })
+    }
+
+    fn verify_certified_memory_root_response(
+        session: &CachedSession,
+        response: &AuthorityCertifiedMemoryRootResponse,
+        expected_root_digest: Option<&str>,
+        now: i64,
+        require_positive_gate: bool,
+    ) -> Result<(), AuthorityClientError> {
+        Self::verify_attested_historical_frontier(session, &response.global_frontier)?;
+        response
+            .read_gate
+            .validate()
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?;
+        if require_positive_gate && !response.read_gate.positive_reads_allowed {
+            return Err(AuthorityClientError::Protocol(
+                "certified-memory root read gate is not positive".to_owned(),
+            ));
+        }
+        let root = &response.root;
+        if root.authority_id != response.global_frontier.authority_id
+            || root.authority_term > response.global_frontier.authority_term
+            || root.global_fence_sequence > response.global_frontier.global_fence_sequence
+            || root.key_epoch > response.global_frontier.key_epoch
+            || expected_root_digest.is_some_and(|expected| expected != root.root_digest)
+        {
+            return Err(AuthorityClientError::Protocol(
+                "certified-memory root is outside the attested frontier".to_owned(),
+            ));
+        }
+        let verifying_key = Self::registered_verifying_key(session, &root.key_id, root.key_epoch)?;
+        root.verify_at(&verifying_key, now)
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?;
+        if root
+            .recompute_root_digest()
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?
+            != root.root_digest
+        {
+            return Err(AuthorityClientError::Protocol(
+                "certified-memory root content digest mismatch".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Linearizable fence read, optionally with certificate and read proof.
-    /// The caller nonce and the immutable policy-request digest are carried
-    /// inside `read_proof` and bound quorum-side by the authority.
+    /// The caller nonce and immutable policy-request digest are carried inside
+    /// `read_proof` and bound quorum-side by the authority.
     pub async fn read_fence(
         &self,
         scope: Option<astral_types::AuthorityProtocolScope>,
@@ -1111,6 +1379,179 @@ impl AuthorityClient {
         }
     }
 
+    fn verify_family_candidate(
+        candidate: &AuthorityFamilyCompletionCandidate,
+        receipt: &astral_types::AuthorityFamilyCompletionReceipt,
+    ) -> Result<(), AuthorityClientError> {
+        let expected = candidate
+            .clone()
+            .into_receipted_completion(receipt.receipt_id.clone())
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?;
+        if receipt.completion != expected {
+            return Err(AuthorityClientError::Protocol(
+                "family completion receipt does not bind the exact candidate".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record one authority-owned certified-memory family completion. The
+    /// authority assigns the receipt identity; callers cannot self-certify it.
+    pub async fn complete_family(
+        &self,
+        database_id: String,
+        completion: AuthorityFamilyCompletionCandidate,
+    ) -> Result<AuthorityFamilyCompletionResponse, AuthorityClientError> {
+        self.complete_family_checked(database_id, completion)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// Perform one completion attempt and retain its verified in-process provenance.
+    pub async fn complete_family_verified(
+        &self,
+        database_id: String,
+        completion: AuthorityFamilyCompletionCandidate,
+    ) -> Result<VerifiedFamilyReceipt, AuthorityClientError> {
+        let (response, session) = self
+            .complete_family_checked(database_id.clone(), completion.clone())
+            .await?;
+        Ok(self.family_receipt(
+            completion,
+            database_id,
+            session,
+            VerifiedFamilyResponse::Completion(response),
+        ))
+    }
+
+    async fn complete_family_checked(
+        &self,
+        database_id: String,
+        completion: AuthorityFamilyCompletionCandidate,
+    ) -> Result<(AuthorityFamilyCompletionResponse, CachedSession), AuthorityClientError> {
+        let body = AuthorityFamilyCompletionRequest {
+            caller: self.caller(),
+            database_id,
+            completion,
+        };
+        body.validate()
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?;
+        self.attest_startup().await?;
+        let response: AuthorityFamilyCompletionResponse =
+            self.post(AUTHORITY_PATH_FAMILY_COMPLETIONS, &body).await?;
+        response
+            .validate()
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?;
+        let session = self.refresh_verified_session().await?;
+        Self::verify_attested_historical_frontier(&session, &response.global_frontier)?;
+        Self::verify_family_candidate(&body.completion, &response.receipt)?;
+        if response.reservation.reservation_id != body.completion.reservation_id
+            || response.reservation.intent.operation_id != body.completion.operation_id
+            || response.reservation.intent.event_id != body.completion.event_id
+            || response.reservation.intent.service_id != body.caller.service_id
+            || response.reservation.intent.database_id != body.database_id
+        {
+            return Err(AuthorityClientError::Protocol(
+                "family completion response does not bind the exact request".to_owned(),
+            ));
+        }
+        Ok((response, session))
+    }
+
+    /// Reconcile one family completion using a read-only authority lookup. No
+    /// completion POST is attempted after an uncertain transport outcome.
+    pub async fn reconcile_family(
+        &self,
+        database_id: String,
+        completion: AuthorityFamilyCompletionCandidate,
+    ) -> Result<AuthorityFamilyCompletionReconcileResponse, AuthorityClientError> {
+        self.reconcile_family_checked(database_id, completion)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// Read-only reconciliation; absence remains `None`, never a receipt.
+    pub async fn reconcile_family_verified(
+        &self,
+        database_id: String,
+        completion: AuthorityFamilyCompletionCandidate,
+    ) -> Result<Option<VerifiedFamilyReceipt>, AuthorityClientError> {
+        let (response, session) = self
+            .reconcile_family_checked(database_id.clone(), completion.clone())
+            .await?;
+        if response.receipt.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(self.family_receipt(
+            completion,
+            database_id,
+            session,
+            VerifiedFamilyResponse::Reconciliation(response),
+        )))
+    }
+
+    async fn reconcile_family_checked(
+        &self,
+        database_id: String,
+        completion: AuthorityFamilyCompletionCandidate,
+    ) -> Result<(AuthorityFamilyCompletionReconcileResponse, CachedSession), AuthorityClientError>
+    {
+        completion
+            .validate()
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?;
+        let body = AuthorityFamilyCompletionReconcileRequest {
+            caller: self.caller(),
+            database_id,
+            reservation_id: completion.reservation_id.clone(),
+            operation_id: completion.operation_id.clone(),
+            family: completion.family,
+        };
+        body.validate()
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?;
+        self.attest_startup().await?;
+        let response: AuthorityFamilyCompletionReconcileResponse = self
+            .post(AUTHORITY_PATH_FAMILY_COMPLETION_RECONCILE, &body)
+            .await?;
+        response
+            .validate()
+            .map_err(|error| AuthorityClientError::Protocol(error.to_string()))?;
+        let session = self.refresh_verified_session().await?;
+        Self::verify_attested_historical_frontier(&session, &response.global_frontier)?;
+        if response.reservation.reservation_id != body.reservation_id
+            || response.reservation.intent.operation_id != body.operation_id
+            || response.reservation.intent.event_id != completion.event_id
+            || response.reservation.intent.service_id != body.caller.service_id
+            || response.reservation.intent.database_id != body.database_id
+        {
+            return Err(AuthorityClientError::Protocol(
+                "family completion reconciliation does not bind the requested operation".to_owned(),
+            ));
+        }
+        if let Some(receipt) = &response.receipt {
+            Self::verify_family_candidate(&completion, receipt)?;
+        }
+        Ok((response, session))
+    }
+
+    fn family_receipt(
+        &self,
+        candidate: AuthorityFamilyCompletionCandidate,
+        database_id: String,
+        session: CachedSession,
+        response: VerifiedFamilyResponse,
+    ) -> VerifiedFamilyReceipt {
+        VerifiedFamilyReceipt {
+            candidate,
+            response,
+            attestation: session.attestation,
+            genesis_pin: self.pinned_genesis_trust_root_digest.clone(),
+            base_url: self.base_url.clone(),
+            service_id: self.service_id.clone(),
+            database_id,
+            provenance: self.provenance.clone(),
+        }
+    }
+
     /// Complete one exact COMMITTED configuration mutation. No publication
     /// certificate is created. On uncertain transport, use `reconcile_config`
     /// with the same immutable request inputs.
@@ -1358,15 +1799,11 @@ impl AuthorityClient {
         let status = response.status();
         let bytes = read_bounded(response, path).await?;
         if !status.is_success() {
-            let wire_error: AuthorityWireError =
-                serde_json::from_slice(&bytes).unwrap_or(AuthorityWireError {
-                    code: astral_types::AuthorityWireErrorCode::Internal,
-                    message: format!("HTTP {status}"),
-                    leader_hint: None,
-                    current_frontier: None,
-                    current_certificate_hash: None,
-                    reservation_id: None,
-                });
+            let wire_error: AuthorityWireError = serde_json::from_slice(&bytes).map_err(|_| {
+                AuthorityClientError::UnknownOutcome {
+                    operation_hint: path.to_owned(),
+                }
+            })?;
             return Err(AuthorityClientError::Rejected {
                 code: format!("{:?}", wire_error.code),
                 message: wire_error.message,
@@ -1440,6 +1877,192 @@ mod tests {
         GlobalAuthorityFrontier, AUTHORITY_PROTOCOL_VERSION, AUTHORIZATION_EDITION,
     };
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn verified_root_requires_originating_client_fresh_chain_and_untampered_root() {
+        use astral_types::{
+            AuthorityCertifiedMemoryCoverage, AuthorityCertifiedMemoryRoot, AuthorityReadGate,
+        };
+
+        let signer = SigningKey::from_bytes(&[0xA0; 32]);
+        let (session, _) = fixture_session(&signer);
+        let client =
+            client_with_cached_session("https://authority.example".into(), session.clone());
+        let other = client_with_cached_session("https://authority.example".into(), session.clone());
+        let now = now_unix();
+        let frontier = session.attestation.global_frontier.clone();
+        let mut root = AuthorityCertifiedMemoryRoot {
+            protocol_version: AUTHORITY_PROTOCOL_VERSION,
+            authorization_edition: AUTHORIZATION_EDITION,
+            authority_id: frontier.authority_id.clone(),
+            authority_term: frontier.authority_term,
+            global_fence_sequence: frontier.global_fence_sequence,
+            root_id: frontier.root_id.clone(),
+            reservation_id: "reservation".into(),
+            operation_id: "operation".into(),
+            event_id: "event".into(),
+            source_commit_digest: "11".repeat(32),
+            source_outcome_digest: "22".repeat(32),
+            family_bundle_digest: "33".repeat(32),
+            snapshot_hash: "44".repeat(32),
+            scope_generation: 1,
+            revoke_watermark: 0,
+            parent_root_digest: None,
+            coverage: AuthorityCertifiedMemoryCoverage::complete(),
+            key_id: "signer-active".into(),
+            key_epoch: 2,
+            issued_at: now,
+            not_before: now,
+            expires_at: now + 60,
+            root_digest: "0".repeat(64),
+            signature: "0".repeat(128),
+        };
+        root.sign_with(&signer).unwrap();
+        let observation = VerifiedCertifiedMemoryRoot {
+            response: AuthorityCertifiedMemoryRootResponse {
+                root,
+                global_frontier: frontier,
+                read_gate: AuthorityReadGate::evaluate(Vec::new()).unwrap(),
+            },
+            session,
+            provenance: Arc::clone(&client.provenance),
+        };
+        assert!(observation.verified_root_and_key(&client).is_ok());
+        assert!(observation.verified_root_and_key(&client.clone()).is_ok());
+        assert!(observation.verified_root_and_key(&other).is_err());
+        let mut tampered = observation.clone();
+        tampered.response.root.snapshot_hash = "55".repeat(32);
+        assert!(tampered.verified_root_and_key(&client).is_err());
+        let mut expired = observation;
+        expired.session.attestation.expires_at = now;
+        assert!(expired.verified_root_and_key(&client).is_err());
+    }
+
+    #[test]
+    fn family_receipt_requires_the_exact_candidate() {
+        use astral_types::{
+            AuthorityCertifiedMemoryFamily, AuthorityFamilyCompletionReceipt,
+            AuthorityFamilyCompletionState, AuthorityFamilyDependencyFrontier,
+            AuthorityFamilyScope,
+        };
+
+        let candidate = AuthorityFamilyCompletionCandidate {
+            family: AuthorityCertifiedMemoryFamily::CardContext,
+            state: AuthorityFamilyCompletionState::CompleteEmpty,
+            scope: AuthorityFamilyScope {
+                tenant_id: Some(7),
+                scope: "tenant:7".into(),
+            },
+            reservation_id: "reservation".into(),
+            operation_id: "operation".into(),
+            event_id: "event".into(),
+            message_id: Some("message".into()),
+            source_commit_digest: "11".repeat(32),
+            source_outcome_digest: "22".repeat(32),
+            before_content_digest: None,
+            after_content_digest: None,
+            complete_content_digest: Some("33".repeat(32)),
+            audit_correlation_id: "audit".into(),
+            inventory: Vec::new(),
+            scope_generation: 3,
+            revoke_watermark: 1,
+            dependency_frontier: AuthorityFamilyDependencyFrontier {
+                authority_term: 1,
+                global_fence_sequence: 2,
+                dependency_generation: 3,
+            },
+        };
+        let signer = SigningKey::from_bytes(&[0xA0; 32]);
+        let (session, _) = fixture_session(&signer);
+        let receipt = AuthorityFamilyCompletionReceipt {
+            receipt_id: "receipt".into(),
+            completion: candidate
+                .clone()
+                .into_receipted_completion("receipt".into())
+                .unwrap(),
+            completed_at: 1_500,
+            global_frontier: session.attestation.global_frontier,
+        };
+        assert!(AuthorityClient::verify_family_candidate(&candidate, &receipt).is_ok());
+        let mut drifted = receipt.clone();
+        drifted.completion.state = AuthorityFamilyCompletionState::Complete;
+        assert!(AuthorityClient::verify_family_candidate(&candidate, &drifted).is_err());
+        let mut drifted = receipt.clone();
+        drifted.completion.message_id = Some("other-message".into());
+        assert!(AuthorityClient::verify_family_candidate(&candidate, &drifted).is_err());
+        let mut drifted = receipt.clone();
+        drifted.completion.dependency_frontier.dependency_generation += 1;
+        assert!(AuthorityClient::verify_family_candidate(&candidate, &drifted).is_err());
+
+        let (session, _) = fixture_session(&signer);
+        let client =
+            client_with_cached_session("https://authority.example".into(), session.clone());
+        let other = client_with_cached_session("https://authority.example".into(), session.clone());
+        let intent = astral_types::AuthoritySourceIntent {
+            authorization_edition: AUTHORIZATION_EDITION,
+            mutation_kind: astral_types::AuthorityMutationKind::AuthorizationSource,
+            operation_id: candidate.operation_id.clone(),
+            event_id: candidate.event_id.clone(),
+            admission_proof_id: "proof".into(),
+            request_digest: "ab".repeat(32),
+            service_id: "client-test".into(),
+            database_id: "db-1".into(),
+            coverage: astral_types::AuthorityReservationCoverage::Global,
+            before_image_digest: None,
+            lease_not_before: 1_000,
+            lease_expires_at: 2_000,
+            intent_nonce: "intent".into(),
+        };
+        let reservation = astral_types::AuthorityScopeReservation {
+            reservation_id: candidate.reservation_id.clone(),
+            intent_digest: intent.digest().unwrap(),
+            intent,
+            state: astral_types::AuthorityReservationState::Committed,
+            authority_term: 1,
+            fence_sequence_at_prepare: 1,
+            created_at: 1_000,
+            updated_at: 1_500,
+            committed_at: Some(1_500),
+            source_commit_digest: Some(candidate.source_commit_digest.clone()),
+            after_image_digest: Some("44".repeat(32)),
+            certificate_id: None,
+            certified_scopes: Vec::new(),
+            source_outcome_digest: Some(candidate.source_outcome_digest.clone()),
+        };
+        let response = AuthorityFamilyCompletionResponse {
+            disposition: astral_types::AuthorityReservationDisposition::from_reservation(
+                &reservation,
+            ),
+            reservation,
+            global_frontier: receipt.global_frontier.clone(),
+            read_gate: astral_types::AuthorityReadGate::blocked(),
+            receipt,
+        };
+        response.validate().unwrap();
+        AuthorityClient::verify_attested_historical_frontier(&session, &response.global_frontier)
+            .unwrap();
+        let verified = client.family_receipt(
+            candidate.clone(),
+            "db-1".into(),
+            session.clone(),
+            VerifiedFamilyResponse::Completion(response.clone()),
+        );
+        assert!(verified.verified_by(&client));
+        assert!(verified.verified_by(&client.clone()));
+        assert!(!verified.verified_by(&other));
+        assert_eq!(verified.candidate(), &candidate);
+        assert_eq!(verified.completion_response(), Some(&response));
+        assert_eq!(verified.receipt(), &response.receipt);
+        assert_eq!(
+            verified.genesis_pin(),
+            session.signer.genesis_trust_root_digest
+        );
+        assert_eq!(verified.attestation(), &session.attestation);
+        assert_eq!(verified.endpoint(), "https://authority.example");
+        assert_eq!(verified.service_id(), "client-test");
+        assert_eq!(verified.database_id(), "db-1");
+        assert!(verified.reconciliation_response().is_none());
+    }
 
     fn trust_root(
         active_signer: &SigningKey,
@@ -1549,6 +2172,7 @@ mod tests {
                 .digest()
                 .unwrap(),
             session: Arc::new(RwLock::new(Some(session))),
+            provenance: Arc::new(()),
         }
     }
 
@@ -1707,6 +2331,32 @@ mod tests {
         assert!(
             matches!(result, Err(AuthorityClientError::UnknownOutcome { operation_hint })
             if operation_hint == AUTHORITY_PATH_SOURCE_BOOTSTRAP_FINALIZE)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_error_response_after_send_is_unknown() {
+        let (base_url, owner) = serve_raw_response_once(
+            b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 5\r\nconnection: close\r\n\r\nerror".to_vec(),
+        )
+        .await;
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let (session, _) = fixture_session(&key);
+        let mut client = client_with_cached_session(base_url, session);
+        client.http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let result = client
+            .post::<_, serde_json::Value>(
+                AUTHORITY_PATH_SOURCE_BOOTSTRAP_FINALIZE,
+                &serde_json::json!({}),
+            )
+            .await;
+        owner.await.unwrap();
+        assert!(
+            matches!(result, Err(AuthorityClientError::UnknownOutcome { operation_hint })
+                if operation_hint == AUTHORITY_PATH_SOURCE_BOOTSTRAP_FINALIZE)
         );
     }
 

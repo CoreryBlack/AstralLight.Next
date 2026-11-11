@@ -653,6 +653,9 @@ pub struct SourceTransactionGuard {
 }
 
 fn invalidate_positive_read_caches() {
+    if let Some(surface) = crate::authorization_read_surface::authorization_read_surface() {
+        surface.invalidate_certified_memory();
+    }
     crate::eligibility::evict_all_l1_card_active_caches();
     if let Some(store) = astral_common::session_projection_store::global_session_projection_store()
     {
@@ -1697,19 +1700,19 @@ impl MemoryProjectionHub {
 
     /// Enter sticky suspect mode. Only a complete durable reconciliation can clear it.
     pub fn mark_channel_suspect(&self, reason: impl Into<String>) {
+        invalidate_positive_read_caches();
         if let Ok(mut maps) = self.maps.write() {
             maps.suspect(reason);
         }
-        invalidate_positive_read_caches();
     }
 
     /// A required owner cannot recover through channel heartbeat or pointer reconciliation.
     pub fn mark_runtime_owner_failed(&self, reason: impl Into<String>) {
+        invalidate_positive_read_caches();
         if let Ok(mut maps) = self.maps.write() {
             maps.runtime_owner_failed = true;
             maps.suspect(reason);
         }
-        invalidate_positive_read_caches();
     }
 
     #[must_use]

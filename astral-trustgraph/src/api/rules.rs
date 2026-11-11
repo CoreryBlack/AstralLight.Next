@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 
 use astral_common::contract::{ApiResponse, EmptyResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
-use astral_db::resolve_resource_ownership;
 use astral_types::{AstralError, AuthorizationAdmission, ResourceRegistry};
 
 fn current_card_id(headers: &HeaderMap) -> Result<i64, AppError> {
@@ -255,7 +254,6 @@ async fn delete_rules_by_card(
     Ok(Json(ApiResponse::success(EmptyResponse)))
 }
 
-/// 权限检查
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CheckPermissionQuery {
@@ -265,11 +263,59 @@ struct CheckPermissionQuery {
     resource_id: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PermissionCheckResult {
+    /// Advisory only: this field never carries an AuthorizationAdmission.
+    allowed: bool,
+    effect: &'static str,
+    reason: String,
+    state: &'static str,
+}
+
+impl PermissionCheckResult {
+    fn from_decision(decision: &astral_types::PolicyDecision) -> Self {
+        let (effect, state) = if decision.allowed {
+            ("ALLOW", "ALLOW")
+        } else if decision.reason == "NO_MATCH" || decision.reason == "DEFAULT_DENY" {
+            ("DENY", "DENY")
+        } else {
+            ("PENDING", "PENDING")
+        };
+        Self {
+            allowed: decision.allowed,
+            effect,
+            reason: decision.reason.clone(),
+            state,
+        }
+    }
+}
+
+fn permission_check_response(
+    result: PermissionCheckResult,
+) -> Result<Json<ApiResponse<PermissionCheckResult>>, AppError> {
+    if result.allowed {
+        return Ok(Json(ApiResponse::success(result)));
+    }
+    if result.state == "PENDING" {
+        return Err(AppError(AstralError::Pending(format!(
+            "permission check is pending: {}",
+            result.reason
+        ))));
+    }
+    Err(AppError(AstralError::Permission(format!(
+        "permission check denied: {}",
+        result.reason
+    ))))
+}
+
+/// 权限检查结果是 advisory，不产生 AuthorizationAdmission；调用方必须
+/// 继续走正式 frozen-surface middleware 与 admission-bound source transaction。
 async fn check_permission(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<CheckPermissionQuery>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+) -> Result<Json<ApiResponse<PermissionCheckResult>>, AppError> {
     let context_card_id = headers
         .get("x-user-card-id")
         .and_then(|value| value.to_str().ok())
@@ -279,7 +325,19 @@ async fn check_permission(
             "card context does not match requested card".into(),
         )));
     }
-    require_card_scope(&state, &headers, q.card_id).await?;
+    let read_surface = astral_db::authorization_read_surface().ok_or_else(|| {
+        AppError(AstralError::Pending(
+            "authorization read surface unavailable".into(),
+        ))
+    })?;
+    if read_surface.is_certified_memory() {
+        // The self-card identity and physical tenant/domain binding are checked
+        // by the request-bound policy repository below. Do not consult the live
+        // SQL ownership/admin path while evaluating a certified snapshot.
+        require_management_context(&headers)?;
+    } else {
+        require_card_scope(&state, &headers, q.card_id).await?;
+    }
 
     // 统一走物理双卡上下文：principal_kind + identity_card_id 一并注入，
     // 引擎的 check_card_active 才能完成双卡匹配校验（手工构造会缺 identity 字段）。
@@ -293,32 +351,31 @@ async fn check_permission(
     // This endpoint is a self-card permission inspection operation, not access
     // to the query-addressed business object. Its route is explicitly global in
     // the shared resolver, while q.resource_id remains the policy-match target.
-    let resolution = resolve_resource_ownership(
-        &state.db,
-        "permission_rule",
-        "/permission-rules/check",
-        "GET",
-        q.resource_id,
-        ctx.card_id,
-        ctx.user_id,
-    )
-    .await;
+    let read_request = read_surface.begin_request().map_err(|error| {
+        AppError(AstralError::Pending(format!(
+            "authorization request token unavailable: {error}"
+        )))
+    })?;
+    let resolution = read_request
+        .resolve_ownership(
+            "permission_rule",
+            "/permission-rules/check",
+            "GET",
+            q.resource_id,
+            ctx.card_id,
+            ctx.user_id,
+        )
+        .await;
     resolution.apply_to(&mut ctx);
-    // 与 permission_check 中间件同一份启动期冻结旗标：正式授权仓储必须携带
-    // org_scope 准入状态（default-off），避免同进程内构造出无旗标仓储造成
-    // 与策略引擎宿主不一致的 ORG_AUTHORITY_DISABLED 判定（split-brain）。
-    let repo = state.rule_repository();
-    let decision = state.engine.evaluate(&ctx, &repo).await;
-    let result = if decision.allowed {
-        "ALLOW"
-    } else if decision.reason == "NO_MATCH" {
-        "NO_MATCH"
-    } else {
-        "DENY"
-    };
-    Ok(Json(ApiResponse::success(
-        serde_json::json!({ "effect": result, "reason": decision.reason }),
-    )))
+    let decision = read_request
+        .evaluate_with_admission(&state.engine, &ctx)
+        .await
+        .into_parts()
+        .0;
+    read_request
+        .ensure_current()
+        .map_err(|error| AppError(AstralError::Pending(error.to_string())))?;
+    permission_check_response(PermissionCheckResult::from_decision(&decision))
 }
 
 async fn list_rules(
@@ -499,4 +556,67 @@ async fn list_resource_types(
         })
         .collect();
     Ok(Json(ApiResponse::success(types)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astral_types::PolicyDecision;
+    use axum::response::IntoResponse;
+
+    fn decision(allowed: bool, reason: &str) -> PolicyDecision {
+        PolicyDecision {
+            allowed,
+            reason: reason.to_owned(),
+            matched_rule: None,
+            audit_required: false,
+            evaluation_path: Vec::new(),
+            matched_rule_id: None,
+            condition_results: None,
+            snapshot_version: None,
+            org_provenance: None,
+        }
+    }
+
+    #[test]
+    fn advisory_allow_is_the_only_success_envelope() {
+        let result = PermissionCheckResult::from_decision(&decision(true, "RULE_SET_ALLOW"));
+        assert!(result.allowed);
+        assert_eq!(result.effect, "ALLOW");
+        assert_eq!(result.state, "ALLOW");
+        let response = permission_check_response(result).expect("ALLOW is advisory success");
+        assert_eq!(response.0.data.expect("data").effect, "ALLOW");
+    }
+
+    #[test]
+    fn advisory_deny_and_no_match_are_transport_denials() {
+        for reason in ["DEFAULT_DENY", "NO_MATCH"] {
+            let result = PermissionCheckResult::from_decision(&decision(false, reason));
+            assert!(!result.allowed);
+            assert_eq!(result.effect, "DENY");
+            assert_eq!(result.state, "DENY");
+            let error = permission_check_response(result).expect_err("deny must not be success");
+            let response = error.into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[test]
+    fn advisory_pending_is_not_an_allowance() {
+        let result = PermissionCheckResult::from_decision(&decision(false, "EVIDENCE_PENDING"));
+        assert!(!result.allowed);
+        assert_eq!(result.effect, "PENDING");
+        assert_eq!(result.state, "PENDING");
+        let error = permission_check_response(result).expect_err("pending must not be success");
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn advisory_payload_has_no_mutation_admission_field() {
+        let result = PermissionCheckResult::from_decision(&decision(true, "RULE_SET_ALLOW"));
+        let value = serde_json::to_value(result).expect("advisory result serializes");
+        assert!(value.get("authorizationAdmission").is_none());
+        assert!(value.get("admission").is_none());
+    }
 }

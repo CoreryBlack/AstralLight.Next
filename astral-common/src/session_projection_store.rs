@@ -19,6 +19,9 @@
 //!   [`MirrorPolicy::DenyOnly`]（撤销 marker 可加速，ALLOW 每请求 strict DB），
 //!   直到自身拥有完整的 channel proof/watermark。组合进程（单写者，global
 //!   LocalBus/hub 安装方）经显式配置开启 VerifiedPositive。
+//! - **certified memory-only**：[`MirrorPolicy::CertifiedMemoryOnly`] 只使用已认证的
+//!   进程内 grant；撤销、绑定不一致和过期仍拒绝，镜像未命中/不可用返回
+//!   [`SessionProjectionDecision::Unavailable`]，绝不回退 [`AccessSessionSource`]。
 //! - **源回收后即拒绝**：ALLOW 只能来自 durable 事实（jti index ACTIVE +
 //!   session ACTIVE + family ACTIVE + 卡绑定逐项一致 + 未过期），DB 侧撤销
 //!   （status='DELETED'/REVOKED）下一请求立即生效。
@@ -65,11 +68,15 @@ const SUSPECT_PERMANENT: u8 = 2;
 /// - [`MirrorPolicy::DenyOnly`]（默认/安全）：镜像只承载撤销 marker（命中即
 ///   拒）；ALLOW 一律 strict DB。适用于独立多写者 Gateway。
 /// - [`MirrorPolicy::VerifiedPositive`]：镜像 active grant 命中且逐项绑定
-///   一致时可放行。**仅限**显式配置 + 单写者组合进程（见模块文档）。
+///   一致时可放行；miss 回退 strict DB。**仅限**显式配置 + 单写者组合进程
+///   （见模块文档）。
+/// - [`MirrorPolicy::CertifiedMemoryOnly`]：只接受镜像 active grant 命中；撤销、
+///   绑定不一致和过期拒绝，miss/不可用返回 `Unavailable`，不调用 strict source。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MirrorPolicy {
     DenyOnly,
     VerifiedPositive,
+    CertifiedMemoryOnly,
 }
 
 /// Gateway 鉴权侧用于与 durable 事实逐项绑定的 claims 事实集。
@@ -554,6 +561,46 @@ impl SessionProjectionMirror {
         }
     }
 
+    /// Memory-only grant query. Unlike [`Self::lookup_grant`], an expired token
+    /// remains a stable deny; stale mirror state is an unavailable miss because
+    /// this policy has no strict source fallback.
+    fn lookup_grant_memory_only(
+        &self,
+        jti: &str,
+        bind: &SessionBindContext,
+    ) -> SessionProjectionDecision {
+        let jti = jti.trim();
+        if jti.is_empty() {
+            return SessionProjectionDecision::Deny("SESSION_NOT_FOUND");
+        }
+        if !self.grant_mirror_healthy() {
+            return SessionProjectionDecision::Deny(MIRROR_MISS);
+        }
+        let Ok(mut inner) = self.inner.write() else {
+            self.mark_suspect_for_secs(60);
+            return SessionProjectionDecision::Deny(MIRROR_MISS);
+        };
+        let now_epoch = utc_now_seconds();
+        let now = Instant::now();
+        match inner.grants.get(jti) {
+            Some(entry) if entry.grant.expires_at_epoch_second <= now_epoch => {
+                inner.grants.remove(jti);
+                SessionProjectionDecision::Deny("TOKEN_EXPIRED")
+            }
+            Some(_) if bind.expires_at_epoch_second <= now_epoch => {
+                inner.grants.remove(jti);
+                SessionProjectionDecision::Deny("TOKEN_EXPIRED")
+            }
+            Some(entry) if entry.mirror_expires_at <= now => {
+                inner.grants.remove(jti);
+                SessionProjectionDecision::Deny(MIRROR_MISS)
+            }
+            Some(entry) if entry.grant.binds_match(bind) => SessionProjectionDecision::Allow,
+            Some(_) => SessionProjectionDecision::Deny("SESSION_CONTEXT_MISMATCH"),
+            None => SessionProjectionDecision::Deny(MIRROR_MISS),
+        }
+    }
+
     /// 观测计数（测试/诊断用）。
     pub fn live_entries(&self) -> (usize, usize) {
         self.inner
@@ -665,22 +712,52 @@ impl SessionProjectionStore {
         self.mirror.as_ref()
     }
 
+    fn uses_positive_mirror(&self) -> bool {
+        matches!(
+            self.policy,
+            MirrorPolicy::VerifiedPositive | MirrorPolicy::CertifiedMemoryOnly
+        )
+    }
+
     /// positive allow 是否被策略允许（观测/安装侧守卫用）。
     pub fn mirror_positive_allowed(&self) -> bool {
-        self.policy == MirrorPolicy::VerifiedPositive && self.mirror.is_some()
+        self.uses_positive_mirror() && self.mirror.is_some()
+    }
+
+    fn certified_memory_only_decision(
+        &self,
+        jti: &str,
+        bind: &SessionBindContext,
+    ) -> SessionProjectionDecision {
+        let Some(mirror) = &self.mirror else {
+            return SessionProjectionDecision::Unavailable;
+        };
+        if mirror.lookup_revoked(jti) {
+            return SessionProjectionDecision::Deny("TOKEN_REVOKED");
+        }
+        match mirror.lookup_grant_memory_only(jti, bind) {
+            SessionProjectionDecision::Allow => SessionProjectionDecision::Allow,
+            SessionProjectionDecision::Deny(MIRROR_MISS)
+            | SessionProjectionDecision::Unavailable => SessionProjectionDecision::Unavailable,
+            SessionProjectionDecision::Deny(reason) => SessionProjectionDecision::Deny(reason),
+        }
     }
 
     /// Gateway 会话判定主路径：
     /// 1. 镜像撤销 marker 命中 → Deny（已证明撤销事实，任何策略下启用）；
-    /// 2. 仅 VerifiedPositive：镜像 grant 命中且绑定一致 → Allow（健康 +
-    ///    未过期 + 逐项绑定）；
-    /// 3. 其余一律 strict DB：`Err` → Unavailable，`Ok(None)` → Deny，
+    /// 2. VerifiedPositive：镜像 grant 命中且绑定一致 → Allow（健康 + 未过期
+    ///    + 逐项绑定），miss 回退 strict DB；CertifiedMemoryOnly 只在此命中
+    ///      时 Allow，miss/不可用返回 Unavailable；
+    /// 3. DenyOnly 或 VerifiedPositive 的其余路径 strict DB：`Err` → Unavailable，`Ok(None)` → Deny，
     ///    `Ok(Some)` → [`evaluate_access_fact`] 逐项绑定后 Allow/Deny。
     pub async fn verify_access(
         &self,
         jti: &str,
         bind: &SessionBindContext,
     ) -> SessionProjectionDecision {
+        if self.policy == MirrorPolicy::CertifiedMemoryOnly {
+            return self.certified_memory_only_decision(jti, bind);
+        }
         if let Some(mirror) = &self.mirror {
             if mirror.lookup_revoked(jti) {
                 return SessionProjectionDecision::Deny("TOKEN_REVOKED");
@@ -705,6 +782,9 @@ impl SessionProjectionStore {
         jti: &str,
         bind: &SessionBindContext,
     ) -> SessionProjectionDecision {
+        if self.policy == MirrorPolicy::CertifiedMemoryOnly {
+            return self.certified_memory_only_decision(jti, bind);
+        }
         if let Some(mirror) = &self.mirror {
             if mirror.lookup_revoked(jti) {
                 return SessionProjectionDecision::Deny("TOKEN_REVOKED");
@@ -745,6 +825,14 @@ impl SessionProjectionStore {
     {
         if !fence_current() {
             return SessionProjectionDecision::Unavailable;
+        }
+        if self.policy == MirrorPolicy::CertifiedMemoryOnly {
+            let decision = self.certified_memory_only_decision(jti, bind);
+            return if fence_current() {
+                decision
+            } else {
+                SessionProjectionDecision::Unavailable
+            };
         }
         if let Some(hit) = self.mirror_decision(jti, bind) {
             return if fence_current() {
@@ -817,7 +905,7 @@ impl SessionProjectionStore {
         if mirror.lookup_revoked(jti) {
             return Some(SessionProjectionDecision::Deny("TOKEN_REVOKED"));
         }
-        if self.policy == MirrorPolicy::VerifiedPositive {
+        if self.uses_positive_mirror() {
             match mirror.lookup_grant(jti, bind) {
                 SessionProjectionDecision::Deny(MIRROR_MISS)
                 | SessionProjectionDecision::Unavailable => {}
@@ -828,9 +916,10 @@ impl SessionProjectionStore {
     }
 
     /// 签发侧登记：durable proof 已落库并 strict 复核后调用（DenyOnly 策略
-    /// 下跳过 grant 登记，只保留撤销 marker 通道）。
+    /// 下跳过 grant 登记，只保留撤销 marker 通道）。CertifiedMemoryOnly 同样
+    /// 只接受此类已认证 grant，但验证时不会从 source refill。
     pub fn note_grant_installed(&self, grant: IssuedAccessGrant) {
-        if self.policy != MirrorPolicy::VerifiedPositive {
+        if !self.uses_positive_mirror() {
             return;
         }
         if let Some(mirror) = &self.mirror {
@@ -1168,6 +1257,99 @@ mod tests {
             } else {
                 Ok(self.fact.clone())
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn certified_memory_only_never_invokes_source_for_hit_miss_revoke_or_mismatch() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = SessionProjectionStore::new(
+            Arc::new(CountingSource {
+                calls: calls.clone(),
+            }),
+            Some(SessionProjectionMirror::default()),
+            MirrorPolicy::CertifiedMemoryOnly,
+        );
+        let request = bind(Some(40), Some(20), Some(30));
+        store.note_grant_installed(issued("memory-hit", 3));
+        let mut expiring = issued("memory-expired", 3);
+        expiring.expires_at_epoch_second = utc_now_seconds() + 1;
+        store.note_grant_installed(expiring);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        assert_eq!(
+            store.verify_access("memory-expired", &request).await,
+            SessionProjectionDecision::Deny("TOKEN_EXPIRED")
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        assert_eq!(
+            store.verify_access("memory-hit", &request).await,
+            SessionProjectionDecision::Allow
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        assert_eq!(
+            store.verify_access("memory-miss", &request).await,
+            SessionProjectionDecision::Unavailable
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        store.note_revocation("memory-revoked", 3600);
+        assert_eq!(
+            store.verify_access("memory-revoked", &request).await,
+            SessionProjectionDecision::Deny("TOKEN_REVOKED")
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        assert_eq!(
+            store
+                .verify_access("memory-hit", &bind(Some(41), Some(20), Some(30)))
+                .await,
+            SessionProjectionDecision::Deny("SESSION_CONTEXT_MISMATCH")
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn certified_memory_only_returns_unavailable_for_stale_grant_without_source() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = SessionProjectionStore::new(
+            Arc::new(CountingSource {
+                calls: calls.clone(),
+            }),
+            Some(SessionProjectionMirror::new(1, DEFAULT_MIRROR_MAX_ENTRIES)),
+            MirrorPolicy::CertifiedMemoryOnly,
+        );
+        store.note_grant_installed(issued("memory-stale", 3));
+        std::thread::sleep(Duration::from_millis(1_100));
+
+        assert_eq!(
+            store
+                .verify_access_with_fence(
+                    "memory-stale",
+                    &bind(Some(40), Some(20), Some(30)),
+                    || { true }
+                )
+                .await,
+            SessionProjectionDecision::Unavailable
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    struct CountingSource {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AccessSessionSource for CountingSource {
+        async fn load_access_fact(
+            &self,
+            _jti: &str,
+            _bind: &SessionBindContext,
+        ) -> Result<Option<AccessSessionDurableFact>, String> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Ok(Some(active_fact(Some(40), Some(20), Some(30))))
         }
     }
 

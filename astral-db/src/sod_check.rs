@@ -72,9 +72,11 @@ use astral_types::org_scope::{
     OrgBranchProvenance, OrgContribution, OrgReadRequest, OrgSubjectFilter,
 };
 use astral_types::{
-    build_resource_key, DomainScopeRequirement, PolicyContext, PolicyDecision,
+    build_resource_key, DomainScopeRequirement, PolicyContext, PolicyDecision, PolicyError,
     PublishedCardAuthorization, PublishedCardEvidenceScope, ResourceOwnershipScope,
 };
+
+use crate::certified_memory_authority::{CertifiedSodConflictType, CertifiedSodPolicy};
 use sqlx::MySqlPool;
 
 use crate::authorization_projection_repository::AuthorizationEvidenceError;
@@ -269,7 +271,159 @@ fn prove_direct_update_self_exclusion(
     Ok(grant_id)
 }
 
-/// 解析 scoped resource key 为 plain resource type：`type:*` 与 `type:id` 均返回
+/// Certified-memory deny-only SoD input. All values must come from one
+/// `CertifiedSodReadSet`; no durable source may be consulted after construction.
+#[derive(Debug, Clone)]
+pub struct CertifiedSodInput {
+    pub policies: Vec<CertifiedSodPolicy>,
+    pub evidence: PublishedCardAuthorization,
+    pub org_contributions: Option<Vec<OrgContribution>>,
+}
+
+/// Evaluate certified SoD facts without I/O. Missing dynamic owner facts,
+/// malformed active policies, invalid evidence, and unavailable ORG provenance
+/// are errors, never an empty/no-conflict result.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_certified_sod(
+    input: CertifiedSodInput,
+    context: &PolicyContext,
+    resource_owner_id: Option<i64>,
+) -> Result<SodCheckResult, PolicyError> {
+    let Some(card_id) = context.card_id else {
+        return Err(PolicyError::Repository(
+            "certified_memory.sod_context_missing".to_owned(),
+        ));
+    };
+    let Some(resource_type) = context.resource.as_deref() else {
+        return Err(PolicyError::Repository(
+            "certified_memory.sod_context_missing".to_owned(),
+        ));
+    };
+    let Some(user_id) = context.user_id else {
+        return Err(PolicyError::Repository(
+            "certified_memory.sod_context_missing".to_owned(),
+        ));
+    };
+    if card_id <= 0 || user_id <= 0 || input.evidence.card_id != card_id {
+        return Err(PolicyError::Repository(
+            "certified_memory.sod_evidence_scope_mismatch".to_owned(),
+        ));
+    }
+    if context.tenant_id != Some(input.evidence.tenant_id) {
+        return Err(PolicyError::Repository(
+            "certified_memory.sod_evidence_scope_mismatch".to_owned(),
+        ));
+    }
+    for policy in &input.policies {
+        policy.validate().map_err(|error| {
+            PolicyError::Repository(format!(
+                "certified_memory.sod_policy_invalid;detail={error}"
+            ))
+        })?;
+    }
+    input.evidence.validate().map_err(|error| {
+        PolicyError::Repository(format!(
+            "certified_memory.sod_evidence_invalid;detail={error}"
+        ))
+    })?;
+    if context.resource_ownership_scope == ResourceOwnershipScope::Unavailable
+        || context.resource_ownership_scope == ResourceOwnershipScope::Unresolved
+    {
+        return Err(PolicyError::Repository(
+            "certified_memory.sod_ownership_unavailable".to_owned(),
+        ));
+    }
+
+    let perm_key = format!("{resource_type}:{}", context.action);
+    for policy in &input.policies {
+        let (policy_name, conflict_type, partner) = match policy.conflict_type {
+            CertifiedSodConflictType::Static => {
+                let (Some(a), Some(b)) = (&policy.permission_a, &policy.permission_b) else {
+                    return Err(PolicyError::Repository(
+                        "certified_memory.sod_policy_invalid_static".to_owned(),
+                    ));
+                };
+                let partner = if a == &perm_key {
+                    b
+                } else if b == &perm_key {
+                    a
+                } else {
+                    continue;
+                };
+                (
+                    policy.policy_name.as_str(),
+                    "STATIC",
+                    Some(partner.as_str()),
+                )
+            }
+            CertifiedSodConflictType::Dynamic => {
+                let Some(script) = policy.condition_script.as_deref() else {
+                    return Err(PolicyError::Repository(
+                        "certified_memory.sod_policy_invalid_dynamic".to_owned(),
+                    ));
+                };
+                let matches = policy
+                    .resource_type
+                    .as_deref()
+                    .is_none_or(|value| value.eq_ignore_ascii_case(resource_type))
+                    && policy
+                        .action_code
+                        .as_deref()
+                        .is_none_or(|value| value.eq_ignore_ascii_case(&context.action));
+                if !matches {
+                    continue;
+                }
+                let triggered =
+                    evaluate_dynamic_condition(script, Some(user_id), resource_owner_id)
+                        .map_err(|error| PolicyError::Repository(error.to_string()))?;
+                if triggered {
+                    return Ok(SodCheckResult {
+                        has_conflict: true,
+                        conflict_policy: Some(policy.policy_name.clone()),
+                        conflict_permission: Some(format!("DYNAMIC: {script}")),
+                        conflict_type: Some("DYNAMIC".to_owned()),
+                    });
+                }
+                continue;
+            }
+        };
+        let Some(partner) = partner else {
+            continue;
+        };
+        let parts: Vec<&str> = partner.splitn(2, ':').collect();
+        if parts.len() == 2
+            && input.evidence.effective_grants.iter().any(|grant| {
+                sod_partner_matches_grant(&grant.resource, &grant.action, parts[0], parts[1])
+            })
+        {
+            return Ok(SodCheckResult {
+                has_conflict: true,
+                conflict_policy: Some(policy_name.to_owned()),
+                conflict_permission: Some(partner.to_owned()),
+                conflict_type: Some(conflict_type.to_owned()),
+            });
+        }
+        if let Some(contributions) = input.org_contributions.as_deref() {
+            if contributions.iter().any(|contribution| {
+                org_sod_contribution_matches_partner(contribution, parts[0], parts[1])
+            }) {
+                return Ok(SodCheckResult {
+                    has_conflict: true,
+                    conflict_policy: Some(policy_name.to_owned()),
+                    conflict_permission: Some(partner.to_owned()),
+                    conflict_type: Some(conflict_type.to_owned()),
+                });
+            }
+        }
+    }
+    Ok(SodCheckResult {
+        has_conflict: false,
+        conflict_policy: None,
+        conflict_permission: None,
+        conflict_type: None,
+    })
+}
+
 /// `type`，plain key 原样返回。
 ///
 /// 语义对齐 `permission_query::parse_resource_type`（Java `parseResourceKey`）：
@@ -549,17 +703,17 @@ fn org_sod_contribution_matches_partner(
         && org_action_matches(partner_action, &contribution.scope.action)
 }
 
-fn org_sod_contributions(
-    tenant_id: i64,
-    card_id: i64,
-    user_id: i64,
-    resource_type: &str,
-    action_code: &str,
-    input: &OrgSodInput<'_>,
+pub fn collect_org_sod_contributions(
+    context: &PolicyContext,
+    admission: &OrgSodAdmission,
 ) -> Result<Vec<OrgContribution>, sqlx::Error> {
-    let context = input.context;
-    let evidence = &input.admission.evidence;
-    let provenance = &input.admission.provenance;
+    let tenant_id = context.tenant_id.unwrap_or_default();
+    let card_id = context.card_id.unwrap_or_default();
+    let user_id = context.user_id.unwrap_or_default();
+    let resource_type = context.resource.as_deref().unwrap_or_default();
+    let action_code = context.action.as_str();
+    let evidence = &admission.evidence;
+    let provenance = &admission.provenance;
     evidence.validate().map_err(|error| {
         sod_gate_error(&format!("org_scope_sod_evidence_invalid;detail={error}"))
     })?;
@@ -659,6 +813,10 @@ fn org_sod_contributions(
         return Err(sod_gate_error("org_scope_sod_provenance_stale"));
     }
     Ok(contributions)
+}
+
+fn org_sod_contributions(input: &OrgSodInput<'_>) -> Result<Vec<OrgContribution>, sqlx::Error> {
+    collect_org_sod_contributions(input.context, input.admission)
 }
 
 /// Native pre-grant SoD validation for a card-level grant.
@@ -1049,17 +1207,7 @@ async fn check_published_sod_conflict(
     }
 
     let org_contributions = match org_input {
-        Some(input) => {
-            let user_id = user_id.ok_or_else(|| sod_gate_error("org_scope_sod_context_missing"))?;
-            Some(org_sod_contributions(
-                tenant_id,
-                card_id,
-                user_id,
-                resource_type,
-                action_code,
-                &input,
-            )?)
-        }
+        Some(input) => Some(org_sod_contributions(&input)?),
         None => None,
     };
 
@@ -1513,6 +1661,97 @@ mod tests {
             permission_a: Some(permission_a.to_owned()),
             permission_b: Some(permission_b.to_owned()),
         }
+    }
+
+    #[test]
+    fn certified_static_sod_uses_published_grants_and_denies_conflict() {
+        let input = CertifiedSodInput {
+            policies: vec![CertifiedSodPolicy {
+                policy_name: "exclusive-review-submit".to_owned(),
+                conflict_type: CertifiedSodConflictType::Static,
+                permission_a: Some("approval:submit".to_owned()),
+                permission_b: Some("approval:approve".to_owned()),
+                condition_script: None,
+                resource_type: None,
+                action_code: None,
+            }],
+            evidence: published_sod_evidence(vec![published_sod_grant("approval:*", "approve", 1)]),
+            org_contributions: None,
+        };
+        let context = PolicyContext::builder()
+            .user_id(Some(42))
+            .card_id(Some(17))
+            .tenant_id(Some(7))
+            .resource(Some("approval".to_owned()))
+            .resource_tenant_id(Some(7))
+            .resource_ownership_scope(ResourceOwnershipScope::TenantScoped)
+            .action("submit".to_owned())
+            .build();
+        let result = evaluate_certified_sod(input, &context, None).expect("certified SoD read");
+        assert!(result.has_conflict);
+        assert_eq!(result.conflict_type.as_deref(), Some("STATIC"));
+    }
+
+    #[test]
+    fn certified_dynamic_sod_missing_owner_is_unavailable() {
+        let input = CertifiedSodInput {
+            policies: vec![CertifiedSodPolicy {
+                policy_name: "owner-only".to_owned(),
+                conflict_type: CertifiedSodConflictType::Dynamic,
+                permission_a: None,
+                permission_b: None,
+                condition_script: Some("resourceOwnerId == currentUserId".to_owned()),
+                resource_type: Some("approval".to_owned()),
+                action_code: Some("submit".to_owned()),
+            }],
+            evidence: published_sod_evidence(Vec::new()),
+            org_contributions: None,
+        };
+        let context = PolicyContext::builder()
+            .user_id(Some(42))
+            .card_id(Some(17))
+            .tenant_id(Some(7))
+            .resource(Some("approval".to_owned()))
+            .resource_tenant_id(Some(7))
+            .resource_ownership_scope(ResourceOwnershipScope::TenantScoped)
+            .action("submit".to_owned())
+            .build();
+        assert!(matches!(
+            evaluate_certified_sod(input, &context, None),
+            Err(PolicyError::Repository(message))
+                if message.contains("dynamic SoD owner condition requires authoritative owner fact")
+        ));
+    }
+
+    #[test]
+    fn certified_invalid_policy_cannot_be_interpreted_as_no_conflict() {
+        let input = CertifiedSodInput {
+            policies: vec![CertifiedSodPolicy {
+                policy_name: "invalid-static".to_owned(),
+                conflict_type: CertifiedSodConflictType::Static,
+                permission_a: Some("approval:submit".to_owned()),
+                permission_b: None,
+                condition_script: None,
+                resource_type: None,
+                action_code: None,
+            }],
+            evidence: published_sod_evidence(Vec::new()),
+            org_contributions: None,
+        };
+        let context = PolicyContext::builder()
+            .user_id(Some(42))
+            .card_id(Some(17))
+            .tenant_id(Some(7))
+            .resource(Some("approval".to_owned()))
+            .resource_tenant_id(Some(7))
+            .resource_ownership_scope(ResourceOwnershipScope::TenantScoped)
+            .action("submit".to_owned())
+            .build();
+        assert!(matches!(
+            evaluate_certified_sod(input, &context, None),
+            Err(PolicyError::Repository(message))
+                if message.starts_with("certified_memory.sod_policy_invalid;")
+        ));
     }
 
     #[test]
@@ -2434,8 +2673,7 @@ mod tests {
         context: &PolicyContext,
         admission: &OrgSodAdmission,
     ) -> Result<Vec<OrgContribution>, sqlx::Error> {
-        let input = OrgSodInput { context, admission };
-        org_sod_contributions(ORG_SOD_TENANT, 222, 11, "doc", "read", &input)
+        collect_org_sod_contributions(context, admission)
     }
 
     /// 跨租户组织贡献必须被 STATIC 持有复核看见：贡献按自身权威 resource

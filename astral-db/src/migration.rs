@@ -26,6 +26,8 @@ mod authority_publication_history;
 mod authority_source_bootstrap_use;
 mod authority_source_outcome;
 mod authority_v7;
+mod certified_memory_completion;
+mod certified_memory_operation_width;
 mod commerce_billing_cycle;
 mod delivery_intent;
 mod empty_card_origin;
@@ -1428,6 +1430,7 @@ fn migration_requires_exact_artifact_parse(version: i64) -> bool {
                 | source_terminal_receipt::VERSION
                 | authority_operation_width::VERSION
                 | authority_source_bootstrap_use::VERSION
+                | certified_memory_completion::VERSION
                 | commerce_billing_cycle::VERSION
         )
 }
@@ -6280,6 +6283,8 @@ async fn preflight_schema_contract_before_sqlx(
     let manifest_v3_complete = preflight_manifest_v3(pool, applied_versions, migrations).await?;
     let operation_width_complete =
         authority_operation_width::preflight(pool, applied_versions, migrations).await?;
+    let certified_memory_operation_width_complete =
+        certified_memory_operation_width::preflight(pool, applied_versions, migrations).await?;
     let source_bootstrap_complete =
         authority_source_bootstrap_use::preflight(pool, applied_versions, migrations).await?;
     let review_schema_complete =
@@ -6309,6 +6314,7 @@ async fn preflight_schema_contract_before_sqlx(
         && terminal_receipt_complete
         && commerce_billing_complete
         && operation_width_complete
+        && certified_memory_operation_width_complete
         && source_bootstrap_complete;
     let mut absent_tables = HashSet::new();
     for (table, columns) in REQUIRED_SCHEMA_COLUMNS {
@@ -11356,6 +11362,22 @@ const EXACT_MIGRATION_ARTIFACT_CONTRACTS: &[ExactMigrationArtifactContract] = &[
         indexes: authority_source_outcome::INDEXES,
     },
     ExactMigrationArtifactContract {
+        version: certified_memory_completion::VERSION,
+        source_sha384: certified_memory_completion::SOURCE_SHA384,
+        supports_existing_artifacts: false,
+        tables: certified_memory_completion::TABLES,
+        columns: certified_memory_completion::COLUMNS,
+        indexes: certified_memory_completion::INDEXES,
+    },
+    ExactMigrationArtifactContract {
+        version: certified_memory_operation_width::VERSION,
+        source_sha384: certified_memory_operation_width::SOURCE_SHA384,
+        supports_existing_artifacts: true,
+        tables: certified_memory_operation_width::TABLES,
+        columns: certified_memory_operation_width::COLUMNS,
+        indexes: certified_memory_operation_width::INDEXES,
+    },
+    ExactMigrationArtifactContract {
         version: delivery_intent::VERSION,
         source_sha384: delivery_intent::SOURCE_SHA384,
         supports_existing_artifacts: false,
@@ -14043,6 +14065,9 @@ pub async fn validate_schema_contract(pool: &MySqlPool) -> Result<(), MigrationE
     )
     .await?;
     validate_indexes(pool, authority_source_outcome::INDEXES).await?;
+    certified_memory_operation_width::validate_runtime_columns(pool).await?;
+    validate_schema_columns(pool, certified_memory_completion::COLUMN_CONTRACTS).await?;
+    validate_indexes(pool, certified_memory_completion::INDEXES).await?;
     validate_schema_columns(pool, authority_source_bootstrap_use::COLUMN_CONTRACTS).await?;
     validate_indexes(pool, authority_source_bootstrap_use::INDEXES).await?;
     commerce_billing_cycle::validate_runtime(pool).await?;

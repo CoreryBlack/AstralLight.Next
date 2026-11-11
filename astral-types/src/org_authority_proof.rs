@@ -4,8 +4,9 @@ use sha2::{Digest, Sha256};
 
 use crate::org_scope::OrgAdmissionEvidence;
 use crate::{
-    AuthorizationAuthorityError, AuthorizationDomainScope, AuthorizationFenceProof,
-    DomainScopeRequirement, PolicyContext, PublishedCardEvidenceScope,
+    authorization_request_digest, AuthorityOrgScope, AuthorityProtocolScope,
+    AuthorityScopePublicationCertificate, AuthorizationAuthorityError, AuthorizationDomainScope,
+    AuthorizationFenceProof, DomainScopeRequirement, PolicyContext, PublishedCardEvidenceScope,
 };
 
 pub fn org_authority_evidence_scope(
@@ -81,6 +82,11 @@ fn org_evidence_content_digest(
     Ok(hex::encode(digest.finalize()))
 }
 
+/// Validate an ORG proof against the exact request and its immutable evidence.
+///
+/// `snapshot_hash` is the ORG evidence content identity. It is intentionally
+/// independent from the certified-memory root attestation hash; the latter is
+/// checked by the memory repository as a global root identity.
 pub fn validate_org_authority_proof(
     proof: &AuthorizationFenceProof,
     context: &PolicyContext,
@@ -89,6 +95,9 @@ pub fn validate_org_authority_proof(
     now_seconds: i64,
 ) -> Result<(), AuthorizationAuthorityError> {
     proof.validate_at(now_seconds)?;
+    if proof.request_binding_digest.is_none() || proof.scope_certificate_hash.is_none() {
+        return Err(AuthorizationAuthorityError::ScopeMismatch);
+    }
     proof
         .scope
         .matches_evidence_scope(&org_authority_evidence_scope(context)?)?;
@@ -97,8 +106,13 @@ pub fn validate_org_authority_proof(
         AuthorizationDomainScope::NoDomain => context.domain_id.is_none(),
         AuthorizationDomainScope::Exact(domain_id) => context.domain_id == Some(domain_id),
     };
+    let request_binding_digest = authorization_request_digest(context)
+        .map_err(|_| AuthorizationAuthorityError::ScopeMismatch)?;
+    let request_binding_matches =
+        proof.request_binding_digest.as_deref() == Some(request_binding_digest.as_str());
     if proof.request_nonce != nonce
         || !domain_matches
+        || !request_binding_matches
         || context.user_id != Some(evidence.membership.user_id)
         || context.identity_card_id != Some(evidence.membership.identity_card_id)
         || context.card_id != Some(evidence.membership.card_id)
@@ -112,6 +126,60 @@ pub fn validate_org_authority_proof(
     Ok(())
 }
 
+/// The publication certificate's mutation identity and signer may legitimately
+/// differ from the fresh request proof: the proof authorizes a read of an
+/// existing publication, while the certificate records the publication
+/// operation. The authority transport must verify the certificate signature
+/// against its registered signer before this value-level binding is accepted.
+pub fn validate_org_authority_proof_with_certificate(
+    proof: &AuthorizationFenceProof,
+    context: &PolicyContext,
+    evidence: &OrgAdmissionEvidence,
+    certificate: &AuthorityScopePublicationCertificate,
+    nonce: &str,
+    now_seconds: i64,
+) -> Result<(), AuthorizationAuthorityError> {
+    validate_org_authority_proof(proof, context, evidence, nonce, now_seconds)?;
+    certificate
+        .validate()
+        .map_err(|_| AuthorizationAuthorityError::EvidenceInvalid)?;
+    let expected_scope = AuthorityProtocolScope::Org(AuthorityOrgScope {
+        tenant_id: evidence.publication.tenant_id,
+        root_tenant_id: Some(evidence.publication.root_tenant_id),
+        member: crate::AuthorityOrgMemberSubject {
+            user_id: evidence.membership.user_id,
+            identity_card_id: evidence.membership.identity_card_id,
+            card_id: evidence.membership.card_id,
+        },
+    });
+    let certificate_hash = certificate
+        .record_digest()
+        .map_err(|_| AuthorizationAuthorityError::EvidenceInvalid)?;
+    let evidence_hash = org_authority_evidence_hash(evidence)?;
+    let (certificate_generation, certificate_revoke_watermark) =
+        certificate
+            .manifests
+            .iter()
+            .fold((0, 0), |(generation, revoke_watermark), manifest| {
+                (
+                    generation.max(manifest.generation),
+                    revoke_watermark.max(manifest.revoke_fence),
+                )
+            });
+    if proof.scope_certificate_hash.as_deref() != Some(certificate_hash.as_str())
+        || certificate.scope != expected_scope
+        || certificate.snapshot_hash != evidence_hash
+        || certificate.authority_id != proof.authority_id
+        || certificate.authority_term > proof.authority_term
+        || certificate.global_fence_sequence > proof.global_fence_sequence
+        || certificate_generation != proof.scope_generation
+        || certificate_revoke_watermark != proof.revoke_watermark
+    {
+        return Err(AuthorizationAuthorityError::EvidenceFrontierMismatch);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +187,7 @@ mod tests {
         org_build_segment, org_manifest_digest_hex, OrgContribution, OrgGrant, OrgGrantRef,
         OrgManifestDigestMaterial, OrgProvenance, OrgScope, OrgScopeKey, OrgSegmentContent,
     };
+    use crate::AuthorizationAuthorityScope;
     use crate::ValidityWindow;
     use uuid::Uuid;
 
@@ -251,10 +320,189 @@ mod tests {
         }
     }
 
+    fn authority_context() -> PolicyContext {
+        PolicyContext::builder()
+            .user_id(Some(11))
+            .principal_kind(Some("PLATFORM_USER".to_owned()))
+            .card_id(Some(222))
+            .identity_card_id(Some(111))
+            .tenant_id(Some(ROOT_TENANT))
+            .resource(Some("doc:42".to_owned()))
+            .action("read".to_owned())
+            .target_id(Some(42))
+            .request_fingerprint(Some("a".repeat(64)))
+            .request_operation_id(Some("op-request-1".to_owned()))
+            .build()
+    }
+
+    fn authority_proof(
+        context: &PolicyContext,
+        evidence: &OrgAdmissionEvidence,
+    ) -> AuthorizationFenceProof {
+        AuthorizationFenceProof {
+            authorization_edition: crate::AUTHORIZATION_EDITION,
+            authority_id: "authority-1".to_owned(),
+            authority_term: 1,
+            global_fence_sequence: 1,
+            scope: AuthorizationAuthorityScope::from_evidence_scope(
+                &org_authority_evidence_scope(context).unwrap(),
+            ),
+            scope_generation: evidence.publication.generation,
+            revoke_watermark: evidence.publication.revoke_fence,
+            snapshot_hash: org_authority_evidence_hash(evidence).unwrap(),
+            parent_hash: None,
+            operation_id: "op-authority-1".to_owned(),
+            event_id: "event-authority-1".to_owned(),
+            key_id: "key-1".to_owned(),
+            key_epoch: 1,
+            issued_at: 1_000,
+            not_before: 1_000,
+            expires_at: 2_000,
+            request_nonce: "nonce-1".to_owned(),
+            request_binding_digest: Some(authorization_request_digest(context).unwrap()),
+            scope_certificate_hash: Some("cd".repeat(32)),
+            proof_id: "proof-1".to_owned(),
+            signature: "00".repeat(64),
+        }
+    }
+
     fn revoked_evidence() -> OrgAdmissionEvidence {
         let mut evidence = active_evidence();
         evidence.membership.active = false;
         evidence
+    }
+
+    fn authority_certificate(
+        context: &PolicyContext,
+        evidence: &OrgAdmissionEvidence,
+        proof: &AuthorizationFenceProof,
+    ) -> AuthorityScopePublicationCertificate {
+        AuthorityScopePublicationCertificate {
+            protocol_version: crate::AUTHORITY_PROTOCOL_VERSION,
+            authorization_edition: crate::AUTHORIZATION_EDITION,
+            authority_id: proof.authority_id.clone(),
+            authority_term: proof.authority_term,
+            global_fence_sequence: proof.global_fence_sequence,
+            certificate_id: "certificate-1".to_owned(),
+            intent_digest: "11".repeat(32),
+            reservation_id: "reservation-1".to_owned(),
+            operation_id: proof.operation_id.clone(),
+            event_id: proof.event_id.clone(),
+            scope: AuthorityProtocolScope::Org(AuthorityOrgScope {
+                tenant_id: evidence.publication.tenant_id,
+                root_tenant_id: Some(evidence.publication.root_tenant_id),
+                member: crate::AuthorityOrgMemberSubject {
+                    user_id: evidence.membership.user_id,
+                    identity_card_id: evidence.membership.identity_card_id,
+                    card_id: evidence.membership.card_id,
+                },
+            }),
+            approved_request_digest: authorization_request_digest(context).unwrap(),
+            before_image_digest: None,
+            after_image_digest: "22".repeat(32),
+            source_commit_digest: "33".repeat(32),
+            completion_digest: "44".repeat(32),
+            snapshot_hash: org_authority_evidence_hash(evidence).unwrap(),
+            source_outcome_digest: "55".repeat(32),
+            parent_certificate_hash: None,
+            manifests: vec![crate::AuthorityManifestIdentity {
+                aggregate_type: "ORG_PUBLICATION".to_owned(),
+                aggregate_id: evidence.publication.tenant_id,
+                manifest_digest_hex: evidence.publication.manifest_digest_hex.clone(),
+                dependency_hash_hex: "66".repeat(32),
+                semantic_hash_hex: "77".repeat(32),
+                generation: evidence.publication.generation,
+                revoke_fence: evidence.publication.revoke_fence,
+                event_id: proof.event_id.clone(),
+                operation_id: proof.operation_id.clone(),
+            }],
+            key_id: proof.key_id.clone(),
+            key_epoch: proof.key_epoch,
+            issued_at: 1_000,
+            not_before: 1_000,
+            expires_at: None,
+            certificate_nonce: "certificate-nonce-1".to_owned(),
+            signature: "00".repeat(64),
+        }
+    }
+
+    #[test]
+    fn validator_rejects_missing_request_binding_digest() {
+        let context = authority_context();
+        let evidence = active_evidence();
+        let mut proof = authority_proof(&context, &evidence);
+        proof.request_binding_digest = None;
+
+        assert_eq!(
+            validate_org_authority_proof(&proof, &context, &evidence, "nonce-1", 1_500),
+            Err(AuthorizationAuthorityError::ScopeMismatch)
+        );
+    }
+
+    #[test]
+    fn validator_rejects_mismatched_request_binding_digest() {
+        let context = authority_context();
+        let evidence = active_evidence();
+        let mut proof = authority_proof(&context, &evidence);
+        proof.request_binding_digest = Some("b".repeat(64));
+
+        assert_eq!(
+            validate_org_authority_proof(&proof, &context, &evidence, "nonce-1", 1_500),
+            Err(AuthorizationAuthorityError::ScopeMismatch)
+        );
+    }
+
+    #[test]
+    fn validator_binds_evidence_identity_separately_from_any_memory_root_hash() {
+        let context = authority_context();
+        let evidence = active_evidence();
+        let proof = authority_proof(&context, &evidence);
+        let root_hash = "ef".repeat(32);
+        assert_ne!(root_hash, proof.snapshot_hash);
+        assert!(
+            validate_org_authority_proof(&proof, &context, &evidence, "nonce-1", 1_500).is_ok()
+        );
+    }
+
+    #[test]
+    fn certificate_binding_requires_the_real_record_digest_and_frontier_fields() {
+        let context = authority_context();
+        let evidence = active_evidence();
+        let mut proof = authority_proof(&context, &evidence);
+        let certificate = authority_certificate(&context, &evidence, &proof);
+        proof.scope_certificate_hash = Some(certificate.record_digest().unwrap());
+        assert!(validate_org_authority_proof_with_certificate(
+            &proof,
+            &context,
+            &evidence,
+            &certificate,
+            "nonce-1",
+            1_500,
+        )
+        .is_ok());
+
+        let mut changed = certificate.clone();
+        changed.key_id = "different-key".to_owned();
+        assert_eq!(
+            validate_org_authority_proof_with_certificate(
+                &proof, &context, &evidence, &changed, "nonce-1", 1_500,
+            ),
+            Err(AuthorizationAuthorityError::EvidenceFrontierMismatch)
+        );
+
+        let mut changed_proof = proof.clone();
+        changed_proof.scope_certificate_hash = Some("ab".repeat(32));
+        assert_eq!(
+            validate_org_authority_proof_with_certificate(
+                &changed_proof,
+                &context,
+                &evidence,
+                &certificate,
+                "nonce-1",
+                1_500,
+            ),
+            Err(AuthorizationAuthorityError::EvidenceFrontierMismatch)
+        );
     }
 
     #[test]

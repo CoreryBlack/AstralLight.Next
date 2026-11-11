@@ -78,8 +78,14 @@ pub enum ConfigValidationError {
     InvalidOrgScopeEnabled,
     #[error("ASTRAL_AUTHORITY_RUNTIME_MODE must be exactly \"strict\" or \"durable-only\"")]
     InvalidAuthorityRuntimeMode,
-    #[error("durable-only authority mode is offline diagnostics only; a production listener requires strict authority")]
+    #[error("ASTRAL_AUTHORITY_RUNTIME_MODE=durable-only is not allowed for a listener")]
     OfflineAuthorityModeForListener,
+    #[error(
+        "ASTRAL_AUTHORIZATION_READ_PROFILE must be durable, db-backed-mirror, certified-memory, or single-node-memory"
+    )]
+    InvalidAuthorizationReadProfile,
+    #[error("certified-memory authorization read profile is not wired to a complete production serving root")]
+    CertifiedMemoryProfileNotReady,
 }
 
 impl ConfigValidationError {
@@ -140,14 +146,76 @@ impl AuthorityRuntimeMode {
     }
 }
 
-pub const AUTHORITY_RUNTIME_MODE_ENV: &str = "ASTRAL_AUTHORITY_RUNTIME_MODE";
-
-pub fn authority_runtime_mode_from_env() -> Result<AuthorityRuntimeMode, ConfigValidationError> {
-    let raw = std::env::var(AUTHORITY_RUNTIME_MODE_ENV).ok();
-    AuthorityRuntimeMode::parse(raw.as_deref())
+/// Stable authorization read profile, frozen during startup.
+///
+/// This profile selects only the policy/authorization read surface. Credential
+/// roots, session/JWT/refresh state, audit, management, and cold queries remain
+/// durable even when a future certified-memory profile is enabled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AuthorizationReadProfile {
+    /// Strict durable reads with no process-local positive authorization mirror.
+    Durable,
+    /// Existing bounded mirror whose misses may use the strict durable reader.
+    #[default]
+    DbBackedMirror,
+    /// Certified immutable memory snapshot with no durable fallback on a miss.
+    CertifiedMemory,
+    /// Single-node immutable memory root. MySQL is used only during the
+    /// startup/rebuild phase; serving requests never refill from SQL.
+    SingleNodeMemory,
 }
 
-// ===== ORG_SCOPE 部署旗标（default-off，跨宿主共享契约） =====
+impl AuthorizationReadProfile {
+    pub fn parse(raw: Option<&str>) -> Result<Self, ConfigValidationError> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("db-backed-mirror") | Some("DbBackedMirror") => {
+                Ok(Self::DbBackedMirror)
+            }
+            Some("durable") | Some("Durable") => Ok(Self::Durable),
+            Some("certified-memory") | Some("CertifiedMemory") => Ok(Self::CertifiedMemory),
+            Some("single-node-memory") | Some("SingleNodeMemory") => Ok(Self::SingleNodeMemory),
+            Some(_) => Err(ConfigValidationError::InvalidAuthorizationReadProfile),
+        }
+    }
+
+    pub const fn uses_certified_memory(self) -> bool {
+        matches!(self, Self::CertifiedMemory)
+    }
+
+    pub const fn uses_memory_authority(self) -> bool {
+        matches!(self, Self::CertifiedMemory | Self::SingleNodeMemory)
+    }
+
+    pub const fn is_single_node_memory(self) -> bool {
+        matches!(self, Self::SingleNodeMemory)
+    }
+
+    pub const fn sessions_remain_durable(self) -> bool {
+        true
+    }
+
+    /// Listener validation only checks that the profile name is valid. The
+    /// selected profile is admitted by the service composition root, which must
+    /// install a serving certified surface before a CertifiedMemory listener is
+    /// started.
+    pub const fn validate_listener(self) -> Result<(), ConfigValidationError> {
+        Ok(())
+    }
+}
+
+pub const AUTHORIZATION_READ_PROFILE_ENV: &str = "ASTRAL_AUTHORIZATION_READ_PROFILE";
+
+pub fn authorization_read_profile_from_env(
+) -> Result<AuthorizationReadProfile, ConfigValidationError> {
+    let raw = std::env::var(AUTHORIZATION_READ_PROFILE_ENV).ok();
+    AuthorizationReadProfile::parse(raw.as_deref())
+}
+
+/// Authority runtime mode environment variable. This is independent from the
+/// authorization read profile: it controls proof-provider availability, not the
+/// choice between durable, mirrored, and certified business reads.
+pub const AUTHORITY_RUNTIME_MODE_ENV: &str = "ASTRAL_AUTHORITY_RUNTIME_MODE";
+
 //
 // `SqlxRuleRepository::new()` 默认 org_scope 关闭；每个 PolicyEngine 宿主
 // （trustgraph / identity / monitor）必须在启动期用本节共享解析器解析
@@ -507,10 +575,15 @@ pub struct AppConfig {
     #[serde(skip)]
     pub org_scope_enabled: bool,
 
-    /// Authority proof runtime mode, frozen at startup. Strict is the secure
-    /// default; durable-only requires an explicit deployment opt-in.
+    /// Authority runtime mode (strict by default), frozen at startup.
     #[serde(skip)]
     pub authority_runtime_mode: AuthorityRuntimeMode,
+
+    /// Authorization read profile, frozen at startup. This selects only the
+    /// policy/authorization read surface; credential and session state remain
+    /// database-primary in every profile.
+    #[serde(skip)]
+    pub authorization_read_profile: AuthorizationReadProfile,
 
     /// 单机组合进程镜像加速器（**default-on**，composite 正常会话 zero-DB
     /// 目标的默认闭合）：安装有界
@@ -569,6 +642,7 @@ impl Default for AppConfig {
             db_acquire_timeout_seconds: default_db_acquire_timeout_seconds(),
             org_scope_enabled: false,
             authority_runtime_mode: AuthorityRuntimeMode::Strict,
+            authorization_read_profile: AuthorizationReadProfile::default(),
             session_grant_mirror_enabled: default_session_grant_mirror_enabled(),
             session_grant_mirror_positive_disabled: false,
             wechat: WeChatConfig::default(),
@@ -1035,6 +1109,10 @@ fn apply_flat_env_overrides(cfg: &mut AppConfig) -> Result<(), config::ConfigErr
         cfg.authority_runtime_mode = AuthorityRuntimeMode::parse(Some(&value))
             .map_err(ConfigValidationError::into_config_error)?;
     }
+    if let Some(value) = optional_env(AUTHORIZATION_READ_PROFILE_ENV) {
+        cfg.authorization_read_profile = AuthorizationReadProfile::parse(Some(&value))
+            .map_err(ConfigValidationError::into_config_error)?;
+    }
     // 单机镜像加速器（default-off）：严格 bool；语义边界见字段文档
     // （未命中/suspect 必须回退 strict DB，多节点部署保持关闭）。
     if let Some(value) = optional_env(SESSION_GRANT_MIRROR_ENV) {
@@ -1092,6 +1170,9 @@ impl AppConfig {
         cfg.authority_runtime_mode
             .validate_listener()
             .map_err(ConfigValidationError::into_config_error)?;
+        cfg.authorization_read_profile
+            .validate_listener()
+            .map_err(ConfigValidationError::into_config_error)?;
         cfg.validate_secrets_for(role)
             .map_err(ConfigValidationError::into_config_error)?;
         cfg.validate_runtime_safety(Self::is_test_profile())
@@ -1127,6 +1208,9 @@ impl AppConfig {
         cfg.authority_runtime_mode
             .validate_listener()
             .map_err(ConfigValidationError::into_config_error)?;
+        cfg.authorization_read_profile
+            .validate_listener()
+            .map_err(ConfigValidationError::into_config_error)?;
         cfg.validate_secrets_for(role)
             .map_err(ConfigValidationError::into_config_error)?;
         cfg.validate_runtime_safety(Self::is_test_profile())
@@ -1141,6 +1225,7 @@ impl AppConfig {
         role: JwtValidationRole,
     ) -> Result<(), ConfigValidationError> {
         self.authority_runtime_mode.validate_listener()?;
+        self.authorization_read_profile.validate_listener()?;
         self.validate_secrets_for(role)?;
         self.validate_runtime_safety(false)
     }
@@ -1478,6 +1563,7 @@ mod tests {
         "GATEWAY_HMAC_SECRET",
         "CORS_ALLOWED_ORIGINS",
         "CORS_ALLOW_CREDENTIALS",
+        AUTHORIZATION_READ_PROFILE_ENV,
         // ORG_SCOPE 部署旗标（parse_org_scope_enabled 契约）。
         ORG_SCOPE_ENABLED_ENV,
         // Authority runtime mode is process-frozen and isolated from the shell
@@ -2667,7 +2753,74 @@ cors:
         );
     }
 
-    /// `from_env_for` 与 `from_files_for` 应用同一份 flat 覆盖契约；Gateway
+    #[test]
+    fn authorization_read_profile_is_frozen_and_sessions_remain_durable() {
+        assert_eq!(
+            AuthorizationReadProfile::default(),
+            AuthorizationReadProfile::DbBackedMirror
+        );
+        assert_eq!(
+            AuthorizationReadProfile::parse(None).unwrap(),
+            AuthorizationReadProfile::DbBackedMirror
+        );
+        assert_eq!(
+            AuthorizationReadProfile::parse(Some(" durable ")).unwrap(),
+            AuthorizationReadProfile::Durable
+        );
+        assert_eq!(
+            AuthorizationReadProfile::parse(Some("CertifiedMemory")).unwrap(),
+            AuthorizationReadProfile::CertifiedMemory
+        );
+        assert!(AuthorizationReadProfile::Durable
+            .validate_listener()
+            .is_ok());
+        assert!(AuthorizationReadProfile::DbBackedMirror
+            .validate_listener()
+            .is_ok());
+        assert!(AuthorizationReadProfile::CertifiedMemory
+            .validate_listener()
+            .is_ok());
+        for invalid in ["", "memory", "certified", "db", "CERTIFIED-MEMORY"] {
+            if invalid.is_empty() {
+                assert_eq!(
+                    AuthorizationReadProfile::parse(Some(invalid)).unwrap(),
+                    AuthorizationReadProfile::DbBackedMirror
+                );
+            } else {
+                assert_eq!(
+                    AuthorizationReadProfile::parse(Some(invalid)).unwrap_err(),
+                    ConfigValidationError::InvalidAuthorizationReadProfile
+                );
+            }
+        }
+        assert!(AuthorizationReadProfile::Durable.sessions_remain_durable());
+        assert!(AuthorizationReadProfile::DbBackedMirror.sessions_remain_durable());
+        assert!(AuthorizationReadProfile::CertifiedMemory.sessions_remain_durable());
+    }
+
+    #[test]
+    fn certified_memory_profile_is_admitted_by_composition_root() {
+        let mut config = valid_runtime_config();
+        config.jwt = valid_jwt_config();
+        config.gateway = valid_gateway();
+        config.authorization_read_profile = AuthorizationReadProfile::CertifiedMemory;
+        assert!(config
+            .validate_listener_for(JwtValidationRole::Gateway)
+            .is_ok());
+    }
+
+    #[test]
+    fn authority_read_mode_does_not_select_authorization_read_profile() {
+        assert!(!AuthorizationReadProfile::Durable.uses_certified_memory());
+        assert!(!AuthorizationReadProfile::DbBackedMirror.uses_certified_memory());
+        assert!(AuthorizationReadProfile::CertifiedMemory.uses_certified_memory());
+        assert_eq!(
+            AuthorizationReadProfile::parse(Some("durable")).unwrap(),
+            AuthorizationReadProfile::Durable
+        );
+        assert!(AuthorizationReadProfile::Durable.sessions_remain_durable());
+    }
+
     /// 角色的 HMAC 密钥必须从独立 env 名落位，绝不允许共用 JWT 签名材料。
     #[test]
     fn flat_env_config_from_env_for_applies_overrides_for_gateway_role() {

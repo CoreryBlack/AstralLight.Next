@@ -538,7 +538,7 @@ impl PolicyEngine {
                     steps.clone(),
                 );
             };
-            match AuthorizationAdmission::from_verified_proof((*proof).clone()) {
+            match AuthorizationAdmission::from_verified_request_bound_proof((*proof).clone()) {
                 Ok(admission_value) => Some(admission_value),
                 Err(error) => {
                     tracing::error!(%error, "final certified authority proof could not become admission");

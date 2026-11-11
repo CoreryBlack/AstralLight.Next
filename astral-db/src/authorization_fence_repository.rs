@@ -21,7 +21,7 @@ use astral_types::{
     DomainScopeRequirement, PolicyError, PublishedCardAuthorization, PublishedCardEvidenceScope,
 };
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
-use policy_engine::AuthorizationFenceProvider;
+use policy_engine::{AuthorizationFenceProvider, OrgAuthorityFenceRead};
 use sha2::{Digest, Sha256};
 use sqlx::{MySql, MySqlPool, Transaction};
 use time::OffsetDateTime;
@@ -805,6 +805,7 @@ impl SqlxAuthorizationAuthorityIssuer {
                 "authorization authority proof signing failed: {error}"
             ))
         })?;
+        ensure_legacy_v7_request_bindings(&proof)?;
         let frontier_snapshot_hash = digest_bytes(&lease.snapshot_hash, "snapshot_hash")?;
         proof
             .verify_at(self.trust_root.verifying_key(), now_seconds)
@@ -885,6 +886,7 @@ async fn insert_authority_proof(
     tx: &mut Transaction<'_, MySql>,
     proof: &AuthorizationFenceProof,
 ) -> Result<(), PolicyError> {
+    ensure_legacy_v7_request_bindings(proof)?;
     let snapshot_hash = digest_bytes(&proof.snapshot_hash, "snapshot_hash")?;
     let parent_hash = proof
         .parent_hash
@@ -940,6 +942,16 @@ async fn insert_authority_proof(
             "authorization authority proof insertion failed: {error}"
         ))
     })?;
+    Ok(())
+}
+
+fn ensure_legacy_v7_request_bindings(proof: &AuthorizationFenceProof) -> Result<(), PolicyError> {
+    if proof.request_binding_digest.is_none() || proof.scope_certificate_hash.is_none() {
+        return Err(PolicyError::Repository(
+            "legacy authorization issuance cannot mint a V7 positive AuthorizationFenceProof: old schema cannot store request_binding_digest and scope_certificate_hash"
+                .to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1392,6 +1404,49 @@ pub struct SqlxAuthorizationFenceProvider {
 }
 
 impl SqlxAuthorizationFenceProvider {
+    /// Reuse the same attested authority session for certified-memory roots and
+    /// family receipts. Diagnostic providers cannot furnish this capability.
+    pub fn certified_memory_authority_client(
+        &self,
+    ) -> Result<astral_authority::AuthorityClient, PolicyError> {
+        self.quorum
+            .as_ref()
+            .map(|quorum| quorum.authority_client())
+            .ok_or_else(|| PolicyError::Repository("quorum authority is not configured".to_owned()))
+    }
+
+    /// Build a family ledger reader bound to this provider's configured
+    /// database identity and the same attested authority session.
+    pub fn certified_memory_owner_context(
+        &self,
+    ) -> Result<crate::CertifiedMemoryDurableOwnerContext, PolicyError> {
+        let quorum = self.quorum.as_ref().ok_or_else(|| {
+            PolicyError::Repository("quorum authority is not configured".to_owned())
+        })?;
+        Ok(
+            crate::CertifiedMemoryDurableOwnerContext::new(self.pool.clone())
+                .with_authority_client(quorum.authority_client(), quorum.database_id()),
+        )
+    }
+
+    /// Build a family completion coordinator bound to this provider's pool,
+    /// registered database identity, and the same attested authority session.
+    /// Candidate capture remains owned by the six family source owners; this
+    /// adapter only supplies the shared post-commit reconciliation boundary.
+    pub fn certified_memory_completion_coordinator(
+        &self,
+    ) -> Result<crate::CertifiedMemoryCompletionCoordinator, PolicyError> {
+        let quorum = self.quorum.as_ref().ok_or_else(|| {
+            PolicyError::Repository("quorum authority is not configured".to_owned())
+        })?;
+        crate::CertifiedMemoryCompletionCoordinator::new(
+            self.pool.clone(),
+            quorum.authority_client(),
+            quorum.database_id(),
+        )
+        .map_err(|error| PolicyError::Repository(error.to_string()))
+    }
+
     pub fn new(pool: MySqlPool, trust_root: AuthorizationTrustRoot) -> Result<Self, PolicyError> {
         Ok(Self {
             pool,
@@ -1669,6 +1724,14 @@ pub async fn validate_diagnostic_admission_in_tx(
     tx: &mut Transaction<'_, MySql>,
     admission: &AuthorizationAdmission,
 ) -> Result<(), PolicyError> {
+    admission
+        .proof()
+        .validate_request_bound()
+        .map_err(|error| {
+            PolicyError::Repository(format!(
+                "diagnostic admission cannot consume an unbound V7 proof: {error}"
+            ))
+        })?;
     let proof = admission.proof();
     let frontier = sqlx::query_as::<_, AuthorityFrontierRow>(
         "SELECT authority_id, authority_term, global_fence_sequence, key_id, key_epoch, \
@@ -1811,6 +1874,42 @@ impl AuthorizationFenceProvider for SqlxAuthorizationFenceProvider {
         Ok(proof)
     }
 
+    async fn read_org_authorization_fence_with_certificate(
+        &self,
+        context: &astral_types::PolicyContext,
+        evidence: &astral_types::org_scope::OrgAdmissionEvidence,
+        request_nonce: &str,
+    ) -> Result<OrgAuthorityFenceRead, PolicyError> {
+        let quorum = self
+            .quorum
+            .as_ref()
+            .ok_or_else(|| PolicyError::Repository("ORG reads require quorum authority".into()))?;
+        let scope = astral_types::org_authority_evidence_scope(context)
+            .map_err(|error| PolicyError::InvalidContext(error.to_string()))?;
+        let source = astral_types::AuthorityProtocolScope::Org(astral_types::AuthorityOrgScope {
+            tenant_id: evidence.publication.tenant_id,
+            root_tenant_id: Some(evidence.publication.root_tenant_id),
+            member: astral_types::AuthorityOrgMemberSubject {
+                user_id: evidence.membership.user_id,
+                identity_card_id: evidence.membership.identity_card_id,
+                card_id: evidence.membership.card_id,
+            },
+        });
+        let (proof, certificate) = quorum
+            .read_org_with_certificate(&self.pool, context, &scope, request_nonce, source)
+            .await?;
+        astral_types::validate_org_authority_proof_with_certificate(
+            &proof,
+            context,
+            evidence,
+            &certificate,
+            request_nonce,
+            OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .map_err(|error| PolicyError::Repository(error.to_string()))?;
+        Ok(OrgAuthorityFenceRead { proof, certificate })
+    }
+
     fn certify_authorization_evidence(
         &self,
         proof: AuthorizationFenceProof,
@@ -1918,7 +2017,7 @@ impl DurableAuthorityProofRow {
                 ));
             }
         };
-        Ok(AuthorizationFenceProof {
+        let proof = AuthorizationFenceProof {
             authorization_edition: self.authorization_edition,
             authority_id: self.authority_id,
             authority_term: counter(self.authority_term, "authority_term")?,
@@ -1948,7 +2047,13 @@ impl DurableAuthorityProofRow {
             scope_certificate_hash: None,
             proof_id: self.proof_id,
             signature: signature_hex(self.signature)?,
-        })
+        };
+        proof.validate_request_bound().map_err(|error| {
+            PolicyError::Repository(format!(
+                "legacy durable authority proof is not request-bound: {error}"
+            ))
+        })?;
+        Ok(proof)
     }
 }
 
@@ -2040,6 +2145,7 @@ fn verify_proof_signature_without_time(
             "authorization proof trust root identity mismatch".to_owned(),
         ));
     }
+    ensure_legacy_v7_request_bindings(proof)?;
     proof
         .validate()
         .map_err(|error| PolicyError::Repository(format!("invalid authority proof: {error}")))?;
@@ -2080,6 +2186,7 @@ fn validate_current_proof(
     trust_root: &AuthorizationTrustRoot,
     now_seconds: i64,
 ) -> Result<(), PolicyError> {
+    ensure_legacy_v7_request_bindings(proof)?;
     if proof.request_nonce != request_nonce {
         return Err(PolicyError::Repository(
             "authorization authority proof request nonce mismatch".to_owned(),
@@ -2346,6 +2453,82 @@ mod tests {
         };
         let lease = test_issuance_lease(1, 1);
         assert!(validate_issuer_frontier(&frontier, &lease, &trust_root).is_ok());
+    }
+
+    #[test]
+    fn legacy_proof_row_rejects_missing_v7_request_bindings() {
+        let row = DurableAuthorityProofRow {
+            proof_id: "proof-1".to_owned(),
+            request_nonce: "nonce-1".to_owned(),
+            authorization_edition: astral_types::AUTHORIZATION_EDITION,
+            authority_id: "authority".to_owned(),
+            authority_term: 1,
+            global_fence_sequence: 1,
+            tenant_id: 7,
+            card_id: 17,
+            scope_user_id: None,
+            scope_domain_kind: "ANY".to_owned(),
+            scope_domain_id: None,
+            scope_generation: 1,
+            revoke_watermark: 1,
+            snapshot_hash: vec![0; 32],
+            parent_hash: None,
+            operation_id: "operation-1".to_owned(),
+            event_id: "event-1".to_owned(),
+            key_id: "key-1".to_owned(),
+            key_epoch: 1,
+            issued_at: 100,
+            not_before: 100,
+            expires_at: 200,
+            signature: vec![0; 64],
+            status: "ACTIVE".to_owned(),
+        };
+        let error = row
+            .into_proof()
+            .expect_err("legacy proof rows without V7 bindings must fail closed");
+        assert!(matches!(
+            error,
+            PolicyError::Repository(message)
+                if message.contains("not request-bound")
+                    && message.contains("request_binding_digest")
+        ));
+    }
+
+    #[test]
+    fn legacy_issuer_rejects_v7_proof_without_request_bindings() {
+        let lease = test_issuance_lease(1, 1);
+        let proof = AuthorizationFenceProof {
+            authorization_edition: lease.authorization_edition,
+            authority_id: lease.authority_id,
+            authority_term: lease.authority_term,
+            global_fence_sequence: lease.global_fence_sequence,
+            scope: lease.scope,
+            scope_generation: lease.scope_generation,
+            revoke_watermark: lease.revoke_watermark,
+            snapshot_hash: lease.snapshot_hash,
+            parent_hash: lease.parent_hash,
+            operation_id: lease.operation_id,
+            event_id: lease.event_id,
+            key_id: lease.key_id,
+            key_epoch: lease.key_epoch,
+            issued_at: lease.issued_at,
+            not_before: lease.not_before,
+            expires_at: lease.expires_at,
+            request_nonce: lease.request_nonce,
+            request_binding_digest: None,
+            scope_certificate_hash: None,
+            proof_id: lease.lease_id,
+            signature: "00".repeat(64),
+        };
+        let error = ensure_legacy_v7_request_bindings(&proof)
+            .expect_err("missing bindings must fail closed");
+        assert!(matches!(
+            error,
+            PolicyError::Repository(message)
+                if message.contains("request_binding_digest")
+                    && message.contains("scope_certificate_hash")
+                    && message.contains("old schema cannot store")
+        ));
     }
 
     fn test_issuance_lease(

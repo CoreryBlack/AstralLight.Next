@@ -9,6 +9,10 @@
 use astral_types::{GlobalAccessRequirement, PolicyContext, ResourceOwnershipScope};
 use sqlx::MySqlPool;
 
+use crate::certified_memory_authority::{
+    CertifiedMemoryReadModel, CertifiedMemoryStore, OwnershipReadKey,
+};
+
 /// The legacy ownership memory adapter is retained only for isolated tests and
 /// a future adapter that can prove the same certified global authority contract
 /// as published card evidence. It is not reachable from the production entry.
@@ -153,7 +157,77 @@ pub async fn resolve_resource_ownership(
     }
 }
 
-/// Strict DB resolver: the frozen authoritative implementation. Every memory
+/// Immutable request inputs for one certified ownership read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertifiedOwnershipRequest {
+    pub resource: String,
+    pub path: String,
+    pub method: String,
+    pub query_target_id: Option<i64>,
+    pub actor_card_id: Option<i64>,
+    pub actor_user_id: Option<i64>,
+    pub now_unix: i64,
+}
+
+/// Certified-memory-only ownership resolution. It consumes one read token and
+/// never invokes the durable resolver on a miss or unavailable serving state.
+pub fn resolve_resource_ownership_certified(
+    store: &CertifiedMemoryStore,
+    request: &CertifiedOwnershipRequest,
+) -> Result<ResourceOwnershipResolution, &'static str> {
+    let token = store
+        .begin_read(request.now_unix)
+        .map_err(|_| "resource_ownership.certified_memory_unavailable")?;
+    resolve_resource_ownership_certified_with_token(store, request, &token)
+}
+
+/// Resolve ownership against a request-scoped token. No new token is sampled,
+/// so ownership and subsequent policy reads observe one immutable request lens.
+pub fn resolve_resource_ownership_certified_with_token(
+    store: &CertifiedMemoryStore,
+    request: &CertifiedOwnershipRequest,
+    token: &crate::certified_memory_authority::CertifiedMemoryReadToken,
+) -> Result<ResourceOwnershipResolution, &'static str> {
+    store
+        .validate_read_token(token, request.now_unix)
+        .map_err(|_| "resource_ownership.certified_memory_unavailable")?;
+    let CertifiedOwnershipRequest {
+        resource,
+        path,
+        method,
+        query_target_id,
+        actor_card_id,
+        actor_user_id,
+        now_unix,
+    } = request;
+    match resolve_plan(
+        resource,
+        path,
+        method,
+        *query_target_id,
+        *actor_card_id,
+        *actor_user_id,
+    ) {
+        ResolvePlan::Pure(outcome) => Ok(outcome),
+        ResolvePlan::StrictDbOnly => Err("resource_ownership.certified_route_unsupported"),
+        ResolvePlan::MemoryEligible(_) => {
+            let key = OwnershipReadKey::new(
+                resource.clone(),
+                path.clone(),
+                method.clone(),
+                *query_target_id,
+                *actor_card_id,
+                *actor_user_id,
+            )
+            .map_err(|_| "resource_ownership.certified_key_invalid")?;
+            store
+                .read_ownership(token, &key, *now_unix)
+                .map_err(|_| "resource_ownership.certified_memory_unavailable")?
+                .ok_or("resource_ownership.certified_memory_miss")
+        }
+    }
+}
+
 /// path is a bounded cache over this function; nothing else may produce facts.
 async fn resolve_resource_ownership_strict(
     pool: &MySqlPool,
@@ -1455,7 +1529,66 @@ async fn resolve_single_tenant_domain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::certified_memory_authority::CertifiedMemoryConfig;
     use astral_types::{GlobalAccessRequirement, PolicyContext};
+
+    #[test]
+    fn certified_ownership_requires_serving_store_even_for_global_routes() {
+        let store = CertifiedMemoryStore::new(CertifiedMemoryConfig::default());
+        let request = CertifiedOwnershipRequest {
+            resource: "authorization".to_owned(),
+            path: "/stats".to_owned(),
+            method: "GET".to_owned(),
+            query_target_id: None,
+            actor_card_id: None,
+            actor_user_id: None,
+            now_unix: 1_000,
+        };
+        assert_eq!(
+            resolve_resource_ownership_certified(&store, &request),
+            Err("resource_ownership.certified_memory_unavailable")
+        );
+        assert_eq!(
+            store.serving_state(),
+            crate::certified_memory_authority::CertifiedMemoryServing::Cold
+        );
+    }
+
+    #[test]
+    fn certified_ownership_requires_serving_store_for_unresolved_routes() {
+        let store = CertifiedMemoryStore::new(CertifiedMemoryConfig::default());
+        let request = CertifiedOwnershipRequest {
+            resource: "domain".to_owned(),
+            path: "/not-a-registered-route".to_owned(),
+            method: "GET".to_owned(),
+            query_target_id: None,
+            actor_card_id: None,
+            actor_user_id: None,
+            now_unix: 1_000,
+        };
+        assert_eq!(
+            resolve_resource_ownership_certified(&store, &request),
+            Err("resource_ownership.certified_memory_unavailable")
+        );
+    }
+
+    #[test]
+    fn certified_ownership_miss_is_not_durable_fallback() {
+        let store = CertifiedMemoryStore::new(CertifiedMemoryConfig::default());
+        let request = CertifiedOwnershipRequest {
+            resource: "domain".to_owned(),
+            path: "/user-cards/17".to_owned(),
+            method: "GET".to_owned(),
+            query_target_id: Some(17),
+            actor_card_id: None,
+            actor_user_id: None,
+            now_unix: 1_000,
+        };
+        assert_eq!(
+            resolve_resource_ownership_certified(&store, &request),
+            Err("resource_ownership.certified_memory_unavailable")
+        );
+    }
 
     #[test]
     fn path_target_is_authoritative_over_matching_query_target() {
@@ -2589,9 +2722,11 @@ mod tests {
                 production.contains("physical_policy_context("),
                 "{service} HTTP middleware must start from verified physical actor facts"
             );
-            let ownership_entry = "resolve_resource_ownership(";
+            let has_surface_ownership = production.contains(".resolve_ownership(");
+            let has_operation_poll_ownership =
+                service == "trustgraph" && production.contains("resolve_operation_poll_ownership(");
             assert!(
-                production.contains(ownership_entry),
+                has_surface_ownership || has_operation_poll_ownership,
                 "{service} HTTP middleware must resolve server-side target ownership"
             );
             assert!(
@@ -2599,7 +2734,7 @@ mod tests {
                 "{service} HTTP middleware must apply the resolver result before evaluation"
             );
             assert!(
-                production.contains(".evaluate_with_admission(&ctx"),
+                production.contains("evaluate_with_admission(&state.engine, &ctx"),
                 "{service} HTTP middleware must send the resolved context to PolicyEngine through the admission-bearing evaluation entry"
             );
             assert!(

@@ -21,7 +21,10 @@ use etcd_client::{
 use async_trait::async_trait;
 
 use crate::error::AuthorityStoreError;
-use crate::store::{AuthorityStore, StoreOp, StoreTxn, StoreTxnOutcome, StoredRecord};
+use crate::store::{
+    validate_snapshot_reads, AuthorityStore, SnapshotRead, StoreOp, StoreSnapshot, StoreTxn,
+    StoreTxnOutcome, StoredRecord,
+};
 
 /// Hard upper bound for every etcd request. Authority mutations and fence
 /// reads must never hang on a wedged quorum connection: the timeout surfaces
@@ -187,6 +190,37 @@ fn map_etcd_error(error: etcd_client::Error) -> AuthorityStoreError {
     AuthorityStoreError::Unavailable(error.to_string())
 }
 
+// A zero mod_revision represents an absent key in etcd. Every store guard
+// documented as requiring an existing record must compare existence in the
+// same transaction, including when the supplied revision or value is empty.
+fn compare_existing(key: &str, comparison: Compare) -> [Compare; 2] {
+    [
+        Compare::create_revision(key.as_bytes(), CompareOp::Greater, 0),
+        comparison,
+    ]
+}
+
+fn compare_existing_revision(key: &str, revision: u64) -> Option<[Compare; 2]> {
+    let revision = i64::try_from(revision).ok()?;
+    Some(compare_existing(
+        key,
+        Compare::mod_revision(key.as_bytes(), CompareOp::Equal, revision),
+    ))
+}
+
+fn refuse_unbounded_snapshot(reads: &[SnapshotRead]) -> Result<StoreSnapshot, AuthorityStoreError> {
+    validate_snapshot_reads(reads)?;
+    // etcd RangeRequest limits key count, not bytes. RangeResponse.more can
+    // reveal truncation, but neither a per-range key limit nor a client decode
+    // limit bounds the bytes the server materializes across the transaction,
+    // including a single large value. The JSON gateway exposes the same Range
+    // and Txn semantics. Refuse before any RPC until a server-side aggregate
+    // byte budget is enforced and verified for this API.
+    Err(AuthorityStoreError::Unavailable(
+        "etcd snapshot server-side byte budget is not proven".to_owned(),
+    ))
+}
+
 #[async_trait]
 impl AuthorityStore for EtcdAuthorityStore {
     async fn get(&self, key: &str) -> Result<Option<StoredRecord>, AuthorityStoreError> {
@@ -226,6 +260,13 @@ impl AuthorityStore for EtcdAuthorityStore {
         Ok(records)
     }
 
+    async fn read_snapshot(
+        &self,
+        reads: &[SnapshotRead],
+    ) -> Result<StoreSnapshot, AuthorityStoreError> {
+        refuse_unbounded_snapshot(reads)
+    }
+
     async fn execute(&self, txn: StoreTxn) -> Result<StoreTxnOutcome, AuthorityStoreError> {
         if txn.ops.is_empty() {
             return Ok(StoreTxnOutcome::Applied {
@@ -253,11 +294,10 @@ impl AuthorityStore for EtcdAuthorityStore {
                     expected_revision,
                     value,
                 } => {
-                    compares.push(Compare::mod_revision(
-                        key.as_bytes(),
-                        CompareOp::Equal,
-                        *expected_revision as i64,
-                    ));
+                    let Some(guard) = compare_existing_revision(key, *expected_revision) else {
+                        return Ok(StoreTxnOutcome::PreconditionFailed { key: key.clone() });
+                    };
+                    compares.extend(guard);
                     operations.push(TxnOp::put(key.as_bytes(), value.clone(), None));
                     if first_guarded_key.is_none() {
                         first_guarded_key = Some(key.clone());
@@ -273,11 +313,10 @@ impl AuthorityStore for EtcdAuthorityStore {
                     key,
                     expected_revision,
                 } => {
-                    compares.push(Compare::mod_revision(
-                        key.as_bytes(),
-                        CompareOp::Equal,
-                        *expected_revision as i64,
-                    ));
+                    let Some(guard) = compare_existing_revision(key, *expected_revision) else {
+                        return Ok(StoreTxnOutcome::PreconditionFailed { key: key.clone() });
+                    };
+                    compares.extend(guard);
                     operations.push(TxnOp::delete(key.as_bytes(), None));
                     if first_guarded_key.is_none() {
                         first_guarded_key = Some(key.clone());
@@ -286,11 +325,23 @@ impl AuthorityStore for EtcdAuthorityStore {
                 StoreOp::RequireValue { key, value } => {
                     // Compare-only guard: no TxnOp, so the guarded record is
                     // never overwritten and its lease attachment is intact.
-                    compares.push(Compare::value(
-                        key.as_bytes(),
-                        CompareOp::Equal,
-                        value.clone(),
+                    compares.extend(compare_existing(
+                        key,
+                        Compare::value(key.as_bytes(), CompareOp::Equal, value.clone()),
                     ));
+                    if first_guarded_key.is_none() {
+                        first_guarded_key = Some(key.clone());
+                    }
+                }
+                StoreOp::RequireRevision {
+                    key,
+                    expected_revision,
+                } => {
+                    // Both compares leave the record and its lease intact.
+                    let Some(guard) = compare_existing_revision(key, *expected_revision) else {
+                        return Ok(StoreTxnOutcome::PreconditionFailed { key: key.clone() });
+                    };
+                    compares.extend(guard);
                     if first_guarded_key.is_none() {
                         first_guarded_key = Some(key.clone());
                     }
@@ -328,5 +379,60 @@ impl AuthorityStore for EtcdAuthorityStore {
             revisions.push(revision.unwrap_or(0).max(0) as u64);
         }
         Ok(StoreTxnOutcome::Applied { revisions })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_guard_contains_an_existence_compare_and_original_compare() {
+        let key = "leader";
+        for expected in [
+            Compare::value(key.as_bytes(), CompareOp::Equal, Vec::new()),
+            Compare::mod_revision(key.as_bytes(), CompareOp::Equal, 0),
+        ] {
+            let comparisons = compare_existing(key, expected.clone());
+            assert_eq!(
+                format!("{:?}", comparisons[0]),
+                format!(
+                    "{:?}",
+                    Compare::create_revision(key.as_bytes(), CompareOp::Greater, 0)
+                )
+            );
+            assert_eq!(format!("{:?}", comparisons[1]), format!("{expected:?}"));
+        }
+    }
+
+    #[test]
+    fn revision_guards_reject_unsigned_overflow_instead_of_wrapping() {
+        assert!(compare_existing_revision("key", 0).is_some());
+        assert!(compare_existing_revision("key", i64::MAX as u64).is_some());
+        assert!(compare_existing_revision("key", i64::MAX as u64 + 1).is_none());
+        assert!(compare_existing_revision("key", u64::MAX).is_none());
+    }
+
+    #[test]
+    fn snapshot_refuses_before_rpc_without_a_server_byte_budget() {
+        for reads in [
+            vec![SnapshotRead::Key("frontier".into())],
+            vec![
+                SnapshotRead::Prefix("scope/".into()),
+                SnapshotRead::Prefix("certificate/".into()),
+            ],
+        ] {
+            assert!(matches!(
+                refuse_unbounded_snapshot(&reads),
+                Err(AuthorityStoreError::Unavailable(_))
+            ));
+        }
+        assert!(matches!(
+            refuse_unbounded_snapshot(&[
+                SnapshotRead::Prefix("scope/".into()),
+                SnapshotRead::Key("scope/a".into()),
+            ]),
+            Err(AuthorityStoreError::Configuration(_))
+        ));
     }
 }

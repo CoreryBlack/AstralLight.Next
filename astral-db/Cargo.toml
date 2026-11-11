@@ -15,6 +15,7 @@ performance-attribution = ["policy-engine/performance-attribution"]
 [dependencies]
 policy-engine = { path = "../policy-engine" }
 astral-types = { path = "../astral-types" }
+astral-authorization-root = { path = "../astral-authorization-root" }
 astral-authority = { path = "../astral-authority", default-features = false }
 astral-common = { path = "../astral-common" }
 

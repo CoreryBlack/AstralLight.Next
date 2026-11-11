@@ -136,7 +136,8 @@ pub fn request_target_id(req: &Request) -> Option<i64> {
 /// 根据资源、路径和 HTTP 方法解析 Java canonical permission action。
 ///
 /// 只有明确的业务特例在这里覆盖 HTTP 默认动作；其余操作保持 REST 映射，
-/// 未知方法返回 `None`，由调用方放行非业务的 OPTIONS 等预检请求。
+/// 未知方法返回 `None`。调用方必须对受保护业务请求 fail-closed；Gateway
+/// 的 CORS `OPTIONS` 仅由外层 preflight 处理，不得把 `None` 当作下游业务放行。
 pub fn resolve_permission_action(resource: &str, path: &str, method: &str) -> Option<&'static str> {
     if resource == "identity_users"
         && method == "POST"

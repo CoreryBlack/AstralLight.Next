@@ -3,9 +3,22 @@
 > 状态：P0–P5 主体已接线；2026-10-03 五链审查发现的源码缺口已修补并冻结，默认 workspace、显式 Redis 兼容、冻结 Chat/Learn 与离线工具的本地门禁已执行，结果及跳过项见第 10 节。真实基础设施、迁移、并发/崩溃及部署验收仍 BLOCKED，本文不构成整体 PASS 或部署/生产验收证明。
 > 更新日期：2026-10-03
 > 规范入口：[Rust 后端编码规范](../../规范/Rust后端编码规范_V1.0.md)。本文记录架构、实现边界和恢复语义，不覆盖仓库执行门禁。
+> 实验范围提示（2026-11-11）：本文记录旧基线及当前 DB-primary/投影实现，不是新单机实验必须兼容的目标协议。以内存权威为中心的实验目标见 [Rust 单机 MySQL 快照内存权威设计](Rust单机MySQL快照内存权威设计_V0.1.md)；该目标尚未取代现行规范、生产实现及其门禁。
+>
 > CURRENT V6 证据边界：本文的显式 Redis compatibility、冻结 Chat/Learn、离线 harness 和历史验证结果均是比较/退役兼容材料，不是当前 Redis runtime、Chat/Learn production route、当前 gate 或真实集成 `PASS`。当前正式授权只消费 strict published evidence；进程本地 L1 仍须有 TTL、容量和 GC，失配或故障转为 strict DB read、`PENDING` 或 `DENY`。`UNKNOWN`/`PENDING` 及跨 aggregate completion 必须先完成完整 receipt/evidence reconciliation。
 
-## 1. 目标与边界
+## 0A. V7 三层读面职责冻结（2026-11-08）
+
+本 checkout 的内存授权改造必须按职责分层，不能把“内存加速器”称作“内存权威”：
+
+| 层 | 事实与允许用途 | 缺失/失效语义 | 当前状态 |
+|---|---|---|---|
+| DB-primary | 凭证根、密码/MFA/reset、Session/JWT/Refresh、JTI/family/revocation、审计/ledger/outbox、管理 CRUD、统计/历史/冷查询、source mutation、冷启动与恢复 | durable read/write 失败保持拒绝、PENDING 或 UNKNOWN；不由 snapshot 伪造成功 | 当前生产主路径 |
+| DB-backed accelerator | `MemoryProjectionHub`、`AuxiliaryAuthorizationMirror`、`VerifiedPositive` session mirror；仅减少已验证命中的 DB 往返 | miss/stale/suspect/unavailable 按 profile 严格回 DB 或拒绝；不等同 certified authority | 当前兼容/加速路径 |
+| Certified-memory authority | 完整 immutable snapshot 中的 card/eligibility、published evidence、ORG/GlobalAdmin 授权事实、certified ownership/SoD、authority term/fence/frontier/key epoch、coverage/watermark/serving gate | miss、gap、unknown、过期、token drift、authority/worker/transport loss 只能 PENDING/DENY/503，绝不回 SQL、旧 snapshot 或 raw source | library seam；生产组合仍 BLOCKED |
+
+当前 `CertifiedMemoryStore` 已有 bounded immutable residency、attestation-required serving、单调 generation 和显式失效 API；`CertifiedMemoryRuleRepository` 的 fresh F0/F1/evidence certification、完整 snapshot builder、ownership/SoD projection、single-node/TrustGraph/Identity production composition 尚未闭合。因此 `ASTRAL_AUTHORIZATION_READ_PROFILE=certified-memory` 必须继续启动拒绝，不能由 `ASTRAL_AUTHORITY_READ_MODE` 单独切换业务读面。真实 authority/etcd/mTLS、MySQL recovery、RabbitMQ、多节点和部署证据仍分别记录为 `BLOCKED/UNKNOWN`。
+
 
 单机以一个 Tokio 组合进程承载 Identity、TrustGraph 和 Gateway。普通消息通过有界 `LocalBus` 传播，授权增量通过 `LocalProjectionBus` 交给单一投影 owner，在 Rust 进程内编译。正常直发不以数据库轮询、Redis 或 RabbitMQ 作为消息传输；MySQL 继续保存必须跨崩溃证明的业务事实。
 

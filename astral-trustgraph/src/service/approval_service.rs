@@ -105,7 +105,11 @@ impl ApprovalService {
                 card_id,
                 &content.resource_type,
                 &content.action_code,
-                content.effect.as_deref().unwrap_or("ALLOW"),
+                content.effect.as_deref().ok_or_else(|| {
+                    AstralError::Validation(
+                        "permission request approval requires an explicit ALLOW effect".into(),
+                    )
+                })?,
                 content.priority.unwrap_or(0),
                 condition_json.as_deref(),
                 content.valid_from.as_deref(),
@@ -172,10 +176,11 @@ fn parse_rule_content(value: &str) -> Result<RequestContent, AstralError> {
         )?;
     content.resource_type = resource_type;
     content.action_code = action_code;
-    // fail-closed：审批通过的 canonical grant 只接受 ALLOW（大小写归一后回写）。
-    if let Some(effect) = content.effect.as_deref() {
-        content.effect = Some(crate::service::validate_canonical_grant_effect(effect)?);
-    }
+    // fail-closed：审批通过的 canonical grant 必须显式提供 ALLOW（大小写归一后回写）。
+    let effect = content.effect.as_deref().ok_or_else(|| {
+        AstralError::Validation("RULE permission request requires an explicit ALLOW effect".into())
+    })?;
+    content.effect = Some(crate::service::validate_canonical_grant_effect(effect)?);
     Ok(content)
 }
 
@@ -377,7 +382,7 @@ mod tests {
             user_id: 7,
             request_type: "RULE".into(),
             request_content: Some(
-                r#"{"resourceType":"permission_rule","actionCode":"read","cardId":3}"#.into(),
+                r#"{"resourceType":"permission_rule","actionCode":"read","cardId":3,"effect":"ALLOW"}"#.into(),
             ),
             reason: None,
             status: "PENDING".into(),
@@ -565,7 +570,7 @@ mod tests {
     #[test]
     fn rule_content_resource_action_is_trimmed() {
         let content = parse_rule_content(
-            r#"{"resourceType":"  permission_rule ","actionCode":" read ","cardId":3}"#,
+            r#"{"resourceType":"  permission_rule ","actionCode":" read ","cardId":3,"effect":"ALLOW"}"#,
         )
         .expect("registered resource/action with whitespace must be accepted");
         // 归一化（trim）值回写 content：approve 转发到事务写入的与解析层同源
@@ -605,7 +610,7 @@ mod tests {
         assert_eq!(tx.card_id, 3);
         assert_eq!(tx.resource, "permission_rule");
         assert_eq!(tx.action, "read");
-        // 请求未带 effect → 默认 ALLOW 写入
+        // 请求显式携带 ALLOW；缺失 effect 已在解析阶段 fail-closed。
         assert_eq!(tx.effect, "ALLOW");
         assert_eq!(tx.request_id_header.as_deref(), Some("request-5"));
         // Repository approval transaction owns the durable projection append.
@@ -730,6 +735,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approve_rejects_missing_effect_without_writing_source() {
+        let repo = Arc::new(FakeRequestRepository::new(Some(PermissionRequestRecord {
+            request_content: Some(
+                r#"{"resourceType":"permission_rule","actionCode":"read","cardId":3}"#.into(),
+            ),
+            ..pending_record()
+        })));
+        let svc = ApprovalService::new(repo.clone());
+
+        let error = svc
+            .approve(5, 1, None, None, test_admission())
+            .await
+            .expect_err("missing effect must fail closed");
+        assert!(
+            matches!(error, AstralError::Validation(message) if message.contains("explicit ALLOW"))
+        );
+        assert!(repo.approve_tx.lock().unwrap().is_none());
+    }
+    #[tokio::test]
     async fn approve_rejects_deny_effect_without_writing_source() {
         let mut rec = pending_record();
         rec.request_content = Some(
@@ -778,12 +802,12 @@ mod tests {
 
     #[tokio::test]
     async fn approve_trims_and_forwards_normalized_resource_action() {
-        let repo = Arc::new(FakeRequestRepository::new(Some(PermissionRequestRecord {
-            request_content: Some(
-                r#"{"resourceType":"  permission_rule ","actionCode":" read ","cardId":3}"#.into(),
-            ),
-            ..pending_record()
-        })));
+        let mut request_record = pending_record();
+        request_record.request_content = Some(
+            r#"{"resourceType":"  permission_rule ","actionCode":" read ","cardId":3,"effect":"ALLOW"}"#
+                .into(),
+        );
+        let repo = Arc::new(FakeRequestRepository::new(Some(request_record)));
         let svc = ApprovalService::new(repo.clone());
 
         svc.approve(5, 1, None, None, test_admission())

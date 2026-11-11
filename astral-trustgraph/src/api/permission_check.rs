@@ -10,7 +10,6 @@
 //!   PUT / PATCH → "update"
 //!   DELETE → "delete"
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::{Request, State};
@@ -24,9 +23,7 @@ use astral_common::middleware::permission_check_shared::{
     path_matches_prefix, physical_policy_context, request_target_id, resolve_permission_action,
     BoxedResponse,
 };
-use astral_db::{
-    resolve_resource_ownership, CachedPublishedEvidenceRuleRepository, SqlxRuleRepository,
-};
+use astral_db::resolve_resource_ownership;
 use astral_types::AstralError;
 
 use crate::observability::{
@@ -303,7 +300,60 @@ fn audit_request_id(headers: &HeaderMap) -> Option<String> {
     }
 }
 
-///
+async fn abort_source_reservation_and_record(
+    provider: &astral_db::SqlxAuthorizationFenceProvider,
+    abort: &astral_db::SourceReservationAbort,
+    phase: &'static str,
+) {
+    match provider.abort_source_reservation(abort).await {
+        Ok(report) => {
+            let proven = matches!(
+                report.outcome,
+                astral_db::SourceAbortOutcome::Aborted
+                    | astral_db::SourceAbortOutcome::AlreadyAborted
+            );
+            if proven {
+                tracing::info!(
+                    phase,
+                    operation_id = %report.operation_id,
+                    reservation_id = %report.reservation_id,
+                    proof_id = %abort.proof_id,
+                    request_digest = %abort.request_digest,
+                    reason = %abort.reason,
+                    outcome = ?report.outcome,
+                    observed_disposition = ?report.observed_disposition,
+                    "durable source reservation abort proven"
+                );
+            } else {
+                tracing::warn!(
+                    phase,
+                    operation_id = %report.operation_id,
+                    reservation_id = %report.reservation_id,
+                    proof_id = %abort.proof_id,
+                    request_digest = %abort.request_digest,
+                    reason = %abort.reason,
+                    outcome = ?report.outcome,
+                    observed_disposition = ?report.observed_disposition,
+                    "source reservation abort not proven; stable identity recovery required"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                phase,
+                operation_id = %abort.operation_id,
+                reservation_id = %abort.reservation_id,
+                proof_id = %abort.proof_id,
+                request_digest = %abort.request_digest,
+                reason = %abort.reason,
+                outcome = "UNKNOWN",
+                error = %error,
+                "source reservation abort outcome unknown; stable identity recovery required"
+            );
+        }
+    }
+}
+
 /// 用法（在 route group 的最外层应用）:
 /// ```
 /// use axum::{routing::get, Router};
@@ -447,19 +497,54 @@ async fn permission_check_middleware_scoped(
             .await
             .map_err(|status| BoxedResponse::new(status.into_response()))?,
     );
+    let read_surface = match astral_db::authorization_read_surface() {
+        Some(surface) => surface,
+        None => {
+            return Err(BoxedResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            ));
+        }
+    };
+    let read_request = match read_surface.begin_request() {
+        Ok(request) => request,
+        Err(error) => {
+            record_authorization_request(
+                AuthorizationAdmissionOutcome::RejectedContext,
+                authorization_started.elapsed(),
+            );
+            tracing::error!(%error, "authorization request token unavailable");
+            return Err(BoxedResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            ));
+        }
+    };
+    if path_matches_prefix(path, "/operations")
+        && method == "GET"
+        && matches!(
+            read_surface.profile(),
+            astral_common::config::AuthorizationReadProfile::CertifiedMemory
+        )
+    {
+        return Err(BoxedResponse::new(
+            StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        ));
+    }
+    // The surface dispatch is the ownership resolver for every profile; this
+    // marker keeps the source-layout guard tied to the pre-evaluation boundary.
+    // CertifiedMemory never falls back to the durable resolver on this path.
     let resolution = if path_matches_prefix(path, "/operations") && method == "GET" {
         resolve_operation_poll_ownership(&state.db, path, &ctx).await
     } else {
-        resolve_resource_ownership(
-            &state.db,
-            resource,
-            path,
-            method.as_str(),
-            query_target_id,
-            ctx.card_id,
-            ctx.user_id,
-        )
-        .await
+        read_request
+            .resolve_ownership(
+                resource,
+                path,
+                method.as_str(),
+                query_target_id,
+                ctx.card_id,
+                ctx.user_id,
+            )
+            .await
     };
     resolution.apply_to(&mut ctx);
     #[cfg(feature = "e1-observability")]
@@ -486,45 +571,9 @@ async fn permission_check_middleware_scoped(
     let card_id = ctx.card_id;
     let tenant_id = ctx.tenant_id;
 
-    // 进程内 evidence 缓存包装（装配侧接线）：load_published_card_authorization
-    // 走"指针对牌 + epoch + 时钟重验"命中协议，miss/漂移回源严格 reader；
-    // engine 的 ALLOW 前复读由此退化为同一缓存条目的恒等克隆，其有效强度由
-    // 包装层的读前/读后双读对牌承担。policy-engine 与 astral-db 严格 reader
-    // 零改动。见 astral_db::evidence_cache 模块文档。
-    //
-    // 单机内存镜像读面（default-off）：组合进程安装
-    // astral_db::memory_projection_hub 后，命中镜像的直接返回与 durable 同源
-    // 的已验证证据（同一纯装配函数），pending/未预热一律回退既有链路。
-    let evaluation = if astral_db::memory_mirror_is_installed() {
-        let repo = astral_db::MemoryMirroredRuleRepository::new(
-            CachedPublishedEvidenceRuleRepository::new(
-                SqlxRuleRepository::new(state.db.clone())
-                    .with_org_scope_enabled(state.org_scope_enabled)
-                    .with_authority_provider_opt(state.authorization_fence_provider.clone())
-                    .with_authority_required(
-                        state.config.authority_runtime_mode.requires_authority(),
-                    ),
-                state.db.clone(),
-            ),
-        )
-        .with_authority_provider_opt(
-            state
-                .authorization_fence_provider
-                .clone()
-                .map(|provider| provider as Arc<dyn policy_engine::AuthorizationFenceProvider>),
-        )
-        .with_durable_refill(state.db.clone());
-        state.engine.evaluate_with_admission(&ctx, &repo).await
-    } else {
-        let repo = CachedPublishedEvidenceRuleRepository::new(
-            SqlxRuleRepository::new(state.db.clone())
-                .with_org_scope_enabled(state.org_scope_enabled)
-                .with_authority_provider_opt(state.authorization_fence_provider.clone())
-                .with_authority_required(state.config.authority_runtime_mode.requires_authority()),
-            state.db.clone(),
-        );
-        state.engine.evaluate_with_admission(&ctx, &repo).await
-    };
+    let evaluation = read_request
+        .evaluate_with_admission(&state.engine, &ctx)
+        .await;
     let (decision, authorization_admission) = evaluation.into_parts();
     record_authorization_decision(classify_policy_decision(&decision));
     #[cfg(feature = "e1-observability")]
@@ -635,8 +684,7 @@ async fn permission_check_middleware_scoped(
     // deny-only 入口（warm 态同样零 DB；durable 回退与旧路径同语义）。
     if let Some(so_card_id) = card_id {
         let sod_started = Instant::now();
-        let sod_result =
-            crate::service::admission_checks::check_sod(&state.db, &ctx, &decision).await;
+        let sod_result = read_request.check_sod(&ctx, &decision).await;
         match sod_result {
             Ok(result) if result.has_conflict => {
                 record_sod_check(SodCheckOutcome::Conflict, sod_started.elapsed());
@@ -685,6 +733,17 @@ async fn permission_check_middleware_scoped(
         }
     }
 
+    if let Err(error) = read_request.ensure_current() {
+        record_authorization_request(
+            AuthorizationAdmissionOutcome::RejectedContext,
+            authorization_started.elapsed(),
+        );
+        tracing::error!(%error, "authorization request token changed; denying request");
+        return Err(BoxedResponse::new(
+            StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        ));
+    }
+
     // Compare the original fence after all authority reads. A cold installation
     // can invalidate it; the next request must evaluate from the new baseline.
     if let Some(fence) = admission_fence {
@@ -707,6 +766,62 @@ async fn permission_check_middleware_scoped(
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "admission fence mismatch; request denied".to_string(),
+                )
+                    .into_response(),
+            ));
+        }
+    }
+
+    let source_abort = if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        read_request
+            .ensure_mutation_commit_fence()
+            .map_err(|_| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+        let provider = state
+            .authorization_fence_provider
+            .as_ref()
+            .ok_or_else(|| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+        let admission = authorization_admission
+            .as_ref()
+            .ok_or_else(|| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+        let abort = provider
+            .reserve_mutation_with_abort(&ctx, admission)
+            .await
+            .map_err(|error| {
+                BoxedResponse::new(
+                    AppError(AstralError::Pending(error.to_string())).into_response(),
+                )
+            })?;
+        Some((provider.clone(), abort))
+    } else {
+        None
+    };
+
+    // The reservation await is a second consistency window. Recheck the
+    // original request token and captured fence before exposing the mutation to
+    // the handler; never replace them with a newly sampled request.
+    if let Some((provider, abort)) = &source_abort {
+        let token_error = read_request.ensure_current().err();
+        let token_changed = token_error.is_some();
+        let fence_holds = admission_fence.is_none_or(|fence| {
+            astral_db::memory_projection_hub().is_some_and(|hub| hub.authority_fence_matches(fence))
+        });
+        if let Some(error) = token_error {
+            tracing::error!(%error, "post-reservation request token changed; handler denied");
+        }
+        if !fence_holds {
+            tracing::error!("post-reservation admission fence changed; handler denied");
+        }
+        if token_changed || !fence_holds {
+            record_authorization_request(
+                AuthorizationAdmissionOutcome::RejectedContext,
+                authorization_started.elapsed(),
+            );
+            abort_source_reservation_and_record(provider, abort, "trustgraph_post_reservation")
+                .await;
+            return Err(BoxedResponse::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authorization state changed after reservation; request denied".to_string(),
                 )
                     .into_response(),
             ));
@@ -744,26 +859,6 @@ async fn permission_check_middleware_scoped(
         authorization_started.elapsed(),
     );
 
-    let source_abort = if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
-        let provider = state
-            .authorization_fence_provider
-            .as_ref()
-            .ok_or_else(|| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
-        let admission = authorization_admission
-            .as_ref()
-            .ok_or_else(|| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
-        let abort = provider
-            .reserve_mutation_with_abort(&ctx, admission)
-            .await
-            .map_err(|error| {
-                BoxedResponse::new(
-                    AppError(AstralError::Pending(error.to_string())).into_response(),
-                )
-            })?;
-        Some((provider.clone(), abort))
-    } else {
-        None
-    };
     // 将校验后的上下文注入请求扩展，供下游 handler 使用
     req.extensions_mut().insert(ctx);
     if let Some(authorization_admission) = authorization_admission {
@@ -773,14 +868,7 @@ async fn permission_check_middleware_scoped(
     if let Some((provider, abort)) = source_abort {
         // HTTP status does not prove source rollback. The DB owner attempts a
         // same-row durable abort and refuses it if admission use/outcome exists.
-        if let Err(error) = provider.abort_source_reservation(&abort).await {
-            tracing::warn!(
-                operation_id = %abort.operation_id,
-                reservation_id = %abort.reservation_id,
-                error = %error,
-                "post-handler source abort remains unknown; stable identity recovery required"
-            );
-        }
+        abort_source_reservation_and_record(&provider, &abort, "trustgraph_post_handler").await;
     }
     Ok(response)
 }
@@ -793,6 +881,33 @@ mod tests {
     };
     use axum::extract::Request;
     use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn post_reservation_gate_rechecks_and_aborts_before_handler() {
+        let source = include_str!("permission_check.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let gate = production.find(".ensure_mutation_commit_fence()").unwrap();
+        let reservation = production
+            .find(".reserve_mutation_with_abort(&ctx, admission)")
+            .unwrap();
+        assert!(gate < reservation);
+        let handler = production[reservation..]
+            .find("next.run(req).await")
+            .unwrap()
+            + reservation;
+        let window = &production[reservation..handler];
+        let token = window.find("read_request.ensure_current()").unwrap();
+        let fence = window.find("authority_fence_matches(fence)").unwrap();
+        let abort = window
+            .find("abort_source_reservation_and_record(provider, abort")
+            .unwrap();
+        let denial = window[abort..].find("return Err(").unwrap() + abort;
+        let admitted = window
+            .find("AuthorizationAdmissionOutcome::Admitted")
+            .unwrap();
+        assert!(token < abort && fence < abort && abort < denial && denial < admitted);
+        assert!(!window.contains("begin_request("));
+    }
 
     #[test]
     fn business_mutation_classification_requires_an_exact_trusted_route() {
@@ -1270,15 +1385,17 @@ mod tests {
             .find("capture_authority_fence")
             .expect("host must capture the opaque admission fence before authorization");
         let ownership = production
-            .find("resolve_resource_ownership(")
-            .expect("ownership resolution must exist after the fence capture");
+            .find("read_request\n            .resolve_ownership(")
+            .expect("ownership resolution must use the request-scoped read handle");
+        // Durable/mirror profiles retain the shared DB helper; CertifiedMemory
+        // uses its one-token read set and never calls this legacy helper.
         let helper = include_str!("../service/admission_checks.rs")
             .split("#[cfg(test)]")
             .next()
             .expect("production helper");
         let dispatch = production
-            .find("admission_checks::check_sod(&state.db, &ctx, &decision)")
-            .expect("host must use the shared deny-only SoD checks");
+            .find("read_request.check_sod(&ctx, &decision)")
+            .expect("host must use the request-scoped read handle for SoD");
         let loader = helper
             .find("load_org_sod_admission_mirrored(db, ctx, decision)")
             .expect("shared helper must assemble fresh org admission");

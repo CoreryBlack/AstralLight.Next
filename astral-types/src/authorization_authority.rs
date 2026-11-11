@@ -11,7 +11,7 @@ use std::sync::{
     Arc,
 };
 
-use ed25519_dalek::{Signature, Signer, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -230,8 +230,19 @@ impl AuthorizationAdmission {
         })
     }
 
-    /// Reserve this request-bound admission exactly once after the durable
-    /// authority rows have been revalidated. A failed reservation is a replay
+    /// Construct a production request-bound capability. Unlike the legacy
+    /// compatibility constructor, this cannot create an admission from a
+    /// scope-only proof or a proof missing its certificate identity.
+    pub fn from_verified_request_bound_proof(
+        proof: AuthorizationFenceProof,
+    ) -> Result<Self, AuthorizationAuthorityError> {
+        proof.validate_request_bound()?;
+        Ok(Self {
+            proof,
+            consumption: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     /// or concurrent reuse and must remain fail-closed.
     pub fn consume_once(&self) -> Result<(), AuthorizationAuthorityError> {
         self.consumption
@@ -491,40 +502,16 @@ impl AuthorizationIssuanceLease {
         self.scope.matches_evidence_scope(scope)
     }
 
-    /// Mint the publisher proof only after the caller has verified and consumed
-    /// this lease. The caller must persist the resulting proof atomically with
-    /// the lease consumption and frontier CAS.
+    /// Legacy issuance cannot mint a positive V7 proof because its lease shape
+    /// has no request binding digest or scope certificate identity.
     pub fn sign_proof(
         &self,
-        signing_key: &ed25519_dalek::SigningKey,
+        _signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<AuthorizationFenceProof, AuthorizationAuthorityError> {
         self.validate()?;
-        let mut proof = AuthorizationFenceProof {
-            authorization_edition: self.authorization_edition,
-            authority_id: self.authority_id.clone(),
-            authority_term: self.authority_term,
-            global_fence_sequence: self.global_fence_sequence,
-            scope: self.scope.clone(),
-            scope_generation: self.scope_generation,
-            revoke_watermark: self.revoke_watermark,
-            snapshot_hash: self.snapshot_hash.clone(),
-            parent_hash: self.parent_hash.clone(),
-            operation_id: self.operation_id.clone(),
-            event_id: self.event_id.clone(),
-            key_id: self.key_id.clone(),
-            key_epoch: self.key_epoch,
-            issued_at: self.issued_at,
-            not_before: self.not_before,
-            expires_at: self.expires_at,
-            request_nonce: self.request_nonce.clone(),
-            request_binding_digest: None,
-            scope_certificate_hash: None,
-            proof_id: self.lease_id.clone(),
-            signature: String::new(),
-        };
-        let signature = signing_key.sign(&proof.signing_bytes()?);
-        proof.signature = hex::encode(signature.to_bytes());
-        Ok(proof)
+        Err(AuthorizationAuthorityError::InvalidText {
+            field: "request_binding_digest",
+        })
     }
 }
 /// authorization state.
@@ -617,6 +604,26 @@ impl AuthorizationFenceProof {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             return Err(AuthorizationAuthorityError::InvalidSignatureEncoding);
+        }
+        Ok(())
+    }
+
+    /// Validate a proof for a production request-bound authorization use.
+    ///
+    /// The legacy compatibility constructor intentionally remains available for
+    /// historical fixtures and diagnostics, but it must never be promoted to a
+    /// positive V7 authorization capability without both bindings.
+    pub fn validate_request_bound(&self) -> Result<(), AuthorizationAuthorityError> {
+        self.validate()?;
+        if self.request_binding_digest.is_none() {
+            return Err(AuthorizationAuthorityError::InvalidText {
+                field: "request_binding_digest",
+            });
+        }
+        if self.scope_certificate_hash.is_none() {
+            return Err(AuthorizationAuthorityError::InvalidText {
+                field: "scope_certificate_hash",
+            });
         }
         Ok(())
     }
@@ -1532,6 +1539,79 @@ mod tests {
         )
         .unwrap();
         assert!(detached.validate_at(100, &evidence_scope()).is_err());
+    }
+
+    #[test]
+    fn legacy_issuance_lease_cannot_mint_unbound_v7_proof() {
+        let lease = AuthorizationIssuanceLease {
+            authorization_edition: AUTHORIZATION_EDITION,
+            authority_id: "authority".to_owned(),
+            authority_term: 1,
+            global_fence_sequence: 1,
+            previous_authority_term: 0,
+            previous_global_fence_sequence: 0,
+            previous_key_id: "-".to_owned(),
+            previous_key_epoch: 0,
+            scope: AuthorizationAuthorityScope {
+                tenant_id: 7,
+                card_id: 17,
+                user_id: None,
+                domain: AuthorizationDomainScope::Any,
+            },
+            scope_generation: 1,
+            revoke_watermark: 1,
+            snapshot_hash: "00".repeat(32),
+            parent_hash: None,
+            operation_id: "operation".to_owned(),
+            event_id: "event".to_owned(),
+            key_id: "key-1".to_owned(),
+            key_epoch: 1,
+            issued_at: 100,
+            not_before: 100,
+            expires_at: 200,
+            request_nonce: "nonce".to_owned(),
+            lease_id: "lease".to_owned(),
+            arbiter_id: "arbiter".to_owned(),
+            arbiter_key_id: "arbiter-key".to_owned(),
+            arbiter_key_epoch: 1,
+            arbiter_signature: "00".repeat(64),
+        };
+        let signing_key = SigningKey::from_bytes(&[24_u8; 32]);
+        assert!(matches!(
+            lease.sign_proof(&signing_key),
+            Err(AuthorizationAuthorityError::InvalidText {
+                field: "request_binding_digest"
+            })
+        ));
+    }
+
+    #[test]
+    fn request_bound_admission_requires_binding_and_certificate() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let (mut proof, _) = signed_proof_for(
+            &fixture_evidence(),
+            3,
+            2,
+            "nonce-request-bound",
+            "proof-request-bound",
+        );
+        assert!(matches!(
+            AuthorizationAdmission::from_verified_request_bound_proof(proof.clone()),
+            Err(AuthorizationAuthorityError::InvalidText {
+                field: "request_binding_digest"
+            })
+        ));
+        proof.request_binding_digest = Some("11".repeat(32));
+        proof.signature = hex::encode(key.sign(&proof.signing_bytes().unwrap()).to_bytes());
+        assert!(matches!(
+            AuthorizationAdmission::from_verified_request_bound_proof(proof.clone()),
+            Err(AuthorizationAuthorityError::InvalidText {
+                field: "scope_certificate_hash"
+            })
+        ));
+        proof.scope_certificate_hash = Some("22".repeat(32));
+        proof.signature = hex::encode(key.sign(&proof.signing_bytes().unwrap()).to_bytes());
+        assert!(AuthorizationAdmission::from_verified_request_bound_proof(proof).is_ok());
     }
 
     #[test]

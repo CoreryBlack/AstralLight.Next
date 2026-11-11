@@ -64,8 +64,11 @@ impl QuorumProvider {
         if hints != scope_hints(pool).await? {
             return Err(pending("local scope inventory changed during attestation"));
         }
-        hub.install_certified_partition(token, certified)
-            .map_err(pending)
+        let installed = hub
+            .install_certified_partition(token, certified)
+            .map_err(pending)?;
+        self.certified_read_state.mark_warmed();
+        Ok(installed)
     }
 
     async fn attest_scope(
@@ -152,7 +155,15 @@ impl QuorumProvider {
             &evidence_scope,
         )
         .map_err(pending)?;
-        persist_response(pool, &response, &scope, &binding).await?;
+        if matches!(self.read_mode, super::AuthorityReadMode::Durable) {
+            persist_response(
+                &self.warmup_response_persistence(pool),
+                &response,
+                &scope,
+                &binding,
+            )
+            .await?;
+        }
         *self
             .roots
             .write()

@@ -1,10 +1,62 @@
 //! Fresh policy admission for one immutable, durable batch item.
 
-use astral_db::{CachedPublishedEvidenceRuleRepository, SqlxRuleRepository};
 use astral_types::{AstralError, AuthorityMutationKind, AuthorizationAdmission, PolicyContext};
 use sha2::{Digest, Sha256};
 
 use crate::AppState;
+
+pub(crate) async fn abort_after_admission_drift(
+    provider: &astral_db::SqlxAuthorizationFenceProvider,
+    abort: &astral_db::SourceReservationAbort,
+    drift: &str,
+) -> AstralError {
+    match provider.abort_source_reservation(abort).await {
+        Ok(report) => {
+            let outcome = format!("{:?}", report.outcome);
+            let certainty = if matches!(
+                &report.outcome,
+                astral_db::SourceAbortOutcome::Aborted
+                    | astral_db::SourceAbortOutcome::AlreadyAborted
+            ) {
+                "ABORT_PROVEN"
+            } else if matches!(
+                &report.outcome,
+                astral_db::SourceAbortOutcome::Unknown
+                    | astral_db::SourceAbortOutcome::RemoteNotFound
+                    | astral_db::SourceAbortOutcome::NoLocalTombstone
+            ) {
+                "UNKNOWN"
+            } else {
+                "ABORT_REFUSED"
+            };
+            tracing::warn!(
+                operation_id = %report.operation_id,
+                reservation_id = %report.reservation_id,
+                outcome = %outcome,
+                certainty,
+                drift,
+                "batch item admission drift after source reservation"
+            );
+            AstralError::Pending(format!(
+                "batch item admission drift after source reservation; stable-id abort {certainty}; operation_id={}; reservation_id={}; outcome={outcome}; drift={drift}",
+                report.operation_id, report.reservation_id
+            ))
+        }
+        Err(error) => {
+            tracing::warn!(
+                operation_id = %abort.operation_id,
+                reservation_id = %abort.reservation_id,
+                drift,
+                error = %error,
+                "batch item source reservation abort outcome unknown"
+            );
+            AstralError::Pending(format!(
+                "batch item admission drift after source reservation; stable-id abort UNKNOWN; operation_id={}; reservation_id={}; drift={drift}; abort_error={error}",
+                abort.operation_id, abort.reservation_id
+            ))
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn admit_item(
@@ -16,7 +68,7 @@ pub(crate) async fn admit_item(
     target_user_id: i64,
     tenant_id: i64,
     domain_id: i64,
-) -> Result<AuthorizationAdmission, AstralError> {
+) -> Result<(AuthorizationAdmission, astral_db::SourceReservationAbort), AstralError> {
     let mut context = item_context(parent, task_id, operation_id, card_id, target_user_id)?;
     let fence = match astral_db::memory_projection_hub() {
         Some(hub) => Some(hub.capture_authority_fence().ok_or_else(|| {
@@ -25,17 +77,24 @@ pub(crate) async fn admit_item(
         None => None,
     };
     let path = format!("/user-cards/{card_id}/bind");
-    astral_db::resolve_resource_ownership(
-        &state.db,
-        "domain",
-        &path,
-        "POST",
-        None,
-        context.card_id,
-        context.user_id,
-    )
-    .await
-    .apply_to(&mut context);
+    let read_surface = astral_db::authorization_read_surface()
+        .ok_or_else(|| AstralError::Pending("authorization read surface unavailable".into()))?;
+    let read_request = read_surface.begin_request().map_err(|error| {
+        AstralError::Pending(format!(
+            "batch item certified-memory request token unavailable: {error}"
+        ))
+    })?;
+    read_request
+        .resolve_ownership(
+            "domain",
+            &path,
+            "POST",
+            None,
+            context.card_id,
+            context.user_id,
+        )
+        .await
+        .apply_to(&mut context);
     if context.target_id != Some(card_id)
         || context.resource_tenant_id != Some(tenant_id)
         || context.resource_domain_id != Some(domain_id)
@@ -44,16 +103,8 @@ pub(crate) async fn admit_item(
             "batch item ownership changed from its immutable registration".into(),
         ));
     }
-    let repo = CachedPublishedEvidenceRuleRepository::new(
-        SqlxRuleRepository::new(state.db.clone())
-            .with_org_scope_enabled(state.org_scope_enabled)
-            .with_authority_provider_opt(state.authorization_fence_provider.clone())
-            .with_authority_required(true),
-        state.db.clone(),
-    );
-    let (decision, admission) = state
-        .engine
-        .evaluate_with_admission(&context, &repo)
+    let (decision, admission) = read_request
+        .evaluate_with_admission(&state.engine, &context)
         .await
         .into_parts();
     if !decision.allowed {
@@ -62,7 +113,8 @@ pub(crate) async fn admit_item(
             decision.reason
         )));
     }
-    let sod = super::admission_checks::check_sod(&state.db, &context, &decision)
+    let sod = read_request
+        .check_sod(&context, &decision)
         .await
         .map_err(|error| AstralError::Pending(format!("batch item SoD unavailable: {error}")))?;
     if sod.has_conflict {
@@ -70,22 +122,52 @@ pub(crate) async fn admit_item(
             "batch item conflicts with separation of duties".into(),
         ));
     }
+    read_request.ensure_current().map_err(|error| {
+        AstralError::Pending(format!(
+            "batch item certified-memory request token changed before reservation: {error}"
+        ))
+    })?;
     if fence.is_some_and(|fence| {
         !astral_db::memory_projection_hub().is_some_and(|hub| hub.authority_fence_matches(fence))
     }) {
         return Err(AstralError::Pending(
-            "batch item host authority fence changed".into(),
+            "batch item host authority fence changed before reservation".into(),
         ));
     }
+    read_request
+        .ensure_mutation_commit_fence()
+        .map_err(|error| AstralError::Pending(error.to_string()))?;
     let admission = admission
         .ok_or_else(|| AstralError::Pending("batch item has no fresh admission".into()))?;
-    state
+    let provider = state
         .authorization_fence_provider
         .as_ref()
-        .ok_or_else(|| AstralError::Pending("batch item authority provider unavailable".into()))?
-        .reserve_mutation(&context, &admission)
-        .await?;
-    Ok(admission)
+        .ok_or_else(|| AstralError::Pending("batch item authority provider unavailable".into()))?;
+    let abort = provider
+        .reserve_mutation_with_abort(&context, &admission)
+        .await
+        .map_err(|error| {
+            AstralError::Pending(format!(
+                "batch item source reservation not proven; operation_id={operation_id}; {error}"
+            ))
+        })?;
+
+    let token_error = read_request.ensure_current().err();
+    let fence_holds = fence.is_none_or(|captured| {
+        astral_db::memory_projection_hub().is_some_and(|hub| hub.authority_fence_matches(captured))
+    });
+    if let Some(error) = token_error {
+        return Err(abort_after_admission_drift(
+            provider,
+            &abort,
+            &format!("request_token={error}"),
+        )
+        .await);
+    }
+    if !fence_holds {
+        return Err(abort_after_admission_drift(provider, &abort, "authority_fence=changed").await);
+    }
+    Ok((admission, abort))
 }
 
 fn item_context(
@@ -157,6 +239,17 @@ mod tests {
             .resource_tenant_id(Some(10))
             .resource_domain_id(Some(40))
             .build()
+    }
+
+    #[test]
+    fn item_commit_fence_precedes_reservation() {
+        let source = include_str!("user_card_batch_admission.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let gate = production.find(".ensure_mutation_commit_fence()").unwrap();
+        let reservation = production
+            .find(".reserve_mutation_with_abort(&context, &admission)")
+            .unwrap();
+        assert!(gate < reservation);
     }
 
     #[test]

@@ -604,6 +604,16 @@ where
         .map_err(|error| {
             anyhow::anyhow!("authorization authority trust-root configuration invalid: {error}")
         })?;
+    let authorization_read_surface = astral_db::ensure_authorization_read_surface(
+        config.authorization_read_profile,
+        db.clone(),
+        config.org_scope_enabled,
+        config.authority_runtime_mode.requires_authority(),
+        authorization_fence_provider.clone(),
+        None,
+    )
+    .map_err(|error| anyhow::anyhow!("authorization read surface unavailable: {error}"))?;
+    let _authorization_read_surface = authorization_read_surface;
     // Authority source outcome reconciliation runtime（V7）：Identity 与
     // TrustGraph/Monitor 运行同一共享生命周期任务。worker 序列中最先启动，
     // 按严格逆序在关闭尾段最后停止——位于 HTTP/request drain、producers

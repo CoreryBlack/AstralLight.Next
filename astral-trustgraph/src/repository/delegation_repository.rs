@@ -2090,7 +2090,7 @@ impl DelegationRepository for SqlxDelegationRepository {
                 "delegation expiry reconciliation requires a positive delegation id, got {delegation_id}"
             )));
         }
-        let capability = SourceMutationCapability::System;
+        let capability = SourceMutationCapability::system_for_delegation_expiry();
         let mut tx = begin_source_transaction_with_capability_and_optional_delivery_context(
             &self.db,
             &capability,

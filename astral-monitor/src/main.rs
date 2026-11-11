@@ -94,16 +94,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let config = Arc::new(AppConfig::from_files_for(
-        "application",
-        JwtValidationRole::Gateway,
-    )?);
+    let config = AppConfig::from_files_for("application", JwtValidationRole::Gateway)?;
+    config.validate_listener_for(JwtValidationRole::Gateway)?;
+    let config = Arc::new(config);
     let db = connect_and_validate_schema(&config.database_url).await?;
     let authorization_fence_provider = astral_db::authority_provider_from_env(db.clone())
         .await
         .map_err(|error| {
             anyhow::anyhow!("authorization authority trust-root configuration invalid: {error}")
         })?;
+    let authorization_read_surface = astral_db::ensure_authorization_read_surface(
+        config.authorization_read_profile,
+        db.clone(),
+        config.org_scope_enabled,
+        config.authority_runtime_mode.requires_authority(),
+        authorization_fence_provider.clone(),
+        None,
+    )
+    .map_err(|error| anyhow::anyhow!("authorization read surface unavailable: {error}"))?;
+    let _authorization_read_surface = authorization_read_surface;
     // Authority source outcome reconciliation runtime（V7）：provider 存在时
     // 运行与 TrustGraph/Identity 相同的共享生命周期任务；先于 collector 启动，
     // 因此按严格逆序在关闭尾段（HTTP drain、collector 停止与 owned audit

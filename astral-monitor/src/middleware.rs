@@ -10,11 +10,6 @@ use astral_common::middleware::permission_check_shared::{
     path_matches_prefix, physical_policy_context, request_target_id, resolve_permission_action,
     BoxedResponse, PathResourceMap,
 };
-use astral_db::{
-    check_sod_conflict_with_context, check_sod_conflict_with_context_and_org,
-    load_org_sod_admission, resolve_resource_ownership, MemoryMirroredRuleRepository,
-    SqlxRuleRepository,
-};
 
 use crate::AppState;
 
@@ -39,6 +34,60 @@ pub const MONITOR_PATH_MAP: PathResourceMap = &[
     ("/system-info", "monitor"),
     ("/dashboard", "monitor"),
 ];
+
+async fn abort_source_reservation_and_record(
+    provider: &astral_db::SqlxAuthorizationFenceProvider,
+    abort: &astral_db::SourceReservationAbort,
+    phase: &'static str,
+) {
+    match provider.abort_source_reservation(abort).await {
+        Ok(report) => {
+            let proven = matches!(
+                report.outcome,
+                astral_db::SourceAbortOutcome::Aborted
+                    | astral_db::SourceAbortOutcome::AlreadyAborted
+            );
+            if proven {
+                tracing::info!(
+                    phase,
+                    operation_id = %report.operation_id,
+                    reservation_id = %report.reservation_id,
+                    proof_id = %abort.proof_id,
+                    request_digest = %abort.request_digest,
+                    reason = %abort.reason,
+                    outcome = ?report.outcome,
+                    observed_disposition = ?report.observed_disposition,
+                    "durable source reservation abort proven"
+                );
+            } else {
+                tracing::warn!(
+                    phase,
+                    operation_id = %report.operation_id,
+                    reservation_id = %report.reservation_id,
+                    proof_id = %abort.proof_id,
+                    request_digest = %abort.request_digest,
+                    reason = %abort.reason,
+                    outcome = ?report.outcome,
+                    observed_disposition = ?report.observed_disposition,
+                    "source reservation abort not proven; stable identity recovery required"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                phase,
+                operation_id = %abort.operation_id,
+                reservation_id = %abort.reservation_id,
+                proof_id = %abort.proof_id,
+                request_digest = %abort.request_digest,
+                reason = %abort.reason,
+                outcome = "UNKNOWN",
+                error = %error,
+                "source reservation abort outcome unknown; stable identity recovery required"
+            );
+        }
+    }
+}
 
 pub async fn monitor_permission_middleware(
     State(state): State<AppState>,
@@ -112,38 +161,36 @@ pub async fn monitor_permission_middleware(
             .await
             .map_err(|status| BoxedResponse::new(status.into_response()))?,
     );
-    let resolution = resolve_resource_ownership(
-        &state.db,
-        resource,
-        path,
-        method.as_str(),
-        query_target_id,
-        ctx.card_id,
-        ctx.user_id,
-    )
-    .await;
+    let read_surface = astral_db::authorization_read_surface()
+        .ok_or_else(|| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+    let read_request = read_surface.begin_request().map_err(|error| {
+        tracing::error!(%error, "monitor authorization request token unavailable");
+        BoxedResponse::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authorization request token unavailable; request denied",
+            )
+                .into_response(),
+        )
+    })?;
+    let resolution = read_request
+        .resolve_ownership(
+            resource,
+            path,
+            method.as_str(),
+            query_target_id,
+            ctx.card_id,
+            ctx.user_id,
+        )
+        .await;
     resolution.apply_to(&mut ctx);
     let user_id = ctx.user_id;
     let card_id = ctx.card_id;
     let tenant_id = ctx.tenant_id;
-    let resource_owner_id = ctx.resource_owner_id;
 
-    // 正式授权仓储必须携带启动期冻结的 ORG_SCOPE 旗标（default-off；冻结于
-    // 共享 AppConfig，与 identity/trustgraph 同一严格解析器与默认关闭语义），
-    // 避免同一受管租户在不同宿主间出现 org_scope 准入 split-brain。
-    // 绝不逐请求读 env。
-    let repo =
-        MemoryMirroredRuleRepository::new(
-            SqlxRuleRepository::new(state.db.clone())
-                .with_org_scope_enabled(state.config.org_scope_enabled)
-                .with_authority_provider_opt(state.authorization_fence_provider.clone())
-                .with_authority_required(state.config.authority_runtime_mode.requires_authority()),
-        )
-        .with_authority_provider_opt(state.authorization_fence_provider.clone().map(|provider| {
-            provider as std::sync::Arc<dyn policy_engine::AuthorizationFenceProvider>
-        }))
-        .with_durable_refill(state.db.clone());
-    let evaluation = state.engine.evaluate_with_admission(&ctx, &repo).await;
+    let evaluation = read_request
+        .evaluate_with_admission(&state.engine, &ctx)
+        .await;
     let (decision, authorization_admission) = evaluation.into_parts();
 
     // 权限决策审计（MQ-first，DB fallback；故障不影响权限决策）。
@@ -214,19 +261,7 @@ pub async fn monitor_permission_middleware(
         // publication/member evidence 经共享 helper 重新装配，再进入 deny-only
         // 复核；读取、钉栅或匹配失败统一进入 unavailable 分支，绝不把组织持有
         // 权限折算为空集。非 ORG 判定保持既有纯 deny-only 检查不变。
-        let sod_result = match load_org_sod_admission(&state.db, &ctx, &decision).await {
-            Ok(Some(admission)) => {
-                check_sod_conflict_with_context_and_org(
-                    &state.db,
-                    &ctx,
-                    &admission,
-                    resource_owner_id,
-                )
-                .await
-            }
-            Ok(None) => check_sod_conflict_with_context(&state.db, &ctx, resource_owner_id).await,
-            Err(error) => Err(error),
-        };
+        let sod_result = read_request.check_sod(&ctx, &decision).await;
         match sod_result {
             Ok(result) if result.has_conflict => {
                 return Err(BoxedResponse::new(
@@ -256,6 +291,17 @@ pub async fn monitor_permission_middleware(
         }
     }
 
+    if let Err(error) = read_request.ensure_current() {
+        tracing::error!(%error, "monitor authorization request token changed; denying request");
+        return Err(BoxedResponse::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authorization request token changed; request denied",
+            )
+                .into_response(),
+        ));
+    }
+
     if let Some(fence) = admission_fence {
         if !astral_db::memory_projection_hub().is_some_and(|hub| hub.authority_fence_matches(fence))
         {
@@ -271,6 +317,9 @@ pub async fn monitor_permission_middleware(
     }
 
     let source_abort = if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        read_request
+            .ensure_mutation_commit_fence()
+            .map_err(|_| BoxedResponse::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
         let provider = state
             .authorization_fence_provider
             .as_ref()
@@ -286,6 +335,34 @@ pub async fn monitor_permission_middleware(
     } else {
         None
     };
+
+    // The reservation await is an independent consistency window. Recheck the
+    // original request token and captured fence before exposing the mutation to
+    // the handler; never replace them with a newly sampled request.
+    if let Some((provider, abort)) = &source_abort {
+        let token_error = read_request.ensure_current().err();
+        let token_changed = token_error.is_some();
+        let fence_holds = admission_fence.is_none_or(|fence| {
+            astral_db::memory_projection_hub().is_some_and(|hub| hub.authority_fence_matches(fence))
+        });
+        if let Some(error) = token_error {
+            tracing::error!(%error, "monitor post-reservation request token changed; handler denied");
+        }
+        if !fence_holds {
+            tracing::error!("monitor post-reservation admission fence changed; handler denied");
+        }
+        if token_changed || !fence_holds {
+            abort_source_reservation_and_record(provider, abort, "monitor_post_reservation").await;
+            return Err(BoxedResponse::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authorization state changed after reservation; request denied",
+                )
+                    .into_response(),
+            ));
+        }
+    }
+
     req.extensions_mut().insert(ctx);
     if let Some(authorization_admission) = authorization_admission {
         req.extensions_mut().insert(authorization_admission);
@@ -293,9 +370,7 @@ pub async fn monitor_permission_middleware(
 
     let response = next.run(req).await;
     if let Some((provider, abort)) = source_abort {
-        if let Err(error) = provider.abort_source_reservation(&abort).await {
-            tracing::warn!(operation_id = %abort.operation_id, reservation_id = %abort.reservation_id, error = %error, "monitor post-handler source abort remains unknown; stable identity recovery required");
-        }
+        abort_source_reservation_and_record(&provider, &abort, "monitor_post_handler").await;
     }
     Ok(response)
 }
@@ -304,6 +379,30 @@ pub async fn monitor_permission_middleware(
 mod tests {
     use astral_common::middleware::permission_check_shared::resolve_permission_action;
     use astral_types::ResourceRegistry;
+
+    #[test]
+    fn post_reservation_gate_rechecks_and_aborts_before_handler() {
+        let source = include_str!("middleware.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let gate = production.find(".ensure_mutation_commit_fence()").unwrap();
+        let reservation = production
+            .find(".reserve_mutation_with_abort(&ctx, admission)")
+            .unwrap();
+        assert!(gate < reservation);
+        let handler = production[reservation..]
+            .find("next.run(req).await")
+            .unwrap()
+            + reservation;
+        let window = &production[reservation..handler];
+        let token = window.find("read_request.ensure_current()").unwrap();
+        let fence = window.find("authority_fence_matches(fence)").unwrap();
+        let abort = window
+            .find("abort_source_reservation_and_record(provider, abort")
+            .unwrap();
+        let denial = window[abort..].find("return Err(").unwrap() + abort;
+        assert!(token < abort && fence < abort && abort < denial);
+        assert!(!window.contains("begin_request("));
+    }
 
     #[test]
     fn monitor_write_routes_use_registered_actions() {
@@ -356,12 +455,11 @@ mod tests {
         }
     }
 
-    /// 宿主 SoD 分发形状守卫（对齐 TrustGraph/identity 的源文本守卫惯例）：
-    /// ORG provenance 判定必须先经 shared fresh 准入装配
-    /// （`load_org_sod_admission`）再进入 context-aware org SoD
-    /// deny-only 复核；无 provenance 时使用同一 context-aware 卡级检查；审计
-    /// detail 必须经 shared 有界 provenance helper 并通过显式 detail 审计
-    /// 入口传播。本地不得重新引入任何重复 helper 定义。
+    /// 宿主 SoD 分发形状守卫（对齐 TrustGraph/Identity 的源文本守卫惯例）：
+    /// 受保护请求必须经 frozen read surface 完成 ownership、admission-bearing
+    /// evaluation 与 SoD deny-only 复核；CertifiedMemory 不得从宿主回到 durable
+    /// helper。审计 detail 必须经 shared 有界 provenance helper 并通过显式 detail
+    /// 审计入口传播。本地不得重新引入任何重复 helper 定义。
     #[test]
     fn sod_dispatch_wires_org_provenance_to_fresh_admission_recheck() {
         let source = include_str!("middleware.rs");
@@ -370,18 +468,38 @@ mod tests {
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect();
-        let loader = dispatch
-            .find("load_org_sod_admission(&state.db,&ctx,&decision)")
-            .expect("org dispatch must load fresh admission via the shared helper");
-        let with_org = dispatch
-            .find("check_sod_conflict_with_context_and_org(&state.db,&ctx,&admission,resource_owner_id,)")
-            .expect("org admission must recheck with the complete context");
-        let plain = dispatch
-            .find("check_sod_conflict_with_context(&state.db,&ctx,resource_owner_id)")
-            .expect("non-org decisions must use the complete context");
+        let fence_capture = dispatch
+            .find("capture_authority_fence()")
+            .expect("host must capture the opaque admission fence before authority reads");
+        let ownership = dispatch
+            .find("read_request.resolve_ownership(")
+            .expect("host must resolve ownership through the request-scoped read handle");
+        let evaluation = dispatch
+            .find("read_request.evaluate_with_admission(&state.engine,&ctx)")
+            .expect("host must evaluate through the request-scoped read handle");
+        let sod_dispatch = dispatch
+            .find("read_request.check_sod(&ctx,&decision)")
+            .expect("host SoD must use the request-scoped read handle");
         assert!(
-            loader < with_org && with_org < plain,
-            "dispatch order must be loader -> with_org -> plain fallback"
+            fence_capture < ownership && ownership < evaluation && evaluation < sod_dispatch,
+            "dispatch order must be fence -> ownership -> evaluation -> SoD"
+        );
+        assert!(
+            !production.contains("load_org_sod_admission(")
+                && !production.contains("check_sod_conflict_with_context_and_org(")
+                && !production.contains("check_sod_conflict_with_context(&state.db"),
+            "host middleware must not bypass the frozen read surface with durable SoD helpers"
+        );
+        assert!(
+            !production.contains("resolve_resource_ownership("),
+            "host middleware must not bypass the frozen read surface with durable ownership"
+        );
+        let fence_recheck = dispatch
+            .find("authority_fence_matches(fence)")
+            .expect("host must recheck the captured authority fence before admission");
+        assert!(
+            sod_dispatch < fence_recheck,
+            "the fence recheck must run after the complete SoD window"
         );
         assert!(
             !production.contains("fn org_provenance_audit_detail"),

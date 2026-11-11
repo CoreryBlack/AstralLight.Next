@@ -294,8 +294,14 @@ async fn grant_user_permission(
     // canonical 单卡管理范围门（tenant/domain 比对 + ACTIVE GlobalAdmin 例外）
     crate::api::rules::require_card_scope(&state, &headers, card).await?;
 
+    let effect = req.effect.as_deref().ok_or_else(|| {
+        AppError(AstralError::Validation(
+            "personal permission effect must be explicitly ALLOW".into(),
+        ))
+    })?;
+
     // fail-closed（service 内先于任何 source mutation）：canonical 授权只接受
-    // ALLOW（大小写归一）且 resource/action 必须命中 ResourceRegistry；
+    // 显式 ALLOW（大小写归一）且 resource/action 必须命中 ResourceRegistry；
     // 空值/未知值/DENY/未注册资源一律在写入前拒绝。
     let outcome = state
         .personal_permission_service
@@ -303,7 +309,7 @@ async fn grant_user_permission(
             card,
             &req.resource_type,
             &req.action_code,
-            req.effect.as_deref().unwrap_or("ALLOW"),
+            effect,
             req.priority,
             &mutation_context(&headers, admission)?,
         )

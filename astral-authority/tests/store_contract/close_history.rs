@@ -112,6 +112,103 @@ async fn seeded_committed_global(
 }
 
 #[tokio::test]
+async fn service_index_writers_advance_reservation_revision_and_fence_stale_snapshot() {
+    use astral_authority::store::{SnapshotRead, StoreTxnOutcome};
+
+    let (service, store, keys, signer_key) = test_service().await;
+    let prepare = seeded_committed_global(&service, &store, &keys, &signer_key, None).await;
+    let reservation_id = &prepare.reservation.reservation_id;
+    let reservation_key = keys.reservation(reservation_id);
+    let index_key =
+        keys.reservation_certificate(reservation_id, &card_scope().store_key_text().unwrap());
+    let reads = [
+        SnapshotRead::Key(reservation_key.clone()),
+        SnapshotRead::Prefix(keys.reservation_certificate(reservation_id, "")),
+    ];
+    let before_certify = store.read_snapshot(&reads).await.unwrap();
+    let old_reservation_revision = before_certify.reads[0][0].1.revision;
+    assert!(before_certify.reads[1].is_empty());
+
+    let certify_request = op_certify_request(&op_one(), &prepare.reservation, None, card_scope());
+    let certified = service.certify_publication(&certify_request).await.unwrap();
+    let reservation_after_certify = store.get(&reservation_key).await.unwrap().unwrap();
+    let index_after_certify = store.get(&index_key).await.unwrap().unwrap();
+    assert!(reservation_after_certify.revision > old_reservation_revision);
+    assert_eq!(
+        reservation_after_certify.revision,
+        index_after_certify.revision
+    );
+    let stale_root = StoreTxn::new()
+        .with_op(StoreOp::RequireRevision {
+            key: reservation_key.clone(),
+            expected_revision: old_reservation_revision,
+        })
+        .with_op(StoreOp::PutIfAbsent {
+            key: "test/stale-root-after-certify".into(),
+            value: vec![1],
+        });
+    assert!(matches!(
+        store.execute(stale_root).await.unwrap(),
+        StoreTxnOutcome::PreconditionFailed { .. }
+    ));
+    assert!(store
+        .get("test/stale-root-after-certify")
+        .await
+        .unwrap()
+        .is_none());
+
+    let replay = service.certify_publication(&certify_request).await.unwrap();
+    assert_eq!(replay.certificate, certified.certificate);
+    assert_eq!(
+        store.get(&reservation_key).await.unwrap().unwrap(),
+        reservation_after_certify
+    );
+    assert_eq!(
+        store.get(&index_key).await.unwrap().unwrap(),
+        index_after_certify
+    );
+
+    let before_close = store.read_snapshot(&reads).await.unwrap();
+    let before_close_revision = before_close.reads[0][0].1.revision;
+    let closed = operator_close(&service, reservation_id, "complete history")
+        .await
+        .unwrap();
+    let reservation_after_close = store.get(&reservation_key).await.unwrap().unwrap();
+    let receipt_key = keys.reservation_certificate(reservation_id, "OPERATOR-CLOSE");
+    let receipt = store.get(&receipt_key).await.unwrap().unwrap();
+    assert!(reservation_after_close.revision > before_close_revision);
+    assert_eq!(reservation_after_close.revision, receipt.revision);
+    let stale_root = StoreTxn::new()
+        .with_op(StoreOp::RequireRevision {
+            key: reservation_key.clone(),
+            expected_revision: before_close_revision,
+        })
+        .with_op(StoreOp::PutIfAbsent {
+            key: "test/stale-root-after-close".into(),
+            value: vec![1],
+        });
+    assert!(matches!(
+        store.execute(stale_root).await.unwrap(),
+        StoreTxnOutcome::PreconditionFailed { .. }
+    ));
+    assert!(store
+        .get("test/stale-root-after-close")
+        .await
+        .unwrap()
+        .is_none());
+
+    let replay = operator_close(&service, reservation_id, "complete history")
+        .await
+        .unwrap();
+    assert_eq!(replay.global_frontier, closed.global_frontier);
+    assert_eq!(
+        store.get(&reservation_key).await.unwrap().unwrap(),
+        reservation_after_close
+    );
+    assert_eq!(store.get(&receipt_key).await.unwrap().unwrap(), receipt);
+}
+
+#[tokio::test]
 async fn close_verifies_history_before_flip_and_records_stable_receipt() {
     let (service, store, keys, signer_key) = test_service().await;
     let one = op_one();

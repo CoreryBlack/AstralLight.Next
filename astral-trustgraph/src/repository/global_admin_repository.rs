@@ -715,13 +715,10 @@ const STATUS_DISABLED: &str = "DISABLED";
 // is_active_admin 进程级缓存（读链规模化：每请求 1 次 identity_global_admin 读收敛）
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// ACTIVE 全局管理员判定的进程级缓存 TTL（5s 短窗口）。
+/// ACTIVE 全局管理员判定的进程级缓存 TTL（5s 短窗，仅用于 deny-only 结果）。
 ///
-/// 显式取舍（记录在案）：全局管理员撤销/禁用需快速生效，但缓存条目在 TTL
-/// 窗口内仍可能携带旧的 ACTIVE 结论——**5s 窗口内已撤销的管理员仍可通过
-/// `require_platform_admin` 类管理范围例外判定（放行方向），属显式接受的
-/// 安全成本**；反向（新授予/启用延迟 ≤5s 生效）只会延迟放行，是安全方向。
-/// 失效方式见模块文档"is_active_admin 进程级缓存"节。
+/// ACTIVE 结果不会从缓存直接返回；每次管理边界的 positive allow 都回源
+/// `identity_global_admin`，避免跨实例撤销在 TTL 窗口内形成 stale-true。
 const ACTIVE_ADMIN_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// 进程缓存容量上限（键数）：超限先淘汰过期条目，仍超限整体清空——缓存是
@@ -752,7 +749,13 @@ fn fresh_active_admin_entry(user_id: i64) -> Option<bool> {
     None
 }
 
-/// 写入缓存（权威查询成功后调用；错误结果绝不缓存）。锁中毒时静默跳过
+/// The cache is deny-only: a fresh inactive result may reject quickly, while
+/// every active result still comes from the durable status row. This prevents a
+/// cross-instance revoke from becoming a stale management allow.
+fn fresh_inactive_admin_entry(user_id: i64) -> Option<bool> {
+    (fresh_active_admin_entry(user_id) == Some(false)).then_some(false)
+}
+
 /// （缓存侧任何异常只意味着下一次读回源权威查询，绝不影响 fail-closed）。
 /// 容量清理随 TTL：超限先淘汰过期条目，仍超限整体清空。
 fn store_active_admin_entry(user_id: i64, active: bool) {
@@ -769,8 +772,8 @@ fn store_active_admin_entry(user_id: i64, active: bool) {
     cache.insert(user_id, (active, Instant::now()));
 }
 
-/// 按 user 主动失效（grant/disable 提交成功后的 evict 钩子：本进程立即生效；
-/// 跨实例无广播，由 TTL 兜底，见 `ACTIVE_ADMIN_CACHE_TTL` 取舍记录）。
+/// 按 user 主动失效（grant/disable 提交成功后的 evict 钩子）。跨实例撤销不依赖
+/// 该 hook：positive allow 始终回源 durable status，缓存只加速 deny。
 fn evict_active_admin_entry(user_id: i64) {
     if let Ok(mut cache) = active_admin_cache().write() {
         cache.remove(&user_id);
@@ -1213,8 +1216,8 @@ impl GlobalAdminRepository for SqlxGlobalAdminRepository {
         // 进程级短窗缓存（TTL 5s，取舍见 ACTIVE_ADMIN_CACHE_TTL/模块文档）：
         // 命中直接返回；miss/DB 错误回源权威查询，fail-closed 不变，错误绝不
         // 入缓存。
-        if let Some(active) = fresh_active_admin_entry(user_id) {
-            return Ok(active);
+        if let Some(false) = fresh_inactive_admin_entry(user_id) {
+            return Ok(false);
         }
         let active = astral_db::is_active_global_admin(&self.db, user_id)
             .await

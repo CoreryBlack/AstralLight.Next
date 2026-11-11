@@ -22,9 +22,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use astral_types::{
-    AuthorityAbortRequest, AuthorityCertifyRequest, AuthorityCloseReservationRequest,
-    AuthorityCommitRequest, AuthorityConfigCompletionRequest,
-    AuthorityEligibilityCompletionRequest, AuthorityFenceReadRequest, AuthorityPrepareRequest,
+    AuthorityAbortRequest, AuthorityCertifiedMemoryRootInstallRequest,
+    AuthorityCertifiedMemoryRootReadRequest, AuthorityCertifyRequest,
+    AuthorityCloseReservationRequest, AuthorityCommitRequest, AuthorityConfigCompletionRequest,
+    AuthorityEligibilityCompletionRequest, AuthorityFamilyCompletionReconcileRequest,
+    AuthorityFamilyCompletionRequest, AuthorityFenceReadRequest, AuthorityPrepareRequest,
     AuthorityReconcileRequest, AuthoritySourceBootstrapFinalizeRequest,
     AuthoritySourceBootstrapPrepareRequest, AuthoritySourceBootstrapReconcileRequest,
     AuthorityWireError, AuthorityWireErrorCode, AUTHORITY_PATH_CONFIG_COMPLETIONS,
@@ -219,6 +221,36 @@ async fn handle_eligibility_completion(
     }
 }
 
+async fn handle_family_completion(
+    State(service): State<Arc<AuthorityService>>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Json(mut request): Json<AuthorityFamilyCompletionRequest>,
+) -> Response {
+    if let Err(response) = check_caller(&caller, &request.caller.service_id) {
+        return response;
+    }
+    request.caller.service_id = caller.service_id.clone();
+    match service.record_family_completion(&request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => service_error_response(&error, &service),
+    }
+}
+
+async fn handle_family_completion_reconcile(
+    State(service): State<Arc<AuthorityService>>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Json(mut request): Json<AuthorityFamilyCompletionReconcileRequest>,
+) -> Response {
+    if let Err(response) = check_caller(&caller, &request.caller.service_id) {
+        return response;
+    }
+    request.caller.service_id = caller.service_id.clone();
+    match service.reconcile_family_completion(&request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => service_error_response(&error, &service),
+    }
+}
+
 async fn handle_config_completion(
     State(service): State<Arc<AuthorityService>>,
     Extension(caller): Extension<AuthenticatedCaller>,
@@ -242,6 +274,35 @@ async fn handle_certify(
         return response;
     }
     match service.certify_publication(&request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => service_error_response(&error, &service),
+    }
+}
+
+async fn handle_certified_memory_root_install(
+    State(service): State<Arc<AuthorityService>>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Json(mut request): Json<AuthorityCertifiedMemoryRootInstallRequest>,
+) -> Response {
+    if let Err(response) = check_caller(&caller, &request.caller.service_id) {
+        return response;
+    }
+    request.caller.service_id = caller.service_id.clone();
+    match service.install_certified_memory_root(&request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => service_error_response(&error, &service),
+    }
+}
+
+async fn handle_certified_memory_root_read(
+    State(service): State<Arc<AuthorityService>>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Json(request): Json<AuthorityCertifiedMemoryRootReadRequest>,
+) -> Response {
+    if let Err(response) = check_caller(&caller, &request.caller.service_id) {
+        return response;
+    }
+    match service.read_certified_memory_root(&request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => service_error_response(&error, &service),
     }
@@ -335,6 +396,14 @@ async fn handle_source_bootstrap_reconcile(
 pub fn build_router(service: Arc<AuthorityService>, max_body_bytes: usize) -> Router {
     Router::new()
         .route(
+            astral_types::AUTHORITY_PATH_CERTIFIED_MEMORY_ROOT_INSTALL,
+            post(handle_certified_memory_root_install),
+        )
+        .route(
+            astral_types::AUTHORITY_PATH_CERTIFIED_MEMORY_ROOT_CURRENT,
+            post(handle_certified_memory_root_read),
+        )
+        .route(
             astral_types::AUTHORITY_PATH_FENCE_CURRENT,
             post(handle_fence_read),
         )
@@ -349,6 +418,14 @@ pub fn build_router(service: Arc<AuthorityService>, max_body_bytes: usize) -> Ro
         .route(
             AUTHORITY_PATH_ELIGIBILITY_COMPLETIONS,
             post(handle_eligibility_completion),
+        )
+        .route(
+            astral_types::AUTHORITY_PATH_FAMILY_COMPLETIONS,
+            post(handle_family_completion),
+        )
+        .route(
+            astral_types::AUTHORITY_PATH_FAMILY_COMPLETION_RECONCILE,
+            post(handle_family_completion_reconcile),
         )
         .route(
             AUTHORITY_PATH_CONFIG_COMPLETIONS,

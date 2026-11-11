@@ -10,17 +10,18 @@
 use std::collections::BTreeMap;
 
 use astral_types::{
-    AuthorityCommitBinding, AuthorityManifestIdentity, AuthorityProtocolError,
-    AuthorityProtocolScope, AuthorityReservationCoverage, AuthorityReservationState,
-    AuthorityRootKeyRole, AuthorityScopePublicationCertificate, AuthorityScopeReservation,
-    AuthorityStagedScopeCoverage, GlobalAuthorityFrontier,
+    AuthorityCertifiedMemoryPublicationProof, AuthorityCertifiedMemoryRoot,
+    AuthorityCertifiedMemoryRootProposal, AuthorityCommitBinding, AuthorityManifestIdentity,
+    AuthorityProtocolError, AuthorityProtocolScope, AuthorityReservationCoverage,
+    AuthorityReservationState, AuthorityRootKeyRole, AuthorityScopePublicationCertificate,
+    AuthorityScopeReservation, AuthorityStagedScopeCoverage, GlobalAuthorityFrontier,
 };
 
 use super::{
     decode, manifest_frontier, AuthorityServiceError, StoredScopeCurrent, VerifiedAuthorityState,
 };
 use crate::error::AuthorityStoreError;
-use crate::store::{AuthorityStore, KeyLayout};
+use crate::store::{AuthorityStore, KeyLayout, SnapshotRead, StoreOp, StoreSnapshot, StoreTxn};
 
 /// Publication pointer identity for one requested scope. CARD scopes resolve
 /// through their canonical publication identity — the same `(tenant_id,
@@ -74,7 +75,83 @@ pub(super) fn verify_certificate_record(
     Ok(())
 }
 
-/// One scope's current publication: the durable pointer PLUS the certificate
+/// Verify an authority-owned certified-memory root after resolving its signer
+/// from the attested trust root. The current pointer is only an index.
+pub(super) fn verify_certified_memory_root(
+    state: &VerifiedAuthorityState,
+    expected_root_id: &str,
+    expected_root_digest: &str,
+    root: &AuthorityCertifiedMemoryRoot,
+    now: i64,
+) -> Result<(), AuthorityServiceError> {
+    root.validate().map_err(AuthorityServiceError::Protocol)?;
+    if root.root_id != expected_root_id
+        || root.root_digest != expected_root_digest
+        || root.authority_id != state.frontier.authority_id
+        || root.authority_term > state.frontier.authority_term
+        || root.global_fence_sequence > state.frontier.global_fence_sequence
+        || root.key_epoch > state.frontier.key_epoch
+    {
+        return Err(AuthorityServiceError::Protocol(
+            AuthorityProtocolError::ScopeMismatch,
+        ));
+    }
+    let key = state
+        .trust_root
+        .keys
+        .iter()
+        .find(|key| {
+            key.key_id == root.key_id
+                && key.key_epoch == root.key_epoch
+                && key.role == AuthorityRootKeyRole::Signer
+        })
+        .ok_or_else(|| {
+            AuthorityServiceError::Store(AuthorityStoreError::Corrupt(
+                "certified-memory root signer is not registered".to_owned(),
+            ))
+        })?
+        .verifying_key()
+        .map_err(AuthorityServiceError::Protocol)?;
+    root.verify_at(&key, now)
+        .map_err(AuthorityServiceError::Protocol)
+}
+
+/// Verify the current certified-memory pointer and resolve its immutable root.
+pub(super) async fn load_verified_certified_memory_root(
+    store: &dyn AuthorityStore,
+    keys: &KeyLayout,
+    state: &VerifiedAuthorityState,
+    now: i64,
+) -> Result<AuthorityCertifiedMemoryRoot, AuthorityServiceError> {
+    let pointer_record = store
+        .get(&keys.certified_memory_root_current())
+        .await?
+        .ok_or(AuthorityServiceError::Protocol(
+            AuthorityProtocolError::NotFound {
+                record: "certified_memory_root",
+            },
+        ))?;
+    let pointer: super::StoredCertifiedMemoryRootPointer =
+        decode(&pointer_record.value, "certified memory root pointer")?;
+    let root_record = store
+        .get(&keys.certified_memory_root(&pointer.root_id))
+        .await?
+        .ok_or_else(|| {
+            AuthorityServiceError::Store(AuthorityStoreError::Corrupt(
+                "certified-memory root record is missing".to_owned(),
+            ))
+        })?;
+    let root: AuthorityCertifiedMemoryRoot = decode(&root_record.value, "certified memory root")?;
+    verify_certified_memory_root(state, &pointer.root_id, &pointer.root_digest, &root, now)?;
+    if root.operation_id != pointer.operation_id {
+        return Err(AuthorityServiceError::Protocol(
+            AuthorityProtocolError::ScopeMismatch,
+        ));
+    }
+    Ok(root)
+}
+
+/// Publication pointer identity for one requested scope.
 /// record it resolves to, after full verification of the pair.
 pub(super) struct VerifiedScopePublication {
     /// The pointer exactly as stored. Its raw bytes go back into the mint CAS.
@@ -236,6 +313,147 @@ pub(super) fn close_receipt_key(keys: &KeyLayout, reservation_id: &str) -> Strin
     keys.reservation_certificate(reservation_id, CLOSE_RECEIPT_SCOPE_KEY)
 }
 
+/// Evidence validated at one snapshot. These guards cover observed records only;
+/// they cannot prevent a new key from appearing under an observed prefix.
+pub(super) struct VerifiedPublicationSnapshot(StoreSnapshot);
+
+impl VerifiedPublicationSnapshot {
+    pub(super) fn fence_observed_records(self, mut txn: StoreTxn) -> StoreTxn {
+        for (key, record) in self.0.reads.into_iter().flatten() {
+            txn = txn.with_op(StoreOp::RequireRevision {
+                key,
+                expected_revision: record.revision,
+            });
+        }
+        txn
+    }
+}
+
+/// Verify the immutable certificate set at a single store revision. This is
+/// evidence validation only: a later root installation must also fence every
+/// relevant record and the authority frontier in its own atomic transaction.
+pub(super) async fn verify_certified_memory_publication_snapshot(
+    store: &dyn AuthorityStore,
+    keys: &KeyLayout,
+    state: &VerifiedAuthorityState,
+    proposal: &AuthorityCertifiedMemoryRootProposal,
+    proof: &AuthorityCertifiedMemoryPublicationProof,
+) -> Result<VerifiedPublicationSnapshot, AuthorityServiceError> {
+    proof.validate().map_err(AuthorityServiceError::Protocol)?;
+    let reservation_key = keys.reservation(&proof.reservation_id);
+    let binding_key = keys.commit_binding(&proof.reservation_id);
+    let coverage_key = keys.commit_coverage(&proof.reservation_id);
+    let index_prefix = keys.reservation_certificate(&proof.reservation_id, "");
+    let mut reads = vec![
+        SnapshotRead::Key(reservation_key.clone()),
+        SnapshotRead::Key(binding_key.clone()),
+        SnapshotRead::Key(coverage_key.clone()),
+        SnapshotRead::Prefix(index_prefix.clone()),
+    ];
+    reads.extend(
+        proof
+            .certificates
+            .iter()
+            .map(|certificate| SnapshotRead::Key(keys.certificate(&certificate.certificate_id))),
+    );
+    let snapshot = store.read_snapshot(&reads).await?;
+    if snapshot.reads.len() != reads.len() {
+        return Err(AuthorityServiceError::Store(AuthorityStoreError::Corrupt(
+            "publication snapshot read count mismatch".to_owned(),
+        )));
+    }
+    let exact = |index: usize, key: &str| -> Result<&[u8], AuthorityServiceError> {
+        match snapshot.reads[index].as_slice() {
+            [(actual, record)] if actual == key => Ok(&record.value),
+            _ => Err(AuthorityServiceError::Store(AuthorityStoreError::Corrupt(
+                "publication snapshot exact record missing".to_owned(),
+            ))),
+        }
+    };
+    let reservation: AuthorityScopeReservation =
+        decode(exact(0, &reservation_key)?, "reservation")?;
+    let binding: AuthorityCommitBinding = decode(exact(1, &binding_key)?, "source commit binding")?;
+    let coverage: super::coverage::StoredCommitCoverage =
+        decode(exact(2, &coverage_key)?, "source commit coverage")?;
+    if coverage.binding() != &binding
+        || coverage.declared_coverage() != Some(&proof.declared_coverage)
+    {
+        return Err(AuthorityServiceError::Protocol(
+            AuthorityProtocolError::ScopeMismatch,
+        ));
+    }
+    proof
+        .validate_for_root(proposal, &reservation, &binding)
+        .map_err(AuthorityServiceError::Protocol)?;
+    let mut expected = BTreeMap::new();
+    for (position, certificate) in proof.certificates.iter().enumerate() {
+        let scope_key = certificate
+            .scope
+            .store_key_text()
+            .map_err(AuthorityServiceError::Protocol)?;
+        let index_key = keys.reservation_certificate(&proof.reservation_id, &scope_key);
+        expected.insert(index_key, certificate.certificate_id.as_str());
+        let certificate_key = keys.certificate(&certificate.certificate_id);
+        let stored: AuthorityScopePublicationCertificate = decode(
+            exact(position + 4, &certificate_key)?,
+            "reservation certificate",
+        )?;
+        verify_certificate_record(state, &certificate.certificate_id, &stored)?;
+        if &stored != certificate
+            || stored.intent_digest != reservation.intent_digest
+            || stored.authority_term != reservation.authority_term
+            || stored.global_fence_sequence != reservation.fence_sequence_at_prepare
+            || stored.approved_request_digest != binding.request_digest
+            || stored.before_image_digest != binding.before_image_digest
+            || stored.after_image_digest != binding.after_image_digest
+        {
+            return Err(AuthorityServiceError::Protocol(
+                AuthorityProtocolError::ScopeMismatch,
+            ));
+        }
+    }
+    let expected_scopes: std::collections::BTreeSet<String> = proof
+        .certificates
+        .iter()
+        .map(|certificate| certificate.scope.store_key_text())
+        .collect::<Result<_, _>>()
+        .map_err(AuthorityServiceError::Protocol)?;
+    if reservation
+        .certified_scopes
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        != expected_scopes
+    {
+        return Err(AuthorityServiceError::Protocol(
+            AuthorityProtocolError::InvalidCoverage,
+        ));
+    }
+    verify_certified_memory_index(&snapshot.reads[3], &expected)?;
+    Ok(VerifiedPublicationSnapshot(snapshot))
+}
+
+fn verify_certified_memory_index(
+    index: &[(String, crate::store::StoredRecord)],
+    expected: &BTreeMap<String, &str>,
+) -> Result<(), AuthorityServiceError> {
+    if index.len() != expected.len() {
+        return Err(AuthorityServiceError::Protocol(
+            AuthorityProtocolError::InvalidCoverage,
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (key, record) in index {
+        let certificate_id: String = decode(&record.value, "reservation certificate index")?;
+        if !seen.insert(key) || expected.get(key).copied() != Some(certificate_id.as_str()) {
+            return Err(AuthorityServiceError::Protocol(
+                AuthorityProtocolError::InvalidCoverage,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The complete publication history of one reservation, verified end to end.
 ///
 /// Every certified scope's index must resolve to an immutable certificate
@@ -357,4 +575,162 @@ pub(super) async fn verify_reservation_history(
         }
     }
     Ok(certificates)
+}
+
+#[cfg(test)]
+mod certified_memory_snapshot_tests {
+    use super::*;
+    use crate::store::{memory::MemoryAuthorityStore, StoreTxnOutcome, StoredRecord};
+
+    #[tokio::test]
+    async fn observed_publication_records_fence_root_transaction_against_races() {
+        let keys = [
+            "reservation",
+            "binding",
+            "coverage",
+            "index/a",
+            "certificate/a",
+        ];
+        for changed in
+            keys.iter()
+                .copied()
+                .chain(["index/a-deleted", "index/a-recreated", "unchanged"])
+        {
+            let store = MemoryAuthorityStore::new();
+            for key in keys {
+                store
+                    .execute(StoreTxn::new().with_op(StoreOp::Put {
+                        key: key.to_owned(),
+                        value: b"observed".to_vec(),
+                    }))
+                    .await
+                    .unwrap();
+            }
+            let reads = [
+                SnapshotRead::Key("reservation".into()),
+                SnapshotRead::Key("binding".into()),
+                SnapshotRead::Key("coverage".into()),
+                SnapshotRead::Prefix("index/".into()),
+                SnapshotRead::Key("certificate/a".into()),
+            ];
+            let snapshot = VerifiedPublicationSnapshot(store.read_snapshot(&reads).await.unwrap());
+            if changed == "index/a-deleted" || changed == "index/a-recreated" {
+                store
+                    .execute(StoreTxn::new().with_op(StoreOp::Delete {
+                        key: "index/a".into(),
+                    }))
+                    .await
+                    .unwrap();
+                if changed == "index/a-recreated" {
+                    store
+                        .execute(StoreTxn::new().with_op(StoreOp::Put {
+                            key: "index/a".into(),
+                            value: b"observed".to_vec(),
+                        }))
+                        .await
+                        .unwrap();
+                }
+            } else if changed != "unchanged" {
+                store
+                    .execute(StoreTxn::new().with_op(StoreOp::Put {
+                        key: changed.into(),
+                        value: b"observed".to_vec(),
+                    }))
+                    .await
+                    .unwrap();
+            }
+            let txn =
+                snapshot.fence_observed_records(StoreTxn::new().with_op(StoreOp::PutIfAbsent {
+                    key: "root".into(),
+                    value: b"installed".to_vec(),
+                }));
+            let outcome = store.execute(txn).await.unwrap();
+            if changed == "unchanged" {
+                assert!(matches!(outcome, StoreTxnOutcome::Applied { .. }));
+                assert!(store.get("root").await.unwrap().is_some());
+            } else {
+                let expected = if changed == "index/a-deleted" || changed == "index/a-recreated" {
+                    "index/a"
+                } else {
+                    changed
+                };
+                assert_eq!(
+                    outcome,
+                    StoreTxnOutcome::PreconditionFailed {
+                        key: expected.into()
+                    }
+                );
+                assert!(store.get("root").await.unwrap().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_record_fences_do_not_seal_prefix_against_new_keys() {
+        let store = MemoryAuthorityStore::new();
+        store
+            .execute(StoreTxn::new().with_op(StoreOp::Put {
+                key: "index/a".into(),
+                value: b"a".to_vec(),
+            }))
+            .await
+            .unwrap();
+        let snapshot = VerifiedPublicationSnapshot(
+            store
+                .read_snapshot(&[SnapshotRead::Prefix("index/".into())])
+                .await
+                .unwrap(),
+        );
+        store
+            .execute(StoreTxn::new().with_op(StoreOp::Put {
+                key: "index/b".into(),
+                value: b"b".to_vec(),
+            }))
+            .await
+            .unwrap();
+        let txn = snapshot.fence_observed_records(StoreTxn::new().with_op(StoreOp::PutIfAbsent {
+            key: "root".into(),
+            value: b"installed".to_vec(),
+        }));
+        assert!(matches!(
+            store.execute(txn).await.unwrap(),
+            StoreTxnOutcome::Applied { .. }
+        ));
+        assert!(!super::super::AuthorityService::certified_memory_publication_proof_available());
+    }
+
+    #[test]
+    fn exact_certificate_index_rejects_missing_foreign_and_changed_entries() {
+        let expected = BTreeMap::from([
+            ("index/a".to_owned(), "cert-a"),
+            ("index/b".to_owned(), "cert-b"),
+        ]);
+        let record = |key: &str, id: &str| {
+            (
+                key.to_owned(),
+                StoredRecord {
+                    revision: 1,
+                    value: serde_json::to_vec(id).unwrap(),
+                },
+            )
+        };
+        let valid = vec![record("index/a", "cert-a"), record("index/b", "cert-b")];
+        assert!(verify_certified_memory_index(&valid, &expected).is_ok());
+        assert!(verify_certified_memory_index(&valid[..1], &expected).is_err());
+        assert!(verify_certified_memory_index(
+            &[record("index/a", "cert-a"), record("index/b", "other")],
+            &expected,
+        )
+        .is_err());
+        assert!(verify_certified_memory_index(
+            &[record("index/a", "cert-a"), record("index/other", "cert-b")],
+            &expected,
+        )
+        .is_err());
+        assert!(verify_certified_memory_index(
+            &[record("index/a", "cert-a"), record("index/a", "cert-a")],
+            &expected,
+        )
+        .is_err());
+    }
 }

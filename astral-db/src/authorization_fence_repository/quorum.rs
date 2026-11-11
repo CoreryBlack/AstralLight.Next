@@ -25,13 +25,69 @@ use sha2::{Digest, Sha256};
 use sqlx::{MySql, MySqlPool, Transaction};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
+    },
     time::{Duration, Instant},
 };
 use time::OffsetDateTime;
 
 const MAX_CERTIFICATE_CACHE_ENTRIES: usize = 4096;
 const CERTIFICATE_CACHE_TTL: Duration = Duration::from_secs(300);
+const MAX_REQUEST_RESPONSE_CACHE_ENTRIES: usize = 4096;
+const REQUEST_RESPONSE_CACHE_TTL: Duration = Duration::from_secs(30);
+const MAX_REQUEST_RESPONSE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const AUTHORITY_READ_MODE_ENV: &str = "ASTRAL_AUTHORITY_READ_MODE";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthorityReadMode {
+    Durable,
+    CertifiedMemory,
+}
+
+impl AuthorityReadMode {
+    fn from_env() -> Result<Self, PolicyError> {
+        Self::parse(std::env::var(AUTHORITY_READ_MODE_ENV).ok().as_deref())
+    }
+
+    fn parse(value: Option<&str>) -> Result<Self, PolicyError> {
+        match value.map(str::trim) {
+            None | Some("") | Some("durable") | Some("Durable") => Ok(Self::Durable),
+            Some("certified-memory") | Some("CertifiedMemory") => Ok(Self::CertifiedMemory),
+            Some(value) => Err(pending(format!(
+                "{AUTHORITY_READ_MODE_ENV} must be durable or certified-memory, got {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CertifiedReadState {
+    warmed: AtomicBool,
+}
+
+impl CertifiedReadState {
+    fn require_warmed(&self) -> Result<(), PolicyError> {
+        if self.warmed.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(pending(
+                "certified-memory authority reads require certified warm-up",
+            ))
+        }
+    }
+
+    fn mark_warmed(&self) {
+        self.warmed.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ResponsePersistence {
+    Durable(MySqlPool),
+    ReadOnly,
+}
+
 /// Keep recovery of one durable ABORTED row within the source-outcome cycle's
 /// 2-second cadence; unfinished work is retried by stable identity next pass.
 const ABORTED_RESERVATION_RECOVERY_BUDGET: Duration = Duration::from_secs(2);
@@ -308,13 +364,43 @@ struct CachedCertificate {
     observed: Instant,
 }
 
+#[derive(Clone)]
+struct VerifiedRequestResponse {
+    response: AuthorityFenceReadResponse,
+    publication_scope: AuthorityProtocolScope,
+    observed: Instant,
+    encoded_bytes: usize,
+}
+
+fn take_verified_request_response(
+    responses: &Mutex<HashMap<String, VerifiedRequestResponse>>,
+    proof: &AuthorizationFenceProof,
+) -> Result<VerifiedRequestResponse, PolicyError> {
+    let mut responses = responses
+        .lock()
+        .map_err(|_| pending("verified request response cache unavailable"))?;
+    responses.retain(|_, entry| entry.observed.elapsed() < REQUEST_RESPONSE_CACHE_TTL);
+    let cached = responses
+        .remove(&proof.proof_id)
+        .ok_or_else(|| pending("verified request response missing or expired"))?;
+    if cached.response.proof.as_ref() != Some(proof) {
+        return Err(pending(
+            "mutation admission differs from verified request proof",
+        ));
+    }
+    Ok(cached)
+}
+
 pub(super) struct QuorumProvider {
     client: AuthorityClient,
     roots: RwLock<AuthorityTrustRoot>,
     certificates: RwLock<HashMap<String, CachedCertificate>>,
+    request_responses: Mutex<HashMap<String, VerifiedRequestResponse>>,
     service_id: String,
     database_id: String,
     abort_recovery_cursor: Mutex<AbortedRecoveryCursor>,
+    read_mode: AuthorityReadMode,
+    certified_read_state: CertifiedReadState,
 }
 
 fn pending(message: impl std::fmt::Display) -> PolicyError {
@@ -374,6 +460,7 @@ pub(super) async fn provider_from_env(
         request_timeout: Duration::from_secs(3),
     })
     .map_err(pending)?;
+    let read_mode = AuthorityReadMode::from_env()?;
     let attestation = client.attest_startup().await.map_err(pending)?;
     let signer = attestation.trust_root.signer_key().map_err(pending)?;
     let root = AuthorizationTrustRoot::new(
@@ -387,9 +474,12 @@ pub(super) async fn provider_from_env(
         client,
         roots: RwLock::new(attestation.trust_root),
         certificates: RwLock::new(HashMap::new()),
+        request_responses: Mutex::new(HashMap::new()),
         service_id,
         database_id,
         abort_recovery_cursor: Mutex::new(AbortedRecoveryCursor(None)),
+        read_mode,
+        certified_read_state: CertifiedReadState::default(),
     }));
     Ok(Some(Arc::new(provider)))
 }
@@ -453,11 +543,59 @@ fn decoded<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, PolicyError
     serde_json::from_str(value).map_err(pending)
 }
 
+// The signed JSON is the only source of proof fields. The separate indexed
+// digests corroborate it; they must never be used to fill in missing fields.
+fn reconstruct_request_proof(
+    row: &DurableRequestProof,
+) -> Result<AuthorizationFenceProof, PolicyError> {
+    let proof: AuthorizationFenceProof = decoded(&row.proof_json)?;
+    proof.validate_request_bound().map_err(pending)?;
+    let binding = proof
+        .request_binding_digest
+        .as_deref()
+        .ok_or_else(|| pending("durable proof request binding missing"))?;
+    let certificate = proof
+        .scope_certificate_hash
+        .as_deref()
+        .ok_or_else(|| pending("durable proof certificate binding missing"))?;
+    if row.request_digest != digest_bytes(binding)?
+        || row.certificate_hash != digest_bytes(certificate)?
+    {
+        return Err(pending("durable request proof binding diverged"));
+    }
+    Ok(proof)
+}
+
 fn signed_counter(value: u64) -> Result<i64, PolicyError> {
     i64::try_from(value).map_err(|_| pending("authority counter exceeds local storage range"))
 }
 
 impl QuorumProvider {
+    pub(super) fn authority_client(&self) -> AuthorityClient {
+        self.client.clone()
+    }
+
+    pub(super) fn database_id(&self) -> &str {
+        &self.database_id
+    }
+
+    fn response_persistence(&self, pool: &MySqlPool) -> Result<ResponsePersistence, PolicyError> {
+        match self.read_mode {
+            AuthorityReadMode::Durable => Ok(ResponsePersistence::Durable(pool.clone())),
+            AuthorityReadMode::CertifiedMemory => {
+                self.certified_read_state.require_warmed()?;
+                Ok(ResponsePersistence::ReadOnly)
+            }
+        }
+    }
+
+    fn warmup_response_persistence(&self, pool: &MySqlPool) -> ResponsePersistence {
+        match self.read_mode {
+            AuthorityReadMode::Durable => ResponsePersistence::Durable(pool.clone()),
+            AuthorityReadMode::CertifiedMemory => ResponsePersistence::ReadOnly,
+        }
+    }
+
     pub(super) async fn abort_reservation(
         &self,
         pool: &MySqlPool,
@@ -756,14 +894,15 @@ impl QuorumProvider {
         Ok(source)
     }
 
-    pub(super) async fn read(
+    async fn read_verified_response(
         &self,
         pool: &MySqlPool,
         context: &PolicyContext,
         scope: &PublishedCardEvidenceScope,
         nonce: &str,
         source_scope: Option<AuthorityProtocolScope>,
-    ) -> Result<AuthorizationFenceProof, PolicyError> {
+    ) -> Result<AuthorityFenceReadResponse, PolicyError> {
+        let response_persistence = self.response_persistence(pool)?;
         scope.validate().map_err(pending)?;
         let binding = authorization_request_digest(context)?;
         let actor_scope =
@@ -817,7 +956,13 @@ impl QuorumProvider {
             .roots
             .write()
             .map_err(|_| pending("public trust registry unavailable"))? = attestation.trust_root;
-        persist_response(pool, &response, &publication_scope, &binding).await?;
+        persist_response(
+            &response_persistence,
+            &response,
+            &publication_scope,
+            &binding,
+        )
+        .await?;
         if let Some(certificate) = response.scope_certificate.as_ref() {
             let hash = certificate.record_digest().map_err(pending)?;
             let mut certificates = self
@@ -838,9 +983,117 @@ impl QuorumProvider {
                 },
             );
         }
-        response
+        if matches!(response_persistence, ResponsePersistence::ReadOnly) {
+            let mut responses = self
+                .request_responses
+                .lock()
+                .map_err(|_| pending("verified request response cache unavailable"))?;
+            responses.retain(|_, entry| entry.observed.elapsed() < REQUEST_RESPONSE_CACHE_TTL);
+            if responses.contains_key(&proof.proof_id) {
+                return Err(pending("authority reused a request proof identity"));
+            }
+            let encoded_bytes = serde_json::to_vec(&response).map_err(pending)?.len();
+            if encoded_bytes <= MAX_REQUEST_RESPONSE_CACHE_BYTES {
+                let mut used: usize = responses.values().map(|entry| entry.encoded_bytes).sum();
+                while responses.len() >= MAX_REQUEST_RESPONSE_CACHE_ENTRIES
+                    || used.saturating_add(encoded_bytes) > MAX_REQUEST_RESPONSE_CACHE_BYTES
+                {
+                    let Some(oldest) = responses
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.observed)
+                        .map(|(proof_id, _)| proof_id.clone())
+                    else {
+                        break;
+                    };
+                    if let Some(removed) = responses.remove(&oldest) {
+                        used = used.saturating_sub(removed.encoded_bytes);
+                    }
+                }
+                responses.insert(
+                    proof.proof_id.clone(),
+                    VerifiedRequestResponse {
+                        response: response.clone(),
+                        publication_scope: publication_scope.clone(),
+                        observed: Instant::now(),
+                        encoded_bytes,
+                    },
+                );
+            }
+        }
+        Ok(response)
+    }
+
+    pub(super) async fn read(
+        &self,
+        pool: &MySqlPool,
+        context: &PolicyContext,
+        scope: &PublishedCardEvidenceScope,
+        nonce: &str,
+        source_scope: Option<AuthorityProtocolScope>,
+    ) -> Result<AuthorizationFenceProof, PolicyError> {
+        self.read_verified_response(pool, context, scope, nonce, source_scope)
+            .await?
             .proof
             .ok_or_else(|| pending("fresh request proof missing"))
+    }
+
+    pub(super) async fn read_org_with_certificate(
+        &self,
+        pool: &MySqlPool,
+        context: &PolicyContext,
+        scope: &PublishedCardEvidenceScope,
+        nonce: &str,
+        source_scope: AuthorityProtocolScope,
+    ) -> Result<
+        (
+            AuthorizationFenceProof,
+            AuthorityScopePublicationCertificate,
+        ),
+        PolicyError,
+    > {
+        let response = self
+            .read_verified_response(pool, context, scope, nonce, Some(source_scope))
+            .await?;
+        let proof = response
+            .proof
+            .ok_or_else(|| pending("fresh request proof missing"))?;
+        let certificate = response
+            .scope_certificate
+            .ok_or_else(|| pending("scope certificate missing"))?;
+        Ok((proof, certificate))
+    }
+
+    async fn persist_mutation_proof(
+        &self,
+        pool: &MySqlPool,
+        proof: &AuthorizationFenceProof,
+        binding: &str,
+    ) -> Result<(), PolicyError> {
+        self.certified_read_state.require_warmed()?;
+        let cached = take_verified_request_response(&self.request_responses, proof)?;
+        let roots = self
+            .client
+            .attest_startup()
+            .await
+            .map_err(pending)?
+            .trust_root;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        verify_response(
+            &cached.response,
+            &roots,
+            &AuthorityProtocolScope::Card(proof.scope.clone()),
+            &cached.publication_scope,
+            &proof.request_nonce,
+            binding,
+            now,
+        )?;
+        persist_response(
+            &ResponsePersistence::Durable(pool.clone()),
+            &cached.response,
+            &cached.publication_scope,
+            binding,
+        )
+        .await
     }
 
     pub(super) async fn reserve(
@@ -867,6 +1120,9 @@ impl QuorumProvider {
             || context.request_operation_id.as_deref() != Some(proof.operation_id.as_str())
         {
             return Err(pending("mutation admission request identity mismatch"));
+        }
+        if self.read_mode == AuthorityReadMode::CertifiedMemory {
+            self.persist_mutation_proof(pool, proof, &binding).await?;
         }
         let intent = astral_types::AuthoritySourceIntent {
             authorization_edition: astral_types::AUTHORIZATION_EDITION,
@@ -1096,11 +1352,18 @@ fn monotonic_frontier(
 }
 
 async fn persist_response(
-    pool: &MySqlPool,
+    persistence: &ResponsePersistence,
     response: &AuthorityFenceReadResponse,
     scope: &AuthorityProtocolScope,
     binding: &str,
 ) -> Result<(), PolicyError> {
+    if matches!(persistence, ResponsePersistence::ReadOnly) {
+        return Ok(());
+    }
+    let pool = match persistence {
+        ResponsePersistence::Durable(pool) => pool,
+        ResponsePersistence::ReadOnly => unreachable!("read-only persistence returned early"),
+    };
     let frontier = &response.global_frontier;
     let certificate = response
         .scope_certificate
@@ -1160,19 +1423,17 @@ pub(super) async fn validate_in_tx(
     }
     let row: Option<DurableRequestProof> = sqlx::query_as("SELECT CAST(proof_json AS CHAR) AS proof_json,scope_hash,certificate_hash,request_digest FROM authorization_request_proof WHERE proof_id=? AND request_nonce=? FOR UPDATE")
         .bind(&proof.proof_id).bind(&proof.request_nonce).fetch_optional(&mut **tx).await.map_err(pending)?;
-    let DurableRequestProof {
-        proof_json: stored,
-        scope_hash,
-        certificate_hash: stored_certificate,
-        request_digest: stored_binding,
-    } = row.ok_or_else(|| pending("durable request proof missing"))?;
-    if decoded::<AuthorizationFenceProof>(&stored)? != *proof
-        || stored_binding != digest_bytes(binding)?
-        || stored_certificate != digest_bytes(certificate_hash)?
+    let row = row.ok_or_else(|| pending("durable request proof missing"))?;
+    let stored = reconstruct_request_proof(&row)?;
+    if stored != *proof
+        || row.request_digest != digest_bytes(binding)?
+        || row.certificate_hash != digest_bytes(certificate_hash)?
     {
         return Err(pending("durable request proof diverged"));
     }
-    let current: Option<Vec<u8>> = sqlx::query_scalar("SELECT certificate_hash FROM authorization_scope_certificate WHERE scope_hash=? FOR UPDATE").bind(scope_hash).fetch_optional(&mut **tx).await.map_err(pending)?;
+    let stored_binding = row.request_digest;
+    let stored_certificate = row.certificate_hash;
+    let current: Option<Vec<u8>> = sqlx::query_scalar("SELECT certificate_hash FROM authorization_scope_certificate WHERE scope_hash=? FOR UPDATE").bind(row.scope_hash).fetch_optional(&mut **tx).await.map_err(pending)?;
     if current.as_deref() != Some(stored_certificate.as_slice()) {
         return Err(pending("admission scope certificate changed"));
     }
@@ -1200,7 +1461,154 @@ pub(super) async fn validate_in_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astral_types::AuthorizationDomainScope;
+    use astral_types::{AuthorizationDomainScope, AUTHORIZATION_EDITION};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn signed_request_proof(nonce: &str, proof_id: &str) -> (AuthorizationFenceProof, SigningKey) {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut proof = AuthorizationFenceProof {
+            authorization_edition: AUTHORIZATION_EDITION,
+            authority_id: "authority-test".into(),
+            authority_term: 1,
+            global_fence_sequence: 2,
+            scope: AuthorizationAuthorityScope {
+                tenant_id: 3,
+                card_id: 4,
+                user_id: Some(5),
+                domain: AuthorizationDomainScope::Exact(6),
+            },
+            scope_generation: 1,
+            revoke_watermark: 0,
+            snapshot_hash: "11".repeat(32),
+            parent_hash: None,
+            operation_id: "operation-test".into(),
+            event_id: "operation-test:commit".into(),
+            key_id: "key-test".into(),
+            key_epoch: 1,
+            issued_at: 100,
+            not_before: 100,
+            expires_at: 120,
+            request_nonce: nonce.into(),
+            request_binding_digest: Some("22".repeat(32)),
+            scope_certificate_hash: Some("33".repeat(32)),
+            proof_id: proof_id.into(),
+            signature: String::new(),
+        };
+        proof.signature = hex::encode(key.sign(&proof.signing_bytes().unwrap()).to_bytes());
+        (proof, key)
+    }
+
+    fn durable_row(proof: &AuthorizationFenceProof) -> DurableRequestProof {
+        DurableRequestProof {
+            proof_json: encoded(proof).unwrap(),
+            scope_hash: vec![0; 32],
+            certificate_hash: digest_bytes(proof.scope_certificate_hash.as_deref().unwrap())
+                .unwrap(),
+            request_digest: digest_bytes(proof.request_binding_digest.as_deref().unwrap()).unwrap(),
+        }
+    }
+
+    fn cached_response(
+        proof: &AuthorizationFenceProof,
+        observed: Instant,
+    ) -> VerifiedRequestResponse {
+        VerifiedRequestResponse {
+            response: AuthorityFenceReadResponse {
+                protocol_version: astral_types::AUTHORITY_PROTOCOL_VERSION,
+                authorization_edition: AUTHORIZATION_EDITION,
+                global_frontier: GlobalAuthorityFrontier {
+                    authorization_edition: AUTHORIZATION_EDITION,
+                    authority_id: proof.authority_id.clone(),
+                    authority_term: proof.authority_term,
+                    global_fence_sequence: proof.global_fence_sequence,
+                    key_id: proof.key_id.clone(),
+                    key_epoch: proof.key_epoch,
+                    root_id: "root".into(),
+                    trust_root_digest: "aa".repeat(32),
+                    global_chain_digest: "bb".repeat(32),
+                    updated_at: 100,
+                },
+                read_gate: astral_types::AuthorityReadGate {
+                    positive_reads_allowed: true,
+                    global_pending: false,
+                    blocking_reservations: Vec::new(),
+                },
+                scope_certificate: None,
+                scope_certificate_hash: proof.scope_certificate_hash.clone(),
+                proof: Some(proof.clone()),
+                observed_at: 100,
+            },
+            publication_scope: AuthorityProtocolScope::Card(proof.scope.clone()),
+            observed,
+            encoded_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn verified_response_cache_requires_exact_fresh_one_use_proof() {
+        let (proof, _) = signed_request_proof("nonce-f1", "proof-f1");
+        let cache = Mutex::new(HashMap::new());
+        cache.lock().unwrap().insert(
+            proof.proof_id.clone(),
+            cached_response(&proof, Instant::now()),
+        );
+        let mut changed = proof.clone();
+        changed.signature = "00".repeat(64);
+        assert!(take_verified_request_response(&cache, &changed).is_err());
+        assert!(take_verified_request_response(&cache, &proof).is_err());
+        cache.lock().unwrap().insert(
+            proof.proof_id.clone(),
+            cached_response(&proof, Instant::now() - REQUEST_RESPONSE_CACHE_TTL),
+        );
+        assert!(take_verified_request_response(&cache, &proof).is_err());
+        cache.lock().unwrap().insert(
+            proof.proof_id.clone(),
+            cached_response(&proof, Instant::now()),
+        );
+        assert!(take_verified_request_response(&cache, &proof).is_ok());
+        assert!(take_verified_request_response(&cache, &proof).is_err());
+    }
+
+    #[test]
+    fn persisted_request_proofs_preserve_signed_f0_f1_bindings() {
+        let (f0, key) = signed_request_proof("nonce-f0", "proof-f0");
+        let (f1, _) = signed_request_proof("nonce-f1", "proof-f1");
+        let recovered_f0 = reconstruct_request_proof(&durable_row(&f0)).unwrap();
+        let recovered_f1 = reconstruct_request_proof(&durable_row(&f1)).unwrap();
+        assert_eq!(recovered_f0, f0);
+        assert_eq!(recovered_f1, f1);
+        recovered_f0.verify_at(&key.verifying_key(), 110).unwrap();
+        recovered_f1.verify_at(&key.verifying_key(), 110).unwrap();
+        assert_ne!(recovered_f0.request_nonce, recovered_f1.request_nonce);
+        assert_ne!(recovered_f0.proof_id, recovered_f1.proof_id);
+        recovered_f0.same_frontier_as(&recovered_f1).unwrap();
+    }
+
+    #[test]
+    fn persisted_request_proof_rejects_missing_corrupt_or_divergent_bindings() {
+        let (proof, key) = signed_request_proof("nonce-f1", "proof-f1");
+        for field in ["requestBindingDigest", "scopeCertificateHash"] {
+            let mut row = durable_row(&proof);
+            let mut json: serde_json::Value = serde_json::from_str(&row.proof_json).unwrap();
+            json.as_object_mut().unwrap().remove(field);
+            row.proof_json = json.to_string();
+            assert!(reconstruct_request_proof(&row).is_err(), "missing {field}");
+        }
+        let mut row = durable_row(&proof);
+        row.proof_json = "{".into();
+        assert!(reconstruct_request_proof(&row).is_err());
+        let mut row = durable_row(&proof);
+        row.request_digest[0] ^= 1;
+        assert!(reconstruct_request_proof(&row).is_err());
+        let mut row = durable_row(&proof);
+        row.certificate_hash[0] ^= 1;
+        assert!(reconstruct_request_proof(&row).is_err());
+        let mut tampered = proof.clone();
+        tampered.request_binding_digest = Some("44".repeat(32));
+        let recovered = reconstruct_request_proof(&durable_row(&tampered)).unwrap();
+        assert!(recovered.verify_at(&key.verifying_key(), 110).is_err());
+        assert_ne!(recovered, proof);
+    }
 
     #[test]
     fn tenant_targets_alone_do_not_select_business_mutations() {

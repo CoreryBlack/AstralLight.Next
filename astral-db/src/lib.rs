@@ -43,9 +43,25 @@ pub mod authority_source_runtime;
 mod authorization_admission_repository;
 mod authorization_fence_repository;
 mod authorization_projection_repository;
+mod authorization_read_surface;
 mod authorization_snapshot;
 mod auxiliary_authorization_mirror;
 mod cache_epoch;
+pub mod certified_memory_authority;
+pub mod certified_memory_completion;
+pub mod certified_memory_completion_coordinator;
+pub mod certified_memory_completion_producer;
+pub mod certified_memory_completion_writer;
+pub mod certified_memory_coordinator;
+pub mod certified_memory_family_owner;
+mod certified_memory_family_reconciler;
+pub mod certified_memory_installer;
+pub mod certified_memory_materializer;
+pub mod certified_memory_readiness;
+mod certified_memory_repository;
+pub mod certified_memory_runtime;
+pub mod certified_memory_snapshot_builder;
+pub mod certified_memory_source_owner_producer;
 mod cross_city_repository;
 mod cross_city_runtime_repository;
 mod cross_city_transport_repository;
@@ -75,6 +91,9 @@ mod quarantine;
 mod repository;
 mod resource_ownership;
 mod session_state_repository;
+mod single_node_memory_loader;
+mod single_node_memory_root;
+pub mod single_node_published_candidate;
 mod sod_check;
 pub mod verification_durable_repository;
 
@@ -103,6 +122,11 @@ pub use authorization_fence_repository::{
     SqlxAuthorizationFenceProvider, MAX_AUTHORITY_PROOF_WINDOW_SECONDS,
 };
 pub use authorization_projection_repository::*;
+pub use authorization_read_surface::{
+    authorization_read_surface, build_authorization_read_surface, certified_surface_unavailable,
+    ensure_authorization_read_surface, install_authorization_read_surface,
+    AuthorizationReadSurface,
+};
 pub use authorization_snapshot::{
     authorization_aggregate_key, capture_projection_snapshot, check_projection_snapshot_freshness,
     decode_projection_snapshot_payload, load_projection_snapshot_hint, save_projection_snapshot,
@@ -116,6 +140,61 @@ pub use auxiliary_authorization_mirror::{
     AuxiliaryAuthorizationMirror,
 };
 pub use cache_epoch::*;
+pub use certified_memory_completion::{
+    CertifiedMemoryCompletionError, CertifiedMemoryCompletionRecord, CertifiedMemoryCompletionRow,
+    CertifiedMemoryDurableOwnerContext,
+};
+pub use certified_memory_completion_coordinator::{
+    CertifiedMemoryCompletionCoordinator, CertifiedMemoryCompletionCoordinatorError,
+};
+pub use certified_memory_completion_producer::{
+    AuthorityCompletionReceipt, CertifiedMemoryCompletionProducer, CommittedBatchIdentity,
+    CompletionProducerError, CompletionProducerErrorCode, DurableAuthorityFrontierIdentity,
+    FamilyCompletionCandidate, FamilyCompletionOrchestrationOutcome, FamilyCompletionReady,
+    NoAuthorityCompletionReceiptSource,
+};
+pub use certified_memory_completion_writer::{
+    record_proven_certified_memory_completion_in_tx,
+    record_verified_certified_memory_completion_in_tx, CertifiedMemoryCompletionWriteError,
+    CertifiedMemoryCompletionWriteRequest, CertifiedMemoryCompletionWriteResult,
+    VerifiedCertifiedMemoryCompletionWriteRequest,
+};
+pub use certified_memory_coordinator::{
+    CertifiedMemoryCoordinator, CertifiedMemoryCoordinatorError, CertifiedMemoryFamilyBundle,
+    CertifiedMemoryRootObservation,
+};
+pub use certified_memory_family_reconciler::{
+    reconcile_verified_certified_memory_family, CertifiedMemoryFamilyReconcilerError,
+};
+pub use certified_memory_installer::{
+    CertifiedMemoryInstaller, CertifiedMemoryInstallerError, CertifiedMemoryInstallerStatus,
+};
+pub use certified_memory_materializer::{
+    CertifiedMemoryFamilyMaterialization, CertifiedMemoryFamilyOwner,
+    CertifiedMemoryFamilyOwnerRequest, CertifiedMemoryFamilyPayload,
+    CertifiedMemoryMaterialization, CertifiedMemoryMaterializer, CertifiedMemoryMaterializerError,
+    UnavailableCertifiedMemoryFamilyOwner, CERTIFIED_MEMORY_FAMILY_COUNT,
+};
+pub use certified_memory_readiness::{
+    CertifiedMemoryLeaseBinding, CertifiedMemoryReadinessBinding,
+    CertifiedMemoryReadinessCapability, CertifiedMemoryReadinessOwner, ReadinessError,
+};
+pub use certified_memory_repository::{
+    CertifiedMemoryProofRepository, CertifiedMemoryRuleRepository, CertifiedMemorySodRepository,
+    CertifiedSodReadSet,
+};
+pub use certified_memory_runtime::{
+    CertifiedMemoryCompositionConfig, CertifiedMemoryCompositionError,
+    CertifiedMemoryCompositionRoot, CertifiedMemoryCompositionStatus,
+};
+pub use certified_memory_source_owner_producer::{
+    build_ownership_family_completion, build_sod_policy_family_completion,
+    produce_card_context_family_completion, produce_global_admin_family_completion,
+    produce_ownership_family_completion, produce_sod_policy_family_completion,
+    record_independently_proven_family_completion_in_tx, CardContextSourceFact,
+    GlobalAdminSourceFact, OwnershipSourceFact, SodPolicySourceFact, SodPolicySourceProvenance,
+    SourceOwnerCompletionError, SourceOwnerCompletionIdentity, SourceOwnerCompletionOutcome,
+};
 pub use cross_city_repository::*;
 pub use cross_city_runtime_repository::*;
 pub use cross_city_transport_repository::*;
@@ -174,6 +253,8 @@ pub use quarantine::*;
 pub use repository::*;
 pub use resource_ownership::*;
 pub use session_state_repository::*;
+pub use single_node_memory_loader::{load_single_node_memory_root, SingleNodeMemoryLoaderError};
+pub use single_node_memory_root::*;
 pub use sod_check::*;
 
 // ─────────────────────────────────────────────────────────────────────────────

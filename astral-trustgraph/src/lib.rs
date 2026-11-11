@@ -101,7 +101,6 @@ pub struct AppState {
     /// missing provider is not-ready in Strict mode; DurableOnly is an explicit
     /// compatibility profile and never enables memory by accident.
     pub authorization_fence_provider: Option<Arc<astral_db::SqlxAuthorizationFenceProvider>>,
-    /// 投影 worker 监督健康共享态（F5 修复 1d）：main 在启动 projector 后
     /// 写入一次；未启动（配置拒绝）时保持为空，stats 端点如实返回 None。
     pub projector_health:
         Arc<std::sync::OnceLock<Arc<service::authorization_projector::ProjectorHealthShared>>>,

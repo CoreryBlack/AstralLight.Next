@@ -15,6 +15,8 @@ The source tree publishes executable inputs and bounded checks. It does not publ
 credentials, host routes, generated evidence, deployment logs, binaries, or private
 infrastructure state.
 
+The 2026-11-09 local composition increment adds a typed `CertifiedMemoryCompositionRoot`, an explicit durable-owner-context constructor, six ledger-backed family adapters, caller-provided typed non-terminal source-owner drafts for `CARD_CONTEXT`/`GLOBAL_ADMIN`, strict read candidates for `PUBLISHED_EVIDENCE`/`ORG_AUTHORIZATION`, a caller-owned proof-only completion sink, the operation-id width contract, and a strict `require_serving()` gate. The focused producer suites and migration contracts pass; missing source-owner completion callers, authority receipts, root, or readiness proofs remain non-serving. This is not CertifiedMemory Serving evidence and does not change the external `BLOCKED`/`UNKNOWN` boundary.
+
 ## Status discipline
 
 Validation states are explicit: `PLANNED`, `PASS`, `FAIL`, `BLOCKED`, `UNKNOWN`,
@@ -40,9 +42,10 @@ or multi-node deployment.
 - [V7 completion results and review](认证内存授权状态机计划完成度审查报告_2026-11-06.md):
   current local completion, five-chain review, final validation summary, and blocked
   external acceptance. The original filename is retained for existing references.
-- [V7 implementation process](认证内存授权状态机实施过程报告_2026-11-08.md):
-  canonical attempt records, handoffs, failures and fixes, exact commands, raw-log
-  references, final freeze, and historical V6/intermediate review excerpts.
+- [V7 implementation process](认证内存授权状态机实施过程报告_2026-11-08.md): attempts, handoffs, failures, commands, and original evidence artifacts.
+- [V7 未完成项清单](认证内存授权状态机未完成项清单_2026-11-09.md)：生产代码、控制面、部署和外部验收的未闭合事项及关闭条件。
+
+2026-11-10 格式化前冻结快照的 workspace test 为 **4199 passed、0 failed、119 ignored**；ignored 是 `SKIP`，输出捕获可能隐藏测试内部跳过。后续格式化后 fmt check 通过，最终快照仍须重验。family aggregate 的 GLOBAL 自动认证及 CertifiedMemory root install/read 在完整 publication/snapshot proof 未实现时保持关闭，生产 Serving 未证明。
 
 Generated `evidence/`, `artifact/`, result, log, credential, and private deployment
 folders are intentionally excluded. A live run requires an isolated environment,

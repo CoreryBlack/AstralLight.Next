@@ -14,6 +14,15 @@ enum Fault {
     Expired,
     WrongActor,
     FrontierDrift,
+    TermDrift,
+    KeyDrift,
+    ScopeDrift,
+    GenerationDrift,
+    RevokeDrift,
+    BindingDrift,
+    CertificateMismatch,
+    DependencyDrift,
+    MissingCertificate,
     InitialEvidenceDrift,
     FinalEvidenceDrift,
     NotServing,
@@ -25,6 +34,7 @@ struct CertifiedOrgRepo {
     org_reads: AtomicUsize,
     proof_reads: AtomicUsize,
     nonces: Mutex<Vec<String>>,
+    proofs: Mutex<Vec<AuthorizationFenceProof>>,
 }
 
 impl CertifiedOrgRepo {
@@ -35,6 +45,7 @@ impl CertifiedOrgRepo {
             org_reads: AtomicUsize::new(0),
             proof_reads: AtomicUsize::new(0),
             nonces: Mutex::new(Vec::new()),
+            proofs: Mutex::new(Vec::new()),
         }
     }
 }
@@ -114,8 +125,8 @@ impl RuleRepository for CertifiedOrgRepo {
             not_before: now - 1,
             expires_at: now + 60,
             request_nonce: nonce.to_owned(),
-            request_binding_digest: None,
-            scope_certificate_hash: None,
+            request_binding_digest: Some(astral_types::authorization_request_digest(ctx).unwrap()),
+            scope_certificate_hash: Some("cd".repeat(32)),
             proof_id: format!("org-proof-{read}"),
             signature: "ab".repeat(64),
         };
@@ -129,8 +140,22 @@ impl RuleRepository for CertifiedOrgRepo {
             }
             Fault::WrongActor => proof.scope.card_id += 1,
             Fault::FrontierDrift if read == 1 => proof.global_fence_sequence += 1,
+            Fault::TermDrift if read == 1 => proof.authority_term += 1,
+            Fault::KeyDrift if read == 1 => proof.key_epoch += 1,
+            Fault::ScopeDrift if read == 1 => proof.scope.tenant_id += 1,
+            Fault::GenerationDrift if read == 1 => proof.scope_generation += 1,
+            Fault::RevokeDrift if read == 1 => proof.revoke_watermark += 1,
+            Fault::BindingDrift if read == 1 => {
+                proof.request_binding_digest = Some("ee".repeat(32))
+            }
+            Fault::CertificateMismatch if read == 1 => {
+                proof.scope_certificate_hash = Some("ee".repeat(32))
+            }
+            Fault::DependencyDrift if read == 1 => proof.snapshot_hash = "dd".repeat(32),
+            Fault::MissingCertificate if read == 1 => proof.scope_certificate_hash = None,
             _ => {}
         }
+        self.proofs.lock().unwrap().push(proof.clone());
         Ok(proof)
     }
 }
@@ -150,6 +175,12 @@ async fn certified_org_uses_independent_fences_and_returns_final_admission() {
     assert_eq!(nonces.len(), 2);
     assert_ne!(nonces[0], nonces[1]);
     assert_eq!(admission.proof().request_nonce, nonces[1]);
+    assert_ne!(admission.proof_id(), "org-proof-0");
+    let proofs = repo.proofs.lock().unwrap();
+    assert_eq!(proofs.len(), 2);
+    assert_ne!(proofs[0].request_nonce, proofs[1].request_nonce);
+    assert_ne!(proofs[0].proof_id, proofs[1].proof_id);
+    proofs[0].same_frontier_as(&proofs[1]).unwrap();
     assert_eq!(repo.org_reads.load(Ordering::SeqCst), 4);
     assert!(admission.consume_once().is_ok());
     assert!(admission.consume_once().is_err());
@@ -165,6 +196,15 @@ async fn certified_org_rejects_unavailable_replayed_or_changed_authority() {
         Fault::Expired,
         Fault::WrongActor,
         Fault::FrontierDrift,
+        Fault::TermDrift,
+        Fault::KeyDrift,
+        Fault::ScopeDrift,
+        Fault::GenerationDrift,
+        Fault::RevokeDrift,
+        Fault::BindingDrift,
+        Fault::CertificateMismatch,
+        Fault::DependencyDrift,
+        Fault::MissingCertificate,
         Fault::InitialEvidenceDrift,
         Fault::FinalEvidenceDrift,
         Fault::NotServing,

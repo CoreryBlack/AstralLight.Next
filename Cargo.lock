@@ -217,6 +217,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "astral-authorization-root"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "astral-types",
+ "hex",
+ "im",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "astral-common"
 version = "0.1.0"
 dependencies = [
@@ -260,6 +274,7 @@ name = "astral-db"
 version = "0.1.0"
 dependencies = [
  "astral-authority",
+ "astral-authorization-root",
  "astral-common",
  "astral-types",
  "async-trait",

@@ -63,7 +63,7 @@ impl RuleSetMutationContext {
             actor_id: SYSTEM_RULE_SET_ACTOR_ID,
             operation_id: operation_id.trim().to_owned(),
             proven_operation_identity: true,
-            source_capability: SourceMutationCapability::System,
+            source_capability: SourceMutationCapability::system_for_audit_log(),
         })
     }
 

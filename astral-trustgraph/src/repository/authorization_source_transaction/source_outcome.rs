@@ -415,7 +415,11 @@ pub(super) async fn stage_source_outcome(
         after_image_digest = after;
         for receipt in origin.source_receipts() {
             let identity = astral_db::authority_source_outcome::AuthoritySourceReceiptIdentity {
-                identity_kind: format!("{}:{}", receipt.entity, receipt.kind),
+                identity_kind: if receipt.entity == "audit_log" {
+                    "audit_log".to_owned()
+                } else {
+                    format!("{}:{}", receipt.entity, receipt.kind)
+                },
                 identity: receipt.durable_id.clone(),
             };
             if !receipts.contains(&identity) {
@@ -545,7 +549,11 @@ pub(super) async fn stage_eligibility_source_outcome(
         .iter()
         .map(
             |source| astral_db::authority_source_outcome::AuthoritySourceReceiptIdentity {
-                identity_kind: format!("{}:{}", source.entity, source.kind),
+                identity_kind: if source.entity == "audit_log" {
+                    "audit_log".to_owned()
+                } else {
+                    format!("{}:{}", source.entity, source.kind)
+                },
                 identity: source.durable_id.clone(),
             },
         )

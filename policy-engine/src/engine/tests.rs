@@ -1622,11 +1622,14 @@ fn org_gate_ctx() -> PolicyContext {
         .identity_card_id(Some(ORG_GATE_IDENTITY_CARD_ID))
         .card_id(Some(ORG_GATE_CARD_ID))
         .tenant_id(Some(ORG_GATE_TENANT))
+        .principal_kind(Some("PLATFORM_USER".into()))
         .resource_tenant_id(Some(ORG_GATE_TENANT))
         .resource_ownership_scope(ResourceOwnershipScope::TenantScoped)
         .resource(Some("doc".into()))
         .target_id(Some(42))
         .action("read".into())
+        .request_fingerprint(Some("a".repeat(64)))
+        .request_operation_id(Some("org-authority-test-operation".into()))
         .build()
 }
 

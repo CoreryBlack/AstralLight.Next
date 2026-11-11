@@ -154,7 +154,19 @@ pub fn install_gateway_session_auth(
     }
 }
 
-/// strict 判定面的连接池句柄；未安装（无 DB 的测试/组合）返回 `None`。
+/// Install the explicitly requested certified-memory-only session authority.
+///
+/// This path is separate from [`install_gateway_session_auth`]: it does not accept a
+/// MySQL pool, does not populate `GATEWAY_SESSION_DB`, and never silently changes the
+/// runtime's existing MySQL installation policy. Mirror misses and unavailable mirror
+/// state remain fail-closed through `SessionProjectionDecision::Unavailable`.
+pub fn install_gateway_certified_memory_session_auth(
+    mirror: astral_common::session_projection_store::SessionProjectionMirror,
+) -> Result<(), String> {
+    astral_db::install_global_certified_memory_session_projection_store(mirror)
+}
+
+/// strict 判定面的连接池句柄；未安装（无 DB 的组合）返回 `None`。
 fn gateway_session_db() -> Option<&'static sqlx::MySqlPool> {
     GATEWAY_SESSION_DB.get()
 }

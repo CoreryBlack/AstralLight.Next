@@ -46,6 +46,9 @@ mod eligibility_completion_contract;
 #[path = "store_contract/config_completion_contract.rs"]
 mod config_completion_contract;
 
+#[path = "store_contract/family_completion_contract.rs"]
+mod family_completion_contract;
+
 #[path = "store_contract/abort_contract.rs"]
 mod abort_contract;
 

@@ -21,6 +21,7 @@ mod publication;
 pub mod registry;
 mod request_binding;
 mod rule_set;
+pub mod sod;
 
 pub use authority_protocol::*;
 pub use authorization_authority::*;
@@ -38,3 +39,4 @@ pub use publication::*;
 pub use registry::*;
 pub use request_binding::*;
 pub use rule_set::*;
+pub use sod::*;

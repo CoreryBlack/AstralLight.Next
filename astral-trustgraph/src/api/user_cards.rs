@@ -672,7 +672,7 @@ async fn bind_card_async(
                     // FRESH per-item admission：独立策略 + SoD + host fence +
                     // reserve。每项各自 AuthorizationSource、各自 operation_id
                     //（durable 冻结集派生），失败分类与既有合同一致。
-                    let admission = match crate::service::user_card_batch_admission::admit_item(
+                    let (admission, source_abort) = match crate::service::user_card_batch_admission::admit_item(
                         &app,
                         &parent_context,
                         &tid,
@@ -804,17 +804,20 @@ async fn bind_card_async(
                         Err(error) => {
                             let message = error.to_string();
                             tracing::warn!(task_id = %tid, card_id = item.card_id, error = %message, "failed to bind card");
-                            let outcome = if matches!(
-                                error,
-                                AstralError::Validation(_)
-                                    | AstralError::Auth(_)
-                                    | AstralError::Permission(_)
-                                    | AstralError::NotFound(_)
-                            ) {
-                                "FAILED"
-                            } else {
-                                "IN_DOUBT"
+                            let abort_result = match app.authorization_fence_provider.as_ref() {
+                                Some(provider) => crate::service::user_card_batch_admission::abort_after_admission_drift(
+                                    provider,
+                                    &source_abort,
+                                    "batch_item_failed",
+                                )
+                                .await
+                                .to_string(),
+                                None => "source reservation abort UNKNOWN: authority provider unavailable".to_owned(),
                             };
+                            let message = format!("{message}; {abort_result}");
+                            // A failed call may still have committed. Keep the item
+                            // in doubt until its durable reservation is reconciled.
+                            let outcome = "IN_DOUBT";
                             let mut completion_proven = false;
                             if let Err(persist) = async_tracker::fail_card_bind_item(
                                 &db,

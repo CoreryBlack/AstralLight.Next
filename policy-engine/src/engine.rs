@@ -19,7 +19,9 @@ mod formal;
 mod ports;
 mod published;
 
-pub use ports::{AuthorizationFenceProvider, PublishedEvidenceReadMode, RuleRepository};
+pub use ports::{
+    AuthorizationFenceProvider, OrgAuthorityFenceRead, PublishedEvidenceReadMode, RuleRepository,
+};
 
 /// Result of a formal authorization evaluation plus an optional proof-bound
 /// capability. The capability is present only for a certified F1 ALLOW and is
@@ -31,7 +33,7 @@ pub struct PolicyEvaluation {
 }
 
 impl PolicyEvaluation {
-    pub(crate) fn without_admission(decision: PolicyDecision) -> Self {
+    pub fn without_admission(decision: PolicyDecision) -> Self {
         Self {
             decision,
             admission: None,
@@ -215,6 +217,20 @@ impl PolicyEngine {
             global.record_failure();
             self.breaker_attribution
                 .record_state_wait(state_started.elapsed());
+        }
+    }
+
+    pub fn authorization_pending(reason: &str) -> PolicyDecision {
+        PolicyDecision {
+            allowed: false,
+            reason: "AUTHORIZATION_PENDING".to_owned(),
+            matched_rule: Some(reason.to_owned()),
+            audit_required: true,
+            evaluation_path: Vec::new(),
+            matched_rule_id: None,
+            condition_results: None,
+            snapshot_version: None,
+            org_provenance: None,
         }
     }
 

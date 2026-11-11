@@ -48,6 +48,82 @@ const PUBLISHED_BATCH_SIZE: u32 = 1;
 /// checkpoint, so this cap can only bind on a contract violation.
 const MAX_BUDGET_CHECKPOINTS_PER_PASS: u32 = 256;
 
+/// CertifiedMemory family-ledger publication is deliberately closed until the
+/// source outcome carries a typed contract binding the expected family scope
+/// and frontier. The current schema and [`AuthorityStagedSourceEvidence`] have
+/// no such field, so this predicate must remain false. In particular, a family
+/// row count or six mutually consistent rows cannot prove this contract.
+const CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT_GATE_SQL: &str = "1 = 0";
+const CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT_PLACEHOLDER: &str =
+    "__CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT__";
+
+/// Typed counterpart of [`CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT_GATE_SQL`].
+///
+/// This helper intentionally has no way to manufacture a contract from the
+/// existing coverage envelope. It is a separate hard stop from the SQL gate so
+/// a future query change cannot accidentally turn ordinary coverage into a
+/// CertifiedMemory family-ledger scope/frontier proof.
+fn certified_memory_family_ledger_contract_is_proven(
+    _envelope: &AuthorityStagedSourceEvidence,
+) -> bool {
+    false
+}
+
+fn require_certified_memory_family_ledger_contract(
+    envelope: &AuthorityStagedSourceEvidence,
+) -> Result<(), PolicyError> {
+    certified_memory_family_ledger_contract_is_proven(envelope)
+        .then_some(())
+        .ok_or_else(|| {
+            pending(
+                "CertifiedMemory family scope/frontier contract is absent from the source outcome",
+            )
+        })
+}
+
+const COMMITTED_CANDIDATE_SQL_TEMPLATE: &str =
+    "SELECT reservation_id, generation, attempts FROM authority_source_outcome \
+         WHERE status = 'COMMITTED' AND mutation_kind = 'AUTHORIZATION_SOURCE' \
+         AND service_id = ? AND database_id = ? \
+         AND JSON_TYPE(JSON_EXTRACT(staged_evidence, '$.coverage')) = 'OBJECT' \
+         AND __CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT__ \
+         AND (lease_until IS NULL OR lease_until <= UNIX_TIMESTAMP()) \
+         ORDER BY reservation_id LIMIT ?";
+
+const COMMITTED_QUARANTINE_SQL_TEMPLATE: &str = "UPDATE authority_source_outcome SET status = 'QUARANTINED', \
+                last_error = 'publication reconciliation budget exhausted; operator reconciliation required', \
+                generation = generation + 1, lease_owner = NULL, lease_until = NULL, updated_at = UNIX_TIMESTAMP() \
+                WHERE reservation_id = ? AND generation = ? AND status = 'COMMITTED' \
+                AND service_id = ? AND database_id = ? AND attempts >= ? \
+                AND __CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT__ \
+                AND (lease_until IS NULL OR lease_until <= UNIX_TIMESTAMP())";
+
+const COMMITTED_CLAIM_SQL_TEMPLATE: &str = "UPDATE authority_source_outcome SET lease_owner = ?, \
+            lease_until = UNIX_TIMESTAMP() + ?, generation = generation + 1, attempts = attempts + 1, \
+            updated_at = UNIX_TIMESTAMP() WHERE reservation_id = ? AND generation = ? AND status = 'COMMITTED' \
+            AND service_id = ? AND database_id = ? AND attempts < ? \
+            AND __CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT__ \
+            AND (lease_until IS NULL OR lease_until <= UNIX_TIMESTAMP())";
+
+const COMMITTED_LIVE_LEASE_SQL_TEMPLATE: &str = "SELECT CAST(1 AS SIGNED) FROM authority_source_outcome \
+            WHERE reservation_id = ? AND status = 'COMMITTED' AND service_id = ? AND database_id = ? \
+            AND lease_owner = ? AND generation = ? AND lease_until > UNIX_TIMESTAMP() \
+            AND __CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT__ LIMIT 1";
+
+const COMMITTED_TERMINAL_CAS_SQL_TEMPLATE: &str = "UPDATE authority_source_outcome SET status = ?, \
+                    authority_disposition = ?, generation = generation + 1, lease_owner = NULL, lease_until = NULL, \
+                    updated_at = UNIX_TIMESTAMP() WHERE reservation_id = ? AND status = 'COMMITTED' \
+                    AND service_id = ? AND database_id = ? AND lease_owner = ? AND generation = ? \
+                    AND lease_until > UNIX_TIMESTAMP() AND attempts <= ? \
+                    AND __CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT__";
+
+fn apply_certified_memory_family_ledger_gate(template: &str) -> String {
+    template.replace(
+        CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT_PLACEHOLDER,
+        CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT_GATE_SQL,
+    )
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct PublicationReport {
     pub leased: u64,
@@ -89,42 +165,45 @@ pub(crate) async fn reconcile_publications(
     let mut report = PublicationReport::default();
     // Only a source owner that recorded a finite coverage contract may enter
     // automatic certification. Unknown GLOBAL coverage remains operator-owned.
-    let candidates: Vec<(String, u64, u32)> = sqlx::query_as(
-        "SELECT reservation_id, generation, attempts FROM authority_source_outcome \
-         WHERE status = 'COMMITTED' AND mutation_kind = 'AUTHORIZATION_SOURCE' \
-         AND service_id = ? AND database_id = ? \
-         AND JSON_TYPE(JSON_EXTRACT(staged_evidence, '$.coverage')) = 'OBJECT' \
-         AND (lease_until IS NULL OR lease_until <= UNIX_TIMESTAMP()) \
-         ORDER BY reservation_id LIMIT ?",
-    )
-    .bind(service_id)
-    .bind(database_id)
-    .bind(BATCH_SIZE)
-    .fetch_all(pool)
-    .await
-    .map_err(pending)?;
+    let committed_candidate_sql =
+        apply_certified_memory_family_ledger_gate(COMMITTED_CANDIDATE_SQL_TEMPLATE);
+    let candidates: Vec<(String, u64, u32)> = sqlx::query_as(&committed_candidate_sql)
+        .bind(service_id)
+        .bind(database_id)
+        .bind(BATCH_SIZE)
+        .fetch_all(pool)
+        .await
+        .map_err(pending)?;
     for (reservation_id, generation, attempts) in candidates {
         if attempts >= MAX_ATTEMPTS {
-            sqlx::query("UPDATE authority_source_outcome SET status = 'QUARANTINED', \
-                last_error = 'publication reconciliation budget exhausted; operator reconciliation required', \
-                generation = generation + 1, lease_owner = NULL, lease_until = NULL, updated_at = UNIX_TIMESTAMP() \
-                WHERE reservation_id = ? AND generation = ? AND status = 'COMMITTED' \
-                AND service_id = ? AND database_id = ? AND attempts >= ? \
-                AND (lease_until IS NULL OR lease_until <= UNIX_TIMESTAMP())")
-                .bind(&reservation_id).bind(generation).bind(service_id).bind(database_id).bind(MAX_ATTEMPTS)
-                .execute(pool).await.map_err(pending)?;
+            let quarantine_sql =
+                apply_certified_memory_family_ledger_gate(COMMITTED_QUARANTINE_SQL_TEMPLATE);
+            sqlx::query(&quarantine_sql)
+                .bind(&reservation_id)
+                .bind(generation)
+                .bind(service_id)
+                .bind(database_id)
+                .bind(MAX_ATTEMPTS)
+                .execute(pool)
+                .await
+                .map_err(pending)?;
             continue;
         }
         let next_generation = generation
             .checked_add(1)
             .ok_or_else(|| pending("lease generation exhausted"))?;
-        let claimed = sqlx::query("UPDATE authority_source_outcome SET lease_owner = ?, \
-            lease_until = UNIX_TIMESTAMP() + ?, generation = generation + 1, attempts = attempts + 1, \
-            updated_at = UNIX_TIMESTAMP() WHERE reservation_id = ? AND generation = ? AND status = 'COMMITTED' \
-            AND service_id = ? AND database_id = ? AND attempts < ? \
-            AND (lease_until IS NULL OR lease_until <= UNIX_TIMESTAMP())")
-            .bind(&owner).bind(LEASE_SECONDS).bind(&reservation_id).bind(generation)
-            .bind(service_id).bind(database_id).bind(MAX_ATTEMPTS).execute(pool).await.map_err(pending)?;
+        let claim_sql = apply_certified_memory_family_ledger_gate(COMMITTED_CLAIM_SQL_TEMPLATE);
+        let claimed = sqlx::query(&claim_sql)
+            .bind(&owner)
+            .bind(LEASE_SECONDS)
+            .bind(&reservation_id)
+            .bind(generation)
+            .bind(service_id)
+            .bind(database_id)
+            .bind(MAX_ATTEMPTS)
+            .execute(pool)
+            .await
+            .map_err(pending)?;
         if claimed.rows_affected() != 1 {
             continue;
         }
@@ -162,14 +241,24 @@ pub(crate) async fn reconcile_publications(
                 report.budget_resets += u64::from(progress.checkpoints);
                 // Local terminal state requires a durable certificate for EVERY
                 // declared scope. GLOBAL remains barrier-blocked at authority.
-                let updated = sqlx::query("UPDATE authority_source_outcome SET status = ?, \
-                    authority_disposition = ?, generation = generation + 1, lease_owner = NULL, lease_until = NULL, \
-                    updated_at = UNIX_TIMESTAMP() WHERE reservation_id = ? AND status = 'COMMITTED' \
-                    AND service_id = ? AND database_id = ? AND lease_owner = ? AND generation = ? \
-                    AND lease_until > UNIX_TIMESTAMP() AND attempts <= ?")
-                    .bind(if state == AuthorityReservationState::Certified { "COMPLETE" } else { "PUBLISHED" })
-                    .bind(state.as_text()).bind(&reservation_id).bind(service_id).bind(database_id)
-                    .bind(&owner).bind(next_generation).bind(MAX_ATTEMPTS).execute(pool).await.map_err(pending)?;
+                let terminal_sql =
+                    apply_certified_memory_family_ledger_gate(COMMITTED_TERMINAL_CAS_SQL_TEMPLATE);
+                let updated = sqlx::query(&terminal_sql)
+                    .bind(if state == AuthorityReservationState::Certified {
+                        "COMPLETE"
+                    } else {
+                        "PUBLISHED"
+                    })
+                    .bind(state.as_text())
+                    .bind(&reservation_id)
+                    .bind(service_id)
+                    .bind(database_id)
+                    .bind(&owner)
+                    .bind(next_generation)
+                    .bind(MAX_ATTEMPTS)
+                    .execute(pool)
+                    .await
+                    .map_err(pending)?;
                 if updated.rows_affected() == 1 {
                     report.certified += 1;
                 }
@@ -239,6 +328,29 @@ struct CertificationLease<'a> {
 }
 
 impl CertificationLease<'_> {
+    /// Re-read the durable row immediately before any authority certification.
+    /// The lease and the CertifiedMemory family-ledger contract use the same
+    /// SQL fence; a lost lease or absent contract stops before network I/O.
+    async fn require_live_lease_and_family_contract(&self) -> Result<(), PolicyError> {
+        let live_lease_sql =
+            apply_certified_memory_family_ledger_gate(COMMITTED_LIVE_LEASE_SQL_TEMPLATE);
+        let live: Option<i64> = sqlx::query_scalar(&live_lease_sql)
+            .bind(self.reservation_id)
+            .bind(self.service_id)
+            .bind(self.database_id)
+            .bind(self.owner)
+            .bind(self.generation)
+            .fetch_optional(self.pool)
+            .await
+            .map_err(pending)?;
+        if live != Some(1) {
+            return Err(pending(
+                "publication lease or CertifiedMemory family scope/frontier contract is not live",
+            ));
+        }
+        Ok(())
+    }
+
     /// Progress-budget checkpoint: zero the certification attempt budget and
     /// renew the lease, ONLY under the live lease fence and ONLY right after a
     /// NEW durable record was persisted. Bounded: at most one checkpoint per
@@ -371,6 +483,8 @@ async fn certify_row(
 ) -> Result<AuthorityReservationState, PolicyError> {
     let pool = fence.pool;
     let verified = verify_durable_source_outcome(row, "COMMITTED")?;
+    require_certified_memory_family_ledger_contract(&verified.envelope)?;
+    fence.require_live_lease_and_family_contract().await?;
     let scopes = verified
         .envelope
         .coverage
@@ -457,6 +571,10 @@ async fn certify_row(
             binding.source_outcome_digest.clone(),
             current.global_frontier.authority_id,
         )?;
+        // Recheck for each scope after candidate construction, which can outlive
+        // the lease. Ordinary coverage is never the family-ledger contract.
+        require_certified_memory_family_ledger_contract(&verified.envelope)?;
+        fence.require_live_lease_and_family_contract().await?;
         // No retries here: interruption leaves the lease and stable scope
         // identity intact. The next pass begins with authority reconciliation.
         let response = client.certify(request).await.map_err(pending)?;
@@ -763,6 +881,89 @@ mod binding_tests {
             source_outcome_digest: hex::encode(&row.outcome_digest),
             staged_evidence_digest: row.staged_digest().unwrap(),
         }
+    }
+
+    #[test]
+    fn certified_memory_family_scope_frontier_contract_is_fail_closed() {
+        for coverage in [false, true] {
+            let envelope: AuthorityStagedSourceEvidence =
+                serde_json::from_str(&staged_json(coverage)).unwrap();
+            assert!(!certified_memory_family_ledger_contract_is_proven(
+                &envelope
+            ));
+            assert!(require_certified_memory_family_ledger_contract(&envelope).is_err());
+        }
+        let (row, _) = durable_row("COMMITTED");
+        let verified = verify_durable_source_outcome(&row, "COMMITTED").unwrap();
+        assert!(verified.envelope.coverage.is_some());
+        assert!(require_certified_memory_family_ledger_contract(&verified.envelope).is_err());
+    }
+
+    #[test]
+    fn candidate_queries_filter_with_the_closed_gate_before_limit() {
+        let sql = apply_certified_memory_family_ledger_gate(COMMITTED_CANDIDATE_SQL_TEMPLATE);
+        let gate_position = sql
+            .find("AND 1 = 0")
+            .expect("candidate query must carry the hard gate");
+        let limit_position = sql
+            .find("LIMIT ?")
+            .expect("candidate query must be bounded");
+        assert!(gate_position < limit_position);
+        assert!(!sql.contains(CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT_PLACEHOLDER));
+        assert_eq!(CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT_GATE_SQL, "1 = 0");
+    }
+
+    #[test]
+    fn every_committed_mutation_path_rechecks_the_same_closed_gate() {
+        for template in [
+            COMMITTED_CANDIDATE_SQL_TEMPLATE,
+            COMMITTED_QUARANTINE_SQL_TEMPLATE,
+            COMMITTED_CLAIM_SQL_TEMPLATE,
+            COMMITTED_LIVE_LEASE_SQL_TEMPLATE,
+            COMMITTED_TERMINAL_CAS_SQL_TEMPLATE,
+        ] {
+            let sql = apply_certified_memory_family_ledger_gate(template);
+            assert!(sql.contains(CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT_GATE_SQL));
+            assert!(!sql.contains(CERTIFIED_MEMORY_FAMILY_LEDGER_CONTRACT_PLACEHOLDER));
+        }
+        assert!(COMMITTED_CLAIM_SQL_TEMPLATE.contains("attempts = attempts + 1"));
+    }
+
+    #[test]
+    fn production_paths_apply_gate_and_recheck_each_certify() {
+        let source = include_str!("runtime.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for template in [
+            "COMMITTED_CANDIDATE_SQL_TEMPLATE",
+            "COMMITTED_QUARANTINE_SQL_TEMPLATE",
+            "COMMITTED_CLAIM_SQL_TEMPLATE",
+            "COMMITTED_LIVE_LEASE_SQL_TEMPLATE",
+            "COMMITTED_TERMINAL_CAS_SQL_TEMPLATE",
+        ] {
+            assert_eq!(
+                source.matches(template).count(),
+                2,
+                "{template} must be declared and applied"
+            );
+        }
+        let certify = source
+            .split("async fn certify_row(")
+            .nth(1)
+            .unwrap()
+            .split("async fn reconcile_published_rows(")
+            .next()
+            .unwrap();
+        let network = certify.find("client.certify(request)").unwrap();
+        let per_scope = certify.find("for scope in &scopes.scopes").unwrap();
+        let contract = certify
+            .rfind("require_certified_memory_family_ledger_contract(&verified.envelope)")
+            .unwrap();
+        let lease = certify
+            .rfind("fence.require_live_lease_and_family_contract().await")
+            .unwrap();
+        assert!(per_scope < contract && contract < lease && lease < network);
     }
 
     #[test]

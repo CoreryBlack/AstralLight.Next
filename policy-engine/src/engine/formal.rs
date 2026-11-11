@@ -487,7 +487,7 @@ impl PolicyEngine {
                             };
                             if stable {
                                 admission = final_proof.and_then(|proof| {
-                                    astral_types::AuthorizationAdmission::from_verified_proof(proof)
+                                    astral_types::AuthorizationAdmission::from_verified_request_bound_proof(proof)
                                         .ok()
                                 });
                             }

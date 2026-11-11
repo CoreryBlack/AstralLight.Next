@@ -100,6 +100,11 @@ impl IntegrationAuthorizationService {
     ) -> Result<SignedAuthorizationDecision, &'static str> {
         let start = std::time::Instant::now();
         let request = &signed.request;
+        if astral_db::authorization_read_surface()
+            .is_some_and(|surface| surface.is_certified_memory())
+        {
+            return Err("AUTHORIZATION_PENDING");
+        }
         let now = utc_millis()?;
         request
             .validate_at(now)

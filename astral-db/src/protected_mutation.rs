@@ -404,7 +404,7 @@ mod tests {
             proof_id: "proof".into(),
             signature: "22".repeat(64),
         };
-        let admission = AuthorizationAdmission::from_verified_proof(proof).unwrap();
+        let admission = AuthorizationAdmission::from_verified_request_bound_proof(proof).unwrap();
         let ctx = ProtectedMutationContext::from_policy_context(
             &policy,
             admission.clone(),

@@ -1,8 +1,12 @@
-# AstralLight Rust
+# AstralLight.Next
 
-AstralLight Rust is a Rust backend for **centralized, tenant-scoped authorization across API services**. It brings identity and session handling, gateway authentication, policy evaluation, durable authorization evidence, governance, messaging, and audit into one workspace. Instead of letting each application invent its own role checks or read permission tables directly, services use a shared authorization decision path.
+**A research-grade authorization engine in Rust, built around one rule: once a permission is revoked and acknowledged, no request may be allowed on stale evidence.** Every decision is either backed by current, complete, published evidence, or it is `PENDING` / `DENY`. There is no fallback to raw rows, old snapshots, or caches.
 
-The project is for teams building multi-tenant services where access depends on **who is acting, which authorization card they use, which tenant owns the data, and what resource/action is requested**. It is not a frontend application or a drop-in, preconfigured production deployment: this repository provides the Rust implementation, integration SDKs, schemas, Rust tests, and technical documentation. It does not include credentials or private infrastructure, and published test assets do not mean every live integration or deployment has been accepted. Project tests, harness assertions, test helpers, and result evaluation are implemented in Rust; retained Python files are historical or independent mathematical/statistical references. They are not current runtime tools, test gates or acceptance evidence; current validation uses Rust `test-campaign` and `tests-suite/MANIFEST.toml`.
+> **Looking for maintainers and experimenters for `main`.**
+> `main` holds the stable reference design: gateway, policy engine, durable authorization projection, governance, audit, and a Rust test harness. I'm focusing my own time on a redesign (memory-resident authority) in the [`memroy-v1`](https://github.com/CoreryBlack/AstralLight.Next/tree/memroy-v1) branch, so `main` is open for you to maintain, benchmark, break, and extend.
+> Good ways to start: reproduce the test campaigns, try new revocation or race experiments, compare against other engines, or improve docs. See [CONTRIBUTING.md](CONTRIBUTING.md), and open an issue to discuss bigger ideas.
+
+**Who this is for:** security and distributed-systems researchers studying revocation and authorization consistency, engineers building multi-tenant services, and anyone who wants a real codebase to run access-control experiments on.
 
 ## Project overview
 

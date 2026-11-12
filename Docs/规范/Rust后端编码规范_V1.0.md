@@ -1357,6 +1357,7 @@ V6 does not renumber generic MQ `schemaVersion`, JWT signature/version fields, H
 
 ## 17. Git 提交规范
 
+> 完整的分支、Issue、PR、评审、合并与发布流程见 [Git 与 GitHub 协作规范](Git与GitHub协作规范_V1.0.md)；本仓库不设 `dev` 分支，§17.2 中的 `dev` 约定以该文为准。
 
 ### 17.1 提交信息格式
 

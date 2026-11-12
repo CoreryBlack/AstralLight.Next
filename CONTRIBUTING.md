@@ -5,6 +5,55 @@ current proposed intake policy. It is not a signed contributor agreement or a
 patent assignment, and the project may require a separately signed agreement
 before accepting contributions intended for commercial relicensing.
 
+## Getting started
+
+`main` holds the stable reference design and is open for maintenance and
+experiments; the maintainer's redesign lives in the `memroy-v1` branch. New here?
+Pick an issue labeled
+[`good first issue`](https://github.com/CoreryBlack/AstralLight.Next/labels/good%20first%20issue)
+or [`help wanted`](https://github.com/CoreryBlack/AstralLight.Next/labels/help%20wanted),
+or open an issue to discuss an idea before writing code.
+
+### Build and test
+
+```bash
+cargo test --workspace --locked
+cargo run --locked -p test-harness --bin test-campaign -- --list --json
+scripts/run-tests.sh --campaign --run --profile native-kernel
+```
+
+The first command runs the workspace tests, the second lists every suite in
+[`tests-suite/MANIFEST.toml`](tests-suite/MANIFEST.toml), and the third runs the
+pure component regression profile. Suites that need MySQL or RabbitMQ require
+an environment you prepare yourself; if a dependency was unavailable, say so and
+do not report the run as passing. All tests and test verdicts are written in
+Rust only (coding standard §10.0).
+
+### Branches, commits, and pull requests
+
+The full workflow is in the
+[Git and GitHub collaboration standard](Docs/规范/Git与GitHub协作规范_V1.0.md). In short:
+
+- Fork the repository and branch from the latest `main` as
+  `<type>/<issue-id>-<short-desc>`, for example `fix/41-revoke-fence-timeout`.
+  Never push to `main` or force-push shared branches.
+- Commit messages use `<type>(<scope>): <subject>`, where type is one of
+  `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, and the subject is
+  lowercase, imperative, and at most 72 characters. Mark breaking changes with
+  `BREAKING CHANGE:` as described in coding standard §14.
+- Open the pull request against `main`, link the issue, list the checks you ran
+  and their environment, and include the AGPL confirmation below. `Rust CI`
+  (fmt, check, clippy with `-D warnings`, tests, docs) must pass, and a
+  maintainer reviews and merges.
+
+### The one rule not to break
+
+Every change must keep authorization fail-closed: decisions go through
+`PolicyEngine::evaluate()`, and missing, stale, or unproven evidence yields
+`PENDING` or `DENY`, never a fallback to raw rows, old snapshots, or caches.
+See the [Rust backend coding standard](Docs/规范/Rust后端编码规范_V1.0.md) for
+layering, error handling, testing, and security rules.
+
 ## Community license
 
 Contributions accepted into this repository are offered to the community under

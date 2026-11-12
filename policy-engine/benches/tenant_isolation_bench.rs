@@ -1,112 +1,15 @@
-//! Multi-tenant benchmarks for strict published-evidence authorization.
-
-#[allow(dead_code)]
-#[path = "../../tests-suite/series/MT-E1/support/published.rs"]
-mod published;
-
-use std::sync::Arc;
+//! memory—v1: Retained data-scope resolution benchmarks.
+//!
+//! The published-evidence tenant-isolation benchmarks
+//! (`tenant_isolation/published_*`) were removed together with the retired
+//! V6/V7 published-evidence evaluation chain (Rust 规范 §15.10). The data-scope
+//! resolver below runs standalone; no PENDING benchmark is added as a stand-in
+//! for future memory-v1 authorization performance.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use policy_engine::{DataScopeFilterResolver, PolicyEngine};
-use published::{assert_allow, assert_deny, canonical_grant, strict_context, PublishedRepo};
+use policy_engine::DataScopeFilterResolver;
 
-fn tenant_grants(
-    tenant_count: usize,
-    rules_per_tenant: usize,
-) -> Vec<astral_types::CanonicalGrant> {
-    let mut grants = Vec::with_capacity(tenant_count * rules_per_tenant);
-    for tenant_index in 0..tenant_count {
-        let tenant_id = 1000 + tenant_index as i64;
-        let card_id = 2000 + tenant_index as i64;
-        let user_id = 3000 + tenant_index as i64;
-        let domain_id = 4000 + tenant_index as i64;
-        for rule_index in 0..rules_per_tenant {
-            grants.push(canonical_grant(
-                (tenant_index * rules_per_tenant + rule_index + 1) as u64,
-                tenant_id,
-                Some(domain_id),
-                card_id,
-                user_id,
-                &format!("tenant_{tenant_index}_resource_{rule_index}"),
-                "read",
-            ));
-        }
-    }
-    grants
-}
-
-fn tenant_context(tenant_index: i64, rule_index: i64) -> astral_types::PolicyContext {
-    strict_context(
-        3000 + tenant_index,
-        2000 + tenant_index,
-        1000 + tenant_index,
-        Some(4000 + tenant_index),
-        &format!("tenant_{tenant_index}_resource_{rule_index}"),
-        "read",
-    )
-}
-
-fn bench_single_tenant(c: &mut Criterion) {
-    let engine = PolicyEngine::new();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let repo = PublishedRepo::from_grants(tenant_grants(1, 10));
-    let ctx = tenant_context(0, 5);
-
-    let decision = rt.block_on(engine.evaluate(&ctx, &repo));
-    assert_allow(&decision);
-    assert_eq!(repo.published_reads(), 2);
-    repo.reset_counters();
-
-    c.bench_function("tenant_isolation/published_single_tenant_10_rules", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                black_box(engine.evaluate(&ctx, &repo).await);
-            });
-        });
-    });
-    assert!(repo.published_reads() > 0);
-    assert_eq!(repo.published_reads() % 2, 0);
-}
-
-fn bench_multi_tenant_concurrent(c: &mut Criterion) {
-    let engine = Arc::new(PolicyEngine::new());
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
-    for tenant_count in [10usize, 50, 100] {
-        let repo = Arc::new(PublishedRepo::from_grants(tenant_grants(tenant_count, 10)));
-        for tenant_index in [0i64, tenant_count as i64 - 1] {
-            let ctx = tenant_context(tenant_index, 5);
-            let decision = rt.block_on(engine.evaluate(&ctx, repo.as_ref()));
-            assert_allow(&decision);
-        }
-        repo.reset_counters();
-
-        let label = format!("tenant_isolation/published_concurrent_{tenant_count}_tenants");
-        c.bench_function(&label, |b| {
-            b.iter(|| {
-                rt.block_on(async {
-                    let mut handles = Vec::with_capacity(tenant_count);
-                    for tenant_index in 0..tenant_count as i64 {
-                        let engine = Arc::clone(&engine);
-                        let repo = Arc::clone(&repo);
-                        handles.push(tokio::spawn(async move {
-                            let ctx = tenant_context(tenant_index, 5);
-                            let decision = engine.evaluate(&ctx, repo.as_ref()).await;
-                            black_box(decision)
-                        }));
-                    }
-                    for handle in handles {
-                        let decision = handle.await.unwrap();
-                        assert_allow(&decision);
-                    }
-                });
-            });
-        });
-        assert_eq!(repo.published_reads() % 2, 0);
-        assert!(repo.published_reads() > 0);
-    }
-}
-
+/// memory—v1: Benchmark data-scope filter resolution in isolation.
 fn bench_data_scope_resolve(c: &mut Criterion) {
     let resolver = DataScopeFilterResolver::new();
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -139,79 +42,12 @@ fn bench_data_scope_resolve(c: &mut Criterion) {
     });
 }
 
-fn bench_cross_tenant_published_lookup(c: &mut Criterion) {
-    let engine = PolicyEngine::new();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let repo = PublishedRepo::from_grants(tenant_grants(100, 50));
-    let matching_ctx = tenant_context(25, 25);
-    let matching_decision = rt.block_on(engine.evaluate(&matching_ctx, &repo));
-    assert_allow(&matching_decision);
-    repo.reset_counters();
-
-    let mut nonmatching_ctx = tenant_context(25, 25);
-    nonmatching_ctx.resource = Some("tenant_26_resource_25".to_owned());
-    let nonmatching_decision = rt.block_on(engine.evaluate(&nonmatching_ctx, &repo));
-    assert_deny(&nonmatching_decision, "DEFAULT_DENY");
-    repo.reset_counters();
-
-    c.bench_function("tenant_isolation/published_cross_tenant_100x50", |b| {
-        let mut index = 0i64;
-        b.iter(|| {
-            let tenant_index = index % 100;
-            let rule_index = (index / 100) % 50;
-            index += 1;
-            let ctx = tenant_context(tenant_index, rule_index);
-            rt.block_on(async {
-                black_box(engine.evaluate(&ctx, &repo).await);
-            });
-        });
-    });
-    assert!(repo.published_reads() > 0);
-    assert_eq!(repo.published_reads() % 2, 0);
-}
-
-fn bench_ready_empty_and_unavailable(c: &mut Criterion) {
-    let engine = PolicyEngine::new();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let ctx = tenant_context(0, 5);
-
-    let empty_repo = PublishedRepo::ready_empty_without_scope_recording(1000, 2000);
-    let empty_decision = rt.block_on(engine.evaluate(&ctx, &empty_repo));
-    assert_deny(&empty_decision, "DEFAULT_DENY");
-    empty_repo.reset_counters();
-    c.bench_function("tenant_isolation/published_empty_deny", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                black_box(engine.evaluate(&ctx, &empty_repo).await);
-            });
-        });
-    });
-    assert!(empty_repo.published_reads() > 0);
-
-    let unavailable_repo = PublishedRepo::unavailable_without_scope_recording();
-    let unavailable_decision = rt.block_on(engine.evaluate(&ctx, &unavailable_repo));
-    assert_deny(&unavailable_decision, "AUTHORIZATION_PENDING");
-    unavailable_repo.reset_counters();
-    c.bench_function("tenant_isolation/published_unavailable_pending", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                black_box(engine.evaluate(&ctx, &unavailable_repo).await);
-            });
-        });
-    });
-    assert!(unavailable_repo.published_reads() > 0);
-}
-
 criterion_group! {
     name = tenant_isolation_benches;
     config = Criterion::default()
         .sample_size(500)
         .confidence_level(0.95);
-    targets = bench_single_tenant,
-              bench_multi_tenant_concurrent,
-              bench_data_scope_resolve,
-              bench_cross_tenant_published_lookup,
-              bench_ready_empty_and_unavailable,
+    targets = bench_data_scope_resolve,
 }
 
 criterion_main!(tenant_isolation_benches);

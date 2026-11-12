@@ -568,6 +568,14 @@ fn digest_rows(
     Ok(digest)
 }
 
+/// memory—v1: Compute the candidate digest used by the unique-root installer.
+pub(crate) fn digest_candidate(
+    rows: &CandidateRows,
+    selections: &[CurrentSelection],
+) -> Result<ContentDigest, RuntimeError> {
+    Ok(digest_rows(rows, selections)?.digest())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

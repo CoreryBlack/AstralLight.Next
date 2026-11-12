@@ -212,6 +212,9 @@ pub struct E2Control {
     pub expected_finding: &'static str,
 }
 
+// memory—v1: Historical V6/V7 experiment inventory. The two policy-engine
+// controls were retired with the evaluator and do not establish runtime coverage
+// for memory-v1; the model and any remaining tests are historical evidence only.
 pub const E2_CONTROLS: [E2Control; 5] = [
     E2Control {
         premise: "pending_probe",
@@ -539,8 +542,10 @@ pub fn validate_register() -> Result<(), Vec<String>> {
 mod tests {
     use super::*;
 
+    // memory—v1: The two policy-engine controls describe the retired evaluator;
+    // keep their historical identities while explicitly checking retirement.
     #[test]
-    fn registry_links_every_runtime_e2_premise_to_a_native_rust_test() {
+    fn registry_distinguishes_retired_e2_controls_from_existing_tests() {
         assert_eq!(E2_RUST_TESTS.len(), E2_RUNTIME_PREMISES.len());
         for (control, expected) in E2_CONTROLS.iter().zip(E2_RUNTIME_PREMISES) {
             assert_eq!(control.premise, expected);
@@ -595,12 +600,19 @@ mod tests {
                 .find(|(crate_name, _)| *crate_name == control.crate_name)
                 .map(|(_, source)| *source)
                 .expect("E2 control crate has a native Rust source");
-            assert!(
-                source.contains(&format!("fn {test_name}")),
-                "{} does not resolve to a Rust test in {}",
-                control.rust_test,
-                control.crate_name
-            );
+            if control.crate_name == "policy-engine" {
+                assert!(
+                    !source.contains(&format!("fn {test_name}")),
+                    "historical E2 control was restored; update its retirement status"
+                );
+            } else {
+                assert!(
+                    source.contains(&format!("fn {test_name}")),
+                    "{} does not resolve to a Rust test in {}",
+                    control.rust_test,
+                    control.crate_name
+                );
+            }
         }
     }
 

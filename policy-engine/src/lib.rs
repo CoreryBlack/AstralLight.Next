@@ -1,10 +1,14 @@
 //! AstralLight authorization policy engine.
 //!
-//! `PolicyEngine::evaluate()` is the only formal authorization entry point. It
-//! applies identity and target-ownership gates, then requires CURRENT V6 published
-//! ORG_SCOPE or CARD evidence; missing, stale, malformed, or unavailable proof
-//! fails closed. This crate contains no database, cache, or message transport
-//! implementation; authoritative reads are injected through `RuleRepository`.
+//! `PolicyEngine::evaluate()` is the only formal authorization entry point.
+//! memory—v1: the legacy CURRENT V6/V7 published-evidence execution chain has
+//! been physically retired (`memory-v1-retire-legacy-read-20261112`, Rust 规范
+//! §15.10); until the memory-v1 shared root completes adoption, every formal
+//! evaluation fails closed to `AUTHORIZATION_PENDING` and no repository state,
+//! published evidence, or authorization fence can produce an ALLOW. This crate
+//! contains no database, cache, or message transport implementation;
+//! authoritative reads for the future positive path stay injected through
+//! `RuleRepository`.
 //!
 //! The crate also exposes Rust-native authorization compiler kernels. Their
 //! candidate and rebuild APIs are separate from the formal authorization read path.
@@ -19,6 +23,9 @@ mod data_scope;
 pub mod e1_observation;
 mod engine;
 mod hit_stats;
+/// Experimental memory-v1 candidate inspection; never an authorization decision.
+#[cfg(feature = "memory-v1-candidate")]
+pub mod memory_v1_candidate;
 /// ORG_SCOPE admission contract and evidence validation.
 pub mod org_admission;
 /// ORG_SCOPE pure compiler kernel.

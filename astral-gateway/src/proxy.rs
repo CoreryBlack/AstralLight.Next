@@ -11,7 +11,7 @@ use std::time::SystemTime;
 
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderName, StatusCode};
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{Stream, StreamExt};
 
@@ -21,6 +21,13 @@ use astral_common::middleware::gateway_signature::compute_hmac_signature_v3;
 /// HTTP 客户端（连接池复用）
 static CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        // The proxy relays content-encoding and bytes together; decoding only the
+        // body would change upstream representations and invalidate length headers.
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
         .connect_timeout(std::time::Duration::from_secs(3))
         // 对齐 Java Gateway application.yml `response-timeout: 30s`（路由转发响应超时）
         .timeout(std::time::Duration::from_secs(30))
@@ -106,6 +113,39 @@ async fn collect_upstream_response_body(
         MAX_UPSTREAM_RESPONSE_BYTES,
     )
     .await
+}
+
+// memory—v1: Connection nominates additional hop-by-hop fields for this message.
+fn connection_header_names(headers: &HeaderMap) -> Result<Vec<HeaderName>, ()> {
+    let mut names = Vec::new();
+    for value in headers.get_all(axum::http::header::CONNECTION) {
+        let value = value.to_str().map_err(|_| ())?;
+        for name in value.split(',') {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(());
+            }
+            names.push(HeaderName::from_bytes(name.as_bytes()).map_err(|_| ())?);
+        }
+    }
+    Ok(names)
+}
+
+// memory—v1: A proxy must not carry hop-by-hop metadata across either leg.
+fn is_hop_by_hop_header(name: &HeaderName, nominated: &[HeaderName]) -> bool {
+    nominated.contains(name)
+        || matches!(
+            name.as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        )
 }
 
 fn should_forward_client_header(
@@ -328,10 +368,27 @@ pub async fn forward_to_monitor(
     response
 }
 
+// memory—v1: Forward only after filtering each leg's connection-scoped headers.
 async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let external_path = parts.uri.path().to_string();
     let method = parts.method.clone();
+    let connection_names = match connection_header_names(&parts.headers) {
+        Ok(names) => names,
+        Err(()) => {
+            return json_error(
+                method.as_str(),
+                &external_path,
+                parts
+                    .headers
+                    .get("x-request-id")
+                    .and_then(|v| v.to_str().ok()),
+                400,
+                "Invalid Connection header",
+                "BAD_REQUEST",
+            );
+        }
+    };
     let identity_empty_bootstrap = is_public_identity_empty_bootstrap(&method, &external_path);
     // 保留原始请求的查询字符串
     let query = parts
@@ -387,7 +444,6 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
     let claims_version = extract_header("x-claims-version");
     let action_codes = extract_header("x-action-codes");
     let user_roles = extract_header("x-user-roles");
-    let template_id = extract_header("x-template-id");
     let tenant_status = extract_header("x-tenant-status");
     let perms_ref = extract_header("x-perms-ref");
     let permissions_truncated = extract_header("x-permissions-truncated");
@@ -423,7 +479,11 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
         let key_str = key.as_str().to_lowercase();
         // Keep a client Bearer only for Identity's exact session operations.
         // All other sensitive, gateway, and hop-by-hop headers remain stripped.
-        if !should_forward_client_header(&method, &external_path, &key_str, value) {
+        // Payload framing is regenerated from the buffered body by reqwest.
+        if is_hop_by_hop_header(key, &connection_names)
+            || key == axum::http::header::CONTENT_LENGTH
+            || !should_forward_client_header(&method, &external_path, &key_str, value)
+        {
             continue;
         }
         if let Ok(v) = value.to_str() {
@@ -446,7 +506,6 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
         ("x-claims-version", claims_version.as_str()),
         ("x-action-codes", action_codes.as_str()),
         ("x-user-roles", user_roles.as_str()),
-        ("x-template-id", template_id.as_str()),
         ("x-tenant-status", tenant_status.as_str()),
         ("x-perms-ref", perms_ref.as_str()),
         ("x-permissions-truncated", permissions_truncated.as_str()),
@@ -472,6 +531,22 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
         Ok(response) => {
             let status = response.status();
             let resp_headers = response.headers().clone();
+            let response_connection_names = match connection_header_names(&resp_headers) {
+                Ok(names) => names,
+                Err(()) => {
+                    return json_error(
+                        method.as_str(),
+                        &external_path,
+                        parts
+                            .headers
+                            .get("x-request-id")
+                            .and_then(|v| v.to_str().ok()),
+                        502,
+                        "Invalid upstream Connection header",
+                        "BAD_GATEWAY",
+                    );
+                }
+            };
             let resp_body = match collect_upstream_response_body(response).await {
                 Ok(body) => body,
                 Err(_) => {
@@ -496,8 +571,7 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
 
             let mut response_builder = Response::builder().status(status);
             for (key, value) in resp_headers.iter() {
-                let key_str = key.as_str().to_lowercase();
-                if key_str == "transfer-encoding" || key_str == "connection" {
+                if is_hop_by_hop_header(key, &response_connection_names) {
                     continue;
                 }
                 if let Ok(name) = HeaderName::from_bytes(key.as_str().as_bytes()) {
@@ -612,7 +686,141 @@ mod circuit_breaker_tests {
 #[cfg(test)]
 mod client_header_policy_tests {
     use super::*;
-    use axum::http::{HeaderMap, HeaderValue};
+    use axum::http::HeaderValue;
+
+    // memory—v1: Check each message's explicit and nominated hop-by-hop fields.
+    #[test]
+    fn connection_scoped_fields_are_removed_and_invalid_lists_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "connection",
+            HeaderValue::from_static("keep-alive, X-Private"),
+        );
+        headers.append("connection", HeaderValue::from_static("x-second"));
+        let names = connection_header_names(&headers).unwrap();
+        for name in [
+            "x-private",
+            "x-second",
+            "keep-alive",
+            "te",
+            "proxy-authorization",
+            "trailer",
+            "transfer-encoding",
+        ] {
+            assert!(is_hop_by_hop_header(
+                &HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                &names
+            ));
+        }
+        assert!(!is_hop_by_hop_header(
+            &HeaderName::from_static("content-type"),
+            &names
+        ));
+        headers.append("connection", HeaderValue::from_static("good, bad name"));
+        assert!(connection_header_names(&headers).is_err());
+    }
+
+    // memory—v1: Sensitive cookies cannot cross the gateway's client boundary.
+    #[test]
+    fn client_cookie_is_not_forwarded_even_on_session_routes() {
+        assert!(!should_forward_client_header(
+            &axum::http::Method::POST,
+            "/api/v1/auth/sessions/refresh",
+            "cookie",
+            &HeaderValue::from_static("session=secret"),
+        ));
+    }
+
+    // memory—v1: Exercise both proxy legs and redirect behavior over an isolated listener.
+    #[tokio::test]
+    async fn proxy_preserves_body_filters_connection_headers_and_does_not_follow_redirects() {
+        use axum::body::to_bytes;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct ServerGuard(tokio::task::JoinHandle<()>);
+        impl Drop for ServerGuard {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
+        let redirect_hits = Arc::new(AtomicUsize::new(0));
+        let sink_hits = redirect_hits.clone();
+        let app = Router::new()
+            .route(
+                "/inspect",
+                post(|headers: HeaderMap, body: bytes::Bytes| async move {
+                    let report = json!({
+                        "body": String::from_utf8_lossy(&body),
+                        "private": headers.get("x-private").is_some(),
+                        "cookie": headers.get("cookie").is_some(),
+                        "template": headers.get("x-template-id").is_some(),
+                        "contentLength": headers.get("content-length").and_then(|v| v.to_str().ok()),
+                    });
+                    (
+                        [("connection", "x-upstream-private"), ("x-upstream-private", "secret")],
+                        Json(report),
+                    )
+                }),
+            )
+            .route(
+                "/redirect",
+                get(|| async { (StatusCode::TEMPORARY_REDIRECT, [("location", "/sink")]) }),
+            )
+            .route(
+                "/sink",
+                get(move || {
+                    let hits = sink_hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = ServerGuard(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let base_uri = format!("http://{address}");
+        let config = AppConfig::default();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/inspect")
+            .header("connection", "x-private")
+            .header("x-private", "secret")
+            .header("cookie", "session=secret")
+            .header("x-template-id", "obsolete-template")
+            .header("content-length", "7")
+            .body(Body::from("payload"))
+            .unwrap();
+        let response = forward(&config, &base_uri, "/inspect", request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("connection"));
+        assert!(!response.headers().contains_key("x-upstream-private"));
+        let report: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(report["body"], "payload");
+        assert_eq!(report["private"], false);
+        assert_eq!(report["cookie"], false);
+        assert_eq!(report["template"], false);
+        assert_eq!(report["contentLength"], "7");
+
+        let request = Request::builder()
+            .uri("/redirect")
+            .body(Body::empty())
+            .unwrap();
+        let response = forward(&config, &base_uri, "/redirect", request).await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.headers().get("location").unwrap(), "/sink");
+        assert_eq!(redirect_hits.load(Ordering::SeqCst), 0);
+    }
 
     #[tokio::test]
     async fn gateway_proxy_and_identity_v3_verifier_share_empty_refresh_contract() {

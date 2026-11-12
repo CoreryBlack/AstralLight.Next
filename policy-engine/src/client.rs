@@ -250,11 +250,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_denies_inactive_card_before_reading_evidence() {
-        let client = PermissionClient::new(MockRepo { card_active: false });
-        let decision = client.check(valid_context()).await.unwrap();
-        assert!(!decision.allowed);
-        assert_eq!(decision.reason, "CARD_DISABLED");
+    async fn check_fails_closed_identically_regardless_of_card_context() {
+        // memory—v1：旧 CARD_CONTEXT 门随 V6/V7 评估链退役；客户端不再读卡，
+        // 一律得到同一 fail-closed PENDING，绝不因仓库状态差异产生 ALLOW。
+        let active = PermissionClient::new(MockRepo { card_active: true });
+        let inactive = PermissionClient::new(MockRepo { card_active: false });
+        let active_decision = active.check(valid_context()).await.unwrap();
+        let inactive_decision = inactive.check(valid_context()).await.unwrap();
+        assert!(!active_decision.allowed);
+        assert_eq!(active_decision.reason, "AUTHORIZATION_PENDING");
+        assert!(!inactive_decision.allowed);
+        assert_eq!(inactive_decision.reason, "AUTHORIZATION_PENDING");
+        assert_eq!(active_decision.matched_rule, inactive_decision.matched_rule);
     }
 
     #[tokio::test]

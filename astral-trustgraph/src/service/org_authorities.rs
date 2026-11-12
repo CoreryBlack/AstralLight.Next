@@ -45,7 +45,6 @@ use astral_db::org_scope_repository::{
     OrgRequestView, OrgScopeGateState, OrgScopeRepository, SqlxOrgScopeRepository,
     ORG_MAX_ROOT_INIT_GRANTS,
 };
-use astral_db::{CachedPublishedEvidenceRuleRepository, SqlxRuleRepository};
 
 /// ROOT_INIT 请求可携带的初始 grant 数上限（取 DB 更严界；types 上限 1000）。
 pub const MAX_ROOT_INIT_SEEDS: usize = ORG_MAX_ROOT_INIT_GRANTS;
@@ -677,8 +676,6 @@ pub struct OrgAuthoritiesService {
     db: sqlx::MySqlPool,
     engine: Arc<PolicyEngine>,
     org_scope_enabled: bool,
-    authority_provider: Option<Arc<SqlxAuthorizationFenceProvider>>,
-    authority_required: bool,
     /// Frozen projector ownership boundary copied from startup configuration.
     /// It is never parsed from a request and is checked before a mutation can
     /// create or restore usable authority for a managed tenant. Safety-reducing
@@ -690,12 +687,16 @@ impl OrgAuthoritiesService {
     /// The deployment state and projector tenant boundary are frozen at startup
     /// and reused for every governance mutation, so environment changes cannot
     /// alter an in-flight authorization decision or strand newly managed work.
+    ///
+    /// memory—v1：`authority_provider`/`authority_required` 仅作为组合根冻结
+    /// 签名保留（api 装配点不变），不再用于构造 SQL 规则仓储；治理元能力
+    /// 评估一律走根一致读面（见 [`Self::evaluate_meta`]）。
     pub fn new(
         db: sqlx::MySqlPool,
         engine: Arc<PolicyEngine>,
         org_scope_enabled: bool,
-        authority_provider: Option<Arc<SqlxAuthorizationFenceProvider>>,
-        authority_required: bool,
+        _authority_provider: Option<Arc<SqlxAuthorizationFenceProvider>>,
+        _authority_required: bool,
         org_scope_tenant_allowlist: Vec<i64>,
     ) -> Self {
         Self {
@@ -703,8 +704,6 @@ impl OrgAuthoritiesService {
             db,
             engine,
             org_scope_enabled,
-            authority_provider,
-            authority_required,
             org_scope_tenant_allowlist,
         }
     }
@@ -1248,8 +1247,12 @@ impl OrgAuthoritiesService {
         })
     }
 
+    /// memory—v1：治理元能力评估的唯一入口必须运行在根一致读面上。
     /// 经 `PolicyEngine.evaluate()`（唯一授权入口）评估 actor 对
     /// resource:action 的持权；评估失败/拒绝一律 Err（fail-closed，不旁路）。
+    /// 新版共享根未安装或读面请求不可用时一律 PENDING——本入口不再构造
+    /// SQL 规则仓储，绝不从 SQL 规则行或旧 published evidence 回退放行；
+    /// 引擎明确拒绝为 DENY，依赖不可用为 PENDING。
     /// `resource_tenant_id`/`resource_domain_id` 是权威解析的目标资源事实：
     /// root kind 场景下 resource tenant 已约束为签名 actor tenant，domain 来自
     /// 被 eval 的 scope（或 actor 签名 domain），绝不信任任意请求头。
@@ -1261,13 +1264,17 @@ impl OrgAuthoritiesService {
         resource_tenant_id: i64,
         resource_domain_id: Option<i64>,
     ) -> Result<(), AstralError> {
-        if astral_db::authorization_read_surface()
-            .is_some_and(|surface| surface.is_certified_memory())
-        {
-            return Err(AstralError::Pending(
-                "certified-memory org governance materialization unavailable".into(),
-            ));
-        }
+        let surface = astral_db::authorization_read_surface().ok_or_else(|| {
+            AstralError::Pending(
+                "memory-v1 authorization root not installed; org governance meta unavailable"
+                    .into(),
+            )
+        })?;
+        let read_request = surface.begin_request().map_err(|error| {
+            AstralError::Pending(format!(
+                "memory-v1 org governance read request unavailable: {error}"
+            ))
+        })?;
         let ctx = PolicyContext::builder()
             .user_id(Some(actor.user_id))
             .principal_kind(Some("PLATFORM_USER".to_owned()))
@@ -1281,16 +1288,19 @@ impl OrgAuthoritiesService {
             .resource(Some(resource.to_owned()))
             .action(action.to_owned())
             .build();
-        let repo = CachedPublishedEvidenceRuleRepository::new(
-            SqlxRuleRepository::new(self.db.clone())
-                .with_org_scope_enabled(self.org_scope_enabled)
-                .with_authority_provider_opt(self.authority_provider.clone())
-                .with_authority_required(self.authority_required),
-            self.db.clone(),
-        );
-        let decision = self.engine.evaluate(&ctx, &repo).await;
+        let decision = read_request
+            .evaluate_with_admission(&self.engine, &ctx)
+            .await
+            .decision;
         if decision.allowed {
             Ok(())
+        } else if decision.reason == "AUTHORIZATION_PENDING"
+            || decision.reason == "DEPENDENCY_UNAVAILABLE"
+        {
+            Err(AstralError::Pending(format!(
+                "org governance meta permission pending for {resource}:{action} (reason {})",
+                decision.reason
+            )))
         } else {
             Err(AstralError::Permission(format!(
                 "org governance meta permission denied for {resource}:{action} (reason {})",
@@ -2137,5 +2147,70 @@ mod tests {
         assert_eq!(cmd.governance_proof.as_ref(), Some(&proof));
         let cmd = db_commands::reject_request(&decider, 1, 3, None, None);
         assert!(cmd.governance_proof.is_none());
+    }
+
+    // ===== memory—v1：根未安装时的 fail-closed 门（无 DB 访问） =====
+
+    /// memory—v1：新版共享根未安装时，治理元能力评估必须在任何 DB 访问之前
+    /// 返回 PENDING，绝不回退 SQL 规则仓储或旧 published evidence。
+    #[tokio::test]
+    async fn org_governance_meta_is_pending_without_the_new_root() {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new());
+        let service = OrgAuthoritiesService::new(
+            pool,
+            Arc::new(PolicyEngine::new()),
+            true,
+            None,
+            true,
+            vec![20],
+        );
+        let governance_actor = actor(20);
+        let error = service
+            .evaluate_meta(
+                &governance_actor,
+                META_RESOURCE,
+                META_ACTION_BOOTSTRAP,
+                20,
+                Some(governance_actor.domain_id),
+            )
+            .await
+            .expect_err("without the memory-v1 root the meta check must stay pending");
+        assert!(
+            matches!(error, AstralError::Pending(ref message) if message.contains("not installed")),
+            "uninstalled root must surface a pending error, got {error}"
+        );
+    }
+
+    /// memory—v1：治理元能力评估不得再构造 SQL 规则仓储或直接调用
+    /// engine.evaluate；必须先经根读面门并在其 token 化读请求上评估。
+    #[test]
+    fn root_meta_evaluation_never_falls_back_to_sql_rule_repositories() {
+        let source = include_str!("org_authorities.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source must precede tests");
+        assert!(
+            !source.contains("SqlxRuleRepository"),
+            "org governance meta must not construct SQL rule repositories"
+        );
+        assert!(
+            !source.contains("CachedPublishedEvidenceRuleRepository"),
+            "org governance meta must not read legacy published evidence"
+        );
+        assert!(
+            !source.contains("engine.evaluate("),
+            "org governance meta must not evaluate through a raw repository"
+        );
+        let gate = source
+            .find("authorization_read_surface()")
+            .expect("the root read-surface gate must remain");
+        let begin = source
+            .find("begin_request()")
+            .expect("evaluation must run on a token-fenced read request");
+        let evaluate = source
+            .find("evaluate_with_admission")
+            .expect("evaluation must go through the root-backed read request");
+        assert!(gate < begin && begin < evaluate);
     }
 }

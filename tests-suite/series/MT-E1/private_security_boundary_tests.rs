@@ -1,9 +1,5 @@
-//! P0 security-boundary migration from the private Java baseline.
-//!
-//! The Java `SecurityBoundaryTest` asserts that client-supplied roles and
-//! cross-tenant data cannot replace the authoritative authorization facts.
-//! These tests exercise the same purpose through the Rust strict published
-//! evidence path; they do not claim to reproduce Java service wiring.
+//! memory—v1: Fail-closed checks while the shared-root evaluator is unavailable.
+//! These cases do not establish tenant isolation or a working positive authorization path.
 
 #[allow(dead_code)]
 #[path = "support/published.rs"]
@@ -29,6 +25,7 @@ fn context_with_client_roles(
     ctx
 }
 
+// memory—v1: Client-supplied roles cannot bypass the unavailable evaluator.
 #[tokio::test]
 async fn client_supplied_roles_do_not_authorize_without_published_grant() {
     let repo = PublishedRepo::from_evidence(vec![ready_evidence(100, 1000, vec![])]);
@@ -36,13 +33,11 @@ async fn client_supplied_roles_do_not_authorize_without_published_grant() {
 
     let decision = PolicyEngine::new().evaluate(&ctx, &repo).await;
 
-    assert_deny(&decision, "DEFAULT_DENY");
-    assert!(
-        repo.published_reads() >= 1,
-        "strict evaluation must read published evidence"
-    );
+    assert_deny(&decision, "AUTHORIZATION_PENDING");
+    assert_eq!(repo.published_reads(), 0);
 }
 
+// memory—v1: Legacy grants cannot bypass the unavailable evaluator.
 #[tokio::test]
 async fn foreign_tenant_or_other_action_grant_does_not_authorize() {
     let cross_tenant = PublishedRepo::from_evidence(vec![
@@ -65,7 +60,8 @@ async fn foreign_tenant_or_other_action_grant_does_not_authorize() {
     let cross_tenant_decision = PolicyEngine::new()
         .evaluate(&cross_tenant_ctx, &cross_tenant)
         .await;
-    assert_deny(&cross_tenant_decision, "DEFAULT_DENY");
+    assert_deny(&cross_tenant_decision, "AUTHORIZATION_PENDING");
+    assert_eq!(cross_tenant.published_reads(), 0);
 
     let other_action = PublishedRepo::from_evidence(vec![ready_evidence(
         100,
@@ -84,5 +80,6 @@ async fn foreign_tenant_or_other_action_grant_does_not_authorize() {
     let other_action_decision = PolicyEngine::new()
         .evaluate(&other_action_ctx, &other_action)
         .await;
-    assert_deny(&other_action_decision, "DEFAULT_DENY");
+    assert_deny(&other_action_decision, "AUTHORIZATION_PENDING");
+    assert_eq!(other_action.published_reads(), 0);
 }

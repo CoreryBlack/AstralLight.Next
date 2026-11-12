@@ -771,20 +771,6 @@ impl SingleNodeMemoryRoot {
         self.domains.get(&domain_id)
     }
 
-    pub(crate) fn tenant_domain(
-        &self,
-        tenant_id: i64,
-        domain_id: i64,
-    ) -> Option<&SingleNodeTenantDomain> {
-        self.tenant_domains
-            .values()
-            .find(|row| row.tenant_id == tenant_id && row.domain_id == domain_id)
-    }
-
-    pub(crate) fn rule_set(&self, rule_set_id: i64) -> Option<&SingleNodeRuleSet> {
-        self.rule_sets.get(&rule_set_id)
-    }
-
     pub fn identity_card_by_user(&self, user_id: i64) -> Option<&SingleNodeIdentityCard> {
         self.identity_card_by_user
             .get(&user_id)

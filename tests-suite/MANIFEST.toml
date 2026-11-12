@@ -25,8 +25,8 @@ owner_crate = "policy-engine"
 path = "tests-suite/series/MT-E1/tenant_isolation_tests.rs"
 kind = "strict-published-fixture"
 tenants = "2(成对);10(并发求值)"
-arch_status = "current"
-note = "strict published-evidence 注入夹具;验证 scope/最终重读且禁止 legacy ports;不替代真实 MySQL 或并发写入证明"
+arch_status = "compat"
+note = "memory—v1: 旧 published-evidence 授权用例已忽略；仅独立数据范围组件用例运行，不证明新版租户授权隔离"
 run = "cargo test -p testsuite --test tenant_isolation_tests"
 
 [[entry]]
@@ -36,7 +36,7 @@ owner_crate = "astral-common"
 path = "tests-suite/series/E1/gateway_contract_tests.rs"
 kind = "integration"
 arch_status = "current"
-note = "含 legacy v2 签名被 v3-only 中间件拒绝的退役守卫断言"
+note = "含 legacy v2 签名拒绝；memory—v1 签名请求经双卡上下文到正式引擎的 PENDING 检查，不证明 Gateway JWT、根接线或 ALLOW"
 
 [[entry]]
 id = "astral-common/audit_tenant_tests"
@@ -350,13 +350,22 @@ arch_status = "current"
 # ═══════════════ 性能/基准 ═══════════════
 
 [[entry]]
+id = "bench/memory-v1-candidate-root"
+category = "performance"
+owner_crate = "astral-authorization-root"
+path = "astral-authorization-root/benches/memory_v1_candidate.rs"
+kind = "bench"
+arch_status = "current"
+note = "memory—v1 实验候选根：纳秒计数和多线程读取；不代表正式鉴权、数据库加载或生产吞吐。cargo bench -p astral-authorization-root --bench memory_v1_candidate"
+
+[[entry]]
 id = "bench/policy-engine-benches"
 category = "performance"
 owner_crate = "policy-engine"
 path = "policy-engine/benches/"
 kind = "bench"
-arch_status = "current"
-note = "5 个 bench 目标(authorization_compiler/alloc/iai/policy/tenant_isolation);cargo bench -p policy-engine"
+arch_status = "archived"
+note = "历史组件基准（authorization_compiler/alloc/iai/policy/tenant_isolation），不属于 memory-v1 权威或正式鉴权性能证据；保留供源码迁移对账"
 
 [[entry]]
 id = "bench/engine-comparison"
@@ -364,8 +373,8 @@ category = "performance"
 owner_crate = "bench/engine-comparison(独立 crate)"
 path = "bench/engine-comparison/"
 kind = "bench-binary"
-arch_status = "current"
-note = "AstralLight vs Casbin/Cedar(进程内)+ OPA(sidecar);cargo run --release --run-id=..."
+arch_status = "archived"
+note = "历史跨引擎比较，尚未接入 memory-v1 正式授权；不可作为新版性能证据"
 
 [[entry]]
 id = "bench/loadgen"
@@ -373,8 +382,8 @@ category = "performance"
 owner_crate = "bench/loadgen(独立 crate)"
 path = "bench/loadgen/"
 kind = "bench-binary"
-arch_status = "current"
-note = "HMAC v3 Rust 压测客户端;由 crate 内 Rust CLI 配置 bounded open-loop offered-RPS 测点;每次测点独立 SLO;需 native composite 实际部署、可信 SUT 采样、积压稳定与运行级 95% CI 半宽 <=2% 收敛证据;旧复合 shell wrapper 已移除"
+arch_status = "archived"
+note = "历史 HMAC v3 HTTP 压测客户端，尚未适配 memory-v1 正式 listener；不可作为新版吞吐证据"
 
 [[entry]]
 id = "perf/no-regression-matrices"
@@ -421,7 +430,7 @@ owner_crate = "testsuite"
 path = "tests-suite/series/MT-E1/private_security_boundary_tests.rs"
 kind = "unit"
 arch_status = "current"
-note = "从私有 Java SecurityBoundaryTest 迁移测试目的:客户端角色 JSON 与外部租户 evidence 不得替代 strict published grant;不复制 Java 服务装配"
+note = "memory—v1: 客户端角色及旧租户证据不能绕过当前 PENDING；不证明新版租户隔离或正向授权"
 run = "cargo test -p testsuite --test private_security_boundary_tests"
 
 # ═══════════════ e2e / 多租户极限(testsuite 新增)═══════════════
@@ -453,8 +462,8 @@ owner_crate = "test-harness + testsuite"
 path = "test-harness/src/s15_validation.rs"
 kind = "campaign-gate"
 requires = ["four protected AL servers", "two isolated MySQL databases", "half-A AL1+AL2 -> DB1", "half-B AL3+AL4 -> DB2", "RabbitMQ cross-database transport", "custom same-database channel", "half membership and database ownership", "partition/fault controller", "current V6 signed identity", "WorkerOwned durable receipt", "published-evidence read-gate", "run-scoped provenance", "tenant isolation", "audit correlation", "half-authority fence", "split-brain fail-closed"]
-arch_status = "current"
-note = "CURRENT V6 S15 四服务器两半区设计入口：AL1/AL2 配对 DB1，AL3/AL4 配对 DB2；同库仅走 custom_same_db_channel，跨库仅走 RabbitMQ。当前仓库尚无网络化同库自研通道、四节点部署或批准的半区接管协议，因此离线 Rust contract 只验证拓扑/覆盖/前置门，live campaign 保持 BLOCKED。S15 live 身份探测执行器与 coordinator 的进程内离线合同另行登记为 s15-live-coordinator-contracts 与 s15-probe-executor-contracts suite（s15-probe CLI 在缺少完整受保护配置与批准值时网络惰性并返回 BLOCKED）"
+arch_status = "archived"
+note = "已退役的 CURRENT V6 S15 四服务器两半区历史编目（memory-v1-retire-legacy-read-20261112，Rust 规范 §15.10）：AL1/AL2 配对 DB1，AL3/AL4 配对 DB2；同库仅走 custom_same_db_channel，跨库仅走 RabbitMQ。requires 列表仅作为退役 V6 链的历史前置记录保留；旧执行入口（policy-engine engine/published.rs、matcher_curve.rs 等）已物理删除，正式评估一律 fail-closed AUTHORIZATION_PENDING，memory-v1 共享根未完成采用前不得放行。本条目不适用于 memory-v1，历史 S15 能力/报告不得计入 memory-v1 PASS；离线 Rust contract 只保留拓扑/覆盖/退役守卫，live campaign 保持 BLOCKED。S15 live 身份探测执行器与 coordinator 的进程内离线合同另行登记为 s15-live-coordinator-contracts 与 s15-probe-executor-contracts suite（s15-probe CLI 在缺少完整受保护配置与批准值时网络惰性并返回 BLOCKED）"
 
 [[entry]]
 id = "mt-extreme/testsuite"
@@ -862,7 +871,7 @@ profile = "native-kernel"
 test_services = []
 series = ["M3", "M5", "MT-E1", "RQ2"]
 scope = "component"
-boundary = "strict published-evidence injected fixture; final reload/scope/legacy-port assertions, no durable DB"
+boundary = "historical published-evidence authorization cases ignored; remaining data-scope component tests do not prove memory-v1 tenant authorization isolation"
 sources = ["tests-suite/series/MT-E1/tenant_isolation_tests.rs", "tests-suite/series/MT-E1/support/published.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "tenant_isolation_tests", "--locked", "--", "--nocapture"]
 acceptance = "rust"
@@ -875,7 +884,7 @@ profile = "native-kernel"
 test_services = []
 series = ["E1", "M5", "MT-E1"]
 scope = "component"
-boundary = "migrated Java SecurityBoundaryTest purpose: client roles and foreign-tenant evidence never replace strict published grants; no Java service wiring"
+boundary = "memory-v1 fail-closed placeholder rejects client roles and legacy grants without repository reads; does not prove tenant isolation or positive authorization"
 sources = ["tests-suite/series/MT-E1/private_security_boundary_tests.rs", "tests-suite/series/MT-E1/support/published.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "private_security_boundary_tests", "--locked"]
 acceptance = "rust"
@@ -953,20 +962,15 @@ profile = "native-kernel"
 test_services = []
 series = ["CORE", "PERF"]
 scope = "component"
-boundary = "Criterion test mode verifies fixture decisions and setup only; no statistical timing"
+boundary = "Criterion test mode verifies retained standalone condition-component and data-scope resolver setup only; no statistical timing. memory—v1: the retired V6/V7 published-evidence engine benchmarks were deleted (Rust 规范 §15.10); these retained component benches are not memory-v1 authorization performance, and the new-design authorization/throughput benchmark suite (nanosecond timing, more detailed analysis surface) remains to be designed and registered"
 sources = ["policy-engine/benches/policy_bench.rs", "policy-engine/benches/tenant_isolation_bench.rs"]
 argv = ["cargo", "test", "-p", "policy-engine", "--bench", "policy_bench", "--bench", "tenant_isolation_bench", "--locked", "--", "--test"]
 acceptance = "criterion-smoke"
 benchmark_cases = [
-  "engine/published_ready_allow", "engine/published_ready_empty_deny",
-  "engine/published_unavailable_pending", "engine/published_ready_nonmatching_set",
-  "engine/published_tenant_gradient_32", "condition/component_time_range",
+  "condition/component_time_range",
   "condition/component_ipv4_range", "condition/component_scope",
-  "tenant_isolation/published_single_tenant_10_rules",
-  "tenant_isolation/published_concurrent_10_tenants", "tenant_isolation/published_concurrent_50_tenants",
-  "tenant_isolation/published_concurrent_100_tenants", "tenant_isolation/data_scope_resolve",
-  "tenant_isolation/data_scope_resolve_personal", "tenant_isolation/published_cross_tenant_100x50",
-  "tenant_isolation/published_empty_deny", "tenant_isolation/published_unavailable_pending",
+  "tenant_isolation/data_scope_resolve",
+  "tenant_isolation/data_scope_resolve_personal",
 ]
 
 [[suite]]
@@ -2613,14 +2617,12 @@ profile = "performance-kernel"
 test_services = []
 series = ["PERF", "RQ1", "RQ5"]
 scope = "component"
-boundary = "strict fixture decision and condition CPU timing, preasserted ALLOW/DENY/PENDING; no MySQL/HTTP"
-sources = ["policy-engine/benches/policy_bench.rs", "tests-suite/series/MT-E1/support/published.rs"]
+boundary = "retained standalone condition-component CPU timing only; no MySQL/HTTP. memory—v1: the retired V6/V7 published-evidence engine benchmarks were deleted (Rust 规范 §15.10); this is not memory-v1 authorization performance, and the new-design authorization benchmark suite (nanosecond timing, more detailed analysis surface) remains to be designed and registered"
+sources = ["policy-engine/benches/policy_bench.rs"]
 argv = ["cargo", "bench", "-p", "policy-engine", "--bench", "policy_bench", "--locked", "--", "--color", "never"]
 acceptance = "criterion"
 benchmark_cases = [
-  "engine/published_ready_allow", "engine/published_ready_empty_deny",
-  "engine/published_unavailable_pending", "engine/published_ready_nonmatching_set",
-  "engine/published_tenant_gradient_32", "condition/component_time_range",
+  "condition/component_time_range",
   "condition/component_ipv4_range", "condition/component_scope",
 ]
 timeout_seconds = 1800
@@ -2722,16 +2724,13 @@ profile = "performance-kernel"
 test_services = []
 series = ["PERF", "RQ2", "RQ5", "MT-E1"]
 scope = "component"
-boundary = "strict scope-aware positive identities and checked join/decisions; CPU-only"
-sources = ["policy-engine/benches/tenant_isolation_bench.rs", "tests-suite/series/MT-E1/support/published.rs"]
+boundary = "retained standalone data-scope resolver CPU timing only; CPU-only. memory—v1: the retired V6/V7 published-evidence tenant-isolation benchmarks were deleted (Rust 规范 §15.10); this is not memory-v1 tenant-isolation authorization performance, and the new-design benchmark suite (nanosecond timing, more detailed analysis surface) remains to be designed and registered"
+sources = ["policy-engine/benches/tenant_isolation_bench.rs"]
 argv = ["cargo", "bench", "-p", "policy-engine", "--bench", "tenant_isolation_bench", "--locked", "--", "--color", "never"]
 acceptance = "criterion"
 benchmark_cases = [
-  "tenant_isolation/published_single_tenant_10_rules",
-  "tenant_isolation/published_concurrent_10_tenants", "tenant_isolation/published_concurrent_50_tenants",
-  "tenant_isolation/published_concurrent_100_tenants", "tenant_isolation/data_scope_resolve",
-  "tenant_isolation/data_scope_resolve_personal", "tenant_isolation/published_cross_tenant_100x50",
-  "tenant_isolation/published_empty_deny", "tenant_isolation/published_unavailable_pending",
+  "tenant_isolation/data_scope_resolve",
+  "tenant_isolation/data_scope_resolve_personal",
 ]
 timeout_seconds = 1800
 
@@ -2816,13 +2815,9 @@ profile = "native-kernel"
 test_services = []
 series = ["PERF", "RQ5"]
 scope = "component"
-boundary = "full evaluate fixture parity, ALLOW/DENY/PENDING read counts, expiry and final-revoke controls; no durable or HTTP proof"
+boundary = "historical V6 evaluation controls; not memory-v1 evidence"
+blocked_reason = "retired V6 evaluator; the memory-v1 formal ALLOW path is not implemented"
 sources = ["astral-db/src/memory_projection_hub/tests/evaluate_performance.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs"]
-argv = ["cargo", "test", "-p", "astral-db", "--lib", "memory_projection_hub::tests::evaluate_performance::controls::policy_evaluate_benefit_controls_preserve_decisions_and_fences", "--locked", "--", "--exact", "--nocapture", "--test-threads=1"]
-acceptance = "rust"
-minimum_tests = 1
-expected_tests = 1
-timeout_seconds = 600
 
 [[suite]]
 id = "policy-evaluate-benefit"
@@ -2831,31 +2826,20 @@ profile = "performance-kernel"
 test_services = []
 series = ["PERF", "RQ5"]
 scope = "component"
-boundary = "complete production PolicyEngine.evaluate CPU call-return: Arc-backed assembly hits versus forced misses, actual-clock reference and owned evidence; not signed HTTP/MySQL/SDK admission"
+boundary = "historical V6/V7 PolicyEngine.evaluate CPU call-return matrix over retired published-evidence ALLOW paths; kept as an archived record only"
+blocked_reason = "retired with memory-v1-retire-legacy-read-20261112 (Rust 规范 §15.10): policy_evaluate_complete_benefit_matrix depends on the old-engine ALLOW chain, which no longer exists — every formal evaluation is fail-closed AUTHORIZATION_PENDING; this suite must not be dispatched on the memory-v1 branch and its historical results must never be counted as memory-v1 PASS; a replacement benefit matrix on the new memory-v1 design (nanosecond timing, more detailed analysis surface) remains to be designed"
 sources = ["astral-db/src/memory_projection_hub/tests/evaluate_performance.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs", "test-harness/src/evaluate_acceptance.rs"]
-argv = ["cargo", "test", "--release", "-p", "astral-db", "--lib", "memory_projection_hub::tests::evaluate_performance::policy_evaluate_complete_benefit_matrix", "--locked", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"]
-acceptance = "rust"
-evidence_contract = "policy-evaluate-benefit"
-minimum_tests = 1
-expected_tests = 1
-timeout_seconds = 1800
 
 [[suite]]
 id = "policy-evaluate-attribution"
-performance_cases = 45
 owner = "astral-db"
 profile = "performance-kernel"
 test_services = []
 series = ["PERF", "RQ5"]
 scope = "component"
-boundary = "instrumented CPU PolicyEngine.evaluate phase/cache/allocator attribution; process-global allocator observation only, not formal throughput or evidence-copy/Arc-drop counts; no signed HTTP/MySQL/SDK/deployment claim"
-sources = ["astral-db/src/memory_projection_hub/tests/evaluate_performance.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs", "policy-engine/src/engine/formal.rs", "policy-engine/src/engine/published.rs", "policy-engine/src/hit_stats.rs", "astral-db/src/memory_projection_hub/assembly_cache.rs", "test-harness/src/evaluate_acceptance.rs"]
-argv = ["cargo", "test", "--release", "-p", "astral-db", "--features", "performance-attribution", "--lib", "memory_projection_hub::tests::evaluate_performance::policy_evaluate_attribution_matrix", "--locked", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"]
-acceptance = "rust"
-evidence_contract = "policy-evaluate-attribution"
-minimum_tests = 1
-expected_tests = 1
-timeout_seconds = 1800
+boundary = "historical V6/V7 instrumented PolicyEngine.evaluate phase/cache/allocator attribution over retired published-evidence ALLOW paths; kept as an archived record only"
+blocked_reason = "retired with memory-v1-retire-legacy-read-20261112 (Rust 规范 §15.10): policy_evaluate_attribution_matrix depends on the old-engine ALLOW chain, which no longer exists — every formal evaluation is fail-closed AUTHORIZATION_PENDING; this suite must not be dispatched on the memory-v1 branch and its historical results must never be counted as memory-v1 PASS; a replacement attribution matrix on the new memory-v1 design (nanosecond timing, more detailed analysis surface) remains to be designed"
+sources = ["astral-db/src/memory_projection_hub/tests/evaluate_performance.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs", "policy-engine/src/engine/formal.rs", "policy-engine/src/hit_stats.rs", "astral-db/src/memory_projection_hub/assembly_cache.rs", "test-harness/src/evaluate_acceptance.rs"]
 
 [[suite]]
 id = "policy-evaluate-sharing-experiment"
@@ -2864,14 +2848,9 @@ profile = "performance-kernel"
 test_services = []
 series = ["PERF", "RQ5"]
 scope = "component"
-boundary = "CPU-only owner-sharing causal experiment: shared/private AssemblyCache and PolicyEngine, cached/forced assembly, 128/1001/2048 grants, t1/t4/t8; no HTTP/MySQL/RabbitMQ/signed transport/deployment/production QPS/distributed capacity claim"
+boundary = "historical V6/V7 CPU-only owner-sharing causal experiment over retired published-evidence ALLOW paths; kept as an archived record only"
+blocked_reason = "retired with memory-v1-retire-legacy-read-20261112 (Rust 规范 §15.10): policy_evaluate_sharing_experiment depends on the old-engine ALLOW chain, which no longer exists — every formal evaluation is fail-closed AUTHORIZATION_PENDING; this suite must not be dispatched on the memory-v1 branch and its historical results must never be counted as memory-v1 PASS; a replacement sharing experiment on the new memory-v1 design (nanosecond timing, more detailed analysis surface) remains to be designed"
 sources = ["astral-db/src/memory_projection_hub/tests/evaluate_experimental.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs", "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs", "astral-db/src/memory_projection_hub/assembly_cache.rs", "test-harness/src/evaluate_sharing_acceptance.rs", "test-harness/src/campaign.rs"]
-argv = ["cargo", "test", "--release", "-p", "astral-db", "--lib", "memory_projection_hub::tests::evaluate_experimental::policy_evaluate_sharing_experiment", "--locked", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"]
-acceptance = "rust"
-evidence_contract = "policy-evaluate-sharing-experiment"
-minimum_tests = 1
-expected_tests = 1
-timeout_seconds = 1800
 
 [[suite]]
 id = "policy-evaluate-sharing-experiment-v2"
@@ -2880,14 +2859,9 @@ profile = "performance-kernel"
 test_services = []
 series = ["PERF", "RQ5"]
 scope = "component"
-boundary = "CPU-only owner-sharing attribution contract: v1 remains the immutable historical baseline; v2 reconciles AssemblyCache stripe wait/hold, GC/eviction, atomic PolicyEngine owner stats, and breaker map/state attribution across shared/private owners; no HTTP/MySQL/RabbitMQ/signed transport/deployment/production QPS/distributed capacity claim"
+boundary = "historical V6/V7 CPU-only owner-sharing attribution contract (v1 remains the immutable historical baseline); kept as an archived record only"
+blocked_reason = "retired with memory-v1-retire-legacy-read-20261112 (Rust 规范 §15.10): policy_evaluate_sharing_experiment depends on the old-engine ALLOW chain, which no longer exists — every formal evaluation is fail-closed AUTHORIZATION_PENDING; this suite must not be dispatched on the memory-v1 branch and its historical results must never be counted as memory-v1 PASS; a replacement sharing-experiment attribution contract on the new memory-v1 design (nanosecond timing, more detailed analysis surface) remains to be designed"
 sources = ["astral-db/src/memory_projection_hub/tests/evaluate_experimental.rs", "astral-db/src/memory_projection_hub/assembly_cache.rs", "policy-engine/src/engine.rs", "policy-engine/src/engine/formal.rs", "policy-engine/src/hit_stats.rs", "policy-engine/src/circuit_breaker.rs", "test-harness/src/evaluate_sharing_v2_acceptance.rs", "test-harness/src/campaign.rs"]
-argv = ["cargo", "test", "--release", "-p", "astral-db", "--features", "performance-attribution", "--lib", "memory_projection_hub::tests::evaluate_experimental::policy_evaluate_sharing_experiment", "--locked", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"]
-acceptance = "rust"
-evidence_contract = "policy-evaluate-sharing-experiment-v2"
-minimum_tests = 1
-expected_tests = 1
-timeout_seconds = 1800
 
 [[suite]]
 id = "performance-acceptance-parser-contracts"
@@ -2906,19 +2880,14 @@ timeout_seconds = 600
 
 [[suite]]
 id = "policy-matcher-relay-performance"
-performance_cases = 16
 owner = "policy-engine"
 profile = "performance-kernel"
 test_services = []
 series = ["PERF", "RQ5"]
 scope = "component"
-boundary = "CPU matcher relay warm steady-state, mixed and single resource buckets, stable/fresh Arc paths, and per-worker thread-local warmup; no HTTP/DB/deployment/distributed capacity claim"
-sources = ["policy-engine/src/engine/published.rs", "policy-engine/src/engine/matcher_curve.rs"]
-argv = ["cargo", "test", "--release", "-p", "policy-engine", "--lib", "engine::published::matcher_curve::matcher_relay_composed_matrix", "--locked", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"]
-acceptance = "rust"
-minimum_tests = 1
-expected_tests = 1
-timeout_seconds = 1800
+boundary = "historical V6/V7 CPU matcher relay warm steady-state matrix; its source (engine/matcher_curve.rs) was deleted with the retired published-evidence chain, so this entry is an archived record only"
+blocked_reason = "retired with memory-v1-retire-legacy-read-20261112 (Rust 规范 §15.10): engine/published.rs and engine/matcher_curve.rs were physically deleted, so the historical matcher relay matrix no longer has a runnable target; this suite must not be dispatched on the memory-v1 branch and its historical results must never be counted as memory-v1 PASS; a replacement matcher/relay benchmark on the new memory-v1 design (nanosecond timing, more detailed analysis surface) remains to be designed"
+sources = ["policy-engine/src/engine.rs", "policy-engine/src/engine/formal.rs"]
 
 [[suite]]
 id = "policy-evaluate-evidence-contracts"
@@ -2957,8 +2926,8 @@ profile = "offline-validation"
 test_services = []
 series = ["PERF", "RQ5"]
 scope = "component"
-boundary = "Rust offline equivalents for CURRENT V6 S15 run-selection, required-case and coverage predicates; S15 requires the four-server/two-half topology (AL1+AL2 -> DB1, AL3+AL4 -> DB2), custom same-database channel, RabbitMQ cross-database transport, exact durable receipt, canonical message identity, duplicate single-terminal completion, UNKNOWN reconciliation, no stale ALLOW during recovery, and final published-evidence READY; not the protected live campaign"
-sources = ["test-harness/src/s15_validation.rs", "test-harness/src/remaining_contracts.rs", "astral-mq/src/local_bus.rs", "astral-db/src/local_projection_bus.rs", "astral-mq/src/consumer.rs", "astral-mq/src/invalidation_fanout.rs", "astral-db/src/projection_execution/completion.rs", "astral-db/src/authorization_projection_repository.rs", "policy-engine/src/engine/published.rs", "Docs/实验/分布式测试/rust-s15/test_s15_validation.py", "Docs/实验/分布式测试/rust-s15/s15_validation.py"]
+boundary = "Rust offline contract for the RETIRED CURRENT V6 S15 campaign record: run-selection, required-case and coverage predicates are kept as historical identity (four-server/two-half topology, custom same-database channel, RabbitMQ cross-database transport, durable receipt, UNKNOWN reconciliation, no stale ALLOW during recovery, final published-evidence READY), but the V6/V7 execution entry was physically deleted (memory-v1-retire-legacy-read-20261112, Rust 规范 §15.10); the guard verifies the old entry stays unusable and every formal evaluation remains fail-closed AUTHORIZATION_PENDING until the memory-v1 shared root completes adoption; not applicable to memory-v1 and never counted as a memory-v1 PASS; not the protected live campaign"
+sources = ["test-harness/src/s15_validation.rs", "test-harness/src/remaining_contracts.rs", "astral-mq/src/local_bus.rs", "astral-db/src/local_projection_bus.rs", "astral-mq/src/consumer.rs", "astral-mq/src/invalidation_fanout.rs", "astral-db/src/projection_execution/completion.rs", "astral-db/src/authorization_projection_repository.rs", "policy-engine/src/engine.rs", "policy-engine/src/engine/formal.rs", "Docs/实验/分布式测试/rust-s15/test_s15_validation.py", "Docs/实验/分布式测试/rust-s15/s15_validation.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "s15_validation::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 8
@@ -3019,8 +2988,8 @@ profile = "offline-validation"
 test_services = []
 series = ["RQ4", "RQ5", "PERF"]
 scope = "live-campaign"
-boundary = "CURRENT V6 S15 four-server/two-half prerequisite gate: AL1+AL2 share DB1, AL3+AL4 share DB2; same-DB links require custom_same_db_channel, cross-DB links require RabbitMQ, and exact durable publication evidence, half-authority fencing and split-brain fail-closed are required; offline contract only and no Redis/OPA dispatch"
-sources = ["test-harness/src/s15_validation.rs", "test-harness/src/remaining_contracts.rs", "astral-mq/src/local_bus.rs", "astral-db/src/local_projection_bus.rs", "astral-mq/src/consumer.rs", "astral-mq/src/invalidation_fanout.rs", "astral-db/src/projection_execution/completion.rs", "astral-db/src/authorization_projection_repository.rs", "policy-engine/src/engine/published.rs", "tests-suite/series/RQ3/native_projection_lifecycle.rs", "Docs/实验/分布式测试/rust-s15"]
+boundary = "RETIRED CURRENT V6 S15 four-server/two-half prerequisite gate kept as historical identity: AL1+AL2 share DB1, AL3+AL4 share DB2; same-DB links require custom_same_db_channel, cross-DB links require RabbitMQ, and the historical V6 durable publication prerequisites stay enumerated. memory—v1: the V6/V7 execution entry was physically deleted (memory-v1-retire-legacy-read-20261112, Rust 规范 §15.10), the live campaign stays retired/BLOCKED on this branch, the gate can never be satisfied by a memory-v1 deployment, and no historical S15 capability counts as a memory-v1 PASS; offline contract only and no Redis/OPA dispatch"
+sources = ["test-harness/src/s15_validation.rs", "test-harness/src/remaining_contracts.rs", "astral-mq/src/local_bus.rs", "astral-db/src/local_projection_bus.rs", "astral-mq/src/consumer.rs", "astral-mq/src/invalidation_fanout.rs", "astral-db/src/projection_execution/completion.rs", "astral-db/src/authorization_projection_repository.rs", "policy-engine/src/engine.rs", "policy-engine/src/engine/formal.rs", "tests-suite/series/RQ3/native_projection_lifecycle.rs", "Docs/实验/分布式测试/rust-s15"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "remaining_contracts::tests::s15_v6_distributed_campaign_requires_current_durable_prerequisites", "--", "--exact", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1

@@ -1,15 +1,48 @@
 use astral_common::config::{AppConfig, GatewayCfg};
 use astral_common::middleware::gateway_signature::compute_hmac_signature_v3;
+use astral_common::middleware::permission_check_shared::physical_policy_context;
+use astral_types::{
+    PolicyContext, PolicyError, PublishedCardAuthorization, PublishedCardEvidenceScope,
+};
 use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use axum::{middleware, routing::get, Router};
 use hmac::Mac;
+use policy_engine::{OrgAuthorityRead, PolicyEngine, RuleRepository};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
+
+// memory—v1: This legacy repository must never be consulted by the retired evaluator.
+struct UnavailableRepository;
+
+#[async_trait::async_trait]
+impl RuleRepository for UnavailableRepository {
+    async fn check_card_active(&self, _: &PolicyContext) -> Result<bool, PolicyError> {
+        panic!("legacy card lookup must not be called")
+    }
+
+    async fn is_active_global_admin(&self, _: i64) -> Result<bool, PolicyError> {
+        panic!("legacy admin lookup must not be called")
+    }
+
+    async fn load_published_card_authorization(
+        &self,
+        _: &PublishedCardEvidenceScope,
+    ) -> Result<Option<Arc<PublishedCardAuthorization>>, PolicyError> {
+        panic!("legacy published evidence must not be called")
+    }
+
+    async fn load_org_authorization(
+        &self,
+        _: &PolicyContext,
+    ) -> Result<OrgAuthorityRead, PolicyError> {
+        panic!("legacy organization lookup must not be called")
+    }
+}
 
 const PATH: &str = "/contract-tests/gateway/resources/42";
 const USER_ID: &str = "42";
@@ -371,6 +404,101 @@ async fn identity_and_user_card_field_tampering_invalidates_signature() {
             "{label} must not invoke handler"
         );
     }
+}
+
+// memory—v1: Exercise one signed downstream request through dual-card parsing
+// and the formal evaluator; the unavailable root cannot authorize the handler.
+#[tokio::test]
+async fn signed_dual_card_request_stays_pending_without_shared_root() {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .to_string();
+    let signature = compute_hmac_signature_v3(
+        &gateway_secret(),
+        "GET",
+        PATH,
+        "42",
+        "PLATFORM_USER",
+        TOKEN_ID,
+        "43",
+        "44",
+        "45",
+        "46",
+        "ACCESS",
+        "2",
+        ACTION_CODES,
+        USER_ROLES,
+        &timestamp,
+    );
+    let request = Request::builder()
+        .method("GET")
+        .uri(PATH)
+        .header("x-gateway-auth", "verified")
+        .header("x-gateway-ts", timestamp)
+        .header("x-gateway-signature", signature)
+        .header("x-user-id", "42")
+        .header("x-principal-kind", "PLATFORM_USER")
+        .header("x-token-id", TOKEN_ID)
+        .header("x-identity-card-id", "43")
+        .header("x-user-card-id", "44")
+        .header("x-user-card-domain-id", "45")
+        .header("x-user-card-tenant-id", "46")
+        .header("x-token-use", "ACCESS")
+        .header("x-claims-version", "2")
+        .header("x-action-codes", ACTION_CODES)
+        .header("x-user-roles", USER_ROLES)
+        .body(Body::empty())
+        .unwrap();
+    let evaluations = Arc::new(AtomicUsize::new(0));
+    let business_calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            PATH,
+            get({
+                let evaluations = Arc::clone(&evaluations);
+                let business_calls = Arc::clone(&business_calls);
+                move |headers: axum::http::HeaderMap| {
+                    let evaluations = Arc::clone(&evaluations);
+                    let business_calls = Arc::clone(&business_calls);
+                    async move {
+                        let ctx =
+                            physical_policy_context(&headers, "test_resource", "read", Some(42))
+                                .unwrap();
+                        assert_eq!(
+                            (
+                                ctx.user_id,
+                                ctx.identity_card_id,
+                                ctx.card_id,
+                                ctx.tenant_id
+                            ),
+                            (Some(42), Some(43), Some(44), Some(46))
+                        );
+                        evaluations.fetch_add(1, Ordering::SeqCst);
+                        let decision = PolicyEngine::new()
+                            .evaluate(&ctx, &UnavailableRepository)
+                            .await;
+                        if decision.allowed {
+                            business_calls.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        } else {
+                            assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
+                            StatusCode::SERVICE_UNAVAILABLE
+                        }
+                    }
+                }
+            }),
+        )
+        .layer(middleware::from_fn_with_state(
+            config(),
+            astral_common::middleware::gateway_signature::gateway_signature_middleware,
+        ))
+        .with_state(config());
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(evaluations.load(Ordering::SeqCst), 1);
+    assert_eq!(business_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

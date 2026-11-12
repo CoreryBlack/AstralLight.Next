@@ -3,7 +3,9 @@
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Outcome counters for the CURRENT V6 evidence evaluator.
+/// Outcome counters for the formal authorization evaluator. memory—v1: the
+/// retired V6/V7 chain no longer reports per-phase timings; every evaluation
+/// is counted as a non-allowing attempt with total wall time only.
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HitStats {
@@ -56,8 +58,6 @@ impl AtomicHitStats {
             final_evidence_reload_ns: self.final_evidence_reload_ns.load(Ordering::Relaxed),
             evidence_match_ns: self.evidence_match_ns.load(Ordering::Relaxed),
             total_ns: self.total_ns.load(Ordering::Relaxed),
-            #[cfg(feature = "performance-attribution")]
-            attribution: AttributionBreakdown::default(),
         };
         HitStats {
             evaluation_count: self.evaluation_count.load(Ordering::Relaxed),
@@ -100,16 +100,6 @@ pub(crate) struct AtomicBreakerAttribution {
 
 #[cfg(feature = "performance-attribution")]
 impl AtomicBreakerAttribution {
-    pub(crate) fn record_map_wait(&self, elapsed: std::time::Duration) {
-        self.map_wait_ns
-            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
-    }
-
-    pub(crate) fn record_state_wait(&self, elapsed: std::time::Duration) {
-        self.state_wait_ns
-            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
-    }
-
     pub(crate) fn snapshot(&self) -> BreakerAttribution {
         BreakerAttribution {
             map_wait_ns: self.map_wait_ns.load(Ordering::Relaxed),
@@ -131,9 +121,6 @@ pub struct TimingBreakdown {
     pub final_evidence_reload_ns: u64,
     pub evidence_match_ns: u64,
     pub total_ns: u64,
-    #[cfg(feature = "performance-attribution")]
-    #[serde(skip)]
-    pub(crate) attribution: AttributionBreakdown,
 }
 
 #[cfg(feature = "performance-attribution")]
@@ -202,33 +189,6 @@ pub fn take_evaluation_attribution() -> AttributionBreakdown {
         .unwrap_or_default()
 }
 
-#[cfg(feature = "performance-attribution")]
-pub(crate) fn add_evaluation_stats_and_breaker(ns: u64) {
-    EVALUATION_ATTRIBUTION.with(|slot| {
-        if let Some(attribution) = slot.borrow_mut().as_mut() {
-            attribution.stats_and_breaker_ns = attribution.stats_and_breaker_ns.saturating_add(ns);
-        }
-    });
-}
-
-#[cfg(feature = "performance-attribution")]
-pub(crate) fn publish_evaluation_attribution(timing: &mut TimingBreakdown) {
-    EVALUATION_ATTRIBUTION.with(|slot| {
-        if let Some(attribution) = slot.borrow_mut().as_mut() {
-            let detailed = timing.attribution.clone();
-            attribution.card_context_check_ns = timing.card_context_check_ns;
-            attribution.initial_evidence_load_ns = timing.initial_evidence_load_ns;
-            attribution.initial_validation_ns = detailed.initial_validation_ns;
-            attribution.evidence_match_ns = timing.evidence_match_ns;
-            attribution.final_evidence_reload_ns = timing.final_evidence_reload_ns;
-            attribution.final_recheck_validation_ns = detailed.final_recheck_validation_ns;
-            attribution.final_recheck_scan_ns = detailed.final_recheck_scan_ns;
-            attribution.total_ns = timing.total_ns;
-            timing.attribution = attribution.clone();
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::{AtomicHitStats, TimingBreakdown};
@@ -243,8 +203,6 @@ mod tests {
             final_evidence_reload_ns: 5,
             evidence_match_ns: 7,
             total_ns: 11,
-            #[cfg(feature = "performance-attribution")]
-            attribution: Default::default(),
         };
         let workers = 8;
         let records_per_worker = 1_000;

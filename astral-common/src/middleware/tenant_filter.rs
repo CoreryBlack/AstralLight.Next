@@ -649,7 +649,17 @@ mod tests {
         }
     }
 
-    async fn authorized_global_scope() -> AuthorizedGlobalScope {
+    // memory—v1: Exercise query-builder handling independently of the unavailable
+    // formal ALLOW path; this private fixture is not an authorization proof.
+    fn query_builder_global_scope_fixture() -> AuthorizedGlobalScope {
+        AuthorizedGlobalScope {
+            resource: "global_resource".into(),
+        }
+    }
+
+    #[tokio::test]
+    // memory—v1: Even a permissive legacy repository cannot mint a capability.
+    async fn retired_engine_cannot_authorize_global_scope() {
         let context = PolicyContext::builder()
             .user_id(Some(1))
             .card_id(Some(1))
@@ -660,13 +670,15 @@ mod tests {
             .resource_ownership_scope(ResourceOwnershipScope::Global)
             .global_access_requirement(GlobalAccessRequirement::PolicyEvidence)
             .build();
-        AuthorizedGlobalScope::evaluate_and_authorize(
-            &context,
-            &PolicyEngine::new(),
-            &AllowGlobalRepository,
-        )
-        .await
-        .unwrap()
+        assert_eq!(
+            AuthorizedGlobalScope::evaluate_and_authorize(
+                &context,
+                &PolicyEngine::new(),
+                &AllowGlobalRepository,
+            )
+            .await,
+            Err(TenantScopeQueryError::GlobalAuthorizationRequired)
+        );
     }
 
     #[tokio::test]
@@ -714,7 +726,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_global_authorization_is_separate_from_missing_scope() {
         let query = TenantScopedQuery::new("SELECT id FROM global_resource")
-            .with_authorized_global_scope("global_resource", &authorized_global_scope().await);
+            .with_authorized_global_scope("global_resource", &query_builder_global_scope_fixture());
         assert_eq!(
             query.try_build().unwrap(),
             ("SELECT id FROM global_resource".into(), vec![])
@@ -785,8 +797,8 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(query.try_build(), Err(TenantScopeQueryError::ScopeRequired));
-        let query =
-            query.with_authorized_global_scope("global_resource", &authorized_global_scope().await);
+        let query = query
+            .with_authorized_global_scope("global_resource", &query_builder_global_scope_fixture());
         assert_eq!(
             query.try_build(),
             Err(TenantScopeQueryError::GlobalAuthorizationRequired)
@@ -796,7 +808,7 @@ mod tests {
                 domain: Some(3),
                 ..Default::default()
             })
-            .with_authorized_global_scope("global_resource", &authorized_global_scope().await);
+            .with_authorized_global_scope("global_resource", &query_builder_global_scope_fixture());
         assert_eq!(
             query.try_build().unwrap(),
             (

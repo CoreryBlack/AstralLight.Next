@@ -389,6 +389,7 @@ pub async fn permission_check_middleware(
     }
 }
 
+/// memory—v1: Operation ownership remains unavailable until the shared root supports it.
 async fn permission_check_middleware_scoped(
     state: AppState,
     mut req: Request,
@@ -518,13 +519,8 @@ async fn permission_check_middleware_scoped(
             ));
         }
     };
-    if path_matches_prefix(path, "/operations")
-        && method == "GET"
-        && matches!(
-            read_surface.profile(),
-            astral_common::config::AuthorizationReadProfile::CertifiedMemory
-        )
-    {
+    // memory—v1: Operation ownership is not yet available from the shared root.
+    if path_matches_prefix(path, "/operations") && method == "GET" {
         return Err(BoxedResponse::new(
             StatusCode::SERVICE_UNAVAILABLE.into_response(),
         ));

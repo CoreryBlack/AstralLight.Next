@@ -1,4 +1,5 @@
-//! PolicyEngine tenant-isolation tests for the strict published-evidence path.
+//! memory—v1: Historical published-evidence checks are ignored after retirement.
+//! The independent data-scope tests remain runnable and are not authorization proof.
 
 #[path = "support/published.rs"]
 mod published;
@@ -12,7 +13,9 @@ use published::{
     PublishedRepo,
 };
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_multi_tenant_same_resource_allow_and_deny() {
     let engine = PolicyEngine::new();
     let repo = PublishedRepo::from_evidence(vec![
@@ -59,7 +62,9 @@ async fn test_multi_tenant_same_resource_allow_and_deny() {
     assert_eq!(scopes[2], strict_scope(200, 2000, 3000, Some(20)));
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_tenant_id_in_context_preserved() {
     let engine = PolicyEngine::new();
     let repo = PublishedRepo::from_grants(vec![canonical_grant(
@@ -87,7 +92,9 @@ async fn test_tenant_id_in_context_preserved() {
     );
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_cross_tenant_rule_no_cross_talk() {
     let engine = PolicyEngine::new();
     let repo = PublishedRepo::from_evidence(vec![
@@ -124,7 +131,9 @@ async fn test_cross_tenant_rule_no_cross_talk() {
     assert_deny(&tenant_b, "DEFAULT_DENY");
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_same_card_wrong_tenant_is_pending_without_leakage() {
     let engine = PolicyEngine::new();
     let repo = PublishedRepo::from_grants(vec![canonical_grant(
@@ -148,7 +157,9 @@ async fn test_same_card_wrong_tenant_is_pending_without_leakage() {
     assert_eq!(repo.scopes(), vec![strict_scope(200, 1000, 1, Some(10))]);
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_same_card_wrong_user_or_domain_fails_closed() {
     let engine = PolicyEngine::new();
     let repo = PublishedRepo::from_grants(vec![canonical_grant(
@@ -186,7 +197,9 @@ async fn test_same_card_wrong_user_or_domain_fails_closed() {
     );
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_missing_or_unpublished_evidence_is_pending() {
     let engine = PolicyEngine::new();
     let ctx = strict_context(1, 1000, 100, Some(10), "sensitive_data", "read");
@@ -207,7 +220,9 @@ async fn test_missing_or_unpublished_evidence_is_pending() {
     );
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_concurrent_multi_tenant_evaluations_use_positive_ids() {
     let engine = Arc::new(PolicyEngine::new());
     let mut grants = Vec::new();
@@ -260,7 +275,9 @@ async fn test_concurrent_multi_tenant_evaluations_use_positive_ids() {
     }
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_inactive_card_rejected_multi_tenant() {
     let engine = PolicyEngine::new();
     let repo = PublishedRepo::inactive_with_evidence(vec![canonical_grant(
@@ -281,7 +298,9 @@ async fn test_inactive_card_rejected_multi_tenant() {
     assert_eq!(repo.published_reads(), 0);
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_benchmark_fixture_disables_scope_samples_without_bypassing_strict_reads() {
     let ctx = strict_context(1, 1000, 100, Some(10), "test", "read");
     let grant = canonical_grant(7, 100, Some(10), 1000, 1, "test", "read");
@@ -331,7 +350,9 @@ fn assisted_password_reset_context() -> PolicyContext {
     ctx
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_assisted_password_reset_rejects_crud_and_write_grants() {
     for action in ["read", "create", "update", "delete", "write"] {
         let repo = PublishedRepo::from_grants(vec![canonical_grant(
@@ -351,7 +372,9 @@ async fn test_assisted_password_reset_rejects_crud_and_write_grants() {
     }
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_assisted_password_reset_grant_does_not_authorize_crud() {
     let repo = PublishedRepo::from_grants(vec![canonical_grant(
         21,
@@ -371,7 +394,9 @@ async fn test_assisted_password_reset_grant_does_not_authorize_crud() {
     assert_eq!(repo.published_reads(), 4);
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_assisted_password_reset_requires_matching_scope_and_final_read() {
     for resource in ["identity_users:42", "identity_users:*"] {
         let repo = PublishedRepo::from_grants(vec![canonical_grant(
@@ -412,7 +437,9 @@ async fn test_assisted_password_reset_requires_matching_scope_and_final_read() {
     assert_deny(&decision, "DEFAULT_DENY");
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_assisted_password_reset_keeps_existing_action_wildcard_semantics() {
     for resource in ["identity_users:*", "*"] {
         let repo = PublishedRepo::from_grants(vec![canonical_grant(
@@ -432,7 +459,9 @@ async fn test_assisted_password_reset_keeps_existing_action_wildcard_semantics()
     }
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_assisted_password_reset_rejects_foreign_or_unresolved_target_scope() {
     let repo = PublishedRepo::from_grants(vec![canonical_grant(
         25,
@@ -461,7 +490,9 @@ async fn test_assisted_password_reset_rejects_foreign_or_unresolved_target_scope
     assert_deny(&decision, "DEFAULT_DENY");
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_assisted_password_reset_missing_or_unpublished_evidence_stays_pending() {
     for repo in [
         PublishedRepo::missing(),
@@ -490,7 +521,9 @@ async fn test_assisted_password_reset_missing_or_unpublished_evidence_stays_pend
     assert_eq!(repo.published_reads(), 0);
 }
 
+// memory—v1: Retired V6 evidence assertions are preserved as historical tests.
 #[tokio::test]
+#[ignore = "retired V6 published evaluator; memory-v1 authorization is not implemented"]
 async fn test_identity_create_and_write_grants_keep_existing_create_access() {
     for action in ["create", "write"] {
         let repo = PublishedRepo::from_grants(vec![canonical_grant(
@@ -510,6 +543,7 @@ async fn test_identity_create_and_write_grants_keep_existing_create_access() {
     }
 }
 
+// memory—v1: Data-scope filtering is tested independently of authorization.
 #[tokio::test]
 async fn test_data_scope_tenant_isolation() {
     let resolver = DataScopeFilterResolver::new();
@@ -533,6 +567,7 @@ async fn test_data_scope_tenant_isolation() {
     assert_ne!(filter_a.tenant_id, filter_b.tenant_id);
 }
 
+// memory—v1: Data-scope filtering is tested independently of authorization.
 #[tokio::test]
 async fn test_data_scope_no_tenant_no_filter() {
     let resolver = DataScopeFilterResolver::new();
@@ -542,6 +577,7 @@ async fn test_data_scope_no_tenant_no_filter() {
     assert!(filter.tenant_id.is_none());
 }
 
+// memory—v1: Data-scope filtering is tested independently of authorization.
 #[tokio::test]
 async fn test_data_scope_personal_scope_user_isolation() {
     let resolver = DataScopeFilterResolver::new();
@@ -555,6 +591,7 @@ async fn test_data_scope_personal_scope_user_isolation() {
     assert_eq!(filter.user_id, Some(999));
 }
 
+// memory—v1: Data-scope filtering is tested independently of authorization.
 #[tokio::test]
 async fn test_data_scope_non_personal_no_user_filter() {
     let resolver = DataScopeFilterResolver::new();
@@ -568,6 +605,7 @@ async fn test_data_scope_non_personal_no_user_filter() {
     assert!(filter.user_id.is_none());
 }
 
+// memory—v1: Data-scope filtering is tested independently of authorization.
 #[tokio::test]
 async fn test_data_scope_custom_filters() {
     let resolver = DataScopeFilterResolver::new();

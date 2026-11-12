@@ -1,455 +1,185 @@
 //! Startup-frozen authorization read surfaces.
 //!
-//! The surface is the only composition point for policy authorization reads. It
-//! keeps profile selection out of request handlers while preserving the durable
-//! owners for sessions, mutations, audit, and cold data.
+//! memory—v1: every V6/V7 read profile (durable SQL, DB-backed mirror,
+//! certified memory) has been physically retired from this surface. The
+//! `AuthorizationReadSurface` enum is deliberately uninhabited: no value can
+//! ever be constructed until the new single-node memory root is installed and
+//! a successor request path lands, so the type system itself is the
+//! fail-closed boundary. The durable owners for sessions, mutations, audit,
+//! and cold data are unchanged.
 
 use std::sync::{Arc, OnceLock};
 
 use astral_common::config::AuthorizationReadProfile;
-use astral_types::{
-    DomainScopeRequirement, PolicyContext, PolicyDecision, PolicyError, PublishedCardEvidenceScope,
-};
+use astral_types::{PolicyContext, PolicyDecision, PolicyError};
 use policy_engine::{PolicyEngine, PolicyEvaluation};
 use sqlx::MySqlPool;
-use time::OffsetDateTime;
 
 use crate::{
-    certified_memory_authority::{CertifiedMemoryReadToken, CertifiedMemoryStore},
-    CachedPublishedEvidenceRuleRepository, CertifiedMemoryProofRepository,
-    CertifiedMemorySodRepository, CertifiedOwnershipRequest, MemoryMirroredRuleRepository,
-    ResourceOwnershipResolution, SodCheckResult, SqlxAuthorizationFenceProvider,
-    SqlxRuleRepository,
+    certified_memory_authority::CertifiedMemoryStore, ResourceOwnershipResolution, SodCheckResult,
+    SqlxAuthorizationFenceProvider,
 };
 
+/// memory—v1: Test the remaining certified store's invalidation behavior.
+#[cfg(test)]
 pub(crate) fn invalidate_certified_store(store: &CertifiedMemoryStore) {
     if let Err(error) = store.mark_unknown() {
         tracing::error!(%error, "certified-memory invalidation failed");
     }
 }
 
+/// memory—v1: Request handle kept only for signature compatibility with
+/// callers still wired to the retired read path. It cannot be constructed in
+/// production: `begin_request` always refuses and no surface value exists.
 pub struct AuthorizationReadRequest {
-    surface: Arc<AuthorizationReadSurface>,
-    token: Option<CertifiedMemoryReadToken>,
+    _no_installed_root: (),
 }
 
 impl AuthorizationReadRequest {
+    /// memory—v1: A retired request cannot establish resource ownership.
     pub async fn resolve_ownership(
         &self,
-        resource: &str,
-        path: &str,
-        method: &str,
-        query_target_id: Option<i64>,
-        actor_card_id: Option<i64>,
-        actor_user_id: Option<i64>,
+        _resource: &str,
+        _path: &str,
+        _method: &str,
+        _query_target_id: Option<i64>,
+        _actor_card_id: Option<i64>,
+        _actor_user_id: Option<i64>,
     ) -> ResourceOwnershipResolution {
-        match self.surface.as_ref() {
-            AuthorizationReadSurface::Durable { pool, .. }
-            | AuthorizationReadSurface::DbBackedMirror { pool, .. } => {
-                crate::resolve_resource_ownership(
-                    pool,
-                    resource,
-                    path,
-                    method,
-                    query_target_id,
-                    actor_card_id,
-                    actor_user_id,
-                )
-                .await
-            }
-            AuthorizationReadSurface::CertifiedMemory(repository) => {
-                let Some(token) = self.token.as_ref() else {
-                    return ResourceOwnershipResolution::Unavailable {
-                        code: "resource_ownership.certified_memory_token_missing",
-                    };
-                };
-                let request = CertifiedOwnershipRequest {
-                    resource: resource.to_owned(),
-                    path: path.to_owned(),
-                    method: method.to_owned(),
-                    query_target_id,
-                    actor_card_id,
-                    actor_user_id,
-                    now_unix: OffsetDateTime::now_utc().unix_timestamp(),
-                };
-                crate::resolve_resource_ownership_certified_with_token(
-                    &repository.certified_store(),
-                    &request,
-                    token,
-                )
-                .unwrap_or(ResourceOwnershipResolution::Unavailable {
-                    code: "resource_ownership.certified_memory_unavailable",
-                })
-            }
+        ResourceOwnershipResolution::Unavailable {
+            code: "legacy_authorization_profile.retired",
         }
     }
 
+    /// memory—v1: A retired request cannot produce positive authorization.
     pub async fn evaluate_with_admission(
         &self,
-        engine: &PolicyEngine,
-        context: &PolicyContext,
+        _engine: &PolicyEngine,
+        _context: &PolicyContext,
     ) -> PolicyEvaluation {
-        match self.surface.as_ref() {
-            AuthorizationReadSurface::Durable { repository, .. } => {
-                engine.evaluate_with_admission(context, repository).await
-            }
-            AuthorizationReadSurface::DbBackedMirror { repository, .. } => {
-                engine.evaluate_with_admission(context, repository).await
-            }
-            AuthorizationReadSurface::CertifiedMemory(repository) => {
-                let Some(token) = self.token.as_ref() else {
-                    return PolicyEvaluation::without_admission(
-                        policy_engine::PolicyEngine::authorization_pending(
-                            "certified_memory.request_token_missing",
-                        ),
-                    );
-                };
-                let repository = repository.with_request_token(token.clone());
-                engine.evaluate_with_admission(context, &repository).await
-            }
-        }
+        PolicyEvaluation::without_admission(PolicyEngine::authorization_pending(
+            "legacy_authorization_profile.retired",
+        ))
     }
 
+    /// memory—v1: A retired request cannot admit separation-of-duty checks.
     pub async fn check_sod(
         &self,
-        context: &PolicyContext,
-        decision: &PolicyDecision,
+        _context: &PolicyContext,
+        _decision: &PolicyDecision,
     ) -> Result<SodCheckResult, PolicyError> {
-        match self.surface.as_ref() {
-            AuthorizationReadSurface::Durable { pool, .. }
-            | AuthorizationReadSurface::DbBackedMirror { pool, .. } => {
-                let result = match crate::load_org_sod_admission_mirrored(pool, context, decision)
-                    .await
-                    .map_err(|error| PolicyError::Repository(error.to_string()))?
-                {
-                    Some(admission) => {
-                        crate::check_sod_conflict_with_context_and_org(
-                            pool,
-                            context,
-                            &admission,
-                            context.resource_owner_id,
-                        )
-                        .await
-                    }
-                    None => {
-                        crate::check_sod_conflict_with_context(
-                            pool,
-                            context,
-                            context.resource_owner_id,
-                        )
-                        .await
-                    }
-                };
-                result.map_err(|error| PolicyError::Repository(error.to_string()))
-            }
-            AuthorizationReadSurface::CertifiedMemory(repository) => {
-                let token = self.token.as_ref().ok_or_else(|| {
-                    PolicyError::Repository("certified_memory.request_token_missing".to_owned())
-                })?;
-                let sod = CertifiedMemorySodRepository::with_read_token(
-                    repository.certified_store(),
-                    token.clone(),
-                );
-                let scope = PublishedCardEvidenceScope {
-                    tenant_id: context.tenant_id.ok_or_else(|| {
-                        PolicyError::Repository("certified_memory.sod_context_missing".to_owned())
-                    })?,
-                    card_id: context.card_id.ok_or_else(|| {
-                        PolicyError::Repository("certified_memory.sod_context_missing".to_owned())
-                    })?,
-                    user_filter: None,
-                    domain: DomainScopeRequirement::Unconstrained,
-                };
-                let org_contributions = if decision.org_provenance.is_some() {
-                    let admission = sod.load_org_admission(context, decision)?;
-                    Some(
-                        crate::collect_org_sod_contributions(context, &admission)
-                            .map_err(|error| PolicyError::Repository(error.to_string()))?,
-                    )
-                } else {
-                    None
-                };
-                let read_set = sod.load_read_set(&scope)?;
-                crate::evaluate_certified_sod(
-                    crate::CertifiedSodInput {
-                        policies: read_set.policies,
-                        evidence: read_set.evidence.as_ref().clone(),
-                        org_contributions,
-                    },
-                    context,
-                    context.resource_owner_id,
-                )
-            }
-        }
+        Err(PolicyError::Repository(
+            "legacy_authorization_profile.retired".to_owned(),
+        ))
     }
 
-    /// Reject certified-memory mutations until the request token is fenced
-    /// through the transaction's proven COMMIT on every source owner.
+    /// memory—v1: No request passes the mutation commit fence until the new
+    /// root is installed and every source owner proves its COMMIT.
     pub fn ensure_mutation_commit_fence(&self) -> Result<(), PolicyError> {
-        ensure_mutation_commit_fence_for_profile(self.surface.profile())
+        Err(PolicyError::Repository(
+            "legacy_authorization_profile.retired".to_owned(),
+        ))
     }
 
+    /// memory—v1: A retired request never carries a current read token.
     pub fn ensure_current(&self) -> Result<(), PolicyError> {
-        match (self.surface.as_ref(), self.token.as_ref()) {
-            (AuthorizationReadSurface::CertifiedMemory(repository), Some(token)) => repository
-                .certified_store()
-                .validate_read_token(token, OffsetDateTime::now_utc().unix_timestamp())
-                .map_err(|error| {
-                    PolicyError::Repository(format!(
-                        "certified_memory.request_token_failed;{error}"
-                    ))
-                }),
-            (AuthorizationReadSurface::CertifiedMemory(_), None) => Err(PolicyError::Repository(
-                "certified_memory.request_token_missing".to_owned(),
-            )),
-            _ => Ok(()),
-        }
+        Err(PolicyError::Repository(
+            "legacy_authorization_profile.retired".to_owned(),
+        ))
     }
 }
 
-fn ensure_mutation_commit_fence_for_profile(
-    profile: AuthorizationReadProfile,
-) -> Result<(), PolicyError> {
-    match profile {
-        AuthorizationReadProfile::CertifiedMemory => Err(PolicyError::Repository(
-            "certified_memory.mutation_commit_fence_unavailable".to_owned(),
-        )),
-        AuthorizationReadProfile::Durable | AuthorizationReadProfile::DbBackedMirror => Ok(()),
-        AuthorizationReadProfile::SingleNodeMemory => Err(PolicyError::Repository(
-            "single_node_memory.root_not_installed".to_owned(),
-        )),
-    }
-}
-
-///
-/// Each variant owns its concrete repository so the generic `PolicyEngine`
-/// entry point remains available without a dynamic repository object. The
-/// request path only borrows this already-frozen value.
-pub enum AuthorizationReadSurface {
-    Durable {
-        repository: CachedPublishedEvidenceRuleRepository<SqlxRuleRepository>,
-        pool: MySqlPool,
-    },
-    DbBackedMirror {
-        repository:
-            MemoryMirroredRuleRepository<CachedPublishedEvidenceRuleRepository<SqlxRuleRepository>>,
-        pool: MySqlPool,
-    },
-    CertifiedMemory(CertifiedMemoryProofRepository<SqlxAuthorizationFenceProvider>),
-}
+/// memory—v1: The V6/V7 variants (durable SQL, DB-backed mirror, certified
+/// memory) have been physically removed. The enum is uninhabited so that no
+/// retired read surface can be constructed, not even behind a feature flag.
+pub enum AuthorizationReadSurface {}
 
 impl AuthorizationReadSurface {
-    /// Close certified positive reads when a required runtime owner or
-    /// transport fails. Durable and mirror profiles have their own gates.
+    /// memory—v1: Nothing can be invalidated; no certified store is installed.
     pub(crate) fn invalidate_certified_memory(&self) {
-        if let Self::CertifiedMemory(repository) = self {
-            invalidate_certified_store(&repository.certified_store());
-        }
+        match *self {}
     }
 
+    /// memory—v1: No surface exists, hence no profile can be serving.
     pub const fn profile(&self) -> AuthorizationReadProfile {
-        match self {
-            Self::Durable { .. } => AuthorizationReadProfile::Durable,
-            Self::DbBackedMirror { .. } => AuthorizationReadProfile::DbBackedMirror,
-            Self::CertifiedMemory(_) => AuthorizationReadProfile::CertifiedMemory,
-        }
+        match *self {}
     }
 
+    /// memory—v1: No surface exists, hence certified memory is never active.
     pub const fn is_certified_memory(&self) -> bool {
-        matches!(self, Self::CertifiedMemory(_))
+        match *self {}
     }
 
-    /// Construct one surface from startup-frozen inputs.
-    ///
-    /// `CertifiedMemory` deliberately requires both a verified authority
-    /// provider and a currently-serving certified store. Missing either input is
-    /// a startup error; it never silently selects the mirror or SQL path.
+    /// memory—v1: Every profile is refused until the new root is installed.
     pub fn build(
-        profile: AuthorizationReadProfile,
-        pool: MySqlPool,
-        org_scope_enabled: bool,
-        authority_required: bool,
-        authority_provider: Option<Arc<SqlxAuthorizationFenceProvider>>,
-        certified_store: Option<Arc<CertifiedMemoryStore>>,
+        _profile: AuthorizationReadProfile,
+        _pool: MySqlPool,
+        _org_scope_enabled: bool,
+        _authority_required: bool,
+        _authority_provider: Option<Arc<SqlxAuthorizationFenceProvider>>,
+        _certified_store: Option<Arc<CertifiedMemoryStore>>,
     ) -> Result<Self, String> {
-        let sql = || {
-            SqlxRuleRepository::new(pool.clone())
-                .with_org_scope_enabled(org_scope_enabled)
-                .with_authority_provider_opt(authority_provider.clone())
-                .with_authority_required(authority_required)
-        };
-
-        match profile {
-            AuthorizationReadProfile::Durable => Ok(Self::Durable {
-                repository: CachedPublishedEvidenceRuleRepository::new(sql(), pool.clone()),
-                pool,
-            }),
-            AuthorizationReadProfile::DbBackedMirror => {
-                let inner = CachedPublishedEvidenceRuleRepository::new(sql(), pool.clone());
-                let mirror = MemoryMirroredRuleRepository::new(inner)
-                    .with_authority_provider_opt(authority_provider.clone().map(|provider| {
-                        provider as Arc<dyn policy_engine::AuthorizationFenceProvider>
-                    }))
-                    .with_durable_refill(pool.clone());
-                Ok(Self::DbBackedMirror {
-                    repository: mirror,
-                    pool,
-                })
-            }
-            AuthorizationReadProfile::CertifiedMemory => {
-                let provider = authority_provider.ok_or_else(|| {
-                    "certified-memory authorization surface requires an authority provider"
-                        .to_owned()
-                })?;
-                let store = certified_store.ok_or_else(|| {
-                    "certified-memory authorization surface requires a certified memory store"
-                        .to_owned()
-                })?;
-                store
-                    .begin_read(OffsetDateTime::now_utc().unix_timestamp())
-                    .map_err(|error| format!("certified-memory store is not serving: {error:?}"))?;
-                Ok(Self::CertifiedMemory(CertifiedMemoryProofRepository::new(
-                    store, provider,
-                )))
-            }
-            AuthorizationReadProfile::SingleNodeMemory => Err(
-                "single-node-memory authorization surface requires an installed local root"
-                    .to_owned(),
-            ),
-        }
+        Err("memory-v1 authorization surface requires a verified installed root".to_owned())
     }
 
+    /// memory—v1: A retired surface cannot start an authorization request.
     pub fn begin_request(self: &Arc<Self>) -> Result<AuthorizationReadRequest, PolicyError> {
-        let token = match self.as_ref() {
-            Self::CertifiedMemory(repository) => Some(
-                repository
-                    .certified_store()
-                    .begin_read(OffsetDateTime::now_utc().unix_timestamp())
-                    .map_err(|error| {
-                        PolicyError::Repository(format!(
-                            "certified_memory.request_begin_failed;{error}"
-                        ))
-                    })?,
-            ),
-            Self::Durable { .. } | Self::DbBackedMirror { .. } => None,
-        };
-        Ok(AuthorizationReadRequest {
-            surface: Arc::clone(self),
-            token,
-        })
+        Err(PolicyError::Repository(
+            "legacy_authorization_profile.retired".to_owned(),
+        ))
     }
 
+    /// memory—v1: Direct calls on retired surfaces remain pending.
     pub async fn evaluate_with_admission(
         &self,
-        engine: &PolicyEngine,
-        context: &PolicyContext,
+        _engine: &PolicyEngine,
+        _context: &PolicyContext,
     ) -> PolicyEvaluation {
-        match self {
-            Self::Durable { repository, .. } => {
-                engine.evaluate_with_admission(context, repository).await
-            }
-            Self::DbBackedMirror { repository, .. } => {
-                engine.evaluate_with_admission(context, repository).await
-            }
-            Self::CertifiedMemory(_) => PolicyEvaluation::without_admission(
-                policy_engine::PolicyEngine::authorization_pending(
-                    "certified_memory.request_token_missing",
-                ),
-            ),
-        }
+        PolicyEvaluation::without_admission(PolicyEngine::authorization_pending(
+            "legacy_authorization_profile.retired",
+        ))
     }
 
+    /// memory—v1: A retired surface cannot establish resource ownership.
     pub async fn resolve_ownership(
         &self,
-        resource: &str,
-        path: &str,
-        method: &str,
-        query_target_id: Option<i64>,
-        actor_card_id: Option<i64>,
-        actor_user_id: Option<i64>,
+        _resource: &str,
+        _path: &str,
+        _method: &str,
+        _query_target_id: Option<i64>,
+        _actor_card_id: Option<i64>,
+        _actor_user_id: Option<i64>,
     ) -> ResourceOwnershipResolution {
-        match self {
-            Self::Durable { pool, .. } | Self::DbBackedMirror { pool, .. } => {
-                crate::resolve_resource_ownership(
-                    pool,
-                    resource,
-                    path,
-                    method,
-                    query_target_id,
-                    actor_card_id,
-                    actor_user_id,
-                )
-                .await
-            }
-            Self::CertifiedMemory(_) => ResourceOwnershipResolution::Unavailable {
-                code: "resource_ownership.certified_memory_token_missing",
-            },
+        ResourceOwnershipResolution::Unavailable {
+            code: "legacy_authorization_profile.retired",
         }
     }
 
+    /// memory—v1: A retired surface cannot admit separation-of-duty checks.
     pub async fn check_sod(
         &self,
-        context: &PolicyContext,
-        decision: &PolicyDecision,
+        _context: &PolicyContext,
+        _decision: &PolicyDecision,
     ) -> Result<SodCheckResult, PolicyError> {
-        match self {
-            Self::Durable { pool, .. } | Self::DbBackedMirror { pool, .. } => {
-                let result = match crate::load_org_sod_admission_mirrored(pool, context, decision)
-                    .await
-                    .map_err(|error| PolicyError::Repository(error.to_string()))?
-                {
-                    Some(admission) => {
-                        crate::check_sod_conflict_with_context_and_org(
-                            pool,
-                            context,
-                            &admission,
-                            context.resource_owner_id,
-                        )
-                        .await
-                    }
-                    None => {
-                        crate::check_sod_conflict_with_context(
-                            pool,
-                            context,
-                            context.resource_owner_id,
-                        )
-                        .await
-                    }
-                };
-                result.map_err(|error| PolicyError::Repository(error.to_string()))
-            }
-            Self::CertifiedMemory(_) => Err(PolicyError::Repository(
-                "certified_memory.request_token_missing".to_owned(),
-            )),
-        }
+        Err(PolicyError::Repository(
+            "legacy_authorization_profile.retired".to_owned(),
+        ))
     }
 
+    /// memory—v1: Retired surfaces are never ready for positive authorization.
     pub fn positive_authorization_ready(&self) -> bool {
-        match self {
-            Self::Durable { repository, .. } => {
-                policy_engine::RuleRepository::positive_authorization_ready(repository)
-            }
-            Self::DbBackedMirror { repository, .. } => {
-                policy_engine::RuleRepository::positive_authorization_ready(repository)
-            }
-            Self::CertifiedMemory(repository) => {
-                policy_engine::RuleRepository::positive_authorization_ready(repository)
-            }
-        }
+        false
     }
 }
 
 static AUTHORIZATION_READ_SURFACE: OnceLock<Arc<AuthorizationReadSurface>> = OnceLock::new();
 
-/// Install the surface once per process and return the canonical instance.
-///
-/// A composite single-node process may let Identity and TrustGraph race to
-/// install the same startup profile. The first owner wins; later callers reuse
-/// that immutable instance rather than replacing it mid-flight.
+/// memory—v1: Direct installation is refused; no surface value can even be
+/// built to pass in.
 pub fn install_authorization_read_surface(
-    surface: Arc<AuthorizationReadSurface>,
-) -> Arc<AuthorizationReadSurface> {
-    Arc::clone(AUTHORIZATION_READ_SURFACE.get_or_init(|| surface))
+    _surface: Arc<AuthorizationReadSurface>,
+) -> Result<Arc<AuthorizationReadSurface>, String> {
+    Err("V6/V7 authorization read surfaces are retired".to_owned())
 }
 
 pub fn authorization_read_surface() -> Option<Arc<AuthorizationReadSurface>> {
@@ -459,6 +189,8 @@ pub fn authorization_read_surface() -> Option<Arc<AuthorizationReadSurface>> {
 /// Install or reuse the process-frozen surface when one exists. Once a process selects a
 /// profile, a later runtime may only reuse that profile; it cannot silently
 /// replace it or downgrade to SQL/mirror.
+///
+/// memory—v1: refused for every profile until the new root is installed.
 pub fn ensure_authorization_read_surface(
     profile: AuthorizationReadProfile,
     pool: MySqlPool,
@@ -494,6 +226,7 @@ pub fn ensure_authorization_read_surface(
     Ok(Arc::clone(installed))
 }
 
+/// memory—v1: refused for every profile until the new root is installed.
 pub fn build_authorization_read_surface(
     profile: AuthorizationReadProfile,
     pool: MySqlPool,
@@ -520,21 +253,72 @@ pub fn certified_surface_unavailable() -> PolicyError {
 }
 
 #[cfg(test)]
-mod mutation_fence_tests {
+mod retired_surface_tests {
     use super::*;
 
-    #[test]
-    fn certified_memory_mutation_requires_commit_fence() {
-        assert!(ensure_mutation_commit_fence_for_profile(
-            AuthorizationReadProfile::CertifiedMemory
-        )
-        .is_err());
-        assert!(
-            ensure_mutation_commit_fence_for_profile(AuthorizationReadProfile::Durable).is_ok()
-        );
-        assert!(
-            ensure_mutation_commit_fence_for_profile(AuthorizationReadProfile::DbBackedMirror)
-                .is_ok()
-        );
+    // memory—v1: Construction through every profile and entry point is refused
+    // while the new root is not installed.
+    #[tokio::test]
+    async fn every_profile_construction_is_refused() {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new());
+        for profile in [AuthorizationReadProfile::SingleNodeMemory] {
+            assert!(AuthorizationReadSurface::build(
+                profile,
+                pool.clone(),
+                false,
+                false,
+                None,
+                None
+            )
+            .is_err());
+            assert!(build_authorization_read_surface(
+                profile,
+                pool.clone(),
+                false,
+                false,
+                None,
+                None
+            )
+            .is_err());
+            assert!(ensure_authorization_read_surface(
+                profile,
+                pool.clone(),
+                false,
+                false,
+                None,
+                None
+            )
+            .is_err());
+        }
+        assert!(authorization_read_surface().is_none());
+    }
+
+    // memory—v1: A retired request handle (constructible only inside this
+    // module) refuses every authorization call.
+    #[tokio::test]
+    async fn retired_request_refuses_every_authorization_call() {
+        let request = AuthorizationReadRequest {
+            _no_installed_root: (),
+        };
+        let context = PolicyContext::builder().action("read".into()).build();
+        let evaluation = request
+            .evaluate_with_admission(&PolicyEngine::new(), &context)
+            .await;
+
+        assert!(!evaluation.decision.allowed);
+        assert!(evaluation.admission().is_none());
+        assert!(matches!(
+            request
+                .resolve_ownership("resource", "/", "GET", None, None, None)
+                .await,
+            ResourceOwnershipResolution::Unavailable { .. }
+        ));
+        assert!(request
+            .check_sod(&context, &evaluation.decision)
+            .await
+            .is_err());
+        assert!(request.ensure_current().is_err());
+        assert!(request.ensure_mutation_commit_fence().is_err());
     }
 }

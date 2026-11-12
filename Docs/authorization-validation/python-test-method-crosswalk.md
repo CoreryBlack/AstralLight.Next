@@ -6,7 +6,7 @@
 
 ## 总体结论
 
-- 历史 Python unittest 库存为 25 模块、622 方法，来源方法与分区保持不变。2026-10-24 的审查曾登记 621 EQUIVALENT、1 PARTIAL；该历史计数不再代表 CURRENT V6 的覆盖结论。CURRENT V6 当前清单为 599 EQUIVALENT、9 PARTIAL、0 BLOCKED、14 RETIRED，合计 622；各行状态以本表为准，执行数量和结果以对应 Cargo 日志与唯一任务证据为准。
+- 历史 Python unittest 库存为 25 模块、622 方法，来源方法与分区保持不变。2026-10-24 的审查曾登记 621 EQUIVALENT、1 PARTIAL；旧引擎退役后当前清单为 596 EQUIVALENT、12 PARTIAL、0 BLOCKED、14 RETIRED，合计 622。该统计仅描述历史方法与现存离线测试的映射，不代表 memory-v1 运行覆盖或测试通过；各行状态以本表为准。
 - Redis profile、Redis adapter/command、执行协议 selector 和 Python 日志过滤器的正向合同已经退役；拒绝旧配置、SQL 只读、原生有界日志采集/过滤/脱敏及 UNKNOWN 状态保留为当前 Rust 断言。旧能力删除不计为等价迁移。
 - `test_actor_switching_roles_and_cards` 仍为 PARTIAL；fake、受限本机子进程及 parser/reducer 断言均不证明真实依赖、HTTP campaign 或三节点部署通过。
 - 已删除的 `experiments/tdsc/protocol-runner/test_run_performance.py` 以基线 `62b434937270352d54ea70c9be7081d616099b24` 的 Git blob `53839fda51d4fe8888da598810b7e75ffb5b18a7` 固定十个历史方法名；库存由 Rust guard 保存，当前独立统计 parser 测试只运行 `tdsc_performance.rs`，不恢复旧 runner。
@@ -610,7 +610,7 @@
 |---|---|---|
 | `test_register_validates` | `experiment_register.rs::tests::registry_pins_stimulus_canary_capture_and_acceptance_surfaces` | EQUIVALENT：registry consistency。 |
 | `test_stimulus_classes_complete_and_revocation_class` | `experiment_register.rs::tests::registry_pins_stimulus_canary_capture_and_acceptance_surfaces` | EQUIVALENT：刺激类型集合/revocation metadata。 |
-| `test_e2_controls_cover_every_runtime_switch_premise` | `experiment_register.rs::tests::registry_links_every_runtime_e2_premise_to_a_native_rust_test` | EQUIVALENT：E2 premise 和 Rust test link。 |
+| `test_e2_controls_cover_every_runtime_switch_premise` | `experiment_register.rs::tests::registry_distinguishes_retired_e2_controls_from_existing_tests` | PARTIAL：历史 E2 登记保留；两项旧引擎控制已退役，不代表新版运行覆盖。 |
 | `test_canary_ground_truth_fixed_by_construction` | `experiment_register.rs::tests::registry_pins_stimulus_canary_capture_and_acceptance_surfaces` | EQUIVALENT：检测/误阻断率固定。 |
 | `test_dependency_fault_matrix_is_full_cross_product` | `dependency_profiles.rs::tests::every_fault_dependency_and_matrix_entry_is_explicit` | EQUIVALENT：profile-filtered dependency×fault timing rows。 |
 | `test_capture_and_acceptance_tables_present` | `experiment_register.rs::tests::registry_pins_stimulus_canary_capture_and_acceptance_surfaces` | EQUIVALENT：capture/acceptance field inventories。 |
@@ -750,9 +750,9 @@
 | `test_e5_complete_passing_report_passes` | `model_acceptance.rs::tests::full_contract_checks_identity_modes_counts_status_and_omissions` | EQUIVALENT：完整报告 PASS。 |
 | `test_exit_zero_without_expected_marker_is_fail` | `campaign.rs::tests::model_dependency_and_required_output_acceptance_keep_contract_boundaries` | EQUIVALENT：marker/postcondition 必须出现。 |
 | `test_checksum_verifier_detects_artifact_tampering` | `readiness_contract.rs::tests::checksum_manifest_detects_tampering_bad_lines_and_path_escape` | EQUIVALENT：篡改检测。 |
-| `test_every_modeled_premise_maps_to_exactly_one_executed_command` | `experiment_register.rs::tests::registry_links_every_runtime_e2_premise_to_a_native_rust_test` | EQUIVALENT：5 个 runtime premise + host_mediation 完整覆盖 E5 premises；每个 premise/test id 唯一一次映射。 |
-| `test_each_e2_command_targets_a_real_test_with_an_exact_marker` | `experiment_register.rs::tests::registry_links_every_runtime_e2_premise_to_a_native_rust_test` | EQUIVALENT：每个 E2 rust_test 均能在 astral-db/policy-engine 源中找到对应 `fn`，且注册表登记于 campaign 源。 |
-| `test_host_mediation_has_no_claimed_omission_command` | `experiment_register.rs::tests::registry_links_every_runtime_e2_premise_to_a_native_rust_test` | EQUIVALENT：host_mediation 仅存在于 model-only premises，E2 premise/test id 均不含 host。 |
+| `test_every_modeled_premise_maps_to_exactly_one_executed_command` | `experiment_register.rs::tests::registry_distinguishes_retired_e2_controls_from_existing_tests` | PARTIAL：历史 premise 映射保留，两项旧引擎命令已退役。 |
+| `test_each_e2_command_targets_a_real_test_with_an_exact_marker` | `experiment_register.rs::tests::registry_distinguishes_retired_e2_controls_from_existing_tests` | PARTIAL：三项旧数据库测试仍存在；两项旧引擎测试已退役，不再声称所有命令可执行。 |
+| `test_host_mediation_has_no_claimed_omission_command` | `experiment_register.rs::tests::registry_distinguishes_retired_e2_controls_from_existing_tests` | EQUIVALENT：host_mediation 仅存在于 model-only premises，历史 E2 premise/test id 均不含 host。 |
 
 <!-- python-source: Docs/authorization-validation/archive/python-tests/test_tenant_isolation_model.py -->
 ### `test_tenant_isolation_model.py`（8）

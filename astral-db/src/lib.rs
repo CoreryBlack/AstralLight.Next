@@ -76,6 +76,7 @@ pub mod local_message_repository;
 pub mod local_projection_bus;
 pub mod local_projection_snapshot;
 pub mod memory_projection_hub;
+pub mod memory_v1_candidate_loader;
 mod migration;
 mod mq_idempotency_repository;
 

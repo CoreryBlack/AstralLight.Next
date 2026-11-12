@@ -228,6 +228,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -3347,6 +3348,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "astral-authorization-root",
  "astral-types",
  "async-trait",
  "criterion",

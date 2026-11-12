@@ -1,13 +1,15 @@
 # Rust 后端编码规范 V1.0
 
-> 版本：1.4.0
-> 日期：2026-10-28
+> 版本：1.5.0
+> 日期：2026-11-12
 > 状态：当前软件合同；运行时验收单列
 > 适用范围：AstralLight Rust workspace 中所有 Rust crate
 >
 > CURRENT V6 合同：正式授权只经 `PolicyEngine::evaluate()` 和 published-evidence strict gate；`RuleRepository` 是四个无默认实现的 required read port（§7.2），projection 唯一执行协议为 `WorkerOwned`（§15.5）。Redis runtime/compatibility surface 已从当前合同移除；进程本地 L1 必须有 TTL、容量和清理边界，cache miss/failure 只回到严格 DB reader 或 `PENDING`/`DENY`，不声称等价替代跨实例性能或 Redis 指标。`astral-cache` crate/source/standalone manifest/lock/test surface 已退出当前软件合同；不得将其视为保留的 archive，也不得据此声称数据库表或外部环境已清理。旧 head/outbox 不再作为授权完成证明，仍用于 source correlation、revoke / RuleSet 初始化关联、ELIGIBILITY L1 invalidation 等明确职责；不据此声明数据库表已删除或任何环境已迁移。CURRENT V6 的完整授权 bundle 与采用、迁移和回退边界见 §§15.7–15.8。本文为工程规范；架构解释和证据索引见 [Rust访问控制总览与调整路线](../架构/Rust架构设计/Rust访问控制总览与调整路线_V1.0.md) 与 [Rust权限投影快照与版本栅栏](../架构/Rust架构设计/Rust权限投影快照与版本栅栏_V1.0.md)。
 >
 > 源码、历史迁移与验收状态须分别举证。`astral-chat` 与 `astral-learn` 生产 runtime crates 已退役并从 checkout 物理移除；历史 v3 migration 文件名、字节、migration ID、SQLx checksum 与既有经验报告保持原样。文档中的 V6 adoption notice 不表示目标数据库、Redis/MQ 资源或任何部署环境已经修改。
+>
+> **memory-v1 单机合同及适用范围（2026-11-12）**：`memroy-v1` 分支的新数据库和单机内存权威按 §15.10 开发与采用。本文中 CURRENT V6/V7 的 published-evidence、四个旧读口、WorkerOwned、source/admission、单机写前门、旧数据结构及其迁移条款只约束相应旧路径，不是 §15.10 的默认协议；分布式 V7 合同不因本条改变。通用认证、租户隔离、唯一引擎、注册表、安全、审计、测试和 Agent 执行门禁继续适用。不得仅用配置名称、跳过旧检查或混接组件宣称采用 §15.10；当前候选尚未完成该合同和生产验收，不得用于正式 ALLOW 或开放生产 listener。
 
 ## CURRENT V6 验收边界
 
@@ -32,6 +34,8 @@
 
 ### 2.1 Crate 职责
 
+下表主要描述现有 V6/V7 职责；memory-v1 单机目标及依赖方向按 §15.10 和该节模块职责执行，不将表中旧投影或 MQ 实现视为新版必需依赖。
+
 | Crate | 类型 | 职责 |
 |-------|------|------|
 | `astral-types` | 库 | 共享类型、实体、错误模型、资源注册表。不依赖任何外部基础设施 |
@@ -44,7 +48,11 @@
 | `astral-identity` | 二进制 | 身份认证服务：登录/注册/JWT 签发/用户管理/卡片管理/MFA |
 | `astral-trustgraph` | 库+二进制 | 权限治理中心：规则管理/规则集/审批/审计/新授权投影 |
 | `astral-monitor` | 库+二进制 | 监控与告警服务：健康检查/指标/告警规则 |
-| `astral-single-node` | 二进制 | 单机组合进程运行时：同进程装配 Gateway/Identity/MQ/TrustGraph（单机降级形态） |
+| `astral-single-node` | 二进制 | 单机组合进程运行时：装配服务；memory-v1 的目标是创建唯一共享根 owner 并注入所需能力（§15.10） |
+| `astral-authorization-root` | 库 | memory-v1 的独立共享授权根候选；目标职责及尚未完成的采用条件见 §15.10 |
+| `astral-authority` | 库 | V7 分布式 authority 协议与能力；不是 memory-v1 单机默认依赖 |
+| `astral-sdk-contracts`、`astral-sdk`、`astral-sdk-axum` | 库 | SDK 接入合同、客户端与 Axum 适配；不替代服务端授权 |
+| `tests-suite`、`test-harness` | 测试/工具 | 分类 Rust 测试与测试编排；不拥有运行时授权权威 |
 | `e2e-bootstrap` | 二进制 | e2e 实验隔离启动入口 |
 
 
@@ -272,6 +280,8 @@ let sql = format!("SELECT * FROM rule_set WHERE name = '{}'", name);
 
 ### 7.2 Repository 模式
 
+本节以下四个 required port 及 published-evidence 合同适用于 CURRENT V6/V7 旧路径；memory-v1 的正式读口及一致性合同按 §15.10，不能将旧 port 数量或旧证据结构强行映射为新版前提。
+
 正式权限读取由 `policy_engine::RuleRepository` 的四个无默认实现方法约束，生产实现位于 `astral-db::SqlxRuleRepository`。它们分别校验卡上下文、读取活动 GlobalAdmin 事实、加载完整 published card authorization 和读取 ORG_SCOPE 权威状态；正式 `PolicyEngine::evaluate()` 无 capability marker、fallback 阶段或兼容 reader。缺少 current pointer、V6 manifest/segment seal、scope、lineage、generation、revoke-fence proof、最终复读或组织授权证明时只能 `PENDING`/`DENY`。旧 `authorization_projection_head/outbox` 不构成 canonical publication proof，仍可能用于 source correlation、revoke / RuleSet 初始化关联及 ELIGIBILITY L1 invalidation；本文不主张数据库表已删除。
 
 旧 snapshot、raw-source、consistency-oracle 和 realtime Arbiter 入口不再属于当前 formal authorization surface。Published diagnostics 与 simulation 若存在，仅作非授权用途并须与 formal evaluate 隔离；不得作为读取端口注入 `RuleRepository` 或提供 ALLOW。
@@ -280,6 +290,8 @@ Rust 0.x 内部 API 下线须同步仓内调用方、测试和文档，并在变
 
 
 ### 7.3 事务规范
+
+以下 source、canonical publication 和 WorkerOwned 条款适用于 CURRENT V6/V7 旧路径。memory-v1 的内存原子生效与 MySQL 持久化分离，按 §15.10 实施；所有 profile 的数据库操作仍须保持适用事务边界，不得把网络操作放入数据库事务。
 
 - 使用 `sqlx::Transaction` 或 `pool.begin().await?`
 - source mutation 的必要 source 写入、grant revision/delta event、需要的 source-correlation head/outbox（含 revoke / RuleSet 初始化关联、ELIGIBILITY L1 invalidation）与 audit correlation 必须在同一短事务提交；事务内不访问网络/MQ/缓存。此描述不代表旧表删除
@@ -1075,6 +1087,8 @@ CURRENT V6 不定义 Redis L2 分发、HMAC/MAC cache protocol 或跨卡共享 R
 
 ### 14.9 文档注释
 
+以下 `evaluate` 示例描述 CURRENT V6 旧路径；memory-v1 的文档注释应准确描述 §15.10 的共享根读取和最终复核，不复制旧 published evidence 作为新版前置。
+
 ```rust
 /// PolicyEngine 生产授权入口
 ///
@@ -1101,7 +1115,7 @@ pub async fn evaluate<R: RuleRepository>(&self, ctx: &PolicyContext, repo: &R) -
 - crate 根必须有模块级文档（`//!`）
 - 复杂逻辑必须注释说明意图
 - **单机内存权威实验 `memory—v1` 标记**：以 `main` 为旧基线；本实验每次新增或改造方法时，在该方法紧邻声明的注释中标注精确文本 `memory—v1`（使用 U+2014，Rust 公共方法可放在已有 `///` 文档注释中，内部方法可用 `// memory—v1`）。已有标记不重复添加；保留其他必要的文档、属性和说明。标记仅说明该方法已纳入实验基线，不证明实现完整、安全、接线或验收，也不代表整个文件已迁移。此前代码不因本条自动追溯标记，实际修改时再标记。
-- **实验与旧基线关系**：实验设计吸收适用的先进概念，按内存权威目标定义新方法，不以兼容旧方法、旧授权发布协议或旧内部实现为目标。需要迁移旧数据或变更已受保护的公开接口时，仍按适用数据合同、迁移和 API 门禁单独处理；本条不撤销 `AGENTS.md` 执行门禁、现行生产授权合同或适用规范的采用前置。
+- **实验与旧基线关系**：`main` 为旧基线，memory-v1 使用全新数据库和新模型，不以兼容旧数据库、旧数据、旧方法或旧授权发布协议为目标，不迁移旧数据；旧系统只供概念与技术参考。不得据此删除、覆盖旧库或绕开稳定公开 API、跨仓、外部协议的适用变更门禁。旧生产路径继续遵循自身合同；新版遵循 §15.10 与 `AGENTS.md` 执行门禁，合同登记不代表采用验收。
 
 ---
 
@@ -1149,7 +1163,7 @@ Historical comparative Redis fixtures and empirical reports may remain if isolat
 
 ### 15.4 单机内存读写生命周期、SoD 与审计边界
 
-本节记录需要保留的安全语义，不声称真实环境已完成验收。
+本节记录 CURRENT V6/V7 旧路径的安全语义，不声称真实环境已完成验收。memory-v1 的资格、SoD、审计和失效语义按 §15.10 单独实现并验证，不据此放弃这些业务边界。
 
 - **失效传播**：单机使用有界 LocalBus/LocalProjectionBus；多机可使用 Rabbit durable transport、exact inbox、application proof、confirm/ACK、DLX、水位和 suspect 门。不得宣称异常回退等于跨实例零窗口或测试通过等于部署验收。
 - **正式 evidence 内存化**：只复用完整严格校验的 published 状态；aggregate、generation/dependency/fence/read-gate、source/health token 与有效期均须满足。DB/source guard、COMMIT 证明、opaque fence 与最终复读保持原有边界；取消或 UNKNOWN 关闭 authority read，必须先对账。缓存只能是有界进程本地 L1，TTL/容量/GC 耗尽不得将缺失状态转成完整证据。
@@ -1165,6 +1179,8 @@ Historical comparative Redis fixtures and empirical reports may remain if isolat
 
 
 ### 15.5 聚合发布 ownership 与请求完成等待（唯一 `WorkerOwned` 协议）
+
+本节适用于采用该 projection 发布协议的旧 V6/V7 路径；§15.10 的 memory-v1 单机内存生效不依赖旧 projection 发布。
 
 `WorkerOwned` 是唯一 projection execution protocol。`ASTRAL_PROJECTION_EXECUTION_MODE` selector、`legacy-hybrid` mode、hybrid fallback、request-side claim/release、synchronous publisher targets 和其 configuration/API surfaces 均移除；不得新增 hot mixed mode。`TenantSerial` 与 `Partitioned` 是独立 topology choices，并保留各自既有默认值；ORG_SCOPE 的 default-off 状态与租户范围不因 topology 改变。配置/拓扑不是 source authorization mutation，也不执行 migration。
 
@@ -1406,6 +1422,8 @@ key registry 固定启动 trust root；rotation 由受信任根授权，新 sign
 
 #### 15.9.5 单机共享根与本地双次新鲜度合同（2026-11-11）
 
+本节为保留 canonical publication 的 V7 单机 profile；不适用于 §15.10 的 memory-v1 新数据库和内存先生效协议。不能将两个 profile 的读口、提交或恢复步骤拼装为未定义的新协议。
+
 本 profile 仅适用于 Identity、TrustGraph 与 PolicyEngine 在同一受监督进程中共享唯一 `astral-authorization-root` owner、且所有影响授权的写者均受该 owner 写前门约束的单机部署。它不提供跨进程、多机、数据库回滚或恶意数据库管理员的分布式一致性保证，也不把本地 hash 称作 quorum proof。不能证明唯一 owner、写者覆盖或环境假设时不得采用该 profile；§§15.9.1–15.9.4 的分布式合同保持不变。当前该 profile 尚未实现或验收，登记设计不能开启生产 listener。
 
 - **完整根与安装**：关闭读门，从单一 MySQL InnoDB 一致性快照有界采集完整身份、双卡、租户、CARD 发布链及 grant、ORG、资源归属、资格、SoD 和限制性配置，校验字段、租户关系、来源、有效期、条件及 scope 覆盖；空集合只有在完整范围已证明时才可表示不存在，未加载、未覆盖和不可验证均为 PENDING。保留 canonical durable publication 及 source/audit correlation，不以 source 原始行、候选 hash 或 ACK 代替发布证明。对账 source、未决 operation、撤权、发布指针、资格、配置及必需 owner；从对账至原子安装持有有效写入和健康栅栏。变化或 UNKNOWN 时保持关闭并重建，不以不同 scope generation 的最大值冒充根版本。
@@ -1413,6 +1431,60 @@ key registry 固定启动 trust root；rotation 由受信任根授权，新 sign
 - **时间与线性化**：最终检查必须与影响该 scope 的写前关门在同一互斥或等价原子协议下线性化；关门之后不得提交依赖旧根的新 ALLOW。有效期、条件和限制性策略需以决策时可信时间及请求上下文判断；等待期间跨越有效窗口、时钟异常或无法证明结果仍有效时重新评估或拒绝，版本/hash 相等不能冻结时间。决策线性化不自动保护之后的业务写入；受保护业务副作用继续遵循与实际事务提交绑定的一次消费 admission/fence 合同。
 - **写入和恢复**：所有影响授权、资格、资源归属和限制性配置的 HTTP、后台、批量、仓储及数据库写者，在 source COMMIT 前关闭完整影响范围；不能证明范围时关闭全局。以数据库身份和权限限制绕过者，异步审计/检测只用于发现和恢复，不能消除提交至发现间的陈旧窗口。source 短事务、已有 reservation/admission-use、审计关联、已证明 COMMIT、WorkerOwned durable publication 或资格/配置独立完成均继续适用；新根完成对账和原子安装后才开门。缺失上下文时受影响范围关闭，由 manager 在受控重建阶段读取 MySQL、补齐并验证；正式请求不得通过 SQL miss 补查直接 ALLOW。取消、UNKNOWN、owner 失效或崩溃保持关闭，按稳定 operation 对账，重启冷加载并告警检查可能尚未生效的近期变更。
 - **资源与验证**：对输入、根及候选、旧读者、并发构建、读取/构建时间和进程总内存设置可执行上限；预算耗尽不得截断后当作完整根。Rust 测试覆盖完整性与已证明不存在、租户及时间边界、F0/F1 与写门竞态、全部写者覆盖、取消/UNKNOWN、重建、资源预算与崩溃恢复。真实 MySQL 快照和并发、旁路写限制、消息/worker 与部署恢复需独立证据；未验证不计 PASS。
+
+<a id="1510-memory-v1-单机内存权威合同2026-11-12"></a>
+
+### 15.10 memory-v1 单机内存权威合同（2026-11-12）
+
+#### 15.10.1 适用范围与数据模型
+
+本合同适用于新建数据库、单个受监督进程、唯一授权根 owner 的 memory-v1 profile；它是本实验分支的目标开发合同，不证明任何现有服务、schema 或 listener 已采用。`main` 和当前实验代码仅供技术参考，不兼容旧数据库、旧数据及旧授权结构，不迁移旧数据；实际建库或部署须另行满足执行门禁，不能据此删除或覆盖旧库。自本次分支变更起，V6/V7 授权读面不再作为本分支可采用运行配置；旧代码仍在时不得混用其证据、source 写入或发布机制冒充本合同的实现。
+
+**BREAKING CHANGE `memory-v1-retire-legacy-read-20261112`**（2026-11-12 起本分支生效）：本次删除面为 `ASTRAL_AUTHORIZATION_READ_PROFILE` 的 `durable`、`db-backed-mirror`、`certified-memory` 配置入口，`AuthorizationReadProfile` 的对应三个枚举值及其 `uses_certified_memory`、`uses_memory_authority`、`is_single_node_memory`、`sessions_remain_durable` 辅助方法，`AuthorizationReadSurface` 的三个旧变体与旧请求分派，以及单机进程的 `CertifiedMemoryComposition`。默认改为 `single-node-memory`，旧配置显式拒绝；保留的读面类型当前不可构造，builder 和 listener 均拒绝。`install_authorization_read_surface` 改为返回 `Result` 并拒绝安装。
+
+旧 `PolicyEngine.evaluate`、`evaluate_with_admission` 和 `simulate` 保留签名，但不再读取 `RuleRepository`，统一返回 `AUTHORIZATION_PENDING`、无 admission；删除 V6/V7 的 formal evaluator、published evidence matcher、ORG admission 执行链及其专属测试和基准。删除的公开方法 `PolicyEngine::evaluate_fallback` 无仓内调用方；现阶段通过 `PolicyEngine::authorization_pending` 返回拒绝，不能以此作为未来根完整性证明。TrustGraph 的治理元能力与集成准入不再创建 SQL 规则仓储，依赖未安装的读面时保持 PENDING；操作查询的旧所有权读取暂不可用。仓内调用方、源码守卫和测试编目须随本变更同步迁移；外部使用上述类型、方法或依赖旧模拟/性能行为的消费者须停止使用并迁移至未来的 memory-v1 根合同。
+
+替代目标为唯一 memory-v1 共享根与 `PolicyEngine.evaluate()`；根构建、规则语义和正式鉴权尚未完成，所有依赖 listener 的服务因此不可用。其他 V6/V7 仓储、投影、写者、测试和公共 port 仍有残留，不能宣称旧代码已全量清空。切换前停止旧进程并核对调用方、请求与已启动变更；新库按新版合同另建，不迁移或删除旧库数据。回退只能在停止新旧进程、对账进行中和未知操作后恢复切换前的软件与其匹配数据和配置，重新执行其原安全门禁；不得混跑、将旧证据伪装为新版根或用旧快照直接放行。本条不证明部署、数据迁移或生产验收。
+
+身份卡每人一张且与租户无关，用户卡是具体用户在具体租户的授权载体；租户可分层表示公司、部门、组，但组织关系、同事关系、角色或身份卡不自动生成授权。每项实际用户卡绑定须经有权人员明确确认并可追溯；普通请求不逐次人工确认。取消独立 domain、等级、卡模板和模板规则作为新版授权模型。`BASE`/`OVERLAY` 是卡与规则集的绑定层；`OVERLAY` 可追加允许或明确拒绝对应 BASE 权限。精确匹配、冲突、确认有效范围与其他来源语义未冻结，不能自行填补缺失语义放行。
+
+`astral_types::memory_v1::MemoryId` 仅定义新版候选标识的底层编解码：16 字节依 UUID 网络字节序（文本十六进制从左到右）原样保存；字符串及 Serde 表示严格使用 36 个 ASCII 字符的小写 `8-4-4-4-12` 连字符 UUID，拒绝其他表示，不限制 UUID 版本或变体。全零字节按原值保留，不能据此认定身份存在、有效或拥有权限；生成、生命周期、数据库字段映射及对外协议仍须另定。该类型尚未接入既有身份结构、数据库或运行路径，不映射旧 `i64`，不表示正式协议已部署。
+
+规则集统一为 `version + content + timestamp + hash`，其中 hash 对前三项的确定性规范编码计算且不包含自身；算法、编码和版本/时间含义须在实现前冻结。规则集版本、根进程内版本和旧 publication stamp、scope generation 属不同身份域，不得互相替代。共享规则集经授权和确认修改后，在根中原子生效并立即影响其现有有效绑定，不默认逐卡重新确认；修改人的确认权限、覆盖范围与审计仍须形成可验证合同。系统接口所需的超管规则集通过普通规则和绑定表达；正常请求仍经引擎，不得用超管标记绕过。空库首次建立及失去管理权限后的恢复须单独设计并审计。
+
+#### 15.10.2 模块与受信任边界
+
+- `astral-single-node` 负责组合、创建唯一 owner、受监督生命周期和能力注入；`astral-authorization-root` 拥有完整授权事实、预建对象关系、索引及根元数据，提供一致读和受限修改能力，不能自行判断 ALLOW。全部可信消费者使用同一 owner；不同模块不得维护各自的授权根。唯一根的对象关系、共享与缺失补齐设计见 [memory-v1 单机唯一共享根设计](../memory-v1/单机唯一共享根设计.md)。仅 owner 不可克隆不足以证明进程唯一，须由构造、安装和启动检查共同约束。
+- Gateway 是外部认证事实入口，清洗客户端伪造的内部身份、双卡、租户和网关字段，构造受保护的可信上下文。下游必须验证签名、时间戳与来源，失败不得回退原始身份头。Identity 负责身份、凭证、会话及选卡/切卡流程；不得将认证或卡存在等同业务授权。
+- TrustGraph 负责规则、绑定、确认及授权治理；业务服务负责可信资源归属和业务对象。所有正式权限判断经 `PolicyEngine.evaluate()`；禁止以角色、`isSuperAdmin()`、客户端声明、直接数据库行、旧快照或缓存绕过。
+- `astral-db` 负责新版持久化及一致性快照适配；数据库不是服务期当前授权裁判。消息、监控和审计提供各自的传输、观测和记录能力，不构成第二授权权威；MQ 不是默认生效前置。模块接口、可信资源归属及其进入根的写入一致性须在实现前明确。
+- `astral-types` 承载共享语义类型；`astral-common` 承载通用配置、错误和观测基础能力，不成为授权状态 owner。SDK 合同、客户端与框架适配只传递和消费服务端合同；测试、隔离启动和编排工具不拥有运行时授权事实。各模块仅依赖职责所需的类型与能力，根不依赖 Gateway、Identity 或 TrustGraph 的具体运行时实现。
+
+#### 15.10.3 冷启动、读取和原子变更
+
+冷启动从单个 MySQL 一致性快照加载正式授权所需的完整事实与关系；校验身份、双卡、租户隔离、规则、确认、适用资源归属、资格和限制事实、引用闭合、状态、范围覆盖和资源预算。已证明不存在与未加载、未覆盖或不可验证必须区分。唯一 owner 安装完整一致状态，必需消费者持有同一权威的能力且 readiness 满足后才处理正式授权请求。冷启动假设没有绕过统一权威的有效授权写者；须核验进程、后台、批量、仓储、数据库权限及其他写入口，不能证明该假设时不得采用。此合同不新增请求与写入共用的写前开关门，也不以监控替代写者覆盖。该单机边界不承诺识别或抵御冷启动时恶意数据库管理员篡改、数据库回滚或损坏；必须清楚报告这些假设，不能将其表述为已验证的安全保证。
+
+正式受保护请求在首次需要根事实时创建一个覆盖请求生命周期的只读读者；同一组合进程内参与该请求的模块共享它，在同一读取阶段取得该请求完整一致的上下文及根实例、单调不复用的本地版本、预存内容 hash 和状态。Gateway 可先执行不依赖根的清洗与认证；未经验证的客户端参数不得扩大读取范围。请求结束、失败、取消或超时须释放请求持有的读者；请求并发、持有时间、派生任务和内存须有可执行边界。跨进程不能传递内存引用或将本合同当作多进程共享协议。具体请求生命周期见 [memory-v1 请求生命周期与共享根读取设计](../memory-v1/请求生命周期与共享根读取设计.md)。
+
+通过 `PolicyEngine.evaluate()` 判断身份、卡、租户、已确认绑定、规则、资源和适用限制。最终 ALLOW 前仅复核同一 owner 的实例、版本、预存 hash、状态及可信时间，不重复读取或重算全部内容；元数据变化、状态失效、上下文不完整或时间条件无法确认时 PENDING/DENY。内容回到原值、时钟回拨或相同时间戳也不能复用版本；重启更换实例，溢出停止正向授权。hash 的域、覆盖和确定性编码须明确，hash 本身不证明来源、覆盖或确认有效性。
+
+同一根中的获准变更须使相关事实、关系、索引和根版本/hash 对读者作为一个一致状态原子可见；中间失败、取消、冲突或未知结果不得形成部分生效。规则治理路径为 Gateway → TrustGraph → `PolicyEngine.evaluate()` → 根一致读取 → 授权通过 → TrustGraph 使用与本次授权绑定的受限能力 → 同一根原子更新。管理请求属于正式授权请求，必须将具体动作、操作者、目标范围、拟变更摘要和稳定操作标识纳入评估；TrustGraph 身份、路径、角色或超管标记不能绕过引擎。受限提交必须核对授权结果未过期、目标和摘要未替换、根版本/CAS 前提仍成立，发生重放、替换或并发冲突时拒绝提交并重新评估。其他身份、资格和资源归属写入口须登记 owner 并进入受控路径。授权检查通过后该请求生命周期中的操作可以继续；随后撤权不追溯否定该次已通过的判断，后续新请求重新授权。授权与修改之间的并发冲突、业务约束和多对象原子范围仍须制定合同并验证，不能把一次裸鉴权或读取 token 当作无限制写能力。
+
+服务期发现所需上下文未加载时，允许本次请求触发受控 MySQL 一致性读取，校验缺失范围及关系闭包，并在同一 owner 中原子补入事实、预建关系、索引、覆盖状态和根版本/hash；本次请求的同一读者须先结束使用旧阶段的并发分支，再受控进入新读取阶段，废弃旧阶段派生的授权判断及依赖，重新从根取得完整一致上下文，经引擎评估和最终复核后才可放行。已完整的后续授权请求不查 DB。DB 可能落后于内存，补齐不得覆盖内存修改或复活撤销/删除；须验证同一根实例及范围前提，不能证明安全合并时 PENDING/DENY。明确不存在、未加载、失效和不一致须区分；根失效、范围不明、容量耗尽、补齐失败或 UNKNOWN 不得作为普通缺失放行，无法限定影响范围时停止全局正向授权。具体补齐隔离、冲突及覆盖证明按 [唯一根设计](../memory-v1/单机唯一共享根设计.md) 实现并验收；数据库行本身不构成 ALLOW。持久结构共享、局部锁或其他并发机制均须证明上述语义，不要求每次更新替换整棵根，也不以两次相同元数据单独证明完整性。
+
+#### 15.10.4 持久化、审计与崩溃边界
+
+内存原子更新并确认一致后可返回成功；该成功只表示内存生效，不证明 MySQL、审计或消息已持久化。数据库目标归档从首版到最新版的完整规则集版本，已成功落盘的版本应保持可追溯；崩溃前尚未落盘的版本、授权或撤权可能丢失。崩溃后从 MySQL 最新一致性快照重新冷加载，不主动回放未落盘内存操作；不得承诺跨崩溃保留成功撤权。通过实际可用的持久审计、进程监督或启动检查提示用户检查最近授权变更；不能保证每次崩溃均有记录或据此自动恢复丢失事实。
+
+持久化队列、操作身份、顺序、版本缺口、重试及未知结果对账、失败通知、确认与版本外键顺序、审计记录和恢复流程须在采用前单独定义并验证。ACK、HTTP 成功或内存状态不能作为持久化证明；有 durable 副作用的重试仍受 `AGENTS.md` 的稳定身份、幂等和对账门禁约束。授权变更、敏感访问及关键写入仍需适用审计关联；不能将内存成功宣传为审计已落盘。
+
+#### 15.10.5 实施和采用门禁
+
+当前九表及 HAMT/runtime 是候选，不证明完整事实、来源、规则语义或可服务状态。正式采用前必须完成：规则语法与冲突、确认与审计、资源归属/资格/SoD、会话及切卡、首次初始化、可信时间、完整冷加载清单和覆盖、全部写入口及并发、根 hash/版本、内存预算、持久化及异常提示等合同；为其实现、配置和运行状态提供可重复证据。未知语义不得通过默认 ALLOW 补齐。
+
+Rust 测试至少覆盖跨租户与双卡、显式确认及组织不继承、规则集共享更新、覆盖和缺失、并发一致读写、撤权与最终复核、有效期及异常时钟、版本不复用、hash 一致性、容量耗尽、旁路写入口、受控重建及崩溃后已落盘/未落盘区别。真实 MySQL 快照、持久化故障与启动恢复、全部写者覆盖及部署切换分别验收；未部署的 MQ 不作为该 profile 的虚构依赖，实际采用的消息组件需独立验收。单元、mock 或文档不证明外部集成成功。执行真实数据库、初始化、部署、删除或其他外部可见操作仍须满足相应审批和恢复门禁。
+
+---
 
 ## 16. 安全规范
 

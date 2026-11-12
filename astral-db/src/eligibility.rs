@@ -1368,10 +1368,9 @@ mod tests {
         }
     }
 
+    // memory—v1: Retired evaluation cannot consult legacy eligibility or evidence.
     #[tokio::test]
     async fn default_physical_eligibility_without_current_evidence_stays_pending() {
-        // The default false option means the physical ELIGIBILITY head is not a
-        // readiness requirement; it never grants permission or bypasses V6 evidence.
         assert!(!CardEligibilityCheckOptions::default().require_projection_ready);
         let repo = PhysicalPositiveWithoutEvidence::default();
         let context = PolicyContext::builder()
@@ -1391,14 +1390,14 @@ mod tests {
         assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
         assert_eq!(
             repo.card_checks.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "physical eligibility positive must be observed first"
+            0,
+            "retired evaluation must not read legacy physical eligibility"
         );
         assert_eq!(
             repo.evidence_reads
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "formal authorization must still request CURRENT V6 evidence"
+            0,
+            "retired evaluation must not read legacy evidence"
         );
     }
 

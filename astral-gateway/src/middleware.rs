@@ -64,6 +64,7 @@ const INTERNAL_AUTH_HEADERS: &[&str] = &[
 
 /// Return true for client-controlled authentication, identity, or gateway
 /// headers. The prefix checks keep newly-added security headers fail-closed.
+/// memory—v1: Classify client-controlled credentials and internal identity headers.
 pub(crate) fn is_sensitive_auth_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name == "authorization"
@@ -75,7 +76,10 @@ pub(crate) fn is_sensitive_auth_header(name: &str) -> bool {
         || name.starts_with("x-action-")
         || name.starts_with("x-permission-")
         || name.starts_with("x-gateway-")
-        || name.starts_with("x-internal-service-")
+        || name.starts_with("x-internal-")
+        || name.starts_with("x-tenant-")
+        || name.starts_with("x-resource-")
+        || name == "forwarded"
         || matches!(
             name.as_str(),
             "x-claims-version"
@@ -84,6 +88,7 @@ pub(crate) fn is_sensitive_auth_header(name: &str) -> bool {
                 | "x-template-id"
                 | "x-tenant-status"
                 | "x-original-path"
+                | "cookie"
                 | "x-perms-ref"
                 | "x-permissions-truncated"
                 | "x-org-id"
@@ -470,6 +475,7 @@ fn route_credential_policy_with_config(
     route_credential_policy_inner(method, path, configured_public_route(config, method, path))
 }
 
+/// memory—v1: Remove untrusted identity fields before authentication.
 pub async fn sanitize_internal_auth_headers(mut req: Request, next: Next) -> Response {
     let headers = req.headers_mut();
     for name in INTERNAL_AUTH_HEADERS {
@@ -488,6 +494,7 @@ pub async fn sanitize_internal_auth_headers(mut req: Request, next: Next) -> Res
 
 /// JWT 认证中间件：公共路径放行 → JWT 校验 → 租户状态拦截 → 身份头注入
 ///
+/// memory—v1：拒绝重复或不可解析的凭证头，避免公开路由将其视为匿名请求。
 /// 对齐 Java `JwtGlobalFilter.filter()`
 pub async fn jwt_auth_middleware(
     State(config): State<AppConfig>,
@@ -496,18 +503,26 @@ pub async fn jwt_auth_middleware(
 ) -> Response {
     let path = req.uri().path().to_owned();
 
-    // Step 0: CORS 预检直通
-    if req.method() == "OPTIONS" {
-        return next.run(req).await;
-    }
+    // CORS preflight is handled by the outer CORS layer. An OPTIONS request
+    // reaching authentication is a normal request and must follow route policy.
 
     // Route classification is performed before credential decoding. Unknown
     // routes are never treated as anonymous or refresh endpoints.
     let policy = route_credential_policy_with_config(&config, req.method(), &path);
-    let auth_header = req
-        .headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok());
+    let mut auth_values = req.headers().get_all("authorization").iter();
+    let first_auth = auth_values.next();
+    if auth_values.next().is_some() || first_auth.is_some_and(|value| value.to_str().is_err()) {
+        return json_error(
+            req.method().as_str(),
+            &path,
+            request_trace_id(&req),
+            401,
+            "Invalid Authorization header",
+            "UNAUTHORIZED",
+            "AUTHENTICATION_REQUIRED",
+        );
+    }
+    let auth_header = first_auth.and_then(|value| value.to_str().ok());
     let token = match auth_header {
         Some(header) => match header
             .strip_prefix("Bearer ")
@@ -705,12 +720,6 @@ pub async fn jwt_auth_middleware(
         if let Ok(v) = HeaderValue::from_str(&did.to_string()) {
             req.headers_mut()
                 .insert(HeaderName::from_static(USER_CARD_DOMAIN_ID_HEADER), v);
-        }
-    }
-    if let Some(tid) = &claims.template_id {
-        if let Ok(v) = HeaderValue::from_str(&tid.to_string()) {
-            req.headers_mut()
-                .insert(HeaderName::from_static("x-template-id"), v);
         }
     }
     if let Some(ref status) = claims.tenant_status {
@@ -986,6 +995,132 @@ fn dependency_unavailable(method: &str, path: &str, trace_id: Option<&str>) -> R
 mod tests {
     use super::*;
     use astral_common::token_contract::CLAIMS_VERSION;
+
+    // memory—v1: Exercise the real sanitizer before any identity can be injected.
+    #[tokio::test]
+    async fn sanitizer_removes_all_forged_variants_and_keeps_bearer() {
+        use axum::{middleware, routing::get, Router};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/",
+                get(|headers: axum::http::HeaderMap| async move {
+                    assert!(!headers.contains_key("x-user-id"));
+                    assert!(!headers.contains_key("x-user-future"));
+                    assert!(!headers.contains_key("x-internal-future"));
+                    assert!(!headers.contains_key("x-tenant-future"));
+                    assert!(!headers.contains_key("cookie"));
+                    assert_eq!(headers.get("authorization").unwrap(), "Bearer credential");
+                    assert_eq!(headers.get("accept-language").unwrap(), "en");
+                    StatusCode::NO_CONTENT
+                }),
+            )
+            .layer(middleware::from_fn(sanitize_internal_auth_headers));
+        let request = Request::builder()
+            .uri("/")
+            .header("X-User-Id", "one")
+            .header("x-user-id", "two")
+            .header("X-User-Future", "forged")
+            .header("X-Internal-Future", "forged")
+            .header("X-Tenant-Future", "forged")
+            .header("Cookie", "session=secret")
+            .header("Authorization", "Bearer credential")
+            .header("Accept-Language", "en")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    // memory—v1: Public and protected routes reject ambiguous credentials and bare OPTIONS.
+    #[tokio::test]
+    async fn authentication_rejects_ambiguous_headers_and_uncredentialed_options() {
+        use axum::{middleware, routing::any, Router};
+        use tower::ServiceExt;
+
+        let config = AppConfig::default();
+        let app = Router::new()
+            .route(
+                "/api/v1/auth/sessions",
+                any(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route("/protected", any(|| async { StatusCode::NO_CONTENT }))
+            .route_layer(middleware::from_fn_with_state(
+                config.clone(),
+                jwt_auth_middleware,
+            ))
+            .with_state(config);
+        let duplicate = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/auth/sessions")
+            .header("authorization", "Bearer one")
+            .header("authorization", "Bearer two")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(duplicate).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let invalid = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/auth/sessions")
+            .header("authorization", HeaderValue::from_bytes(&[0xff]).unwrap())
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(invalid).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let options = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/protected")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(options).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    // memory—v1: The outer CORS layer still answers valid browser preflights.
+    #[tokio::test]
+    async fn cors_preflight_completes_before_authentication() {
+        use axum::{middleware, routing::any, Router};
+        use tower::ServiceExt;
+        use tower_http::cors::{Any, CorsLayer};
+
+        let config = AppConfig::default();
+        let app = Router::new()
+            .route("/protected", any(|| async { StatusCode::NO_CONTENT }))
+            .route_layer(middleware::from_fn_with_state(
+                config.clone(),
+                jwt_auth_middleware,
+            ))
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods(Any)
+                    .allow_headers(Any),
+            )
+            .with_state(config);
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/protected")
+            .header("origin", "https://example.test")
+            .header("access-control-request-method", "GET")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .contains_key("access-control-allow-origin"));
+    }
 
     /// strict 判定的绑定上下文必须与 JWT claims 逐项对应；
     /// principal_kind 不可解析时映射为空串（durable 评估 fail-closed 拒绝）。

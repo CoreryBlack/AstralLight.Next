@@ -480,29 +480,6 @@ impl HamtCandidate {
         Ok(result)
     }
 
-    /// memory—v1: Replace one already supplied version row with a complete row.
-    ///
-    /// The composite version identity must already exist. Other version rows and
-    /// confirmations are retained; the original candidate retains the old row.
-    /// Changing bytes at an existing identity is only a candidate operation and
-    /// does not establish history, source consistency, or confirmation validity.
-    pub fn replace_existing_version(&self, row: RuleSetVersionRow) -> Result<Self, CandidateError> {
-        self.require_rule_set(row.rule_set_id)?;
-        if self.version(row.rule_set_id, &row.version_bytes).is_none() {
-            return Err(CandidateError::UnknownVersion {
-                rule_set_id: row.rule_set_id,
-                version_bytes: row.version_bytes,
-            });
-        }
-        self.validate_version_row(&row)?;
-        let mut next = self.clone();
-        let mut versions = next.versions[&row.rule_set_id].clone();
-        let rule_set_id = row.rule_set_id;
-        versions.insert(row.version_bytes.clone(), Arc::new(row));
-        next.versions.insert(rule_set_id, versions);
-        Ok(next)
-    }
-
     /// memory—v1: Append one complete version row without overwriting history.
     pub fn append_version(&self, row: RuleSetVersionRow) -> Result<Self, CandidateError> {
         self.require_rule_set(row.rule_set_id)?;
@@ -908,27 +885,25 @@ mod tests {
     // memory—v1: Share unaffected HAMT indexes and row allocations across local changes.
     fn version_changes_share_structure_and_preserve_old_candidates() {
         let old = candidate();
-        let mut replacement = version(10, 2);
-        replacement.content_bytes = vec![42];
-        let changed = old.replace_existing_version(replacement.clone()).unwrap();
+        let appended = old.append_version(version(10, 3)).unwrap();
         assert_eq!(old.version(id(10), &[2]).unwrap().content_bytes, vec![2, 0]);
-        assert_eq!(changed.version(id(10), &[2]).unwrap(), &replacement);
-        assert!(old.users.ptr_eq(&changed.users));
-        assert!(old.bindings.ptr_eq(&changed.bindings));
+        assert!(old.version(id(10), &[3]).is_none());
+        assert_eq!(appended.version(id(10), &[3]).unwrap(), &version(10, 3));
+        assert!(old.users.ptr_eq(&appended.users));
+        assert!(old.bindings.ptr_eq(&appended.bindings));
         assert!(old
             .bindings_by_rule_set
-            .ptr_eq(&changed.bindings_by_rule_set));
-        assert!(old.confirmations.ptr_eq(&changed.confirmations));
-        assert!(old.versions[&id(11)].ptr_eq(&changed.versions[&id(11)]));
+            .ptr_eq(&appended.bindings_by_rule_set));
+        assert!(old.confirmations.ptr_eq(&appended.confirmations));
+        assert!(old.versions[&id(11)].ptr_eq(&appended.versions[&id(11)]));
         assert!(Arc::ptr_eq(
             &old.versions[&id(10)][&vec![1]],
-            &changed.versions[&id(10)][&vec![1]]
+            &appended.versions[&id(10)][&vec![1]]
         ));
-        assert!(!Arc::ptr_eq(
+        assert!(Arc::ptr_eq(
             &old.versions[&id(10)][&vec![2]],
-            &changed.versions[&id(10)][&vec![2]]
+            &appended.versions[&id(10)][&vec![2]]
         ));
-        let appended = changed.append_version(version(10, 3)).unwrap();
         let selected = appended.with_selection(id(10), Some(&[3])).unwrap();
         assert_eq!(
             selected
@@ -964,10 +939,6 @@ mod tests {
     // memory—v1: Reject unknown or invalid incremental version operations.
     fn version_changes_enforce_references_and_row_constraints() {
         let candidate = candidate();
-        assert!(matches!(
-            candidate.replace_existing_version(version(10, 99)),
-            Err(CandidateError::UnknownVersion { .. })
-        ));
         assert!(matches!(
             candidate.append_version(version(10, 1)),
             Err(CandidateError::DuplicateVersion { .. })

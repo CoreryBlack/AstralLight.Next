@@ -13,6 +13,8 @@ mod eligibility;
 mod entities;
 mod error;
 mod grant;
+/// memory-v1 标识及其严格编解码。
+pub mod memory_v1;
 mod org_authority_proof;
 /// 组织范围（ORG_SCOPE）共享类型合同 — Phase 2 default-off（types owner 维护）。
 pub mod org_scope;

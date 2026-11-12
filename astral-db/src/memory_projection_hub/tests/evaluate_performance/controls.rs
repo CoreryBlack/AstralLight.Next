@@ -166,7 +166,9 @@ impl RuleRepository for RevokeBeforeFinal<'_> {
     }
 }
 
+// memory—v1: Historical V6 ALLOW controls are retained only for archived experiments.
 #[tokio::test]
+#[ignore = "retired V6 evaluation controls; not memory-v1 authorization evidence"]
 async fn policy_evaluate_benefit_controls_preserve_decisions_and_fences() {
     verify_controls().await;
 }

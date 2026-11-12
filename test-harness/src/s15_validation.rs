@@ -1,3 +1,15 @@
+//! Retired CURRENT V6 S15 distributed-campaign offline contract.
+//!
+//! memory—v1: the legacy CURRENT V6/V7 published-evidence execution chain was
+//! physically retired (`memory-v1-retire-legacy-read-20261112`, Rust 规范
+//! §15.10). This module preserves the historical S15 scenario/required-case
+//! identity as an archived record only. None of its cases apply to memory-v1:
+//! recorded S15 verdicts (historical or replayed) must never be counted as a
+//! memory-v1 PASS, and no live S15 campaign may be dispatched on this branch.
+//! The source guards below verify the retired execution entry stays unusable
+//! and that every formal evaluation remains fail-closed
+//! `AUTHORIZATION_PENDING` until the memory-v1 shared root completes adoption.
+
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -6,7 +18,8 @@ pub const SCENARIO_NAMES: [&str; 15] = [
 ];
 pub const MIN_FULL_ROUNDS: usize = 3;
 
-/// Current V6 S15 test topology: four servers form two database-backed halves.
+/// Historical V6 S15 test topology: four servers form two database-backed
+/// halves. Kept as archived campaign identity; it is not a memory-v1 topology.
 pub const S15_NODE_COUNT: usize = 4;
 pub const S15_HALF_COUNT: usize = 2;
 pub const S15_NODES_PER_HALF: usize = 2;
@@ -99,6 +112,11 @@ pub fn s15_topology_is_valid() -> bool {
             == S15_NODES_PER_HALF
 }
 
+/// Historical CURRENT V6 S15 live-gate prerequisite inventory, kept for the
+/// archived live-gate contract (`s15-v6-distributed-campaign`). The campaign
+/// itself stays retired on this branch: these prerequisites can never be
+/// satisfied by a memory-v1 deployment, and no live dispatch may be derived
+/// from this list.
 pub const CURRENT_S15_LIVE_REQUIREMENTS: &[&str] = &[
     "approved_deployment",
     "signed_identity",
@@ -118,6 +136,10 @@ pub const CURRENT_S15_LIVE_REQUIREMENTS: &[&str] = &[
     "split_brain_fail_closed",
 ];
 
+/// Historical CURRENT V6 S15 required-case identity, preserved verbatim for
+/// the archived campaign record. These cases describe the retired V6/V7
+/// durable projection chain; they are not memory-v1 requirements and their
+/// verdicts must not be counted as memory-v1 coverage or PASS.
 pub const S15_V6_REQUIRED_CASES: &[&str] = &[
     "S15_source_commit_exact_receipt",
     "S15_transport_identity_matches_canonical_message",
@@ -396,6 +418,7 @@ pub fn campaign_coverage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn full_verdicts() -> BTreeMap<String, String> {
         REQUIRED_CASES
@@ -518,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn test_s15_required_cases_are_current_v6_durable_recovery_contract() {
+    fn test_s15_required_cases_are_retired_v6_historical_identity() {
         assert_eq!(required_cases("S15"), Some(S15_V6_REQUIRED_CASES));
         assert_eq!(S15_V6_REQUIRED_CASES.len(), 11);
         assert!(S15_V6_REQUIRED_CASES
@@ -529,8 +552,13 @@ mod tests {
             .all(|case| case.starts_with("S15_")));
     }
 
+    /// memory—v1: the archived S15 identity and the historical chain anchors
+    /// are kept as a record only. The retired V6/V7 execution entry must stay
+    /// deleted/unusable, and the formal entry must remain fail-closed
+    /// `AUTHORIZATION_PENDING`; passing here never certifies a memory-v1
+    /// authorization capability or a live S15 campaign.
     #[test]
-    fn test_current_s15_live_gate_requires_v6_and_durable_prerequisites() {
+    fn test_retired_v6_s15_guard_old_entry_unusable_and_memory_v1_root_pending() {
         assert_eq!(S15_NODE_COUNT, 4);
         assert_eq!(S15_HALF_COUNT, 2);
         assert_eq!(S15_NODES_PER_HALF, 2);
@@ -629,17 +657,65 @@ mod tests {
             );
         }
 
-        let policy_engine = include_str!("../../policy-engine/src/engine/published.rs");
-        for anchor in [
-            "evaluate_published_card_evidence",
-            "PublishedCardEvidenceScope",
-            "AUTHORIZATION_PENDING",
+        // memory—v1 retirement guard: the legacy V6/V7 published-evidence
+        // execution entry (`engine/published.rs`, `engine/matcher_curve.rs`,
+        // `engine/ceiling_probe.rs`, `engine/decision.rs`) was physically
+        // deleted (`memory-v1-retire-legacy-read-20261112`). The old entry must
+        // stay unusable, and the formal entry must remain fail-closed
+        // `AUTHORIZATION_PENDING` until the memory-v1 shared root completes
+        // adoption (Rust 规范 §15.10). This guard never proves a memory-v1
+        // authorization capability.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        for retired in [
+            "policy-engine/src/engine/published.rs",
+            "policy-engine/src/engine/matcher_curve.rs",
+            "policy-engine/src/engine/ceiling_probe.rs",
+            "policy-engine/src/engine/decision.rs",
+            "policy-engine/src/engine/tests/org_authority.rs",
         ] {
             assert!(
-                policy_engine.contains(anchor),
-                "missing PolicyEngine anchor: {anchor}"
+                !root.join(retired).exists(),
+                "retired V6/V7 execution source must stay deleted: {retired}"
             );
         }
+        let policy_engine = include_str!("../../policy-engine/src/engine.rs");
+        assert!(
+            policy_engine.contains("memory-v1-retire-legacy-read-20261112"),
+            "missing PolicyEngine retirement marker"
+        );
+        assert!(
+            policy_engine.contains("fails closed to `AUTHORIZATION_PENDING`"),
+            "PolicyEngine must stay fail-closed pending after retirement"
+        );
+        assert!(
+            policy_engine.contains("no evaluation path can return ALLOW"),
+            "retired PolicyEngine must not offer a positive ALLOW path"
+        );
+        for retired_registration in [
+            "mod published;",
+            "mod matcher_curve;",
+            "mod ceiling_probe;",
+            "mod decision;",
+        ] {
+            assert!(
+                !policy_engine.contains(retired_registration),
+                "retired V6/V7 engine module must not be registered again: {retired_registration}"
+            );
+        }
+        let formal = include_str!("../../policy-engine/src/engine/formal.rs");
+        for anchor in [
+            "AUTHORIZATION_PENDING",
+            "legacy V6/V7 formal evaluation chain retired",
+        ] {
+            assert!(
+                formal.contains(anchor),
+                "missing retired formal-entry anchor: {anchor}"
+            );
+        }
+        assert!(
+            !formal.contains("evaluate_published_card_evidence"),
+            "retired formal entry must not keep the published-evidence evaluator"
+        );
 
         let lifecycle = include_str!("../../tests-suite/series/RQ3/native_projection_lifecycle.rs");
         for anchor in [

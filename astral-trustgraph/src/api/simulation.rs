@@ -1,64 +1,60 @@
-//! 策略模拟 API
+//! 策略模拟 API（V6/V7 旧评估路径已退役）
 //!
-//! 对应 Java `PolicySimulationController`。
-//! What-If 场景：基于卡级已发布授权 evidence 评估当前判定，并叠加假设规则
-//! （OVERLAY 语义）得到假设判定。
+//! 对应 Java `PolicySimulationController` 的 HTTP 面。历史上本模块基于
+//! V6/V7 卡级已发布授权 evidence 读取 + 统一匹配器执行 what-if 评估，并可能
+//! 返回 ALLOW；按用户授权的 V6/V7 评估与结构退役（Rust 规范 §15.8 / §15.10
+//! BREAKING CHANGE），旧评估路径已整体移除：
 //!
-//! ## 数据流（新链，旧链下线前置改造）
-//!
-//! - 主判定：卡级 published evidence（`load_diagnostic_card_evidence`，
-//!   严格 reader 单短事务内锁定当前指针并整链校验 + 卡级 lens）经统一
-//!   ALLOW-only 匹配器（`match_published_effective_grant`，与
-//!   PolicyEngine strict gate 同语义）——展示"若现在发起该请求，按当前已发布
-//!   授权将得到 ALLOW/DENY"；
-//! - 假设判定：proposed 规则按 OVERLAY 优先（首条命中即胜出），未命中回落到
-//!   当前 evidence 基线（对齐旧实现的 OVERLAY→BASE 层序）；
-//! - 旧链实现（SimulationRepo 注入旧读取器、直读旧链规则/卡规则快照表 +
-//!   旧链 head 门禁）已全部移除；仿真不再经过 `PolicyEngine.evaluate`
-//!   （避免为仿真构造完整 RuleRepository）；
-//! - evidence 不可用（NotReady/Corrupt/合同拒绝/租户缺失/scope 不符）→
-//!   判定 fail-closed DENY 并以稳定前缀呈现"新链不可用"，不 panic、不 500
-//!   （诊断端点语义）。
+//! - 不再读取任何旧 published evidence、旧快照或旧链 head 门禁，也不构造
+//!   旧 evaluate / 匹配器评估路径；
+//! - 不伪造 memory-v1 / 新版规则语义：proposed 规则不再参与任何判定；
+//! - HTTP 路径、admin 门禁与请求契约保留（`/simulation/evaluate`、
+//!   `/simulation/what-if`，`SimulationRequest` 反序列化形状不变），两个
+//!   端点恒定返回 fail-closed 的 PENDING/不可用结论（稳定前缀
+//!   `simulation:unavailable;legacy_evaluation_retired`，`allowed=false`），
+//!   绝不返回 ALLOW；
+//! - 仿真结论不是授权证据：诊断面不 panic、不 500，也不构成授权读口或
+//!   fallback；唯一授权判断入口仍是 `PolicyEngine.evaluate()`。
 
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use sqlx::MySqlPool;
 
 use astral_common::contract::ApiResponse;
 use astral_common::error::AppError;
-use astral_types::{AstralError, Effect, PolicyContext, PublishedCardAuthorization};
+use astral_types::AstralError;
 
-use crate::api::{
-    load_diagnostic_card_evidence, match_published_effective_grant, require_platform_admin,
-};
+use crate::api::require_platform_admin;
 use crate::AppState;
 
-/// What-If 模拟请求
+/// What-If 模拟请求（HTTP 请求契约保留）
+///
+/// 退役后各字段仅维持原 camelCase 反序列化形状，不再参与任何判定。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SimulationRequest {
+    /// 原契约字段：退役后仅保留"缺失即 Validation 拒绝"的原语义，不再用于
+    /// 定位任何授权证据。
     pub card_id: Option<i64>,
-    /// 请求资源 key（`type` / `type:*` / `type:id`，按 `parse_resource_key`
-    /// 语义归一）；裸 `type` 等价类型级请求 `type:*`。
+    /// 原契约字段：请求资源 key；退役后不参与任何判定。
     pub resource: String,
+    /// 原契约字段：请求动作；退役后不参与任何判定。
     pub action: String,
-    /// 请求用户（匹配器身份边界；缺省时一律不命中——与 strict gate 请求恒
-    /// 携带 user 的语义一致）。
+    /// 原契约字段：请求用户；退役后不参与任何判定。
     pub user_id: Option<i64>,
-    /// 请求 domain（携带时 grant 必须属于同一 domain）。
+    /// 原契约字段：请求 domain；退役后不参与任何判定。
     pub domain_id: Option<i64>,
-    /// 仅作 scope 一致性校验（与卡权威租户不符 → scope-mismatch fail-closed）；
-    /// 不是授权事实，匹配器租户一律取证据的权威租户。
+    /// 原契约字段：请求租户；退役后不参与任何判定。
     pub tenant_id: Option<i64>,
-    /// 目标资源属主（请求兼容保留；已发布 evidence 的生效集合为无条件 ALLOW，
-    /// 匹配器不消费 owner 条件）。
+    /// 原契约字段：目标资源属主；退役后不参与任何判定。
     pub resource_owner_id: Option<i64>,
+    /// 原契约字段：假设规则；退役后不参与任何判定（不伪造新版规则语义）。
     pub proposed_rules: Vec<ProposedRule>,
 }
 
+/// 原假设规则请求契约（保留反序列化形状；退役后不参与任何判定）。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProposedRule {
@@ -67,7 +63,7 @@ pub struct ProposedRule {
     pub action: String,
 }
 
-/// 模拟结果
+/// 模拟结果（HTTP 响应契约保留；退役后恒为 PENDING/不可用结论）。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SimulationResult {
@@ -76,6 +72,8 @@ pub struct SimulationResult {
     pub would_change: bool,
 }
 
+/// 单条模拟判定（响应契约保留；退役后 `allowed` 恒为 false，`reason` 携带
+/// 稳定前缀 `simulation:unavailable;legacy_evaluation_retired`）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SimulatedDecision {
@@ -85,81 +83,37 @@ pub struct SimulatedDecision {
     pub evaluation_path: Vec<String>,
 }
 
-/// 归一化后的假设规则（OVERLAY 语义：首条命中即胜出，未命中回落 evidence 基线）。
-struct ProposedOverlayRule {
-    effect: Effect,
-    resource: String,
-    action: String,
-}
-
-impl ProposedOverlayRule {
-    fn from_request(rule: &ProposedRule) -> Self {
-        Self {
-            // 对齐旧实现的宽松映射：非 ALLOW 一律按 DENY 处理（fail-closed）。
-            effect: match rule.effect.to_uppercase().as_str() {
-                "ALLOW" => Effect::Allow,
-                _ => Effect::Deny,
-            },
-            resource: rule.resource.clone(),
-            action: rule.action.clone(),
-        }
-    }
-
-    /// 假设规则是否命中请求（资源/动作匹配语义与统一匹配器一致）。
-    ///
-    /// - 资源（`parse_resource_key` 语义）：类型级规则（`type:*`/裸 `type`/`*`）
-    ///   可命中同类型的对象请求；对象级规则只命中同一对象；类型级请求绝不
-    ///   命中对象级规则；
-    /// - 动作：exact → `write` 别名（write→create/update/delete）→ `'*'`。
-    fn matches(&self, resource_key: &str, action: &str) -> bool {
-        let (rule_type, rule_id) = astral_types::parse_resource_key(&self.resource);
-        let (request_type, request_id) = astral_types::parse_resource_key(resource_key);
-        let type_level_request = request_id.is_none();
-        if rule_type != request_type && rule_type != "*" {
-            return false;
-        }
-        if type_level_request {
-            if rule_id.is_some() {
-                return false;
-            }
-        } else if rule_id.is_some() && rule_id != request_id {
-            return false;
-        }
-        self.action == action
-            || self.action == "*"
-            || astral_types::get_alias_sources(action).contains(&self.action.as_str())
-    }
-}
-
 pub fn simulation_routes() -> Router<AppState> {
     Router::new()
         .route("/simulation/evaluate", post(simulate_evaluate))
         .route("/simulation/what-if", post(simulate_what_if))
 }
 
-/// POST /main/api/v1/simulation/evaluate — 基于已发布授权的 what-if 仿真
+/// POST /main/api/v1/simulation/evaluate — 已退役的 what-if 仿真
 ///
-/// 模拟接口可对任意 `card_id` 评估当前已发布授权并返回 matched_rule 与评估
-/// 路径，是对已发布授权面只读的探测面；Java 无对应实现，前端也不使用。仅
-/// 允许已验证的 ACTIVE GlobalAdmin 调用，避免普通 operator 枚举其他卡权限。
+/// memory—v1：旧 V6/V7 published evidence 评估与匹配已按用户授权退役；本
+/// 端点保留 HTTP 路径、admin 门禁与请求契约，不再读取任何授权证据，恒定
+/// 返回 PENDING/不可用结论（不返回 ALLOW，也不伪造新版规则语义）。仅允许
+/// 已验证的 ACTIVE GlobalAdmin 调用，admin 边界不放宽。
 async fn simulate_evaluate(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<SimulationRequest>,
 ) -> Result<Json<ApiResponse<SimulationResult>>, AppError> {
     require_platform_admin(&state, &headers).await?;
-    let card_id = req
-        .card_id
-        .ok_or_else(|| AstralError::Validation("card_id required".into()))?;
+    // 请求契约保留：card_id 缺失仍按原 Validation 语义拒绝；其余输入不再
+    // 参与任何判定。
+    if req.card_id.is_none() {
+        return Err(AstralError::Validation("card_id required".into()).into());
+    }
 
-    let result = simulate_one(&state.db, card_id, &req).await;
-
-    Ok(Json(ApiResponse::success(result)))
+    Ok(Json(ApiResponse::success(retired_result())))
 }
 
-/// POST /main/api/v1/simulation/what-if — 批量 What-If
+/// POST /main/api/v1/simulation/what-if — 已退役的批量 What-If
 ///
-/// 同 evaluate：对任意卡已发布授权的只读探测面，仅限已验证 ACTIVE GlobalAdmin。
+/// memory—v1：同 evaluate；保留 HTTP 路径、admin 门禁与请求契约，恒定返回
+/// PENDING/不可用结论，不返回 ALLOW。
 async fn simulate_what_if(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -168,142 +122,32 @@ async fn simulate_what_if(
     require_platform_admin(&state, &headers).await?;
     let mut results = Vec::with_capacity(req.len());
     for request in &req {
-        let card_id = request
-            .card_id
-            .ok_or_else(|| AstralError::Validation("card_id required".into()))?;
-        results.push(simulate_one(&state.db, card_id, request).await);
+        // 请求契约保留：逐条维持原 card_id 缺失 Validation 语义。
+        if request.card_id.is_none() {
+            return Err(AstralError::Validation("card_id required".into()).into());
+        }
+        results.push(retired_result());
     }
 
     Ok(Json(ApiResponse::success(results)))
 }
 
-/// 单条 what-if 仿真：主判定走已发布 evidence 匹配（与一致性巡检共享的
-/// 读取路径与统一匹配器，同一严格证据语义）。
-async fn simulate_one(
-    db: &MySqlPool,
-    card_id: i64,
-    request: &SimulationRequest,
-) -> SimulationResult {
-    // === 卡级 published evidence 门禁（fail-closed，先于任何判定） ===
-    // evidence 不可用 → fail-closed DENY + 稳定前缀"新链不可用"（诊断端点
-    // 不 panic、不 500），绝不折算成空证据伪装成"无授权"基线。
-    let evidence = match load_diagnostic_card_evidence(db, card_id).await {
-        Ok(evidence) => evidence,
-        Err(unavailable) => {
-            return unavailable_result(unavailable.code, &unavailable.detail);
-        }
-    };
-
-    // 请求租户必须与卡的权威租户一致（reader 已复核租户戳）；不一致时对齐
-    // PolicyEngine strict gate 的 scope-mismatch 语义 fail-closed。
-    if let Some(requested) = request.tenant_id {
-        if requested != evidence.tenant_id {
-            return unavailable_result(
-                "published_card_evidence_scope_mismatch",
-                &format!(
-                    "request tenant {requested} does not match card tenant {}",
-                    evidence.tenant_id
-                ),
-            );
-        }
-    }
-
-    // 评估上下文：tenant 取证据权威租户；user/domain 传入匹配器做身份边界。
-    let ctx = PolicyContext::builder()
-        .user_id(request.user_id)
-        .card_id(Some(card_id))
-        .tenant_id(Some(evidence.tenant_id))
-        .domain_id(request.domain_id)
-        .resource(Some(request.resource.clone()))
-        .action(request.action.clone())
-        .resource_owner_id(request.resource_owner_id)
-        .build();
-
-    // 当前判定：已发布 evidence 匹配（无条件生效集合；CanonicalGrant 合同
-    // 当前不含 condition 字段，resource_owner_id 仅作请求兼容保留）。
-    let current_decision = evidence_decision(&ctx, &evidence, &request.resource);
-
-    // 假设判定：proposed 规则 OVERLAY 优先（首条命中即胜出），未命中回落
-    // evidence 基线。
-    let proposed_decision = match request
-        .proposed_rules
-        .iter()
-        .map(ProposedOverlayRule::from_request)
-        .enumerate()
-        .find(|(_, rule)| rule.matches(&request.resource, &request.action))
-    {
-        Some((index, rule)) => {
-            let (allowed, effect_label) = match rule.effect {
-                Effect::Allow => (true, "ALLOW"),
-                _ => (false, "DENY"),
-            };
-            SimulatedDecision {
-                allowed,
-                reason: format!(
-                    "simulation:proposed-overlay:{}:{}:effect={effect_label}",
-                    request.resource, request.action
-                ),
-                matched_rule_id: Some(format!("proposed[{index}]")),
-                evaluation_path: vec![format!("PROPOSED_OVERLAY:{effect_label}")],
-            }
-        }
-        None => {
-            let mut decision = evidence_decision(&ctx, &evidence, &request.resource);
-            decision
-                .evaluation_path
-                .insert(0, "PROPOSED_OVERLAY:NO_MATCH".into());
-            decision
-        }
-    };
-
-    SimulationResult {
-        would_change: current_decision.allowed != proposed_decision.allowed,
-        current_decision,
-        proposed_decision,
-    }
-}
-
-/// 基于已发布 evidence 的统一匹配器判定（仿真主判定路径）。
-fn evidence_decision(
-    ctx: &PolicyContext,
-    evidence: &PublishedCardAuthorization,
-    resource_key: &str,
-) -> SimulatedDecision {
-    match match_published_effective_grant(ctx, evidence, resource_key) {
-        Some(grant) => SimulatedDecision {
-            allowed: true,
-            reason: format!(
-                "published:{resource_key}:{}:cardId={}",
-                ctx.action,
-                ctx.card_id.unwrap_or(0)
-            ),
-            matched_rule_id: Some(grant.grant_id.as_str()),
-            evaluation_path: vec!["PUBLISHED_EVIDENCE:ALLOW".into()],
-        },
-        None => SimulatedDecision {
-            allowed: false,
-            reason: format!("published:no-matching-grant:{resource_key}:{}", ctx.action),
-            matched_rule_id: None,
-            evaluation_path: vec!["PUBLISHED_EVIDENCE:DENY".into(), "DEFAULT:DENY".into()],
-        },
-    }
-}
-
-/// evidence 不可用（NotReady/Corrupt/合同拒绝/租户缺失/scope 不符）时的
-/// fail-closed 仿真结论：当前/假设判定均 DENY + 稳定前缀"新链不可用"。
-fn unavailable_result(code: &str, detail: &str) -> SimulationResult {
-    let denied = SimulatedDecision {
+// memory—v1：退役后的固定结论；当前/假设判定均为 PENDING/不可用（fail-closed
+// DENY 形态，allowed 恒为 false），不产生 would_change，绝不返回 ALLOW。
+fn retired_result() -> SimulationResult {
+    let pending = SimulatedDecision {
         allowed: false,
-        reason: format!("published:unavailable;{code};detail={detail}"),
+        reason: "simulation:unavailable;legacy_evaluation_retired;decision=PENDING".to_string(),
         matched_rule_id: None,
         evaluation_path: vec![
-            "PUBLISHED_EVIDENCE:UNAVAILABLE".into(),
-            "DEFAULT:DENY".into(),
+            "SIMULATION:LEGACY_RETIRED".to_string(),
+            "DECISION:PENDING".to_string(),
+            "DEFAULT:DENY".to_string(),
         ],
     };
     SimulationResult {
-        current_decision: denied.clone(),
-        proposed_decision: denied,
+        current_decision: pending.clone(),
+        proposed_decision: pending,
         would_change: false,
     }
 }
@@ -312,17 +156,18 @@ fn unavailable_result(code: &str, detail: &str) -> SimulationResult {
 mod tests {
     use super::*;
 
-    /// 全文件守卫（生产代码段）：旧链快照读取与旧链 head 门禁已从仿真移除，
-    /// 新链 evidence 数据通路在位。
+    /// 全文件守卫（生产代码段）：V6/V7 published evidence 评估与匹配已整体
+    /// 退役；仿真不再读取任何证据、不构造任何 ALLOW 判定路径，HTTP 路径、
+    /// admin 门禁与 PENDING/不可用结论在位。
     #[test]
-    fn legacy_snapshot_reads_are_gone_from_simulation() {
+    fn legacy_evaluation_is_gone_and_retirement_is_wired() {
         let source = include_str!("simulation.rs");
         let production = source
             .split("#[cfg(test)]")
             .next()
             .expect("test module must be separable");
 
-        // 旧链读取零残留
+        // 旧链读取零残留（保留原有安全断言强度）。
         assert!(
             !production.contains("load_snapshot_winners"),
             "legacy snapshot winner read must be gone from simulation"
@@ -335,7 +180,6 @@ mod tests {
             !production.contains("FROM permission_rule_snapshot"),
             "legacy permission_rule_snapshot table must not be read"
         );
-        // 旧链快照表名在生产代码段（含文档）零残留（对齐 sod_check.rs 守卫强度）。
         assert!(
             !production.contains("rule_set_snapshot"),
             "legacy rule_set_snapshot identifier must be gone from simulation"
@@ -361,96 +205,106 @@ mod tests {
             "simulation must not construct the legacy evaluate() path any more"
         );
 
-        // 新链数据通路在位
+        // 旧 published evidence 读取与 ALLOW 匹配器零残留（本次退役面）。
         assert!(
-            production.contains("load_diagnostic_card_evidence"),
-            "card-level published evidence read must be wired"
+            !production.contains("load_diagnostic_card_evidence"),
+            "card-level published evidence read must be gone from simulation"
         );
         assert!(
-            production.contains("match_published_effective_grant"),
-            "unified ALLOW-only matcher must be wired"
+            !production.contains("match_published_effective_grant"),
+            "unified ALLOW-only matcher must be gone from simulation"
+        );
+        assert!(
+            !production.contains("PublishedCardAuthorization"),
+            "old published evidence type must be gone from simulation"
+        );
+        assert!(
+            !production.contains("PolicyContext"),
+            "evaluation context must not be constructed by retired simulation"
+        );
+        assert!(
+            !production.contains("ProposedOverlayRule"),
+            "proposed overlay evaluation must be gone (no fabricated new-version semantics)"
+        );
+        assert!(
+            !production.contains("allowed: true"),
+            "retired simulation must never produce an ALLOW decision"
+        );
+
+        // HTTP 路径、admin 门禁与 PENDING/不可用结论在位（契约与安全守卫不弱化）。
+        assert!(
+            production.contains(".route(\"/simulation/evaluate\""),
+            "HTTP route /simulation/evaluate must be preserved"
+        );
+        assert!(
+            production.contains(".route(\"/simulation/what-if\""),
+            "HTTP route /simulation/what-if must be preserved"
+        );
+        assert!(
+            production.contains("require_platform_admin"),
+            "platform admin gate must be retained"
+        );
+        assert!(
+            production.contains("simulation:unavailable;legacy_evaluation_retired"),
+            "stable retirement prefix must be present"
+        );
+        assert!(
+            production.contains("DECISION:PENDING"),
+            "PENDING decision path must be present"
         );
     }
 
-    // ===== 假设规则（OVERLAY）匹配语义 =====
-
-    fn overlay(effect: &str, resource: &str, action: &str) -> ProposedOverlayRule {
-        ProposedOverlayRule::from_request(&ProposedRule {
-            effect: effect.to_string(),
-            resource: resource.to_string(),
-            action: action.to_string(),
-        })
-    }
-
+    /// 行为守卫：退役结论必须恒为 fail-closed DENY 形态 + PENDING 标记，
+    /// 当前/假设判定一致、不产生 would_change、不含任何 matched_rule。
     #[test]
-    fn proposed_type_level_rule_matches_object_and_type_requests() {
-        let rule = overlay("ALLOW", "permission_rule:*", "read");
-        assert!(rule.matches("permission_rule:42", "read"));
-        assert!(rule.matches("permission_rule", "read"));
-        assert!(rule.matches("permission_rule:*", "read"));
-        // 其它类型不命中。
-        assert!(!rule.matches("approval:1", "read"));
-        // 类型级请求绝不命中对象级规则。
-        assert!(!overlay("ALLOW", "permission_rule:42", "read").matches("permission_rule", "read"));
-        assert!(
-            !overlay("ALLOW", "permission_rule:42", "read").matches("permission_rule:*", "read")
-        );
-        // 对象级规则只命中同一对象。
-        assert!(
-            overlay("ALLOW", "permission_rule:42", "read").matches("permission_rule:42", "read")
-        );
-        assert!(
-            !overlay("ALLOW", "permission_rule:42", "read").matches("permission_rule:43", "read")
-        );
-        // 全局通配。
-        assert!(overlay("DENY", "*", "read").matches("anything:1", "read"));
-    }
-
-    #[test]
-    fn proposed_action_matching_supports_exact_alias_and_wildcard() {
-        // write 别名展开：create/update/delete 请求可命中 write 规则。
-        let rule = overlay("ALLOW", "permission_rule:*", "write");
-        assert!(rule.matches("permission_rule:1", "create"));
-        assert!(rule.matches("permission_rule:1", "update"));
-        assert!(rule.matches("permission_rule:1", "delete"));
-        assert!(!rule.matches("permission_rule:1", "read"));
-        // 通配动作命中任意请求动作；exact 照常命中。
-        assert!(overlay("ALLOW", "permission_rule:*", "*").matches("permission_rule:1", "read"));
-        assert!(overlay("ALLOW", "permission_rule:*", "read").matches("permission_rule:1", "read"));
-    }
-
-    #[test]
-    fn proposed_effect_normalization_is_deny_biased() {
-        // 非 ALLOW 一律按 DENY（对齐旧实现的宽松映射，fail-closed）。
-        assert!(matches!(
-            overlay("DENY", "a:1", "read").effect,
-            Effect::Deny
-        ));
-        assert!(matches!(
-            overlay("allow", "a:1", "read").effect,
-            Effect::Allow
-        ));
-        assert!(matches!(
-            overlay("bogus", "a:1", "read").effect,
-            Effect::Deny
-        ));
-    }
-
-    /// 形状守卫：unavailable 结论必须是 fail-closed DENY + 稳定前缀，
-    /// 当前/假设判定一致且不产生 would_change。
-    #[test]
-    fn unavailable_result_is_fail_closed_with_stable_prefix() {
-        let result = unavailable_result("published_card_evidence_not_ready", "pointer missing");
+    fn retired_result_is_fail_closed_pending() {
+        let result = retired_result();
         assert!(!result.current_decision.allowed);
         assert!(!result.proposed_decision.allowed);
         assert!(!result.would_change);
+        assert_eq!(result.current_decision.matched_rule_id, None);
+        assert_eq!(result.proposed_decision.matched_rule_id, None);
         assert!(
             result
                 .current_decision
                 .reason
-                .starts_with("published:unavailable;published_card_evidence_not_ready;"),
-            "unavailable reason must keep the stable prefix, got: {}",
+                .starts_with("simulation:unavailable;legacy_evaluation_retired;"),
+            "retired reason must keep the stable prefix, got: {}",
             result.current_decision.reason
         );
+        assert!(
+            result.proposed_decision.reason.contains("decision=PENDING"),
+            "proposed decision must be marked PENDING, got: {}",
+            result.proposed_decision.reason
+        );
+        assert!(
+            result
+                .current_decision
+                .evaluation_path
+                .iter()
+                .any(|step| step == "DECISION:PENDING"),
+            "evaluation path must carry the PENDING decision step"
+        );
+        assert!(
+            result
+                .current_decision
+                .evaluation_path
+                .iter()
+                .any(|step| step == "DEFAULT:DENY"),
+            "evaluation path must end fail-closed"
+        );
+    }
+
+    /// 行为守卫：退役结论确定性恒定（多次构造完全一致，无任何输入派生语义）。
+    #[test]
+    fn retired_result_is_deterministic() {
+        let a = retired_result();
+        let b = retired_result();
+        assert_eq!(a.current_decision.reason, b.current_decision.reason);
+        assert_eq!(
+            a.current_decision.evaluation_path,
+            b.current_decision.evaluation_path
+        );
+        assert_eq!(a.would_change, b.would_change);
     }
 }

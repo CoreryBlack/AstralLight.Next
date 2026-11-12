@@ -1,7 +1,7 @@
 # AstralLight Rust 项目编码规范（Agent 规则入口）
 
-> 版本：2.6.0
-> 更新日期：2026-10-27
+> 版本：2.7.0
+> 更新日期：2026-11-12
 >
 > **本文档是仓库唯一的 Agent 规则入口**。CLAUDE.md、`.trae/rules/project_rules.md`、`.trae/skills/project_rules.md` 已移除，不新增规则副本。
 > **工程规范正文的唯一规范源是 `Docs/规范/`**，其目录清单以 [`Docs/规范/README.md`](Docs/规范/README.md) 为准。
@@ -142,7 +142,9 @@
 ```
 AstralLight-Next/             # Rust workspace + Rust-specific Docs
 ├── astral-types/              # 共享类型、实体、错误模型与资源注册表
-├── policy-engine/             # 权限评估、编译内核、strict evidence gate
+├── astral-authorization-root/ # memory-v1 共享授权根候选
+├── astral-authority/          # 分布式 V7 authority
+├── policy-engine/             # 唯一授权判断入口
 ├── astral-common/             # 配置、错误、API 契约、中间件、审计与可观测性
 ├── astral-db/                 # SQLx repository、迁移、投影与证据持久化
 ├── astral-mq/                 # RabbitMQ 消息契约与传输
@@ -150,8 +152,11 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 ├── astral-identity/           # 身份、会话、JWT 与卡片管理
 ├── astral-trustgraph/         # 治理、审批、审计与授权投影
 ├── astral-monitor/            # 监控、指标与告警
+├── astral-single-node/        # 单进程组合根
+├── astral-sdk*/               # SDK 合同、客户端及 Axum 适配
 ├── e2e-bootstrap/             # 隔离启动入口
-├── testsuite/ (tests-suite/)  # 分类测试套件(多租户极限/安全前提;编目见 tests-suite/MANIFEST.toml)
+├── tests-suite/              # 分类测试套件（编目见 tests-suite/MANIFEST.toml）
+├── test-harness/             # 测试编排工具
 ├── integrations/             # 独立 SDK consumer 样例(nested workspace)
 └── Docs/                     # Rust 工程规范、架构、迁移与 schema
 ```
@@ -167,20 +172,20 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 ### 3.1 Gateway 与统一授权链路
 
 1. Gateway 是外部认证事实入口；下游只有在验证 Gateway 身份头签名、时间戳和来源后，才能信任身份字段。带有网关元数据但验签失败时必须拒绝，不得回退原始头、伪造头或客户端自带身份。
-2. Identity 负责身份/会话生命周期，TrustGraph 负责授权决策；授权唯一入口是 `PolicyEngine.evaluate()`。
+2. Identity 负责身份/会话生命周期，TrustGraph 负责授权治理；授权唯一决策入口是 `PolicyEngine.evaluate()`。
 3. 禁止角色、`isSuperAdmin()`、旧角色映射、客户端菜单或直接查询 source/snapshot 作为授权旁路。`isSuperAdmin()` 只可用于日志、审计或 UI 展示，不得用于放行。
 4. 权限采用规则/规则集模型；评估必须同时满足用户、有效 `user_card`、资源、动作和租户隔离约束，任何缺失或不一致均 PENDING/DENY。
 
 ### 3.2 双卡、租户与有效授权变更
 
 - `identity_card` 表示认证身份，每人一张；`user_card` 表示授权载体，每人可多张。两者不得混用，权限不得从旧角色映射旁路取得。
+- memory-v1 以分层租户表示组织范围，不引入独立 domain、等级或卡模板；上下级和同事关系不自动产生权限，具体绑定须由有权人员明确确认。
 - 所有有效授权读取和写入都必须带租户边界；跨租户数据、缓存键、projection 和审计关联不得相互污染。
-- **凡影响有效授权或资格的 source mutation**，必须按 aggregate contract 进入 durable source/evidence path；canonical 授权发布以 grant revision/delta、manifest/segment 与 current pointer 证明。保留的 head/outbox 只承担 source correlation、revoke / RuleSet 初始化关联及 ELIGIBILITY L1 资格缓存失效等已登记职责，不代表授权发布完成，也不意味着本次变更删除表。
-- source transaction 只覆盖必要的 source、durable correlation/outbox 和 audit correlation 写入；不得把网络、MQ、缓存操作、快照构建、重试、安装或验收放进事务。提交后由 projector/worker 处理 durable projection、进程内缓存失效、消息和审计。缓存有界 TTL/容量；缓存失败、过期或不一致不得绕过适用的 strict read gate，单机共享根按 §15.9.5 使用本地门禁。
-- `CARD` refresh 与 `ELIGIBILITY` cache eviction 是不同语义，必须分别记录、分别失效和分别验证，不得用一个事件代替另一个。
-- 正式授权路径必须同时满足 generation、dependency、`READY` 和 read-gate；任一不足、unknown、failed 或 stale 时只能 `PENDING`/`DENY`，禁止使用旧快照、source/raw 读取或缓存回退放行，不得以 ACK 代替 durable proof。
-- V7 authority 合同以 [Rust 规范 §15.9](Docs/规范/Rust后端编码规范_V1.0.md#159-v7-authority-生产协议与采用合同2026-11-07) 为准：分布式 profile 区分全局 quorum、逐 scope 证书和每次 F0/F1 proof；满足 §15.9.5 完整前置的单机共享根 profile 使用与写前关门线性化的本地版本和内容 hash 双次核对，正式请求不做 SQL miss 放行。敏感 source 提交与 durable admission、发布和恢复仍须遵循适用合同。未决提交不能因 lease 过期而重放或恢复 ALLOW；资格/配置的独立完成与已证明 rollback 的 abort 必须遵循该节的精确 durable 证据、同事务排他及历史 receipt 恢复合同，不以伪造 delta、旧 snapshot 或 HTTP 状态关闭 barrier；规范登记不代表实现或环境验收已通过。
-- CURRENT V6 不接受 native `CARD_ONLY` 输入；保留 `MANUAL`/direct-delta 的明示语义。不得自动改写旧 source 数据；如需迁移，必须使用单独批准的 offline preflight/rebuild，并保留 revoke/fence 与审计事实。正式授权仍必须经过 `PolicyEngine.evaluate()` 与 published-evidence strict gate。
+- 本分支按用户要求退役 V6/V7 授权读面，具体生效范围及保留代码见 [Rust 规范 §15.10](Docs/规范/Rust后端编码规范_V1.0.md#1510-memory-v1-单机内存权威合同2026-11-12) 的 BREAKING CHANGE；未完成物理删除不代表旧链仍获准运行。不得将旧证据、source 写入或 ACK 伪装为新版授权证明。
+- **memory-v1 单机路径**：按 [Rust 规范 §15.10](Docs/规范/Rust后端编码规范_V1.0.md#1510-memory-v1-单机内存权威合同2026-11-12) 使用新数据库和唯一共享根；冷启动预建对象关系。`PolicyEngine.evaluate()` 首次读取完整一致上下文，允许前复核根实例、版本、预存 hash、状态与可信时间。经授权的变更在同一根中原子生效；管理请求也必须经引擎评估具体动作、目标范围、变更摘要和稳定操作标识，TrustGraph、路径或超管标记不能绕过引擎，受限提交需再次核对授权绑定和根版本/CAS。服务期未加载可由本次请求触发受控查库、安全原子补入同一根后重新评估，完整后续请求不查 DB；不能证明完整或安全合并时 PENDING/DENY，SQL 行不得直接作为放行依据。旧 V7 写前门、发布链及 durable admission 不是此 profile 的默认前置。
+- memory-v1 内存一致更新后可返回成功，不证明 MySQL 或审计已落盘；崩溃从 MySQL 一致性快照重建，未落盘授权及撤权可能丢失，需按可用证据提示检查。唯一 owner、全部写者覆盖、完整上下文、并发与持久化/审计等采用条件尚须实现和验证；不得因规范登记开放正式 listener 或将候选作为授权证据。
+- 分布式 V7 和旧 V7 单机 profile 不再是本分支的目标运行模式；残留实现不构成已退役完成。不得混用 profile、伪造 durable proof 或将本地根称为分布式证明。
+- CURRENT V6 不接受 native `CARD_ONLY` 输入；保留 `MANUAL`/direct-delta 的明示语义。不得自动改写旧 source 数据；如需迁移，必须使用单独批准的 offline preflight/rebuild，并保留 revoke/fence 与审计事实。上述要求属于旧路径，不构成 memory-v1 兼容旧数据的要求。
 
 ### 3.3 规则、资源与路径
 
@@ -193,11 +198,9 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 ### 3.4 事务、投影、消息与恢复
 
 - Rust 的分层、事务、projection、消息和错误语义以 [`Rust后端编码规范_V1.0.md`](Docs/规范/Rust后端编码规范_V1.0.md) 为准；Java 专属实现不在本独立仓库范围内，本文件不复制实现正文。
-- `WorkerOwned` 是唯一授权 projection 执行协议；source transaction 只有在 COMMIT 已证明后才交付完整 receipt，请求端只能有界等待完整 receipt 批次的 exact durable completion，不能 claim、compile 或 publish。worker 必须保留 ownership、CAS lease、generation/token fence、幂等、有限重试和 UNKNOWN 对账。`TenantSerial`/`Partitioned` 是独立调度拓扑，默认值及 ORG_SCOPE 的 default-off 状态不因本次清理改变。
-- 保留的 source head/outbox 仅承担 source correlation、revoke / RuleSet 初始化关联和 ELIGIBILITY L1 失效等职责；不得把它当成 canonical 发布证明，也不得从本次 V6 文档更新推断数据库表已删除。
-- source transaction 必须保持短事务边界，只覆盖必要的 source、durable head/outbox 和 audit correlation 写入；网络、MQ/缓存、projection/快照构建、重试、安装和验收均在事务外执行。
-- 迁移必须按所在技术栈规范设计可回滚、可恢复、可重入的步骤，并完成 preflight、备份/恢复演练和 postcondition 验证后才可进入 Exec-L3。
-- 投影不一致、消息 ACK 无 durable proof 或恢复状态未知时默认 `PENDING`/`DENY`；其中因审计证据不足而触发 `PENDING`/`DENY`，仅限授权变更、敏感访问、关键写操作及 projection audit correlation。普通成功 `ALLOW` 的审计频率和是否同步由对应技术栈 Docs 决定，本文件不新增“每次 `ALLOW` 必须同步审计”的要求。
+- 本分支退役旧 V6/V7 授权 projection 运行路径；残留 WorkerOwned/source/worker 代码不得被当作 memory-v1 的授权生效链。memory-v1 的受限原子更新和持久化按 §15.10。
+- 所有 profile 的数据库事务保持必要范围，网络、MQ/缓存、重试及验收在事务外；消息 ACK 不代替 durable proof。迁移须按所在技术栈规范设计可回滚、可恢复、可重入步骤，并完成 preflight、备份/恢复演练和 postcondition 验证后才可进入 Exec-L3。
+- 适用 profile 的事实、状态或完整性未知时默认 `PENDING`/`DENY`；因审计证据不足触发 `PENDING`/`DENY` 仅限授权变更、敏感访问、关键写操作及适用的审计关联。普通成功 `ALLOW` 的审计频率和是否同步由对应技术栈 Docs 决定。
 
 ### 3.5 迁移、秘密与敏感事件
 
@@ -288,6 +291,7 @@ AstralLight-Next/             # Rust workspace + Rust-specific Docs
 | API 路径冻结清单 | [`Docs/规范/统一接口路径规范_V5.md`](Docs/规范/统一接口路径规范_V5.md) |
 | 响应、消息、ACK、trace、audit、流式协议 | [`Docs/规范/统一消息协议与智能层消息规范_2026-03-18.md`](Docs/规范/统一消息协议与智能层消息规范_2026-03-18.md) |
 | Rust workspace、projection、migration、fail-closed | [`Docs/规范/Rust后端编码规范_V1.0.md`](Docs/规范/Rust后端编码规范_V1.0.md)（文件名保留现状；正文版本以文件头和 [`Docs/规范/README.md`](Docs/规范/README.md) 为准） |
+| memory-v1 单机内存权威与采用 | [Rust 规范 §15.10](Docs/规范/Rust后端编码规范_V1.0.md#1510-memory-v1-单机内存权威合同2026-11-12)；新增或改造方法按 §14.9 标记 `memory—v1`（U+2014）。设计事实见 [`Docs/memory-v1/`](Docs/memory-v1/)；登记不代表已实现或验收。 |
 | projection、read-gate、generation 与快照版本栅栏 | [`Docs/架构/Rust架构设计/Rust权限投影快照与版本栅栏_V1.0.md`](Docs/架构/Rust架构设计/Rust权限投影快照与版本栅栏_V1.0.md)、[`Docs/架构/Rust架构设计/Rust增量重建与实时授权边界_V1.0.md`](Docs/架构/Rust架构设计/Rust增量重建与实时授权边界_V1.0.md) |
 | audit、reliability、消息恢复与审查证据 | [`Docs/规范/统一消息协议与智能层消息规范_2026-03-18.md`](Docs/规范/统一消息协议与智能层消息规范_2026-03-18.md) |
 | migration、rollback、preflight 与 acceptance | [`Docs/迁移/README.md`](Docs/迁移/README.md) |

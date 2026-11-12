@@ -610,95 +610,7 @@ fn mark_hub_suspect(reason: &str) {
     }
 }
 
-/// Owns the one provider and the root whose store will back the process-wide
-/// certified read surface. Dropping the owner closes that store before its
-/// dependencies are released, including on startup errors.
-struct CertifiedMemoryComposition {
-    provider: Arc<astral_db::SqlxAuthorizationFenceProvider>,
-    completion_coordinator: astral_db::CertifiedMemoryCompletionCoordinator,
-    root: astral_db::CertifiedMemoryCompositionRoot,
-}
-
-impl Drop for CertifiedMemoryComposition {
-    fn drop(&mut self) {
-        if let Err(error) = self.root.shutdown() {
-            tracing::error!(error = %error, "certified-memory shutdown could not be proven");
-        }
-    }
-}
-
-impl CertifiedMemoryComposition {
-    async fn new(db: &sqlx::MySqlPool) -> anyhow::Result<Self> {
-        let provider = astral_db::authority_provider_from_env(db.clone())
-            .await
-            .context("load certified-memory quorum authority provider")?
-            .ok_or_else(|| anyhow!("certified-memory requires a quorum authority provider"))?;
-        let owner_context = provider
-            .certified_memory_owner_context()
-            .context("bind certified-memory owners to the quorum provider")?;
-        let root = astral_db::CertifiedMemoryCompositionRoot::from_durable_owner_context(
-            Default::default(),
-            owner_context,
-        )?
-        .with_authority_provider(&provider)
-        .context("bind certified-memory root to the quorum provider")?;
-        let completion_coordinator = provider
-            .certified_memory_completion_coordinator()
-            .context("bind certified-memory completion coordinator to the quorum provider")?;
-        Ok(Self {
-            provider,
-            completion_coordinator,
-            root,
-        })
-    }
-
-    /// Second-stage listener gate: the same root and provider must already have
-    /// independently proven readiness before the surface can be installed.
-    fn install_serving_surface(
-        &self,
-        config: &AppConfig,
-        db: &sqlx::MySqlPool,
-    ) -> anyhow::Result<()> {
-        // Keep the post-commit coordinator attached to this exact provider. It
-        // is intentionally not invoked here: startup has no complete six-family
-        // candidate bundle, so no authority completion or ledger write is safe.
-        if self.completion_coordinator.database_id().is_empty() {
-            return Err(anyhow!(
-                "certified-memory completion coordinator has no database identity"
-            ));
-        }
-        certified_memory_startup_preflight(&self.root)?;
-        let surface = astral_db::build_authorization_read_surface(
-            config.authorization_read_profile,
-            db.clone(),
-            config.org_scope_enabled,
-            config.authority_runtime_mode.requires_authority(),
-            Some(Arc::clone(&self.provider)),
-            Some(self.root.certified_store()),
-        )
-        .map_err(|error| anyhow!("build certified-memory read surface: {error}"))?;
-        let installed = astral_db::install_authorization_read_surface(Arc::clone(&surface));
-        if !Arc::ptr_eq(&surface, &installed) {
-            return Err(anyhow!(
-                "a different authorization read surface is already installed"
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn certified_memory_startup_preflight(
-    root: &astral_db::CertifiedMemoryCompositionRoot,
-) -> anyhow::Result<()> {
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0);
-    root.require_serving(now_unix).map_err(|error| {
-        anyhow!("certified-memory profile requires complete root/runtime preflight: {error}")
-    })
-}
-
+/// memory—v1: Refuse startup until the shared root is ready for serving.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -706,12 +618,6 @@ async fn main() -> anyhow::Result<()> {
         .context("load single-node configuration")?;
     config.validate_listener_for(JwtValidationRole::Gateway)?;
     config.validate_listener_for(JwtValidationRole::Identity)?;
-    // Keep this zero-side-effect gate until worker-only startup and independently
-    // verified readiness can safely drive the real composition below.
-    if config.authorization_read_profile.uses_certified_memory() {
-        let root = astral_db::CertifiedMemoryCompositionRoot::pending(Default::default());
-        certified_memory_startup_preflight(&root)?;
-    }
     let config = Arc::new(config);
     let gateway_addr = env_or("SINGLE_NODE_GATEWAY_ADDR", DEFAULT_GATEWAY_ADDR);
     let identity_addr = env_or("SINGLE_NODE_IDENTITY_ADDR", DEFAULT_IDENTITY_ADDR);
@@ -759,29 +665,6 @@ async fn main() -> anyhow::Result<()> {
     let mut lease_supervisor = writer_lease::start_writer_lease_supervisor(lease_connection)
         .await
         .map_err(|error| anyhow!("start writer lease supervision: {error}"))?;
-
-    // This scaffold is unreachable for CertifiedMemory while the early pending
-    // gate above is in place. Do not remove that gate until the worker-only and
-    // independently verified readiness interfaces are wired into this owner.
-    if config.authorization_read_profile.uses_certified_memory() {
-        let composition = tokio::select! {
-            result = CertifiedMemoryComposition::new(&db) => result?,
-            loss = lease_supervisor.wait_for_loss() => {
-                mark_hub_suspect(&loss);
-                return Err(anyhow!("single-node writer lease lost during certified-memory composition: {loss}"));
-            }
-        };
-        // Until independently verified worker readiness, completion receipts and
-        // attestation are available, this gate fails closed before any host is
-        // spawned. It must not be replaced with caller-supplied positive proofs.
-        composition.install_serving_surface(&config, &db)?;
-        // Existing host entry points independently construct providers and do
-        // not expose worker-only startup. They cannot safely consume this root.
-        // Keep the listener gate closed until the two-phase host API exists.
-        return Err(anyhow!(
-            "certified-memory host worker readiness and shared-provider injection are unavailable"
-        ));
-    }
 
     // 预热同样处于租约监督之下：租约在预热期间丢失时立即放弃启动，绝不
     // 等预热或 readiness 完成才承认丢失（不误声明 READINESS）。
@@ -1118,28 +1001,6 @@ mod tests {
             pending_restored: 0,
         };
         assert!(require_complete_warm_report(&report).is_ok());
-    }
-
-    /// 只有完整 root/runtime preflight 成功时才允许 CertifiedMemory profile
-    /// 启动；pending 占位组合根永远无法通过 preflight，且失败路径绝不回退
-    /// Durable/DbBackedMirror，而是整体启动失败（fail-closed）。
-    #[test]
-    fn certified_memory_preflight_fails_closed_without_serving_root() {
-        let root = astral_db::CertifiedMemoryCompositionRoot::pending(Default::default());
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
-        let error = root
-            .require_serving(now_unix)
-            .expect_err("a pending composition root must never pass the listener gate");
-        assert!(matches!(
-            error,
-            astral_db::CertifiedMemoryCompositionError::NotServing
-        ));
-        assert!(certified_memory_startup_preflight(&root).is_err());
-        assert!(!root.status().positive_reads_ready());
-        assert!(!root.readiness(now_unix).positive_reads_ready);
     }
 
     #[test]

@@ -1,9 +1,14 @@
 //! PolicyEngine 评估引擎
 //!
-//! CURRENT V6 published-evidence authorization evaluator.
+//! memory—v1 单机权威 profile 的 fail-closed 正式评估入口。
 //!
-//! Evaluation is fail-closed and consumes only strict published evidence after
-//! AUTHN, CARD_CONTEXT, target ownership, ORG_SCOPE, and GlobalAdmin gates.
+//! The legacy CURRENT V6/V7 published-evidence execution chain has been
+//! physically retired (`memory-v1-retire-legacy-read-20261112`). Every formal
+//! evaluation now fails closed to `AUTHORIZATION_PENDING`; no published CARD
+//! evidence, ORG_SCOPE admission proof, GlobalAdmin lookup, or authorization
+//! fence is read, and no evaluation path can return ALLOW. Positive
+//! authorization stays reserved for the memory-v1 shared root via
+//! `PolicyEngine.evaluate()` once that contract completes adoption (§15.10).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,20 +17,19 @@ use crate::circuit_breaker::{AutoCircuitBreaker, CircuitBreakerState};
 #[cfg(feature = "performance-attribution")]
 use crate::hit_stats::AtomicBreakerAttribution;
 use crate::hit_stats::{AtomicHitStats, HitStats, TimingBreakdown};
-use astral_types::{AuthorizationAdmission, PolicyContext, PolicyDecision};
+use astral_types::{AuthorizationAdmission, PolicyDecision};
 
-mod decision;
 mod formal;
 mod ports;
-mod published;
 
 pub use ports::{
     AuthorizationFenceProvider, OrgAuthorityFenceRead, PublishedEvidenceReadMode, RuleRepository,
 };
 
 /// Result of a formal authorization evaluation plus an optional proof-bound
-/// capability. The capability is present only for a certified F1 ALLOW and is
-/// intentionally excluded from `PolicyDecision` serialization.
+/// capability. The capability is reserved for a certified positive ALLOW of the
+/// memory-v1 shared root and is intentionally excluded from `PolicyDecision`
+/// serialization. The retired legacy evaluator never produces one.
 #[derive(Debug)]
 pub struct PolicyEvaluation {
     pub decision: PolicyDecision,
@@ -33,21 +37,11 @@ pub struct PolicyEvaluation {
 }
 
 impl PolicyEvaluation {
+    /// memory—v1: Wrap a decision without a certified admission capability.
     pub fn without_admission(decision: PolicyDecision) -> Self {
         Self {
             decision,
             admission: None,
-        }
-    }
-
-    pub(crate) fn from_parts(
-        decision: PolicyDecision,
-        admission: Option<AuthorizationAdmission>,
-    ) -> Self {
-        let admission = if decision.allowed { admission } else { None };
-        Self {
-            decision,
-            admission,
         }
     }
 
@@ -65,7 +59,12 @@ pub struct PolicyEngine {
     #[cfg(feature = "performance-attribution")]
     breaker_attribution: AtomicBreakerAttribution,
     /// per-resource 断路器（对齐 Java Resilience4j per-endpoint 隔离），
-    /// key = resource_type 字符串，"__global__" 为默认兜底
+    /// key = resource_type 字符串，"__global__" 为默认兜底。
+    ///
+    /// memory—v1：旧 V6/V7 评估链退役后，评估路径不再读取任何依赖，因此
+    /// 不再产生依赖失败信号，也不再以断路器 fallback 影响正式评估；断路器
+    /// 仅作为可观测/演练组件保留（`circuit_breaker_state` /
+    /// `force_open_circuit_breaker`）。
     circuit_breakers: std::sync::RwLock<HashMap<String, Arc<AutoCircuitBreaker>>>,
 }
 
@@ -85,141 +84,37 @@ impl PolicyEngine {
         }
     }
 
-    #[cfg(not(feature = "performance-attribution"))]
-    fn breaker_for(&self, key: &str) -> Arc<AutoCircuitBreaker> {
-        if let Ok(guard) = self.circuit_breakers.read() {
-            if let Some(breaker) = guard.get(key) {
-                return Arc::clone(breaker);
+    /// 返回全局断路器状态
+    pub fn circuit_breaker_state(&self) -> CircuitBreakerState {
+        let guard = self
+            .circuit_breakers
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .get("__global__")
+            .map(Arc::as_ref)
+            .map(AutoCircuitBreaker::state)
+            .unwrap_or(CircuitBreakerState::Closed)
+    }
+
+    /// 强制打开所有断路器（仅测试用途）。memory—v1：评估结果不受断路器
+    /// 状态影响，fail-closed PENDING 与断路器状态无关。
+    pub fn force_open_circuit_breaker(&self) {
+        let guard = self
+            .circuit_breakers
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for breaker in guard.values() {
+            for _ in 0..crate::circuit_breaker::CB_THRESHOLD {
+                breaker.record_failure();
             }
         }
-        let mut guard = self
-            .circuit_breakers
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        Arc::clone(
-            guard
-                .entry(key.to_owned())
-                .or_insert_with(|| Arc::new(AutoCircuitBreaker::new())),
-        )
     }
 
-    #[cfg(feature = "performance-attribution")]
-    fn breaker_for_attributed(&self, key: &str) -> Arc<AutoCircuitBreaker> {
-        let started = std::time::Instant::now();
-        if let Ok(guard) = self.circuit_breakers.read() {
-            if let Some(breaker) = guard.get(key) {
-                self.breaker_attribution.record_map_wait(started.elapsed());
-                return Arc::clone(breaker);
-            }
-        }
-        let mut guard = self
-            .circuit_breakers
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        self.breaker_attribution.record_map_wait(started.elapsed());
-        Arc::clone(
-            guard
-                .entry(key.to_owned())
-                .or_insert_with(|| Arc::new(AutoCircuitBreaker::new())),
-        )
-    }
-
-    #[cfg(feature = "performance-attribution")]
-    fn check_circuit_breaker_attributed(&self, ctx: &PolicyContext) -> Option<PolicyDecision> {
-        let key = Self::breaker_key(ctx.resource.as_deref());
-        let resource_breaker = self.breaker_for_attributed(key);
-        let state_started = std::time::Instant::now();
-        let resource_open = resource_breaker.is_open();
-        self.breaker_attribution
-            .record_state_wait(state_started.elapsed());
-        let global_open = if key != "__global__" {
-            let global = self.breaker_for_attributed("__global__");
-            let state_started = std::time::Instant::now();
-            let open = global.is_open();
-            self.breaker_attribution
-                .record_state_wait(state_started.elapsed());
-            open
-        } else {
-            false
-        };
-        (resource_open || global_open).then(|| self.evaluate_fallback(ctx))
-    }
-    fn breaker_key(resource: Option<&str>) -> &str {
-        resource
-            .filter(|resource| !resource.is_empty())
-            .unwrap_or("__global__")
-    }
-
+    /// memory—v1：旧 V6/V7 评估入口退役后的统一 fail-closed 决策。
     ///
-    /// 自动从 Open → HalfOpen 超时恢复（30 秒），
-    /// 从 HalfOpen → Closed（成功探测时由 record_success_on_evaluate 触发）。
-    #[cfg(not(feature = "performance-attribution"))]
-    fn check_circuit_breaker(&self, ctx: &PolicyContext) -> Option<PolicyDecision> {
-        let key = Self::breaker_key(ctx.resource.as_deref());
-        let resource_breaker = self.breaker_for(key);
-        let resource_open = resource_breaker.is_open();
-        let global_open = key != "__global__" && self.breaker_for("__global__").is_open();
-        if resource_open || global_open {
-            Some(self.evaluate_fallback(ctx))
-        } else {
-            None
-        }
-    }
-
-    #[cfg(not(feature = "performance-attribution"))]
-    fn record_success_on_evaluate(&self, resource: Option<&str>) {
-        let key = Self::breaker_key(resource);
-        let breaker = self.breaker_for(key);
-        breaker.record_success();
-        if key != "__global__" {
-            self.breaker_for("__global__").record_success();
-        }
-    }
-
-    #[cfg(feature = "performance-attribution")]
-    fn record_success_on_evaluate(&self, resource: Option<&str>) {
-        let key = Self::breaker_key(resource);
-        let breaker = self.breaker_for_attributed(key);
-        let state_started = std::time::Instant::now();
-        breaker.record_success();
-        self.breaker_attribution
-            .record_state_wait(state_started.elapsed());
-        if key != "__global__" {
-            let global = self.breaker_for_attributed("__global__");
-            let state_started = std::time::Instant::now();
-            global.record_success();
-            self.breaker_attribution
-                .record_state_wait(state_started.elapsed());
-        }
-    }
-
-    #[cfg(not(feature = "performance-attribution"))]
-    fn record_failure_on_evaluate(&self, resource: Option<&str>) {
-        let key = Self::breaker_key(resource);
-        let breaker = self.breaker_for(key);
-        breaker.record_failure();
-        if key != "__global__" {
-            self.breaker_for("__global__").record_failure();
-        }
-    }
-
-    #[cfg(feature = "performance-attribution")]
-    fn record_failure_on_evaluate(&self, resource: Option<&str>) {
-        let key = Self::breaker_key(resource);
-        let breaker = self.breaker_for_attributed(key);
-        let state_started = std::time::Instant::now();
-        breaker.record_failure();
-        self.breaker_attribution
-            .record_state_wait(state_started.elapsed());
-        if key != "__global__" {
-            let global = self.breaker_for_attributed("__global__");
-            let state_started = std::time::Instant::now();
-            global.record_failure();
-            self.breaker_attribution
-                .record_state_wait(state_started.elapsed());
-        }
-    }
-
+    /// 正式评估在任何上下文下都返回 `AUTHORIZATION_PENDING`；缺失、退役或
+    /// 不一致的评估能力一律不得放行（AGENTS §3.4 默认 PENDING/DENY）。
     pub fn authorization_pending(reason: &str) -> PolicyDecision {
         PolicyDecision {
             allowed: false,
@@ -234,35 +129,12 @@ impl PolicyEngine {
         }
     }
 
-    /// 返回全局断路器状态
-    pub fn circuit_breaker_state(&self) -> CircuitBreakerState {
-        let guard = self
-            .circuit_breakers
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        guard
-            .get("__global__")
-            .map(Arc::as_ref)
-            .map(AutoCircuitBreaker::state)
-            .unwrap_or(CircuitBreakerState::Closed)
-    }
-
-    /// 强制打开所有断路器（仅测试用途）
-    pub fn force_open_circuit_breaker(&self) {
-        let guard = self
-            .circuit_breakers
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        for breaker in guard.values() {
-            for _ in 0..crate::circuit_breaker::CB_THRESHOLD {
-                breaker.record_failure();
-            }
-        }
-    }
-
     // ==================== 统计 ====================
 
-    /// 累加 CURRENT V6 evidence evaluation 的结果计数与阶段耗时。
+    /// memory—v1：记录一次 fail-closed 正式评估的结果计数与总耗时。
+    ///
+    /// 旧评估链的阶段耗时（card context / evidence load / reload / match）
+    /// 随链路退役，不再产生；快照中这些字段恒为 0。
     fn record_evaluation(&self, allowed: bool, timing: &TimingBreakdown) {
         self.stats.record(allowed, timing);
     }
@@ -296,7 +168,5 @@ impl Default for PolicyEngine {
         Self::new()
     }
 }
-#[cfg(test)]
-mod ceiling_probe;
 #[cfg(test)]
 mod tests;

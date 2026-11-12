@@ -1983,9 +1983,49 @@ exit "${FAKE_CARGO_EXIT:-0}"
         assert!(all_with_blocked
             .iter()
             .any(|suite| suite.get("blocked_reason").is_some()));
-        assert!(all_profiles
+        // memory—v1: the only blocked suites are the retired V6/V7 legacy
+        // performance records. They must never be dispatched and their
+        // historical capability must never be counted as a memory-v1 PASS;
+        // every other suite stays dispatchable with a non-empty argv.
+        let retired_legacy_suites: BTreeSet<String> = [
+            "policy-matcher-relay-performance",
+            "policy-evaluate-benefit-controls",
+            "policy-evaluate-benefit",
+            "policy-evaluate-attribution",
+            "policy-evaluate-sharing-experiment",
+            "policy-evaluate-sharing-experiment-v2",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let blocked_suites = all_profiles
             .iter()
-            .all(|suite| suite.get("blocked_reason").is_none()));
+            .filter(|suite| suite.get("blocked_reason").is_some())
+            .map(suite_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            blocked_suites, retired_legacy_suites,
+            "blocked suites must be exactly the retired V6/V7 legacy performance records"
+        );
+        assert!(all_profiles.iter().all(|suite| {
+            suite.get("blocked_reason").is_some()
+                || string_array(suite, "argv")
+                    .map(|argv| !argv.is_empty())
+                    .unwrap_or(false)
+        }));
+        for suite in all_profiles
+            .iter()
+            .filter(|suite| suite.get("blocked_reason").is_some())
+        {
+            assert!(
+                suite
+                    .get("argv")
+                    .and_then(TomlValue::as_array)
+                    .is_none_or(Vec::is_empty),
+                "retired suite must not keep a dispatchable argv: {}",
+                suite_id(suite)
+            );
+        }
         assert!(all_profiles
             .iter()
             .any(|suite| !string_array(suite, "test_services").unwrap().is_empty()));
@@ -2433,8 +2473,8 @@ exit "${FAKE_CARGO_EXIT:-0}"
             "the Python unittest method inventory changed"
         );
         for (status, expected) in [
-            ("EQUIVALENT", 599),
-            ("PARTIAL", 9),
+            ("EQUIVALENT", 596),
+            ("PARTIAL", 12),
             ("BLOCKED", 0),
             ("RETIRED", 14),
         ] {
@@ -2773,7 +2813,8 @@ exit "${FAKE_CARGO_EXIT:-0}"
                     "astral-mq/src/invalidation_fanout.rs".to_owned(),
                     "astral-db/src/projection_execution/completion.rs".to_owned(),
                     "astral-db/src/authorization_projection_repository.rs".to_owned(),
-                    "policy-engine/src/engine/published.rs".to_owned(),
+                    "policy-engine/src/engine.rs".to_owned(),
+                    "policy-engine/src/engine/formal.rs".to_owned(),
                     module.to_owned(),
                     "Docs/实验/分布式测试/rust-s15/s15_validation.py".to_owned(),
                 ]
@@ -3078,20 +3119,68 @@ exit "${FAKE_CARGO_EXIT:-0}"
                 .and_then(TomlValue::as_integer),
             Some(15)
         );
-        let benefit = manifest
-            .suites
-            .iter()
-            .find(|suite| suite_id(suite) == "policy-evaluate-benefit")
-            .unwrap();
-        assert_eq!(
-            string_array(benefit, "sources").unwrap(),
-            vec![
-                "astral-db/src/memory_projection_hub/tests/evaluate_performance.rs",
-                "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs",
-                "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs",
-                "test-harness/src/evaluate_acceptance.rs",
-            ]
-        );
+        // memory—v1: the retired V6/V7 evaluate suites are archived records.
+        // They must stay blocked with no dispatchable argv, and their historical
+        // capability must never be counted as a memory-v1 PASS.
+        for (id, sources) in [
+            (
+                "policy-evaluate-benefit",
+                vec![
+                    "astral-db/src/memory_projection_hub/tests/evaluate_performance.rs",
+                    "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs",
+                    "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs",
+                    "test-harness/src/evaluate_acceptance.rs",
+                ],
+            ),
+            (
+                "policy-evaluate-sharing-experiment",
+                vec![
+                    "astral-db/src/memory_projection_hub/tests/evaluate_experimental.rs",
+                    "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs",
+                    "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs",
+                    "astral-db/src/memory_projection_hub/assembly_cache.rs",
+                    "test-harness/src/evaluate_sharing_acceptance.rs",
+                    "test-harness/src/campaign.rs",
+                ],
+            ),
+            (
+                "policy-evaluate-sharing-experiment-v2",
+                vec![
+                    "astral-db/src/memory_projection_hub/tests/evaluate_experimental.rs",
+                    "astral-db/src/memory_projection_hub/assembly_cache.rs",
+                    "policy-engine/src/engine.rs",
+                    "policy-engine/src/engine/formal.rs",
+                    "policy-engine/src/hit_stats.rs",
+                    "policy-engine/src/circuit_breaker.rs",
+                    "test-harness/src/evaluate_sharing_v2_acceptance.rs",
+                    "test-harness/src/campaign.rs",
+                ],
+            ),
+        ] {
+            let suite = manifest
+                .suites
+                .iter()
+                .find(|suite| suite_id(suite) == id)
+                .unwrap_or_else(|| panic!("retired suite {id} stays registered"));
+            assert!(
+                str_field(suite, "blocked_reason")
+                    .unwrap()
+                    .contains("memory-v1-retire-legacy-read-20261112"),
+                "retired suite {id} must cite the retirement marker"
+            );
+            assert!(
+                suite
+                    .get("argv")
+                    .is_none_or(|argv| argv.as_array().map(Vec::is_empty).unwrap_or(true)),
+                "retired suite {id} must not keep a dispatchable argv"
+            );
+            assert!(suite.get("evidence_contract").is_none(), "{id}");
+            assert!(str_field(suite, "boundary")
+                .unwrap()
+                .contains("archived record only"));
+            assert_eq!(string_array(suite, "sources").unwrap(), sources);
+        }
+
         let sharing = manifest
             .suites
             .iter()
@@ -3099,61 +3188,11 @@ exit "${FAKE_CARGO_EXIT:-0}"
             .expect("sharing experiment suite is registered");
         assert_eq!(str_field(sharing, "owner").unwrap(), "astral-db");
         assert_eq!(str_field(sharing, "profile").unwrap(), "performance-kernel");
-        assert_eq!(str_field(sharing, "acceptance").unwrap(), "rust");
-        assert_eq!(
-            str_field(sharing, "evidence_contract").unwrap(),
-            "policy-evaluate-sharing-experiment"
-        );
         assert_eq!(
             string_array(sharing, "test_services").unwrap(),
             Vec::<String>::new()
         );
         assert_eq!(str_field(sharing, "scope").unwrap(), "component");
-        assert!(str_field(sharing, "boundary")
-            .unwrap()
-            .contains("owner-sharing causal experiment"));
-        assert!(str_field(sharing, "boundary")
-            .unwrap()
-            .contains("128/1001/2048"));
-        assert_eq!(
-            string_array(sharing, "sources").unwrap(),
-            vec![
-                "astral-db/src/memory_projection_hub/tests/evaluate_experimental.rs",
-                "astral-db/src/memory_projection_hub/tests/evaluate_performance/fixture.rs",
-                "astral-db/src/memory_projection_hub/tests/evaluate_performance/controls.rs",
-                "astral-db/src/memory_projection_hub/assembly_cache.rs",
-                "test-harness/src/evaluate_sharing_acceptance.rs",
-                "test-harness/src/campaign.rs",
-            ]
-        );
-        assert_eq!(
-            string_array(sharing, "argv").unwrap(),
-            vec![
-                "cargo",
-                "test",
-                "--release",
-                "-p",
-                "astral-db",
-                "--lib",
-                "memory_projection_hub::tests::evaluate_experimental::policy_evaluate_sharing_experiment",
-                "--locked",
-                "--",
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ]
-        );
-        assert_eq!(
-            sharing.get("minimum_tests").and_then(TomlValue::as_integer),
-            Some(1)
-        );
-        assert_eq!(
-            sharing
-                .get("expected_tests")
-                .and_then(TomlValue::as_integer),
-            Some(1)
-        );
 
         let sharing_v2 = manifest
             .suites
@@ -3165,67 +3204,11 @@ exit "${FAKE_CARGO_EXIT:-0}"
             str_field(sharing_v2, "profile").unwrap(),
             "performance-kernel"
         );
-        assert_eq!(str_field(sharing_v2, "acceptance").unwrap(), "rust");
-        assert_eq!(
-            str_field(sharing_v2, "evidence_contract").unwrap(),
-            "policy-evaluate-sharing-experiment-v2"
-        );
         assert_eq!(
             string_array(sharing_v2, "test_services").unwrap(),
             Vec::<String>::new()
         );
         assert_eq!(str_field(sharing_v2, "scope").unwrap(), "component");
-        assert!(str_field(sharing_v2, "boundary")
-            .unwrap()
-            .contains("v1 remains the immutable historical baseline"));
-        assert!(str_field(sharing_v2, "boundary")
-            .unwrap()
-            .contains("AssemblyCache stripe wait/hold"));
-        assert_eq!(
-            string_array(sharing_v2, "sources").unwrap(),
-            vec![
-                "astral-db/src/memory_projection_hub/tests/evaluate_experimental.rs",
-                "astral-db/src/memory_projection_hub/assembly_cache.rs",
-                "policy-engine/src/engine.rs",
-                "policy-engine/src/engine/formal.rs",
-                "policy-engine/src/hit_stats.rs",
-                "policy-engine/src/circuit_breaker.rs",
-                "test-harness/src/evaluate_sharing_v2_acceptance.rs",
-                "test-harness/src/campaign.rs",
-            ]
-        );
-        assert_eq!(
-            string_array(sharing_v2, "argv").unwrap(),
-            vec![
-                "cargo",
-                "test",
-                "--release",
-                "-p",
-                "astral-db",
-                "--features",
-                "performance-attribution",
-                "--lib",
-                "memory_projection_hub::tests::evaluate_experimental::policy_evaluate_sharing_experiment",
-                "--locked",
-                "--",
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ]
-        );
-        assert_eq!(
-            sharing_v2
-                .get("minimum_tests")
-                .and_then(TomlValue::as_integer),
-            Some(1)
-        );
-        assert_eq!(
-            sharing_v2
-                .get("expected_tests")
-                .and_then(TomlValue::as_integer),
-            Some(1)
-        );
 
         let shell = manifest
             .suites

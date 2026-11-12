@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use astral_common::middleware::permission_check_shared::physical_policy_context;
 use astral_db::{
-    claim_replay_guard, read_integration_identity_mapping, GuardClaim, IntegrationIdentityKey,
-    SqlxAuthorizationFenceProvider, SqlxRuleRepository,
+    claim_replay_guard, read_integration_identity_mapping, AuthorizationReadSurface, GuardClaim,
+    IntegrationIdentityKey, SqlxAuthorizationFenceProvider,
 };
 use astral_sdk_contracts::{
     sign_decision, verify_request, AuthorizationDecision, AuthorizationRequest, DecisionOutcome,
@@ -66,7 +66,9 @@ struct AdmissionProof<'a> {
     session: &'a astral_common::session_projection_store::AccessSessionDurableFact,
     ctx: &'a PolicyContext,
     request: &'a AuthorizationRequest,
-    repo: &'a SqlxRuleRepository,
+    /// memory—v1：保留退役读面占位，不重新读取完整授权上下文。
+    /// 新版根及其最终元数据复核实现前，终检不能产生 ALLOW。
+    surface: &'a std::sync::Arc<AuthorizationReadSurface>,
     policy: &'a astral_types::PolicyDecision,
     fence: Option<astral_db::AuthorityReadFence>,
 }
@@ -84,6 +86,11 @@ impl IntegrationAuthorizationService {
                 reason_code = *code,
                 retry_count = 0u32,
                 phase_elapsed_micros = started.elapsed().as_micros() as u64,
+                // memory—v1：冻结的部署旋钮随拒绝一并留痕，供事故链排查；
+                // 评估入口本身已不消费这些 SQL 仓储旋钮。
+                org_scope_enabled = self.org_scope_enabled,
+                authority_required = self.authority_required,
+                authority_provider_present = self.authority_provider.is_some(),
                 "integration admission refused"
             );
             if signed.request.validate().is_ok() && *code != "INTEGRATION_REPLAY_REJECTED" {
@@ -93,6 +100,9 @@ impl IntegrationAuthorizationService {
         result
     }
 
+    /// memory—v1：远端准入评估入口必须运行在根一致读面上。新版共享根未安装
+    /// 或读面请求不可用时一律 AUTHORIZATION_PENDING；本入口不再构造 SQL 规则
+    /// 仓储，禁止从 SQL 规则行或旧 published evidence 回退放行。
     async fn authorize_inner(
         &self,
         headers: &HeaderMap,
@@ -100,11 +110,10 @@ impl IntegrationAuthorizationService {
     ) -> Result<SignedAuthorizationDecision, &'static str> {
         let start = std::time::Instant::now();
         let request = &signed.request;
-        if astral_db::authorization_read_surface()
-            .is_some_and(|surface| surface.is_certified_memory())
-        {
-            return Err("AUTHORIZATION_PENDING");
-        }
+        let surface = astral_db::authorization_read_surface().ok_or("AUTHORIZATION_PENDING")?;
+        let read_request = surface
+            .begin_request()
+            .map_err(|_| "AUTHORIZATION_PENDING")?;
         let now = utc_millis()?;
         request
             .validate_at(now)
@@ -218,11 +227,10 @@ impl IntegrationAuthorizationService {
         } else {
             None
         };
-        let repo = SqlxRuleRepository::new(self.db.clone())
-            .with_org_scope_enabled(self.org_scope_enabled)
-            .with_authority_provider_opt(self.authority_provider.clone())
-            .with_authority_required(self.authority_required);
-        let policy = self.engine.evaluate(&ctx, &repo).await;
+        let policy = read_request
+            .evaluate_with_admission(&self.engine, &ctx)
+            .await
+            .decision;
         let (mut outcome, mut reason) = if policy.allowed {
             (DecisionOutcome::Allow, "ADMITTED")
         } else if policy.reason == "AUTHORIZATION_PENDING"
@@ -276,7 +284,7 @@ impl IntegrationAuthorizationService {
             session: &initial_session,
             ctx: &ctx,
             request,
-            repo: &repo,
+            surface: &surface,
             policy: &policy,
             fence,
         };
@@ -395,6 +403,8 @@ impl IntegrationAuthorizationService {
         .map_err(|_| "AUTHORIZATION_PENDING")
     }
 
+    /// memory—v1：退役读面的占位终检不能发放准入；新版实现须复用首次
+    /// 根读取并仅复核根元数据和可信时间，不能重新读取完整上下文。
     async fn final_check(&self, proof: &AdmissionProof<'_>) -> Result<(), &'static str> {
         self.recheck_identity(
             proof.mapping_key,
@@ -405,7 +415,11 @@ impl IntegrationAuthorizationService {
             proof.request,
         )
         .await?;
-        let final_policy = self.engine.evaluate(proof.ctx, proof.repo).await;
+        let final_policy = proof
+            .surface
+            .evaluate_with_admission(&self.engine, proof.ctx)
+            .await
+            .decision;
         if !same_policy(&final_policy, proof.policy) {
             return Err("AUTHORIZATION_PENDING");
         }
@@ -572,5 +586,84 @@ mod tests {
         let invalidation = source.find("&signed_decision, \"INVALIDATED\"").unwrap();
         assert!(before < candidate && candidate < audit && audit < after && after < invalidation);
         assert!(!source.contains("FINAL_PLATFORM_ADMISSION_NOT_BUSINESS_COMMIT"));
+    }
+
+    // ===== memory—v1：根未安装时的 fail-closed 门 =====
+
+    /// memory—v1：新版共享根未安装时，评估入口必须在任何数据库访问与请求
+    /// 结构校验之前返回 AUTHORIZATION_PENDING，绝不回退 SQL 规则仓储或旧证据。
+    #[tokio::test]
+    async fn admission_is_pending_without_the_new_root() {
+        // 不落任何连接串：惰性池仅用于类型构造，本测试不触达数据库。
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new());
+        let service = IntegrationAuthorizationService {
+            db: pool,
+            engine: Arc::new(PolicyEngine::new()),
+            config: config::IntegrationConfig::test_config(),
+            org_scope_enabled: false,
+            authority_provider: None,
+            authority_required: true,
+        };
+        let signed = SignedAuthorizationRequest {
+            request: AuthorizationRequest {
+                app_id: "gate-test".to_owned(),
+                key_id: "gate-key".to_owned(),
+                manifest_digest: "00".to_owned(),
+                revision: "1".to_owned(),
+                request_id: "gate-request".to_owned(),
+                nonce: "gate-nonce".to_owned(),
+                timestamp: 1,
+                session_token_id: "gate-session".to_owned(),
+                subject: astral_sdk_contracts::ExternalSubject {
+                    issuer: "gate-issuer".to_owned(),
+                    subject: "gate-subject".to_owned(),
+                },
+                method: "GET".to_owned(),
+                path: "/".to_owned(),
+                action: "read".to_owned(),
+                operation_id: "gate-operation".to_owned(),
+                facts: astral_sdk_contracts::ResourceFacts {
+                    resource_type: "gate_resource".to_owned(),
+                    target_id: "1".to_owned(),
+                    external_tenant_id: "gate-tenant".to_owned(),
+                    external_domain_id: "gate-domain".to_owned(),
+                    owner: None,
+                    revision: "1".to_owned(),
+                    operation: astral_sdk_contracts::ResourceOperation::Object,
+                },
+            },
+            signature: String::new(),
+        };
+        let code = service
+            .authorize(&HeaderMap::new(), &signed)
+            .await
+            .expect_err("without the memory-v1 root the admission must stay pending");
+        assert_eq!(code, "AUTHORIZATION_PENDING");
+    }
+
+    /// memory—v1：本入口不得再构造 SQL 规则仓储或直接调用 engine.evaluate；
+    /// 评估必须先经根读面门并在其读请求上执行。
+    #[test]
+    fn admission_never_falls_back_to_sql_rule_repositories() {
+        let source = include_str!("mod.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !source.contains("SqlxRuleRepository"),
+            "the admission path must not construct SQL rule repositories"
+        );
+        assert!(
+            !source.contains("engine.evaluate("),
+            "the admission path must not evaluate through a raw repository"
+        );
+        let gate = source
+            .find("authorization_read_surface()")
+            .expect("the root read-surface gate must remain");
+        let begin = source
+            .find("begin_request()")
+            .expect("evaluation must run on a token-fenced read request");
+        let evaluate = source
+            .find("evaluate_with_admission")
+            .expect("evaluation must go through the root-backed read request");
+        assert!(gate < begin && begin < evaluate);
     }
 }

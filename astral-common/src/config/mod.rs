@@ -80,10 +80,12 @@ pub enum ConfigValidationError {
     InvalidAuthorityRuntimeMode,
     #[error("ASTRAL_AUTHORITY_RUNTIME_MODE=durable-only is not allowed for a listener")]
     OfflineAuthorityModeForListener,
-    #[error(
-        "ASTRAL_AUTHORIZATION_READ_PROFILE must be durable, db-backed-mirror, certified-memory, or single-node-memory"
-    )]
+    #[error("ASTRAL_AUTHORIZATION_READ_PROFILE must be single-node-memory")]
     InvalidAuthorizationReadProfile,
+    #[error("V6/V7 authorization read profiles are retired on this branch")]
+    LegacyAuthorizationProfileRetired,
+    #[error("memory-v1 authorization root is not ready for a listener")]
+    MemoryV1ProfileNotReady,
     #[error("certified-memory authorization read profile is not wired to a complete production serving root")]
     CertifiedMemoryProfileNotReady,
 }
@@ -146,60 +148,32 @@ impl AuthorityRuntimeMode {
     }
 }
 
-/// Stable authorization read profile, frozen during startup.
-///
-/// This profile selects only the policy/authorization read surface. Credential
-/// roots, session/JWT/refresh state, audit, management, and cold queries remain
-/// durable even when a future certified-memory profile is enabled.
+/// memory—v1: The only authorization profile is the single-node shared root.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AuthorizationReadProfile {
-    /// Strict durable reads with no process-local positive authorization mirror.
-    Durable,
-    /// Existing bounded mirror whose misses may use the strict durable reader.
+    /// MySQL supplies cold snapshots; serving authorization uses the shared root.
     #[default]
-    DbBackedMirror,
-    /// Certified immutable memory snapshot with no durable fallback on a miss.
-    CertifiedMemory,
-    /// Single-node immutable memory root. MySQL is used only during the
-    /// startup/rebuild phase; serving requests never refill from SQL.
     SingleNodeMemory,
 }
 
 impl AuthorizationReadProfile {
+    /// memory—v1: Select only the new single-node profile; reject retired names.
     pub fn parse(raw: Option<&str>) -> Result<Self, ConfigValidationError> {
         match raw.map(str::trim) {
-            None | Some("") | Some("db-backed-mirror") | Some("DbBackedMirror") => {
-                Ok(Self::DbBackedMirror)
+            None | Some("") | Some("single-node-memory") | Some("SingleNodeMemory") => {
+                Ok(Self::SingleNodeMemory)
             }
-            Some("durable") | Some("Durable") => Ok(Self::Durable),
-            Some("certified-memory") | Some("CertifiedMemory") => Ok(Self::CertifiedMemory),
-            Some("single-node-memory") | Some("SingleNodeMemory") => Ok(Self::SingleNodeMemory),
+            Some(
+                "durable" | "Durable" | "db-backed-mirror" | "DbBackedMirror" | "certified-memory"
+                | "CertifiedMemory",
+            ) => Err(ConfigValidationError::LegacyAuthorizationProfileRetired),
             Some(_) => Err(ConfigValidationError::InvalidAuthorizationReadProfile),
         }
     }
 
-    pub const fn uses_certified_memory(self) -> bool {
-        matches!(self, Self::CertifiedMemory)
-    }
-
-    pub const fn uses_memory_authority(self) -> bool {
-        matches!(self, Self::CertifiedMemory | Self::SingleNodeMemory)
-    }
-
-    pub const fn is_single_node_memory(self) -> bool {
-        matches!(self, Self::SingleNodeMemory)
-    }
-
-    pub const fn sessions_remain_durable(self) -> bool {
-        true
-    }
-
-    /// Listener validation only checks that the profile name is valid. The
-    /// selected profile is admitted by the service composition root, which must
-    /// install a serving certified surface before a CertifiedMemory listener is
-    /// started.
+    /// memory—v1: Refuse listeners until the new root has a verified composition.
     pub const fn validate_listener(self) -> Result<(), ConfigValidationError> {
-        Ok(())
+        Err(ConfigValidationError::MemoryV1ProfileNotReady)
     }
 }
 
@@ -1153,7 +1127,10 @@ impl AppConfig {
             })
     }
 
-    pub fn from_env_for(role: JwtValidationRole) -> Result<Self, config::ConfigError> {
+    // memory—v1: 解析层（无任何 listener 校验）：env 反序列化 + flat 覆盖 +
+    // 必备公共路径。listener 准入由加载入口单独应用，解析/覆盖契约测试也用
+    // 本层把"配置内容有效"与"listener 就绪"两个关注点分开验证。
+    fn load_from_env() -> Result<Self, config::ConfigError> {
         let mut cfg: Self = config::Config::builder()
             .add_source(
                 config::Environment::default()
@@ -1167,15 +1144,18 @@ impl AppConfig {
         // 校验之前应用，env 存在即覆盖，缺失保留默认值。
         apply_flat_env_overrides(&mut cfg)?;
         ensure_required_public_paths(&mut cfg.public_paths);
-        cfg.authority_runtime_mode
-            .validate_listener()
+        Ok(cfg)
+    }
+
+    /// memory—v1: Load and validate configuration before listener admission.
+    pub fn from_env_for(role: JwtValidationRole) -> Result<Self, config::ConfigError> {
+        let cfg = Self::load_from_env()?;
+        cfg.validate_identity_for(role, Self::is_test_profile())
             .map_err(ConfigValidationError::into_config_error)?;
+        // memory—v1: listener 准入在 memory-v1 共享根组合通过验证前保持关闭；
+        // 就绪门放在最后执行，避免掩盖具体配置错误，失败仍然 fail-closed。
         cfg.authorization_read_profile
             .validate_listener()
-            .map_err(ConfigValidationError::into_config_error)?;
-        cfg.validate_secrets_for(role)
-            .map_err(ConfigValidationError::into_config_error)?;
-        cfg.validate_runtime_safety(Self::is_test_profile())
             .map_err(ConfigValidationError::into_config_error)?;
         Ok(cfg)
     }
@@ -1184,10 +1164,9 @@ impl AppConfig {
         Self::from_files_for(path, JwtValidationRole::Identity)
     }
 
-    pub fn from_files_for(
-        path: &str,
-        role: JwtValidationRole,
-    ) -> Result<Self, config::ConfigError> {
+    // memory—v1: 解析层（无任何 listener 校验）：文件 + env 反序列化 + flat
+    // 覆盖 + 必备公共路径（语义同 `load_from_env`）。
+    fn load_from_files(path: &str) -> Result<Self, config::ConfigError> {
         let mut cfg: Self = config::Config::builder()
             .add_source(config::File::with_name(path).required(false))
             .add_source(
@@ -1205,29 +1184,50 @@ impl AppConfig {
         // An explicit YAML list must not accidentally remove the mandatory
         // Java-compatible login, refresh, and verification routes.
         ensure_required_public_paths(&mut cfg.public_paths);
-        cfg.authority_runtime_mode
-            .validate_listener()
+        Ok(cfg)
+    }
+
+    /// memory—v1: Load file and environment configuration before listener admission.
+    pub fn from_files_for(
+        path: &str,
+        role: JwtValidationRole,
+    ) -> Result<Self, config::ConfigError> {
+        let cfg = Self::load_from_files(path)?;
+        cfg.validate_identity_for(role, Self::is_test_profile())
             .map_err(ConfigValidationError::into_config_error)?;
+        // memory—v1: listener 准入在 memory-v1 共享根组合通过验证前保持关闭
+        // （语义同 `from_env_for`）；就绪门最后执行，失败仍然 fail-closed。
         cfg.authorization_read_profile
             .validate_listener()
-            .map_err(ConfigValidationError::into_config_error)?;
-        cfg.validate_secrets_for(role)
-            .map_err(ConfigValidationError::into_config_error)?;
-        cfg.validate_runtime_safety(Self::is_test_profile())
             .map_err(ConfigValidationError::into_config_error)?;
         Ok(cfg)
     }
 
+    // memory—v1: 分层校验的启动层：authority 运行模式门 + 角色 secret 门 +
+    // 运行时安全门。仅 crate 内可见——listener 准入必须走
+    // `validate_listener_for`，由它在最后叠加授权读 profile 就绪门（当前对
+    // 全部 profile 拒绝，保持所有 listener 关闭）。
+    fn validate_identity_for(
+        &self,
+        role: JwtValidationRole,
+        test_profile: bool,
+    ) -> Result<(), ConfigValidationError> {
+        self.authority_runtime_mode.validate_listener()?;
+        self.validate_secrets_for(role)?;
+        self.validate_runtime_safety(test_profile)
+    }
+
     /// Validate an already frozen production listener configuration without
     /// loading files or environment values again.
+    ///
+    /// memory—v1: 启动层校验先行，具体配置错误不被就绪门掩盖；授权读 profile
+    /// 就绪门最后执行，在 memory-v1 共享根组合通过验证前拒绝一切 listener。
     pub fn validate_listener_for(
         &self,
         role: JwtValidationRole,
     ) -> Result<(), ConfigValidationError> {
-        self.authority_runtime_mode.validate_listener()?;
-        self.authorization_read_profile.validate_listener()?;
-        self.validate_secrets_for(role)?;
-        self.validate_runtime_safety(false)
+        self.validate_identity_for(role, false)?;
+        self.authorization_read_profile.validate_listener()
     }
 
     pub fn message_transport(&self) -> Result<MessageTransport, ConfigValidationError> {
@@ -2118,18 +2118,44 @@ mod tests {
         }
     }
 
+    /// memory—v1: 解析/覆盖契约测试共用入口：解析层加载 + 启动层校验（不含
+    /// listener 就绪门），断言"配置内容有效"与 listener 准入门两个关注点分离。
+    fn load_and_validate_identity_for(
+        path: &str,
+        role: JwtValidationRole,
+        context: &str,
+    ) -> AppConfig {
+        let config = AppConfig::load_from_files(path)
+            .unwrap_or_else(|error| panic!("{context}: parse layer failed: {error}"));
+        config
+            .validate_identity_for(role, AppConfig::is_test_profile())
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+        config
+    }
+
     #[test]
     fn frozen_listener_validation_keeps_authority_secret_and_runtime_gates() {
         let mut config = valid_runtime_config();
         config.jwt = valid_jwt_config();
         config.gateway = valid_gateway();
+        // memory—v1: 分层后的启动层仍然放行一份完整配置（两个角色一致）……
         config
-            .validate_listener_for(JwtValidationRole::Gateway)
+            .validate_identity_for(JwtValidationRole::Gateway, false)
             .unwrap();
         config
-            .validate_listener_for(JwtValidationRole::Identity)
+            .validate_identity_for(JwtValidationRole::Identity, false)
             .unwrap();
+        // ……而 listener 准入在 memory-v1 共享根组合通过验证前保持关闭。
+        assert_eq!(
+            config.validate_listener_for(JwtValidationRole::Gateway),
+            Err(ConfigValidationError::MemoryV1ProfileNotReady)
+        );
+        assert_eq!(
+            config.validate_listener_for(JwtValidationRole::Identity),
+            Err(ConfigValidationError::MemoryV1ProfileNotReady)
+        );
 
+        // 启动层先于就绪门执行：具体配置错误不会被 MemoryV1ProfileNotReady 掩盖。
         let mut changed = config.clone();
         changed.authority_runtime_mode = AuthorityRuntimeMode::DurableOnly;
         assert_eq!(
@@ -2345,19 +2371,19 @@ mod tests {
         guard.set("CORS_ALLOWED_ORIGINS", "https://console.example.invalid");
 
         guard.set(SESSION_GRANT_MIRROR_ENV, "false");
-        let config = AppConfig::from_files_for(
+        let config = load_and_validate_identity_for(
             "astral-common-mirror-contract-no-such-file",
             JwtValidationRole::Identity,
-        )
-        .expect("explicit mirror opt-out must pass validation");
+            "explicit mirror opt-out must pass validation",
+        );
         assert!(!config.session_grant_mirror_enabled);
 
         guard.set(SESSION_GRANT_MIRROR_ENV, "true");
-        let config = AppConfig::from_files_for(
+        let config = load_and_validate_identity_for(
             "astral-common-mirror-contract-no-such-file",
             JwtValidationRole::Identity,
-        )
-        .expect("explicit mirror opt-in must pass validation");
+            "explicit mirror opt-in must pass validation",
+        );
         assert!(config.session_grant_mirror_enabled);
 
         guard.set(SESSION_GRANT_MIRROR_ENV, "maybe");
@@ -2415,8 +2441,11 @@ cors:
             "gateway-hmac-override-secret-0123456789",
         );
 
-        let config = AppConfig::from_files_for(&yaml_stem, JwtValidationRole::Identity)
-            .expect("yaml explicit mirror opt-out must pass current identity validation");
+        let config = load_and_validate_identity_for(
+            &yaml_stem,
+            JwtValidationRole::Identity,
+            "yaml explicit mirror opt-out must pass current identity validation",
+        );
         let _ = fs::remove_file(&yaml_path);
         assert!(
             !config.session_grant_mirror_enabled,
@@ -2455,20 +2484,20 @@ cors:
         guard.set("CORS_ALLOW_CREDENTIALS", "false");
 
         // env 缺失 → default-off。
-        let config = AppConfig::from_files_for(
+        let config = load_and_validate_identity_for(
             "astral-common-org-scope-contract-no-such-file",
             JwtValidationRole::Identity,
-        )
-        .expect("file-less node without the org flag must pass validation");
+            "file-less node without the org flag must pass validation",
+        );
         assert!(!config.org_scope_enabled);
 
         // env "true" → 冻结 true。
         guard.set(ORG_SCOPE_ENABLED_ENV, "true");
-        let config = AppConfig::from_files_for(
+        let config = load_and_validate_identity_for(
             "astral-common-org-scope-contract-no-such-file",
             JwtValidationRole::Identity,
-        )
-        .expect("explicit org flag must freeze into config");
+            "explicit org flag must freeze into config",
+        );
         assert!(config.org_scope_enabled);
 
         // env 非法 → fail-fast（启动拒绝），且错误不得回显覆盖值。
@@ -2527,8 +2556,11 @@ cors:
             "gateway-hmac-override-secret-0123456789",
         );
 
-        let config = AppConfig::from_files_for(&yaml_stem, JwtValidationRole::Identity)
-            .expect("yaml fallback must pass current identity validation");
+        let config = load_and_validate_identity_for(
+            &yaml_stem,
+            JwtValidationRole::Identity,
+            "yaml fallback must pass current identity validation",
+        );
         let _ = fs::remove_file(&yaml_path);
         assert!(
             !config.org_scope_enabled,
@@ -2580,11 +2612,11 @@ cors:
         );
         guard.set("CORS_ALLOW_CREDENTIALS", "true");
 
-        let config = AppConfig::from_files_for(
+        let config = load_and_validate_identity_for(
             "astral-common-flat-env-contract-no-such-file",
             JwtValidationRole::Identity,
-        )
-        .expect("file-less node with the explicit flat env contract must pass current identity validation");
+            "file-less node with the explicit flat env contract must pass current identity validation",
+        );
 
         assert_eq!(
             config.database_url,
@@ -2711,8 +2743,11 @@ cors:
             "gateway-hmac-override-secret-0123456789",
         );
 
-        let config = AppConfig::from_files_for(&yaml_stem, JwtValidationRole::Identity)
-            .expect("yaml fallback + partial env overrides must pass current identity validation");
+        let config = load_and_validate_identity_for(
+            &yaml_stem,
+            JwtValidationRole::Identity,
+            "yaml fallback + partial env overrides must pass current identity validation",
+        );
         let _ = fs::remove_file(&yaml_path);
 
         // env 未覆盖的字段保留 YAML 值。
@@ -2753,72 +2788,55 @@ cors:
         );
     }
 
+    /// memory—v1: Accept only the new profile and keep every listener closed.
     #[test]
-    fn authorization_read_profile_is_frozen_and_sessions_remain_durable() {
+    fn authorization_read_profile_retires_legacy_modes() {
         assert_eq!(
             AuthorizationReadProfile::default(),
-            AuthorizationReadProfile::DbBackedMirror
+            AuthorizationReadProfile::SingleNodeMemory
         );
-        assert_eq!(
-            AuthorizationReadProfile::parse(None).unwrap(),
-            AuthorizationReadProfile::DbBackedMirror
-        );
-        assert_eq!(
-            AuthorizationReadProfile::parse(Some(" durable ")).unwrap(),
-            AuthorizationReadProfile::Durable
-        );
-        assert_eq!(
-            AuthorizationReadProfile::parse(Some("CertifiedMemory")).unwrap(),
-            AuthorizationReadProfile::CertifiedMemory
-        );
-        assert!(AuthorizationReadProfile::Durable
-            .validate_listener()
-            .is_ok());
-        assert!(AuthorizationReadProfile::DbBackedMirror
-            .validate_listener()
-            .is_ok());
-        assert!(AuthorizationReadProfile::CertifiedMemory
-            .validate_listener()
-            .is_ok());
-        for invalid in ["", "memory", "certified", "db", "CERTIFIED-MEMORY"] {
-            if invalid.is_empty() {
-                assert_eq!(
-                    AuthorizationReadProfile::parse(Some(invalid)).unwrap(),
-                    AuthorizationReadProfile::DbBackedMirror
-                );
-            } else {
-                assert_eq!(
-                    AuthorizationReadProfile::parse(Some(invalid)).unwrap_err(),
-                    ConfigValidationError::InvalidAuthorizationReadProfile
-                );
-            }
+        for input in [
+            None,
+            Some(""),
+            Some("single-node-memory"),
+            Some("SingleNodeMemory"),
+        ] {
+            assert_eq!(
+                AuthorizationReadProfile::parse(input),
+                Ok(AuthorizationReadProfile::SingleNodeMemory)
+            );
         }
-        assert!(AuthorizationReadProfile::Durable.sessions_remain_durable());
-        assert!(AuthorizationReadProfile::DbBackedMirror.sessions_remain_durable());
-        assert!(AuthorizationReadProfile::CertifiedMemory.sessions_remain_durable());
-    }
-
-    #[test]
-    fn certified_memory_profile_is_admitted_by_composition_root() {
-        let mut config = valid_runtime_config();
-        config.jwt = valid_jwt_config();
-        config.gateway = valid_gateway();
-        config.authorization_read_profile = AuthorizationReadProfile::CertifiedMemory;
-        assert!(config
-            .validate_listener_for(JwtValidationRole::Gateway)
-            .is_ok());
-    }
-
-    #[test]
-    fn authority_read_mode_does_not_select_authorization_read_profile() {
-        assert!(!AuthorizationReadProfile::Durable.uses_certified_memory());
-        assert!(!AuthorizationReadProfile::DbBackedMirror.uses_certified_memory());
-        assert!(AuthorizationReadProfile::CertifiedMemory.uses_certified_memory());
+        for input in [
+            "durable",
+            "Durable",
+            "db-backed-mirror",
+            "DbBackedMirror",
+            "certified-memory",
+            "CertifiedMemory",
+        ] {
+            assert_eq!(
+                AuthorizationReadProfile::parse(Some(input)),
+                Err(ConfigValidationError::LegacyAuthorizationProfileRetired)
+            );
+        }
         assert_eq!(
-            AuthorizationReadProfile::parse(Some("durable")).unwrap(),
-            AuthorizationReadProfile::Durable
+            AuthorizationReadProfile::parse(Some("memory")),
+            Err(ConfigValidationError::InvalidAuthorizationReadProfile)
         );
-        assert!(AuthorizationReadProfile::Durable.sessions_remain_durable());
+        assert_eq!(
+            AuthorizationReadProfile::SingleNodeMemory.validate_listener(),
+            Err(ConfigValidationError::MemoryV1ProfileNotReady)
+        );
+    }
+
+    /// memory—v1: Retired authority modes cannot select an old authorization profile.
+    #[test]
+    fn authority_read_mode_does_not_enable_legacy_profile() {
+        assert!(AuthorizationReadProfile::parse(Some("durable")).is_err());
+        assert_eq!(
+            AuthorizationReadProfile::parse(None),
+            Ok(AuthorizationReadProfile::SingleNodeMemory)
+        );
     }
 
     /// 角色的 HMAC 密钥必须从独立 env 名落位，绝不允许共用 JWT 签名材料。
@@ -2861,7 +2879,12 @@ cors:
         guard.set("CORS_ALLOWED_ORIGINS", "https://console.example.invalid");
         guard.set("CORS_ALLOW_CREDENTIALS", "false");
 
-        let config = AppConfig::from_env_for(JwtValidationRole::Gateway)
+        // memory—v1: 解析层 + 启动层校验（不含 listener 就绪门）；env 版加载
+        // 走 `load_from_env`，flat env 覆盖语义与加载入口完全一致。
+        let config = AppConfig::load_from_env()
+            .expect("gateway role with the explicit flat env contract must parse");
+        config
+            .validate_identity_for(JwtValidationRole::Gateway, AppConfig::is_test_profile())
             .expect("gateway role with the explicit flat env contract must pass validation");
 
         assert_eq!(

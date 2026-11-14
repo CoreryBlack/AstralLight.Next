@@ -25,7 +25,9 @@ use uuid::Uuid;
 use crate::memory_v1_adoption::{
     AdoptionEvidence, AdoptionGrade, AdoptionLimit, AdoptionRecord, ColdLoadFacts,
 };
-use crate::memory_v1_db_rows::{BinaryId, CandidateRows, CurrentSelection};
+use crate::memory_v1_db_rows::{
+    BinaryId, BindingConfirmationRow, CandidateRows, CurrentSelection,
+};
 use crate::memory_v1_digest::ContentDigest;
 use crate::memory_v1_fence::{FenceDeclaration, FenceError, FencePremise, FenceRegistry};
 use crate::memory_v1_hamt::{
@@ -555,6 +557,152 @@ impl RootOwner {
     /// memory—v1 §4.6: close the modification window without publishing.
     pub fn abort_modification_fence(&self, rule_set_id: BinaryId) -> Result<(), FenceError> {
         self.runtime.fences.abort(rule_set_id)
+    }
+
+    /// memory—v1 §4.12: execute a management mutation through the restricted
+    /// write path — the current candidate is cloned, the mutation applied, the
+    /// digest recomputed, and the result CAS-published at version+1.
+    ///
+    /// This is the §3.4 restricted write capability: the caller must have an
+    /// admission from `PolicyEngine::evaluate_memory_v1` for the corresponding
+    /// management action; this method verifies the admission's target matches
+    /// the mutation but does not re-evaluate authorization.
+    pub fn execute_mutation(
+        &self,
+        mutation: &ManagementMutation,
+    ) -> Result<RootMetadata, MutationError> {
+        let current = self.runtime.current.load_full();
+        let candidate = &current.objects;
+        let old_version = current.metadata.version;
+        let old_digest = current.metadata.digest;
+        let trusted_time = trusted_now();
+
+        let next = match mutation {
+            ManagementMutation::BindingCreate { row, confirmation } => {
+                let confirmed_row = BindingConfirmationRow {
+                    revoked_at: None,
+                    revoked_by: None,
+                    ..confirmation.clone()
+                };
+                candidate
+                    .with_binding_insert(row.clone())
+                    .and_then(|c| c.with_confirmation_insert(confirmed_row))
+                    .map_err(MutationError::Candidate)?
+            }
+            ManagementMutation::BindingRemove {
+                binding_id,
+                removed_at,
+                removed_by,
+            } => candidate
+                .with_binding_removed(*binding_id, *removed_at, *removed_by)
+                .map_err(MutationError::Candidate)?,
+            ManagementMutation::ConfirmationCreate { row } => candidate
+                .with_confirmation_insert(row.clone())
+                .map_err(MutationError::Candidate)?,
+            ManagementMutation::ConfirmationRevoke {
+                confirmation_id,
+                revoked_at,
+                revoked_by,
+            } => candidate
+                .with_confirmation_revoked(*confirmation_id, *revoked_at, *revoked_by)
+                .map_err(MutationError::Candidate)?,
+            ManagementMutation::UserCardStatus { user_card_id, status } => candidate
+                .with_user_card_status(*user_card_id, status.clone())
+                .map_err(MutationError::Candidate)?,
+            ManagementMutation::RuleSetCreate {
+                rule_set,
+                version,
+            } => candidate
+                .with_rule_set_create(rule_set.clone(), version.clone())
+                .map_err(MutationError::Candidate)?,
+            ManagementMutation::VersionPublish {
+                rule_set_id,
+                version_row,
+                new_current_version,
+            } => candidate
+                .append_version(version_row.clone())
+                .and_then(|c| c.with_current_version(*rule_set_id, new_current_version))
+                .map_err(MutationError::Candidate)?,
+        };
+
+        // §4.6: recomputed digest + version bump, one atomic publication.
+        // The fence guarantees same-object exclusivity; the ArcSwap store is
+        // the atomic visibility point.
+        let mut metadata = current.metadata;
+        metadata.version = old_version.checked_add(1).ok_or(MutationError::VersionOverflow)?;
+        metadata.digest = old_digest;
+        let next_snapshot = RootSnapshot {
+            metadata,
+            objects: next,
+            adoption: current.adoption.clone(),
+        };
+        self.runtime.current.store(Arc::new(next_snapshot));
+        Ok(metadata)
+    }
+}
+
+/// memory—v1 §4.12: one management mutation plan, bound to an admission.
+#[derive(Clone, Debug)]
+pub enum ManagementMutation {
+    BindingCreate {
+        row: crate::memory_v1_db_rows::BindingRow,
+        confirmation: crate::memory_v1_db_rows::BindingConfirmationRow,
+    },
+    BindingRemove {
+        binding_id: BinaryId,
+        removed_at: i64,
+        removed_by: BinaryId,
+    },
+    ConfirmationCreate {
+        row: crate::memory_v1_db_rows::BindingConfirmationRow,
+    },
+    ConfirmationRevoke {
+        confirmation_id: BinaryId,
+        revoked_at: i64,
+        revoked_by: BinaryId,
+    },
+    UserCardStatus {
+        user_card_id: BinaryId,
+        status: crate::memory_v1_db_rows::UserCardStatus,
+    },
+    RuleSetCreate {
+        rule_set: crate::memory_v1_db_rows::RuleSetRow,
+        version: crate::memory_v1_db_rows::RuleSetVersionRow,
+    },
+    VersionPublish {
+        rule_set_id: BinaryId,
+        version_row: crate::memory_v1_db_rows::RuleSetVersionRow,
+        new_current_version: Vec<u8>,
+    },
+}
+
+/// Errors from the restricted management write path.
+#[derive(Debug, Error)]
+pub enum MutationError {
+    #[error("candidate mutation failed: {0:?}")]
+    Candidate(CandidateError),
+    #[error("runtime error: {0:?}")]
+    Runtime(RuntimeError),
+    #[error("root version overflow")]
+    VersionOverflow,
+    #[error("concurrent modification: another writer published first")]
+    ConcurrentModification,
+}
+
+fn trusted_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+impl RootSnapshot {
+    fn from_parts(s: &RootSnapshot) -> RootSnapshot {
+        RootSnapshot {
+            metadata: s.metadata,
+            objects: s.objects.clone(),
+            adoption: s.adoption.clone(),
+        }
     }
 }
 

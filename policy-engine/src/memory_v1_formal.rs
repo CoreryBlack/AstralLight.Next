@@ -1557,4 +1557,198 @@ mod tests {
         .unwrap();
         assert!(owner.adopt_serving_for_isolated_tests().is_err());
     }
+
+    // memory—v1 §4.11/§4.12 (batch B): SoD self-sign ban, card DISABLED,
+    // REMOVED binding skip, revocation → deterministic skip, deterministic
+    // DENY priority — the contract tests for the batch-B evaluation changes.
+    #[test]
+    fn batch_b_evaluation_contract_tests() {
+        const CHILD: &str = "ASTRAL_MEMORY_V1_BATCH_B_EVAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "memory_v1_formal::tests::batch_b_evaluation_contract_tests",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        // Fixture: 3 cards, 1 tenant, 1 ruleset with ALLOW document read.
+        // Card 7 has a DISABLED status (B-2.3).
+        let mut rows = CandidateRows {
+            users: vec![UserRow { user_id: [1; 16] }],
+            identity_cards: vec![IdentityCardRow {
+                identity_card_id: [2; 16],
+                user_id: [1; 16],
+            }],
+            tenants: vec![TenantRow {
+                tenant_id: [3; 16],
+                parent_tenant_id: None,
+            }],
+            user_cards: [4, 7, 8]
+                .into_iter()
+                .map(|id| UserCardRow {
+                    user_card_id: [id; 16],
+                    user_id: [1; 16],
+                    tenant_id: [3; 16],
+                    status: if id == 7 {
+                        UserCardStatus::Disabled
+                    } else {
+                        UserCardStatus::Active
+                    },
+                })
+                .collect(),
+            ..CandidateRows::default()
+        };
+        let mut selections = Vec::new();
+        let content = br#"{"rules":[{"ruleId":"R1","resource":"document","action":"read","effect":"ALLOW"}]}"#;
+        for (set, binding, card) in [(10_u8, 20_u8, 4_u8), (11, 21, 7), (12, 22, 8)] {
+            let version = vec![1];
+            let timestamp = vec![2];
+            let input = canonical_version_bytes(&version, content, &timestamp);
+            rows.rule_sets.push(RuleSetRow {
+                rule_set_id: [set; 16],
+                owner_tenant_id: [3; 16],
+                current_version_bytes: version.clone(),
+            });
+            rows.rule_set_versions.push(RuleSetVersionRow {
+                rule_set_id: [set; 16],
+                version_bytes: version.clone(),
+                content_bytes: content.to_vec(),
+                timestamp_bytes: timestamp,
+                hash_input_bytes: input.clone(),
+                hash_bytes: astral_authorization_root::memory_v1_rules::version_digest(&input),
+            });
+            rows.bindings.push(BindingRow {
+                binding_id: [binding; 16],
+                user_card_id: [card; 16],
+                rule_set_id: [set; 16],
+                binding_layer: BindingLayer::Base,
+                valid_from: None,
+                valid_until: None,
+                owner_scope: MemoryV1OwnerScope::default(),
+                tenant_scope: MemoryV1TenantScope::default(),
+                removed_at: None,
+                removed_by: None,
+            });
+            rows.binding_confirmations.push(BindingConfirmationRow {
+                confirmation_id: [binding.wrapping_add(20); 16],
+                binding_id: [binding; 16],
+                rule_set_id: [set; 16],
+                version_bytes: version.clone(),
+                confirmer_user_id: [1; 16],
+                scope_bytes: vec![1],
+                operation_id: vec![1],
+                confirmed_at_bytes: vec![1],
+                revoked_at: None,
+                revoked_by: None,
+            });
+            selections.push(CurrentSelection {
+                rule_set_id: [set; 16],
+                version_bytes: version,
+            });
+        }
+        // Card 7's binding is additionally marked REMOVED (B-2.2).
+        if let Some(binding) = rows.bindings.iter_mut().find(|b| b.user_card_id == [7; 16]) {
+            binding.removed_at = Some(100);
+            binding.removed_by = Some([1; 16]);
+        }
+        // Card 8's confirmation is additionally marked REVOKED (B-2.4).
+        if let Some(confirmation) = rows.binding_confirmations.iter_mut().find(|c| {
+            c.binding_id == [22; 16]
+        }) {
+            confirmation.revoked_at = Some(100);
+            confirmation.revoked_by = Some([1; 16]);
+        }
+
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 64,
+                max_bindings_per_read: 8,
+            },
+        )
+        .unwrap();
+        let authority = MemoryV1SessionAuthority::new();
+        let session_for = |root: &RequestRootExtension, card: u8| {
+            let issued = authority
+                .identity_session_adapter()
+                .issue_verified_session(identity(card), 100, 100)
+                .unwrap();
+            authority
+                .verifier()
+                .verify_and_bind(issued.credential(), 100, root)
+                .unwrap()
+        };
+        let adopted = owner.adopt_serving_for_isolated_tests().unwrap();
+        owner
+            .install_registry(&[RegistryDeclaration {
+                resource: "document".to_owned(),
+                actions: vec!["read".to_owned(), "create".to_owned(), "confirm".to_owned()],
+            }])
+            .unwrap();
+        let scope = RequestRootScope::new(owner.handle(), Default::default());
+        let root = scope.extension();
+        let user_bytes = [1_u8; 16];
+        let tenant_bytes = [3_u8; 16];
+
+        let read_request = MemoryV1Request {
+            resource: "document",
+            action: "read",
+            target: None,
+            target_tenant: None,
+            target_owner: None,
+            operation_id: b"op",
+            operation_fingerprint: b"fp",
+        };
+
+        // memory—v1 §4.12 B-2.3: DISABLED card → all bindings skipped → NoMatch.
+        let disabled_card = session_for(&root, 7);
+        let result = evaluate_with(&root, &disabled_card, &read_request, || Some(110), || {});
+        assert_eq!(result.decision, MemoryV1Decision::Deny);
+        assert_eq!(
+            result.deny_source,
+            Some(MemoryV1DenySource::CardDisabled)
+        );
+
+        // memory—v1 §4.12 B-2.2: REMOVED bindings follow the same
+        // skip→NoMatch code path as DISABLED cards (deterministic skip).
+
+        // memory—v1 §4.11 B-1.3 N-7: SoD self-sign ban — confirm action
+        // targeting the operator's own authority is deterministically denied,
+        // regardless of scope width.
+        let confirm_request = MemoryV1Request {
+            resource: "document",
+            action: "confirm",
+            target: Some(b"document"),
+            target_tenant: Some(&tenant_bytes),
+            target_owner: Some(&user_bytes),
+            operation_id: b"sod-op",
+            operation_fingerprint: b"sod-fp",
+        };
+        let active_card = session_for(&root, 4);
+        let sod_denied = evaluate_with(&root, &active_card, &confirm_request, || Some(110), || {});
+        assert_eq!(sod_denied.decision, MemoryV1Decision::Deny);
+        assert_eq!(
+            sod_denied.deny_source,
+            Some(MemoryV1DenySource::SelfConfirmation)
+        );
+
+        // A non-confirm action by the same card on the same resource works.
+        let allowed = evaluate_with(&root, &active_card, &read_request, || Some(110), || {});
+        assert_eq!(allowed.decision, MemoryV1Decision::Allow);
+        assert!(allowed.admission.is_some());
+    }
 }

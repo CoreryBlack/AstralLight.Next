@@ -41,14 +41,6 @@ e1-observability = ["dep:uuid"]
 performance-attribution = []
 
 [[bench]]
-name = "policy_bench"
-harness = false
-
-[[bench]]
-name = "tenant_isolation_bench"
-harness = false
-
-[[bench]]
 name = "authorization_compiler_bench"
 harness = false
 

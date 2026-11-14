@@ -15,9 +15,7 @@
 
 mod authorization_compiler;
 mod circuit_breaker;
-mod client;
 mod condition;
-mod cross_city_conflict;
 mod data_scope;
 #[cfg(any(feature = "e1-observability", test))]
 pub mod e1_observation;
@@ -29,14 +27,11 @@ pub mod memory_v1_candidate;
 pub mod memory_v1_formal;
 /// ORG_SCOPE admission contract and evidence validation.
 pub mod org_admission;
-/// ORG_SCOPE pure compiler kernel.
 mod org_compiler;
-
+/// ORG_SCOPE pure compiler kernel.
 pub use authorization_compiler::*;
 pub use circuit_breaker::*;
-pub use client::*;
 pub use condition::*;
-pub use cross_city_conflict::*;
 pub use data_scope::*;
 pub use engine::*;
 pub use hit_stats::*;

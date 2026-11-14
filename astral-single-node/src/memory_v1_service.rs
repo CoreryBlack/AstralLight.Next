@@ -391,7 +391,6 @@ mod tests {
         }
     }
 
-
     #[test]
     // memory—v1: The listener must be loopback; the default is loopback; garbage is refused.
     fn settings_require_a_loopback_listener() {

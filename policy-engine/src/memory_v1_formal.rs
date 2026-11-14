@@ -399,19 +399,33 @@ fn evaluate_reader(
             if binding.binding.user_card_id != card
                 || binding.rule_set.rule_set_id != binding.binding.rule_set_id
                 || version.rule_set_id != binding.binding.rule_set_id
-                || !binding
-                    .confirmations
-                    .iter()
-                    .filter(|confirmation| confirmation.revoked_at.is_none())
-                    .any(|confirmation| {
-                        confirmation_matches(
-                            confirmation,
-                            binding.binding.binding_id,
-                            binding.binding.rule_set_id,
-                            &version.version_bytes,
-                        )
-                    })
             {
+                pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                continue;
+            }
+            // memory—v1 §4.12 B-2.4: a REVOKED confirmation is a deliberate
+            // management withdrawal — the binding contributes nothing (skip
+            // → deterministic NoMatch), unlike bad data. §4.11 A-1: no
+            // matching confirmation at all is bad data → PENDING.
+            let matching: Vec<_> = binding
+                .confirmations
+                .iter()
+                .filter(|confirmation| {
+                    confirmation_matches(
+                        confirmation,
+                        binding.binding.binding_id,
+                        binding.binding.rule_set_id,
+                        &version.version_bytes,
+                    )
+                })
+                .collect();
+            if !matching
+                .iter()
+                .any(|confirmation| confirmation.revoked_at.is_none())
+            {
+                if !matching.is_empty() {
+                    continue;
+                }
                 pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
                 continue;
             }
@@ -655,7 +669,9 @@ mod tests {
     use astral_authorization_root::memory_v1_hamt::CandidateBudget;
     use astral_authorization_root::memory_v1_registry::RegistryDeclaration;
     use astral_authorization_root::memory_v1_request::RequestRootScope;
-    use astral_authorization_root::memory_v1_root::{install_process_root, RootStatus};
+    use astral_authorization_root::memory_v1_root::{
+        install_process_root, ManagementMutation, RootStatus,
+    };
     use astral_authorization_root::memory_v1_rules::canonical_version_bytes;
     use astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthority;
     use astral_types::memory_v1::MemoryId;
@@ -1754,4 +1770,183 @@ mod tests {
     // memory—v1 §4.12/§4.11 (batch B): REMOVED binding skip, confirmation
     // revocation → binding skip, revocation vs bad-data distinction, and
     // dual-layer governance grants.
+    #[test]
+    fn batch_b_lifecycle_state_tests() {
+        const CHILD: &str = "ASTRAL_MEMORY_V1_BATCH_B_LIFECYCLE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "memory_v1_formal::tests::batch_b_lifecycle_state_tests",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        // Fixture: 2 rulesets (10-11), each with its own version (vn 1-2),
+        // bound to 2 different cards. Binding states:
+        //   card 4 → set 10: normal (baseline ALLOW)
+        //   card 7 → set 11: REMOVED (removed_at set) → NoMatch
+        // Revocation is a mid-session management action (B-2.4) and is
+        // exercised below through the real RootOwner mutation path — a
+        // binding whose only confirmation is already revoked at fixture
+        // time cannot be adopted as serving (fail-closed; asserted in
+        // batch_b_revoked_confirmation_fails_adoption).
+        let mut rows = CandidateRows {
+            users: vec![UserRow { user_id: [1; 16] }],
+            identity_cards: vec![IdentityCardRow {
+                identity_card_id: [2; 16],
+                user_id: [1; 16],
+            }],
+            tenants: vec![TenantRow {
+                tenant_id: [3; 16],
+                parent_tenant_id: None,
+            }],
+            user_cards: [4, 7]
+                .into_iter()
+                .map(|id| UserCardRow {
+                    user_card_id: [id; 16],
+                    user_id: [1; 16],
+                    tenant_id: [3; 16],
+                    status: UserCardStatus::Active,
+                })
+                .collect(),
+            ..CandidateRows::default()
+        };
+        let mut selections = Vec::new();
+        let content = br#"{"rules":[{"ruleId":"R1","resource":"document","action":"read","effect":"ALLOW"}]}"#;
+        for (set, binding, card, removed, vn) in
+            [(10u8, 20u8, 4u8, false, 1u8), (11, 21, 7, true, 2)]
+        {
+            let version = vec![vn];
+            let timestamp = vec![vn];
+            let input = canonical_version_bytes(&version, content, &timestamp);
+            rows.rule_sets.push(RuleSetRow {
+                rule_set_id: [set; 16],
+                owner_tenant_id: [3; 16],
+                current_version_bytes: version.clone(),
+            });
+            rows.rule_set_versions.push(RuleSetVersionRow {
+                rule_set_id: [set; 16],
+                version_bytes: version.clone(),
+                content_bytes: content.to_vec(),
+                timestamp_bytes: timestamp,
+                hash_input_bytes: input.clone(),
+                hash_bytes: astral_authorization_root::memory_v1_rules::version_digest(&input),
+            });
+            rows.bindings.push(BindingRow {
+                binding_id: [binding; 16],
+                user_card_id: [card; 16],
+                rule_set_id: [set; 16],
+                binding_layer: BindingLayer::Base,
+                valid_from: None,
+                valid_until: None,
+                owner_scope: MemoryV1OwnerScope::default(),
+                tenant_scope: MemoryV1TenantScope::default(),
+                removed_at: if removed { Some(100) } else { None },
+                removed_by: if removed { Some([1; 16]) } else { None },
+            });
+            rows.binding_confirmations.push(BindingConfirmationRow {
+                confirmation_id: [binding.wrapping_add(20); 16],
+                binding_id: [binding; 16],
+                rule_set_id: [set; 16],
+                version_bytes: version.clone(),
+                confirmer_user_id: [1; 16],
+                scope_bytes: vec![1],
+                operation_id: vec![1],
+                confirmed_at_bytes: vec![1],
+                revoked_at: None,
+                revoked_by: None,
+            });
+            selections.push(CurrentSelection {
+                rule_set_id: [set; 16],
+                version_bytes: version.clone(),
+            });
+        }
+
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 64,
+                max_bindings_per_read: 8,
+            },
+        )
+        .unwrap();
+        let authority = MemoryV1SessionAuthority::new();
+        let session_for = |root: &RequestRootExtension, card: u8| {
+            let issued = authority
+                .identity_session_adapter()
+                .issue_verified_session(identity(card), 100, 100)
+                .unwrap();
+            authority
+                .verifier()
+                .verify_and_bind(issued.credential(), 100, root)
+                .unwrap()
+        };
+        owner.adopt_serving_for_isolated_tests().unwrap();
+        owner
+            .install_registry(&[RegistryDeclaration {
+                resource: "document".to_owned(),
+                actions: vec!["read".to_owned()],
+            }])
+            .unwrap();
+        let scope = RequestRootScope::new(owner.handle(), Default::default());
+        let root = scope.extension();
+        let request = MemoryV1Request {
+            resource: "document",
+            action: "read",
+            target: None,
+            target_tenant: None,
+            target_owner: None,
+            operation_id: b"op",
+            operation_fingerprint: b"fp",
+        };
+
+        // Card 4 (normal binding): Allow — baseline.
+        let card4 = session_for(&root, 4);
+        let result = evaluate_with(&root, &card4, &request, || Some(110), || {});
+        assert_eq!(result.decision, MemoryV1Decision::Allow);
+
+        // memory—v1 §4.12 B-2.2: REMOVED binding → skipped → NoMatch.
+        // The tombstone row is loaded but the evaluation skips it.
+        let card7 = session_for(&root, 7);
+        let result = evaluate_with(&root, &card7, &request, || Some(110), || {});
+        assert_eq!(result.decision, MemoryV1Decision::Deny);
+        assert_eq!(result.deny_source, Some(MemoryV1DenySource::NoMatch));
+
+        // memory—v1 §4.12 B-2.4: REVOKED confirmation is a deliberate
+        // management withdrawal → the binding contributes nothing →
+        // deterministic NoMatch. Exercised through the real RootOwner
+        // mutation path (batch-B §4.12 executor), not fixture data.
+        owner
+            .execute_mutation(&ManagementMutation::ConfirmationRevoke {
+                confirmation_id: [40; 16],
+                revoked_at: 120,
+                revoked_by: [1; 16],
+            })
+            .unwrap();
+        // A new request reader binds the post-mutation snapshot (§4.7).
+        let scope_after = RequestRootScope::new(owner.handle(), Default::default());
+        let root_after = scope_after.extension();
+        let card4_after = session_for(&root_after, 4);
+        let result = evaluate_with(&root_after, &card4_after, &request, || Some(110), || {});
+        assert_eq!(result.decision, MemoryV1Decision::Deny);
+        assert_eq!(result.deny_source, Some(MemoryV1DenySource::NoMatch));
+
+        // The pre-mutation reader still sees its own immutable snapshot —
+        // one request sees one consistent view (§4.7 dependency isolation).
+        let result = evaluate_with(&root, &card4, &request, || Some(110), || {});
+        assert_eq!(result.decision, MemoryV1Decision::Allow);
+    }
 }

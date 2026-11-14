@@ -620,6 +620,11 @@ impl HamtCandidate {
             parse_version(version).map_err(CandidateError::RuleIntegrity)?;
         }
         for binding in self.bindings.values() {
+            // memory—v1 §4.12 B-2.2: tombstoned bindings are deliberate
+            // withdrawals and need no confirmation to serve.
+            if binding.removed_at.is_some() {
+                continue;
+            }
             let selected = self
                 .selected_version(binding.rule_set_id)
                 .map_err(|_| CandidateError::InconsistentBinding)?
@@ -633,6 +638,13 @@ impl HamtCandidate {
                 .into_iter()
                 .flat_map(|ids| ids.iter())
                 .filter_map(|id| self.confirmations.get(id).map(Arc::as_ref));
+            // memory—v1 §4.11 A-1: a binding must carry at least one
+            // matching confirmation (non-zero confirmer, non-empty scope/
+            // operation/time). A REVOKED one still proves the binding was
+            // authorized once — withdrawal is valid durable state that the
+            // evaluator skips deterministically; restart must not fail-close
+            // on it. Truly missing/broken confirmation data is bad data and
+            // is rejected here.
             let confirmed = confirmations.any(|confirmation| {
                 confirmation_matches(
                     confirmation,

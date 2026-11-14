@@ -15,7 +15,6 @@
 //! operator-acknowledged limits) and the test-only hook.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use crate::memory_v1_db_rows::UserCardStatus;
 use std::sync::{Arc, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
@@ -25,9 +24,7 @@ use uuid::Uuid;
 use crate::memory_v1_adoption::{
     AdoptionEvidence, AdoptionGrade, AdoptionLimit, AdoptionRecord, ColdLoadFacts,
 };
-use crate::memory_v1_db_rows::{
-    BinaryId, BindingConfirmationRow, CandidateRows, CurrentSelection,
-};
+use crate::memory_v1_db_rows::{BinaryId, BindingConfirmationRow, CandidateRows, CurrentSelection};
 use crate::memory_v1_digest::ContentDigest;
 use crate::memory_v1_fence::{FenceDeclaration, FenceError, FencePremise, FenceRegistry};
 use crate::memory_v1_hamt::{
@@ -575,7 +572,7 @@ impl RootOwner {
         let candidate = &current.objects;
         let old_version = current.metadata.version;
         let old_digest = current.metadata.digest;
-        let trusted_time = trusted_now();
+        let _trusted_time = trusted_now();
 
         let next = match mutation {
             ManagementMutation::BindingCreate { row, confirmation } => {
@@ -606,13 +603,13 @@ impl RootOwner {
             } => candidate
                 .with_confirmation_revoked(*confirmation_id, *revoked_at, *revoked_by)
                 .map_err(MutationError::Candidate)?,
-            ManagementMutation::UserCardStatus { user_card_id, status } => candidate
-                .with_user_card_status(*user_card_id, status.clone())
-                .map_err(MutationError::Candidate)?,
-            ManagementMutation::RuleSetCreate {
-                rule_set,
-                version,
+            ManagementMutation::UserCardStatus {
+                user_card_id,
+                status,
             } => candidate
+                .with_user_card_status(*user_card_id, *status)
+                .map_err(MutationError::Candidate)?,
+            ManagementMutation::RuleSetCreate { rule_set, version } => candidate
                 .with_rule_set_create(rule_set.clone(), version.clone())
                 .map_err(MutationError::Candidate)?,
             ManagementMutation::VersionPublish {
@@ -629,7 +626,9 @@ impl RootOwner {
         // The fence guarantees same-object exclusivity; the ArcSwap store is
         // the atomic visibility point.
         let mut metadata = current.metadata;
-        metadata.version = old_version.checked_add(1).ok_or(MutationError::VersionOverflow)?;
+        metadata.version = old_version
+            .checked_add(1)
+            .ok_or(MutationError::VersionOverflow)?;
         metadata.digest = old_digest;
         let next_snapshot = RootSnapshot {
             metadata,
@@ -696,15 +695,6 @@ fn trusted_now() -> i64 {
         .unwrap_or(0)
 }
 
-impl RootSnapshot {
-    fn from_parts(s: &RootSnapshot) -> RootSnapshot {
-        RootSnapshot {
-            metadata: s.metadata,
-            objects: s.objects.clone(),
-            adoption: s.adoption.clone(),
-        }
-    }
-}
 
 impl Drop for RootOwner {
     // memory—v1: Consumer handles become unavailable before a replacement root can exist.
@@ -1064,7 +1054,8 @@ impl RequestRootReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_v1_db_rows::{
+        use crate::memory_v1_db_rows::UserCardStatus;
+use crate::memory_v1_db_rows::{
         BindingConfirmationRow, BindingLayer, BindingRow, IdentityCardRow, RuleSetRow,
         RuleSetVersionRow, TenantRow, UserCardRow, UserRow,
     };
@@ -1094,7 +1085,8 @@ mod tests {
             rule_sets: vec![RuleSetRow {
                 rule_set_id: id(5),
                 owner_tenant_id: id(3),
-                current_version_bytes: Vec::new(),            }],
+                current_version_bytes: Vec::new(),
+            }],
             rule_set_versions: vec![RuleSetVersionRow {
                 rule_set_id: id(5),
                 version_bytes: vec![1],
@@ -1113,7 +1105,8 @@ mod tests {
                 owner_scope: MemoryV1OwnerScope::default(),
                 tenant_scope: MemoryV1TenantScope::default(),
                 removed_at: None,
-                removed_by: None,            }],
+                removed_by: None,
+            }],
             ..CandidateRows::default()
         }
     }
@@ -1153,7 +1146,8 @@ mod tests {
                 operation_id: vec![1],
                 confirmed_at_bytes: vec![1],
                 revoked_at: None,
-                revoked_by: None,            });
+                revoked_by: None,
+            });
         let selections = vec![CurrentSelection {
             rule_set_id: id(5),
             version_bytes: vec![1],
@@ -2096,11 +2090,13 @@ mod tests {
                 RuleSetRow {
                     rule_set_id: id(30),
                     owner_tenant_id: id(20),
-                    current_version_bytes: Vec::new(),                },
+                    current_version_bytes: Vec::new(),
+                },
                 RuleSetRow {
                     rule_set_id: id(31),
                     owner_tenant_id: id(20),
-                    current_version_bytes: Vec::new(),                },
+                    current_version_bytes: Vec::new(),
+                },
             ],
             rule_set_versions: vec![
                 RuleSetVersionRow {
@@ -2131,7 +2127,8 @@ mod tests {
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
                     removed_at: None,
-                    removed_by: None,                },
+                    removed_by: None,
+                },
                 BindingRow {
                     binding_id: id(41),
                     user_card_id: id(22),
@@ -2142,7 +2139,8 @@ mod tests {
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
                     removed_at: None,
-                    removed_by: None,                },
+                    removed_by: None,
+                },
                 BindingRow {
                     binding_id: id(42),
                     user_card_id: id(23),
@@ -2153,7 +2151,8 @@ mod tests {
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
                     removed_at: None,
-                    removed_by: None,                },
+                    removed_by: None,
+                },
                 BindingRow {
                     binding_id: id(43),
                     user_card_id: id(23),
@@ -2164,7 +2163,8 @@ mod tests {
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
                     removed_at: None,
-                    removed_by: None,                },
+                    removed_by: None,
+                },
             ],
             ..CandidateRows::default()
         };

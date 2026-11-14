@@ -20,10 +20,9 @@ use crate::memory_v1_schema::{
 };
 use astral_authorization_root::memory_v1_adoption::ColdLoadFacts;
 use astral_authorization_root::memory_v1_db_rows::{
-    UserCardStatus,
     BinaryId, BindingConfirmationRow, BindingLayer, BindingRow, CandidateRows, IdentityCardRow,
     RuleSetChangeConfirmationRow, RuleSetRow, RuleSetVersionRow, TableCounts, TenantRow,
-    UserCardRow, UserRow,
+    UserCardRow, UserCardStatus, UserRow,
 };
 use astral_authorization_root::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
 use sqlx::{mysql::MySqlRow, Connection, MySql, MySqlPool, Row, Transaction};
@@ -355,9 +354,7 @@ fn user_card_status(
     row: &MySqlRow,
     meter: &mut Meter,
 ) -> Result<UserCardStatus, CandidateCaptureError> {
-    let value: Option<Vec<u8>> = row
-        .try_get("status")
-        .map_err(|e| db_error("status", e))?;
+    let value: Option<Vec<u8>> = row.try_get("status").map_err(|e| db_error("status", e))?;
     let Some(value) = value else {
         return Ok(UserCardStatus::Active);
     };

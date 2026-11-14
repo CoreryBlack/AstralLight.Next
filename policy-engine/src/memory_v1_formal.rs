@@ -7,11 +7,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
 use astral_authorization_root::memory_v1_request::RequestRootExtension;
 use astral_authorization_root::memory_v1_root::{
     DependencyRecord, EvaluationDependency, RequestRootReader, RootMetadata, RootStatus,
 };
-use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
 use astral_authorization_root::memory_v1_rules::{
     confirmation_matches, parse_version, window_active, MemoryV1OwnerScope, MemoryV1RuleEffect,
     MemoryV1TenantScope, MemoryV1Validity,
@@ -404,13 +404,13 @@ fn evaluate_reader(
                     .iter()
                     .filter(|confirmation| confirmation.revoked_at.is_none())
                     .any(|confirmation| {
-                    confirmation_matches(
-                        confirmation,
-                        binding.binding.binding_id,
-                        binding.binding.rule_set_id,
-                        &version.version_bytes,
-                    )
-                })
+                        confirmation_matches(
+                            confirmation,
+                            binding.binding.binding_id,
+                            binding.binding.rule_set_id,
+                            &version.version_bytes,
+                        )
+                    })
             {
                 pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
                 continue;
@@ -649,8 +649,8 @@ mod tests {
     use super::*;
     use astral_authorization_root::memory_v1_db_rows::{
         BindingConfirmationRow, BindingLayer, BindingRow, CandidateRows, CurrentSelection,
-        IdentityCardRow, RuleSetRow, RuleSetVersionRow, TenantRow, UserCardRow, UserRow,
-        UserCardStatus,
+        IdentityCardRow, RuleSetRow, RuleSetVersionRow, TenantRow, UserCardRow, UserCardStatus,
+        UserRow,
     };
     use astral_authorization_root::memory_v1_hamt::CandidateBudget;
     use astral_authorization_root::memory_v1_registry::RegistryDeclaration;
@@ -1665,9 +1665,11 @@ mod tests {
             binding.removed_by = Some([1; 16]);
         }
         // Card 8's confirmation is additionally marked REVOKED (B-2.4).
-        if let Some(confirmation) = rows.binding_confirmations.iter_mut().find(|c| {
-            c.binding_id == [22; 16]
-        }) {
+        if let Some(confirmation) = rows
+            .binding_confirmations
+            .iter_mut()
+            .find(|c| c.binding_id == [22; 16])
+        {
             confirmation.revoked_at = Some(100);
             confirmation.revoked_by = Some([1; 16]);
         }
@@ -1692,7 +1694,7 @@ mod tests {
                 .verify_and_bind(issued.credential(), 100, root)
                 .unwrap()
         };
-        let adopted = owner.adopt_serving_for_isolated_tests().unwrap();
+        owner.adopt_serving_for_isolated_tests().unwrap();
         owner
             .install_registry(&[RegistryDeclaration {
                 resource: "document".to_owned(),
@@ -1718,10 +1720,7 @@ mod tests {
         let disabled_card = session_for(&root, 7);
         let result = evaluate_with(&root, &disabled_card, &read_request, || Some(110), || {});
         assert_eq!(result.decision, MemoryV1Decision::Deny);
-        assert_eq!(
-            result.deny_source,
-            Some(MemoryV1DenySource::CardDisabled)
-        );
+        assert_eq!(result.deny_source, Some(MemoryV1DenySource::CardDisabled));
 
         // memory—v1 §4.12 B-2.2: REMOVED bindings follow the same
         // skip→NoMatch code path as DISABLED cards (deterministic skip).

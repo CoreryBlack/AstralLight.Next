@@ -12,7 +12,6 @@
 //! owned rows require separate resource bounds. No global singleton is enforced.
 
 use std::sync::{Arc, RwLock, Weak};
-use crate::memory_v1_db_rows::UserCardStatus;
 
 use crate::memory_v1_db_rows::{
     BinaryId, BindingConfirmationRow, BindingLayer, BindingRow, CandidateRows, CurrentSelection,
@@ -583,7 +582,8 @@ pub(crate) fn digest_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_v1_db_rows::{IdentityCardRow, RuleSetRow, TenantRow, UserRow};
+        use crate::memory_v1_db_rows::UserCardStatus;
+use crate::memory_v1_db_rows::{IdentityCardRow, RuleSetRow, TenantRow, UserRow};
     use crate::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
 
     // memory—v1: Construct distinct candidate IDs.
@@ -624,7 +624,8 @@ mod tests {
             rule_sets: vec![RuleSetRow {
                 rule_set_id: id(3),
                 owner_tenant_id: id(4),
-                current_version_bytes: Vec::new(),            }],
+                current_version_bytes: Vec::new(),
+            }],
             rule_set_versions: vec![version(1)],
             bindings: vec![BindingRow {
                 binding_id: id(6),
@@ -636,7 +637,8 @@ mod tests {
                 owner_scope: MemoryV1OwnerScope::default(),
                 tenant_scope: MemoryV1TenantScope::default(),
                 removed_at: None,
-                removed_by: None,            }],
+                removed_by: None,
+            }],
             binding_confirmations: vec![BindingConfirmationRow {
                 confirmation_id: id(7),
                 binding_id: id(6),
@@ -647,7 +649,8 @@ mod tests {
                 operation_id: vec![1],
                 confirmed_at_bytes: vec![0],
                 revoked_at: None,
-                revoked_by: None,            }],
+                revoked_by: None,
+            }],
             ..CandidateRows::default()
         };
         HamtRuntimeOwner::new(

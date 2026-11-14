@@ -14,13 +14,48 @@ use crate::api::permission_check::MemoryV1RouteDeclaration;
 /// memory—v1 §4.11: governance route metadata declarations — these are
 /// the batch-B governance routes (①-⑤), auto-registered via §4.9.
 pub const GOVERNANCE_ROUTE_DECLARATIONS: &[MemoryV1RouteDeclaration] = &[
-    MemoryV1RouteDeclaration { method: "POST", path: "/governance/bindings", resource: "binding", action: "create" },
-    MemoryV1RouteDeclaration { method: "POST", path: "/governance/bindings/confirm", resource: "binding", action: "confirm" },
-    MemoryV1RouteDeclaration { method: "DELETE", path: "/governance/bindings", resource: "binding", action: "remove" },
-    MemoryV1RouteDeclaration { method: "POST", path: "/governance/bindings/revoke-confirmation", resource: "binding", action: "revoke-confirmation" },
-    MemoryV1RouteDeclaration { method: "POST", path: "/governance/rule-sets", resource: "rule_set", action: "create" },
-    MemoryV1RouteDeclaration { method: "POST", path: "/governance/rule-sets/publish", resource: "rule_set", action: "version-publish" },
-    MemoryV1RouteDeclaration { method: "POST", path: "/governance/user-cards/disable", resource: "user_card", action: "disable" },
+    MemoryV1RouteDeclaration {
+        method: "POST",
+        path: "/governance/bindings",
+        resource: "binding",
+        action: "create",
+    },
+    MemoryV1RouteDeclaration {
+        method: "POST",
+        path: "/governance/bindings/confirm",
+        resource: "binding",
+        action: "confirm",
+    },
+    MemoryV1RouteDeclaration {
+        method: "DELETE",
+        path: "/governance/bindings",
+        resource: "binding",
+        action: "remove",
+    },
+    MemoryV1RouteDeclaration {
+        method: "POST",
+        path: "/governance/bindings/revoke-confirmation",
+        resource: "binding",
+        action: "revoke-confirmation",
+    },
+    MemoryV1RouteDeclaration {
+        method: "POST",
+        path: "/governance/rule-sets",
+        resource: "rule_set",
+        action: "create",
+    },
+    MemoryV1RouteDeclaration {
+        method: "POST",
+        path: "/governance/rule-sets/publish",
+        resource: "rule_set",
+        action: "version-publish",
+    },
+    MemoryV1RouteDeclaration {
+        method: "POST",
+        path: "/governance/user-cards/disable",
+        resource: "user_card",
+        action: "disable",
+    },
 ];
 
 /// memory—v1 §4.12: management mutation plan types for the governance routes.

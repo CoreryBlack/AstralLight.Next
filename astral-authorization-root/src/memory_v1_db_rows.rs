@@ -827,7 +827,8 @@ mod tests {
             rule_sets: vec![RuleSetRow {
                 rule_set_id: id(6),
                 owner_tenant_id: id(4),
-                current_version_bytes: Vec::new(),            }],
+                current_version_bytes: Vec::new(),
+            }],
             rule_set_versions: vec![RuleSetVersionRow {
                 rule_set_id: id(6),
                 version_bytes: vec![0, 0xff],
@@ -846,7 +847,8 @@ mod tests {
                 owner_scope: MemoryV1OwnerScope::default(),
                 tenant_scope: MemoryV1TenantScope::default(),
                 removed_at: None,
-                removed_by: None,            }],
+                removed_by: None,
+            }],
             binding_confirmations: vec![BindingConfirmationRow {
                 confirmation_id: id(8),
                 binding_id: id(7),
@@ -857,7 +859,8 @@ mod tests {
                 operation_id: vec![0xff],
                 confirmed_at_bytes: vec![0],
                 revoked_at: None,
-                revoked_by: None,            }],
+                revoked_by: None,
+            }],
             rule_set_change_confirmations: vec![RuleSetChangeConfirmationRow {
                 confirmation_id: id(8),
                 rule_set_id: id(6),
@@ -867,7 +870,8 @@ mod tests {
                 operation_id: vec![0],
                 confirmed_at_bytes: vec![0xff],
                 revoked_at: None,
-                revoked_by: None,            }],
+                revoked_by: None,
+            }],
         }
     }
 

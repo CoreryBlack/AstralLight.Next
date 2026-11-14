@@ -173,12 +173,12 @@ mod tests {
         install_captured_candidate, require_serving_root, CandidateInstallationError,
         MemoryV1Composition,
     };
+    use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
     use astral_authorization_root::memory_v1_db_rows::{
         BindingLayer, BindingRow, CandidateRows, CurrentSelection, IdentityCardRow, RuleSetRow,
         RuleSetVersionRow, Table, TenantRow, UserCardRow, UserRow, ValidationError,
     };
     use astral_authorization_root::memory_v1_hamt::{CandidateBudget, CandidateError};
-    use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
     use astral_authorization_root::memory_v1_request::{
         RequestRootAccessError, RequestRootExtension,
     };
@@ -264,7 +264,8 @@ mod tests {
                 rule_sets: vec![RuleSetRow {
                     rule_set_id: id(5),
                     owner_tenant_id: id(3),
-                    current_version_bytes: Vec::new(),                }],
+                    current_version_bytes: Vec::new(),
+                }],
                 rule_set_versions: vec![version(1), version(2)],
                 bindings: vec![BindingRow {
                     binding_id: id(6),
@@ -276,7 +277,8 @@ mod tests {
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
                     removed_at: None,
-                    removed_by: None,                }],
+                    removed_by: None,
+                }],
                 ..CandidateRows::default()
             }
         }

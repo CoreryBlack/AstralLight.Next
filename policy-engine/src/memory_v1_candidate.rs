@@ -5,7 +5,7 @@
 //! ownership, or rule semantics. This module cannot return an ALLOW or a
 //! `PolicyDecision` and must not be used to authorize a request.
 
-use astral_authorization_root::memory_v1_db_rows::{BinaryId, UserCardStatus};
+use astral_authorization_root::memory_v1_db_rows::BinaryId;
 use astral_authorization_root::memory_v1_hamt_runtime::{HamtRuntimeHandle, RuntimeCardContext};
 use astral_authorization_root::memory_v1_root::RequestRootReader;
 use astral_types::memory_v1::CandidateIdentity;
@@ -136,6 +136,7 @@ fn inspect_with(
 
 #[cfg(test)]
 mod tests {
+    use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
     use super::*;
     use astral_authorization_root::memory_v1_db_rows::{
         BindingLayer, BindingRow, CandidateRows, CurrentSelection, IdentityCardRow, RuleSetRow,

@@ -6,7 +6,6 @@
 //! There is no database, network, read gate, or service-root installation here.
 
 use std::sync::Arc;
-use crate::memory_v1_db_rows::UserCardStatus;
 
 use im::{HashMap, HashSet};
 
@@ -40,7 +39,10 @@ pub enum CandidateError {
     /// A referenced entity is absent from the supplied candidate.
     UnknownId { table: Table, id: BinaryId },
     /// §4.5 double-bind prohibition: (card, ruleset) already has a binding.
-    DoubleBinding { user_card_id: BinaryId, rule_set_id: BinaryId },
+    DoubleBinding {
+        user_card_id: BinaryId,
+        rule_set_id: BinaryId,
+    },
     /// §4.5 one-OVERLAY-per-card: this card already has an OVERLAY binding.
     DoubleOverlay { user_card_id: BinaryId },
     /// A selected or replacement version is absent from the supplied candidate.
@@ -753,8 +755,7 @@ impl HamtCandidate {
             })?;
         // §4.5 double-bind prohibition: (user_card_id, rule_set_id) must be unique.
         for existing in self.bindings.values() {
-            if existing.user_card_id == row.user_card_id
-                && existing.rule_set_id == row.rule_set_id
+            if existing.user_card_id == row.user_card_id && existing.rule_set_id == row.rule_set_id
             {
                 return Err(CandidateError::DoubleBinding {
                     user_card_id: row.user_card_id,
@@ -773,10 +774,13 @@ impl HamtCandidate {
         }
         let mut next = self.clone();
         next.row_count = row_count;
-        next.bindings
-            .insert(row.binding_id, Arc::new(row.clone()));
+        next.bindings.insert(row.binding_id, Arc::new(row.clone()));
         index(&mut next.bindings_by_card, row.user_card_id, row.binding_id);
-        index(&mut next.bindings_by_rule_set, row.rule_set_id, row.binding_id);
+        index(
+            &mut next.bindings_by_rule_set,
+            row.rule_set_id,
+            row.binding_id,
+        );
         Ok(next)
     }
 
@@ -849,8 +853,7 @@ impl HamtCandidate {
         row.revoked_at = Some(revoked_at);
         row.revoked_by = Some(revoked_by);
         let mut next = self.clone();
-        next.confirmations
-            .insert(confirmation_id, Arc::new(row));
+        next.confirmations.insert(confirmation_id, Arc::new(row));
         Ok(next)
     }
 
@@ -895,9 +898,14 @@ impl HamtCandidate {
         next.versions
             .entry(rule_set_row.rule_set_id)
             .or_default()
-            .insert(version_row.version_bytes.clone(), Arc::new(version_row.clone()));
-        next.selections
-            .insert(rule_set_row.rule_set_id, Arc::new(version_row.version_bytes.clone()));
+            .insert(
+                version_row.version_bytes.clone(),
+                Arc::new(version_row.clone()),
+            );
+        next.selections.insert(
+            rule_set_row.rule_set_id,
+            Arc::new(version_row.version_bytes.clone()),
+        );
         Ok(next)
     }
 
@@ -965,7 +973,8 @@ impl HamtCandidate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_v1_db_rows::BindingLayer;
+        use crate::memory_v1_db_rows::UserCardStatus;
+use crate::memory_v1_db_rows::BindingLayer;
     use crate::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
 
     // memory—v1: Generate distinct binary IDs without assuming an encoding.
@@ -1034,11 +1043,13 @@ mod tests {
                 RuleSetRow {
                     rule_set_id: id(10),
                     owner_tenant_id: id(5),
-                    current_version_bytes: Vec::new(),                },
+                    current_version_bytes: Vec::new(),
+                },
                 RuleSetRow {
                     rule_set_id: id(11),
                     owner_tenant_id: id(6),
-                    current_version_bytes: Vec::new(),                },
+                    current_version_bytes: Vec::new(),
+                },
             ],
             rule_set_versions: vec![version(10, 1), version(10, 2), version(11, 1)],
             bindings: vec![
@@ -1052,7 +1063,8 @@ mod tests {
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
                     removed_at: None,
-                    removed_by: None,                },
+                    removed_by: None,
+                },
                 BindingRow {
                     binding_id: id(13),
                     user_card_id: id(9),
@@ -1063,7 +1075,8 @@ mod tests {
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
                     removed_at: None,
-                    removed_by: None,                },
+                    removed_by: None,
+                },
                 BindingRow {
                     binding_id: id(14),
                     user_card_id: id(8),
@@ -1074,7 +1087,8 @@ mod tests {
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
                     removed_at: None,
-                    removed_by: None,                },
+                    removed_by: None,
+                },
             ],
             binding_confirmations: vec![BindingConfirmationRow {
                 confirmation_id: id(15),
@@ -1086,7 +1100,8 @@ mod tests {
                 operation_id: vec![0],
                 confirmed_at_bytes: vec![0x80],
                 revoked_at: None,
-                revoked_by: None,            }],
+                revoked_by: None,
+            }],
             rule_set_change_confirmations: vec![RuleSetChangeConfirmationRow {
                 confirmation_id: id(15),
                 rule_set_id: id(10),
@@ -1096,7 +1111,8 @@ mod tests {
                 operation_id: vec![0xff],
                 confirmed_at_bytes: vec![0],
                 revoked_at: None,
-                revoked_by: None,            }],
+                revoked_by: None,
+            }],
         }
     }
 

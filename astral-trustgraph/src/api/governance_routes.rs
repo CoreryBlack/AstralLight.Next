@@ -102,25 +102,27 @@ pub enum GovernanceMutationPlan {
 
 /// memory—v1 §4.14: audit event emission — structured log with the B-4
 /// field set; persistent rows land via C-2 five-piece writing.
-pub fn emit_governance_audit(
-    operator_user: &str,
-    operator_identity: &str,
-    action: &str,
-    resource: &str,
-    target: &str,
-    approver: &str,
-    operation_id: &str,
-    root_version: u64,
-) {
+pub struct GovernanceAuditEvent<'a> {
+    pub operator_user: &'a str,
+    pub operator_identity: &'a str,
+    pub action: &'a str,
+    pub resource: &'a str,
+    pub target: &'a str,
+    pub approver: &'a str,
+    pub operation_id: &'a str,
+    pub root_version: u64,
+}
+
+pub fn emit_governance_audit(event: &GovernanceAuditEvent<'_>) {
     tracing::info!(
-        target = %target,
-        operator_user = %operator_user,
-        operator_identity = %operator_identity,
-        approver = %approver,
-        action = %action,
-        resource = %resource,
-        operation_id = %operation_id,
-        root_version = root_version,
+        target = event.target,
+        operator_user = event.operator_user,
+        operator_identity = event.operator_identity,
+        approver = event.approver,
+        action = event.action,
+        resource = event.resource,
+        operation_id = event.operation_id,
+        root_version = event.root_version,
         "memory-v1 governance mutation"
     );
 }

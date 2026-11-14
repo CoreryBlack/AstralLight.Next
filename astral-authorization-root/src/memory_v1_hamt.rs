@@ -973,8 +973,8 @@ impl HamtCandidate {
 #[cfg(test)]
 mod tests {
     use super::*;
-        use crate::memory_v1_db_rows::UserCardStatus;
-use crate::memory_v1_db_rows::BindingLayer;
+    use crate::memory_v1_db_rows::BindingLayer;
+    use crate::memory_v1_db_rows::UserCardStatus;
     use crate::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
 
     // memory—v1: Generate distinct binary IDs without assuming an encoding.

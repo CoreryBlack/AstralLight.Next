@@ -582,8 +582,8 @@ pub(crate) fn digest_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-        use crate::memory_v1_db_rows::UserCardStatus;
-use crate::memory_v1_db_rows::{IdentityCardRow, RuleSetRow, TenantRow, UserRow};
+    use crate::memory_v1_db_rows::UserCardStatus;
+    use crate::memory_v1_db_rows::{IdentityCardRow, RuleSetRow, TenantRow, UserRow};
     use crate::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
 
     // memory—v1: Construct distinct candidate IDs.

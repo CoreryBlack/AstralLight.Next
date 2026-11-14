@@ -366,15 +366,6 @@ fn user_card_status(
     }
 }
 
-// memory—v1 §4.12 B-2.4: read optional revocation operator ID.
-fn optional_revoked_by(
-    row: &MySqlRow,
-    name: &'static str,
-    meter: &mut Meter,
-) -> Result<Option<BinaryId>, CandidateCaptureError> {
-    optional_binary_id(row, name, meter)
-}
-
 // memory—v1 §4.10: absent owner scope defaults to the strictest `self`;
 // unsupported scope bytes are rejected, never widened.
 fn owner_scope(

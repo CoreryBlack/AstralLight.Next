@@ -1750,4 +1750,8 @@ mod tests {
         assert_eq!(allowed.decision, MemoryV1Decision::Allow);
         assert!(allowed.admission.is_some());
     }
+
+    // memory—v1 §4.12/§4.11 (batch B): REMOVED binding skip, confirmation
+    // revocation → binding skip, revocation vs bad-data distinction, and
+    // dual-layer governance grants.
 }

@@ -695,7 +695,6 @@ fn trusted_now() -> i64 {
         .unwrap_or(0)
 }
 
-
 impl Drop for RootOwner {
     // memory—v1: Consumer handles become unavailable before a replacement root can exist.
     fn drop(&mut self) {
@@ -1054,8 +1053,8 @@ impl RequestRootReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-        use crate::memory_v1_db_rows::UserCardStatus;
-use crate::memory_v1_db_rows::{
+    use crate::memory_v1_db_rows::UserCardStatus;
+    use crate::memory_v1_db_rows::{
         BindingConfirmationRow, BindingLayer, BindingRow, IdentityCardRow, RuleSetRow,
         RuleSetVersionRow, TenantRow, UserCardRow, UserRow,
     };

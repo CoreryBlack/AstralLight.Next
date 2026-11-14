@@ -136,8 +136,8 @@ fn inspect_with(
 
 #[cfg(test)]
 mod tests {
-    use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
     use super::*;
+    use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
     use astral_authorization_root::memory_v1_db_rows::{
         BindingLayer, BindingRow, CandidateRows, CurrentSelection, IdentityCardRow, RuleSetRow,
         RuleSetVersionRow, TenantRow, UserCardRow, UserRow,

@@ -39,6 +39,16 @@ arch_status = "current"
 note = "含 legacy v2 签名拒绝；memory—v1 签名请求经双卡上下文到正式引擎的 PENDING 检查，不证明 Gateway JWT、根接线或 ALLOW"
 
 [[entry]]
+id = "testsuite/memory-v1-request-chain-candidate"
+category = "security"
+owner_crate = "testsuite"
+path = "tests-suite/series/E1/memory_v1_request_chain_candidate.rs"
+kind = "integration"
+arch_status = "current"
+note = "memory—v1 candidate：进程内 Router、测试认证/签名与候选根；正式评估 PENDING；不证明生产认证、来源校验、数据库、listener 或 ALLOW"
+run = "cargo test -p testsuite --features memory-v1-candidate --test memory_v1_request_chain_candidate"
+
+[[entry]]
 id = "astral-common/audit_tenant_tests"
 category = "multi-tenant"
 owner_crate = "astral-common"
@@ -169,6 +179,15 @@ arch_status = "current"
 note = "含级联删除 fail-closed 守卫(依赖 origin region 安装契约)与旧快照退役守卫"
 
 [[entry]]
+id = "astral-trustgraph/memory-v1-permission-chain"
+category = "security"
+owner_crate = "astral-trustgraph"
+path = "astral-trustgraph/tests/memory_v1_permission_chain.rs"
+kind = "integration"
+arch_status = "current"
+note = "memory—v1 权限链夹具切片：无已核验会话时 Gateway 在任何下游分发与策略评估前拒绝；已核验夹具根由 TrustGraph 权限守卫在任何策略评估前拒绝（503，评估计数为零，处理器未运行）。夹具身份与测试签发者不代表网关认证、会话或授权事实；无数据库、无监听"
+
+[[entry]]
 id = "astral-monitor/integration"
 category = "integration"
 owner_crate = "astral-monitor"
@@ -242,6 +261,25 @@ kind = "integration-ignored"
 requires = ["ASTRAL_AUTHORITY_ETCD_ENDPOINTS(真实 etcd quorum + v3 JSON 网关)", "RUST_INTEGRATION_REQUIRED=1"]
 arch_status = "current"
 note = "默认 #[ignore] 不计 PASS;RUST_INTEGRATION_REQUIRED=1 而环境缺失时显式 FAIL,无环境且未要求时报告 [SKIP];当前宿主机无 etcd,保持 BLOCKED"
+
+[[entry]]
+id = "astral-single-node/memory-v1-service-process"
+category = "security"
+owner_crate = "astral-single-node"
+path = "astral-single-node/tests/memory_v1_service_process.rs"
+kind = "integration"
+arch_status = "current"
+note = "memory—v1 实验真实服务：启动真实二进制并断言不安全或不完整的启动全部被拒（正式路径仍拒、未知 profile、非回环监听、缺凭据文件/未知限制名、0644 凭据文件、不可达数据库），任何拒绝都不输出就绪行；无数据库；其数据库端到端用例单独登记为 ignored"
+
+[[entry]]
+id = "astral-single-node/memory-v1-service-database-e2e"
+category = "integration"
+owner_crate = "astral-single-node"
+path = "astral-single-node/tests/memory_v1_service_process.rs"
+kind = "integration-ignored"
+requires = ["ASTRAL_MEMORY_V1_E2E_ADMIN_URL(回环 MySQL 8 服务器 URL,例如 SSH 隧道;本测试在其上创建并删除唯一 run-scoped 库)"]
+arch_status = "current"
+note = "默认 #[ignore] 不计 PASS;缺环境变量或服务器非回环时 --ignored 显式 panic,不静默跳过（配置与回环检查先于平台检查）。非 Unix 在数据库连接之前以 [SKIP] 结束（范围外：服务凭据门禁一律拒绝无法核验 0600 模式的凭据文件，SIGTERM 排空亦仅 Unix）；直接运行显示 ok，但该 [SKIP] 须按 AGENTS.md 单列记录、不计 PASS，本条目不属于任何 [[suite]]，故无 runner 把它映射为 SKIP。用例创建 astral_rehearsal_mv1_<16hex> 库、应用已审查候选 DDL、参数化写入夹具行,启动真实二进制冷加载并经 HTTP 完成登录→授权读→拒绝→pending→登出,确认冷加载后无库连接、SIGTERM（经 libc::kill(2) 发送，仅 Unix）退出码 0,最后 DROP 该库并核对受保护库表清单不变。2026-11-13 经用户批准在远程测试服务器上运行两次均通过(首次运行暴露并修复列长度类型解码缺陷),两次均早于最后的源码改动,未对最终树复跑;本条目不属于任何 [[suite]],常规 refusal suite 以 --skip 排除它;当前 checkout 不带受保护数据库,不作为生产采用或授权证据"
 
 # ═══════════════ 内联单元测试(#[cfg(test)];物理上属于属主 crate)═══════════════
 
@@ -327,9 +365,8 @@ id = "inline/astral-single-node"
 category = "unit-inline"
 owner_crate = "astral-single-node"
 kind = "unit-inline"
-modules = 2
 arch_status = "current"
-note = "writer lease 监督分类 + 启动顺序形态"
+note = "writer lease 监督分类 + 启动顺序形态；memory—v1 候选组合（含隔离进程全链路生命周期请求）与实验服务配置/回环 TCP 生命周期（夹具根，非真实数据库）"
 
 [[entry]]
 id = "inline/e2e-bootstrap"
@@ -900,6 +937,19 @@ scope = "component"
 boundary = "signed gateway middleware fixture; not deployed host full mediation"
 sources = ["tests-suite/series/E1/gateway_contract_tests.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "gateway_contract_tests", "--locked"]
+acceptance = "rust"
+minimum_tests = 1
+
+[[suite]]
+id = "memory-v1-request-chain-candidate"
+owner = "testsuite"
+profile = "native-kernel"
+test_services = []
+series = ["E1"]
+scope = "component"
+boundary = "candidate in-process Router with real Gateway sanitizer and downstream signature verifier, test-only authentication, signing and ID mapping; formal evaluation remains PENDING; no production JWT, source-IP validation, listener, database or ALLOW evidence"
+sources = ["tests-suite/series/E1/memory_v1_request_chain_candidate.rs"]
+argv = ["cargo", "test", "-p", "testsuite", "--features", "memory-v1-candidate", "--test", "memory_v1_request_chain_candidate"]
 acceptance = "rust"
 minimum_tests = 1
 
@@ -1513,11 +1563,56 @@ series = ["M2", "E3", "E4"]
 scope = "component"
 boundary = "Single-node binary readiness/liveness ordering contract: required-service or owner loss closes admission before abort, writer-lease supervision precedes warm-up and service spawn, projection-owner liveness gate is wired into readiness and the run loop, lease loss is watched during readiness, terminal service errors are recorded and never polled again, bounded abort joins with detach classification, and writer-lease probe mismatch/unknown classifications are fatal; in-process and source-shape assertions only; liveness is never an authorization proof; not MySQL, RabbitMQ, four-node, dual-database, external arbiter, TLC or deployment evidence"
 sources = ["astral-single-node/src/main.rs", "astral-single-node/src/writer_lease.rs"]
-argv = ["cargo", "test", "-p", "astral-single-node", "--locked", "--bin", "astral-single-node", "--", "--test-threads=1"]
+argv = ["cargo", "test", "-p", "astral-single-node", "--locked", "--bin", "astral-single-node", "--", "--test-threads=1", "--skip", "memory_v1_composition::", "--skip", "memory_v1_service::", "--skip", "memory_v1_preflight::"]
 acceptance = "rust"
-minimum_tests = 18
-expected_tests = 18
+minimum_tests = 26
+expected_tests = 26
 timeout_seconds = 600
+
+[[suite]]
+id = "single-node-memory-v1-composition-contracts"
+owner = "astral-single-node"
+profile = "native-kernel"
+test_services = []
+series = ["E1", "M2"]
+scope = "component"
+boundary = "memory-v1 single-node composition and experimental service contracts over a fixture root adopted through the test-only test-support hook: one full-path protected request through the real Gateway, TrustGraph routes, permission middleware and PolicyEngine::evaluate_memory_v1, the Identity capability handed to Gateway assembly, request-scope budget lifecycle, captured-candidate installation, exact profile/settings/acknowledged-limit parsing, the experimental profile never reaching the production adoption path, and a loopback-TCP lifecycle of login, authorized read, deny decisions, pending route and logout with graceful drain; the root rows are fixtures, not database provenance, coverage, confirmer authority or production adoption; loopback sockets only, no MySQL, RabbitMQ, deployment, formal listener or authorization-proof evidence"
+sources = ["astral-single-node/src/memory_v1_composition.rs", "astral-single-node/src/memory_v1_full_path_tests.rs", "astral-single-node/src/memory_v1_service.rs", "astral-single-node/src/memory_v1_service_tests.rs"]
+argv = ["cargo", "test", "-p", "astral-single-node", "--locked", "--bin", "astral-single-node", "--", "--test-threads=1", "memory_v1_composition::", "memory_v1_service::"]
+acceptance = "rust"
+minimum_tests = 12
+expected_tests = 12
+timeout_seconds = 900
+
+[[suite]]
+id = "single-node-memory-v1-preflight-contracts"
+owner = "astral-single-node"
+profile = "native-kernel"
+test_services = []
+series = ["E1", "M2"]
+scope = "component"
+boundary = "memory-v1 formal-path startup preflight over fixture rows: the refusal names every evidence family the gate checks that the production grade cannot prove, and only an empty report passes; the gate does not check every family Rust spec §15.10.5 requires before adoption, so a passing refusal is not production readiness; the formal path loads through the preflight loader, reads and validates the candidate before its listener gates, and never loads through the readiness loader (source-shape guard); the candidate is installed through the process-root installer, reported and retired in an isolated child process, after which no handle can read it; the rows are fixtures, not database provenance, coverage or adoption evidence; no MySQL, no listener, no adoption and no served request"
+sources = ["astral-single-node/src/memory_v1_preflight.rs", "astral-single-node/src/memory_v1_service.rs", "astral-single-node/src/main.rs"]
+argv = ["cargo", "test", "-p", "astral-single-node", "--locked", "--bin", "astral-single-node", "--", "--test-threads=1", "memory_v1_preflight::"]
+acceptance = "rust"
+minimum_tests = 3
+expected_tests = 3
+timeout_seconds = 600
+
+[[suite]]
+id = "single-node-memory-v1-service-process-refusals"
+owner = "astral-single-node"
+profile = "native-kernel"
+test_services = []
+series = ["E1", "M2"]
+scope = "component"
+boundary = "real astral-single-node binary started as a child process with a cleared environment: an unknown profile, a non-loopback listen address, an unset ASTRAL_MEMORY_V1_CREDENTIALS_FILE, an unknown acknowledged-limit name, a group/world-readable credentials file (on a platform without Unix mode bits every credentials file is refused as unverifiable) and, under the experimental profile on Unix, an unreachable candidate database are each refused without ever printing the readiness line; on a non-Unix host the unreachable-database case prints [SKIP] because the credentials gate refuses first; the formal path (no profile) is driven only to its strict loopback gate, which refuses a loopback database before any candidate read, so this suite does not execute the formal path's candidate read or its listener refusal (their ordering is checked only by source-shape guards in the readiness and preflight contract suites); the end-to-end loopback host guard is checked on parsed URLs only; no reachable database, no served request and no adoption evidence; the database-backed end-to-end case is registered separately as ignored and is not selected here"
+sources = ["astral-single-node/tests/memory_v1_service_process.rs", "astral-single-node/src/memory_v1_service.rs", "astral-single-node/src/main.rs", "astral-single-node/src/memory_v1_preflight.rs"]
+argv = ["cargo", "test", "-p", "astral-single-node", "--locked", "--test", "memory_v1_service_process", "--", "--test-threads=1", "--skip", "real_service_end_to_end"]
+acceptance = "rust"
+minimum_tests = 7
+expected_tests = 7
+timeout_seconds = 900
 
 [[suite]]
 id = "mq-consumer-unknown-transition-contracts"
@@ -2465,6 +2560,21 @@ sources = ["tests-suite/series/E3/org_scope_projector_integration.rs"]
 argv = ["cargo", "test", "-p", "testsuite", "--test", "org_scope_projector_integration", "--locked", "--", "--ignored", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 minimum_tests = 1
+
+[[suite]]
+id = "trustgraph-memory-v1-permission-chain"
+owner = "astral-trustgraph"
+profile = "native-kernel"
+test_services = []
+series = ["E1", "M2"]
+scope = "component"
+boundary = "memory-v1 permission chain in process: the Gateway refuses a request without a verified session before any downstream dispatch or policy evaluation, and a verified fixture root is likewise refused by the TrustGraph permission guard before any policy evaluation (503, zero evaluations, no handler run); fixture identity and the test issuer do not represent Gateway authentication, a live session or authorization; no database and no listener"
+sources = ["astral-trustgraph/tests/memory_v1_permission_chain.rs", "astral-trustgraph/src/api/permission_check.rs"]
+argv = ["cargo", "test", "-p", "astral-trustgraph", "--locked", "--test", "memory_v1_permission_chain", "--", "--test-threads=1"]
+acceptance = "rust"
+minimum_tests = 1
+expected_tests = 1
+timeout_seconds = 600
 
 [[suite]]
 id = "monitor-integration"

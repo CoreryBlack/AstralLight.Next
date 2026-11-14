@@ -26,7 +26,8 @@ path = "src/main.rs"
 [dependencies]
 astral-common = { path = "../astral-common" }
 astral-types = { path = "../astral-types" }
-policy-engine = { path = "../policy-engine" }
+astral-authorization-root = { path = "../astral-authorization-root" }
+policy-engine = { path = "../policy-engine", features = ["memory-v1-candidate"] }
 astral-db = { path = "../astral-db" }
 astral-authority = { path = "../astral-authority", default-features = false }
 astral-sdk-contracts = { path = "../astral-sdk-contracts" }
@@ -53,6 +54,9 @@ once_cell = "1"
 uuid = { workspace = true }
 
 [dev-dependencies]
+astral-gateway = { path = "../astral-gateway" }
+jsonwebtoken = { workspace = true }
+tracing-subscriber = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tokio = { workspace = true, features = ["full"] }
 astral-db = { path = "../astral-db", features = ["test-support"] }

@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
+
 /// Exact bytes of a candidate `BINARY(16)` identifier, including zero bytes.
 pub type BinaryId = [u8; 16];
 
@@ -91,6 +93,10 @@ pub enum BindingLayer {
 }
 
 /// Candidate `memory_card_rule_set_binding` row.
+///
+/// §4.4/§4.10: the optional binding-level validity window and visibility scope
+/// are binding attributes; absent values default to an open window and the
+/// strictest `self`/`self` scope at evaluation time.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindingRow {
     /// Binding identifier.
@@ -101,6 +107,14 @@ pub struct BindingRow {
     pub rule_set_id: BinaryId,
     /// Candidate binding layer.
     pub binding_layer: BindingLayer,
+    /// Optional inclusive window start in trusted Unix seconds.
+    pub valid_from: Option<i64>,
+    /// Optional exclusive window end in trusted Unix seconds.
+    pub valid_until: Option<i64>,
+    /// Owner visibility scope; absent (loaded) value defaults to `self`.
+    pub owner_scope: MemoryV1OwnerScope,
+    /// Tenant visibility scope; absent (loaded) value defaults to `self`.
+    pub tenant_scope: MemoryV1TenantScope,
 }
 
 /// Candidate `memory_binding_confirmation` traceability row.
@@ -189,6 +203,115 @@ pub enum Table {
     RuleSetChangeConfirmation,
 }
 
+/// Row count of every candidate table; carries no completeness semantics by itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TableCounts {
+    /// `memory_user` rows.
+    pub users: usize,
+    /// `memory_identity_card` rows.
+    pub identity_cards: usize,
+    /// `memory_tenant` rows.
+    pub tenants: usize,
+    /// `memory_user_card` rows.
+    pub user_cards: usize,
+    /// `memory_rule_set` rows.
+    pub rule_sets: usize,
+    /// `memory_rule_set_version` rows.
+    pub rule_set_versions: usize,
+    /// `memory_card_rule_set_binding` rows.
+    pub bindings: usize,
+    /// `memory_binding_confirmation` rows.
+    pub binding_confirmations: usize,
+    /// `memory_rule_set_change_confirmation` rows.
+    pub rule_set_change_confirmations: usize,
+}
+
+impl TableCounts {
+    /// memory—v1: Sum of the nine tables, or `None` if the sum would overflow.
+    pub fn total(&self) -> Option<usize> {
+        [
+            self.users,
+            self.identity_cards,
+            self.tenants,
+            self.user_cards,
+            self.rule_sets,
+            self.rule_set_versions,
+            self.bindings,
+            self.binding_confirmations,
+            self.rule_set_change_confirmations,
+        ]
+        .into_iter()
+        .try_fold(0_usize, usize::checked_add)
+    }
+}
+
+/// Why no unambiguous current version can be named for a rule set.
+///
+/// The candidate schema defines no current-version pointer, and neither version
+/// bytes nor timestamps order versions; the only unambiguous case is a rule set
+/// that has exactly one stored version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionError {
+    /// The rule set has no stored version.
+    NoVersion {
+        /// The rule set without a version.
+        rule_set_id: BinaryId,
+    },
+    /// The rule set has several stored versions and the contract orders none of them.
+    AmbiguousVersions {
+        /// The rule set with more than one version.
+        rule_set_id: BinaryId,
+    },
+}
+
+impl CandidateRows {
+    /// memory—v1: Row count of each supplied table.
+    pub fn table_counts(&self) -> TableCounts {
+        TableCounts {
+            users: self.users.len(),
+            identity_cards: self.identity_cards.len(),
+            tenants: self.tenants.len(),
+            user_cards: self.user_cards.len(),
+            rule_sets: self.rule_sets.len(),
+            rule_set_versions: self.rule_set_versions.len(),
+            bindings: self.bindings.len(),
+            binding_confirmations: self.binding_confirmations.len(),
+            rule_set_change_confirmations: self.rule_set_change_confirmations.len(),
+        }
+    }
+
+    /// memory—v1: Name the current version of each rule set without inferring an order.
+    ///
+    /// A rule set with exactly one stored version selects it. Zero or several
+    /// versions are refused, because the candidate schema has no current-version
+    /// pointer and version bytes or timestamps are not an ordering. The result is
+    /// sorted by rule-set identifier so it is deterministic.
+    pub fn single_version_selections(&self) -> Result<Vec<CurrentSelection>, SelectionError> {
+        let mut by_rule_set: BTreeMap<BinaryId, (usize, &[u8])> = self
+            .rule_sets
+            .iter()
+            .map(|rule_set| (rule_set.rule_set_id, (0_usize, &[][..])))
+            .collect();
+        for version in &self.rule_set_versions {
+            if let Some(entry) = by_rule_set.get_mut(&version.rule_set_id) {
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = &version.version_bytes;
+            }
+        }
+        by_rule_set
+            .into_iter()
+            .map(|(rule_set_id, (versions, version_bytes))| match versions {
+                0 => Err(SelectionError::NoVersion { rule_set_id }),
+                1 => Ok(CurrentSelection {
+                    rule_set_id,
+                    version_bytes: version_bytes.to_vec(),
+                }),
+                _ => Err(SelectionError::AmbiguousVersions { rule_set_id }),
+            })
+            .collect()
+    }
+}
+
 /// A failure of a candidate row constraint or an explicit selection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidationError {
@@ -220,6 +343,8 @@ pub enum ValidationError {
     },
     /// The candidate SQL forbids a tenant being its own direct parent.
     SelfParent { tenant_id: BinaryId },
+    /// A binding window has both bounds with `from >= until` (§4.4).
+    InvalidBindingWindow { binding_id: BinaryId },
     /// An opaque byte field exceeds the SQL candidate's storage capacity.
     FieldTooLong {
         table: Table,
@@ -452,6 +577,13 @@ impl CandidateRows {
             unique(&mut binding_ids, Table::Binding, row.binding_id)?;
             require(&cards, Table::Binding, "user_card_id", row.user_card_id)?;
             require(&rule_sets, Table::Binding, "rule_set_id", row.rule_set_id)?;
+            if let (Some(from), Some(until)) = (row.valid_from, row.valid_until) {
+                if from >= until {
+                    return Err(ValidationError::InvalidBindingWindow {
+                        binding_id: row.binding_id,
+                    });
+                }
+            }
             bindings.insert(row.binding_id, row);
         }
         for row in &self.binding_confirmations {
@@ -683,6 +815,10 @@ mod tests {
                 user_card_id: id(5),
                 rule_set_id: id(6),
                 binding_layer: BindingLayer::Base,
+                valid_from: None,
+                valid_until: None,
+                owner_scope: MemoryV1OwnerScope::default(),
+                tenant_scope: MemoryV1TenantScope::default(),
             }],
             binding_confirmations: vec![BindingConfirmationRow {
                 confirmation_id: id(8),

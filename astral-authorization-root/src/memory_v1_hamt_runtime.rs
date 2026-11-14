@@ -379,6 +379,9 @@ impl HamtRuntimeHandle {
         let tenant = candidate
             .tenant(card.card.tenant_id)
             .ok_or(RuntimeError::InconsistentCandidate)?;
+        candidate
+            .check_card_confirmation_budget(&card.bindings)
+            .map_err(RuntimeError::Candidate)?;
         let mut bindings = Vec::with_capacity(card.bindings.len());
         for binding in card.bindings {
             bindings.push(RuntimeBindingContext {
@@ -580,6 +583,7 @@ pub(crate) fn digest_candidate(
 mod tests {
     use super::*;
     use crate::memory_v1_db_rows::{IdentityCardRow, RuleSetRow, TenantRow, UserRow};
+    use crate::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
 
     // memory—v1: Construct distinct candidate IDs.
     fn id(n: u8) -> BinaryId {
@@ -625,6 +629,10 @@ mod tests {
                 user_card_id: id(5),
                 rule_set_id: id(3),
                 binding_layer: BindingLayer::Base,
+                valid_from: None,
+                valid_until: None,
+                owner_scope: MemoryV1OwnerScope::default(),
+                tenant_scope: MemoryV1TenantScope::default(),
             }],
             binding_confirmations: vec![BindingConfirmationRow {
                 confirmation_id: id(7),

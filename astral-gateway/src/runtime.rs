@@ -23,6 +23,8 @@ use astral_common::config::{AppConfig, JwtValidationRole};
 use astral_common::error::global_exception_handler;
 use std::future::Future;
 
+#[path = "circuit_breaker.rs"]
+mod circuit_breaker;
 #[path = "middleware.rs"]
 pub mod middleware;
 #[path = "observability.rs"]
@@ -34,6 +36,7 @@ pub mod rate_limit;
 
 use crate::middleware::{jwt_auth_middleware, sanitize_internal_auth_headers};
 use crate::rate_limit::rate_limit_middleware;
+use astral_authorization_root::memory_v1_session_authority::MemoryV1SessionVerifier;
 
 /// Identity 用户管理的 canonical 外部路由。
 ///
@@ -211,13 +214,33 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     config.validate_listener_for(JwtValidationRole::Gateway)?;
-    run_with_listen_addr_and_shutdown_inner(config, addr, shutdown).await
+    run_with_listen_addr_and_shutdown_inner(config, addr, shutdown, None).await
+}
+
+/// memory—v1: Run the legacy listener while retaining the process-composed
+/// verifier capability for the future memory—v1 authentication branch.
+///
+/// The current listener still authenticates through the legacy JWT/MySQL path;
+/// accepting this verifier does not authorize `m1.*` credentials or claim that
+/// an external HTTP hop carries a request reader.
+pub async fn run_with_memory_v1_session_and_config_and_listen_addr_and_shutdown<F>(
+    config: AppConfig,
+    addr: &str,
+    shutdown: F,
+    session_verifier: MemoryV1SessionVerifier,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    config.validate_listener_for(JwtValidationRole::Gateway)?;
+    run_with_listen_addr_and_shutdown_inner(config, addr, shutdown, Some(session_verifier)).await
 }
 
 async fn run_with_listen_addr_and_shutdown_inner<F>(
     config: AppConfig,
     addr: &str,
     shutdown: F,
+    memory_v1_session_verifier: Option<MemoryV1SessionVerifier>,
 ) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -285,6 +308,105 @@ where
 
     tracing::info!("gateway starting");
 
+    let app = build_gateway_router(config);
+    let app = match memory_v1_session_verifier {
+        Some(session_verifier) => app.layer(axum::Extension(session_verifier)),
+        None => app,
+    };
+
+    tracing::info!(addr = %addr, "gateway listening");
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("Gateway HTTP server failed before graceful shutdown completed")?;
+
+    Ok(())
+}
+
+/// memory—v1: Construct a Gateway router for one supervised in-process composition.
+///
+/// The caller must validate configuration and retain the unique root owner.
+/// This does not open a listener or establish readiness.
+pub fn build_in_process_gateway_router(
+    config: AppConfig,
+    identity: Router,
+    trustgraph: Router,
+    root: astral_authorization_root::memory_v1_root::RootHandle,
+) -> Router {
+    build_in_process_gateway_router_with_session_verifier(
+        config,
+        identity,
+        trustgraph,
+        root,
+        MemoryV1SessionVerifier::deny_all(),
+    )
+}
+
+/// memory—v1: Build the in-process Gateway with the Identity-owned verifier.
+pub fn build_in_process_gateway_router_with_session_verifier(
+    config: AppConfig,
+    identity: Router,
+    trustgraph: Router,
+    root: astral_authorization_root::memory_v1_root::RootHandle,
+    session_verifier: MemoryV1SessionVerifier,
+) -> Router {
+    build_in_process_gateway_router_with_session_verifier_and_budget(
+        config,
+        identity,
+        trustgraph,
+        root,
+        session_verifier,
+        astral_authorization_root::memory_v1_request::RequestRootBudget::new(
+            proxy::DEFAULT_MAX_ACTIVE_REQUEST_SCOPES,
+        ),
+    )
+}
+
+/// memory—v1: Build the in-process Gateway whose request scopes are admitted
+/// through the composition-owned `scope_budget`.
+///
+/// The composition keeps a clone of the budget to observe live request scopes;
+/// exhaustion is rejected per request (503) and never queued.
+pub fn build_in_process_gateway_router_with_session_verifier_and_budget(
+    config: AppConfig,
+    identity: Router,
+    trustgraph: Router,
+    root: astral_authorization_root::memory_v1_root::RootHandle,
+    session_verifier: MemoryV1SessionVerifier,
+    scope_budget: astral_authorization_root::memory_v1_request::RequestRootBudget,
+) -> Router {
+    let (identity_issuer, identity_verifier) =
+        astral_common::middleware::gateway_signature::in_process_gateway_source();
+    let (trustgraph_issuer, trustgraph_verifier) =
+        astral_common::middleware::gateway_signature::in_process_gateway_source();
+    let identity = identity.layer(axum_middleware::from_fn_with_state(
+        (config.clone(), identity_verifier),
+        astral_common::middleware::gateway_signature::in_process_gateway_signature_middleware,
+    ));
+    let trustgraph = trustgraph.layer(axum_middleware::from_fn_with_state(
+        (config.clone(), trustgraph_verifier),
+        astral_common::middleware::gateway_signature::in_process_gateway_signature_middleware,
+    ));
+    build_gateway_router(config).layer(axum::Extension(
+        proxy::InProcessTargets::with_session_verifier_and_budget(
+            identity,
+            trustgraph,
+            std::sync::Arc::new(identity_issuer),
+            std::sync::Arc::new(trustgraph_issuer),
+            root,
+            session_verifier,
+            scope_budget,
+        ),
+    ))
+}
+
+// memory—v1: Assemble the Gateway middleware independently of listener ownership.
+fn build_gateway_router(config: AppConfig) -> Router {
     // 配置 CORS。AppConfig 已在启动前拒绝 wildcard、缺失和不安全 origin，
     // 这里仅构造显式 allow-list，避免运行时镜像任意请求 Origin。
     let origins: Vec<_> = config
@@ -302,7 +424,7 @@ where
         .allow_headers(Any)
         .allow_credentials(config.cors.allow_credentials);
 
-    let app = gateway_routes()
+    gateway_routes()
         // JWT 中间件（公共路径放行 + strict MySQL 会话判定（可选已证明镜像）+
         // 租户状态严格校验 + 身份头注入）
         .route_layer(axum_middleware::from_fn_with_state(
@@ -330,20 +452,7 @@ where
         )
         // 最外层指标中间件：看到最终状态码（JWT 401/403、限流 429、404）。
         .layer(axum_middleware::from_fn(observability::metrics_middleware))
-        .with_state(config);
-
-    tracing::info!(addr = %addr, "gateway listening");
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await
-    .context("Gateway HTTP server failed before graceful shutdown completed")?;
-
-    Ok(())
+        .with_state(config)
 }
 
 #[cfg(test)]
@@ -356,6 +465,114 @@ mod tests {
 
     use super::axum_middleware;
     use astral_common::config::AppConfig;
+
+    // memory—v1: The real Gateway route carries one request scope through in-process dispatch.
+    #[tokio::test]
+    async fn in_process_gateway_dispatches_public_route_and_ends_reader_scope() {
+        use astral_authorization_root::memory_v1_db_rows::CandidateRows;
+        use astral_authorization_root::memory_v1_hamt::CandidateBudget;
+        use astral_authorization_root::memory_v1_request::{
+            RequestRootAccessError, RequestRootExtension,
+        };
+        use astral_authorization_root::memory_v1_root::install_process_root;
+        use axum::extract::Extension;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+
+        let owner = install_process_root(
+            CandidateRows::default(),
+            vec![],
+            CandidateBudget {
+                max_table_rows: 16,
+                max_bindings_per_read: 4,
+            },
+        )
+        .unwrap();
+        let captured: Arc<Mutex<Option<RequestRootExtension>>> = Arc::new(Mutex::new(None));
+        let downstream_captured = Arc::clone(&captured);
+        let identity = Router::new().route(
+            "/api/v1/auth/sessions",
+            post(
+                move |Extension(root): Extension<RequestRootExtension>,
+                      axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
+                    std::net::SocketAddr,
+                >,
+                      headers: HeaderMap| {
+                    let captured = Arc::clone(&downstream_captured);
+                    async move {
+                        assert!(!headers.contains_key("x-user-id"));
+                        assert!(!headers.contains_key("x-real-ip"));
+                        assert_eq!(
+                            peer.ip(),
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                        );
+                        let first = root
+                            .with_reader(|reader| (reader.request_id(), reader.metadata()))
+                            .unwrap();
+                        let second = root
+                            .clone()
+                            .with_reader(|reader| (reader.request_id(), reader.metadata()))
+                            .unwrap();
+                        assert_eq!(first, second);
+                        *captured.lock().unwrap() = Some(root);
+                        StatusCode::NO_CONTENT
+                    }
+                },
+            ),
+        );
+        let mut config = AppConfig::default();
+        config.gateway.hmac_secret = uuid::Uuid::new_v4().to_string();
+        let app =
+            super::build_in_process_gateway_router(config, identity, Router::new(), owner.handle());
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/main/api/v1/permission-rules/registry")
+                    .header("x-user-id", "forged")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        std::net::Ipv4Addr::LOCALHOST,
+                        12345,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert!(captured.lock().unwrap().is_none());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/sessions")
+                    .header("x-user-id", "forged")
+                    .header("x-real-ip", "forged")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        std::net::Ipv4Addr::LOCALHOST,
+                        12345,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let extension = captured.lock().unwrap().take().unwrap();
+        assert!(matches!(
+            extension.with_reader(|_| ()),
+            Err(RequestRootAccessError::ScopeEnded)
+        ));
+        in_process_routes_preserve_encoded_paths_and_query(owner.handle()).await;
+    }
 
     #[test]
     fn os_signal_failure_is_retained_after_runtime_cleanup() {
@@ -612,6 +829,91 @@ mod tests {
                 "unsupported alias must remain 404: {path}"
             );
         }
+    }
+
+    // memory—v1: Exercise real Gateway route extraction and both downstream verifier boundaries.
+    async fn in_process_routes_preserve_encoded_paths_and_query(
+        root: astral_authorization_root::memory_v1_root::RootHandle,
+    ) {
+        use astral_common::middleware::gateway_signature::{
+            in_process_gateway_signature_middleware, in_process_gateway_source,
+        };
+        use axum::http::StatusCode;
+        use axum::routing::any;
+        use std::sync::Arc;
+
+        let mut config = AppConfig::default();
+        config.gateway.hmac_secret = uuid::Uuid::new_v4().to_string();
+        let (identity_issuer, identity_verifier) = in_process_gateway_source();
+        let (trustgraph_issuer, trustgraph_verifier) = in_process_gateway_source();
+        let identity = Router::new()
+            .route(
+                "/api/v1/auth/password/reset/{token}",
+                any(inspect_in_process_route),
+            )
+            .route("/api/v1/auth/me", any(inspect_in_process_route))
+            .layer(axum_middleware::from_fn_with_state(
+                (config.clone(), identity_verifier),
+                in_process_gateway_signature_middleware,
+            ));
+        let trustgraph = Router::new()
+            .route("/main/api/v1/{*path}", any(inspect_in_process_route))
+            .layer(axum_middleware::from_fn_with_state(
+                (config.clone(), trustgraph_verifier),
+                in_process_gateway_signature_middleware,
+            ));
+        let app = super::gateway_routes()
+            .with_state(config)
+            .layer(axum::Extension(super::proxy::InProcessTargets::new(
+                identity,
+                trustgraph,
+                Arc::new(identity_issuer),
+                Arc::new(trustgraph_issuer),
+                root,
+            )));
+
+        for (method, uri) in [
+            ("POST", "/api/v1/auth/password/reset/plain?source=email"),
+            (
+                "POST",
+                "/api/v1/auth/password/reset/a%2Fb%3Fc%25d%23e?source=a%2Fb&empty=",
+            ),
+            ("GET", "/api/v1/auth/me?view=cards%2Factive"),
+            (
+                "GET",
+                "/main/api/v1/permission-rules/a%2Fb%3Fc%25d%23e?view=a%2Fb&empty=",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        // Fixture identity stands in for the Gateway authentication layer.
+                        .header("x-principal-kind", "APP_USER")
+                        .header("x-identity-card-id", "fixture-card")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(body, uri, "{uri}");
+        }
+    }
+
+    // memory—v1: Assert the handler sees exactly the URI bound by the verifier.
+    async fn inspect_in_process_route(req: Request<Body>) -> String {
+        assert_eq!(req.headers()["x-original-path"], req.uri().path());
+        req.uri().to_string()
     }
 
     #[tokio::test]

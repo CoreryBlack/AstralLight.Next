@@ -350,6 +350,8 @@ impl AuthorityReservationState {
 /// one-use admission row; `request_digest` is the approved immutable target
 /// request digest. Together they tie the trusted source process identity to
 /// exactly one approved mutation: the database alone cannot self-certify.
+///
+/// [`AuthorizationFenceProof`]: crate::AuthorizationFenceProof
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthoritySourceIntent {

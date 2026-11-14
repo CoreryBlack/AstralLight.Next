@@ -17,18 +17,24 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
+use astral_authorization_root::memory_v1_request::RequestRootExtension;
+use astral_authorization_root::memory_v1_session::RequestSessionExtension;
 use astral_common::audit::org_provenance_audit_detail;
 use astral_common::error::AppError;
+use astral_common::middleware::gateway_signature::VerifiedMemoryV1SessionTransport;
 use astral_common::middleware::permission_check_shared::{
     path_matches_prefix, physical_policy_context, request_target_id, resolve_permission_action,
-    BoxedResponse,
+    AuthorizationPendingRefusal, BoxedResponse,
 };
 use astral_db::resolve_resource_ownership;
 use astral_types::AstralError;
+use policy_engine::memory_v1_formal::{
+    MemoryV1Decision, MemoryV1DenySource, MemoryV1PendingSource, MemoryV1Request,
+};
 
 use crate::observability::{
     classify_policy_decision, record_authorization_decision, record_authorization_request,
-    record_sod_check, AuthorizationAdmissionOutcome, SodCheckOutcome,
+    record_sod_check, AuthorizationAdmissionOutcome, AuthorizationDecisionOutcome, SodCheckOutcome,
 };
 use crate::AppState;
 
@@ -389,6 +395,235 @@ pub async fn permission_check_middleware(
     }
 }
 
+/// memory—v1 §4.9: TrustGraph route metadata declarations — the single
+/// registration point for adapted routes.
+///
+/// The composition root aggregates these declarations into the root registry at
+/// startup, so a route cannot be adapted without also registering its
+/// (resource, action) pair. Every other handler still scopes its data or writes
+/// by legacy identity context, which a memory—v1 request never carries, and
+/// mutations need the restricted management write path bound to one
+/// authorization, which is not implemented yet; those routes stay
+/// `AUTHORIZATION_ROUTE_NOT_ADAPTED` (503) under a memory—v1 session.
+pub struct MemoryV1RouteDeclaration {
+    pub method: &'static str,
+    /// Path relative to `/main/api/v1`.
+    pub path: &'static str,
+    pub resource: &'static str,
+    pub action: &'static str,
+}
+
+pub const MEMORY_V1_ROUTE_DECLARATIONS: &[MemoryV1RouteDeclaration] = &[MemoryV1RouteDeclaration {
+    method: "GET",
+    path: "/permission-rules/registry",
+    resource: "permission_rule",
+    action: "read",
+}];
+
+// memory—v1: Exact method/path resolution; HEAD follows its GET route.
+fn memory_v1_route_declaration(
+    method: &axum::http::Method,
+    path: &str,
+) -> Option<&'static MemoryV1RouteDeclaration> {
+    let method = if method == axum::http::Method::HEAD {
+        "GET"
+    } else {
+        method.as_str()
+    };
+    MEMORY_V1_ROUTE_DECLARATIONS
+        .iter()
+        .find(|declaration| declaration.method == method && declaration.path == path)
+}
+
+/// memory—v1: Authorize one in-process request through its request-lifecycle reader.
+///
+/// The session must be authority-verified, bound to this request's exact root
+/// scope and delivered over the proven in-process session transport; identity
+/// comes only from those facts, never from headers. Only routes adapted to
+/// memory—v1 can be admitted. The operation id and the request fingerprint are
+/// frozen before evaluation and bound into the admission. Per §3.5: DENY is 403
+/// with a subdivided reason code, retryable PENDING is 503 and a root-level
+/// failure is 500 `AUTHORIZATION_ROOT_UNAVAILABLE`. There is no fallback to the
+/// legacy path.
+async fn memory_v1_permission_check(
+    state: &AppState,
+    mut req: Request,
+    next: Next,
+    root: RequestRootExtension,
+    declaration: &'static MemoryV1RouteDeclaration,
+    authorization_started: Instant,
+) -> Result<Response, BoxedResponse> {
+    let external_path = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.0.path().to_owned())
+        .unwrap_or_else(|| req.uri().path().to_owned());
+    let transport_verified = req
+        .extensions()
+        .get::<VerifiedMemoryV1SessionTransport>()
+        .is_some();
+    let session = req
+        .extensions()
+        .get::<RequestSessionExtension>()
+        .filter(|session| transport_verified && session.is_bound_to(&root))
+        .cloned();
+    let Some(session) = session else {
+        record_authorization_request(
+            AuthorizationAdmissionOutcome::RejectedContext,
+            authorization_started.elapsed(),
+        );
+        record_authorization_decision(AuthorizationDecisionOutcome::Pending);
+        tracing::warn!(
+            resource = declaration.resource,
+            action = declaration.action,
+            path = %external_path,
+            "memory-v1 request lacks a bound authenticated session; authorization pending"
+        );
+        return Err(memory_v1_refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Authorization pending",
+            "AUTHORIZATION_PENDING",
+            &external_path,
+        ));
+    };
+    let operation_id = astral_common::middleware::request_binding::request_operation_id(&req)
+        .map_err(|status| BoxedResponse::new(status.into_response()))?;
+    let fingerprint = astral_common::middleware::request_binding::bind_http_request(&mut req)
+        .await
+        .map_err(|status| BoxedResponse::new(status.into_response()))?;
+    // memory—v1 §3.6/§4.10: object-level attribution arrives from the owning
+    // handler; the registry route is type-level, so no target is supplied yet.
+    let request = MemoryV1Request {
+        resource: declaration.resource,
+        action: declaration.action,
+        target: None,
+        target_tenant: None,
+        target_owner: None,
+        operation_id: operation_id.as_bytes(),
+        operation_fingerprint: fingerprint.as_bytes(),
+    };
+    let evaluation = state.engine.evaluate_memory_v1(&root, &session, &request);
+    match (evaluation.decision, evaluation.admission) {
+        (MemoryV1Decision::Allow, Some(admission)) => {
+            record_authorization_decision(AuthorizationDecisionOutcome::Allow);
+            record_authorization_request(
+                AuthorizationAdmissionOutcome::Admitted,
+                authorization_started.elapsed(),
+            );
+            tracing::debug!(
+                resource = declaration.resource,
+                action = declaration.action,
+                path = %external_path,
+                root_version = admission.root().version,
+                "memory-v1 request admitted"
+            );
+            req.extensions_mut().insert(admission);
+            Ok(next.run(req).await)
+        }
+        (MemoryV1Decision::Deny, _) => {
+            record_authorization_decision(AuthorizationDecisionOutcome::Deny);
+            record_authorization_request(
+                AuthorizationAdmissionOutcome::RejectedPolicy,
+                authorization_started.elapsed(),
+            );
+            // memory—v1 §3.5: the subdivided reason code is the external
+            // contract; the audit-internal source stays in the structured log
+            // (durable audit rows are the batch B audit contract).
+            let (reason, source) = match evaluation.deny_source {
+                Some(MemoryV1DenySource::RuleDenied) => ("AUTHORIZATION_RULE_DENIED", "rule_deny"),
+                Some(MemoryV1DenySource::NoMatch) => ("AUTHORIZATION_NO_MATCH", "no_match"),
+                Some(MemoryV1DenySource::ScopeDenied) => ("AUTHORIZATION_NO_MATCH", "scope_denied"),
+                Some(MemoryV1DenySource::CardUnbound) => {
+                    ("AUTHORIZATION_CARD_UNBOUND", "card_unbound")
+                }
+                Some(MemoryV1DenySource::IdentityMismatch) => {
+                    ("AUTHORIZATION_NO_MATCH", "identity_mismatch")
+                }
+                Some(MemoryV1DenySource::UnregisteredResource) => {
+                    ("AUTHORIZATION_NO_MATCH", "unregistered_resource")
+                }
+                None => ("AUTHORIZATION_NO_MATCH", "unclassified"),
+            };
+            tracing::warn!(
+                resource = declaration.resource,
+                action = declaration.action,
+                path = %external_path,
+                deny_source = source,
+                "memory-v1 request denied"
+            );
+            Err(memory_v1_refusal(
+                StatusCode::FORBIDDEN,
+                "Permission denied",
+                reason,
+                &external_path,
+            ))
+        }
+        // `Pending`, or an `Allow` without its admission, never admits the handler.
+        _ => {
+            record_authorization_decision(AuthorizationDecisionOutcome::Pending);
+            record_authorization_request(
+                AuthorizationAdmissionOutcome::RejectedPolicy,
+                authorization_started.elapsed(),
+            );
+            // memory—v1 §3.5: retryable pending stays 503; a root-level failure
+            // is 500 `AUTHORIZATION_ROOT_UNAVAILABLE` and needs human attention.
+            let (status, message, reason) = match evaluation.pending_source {
+                Some(MemoryV1PendingSource::ContextInvalid) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Authorization pending",
+                    "AUTHORIZATION_CONTEXT_INVALID",
+                ),
+                Some(MemoryV1PendingSource::FenceActive) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Authorization pending",
+                    "AUTHORIZATION_PENDING",
+                ),
+                Some(MemoryV1PendingSource::RootUnavailable) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Authorization unavailable",
+                    "AUTHORIZATION_ROOT_UNAVAILABLE",
+                ),
+                None => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Authorization pending",
+                    "AUTHORIZATION_PENDING",
+                ),
+            };
+            tracing::warn!(
+                resource = declaration.resource,
+                action = declaration.action,
+                path = %external_path,
+                reason,
+                "memory-v1 request pending"
+            );
+            Err(memory_v1_refusal(status, message, reason, &external_path))
+        }
+    }
+}
+
+// memory—v1: Uniform refusal body; it exposes no identity, rule or root detail.
+fn memory_v1_refusal(status: StatusCode, message: &str, reason: &str, path: &str) -> BoxedResponse {
+    let body = serde_json::json!({
+        "code": status.as_u16(),
+        "message": message,
+        "requestPath": path,
+        "decision": reason,
+        "reasonCode": reason,
+    });
+    let mut response = (status, axum::Json(body)).into_response();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("3"),
+        );
+        // memory—v1: A pending guard answer is healthy; the gateway must not count it as an outage.
+        if reason == "AUTHORIZATION_PENDING" {
+            AuthorizationPendingRefusal::attach(&mut response);
+        }
+    }
+    BoxedResponse::new(response)
+}
+
 /// memory—v1: Operation ownership remains unavailable until the shared root supports it.
 async fn permission_check_middleware_scoped(
     state: AppState,
@@ -450,6 +685,41 @@ async fn permission_check_middleware_scoped(
             ));
         }
     };
+
+    // memory—v1: A request dispatched with a request root scope is decided only
+    // by the memory—v1 engine entry against that scope's reader. It never reaches
+    // the legacy fence, header-derived context or retired read surface below.
+    // §4.9: adapted routes come from the metadata declarations; anything else
+    // under a memory—v1 session stays `AUTHORIZATION_ROUTE_NOT_ADAPTED`.
+    if let Some(root) = req.extensions().get::<RequestRootExtension>().cloned() {
+        let Some(declaration) = memory_v1_route_declaration(&method, path) else {
+            record_authorization_request(
+                AuthorizationAdmissionOutcome::RejectedMethodOrRoute,
+                authorization_started.elapsed(),
+            );
+            record_authorization_decision(AuthorizationDecisionOutcome::Pending);
+            tracing::warn!(
+                path,
+                method = %method,
+                "route is not adapted to memory-v1 admission; authorization pending"
+            );
+            return Err(memory_v1_refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Authorization pending",
+                "AUTHORIZATION_ROUTE_NOT_ADAPTED",
+                path,
+            ));
+        };
+        return memory_v1_permission_check(
+            &state,
+            req,
+            next,
+            root,
+            declaration,
+            authorization_started,
+        )
+        .await;
+    }
 
     // Capture once before authority reads; installed-but-unavailable is a refusal.
     let admission_fence = match astral_db::memory_projection_hub() {
@@ -875,8 +1145,81 @@ mod tests {
         audit_request_id, request_target_id, resolve_trustgraph_permission_action,
         resource_for_path, TRUSTGRAPH_PATH_RESOURCE_MAP,
     };
+
+    // memory—v1: Only a pending guard refusal carries the mark that the gateway may trust.
+    #[test]
+    fn only_pending_guard_refusals_carry_the_pending_mark() {
+        use astral_common::middleware::permission_check_shared::AuthorizationPendingRefusal;
+        use axum::response::IntoResponse as _;
+        let pending = super::memory_v1_refusal(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Authorization pending",
+            "AUTHORIZATION_PENDING",
+            "/main/api/v1/example",
+        )
+        .into_response();
+        assert!(AuthorizationPendingRefusal::is_attached(
+            pending.extensions()
+        ));
+        let denied = super::memory_v1_refusal(
+            axum::http::StatusCode::FORBIDDEN,
+            "Permission denied",
+            "AUTHORIZATION_DENIED",
+            "/main/api/v1/example",
+        )
+        .into_response();
+        assert!(!AuthorizationPendingRefusal::is_attached(
+            denied.extensions()
+        ));
+    }
+    use astral_authorization_root::memory_v1_request::RequestRootExtension;
     use axum::extract::Request;
     use axum::http::{HeaderMap, HeaderValue};
+
+    // memory—v1: The candidate adapter remains a compatibility helper for
+    // unit-level observations; production request handling requires session facts.
+    async fn evaluate_candidate_request(
+        engine: &policy_engine::PolicyEngine,
+        ctx: &astral_types::PolicyContext,
+        root: RequestRootExtension,
+    ) -> astral_types::PolicyDecision {
+        engine.evaluate_with_request_root(ctx, root).await
+    }
+
+    // memory—v1: The middleware adapter preserves candidate scope and always receives pending.
+    #[tokio::test]
+    async fn candidate_adapter_reaches_formal_engine_without_admission() {
+        use astral_authorization_root::memory_v1_db_rows::CandidateRows;
+        use astral_authorization_root::memory_v1_hamt::CandidateBudget;
+        use astral_authorization_root::memory_v1_request::RequestRootScope;
+        use astral_authorization_root::memory_v1_root::install_process_root;
+        use policy_engine::PolicyEngine;
+
+        let owner = install_process_root(
+            CandidateRows::default(),
+            vec![],
+            CandidateBudget {
+                max_table_rows: 16,
+                max_bindings_per_read: 4,
+            },
+        )
+        .unwrap();
+        let scope = RequestRootScope::new(owner.handle(), uuid::Uuid::new_v4());
+        let extension = scope.extension();
+        let ctx = astral_types::PolicyContext::builder()
+            .action("read".into())
+            .build();
+        let engine = PolicyEngine::new();
+        let decision = evaluate_candidate_request(&engine, &ctx, extension.clone()).await;
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
+        assert!(decision.audit_required);
+        assert_eq!(engine.get_stats().evaluation_count, 1);
+        drop(owner);
+        let decision = evaluate_candidate_request(&engine, &ctx, extension).await;
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason, "AUTHORIZATION_PENDING");
+    }
 
     #[test]
     fn post_reservation_gate_rechecks_and_aborts_before_handler() {

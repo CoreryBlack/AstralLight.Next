@@ -302,6 +302,7 @@ name = "astral-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "astral-authorization-root",
  "astral-common",
  "astral-db",
  "astral-mq",
@@ -336,6 +337,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "argon2",
+ "astral-authorization-root",
  "astral-common",
  "astral-db",
  "astral-mq",
@@ -475,15 +477,26 @@ name = "astral-single-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "astral-authorization-root",
  "astral-common",
  "astral-db",
  "astral-gateway",
  "astral-identity",
  "astral-mq",
  "astral-trustgraph",
+ "astral-types",
+ "async-trait",
+ "axum",
+ "libc",
+ "policy-engine",
+ "reqwest",
+ "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
+ "tower",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -492,8 +505,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "astral-authority",
+ "astral-authorization-root",
  "astral-common",
  "astral-db",
+ "astral-gateway",
  "astral-mq",
  "astral-sdk-contracts",
  "astral-types",
@@ -502,6 +517,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "hex",
+ "jsonwebtoken",
  "lapin",
  "metrics",
  "metrics-exporter-prometheus",
@@ -517,6 +533,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.0",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -4849,6 +4866,7 @@ name = "testsuite"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "astral-authorization-root",
  "astral-common",
  "astral-db",
  "astral-gateway",

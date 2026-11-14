@@ -1,6 +1,7 @@
 //! memory—v1: Execution-only measurements of the experimental candidate root.
 //! This does not measure production authorization, database loading or audit.
 
+use astral_authorization_root::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -70,6 +71,10 @@ fn fixture(
                 user_card_id: id(card as u64 + 1),
                 rule_set_id: rule,
                 binding_layer: BindingLayer::Base,
+                valid_from: None,
+                valid_until: None,
+                owner_scope: MemoryV1OwnerScope::default(),
+                tenant_scope: MemoryV1TenantScope::default(),
             });
             rows.binding_confirmations.push(BindingConfirmationRow {
                 confirmation_id: binding,

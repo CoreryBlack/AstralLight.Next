@@ -30,6 +30,22 @@ impl MemoryId {
     }
 }
 
+/// 候选请求中的用户、身份卡、用户卡和租户标识。
+///
+/// 这些标识仅用于候选关系检查，不证明来源、认证、对象有效性或授权。
+/// 身份卡不隶属于租户；用户卡与其用户、租户的关系须由同一读者核对。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CandidateIdentity {
+    /// 候选用户标识。
+    pub user_id: MemoryId,
+    /// 与用户关联的候选身份卡标识。
+    pub identity_card_id: MemoryId,
+    /// 候选用户卡标识。
+    pub user_card_id: MemoryId,
+    /// 用户卡所在的候选租户标识。
+    pub tenant_id: MemoryId,
+}
+
 /// 输入不符合小写、带连字符的规范 UUID 字符串格式。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ParseMemoryIdError;

@@ -142,21 +142,6 @@ impl WriterLeaseSupervisor {
             }
         }
     }
-
-    /// 非阻塞查询当前已确认的丢失原因（测试与状态检查用）。
-    #[cfg(test)]
-    #[must_use]
-    pub fn loss_reason_if_any(&self) -> Option<String> {
-        self.loss_rx.borrow().clone()
-    }
-
-    #[cfg(test)]
-    fn from_receiver(loss_rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
-        Self {
-            loss_rx,
-            join: None,
-        }
-    }
 }
 
 /// 启动租约监督：在租约连接本身上捕获初始 `CONNECTION_ID()`，随后派生
@@ -237,6 +222,21 @@ mod tests {
     use super::*;
 
     const LEASE: LeaseIdentity = LeaseIdentity { connection_id: 42 };
+
+    impl WriterLeaseSupervisor {
+        /// 非阻塞查询当前已确认的丢失原因（测试与状态检查用）。
+        #[must_use]
+        pub fn loss_reason_if_any(&self) -> Option<String> {
+            self.loss_rx.borrow().clone()
+        }
+
+        fn from_receiver(loss_rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
+            Self {
+                loss_rx,
+                join: None,
+            }
+        }
+    }
 
     /// Fatal lease loss must raise the STICKY required-owner failure at the
     /// detection instant (before the loss signal reaches main) — ordinary

@@ -1,6 +1,7 @@
 use super::*;
 
 mod archive_indexes;
+mod compose_baseline;
 mod constraints;
 
 const SWITCH_OPERATION_RECOVERY_CONTRACT_VERSION: i64 = 20261029000001;

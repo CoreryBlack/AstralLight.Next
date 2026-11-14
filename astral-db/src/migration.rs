@@ -35,6 +35,7 @@ mod invalidation_delivery;
 mod manifest_v3;
 mod password_reset_delivery_binding;
 mod protected_mutation;
+mod referential_rules;
 mod source_terminal_receipt;
 mod verification_durable;
 
@@ -14724,7 +14725,9 @@ async fn schema_foreign_keys_match(
             },
         )
         .collect::<Vec<_>>();
-    Ok(actual == expected)
+    // RESTRICT and NO ACTION are one rule in InnoDB and the catalog may report either,
+    // so only the delete rule is compared through the equivalence in referential_rules.
+    Ok(referential_rules::foreign_keys_match(&actual, &expected))
 }
 
 type SchemaColumnMetadataRow = (

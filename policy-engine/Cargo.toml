@@ -24,6 +24,9 @@ async-trait = "0.1"
 iai-callgrind = { version = "0.14", optional = true }
 
 [dev-dependencies]
+# memory—v1: test-only adoption hooks; dev-dependency features never reach a
+# production build under resolver 2.
+astral-authorization-root = { path = "../astral-authorization-root", features = ["test-support"] }
 metrics-exporter-prometheus = { workspace = true }
 tokio = { workspace = true }
 tokio-test = { workspace = true }

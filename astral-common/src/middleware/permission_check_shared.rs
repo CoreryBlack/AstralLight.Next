@@ -7,7 +7,7 @@ use crate::token_contract::{PrincipalKind, PRINCIPAL_KIND_HEADER};
 use astral_types::ResourceRegistry;
 use astral_types::{AstralError, PolicyContext, ResourceOwnershipScope};
 use axum::extract::Request;
-use axum::http::StatusCode;
+use axum::http::{Extensions, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 /// Heap-backed middleware response error.
@@ -28,6 +28,27 @@ impl BoxedResponse {
 impl IntoResponse for BoxedResponse {
     fn into_response(self) -> Response {
         *self.0
+    }
+}
+
+/// memory—v1: Marks a 503 that a permission guard answered as `AUTHORIZATION_PENDING`.
+///
+/// Such a refusal is a deliberate, healthy answer, so the gateway's circuit breaker must
+/// not count it as an outage. The mark is a response extension and is never serialized:
+/// an HTTP client or HTTP upstream cannot set it, and only in-process code that builds
+/// the response can attach it.
+#[derive(Clone, Copy, Debug)]
+pub struct AuthorizationPendingRefusal;
+
+impl AuthorizationPendingRefusal {
+    /// Mark a response that a guard refused as pending.
+    pub fn attach(response: &mut Response) {
+        response.extensions_mut().insert(Self);
+    }
+
+    /// Whether the extensions of a response carry this mark.
+    pub fn is_attached(extensions: &Extensions) -> bool {
+        extensions.get::<Self>().is_some()
     }
 }
 

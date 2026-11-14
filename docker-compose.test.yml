@@ -27,14 +27,21 @@ services:
     # incremental DDL is applied explicitly by astral-migrate.
     volumes:
       - ./Docs/sql/full_schema_v4.sql:/docker-entrypoint-initdb.d/00-platform-v4.sql:ro
-      # The adopted Java-era history includes MFA, absent from the v4 dump.
+      # The adopted Java-era history adds user_mfa, which the v4 dump lacks. The dump already
+      # defines mfa_attempt_log in another shape, so this migration's CREATE TABLE for it is a
+      # no-op here, and its idx_mal_attempted index is never created on the test database.
       - ./astral-db/migrations/20240630000012_user_mfa.sql:/docker-entrypoint-initdb.d/01-mfa-baseline.sql:ro
+      # Adopted Java-era identity tables that the v4 dump lacks; the fixture header explains why.
+      - ./Docs/sql/identity_ext_baseline.sql:/docker-entrypoint-initdb.d/02-identity-ext-baseline.sql:ro
 
   rabbitmq:
     profiles: ["rabbit"]
     image: rabbitmq:3-management
     environment:
-      # Inactive profiles still interpolate; the runner validates these for --rabbit.
+      # Inactive profiles still interpolate, so these default to blank. The runner does not
+      # validate them: for --rabbit it checks only RABBITMQ_URL (test-harness/src/campaign.rs
+      # prepare_environment), and it strips them from child processes. Compose maps them to the
+      # image's RABBITMQ_DEFAULT_USER and _PASS, so RABBITMQ_URL must use that account.
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-}
     ports:

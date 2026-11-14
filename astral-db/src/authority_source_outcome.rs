@@ -1,8 +1,8 @@
 //! Durable source-outcome owner for the external authority control plane.
 //!
-//! One row of [`authority_source_outcome`] is committed in the SAME source
+//! One row of `authority_source_outcome` is committed in the SAME source
 //! transaction as the mutation it describes (via
-//! [`enqueue_authority_source_outcome_tx`], the hook the shared admission-use
+//! [`stage_authority_source_outcome_tx`], the hook the shared admission-use
 //! owner calls inside its transaction). The row is the exact binding between:
 //! the stable authority reservation/proof/operation identity, the registered
 //! service/database owner, the ACTUAL source receipt identities produced by

@@ -115,7 +115,7 @@ impl EtcdAuthorityStore {
     /// One-shot lease keepalive; returns true while the lease is alive.
     ///
     /// Both the request send and the response wait are bounded by
-    /// [`LEASE_KEEP_ALIVE_TIMEOUT`]; a timeout is surfaced as `Unavailable`
+    /// `LEASE_KEEP_ALIVE_TIMEOUT`; a timeout is surfaced as `Unavailable`
     /// so the election treats it as liveness loss instead of hanging.
     pub async fn lease_keep_alive(&self, lease_id: i64) -> Result<bool, AuthorityStoreError> {
         let mut client = self.client.clone();

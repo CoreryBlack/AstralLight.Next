@@ -26,6 +26,9 @@ mod hit_stats;
 /// Experimental memory-v1 candidate inspection; never an authorization decision.
 #[cfg(feature = "memory-v1-candidate")]
 pub mod memory_v1_candidate;
+/// Typed memory-v1 evaluator, isolated from the legacy formal path.
+#[cfg(feature = "memory-v1-candidate")]
+pub mod memory_v1_formal;
 /// ORG_SCOPE admission contract and evidence validation.
 pub mod org_admission;
 /// ORG_SCOPE pure compiler kernel.

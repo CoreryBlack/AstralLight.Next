@@ -16,6 +16,12 @@ thiserror = { workspace = true }
 arc-swap = { workspace = true }
 uuid = { workspace = true }
 
+[features]
+# memory—v1: Isolated-test hooks only (for example adopting a fixture root as
+# Serving). Enable it exclusively from `[dev-dependencies]`; with resolver 2 it
+# is then absent from every non-test build, including production binaries.
+test-support = []
+
 [[bench]]
 name = "memory_v1_candidate"
 harness = false

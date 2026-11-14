@@ -262,35 +262,18 @@ mod retired_surface_tests {
     async fn every_profile_construction_is_refused() {
         let pool = sqlx::mysql::MySqlPoolOptions::new()
             .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new());
-        for profile in [AuthorizationReadProfile::SingleNodeMemory] {
-            assert!(AuthorizationReadSurface::build(
-                profile,
-                pool.clone(),
-                false,
-                false,
-                None,
-                None
-            )
-            .is_err());
-            assert!(build_authorization_read_surface(
-                profile,
-                pool.clone(),
-                false,
-                false,
-                None,
-                None
-            )
-            .is_err());
-            assert!(ensure_authorization_read_surface(
-                profile,
-                pool.clone(),
-                false,
-                false,
-                None,
-                None
-            )
-            .is_err());
-        }
+        let profile = AuthorizationReadProfile::SingleNodeMemory;
+        assert!(
+            AuthorizationReadSurface::build(profile, pool.clone(), false, false, None, None)
+                .is_err()
+        );
+        assert!(
+            build_authorization_read_surface(profile, pool.clone(), false, false, None, None)
+                .is_err()
+        );
+        assert!(
+            ensure_authorization_read_surface(profile, pool, false, false, None, None).is_err()
+        );
         assert!(authorization_read_surface().is_none());
     }
 

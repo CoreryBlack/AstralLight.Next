@@ -49,7 +49,7 @@ pub fn org_authority_evidence_hash(
 /// through [`org_authority_evidence_hash`]; expiry alone (still active) is
 /// never a revocation. The full structural binding is enforced exactly as on
 /// the positive path (shared single owner on
-/// [`OrgAdmissionEvidence::validate_structure`]): tenant/root identity, node
+/// `OrgAdmissionEvidence::validate_structure`): tenant/root identity, node
 /// head fences, dependency pinning and the complete publication/node/
 /// membership content. `checked_at_unix` stays excluded from content
 /// identity; membership validity bytes remain bound in full.

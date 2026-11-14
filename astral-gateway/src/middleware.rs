@@ -492,6 +492,85 @@ pub async fn sanitize_internal_auth_headers(mut req: Request, next: Next) -> Res
     next.run(req).await
 }
 
+// memory—v1: An opaque session is an access credential, never a refresh credential. It
+// may therefore authenticate on access routes and on the session-ending routes that
+// accept either credential kind (logout, revoke) — which only act on the presented
+// session and make no authorization decision. Refresh-only routes (refresh,
+// switch-card) and public routes keep refusing it.
+const fn memory_v1_session_route_allowed(policy: RouteCredentialPolicy) -> bool {
+    matches!(
+        policy,
+        RouteCredentialPolicy::AccessOnly | RouteCredentialPolicy::AccessOrRefresh
+    )
+}
+
+/// memory—v1: Authenticate an opaque memory—v1 access session for in-process dispatch.
+///
+/// Accepted only on access routes of the composed process, whose dispatcher then
+/// rechecks the credential and binds the same session to the request's root
+/// scope. No legacy identity header is injected: identity reaches the engine
+/// only through the bound session facts. Unknown, malformed, expired or revoked
+/// credentials are 401; an unavailable authority is 503. There is no fallback to
+/// the JWT decoder, the MySQL session path or client-supplied identity.
+async fn memory_v1_session_authentication(
+    policy: RouteCredentialPolicy,
+    req: Request,
+    next: Next,
+    path: &str,
+    credential: &str,
+) -> Response {
+    if !memory_v1_session_route_allowed(policy) {
+        return json_error(
+            req.method().as_str(),
+            path,
+            request_trace_id(&req),
+            401,
+            "Token type is not accepted on this route",
+            "UNAUTHORIZED",
+            "TOKEN_ROUTE_MISMATCH",
+        );
+    }
+    // A memory—v1 session cannot cross a network hop: only the composed process
+    // can bind it to a request root, so other Gateway modes reject it.
+    let verification = match req.extensions().get::<crate::proxy::InProcessTargets>() {
+        Some(targets) => targets.session_verifier().verify_now(credential),
+        None => {
+            return json_error(
+                req.method().as_str(),
+                path,
+                request_trace_id(&req),
+                401,
+                "memory-v1 sessions require the in-process composition",
+                "UNAUTHORIZED",
+                "AUTHENTICATION_REQUIRED",
+            )
+        }
+    };
+    match verification {
+        Ok(_) => next.run(req).await,
+        Err(astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthorityError::Unavailable) => {
+            json_error(
+                req.method().as_str(),
+                path,
+                request_trace_id(&req),
+                503,
+                "Session authority unavailable",
+                "SERVICE_UNAVAILABLE",
+                "AUTH_STATE_UNAVAILABLE",
+            )
+        }
+        Err(_) => json_error(
+            req.method().as_str(),
+            path,
+            request_trace_id(&req),
+            401,
+            "Invalid, expired or revoked session",
+            "UNAUTHORIZED",
+            "AUTHENTICATION_REQUIRED",
+        ),
+    }
+}
+
 /// JWT 认证中间件：公共路径放行 → JWT 校验 → 租户状态拦截 → 身份头注入
 ///
 /// memory—v1：拒绝重复或不可解析的凭证头，避免公开路由将其视为匿名请求。
@@ -556,6 +635,12 @@ pub async fn jwt_auth_middleware(
             )
         }
     };
+
+    // memory—v1: An opaque memory—v1 access session is never decoded as a JWT.
+    if astral_authorization_root::memory_v1_session_authority::is_memory_v1_credential(token) {
+        let credential = token.to_owned();
+        return memory_v1_session_authentication(policy, req, next, &path, &credential).await;
+    }
 
     let (claims, token_use) = match decode_v2_token(token, &config) {
         Ok(value) => value,
@@ -1385,6 +1470,50 @@ mod tests {
         assert!(RouteCredentialPolicy::PublicOnly.accepts(None));
         assert!(RouteCredentialPolicy::PublicOnly.accepts(Some(TokenUse::Access)));
         assert!(!RouteCredentialPolicy::PublicOnly.accepts(Some(TokenUse::Refresh)));
+    }
+
+    /// memory—v1: An opaque access session authenticates exactly where an access
+    /// credential would: access routes and the session-ending routes that accept
+    /// either kind. It never authenticates on refresh-only or public routes.
+    #[test]
+    fn memory_v1_session_follows_access_credential_route_policy() {
+        let route = |method: Method, path: &str| {
+            route_credential_policy_inner(&method, path, approved_public_route(&method, path))
+        };
+        for (method, path, allowed) in [
+            (Method::POST, "/api/v1/auth/sessions/logout", true),
+            (Method::POST, "/api/v1/auth/sessions/revoke", true),
+            (Method::GET, "/main/api/v1/permission-rules/registry", true),
+            (Method::POST, "/api/v1/auth/sessions/refresh", false),
+            (Method::POST, "/api/v1/auth/sessions/switch-card", false),
+            (Method::POST, "/api/v1/auth/sessions", false),
+        ] {
+            assert_eq!(
+                memory_v1_session_route_allowed(route(method.clone(), path)),
+                allowed,
+                "{method} {path}"
+            );
+        }
+        // The decision is exactly "does an access credential pass this policy",
+        // restricted to the two policies that are not public or refresh-only.
+        for policy in [
+            RouteCredentialPolicy::PublicOnly,
+            RouteCredentialPolicy::AccessOnly,
+            RouteCredentialPolicy::RefreshOnly,
+            RouteCredentialPolicy::AccessOrRefresh,
+        ] {
+            let allowed = memory_v1_session_route_allowed(policy);
+            if allowed {
+                assert!(policy.accepts(Some(TokenUse::Access)));
+            }
+            assert_eq!(
+                allowed,
+                !matches!(
+                    policy,
+                    RouteCredentialPolicy::PublicOnly | RouteCredentialPolicy::RefreshOnly
+                )
+            );
+        }
     }
 
     // ---- gateway-read-final：租户检查模式与 admission 栅栏契约 -------------

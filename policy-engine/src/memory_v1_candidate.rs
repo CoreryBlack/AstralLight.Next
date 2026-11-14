@@ -6,7 +6,9 @@
 //! `PolicyDecision` and must not be used to authorize a request.
 
 use astral_authorization_root::memory_v1_db_rows::BinaryId;
-use astral_authorization_root::memory_v1_hamt_runtime::HamtRuntimeHandle;
+use astral_authorization_root::memory_v1_hamt_runtime::{HamtRuntimeHandle, RuntimeCardContext};
+use astral_authorization_root::memory_v1_root::RequestRootReader;
+use astral_types::memory_v1::CandidateIdentity;
 
 /// Candidate identity supplied to the inspection. It is not an authentication proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +34,68 @@ pub enum CandidateInspection {
     Unverified,
 }
 
+// memory—v1: Compare the candidate identity and selection in one borrowed view.
+fn inspect_context(context: RuntimeCardContext<'_>, request: &CandidateRequest) -> (bool, bool) {
+    let matches = context.user.user_id == request.user_id
+        && context.identity.identity_card_id == request.identity_card_id
+        && context.identity.user_id == request.user_id
+        && context.card.user_card_id == request.user_card_id
+        && context.card.user_id == request.user_id
+        && context.card.tenant_id == request.tenant_id
+        && context.tenant.tenant_id == request.tenant_id;
+    let all_selected = context
+        .bindings
+        .iter()
+        .all(|binding| binding.selected.is_some());
+    (matches, all_selected)
+}
+
+/// memory—v1: Inspect a candidate using the request's shared reader and recheck it.
+///
+/// This is not an authorization decision; even `Unverified` must never grant
+/// permission. Read or owner failures are reported as unavailable.
+pub fn inspect_request_candidate(
+    reader: &RequestRootReader,
+    request: &CandidateRequest,
+) -> CandidateInspection {
+    let (matches, all_selected) = match reader.read_card(request.user_card_id, |context| {
+        inspect_context(context, request)
+    }) {
+        Ok(value) => value,
+        Err(_) => return CandidateInspection::Unavailable,
+    };
+    match reader.is_current() {
+        Ok(true) => {}
+        Ok(false) => return CandidateInspection::Changed,
+        Err(_) => return CandidateInspection::Unavailable,
+    }
+    if !matches {
+        CandidateInspection::IdentityMismatch
+    } else if !all_selected {
+        CandidateInspection::MissingSelection
+    } else {
+        CandidateInspection::Unverified
+    }
+}
+
+/// memory—v1: Inspect typed candidate identity with the same request reader.
+///
+/// The conversion preserves all 16 bytes of each ID. Neither the identity nor
+/// any inspection outcome proves authentication or permits authorization.
+/// Read or owner failures remain unavailable; a matching candidate is unverified.
+pub fn inspect_typed_request_candidate(
+    reader: &RequestRootReader,
+    identity: &CandidateIdentity,
+) -> CandidateInspection {
+    let request = CandidateRequest {
+        user_id: identity.user_id.into_bytes(),
+        identity_card_id: identity.identity_card_id.into_bytes(),
+        user_card_id: identity.user_card_id.into_bytes(),
+        tenant_id: identity.tenant_id.into_bytes(),
+    };
+    inspect_request_candidate(reader, &request)
+}
+
 /// memory—v1: Inspect one candidate context and recheck its owner-bound token.
 ///
 /// This does not parse rule bytes or decide whether a request is authorized.
@@ -50,18 +114,7 @@ fn inspect_with(
     after_read: impl FnOnce(),
 ) -> CandidateInspection {
     let read = match root.read_card(request.user_card_id, |context| {
-        let matches = context.user.user_id == request.user_id
-            && context.identity.identity_card_id == request.identity_card_id
-            && context.identity.user_id == request.user_id
-            && context.card.user_card_id == request.user_card_id
-            && context.card.user_id == request.user_id
-            && context.card.tenant_id == request.tenant_id
-            && context.tenant.tenant_id == request.tenant_id;
-        let all_selected = context
-            .bindings
-            .iter()
-            .all(|binding| binding.selected.is_some());
-        (matches, all_selected)
+        inspect_context(context, request)
     }) {
         Ok(read) => read,
         Err(_) => return CandidateInspection::Unavailable,
@@ -90,6 +143,8 @@ mod tests {
     };
     use astral_authorization_root::memory_v1_hamt::CandidateBudget;
     use astral_authorization_root::memory_v1_hamt_runtime::HamtRuntimeOwner;
+    use astral_authorization_root::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
+    use astral_types::memory_v1::MemoryId;
 
     // memory—v1: Create distinct candidate identities for isolation checks.
     fn id(value: u8) -> BinaryId {
@@ -138,6 +193,10 @@ mod tests {
                 user_card_id: id(4),
                 rule_set_id: id(5),
                 binding_layer: BindingLayer::Base,
+                valid_from: None,
+                valid_until: None,
+                owner_scope: MemoryV1OwnerScope::default(),
+                tenant_scope: MemoryV1TenantScope::default(),
             }],
             ..CandidateRows::default()
         };
@@ -168,6 +227,230 @@ mod tests {
             user_card_id: id(4),
             tenant_id: id(3),
         }
+    }
+
+    // memory—v1: One process root and reader cover identity, selection, and owner lifetime.
+    #[test]
+    fn request_reader_candidate_checks_remain_non_authorizing() {
+        use astral_authorization_root::memory_v1_root::install_process_root;
+
+        let rows = CandidateRows {
+            users: vec![UserRow { user_id: id(1) }, UserRow { user_id: id(11) }],
+            identity_cards: vec![
+                IdentityCardRow {
+                    identity_card_id: id(2),
+                    user_id: id(1),
+                },
+                IdentityCardRow {
+                    identity_card_id: id(12),
+                    user_id: id(11),
+                },
+            ],
+            tenants: vec![
+                TenantRow {
+                    tenant_id: id(3),
+                    parent_tenant_id: None,
+                },
+                TenantRow {
+                    tenant_id: id(13),
+                    parent_tenant_id: None,
+                },
+            ],
+            user_cards: vec![
+                UserCardRow {
+                    user_card_id: id(4),
+                    user_id: id(1),
+                    tenant_id: id(3),
+                },
+                UserCardRow {
+                    user_card_id: id(7),
+                    user_id: id(1),
+                    tenant_id: id(3),
+                },
+                UserCardRow {
+                    user_card_id: id(14),
+                    user_id: id(11),
+                    tenant_id: id(3),
+                },
+                UserCardRow {
+                    user_card_id: id(15),
+                    user_id: id(1),
+                    tenant_id: id(13),
+                },
+            ],
+            rule_sets: vec![
+                RuleSetRow {
+                    rule_set_id: id(5),
+                    owner_tenant_id: id(3),
+                },
+                RuleSetRow {
+                    rule_set_id: id(8),
+                    owner_tenant_id: id(3),
+                },
+            ],
+            rule_set_versions: vec![RuleSetVersionRow {
+                rule_set_id: id(5),
+                version_bytes: vec![1],
+                content_bytes: vec![1],
+                timestamp_bytes: vec![1],
+                hash_input_bytes: vec![1],
+                hash_bytes: vec![1],
+            }],
+            bindings: vec![
+                BindingRow {
+                    binding_id: id(6),
+                    user_card_id: id(4),
+                    rule_set_id: id(5),
+                    binding_layer: BindingLayer::Base,
+                    valid_from: None,
+                    valid_until: None,
+                    owner_scope: MemoryV1OwnerScope::default(),
+                    tenant_scope: MemoryV1TenantScope::default(),
+                },
+                BindingRow {
+                    binding_id: id(9),
+                    user_card_id: id(7),
+                    rule_set_id: id(8),
+                    binding_layer: BindingLayer::Base,
+                    valid_from: None,
+                    valid_until: None,
+                    owner_scope: MemoryV1OwnerScope::default(),
+                    tenant_scope: MemoryV1TenantScope::default(),
+                },
+            ],
+            ..CandidateRows::default()
+        };
+        let owner = install_process_root(
+            rows,
+            vec![CurrentSelection {
+                rule_set_id: id(5),
+                version_bytes: vec![1],
+            }],
+            CandidateBudget {
+                max_table_rows: 32,
+                max_bindings_per_read: 4,
+            },
+        )
+        .unwrap();
+        let reader = owner
+            .handle()
+            .begin_request("00000000-0000-4000-8000-000000000001".parse().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            inspect_request_candidate(&reader, &request()),
+            CandidateInspection::Unverified
+        );
+        for mismatch in [
+            CandidateRequest {
+                user_id: id(10),
+                ..request()
+            },
+            CandidateRequest {
+                identity_card_id: id(10),
+                ..request()
+            },
+            CandidateRequest {
+                tenant_id: id(10),
+                ..request()
+            },
+        ] {
+            assert_eq!(
+                inspect_request_candidate(&reader, &mismatch),
+                CandidateInspection::IdentityMismatch
+            );
+        }
+        assert_eq!(
+            inspect_request_candidate(
+                &reader,
+                &CandidateRequest {
+                    user_card_id: id(7),
+                    ..request()
+                },
+            ),
+            CandidateInspection::MissingSelection
+        );
+        assert_eq!(
+            inspect_request_candidate(
+                &reader,
+                &CandidateRequest {
+                    user_card_id: id(10),
+                    ..request()
+                },
+            ),
+            CandidateInspection::Unavailable
+        );
+        // UUID values enter directly, without a numeric identity mapping.
+        let identity = CandidateIdentity {
+            user_id: "01010101-0101-0101-0101-010101010101".parse().unwrap(),
+            identity_card_id: "02020202-0202-0202-0202-020202020202".parse().unwrap(),
+            user_card_id: "04040404-0404-0404-0404-040404040404".parse().unwrap(),
+            tenant_id: "03030303-0303-0303-0303-030303030303".parse().unwrap(),
+        };
+        assert_eq!(
+            inspect_typed_request_candidate(&reader, &identity),
+            CandidateInspection::Unverified
+        );
+        for mismatch in [
+            CandidateIdentity {
+                user_id: MemoryId::from_bytes(id(11)),
+                ..identity
+            },
+            CandidateIdentity {
+                identity_card_id: MemoryId::from_bytes(id(12)),
+                ..identity
+            },
+            CandidateIdentity {
+                user_card_id: MemoryId::from_bytes(id(14)),
+                ..identity
+            },
+            CandidateIdentity {
+                user_card_id: MemoryId::from_bytes(id(15)),
+                ..identity
+            },
+            CandidateIdentity {
+                tenant_id: MemoryId::from_bytes(id(13)),
+                ..identity
+            },
+            CandidateIdentity {
+                user_id: MemoryId::from_bytes([0; 16]),
+                ..identity
+            },
+        ] {
+            assert_eq!(
+                inspect_typed_request_candidate(&reader, &mismatch),
+                CandidateInspection::IdentityMismatch
+            );
+        }
+        assert_eq!(
+            inspect_typed_request_candidate(
+                &reader,
+                &CandidateIdentity {
+                    user_card_id: MemoryId::from_bytes(id(7)),
+                    ..identity
+                },
+            ),
+            CandidateInspection::MissingSelection
+        );
+        assert_eq!(
+            inspect_typed_request_candidate(
+                &reader,
+                &CandidateIdentity {
+                    user_card_id: MemoryId::from_bytes(id(10)),
+                    ..identity
+                },
+            ),
+            CandidateInspection::Unavailable
+        );
+        drop(owner);
+        assert_eq!(
+            inspect_request_candidate(&reader, &request()),
+            CandidateInspection::Unavailable
+        );
+        assert_eq!(
+            inspect_typed_request_candidate(&reader, &identity),
+            CandidateInspection::Unavailable
+        );
     }
 
     // memory—v1: Matching rows and arbitrary rule bytes never yield an ALLOW.

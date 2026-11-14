@@ -690,7 +690,7 @@ impl OrgAuthoritiesService {
     ///
     /// memory—v1：`authority_provider`/`authority_required` 仅作为组合根冻结
     /// 签名保留（api 装配点不变），不再用于构造 SQL 规则仓储；治理元能力
-    /// 评估一律走根一致读面（见 [`Self::evaluate_meta`]）。
+    /// 评估一律走根一致读面（见 `Self::evaluate_meta`）。
     pub fn new(
         db: sqlx::MySqlPool,
         engine: Arc<PolicyEngine>,

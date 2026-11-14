@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 astral-common = { path = "../astral-common" }
+astral-authorization-root = { path = "../astral-authorization-root" }
 astral-types = { path = "../astral-types" }
 # Redis-free 会话判定（strict MySQL durable facts）：Gateway 复用 astral-db 的
 # 会话状态仓储与连接池构建（astral-common::session_projection_store 组合层）。
@@ -40,3 +41,6 @@ bytes = "1"
 uuid = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

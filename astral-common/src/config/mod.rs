@@ -1203,6 +1203,79 @@ impl AppConfig {
         Ok(cfg)
     }
 
+    /// memory—v1 experimental: Load file and environment configuration for the
+    /// loopback-only experimental service profile.
+    ///
+    /// Every startup gate of [`AppConfig::from_files_for`] still applies —
+    /// authority runtime mode, role secrets and runtime safety, with the same
+    /// test-profile resolution — and exactly one gate is skipped: the
+    /// `MemoryV1ProfileNotReady` readiness refusal. The caller is responsible
+    /// for the conditions that refusal stands for: binding the listener to
+    /// loopback only and recording the experimental adoption it serves under.
+    /// The formal entry points (`from_files_for`, `from_env_for`,
+    /// `validate_listener_for`) keep refusing; this is not a way around them for
+    /// a production listener.
+    pub fn from_files_for_memory_v1_experimental(
+        path: &str,
+        role: JwtValidationRole,
+    ) -> Result<Self, config::ConfigError> {
+        let cfg = Self::load_from_files(path)?;
+        cfg.validate_identity_for(role, Self::is_test_profile())
+            .map_err(ConfigValidationError::into_config_error)?;
+        Ok(cfg)
+    }
+
+    /// memory—v1 experimental: Validate an already loaded configuration for the
+    /// loopback-only experimental profile, with the same startup gates and
+    /// test-profile resolution as [`AppConfig::from_files_for_memory_v1_experimental`].
+    pub fn validate_memory_v1_experimental_for(
+        &self,
+        role: JwtValidationRole,
+    ) -> Result<(), ConfigValidationError> {
+        self.validate_identity_for(role, Self::is_test_profile())
+    }
+
+    /// memory—v1 preflight: Load file and environment configuration for the formal
+    /// path's startup validation, which reads the candidate snapshot before it refuses.
+    ///
+    /// Every startup gate of [`AppConfig::from_files_for`] applies with the same
+    /// test-profile resolution, and exactly one gate is skipped: the
+    /// `MemoryV1ProfileNotReady` readiness refusal. Loading grants no admission. The
+    /// caller must pass the configuration through [`AppConfig::validate_listener_for`]
+    /// before any listener can exist, and that gate keeps refusing.
+    pub fn from_files_for_memory_v1_preflight(
+        path: &str,
+        role: JwtValidationRole,
+    ) -> Result<Self, config::ConfigError> {
+        let cfg = Self::load_from_files(path)?;
+        cfg.validate_identity_for(role, Self::is_test_profile())
+            .map_err(ConfigValidationError::into_config_error)?;
+        Ok(cfg)
+    }
+
+    /// memory—v1 preflight: Validate an already loaded configuration with the same
+    /// startup gates as [`AppConfig::from_files_for_memory_v1_preflight`]. It never
+    /// admits a listener.
+    pub fn validate_memory_v1_preflight_for(
+        &self,
+        role: JwtValidationRole,
+    ) -> Result<(), ConfigValidationError> {
+        self.validate_identity_for(role, Self::is_test_profile())
+    }
+
+    /// memory—v1 preflight: Apply the non-test startup gates before the candidate read.
+    ///
+    /// [`AppConfig::from_files_for_memory_v1_preflight`] resolves the test profile, so under
+    /// a test-profile environment a local database URL reaches the candidate read. This runs
+    /// the same identity gates with the test profile disabled, for either role, and it never
+    /// admits a listener.
+    pub fn validate_strict_startup_for(
+        &self,
+        role: JwtValidationRole,
+    ) -> Result<(), ConfigValidationError> {
+        self.validate_identity_for(role, false)
+    }
+
     // memory—v1: 分层校验的启动层：authority 运行模式门 + 角色 secret 门 +
     // 运行时安全门。仅 crate 内可见——listener 准入必须走
     // `validate_listener_for`，由它在最后叠加授权读 profile 就绪门（当前对
@@ -2786,6 +2859,139 @@ cors:
             config.jwt.refresh.secret,
             "dist-refresh-override-secret-0123456789abcdef"
         );
+    }
+
+    /// memory—v1 experimental: The named experimental loader skips only the
+    /// readiness refusal. Each startup gate still applies, and the formal entry
+    /// points keep refusing the same configuration.
+    #[test]
+    fn memory_v1_loaders_skip_only_the_readiness_gate() {
+        let guard = FlatEnvGuard::acquire();
+        for (name, value) in [
+            (
+                "DATABASE_URL",
+                "mysql://db.example.invalid:3306/astral_test",
+            ),
+            ("RABBITMQ_URL", "amqps://mq.example.invalid:5671/%2f"),
+            (
+                "JWT_ACCESS_SECRET",
+                "dist-access-override-secret-0123456789abcdef",
+            ),
+            (
+                "JWT_REFRESH_SECRET",
+                "dist-refresh-override-secret-0123456789abcdef",
+            ),
+            ("JWT_ACCESS_ISSUER", "dist-test-access-issuer"),
+            ("JWT_REFRESH_ISSUER", "dist-test-refresh-issuer"),
+            ("JWT_ACCESS_AUDIENCE", "dist-test-astral-api"),
+            ("JWT_REFRESH_AUDIENCE", "dist-test-astral-session"),
+            (
+                "GATEWAY_HMAC_SECRET",
+                "gateway-hmac-override-secret-0123456789",
+            ),
+            ("CORS_ALLOWED_ORIGINS", "https://console.example.invalid"),
+            ("CORS_ALLOW_CREDENTIALS", "false"),
+        ] {
+            guard.set(name, value);
+        }
+        let missing_stem = "no-such-application-config-for-memory-v1-experimental";
+
+        // The formal entry points still refuse this very configuration.
+        let formal = AppConfig::from_files_for(missing_stem, JwtValidationRole::Gateway)
+            .expect_err("the formal loader must keep refusing listeners");
+        assert!(
+            formal.to_string().contains("not ready for a listener"),
+            "unexpected formal refusal: {formal}"
+        );
+
+        // The named experimental loader accepts it for both active roles.
+        let config = AppConfig::from_files_for_memory_v1_experimental(
+            missing_stem,
+            JwtValidationRole::Gateway,
+        )
+        .expect("the experimental loader skips only the readiness refusal");
+        config
+            .validate_memory_v1_experimental_for(JwtValidationRole::Identity)
+            .expect("the frozen experimental validation matches the loader");
+        assert_eq!(
+            config.validate_listener_for(JwtValidationRole::Gateway),
+            Err(ConfigValidationError::MemoryV1ProfileNotReady),
+            "the formal frozen validator must still refuse"
+        );
+
+        // The preflight loader used by the formal path's startup validation skips only the
+        // readiness refusal too, and it grants no listener admission.
+        let preflight =
+            AppConfig::from_files_for_memory_v1_preflight(missing_stem, JwtValidationRole::Gateway)
+                .expect("the preflight loader skips only the readiness refusal");
+        preflight
+            .validate_memory_v1_preflight_for(JwtValidationRole::Identity)
+            .expect("the preflight validation matches the loader");
+        assert_eq!(
+            preflight.validate_listener_for(JwtValidationRole::Gateway),
+            Err(ConfigValidationError::MemoryV1ProfileNotReady),
+            "the preflight must not admit a listener"
+        );
+
+        // Authority mode, role secrets and runtime safety still apply.
+        let mut changed = config.clone();
+        changed.authority_runtime_mode = AuthorityRuntimeMode::DurableOnly;
+        assert_eq!(
+            changed.validate_memory_v1_experimental_for(JwtValidationRole::Gateway),
+            Err(ConfigValidationError::OfflineAuthorityModeForListener)
+        );
+        let mut changed = config.clone();
+        changed.gateway.hmac_secret.clear();
+        assert_eq!(
+            changed.validate_memory_v1_experimental_for(JwtValidationRole::Gateway),
+            Err(ConfigValidationError::GatewayHmacSecretTooShort)
+        );
+        let mut changed = config.clone();
+        changed.cors.allowed_origins = vec!["*".into()];
+        assert_eq!(
+            changed.validate_memory_v1_experimental_for(JwtValidationRole::Gateway),
+            Err(ConfigValidationError::CorsWildcard)
+        );
+        let mut changed = config;
+        changed.database_url = "mysql://127.0.0.1:3306/astral_test".into();
+        assert_eq!(
+            changed.validate_memory_v1_experimental_for(JwtValidationRole::Gateway),
+            Err(ConfigValidationError::LocalhostConnection(
+                "DATABASE_URL".into()
+            )),
+            "a local database URL stays refused outside an explicit test profile"
+        );
+        // The loader applies the same gate while loading.
+        guard.set("ASTRAL_AUTHORITY_RUNTIME_MODE", "durable-only");
+        assert!(AppConfig::from_files_for_memory_v1_experimental(
+            missing_stem,
+            JwtValidationRole::Gateway
+        )
+        .is_err());
+        assert!(AppConfig::from_files_for_memory_v1_preflight(
+            missing_stem,
+            JwtValidationRole::Gateway
+        )
+        .is_err());
+
+        // The preflight loader resolves the test profile, which admits a local database URL
+        // before the candidate read. The strict pre-check applies the non-test gates first, so
+        // it refuses that same URL before any database access.
+        guard.set("APP_PROFILE", "test");
+        let mut local = preflight.clone();
+        local.database_url = "mysql://127.0.0.1:3306/astral_test".into();
+        local
+            .validate_memory_v1_preflight_for(JwtValidationRole::Identity)
+            .expect("the test profile admits a local database for the preflight");
+        for role in [JwtValidationRole::Gateway, JwtValidationRole::Identity] {
+            assert_eq!(
+                local.validate_strict_startup_for(role),
+                Err(ConfigValidationError::LocalhostConnection(
+                    "DATABASE_URL".into()
+                )),
+                "the strict pre-check must refuse a local database before the candidate read"
+            );
+        }
     }
 
     /// memory—v1: Accept only the new profile and keep every listener closed.

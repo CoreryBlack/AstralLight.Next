@@ -16,6 +16,7 @@ use crate::auth::{
     issue_refresh_token, map_eligibility_error, normalize_phone, sha256_hash, verify_password,
     LoginResponse, SessionContext, SessionGrant, TokenClaimsExtra,
 };
+use crate::runtime::memory_v1::MemoryV1IdentitySession;
 use crate::srv::auth_repository::AuthRepository;
 use crate::srv::session::{project_password_revocation, store_session_grant_projection};
 use crate::AppState;
@@ -96,11 +97,49 @@ pub struct ChangePasswordRequest {
 
 pub struct AuthService {
     repository: Arc<dyn AuthRepository>,
+    /// memory—v1: Optional Identity-owned UUID session boundary. The legacy
+    /// login flow remains separate until a UUID-native credential repository is
+    /// available and therefore never calls this capability implicitly.
+    memory_v1_session: Option<Arc<MemoryV1IdentitySession>>,
 }
 
 impl AuthService {
     pub fn new(repository: Arc<dyn AuthRepository>) -> Self {
-        Self { repository }
+        Self {
+            repository,
+            memory_v1_session: None,
+        }
+    }
+
+    /// memory—v1: Construct an Identity service with an explicitly injected
+    /// UUID-native session boundary. No legacy integer is converted here.
+    pub fn with_memory_v1_session(
+        repository: Arc<dyn AuthRepository>,
+        memory_v1_session: Arc<MemoryV1IdentitySession>,
+    ) -> Self {
+        Self {
+            repository,
+            memory_v1_session: Some(memory_v1_session),
+        }
+    }
+
+    /// memory—v1: Report whether the UUID-native Identity adapter was injected.
+    /// This is readiness/diagnostic state, never an authorization decision.
+    pub fn has_memory_v1_session(&self) -> bool {
+        self.memory_v1_session.is_some()
+    }
+
+    /// memory—v1: Clone the service boundary while retaining the same repository
+    /// and replacing only the explicitly injected UUID-native session capability.
+    /// Legacy login data remains unchanged and no integer identity is converted.
+    pub fn with_memory_v1_session_boundary(
+        &self,
+        memory_v1_session: Arc<MemoryV1IdentitySession>,
+    ) -> Self {
+        Self {
+            repository: Arc::clone(&self.repository),
+            memory_v1_session: Some(memory_v1_session),
+        }
     }
 
     pub async fn login(

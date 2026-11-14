@@ -6,8 +6,9 @@
 //! - HMAC-SHA256 签名注入（X-Gateway-Signature）
 //! - X-Original-Path 注入
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+use super::circuit_breaker::{CircuitBreaker, RequestPermit};
 
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
@@ -15,8 +16,16 @@ use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{Stream, StreamExt};
 
+use astral_authorization_root::memory_v1_request::RequestRootBudget;
+use astral_authorization_root::memory_v1_root::RootHandle;
+use astral_authorization_root::memory_v1_session_authority::MemoryV1SessionVerifier;
 use astral_common::config::AppConfig;
-use astral_common::middleware::gateway_signature::compute_hmac_signature_v3;
+use astral_common::middleware::gateway_signature::{
+    compute_hmac_signature_v3, InProcessGatewayIssuer,
+};
+use astral_common::middleware::permission_check_shared::AuthorizationPendingRefusal;
+use axum::Router;
+use tower::ServiceExt;
 
 /// HTTP 客户端（连接池复用）
 static CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
@@ -103,18 +112,6 @@ enum BoundedBodyError {
     Read,
 }
 
-async fn collect_upstream_response_body(
-    response: reqwest::Response,
-) -> Result<bytes::Bytes, BoundedBodyError> {
-    let declared_length = response.content_length();
-    collect_bounded_response_body(
-        response.bytes_stream(),
-        declared_length,
-        MAX_UPSTREAM_RESPONSE_BYTES,
-    )
-    .await
-}
-
 // memory—v1: Connection nominates additional hop-by-hop fields for this message.
 fn connection_header_names(headers: &HeaderMap) -> Result<Vec<HeaderName>, ()> {
     let mut names = Vec::new();
@@ -192,74 +189,88 @@ fn should_forward_client_header(
     !crate::middleware::is_proxy_forbidden_header(key)
 }
 
-/// 断路器失败阈值
-const CB_FAILURE_THRESHOLD: u32 = 5;
-
-/// 断路器恢复间隔（秒）：打开后经过此时间允许探测请求
-const CB_RECOVERY_SECS: u64 = 30;
-
-/// 断路器状态：每个上游服务独立跟踪
+/// memory—v1: Default bound on concurrently live in-process request scopes.
 ///
-/// 状态机：CLOSED → (连续 N 次失败) → OPEN → (等待 CB_RECOVERY_SECS) → HALF_OPEN → (成功) → CLOSED / (失败) → OPEN
-struct CircuitBreaker {
-    failures: AtomicU32,
-    opened_at: AtomicU64,
-    probe_in_flight: AtomicBool,
+/// Each live scope may pin one immutable root phase. Exhaustion is rejected
+/// immediately (503) rather than queued. This candidate default is not a
+/// capacity-validated production setting.
+pub const DEFAULT_MAX_ACTIVE_REQUEST_SCOPES: usize = 1024;
+
+// memory—v1: Trusted composition supplies separate in-process targets and the root handle.
+#[derive(Clone)]
+pub(crate) struct InProcessTargets {
+    identity: Router,
+    trustgraph: Router,
+    identity_issuer: std::sync::Arc<InProcessGatewayIssuer>,
+    trustgraph_issuer: std::sync::Arc<InProcessGatewayIssuer>,
+    root: RootHandle,
+    session_verifier: MemoryV1SessionVerifier,
+    scope_budget: RequestRootBudget,
 }
 
-impl CircuitBreaker {
-    const fn new() -> Self {
+impl InProcessTargets {
+    /// memory—v1: Bind downstream routes to the composition's source and read capabilities.
+    pub(crate) fn new(
+        identity: Router,
+        trustgraph: Router,
+        identity_issuer: std::sync::Arc<InProcessGatewayIssuer>,
+        trustgraph_issuer: std::sync::Arc<InProcessGatewayIssuer>,
+        root: RootHandle,
+    ) -> Self {
+        Self::with_session_verifier(
+            identity,
+            trustgraph,
+            identity_issuer,
+            trustgraph_issuer,
+            root,
+            MemoryV1SessionVerifier::deny_all(),
+        )
+    }
+
+    /// memory—v1: Construct targets with the Identity-owned session verifier.
+    pub(crate) fn with_session_verifier(
+        identity: Router,
+        trustgraph: Router,
+        identity_issuer: std::sync::Arc<InProcessGatewayIssuer>,
+        trustgraph_issuer: std::sync::Arc<InProcessGatewayIssuer>,
+        root: RootHandle,
+        session_verifier: MemoryV1SessionVerifier,
+    ) -> Self {
+        Self::with_session_verifier_and_budget(
+            identity,
+            trustgraph,
+            identity_issuer,
+            trustgraph_issuer,
+            root,
+            session_verifier,
+            RequestRootBudget::new(DEFAULT_MAX_ACTIVE_REQUEST_SCOPES),
+        )
+    }
+
+    /// memory—v1: Construct targets that admit request scopes through `scope_budget`.
+    pub(crate) fn with_session_verifier_and_budget(
+        identity: Router,
+        trustgraph: Router,
+        identity_issuer: std::sync::Arc<InProcessGatewayIssuer>,
+        trustgraph_issuer: std::sync::Arc<InProcessGatewayIssuer>,
+        root: RootHandle,
+        session_verifier: MemoryV1SessionVerifier,
+        scope_budget: RequestRootBudget,
+    ) -> Self {
         Self {
-            failures: AtomicU32::new(0),
-            opened_at: AtomicU64::new(0),
-            probe_in_flight: AtomicBool::new(false),
+            identity,
+            trustgraph,
+            identity_issuer,
+            trustgraph_issuer,
+            root,
+            session_verifier,
+            scope_budget,
         }
     }
 
-    /// Returns true when the request may proceed. At most one request is
-    /// allowed through after the recovery window as the half-open probe.
-    fn allow_request(&self) -> bool {
-        if self.failures.load(Ordering::Acquire) < CB_FAILURE_THRESHOLD {
-            return true;
-        }
-        let opened = self.opened_at.load(Ordering::Acquire);
-        if opened == 0 {
-            return false;
-        }
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if now < opened + CB_RECOVERY_SECS {
-            return false;
-        }
-        self.probe_in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    fn is_open(&self) -> bool {
-        !self.allow_request()
-    }
-
-    fn record_failure(&self) {
-        self.probe_in_flight.store(false, Ordering::Release);
-        let prev = self.failures.fetch_add(1, Ordering::Release);
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if prev + 1 >= CB_FAILURE_THRESHOLD {
-            // 首次达阈值 → OPEN；半开探测失败 → 重置 opened_at 重新进入 OPEN
-            // （否则恢复窗口过后每个请求都变探针，持续失败时不再 fail-closed）。
-            self.opened_at.store(now, Ordering::Release);
-        }
-    }
-
-    fn record_success(&self) {
-        self.probe_in_flight.store(false, Ordering::Release);
-        self.failures.store(0, Ordering::Release);
-        self.opened_at.store(0, Ordering::Release);
+    /// memory—v1: The composition's verifier; it can validate but never mint sessions.
+    pub(crate) fn session_verifier(&self) -> &MemoryV1SessionVerifier {
+        &self.session_verifier
     }
 }
 
@@ -292,8 +303,9 @@ pub async fn forward_to_identity_sessions_root(
     forward_identity_path(config, "/api/v1/auth/sessions".into(), req).await
 }
 
+// memory—v1: Hold the upstream permit through dispatch and response classification.
 async fn forward_identity_path(config: AppConfig, full_path: String, req: Request) -> Response {
-    if CB_IDENTITY.is_open() {
+    let Some(permit) = CB_IDENTITY.acquire() else {
         return json_error(
             req.method().as_str(),
             req.uri().path(),
@@ -302,23 +314,32 @@ async fn forward_identity_path(config: AppConfig, full_path: String, req: Reques
             "Identity service unavailable (circuit breaker)",
             "SERVICE_UNAVAILABLE",
         );
-    }
+    };
     let identity_uri = config.identity_service_uri.as_str();
-    let response = forward(&config, identity_uri, &full_path, req).await;
-    if dependency_failure(response.status()) {
-        CB_IDENTITY.record_failure();
+    let response = if let Some(targets) = req.extensions().get::<InProcessTargets>().cloned() {
+        forward_in_process(
+            &config,
+            req,
+            &targets,
+            targets.identity.clone(),
+            &targets.identity_issuer,
+            SessionTransport::LegacyOnly,
+        )
+        .await
     } else {
-        CB_IDENTITY.record_success();
-    }
+        forward(&config, identity_uri, &full_path, req).await
+    };
+    settle(permit, &response);
     response
 }
 
+/// memory—v1: Forward through the TrustGraph circuit's request-scoped permit.
 pub async fn forward_to_trustgraph(
     State(config): State<AppConfig>,
     Path(path): Path<String>,
     req: Request,
 ) -> Response {
-    if CB_TRUSTGRAPH.is_open() {
+    let Some(permit) = CB_TRUSTGRAPH.acquire() else {
         tracing::warn!("circuit breaker open for trustgraph service");
         return json_error(
             req.method().as_str(),
@@ -328,25 +349,34 @@ pub async fn forward_to_trustgraph(
             "TrustGraph service unavailable (circuit breaker)",
             "SERVICE_UNAVAILABLE",
         );
-    }
+    };
     let full_path = format!("/main/api/v1/{path}");
     let trustgraph_uri = config.trust_graph_uri.as_str();
-    let response = forward(&config, trustgraph_uri, &full_path, req).await;
-    if dependency_failure(response.status()) {
-        CB_TRUSTGRAPH.record_failure();
+    let response = if let Some(targets) = req.extensions().get::<InProcessTargets>().cloned() {
+        forward_in_process(
+            &config,
+            req,
+            &targets,
+            targets.trustgraph.clone(),
+            &targets.trustgraph_issuer,
+            SessionTransport::MemoryV1Guarded,
+        )
+        .await
     } else {
-        CB_TRUSTGRAPH.record_success();
-    }
+        forward(&config, trustgraph_uri, &full_path, req).await
+    };
+    settle(permit, &response);
     response
 }
 
-/// 转发到 Monitor 服务
+/// 转发到 Monitor 服务。
+/// memory—v1: Hold the circuit permit until the response is classified.
 pub async fn forward_to_monitor(
     State(config): State<AppConfig>,
     Path(path): Path<String>,
     req: Request,
 ) -> Response {
-    if CB_MONITOR.is_open() {
+    let Some(permit) = CB_MONITOR.acquire() else {
         tracing::warn!("circuit breaker open for monitor service");
         return json_error(
             req.method().as_str(),
@@ -356,27 +386,41 @@ pub async fn forward_to_monitor(
             "Monitor service unavailable (circuit breaker)",
             "SERVICE_UNAVAILABLE",
         );
-    }
+    };
     let full_path = format!("/api/v1/monitor/{path}");
     let monitor_uri = config.monitor_service_uri.as_str();
     let response = forward(&config, monitor_uri, &full_path, req).await;
-    if dependency_failure(response.status()) {
-        CB_MONITOR.record_failure();
-    } else {
-        CB_MONITOR.record_success();
-    }
+    settle(permit, &response);
     response
 }
 
-// memory—v1: Forward only after filtering each leg's connection-scoped headers.
-async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -> Response {
+// A transport-independent request prepared only after Gateway authentication.
+// Header entries stay ordered and may repeat, matching reqwest's append semantics.
+struct PreparedRequest {
+    method: axum::http::Method,
+    external_path: String,
+    upstream_path_and_query: String,
+    trace_id: Option<String>,
+    headers: Vec<(HeaderName, String)>,
+    body: bytes::Bytes,
+    session_credential: Option<String>,
+}
+
+// memory—v1: Preserve the external path for signing while preparing the downstream request.
+// This relies on the existing Gateway sanitization and authentication middleware;
+// it is not an authentication entry point for arbitrary in-process callers.
+async fn prepare_request(
+    config: &AppConfig,
+    path: &str,
+    req: Request,
+) -> Result<PreparedRequest, Box<Response>> {
     let (parts, body) = req.into_parts();
     let external_path = parts.uri.path().to_string();
     let method = parts.method.clone();
     let connection_names = match connection_header_names(&parts.headers) {
         Ok(names) => names,
         Err(()) => {
-            return json_error(
+            return Err(Box::new(json_error(
                 method.as_str(),
                 &external_path,
                 parts
@@ -386,7 +430,7 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
                 400,
                 "Invalid Connection header",
                 "BAD_REQUEST",
-            );
+            )));
         }
     };
     let identity_empty_bootstrap = is_public_identity_empty_bootstrap(&method, &external_path);
@@ -396,14 +440,14 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
         .query()
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
-    let uri = format!("{}{}{query}", base_uri.trim_end_matches('/'), path);
+    let upstream_path_and_query = format!("{path}{query}");
 
     // 读取请求体
     let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(error = %e, "Failed to read request body");
-            return json_error(
+            return Err(Box::new(json_error(
                 method.as_str(),
                 &external_path,
                 parts
@@ -413,7 +457,7 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
                 400,
                 &format!("Failed to read body: {e}"),
                 "BAD_REQUEST",
-            );
+            )));
         }
     };
 
@@ -473,8 +517,8 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
         &timestamp,
     );
 
-    // 构建转发请求
-    let mut forwarded = CLIENT.request(method.clone(), &uri);
+    // Build an ordered list, preserving duplicate values and reqwest's text-only forwarding.
+    let mut headers = Vec::new();
     for (key, value) in parts.headers.iter() {
         let key_str = key.as_str().to_lowercase();
         // Keep a client Bearer only for Identity's exact session operations.
@@ -487,7 +531,7 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
             continue;
         }
         if let Ok(v) = value.to_str() {
-            forwarded = forwarded.header(key.as_str(), v);
+            headers.push((key.clone(), v.to_string()));
         }
     }
 
@@ -511,77 +555,318 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
         ("x-permissions-truncated", permissions_truncated.as_str()),
     ] {
         if !value.is_empty() {
-            forwarded = forwarded.header(name, value);
+            headers.push((HeaderName::from_static(name), value.to_string()));
         }
     }
 
     // 注入网关签名头（覆盖任何残留值）
-    forwarded = forwarded
-        .header("X-Gateway-Auth", "verified")
-        .header("X-Gateway-Ts", &timestamp)
-        .header("X-Gateway-Signature", &signature)
-        .header("X-Original-Path", &external_path);
-
-    if !body_bytes.is_empty() {
-        forwarded = forwarded.body(body_bytes.to_vec());
+    for (name, value) in [
+        ("x-gateway-auth", "verified"),
+        ("x-gateway-ts", timestamp.as_str()),
+        ("x-gateway-signature", signature.as_str()),
+        ("x-original-path", external_path.as_str()),
+    ] {
+        headers.push((HeaderName::from_static(name), value.to_string()));
     }
 
+    let trace_id = parts
+        .headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let session_credential = if is_public_identity_empty_bootstrap(&method, &external_path) {
+        None
+    } else {
+        parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    Ok(PreparedRequest {
+        method,
+        external_path,
+        upstream_path_and_query,
+        trace_id,
+        headers,
+        body: body_bytes,
+        session_credential,
+    })
+}
+
+// memory—v1: Apply the same response limits and hop-by-hop filtering to either transport.
+async fn finish_upstream_response<S, E>(
+    prepared: &PreparedRequest,
+    status: StatusCode,
+    resp_headers: HeaderMap,
+    declared_length: Option<u64>,
+    chunks: S,
+) -> Response
+where
+    S: Stream<Item = Result<bytes::Bytes, E>>,
+{
+    let method = &prepared.method;
+    let external_path = &prepared.external_path;
+    let trace_id = prepared.trace_id.as_deref();
+    let response_connection_names = match connection_header_names(&resp_headers) {
+        Ok(names) => names,
+        Err(()) => {
+            return json_error(
+                method.as_str(),
+                external_path,
+                trace_id,
+                502,
+                "Invalid upstream Connection header",
+                "BAD_GATEWAY",
+            );
+        }
+    };
+    let resp_body =
+        match collect_bounded_response_body(chunks, declared_length, MAX_UPSTREAM_RESPONSE_BYTES)
+            .await
+        {
+            Ok(body) => body,
+            Err(_) => {
+                tracing::warn!(
+                    method = %method,
+                    path = %external_path,
+                    "upstream response read failed or exceeded the configured size limit"
+                );
+                return json_error(
+                    method.as_str(),
+                    external_path,
+                    trace_id,
+                    502,
+                    "Upstream response read failed or exceeded the configured size limit",
+                    "BAD_GATEWAY",
+                );
+            }
+        };
+
+    let mut response_builder = Response::builder().status(status);
+    for (key, value) in resp_headers.iter() {
+        if is_hop_by_hop_header(key, &response_connection_names) {
+            continue;
+        }
+        if let Ok(name) = HeaderName::from_bytes(key.as_str().as_bytes()) {
+            response_builder = response_builder.header(name, value);
+        }
+    }
+    response_builder
+        .body(Body::from(resp_body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// memory—v1: Whether a downstream target may receive the memory—v1 session transport.
+///
+/// Only a target whose permission guard evaluates memory—v1 sessions (TrustGraph)
+/// is `MemoryV1Guarded`. A `LegacyOnly` target keeps the legacy identity
+/// requirements even when a verified session is bound, so its handlers never
+/// see an identity-empty request on a protected route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionTransport {
+    MemoryV1Guarded,
+    LegacyOnly,
+}
+
+// memory—v1: Dispatch an authenticated Gateway request within the composed process.
+async fn forward_in_process(
+    config: &AppConfig,
+    req: Request,
+    targets: &InProcessTargets,
+    router: Router,
+    issuer: &InProcessGatewayIssuer,
+    session_transport: SessionTransport,
+) -> Response {
+    // Both candidate downstream routers register the external path unchanged.
+    // Preserve the raw encoding; Axum's extracted parameters are percent-decoded.
+    let path = req.uri().path().to_owned();
+    let client_ip = req
+        .extensions()
+        .get::<super::rate_limit::ResolvedClientIp>()
+        .map(|client| client.0);
+    let method = req.method().clone();
+    let trace_id = request_trace_id(&req).map(str::to_owned);
+    // memory—v1: Admit this request's root scope before buffering its body.
+    // Exhaustion is rejected at once and never queued; the slot returns when the
+    // scope and every reader lease of this request have been released.
+    let scope = match targets
+        .scope_budget
+        .try_begin(targets.root.clone(), uuid::Uuid::new_v4())
+    {
+        Ok(scope) => scope,
+        Err(_) => {
+            return json_error(
+                method.as_str(),
+                &path,
+                trace_id.as_deref(),
+                503,
+                "In-process request capacity exhausted",
+                "SERVICE_UNAVAILABLE",
+            )
+        }
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let prepared =
+        match tokio::time::timeout_at(deadline, prepare_request(config, &path, req)).await {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(response)) => return *response,
+            Err(_) => {
+                return json_error(
+                    method.as_str(),
+                    &path,
+                    trace_id.as_deref(),
+                    408,
+                    "Request body timed out",
+                    "REQUEST_TIMEOUT",
+                )
+            }
+        };
+    let mut builder = Request::builder()
+        .method(prepared.method.clone())
+        .uri(&prepared.upstream_path_and_query);
+    for (name, value) in &prepared.headers {
+        builder = builder.header(name, value.as_str());
+    }
+    let mut downstream = match builder.body(Body::from(prepared.body.clone())) {
+        Ok(request) => request,
+        Err(_) => {
+            return json_error(
+                prepared.method.as_str(),
+                &prepared.external_path,
+                prepared.trace_id.as_deref(),
+                502,
+                "Invalid upstream request",
+                "BAD_GATEWAY",
+            )
+        }
+    };
+    downstream.headers_mut().remove("x-real-ip");
+    if let Some(client_ip) = client_ip {
+        downstream
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                client_ip, 0,
+            )));
+    }
+    downstream.extensions_mut().insert(scope.extension());
+    let memory_v1_session = if let Some(credential) = prepared.session_credential.as_deref() {
+        let root = scope.extension();
+        let session = match targets.session_verifier.verify_and_bind(
+            credential,
+            trusted_request_time(),
+            &root,
+        ) {
+            Ok(session) => session,
+            Err(_) => {
+                return json_error(
+                    prepared.method.as_str(),
+                    &prepared.external_path,
+                    prepared.trace_id.as_deref(),
+                    503,
+                    "Authenticated memory-v1 session unavailable",
+                    "AUTHORIZATION_PENDING",
+                )
+            }
+        };
+        downstream.extensions_mut().insert(session);
+        true
+    } else {
+        false
+    };
+    // memory—v1: Only a request whose verified session is bound to this exact
+    // scope, dispatched to a memory—v1-guarded target, carries the session-
+    // transport mark; every other dispatch keeps the legacy identity
+    // requirements downstream.
+    if memory_v1_session && session_transport == SessionTransport::MemoryV1Guarded {
+        issuer.mark_memory_v1_session(&mut downstream);
+    } else {
+        issuer.mark(&mut downstream);
+    }
+    let result = tokio::time::timeout_at(deadline, async {
+        let _scope = scope;
+        let response = router
+            .oneshot(downstream)
+            .await
+            .expect("Router is infallible");
+        let (parts, body) = response.into_parts();
+        // memory—v1: Read the guard's mark before the rebuild below drops the extensions.
+        let guard_refusal = session_transport == SessionTransport::MemoryV1Guarded
+            && parts.status == StatusCode::SERVICE_UNAVAILABLE
+            && AuthorizationPendingRefusal::is_attached(&parts.extensions);
+        let declared_length = parts
+            .headers
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok());
+        let mut response = finish_upstream_response(
+            &prepared,
+            parts.status,
+            parts.headers,
+            declared_length,
+            body.into_data_stream(),
+        )
+        .await;
+        // memory—v1: Only a guard-attached 503 from a memory-v1 target is exempt, and only
+        // after the dispatcher has verified the mark above.
+        if guard_refusal && response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            response.extensions_mut().insert(VerifiedPendingRefusal);
+        }
+        response
+    })
+    .await;
+    match result {
+        Ok(response) => response,
+        Err(_) => json_error(
+            prepared.method.as_str(),
+            &prepared.external_path,
+            prepared.trace_id.as_deref(),
+            502,
+            "Upstream request failed",
+            "BAD_GATEWAY",
+        ),
+    }
+}
+
+// memory—v1: The production HTTP transport consumes the same prepared request.
+async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -> Response {
+    let prepared = match prepare_request(config, path, req).await {
+        Ok(prepared) => prepared,
+        Err(response) => return *response,
+    };
+    let uri = format!(
+        "{}{}",
+        base_uri.trim_end_matches('/'),
+        prepared.upstream_path_and_query
+    );
+    let mut forwarded = CLIENT.request(prepared.method.clone(), &uri);
+    for (name, value) in &prepared.headers {
+        forwarded = forwarded.header(name.as_str(), value.as_str());
+    }
+    if !prepared.body.is_empty() {
+        forwarded = forwarded.body(prepared.body.to_vec());
+    }
+
+    let method = &prepared.method;
+    let external_path = &prepared.external_path;
+    let trace_id = prepared.trace_id.as_deref();
     // 发送请求并接收响应
     match forwarded.send().await {
         Ok(response) => {
             let status = response.status();
             let resp_headers = response.headers().clone();
-            let response_connection_names = match connection_header_names(&resp_headers) {
-                Ok(names) => names,
-                Err(()) => {
-                    return json_error(
-                        method.as_str(),
-                        &external_path,
-                        parts
-                            .headers
-                            .get("x-request-id")
-                            .and_then(|v| v.to_str().ok()),
-                        502,
-                        "Invalid upstream Connection header",
-                        "BAD_GATEWAY",
-                    );
-                }
-            };
-            let resp_body = match collect_upstream_response_body(response).await {
-                Ok(body) => body,
-                Err(_) => {
-                    tracing::warn!(
-                        method = %method,
-                        path = %external_path,
-                        "upstream response read failed or exceeded the configured size limit"
-                    );
-                    return json_error(
-                        method.as_str(),
-                        &external_path,
-                        parts
-                            .headers
-                            .get("x-request-id")
-                            .and_then(|v| v.to_str().ok()),
-                        502,
-                        "Upstream response read failed or exceeded the configured size limit",
-                        "BAD_GATEWAY",
-                    );
-                }
-            };
-
-            let mut response_builder = Response::builder().status(status);
-            for (key, value) in resp_headers.iter() {
-                if is_hop_by_hop_header(key, &response_connection_names) {
-                    continue;
-                }
-                if let Ok(name) = HeaderName::from_bytes(key.as_str().as_bytes()) {
-                    response_builder = response_builder.header(name, value);
-                }
-            }
-
-            response_builder
-                .body(Body::from(resp_body))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            let declared_length = response.content_length();
+            finish_upstream_response(
+                &prepared,
+                status,
+                resp_headers,
+                declared_length,
+                response.bytes_stream(),
+            )
+            .await
         }
         Err(error) => {
             tracing::warn!(
@@ -592,11 +877,8 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
             );
             json_error(
                 method.as_str(),
-                &external_path,
-                parts
-                    .headers
-                    .get("x-request-id")
-                    .and_then(|v| v.to_str().ok()),
+                external_path,
+                trace_id,
                 502,
                 "Upstream request failed",
                 "BAD_GATEWAY",
@@ -605,8 +887,44 @@ async fn forward(config: &AppConfig, base_uri: &str, path: &str, req: Request) -
     }
 }
 
+fn trusted_request_time() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(i64::MAX)
+}
+
 fn dependency_failure(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 502..=504)
+}
+
+/// memory—v1: Attached by the gateway only, after the in-process dispatcher verified the
+/// `AuthorizationPendingRefusal` mark on a memory-v1 target's 503. Clients and HTTP
+/// upstreams cannot set it, because it is a response extension and never serialized.
+#[derive(Clone, Copy)]
+struct VerifiedPendingRefusal;
+
+/// memory—v1: Settle one upstream permit from the response it produced. A verified guard
+/// refusal is a healthy answer; every other 502-504 remains an upstream failure.
+fn settle(permit: RequestPermit<'_>, response: &Response) {
+    if circuit_failure(response) {
+        permit.record_failure();
+    } else {
+        permit.record_success();
+    }
+}
+
+fn circuit_failure(response: &Response) -> bool {
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE
+        && response
+            .extensions()
+            .get::<VerifiedPendingRefusal>()
+            .is_some()
+    {
+        return false;
+    }
+    dependency_failure(response.status())
 }
 
 /// 统一 JSON 错误响应（对齐 Java `JwtGlobalFilter.writeErrorResponse`）
@@ -659,34 +977,147 @@ fn request_trace_id(req: &Request) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod circuit_breaker_tests {
-    use super::*;
-
-    #[test]
-    fn half_open_allows_only_one_probe() {
-        let breaker = CircuitBreaker::new();
-        for _ in 0..CB_FAILURE_THRESHOLD {
-            breaker.record_failure();
-        }
-        breaker.opened_at.store(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                .saturating_sub(CB_RECOVERY_SECS + 1),
-            Ordering::Release,
-        );
-        assert!(breaker.allow_request());
-        assert!(!breaker.allow_request());
-        breaker.record_failure();
-        assert!(!breaker.allow_request());
-    }
-}
-
-#[cfg(test)]
 mod client_header_policy_tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    // memory—v1: A gateway test response with a status and an optional verified mark.
+    fn upstream_response(status: u16, verified: bool) -> Response {
+        let mut response = StatusCode::from_u16(status).unwrap().into_response();
+        if verified {
+            response.extensions_mut().insert(VerifiedPendingRefusal);
+        }
+        response
+    }
+
+    #[test]
+    fn circuit_exempts_only_verified_pending_refusals() {
+        assert!(!circuit_failure(&upstream_response(503, true)));
+        assert!(circuit_failure(&upstream_response(503, false)));
+        assert!(circuit_failure(&upstream_response(502, true)));
+        assert!(circuit_failure(&upstream_response(504, true)));
+        assert!(!circuit_failure(&upstream_response(403, false)));
+    }
+
+    #[test]
+    fn verified_pending_refusals_never_open_the_circuit() {
+        let breaker = CircuitBreaker::new();
+        for _ in 0..12 {
+            let permit = breaker
+                .acquire()
+                .expect("verified refusals keep the circuit closed");
+            settle(permit, &upstream_response(503, true));
+        }
+        assert!(breaker.acquire().is_some());
+        for _ in 0..5 {
+            let permit = breaker
+                .acquire()
+                .expect("the circuit opens only at the failure threshold");
+            settle(permit, &upstream_response(503, false));
+        }
+        assert!(breaker.acquire().is_none());
+    }
+
+    // memory—v1: Body and downstream share a deadline; expiry revokes the reader scope.
+    #[tokio::test(start_paused = true)]
+    async fn in_process_body_and_downstream_share_one_deadline() {
+        use astral_authorization_root::memory_v1_db_rows::CandidateRows;
+        use astral_authorization_root::memory_v1_hamt::CandidateBudget;
+        use astral_authorization_root::memory_v1_request::{
+            RequestRootAccessError, RequestRootExtension,
+        };
+        use astral_authorization_root::memory_v1_root::install_process_root;
+        use axum::extract::Extension;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+
+        // The process root is install-once, so run this test in a fresh process.
+        const CHILD: &str = "ASTRAL_MEMORY_V1_DEADLINE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::proxy::client_header_policy_tests::in_process_body_and_downstream_share_one_deadline",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        let owner = install_process_root(
+            CandidateRows::default(),
+            vec![],
+            CandidateBudget {
+                max_table_rows: 16,
+                max_bindings_per_read: 4,
+            },
+        )
+        .unwrap();
+        let captured: Arc<Mutex<Option<RequestRootExtension>>> = Arc::new(Mutex::new(None));
+        let downstream_captured = Arc::clone(&captured);
+        let downstream = Router::new().route(
+            "/api/v1/auth/sessions",
+            post(move |Extension(root): Extension<RequestRootExtension>| {
+                let captured = Arc::clone(&downstream_captured);
+                async move {
+                    root.with_reader(|_| ()).unwrap();
+                    *captured.lock().unwrap() = Some(root);
+                    std::future::pending::<StatusCode>().await
+                }
+            }),
+        );
+        let (issuer, _) = astral_common::middleware::gateway_signature::in_process_gateway_source();
+        let targets = InProcessTargets::new(
+            downstream.clone(),
+            Router::new(),
+            Arc::new(issuer),
+            Arc::new(astral_common::middleware::gateway_signature::in_process_gateway_source().0),
+            owner.handle(),
+        );
+        let config = AppConfig::default();
+        let body = Body::from_stream(futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"body"))
+        }));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/sessions")
+            .body(body)
+            .unwrap();
+        let task = tokio::spawn(async move {
+            forward_in_process(
+                &config,
+                req,
+                &targets,
+                downstream,
+                &targets.identity_issuer,
+                SessionTransport::LegacyOnly,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::task::yield_now().await;
+        let root = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("downstream received reader");
+        assert!(root.with_reader(|_| ()).is_ok());
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert_eq!(task.await.unwrap().status(), StatusCode::BAD_GATEWAY);
+        assert!(matches!(
+            root.with_reader(|_| ()),
+            Err(RequestRootAccessError::ScopeEnded)
+        ));
+    }
 
     // memory—v1: Check each message's explicit and nominated hop-by-hop fields.
     #[test]
@@ -905,6 +1336,156 @@ mod client_header_policy_tests {
         assert!(body["principalKind"].is_null());
         assert_eq!(body["gatewayAuth"], "verified");
         server.abort();
+    }
+
+    // memory—v1: Exercise the production preparation and response boundary through a real verifier.
+    #[tokio::test]
+    async fn prepared_request_supports_in_process_verified_dispatch() {
+        use axum::body::to_bytes;
+        use axum::routing::post;
+        use axum::{middleware, Router};
+        use tower::ServiceExt;
+
+        let config = AppConfig {
+            gateway: astral_common::config::GatewayCfg {
+                hmac_secret: uuid::Uuid::new_v4().to_string(),
+                timestamp_tolerance_secs: 30,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route(
+                "/internal/session",
+                post(|req: Request| async move {
+                    assert_eq!(req.uri().query(), Some("next=%2Fhome"));
+                    assert_eq!(req.headers()["x-original-path"], "/api/v1/auth/sessions");
+                    assert!(!req.headers().contains_key("authorization"));
+                    assert!(!req.headers().contains_key("x-user-id"));
+                    assert!(!req.headers().contains_key("x-private"));
+                    assert!(!req.headers().contains_key("content-length"));
+                    assert_eq!(req.headers().get_all("x-example").iter().count(), 2);
+                    let body = to_bytes(req.into_body(), 1024).await.unwrap();
+                    assert_eq!(body.as_ref(), b"credentials");
+                    (
+                        [
+                            ("connection", "x-private-response"),
+                            ("x-private-response", "secret"),
+                        ],
+                        "upstream body",
+                    )
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                config.clone(),
+                astral_common::middleware::gateway_signature::gateway_signature_middleware,
+            ))
+            .with_state(config.clone());
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/sessions?next=%2Fhome")
+            .header("connection", "x-private")
+            .header("x-private", "secret")
+            .header("authorization", "Bearer client-token")
+            .header("x-user-id", "forged-user")
+            .header("x-original-path", "/forged")
+            .header("content-length", "11")
+            .header("x-example", "one")
+            .header("x-example", "two")
+            .body(Body::from("credentials"))
+            .unwrap();
+        let prepared = prepare_request(&config, "/internal/session", request)
+            .await
+            .unwrap_or_else(|_| panic!("request preparation failed"));
+        let mut builder = Request::builder()
+            .method(prepared.method.clone())
+            .uri(&prepared.upstream_path_and_query);
+        for (name, value) in &prepared.headers {
+            builder = builder.header(name, value.as_str());
+        }
+        let downstream = builder.body(Body::from(prepared.body.clone())).unwrap();
+        let response = app.oneshot(downstream).await.unwrap();
+        let (parts, body) = response.into_parts();
+        let response = finish_upstream_response(
+            &prepared,
+            parts.status,
+            parts.headers,
+            None,
+            body.into_data_stream(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("connection"));
+        assert!(!response.headers().contains_key("x-private-response"));
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+            b"upstream body"
+        );
+    }
+
+    // memory—v1: Reject malformed connection lists and oversized bodies on both legs.
+    #[tokio::test]
+    async fn prepared_boundaries_reject_invalid_and_oversized_messages() {
+        use futures_util::stream;
+
+        let config = AppConfig::default();
+        let invalid = Request::builder()
+            .uri("/external")
+            .header("connection", "bad name")
+            .header("x-request-id", "trace-invalid")
+            .body(Body::empty())
+            .unwrap();
+        let error = match prepare_request(&config, "/internal", invalid).await {
+            Ok(_) => panic!("invalid Connection accepted"),
+            Err(response) => response,
+        };
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.headers()["x-trace-id"], "trace-invalid");
+
+        let too_large = Request::builder()
+            .uri("/external")
+            .body(Body::from(vec![0; 10 * 1024 * 1024 + 1]))
+            .unwrap();
+        assert!(matches!(
+            prepare_request(&config, "/internal", too_large).await,
+            Err(response) if response.status() == StatusCode::BAD_REQUEST
+        ));
+
+        let prepared = prepare_request(
+            &config,
+            "/internal",
+            Request::builder()
+                .uri("/external")
+                .header("x-request-id", "trace-upstream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("request preparation failed"));
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", HeaderValue::from_static("bad name"));
+        let response = finish_upstream_response(
+            &prepared,
+            StatusCode::OK,
+            headers,
+            None,
+            stream::empty::<Result<bytes::Bytes, ()>>(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()["x-trace-id"], "trace-upstream");
+
+        let response = finish_upstream_response(
+            &prepared,
+            StatusCode::OK,
+            HeaderMap::new(),
+            Some(MAX_UPSTREAM_RESPONSE_BYTES as u64 + 1),
+            stream::empty::<Result<bytes::Bytes, ()>>(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()["x-trace-id"], "trace-upstream");
     }
 
     #[test]

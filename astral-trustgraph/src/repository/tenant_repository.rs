@@ -675,7 +675,7 @@ pub trait TenantRepository: Send + Sync {
         let _ = (tenant_id, user_id, column, value);
         Err(tenant_context_required())
     }
-    /// 更新成员字段的 proof-bound 入口：动态列先过 [`MEMBER_FIELD_COLUMNS`]
+    /// 更新成员字段的 proof-bound 入口：动态列先过 `MEMBER_FIELD_COLUMNS`
     /// 白名单，目标成员行锁定后更新。
     async fn update_member_field_with_context(
         &self,

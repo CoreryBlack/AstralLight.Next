@@ -14,7 +14,7 @@
 //! - Connection lifecycle (bounded handshake, bounded connection lifetime,
 //!   semaphore permits held for the whole connection, `JoinSet`-owned tasks
 //!   aborted deterministically on shutdown) lives in the private
-//!   [`lifecycle`] submodule.
+//!   `lifecycle` submodule.
 
 mod lifecycle;
 
@@ -523,7 +523,7 @@ pub fn build_tls_acceptor(
 ///
 /// This is the ONLY serving path: there is no plaintext fallback.
 ///
-/// Connection lifecycle is owned by [`lifecycle`]: per-phase timeouts (the
+/// Connection lifecycle is owned by `lifecycle`: per-phase timeouts (the
 /// TLS handshake and the whole connection lifetime are hard-capped; the
 /// request timeout stays the configured `request_timeout_seconds`), a strict
 /// connection semaphore whose permit is held for the whole connection, and a

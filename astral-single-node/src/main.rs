@@ -4,11 +4,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+use astral_authorization_root::memory_v1_root::process_root_handle;
+use astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthority;
 use astral_common::config::{AppConfig, JwtValidationRole, MessageTransport};
 use astral_common::tracing::init_tracing;
 use astral_db::{install_local_projection_bus, LocalProjectionBusConfig};
+use astral_identity::MemoryV1IdentitySession;
 use astral_mq::local_bus::{install_global_local_bus, LocalBus, LocalBusLimits};
 
+mod memory_v1_composition;
+mod memory_v1_preflight;
+mod memory_v1_service;
 mod writer_lease;
 
 const DEFAULT_GATEWAY_ADDR: &str = "0.0.0.0:9001";
@@ -610,23 +616,51 @@ fn mark_hub_suspect(reason: &str) {
     }
 }
 
+// memory—v1: The legacy listener assembly does not distribute the shared root.
+fn require_memory_v1_listener_assembly() -> anyhow::Result<()> {
+    Err(anyhow!(
+        "memory-v1 listener assembly is not wired to the shared root"
+    ))
+}
+
 /// memory—v1: Refuse startup until the shared root is ready for serving.
+///
+/// The formal path validates its startup configuration, reads the candidate
+/// snapshot read-only (`memory_v1_preflight`), and then keeps its readiness
+/// refusal, so no listener is admitted. The loopback-only experimental real
+/// service is a separate, explicitly selected profile with its own module and
+/// is not reachable from the formal path.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
-    let config = AppConfig::from_files_for("application", JwtValidationRole::Gateway)
-        .context("load single-node configuration")?;
-    config.validate_listener_for(JwtValidationRole::Gateway)?;
-    config.validate_listener_for(JwtValidationRole::Identity)?;
-    let config = Arc::new(config);
-    let gateway_addr = env_or("SINGLE_NODE_GATEWAY_ADDR", DEFAULT_GATEWAY_ADDR);
+    if memory_v1_service::profile_requested()? {
+        return memory_v1_service::run().await;
+    }
+    let config =
+        AppConfig::from_files_for_memory_v1_preflight("application", JwtValidationRole::Gateway)
+            .context("load single-node configuration")?;
+    config.validate_memory_v1_preflight_for(JwtValidationRole::Identity)?;
+    // The preflight reads the candidate database, so every pure startup check runs before it.
+    config.validate_strict_startup_for(JwtValidationRole::Gateway)?;
+    config.validate_strict_startup_for(JwtValidationRole::Identity)?;
     let identity_addr = env_or("SINGLE_NODE_IDENTITY_ADDR", DEFAULT_IDENTITY_ADDR);
     let trustgraph_addr = env_or("SINGLE_NODE_TRUSTGRAPH_ADDR", DEFAULT_TRUSTGRAPH_ADDR);
     let local_snapshot_path =
         snapshot_path(std::env::var("SINGLE_NODE_SNAPSHOT_PATH").ok().as_deref())?;
     validate_composite_config(&config, &identity_addr, &trustgraph_addr)?;
+    memory_v1_preflight::run(&config).await?;
+    config.validate_listener_for(JwtValidationRole::Gateway)?;
+    config.validate_listener_for(JwtValidationRole::Identity)?;
+    let config = Arc::new(config);
+    let gateway_addr = env_or("SINGLE_NODE_GATEWAY_ADDR", DEFAULT_GATEWAY_ADDR);
     astral_mq::invalidation::install_origin_region(config.region_id.clone())
         .map_err(|error| anyhow!(error))?;
+    let memory_v1_root = process_root_handle().context(
+        "memory-v1 process root is retired by the candidate preflight; the formal path never adopts a serving root",
+    )?;
+    memory_v1_composition::require_serving_root(&memory_v1_root)
+        .context("memory-v1 serving root admission")?;
+    require_memory_v1_listener_assembly()?;
 
     let bus = LocalBus::new(LocalBusLimits::default())?;
     install_global_local_bus(bus.clone())?;
@@ -695,6 +729,16 @@ async fn main() -> anyhow::Result<()> {
         "memory mirror warm-up complete; composite readiness gate passed"
     );
 
+    // memory—v1: Construct the sole process session authority only after the
+    // startup data gates pass. Identity receives the issuer-side adapter;
+    // Gateway receives only the matching verifier. The owner stays in this
+    // scope until all three supervised services have drained.
+    let memory_v1_session_authority = MemoryV1SessionAuthority::new();
+    let memory_v1_identity_session = Arc::new(MemoryV1IdentitySession::from_session_adapter(
+        memory_v1_session_authority.identity_session_adapter(),
+    ));
+    let memory_v1_session_verifier = memory_v1_session_authority.verifier();
+
     let (identity_shutdown_tx, identity_shutdown_rx) = tokio::sync::oneshot::channel();
     let mut identity_shutdown_tx = Some(identity_shutdown_tx);
     let (trustgraph_shutdown_tx, trustgraph_shutdown_rx) = tokio::sync::oneshot::channel();
@@ -704,8 +748,9 @@ async fn main() -> anyhow::Result<()> {
     let trustgraph_barrier = Arc::clone(&producer_drain_barrier);
     let identity_task_addr = identity_addr.clone();
     let identity_config = (*config).clone();
+    let identity_memory_v1_session = Arc::clone(&memory_v1_identity_session);
     let mut identity = tokio::spawn(async move {
-        astral_identity::run_with_config_and_listen_addr_and_shutdown_and_drain(
+        astral_identity::run_with_memory_v1_session_and_config_and_listen_addr_and_shutdown_and_drain(
             identity_config,
             &identity_task_addr,
             async move {
@@ -714,6 +759,7 @@ async fn main() -> anyhow::Result<()> {
             async move {
                 identity_barrier.wait().await;
             },
+            identity_memory_v1_session,
         )
         .await
     });
@@ -796,13 +842,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("single-node service listeners and message owners ready; starting gateway");
     let (gateway_shutdown_tx, gateway_shutdown_rx) = tokio::sync::oneshot::channel();
     let gateway_config = (*config).clone();
+    let gateway_session_verifier = memory_v1_session_verifier.clone();
     let mut gateway = tokio::spawn(async move {
-        astral_gateway::run_with_config_and_listen_addr_and_shutdown(
+        astral_gateway::run_with_memory_v1_session_and_config_and_listen_addr_and_shutdown(
             gateway_config,
             &gateway_addr,
             async move {
                 let _ = gateway_shutdown_rx.await;
             },
+            gateway_session_verifier,
         )
         .await
     });
@@ -982,6 +1030,45 @@ mod tests {
     }
 
     #[test]
+    fn memory_v1_serving_gate_precedes_database_and_listener_startup() {
+        let source = include_str!("main.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let gate = production
+            .find("memory_v1_composition::require_serving_root(&memory_v1_root)")
+            .expect("single-node must require an adopted serving root");
+        let assembly = production
+            .find("require_memory_v1_listener_assembly()?;")
+            .expect("single-node must block the unwired listener assembly");
+        let database = production
+            .find("connect_and_validate_schema(&config.database_url)")
+            .expect("database preflight must remain explicit");
+        let spawn = production
+            .find("tokio::spawn")
+            .expect("listeners must be spawned only after startup gates");
+        assert!(gate < assembly, "root gate must precede listener assembly");
+        assert!(
+            assembly < database,
+            "listener assembly gate must precede legacy warm-up"
+        );
+        assert!(
+            gate < spawn,
+            "memory-v1 gate must precede every listener spawn"
+        );
+    }
+
+    #[test]
+    fn memory_v1_listener_assembly_stays_closed_until_wired() {
+        assert!(require_memory_v1_listener_assembly().is_err());
+    }
+
+    #[test]
+    fn memory_v1_candidate_root_cannot_admit_a_listener() {
+        let source = include_str!("memory_v1_composition.rs");
+        assert!(source.contains("metadata.status != RootStatus::Serving"));
+        assert!(source.contains("memory-v1 serving root is not adopted"));
+    }
+
+    #[test]
     fn incomplete_warm_report_blocks_listener_startup() {
         let report = astral_db::WarmReport {
             identities: 3,
@@ -1036,20 +1123,135 @@ mod tests {
     }
 
     #[test]
+    fn formal_path_gates_precede_the_candidate_read() {
+        let source = include_str!("main.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let body = production
+            .split("async fn main() -> anyhow::Result<()> {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("main must be a single function body");
+        let code: Vec<&str> = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        let position = |anchor: &str| {
+            let found: Vec<usize> = code
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.contains(anchor))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "the formal branch must contain `{anchor}` exactly once"
+            );
+            found[0]
+        };
+        let read = position("memory_v1_preflight::run(&config).await?;");
+        for gate in [
+            "config.validate_memory_v1_preflight_for(JwtValidationRole::Identity)?;",
+            "config.validate_strict_startup_for(JwtValidationRole::Gateway)?;",
+            "config.validate_strict_startup_for(JwtValidationRole::Identity)?;",
+            "snapshot_path(std::env::var(\"SINGLE_NODE_SNAPSHOT_PATH\")",
+            "validate_composite_config(&config, &identity_addr, &trustgraph_addr)?;",
+        ] {
+            assert!(
+                position(gate) < read,
+                "{gate} must run before the candidate database is read"
+            );
+        }
+        assert!(
+            read < position("config.validate_listener_for(JwtValidationRole::Gateway)?;"),
+            "the candidate read must precede the listener gates"
+        );
+
+        // Every source file is scanned, not only the formal branch, so a second reader or a
+        // second preflight call anywhere in the crate fails here. A file's production region
+        // ends at its first `#[cfg(test)]`, which must open a test module: a test-only item
+        // above production code would hide that code from every source guard.
+        const CFG_TEST: &str = "#[cfg(test)]";
+        let mut preflight_callers = Vec::new();
+        let mut database_reads = Vec::new();
+        for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let production = match text.find(CFG_TEST) {
+                Some(index) => {
+                    assert!(
+                        text[index + CFG_TEST.len()..]
+                            .trim_start()
+                            .starts_with("mod "),
+                        "{name}: the first #[cfg(test)] must open a test module"
+                    );
+                    &text[..index]
+                }
+                None => text.as_str(),
+            };
+            if production.contains("memory_v1_preflight::run(") {
+                preflight_callers.push(name.clone());
+            }
+            let reads = production.matches("capture_from_database(").count();
+            if reads > 0 {
+                database_reads.push((name, reads));
+            }
+        }
+        assert_eq!(
+            preflight_callers,
+            ["main.rs"],
+            "only the formal branch may read the candidate through the preflight"
+        );
+        database_reads.sort();
+        assert_eq!(
+            database_reads,
+            [
+                ("memory_v1_preflight.rs".to_owned(), 1),
+                ("memory_v1_service.rs".to_owned(), 2),
+            ],
+            "only the preflight and the experimental profile may read the candidate database"
+        );
+    }
+
+    #[test]
     fn local_composite_passes_one_frozen_config_to_each_runtime() {
         let source = include_str!("main.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         assert_eq!(
-            production.matches("AppConfig::from_files_for(").count(),
+            production
+                .matches("AppConfig::from_files_for_memory_v1_preflight(")
+                .count(),
             1,
             "single-node must load AppConfig exactly once"
         );
-        assert!(production
-            .contains("astral_identity::run_with_config_and_listen_addr_and_shutdown_and_drain"));
-        assert!(production
-            .contains("astral_trustgraph::run_with_config_and_listen_addr_and_shutdown_and_drain"));
-        assert!(production.contains("astral_gateway::run_with_config_and_listen_addr_and_shutdown"));
-        assert!(!production.contains("reloaded_config"));
+        assert!(production.contains("astral_identity::run_with_memory_v1_session_and_config_and_listen_addr_and_shutdown_and_drain"));
+        assert!(production.contains(
+            "astral_gateway::run_with_memory_v1_session_and_config_and_listen_addr_and_shutdown"
+        ));
+        let authority = production
+            .find("let memory_v1_session_authority = MemoryV1SessionAuthority::new();")
+            .expect("single-node must create one memory-v1 authority");
+        let identity_adapter = production
+            .find("memory_v1_session_authority.identity_session_adapter()")
+            .expect("Identity must receive the authority adapter");
+        let gateway_verifier = production
+            .find("let memory_v1_session_verifier = memory_v1_session_authority.verifier();")
+            .expect("Gateway must receive the authority verifier");
+        let identity_spawn = production
+            .find("run_with_memory_v1_session_and_config_and_listen_addr_and_shutdown_and_drain(")
+            .expect("Identity must use the injected runtime entry point");
+        let gateway_spawn = production
+            .find("run_with_memory_v1_session_and_config_and_listen_addr_and_shutdown(")
+            .expect("Gateway must use the injected runtime entry point");
+        assert!(authority < identity_adapter);
+        assert!(identity_adapter < gateway_verifier);
+        assert!(gateway_verifier < identity_spawn);
+        assert!(identity_spawn < gateway_spawn);
+        assert!(!production.contains("MemoryV1SessionAuthority::new();\n    let identity ="));
         assert!(!production.contains("validate_reloaded_config"));
         assert!(!production.contains("invalidation_delivery == second.invalidation_delivery"));
         assert!(

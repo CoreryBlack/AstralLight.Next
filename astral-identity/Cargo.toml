@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 astral-common = { path = "../astral-common" }
+astral-authorization-root = { path = "../astral-authorization-root" }
 astral-types = { path = "../astral-types" }
 
 axum = { workspace = true }

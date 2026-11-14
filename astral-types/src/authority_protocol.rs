@@ -8,7 +8,8 @@
 //!
 //! Design rules honored by this module:
 //! - Existing contracts are reused, not duplicated: read responses carry the
-//!   existing [`AuthorizationFenceProof`], [`AuthorizationAuthorityScope`] and
+//!   existing [`AuthorizationFenceProof`](crate::AuthorizationFenceProof),
+//!   [`AuthorizationAuthorityScope`](crate::AuthorizationAuthorityScope) and
 //!   related types unchanged. [`GlobalAuthorityFrontier`] is a separate
 //!   global frontier whose `global_chain_digest` is deliberately NOT a scope
 //!   snapshot hash; global and per-scope content identity never collapse into

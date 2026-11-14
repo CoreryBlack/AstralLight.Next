@@ -32,10 +32,14 @@ struct GatewayRateLimit {
 
 static GATEWAY_RATE_LIMIT: OnceLock<GatewayRateLimit> = OnceLock::new();
 
+// memory—v1: Internal result of Gateway's trusted-proxy resolution, never an HTTP header.
+#[derive(Clone, Copy)]
+pub(crate) struct ResolvedClientIp(pub std::net::IpAddr);
+
 pub async fn rate_limit_middleware(
     State(config): State<AppConfig>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let shared = GATEWAY_RATE_LIMIT.get_or_init(|| {
@@ -59,6 +63,9 @@ pub async fn rate_limit_middleware(
         return rate_limit_response(&req, "rate-limit-error");
     }
 
+    if let Some(client) = client {
+        req.extensions_mut().insert(ResolvedClientIp(client));
+    }
     next.run(req).await
 }
 

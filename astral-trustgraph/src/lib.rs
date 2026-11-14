@@ -1,9 +1,12 @@
 //! AstralTrustGraph — 权限治理中心后端
 
 pub mod api;
+pub mod memory_v1_state;
 pub mod observability;
 pub mod repository;
 pub mod service;
+
+pub use memory_v1_state::build_memory_v1_offline_app_state;
 
 use astral_common::config::AppConfig;
 use axum::extract::FromRef;
@@ -46,8 +49,9 @@ use service::tenant_service::TenantService;
 use service::user_card_service::UserCardService;
 
 pub use runtime::{
-    run, run_with_config_and_listen_addr_and_shutdown_and_drain, run_with_listen_addr,
-    run_with_listen_addr_and_shutdown, run_with_listen_addr_and_shutdown_and_drain,
+    build_router, run, run_with_config_and_listen_addr_and_shutdown_and_drain,
+    run_with_listen_addr, run_with_listen_addr_and_shutdown,
+    run_with_listen_addr_and_shutdown_and_drain, RouterIntegrationConfig,
 };
 
 pub mod runtime;

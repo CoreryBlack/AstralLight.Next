@@ -143,7 +143,8 @@ TraceLayer → CORS → global_exception_handler → rate_limit_middleware
 | `gateway_signature_middleware` | 同上 | 下游验签（只接受 v3，v2 签名拒绝） |
 | `physical_policy_context` | `astral-common/src/middleware/permission_check_shared.rs` | 下游从身份头构建 `PolicyContext` |
 | `forward` / `forward_chat_ws` / `bridge_websocket` | `astral-gateway/src/proxy.rs` | HTTP 转发与 WS 双向桥 |
-| `CircuitBreaker` / `CB_LEARN`…`CB_CHAT` | 同上 | 每上游静态断路器 |
+| `CircuitBreaker` | `astral-gateway/src/circuit_breaker.rs` | 每上游断路器类型（`pub(super)`，由 `proxy.rs` 引用） |
+| `CB_IDENTITY`、`CB_TRUSTGRAPH`、`CB_MONITOR` | `astral-gateway/src/proxy.rs` | 每上游静态断路器实例 |
 | `store_session_grant_in_redis` | `astral-identity/src/srv/session.rs` | `access:jti` / `access:grant` 写入方 |
 | `issue_app_session` | `astral-identity/src/srv/internal.rs` | Learn App 登录内部会话签发端点 |
 | `HmacAppSessionIssuer` | `astral-learn/src/service/app_user_service.rs` | Learn→Gateway 内部会话客户端（冻结源码） |
@@ -215,7 +216,7 @@ AppUser 不注入 user-card 三头（claims 校验已强制其为空）。
 2. 提取 11 个身份头作为签名 payload（`x-user-id`、`x-token-id`、`x-identity-card-id`、`x-principal-kind`、`x-user-card-id`、`x-user-card-domain-id`、`x-user-card-tenant-id`、`x-token-use`、`x-claims-version`、`x-action-codes`、`x-user-roles`）。
 3. 生成毫秒时间戳，调 `compute_hmac_signature_v3(hmac_secret, method, external_path, …)`。
 4. 重建上游请求：`base_uri + rewritten_path + query`；转发客户端头时跳过 `x-gateway-*`、`x-forwarded-*`、`host`、`x-resource-owner-id`；注入 `X-Gateway-Auth: verified`、`X-Gateway-Ts`、`X-Gateway-Signature`、`X-Original-Path: external_path`（签名用外部原始路径，重写用内部路径）。
-5. 上游响应透传：状态码 + 头（剔除 `transfer-encoding` / `connection`）+ 响应体；上游 502~504 计入断路器失败，其余计入成功。
+5. 上游响应透传：状态码 + 头（剔除逐跳头 `connection`、`keep-alive`、`proxy-authenticate`、`proxy-authorization`、`proxy-connection`、`te`、`trailer`、`transfer-encoding`、`upgrade` 及 `Connection` 声明的字段）+ 响应体；上游 502~504 计入断路器失败，其余计入成功（分类与唯一例外见 §6.5）。
 6. 上游连接/读取失败 → 502 `BAD_GATEWAY`（统一 JSON）。
 
 #### ⑦ 下游 gateway_signature 验签
@@ -380,7 +381,9 @@ AppUser 不注入 user-card 三头（claims 校验已强制其为空）。
 
 ### 6.5 手写断路器
 
-- `proxy.rs` 每个上游一个 `static` `CircuitBreaker`（`CB_LEARN/CB_IDENTITY/CB_TRUSTGRAPH/CB_MONITOR/CB_CHAT`），阈值 5、恢复 30s、半开单探针，状态保存在进程内 `Atomic`，无集中配置、无 metrics/面板暴露、重启即清零。
+- `proxy.rs` 每个上游一个 `static` `CircuitBreaker`（`CB_IDENTITY/CB_TRUSTGRAPH/CB_MONITOR`），阈值 5、恢复 30s、半开单探针；状态保存在进程内 `Mutex<State>` 中，每次阶段切换推进代际，旧代际请求的结果不改变当前周期，半开探针被丢弃时重新打开并重新计时，锁中毒时失败关闭。无集中配置、无 metrics/面板暴露、重启即清零。
+- 唯一例外：进程内 TrustGraph 的 memory—v1 守卫 `AUTHORIZATION_PENDING` 503，仅当分发器核验 `AuthorizationPendingRefusal` 标记且目标为 memory—v1 守卫路由时计为成功；该标记只由 TrustGraph 守卫（`permission_check.rs` 的 `memory_v1_refusal`）在产生该 503 时附加；网关在进程内分发路径（`proxy.rs` 的 `forward_in_process`）只读取并核验该标记，核验通过且重建后的响应仍为 503 时，才附加网关私有的 `VerifiedPendingRefusal` 标记供断路器分类。两种标记都是从不序列化的响应扩展，客户端与 HTTP 上游无法设置。HTTP 上游与 Identity 不适用此例外，客户端收到的状态码、头与响应体不变。
+- 已知耦合（待 §10 决策 7：未抵达 TrustGraph 的网关本地拒绝是否计入 `CB_TRUSTGRAPH` 失败）：进程内分发路径上的网关本地 503（进程内请求容量耗尽、会话绑定失败）当前按 502~504 规则仍计入 `CB_TRUSTGRAPH` 失败。
 
 ### 6.6 astral-common 混合承载 Gateway 与下游 runtime
 
@@ -633,6 +636,7 @@ astral-gateway（边界职责收敛）
 | 4 | **Chat WS owner** | 桥接代码在 Gateway（`bridge_websocket`），连接生命周期/鉴权在 Chat（`realtime.rs`） | 决定 WS 桥是否移出 Gateway、协议适配（STOMP/SockJS 兼容、`/ws` 501 桩）归属 |
 | 5 | **route 501 桩** | `proxy::not_implemented` 对 checkins 兼容子路径（`/v1/app/users/checkins/{*path}`、`/v1/app/users/{user_id}/checkins[/{*path}]`、`/duo/**` 对应子路径）与 `/ws`、`/ws/{*path}` 返回 501；`/v1/app/users/checkins`、`/duo/v1/app/users/checkins` 两个根路径则实际转发到 Learn `/v1/app/learn/checkins` | 决定这些路径是补实现、下线还是长期桩；涉及 Java 兼容契约与前端/Duo 调用方 |
 | 6 | **Learn internal session 协议** | Learn `HmacAppSessionIssuer` 使用 `gateway_service_uri` 调用 Gateway `POST /api/v1/auth/internal/sessions`；Gateway 校验 Learn→Gateway `astral-internal-v1` assertion 后，以 Gateway→Identity `astral-internal-v1` assertion 转发；Identity 创建 AppUser identity-only access/refresh 会话，该流程不进入普通 PlatformUser 双卡策略链 | 当前两跳已实现；解冻 Learn 前仍需将两跳 producer/consumer、密钥隔离、幂等/重放语义和 wire contract 纳入正式 contract crate 与契约测试（阶段 F 门禁） |
+| 7 | **未抵达 TrustGraph 的网关本地拒绝是否计入 `CB_TRUSTGRAPH` 失败** | 派发前的两类网关本地 503 当前均计入失败：进程内请求容量耗尽（容量 503）与会话绑定失败（`reasonCode` 为 `AUTHORIZATION_PENDING`，未附加 `VerifiedPendingRefusal`），二者经 `settle`/`circuit_failure` 按 502~504 规则计入；派发前另有一处本地 502，其计数规则未逐一核验 | 决定这类派发前本地拒绝计为基础设施失败（现状），还是与 §6.5 已核验的 guard 拒绝一样不计入；计入时连续 5 次失败即打开 `CB_TRUSTGRAPH` 30 s（`circuit_breaker.rs`）；会话绑定失败能否由客户端触发未追踪，待核验 |
 
 ---
 

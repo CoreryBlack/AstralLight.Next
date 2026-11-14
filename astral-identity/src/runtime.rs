@@ -9,6 +9,8 @@ pub mod api;
 pub mod auth;
 #[path = "integration_mappings.rs"]
 mod integration_mappings;
+#[path = "memory_v1.rs"]
+pub mod memory_v1;
 #[path = "middleware.rs"]
 pub mod middleware;
 #[path = "srv/mod.rs"]
@@ -549,11 +551,80 @@ where
     .await
 }
 
+/// memory—v1
 pub async fn run_with_config_and_listen_addr_and_shutdown_and_drain<F, D>(
     config: AppConfig,
     addr: &str,
     shutdown: F,
     producers_drained: D,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+    D: std::future::Future<Output = ()> + Send + 'static,
+{
+    run_with_config_and_listen_addr_and_shutdown_and_drain_inner(
+        config,
+        addr,
+        shutdown,
+        producers_drained,
+        None,
+    )
+    .await
+}
+
+/// memory—v1: Run Identity with an explicitly injected UUID-native session
+/// boundary while retaining the existing startup and shutdown contract.
+pub async fn run_with_memory_v1_session_and_config_and_listen_addr_and_shutdown<F>(
+    config: AppConfig,
+    addr: &str,
+    shutdown: F,
+    memory_v1_session: Arc<memory_v1::MemoryV1IdentitySession>,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    run_with_memory_v1_session_and_config_and_listen_addr_and_shutdown_and_drain(
+        config,
+        addr,
+        shutdown,
+        std::future::ready(()),
+        memory_v1_session,
+    )
+    .await
+}
+
+/// memory—v1: Composite hosts use this entry to inject the Identity-owned
+/// session boundary created by the single process authority.
+pub async fn run_with_memory_v1_session_and_config_and_listen_addr_and_shutdown_and_drain<F, D>(
+    config: AppConfig,
+    addr: &str,
+    shutdown: F,
+    producers_drained: D,
+    memory_v1_session: Arc<memory_v1::MemoryV1IdentitySession>,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+    D: std::future::Future<Output = ()> + Send + 'static,
+{
+    run_with_config_and_listen_addr_and_shutdown_and_drain_inner(
+        config,
+        addr,
+        shutdown,
+        producers_drained,
+        Some(memory_v1_session),
+    )
+    .await
+}
+
+/// memory—v1: Internal startup implementation shared by legacy standalone and
+/// injected composite entry points. `None` preserves the legacy runtime shape;
+/// it never manufactures a memory—v1 authority.
+async fn run_with_config_and_listen_addr_and_shutdown_and_drain_inner<F, D>(
+    config: AppConfig,
+    addr: &str,
+    shutdown: F,
+    producers_drained: D,
+    memory_v1_session: Option<Arc<memory_v1::MemoryV1IdentitySession>>,
 ) -> anyhow::Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -628,7 +699,12 @@ where
     register_audit_db_writer(Arc::new(IdentityAuditDbWriter { pool: db.clone() }));
     let me_service = Arc::new(MeService::new(Arc::new(SqlxMeRepository::new(db.clone()))));
     let auth_repository = Arc::new(SqlxAuthRepository::new(db.clone()));
-    let auth_service = Arc::new(AuthService::new(auth_repository.clone()));
+    let auth_service = Arc::new(match memory_v1_session {
+        Some(memory_v1_session) => {
+            AuthService::with_memory_v1_session(auth_repository.clone(), memory_v1_session)
+        }
+        None => AuthService::new(auth_repository.clone()),
+    });
     let user_repository = match &invalidation_delivery {
         Some(context) => SqlxUserRepository::new_with_delivery_context(db.clone(), context.clone()),
         None => SqlxUserRepository::new(db.clone()),
@@ -798,61 +874,7 @@ where
     }
 
     // 启动期注册校验已在所有 worker、consumer、metrics 和 router 装配前完成。
-    let identity_mapping_routes = if identity_mapping_enabled {
-        integration_mappings::routes()
-    } else {
-        Router::new()
-    };
-
-    // 将所有 /api/v1/auth 路由合并到子路由，应用权限检查中间件
-    let auth_routes = Router::new()
-        .merge(identity_mapping_routes)
-        .merge(api::auth_routes())
-        .merge(srv::users::user_routes())
-        .merge(srv::cards::card_routes())
-        .merge(srv::session::session_routes())
-        .merge(
-            // /password/forgot 的进程内 per-IP 限流：route_layer 覆盖整个
-            // password 子路由，但中间件内部仅对 forgot 路径计预算
-            // （reset/{token} 直通，见 password_forgot_ip_rate_limit 文档）。
-            // 可用性保护而已：不产生 AuthorizationAdmission、不消费准入栅栏。
-            srv::password::password_reset_routes().route_layer(
-                axum::middleware::from_fn_with_state(state.clone(), password_forgot_ip_rate_limit),
-            ),
-        )
-        .merge(srv::admin::admin_routes())
-        .merge(
-            // Verification 路由的进程内 per-IP 限流（Identity 直连监听器防护；
-            // 语义复用共享 RateLimitCfg 合同，跨副本限制刻意保留，见
-            // middleware 模块文档）。可用性保护而已：不产生
-            // AuthorizationAdmission、不消费准入栅栏，bootstrap 路由的
-            // admission-free 语义不变。
-            srv::verification::verification_routes().route_layer(
-                axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    middleware::verification_ip_rate_limit,
-                ),
-            ),
-        )
-        .merge(srv::mfa::mfa_routes())
-        .merge(srv::orgs::org_routes())
-        .merge(srv::orgs::domain_routes())
-        .merge(srv::orgs::tenant_routes())
-        .merge(srv::me::me_routes())
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            middleware::identity_permission_middleware,
-        ));
-
-    let public_routes = Router::new().nest("/api/v1/auth", auth_routes).layer(
-        axum::middleware::from_fn_with_state(state.clone(), gateway_signature_middleware),
-    );
-
-    let app = Router::new()
-        .merge(public_routes)
-        .layer(axum::middleware::from_fn(global_exception_handler))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
-        .with_state(state);
+    let app = build_router(state, identity_mapping_enabled);
 
     tracing::info!(addr = %addr, "identity service starting");
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -984,6 +1006,88 @@ where
     }
     serve_result?;
     Ok(())
+}
+
+/// memory—v1: Assemble the Identity router with the explicitly injected
+/// Identity-owned UUID session boundary. The capability is kept inside
+/// `AuthService`; it is never derived from legacy state or client input.
+pub fn build_router_with_memory_v1_session(
+    mut state: AppState,
+    identity_mapping_enabled: bool,
+    memory_v1_session: Arc<memory_v1::MemoryV1IdentitySession>,
+) -> Router {
+    state.auth_service = Arc::new(
+        state
+            .auth_service
+            .with_memory_v1_session_boundary(memory_v1_session),
+    );
+    build_router(state, identity_mapping_enabled)
+}
+
+/// Assemble the same Identity router used by the standalone runtime.
+///
+/// `identity_mapping_enabled` must be the startup-frozen, validated setting.
+/// This does not perform listener, schema, worker, or readiness checks; a host
+/// must retain those gates and supply peer `ConnectInfo<SocketAddr>` for rate
+/// limiting. Constructing a router does not authorize opening a listener.
+///
+/// memory—v1
+pub fn build_router(state: AppState, identity_mapping_enabled: bool) -> Router {
+    let identity_mapping_routes = if identity_mapping_enabled {
+        integration_mappings::routes()
+    } else {
+        Router::new()
+    };
+
+    // 将所有 /api/v1/auth 路由合并到子路由，应用权限检查中间件
+    let auth_routes = Router::new()
+        .merge(identity_mapping_routes)
+        .merge(api::auth_routes())
+        .merge(srv::users::user_routes())
+        .merge(srv::cards::card_routes())
+        .merge(srv::session::session_routes())
+        .merge(
+            // /password/forgot 的进程内 per-IP 限流：route_layer 覆盖整个
+            // password 子路由，但中间件内部仅对 forgot 路径计预算
+            // （reset/{token} 直通，见 password_forgot_ip_rate_limit 文档）。
+            // 可用性保护而已：不产生 AuthorizationAdmission、不消费准入栅栏。
+            srv::password::password_reset_routes().route_layer(
+                axum::middleware::from_fn_with_state(state.clone(), password_forgot_ip_rate_limit),
+            ),
+        )
+        .merge(srv::admin::admin_routes())
+        .merge(
+            // Verification 路由的进程内 per-IP 限流（Identity 直连监听器防护；
+            // 语义复用共享 RateLimitCfg 合同，跨副本限制刻意保留，见
+            // middleware 模块文档）。可用性保护而已：不产生
+            // AuthorizationAdmission、不消费准入栅栏，bootstrap 路由的
+            // admission-free 语义不变。
+            srv::verification::verification_routes().route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    middleware::verification_ip_rate_limit,
+                ),
+            ),
+        )
+        .merge(srv::mfa::mfa_routes())
+        .merge(srv::orgs::org_routes())
+        .merge(srv::orgs::domain_routes())
+        .merge(srv::orgs::tenant_routes())
+        .merge(srv::me::me_routes())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::identity_permission_middleware,
+        ));
+
+    let public_routes = Router::new().nest("/api/v1/auth", auth_routes).layer(
+        axum::middleware::from_fn_with_state(state.clone(), gateway_signature_middleware),
+    );
+
+    Router::new()
+        .merge(public_routes)
+        .layer(axum::middleware::from_fn(global_exception_handler))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .with_state(state)
 }
 
 /// 初始化 MQ：连接 RabbitMQ、声明队列、创建 Producer、启动消费者
@@ -1386,6 +1490,74 @@ mod tests {
             authorization_fence_provider: None,
             org_scope_enabled: false,
         }
+    }
+
+    /// memory—v1
+    #[tokio::test]
+    async fn assembled_router_rejects_unverified_gateway_requests() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        for identity_mapping_enabled in [false, true] {
+            let app = super::build_router(forgot_rate_limit_test_state(), identity_mapping_enabled);
+            for path in [
+                "/api/v1/auth/password/forgot",
+                "/api/v1/auth/verification/send",
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header("x-gateway-auth", "verified")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            }
+        }
+    }
+
+    /// memory—v1
+    #[test]
+    fn standalone_uses_complete_router_before_listener() {
+        let source = include_str!("runtime.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let caller = production
+            .find("let app = build_router(state, identity_mapping_enabled);")
+            .expect("standalone runtime must use the reusable router");
+        let listener = production[caller..]
+            .find("let listener = match tokio::net::TcpListener::bind(addr).await")
+            .expect("listener must remain after router assembly");
+        assert!(listener > 0);
+        let router = production
+            .split("pub fn build_router(")
+            .nth(1)
+            .expect("router constructor must remain in production source")
+            .split("/// 初始化 MQ")
+            .next()
+            .unwrap();
+        let layers = [
+            "password_reset_routes().route_layer(",
+            "verification_routes().route_layer(",
+            "middleware::identity_permission_middleware",
+            "gateway_signature_middleware",
+            "global_exception_handler",
+            "TraceLayer::new_for_http()",
+            ".with_state(state)",
+        ];
+        let mut remaining = router;
+        for layer in layers {
+            let position = remaining.find(layer).expect(layer);
+            remaining = &remaining[position + layer.len()..];
+        }
+        assert!(router.contains("if identity_mapping_enabled"));
+        assert!(router.contains(".merge(identity_mapping_routes)"));
+        assert!(router.contains(".nest(\"/api/v1/auth\", auth_routes)"));
     }
 
     /// 路由层行为测试：/password/forgot 消耗 per-IP 预算（耗尽后 429 共享有界

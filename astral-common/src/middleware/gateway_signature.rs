@@ -1,20 +1,172 @@
-//! Gateway 签名验证中间件
+//! Gateway 签名与进程内来源验证中间件。
 //!
-//! 对齐 Java `GatewayIdentityHeaders.isVerified()`：
-//! 下游服务验证 X-Gateway-Auth / X-Gateway-Ts / X-Gateway-Signature 头，
-//! 确保请求确实来自 Gateway 而非伪造。
+//! 来源能力与 v3 签名、时间戳分别验证；有效签名本身不能证明来源。
+//! 旧验签入口不验证来源，HTTP 来源验证尚未实现，不应据此开放 listener。
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use hmac::Mac;
+use std::sync::Arc;
 
 use crate::config::AppConfig;
 use crate::middleware::constant_time_eq;
 use crate::token_contract::PrincipalKind;
 
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
+// This identity is intentionally private and cannot be constructed from HTTP data.
+struct InProcessSourceIdentity;
+
+#[derive(Clone)]
+struct InProcessSourceMark {
+    identity: Arc<InProcessSourceIdentity>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    external_path: Option<axum::http::HeaderValue>,
+    // Set only by the trusted Gateway after it bound an authority-verified
+    // memory—v1 session to this request's root scope.
+    memory_v1_session: bool,
+}
+
+/// Proof that the paired in-process Gateway source dispatched this request with
+/// an authority-verified memory—v1 session bound to the request's root scope.
+///
+/// Only [`in_process_gateway_signature_middleware`] inserts this value, after
+/// validating the source mark; it has no public constructor and HTTP clients
+/// cannot set request extensions. It identifies the transport only: identity
+/// is carried by the bound session facts, never by legacy identity headers,
+/// and this value is not an authorization decision.
+///
+/// memory—v1
+#[derive(Clone, Debug)]
+pub struct VerifiedMemoryV1SessionTransport {
+    _private: (),
+}
+
+/// Capability held only by the trusted Gateway's in-process dispatch code.
+///
+/// Possession permits marking arbitrary requests. The composition root must not
+/// give it to external request handlers or use it before Gateway authentication
+/// and header sanitization have succeeded. It is not an authorization decision.
+pub struct InProcessGatewayIssuer(Arc<InProcessSourceIdentity>);
+
+/// Verifier for exactly one composition's in-process Gateway source.
+///
+/// Clones verify the same issuer; a verifier cannot mark requests.
+#[derive(Clone)]
+pub struct InProcessGatewayVerifier(Arc<InProcessSourceIdentity>);
+
+/// Create an issuer and verifier bound to a fresh, process-local identity.
+///
+/// The composition root must inject the issuer into the trusted Gateway and the
+/// verifier into downstream middleware. Neither capability is an HTTP credential,
+/// and this function does not establish a globally unique process owner.
+///
+/// memory—v1
+pub fn in_process_gateway_source() -> (InProcessGatewayIssuer, InProcessGatewayVerifier) {
+    let identity = Arc::new(InProcessSourceIdentity);
+    (
+        InProcessGatewayIssuer(Arc::clone(&identity)),
+        InProcessGatewayVerifier(identity),
+    )
+}
+
+impl InProcessGatewayIssuer {
+    /// Mark a fully constructed request for this issuer's paired verifier after
+    /// Gateway authentication and sanitization. The snapshot binds the actual
+    /// method, URI (including query), and signed external-path header. Replaces
+    /// any earlier mark; it is not a signature, replay defense, or authorization.
+    ///
+    /// memory—v1
+    pub fn mark<B>(&self, request: &mut axum::http::Request<B>) {
+        self.insert_mark(request, false);
+    }
+
+    /// Mark a request whose authority-verified memory—v1 session the trusted
+    /// Gateway has already bound to the request's root scope.
+    ///
+    /// The downstream verifier then accepts the request only with a completely
+    /// empty legacy identity context; the v3 signature and timestamp are still
+    /// verified. Calling this without a bound session is a composition bug.
+    ///
+    /// memory—v1
+    pub fn mark_memory_v1_session<B>(&self, request: &mut axum::http::Request<B>) {
+        self.insert_mark(request, true);
+    }
+
+    // memory—v1: Snapshot the exact request shape under this issuer's identity.
+    fn insert_mark<B>(&self, request: &mut axum::http::Request<B>, memory_v1_session: bool) {
+        let mark = InProcessSourceMark {
+            identity: Arc::clone(&self.0),
+            method: request.method().clone(),
+            uri: request.uri().clone(),
+            external_path: request.headers().get("x-original-path").cloned(),
+            memory_v1_session,
+        };
+        request.extensions_mut().insert(mark);
+    }
+}
+
+/// Require the paired in-process Gateway source before the existing v3 verifier.
+///
+/// Install with `from_fn_with_state((config, verifier),
+/// in_process_gateway_signature_middleware)`. The mark is consumed before any
+/// signature checks or handler execution. This middleware does not validate an
+/// HTTP peer and must only be installed on the intended in-process dispatch.
+///
+/// memory—v1
+pub async fn in_process_gateway_signature_middleware(
+    State((config, verifier)): State<(AppConfig, InProcessGatewayVerifier)>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let mark = req.extensions_mut().remove::<InProcessSourceMark>();
+    let valid_source = mark.as_ref().is_some_and(|mark| {
+        let mut paths = req.headers().get_all("x-original-path").iter();
+        let path = paths.next();
+        Arc::ptr_eq(&mark.identity, &verifier.0)
+            && mark.method == *req.method()
+            && mark.uri == *req.uri()
+            && mark.external_path.as_ref() == path
+            && paths.next().is_none()
+            && path.and_then(|value| value.to_str().ok()) == Some(req.uri().path())
+            && req.uri().scheme().is_none()
+            && req.uri().authority().is_none()
+            && req.uri().path().starts_with('/')
+    });
+    if !valid_source {
+        return gateway_error(
+            &req,
+            403,
+            "Missing or invalid gateway source",
+            "FORBIDDEN",
+            "GATEWAY_SOURCE_INVALID",
+        );
+    }
+    // memory—v1: A session transport carries identity only in its bound session
+    // facts. Any legacy identity header is a mixed context and is rejected; a
+    // marker never survives a dispatch that did not bind a session.
+    if mark.is_some_and(|mark| mark.memory_v1_session) {
+        if !has_empty_identity_context(req.headers()) {
+            return gateway_error(
+                &req,
+                403,
+                "Mixed memory-v1 and legacy identity context",
+                "FORBIDDEN",
+                "PRINCIPAL_CARD_CONTEXT_INVALID",
+            );
+        }
+        req.extensions_mut()
+            .insert(VerifiedMemoryV1SessionTransport { _private: () });
+    } else {
+        req.extensions_mut()
+            .remove::<VerifiedMemoryV1SessionTransport>();
+    }
+
+    gateway_signature_middleware(State(config), req, next).await
+}
 
 /// 计算 Rust v3 HMAC-SHA256 签名。
 ///
@@ -135,7 +287,10 @@ fn timestamp_within_tolerance(now_ms: i64, timestamp_ms: i64, tolerance_ms: i64)
 /// 3. 时间戳容差检查（默认 30 秒）
 /// 4. 重新计算签名并做常量时间比较
 ///
-/// 注意：Gateway 自身不添加此中间件（它是签名生成方，不是验证方）
+/// 注意：Gateway 自身不添加此中间件（它是签名生成方，不是验证方）。
+/// 此兼容入口不验证请求来源；不能独立作为可信来源或开放 listener 的依据。
+///
+/// memory—v1
 pub async fn gateway_signature_middleware(
     State(config): State<AppConfig>,
     req: Request,
@@ -281,8 +436,15 @@ pub async fn gateway_signature_middleware(
     // Bootstrap and Refresh transports carry an empty identity payload. The
     // branch stays behind the same v3 verification, and is exact on method/path;
     // any partial or spoofed identity context is rejected rather than ignored.
-    let identity_empty_transport =
-        is_identity_empty_signed_transport(method, path) && has_empty_identity_context(headers);
+    // memory—v1: a request the in-process source verifier proved to carry a
+    // bound memory—v1 session is also identity-empty at this legacy layer; its
+    // identity travels only in the session facts and is checked by the engine.
+    let identity_empty_transport = (is_identity_empty_signed_transport(method, path)
+        || req
+            .extensions()
+            .get::<VerifiedMemoryV1SessionTransport>()
+            .is_some())
+        && has_empty_identity_context(headers);
     let principal_kind = if identity_empty_transport {
         None
     } else {
@@ -563,6 +725,312 @@ mod tests {
                 gateway_signature_middleware,
             ));
         app.with_state(config())
+    }
+
+    // memory—v1
+    fn in_process_route_app(
+        verifier: InProcessGatewayVerifier,
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> axum::Router {
+        use axum::{routing::post, Router};
+
+        Router::new()
+            .route(
+                "/api/v1/auth/sessions",
+                post(move |request: Request| {
+                    let counter = counter.clone();
+                    async move {
+                        assert!(request.extensions().get::<InProcessSourceMark>().is_none());
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        "verified"
+                    }
+                }),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                (config(), verifier),
+                in_process_gateway_signature_middleware,
+            ))
+    }
+
+    // memory—v1
+    async fn response_reason(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        json["reasonCode"].as_str().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    // memory—v1: A bound-session transport is identity-empty only behind the
+    // paired session mark; plain marks, forged markers, mixed identity and bad
+    // signatures all fail, and the legacy layer alone never grants the branch.
+    async fn memory_v1_session_transport_requires_session_mark_and_empty_identity() {
+        use axum::{routing::get, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tower::ServiceExt;
+
+        let (issuer, verifier) = in_process_gateway_source();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&counter);
+        let path = "/main/api/v1/permission-rules/registry";
+        let app = Router::new()
+            .route(
+                path,
+                get(move |request: Request| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        assert!(request
+                            .extensions()
+                            .get::<VerifiedMemoryV1SessionTransport>()
+                            .is_some());
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        "verified"
+                    }
+                }),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                (config(), verifier),
+                in_process_gateway_signature_middleware,
+            ));
+
+        // A plain in-process mark keeps the legacy principal requirement.
+        let mut plain = empty_signed_request("GET", path);
+        issuer.mark(&mut plain);
+        let response = app.clone().oneshot(plain).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_reason(response).await, "PRINCIPAL_KIND_INVALID");
+
+        // A marker inserted before a non-session dispatch is stripped.
+        let mut forged = empty_signed_request("GET", path);
+        forged
+            .extensions_mut()
+            .insert(VerifiedMemoryV1SessionTransport { _private: () });
+        issuer.mark(&mut forged);
+        let response = app.clone().oneshot(forged).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_reason(response).await, "PRINCIPAL_KIND_INVALID");
+
+        // Any legacy identity header beside a session mark is a mixed context.
+        let mut mixed = empty_signed_request("GET", path);
+        mixed
+            .headers_mut()
+            .insert("x-user-id", "42".parse().unwrap());
+        issuer.mark_memory_v1_session(&mut mixed);
+        let response = app.clone().oneshot(mixed).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_reason(response).await,
+            "PRINCIPAL_CARD_CONTEXT_INVALID"
+        );
+
+        // The v3 signature is still required on the session transport.
+        let mut bad_signature = empty_signed_request("GET", path);
+        bad_signature
+            .headers_mut()
+            .insert("x-gateway-signature", "invalid".parse().unwrap());
+        issuer.mark_memory_v1_session(&mut bad_signature);
+        let response = app.clone().oneshot(bad_signature).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_reason(response).await,
+            "GATEWAY_SIGNATURE_MISMATCH"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        let mut session = empty_signed_request("GET", path);
+        issuer.mark_memory_v1_session(&mut session);
+        let response = app.clone().oneshot(session).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Without the in-process verifier the legacy layer keeps rejecting.
+        let legacy_only = Router::new()
+            .route(path, get(|| async { "unreachable" }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                config(),
+                gateway_signature_middleware,
+            ));
+        let response = legacy_only
+            .oneshot(empty_signed_request("GET", path))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_reason(response).await, "PRINCIPAL_KIND_INVALID");
+    }
+
+    #[tokio::test]
+    // memory—v1
+    async fn in_process_source_must_match_before_signature_validation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tower::ServiceExt;
+
+        let (issuer, verifier) = in_process_gateway_source();
+        let (other_issuer, _) = in_process_gateway_source();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = in_process_route_app(verifier, Arc::clone(&counter));
+        let path = "/api/v1/auth/sessions";
+
+        // Even a valid signature and plausible source headers cannot create the mark.
+        let mut forged = empty_signed_request("POST", path);
+        forged
+            .headers_mut()
+            .insert("x-gateway-source", "in-process".parse().unwrap());
+        forged
+            .headers_mut()
+            .insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+        let response = app.clone().oneshot(forged).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_reason(response).await, "GATEWAY_SOURCE_INVALID");
+
+        let mut wrong_issuer = empty_signed_request("POST", path);
+        other_issuer.mark(&mut wrong_issuer);
+        let response = app.clone().oneshot(wrong_issuer).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_reason(response).await, "GATEWAY_SOURCE_INVALID");
+
+        // Source failure is returned even when the signature fields are missing.
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_reason(response).await, "GATEWAY_SOURCE_INVALID");
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        let mut valid = empty_signed_request("POST", path);
+        issuer.mark(&mut valid);
+        let response = app.clone().oneshot(valid).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // A mark from the correct issuer does not bypass the existing verifier.
+        let mut invalid_signature = empty_signed_request("POST", path);
+        invalid_signature
+            .headers_mut()
+            .insert("x-gateway-signature", "invalid".parse().unwrap());
+        issuer.mark(&mut invalid_signature);
+        let response = app.clone().oneshot(invalid_signature).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_reason(response).await,
+            "GATEWAY_SIGNATURE_MISMATCH"
+        );
+
+        let mut stale = empty_signed_request("POST", path);
+        stale
+            .headers_mut()
+            .insert("x-gateway-ts", "1".parse().unwrap());
+        resign_request(&mut stale);
+        issuer.mark(&mut stale);
+        let response = app.clone().oneshot(stale).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_reason(response).await, "GATEWAY_TIMESTAMP_SKEW");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    // memory—v1: The consumed capability binds target identity, method, raw URI and signed path.
+    async fn in_process_binding_rejects_retargeting_and_mutation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tower::ServiceExt;
+
+        let (issuer, verifier) = in_process_gateway_source();
+        let (_, other_verifier) = in_process_gateway_source();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .fallback({
+                let counter = Arc::clone(&counter);
+                move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                (config(), verifier),
+                in_process_gateway_signature_middleware,
+            ));
+        let other_app = axum::Router::new()
+            .fallback(|| async { StatusCode::OK })
+            .layer(axum::middleware::from_fn_with_state(
+                (config(), other_verifier),
+                in_process_gateway_signature_middleware,
+            ));
+        let path = "/api/v1/auth/sessions";
+        let uri = "/api/v1/auth/sessions?next=%2Fhome";
+        let make_request = || {
+            let mut request = empty_signed_request("POST", path);
+            *request.uri_mut() = uri.parse().unwrap();
+            issuer.mark(&mut request);
+            request
+        };
+
+        let response = other_app.oneshot(make_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_reason(response).await, "GATEWAY_SOURCE_INVALID");
+
+        for case in ["method", "path", "query", "signed path", "duplicate path"] {
+            let mut request = make_request();
+            match case {
+                "method" => *request.method_mut() = axum::http::Method::GET,
+                "path" => {
+                    *request.uri_mut() = "/api/v1/auth/register?next=%2Fhome".parse().unwrap()
+                }
+                "query" => {
+                    *request.uri_mut() = "/api/v1/auth/sessions?next=%2Fother".parse().unwrap()
+                }
+                "signed path" => {
+                    request
+                        .headers_mut()
+                        .insert("x-original-path", "/api/v1/auth/register".parse().unwrap());
+                    resign_request(&mut request);
+                }
+                "duplicate path" => {
+                    request
+                        .headers_mut()
+                        .append("x-original-path", path.parse().unwrap());
+                }
+                _ => unreachable!(),
+            }
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{case}");
+            assert_eq!(
+                response_reason(response).await,
+                "GATEWAY_SOURCE_INVALID",
+                "{case}"
+            );
+        }
+
+        // Even a correctly signed external path cannot be marked for another URI.
+        let mut mismatched = empty_signed_request("POST", path);
+        *mismatched.uri_mut() = "/api/v1/auth/register".parse().unwrap();
+        issuer.mark(&mut mismatched);
+        let response = app.clone().oneshot(mismatched).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_reason(response).await, "GATEWAY_SOURCE_INVALID");
+
+        let response = app.oneshot(make_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

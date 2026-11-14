@@ -264,6 +264,7 @@ where
     .await
 }
 
+/// memory—v1
 pub async fn run_with_config_and_listen_addr_and_shutdown_and_drain<F, D>(
     config: AppConfig,
     addr: &str,
@@ -458,10 +459,8 @@ where
         .list_registry()
         .await?;
     load_registry_rows(&registry_rows)?;
-    let integration_config =
-        crate::service::integration_authorization::IntegrationConfig::from_env()
-            .map_err(anyhow::Error::msg)?;
-    if integration_config.is_some() {
+    let integration_config = RouterIntegrationConfig::from_env().map_err(anyhow::Error::msg)?;
+    if integration_config.is_enabled() {
         astral_db::validate_integration_mapping_schema(&db).await?;
         astral_db::validate_auth_internal_request_guard_schema(&db)
             .await
@@ -1429,76 +1428,7 @@ where
 
     // 将 /main/api/v1 下的所有路由合并到一个子路由，
     // 并在其上应用权限检查中间件（对齐 Java PermissionAspect.enforce()）
-    let api_routes = Router::new()
-        .merge(api::rules::rule_routes())
-        .merge(api::rule_sets::rule_set_routes())
-        .merge(api::audit::audit_routes())
-        .merge(api::audit_replay::audit_replay_routes())
-        .merge(api::simulation::simulation_routes())
-        .merge(api::approval::approval_routes())
-        .merge(api::templates::template_routes())
-        .merge(api::delegation::delegation_routes())
-        .merge(api::stats::stats_routes())
-        .merge(api::authorization_observations::authorization_observation_routes())
-        .merge(api::sod::sod_routes())
-        .merge(api::tenants::tenant_routes())
-        .merge(api::platform_packages::platform_package_routes())
-        .merge(api::departments::department_routes())
-        .merge(api::personal_permissions::personal_permission_routes())
-        .merge(api::inheritance::inheritance_routes())
-        .merge(api::cross_org_grants::cross_org_grant_routes())
-        // DomainControl 拆分后的 7 个独立模块
-        .merge(api::domains::domain_routes())
-        .merge(api::resource_types::resource_type_routes())
-        .merge(api::permission_actions::permission_action_routes())
-        .merge(api::user_levels::user_level_routes())
-        .merge(api::user_gradings::user_grading_routes())
-        .merge(api::level_templates::level_template_routes())
-        .merge(api::user_cards::user_card_routes())
-        .merge(api::card_templates::card_template_routes())
-        .merge(api::global_admin::global_admin_routes())
-        // 内部测试控制面（默认不注册任何路由；启用后仅只读 worker-id 探针）
-        .merge(api::test_control::test_control_routes(
-            test_control.as_ref(),
-        ));
-    let api_routes = if org_scope_enabled {
-        api_routes
-            .merge(api::org_authorities::org_authority_edge_routes())
-            .merge(api::org_authorities::org_unit_card_routes())
-            .merge(api::org_authorities::org_membership_routes())
-            .merge(api::org_authorities::org_scope_request_routes())
-    } else {
-        api_routes
-    }
-    .layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        api::permission_check::permission_check_middleware,
-    ));
-
-    let integration_routes: Router<AppState> = match integration_config {
-        Some(config) => api::integrations::routes(Arc::new(
-            crate::service::integration_authorization::IntegrationAuthorizationService {
-                db: state.db.clone(),
-                engine: state.engine.clone(),
-                config,
-                org_scope_enabled: state.org_scope_enabled,
-                authority_provider: state.authorization_fence_provider.clone(),
-                authority_required: state.config.authority_runtime_mode.requires_authority(),
-            },
-        ))
-        .with_state(()),
-        None => Router::new(),
-    };
-    let app = Router::new()
-        .nest("/main/api/v1", api_routes)
-        .merge(integration_routes)
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            gateway_signature_middleware,
-        ))
-        .layer(axum::middleware::from_fn(global_exception_handler))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
-        .with_state(state);
+    let app = build_router(state, integration_config);
 
     tracing::info!(addr = %addr, "trustgraph service starting");
 
@@ -1908,6 +1838,118 @@ where
     server_result?;
 
     Ok(())
+}
+
+/// Startup-frozen SDK integration configuration used by the TrustGraph router.
+///
+/// Loading this value does not validate the database schema or start workers.
+pub struct RouterIntegrationConfig(
+    Option<Arc<crate::service::integration_authorization::IntegrationConfig>>,
+);
+
+impl RouterIntegrationConfig {
+    /// memory—v1: Router assembly without integration routes, independent of the
+    /// process environment (for explicitly composed in-process routers).
+    pub fn disabled() -> Self {
+        Self(None)
+    }
+
+    /// Load and validate the same integration settings as the standalone runtime.
+    /// The host must separately perform all applicable startup and schema gates.
+    ///
+    /// memory—v1
+    pub fn from_env() -> Result<Self, &'static str> {
+        crate::service::integration_authorization::IntegrationConfig::from_env().map(Self)
+    }
+
+    /// Whether integration routes are configured and their schema gates apply.
+    ///
+    /// memory—v1
+    pub fn is_enabled(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+/// Assemble the same TrustGraph router used by the standalone runtime.
+///
+/// The state and integration configuration must be startup-frozen and the host
+/// must retain the existing listener, schema, worker, and readiness gates.
+/// Constructing a router does not authorize opening a listener.
+///
+/// memory—v1
+pub fn build_router(state: AppState, integration_config: RouterIntegrationConfig) -> Router {
+    // 将 /main/api/v1 下的所有路由合并到一个子路由，
+    // 并在其上应用权限检查中间件（对齐 Java PermissionAspect.enforce()）
+    let api_routes = Router::new()
+        .merge(api::rules::rule_routes())
+        .merge(api::rule_sets::rule_set_routes())
+        .merge(api::audit::audit_routes())
+        .merge(api::audit_replay::audit_replay_routes())
+        .merge(api::simulation::simulation_routes())
+        .merge(api::approval::approval_routes())
+        .merge(api::templates::template_routes())
+        .merge(api::delegation::delegation_routes())
+        .merge(api::stats::stats_routes())
+        .merge(api::authorization_observations::authorization_observation_routes())
+        .merge(api::sod::sod_routes())
+        .merge(api::tenants::tenant_routes())
+        .merge(api::platform_packages::platform_package_routes())
+        .merge(api::departments::department_routes())
+        .merge(api::personal_permissions::personal_permission_routes())
+        .merge(api::inheritance::inheritance_routes())
+        .merge(api::cross_org_grants::cross_org_grant_routes())
+        // DomainControl 拆分后的 7 个独立模块
+        .merge(api::domains::domain_routes())
+        .merge(api::resource_types::resource_type_routes())
+        .merge(api::permission_actions::permission_action_routes())
+        .merge(api::user_levels::user_level_routes())
+        .merge(api::user_gradings::user_grading_routes())
+        .merge(api::level_templates::level_template_routes())
+        .merge(api::user_cards::user_card_routes())
+        .merge(api::card_templates::card_template_routes())
+        .merge(api::global_admin::global_admin_routes())
+        // 内部测试控制面（默认不注册任何路由；启用后仅只读 worker-id 探针）
+        .merge(api::test_control::test_control_routes(
+            state.test_control.as_ref(),
+        ));
+    let api_routes = if state.org_scope_enabled {
+        api_routes
+            .merge(api::org_authorities::org_authority_edge_routes())
+            .merge(api::org_authorities::org_unit_card_routes())
+            .merge(api::org_authorities::org_membership_routes())
+            .merge(api::org_authorities::org_scope_request_routes())
+    } else {
+        api_routes
+    }
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        api::permission_check::permission_check_middleware,
+    ));
+
+    let integration_routes: Router<AppState> = match integration_config.0 {
+        Some(config) => api::integrations::routes(Arc::new(
+            crate::service::integration_authorization::IntegrationAuthorizationService {
+                db: state.db.clone(),
+                engine: state.engine.clone(),
+                config,
+                org_scope_enabled: state.org_scope_enabled,
+                authority_provider: state.authorization_fence_provider.clone(),
+                authority_required: state.config.authority_runtime_mode.requires_authority(),
+            },
+        ))
+        .with_state(()),
+        None => Router::new(),
+    };
+    Router::new()
+        .nest("/main/api/v1", api_routes)
+        .merge(integration_routes)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            gateway_signature_middleware,
+        ))
+        .layer(axum::middleware::from_fn(global_exception_handler))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .with_state(state)
 }
 
 async fn shutdown_audit_replay_worker(
@@ -2606,12 +2648,26 @@ mod tests {
         })
     }
 
+    /// memory—v1
     #[test]
     fn all_main_api_routes_are_inside_both_security_layers() {
         let source = production_source();
-        let routes_start = source
+        let caller = source
+            .find("let app = build_router(state, integration_config);")
+            .expect("standalone runtime must use the reusable router");
+        assert!(source[caller..]
+            .contains("let listener = match tokio::net::TcpListener::bind(addr).await"));
+        let router = source
+            .split("pub fn build_router(")
+            .nth(1)
+            .expect("router constructor must remain in production source")
+            .split("async fn shutdown_audit_replay_worker(")
+            .next()
+            .unwrap();
+        let routes_start = router
             .find("let api_routes = Router::new()")
             .expect("main API router must remain explicit");
+        let source = router;
         let nest = source[routes_start..]
             .find(".nest(\"/main/api/v1\", api_routes)")
             .map(|offset| routes_start + offset)
@@ -2624,6 +2680,20 @@ mod tests {
             .expect("the nested main API router must cross gateway verification");
         assert!(permission_layer > 0);
         assert!(gateway_layer > 0);
+        assert!(source.contains("state.test_control.as_ref()"));
+        assert!(source.contains("if state.org_scope_enabled"));
+        assert!(source.contains("match integration_config.0"));
+        let mut outer_layers = &source[nest..];
+        for layer in [
+            ".merge(integration_routes)",
+            "gateway_signature_middleware",
+            "global_exception_handler",
+            "TraceLayer::new_for_http()",
+            ".with_state(state)",
+        ] {
+            let position = outer_layers.find(layer).expect(layer);
+            outer_layers = &outer_layers[position + layer.len()..];
+        }
 
         let merge_block = &source[routes_start..nest];
         let expected_merges = [

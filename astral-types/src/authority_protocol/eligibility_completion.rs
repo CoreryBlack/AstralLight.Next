@@ -447,7 +447,7 @@ impl AuthorityEligibilityCardCompletion {
 }
 
 /// The complete finite card set of one eligibility completion: non-empty, at
-/// most [`MAX_COMPLETION_CARDS`] entries, strictly sorted and deduplicated by
+/// most `MAX_COMPLETION_CARDS` entries, strictly sorted and deduplicated by
 /// the canonical store key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

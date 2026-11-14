@@ -8,7 +8,7 @@
 //! - [`run_install_bootstrap`]: connect the etcd quorum, load the durable
 //!   trust chain and the configured protected signer through the existing
 //!   runtime assembly, acquire a one-term leadership through the shared
-//!   [`crate::service::leadership::EphemeralLeadership`] path (real lease,
+//!   `crate::service::leadership::EphemeralLeadership` path (real lease,
 //!   lease-attached canonical leader key, production
 //!   `bind_leadership_token` install), and apply the artifact via
 //!   [`crate::service::AuthorityService::install_bootstrap`]. The WHOLE
@@ -106,7 +106,7 @@ pub fn run_sign_bootstrap(
 
 /// Install the signed artifact on the quorum and return the durable outcome.
 ///
-/// Leadership is a one-term [`EphemeralLeadership`]: the WHOLE operation —
+/// Leadership is a one-term `EphemeralLeadership`: the WHOLE operation —
 /// acquire elapsed time INCLUDED — is bounded strictly below the lease TTL
 /// (`deadline_seconds = ttl - 1`); the acquire itself reports its elapsed
 /// time and it is deducted from the remaining install budget, never ignored.

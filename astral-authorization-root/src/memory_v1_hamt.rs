@@ -11,9 +11,10 @@ use im::{HashMap, HashSet};
 
 use crate::memory_v1_db_rows::{
     BinaryId, BindingConfirmationRow, BindingRow, CandidateRows, CurrentSelection, IdentityCardRow,
-    RuleSetChangeConfirmationRow, RuleSetRow, RuleSetVersionRow, Table, TenantRow, UserCardRow,
-    UserRow, ValidationError,
+    RuleSetChangeConfirmationRow, RuleSetRow, RuleSetVersionRow, Table, TableCounts, TenantRow,
+    UserCardRow, UserRow, ValidationError,
 };
+use crate::memory_v1_rules::{confirmation_matches, parse_version, MemoryV1RuleError};
 
 /// Limits applied to a supplied candidate and each binding-bearing query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +30,8 @@ pub struct CandidateBudget {
 pub enum CandidateError {
     /// A supplied row violates the candidate SQL constraints.
     Rows(ValidationError),
+    /// The candidate contains no facts and cannot be adopted as a serving root.
+    EmptyCandidate,
     /// A supplied user has no identity card.
     MissingIdentityCard { user_id: BinaryId },
     /// The supplied tenant parent graph contains a cycle.
@@ -37,6 +40,16 @@ pub enum CandidateError {
     UnknownId { table: Table, id: BinaryId },
     /// A selected or replacement version is absent from the supplied candidate.
     UnknownVersion {
+        rule_set_id: BinaryId,
+        version_bytes: Vec<u8>,
+    },
+    /// A selected version failed the closed memory—v1 rule/hash contract.
+    RuleIntegrity(MemoryV1RuleError),
+    /// A binding could not resolve its selected rule-set version.
+    InconsistentBinding,
+    /// A binding has no structurally matching confirmation for its selected version.
+    MissingConfirmation {
+        binding_id: BinaryId,
         rule_set_id: BinaryId,
         version_bytes: Vec<u8>,
     },
@@ -49,6 +62,8 @@ pub enum CandidateError {
     RowBudgetExceeded { max: usize },
     /// The query would traverse more bindings than its configured limit.
     BindingBudgetExceeded { max: usize, actual: usize },
+    /// A card read would allocate more confirmation references than its row budget.
+    ConfirmationBudgetExceeded { max: usize },
 }
 
 /// One card and its supplied bindings; no permission decision is implied.
@@ -286,6 +301,38 @@ impl HamtCandidate {
         (self.budget, self.row_count)
     }
 
+    /// memory—v1: Row count of each table held by this candidate.
+    pub fn table_counts(&self) -> TableCounts {
+        TableCounts {
+            users: self.users.len(),
+            identity_cards: self.identities.len(),
+            tenants: self.tenants.len(),
+            user_cards: self.cards.len(),
+            rule_sets: self.rule_sets.len(),
+            rule_set_versions: self
+                .versions
+                .values()
+                .map(HashMap::len)
+                .fold(0_usize, usize::saturating_add),
+            bindings: self.bindings.len(),
+            binding_confirmations: self.confirmations.len(),
+            rule_set_change_confirmations: self.change_confirmations.len(),
+        }
+    }
+
+    /// memory—v1: Whether every rule set holds exactly one stored version.
+    ///
+    /// That is the only case in which the candidate schema, which has no
+    /// current-version pointer and defines no version order, names one current
+    /// version without inference.
+    pub fn has_single_version_per_rule_set(&self) -> bool {
+        self.rule_sets.keys().all(|id| {
+            self.versions
+                .get(id)
+                .is_some_and(|versions| versions.len() == 1)
+        })
+    }
+
     /// memory—v1: Look up a supplied user by ID.
     pub fn user(&self, id: BinaryId) -> Option<&UserRow> {
         self.users.get(&id).map(Arc::as_ref)
@@ -396,6 +443,32 @@ impl HamtCandidate {
         Ok(result)
     }
 
+    /// memory—v1 §4.10: every tenant strictly below `tenant_id` in the
+    /// supplied tree, cycle-safe and sorted for deterministic comparison.
+    ///
+    /// Resolution supports the `self+descendants` scope; it grants nothing by
+    /// itself and never crosses into another company's tree.
+    pub fn tenant_descendants(&self, tenant_id: BinaryId) -> Result<Vec<BinaryId>, CandidateError> {
+        self.require_tenant(tenant_id)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut queue: Vec<BinaryId> = self
+            .children_by_tenant
+            .get(&tenant_id)
+            .map(|children| children.iter().copied().collect())
+            .unwrap_or_default();
+        let mut result = Vec::new();
+        while let Some(next) = queue.pop() {
+            if seen.insert(next) {
+                result.push(next);
+                if let Some(children) = self.children_by_tenant.get(&next) {
+                    queue.extend(children.iter().copied());
+                }
+            }
+        }
+        result.sort_unstable();
+        Ok(result)
+    }
+
     /// memory—v1: Read one card and all its bindings, rejecting over-budget reads.
     pub fn card_candidate(&self, card_id: BinaryId) -> Result<CardCandidate<'_>, CandidateError> {
         let card = self.user_card(card_id).ok_or(CandidateError::UnknownId {
@@ -417,6 +490,31 @@ impl HamtCandidate {
         let binding = self.bindings.get(&binding_id);
         self.check_bindings(usize::from(binding.is_some()))?;
         Ok(binding.map(Arc::as_ref))
+    }
+
+    /// memory—v1: Bound aggregate confirmation references before allocating card results.
+    pub(crate) fn check_card_confirmation_budget(
+        &self,
+        bindings: &[&BindingRow],
+    ) -> Result<(), CandidateError> {
+        let max = self.budget.max_table_rows;
+        let mut total = 0usize;
+        for binding in bindings {
+            for count in [
+                self.confirmations_by_binding
+                    .get(&binding.binding_id)
+                    .map_or(0, HashSet::len),
+                self.changes_by_rule_set
+                    .get(&binding.rule_set_id)
+                    .map_or(0, HashSet::len),
+            ] {
+                total = total
+                    .checked_add(count)
+                    .filter(|sum| *sum <= max)
+                    .ok_or(CandidateError::ConfirmationBudgetExceeded { max })?;
+            }
+        }
+        Ok(())
     }
 
     /// memory—v1: Return every supplied confirmation for a binding, across versions.
@@ -480,6 +578,72 @@ impl HamtCandidate {
         Ok(result)
     }
 
+    /// memory—v1: Validate every selected rule version and binding confirmation
+    /// required for a serving authorization root.
+    ///
+    /// The structural candidate checks have already run during construction. This
+    /// second gate checks the frozen rule grammar, canonical version hash and the
+    /// selected-version confirmation edge for every binding. Confirmation rows
+    /// remain traceability inputs; this gate does not infer confirmer authority.
+    pub fn validate_for_serving(&self) -> Result<(), CandidateError> {
+        if self.row_count == 0
+            || self.users.is_empty()
+            || self.identities.is_empty()
+            || self.tenants.is_empty()
+            || self.cards.is_empty()
+            || self.rule_sets.is_empty()
+            || self.versions.is_empty()
+            || self.bindings.is_empty()
+        {
+            return Err(CandidateError::EmptyCandidate);
+        }
+        for rule_set_id in self.rule_sets.keys() {
+            let Some(version) =
+                self.selected_version(*rule_set_id)
+                    .map_err(|_| CandidateError::UnknownId {
+                        table: Table::RuleSet,
+                        id: *rule_set_id,
+                    })?
+            else {
+                return Err(CandidateError::UnknownVersion {
+                    rule_set_id: *rule_set_id,
+                    version_bytes: Vec::new(),
+                });
+            };
+            parse_version(version).map_err(CandidateError::RuleIntegrity)?;
+        }
+        for binding in self.bindings.values() {
+            let selected = self
+                .selected_version(binding.rule_set_id)
+                .map_err(|_| CandidateError::InconsistentBinding)?
+                .ok_or(CandidateError::UnknownVersion {
+                    rule_set_id: binding.rule_set_id,
+                    version_bytes: Vec::new(),
+                })?;
+            let mut confirmations = self
+                .confirmations_by_binding
+                .get(&binding.binding_id)
+                .into_iter()
+                .flat_map(|ids| ids.iter())
+                .filter_map(|id| self.confirmations.get(id).map(Arc::as_ref));
+            let confirmed = confirmations.any(|confirmation| {
+                confirmation_matches(
+                    confirmation,
+                    binding.binding_id,
+                    binding.rule_set_id,
+                    &selected.version_bytes,
+                )
+            });
+            if !confirmed {
+                return Err(CandidateError::MissingConfirmation {
+                    binding_id: binding.binding_id,
+                    rule_set_id: binding.rule_set_id,
+                    version_bytes: selected.version_bytes.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
     /// memory—v1: Append one complete version row without overwriting history.
     pub fn append_version(&self, row: RuleSetVersionRow) -> Result<Self, CandidateError> {
         self.require_rule_set(row.rule_set_id)?;
@@ -598,6 +762,7 @@ impl HamtCandidate {
 mod tests {
     use super::*;
     use crate::memory_v1_db_rows::BindingLayer;
+    use crate::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
 
     // memory—v1: Generate distinct binary IDs without assuming an encoding.
     fn id(value: u8) -> BinaryId {
@@ -676,18 +841,30 @@ mod tests {
                     user_card_id: id(8),
                     rule_set_id: id(10),
                     binding_layer: BindingLayer::Base,
+                    valid_from: None,
+                    valid_until: None,
+                    owner_scope: MemoryV1OwnerScope::default(),
+                    tenant_scope: MemoryV1TenantScope::default(),
                 },
                 BindingRow {
                     binding_id: id(13),
                     user_card_id: id(9),
                     rule_set_id: id(10),
                     binding_layer: BindingLayer::Overlay,
+                    valid_from: None,
+                    valid_until: None,
+                    owner_scope: MemoryV1OwnerScope::default(),
+                    tenant_scope: MemoryV1TenantScope::default(),
                 },
                 BindingRow {
                     binding_id: id(14),
                     user_card_id: id(8),
                     rule_set_id: id(11),
                     binding_layer: BindingLayer::Overlay,
+                    valid_from: None,
+                    valid_until: None,
+                    owner_scope: MemoryV1OwnerScope::default(),
+                    tenant_scope: MemoryV1TenantScope::default(),
                 },
             ],
             binding_confirmations: vec![BindingConfirmationRow {
@@ -718,6 +895,27 @@ mod tests {
             max_table_rows: 100,
             max_bindings_per_read: 10,
         }
+    }
+
+    // memory—v1: Repeated rule-set references consume one aggregate read budget.
+    #[test]
+    fn confirmation_budget_counts_repeated_rule_set_references() {
+        let mut candidate = candidate();
+        let first = candidate.binding(id(12)).unwrap().unwrap();
+        candidate
+            .check_card_confirmation_budget(&[first, first])
+            .unwrap();
+        candidate.budget.max_table_rows = 3;
+        let first = candidate.binding(id(12)).unwrap().unwrap();
+        assert_eq!(
+            candidate.check_card_confirmation_budget(&[first, first]),
+            Err(CandidateError::ConfirmationBudgetExceeded { max: 3 })
+        );
+        candidate.budget.max_table_rows = 4;
+        let first = candidate.binding(id(12)).unwrap().unwrap();
+        candidate
+            .check_card_confirmation_budget(&[first, first])
+            .unwrap();
     }
 
     // memory—v1: Construct a selected candidate for subsequent checks.

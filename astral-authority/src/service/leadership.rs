@@ -9,7 +9,7 @@
 //!   [`LeadershipTokenRecord`] value (term identity: authority, instance,
 //!   lease). Etcd deletes the key the moment the lease expires, so the fence
 //!   compare fails for every stale term automatically.
-//! - [`AuthorityService::execute_leader_txn`] appends a compare-only
+//! - `AuthorityService::execute_leader_txn` appends a compare-only
 //!   [`StoreOp::RequireValue`] on the canonical leader key to the final
 //!   transaction. A stale owner (expired lease, newer term) can therefore
 //!   never land a write, even when its local flag is still `true`.
@@ -23,6 +23,8 @@
 //! [`AuthorityServiceError::NotLeader`] and revokes the local fence
 //! immediately; the write is refused, never retried against a possibly newer
 //! term. Unknown store outcomes keep their explicit unknown semantics.
+//!
+//! [`LeadershipTokenRecord`]: crate::service::leadership::LeadershipTokenRecord
 
 use std::sync::RwLock;
 

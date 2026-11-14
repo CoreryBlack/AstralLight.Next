@@ -8,13 +8,33 @@ license.workspace = true
 description = "AstralLight single-node composite runtime"
 
 [dependencies]
+astral-authorization-root = { path = "../astral-authorization-root" }
 astral-common = { path = "../astral-common" }
+axum = { workspace = true }
 astral-db = { path = "../astral-db" }
 astral-gateway = { path = "../astral-gateway" }
 astral-identity = { path = "../astral-identity" }
 astral-mq = { path = "../astral-mq" }
 astral-trustgraph = { path = "../astral-trustgraph" }
 anyhow = { workspace = true }
+policy-engine = { path = "../policy-engine", features = ["memory-v1-candidate"] }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# memory—v1: the isolated full-path test adopts a fixture root through the
+# root's `test-support` hook. Dev-dependency features never reach a production
+# build of this binary under resolver 2.
+astral-authorization-root = { path = "../astral-authorization-root", features = ["test-support"] }
+astral-types = { path = "../astral-types" }
+async-trait = "0.1"
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+uuid = { workspace = true }
+
+# memory—v1: the SIGTERM scenario sends its signal with libc::kill(2) on Unix only.
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }

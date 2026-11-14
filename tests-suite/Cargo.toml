@@ -38,7 +38,6 @@ futures-util = "0.3"
 
 [features]
 default = ["astral-db/test-support"]
-memory-v1-candidate = ["policy-engine/memory-v1-candidate"]
 
 # Cargo 不会自动发现 series/<系列>/ 下的测试文件,全部目标显式登记。
 [[test]]
@@ -64,7 +63,6 @@ path = "series/E1/gateway_contract_tests.rs"
 [[test]]
 name = "memory_v1_request_chain_candidate"
 path = "series/E1/memory_v1_request_chain_candidate.rs"
-required-features = ["memory-v1-candidate"]
 
 [[test]]
 name = "audit_replay_integration"

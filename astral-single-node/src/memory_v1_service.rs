@@ -47,10 +47,6 @@ use tokio::net::TcpListener;
 
 use crate::memory_v1_composition::{require_serving_root, MemoryV1Composition};
 
-/// Environment variable that selects the single-node profile.
-pub(crate) const PROFILE_ENV: &str = "ASTRAL_SINGLE_NODE_PROFILE";
-/// The only value that selects this profile; any other non-empty value is refused.
-pub(crate) const EXPERIMENTAL_PROFILE: &str = "memory-v1-experimental";
 const LISTEN_ADDR_ENV: &str = "SINGLE_NODE_GATEWAY_ADDR";
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9001";
 const CREDENTIALS_FILE_ENV: &str = "ASTRAL_MEMORY_V1_CREDENTIALS_FILE";
@@ -71,30 +67,7 @@ const CAPTURE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound on the graceful HTTP drain; after it, remaining connections are dropped.
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(35);
 
-/// memory—v1: Whether the operator selected the experimental real-service profile.
-///
-/// An unset or empty variable selects the formal path. Any other value that is
-/// not the exact profile name is an error, never a silent fallback.
-pub(crate) fn profile_requested() -> Result<bool> {
-    match std::env::var(PROFILE_ENV) {
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            bail!("{PROFILE_ENV} must be valid unicode")
-        }
-        Ok(value) => parse_profile(&value),
-    }
-}
-
-// memory—v1: Pure profile-name check so it can be tested without touching the process env.
-fn parse_profile(value: &str) -> Result<bool> {
-    match value.trim() {
-        "" => Ok(false),
-        EXPERIMENTAL_PROFILE => Ok(true),
-        _ => bail!("{PROFILE_ENV} must be unset or `{EXPERIMENTAL_PROFILE}`"),
-    }
-}
-
-/// Operator inputs of the experimental profile, validated before any I/O.
+/// Operator inputs of the single production startup path, validated before any I/O.
 #[derive(Debug)]
 pub(crate) struct ServiceSettings {
     pub(crate) listen: SocketAddr,
@@ -418,22 +391,6 @@ mod tests {
         }
     }
 
-    #[test]
-    // memory—v1: Only the exact profile name selects the experiment; garbage never falls back.
-    fn profile_selection_is_exact() {
-        assert!(!parse_profile("").unwrap());
-        assert!(!parse_profile("   ").unwrap());
-        assert!(parse_profile(EXPERIMENTAL_PROFILE).unwrap());
-        assert!(parse_profile(&format!("  {EXPERIMENTAL_PROFILE} ")).unwrap());
-        for refused in [
-            "memory-v1",
-            "experimental",
-            "Memory-V1-Experimental",
-            "formal",
-        ] {
-            assert!(parse_profile(refused).is_err(), "{refused} must be refused");
-        }
-    }
 
     #[test]
     // memory—v1: The listener must be loopback; the default is loopback; garbage is refused.

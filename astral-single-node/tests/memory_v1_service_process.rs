@@ -125,7 +125,6 @@ fn all_limits() -> String {
 // memory—v1: The environment the service needs; nothing is inherited from the caller.
 fn service_env(database_url: &str, credentials: &Path) -> Vec<(String, String)> {
     [
-        ("ASTRAL_SINGLE_NODE_PROFILE", "memory-v1-experimental"),
         ("SINGLE_NODE_GATEWAY_ADDR", "127.0.0.1:0"),
         (
             "ASTRAL_MEMORY_V1_CREDENTIALS_FILE",
@@ -285,40 +284,6 @@ async fn refused(env: &[(String, String)]) -> String {
 // ──────────────────────── Part A: refusals, no database ────────────────────────
 
 const UNREACHABLE_DB: &str = "mysql://unused:unused@127.0.0.1:1/memory_v1_unreachable";
-
-#[tokio::test]
-// memory—v1: Without the profile the formal path validates its startup gates before any read. The
-// non-test gates refuse a loopback database even under the test profile, so no candidate read
-// happens, and no readiness line or listener can follow.
-async fn formal_path_still_refuses_without_the_profile() {
-    let dir = TempDir::new("formal");
-    let credentials = write_credentials(dir.path(), 0o600);
-    let mut env = service_env(UNREACHABLE_DB, &credentials);
-    env.retain(|(name, _)| name != "ASTRAL_SINGLE_NODE_PROFILE");
-    let output = refused(&env).await;
-    assert!(
-        output.contains("must not point to localhost"),
-        "the strict gates must refuse a loopback database before the candidate read\n{output}"
-    );
-    assert!(
-        !output.contains("candidate database"),
-        "no candidate read may happen before the strict gates\n{output}"
-    );
-}
-
-#[tokio::test]
-// memory—v1: A profile name other than the exact one is refused, never ignored.
-async fn unknown_profile_is_refused() {
-    let dir = TempDir::new("profile");
-    let credentials = write_credentials(dir.path(), 0o600);
-    let env = with_var(
-        service_env(UNREACHABLE_DB, &credentials),
-        "ASTRAL_SINGLE_NODE_PROFILE",
-        "memory-v1",
-    );
-    let output = refused(&env).await;
-    assert!(output.contains("ASTRAL_SINGLE_NODE_PROFILE"), "{output}");
-}
 
 #[tokio::test]
 // memory—v1: A non-loopback listener is refused before any file or database is touched.

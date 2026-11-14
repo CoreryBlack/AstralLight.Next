@@ -17,7 +17,7 @@ astral-identity = { path = "../astral-identity" }
 astral-mq = { path = "../astral-mq" }
 astral-trustgraph = { path = "../astral-trustgraph" }
 anyhow = { workspace = true }
-policy-engine = { path = "../policy-engine", features = ["memory-v1-candidate"] }
+policy-engine = { path = "../policy-engine" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

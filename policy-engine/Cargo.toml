@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 astral-types = { path = "../astral-types" }
-astral-authorization-root = { path = "../astral-authorization-root", optional = true }
+astral-authorization-root = { path = "../astral-authorization-root" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -36,7 +36,6 @@ criterion = { workspace = true }
 divan = { workspace = true }
 
 [features]
-memory-v1-candidate = ["dep:astral-authorization-root"]
 iai = ["dep:iai-callgrind"]
 e1-observability = ["dep:uuid"]
 performance-attribution = []

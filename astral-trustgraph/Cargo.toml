@@ -27,7 +27,7 @@ path = "src/main.rs"
 astral-common = { path = "../astral-common" }
 astral-types = { path = "../astral-types" }
 astral-authorization-root = { path = "../astral-authorization-root" }
-policy-engine = { path = "../policy-engine", features = ["memory-v1-candidate"] }
+policy-engine = { path = "../policy-engine" }
 astral-db = { path = "../astral-db" }
 astral-authority = { path = "../astral-authority", default-features = false }
 astral-sdk-contracts = { path = "../astral-sdk-contracts" }

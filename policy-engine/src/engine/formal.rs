@@ -14,13 +14,11 @@ use super::ports::RuleRepository;
 use super::PolicyEngine;
 use crate::hit_stats::TimingBreakdown;
 
-#[cfg(feature = "memory-v1-candidate")]
 tokio::task_local! {
     static REQUEST_ROOT: astral_authorization_root::memory_v1_request::RequestRootExtension;
     static REQUEST_CANDIDATE_IDENTITY: Option<astral_types::memory_v1::CandidateIdentity>;
 }
 
-#[cfg(all(test, feature = "memory-v1-candidate"))]
 tokio::task_local! {
     static TEST_READER_ADDRESS: std::cell::Cell<Option<usize>>;
     static TEST_INSPECTION: std::cell::Cell<Option<crate::memory_v1_candidate::CandidateInspection>>;
@@ -28,10 +26,8 @@ tokio::task_local! {
 
 // The formal signature still requires a repository, but this candidate path
 // never uses legacy reads. Every port also fails closed if called accidentally.
-#[cfg(feature = "memory-v1-candidate")]
 struct RetiredRepository;
 
-#[cfg(feature = "memory-v1-candidate")]
 #[async_trait::async_trait]
 impl RuleRepository for RetiredRepository {
     // memory—v1: Retired card lookups are unavailable.
@@ -78,7 +74,6 @@ impl PolicyEngine {
         ctx: &PolicyContext,
         repo: &R,
     ) -> PolicyDecision {
-        #[cfg(feature = "memory-v1-candidate")]
         let _ = REQUEST_ROOT.try_with(|extension| {
             let outcome = extension.with_reader(|reader| {
                 #[cfg(test)]
@@ -115,7 +110,6 @@ impl PolicyEngine {
     /// The capability is scoped to this future and never stored on the engine or
     /// repository. It carries no identity or authorization evidence. Missing,
     /// expired, changed and readable roots all retain the formal pending result.
-    #[cfg(feature = "memory-v1-candidate")]
     pub async fn evaluate_with_request_root(
         &self,
         ctx: &PolicyContext,
@@ -133,7 +127,6 @@ impl PolicyEngine {
     ///
     /// This input is not an authentication proof. The observation does not grant
     /// authority or alter the pending decision, and no identity is logged.
-    #[cfg(feature = "memory-v1-candidate")]
     pub async fn evaluate_with_request_root_and_candidate_identity(
         &self,
         ctx: &PolicyContext,
@@ -158,7 +151,6 @@ impl PolicyEngine {
     /// and rechecks root metadata and trusted time before `Allow`. Any root,
     /// session, scope, rule or time failure yields `Pending`; a complete phase
     /// without a matching confirmed allow (or with a matching deny) yields `Deny`.
-    #[cfg(feature = "memory-v1-candidate")]
     pub fn evaluate_memory_v1(
         &self,
         root: &astral_authorization_root::memory_v1_request::RequestRootExtension,
@@ -270,7 +262,7 @@ impl PolicyEngine {
     }
 }
 
-#[cfg(all(test, feature = "memory-v1-candidate"))]
+#[cfg(test)]
 mod request_root_tests {
     use super::*;
     use crate::memory_v1_candidate::CandidateInspection;

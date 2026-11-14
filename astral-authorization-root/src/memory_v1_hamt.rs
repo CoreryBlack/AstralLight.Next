@@ -11,9 +11,9 @@ use crate::memory_v1_db_rows::UserCardStatus;
 use im::{HashMap, HashSet};
 
 use crate::memory_v1_db_rows::{
-    BinaryId, BindingConfirmationRow, BindingRow, CandidateRows, CurrentSelection, IdentityCardRow,
-    RuleSetChangeConfirmationRow, RuleSetRow, RuleSetVersionRow, Table, TableCounts, TenantRow,
-    UserCardRow, UserRow, ValidationError,
+    BinaryId, BindingConfirmationRow, BindingLayer, BindingRow, CandidateRows, CurrentSelection,
+    IdentityCardRow, RuleSetChangeConfirmationRow, RuleSetRow, RuleSetVersionRow, Table,
+    TableCounts, TenantRow, UserCardRow, UserRow, ValidationError,
 };
 use crate::memory_v1_rules::{confirmation_matches, parse_version, MemoryV1RuleError};
 
@@ -39,6 +39,10 @@ pub enum CandidateError {
     TenantCycle { tenant_id: BinaryId },
     /// A referenced entity is absent from the supplied candidate.
     UnknownId { table: Table, id: BinaryId },
+    /// §4.5 double-bind prohibition: (card, ruleset) already has a binding.
+    DoubleBinding { user_card_id: BinaryId, rule_set_id: BinaryId },
+    /// §4.5 one-OVERLAY-per-card: this card already has an OVERLAY binding.
+    DoubleOverlay { user_card_id: BinaryId },
     /// A selected or replacement version is absent from the supplied candidate.
     UnknownVersion {
         rule_set_id: BinaryId,
@@ -704,6 +708,205 @@ impl HamtCandidate {
             }
         }
         Ok(next)
+    }
+
+    /// memory—v1 §4.12: Update the current-version pointer on a rule set.
+    ///
+    /// The target version must already exist (B-3.1: explicit pointer, never
+    /// inferred from max version or timestamps).
+    pub fn with_current_version(
+        &self,
+        rule_set_id: BinaryId,
+        version_bytes: &[u8],
+    ) -> Result<Self, CandidateError> {
+        self.require_rule_set(rule_set_id)?;
+        if self.version(rule_set_id, version_bytes).is_none() {
+            return Err(CandidateError::UnknownVersion {
+                rule_set_id,
+                version_bytes: version_bytes.to_vec(),
+            });
+        }
+        let mut next = self.clone();
+        next.selections
+            .insert(rule_set_id, Arc::new(version_bytes.to_vec()));
+        Ok(next)
+    }
+
+    /// memory—v1 §4.12 B-2.2: Insert a new binding row (structure only).
+    ///
+    /// Enforces the §4.5 double-bind prohibition (one binding per
+    /// card+ruleset pair) and the §4.5 one-OVERLAY-per-card constraint.
+    pub fn with_binding_insert(&self, row: BindingRow) -> Result<Self, CandidateError> {
+        if self.user_card(row.user_card_id).is_none() {
+            return Err(CandidateError::UnknownId {
+                table: crate::memory_v1_db_rows::Table::UserCard,
+                id: row.user_card_id,
+            });
+        }
+        self.require_rule_set(row.rule_set_id)?;
+        let row_count = self
+            .row_count
+            .checked_add(1)
+            .filter(|count| *count <= self.budget.max_table_rows)
+            .ok_or(CandidateError::RowBudgetExceeded {
+                max: self.budget.max_table_rows,
+            })?;
+        // §4.5 double-bind prohibition: (user_card_id, rule_set_id) must be unique.
+        for existing in self.bindings.values() {
+            if existing.user_card_id == row.user_card_id
+                && existing.rule_set_id == row.rule_set_id
+            {
+                return Err(CandidateError::DoubleBinding {
+                    user_card_id: row.user_card_id,
+                    rule_set_id: row.rule_set_id,
+                });
+            }
+            // §4.5: at most one OVERLAY binding per user card.
+            if existing.binding_layer == BindingLayer::Overlay
+                && row.binding_layer == BindingLayer::Overlay
+                && existing.user_card_id == row.user_card_id
+            {
+                return Err(CandidateError::DoubleOverlay {
+                    user_card_id: row.user_card_id,
+                });
+            }
+        }
+        let mut next = self.clone();
+        next.row_count = row_count;
+        next.bindings
+            .insert(row.binding_id, Arc::new(row.clone()));
+        index(&mut next.bindings_by_card, row.user_card_id, row.binding_id);
+        index(&mut next.bindings_by_rule_set, row.rule_set_id, row.binding_id);
+        Ok(next)
+    }
+
+    /// memory—v1 §4.12 B-2.2: Mark a binding as removed (REMOVE verb).
+    ///
+    /// The binding row is retained as a tombstone (append-only principle);
+    /// evaluation skips removed bindings deterministically.
+    pub fn with_binding_removed(
+        &self,
+        binding_id: BinaryId,
+        removed_at: i64,
+        removed_by: BinaryId,
+    ) -> Result<Self, CandidateError> {
+        let existing = self
+            .bindings
+            .get(&binding_id)
+            .ok_or(CandidateError::UnknownId {
+                table: crate::memory_v1_db_rows::Table::Binding,
+                id: binding_id,
+            })?
+            .clone();
+        let mut row = (*existing).clone();
+        row.removed_at = Some(removed_at);
+        row.removed_by = Some(removed_by);
+        let mut next = self.clone();
+        next.bindings.insert(binding_id, Arc::new(row));
+        Ok(next)
+    }
+
+    /// memory—v1 §4.12 B-2.4: Insert a new confirmation row.
+    pub fn with_confirmation_insert(
+        &self,
+        row: BindingConfirmationRow,
+    ) -> Result<Self, CandidateError> {
+        let row_count = self
+            .row_count
+            .checked_add(1)
+            .filter(|count| *count <= self.budget.max_table_rows)
+            .ok_or(CandidateError::RowBudgetExceeded {
+                max: self.budget.max_table_rows,
+            })?;
+        let mut next = self.clone();
+        next.row_count = row_count;
+        next.confirmations
+            .insert(row.confirmation_id, Arc::new(row.clone()));
+        index(
+            &mut next.confirmations_by_binding,
+            row.binding_id,
+            row.confirmation_id,
+        );
+        Ok(next)
+    }
+
+    /// memory—v1 §4.12 B-2.4: Mark a confirmation as revoked (REVOKE verb).
+    pub fn with_confirmation_revoked(
+        &self,
+        confirmation_id: BinaryId,
+        revoked_at: i64,
+        revoked_by: BinaryId,
+    ) -> Result<Self, CandidateError> {
+        let existing = self
+            .confirmations
+            .get(&confirmation_id)
+            .ok_or(CandidateError::UnknownId {
+                table: crate::memory_v1_db_rows::Table::BindingConfirmation,
+                id: confirmation_id,
+            })?
+            .clone();
+        let mut row = (*existing).clone();
+        row.revoked_at = Some(revoked_at);
+        row.revoked_by = Some(revoked_by);
+        let mut next = self.clone();
+        next.confirmations
+            .insert(confirmation_id, Arc::new(row));
+        Ok(next)
+    }
+
+    /// memory—v1 §4.12 B-2.3: Update a user card's lifecycle status.
+    pub fn with_user_card_status(
+        &self,
+        user_card_id: BinaryId,
+        status: crate::memory_v1_db_rows::UserCardStatus,
+    ) -> Result<Self, CandidateError> {
+        let existing = self
+            .cards
+            .get(&user_card_id)
+            .ok_or(CandidateError::UnknownId {
+                table: crate::memory_v1_db_rows::Table::UserCard,
+                id: user_card_id,
+            })?
+            .clone();
+        let mut row = (*existing).clone();
+        row.status = status;
+        let mut next = self.clone();
+        next.cards.insert(user_card_id, Arc::new(row));
+        Ok(next)
+    }
+
+    /// memory—v1 §4.12: Insert a new rule set with its initial version and pointer.
+    pub fn with_rule_set_create(
+        &self,
+        rule_set_row: crate::memory_v1_db_rows::RuleSetRow,
+        version_row: RuleSetVersionRow,
+    ) -> Result<Self, CandidateError> {
+        let row_count = self
+            .row_count
+            .checked_add(2)
+            .filter(|count| *count <= self.budget.max_table_rows)
+            .ok_or(CandidateError::RowBudgetExceeded {
+                max: self.budget.max_table_rows,
+            })?;
+        let mut next = self.clone();
+        next.row_count = row_count;
+        next.rule_sets
+            .insert(rule_set_row.rule_set_id, Arc::new(rule_set_row.clone()));
+        next.versions
+            .entry(rule_set_row.rule_set_id)
+            .or_default()
+            .insert(version_row.version_bytes.clone(), Arc::new(version_row.clone()));
+        next.selections
+            .insert(rule_set_row.rule_set_id, Arc::new(version_row.version_bytes.clone()));
+        Ok(next)
+    }
+
+    /// memory—v1 §4.12 B-2.3: Check whether a user card is active.
+    pub fn is_user_card_active(&self, user_card_id: BinaryId) -> bool {
+        self.cards
+            .get(&user_card_id)
+            .map(|card| card.status == crate::memory_v1_db_rows::UserCardStatus::Active)
+            .unwrap_or(false)
     }
 
     // memory—v1: Reuse SQL row validation for an isolated complete version row.

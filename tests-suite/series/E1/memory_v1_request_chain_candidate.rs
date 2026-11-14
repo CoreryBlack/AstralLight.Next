@@ -305,6 +305,7 @@ async fn isolated_gateway_to_shared_candidate_reader_stays_pending() {
             user_card_id: USER_CARD,
             user_id: USER,
             tenant_id: TENANT,
+            status: astral_authorization_root::memory_v1_db_rows::UserCardStatus::Active,
         }],
         ..CandidateRows::default()
     };

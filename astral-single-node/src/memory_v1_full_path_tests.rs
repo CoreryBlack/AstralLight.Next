@@ -21,6 +21,7 @@ use astral_authorization_root::memory_v1_db_rows::{
     IdentityCardRow, RuleSetRow, RuleSetVersionRow, TenantRow, UserCardRow, UserRow,
 };
 use astral_authorization_root::memory_v1_hamt::CandidateBudget;
+    use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
 use astral_authorization_root::memory_v1_registry::RegistryDeclaration;
 use astral_authorization_root::memory_v1_request::{
     RequestRootAccessError, RequestRootExtension, RequestRootScope,

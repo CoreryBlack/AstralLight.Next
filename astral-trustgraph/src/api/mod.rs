@@ -51,6 +51,7 @@ pub mod authorization_observations;
 pub mod cross_org_grants;
 pub mod delegation;
 pub mod departments;
+pub mod governance_routes;
 pub mod inheritance;
 pub(crate) mod integrations;
 pub mod org_authorities;

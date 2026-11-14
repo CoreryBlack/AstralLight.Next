@@ -542,6 +542,12 @@ async fn memory_v1_permission_check(
                 Some(MemoryV1DenySource::UnregisteredResource) => {
                     ("AUTHORIZATION_NO_MATCH", "unregistered_resource")
                 }
+                Some(MemoryV1DenySource::SelfConfirmation) => {
+                    ("AUTHORIZATION_NO_MATCH", "self_confirmation")
+                }
+                Some(MemoryV1DenySource::CardDisabled) => {
+                    ("AUTHORIZATION_NO_MATCH", "card_disabled")
+                }
                 None => ("AUTHORIZATION_NO_MATCH", "unclassified"),
             };
             tracing::warn!(

@@ -178,6 +178,7 @@ mod tests {
         RuleSetVersionRow, Table, TenantRow, UserCardRow, UserRow, ValidationError,
     };
     use astral_authorization_root::memory_v1_hamt::{CandidateBudget, CandidateError};
+    use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
     use astral_authorization_root::memory_v1_request::{
         RequestRootAccessError, RequestRootExtension,
     };

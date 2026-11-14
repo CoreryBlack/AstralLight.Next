@@ -94,6 +94,7 @@ pub(crate) fn fixture() -> (CandidateRows, Vec<CurrentSelection>) {
         user_card_id,
         user_id,
         tenant_id: TENANT,
+        status: UserCardStatus::Active,
     };
     let bindings = [
         ([0x51; 16], CARD_ALLOW, RULES_READ, BindingLayer::Base),
@@ -137,11 +138,11 @@ pub(crate) fn fixture() -> (CandidateRows, Vec<CurrentSelection>) {
             RuleSetRow {
                 rule_set_id: RULES_READ,
                 owner_tenant_id: TENANT,
-            },
+                current_version_bytes: Vec::new(),            },
             RuleSetRow {
                 rule_set_id: RULES_DENY,
                 owner_tenant_id: TENANT,
-            },
+                current_version_bytes: Vec::new(),            },
         ],
         rule_set_versions: vec![version_row(RULES_READ, read), version_row(RULES_DENY, deny)],
         bindings: bindings
@@ -156,7 +157,8 @@ pub(crate) fn fixture() -> (CandidateRows, Vec<CurrentSelection>) {
                     valid_until: None,
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
-                },
+                    removed_at: None,
+                    removed_by: None,                },
             )
             .collect(),
         binding_confirmations: bindings
@@ -170,7 +172,8 @@ pub(crate) fn fixture() -> (CandidateRows, Vec<CurrentSelection>) {
                 scope_bytes: vec![1],
                 operation_id: vec![1],
                 confirmed_at_bytes: vec![1],
-            })
+                revoked_at: None,
+                revoked_by: None,            })
             .collect(),
         ..CandidateRows::default()
     };

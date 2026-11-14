@@ -5,7 +5,7 @@
 //! ownership, or rule semantics. This module cannot return an ALLOW or a
 //! `PolicyDecision` and must not be used to authorize a request.
 
-use astral_authorization_root::memory_v1_db_rows::BinaryId;
+use astral_authorization_root::memory_v1_db_rows::{BinaryId, UserCardStatus};
 use astral_authorization_root::memory_v1_hamt_runtime::{HamtRuntimeHandle, RuntimeCardContext};
 use astral_authorization_root::memory_v1_root::RequestRootReader;
 use astral_types::memory_v1::CandidateIdentity;
@@ -175,10 +175,12 @@ mod tests {
                 user_card_id: id(4),
                 user_id: id(1),
                 tenant_id: id(3),
+                status: UserCardStatus::Active,
             }],
             rule_sets: vec![RuleSetRow {
                 rule_set_id: id(5),
                 owner_tenant_id: id(3),
+                current_version_bytes: vec![1],
             }],
             rule_set_versions: vec![RuleSetVersionRow {
                 rule_set_id: id(5),
@@ -197,6 +199,8 @@ mod tests {
                 valid_until: None,
                 owner_scope: MemoryV1OwnerScope::default(),
                 tenant_scope: MemoryV1TenantScope::default(),
+                removed_at: None,
+                removed_by: None,
             }],
             ..CandidateRows::default()
         };
@@ -261,31 +265,37 @@ mod tests {
                     user_card_id: id(4),
                     user_id: id(1),
                     tenant_id: id(3),
+                    status: UserCardStatus::Active,
                 },
                 UserCardRow {
                     user_card_id: id(7),
                     user_id: id(1),
                     tenant_id: id(3),
+                    status: UserCardStatus::Active,
                 },
                 UserCardRow {
                     user_card_id: id(14),
                     user_id: id(11),
                     tenant_id: id(3),
+                    status: UserCardStatus::Active,
                 },
                 UserCardRow {
                     user_card_id: id(15),
                     user_id: id(1),
                     tenant_id: id(13),
+                    status: UserCardStatus::Active,
                 },
             ],
             rule_sets: vec![
                 RuleSetRow {
                     rule_set_id: id(5),
                     owner_tenant_id: id(3),
+                    current_version_bytes: vec![1],
                 },
                 RuleSetRow {
                     rule_set_id: id(8),
                     owner_tenant_id: id(3),
+                    current_version_bytes: vec![1],
                 },
             ],
             rule_set_versions: vec![RuleSetVersionRow {
@@ -306,6 +316,8 @@ mod tests {
                     valid_until: None,
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
+                    removed_at: None,
+                    removed_by: None,
                 },
                 BindingRow {
                     binding_id: id(9),
@@ -316,6 +328,8 @@ mod tests {
                     valid_until: None,
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
+                    removed_at: None,
+                    removed_by: None,
                 },
             ],
             ..CandidateRows::default()

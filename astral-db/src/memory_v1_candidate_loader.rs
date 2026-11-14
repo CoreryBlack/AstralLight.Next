@@ -20,6 +20,7 @@ use crate::memory_v1_schema::{
 };
 use astral_authorization_root::memory_v1_adoption::ColdLoadFacts;
 use astral_authorization_root::memory_v1_db_rows::{
+    UserCardStatus,
     BinaryId, BindingConfirmationRow, BindingLayer, BindingRow, CandidateRows, IdentityCardRow,
     RuleSetChangeConfirmationRow, RuleSetRow, RuleSetVersionRow, TableCounts, TenantRow,
     UserCardRow, UserRow,
@@ -332,6 +333,51 @@ fn optional_window_bound(
     Ok(value)
 }
 
+// memory—v1 §4.12 B-2.2: read an optional removal operator ID.
+fn optional_binary_id(
+    row: &MySqlRow,
+    name: &'static str,
+    meter: &mut Meter,
+) -> Result<Option<BinaryId>, CandidateCaptureError> {
+    let value: Option<Vec<u8>> = row.try_get(name).map_err(|e| db_error(name, e))?;
+    value
+        .map(|value| {
+            meter.bytes(value.len())?;
+            value
+                .try_into()
+                .map_err(|_| CandidateCaptureError::InvalidField(name))
+        })
+        .transpose()
+}
+
+// memory—v1 §4.12 B-2.3: parse user-card lifecycle status.
+fn user_card_status(
+    row: &MySqlRow,
+    meter: &mut Meter,
+) -> Result<UserCardStatus, CandidateCaptureError> {
+    let value: Option<Vec<u8>> = row
+        .try_get("status")
+        .map_err(|e| db_error("status", e))?;
+    let Some(value) = value else {
+        return Ok(UserCardStatus::Active);
+    };
+    meter.bytes(value.len())?;
+    match value.as_slice() {
+        b"ACTIVE" => Ok(UserCardStatus::Active),
+        b"DISABLED" => Ok(UserCardStatus::Disabled),
+        _ => Err(CandidateCaptureError::InvalidField("status")),
+    }
+}
+
+// memory—v1 §4.12 B-2.4: read optional revocation operator ID.
+fn optional_revoked_by(
+    row: &MySqlRow,
+    name: &'static str,
+    meter: &mut Meter,
+) -> Result<Option<BinaryId>, CandidateCaptureError> {
+    optional_binary_id(row, name, meter)
+}
+
 // memory—v1 §4.10: absent owner scope defaults to the strictest `self`;
 // unsupported scope bytes are rejected, never widened.
 fn owner_scope(
@@ -525,10 +571,12 @@ fn append(
             user_card_id: binary_id(row, "user_card_id", meter)?,
             user_id: binary_id(row, "user_id", meter)?,
             tenant_id: binary_id(row, "tenant_id", meter)?,
+            status: user_card_status(row, meter)?,
         }),
         "memory_rule_set" => out.rule_sets.push(RuleSetRow {
             rule_set_id: binary_id(row, "rule_set_id", meter)?,
             owner_tenant_id: binary_id(row, "owner_tenant_id", meter)?,
+            current_version_bytes: bytes(row, "current_version_bytes", meter)?,
         }),
         "memory_rule_set_version" => out.rule_set_versions.push(RuleSetVersionRow {
             rule_set_id: binary_id(row, "rule_set_id", meter)?,
@@ -547,6 +595,8 @@ fn append(
             valid_until: optional_window_bound(row, "valid_until", meter)?,
             owner_scope: owner_scope(row, meter)?,
             tenant_scope: tenant_scope(row, meter)?,
+            removed_at: optional_window_bound(row, "removed_at", meter)?,
+            removed_by: optional_binary_id(row, "removed_by", meter)?,
         }),
         "memory_binding_confirmation" => out.binding_confirmations.push(BindingConfirmationRow {
             confirmation_id: binary_id(row, "confirmation_id", meter)?,
@@ -557,6 +607,8 @@ fn append(
             scope_bytes: bytes(row, "scope_bytes", meter)?,
             operation_id: bytes(row, "operation_id", meter)?,
             confirmed_at_bytes: bytes(row, "confirmed_at_bytes", meter)?,
+            revoked_at: optional_window_bound(row, "revoked_at", meter)?,
+            revoked_by: optional_binary_id(row, "revoked_by", meter)?,
         }),
         "memory_rule_set_change_confirmation" => {
             out.rule_set_change_confirmations
@@ -568,6 +620,8 @@ fn append(
                     affected_scope_bytes: bytes(row, "affected_scope_bytes", meter)?,
                     operation_id: bytes(row, "operation_id", meter)?,
                     confirmed_at_bytes: bytes(row, "confirmed_at_bytes", meter)?,
+                    revoked_at: optional_window_bound(row, "revoked_at", meter)?,
+                    revoked_by: optional_binary_id(row, "revoked_by", meter)?,
                 })
         }
         _ => return Err(CandidateCaptureError::Schema("unknown table")),

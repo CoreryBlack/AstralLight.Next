@@ -264,6 +264,7 @@ impl PolicyEngine {
 
 #[cfg(test)]
 mod request_root_tests {
+    use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
     use super::*;
     use crate::memory_v1_candidate::CandidateInspection;
     use astral_authorization_root::memory_v1_db_rows::{
@@ -365,11 +366,13 @@ mod request_root_tests {
                     user_card_id: [4; 16],
                     user_id: [1; 16],
                     tenant_id: [3; 16],
+                    status: UserCardStatus::Active,
                 },
                 UserCardRow {
                     user_card_id: [8; 16],
                     user_id: [5; 16],
                     tenant_id: [7; 16],
+                    status: UserCardStatus::Active,
                 },
             ],
             ..CandidateRows::default()

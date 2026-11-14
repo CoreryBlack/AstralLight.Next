@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Version of the UUID-native nine-table candidate shape.
-pub const MEMORY_V1_CANDIDATE_SCHEMA_VERSION: u16 = 1;
+pub const MEMORY_V1_CANDIDATE_SCHEMA_VERSION: u16 = 2;
 
 /// The exact storage kind and length reported by MySQL metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,6 +135,14 @@ const CANDIDATE_TABLES: &[TableContract] = &[
                 name: "tenant_id",
                 ..BINARY_ID
             },
+            ColumnContract {
+                name: "status",
+                data_type: "varchar",
+                max_length: Some(16),
+                nullable: false,
+                character_set: Some("ascii"),
+                collation: Some("ascii_bin"),
+            },
         ],
     },
     TableContract {
@@ -147,6 +155,14 @@ const CANDIDATE_TABLES: &[TableContract] = &[
             ColumnContract {
                 name: "owner_tenant_id",
                 ..BINARY_ID
+            },
+            ColumnContract {
+                name: "current_version_bytes",
+                data_type: "varbinary",
+                max_length: Some(255),
+                nullable: false,
+                character_set: None,
+                collation: None,
             },
         ],
     },
@@ -254,6 +270,22 @@ const CANDIDATE_TABLES: &[TableContract] = &[
                 character_set: Some("ascii"),
                 collation: Some("ascii_bin"),
             },
+            ColumnContract {
+                name: "removed_at",
+                data_type: "bigint",
+                max_length: None,
+                nullable: true,
+                character_set: None,
+                collation: None,
+            },
+            ColumnContract {
+                name: "removed_by",
+                data_type: "varbinary",
+                max_length: Some(16),
+                nullable: true,
+                character_set: None,
+                collation: None,
+            },
         ],
     },
     TableContract {
@@ -307,6 +339,22 @@ const CANDIDATE_TABLES: &[TableContract] = &[
                 character_set: None,
                 collation: None,
             },
+            ColumnContract {
+                name: "revoked_at",
+                data_type: "bigint",
+                max_length: None,
+                nullable: true,
+                character_set: None,
+                collation: None,
+            },
+            ColumnContract {
+                name: "revoked_by",
+                data_type: "varbinary",
+                max_length: Some(16),
+                nullable: true,
+                character_set: None,
+                collation: None,
+            },
         ],
     },
     TableContract {
@@ -353,6 +401,22 @@ const CANDIDATE_TABLES: &[TableContract] = &[
                 data_type: "varbinary",
                 max_length: Some(255),
                 nullable: false,
+                character_set: None,
+                collation: None,
+            },
+            ColumnContract {
+                name: "revoked_at",
+                data_type: "bigint",
+                max_length: None,
+                nullable: true,
+                character_set: None,
+                collation: None,
+            },
+            ColumnContract {
+                name: "revoked_by",
+                data_type: "varbinary",
+                max_length: Some(16),
+                nullable: true,
                 character_set: None,
                 collation: None,
             },

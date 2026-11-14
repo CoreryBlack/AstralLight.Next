@@ -623,6 +623,7 @@ mod tests {
     use astral_authorization_root::memory_v1_db_rows::{
         BindingConfirmationRow, BindingLayer, BindingRow, CandidateRows, CurrentSelection,
         IdentityCardRow, RuleSetRow, RuleSetVersionRow, TenantRow, UserCardRow, UserRow,
+        UserCardStatus,
     };
     use astral_authorization_root::memory_v1_hamt::CandidateBudget;
     use astral_authorization_root::memory_v1_registry::RegistryDeclaration;
@@ -660,6 +661,7 @@ mod tests {
                     user_card_id: [id; 16],
                     user_id: [1; 16],
                     tenant_id: [3; 16],
+                    status: UserCardStatus::Active,
                 })
                 .collect(),
             ..CandidateRows::default()
@@ -705,6 +707,7 @@ mod tests {
             rows.rule_sets.push(RuleSetRow {
                 rule_set_id: [set; 16],
                 owner_tenant_id: [3; 16],
+                current_version_bytes: version.clone(),
             });
             rows.rule_set_versions.push(RuleSetVersionRow {
                 rule_set_id: [set; 16],
@@ -725,6 +728,8 @@ mod tests {
                 valid_until: None,
                 owner_scope: MemoryV1OwnerScope::default(),
                 tenant_scope: MemoryV1TenantScope::default(),
+                removed_at: None,
+                removed_by: None,
             });
             rows.binding_confirmations.push(BindingConfirmationRow {
                 confirmation_id: [binding + 20; 16],
@@ -735,6 +740,8 @@ mod tests {
                 scope_bytes: vec![1],
                 operation_id: vec![1],
                 confirmed_at_bytes: vec![1],
+                revoked_at: None,
+                revoked_by: None,
             });
             selections.push(CurrentSelection {
                 rule_set_id: [set; 16],
@@ -1196,6 +1203,7 @@ mod tests {
                     user_card_id: [id; 16],
                     user_id: [1; 16],
                     tenant_id: [3; 16],
+                    status: UserCardStatus::Active,
                 })
                 .collect(),
             ..CandidateRows::default()
@@ -1235,6 +1243,7 @@ mod tests {
             rows.rule_sets.push(RuleSetRow {
                 rule_set_id: [set; 16],
                 owner_tenant_id: [3; 16],
+                current_version_bytes: version.clone(),
             });
             rows.rule_set_versions.push(RuleSetVersionRow {
                 rule_set_id: [set; 16],
@@ -1415,6 +1424,8 @@ mod tests {
                 valid_until: until,
                 owner_scope: owner_scope.unwrap_or_default(),
                 tenant_scope: tenant_scope.unwrap_or_default(),
+                removed_at: None,
+                removed_by: None,
             });
             let confirmer = [1_u8; 16];
             rows.binding_confirmations.push(BindingConfirmationRow {
@@ -1426,6 +1437,8 @@ mod tests {
                 scope_bytes: vec![1],
                 operation_id: vec![1],
                 confirmed_at_bytes: vec![1],
+                revoked_at: None,
+                revoked_by: None,
             });
         }
         (rows, selections)
@@ -1469,6 +1482,7 @@ mod tests {
                 user_card_id: [4; 16],
                 user_id: [1; 16],
                 tenant_id: [3; 16],
+                status: UserCardStatus::Active,
             }],
             ..CandidateRows::default()
         };
@@ -1480,6 +1494,7 @@ mod tests {
         rows.rule_sets.push(RuleSetRow {
             rule_set_id: [10; 16],
             owner_tenant_id: [3; 16],
+            current_version_bytes: version.clone(),
         });
         rows.rule_set_versions.push(RuleSetVersionRow {
             rule_set_id: [10; 16],
@@ -1498,6 +1513,8 @@ mod tests {
             valid_until: None,
             owner_scope: MemoryV1OwnerScope::default(),
             tenant_scope: MemoryV1TenantScope::default(),
+            removed_at: None,
+            removed_by: None,
         });
         let owner = install_process_root(
             rows,

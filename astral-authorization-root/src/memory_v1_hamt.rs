@@ -6,6 +6,7 @@
 //! There is no database, network, read gate, or service-root installation here.
 
 use std::sync::Arc;
+use crate::memory_v1_db_rows::UserCardStatus;
 
 use im::{HashMap, HashSet};
 
@@ -817,22 +818,24 @@ mod tests {
                     user_card_id: id(8),
                     user_id: id(1),
                     tenant_id: id(5),
+                    status: UserCardStatus::Active,
                 },
                 UserCardRow {
                     user_card_id: id(9),
                     user_id: id(2),
                     tenant_id: id(7),
+                    status: UserCardStatus::Active,
                 },
             ],
             rule_sets: vec![
                 RuleSetRow {
                     rule_set_id: id(10),
                     owner_tenant_id: id(5),
-                },
+                    current_version_bytes: Vec::new(),                },
                 RuleSetRow {
                     rule_set_id: id(11),
                     owner_tenant_id: id(6),
-                },
+                    current_version_bytes: Vec::new(),                },
             ],
             rule_set_versions: vec![version(10, 1), version(10, 2), version(11, 1)],
             bindings: vec![
@@ -845,7 +848,8 @@ mod tests {
                     valid_until: None,
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
-                },
+                    removed_at: None,
+                    removed_by: None,                },
                 BindingRow {
                     binding_id: id(13),
                     user_card_id: id(9),
@@ -855,7 +859,8 @@ mod tests {
                     valid_until: None,
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
-                },
+                    removed_at: None,
+                    removed_by: None,                },
                 BindingRow {
                     binding_id: id(14),
                     user_card_id: id(8),
@@ -865,7 +870,8 @@ mod tests {
                     valid_until: None,
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
-                },
+                    removed_at: None,
+                    removed_by: None,                },
             ],
             binding_confirmations: vec![BindingConfirmationRow {
                 confirmation_id: id(15),
@@ -876,7 +882,8 @@ mod tests {
                 scope_bytes: vec![0xff],
                 operation_id: vec![0],
                 confirmed_at_bytes: vec![0x80],
-            }],
+                revoked_at: None,
+                revoked_by: None,            }],
             rule_set_change_confirmations: vec![RuleSetChangeConfirmationRow {
                 confirmation_id: id(15),
                 rule_set_id: id(10),
@@ -885,7 +892,8 @@ mod tests {
                 affected_scope_bytes: vec![0],
                 operation_id: vec![0xff],
                 confirmed_at_bytes: vec![0],
-            }],
+                revoked_at: None,
+                revoked_by: None,            }],
         }
     }
 

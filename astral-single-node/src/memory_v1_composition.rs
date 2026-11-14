@@ -258,11 +258,12 @@ mod tests {
                     user_card_id: id(4),
                     user_id: id(1),
                     tenant_id: id(3),
+                    status: UserCardStatus::Active,
                 }],
                 rule_sets: vec![RuleSetRow {
                     rule_set_id: id(5),
                     owner_tenant_id: id(3),
-                }],
+                    current_version_bytes: Vec::new(),                }],
                 rule_set_versions: vec![version(1), version(2)],
                 bindings: vec![BindingRow {
                     binding_id: id(6),
@@ -273,7 +274,8 @@ mod tests {
                     valid_until: None,
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
-                }],
+                    removed_at: None,
+                    removed_by: None,                }],
                 ..CandidateRows::default()
             }
         }

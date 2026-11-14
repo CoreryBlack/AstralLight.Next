@@ -2,6 +2,7 @@
 //! This does not measure production authorization, database loading or audit.
 
 use astral_authorization_root::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
+use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -43,6 +44,7 @@ fn fixture(
             user_card_id: user,
             user_id: user,
             tenant_id: id(1),
+            status: UserCardStatus::Active,
         });
     }
     let mut selections = Vec::new();
@@ -51,7 +53,7 @@ fn fixture(
         rows.rule_sets.push(RuleSetRow {
             rule_set_id: rule,
             owner_tenant_id: id(1),
-        });
+            current_version_bytes: Vec::new(),        });
         rows.rule_set_versions.push(RuleSetVersionRow {
             rule_set_id: rule,
             version_bytes: vec![1],
@@ -75,7 +77,8 @@ fn fixture(
                 valid_until: None,
                 owner_scope: MemoryV1OwnerScope::default(),
                 tenant_scope: MemoryV1TenantScope::default(),
-            });
+                removed_at: None,
+                removed_by: None,            });
             rows.binding_confirmations.push(BindingConfirmationRow {
                 confirmation_id: binding,
                 binding_id: binding,
@@ -85,7 +88,8 @@ fn fixture(
                 scope_bytes: vec![],
                 operation_id: vec![1],
                 confirmed_at_bytes: vec![0],
-            });
+                revoked_at: None,
+                revoked_by: None,            });
         }
     }
     let budget = CandidateBudget {

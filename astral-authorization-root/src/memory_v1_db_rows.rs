@@ -50,6 +50,17 @@ pub struct UserCardRow {
     pub user_id: BinaryId,
     /// Referenced tenant.
     pub tenant_id: BinaryId,
+    /// §4.12 B-2.3: lifecycle status; DISABLED cards contribute nothing.
+    pub status: UserCardStatus,
+}
+
+/// memory—v1 §4.12: user-card lifecycle status (B-2.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UserCardStatus {
+    #[serde(rename = "ACTIVE")]
+    Active,
+    #[serde(rename = "DISABLED")]
+    Disabled,
 }
 
 /// Candidate `memory_rule_set` row.
@@ -59,6 +70,8 @@ pub struct RuleSetRow {
     pub rule_set_id: BinaryId,
     /// Referenced administrative owner.
     pub owner_tenant_id: BinaryId,
+    /// §4.13: explicit current-version pointer (B-3.1); never inferred.
+    pub current_version_bytes: Vec<u8>,
 }
 
 /// Candidate `memory_rule_set_version` row, preserving all five byte fields.
@@ -115,6 +128,10 @@ pub struct BindingRow {
     pub owner_scope: MemoryV1OwnerScope,
     /// Tenant visibility scope; absent (loaded) value defaults to `self`.
     pub tenant_scope: MemoryV1TenantScope,
+    /// §4.12 B-2.2: removal tombstone (REMOVED bindings contribute nothing).
+    pub removed_at: Option<i64>,
+    /// §4.12 B-2.2: who removed this binding.
+    pub removed_by: Option<BinaryId>,
 }
 
 /// Candidate `memory_binding_confirmation` traceability row.
@@ -136,6 +153,10 @@ pub struct BindingConfirmationRow {
     pub operation_id: Vec<u8>,
     /// Opaque confirmation time bytes.
     pub confirmed_at_bytes: Vec<u8>,
+    /// §4.12 B-2.4: revocation tombstone (REVOKE = deterministic failure).
+    pub revoked_at: Option<i64>,
+    /// §4.12 B-2.4: who revoked this confirmation.
+    pub revoked_by: Option<BinaryId>,
 }
 
 /// Candidate `memory_rule_set_change_confirmation` traceability row.
@@ -155,6 +176,10 @@ pub struct RuleSetChangeConfirmationRow {
     pub operation_id: Vec<u8>,
     /// Opaque confirmation time bytes.
     pub confirmed_at_bytes: Vec<u8>,
+    /// §4.12 B-2.4: revocation tombstone (REVOKE = deterministic failure).
+    pub revoked_at: Option<i64>,
+    /// §4.12 B-2.4: who revoked this confirmation.
+    pub revoked_by: Option<BinaryId>,
 }
 
 /// The nine caller-supplied tables; deserialization does not validate them.
@@ -797,11 +822,12 @@ mod tests {
                 user_card_id: id(5),
                 user_id: id(1),
                 tenant_id: id(3),
+                status: UserCardStatus::Active,
             }],
             rule_sets: vec![RuleSetRow {
                 rule_set_id: id(6),
                 owner_tenant_id: id(4),
-            }],
+                current_version_bytes: Vec::new(),            }],
             rule_set_versions: vec![RuleSetVersionRow {
                 rule_set_id: id(6),
                 version_bytes: vec![0, 0xff],
@@ -819,7 +845,8 @@ mod tests {
                 valid_until: None,
                 owner_scope: MemoryV1OwnerScope::default(),
                 tenant_scope: MemoryV1TenantScope::default(),
-            }],
+                removed_at: None,
+                removed_by: None,            }],
             binding_confirmations: vec![BindingConfirmationRow {
                 confirmation_id: id(8),
                 binding_id: id(7),
@@ -829,7 +856,8 @@ mod tests {
                 scope_bytes: vec![0],
                 operation_id: vec![0xff],
                 confirmed_at_bytes: vec![0],
-            }],
+                revoked_at: None,
+                revoked_by: None,            }],
             rule_set_change_confirmations: vec![RuleSetChangeConfirmationRow {
                 confirmation_id: id(8),
                 rule_set_id: id(6),
@@ -838,7 +866,8 @@ mod tests {
                 affected_scope_bytes: vec![0xff],
                 operation_id: vec![0],
                 confirmed_at_bytes: vec![0xff],
-            }],
+                revoked_at: None,
+                revoked_by: None,            }],
         }
     }
 

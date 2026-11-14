@@ -15,6 +15,7 @@
 //! operator-acknowledged limits) and the test-only hook.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use crate::memory_v1_db_rows::UserCardStatus;
 use std::sync::{Arc, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
@@ -940,11 +941,12 @@ mod tests {
                 user_card_id: id(4),
                 user_id: id(1),
                 tenant_id: id(3),
+                status: UserCardStatus::Active,
             }],
             rule_sets: vec![RuleSetRow {
                 rule_set_id: id(5),
                 owner_tenant_id: id(3),
-            }],
+                current_version_bytes: Vec::new(),            }],
             rule_set_versions: vec![RuleSetVersionRow {
                 rule_set_id: id(5),
                 version_bytes: vec![1],
@@ -962,7 +964,8 @@ mod tests {
                 valid_until: None,
                 owner_scope: MemoryV1OwnerScope::default(),
                 tenant_scope: MemoryV1TenantScope::default(),
-            }],
+                removed_at: None,
+                removed_by: None,            }],
             ..CandidateRows::default()
         }
     }
@@ -1001,7 +1004,8 @@ mod tests {
                 scope_bytes: vec![1],
                 operation_id: vec![1],
                 confirmed_at_bytes: vec![1],
-            });
+                revoked_at: None,
+                revoked_by: None,            });
         let selections = vec![CurrentSelection {
             rule_set_id: id(5),
             version_bytes: vec![1],
@@ -1925,27 +1929,30 @@ mod tests {
                     user_card_id: id(21),
                     user_id: id(1),
                     tenant_id: id(20),
+                    status: UserCardStatus::Active,
                 },
                 UserCardRow {
                     user_card_id: id(22),
                     user_id: id(2),
                     tenant_id: id(20),
+                    status: UserCardStatus::Active,
                 },
                 UserCardRow {
                     user_card_id: id(23),
                     user_id: id(3),
                     tenant_id: id(20),
+                    status: UserCardStatus::Active,
                 },
             ],
             rule_sets: vec![
                 RuleSetRow {
                     rule_set_id: id(30),
                     owner_tenant_id: id(20),
-                },
+                    current_version_bytes: Vec::new(),                },
                 RuleSetRow {
                     rule_set_id: id(31),
                     owner_tenant_id: id(20),
-                },
+                    current_version_bytes: Vec::new(),                },
             ],
             rule_set_versions: vec![
                 RuleSetVersionRow {
@@ -1975,7 +1982,8 @@ mod tests {
                     valid_until: None,
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
-                },
+                    removed_at: None,
+                    removed_by: None,                },
                 BindingRow {
                     binding_id: id(41),
                     user_card_id: id(22),
@@ -1985,7 +1993,8 @@ mod tests {
                     valid_until: None,
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
-                },
+                    removed_at: None,
+                    removed_by: None,                },
                 BindingRow {
                     binding_id: id(42),
                     user_card_id: id(23),
@@ -1995,7 +2004,8 @@ mod tests {
                     valid_until: None,
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
-                },
+                    removed_at: None,
+                    removed_by: None,                },
                 BindingRow {
                     binding_id: id(43),
                     user_card_id: id(23),
@@ -2005,7 +2015,8 @@ mod tests {
                     valid_until: None,
                     owner_scope: MemoryV1OwnerScope::default(),
                     tenant_scope: MemoryV1TenantScope::default(),
-                },
+                    removed_at: None,
+                    removed_by: None,                },
             ],
             ..CandidateRows::default()
         };

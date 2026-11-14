@@ -11,6 +11,7 @@ use astral_authorization_root::memory_v1_request::RequestRootExtension;
 use astral_authorization_root::memory_v1_root::{
     DependencyRecord, EvaluationDependency, RequestRootReader, RootMetadata, RootStatus,
 };
+use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
 use astral_authorization_root::memory_v1_rules::{
     confirmation_matches, parse_version, window_active, MemoryV1OwnerScope, MemoryV1RuleEffect,
     MemoryV1TenantScope, MemoryV1Validity,
@@ -136,6 +137,10 @@ pub enum MemoryV1DenySource {
     IdentityMismatch,
     /// The evaluated (resource, action) pair is not registered and active.
     UnregisteredResource,
+    /// §4.11 B-1.3 N-7: confirm-class action targeting the operator's own authority.
+    SelfConfirmation,
+    /// §4.12 B-2.3: the session card is DISABLED.
+    CardDisabled,
 }
 
 /// memory—v1 §4.8: why an evaluation could not produce a determinate outcome.
@@ -345,6 +350,20 @@ fn evaluate_reader(
         if context.bindings.is_empty() {
             return CardOutcome::Deny(MemoryV1DenySource::CardUnbound);
         }
+        // memory—v1 §4.12 B-2.3: a DISABLED card is deterministically denied.
+        if context.card.status != UserCardStatus::Active {
+            return CardOutcome::Deny(MemoryV1DenySource::CardDisabled);
+        }
+        // memory—v1 §4.11 B-1.3 N-7: SoD self-sign ban is a structural rule —
+        // confirm-class actions can never target the operator's own authority,
+        // regardless of scope width.
+        if request.action.starts_with("confirm") {
+            if let Some(owner) = request.target_owner {
+                if owner == user {
+                    return CardOutcome::Deny(MemoryV1DenySource::SelfConfirmation);
+                }
+            }
+        }
         // memory—v1 §4.10: descendant resolution happens in the root tenant tree.
         let descendants = match reader.tenant_descendants(tenant) {
             Ok(list) => list,
@@ -361,6 +380,10 @@ fn evaluate_reader(
         let mut scope_denied = false;
         let mut pending: Option<MemoryV1PendingSource> = None;
         for binding in &context.bindings {
+            // memory—v1 §4.12 B-2.2: REMOVED bindings contribute nothing.
+            if binding.binding.removed_at.is_some() {
+                continue;
+            }
             // memory—v1 §4.6: reads depending on a fenced object are refused
             // immediately; §4.8 keeps a determinate DENY from a valid binding
             // ahead of any pending cause.
@@ -376,7 +399,11 @@ fn evaluate_reader(
             if binding.binding.user_card_id != card
                 || binding.rule_set.rule_set_id != binding.binding.rule_set_id
                 || version.rule_set_id != binding.binding.rule_set_id
-                || !binding.confirmations.iter().any(|confirmation| {
+                || !binding
+                    .confirmations
+                    .iter()
+                    .filter(|confirmation| confirmation.revoked_at.is_none())
+                    .any(|confirmation| {
                     confirmation_matches(
                         confirmation,
                         binding.binding.binding_id,

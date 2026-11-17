@@ -15,6 +15,14 @@ mod error;
 mod grant;
 /// memory-v1 标识及其严格编解码。
 pub mod memory_v1;
+/// memory-v1 结构化审计值合同。
+pub mod memory_v1_audit;
+/// memory-v1 审计候选值的有界编解码。
+pub mod memory_v1_audit_wire;
+/// memory-v1 未认证拒绝观察值及其有界编码。
+pub mod memory_v1_deny_observation;
+/// memory-v1 有界日志记录编码与链校验。
+pub mod memory_v1_journal;
 mod org_authority_proof;
 /// 组织范围（ORG_SCOPE）共享类型合同 — Phase 2 default-off（types owner 维护）。
 pub mod org_scope;
@@ -35,6 +43,7 @@ pub use eligibility::*;
 pub use entities::*;
 pub use error::*;
 pub use grant::*;
+pub use memory_v1_audit::*;
 pub use org_authority_proof::*;
 pub use projection::*;
 pub use publication::*;

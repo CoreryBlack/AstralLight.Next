@@ -170,6 +170,73 @@ impl PolicyEngine {
         evaluation
     }
 
+    /// memory—v1: Evaluate one rule-set change confirmation and count the result.
+    /// The resulting admission does not authorize a compound mutation or commit.
+    pub fn evaluate_memory_v1_rule_set_change(
+        &self,
+        root: &astral_authorization_root::memory_v1_request::RequestRootExtension,
+        session: &astral_authorization_root::memory_v1_session::RequestSessionExtension,
+        request: &crate::memory_v1_formal::MemoryV1Request<'_>,
+        intent: crate::memory_v1_formal::MemoryV1RuleSetChangeIntent,
+    ) -> crate::memory_v1_formal::MemoryV1Evaluation {
+        let start = std::time::Instant::now();
+        let evaluation = crate::memory_v1_formal::evaluate_memory_v1_rule_set_change(
+            root, session, request, intent,
+        );
+        let timing = TimingBreakdown {
+            total_ns: start.elapsed().as_nanos() as u64,
+            ..TimingBreakdown::default()
+        };
+        self.record_evaluation(
+            evaluation.decision == crate::memory_v1_formal::MemoryV1Decision::Allow,
+            &timing,
+        );
+        evaluation
+    }
+
+    /// memory—v1: Evaluate all same-request actions with one shared final check.
+    /// The result is an authorization observation only; it is not a mutation or
+    /// commit capability.
+    pub fn evaluate_memory_v1_compound(
+        &self,
+        root: &astral_authorization_root::memory_v1_request::RequestRootExtension,
+        session: &astral_authorization_root::memory_v1_session::RequestSessionExtension,
+        request: &crate::memory_v1_compound::MemoryV1CompoundRequest<'_>,
+    ) -> crate::memory_v1_compound::MemoryV1CompoundEvaluation {
+        let start = std::time::Instant::now();
+        let evaluation =
+            crate::memory_v1_compound::evaluate_memory_v1_compound(root, session, request);
+        let timing = TimingBreakdown {
+            total_ns: start.elapsed().as_nanos() as u64,
+            ..TimingBreakdown::default()
+        };
+        self.record_evaluation(
+            evaluation.decision == crate::memory_v1_formal::MemoryV1Decision::Allow,
+            &timing,
+        );
+        evaluation
+    }
+
+    /// memory—v1: Evaluate a complete confirmation batch in one root phase.
+    pub fn evaluate_memory_v1_confirmation_batch(
+        &self,
+        root: &astral_authorization_root::memory_v1_request::RequestRootExtension,
+        session: &astral_authorization_root::memory_v1_session::RequestSessionExtension,
+        request: &crate::memory_v1_batch::MemoryV1BatchRequest<'_>,
+    ) -> crate::memory_v1_batch::MemoryV1BatchEvaluation {
+        let start = std::time::Instant::now();
+        let evaluation = crate::memory_v1_batch::evaluate_memory_v1_batch(root, session, request);
+        let timing = TimingBreakdown {
+            total_ns: start.elapsed().as_nanos() as u64,
+            ..TimingBreakdown::default()
+        };
+        self.record_evaluation(
+            evaluation.decision == crate::memory_v1_formal::MemoryV1Decision::Allow,
+            &timing,
+        );
+        evaluation
+    }
+
     /// memory—v1: Evaluate a request and retain the admission slot for the
     /// future memory-v1 positive path. The retired evaluator never certifies an
     /// admission, so `admission()` is always `None` for now. Existing callers

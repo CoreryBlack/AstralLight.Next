@@ -179,6 +179,7 @@ mod tests {
                 status: UserCardStatus::Active,
             }],
             rule_sets: vec![RuleSetRow {
+                status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
                 rule_set_id: id(5),
                 owner_tenant_id: id(3),
                 current_version_bytes: vec![1],
@@ -289,11 +290,13 @@ mod tests {
             ],
             rule_sets: vec![
                 RuleSetRow {
+                    status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
                     rule_set_id: id(5),
                     owner_tenant_id: id(3),
                     current_version_bytes: vec![1],
                 },
                 RuleSetRow {
+                    status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
                     rule_set_id: id(8),
                     owner_tenant_id: id(3),
                     current_version_bytes: vec![1],

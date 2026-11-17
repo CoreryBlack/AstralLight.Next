@@ -7,17 +7,25 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
+use astral_authorization_root::memory_v1_db_rows::{
+    binding_is_active, RuleSetStatus, UserCardStatus,
+};
+use astral_authorization_root::memory_v1_registry::RegistryError;
 use astral_authorization_root::memory_v1_request::RequestRootExtension;
 use astral_authorization_root::memory_v1_root::{
-    DependencyRecord, EvaluationDependency, RequestRootReader, RootMetadata, RootStatus,
+    DependencyRecord, EvaluationDependency, GovernanceTargetFacts, RequestRootReader, RootMetadata,
+    RootStatus,
 };
 use astral_authorization_root::memory_v1_rules::{
-    confirmation_matches, parse_version, window_active, MemoryV1OwnerScope, MemoryV1RuleEffect,
-    MemoryV1TenantScope, MemoryV1Validity,
+    parse_version, window_active, BindingConfirmationState, ChangeConfirmationState,
+    MemoryV1OwnerScope, MemoryV1RuleEffect, MemoryV1TenantScope, MemoryV1Validity,
 };
-use astral_authorization_root::memory_v1_session::{RequestSessionExtension, VerifiedSessionFacts};
+use astral_authorization_root::memory_v1_session::{
+    FinalCheckTimeConstraints, FinalCheckWindow, RequestSessionExtension, SessionFinalCheck,
+    VerifiedSessionFacts,
+};
 use astral_types::memory_v1::CandidateIdentity;
+use astral_types::memory_v1_audit::MemoryV1AuditDenySource;
 
 const MAX_TEXT_BYTES: usize = 256;
 const MAX_BINDING_BYTES: usize = 4096;
@@ -47,6 +55,13 @@ pub struct MemoryV1Request<'a> {
     pub operation_fingerprint: &'a [u8],
 }
 
+/// memory—v1: Explicit intended operation for a rule-set change confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryV1RuleSetChangeIntent {
+    Create,
+    Publish,
+}
+
 /// Details bound to one successful evaluation, not a durable or transferable proof.
 ///
 /// A consumer performing a mutation must independently enforce its own authorization
@@ -58,9 +73,12 @@ pub struct MemoryV1Admission {
     resource: String,
     action: String,
     target: Option<Vec<u8>>,
+    target_tenant: Option<Vec<u8>>,
+    target_owner: Option<Vec<u8>>,
     operation_id: Vec<u8>,
     operation_fingerprint: Vec<u8>,
     trusted_time_unix_seconds: i64,
+    change_intent: Option<MemoryV1RuleSetChangeIntent>,
     /// §4.10: the effective owner visibility scope for business filtering.
     effective_owner_scope: MemoryV1OwnerScope,
     /// §4.10: the effective tenant visibility scope for business filtering.
@@ -93,6 +111,16 @@ impl MemoryV1Admission {
         self.target.as_deref()
     }
 
+    /// memory—v1: Access the exact target tenant attribution bound at evaluation.
+    pub fn target_tenant(&self) -> Option<&[u8]> {
+        self.target_tenant.as_deref()
+    }
+
+    /// memory—v1: Access the exact target owner attribution bound at evaluation.
+    pub fn target_owner(&self) -> Option<&[u8]> {
+        self.target_owner.as_deref()
+    }
+
     /// memory—v1: Access the stable operation identifier supplied by the caller.
     pub fn operation_id(&self) -> &[u8] {
         &self.operation_id
@@ -106,6 +134,11 @@ impl MemoryV1Admission {
     /// memory—v1: Access the final trusted UTC clock observation.
     pub fn trusted_time_unix_seconds(&self) -> i64 {
         self.trusted_time_unix_seconds
+    }
+
+    /// memory—v1: Return the explicit change-confirmation intent, if any.
+    pub fn change_intent(&self) -> Option<MemoryV1RuleSetChangeIntent> {
+        self.change_intent
     }
 
     /// memory—v1 §4.10: the effective owner visibility scope delivered to the
@@ -143,6 +176,23 @@ pub enum MemoryV1DenySource {
     CardDisabled,
 }
 
+impl MemoryV1DenySource {
+    /// memory—v1: Map the observed decision source to the frozen audit vocabulary.
+    /// This conversion does not supply a trusted observation or persist an audit event.
+    pub const fn audit_source(self) -> MemoryV1AuditDenySource {
+        match self {
+            Self::RuleDenied => MemoryV1AuditDenySource::RuleDeny,
+            Self::NoMatch => MemoryV1AuditDenySource::NoMatch,
+            Self::ScopeDenied => MemoryV1AuditDenySource::ScopeDenied,
+            Self::CardUnbound => MemoryV1AuditDenySource::CardUnbound,
+            Self::IdentityMismatch => MemoryV1AuditDenySource::IdentityMismatch,
+            Self::UnregisteredResource => MemoryV1AuditDenySource::UnregisteredResource,
+            Self::SelfConfirmation => MemoryV1AuditDenySource::SelfConfirmation,
+            Self::CardDisabled => MemoryV1AuditDenySource::CardDisabled,
+        }
+    }
+}
+
 /// memory—v1 §4.8: why an evaluation could not produce a determinate outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryV1PendingSource {
@@ -154,6 +204,199 @@ pub enum MemoryV1PendingSource {
     RootUnavailable,
 }
 
+impl MemoryV1PendingSource {
+    /// memory—v1: Return the frozen internal source for log and metric correlation.
+    /// PENDING remains non-persistable under the audit contract.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextInvalid => "context_invalid",
+            Self::FenceActive => "fence_active",
+            Self::RootUnavailable => "root_unavailable",
+        }
+    }
+}
+
+/// memory—v1: A root-derived binding checked as part of a rule-set change.
+///
+/// This is a read-phase association, not proof of authorization or durable audit.
+/// Its values are kept separate from the rule-set request target.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MemoryV1AffectedBindingObservation {
+    binding_id: [u8; 16],
+    user_card_id: [u8; 16],
+    owner_user_id: [u8; 16],
+    tenant_id: [u8; 16],
+}
+
+impl std::fmt::Debug for MemoryV1AffectedBindingObservation {
+    // memory—v1: Avoid exposing affected identities through nested debug output.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MemoryV1AffectedBindingObservation(<redacted>)")
+    }
+}
+
+impl MemoryV1AffectedBindingObservation {
+    /// memory—v1: Return the impacted binding's identifier.
+    pub fn binding_id(&self) -> [u8; 16] {
+        self.binding_id
+    }
+    /// memory—v1: Return the impacted authorization card's identifier.
+    pub fn user_card_id(&self) -> [u8; 16] {
+        self.user_card_id
+    }
+    /// memory—v1: Return the impacted card owner's identifier.
+    pub fn owner_user_id(&self) -> [u8; 16] {
+        self.owner_user_id
+    }
+    /// memory—v1: Return the impacted binding's tenant identifier.
+    pub fn tenant_id(&self) -> [u8; 16] {
+        self.tenant_id
+    }
+}
+
+/// A bounded snapshot of a DENY from one authoritative read phase.
+///
+/// This value is not an audit event, a final trusted-time observation, durable
+/// evidence, or an authorization to allow or commit. Its fields can only be
+/// populated by the evaluator. Debug output deliberately omits request data.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MemoryV1DenyObservation {
+    root: RootMetadata,
+    identity: CandidateIdentity,
+    read_started_at_unix_seconds: i64,
+    resource: String,
+    action: String,
+    target: Option<Vec<u8>>,
+    target_tenant: Option<Vec<u8>>,
+    target_owner: Option<Vec<u8>>,
+    affected_binding: Option<MemoryV1AffectedBindingObservation>,
+    operation_id: Vec<u8>,
+    operation_fingerprint: Vec<u8>,
+    source: MemoryV1DenySource,
+    batch_sequence: Option<u32>,
+}
+
+impl std::fmt::Debug for MemoryV1DenyObservation {
+    // memory—v1: Do not expose any request, identity, or root data in logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MemoryV1DenyObservation(<redacted>)")
+    }
+}
+
+impl MemoryV1DenyObservation {
+    /// memory—v1: Return the metadata of the root read during the decision.
+    pub fn root(&self) -> RootMetadata {
+        self.root
+    }
+    /// memory—v1: Return the verified session identity used in that read.
+    pub fn identity(&self) -> CandidateIdentity {
+        self.identity
+    }
+    /// memory—v1: Return the read-start clock sample, not a final trusted time.
+    pub fn read_started_at_unix_seconds(&self) -> i64 {
+        self.read_started_at_unix_seconds
+    }
+    /// memory—v1: Return the resource of the selected denial.
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+    /// memory—v1: Return the action of the selected denial.
+    pub fn action(&self) -> &str {
+        &self.action
+    }
+    /// memory—v1: Return the selected target, if known to the evaluation.
+    pub fn target(&self) -> Option<&[u8]> {
+        self.target.as_deref()
+    }
+    /// memory—v1: Return the selected target's tenant, when supplied.
+    pub fn target_tenant(&self) -> Option<&[u8]> {
+        self.target_tenant.as_deref()
+    }
+    /// memory—v1: Return the selected target's owner, when supplied.
+    pub fn target_owner(&self) -> Option<&[u8]> {
+        self.target_owner.as_deref()
+    }
+    /// memory—v1: Return a separately identified binding when its evaluation
+    /// caused a rule-set change denial. This is absent for a rule-set-level
+    /// denial or when no single binding was selected.
+    pub fn affected_binding(&self) -> Option<&MemoryV1AffectedBindingObservation> {
+        self.affected_binding.as_ref()
+    }
+    /// memory—v1: Return the raw caller-supplied operation binding.
+    pub fn operation_id(&self) -> &[u8] {
+        &self.operation_id
+    }
+    /// memory—v1: Return the raw caller-supplied fingerprint binding.
+    pub fn operation_fingerprint(&self) -> &[u8] {
+        &self.operation_fingerprint
+    }
+    /// memory—v1: Return the actual denial source.
+    pub fn source(&self) -> MemoryV1DenySource {
+        self.source
+    }
+    /// memory—v1: Return the selected batch item's original sequence, if applicable.
+    pub fn batch_sequence(&self) -> Option<u32> {
+        self.batch_sequence
+    }
+}
+
+// memory—v1: Capture only after a real denial has been selected in this reader.
+pub(crate) fn capture_deny_observation(
+    metadata: RootMetadata,
+    facts: &VerifiedSessionFacts,
+    read_started_at_unix_seconds: i64,
+    request: &MemoryV1Request<'_>,
+    source: MemoryV1DenySource,
+    batch_sequence: Option<u32>,
+) -> Box<MemoryV1DenyObservation> {
+    Box::new(MemoryV1DenyObservation {
+        root: metadata,
+        identity: facts.candidate_identity(),
+        read_started_at_unix_seconds,
+        resource: request.resource.to_owned(),
+        action: request.action.to_owned(),
+        target: request.target.map(<[u8]>::to_vec),
+        target_tenant: request.target_tenant.map(<[u8]>::to_vec),
+        target_owner: request.target_owner.map(<[u8]>::to_vec),
+        affected_binding: None,
+        operation_id: request.operation_id.to_vec(),
+        operation_fingerprint: request.operation_fingerprint.to_vec(),
+        source,
+        batch_sequence,
+    })
+}
+
+// memory—v1: A checked impact binding is an association, not a replacement for
+// the original rule-set target or its ownerless attribution.
+pub(crate) fn capture_rule_set_binding_deny_observation(
+    metadata: RootMetadata,
+    facts: &VerifiedSessionFacts,
+    read_started_at_unix_seconds: i64,
+    request: &MemoryV1Request<'_>,
+    source: MemoryV1DenySource,
+    binding_id: [u8; 16],
+    target: GovernanceTargetFacts,
+) -> Box<MemoryV1DenyObservation> {
+    let mut observation = capture_deny_observation(
+        metadata,
+        facts,
+        read_started_at_unix_seconds,
+        request,
+        source,
+        None,
+    );
+    observation.affected_binding = Some(MemoryV1AffectedBindingObservation {
+        binding_id,
+        user_card_id: target.user_card_id,
+        owner_user_id: target.owner_user_id,
+        tenant_id: target.tenant_id,
+    });
+    observation
+}
+
+/// Evaluation values remain publicly constructible, so consumers must not treat
+/// an observation attached to a result as proof of the result's origin. A captured
+/// observation itself has private fields and cannot be fabricated by callers.
 /// An admission is present only when the decision is `Allow`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryV1Evaluation {
@@ -161,6 +404,126 @@ pub struct MemoryV1Evaluation {
     pub deny_source: Option<MemoryV1DenySource>,
     pub pending_source: Option<MemoryV1PendingSource>,
     pub admission: Option<MemoryV1Admission>,
+    /// Read-phase data, present only when a DENY was attributable in that phase.
+    pub deny_observation: Option<Box<MemoryV1DenyObservation>>,
+}
+
+// memory—v1: A planned action contains all inputs needed for one shared final
+// check. It deliberately does not expose a mutation capability or a commit gate.
+#[derive(Clone)]
+pub(crate) struct MemoryV1ActionDraft {
+    root: RootMetadata,
+    identity: CandidateIdentity,
+    resource: String,
+    action: String,
+    target: Option<Vec<u8>>,
+    target_tenant: Option<Vec<u8>>,
+    target_owner: Option<Vec<u8>>,
+    operation_id: Vec<u8>,
+    operation_fingerprint: Vec<u8>,
+    change_intent: Option<MemoryV1RuleSetChangeIntent>,
+    effective_owner_scope: MemoryV1OwnerScope,
+    effective_tenant_scope: MemoryV1TenantScope,
+    dependency: DependencyRecord,
+    future_boundaries: Vec<i64>,
+    winning_windows: Vec<FinalCheckWindow>,
+    target_rule_sets: Vec<[u8; 16]>,
+}
+
+impl MemoryV1ActionDraft {
+    // memory—v1: Expose only the shared evaluator's final-check inputs.
+    pub(crate) fn root(&self) -> RootMetadata {
+        self.root
+    }
+
+    pub(crate) fn identity(&self) -> CandidateIdentity {
+        self.identity
+    }
+
+    pub(crate) fn dependency(&self) -> &DependencyRecord {
+        &self.dependency
+    }
+
+    pub(crate) fn future_boundaries(&self) -> &[i64] {
+        &self.future_boundaries
+    }
+
+    pub(crate) fn winning_windows(&self) -> &[FinalCheckWindow] {
+        &self.winning_windows
+    }
+
+    pub(crate) fn target_rule_sets(&self) -> &[[u8; 16]] {
+        &self.target_rule_sets
+    }
+
+    pub(crate) fn into_admission(self, trusted_time_unix_seconds: i64) -> MemoryV1Admission {
+        MemoryV1Admission {
+            root: self.root,
+            identity: self.identity,
+            resource: self.resource,
+            action: self.action,
+            target: self.target,
+            target_tenant: self.target_tenant,
+            target_owner: self.target_owner,
+            operation_id: self.operation_id,
+            operation_fingerprint: self.operation_fingerprint,
+            trusted_time_unix_seconds,
+            change_intent: self.change_intent,
+            effective_owner_scope: self.effective_owner_scope,
+            effective_tenant_scope: self.effective_tenant_scope,
+        }
+    }
+}
+
+pub(crate) enum MemoryV1DenyTarget {
+    Request,
+    AffectedBinding {
+        binding_id: [u8; 16],
+        facts: GovernanceTargetFacts,
+    },
+    Unavailable,
+}
+
+pub(crate) enum MemoryV1DraftResult {
+    Allow(Box<MemoryV1ActionDraft>),
+    Deny(MemoryV1DenySource, MemoryV1DenyTarget),
+    Pending(MemoryV1PendingSource),
+}
+
+// memory—v1: Keep request shape validation identical for ordinary and compound
+// entries before any rule or root fact can influence the result.
+pub(crate) fn memory_v1_request_is_well_formed(request: &MemoryV1Request<'_>) -> bool {
+    request.resource.len() <= MAX_TEXT_BYTES
+        && !request.resource.is_empty()
+        && request.action.len() <= MAX_TEXT_BYTES
+        && !request.action.is_empty()
+        && !request.operation_id.is_empty()
+        && request.operation_id.len() <= MAX_BINDING_BYTES
+        && !request.operation_fingerprint.is_empty()
+        && request.operation_fingerprint.len() <= MAX_BINDING_BYTES
+        && request
+            .target
+            .is_none_or(|target| target.len() <= MAX_BINDING_BYTES)
+        && request
+            .target_tenant
+            .is_none_or(|tenant| tenant.len() <= MAX_BINDING_BYTES)
+        && request
+            .target_owner
+            .is_none_or(|owner| owner.len() <= MAX_BINDING_BYTES)
+}
+
+pub(crate) fn memory_v1_rule_set_change_is_well_formed(request: &MemoryV1Request<'_>) -> bool {
+    request.resource == "rule_set"
+        && request.action == "confirm-change"
+        && request.target_owner.is_none()
+        && !request.operation_id.is_empty()
+        && request.operation_id.len() <= MAX_BINDING_BYTES
+        && !request.operation_fingerprint.is_empty()
+        && request.operation_fingerprint.len() <= MAX_BINDING_BYTES
+        && request.target.is_some_and(|target| target.len() == 16)
+        && request
+            .target_tenant
+            .is_some_and(|tenant| tenant.len() == 16)
 }
 
 // memory—v1: Produce a non-authorizing outcome without an admission.
@@ -175,7 +538,28 @@ fn non_allow(
         deny_source,
         pending_source,
         admission: None,
+        deny_observation: None,
     }
+}
+
+// memory—v1: Attach an observation only to a denial selected in this read phase.
+fn observed_deny(
+    facts: &VerifiedSessionFacts,
+    reader: &RequestRootReader,
+    start_time: i64,
+    request: &MemoryV1Request<'_>,
+    source: MemoryV1DenySource,
+) -> MemoryV1Evaluation {
+    let mut result = non_allow(MemoryV1Decision::Deny, Some(source), None);
+    result.deny_observation = Some(capture_deny_observation(
+        reader.metadata(),
+        facts,
+        start_time,
+        request,
+        source,
+        None,
+    ));
+    result
 }
 
 // memory—v1: Obtain process time without accepting clock errors or overflow.
@@ -197,16 +581,357 @@ pub(crate) fn evaluate_memory_v1(
     session: &RequestSessionExtension,
     request: &MemoryV1Request<'_>,
 ) -> MemoryV1Evaluation {
-    evaluate_with(root, session, request, trusted_now, || {})
+    evaluate_with_final(
+        root,
+        session,
+        request,
+        trusted_now,
+        || {},
+        |check, record, constraints, _| check.try_final_time(record, constraints),
+    )
+}
+
+/// memory—v1: Evaluate one explicit rule-set confirmation against its full
+/// root-derived impact. This does not authorize a compound mutation or commit.
+pub(crate) fn evaluate_memory_v1_rule_set_change(
+    root: &RequestRootExtension,
+    session: &RequestSessionExtension,
+    request: &MemoryV1Request<'_>,
+    intent: MemoryV1RuleSetChangeIntent,
+) -> MemoryV1Evaluation {
+    evaluate_rule_set_change_with(
+        root,
+        session,
+        request,
+        intent,
+        trusted_now,
+        || {},
+        |check, record, constraints, metadata, target, _| {
+            check.try_final_time_exact_root(record, constraints, metadata, target)
+        },
+    )
+}
+
+// memory—v1: The request's intent is explicit; no caller supplies beneficiaries.
+fn evaluate_rule_set_change_with(
+    root: &RequestRootExtension,
+    session: &RequestSessionExtension,
+    request: &MemoryV1Request<'_>,
+    intent: MemoryV1RuleSetChangeIntent,
+    mut clock: impl FnMut() -> Option<i64>,
+    after_read: impl FnOnce(),
+    final_time: impl FnOnce(
+        &SessionFinalCheck<'_>,
+        &DependencyRecord,
+        &FinalCheckTimeConstraints<'_>,
+        RootMetadata,
+        [u8; 16],
+        &mut dyn FnMut() -> Option<i64>,
+    ) -> Option<i64>,
+) -> MemoryV1Evaluation {
+    let pending = || {
+        non_allow(
+            MemoryV1Decision::Pending,
+            None,
+            Some(MemoryV1PendingSource::ContextInvalid),
+        )
+    };
+    if request.resource != "rule_set"
+        || request.action != "confirm-change"
+        || request.target_owner.is_some()
+        || request.operation_id.is_empty()
+        || request.operation_id.len() > MAX_BINDING_BYTES
+        || request.operation_fingerprint.is_empty()
+        || request.operation_fingerprint.len() > MAX_BINDING_BYTES
+    {
+        return pending();
+    }
+    let Some(target): Option<[u8; 16]> = request.target.and_then(|value| value.try_into().ok())
+    else {
+        return pending();
+    };
+    let Some(tenant): Option<[u8; 16]> = request
+        .target_tenant
+        .and_then(|value| value.try_into().ok())
+    else {
+        return pending();
+    };
+    if target == [0; 16] || tenant == [0; 16] {
+        return pending();
+    }
+    session
+        .with_authoritative_context(root, |facts, reader, check| {
+            if check.is_none() {
+                return pending();
+            }
+            let metadata = reader.metadata();
+            let Some(start_time) = clock() else {
+                return pending();
+            };
+            if metadata.status != RootStatus::Serving || !facts.valid_at(start_time) {
+                return pending();
+            }
+            match reader.is_fenced(target) {
+                Ok(true) => {
+                    return non_allow(
+                        MemoryV1Decision::Pending,
+                        None,
+                        Some(MemoryV1PendingSource::FenceActive),
+                    );
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    return non_allow(
+                        MemoryV1Decision::Pending,
+                        None,
+                        Some(MemoryV1PendingSource::RootUnavailable),
+                    );
+                }
+            }
+            let target_facts = match intent {
+                MemoryV1RuleSetChangeIntent::Create => {
+                    reader.rule_set_create_target(target, tenant)
+                }
+                MemoryV1RuleSetChangeIntent::Publish => reader.active_rule_set_target(target),
+            };
+            let Ok(target_facts) = target_facts else {
+                return pending();
+            };
+            if target_facts.rule_set_id != target || target_facts.tenant_id != tenant {
+                return pending();
+            }
+            let mut beneficiaries = Vec::new();
+            if intent == MemoryV1RuleSetChangeIntent::Publish {
+                let Ok(impact) = reader.read_change_impact(target) else {
+                    return pending();
+                };
+                let mut cards = std::collections::HashSet::new();
+                let mut users = std::collections::HashSet::new();
+                let mut tenants = std::collections::HashSet::new();
+                for binding_id in &impact.binding_ids {
+                    let Ok(bound) = reader.binding_target(*binding_id) else {
+                        return pending();
+                    };
+                    if bound.rule_set_id != target
+                        || bound.tenant_id != tenant
+                        || bound.user_card_id == [0; 16]
+                        || bound.owner_user_id == [0; 16]
+                    {
+                        return pending();
+                    }
+                    cards.insert(bound.user_card_id);
+                    users.insert(bound.owner_user_id);
+                    tenants.insert(bound.tenant_id);
+                    beneficiaries.push((*binding_id, bound));
+                }
+                if cards.len() != impact.card_ids.len()
+                    || users.len() != impact.user_ids.len()
+                    || tenants.len() != impact.tenant_ids.len()
+                    || !impact.card_ids.iter().all(|id| cards.contains(id))
+                    || !impact.user_ids.iter().all(|id| users.contains(id))
+                    || !impact.tenant_ids.iter().all(|id| tenants.contains(id))
+                {
+                    return pending();
+                }
+                if users.contains(&facts.candidate_identity().user_id.into_bytes()) {
+                    return observed_deny(
+                        facts,
+                        reader,
+                        start_time,
+                        request,
+                        MemoryV1DenySource::SelfConfirmation,
+                    );
+                }
+            }
+            beneficiaries.sort_unstable_by_key(|(binding_id, _)| *binding_id);
+            let mut candidate_requests = Vec::with_capacity(beneficiaries.len() + 1);
+            candidate_requests.push((target, tenant, None, None));
+            candidate_requests.extend(beneficiaries.iter().map(|(binding_id, facts)| {
+                (
+                    *binding_id,
+                    facts.tenant_id,
+                    Some(facts.owner_user_id),
+                    Some((*binding_id, *facts)),
+                )
+            }));
+            let mut dependency_record = None;
+            let mut windows = Vec::new();
+            let mut boundaries = Vec::new();
+            let mut owner_scope = MemoryV1OwnerScope::AllUsers;
+            let mut tenant_scope = MemoryV1TenantScope::SelfAndDescendants;
+            let mut pending_source = None;
+            let mut deny_source = None;
+            for (target_id, target_tenant, target_owner, affected_binding) in &candidate_requests {
+                let candidate_request = MemoryV1Request {
+                    target: Some(target_id),
+                    target_tenant: Some(target_tenant),
+                    target_owner: target_owner.as_ref().map(|value| value.as_slice()),
+                    ..*request
+                };
+                match evaluate_card_candidate(
+                    facts,
+                    reader,
+                    &candidate_request,
+                    start_time,
+                    target_owner.is_none(),
+                ) {
+                    CardOutcome::Deny(source) => {
+                        deny_source.get_or_insert((source, *affected_binding));
+                    }
+                    CardOutcome::Pending(source) => {
+                        pending_source.get_or_insert(source);
+                    }
+                    CardOutcome::Allow {
+                        dependencies,
+                        winning_allows,
+                        future_boundaries,
+                        owner_scope: owner,
+                        tenant_scope: scope,
+                        tree_version,
+                        registry_version,
+                    } => {
+                        let record = DependencyRecord {
+                            card_id: facts.candidate_identity().user_card_id.into_bytes(),
+                            instance_id: metadata.instance_id,
+                            bindings: dependencies,
+                            tenant_tree_version: tree_version,
+                            registry_version,
+                        };
+                        if let Some(existing) = &dependency_record {
+                            if existing != &record {
+                                pending_source.get_or_insert(MemoryV1PendingSource::ContextInvalid);
+                            }
+                        } else {
+                            dependency_record = Some(record);
+                        }
+                        owner_scope = strictest_owner_scope(owner_scope, owner);
+                        tenant_scope = strictest_tenant_scope(tenant_scope, scope);
+                        boundaries.extend(future_boundaries);
+                        windows.extend(winning_allows.into_iter().map(|winner| FinalCheckWindow {
+                            entry_validity: winner.entry_validity,
+                            binding_from: winner.binding_from,
+                            binding_until: winner.binding_until,
+                        }));
+                    }
+                }
+            }
+            if let Some((source, affected_binding)) = deny_source {
+                return match affected_binding {
+                    Some((binding_id, _target_facts)) => {
+                        let mut result = non_allow(MemoryV1Decision::Deny, Some(source), None);
+                        if let Some(target_facts) = attributable_rule_set_binding_deny(
+                            facts,
+                            reader,
+                            request,
+                            start_time,
+                            &beneficiaries,
+                            binding_id,
+                            source,
+                        ) {
+                            result.deny_observation =
+                                Some(capture_rule_set_binding_deny_observation(
+                                    metadata,
+                                    facts,
+                                    start_time,
+                                    request,
+                                    source,
+                                    binding_id,
+                                    target_facts,
+                                ));
+                        } else {
+                            // A selected beneficiary is not enough to establish unique
+                            // attribution: another beneficiary may deny or remain pending.
+                            result.deny_observation = Some(capture_deny_observation(
+                                metadata, facts, start_time, request, source, None,
+                            ));
+                        }
+                        result
+                    }
+                    None => observed_deny(facts, reader, start_time, request, source),
+                };
+            }
+            if let Some(source) = pending_source {
+                return non_allow(MemoryV1Decision::Pending, None, Some(source));
+            }
+            let Some(record) = dependency_record else {
+                return pending();
+            };
+            after_read();
+            let constraints = FinalCheckTimeConstraints {
+                start_time,
+                future_boundaries: &boundaries,
+                winning_windows: &windows,
+            };
+            let Some(now) = check.as_ref().and_then(|check| {
+                final_time(check, &record, &constraints, metadata, target, &mut clock)
+            }) else {
+                return pending();
+            };
+            MemoryV1Evaluation {
+                decision: MemoryV1Decision::Allow,
+                deny_source: None,
+                pending_source: None,
+                deny_observation: None,
+                admission: Some(MemoryV1Admission {
+                    root: metadata,
+                    identity: facts.candidate_identity(),
+                    resource: request.resource.to_owned(),
+                    action: request.action.to_owned(),
+                    target: Some(target.to_vec()),
+                    target_tenant: Some(tenant.to_vec()),
+                    target_owner: None,
+                    operation_id: request.operation_id.to_vec(),
+                    operation_fingerprint: request.operation_fingerprint.to_vec(),
+                    trusted_time_unix_seconds: now,
+                    change_intent: Some(intent),
+                    effective_owner_scope: owner_scope,
+                    effective_tenant_scope: tenant_scope,
+                }),
+            }
+        })
+        .unwrap_or_else(|_| {
+            non_allow(
+                MemoryV1Decision::Pending,
+                None,
+                Some(MemoryV1PendingSource::RootUnavailable),
+            )
+        })
 }
 
 // memory—v1: Keep clock and post-read hooks private for deterministic tests.
+#[cfg(test)]
 fn evaluate_with(
+    root: &RequestRootExtension,
+    session: &RequestSessionExtension,
+    request: &MemoryV1Request<'_>,
+    clock: impl FnMut() -> Option<i64>,
+    after_read: impl FnOnce(),
+) -> MemoryV1Evaluation {
+    evaluate_with_final(
+        root,
+        session,
+        request,
+        clock,
+        after_read,
+        |check, record, constraints, clock| {
+            check.try_final_time_for_test(record, constraints, clock)
+        },
+    )
+}
+
+// memory—v1: Share evaluation while keeping production clock sampling inside the root crate.
+fn evaluate_with_final(
     root: &RequestRootExtension,
     session: &RequestSessionExtension,
     request: &MemoryV1Request<'_>,
     mut clock: impl FnMut() -> Option<i64>,
     after_read: impl FnOnce(),
+    final_time: impl FnOnce(
+        &SessionFinalCheck<'_>,
+        &DependencyRecord,
+        &FinalCheckTimeConstraints<'_>,
+        &mut dyn FnMut() -> Option<i64>,
+    ) -> Option<i64>,
 ) -> MemoryV1Evaluation {
     if request.resource.is_empty()
         || request.resource.len() > MAX_TEXT_BYTES
@@ -233,8 +958,23 @@ fn evaluate_with(
         );
     }
     session
-        .with_context(root, |facts, reader| {
-            evaluate_reader(facts, reader, request, &mut clock, after_read)
+        .with_authoritative_context(root, |facts, reader, final_check| {
+            if final_check.is_none() {
+                return non_allow(
+                    MemoryV1Decision::Pending,
+                    None,
+                    Some(MemoryV1PendingSource::ContextInvalid),
+                );
+            }
+            evaluate_reader(
+                facts,
+                reader,
+                final_check,
+                request,
+                &mut clock,
+                after_read,
+                final_time,
+            )
         })
         .unwrap_or_else(|_| {
             non_allow(
@@ -246,12 +986,13 @@ fn evaluate_with(
 }
 
 // memory—v1 §4.8: the deterministic outcome of one card's aggregate.
-enum CardOutcome {
+pub(crate) enum CardOutcome {
     Deny(MemoryV1DenySource),
     Pending(MemoryV1PendingSource),
     Allow {
         dependencies: Vec<EvaluationDependency>,
         winning_allows: Vec<WinningAllow>,
+        future_boundaries: Vec<i64>,
         owner_scope: MemoryV1OwnerScope,
         tenant_scope: MemoryV1TenantScope,
         tree_version: u64,
@@ -261,10 +1002,10 @@ enum CardOutcome {
 
 // memory—v1 §4.4: one winning ALLOW rule whose window and scope must still
 // hold at the final trusted-time observation.
-struct WinningAllow {
-    entry_validity: Option<MemoryV1Validity>,
-    binding_from: Option<i64>,
-    binding_until: Option<i64>,
+pub(crate) struct WinningAllow {
+    pub(crate) entry_validity: Option<MemoryV1Validity>,
+    pub(crate) binding_from: Option<i64>,
+    pub(crate) binding_until: Option<i64>,
     owner_scope: MemoryV1OwnerScope,
     tenant_scope: MemoryV1TenantScope,
 }
@@ -295,13 +1036,902 @@ fn strictest_tenant_scope(
     }
 }
 
-// memory—v1: Evaluate one immutable snapshot and recheck it before allowing.
-fn evaluate_reader(
+// memory—v1: Convert one already evaluated card aggregate into a draft. No
+// clock or final check is performed here; the compound owner performs exactly
+// one final check after all action drafts have succeeded.
+fn draft_from_card_outcome(
+    facts: &VerifiedSessionFacts,
+    metadata: RootMetadata,
+    request: &MemoryV1Request<'_>,
+    outcome: CardOutcome,
+    target_rule_sets: Option<&[[u8; 16]]>,
+) -> MemoryV1DraftResult {
+    let CardOutcome::Allow {
+        dependencies,
+        winning_allows,
+        future_boundaries,
+        owner_scope,
+        tenant_scope,
+        tree_version,
+        registry_version,
+    } = outcome
+    else {
+        return match outcome {
+            CardOutcome::Deny(source) => {
+                MemoryV1DraftResult::Deny(source, MemoryV1DenyTarget::Request)
+            }
+            CardOutcome::Pending(source) => MemoryV1DraftResult::Pending(source),
+            CardOutcome::Allow { .. } => unreachable!(),
+        };
+    };
+    if winning_allows.is_empty() {
+        return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+    }
+    let Some(target_rule_sets) = target_rule_sets.filter(|targets| {
+        targets.iter().all(|target| *target != [0; 16])
+            && (!targets.is_empty()
+                || (request.resource == "user_card"
+                    && matches!(request.action, "create" | "disable" | "enable")))
+    }) else {
+        return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+    };
+    let mut target_rule_sets = target_rule_sets.to_vec();
+    target_rule_sets.sort_unstable();
+    target_rule_sets.dedup();
+    MemoryV1DraftResult::Allow(Box::new(MemoryV1ActionDraft {
+        root: metadata,
+        identity: facts.candidate_identity(),
+        resource: request.resource.to_owned(),
+        action: request.action.to_owned(),
+        target: request.target.map(<[u8]>::to_vec),
+        target_tenant: request.target_tenant.map(<[u8]>::to_vec),
+        target_owner: request.target_owner.map(<[u8]>::to_vec),
+        operation_id: request.operation_id.to_vec(),
+        operation_fingerprint: request.operation_fingerprint.to_vec(),
+        change_intent: None,
+        effective_owner_scope: owner_scope,
+        effective_tenant_scope: tenant_scope,
+        dependency: DependencyRecord {
+            card_id: facts.candidate_identity().user_card_id.into_bytes(),
+            instance_id: metadata.instance_id,
+            bindings: dependencies,
+            tenant_tree_version: tree_version,
+            registry_version,
+        },
+        future_boundaries,
+        winning_windows: winning_allows
+            .into_iter()
+            .map(|winning| FinalCheckWindow {
+                entry_validity: winning.entry_validity,
+                binding_from: winning.binding_from,
+                binding_until: winning.binding_until,
+            })
+            .collect(),
+        target_rule_sets,
+    }))
+}
+
+// memory—v1: Plan one ordinary action against one immutable request phase.
+pub(crate) fn plan_memory_v1_action_reader(
     facts: &VerifiedSessionFacts,
     reader: &RequestRootReader,
     request: &MemoryV1Request<'_>,
+    start_time: i64,
+    target_rule_sets: &[[u8; 16]],
+    ownerless_rule_set_target: bool,
+) -> MemoryV1DraftResult {
+    if !memory_v1_request_is_well_formed(request) {
+        return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+    }
+    draft_from_card_outcome(
+        facts,
+        reader.metadata(),
+        request,
+        evaluate_card_candidate(
+            facts,
+            reader,
+            request,
+            start_time,
+            ownerless_rule_set_target,
+        ),
+        Some(target_rule_sets),
+    )
+}
+
+// memory—v1: Plan the dedicated confirm-change action while retaining its
+// impact-set, self-confirmation, scope and dependency semantics. The caller
+// supplies the actual nonzero rule-set target from the bound request.
+pub(crate) fn plan_memory_v1_rule_set_change_reader(
+    facts: &VerifiedSessionFacts,
+    reader: &RequestRootReader,
+    request: &MemoryV1Request<'_>,
+    intent: MemoryV1RuleSetChangeIntent,
+    start_time: i64,
+) -> MemoryV1DraftResult {
+    if !memory_v1_rule_set_change_is_well_formed(request) {
+        return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+    }
+    let metadata = reader.metadata();
+    let actor = facts.candidate_identity();
+    let actor_matches = match reader.read_card_for_evaluation(
+        actor.user_card_id.into_bytes(),
+        |context, _has_binding_history| {
+            context.user.user_id == actor.user_id.into_bytes()
+                && context.identity.identity_card_id == actor.identity_card_id.into_bytes()
+                && context.identity.user_id == actor.user_id.into_bytes()
+                && context.card.user_card_id == actor.user_card_id.into_bytes()
+                && context.card.user_id == actor.user_id.into_bytes()
+                && context.card.tenant_id == actor.tenant_id.into_bytes()
+                && context.tenant.tenant_id == actor.tenant_id.into_bytes()
+        },
+    ) {
+        Ok(matches) => matches,
+        Err(_) => return MemoryV1DraftResult::Pending(MemoryV1PendingSource::RootUnavailable),
+    };
+    if !actor_matches {
+        return MemoryV1DraftResult::Deny(
+            MemoryV1DenySource::IdentityMismatch,
+            MemoryV1DenyTarget::Unavailable,
+        );
+    }
+    let Some(target): Option<[u8; 16]> = request.target.and_then(|id| id.try_into().ok()) else {
+        return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+    };
+    let Some(tenant): Option<[u8; 16]> = request
+        .target_tenant
+        .and_then(|tenant| tenant.try_into().ok())
+    else {
+        return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+    };
+    if target == [0; 16] || tenant == [0; 16] {
+        return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+    }
+    match reader.is_fenced(target) {
+        Ok(true) => return MemoryV1DraftResult::Pending(MemoryV1PendingSource::FenceActive),
+        Ok(false) => {}
+        Err(_) => return MemoryV1DraftResult::Pending(MemoryV1PendingSource::RootUnavailable),
+    }
+    let target_facts = match intent {
+        MemoryV1RuleSetChangeIntent::Create => reader.rule_set_create_target(target, tenant),
+        MemoryV1RuleSetChangeIntent::Publish => reader.active_rule_set_target(target),
+    };
+    let Ok(target_facts) = target_facts else {
+        return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+    };
+    if target_facts.rule_set_id != target || target_facts.tenant_id != tenant {
+        return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+    }
+
+    let mut beneficiaries = Vec::new();
+    if intent == MemoryV1RuleSetChangeIntent::Publish {
+        let Ok(impact) = reader.read_change_impact(target) else {
+            return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+        };
+        let mut cards = std::collections::HashSet::new();
+        let mut users = std::collections::HashSet::new();
+        let mut tenants = std::collections::HashSet::new();
+        for binding_id in &impact.binding_ids {
+            let Ok(bound) = reader.binding_target(*binding_id) else {
+                return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+            };
+            if bound.rule_set_id != target
+                || bound.tenant_id != tenant
+                || bound.user_card_id == [0; 16]
+                || bound.owner_user_id == [0; 16]
+            {
+                return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+            }
+            cards.insert(bound.user_card_id);
+            users.insert(bound.owner_user_id);
+            tenants.insert(bound.tenant_id);
+            beneficiaries.push((*binding_id, bound));
+        }
+        if cards.len() != impact.card_ids.len()
+            || users.len() != impact.user_ids.len()
+            || tenants.len() != impact.tenant_ids.len()
+            || !impact.card_ids.iter().all(|id| cards.contains(id))
+            || !impact.user_ids.iter().all(|id| users.contains(id))
+            || !impact.tenant_ids.iter().all(|id| tenants.contains(id))
+        {
+            return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+        }
+        if users.contains(&actor.user_id.into_bytes()) {
+            return MemoryV1DraftResult::Deny(
+                MemoryV1DenySource::SelfConfirmation,
+                MemoryV1DenyTarget::Request,
+            );
+        }
+    }
+    beneficiaries.sort_unstable_by_key(|(binding_id, _)| *binding_id);
+    let mut candidate_requests = Vec::with_capacity(beneficiaries.len() + 1);
+    candidate_requests.push((target, tenant, None, None));
+    candidate_requests.extend(beneficiaries.iter().map(|(binding_id, facts)| {
+        (
+            *binding_id,
+            facts.tenant_id,
+            Some(facts.owner_user_id),
+            Some((*binding_id, *facts)),
+        )
+    }));
+
+    let mut dependency_record = None;
+    let mut windows = Vec::new();
+    let mut boundaries = Vec::new();
+    let mut owner_scope = MemoryV1OwnerScope::AllUsers;
+    let mut tenant_scope = MemoryV1TenantScope::SelfAndDescendants;
+    for (target_id, target_tenant, target_owner, affected_binding) in &candidate_requests {
+        let candidate_request = MemoryV1Request {
+            target: Some(target_id),
+            target_tenant: Some(target_tenant),
+            target_owner: target_owner.as_ref().map(|value| value.as_slice()),
+            ..*request
+        };
+        match evaluate_card_candidate(
+            facts,
+            reader,
+            &candidate_request,
+            start_time,
+            target_owner.is_none(),
+        ) {
+            CardOutcome::Deny(source) => {
+                let target = match affected_binding {
+                    Some((binding_id, _target_facts)) => {
+                        if let Some(target_facts) = attributable_rule_set_binding_deny(
+                            facts,
+                            reader,
+                            request,
+                            start_time,
+                            &beneficiaries,
+                            *binding_id,
+                            source,
+                        ) {
+                            MemoryV1DenyTarget::AffectedBinding {
+                                binding_id: *binding_id,
+                                facts: target_facts,
+                            }
+                        } else {
+                            MemoryV1DenyTarget::Request
+                        }
+                    }
+                    None => MemoryV1DenyTarget::Request,
+                };
+                return MemoryV1DraftResult::Deny(source, target);
+            }
+            CardOutcome::Pending(source) => return MemoryV1DraftResult::Pending(source),
+            CardOutcome::Allow {
+                dependencies,
+                winning_allows,
+                future_boundaries,
+                owner_scope: action_owner_scope,
+                tenant_scope: action_tenant_scope,
+                tree_version,
+                registry_version,
+            } => {
+                let record = DependencyRecord {
+                    card_id: actor.user_card_id.into_bytes(),
+                    instance_id: metadata.instance_id,
+                    bindings: dependencies,
+                    tenant_tree_version: tree_version,
+                    registry_version,
+                };
+                if let Some(existing) = &dependency_record {
+                    if existing != &record {
+                        return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+                    }
+                } else {
+                    dependency_record = Some(record);
+                }
+                owner_scope = strictest_owner_scope(owner_scope, action_owner_scope);
+                tenant_scope = strictest_tenant_scope(tenant_scope, action_tenant_scope);
+                boundaries.extend(future_boundaries);
+                windows.extend(winning_allows.into_iter().map(|winning| FinalCheckWindow {
+                    entry_validity: winning.entry_validity,
+                    binding_from: winning.binding_from,
+                    binding_until: winning.binding_until,
+                }));
+            }
+        }
+    }
+    let Some(dependency) = dependency_record else {
+        return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+    };
+    if windows.is_empty() {
+        return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
+    }
+    MemoryV1DraftResult::Allow(Box::new(MemoryV1ActionDraft {
+        root: metadata,
+        identity: actor,
+        resource: request.resource.to_owned(),
+        action: request.action.to_owned(),
+        target: Some(target.to_vec()),
+        target_tenant: Some(tenant.to_vec()),
+        target_owner: None,
+        operation_id: request.operation_id.to_vec(),
+        operation_fingerprint: request.operation_fingerprint.to_vec(),
+        change_intent: Some(intent),
+        effective_owner_scope: owner_scope,
+        effective_tenant_scope: tenant_scope,
+        target_rule_sets: vec![target],
+        dependency,
+        future_boundaries: boundaries,
+        winning_windows: windows,
+    }))
+}
+
+// memory—v1: A binding attribution requires evidence that the selected DENY is
+// specific to exactly one beneficiary check. The ownerless rule-set check and
+// every other beneficiary are read only for attribution after the caller has
+// already selected DENY; their results never change the decision or source.
+fn attributable_rule_set_binding_deny(
+    facts: &VerifiedSessionFacts,
+    reader: &RequestRootReader,
+    request: &MemoryV1Request<'_>,
+    start_time: i64,
+    targets: &[([u8; 16], GovernanceTargetFacts)],
+    selected_binding_id: [u8; 16],
+    source: MemoryV1DenySource,
+) -> Option<GovernanceTargetFacts> {
+    if !matches!(
+        source,
+        MemoryV1DenySource::RuleDenied
+            | MemoryV1DenySource::NoMatch
+            | MemoryV1DenySource::ScopeDenied
+    ) {
+        return None;
+    }
+    if !matches!(
+        evaluate_card_candidate(facts, reader, request, start_time, true),
+        CardOutcome::Allow { .. }
+    ) {
+        return None;
+    }
+    for (binding_id, target) in targets {
+        if *binding_id == selected_binding_id {
+            continue;
+        }
+        let beneficiary_request = MemoryV1Request {
+            target: Some(binding_id),
+            target_tenant: Some(&target.tenant_id),
+            target_owner: Some(&target.owner_user_id),
+            ..*request
+        };
+        if !matches!(
+            evaluate_card_candidate(facts, reader, &beneficiary_request, start_time, false),
+            CardOutcome::Allow { .. }
+        ) {
+            return None;
+        }
+    }
+    targets
+        .iter()
+        .find(|(binding_id, _)| *binding_id == selected_binding_id)
+        .map(|(_, target)| *target)
+}
+
+// memory—v1: A rule-set change has many root-owned beneficiaries. Until the
+// root exposes an impact-set dependency that its final check can fence, no
+// evaluation of that set may issue an admission. Determinate denials can still
+// be established from the immutable request phase.
+fn evaluate_reader(
+    facts: &VerifiedSessionFacts,
+    reader: &RequestRootReader,
+    final_check: Option<SessionFinalCheck<'_>>,
+    request: &MemoryV1Request<'_>,
     clock: &mut impl FnMut() -> Option<i64>,
     after_read: impl FnOnce(),
+    final_time: impl FnOnce(
+        &SessionFinalCheck<'_>,
+        &DependencyRecord,
+        &FinalCheckTimeConstraints<'_>,
+        &mut dyn FnMut() -> Option<i64>,
+    ) -> Option<i64>,
+) -> MemoryV1Evaluation {
+    if request.resource != "rule_set" || request.action != "confirm-change" {
+        return evaluate_reader_single(
+            facts,
+            reader,
+            final_check,
+            request,
+            clock,
+            after_read,
+            final_time,
+        );
+    }
+
+    let pending = || {
+        non_allow(
+            MemoryV1Decision::Pending,
+            None,
+            Some(MemoryV1PendingSource::ContextInvalid),
+        )
+    };
+    let Some(start_time) = clock() else {
+        return pending();
+    };
+    if reader.metadata().status != RootStatus::Serving || !facts.valid_at(start_time) {
+        return pending();
+    }
+    let actor = facts.candidate_identity();
+    let Ok(actor_matches) = reader.read_card_for_evaluation(
+        actor.user_card_id.into_bytes(),
+        |context, _has_binding_history| {
+            context.user.user_id == actor.user_id.into_bytes()
+                && context.identity.identity_card_id == actor.identity_card_id.into_bytes()
+                && context.identity.user_id == actor.user_id.into_bytes()
+                && context.card.user_card_id == actor.user_card_id.into_bytes()
+                && context.card.user_id == actor.user_id.into_bytes()
+                && context.card.tenant_id == actor.tenant_id.into_bytes()
+                && context.tenant.tenant_id == actor.tenant_id.into_bytes()
+        },
+    ) else {
+        return pending();
+    };
+    if !actor_matches {
+        return non_allow(
+            MemoryV1Decision::Deny,
+            Some(MemoryV1DenySource::IdentityMismatch),
+            None,
+        );
+    }
+    let Some(rule_set_id): Option<[u8; 16]> = request.target.and_then(|id| id.try_into().ok())
+    else {
+        return pending();
+    };
+    match reader.is_fenced(rule_set_id) {
+        Ok(true) => {
+            return non_allow(
+                MemoryV1Decision::Pending,
+                None,
+                Some(MemoryV1PendingSource::FenceActive),
+            );
+        }
+        Ok(false) => {}
+        Err(_) => {
+            return non_allow(
+                MemoryV1Decision::Pending,
+                None,
+                Some(MemoryV1PendingSource::RootUnavailable),
+            );
+        }
+    }
+    // A caller-supplied owner is never a trusted beneficiary for this action.
+    let owner_was_supplied = request.target_owner.is_some();
+    let Ok(rule_set) = reader.rule_set_target(rule_set_id) else {
+        return pending();
+    };
+    if request.target_tenant != Some(rule_set.tenant_id.as_slice()) {
+        return pending();
+    }
+    let Ok(impact) = reader.read_change_impact(rule_set_id) else {
+        return pending();
+    };
+    let mut targets = Vec::with_capacity(impact.binding_ids.len());
+    let mut cards = std::collections::HashSet::new();
+    let mut users = std::collections::HashSet::new();
+    let mut tenants = std::collections::HashSet::new();
+    for binding_id in &impact.binding_ids {
+        let Ok(target) = reader.binding_target(*binding_id) else {
+            return pending();
+        };
+        if target.rule_set_id != rule_set_id
+            || target.tenant_id != rule_set.tenant_id
+            || target.user_card_id == [0; 16]
+            || target.owner_user_id == [0; 16]
+        {
+            return pending();
+        }
+        cards.insert(target.user_card_id);
+        users.insert(target.owner_user_id);
+        tenants.insert(target.tenant_id);
+        targets.push((*binding_id, target));
+    }
+    if cards.len() != impact.card_ids.len()
+        || users.len() != impact.user_ids.len()
+        || tenants.len() != impact.tenant_ids.len()
+        || !impact.card_ids.iter().all(|id| cards.contains(id))
+        || !impact.user_ids.iter().all(|id| users.contains(id))
+        || !impact.tenant_ids.iter().all(|id| tenants.contains(id))
+    {
+        return pending();
+    }
+    // Inspect all beneficiaries first so self-signing wins regardless of set order.
+    if users.contains(&facts.candidate_identity().user_id.into_bytes()) {
+        // A caller-supplied owner is not a trusted beneficiary on this path.
+        let denied_request = MemoryV1Request {
+            target_owner: None,
+            ..*request
+        };
+        return observed_deny(
+            facts,
+            reader,
+            start_time,
+            &denied_request,
+            MemoryV1DenySource::SelfConfirmation,
+        );
+    }
+    if owner_was_supplied {
+        return pending();
+    }
+    targets.sort_unstable_by_key(|(binding_id, _)| *binding_id);
+    for (binding_id, target) in targets.iter().copied() {
+        let beneficiary_request = MemoryV1Request {
+            target: Some(&binding_id),
+            target_tenant: Some(&target.tenant_id),
+            target_owner: Some(&target.owner_user_id),
+            ..*request
+        };
+        if let CardOutcome::Deny(source) =
+            evaluate_card_candidate(facts, reader, &beneficiary_request, start_time, false)
+        {
+            let mut result = non_allow(MemoryV1Decision::Deny, Some(source), None);
+            if let Some(target) = attributable_rule_set_binding_deny(
+                facts, reader, request, start_time, &targets, binding_id, source,
+            ) {
+                result.deny_observation = Some(capture_rule_set_binding_deny_observation(
+                    reader.metadata(),
+                    facts,
+                    start_time,
+                    request,
+                    source,
+                    binding_id,
+                    target,
+                ));
+            } else {
+                result.deny_observation = Some(capture_deny_observation(
+                    reader.metadata(),
+                    facts,
+                    start_time,
+                    request,
+                    source,
+                    None,
+                ));
+            }
+            return result;
+        }
+    }
+    pending()
+}
+
+// memory—v1: Compute one target without sampling a clock or issuing admission.
+pub(crate) fn evaluate_card_candidate(
+    facts: &VerifiedSessionFacts,
+    reader: &RequestRootReader,
+    request: &MemoryV1Request<'_>,
+    start_time: i64,
+    ownerless_governance_target: bool,
+) -> CardOutcome {
+    // memory—v1 §4.9 A-3.4: a proven missing or inactive entry is a
+    // structural denial; an unavailable registry cannot establish that fact.
+    let registry_version =
+        match reader.registry_check_with_version(request.resource, request.action) {
+            Ok(version) => version,
+            Err(
+                RegistryError::Unregistered(_)
+                | RegistryError::Inactive(_, _)
+                | RegistryError::UnknownAction(_, _),
+            ) => {
+                return CardOutcome::Deny(MemoryV1DenySource::UnregisteredResource);
+            }
+            Err(_) => {
+                return CardOutcome::Pending(MemoryV1PendingSource::RootUnavailable);
+            }
+        };
+    let identity = facts.candidate_identity();
+    let outcome = reader.read_card_for_evaluation(
+        identity.user_card_id.into_bytes(),
+        |context, has_binding_history| {
+            let user = identity.user_id.into_bytes();
+            let card = identity.user_card_id.into_bytes();
+            let tenant = identity.tenant_id.into_bytes();
+            // memory—v1 §4.8: a proven relationship mismatch is a deterministic denial.
+            if context.user.user_id != user
+                || context.identity.identity_card_id != identity.identity_card_id.into_bytes()
+                || context.identity.user_id != user
+                || context.card.user_card_id != card
+                || context.card.user_id != user
+                || context.card.tenant_id != tenant
+                || context.tenant.tenant_id != tenant
+            {
+                return CardOutcome::Deny(MemoryV1DenySource::IdentityMismatch);
+            }
+            // memory—v1 §4.12 B-2.3: a DISABLED card is deterministically denied,
+            // including when the card has no bindings.
+            if context.card.status != UserCardStatus::Active {
+                return CardOutcome::Deny(MemoryV1DenySource::CardDisabled);
+            }
+            // memory—v1 §4.8: an unbound active card is a deterministic denial.
+            if context.bindings.is_empty() && !has_binding_history {
+                return CardOutcome::Deny(MemoryV1DenySource::CardUnbound);
+            }
+            // memory—v1 §4.11 B-1.3 N-7: SoD self-sign ban is a structural rule —
+            // confirm-class actions can never target the operator's own authority,
+            // regardless of scope width.
+            if request.action.starts_with("confirm") || request.action == "create-overlay-only" {
+                if let Some(owner) = request.target_owner {
+                    if owner == user {
+                        return CardOutcome::Deny(MemoryV1DenySource::SelfConfirmation);
+                    }
+                }
+            }
+            // memory—v1 §4.10: descendant resolution happens in the root tenant tree.
+            let descendants = match reader.tenant_descendants(tenant) {
+                Ok(list) => list,
+                Err(_) => return CardOutcome::Pending(MemoryV1PendingSource::RootUnavailable),
+            };
+            let (tree_version, _) = match reader.dependency_versions() {
+                Ok(versions) => versions,
+                Err(_) => return CardOutcome::Pending(MemoryV1PendingSource::RootUnavailable),
+            };
+            let mut dependencies: Vec<EvaluationDependency> = Vec::new();
+            let mut winning_allows: Vec<WinningAllow> = Vec::new();
+            let mut future_boundaries = Vec::new();
+            let mut allow = false;
+            let mut deny = false;
+            let mut scope_denied = false;
+            let mut pending: Option<MemoryV1PendingSource> = None;
+            for binding in &context.bindings {
+                // memory—v1 §4.13 N-19: only an active binding of this active
+                // card contributes; inconsistent ownership remains bad data.
+                if binding.binding.user_card_id != card {
+                    pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                    continue;
+                }
+                if !binding_is_active(binding.binding, Some(context.card)) {
+                    continue;
+                }
+                // memory—v1 §4.6: readers of a fenced rule set fail closed as
+                // soon as the modification window is observed.
+                match reader.is_fenced(binding.rule_set.rule_set_id) {
+                    Ok(true) => return CardOutcome::Pending(MemoryV1PendingSource::FenceActive),
+                    Ok(false) => {}
+                    Err(_) => return CardOutcome::Pending(MemoryV1PendingSource::RootUnavailable),
+                }
+                let Some(version) = binding.selected else {
+                    pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                    continue;
+                };
+                if binding.rule_set.rule_set_id != binding.binding.rule_set_id
+                    || binding.rule_set.owner_tenant_id != context.card.tenant_id
+                    || binding.rule_set.status != RuleSetStatus::Active
+                    || version.rule_set_id != binding.binding.rule_set_id
+                {
+                    pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                    continue;
+                }
+                // memory—v1 §4.11/§4.12: A revoked set withdraws the whole
+                // binding; bad active data is pending and cannot be concealed by
+                // another valid confirmation.
+                match binding.confirmation_state {
+                    BindingConfirmationState::Active => {}
+                    BindingConfirmationState::Withdrawn => continue,
+                    BindingConfirmationState::Invalid => {
+                        pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                        continue;
+                    }
+                }
+                // memory—v1 §4.11/§4.5 (N-16 版本新鲜度不变式): the CURRENT version
+                // is servable only with a non-revoked change confirmation for
+                // exactly that version; 首版与每次发布同事务确认（一次确认覆盖全部
+                // 既有绑定，逐卡不重确认）.
+                match binding.change_confirmation_state {
+                    ChangeConfirmationState::Active => {}
+                    ChangeConfirmationState::Withdrawn | ChangeConfirmationState::Missing => {
+                        pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                        continue;
+                    }
+                    ChangeConfirmationState::Invalid => {
+                        pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                        continue;
+                    }
+                }
+                // memory—v1: Without authority and scope evidence the active
+                // confirmation might not contribute any rule. A confirmed denial
+                // from another binding may still win, but this binding cannot prove
+                // an ALLOW, a rule DENY, or a complete no-match result.
+                if !reader.confirmation_authority_available_for_evaluation() {
+                    pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                    continue;
+                }
+                let content = match parse_version(version) {
+                    Ok(content) => content,
+                    Err(_) => {
+                        // memory—v1 §4.5/A-1: hash or grammar failure is bad data,
+                        // never a silent skip.
+                        pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                        continue;
+                    }
+                };
+                // memory—v1 §4.9: A valid matching rule cannot conceal another
+                // reference to an inactive or unregistered resource in this version.
+                // The same registry generation must cover the request and all rules.
+                match reader.registry_check_rules_with_version(&content) {
+                    Ok(version) if version == registry_version => {}
+                    Err(RegistryError::NotInstalled) => {
+                        pending = pending.or(Some(MemoryV1PendingSource::RootUnavailable));
+                        continue;
+                    }
+                    _ => {
+                        pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                        continue;
+                    }
+                }
+                dependencies.push(EvaluationDependency {
+                    binding_id: binding.binding.binding_id,
+                    rule_set_id: binding.binding.rule_set_id,
+                    version_bytes: version.version_bytes.clone(),
+                });
+                // Any later transition can change the aggregate, including a DENY
+                // whose binding or entry window has not opened yet.
+                if let Some(from) = binding.binding.valid_from.filter(|from| *from > start_time) {
+                    future_boundaries.push(from);
+                }
+                if !window_active(
+                    binding.binding.valid_from,
+                    binding.binding.valid_until,
+                    start_time,
+                ) {
+                    continue;
+                }
+                for hit in content.rule_hits(request.resource, request.action) {
+                    if let Some(from) = hit.validity.and_then(|validity| validity.from) {
+                        if from > start_time {
+                            future_boundaries.push(from);
+                        }
+                    }
+                    // memory—v1 §4.4: the entry-level window.
+                    let entry_open = hit
+                        .validity
+                        .map(|validity| validity.active_at(start_time))
+                        .unwrap_or(true);
+                    if !entry_open {
+                        continue;
+                    }
+                    // memory—v1 §4.10: scope predicates apply to object-bearing
+                    // requests only; type-level requests skip them. A present but
+                    // mismatched attribution is a deterministic scope denial; a
+                    // missing attribution is unverifiable and stays pending.
+                    let scope_ok = if request.target.is_none() {
+                        true
+                    } else {
+                        let owner_effective =
+                            strictest_owner_scope(hit.owner_scope, binding.binding.owner_scope);
+                        let tenant_effective =
+                            strictest_tenant_scope(hit.tenant_scope, binding.binding.tenant_scope);
+                        let owner_ok = match owner_effective {
+                            MemoryV1OwnerScope::AllUsers => match request.target_owner {
+                                Some(_) => true,
+                                None if ownerless_governance_target => true,
+                                None => {
+                                    pending =
+                                        pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                                    false
+                                }
+                            },
+                            MemoryV1OwnerScope::SelfUser => match request.target_owner {
+                                Some(owner) if owner == user => true,
+                                Some(_) => {
+                                    scope_denied = true;
+                                    false
+                                }
+                                None if ownerless_governance_target => {
+                                    scope_denied = true;
+                                    false
+                                }
+                                None => {
+                                    pending =
+                                        pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                                    false
+                                }
+                            },
+                        };
+                        let tenant_ok = match tenant_effective {
+                            MemoryV1TenantScope::SelfTenant => match request.target_tenant {
+                                Some(object_tenant) if object_tenant == tenant => true,
+                                Some(_) => {
+                                    scope_denied = true;
+                                    false
+                                }
+                                None => {
+                                    pending =
+                                        pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                                    false
+                                }
+                            },
+                            MemoryV1TenantScope::SelfAndDescendants => {
+                                match request.target_tenant {
+                                    Some(object_tenant)
+                                        if object_tenant == tenant
+                                            || descendants.iter().any(|descendant| {
+                                                descendant.as_slice() == object_tenant
+                                            }) =>
+                                    {
+                                        true
+                                    }
+                                    Some(_) => {
+                                        scope_denied = true;
+                                        false
+                                    }
+                                    None => {
+                                        pending =
+                                            pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                                        false
+                                    }
+                                }
+                            }
+                        };
+                        owner_ok && tenant_ok
+                    };
+                    if !scope_ok {
+                        continue;
+                    }
+                    match hit.effect {
+                        MemoryV1RuleEffect::Deny => deny = true,
+                        MemoryV1RuleEffect::Allow => {
+                            allow = true;
+                            winning_allows.push(WinningAllow {
+                                entry_validity: hit.validity.copied(),
+                                binding_from: binding.binding.valid_from,
+                                binding_until: binding.binding.valid_until,
+                                owner_scope: strictest_owner_scope(
+                                    hit.owner_scope,
+                                    binding.binding.owner_scope,
+                                ),
+                                tenant_scope: strictest_tenant_scope(
+                                    hit.tenant_scope,
+                                    binding.binding.tenant_scope,
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            // memory—v1 §4.8/§4.10: out-of-scope rules do not contribute.
+            // A matching DENY wins, followed by pending causes and matching ALLOWs.
+            // ScopeDenied describes a complete evaluation with no applicable allow.
+            if deny {
+                CardOutcome::Deny(MemoryV1DenySource::RuleDenied)
+            } else if let Some(pending) = pending {
+                CardOutcome::Pending(pending)
+            } else if allow {
+                let mut owner_scope = MemoryV1OwnerScope::AllUsers;
+                let mut tenant_scope = MemoryV1TenantScope::SelfAndDescendants;
+                for winning in &winning_allows {
+                    owner_scope = strictest_owner_scope(owner_scope, winning.owner_scope);
+                    tenant_scope = strictest_tenant_scope(tenant_scope, winning.tenant_scope);
+                }
+                CardOutcome::Allow {
+                    dependencies,
+                    winning_allows,
+                    future_boundaries,
+                    owner_scope,
+                    tenant_scope,
+                    tree_version,
+                    registry_version,
+                }
+            } else if scope_denied {
+                CardOutcome::Deny(MemoryV1DenySource::ScopeDenied)
+            } else {
+                CardOutcome::Deny(MemoryV1DenySource::NoMatch)
+            }
+        },
+    );
+    outcome.unwrap_or(CardOutcome::Pending(MemoryV1PendingSource::RootUnavailable))
+}
+
+// memory—v1: Evaluate one immutable snapshot and recheck it before allowing.
+fn evaluate_reader_single(
+    facts: &VerifiedSessionFacts,
+    reader: &RequestRootReader,
+    final_check: Option<SessionFinalCheck<'_>>,
+    request: &MemoryV1Request<'_>,
+    clock: &mut impl FnMut() -> Option<i64>,
+    after_read: impl FnOnce(),
+    final_time: impl FnOnce(
+        &SessionFinalCheck<'_>,
+        &DependencyRecord,
+        &FinalCheckTimeConstraints<'_>,
+        &mut dyn FnMut() -> Option<i64>,
+    ) -> Option<i64>,
 ) -> MemoryV1Evaluation {
     let metadata = reader.metadata();
     let Some(start_time) = clock() else {
@@ -318,294 +1948,21 @@ fn evaluate_reader(
             Some(MemoryV1PendingSource::ContextInvalid),
         );
     }
-    // memory—v1 §4.9 A-3.4: registry membership is a structural precondition;
-    // not installed, unregistered, inactive and unknown-action all refuse.
-    if reader
-        .registry_check(request.resource, request.action)
-        .is_err()
-    {
-        return non_allow(
-            MemoryV1Decision::Deny,
-            Some(MemoryV1DenySource::UnregisteredResource),
-            None,
-        );
-    }
     let identity = facts.candidate_identity();
-    let outcome = reader.read_card(identity.user_card_id.into_bytes(), |context| {
-        let user = identity.user_id.into_bytes();
-        let card = identity.user_card_id.into_bytes();
-        let tenant = identity.tenant_id.into_bytes();
-        // memory—v1 §4.8: a proven relationship mismatch is a deterministic denial.
-        if context.user.user_id != user
-            || context.identity.identity_card_id != identity.identity_card_id.into_bytes()
-            || context.identity.user_id != user
-            || context.card.user_card_id != card
-            || context.card.user_id != user
-            || context.card.tenant_id != tenant
-            || context.tenant.tenant_id != tenant
-        {
-            return CardOutcome::Deny(MemoryV1DenySource::IdentityMismatch);
-        }
-        // memory—v1 §4.8: an unbound card is a deterministic denial.
-        if context.bindings.is_empty() {
-            return CardOutcome::Deny(MemoryV1DenySource::CardUnbound);
-        }
-        // memory—v1 §4.12 B-2.3: a DISABLED card is deterministically denied.
-        if context.card.status != UserCardStatus::Active {
-            return CardOutcome::Deny(MemoryV1DenySource::CardDisabled);
-        }
-        // memory—v1 §4.11 B-1.3 N-7: SoD self-sign ban is a structural rule —
-        // confirm-class actions can never target the operator's own authority,
-        // regardless of scope width.
-        if request.action.starts_with("confirm") {
-            if let Some(owner) = request.target_owner {
-                if owner == user {
-                    return CardOutcome::Deny(MemoryV1DenySource::SelfConfirmation);
-                }
-            }
-        }
-        // memory—v1 §4.10: descendant resolution happens in the root tenant tree.
-        let descendants = match reader.tenant_descendants(tenant) {
-            Ok(list) => list,
-            Err(_) => return CardOutcome::Pending(MemoryV1PendingSource::RootUnavailable),
-        };
-        let (tree_version, registry_version) = match reader.dependency_versions() {
-            Ok(versions) => versions,
-            Err(_) => return CardOutcome::Pending(MemoryV1PendingSource::RootUnavailable),
-        };
-        let mut dependencies: Vec<EvaluationDependency> = Vec::new();
-        let mut winning_allows: Vec<WinningAllow> = Vec::new();
-        let mut allow = false;
-        let mut deny = false;
-        let mut scope_denied = false;
-        let mut pending: Option<MemoryV1PendingSource> = None;
-        for binding in &context.bindings {
-            // memory—v1 §4.12 B-2.2: REMOVED bindings contribute nothing.
-            if binding.binding.removed_at.is_some() {
-                continue;
-            }
-            // memory—v1 §4.6: reads depending on a fenced object are refused
-            // immediately; §4.8 keeps a determinate DENY from a valid binding
-            // ahead of any pending cause.
-            match reader.is_fenced(binding.rule_set.rule_set_id) {
-                Ok(true) => pending = pending.or(Some(MemoryV1PendingSource::FenceActive)),
-                Ok(false) => {}
-                Err(_) => pending = pending.or(Some(MemoryV1PendingSource::RootUnavailable)),
-            }
-            let Some(version) = binding.selected else {
-                pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
-                continue;
-            };
-            if binding.binding.user_card_id != card
-                || binding.rule_set.rule_set_id != binding.binding.rule_set_id
-                || version.rule_set_id != binding.binding.rule_set_id
-            {
-                pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
-                continue;
-            }
-            // memory—v1 §4.12 B-2.4: a REVOKED confirmation is a deliberate
-            // management withdrawal — the binding contributes nothing (skip
-            // → deterministic NoMatch), unlike bad data. §4.11 A-1: no
-            // matching confirmation at all is bad data → PENDING.
-            let matching: Vec<_> = binding
-                .confirmations
-                .iter()
-                .filter(|confirmation| {
-                    confirmation_matches(
-                        confirmation,
-                        binding.binding.binding_id,
-                        binding.binding.rule_set_id,
-                        &version.version_bytes,
-                    )
-                })
-                .collect();
-            if !matching
-                .iter()
-                .any(|confirmation| confirmation.revoked_at.is_none())
-            {
-                if !matching.is_empty() {
-                    continue;
-                }
-                pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
-                continue;
-            }
-            let content = match parse_version(version) {
-                Ok(content) => content,
-                Err(_) => {
-                    // memory—v1 §4.5/A-1: hash or grammar failure is bad data,
-                    // never a silent skip.
-                    pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
-                    continue;
-                }
-            };
-            dependencies.push(EvaluationDependency {
-                binding_id: binding.binding.binding_id,
-                rule_set_id: binding.binding.rule_set_id,
-                version_bytes: version.version_bytes.clone(),
-            });
-            // memory—v1 §4.4: a binding outside its window contributes nothing
-            // (skip, not fail — unlike a broken binding above).
-            if !window_active(
-                binding.binding.valid_from,
-                binding.binding.valid_until,
-                start_time,
-            ) {
-                continue;
-            }
-            for hit in content.rule_hits(request.resource, request.action) {
-                // memory—v1 §4.4: the entry-level window.
-                let entry_open = hit
-                    .validity
-                    .map(|validity| validity.active_at(start_time))
-                    .unwrap_or(true);
-                if !entry_open {
-                    continue;
-                }
-                // memory—v1 §4.10: scope predicates apply to object-bearing
-                // requests only; type-level requests skip them. A present but
-                // mismatched attribution is a deterministic scope denial; a
-                // missing attribution is unverifiable and stays pending.
-                let scope_ok = if request.target.is_none() {
-                    true
-                } else {
-                    let owner_effective =
-                        strictest_owner_scope(hit.owner_scope, binding.binding.owner_scope);
-                    let tenant_effective =
-                        strictest_tenant_scope(hit.tenant_scope, binding.binding.tenant_scope);
-                    let owner_ok = match owner_effective {
-                        MemoryV1OwnerScope::AllUsers => true,
-                        MemoryV1OwnerScope::SelfUser => match request.target_owner {
-                            Some(owner) if owner == user => true,
-                            Some(_) => {
-                                scope_denied = true;
-                                false
-                            }
-                            None => {
-                                pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
-                                false
-                            }
-                        },
-                    };
-                    let tenant_ok = match tenant_effective {
-                        MemoryV1TenantScope::SelfTenant => match request.target_tenant {
-                            Some(object_tenant) if object_tenant == tenant => true,
-                            Some(_) => {
-                                scope_denied = true;
-                                false
-                            }
-                            None => {
-                                pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
-                                false
-                            }
-                        },
-                        MemoryV1TenantScope::SelfAndDescendants => match request.target_tenant {
-                            Some(object_tenant)
-                                if object_tenant == tenant
-                                    || descendants.iter().any(|descendant| {
-                                        descendant.as_slice() == object_tenant
-                                    }) =>
-                            {
-                                true
-                            }
-                            Some(_) => {
-                                scope_denied = true;
-                                false
-                            }
-                            None => {
-                                pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
-                                false
-                            }
-                        },
-                    };
-                    owner_ok && tenant_ok
-                };
-                if scope_denied {
-                    return CardOutcome::Deny(MemoryV1DenySource::ScopeDenied);
-                }
-                if !scope_ok {
-                    continue;
-                }
-                match hit.effect {
-                    MemoryV1RuleEffect::Deny => deny = true,
-                    MemoryV1RuleEffect::Allow => {
-                        allow = true;
-                        winning_allows.push(WinningAllow {
-                            entry_validity: hit.validity.copied(),
-                            binding_from: binding.binding.valid_from,
-                            binding_until: binding.binding.valid_until,
-                            owner_scope: strictest_owner_scope(
-                                hit.owner_scope,
-                                binding.binding.owner_scope,
-                            ),
-                            tenant_scope: strictest_tenant_scope(
-                                hit.tenant_scope,
-                                binding.binding.tenant_scope,
-                            ),
-                        });
-                    }
-                }
-            }
-        }
-        // memory—v1 §4.8/§4.10: the decision order — determinate DENY (rule or
-        // scope), then pending causes, then ALLOW, then no-match refusal.
-        if deny {
-            CardOutcome::Deny(MemoryV1DenySource::RuleDenied)
-        } else if scope_denied {
-            CardOutcome::Deny(MemoryV1DenySource::ScopeDenied)
-        } else if let Some(pending) = pending {
-            CardOutcome::Pending(pending)
-        } else if allow {
-            let mut owner_scope = MemoryV1OwnerScope::AllUsers;
-            let mut tenant_scope = MemoryV1TenantScope::SelfAndDescendants;
-            for winning in &winning_allows {
-                owner_scope = strictest_owner_scope(owner_scope, winning.owner_scope);
-                tenant_scope = strictest_tenant_scope(tenant_scope, winning.tenant_scope);
-            }
-            CardOutcome::Allow {
-                dependencies,
-                winning_allows,
-                owner_scope,
-                tenant_scope,
-                tree_version,
-                registry_version,
-            }
-        } else {
-            CardOutcome::Deny(MemoryV1DenySource::NoMatch)
-        }
-    });
-    let outcome = match outcome {
-        Err(_) => CardOutcome::Pending(MemoryV1PendingSource::RootUnavailable),
-        Ok(outcome) => outcome,
-    };
+    let outcome = evaluate_card_candidate(facts, reader, request, start_time, false);
     match outcome {
-        CardOutcome::Deny(source) => non_allow(MemoryV1Decision::Deny, Some(source), None),
+        CardOutcome::Deny(source) => observed_deny(facts, reader, start_time, request, source),
         CardOutcome::Pending(source) => non_allow(MemoryV1Decision::Pending, None, Some(source)),
         CardOutcome::Allow {
             dependencies,
             winning_allows,
+            future_boundaries,
             owner_scope,
             tenant_scope,
             tree_version,
             registry_version,
         } => {
             after_read();
-            let Some(final_time) = clock() else {
-                return non_allow(
-                    MemoryV1Decision::Pending,
-                    None,
-                    Some(MemoryV1PendingSource::ContextInvalid),
-                );
-            };
-            if final_time < start_time || !facts.valid_at(final_time) {
-                return non_allow(
-                    MemoryV1Decision::Pending,
-                    None,
-                    Some(MemoryV1PendingSource::ContextInvalid),
-                );
-            }
-            // memory—v1 §4.7: the dependency-scoped recheck replaces the global
-            // metadata comparison — unrelated modifications no longer invalidate
-            // this request, while any touched-object change does.
             let record = DependencyRecord {
                 card_id: identity.user_card_id.into_bytes(),
                 instance_id: metadata.instance_id,
@@ -613,43 +1970,48 @@ fn evaluate_reader(
                 tenant_tree_version: tree_version,
                 registry_version,
             };
-            if !reader.recheck_dependencies(&record).unwrap_or(false) {
+            // memory—v1: The root crate samples the final clock only while the
+            // live session, root, registry and complete fence table are stable.
+            let windows: Vec<_> = winning_allows
+                .iter()
+                .map(|winning| FinalCheckWindow {
+                    entry_validity: winning.entry_validity,
+                    binding_from: winning.binding_from,
+                    binding_until: winning.binding_until,
+                })
+                .collect();
+            let constraints = FinalCheckTimeConstraints {
+                start_time,
+                future_boundaries: &future_boundaries,
+                winning_windows: &windows,
+            };
+            let final_time = final_check
+                .as_ref()
+                .and_then(|check| final_time(check, &record, &constraints, clock));
+            let Some(final_time) = final_time else {
                 return non_allow(
                     MemoryV1Decision::Pending,
                     None,
                     Some(MemoryV1PendingSource::ContextInvalid),
                 );
-            }
-            // memory—v1 §4.4: every winning ALLOW window must still be active
-            // at the final trusted-time observation; a boundary crossing is
-            // PENDING, never a silent pass.
-            for winning in &winning_allows {
-                if !window_active(
-                    winning.entry_validity.and_then(|validity| validity.from),
-                    winning.entry_validity.and_then(|validity| validity.until),
-                    final_time,
-                ) || !window_active(winning.binding_from, winning.binding_until, final_time)
-                {
-                    return non_allow(
-                        MemoryV1Decision::Pending,
-                        None,
-                        Some(MemoryV1PendingSource::ContextInvalid),
-                    );
-                }
-            }
+            };
             MemoryV1Evaluation {
                 decision: MemoryV1Decision::Allow,
                 deny_source: None,
                 pending_source: None,
+                deny_observation: None,
                 admission: Some(MemoryV1Admission {
                     root: metadata,
                     identity,
                     resource: request.resource.to_owned(),
                     action: request.action.to_owned(),
                     target: request.target.map(<[u8]>::to_vec),
+                    target_tenant: request.target_tenant.map(<[u8]>::to_vec),
+                    target_owner: request.target_owner.map(<[u8]>::to_vec),
                     operation_id: request.operation_id.to_vec(),
                     operation_fingerprint: request.operation_fingerprint.to_vec(),
                     trusted_time_unix_seconds: final_time,
+                    change_intent: None,
                     effective_owner_scope: owner_scope,
                     effective_tenant_scope: tenant_scope,
                 }),
@@ -663,18 +2025,89 @@ mod tests {
     use super::*;
     use astral_authorization_root::memory_v1_db_rows::{
         BindingConfirmationRow, BindingLayer, BindingRow, CandidateRows, CurrentSelection,
-        IdentityCardRow, RuleSetRow, RuleSetVersionRow, TenantRow, UserCardRow, UserCardStatus,
-        UserRow,
+        IdentityCardRow, RuleSetChangeConfirmationRow, RuleSetRow, RuleSetVersionRow, TenantRow,
+        UserCardRow, UserCardStatus, UserRow,
     };
-    use astral_authorization_root::memory_v1_hamt::CandidateBudget;
-    use astral_authorization_root::memory_v1_registry::RegistryDeclaration;
+    use astral_authorization_root::memory_v1_hamt::{CandidateBudget, CandidateError};
+    use astral_authorization_root::memory_v1_registry::{RegistryDeclaration, RegistryError};
     use astral_authorization_root::memory_v1_request::RequestRootScope;
     use astral_authorization_root::memory_v1_root::{
-        install_process_root, ManagementMutation, RootStatus,
+        install_process_root, ManagementMutationV2, MutationPrecondition, RootError, RootStatus,
     };
-    use astral_authorization_root::memory_v1_rules::canonical_version_bytes;
+    use astral_authorization_root::memory_v1_rules::{canonical_version_bytes, MemoryV1RuleError};
     use astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthority;
     use astral_types::memory_v1::MemoryId;
+
+    // memory—v1: Every engine DENY has the corresponding frozen audit source;
+    // converting a source does not manufacture the remaining audit evidence.
+    #[test]
+    fn deny_sources_map_to_frozen_audit_vocabulary() {
+        for (source, expected, name) in [
+            (
+                MemoryV1DenySource::RuleDenied,
+                MemoryV1AuditDenySource::RuleDeny,
+                "rule_deny",
+            ),
+            (
+                MemoryV1DenySource::NoMatch,
+                MemoryV1AuditDenySource::NoMatch,
+                "no_match",
+            ),
+            (
+                MemoryV1DenySource::ScopeDenied,
+                MemoryV1AuditDenySource::ScopeDenied,
+                "scope_denied",
+            ),
+            (
+                MemoryV1DenySource::CardUnbound,
+                MemoryV1AuditDenySource::CardUnbound,
+                "card_unbound",
+            ),
+            (
+                MemoryV1DenySource::IdentityMismatch,
+                MemoryV1AuditDenySource::IdentityMismatch,
+                "identity_mismatch",
+            ),
+            (
+                MemoryV1DenySource::UnregisteredResource,
+                MemoryV1AuditDenySource::UnregisteredResource,
+                "unregistered_resource",
+            ),
+            (
+                MemoryV1DenySource::SelfConfirmation,
+                MemoryV1AuditDenySource::SelfConfirmation,
+                "self_confirmation",
+            ),
+            (
+                MemoryV1DenySource::CardDisabled,
+                MemoryV1AuditDenySource::CardDisabled,
+                "card_disabled",
+            ),
+        ] {
+            assert_eq!(source.audit_source(), expected);
+            assert_eq!(source.audit_source().as_str(), name);
+        }
+        // OVERLAY-only is a separate T2 audit marker, not inferred from a generic DENY.
+        assert_eq!(
+            MemoryV1AuditDenySource::OverlayOnlyCreation.as_str(),
+            "overlay_only_creation"
+        );
+    }
+
+    // memory—v1: A pending source stays distinguishable in logs even when
+    // multiple sources share one external retry response.
+    #[test]
+    fn pending_sources_map_to_frozen_log_vocabulary() {
+        assert_eq!(
+            MemoryV1PendingSource::ContextInvalid.as_str(),
+            "context_invalid"
+        );
+        assert_eq!(MemoryV1PendingSource::FenceActive.as_str(), "fence_active");
+        assert_eq!(
+            MemoryV1PendingSource::RootUnavailable.as_str(),
+            "root_unavailable"
+        );
+    }
 
     // memory—v1: Build an identity with exact UUID bytes.
     fn identity(card: u8) -> CandidateIdentity {
@@ -748,6 +2181,7 @@ mod tests {
             let timestamp = vec![2];
             let input = canonical_version_bytes(&version, content, &timestamp);
             rows.rule_sets.push(RuleSetRow {
+                status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
                 rule_set_id: [set; 16],
                 owner_tenant_id: [3; 16],
                 current_version_bytes: version.clone(),
@@ -786,6 +2220,21 @@ mod tests {
                 revoked_at: None,
                 revoked_by: None,
             });
+            // memory—v1 §4.11/§4.5 (N-16): the fixture is a conforming writer —
+            // 首版创建同事务携带变更确认（版本新鲜度不变式）.
+            rows.rule_set_change_confirmations.push(
+                RuleSetChangeConfirmationRow {
+                    confirmation_id: [set + 200; 16],
+                    rule_set_id: [set; 16],
+                    version_bytes: version.clone(),
+                    confirmer_user_id: [1; 16],
+                    affected_scope_bytes: vec![1],
+                    operation_id: vec![1],
+                    confirmed_at_bytes: vec![1],
+                    revoked_at: None,
+                    revoked_by: None,
+                },
+            );
             selections.push(CurrentSelection {
                 rule_set_id: [set; 16],
                 version_bytes: version,
@@ -828,10 +2277,11 @@ mod tests {
         )
         .unwrap();
         let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
         let session_for = |root: &RequestRootExtension, identity: CandidateIdentity| {
             let issued = authority
                 .identity_session_adapter()
-                .issue_verified_session(identity, 100, 100)
+                .issue_unchecked_for_test(identity, 100, 100)
                 .unwrap();
             authority
                 .verifier()
@@ -873,6 +2323,7 @@ mod tests {
         let no_match = evaluate_with(&root, &session, &unmatched, || Some(110), || {});
         assert_eq!(no_match.decision, MemoryV1Decision::Pending);
         assert!(no_match.admission.is_none());
+        assert!(no_match.deny_observation.is_none());
 
         let other_scope = RequestRootScope::new(owner.handle(), Default::default());
         let other_root = other_scope.extension();
@@ -891,11 +2342,13 @@ mod tests {
             MemoryV1Decision::Pending
         );
 
-        // memory—v1: Adoption publishes a new phase. The earlier request reader
-        // keeps its Candidate phase for its whole lifetime and stays pending.
-        let adopted = owner.adopt_serving_for_isolated_tests().unwrap();
-        // memory—v1 §4.9: the composition installs the aggregated registry
-        // before any formal evaluation; uninstalled means deterministic denial.
+        // memory—v1: The candidate and its uninstalled registry cannot authorize.
+        assert_eq!(
+            root.with_reader(|reader| reader.registry_check("document", "read"))
+                .unwrap(),
+            Err(RegistryError::NotInstalled)
+        );
+        // memory—v1 §4.9: install the aggregated registry before adoption.
         owner
             .install_registry(&[
                 RegistryDeclaration {
@@ -913,6 +2366,8 @@ mod tests {
                 },
             ])
             .unwrap();
+        // The earlier reader remains bound to Candidate after adoption.
+        let adopted = owner.adopt_serving_for_isolated_tests().unwrap();
         assert_eq!(adopted.status, RootStatus::Serving);
         assert_eq!(
             evaluate_with(&root, &session, &request, || Some(110), || {}).decision,
@@ -937,7 +2392,37 @@ mod tests {
         // A complete serving phase without a matching confirmed allow is a deny.
         let denied = evaluate_with(&serving_root, &card4, &unmatched, || Some(110), || {});
         assert_eq!(denied.decision, MemoryV1Decision::Deny);
+        assert_eq!(
+            denied.deny_source,
+            Some(MemoryV1DenySource::UnregisteredResource)
+        );
+        assert!(denied.pending_source.is_none());
         assert!(denied.admission.is_none());
+        let observation = denied
+            .deny_observation
+            .as_deref()
+            .expect("read-phase denial");
+        assert_eq!(observation.root(), adopted);
+        assert_eq!(observation.identity(), identity(4));
+        assert_eq!(observation.read_started_at_unix_seconds(), 110);
+        assert_eq!(
+            (observation.resource(), observation.action()),
+            ("document", "READ")
+        );
+        assert_eq!(observation.target(), Some(b"target".as_slice()));
+        assert_eq!(observation.target_tenant(), Some(tenant_bytes.as_slice()));
+        assert_eq!(observation.target_owner(), Some(user_bytes.as_slice()));
+        assert_eq!(observation.operation_id(), b"operation");
+        assert_eq!(observation.operation_fingerprint(), b"fingerprint");
+        assert_eq!(
+            observation.source(),
+            MemoryV1DenySource::UnregisteredResource
+        );
+        assert_eq!(observation.batch_sequence(), None);
+        assert_eq!(
+            format!("{observation:?}"),
+            "MemoryV1DenyObservation(<redacted>)"
+        );
         // OVERLAY DENY blocks the BASE allow for card 7 only; an OVERLAY allow
         // alone (card 8) adds the permission.
         let card7 = session_for(&serving_root, identity(7));
@@ -1049,23 +2534,24 @@ mod tests {
         )
         .unwrap();
         let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
         let session_for = |root: &RequestRootExtension, card: u8| {
             let issued = authority
                 .identity_session_adapter()
-                .issue_verified_session(identity(card), 100, 100)
+                .issue_unchecked_for_test(identity(card), 100, 100)
                 .unwrap();
             authority
                 .verifier()
                 .verify_and_bind(issued.credential(), 100, root)
                 .unwrap()
         };
-        let adopted = owner.adopt_serving_for_isolated_tests().unwrap();
         owner
             .install_registry(&[RegistryDeclaration {
                 resource: "document".to_owned(),
                 actions: vec!["read".to_owned()],
             }])
             .unwrap();
+        let adopted = owner.adopt_serving_for_isolated_tests().unwrap();
         let scope = RequestRootScope::new(owner.handle(), Default::default());
         let root = scope.extension();
         let user_bytes = [1_u8; 16];
@@ -1093,10 +2579,8 @@ mod tests {
         assert_eq!(mirrored.decision, MemoryV1Decision::Deny);
         assert_eq!(mirrored.deny_source, Some(MemoryV1DenySource::RuleDenied));
 
-        // memory—v1 §4.10: a matched rule whose scope excludes the object is
-        // a deterministic scope denial — card 4 carries both the wide rule and
-        // a strict-default rule, so the tenant-30 object is scope-denied while
-        // the tenant-3 object allows with the strictest effective scope.
+        // memory—v1 §4.10: the strict binding excludes the child tenant, so
+        // neither of card 4's rules contributes for that target.
         let own_tenant = evaluate(4, Some(&tenant_bytes), Some(&user_bytes));
         assert_eq!(own_tenant.decision, MemoryV1Decision::Allow);
         assert_eq!(
@@ -1189,7 +2673,7 @@ mod tests {
         );
 
         // memory—v1 §4.6: the modification window refuses reads immediately and
-        // releases them when the fence closes; a determinate DENY still wins.
+        // releases them when the fence closes.
         let declaration = astral_authorization_root::memory_v1_fence::FenceDeclaration {
             rule_set_version: vec![1],
             root_version: adopted.version,
@@ -1284,6 +2768,7 @@ mod tests {
                 wrong
             };
             rows.rule_sets.push(RuleSetRow {
+                status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
                 rule_set_id: [set; 16],
                 owner_tenant_id: [3; 16],
                 current_version_bytes: version.clone(),
@@ -1483,6 +2968,28 @@ mod tests {
                 revoked_at: None,
                 revoked_by: None,
             });
+            // memory—v1 §4.11/§4.5 N-16: every selected version in a serving
+            // fixture has its required active change confirmation. Broken
+            // binding confirmations remain the service-period bad-data cases;
+            // malformed versions remain rejected by parse/hash validation.
+            if !rows
+                .rule_set_change_confirmations
+                .iter()
+                .any(|confirmation| confirmation.rule_set_id == [set; 16])
+            {
+                rows.rule_set_change_confirmations
+                    .push(RuleSetChangeConfirmationRow {
+                        confirmation_id: [set.wrapping_add(0x80); 16],
+                        rule_set_id: [set; 16],
+                        version_bytes: vec![1],
+                        confirmer_user_id: [1; 16],
+                        affected_scope_bytes: vec![1],
+                        operation_id: vec![1],
+                        confirmed_at_bytes: vec![1],
+                        revoked_at: None,
+                        revoked_by: None,
+                    });
+            }
         }
         (rows, selections)
     }
@@ -1535,6 +3042,7 @@ mod tests {
         let timestamp = vec![2];
         let input = canonical_version_bytes(&version, content, &timestamp);
         rows.rule_sets.push(RuleSetRow {
+            status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
             rule_set_id: [10; 16],
             owner_tenant_id: [3; 16],
             current_version_bytes: version.clone(),
@@ -1571,7 +3079,18 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(owner.adopt_serving_for_isolated_tests().is_err());
+        owner
+            .install_registry(&[RegistryDeclaration {
+                resource: "document".to_owned(),
+                actions: vec!["read".to_owned()],
+            }])
+            .unwrap();
+        assert_eq!(
+            owner.adopt_serving_for_isolated_tests(),
+            Err(RootError::Candidate(CandidateError::RuleIntegrity(
+                MemoryV1RuleError::HashMismatch,
+            )))
+        );
     }
 
     // memory—v1 §4.11/§4.12 (batch B): SoD self-sign ban, card DISABLED,
@@ -1600,8 +3119,7 @@ mod tests {
             return;
         }
 
-        // Fixture: 3 cards, 1 tenant, 1 ruleset with ALLOW document read.
-        // Card 7 has a DISABLED status (B-2.3).
+        // Cards 7 and 9 are disabled; card 9 has no bindings.
         let mut rows = CandidateRows {
             users: vec![UserRow { user_id: [1; 16] }],
             identity_cards: vec![IdentityCardRow {
@@ -1612,13 +3130,13 @@ mod tests {
                 tenant_id: [3; 16],
                 parent_tenant_id: None,
             }],
-            user_cards: [4, 7, 8]
+            user_cards: [4, 7, 8, 9]
                 .into_iter()
                 .map(|id| UserCardRow {
                     user_card_id: [id; 16],
                     user_id: [1; 16],
                     tenant_id: [3; 16],
-                    status: if id == 7 {
+                    status: if id == 7 || id == 9 {
                         UserCardStatus::Disabled
                     } else {
                         UserCardStatus::Active
@@ -1634,6 +3152,7 @@ mod tests {
             let timestamp = vec![2];
             let input = canonical_version_bytes(&version, content, &timestamp);
             rows.rule_sets.push(RuleSetRow {
+                status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
                 rule_set_id: [set; 16],
                 owner_tenant_id: [3; 16],
                 current_version_bytes: version.clone(),
@@ -1670,6 +3189,19 @@ mod tests {
                 revoked_at: None,
                 revoked_by: None,
             });
+            // memory—v1 §4.11/§4.5 (N-16): 首版同事务变更确认（版本新鲜度不变式）.
+            rows.rule_set_change_confirmations
+                .push(RuleSetChangeConfirmationRow {
+                    confirmation_id: [set.wrapping_add(200); 16],
+                    rule_set_id: [set; 16],
+                    version_bytes: version.clone(),
+                    confirmer_user_id: [1; 16],
+                    affected_scope_bytes: vec![1],
+                    operation_id: vec![1],
+                    confirmed_at_bytes: vec![1],
+                    revoked_at: None,
+                    revoked_by: None,
+                });
             selections.push(CurrentSelection {
                 rule_set_id: [set; 16],
                 version_bytes: version,
@@ -1700,23 +3232,29 @@ mod tests {
         )
         .unwrap();
         let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
         let session_for = |root: &RequestRootExtension, card: u8| {
             let issued = authority
                 .identity_session_adapter()
-                .issue_verified_session(identity(card), 100, 100)
+                .issue_unchecked_for_test(identity(card), 100, 100)
                 .unwrap();
             authority
                 .verifier()
                 .verify_and_bind(issued.credential(), 100, root)
                 .unwrap()
         };
-        owner.adopt_serving_for_isolated_tests().unwrap();
         owner
             .install_registry(&[RegistryDeclaration {
                 resource: "document".to_owned(),
-                actions: vec!["read".to_owned(), "create".to_owned(), "confirm".to_owned()],
+                actions: vec![
+                    "read".to_owned(),
+                    "create".to_owned(),
+                    "confirm".to_owned(),
+                    "create-overlay-only".to_owned(),
+                ],
             }])
             .unwrap();
+        owner.adopt_serving_for_isolated_tests().unwrap();
         let scope = RequestRootScope::new(owner.handle(), Default::default());
         let root = scope.extension();
         let user_bytes = [1_u8; 16];
@@ -1735,6 +3273,14 @@ mod tests {
         // memory—v1 §4.12 B-2.3: DISABLED card → all bindings skipped → NoMatch.
         let disabled_card = session_for(&root, 7);
         let result = evaluate_with(&root, &disabled_card, &read_request, || Some(110), || {});
+        assert_eq!(result.decision, MemoryV1Decision::Deny);
+        assert_eq!(result.deny_source, Some(MemoryV1DenySource::CardDisabled));
+        let observation = result.deny_observation.as_deref().unwrap();
+        assert_eq!(observation.identity(), identity(7));
+        assert_eq!(observation.source(), MemoryV1DenySource::CardDisabled);
+        assert_eq!(observation.read_started_at_unix_seconds(), 110);
+        let unbound_disabled = session_for(&root, 9);
+        let result = evaluate_with(&root, &unbound_disabled, &read_request, || Some(110), || {});
         assert_eq!(result.decision, MemoryV1Decision::Deny);
         assert_eq!(result.deny_source, Some(MemoryV1DenySource::CardDisabled));
 
@@ -1758,6 +3304,21 @@ mod tests {
         assert_eq!(sod_denied.decision, MemoryV1Decision::Deny);
         assert_eq!(
             sod_denied.deny_source,
+            Some(MemoryV1DenySource::SelfConfirmation)
+        );
+        let observation = sod_denied.deny_observation.as_deref().unwrap();
+        assert_eq!(observation.source(), MemoryV1DenySource::SelfConfirmation);
+        assert_eq!(observation.target_owner(), Some(user_bytes.as_slice()));
+        assert_eq!(observation.operation_id(), b"sod-op");
+        let overlay_request = MemoryV1Request {
+            action: "create-overlay-only",
+            ..confirm_request
+        };
+        let overlay_denied =
+            evaluate_with(&root, &active_card, &overlay_request, || Some(110), || {});
+        assert_eq!(overlay_denied.decision, MemoryV1Decision::Deny);
+        assert_eq!(
+            overlay_denied.deny_source,
             Some(MemoryV1DenySource::SelfConfirmation)
         );
 
@@ -1797,11 +3358,8 @@ mod tests {
         // bound to 2 different cards. Binding states:
         //   card 4 → set 10: normal (baseline ALLOW)
         //   card 7 → set 11: REMOVED (removed_at set) → NoMatch
-        // Revocation is a mid-session management action (B-2.4) and is
-        // exercised below through the real RootOwner mutation path — a
-        // binding whose only confirmation is already revoked at fixture
-        // time cannot be adopted as serving (fail-closed; asserted in
-        // batch_b_revoked_confirmation_fails_adoption).
+        // Revocation is exercised below through the real RootOwner mutation
+        // path; a valid revoked confirmation is also accepted on cold adoption.
         let mut rows = CandidateRows {
             users: vec![UserRow { user_id: [1; 16] }],
             identity_cards: vec![IdentityCardRow {
@@ -1832,6 +3390,7 @@ mod tests {
             let timestamp = vec![vn];
             let input = canonical_version_bytes(&version, content, &timestamp);
             rows.rule_sets.push(RuleSetRow {
+                status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
                 rule_set_id: [set; 16],
                 owner_tenant_id: [3; 16],
                 current_version_bytes: version.clone(),
@@ -1868,6 +3427,19 @@ mod tests {
                 revoked_at: None,
                 revoked_by: None,
             });
+            // memory—v1 §4.11/§4.5 (N-16): 首版同事务变更确认（版本新鲜度不变式）.
+            rows.rule_set_change_confirmations
+                .push(RuleSetChangeConfirmationRow {
+                    confirmation_id: [set.wrapping_add(200); 16],
+                    rule_set_id: [set; 16],
+                    version_bytes: version.clone(),
+                    confirmer_user_id: [1; 16],
+                    affected_scope_bytes: vec![1],
+                    operation_id: vec![1],
+                    confirmed_at_bytes: vec![1],
+                    revoked_at: None,
+                    revoked_by: None,
+                });
             selections.push(CurrentSelection {
                 rule_set_id: [set; 16],
                 version_bytes: version.clone(),
@@ -1884,23 +3456,24 @@ mod tests {
         )
         .unwrap();
         let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
         let session_for = |root: &RequestRootExtension, card: u8| {
             let issued = authority
                 .identity_session_adapter()
-                .issue_verified_session(identity(card), 100, 100)
+                .issue_unchecked_for_test(identity(card), 100, 100)
                 .unwrap();
             authority
                 .verifier()
                 .verify_and_bind(issued.credential(), 100, root)
                 .unwrap()
         };
-        owner.adopt_serving_for_isolated_tests().unwrap();
         owner
             .install_registry(&[RegistryDeclaration {
                 resource: "document".to_owned(),
                 actions: vec!["read".to_owned()],
             }])
             .unwrap();
+        owner.adopt_serving_for_isolated_tests().unwrap();
         let scope = RequestRootScope::new(owner.handle(), Default::default());
         let root = scope.extension();
         let request = MemoryV1Request {
@@ -1927,14 +3500,19 @@ mod tests {
 
         // memory—v1 §4.12 B-2.4: REVOKED confirmation is a deliberate
         // management withdrawal → the binding contributes nothing →
-        // deterministic NoMatch. Exercised through the real RootOwner
-        // mutation path (batch-B §4.12 executor), not fixture data.
+        // deterministic NoMatch. Simulate the mutation through the explicit
+        // isolated-test hook; this is not an authorized governance commit.
         owner
-            .execute_mutation(&ManagementMutation::ConfirmationRevoke {
-                confirmation_id: [40; 16],
-                revoked_at: 120,
-                revoked_by: [1; 16],
-            })
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ConfirmationRevoke {
+                    confirmation_id: [40; 16],
+                    revoked_at: 120,
+                    revoked_by: [1; 16],
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: owner.handle().metadata().unwrap().version,
+                },
+            )
             .unwrap();
         // A new request reader binds the post-mutation snapshot (§4.7).
         let scope_after = RequestRootScope::new(owner.handle(), Default::default());
@@ -1944,9 +3522,1494 @@ mod tests {
         assert_eq!(result.decision, MemoryV1Decision::Deny);
         assert_eq!(result.deny_source, Some(MemoryV1DenySource::NoMatch));
 
-        // The pre-mutation reader still sees its own immutable snapshot —
-        // one request sees one consistent view (§4.7 dependency isolation).
+        // The old immutable reader cannot authorize after its confirmation was
+        // revoked, even though it still sees the original relationship.
         let result = evaluate_with(&root, &card4, &request, || Some(110), || {});
-        assert_eq!(result.decision, MemoryV1Decision::Allow);
+        assert_eq!(result.decision, MemoryV1Decision::Pending);
+    }
+
+    // memory—v1 §4.11/§4.12: A cold-adopted revoked OVERLAY DENY leaves
+    // BASE active, and a new confirmation restores the OVERLAY contribution.
+    #[test]
+    fn withdrawn_overlay_survives_adoption_and_reconfirmation() {
+        const CHILD: &str = "ASTRAL_MEMORY_V1_WITHDRAWN_OVERLAY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "memory_v1_formal::tests::withdrawn_overlay_survives_adoption_and_reconfirmation",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let (mut rows, selections) = fixture();
+        let confirmation = rows
+            .binding_confirmations
+            .iter_mut()
+            .find(|row| row.confirmation_id == [42; 16])
+            .unwrap();
+        confirmation.revoked_at = Some(100);
+        confirmation.revoked_by = Some([1; 16]);
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 64,
+                max_bindings_per_read: 8,
+            },
+        )
+        .unwrap();
+        owner
+            .install_registry(&[RegistryDeclaration {
+                resource: "document".to_owned(),
+                actions: vec!["read".to_owned()],
+            }])
+            .unwrap();
+        owner.adopt_serving_for_isolated_tests().unwrap();
+        let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
+        let request = MemoryV1Request {
+            resource: "document",
+            action: "read",
+            target: None,
+            target_tenant: None,
+            target_owner: None,
+            operation_id: b"op",
+            operation_fingerprint: b"fp",
+        };
+        let evaluate = || {
+            let scope = RequestRootScope::new(owner.handle(), Default::default());
+            let root = scope.extension();
+            let issued = authority
+                .identity_session_adapter()
+                .issue_unchecked_for_test(identity(7), 100, 100)
+                .unwrap();
+            let session = authority
+                .verifier()
+                .verify_and_bind(issued.credential(), 100, &root)
+                .unwrap();
+            evaluate_with(&root, &session, &request, || Some(110), || {})
+        };
+        assert_eq!(evaluate().decision, MemoryV1Decision::Allow);
+        owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ConfirmationCreate {
+                    row: BindingConfirmationRow {
+                        confirmation_id: [90; 16],
+                        binding_id: [22; 16],
+                        rule_set_id: [12; 16],
+                        version_bytes: vec![1],
+                        confirmer_user_id: [1; 16],
+                        scope_bytes: vec![1],
+                        operation_id: vec![1],
+                        confirmed_at_bytes: vec![1],
+                        revoked_at: None,
+                        revoked_by: None,
+                    },
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: owner.handle().metadata().unwrap().version,
+                },
+            )
+            .unwrap();
+        let restored = evaluate();
+        assert_eq!(restored.decision, MemoryV1Decision::Deny);
+        assert_eq!(restored.deny_source, Some(MemoryV1DenySource::RuleDenied));
+        owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ConfirmationRevoke {
+                    confirmation_id: [90; 16],
+                    revoked_at: 120,
+                    revoked_by: [1; 16],
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: owner.handle().metadata().unwrap().version,
+                },
+            )
+            .unwrap();
+        assert_eq!(evaluate().decision, MemoryV1Decision::Allow);
+    }
+
+    // memory—v1 §4.4: an ALLOW cannot cross a later DENY activation boundary.
+    #[test]
+    fn future_deny_activation_invalidates_inflight_allow() {
+        const CHILD: &str = "ASTRAL_MEMORY_V1_FUTURE_DENY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "memory_v1_formal::tests::future_deny_activation_invalidates_inflight_allow",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let (mut rows, selections) = fixture();
+        let deny = rows
+            .rule_set_versions
+            .iter_mut()
+            .find(|version| version.rule_set_id == [12; 16])
+            .unwrap();
+        deny.content_bytes = br#"{"rules":[{"ruleId":"D","resource":"document","action":"read","effect":"DENY","validity":{"from":120}}]}"#.to_vec();
+        deny.hash_input_bytes = canonical_version_bytes(
+            &deny.version_bytes,
+            &deny.content_bytes,
+            &deny.timestamp_bytes,
+        );
+        deny.hash_bytes =
+            astral_authorization_root::memory_v1_rules::version_digest(&deny.hash_input_bytes);
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 128,
+                max_bindings_per_read: 8,
+            },
+        )
+        .unwrap();
+        owner
+            .install_registry(&[RegistryDeclaration {
+                resource: "document".to_owned(),
+                actions: vec!["read".to_owned()],
+            }])
+            .unwrap();
+        owner.adopt_serving_for_isolated_tests().unwrap();
+        let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
+        let scope = RequestRootScope::new(owner.handle(), Default::default());
+        let root = scope.extension();
+        let issued = authority
+            .identity_session_adapter()
+            .issue_unchecked_for_test(identity(7), 100, 100)
+            .unwrap();
+        let session = authority
+            .verifier()
+            .verify_and_bind(issued.credential(), 100, &root)
+            .unwrap();
+        let request = MemoryV1Request {
+            resource: "document",
+            action: "read",
+            target: None,
+            target_tenant: None,
+            target_owner: None,
+            operation_id: b"op",
+            operation_fingerprint: b"fp",
+        };
+        let mut before_boundary = [110, 119].into_iter();
+        assert_eq!(
+            evaluate_with(&root, &session, &request, || before_boundary.next(), || {}).decision,
+            MemoryV1Decision::Allow
+        );
+        let mut crossing_boundary = [110, 120].into_iter();
+        let crossing = evaluate_with(
+            &root,
+            &session,
+            &request,
+            || crossing_boundary.next(),
+            || {},
+        );
+        assert_eq!(crossing.decision, MemoryV1Decision::Pending);
+        assert!(crossing.admission.is_none());
+        assert_eq!(
+            evaluate_with(&root, &session, &request, || Some(120), || {}).decision,
+            MemoryV1Decision::Deny
+        );
+    }
+
+    // memory—v1: Exact-root confirmation samples the clock with the live
+    // session, root and registry guarded; fences use a subsequent snapshot.
+    #[test]
+    fn rule_set_change_exact_root_time_and_races() {
+        const CHILD: &str = "ASTRAL_MEMORY_V1_CHANGE_EXACT_ROOT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "memory_v1_formal::tests::rule_set_change_exact_root_time_and_races",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let (mut rows, selections) = fixture();
+        let version = rows
+            .rule_set_versions
+            .iter_mut()
+            .find(|row| row.rule_set_id == [10; 16])
+            .unwrap();
+        version.content_bytes = br#"{"rules":[{"ruleId":"confirm","resource":"rule_set","action":"confirm-change","effect":"ALLOW","ownerScope":"all","validity":{"until":120}}]}"#.to_vec();
+        version.hash_input_bytes = canonical_version_bytes(
+            &version.version_bytes,
+            &version.content_bytes,
+            &version.timestamp_bytes,
+        );
+        version.hash_bytes =
+            astral_authorization_root::memory_v1_rules::version_digest(&version.hash_input_bytes);
+        rows.bindings
+            .iter_mut()
+            .find(|row| row.binding_id == [20; 16])
+            .unwrap()
+            .owner_scope = MemoryV1OwnerScope::AllUsers;
+        let removed = rows
+            .bindings
+            .iter_mut()
+            .find(|row| row.binding_id == [21; 16])
+            .unwrap();
+        removed.removed_at = Some(100);
+        removed.removed_by = Some([1; 16]);
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 128,
+                max_bindings_per_read: 8,
+            },
+        )
+        .unwrap();
+        owner
+            .install_registry(&[
+                RegistryDeclaration {
+                    resource: "rule_set".to_owned(),
+                    actions: vec!["confirm-change".to_owned()],
+                },
+                RegistryDeclaration {
+                    resource: "document".to_owned(),
+                    actions: vec!["read".to_owned()],
+                },
+            ])
+            .unwrap();
+        owner.adopt_serving_for_isolated_tests().unwrap();
+        let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
+        let adapter = authority.identity_session_adapter();
+        let target = [11; 16];
+        let tenant = [3; 16];
+        let request = MemoryV1Request {
+            resource: "rule_set",
+            action: "confirm-change",
+            target: Some(&target),
+            target_tenant: Some(&tenant),
+            target_owner: None,
+            operation_id: b"op",
+            operation_fingerprint: b"fp",
+        };
+        let scope = RequestRootScope::new(owner.handle(), Default::default());
+        let root = scope.extension();
+        let issued = adapter
+            .issue_unchecked_for_test(identity(4), 100, 100)
+            .unwrap();
+        let session = authority
+            .verifier()
+            .verify_and_bind(issued.credential(), 100, &root)
+            .unwrap();
+        let execute = |start, end, hook: &mut dyn FnMut()| {
+            let mut times = [Some(start), end].into_iter();
+            evaluate_rule_set_change_with(
+                &root,
+                &session,
+                &request,
+                MemoryV1RuleSetChangeIntent::Publish,
+                || times.next().flatten(),
+                hook,
+                |check, record, constraints, metadata, target, clock| {
+                    check.try_final_time_exact_root_for_test(
+                        record,
+                        constraints,
+                        metadata,
+                        target,
+                        clock,
+                    )
+                },
+            )
+        };
+        let pass = execute(110, Some(111), &mut || {});
+        assert_eq!(pass.decision, MemoryV1Decision::Allow);
+        assert_eq!(pass.admission.unwrap().trusted_time_unix_seconds(), 111);
+        for (start, end) in [
+            (110, Some(120)),
+            (110, Some(109)),
+            (110, None),
+            (110, Some(200)),
+        ] {
+            let result = execute(start, end, &mut || {});
+            assert_eq!(result.decision, MemoryV1Decision::Pending);
+            assert!(result.admission.is_none());
+        }
+        let protected = root
+            .with_reader(|reader| {
+                evaluate_rule_set_change_with(
+                    &root,
+                    &session,
+                    &request,
+                    MemoryV1RuleSetChangeIntent::Publish,
+                    || Some(110),
+                    || {},
+                    |check, record, constraints, metadata, target, _| {
+                        check.try_final_time_exact_root_for_test(
+                            record,
+                            constraints,
+                            metadata,
+                            target,
+                            || {
+                                assert!(!authority.write_available_for_test());
+                                assert_eq!(
+                                    reader.final_check_locks_available_for_test().unwrap(),
+                                    [false, false, true]
+                                );
+                                Some(111)
+                            },
+                        )
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(protected.decision, MemoryV1Decision::Allow);
+        // memory—v1: Every batch target shares the same final root, session,
+        // registry and fence observation, including targets unrelated to the actor.
+        let batch_check = root
+            .with_reader(|reader| {
+                evaluate_rule_set_change_with(
+                    &root,
+                    &session,
+                    &request,
+                    MemoryV1RuleSetChangeIntent::Publish,
+                    || Some(110),
+                    || {},
+                    |check, record, constraints, metadata, target, _| {
+                        assert_eq!(
+                            check.try_final_time_exact_batch_for_test(
+                                record,
+                                constraints,
+                                metadata,
+                                &[],
+                                || Some(111),
+                            ),
+                            None
+                        );
+                        assert_eq!(
+                            check.try_final_time_exact_batch_for_test(
+                                record,
+                                constraints,
+                                metadata,
+                                &[target, [0; 16]],
+                                || Some(111),
+                            ),
+                            None
+                        );
+                        check.try_final_time_exact_batch_for_test(
+                            record,
+                            constraints,
+                            metadata,
+                            &[target, [10; 16]],
+                            || {
+                                assert!(!authority.write_available_for_test());
+                                assert_eq!(
+                                    reader.final_check_locks_available_for_test().unwrap(),
+                                    [false, false, true]
+                                );
+                                Some(111)
+                            },
+                        )
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(batch_check.decision, MemoryV1Decision::Allow);
+        let metadata = owner.handle().metadata().unwrap();
+        let declaration = astral_authorization_root::memory_v1_fence::FenceDeclaration {
+            rule_set_version: vec![1],
+            root_version: metadata.version,
+            digest: metadata.digest,
+        };
+        owner
+            .begin_modification_fence(target, &declaration)
+            .unwrap();
+        let ordinary_fenced = evaluate_with(&root, &session, &request, || Some(110), || {});
+        assert_eq!(ordinary_fenced.decision, MemoryV1Decision::Pending);
+        assert_eq!(
+            ordinary_fenced.pending_source,
+            Some(MemoryV1PendingSource::FenceActive)
+        );
+        assert!(ordinary_fenced.admission.is_none());
+        let mut after_read_called = false;
+        let already_fenced = execute(110, Some(111), &mut || {
+            after_read_called = true;
+            owner.abort_modification_fence(target).unwrap();
+        });
+        assert_eq!(already_fenced.decision, MemoryV1Decision::Pending);
+        assert_eq!(
+            already_fenced.pending_source,
+            Some(MemoryV1PendingSource::FenceActive)
+        );
+        assert!(already_fenced.admission.is_none());
+        assert!(!after_read_called);
+        owner.abort_modification_fence(target).unwrap();
+        owner
+            .begin_modification_fence([10; 16], &declaration)
+            .unwrap();
+        let batch_target_fenced = evaluate_rule_set_change_with(
+            &root,
+            &session,
+            &request,
+            MemoryV1RuleSetChangeIntent::Publish,
+            || Some(110),
+            || {},
+            |check, record, constraints, metadata, target, _| {
+                check.try_final_time_exact_batch_for_test(
+                    record,
+                    constraints,
+                    metadata,
+                    &[target, [10; 16]],
+                    || Some(111),
+                )
+            },
+        );
+        assert_eq!(batch_target_fenced.decision, MemoryV1Decision::Pending);
+        assert!(batch_target_fenced.admission.is_none());
+        owner.abort_modification_fence([10; 16]).unwrap();
+        let mut target_fence = false;
+        let fenced = execute(110, Some(111), &mut || {
+            let meta = owner.handle().metadata().unwrap();
+            owner
+                .begin_modification_fence(
+                    target,
+                    &astral_authorization_root::memory_v1_fence::FenceDeclaration {
+                        rule_set_version: vec![1],
+                        root_version: meta.version,
+                        digest: meta.digest,
+                    },
+                )
+                .unwrap();
+            target_fence = true;
+        });
+        assert_eq!(fenced.decision, MemoryV1Decision::Pending);
+        assert!(target_fence);
+        owner.abort_modification_fence(target).unwrap();
+        let revoked = execute(110, Some(111), &mut || {
+            adapter.revoke(issued.credential()).unwrap();
+        });
+        assert_eq!(revoked.decision, MemoryV1Decision::Pending);
+        let issued2 = adapter
+            .issue_unchecked_for_test(identity(4), 100, 100)
+            .unwrap();
+        let session2 = authority
+            .verifier()
+            .verify_and_bind(issued2.credential(), 100, &root)
+            .unwrap();
+        let stale = evaluate_rule_set_change_with(
+            &root,
+            &session2,
+            &request,
+            MemoryV1RuleSetChangeIntent::Publish,
+            || Some(110),
+            || {
+                let before = owner.handle().metadata().unwrap();
+                authority
+                    .disable_card_with_sessions_for_isolated_tests(
+                        &owner.mutation_executor(),
+                        astral_types::memory_v1::MemoryId::from_bytes([8; 16]),
+                        before,
+                    )
+                    .unwrap();
+            },
+            |check, record, constraints, metadata, target, clock| {
+                check.try_final_time_exact_root_for_test(
+                    record,
+                    constraints,
+                    metadata,
+                    target,
+                    clock,
+                )
+            },
+        );
+        assert_eq!(stale.decision, MemoryV1Decision::Pending);
+        assert!(stale.admission.is_none());
+        let fresh_scope = RequestRootScope::new(owner.handle(), Default::default());
+        let fresh_root = fresh_scope.extension();
+        let fresh_session = authority
+            .verifier()
+            .verify_and_bind(issued2.credential(), 100, &fresh_root)
+            .unwrap();
+        let registry_changed = evaluate_rule_set_change_with(
+            &fresh_root,
+            &fresh_session,
+            &request,
+            MemoryV1RuleSetChangeIntent::Publish,
+            || Some(110),
+            || {
+                owner
+                    .request_registry_retirement_for_test("document")
+                    .unwrap();
+            },
+            |check, record, constraints, metadata, target, clock| {
+                check.try_final_time_exact_root_for_test(
+                    record,
+                    constraints,
+                    metadata,
+                    target,
+                    clock,
+                )
+            },
+        );
+        assert_eq!(registry_changed.decision, MemoryV1Decision::Pending);
+        assert!(registry_changed.admission.is_none());
+    }
+
+    // memory—v1: Final observations cover time boundaries and every lock domain.
+    #[test]
+    fn final_check_time_and_contention_fail_closed() {
+        const CHILD: &str = "ASTRAL_MEMORY_V1_FINAL_CHECK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "memory_v1_formal::tests::final_check_time_and_contention_fail_closed",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        let (mut rows, selections) = fixture();
+        let version = rows
+            .rule_set_versions
+            .iter_mut()
+            .find(|version| version.rule_set_id == [10; 16])
+            .unwrap();
+        version.content_bytes = br#"{"rules":[{"ruleId":"R1","resource":"document","action":"read","effect":"ALLOW","validity":{"until":120}}]}"#.to_vec();
+        version.hash_input_bytes = canonical_version_bytes(
+            &version.version_bytes,
+            &version.content_bytes,
+            &version.timestamp_bytes,
+        );
+        version.hash_bytes =
+            astral_authorization_root::memory_v1_rules::version_digest(&version.hash_input_bytes);
+        rows.bindings
+            .iter_mut()
+            .find(|binding| binding.binding_id == [23; 16])
+            .unwrap()
+            .valid_until = Some(130);
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 128,
+                max_bindings_per_read: 8,
+            },
+        )
+        .unwrap();
+        owner
+            .install_registry(&[RegistryDeclaration {
+                resource: "document".to_owned(),
+                actions: vec!["read".to_owned()],
+            }])
+            .unwrap();
+        owner.adopt_serving_for_isolated_tests().unwrap();
+        let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
+        let adapter = authority.identity_session_adapter();
+        let scope = RequestRootScope::new(owner.handle(), Default::default());
+        let root = scope.extension();
+        let issued = adapter
+            .issue_unchecked_for_test(identity(4), 100, 15)
+            .unwrap();
+        let session = authority
+            .verifier()
+            .verify_and_bind(issued.credential(), 100, &root)
+            .unwrap();
+        let request = MemoryV1Request {
+            resource: "document",
+            action: "read",
+            target: None,
+            target_tenant: None,
+            target_owner: None,
+            operation_id: b"op",
+            operation_fingerprint: b"fp",
+        };
+        let assert_pending = |result: MemoryV1Evaluation| {
+            assert_eq!(result.decision, MemoryV1Decision::Pending);
+            assert!(result.admission.is_none());
+        };
+        // memory—v1: Probe the guards and fence writer at final clock sampling.
+        let protected = root
+            .with_reader(|reader| {
+                evaluate_with_final(
+                    &root,
+                    &session,
+                    &request,
+                    || Some(110),
+                    || {},
+                    |check, record, constraints, _| {
+                        check.try_final_time_for_test(record, constraints, || {
+                            assert!(!authority.write_available_for_test());
+                            assert_eq!(
+                                reader.final_check_locks_available_for_test().unwrap(),
+                                [false, false, true]
+                            );
+                            Some(114)
+                        })
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(protected.decision, MemoryV1Decision::Allow);
+        let mut before = [110, 114].into_iter();
+        let allowed = evaluate_with(&root, &session, &request, || before.next(), || {});
+        assert_eq!(allowed.decision, MemoryV1Decision::Allow);
+        assert_eq!(allowed.admission.unwrap().trusted_time_unix_seconds(), 114);
+        let mut expired = [110, 115].into_iter();
+        assert_pending(evaluate_with(
+            &root,
+            &session,
+            &request,
+            || expired.next(),
+            || {},
+        ));
+        let mut rollback = [110, 109].into_iter();
+        assert_pending(evaluate_with(
+            &root,
+            &session,
+            &request,
+            || rollback.next(),
+            || {},
+        ));
+        let mut unavailable = [Some(110), None].into_iter();
+        assert_pending(evaluate_with(
+            &root,
+            &session,
+            &request,
+            || unavailable.next().flatten(),
+            || {},
+        ));
+
+        let long_issued = adapter
+            .issue_unchecked_for_test(identity(4), 100, 100)
+            .unwrap();
+        let long_session = authority
+            .verifier()
+            .verify_and_bind(long_issued.credential(), 100, &root)
+            .unwrap();
+        let mut rule_expired = [110, 120].into_iter();
+        assert_pending(evaluate_with(
+            &root,
+            &long_session,
+            &request,
+            || rule_expired.next(),
+            || {},
+        ));
+        let card8_issued = adapter
+            .issue_unchecked_for_test(identity(8), 100, 100)
+            .unwrap();
+        let card8 = authority
+            .verifier()
+            .verify_and_bind(card8_issued.credential(), 100, &root)
+            .unwrap();
+        let mut binding_expired = [110, 130].into_iter();
+        assert_pending(evaluate_with(
+            &root,
+            &card8,
+            &request,
+            || binding_expired.next(),
+            || {},
+        ));
+
+        let metadata = owner.handle().metadata().unwrap();
+        let declaration = astral_authorization_root::memory_v1_fence::FenceDeclaration {
+            rule_set_version: vec![1],
+            root_version: metadata.version,
+            digest: metadata.digest,
+        };
+        // memory—v1: An aborted window with no publication leaves the original
+        // dependencies valid, while an observed live window fails closed.
+        let aborted = evaluate_with(
+            &root,
+            &long_session,
+            &request,
+            || Some(110),
+            || {
+                owner
+                    .begin_modification_fence([10; 16], &declaration)
+                    .unwrap();
+                owner.abort_modification_fence([10; 16]).unwrap();
+            },
+        );
+        assert_eq!(aborted.decision, MemoryV1Decision::Allow);
+
+        // memory—v1: Even if the window closes before the final snapshot, a
+        // sample taken inside it must not produce an admission at the edge of
+        // the winning rule's validity interval.
+        let transient_at_final_time = evaluate_with_final(
+            &root,
+            &long_session,
+            &request,
+            || Some(110),
+            || {},
+            |check, record, constraints, _| {
+                check.try_final_time_for_test(record, constraints, || {
+                    owner
+                        .begin_modification_fence([10; 16], &declaration)
+                        .unwrap();
+                    let sampled = Some(119);
+                    owner.abort_modification_fence([10; 16]).unwrap();
+                    sampled
+                })
+            },
+        );
+        assert_pending(transient_at_final_time);
+        let unrelated_at_final_time = evaluate_with_final(
+            &root,
+            &long_session,
+            &request,
+            || Some(110),
+            || {},
+            |check, record, constraints, _| {
+                check.try_final_time_for_test(record, constraints, || {
+                    owner
+                        .begin_modification_fence([13; 16], &declaration)
+                        .unwrap();
+                    let sampled = Some(119);
+                    owner.abort_modification_fence([13; 16]).unwrap();
+                    sampled
+                })
+            },
+        );
+        assert_eq!(unrelated_at_final_time.decision, MemoryV1Decision::Allow);
+        assert_eq!(
+            unrelated_at_final_time
+                .admission
+                .unwrap()
+                .trusted_time_unix_seconds(),
+            119
+        );
+        owner
+            .begin_modification_fence([10; 16], &declaration)
+            .unwrap();
+        assert_pending(evaluate_with(
+            &root,
+            &long_session,
+            &request,
+            || Some(110),
+            || {},
+        ));
+        owner.abort_modification_fence([10; 16]).unwrap();
+        owner
+            .begin_modification_fence([13; 16], &declaration)
+            .unwrap();
+        let unrelated = evaluate_with(&root, &long_session, &request, || Some(110), || {});
+        assert_eq!(unrelated.decision, MemoryV1Decision::Allow);
+        owner.abort_modification_fence([13; 16]).unwrap();
+
+        for lock in ["session", "root", "registry"] {
+            let result = evaluate_with(&root, &long_session, &request, || Some(110), || {});
+            assert_eq!(result.decision, MemoryV1Decision::Allow);
+            let result = evaluate_with_final(
+                &root,
+                &long_session,
+                &request,
+                || Some(110),
+                || {},
+                |check, record, constraints, clock| {
+                    let final_check = || check.try_final_time_for_test(record, constraints, clock);
+                    std::thread::scope(|threads| {
+                        let (held_tx, held_rx) = std::sync::mpsc::channel();
+                        let (release_tx, release_rx) = std::sync::mpsc::channel();
+                        let authority_ref = &authority;
+                        let root_ref = &root;
+                        let holder = threads.spawn(move || {
+                            let hold = || {
+                                held_tx.send(()).unwrap();
+                                release_rx
+                                    .recv_timeout(std::time::Duration::from_secs(5))
+                                    .unwrap();
+                            };
+                            if lock == "session" {
+                                authority_ref.with_write_lock_for_test(hold);
+                            } else {
+                                root_ref
+                                    .with_reader(|reader| {
+                                        reader.with_final_check_lock_for_test(lock, hold).unwrap()
+                                    })
+                                    .unwrap();
+                            }
+                        });
+                        held_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                        let result = final_check();
+                        release_tx.send(()).unwrap();
+                        holder.join().unwrap();
+                        result
+                    })
+                },
+            );
+            assert_pending(result);
+        }
+        // memory—v1: Two final readers may overlap, but revocation cannot
+        // linearize until both guarded clock observations have finished.
+        let raced_issued = adapter
+            .issue_unchecked_for_test(identity(4), 100, 100)
+            .unwrap();
+        let raced_session = authority
+            .verifier()
+            .verify_and_bind(raced_issued.credential(), 100, &root)
+            .unwrap();
+        std::thread::scope(|threads| {
+            use std::sync::mpsc;
+            use std::time::Duration;
+
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (attempt_tx, attempt_rx) = mpsc::channel();
+            let (revoked_tx, revoked_rx) = mpsc::channel();
+            let mut releases = Vec::new();
+            let mut readers = Vec::new();
+            for _ in 0..2 {
+                let entered = entered_tx.clone();
+                let (release_tx, release_rx) = mpsc::channel();
+                releases.push(release_tx);
+                let root_ref = &root;
+                let session_ref = &raced_session;
+                let request_ref = &request;
+                readers.push(threads.spawn(move || {
+                    evaluate_with_final(
+                        root_ref,
+                        session_ref,
+                        request_ref,
+                        || Some(110),
+                        || {},
+                        |check, record, constraints, _| {
+                            check.try_final_time_for_test(record, constraints, || {
+                                entered.send(()).unwrap();
+                                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                                Some(110)
+                            })
+                        },
+                    )
+                }));
+            }
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let adapter_ref = &adapter;
+            let credential = raced_issued.credential();
+            let writer = threads.spawn(move || {
+                attempt_tx.send(()).unwrap();
+                let result = adapter_ref.revoke(credential);
+                revoked_tx.send(result).unwrap();
+            });
+            attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(
+                revoked_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            for release in releases {
+                release.send(()).unwrap();
+            }
+            for reader in readers {
+                assert_eq!(reader.join().unwrap().decision, MemoryV1Decision::Allow);
+            }
+            revoked_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            writer.join().unwrap();
+        });
+        assert_pending(evaluate_with(
+            &root,
+            &raced_session,
+            &request,
+            || Some(110),
+            || {},
+        ));
+        assert_pending(evaluate_with(
+            &root,
+            &long_session,
+            &request,
+            || Some(110),
+            || adapter.revoke(long_issued.credential()).unwrap(),
+        ));
+    }
+
+    // memory—v1 §4.7: publishing a rule set only invalidates readers that
+    // actually depend on it, even though both publications change the root.
+    #[test]
+    fn rule_set_dependency_recheck_isolates_unrelated_publications() {
+        const CHILD: &str = "ASTRAL_MEMORY_V1_RULE_SET_ISOLATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for scenario in ["unrelated", "affected"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "memory_v1_formal::tests::rule_set_dependency_recheck_isolates_unrelated_publications",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, scenario)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "scenario: {scenario}\nstdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        }
+        let (card, expected) = match std::env::var(CHILD).as_deref() {
+            Ok("unrelated") => (4, MemoryV1Decision::Allow),
+            Ok("affected") => (8, MemoryV1Decision::Pending),
+            other => panic!("unexpected isolation scenario: {other:?}"),
+        };
+
+        let (rows, selections) = fixture();
+        for (card, set) in [(4, 10), (8, 13)] {
+            let bindings: Vec<_> = rows
+                .bindings
+                .iter()
+                .filter(|binding| binding.user_card_id == [card; 16])
+                .collect();
+            assert_eq!(bindings.len(), 1);
+            assert_eq!(bindings[0].rule_set_id, [set; 16]);
+        }
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 128,
+                max_bindings_per_read: 8,
+            },
+        )
+        .unwrap();
+        owner
+            .install_registry(&[RegistryDeclaration {
+                resource: "document".to_owned(),
+                actions: vec!["read".to_owned()],
+            }])
+            .unwrap();
+        owner.adopt_serving_for_isolated_tests().unwrap();
+        let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
+        let request = MemoryV1Request {
+            resource: "document",
+            action: "read",
+            target: None,
+            target_tenant: None,
+            target_owner: None,
+            operation_id: b"op",
+            operation_fingerprint: b"fp",
+        };
+
+        // Both scenarios start from the same fixture in separate processes.
+        // Card 4 depends only on A; card 8 depends only on B.
+        let version = 2;
+        let confirmation_id = 90;
+        let scope = RequestRootScope::new(owner.handle(), Default::default());
+        let root = scope.extension();
+        let issued = authority
+            .identity_session_adapter()
+            .issue_unchecked_for_test(identity(card), 100, 100)
+            .unwrap();
+        let session = authority
+            .verifier()
+            .verify_and_bind(issued.credential(), 100, &root)
+            .unwrap();
+        let baseline = evaluate_with(&root, &session, &request, || Some(110), || {});
+        assert_eq!(baseline.decision, MemoryV1Decision::Allow);
+        assert!(baseline.admission.is_some());
+
+        let content = br#"{"rules":[{"ruleId":"R4","resource":"document","action":"read","effect":"ALLOW"}]}"#;
+        let version_bytes = vec![version];
+        let timestamp_bytes = vec![version];
+        let hash_input_bytes = canonical_version_bytes(&version_bytes, content, &timestamp_bytes);
+        let mutation = ManagementMutationV2::VersionPublish {
+            rule_set_id: [13; 16],
+            version_row: RuleSetVersionRow {
+                rule_set_id: [13; 16],
+                version_bytes: version_bytes.clone(),
+                content_bytes: content.to_vec(),
+                timestamp_bytes,
+                hash_bytes: astral_authorization_root::memory_v1_rules::version_digest(
+                    &hash_input_bytes,
+                ),
+                hash_input_bytes,
+            },
+            new_current_version: version_bytes.clone(),
+            change_confirmation: RuleSetChangeConfirmationRow {
+                confirmation_id: [confirmation_id; 16],
+                rule_set_id: [13; 16],
+                version_bytes,
+                confirmer_user_id: [1; 16],
+                affected_scope_bytes: vec![1],
+                operation_id: vec![1],
+                confirmed_at_bytes: vec![1],
+                revoked_at: None,
+                revoked_by: None,
+            },
+        };
+        let before = owner.handle().metadata().unwrap();
+        let unregistered_request = MemoryV1Request {
+            action: "unknown",
+            ..request
+        };
+        let denied_before =
+            evaluate_with(&root, &session, &unregistered_request, || Some(110), || {});
+        let deny_observation = denied_before.deny_observation.as_deref().unwrap();
+        assert_eq!(deny_observation.root(), before);
+        let mut after_read_called = false;
+        let result = evaluate_with(
+            &root,
+            &session,
+            &request,
+            || Some(110),
+            || {
+                after_read_called = true;
+                owner
+                    .execute_mutation_with_precondition_for_isolated_tests(
+                        &mutation,
+                        &MutationPrecondition {
+                            evaluated_root_version: before.version,
+                        },
+                    )
+                    .unwrap();
+            },
+        );
+        assert!(after_read_called);
+        assert!(owner.handle().metadata().unwrap().version > before.version);
+        assert_eq!(deny_observation.root(), before);
+        assert_ne!(deny_observation.root(), owner.handle().metadata().unwrap());
+        assert_eq!(deny_observation.action(), "unknown");
+        assert_eq!(result.decision, expected);
+        if expected == MemoryV1Decision::Allow {
+            let admission = result
+                .admission
+                .expect("unrelated publish retains admission");
+            assert_eq!(admission.identity(), identity(card));
+        } else {
+            assert_eq!(
+                result.pending_source,
+                Some(MemoryV1PendingSource::ContextInvalid)
+            );
+            assert!(result.admission.is_none());
+        }
+    }
+
+    // memory—v1 §4.7: in-flight decisions recheck card and rule-set
+    // generations, while changes to an unrelated card remain isolated.
+    #[test]
+    fn dependency_recheck_covers_inflight_mutations() {
+        const CHILD: &str = "ASTRAL_MEMORY_V1_DEPENDENCY_RECHECK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "memory_v1_formal::tests::dependency_recheck_covers_inflight_mutations",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let (rows, selections) = fixture();
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 128,
+                max_bindings_per_read: 8,
+            },
+        )
+        .unwrap();
+        owner
+            .install_registry(&[RegistryDeclaration {
+                resource: "document".to_owned(),
+                actions: vec!["read".to_owned()],
+            }])
+            .unwrap();
+        owner.adopt_serving_for_isolated_tests().unwrap();
+        let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
+        let request = MemoryV1Request {
+            resource: "document",
+            action: "read",
+            target: None,
+            target_tenant: None,
+            target_owner: None,
+            operation_id: b"op",
+            operation_fingerprint: b"fp",
+        };
+        let scope = RequestRootScope::new(owner.handle(), Default::default());
+        let root = scope.extension();
+        let adapter = authority.identity_session_adapter();
+        let issued = adapter
+            .issue_unchecked_for_test(identity(4), 100, 100)
+            .unwrap();
+        let compatibility = root
+            .bind_session_facts(
+                authority
+                    .verifier()
+                    .verify(issued.credential(), 100)
+                    .unwrap()
+                    .facts_for_test(),
+            )
+            .unwrap();
+        let unregistered = MemoryV1Request {
+            resource: "unregistered",
+            ..request
+        };
+        let compatibility_result =
+            evaluate_with(&root, &compatibility, &unregistered, || Some(110), || {});
+        assert_eq!(compatibility_result.decision, MemoryV1Decision::Pending);
+        assert_eq!(
+            compatibility_result.pending_source,
+            Some(MemoryV1PendingSource::ContextInvalid)
+        );
+        assert!(compatibility_result.admission.is_none());
+        let target = [11; 16];
+        let tenant = [3; 16];
+        let change_request = MemoryV1Request {
+            resource: "rule_set",
+            action: "confirm-change",
+            target: Some(&target),
+            target_tenant: Some(&tenant),
+            ..request
+        };
+        let compatibility_change = evaluate_rule_set_change_with(
+            &root,
+            &compatibility,
+            &change_request,
+            MemoryV1RuleSetChangeIntent::Publish,
+            || Some(110),
+            || {},
+            |_, _, _, _, _, _| panic!("compatibility facts must not reach final admission"),
+        );
+        assert_eq!(compatibility_change.decision, MemoryV1Decision::Pending);
+        assert!(compatibility_change.admission.is_none());
+        let session = authority
+            .verifier()
+            .verify_and_bind(issued.credential(), 100, &root)
+            .unwrap();
+        let revoked_in_flight = evaluate_with(
+            &root,
+            &session,
+            &request,
+            || Some(110),
+            || {
+                adapter.revoke(issued.credential()).unwrap();
+            },
+        );
+        assert_eq!(revoked_in_flight.decision, MemoryV1Decision::Pending);
+        assert!(revoked_in_flight.admission.is_none());
+
+        let run = |mutation: ManagementMutationV2, expected| {
+            let scope = RequestRootScope::new(owner.handle(), Default::default());
+            let root = scope.extension();
+            let issued = authority
+                .identity_session_adapter()
+                .issue_unchecked_for_test(identity(4), 100, 100)
+                .unwrap();
+            let session = authority
+                .verifier()
+                .verify_and_bind(issued.credential(), 100, &root)
+                .unwrap();
+            let result = evaluate_with(
+                &root,
+                &session,
+                &request,
+                || Some(110),
+                || {
+                    let before = owner.handle().metadata().unwrap();
+                    if let ManagementMutationV2::UserCardStatus {
+                        user_card_id,
+                        status: UserCardStatus::Disabled,
+                    } = &mutation
+                    {
+                        authority
+                            .disable_card_with_sessions_for_isolated_tests(
+                                &owner.mutation_executor(),
+                                astral_types::memory_v1::MemoryId::from_bytes(*user_card_id),
+                                before,
+                            )
+                            .unwrap();
+                    } else {
+                        owner
+                            .execute_mutation_with_precondition_for_isolated_tests(
+                                &mutation,
+                                &MutationPrecondition {
+                                    evaluated_root_version: before.version,
+                                },
+                            )
+                            .unwrap();
+                    }
+                },
+            );
+            assert_eq!(result.decision, expected);
+        };
+
+        run(
+            ManagementMutationV2::UserCardStatus {
+                user_card_id: [8; 16],
+                status: UserCardStatus::Disabled,
+            },
+            MemoryV1Decision::Allow,
+        );
+        run(
+            ManagementMutationV2::ConfirmationRevoke {
+                confirmation_id: [40; 16],
+                revoked_at: 110,
+                revoked_by: [1; 16],
+            },
+            MemoryV1Decision::Pending,
+        );
+        let restore = ManagementMutationV2::ConfirmationCreate {
+            row: BindingConfirmationRow {
+                confirmation_id: [90; 16],
+                binding_id: [20; 16],
+                rule_set_id: [10; 16],
+                version_bytes: vec![1],
+                confirmer_user_id: [1; 16],
+                scope_bytes: vec![1],
+                operation_id: vec![1],
+                confirmed_at_bytes: vec![1],
+                revoked_at: None,
+                revoked_by: None,
+            },
+        };
+        let before = owner.handle().metadata().unwrap();
+        owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &restore,
+                &MutationPrecondition {
+                    evaluated_root_version: before.version,
+                },
+            )
+            .unwrap();
+
+        let content =
+            br#"{"rules":[{"ruleId":"R","resource":"document","action":"read","effect":"ALLOW"}]}"#;
+        let version_bytes = vec![2];
+        let timestamp_bytes = vec![2];
+        let hash_input_bytes = canonical_version_bytes(&version_bytes, content, &timestamp_bytes);
+        run(
+            ManagementMutationV2::VersionPublish {
+                rule_set_id: [10; 16],
+                version_row: RuleSetVersionRow {
+                    rule_set_id: [10; 16],
+                    version_bytes: version_bytes.clone(),
+                    content_bytes: content.to_vec(),
+                    timestamp_bytes,
+                    hash_bytes: astral_authorization_root::memory_v1_rules::version_digest(
+                        &hash_input_bytes,
+                    ),
+                    hash_input_bytes,
+                },
+                new_current_version: version_bytes.clone(),
+                change_confirmation: RuleSetChangeConfirmationRow {
+                    confirmation_id: [91; 16],
+                    rule_set_id: [10; 16],
+                    version_bytes: version_bytes.clone(),
+                    confirmer_user_id: [1; 16],
+                    affected_scope_bytes: vec![1],
+                    operation_id: vec![1],
+                    confirmed_at_bytes: vec![1],
+                    revoked_at: None,
+                    revoked_by: None,
+                },
+            },
+            MemoryV1Decision::Pending,
+        );
+        run(
+            ManagementMutationV2::BindingCreate {
+                row: BindingRow {
+                    binding_id: [91; 16],
+                    user_card_id: [4; 16],
+                    rule_set_id: [12; 16],
+                    binding_layer: BindingLayer::Overlay,
+                    valid_from: None,
+                    valid_until: None,
+                    owner_scope: MemoryV1OwnerScope::default(),
+                    tenant_scope: MemoryV1TenantScope::default(),
+                    removed_at: None,
+                    removed_by: None,
+                },
+                confirmation: BindingConfirmationRow {
+                    confirmation_id: [92; 16],
+                    binding_id: [91; 16],
+                    rule_set_id: [12; 16],
+                    version_bytes: vec![1],
+                    confirmer_user_id: [1; 16],
+                    scope_bytes: vec![1],
+                    operation_id: vec![1],
+                    confirmed_at_bytes: vec![1],
+                    revoked_at: None,
+                    revoked_by: None,
+                },
+            },
+            MemoryV1Decision::Pending,
+        );
+        let remove_overlay = ManagementMutationV2::BindingRemove {
+            binding_id: [91; 16],
+            removed_at: 110,
+            removed_by: [1; 16],
+        };
+        let before = owner.handle().metadata().unwrap();
+        owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &remove_overlay,
+                &MutationPrecondition {
+                    evaluated_root_version: before.version,
+                },
+            )
+            .unwrap();
+        let before = owner.handle().metadata().unwrap();
+        let declaration = astral_authorization_root::memory_v1_fence::FenceDeclaration {
+            rule_set_version: version_bytes,
+            root_version: before.version,
+            digest: before.digest,
+        };
+        let scope = RequestRootScope::new(owner.handle(), Default::default());
+        let root = scope.extension();
+        let issued = authority
+            .identity_session_adapter()
+            .issue_unchecked_for_test(identity(4), 100, 100)
+            .unwrap();
+        let session = authority
+            .verifier()
+            .verify_and_bind(issued.credential(), 100, &root)
+            .unwrap();
+        let fenced_in_flight = evaluate_with(
+            &root,
+            &session,
+            &request,
+            || Some(110),
+            || {
+                owner
+                    .begin_modification_fence([10; 16], &declaration)
+                    .unwrap();
+            },
+        );
+        assert_eq!(fenced_in_flight.decision, MemoryV1Decision::Pending);
+        assert!(fenced_in_flight.admission.is_none());
+        owner.abort_modification_fence([10; 16]).unwrap();
+        let admitted_scope = RequestRootScope::new(owner.handle(), Default::default());
+        let admitted_root = admitted_scope.extension();
+        let admitted_issued = authority
+            .identity_session_adapter()
+            .issue_unchecked_for_test(identity(4), 100, 100)
+            .unwrap();
+        let admitted_session = authority
+            .verifier()
+            .verify_and_bind(admitted_issued.credential(), 100, &admitted_root)
+            .unwrap();
+        let already_admitted = evaluate_with(
+            &admitted_root,
+            &admitted_session,
+            &request,
+            || Some(110),
+            || {},
+        );
+        assert_eq!(already_admitted.decision, MemoryV1Decision::Allow);
+        assert!(already_admitted.admission.is_some());
+
+        let before_revoke = owner.handle().metadata().unwrap();
+        owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ConfirmationRevoke {
+                    confirmation_id: [90; 16],
+                    revoked_at: 110,
+                    revoked_by: [1; 16],
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: before_revoke.version,
+                },
+            )
+            .unwrap();
+        // memory—v1: A decision already admitted is not retroactively canceled;
+        // a later request obtains a fresh root snapshot and sees the revocation.
+        assert_eq!(already_admitted.decision, MemoryV1Decision::Allow);
+        assert!(already_admitted.admission.is_some());
+        let next_scope = RequestRootScope::new(owner.handle(), Default::default());
+        let next_root = next_scope.extension();
+        let next_session = authority
+            .verifier()
+            .verify_and_bind(admitted_issued.credential(), 110, &next_root)
+            .unwrap();
+        let after_revoke = evaluate_with(&next_root, &next_session, &request, || Some(110), || {});
+        assert_eq!(after_revoke.decision, MemoryV1Decision::Deny);
+        assert_eq!(after_revoke.deny_source, Some(MemoryV1DenySource::NoMatch));
+        assert!(after_revoke.admission.is_none());
+        let latest = owner.handle().metadata().unwrap();
+        let replacement = ManagementMutationV2::ConfirmationCreate {
+            row: BindingConfirmationRow {
+                confirmation_id: [93; 16],
+                binding_id: [20; 16],
+                rule_set_id: [10; 16],
+                version_bytes: vec![1],
+                confirmer_user_id: [1; 16],
+                scope_bytes: vec![1],
+                operation_id: vec![1],
+                confirmed_at_bytes: vec![1],
+                revoked_at: None,
+                revoked_by: None,
+            },
+        };
+        owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &replacement,
+                &MutationPrecondition {
+                    evaluated_root_version: latest.version,
+                },
+            )
+            .unwrap();
+        run(
+            ManagementMutationV2::UserCardStatus {
+                user_card_id: [4; 16],
+                status: UserCardStatus::Disabled,
+            },
+            MemoryV1Decision::Pending,
+        );
     }
 }

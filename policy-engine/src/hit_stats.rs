@@ -3,9 +3,10 @@
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Outcome counters for the formal authorization evaluator. memory—v1: the
-/// retired V6/V7 chain no longer reports per-phase timings; every evaluation
-/// is counted as a non-allowing attempt with total wall time only.
+/// Outcome counters for the formal authorization evaluator. memory—v1 records
+/// one result per evaluator invocation, including a compound or batch request.
+/// `deny_count` includes all non-allow results, including pending. The retired
+/// V6/V7 chain no longer reports per-phase timings; memory—v1 records total time.
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HitStats {

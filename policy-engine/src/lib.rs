@@ -21,8 +21,16 @@ mod data_scope;
 pub mod e1_observation;
 mod engine;
 mod hit_stats;
+/// Candidate batch-confirmation evaluation; not a mutation capability.
+pub mod memory_v1_batch;
+/// Offline structural batch plan; not an authorization or commit capability.
+pub mod memory_v1_batch_plan;
 /// Experimental memory-v1 candidate inspection; never an authorization decision.
 pub mod memory_v1_candidate;
+/// Shared memory-v1 compound evaluator; one request root/session and one final check.
+pub mod memory_v1_compound;
+/// Same-call evaluation envelopes; not authorization or durable proof.
+pub mod memory_v1_credentialed;
 /// Typed memory-v1 evaluator, isolated from the legacy formal path.
 pub mod memory_v1_formal;
 /// ORG_SCOPE admission contract and evidence validation.

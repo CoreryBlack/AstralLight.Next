@@ -16,6 +16,10 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use astral_types::memory_v1::MemoryId;
 use astral_types::memory_v1_journal::{
@@ -262,6 +266,147 @@ struct StoredOperation {
     tail_hash: [u8; 32],
 }
 
+/// memory—v1: The durability coordinator for one opened journal file.
+///
+/// The contract revision this type implements: the directory entry is made
+/// durable once, at creation (fsync file + fsync directory); every append
+/// extends an already-durable entry and therefore requires only the file's
+/// data synchronization (`fdatasync`), which always flushes the file size
+/// needed for later retrieval. This is the same model PostgreSQL uses for its
+/// WAL (`wal_sync_method = fdatasync`).
+///
+/// Group commit: fsync durability is monotone over the file prefix — one
+/// `fdatasync` makes every byte written before it durable. Writers register
+/// their end offset and wait on a durable watermark; concurrent writers share
+/// one synchronization, so the per-commit fsync cost amortizes to
+/// `fsync_time / batch_size` under load without weakening the contract: an
+/// acknowledged mutation still implies its bytes and every prior byte are on
+/// disk before the receipt is returned.
+pub struct JournalDurability {
+    file: File,
+    state: Mutex<SyncState>,
+    cv: Condvar,
+    latest_written: AtomicU64,
+    #[cfg(test)]
+    sync_calls: AtomicU64,
+    #[cfg(test)]
+    fail_sync: AtomicBool,
+}
+
+#[derive(Default)]
+struct SyncState {
+    /// Bytes confirmed durable by a completed `fdatasync`.
+    durable_end: u64,
+    /// Set while a leader is running its synchronization.
+    in_flight: bool,
+    /// A synchronization failure poisons the whole journal: no byte past the
+    /// last durable point can be trusted, so every append refuses until an
+    /// explicit reconciliation owner takes over.
+    failed: bool,
+}
+
+impl JournalDurability {
+    /// Bind the coordinator to one open journal file. The handle is a clone
+    /// that never seeks or writes: it only runs `fdatasync` and stats, so it
+    /// cannot disturb the writer's file offset.
+    pub fn new(file: &File) -> Result<Self, DurableJournalError> {
+        // An independent fd (not a clone of the writer's fd) is used here:
+        // the writer's fd holds the cooperative flock, and a try_clone would
+        // share that same open file description — preventing reopen after
+        // the journal is dropped. This fd is flock-free and only does
+        // fdatasync + stat.
+        Ok(Self {
+            file: file.try_clone().map_err(|error| DurableJournalError::Io {
+                operation: IoOperation::OpenTarget,
+                kind: error.kind(),
+            })?,
+            state: Mutex::new(SyncState::default()),
+            cv: Condvar::new(),
+            latest_written: AtomicU64::new(0),
+            #[cfg(test)]
+            sync_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_sync: AtomicBool::new(false),
+        })
+    }
+
+    /// Record that bytes up to `end` have been written (called by the write
+    /// path while holding the writer lock).
+    fn mark_written(&self, end: u64) {
+        self.latest_written.fetch_max(end, Ordering::AcqRel);
+    }
+
+    /// Whether a synchronization failure has poisoned the journal.
+    pub fn is_failed(&self) -> bool {
+        self.state.lock().unwrap().failed
+    }
+
+    /// Wait until every byte up to `end` is confirmed durable. The first
+    /// caller without an in-flight synchronization becomes the leader and
+    /// flushes the whole written prefix; concurrent writers wait and are
+    /// woken by the same flush.
+    pub fn ensure_durable(&self, end: u64) -> Result<(), DurableJournalError> {
+        loop {
+            let mut state = self.state.lock().unwrap();
+            if state.failed {
+                return Err(DurableJournalError::StickyUnknown);
+            }
+            if state.durable_end >= end {
+                return Ok(());
+            }
+            if state.in_flight {
+                state = self
+                    .cv
+                    .wait_while(state, |state| !state.failed && state.durable_end < end)
+                    .unwrap();
+                drop(state);
+                continue;
+            }
+            // Become the leader: flush the whole written prefix.
+            state.in_flight = true;
+            let target = self.latest_written.load(Ordering::Acquire).max(end);
+            drop(state);
+            let result = self.flush_upto(target);
+            let mut state = self.state.lock().unwrap();
+            state.in_flight = false;
+            match result {
+                Ok(()) => state.durable_end = state.durable_end.max(target),
+                Err(_) => state.failed = true,
+            }
+            self.cv.notify_all();
+            drop(state);
+        }
+    }
+
+    // memory—v1: One fdatasync followed by a length floor check. No locks are
+    // held: writers keep appending while the flush runs, and only bytes up to
+    // `target` are claimed durable.
+    fn flush_upto(&self, target: u64) -> Result<(), DurableJournalError> {
+        #[cfg(test)]
+        {
+            self.sync_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_sync.load(Ordering::Relaxed) {
+                return Err(DurableJournalError::Io {
+                    operation: IoOperation::SyncFile,
+                    kind: io::ErrorKind::Other,
+                });
+            }
+        }
+        self.file
+            .sync_data()
+            .map_err(|error| DurableJournalError::Io {
+                operation: IoOperation::SyncFile,
+                kind: error.kind(),
+            })?;
+        let actual = file_length(&self.file)?;
+        if actual < target {
+            // The file shrank below the written prefix: external tampering.
+            return Err(DurableJournalError::FileChanged);
+        }
+        Ok(())
+    }
+}
+
 /// The unique local owner for one journal stream and epoch.
 ///
 /// The owner is intentionally synchronous and requires `&mut self` for every
@@ -269,7 +414,6 @@ struct StoredOperation {
 /// no second writer protocol hidden in this type.
 pub struct MemoryV1DurableJournal {
     file: File,
-    directory: File,
     stream_id: MemoryId,
     epoch_id: MemoryId,
     limits: DurableJournalLimits,
@@ -298,7 +442,7 @@ impl MemoryV1DurableJournal {
         epoch_id: MemoryId,
         anchor: JournalAnchor,
         limits: DurableJournalLimits,
-    ) -> Result<Self, DurableJournalError> {
+    ) -> Result<(Self, JournalDurability), DurableJournalError> {
         validate_stream_epoch(stream_id, epoch_id, anchor)?;
         validate_limits(limits)?;
         let resolved = resolve_path(path)?;
@@ -323,21 +467,27 @@ impl MemoryV1DurableJournal {
             })?;
         configure_new_file(&file)?;
         lock_file(&file)?;
+        // Creation durability: the file's initial bytes AND its directory
+        // entry are made durable once here. Every later append extends an
+        // already-durable entry and synchronizes only file data.
         sync_file(&file)?;
         sync_directory(&directory)?;
-        Ok(Self {
-            file,
-            directory,
-            stream_id,
-            epoch_id,
-            limits,
-            position: anchor,
-            record_count: 0,
-            file_position: 0,
-            operations: BTreeMap::new(),
-            recovery: Vec::new(),
-            state: DurableJournalState::Ready,
-        })
+        let durability = JournalDurability::new(&file)?;
+        Ok((
+            Self {
+                file,
+                stream_id,
+                epoch_id,
+                limits,
+                position: anchor,
+                record_count: 0,
+                file_position: 0,
+                operations: BTreeMap::new(),
+                recovery: Vec::new(),
+                state: DurableJournalState::Ready,
+            },
+            durability,
+        ))
     }
 
     /// memory—v1: Derive the exact verified tail of one existing journal file.
@@ -387,7 +537,7 @@ impl MemoryV1DurableJournal {
         anchor: JournalAnchor,
         expected_tail: JournalAnchor,
         limits: DurableJournalLimits,
-    ) -> Result<Self, DurableJournalError> {
+    ) -> Result<(Self, JournalDurability), DurableJournalError> {
         validate_stream_epoch(stream_id, epoch_id, anchor)?;
         validate_limits(limits)?;
         if expected_tail.stream_id() != stream_id {
@@ -395,7 +545,7 @@ impl MemoryV1DurableJournal {
         }
         let resolved = resolve_path(path)?;
         inspect_target(&resolved.target)?;
-        let directory = open_directory(&resolved.parent)?;
+        // No directory sync needed: the entry was made durable at creation.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -447,19 +597,26 @@ impl MemoryV1DurableJournal {
         {
             return Err(DurableJournalError::FileChanged);
         }
-        Ok(Self {
-            file,
-            directory,
-            stream_id,
-            epoch_id,
-            limits,
-            position: scan.position,
-            record_count: scan.record_count,
-            file_position: scan.file_position,
-            operations: scan.operations,
-            recovery: scan.recovery,
-            state: DurableJournalState::Ready,
-        })
+        let durability = JournalDurability::new(&file)?;
+        durability
+            .latest_written
+            .store(scan.file_position, Ordering::Release);
+        durability.state.lock().unwrap().durable_end = scan.file_position;
+        Ok((
+            Self {
+                file,
+                stream_id,
+                epoch_id,
+                limits,
+                position: scan.position,
+                record_count: scan.record_count,
+                file_position: scan.file_position,
+                operations: scan.operations,
+                recovery: scan.recovery,
+                state: DurableJournalState::Ready,
+            },
+            durability,
+        ))
     }
 
     pub const fn state(&self) -> DurableJournalState {
@@ -493,12 +650,15 @@ impl MemoryV1DurableJournal {
         &self.recovery
     }
 
-    /// Append the exact mutation/audit envelope and issue its proof only after
-    /// both file and parent-directory synchronization complete.
-    pub fn append_mutation(
+    /// Phase 1 of the mutation append: write the frame (no synchronization)
+    /// and register it with the durability coordinator. The receipt is
+    /// completed by [`JournalDurability::ensure_durable`] — group commit
+    /// coalesces concurrent writers into one `fdatasync`.
+    pub fn prepare_mutation(
         &mut self,
         request: &MutationRequest,
-    ) -> Result<LocalDurablePrefixReceipt, DurableJournalError> {
+        durability: &JournalDurability,
+    ) -> Result<PreparedAppend, DurableJournalError> {
         self.ensure_ready()?;
         let payload = request
             .journal_payload()
@@ -529,7 +689,10 @@ impl MemoryV1DurableJournal {
             if existing.identity.mutation_identity()? != identity {
                 return Err(DurableJournalError::ExistingOperation);
             }
-            return Ok(LocalDurablePrefixReceipt {
+            // A replayed record is durable only when the whole written prefix
+            // is; the coordinator coalesces this with any in-flight flush.
+            durability.mark_written(self.file_position);
+            return Ok(PreparedAppend {
                 operation_id: request.operation_id().to_owned(),
                 request_fingerprint: *request.request_fingerprint(),
                 mutation_digest: existing
@@ -542,7 +705,7 @@ impl MemoryV1DurableJournal {
                 tail_hash: existing.tail_hash,
                 disposition: JournalAppendDisposition::Replayed,
                 start_offset: 0,
-                end_offset: self.file_position,
+                durable_end: self.file_position,
             });
         }
 
@@ -597,7 +760,8 @@ impl MemoryV1DurableJournal {
         )
         .map_err(DurableJournalError::Frame)?;
         self.record_count += 1;
-        Ok(LocalDurablePrefixReceipt {
+        durability.mark_written(end);
+        Ok(PreparedAppend {
             operation_id: request.operation_id().to_owned(),
             request_fingerprint: *request.request_fingerprint(),
             mutation_digest: request.mutation_digest(),
@@ -606,20 +770,21 @@ impl MemoryV1DurableJournal {
             tail_hash,
             disposition: JournalAppendDisposition::Appended,
             start_offset: start,
-            end_offset: end,
+            durable_end: end,
         })
     }
 
     /// Append one DENY observation as its own journal record and issue its
-    /// receipt only after both file and parent-directory synchronization.
+    /// receipt only after the whole written prefix is durable (group commit).
     ///
     /// A DENY does not advance the mutation sequence; its journal sequence is
     /// the next contiguous frame. An already-recorded operation with the same
     /// identity replays the original receipt without a second write.
-    pub fn append_deny(
+    pub fn prepare_deny(
         &mut self,
         request: &astral_trustgraph::service::memory_v1_mutation_coordinator::DenyJournalRequest,
-    ) -> Result<LocalDurablePrefixReceipt, DurableJournalError> {
+        durability: &JournalDurability,
+    ) -> Result<PreparedAppend, DurableJournalError> {
         self.ensure_ready()?;
         let payload = request
             .journal_payload()
@@ -658,7 +823,8 @@ impl MemoryV1DurableJournal {
                 .identity
                 .mutation_identity_deny()
                 .ok_or(DurableJournalError::InvalidRecord)?;
-            return Ok(LocalDurablePrefixReceipt {
+            durability.mark_written(self.file_position);
+            return Ok(PreparedAppend {
                 operation_id: request.operation_id().to_owned(),
                 request_fingerprint: request.request_fingerprint(),
                 mutation_digest: [0; 32],
@@ -667,7 +833,7 @@ impl MemoryV1DurableJournal {
                 tail_hash: existing.tail_hash,
                 disposition: JournalAppendDisposition::Replayed,
                 start_offset: 0,
-                end_offset: self.file_position,
+                durable_end: self.file_position,
             });
         }
 
@@ -724,7 +890,8 @@ impl MemoryV1DurableJournal {
         )
         .map_err(DurableJournalError::Frame)?;
         self.record_count += 1;
-        Ok(LocalDurablePrefixReceipt {
+        durability.mark_written(end);
+        Ok(PreparedAppend {
             operation_id: request.operation_id().to_owned(),
             request_fingerprint: request.request_fingerprint(),
             mutation_digest: [0; 32],
@@ -733,7 +900,7 @@ impl MemoryV1DurableJournal {
             tail_hash,
             disposition: JournalAppendDisposition::Appended,
             start_offset: start,
-            end_offset: end,
+            durable_end: end,
         })
     }
 
@@ -827,24 +994,9 @@ impl MemoryV1DurableJournal {
             self.state = DurableJournalState::StickyUnknown;
             return Err(DurableJournalError::FileChanged);
         }
-        sync_file(&self.file).map_err(|error| {
-            self.state = DurableJournalState::StickyUnknown;
-            match error {
-                DurableJournalError::Io { operation, kind } => {
-                    DurableJournalError::Io { operation, kind }
-                }
-                other => other,
-            }
-        })?;
-        sync_directory(&self.directory).inspect_err(|_| {
-            self.state = DurableJournalState::StickyUnknown;
-        })?;
-        let actual = file_length(&self.file)
-            .inspect_err(|_| self.state = DurableJournalState::StickyUnknown)?;
-        if actual != end {
-            self.state = DurableJournalState::StickyUnknown;
-            return Err(DurableJournalError::FileChanged);
-        }
+        // No synchronization here: the write is flushed by the durability
+        // coordinator (group commit). The directory entry was made durable at
+        // creation, so appends need only the file's data synchronization.
         self.file_position = end;
         Ok(())
     }
@@ -1044,6 +1196,45 @@ pub struct RecoveryRecord {
     /// the mutation sequence observed at the denial.
     pub mutation_sequence: u64,
     pub payload: Vec<u8>,
+}
+
+/// A written-but-not-yet-confirmed-durable journal record. The receipt is
+/// completed by [`JournalDurability::ensure_durable`] — group commit
+/// coalesces concurrent writers into one `fdatasync`.
+#[derive(Clone, Debug)]
+pub struct PreparedAppend {
+    pub operation_id: String,
+    pub request_fingerprint: [u8; 32],
+    pub mutation_digest: [u8; 32],
+    pub audit_digest: [u8; 32],
+    pub identity: JournalIdentity,
+    pub tail_hash: [u8; 32],
+    pub disposition: JournalAppendDisposition,
+    pub start_offset: u64,
+    pub durable_end: u64,
+}
+
+impl PreparedAppend {
+    /// Wait for the whole written prefix to become durable, then return the
+    /// receipt. Under concurrency this shares one `fdatasync` with the other
+    /// writers in the same prefix.
+    pub fn into_durable_receipt(
+        self,
+        durability: &JournalDurability,
+    ) -> Result<LocalDurablePrefixReceipt, DurableJournalError> {
+        durability.ensure_durable(self.durable_end)?;
+        Ok(LocalDurablePrefixReceipt {
+            operation_id: self.operation_id,
+            request_fingerprint: self.request_fingerprint,
+            mutation_digest: self.mutation_digest,
+            audit_digest: self.audit_digest,
+            identity: self.identity,
+            tail_hash: self.tail_hash,
+            disposition: self.disposition,
+            start_offset: self.start_offset,
+            end_offset: self.durable_end,
+        })
+    }
 }
 
 fn scan_file(
@@ -1370,26 +1561,39 @@ mod tests {
         DurableJournalLimits::new(32, 1024 * 1024, 1024 * 1024).unwrap()
     }
 
-    fn owner(directory: &TestDir) -> MemoryV1DurableJournal {
+    fn owner(directory: &TestDir) -> (MemoryV1DurableJournal, JournalDurability) {
         MemoryV1DurableJournal::create(&directory.path(), id(10), id(11), anchor(), limits())
             .unwrap()
+    }
+
+    // memory—v1: Prepare + durable receipt in one call for tests.
+    fn append_mutation_test(
+        journal: &mut MemoryV1DurableJournal,
+        durability: &JournalDurability,
+        request: &MutationRequest,
+    ) -> Result<LocalDurablePrefixReceipt, DurableJournalError> {
+        journal
+            .prepare_mutation(request, durability)
+            .unwrap()
+            .into_durable_receipt(durability)
     }
 
     #[test]
     fn append_replay_and_reopen_reconcile_the_same_operation() {
         let directory = TestDir::new();
-        let mut journal = owner(&directory);
+        let (mut journal, durability) = owner(&directory);
         let first_request = request("operation-1", 1);
-        let first = journal.append_mutation(&first_request).unwrap();
+        let first = append_mutation_test(&mut journal, &durability, &first_request).unwrap();
         assert_eq!(first.disposition(), JournalAppendDisposition::Appended);
         assert_eq!(first.identity(), first_request.journal());
         let tail = journal.position();
-        let replay = journal.append_mutation(&first_request).unwrap();
+        let replay = append_mutation_test(&mut journal, &durability, &first_request).unwrap();
         assert_eq!(replay.disposition(), JournalAppendDisposition::Replayed);
         assert_eq!(replay.tail_hash(), first.tail_hash());
         drop(journal);
+        drop(durability);
 
-        let mut reopened = MemoryV1DurableJournal::open(
+        let (mut reopened, reopened_durability) = MemoryV1DurableJournal::open(
             &directory.path(),
             id(10),
             id(11),
@@ -1398,7 +1602,11 @@ mod tests {
             limits(),
         )
         .unwrap();
-        let recovered = reopened.append_mutation(&first_request).unwrap();
+        let recovered = reopened
+            .prepare_mutation(&first_request, &reopened_durability)
+            .unwrap()
+            .into_durable_receipt(&reopened_durability)
+            .unwrap();
         assert_eq!(recovered.disposition(), JournalAppendDisposition::Replayed);
         assert_eq!(recovered.tail_hash(), first.tail_hash());
     }
@@ -1406,7 +1614,7 @@ mod tests {
     #[test]
     fn wrong_epoch_or_sequence_is_refused_before_file_change() {
         let directory = TestDir::new();
-        let mut journal = owner(&directory);
+        let (mut journal, durability) = owner(&directory);
         let before = journal.file_position();
         let mut wrong_epoch = request("operation-1", 1);
         wrong_epoch = MutationRequest::try_new(
@@ -1419,14 +1627,16 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            journal.append_mutation(&wrong_epoch),
+            journal.prepare_mutation(&wrong_epoch, &durability),
             Err(DurableJournalError::SequenceMismatch)
         ));
         assert_eq!(journal.file_position(), before);
 
         let second = request("operation-2", 2);
         assert!(matches!(
-            journal.append_mutation(&second),
+            journal
+                .prepare_mutation(&second, &durability)
+                .and_then(|p| p.into_durable_receipt(&durability)),
             Err(DurableJournalError::SequenceMismatch)
         ));
         assert_eq!(journal.file_position(), before);
@@ -1435,17 +1645,22 @@ mod tests {
     #[test]
     fn concurrent_replays_are_idempotent_under_one_writer_lease() {
         let directory = TestDir::new();
-        let journal = Arc::new(Mutex::new(owner(&directory)));
+        let (journal_inner, durability) = owner(&directory);
+        let durability = std::sync::Arc::new(durability);
+        let journal = Arc::new(Mutex::new(journal_inner));
         let request = Arc::new(request("operation-1", 1));
         let mut handles = Vec::new();
         for _ in 0..8 {
             let journal = Arc::clone(&journal);
+            let durability = std::sync::Arc::clone(&durability);
             let request = Arc::clone(&request);
             handles.push(std::thread::spawn(move || {
                 journal
                     .lock()
                     .unwrap()
-                    .append_mutation(&request)
+                    .prepare_mutation(&request, &durability)
+                    .unwrap()
+                    .into_durable_receipt(&durability)
                     .unwrap()
                     .disposition()
             }));
@@ -1473,7 +1688,7 @@ mod tests {
     #[test]
     fn post_write_length_mismatch_sticks_unknown_before_returning() {
         let directory = TestDir::new();
-        let mut journal = owner(&directory);
+        let (mut journal, durability) = owner(&directory);
         let frame = b"frame";
         let start = journal.file_position();
         let end = start + frame.len() as u64 + 1;
@@ -1488,10 +1703,12 @@ mod tests {
             fs::metadata(directory.path()).unwrap().len(),
             frame.len() as u64
         );
-        assert_eq!(
-            journal.append_mutation(&request("operation-1", 1)),
+        assert!(matches!(
+            journal
+                .prepare_mutation(&request("operation-1", 1), &durability)
+                .and_then(|p| p.into_durable_receipt(&durability)),
             Err(DurableJournalError::StickyUnknown)
-        );
+        ));
     }
 
     fn rewrite_payload(path: &Path, mutate: impl FnOnce(&mut Vec<u8>)) {
@@ -1521,11 +1738,12 @@ mod tests {
     #[test]
     fn reopen_rejects_inner_mutation_digest_tampering_after_outer_rehash() {
         let directory = TestDir::new();
-        let mut journal = owner(&directory);
+        let (mut journal, durability) = owner(&directory);
         let request = request("operation-1", 1);
-        journal.append_mutation(&request).unwrap();
+        append_mutation_test(&mut journal, &durability, &request).unwrap();
         let tail = journal.position();
         drop(journal);
+        drop(durability);
 
         rewrite_payload(&directory.path(), |payload| {
             payload[JOURNAL_ENVELOPE_DIGEST_OFFSET] ^= 1;
@@ -1546,11 +1764,12 @@ mod tests {
     #[test]
     fn reopen_rejects_inner_audit_digest_tampering_after_outer_rehash() {
         let directory = TestDir::new();
-        let mut journal = owner(&directory);
+        let (mut journal, durability) = owner(&directory);
         let request = request("operation-1", 1);
-        journal.append_mutation(&request).unwrap();
+        append_mutation_test(&mut journal, &durability, &request).unwrap();
         let tail = journal.position();
         drop(journal);
+        drop(durability);
 
         rewrite_payload(&directory.path(), |payload| {
             payload[JOURNAL_ENVELOPE_DIGEST_OFFSET + 32] ^= 1;
@@ -1571,11 +1790,12 @@ mod tests {
     #[test]
     fn reopen_rejects_outer_operation_binding_mismatch() {
         let directory = TestDir::new();
-        let mut journal = owner(&directory);
+        let (mut journal, durability) = owner(&directory);
         let request = request("operation-1", 1);
-        journal.append_mutation(&request).unwrap();
+        append_mutation_test(&mut journal, &durability, &request).unwrap();
         let tail = journal.position();
         drop(journal);
+        drop(durability);
 
         let bytes = fs::read(directory.path()).unwrap();
         let decoded = decode_record(&bytes).unwrap();
@@ -1609,12 +1829,13 @@ mod tests {
     #[test]
     fn append_replay_uses_recovered_digest_binding() {
         let directory = TestDir::new();
-        let mut journal = owner(&directory);
+        let (mut journal, durability) = owner(&directory);
         let first_request = request("operation-1", 1);
-        let first = journal.append_mutation(&first_request).unwrap();
+        let first = append_mutation_test(&mut journal, &durability, &first_request).unwrap();
         drop(journal);
+        drop(durability);
 
-        let mut reopened = MemoryV1DurableJournal::open(
+        let (mut reopened, reopened_durability) = MemoryV1DurableJournal::open(
             &directory.path(),
             id(10),
             id(11),
@@ -1623,7 +1844,11 @@ mod tests {
             limits(),
         )
         .unwrap();
-        let replay = reopened.append_mutation(&first_request).unwrap();
+        let replay = reopened
+            .prepare_mutation(&first_request, &reopened_durability)
+            .unwrap()
+            .into_durable_receipt(&reopened_durability)
+            .unwrap();
         assert_eq!(replay.mutation_digest(), first_request.mutation_digest());
         assert_eq!(replay.audit_digest(), first_request.audit_digest());
         assert_eq!(replay.disposition(), JournalAppendDisposition::Replayed);
@@ -1632,11 +1857,12 @@ mod tests {
     #[test]
     fn tampered_tail_cannot_be_reopened_as_a_verified_owner() {
         let directory = TestDir::new();
-        let mut journal = owner(&directory);
+        let (mut journal, durability) = owner(&directory);
         let request = request("operation-1", 1);
-        journal.append_mutation(&request).unwrap();
+        append_mutation_test(&mut journal, &durability, &request).unwrap();
         let tail = journal.position();
         drop(journal);
+        drop(durability);
         let path = directory.path();
         let mut bytes = fs::read(&path).unwrap();
         let tamper_index = bytes.len() - FRAME_DIGEST_BYTES - 1;

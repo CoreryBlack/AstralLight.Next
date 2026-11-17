@@ -567,7 +567,7 @@ async fn production_service_lifecycle() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&journal_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let journal = super::open_durable_journal(&journal_dir).unwrap();
+    let (journal, durability) = super::open_durable_journal(&journal_dir).unwrap();
     assert_eq!(journal.record_count(), 0);
     assert_eq!(journal.file_position(), 0);
 
@@ -599,7 +599,7 @@ async fn production_service_lifecycle() {
     let composition = super::assemble_production(
         std::sync::Arc::new(owner),
         Arc::new(admission),
-        journal,
+        (journal, durability),
         config,
         credentials,
     )

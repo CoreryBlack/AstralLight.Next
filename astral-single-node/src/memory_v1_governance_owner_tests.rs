@@ -229,7 +229,12 @@ fn production_root() -> TestRoot {
     }
 }
 
-fn reopened_journal(root: &TestRoot) -> super::memory_v1_durable_journal::MemoryV1DurableJournal {
+fn reopened_journal(
+    root: &TestRoot,
+) -> (
+    super::memory_v1_durable_journal::MemoryV1DurableJournal,
+    super::memory_v1_durable_journal::JournalDurability,
+) {
     use astral_types::memory_v1::MemoryId;
     use astral_types::memory_v1_journal::JournalAnchor;
     let target = root.dir.join("journal.bin");
@@ -253,7 +258,12 @@ fn reopened_journal(root: &TestRoot) -> super::memory_v1_durable_journal::Memory
     .unwrap()
 }
 
-fn opened_journal(root: &TestRoot) -> super::memory_v1_durable_journal::MemoryV1DurableJournal {
+fn opened_journal(
+    root: &TestRoot,
+) -> (
+    super::memory_v1_durable_journal::MemoryV1DurableJournal,
+    super::memory_v1_durable_journal::JournalDurability,
+) {
     use astral_types::memory_v1::MemoryId;
     use astral_types::memory_v1_journal::JournalAnchor;
     let anchor = JournalAnchor::new(MemoryId::from_bytes([10; 16]), 0, 0, [5; 32]).unwrap();
@@ -588,7 +598,7 @@ fn recovery_replays_a_journaled_mutation_before_adoption() {
     fresh.install_registry(&registry_declarations()).unwrap();
     let facts = cold_facts(counts);
     let input = sealed_input();
-    let journal = reopened_journal(&root);
+    let (journal, _durability) = reopened_journal(&root);
     let recovered = recover_root(fresh, &journal, &facts, &input).unwrap();
     assert_eq!(recovered.replayed_mutations, 1);
     let metadata = recovered.owner.handle().metadata().unwrap();
@@ -650,7 +660,7 @@ fn recovery_refuses_a_sequence_gap() {
         .unwrap();
     let facts = cold_facts(counts);
     let input = sealed_input();
-    let journal = reopened_journal(&root);
+    let (journal, _durability) = reopened_journal(&root);
     let error = recover_root(advanced, &journal, &facts, &input).unwrap_err();
     assert!(matches!(error, RecoveryError::ReplayConflict), "{error:?}");
 }

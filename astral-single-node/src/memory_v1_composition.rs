@@ -230,7 +230,10 @@ impl MemoryV1Composition {
     pub(crate) fn new_with_file_credentials_production<F>(
         root: Arc<RootOwner>,
         admission: Arc<ProductionAdmission>,
-        journal: MemoryV1DurableJournal,
+        journal_durability: (
+            MemoryV1DurableJournal,
+            astral_single_node::memory_v1_durable_journal::JournalDurability,
+        ),
         credentials: Arc<MemoryV1FileCredentials>,
         build_identity: F,
         config: AppConfig,
@@ -259,7 +262,8 @@ impl MemoryV1Composition {
         writer.set_session_authority(Some(Arc::clone(&session_authority_cell)));
         let commit_port = Arc::new(
             astral_single_node::memory_v1_governance_owner::MemoryV1DurableCommitOwner::new(
-                journal, writer,
+                journal_durability,
+                writer,
             ),
         );
         let commit_port_for_composition = Arc::clone(&commit_port);

@@ -172,7 +172,10 @@ fn journal_genesis_anchor() -> astral_types::memory_v1_journal::JournalAnchor {
 // truncation, repair, or replay is performed here.
 pub(crate) fn open_durable_journal(
     journal_dir: &PathBuf,
-) -> Result<astral_single_node::memory_v1_durable_journal::MemoryV1DurableJournal> {
+) -> Result<(
+    astral_single_node::memory_v1_durable_journal::MemoryV1DurableJournal,
+    astral_single_node::memory_v1_durable_journal::JournalDurability,
+)> {
     use astral_single_node::memory_v1_durable_journal::{
         DurableJournalLimits, MemoryV1DurableJournal,
     };
@@ -475,7 +478,10 @@ pub(crate) fn assemble(
 pub(crate) fn assemble_production(
     owner: std::sync::Arc<RootOwner>,
     admission: Arc<astral_authorization_root::memory_v1_root::ProductionAdmission>,
-    journal: astral_single_node::memory_v1_durable_journal::MemoryV1DurableJournal,
+    journal_durability: (
+        astral_single_node::memory_v1_durable_journal::MemoryV1DurableJournal,
+        astral_single_node::memory_v1_durable_journal::JournalDurability,
+    ),
     config: AppConfig,
     credentials: MemoryV1FileCredentials,
 ) -> Result<MemoryV1Composition> {
@@ -485,7 +491,7 @@ pub(crate) fn assemble_production(
     MemoryV1Composition::new_with_file_credentials_production(
         owner,
         admission,
-        journal,
+        journal_durability,
         credentials,
         move |session| memory_v1_auth_router(session, authenticator, SESSION_LIFETIME_SECONDS),
         config,
@@ -595,7 +601,7 @@ pub(crate) async fn run() -> Result<()> {
 
     // The durable journal is opened before any capture so the persistence
     // fact in the adoption bundle covers this exact handle.
-    let journal = open_durable_journal(&settings.journal_dir)
+    let (journal, durability) = open_durable_journal(&settings.journal_dir)
         .context("open the durable memory-v1 journal")?;
     tracing::info!(
         records = journal.record_count(),
@@ -637,7 +643,8 @@ pub(crate) async fn run() -> Result<()> {
     let root = owner.handle();
     require_serving_root(&root).context("memory-v1 serving root admission")?;
 
-    let composition = assemble_production(owner, admission, journal, config, credentials)?;
+    let composition =
+        assemble_production(owner, admission, (journal, durability), config, credentials)?;
     let listener = TcpListener::bind(settings.listen)
         .await
         .context("bind the memory-v1 listener")?;

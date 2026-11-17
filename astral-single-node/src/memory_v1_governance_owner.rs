@@ -40,7 +40,7 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::memory_v1_durable_journal::{
-    DurableJournalState, JournalAppendDisposition, MemoryV1DurableJournal,
+    DurableJournalState, JournalAppendDisposition, JournalDurability, MemoryV1DurableJournal,
 };
 use crate::memory_v1_root_writer::RootMutationWriter;
 
@@ -116,7 +116,13 @@ impl JournalIdentityAllocator {
 
 /// The concrete fail-closed commit owner for the unified single-node path.
 pub struct MemoryV1DurableCommitOwner {
+    /// Serializes the write phase (identity allocation + frame write).
+    /// The durability wait runs OUTSIDE this mutex — concurrent writers
+    /// coalesce their fsyncs through the shared JournalDurability.
     journal: Mutex<MemoryV1DurableJournal>,
+    /// Shared durability coordinator; `ensure_durable` takes `&self` so
+    /// concurrent waiters group-commit into one fdatasync.
+    durability: JournalDurability,
     writer: RootMutationWriter,
     identities: JournalIdentityAllocator,
     ledger: Mutex<MemoryV1OperationLedger>,
@@ -132,11 +138,15 @@ impl MemoryV1DurableCommitOwner {
     /// Assemble the owner around one opened journal and one validated root
     /// writer. The caller (composition/startup owner) is responsible for the
     /// recovery and production-adoption gate that produced both values.
-    pub fn new(journal: MemoryV1DurableJournal, writer: RootMutationWriter) -> Self {
+    pub fn new(
+        (journal, durability): (MemoryV1DurableJournal, JournalDurability),
+        writer: RootMutationWriter,
+    ) -> Self {
         let stream_id = journal.stream_id();
         let epoch_id = journal.epoch_id();
         Self {
             journal: Mutex::new(journal),
+            durability,
             writer,
             identities: JournalIdentityAllocator::for_journal(stream_id, epoch_id),
             ledger: Mutex::new(
@@ -166,15 +176,15 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
             .verified_admission(&request.root)
             .map_err(|error| pending_error(format!("root admission is not verifiable: {error}")))?;
 
-        // 3. Journal critical section: identity, ledger claim, binding, append.
-        let durable = {
+        // 3. Journal: write phase (identity, ledger claim, frame write) is
+        //    serialized by the journal mutex; the durability wait runs after
+        //    the mutex is released — concurrent writers coalesce their
+        //    fdatasyncs through the shared JournalDurability (group commit).
+        let prepared = {
             let mut journal = self
                 .journal
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if journal.state() != DurableJournalState::Ready {
-                return Err(pending_error("durable journal is sticky unknown"));
-            }
             let journal_sequence = journal.position().journal_sequence() + 1;
             let mutation_sequence = journal.position().mutation_sequence() + 1;
             let identity = self
@@ -207,16 +217,22 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
             }
 
             let journal_io_started = Instant::now();
-            let receipt = match journal.append_mutation(&coordinator_request) {
-                Ok(receipt) => receipt,
-                Err(error) => {
+            let prepared = journal
+                .prepare_mutation(&coordinator_request, &self.durability)
+                .map_err(|error| {
                     // The journal owns its own sticky-unknown transition on
                     // write uncertainty. Keep the ledger claim terminal.
-                    return Err(pending_error(format!(
+                    pending_error(format!(
                         "durable journal append is unavailable or unknown: {error:?}"
-                    )));
-                }
-            };
+                    ))
+                })?;
+            let receipt = prepared
+                .into_durable_receipt(&self.durability)
+                .map_err(|error| {
+                    pending_error(format!(
+                        "durable journal append is unavailable or unknown: {error:?}"
+                    ))
+                })?;
             record_memory_v1_commit_phase(
                 MemoryV1CommitPhase::JournalIo,
                 journal_io_started.elapsed(),
@@ -239,7 +255,7 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
                 coordinator_request,
             )
         };
-        let (journal_proof, coordinator_request) = durable;
+        let (journal_proof, coordinator_request) = prepared;
 
         // 4. Root publication under the root writer serialization. A card
         // disable takes the session-coordinated path: the revocation updates
@@ -382,8 +398,11 @@ impl astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofP
         let fingerprint = request.request_fingerprint();
 
         let deny_io_started = Instant::now();
-        let receipt = journal
-            .append_deny(&request)
+        let prepared = journal
+            .prepare_deny(&request, &self.durability)
+            .map_err(|error| pending_error(format!("durable deny append failed: {error:?}")))?;
+        let receipt = prepared
+            .into_durable_receipt(&self.durability)
             .map_err(|error| pending_error(format!("durable deny append failed: {error:?}")))?;
         record_memory_v1_deny_phase(MemoryV1DenyPhase::JournalIo, deny_io_started.elapsed());
         // Both an original append and an idempotent replay prove the same

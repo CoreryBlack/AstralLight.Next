@@ -28,6 +28,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+metrics-exporter-prometheus = { workspace = true }
 # memory—v1: the isolated full-path test adopts a fixture root through the
 # root's `test-support` hook. Resolver 2 isolates this dev dependency from
 # ordinary production builds, not explicitly selected feature sets.

@@ -23,6 +23,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use astral_trustgraph::observability::{
+    record_memory_v1_commit_phase, record_memory_v1_deny_phase, MemoryV1CommitPhase,
+    MemoryV1DenyPhase,
+};
 use astral_trustgraph::service::memory_v1_governance_commit::{
     MemoryV1GovernanceCommitPort, MemoryV1GovernanceCommitRequest, MemoryV1GovernanceCommitResponse,
 };
@@ -32,6 +36,7 @@ use astral_trustgraph::service::memory_v1_mutation_coordinator::{
 };
 use astral_types::memory_v1::MemoryId;
 use astral_types::AstralError;
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::memory_v1_durable_journal::{
@@ -146,10 +151,13 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
         &self,
         request: MemoryV1GovernanceCommitRequest,
     ) -> Result<MemoryV1GovernanceCommitResponse, AstralError> {
+        let commit_started = Instant::now();
         // 1. Value-level audit and request binding before any side effect.
+        let binding_started = Instant::now();
         request.validate().map_err(|error| {
             pending_error(format!("governance request binding rejected: {error}"))
         })?;
+        record_memory_v1_commit_phase(MemoryV1CommitPhase::Binding, binding_started.elapsed());
 
         // 2. Mint the crate-private root admission; the writer re-checks the
         //    production capability and the exact root observation atomically.
@@ -198,6 +206,7 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
                 )));
             }
 
+            let journal_io_started = Instant::now();
             let receipt = match journal.append_mutation(&coordinator_request) {
                 Ok(receipt) => receipt,
                 Err(error) => {
@@ -208,6 +217,10 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
                     )));
                 }
             };
+            record_memory_v1_commit_phase(
+                MemoryV1CommitPhase::JournalIo,
+                journal_io_started.elapsed(),
+            );
             if receipt.disposition() != JournalAppendDisposition::Appended {
                 return Err(pending_error(
                     "durable journal replay requires reconciliation",
@@ -231,6 +244,7 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
         // 4. Root publication under the root writer serialization. A card
         // disable takes the session-coordinated path: the revocation updates
         // apply inside the same root writer lock.
+        let cas_started = Instant::now();
         let after = if matches!(
             &request.mutation,
             astral_authorization_root::memory_v1_root::ManagementMutationV2::UserCardStatus {
@@ -256,6 +270,7 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
                 pending_error(format!("root publication is unavailable: {error:?}"))
             })?
         };
+        record_memory_v1_commit_phase(MemoryV1CommitPhase::RootCas, cas_started.elapsed());
         let root_proof =
             astral_trustgraph::service::memory_v1_mutation_coordinator::RootPublicationProof::mint_for_owner(
                 &coordinator_request,
@@ -267,6 +282,7 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
         // from the same request); the response carries the published metadata.
         let _ = root_proof;
 
+        record_memory_v1_commit_phase(MemoryV1CommitPhase::Total, commit_started.elapsed());
         Ok(MemoryV1GovernanceCommitResponse {
             operation_id: request.operation_id.clone(),
             root: after,
@@ -327,6 +343,7 @@ impl astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofP
             AuthorizationStatePrefixProof, DenyAuditProof, DenyJournalRequest, DenyProofGate,
             DenyProofRequest, DenyResponse, JournalReadWatermark, RootBinding,
         };
+        let deny_total_started = Instant::now();
         let mut journal = self
             .journal
             .lock()
@@ -364,9 +381,11 @@ impl astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofP
         });
         let fingerprint = request.request_fingerprint();
 
+        let deny_io_started = Instant::now();
         let receipt = journal
             .append_deny(&request)
             .map_err(|error| pending_error(format!("durable deny append failed: {error:?}")))?;
+        record_memory_v1_deny_phase(MemoryV1DenyPhase::JournalIo, deny_io_started.elapsed());
         // Both an original append and an idempotent replay prove the same
         // durable record; the receipt carries the recorded identity and tail.
         let _ = receipt.disposition();
@@ -407,6 +426,7 @@ impl astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofP
             *receipt.tail_hash(),
         ))
         .map_err(|error| pending_error(format!("deny prefix proof rejected: {error}")))?;
+        record_memory_v1_deny_phase(MemoryV1DenyPhase::Total, deny_total_started.elapsed());
         Ok(gate.response())
     }
 }

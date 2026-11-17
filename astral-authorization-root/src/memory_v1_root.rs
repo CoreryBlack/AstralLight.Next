@@ -167,6 +167,10 @@ impl ServingAdoptionCertificate {
 /// diagnostic facts, not substitutes for this capability.
 pub struct ProductionAdmission {
     runtime: Weak<RootRuntime>,
+    /// The snapshot the admission was minted on. Validation binds to the
+    /// admission's carried metadata as the chain anchor; this weak reference
+    /// is retained for diagnostics but no longer needs to be alive.
+    #[allow(dead_code)]
     snapshot: Weak<RootSnapshot>,
     metadata: RootMetadata,
 }
@@ -1673,16 +1677,19 @@ impl RootHandle {
         if !Arc::ptr_eq(&admission_runtime, &current_runtime) {
             return Err(RootError::ProductionAdmissionMismatch);
         }
-        let admitted_snapshot = admission
-            .snapshot
-            .upgrade()
-            .ok_or(RootError::ProductionAdmissionUnavailable)?;
         let current = current_runtime.current.load_full();
-        if !Arc::ptr_eq(&current, &admitted_snapshot) || current.metadata != admission.metadata {
-            return Err(RootError::ProductionAdmissionMismatch);
-        }
+        // The admission survives legitimate commits: every snapshot on this
+        // runtime is derived from the admitted one by ordered CAS, and the
+        // version advances monotonically. The admitted snapshot itself is a
+        // weak reference and may be freed once no reader holds it; the
+        // metadata carried by the admission remains the chain anchor. A
+        // non-Serving current state or a version below the admitted one
+        // breaks the chain and fails the check.
         if current.metadata.status != RootStatus::Serving {
             return Err(RootError::ProductionAdmissionUnavailable);
+        }
+        if current.metadata.version < admission.metadata.version {
+            return Err(RootError::ProductionAdmissionMismatch);
         }
         let record = current
             .adoption

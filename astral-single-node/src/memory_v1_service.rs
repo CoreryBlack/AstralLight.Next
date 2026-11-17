@@ -803,3 +803,7 @@ mod tests {
 #[cfg(test)]
 #[path = "memory_v1_service_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "memory_v1_lifecycle_stress_tests.rs"]
+mod lifecycle_stress_tests;

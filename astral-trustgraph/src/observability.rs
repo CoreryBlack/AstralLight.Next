@@ -263,6 +263,73 @@ pub(crate) fn record_sync_publish(outcome: SyncPublishMetricOutcome, elapsed: Du
     .record(elapsed.as_secs_f64());
 }
 
+/// memory—v1: Governed-commit phase timing. Every phase is a closed
+/// vocabulary label; the histogram is recorded once per phase per commit and
+/// the total covers the full request lifetime the commit owner observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryV1CommitPhase {
+    /// Value-level binding validation before any side effect.
+    Binding,
+    /// Journal identity allocation, ledger claim and request binding.
+    Prepare,
+    /// Journal payload encode, frame write, file and directory fsync.
+    JournalIo,
+    /// Root CAS: candidate construction, digest, atomic publication.
+    RootCas,
+    /// Session-coordinated disable path (revocations inside the writer lock).
+    SessionDisable,
+    /// The whole commit call the owner observed.
+    Total,
+}
+
+impl MemoryV1CommitPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Binding => "binding",
+            Self::Prepare => "prepare",
+            Self::JournalIo => "journal_io",
+            Self::RootCas => "root_cas",
+            Self::SessionDisable => "session_disable",
+            Self::Total => "total",
+        }
+    }
+}
+
+pub fn record_memory_v1_commit_phase(phase: MemoryV1CommitPhase, elapsed: Duration) {
+    metrics::histogram!(
+        "astral_memory_v1_commit_phase_seconds",
+        "phase" => phase.label()
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+/// memory—v1: DENY proof chain phase timing. The two independent proofs and
+/// the journal append that backs them are recorded separately from commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryV1DenyPhase {
+    /// Journal record encode, frame write, file and directory fsync.
+    JournalIo,
+    /// The whole deny proof call the owner observed.
+    Total,
+}
+
+impl MemoryV1DenyPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::JournalIo => "journal_io",
+            Self::Total => "total",
+        }
+    }
+}
+
+pub fn record_memory_v1_deny_phase(phase: MemoryV1DenyPhase, elapsed: Duration) {
+    metrics::histogram!(
+        "astral_memory_v1_deny_phase_seconds",
+        "phase" => phase.label()
+    )
+    .record(elapsed.as_secs_f64());
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

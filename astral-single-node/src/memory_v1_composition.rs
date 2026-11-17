@@ -144,6 +144,11 @@ pub(crate) struct MemoryV1Composition {
     #[allow(dead_code)]
     admission: RootAdmission,
     _session_authority: Arc<MemoryV1SessionAuthority>,
+    /// The durable commit owner, shared with the TrustGraph state and, on the
+    /// stress path, driven directly to collect phase timings.
+    _commit_port: Arc<
+        dyn astral_trustgraph::service::memory_v1_governance_commit::MemoryV1GovernanceCommitPort,
+    >,
     request_scopes: RequestRootBudget,
     router: Router,
 }
@@ -257,6 +262,7 @@ impl MemoryV1Composition {
                 journal, writer,
             ),
         );
+        let commit_port_for_composition = Arc::clone(&commit_port);
         // The durable commit port is injected through the TrustGraph offline
         // state; the caller-supplied router parameter is not used on this
         // production path because the commit port must be present at state
@@ -273,6 +279,7 @@ impl MemoryV1Composition {
                 admission,
             },
             Some(session_authority_cell),
+            Some(commit_port_for_composition),
             move |adapter| {
                 Arc::new(
                     MemoryV1IdentitySession::from_session_adapter_with_file_credentials(
@@ -310,6 +317,7 @@ impl MemoryV1Composition {
             root,
             admission,
             None,
+            None,
             build_session,
             build_identity,
             trustgraph,
@@ -317,10 +325,16 @@ impl MemoryV1Composition {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assemble_with_authority<S, F>(
         root: impl Into<Arc<RootOwner>>,
         admission: RootAdmission,
         provided_authority: Option<Arc<MemoryV1SessionAuthority>>,
+        provided_commit_port: Option<
+            Arc<
+                dyn astral_trustgraph::service::memory_v1_governance_commit::MemoryV1GovernanceCommitPort,
+            >,
+        >,
         build_session: S,
         build_identity: F,
         trustgraph: Router,
@@ -367,11 +381,19 @@ impl MemoryV1Composition {
                 admission.clone(),
                 require_live_admission,
             ));
+        let commit_port_for_composition: Arc<
+            dyn astral_trustgraph::service::memory_v1_governance_commit::MemoryV1GovernanceCommitPort,
+        > = provided_commit_port.unwrap_or_else(|| {
+            Arc::new(
+                astral_trustgraph::service::memory_v1_governance_commit::FailClosedMemoryV1GovernanceCommitPort,
+            )
+        });
         Ok(Self {
             _root: root,
             _journal: None,
             admission,
             _session_authority: session_authority,
+            _commit_port: commit_port_for_composition,
             request_scopes,
             router,
         })
@@ -380,6 +402,17 @@ impl MemoryV1Composition {
     /// memory—v1: Clone a router handle without extending root ownership.
     pub(crate) fn router(&self) -> Router {
         self.router.clone()
+    }
+
+    /// memory—v1: The injected durable commit port, for drivers that need to
+    /// measure the commit phases directly (stress/observability).
+    #[cfg(test)]
+    pub(crate) fn commit_port(
+        &self,
+    ) -> Arc<
+        dyn astral_trustgraph::service::memory_v1_governance_commit::MemoryV1GovernanceCommitPort,
+    > {
+        Arc::clone(&self._commit_port)
     }
 
     /// memory—v1: Observe the composition's live request scopes (diagnostic).

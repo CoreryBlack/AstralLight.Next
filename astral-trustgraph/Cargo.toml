@@ -6,6 +6,7 @@ description = "AstralLight 权限治理中心 — 策略管理/规则集/审批"
 license.workspace = true
 
 [features]
+test-support = []
 e1-observability = [
     "astral-db/e1-observability",
     "policy-engine/e1-observability",
@@ -54,6 +55,8 @@ once_cell = "1"
 uuid = { workspace = true }
 
 [dev-dependencies]
+# memory—v1: isolated fixture adoption for rule-algorithm tests only.
+astral-authorization-root = { path = "../astral-authorization-root", features = ["test-support"] }
 astral-gateway = { path = "../astral-gateway" }
 jsonwebtoken = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -11,9 +11,12 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use astral_authorization_root::memory_v1_registry::{RegistrySnapshot, RegistryStatus};
+use astral_authorization_root::memory_v1_request::RequestRootExtension;
+use astral_authorization_root::memory_v1_root::RootStatus;
 use astral_common::contract::{ApiResponse, EmptyResponse, PageResponse, PaginationParams};
 use astral_common::error::AppError;
-use astral_types::{AstralError, AuthorizationAdmission, ResourceRegistry};
+use astral_types::{AstralError, AuthorizationAdmission};
 
 fn current_card_id(headers: &HeaderMap) -> Result<i64, AppError> {
     headers
@@ -537,30 +540,63 @@ async fn validate_rule(
     )))
 }
 
-async fn list_resource_types(
-    State(_state): State<AppState>,
-) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, AppError> {
-    let reg = ResourceRegistry::global();
-    let types: Vec<serde_json::Value> = reg
-        .list_resources()
-        .iter()
-        .map(|name| {
-            let actions = reg.list_actions(name).unwrap_or_default();
-            let supported_conditions = reg.list_supported_conditions(name).unwrap_or_default();
+// memory—v1 §4.9: Render only the active portion of one root-owned snapshot.
+// Retired entries remain historical root facts, never usable directory entries.
+fn resource_types_from_snapshot(snapshot: RegistrySnapshot) -> Vec<serde_json::Value> {
+    snapshot
+        .entries
+        .into_iter()
+        // RetireRequested and Retired remain root facts, but are not available
+        // resource types. Omitting them preserves the legacy DTO while never
+        // presenting an inactive action set as usable.
+        .filter(|entry| entry.status == RegistryStatus::Active)
+        .map(|entry| {
             serde_json::json!({
-                "resourceType": name,
-                "actions": actions,
-                "supportedConditions": supported_conditions,
+                "resourceType": entry.resource,
+                "actions": entry.actions,
+                // memory—v1 §4.4 (design §4.4, lines 225/247): v1 has no
+                // condition-expression language; retain the legacy field with
+                // its contractually empty value.
+                "supportedConditions": [],
                 "description": serde_json::Value::Null,
             })
         })
-        .collect();
-    Ok(Json(ApiResponse::success(types)))
+        .collect()
+}
+
+// memory—v1: Serve the registry only from the request-pinned root reader;
+// missing/non-serving root or unavailable registry is PENDING, never global fallback.
+async fn list_resource_types(
+    State(_state): State<AppState>,
+    root: Option<Extension<RequestRootExtension>>,
+) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, AppError> {
+    let root = root
+        .map(|Extension(root)| root)
+        .ok_or_else(|| AppError(AstralError::Pending("request root unavailable".into())))?;
+    let snapshot = root
+        .with_reader(|reader| {
+            if reader.metadata().status != RootStatus::Serving {
+                return Err(format!(
+                    "memory-v1 root is not serving: {:?}",
+                    reader.metadata().status
+                ));
+            }
+            reader
+                .registry_snapshot()
+                .map_err(|error| format!("memory-v1 registry unavailable: {error}"))
+        })
+        .map_err(|error| AppError(AstralError::Pending(error.to_string())))?
+        .map_err(|error| AppError(AstralError::Pending(error)))?;
+
+    Ok(Json(ApiResponse::success(resource_types_from_snapshot(
+        snapshot,
+    ))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astral_authorization_root::memory_v1_registry::RegistryEntryView;
     use astral_types::PolicyDecision;
     use axum::response::IntoResponse;
 
@@ -576,6 +612,45 @@ mod tests {
             snapshot_version: None,
             org_provenance: None,
         }
+    }
+
+    #[test]
+    fn registry_dto_renders_only_active_root_entries_with_legacy_shape() {
+        let values = resource_types_from_snapshot(RegistrySnapshot {
+            version: 7,
+            entries: vec![
+                RegistryEntryView {
+                    resource: "retiring_resource".into(),
+                    actions: vec!["read".into()],
+                    status: RegistryStatus::RetireRequested,
+                },
+                RegistryEntryView {
+                    resource: "active_resource".into(),
+                    actions: vec!["read".into(), "scan".into()],
+                    status: RegistryStatus::Active,
+                },
+                RegistryEntryView {
+                    resource: "retired_resource".into(),
+                    actions: vec!["read".into()],
+                    status: RegistryStatus::Retired,
+                },
+            ],
+        });
+
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["resourceType"], "active_resource");
+        assert_eq!(values[0]["actions"], serde_json::json!(["read", "scan"]));
+        assert_eq!(values[0]["supportedConditions"], serde_json::json!([]));
+        assert!(values[0]["description"].is_null());
+    }
+
+    #[test]
+    fn registry_dto_does_not_fabricate_entries_from_an_empty_root_snapshot() {
+        let values = resource_types_from_snapshot(RegistrySnapshot {
+            version: 1,
+            entries: Vec::new(),
+        });
+        assert!(values.is_empty());
     }
 
     #[test]

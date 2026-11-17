@@ -827,6 +827,12 @@ where
         level_template_service,
         user_card_service,
         personal_permission_service,
+        memory_v1_governance_commit: Arc::new(
+            crate::service::memory_v1_governance_commit::FailClosedMemoryV1GovernanceCommitPort,
+        ),
+        memory_v1_deny_proof: Arc::new(
+            crate::service::memory_v1_governance_commit::FailClosedMemoryV1DenyProofPort,
+        ),
         authorization_fence_provider,
         tenant_repository,
         tenant_service,
@@ -1908,6 +1914,7 @@ pub fn build_router(state: AppState, integration_config: RouterIntegrationConfig
         .merge(api::user_cards::user_card_routes())
         .merge(api::card_templates::card_template_routes())
         .merge(api::global_admin::global_admin_routes())
+        .merge(api::governance_routes::governance_routes())
         // 内部测试控制面（默认不注册任何路由；启用后仅只读 worker-id 探针）
         .merge(api::test_control::test_control_routes(
             state.test_control.as_ref(),
@@ -2723,6 +2730,7 @@ mod tests {
             "user_cards::user_card_routes",
             "card_templates::card_template_routes",
             "global_admin::global_admin_routes",
+            "governance_routes::governance_routes",
             "test_control::test_control_routes",
             "org_authorities::org_authority_edge_routes",
             "org_authorities::org_unit_card_routes",

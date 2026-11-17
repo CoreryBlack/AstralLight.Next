@@ -7,6 +7,7 @@ pub mod repository;
 pub mod service;
 
 pub use memory_v1_state::build_memory_v1_offline_app_state;
+pub use memory_v1_state::build_memory_v1_offline_app_state_with_commit;
 
 use astral_common::config::AppConfig;
 use axum::extract::FromRef;
@@ -41,6 +42,7 @@ use service::approval_service::ApprovalService;
 use service::audit_replay_worker::AuditReplayProducerSlot;
 use service::delegation_service::DelegationWriteService;
 use service::level_template_service::LevelTemplateService;
+use service::memory_v1_governance_commit::MemoryV1GovernanceCommitPort;
 use service::personal_permission_service::PersonalPermissionService;
 use service::rule_set_write_service::RuleSetWriteService;
 use service::rule_write_service::RuleWriteService;
@@ -101,6 +103,14 @@ pub struct AppState {
     pub level_template_service: Arc<LevelTemplateService>,
     pub user_card_service: Arc<UserCardService>,
     pub personal_permission_service: Arc<PersonalPermissionService>,
+    /// The only memory-v1 governance mutation owner. Offline and legacy
+    /// compositions receive a fail-closed implementation; no handler may fall
+    /// back to a repository when this owner is unavailable.
+    pub memory_v1_governance_commit: Arc<dyn MemoryV1GovernanceCommitPort>,
+    /// The only memory-v1 DENY proof issuer. Offline and legacy compositions
+    /// receive a fail-closed implementation that keeps every DENY a 503; a 403
+    /// requires two independently verified durable proofs.
+    pub memory_v1_deny_proof: Arc<dyn service::memory_v1_governance_commit::MemoryV1DenyProofPort>,
     /// Fixed trust-root verifier for request-bound authorization fences. A
     /// missing provider is not-ready in Strict mode; DurableOnly is an explicit
     /// compatibility profile and never enables memory by accident.

@@ -39,6 +39,7 @@ use crate::service::{
     audit_replay_worker::AuditReplayProducerSlot,
     delegation_service::DelegationWriteService,
     level_template_service::LevelTemplateService,
+    memory_v1_governance_commit::FailClosedMemoryV1GovernanceCommitPort,
     personal_permission_service::PersonalPermissionService,
     rule_set_write_service::RuleSetWriteService,
     rule_write_service::{RuleWriteService, SqlxGrantSodValidator},
@@ -68,6 +69,25 @@ fn offline_pool() -> MySqlPool {
 /// legacy row can back a decision or a response. `engine` is the shared
 /// [`PolicyEngine`]; its decisions come from the request's root scope, never from
 /// this state. No background worker, fence provider or audit producer is started.
+///
+/// `governance_commit` overrides the default fail-closed commit port: the
+/// single-node composition injects its durable owner here so the governance
+/// routes commit through the journal/root proof chain instead of staying
+/// PENDING. Passing nothing keeps the fail-closed default.
+pub fn build_memory_v1_offline_app_state_with_commit(
+    config: AppConfig,
+    engine: Arc<PolicyEngine>,
+    governance_commit: Arc<
+        dyn crate::service::memory_v1_governance_commit::MemoryV1GovernanceCommitPort,
+    >,
+    deny_proof: Arc<dyn crate::service::memory_v1_governance_commit::MemoryV1DenyProofPort>,
+) -> AppState {
+    let mut state = build_memory_v1_offline_app_state(config, engine);
+    state.memory_v1_governance_commit = governance_commit;
+    state.memory_v1_deny_proof = deny_proof;
+    state
+}
+
 pub fn build_memory_v1_offline_app_state(config: AppConfig, engine: Arc<PolicyEngine>) -> AppState {
     let pool = offline_pool();
     let sod = Arc::new(SqlxGrantSodValidator::new(pool.clone()));
@@ -115,6 +135,10 @@ pub fn build_memory_v1_offline_app_state(config: AppConfig, engine: Arc<PolicyEn
         level_template_service: Arc::new(LevelTemplateService::new(level_templates)),
         user_card_service: Arc::new(UserCardService::new(user_cards)),
         personal_permission_service: Arc::new(PersonalPermissionService::new(rules, sod)),
+        memory_v1_governance_commit: Arc::new(FailClosedMemoryV1GovernanceCommitPort),
+        memory_v1_deny_proof: Arc::new(
+            crate::service::memory_v1_governance_commit::FailClosedMemoryV1DenyProofPort,
+        ),
         authorization_fence_provider: None,
         projector_health: Arc::new(OnceLock::new()),
         audit_replay_producer: AuditReplayProducerSlot::new(),

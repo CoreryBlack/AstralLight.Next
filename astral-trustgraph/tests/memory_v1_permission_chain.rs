@@ -132,6 +132,12 @@ fn fixture_state(config: AppConfig, engine: Arc<PolicyEngine>) -> AppState {
         level_template_service: Arc::new(LevelTemplateService::new(level_templates)),
         user_card_service: Arc::new(UserCardService::new(user_cards)),
         personal_permission_service: Arc::new(PersonalPermissionService::new(rules, sod)),
+        memory_v1_governance_commit: Arc::new(
+            astral_trustgraph::service::memory_v1_governance_commit::FailClosedMemoryV1GovernanceCommitPort,
+        ),
+        memory_v1_deny_proof: std::sync::Arc::new(
+            astral_trustgraph::service::memory_v1_governance_commit::FailClosedMemoryV1DenyProofPort,
+        ),
         authorization_fence_provider: None,
         projector_health: Arc::new(OnceLock::new()),
         audit_replay_producer: AuditReplayProducerSlot::new(),

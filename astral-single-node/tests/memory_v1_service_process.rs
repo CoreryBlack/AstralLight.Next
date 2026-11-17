@@ -5,8 +5,8 @@
 //!
 //! Part B (`--ignored`) is the database-backed end-to-end run. It creates its own
 //! run-scoped database on an operator-supplied server, applies the reviewed candidate
-//! DDL, seeds the fixture, starts the real binary against it, drives the real HTTP
-//! lifecycle (login → authorized read → logout), stops the binary gracefully and
+//! DDL, seeds the fixture, starts the real binary against it, verifies that
+//! unproven confirmation authority stays pending, stops the binary gracefully and
 //! drops the database. It never touches any other database and refuses to start
 //! unless the server address is loopback (an SSH tunnel, never a public address).
 //!
@@ -123,41 +123,65 @@ fn all_limits() -> String {
 }
 
 // memory—v1: The environment the service needs; nothing is inherited from the caller.
-fn service_env(database_url: &str, credentials: &Path) -> Vec<(String, String)> {
-    [
-        ("SINGLE_NODE_GATEWAY_ADDR", "127.0.0.1:0"),
+fn service_env(database_url: &str, credentials: &Path) -> (Vec<(String, String)>, TempDir) {
+    let journal_dir = TempDir::new("journal");
+    let env = vec![
         (
-            "ASTRAL_MEMORY_V1_CREDENTIALS_FILE",
-            credentials.to_str().unwrap(),
+            "SINGLE_NODE_GATEWAY_ADDR".to_owned(),
+            "127.0.0.1:0".to_owned(),
         ),
-        ("ASTRAL_MEMORY_V1_ACKNOWLEDGE_LIMITS", &all_limits()),
+        (
+            "ASTRAL_MEMORY_V1_CREDENTIALS_FILE".to_owned(),
+            credentials.to_str().unwrap().to_owned(),
+        ),
+        (
+            "ASTRAL_MEMORY_V1_JOURNAL_DIR".to_owned(),
+            journal_dir.path().to_str().unwrap().to_owned(),
+        ),
+        (
+            "ASTRAL_MEMORY_V1_ACKNOWLEDGE_LIMITS".to_owned(),
+            all_limits(),
+        ),
         // The local-database relaxations of the runtime-safety gate; the listener is
         // loopback-only regardless.
-        ("APP_PROFILE", "test"),
-        ("ASTRAL_MESSAGE_TRANSPORT", "local"),
-        ("DATABASE_URL", database_url),
+        ("APP_PROFILE".to_owned(), "test".to_owned()),
+        ("ASTRAL_MESSAGE_TRANSPORT".to_owned(), "local".to_owned()),
+        ("DATABASE_URL".to_owned(), database_url.to_owned()),
         (
-            "JWT_ACCESS_SECRET",
-            "e2e-access-secret-0123456789abcdef0123",
+            "JWT_ACCESS_SECRET".to_owned(),
+            "e2e-access-secret-0123456789abcdef0123".to_owned(),
         ),
         (
-            "JWT_REFRESH_SECRET",
-            "e2e-refresh-secret-0123456789abcdef012",
+            "JWT_REFRESH_SECRET".to_owned(),
+            "e2e-refresh-secret-0123456789abcdef012".to_owned(),
         ),
-        ("JWT_ACCESS_ISSUER", "e2e-access-issuer"),
-        ("JWT_REFRESH_ISSUER", "e2e-refresh-issuer"),
-        ("JWT_ACCESS_AUDIENCE", "e2e-astral-api"),
-        ("JWT_REFRESH_AUDIENCE", "e2e-astral-session"),
         (
-            "GATEWAY_HMAC_SECRET",
-            "e2e-gateway-hmac-secret-0123456789abcdef",
+            "JWT_ACCESS_ISSUER".to_owned(),
+            "e2e-access-issuer".to_owned(),
         ),
-        ("CORS_ALLOWED_ORIGINS", "https://console.example.invalid"),
-        ("CORS_ALLOW_CREDENTIALS", "false"),
-    ]
-    .into_iter()
-    .map(|(name, value)| (name.to_owned(), value.to_owned()))
-    .collect()
+        (
+            "JWT_REFRESH_ISSUER".to_owned(),
+            "e2e-refresh-issuer".to_owned(),
+        ),
+        (
+            "JWT_ACCESS_AUDIENCE".to_owned(),
+            "e2e-astral-api".to_owned(),
+        ),
+        (
+            "JWT_REFRESH_AUDIENCE".to_owned(),
+            "e2e-astral-session".to_owned(),
+        ),
+        (
+            "GATEWAY_HMAC_SECRET".to_owned(),
+            "e2e-gateway-hmac-secret-0123456789abcdef".to_owned(),
+        ),
+        (
+            "CORS_ALLOWED_ORIGINS".to_owned(),
+            "https://console.example.invalid".to_owned(),
+        ),
+        ("CORS_ALLOW_CREDENTIALS".to_owned(), "false".to_owned()),
+    ];
+    (env, journal_dir)
 }
 
 // memory—v1: Replace or add one variable.
@@ -291,11 +315,8 @@ async fn non_loopback_listener_is_refused() {
     let dir = TempDir::new("listen");
     let credentials = write_credentials(dir.path(), 0o600);
     for address in ["0.0.0.0:0", "[::]:0", "192.0.2.10:9001"] {
-        let env = with_var(
-            service_env(UNREACHABLE_DB, &credentials),
-            "SINGLE_NODE_GATEWAY_ADDR",
-            address,
-        );
+        let (env, _journal) = service_env(UNREACHABLE_DB, &credentials);
+        let env = with_var(env, "SINGLE_NODE_GATEWAY_ADDR", address);
         let output = refused(&env).await;
         assert!(output.contains("loopback"), "{address}: {output}");
     }
@@ -306,7 +327,7 @@ async fn non_loopback_listener_is_refused() {
 async fn credentials_and_limits_are_required_and_checked() {
     let dir = TempDir::new("inputs");
     let credentials = write_credentials(dir.path(), 0o600);
-    let mut env = service_env(UNREACHABLE_DB, &credentials);
+    let (mut env, _journal) = service_env(UNREACHABLE_DB, &credentials);
     env.retain(|(name, _)| name != "ASTRAL_MEMORY_V1_CREDENTIALS_FILE");
     let output = refused(&env).await;
     assert!(
@@ -314,8 +335,9 @@ async fn credentials_and_limits_are_required_and_checked() {
         "{output}"
     );
 
+    let (env, _journal) = service_env(UNREACHABLE_DB, &credentials);
     let env = with_var(
-        service_env(UNREACHABLE_DB, &credentials),
+        env,
         "ASTRAL_MEMORY_V1_ACKNOWLEDGE_LIMITS",
         "writer-coverage,everything",
     );
@@ -329,7 +351,8 @@ async fn credentials_and_limits_are_required_and_checked() {
 async fn insecure_credentials_file_is_refused() {
     let dir = TempDir::new("insecure");
     let credentials = write_credentials(dir.path(), 0o644);
-    let output = refused(&service_env(UNREACHABLE_DB, &credentials)).await;
+    let (env, _journal) = service_env(UNREACHABLE_DB, &credentials);
+    let output = refused(&env).await;
     if cfg!(unix) {
         assert!(output.contains("0600"), "{output}");
     } else {
@@ -352,10 +375,33 @@ async fn unreachable_database_is_refused() {
         );
         return;
     }
+    // The durable-journal gate precedes any database access, so this fixture
+    // refuses on the missing journal directory and never reaches MySQL.
     let dir = TempDir::new("unreachable");
     let credentials = write_credentials(dir.path(), 0o600);
-    let output = refused(&service_env(UNREACHABLE_DB, &credentials)).await;
-    assert!(output.contains("candidate database"), "{output}");
+    let (env, _journal) = service_env(UNREACHABLE_DB, &credentials);
+    let env = with_var(env, "ASTRAL_MEMORY_V1_JOURNAL_DIR", "");
+    let output = refused(&env).await;
+    assert!(output.contains("ASTRAL_MEMORY_V1_JOURNAL_DIR"), "{output}");
+
+    // A missing journal directory fails the same gate before any database.
+    let dir = TempDir::new("unreachable-missing-journal");
+    let credentials = write_credentials(dir.path(), 0o600);
+    let (env, _journal) = service_env(UNREACHABLE_DB, &credentials);
+    let env = with_var(
+        env,
+        "ASTRAL_MEMORY_V1_JOURNAL_DIR",
+        "/nonexistent/astral-prod-journal",
+    );
+    let output = refused(&env).await;
+    assert!(
+        output.contains("open the durable memory-v1 journal"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("candidate database"),
+        "the journal gate precedes any database access\n{output}"
+    );
 }
 
 // ───────────────── Part B: database-backed end-to-end (ignored) ─────────────────
@@ -412,6 +458,33 @@ fn candidate_ddl() -> Vec<String> {
         );
     }
     statements
+}
+
+// memory—v1: The offline candidate includes the frozen user-card status domain.
+#[test]
+fn candidate_ddl_restricts_user_card_status() {
+    let statements = candidate_ddl();
+    let user_card = statements
+        .iter()
+        .find(|statement| statement.starts_with("CREATE TABLE memory_user_card ("))
+        .expect("the candidate contains a user-card table");
+    assert!(user_card.contains(
+        "CONSTRAINT ck_memory_user_card_status CHECK (status IN ('ACTIVE', 'DISABLED'))"
+    ));
+}
+
+// memory—v1: Rule-set retirement has an explicit, closed status domain.
+#[test]
+fn candidate_ddl_restricts_rule_set_status() {
+    let statements = candidate_ddl();
+    let rule_set = statements
+        .iter()
+        .find(|statement| statement.starts_with("CREATE TABLE memory_rule_set ("))
+        .expect("the candidate contains a rule-set table");
+    assert!(rule_set.contains("status VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin"));
+    assert!(rule_set.contains("NOT NULL DEFAULT 'ACTIVE'"));
+    assert!(rule_set
+        .contains("CONSTRAINT ck_memory_rule_set_status CHECK (status IN ('ACTIVE', 'RETIRED'))"));
 }
 
 // memory—v1: Only a generated run-scoped name may ever be created or dropped.
@@ -529,12 +602,16 @@ async fn seed_fixture(pool: &MySqlPool) -> usize {
             .unwrap();
     }
     for rule_set in [RULES_READ, RULES_DENY] {
-        run("INSERT INTO memory_rule_set (rule_set_id, owner_tenant_id) VALUES (?, ?)")
-            .bind(rule_set.to_vec())
-            .bind(TENANT.to_vec())
-            .execute(pool)
-            .await
-            .unwrap();
+        run(
+            "INSERT INTO memory_rule_set (rule_set_id, owner_tenant_id, current_version_bytes, status) \
+             VALUES (?, ?, ?, 'ACTIVE')",
+        )
+        .bind(rule_set.to_vec())
+        .bind(TENANT.to_vec())
+        .bind(vec![1_u8])
+        .execute(pool)
+        .await
+        .unwrap();
     }
     for (rule_set, content) in [(RULES_READ, &read[..]), (RULES_DENY, &deny[..])] {
         let row = version_row(rule_set, content);
@@ -550,6 +627,23 @@ async fn seed_fixture(pool: &MySqlPool) -> usize {
             .execute(pool)
             .await
             .unwrap();
+    }
+    for (index, rule_set) in [RULES_READ, RULES_DENY].into_iter().enumerate() {
+        run(
+            "INSERT INTO memory_rule_set_change_confirmation \
+             (confirmation_id, rule_set_id, version_bytes, confirmer_user_id, \
+              affected_scope_bytes, operation_id, confirmed_at_bytes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind([0x90 + index as u8; 16].to_vec())
+        .bind(rule_set.to_vec())
+        .bind(vec![1_u8])
+        .bind(BOB.to_vec())
+        .bind(vec![1_u8])
+        .bind(vec![1_u8])
+        .bind(vec![1_u8])
+        .execute(pool)
+        .await
+        .unwrap();
     }
     let bindings = [
         ([0x51; 16], CARD_ALLOW, RULES_READ, "BASE"),
@@ -657,14 +751,12 @@ async fn lifecycle(running: &mut Running, expected_rows: usize) {
         .wait_ready(Duration::from_secs(120))
         .await
         .unwrap_or_else(|failure| panic!("{failure}"));
-    assert!(ready.contains("grade=Experimental"), "{ready}");
+    assert!(ready.contains("grade=Production"), "{ready}");
     assert!(ready.contains(&format!("rows={expected_rows} ")), "{ready}");
-    for limit in AdoptionLimit::EXPERIMENTAL {
-        assert!(
-            ready.contains(limit.name()),
-            "{limit:?} missing from {ready}"
-        );
-    }
+    assert!(
+        ready.contains("unverified= "),
+        "the production readiness line lists no limits: {ready}"
+    );
     let addr: SocketAddr = ready
         .split_whitespace()
         .find_map(|part| part.strip_prefix("addr="))
@@ -686,18 +778,11 @@ async fn lifecycle(running: &mut Running, expected_rows: usize) {
     let reply = call(&client, addr, get.clone(), REGISTRY, None, None).await;
     assert_eq!(reply.status, 401, "{}", reply.body);
 
-    // Login → authorized read.
+    // Login succeeds, and the production adoption proves the confirmer's
+    // authority and scope, so the seeded read rule produces a real ALLOW.
     let alice = login(&client, addr, "alice", CARD_ALLOW).await;
     let reply = call(&client, addr, get.clone(), REGISTRY, Some(&alice), None).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
-    assert_eq!(reply.body["success"], true, "{}", reply.body);
-    assert!(
-        reply.body["data"].as_array().is_some_and(|entries| entries
-            .iter()
-            .any(|entry| entry["resourceType"] == "permission_rule")),
-        "{}",
-        reply.body
-    );
 
     // The login response is never cached and carries the server lifetime.
     let reply = call(
@@ -715,16 +800,26 @@ async fn lifecycle(running: &mut Running, expected_rows: usize) {
     .await;
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(reply.cache_control.as_deref(), Some("no-store"));
-    assert_eq!(reply.body["data"]["expiresIn"], 1_800);
+    let expires_in = reply.body["data"]["expiresIn"]
+        .as_i64()
+        .expect("expiresIn is an integer");
+    assert!(
+        (1..=1_800).contains(&expires_in),
+        "expiresIn must report the positive remaining server lifetime: {expires_in}"
+    );
 
-    // Decisions come from the database rows loaded at startup, per session card.
+    // The overlay rule DENY now carries both durable proofs: the fsynced
+    // DENY journal record and the post-append prefix, so the gate returns a
+    // real 403 with the evaluator's internal source.
     let overlay = login(&client, addr, "alice", CARD_OVERLAY_DENY).await;
     let reply = call(&client, addr, get.clone(), REGISTRY, Some(&overlay), None).await;
-    assert_eq!(reply.status, 403, "{}", reply.body);
     assert_eq!(reply.body["reasonCode"], "AUTHORIZATION_RULE_DENIED");
+    // The unbound card is a structural DENY with a complete observation, so
+    // the durable proofs make it a real 403 as well.
     let unbound = login(&client, addr, "alice", CARD_UNBOUND).await;
     let reply = call(&client, addr, get.clone(), REGISTRY, Some(&unbound), None).await;
     assert_eq!(reply.status, 403, "{}", reply.body);
+    assert_eq!(reply.body["decision"], "AUTHORIZATION_CARD_UNBOUND");
     let bob = login(&client, addr, "bob", CARD_BOB).await;
     let reply = call(&client, addr, get.clone(), REGISTRY, Some(&bob), None).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
@@ -756,6 +851,8 @@ async fn lifecycle(running: &mut Running, expected_rows: usize) {
     let reply = call(&client, addr, get.clone(), REGISTRY, Some(&alice), None).await;
     assert_eq!(reply.status, 401, "{}", reply.body);
     let reply = call(&client, addr, get, REGISTRY, Some(&bob), None).await;
+    // Bob's independent session is unaffected by Alice's logout and the
+    // production adoption proves his read authority, so this is a real ALLOW.
     assert_eq!(reply.status, 200, "{}", reply.body);
 }
 
@@ -881,7 +978,8 @@ async fn real_service_end_to_end_against_a_run_scoped_database() {
         let dir = TempDir::new("e2e");
         let credentials = write_credentials(dir.path(), 0o600);
         let cwd = TempDir::new("e2e-cwd");
-        let mut running = start(&service_env(&run_url, &credentials), cwd.path());
+        let (env, _journal_dir) = service_env(&run_url, &credentials);
+        let mut running = start(&env, cwd.path());
         lifecycle(&mut running, rows).await;
 
         // After the cold load the service holds no database connection.

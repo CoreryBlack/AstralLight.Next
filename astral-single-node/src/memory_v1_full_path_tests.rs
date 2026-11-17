@@ -16,13 +16,16 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use astral_authorization_root::memory_v1_adoption::{
+    AdoptionLimit, ColdLoadFacts, MEMORY_V1_CANDIDATE_SCHEMA_VERSION,
+};
 use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
 use astral_authorization_root::memory_v1_db_rows::{
     BindingConfirmationRow, BindingLayer, BindingRow, CandidateRows, CurrentSelection,
-    IdentityCardRow, RuleSetRow, RuleSetVersionRow, TenantRow, UserCardRow, UserRow,
+    IdentityCardRow, RuleSetChangeConfirmationRow, RuleSetRow, RuleSetVersionRow, TenantRow,
+    UserCardRow, UserRow,
 };
 use astral_authorization_root::memory_v1_hamt::CandidateBudget;
-use astral_authorization_root::memory_v1_registry::RegistryDeclaration;
 use astral_authorization_root::memory_v1_request::{
     RequestRootAccessError, RequestRootExtension, RequestRootScope,
 };
@@ -66,6 +69,15 @@ pub(crate) const CARD_UNBOUND: [u8; 16] = [0x33; 16];
 pub(crate) const CARD_BOB: [u8; 16] = [0x34; 16];
 const RULES_READ: [u8; 16] = [0x41; 16];
 const RULES_DENY: [u8; 16] = [0x42; 16];
+const GOVERNANCE_BINDINGS: &str = "/main/api/v1/governance/bindings";
+const GOVERNANCE_CONFIRM_BATCH: &str = "/main/api/v1/governance/bindings/confirm/batch";
+const GOVERNANCE_RULE_SETS: &str = "/main/api/v1/governance/rule-sets";
+const GOVERNANCE_RULE_SET_PUBLISH: &str = "/main/api/v1/governance/rule-sets/publish";
+const CARD_OPERATOR: [u8; 16] = [0x35; 16];
+const CARD_CREATE_ONLY: [u8; 16] = [0x36; 16];
+const CARD_TARGET: [u8; 16] = [0x37; 16];
+const RULES_OPERATOR: [u8; 16] = [0x43; 16];
+const RULES_CREATE_ONLY: [u8; 16] = [0x44; 16];
 
 // memory—v1: Build one hashed version of the closed rule grammar.
 fn version_row(rule_set_id: [u8; 16], content: &[u8]) -> RuleSetVersionRow {
@@ -137,17 +149,34 @@ pub(crate) fn fixture() -> (CandidateRows, Vec<CurrentSelection>) {
         ],
         rule_sets: vec![
             RuleSetRow {
+                status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
                 rule_set_id: RULES_READ,
                 owner_tenant_id: TENANT,
-                current_version_bytes: Vec::new(),
+                current_version_bytes: vec![1],
             },
             RuleSetRow {
+                status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
                 rule_set_id: RULES_DENY,
                 owner_tenant_id: TENANT,
-                current_version_bytes: Vec::new(),
+                current_version_bytes: vec![1],
             },
         ],
         rule_set_versions: vec![version_row(RULES_READ, read), version_row(RULES_DENY, deny)],
+        rule_set_change_confirmations: [RULES_READ, RULES_DENY]
+            .into_iter()
+            .enumerate()
+            .map(|(index, rule_set_id)| RuleSetChangeConfirmationRow {
+                confirmation_id: [0x90 + index as u8; 16],
+                rule_set_id,
+                version_bytes: vec![1],
+                confirmer_user_id: BOB,
+                affected_scope_bytes: vec![1],
+                operation_id: vec![1],
+                confirmed_at_bytes: vec![1],
+                revoked_at: None,
+                revoked_by: None,
+            })
+            .collect(),
         bindings: bindings
             .iter()
             .map(
@@ -180,7 +209,6 @@ pub(crate) fn fixture() -> (CandidateRows, Vec<CurrentSelection>) {
                 revoked_by: None,
             })
             .collect(),
-        ..CandidateRows::default()
     };
     let selections = [RULES_READ, RULES_DENY]
         .into_iter()
@@ -355,6 +383,649 @@ async fn send(router: &Router, credential: Option<&str>) -> (StatusCode, serde_j
     send_to(router, "GET", REGISTRY, credential).await
 }
 
+// memory—v1: Construct distinct operator cards for compound governance actions.
+fn governance_fixture() -> (CandidateRows, Vec<CurrentSelection>) {
+    let (mut rows, mut selections) = fixture();
+    let compound = br#"{"rules":[{"ruleId":"create","resource":"binding","action":"create","effect":"ALLOW","ownerScope":"all"},{"ruleId":"confirm","resource":"binding","action":"confirm","effect":"ALLOW","ownerScope":"all"},{"ruleId":"create-set","resource":"rule_set","action":"create","effect":"ALLOW","ownerScope":"all"},{"ruleId":"publish-set","resource":"rule_set","action":"version-publish","effect":"ALLOW","ownerScope":"all"},{"ruleId":"confirm-change","resource":"rule_set","action":"confirm-change","effect":"ALLOW","ownerScope":"all"}]}"#;
+    let create_only = br#"{"rules":[{"ruleId":"create","resource":"binding","action":"create","effect":"ALLOW","ownerScope":"all"},{"ruleId":"create-set","resource":"rule_set","action":"create","effect":"ALLOW","ownerScope":"all"},{"ruleId":"publish-set","resource":"rule_set","action":"version-publish","effect":"ALLOW","ownerScope":"all"}]}"#;
+    for (index, (card_id, rule_set_id, content)) in [
+        (CARD_OPERATOR, RULES_OPERATOR, compound.as_slice()),
+        (CARD_CREATE_ONLY, RULES_CREATE_ONLY, create_only.as_slice()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let binding_id = [0xa0 + index as u8; 16];
+        rows.user_cards.push(UserCardRow {
+            user_card_id: card_id,
+            user_id: ALICE,
+            tenant_id: TENANT,
+            status: UserCardStatus::Active,
+        });
+        rows.rule_sets.push(RuleSetRow {
+            status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
+            rule_set_id,
+            owner_tenant_id: TENANT,
+            current_version_bytes: vec![1],
+        });
+        rows.rule_set_versions
+            .push(version_row(rule_set_id, content));
+        rows.rule_set_change_confirmations
+            .push(RuleSetChangeConfirmationRow {
+                confirmation_id: [0xa4 + index as u8; 16],
+                rule_set_id,
+                version_bytes: vec![1],
+                confirmer_user_id: BOB,
+                affected_scope_bytes: vec![1],
+                operation_id: vec![1],
+                confirmed_at_bytes: vec![1],
+                revoked_at: None,
+                revoked_by: None,
+            });
+        rows.bindings.push(BindingRow {
+            binding_id,
+            user_card_id: card_id,
+            rule_set_id,
+            binding_layer: BindingLayer::Base,
+            valid_from: None,
+            valid_until: None,
+            owner_scope: MemoryV1OwnerScope::AllUsers,
+            tenant_scope: MemoryV1TenantScope::SelfTenant,
+            removed_at: None,
+            removed_by: None,
+        });
+        rows.binding_confirmations.push(BindingConfirmationRow {
+            confirmation_id: [0xa2 + index as u8; 16],
+            binding_id,
+            rule_set_id,
+            version_bytes: vec![1],
+            confirmer_user_id: BOB,
+            scope_bytes: vec![1],
+            operation_id: vec![1],
+            confirmed_at_bytes: vec![1],
+            revoked_at: None,
+            revoked_by: None,
+        });
+        selections.push(CurrentSelection {
+            rule_set_id,
+            version_bytes: vec![1],
+        });
+    }
+    rows.user_cards.push(UserCardRow {
+        user_card_id: CARD_TARGET,
+        user_id: BOB,
+        tenant_id: TENANT,
+        status: UserCardStatus::Active,
+    });
+    // memory—v1: A withdrawn confirmation lets the batch exercise a genuine
+    // reconfirmation target without changing the operator's own bindings.
+    let withdrawn = rows
+        .binding_confirmations
+        .iter_mut()
+        .find(|confirmation| confirmation.binding_id == [0x54; 16])
+        .unwrap();
+    withdrawn.revoked_at = Some(1);
+    withdrawn.revoked_by = Some(ALICE);
+    let unbound_rule_set = [0xc4; 16];
+    rows.rule_sets.push(RuleSetRow {
+        status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
+        rule_set_id: unbound_rule_set,
+        owner_tenant_id: TENANT,
+        current_version_bytes: vec![1],
+    });
+    rows.rule_set_versions
+        .push(version_row(unbound_rule_set, br#"{"rules":[]}"#));
+    rows.rule_set_change_confirmations
+        .push(RuleSetChangeConfirmationRow {
+            confirmation_id: [0xc6; 16],
+            rule_set_id: unbound_rule_set,
+            version_bytes: vec![1],
+            confirmer_user_id: BOB,
+            affected_scope_bytes: vec![1],
+            operation_id: vec![1],
+            confirmed_at_bytes: vec![1],
+            revoked_at: None,
+            revoked_by: None,
+        });
+    selections.push(CurrentSelection {
+        rule_set_id: unbound_rule_set,
+        version_bytes: vec![1],
+    });
+    (rows, selections)
+}
+
+// memory—v1: Send the exact governance body through the composed Gateway.
+async fn send_governance(
+    router: &Router,
+    path: &str,
+    credential: Option<&str>,
+    body: &serde_json::Value,
+    operation_id: &str,
+) -> (StatusCode, serde_json::Value) {
+    let (mut parts, _) = client_request("POST", path, credential).into_parts();
+    parts
+        .headers
+        .insert("content-type", "application/json".parse().unwrap());
+    parts
+        .headers
+        .insert("x-request-id", operation_id.parse().unwrap());
+    let response = router
+        .clone()
+        .oneshot(Request::from_parts(parts, Body::from(body.to_string())))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+// memory—v1: Exercise the real request chain with an acknowledged but
+// unverified confirmation authority, without opening a listener or database.
+#[test]
+fn unproven_confirmation_request_isolated_process() {
+    const CHILD: &str = "ASTRAL_MEMORY_V1_UNPROVEN_CONFIRMATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "memory_v1_composition::full_path_tests::unproven_confirmation_request_isolated_process",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(unproven_confirmation_request());
+}
+
+async fn unproven_confirmation_request() {
+    let (rows, selections) = governance_fixture();
+    let counts = rows.table_counts();
+    let owner = install_process_root(
+        rows,
+        selections,
+        CandidateBudget {
+            max_table_rows: 128,
+            max_bindings_per_read: 16,
+        },
+    )
+    .unwrap();
+    owner
+        .install_registry(&crate::memory_v1_service::registry_declarations())
+        .unwrap();
+    let captured_at_unix_seconds = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    owner
+        .adopt_experimental(
+            &ColdLoadFacts {
+                schema_contract_version: MEMORY_V1_CANDIDATE_SCHEMA_VERSION,
+                schema_fingerprint: [1; 32],
+                snapshot_counts: counts,
+                scanned_counts: counts,
+                captured_at_unix_seconds,
+            },
+            &AdoptionLimit::EXPERIMENTAL,
+        )
+        .unwrap();
+    let handle = owner.handle();
+    assert!(handle
+        .adoption_record()
+        .unwrap()
+        .unwrap()
+        .unverified
+        .contains(&AdoptionLimit::ConfirmationAuthority));
+    assert!(super::require_serving_root(&handle).is_err());
+    let before = handle.metadata().unwrap();
+    let mut config = AppConfig::default();
+    config.gateway.hmac_secret = uuid::Uuid::new_v4().to_string();
+    let engine = Arc::new(PolicyEngine::new());
+    let trustgraph = build_router(
+        build_memory_v1_offline_app_state(config.clone(), Arc::clone(&engine)),
+        RouterIntegrationConfig::disabled(),
+    );
+    let identity_slot = Arc::new(OnceLock::new());
+    let slot = Arc::clone(&identity_slot);
+    let composition = MemoryV1Composition::new(
+        owner,
+        move |session| {
+            slot.set(session).ok();
+            Router::new()
+        },
+        trustgraph,
+        config,
+    )
+    .unwrap();
+    let identity = identity_slot.get().cloned().unwrap();
+    let router = composition.router();
+    let credentials = authenticator();
+    let reader = login(
+        &identity,
+        &credentials,
+        &handle,
+        "alice",
+        "alice-secret",
+        CARD_ALLOW,
+    )
+    .await
+    .unwrap();
+    let operator = login(
+        &identity,
+        &credentials,
+        &handle,
+        "alice",
+        "alice-secret",
+        CARD_OPERATOR,
+    )
+    .await
+    .unwrap();
+
+    let (status, refusal) = send(&router, Some(&reader)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+    assert_eq!(refusal["reasonCode"], "AUTHORIZATION_CONTEXT_INVALID");
+    let id = |bytes| MemoryId::from_bytes(bytes).to_string();
+    let batch = serde_json::json!({"items": [{
+        "sequence": 0,
+        "binding_id": id([0x54; 16]),
+        "confirmation_id": id([0xd1; 16]),
+        "rule_set_id": id(RULES_READ),
+        "scope": "tenant",
+    }]});
+    let (status, refusal) = send_governance(
+        &router,
+        GOVERNANCE_CONFIRM_BATCH,
+        Some(&operator),
+        &batch,
+        "unproven-confirmation-batch",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+    assert_eq!(refusal["reasonCode"], "AUTHORIZATION_CONTEXT_INVALID");
+    assert_eq!(engine.get_stats().allow_count, 0);
+    assert_eq!(handle.metadata().unwrap(), before);
+}
+
+// memory—v1: Use real Gateway/session routing while keeping the root process isolated.
+#[test]
+fn governance_compound_authorization_isolated_process() {
+    const CHILD: &str = "ASTRAL_MEMORY_V1_GOVERNANCE_CHAIN_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "memory_v1_composition::full_path_tests::governance_compound_authorization_isolated_process",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("failed to start isolated governance chain test");
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(governance_compound_authorization());
+}
+
+// memory—v1: Action checks and root-derived targets precede the durable audit gate.
+async fn governance_compound_authorization() {
+    let (rows, selections) = governance_fixture();
+    let owner = install_process_root(
+        rows,
+        selections,
+        CandidateBudget {
+            max_table_rows: 128,
+            max_bindings_per_read: 16,
+        },
+    )
+    .unwrap();
+    owner
+        .install_registry(&crate::memory_v1_service::registry_declarations())
+        .unwrap();
+    owner.adopt_serving_for_isolated_tests().unwrap();
+    let handle = owner.handle();
+    let mut config = AppConfig::default();
+    config.gateway.hmac_secret = uuid::Uuid::new_v4().to_string();
+    let engine = Arc::new(PolicyEngine::new());
+    let trustgraph = build_router(
+        build_memory_v1_offline_app_state(config.clone(), Arc::clone(&engine)),
+        RouterIntegrationConfig::disabled(),
+    );
+    let identity_slot = Arc::new(OnceLock::new());
+    let slot = Arc::clone(&identity_slot);
+    let composition = MemoryV1Composition::new(
+        owner,
+        move |session| {
+            slot.set(session).ok();
+            Router::new()
+        },
+        trustgraph,
+        config,
+    )
+    .expect("composition binds the session authority");
+    let identity = identity_slot.get().cloned().unwrap();
+    let router = composition.router();
+    let credentials = authenticator();
+    let operator = login(
+        &identity,
+        &credentials,
+        &handle,
+        "alice",
+        "alice-secret",
+        CARD_OPERATOR,
+    )
+    .await
+    .unwrap();
+    let create_only = login(
+        &identity,
+        &credentials,
+        &handle,
+        "alice",
+        "alice-secret",
+        CARD_CREATE_ONLY,
+    )
+    .await
+    .unwrap();
+    let id = |bytes| MemoryId::from_bytes(bytes).to_string();
+    let mut body = serde_json::json!({
+        "binding_id": id([0xb1; 16]),
+        "user_card_id": id(CARD_BOB),
+        "rule_set_id": id(RULES_READ),
+        "binding_layer": "BASE",
+        "confirmation_id": id([0xb2; 16]),
+        "confirmation_scope": "self",
+    });
+    let before = handle.metadata().unwrap();
+
+    let (status, _) = send_governance(
+        &router,
+        GOVERNANCE_BINDINGS,
+        None,
+        &body,
+        "governance-unauthenticated",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(engine.get_stats().evaluation_count, 0);
+
+    let (status, refusal) = send_governance(
+        &router,
+        GOVERNANCE_BINDINGS,
+        Some(&create_only),
+        &body,
+        "governance-missing-confirm",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+    assert_eq!(refusal["decision"], "AUTHORIZATION_NO_MATCH");
+    assert_eq!(refusal["reasonCode"], "AUTHORIZATION_AUDIT_UNAVAILABLE");
+    assert_eq!(engine.get_stats().evaluation_count, 1);
+
+    let (status, refusal) = send_governance(
+        &router,
+        GOVERNANCE_BINDINGS,
+        Some(&operator),
+        &body,
+        "governance-audit-unavailable",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+    assert_eq!(refusal["reasonCode"], "AUTHORIZATION_PENDING");
+    assert_eq!(engine.get_stats().evaluation_count, 2);
+    assert_eq!(handle.metadata().unwrap(), before);
+
+    body["user_card_id"] = id(CARD_OPERATOR).into();
+    body["target_owner"] = id(BOB).into();
+    body["target_tenant"] = id(TENANT).into();
+    let (status, refusal) = send_governance(
+        &router,
+        GOVERNANCE_BINDINGS,
+        Some(&operator),
+        &body,
+        "governance-forged-owner",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+    assert_eq!(refusal["decision"], "AUTHORIZATION_NO_MATCH");
+    assert_eq!(refusal["reasonCode"], "AUTHORIZATION_AUDIT_UNAVAILABLE");
+    assert_eq!(engine.get_stats().evaluation_count, 3);
+    assert_eq!(handle.metadata().unwrap(), before);
+
+    body.as_object_mut().unwrap().remove("target_owner");
+    body.as_object_mut().unwrap().remove("target_tenant");
+    body["user_card_id"] = id(CARD_TARGET).into();
+    body["binding_layer"] = "OVERLAY".into();
+    let (status, refusal) = send_governance(
+        &router,
+        GOVERNANCE_BINDINGS,
+        Some(&operator),
+        &body,
+        "governance-overlay-only",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+    assert_eq!(refusal["decision"], "AUTHORIZATION_NO_MATCH");
+    assert_eq!(refusal["reasonCode"], "AUTHORIZATION_AUDIT_UNAVAILABLE");
+    assert_eq!(engine.get_stats().evaluation_count, 4);
+    assert_eq!(handle.metadata().unwrap(), before);
+
+    let rule_set_body = serde_json::json!({
+        "rule_set_id": id([0xc1; 16]),
+        "owner_tenant_id": id(TENANT),
+        "content": "{\"rules\":[]}",
+        "version_bytes": "v1",
+        "change_confirmation_id": id([0xc2; 16]),
+        "affected_scope": "tenant",
+    });
+    let (status, refusal) = send_governance(
+        &router,
+        GOVERNANCE_RULE_SETS,
+        Some(&create_only),
+        &rule_set_body,
+        "governance-rule-set-missing-confirm-change",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+    assert_eq!(refusal["decision"], "AUTHORIZATION_NO_MATCH");
+    assert_eq!(refusal["reasonCode"], "AUTHORIZATION_AUDIT_UNAVAILABLE");
+    assert_eq!(engine.get_stats().evaluation_count, 5);
+    assert_eq!(handle.metadata().unwrap(), before);
+
+    let (status, refusal) = send_governance(
+        &router,
+        GOVERNANCE_RULE_SETS,
+        Some(&operator),
+        &rule_set_body,
+        "governance-rule-set-audit-unavailable",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+    assert_eq!(refusal["reasonCode"], "AUTHORIZATION_PENDING");
+    assert_eq!(engine.get_stats().evaluation_count, 6);
+    assert_eq!(handle.metadata().unwrap(), before);
+
+    let mut publish_body = serde_json::json!({
+        "rule_set_id": id([0xc4; 16]),
+        "content": "{\"rules\":[]}",
+        "version_bytes": "v2",
+        "change_confirmation_id": id([0xc3; 16]),
+        "affected_scope": "tenant",
+    });
+    let (status, refusal) = send_governance(
+        &router,
+        GOVERNANCE_RULE_SET_PUBLISH,
+        Some(&create_only),
+        &publish_body,
+        "governance-publish-missing-confirm-change",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+    assert_eq!(refusal["decision"], "AUTHORIZATION_NO_MATCH");
+    assert_eq!(refusal["reasonCode"], "AUTHORIZATION_AUDIT_UNAVAILABLE");
+    assert_eq!(engine.get_stats().evaluation_count, 7);
+    assert_eq!(handle.metadata().unwrap(), before);
+
+    publish_body["rule_set_id"] = id(RULES_CREATE_ONLY).into();
+    let (status, refusal) = send_governance(
+        &router,
+        GOVERNANCE_RULE_SET_PUBLISH,
+        Some(&operator),
+        &publish_body,
+        "governance-publish-self-confirmation",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+    assert_eq!(refusal["decision"], "AUTHORIZATION_NO_MATCH");
+    assert_eq!(refusal["reasonCode"], "AUTHORIZATION_AUDIT_UNAVAILABLE");
+    assert_eq!(engine.get_stats().evaluation_count, 8);
+    assert_eq!(handle.metadata().unwrap(), before);
+
+    let allows_before_publish = engine.get_stats().allow_count;
+    let unbound_publish_body = serde_json::json!({
+        "rule_set_id": id([0xc4; 16]),
+        "content": "{\"rules\":[]}",
+        "version_bytes": "v2",
+        "change_confirmation_id": id([0xc5; 16]),
+        "affected_scope": "tenant",
+    });
+    let (status, refusal) = send_governance(
+        &router,
+        GOVERNANCE_RULE_SET_PUBLISH,
+        Some(&operator),
+        &unbound_publish_body,
+        "governance-publish-audit-unavailable",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+    assert_eq!(refusal["reasonCode"], "AUTHORIZATION_PENDING");
+    assert_eq!(engine.get_stats().evaluation_count, 9);
+    assert_eq!(engine.get_stats().allow_count, allows_before_publish + 1);
+    assert_eq!(handle.metadata().unwrap(), before);
+
+    let batch_item = |sequence, binding_id, rule_set_id, confirmation_id| {
+        serde_json::json!({
+            "sequence": sequence,
+            "binding_id": id(binding_id),
+            "confirmation_id": id(confirmation_id),
+            "rule_set_id": id(rule_set_id),
+            "scope": "tenant",
+        })
+    };
+    let allowed_item = batch_item(0, [0x54; 16], RULES_READ, [0xd1; 16]);
+    let self_item = batch_item(0, [0xa0; 16], RULES_OPERATOR, [0xd2; 16]);
+    let unknown_item = batch_item(0, [0xdf; 16], RULES_READ, [0xd3; 16]);
+    let request_batch = |items: Vec<serde_json::Value>| serde_json::json!({"items": items});
+
+    let (status, _) = send_governance(
+        &router,
+        GOVERNANCE_CONFIRM_BATCH,
+        None,
+        &request_batch(vec![allowed_item.clone()]),
+        "batch-unauthenticated",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(engine.get_stats().evaluation_count, 9);
+
+    let (status, refusal) = send_governance(
+        &router,
+        GOVERNANCE_CONFIRM_BATCH,
+        Some(&operator),
+        &request_batch(vec![allowed_item.clone()]),
+        "batch-audit-unavailable",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+    assert_eq!(refusal["reasonCode"], "AUTHORIZATION_PENDING");
+    assert_eq!(engine.get_stats().evaluation_count, 10);
+    assert_eq!(handle.metadata().unwrap(), before);
+
+    for (index, mut items) in [
+        vec![self_item.clone(), unknown_item.clone()],
+        vec![unknown_item.clone(), self_item.clone()],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (sequence, item) in items.iter_mut().enumerate() {
+            item["sequence"] = sequence.into();
+        }
+        let (status, refusal) = send_governance(
+            &router,
+            GOVERNANCE_CONFIRM_BATCH,
+            Some(&operator),
+            &request_batch(items),
+            &format!("batch-self-unknown-{index}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+        assert_eq!(refusal["decision"], "AUTHORIZATION_NO_MATCH");
+        assert_eq!(refusal["reasonCode"], "AUTHORIZATION_AUDIT_UNAVAILABLE");
+        assert_eq!(handle.metadata().unwrap(), before);
+    }
+    for (index, mut items) in [
+        vec![allowed_item.clone(), unknown_item.clone()],
+        vec![unknown_item.clone(), allowed_item.clone()],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (sequence, item) in items.iter_mut().enumerate() {
+            item["sequence"] = sequence.into();
+        }
+        let (status, refusal) = send_governance(
+            &router,
+            GOVERNANCE_CONFIRM_BATCH,
+            Some(&operator),
+            &request_batch(items),
+            &format!("batch-valid-unknown-{index}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refusal}");
+        assert_eq!(refusal["reasonCode"], "AUTHORIZATION_CONTEXT_INVALID");
+        assert_eq!(handle.metadata().unwrap(), before);
+    }
+    let (status, _) = send_governance(
+        &router,
+        GOVERNANCE_CONFIRM_BATCH,
+        Some(&operator),
+        &serde_json::json!({"items": [allowed_item], "unexpected": true}),
+        "batch-invalid-body",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(engine.get_stats().evaluation_count, 14);
+    assert_eq!(handle.metadata().unwrap(), before);
+    assert_eq!(composition.request_scope_budget().active(), 0);
+}
+
 // memory—v1: Install the one process root in a child process, then run the lifecycle.
 #[test]
 fn full_path_lifecycle_request_isolated_process() {
@@ -397,6 +1068,9 @@ async fn full_path_lifecycle() {
         },
     )
     .unwrap();
+    owner
+        .install_registry(&crate::memory_v1_service::registry_declarations())
+        .unwrap();
     let handle = owner.handle();
     let mut config = AppConfig::default();
     config.gateway.hmac_secret = uuid::Uuid::new_v4().to_string();
@@ -420,7 +1094,8 @@ async fn full_path_lifecycle() {
         },
         trustgraph,
         config,
-    );
+    )
+    .expect("composition binds the session authority");
     let identity: Arc<MemoryV1IdentitySession> = identity_slot
         .get()
         .cloned()
@@ -450,15 +1125,7 @@ async fn full_path_lifecycle() {
         .adopt_serving_for_isolated_tests()
         .unwrap();
     assert_eq!(serving.status, RootStatus::Serving);
-    // memory—v1 §4.9: the composition installs the aggregated registry before
-    // any formal evaluation; an uninstalled registry refuses deterministically.
-    composition
-        ._root
-        .install_registry(&[RegistryDeclaration {
-            resource: "permission_rule".to_owned(),
-            actions: vec!["read".to_owned()],
-        }])
-        .unwrap();
+    assert!(super::require_serving_root(&handle).is_err());
 
     // 3. Identity checks the credential, then the dual-card relationship, first.
     assert_eq!(
@@ -512,12 +1179,50 @@ async fn full_path_lifecycle() {
     let (status, body) = send(&router, Some(&alice)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["success"], true, "{body}");
-    assert!(
-        body["data"].as_array().is_some_and(|entries| entries
-            .iter()
-            .any(|entry| entry["resourceType"] == "permission_rule")),
-        "the real registry handler ran: {body}"
+    let entries = body["data"].as_array().expect("registry entries");
+    let active: std::collections::BTreeMap<_, _> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry["resourceType"].as_str().expect("resourceType"),
+                entry["actions"]
+                    .as_array()
+                    .expect("actions")
+                    .iter()
+                    .map(|action| action.as_str().expect("action"))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        active.len(),
+        4,
+        "the root route registry is the only catalog"
     );
+    assert_eq!(active["permission_rule"], ["read"]);
+    assert_eq!(
+        active["binding"],
+        [
+            "confirm",
+            "create",
+            "create-overlay-only",
+            "remove",
+            "revoke-confirmation"
+        ]
+    );
+    assert_eq!(
+        active["rule_set"],
+        ["confirm-change", "create", "retire", "version-publish"]
+    );
+    assert_eq!(active["user_card"], ["create", "disable", "enable"]);
+    assert!(
+        !active.contains_key("organization"),
+        "legacy global catalog leaked"
+    );
+    assert!(entries.iter().all(
+        |entry| entry["supportedConditions"] == serde_json::json!([])
+            && entry["description"].is_null()
+    ));
     let stats = engine.get_stats();
     assert_eq!((stats.evaluation_count, stats.allow_count), (1, 1));
     let first = observations
@@ -570,8 +1275,9 @@ async fn full_path_lifecycle() {
     .await
     .unwrap();
     let (status, body) = send(&router, Some(&overlay)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["reasonCode"], "AUTHORIZATION_RULE_DENIED");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["decision"], "AUTHORIZATION_RULE_DENIED");
+    assert_eq!(body["reasonCode"], "AUTHORIZATION_AUDIT_UNAVAILABLE");
     let unbound = login(
         &identity,
         &credentials,
@@ -583,7 +1289,9 @@ async fn full_path_lifecycle() {
     .await
     .unwrap();
     let (status, body) = send(&router, Some(&unbound)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["decision"], "AUTHORIZATION_CARD_UNBOUND");
+    assert_eq!(body["reasonCode"], "AUTHORIZATION_AUDIT_UNAVAILABLE");
     let bob = login(
         &identity,
         &credentials,

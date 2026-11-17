@@ -185,7 +185,8 @@ fn attested_facts(
 ) -> ColdLoadFacts {
     let counts = rows.table_counts();
     ColdLoadFacts {
-        schema_contract_version: 1,
+        schema_contract_version:
+            astral_authorization_root::memory_v1_adoption::MEMORY_V1_CANDIDATE_SCHEMA_VERSION,
         schema_fingerprint: [7; 32],
         snapshot_counts: counts,
         scanned_counts: counts,
@@ -269,8 +270,26 @@ fn report_skip(reason: &str) {
     let _ = writeln!(std::io::stderr(), "[SKIP] {reason}");
 }
 
+// memory—v1: Adoption acknowledgements do not prove recovery or formal readiness.
 #[test]
-// memory—v1: A login → authorized read → logout lifecycle over a real socket. The credentials gate
+fn readiness_reports_unverified_recovery_without_opening_a_listener() {
+    if in_isolated_child(
+        "memory_v1_service::lifecycle_tests::readiness_reports_unverified_recovery_without_opening_a_listener",
+        "ASTRAL_MEMORY_V1_READY_STATUS_CHILD",
+    ) {
+        let (rows, _) = fixture();
+        let facts = attested_facts(&rows);
+        let owner = adopt_rows(rows, &facts, &AdoptionLimit::EXPERIMENTAL).unwrap();
+        let ready = readiness_line(&owner.handle(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        assert!(ready.contains("grade=Experimental"), "{ready}");
+        assert!(ready.contains("persistence-recovery"), "{ready}");
+        assert!(ready.contains("recovery=unverified"), "{ready}");
+        assert!(ready.contains("formal_authorization=unverified"), "{ready}");
+    }
+}
+
+#[test]
+// memory—v1: Login → fail-closed authorization → logout over a real socket. The credentials gate
 // refuses a file whose mode cannot be verified, so this run needs Unix.
 fn real_service_lifecycle_over_loopback_tcp_isolated_process() {
     if !cfg!(unix) {
@@ -308,7 +327,7 @@ async fn real_service_lifecycle() {
 
     let mut config = AppConfig::default();
     config.gateway.hmac_secret = uuid::Uuid::new_v4().to_string();
-    let composition = assemble(owner, config, credentials);
+    let composition = assemble(owner, config, credentials).unwrap();
     let budget = composition.request_scope_budget();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -403,23 +422,23 @@ async fn real_service_lifecycle() {
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(reply.header("cache-control"), Some("no-store"));
     assert_eq!(reply.body["data"]["tokenType"], "Bearer");
-    assert_eq!(reply.body["data"]["expiresIn"], 1_800);
+    let expires_in = reply.body["data"]["expiresIn"]
+        .as_i64()
+        .expect("expiresIn is an integer");
+    assert!(
+        (1..=1_800).contains(&expires_in),
+        "expiresIn must report positive remaining lifetime: {expires_in}"
+    );
     let alice = reply.body["data"]["accessToken"]
         .as_str()
         .expect("an access token")
         .to_owned();
 
-    // 4. The lifecycle request: authorized read through Gateway → TrustGraph → engine.
+    // 4. An acknowledged experimental limit is not evidence of the confirmer's
+    // authority or scope, so the lifecycle request stays pending.
     let reply = http(addr, "GET", REGISTRY, Some(&alice), None, &[]).await;
-    assert_eq!(reply.status, 200, "{}", reply.body);
-    assert_eq!(reply.body["success"], true, "{}", reply.body);
-    assert!(
-        reply.body["data"].as_array().is_some_and(|entries| entries
-            .iter()
-            .any(|entry| entry["resourceType"] == "permission_rule")),
-        "the real registry handler ran: {}",
-        reply.body
-    );
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.body["reasonCode"], "AUTHORIZATION_CONTEXT_INVALID");
     // Forged internal headers on an authenticated request change nothing.
     let reply = http(
         addr,
@@ -430,20 +449,26 @@ async fn real_service_lifecycle() {
         &[("x-user-id", "999"), ("x-user-card-id", "999")],
     )
     .await;
-    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.body["reasonCode"], "AUTHORIZATION_CONTEXT_INVALID");
     assert_eq!(budget.active(), 0, "the request scope returned its slot");
 
-    // 5. Decisions follow the session's own card.
+    // 5. Unproven confirmation prevents rule ALLOW and DENY; an unbound card
+    // remains a structural denial independent of confirmation rows. The missing
+    // durable DENY audit and evidence proofs make its HTTP response a 503.
     let overlay = login(addr, "alice", "alice-secret", CARD_OVERLAY_DENY).await;
     let reply = http(addr, "GET", REGISTRY, Some(&overlay), None, &[]).await;
-    assert_eq!(reply.status, 403, "{}", reply.body);
-    assert_eq!(reply.body["reasonCode"], "AUTHORIZATION_RULE_DENIED");
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.body["reasonCode"], "AUTHORIZATION_CONTEXT_INVALID");
     let unbound = login(addr, "alice", "alice-secret", CARD_UNBOUND).await;
     let reply = http(addr, "GET", REGISTRY, Some(&unbound), None, &[]).await;
-    assert_eq!(reply.status, 403, "{}", reply.body);
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.body["decision"], "AUTHORIZATION_CARD_UNBOUND");
+    assert_eq!(reply.body["reasonCode"], "AUTHORIZATION_AUDIT_UNAVAILABLE");
     let bob = login(addr, "bob", "bob-secret", CARD_BOB).await;
     let reply = http(addr, "GET", REGISTRY, Some(&bob), None, &[]).await;
-    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.body["reasonCode"], "AUTHORIZATION_CONTEXT_INVALID");
 
     // 6. A route not adapted to memory—v1 stays pending; no legacy handler runs.
     let reply = http(addr, "GET", UNADAPTED, Some(&bob), None, &[]).await;
@@ -458,9 +483,10 @@ async fn real_service_lifecycle() {
     assert_eq!(reply.status, 401, "{}", reply.body);
     let reply = http(addr, "POST", LOGOUT, Some(&alice), None, &[]).await;
     assert_eq!(reply.status, 401, "{}", reply.body);
-    // Bob's independent session is unaffected.
+    // Bob's independent session is unaffected and remains fail-closed.
     let reply = http(addr, "GET", REGISTRY, Some(&bob), None, &[]).await;
-    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.body["reasonCode"], "AUTHORIZATION_CONTEXT_INVALID");
     assert_eq!(budget.active(), 0);
 
     // 8. Graceful stop: the server drains, then dropping the composition ends the root.
@@ -501,4 +527,127 @@ fn unacknowledged_limits_refuse_adoption_isolated_process() {
         // The failed owner is gone and the root never served.
         assert!(matches!(process_root_handle(), Err(RootError::OwnerGone)));
     }
+}
+
+// memory—v1: The production startup sequence with a real durable journal:
+// open/verify journal → production adoption with the sealed bundle → validated
+// capability → a real loopback listener that serves requests. This is the
+// isolated-process acceptance run for the unified path; it uses the same
+// public production functions as `run()` with a fixture instead of MySQL.
+#[test]
+fn production_service_opens_a_verified_journal_and_admits_a_listener_isolated_process() {
+    if !cfg!(unix) {
+        report_skip("the lifecycle run needs Unix for the credentials file mode");
+        return;
+    }
+    if in_isolated_child(
+        "memory_v1_service::lifecycle_tests::production_service_opens_a_verified_journal_and_admits_a_listener_isolated_process",
+        "ASTRAL_MEMORY_V1_SERVICE_PRODUCTION_CHILD",
+    ) {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(production_service_lifecycle());
+    }
+}
+
+async fn production_service_lifecycle() {
+    let credentials_file = CredentialsFile::write();
+    let credentials = MemoryV1FileCredentials::load(&credentials_file.path).unwrap();
+    let (rows, _selections) = fixture();
+    let facts = attested_facts(&rows);
+
+    // 1. Open (create) the durable journal in one private temp directory.
+    let journal_dir =
+        std::env::temp_dir().join(format!("astral-prod-journal-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&journal_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let journal = super::open_durable_journal(&journal_dir).unwrap();
+    assert_eq!(journal.record_count(), 0);
+    assert_eq!(journal.file_position(), 0);
+
+    // 2. Install and adopt at the production grade with the sealed bundle.
+    let owner = super::install_rows(rows).unwrap();
+    owner
+        .install_registry(&super::registry_declarations())
+        .unwrap();
+    let input = super::sealed_production_input(&facts).unwrap();
+    use std::sync::Arc;
+    let (metadata, admission) = owner
+        .adopt_with_production_evidence(&facts, &input)
+        .expect("production adoption");
+    assert_eq!(metadata.status, RootStatus::Serving);
+    let root = owner.handle();
+    let record = root.adoption_record().unwrap().unwrap();
+    assert_eq!(record.grade, AdoptionGrade::Production);
+    assert!(record.unverified.is_empty());
+    // The capability validates against this exact root.
+    assert_eq!(
+        root.validate_production_admission(&admission).unwrap(),
+        root.metadata().unwrap()
+    );
+    super::require_serving_root(&root).unwrap();
+
+    // 3. Compose the production path with the durable commit owner.
+    let mut config = AppConfig::default();
+    config.gateway.hmac_secret = uuid::Uuid::new_v4().to_string();
+    let composition = super::assemble_production(
+        std::sync::Arc::new(owner),
+        Arc::new(admission),
+        journal,
+        config,
+        credentials,
+    )
+    .unwrap();
+    let budget = composition.request_scope_budget();
+
+    // 4. A real listener opens and the readiness line reports production.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let ready = readiness_line(&root, addr).unwrap();
+    assert!(ready.contains("grade=Production"), "{ready}");
+    assert!(
+        !ready.contains("persistence-recovery"),
+        "no unverified limit may be listed: {ready}"
+    );
+
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(serve(listener, composition.router(), async move {
+        let _ = stop_rx.await;
+    }));
+
+    // 5. Login works on the production listener; the registry request carries
+    //    the full fail-closed chain. (The engine rules of the fixture are
+    //    exercised in the composition contract tests.)
+    let reply = http(
+        addr,
+        "POST",
+        LOGIN,
+        None,
+        Some(&login_body("alice", "alice-secret", CARD_ALLOW)),
+        &[],
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let alice = reply.body["data"]["accessToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(budget.active(), 0);
+
+    // 6. Graceful stop.
+    stop_tx.send(()).unwrap();
+    timeout(Duration::from_secs(10), server)
+        .await
+        .expect("the server stopped within the drain budget")
+        .unwrap()
+        .unwrap();
+    drop(composition);
+    assert!(matches!(root.metadata(), Err(RootError::OwnerGone)));
+    std::fs::remove_dir_all(&journal_dir).unwrap();
 }

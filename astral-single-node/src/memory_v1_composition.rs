@@ -3,16 +3,18 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use astral_authorization_root::memory_v1_adoption::AdoptionGrade;
 use astral_authorization_root::memory_v1_db_rows::CurrentSelection;
 use astral_authorization_root::memory_v1_hamt::CandidateBudget;
 use astral_authorization_root::memory_v1_request::RequestRootBudget;
 use astral_authorization_root::memory_v1_root::{
-    install_process_root, RootError, RootHandle, RootOwner, RootStatus,
+    install_process_root, ProductionAdmission, RootError, RootHandle, RootOwner, RootStatus,
 };
 use astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthority;
 use astral_common::config::AppConfig;
 use astral_db::memory_v1_candidate_loader::{CandidateCaptureError, UnverifiedCandidateRows};
 use astral_gateway::proxy::DEFAULT_MAX_ACTIVE_REQUEST_SCOPES;
+use astral_identity::memory_v1_service::MemoryV1FileCredentials;
 use astral_identity::MemoryV1IdentitySession;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -72,6 +74,63 @@ pub(crate) fn install_captured_candidate(
     })
 }
 
+use astral_single_node::memory_v1_durable_journal::MemoryV1DurableJournal;
+
+fn trustgraph_with_commit_port(
+    config: AppConfig,
+    commit_port: Arc<
+        dyn astral_trustgraph::service::memory_v1_governance_commit::MemoryV1GovernanceCommitPort,
+    >,
+    deny_port: Arc<
+        dyn astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofPort,
+    >,
+) -> Router {
+    // The TrustGraph state carries both durable owners: the commit port for
+    // the governance routes and the deny port for the permission middleware's
+    // 403 gate. Both are the same journal-backed owner.
+    astral_trustgraph::build_router(
+        astral_trustgraph::build_memory_v1_offline_app_state_with_commit(
+            config,
+            Arc::new(policy_engine::PolicyEngine::new()),
+            commit_port,
+            deny_port,
+        ),
+        astral_trustgraph::RouterIntegrationConfig::disabled(),
+    )
+}
+
+/// The listener/request gate carries either the explicitly isolated candidate mode
+/// or a root-owned production capability. A production caller cannot select the
+/// experimental variant after construction because this enum is private.
+#[derive(Clone)]
+enum RootAdmission {
+    Experimental {
+        root: RootHandle,
+    },
+    Production {
+        root: RootHandle,
+        admission: Arc<ProductionAdmission>,
+    },
+}
+
+impl RootAdmission {
+    fn root(&self) -> &RootHandle {
+        match self {
+            Self::Experimental { root } | Self::Production { root, .. } => root,
+        }
+    }
+
+    /// memory—v1: Validate the root-owned capability without exposing its fields.
+    fn validate(&self) -> Result<(), RootError> {
+        match self {
+            Self::Experimental { root } => root.metadata().map(|_| ()),
+            Self::Production { root, admission } => {
+                root.validate_production_admission(admission).map(|_| ())
+            }
+        }
+    }
+}
+
 /// Owns the already installed root for the lifetime of an in-process router.
 ///
 /// This candidate does not start services or establish readiness. Before any
@@ -79,8 +138,12 @@ pub(crate) fn install_captured_candidate(
 /// that every trusted consumer uses this same root, and pass the existing
 /// readiness gates. Shut down and drain consumers before dropping this owner.
 pub(crate) struct MemoryV1Composition {
-    _root: RootOwner,
-    _session_authority: MemoryV1SessionAuthority,
+    _root: Arc<RootOwner>,
+    _journal: Option<MemoryV1DurableJournal>,
+    /// Validated on every request through the middleware state clone.
+    #[allow(dead_code)]
+    admission: RootAdmission,
+    _session_authority: Arc<MemoryV1SessionAuthority>,
     request_scopes: RequestRootBudget,
     router: Router,
 }
@@ -91,20 +154,204 @@ impl MemoryV1Composition {
     /// creates the authority, so the caller cannot accidentally build a second
     /// authority before the Identity-owned capability is injected. Every Gateway
     /// request scope is admitted through one composition-owned budget.
+    #[cfg(test)]
     pub(crate) fn new<F>(
         root: RootOwner,
         build_identity: F,
         trustgraph: Router,
         config: AppConfig,
-    ) -> Self
+    ) -> Result<
+        Self,
+        astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthorityError,
+    >
     where
         F: FnOnce(Arc<MemoryV1IdentitySession>) -> Router,
     {
-        let handle = root.handle();
+        let root_handle = root.handle();
+        Self::assemble(
+            Arc::new(root),
+            RootAdmission::Experimental { root: root_handle },
+            |adapter| Arc::new(MemoryV1IdentitySession::from_session_adapter(adapter)),
+            build_identity,
+            trustgraph,
+            config,
+        )
+    }
+
+    /// memory—v1: Assemble a configured Identity from one concrete immutable
+    /// FileCredentials snapshot. The same Arc is retained by the session and
+    /// supplied to the Identity router factory; Gateway receives only verifier.
+    pub(crate) fn new_with_file_credentials<F>(
+        root: RootOwner,
+        credentials: Arc<MemoryV1FileCredentials>,
+        build_identity: F,
+        trustgraph: Router,
+        config: AppConfig,
+        session_lifetime_seconds: i64,
+    ) -> Result<
+        Self,
+        astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthorityError,
+    >
+    where
+        F: FnOnce(Arc<MemoryV1IdentitySession>) -> Router,
+    {
+        let admission = RootAdmission::Experimental {
+            root: root.handle(),
+        };
+        Self::assemble(
+            Arc::new(root),
+            admission,
+            move |adapter| {
+                Arc::new(
+                    MemoryV1IdentitySession::from_session_adapter_with_file_credentials(
+                        adapter,
+                        credentials,
+                        session_lifetime_seconds,
+                    ),
+                )
+            },
+            build_identity,
+            trustgraph,
+            config,
+        )
+    }
+
+    /// memory—v1: Assemble a configured Identity from one production admission
+    /// issued by the root owner, with the durable governance owner injected as
+    /// the TrustGraph commit port. The capability is checked before any
+    /// consumer receives the session authority and is retained for the
+    /// composition lifetime; the journal and the root writer are kept alive by
+    /// the same owner.
+    pub(crate) fn new_with_file_credentials_production<F>(
+        root: Arc<RootOwner>,
+        admission: Arc<ProductionAdmission>,
+        journal: MemoryV1DurableJournal,
+        credentials: Arc<MemoryV1FileCredentials>,
+        build_identity: F,
+        config: AppConfig,
+        session_lifetime_seconds: i64,
+    ) -> anyhow::Result<Self>
+    where
+        F: FnOnce(Arc<MemoryV1IdentitySession>) -> Router,
+    {
+        root.validate_production_admission(admission.as_ref())
+            .map_err(|error| anyhow!("memory-v1 production admission: {error}"))?;
+        let root_handle = root.handle();
+        // The writer shares the composition's root owner through the same Arc
+        // so both keep the same runtime alive; the commit owner wraps the
+        // writer and the journal as the only serving-root mutation path.
+        let root = root;
         let session_authority = MemoryV1SessionAuthority::new();
-        let identity_session = Arc::new(MemoryV1IdentitySession::from_session_adapter(
-            session_authority.identity_session_adapter(),
-        ));
+        // The same binding text as the experimental assemble; the guard
+        // test asserts this ordering for every constructor.
+        session_authority.bind_to_root(&root)?;
+        let mut writer = astral_single_node::memory_v1_root_writer::RootMutationWriter::new(
+            Arc::clone(&root),
+            Arc::clone(&admission),
+        )
+        .map_err(|error| anyhow!("memory-v1 root writer: {error}"))?;
+        let session_authority_cell = Arc::new(session_authority);
+        writer.set_session_authority(Some(Arc::clone(&session_authority_cell)));
+        let commit_port = Arc::new(
+            astral_single_node::memory_v1_governance_owner::MemoryV1DurableCommitOwner::new(
+                journal, writer,
+            ),
+        );
+        // The durable commit port is injected through the TrustGraph offline
+        // state; the caller-supplied router parameter is not used on this
+        // production path because the commit port must be present at state
+        // construction, not layered on afterwards. The same owner implements
+        // the deny proof port, so both gates share one journal sequence.
+        let deny_port: Arc<
+            dyn astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofPort,
+        > = commit_port.clone();
+        let trustgraph = trustgraph_with_commit_port(config.clone(), commit_port, deny_port);
+        Self::assemble_with_authority(
+            root,
+            RootAdmission::Production {
+                root: root_handle,
+                admission,
+            },
+            Some(session_authority_cell),
+            move |adapter| {
+                Arc::new(
+                    MemoryV1IdentitySession::from_session_adapter_with_file_credentials(
+                        adapter,
+                        credentials,
+                        session_lifetime_seconds,
+                    ),
+                )
+            },
+            build_identity,
+            trustgraph,
+            config,
+        )
+        .map_err(|error| anyhow!("bind the memory-v1 session authority: {error}"))
+    }
+
+    fn assemble<S, F>(
+        root: impl Into<Arc<RootOwner>>,
+        admission: RootAdmission,
+        build_session: S,
+        build_identity: F,
+        trustgraph: Router,
+        config: AppConfig,
+    ) -> Result<
+        Self,
+        astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthorityError,
+    >
+    where
+        S: FnOnce(
+            astral_authorization_root::memory_v1_session_authority::MemoryV1IdentitySessionAdapter,
+        ) -> Arc<MemoryV1IdentitySession>,
+        F: FnOnce(Arc<MemoryV1IdentitySession>) -> Router,
+    {
+        Self::assemble_with_authority(
+            root,
+            admission,
+            None,
+            build_session,
+            build_identity,
+            trustgraph,
+            config,
+        )
+    }
+
+    fn assemble_with_authority<S, F>(
+        root: impl Into<Arc<RootOwner>>,
+        admission: RootAdmission,
+        provided_authority: Option<Arc<MemoryV1SessionAuthority>>,
+        build_session: S,
+        build_identity: F,
+        trustgraph: Router,
+        config: AppConfig,
+    ) -> Result<
+        Self,
+        astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthorityError,
+    >
+    where
+        S: FnOnce(
+            astral_authorization_root::memory_v1_session_authority::MemoryV1IdentitySessionAdapter,
+        ) -> Arc<MemoryV1IdentitySession>,
+        F: FnOnce(Arc<MemoryV1IdentitySession>) -> Router,
+    {
+        let root = root.into();
+        admission
+            .validate()
+            .map_err(|_| astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthorityError::Unavailable)?;
+        let handle = admission.root().clone();
+        // The production path created and bound its authority to the same
+        // root before handing it over; binding again would fail the one-time
+        // slot, so it is used as-is through the Arc.
+        let session_authority = match provided_authority {
+            Some(authority) => authority,
+            None => {
+                let authority = Arc::new(MemoryV1SessionAuthority::new());
+                authority.bind_to_root(&root)?;
+                authority
+            }
+        };
+        let identity_session = build_session(session_authority.identity_session_adapter());
         let identity = build_identity(identity_session);
         let request_scopes = RequestRootBudget::new(DEFAULT_MAX_ACTIVE_REQUEST_SCOPES);
         let router =
@@ -112,17 +359,22 @@ impl MemoryV1Composition {
                 config,
                 identity,
                 trustgraph,
-                handle.clone(),
+                handle,
                 session_authority.verifier(),
                 request_scopes.clone(),
             )
-            .layer(middleware::from_fn_with_state(handle, require_live_root));
-        Self {
+            .layer(middleware::from_fn_with_state(
+                admission.clone(),
+                require_live_admission,
+            ));
+        Ok(Self {
             _root: root,
+            _journal: None,
+            admission,
             _session_authority: session_authority,
             request_scopes,
             router,
-        }
+        })
     }
 
     /// memory—v1: Clone a router handle without extending root ownership.
@@ -139,10 +391,10 @@ impl MemoryV1Composition {
     }
 }
 
-/// memory—v1: A listener is admissible only after a verified serving root exists.
+/// memory—v1: The unified listener requires an adopted serving root.
 ///
-/// The current database capture is intentionally unverified, so this gate returns
-/// an error until a verifier-owned `AdoptionEvidence` path is wired in.
+/// Experimental adoption retains its explicit limitations; it is not production
+/// evidence. An isolated-test root must never be used to admit a listener.
 pub(crate) fn require_serving_root(root: &RootHandle) -> Result<()> {
     let metadata = root
         .metadata()
@@ -153,16 +405,24 @@ pub(crate) fn require_serving_root(root: &RootHandle) -> Result<()> {
             metadata.status
         ));
     }
-    Ok(())
+    let record = root
+        .adoption_record()
+        .map_err(|error| anyhow!("memory-v1 adoption record is unavailable: {error}"))?
+        .ok_or_else(|| anyhow!("memory-v1 serving root has no adoption record"))?;
+    match record.grade {
+        AdoptionGrade::Production if record.unverified.is_empty() => Ok(()),
+        _ => Err(anyhow!("memory-v1 adoption grade cannot admit a listener")),
+    }
 }
 
-// memory—v1: Reject requests if the composition no longer owns a readable root.
-async fn require_live_root(
-    State(root): State<RootHandle>,
+// memory—v1: The production middleware revalidates the sealed admission on every request.
+async fn require_live_admission(
+    State(admission): State<RootAdmission>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    root.metadata()
+    admission
+        .validate()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     Ok(next.run(request).await)
 }
@@ -172,6 +432,9 @@ mod tests {
     use super::{
         install_captured_candidate, require_serving_root, CandidateInstallationError,
         MemoryV1Composition,
+    };
+    use astral_authorization_root::memory_v1_adoption::{
+        AdoptionGrade, AdoptionLimit, ColdLoadFacts, MEMORY_V1_CANDIDATE_SCHEMA_VERSION,
     };
     use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
     use astral_authorization_root::memory_v1_db_rows::{
@@ -262,9 +525,10 @@ mod tests {
                     status: UserCardStatus::Active,
                 }],
                 rule_sets: vec![RuleSetRow {
+                    status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
                     rule_set_id: id(5),
                     owner_tenant_id: id(3),
-                    current_version_bytes: Vec::new(),
+                    current_version_bytes: vec![1],
                 }],
                 rule_set_versions: vec![version(1), version(2)],
                 bindings: vec![BindingRow {
@@ -415,32 +679,143 @@ mod tests {
         ));
     }
 
+    // memory—v1: Check the listener gate against real root lifecycle and adoption records
+    // in child processes, because the process-wide installation slot is one-shot.
+    #[test]
+    fn require_serving_root_gate_isolated_process() {
+        const CHILD: &str = "ASTRAL_MEMORY_V1_REQUIRE_SERVING_ROOT_CHILD";
+        const CASE: &str = "ASTRAL_MEMORY_V1_REQUIRE_SERVING_ROOT_CASE";
+        if std::env::var_os(CHILD).is_none() {
+            for scenario in ["candidate", "experimental", "isolated", "stopped"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "memory_v1_composition::tests::require_serving_root_gate_isolated_process",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env(CASE, scenario)
+                    .output()
+                    .unwrap_or_else(|error| {
+                        panic!("failed to start {scenario} serving-gate child: {error}")
+                    });
+                assert!(
+                    output.status.success(),
+                    "{scenario} serving-gate child failed: {}\nstdout: {}\nstderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "{scenario} child did not report one passing test: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+            }
+            return;
+        }
+
+        let scenario = std::env::var(CASE).expect("the isolated serving-gate case is set");
+        let (rows, selections) = super::full_path_tests::fixture();
+        let counts = rows.table_counts();
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 128,
+                max_bindings_per_read: 16,
+            },
+        )
+        .unwrap();
+        let handle = owner.handle();
+
+        match scenario.as_str() {
+            "candidate" => {
+                let metadata = handle.metadata().unwrap();
+                assert_eq!(metadata.status, RootStatus::Candidate);
+                assert_eq!(handle.adoption_record().unwrap(), None);
+                assert!(require_serving_root(&handle).is_err());
+            }
+            "experimental" => {
+                owner
+                    .install_registry(&crate::memory_v1_service::registry_declarations())
+                    .unwrap();
+                owner
+                    .adopt_experimental(
+                        &ColdLoadFacts {
+                            schema_contract_version: MEMORY_V1_CANDIDATE_SCHEMA_VERSION,
+                            schema_fingerprint: [7; 32],
+                            snapshot_counts: counts,
+                            scanned_counts: counts,
+                            captured_at_unix_seconds: 1_700_000_000,
+                        },
+                        &AdoptionLimit::EXPERIMENTAL,
+                    )
+                    .unwrap();
+                let metadata = handle.metadata().unwrap();
+                assert_eq!(metadata.status, RootStatus::Serving);
+                let record = handle.adoption_record().unwrap().unwrap();
+                assert_eq!(record.grade, AdoptionGrade::Experimental);
+                assert!(require_serving_root(&handle).is_err());
+            }
+            "isolated" => {
+                owner
+                    .install_registry(&crate::memory_v1_service::registry_declarations())
+                    .unwrap();
+                owner.adopt_serving_for_isolated_tests().unwrap();
+                let metadata = handle.metadata().unwrap();
+                assert_eq!(metadata.status, RootStatus::Serving);
+                let record = handle.adoption_record().unwrap().unwrap();
+                assert_eq!(record.grade, AdoptionGrade::IsolatedTest);
+                assert!(require_serving_root(&handle).is_err());
+            }
+            "stopped" => {
+                let metadata = handle.metadata().unwrap();
+                assert_eq!(metadata.status, RootStatus::Candidate);
+                drop(owner);
+                // RootOwner::drop publishes Stopped, then releases the only strong
+                // runtime reference; the public weak handle observes OwnerGone.
+                assert!(matches!(handle.metadata(), Err(RootError::OwnerGone)));
+                assert!(require_serving_root(&handle).is_err());
+            }
+            other => panic!("unknown serving-gate scenario: {other}"),
+        }
+    }
+
     // memory—v1: The factory receives the Identity-owned capability before the
     // Gateway receives the matching verifier; both originate from one authority.
     #[test]
     fn composition_passes_identity_capability_before_gateway_assembly() {
         let source = include_str!("memory_v1_composition.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
+        let production = source.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        // Each composition constructor creates exactly one authority: the
+        // production constructor creates and binds its own before the shared
+        // assemble runs; the experimental assemble creates one lazily. Both
+        // are one authority per composition.
         assert_eq!(
             production
                 .matches("MemoryV1SessionAuthority::new()")
                 .count(),
-            1,
-            "composition must create one session authority"
+            2,
+            "each composition constructor must create one session authority"
         );
         let authority = production
             .find("let session_authority = MemoryV1SessionAuthority::new();")
             .expect("composition must create the authority before capability distribution");
-        let identity = source
-            .find("let identity_session = Arc::new(MemoryV1IdentitySession::from_session_adapter(")
+        let binding = production
+            .find("session_authority.bind_to_root(&root)?;")
+            .expect("composition must bind the authority to the root");
+        let identity = production
+            .find("let identity_session = build_session(session_authority.identity_session_adapter());")
             .expect("composition must create the Identity-owned session boundary");
-        let identity_factory = source
+        let identity_factory = production
             .find("let identity = build_identity(identity_session);")
             .expect("composition must build Identity from the injected boundary");
-        let verifier = source
+        let verifier = production
             .find("session_authority.verifier(),")
             .expect("Gateway must receive the matching verifier");
-        assert!(authority < identity);
+        assert!(authority < binding);
+        assert!(binding < identity);
         assert!(identity < identity_factory);
         assert!(identity_factory < verifier);
     }
@@ -489,7 +864,8 @@ mod tests {
         );
         let mut config = AppConfig::default();
         config.gateway.hmac_secret = uuid::Uuid::new_v4().to_string();
-        let composition = MemoryV1Composition::new(root, |_| identity, Router::new(), config);
+        let composition = MemoryV1Composition::new(root, |_| identity, Router::new(), config)
+            .expect("composition binds the session authority");
         let router = composition.router();
         let request = || {
             Request::builder()

@@ -16,17 +16,23 @@ astral-gateway = { path = "../astral-gateway" }
 astral-identity = { path = "../astral-identity" }
 astral-mq = { path = "../astral-mq" }
 astral-trustgraph = { path = "../astral-trustgraph" }
+astral-types = { path = "../astral-types" }
+hex = { workspace = true }
+uuid = { workspace = true }
 anyhow = { workspace = true }
 policy-engine = { path = "../policy-engine" }
+sha2 = { workspace = true }
 sqlx = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 # memory—v1: the isolated full-path test adopts a fixture root through the
-# root's `test-support` hook. Dev-dependency features never reach a production
-# build of this binary under resolver 2.
+# root's `test-support` hook. Resolver 2 isolates this dev dependency from
+# ordinary production builds, not explicitly selected feature sets.
 astral-authorization-root = { path = "../astral-authorization-root", features = ["test-support"] }
+astral-trustgraph = { path = "../astral-trustgraph", features = ["test-support"] }
 astral-types = { path = "../astral-types" }
 async-trait = "0.1"
 reqwest = { workspace = true }

@@ -23,7 +23,9 @@ use astral_common::config::AppConfig;
 use astral_common::middleware::gateway_signature::{
     compute_hmac_signature_v3, InProcessGatewayIssuer,
 };
-use astral_common::middleware::permission_check_shared::AuthorizationPendingRefusal;
+use astral_common::middleware::permission_check_shared::{
+    AuthorizationAuditUnavailableRefusal, AuthorizationPendingRefusal,
+};
 use axum::Router;
 use tower::ServiceExt;
 
@@ -792,30 +794,7 @@ async fn forward_in_process(
             .oneshot(downstream)
             .await
             .expect("Router is infallible");
-        let (parts, body) = response.into_parts();
-        // memory—v1: Read the guard's mark before the rebuild below drops the extensions.
-        let guard_refusal = session_transport == SessionTransport::MemoryV1Guarded
-            && parts.status == StatusCode::SERVICE_UNAVAILABLE
-            && AuthorizationPendingRefusal::is_attached(&parts.extensions);
-        let declared_length = parts
-            .headers
-            .get(axum::http::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse().ok());
-        let mut response = finish_upstream_response(
-            &prepared,
-            parts.status,
-            parts.headers,
-            declared_length,
-            body.into_data_stream(),
-        )
-        .await;
-        // memory—v1: Only a guard-attached 503 from a memory-v1 target is exempt, and only
-        // after the dispatcher has verified the mark above.
-        if guard_refusal && response.status() == StatusCode::SERVICE_UNAVAILABLE {
-            response.extensions_mut().insert(VerifiedPendingRefusal);
-        }
-        response
+        finish_in_process_response(&prepared, response, session_transport, memory_v1_session).await
     })
     .await;
     match result {
@@ -829,6 +808,39 @@ async fn forward_in_process(
             "BAD_GATEWAY",
         ),
     }
+}
+
+// memory—v1: Inspect native guarded responses before rebuilding them. A true
+// DENY can only follow a verified session; pending may also precede session binding.
+async fn finish_in_process_response(
+    prepared: &PreparedRequest,
+    response: Response,
+    session_transport: SessionTransport,
+    memory_v1_session: bool,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let guard_refusal = session_transport == SessionTransport::MemoryV1Guarded
+        && parts.status == StatusCode::SERVICE_UNAVAILABLE
+        && (AuthorizationPendingRefusal::is_attached(&parts.extensions)
+            || (memory_v1_session
+                && AuthorizationAuditUnavailableRefusal::is_attached(&parts.extensions)));
+    let declared_length = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let mut response = finish_upstream_response(
+        prepared,
+        parts.status,
+        parts.headers,
+        declared_length,
+        body.into_data_stream(),
+    )
+    .await;
+    if guard_refusal && response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        response.extensions_mut().insert(VerifiedGuardRefusal);
+    }
+    response
 }
 
 // memory—v1: The production HTTP transport consumes the same prepared request.
@@ -899,11 +911,11 @@ fn dependency_failure(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 502..=504)
 }
 
-/// memory—v1: Attached by the gateway only, after the in-process dispatcher verified the
-/// `AuthorizationPendingRefusal` mark on a memory-v1 target's 503. Clients and HTTP
-/// upstreams cannot set it, because it is a response extension and never serialized.
+/// memory—v1: Gateway-only breaker classification after a guarded in-process
+/// 503 carries a native pending or audit-unavailable refusal extension. This
+/// conveys neither the decision nor proof that an audit was persisted.
 #[derive(Clone, Copy)]
-struct VerifiedPendingRefusal;
+struct VerifiedGuardRefusal;
 
 /// memory—v1: Settle one upstream permit from the response it produced. A verified guard
 /// refusal is a healthy answer; every other 502-504 remains an upstream failure.
@@ -915,11 +927,12 @@ fn settle(permit: RequestPermit<'_>, response: &Response) {
     }
 }
 
+// memory—v1: Only the gateway's verified guard classification bypasses failure counting.
 fn circuit_failure(response: &Response) -> bool {
     if response.status() == StatusCode::SERVICE_UNAVAILABLE
         && response
             .extensions()
-            .get::<VerifiedPendingRefusal>()
+            .get::<VerifiedGuardRefusal>()
             .is_some()
     {
         return false;
@@ -985,7 +998,7 @@ mod client_header_policy_tests {
     fn upstream_response(status: u16, verified: bool) -> Response {
         let mut response = StatusCode::from_u16(status).unwrap().into_response();
         if verified {
-            response.extensions_mut().insert(VerifiedPendingRefusal);
+            response.extensions_mut().insert(VerifiedGuardRefusal);
         }
         response
     }
@@ -1016,6 +1029,304 @@ mod client_header_policy_tests {
             settle(permit, &upstream_response(503, false));
         }
         assert!(breaker.acquire().is_none());
+    }
+
+    // memory—v1: Classify native responses at the same rebuild boundary used by
+    // dispatch, including the verified-session signal produced by the verifier.
+    #[tokio::test]
+    async fn audit_refusal_rebuild_preserves_breaker_and_response_contract() {
+        use axum::body::to_bytes;
+
+        let config = AppConfig::default();
+        let prepared = prepare_request(
+            &config,
+            "/main/api/v1/test",
+            Request::builder()
+                .uri("/main/api/v1/test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("request preparation failed"));
+        let breaker = CircuitBreaker::new();
+        for _ in 0..5 {
+            let mut native =
+                (StatusCode::SERVICE_UNAVAILABLE, "deny audit unavailable").into_response();
+            native
+                .headers_mut()
+                .insert("x-test-response", HeaderValue::from_static("preserved"));
+            AuthorizationAuditUnavailableRefusal::attach(&mut native);
+            assert!(!AuthorizationPendingRefusal::is_attached(
+                native.extensions()
+            ));
+            let response = finish_in_process_response(
+                &prepared,
+                native,
+                SessionTransport::MemoryV1Guarded,
+                true,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["x-test-response"], "preserved");
+            assert!(!circuit_failure(&response));
+            settle(breaker.acquire().unwrap(), &response);
+            assert_eq!(
+                to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+                b"deny audit unavailable"
+            );
+        }
+        assert!(breaker.acquire().is_some());
+        for _ in 0..5 {
+            let response = finish_in_process_response(
+                &prepared,
+                StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                SessionTransport::MemoryV1Guarded,
+                true,
+            )
+            .await;
+            assert!(circuit_failure(&response));
+            settle(breaker.acquire().unwrap(), &response);
+        }
+        assert!(breaker.acquire().is_none());
+
+        for (status, transport, session) in [
+            (503, SessionTransport::LegacyOnly, true),
+            (503, SessionTransport::MemoryV1Guarded, false),
+            (502, SessionTransport::MemoryV1Guarded, true),
+            (504, SessionTransport::MemoryV1Guarded, true),
+            (403, SessionTransport::MemoryV1Guarded, true),
+        ] {
+            let mut native = StatusCode::from_u16(status).unwrap().into_response();
+            AuthorizationAuditUnavailableRefusal::attach(&mut native);
+            let response = finish_in_process_response(&prepared, native, transport, session).await;
+            assert!(response
+                .extensions()
+                .get::<VerifiedGuardRefusal>()
+                .is_none());
+            assert_eq!(circuit_failure(&response), matches!(status, 502..=504));
+        }
+        let mut forged = StatusCode::SERVICE_UNAVAILABLE.into_response();
+        forged.headers_mut().insert(
+            "x-authorization-audit-unavailable-refusal",
+            HeaderValue::from_static("true"),
+        );
+        let response =
+            finish_in_process_response(&prepared, forged, SessionTransport::MemoryV1Guarded, true)
+                .await;
+        assert!(circuit_failure(&response));
+    }
+
+    // memory—v1: Exercise the signed dispatcher, native response extensions and
+    // breaker permits together without opening a listener or using a database.
+    #[tokio::test]
+    async fn guarded_audit_refusals_are_exempt_only_after_native_dispatch() {
+        use astral_authorization_root::memory_v1_db_rows::CandidateRows;
+        use astral_authorization_root::memory_v1_hamt::CandidateBudget;
+        use astral_authorization_root::memory_v1_root::install_process_root;
+        use astral_common::middleware::gateway_signature::{
+            in_process_gateway_signature_middleware, in_process_gateway_source,
+        };
+        use axum::{middleware, routing::get};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        // The process root is install-once and cannot be shared with other tests.
+        const CHILD: &str = "ASTRAL_MEMORY_V1_AUDIT_BREAKER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::proxy::client_header_policy_tests::guarded_audit_refusals_are_exempt_only_after_native_dispatch",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        let owner = install_process_root(
+            CandidateRows::default(),
+            vec![],
+            CandidateBudget {
+                max_table_rows: 16,
+                max_bindings_per_read: 4,
+            },
+        )
+        .unwrap();
+        let config = AppConfig {
+            gateway: astral_common::config::GatewayCfg {
+                hmac_secret: uuid::Uuid::new_v4().to_string(),
+                timestamp_tolerance_secs: 30,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (issuer, verifier) = in_process_gateway_source();
+        let (other_issuer, _) = in_process_gateway_source();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let handler_reached = Arc::clone(&reached);
+        let router = Router::new()
+            .route(
+                "/main/api/v1/test",
+                get(move |req: Request| {
+                    let reached = Arc::clone(&handler_reached);
+                    async move {
+                        reached.fetch_add(1, Ordering::SeqCst);
+                        let case = req.headers()["x-test-case"].to_str().unwrap();
+                        let status = match case {
+                            "marked-502" => StatusCode::BAD_GATEWAY,
+                            "marked-504" => StatusCode::GATEWAY_TIMEOUT,
+                            "marked-403" => StatusCode::FORBIDDEN,
+                            _ => StatusCode::SERVICE_UNAVAILABLE,
+                        };
+                        let mut response = (status, "unchanged").into_response();
+                        match case {
+                            "audit" | "marked-502" | "marked-504" | "marked-403"
+                            | "bad-connection" => {
+                                AuthorizationAuditUnavailableRefusal::attach(&mut response);
+                            }
+                            "pending" => AuthorizationPendingRefusal::attach(&mut response),
+                            // Simulate a peer reflecting a forged client header.
+                            "forged" => {
+                                response.headers_mut().insert(
+                                    "x-authorization-audit-unavailable-refusal",
+                                    HeaderValue::from_static("true"),
+                                );
+                            }
+                            _ => {}
+                        }
+                        if case == "bad-connection" {
+                            response
+                                .headers_mut()
+                                .insert("connection", HeaderValue::from_static("bad name"));
+                        }
+                        response
+                    }
+                }),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                (config.clone(), verifier),
+                in_process_gateway_signature_middleware,
+            ));
+        let issuer = Arc::new(issuer);
+        let targets = InProcessTargets::new(
+            Router::new(),
+            router.clone(),
+            Arc::new(in_process_gateway_source().0),
+            Arc::clone(&issuer),
+            owner.handle(),
+        );
+        let request = |case: &str| {
+            let mut req = Request::builder()
+                .uri("/main/api/v1/test")
+                .header("x-test-case", case)
+                .header("x-authorization-audit-unavailable-refusal", "true")
+                .header("x-user-id", "1")
+                .header("x-principal-kind", "PLATFORM_USER")
+                .header("x-identity-card-id", "1")
+                .header("x-user-card-id", "2")
+                .header("x-user-card-domain-id", "3")
+                .header("x-user-card-tenant-id", "4")
+                .body(Body::empty())
+                .unwrap();
+            // A request extension is also discarded before downstream dispatch.
+            req.extensions_mut()
+                .insert(AuthorizationAuditUnavailableRefusal);
+            req
+        };
+        // A sessionless request must not turn even a native audit mark into an
+        // exemption. Pending deliberately keeps its pre-session behavior.
+        for (case, transport, status, failure, verified) in [
+            (
+                "pending",
+                SessionTransport::MemoryV1Guarded,
+                503,
+                false,
+                true,
+            ),
+            ("audit", SessionTransport::MemoryV1Guarded, 503, true, false),
+            ("audit", SessionTransport::LegacyOnly, 503, true, false),
+            (
+                "marked-502",
+                SessionTransport::MemoryV1Guarded,
+                502,
+                true,
+                false,
+            ),
+            (
+                "marked-504",
+                SessionTransport::MemoryV1Guarded,
+                504,
+                true,
+                false,
+            ),
+            (
+                "marked-403",
+                SessionTransport::MemoryV1Guarded,
+                403,
+                false,
+                false,
+            ),
+            (
+                "forged",
+                SessionTransport::MemoryV1Guarded,
+                503,
+                true,
+                false,
+            ),
+            (
+                "bad-connection",
+                SessionTransport::MemoryV1Guarded,
+                502,
+                true,
+                false,
+            ),
+        ] {
+            let response = forward_in_process(
+                &config,
+                request(case),
+                &targets,
+                router.clone(),
+                &issuer,
+                transport,
+            )
+            .await;
+            assert_eq!(response.status().as_u16(), status, "{case}");
+            assert_eq!(circuit_failure(&response), failure, "{case}");
+            assert_eq!(
+                response
+                    .extensions()
+                    .get::<VerifiedGuardRefusal>()
+                    .is_some(),
+                verified,
+                "{case}"
+            );
+        }
+        assert_eq!(reached.load(Ordering::SeqCst), 8);
+        let before = reached.load(Ordering::SeqCst);
+        let rejected = forward_in_process(
+            &config,
+            request("audit"),
+            &targets,
+            router,
+            &other_issuer,
+            SessionTransport::MemoryV1Guarded,
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        assert!(rejected
+            .extensions()
+            .get::<VerifiedGuardRefusal>()
+            .is_none());
+        assert_eq!(reached.load(Ordering::SeqCst), before);
     }
 
     // memory—v1: Body and downstream share a deadline; expiry revokes the reader scope.

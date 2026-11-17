@@ -40,7 +40,7 @@ use astral_types::memory_v1::MemoryId;
 use crate::runtime::memory_v1::{
     normalize_identifier, MemoryV1CredentialAuthenticator, MemoryV1CredentialRecord,
     MemoryV1CredentialRepository, MemoryV1CredentialRepositoryError, MemoryV1CredentialStatus,
-    MemoryV1IdentitySession, MemoryV1LoginError, MemoryV1LoginRequest,
+    MemoryV1IdentitySession, MemoryV1LoginError, MemoryV1LoginInput,
 };
 
 /// The only credential-file layout this build accepts.
@@ -324,6 +324,15 @@ fn now_unix_seconds() -> Option<i64> {
     i64::try_from(elapsed.as_secs()).ok()
 }
 
+// memory—v1: Round response time up so whole-second expires_in never
+// overstates the remaining lifetime because of subsecond truncation.
+fn response_now_unix_seconds() -> Option<(i64, i64)> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    let seconds = i64::try_from(elapsed.as_secs()).ok()?;
+    let rounded_up = seconds.checked_add(i64::from(elapsed.subsec_nanos() != 0))?;
+    Some((seconds, rounded_up))
+}
+
 // memory—v1: One failure envelope with a machine-readable reason, no internals.
 fn failure(status: StatusCode, reason_code: &'static str, message: &'static str) -> Response {
     let mut body = ApiResponse::<EmptyResponse>::error(i32::from(status.as_u16()), message);
@@ -392,36 +401,66 @@ async fn login(State(state): State<AuthRouteState>, request: Request) -> Respons
             )
         }
     };
-    let Some(now) = now_unix_seconds() else {
-        return unavailable();
-    };
     match state
         .session
-        .login(
+        .login_with_clock(
             &state.authenticator,
             &root,
-            MemoryV1LoginRequest {
+            MemoryV1LoginInput {
                 identifier: &body.identifier,
                 password: &body.password,
                 user_card_id: body.user_card_id,
-                now_unix_seconds: now,
                 lifetime_seconds: state.session_lifetime_seconds,
             },
+            now_unix_seconds,
         )
         .await
     {
-        Ok(issued) => (
-            StatusCode::OK,
-            [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
-            Json(ApiResponse::success(LoginData {
-                access_token: issued.credential().to_owned(),
-                token_type: "Bearer",
-                expires_in: state.session_lifetime_seconds,
-            })),
-        )
-            .into_response(),
+        Ok((issued, issued_at)) => login_success(
+            &state.session,
+            issued,
+            issued_at,
+            state.session_lifetime_seconds,
+            response_now_unix_seconds,
+        ),
         Err(error) => login_failure(error),
     }
+}
+
+// memory—v1: Report the remaining validity, and never return a credential when
+// the response-time clock is invalid, moved backwards, or the session expired.
+pub(crate) fn login_success(
+    session: &MemoryV1IdentitySession,
+    issued: astral_authorization_root::memory_v1_session_authority::MemoryV1IssuedSession,
+    issued_at: i64,
+    lifetime_seconds: i64,
+    clock: impl FnOnce() -> Option<(i64, i64)>,
+) -> Response {
+    let remaining = clock().and_then(|(now, rounded_up)| {
+        if now < issued_at || rounded_up < now {
+            return None;
+        }
+        issued_at
+            .checked_add(lifetime_seconds)?
+            .checked_sub(rounded_up)
+            .filter(|remaining| *remaining > 0)
+    });
+    let Some(expires_in) = remaining else {
+        if session.revoke(issued.credential()).is_err() {
+            tracing::warn!("memory-v1 undelivered session revocation failed");
+        }
+        return unavailable();
+    };
+    (
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(ApiResponse::success(LoginData {
+            access_token: issued.credential().to_owned(),
+            token_type: "Bearer",
+            expires_in,
+        })),
+    )
+        .into_response()
 }
 
 // memory—v1: Extract a non-empty bearer credential; any other scheme yields none.

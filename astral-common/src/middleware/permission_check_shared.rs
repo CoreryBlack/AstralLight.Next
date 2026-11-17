@@ -52,6 +52,25 @@ impl AuthorizationPendingRefusal {
     }
 }
 
+/// memory—v1: Marks a real DENY returned as 503 because durable audit or its
+/// authorization evidence cannot be proven. This is distinct from PENDING and
+/// does not prove persistence or change the authorization decision. The gateway
+/// uses this non-serialized response extension only for breaker classification.
+#[derive(Clone, Copy, Debug)]
+pub struct AuthorizationAuditUnavailableRefusal;
+
+impl AuthorizationAuditUnavailableRefusal {
+    /// memory—v1: Mark the response for a real DENY with unavailable audit proof.
+    pub fn attach(response: &mut Response) {
+        response.extensions_mut().insert(Self);
+    }
+
+    /// memory—v1: Whether the extensions of a response carry this mark.
+    pub fn is_attached(extensions: &Extensions) -> bool {
+        extensions.get::<Self>().is_some()
+    }
+}
+
 /// 路径前缀 → 资源类型映射表
 pub type PathResourceMap = &'static [(&'static str, &'static str)];
 

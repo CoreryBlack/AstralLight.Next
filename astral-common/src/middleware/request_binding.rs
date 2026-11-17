@@ -1,7 +1,7 @@
 //! Bind permission evaluation to the exact bounded HTTP request without retaining its payload.
 
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes},
     extract::{OriginalUri, Request},
     http::StatusCode,
 };
@@ -12,22 +12,39 @@ const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_DOMAIN: &[u8] = b"ASTRAL_HTTP_REQUEST_V7\0";
 
-/// Buffer once, hash the original URI and bytes, then restore the body for the handler.
-/// On failure the request must be rejected; a partially read body cannot be reused.
-pub async fn bind_http_request(request: &mut Request) -> Result<String, StatusCode> {
+/// memory—v1: Buffer, hash and restore a request body for a handler that needs
+/// the bytes before authorization. The returned bytes are the exact bounded payload that
+/// was hashed; callers must not parse a second, independently read body.
+pub async fn bind_http_request_with_body(
+    request: &mut Request,
+) -> Result<(String, Bytes), StatusCode> {
     let body = std::mem::replace(request.body_mut(), Body::empty());
     let bytes = tokio::time::timeout(BODY_READ_TIMEOUT, to_bytes(body, MAX_REQUEST_BODY_BYTES))
         .await
         .map_err(|_| StatusCode::REQUEST_TIMEOUT)?
         .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
+    let fingerprint = fingerprint_bound_http_request(request, &bytes);
+    *request.body_mut() = Body::from(bytes.clone());
+    Ok((fingerprint, bytes))
+}
+
+/// memory—v1: Recompute the binding over the current method, original URI and
+/// the exact frozen body before a protected handler commits its mutation.
+pub fn fingerprint_bound_http_request(request: &Request, body: &[u8]) -> String {
     let uri = request
         .extensions()
         .get::<OriginalUri>()
         .map(|original| &original.0)
         .unwrap_or_else(|| request.uri());
-    let fingerprint = fingerprint(request.method().as_str(), &uri.to_string(), &bytes);
-    *request.body_mut() = Body::from(bytes);
-    Ok(fingerprint)
+    fingerprint(request.method().as_str(), &uri.to_string(), body)
+}
+
+/// memory—v1: Buffer once, hash the original URI and bytes, then restore the body.
+/// On failure the request must be rejected; a partially read body cannot be reused.
+pub async fn bind_http_request(request: &mut Request) -> Result<String, StatusCode> {
+    bind_http_request_with_body(request)
+        .await
+        .map(|(fingerprint, _)| fingerprint)
 }
 
 /// Freeze the request operation before proof issuance. Writes require a caller

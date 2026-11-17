@@ -74,6 +74,8 @@ pub enum ConfigValidationError {
     InvalidInvalidationDeliveryReceiver,
     #[error("invalidation delivery flag must be exactly \"true\" or \"false\" (default off)")]
     InvalidInvalidationDeliveryEnabled,
+    #[error("ASTRAL_MEMORY_V1_CONFIRMATION_BATCH_MAX must be an integer from 1 through 64")]
+    InvalidMemoryV1ConfirmationBatchMax,
     #[error("ASTRAL_ORG_SCOPE_ENABLED must be exactly \"true\" or \"false\" (default off)")]
     InvalidOrgScopeEnabled,
     #[error("ASTRAL_AUTHORITY_RUNTIME_MODE must be exactly \"strict\" or \"durable-only\"")]
@@ -472,6 +474,56 @@ impl InvalidationDeliveryConfig {
     }
 }
 
+/// Startup-frozen operational limit for a binding confirmation batch.
+/// The policy engine retains its independent hard resource ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryV1ConfirmationBatchLimit(usize);
+
+impl MemoryV1ConfirmationBatchLimit {
+    /// memory—v1: Validate an operator-selected limit against the engine ceiling.
+    pub fn new(value: usize) -> Result<Self, ConfigValidationError> {
+        if (1..=policy_engine::memory_v1_batch::MAX_MEMORY_V1_BINDING_CONFIRMATION_BATCH)
+            .contains(&value)
+        {
+            Ok(Self(value))
+        } else {
+            Err(ConfigValidationError::InvalidMemoryV1ConfirmationBatchMax)
+        }
+    }
+
+    /// memory—v1: Return the immutable limit to request processing.
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for MemoryV1ConfirmationBatchLimit {
+    // memory—v1: Preserve the previous hard-limit behavior when not configured.
+    fn default() -> Self {
+        Self(policy_engine::memory_v1_batch::MAX_MEMORY_V1_BINDING_CONFIRMATION_BATCH)
+    }
+}
+
+/// Environment override for the startup-frozen confirmation batch limit.
+pub const MEMORY_V1_CONFIRMATION_BATCH_MAX_ENV: &str = "ASTRAL_MEMORY_V1_CONFIRMATION_BATCH_MAX";
+
+// memory—v1: Parse a present value strictly; missing values use the prior limit.
+fn parse_memory_v1_confirmation_batch_limit(
+    raw: Option<&str>,
+) -> Result<MemoryV1ConfirmationBatchLimit, ConfigValidationError> {
+    let Some(raw) = raw else {
+        return Ok(MemoryV1ConfirmationBatchLimit::default());
+    };
+    let raw = raw.trim();
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ConfigValidationError::InvalidMemoryV1ConfirmationBatchMax);
+    }
+    let value = raw
+        .parse()
+        .map_err(|_| ConfigValidationError::InvalidMemoryV1ConfirmationBatchMax)?;
+    MemoryV1ConfirmationBatchLimit::new(value)
+}
+
 /// 全局应用配置
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -549,6 +601,11 @@ pub struct AppConfig {
     #[serde(skip)]
     pub org_scope_enabled: bool,
 
+    /// memory—v1: Confirmation batch limit, parsed once at startup. A missing
+    /// override retains the existing hard ceiling; invalid values fail startup.
+    #[serde(skip)]
+    pub memory_v1_confirmation_batch_limit: MemoryV1ConfirmationBatchLimit,
+
     /// Authority runtime mode (strict by default), frozen at startup.
     #[serde(skip)]
     pub authority_runtime_mode: AuthorityRuntimeMode,
@@ -594,6 +651,7 @@ pub struct AppConfig {
 }
 
 impl Default for AppConfig {
+    // memory—v1: Supply the bounded default confirmation batch limit.
     fn default() -> Self {
         Self {
             identity_service_uri: String::new(),
@@ -615,6 +673,7 @@ impl Default for AppConfig {
             db_max_connections: default_db_max_connections(),
             db_acquire_timeout_seconds: default_db_acquire_timeout_seconds(),
             org_scope_enabled: false,
+            memory_v1_confirmation_batch_limit: MemoryV1ConfirmationBatchLimit::default(),
             authority_runtime_mode: AuthorityRuntimeMode::Strict,
             authorization_read_profile: AuthorizationReadProfile::default(),
             session_grant_mirror_enabled: default_session_grant_mirror_enabled(),
@@ -914,10 +973,9 @@ fn validate_jwt_profile(
 ///   trim 后使用。
 /// - typed 字段（bool/list）严格解析，非法值一律返回配置错误使启动失败
 ///   （fail-fast），错误信息只包含变量名与期望格式，绝不回显值。
-/// - `LISTEN_ADDR` 与 `ASTRAL_*` 测试控制面变量在 `AppConfig` 之外读取
-///   （main.rs / api::test_control），不属于本契约；唯一的 `ASTRAL_*` 例外是
-///   部署旗标 `ASTRAL_ORG_SCOPE_ENABLED`（下方 ORG_SCOPE 块，经
-///   [`parse_org_scope_enabled`] 严格解析并冻结到 [`AppConfig::org_scope_enabled`]）。
+/// - `LISTEN_ADDR` 与 `ASTRAL_*` 测试控制面变量在 `AppConfig` 之外读取。
+///   部署用 `ASTRAL_*` 例外在下方显式映射并冻结。
+// memory—v1: Freeze and validate the confirmation limit along with the other overrides.
 fn apply_flat_env_overrides(cfg: &mut AppConfig) -> Result<(), config::ConfigError> {
     fn optional_env(name: &str) -> Option<String> {
         match std::env::var(name) {
@@ -1042,6 +1100,21 @@ fn apply_flat_env_overrides(cfg: &mut AppConfig) -> Result<(), config::ConfigErr
             .parse::<usize>()
             .map_err(|_| ConfigValidationError::InvalidInvalidationDeliveryReceiver)
             .map_err(ConfigValidationError::into_config_error)?;
+    }
+    // A present but empty, malformed or non-Unicode value is an error; only
+    // an absent variable keeps the default. Never reread it during requests.
+    match std::env::var(MEMORY_V1_CONFIRMATION_BATCH_MAX_ENV) {
+        Ok(value) => {
+            cfg.memory_v1_confirmation_batch_limit =
+                parse_memory_v1_confirmation_batch_limit(Some(&value))
+                    .map_err(ConfigValidationError::into_config_error)?;
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(
+                ConfigValidationError::InvalidMemoryV1ConfirmationBatchMax.into_config_error()
+            );
+        }
     }
     // JWT 双 profile：access 与 refresh 的签名材料必须相互独立（见 JwtConfig
     // 注释），因此不提供共享的 `JWT_SECRET` 名，避免静默复用。issuer/audience
@@ -1637,6 +1710,7 @@ mod tests {
         "CORS_ALLOWED_ORIGINS",
         "CORS_ALLOW_CREDENTIALS",
         AUTHORIZATION_READ_PROFILE_ENV,
+        MEMORY_V1_CONFIRMATION_BATCH_MAX_ENV,
         // ORG_SCOPE 部署旗标（parse_org_scope_enabled 契约）。
         ORG_SCOPE_ENABLED_ENV,
         // Authority runtime mode is process-frozen and isolated from the shell
@@ -1686,6 +1760,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    // memory—v1: Freeze the operational limit once and reject invalid overrides.
+    fn memory_v1_confirmation_batch_limit_is_frozen_and_bounded() {
+        let guard = FlatEnvGuard::acquire();
+        let absent = AppConfig::load_from_files("memory-v1-batch-limit-no-such-file").unwrap();
+        assert_eq!(absent.memory_v1_confirmation_batch_limit.get(), 64);
+        assert_eq!(
+            AppConfig::default()
+                .memory_v1_confirmation_batch_limit
+                .get(),
+            64
+        );
+        for (raw, expected) in [("1", 1), ("  2  ", 2), ("64", 64)] {
+            guard.set(MEMORY_V1_CONFIRMATION_BATCH_MAX_ENV, raw);
+            let cfg = AppConfig::load_from_files("memory-v1-batch-limit-no-such-file").unwrap();
+            assert_eq!(cfg.memory_v1_confirmation_batch_limit.get(), expected);
+        }
+        let frozen = AppConfig::load_from_files("memory-v1-batch-limit-no-such-file").unwrap();
+        for invalid in [
+            "",
+            " ",
+            "0",
+            "65",
+            "-1",
+            "+1",
+            "not-a-number",
+            "999999999999999999999999999999999999",
+        ] {
+            guard.set(MEMORY_V1_CONFIRMATION_BATCH_MAX_ENV, invalid);
+            let error = AppConfig::load_from_files("memory-v1-batch-limit-no-such-file")
+                .expect_err("invalid batch limit must fail startup loading");
+            assert!(error
+                .to_string()
+                .contains(MEMORY_V1_CONFIRMATION_BATCH_MAX_ENV));
+            assert_eq!(frozen.memory_v1_confirmation_batch_limit.get(), 64);
+        }
+        assert!(MemoryV1ConfirmationBatchLimit::new(0).is_err());
+        assert!(MemoryV1ConfirmationBatchLimit::new(65).is_err());
     }
 
     #[test]

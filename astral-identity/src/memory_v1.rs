@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use astral_authorization_root::memory_v1_db_rows::Table;
+use astral_authorization_root::memory_v1_db_rows::{Table, UserCardStatus};
 use astral_authorization_root::memory_v1_hamt::CandidateError;
 use astral_authorization_root::memory_v1_request::RequestRootExtension;
 use astral_authorization_root::memory_v1_root::{RequestRootReader, RootError, RootStatus};
@@ -11,6 +11,8 @@ use astral_authorization_root::memory_v1_session_authority::{
     MemoryV1IdentitySessionAdapter, MemoryV1IssuedSession, MemoryV1SessionAuthorityError,
 };
 use astral_types::memory_v1::{CandidateIdentity, MemoryId};
+
+use crate::memory_v1_service::MemoryV1FileCredentials;
 
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_PASSWORD_BYTES: usize = 1024;
@@ -101,16 +103,33 @@ pub enum MemoryV1CredentialAuthenticationError {
 }
 
 /// memory—v1: Authenticate a UUID-native credential without touching the legacy
-/// integer/JWT login service. The production HTTP route is intentionally not
-/// wired until the credential, card, tenant and session contracts are complete.
+/// integer/JWT login service. The composed HTTP login route uses this
+/// authenticator before checking the selected card and issuing a session.
 #[derive(Clone)]
 pub struct MemoryV1CredentialAuthenticator {
     repository: Arc<dyn MemoryV1CredentialRepository>,
+    /// `Some` exists only for the composition-owned concrete FileCredentials
+    /// snapshot. The public `new` constructor remains an unrestricted legacy
+    /// injection point and therefore cannot satisfy a configured source pin.
+    file_source: Option<Arc<MemoryV1FileCredentials>>,
 }
 
 impl MemoryV1CredentialAuthenticator {
     pub fn new(repository: Arc<dyn MemoryV1CredentialRepository>) -> Self {
-        Self { repository }
+        Self {
+            repository,
+            file_source: None,
+        }
+    }
+
+    /// memory—v1: Build the configured authenticator only from Identity's
+    /// immutable, concrete FileCredentials snapshot. The snapshot is shared by
+    /// Arc and cannot be replaced through the repository trait object.
+    pub fn from_file_credentials(credentials: Arc<MemoryV1FileCredentials>) -> Self {
+        Self {
+            repository: credentials.clone(),
+            file_source: Some(credentials),
+        }
     }
 
     /// Check a normalized UUID-native credential and return only its user
@@ -191,23 +210,78 @@ impl VerifiedMemoryV1Identity {
 #[derive(Clone)]
 pub struct MemoryV1IdentitySession {
     adapter: MemoryV1IdentitySessionAdapter,
+    /// `Some` marks a composition-owned session whose authentication source is
+    /// fixed to one immutable FileCredentials allocation.
+    credential_source: Option<Arc<MemoryV1FileCredentials>>,
+    /// `Some` fixes the server lifetime for a configured composition instance.
+    session_lifetime_seconds: Option<i64>,
 }
 
 impl MemoryV1IdentitySession {
-    /// memory—v1: Accept the capability injected by the single-node composition.
+    /// memory—v1: Preserve the legacy adapter-only construction and its
+    /// caller-supplied authenticator/lifetime behavior.
     pub fn from_session_adapter(adapter: MemoryV1IdentitySessionAdapter) -> Self {
-        Self { adapter }
+        Self {
+            adapter,
+            credential_source: None,
+            session_lifetime_seconds: None,
+        }
     }
 
-    /// memory—v1: Issue a session only from an Identity-verified UUID principal.
+    /// memory—v1: Construct the composition-owned session from Identity's
+    /// concrete immutable FileCredentials snapshot. The `Arc` allocation is
+    /// retained as the source identity and the lifetime is fixed for this
+    /// instance. Gateway never receives this session or its adapter.
+    pub fn from_session_adapter_with_file_credentials(
+        adapter: MemoryV1IdentitySessionAdapter,
+        credentials: Arc<MemoryV1FileCredentials>,
+        session_lifetime_seconds: i64,
+    ) -> Self {
+        Self {
+            adapter,
+            credential_source: Some(credentials),
+            session_lifetime_seconds: Some(session_lifetime_seconds),
+        }
+    }
+
+    fn validate_login_configuration(
+        &self,
+        authenticator: &MemoryV1CredentialAuthenticator,
+        lifetime_seconds: i64,
+    ) -> Result<(), MemoryV1LoginError> {
+        if let Some(expected_source) = &self.credential_source {
+            let source_matches = authenticator
+                .file_source
+                .as_ref()
+                .is_some_and(|actual| Arc::ptr_eq(expected_source, actual));
+            if !source_matches {
+                return Err(MemoryV1LoginError::Unavailable);
+            }
+        }
+        if self
+            .session_lifetime_seconds
+            .is_some_and(|expected| expected != lifetime_seconds)
+        {
+            return Err(MemoryV1LoginError::Unavailable);
+        }
+        Ok(())
+    }
+
+    /// memory—v1: Issue a session only from an Identity-verified UUID principal
+    /// whose card is still current at insertion.
     pub(crate) fn issue_verified_session(
         &self,
+        root: &RequestRootExtension,
         identity: VerifiedMemoryV1Identity,
         now_unix_seconds: i64,
         lifetime_seconds: i64,
     ) -> Result<MemoryV1IssuedSession, MemoryV1SessionAuthorityError> {
-        self.adapter
-            .issue_verified_session(identity.identity, now_unix_seconds, lifetime_seconds)
+        self.adapter.issue_verified_session_in_root(
+            root,
+            identity.identity,
+            now_unix_seconds,
+            lifetime_seconds,
+        )
     }
 
     /// memory—v1: Revoke through the same Identity-owned session boundary.
@@ -215,6 +289,20 @@ impl MemoryV1IdentitySession {
     /// Used by logout; the next request presenting the credential is refused.
     pub fn revoke(&self, credential: &str) -> Result<(), MemoryV1SessionAuthorityError> {
         self.adapter.revoke(credential)
+    }
+
+    /// memory—v1: Revoke all current process sessions for one user card.
+    ///
+    /// This is only a session-component operation for a later restricted card
+    /// disable coordinator. It does not evaluate authorization, change the
+    /// card's lifecycle state, or prevent a subsequent session issuance; the
+    /// shared-root coordinator must provide those semantics and their
+    /// linearization boundary.
+    pub fn revoke_sessions_for_user_card(
+        &self,
+        user_card_id: MemoryId,
+    ) -> Result<usize, MemoryV1SessionAuthorityError> {
+        self.adapter.revoke_sessions_for_user_card(user_card_id)
     }
 
     /// memory—v1: Identity-owned login verification and session issuance.
@@ -233,6 +321,31 @@ impl MemoryV1IdentitySession {
         root: &RequestRootExtension,
         request: MemoryV1LoginRequest<'_>,
     ) -> Result<MemoryV1IssuedSession, MemoryV1LoginError> {
+        self.login_with_clock(
+            authenticator,
+            root,
+            MemoryV1LoginInput {
+                identifier: request.identifier,
+                password: request.password,
+                user_card_id: request.user_card_id,
+                lifetime_seconds: request.lifetime_seconds,
+            },
+            || Some(request.now_unix_seconds),
+        )
+        .await
+        .map(|(issued, _)| issued)
+    }
+
+    /// memory—v1: Sample the trusted clock after authentication and card checks,
+    /// immediately before entering the root/session issuance boundary.
+    pub(crate) async fn login_with_clock(
+        &self,
+        authenticator: &MemoryV1CredentialAuthenticator,
+        root: &RequestRootExtension,
+        request: MemoryV1LoginInput<'_>,
+        clock: impl FnOnce() -> Option<i64>,
+    ) -> Result<(MemoryV1IssuedSession, i64), MemoryV1LoginError> {
+        self.validate_login_configuration(authenticator, request.lifetime_seconds)?;
         let credential = authenticator
             .authenticate(request.identifier, request.password)
             .await
@@ -251,13 +364,25 @@ impl MemoryV1IdentitySession {
         let identity = root
             .with_reader(|reader| verified_card_identity(reader, user, request.user_card_id))
             .map_err(|_| MemoryV1LoginError::Unavailable)??;
-        self.issue_verified_session(
-            VerifiedMemoryV1Identity::from_verified_facts(identity),
-            request.now_unix_seconds,
-            request.lifetime_seconds,
-        )
-        .map_err(|_| MemoryV1LoginError::Unavailable)
+        let issued_at = clock().ok_or(MemoryV1LoginError::Unavailable)?;
+        let issued = self
+            .issue_verified_session(
+                root,
+                VerifiedMemoryV1Identity::from_verified_facts(identity),
+                issued_at,
+                request.lifetime_seconds,
+            )
+            .map_err(|_| MemoryV1LoginError::Unavailable)?;
+        Ok((issued, issued_at))
     }
+}
+
+/// memory—v1: Login inputs whose issuance time is supplied by a trusted clock.
+pub(crate) struct MemoryV1LoginInput<'a> {
+    pub(crate) identifier: &'a str,
+    pub(crate) password: &'a str,
+    pub(crate) user_card_id: MemoryId,
+    pub(crate) lifetime_seconds: i64,
 }
 
 /// memory—v1: Inputs of one Identity-owned memory—v1 login.
@@ -301,19 +426,21 @@ fn verified_card_identity(
     }
     let user_bytes = user.into_bytes();
     let card_bytes = user_card_id.into_bytes();
-    let relationship = reader.read_card(card_bytes, |context| {
-        (context.card.user_card_id == card_bytes
-            && context.card.user_id == user_bytes
-            && context.user.user_id == user_bytes
-            && context.identity.user_id == user_bytes
-            && context.tenant.tenant_id == context.card.tenant_id)
-            .then(|| CandidateIdentity {
-                user_id: user,
-                identity_card_id: MemoryId::from_bytes(context.identity.identity_card_id),
-                user_card_id,
-                tenant_id: MemoryId::from_bytes(context.card.tenant_id),
-            })
-    });
+    let relationship =
+        reader.read_card_for_evaluation(card_bytes, |context, _has_binding_history| {
+            (context.card.user_card_id == card_bytes
+                && context.card.status == UserCardStatus::Active
+                && context.card.user_id == user_bytes
+                && context.user.user_id == user_bytes
+                && context.identity.user_id == user_bytes
+                && context.tenant.tenant_id == context.card.tenant_id)
+                .then(|| CandidateIdentity {
+                    user_id: user,
+                    identity_card_id: MemoryId::from_bytes(context.identity.identity_card_id),
+                    user_card_id,
+                    tenant_id: MemoryId::from_bytes(context.card.tenant_id),
+                })
+        });
     match relationship {
         Ok(Some(identity)) => Ok(identity),
         Ok(None)
@@ -328,9 +455,38 @@ fn verified_card_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astral_authorization_root::memory_v1_adoption::{
+        AdoptionLimit, ColdLoadFacts, MEMORY_V1_CANDIDATE_SCHEMA_VERSION,
+    };
+    use astral_authorization_root::memory_v1_db_rows::{
+        BindingConfirmationRow, BindingLayer, BindingRow, CandidateRows, CurrentSelection,
+        IdentityCardRow, RuleSetChangeConfirmationRow, RuleSetRow, RuleSetVersionRow, TableCounts,
+        TenantRow, UserCardRow, UserCardStatus as CardStatus, UserRow,
+    };
+    use astral_authorization_root::memory_v1_hamt::CandidateBudget;
+    use astral_authorization_root::memory_v1_registry::RegistryDeclaration;
+    use astral_authorization_root::memory_v1_root::{
+        install_process_root, ManagementMutationV2, MutationPrecondition, RootOwner,
+    };
+    use astral_authorization_root::memory_v1_rules::{
+        canonical_version_bytes, version_digest, MemoryV1OwnerScope, MemoryV1TenantScope,
+    };
     use astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthority;
     use astral_types::memory_v1::MemoryId;
+    use std::process::Command;
     use std::sync::Mutex;
+    use uuid::Uuid;
+
+    // memory—v1: Align fixture time with the actual issuance clock.
+    fn fixture_now() -> i64 {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+    }
 
     fn identity() -> CandidateIdentity {
         CandidateIdentity {
@@ -363,6 +519,836 @@ mod tests {
             }
             Ok(self.record.clone())
         }
+    }
+
+    const LOGIN_CHILD_ENV: &str = "ASTRAL_MEMORY_V1_DISABLED_LOGIN_CHILD";
+
+    fn run_isolated(test_name: &str) {
+        if std::env::var_os(LOGIN_CHILD_ENV).is_some() {
+            return;
+        }
+        let output = Command::new(std::env::current_exe().expect("test executable is available"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env(LOGIN_CHILD_ENV, "1")
+            .output()
+            .expect("failed to start isolated disabled-card login test");
+        assert!(
+            output.status.success(),
+            "isolated test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "isolated test did not report one passing test\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn id(value: u8) -> [u8; 16] {
+        [value; 16]
+    }
+
+    fn login_fixture() -> (CandidateRows, Vec<CurrentSelection>) {
+        let version_bytes = vec![1];
+        let timestamp_bytes = vec![2];
+        let content_bytes =
+            br#"{"rules":[{"ruleId":"login-test","resource":"document","action":"read","effect":"ALLOW"}]}"#
+                .to_vec();
+        let hash_input_bytes =
+            canonical_version_bytes(&version_bytes, &content_bytes, &timestamp_bytes);
+        let version = RuleSetVersionRow {
+            rule_set_id: id(5),
+            version_bytes: version_bytes.clone(),
+            content_bytes,
+            timestamp_bytes,
+            hash_bytes: version_digest(&hash_input_bytes),
+            hash_input_bytes,
+        };
+        let binding = |binding_id: u8, card_id: u8| BindingRow {
+            binding_id: id(binding_id),
+            user_card_id: id(card_id),
+            rule_set_id: id(5),
+            binding_layer: BindingLayer::Base,
+            valid_from: None,
+            valid_until: None,
+            owner_scope: MemoryV1OwnerScope::default(),
+            tenant_scope: MemoryV1TenantScope::default(),
+            removed_at: None,
+            removed_by: None,
+        };
+        let confirmation = |confirmation_id: u8, binding_id: u8| BindingConfirmationRow {
+            confirmation_id: id(confirmation_id),
+            binding_id: id(binding_id),
+            rule_set_id: id(5),
+            version_bytes: version_bytes.clone(),
+            confirmer_user_id: id(1),
+            scope_bytes: vec![1],
+            operation_id: vec![confirmation_id],
+            confirmed_at_bytes: vec![1],
+            revoked_at: None,
+            revoked_by: None,
+        };
+        (
+            CandidateRows {
+                users: vec![UserRow { user_id: id(1) }],
+                identity_cards: vec![IdentityCardRow {
+                    identity_card_id: id(2),
+                    user_id: id(1),
+                }],
+                tenants: vec![TenantRow {
+                    tenant_id: id(3),
+                    parent_tenant_id: None,
+                }],
+                user_cards: vec![
+                    UserCardRow {
+                        user_card_id: id(4),
+                        user_id: id(1),
+                        tenant_id: id(3),
+                        status: CardStatus::Active,
+                    },
+                    UserCardRow {
+                        user_card_id: id(6),
+                        user_id: id(1),
+                        tenant_id: id(3),
+                        status: CardStatus::Disabled,
+                    },
+                ],
+                rule_sets: vec![RuleSetRow {
+                    status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
+                    rule_set_id: id(5),
+                    owner_tenant_id: id(3),
+                    current_version_bytes: version_bytes.clone(),
+                }],
+                rule_set_versions: vec![version],
+                bindings: vec![binding(7, 4), binding(8, 6)],
+                binding_confirmations: vec![confirmation(9, 7), confirmation(10, 8)],
+                rule_set_change_confirmations: vec![RuleSetChangeConfirmationRow {
+                    confirmation_id: id(11),
+                    rule_set_id: id(5),
+                    version_bytes,
+                    confirmer_user_id: id(1),
+                    affected_scope_bytes: vec![1],
+                    operation_id: vec![11],
+                    confirmed_at_bytes: vec![1],
+                    revoked_at: None,
+                    revoked_by: None,
+                }],
+            },
+            vec![CurrentSelection {
+                rule_set_id: id(5),
+                version_bytes: vec![1],
+            }],
+        )
+    }
+
+    fn serving_login_owner() -> RootOwner {
+        let (rows, selections) = login_fixture();
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 32,
+                max_bindings_per_read: 8,
+            },
+        )
+        .expect("login fixture root installs");
+        let counts = TableCounts {
+            users: 1,
+            identity_cards: 1,
+            tenants: 1,
+            user_cards: 2,
+            rule_sets: 1,
+            rule_set_versions: 1,
+            bindings: 2,
+            binding_confirmations: 2,
+            rule_set_change_confirmations: 1,
+        };
+        owner
+            .install_registry(&[RegistryDeclaration {
+                resource: "document".to_owned(),
+                actions: vec!["read".to_owned()],
+            }])
+            .expect("login fixture registry installs before adoption");
+        owner
+            .adopt_experimental(
+                &ColdLoadFacts {
+                    schema_contract_version: MEMORY_V1_CANDIDATE_SCHEMA_VERSION,
+                    schema_fingerprint: [7; 32],
+                    snapshot_counts: counts,
+                    scanned_counts: counts,
+                    captured_at_unix_seconds: 1_700_000_000,
+                },
+                &AdoptionLimit::EXPERIMENTAL,
+            )
+            .expect("login fixture root becomes serving");
+        owner
+    }
+
+    // memory—v1: Historical removed bindings must not exhaust a current
+    // card's login budget; lifecycle and session revocation still fail closed.
+    #[tokio::test]
+    async fn login_ignores_removed_binding_history_without_reviving_sessions() {
+        let test_name =
+            "runtime::memory_v1::tests::login_ignores_removed_binding_history_without_reviving_sessions";
+        if std::env::var_os(LOGIN_CHILD_ENV).is_none() {
+            run_isolated(test_name);
+            return;
+        }
+
+        let (mut rows, selections) = login_fixture();
+        for binding_id in 20..40 {
+            let mut historical = rows.bindings[0].clone();
+            historical.binding_id = id(binding_id);
+            historical.removed_at = Some(100);
+            historical.removed_by = Some(id(1));
+            rows.bindings.push(historical);
+        }
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 64,
+                max_bindings_per_read: 8,
+            },
+        )
+        .unwrap();
+        owner
+            .install_registry(&[RegistryDeclaration {
+                resource: "document".to_owned(),
+                actions: vec!["read".to_owned()],
+            }])
+            .unwrap();
+        owner.adopt_serving_for_isolated_tests().unwrap();
+        let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
+        let session =
+            MemoryV1IdentitySession::from_session_adapter(authority.identity_session_adapter());
+        let authenticator =
+            MemoryV1CredentialAuthenticator::new(Arc::new(FakeCredentialRepository {
+                record: Some(MemoryV1CredentialRecord::new(
+                    identity().user_id,
+                    crate::auth::hash_password("correct").unwrap(),
+                    MemoryV1CredentialStatus::Active,
+                    1,
+                )),
+                ..Default::default()
+            }));
+        let issued_at = fixture_now() - 1;
+        let scope = astral_authorization_root::memory_v1_request::RequestRootScope::new(
+            owner.handle(),
+            Uuid::new_v4(),
+        );
+        let root = scope.extension();
+        let issued = session
+            .login(
+                &authenticator,
+                &root,
+                MemoryV1LoginRequest {
+                    identifier: "alice",
+                    password: "correct",
+                    user_card_id: MemoryId::from_bytes(id(4)),
+                    now_unix_seconds: issued_at,
+                    lifetime_seconds: 30,
+                },
+            )
+            .await
+            .expect("removed history does not prevent a valid login");
+        assert!(authority
+            .verifier()
+            .verify(issued.credential(), issued_at)
+            .is_ok());
+        let before_revoke = owner.handle().metadata().unwrap();
+        owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ConfirmationRevoke {
+                    confirmation_id: id(9),
+                    revoked_at: issued_at,
+                    revoked_by: id(1),
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: before_revoke.version,
+                },
+            )
+            .unwrap();
+        let fresh_scope = astral_authorization_root::memory_v1_request::RequestRootScope::new(
+            owner.handle(),
+            Uuid::new_v4(),
+        );
+        let fresh_root = fresh_scope.extension();
+        let after_revoke = session
+            .login(
+                &authenticator,
+                &fresh_root,
+                MemoryV1LoginRequest {
+                    identifier: "alice",
+                    password: "correct",
+                    user_card_id: MemoryId::from_bytes(id(4)),
+                    now_unix_seconds: issued_at,
+                    lifetime_seconds: 30,
+                },
+            )
+            .await
+            .expect("revoking authorization confirmation does not disable login");
+        assert!(authority
+            .verifier()
+            .verify(after_revoke.credential(), issued_at)
+            .is_ok());
+        let before = owner.handle().metadata().unwrap();
+        let (after, revoked) = authority
+            .disable_card_with_sessions_for_isolated_tests(
+                &owner.mutation_executor(),
+                MemoryId::from_bytes(id(4)),
+                before,
+            )
+            .unwrap();
+        assert_eq!(revoked, 2);
+        for credential in [issued.credential(), after_revoke.credential()] {
+            assert!(matches!(
+                authority.verifier().verify(credential, issued_at),
+                Err(MemoryV1SessionAuthorityError::Revoked)
+            ));
+        }
+        owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::UserCardStatus {
+                    user_card_id: id(4),
+                    status: CardStatus::Active,
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: after.version,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            authority.verifier().verify(issued.credential(), issued_at),
+            Err(MemoryV1SessionAuthorityError::Revoked)
+        ));
+    }
+
+    // memory—v1: A disabled card is never selected by a fresh login request.
+    #[tokio::test]
+    async fn serving_login_checks_card_status_in_one_reader_phase() {
+        let test_name =
+            "runtime::memory_v1::tests::serving_login_checks_card_status_in_one_reader_phase";
+        if std::env::var_os(LOGIN_CHILD_ENV).is_none() {
+            run_isolated(test_name);
+            return;
+        }
+
+        let base = fixture_now() - 1;
+        let owner = serving_login_owner();
+        let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
+        let session =
+            MemoryV1IdentitySession::from_session_adapter(authority.identity_session_adapter());
+        let authenticator =
+            MemoryV1CredentialAuthenticator::new(Arc::new(FakeCredentialRepository {
+                record: Some(MemoryV1CredentialRecord::new(
+                    identity().user_id,
+                    crate::auth::hash_password("correct").unwrap(),
+                    MemoryV1CredentialStatus::Active,
+                    1,
+                )),
+                ..Default::default()
+            }));
+
+        let active_scope = astral_authorization_root::memory_v1_request::RequestRootScope::new(
+            owner.handle(),
+            Uuid::new_v4(),
+        );
+        let active_root = active_scope.extension();
+        let stale_identity = active_root
+            .with_reader(|reader| {
+                verified_card_identity(reader, identity().user_id, MemoryId::from_bytes(id(4)))
+            })
+            .expect("root reader is available")
+            .expect("active card is verified");
+        let mismatch = CandidateIdentity {
+            tenant_id: MemoryId::from_bytes(id(99)),
+            ..stale_identity
+        };
+        assert!(matches!(
+            session.issue_verified_session(
+                &active_root,
+                VerifiedMemoryV1Identity::from_verified_facts(mismatch),
+                base,
+                30,
+            ),
+            Err(MemoryV1SessionAuthorityError::Unavailable)
+        ));
+        let active = session
+            .login(
+                &authenticator,
+                &active_root,
+                MemoryV1LoginRequest {
+                    identifier: "alice",
+                    password: "correct",
+                    user_card_id: MemoryId::from_bytes(id(4)),
+                    now_unix_seconds: base,
+                    lifetime_seconds: 30,
+                },
+            )
+            .await
+            .expect("active card login succeeds");
+        assert!(authority
+            .verifier()
+            .verify(active.credential(), base)
+            .is_ok());
+
+        let disabled_scope = astral_authorization_root::memory_v1_request::RequestRootScope::new(
+            owner.handle(),
+            Uuid::new_v4(),
+        );
+        let disabled_root = disabled_scope.extension();
+        assert!(matches!(
+            session
+                .login(
+                    &authenticator,
+                    &disabled_root,
+                    MemoryV1LoginRequest {
+                        identifier: "alice",
+                        password: "correct",
+                        user_card_id: MemoryId::from_bytes(id(6)),
+                        now_unix_seconds: base,
+                        lifetime_seconds: 30,
+                    },
+                )
+                .await,
+            Err(MemoryV1LoginError::CardNotOwned)
+        ));
+
+        let before = owner
+            .handle()
+            .metadata()
+            .expect("root metadata is readable");
+        let mut stale = before;
+        stale.version += 1;
+        assert!(authority
+            .disable_card_with_sessions_for_isolated_tests(
+                &owner.mutation_executor(),
+                MemoryId::from_bytes(id(4)),
+                stale
+            )
+            .is_err());
+        assert!(authority
+            .disable_card_with_sessions_for_isolated_tests(
+                &owner.mutation_executor(),
+                MemoryId::from_bytes(id(99)),
+                before
+            )
+            .is_err());
+        assert_eq!(owner.handle().metadata().unwrap(), before);
+        assert!(authority
+            .verifier()
+            .verify(active.credential(), base)
+            .is_ok());
+        let (after, revoked) = authority
+            .disable_card_with_sessions_for_isolated_tests(
+                &owner.mutation_executor(),
+                MemoryId::from_bytes(id(4)),
+                before,
+            )
+            .expect("low-level card/session coordinator publishes");
+        assert_eq!(after.version, before.version + 1);
+        assert_eq!(revoked, 1);
+
+        assert!(matches!(
+            authority.verifier().verify(active.credential(), base),
+            Err(MemoryV1SessionAuthorityError::Revoked)
+        ));
+        assert!(matches!(
+            session.issue_verified_session(
+                &active_root,
+                VerifiedMemoryV1Identity::from_verified_facts(stale_identity),
+                base,
+                30,
+            ),
+            Err(MemoryV1SessionAuthorityError::Unavailable)
+        ));
+
+        let switched_scope = astral_authorization_root::memory_v1_request::RequestRootScope::new(
+            owner.handle(),
+            Uuid::new_v4(),
+        );
+        let switched_root = switched_scope.extension();
+        assert!(matches!(
+            session
+                .login(
+                    &authenticator,
+                    &switched_root,
+                    MemoryV1LoginRequest {
+                        identifier: "alice",
+                        password: "correct",
+                        user_card_id: MemoryId::from_bytes(id(4)),
+                        now_unix_seconds: base,
+                        lifetime_seconds: 30,
+                    },
+                )
+                .await,
+            Err(MemoryV1LoginError::CardNotOwned)
+        ));
+
+        owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::UserCardStatus {
+                    user_card_id: id(4),
+                    status: CardStatus::Active,
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: after.version,
+                },
+            )
+            .expect("low-level enable publishes");
+        assert!(matches!(
+            authority.verifier().verify(active.credential(), base),
+            Err(MemoryV1SessionAuthorityError::Revoked
+                | MemoryV1SessionAuthorityError::InvalidCredential)
+        ));
+        assert!(matches!(
+            session.issue_verified_session(
+                &active_root,
+                VerifiedMemoryV1Identity::from_verified_facts(stale_identity),
+                base,
+                30,
+            ),
+            Err(MemoryV1SessionAuthorityError::Unavailable)
+        ));
+    }
+
+    // memory—v1: Authentication delay is excluded from issuance, and clock
+    // failures or a response delayed past expiry never return a credential.
+    #[tokio::test]
+    async fn login_samples_after_authentication_and_reports_remaining_validity() {
+        use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+
+        struct DelayedRepository {
+            authenticated_at: i64,
+            record: MemoryV1CredentialRecord,
+            clock: Arc<AtomicI64>,
+        }
+
+        #[async_trait]
+        impl MemoryV1CredentialRepository for DelayedRepository {
+            async fn find_by_identifier(
+                &self,
+                _: &str,
+            ) -> Result<Option<MemoryV1CredentialRecord>, MemoryV1CredentialRepositoryError>
+            {
+                self.clock.store(self.authenticated_at, Ordering::SeqCst);
+                Ok(Some(self.record.clone()))
+            }
+        }
+
+        let test_name = "runtime::memory_v1::tests::login_samples_after_authentication_and_reports_remaining_validity";
+        if std::env::var_os(LOGIN_CHILD_ENV).is_none() {
+            run_isolated(test_name);
+            return;
+        }
+        let base = fixture_now() - 51;
+        let owner = serving_login_owner();
+        let scope = astral_authorization_root::memory_v1_request::RequestRootScope::new(
+            owner.handle(),
+            Uuid::new_v4(),
+        );
+        let root = scope.extension();
+        let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
+        let session =
+            MemoryV1IdentitySession::from_session_adapter(authority.identity_session_adapter());
+        let time = Arc::new(AtomicI64::new(base));
+        let authenticator = MemoryV1CredentialAuthenticator::new(Arc::new(DelayedRepository {
+            authenticated_at: base + 50,
+            record: MemoryV1CredentialRecord::new(
+                identity().user_id,
+                crate::auth::hash_password("correct").unwrap(),
+                MemoryV1CredentialStatus::Active,
+                1,
+            ),
+            clock: Arc::clone(&time),
+        }));
+        let input = || MemoryV1LoginInput {
+            identifier: "alice",
+            password: "correct",
+            user_card_id: MemoryId::from_bytes(id(4)),
+            lifetime_seconds: 30,
+        };
+        let (issued, issued_at) = session
+            .login_with_clock(&authenticator, &root, input(), || {
+                Some(time.load(Ordering::SeqCst))
+            })
+            .await
+            .expect("login succeeds after delayed authentication");
+        assert_eq!(issued_at, base + 50);
+        let credential = issued.credential().to_owned();
+        assert!(authority.verifier().verify(&credential, base + 79).is_ok());
+        assert!(matches!(
+            authority.verifier().verify(&credential, base + 80),
+            Err(MemoryV1SessionAuthorityError::Expired)
+        ));
+        let response =
+            crate::memory_v1_service::login_success(&session, issued, issued_at, 30, || {
+                Some((base + 57, base + 58))
+            });
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["data"]["expiresIn"], 22);
+        assert!(body["data"]["accessToken"] == credential);
+
+        let calls = AtomicUsize::new(0);
+        assert!(matches!(
+            session
+                .login_with_clock(&authenticator, &root, input(), || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    None
+                })
+                .await,
+            Err(MemoryV1LoginError::Unavailable)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let bad_input = MemoryV1LoginInput {
+            password: "wrong",
+            ..input()
+        };
+        assert!(matches!(
+            session
+                .login_with_clock(&authenticator, &root, bad_input, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Some(base + 50)
+                })
+                .await,
+            Err(MemoryV1LoginError::InvalidCredentials)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        for response_time in [
+            None,
+            Some((base + 49, base + 50)),
+            Some((base + 80, base + 80)),
+            Some((base + 79, base + 80)),
+        ] {
+            let (issued, issued_at) = session
+                .login_with_clock(&authenticator, &root, input(), || Some(base + 50))
+                .await
+                .unwrap();
+            let credential = issued.credential().to_owned();
+            let response =
+                crate::memory_v1_service::login_success(&session, issued, issued_at, 30, || {
+                    response_time
+                });
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(matches!(
+                authority.verifier().verify(&credential, base + 50),
+                Err(MemoryV1SessionAuthorityError::Revoked)
+            ));
+        }
+    }
+
+    // memory—v1: A root phase captured before disable cannot issue afterwards,
+    // and a session issued first is included in the later revocation.
+    #[tokio::test]
+    async fn login_and_disable_share_the_card_commit_boundary() {
+        let test_name =
+            "runtime::memory_v1::tests::login_and_disable_share_the_card_commit_boundary";
+        if std::env::var_os(LOGIN_CHILD_ENV).is_none() {
+            run_isolated(test_name);
+            return;
+        }
+        let base = fixture_now() - 1;
+        let owner = serving_login_owner();
+        let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
+        let session =
+            MemoryV1IdentitySession::from_session_adapter(authority.identity_session_adapter());
+        let scope = astral_authorization_root::memory_v1_request::RequestRootScope::new(
+            owner.handle(),
+            Uuid::new_v4(),
+        );
+        let root = scope.extension();
+        let principal = root
+            .with_reader(|reader| {
+                verified_card_identity(reader, identity().user_id, MemoryId::from_bytes(id(4)))
+            })
+            .unwrap()
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let writer = owner.mutation_executor();
+        let before = owner.handle().metadata().unwrap();
+        let (issued, mutation) = std::thread::scope(|threads| {
+            let login_barrier = Arc::clone(&barrier);
+            let login_session = &session;
+            let login_root = &root;
+            let login = threads.spawn(move || {
+                login_barrier.wait();
+                login_session.issue_verified_session(
+                    login_root,
+                    VerifiedMemoryV1Identity::from_verified_facts(principal),
+                    base,
+                    30,
+                )
+            });
+            let disable_barrier = Arc::clone(&barrier);
+            let disable_authority = &authority;
+            let disable = threads.spawn(move || {
+                disable_barrier.wait();
+                disable_authority.disable_card_with_sessions_for_isolated_tests(
+                    &writer,
+                    MemoryId::from_bytes(id(4)),
+                    before,
+                )
+            });
+            barrier.wait();
+            (login.join().unwrap(), disable.join().unwrap())
+        });
+        mutation.expect("disable publishes");
+        match issued {
+            Ok(issued) => assert!(matches!(
+                authority.verifier().verify(issued.credential(), base),
+                Err(MemoryV1SessionAuthorityError::Revoked)
+            )),
+            Err(error) => assert_eq!(error, MemoryV1SessionAuthorityError::Unavailable),
+        }
+        assert!(matches!(
+            session.issue_verified_session(
+                &root,
+                VerifiedMemoryV1Identity::from_verified_facts(principal),
+                base,
+                30,
+            ),
+            Err(MemoryV1SessionAuthorityError::Unavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn configured_session_pins_file_credentials_and_preserves_legacy_constructor() {
+        let test_name = "runtime::memory_v1::tests::configured_session_pins_file_credentials_and_preserves_legacy_constructor";
+        if std::env::var_os(LOGIN_CHILD_ENV).is_none() {
+            run_isolated(test_name);
+            return;
+        }
+
+        let owner = serving_login_owner();
+        let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
+        let scope = astral_authorization_root::memory_v1_request::RequestRootScope::new(
+            owner.handle(),
+            Uuid::new_v4(),
+        );
+        let root = scope.extension();
+        let user_id = identity().user_id;
+        let credentials = Arc::new(
+            crate::memory_v1_service::MemoryV1FileCredentials::from_json(&format!(
+                r#"{{"version":1,"credentials":[{{"identifier":"Alice","userId":"{user_id}","passwordHash":"{}","status":"active","revision":1}}]}}"#,
+                crate::auth::hash_password("correct").unwrap()
+            ))
+            .unwrap(),
+        );
+        let configured = MemoryV1IdentitySession::from_session_adapter_with_file_credentials(
+            authority.identity_session_adapter(),
+            Arc::clone(&credentials),
+            30,
+        );
+        let pinned_authenticator =
+            MemoryV1CredentialAuthenticator::from_file_credentials(Arc::clone(&credentials));
+        fn request<'a>(password: &'a str, lifetime_seconds: i64) -> MemoryV1LoginRequest<'a> {
+            MemoryV1LoginRequest {
+                identifier: "alice",
+                password,
+                user_card_id: MemoryId::from_bytes(id(4)),
+                now_unix_seconds: fixture_now() - 1,
+                lifetime_seconds,
+            }
+        }
+
+        let issued = configured
+            .login(&pinned_authenticator, &root, request("correct", 30))
+            .await
+            .expect("the pinned file credential authenticates");
+        assert!(authority
+            .verifier()
+            .verify(issued.credential(), fixture_now())
+            .is_ok());
+        assert!(matches!(
+            configured
+                .login(&pinned_authenticator, &root, request("wrong", 30))
+                .await,
+            Err(MemoryV1LoginError::InvalidCredentials)
+        ));
+        assert!(configured
+            .login(&pinned_authenticator, &root, request("correct", 31))
+            .await
+            .is_err());
+
+        let alternative_repository = Arc::new(FakeCredentialRepository {
+            record: Some(MemoryV1CredentialRecord::new(
+                user_id,
+                crate::auth::hash_password("correct").unwrap(),
+                MemoryV1CredentialStatus::Active,
+                1,
+            )),
+            ..Default::default()
+        });
+        let alternative_authenticator =
+            MemoryV1CredentialAuthenticator::new(alternative_repository.clone());
+        assert!(configured
+            .login(&alternative_authenticator, &root, request("correct", 30))
+            .await
+            .is_err());
+        assert!(alternative_repository.seen.lock().unwrap().is_empty());
+
+        let alternative_router = crate::memory_v1_service::memory_v1_auth_router(
+            Arc::new(configured.clone()),
+            alternative_authenticator,
+            30,
+        );
+        let body = format!(
+            r#"{{"identifier":"alice","password":"correct","userCardId":"{}"}}"#,
+            MemoryId::from_bytes(id(4))
+        );
+        let response = tower::ServiceExt::oneshot(
+            alternative_router,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/sessions")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .extension(root.clone())
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["reasonCode"], "IDENTITY_UNAVAILABLE");
+        assert!(!body.to_string().contains("correct"));
+
+        let legacy =
+            MemoryV1IdentitySession::from_session_adapter(authority.identity_session_adapter());
+        let legacy_issued = legacy
+            .login(
+                &MemoryV1CredentialAuthenticator::new(alternative_repository),
+                &root,
+                request("correct", 30),
+            )
+            .await
+            .expect("the legacy adapter-only constructor keeps its behavior");
+        assert!(authority
+            .verifier()
+            .verify(legacy_issued.credential(), fixture_now())
+            .is_ok());
     }
 
     #[tokio::test]
@@ -449,17 +1435,40 @@ mod tests {
         assert!(repository.seen.lock().unwrap().is_empty());
     }
 
+    // memory—v1: The Identity boundary cannot issue without the matching root.
     #[test]
     fn only_verified_identity_value_enters_identity_session_boundary() {
+        let test_name =
+            "runtime::memory_v1::tests::only_verified_identity_value_enters_identity_session_boundary";
+        if std::env::var_os(LOGIN_CHILD_ENV).is_none() {
+            run_isolated(test_name);
+            return;
+        }
+        let base = fixture_now() - 1;
+        let owner = serving_login_owner();
+        let scope = astral_authorization_root::memory_v1_request::RequestRootScope::new(
+            owner.handle(),
+            Uuid::new_v4(),
+        );
+        let root = scope.extension();
         let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
         let session =
             MemoryV1IdentitySession::from_session_adapter(authority.identity_session_adapter());
-        let principal = VerifiedMemoryV1Identity::from_verified_facts(identity());
-        let issued = session.issue_verified_session(principal, 100, 30).unwrap();
+        let identity = root
+            .with_reader(|reader| {
+                verified_card_identity(reader, identity().user_id, MemoryId::from_bytes(id(4)))
+            })
+            .unwrap()
+            .unwrap();
+        let principal = VerifiedMemoryV1Identity::from_verified_facts(identity);
+        let issued = session
+            .issue_verified_session(&root, principal, base, 30)
+            .unwrap();
         assert!(issued.credential().starts_with("m1."));
         assert!(authority
             .verifier()
-            .verify(issued.credential(), 100)
+            .verify(issued.credential(), base)
             .is_ok());
     }
 }

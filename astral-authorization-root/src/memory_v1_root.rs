@@ -996,17 +996,6 @@ impl RootOwner {
         self.runtime.fences.abort(rule_set_id)
     }
 
-    /// Legacy plans lack the admission and change confirmation required by the
-    /// current management contract. Refuse them without changing the root.
-    pub fn execute_mutation(
-        &self,
-        _mutation: &ManagementMutation,
-    ) -> Result<RootMetadata, MutationError> {
-        Err(MutationError::Candidate(
-            CandidateError::InconsistentBinding,
-        ))
-    }
-
     /// memory—v1: Apply a mutation only while constructing a candidate root.
     ///
     /// This low-level operation is not an authorization-bound management path.
@@ -1500,42 +1489,6 @@ impl RootMutationExecutor {
         apply_session_updates();
         Ok(metadata)
     }
-}
-
-/// Legacy candidate mutation plan. It does not carry an admission or enough
-/// information to authorize a governance write.
-#[derive(Clone, Debug)]
-pub enum ManagementMutation {
-    BindingCreate {
-        row: crate::memory_v1_db_rows::BindingRow,
-        confirmation: crate::memory_v1_db_rows::BindingConfirmationRow,
-    },
-    BindingRemove {
-        binding_id: BinaryId,
-        removed_at: i64,
-        removed_by: BinaryId,
-    },
-    ConfirmationCreate {
-        row: crate::memory_v1_db_rows::BindingConfirmationRow,
-    },
-    ConfirmationRevoke {
-        confirmation_id: BinaryId,
-        revoked_at: i64,
-        revoked_by: BinaryId,
-    },
-    UserCardStatus {
-        user_card_id: BinaryId,
-        status: crate::memory_v1_db_rows::UserCardStatus,
-    },
-    RuleSetCreate {
-        rule_set: crate::memory_v1_db_rows::RuleSetRow,
-        version: crate::memory_v1_db_rows::RuleSetVersionRow,
-    },
-    VersionPublish {
-        rule_set_id: BinaryId,
-        version_row: crate::memory_v1_db_rows::RuleSetVersionRow,
-        new_current_version: Vec<u8>,
-    },
 }
 
 /// memory—v1: A candidate mutation plan; this value carries no admission.
@@ -7452,60 +7405,6 @@ mod tests {
             stopped.objects.user_card(id(4)).unwrap().status,
             UserCardStatus::Disabled
         );
-    }
-
-    #[test]
-    // memory—v1: Legacy plans remain source-compatible but cannot bypass admission.
-    fn legacy_mutation_plan_refuses_without_publishing() {
-        fn exhaustive(plan: &ManagementMutation) {
-            match plan {
-                ManagementMutation::BindingCreate {
-                    row: _,
-                    confirmation: _,
-                }
-                | ManagementMutation::BindingRemove {
-                    binding_id: _,
-                    removed_at: _,
-                    removed_by: _,
-                }
-                | ManagementMutation::ConfirmationCreate { row: _ }
-                | ManagementMutation::ConfirmationRevoke {
-                    confirmation_id: _,
-                    revoked_at: _,
-                    revoked_by: _,
-                }
-                | ManagementMutation::UserCardStatus {
-                    user_card_id: _,
-                    status: _,
-                }
-                | ManagementMutation::RuleSetCreate {
-                    rule_set: _,
-                    version: _,
-                }
-                | ManagementMutation::VersionPublish {
-                    rule_set_id: _,
-                    version_row: _,
-                    new_current_version: _,
-                } => {}
-            }
-        }
-        let (input, selections) = serving_ready();
-        let owner = RootRegistry::new()
-            .install_candidate(input, selections, budget())
-            .unwrap();
-        let before = owner.handle().metadata().unwrap();
-        let plan = ManagementMutation::UserCardStatus {
-            user_card_id: id(4),
-            status: UserCardStatus::Disabled,
-        };
-        exhaustive(&plan);
-        assert!(matches!(
-            owner.execute_mutation(&plan),
-            Err(MutationError::Candidate(
-                CandidateError::InconsistentBinding
-            ))
-        ));
-        assert_eq!(owner.handle().metadata().unwrap(), before);
     }
 
     #[test]

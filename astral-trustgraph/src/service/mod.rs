@@ -80,7 +80,6 @@ pub mod invalidation_runtime;
 pub mod level_template_service;
 pub mod memory_v1_governance_commit;
 pub mod memory_v1_mutation_coordinator;
-pub mod memory_v1_protected_mutation;
 // 单机组合路径的进程内投影 worker（由组合安装门禁）：消费
 // astral_db::LocalProjectionBus 的 commit-proven delta（source 事务提交后
 // dispatch），按稳定事件身份单事务 CAS claim + 同事务 payload binding，

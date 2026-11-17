@@ -489,6 +489,7 @@ dependencies = [
  "axum",
  "hex",
  "libc",
+ "metrics-exporter-prometheus",
  "policy-engine",
  "reqwest",
  "serde_json",

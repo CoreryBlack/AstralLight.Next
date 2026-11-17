@@ -13,9 +13,12 @@
 -- 2. 租户自引用 FK 只能保证父节点存在，不能阻止多节点环；并发建树、重挂和
 --    无环验证由后续合同解决。身份卡唯一约束仅保证每用户至多一张；每人至少一张
 --    的创建及生命周期仍需应用事务和完整性验证。一个用户同一租户可有多张用户卡。
--- 3. 规则集有管理归属，绑定关联具体用户卡与规则集。这里故意不限制二者同租户、
---    同卡的绑定数量或重复组合；这不是允许跨租户或重复绑定的授权。跨租户复用
---    合同未建立时，管理端须拒绝跨租户绑定；组织关系不能自动创建绑定或授权。
+-- 3. 规则集有管理归属，绑定关联具体用户卡与规则集。活跃绑定的同卡同规则集
+--    组合不得重复，且每卡至多一个活跃 OVERLAY；解绑行保留 tombstone，只有
+--    removed_at IS NULL 的绑定参与这些唯一性约束。已移除行可由新 binding_id 重建。
+--    这不是允许跨租户或重复绑定的授权。跨租户复用合同未建立时，管理端须拒绝
+--    跨租户绑定；组织关系不能自动创建绑定或授权。规则集仅在零活跃绑定时退役，
+--    状态标记为 RETIRED 且保留行；ACTIVE 默认值只用于新建行。
 -- 4. 绑定只指向规则集稳定身份，不固定某个版本。共享规则集经有权人员确认修改，
 --    在共享根原子生效后立即影响已有有效绑定，不以逐卡重新确认为默认前置。
 --    修改确认如何覆盖后续变更及影响范围尚待确定，不得把绑定行视作已确认授权。
@@ -30,15 +33,15 @@
 -- 6. 每条成功持久化的版本记录保留完整四元组及精确 hash 输入；此处的主键仅防止
 --    同规则集下相同版本标识重复，未定义版本分配、排序、连续性、不可变执法、
 --    当前版本指针或缺口检测。不得从最大值或时间戳推断当前版本或完整历史。
---    内存成功可先于异步落盘，崩溃可能丢失已生效版本甚至撤权；数据库目标保存
---    从首版到最新版的所有完整版本，与此存在尚未解决的缺口。队列、顺序、失败
---    通知、落盘确认、缺口发现、恢复和一致性快照均待设计，不能宣称连续完整。
+--    内存生效可先于本机消息持久化与 MySQL 应用；A/A1 要求管理成功前证明
+--    连续本机持久前缀，恢复时先按序补齐数据库。消息持久化前崩溃仍可能丢失
+--    已生效版本或撤权。消息协议、容量、失败对账与恢复尚未实现或验收。
 -- 7. 确认表只提供追溯候选：确认人、对象、版本、范围字节、操作关联及时间。
 --    它不证明确认人当时有权、确认仍有效、覆盖未来修改、审计已落盘或操作已完成。
 --    确认引用版本的 FK 要求数据库先保存该版本；内存先生效时确认与版本的异步
 --    落盘顺序、部分失败和崩溃恢复仍待设计，不能据此宣称内存确认必然持久化。
---    撤销、有效期、状态、影响集合、批量确认及确认/审计完整性均待定；缺少可证明
---    的有效确认时不得放行。规则、用户、卡、租户及绑定的状态和资格也尚未建模。
+--    撤销、有效期、状态、影响集合、批量确认及确认/审计完整性以更新的生命周期
+--    合同为准；缺少可证明的有效确认时不得放行。行上的状态字段不证明资格。
 -- 8. 不定义具体规则语言、资源动作、规则冲突或隐式授权，不建立模板、等级、
 --    domain、旧 projection 表，不插入初始超级管理员或任何授权。规则条目保存在
 --    不透明的完整 content 中，待规则语言确定后再设计可验证的表达和访问方式。
@@ -83,6 +86,7 @@ CREATE TABLE memory_user_card (
     PRIMARY KEY (user_card_id),
     KEY ix_memory_user_card_user (user_id),
     KEY ix_memory_user_card_tenant (tenant_id),
+    CONSTRAINT ck_memory_user_card_status CHECK (status IN ('ACTIVE', 'DISABLED')),
     CONSTRAINT fk_memory_user_card_user
         FOREIGN KEY (user_id) REFERENCES memory_user (user_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
@@ -95,8 +99,10 @@ CREATE TABLE memory_rule_set (
     rule_set_id BINARY(16) NOT NULL,
     owner_tenant_id BINARY(16) NOT NULL,
     current_version_bytes VARBINARY(255) NOT NULL,
+    status VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'ACTIVE',
     PRIMARY KEY (rule_set_id),
     KEY ix_memory_rule_set_owner (owner_tenant_id),
+    CONSTRAINT ck_memory_rule_set_status CHECK (status IN ('ACTIVE', 'RETIRED')),
     CONSTRAINT fk_memory_rule_set_owner
         FOREIGN KEY (owner_tenant_id) REFERENCES memory_tenant (tenant_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT
@@ -126,10 +132,12 @@ CREATE TABLE memory_card_rule_set_binding (
     tenant_scope VARCHAR(24) CHARACTER SET ascii COLLATE ascii_bin NULL,
     removed_at BIGINT NULL,
     removed_by VARBINARY(16) NULL,
-    overlay_guard BINARY(16) GENERATED ALWAYS AS (CASE WHEN binding_layer = 'OVERLAY' THEN user_card_id ELSE NULL END) STORED,
+    active_user_card_id BINARY(16) GENERATED ALWAYS AS (CASE WHEN removed_at IS NULL THEN user_card_id ELSE NULL END) STORED,
+    active_rule_set_id BINARY(16) GENERATED ALWAYS AS (CASE WHEN removed_at IS NULL THEN rule_set_id ELSE NULL END) STORED,
+    overlay_guard BINARY(16) GENERATED ALWAYS AS (CASE WHEN removed_at IS NULL AND binding_layer = 'OVERLAY' THEN user_card_id ELSE NULL END) STORED,
     PRIMARY KEY (binding_id),
-    UNIQUE KEY uq_binding_card_ruleset (user_card_id, rule_set_id),
-    UNIQUE KEY uq_binding_one_overlay (overlay_guard),
+    UNIQUE KEY uq_binding_card_ruleset_active (active_user_card_id, active_rule_set_id),
+    UNIQUE KEY uq_binding_one_overlay_active (overlay_guard),
     UNIQUE KEY uq_memory_binding_rule_set (binding_id, rule_set_id),
     KEY ix_memory_binding_card (user_card_id),
     KEY ix_memory_binding_rule_set (rule_set_id),

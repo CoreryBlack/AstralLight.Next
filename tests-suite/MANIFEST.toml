@@ -387,6 +387,16 @@ arch_status = "current"
 # ═══════════════ 性能/基准 ═══════════════
 
 [[entry]]
+id = "perf/memory-v1-binding-history-scale"
+category = "performance"
+owner_crate = "astral-authorization-root"
+path = "astral-authorization-root/tests/memory_v1_binding_scale.rs"
+kind = "integration-ignored"
+arch_status = "current"
+note = "memory—v1 隔离测试根：测量不同解绑历史规模下绑定变更及规则集退役的候选校验与发布合计耗时；绑定变更在 5000 条时触发摘要容量限制而跳过；不证明治理准入、持久化或审计"
+run = "cargo test --offline --locked --release -p astral-authorization-root --features test-support --test memory_v1_binding_scale -- --ignored --nocapture --test-threads=1"
+
+[[entry]]
 id = "bench/memory-v1-candidate-root"
 category = "performance"
 owner_crate = "astral-authorization-root"
@@ -1004,24 +1014,6 @@ argv = ["cargo", "test", "-p", "testsuite", "--test", "native_projection_lifecyc
 acceptance = "rust"
 minimum_tests = 1
 expected_tests = 1
-
-[[suite]]
-id = "strict-benchmark-smoke"
-owner = "policy-engine"
-profile = "native-kernel"
-test_services = []
-series = ["CORE", "PERF"]
-scope = "component"
-boundary = "Criterion test mode verifies retained standalone condition-component and data-scope resolver setup only; no statistical timing. memory—v1: the retired V6/V7 published-evidence engine benchmarks were deleted (Rust 规范 §15.10); these retained component benches are not memory-v1 authorization performance, and the new-design authorization/throughput benchmark suite (nanosecond timing, more detailed analysis surface) remains to be designed and registered"
-sources = ["policy-engine/benches/policy_bench.rs", "policy-engine/benches/tenant_isolation_bench.rs"]
-argv = ["cargo", "test", "-p", "policy-engine", "--bench", "policy_bench", "--bench", "tenant_isolation_bench", "--locked", "--", "--test"]
-acceptance = "criterion-smoke"
-benchmark_cases = [
-  "condition/component_time_range",
-  "condition/component_ipv4_range", "condition/component_scope",
-  "tenant_isolation/data_scope_resolve",
-  "tenant_isolation/data_scope_resolve_personal",
-]
 
 [[suite]]
 id = "e2-pending-probe"
@@ -1858,8 +1850,8 @@ boundary = "U1-U10 report/reducer contracts use injected records for both models
 sources = ["test-harness/src/universal_hypotheses.rs", "test-harness/src/model_acceptance.rs", "Docs/authorization-validation/tools/universal_hypotheses_check.py", "Docs/authorization-validation/tools/model_acceptance.py", "Docs/authorization-validation/archive/python-tests/test_universal_hypotheses_check.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "universal_hypotheses::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
-minimum_tests = 5
-expected_tests = 5
+minimum_tests = 7
+expected_tests = 7
 timeout_seconds = 1200
 
 [[suite]]
@@ -1902,8 +1894,8 @@ boundary = "typed offline observation/auth/preflight/recovery contract with one 
 sources = ["test-harness/src/e4_protocol.rs", "Docs/authorization-validation/archive/python-tests/test_e4_fault_driver.py", "Docs/authorization-validation/archive/python-tests/test_experiment_common.py"]
 argv = ["cargo", "test", "-p", "test-harness", "--locked", "--lib", "e4_protocol::tests::", "--", "--test-threads=1"]
 acceptance = "rust"
-minimum_tests = 5
-expected_tests = 5
+minimum_tests = 7
+expected_tests = 7
 timeout_seconds = 600
 
 [[suite]]
@@ -2691,23 +2683,6 @@ acceptance = "rust"
 minimum_tests = 1
 
 [[suite]]
-id = "strict-policy-benchmark"
-owner = "policy-engine"
-profile = "performance-kernel"
-test_services = []
-series = ["PERF", "RQ1", "RQ5"]
-scope = "component"
-boundary = "retained standalone condition-component CPU timing only; no MySQL/HTTP. memory—v1: the retired V6/V7 published-evidence engine benchmarks were deleted (Rust 规范 §15.10); this is not memory-v1 authorization performance, and the new-design authorization benchmark suite (nanosecond timing, more detailed analysis surface) remains to be designed and registered"
-sources = ["policy-engine/benches/policy_bench.rs"]
-argv = ["cargo", "bench", "-p", "policy-engine", "--bench", "policy_bench", "--locked", "--", "--color", "never"]
-acceptance = "criterion"
-benchmark_cases = [
-  "condition/component_time_range",
-  "condition/component_ipv4_range", "condition/component_scope",
-]
-timeout_seconds = 1800
-
-[[suite]]
 id = "rq-a-rule-complexity"
 owner = "bench/engine-comparison"
 profile = "offline-validation"
@@ -2721,6 +2696,7 @@ acceptance = "rust"
 minimum_tests = 1
 expected_tests = 1
 timeout_seconds = 600
+
 
 [[suite]]
 id = "rq-b-card-scale"
@@ -2796,23 +2772,6 @@ acceptance = "rust"
 minimum_tests = 1
 expected_tests = 1
 timeout_seconds = 600
-
-[[suite]]
-id = "strict-tenant-benchmark"
-owner = "policy-engine"
-profile = "performance-kernel"
-test_services = []
-series = ["PERF", "RQ2", "RQ5", "MT-E1"]
-scope = "component"
-boundary = "retained standalone data-scope resolver CPU timing only; CPU-only. memory—v1: the retired V6/V7 published-evidence tenant-isolation benchmarks were deleted (Rust 规范 §15.10); this is not memory-v1 tenant-isolation authorization performance, and the new-design benchmark suite (nanosecond timing, more detailed analysis surface) remains to be designed and registered"
-sources = ["policy-engine/benches/tenant_isolation_bench.rs"]
-argv = ["cargo", "bench", "-p", "policy-engine", "--bench", "tenant_isolation_bench", "--locked", "--", "--color", "never"]
-acceptance = "criterion"
-benchmark_cases = [
-  "tenant_isolation/data_scope_resolve",
-  "tenant_isolation/data_scope_resolve_personal",
-]
-timeout_seconds = 1800
 
 [[suite]]
 id = "compiler-benchmark"

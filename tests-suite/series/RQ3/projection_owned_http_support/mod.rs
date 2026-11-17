@@ -373,6 +373,17 @@ fn build_app_state(pool: MySqlPool, config: AppConfig) -> AppState {
     let level_template_repository = Arc::new(SqlxLevelTemplateRepository::new(pool.clone()));
     let user_card_repository = Arc::new(SqlxUserCardRepository::new(pool.clone()));
     let tenant_repository = Arc::new(SqlxTenantRepository::new(pool.clone()));
+    #[allow(unused_qualifications)]
+    let memory_v1_governance_commit: std::sync::Arc<
+        dyn astral_trustgraph::service::memory_v1_governance_commit::MemoryV1GovernanceCommitPort,
+    > = std::sync::Arc::new(
+        astral_trustgraph::service::memory_v1_governance_commit::FailClosedMemoryV1GovernanceCommitPort,
+    );
+    let memory_v1_deny_proof: std::sync::Arc<
+        dyn astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofPort,
+    > = std::sync::Arc::new(
+        astral_trustgraph::service::memory_v1_governance_commit::FailClosedMemoryV1DenyProofPort,
+    );
     AppState {
         config,
         db: pool.clone(),
@@ -406,6 +417,8 @@ fn build_app_state(pool: MySqlPool, config: AppConfig) -> AppState {
         level_template_repository: level_template_repository.clone(),
         user_card_repository: user_card_repository.clone(),
         tenant_repository: tenant_repository.clone(),
+        memory_v1_governance_commit,
+        memory_v1_deny_proof,
         tenant_service: Arc::new(TenantService::new(tenant_repository)),
         approval_service: Arc::new(ApprovalService::new(permission_request_repository)),
         template_service: Arc::new(TemplateService::new(template_repository)),

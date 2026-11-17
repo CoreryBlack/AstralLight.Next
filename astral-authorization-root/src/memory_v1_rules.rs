@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::memory_v1_db_rows::{BindingConfirmationRow, BindingLayer, RuleSetVersionRow};
+use crate::memory_v1_db_rows::{
+    BindingConfirmationRow, BindingLayer, RuleSetChangeConfirmationRow, RuleSetVersionRow,
+};
 
 const HASH_DOMAIN: &[u8] = b"astrallight/memory-v1/rule-set-version/1\0";
 const MAX_RULES: usize = 4096;
@@ -259,17 +261,164 @@ pub fn parse_version(
     MemoryV1RuleSetContent::parse(&version.content_bytes)
 }
 
+// memory—v1 §4.11/N-16 (B-3.8): structural validation of a binding's
+// confirmation row is independent of the selected rule-set version. This
+// check does not prove confirmer authority or scope coverage; the evaluator must
+// require those separately. Version freshness is carried by the rule-set change
+// confirmation.
+pub fn binding_confirmation_valid(
+    confirmation: &BindingConfirmationRow,
+    binding_id: [u8; 16],
+    rule_set_id: [u8; 16],
+) -> bool {
+    confirmation.binding_id == binding_id
+        && confirmation.rule_set_id == rule_set_id
+        && confirmation.confirmer_user_id != [0; 16]
+        && !confirmation.scope_bytes.is_empty()
+        && !confirmation.operation_id.is_empty()
+        && !confirmation.confirmed_at_bytes.is_empty()
+}
+
+/// memory—v1 §4.11/§4.12: The state of a binding's whole confirmation set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingConfirmationState {
+    /// Exactly one valid confirmation is active and no active row is invalid.
+    Active,
+    /// Every structurally valid confirmation has been revoked.
+    Withdrawn,
+    /// No valid confirmation exists, an active row is invalid, or multiple are active.
+    Invalid,
+}
+
+/// memory—v1 §4.11/§4.12: Classify an unordered set without allowing a valid
+/// confirmation to conceal an invalid active row or another active confirmation.
+/// Revoked historical rows do not grant authority; an incomplete tombstone is
+/// always invalid.
+pub fn classify_binding_confirmations<'a>(
+    confirmations: impl IntoIterator<Item = &'a BindingConfirmationRow>,
+    binding_id: [u8; 16],
+    rule_set_id: [u8; 16],
+) -> BindingConfirmationState {
+    let mut valid = false;
+    let mut active = false;
+    for confirmation in confirmations {
+        if confirmation.revoked_at.is_some() != confirmation.revoked_by.is_some() {
+            return BindingConfirmationState::Invalid;
+        }
+        let structurally_valid = binding_confirmation_valid(confirmation, binding_id, rule_set_id);
+        if confirmation.revoked_at.is_none() {
+            if !structurally_valid || active {
+                return BindingConfirmationState::Invalid;
+            }
+            active = true;
+        }
+        valid |= structurally_valid;
+    }
+    if active {
+        BindingConfirmationState::Active
+    } else if valid {
+        BindingConfirmationState::Withdrawn
+    } else {
+        BindingConfirmationState::Invalid
+    }
+}
+
+/// memory—v1 §4.11/§4.12/§4.13: The state of change confirmations for the
+/// explicitly selected current version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeConfirmationState {
+    /// At least one structurally valid, non-revoked confirmation covers the
+    /// current version, and no non-revoked current-version row is invalid.
+    Active,
+    /// Current-version confirmation rows exist, but every one is a complete
+    /// revocation tombstone. A revoked confirmation never proves freshness.
+    Withdrawn,
+    /// No confirmation row covers the current version. Historical rows do not
+    /// satisfy the current-version freshness invariant.
+    Missing,
+    /// A current-version active row is malformed, a row belongs to another
+    /// rule set, or a tombstone has only one half present.
+    Invalid,
+}
+
+/// memory—v1 §4.11/§4.12/§4.13: Classify change confirmations against the
+/// explicit current-version pointer.
+///
+/// Multiple valid active confirmations for one version are permitted as
+/// traceability records. The classifier is deliberately not an `any(valid)`
+/// reduction: a malformed active row for the same current version makes the
+/// whole current-version evidence invalid, even when another row is valid.
+/// Complete revoked rows are historical tombstones and never grant freshness;
+/// rows for an older version are ignored for current-version qualification.
+/// A half tombstone is structural corruption regardless of version.
+pub fn classify_change_confirmations<'a>(
+    confirmations: impl IntoIterator<Item = &'a RuleSetChangeConfirmationRow>,
+    rule_set_id: [u8; 16],
+    version: &[u8],
+) -> ChangeConfirmationState {
+    if version.is_empty() {
+        return ChangeConfirmationState::Invalid;
+    }
+    let mut current_seen = false;
+    let mut current_active = false;
+
+    for confirmation in confirmations {
+        if confirmation.revoked_at.is_some() != confirmation.revoked_by.is_some() {
+            return ChangeConfirmationState::Invalid;
+        }
+        if confirmation.rule_set_id != rule_set_id {
+            return ChangeConfirmationState::Invalid;
+        }
+        if confirmation.version_bytes != version {
+            continue;
+        }
+        current_seen = true;
+        if confirmation.revoked_at.is_some() {
+            continue;
+        }
+        if !change_confirmation_valid(confirmation, rule_set_id, version) {
+            return ChangeConfirmationState::Invalid;
+        }
+        current_active = true;
+    }
+
+    if current_active {
+        ChangeConfirmationState::Active
+    } else if current_seen {
+        ChangeConfirmationState::Withdrawn
+    } else {
+        ChangeConfirmationState::Missing
+    }
+}
+
+/// Legacy structural comparison for callers that record the binding-time version.
+///
+/// This is not an authorization decision: the current version still requires a
+/// separate active change confirmation, and revoked confirmations must not grant
+/// access. New authorization code uses [`binding_confirmation_valid`] together
+/// with [`change_confirmation_valid`].
 pub fn confirmation_matches(
     confirmation: &BindingConfirmationRow,
     binding_id: [u8; 16],
     rule_set_id: [u8; 16],
     version: &[u8],
 ) -> bool {
-    confirmation.binding_id == binding_id
-        && confirmation.rule_set_id == rule_set_id
+    binding_confirmation_valid(confirmation, binding_id, rule_set_id)
+        && confirmation.version_bytes == version
+}
+
+// memory—v1 §4.11/§4.5 (N-16/B-3.8): the CURRENT version is servable only with
+// a non-revoked change confirmation for exactly that version (版本新鲜度不变式:
+// 首版与每次发布同事务确认).
+pub fn change_confirmation_valid(
+    confirmation: &RuleSetChangeConfirmationRow,
+    rule_set_id: [u8; 16],
+    version: &[u8],
+) -> bool {
+    confirmation.rule_set_id == rule_set_id
         && confirmation.version_bytes == version
         && confirmation.confirmer_user_id != [0; 16]
-        && !confirmation.scope_bytes.is_empty()
+        && !confirmation.affected_scope_bytes.is_empty()
         && !confirmation.operation_id.is_empty()
         && !confirmation.confirmed_at_bytes.is_empty()
 }
@@ -326,6 +475,183 @@ mod tests {
             hash_input_bytes: input.clone(),
             hash_bytes: Sha256::digest(input).to_vec(),
         }
+    }
+
+    #[test]
+    fn legacy_confirmation_comparison_preserves_version_matching() {
+        let confirmation = BindingConfirmationRow {
+            confirmation_id: [1; 16],
+            binding_id: [2; 16],
+            rule_set_id: [3; 16],
+            version_bytes: b"v1".to_vec(),
+            confirmer_user_id: [4; 16],
+            scope_bytes: b"scope".to_vec(),
+            operation_id: b"operation".to_vec(),
+            confirmed_at_bytes: b"time".to_vec(),
+            revoked_at: None,
+            revoked_by: None,
+        };
+        assert!(confirmation_matches(&confirmation, [2; 16], [3; 16], b"v1"));
+        assert!(!confirmation_matches(
+            &confirmation,
+            [2; 16],
+            [3; 16],
+            b"v2"
+        ));
+        assert!(!confirmation_matches(
+            &confirmation,
+            [5; 16],
+            [3; 16],
+            b"v1"
+        ));
+        assert!(binding_confirmation_valid(&confirmation, [2; 16], [3; 16]));
+    }
+
+    #[test]
+    // memory—v1 §4.11/§4.12: Set classification is unordered and cannot
+    // confuse corrupt active rows, missing evidence, and historical withdrawals.
+    fn binding_confirmation_set_classification() {
+        let valid = BindingConfirmationRow {
+            confirmation_id: [1; 16],
+            binding_id: [2; 16],
+            rule_set_id: [3; 16],
+            version_bytes: b"v1".to_vec(),
+            confirmer_user_id: [4; 16],
+            scope_bytes: b"scope".to_vec(),
+            operation_id: b"operation".to_vec(),
+            confirmed_at_bytes: b"time".to_vec(),
+            revoked_at: None,
+            revoked_by: None,
+        };
+        let mut second_active = valid.clone();
+        second_active.confirmation_id = [5; 16];
+        let mut revoked = valid.clone();
+        revoked.revoked_at = Some(100);
+        revoked.revoked_by = Some([4; 16]);
+        let mut invalid = valid.clone();
+        invalid.scope_bytes.clear();
+        let mut invalid_revoked = revoked.clone();
+        invalid_revoked.scope_bytes.clear();
+        let mut incomplete_tombstone = valid.clone();
+        incomplete_tombstone.revoked_at = Some(100);
+
+        for (rows, expected) in [
+            (vec![], BindingConfirmationState::Invalid),
+            (vec![&invalid], BindingConfirmationState::Invalid),
+            (vec![&invalid_revoked], BindingConfirmationState::Invalid),
+            (vec![&valid], BindingConfirmationState::Active),
+            (vec![&revoked], BindingConfirmationState::Withdrawn),
+            (
+                vec![&revoked, &invalid_revoked],
+                BindingConfirmationState::Withdrawn,
+            ),
+            (vec![&revoked, &valid], BindingConfirmationState::Active),
+            (
+                vec![&valid, &second_active],
+                BindingConfirmationState::Invalid,
+            ),
+            (
+                vec![&revoked, &valid, &second_active],
+                BindingConfirmationState::Invalid,
+            ),
+            (vec![&valid, &invalid], BindingConfirmationState::Invalid),
+            (vec![&revoked, &invalid], BindingConfirmationState::Invalid),
+            (
+                vec![&valid, &incomplete_tombstone],
+                BindingConfirmationState::Invalid,
+            ),
+        ] {
+            assert_eq!(
+                classify_binding_confirmations(rows.iter().copied(), [2; 16], [3; 16]),
+                expected
+            );
+            assert_eq!(
+                classify_binding_confirmations(rows.iter().rev().copied(), [2; 16], [3; 16]),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    // memory—v1 §4.11–§4.13: current-version change evidence must classify
+    // the whole set; a valid row cannot conceal corrupt active evidence.
+    fn change_confirmation_set_classification_distinguishes_current_and_history() {
+        let valid = RuleSetChangeConfirmationRow {
+            confirmation_id: [1; 16],
+            rule_set_id: [3; 16],
+            version_bytes: b"v2".to_vec(),
+            confirmer_user_id: [4; 16],
+            affected_scope_bytes: b"scope".to_vec(),
+            operation_id: b"operation".to_vec(),
+            confirmed_at_bytes: b"time".to_vec(),
+            revoked_at: None,
+            revoked_by: None,
+        };
+        let mut second_valid = valid.clone();
+        second_valid.confirmation_id = [2; 16];
+        let mut historical = valid.clone();
+        historical.confirmation_id = [3; 16];
+        historical.version_bytes = b"v1".to_vec();
+        let mut revoked = valid.clone();
+        revoked.confirmation_id = [4; 16];
+        revoked.revoked_at = Some(100);
+        revoked.revoked_by = Some([5; 16]);
+        let mut malformed = valid.clone();
+        malformed.confirmation_id = [5; 16];
+        malformed.affected_scope_bytes.clear();
+        let mut half_tombstone = valid.clone();
+        half_tombstone.confirmation_id = [6; 16];
+        half_tombstone.revoked_at = Some(100);
+
+        let classify = |rows: &[RuleSetChangeConfirmationRow]| {
+            classify_change_confirmations(rows.iter(), [3; 16], b"v2")
+        };
+        assert_eq!(classify(&[]), ChangeConfirmationState::Missing);
+        assert_eq!(
+            classify(&[historical.clone()]),
+            ChangeConfirmationState::Missing
+        );
+        assert_eq!(
+            classify(&[revoked.clone()]),
+            ChangeConfirmationState::Withdrawn
+        );
+        assert_eq!(
+            classify(std::slice::from_ref(&valid)),
+            ChangeConfirmationState::Active
+        );
+        assert_eq!(
+            classify(&[valid.clone(), second_valid.clone()]),
+            ChangeConfirmationState::Active
+        );
+        assert_eq!(
+            classify(&[valid.clone(), malformed.clone()]),
+            ChangeConfirmationState::Invalid
+        );
+        assert_eq!(
+            classify(&[revoked.clone(), valid.clone()]),
+            ChangeConfirmationState::Active
+        );
+        assert_eq!(
+            classify(&[valid.clone(), half_tombstone.clone()]),
+            ChangeConfirmationState::Invalid
+        );
+
+        let mut wrong_set = historical.clone();
+        wrong_set.rule_set_id = [9; 16];
+        assert_eq!(classify(&[wrong_set]), ChangeConfirmationState::Invalid);
+
+        assert_eq!(
+            classify_change_confirmations([&valid], [3; 16], b""),
+            ChangeConfirmationState::Invalid
+        );
+
+        // Classification is independent of candidate row order.
+        let reversed = [second_valid.clone(), malformed.clone()];
+        assert_eq!(classify(&reversed), ChangeConfirmationState::Invalid);
+        assert_eq!(
+            classify_change_confirmations(reversed.iter().rev(), [3; 16], b"v2"),
+            ChangeConfirmationState::Invalid
+        );
     }
 
     #[test]

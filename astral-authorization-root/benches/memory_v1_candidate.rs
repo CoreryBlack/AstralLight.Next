@@ -51,6 +51,7 @@ fn fixture(
     for n in 0..bindings {
         let rule = id(n as u64 + 1);
         rows.rule_sets.push(RuleSetRow {
+            status: astral_authorization_root::memory_v1_db_rows::RuleSetStatus::Active,
             rule_set_id: rule,
             owner_tenant_id: id(1),
             current_version_bytes: Vec::new(),

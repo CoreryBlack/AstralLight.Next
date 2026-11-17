@@ -374,6 +374,27 @@ impl RequestRootExtension {
         std::ptr::eq(self.shared.as_ptr(), shared.as_ptr())
     }
 
+    // memory—v1: Check the root-owned session token without capturing a snapshot.
+    pub(crate) fn has_session_authority(
+        &self,
+        authority_id: &Arc<crate::memory_v1_session::SessionAuthorityToken>,
+    ) -> Result<bool, RequestRootAccessError> {
+        let shared = self.active_shared()?;
+        let state = shared
+            .state
+            .lock()
+            .map_err(|_| RequestRootAccessError::Poisoned)?;
+        if !shared.active.load(Ordering::Acquire) {
+            return Err(RequestRootAccessError::ScopeEnded);
+        }
+        state
+            .context
+            .as_ref()
+            .ok_or(RequestRootAccessError::ScopeEnded)?
+            .has_session_authority(authority_id)
+            .map_err(RequestRootAccessError::from)
+    }
+
     /// memory—v1: Borrow this request's one lazy reader for a synchronous action.
     ///
     /// Initialization is serialized only within this request. The lock is

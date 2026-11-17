@@ -15,15 +15,16 @@ use std::sync::{Arc, RwLock, Weak};
 
 use crate::memory_v1_db_rows::{
     BinaryId, BindingConfirmationRow, BindingLayer, BindingRow, CandidateRows, CurrentSelection,
-    IdentityCardRow, RuleSetChangeConfirmationRow, RuleSetRow, RuleSetVersionRow, TenantRow,
-    UserCardRow, UserRow,
+    IdentityCardRow, RuleSetChangeConfirmationRow, RuleSetRow, RuleSetStatus, RuleSetVersionRow,
+    TenantRow, UserCardRow, UserCardStatus, UserRow,
 };
 use crate::memory_v1_digest::{
-    Change, ContentDigest, DigestError, DigestIndex, Fields, Key, Table,
+    Change, ColdDigestBuilder, ContentDigest, DigestError, DigestIndex, Fields, Key, Table,
 };
 use crate::memory_v1_hamt::{
-    CandidateBudget, CandidateError, HamtCandidate, RuleSetImpactCandidate,
+    count_rows, CandidateBudget, CandidateError, HamtCandidate, RuleSetImpactCandidate,
 };
+use crate::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
 
 /// Failures of this isolated candidate runtime.
 #[derive(Debug, PartialEq, Eq)]
@@ -181,6 +182,7 @@ impl HamtRuntimeOwner {
         selections: Vec<CurrentSelection>,
         budget: CandidateBudget,
     ) -> Result<Self, RuntimeError> {
+        count_rows(&rows, budget.max_table_rows).map_err(RuntimeError::Candidate)?;
         let digest = digest_rows(&rows, &selections)?;
         let candidate =
             HamtCandidate::build(rows, selections, budget).map_err(RuntimeError::Candidate)?;
@@ -420,7 +422,7 @@ impl HamtRuntimeHandle {
 }
 
 // memory—v1: Encode every version field, including its composite identity.
-fn version_change(row: &RuleSetVersionRow) -> Change {
+pub(crate) fn version_change(row: &RuleSetVersionRow) -> Change {
     Change::Put {
         key: Key::rule_set_version(row.rule_set_id, row.version_bytes.clone()),
         fields: vec![
@@ -442,23 +444,120 @@ fn row_change(table: Table, id: BinaryId, fields: Fields) -> Change {
     }
 }
 
-// memory—v1: Incrementally index the nine supplied tables and selections.
-fn digest_rows(
+// memory—v1: The same row encoders serve full rebuilds and incremental updates.
+pub(crate) fn card_change(row: &UserCardRow) -> Change {
+    row_change(
+        Table::UserCard,
+        row.user_card_id,
+        vec![
+            Some(row.user_card_id.to_vec()),
+            Some(row.user_id.to_vec()),
+            Some(row.tenant_id.to_vec()),
+            Some(match row.status {
+                UserCardStatus::Active => b"ACTIVE".to_vec(),
+                UserCardStatus::Disabled => b"DISABLED".to_vec(),
+            }),
+        ],
+    )
+}
+
+// memory—v1: Encode the complete current rule-set row for either digest path.
+pub(crate) fn rule_set_change(row: &RuleSetRow) -> Change {
+    row_change(
+        Table::RuleSet,
+        row.rule_set_id,
+        vec![
+            Some(row.rule_set_id.to_vec()),
+            Some(row.owner_tenant_id.to_vec()),
+            Some(row.current_version_bytes.clone()),
+            Some(match row.status {
+                RuleSetStatus::Active => b"ACTIVE".to_vec(),
+                RuleSetStatus::Retired => b"RETIRED".to_vec(),
+            }),
+        ],
+    )
+}
+
+// memory—v1: Encode all binding fields, including scope and tombstone.
+pub(crate) fn binding_change(row: &BindingRow) -> Change {
+    let layer = match row.binding_layer {
+        BindingLayer::Base => b"BASE".to_vec(),
+        BindingLayer::Overlay => b"OVERLAY".to_vec(),
+    };
+    row_change(
+        Table::Binding,
+        row.binding_id,
+        vec![
+            Some(row.binding_id.to_vec()),
+            Some(row.user_card_id.to_vec()),
+            Some(row.rule_set_id.to_vec()),
+            Some(layer),
+            row.valid_from.map(|value| value.to_be_bytes().to_vec()),
+            row.valid_until.map(|value| value.to_be_bytes().to_vec()),
+            Some(match row.owner_scope {
+                MemoryV1OwnerScope::SelfUser => b"self".to_vec(),
+                MemoryV1OwnerScope::AllUsers => b"all".to_vec(),
+            }),
+            Some(match row.tenant_scope {
+                MemoryV1TenantScope::SelfTenant => b"self".to_vec(),
+                MemoryV1TenantScope::SelfAndDescendants => b"self+descendants".to_vec(),
+            }),
+            row.removed_at.map(|value| value.to_be_bytes().to_vec()),
+            row.removed_by.map(|id| id.to_vec()),
+        ],
+    )
+}
+
+// memory—v1: Encode the complete binding confirmation and revocation pair.
+pub(crate) fn confirmation_change(row: &BindingConfirmationRow) -> Change {
+    row_change(
+        Table::BindingConfirmation,
+        row.confirmation_id,
+        vec![
+            Some(row.confirmation_id.to_vec()),
+            Some(row.binding_id.to_vec()),
+            Some(row.rule_set_id.to_vec()),
+            Some(row.version_bytes.clone()),
+            Some(row.confirmer_user_id.to_vec()),
+            Some(row.scope_bytes.clone()),
+            Some(row.operation_id.clone()),
+            Some(row.confirmed_at_bytes.clone()),
+            row.revoked_at.map(|value| value.to_be_bytes().to_vec()),
+            row.revoked_by.map(|id| id.to_vec()),
+        ],
+    )
+}
+
+// memory—v1: Encode the complete rule-set confirmation and revocation pair.
+pub(crate) fn change_confirmation_change(row: &RuleSetChangeConfirmationRow) -> Change {
+    row_change(
+        Table::RuleSetChangeConfirmation,
+        row.confirmation_id,
+        vec![
+            Some(row.confirmation_id.to_vec()),
+            Some(row.rule_set_id.to_vec()),
+            Some(row.version_bytes.clone()),
+            Some(row.confirmer_user_id.to_vec()),
+            Some(row.affected_scope_bytes.clone()),
+            Some(row.operation_id.clone()),
+            Some(row.confirmed_at_bytes.clone()),
+            row.revoked_at.map(|value| value.to_be_bytes().to_vec()),
+            row.revoked_by.map(|id| id.to_vec()),
+        ],
+    )
+}
+
+// memory—v1: Cold-build the nine supplied tables and selections without publication.
+pub(crate) fn digest_rows(
     rows: &CandidateRows,
     selections: &[CurrentSelection],
 ) -> Result<DigestIndex, RuntimeError> {
-    let mut digest = DigestIndex::new();
-    // Each batch is within DigestIndex's fixed limit; the index itself enforces
-    // its aggregate row and byte ceilings. Candidate validation rejects duplicates.
-    let mut batch = Vec::with_capacity(128);
+    let mut builder = ColdDigestBuilder::new();
     let mut push = |change| -> Result<(), RuntimeError> {
-        batch.push(change);
-        if batch.len() == 128 {
-            digest = digest
-                .prepare(batch.drain(..))
-                .map_err(RuntimeError::Digest)?;
-        }
-        Ok(())
+        let Change::Put { key, fields } = change else {
+            unreachable!("cold row encoders only produce puts");
+        };
+        builder.push(key, fields).map_err(RuntimeError::Digest)
     };
     for row in &rows.users {
         push(row_change(
@@ -488,75 +587,22 @@ fn digest_rows(
         ))?;
     }
     for row in &rows.user_cards {
-        push(row_change(
-            Table::UserCard,
-            row.user_card_id,
-            vec![
-                Some(row.user_card_id.to_vec()),
-                Some(row.user_id.to_vec()),
-                Some(row.tenant_id.to_vec()),
-            ],
-        ))?;
+        push(card_change(row))?;
     }
     for row in &rows.rule_sets {
-        push(row_change(
-            Table::RuleSet,
-            row.rule_set_id,
-            vec![
-                Some(row.rule_set_id.to_vec()),
-                Some(row.owner_tenant_id.to_vec()),
-            ],
-        ))?;
+        push(rule_set_change(row))?;
     }
     for row in &rows.rule_set_versions {
         push(version_change(row))?;
     }
     for row in &rows.bindings {
-        let layer = match row.binding_layer {
-            BindingLayer::Base => b"BASE".to_vec(),
-            BindingLayer::Overlay => b"OVERLAY".to_vec(),
-        };
-        push(row_change(
-            Table::Binding,
-            row.binding_id,
-            vec![
-                Some(row.binding_id.to_vec()),
-                Some(row.user_card_id.to_vec()),
-                Some(row.rule_set_id.to_vec()),
-                Some(layer),
-            ],
-        ))?;
+        push(binding_change(row))?;
     }
     for row in &rows.binding_confirmations {
-        push(row_change(
-            Table::BindingConfirmation,
-            row.confirmation_id,
-            vec![
-                Some(row.confirmation_id.to_vec()),
-                Some(row.binding_id.to_vec()),
-                Some(row.rule_set_id.to_vec()),
-                Some(row.version_bytes.clone()),
-                Some(row.confirmer_user_id.to_vec()),
-                Some(row.scope_bytes.clone()),
-                Some(row.operation_id.clone()),
-                Some(row.confirmed_at_bytes.clone()),
-            ],
-        ))?;
+        push(confirmation_change(row))?;
     }
     for row in &rows.rule_set_change_confirmations {
-        push(row_change(
-            Table::RuleSetChangeConfirmation,
-            row.confirmation_id,
-            vec![
-                Some(row.confirmation_id.to_vec()),
-                Some(row.rule_set_id.to_vec()),
-                Some(row.version_bytes.clone()),
-                Some(row.confirmer_user_id.to_vec()),
-                Some(row.affected_scope_bytes.clone()),
-                Some(row.operation_id.clone()),
-                Some(row.confirmed_at_bytes.clone()),
-            ],
-        ))?;
+        push(change_confirmation_change(row))?;
     }
     for selection in selections {
         push(Change::select_current(
@@ -565,13 +611,11 @@ fn digest_rows(
         ))?;
     }
     drop(push);
-    if !batch.is_empty() {
-        digest = digest.prepare(batch).map_err(RuntimeError::Digest)?;
-    }
-    Ok(digest)
+    builder.finish().map_err(RuntimeError::Digest)
 }
 
-/// memory—v1: Compute the candidate digest used by the unique-root installer.
+/// memory—v1: Rebuild the candidate digest for tests and test-support diagnostics.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn digest_candidate(
     rows: &CandidateRows,
     selections: &[CurrentSelection],
@@ -582,24 +626,33 @@ pub(crate) fn digest_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_v1_db_rows::UserCardStatus;
     use crate::memory_v1_db_rows::{IdentityCardRow, RuleSetRow, TenantRow, UserRow};
-    use crate::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
 
     // memory—v1: Construct distinct candidate IDs.
     fn id(n: u8) -> BinaryId {
         [n; 16]
     }
 
-    // memory—v1: Build a minimal complete version row.
+    // memory—v1: Build a complete version with its canonical digest.
     fn version(n: u8) -> RuleSetVersionRow {
+        let version_bytes = vec![n];
+        let content_bytes =
+            br#"{"rules":[{"ruleId":"R","resource":"document","action":"read","effect":"ALLOW"}]}"#
+                .to_vec();
+        let timestamp_bytes = vec![0];
+        let hash_input_bytes = crate::memory_v1_rules::canonical_version_bytes(
+            &version_bytes,
+            &content_bytes,
+            &timestamp_bytes,
+        );
+        let hash_bytes = crate::memory_v1_rules::version_digest(&hash_input_bytes);
         RuleSetVersionRow {
             rule_set_id: id(3),
-            version_bytes: vec![n],
-            content_bytes: vec![n],
-            timestamp_bytes: vec![0],
-            hash_input_bytes: vec![n],
-            hash_bytes: vec![n],
+            version_bytes,
+            content_bytes,
+            timestamp_bytes,
+            hash_input_bytes,
+            hash_bytes,
         }
     }
 
@@ -625,6 +678,7 @@ mod tests {
                 rule_set_id: id(3),
                 owner_tenant_id: id(4),
                 current_version_bytes: Vec::new(),
+                status: RuleSetStatus::Active,
             }],
             rule_set_versions: vec![version(1)],
             bindings: vec![BindingRow {
@@ -665,6 +719,147 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    // memory—v1: Runtime cold encoding matches independently specified row fields.
+    fn digest_rows_matches_explicit_incremental_input() {
+        let rows = CandidateRows {
+            users: vec![UserRow { user_id: id(2) }, UserRow { user_id: id(1) }],
+            tenants: vec![
+                TenantRow {
+                    tenant_id: id(4),
+                    parent_tenant_id: None,
+                },
+                TenantRow {
+                    tenant_id: id(5),
+                    parent_tenant_id: Some(id(4)),
+                },
+            ],
+            rule_set_versions: vec![version(1)],
+            ..CandidateRows::default()
+        };
+        let selections = vec![CurrentSelection {
+            rule_set_id: id(3),
+            version_bytes: vec![],
+        }];
+        let version = &rows.rule_set_versions[0];
+        let expected = DigestIndex::new()
+            .prepare([
+                Change::Put {
+                    key: Key::row(Table::User, id(2)),
+                    fields: vec![Some(id(2).to_vec())],
+                },
+                Change::Put {
+                    key: Key::row(Table::User, id(1)),
+                    fields: vec![Some(id(1).to_vec())],
+                },
+                Change::Put {
+                    key: Key::row(Table::Tenant, id(4)),
+                    fields: vec![Some(id(4).to_vec()), None],
+                },
+                Change::Put {
+                    key: Key::row(Table::Tenant, id(5)),
+                    fields: vec![Some(id(5).to_vec()), Some(id(4).to_vec())],
+                },
+                Change::Put {
+                    key: Key::rule_set_version(id(3), vec![1]),
+                    fields: vec![
+                        Some(id(3).to_vec()),
+                        Some(vec![1]),
+                        Some(version.content_bytes.clone()),
+                        Some(version.timestamp_bytes.clone()),
+                        Some(version.hash_input_bytes.clone()),
+                        Some(version.hash_bytes.clone()),
+                    ],
+                },
+                Change::Put {
+                    key: Key::current_selection(id(3)),
+                    fields: vec![Some(vec![])],
+                },
+            ])
+            .unwrap();
+        let actual = digest_rows(&rows, &selections).unwrap();
+        assert_eq!(actual.digest(), expected.digest());
+        assert_eq!(
+            actual.get(&Key::current_selection(id(3))),
+            Some(&vec![Some(vec![])])
+        );
+        let mut duplicate = rows.clone();
+        duplicate.users.push(UserRow { user_id: id(2) });
+        assert!(matches!(
+            digest_rows(&duplicate, &selections),
+            Err(RuntimeError::Digest(DigestError::DuplicateKey))
+        ));
+    }
+
+    #[test]
+    // memory—v1: Row preflight wins over digest errors, without constructing an
+    // owner. A later bounded construction keeps the original digest and metadata.
+    fn cold_preflight_precedes_digest_errors_and_allows_retry() {
+        let rows = CandidateRows {
+            users: vec![UserRow { user_id: id(1) }, UserRow { user_id: id(1) }],
+            ..CandidateRows::default()
+        };
+        let mut limits = CandidateBudget {
+            max_table_rows: 1,
+            max_bindings_per_read: 4,
+        };
+        assert!(matches!(
+            digest_rows(&rows, &[]),
+            Err(RuntimeError::Digest(DigestError::DuplicateKey))
+        ));
+        assert!(matches!(
+            HamtRuntimeOwner::new(rows.clone(), vec![], limits),
+            Err(RuntimeError::Candidate(CandidateError::RowBudgetExceeded {
+                max: 1
+            }))
+        ));
+        limits.max_table_rows = 2;
+        assert!(matches!(
+            HamtRuntimeOwner::new(rows, vec![], limits),
+            Err(RuntimeError::Digest(DigestError::DuplicateKey))
+        ));
+        let valid = CandidateRows {
+            users: vec![UserRow { user_id: id(1) }],
+            identity_cards: vec![IdentityCardRow {
+                identity_card_id: id(2),
+                user_id: id(1),
+            }],
+            ..CandidateRows::default()
+        };
+        let expected = digest_rows(&valid, &[]).unwrap().digest();
+        let oversized_selection = vec![CurrentSelection {
+            rule_set_id: id(3),
+            version_bytes: vec![0; 256],
+        }];
+        assert!(matches!(
+            digest_rows(&valid, &oversized_selection),
+            Err(RuntimeError::Digest(DigestError::LimitExceeded))
+        ));
+        assert!(matches!(
+            HamtRuntimeOwner::new(
+                valid.clone(),
+                oversized_selection.clone(),
+                CandidateBudget {
+                    max_table_rows: 1,
+                    ..limits
+                }
+            ),
+            Err(RuntimeError::Candidate(CandidateError::RowBudgetExceeded {
+                max: 1
+            }))
+        ));
+        assert!(matches!(
+            HamtRuntimeOwner::new(valid.clone(), oversized_selection, limits),
+            Err(RuntimeError::Digest(DigestError::LimitExceeded))
+        ));
+        let owner = HamtRuntimeOwner::new(valid, vec![], limits).unwrap();
+        let metadata = owner.handle().token().unwrap().metadata();
+        assert_eq!(metadata.version, 0);
+        assert_eq!(metadata.row_count, 2);
+        assert_eq!(metadata.digest, expected);
+        assert_eq!(metadata.budget, limits);
     }
 
     #[test]
@@ -810,5 +1005,76 @@ mod tests {
             .unwrap();
         assert_eq!(current.value, (vec![2], vec![1]));
         assert_eq!(current.token.metadata(), metadata);
+    }
+
+    #[test]
+    // memory—v1: Every lifecycle and scope field changes the root content digest.
+    fn digest_binds_lifecycle_and_scope_fields() {
+        let state = owner();
+        let candidate = state.state.read().unwrap().candidate.clone();
+        let (rows, selections) = candidate.digest_inputs();
+        let baseline = digest_candidate(&rows, &selections).unwrap();
+        let mut variants = Vec::new();
+
+        let mut changed = rows.clone();
+        changed.user_cards[0].status = UserCardStatus::Disabled;
+        variants.push(changed);
+        let mut changed = rows.clone();
+        changed.rule_sets[0].current_version_bytes = vec![2];
+        variants.push(changed);
+        for field in 0..6 {
+            let mut changed = rows.clone();
+            let binding = &mut changed.bindings[0];
+            match field {
+                0 => binding.valid_from = Some(10),
+                1 => binding.valid_until = Some(20),
+                2 => binding.owner_scope = MemoryV1OwnerScope::AllUsers,
+                3 => binding.tenant_scope = MemoryV1TenantScope::SelfAndDescendants,
+                4 => binding.removed_at = Some(10),
+                _ => binding.removed_by = Some(id(1)),
+            }
+            variants.push(changed);
+        }
+        for field in 0..2 {
+            let mut changed = rows.clone();
+            let confirmation = &mut changed.binding_confirmations[0];
+            if field == 0 {
+                confirmation.revoked_at = Some(10);
+            } else {
+                confirmation.revoked_by = Some(id(1));
+            }
+            variants.push(changed);
+        }
+        let mut with_change = rows.clone();
+        with_change
+            .rule_set_change_confirmations
+            .push(RuleSetChangeConfirmationRow {
+                confirmation_id: id(9),
+                rule_set_id: id(3),
+                version_bytes: vec![1],
+                confirmer_user_id: id(1),
+                affected_scope_bytes: vec![1],
+                operation_id: vec![1],
+                confirmed_at_bytes: vec![1],
+                revoked_at: None,
+                revoked_by: None,
+            });
+        let change_baseline = digest_candidate(&with_change, &selections).unwrap();
+        for field in 0..2 {
+            let mut changed = with_change.clone();
+            let confirmation = &mut changed.rule_set_change_confirmations[0];
+            if field == 0 {
+                confirmation.revoked_at = Some(10);
+            } else {
+                confirmation.revoked_by = Some(id(1));
+            }
+            assert_ne!(
+                digest_candidate(&changed, &selections).unwrap(),
+                change_baseline
+            );
+        }
+        for changed in variants {
+            assert_ne!(digest_candidate(&changed, &selections).unwrap(), baseline);
+        }
     }
 }

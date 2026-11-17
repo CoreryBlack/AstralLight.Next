@@ -18,8 +18,9 @@ uuid = { workspace = true }
 
 [features]
 # memory—v1: Isolated-test hooks only (for example adopting a fixture root as
-# Serving). Enable it exclusively from `[dev-dependencies]`; with resolver 2 it
-# is then absent from every non-test build, including production binaries.
+# Serving). Dev-dependency feature isolation under resolver 2 keeps it out of
+# ordinary production builds, but explicit feature selection can enable it.
+# This feature is not a security boundary and must not be used for deployment.
 test-support = []
 
 [[bench]]

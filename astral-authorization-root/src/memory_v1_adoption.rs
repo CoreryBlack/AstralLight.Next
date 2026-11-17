@@ -10,16 +10,14 @@
 //!   lifecycle, confirmation authority, writer inventory, audit and recovery
 //!   contracts are not implemented, so nothing can honestly mark them proven.
 //! * **Experimental** is an explicit, operator-acknowledged profile for an
-//!   isolated service run. The facts that can really be checked are checked and
-//!   cannot be waived: the observed schema, complete table coverage re-derived
-//!   from the root's own rows, and an unambiguous current version. Every other
-//!   family stays `Unverified`; it is adopted only when the
-//!   caller names that exact [`AdoptionLimit`] as acknowledged, and the limits
-//!   are recorded next to the root for readiness output.
+//!   isolated service run. It checks the caller's schema version and nonzero
+//!   fingerprint, compares the reported counts with the root's rows, and checks
+//!   the current-version pointers. Other fact families stay `Unverified` and
+//!   require the caller to acknowledge each corresponding [`AdoptionLimit`].
 //!
-//! Every field is private. A digest or a boolean supplied by an untrusted caller
-//! is never accepted as evidence: the experimental constructor derives its
-//! verdicts from the candidate the root actually holds.
+//! `AdoptionEvidence` has private fields, while [`ColdLoadFacts`] is supplied by
+//! the caller. Experimental adoption does not independently prove the reported
+//! schema, scan, snapshot provenance or capture time.
 
 use thiserror::Error;
 
@@ -27,6 +25,29 @@ use crate::memory_v1_db_rows::TableCounts;
 use crate::memory_v1_digest::ContentDigest;
 use crate::memory_v1_hamt::CandidateBudget;
 use crate::memory_v1_root::{RootInstanceId, RootMetadata, RootStatus, ServingAdoptionCertificate};
+
+/// The only issuers that can be bound to a serving certificate.
+///
+/// This is crate-private so callers cannot select a serving grade by passing a
+/// boolean or a caller-created enum. The verifier chooses the source from the
+/// evidence path, and the root checks it again against the published record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdoptionCertificateSource {
+    /// Complete production evidence, when such a verifier exists.
+    Production,
+    /// Evidence accepted under the explicitly acknowledged experimental profile.
+    Experimental,
+    /// A test-only fixture; it cannot be presented as production evidence.
+    #[cfg(any(test, feature = "test-support"))]
+    IsolatedTest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EvidenceIssuer {
+    Production,
+    #[cfg(any(test, feature = "test-support"))]
+    IsolatedTest,
+}
 
 /// State of one mandatory fact family in the memory—v1 serving-adoption decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,29 +65,34 @@ enum EvidenceState {
 /// This is separate from the rule-set version and the process root version.
 pub const MEMORY_V1_ADOPTION_SCHEMA_VERSION: u16 = 1;
 
+/// Version of the UUID-native nine-table candidate shape required at adoption.
+/// Version 4 requires an explicit rule-set lifecycle state.
+/// This is independent of the root-side adoption input contract version.
+pub const MEMORY_V1_CANDIDATE_SCHEMA_VERSION: u16 = 4;
+
 /// A fact family an experimental adoption may leave unverified when the caller
 /// acknowledges it by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum AdoptionLimit {
-    /// The database is trusted as the cold-start source.
+    /// The database source is not independently proven trustworthy.
     SourceProvenance,
     /// The snapshot is not tied to a durable point such as a GTID.
     SnapshotIdentity,
-    /// The schema models no object state, expiry or deletion.
+    /// Complete lifecycle and validity facts are not proven.
     LifecycleAndValidity,
     /// Confirmation rows are not checked for confirmer authority.
     ConfirmationAuthority,
-    /// The schema models no resource ownership.
+    /// Trusted resource ownership is not completely proven.
     ResourceOwnership,
-    /// The schema models no eligibility or constraint facts.
+    /// Complete eligibility and constraint facts are not proven.
     Eligibility,
-    /// No separation-of-duties facts exist.
+    /// General separation-of-duties facts are not proven.
     SeparationOfDuties,
-    /// Writers outside this process are not inventoried.
+    /// Complete authorized-writer coverage is not proven.
     WriterCoverage,
     /// Decisions are not durably audited or correlated.
     AuditCorrelation,
-    /// Nothing is persisted and no recovery is defined.
+    /// Durable writes and recovery reconciliation are not established.
     PersistenceRecovery,
 }
 
@@ -105,30 +131,34 @@ impl AdoptionLimit {
     pub const fn description(self) -> &'static str {
         match self {
             Self::SourceProvenance => {
-                "the database is trusted as the cold-start source; tampering, rollback or corruption before startup is not detected"
+                "MySQL is the cold-start source, but its provenance and pre-start tampering, rollback or corruption are not independently proven"
             }
             Self::SnapshotIdentity => {
                 "the snapshot is one REPEATABLE READ transaction with no GTID or binlog position tying it to a durable point"
             }
             Self::LifecycleAndValidity => {
-                "the schema models no state, suspension, expiry or deletion; every row is treated as valid"
+                "card and binding states, validity windows and confirmation revocation are partly enforced, but complete lifecycle and validity facts are not proven"
             }
             Self::ConfirmationAuthority => {
-                "confirmations are checked for structure and the selected version only; the confirmer's authority is not verified"
+                "confirmation structure and the current version's change confirmation are checked; confirmer authority and confirmation scope are not proven"
             }
             Self::ResourceOwnership => {
-                "the schema models no resource ownership; rules match on resource type and action only"
+                "scope checks use target owner and tenant attribution; complete trusted resource-ownership facts are not proven"
             }
-            Self::Eligibility => "the schema models no eligibility or constraint facts",
-            Self::SeparationOfDuties => "no separation-of-duties facts exist and none are enforced",
+            Self::Eligibility => {
+                "structural relationships and some eligibility constraints are checked, but complete business eligibility facts are not proven"
+            }
+            Self::SeparationOfDuties => {
+                "self-confirmation and change-impact guards exist, but general separation-of-duties facts and enforcement are not proven"
+            }
             Self::WriterCoverage => {
-                "no in-process writer is mounted, but external writers and database privileges are not inventoried"
+                "governance routes cannot commit; low-level root mutation seams exist, while authorized-writer coverage and external database privileges are not proven"
             }
             Self::AuditCorrelation => {
-                "decisions are not durably audited or correlated by this profile"
+                "operation identifiers and structured logs exist, but decisions and mutations are not durably audited or correlated by this profile"
             }
             Self::PersistenceRecovery => {
-                "nothing is persisted and no recovery is defined; a restart reloads the database snapshot"
+                "MySQL is the cold-start source; in-memory mutations have no proven durable write or recovery reconciliation, and unpersisted changes may be lost on restart"
             }
         }
     }
@@ -141,24 +171,24 @@ impl AdoptionLimit {
     }
 }
 
-/// Facts only the database adapter can observe about one cold-load snapshot.
+/// Caller-supplied observations for one cold-load snapshot.
 ///
-/// The root re-derives everything it can from the candidate it holds: the three
-/// row-count views below must agree with each other and with the rows the root
-/// was built from. The schema fields are the adapter's attestation that its
-/// manifest check passed; the root can record them but cannot recheck them.
+/// The root compares the reported counts with its own rows and checks the schema
+/// contract version and nonzero fingerprint. These public fields do not prove
+/// that a database adapter performed a scan or validated the schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColdLoadFacts {
-    /// Version of the schema contract the adapter validated the observed tables against.
+    /// Caller-reported version of the schema contract.
     pub schema_contract_version: u16,
-    /// Fingerprint of the validated observed schema.
+    /// Caller-reported fingerprint of the observed schema.
     pub schema_fingerprint: [u8; 32],
-    /// `COUNT(*)` of every candidate table, read inside the same snapshot transaction.
+    /// Caller-reported `COUNT(*)` for each candidate table.
     pub snapshot_counts: TableCounts,
-    /// Rows the adapter scanned to the end of an ordered query, per table.
+    /// Caller-reported ordered scan counts, per table.
     pub scanned_counts: TableCounts,
-    /// UTC time of the capture read from the host clock, in Unix seconds. The
-    /// host clock is not an independent time source.
+    /// Caller-reported capture time in Unix seconds; the adapter normally uses
+    /// the host clock, which is not an independent time source. Only nonnegative
+    /// values are accepted; their provenance and accuracy are not verified.
     pub captured_at_unix_seconds: i64,
 }
 
@@ -175,26 +205,26 @@ pub enum AdoptionGrade {
 
 /// What was recorded when one exact root snapshot became serving.
 ///
-/// The record is stored inside the serving snapshot it describes and published
-/// with it in one compare-and-swap, so it can never describe another snapshot.
+/// The record is published atomically with the initial serving snapshot. Later
+/// snapshots may retain it as adoption history; it does not prove their freshness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdoptionRecord {
     /// How the root was adopted.
     pub grade: AdoptionGrade,
     /// Limits that stayed unverified and were acknowledged; empty for production.
     pub unverified: Vec<AdoptionLimit>,
-    /// Fingerprint of the validated schema, when a cold load supplied one.
+    /// Caller-reported schema fingerprint, when a cold load supplied one.
     pub schema_fingerprint: Option<[u8; 32]>,
-    /// Row counts verified against the snapshot, when a cold load supplied them.
+    /// Root row counts compared with caller-reported counts, when supplied.
     pub counts: Option<TableCounts>,
-    /// Capture time from the host clock, when a cold load supplied one.
+    /// Caller-reported capture time, when a cold load supplied one.
     pub captured_at_unix_seconds: Option<i64>,
 }
 
-/// Opaque evidence assembled from a trusted snapshot verification.
+/// Opaque evidence assembled for a snapshot verification.
 ///
-/// No public constructor exists. In particular, a digest or a boolean supplied
-/// by an untrusted caller is never accepted as evidence.
+/// No public constructor exists. Experimental evidence incorporates public,
+/// caller-supplied cold-load facts that are not independently authenticated.
 pub struct AdoptionEvidence {
     instance_id: RootInstanceId,
     version: u64,
@@ -202,6 +232,7 @@ pub struct AdoptionEvidence {
     budget: CandidateBudget,
     row_count: usize,
     adoption_schema_version: u16,
+    issuer: EvidenceIssuer,
     source_provenance: EvidenceState,
     snapshot_identity: EvidenceState,
     schema_manifest: EvidenceState,
@@ -406,11 +437,18 @@ impl AdoptionEvidence {
             return Err(AdoptionEvidenceError::InvalidTrustedTime);
         }
         unverified.sort();
+        let source = match (acknowledged, self.issuer) {
+            (Some(_), _) => AdoptionCertificateSource::Experimental,
+            (None, EvidenceIssuer::Production) => AdoptionCertificateSource::Production,
+            #[cfg(any(test, feature = "test-support"))]
+            (None, EvidenceIssuer::IsolatedTest) => AdoptionCertificateSource::IsolatedTest,
+        };
         Ok(VerifiedAdoption {
             certificate: ServingAdoptionCertificate::from_verified_snapshot(
                 metadata.instance_id,
                 metadata.version,
                 metadata.digest,
+                source,
             ),
             unverified,
             trusted_time_unix_seconds: trusted_time,
@@ -419,15 +457,15 @@ impl AdoptionEvidence {
 
     /// Derive experimental-grade evidence for one exact candidate.
     ///
-    /// `counts` and `single_version` come from the candidate the root holds, not
-    /// from the caller. Coverage is proven only when the snapshot `COUNT(*)`, the
-    /// ordered scan and the root's own rows agree table by table; the current
-    /// selection only when every rule set has exactly one stored version. Every
-    /// family without a real check stays `Unverified`.
+    /// `counts` and `valid_current_pointers` come from the candidate the root
+    /// holds. Coverage requires the caller-reported snapshot and scan counts to
+    /// match those rows; current selection requires every stored pointer to match
+    /// a selection and version. Neither the scan nor schema attestation is
+    /// independently authenticated here. Other unchecked families stay `Unverified`.
     pub(crate) fn from_cold_load(
         metadata: RootMetadata,
         counts: TableCounts,
-        single_version: bool,
+        valid_current_pointers: bool,
         facts: &ColdLoadFacts,
     ) -> Self {
         let proven_if = |holds: bool| {
@@ -440,7 +478,8 @@ impl AdoptionEvidence {
         let coverage = counts == facts.snapshot_counts
             && counts == facts.scanned_counts
             && counts.total() == Some(metadata.row_count);
-        let schema = facts.schema_contract_version != 0 && facts.schema_fingerprint != [0; 32];
+        let schema = facts.schema_contract_version == MEMORY_V1_CANDIDATE_SCHEMA_VERSION
+            && facts.schema_fingerprint != [0; 32];
         Self {
             instance_id: metadata.instance_id,
             version: metadata.version,
@@ -448,11 +487,12 @@ impl AdoptionEvidence {
             budget: metadata.budget,
             row_count: metadata.row_count,
             adoption_schema_version: MEMORY_V1_ADOPTION_SCHEMA_VERSION,
+            issuer: EvidenceIssuer::Production,
             source_provenance: EvidenceState::Unverified,
             snapshot_identity: EvidenceState::Unverified,
             schema_manifest: proven_if(schema),
             complete_coverage: proven_if(coverage),
-            current_selection: proven_if(single_version),
+            current_selection: proven_if(valid_current_pointers),
             lifecycle_and_validity: EvidenceState::Unverified,
             confirmation_authority: EvidenceState::Unverified,
             resource_ownership: EvidenceState::Unverified,
@@ -471,9 +511,8 @@ impl AdoptionEvidence {
         self
     }
 
-    // memory—v1: Test-only evidence for isolated compositions. It is compiled
-    // only for this crate's unit tests or the dev-dependency `test-support`
-    // feature, never for a production build.
+    // memory—v1: Test evidence is only a fixture assumption. Explicitly enabling
+    // `test-support` can expose it in other builds; it is not a security boundary.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn complete_for_test(metadata: RootMetadata) -> Self {
         Self {
@@ -483,6 +522,7 @@ impl AdoptionEvidence {
             budget: metadata.budget,
             row_count: metadata.row_count,
             adoption_schema_version: MEMORY_V1_ADOPTION_SCHEMA_VERSION,
+            issuer: EvidenceIssuer::IsolatedTest,
             source_provenance: EvidenceState::Proven,
             snapshot_identity: EvidenceState::Proven,
             schema_manifest: EvidenceState::Proven,
@@ -498,6 +538,228 @@ impl AdoptionEvidence {
             audit_correlation: EvidenceState::Proven,
             persistence_recovery: EvidenceState::Proven,
         }
+    }
+}
+
+/// A sealed fact supplied by one independent evidence owner for one family.
+///
+/// The type is deliberately empty of constructors in this module: only the
+/// family-specific owner functions below can produce a `Proven` fact, and each
+/// of those checks its own postcondition before returning one. A caller cannot
+/// forge `Proven` by naming a family without running its check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProvenFamily {
+    family: AdoptionLimit,
+}
+
+impl ProvenFamily {
+    /// The family this sealed fact proves; diagnostics only.
+    pub const fn family(self) -> AdoptionLimit {
+        self.family
+    }
+
+    /// memory—v1: Seal one fact for exactly the named family. The caller still
+    /// must run its own owner check; this constructor only binds the fact to
+    /// the family so a later verifier cannot misattribute it.
+    pub const fn proven_for(family: AdoptionLimit) -> Self {
+        Self { family }
+    }
+}
+
+/// One complete production-evidence bundle assembled by the composition owner.
+///
+/// Every mandatory family must carry a sealed [`ProvenFamily`] produced by its
+/// own check; anything absent keeps that family `Unknown` and fails adoption.
+/// This type has no constructor that maps booleans into `Proven`.
+pub struct ProductionEvidenceInput {
+    source_provenance: Option<ProvenFamily>,
+    snapshot_identity: Option<ProvenFamily>,
+    lifecycle_and_validity: Option<ProvenFamily>,
+    confirmation_authority: Option<ProvenFamily>,
+    resource_ownership: Option<ProvenFamily>,
+    eligibility: Option<ProvenFamily>,
+    separation_of_duties: Option<ProvenFamily>,
+    writer_coverage: Option<ProvenFamily>,
+    audit_correlation: Option<ProvenFamily>,
+    persistence_recovery: Option<ProvenFamily>,
+    /// The trusted clock observation, nonnegative Unix seconds. The contract
+    /// requires the issuer to have checked the same clock source it will use
+    /// for commit fences; the adoption verifier rejects only negatives here.
+    trusted_time_unix_seconds: i64,
+}
+
+impl Default for ProductionEvidenceInput {
+    /// An empty bundle fails adoption; families are added one at a time.
+    fn default() -> Self {
+        Self {
+            source_provenance: None,
+            snapshot_identity: None,
+            lifecycle_and_validity: None,
+            confirmation_authority: None,
+            resource_ownership: None,
+            eligibility: None,
+            separation_of_duties: None,
+            writer_coverage: None,
+            audit_correlation: None,
+            persistence_recovery: None,
+            trusted_time_unix_seconds: 0,
+        }
+    }
+}
+
+impl ProductionEvidenceInput {
+    /// Attach a sealed source-provenance fact from its owner.
+    pub fn with_source_provenance(&mut self, fact: ProvenFamily) -> &mut Self {
+        self.source_provenance = Some(fact);
+        self
+    }
+
+    /// Attach a sealed consistent-snapshot-identity fact from its owner.
+    pub fn with_snapshot_identity(&mut self, fact: ProvenFamily) -> &mut Self {
+        self.snapshot_identity = Some(fact);
+        self
+    }
+
+    /// Attach a sealed lifecycle-and-validity fact from its owner.
+    pub fn with_lifecycle_and_validity(&mut self, fact: ProvenFamily) -> &mut Self {
+        self.lifecycle_and_validity = Some(fact);
+        self
+    }
+
+    /// Attach a sealed confirmation-authority fact from its owner.
+    pub fn with_confirmation_authority(&mut self, fact: ProvenFamily) -> &mut Self {
+        self.confirmation_authority = Some(fact);
+        self
+    }
+
+    /// Attach a sealed resource-ownership fact from its owner.
+    pub fn with_resource_ownership(&mut self, fact: ProvenFamily) -> &mut Self {
+        self.resource_ownership = Some(fact);
+        self
+    }
+
+    /// Attach a sealed eligibility fact from its owner.
+    pub fn with_eligibility(&mut self, fact: ProvenFamily) -> &mut Self {
+        self.eligibility = Some(fact);
+        self
+    }
+
+    /// Attach a sealed separation-of-duties fact from its owner.
+    pub fn with_separation_of_duties(&mut self, fact: ProvenFamily) -> &mut Self {
+        self.separation_of_duties = Some(fact);
+        self
+    }
+
+    /// Attach a sealed writer-coverage fact from its owner.
+    pub fn with_writer_coverage(&mut self, fact: ProvenFamily) -> &mut Self {
+        self.writer_coverage = Some(fact);
+        self
+    }
+
+    /// Attach a sealed audit-correlation fact from its owner.
+    pub fn with_audit_correlation(&mut self, fact: ProvenFamily) -> &mut Self {
+        self.audit_correlation = Some(fact);
+        self
+    }
+
+    /// Attach a sealed persistence-and-recovery fact from its owner.
+    pub fn with_persistence_recovery(&mut self, fact: ProvenFamily) -> &mut Self {
+        self.persistence_recovery = Some(fact);
+        self
+    }
+
+    /// Record the trusted clock observation for this bundle.
+    pub fn with_trusted_time(&mut self, unix_seconds: i64) -> &mut Self {
+        self.trusted_time_unix_seconds = unix_seconds;
+        self
+    }
+
+    /// Derive complete production evidence for one exact candidate.
+    ///
+    /// The structural families (schema manifest, coverage, current selection)
+    /// are verified against the root's own rows exactly as in the experimental
+    /// path; they cannot be sealed by the caller because the root re-derives
+    /// them. Every sealed family becomes `Proven`; every missing family stays
+    /// `Unknown` and fails adoption later, listing the exact gaps.
+    fn build_evidence(
+        &self,
+        metadata: RootMetadata,
+        counts: TableCounts,
+        valid_current_pointers: bool,
+        facts: &ColdLoadFacts,
+    ) -> AdoptionEvidence {
+        let proven_if = |holds: bool| {
+            if holds {
+                EvidenceState::Proven
+            } else {
+                EvidenceState::Unknown
+            }
+        };
+        let coverage = counts == facts.snapshot_counts
+            && counts == facts.scanned_counts
+            && counts.total() == Some(metadata.row_count);
+        let schema = facts.schema_contract_version == MEMORY_V1_CANDIDATE_SCHEMA_VERSION
+            && facts.schema_fingerprint != [0; 32];
+        let sealed = |family: Option<ProvenFamily>, limit: AdoptionLimit| {
+            match family {
+                Some(fact) if fact.family() == limit => EvidenceState::Proven,
+                // A mismatched or absent fact is an unknown, never a proven value.
+                _ => EvidenceState::Unknown,
+            }
+        };
+        AdoptionEvidence {
+            instance_id: metadata.instance_id,
+            version: metadata.version,
+            digest: metadata.digest,
+            budget: metadata.budget,
+            row_count: metadata.row_count,
+            adoption_schema_version: MEMORY_V1_ADOPTION_SCHEMA_VERSION,
+            issuer: EvidenceIssuer::Production,
+            source_provenance: sealed(self.source_provenance, AdoptionLimit::SourceProvenance),
+            snapshot_identity: sealed(self.snapshot_identity, AdoptionLimit::SnapshotIdentity),
+            schema_manifest: proven_if(schema),
+            complete_coverage: proven_if(coverage),
+            current_selection: proven_if(valid_current_pointers),
+            lifecycle_and_validity: sealed(
+                self.lifecycle_and_validity,
+                AdoptionLimit::LifecycleAndValidity,
+            ),
+            confirmation_authority: sealed(
+                self.confirmation_authority,
+                AdoptionLimit::ConfirmationAuthority,
+            ),
+            resource_ownership: sealed(self.resource_ownership, AdoptionLimit::ResourceOwnership),
+            eligibility: sealed(self.eligibility, AdoptionLimit::Eligibility),
+            separation_of_duties: sealed(
+                self.separation_of_duties,
+                AdoptionLimit::SeparationOfDuties,
+            ),
+            trusted_time_unix_seconds: Some(self.trusted_time_unix_seconds),
+            writer_coverage: sealed(self.writer_coverage, AdoptionLimit::WriterCoverage),
+            audit_correlation: sealed(self.audit_correlation, AdoptionLimit::AuditCorrelation),
+            persistence_recovery: sealed(
+                self.persistence_recovery,
+                AdoptionLimit::PersistenceRecovery,
+            ),
+        }
+    }
+}
+
+impl AdoptionEvidence {
+    /// Build complete production evidence for one exact candidate snapshot.
+    ///
+    /// This is the single production-grade construction entry point. The
+    /// structural families are re-derived from the candidate's own rows; the
+    /// ten remaining families must carry sealed facts from their independent
+    /// owners, or adoption fails naming the gaps.
+    pub(crate) fn production(
+        metadata: RootMetadata,
+        counts: TableCounts,
+        valid_current_pointers: bool,
+        facts: &ColdLoadFacts,
+        input: &ProductionEvidenceInput,
+    ) -> Self {
+        input.build_evidence(metadata, counts, valid_current_pointers, facts)
     }
 }
 
@@ -535,7 +797,7 @@ mod tests {
 
     fn facts() -> ColdLoadFacts {
         ColdLoadFacts {
-            schema_contract_version: 1,
+            schema_contract_version: MEMORY_V1_CANDIDATE_SCHEMA_VERSION,
             schema_fingerprint: [9; 32],
             snapshot_counts: counts(),
             scanned_counts: counts(),
@@ -701,6 +963,20 @@ mod tests {
             evidence.verify_experimental(metadata(), &all),
             Err(AdoptionEvidenceError::Missing("schema manifest"))
         ));
+
+        for version in [0, 1, 2, 3, MEMORY_V1_CANDIDATE_SCHEMA_VERSION + 1, u16::MAX] {
+            let mut unsupported_schema = facts();
+            unsupported_schema.schema_contract_version = version;
+            let evidence =
+                AdoptionEvidence::from_cold_load(metadata(), counts(), true, &unsupported_schema);
+            assert!(
+                matches!(
+                    evidence.verify_experimental(metadata(), &all),
+                    Err(AdoptionEvidenceError::Missing("schema manifest"))
+                ),
+                "unsupported candidate schema version {version} was accepted"
+            );
+        }
 
         let mut before_epoch = facts();
         before_epoch.captured_at_unix_seconds = -1;

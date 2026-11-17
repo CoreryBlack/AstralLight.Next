@@ -24,7 +24,7 @@
 //! Nodes and the `im` row index are persistent, so a change copies only its trie
 //! path and affected map nodes. This is an experiment, not a stable protocol.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
 use im::OrdMap;
@@ -41,7 +41,9 @@ const MAX_FIELD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FIELDS: usize = 32;
 const MAX_ROW_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BATCH: usize = 128;
-const MAX_ROWS: usize = 4096;
+/// Maximum distinct row and current-selection keys in one candidate digest.
+/// memory—v1: This local resource limit is not a database or business limit.
+pub const MAX_ROOT_DIGEST_KEYS: usize = 4096;
 const MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 
 /// This candidate digest, not a database rule-set hash or authorization proof.
@@ -243,7 +245,7 @@ impl DigestIndex {
                     if old.is_some_and(|old| old.as_ref() == &fields) {
                         continue;
                     }
-                    if old.is_none() && next.rows.len() >= MAX_ROWS {
+                    if old.is_none() && next.rows.len() >= MAX_ROOT_DIGEST_KEYS {
                         return Err(DigestError::LimitExceeded);
                     }
                     let previous_size =
@@ -274,6 +276,145 @@ impl DigestIndex {
         }
         Ok(next)
     }
+}
+
+// memory—v1: Stage a cold build in input order, retaining prepare's 128-change
+// duplicate and replacement semantics without allocating persistent trie paths.
+// This private builder accepts puts only and cannot modify an existing snapshot.
+pub(crate) struct ColdDigestBuilder {
+    rows: BTreeMap<Key, Arc<Fields>>,
+    paths: BTreeMap<ContentDigest, (Key, ContentDigest)>,
+    seen: BTreeSet<Key>,
+    position: usize,
+    total_bytes: usize,
+    error: Option<DigestError>,
+}
+
+impl ColdDigestBuilder {
+    // memory—v1: Start an unpublished empty cold-build staging area.
+    pub(crate) fn new() -> Self {
+        Self {
+            rows: BTreeMap::new(),
+            paths: BTreeMap::new(),
+            seen: BTreeSet::new(),
+            position: 0,
+            total_bytes: 0,
+            error: None,
+        }
+    }
+
+    // memory—v1: Reject a failed staging area even if a caller ignores an error.
+    pub(crate) fn push(&mut self, key: Key, fields: Fields) -> Result<(), DigestError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let result = self.push_inner(key, fields);
+        if let Err(error) = result {
+            self.error = Some(error);
+        }
+        result
+    }
+
+    // memory—v1: Validate each put in the same order as chunked prepare.
+    fn push_inner(&mut self, key: Key, fields: Fields) -> Result<(), DigestError> {
+        if self.position == MAX_BATCH {
+            self.seen.clear();
+            self.position = 0;
+        }
+        self.position += 1;
+        validate_key(&key)?;
+        if !self.seen.insert(key.clone()) {
+            return Err(DigestError::DuplicateKey);
+        }
+        if key.tag == 10 {
+            if fields.len() != 1 || fields[0].is_none() {
+                return Err(DigestError::InvalidSelection);
+            }
+            if fields[0]
+                .as_ref()
+                .is_some_and(|version| version.len() > MAX_VERSION_BYTES)
+            {
+                return Err(DigestError::LimitExceeded);
+            }
+        }
+        let row_bytes = row_size(&fields)?;
+        let old = self.rows.get(&key);
+        if old.is_some_and(|old| old.as_ref() == &fields) {
+            return Ok(());
+        }
+        if old.is_none() && self.rows.len() >= MAX_ROOT_DIGEST_KEYS {
+            return Err(DigestError::LimitExceeded);
+        }
+        let previous_size = old.map_or(0, |old| row_size(old).expect("stored rows are bounded"));
+        let total_bytes = self.total_bytes - previous_size + row_bytes;
+        if total_bytes > MAX_TOTAL_BYTES {
+            return Err(DigestError::LimitExceeded);
+        }
+        let key_bytes = encode_key(&key)?;
+        // Match prepare's framing validation before checking the path collision.
+        let leaf = hash_leaf(&key_bytes, &fields)?;
+        let path = hash_path(&key_bytes);
+        if self
+            .paths
+            .get(&path)
+            .is_some_and(|(other, _)| other != &key)
+        {
+            return Err(DigestError::PathCollision);
+        }
+        self.paths.insert(path, (key.clone(), leaf));
+        self.rows.insert(key, Arc::new(fields));
+        self.total_bytes = total_bytes;
+        Ok(())
+    }
+
+    // memory—v1: Construct every occupied branch once, after complete validation.
+    pub(crate) fn finish(self) -> Result<DigestIndex, DigestError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let leaves: Vec<_> = self
+            .paths
+            .into_iter()
+            .map(|(path, (key, hash))| (path, key, hash))
+            .collect();
+        let tree = build_sorted_tree(&leaves, 0);
+        let mut rows = OrdMap::new();
+        for (key, fields) in self.rows {
+            rows.insert(key, fields);
+        }
+        Ok(DigestIndex {
+            rows,
+            tree,
+            total_bytes: self.total_bytes,
+        })
+    }
+}
+
+// memory—v1: Build the same full-depth sparse trie as update, from sorted paths.
+// Each nonempty range creates one node per occupied prefix; stack depth is 256.
+fn build_sorted_tree(
+    leaves: &[(ContentDigest, Key, ContentDigest)],
+    depth: usize,
+) -> Option<Arc<Node>> {
+    if leaves.is_empty() {
+        return None;
+    }
+    if depth == DEPTH {
+        debug_assert_eq!(leaves.len(), 1, "paths were checked for collisions");
+        return Some(Arc::new(Node::Leaf {
+            hash: leaves[0].2,
+            key: leaves[0].1.clone(),
+        }));
+    }
+    let split = leaves.partition_point(|entry| !bit(&entry.0, depth));
+    let left = build_sorted_tree(&leaves[..split], depth + 1);
+    let right = build_sorted_tree(&leaves[split..], depth + 1);
+    let hash = hash_branch(
+        depth,
+        node_hash(&left, depth + 1),
+        node_hash(&right, depth + 1),
+    );
+    Some(Arc::new(Node::Branch { hash, left, right }))
 }
 
 impl Default for DigestIndex {
@@ -542,6 +683,351 @@ mod tests {
         let result = index.prepare([change]).unwrap();
         assert_eq!(result.digest(), rebuild(rows));
         result
+    }
+
+    // memory—v1: Independently exercise the cold path against chunked preparation.
+    fn cold(changes: &[Change]) -> Result<DigestIndex, DigestError> {
+        let mut builder = ColdDigestBuilder::new();
+        for change in changes {
+            match change {
+                Change::Put { key, fields } => builder.push(key.clone(), fields.clone())?,
+                Change::Delete { .. } => panic!("cold inputs must be puts"),
+            }
+        }
+        builder.finish()
+    }
+
+    // memory—v1: Reproduce the former cold loader's bounded prepare batches.
+    fn chunked(changes: &[Change]) -> Result<DigestIndex, DigestError> {
+        let mut index = DigestIndex::new();
+        for batch in changes.chunks(MAX_BATCH) {
+            index = index.prepare(batch.iter().cloned())?;
+        }
+        Ok(index)
+    }
+
+    #[test]
+    // memory—v1: Cold construction matches independent framing and later updates.
+    fn cold_build_matches_reference_incremental_and_snapshot_updates() {
+        let id = [42; 16];
+        let empty = cold(&[]).unwrap();
+        assert_eq!(empty.digest(), rebuild(&BTreeMap::new()));
+        let keys = vec![
+            Key::row(Table::BindingConfirmation, id),
+            Key::rule_set_version(id, vec![]),
+            Key::row(Table::Tenant, id),
+            Key::current_selection(id),
+            Key::row(Table::RuleSetChangeConfirmation, id),
+            Key::row(Table::User, id),
+            Key::row(Table::IdentityCard, id),
+            Key::row(Table::UserCard, id),
+            Key::row(Table::RuleSet, id),
+            Key::row(Table::Binding, id),
+            Key::rule_set_version(id, vec![0, 1]),
+        ];
+        let changes: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(n, key)| Change::Put {
+                key: key.clone(),
+                fields: if key.tag == 10 {
+                    vec![Some(vec![])]
+                } else {
+                    vec![None, Some(vec![]), Some(vec![n as u8])]
+                },
+            })
+            .collect();
+        let mut reference = BTreeMap::new();
+        for change in &changes {
+            if let Change::Put { key, fields } = change {
+                reference.insert(key.clone(), fields.clone());
+            }
+        }
+        let initial = cold(&changes).unwrap();
+        let mut reversed = changes.clone();
+        reversed.reverse();
+        let incremental = chunked(&changes).unwrap();
+        assert_eq!(initial.digest(), rebuild(&reference));
+        assert_eq!(initial.digest(), incremental.digest());
+        assert_eq!(initial.digest(), cold(&reversed).unwrap().digest());
+        for (key, fields) in &reference {
+            assert_eq!(initial.get(key), Some(fields));
+        }
+        let old_digest = initial.digest();
+        let added = Key::row(Table::User, [77; 16]);
+        let updates = [
+            put(keys[0].clone(), b"modified"),
+            Change::Delete {
+                key: keys[1].clone(),
+            },
+            put(added.clone(), b"added"),
+            Change::select_current(id, vec![0, 1]),
+        ];
+        let next = initial.prepare(updates.clone()).unwrap();
+        let next_incremental = incremental.prepare(updates).unwrap();
+        reference.insert(keys[0].clone(), vec![Some(b"modified".to_vec())]);
+        reference.remove(&keys[1]);
+        reference.insert(added.clone(), vec![Some(b"added".to_vec())]);
+        reference.insert(Key::current_selection(id), vec![Some(vec![0, 1])]);
+        assert_eq!(next.digest(), rebuild(&reference));
+        assert_eq!(next.digest(), next_incremental.digest());
+        assert_eq!(initial.digest(), old_digest);
+        assert_eq!(initial.get(&added), None);
+        assert_eq!(
+            initial.get(&keys[1]),
+            Some(&vec![None, Some(vec![]), Some(vec![1])])
+        );
+    }
+
+    #[test]
+    #[ignore = "near-capacity digest comparison allocates a full sparse tree and is slow"]
+    // memory—v1: Compare both complete 4096-key construction paths without holding both trees.
+    fn cold_build_near_capacity_matches_chunked_and_preserves_snapshots() {
+        use std::time::Instant;
+
+        // The odd multiplier permutes all 4096 IDs and makes input order non-sorted.
+        let changes: Vec<_> = (0..MAX_ROOT_DIGEST_KEYS)
+            .map(|position| {
+                let n = (position * 4051) % MAX_ROOT_DIGEST_KEYS;
+                let mut id = [0; 16];
+                id[8..].copy_from_slice(&(n as u64).to_be_bytes());
+                let key = match n % 10 {
+                    0 => Key::row(Table::User, id),
+                    1 => Key::row(Table::IdentityCard, id),
+                    2 => Key::row(Table::Tenant, id),
+                    3 => Key::row(Table::UserCard, id),
+                    4 => Key::row(Table::RuleSet, id),
+                    5 => Key::rule_set_version(id, vec![0, (n % 251) as u8]),
+                    6 => Key::row(Table::Binding, id),
+                    7 => Key::row(Table::BindingConfirmation, id),
+                    8 => Key::row(Table::RuleSetChangeConfirmation, id),
+                    _ => Key::current_selection(id),
+                };
+                let fields = if key.tag == 10 {
+                    vec![Some(vec![(n % 251) as u8])]
+                } else {
+                    vec![None, Some(vec![]), Some((n as u64).to_be_bytes().to_vec())]
+                };
+                Change::Put { key, fields }
+            })
+            .collect();
+        assert_eq!(changes.len(), MAX_ROOT_DIGEST_KEYS);
+        let Change::Put {
+            key: update_key, ..
+        } = &changes[0]
+        else {
+            unreachable!();
+        };
+        let update_key = update_key.clone();
+        let updated_fields = vec![Some(b"updated at capacity".to_vec()), None];
+        let first_bit = bit(&hash_path(&encode_key(&update_key).unwrap()), 0);
+        let delete_key = changes
+            .iter()
+            .skip(1)
+            .find_map(|change| match change {
+                Change::Put { key, .. }
+                    if bit(&hash_path(&encode_key(key).unwrap()), 0) == first_bit =>
+                {
+                    Some(key.clone())
+                }
+                _ => None,
+            })
+            .expect("sample has two keys in the same root branch");
+
+        // Only one complete tree is live at a time. The updated snapshots below
+        // share all unchanged nodes with that tree and copy at most two paths.
+        let started = Instant::now();
+        let legacy = chunked(&changes).unwrap();
+        let legacy_elapsed = started.elapsed();
+        assert_eq!(legacy.rows.len(), MAX_ROOT_DIGEST_KEYS);
+        for change in &changes {
+            let Change::Put { key, fields } = change else {
+                unreachable!();
+            };
+            assert_eq!(legacy.get(key), Some(fields));
+        }
+        let legacy_digest = legacy.digest();
+        let legacy_updated = legacy
+            .prepare([Change::Put {
+                key: update_key.clone(),
+                fields: updated_fields.clone(),
+            }])
+            .unwrap();
+        let legacy_deleted = legacy_updated
+            .prepare([Change::Delete {
+                key: delete_key.clone(),
+            }])
+            .unwrap();
+        let legacy_updated_digest = legacy_updated.digest();
+        let legacy_deleted_digest = legacy_deleted.digest();
+        drop(legacy_deleted);
+        drop(legacy_updated);
+        drop(legacy);
+
+        let started = Instant::now();
+        let bulk = cold(&changes).unwrap();
+        let bulk_elapsed = started.elapsed();
+        assert_eq!(bulk.rows.len(), MAX_ROOT_DIGEST_KEYS);
+        assert_eq!(bulk.digest(), legacy_digest);
+        for change in &changes {
+            let Change::Put { key, fields } = change else {
+                unreachable!();
+            };
+            assert_eq!(bulk.get(key), Some(fields));
+        }
+        let updated = bulk
+            .prepare([Change::Put {
+                key: update_key.clone(),
+                fields: updated_fields.clone(),
+            }])
+            .unwrap();
+        let deleted = updated
+            .prepare([Change::Delete {
+                key: delete_key.clone(),
+            }])
+            .unwrap();
+        assert_eq!(updated.digest(), legacy_updated_digest);
+        assert_eq!(deleted.digest(), legacy_deleted_digest);
+        assert_eq!(deleted.rows.len(), MAX_ROOT_DIGEST_KEYS - 1);
+        for change in &changes {
+            let Change::Put { key, fields } = change else {
+                unreachable!();
+            };
+            assert_eq!(bulk.get(key), Some(fields));
+            let expected = if key == &delete_key {
+                None
+            } else if key == &update_key {
+                Some(&updated_fields)
+            } else {
+                Some(fields)
+            };
+            assert_eq!(deleted.get(key), expected);
+        }
+        assert_eq!(bulk.digest(), legacy_digest);
+        assert_eq!(updated.get(&update_key), Some(&updated_fields));
+        assert!(updated.get(&delete_key).is_some());
+        // memory—v1: Borrow the root branch that neither change traverses.
+        fn untouched(index: &DigestIndex, first_bit: bool) -> &Arc<Node> {
+            match index.tree.as_deref().unwrap() {
+                Node::Branch { left, right, .. } => if first_bit {
+                    left.as_ref()
+                } else {
+                    right.as_ref()
+                }
+                .expect("opposite root branch exists"),
+                Node::Leaf { .. } => unreachable!(),
+            }
+        }
+        assert!(Arc::ptr_eq(
+            untouched(&bulk, first_bit),
+            untouched(&updated, first_bit)
+        ));
+        assert!(Arc::ptr_eq(
+            untouched(&bulk, first_bit),
+            untouched(&deleted, first_bit)
+        ));
+        eprintln!(
+            "near-capacity digest build: keys={}, chunked={legacy_elapsed:?}, cold={bulk_elapsed:?}; sequential full trees",
+            changes.len()
+        );
+    }
+
+    #[test]
+    // memory—v1: Preserve within-batch duplicate errors and cross-batch replacement.
+    fn cold_build_preserves_chunk_duplicate_semantics() {
+        let key = Key::row(Table::User, [1; 16]);
+        let duplicate = vec![put(key.clone(), b"old"), put(key.clone(), b"new")];
+        assert!(matches!(cold(&duplicate), Err(DigestError::DuplicateKey)));
+        assert!(matches!(
+            chunked(&duplicate),
+            Err(DigestError::DuplicateKey)
+        ));
+        let mut changes = vec![put(key.clone(), b"old")];
+        for n in 1..MAX_BATCH {
+            let mut id = [0; 16];
+            id[8..].copy_from_slice(&(n as u64).to_be_bytes());
+            changes.push(put(Key::row(Table::Tenant, id), b"x"));
+        }
+        changes.push(put(key.clone(), b"new"));
+        let bulk = cold(&changes).unwrap();
+        let original = chunked(&changes).unwrap();
+        assert_eq!(bulk.digest(), original.digest());
+        assert_eq!(bulk.get(&key), Some(&vec![Some(b"new".to_vec())]));
+        changes.push(put(key, b"again"));
+        assert!(matches!(cold(&changes), Err(DigestError::DuplicateKey)));
+        assert!(matches!(chunked(&changes), Err(DigestError::DuplicateKey)));
+    }
+
+    #[test]
+    // memory—v1: Validate limits in order and poison every failed cold staging area.
+    fn cold_build_limits_and_failure_are_atomic() {
+        let key = Key::row(Table::User, [9; 16]);
+        let mut builder = ColdDigestBuilder::new();
+        builder.push(key.clone(), vec![Some(vec![])]).unwrap();
+        assert_eq!(
+            builder.push(Key::current_selection([1; 16]), vec![None]),
+            Err(DigestError::InvalidSelection)
+        );
+        assert_eq!(
+            builder.push(Key::row(Table::User, [10; 16]), vec![]),
+            Err(DigestError::InvalidSelection)
+        );
+        assert!(matches!(
+            builder.finish(),
+            Err(DigestError::InvalidSelection)
+        ));
+        let mut builder = ColdDigestBuilder::new();
+        assert_eq!(
+            builder.push(
+                Key::rule_set_version([0; 16], vec![0; MAX_VERSION_BYTES + 1]),
+                vec![]
+            ),
+            Err(DigestError::LimitExceeded)
+        );
+        assert!(matches!(builder.finish(), Err(DigestError::LimitExceeded)));
+        let mut builder = ColdDigestBuilder::new();
+        assert_eq!(
+            builder.push(key.clone(), vec![None; MAX_FIELDS + 1]),
+            Err(DigestError::LimitExceeded)
+        );
+        assert!(matches!(builder.finish(), Err(DigestError::LimitExceeded)));
+        let mut builder = ColdDigestBuilder::new();
+        builder.total_bytes = MAX_TOTAL_BYTES - 1;
+        builder.push(key.clone(), vec![Some(vec![0])]).unwrap();
+        assert_eq!(builder.total_bytes, MAX_TOTAL_BYTES);
+        assert_eq!(
+            builder.push(Key::row(Table::User, [10; 16]), vec![Some(vec![0])]),
+            Err(DigestError::LimitExceeded)
+        );
+        assert!(matches!(builder.finish(), Err(DigestError::LimitExceeded)));
+        let mut builder = ColdDigestBuilder::new();
+        for n in 0..MAX_ROOT_DIGEST_KEYS {
+            let mut id = [0; 16];
+            id[8..].copy_from_slice(&(n as u64).to_be_bytes());
+            builder.push(Key::row(Table::User, id), vec![]).unwrap();
+        }
+        assert_eq!(builder.rows.len(), MAX_ROOT_DIGEST_KEYS);
+        assert_eq!(
+            builder.push(Key::row(Table::Tenant, [0; 16]), vec![]),
+            Err(DigestError::LimitExceeded)
+        );
+        assert!(matches!(builder.finish(), Err(DigestError::LimitExceeded)));
+    }
+
+    #[test]
+    // memory—v1: A simulated digest collision fails closed before tree creation.
+    fn cold_build_forced_path_collision_is_atomic() {
+        let first = Key::row(Table::User, [1; 16]);
+        let second = Key::row(Table::User, [2; 16]);
+        let mut builder = ColdDigestBuilder::new();
+        builder.push(first.clone(), vec![]).unwrap();
+        let second_path = hash_path(&encode_key(&second).unwrap());
+        builder.paths.insert(second_path, (first, [0; 32]));
+        assert_eq!(
+            builder.push(second, vec![]),
+            Err(DigestError::PathCollision)
+        );
+        assert!(matches!(builder.finish(), Err(DigestError::PathCollision)));
     }
 
     #[test]

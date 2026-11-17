@@ -6,13 +6,15 @@
 //! selection and revocation. UUID values, JWT claims, Gateway signatures and
 //! candidate relationships are not issuance proof.
 
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use astral_types::memory_v1::{CandidateIdentity, MemoryId};
 use thiserror::Error;
 
 use crate::memory_v1_request::{RequestRootAccessError, RequestRootExtension};
-use crate::memory_v1_root::RequestRootReader;
+use crate::memory_v1_root::{DependencyRecord, RequestRootReader, RootMetadata};
+use crate::memory_v1_rules::{window_active, MemoryV1Validity};
 
 /// Facts that a validated memory—v1 ACCESS session would provide.
 ///
@@ -29,6 +31,58 @@ pub struct VerifiedSessionFacts {
     revocation_generation: u64,
 }
 
+/// An internal identity token for one session authority. Its root slot prevents
+/// one authority and its credentials from being reused across installed roots.
+#[derive(Debug)]
+pub(crate) struct SessionAuthorityToken(OnceLock<crate::memory_v1_root::RootInstanceId>);
+
+impl SessionAuthorityToken {
+    // memory—v1: Mint a process-local authority identity.
+    pub(crate) fn new() -> Self {
+        Self(OnceLock::new())
+    }
+
+    // memory—v1: Bind this authority permanently to one installed root instance.
+    pub(crate) fn bind_root(&self, root_id: crate::memory_v1_root::RootInstanceId) -> bool {
+        self.0.set(root_id).is_ok() || self.0.get() == Some(&root_id)
+    }
+}
+
+/// An internal binding proof that ties one request capability to the
+/// authority and credential that produced its facts.
+///
+/// `bind_session_facts` deliberately does not create this value. That public
+/// compatibility path can expose candidate facts to trusted in-process code,
+/// but it cannot establish live-session freshness for a final ALLOW.
+#[derive(Clone)]
+pub(crate) struct SessionAuthorityBinding {
+    authority_id: Arc<SessionAuthorityToken>,
+    credential_digest: [u8; 32],
+    verifier: super::memory_v1_session_authority::MemoryV1SessionVerifier,
+}
+
+impl SessionAuthorityBinding {
+    // memory—v1: Compare the issuing authority's process-local identity.
+    pub(crate) fn is_from(&self, authority_id: &Arc<SessionAuthorityToken>) -> bool {
+        Arc::ptr_eq(&self.authority_id, authority_id)
+    }
+
+    // memory—v1: Return the digest identifying the bound credential record.
+    pub(crate) fn credential_digest(&self) -> [u8; 32] {
+        self.credential_digest
+    }
+}
+
+/// Failures while obtaining the material needed for an authority freshness
+/// check. The authority maps unproven or foreign material to its existing
+/// invalid-credential failure so callers cannot use error detail as proof.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SessionFreshnessBindingError {
+    Scope(RequestRootAccessError),
+    ForeignScope,
+    MissingAuthorityProof,
+}
+
 /// A request-local capability carrying session facts and the same root scope.
 ///
 /// This type is not serializable and cannot outlive the scope: it stores only a
@@ -38,6 +92,7 @@ pub struct VerifiedSessionFacts {
 pub struct RequestSessionExtension {
     shared: Weak<super::memory_v1_request::RequestRootShared>,
     facts: Arc<VerifiedSessionFacts>,
+    authority_binding: Option<SessionAuthorityBinding>,
 }
 
 /// Errors from binding or reading an authenticated request session.
@@ -132,7 +187,8 @@ impl RequestRootExtension {
     /// The root extension itself is not an authentication proof. This method
     /// accepts only the opaque facts type, checks that this scope is still live,
     /// and records the scope identity so downstream code cannot mix facts and a
-    /// different request root.
+    /// different request root. Because no session authority proof is present,
+    /// the result cannot pass the dedicated live-session revalidation API.
     pub fn bind_session_facts(
         &self,
         facts: VerifiedSessionFacts,
@@ -141,14 +197,428 @@ impl RequestRootExtension {
         Ok(RequestSessionExtension {
             shared: Arc::downgrade(&shared),
             facts: Arc::new(facts),
+            authority_binding: None,
+        })
+    }
+
+    /// memory—v1: Bind facts together with an authority-owned proof. This is crate-private
+    /// so an external caller cannot manufacture a live-session binding from a
+    /// cloned [`VerifiedSessionFacts`] value.
+    pub(crate) fn bind_authoritative_session(
+        &self,
+        facts: VerifiedSessionFacts,
+        authority_id: Arc<SessionAuthorityToken>,
+        credential_digest: [u8; 32],
+        verifier: super::memory_v1_session_authority::MemoryV1SessionVerifier,
+    ) -> Result<RequestSessionExtension, RequestSessionError> {
+        let shared = self.active_shared().map_err(RequestSessionError::Scope)?;
+        Ok(RequestSessionExtension {
+            shared: Arc::downgrade(&shared),
+            facts: Arc::new(facts),
+            authority_binding: Some(SessionAuthorityBinding {
+                authority_id,
+                credential_digest,
+                verifier,
+            }),
         })
     }
 }
 
+/// memory—v1: Time windows of one winning rule and its binding.
+#[derive(Clone, Copy)]
+pub struct FinalCheckWindow {
+    /// Rule-level validity, if constrained.
+    pub entry_validity: Option<MemoryV1Validity>,
+    /// Inclusive binding start, if constrained.
+    pub binding_from: Option<i64>,
+    /// Exclusive binding end, if constrained.
+    pub binding_until: Option<i64>,
+}
+
+/// memory—v1: Time-dependent inputs recorded by one rule evaluation.
+pub struct FinalCheckTimeConstraints<'a> {
+    /// Trusted observation made at the beginning of evaluation.
+    pub start_time: i64,
+    /// Later activation boundaries that may alter the aggregate decision.
+    pub future_boundaries: &'a [i64],
+    /// Every matching ALLOW rule's time windows.
+    pub winning_windows: &'a [FinalCheckWindow],
+}
+
+/// A request-scoped handle for a nonblocking live-record check.
+///
+/// memory—v1: This borrowed handle is valid only inside the reader callback.
+/// It does not grant authorization or establish a mutation commit boundary.
+pub struct SessionFinalCheck<'a> {
+    facts: &'a VerifiedSessionFacts,
+    binding: &'a SessionAuthorityBinding,
+    reader: &'a RequestRootReader,
+}
+
+impl SessionFinalCheck<'_> {
+    /// memory—v1: Sample and validate trusted time while the live session,
+    /// root dependencies and registry version are stable. Object-specific fence
+    /// observations bracket the sample. Failure or contention returns `None`.
+    /// The result is not permission to commit a later mutation; the caller must
+    /// perform its own commit checks.
+    pub fn try_final_time(
+        &self,
+        record: &DependencyRecord,
+        constraints: &FinalCheckTimeConstraints<'_>,
+    ) -> Option<i64> {
+        self.try_final_time_with(record, constraints, None, || {
+            let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+            i64::try_from(seconds).ok()
+        })
+    }
+
+    /// memory—v1: Inject a deterministic clock only in isolated test builds.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn try_final_time_for_test(
+        &self,
+        record: &DependencyRecord,
+        constraints: &FinalCheckTimeConstraints<'_>,
+        clock: impl FnOnce() -> Option<i64>,
+    ) -> Option<i64> {
+        self.try_final_time_with(record, constraints, None, clock)
+    }
+
+    /// memory—v1: Recheck the exact request snapshot and target fence using the
+    /// same live-session, writer and registry guards. Object-specific fence
+    /// observations bracket the trusted clock sample.
+    pub fn try_final_time_exact_root(
+        &self,
+        record: &DependencyRecord,
+        constraints: &FinalCheckTimeConstraints<'_>,
+        metadata: RootMetadata,
+        target_rule_set: [u8; 16],
+    ) -> Option<i64> {
+        self.try_final_time_with(
+            record,
+            constraints,
+            Some((metadata, std::slice::from_ref(&target_rule_set))),
+            || {
+                let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+                i64::try_from(seconds).ok()
+            },
+        )
+    }
+
+    /// memory—v1: Inject the exact-root final clock in isolated tests only.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn try_final_time_exact_root_for_test(
+        &self,
+        record: &DependencyRecord,
+        constraints: &FinalCheckTimeConstraints<'_>,
+        metadata: RootMetadata,
+        target_rule_set: [u8; 16],
+        clock: impl FnOnce() -> Option<i64>,
+    ) -> Option<i64> {
+        self.try_final_time_with(
+            record,
+            constraints,
+            Some((metadata, std::slice::from_ref(&target_rule_set))),
+            clock,
+        )
+    }
+
+    /// memory—v1: Recheck one exact root and every target rule-set fence with
+    /// the live session, writer and registry held stable. Fence observations
+    /// bracket the trusted clock. The caller must derive the complete target
+    /// list from that root. This does not authorize a later mutation.
+    pub fn try_final_time_exact_batch(
+        &self,
+        record: &DependencyRecord,
+        constraints: &FinalCheckTimeConstraints<'_>,
+        metadata: RootMetadata,
+        target_rule_sets: &[[u8; 16]],
+    ) -> Option<i64> {
+        if target_rule_sets.is_empty() || target_rule_sets.contains(&[0; 16]) {
+            return None;
+        }
+        self.try_final_time_with(
+            record,
+            constraints,
+            Some((metadata, target_rule_sets)),
+            || {
+                let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+                i64::try_from(seconds).ok()
+            },
+        )
+    }
+
+    /// memory—v1: Inject the batch final clock in isolated tests only.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn try_final_time_exact_batch_for_test(
+        &self,
+        record: &DependencyRecord,
+        constraints: &FinalCheckTimeConstraints<'_>,
+        metadata: RootMetadata,
+        target_rule_sets: &[[u8; 16]],
+        clock: impl FnOnce() -> Option<i64>,
+    ) -> Option<i64> {
+        if target_rule_sets.is_empty() || target_rule_sets.contains(&[0; 16]) {
+            return None;
+        }
+        self.try_final_time_with(
+            record,
+            constraints,
+            Some((metadata, target_rule_sets)),
+            clock,
+        )
+    }
+
+    /// memory—v1: Recheck an active, root-derived card with no unremoved
+    /// bindings while the exact root, session, registry and actor fences are
+    /// stable. This proves only the target-card facts and exact-root observation;
+    /// it does not establish resource/action authorization or permission to commit
+    /// a later mutation. A previously disabled card is conservatively rejected.
+    pub fn try_final_time_exact_empty_card(
+        &self,
+        record: &DependencyRecord,
+        constraints: &FinalCheckTimeConstraints<'_>,
+        metadata: RootMetadata,
+        target: crate::memory_v1_root::GovernanceTargetFacts,
+    ) -> Option<i64> {
+        if target.user_card_id == [0; 16]
+            || target.owner_user_id == [0; 16]
+            || target.tenant_id == [0; 16]
+            || target.rule_set_id != [0; 16]
+        {
+            return None;
+        }
+        self.try_final_time_with(record, constraints, Some((metadata, &[])), || {
+            let valid = self
+                .reader
+                .read_card_for_evaluation(target.user_card_id, |context, _history| {
+                    context.card.user_card_id == target.user_card_id
+                        && context.card.user_id == target.owner_user_id
+                        && context.card.tenant_id == target.tenant_id
+                        && context.card.status == crate::memory_v1_db_rows::UserCardStatus::Active
+                        && context.user.user_id == target.owner_user_id
+                        && context.identity.user_id == target.owner_user_id
+                        && context.tenant.tenant_id == target.tenant_id
+                        && context.bindings.is_empty()
+                })
+                .ok()?;
+            if !valid {
+                return None;
+            }
+            let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+            i64::try_from(seconds).ok()
+        })
+    }
+
+    /// memory—v1: Recheck a disabled, root-derived card with no unremoved
+    /// bindings under the exact root, live session, registry and actor fences.
+    /// The supplied target is only an expectation and is compared with the card,
+    /// user, identity and tenant read from the guarded root snapshot. This is a
+    /// prerequisite observation, not authorization to enable the card or commit.
+    pub fn try_final_time_exact_empty_disabled_card(
+        &self,
+        record: &DependencyRecord,
+        constraints: &FinalCheckTimeConstraints<'_>,
+        metadata: RootMetadata,
+        target: crate::memory_v1_root::GovernanceTargetFacts,
+    ) -> Option<i64> {
+        if target.user_card_id == [0; 16]
+            || target.owner_user_id == [0; 16]
+            || target.tenant_id == [0; 16]
+            || target.rule_set_id != [0; 16]
+        {
+            return None;
+        }
+        self.try_final_time_with(record, constraints, Some((metadata, &[])), || {
+            let valid = self
+                .reader
+                .read_card_for_evaluation(target.user_card_id, |context, _history| {
+                    context.card.user_card_id == target.user_card_id
+                        && context.card.user_id == target.owner_user_id
+                        && context.card.tenant_id == target.tenant_id
+                        && context.card.status == crate::memory_v1_db_rows::UserCardStatus::Disabled
+                        && context.user.user_id == target.owner_user_id
+                        && context.identity.user_id == target.owner_user_id
+                        && context.tenant.tenant_id == target.tenant_id
+                        && context.bindings.is_empty()
+                })
+                .ok()?;
+            if !valid {
+                return None;
+            }
+            let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+            i64::try_from(seconds).ok()
+        })
+    }
+
+    /// memory—v1: Re-resolve a proposed user-card creation target while the
+    /// exact root, live session, registry and actor fences remain stable. The
+    /// supplied IDs are expectations only; the root must independently verify
+    /// a historical user/tenant relationship and that the new card ID is unused.
+    /// The historical relationship does not prove current membership or user status.
+    /// This observation grants no resource/action permission or commit right.
+    pub fn try_final_time_exact_user_card_create(
+        &self,
+        record: &DependencyRecord,
+        constraints: &FinalCheckTimeConstraints<'_>,
+        metadata: RootMetadata,
+        target: crate::memory_v1_root::GovernanceTargetFacts,
+    ) -> Option<i64> {
+        if target.rule_set_id != [0; 16] {
+            return None;
+        }
+        self.try_final_time_with(record, constraints, Some((metadata, &[])), || {
+            let resolved = self
+                .reader
+                .user_card_create_target(
+                    target.user_card_id,
+                    target.owner_user_id,
+                    target.tenant_id,
+                )
+                .ok()?;
+            if resolved != target {
+                return None;
+            }
+            let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+            i64::try_from(seconds).ok()
+        })
+    }
+
+    // memory—v1: No production caller supplies code executed under the locks.
+    fn try_final_time_with(
+        &self,
+        record: &DependencyRecord,
+        constraints: &FinalCheckTimeConstraints<'_>,
+        exact_target: Option<(RootMetadata, &[[u8; 16]])>,
+        clock: impl FnOnce() -> Option<i64>,
+    ) -> Option<i64> {
+        if record.card_id != self.facts.candidate_identity().user_card_id.into_bytes() {
+            return None;
+        }
+        self.binding
+            .verifier
+            .try_with_live_record(self.facts, self.binding, |live_facts| {
+                self.reader.try_with_rechecked_dependencies_and_target(
+                    record,
+                    exact_target,
+                    Some(&self.binding.authority_id),
+                    || {
+                        let now = clock()?;
+                        if now < constraints.start_time
+                            || !live_facts.valid_at(now)
+                            || constraints
+                                .future_boundaries
+                                .iter()
+                                .any(|boundary| *boundary <= now)
+                            || constraints.winning_windows.is_empty()
+                            || constraints.winning_windows.iter().any(|winning| {
+                                !window_active(
+                                    winning.entry_validity.and_then(|validity| validity.from),
+                                    winning.entry_validity.and_then(|validity| validity.until),
+                                    now,
+                                ) || !window_active(
+                                    winning.binding_from,
+                                    winning.binding_until,
+                                    now,
+                                )
+                            })
+                        {
+                            return None;
+                        }
+                        Some(now)
+                    },
+                )
+            })
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .flatten()
+    }
+}
+
 impl RequestSessionExtension {
+    /// memory—v1: Borrow the exact request reader and a live-record check handle.
+    ///
+    /// Scope acquisition completes before the callback can acquire the session
+    /// lock. Compatibility facts receive no final-check handle and cannot be
+    /// used to produce an ALLOW. The result is not a commit authorization.
+    pub fn with_authoritative_context<T>(
+        &self,
+        root: &RequestRootExtension,
+        f: impl for<'a> FnOnce(
+            &'a VerifiedSessionFacts,
+            &'a RequestRootReader,
+            Option<SessionFinalCheck<'a>>,
+        ) -> T,
+    ) -> Result<T, RequestSessionError> {
+        if !self.is_bound_to(root) {
+            return Err(RequestSessionError::ForeignScope);
+        }
+        root.with_reader(|reader| {
+            let facts = self.facts.as_ref();
+            let final_check = self
+                .authority_binding
+                .as_ref()
+                .filter(|binding| reader.has_session_authority(&binding.authority_id))
+                .map(|binding| SessionFinalCheck {
+                    facts,
+                    binding,
+                    reader,
+                });
+            f(facts, reader, final_check)
+        })
+        .map_err(RequestSessionError::Scope)
+    }
+
     /// Check that this capability was bound to the supplied root extension.
     pub fn is_bound_to(&self, root: &RequestRootExtension) -> bool {
         root.shares_scope_with(&self.shared)
+    }
+
+    /// memory—v1: Recheck the issuing authority's live record for this request.
+    ///
+    /// Compatibility bindings without an authority proof fail closed. A caller
+    /// performing a later mutation must recheck again at its own commit boundary.
+    pub fn revalidate_authority(
+        &self,
+        root: &RequestRootExtension,
+        now_unix_seconds: i64,
+    ) -> Result<(), super::memory_v1_session_authority::MemoryV1SessionAuthorityError> {
+        let binding = self.authority_binding.as_ref().ok_or(
+            super::memory_v1_session_authority::MemoryV1SessionAuthorityError::InvalidCredential,
+        )?;
+        binding
+            .verifier
+            .revalidate_bound_session(self, root, now_unix_seconds)
+    }
+
+    /// memory—v1: Capture the facts and authority binding after validating the exact
+    /// request scope. The root reader lease is released before the caller can
+    /// inspect authority state, so live-session checks do not nest the root and
+    /// authority locks.
+    pub(crate) fn authority_binding_material(
+        &self,
+        root: &RequestRootExtension,
+    ) -> Result<(VerifiedSessionFacts, SessionAuthorityBinding), SessionFreshnessBindingError> {
+        if !self.is_bound_to(root) {
+            return Err(SessionFreshnessBindingError::ForeignScope);
+        }
+        let facts = Arc::clone(&self.facts);
+        let binding = self
+            .authority_binding
+            .as_ref()
+            .cloned()
+            .ok_or(SessionFreshnessBindingError::MissingAuthorityProof)?;
+        root.with_reader(|reader| {
+            if reader.has_session_authority(&binding.authority_id) {
+                Ok((facts.as_ref().clone(), binding))
+            } else {
+                Err(SessionFreshnessBindingError::MissingAuthorityProof)
+            }
+        })
+        .map_err(SessionFreshnessBindingError::Scope)?
     }
 
     /// Borrow facts and the same request reader for one synchronous callback.

@@ -63,6 +63,17 @@ pub enum UserCardStatus {
     Disabled,
 }
 
+/// memory—v1 §4.12 B-2.5: rule-set lifecycle state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuleSetStatus {
+    /// Rule set has not been retired.
+    #[serde(rename = "ACTIVE")]
+    Active,
+    /// Rule set is retired and its row remains present.
+    #[serde(rename = "RETIRED")]
+    Retired,
+}
+
 /// Candidate `memory_rule_set` row.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleSetRow {
@@ -72,6 +83,8 @@ pub struct RuleSetRow {
     pub owner_tenant_id: BinaryId,
     /// §4.13: explicit current-version pointer (B-3.1); never inferred.
     pub current_version_bytes: Vec<u8>,
+    /// §4.12 B-2.5: required lifecycle state; missing data is not active.
+    pub status: RuleSetStatus,
 }
 
 /// Candidate `memory_rule_set_version` row, preserving all five byte fields.
@@ -132,6 +145,19 @@ pub struct BindingRow {
     pub removed_at: Option<i64>,
     /// §4.12 B-2.2: who removed this binding.
     pub removed_by: Option<BinaryId>,
+}
+
+/// memory—v1 §4.13 N-19: a binding is active only for its active owner card.
+///
+/// Missing cards, inconsistent ownership and either half of a removal marker
+/// are not active. This predicate does not validate confirmations or windows.
+pub fn binding_is_active(binding: &BindingRow, card: Option<&UserCardRow>) -> bool {
+    card.is_some_and(|card| {
+        binding.user_card_id == card.user_card_id
+            && card.status == UserCardStatus::Active
+            && binding.removed_at.is_none()
+            && binding.removed_by.is_none()
+    })
 }
 
 /// Candidate `memory_binding_confirmation` traceability row.
@@ -270,22 +296,39 @@ impl TableCounts {
     }
 }
 
-/// Why no unambiguous current version can be named for a rule set.
-///
-/// The candidate schema defines no current-version pointer, and neither version
-/// bytes nor timestamps order versions; the only unambiguous case is a rule set
-/// that has exactly one stored version.
+/// Why the legacy single-version selection could not be resolved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionError {
-    /// The rule set has no stored version.
-    NoVersion {
-        /// The rule set without a version.
+    /// The legacy single-version selector found no stored version.
+    NoVersion { rule_set_id: BinaryId },
+    /// The legacy single-version selector found more than one stored version.
+    AmbiguousVersions { rule_set_id: BinaryId },
+}
+
+/// Why a rule set's explicit current-version pointer cannot be resolved.
+///
+/// The pointer is the only source of currentness. Historical versions may be
+/// retained in any number; version bytes and timestamps do not order them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CurrentVersionPointerError {
+    /// The rule set has no current-version pointer.
+    EmptyCurrentVersionPointer {
+        /// The rule set without a pointer.
         rule_set_id: BinaryId,
     },
-    /// The rule set has several stored versions and the contract orders none of them.
-    AmbiguousVersions {
-        /// The rule set with more than one version.
+    /// The pointer names no stored version at all.
+    MissingCurrentVersion {
+        /// The rule set whose pointer cannot be resolved.
         rule_set_id: BinaryId,
+        /// The exact unresolved pointer bytes.
+        version_bytes: Vec<u8>,
+    },
+    /// The pointer bytes exist, but only under another rule set.
+    CrossRuleSetCurrentVersion {
+        /// The rule set whose pointer is mismatched.
+        rule_set_id: BinaryId,
+        /// The exact pointer bytes found under another rule set.
+        version_bytes: Vec<u8>,
     },
 }
 
@@ -305,12 +348,57 @@ impl CandidateRows {
         }
     }
 
-    /// memory—v1: Name the current version of each rule set without inferring an order.
+    /// memory—v1 §4.13: Derive current selections only from the stored explicit
+    /// pointer on each rule-set row. Historical versions do not make a selection
+    /// ambiguous; the pointer must name a version belonging to the same rule set.
+    pub fn current_version_selections(
+        &self,
+    ) -> Result<Vec<CurrentSelection>, CurrentVersionPointerError> {
+        let versions: BTreeSet<_> = self
+            .rule_set_versions
+            .iter()
+            .map(|version| (version.rule_set_id, version.version_bytes.as_slice()))
+            .collect();
+        let mut selections = Vec::with_capacity(self.rule_sets.len());
+        for rule_set in &self.rule_sets {
+            let pointer = rule_set.current_version_bytes.as_slice();
+            if pointer.is_empty() {
+                return Err(CurrentVersionPointerError::EmptyCurrentVersionPointer {
+                    rule_set_id: rule_set.rule_set_id,
+                });
+            }
+            if versions.contains(&(rule_set.rule_set_id, pointer)) {
+                selections.push(CurrentSelection {
+                    rule_set_id: rule_set.rule_set_id,
+                    version_bytes: rule_set.current_version_bytes.clone(),
+                });
+                continue;
+            }
+            let belongs_to_other_rule_set = self
+                .rule_set_versions
+                .iter()
+                .any(|version| version.version_bytes.as_slice() == pointer);
+            return Err(if belongs_to_other_rule_set {
+                CurrentVersionPointerError::CrossRuleSetCurrentVersion {
+                    rule_set_id: rule_set.rule_set_id,
+                    version_bytes: rule_set.current_version_bytes.clone(),
+                }
+            } else {
+                CurrentVersionPointerError::MissingCurrentVersion {
+                    rule_set_id: rule_set.rule_set_id,
+                    version_bytes: rule_set.current_version_bytes.clone(),
+                }
+            });
+        }
+        selections.sort_unstable_by_key(|selection| selection.rule_set_id);
+        Ok(selections)
+    }
+
+    /// memory—v1: Legacy single-version selection retained for compatibility.
     ///
-    /// A rule set with exactly one stored version selects it. Zero or several
-    /// versions are refused, because the candidate schema has no current-version
-    /// pointer and version bytes or timestamps are not an ordering. The result is
-    /// sorted by rule-set identifier so it is deterministic.
+    /// This helper refuses zero or multiple stored versions and does not consult
+    /// the current pointer. Cold loading must use `current_version_selections`.
+    /// Results are sorted by rule-set identifier.
     pub fn single_version_selections(&self) -> Result<Vec<CurrentSelection>, SelectionError> {
         let mut by_rule_set: BTreeMap<BinaryId, (usize, &[u8])> = self
             .rule_sets
@@ -446,6 +534,29 @@ fn unique(ids: &mut BTreeSet<BinaryId>, table: Table, id: BinaryId) -> Result<()
     Ok(())
 }
 
+// memory—v1: Preserve the existing public error shape for a missing paired field.
+pub(crate) fn require_tombstone_pair(
+    table: Table,
+    id: BinaryId,
+    time_present: bool,
+    actor_present: bool,
+    time_field: &'static str,
+    actor_field: &'static str,
+) -> Result<(), ValidationError> {
+    if time_present == actor_present {
+        return Ok(());
+    }
+    Err(ValidationError::MissingReference {
+        table,
+        field: if time_present {
+            actor_field
+        } else {
+            time_field
+        },
+        id,
+    })
+}
+
 // memory—v1: Resolve an actual foreign key in the supplied rows only.
 fn require(
     ids: &BTreeSet<BinaryId>,
@@ -479,7 +590,7 @@ fn length(
 }
 
 // memory—v1: Check the opaque fields shared by both confirmation tables.
-fn confirmation_lengths(
+pub(crate) fn confirmation_lengths(
     table: Table,
     version: &[u8],
     scope: &[u8],
@@ -600,6 +711,14 @@ impl CandidateRows {
         }
         for row in &self.bindings {
             unique(&mut binding_ids, Table::Binding, row.binding_id)?;
+            require_tombstone_pair(
+                Table::Binding,
+                row.binding_id,
+                row.removed_at.is_some(),
+                row.removed_by.is_some(),
+                "removed_at",
+                "removed_by",
+            )?;
             require(&cards, Table::Binding, "user_card_id", row.user_card_id)?;
             require(&rule_sets, Table::Binding, "rule_set_id", row.rule_set_id)?;
             if let (Some(from), Some(until)) = (row.valid_from, row.valid_until) {
@@ -612,6 +731,14 @@ impl CandidateRows {
             bindings.insert(row.binding_id, row);
         }
         for row in &self.binding_confirmations {
+            require_tombstone_pair(
+                Table::BindingConfirmation,
+                row.confirmation_id,
+                row.revoked_at.is_some(),
+                row.revoked_by.is_some(),
+                "revoked_at",
+                "revoked_by",
+            )?;
             unique(
                 &mut binding_confirmation_ids,
                 Table::BindingConfirmation,
@@ -649,6 +776,14 @@ impl CandidateRows {
             )?;
         }
         for row in &self.rule_set_change_confirmations {
+            require_tombstone_pair(
+                Table::RuleSetChangeConfirmation,
+                row.confirmation_id,
+                row.revoked_at.is_some(),
+                row.revoked_by.is_some(),
+                "revoked_at",
+                "revoked_by",
+            )?;
             unique(
                 &mut change_confirmation_ids,
                 Table::RuleSetChangeConfirmation,
@@ -733,11 +868,33 @@ impl<'a> CandidateView<'a> {
         })
     }
 
+    /// memory—v1: Observe all supplied confirmations for an existing binding,
+    /// including historical versions and revoked rows, regardless of selection.
+    ///
+    /// `None` means the binding is absent from these supplied rows; an empty
+    /// vector means it is present but has no supplied confirmations. The result
+    /// is neither a completeness proof nor an authorization decision.
+    pub fn binding_confirmation_history(
+        &self,
+        binding_id: BinaryId,
+    ) -> Option<Vec<&'a BindingConfirmationRow>> {
+        let binding = self.bindings.get(&binding_id)?;
+        Some(
+            self.rows
+                .binding_confirmations
+                .iter()
+                .filter(|row| {
+                    row.binding_id == binding_id && row.rule_set_id == binding.rule_set_id
+                })
+                .collect(),
+        )
+    }
+
     /// memory—v1: Build a binding candidate without treating records as approval.
     ///
-    /// Only records referring to the selected present version are returned here;
-    /// older records remain accessible via `rows`. Neither record type establishes
-    /// authorization, and a change confirmation has no defined effect on bindings.
+    /// This legacy view returns only records referring to the selected present
+    /// version; use `binding_confirmation_history` to observe binding confirmations
+    /// across versions. Neither view establishes confirmation validity or authorization.
     pub fn binding(&self, binding_id: BinaryId) -> Option<BindingCandidate<'a>> {
         let binding = *self.bindings.get(&binding_id)?;
         let current = self.current(binding.rule_set_id)?;
@@ -828,6 +985,7 @@ mod tests {
                 rule_set_id: id(6),
                 owner_tenant_id: id(4),
                 current_version_bytes: Vec::new(),
+                status: RuleSetStatus::Active,
             }],
             rule_set_versions: vec![RuleSetVersionRow {
                 rule_set_id: id(6),
@@ -873,6 +1031,127 @@ mod tests {
                 revoked_by: None,
             }],
         }
+    }
+
+    #[test]
+    // memory—v1: Rule-set status is explicit and has a closed byte vocabulary.
+    fn rule_set_status_serde_rejects_missing_and_unknown_values() {
+        let row = rows().rule_sets.remove(0);
+        let mut value = serde_json::to_value(&row).unwrap();
+        assert_eq!(value["status"], "ACTIVE");
+        value["status"] = serde_json::json!("RETIRED");
+        let retired: RuleSetRow = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(retired.status, RuleSetStatus::Retired);
+        assert_eq!(serde_json::to_value(retired).unwrap()["status"], "RETIRED");
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!("active"),
+            serde_json::json!("UNKNOWN"),
+        ] {
+            value["status"] = invalid;
+            assert!(serde_json::from_value::<RuleSetRow>(value.clone()).is_err());
+        }
+        value.as_object_mut().unwrap().remove("status");
+        assert!(serde_json::from_value::<RuleSetRow>(value).is_err());
+    }
+
+    #[test]
+    // memory—v1 §4.13 N-19: ownership, lifecycle and complete tombstones matter.
+    fn binding_activity_requires_its_active_card_and_no_removal() {
+        let input = rows();
+        let binding = &input.bindings[0];
+        let card = &input.user_cards[0];
+        assert!(binding_is_active(binding, Some(card)));
+        assert!(!binding_is_active(binding, None));
+
+        let mut other_card = card.clone();
+        other_card.user_card_id = id(99);
+        assert!(!binding_is_active(binding, Some(&other_card)));
+        let mut disabled_card = card.clone();
+        disabled_card.status = UserCardStatus::Disabled;
+        assert!(!binding_is_active(binding, Some(&disabled_card)));
+        for (removed_at, removed_by) in [
+            (Some(10), Some(id(1))),
+            (Some(10), None),
+            (None, Some(id(1))),
+        ] {
+            let mut removed = binding.clone();
+            removed.removed_at = removed_at;
+            removed.removed_by = removed_by;
+            assert!(!binding_is_active(&removed, Some(card)));
+        }
+    }
+
+    #[test]
+    // memory—v1: Preserve the legacy error's Copy and exhaustive-match contract.
+    fn legacy_selection_error_remains_copy_and_exhaustive() {
+        fn assert_copy<T: Copy>() {}
+        fn rule_set_id(error: SelectionError) -> BinaryId {
+            match error {
+                SelectionError::NoVersion { rule_set_id }
+                | SelectionError::AmbiguousVersions { rule_set_id } => rule_set_id,
+            }
+        }
+
+        assert_copy::<SelectionError>();
+        let missing = SelectionError::NoVersion { rule_set_id: id(6) };
+        let ambiguous = SelectionError::AmbiguousVersions { rule_set_id: id(7) };
+        assert_eq!(rule_set_id(missing), id(6));
+        assert_eq!(rule_set_id(ambiguous), id(7));
+        assert_eq!(missing, SelectionError::NoVersion { rule_set_id: id(6) });
+    }
+
+    #[test]
+    // memory—v1: Partial lifecycle tombstones cannot be loaded as active facts.
+    fn incomplete_tombstones_are_rejected() {
+        for (table, row_id) in [
+            (Table::Binding, id(7)),
+            (Table::BindingConfirmation, id(8)),
+            (Table::RuleSetChangeConfirmation, id(8)),
+        ] {
+            for missing_time in [false, true] {
+                let mut candidate = rows();
+                let (time, actor) = if missing_time {
+                    (None, Some(id(1)))
+                } else {
+                    (Some(1), None)
+                };
+                match table {
+                    Table::Binding => {
+                        candidate.bindings[0].removed_at = time;
+                        candidate.bindings[0].removed_by = actor;
+                    }
+                    Table::BindingConfirmation => {
+                        candidate.binding_confirmations[0].revoked_at = time;
+                        candidate.binding_confirmations[0].revoked_by = actor;
+                    }
+                    Table::RuleSetChangeConfirmation => {
+                        candidate.rule_set_change_confirmations[0].revoked_at = time;
+                        candidate.rule_set_change_confirmations[0].revoked_by = actor;
+                    }
+                    _ => unreachable!(),
+                }
+                let missing_field = match (table, missing_time) {
+                    (Table::Binding, true) => "removed_at",
+                    (Table::Binding, false) => "removed_by",
+                    (_, true) => "revoked_at",
+                    (_, false) => "revoked_by",
+                };
+                assert!(matches!(
+                    candidate.build_candidate(&[]),
+                    Err(ValidationError::MissingReference { table: actual, field, id })
+                        if actual == table && field == missing_field && id == row_id
+                ));
+            }
+        }
+        let mut candidate = rows();
+        candidate.bindings[0].removed_at = Some(1);
+        candidate.bindings[0].removed_by = Some(id(1));
+        candidate.binding_confirmations[0].revoked_at = Some(1);
+        candidate.binding_confirmations[0].revoked_by = Some(id(1));
+        candidate.rule_set_change_confirmations[0].revoked_at = Some(1);
+        candidate.rule_set_change_confirmations[0].revoked_by = Some(id(1));
+        assert!(candidate.build_candidate(&[]).is_ok());
     }
 
     #[test]
@@ -963,6 +1242,71 @@ mod tests {
             candidate.build_candidate(&first).unwrap().current(id(6)),
             Some(CurrentVersion::Present(&candidate.rule_set_versions[0]))
         );
+    }
+
+    #[test]
+    // memory—v1 §4.5: Binding confirmation history is independent of the
+    // selected version and retains both active rows and revoke tombstones.
+    fn binding_confirmation_history_preserves_rows_across_selection_states() {
+        let mut candidate = rows();
+        candidate.binding_confirmations[0].revoked_at = Some(10);
+        candidate.binding_confirmations[0].revoked_by = Some(id(1));
+        let mut active = candidate.binding_confirmations[0].clone();
+        active.confirmation_id = id(20);
+        active.revoked_at = None;
+        active.revoked_by = None;
+        candidate.binding_confirmations.push(active);
+        candidate.rule_set_versions.push(RuleSetVersionRow {
+            rule_set_id: id(6),
+            version_bytes: vec![2],
+            content_bytes: vec![],
+            timestamp_bytes: vec![2],
+            hash_input_bytes: vec![],
+            hash_bytes: vec![],
+        });
+        let mut change = candidate.rule_set_change_confirmations[0].clone();
+        change.confirmation_id = id(21);
+        change.version_bytes = vec![2];
+        candidate.rule_set_change_confirmations.push(change);
+
+        for selected_version in [None, Some(vec![3]), Some(vec![2])] {
+            let selections: Vec<_> = selected_version
+                .map(|version_bytes| CurrentSelection {
+                    rule_set_id: id(6),
+                    version_bytes,
+                })
+                .into_iter()
+                .collect();
+            let view = candidate.build_candidate(&selections).unwrap();
+            let history = view.binding_confirmation_history(id(7)).unwrap();
+            assert_eq!(
+                history,
+                candidate.binding_confirmations.iter().collect::<Vec<_>>()
+            );
+            assert_eq!(history[0].revoked_at, Some(10));
+            assert_eq!(history[1].revoked_at, None);
+            assert_eq!(view.binding_confirmation_history(id(99)), None);
+            match view.current(id(6)).unwrap() {
+                CurrentVersion::NotSelected => assert!(selections.is_empty()),
+                CurrentVersion::Missing { version_bytes } => assert_eq!(version_bytes, &[3]),
+                CurrentVersion::Present(version) => {
+                    assert_eq!(version.version_bytes, vec![2]);
+                    assert_eq!(
+                        view.binding(id(7)).unwrap().change_confirmations,
+                        ConfirmationRecords::Records(vec![
+                            &candidate.rule_set_change_confirmations[1]
+                        ])
+                    );
+                }
+            }
+        }
+        candidate.binding_confirmations.clear();
+        assert!(candidate
+            .build_candidate(&[])
+            .unwrap()
+            .binding_confirmation_history(id(7))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

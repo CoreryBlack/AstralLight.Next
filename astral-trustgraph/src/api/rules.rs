@@ -540,26 +540,29 @@ async fn validate_rule(
     )))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistryResourceDto {
+    // Match the alphabetical key order of the legacy serde_json map.
+    actions: Vec<String>,
+    description: (), // Serializes as explicit JSON null.
+    resource_type: String,
+    // memory—v1 §4.4 has no condition-expression language. Keep the legacy empty array.
+    supported_conditions: [&'static str; 0],
+}
+
 // memory—v1 §4.9: Render only the active portion of one root-owned snapshot.
 // Retired entries remain historical root facts, never usable directory entries.
-fn resource_types_from_snapshot(snapshot: RegistrySnapshot) -> Vec<serde_json::Value> {
+fn resource_types_from_snapshot(snapshot: RegistrySnapshot) -> Vec<RegistryResourceDto> {
     snapshot
         .entries
         .into_iter()
-        // RetireRequested and Retired remain root facts, but are not available
-        // resource types. Omitting them preserves the legacy DTO while never
-        // presenting an inactive action set as usable.
         .filter(|entry| entry.status == RegistryStatus::Active)
-        .map(|entry| {
-            serde_json::json!({
-                "resourceType": entry.resource,
-                "actions": entry.actions,
-                // memory—v1 §4.4 (design §4.4, lines 225/247): v1 has no
-                // condition-expression language; retain the legacy field with
-                // its contractually empty value.
-                "supportedConditions": [],
-                "description": serde_json::Value::Null,
-            })
+        .map(|entry| RegistryResourceDto {
+            actions: entry.actions,
+            description: (),
+            resource_type: entry.resource,
+            supported_conditions: [],
         })
         .collect()
 }
@@ -569,7 +572,7 @@ fn resource_types_from_snapshot(snapshot: RegistrySnapshot) -> Vec<serde_json::V
 async fn list_resource_types(
     State(_state): State<AppState>,
     root: Option<Extension<RequestRootExtension>>,
-) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, AppError> {
+) -> Result<Json<ApiResponse<Vec<RegistryResourceDto>>>, AppError> {
     let root = root
         .map(|Extension(root)| root)
         .ok_or_else(|| AppError(AstralError::Pending("request root unavailable".into())))?;
@@ -614,9 +617,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn registry_dto_renders_only_active_root_entries_with_legacy_shape() {
-        let values = resource_types_from_snapshot(RegistrySnapshot {
+    #[tokio::test]
+    // memory—v1: Compare wire bytes with the legacy JSON, including entry, action and key order.
+    async fn registry_dto_renders_only_active_root_entries_with_legacy_shape() {
+        let entries = resource_types_from_snapshot(RegistrySnapshot {
             version: 7,
             entries: vec![
                 RegistryEntryView {
@@ -625,8 +629,8 @@ mod tests {
                     status: RegistryStatus::RetireRequested,
                 },
                 RegistryEntryView {
-                    resource: "active_resource".into(),
-                    actions: vec!["read".into(), "scan".into()],
+                    resource: "z_active_resource".into(),
+                    actions: vec!["scan".into(), "read".into()],
                     status: RegistryStatus::Active,
                 },
                 RegistryEntryView {
@@ -634,23 +638,50 @@ mod tests {
                     actions: vec!["read".into()],
                     status: RegistryStatus::Retired,
                 },
+                RegistryEntryView {
+                    resource: "a_active_resource".into(),
+                    actions: vec!["read".into()],
+                    status: RegistryStatus::Active,
+                },
             ],
         });
 
-        assert_eq!(values.len(), 1);
-        assert_eq!(values[0]["resourceType"], "active_resource");
-        assert_eq!(values[0]["actions"], serde_json::json!(["read", "scan"]));
-        assert_eq!(values[0]["supportedConditions"], serde_json::json!([]));
-        assert!(values[0]["description"].is_null());
+        let response = ApiResponse::success(entries);
+        let mut legacy = ApiResponse::success(serde_json::json!([
+            {
+                "resourceType": "z_active_resource",
+                "actions": ["scan", "read"],
+                "supportedConditions": [],
+                "description": null,
+            },
+            {
+                "resourceType": "a_active_resource",
+                "actions": ["read"],
+                "supportedConditions": [],
+                "description": null,
+            },
+        ]));
+        legacy.timestamp = response.timestamp;
+        let expected = serde_json::to_vec(&legacy).expect("legacy response serializes");
+        let body = axum::body::to_bytes(Json(response).into_response().into_body(), 4096)
+            .await
+            .expect("registry response body");
+        assert_eq!(body.as_ref(), expected.as_slice());
     }
 
-    #[test]
-    fn registry_dto_does_not_fabricate_entries_from_an_empty_root_snapshot() {
-        let values = resource_types_from_snapshot(RegistrySnapshot {
+    #[tokio::test]
+    // memory—v1: An empty root snapshot still serializes data as an empty array.
+    async fn registry_dto_does_not_fabricate_entries_from_an_empty_root_snapshot() {
+        let entries = resource_types_from_snapshot(RegistrySnapshot {
             version: 1,
             entries: Vec::new(),
         });
-        assert!(values.is_empty());
+        let response = Json(ApiResponse::success(entries)).into_response();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("registry response body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(payload["data"], serde_json::json!([]));
     }
 
     #[test]

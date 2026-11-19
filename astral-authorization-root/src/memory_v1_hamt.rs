@@ -21,8 +21,24 @@ use crate::memory_v1_registry::{RegistryError, RegistryReadGuard};
 use crate::memory_v1_rules::{
     binding_confirmation_valid, change_confirmation_valid, classify_binding_confirmations,
     classify_change_confirmations, parse_version, BindingConfirmationState,
-    ChangeConfirmationState, MemoryV1RuleError,
+    ChangeConfirmationState, MemoryV1RuleError, PreparedRuleSet,
 };
+
+#[derive(Debug)]
+struct SelectedRuleVersion {
+    row: Arc<RuleSetVersionRow>,
+    // Offline candidates may carry malformed rule content. Keep the error so
+    // serving validation and evaluation still reject it at the existing gates.
+    prepared: Result<PreparedRuleSet, MemoryV1RuleError>,
+}
+
+impl SelectedRuleVersion {
+    // memory—v1: Derive the match plan from the exact canonical row it accompanies.
+    fn new(row: Arc<RuleSetVersionRow>) -> Self {
+        let prepared = PreparedRuleSet::prepare(&row);
+        Self { row, prepared }
+    }
+}
 
 /// Limits applied to a supplied candidate and each binding-bearing query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,7 +152,7 @@ pub struct HamtCandidate {
     binding_confirmation_states: HashMap<BinaryId, BindingConfirmationState>,
     changes_by_rule_set: HashMap<BinaryId, HashSet<BinaryId>>,
     change_confirmation_index: ChangeConfirmationIndex,
-    selections: HashMap<BinaryId, Arc<Vec<u8>>>,
+    selections: HashMap<BinaryId, Arc<SelectedRuleVersion>>,
     // Monotonic generations travel with each immutable candidate snapshot.
     card_dependencies: HashMap<BinaryId, u64>,
     rule_set_dependencies: HashMap<BinaryId, u64>,
@@ -503,9 +519,7 @@ impl HamtCandidate {
                 .insert(row.confirmation_id, Arc::new(row));
         }
         for selection in selections {
-            candidate
-                .selections
-                .insert(selection.rule_set_id, Arc::new(selection.version_bytes));
+            candidate.prepare_selection(selection.rule_set_id, &selection.version_bytes)?;
         }
         candidate.change_confirmation_index = ChangeConfirmationIndex::from_rows(
             candidate.change_confirmations.values().map(Arc::as_ref),
@@ -956,9 +970,9 @@ impl HamtCandidate {
         let selections = self
             .selections
             .iter()
-            .map(|(rule_set_id, version_bytes)| CurrentSelection {
+            .map(|(rule_set_id, selection)| CurrentSelection {
                 rule_set_id: *rule_set_id,
-                version_bytes: (**version_bytes).clone(),
+                version_bytes: selection.row.version_bytes.clone(),
             })
             .collect();
         (rows, selections)
@@ -989,7 +1003,7 @@ impl HamtCandidate {
             && self.rule_sets.iter().all(|(id, rule_set)| {
                 !rule_set.current_version_bytes.is_empty()
                     && self.selections.get(id).is_some_and(|selection| {
-                        selection.as_slice() == rule_set.current_version_bytes.as_slice()
+                        selection.row.version_bytes == rule_set.current_version_bytes
                     })
                     && self.version(*id, &rule_set.current_version_bytes).is_some()
             })
@@ -1081,7 +1095,48 @@ impl HamtCandidate {
         Ok(self
             .selections
             .get(&rule_set_id)
-            .and_then(|version| self.version(rule_set_id, version)))
+            .map(|selected| selected.row.as_ref()))
+    }
+
+    // memory—v1: Bind a borrowed plan to the exact selected row from this snapshot.
+    pub(crate) fn prepared_selected_rules(
+        &self,
+        row: &RuleSetVersionRow,
+    ) -> Option<&PreparedRuleSet> {
+        let selected = self.selections.get(&row.rule_set_id)?;
+        if !std::ptr::eq(selected.row.as_ref(), row) {
+            return None;
+        }
+        selected.prepared.as_ref().ok()
+    }
+
+    // memory—v1: No mutable cache or content-address lookup. The plan is
+    // replaced with the selection and shared with unchanged snapshots.
+    fn prepare_selection(
+        &mut self,
+        rule_set_id: BinaryId,
+        version: &[u8],
+    ) -> Result<(), CandidateError> {
+        if self
+            .selections
+            .get(&rule_set_id)
+            .is_some_and(|selection| selection.row.version_bytes == version)
+        {
+            return Ok(());
+        }
+        let row = self
+            .versions
+            .get(&rule_set_id)
+            .and_then(|versions| versions.get(version))
+            .ok_or_else(|| CandidateError::UnknownVersion {
+                rule_set_id,
+                version_bytes: version.to_vec(),
+            })?;
+        self.selections.insert(
+            rule_set_id,
+            Arc::new(SelectedRuleVersion::new(Arc::clone(row))),
+        );
+        Ok(())
     }
 
     /// memory—v1: Return a user's direct card IDs, or an error for an unknown user.
@@ -1575,10 +1630,7 @@ impl HamtCandidate {
         let mut next = self.clone();
         next.advance_rule_set_dependency(rule_set_id)?;
         match version {
-            Some(bytes) => {
-                next.selections
-                    .insert(rule_set_id, Arc::new(bytes.to_vec()));
-            }
+            Some(bytes) => next.prepare_selection(rule_set_id, bytes)?,
             None => {
                 next.selections.remove(&rule_set_id);
             }
@@ -1612,8 +1664,7 @@ impl HamtCandidate {
             .clone();
         rule_set.current_version_bytes = version_bytes.to_vec();
         next.rule_sets.insert(rule_set_id, Arc::new(rule_set));
-        next.selections
-            .insert(rule_set_id, Arc::new(version_bytes.to_vec()));
+        next.prepare_selection(rule_set_id, version_bytes)?;
         Ok(next)
     }
 
@@ -2472,10 +2523,7 @@ impl HamtCandidate {
                 version_row.version_bytes.clone(),
                 Arc::new(version_row.clone()),
             );
-        next.selections.insert(
-            rule_set_row.rule_set_id,
-            Arc::new(version_row.version_bytes.clone()),
-        );
+        next.prepare_selection(rule_set_row.rule_set_id, &version_row.version_bytes)?;
         Ok(next)
     }
 
@@ -5005,6 +5053,29 @@ mod tests {
             .selected_version(id(10))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    // memory—v1: Bind a prepared plan to its own version and snapshot, not
+    // merely to a rule-set ID or bytes supplied by a caller.
+    fn prepared_plan_tracks_exact_selection() {
+        let before = candidate();
+        let row = before.selected_version(id(10)).unwrap().unwrap();
+        let plan = before.prepared_selected_rules(row).unwrap();
+        assert!(before.prepared_selected_rules(&row.clone()).is_none());
+
+        let unchanged = before
+            .with_selection(id(10), Some(&row.version_bytes))
+            .unwrap();
+        assert!(std::ptr::eq(
+            plan,
+            unchanged.prepared_selected_rules(row).unwrap()
+        ));
+        let changed = before.with_selection(id(10), Some(&[1])).unwrap();
+        let replacement = changed.selected_version(id(10)).unwrap().unwrap();
+        assert!(changed.prepared_selected_rules(row).is_none());
+        assert!(before.prepared_selected_rules(replacement).is_none());
+        assert!(changed.prepared_selected_rules(replacement).is_some());
     }
 
     #[test]

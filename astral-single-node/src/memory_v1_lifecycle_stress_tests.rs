@@ -46,6 +46,9 @@ use crate::memory_v1_composition::full_path_tests::{
     fixture, ALICE, BOB, CARD_ALLOW, CARD_BOB, CARD_OVERLAY_DENY, REGISTRY,
 };
 
+#[path = "memory_v1_lifecycle_stress_tests/login_curve.rs"]
+mod login_curve;
+
 const LOGIN: &str = "/api/v1/auth/sessions";
 const CONCURRENCY_LADDER: &[usize] = &[1, 4, 16];
 const SOAK_CONCURRENCY: usize = 8;
@@ -96,11 +99,15 @@ struct CredentialsFile {
 }
 
 impl CredentialsFile {
+    // memory—v1: Own the fixture directory before creating credentials or journal files.
     fn write() -> Self {
         let dir =
             std::env::temp_dir().join(format!("astral-memory-v1-stress-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("credentials.json");
+        std::fs::create_dir(&dir).unwrap();
+        let fixture = Self {
+            path: dir.join("credentials.json"),
+            dir,
+        };
         let entry = |identifier: &str, user: [u8; 16], password: &str| {
             json!({
                 "identifier": identifier,
@@ -118,20 +125,21 @@ impl CredentialsFile {
             ],
         })
         .to_string();
-        std::fs::write(&path, text).unwrap();
+        std::fs::write(&fixture.path, text).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(&fixture.path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
         }
-        Self { dir, path }
+        fixture
     }
 }
 
 impl Drop for CredentialsFile {
+    // memory—v1: Clean the run-scoped directory even if the test unwinds.
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-        let _ = std::fs::remove_dir(&self.dir);
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -177,23 +185,22 @@ async fn raw_request(
     (status, body)
 }
 
-async fn login(addr: std::net::SocketAddr, card: [u8; 16]) -> String {
+// memory—v1: Share the lifecycle fixture's login payload across HTTP clients.
+fn login_body(card: [u8; 16]) -> Value {
     let (identifier, password) = match card {
         CARD_BOB => ("bob", "bob-secret"),
         _ => ("alice", "alice-secret"),
     };
-    let (status, body) = raw_request(
-        addr,
-        "POST",
-        LOGIN,
-        None,
-        Some(&json!({
-            "identifier": identifier,
-            "password": password,
-            "userCardId": astral_types::memory_v1::MemoryId::from_bytes(card).to_string(),
-        })),
-    )
-    .await;
+    json!({
+        "identifier": identifier,
+        "password": password,
+        "userCardId": astral_types::memory_v1::MemoryId::from_bytes(card).to_string(),
+    })
+}
+
+// memory—v1: Establish a session through the existing fresh-connection client.
+async fn login(addr: std::net::SocketAddr, card: [u8; 16]) -> String {
+    let (status, body) = raw_request(addr, "POST", LOGIN, None, Some(&login_body(card))).await;
     assert_eq!(status, 200, "login must succeed: {body}");
     body["data"]["accessToken"]
         .as_str()
@@ -201,6 +208,103 @@ async fn login(addr: std::net::SocketAddr, card: [u8; 16]) -> String {
         .to_owned()
 }
 
+// memory—v1: Time successful reads separately from login and connection setup
+// policy. Each worker uses one client and pre-issued session for its whole run.
+async fn measure_allow_reads(addr: std::net::SocketAddr, extra_resources: usize) {
+    use reqwest::header::CONNECTION;
+    use tokio::sync::Barrier;
+
+    const ROUNDS: usize = 3;
+    const REQUESTS_PER_WORKER: usize = 128;
+    let token = StdArc::new(login(addr, CARD_ALLOW).await);
+    let url = format!("http://{addr}{REGISTRY}");
+    for round in 0..ROUNDS {
+        // Alternate mode order to reduce systematic warm-up bias.
+        for keep_alive in [round % 2 == 1, round % 2 == 0] {
+            for &workers in CONCURRENCY_LADDER {
+                let ready = StdArc::new(Barrier::new(workers + 1));
+                let start = StdArc::new(Barrier::new(workers + 1));
+                let mut jobs = Vec::with_capacity(workers);
+                for _ in 0..workers {
+                    let token = StdArc::clone(&token);
+                    let ready = StdArc::clone(&ready);
+                    let start = StdArc::clone(&start);
+                    let url = url.clone();
+                    jobs.push(tokio::spawn(async move {
+                        let client = reqwest::Client::builder()
+                            .http1_only()
+                            .no_proxy()
+                            .timeout(Duration::from_secs(5))
+                            .build()
+                            .unwrap();
+                        let get = || {
+                            let request = client.get(&url).bearer_auth(token.as_str());
+                            if keep_alive {
+                                request
+                            } else {
+                                request.header(CONNECTION, "close")
+                            }
+                        };
+                        let warm = get().send().await.unwrap().error_for_status().unwrap();
+                        let body: Value = warm.json().await.unwrap();
+                        let entries = body["data"].as_array().expect("registry response");
+                        assert_eq!(
+                            entries.len(),
+                            registry_declarations().len() + extra_resources
+                        );
+                        ready.wait().await;
+                        start.wait().await;
+                        let mut samples = Vec::with_capacity(REQUESTS_PER_WORKER);
+                        let mut failures = std::collections::BTreeMap::<u16, usize>::new();
+                        for _ in 0..REQUESTS_PER_WORKER {
+                            let began = Instant::now();
+                            let response = get().send().await.unwrap();
+                            let status = response.status();
+                            let _ = response.bytes().await.unwrap();
+                            if status == reqwest::StatusCode::OK {
+                                samples.push(began.elapsed().as_micros() as u64);
+                            } else {
+                                *failures.entry(status.as_u16()).or_default() += 1;
+                            }
+                        }
+                        (samples, failures)
+                    }));
+                }
+                timeout(Duration::from_secs(10), ready.wait())
+                    .await
+                    .expect("ALLOW clients finished warm-up");
+                let began = Instant::now();
+                start.wait().await;
+                let mut samples = Vec::new();
+                let mut failures = std::collections::BTreeMap::<u16, usize>::new();
+                for job in jobs {
+                    let (times, statuses) = job.await.unwrap();
+                    samples.extend(times);
+                    for (status, count) in statuses {
+                        *failures.entry(status).or_default() += count;
+                    }
+                }
+                let elapsed = began.elapsed();
+                let q = PhaseQuantile::summarize(&samples);
+                eprintln!(
+                    "allow_read extra_resources={extra_resources} keep_alive={keep_alive} workers={workers} round={round} ok={} non_200={failures:?} ok_per_sec={:.0} p50_us={} p95_us={} p99_us={}",
+                    q.count,
+                    q.count as f64 / elapsed.as_secs_f64(),
+                    q.p50_us,
+                    q.p95_us,
+                    q.p99_us,
+                );
+                assert!(
+                    failures.is_empty(),
+                    "healthy ALLOW fixture returned {failures:?}"
+                );
+                assert_eq!(samples.len(), workers * REQUESTS_PER_WORKER);
+            }
+        }
+    }
+}
+
+// memory—v1: Reuse the composed stress fixture for isolated opt-in curve cells.
 #[test]
 fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
     // The process root installs once per process; like the other lifecycle
@@ -211,15 +315,19 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
             eprintln!("[SKIP] the stress run needs Unix for the credentials file mode");
             return;
         }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
             .args([
                 "--exact",
                 "memory_v1_service::lifecycle_stress_tests::full_lifecycle_stress_collects_phase_timings_and_quantifies",
                 "--nocapture",
             ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
+            .env(CHILD, "1");
+        if let Some(rounds) = login_curve::rounds() {
+            login_curve::run_matrix(&mut child, rounds);
+            return;
+        }
+        let output = child.output().unwrap();
         assert!(
             output.status.success(),
             "stress child failed:\nstdout: {}\nstderr: {}",
@@ -230,7 +338,9 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
         return;
     }
     #[tokio::main]
+    // memory—v1: Serve one stress mode and drain its loopback composition.
     async fn run() {
+        let login_cell = login_curve::selected_cell();
         // The stress process installs its own Prometheus recorder so the commit
         // owner's phase histograms can be rendered and quantified after the run.
         let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
@@ -249,13 +359,30 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
             scanned_counts: rows.table_counts(),
             captured_at_unix_seconds: 1_700_000_000,
         };
-        let journal_dir =
-            std::env::temp_dir().join(format!("astral-stress-journal-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&journal_dir).unwrap();
+        // The opt-in read curve shares the production composition and file
+        // fixture with the lifecycle test, and runs in a fresh child per size.
+        let read_curve = std::env::var("ASTRAL_MEMORY_V1_ALLOW_CURVE")
+            .ok()
+            .map(|size| match size.as_str() {
+                "0" => 0,
+                "128" => 128,
+                _ => panic!("ALLOW curve size must be 0 or 128"),
+            });
+        let journal_dir = credentials_file.dir.join("journal");
+        std::fs::create_dir(&journal_dir).unwrap();
         let journal = super::open_durable_journal(&journal_dir).unwrap();
         let (owner, admission) = {
             let owner = install_rows(rows).unwrap();
-            owner.install_registry(&registry_declarations()).unwrap();
+            let mut declarations = registry_declarations();
+            for index in 0..read_curve.unwrap_or(0) {
+                declarations.push(
+                    astral_authorization_root::memory_v1_registry::RegistryDeclaration {
+                        resource: format!("curve-resource-{index}"),
+                        actions: vec!["read".into(), "write".into(), "list".into()],
+                    },
+                );
+            }
+            owner.install_registry(&declarations).unwrap();
             let input = sealed_production_input(&facts).unwrap();
             let (metadata, admission) = owner
                 .adopt_with_production_evidence(&facts, &input)
@@ -283,6 +410,31 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
         }));
         let _ = root_handle;
         let _ = &composition;
+
+        if let Some(cell) = login_cell {
+            let result = login_curve::measure(addr, cell).await;
+            stop_tx.send(()).unwrap();
+            timeout(Duration::from_secs(15), server)
+                .await
+                .expect("the server stopped within the drain budget")
+                .unwrap()
+                .unwrap();
+            std::fs::remove_dir_all(&journal_dir).unwrap();
+            result.expect("the login curve cell completed with a valid fixture");
+            return;
+        }
+
+        if let Some(extra_resources) = read_curve {
+            measure_allow_reads(addr, extra_resources).await;
+            stop_tx.send(()).unwrap();
+            timeout(Duration::from_secs(15), server)
+                .await
+                .expect("the server stopped within the drain budget")
+                .unwrap()
+                .unwrap();
+            std::fs::remove_dir_all(&journal_dir).unwrap();
+            return;
+        }
 
         // ── 2. Warm-up: one request per connection outside the measurement ──
         let warm_token = login(addr, CARD_ALLOW).await;

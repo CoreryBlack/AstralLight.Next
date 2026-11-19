@@ -2013,6 +2013,29 @@ impl RequestRootReader {
         runtime.registry.validate_rules_with_version(content)
     }
 
+    /// memory—v1: Borrow the match plan for the exact version row selected by
+    /// this reader. Missing, foreign, or invalid versions yield no plan.
+    pub fn prepared_selected_rules(
+        &self,
+        row: &crate::memory_v1_db_rows::RuleSetVersionRow,
+    ) -> Option<&crate::memory_v1_rules::PreparedRuleSet> {
+        self.snapshot.objects.prepared_selected_rules(row)
+    }
+
+    /// memory—v1: Validate the prepared version against one live registry
+    /// generation; the caller must still perform the final dependency recheck.
+    pub fn registry_check_prepared_with_version(
+        &self,
+        plan: &crate::memory_v1_rules::PreparedRuleSet,
+    ) -> Result<u64, RegistryError> {
+        let runtime = self
+            .observation
+            .owner
+            .upgrade()
+            .ok_or(RegistryError::NotInstalled)?;
+        runtime.registry.validate_prepared_with_version(plan)
+    }
+
     /// memory—v1 §4.6: Read a modification fence without waiting. An unavailable
     /// table is an error, never proof that the rule set is unfenced.
     pub fn is_fenced(&self, rule_set_id: BinaryId) -> Result<bool, RootError> {

@@ -116,9 +116,8 @@ impl JournalIdentityAllocator {
 
 /// The concrete fail-closed commit owner for the unified single-node path.
 pub struct MemoryV1DurableCommitOwner {
-    /// Serializes the write phase (identity allocation + frame write).
-    /// The durability wait runs OUTSIDE this mutex — concurrent writers
-    /// coalesce their fsyncs through the shared JournalDurability.
+    /// Serializes identity allocation and frame writes. Governed mutations
+    /// retain this lock across sync; DENY requests release it before waiting.
     journal: Mutex<MemoryV1DurableJournal>,
     /// Shared durability coordinator; `ensure_durable` takes `&self` so
     /// concurrent waiters group-commit into one fdatasync.
@@ -154,6 +153,12 @@ impl MemoryV1DurableCommitOwner {
             ),
         }
     }
+
+    // memory—v1: Exclude startup syncs from the DENY proof load report.
+    #[cfg(test)]
+    pub(crate) fn journal_sync_calls(&self) -> u64 {
+        self.durability.sync_calls()
+    }
 }
 
 impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
@@ -176,10 +181,9 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
             .verified_admission(&request.root)
             .map_err(|error| pending_error(format!("root admission is not verifiable: {error}")))?;
 
-        // 3. Journal: write phase (identity, ledger claim, frame write) is
-        //    serialized by the journal mutex; the durability wait runs after
-        //    the mutex is released — concurrent writers coalesce their
-        //    fdatasyncs through the shared JournalDurability (group commit).
+        // 3. Keep governed mutation append and sync serialized for now. Do
+        // not widen mutation admission or publication concurrency as part of
+        // DENY batching; both still share the same durable prefix.
         let prepared = {
             let mut journal = self
                 .journal
@@ -340,13 +344,10 @@ fn unknown_reason_for(
 type ReservedReservation = JournalCapacityReservation;
 
 /// The unified owner is also the only DENY proof issuer: one evaluator
-/// observation becomes one fsynced DENY journal record under the same journal
-/// lock as the mutation path, so the record interleaves with mutations in one
-/// sequence. The two independent proofs are minted only from that record's own
-/// receipt: the audit digest binds the durable observation bytes, and the
-/// prefix proof carries the post-append journal tail with the read root's
-/// state digest. Both proofs then pass the coordinator's gate; anything else
-/// stays a fail-closed 503.
+/// observation becomes one DENY frame under the same append lock as mutations.
+/// The lock is released before waiting for durability so independent DENYs
+/// can share a sync. Both proofs still come from the frame's own durable
+/// receipt; anything else remains a fail-closed 503.
 impl astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofPort
     for MemoryV1DurableCommitOwner
 {
@@ -401,6 +402,7 @@ impl astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofP
         let prepared = journal
             .prepare_deny(&request, &self.durability)
             .map_err(|error| pending_error(format!("durable deny append failed: {error:?}")))?;
+        drop(journal);
         let receipt = prepared
             .into_durable_receipt(&self.durability)
             .map_err(|error| pending_error(format!("durable deny append failed: {error:?}")))?;

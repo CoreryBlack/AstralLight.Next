@@ -84,6 +84,7 @@ fn is_non_empty_bearer(value: &str) -> bool {
         .is_some_and(|token| !token.trim().is_empty())
 }
 
+// memory—v1: Keep a lone nonempty chunk intact, but wait for EOF before returning it.
 async fn collect_bounded_response_body<S, E>(
     chunks: S,
     declared_length: Option<u64>,
@@ -96,16 +97,45 @@ where
         return Err(BoundedBodyError::TooLarge);
     }
 
-    let mut body = bytes::BytesMut::new();
-    let mut chunks = Box::pin(chunks);
+    let mut chunks = std::pin::pin!(chunks);
+    let mut first = bytes::Bytes::new();
+    let mut body = loop {
+        let Some(chunk) = chunks.next().await else {
+            return Ok(first);
+        };
+        let chunk = chunk.map_err(|_| BoundedBodyError::Read)?;
+        if chunk.is_empty() {
+            continue;
+        }
+        if chunk.len() > limit.saturating_sub(first.len()) {
+            return Err(BoundedBodyError::TooLarge);
+        }
+        if first.is_empty() {
+            first = chunk;
+            continue;
+        }
+
+        let mut body = Vec::with_capacity(first.len() + chunk.len());
+        body.extend_from_slice(&first);
+        body.extend_from_slice(&chunk);
+        break body;
+    };
+    drop(first);
+
     while let Some(chunk) = chunks.next().await {
         let chunk = chunk.map_err(|_| BoundedBodyError::Read)?;
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(BoundedBodyError::TooLarge);
         }
+        let required = body.len() + chunk.len();
+        if required > body.capacity() {
+            // Grow from observed bytes, with geometric growth capped at the body limit.
+            let capacity = body.capacity().saturating_mul(2).min(limit).max(required);
+            body.reserve_exact(capacity - body.len());
+        }
         body.extend_from_slice(&chunk);
     }
-    Ok(body.freeze())
+    Ok(body.into())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1797,6 +1827,24 @@ mod client_header_policy_tests {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(response.headers()["x-trace-id"], "trace-upstream");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-upstream-test", HeaderValue::from_static("upstream"));
+        let response = finish_upstream_response(
+            &prepared,
+            StatusCode::OK,
+            headers,
+            None,
+            stream::iter([
+                Ok(bytes::Bytes::from_static(b"a")),
+                Ok(bytes::Bytes::from_static(b"b")),
+                Err("truncated upstream body"),
+            ]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()["x-trace-id"], "trace-upstream");
+        assert!(!response.headers().contains_key("x-upstream-test"));
     }
 
     #[test]
@@ -1831,13 +1879,23 @@ mod client_header_policy_tests {
         ));
     }
 
+    // memory—v1: Check declared and observed limits and a read error after the first chunk.
     #[tokio::test]
     async fn bounded_response_collector_rejects_content_length_chunked_and_read_errors() {
         use futures_util::stream;
 
-        let declared_too_large = stream::empty::<Result<bytes::Bytes, &'static str>>();
+        let declared_too_large = stream::poll_fn::<Result<bytes::Bytes, ()>, _>(|_| {
+            panic!("oversized declared body must not be polled")
+        });
         assert_eq!(
             collect_bounded_response_body(declared_too_large, Some(5), 4).await,
+            Err(BoundedBodyError::TooLarge)
+        );
+
+        let oversized_first =
+            stream::iter([Ok::<_, &'static str>(bytes::Bytes::from_static(b"abcde"))]);
+        assert_eq!(
+            collect_bounded_response_body(oversized_first, Some(4), 4).await,
             Err(BoundedBodyError::TooLarge)
         );
 
@@ -1851,21 +1909,59 @@ mod client_header_policy_tests {
         );
 
         let malformed = stream::iter([
-            Ok::<_, &'static str>(bytes::Bytes::from_static(b"a")),
-            Err("truncated upstream body"),
+            Ok(bytes::Bytes::from_static(b"abcd")),
+            Ok(bytes::Bytes::new()),
+            Err("upstream stream error"),
         ]);
         assert_eq!(
-            collect_bounded_response_body(malformed, Some(2), 4).await,
+            collect_bounded_response_body(malformed, Some(4), 4).await,
             Err(BoundedBodyError::Read)
         );
+    }
 
-        let exact_boundary =
-            stream::iter([Ok::<_, &'static str>(bytes::Bytes::from_static(b"abcd"))]);
+    // memory—v1: Empty chunks neither force a copy nor prevent an empty body.
+    #[tokio::test]
+    async fn bounded_response_collector_reuses_a_single_nonempty_chunk() {
+        use futures_util::stream;
+
+        let first = bytes::Bytes::from(vec![b'a', b'b', b'c', b'd']);
+        let original_ptr = first.as_ptr();
+        let chunks = stream::iter([
+            Ok::<_, ()>(bytes::Bytes::new()),
+            Ok(first),
+            Ok(bytes::Bytes::new()),
+        ]);
+        let body = collect_bounded_response_body(chunks, Some(4), 4)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"abcd");
+        assert_eq!(body.as_ptr(), original_ptr);
+
+        let empty = stream::iter([Ok::<_, ()>(bytes::Bytes::new())]);
         assert_eq!(
-            collect_bounded_response_body(exact_boundary, None, 4)
-                .await
-                .unwrap(),
-            bytes::Bytes::from_static(b"abcd")
+            collect_bounded_response_body(empty, None, 0).await,
+            Ok(bytes::Bytes::new())
+        );
+    }
+
+    // memory—v1: Preserve chunk order through buffer growth and enforce the final limit.
+    #[tokio::test]
+    async fn bounded_response_collector_joins_multiple_chunks_at_the_limit() {
+        use futures_util::stream;
+
+        let chunks = [
+            Ok::<_, ()>(bytes::Bytes::from_static(b"abc")),
+            Ok(bytes::Bytes::new()),
+            Ok(bytes::Bytes::from_static(b"def")),
+            Ok(bytes::Bytes::from_static(b"ghi")),
+        ];
+        let body = collect_bounded_response_body(stream::iter(chunks.clone()), None, 9)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"abcdefghi");
+        assert_eq!(
+            collect_bounded_response_body(stream::iter(chunks), None, 8).await,
+            Err(BoundedBodyError::TooLarge)
         );
     }
 

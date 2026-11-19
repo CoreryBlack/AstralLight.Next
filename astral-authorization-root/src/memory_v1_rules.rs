@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod prepared;
+
+pub use prepared::PreparedRuleSet;
+
 use crate::memory_v1_db_rows::{
     BindingConfirmationRow, BindingLayer, RuleSetChangeConfirmationRow, RuleSetVersionRow,
 };

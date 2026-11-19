@@ -12,3 +12,7 @@ pub mod memory_v1_root_writer;
 
 #[cfg(test)]
 mod memory_v1_governance_owner_tests;
+
+// memory—v1: Paper evidence at owner, writer and recovery level (C&S sections 4 and 5).
+#[cfg(test)]
+mod memory_v1_paper_evidence_tests;

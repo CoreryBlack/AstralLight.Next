@@ -7,7 +7,7 @@
 //! and bumps the version counter that participates in the §4.7 dependency set.
 //! The registry never grants authorization: it only defines what may be judged.
 
-use crate::memory_v1_rules::MemoryV1RuleSetContent;
+use crate::memory_v1_rules::{MemoryV1RuleSetContent, PreparedRuleSet};
 use astral_types::{
     MAX_ACTION_NAME_BYTES, MAX_CUSTOM_RESOURCE_ACTIONS, MAX_RESOURCE_TYPE_NAME_BYTES,
 };
@@ -268,6 +268,25 @@ impl RegistryState {
         let guard = RegistryReadGuard { inner };
         guard.validate_rules(content)?;
         Ok(guard.inner.version)
+    }
+
+    // memory—v1: Validate all distinct pairs of a prepared version against the
+    // current live registry. No earlier successful registry observation is reused.
+    pub(crate) fn validate_prepared_with_version(
+        &self,
+        plan: &PreparedRuleSet,
+    ) -> Result<u64, RegistryError> {
+        let inner = self
+            .inner
+            .try_read()
+            .map_err(|_| RegistryError::NotInstalled)?;
+        if !inner.is_available() {
+            return Err(RegistryError::NotInstalled);
+        }
+        for (resource, action) in plan.registry_pairs() {
+            inner.validate(resource, action)?;
+        }
+        Ok(inner.version)
     }
 
     // memory—v1: Keep the active registry stable while a root snapshot is published.

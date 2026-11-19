@@ -427,20 +427,17 @@ fn commit_refuses_a_stale_root_observation() {
     assert_eq!(root.metadata().unwrap().version, before.version + 1);
 }
 
-// memory—v1: The DENY proof issuer on the same journal: one observation
-// becomes one fsynced Deny record, both proofs mint from the receipt, and the
-// gate returns 403. A replay of the same observation is idempotent.
-#[test]
-fn deny_issuer_appends_a_deny_record_and_returns_forbidden() {
-    use astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofPort;
+// memory—v1: Give each fresh DENY a unique stable operation identity.
+fn deny_observation(
+    root: &TestRoot,
+    operation_id: String,
+) -> astral_types::memory_v1_deny_observation::MemoryV1DenyObservation {
     use astral_types::memory_v1::CandidateIdentity;
-    use astral_types::memory_v1_audit::{MemoryV1AuditDenySource, MemoryV1AuditRootStatus};
+    use astral_types::memory_v1_audit::MemoryV1AuditDenySource;
     use astral_types::memory_v1_deny_observation::{
         MemoryV1DenyAffectedBindingState, MemoryV1DenyObservation, MemoryV1DenyRootObservation,
     };
 
-    let root = production_root();
-    let owner = assembled_owner(&root);
     let metadata = root.metadata().unwrap();
     let root_observation = MemoryV1DenyRootObservation::try_from_usize(
         MemoryId::from_bytes(*metadata.instance_id.as_uuid().as_bytes()),
@@ -452,7 +449,7 @@ fn deny_issuer_appends_a_deny_record_and_returns_forbidden() {
         metadata.row_count,
     )
     .unwrap();
-    let observation = MemoryV1DenyObservation::new(
+    MemoryV1DenyObservation::new(
         root_observation,
         CandidateIdentity {
             user_id: MemoryId::from_bytes([1; 16]),
@@ -467,13 +464,22 @@ fn deny_issuer_appends_a_deny_record_and_returns_forbidden() {
         Some(Vec::new()),
         None,
         MemoryV1DenyAffectedBindingState::inapplicable(),
-        b"deny-op-1".to_vec(),
+        operation_id.into_bytes(),
         [9; 32].to_vec(),
-        astral_types::memory_v1_audit::MemoryV1AuditDenySource::RuleDeny,
+        MemoryV1AuditDenySource::RuleDeny,
         None,
     )
-    .unwrap();
+    .unwrap()
+}
 
+// memory—v1: Both proofs mint from the receipt; a replay writes no new frame.
+#[test]
+fn deny_issuer_appends_a_deny_record_and_returns_forbidden() {
+    use astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofPort;
+
+    let root = production_root();
+    let owner = assembled_owner(&root);
+    let observation = deny_observation(&root, "deny-op-1".into());
     let outcome = owner.prove_deny(observation.clone()).unwrap();
     assert_eq!(
         outcome,
@@ -499,7 +505,88 @@ fn deny_issuer_appends_a_deny_record_and_returns_forbidden() {
             crate::memory_v1_durable_journal::DurableJournalLimits::conservative(),
         )
         .unwrap();
-        assert!(tail.journal_sequence() >= 1, "one deny record was appended");
+        assert_eq!(tail.journal_sequence(), 1, "one deny record was appended");
+    }
+    assert_eq!(
+        owner.journal_sync_calls(),
+        1,
+        "a replay does not sync again"
+    );
+}
+
+// memory—v1: Exercise distinct DENY observations through the production proof
+// owner, then reopen the journal to verify the complete audit prefix.
+#[test]
+#[ignore = "local release DENY proof load; run explicitly with --ignored"]
+fn deny_proof_concurrency_curve() {
+    use std::sync::{mpsc, Barrier};
+    use std::time::{Duration, Instant};
+
+    use astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofPort;
+    use astral_trustgraph::service::memory_v1_mutation_coordinator::DenyResponse;
+
+    const ROUNDS: usize = 3;
+    const PER_WORKER: usize = 24;
+    for workers in [1, 2, 4, 8, 16] {
+        for round in 0..ROUNDS {
+            let root = production_root();
+            let owner = Arc::new(assembled_owner(&root));
+            let start = Arc::new(Barrier::new(workers + 1));
+            let (done, results) = mpsc::channel();
+            let mut joins = Vec::with_capacity(workers);
+            for worker in 0..workers {
+                let observations: Vec<_> = (0..PER_WORKER)
+                    .map(|i| deny_observation(&root, format!("deny-{worker}-{i}")))
+                    .collect();
+                let (owner, start, done) = (Arc::clone(&owner), Arc::clone(&start), done.clone());
+                joins.push(std::thread::spawn(move || {
+                    let mut latency = Vec::with_capacity(PER_WORKER);
+                    start.wait();
+                    for observation in observations {
+                        let began = Instant::now();
+                        assert_eq!(
+                            owner.prove_deny(observation).unwrap(),
+                            DenyResponse::Forbidden
+                        );
+                        latency.push(began.elapsed().as_micros());
+                    }
+                    done.send(latency).unwrap();
+                }));
+            }
+            drop(done);
+            let began = Instant::now();
+            start.wait();
+            let mut latency = Vec::with_capacity(workers * PER_WORKER);
+            let deadline = began + Duration::from_secs(15);
+            for _ in 0..workers {
+                latency.extend(
+                    results
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .expect("DENY proof must complete"),
+                );
+            }
+            let elapsed = began.elapsed();
+            for worker in joins {
+                worker.join().unwrap();
+            }
+            let syncs = owner.journal_sync_calls();
+            let operations = workers * PER_WORKER;
+            assert!((1..=operations as u64).contains(&syncs));
+            if workers == 1 {
+                assert_eq!(syncs, operations as u64);
+            }
+            drop(owner);
+            let (journal, _) = reopened_journal(&root);
+            assert_eq!(journal.position().journal_sequence(), operations as u64);
+            assert_eq!(journal.position().mutation_sequence(), 0);
+            assert_eq!(journal.recovery_records().len(), operations);
+            latency.sort_unstable();
+            let percentile = |p: usize| latency[(latency.len() * p).div_ceil(100) - 1];
+            println!(
+                "deny_owner workers={workers} round={round} operations={operations} syncs={syncs} ops_per_sec={:.2} p50_us={} p95_us={} p99_us={}",
+                operations as f64 / elapsed.as_secs_f64(), percentile(50), percentile(95), percentile(99),
+            );
+        }
     }
 }
 

@@ -610,6 +610,66 @@ note = "当前 Rust 枚举仅覆盖 tenant isolation 5-gate/32 assignment 契约
 run = "bash scripts/run-tests.sh --campaign --run --suite offline-tenant-model"
 
 [[entry]]
+id = "harness/memory-v1-authority-model"
+category = "harness"
+owner_crate = "test-harness"
+path = "test-harness/tests/memory_v1_authority_model.rs"
+kind = "offline-model"
+arch_status = "current"
+note = "memory—v1: 单请求最终复核及 A/A1 目标合同的 Rust 有界模型，生产实现与部署需独立验证"
+run = "cargo test -p test-harness --test memory_v1_authority_model -- --nocapture"
+
+[[entry]]
+id = "harness/memory-v1-admission-rule-model"
+category = "harness"
+owner_crate = "test-harness"
+path = "test-harness/tests/memory_v1_admission_rule_model.rs"
+kind = "offline-model"
+arch_status = "current"
+note = "memory—v1: 单点准入规则的有界穷举模型（38,400 个配置，57 个写事件，默认深度 2；深度 3 为单独的 ignored 运行）、35 行前提必要性变异表、信封弃权示例与回滚后恢复场景；仅对所建模宇宙成立，不证明生产实现、未建模的写者或部署"
+run = "cargo test -p test-harness --test memory_v1_admission_rule_model -- --nocapture"
+
+[[entry]]
+id = "harness/memory-v1-journal-protocol-model"
+category = "harness"
+owner_crate = "test-harness"
+path = "test-harness/tests/memory_v1_journal_protocol_model.rs"
+kind = "offline-model"
+arch_status = "current"
+note = "memory—v1: 持久日志与 DENY 回执协议的有界模型（frontier b≤d≤S≤w≤n，Process 与 PowerLoss 两类崩溃，三种 Open 变体，必要性表与修复候选，仅在有界范围内验证）；不证明生产实现，拒绝回执与被评估状态的绑定（H(O)）仍是未建立的义务"
+run = "cargo test -p test-harness --test memory_v1_journal_protocol_model -- --nocapture"
+
+[[entry]]
+id = "policy-engine/memory-v1-paper-evidence"
+category = "security"
+owner_crate = "policy-engine"
+path = "policy-engine/src/memory_v1_formal/tests/paper_evidence.rs"
+kind = "unit"
+arch_status = "current"
+note = "memory—v1: 生产最终复核的写者矩阵（23 行，在途与采用后）与 T2 信封网格（1,332 个形状 × 4 个起点 × 7 个样本 = 37,296 次评估，闭式准入 1,661，休眠 DENY 差距 128）以及 T2b 双 allow 网格（1,296 个形状 × 4 × 7 = 36,288 次评估，闭式准入 3,821，(b) 类弃权 1,266，(c) 类 402），并含只在采用时才拒绝的新鲜度撤销见证；被测生产代码未修改，见证类测试只记录当前行为"
+run = "cargo test -p policy-engine --lib memory_v1_formal::tests::paper_evidence -- --nocapture"
+
+[[entry]]
+id = "policy-engine/memory-v1-paper-integration"
+category = "security"
+owner_crate = "policy-engine"
+path = "policy-engine/tests/memory_v1_paper_envelope_boundaries.rs policy-engine/tests/memory_v1_paper_writer_coverage.rs"
+kind = "integration"
+arch_status = "current"
+note = "memory—v1: 信封边界与空窗口安装拒绝、依赖记录 12 个用例的键拒绝（含另一 root 实例）、exact-root 终检对陈旧请求快照的拒绝、围栏在终检开始时已打开则两种终检均拒绝且无发布地关闭后恢复、会话在途撤销（按凭据与按卡片）、公共写者在服务根上的拒绝、卡片停用协调器的门控、围栏打开器无生产调用者的源码钉住与默认种子随机游走；重型随机游走（256 个种子 × 64 步）为单独的 ignored 运行；不证明部署或其他 profile"
+run = "cargo test -p policy-engine --test memory_v1_paper_envelope_boundaries --test memory_v1_paper_writer_coverage -- --nocapture"
+
+[[entry]]
+id = "astral-single-node/memory-v1-paper-evidence"
+category = "security"
+owner_crate = "astral-single-node"
+path = "astral-single-node/src/memory_v1_paper_evidence_tests.rs astral-single-node/src/memory_v1_durable_journal/tests/paper_evidence.rs"
+kind = "unit"
+arch_status = "current"
+note = "memory—v1: 持久日志与治理拥有者层面的论文证据（48 个测试：控制测试与 witness_* 见证，覆盖 G1–G3、D1、R1、J1–J5；其中 12 个为第二批，针对生产变异分析中无测试钉住的守卫：重复操作号、日志序号间隙、epoch 与 stream 绑定、帧与文件容量上限、重放身份、重开后的持久前缀边界、失败 flush 的粘滞性、日志粘滞后 DENY 端口的响应）；见证类测试记录生产缺口的当前行为而不修复缺口；依赖工作区中尚未提交的 cfg(test) 访问器"
+run = "cargo test -p astral-single-node --lib -- memory_v1_paper_evidence_tests:: memory_v1_durable_journal::paper_evidence::"
+
+[[entry]]
 id = "harness/e5-single-model"
 category = "harness"
 owner_crate = "test-harness"

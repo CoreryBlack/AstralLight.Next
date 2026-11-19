@@ -17,8 +17,8 @@ use astral_authorization_root::memory_v1_root::{
     RootStatus,
 };
 use astral_authorization_root::memory_v1_rules::{
-    parse_version, window_active, BindingConfirmationState, ChangeConfirmationState,
-    MemoryV1OwnerScope, MemoryV1RuleEffect, MemoryV1TenantScope, MemoryV1Validity,
+    window_active, BindingConfirmationState, ChangeConfirmationState, MemoryV1OwnerScope,
+    MemoryV1RuleEffect, MemoryV1TenantScope, MemoryV1Validity,
 };
 use astral_authorization_root::memory_v1_session::{
     FinalCheckTimeConstraints, FinalCheckWindow, RequestSessionExtension, SessionFinalCheck,
@@ -1653,10 +1653,15 @@ pub(crate) fn evaluate_card_candidate(
                     }
                 }
             }
-            // memory—v1 §4.10: descendant resolution happens in the root tenant tree.
-            let descendants = match reader.tenant_descendants(tenant) {
-                Ok(list) => list,
-                Err(_) => return CardOutcome::Pending(MemoryV1PendingSource::RootUnavailable),
+            // memory—v1 §4.10: Only object-bearing scope checks use descendants.
+            // The card context already proves this tenant exists in the same snapshot.
+            let descendants = if request.target.is_some() {
+                match reader.tenant_descendants(tenant) {
+                    Ok(list) => list,
+                    Err(_) => return CardOutcome::Pending(MemoryV1PendingSource::RootUnavailable),
+                }
+            } else {
+                Vec::new()
             };
             let (tree_version, _) = match reader.dependency_versions() {
                 Ok(versions) => versions,
@@ -1732,19 +1737,16 @@ pub(crate) fn evaluate_card_candidate(
                     pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
                     continue;
                 }
-                let content = match parse_version(version) {
-                    Ok(content) => content,
-                    Err(_) => {
-                        // memory—v1 §4.5/A-1: hash or grammar failure is bad data,
-                        // never a silent skip.
-                        pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
-                        continue;
-                    }
+                let Some(content) = reader.prepared_selected_rules(version) else {
+                    // The selected immutable version failed its canonical hash
+                    // or grammar check, or is not from this reader's snapshot.
+                    pending = pending.or(Some(MemoryV1PendingSource::ContextInvalid));
+                    continue;
                 };
                 // memory—v1 §4.9: A valid matching rule cannot conceal another
                 // reference to an inactive or unregistered resource in this version.
                 // The same registry generation must cover the request and all rules.
-                match reader.registry_check_rules_with_version(&content) {
+                match reader.registry_check_prepared_with_version(content) {
                     Ok(version) if version == registry_version => {}
                     Err(RegistryError::NotInstalled) => {
                         pending = pending.or(Some(MemoryV1PendingSource::RootUnavailable));
@@ -5012,4 +5014,6 @@ mod tests {
             MemoryV1Decision::Pending,
         );
     }
+
+    mod paper_evidence;
 }

@@ -6,20 +6,19 @@
 //! issuance point in this crate. It does not publish a root, apply MySQL, or
 //! expose an HTTP route.
 //!
-//! A returned [`LocalDurablePrefixReceipt`] means that the exact frame was written,
-//! the file and parent directory were synchronised, and the complete verified
-//! prefix now ends at the returned tail. It remains a local durable-prefix
-//! proof: adoption, root atomic publication, audit completeness, and physical
-//! power-loss guarantees are separate contracts.
+//! A returned [`LocalDurablePrefixReceipt`] means that the exact frame is in a
+//! synchronized prefix of an already durable directory entry. The receipt
+//! identifies the frame's verified tail, which may precede the synchronized
+//! watermark. It remains a local durable-prefix proof: adoption, root atomic
+//! publication, audit completeness, and physical power-loss guarantees are
+//! separate contracts.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use astral_types::memory_v1::MemoryId;
 use astral_types::memory_v1_journal::{
@@ -268,65 +267,62 @@ struct StoredOperation {
 
 /// memory—v1: The durability coordinator for one opened journal file.
 ///
-/// The contract revision this type implements: the directory entry is made
-/// durable once, at creation (fsync file + fsync directory); every append
-/// extends an already-durable entry and therefore requires only the file's
-/// data synchronization (`fdatasync`), which always flushes the file size
-/// needed for later retrieval. This is the same model PostgreSQL uses for its
-/// WAL (`wal_sync_method = fdatasync`).
+/// The file and directory entry are synced at creation. Appends extend that
+/// durable entry and use `sync_data` to persist the file data and the length
+/// needed to retrieve it.
 ///
-/// Group commit: fsync durability is monotone over the file prefix — one
-/// `fdatasync` makes every byte written before it durable. Writers register
-/// their end offset and wait on a durable watermark; concurrent writers share
-/// one synchronization, so the per-commit fsync cost amortizes to
-/// `fsync_time / batch_size` under load without weakening the contract: an
-/// acknowledged mutation still implies its bytes and every prior byte are on
-/// disk before the receipt is returned.
+/// An idle caller starts a flush immediately. Requests covered by that flush
+/// share its result; if appends accumulated beyond the captured prefix, one
+/// uncovered waiter is signalled to drain the newly written prefix. There is
+/// no batching timer: grouping comes from writes that overlap an active flush.
 pub struct JournalDurability {
     file: File,
     state: Mutex<SyncState>,
-    cv: Condvar,
     latest_written: AtomicU64,
     #[cfg(test)]
     sync_calls: AtomicU64,
     #[cfg(test)]
-    fail_sync: AtomicBool,
+    sync_events: Option<std::sync::mpsc::Sender<SyncTestEvent>>,
 }
 
 #[derive(Default)]
 struct SyncState {
-    /// Bytes confirmed durable by a completed `fdatasync`.
+    /// Bytes confirmed durable by a completed data synchronization.
     durable_end: u64,
     /// Set while a leader is running its synchronization.
     in_flight: bool,
-    /// A synchronization failure poisons the whole journal: no byte past the
-    /// last durable point can be trusted, so every append refuses until an
-    /// explicit reconciliation owner takes over.
+    /// Any synchronization failure fences both append admission and receipts.
     failed: bool,
+    /// Shared by requests for the same end. Separates covered waiters (all
+    /// complete) from the uncovered backlog (only one needs to run next).
+    waiters: BTreeMap<u64, Arc<Condvar>>,
+}
+
+#[cfg(test)]
+enum SyncTestEvent {
+    Waiting(u64),
+    Flushing {
+        target: u64,
+        resume: std::sync::mpsc::Sender<Result<(), DurableJournalError>>,
+    },
 }
 
 impl JournalDurability {
-    /// Bind the coordinator to one open journal file. The handle is a clone
-    /// that never seeks or writes: it only runs `fdatasync` and stats, so it
-    /// cannot disturb the writer's file offset.
+    /// memory—v1: Clone the writer's handle. The clone shares its file offset
+    /// and writer lock lifetime, but only syncs and stats, never seeks or
+    /// writes. Drop both handles before reopening as a new writer.
     pub fn new(file: &File) -> Result<Self, DurableJournalError> {
-        // An independent fd (not a clone of the writer's fd) is used here:
-        // the writer's fd holds the cooperative flock, and a try_clone would
-        // share that same open file description — preventing reopen after
-        // the journal is dropped. This fd is flock-free and only does
-        // fdatasync + stat.
         Ok(Self {
             file: file.try_clone().map_err(|error| DurableJournalError::Io {
                 operation: IoOperation::OpenTarget,
                 kind: error.kind(),
             })?,
             state: Mutex::new(SyncState::default()),
-            cv: Condvar::new(),
             latest_written: AtomicU64::new(0),
             #[cfg(test)]
             sync_calls: AtomicU64::new(0),
             #[cfg(test)]
-            fail_sync: AtomicBool::new(false),
+            sync_events: None,
         })
     }
 
@@ -341,55 +337,88 @@ impl JournalDurability {
         self.state.lock().unwrap().failed
     }
 
-    /// Wait until every byte up to `end` is confirmed durable. The first
-    /// caller without an in-flight synchronization becomes the leader and
-    /// flushes the whole written prefix; concurrent writers wait and are
-    /// woken by the same flush.
+    /// memory—v1: Count flush attempts for local journal and owner tests.
+    #[cfg(test)]
+    pub(crate) fn sync_calls(&self) -> u64 {
+        self.sync_calls.load(Ordering::Relaxed)
+    }
+
+    /// memory—v1: Confirm the prefix through an already registered written
+    /// offset. A caller beyond the active flush can take ownership as soon as
+    /// that flush ends; coverage is never inferred from bytes written during it.
     pub fn ensure_durable(&self, end: u64) -> Result<(), DurableJournalError> {
+        let mut state = self.state.lock().unwrap();
         loop {
-            let mut state = self.state.lock().unwrap();
             if state.failed {
                 return Err(DurableJournalError::StickyUnknown);
             }
             if state.durable_end >= end {
                 return Ok(());
             }
+            let target = self.latest_written.load(Ordering::Acquire);
+            if end > target {
+                return Err(DurableJournalError::InvalidRecord);
+            }
             if state.in_flight {
-                state = self
-                    .cv
-                    .wait_while(state, |state| !state.failed && state.durable_end < end)
+                let waiter = Arc::clone(state.waiters.entry(end).or_default());
+                #[cfg(test)]
+                if let Some(events) = &self.sync_events {
+                    let _ = events.send(SyncTestEvent::Waiting(end));
+                }
+                state = waiter
+                    .wait_while(state, |state| {
+                        state.in_flight && !state.failed && state.durable_end < end
+                    })
                     .unwrap();
-                drop(state);
                 continue;
             }
-            // Become the leader: flush the whole written prefix.
+
             state.in_flight = true;
-            let target = self.latest_written.load(Ordering::Acquire).max(end);
             drop(state);
             let result = self.flush_upto(target);
-            let mut state = self.state.lock().unwrap();
+            state = self.state.lock().unwrap();
             state.in_flight = false;
             match result {
-                Ok(()) => state.durable_end = state.durable_end.max(target),
-                Err(_) => state.failed = true,
+                Ok(()) => {
+                    state.durable_end = target;
+                    while state
+                        .waiters
+                        .first_key_value()
+                        .is_some_and(|(&end, _)| end <= target)
+                    {
+                        state.waiters.pop_first().unwrap().1.notify_all();
+                    }
+                    if let Some((_, next)) = state.waiters.first_key_value() {
+                        // A new caller may win the mutex instead; it takes a
+                        // fresh snapshot covering this same written backlog.
+                        next.notify_one();
+                    }
+                }
+                Err(_) => {
+                    state.failed = true;
+                    for waiter in std::mem::take(&mut state.waiters).into_values() {
+                        waiter.notify_all();
+                    }
+                }
             }
-            self.cv.notify_all();
-            drop(state);
         }
     }
 
-    // memory—v1: One fdatasync followed by a length floor check. No locks are
+    // memory—v1: One sync_data followed by a length floor check. No locks are
     // held: writers keep appending while the flush runs, and only bytes up to
     // `target` are claimed durable.
     fn flush_upto(&self, target: u64) -> Result<(), DurableJournalError> {
         #[cfg(test)]
         {
             self.sync_calls.fetch_add(1, Ordering::Relaxed);
-            if self.fail_sync.load(Ordering::Relaxed) {
-                return Err(DurableJournalError::Io {
-                    operation: IoOperation::SyncFile,
-                    kind: io::ErrorKind::Other,
-                });
+            if let Some(events) = &self.sync_events {
+                let (resume, released) = std::sync::mpsc::channel();
+                events
+                    .send(SyncTestEvent::Flushing { target, resume })
+                    .map_err(|_| DurableJournalError::UnknownAfterIo)?;
+                released
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .map_err(|_| DurableJournalError::UnknownAfterIo)??;
             }
         }
         self.file
@@ -650,16 +679,15 @@ impl MemoryV1DurableJournal {
         &self.recovery
     }
 
-    /// Phase 1 of the mutation append: write the frame (no synchronization)
-    /// and register it with the durability coordinator. The receipt is
-    /// completed by [`JournalDurability::ensure_durable`] — group commit
-    /// coalesces concurrent writers into one `fdatasync`.
+    /// memory—v1: Phase 1 of the mutation append: write and register the
+    /// frame, but leave durability to [`JournalDurability::ensure_durable`].
+    /// A known coordinator failure refuses even replays.
     pub fn prepare_mutation(
         &mut self,
         request: &MutationRequest,
         durability: &JournalDurability,
     ) -> Result<PreparedAppend, DurableJournalError> {
-        self.ensure_ready()?;
+        self.ensure_ready(durability)?;
         let payload = request
             .journal_payload()
             .map_err(|_| DurableJournalError::InvalidRecord)?;
@@ -774,18 +802,18 @@ impl MemoryV1DurableJournal {
         })
     }
 
-    /// Append one DENY observation as its own journal record and issue its
-    /// receipt only after the whole written prefix is durable (group commit).
+    /// memory—v1: Write one DENY observation unless the coordinator is fenced.
     ///
     /// A DENY does not advance the mutation sequence; its journal sequence is
     /// the next contiguous frame. An already-recorded operation with the same
-    /// identity replays the original receipt without a second write.
+    /// identity reuses the record without another write. Either path still
+    /// needs a durable prefix before issuing a receipt.
     pub fn prepare_deny(
         &mut self,
         request: &astral_trustgraph::service::memory_v1_mutation_coordinator::DenyJournalRequest,
         durability: &JournalDurability,
     ) -> Result<PreparedAppend, DurableJournalError> {
-        self.ensure_ready()?;
+        self.ensure_ready(durability)?;
         let payload = request
             .journal_payload()
             .map_err(|_| DurableJournalError::InvalidRecord)?;
@@ -1001,10 +1029,14 @@ impl MemoryV1DurableJournal {
         Ok(())
     }
 
-    fn ensure_ready(&self) -> Result<(), DurableJournalError> {
-        match self.state {
-            DurableJournalState::Ready => Ok(()),
-            DurableJournalState::StickyUnknown => Err(DurableJournalError::StickyUnknown),
+    // memory—v1: Admit no prepare after a known flush failure. A prepare
+    // admitted before the failure can race it, but receipt issuance checks
+    // the same sticky fence even for an already covered offset.
+    fn ensure_ready(&self, durability: &JournalDurability) -> Result<(), DurableJournalError> {
+        if self.state != DurableJournalState::Ready || durability.is_failed() {
+            Err(DurableJournalError::StickyUnknown)
+        } else {
+            Ok(())
         }
     }
 }
@@ -1406,6 +1438,8 @@ fn payload_digest(payload: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    mod scheduling;
+
     use super::*;
     use astral_authorization_root::memory_v1_db_rows::UserCardStatus;
     use astral_authorization_root::memory_v1_root::ManagementMutationV2;
@@ -1486,6 +1520,7 @@ mod tests {
         )
     }
 
+    // memory—v1: Use the full sequence for distinct message IDs in load tests.
     fn request(operation_id: &str, journal_sequence: u64) -> MutationRequest {
         let fingerprint = [4; 32];
         MutationRequest::try_new(
@@ -1502,7 +1537,7 @@ mod tests {
                 id(11),
                 journal_sequence,
                 journal_sequence,
-                id(journal_sequence as u8 + 20),
+                MemoryId::from_bytes((u128::from(journal_sequence) + 20).to_be_bytes()),
             )
             .unwrap(),
         )
@@ -1875,3 +1910,9 @@ mod tests {
         ));
     }
 }
+
+// memory—v1: Paper evidence for the Computers & Security journal (J1 to J5).
+// Appended after the existing `tests` module so source guards keep their slice.
+#[cfg(test)]
+#[path = "memory_v1_durable_journal/tests/paper_evidence.rs"]
+mod paper_evidence;

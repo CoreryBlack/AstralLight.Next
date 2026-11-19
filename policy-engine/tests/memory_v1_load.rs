@@ -36,12 +36,26 @@ fn now() -> i64 {
     .unwrap()
 }
 
-fn fixture() -> (CandidateRows, Vec<CurrentSelection>) {
-    let content =
-        br#"{"rules":[{"ruleId":"read","resource":"document","action":"read","effect":"ALLOW"}]}"#;
+// memory—v1: One matching pair plus registered nonmatching pairs. Keep the
+// policy/result fixed while varying the size of the selected rule version.
+fn fixture(rule_count: usize) -> (CandidateRows, Vec<CurrentSelection>) {
+    let mut content = String::from(
+        r#"{"rules":[{"ruleId":"read","resource":"document","action":"read","effect":"ALLOW"}"#,
+    );
+    for rule in 1..rule_count {
+        use std::fmt::Write as _;
+        write!(
+            content,
+            r#",{{"ruleId":"other-{rule}","resource":"other-{}","action":"read","effect":"DENY"}}"#,
+            rule % rule_count.min(128)
+        )
+        .unwrap();
+    }
+    content.push_str("]}");
+    let content = content.into_bytes();
     let version = vec![1];
     let timestamp = vec![2];
-    let input = canonical_version_bytes(&version, content, &timestamp);
+    let input = canonical_version_bytes(&version, &content, &timestamp);
     (
         CandidateRows {
             users: vec![UserRow { user_id: id(1) }],
@@ -116,12 +130,9 @@ fn fixture() -> (CandidateRows, Vec<CurrentSelection>) {
     )
 }
 
-// memory—v1: Each sample includes request-scope creation, credential verification,
-// session binding and the actual evaluator. It never executes a business handler.
-#[test]
-#[ignore = "memory-v1 evaluator load; run explicitly with --ignored"]
-fn evaluator_concurrency_and_sustained_load() {
-    let (rows, selections) = fixture();
+// memory—v1: Each sample includes request scope, credential, session and formal evaluation.
+fn run_evaluator_load(rule_count: usize) {
+    let (rows, selections) = fixture(rule_count);
     let owner = install_process_root(
         rows,
         selections,
@@ -131,12 +142,17 @@ fn evaluator_concurrency_and_sustained_load() {
         },
     )
     .unwrap();
-    owner
-        .install_registry(&[RegistryDeclaration {
-            resource: "document".into(),
+    let mut declarations = vec![RegistryDeclaration {
+        resource: "document".into(),
+        actions: vec!["read".into()],
+    }];
+    if rule_count > 1 {
+        declarations.extend((0..rule_count.min(128)).map(|index| RegistryDeclaration {
+            resource: format!("other-{index}"),
             actions: vec!["read".into()],
-        }])
-        .unwrap();
+        }));
+    }
+    owner.install_registry(&declarations).unwrap();
     owner.adopt_serving_for_isolated_tests().unwrap();
     let authority = MemoryV1SessionAuthority::new();
     authority.bind_to_root(&owner).unwrap();
@@ -271,7 +287,7 @@ fn evaluator_concurrency_and_sustained_load() {
             };
             let operations = counts.iter().sum::<usize>();
             println!(
-                "workers={workers} round={round} operations={operations} elapsed_ms={} attempts_per_sec={:.2} allow={} deny={} pending={} allow_per_sec={:.2} pending_context_invalid={} pending_fence_active={} pending_root_unavailable={} pending_unclassified={} allow_p50_ns={} allow_p95_ns={} allow_p99_ns={} pending_p50_ns={} pending_p95_ns={} pending_p99_ns={}",
+                "rules={rule_count} workers={workers} round={round} operations={operations} elapsed_ms={} attempts_per_sec={:.2} allow={} deny={} pending={} allow_per_sec={:.2} pending_context_invalid={} pending_fence_active={} pending_root_unavailable={} pending_unclassified={} allow_p50_ns={} allow_p95_ns={} allow_p99_ns={} pending_p50_ns={} pending_p95_ns={} pending_p99_ns={}",
                 elapsed.as_millis(), operations as f64 / elapsed.as_secs_f64(),
                 counts[0], counts[1], counts[2], counts[0] as f64 / elapsed.as_secs_f64(),
                 pending_sources[0], pending_sources[1], pending_sources[2], pending_sources[3],
@@ -286,5 +302,31 @@ fn evaluator_concurrency_and_sustained_load() {
             assert_eq!(counts[0], iterations * workers);
             assert_eq!(pending_sources.iter().sum::<usize>(), counts[2]);
         }
+    }
+}
+
+// memory—v1: Child isolation allows a fresh immutable process root per size.
+#[test]
+#[ignore = "memory-v1 evaluator load; run explicitly with --ignored"]
+fn evaluator_concurrency_and_sustained_load() {
+    const SIZE_ENV: &str = "ASTRAL_MEMORY_V1_LOAD_CHILD_RULES";
+    if let Ok(value) = std::env::var(SIZE_ENV) {
+        let size = value.parse::<usize>().unwrap();
+        assert!((1..=4096).contains(&size));
+        run_evaluator_load(size);
+        return;
+    }
+    for size in [1, 8, 9, 32, 128, 129, 512, 1024] {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "evaluator_concurrency_and_sustained_load",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(SIZE_ENV, size.to_string())
+            .status()
+            .unwrap();
+        assert!(status.success(), "evaluator load failed at {size} rules");
     }
 }

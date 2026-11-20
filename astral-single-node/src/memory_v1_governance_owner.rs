@@ -7,22 +7,19 @@
 //! 1. value-level audit binding (`request.validate()`), which checks the
 //!    complete T2 candidate against the operation, fingerprint, root
 //!    observation, actor, target, tenant, trusted time and mutation summary;
-//! 2. one exclusive journal critical section: identity allocation, ledger
-//!    claim, coordinator request binding and the file/directory-synchronized
-//!    append, producing the crate-internal durable proof from the journal
-//!    owner's own receipt;
-//! 3. one serving-root CAS while still under the root writer, publishing the
-//!    exact mutation and minting the publication proof bound to both proofs;
-//! 4. ledger completion and the proof-backed response.
+//! 2. reserve the exact authorized root and prepare its successor, without
+//!    modifying the serving snapshot or writing a journal record;
+//! 3. allocate the journal identity, claim the operation and sync its record;
+//! 4. publish that same prepared successor before releasing the reservation.
 //!
-//! Every uncertain outcome is terminal for this request: the ledger marks the
-//! operation unknown, the journal keeps its sticky-unknown state on write
-//! uncertainty, and the HTTP layer receives a PENDING error. There is no
-//! repository fallback, no automatic retry and no synchronous MySQL apply.
+//! An uncertain append or publication must be reconciled before any later
+//! mutation or DENY proof. No repository fallback, automatic retry or
+//! synchronous MySQL apply is part of this path.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use astral_authorization_root::memory_v1_root::{GovernanceFrontier, GovernancePrefix};
 use astral_trustgraph::observability::{
     record_memory_v1_commit_phase, record_memory_v1_deny_phase, MemoryV1CommitPhase,
     MemoryV1DenyPhase,
@@ -32,7 +29,7 @@ use astral_trustgraph::service::memory_v1_governance_commit::{
 };
 use astral_trustgraph::service::memory_v1_mutation_coordinator::{
     JournalCapacityReservation, JournalIdentity, MemoryV1OperationLedger, MutationRequest,
-    RootBinding, UnknownReason,
+    UnknownReason,
 };
 use astral_types::memory_v1::MemoryId;
 use astral_types::AstralError;
@@ -125,6 +122,8 @@ pub struct MemoryV1DurableCommitOwner {
     writer: RootMutationWriter,
     identities: JournalIdentityAllocator,
     ledger: Mutex<MemoryV1OperationLedger>,
+    #[cfg(test)]
+    before_append: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl std::fmt::Debug for MemoryV1DurableCommitOwner {
@@ -151,7 +150,15 @@ impl MemoryV1DurableCommitOwner {
             ledger: Mutex::new(
                 MemoryV1OperationLedger::new(65_536).expect("owner ledger capacity is a constant"),
             ),
+            #[cfg(test)]
+            before_append: None,
         }
+    }
+
+    // memory—v1: Pause the real commit after preparation and before durable I/O.
+    #[cfg(test)]
+    pub(crate) fn set_before_append(&mut self, hook: impl Fn() + Send + Sync + 'static) {
+        self.before_append = Some(Box::new(hook));
     }
 
     // memory—v1: Exclude startup syncs from the DENY proof load report.
@@ -174,139 +181,146 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
         })?;
         record_memory_v1_commit_phase(MemoryV1CommitPhase::Binding, binding_started.elapsed());
 
-        // 2. Mint the crate-private root admission; the writer re-checks the
-        //    production capability and the exact root observation atomically.
-        let admission = self
+        let (admission, publication) = self
             .writer
-            .verified_admission(&request.root)
-            .map_err(|error| pending_error(format!("root admission is not verifiable: {error}")))?;
-
-        // 3. Keep governed mutation append and sync serialized for now. Do
-        // not widen mutation admission or publication concurrency as part of
-        // DENY batching; both still share the same durable prefix.
-        let prepared = {
-            let mut journal = self
-                .journal
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let journal_sequence = journal.position().journal_sequence() + 1;
-            let mutation_sequence = journal.position().mutation_sequence() + 1;
-            let identity = self
-                .identities
-                .allocate(journal_sequence, mutation_sequence)?;
-            let fingerprint = decode_fingerprint(&request.request_fingerprint)?;
-            let coordinator_request = MutationRequest::try_new(
-                &request.operation_id,
-                fingerprint,
-                request.mutation.clone(),
-                request.audit.clone(),
-                admission,
-                identity,
-            )
+            .prepare(&request.root, &request.mutation)
             .map_err(|error| {
-                pending_error(format!("coordinator request binding rejected: {error}"))
+                pending_error(format!("root mutation preparation refused: {error}"))
             })?;
 
-            // The ledger claim precedes the append: a replayed operation ID or
-            // digest conflict is refused before the journal can change.
-            let claim_result = self
-                .ledger
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .try_claim(&coordinator_request);
-            if let Err(error) = claim_result {
-                return Err(pending_error(format!(
-                    "operation ledger refused the governance claim: {error:?}"
-                )));
-            }
-
-            let journal_io_started = Instant::now();
-            let prepared = journal
-                .prepare_mutation(&coordinator_request, &self.durability)
-                .map_err(|error| {
-                    // The journal owns its own sticky-unknown transition on
-                    // write uncertainty. Keep the ledger claim terminal.
-                    pending_error(format!(
-                        "durable journal append is unavailable or unknown: {error:?}"
-                    ))
-                })?;
-            let receipt = prepared
-                .into_durable_receipt(&self.durability)
-                .map_err(|error| {
-                    pending_error(format!(
-                        "durable journal append is unavailable or unknown: {error:?}"
-                    ))
-                })?;
-            record_memory_v1_commit_phase(
-                MemoryV1CommitPhase::JournalIo,
-                journal_io_started.elapsed(),
-            );
-            if receipt.disposition() != JournalAppendDisposition::Appended {
-                return Err(pending_error(
-                    "durable journal replay requires reconciliation",
-                ));
-            }
-            (
-                astral_trustgraph::service::memory_v1_mutation_coordinator::JournalDurableProof::mint_for_owner(
-                    &coordinator_request,
-                    receipt.operation_id(),
-                    receipt.request_fingerprint().to_owned(),
-                    receipt.mutation_digest(),
-                    receipt.audit_digest(),
-                    receipt.identity(),
-                    *receipt.tail_hash(),
-                ),
-                coordinator_request,
-            )
+        // Keep the journal prefix and the reserved root in the same order.
+        // Readers never take the reservation or the journal lock for ALLOW.
+        let Ok(mut journal) = self.journal.lock() else {
+            publication.require_reconciliation();
+            return Err(pending_error("journal owner is unavailable"));
         };
-        let (journal_proof, coordinator_request) = prepared;
+        if journal.state() != DurableJournalState::Ready || self.durability.is_failed() {
+            publication.require_reconciliation();
+            return Err(pending_error("journal owner requires reconciliation"));
+        }
+        if !frontier_matches_journal(publication.predecessor_frontier(), &journal) {
+            publication.require_reconciliation();
+            journal.require_reconciliation();
+            return Err(pending_error(
+                "journal prefix does not match the authorized root",
+            ));
+        }
+        let journal_sequence = journal
+            .position()
+            .journal_sequence()
+            .checked_add(1)
+            .ok_or_else(|| pending_error("journal sequence exhausted"))?;
+        let mutation_sequence = journal
+            .last_mutation()
+            .mutation_sequence()
+            .checked_add(1)
+            .ok_or_else(|| pending_error("mutation sequence exhausted"))?;
+        let identity = self
+            .identities
+            .allocate(journal_sequence, mutation_sequence)?;
+        let fingerprint = decode_fingerprint(&request.request_fingerprint)?;
+        let coordinator_request = MutationRequest::try_new(
+            &request.operation_id,
+            fingerprint,
+            request.mutation,
+            request.audit,
+            admission,
+            identity,
+        )
+        .map_err(|error| pending_error(format!("coordinator request binding rejected: {error}")))?;
+        let mut ledger = self
+            .ledger
+            .lock()
+            .map_err(|_| pending_error("operation ledger is unavailable"))?;
+        let claim = ledger.try_claim(&coordinator_request).map_err(|error| {
+            pending_error(format!(
+                "operation ledger refused the governance claim: {error:?}"
+            ))
+        })?;
 
-        // 4. Root publication under the root writer serialization. A card
-        // disable takes the session-coordinated path: the revocation updates
-        // apply inside the same root writer lock.
+        #[cfg(test)]
+        if let Some(hook) = &self.before_append {
+            hook();
+        }
+        let journal_io_started = Instant::now();
+        let before_append = journal.position();
+        let before_offset = journal.file_position();
+        let receipt = journal
+            .prepare_mutation(&coordinator_request, &self.durability)
+            .and_then(|record| record.into_durable_receipt(&self.durability));
+        record_memory_v1_commit_phase(MemoryV1CommitPhase::JournalIo, journal_io_started.elapsed());
+        let receipt = receipt.map_err(|error| {
+            if journal.position() != before_append
+                || journal.file_position() != before_offset
+                || journal.state() != DurableJournalState::Ready
+                || self.durability.is_failed()
+            {
+                publication.require_reconciliation();
+                journal.require_reconciliation();
+                let _ = ledger.mark_unknown(&claim);
+            }
+            pending_error(format!(
+                "durable journal append is unavailable or unknown: {error:?}"
+            ))
+        })?;
+        if receipt.disposition() != JournalAppendDisposition::Appended
+            || receipt.identity() != identity
+            || receipt.tail_hash() != journal.position().frame_hash()
+            || receipt.start_offset() != before_offset
+            || receipt.end_offset() != journal.file_position()
+            || receipt.operation_id() != coordinator_request.operation_id()
+            || receipt.request_fingerprint() != coordinator_request.request_fingerprint()
+            || receipt.mutation_digest() != coordinator_request.mutation_digest()
+            || receipt.audit_digest() != coordinator_request.audit_digest()
+        {
+            publication.require_reconciliation();
+            journal.require_reconciliation();
+            let _ = ledger.mark_unknown(&claim);
+            return Err(pending_error(
+                "durable journal replay requires reconciliation",
+            ));
+        }
+
         let cas_started = Instant::now();
-        let after = if matches!(
-            &request.mutation,
-            astral_authorization_root::memory_v1_root::ManagementMutationV2::UserCardStatus {
-                status: astral_authorization_root::memory_v1_db_rows::UserCardStatus::Disabled,
-                ..
-            }
-        ) {
-            self.writer
-                .disable_card_with_sessions(
-                    self.writer.session_authority().ok_or_else(|| {
-                        pending_error("session authority is not bound for a card disable")
-                    })?,
-                    astral_types::memory_v1::MemoryId::from_bytes(request.target),
-                )
-                .map_err(|error| {
-                    pending_error(format!(
-                        "session-coordinated disable is unavailable: {error:?}"
-                    ))
-                })?
-                .0
-        } else {
-            self.writer.publish(&request.mutation).map_err(|error| {
-                pending_error(format!("root publication is unavailable: {error:?}"))
-            })?
-        };
+        let after = GovernancePrefix::new(journal.last_mutation(), journal.epoch_id())
+            .ok_or("invalid journal boundary")
+            .and_then(|prefix| {
+                publication
+                    .publish_with_prefix(prefix)
+                    .map_err(|_| "root CAS refused")
+            })
+            .map_err(|error| {
+                publication.require_reconciliation();
+                journal.require_reconciliation();
+                let _ = ledger.mark_unknown(&claim);
+                pending_error(format!(
+                    "durable mutation requires root reconciliation: {error}"
+                ))
+            })?;
         record_memory_v1_commit_phase(MemoryV1CommitPhase::RootCas, cas_started.elapsed());
-        let root_proof =
-            astral_trustgraph::service::memory_v1_mutation_coordinator::RootPublicationProof::mint_for_owner(
-                &coordinator_request,
-                &journal_proof,
-                RootBinding::from_metadata(after),
-            );
-        // The proof chain is bound by construction (operation id, both digests,
-        // journal identity and the before→after root binding are all derived
-        // from the same request); the response carries the published metadata.
-        let _ = root_proof;
 
         record_memory_v1_commit_phase(MemoryV1CommitPhase::Total, commit_started.elapsed());
         Ok(MemoryV1GovernanceCommitResponse {
             operation_id: request.operation_id.clone(),
             root: after,
         })
+    }
+}
+
+// memory—v1: A DENY-only tail may be ahead of this exact mutation boundary.
+fn frontier_matches_journal(
+    frontier: GovernanceFrontier,
+    journal: &MemoryV1DurableJournal,
+) -> bool {
+    let boundary = journal.last_mutation();
+    match frontier {
+        GovernanceFrontier::Baseline => {
+            boundary.journal_sequence() == 0 && boundary.mutation_sequence() == 0
+        }
+        GovernanceFrontier::Published(prefix) => {
+            prefix.anchor() == boundary && prefix.epoch() == journal.epoch_id()
+        }
+        GovernanceFrontier::Unproven => false,
     }
 }
 
@@ -361,27 +375,25 @@ impl astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofP
             DenyProofRequest, DenyResponse, JournalReadWatermark, RootBinding,
         };
         let deny_total_started = Instant::now();
-        let mut journal = self
-            .journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if journal.state() != DurableJournalState::Ready {
+        let Ok(mut journal) = self.journal.lock() else {
+            return Ok(DenyResponse::ServiceUnavailable);
+        };
+        if journal.state() != DurableJournalState::Ready || self.durability.is_failed() {
             return Ok(DenyResponse::ServiceUnavailable);
         }
-        let observed_journal_sequence = journal.position().journal_sequence() + 1;
-        let mutation_sequence = journal.position().mutation_sequence();
-        let identity = self
-            .identities
-            .allocate_deny(observed_journal_sequence, mutation_sequence)?;
-        let request = DenyJournalRequest::try_new(observation, identity)
-            .map_err(|error| pending_error(format!("deny request binding rejected: {error}")))?;
-        let root = RootBinding::from_metadata({
-            use astral_authorization_root::memory_v1_root::{RootMetadata, RootStatus};
-            let observed = request.observation().root();
+        let observed = observation.root();
+        let metadata = {
+            use astral_authorization_root::memory_v1_root::{
+                RootInstanceId, RootMetadata, RootStatus,
+            };
+            if observed.status() != astral_types::memory_v1_audit::MemoryV1AuditRootStatus::Serving
+            {
+                return Ok(DenyResponse::ServiceUnavailable);
+            }
             RootMetadata {
-                instance_id: astral_authorization_root::memory_v1_root::RootInstanceId::from_uuid(
-                    uuid::Uuid::from_bytes(*observed.instance().as_bytes()),
-                ),
+                instance_id: RootInstanceId::from_uuid(uuid::Uuid::from_bytes(
+                    *observed.instance().as_bytes(),
+                )),
                 version: observed.version(),
                 digest: *observed.digest(),
                 budget: astral_authorization_root::memory_v1_hamt::CandidateBudget {
@@ -395,7 +407,32 @@ impl astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofP
                 row_count: usize::try_from(observed.row_count()).unwrap_or(0),
                 status: RootStatus::Serving,
             }
-        });
+        };
+        let Ok(frontier) = self.writer.deny_frontier(&metadata) else {
+            return Ok(DenyResponse::ServiceUnavailable);
+        };
+        if !frontier_matches_journal(frontier, &journal) {
+            return Ok(DenyResponse::ServiceUnavailable);
+        }
+        let boundary = journal.last_mutation();
+        let watermark = JournalReadWatermark::new_deny(
+            journal.stream_id(),
+            journal.epoch_id(),
+            boundary.journal_sequence(),
+            boundary.mutation_sequence(),
+        )
+        .map_err(|error| pending_error(format!("deny watermark rejected: {error}")))?;
+        let sequence = journal
+            .position()
+            .journal_sequence()
+            .checked_add(1)
+            .ok_or_else(|| pending_error("journal sequence exhausted"))?;
+        let identity = self
+            .identities
+            .allocate_deny(sequence, watermark.mutation_sequence())?;
+        let request = DenyJournalRequest::try_new(observation, identity)
+            .map_err(|error| pending_error(format!("deny request binding rejected: {error}")))?;
+        let root = RootBinding::from_metadata(metadata);
         let fingerprint = request.request_fingerprint();
 
         let deny_io_started = Instant::now();
@@ -409,7 +446,13 @@ impl astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofP
         record_memory_v1_deny_phase(MemoryV1DenyPhase::JournalIo, deny_io_started.elapsed());
         // Both an original append and an idempotent replay prove the same
         // durable record; the receipt carries the recorded identity and tail.
-        let _ = receipt.disposition();
+        if receipt.operation_id() != request.operation_id()
+            || *receipt.request_fingerprint() != fingerprint
+            || receipt.audit_digest() != request.audit_digest()
+            || receipt.identity().mutation_sequence() != watermark.mutation_sequence()
+        {
+            return Ok(DenyResponse::ServiceUnavailable);
+        }
 
         let proof_request = DenyProofRequest::try_new(
             request.operation_id(),
@@ -420,13 +463,7 @@ impl astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofP
             {
                 astral_trustgraph::service::memory_v1_mutation_coordinator::VerifiedRootAdmission::mint_from_production_owner(root)
             },
-            JournalReadWatermark::new_deny(
-                receipt.identity().stream_id(),
-                receipt.identity().epoch_id(),
-                receipt.identity().journal_sequence(),
-                receipt.identity().mutation_sequence(),
-            )
-            .map_err(|error| pending_error(format!("deny watermark rejected: {error}")))?,
+            watermark,
             request.observation().source(),
         )
         .map_err(|error| pending_error(format!("deny proof request rejected: {error}")))?;

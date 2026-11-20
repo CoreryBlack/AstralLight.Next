@@ -107,6 +107,7 @@ where
         environment: &[],
         snapshot,
         execute_command,
+        paper: None,
     }
 }
 

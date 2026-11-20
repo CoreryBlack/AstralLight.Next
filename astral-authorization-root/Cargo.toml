@@ -10,6 +10,8 @@ astral-types = { path = "../astral-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# memory—v1: Use the workspace's locked SHA-256 backend for fixed-size trie branches.
+ring = "0.17"
 hex = { workspace = true }
 im = { workspace = true }
 thiserror = { workspace = true }

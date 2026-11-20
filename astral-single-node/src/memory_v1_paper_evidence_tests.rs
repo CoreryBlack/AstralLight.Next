@@ -54,6 +54,17 @@ use crate::memory_v1_governance_owner::MemoryV1DurableCommitOwner;
 use crate::memory_v1_recovery_owner::{recover_root, RecoveryError};
 use crate::memory_v1_root_writer::{RootMutationWriter, RootMutationWriterError};
 
+// memory—v1: Serving-root and structural-coverage evidence for ordinary admission.
+#[path = "memory_v1_paper_evidence_tests/ordinary_admission.rs"]
+mod ordinary_admission;
+
+// memory—v1: Separating warm-path recheck cost from memory-authority benefit.
+#[path = "memory_v1_paper_evidence_tests/recheck_cost.rs"]
+mod recheck_cost;
+
+#[path = "memory_v1_paper_evidence_tests/governed_fence.rs"]
+mod governed_fence;
+
 const ACTOR: [u8; 16] = [1; 16];
 const CARD: [u8; 16] = [4; 16];
 const TENANT: [u8; 16] = [3; 16];
@@ -674,35 +685,20 @@ fn witness_j2_capacity_refusal_retains_the_operation_claim() {
     assert_eq!(root.owner.handle().metadata().unwrap(), before);
 }
 
-// memory—v1: G1 witness. The admission is checked only when it is minted. The
-// publish path reads the current version at publish time and never receives
-// the admission, so a mutation evaluated against version v still publishes
-// after another writer advanced the root to v+1.
-// asserts current behaviour that is a known gap; update when fixed.
+// memory—v1: G1 regression. The reserved predecessor is carried into publication;
+// a stale request cannot obtain another reservation against the newer root.
 #[test]
-fn witness_g1_publish_does_not_consume_the_observed_admission() {
+fn regression_g1_publication_keeps_the_authorized_predecessor() {
     let root = production_root("g1");
     let writer = writer_for(&root);
     let observed = root.owner.handle().metadata().unwrap();
-    // Minted at the observation and held across the concurrent-style advance below.
-    // `publish` takes no admission argument, so nothing downstream consults it.
-    let _admission = writer.verified_admission(&observed).unwrap();
-
-    writer.publish(&set_card(UserCardStatus::Active)).unwrap();
-    assert_eq!(
-        root.owner.handle().metadata().unwrap().version,
-        observed.version + 1
-    );
-    assert!(
-        matches!(
-            writer.verified_admission(&observed),
-            Err(RootMutationWriterError::StaleObservation)
-        ),
-        "a stale observation is refused only when it is minted"
-    );
-
-    let published = writer.publish(&set_card(UserCardStatus::Active)).unwrap();
-    assert_eq!(published.version, observed.version + 2);
+    let mutation = set_card(UserCardStatus::Active);
+    let (_, publication) = writer.prepare(&observed, &mutation).unwrap();
+    assert!(writer.prepare(&observed, &mutation).is_err());
+    let published = publication.publish().unwrap();
+    assert_eq!(published.version, observed.version + 1);
+    assert!(writer.prepare(&observed, &mutation).is_err());
+    assert_eq!(root.owner.handle().metadata().unwrap(), published);
 }
 
 // memory—v1: The session-coordinated publish of a card disable, bound the way the
@@ -713,74 +709,43 @@ fn disable_through_writer(writer: &RootMutationWriter, authority: &Arc<MemoryV1S
         .unwrap();
 }
 
-// memory—v1: G2 witness, composition level. Two status changes of one card are
-// appended in journal order A (disable) then B (enable), but published in order B
-// then A through the root writer and session authority, not through
-// `owner.commit`. The owner's journal lock, admission mint, ledger claim and
-// receipt ordering are not exercised, and owner-level interleaving is not run.
-// Both publications succeed. Replaying the journal in its own order reaches the
-// opposite card state, and recovery accepts the result without error.
-// asserts current behaviour that is a known gap; update when fixed.
+// memory—v1: G2 regression at the composition owner. Two requests with the
+// same predecessor can race, but exactly one can journal and publish it.
 #[test]
-fn witness_g2_journal_order_and_publish_order_divergence_is_silent() {
+fn regression_g2_competing_commits_preserve_journal_and_root_order() {
     let root = production_root("g2");
-    let mut writer = writer_for(&root);
-    let authority = Arc::new(MemoryV1SessionAuthority::new());
-    authority.bind_to_root(&root.owner).unwrap();
-    writer.set_session_authority(Some(Arc::clone(&authority)));
+    let owner = assembled_owner(&root);
     let observed = root.owner.handle().metadata().unwrap();
-    let (mut journal, durability) =
-        create_journal(&root, DurableJournalLimits::conservative(), genesis());
-
-    let disable = coordinator_request(
-        "g2-disable",
-        [0x21; 32],
-        set_card(UserCardStatus::Disabled),
-        observed,
-        writer.verified_admission(&observed).unwrap(),
-        identity(1, 1, 1),
-    );
-    let enable = coordinator_request(
-        "g2-enable",
-        [0x22; 32],
-        set_card(UserCardStatus::Active),
-        observed,
-        writer.verified_admission(&observed).unwrap(),
-        identity(2, 2, 2),
-    );
-    journal
-        .prepare_mutation(&disable, &durability)
-        .unwrap()
-        .into_durable_receipt(&durability)
-        .unwrap();
-    journal
-        .prepare_mutation(&enable, &durability)
-        .unwrap()
-        .into_durable_receipt(&durability)
-        .unwrap();
-
-    // Publish order B then A, with no lock held across the two publications.
-    writer.publish(&set_card(UserCardStatus::Active)).unwrap();
-    disable_through_writer(&writer, &authority);
+    let ready = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            ready.wait();
+            owner.commit(default_enable(observed, "g2-first"))
+        });
+        let second = scope.spawn(|| {
+            ready.wait();
+            owner.commit(default_enable(observed, "g2-second"))
+        });
+        let results = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(results
+            .iter()
+            .any(|result| matches!(result, Err(AstralError::Pending(_)))));
+    });
     let live = root.owner.handle().metadata().unwrap();
-    assert_eq!(live.version, observed.version + 2);
-    assert!(!card_is_active(&root.owner), "the live root ends disabled");
-    drop(writer);
-    drop(journal);
-    drop(durability);
+    assert_eq!(live.version, observed.version + 1);
+    drop(owner);
 
-    let (reopened, _durability) = reopen_journal(&root);
+    let (journal, _durability) = reopen_journal(&root);
+    assert_eq!(journal.record_count(), 1);
+    assert_eq!(journal.position().mutation_sequence(), live.version);
     let (candidate, counts) = fresh_candidate();
-    let recovered = recover_root(candidate, &reopened, &cold_facts(counts), &sealed_input())
-        .expect("recovery accepts the journal-order replay");
-    assert_eq!(recovered.replayed_mutations, 2);
+    let recovered =
+        recover_root(candidate, &journal, &cold_facts(counts), &sealed_input()).unwrap();
+    let replayed = recovered.owner.handle().metadata().unwrap();
     assert_eq!(
-        recovered.owner.handle().metadata().unwrap().version,
-        live.version
-    );
-    assert!(
-        card_is_active(&recovered.owner),
-        "the journal-order replay ends with the card active, unlike the live root"
+        (replayed.version, replayed.digest),
+        (live.version, live.digest)
     );
 }
 
@@ -839,18 +804,10 @@ fn g2_control_matching_orders_replay_to_the_live_state() {
     assert!(!card_is_active(&recovered.owner));
 }
 
-// memory—v1: G3 witness. A governed mutation whose frame becomes durable and
-// whose root publication then fails leaves that frame in the journal. Recovery
-// replays the frame onto the baseline, the candidate refuses it, and the restart
-// stops with a replay conflict. The append and its receipt wait are at
-// governance_owner.rs:224-239, publication follows, and the replay failure maps
-// to ReplayConflict at recovery_owner.rs:127-129. The frame does not resurrect
-// into a served root, but the node cannot start until the journal is repaired:
-// startup sends any journaled Mutation record through recovery and aborts on
-// refusal (memory_v1_service.rs:617-630).
-// asserts current behaviour that is a known gap; update when fixed.
+// memory—v1: G3 regression. Candidate validation precedes append, so a known
+// invalid mutation cannot leave a replayable frame or block a later startup.
 #[test]
-fn witness_g3_durable_frame_with_failed_publish_refuses_recovery() {
+fn regression_g3_invalid_successor_never_reaches_the_journal() {
     let root = production_root("g3");
     let owner = assembled_owner(&root);
     let before = root.owner.handle().metadata().unwrap();
@@ -858,69 +815,50 @@ fn witness_g3_durable_frame_with_failed_publish_refuses_recovery() {
     let request = enable_request(ACTOR, missing_card, before, "g3-op", fingerprint_hex());
 
     let error = owner.commit(request).unwrap_err();
-    assert!(
-        pending_reason(&error).contains("root publication is unavailable"),
-        "{error:?}"
-    );
+    assert!(pending_reason(&error).contains("root mutation preparation refused"));
     assert_eq!(root.owner.handle().metadata().unwrap(), before);
+    assert_eq!(file_len(&journal_path(&root)), 0, "no replayable frame");
+    let corrected = owner
+        .commit(default_enable(before, "g3-corrected"))
+        .unwrap();
     drop(owner);
 
     let (journal, _durability) = reopen_journal(&root);
-    assert_eq!(journal.record_count(), 1, "the durable frame stays");
-    assert_eq!(journal.position().mutation_sequence(), 1);
+    assert_eq!(journal.record_count(), 1);
+    assert_eq!(journal.recovery_records()[0].operation_id, "g3-corrected");
     let (candidate, counts) = fresh_candidate();
-    let refusal =
-        recover_root(candidate, &journal, &cold_facts(counts), &sealed_input()).unwrap_err();
-    assert_eq!(refusal, RecoveryError::ReplayConflict);
+    let recovered =
+        recover_root(candidate, &journal, &cold_facts(counts), &sealed_input()).unwrap();
+    assert_eq!(recovered.replayed_mutations, 1);
+    assert_eq!(
+        recovered.owner.handle().metadata().unwrap().digest,
+        corrected.root.digest
+    );
 }
 
-// memory—v1: D1 witness. A denial observed at version v and registered after a
-// mutation is still answered Forbidden. The DENY frame records the mutation
-// sequence at append time, not the observed version, so the frame does not
-// carry the observed history position.
-// asserts current behaviour that is a known gap; update when fixed.
+// memory—v1: Value-only DENYs require an exact live observation.
 #[test]
-fn witness_d1_delayed_denial_frame_records_the_append_time_sequence() {
+fn regression_d1_delayed_denial_fails_closed_without_a_historical_proof() {
     let root = production_root("d1-delayed");
     let owner = assembled_owner(&root);
     let observed = root.owner.handle().metadata().unwrap();
     let observation = live_deny_observation(&root, "d1-delayed");
-    let observed_version = observation.root().version();
     owner.commit(default_enable(observed, "d1-mut")).unwrap();
-
     assert_eq!(
         owner.prove_deny(observation).unwrap(),
-        DenyResponse::Forbidden
+        DenyResponse::ServiceUnavailable
     );
     drop(owner);
-
     let (journal, _durability) = reopen_journal(&root);
-    let records = journal.recovery_records();
-    assert_eq!(records.len(), 2);
-    let deny = &records[1];
-    assert!(matches!(deny.kind, RecordKind::Deny));
-    assert_eq!(deny.journal_sequence, 2);
-    assert_eq!(observed_version, observed.version);
-    assert_eq!(
-        deny.mutation_sequence,
-        observed.version + 1,
-        "the frame stores the sequence at append time"
-    );
-    assert_ne!(deny.mutation_sequence, observed_version);
+    assert_eq!(journal.recovery_records().len(), 1);
+    assert_eq!(journal.last_mutation().mutation_sequence(), 1);
 }
 
-// memory—v1: D1 witness. `prove_deny` (governance_owner.rs:354-451) reads the
-// journal state and builds its root binding from the observation itself. It never
-// reads the live root, so it does not compare the observation's instance, version
-// or digest with any published state. An observation for a root instance, version
-// and digest that were never published is answered Forbidden and written as a
-// durable DENY frame.
-// asserts current behaviour that is a known gap; update when fixed.
 #[test]
-fn witness_d1_unpublished_observation_is_forbidden() {
-    let root = production_root("d1-forged");
+fn regression_d1_unpublished_observation_is_refused_without_an_append() {
+    let root = production_root("d1-foreign");
     let owner = assembled_owner(&root);
-    let forged = MemoryV1DenyRootObservation::try_from_usize(
+    let unknown = MemoryV1DenyRootObservation::try_from_usize(
         MemoryId::from_bytes([0x55; 16]),
         999,
         [0xAB; 32],
@@ -930,16 +868,105 @@ fn witness_d1_unpublished_observation_is_forbidden() {
         9,
     )
     .unwrap();
-    let observation = deny_observation_at(forged, "d1-forged");
-
     assert_eq!(
-        owner.prove_deny(observation).unwrap(),
+        owner
+            .prove_deny(deny_observation_at(unknown, "d1-foreign"))
+            .unwrap(),
+        DenyResponse::ServiceUnavailable
+    );
+    assert_eq!(owner.journal_sync_calls(), 0);
+    assert_eq!(file_len(&journal_path(&root)), 0);
+}
+
+// memory—v1: A context load is neither a governance record nor replay input.
+#[test]
+fn regression_context_load_preserves_governance_prefix_across_recovery() {
+    use astral_authorization_root::memory_v1_root::MutationPrecondition;
+
+    let root = production_root("context-prefix");
+    let owner = assembled_owner(&root);
+    let before = root.owner.handle().metadata().unwrap();
+    let first = owner.commit(default_enable(before, "context-g1")).unwrap();
+    let added = CandidateRows {
+        users: vec![UserRow {
+            user_id: [0x71; 16],
+        }],
+        identity_cards: vec![IdentityCardRow {
+            identity_card_id: [0x72; 16],
+            user_id: [0x71; 16],
+        }],
+        ..CandidateRows::default()
+    };
+    let mutation = ManagementMutationV2::ContextLoad {
+        rows: added.clone(),
+        selections: vec![],
+    };
+    assert!(
+        root.owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &mutation,
+                &MutationPrecondition {
+                    evaluated_root_version: first.root.version
+                },
+            )
+            .is_err(),
+        "ordinary loads cannot publish on a production-adopted fixture"
+    );
+    assert_eq!(root.owner.handle().metadata().unwrap(), first.root);
+    let loaded = root
+        .owner
+        .execute_context_load_from_verified_cold_fixture_for_test(
+            &root.admission,
+            &mutation,
+            &first.root,
+        )
+        .unwrap();
+    assert_eq!(loaded.version, 2);
+    assert!(owner
+        .commit(default_enable(first.root, "context-stale"))
+        .is_err());
+    assert_eq!(
+        owner
+            .prove_deny(live_deny_observation(&root, "context-deny"))
+            .unwrap(),
         DenyResponse::Forbidden
     );
-    assert_eq!(owner.journal_sync_calls(), 1);
+    let second = owner.commit(default_enable(loaded, "context-g2")).unwrap();
+    assert_eq!(second.root.version, 3);
     drop(owner);
-    let (journal, _durability) = reopen_journal(&root);
-    assert_eq!(journal.record_count(), 1);
+
+    let (journal, durability) = reopen_journal(&root);
+    let records = journal.recovery_records();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (record.kind, record.mutation_sequence))
+            .collect::<Vec<_>>(),
+        [
+            (RecordKind::Mutation, 1),
+            (RecordKind::Deny, 1),
+            (RecordKind::Mutation, 2)
+        ]
+    );
+    let (mut rows, selections) = fixture_rows();
+    rows.users.extend(added.users);
+    rows.identity_cards.extend(added.identity_cards);
+    let counts = rows.table_counts();
+    let candidate = install_isolated_test_root(rows, selections, before.budget).unwrap();
+    candidate
+        .install_registry(&registry_declarations())
+        .unwrap();
+    let recovered =
+        recover_root(candidate, &journal, &cold_facts(counts), &sealed_input()).unwrap();
+    let after = recovered.owner.handle().metadata().unwrap();
+    assert_eq!((after.version, after.digest), (2, second.root.digest));
+    assert_eq!(
+        (recovered.replayed_mutations, recovered.observed_denies),
+        (2, 1)
+    );
+    let writer = RootMutationWriter::new(recovered.owner, recovered.admission).unwrap();
+    let owner = MemoryV1DurableCommitOwner::new((journal, durability), writer);
+    owner.commit(default_enable(after, "context-g3")).unwrap();
 }
 
 // memory—v1: The live root metadata with its digest replaced. The result binds an

@@ -670,6 +670,36 @@ note = "memory—v1: 持久日志与治理拥有者层面的论文证据（48 �
 run = "cargo test -p astral-single-node --lib -- memory_v1_paper_evidence_tests:: memory_v1_durable_journal::paper_evidence::"
 
 [[entry]]
+id = "astral-single-node/memory-v1-paper-mediation"
+category = "security"
+owner_crate = "astral-single-node"
+path = "astral-single-node/src/memory_v1_full_path_tests.rs astral-single-node/src/memory_v1_full_path_tests/mediation.rs"
+kind = "integration"
+arch_status = "current"
+note = "memory—v1: 实际组合路由的唯一根、跨租户选卡、会话绑定、无授权继承与请求作用域释放；隔离进程使用夹具，不开 listener，不证明生产对象归属或部署"
+run = "cargo test --locked -p astral-single-node --bin astral-single-node memory_v1_composition::full_path_tests -- --nocapture"
+
+[[entry]]
+id = "astral-single-node/memory-v1-paper-ordinary-admission"
+category = "security"
+owner_crate = "astral-single-node"
+path = "astral-single-node/src/memory_v1_paper_evidence_tests/ordinary_admission.rs"
+kind = "unit"
+arch_status = "current"
+note = "memory—v1: 九表计数对账及结构采纳拒绝；实际 serving writer 的无关发布、撤权、异根 capability 与陈旧观测；无日志持久性、MySQL 或生产采用证据"
+run = "cargo test --locked -p astral-single-node --lib memory_v1_paper_evidence_tests::ordinary_admission -- --nocapture"
+
+[[entry]]
+id = "policy-engine/memory-v1-paper-complete-observation"
+category = "security"
+owner_crate = "policy-engine"
+path = "policy-engine/src/memory_v1_formal/tests/paper_evidence/complete_observation.rs"
+kind = "unit"
+arch_status = "current"
+note = "memory—v1: 固定可信输入与时钟切点，Rust 原始行扫描对照真实 evaluator、索引边界、归属与租户范围以及两类未命中依赖的在途变化；仅证明有限夹具，不证明数据来源或全部写者"
+run = "cargo test --locked -p policy-engine --lib complete_observation -- --nocapture"
+
+[[entry]]
 id = "harness/e5-single-model"
 category = "harness"
 owner_crate = "test-harness"
@@ -857,11 +887,490 @@ boundary = "fail-closed injection contracts"
 id = "PERF"
 boundary = "measured component versus real deployed performance; environment and source snapshot required"
 [[series]]
+id = "SCALE"
+boundary = "bounded process-local scale fixtures; not a deployed sharded service or database baseline"
+[[series]]
 id = "COMPAT"
 boundary = "explicit retired/compatibility semantics; not native current deployment acceptance"
 [[series]]
 id = "EXCLUDED"
 boundary = "outside root workspace; dedicated compile/integration paths only"
+
+[[series]]
+id = "DarkStar-Papers"
+boundary = "USENIX and Computers & Security current-checkout Rust evidence; bounded models, fixture controls, and fresh local timings, not historical reconciliation or deployment"
+
+[[suite]]
+id = "paper-admission-depth2"
+owner = "test-harness"
+profile = "offline-validation"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "offline-model"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "core"
+boundary = "Exhaustive depth two, bounded guard-sensitivity variants, rollback and envelope abstention; no production code."
+sources = ["test-harness/tests/memory_v1_admission_rule_model.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "test-harness", "--test", "memory_v1_admission_rule_model", "--", "--nocapture", "--skip", "depth3_exhaustive_correct_validator", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 6
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-authority-model"
+owner = "test-harness"
+profile = "offline-validation"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "offline-model"
+selection_policy = "explicit-suite"
+paper_track = "both"
+paper_lane = "core"
+boundary = "Finite read and rollback graphs, relevance versus whole-root validation, and journal model cross-checks; no deployment or implementation refinement proof."
+sources = ["test-harness/tests/memory_v1_authority_model.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "test-harness", "--test", "memory_v1_authority_model", "--", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 6
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-journal-model"
+owner = "test-harness"
+profile = "offline-validation"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "offline-model"
+selection_policy = "explicit-suite"
+paper_track = "cose"
+paper_lane = "core"
+boundary = "Bounded target and recovery variants, frontier separation, reduced-bound repair and model crash semantics; no real crash or MySQL."
+sources = ["test-harness/tests/memory_v1_journal_protocol_model.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "test-harness", "--test", "memory_v1_journal_protocol_model", "--", "--nocapture", "--skip", "repair_abort_plus_ordered_publish_full_bounds_has_no_violation", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 43
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-evaluator-fixtures"
+owner = "policy-engine"
+profile = "native-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "core"
+boundary = "Writer matrix, envelope checks, raw-row differential oracle, negative dependencies, owner-stop and in-flight evaluator regressions; supplied rows only."
+sources = ["policy-engine/src/memory_v1_formal.rs", "policy-engine/src/memory_v1_formal/tests/paper_evidence.rs", "policy-engine/src/memory_v1_formal/tests/paper_evidence/complete_observation.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "policy-engine", "--lib", "--", "memory_v1_formal::tests::paper_evidence::", "future_deny_activation_invalidates_inflight_allow", "dependency_recheck_covers_inflight_mutations", "final_check_time_and_contention_fail_closed", "rule_set_dependency_recheck_isolates_unrelated_publications", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 14
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-envelope-and-writers"
+owner = "policy-engine"
+profile = "native-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "core"
+boundary = "Envelope, dependency keys, writer admission, fences, session revocation, source pin and default random walk. Child selector only executes under its driver."
+sources = ["policy-engine/tests/memory_v1_paper_envelope_boundaries.rs", "policy-engine/tests/memory_v1_paper_writer_coverage.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "policy-engine", "--test", "memory_v1_paper_envelope_boundaries", "--test", "memory_v1_paper_writer_coverage", "--", "--nocapture", "--skip", "paper_random_walk_child", "--skip", "paper_random_walk_heavy", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 11
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-root-fences-and-preparation"
+owner = "astral-authorization-root"
+profile = "native-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "core"
+boundary = "Atomic root fixture regressions: two fence observations, registry exhaustion, ordering and registry pairs of a prepared plan, exact selection."
+sources = ["astral-authorization-root/src/memory_v1_fence.rs", "astral-authorization-root/src/memory_v1_registry.rs", "astral-authorization-root/src/memory_v1_hamt.rs", "astral-authorization-root/src/memory_v1_rules/prepared.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-authorization-root", "--features", "test-support", "--lib", "--", "writer_opening_during_final_check_invalidates_result", "observations_detect_transient_fence_generations", "version_exhaustion_stops_new_and_inflight_authorization", "ordered_hits_and_registry_pairs_match_reference_at_each_boundary", "prepared_plan_tracks_exact_selection", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 5
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-composed-mediation"
+owner = "astral-single-node"
+profile = "native-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "core"
+boundary = "Real composed routers with synthetic credentials and facts, no TCP listener, external host object or DB provenance; the object-attribution case binds a host-record object triple into the engine request and proves own-read allow, cross-owner/cross-tenant deny, unattributed pending, unrelated-publication harmlessness and held-view/fresh-reader revocation on one composed session."
+sources = ["astral-single-node/src/memory_v1_full_path_tests.rs", "astral-single-node/src/memory_v1_full_path_tests/mediation.rs", "astral-single-node/src/memory_v1_full_path_tests/object_attribution.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-single-node", "--bin", "astral-single-node", "memory_v1_composition::full_path_tests::", "--", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 5
+timeout_seconds = 1200
+
+[[suite]]
+id = "scale-memory-v1-500k"
+owner = "astral-single-node"
+profile = "native-kernel"
+test_services = []
+series = ["SCALE"]
+scope = "component"
+selection_policy = "explicit-suite"
+boundary = "834 isolated 600-user candidate installs with phase timing and rule-set ID overlap across 40 global, 60 family and 834 private IDs. Single-shard behavior compares 10k seeded evaluations with a reference and checks additive ContextLoad, full replay refusal and stale CAS. The separate profile child samples cold phases, nine root/batch sizes, and concurrent reads at the preparation boundary. No MySQL, service listener, shard routing or deployment evidence."
+sources = ["astral-single-node/src/memory_v1_scale_tests.rs", "astral-single-node/src/memory_v1_scale_tests/profile.rs", "astral-authorization-root/src/memory_v1_root/context_load.rs", "astral-authorization-root/src/memory_v1_hamt/context_load.rs", "astral-authorization-root/src/memory_v1_root.rs", "astral-authorization-root/src/memory_v1_root_digest.rs", "astral-authorization-root/src/memory_v1_digest.rs", "astral-authorization-root/src/memory_v1_digest/tree.rs", "astral-authorization-root/src/memory_v1_hamt_runtime.rs", "astral-authorization-root/src/memory_v1_hamt.rs"]
+argv = ["cargo", "test", "--release", "--locked", "--offline", "-p", "astral-single-node", "--lib", "--", "--nocapture", "--test-threads=1", "--ignored", "--exact", "memory_v1_scale_tests::scale_shards_and_requests_report"]
+acceptance = "rust"
+expected_tests = 1
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-ordinary-admission"
+owner = "astral-single-node"
+profile = "native-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "core"
+boundary = "Supplied table counts and evidence shape, serving capability, unrelated publication versus revoke; the recheck-cost case separates held-scope warm rechecks, fresh-scope per-request rechecks and a whole-root digest-reconstruction anchor over identical facts (child-isolated) and proves held-PENDING/fresh-DENY after withdrawal; no external fact provenance, durable acknowledgement or synchronous database-authority baseline."
+sources = ["astral-single-node/src/memory_v1_paper_evidence_tests/ordinary_admission.rs", "astral-single-node/src/memory_v1_paper_evidence_tests/recheck_cost.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-single-node", "--lib", "--", "--nocapture", "--test-threads=1", "memory_v1_paper_evidence_tests::", "--include-ignored"]
+acceptance = "rust"
+expected_tests = 22
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-journal-witnesses"
+owner = "astral-single-node"
+profile = "native-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "cose"
+paper_lane = "core"
+boundary = "Journal and governance gap witnesses, paired controls, and repaired predecessor/order/Fence, DENY observation and ContextLoad recovery regressions. Remaining witness assertions may demonstrate gaps, not target conformance."
+sources = ["astral-single-node/src/memory_v1_paper_evidence_tests.rs", "astral-single-node/src/memory_v1_paper_evidence_tests/governed_fence.rs", "astral-single-node/src/memory_v1_durable_journal/tests/paper_evidence.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-single-node", "--lib", "--", "memory_v1_paper_evidence_tests::", "memory_v1_durable_journal::paper_evidence::", "--skip", "memory_v1_paper_evidence_tests::ordinary_admission::", "--skip", "memory_v1_paper_evidence_tests::recheck_cost::", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 52
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-journal-controls"
+owner = "astral-single-node"
+profile = "native-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "cose"
+paper_lane = "core"
+boundary = "Local scheduling, flush/floor, commit-owner and journal controls on temporary files; no physical crash or device persistence proof."
+sources = ["astral-single-node/src/memory_v1_governance_owner_tests.rs", "astral-single-node/src/memory_v1_durable_journal.rs", "astral-single-node/src/memory_v1_durable_journal/tests/scheduling.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-single-node", "--lib", "--", "memory_v1_governance_owner_tests::", "memory_v1_durable_journal::tests::", "--skip", "deny_proof_concurrency_curve", "--skip", "local_release_journal_curve", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 20
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-journal-codec"
+owner = "astral-types"
+profile = "native-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "cose"
+paper_lane = "core"
+boundary = "Production journal encoding, verifier and limits; temporary/in-memory test inputs."
+sources = ["astral-types/src/memory_v1_journal.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-types", "--lib", "memory_v1_journal::tests::", "--", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 9
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-current-root-controls"
+owner = "astral-authorization-root"
+profile = "native-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "controls"
+boundary = "Unmodified current source for the root controls of the historical study; skips unrelated opt-in scale tests, not a historical mutation verdict."
+sources = ["astral-authorization-root/src", "astral-authorization-root/tests/memory_v1_atomic_batch.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-authorization-root", "--features", "test-support", "--lib", "--test", "memory_v1_atomic_batch", "--", "--skip", "cold_build_near_capacity_matches_chunked_and_preserves_snapshots", "--skip", "cold_build_two_worker_profile", "--skip", "dependency_recheck_reverse_target_scale", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 318
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-current-evaluator-controls"
+owner = "policy-engine"
+profile = "native-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "controls"
+boundary = "Unmodified current evaluator library outside the paper-evidence module; not a verdict for historical edits."
+sources = ["policy-engine/src"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "policy-engine", "--lib", "--", "--skip", "paper_evidence", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 175
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-current-evaluator-integration-controls"
+owner = "policy-engine"
+profile = "native-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "controls"
+boundary = "Unmodified current nonignored memory-v1 integration controls of the historical evaluator group; ignored scale/soak cases are not silently counted."
+sources = ["policy-engine/tests/memory_v1_batch_b_contract.rs", "policy-engine/tests/memory_v1_batch_plan_contract.rs", "policy-engine/tests/memory_v1_compound_contract.rs", "policy-engine/tests/memory_v1_confirmation_derived_contract.rs", "policy-engine/tests/memory_v1_evaluation_envelope.rs", "policy-engine/tests/memory_v1_governance_scope_contract.rs", "policy-engine/tests/memory_v1_ruleset_retirement_contract.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "policy-engine", "--test", "memory_v1_batch_b_contract", "--test", "memory_v1_batch_plan_contract", "--test", "memory_v1_compound_contract", "--test", "memory_v1_confirmation_derived_contract", "--test", "memory_v1_evaluation_envelope", "--test", "memory_v1_governance_scope_contract", "--test", "memory_v1_ruleset_retirement_contract", "--", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 47
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-admission-depth3"
+owner = "test-harness"
+profile = "offline-validation"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "offline-model"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "heavy"
+boundary = "Ignored exhaustive depth-three run for the correct abstract validator (706,376,460 executions); not the variant matrix."
+sources = ["test-harness/tests/memory_v1_admission_rule_model.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "test-harness", "--test", "memory_v1_admission_rule_model", "--", "--ignored", "--exact", "depth3_exhaustive_correct_validator", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 1
+timeout_seconds = 3600
+
+[[suite]]
+id = "paper-heavy-writer-walk"
+owner = "policy-engine"
+profile = "native-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "heavy"
+boundary = "Ignored 256-seed by 64-step writer walk; local isolated children."
+sources = ["policy-engine/tests/memory_v1_paper_writer_coverage.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "policy-engine", "--test", "memory_v1_paper_writer_coverage", "--", "--ignored", "--exact", "paper_random_walk_heavy", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 1
+timeout_seconds = 3600
+
+[[suite]]
+id = "paper-repair-full-bounds"
+owner = "test-harness"
+profile = "offline-validation"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "offline-model"
+selection_policy = "explicit-suite"
+paper_track = "cose"
+paper_lane = "repair"
+boundary = "Unpublished full-bound candidate repair exploration; memory intensive and no pinned result from the paper."
+sources = ["test-harness/tests/memory_v1_journal_protocol_model.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "test-harness", "--test", "memory_v1_journal_protocol_model", "--", "--ignored", "--exact", "repair_abort_plus_ordered_publish_full_bounds_has_no_violation", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 1
+timeout_seconds = 3600
+
+[[suite]]
+id = "paper-evaluator-load"
+owner = "policy-engine"
+profile = "performance-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "performance"
+paper_fixture = "evaluator-load"
+paper_measurement = "rules="
+paper_rows = 120
+boundary = "Current release in-process evaluator load: eight sizes, five worker counts, three rounds and 1,000 iterations per worker; no historical timing claim."
+sources = ["policy-engine/tests/memory_v1_load.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "policy-engine", "--release", "--test", "memory_v1_load", "--", "--ignored", "--exact", "evaluator_concurrency_and_sustained_load", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 1
+timeout_seconds = 3600
+
+[[suite]]
+id = "paper-deny-group-commit-1"
+owner = "astral-single-node"
+profile = "performance-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "cose"
+paper_lane = "performance"
+paper_measurement = "deny_owner workers="
+paper_rows = 15
+boundary = "Debug repetition 1 of 3, fresh journals: three rounds at each of five worker counts; not the original recorded curve."
+sources = ["astral-single-node/src/memory_v1_governance_owner_tests.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-single-node", "--lib", "--", "--ignored", "--exact", "memory_v1_governance_owner_tests::deny_proof_concurrency_curve", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 1
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-deny-group-commit-2"
+owner = "astral-single-node"
+profile = "performance-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "cose"
+paper_lane = "performance"
+paper_measurement = "deny_owner workers="
+paper_rows = 15
+boundary = "Debug repetition 2 of 3, independent process and fresh journals; not a failure retry."
+sources = ["astral-single-node/src/memory_v1_governance_owner_tests.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-single-node", "--lib", "--", "--ignored", "--exact", "memory_v1_governance_owner_tests::deny_proof_concurrency_curve", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 1
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-deny-group-commit-3"
+owner = "astral-single-node"
+profile = "performance-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "cose"
+paper_lane = "performance"
+paper_measurement = "deny_owner workers="
+paper_rows = 15
+boundary = "Debug repetition 3 of 3, independent process and fresh journals; not a failure retry."
+sources = ["astral-single-node/src/memory_v1_governance_owner_tests.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-single-node", "--lib", "--", "--ignored", "--exact", "memory_v1_governance_owner_tests::deny_proof_concurrency_curve", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 1
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-http-default-registry"
+owner = "astral-single-node"
+profile = "performance-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "loopback"
+paper_fixture = "http-default"
+paper_measurement = "allow_read extra_resources=0 "
+paper_rows = 18
+boundary = "Unix ephemeral loopback with the current release binary, default registry and fresh results; not a replay of the historical A/B."
+sources = ["astral-single-node/src/memory_v1_lifecycle_stress_tests.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-single-node", "--release", "--bin", "astral-single-node", "--", "--exact", "memory_v1_service::lifecycle_stress_tests::full_lifecycle_stress_collects_phase_timings_and_quantifies", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 1
+timeout_seconds = 3600
+
+[[suite]]
+id = "paper-http-expanded-registry"
+owner = "astral-single-node"
+profile = "performance-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "loopback"
+paper_fixture = "http-expanded"
+paper_measurement = "allow_read extra_resources=128 "
+paper_rows = 18
+boundary = "Unix ephemeral loopback, current release binary and 128 added resources; not a replay of the historical A/B."
+sources = ["astral-single-node/src/memory_v1_lifecycle_stress_tests.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-single-node", "--release", "--bin", "astral-single-node", "--", "--exact", "memory_v1_service::lifecycle_stress_tests::full_lifecycle_stress_collects_phase_timings_and_quantifies", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 1
+timeout_seconds = 3600
+
+[[suite]]
+id = "paper-owner-lifecycle"
+owner = "astral-single-node"
+profile = "performance-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+paper_track = "cose"
+paper_lane = "loopback"
+paper_measurement = "client RTT "
+paper_rows = 3
+boundary = "Fresh Unix loopback mixed lifecycle, 24 direct governance commits, 16 denials, client RTT and owner histogram rows; not the historical timings, no MySQL."
+sources = ["astral-single-node/src/memory_v1_lifecycle_stress_tests.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-single-node", "--bin", "astral-single-node", "--", "--exact", "memory_v1_service::lifecycle_stress_tests::full_lifecycle_stress_collects_phase_timings_and_quantifies", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 1
+timeout_seconds = 1200
+
+[[suite]]
+id = "paper-usenix-mysql"
+owner = "astral-single-node"
+profile = "native-single-node"
+test_services = ["mysql"]
+series = ["DarkStar-Papers"]
+scope = "integration"
+selection_policy = "explicit-suite"
+paper_track = "usenix"
+paper_lane = "mysql"
+boundary = "Dedicated, pre-provisioned and approved MySQL 8.0 schema; exact nine-table synthetic facts, real binary cold boot, private DB link cutoff, independent and revoking root publications, source rows unchanged. No provisioning, DDL, cleanup, MySQL replay or deployed object mediation."
+sources = ["tests-suite/src/paper_mysql_scope.rs", "astral-single-node/tests/memory_v1_service_process.rs", "astral-single-node/tests/memory_v1_service_process/paper_mysql.rs", "astral-single-node/tests/memory_v1_service_process/paper_mysql/expected.rs", "astral-single-node/tests/memory_v1_service_process/paper_mysql/relay.rs", "Docs/memory-v1/数据库结构候选.sql", "astral-db/src/memory_v1_candidate_loader.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-single-node", "--test", "memory_v1_service_process", "--", "--ignored", "--exact", "paper_mysql::cold_snapshot_and_warm_governance", "--nocapture", "--test-threads=1"]
+acceptance = "rust"
+expected_tests = 1
+timeout_seconds = 900
+
+[[suite]]
+id = "paper-runner-contracts"
+owner = "test-harness"
+profile = "native-kernel"
+test_services = []
+series = ["DarkStar-Papers"]
+scope = "component"
+selection_policy = "explicit-suite"
+boundary = "Rust CLI selection, default isolation, opt-ins, measurement completeness and fail-closed verdicts; no real listeners, databases, or paper execution."
+sources = ["scripts/run-paper-tests.sh", "test-harness/src/campaign/paper.rs", "test-harness/tests/paper_campaign_cli.rs"]
+argv = ["cargo", "test", "--locked", "--offline", "-p", "test-harness", "--test", "paper_campaign_cli"]
+acceptance = "rust"
+expected_tests = 8
+timeout_seconds = 1200
 
 [[suite]]
 id = "campaign-contracts"
@@ -1628,12 +2137,12 @@ profile = "native-kernel"
 test_services = []
 series = ["E1", "M2"]
 scope = "component"
-boundary = "real astral-single-node binary started as a child process with a cleared environment: a non-loopback listen address, an unset ASTRAL_MEMORY_V1_CREDENTIALS_FILE, an unknown acknowledged-limit name, a group/world-readable credentials file (on a platform without Unix mode bits every credentials file is refused as unverifiable) and an unreachable candidate database are each refused without ever printing the readiness line; on a non-Unix host the unreachable-database case prints [SKIP] because the credentials gate refuses first; the end-to-end loopback host guard is checked on parsed URLs only; no reachable database, no served request and no adoption evidence; the database-backed end-to-end case is registered separately as ignored and is not selected here"
+boundary = "real astral-single-node binary started as a child process with a cleared environment: a non-loopback listen address, an unset ASTRAL_MEMORY_V1_CREDENTIALS_FILE, an unknown acknowledged-limit name, a group/world-readable credentials file (on a platform without Unix mode bits every credentials file is refused as unverifiable) and an unreachable candidate database are each refused without ever printing the readiness line; on a non-Unix host the unreachable-database case prints [SKIP] because the credentials gate refuses first; the end-to-end loopback host guard is checked on parsed URLs only; no reachable database, no served request and no adoption evidence; the database-backed cases are registered separately and not selected here"
 sources = ["astral-single-node/tests/memory_v1_service_process.rs", "astral-single-node/src/memory_v1_service.rs", "astral-single-node/src/main.rs"]
-argv = ["cargo", "test", "-p", "astral-single-node", "--locked", "--test", "memory_v1_service_process", "--", "--test-threads=1", "--skip", "real_service_end_to_end"]
+argv = ["cargo", "test", "-p", "astral-single-node", "--locked", "--test", "memory_v1_service_process", "--", "--test-threads=1", "--skip", "real_service_end_to_end", "--skip", "paper_mysql::"]
 acceptance = "rust"
-minimum_tests = 5
-expected_tests = 5
+minimum_tests = 7
+expected_tests = 7
 timeout_seconds = 900
 
 [[suite]]

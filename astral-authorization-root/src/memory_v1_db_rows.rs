@@ -604,6 +604,36 @@ pub(crate) fn confirmation_lengths(
     length(table, "confirmed_at_bytes", time, 255)
 }
 
+// memory—v1: Check version column sizes identically on capture and incremental loads.
+pub(crate) fn validate_version_lengths(row: &RuleSetVersionRow) -> Result<(), ValidationError> {
+    length(
+        Table::RuleSetVersion,
+        "version_bytes",
+        &row.version_bytes,
+        255,
+    )?;
+    length(
+        Table::RuleSetVersion,
+        "content_bytes",
+        &row.content_bytes,
+        u32::MAX as u64,
+    )?;
+    length(
+        Table::RuleSetVersion,
+        "timestamp_bytes",
+        &row.timestamp_bytes,
+        255,
+    )?;
+    length(
+        Table::RuleSetVersion,
+        "hash_input_bytes",
+        &row.hash_input_bytes,
+        u32::MAX as u64,
+    )?;
+    length(Table::RuleSetVersion, "hash_bytes", &row.hash_bytes, 255)?;
+    Ok(())
+}
+
 impl CandidateRows {
     /// memory—v1: Validate supplied SQL relations and build a read-only candidate.
     ///
@@ -674,31 +704,7 @@ impl CandidateRows {
                 "rule_set_id",
                 row.rule_set_id,
             )?;
-            length(
-                Table::RuleSetVersion,
-                "version_bytes",
-                &row.version_bytes,
-                255,
-            )?;
-            length(
-                Table::RuleSetVersion,
-                "content_bytes",
-                &row.content_bytes,
-                u32::MAX as u64,
-            )?;
-            length(
-                Table::RuleSetVersion,
-                "timestamp_bytes",
-                &row.timestamp_bytes,
-                255,
-            )?;
-            length(
-                Table::RuleSetVersion,
-                "hash_input_bytes",
-                &row.hash_input_bytes,
-                u32::MAX as u64,
-            )?;
-            length(Table::RuleSetVersion, "hash_bytes", &row.hash_bytes, 255)?;
+            validate_version_lengths(row)?;
             if versions
                 .insert((row.rule_set_id, row.version_bytes.as_slice()), row)
                 .is_some()

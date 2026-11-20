@@ -224,6 +224,7 @@ dependencies = [
  "astral-types",
  "hex",
  "im",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -499,6 +500,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "url",
  "uuid",
 ]
 

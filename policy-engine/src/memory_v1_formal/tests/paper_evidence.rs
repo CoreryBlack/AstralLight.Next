@@ -26,6 +26,10 @@ use super::super::{
     evaluate_with, MemoryV1Decision, MemoryV1Evaluation, MemoryV1PendingSource, MemoryV1Request,
 };
 
+// memory—v1: Independent row-scan reference for complete observation.
+#[path = "paper_evidence/complete_observation.rs"]
+mod complete_observation;
+
 /// memory—v1 (T1): Environment gate selecting one matrix scenario per child process.
 const T1_ENV: &str = "ASTRAL_MEMORY_V1_PAPER_T1_SCENARIO";
 /// memory—v1 (T1): Fixed trusted clock sample for every decision in the matrix.
@@ -161,9 +165,8 @@ const MATRIX: &[Row] = &[
         why: "Publishes a semantically identical ALLOW as rule set 10's new current version. The predicate still holds, but the selected version identity changes, so the recheck rejects. This is a conservative precision loss: allowed, and unsound acceptance is not." },
 ];
 
-/// memory—v1 (T1): Exhaustive projection from the production enum. Adding a
-/// `ManagementMutationV2` variant breaks this match until it is classified and
-/// given matrix rows, so writer coverage cannot silently fall behind the executor.
+/// memory—v1 (T1): Exhaustive projection of governed writers. A service-period
+/// load is a separate write family; it must be tested by the context-load suite.
 fn kind_of(mutation: &ManagementMutationV2) -> Kind {
     match mutation {
         ManagementMutationV2::BindingCreate { .. } => Kind::BindingCreate,
@@ -179,6 +182,9 @@ fn kind_of(mutation: &ManagementMutationV2) -> Kind {
         ManagementMutationV2::RuleSetCreate { .. } => Kind::RuleSetCreate,
         ManagementMutationV2::RuleSetRetire { .. } => Kind::RuleSetRetire,
         ManagementMutationV2::VersionPublish { .. } => Kind::VersionPublish,
+        ManagementMutationV2::ContextLoad { .. } => {
+            unreachable!("service-period context load is outside the governance writer matrix")
+        }
     }
 }
 
@@ -200,7 +206,7 @@ fn row_for(kind: Kind, class: Class) -> &'static Row {
 /// memory—v1 (T1): Writes executed inside the after-read hook of one evaluation.
 enum Write {
     /// A governance-shaped mutation through the isolated executor; success is required only when the row says so.
-    Mutation(ManagementMutationV2),
+    Mutation(Box<ManagementMutationV2>),
     /// The coordinated card disable; always expected to succeed.
     Disable(u8),
     /// A plain Disabled status write, which must be refused (no session coordinator).
@@ -426,7 +432,7 @@ fn t1_request() -> MemoryV1Request<'static> {
 /// fixed by its kind (see `Write`); the row's `applied` flag governs the main write.
 fn t1_writes(kind: Kind, class: Class) -> Vec<Write> {
     let row = row_for(kind, class);
-    let main = |mutation: ManagementMutationV2| Write::Mutation(mutation);
+    let main = |mutation: ManagementMutationV2| Write::Mutation(Box::new(mutation));
     match (kind, class) {
         (Kind::BindingCreate, Class::Subject) => vec![main(ManagementMutationV2::BindingCreate {
             row: binding_row(26, SUBJECT, 12, BindingLayer::Overlay),

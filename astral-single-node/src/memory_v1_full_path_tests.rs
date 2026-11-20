@@ -56,6 +56,14 @@ use tower::ServiceExt;
 
 use super::MemoryV1Composition;
 
+// memory—v1: Cross-tenant controls for the paper's ordinary admission path.
+#[path = "memory_v1_full_path_tests/mediation.rs"]
+mod mediation;
+
+// memory—v1: Trusted-host object attribution for one representative business route.
+#[path = "memory_v1_full_path_tests/object_attribution.rs"]
+mod object_attribution;
+
 pub(crate) const REGISTRY: &str = "/main/api/v1/permission-rules/registry";
 
 pub(crate) const ALICE: [u8; 16] = [0x11; 16];

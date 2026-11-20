@@ -41,6 +41,9 @@ pub enum MutationDigestError {
     LengthOverflow,
     /// A field, batch or total encoded size exceeds the candidate limit.
     LimitExceeded,
+    /// A service-period context load is not a governed change and has no
+    /// mutation-digest encoding; its facts live in the root snapshot digest.
+    ContextLoadUnsupported,
 }
 
 struct Encoder {
@@ -354,6 +357,11 @@ pub fn digest_mutation(
             encoder.version(version_row)?;
             encoder.bytes(new_current_version)?;
             encoder.change_confirmation(change_confirmation)?;
+        }
+        // memory—v1 §15.10.3: A context load carries snapshot facts, not an
+        // ordered governed change; it has no mutation-digest encoding.
+        ManagementMutationV2::ContextLoad { .. } => {
+            return Err(MutationDigestError::ContextLoadUnsupported);
         }
     }
     Ok(encoder.hash.finalize().into())

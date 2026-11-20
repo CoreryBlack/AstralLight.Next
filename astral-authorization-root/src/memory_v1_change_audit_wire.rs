@@ -135,7 +135,8 @@ fn validate(
         | ManagementMutationV2::UserCardCreate { .. }
         | ManagementMutationV2::RuleSetCreate { .. }
         | ManagementMutationV2::RuleSetRetire { .. }
-        | ManagementMutationV2::VersionPublish { .. } => {
+        | ManagementMutationV2::VersionPublish { .. }
+        | ManagementMutationV2::ContextLoad { .. } => {
             return Err(CandidateChangeAuditWireError::UnsupportedMutation);
         }
     };
@@ -324,6 +325,7 @@ mod tests {
     }
 
     // memory—v1
+    #[allow(clippy::too_many_arguments)]
     fn audit(
         card: u8,
         before: MemoryV1AuditObjectState,

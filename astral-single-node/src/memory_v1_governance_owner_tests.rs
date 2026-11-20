@@ -32,11 +32,10 @@ use astral_trustgraph::service::memory_v1_governance_commit::{
 use astral_trustgraph::service::memory_v1_mutation_coordinator::MutationAuditCandidate;
 use astral_types::memory_v1_audit::{
     MemoryV1AuditAction, MemoryV1AuditActor, MemoryV1AuditCardState, MemoryV1AuditChange,
-    MemoryV1AuditChangeSummary, MemoryV1AuditConfirmations, MemoryV1AuditContext,
-    MemoryV1AuditDecisionInput, MemoryV1AuditEvent, MemoryV1AuditObject, MemoryV1AuditObjectState,
-    MemoryV1AuditOperation, MemoryV1AuditRootObservation, MemoryV1AuditRootStatus,
-    MemoryV1AuditRootVersion, MemoryV1AuditSource, MemoryV1AuditT2SingleChangeCandidate,
-    MemoryV1AuditTime,
+    MemoryV1AuditConfirmations, MemoryV1AuditContext, MemoryV1AuditDecisionInput,
+    MemoryV1AuditEvent, MemoryV1AuditObject, MemoryV1AuditObjectState, MemoryV1AuditOperation,
+    MemoryV1AuditRootObservation, MemoryV1AuditRootStatus, MemoryV1AuditRootVersion,
+    MemoryV1AuditSource, MemoryV1AuditT2SingleChangeCandidate, MemoryV1AuditTime,
 };
 
 // The registry declaration the fixture root installs before adoption.
@@ -50,7 +49,7 @@ fn registry_declarations() -> Vec<RegistryDeclaration> {
 // The candidate fixture: one user, one identity card, one tenant, one active
 // card, one serving rule set with a hashed body, and one binding.
 fn fixture_rows() -> (CandidateRows, Vec<CurrentSelection>) {
-    use astral_authorization_root::memory_v1_rules::{canonical_version_bytes, version_digest};
+    use astral_authorization_root::memory_v1_rules::canonical_version_bytes;
     use sha2::{Digest, Sha256};
     let id = |value: u8| [value; 16];
     let content =
@@ -655,7 +654,6 @@ fn deny_journal_payload_round_trips() {
 #[test]
 fn recovery_replays_a_journaled_mutation_before_adoption() {
     use crate::memory_v1_recovery_owner::recover_root;
-    use astral_trustgraph::service::memory_v1_mutation_coordinator::MutationRequest;
 
     let root = production_root();
     // The journal starts fresh; the commit owner appends one mutation.

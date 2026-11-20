@@ -16,3 +16,8 @@ mod memory_v1_governance_owner_tests;
 // memory—v1: Paper evidence at owner, writer and recovery level (C&S sections 4 and 5).
 #[cfg(test)]
 mod memory_v1_paper_evidence_tests;
+
+// memory—v1: Large-scale production-shape simulation (sharded fixtures, random
+// rule-set mixing, request distribution and service-period context loads).
+#[cfg(test)]
+mod memory_v1_scale_tests;

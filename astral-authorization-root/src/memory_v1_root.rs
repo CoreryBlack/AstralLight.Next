@@ -14,10 +14,11 @@
 //! issuer yet, so the reachable paths are the experimental one (explicit,
 //! operator-acknowledged limits) and the test-only hook.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use arc_swap::ArcSwap;
+use astral_types::memory_v1::MemoryId;
+use astral_types::memory_v1_journal::JournalAnchor;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -38,8 +39,12 @@ use crate::memory_v1_hamt::{
 #[cfg(any(test, feature = "test-support"))]
 use crate::memory_v1_hamt_runtime::digest_candidate;
 use crate::memory_v1_hamt_runtime::{digest_rows, RuntimeCardContext, RuntimeError};
-use crate::memory_v1_registry::{RegistryDeclaration, RegistryError, RegistryState};
+use crate::memory_v1_registry::{
+    RegistryDeclaration, RegistryError, RegistryReadGuard, RegistryState,
+};
 use crate::memory_v1_root_digest::prepare_root_digest;
+
+mod context_load;
 
 /// Process-local identity of one installed root instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -235,8 +240,63 @@ impl PublicationCandidate {
     }
 }
 
+/// memory—v1: The journal boundary associated with a snapshot. This is
+/// handed in by the composition owner after local durability or verified replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GovernancePrefix {
+    anchor: JournalAnchor,
+    epoch: MemoryId,
+}
+
+impl GovernancePrefix {
+    /// memory—v1: Wrap the supplied journal identity; this is not a durability proof.
+    pub fn new(anchor: JournalAnchor, epoch: MemoryId) -> Option<Self> {
+        (epoch != MemoryId::from_bytes([0; 16])
+            && anchor.mutation_sequence() <= anchor.journal_sequence())
+        .then_some(Self { anchor, epoch })
+    }
+
+    /// memory—v1: Return the journal boundary captured at the governance publication.
+    pub fn anchor(self) -> JournalAnchor {
+        self.anchor
+    }
+
+    /// memory—v1: Return the epoch from the same journal owner.
+    pub fn epoch(self) -> MemoryId {
+        self.epoch
+    }
+
+    // memory—v1: DENY frames can advance the journal position between mutations.
+    fn follows(self, previous: GovernanceFrontier) -> bool {
+        match previous {
+            GovernanceFrontier::Published(previous) => {
+                self.epoch == previous.epoch
+                    && self.anchor.stream_id() == previous.anchor.stream_id()
+                    && self.anchor.journal_sequence() > previous.anchor.journal_sequence()
+                    && previous.anchor.mutation_sequence().checked_add(1)
+                        == Some(self.anchor.mutation_sequence())
+            }
+            GovernanceFrontier::Baseline => self.anchor.mutation_sequence() == 1,
+            GovernanceFrontier::Unproven => false,
+        }
+    }
+}
+
+/// memory—v1: Binding of the in-memory observation to its own governance history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GovernanceFrontier {
+    /// Installed facts before any governance mutation.
+    Baseline,
+    /// Published after a durable governance write or verified recovery replay.
+    Published(GovernancePrefix),
+    /// A compatibility write without a matching durable record.
+    Unproven,
+}
+
+#[derive(Clone)]
 struct RootSnapshot {
     metadata: RootMetadata,
+    frontier: GovernanceFrontier,
     objects: HamtCandidate,
     // The index is published with exactly the objects and digest it describes.
     digest_index: DigestIndex,
@@ -288,8 +348,19 @@ mod validated_adoption_snapshot {
 
 use validated_adoption_snapshot::ValidatedAdoptionSnapshot;
 
+mod governed;
+pub use governed::PreparedGovernedMutation;
+
+struct PreparedSnapshot<'a> {
+    snapshot: Arc<RootSnapshot>,
+    _registry: Option<RegistryReadGuard<'a>>,
+}
+
 struct RootRuntime {
     current: ArcSwap<RootSnapshot>,
+    // memory—v1: Reserve the serving write sequence from preparation through
+    // publication. Request readers never take this lock, including during sync.
+    serving_writer: Mutex<()>,
     // memory—v1 §4.12: Serialize writers while allowing independent final
     // checks to share a stable root observation without blocking one another.
     mutation_lock: RwLock<()>,
@@ -303,7 +374,6 @@ struct RootRuntime {
     session_authority: OnceLock<Arc<crate::memory_v1_session::SessionAuthorityToken>>,
     // memory—v1 §4.10: bumped whenever the tenant tree structure changes; the
     // tree itself is immutable inside one snapshot.
-    tenant_tree_version: AtomicU64,
 }
 
 /// A cloneable read capability for the one installed root.
@@ -390,6 +460,18 @@ pub fn install_isolated_test_root(
     RootRegistry::new().install_candidate(rows, selections, budget)
 }
 
+/// memory—v1: Observe the real candidate construction phases in isolated tests.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn install_isolated_test_root_with_phases(
+    rows: CandidateRows,
+    selections: Vec<CurrentSelection>,
+    budget: CandidateBudget,
+    mut phase: impl FnMut(&'static str),
+) -> Result<RootOwner, RootError> {
+    RootRegistry::new().install_candidate_with_phases(rows, selections, budget, &mut phase)
+}
+
 /// The process-wide installation slot used by the single-node composition root.
 static PROCESS_ROOT: RootRegistry = RootRegistry::new();
 
@@ -459,11 +541,25 @@ impl RootRegistry {
         selections: Vec<CurrentSelection>,
         budget: CandidateBudget,
     ) -> Result<RootOwner, RootError> {
+        self.install_candidate_with_phases(rows, selections, budget, &mut |_| {})
+    }
+
+    // memory—v1: The isolated scale harness observes the actual install phases.
+    fn install_candidate_with_phases(
+        &self,
+        rows: CandidateRows,
+        selections: Vec<CurrentSelection>,
+        budget: CandidateBudget,
+        phase: &mut impl FnMut(&'static str),
+    ) -> Result<RootOwner, RootError> {
         count_rows(&rows, budget.max_table_rows).map_err(RootError::Candidate)?;
+        phase("count");
         let digest_index = digest_rows(&rows, &selections).map_err(RootError::Runtime)?;
         let digest = digest_index.digest();
+        phase("digest");
         let objects =
             HamtCandidate::build(rows, selections, budget).map_err(RootError::Candidate)?;
+        phase("index");
         let (actual_budget, row_count) = objects.budget_and_row_count();
         let metadata = RootMetadata {
             instance_id: RootInstanceId(Uuid::new_v4()),
@@ -479,16 +575,18 @@ impl RootRegistry {
                 objects,
                 digest_index,
                 adoption: None,
+                frontier: GovernanceFrontier::Baseline,
             }),
+            serving_writer: Mutex::new(()),
             mutation_lock: RwLock::new(()),
             registry: RegistryState::default(),
             fences: FenceRegistry::default(),
             session_authority: OnceLock::new(),
-            tenant_tree_version: AtomicU64::new(0),
         });
         self.slot
             .set(Arc::downgrade(&runtime))
             .map_err(|_| RootError::AlreadyInstalled)?;
+        phase("install");
         Ok(RootOwner { runtime })
     }
 
@@ -625,6 +723,21 @@ impl RootOwner {
         self.handle().validate_production_admission(admission)
     }
 
+    /// memory—v1: Validate an exact live production observation and read its
+    /// frontier from the same immutable snapshot. This does not retain history.
+    pub fn current_governance_frontier(
+        &self,
+        admission: &ProductionAdmission,
+        expected: &RootMetadata,
+    ) -> Result<GovernanceFrontier, RootError> {
+        self.validate_production_admission(admission)?;
+        let current = self.runtime.current.load_full();
+        if &current.metadata != expected || current.metadata.status != RootStatus::Serving {
+            return Err(RootError::ProductionAdmissionMismatch);
+        }
+        Ok(current.frontier)
+    }
+
     /// creates a record without schema, count or capture-time details; it is not
     /// evidence that a future production-adoption contract has been completed.
     pub fn adopt_serving(
@@ -715,7 +828,27 @@ impl RootOwner {
         if current.metadata.version != precondition.evaluated_root_version {
             return Err(MutationError::ConcurrentModification);
         }
-        Self::execute_on_recovery(&self.runtime, mutation, precondition)
+        Self::execute_on_recovery(&self.runtime, mutation, precondition, None)
+    }
+
+    /// memory—v1: Replay a verified journal mutation while advancing the
+    /// durable frontier independently of the local snapshot version.
+    pub fn execute_recovery_mutation_with_prefix(
+        &self,
+        mutation: &ManagementMutationV2,
+        precondition: &MutationPrecondition,
+        prefix: GovernancePrefix,
+    ) -> Result<RootMetadata, MutationError> {
+        Self::execute_on_recovery(&self.runtime, mutation, precondition, Some(prefix))
+    }
+
+    /// memory—v1: Read the candidate's replay frontier without exposing a writer.
+    pub fn candidate_governance_frontier(&self) -> Result<GovernanceFrontier, RootError> {
+        let current = self.runtime.current.load_full();
+        if current.metadata.status != RootStatus::Candidate {
+            return Err(RootError::Unavailable(current.metadata.status));
+        }
+        Ok(current.frontier)
     }
 
     /// memory—v1: Adopt a fixture with the same structural and snapshot checks.
@@ -860,6 +993,7 @@ impl RootOwner {
             objects: validated.objects.clone(),
             digest_index: validated.digest_index.clone(),
             adoption: Some(Arc::new(record)),
+            frontier: validated.frontier,
         });
         let previous = self
             .runtime
@@ -885,6 +1019,7 @@ impl RootOwner {
             objects: current.objects.clone(),
             digest_index: current.digest_index.clone(),
             adoption: current.adoption.clone(),
+            frontier: current.frontier,
         }));
     }
     // memory—v1: Read-side exhaustion refuses immediately. Publish Invalid only
@@ -925,7 +1060,7 @@ impl RootOwner {
 
     /// memory—v1 §4.10: the tenant-tree version participates in the §4.7 dependency set.
     pub fn tenant_tree_version(&self) -> u64 {
-        self.runtime.tenant_tree_version.load(Ordering::Relaxed)
+        self.runtime.current.load().objects.tenant_tree_version()
     }
 
     /// memory—v1 §4.6: Open an owner-scoped modification window from the root's
@@ -1021,6 +1156,49 @@ impl RootOwner {
         Self::execute_on(&self.runtime, mutation, precondition, true)
     }
 
+    /// memory—v1: Observe a real isolated context load without enabling it in production.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn execute_context_load_for_scale_test(
+        &self,
+        mutation: &ManagementMutationV2,
+        precondition: &MutationPrecondition,
+        mut phase: impl FnMut(&'static str),
+    ) -> Result<RootMetadata, MutationError> {
+        assert!(matches!(mutation, ManagementMutationV2::ContextLoad { .. }));
+        Self::execute_context_load(
+            &self.runtime,
+            mutation,
+            precondition,
+            context_load::LoadScope::Isolated,
+            &mut phase,
+        )
+    }
+
+    /// memory—v1: Model a batch independently known to be in the cold capture
+    /// for the local journal/restart contract test. Not a source-proof issuer.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn execute_context_load_from_verified_cold_fixture_for_test(
+        &self,
+        admission: &ProductionAdmission,
+        mutation: &ManagementMutationV2,
+        expected: &RootMetadata,
+    ) -> Result<RootMetadata, MutationError> {
+        if self.validate_production_admission(admission).as_ref() != Ok(expected) {
+            return Err(MutationError::ConcurrentModification);
+        }
+        Self::execute_context_load(
+            &self.runtime,
+            mutation,
+            &MutationPrecondition {
+                evaluated_root_version: expected.version,
+            },
+            context_load::LoadScope::VerifiedColdFixture(*expected),
+            &mut |_| {},
+        )
+    }
+
     /// memory—v1: Hand out a weak, low-level candidate mutation capability.
     ///
     /// This is not an authorization-bound management capability. It cannot keep
@@ -1039,7 +1217,11 @@ impl RootOwner {
         runtime: &RootRuntime,
         mutation: &ManagementMutationV2,
         precondition: &MutationPrecondition,
+        prefix: Option<GovernancePrefix>,
     ) -> Result<RootMetadata, MutationError> {
+        if matches!(mutation, ManagementMutationV2::ContextLoad { .. }) {
+            return Err(MutationError::ContextLoadNotGovernable);
+        }
         let _mutation_guard = runtime
             .mutation_lock
             .write()
@@ -1051,7 +1233,16 @@ impl RootOwner {
         {
             return Err(MutationError::ConcurrentModification);
         }
-        Self::execute_on_locked(runtime, mutation, precondition)
+        if let Some(prefix) = prefix {
+            if !prefix.follows(current.frontier) {
+                return Err(MutationError::ConcurrentModification);
+            }
+            let mut next = Self::prepare_mutation_snapshot(runtime, &current, mutation)?;
+            Arc::make_mut(&mut next.snapshot).frontier = GovernanceFrontier::Published(prefix);
+            Self::publish_mutation_snapshot(runtime, &current, next.snapshot)
+        } else {
+            Self::execute_on_locked(runtime, mutation, precondition)
+        }
     }
 
     // memory—v1: The single low-level implementation shared by both callers.
@@ -1061,6 +1252,23 @@ impl RootOwner {
         precondition: &MutationPrecondition,
         isolated_test: bool,
     ) -> Result<RootMetadata, MutationError> {
+        if matches!(mutation, ManagementMutationV2::ContextLoad { .. }) {
+            return Self::execute_context_load(
+                runtime,
+                mutation,
+                precondition,
+                if isolated_test {
+                    context_load::LoadScope::Isolated
+                } else {
+                    context_load::LoadScope::Candidate
+                },
+                &mut |_| {},
+            );
+        }
+        let _reservation = runtime
+            .serving_writer
+            .try_lock()
+            .map_err(|_| MutationError::ConcurrentModification)?;
         let _mutation_guard = runtime
             .mutation_lock
             .write()
@@ -1116,17 +1324,21 @@ impl RootOwner {
         precondition: &MutationPrecondition,
     ) -> Result<RootMetadata, MutationError> {
         let runtime = Arc::clone(&self.runtime);
-        // The admission check and the writer lock are both root-owned: the
-        // capability must match this runtime before any candidate construction.
+        if matches!(mutation, ManagementMutationV2::ContextLoad { .. }) {
+            // This entry has no read-miss scope or source-prefix proof.
+            return Err(MutationError::ContextLoadNotGovernable);
+        }
+        // Preserve this low-level entry point, but share the same serving write reservation.
+        let _reservation = runtime
+            .serving_writer
+            .try_lock()
+            .map_err(|_| MutationError::ConcurrentModification)?;
         self.handle()
             .validate_production_admission(admission)
             .map_err(|error| match error {
                 RootError::ProductionAdmissionMismatch => MutationError::ConcurrentModification,
                 _ => MutationError::Runtime(RuntimeError::OwnerGone),
             })?;
-        if runtime.current.load().metadata.version != precondition.evaluated_root_version {
-            return Err(MutationError::ConcurrentModification);
-        }
         if matches!(
             mutation,
             ManagementMutationV2::UserCardStatus {
@@ -1136,7 +1348,18 @@ impl RootOwner {
         ) {
             return Err(MutationError::CardDisableRequiresSessionCoordinator);
         }
-        Self::execute_on(&runtime, mutation, precondition, true)
+        let _guard = runtime
+            .mutation_lock
+            .write()
+            .map_err(|_| MutationError::Runtime(RuntimeError::Poisoned))?;
+        let current = runtime.current.load_full();
+        if current.metadata.status != RootStatus::Serving {
+            return Err(MutationError::ConcurrentModification);
+        }
+        if Self::governed_fence_target(&current, mutation)?.is_some() {
+            return Err(MutationError::ModificationFenceRequired);
+        }
+        Self::execute_on_locked(&runtime, mutation, precondition)
     }
 
     // memory—v1: Only callers already holding the root writer may use this
@@ -1166,6 +1389,16 @@ impl RootOwner {
         if current.metadata.version != precondition.evaluated_root_version {
             return Err(MutationError::ConcurrentModification);
         }
+        let prepared = Self::prepare_mutation_snapshot(runtime, &current, mutation)?;
+        Self::publish_mutation_snapshot(runtime, &current, prepared.snapshot)
+    }
+
+    // memory—v1: Build and validate the entire successor before any durable write.
+    fn prepare_mutation_snapshot<'a>(
+        runtime: &'a RootRuntime,
+        current: &Arc<RootSnapshot>,
+        mutation: &ManagementMutationV2,
+    ) -> Result<PreparedSnapshot<'a>, MutationError> {
         let candidate = &current.objects;
         let old_version = current.metadata.version;
         // The retirement result is sealed around its exact candidate after the
@@ -1294,6 +1527,9 @@ impl RootOwner {
                         })
                         .map_err(MutationError::Candidate)?
                 }
+                ManagementMutationV2::ContextLoad { .. } => {
+                    return Err(MutationError::ContextLoadNotGovernable)
+                }
             };
             // Index coverage is verified independently of the content digest before CAS.
             next.validate_binding_indexes()
@@ -1328,8 +1564,6 @@ impl RootOwner {
             _ => None,
         };
 
-        // §4.6/§15.10: version, candidate and its prepared digest index are
-        // published together as one atomic root snapshot.
         let mut metadata = current.metadata;
         metadata.version = old_version
             .checked_add(1)
@@ -1337,17 +1571,27 @@ impl RootOwner {
         metadata.budget = budget;
         metadata.row_count = row_count;
         metadata.digest = digest;
-        let next_snapshot = Arc::new(RootSnapshot {
-            metadata,
-            objects: next.into_candidate(),
-            digest_index,
-            adoption: current.adoption.clone(),
-        });
-        let previous = runtime.current.compare_and_swap(&current, next_snapshot);
-        // Hold the registry observation through CAS; releasing it earlier lets
-        // a concurrent retirement invalidate the rule before publication.
-        drop(registry);
-        if !Arc::ptr_eq(&previous, &current) {
+        Ok(PreparedSnapshot {
+            snapshot: Arc::new(RootSnapshot {
+                metadata,
+                objects: next.into_candidate(),
+                digest_index,
+                adoption: current.adoption.clone(),
+                frontier: GovernanceFrontier::Unproven,
+            }),
+            _registry: registry,
+        })
+    }
+
+    // memory—v1 §4.6/§15.10: Publish facts, indexes, version and digest together.
+    fn publish_mutation_snapshot(
+        runtime: &RootRuntime,
+        current: &Arc<RootSnapshot>,
+        next: Arc<RootSnapshot>,
+    ) -> Result<RootMetadata, MutationError> {
+        let metadata = next.metadata;
+        let previous = runtime.current.compare_and_swap(current, next);
+        if !Arc::ptr_eq(&previous, current) {
             return Err(MutationError::ConcurrentModification);
         }
         Ok(metadata)
@@ -1463,6 +1707,10 @@ impl RootMutationExecutor {
             .runtime
             .upgrade()
             .ok_or(MutationError::Runtime(RuntimeError::OwnerGone))?;
+        let _reservation = runtime
+            .serving_writer
+            .try_lock()
+            .map_err(|_| MutationError::ConcurrentModification)?;
         let _guard = runtime
             .mutation_lock
             .try_write()
@@ -1545,6 +1793,20 @@ pub enum ManagementMutationV2 {
         new_current_version: Vec<u8>,
         change_confirmation: crate::memory_v1_db_rows::RuleSetChangeConfirmationRow,
     },
+    /// memory—v1 §15.10.3: one service-period context load. The caller read
+    /// the missing range from the controlled database snapshot, proved that
+    /// every row's references close inside the root's already-served state or
+    /// this batch, and submits the rows for an atomic merge into the same
+    /// owner. The merge must not overwrite newer in-memory facts, must not
+    /// revive a removed binding or a revoked confirmation, and must keep the
+    /// digest capacity; any unprovable conflict fails closed with
+    /// `RuntimeError::UnsafeMerge` and leaves the root unchanged. This value
+    /// authorizes nothing: the caller still needs an admission to act, and
+    /// database rows never become an allow by themselves.
+    ContextLoad {
+        rows: crate::memory_v1_db_rows::CandidateRows,
+        selections: Vec<crate::memory_v1_db_rows::CurrentSelection>,
+    },
 }
 
 /// Errors from the low-level candidate mutation path.
@@ -1562,6 +1824,12 @@ pub enum MutationError {
     ConcurrentModification,
     #[error("card disable requires the bound session coordinator")]
     CardDisableRequiresSessionCoordinator,
+    #[error("rule-set modification requires an owned publication fence")]
+    ModificationFenceRequired,
+    #[error("a context load cannot be submitted as a governed mutation")]
+    ContextLoadNotGovernable,
+    #[error("rule-set modification fence failed: {0}")]
+    ModificationFence(#[from] FenceControlError),
 }
 
 // memory—v1: Recompute a candidate digest for test fixtures.
@@ -1589,6 +1857,7 @@ impl Drop for RootOwner {
             objects: current.objects.clone(),
             digest_index: current.digest_index.clone(),
             adoption: current.adoption.clone(),
+            frontier: current.frontier,
         }));
     }
 }
@@ -1921,7 +2190,8 @@ impl RequestRootReader {
             || current.metadata.status != RootStatus::Serving
             || self.snapshot.metadata.version == u64::MAX
             || current.metadata.version == u64::MAX
-            || runtime.tenant_tree_version.load(Ordering::Relaxed) == u64::MAX
+            || current.objects.tenant_tree_version() == u64::MAX
+            || current.objects.tenant_tree_version() != self.snapshot.objects.tenant_tree_version()
             || self
                 .snapshot
                 .objects
@@ -2068,7 +2338,7 @@ impl RequestRootReader {
             .owner
             .upgrade()
             .ok_or(RootError::OwnerGone)?;
-        let tenant_tree_version = runtime.tenant_tree_version.load(Ordering::Relaxed);
+        let tenant_tree_version = self.snapshot.objects.tenant_tree_version();
         if tenant_tree_version == u64::MAX {
             return Err(RootError::Unavailable(RootStatus::Invalid));
         }
@@ -2254,8 +2524,9 @@ impl RequestRootReader {
                                     || expected != current.metadata
                                     || targets.iter().any(|target| !unfenced(*target))
                             })
-                            || runtime.tenant_tree_version.load(Ordering::Relaxed)
+                            || self.snapshot.objects.tenant_tree_version()
                                 != record.tenant_tree_version
+                            || current.objects.tenant_tree_version() != record.tenant_tree_version
                             || !current.objects.is_user_card_active(record.card_id)
                         {
                             return Ok(None);
@@ -3265,6 +3536,7 @@ mod tests {
             objects,
             digest_index: before.digest_index.clone(),
             adoption: None,
+            frontier: GovernanceFrontier::Unproven,
         });
         owner.runtime.current.store(Arc::clone(&corrupted));
         assert!(matches!(
@@ -3309,6 +3581,7 @@ mod tests {
             objects,
             digest_index: before.digest_index.clone(),
             adoption: None,
+            frontier: GovernanceFrontier::Unproven,
         });
         owner.runtime.current.store(Arc::clone(&corrupted));
         assert!(matches!(
@@ -3361,6 +3634,7 @@ mod tests {
                 objects,
                 digest_index: before.digest_index.clone(),
                 adoption: None,
+                frontier: GovernanceFrontier::Unproven,
             });
             owner.runtime.current.store(Arc::clone(&corrupted));
             assert!(matches!(
@@ -3470,6 +3744,7 @@ mod tests {
             objects,
             digest_index: current.digest_index.clone(),
             adoption: current.adoption.clone(),
+            frontier: current.frontier,
         }));
         let limited = owner.handle().begin_request(Uuid::new_v4()).unwrap();
         assert!(matches!(
@@ -3740,6 +4015,7 @@ mod tests {
                     objects,
                     digest_index: before.digest_index.clone(),
                     adoption: before.adoption.clone(),
+                    frontier: before.frontier,
                 });
                 owner.runtime.current.store(Arc::clone(&corrupted));
                 assert!(
@@ -3785,6 +4061,7 @@ mod tests {
                 objects,
                 digest_index: before.digest_index.clone(),
                 adoption: before.adoption.clone(),
+                frontier: before.frontier,
             });
             owner.runtime.current.store(Arc::clone(&corrupted));
             assert!(matches!(
@@ -3818,6 +4095,7 @@ mod tests {
             digest_index: before.digest_index.clone(),
             objects,
             adoption: before.adoption.clone(),
+            frontier: before.frontier,
         }));
         let exhausted = owner.runtime.current.load_full();
         assert!(owner
@@ -4172,6 +4450,7 @@ mod tests {
             objects,
             digest_index: original.digest_index.clone(),
             adoption: original.adoption.clone(),
+            frontier: original.frontier,
         });
         owner.runtime.current.store(Arc::clone(&limited));
         assert!(matches!(
@@ -4381,6 +4660,7 @@ mod tests {
                 objects: current.objects.clone(),
                 digest_index: current.digest_index.clone(),
                 adoption: current.adoption.clone(),
+                frontier: current.frontier,
             });
             owner.runtime.current.store(Arc::clone(&unavailable));
             let mutation = ManagementMutationV2::ConfirmationRevoke {
@@ -5257,6 +5537,7 @@ mod tests {
             objects: previous.objects.clone(),
             digest_index: previous.digest_index.clone(),
             adoption: previous.adoption.clone(),
+            frontier: previous.frontier,
         }));
         let guard = owner.runtime.mutation_lock.read().unwrap();
         assert_eq!(reader.recheck_dependencies(&record), Ok(false));
@@ -5304,6 +5585,7 @@ mod tests {
             objects: current.objects.clone(),
             digest_index: current.digest_index.clone(),
             adoption: current.adoption.clone(),
+            frontier: current.frontier,
         }));
         assert_eq!(reader.recheck_dependencies(&unknown), Ok(false));
     }
@@ -5500,6 +5782,7 @@ mod tests {
                 digest_index: fixture_digest_index(&objects),
                 objects,
                 adoption: before.adoption.clone(),
+                frontier: before.frontier,
             }));
             assert_eq!(
                 reader.recheck_dependencies(&record),
@@ -5548,6 +5831,7 @@ mod tests {
             digest_index: fixture_digest_index(&objects),
             objects,
             adoption: before.adoption.clone(),
+            frontier: before.frontier,
         }));
         assert_eq!(reader.recheck_dependencies(&record), Ok(false));
     }
@@ -5607,6 +5891,7 @@ mod tests {
             objects,
             digest_index: original.digest_index.clone(),
             adoption: original.adoption.clone(),
+            frontier: original.frontier,
         }));
         assert_eq!(reader.recheck_dependencies(&record), Ok(true));
     }
@@ -5642,6 +5927,7 @@ mod tests {
             objects: previous.objects.clone(),
             digest_index: previous.digest_index.clone(),
             adoption: previous.adoption.clone(),
+            frontier: previous.frontier,
         }));
         assert_eq!(
             owner.handle().metadata(),
@@ -5682,6 +5968,7 @@ mod tests {
             objects: previous.objects.clone(),
             digest_index: previous.digest_index.clone(),
             adoption: previous.adoption.clone(),
+            frontier: previous.frontier,
         }));
         assert_eq!(owner.handle().metadata().unwrap(), metadata);
         let evidence = crate::memory_v1_adoption::AdoptionEvidence::complete_for_test(metadata);
@@ -5717,6 +6004,7 @@ mod tests {
             objects: previous.objects.clone(),
             digest_index: previous.digest_index.clone(),
             adoption: previous.adoption.clone(),
+            frontier: previous.frontier,
         }));
         let evidence = crate::memory_v1_adoption::AdoptionEvidence::complete_for_test(metadata);
         owner.adopt_isolated_evidence(&evidence).unwrap();
@@ -5815,6 +6103,7 @@ mod tests {
                 objects,
                 digest_index: original.digest_index.clone(),
                 adoption: original.adoption.clone(),
+                frontier: original.frontier,
             }));
             let reader = owner.handle().begin_request(Uuid::new_v4()).unwrap();
             let (tenant_tree_version, registry_version) = reader.dependency_versions().unwrap();
@@ -5883,13 +6172,13 @@ mod tests {
             tenant_tree_version,
             registry_version,
         };
-        owner
-            .runtime
-            .tenant_tree_version
-            .store(u64::MAX, Ordering::Relaxed);
+        let mut exhausted = owner.runtime.current.load_full().as_ref().clone();
+        exhausted.objects.exhaust_tenant_tree_for_test();
+        owner.runtime.current.store(Arc::new(exhausted));
         assert_eq!(reader.recheck_dependencies(&record), Ok(false));
+        let fresh = owner.handle().begin_request(Uuid::new_v4()).unwrap();
         assert_eq!(
-            reader.dependency_versions(),
+            fresh.dependency_versions(),
             Err(RootError::Unavailable(RootStatus::Invalid))
         );
     }
@@ -5947,6 +6236,7 @@ mod tests {
                 digest_index: fixture_digest_index(&objects),
                 objects,
                 adoption: original.adoption.clone(),
+                frontier: original.frontier,
             }));
             assert_eq!(reader.recheck_dependencies(&record), Ok(actor_result));
             assert_eq!(
@@ -6081,6 +6371,7 @@ mod tests {
                 digest_index: fixture_digest_index(&objects),
                 objects,
                 adoption: before.adoption.clone(),
+                frontier: before.frontier,
             });
             owner.runtime.current.store(Arc::clone(&malformed));
             (owner, malformed)
@@ -6816,6 +7107,7 @@ mod tests {
             objects: candidate.objects.clone(),
             digest_index: candidate.digest_index.clone(),
             adoption: None,
+            frontier: GovernanceFrontier::Unproven,
         });
         owner.runtime.current.store(Arc::clone(&replacement));
 
@@ -6844,6 +7136,7 @@ mod tests {
             objects: candidate.objects.clone(),
             digest_index: candidate.digest_index.clone(),
             adoption: candidate.adoption.clone(),
+            frontier: candidate.frontier,
         });
         owner.runtime.current.store(Arc::clone(&replacement));
 
@@ -6873,6 +7166,7 @@ mod tests {
             objects: candidate.objects.clone(),
             digest_index: candidate.digest_index.clone(),
             adoption: None,
+            frontier: GovernanceFrontier::Unproven,
         }));
         let foreign = ServingAdoptionCertificate {
             instance_id: RootInstanceId(Uuid::new_v4()),
@@ -6958,6 +7252,7 @@ mod tests {
             digest_index: fixture_digest_index(&objects),
             objects,
             adoption: None,
+            frontier: GovernanceFrontier::Unproven,
         }));
         second
             .with_reader(|reader| {
@@ -7043,6 +7338,7 @@ mod tests {
             objects: previous.objects.clone(),
             digest_index: previous.digest_index.clone(),
             adoption: None,
+            frontier: GovernanceFrontier::Unproven,
         }));
         drop(previous);
         let mut request = Box::pin(async move {
@@ -7097,6 +7393,7 @@ mod tests {
             objects: previous.objects.clone(),
             digest_index: previous.digest_index.clone(),
             adoption: None,
+            frontier: GovernanceFrontier::Unproven,
         }));
         drop(previous);
         drop(scope);
@@ -7209,6 +7506,7 @@ mod tests {
             objects: stopped.objects.clone(),
             digest_index: stopped.digest_index.clone(),
             adoption: None,
+            frontier: GovernanceFrontier::Unproven,
         }));
         drop(stopped);
         let fresh = handle.begin_request(Uuid::new_v4()).unwrap();
@@ -7281,6 +7579,7 @@ mod tests {
             digest_index: fixture_digest_index(&objects),
             objects,
             adoption: None,
+            frontier: GovernanceFrontier::Unproven,
         }));
 
         let reader = context.reader().unwrap();
@@ -7331,6 +7630,7 @@ mod tests {
                     digest_index: fixture_digest_index(&objects),
                     objects,
                     adoption: None,
+                    frontier: GovernanceFrontier::Unproven,
                 }));
                 published.wait();
             });
@@ -7396,6 +7696,7 @@ mod tests {
             digest_index: fixture_digest_index(&objects),
             objects,
             adoption: before.adoption.clone(),
+            frontier: before.frontier,
         });
         let (locked_tx, locked_rx) = mpsc::channel();
         let (publish_tx, publish_rx) = mpsc::channel();
@@ -7840,5 +8141,627 @@ mod tests {
             second.is_current(&observation),
             Err(RootError::ForeignOwner)
         );
+    }
+}
+
+#[cfg(test)]
+mod context_load_tests {
+    use super::*;
+    use crate::memory_v1_db_rows::{
+        BindingConfirmationRow, BindingLayer, BindingRow, CandidateRows, CurrentSelection,
+        IdentityCardRow, RuleSetChangeConfirmationRow, RuleSetRow, RuleSetStatus,
+        RuleSetVersionRow, TenantRow, UserCardRow, UserCardStatus, UserRow,
+    };
+    use crate::memory_v1_rules::canonical_version_bytes;
+    use sha2::{Digest, Sha256};
+
+    fn id(value: u8) -> BinaryId {
+        [value; 16]
+    }
+
+    fn version_row(rule_set: u8, content: &[u8]) -> RuleSetVersionRow {
+        let version_bytes = vec![1u8];
+        let timestamp = vec![1u8];
+        let hash_input = canonical_version_bytes(&version_bytes, content, &timestamp);
+        RuleSetVersionRow {
+            rule_set_id: id(rule_set),
+            version_bytes,
+            content_bytes: content.to_vec(),
+            timestamp_bytes: timestamp,
+            hash_input_bytes: hash_input.clone(),
+            hash_bytes: Sha256::digest(&hash_input).to_vec(),
+        }
+    }
+
+    fn binding(binding_id: u8, card: u8, rule_set: u8, removed_at: Option<i64>) -> BindingRow {
+        BindingRow {
+            binding_id: id(binding_id),
+            user_card_id: id(card),
+            rule_set_id: id(rule_set),
+            binding_layer: BindingLayer::Base,
+            valid_from: None,
+            valid_until: None,
+            owner_scope: crate::memory_v1_rules::MemoryV1OwnerScope::SelfUser,
+            tenant_scope: crate::memory_v1_rules::MemoryV1TenantScope::SelfTenant,
+            removed_at,
+            removed_by: removed_at.map(|_| id(1)),
+        }
+    }
+
+    fn confirmation(confirmation_id: u8, binding_id: u8, rule_set: u8) -> BindingConfirmationRow {
+        BindingConfirmationRow {
+            confirmation_id: id(confirmation_id),
+            binding_id: id(binding_id),
+            rule_set_id: id(rule_set),
+            version_bytes: vec![1],
+            confirmer_user_id: id(1),
+            scope_bytes: vec![1],
+            operation_id: vec![1],
+            confirmed_at_bytes: vec![1],
+            revoked_at: None,
+            revoked_by: None,
+        }
+    }
+
+    // The served fixture: one user, one identity, one tenant, one card, one
+    // confirmed binding to a document-read rule set.
+    fn served_root() -> RootOwner {
+        let content =
+            br#"{"rules":[{"ruleId":"D1","resource":"document","action":"read","effect":"ALLOW"}]}"#;
+        let rows = CandidateRows {
+            users: vec![UserRow { user_id: id(1) }],
+            identity_cards: vec![IdentityCardRow {
+                identity_card_id: id(2),
+                user_id: id(1),
+            }],
+            tenants: vec![TenantRow {
+                tenant_id: id(3),
+                parent_tenant_id: None,
+            }],
+            user_cards: vec![UserCardRow {
+                user_card_id: id(4),
+                user_id: id(1),
+                tenant_id: id(3),
+                status: UserCardStatus::Active,
+            }],
+            rule_sets: vec![RuleSetRow {
+                rule_set_id: id(5),
+                owner_tenant_id: id(3),
+                current_version_bytes: vec![1],
+                status: RuleSetStatus::Active,
+            }],
+            rule_set_versions: vec![version_row(5, content)],
+            bindings: vec![binding(6, 4, 5, None)],
+            binding_confirmations: vec![confirmation(7, 6, 5)],
+            rule_set_change_confirmations: vec![RuleSetChangeConfirmationRow {
+                confirmation_id: id(8),
+                rule_set_id: id(5),
+                version_bytes: vec![1],
+                confirmer_user_id: id(1),
+                affected_scope_bytes: vec![1],
+                operation_id: vec![1],
+                confirmed_at_bytes: vec![1],
+                revoked_at: None,
+                revoked_by: None,
+            }],
+        };
+        let owner = install_isolated_test_root(
+            rows,
+            vec![CurrentSelection {
+                rule_set_id: id(5),
+                version_bytes: vec![1],
+            }],
+            crate::memory_v1_hamt::CandidateBudget {
+                max_table_rows: 32,
+                max_bindings_per_read: 8,
+            },
+        )
+        .expect("served root installs");
+        owner
+            .install_registry(&[crate::memory_v1_registry::RegistryDeclaration {
+                resource: "document".into(),
+                actions: vec!["read".into()],
+            }])
+            .expect("registry installs");
+        owner.adopt_serving_for_isolated_tests().expect("serves");
+        owner
+    }
+
+    // A second complete context block: another user, identity, card and a
+    // confirmed binding onto the same shared rule set.
+    fn missing_block() -> CandidateRows {
+        CandidateRows {
+            users: vec![UserRow { user_id: id(9) }],
+            identity_cards: vec![IdentityCardRow {
+                identity_card_id: id(10),
+                user_id: id(9),
+            }],
+            user_cards: vec![UserCardRow {
+                user_card_id: id(11),
+                user_id: id(9),
+                tenant_id: id(3),
+                status: UserCardStatus::Active,
+            }],
+            bindings: vec![binding(12, 11, 5, None)],
+            binding_confirmations: vec![confirmation(13, 12, 5)],
+            ..CandidateRows::default()
+        }
+    }
+
+    #[test]
+    fn context_load_keeps_unrelated_generations_and_refuses_an_old_dependency() {
+        let owner = served_root();
+        let apply = |mutation| {
+            let before = owner.handle().metadata().unwrap();
+            owner
+                .execute_mutation_with_precondition_for_isolated_tests(
+                    &mutation,
+                    &MutationPrecondition {
+                        evaluated_root_version: before.version,
+                    },
+                )
+                .unwrap()
+        };
+        // A preceding ordinary write gives the original card a nonzero generation.
+        apply(ManagementMutationV2::UserCardStatus {
+            user_card_id: id(4),
+            status: UserCardStatus::Active,
+        });
+        let reader = owner.handle().begin_request(Uuid::new_v4()).unwrap();
+        let record = DependencyRecord {
+            card_id: id(4),
+            instance_id: reader.metadata().instance_id,
+            bindings: vec![EvaluationDependency {
+                binding_id: id(6),
+                rule_set_id: id(5),
+                version_bytes: vec![1],
+            }],
+            tenant_tree_version: reader.dependency_versions().unwrap().0,
+            registry_version: reader.dependency_versions().unwrap().1,
+        };
+        let generation = reader
+            .snapshot
+            .objects
+            .card_dependency_generation(id(4))
+            .unwrap();
+        apply(ManagementMutationV2::ContextLoad {
+            rows: missing_block(),
+            selections: vec![],
+        });
+        assert_eq!(
+            owner
+                .runtime
+                .current
+                .load()
+                .objects
+                .card_dependency_generation(id(4)),
+            Some(generation)
+        );
+        assert!(reader.recheck_dependencies(&record).unwrap());
+
+        // A fresh change confirmation affects the observed rule set, not all cards.
+        let snapshot = owner.runtime.current.load_full();
+        let old_rule_generation = snapshot
+            .objects
+            .rule_set_dependency_generation(id(5))
+            .unwrap();
+        let mut confirmation = snapshot.objects.change_confirmation(id(8)).unwrap().clone();
+        confirmation.confirmation_id = id(19);
+        apply(ManagementMutationV2::ContextLoad {
+            rows: CandidateRows {
+                rule_set_change_confirmations: vec![confirmation],
+                ..CandidateRows::default()
+            },
+            selections: vec![],
+        });
+        assert_eq!(
+            owner
+                .runtime
+                .current
+                .load()
+                .objects
+                .rule_set_dependency_generation(id(5)),
+            Some(old_rule_generation + 1)
+        );
+        assert!(!reader.recheck_dependencies(&record).unwrap());
+    }
+
+    #[test]
+    fn context_load_advances_only_the_card_with_an_added_binding() {
+        let owner = served_root();
+        let reader = owner.handle().begin_request(Uuid::new_v4()).unwrap();
+        let mut change = reader
+            .snapshot
+            .objects
+            .change_confirmation(id(8))
+            .unwrap()
+            .clone();
+        change.confirmation_id = id(19);
+        change.rule_set_id = id(18);
+        let content =
+            br#"{"rules":[{"ruleId":"D2","resource":"document","action":"read","effect":"DENY"}]}"#;
+        let rows = CandidateRows {
+            rule_sets: vec![RuleSetRow {
+                rule_set_id: id(18),
+                owner_tenant_id: id(3),
+                current_version_bytes: vec![1],
+                status: RuleSetStatus::Active,
+            }],
+            rule_set_versions: vec![version_row(18, content)],
+            rule_set_change_confirmations: vec![change],
+            bindings: vec![binding(20, 4, 18, None)],
+            binding_confirmations: vec![confirmation(21, 20, 18)],
+            ..CandidateRows::default()
+        };
+        let (tenant_tree_version, registry_version) = reader.dependency_versions().unwrap();
+        let record = DependencyRecord {
+            card_id: id(4),
+            instance_id: reader.metadata().instance_id,
+            bindings: vec![],
+            tenant_tree_version,
+            registry_version,
+        };
+        assert!(reader.recheck_dependencies(&record).unwrap());
+        owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ContextLoad {
+                    rows,
+                    selections: vec![CurrentSelection {
+                        rule_set_id: id(18),
+                        version_bytes: vec![1],
+                    }],
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: reader.metadata().version,
+                },
+            )
+            .unwrap();
+        let fresh = owner.runtime.current.load_full();
+        assert_eq!(fresh.objects.card_dependency_generation(id(4)), Some(1));
+        assert_eq!(fresh.objects.rule_set_dependency_generation(id(5)), Some(0));
+        assert!(!reader.recheck_dependencies(&record).unwrap());
+        assert_eq!(
+            reader.snapshot.objects.card_dependency_generation(id(4)),
+            Some(0)
+        );
+        assert!(reader.snapshot.objects.binding(id(20)).unwrap().is_none());
+        let (rows, selections) = fresh.objects.digest_inputs();
+        assert_eq!(
+            digest_candidate(&rows, &selections).unwrap(),
+            fresh.metadata.digest
+        );
+    }
+
+    #[test]
+    fn context_load_sequences_a_tenant_tree_addition_with_the_snapshot() {
+        let owner = served_root();
+        let reader = owner.handle().begin_request(Uuid::new_v4()).unwrap();
+        owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ContextLoad {
+                    rows: CandidateRows {
+                        tenants: vec![TenantRow {
+                            tenant_id: id(18),
+                            parent_tenant_id: Some(id(3)),
+                        }],
+                        ..CandidateRows::default()
+                    },
+                    selections: vec![],
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: reader.metadata().version,
+                },
+            )
+            .unwrap();
+        let fresh = owner.handle().begin_request(Uuid::new_v4()).unwrap();
+        let (old_tree, registry_version) = reader.dependency_versions().unwrap();
+        assert_eq!(fresh.dependency_versions().unwrap().0, old_tree + 1);
+        assert!(!reader
+            .recheck_dependencies(&DependencyRecord {
+                card_id: id(4),
+                instance_id: reader.metadata().instance_id,
+                bindings: vec![],
+                tenant_tree_version: old_tree,
+                registry_version,
+            })
+            .unwrap());
+    }
+
+    #[test]
+    fn context_load_merges_a_missing_block_atomically() {
+        let owner = served_root();
+        let before = owner.handle().metadata().unwrap();
+        let merged = owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ContextLoad {
+                    rows: missing_block(),
+                    selections: Vec::new(),
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: before.version,
+                },
+            )
+            .expect("the missing block merges");
+        assert_eq!(merged.version, before.version + 1);
+        assert_ne!(merged.digest, before.digest);
+        assert_eq!(merged.row_count, before.row_count + 5);
+        let live = owner.runtime.current.load_full();
+        let (rows, selections) = live.objects.digest_inputs();
+        assert_eq!(digest_candidate(&rows, &selections).unwrap(), merged.digest);
+        live.objects.validate_binding_indexes().unwrap();
+        live.objects.validate_confirmation_indexes().unwrap();
+        // The merge is idempotent at the identity level: the same block again
+        // is refused because every row now matches a served fact.
+        let error = owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ContextLoad {
+                    rows: missing_block(),
+                    selections: Vec::new(),
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: merged.version,
+                },
+            )
+            .expect_err("a replayed block matches served facts");
+        assert!(
+            matches!(
+                &error,
+                MutationError::Runtime(RuntimeError::UnsafeMerge(reason))
+                    if reason.contains("overwrit")
+                        || reason.contains("disagree")
+                        || reason.contains("adds nothing")
+            ) || matches!(
+                &error,
+                MutationError::Candidate(crate::memory_v1_hamt::CandidateError::Rows(_))
+            )
+        );
+        assert_eq!(owner.handle().metadata().unwrap(), merged);
+    }
+
+    #[test]
+    fn context_load_never_revives_a_removal_or_overwrites_served_facts() {
+        let owner = served_root();
+        let before = owner.handle().metadata().unwrap();
+        owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::BindingRemove {
+                    binding_id: id(6),
+                    removed_at: 5,
+                    removed_by: id(1),
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: before.version,
+                },
+            )
+            .unwrap();
+        let after_removal = owner.handle().metadata().unwrap();
+        // A batch that carries the binding back as active is refused.
+        let mut rows = missing_block();
+        rows.bindings.push(binding(6, 4, 5, None));
+        let error = owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ContextLoad {
+                    rows,
+                    selections: Vec::new(),
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: after_removal.version,
+                },
+            )
+            .expect_err("a removed binding is never revived");
+        assert!(
+            matches!(
+                &error,
+                MutationError::Runtime(RuntimeError::UnsafeMerge(reason))
+                    if reason.contains("revive") || reason.contains("overwrit") || reason.contains("disagree")
+            ) || matches!(
+                &error,
+                MutationError::Candidate(crate::memory_v1_hamt::CandidateError::Rows(_))
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(owner.handle().metadata().unwrap(), after_removal);
+    }
+
+    #[test]
+    fn context_load_refuses_to_replace_a_removed_relationship_with_a_new_id() {
+        let owner = served_root();
+        let before = owner.handle().metadata().unwrap();
+        let withdrawn = owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::BindingRemove {
+                    binding_id: id(6),
+                    removed_at: 5,
+                    removed_by: id(1),
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: before.version,
+                },
+            )
+            .unwrap();
+        let rows = CandidateRows {
+            bindings: vec![binding(20, 4, 5, None)],
+            binding_confirmations: vec![confirmation(21, 20, 5)],
+            ..CandidateRows::default()
+        };
+        assert!(matches!(
+            owner.execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ContextLoad {
+                    rows,
+                    selections: vec![]
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: withdrawn.version
+                },
+            ),
+            Err(MutationError::Candidate(
+                CandidateError::InconsistentBinding
+            ))
+        ));
+        assert_eq!(owner.handle().metadata().unwrap(), withdrawn);
+    }
+
+    #[test]
+    fn context_load_refuses_an_active_rule_set_fence() {
+        let owner = served_root();
+        let before = owner.handle().metadata().unwrap();
+        let fence = owner
+            .begin_owned_modification_fence(
+                id(5),
+                &FenceDeclaration {
+                    rule_set_version: vec![1],
+                    root_version: before.version,
+                    digest: before.digest,
+                },
+            )
+            .unwrap();
+        let mutation = ManagementMutationV2::ContextLoad {
+            rows: missing_block(),
+            selections: vec![],
+        };
+        let precondition = MutationPrecondition {
+            evaluated_root_version: before.version,
+        };
+        assert!(matches!(
+            owner.execute_mutation_with_precondition_for_isolated_tests(&mutation, &precondition),
+            Err(MutationError::ModificationFenceRequired)
+        ));
+        assert_eq!(owner.handle().metadata().unwrap(), before);
+        drop(fence);
+        owner
+            .execute_mutation_with_precondition_for_isolated_tests(&mutation, &precondition)
+            .unwrap();
+    }
+
+    #[test]
+    fn context_load_rejects_oversize_before_preparing_indexes() {
+        let owner = served_root();
+        let before = owner.handle().metadata().unwrap();
+        let mut rows = missing_block();
+        rows.binding_confirmations[0].scope_bytes = vec![1; crate::memory_v1_digest::MAX_ROW_BYTES];
+        assert!(matches!(
+            owner.execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ContextLoad {
+                    rows,
+                    selections: vec![]
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: before.version
+                },
+            ),
+            Err(MutationError::Runtime(RuntimeError::Digest(
+                crate::memory_v1_digest::DigestError::LimitExceeded
+            )))
+        ));
+        assert_eq!(owner.handle().metadata().unwrap(), before);
+    }
+
+    #[test]
+    fn context_load_refuses_an_unclosable_reference_and_stale_cas() {
+        let owner = served_root();
+        let before = owner.handle().metadata().unwrap();
+        // A binding naming an unknown card and an unknown rule set.
+        let rows = CandidateRows {
+            bindings: vec![binding(20, 30, 40, None)],
+            ..CandidateRows::default()
+        };
+        let error = owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ContextLoad {
+                    rows,
+                    selections: Vec::new(),
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: before.version,
+                },
+            )
+            .expect_err("an unclosable reference fails closed");
+        assert!(matches!(
+            error,
+            MutationError::Candidate(CandidateError::UnknownId { table: crate::memory_v1_db_rows::Table::UserCard, id: missing }) if missing == id(30)
+        ));
+        assert_eq!(owner.handle().metadata().unwrap(), before);
+        // A stale precondition loses the CAS race even when the batch is fine:
+        // first advance the root with a real load, then replay the pre-load
+        // version as the precondition.
+        let advanced = owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ContextLoad {
+                    rows: missing_block(),
+                    selections: Vec::new(),
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: before.version,
+                },
+            )
+            .expect("the advancing load merges");
+        let error = owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ContextLoad {
+                    rows: missing_block(),
+                    selections: Vec::new(),
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: before.version,
+                },
+            )
+            .expect_err("a stale precondition loses the CAS");
+        assert!(matches!(error, MutationError::ConcurrentModification));
+        assert_eq!(owner.handle().metadata().unwrap().version, advanced.version);
+    }
+
+    #[test]
+    fn context_load_respects_the_row_budget_fail_closed() {
+        let owner = served_root();
+        let before = owner.handle().metadata().unwrap();
+        // Fill the root until a load hits the row budget; every refusal is
+        // fail-closed and leaves the root untouched.
+        let mut version = before.version;
+        let mut next_card = 20_u8;
+        while next_card < 40 {
+            let rows = CandidateRows {
+                users: vec![UserRow {
+                    user_id: [next_card; 16],
+                }],
+                identity_cards: vec![IdentityCardRow {
+                    identity_card_id: [next_card + 40; 16],
+                    user_id: [next_card; 16],
+                }],
+                user_cards: vec![UserCardRow {
+                    user_card_id: [next_card + 80; 16],
+                    user_id: [next_card; 16],
+                    tenant_id: id(3),
+                    status: UserCardStatus::Active,
+                }],
+                ..CandidateRows::default()
+            };
+            match owner.execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ContextLoad {
+                    rows,
+                    selections: Vec::new(),
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: version,
+                },
+            ) {
+                Ok(metadata) => version = metadata.version,
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error,
+                            MutationError::Runtime(RuntimeError::Digest(_))
+                                | MutationError::Candidate(
+                                    crate::memory_v1_hamt::CandidateError::RowBudgetExceeded { .. }
+                                )
+                        ),
+                        "unexpected error: {error:?}"
+                    );
+                    assert_eq!(owner.handle().metadata().unwrap().version, version);
+                    return;
+                }
+            }
+            next_card += 1;
+        }
+        panic!("the fixture never reached a capacity boundary");
     }
 }

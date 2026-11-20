@@ -10,8 +10,10 @@
 //! drops the database. It never touches any other database and refuses to start
 //! unless the server address is loopback (an SSH tunnel, never a public address).
 //!
-//! No credential, address or connection string is stored in this repository: the
-//! server comes from `ASTRAL_MEMORY_V1_E2E_ADMIN_URL` at run time.
+//! Part C is the explicitly approved paper evidence lane. It uses a dedicated
+//! pre-provisioned schema; it never runs Part B's administrative DDL.
+//!
+//! Database URLs come from the operator's environment at run time.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -26,7 +28,7 @@ use astral_types::memory_v1::MemoryId;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
-use sqlx::{MySqlPool, Row};
+use sqlx::{MySqlConnection, MySqlPool, Row};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -50,6 +52,9 @@ const RULES_DENY: [u8; 16] = [0x42; 16];
 /// nor written; the end-to-end run proves their table lists did not change.
 const PROTECTED_DATABASES: [&str; 2] = ["astral_light_rust", "platform_v4"];
 const RUN_DATABASE_PREFIX: &str = "astral_rehearsal_mv1_";
+
+#[path = "memory_v1_service_process/paper_mysql.rs"]
+mod paper_mysql;
 
 // ───────────────────────────── shared helpers ─────────────────────────────
 
@@ -559,8 +564,12 @@ fn version_row(rule_set_id: [u8; 16], content: &[u8]) -> RuleSetVersionRow {
 
 // memory—v1: Seed the fixture: two users with dual cards in one tenant, shared rule sets,
 // every binding confirmed. Mirrors the in-process full-path fixture row for row.
-async fn seed_fixture(pool: &MySqlPool) -> usize {
-    let read = br#"{"rules":[{"ruleId":"R5","resource":"permission_rule","action":"read","effect":"ALLOW"}]}"#;
+async fn seed_fixture(conn: &mut MySqlConnection, governance: bool) -> Result<usize, sqlx::Error> {
+    let read: &[u8] = if governance {
+        br#"{"rules":[{"ruleId":"R5","resource":"permission_rule","action":"read","effect":"ALLOW"},{"ruleId":"G1","resource":"user_card","action":"create","effect":"ALLOW"},{"ruleId":"G2","resource":"binding","action":"remove","effect":"ALLOW"}]}"#
+    } else {
+        br#"{"rules":[{"ruleId":"R5","resource":"permission_rule","action":"read","effect":"ALLOW"}]}"#
+    };
     let deny = br#"{"rules":[{"ruleId":"R6","resource":"permission_rule","action":"read","effect":"DENY"}]}"#;
     let mut rows = 0;
     let mut run = |sql: &'static str| {
@@ -570,23 +579,20 @@ async fn seed_fixture(pool: &MySqlPool) -> usize {
     for user in [ALICE, BOB] {
         run("INSERT INTO memory_user (user_id) VALUES (?)")
             .bind(user.to_vec())
-            .execute(pool)
-            .await
-            .unwrap();
+            .execute(&mut *conn)
+            .await?;
     }
     for (card, user) in [([0x12; 16], ALICE), ([0x22; 16], BOB)] {
         run("INSERT INTO memory_identity_card (identity_card_id, user_id) VALUES (?, ?)")
             .bind(card.to_vec())
             .bind(user.to_vec())
-            .execute(pool)
-            .await
-            .unwrap();
+            .execute(&mut *conn)
+            .await?;
     }
     run("INSERT INTO memory_tenant (tenant_id, parent_tenant_id) VALUES (?, NULL)")
         .bind(TENANT.to_vec())
-        .execute(pool)
-        .await
-        .unwrap();
+        .execute(&mut *conn)
+        .await?;
     for (card, user) in [
         (CARD_ALLOW, ALICE),
         (CARD_OVERLAY_DENY, ALICE),
@@ -597,9 +603,8 @@ async fn seed_fixture(pool: &MySqlPool) -> usize {
             .bind(card.to_vec())
             .bind(user.to_vec())
             .bind(TENANT.to_vec())
-            .execute(pool)
-            .await
-            .unwrap();
+            .execute(&mut *conn)
+            .await?;
     }
     for rule_set in [RULES_READ, RULES_DENY] {
         run(
@@ -609,11 +614,10 @@ async fn seed_fixture(pool: &MySqlPool) -> usize {
         .bind(rule_set.to_vec())
         .bind(TENANT.to_vec())
         .bind(vec![1_u8])
-        .execute(pool)
-        .await
-        .unwrap();
+        .execute(&mut *conn)
+        .await?;
     }
-    for (rule_set, content) in [(RULES_READ, &read[..]), (RULES_DENY, &deny[..])] {
+    for (rule_set, content) in [(RULES_READ, read), (RULES_DENY, deny.as_slice())] {
         let row = version_row(rule_set, content);
         run("INSERT INTO memory_rule_set_version \
              (rule_set_id, version_bytes, content_bytes, timestamp_bytes, hash_input_bytes, hash_bytes) \
@@ -624,9 +628,8 @@ async fn seed_fixture(pool: &MySqlPool) -> usize {
             .bind(row.timestamp_bytes)
             .bind(row.hash_input_bytes)
             .bind(row.hash_bytes)
-            .execute(pool)
-            .await
-            .unwrap();
+            .execute(&mut *conn)
+            .await?;
     }
     for (index, rule_set) in [RULES_READ, RULES_DENY].into_iter().enumerate() {
         run(
@@ -641,9 +644,8 @@ async fn seed_fixture(pool: &MySqlPool) -> usize {
         .bind(vec![1_u8])
         .bind(vec![1_u8])
         .bind(vec![1_u8])
-        .execute(pool)
-        .await
-        .unwrap();
+        .execute(&mut *conn)
+        .await?;
     }
     let bindings = [
         ([0x51; 16], CARD_ALLOW, RULES_READ, "BASE"),
@@ -658,9 +660,8 @@ async fn seed_fixture(pool: &MySqlPool) -> usize {
         .bind(card.to_vec())
         .bind(rule_set.to_vec())
         .bind(layer)
-        .execute(pool)
-        .await
-        .unwrap();
+        .execute(&mut *conn)
+        .await?;
     }
     for (binding, _, rule_set, _) in bindings {
         run("INSERT INTO memory_binding_confirmation \
@@ -674,11 +675,10 @@ async fn seed_fixture(pool: &MySqlPool) -> usize {
         .bind(vec![1_u8])
         .bind(vec![1_u8])
         .bind(vec![1_u8])
-        .execute(pool)
-        .await
-        .unwrap();
+        .execute(&mut *conn)
+        .await?;
     }
-    rows
+    Ok(rows)
 }
 
 // memory—v1: One HTTP reply.
@@ -972,7 +972,12 @@ async fn real_service_end_to_end_against_a_run_scoped_database() {
                 .await
                 .unwrap_or_else(|error| panic!("apply candidate DDL: {error}\n{statement}"));
         }
-        let rows = seed_fixture(&pool).await;
+        let rows = {
+            let mut connection = pool.acquire().await.expect("acquire fixture connection");
+            seed_fixture(&mut connection, false)
+                .await
+                .expect("seed the E2E fixture")
+        };
         pool.close().await;
 
         let dir = TempDir::new("e2e");

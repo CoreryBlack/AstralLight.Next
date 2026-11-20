@@ -117,6 +117,11 @@ pub(crate) struct RegistryReadGuard<'a> {
 }
 
 impl RegistryReadGuard<'_> {
+    // memory—v1: The exact registry version held stable by this guard.
+    pub(crate) fn version(&self) -> u64 {
+        self.inner.version
+    }
+
     // memory—v1 §4.9: every entry must refer to an active registered pair.
     pub(crate) fn validate_rules(
         &self,
@@ -292,6 +297,18 @@ impl RegistryState {
     // memory—v1: Keep the active registry stable while a root snapshot is published.
     pub(crate) fn read_for_publication(&self) -> Result<RegistryReadGuard<'_>, RegistryError> {
         let inner = self.inner.read().map_err(|_| RegistryError::NotInstalled)?;
+        if !inner.is_available() {
+            return Err(RegistryError::NotInstalled);
+        }
+        Ok(RegistryReadGuard { inner })
+    }
+
+    // memory—v1: Do not wait for a registry writer while holding the root writer.
+    pub(crate) fn try_read_for_publication(&self) -> Result<RegistryReadGuard<'_>, RegistryError> {
+        let inner = self
+            .inner
+            .try_read()
+            .map_err(|_| RegistryError::NotInstalled)?;
         if !inner.is_available() {
             return Err(RegistryError::NotInstalled);
         }

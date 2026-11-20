@@ -8,6 +8,9 @@
 use std::collections::HashMap as TransientHashMap;
 use std::sync::Arc;
 
+mod context_load;
+pub(crate) use context_load::{ContextDelta, ContextLoadError};
+
 use im::{HashMap, HashSet};
 
 use crate::memory_v1_confirmation_index::ChangeConfirmationIndex;
@@ -156,6 +159,7 @@ pub struct HamtCandidate {
     // Monotonic generations travel with each immutable candidate snapshot.
     card_dependencies: HashMap<BinaryId, u64>,
     rule_set_dependencies: HashMap<BinaryId, u64>,
+    tenant_tree_version: u64,
 }
 
 // A retirement proof is deliberately confined to this child module. The root
@@ -284,11 +288,9 @@ mod retirement {
 
 pub(crate) use retirement::PublishableRetirement;
 
-// memory—v1: Insert an ID in a persistent relationship index.
+// memory—v1: Update the private bucket through the persistent map's copy-on-write path.
 fn index(index: &mut HashMap<BinaryId, HashSet<BinaryId>>, key: BinaryId, value: BinaryId) {
-    let mut values = index.get(&key).cloned().unwrap_or_default();
-    values.insert(value);
-    index.insert(key, values);
+    index.entry(key).or_default().insert(value);
 }
 
 // memory—v1: Count an index without allocating a reconstructed copy. Empty
@@ -377,6 +379,7 @@ impl HamtCandidate {
             selections: HashMap::new(),
             card_dependencies: HashMap::new(),
             rule_set_dependencies: HashMap::new(),
+            tenant_tree_version: 0,
         };
         for row in rows.users {
             candidate.users.insert(row.user_id, Arc::new(row));
@@ -936,8 +939,17 @@ impl HamtCandidate {
         Ok(())
     }
 
-    // memory—v1: Reconstruct digest inputs for tests and test-support diagnostics.
-    // This does not establish provenance or turn rows into authorization evidence.
+    // memory—v1: The tenant-tree generation travels with the immutable graph.
+    pub(crate) fn tenant_tree_version(&self) -> u64 {
+        self.tenant_tree_version
+    }
+
+    #[cfg(test)]
+    // memory—v1: Inject exhaustion into one synthetic immutable snapshot.
+    pub(crate) fn exhaust_tenant_tree_for_test(&mut self) {
+        self.tenant_tree_version = u64::MAX;
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn digest_inputs(&self) -> (CandidateRows, Vec<CurrentSelection>) {
         let rows = CandidateRows {
@@ -1673,6 +1685,16 @@ impl HamtCandidate {
     /// Enforces the §4.5 double-bind prohibition and one-OVERLAY-per-card
     /// constraint for nonremoved bindings, including those on disabled cards.
     pub fn with_binding_insert(&self, row: BindingRow) -> Result<Self, CandidateError> {
+        let row_count = self.rows_after_insert()?;
+        let mut next = self.clone();
+        next.advance_card_dependency(row.user_card_id)?;
+        next.insert_context_binding(row)?;
+        next.row_count = row_count;
+        Ok(next)
+    }
+
+    // memory—v1: Insert a checked binding on a private candidate.
+    fn insert_context_binding(&mut self, row: BindingRow) -> Result<(), CandidateError> {
         if self.bindings.contains_key(&row.binding_id) {
             return Err(CandidateError::Rows(ValidationError::DuplicateId {
                 table: Table::Binding,
@@ -1715,13 +1737,6 @@ impl HamtCandidate {
         if card.tenant_id != rule_set.owner_tenant_id || rule_set.status != RuleSetStatus::Active {
             return Err(CandidateError::InconsistentBinding);
         }
-        let row_count = self
-            .row_count
-            .checked_add(1)
-            .filter(|count| *count <= self.budget.max_table_rows)
-            .ok_or(CandidateError::RowBudgetExceeded {
-                max: self.budget.max_table_rows,
-            })?;
         // A disabled card still reserves its nonremoved binding slots; enabling
         // it later must not uncover conflicts. Confirmation revocation also does
         // not remove a binding. Complete tombstones alone release the slots.
@@ -1760,29 +1775,26 @@ impl HamtCandidate {
                 });
             }
         }
-        let mut next = self.clone();
-        next.advance_card_dependency(row.user_card_id)?;
-        next.row_count = row_count;
-        next.bindings.insert(row.binding_id, Arc::new(row.clone()));
-        next.binding_confirmation_states
+        self.bindings.insert(row.binding_id, Arc::new(row.clone()));
+        self.binding_confirmation_states
             .insert(row.binding_id, BindingConfirmationState::Invalid);
-        index(&mut next.bindings_by_card, row.user_card_id, row.binding_id);
+        index(&mut self.bindings_by_card, row.user_card_id, row.binding_id);
         index(
-            &mut next.unremoved_bindings_by_card,
+            &mut self.unremoved_bindings_by_card,
             row.user_card_id,
             row.binding_id,
         );
         index(
-            &mut next.bindings_by_rule_set,
+            &mut self.bindings_by_rule_set,
             row.rule_set_id,
             row.binding_id,
         );
         index(
-            &mut next.unremoved_bindings_by_rule_set,
+            &mut self.unremoved_bindings_by_rule_set,
             row.rule_set_id,
             row.binding_id,
         );
-        Ok(next)
+        Ok(())
     }
 
     /// memory—v1 §4.12 B-2.2: Mark a binding as removed (REMOVE verb).
@@ -1896,6 +1908,21 @@ impl HamtCandidate {
         &self,
         row: BindingConfirmationRow,
     ) -> Result<Self, CandidateError> {
+        let row_count = self.rows_after_insert()?;
+        let binding_id = row.binding_id;
+        let mut next = self.clone();
+        let card = next.insert_context_confirmation(row)?;
+        next.advance_card_dependency(card)?;
+        next.row_count = row_count;
+        next.refresh_binding_confirmation_state(binding_id)?;
+        Ok(next)
+    }
+
+    // memory—v1: Insert a checked confirmation on a private candidate.
+    fn insert_context_confirmation(
+        &mut self,
+        row: BindingConfirmationRow,
+    ) -> Result<BinaryId, CandidateError> {
         require_tombstone_pair(
             Table::BindingConfirmation,
             row.confirmation_id,
@@ -1972,25 +1999,15 @@ impl HamtCandidate {
             }));
         }
         self.require_no_active_binding_confirmation(row.binding_id)?;
-        let row_count = self
-            .row_count
-            .checked_add(1)
-            .filter(|count| *count <= self.budget.max_table_rows)
-            .ok_or(CandidateError::RowBudgetExceeded {
-                max: self.budget.max_table_rows,
-            })?;
-        let mut next = self.clone();
-        next.advance_card_dependency(binding.user_card_id)?;
-        next.row_count = row_count;
-        next.confirmations
+        let card = binding.user_card_id;
+        self.confirmations
             .insert(row.confirmation_id, Arc::new(row.clone()));
         index(
-            &mut next.confirmations_by_binding,
+            &mut self.confirmations_by_binding,
             row.binding_id,
             row.confirmation_id,
         );
-        next.refresh_binding_confirmation_state(row.binding_id)?;
-        Ok(next)
+        Ok(card)
     }
 
     /// memory—v1 §4.12 B-2.4: Mark a confirmation as revoked (REVOKE verb).
@@ -2071,6 +2088,20 @@ impl HamtCandidate {
         &self,
         row: RuleSetChangeConfirmationRow,
     ) -> Result<Self, CandidateError> {
+        let row_count = self.rows_after_insert()?;
+        let rule_set = row.rule_set_id;
+        let mut next = self.clone();
+        next.insert_context_change_confirmation(row)?;
+        next.advance_rule_set_dependency(rule_set)?;
+        next.row_count = row_count;
+        Ok(next)
+    }
+
+    // memory—v1: Insert a checked change confirmation on a private candidate.
+    fn insert_context_change_confirmation(
+        &mut self,
+        row: RuleSetChangeConfirmationRow,
+    ) -> Result<(), CandidateError> {
         require_tombstone_pair(
             Table::RuleSetChangeConfirmation,
             row.confirmation_id,
@@ -2129,27 +2160,17 @@ impl HamtCandidate {
                 },
             ));
         }
-        let row_count = self
-            .row_count
-            .checked_add(1)
-            .filter(|count| *count <= self.budget.max_table_rows)
-            .ok_or(CandidateError::RowBudgetExceeded {
-                max: self.budget.max_table_rows,
-            })?;
-        let mut next = self.clone();
-        next.advance_rule_set_dependency(row.rule_set_id)?;
-        next.row_count = row_count;
-        next.change_confirmation_index
+        self.change_confirmation_index
             .insert(&row)
             .map_err(|_| CandidateError::InconsistentBinding)?;
-        next.change_confirmations
+        self.change_confirmations
             .insert(row.confirmation_id, Arc::new(row.clone()));
         index(
-            &mut next.changes_by_rule_set,
+            &mut self.changes_by_rule_set,
             row.rule_set_id,
             row.confirmation_id,
         );
-        Ok(next)
+        Ok(())
     }
 
     /// memory—v1 §4.11 N-10: Insert a BATCH of binding confirmations atomically.
@@ -2573,6 +2594,16 @@ impl HamtCandidate {
                 id,
             }),
         }
+    }
+
+    // memory—v1: Count a candidate writer's single new row before publication.
+    fn rows_after_insert(&self) -> Result<usize, CandidateError> {
+        self.row_count
+            .checked_add(1)
+            .filter(|count| *count <= self.budget.max_table_rows)
+            .ok_or(CandidateError::RowBudgetExceeded {
+                max: self.budget.max_table_rows,
+            })
     }
 
     // memory—v1: Require a tenant from the supplied candidate.

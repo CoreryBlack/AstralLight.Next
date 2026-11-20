@@ -26,11 +26,13 @@ use std::sync::Arc;
 
 use astral_authorization_root::memory_v1_adoption::ColdLoadFacts;
 use astral_authorization_root::memory_v1_root::{
-    ManagementMutationV2, MutationPrecondition, ProductionAdmission, RootOwner, RootStatus,
+    GovernanceFrontier, GovernancePrefix, ManagementMutationV2, MutationPrecondition,
+    ProductionAdmission, RootOwner, RootStatus,
 };
 use astral_trustgraph::service::memory_v1_mutation_coordinator::{
     decode_deny_journal_payload, decode_journal_payload, MutationAuditCandidate,
 };
+use astral_types::memory_v1_journal::{JournalAnchor, RecordKind};
 use thiserror::Error;
 
 use crate::memory_v1_durable_journal::MemoryV1DurableJournal;
@@ -75,67 +77,86 @@ impl std::fmt::Debug for RecoveredRoot {
 
 /// Replay every journaled mutation onto the candidate and adopt the result.
 ///
-/// `owner` holds the Candidate root installed from the captured MySQL rows.
-/// The journal mutation sequence must continue from the candidate's root
-/// version: record N carries the mutation that advances the root to version
-/// `base + N`, so a gap or a conflicting candidate is refused outright.
+/// `owner` holds the pristine Candidate from the cold capture. Replay follows
+/// the verified governance sequence, not the old process's snapshot versions.
+/// A context load is not replay input: any required fact must already exist in
+/// the capture or be established by an earlier governance record.
 pub fn recover_root(
     owner: RootOwner,
     journal: &MemoryV1DurableJournal,
     facts: &ColdLoadFacts,
     sealed_input: &astral_authorization_root::memory_v1_adoption::ProductionEvidenceInput,
 ) -> Result<RecoveredRoot, RecoveryError> {
+    let initial = owner
+        .handle()
+        .metadata()
+        .map_err(|_| RecoveryError::ReplayUnknown)?;
+    if initial.status != RootStatus::Candidate
+        || initial.version != 0
+        || owner.candidate_governance_frontier() != Ok(GovernanceFrontier::Baseline)
+    {
+        return Err(RecoveryError::ReplayConflict);
+    }
     let mut replayed_mutations = 0_u64;
     let mut observed_denies = 0_u64;
-    // The mutation sequence the replay expects next: each journaled Mutation
-    // record carries its own new sequence starting at 1, so recovery expects
-    // 1, 2, ... in append order regardless of how many the journal holds.
-    let mut expected_mutation_sequence = 0_u64;
 
     for record in journal.recovery_records() {
         match record.kind {
-            astral_types::memory_v1_journal::RecordKind::Mutation => {
-                // The record's mutation sequence must continue the observed
-                // baseline; a gap means the candidate does not correspond to
-                // this journal.
-                expected_mutation_sequence = expected_mutation_sequence
+            RecordKind::Mutation => {
+                let expected = replayed_mutations
                     .checked_add(1)
                     .ok_or(RecoveryError::SequenceGap)?;
-                if record.mutation_sequence != expected_mutation_sequence {
+                if record.mutation_sequence != expected {
                     return Err(RecoveryError::SequenceGap);
                 }
+                let anchor = JournalAnchor::new(
+                    journal.stream_id(),
+                    record.journal_sequence,
+                    expected,
+                    record.frame_hash,
+                )
+                .map_err(|_| RecoveryError::ReplayConflict)?;
+                let prefix = GovernancePrefix::new(anchor, journal.epoch_id())
+                    .ok_or(RecoveryError::ReplayConflict)?;
+                let decoded = decode_journal_payload(&record.payload)
+                    .map_err(|_| RecoveryError::ReplayConflict)?;
+                let mutation: &ManagementMutationV2 = decoded.mutation();
                 let metadata = owner
                     .handle()
                     .metadata()
                     .map_err(|_| RecoveryError::ReplayUnknown)?;
-                if metadata.status != RootStatus::Candidate {
-                    return Err(RecoveryError::ReplayConflict);
-                }
-                // The journal's mutation sequence and the candidate root's
-                // version advance together: record N (mutation sequence N)
-                // applies to root version N-1. A candidate that has already
-                // advanced past the record is a double-apply conflict.
-                if metadata.version != record.mutation_sequence - 1 {
-                    return Err(RecoveryError::ReplayConflict);
-                }
-                let decoded = decode_journal_payload(&record.payload)
-                    .map_err(|_| RecoveryError::ReplayConflict)?;
-                let mutation: ManagementMutationV2 = decoded.mutation().clone();
-                let precondition = MutationPrecondition {
-                    evaluated_root_version: metadata.version,
-                };
                 owner
-                    .execute_recovery_mutation(&mutation, &precondition)
+                    .execute_recovery_mutation_with_prefix(
+                        mutation,
+                        &MutationPrecondition {
+                            evaluated_root_version: metadata.version,
+                        },
+                        prefix,
+                    )
                     .map_err(|_| RecoveryError::ReplayConflict)?;
-                replayed_mutations += 1;
+                replayed_mutations = expected;
             }
-            astral_types::memory_v1_journal::RecordKind::Deny => {
-                // The deny value must decode; anything else is corruption.
+            RecordKind::Deny => {
                 decode_deny_journal_payload(&record.payload)
                     .map_err(|_| RecoveryError::InvalidDenyRecord)?;
                 observed_denies += 1;
             }
         }
+    }
+    let boundary = journal.last_mutation();
+    let expected_frontier = if replayed_mutations == 0 {
+        GovernanceFrontier::Baseline
+    } else {
+        GovernanceFrontier::Published(
+            GovernancePrefix::new(boundary, journal.epoch_id())
+                .ok_or(RecoveryError::ReplayConflict)?,
+        )
+    };
+    if replayed_mutations != boundary.mutation_sequence()
+        || journal.position().mutation_sequence() != boundary.mutation_sequence()
+        || owner.candidate_governance_frontier() != Ok(expected_frontier)
+    {
+        return Err(RecoveryError::SequenceGap);
     }
     let input = sealed_input;
     let (metadata, admission) = owner

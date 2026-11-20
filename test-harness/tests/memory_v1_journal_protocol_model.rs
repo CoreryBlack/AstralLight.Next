@@ -94,7 +94,7 @@
 //!   truncated to `r`, so `n = w = r`. `Process` keeps `S` (the page cache survives). `PowerLoss`
 //!   sets `S := r`. Volatile fields are cleared, and `d := b`, `bc := b`, `unsure := false`.
 //! * `Recover`: `live := R(r)` (or the incremental fold from `db` under the incremental apply
-//!   variants). `d` is set by the open variant: `MarkDurable` (`d := r`), `SyncOnOpen`
+//!   variants). `d` is set by the open variant: `MarkDurable` (`d := r`), `SyncAtOpen`
 //!   (`d := S := r`) or `FromCheckpoint` (`d := b`). `bc := b`, because the checkpoint is read
 //!   back. Statuses are rebuilt for the retained log; pending, round, taint and `unsure` are
 //!   cleared.
@@ -111,7 +111,7 @@
 //!   commits can be uncertain and the belief is not reconciled (`NoReadBack`).
 //! * I3 (S-form, physical): every acked `k < S`, and an acked governance frame is `Published`.
 //! * I3d (d-form, serving states only): every acked `k < d`. This is the paper's `eq:success` and
-//!   `eq:deny` guard in 0-based form. `SyncOnOpen` satisfies it over the whole target graph.
+//!   `eq:deny` guard in 0-based form. `SyncAtOpen` satisfies it over the whole target graph.
 //!   `FromCheckpoint` refutes it at recovery (depth 7). `MarkDurable`, the implemented open, also
 //!   refutes it, at depth 7 after a second process crash that truncates an acked but unsynced frame
 //!   (`witness_current_open_without_sync_loses_an_acked_frame_on_a_second_crash`). The d-form
@@ -306,7 +306,7 @@ enum Open {
     /// The confirmed end is set to the scanned end with no sync (implemented).
     MarkDurable,
     /// A sync at open makes the scanned prefix stable.
-    SyncOnOpen,
+    SyncAtOpenMoment,
     /// The claim restarts at the database checkpoint.
     FromCheckpoint,
 }
@@ -909,10 +909,10 @@ fn recover(st: &St, cfg: &Config) -> St {
         }
     };
     next.d = match cfg.open {
-        Open::MarkDurable | Open::SyncOnOpen => r,
+        Open::MarkDurable | Open::SyncAtOpenMoment => r,
         Open::FromCheckpoint => st.b,
     };
-    if cfg.open == Open::SyncOnOpen {
+    if cfg.open == Open::SyncAtOpenMoment {
         next.s = r;
     }
     next.w = r;
@@ -1461,7 +1461,7 @@ fn replayable_failed_record(st: &St) -> bool {
 // memory—v1: Configuration of the target with sync-on-open, explored once and cached for all target and witness tests.
 fn target_sync_on_open() -> &'static Run {
     static RUN: OnceLock<Run> = OnceLock::new();
-    RUN.get_or_init(|| explore(Config::target(Open::SyncOnOpen), 0))
+    RUN.get_or_init(|| explore(Config::target(Open::SyncAtOpenMoment), 0))
 }
 
 // memory—v1: The target with recovery from the database checkpoint, explored once and cached.
@@ -1564,7 +1564,7 @@ fn split(abort: bool, ordered: bool) -> Config {
     Config {
         publish: Publish::Split { abort, ordered },
         publish_gate: PublishGate::Any,
-        ..Config::target(Open::SyncOnOpen)
+        ..Config::target(Open::SyncAtOpenMoment)
     }
 }
 
@@ -1790,7 +1790,7 @@ fn candidate_published_only_apply_with_resolved_gate_is_refuted() {
 fn fault_capture_at_completion_puts_the_claim_beyond_the_stable_prefix() {
     let cfg = Config {
         capture: Capture::AtCompletion,
-        ..Config::target(Open::SyncOnOpen)
+        ..Config::target(Open::SyncAtOpenMoment)
     };
     let found = stopping_violation(cfg, ALL);
     expect_violation(
@@ -1895,7 +1895,7 @@ fn fault_power_loss_only_mark_durable_is_not_refuted() {
 fn witness_current_deny_binding_uses_the_registration_tail() {
     let cfg = Config {
         deny: DenyBinding::AuditTail,
-        ..Config::target(Open::SyncOnOpen)
+        ..Config::target(Open::SyncAtOpenMoment)
     };
     let found = stopping_violation(cfg, ALL);
     expect_violation(
@@ -1911,7 +1911,7 @@ fn witness_current_deny_binding_uses_the_registration_tail() {
 fn fault_retry_after_uncertain_round_advances_the_claim() {
     let cfg = Config {
         sync_retry: SyncRetry::Advances,
-        ..Config::target(Open::SyncOnOpen)
+        ..Config::target(Open::SyncAtOpenMoment)
     };
     let found = stopping_violation(cfg, ALL);
     expect_violation(
@@ -1927,7 +1927,7 @@ fn fault_retry_after_uncertain_round_advances_the_claim() {
 fn fault_database_gate_on_written_frames_lets_b_outrun_d() {
     let cfg = Config {
         db_gate: DbGate::Written,
-        ..Config::target(Open::SyncOnOpen)
+        ..Config::target(Open::SyncAtOpenMoment)
     };
     let found = stopping_violation(cfg, ALL);
     expect_violation(
@@ -1943,7 +1943,7 @@ fn fault_database_gate_on_written_frames_lets_b_outrun_d() {
 fn fault_response_gate_on_written_frames_acks_an_unstable_frame() {
     let cfg = Config {
         ack_gate: Gate::Written,
-        ..Config::target(Open::SyncOnOpen)
+        ..Config::target(Open::SyncAtOpenMoment)
     };
     let found = stopping_violation(cfg, ALL);
     expect_violation(
@@ -1959,7 +1959,7 @@ fn fault_response_gate_on_written_frames_acks_an_unstable_frame() {
 fn fault_commit_without_read_back_breaks_the_database_claim() {
     let cfg = Config {
         db_commit: DbCommit::NoReadBack,
-        ..Config::target(Open::SyncOnOpen)
+        ..Config::target(Open::SyncAtOpenMoment)
     };
     let found = stopping_violation(cfg, ALL);
     expect_violation(
@@ -1973,7 +1973,7 @@ fn fault_commit_without_read_back_breaks_the_database_claim() {
 // memory—v1: Two DENY observations are pending at distinct observed prefixes at once (depth 4), so one flush can confirm frames that were observed at different prefixes. Witness for the multiset of pending observations.
 #[test]
 fn witness_two_distinct_observations_can_be_pending_together() {
-    let (depth, trace) = goal_trace(Config::target(Open::SyncOnOpen), two_distinct_pending);
+    let (depth, trace) = goal_trace(Config::target(Open::SyncAtOpenMoment), two_distinct_pending);
     assert_eq!(
         depth, 4,
         "shortest depth with two distinct pending prefixes"
@@ -2190,7 +2190,7 @@ fn restricted_original_bounds_encoding_is_pinned() {
 fn larger_publish_first_target_bounds() {
     let cfg = Config {
         crash_budget: 3,
-        ..Config::target(Open::SyncOnOpen)
+        ..Config::target(Open::SyncAtOpenMoment)
     };
     let run = explore(cfg, 0);
     println!(

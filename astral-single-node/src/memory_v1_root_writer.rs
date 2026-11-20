@@ -7,29 +7,20 @@
 //! adoption gate once, and every later commit re-checks the exact observation
 //! before building any candidate.
 //!
-//! Two controlled entry points exist:
-//!
-//! * [`RootMutationWriter::publish`] executes an ordinary governed mutation
-//!   under the root writer lock with the CAS precondition fixed to the
-//!   observed version, and returns the published metadata.
-//! * [`RootMutationWriter::verified_admission`] re-derives the crate-private
-//!   coordinator admission for one exact observation, refusing any stale or
-//!   foreign observation before the durable commit owner binds its request.
-//!
-//! Card disable is intentionally absent here: a serving card disable must be
-//! coordinated with the session authority (revocation generation), which is a
-//! separate controlled path owned by the session authority. Returning an error
-//! keeps the low-level refuse-unknowns contract.
+//! The durable owner prepares an exact successor before appending its record.
+//! The root-owned reservation remains held until the same successor publishes.
+//! Card disable coordinates publication with the bound session authority.
 
 use std::sync::Arc;
 
 use astral_authorization_root::memory_v1_root::{
-    ManagementMutationV2, MutationPrecondition, ProductionAdmission, RootError, RootMetadata,
-    RootOwner, RootStatus,
+    GovernanceFrontier, ManagementMutationV2, PreparedGovernedMutation, ProductionAdmission,
+    RootError, RootMetadata, RootOwner, RootStatus,
 };
 use astral_trustgraph::service::memory_v1_mutation_coordinator::{
     RootBinding, VerifiedRootAdmission,
 };
+#[cfg(test)]
 use astral_types::memory_v1::MemoryId;
 use thiserror::Error;
 
@@ -53,7 +44,6 @@ pub enum RootMutationWriterError {
 /// The only serving-root mutation authority in the unified path.
 pub struct RootMutationWriter {
     root: Arc<RootOwner>,
-    executor: astral_authorization_root::memory_v1_root::RootMutationExecutor,
     admission: Arc<ProductionAdmission>,
     session_authority: Option<
         Arc<astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthority>,
@@ -85,10 +75,8 @@ impl RootMutationWriter {
         if metadata.status != RootStatus::Serving {
             return Err(RootMutationWriterError::NotServing);
         }
-        let executor = root.mutation_executor();
         Ok(Self {
             root,
-            executor,
             admission,
             session_authority: None,
         })
@@ -132,49 +120,45 @@ impl RootMutationWriter {
         ))
     }
 
-    /// Publish one governed mutation against the observed root version.
-    ///
-    /// The precondition is fixed to the caller's observation so the CAS gate
-    /// refuses a stale commit; the root writer lock serializes the candidate
-    /// construction and the atomic publication. A card disable is refused
-    /// because it requires the session-coordinated path.
-    pub fn publish(
+    /// memory—v1: Resolve a live DENY observation; stale or foreign roots
+    /// have no historical proof on this value-only port.
+    pub(crate) fn deny_frontier(
+        &self,
+        expected: &RootMetadata,
+    ) -> Result<GovernanceFrontier, RootError> {
+        self.root
+            .current_governance_frontier(&self.admission, expected)
+    }
+
+    /// memory—v1: Reserve and validate the exact request-bound successor before journaling.
+    pub(crate) fn prepare(
+        &self,
+        observed: &RootMetadata,
+        mutation: &ManagementMutationV2,
+    ) -> Result<(VerifiedRootAdmission, PreparedGovernedMutation<'_>), RootMutationWriterError>
+    {
+        let prepared = self.root.prepare_governed_mutation(
+            self.admission.as_ref(),
+            observed,
+            mutation,
+            self.session_authority.as_deref(),
+        )?;
+        let admission = VerifiedRootAdmission::mint_from_production_owner(
+            RootBinding::from_metadata(*observed),
+        );
+        Ok((admission, prepared))
+    }
+
+    /// memory—v1: Publish directly on an isolated fixture, without the journal.
+    #[cfg(test)]
+    pub(crate) fn publish(
         &self,
         mutation: &ManagementMutationV2,
     ) -> Result<RootMetadata, RootMutationWriterError> {
-        if matches!(
-            mutation,
-            ManagementMutationV2::UserCardStatus {
-                status: astral_authorization_root::memory_v1_db_rows::UserCardStatus::Disabled,
-                ..
-            }
-        ) {
-            return Err(RootMutationWriterError::UnsupportedMutation);
-        }
-        let metadata = self
-            .root
-            .validate_production_admission(self.admission.as_ref())
-            .map_err(|_| RootMutationWriterError::AdmissionMismatch)?;
-        self.root
-            .execute_serving_mutation_with_admission(
-                self.admission.as_ref(),
-                mutation,
-                &MutationPrecondition {
-                    evaluated_root_version: metadata.version,
-                },
-            )
-            .map_err(RootMutationWriterError::Mutation)
-    }
-
-    /// The bound authority, for the commit owner's disable path.
-    pub(crate) fn session_authority(
-        &self,
-    ) -> Option<
-        &std::sync::Arc<
-            astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthority,
-        >,
-    > {
-        self.session_authority.as_ref()
+        self.prepare(&self.observed(), mutation)?
+            .1
+            .publish()
+            .map_err(Into::into)
     }
 
     /// Bind the session authority that owns revocation generations. The
@@ -189,52 +173,25 @@ impl RootMutationWriter {
         self.session_authority = authority;
     }
 
-    /// Publish a session-coordinated card disable through the authority that
-    /// owns revocation generations. The writer forwards the same production
-    /// admission requirement before entering the coordinated path; the
-    /// callback applies the revocation updates inside the root writer lock.
-    pub fn disable_card_with_sessions(
+    /// memory—v1: Publish a session-coordinated disable directly on an isolated fixture.
+    #[cfg(test)]
+    pub(crate) fn disable_card_with_sessions(
         &self,
-        authority: &std::sync::Arc<
+        authority: &Arc<
             astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthority,
         >,
         user_card_id: MemoryId,
-    ) -> Result<
-        (RootMetadata, usize),
-        astral_authorization_root::memory_v1_session_authority::MemoryV1CardDisableError,
-    > {
-        // The authority must be the bound one; anything else fails closed.
-        let Some(bound) = self.session_authority.as_ref() else {
-            return Err(
-                astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthorityError::Unavailable
-                    .into(),
-            );
-        };
-        if !std::sync::Arc::ptr_eq(bound, authority) {
-            return Err(
-                astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthorityError::Unavailable
-                    .into(),
-            );
+    ) -> Result<RootMetadata, RootMutationWriterError> {
+        if !self
+            .session_authority
+            .as_ref()
+            .is_some_and(|bound| Arc::ptr_eq(bound, authority))
+        {
+            return Err(RootMutationWriterError::UnsupportedMutation);
         }
-        // The admission requirement is re-checked by the coordinator itself
-        // against this exact root; the observed metadata comes from the same
-        // capability validation the ordinary publish path uses.
-        let metadata = self
-            .root
-            .validate_production_admission(self.admission.as_ref())
-            .map_err(|_| astral_authorization_root::memory_v1_session_authority::MemoryV1SessionAuthorityError::Unavailable)?;
-        let mut revoked = 0_usize;
-        let metadata = self.executor.disable_card_with_session_updates(
-            authority,
-            user_card_id.into_bytes(),
-            metadata,
-            || {
-                revoked = authority
-                    .identity_session_adapter()
-                    .revoke_sessions_for_user_card(user_card_id)
-                    .unwrap_or(0);
-            },
-        )?;
-        Ok((metadata, revoked))
+        self.publish(&ManagementMutationV2::UserCardStatus {
+            user_card_id: user_card_id.into_bytes(),
+            status: astral_authorization_root::memory_v1_db_rows::UserCardStatus::Disabled,
+        })
     }
 }

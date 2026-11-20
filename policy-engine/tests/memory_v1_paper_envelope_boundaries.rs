@@ -118,6 +118,7 @@ fn final_window(window: &Window) -> FinalCheckWindow {
 /// memory—v1: Candidate rows for one ALLOW rule set bound to one card, with the given binding window
 /// and rule content. Both the binding and the rule content are supplied by the caller so that the
 /// empty-window scenarios can reuse the fixture.
+#[allow(clippy::needless_update)] // memory—v1: CandidateRows gains rows over time; base stays default
 fn rows(binding: (Option<i64>, Option<i64>), content: &str) -> CandidateRows {
     let version_bytes = vec![1];
     let timestamp_bytes = vec![2];
@@ -187,6 +188,7 @@ fn rows(binding: (Option<i64>, Option<i64>), content: &str) -> CandidateRows {
             revoked_at: None,
             revoked_by: None,
         }],
+        // memory—v1: remaining rows are defaults; all consumed fields are set above.
         ..CandidateRows::default()
     }
 }

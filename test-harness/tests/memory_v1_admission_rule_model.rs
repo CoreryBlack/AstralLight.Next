@@ -36,6 +36,7 @@
 //!   - slot[NB]: advanced by every change of that slot. rule[NR]: advanced by every RuleSetPublish,
 //!     including a NoEffect publication. unrelated: advanced by Unrelated and never compared. root:
 //!     advanced by every writer and compared only by the whole-root comparator.
+//!
 //!   The membership identity is the card generation. The recorded-binding loop compares, for every
 //!   recorded member, its slot generation and its rule-set generation. There is no independent
 //!   enumeration in the correct validator; EnumerateMembers adds one as an extra guard.
@@ -67,15 +68,10 @@
 //! high-water mark; the only production check on a sample below T0 is the test at
 //! policy-engine/src/memory_v1_formal.rs:2450-2453. Production rollback-then-return was not run.
 //!
-//! Fence. One global key with one revision. Production uses per-key object revisions with a history
-//! floor. A grep of the production crates found every caller of begin_modification_fence and
-//! begin_owned_modification_fence after the first cfg(test) line of its file, which by repository
-//! convention opens the test region: astral-authorization-root/src/memory_v1_root.rs (from line 3033,
-//! first cfg(test) at 1568), policy-engine/src/memory_v1_compound.rs (from 1520, first cfg(test) at
-//! 31), memory_v1_batch.rs (from 836, first cfg(test) at 433), memory_v1_formal.rs (from 2685, first
-//! cfg(test) at 902) and astral-trustgraph/src/api/permission_check.rs (from 3286, first cfg(test) at
-//! 1946). The fence conjunct therefore holds vacuously in the shipped composition, and the FenceOpen
-//! and FenceClose events are hypothetical writers.
+//! Fence. The model uses one global key with one revision. The governed writer in production
+//! opens one owned window over the affected existing rule set; the registry uses per-object
+//! revisions with a history floor. The model does not exercise target resolution, journal ordering,
+//! guard ownership or isolation between different rule sets; those belong to composition tests.
 //!
 //! Production mapping (ManagementMutationV2 in astral-authorization-root/src/memory_v1_root.rs,
 //! lines 1496-1548; eleven variants):
@@ -94,9 +90,10 @@
 //! - RuleSetRetire -> RuleSetPublish to NoEffect. An approximation: production records a retired
 //!   status (with_rule_set_retired, memory_v1_hamt.rs:2429), which the model reads as no effect.
 //! - VersionPublish -> RuleSetPublish to Allow, Deny or NoEffect.
-//! Binding confirmation: production has Active, Withdrawn and Invalid (memory_v1_rules.rs:288-299). The model's
-//! Confirmed is Active, Revoked is Withdrawn and Pending is Invalid (it blocks K). Production has no
-//! Pending state, and the model's ConfirmationSet to Pending has no direct production writer.
+//! - Binding confirmation: production has Active, Withdrawn and Invalid (memory_v1_rules.rs:288-299).
+//!   The model's Confirmed is Active, Revoked is Withdrawn and Pending is Invalid (it blocks K).
+//!   Production has no Pending state, and the model's ConfirmationSet to Pending has no direct
+//!   production writer.
 //!
 //! Necessity. Each row of the mutant table states its reason. In summary, shown by a depth-two
 //! counterexample: card generation (M7 BindingCreate, M11 CardToggle, FC1 final check); rule-set
@@ -184,7 +181,7 @@ const WINDOWS: [Window; 5] = [
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Effect {
     #[default]
-    NoEffect,
+    Inert,
     Allow,
     Deny,
 }
@@ -405,7 +402,7 @@ fn menu() -> Vec<Event> {
         }
     }
     for rule in 0..NR {
-        for effect in [Effect::Allow, Effect::Deny, Effect::NoEffect] {
+        for effect in [Effect::Allow, Effect::Deny, Effect::Inert] {
             for window in 0..WINDOWS.len() {
                 v.push(Event::RuleSetPublish {
                     rule,
@@ -457,7 +454,7 @@ fn member_at(x: &Live, s: usize) -> Option<Member> {
 
 // memory—v1: Session liveness at a clock value in interval form.
 fn session_live(s: Session, t: u8) -> bool {
-    !s.revoked && s.expires.map_or(true, |e| t < e)
+    !s.revoked && s.expires.is_none_or(|e| t < e)
 }
 
 // memory—v1: Interval intersection of a binding window with an entry window.
@@ -478,7 +475,7 @@ fn intersect(a: Window, b: Window) -> Window {
 
 // memory—v1: Evaluator-side point test in interval form.
 fn contains(w: Window, t: u8) -> bool {
-    w.from.map_or(true, |f| t >= f) && w.until.map_or(true, |u| t < u)
+    w.from.is_none_or(|f| t >= f) && w.until.is_none_or(|u| t < u)
 }
 
 // memory—v1: A window whose lower endpoint is not below its upper endpoint contains no clock value.
@@ -757,7 +754,7 @@ fn family() -> Vec<Live> {
         rs(Effect::Deny, 0),
     ];
     let rule1 = [
-        rs(Effect::NoEffect, 0),
+        rs(Effect::Inert, 0),
         rs(Effect::Deny, 0),
         rs(Effect::Deny, 1),
         rs(Effect::Deny, 2),
@@ -868,7 +865,7 @@ fn evaluate(x: &Live, t0: u8, m: Mutant) -> Option<Record> {
             continue;
         };
         let r = x.rules[rule];
-        if r.effect == Effect::NoEffect {
+        if r.effect == Effect::Inert {
             continue;
         }
         let w = intersect(window, r.window);
@@ -879,7 +876,7 @@ fn evaluate(x: &Live, t0: u8, m: Mutant) -> Option<Record> {
                     winners += 1;
                 }
                 Effect::Deny => negative = true,
-                Effect::NoEffect => {}
+                Effect::Inert => {}
             }
         } else if let Some(start) = w.from.filter(|&f| f > t0) {
             // memory—v1: Dormant pair. EvaluatorNoDormant omits the start of a binding that is itself
@@ -1018,7 +1015,7 @@ fn oracle(x: &Live, t: u8) -> bool {
         } = *s
         {
             let r = x.rules[rule];
-            if r.effect == Effect::NoEffect {
+            if r.effect == Effect::Inert {
                 continue;
             }
             let mask = tick_mask(window) & tick_mask(r.window);
@@ -1026,7 +1023,7 @@ fn oracle(x: &Live, t: u8) -> bool {
                 match r.effect {
                     Effect::Allow => pos = true,
                     Effect::Deny => neg = true,
-                    Effect::NoEffect => {}
+                    Effect::Inert => {}
                 }
             }
         }
@@ -1044,7 +1041,7 @@ fn envelope_mask(rec: &Record) -> u8 {
             .iter()
             .flatten()
             .all(|w| ((tick_mask(*w) >> t) & 1) == 1);
-        let below = rec.threshold.map_or(true, |b| t < b);
+        let below = rec.threshold.is_none_or(|b| t < b);
         if t >= rec.t0 && below && inside {
             mask |= 1u8 << t;
         }
@@ -1707,7 +1704,7 @@ const EXPECTS: [Expect; 35] = [
     // memory—v1: Equivalent: a session generation changes only on revoke, which the Session gate sees.
     Expect { mutant: Mutant::NoSessionGenCheck, label: "FC6 final check skips session generation (equivalent)", violation: None, accepts: Some(2_308_736), relation: Relation::Equal },
     // memory—v1: Killed: the final check must read the live session at the sample.
-    Expect { mutant: Mutant::NoLiveSession, label: "M16 no live session check (killed)", violation: Some((1, "start: T=2 srv=1 card=1 reg=1 sessRev=0 exp=3 fence=0 s0=r0:Confirmed[-inf,+inf) s1=- r0=Allow[-inf,+inf) r1=NoEffect[-inf,+inf) | schedule: Obs1 ; Tick ; Sample ; Obs2 | final: T=3 srv=1 card=1 reg=1 sessRev=0 exp=3 fence=0 s0=r0:Confirmed[-inf,+inf) s1=- r0=Allow[-inf,+inf) r1=NoEffect[-inf,+inf)")), accepts: None, relation: Relation::Killed },
+    Expect { mutant: Mutant::NoLiveSession, label: "M16 no live session check (killed)", violation: Some((1, "start: T=2 srv=1 card=1 reg=1 sessRev=0 exp=3 fence=0 s0=r0:Confirmed[-inf,+inf) s1=- r0=Allow[-inf,+inf) r1=Inert[-inf,+inf) | schedule: Obs1 ; Tick ; Sample ; Obs2 | final: T=3 srv=1 card=1 reg=1 sessRev=0 exp=3 fence=0 s0=r0:Confirmed[-inf,+inf) s1=- r0=Allow[-inf,+inf) r1=Inert[-inf,+inf)")), accepts: None, relation: Relation::Killed },
     // memory—v1: Killed: the registry generation is the only registry check the validator makes.
     Expect { mutant: Mutant::NoRegistryRevalidation, label: "M17 no registry generation check (killed)", violation: Some((1, "start: T=0 srv=1 card=1 reg=1 sessRev=0 exp=- fence=0 s0=- s1=r1:Confirmed[-inf,+inf) r0=Allow[-inf,+inf) r1=Allow[-inf,3) | schedule: Obs1 ; RegistryToggle ; Sample ; Obs2 | final: T=0 srv=1 card=1 reg=0 sessRev=0 exp=- fence=0 s0=- s1=r1:Confirmed[-inf,+inf) r0=Allow[-inf,+inf) r1=Allow[-inf,3)")), accepts: None, relation: Relation::Killed },
     // memory—v1: Killed: the serving flag must be read at the sample.

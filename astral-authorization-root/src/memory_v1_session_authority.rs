@@ -254,6 +254,35 @@ impl MemoryV1SessionAuthority {
         }
     }
 
+    // memory—v1: Refuse an already-poisoned authority before journaling a disable.
+    pub(crate) fn can_coordinate_disable(&self) -> bool {
+        !self.state.is_poisoned()
+    }
+
+    // memory—v1: Exclude live session checks and issuance during the root CAS
+    // and revoke all matched records before releasing that writer. Generation
+    // exhaustion must not prevent marking a record revoked.
+    pub(crate) fn publish_card_disable<T>(
+        &self,
+        user_card_id: [u8; 16],
+        publish: impl FnOnce() -> Result<T, MutationError>,
+    ) -> Result<T, MutationError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| MutationError::CardDisableRequiresSessionCoordinator)?;
+        let result = publish()?;
+        for record in state.records.values_mut() {
+            if !record.revoked
+                && record.facts.candidate_identity().user_card_id.into_bytes() == user_card_id
+            {
+                record.revocation_generation = record.revocation_generation.saturating_add(1);
+                record.revoked = true;
+            }
+        }
+        Ok(result)
+    }
+
     /// memory—v1: The low-level coordinator is not a governance capability.
     /// This public compatibility entry point always fails closed because it
     /// cannot establish admission, mutation binding, replay protection or audit.

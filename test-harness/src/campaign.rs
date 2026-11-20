@@ -19,15 +19,21 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use toml::Value as TomlValue;
 use url::Url;
 
+#[path = "campaign/paper.rs"]
+mod paper;
 #[path = "campaign/process_group.rs"]
 mod process_group;
 
+pub use paper::{run_paper_options, PAPER_USAGE};
 use process_group::{wait_child, OwnedProcess};
 
 pub const STATUSES: [&str; 6] = ["FAIL", "UNKNOWN", "BLOCKED", "PENDING", "SKIP", "PASS"];
 const LOG_LIMIT: u64 = 64 * 1024 * 1024;
 const DEFAULT_PROFILES: [&str; 3] = ["native-kernel", "offline-validation", "performance-kernel"];
-const CLEAR_ENV: [&str; 19] = [
+const CLEAR_ENV: [&str; 22] = [
+    paper::mysql_scope::URL_ENV,
+    paper::mysql_scope::APPROVAL_ENV,
+    paper::mysql_scope::RUN_ENV,
     "DATABASE_URL",
     "REDIS_URL",
     "RABBITMQ_URL",
@@ -398,6 +404,7 @@ pub fn select_suites(
                 && labels_match(&suite_labels(suite), labels)
                 && (suite_ids.is_empty() || suite_ids.contains(&suite_id(suite)))
                 && (!portable || suite.get("blocked_reason").is_none())
+                && !(running && suite_ids.is_empty() && paper::is_paper_suite(suite))
                 && !(running
                     && !all_profiles
                     && suite_ids.is_empty()
@@ -441,6 +448,9 @@ pub fn prepare_environment(
     suite: &TomlValue,
     original: &[(OsString, OsString)],
 ) -> (BTreeMap<OsString, OsString>, Option<String>) {
+    if paper::is_paper_suite(suite) {
+        return paper::environment(suite, original);
+    }
     let mut result = original.iter().cloned().collect::<BTreeMap<_, _>>();
     for name in CLEAR_ENV {
         result.remove(OsString::from(name).as_os_str());
@@ -619,6 +629,12 @@ pub fn classify_output(
         if result["status"] != "PASS" {
             return result;
         }
+        if paper::is_mysql_suite(suite) {
+            return paper::check_mysql_evidence(stdout, result);
+        }
+        if let Some(result) = paper::check_measurements(suite, &combined, &result) {
+            return result;
+        }
         if let Some(contract) = suite.get("evidence_contract").and_then(TomlValue::as_str) {
             let mut evidence = match contract {
                 "policy-evaluate-benefit" => {
@@ -772,6 +788,7 @@ pub fn scrub_log(text: &str, env: &[(OsString, OsString)]) -> String {
         "ACCESS_KEY",
         "PRIVATE_KEY",
         "CREDENTIAL",
+        "ASTRAL_PAPER_MYSQL_URL",
         "DATABASE_URL",
         "REDIS_URL",
         "RABBITMQ_URL",
@@ -1013,7 +1030,10 @@ fn execute_native(
     let mut interrupted = false;
     let mut status = loop {
         let child_status = wait_child(owned.child(), Duration::from_millis(50))?;
-        if overflow.load(Ordering::Acquire) || started.elapsed() >= timeout {
+        if paper::cancelled(suite)
+            || overflow.load(Ordering::Acquire)
+            || started.elapsed() >= timeout
+        {
             interrupted = true;
             let (status, group_stopped) = owned.stop_group()?;
             if !group_stopped {
@@ -1028,7 +1048,7 @@ fn execute_native(
     if !interrupted {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if overflow.load(Ordering::Acquire) {
+            if paper::cancelled(suite) || overflow.load(Ordering::Acquire) {
                 interrupted = true;
                 let (group_status, group_stopped) = owned.stop_group()?;
                 if !group_stopped {
@@ -1301,6 +1321,7 @@ struct SelectedRuntime<'a, F, E> {
     environment: &'a [(OsString, OsString)],
     snapshot: F,
     execute_command: E,
+    paper: Option<Value>,
 }
 
 fn run_selected(
@@ -1321,6 +1342,7 @@ fn run_selected(
             environment: &environment,
             snapshot: snapshot_hash,
             execute_command: execute,
+            paper: None,
         },
     )
 }
@@ -1341,6 +1363,7 @@ where
         environment,
         mut snapshot,
         mut execute_command,
+        paper: paper_plan,
     } = runtime;
     if !safe_id(run_id) {
         return Err("invalid run id".into());
@@ -1353,6 +1376,20 @@ where
     let directory = validate_artifact_root(&manifest.root, &directory)?;
     let frozen = snapshot(&manifest.root)?;
     let mut report = json!({"schema_version":2,"taskId":run_id,"run_id":run_id,"delegated":false,"responsible_agent":"test-harness","cwd":manifest.root,"started_at":utc_now(),"source_sha256":frozen,"status":"PENDING","retries":0,"provisioning":"none; pre-migrated approved dependencies only","selection":suites.iter().map(suite_id).collect::<Vec<_>>(),"results":[],"item_results":[],"verify_items":verify_items,"phase_timing_seconds":[],"rerun_policy":"fix or reconcile the first non-PASS target; rerun the full original selection with a new run id; no cached PASS reuse"});
+    let paper_mysql = suites.iter().any(paper::is_mysql_suite);
+    let mysql_env = if paper_mysql {
+        paper::mysql_environment(environment, run_id, paper_plan.is_some() && !verify_items)
+    } else {
+        Ok(BTreeMap::new())
+    };
+    if let Some(plan) = paper_plan {
+        report["paper"] = plan;
+        report["provisioning"] = if paper_mysql {
+            json!("operator-approved pre-migrated empty MySQL schema; fixture DML only; schema retained, no retry or automatic cleanup")
+        } else {
+            json!("locked offline Cargo build; only opt-in ephemeral loopback fixtures; no database or external services")
+        };
+    }
     let report_path = directory.join("result.json");
     write_report(&report_path, &report)?;
     let mut preflight = Vec::new();
@@ -1363,7 +1400,14 @@ where
             .map(str::to_owned);
         if problem.is_none() {
             let (_, environment_problem) = prepare_environment(suite, environment);
-            problem = environment_problem;
+            let mysql_problem = if paper::is_mysql_suite(suite) {
+                mysql_env.as_ref().err().cloned()
+            } else {
+                None
+            };
+            problem = environment_problem
+                .or(mysql_problem)
+                .or_else(|| paper::loopback_preflight(suite));
             if problem.is_none() {
                 let argv = string_array(suite, "argv")?;
                 if resolve_executable(&argv[0], &env::var("PATH").unwrap_or_default()).is_none() {
@@ -1410,12 +1454,21 @@ where
             } else if let Some((stop_id, stop_status, _)) = &stopped {
                 record["status"] = json!("BLOCKED");
                 record["reason"] = json!(format!("prior {stop_status} in {stop_id}; fix or reconcile before a fresh full collection"));
+            } else if paper::cancelled(suite) {
+                record["status"] = json!("UNKNOWN");
+                record["reason"] = json!("paper run interrupted before suite dispatch");
+                record["stream_disconnect"] = json!(true);
             } else if snapshot(&manifest.root)? != frozen {
                 record["status"] = json!("UNKNOWN");
                 record["reason"] =
                     json!("source changed after freeze; evidence belongs to another snapshot");
             } else {
                 let (mut child_env, issue) = prepare_environment(suite, environment);
+                if paper::is_mysql_suite(suite) {
+                    child_env.extend(mysql_env.as_ref().map_err(Clone::clone)?.clone());
+                    record["external_fixture"] = json!({"run_id":run_id,"schema":paper::mysql_scope::schema_name(run_id)?,
+                        "cleanup":"retained for inspection; operator owns cleanup; never retry without reconciliation"});
+                }
                 child_env.insert(
                     "CRITERION_HOME".into(),
                     phase_directory.join("criterion").join(&id).into_os_string(),
@@ -1425,6 +1478,9 @@ where
                     .filter_map(|key| {
                         let name = key.to_string_lossy();
                         [
+                            paper::mysql_scope::URL_ENV,
+                            paper::mysql_scope::APPROVAL_ENV,
+                            paper::mysql_scope::RUN_ENV,
                             "DATABASE_URL",
                             "RABBITMQ_URL",
                             "REDIS_URL",
@@ -1450,42 +1506,78 @@ where
                     record["status"] = json!("BLOCKED");
                     record["reason"] = json!(format!("required tool unavailable: {}", argv[0]));
                 } else {
-                    let out_path = phase_directory.join(format!("{id}.stdout.log"));
-                    let err_path = phase_directory.join(format!("{id}.stderr.log"));
-                    record["status"] = json!("PENDING");
-                    record["reason"] = json!("command dispatched; result not yet proven");
-                    record["started_at"] = json!(utc_now());
-                    record["stdout"] = json!(out_path);
-                    record["stderr"] = json!(err_path);
-                    record["log_integrity"] =
-                        json!("in progress; terminal integrity not yet proven");
-                    report[records_key]
-                        .as_array_mut()
-                        .unwrap()
-                        .push(record.clone());
-                    report["status"] = json!("PENDING");
-                    write_report(&report_path, &report)?;
-                    match execute_command(suite, &child_env, &manifest.root, &phase_directory) {
-                        Ok(result) => {
-                            record
-                                .as_object_mut()
-                                .unwrap()
-                                .extend(result.as_object().cloned().unwrap_or_default());
+                    let scratch = if paper::is_paper_suite(suite) {
+                        paper::Scratch::new(&phase_directory, &id).map(Some)
+                    } else {
+                        Ok(None)
+                    };
+                    if let Ok(scratch) = scratch {
+                        let out_path = phase_directory.join(format!("{id}.stdout.log"));
+                        let err_path = phase_directory.join(format!("{id}.stderr.log"));
+                        if let Some(scratch) = &scratch {
+                            scratch.bind(&mut child_env);
+                            record["scratch"] = json!(scratch.path());
+                            record["paper_fixture_env"] =
+                                json!(paper::fixture_settings(&child_env));
                         }
-                        Err(error) => {
+                        record["status"] = json!("PENDING");
+                        record["reason"] = json!("command dispatched; result not yet proven");
+                        record["started_at"] = json!(utc_now());
+                        record["stdout"] = json!(out_path);
+                        record["stderr"] = json!(err_path);
+                        record["log_integrity"] =
+                            json!("in progress; terminal integrity not yet proven");
+                        report[records_key]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(record.clone());
+                        report["status"] = json!("PENDING");
+                        write_report(&report_path, &report)?;
+                        if paper::is_paper_suite(suite) {
+                            println!("[START] {id}");
+                        }
+                        match execute_command(suite, &child_env, &manifest.root, &phase_directory) {
+                            Ok(result) => {
+                                record
+                                    .as_object_mut()
+                                    .unwrap()
+                                    .extend(result.as_object().cloned().unwrap_or_default());
+                            }
+                            Err(error) => {
+                                record["status"] = json!("UNKNOWN");
+                                record["reason"] =
+                                    json!(format!("runner/log interrupted: {error}"));
+                                record["stdout"] = json!(out_path);
+                                record["stderr"] = json!(err_path);
+                                record["log_integrity"] =
+                                    json!("unknown; reconcile owned process and artifacts");
+                                record["stream_disconnect"] = json!(true);
+                            }
+                        }
+                        if let Some(scratch) = scratch {
+                            let cleanup = if record["status"] == "UNKNOWN"
+                                && record["exit_code"].is_null()
+                            {
+                                Err("temporary fixture retained until process ownership is reconciled".into())
+                            } else {
+                                scratch.clean()
+                            };
+                            match cleanup {
+                                Ok(()) => record["scratch_cleanup"] = json!("removed"),
+                                Err(reason) => {
+                                    record["scratch_cleanup"] = json!(reason);
+                                    record["status"] = json!("UNKNOWN");
+                                }
+                            }
+                        }
+                        if snapshot(&manifest.root)? != frozen {
                             record["status"] = json!("UNKNOWN");
-                            record["reason"] = json!(format!("runner/log interrupted: {error}"));
-                            record["stdout"] = json!(out_path);
-                            record["stderr"] = json!(err_path);
-                            record["log_integrity"] =
-                                json!("unknown; reconcile owned process and artifacts");
-                            record["stream_disconnect"] = json!(true);
+                            record["reason"] =
+                                json!("source changed while required command was running");
                         }
-                    }
-                    if snapshot(&manifest.root)? != frozen {
-                        record["status"] = json!("UNKNOWN");
-                        record["reason"] =
-                            json!("source changed while required command was running");
+                    } else if let Err(error) = scratch {
+                        record["status"] = json!("BLOCKED");
+                        record["reason"] = json!(error);
                     }
                 }
             }
@@ -1964,7 +2056,14 @@ exit "${FAKE_CARGO_EXIT:-0}"
             .all(|suite| string_array(suite, "test_services").unwrap().is_empty()));
 
         let all_profiles = select_suites(&manifest, &[], &[], &[], true, true).unwrap();
-        assert_eq!(all_profiles.len(), manifest.suites.len());
+        let non_paper_suites = manifest
+            .suites
+            .iter()
+            .filter(|suite| !paper::is_paper_suite(suite));
+        assert_eq!(
+            all_profiles.iter().map(suite_id).collect::<Vec<_>>(),
+            non_paper_suites.map(suite_id).collect::<Vec<_>>()
+        );
 
         let mut with_blocked = manifest.clone();
         let mut blocked = with_blocked.suites[0].clone();

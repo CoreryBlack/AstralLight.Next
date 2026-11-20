@@ -412,6 +412,11 @@ impl MutationAuditCandidate {
             | ManagementMutationV2::VersionPublish { rule_set_id, .. } => {
                 MemoryV1AuditObject::RuleSet(MemoryId::from_bytes(*rule_set_id))
             }
+            // memory—v1 §15.10.3: A context load is not a governed mutation;
+            // it never carries a governance audit candidate.
+            ManagementMutationV2::ContextLoad { .. } => {
+                return Err(CoordinatorError::InvalidAuditCandidate);
+            }
         };
         let (expected_resource, expected_action) = match mutation {
             ManagementMutationV2::BindingCreate { .. } => ("binding", "create"),
@@ -430,6 +435,9 @@ impl MutationAuditCandidate {
             ManagementMutationV2::RuleSetCreate { .. } => ("rule_set", "create"),
             ManagementMutationV2::RuleSetRetire { .. } => ("rule_set", "retire"),
             ManagementMutationV2::VersionPublish { .. } => ("rule_set", "version-publish"),
+            ManagementMutationV2::ContextLoad { .. } => {
+                return Err(CoordinatorError::InvalidAuditCandidate);
+            }
         };
         let context = candidate.context();
         let actor_observation = context.actor();
@@ -491,6 +499,9 @@ impl MutationAuditCandidate {
                 candidate.after(),
                 MemoryV1AuditObjectState::Confirmation(MemoryV1AuditConfirmationState::Active)
             ),
+            ManagementMutationV2::ContextLoad { .. } => {
+                return Err(CoordinatorError::InvalidAuditCandidate);
+            }
         };
         if actor_observation.user().into_bytes() != actor
             || candidate.target() != expected_target
@@ -1782,16 +1793,14 @@ impl JournalReadWatermark {
         })
     }
 
-    /// Watermark for a DENY observed at the external baseline: the mutation
-    /// sequence it read may be zero. Stream, epoch and journal sequence stay
-    /// strict.
+    /// Watermark for a DENY, including the verified external baseline `(0, 0)`.
     pub fn new_deny(
         stream_id: MemoryId,
         epoch_id: MemoryId,
         journal_sequence: u64,
         mutation_sequence: u64,
     ) -> Result<Self, CoordinatorError> {
-        if !nonzero_id(stream_id) || !nonzero_id(epoch_id) || journal_sequence == 0 {
+        if !nonzero_id(stream_id) || !nonzero_id(epoch_id) || mutation_sequence > journal_sequence {
             return Err(CoordinatorError::InvalidJournalIdentity);
         }
         Ok(Self {
@@ -1844,11 +1853,6 @@ impl DenyProofRequest {
         // operation binding; the value is proven as-is by the durable record.
         if !root.valid() {
             return Err(CoordinatorError::RootUnavailable);
-        }
-        // The watermark constructor has already validated its own identity;
-        // a DENY watermark may legitimately carry the zero baseline sequence.
-        if read_journal.journal_sequence == 0 {
-            return Err(CoordinatorError::InvalidJournalIdentity);
         }
         let mut stored = [0u8; MAX_OPERATION_ID_BYTES];
         stored[..operation_id.len()].copy_from_slice(operation_id.as_bytes());

@@ -317,7 +317,7 @@ fn evaluator_concurrency_and_sustained_load() {
         return;
     }
     for size in [1, 8, 9, 32, 128, 129, 512, 1024] {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "evaluator_concurrency_and_sustained_load",
@@ -325,8 +325,16 @@ fn evaluator_concurrency_and_sustained_load() {
                 "--nocapture",
             ])
             .env(SIZE_ENV, size.to_string())
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success(), "evaluator load failed at {size} rules");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "evaluator load failed at {size} rules:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        for row in stdout.lines().filter(|line| line.starts_with("rules=")) {
+            println!("{row}");
+        }
     }
 }

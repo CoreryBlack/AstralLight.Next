@@ -49,6 +49,10 @@ pub enum RuntimeError {
     InconsistentCandidate,
     /// A write must request a version change or a selection change.
     EmptyChange,
+    /// memory—v1 §15.10.3: a service-period context load could not be proven
+    /// to merge safely into the serving root; the request stays pending and
+    /// the root is unchanged.
+    UnsafeMerge(&'static str),
 }
 
 /// Metadata captured atomically with one candidate query.
@@ -553,12 +557,21 @@ pub(crate) fn digest_rows(
     selections: &[CurrentSelection],
 ) -> Result<DigestIndex, RuntimeError> {
     let mut builder = ColdDigestBuilder::new();
-    let mut push = |change| -> Result<(), RuntimeError> {
+    visit_context_changes(rows, selections, |change| {
         let Change::Put { key, fields } = change else {
-            unreachable!("cold row encoders only produce puts");
+            unreachable!("row encoders only produce puts");
         };
         builder.push(key, fields).map_err(RuntimeError::Digest)
-    };
+    })?;
+    builder.finish().map_err(RuntimeError::Digest)
+}
+
+// memory—v1: Encode identical facts for cold build and additive repair.
+pub(crate) fn visit_context_changes(
+    rows: &CandidateRows,
+    selections: &[CurrentSelection],
+    mut push: impl FnMut(Change) -> Result<(), RuntimeError>,
+) -> Result<(), RuntimeError> {
     for row in &rows.users {
         push(row_change(
             Table::User,
@@ -610,8 +623,7 @@ pub(crate) fn digest_rows(
             selection.version_bytes.clone(),
         ))?;
     }
-    drop(push);
-    builder.finish().map_err(RuntimeError::Digest)
+    Ok(())
 }
 
 /// memory—v1: Rebuild the candidate digest for tests and test-support diagnostics.

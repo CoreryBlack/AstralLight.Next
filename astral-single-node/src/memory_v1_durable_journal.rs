@@ -447,6 +447,7 @@ pub struct MemoryV1DurableJournal {
     epoch_id: MemoryId,
     limits: DurableJournalLimits,
     position: JournalAnchor,
+    last_mutation: JournalAnchor,
     record_count: u64,
     file_position: u64,
     operations: BTreeMap<String, StoredOperation>,
@@ -509,6 +510,7 @@ impl MemoryV1DurableJournal {
                 epoch_id,
                 limits,
                 position: anchor,
+                last_mutation: anchor,
                 record_count: 0,
                 file_position: 0,
                 operations: BTreeMap::new(),
@@ -638,6 +640,7 @@ impl MemoryV1DurableJournal {
                 epoch_id,
                 limits,
                 position: scan.position,
+                last_mutation: scan.last_mutation,
                 record_count: scan.record_count,
                 file_position: scan.file_position,
                 operations: scan.operations,
@@ -652,6 +655,12 @@ impl MemoryV1DurableJournal {
         self.state
     }
 
+    /// memory—v1: Stop this owner from advancing the journal when its root
+    /// publication cannot be proved. Do not truncate or replay here.
+    pub(crate) fn require_reconciliation(&mut self) {
+        self.state = DurableJournalState::StickyUnknown;
+    }
+
     pub const fn stream_id(&self) -> MemoryId {
         self.stream_id
     }
@@ -662,6 +671,11 @@ impl MemoryV1DurableJournal {
 
     pub const fn position(&self) -> JournalAnchor {
         self.position
+    }
+
+    /// memory—v1: The last governance boundary is unchanged by DENY records.
+    pub(crate) const fn last_mutation(&self) -> JournalAnchor {
+        self.last_mutation
     }
 
     pub const fn record_count(&self) -> u64 {
@@ -787,6 +801,7 @@ impl MemoryV1DurableJournal {
             tail_hash,
         )
         .map_err(DurableJournalError::Frame)?;
+        self.last_mutation = self.position;
         self.record_count += 1;
         durability.mark_written(end);
         Ok(PreparedAppend {
@@ -1209,6 +1224,7 @@ fn sync_directory(directory: &File) -> Result<(), DurableJournalError> {
 struct ScanResult {
     verifier: JournalVerifier,
     position: JournalAnchor,
+    last_mutation: JournalAnchor,
     file_position: u64,
     record_count: u64,
     operations: BTreeMap<String, StoredOperation>,
@@ -1228,6 +1244,7 @@ pub struct RecoveryRecord {
     /// the mutation sequence observed at the denial.
     pub mutation_sequence: u64,
     pub payload: Vec<u8>,
+    pub(crate) frame_hash: [u8; 32],
 }
 
 /// A written-but-not-yet-confirmed-durable journal record. The receipt is
@@ -1283,6 +1300,7 @@ fn scan_file(
         })?;
     let mut operations = BTreeMap::new();
     let mut recovery = Vec::new();
+    let mut last_mutation = verifier.position();
     let mut file_position = 0_u64;
     let mut record_count = 0_u64;
     loop {
@@ -1381,7 +1399,11 @@ fn scan_file(
             journal_sequence: decoded.record.journal_sequence,
             mutation_sequence: decoded.record.mutation_sequence,
             payload: decoded.record.payload.to_vec(),
+            frame_hash: decoded.digest,
         });
+        if decoded.record.kind == RecordKind::Mutation {
+            last_mutation = verifier.position();
+        }
         file_position = next_position;
         record_count = record_count
             .checked_add(1)
@@ -1392,6 +1414,7 @@ fn scan_file(
     }
     Ok(ScanResult {
         position: verifier.position(),
+        last_mutation,
         verifier,
         file_position,
         record_count,

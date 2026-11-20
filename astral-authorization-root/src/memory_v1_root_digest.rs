@@ -6,11 +6,11 @@
 
 use std::collections::BTreeSet;
 
-use crate::memory_v1_digest::{Change, DigestIndex, Key};
+use crate::memory_v1_digest::{Change, DigestAdditions, DigestIndex, Key};
 use crate::memory_v1_hamt::HamtCandidate;
 use crate::memory_v1_hamt_runtime::{
     binding_change, card_change, change_confirmation_change, confirmation_change, rule_set_change,
-    version_change, RuntimeError,
+    version_change, visit_context_changes, RuntimeError,
 };
 use crate::memory_v1_root::{ManagementMutationV2, MutationError};
 
@@ -131,8 +131,27 @@ pub(crate) fn prepare_root_digest(
                 new_current_version.clone(),
             ));
         }
+        ManagementMutationV2::ContextLoad { .. } => {
+            return Err(MutationError::ContextLoadNotGovernable)
+        }
     }
     prepare_batches(current, changes)
+}
+
+// memory—v1: Share unchanged trie branches; hash only the validated additions.
+pub(crate) fn prepare_context_load_digest(
+    current: &DigestIndex,
+    delta: &crate::memory_v1_hamt::ContextDelta,
+) -> Result<DigestIndex, MutationError> {
+    let (rows, selections) = delta.facts();
+    let mut builder = DigestAdditions::new(current);
+    visit_context_changes(rows, selections, |change| {
+        builder.push(change).map_err(RuntimeError::Digest)
+    })
+    .map_err(MutationError::Runtime)?;
+    builder
+        .finish()
+        .map_err(|error| MutationError::Runtime(RuntimeError::Digest(error)))
 }
 
 // memory—v1: Reject duplicate identities across all chunks, including a duplicate

@@ -361,10 +361,9 @@ struct MutationContext {
     target_tenant: [u8; 16],
     target_owner: Option<[u8; 16]>,
     trusted_time: i64,
-    /// The retirement observation captured with the same read phase as the
-    /// mutation: the rule set's current version and its stored digest. Only
-    /// the retire handler fills this; every other handler leaves it empty.
-    retirement_state: Option<(Vec<u8>, [u8; 32])>,
+    /// The selected rule-set version and digest captured in the admitted read
+    /// phase for publication or retirement.
+    previous_rule_set_state: Option<(Vec<u8>, [u8; 32])>,
 }
 
 fn parse_id(value: &str, field: &'static str) -> Result<[u8; 16], AppError> {
@@ -775,7 +774,7 @@ fn admitted_context(
         target_tenant,
         target_owner,
         trusted_time,
-        retirement_state: None,
+        previous_rule_set_state: None,
     })
 }
 
@@ -854,6 +853,12 @@ fn build_governance_audit_event(
         ManagementMutationV2::VersionPublish { .. } => {
             ("rule_set", "version-publish", "GOVERNANCE_RULE_SET_PUBLISH")
         }
+        // memory—v1 §15.10.3: A service-period context load is not a governed
+        // management change; it has no governance audit vocabulary and never
+        // reaches a governance route. Fail closed as unavailable.
+        ManagementMutationV2::ContextLoad { .. } => {
+            return Err(audit_unavailable("context_load_not_governable"));
+        }
     };
     let (target, before, after) = match mutation {
         ManagementMutationV2::BindingCreate { row, .. } => (
@@ -931,7 +936,8 @@ fn build_governance_audit_event(
         ManagementMutationV2::RuleSetRetire { .. } => {
             // The before state is the same root-phase observation the retire
             // handler captured: the current version and its stored digest.
-            let Some((current_version, content_hash)) = context.retirement_state.as_ref() else {
+            let Some((current_version, content_hash)) = context.previous_rule_set_state.as_ref()
+            else {
                 return Err(AppError(AstralError::Pending(
                     "governance retirement audit observation unavailable".into(),
                 )));
@@ -968,27 +974,36 @@ fn build_governance_audit_event(
             version_row,
             new_current_version,
             ..
-        } => (
-            MemoryV1AuditObject::RuleSet(astral_types::memory_v1::MemoryId::from_bytes(
-                *rule_set_id,
-            )),
-            MemoryV1AuditObjectState::RuleSet(
-                MemoryV1AuditRuleSetState::new_with_status(
-                    new_current_version,
-                    version_hash(&version_row.hash_bytes)?,
-                    MemoryV1AuditRuleSetStatus::Active,
-                )
-                .map_err(|_| audit_unavailable("rule_set_version"))?,
-            ),
-            MemoryV1AuditObjectState::RuleSet(
-                MemoryV1AuditRuleSetState::new_with_status(
-                    new_current_version,
-                    version_hash(&version_row.hash_bytes)?,
-                    MemoryV1AuditRuleSetStatus::Active,
-                )
-                .map_err(|_| audit_unavailable("rule_set_version"))?,
-            ),
-        ),
+        } => {
+            let (previous_version, previous_hash) = context
+                .previous_rule_set_state
+                .as_ref()
+                .ok_or_else(|| audit_unavailable("previous_rule_set_version"))?;
+            (
+                MemoryV1AuditObject::RuleSet(astral_types::memory_v1::MemoryId::from_bytes(
+                    *rule_set_id,
+                )),
+                MemoryV1AuditObjectState::RuleSet(
+                    MemoryV1AuditRuleSetState::new_with_status(
+                        previous_version,
+                        *previous_hash,
+                        MemoryV1AuditRuleSetStatus::Active,
+                    )
+                    .map_err(|_| audit_unavailable("previous_rule_set_version"))?,
+                ),
+                MemoryV1AuditObjectState::RuleSet(
+                    MemoryV1AuditRuleSetState::new_with_status(
+                        new_current_version,
+                        version_hash(&version_row.hash_bytes)?,
+                        MemoryV1AuditRuleSetStatus::Active,
+                    )
+                    .map_err(|_| audit_unavailable("rule_set_version"))?,
+                ),
+            )
+        }
+        ManagementMutationV2::ContextLoad { .. } => {
+            return Err(audit_unavailable("context_load_not_governable"));
+        }
     };
     let (approver, summary_bytes, confirmations) = match mutation {
         ManagementMutationV2::BindingCreate { row, confirmation } => {
@@ -1080,6 +1095,9 @@ fn build_governance_audit_event(
                 MemoryV1AuditConfirmations::references(&refs)
                     .map_err(|_| audit_unavailable("confirmation"))?,
             )
+        }
+        ManagementMutationV2::ContextLoad { .. } => {
+            return Err(audit_unavailable("context_load_not_governable"));
         }
     };
     let root_version = MemoryV1AuditRootVersion::new(
@@ -1492,14 +1510,24 @@ async fn rule_set_create(
 async fn version_publish(
     request: Request,
 ) -> Result<Json<ApiResponse<GovernanceMutationResponse>>, GovernanceError> {
-    let context = admitted_context(&request, "rule_set", "version-publish", &["confirm-change"])?;
+    let mut context =
+        admitted_context(&request, "rule_set", "version-publish", &["confirm-change"])?;
     let body: VersionPublishRequest = parse_body(&context.bound)?;
     let rule_set_id = parse_id(&body.rule_set_id, "rule_set_id")?;
-    let facts = root_scope(&request)?
-        .with_reader(|reader| reader.active_rule_set_target(rule_set_id))
+    let (facts, selected) = root_scope(&request)?
+        .with_reader(|reader| {
+            Ok::<_, astral_authorization_root::memory_v1_root::RootError>((
+                reader.active_rule_set_target(rule_set_id)?,
+                reader.selected_version_row(rule_set_id)?,
+            ))
+        })
         .map_err(|_| AppError(AstralError::Pending("root unavailable".into())))?
         .map_err(|_| AppError(AstralError::Pending("target unavailable".into())))?;
     check_target(&context, rule_set_id, facts)?;
+    context.previous_rule_set_state = Some((
+        selected.version_bytes.clone(),
+        version_hash(&selected.hash_bytes)?,
+    ));
     let version_bytes = bounded_text(body.version_bytes, "version_bytes", 255)?;
     let content = bounded_text(body.content, "content", MAX_CONTENT_BYTES)?;
     let change_confirmation_id = parse_id(&body.change_confirmation_id, "change_confirmation_id")?;
@@ -1552,7 +1580,7 @@ async fn rule_set_retire(
     let hash = version_hash(&version_row.hash_bytes)?;
     let mutation = ManagementMutationV2::RuleSetRetire { rule_set_id };
     let mut context = context;
-    context.retirement_state = Some((version_row.version_bytes.clone(), hash));
+    context.previous_rule_set_state = Some((version_row.version_bytes.clone(), hash));
     Ok(Json(ApiResponse::success(commit(context, mutation)?)))
 }
 
@@ -1739,7 +1767,7 @@ mod tests {
                 target_tenant: [3; 16],
                 target_owner: Some([1; 16]),
                 trusted_time: 123,
-                retirement_state: None,
+                previous_rule_set_state: None,
             },
             mutation.clone(),
         )
@@ -1797,7 +1825,7 @@ mod tests {
                     target_tenant: [3; 16],
                     target_owner: None,
                     trusted_time: 123,
-                    retirement_state: None,
+                    previous_rule_set_state: None,
                 },
                 ManagementMutationV2::UserCardStatus {
                     user_card_id: [2; 16],
@@ -2442,7 +2470,18 @@ mod tests {
                 MemoryV1RuleSetChangeIntent::Publish,
             ),
         ] {
-            let body = Bytes::from(serde_json::json!({"rule_set_id": MemoryId::from_bytes(target).to_string(), "owner_tenant_id": MemoryId::from_bytes(tenant).to_string()}).to_string());
+            let body = Bytes::from(if intent == MemoryV1RuleSetChangeIntent::Publish {
+                serde_json::json!({
+                    "rule_set_id": MemoryId::from_bytes(target).to_string(),
+                    "content": "{\"rules\":[]}",
+                    "version_bytes": "2",
+                    "change_confirmation_id": MemoryId::from_bytes([31; 16]).to_string(),
+                    "affected_scope": "tenant",
+                })
+                .to_string()
+            } else {
+                serde_json::json!({"rule_set_id": MemoryId::from_bytes(target).to_string(), "owner_tenant_id": MemoryId::from_bytes(tenant).to_string()}).to_string()
+            });
             let mut request = Request::builder()
                 .method("POST")
                 .uri(path)
@@ -2538,6 +2577,52 @@ mod tests {
                 admitted_context(&request, "rule_set", primary_action, &["confirm-change"])
                     .is_err()
             );
+
+            if intent == MemoryV1RuleSetChangeIntent::Publish {
+                request
+                    .extensions_mut()
+                    .get_mut::<MemoryV1BoundRequest>()
+                    .unwrap()
+                    .body = body;
+                let old_hash = root
+                    .with_reader(|reader| reader.selected_version_row(target))
+                    .unwrap()
+                    .map(|row| version_hash(&row.hash_bytes).unwrap())
+                    .unwrap();
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let port: Arc<dyn MemoryV1GovernanceCommitPort> = Arc::new(RecordingCommitPort {
+                    seen: Arc::clone(&seen),
+                    response: None,
+                });
+                request.extensions_mut().insert(port);
+                assert_eq!(
+                    version_publish(request)
+                        .await
+                        .unwrap_err()
+                        .into_response()
+                        .status(),
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
+                let requests = seen.lock().unwrap();
+                let [record] = requests.as_slice() else {
+                    panic!("expected exactly one commit");
+                };
+                let MutationAuditCandidate::Single(audit) = &record.audit else {
+                    panic!("expected single-change audit");
+                };
+                assert_eq!(
+                    audit.before(),
+                    &MemoryV1AuditObjectState::RuleSet(
+                        MemoryV1AuditRuleSetState::new_with_status(
+                            &[1],
+                            old_hash,
+                            MemoryV1AuditRuleSetStatus::Active,
+                        )
+                        .unwrap(),
+                    ),
+                );
+                assert_eq!(record.root, owner.handle().metadata().unwrap());
+            }
 
             let wrong_intent = if intent == MemoryV1RuleSetChangeIntent::Create {
                 MemoryV1RuleSetChangeIntent::Publish
@@ -3321,7 +3406,7 @@ mod tests {
             target_tenant: [3; 16],
             target_owner: Some([1; 16]),
             trusted_time: 1,
-            retirement_state: None,
+            previous_rule_set_state: None,
         };
         let result = commit(
             context,

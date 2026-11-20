@@ -37,6 +37,7 @@ astral-trustgraph = { path = "../astral-trustgraph", features = ["test-support"]
 astral-types = { path = "../astral-types" }
 async-trait = "0.1"
 reqwest = { workspace = true }
+url = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tower = { workspace = true, features = ["util"] }

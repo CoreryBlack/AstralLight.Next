@@ -5,7 +5,7 @@
 //! of the bound session does not change. Second, the one public writer that changes serving state,
 //! the card-disable coordinator, is gated by the bound authority and the exact serving metadata, and
 //! a successful disable changes the decision of the affected card only. Third, a source pin scans
-//! the workspace and asserts that the fence openers have no non-test callers outside their definitions.
+//! the workspace and pins the production opener to the governed root preparation path.
 //! Root-backed tests run in child processes because the process root is one-shot. No service,
 //! listener, database, queue, or migration is started.
 //!
@@ -15,16 +15,15 @@
 //!
 //! A fifth test opens a modification fence on the rule set of the subject's active binding and shows
 //! that the ordinary and the exact-root final checks refuse while the fence is open and admit again
-//! once it is closed without publishing. No production code opens a fence (the source pin), so the
-//! test records what the final check does if a composition did.
+//! once it is closed without publishing. The isolated test controls the window independently
+//! of the production commit owner so a publication cannot mask this check.
 //!
 //! A sixth test revokes the subject's session between the request and the final check, by credential
 //! and by user card, and shows that both final checks refuse while a session issued afterwards for the
 //! same card is admitted.
 //!
-//! Paper scope: the disclosure that the object-specific fence is vacuous in the shipped composition
-//! was not found in any paper source. The source pin records the observed repository fact only and
-//! does not assert a paper claim.
+//! The source pin checks ownership of the production call; the read-side tests
+//! do not replace end-to-end coverage of the durable commit owner.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -58,7 +57,7 @@ use policy_engine::PolicyEngine;
 const CHILD_ENV: &str = "ASTRAL_MEMORY_V1_PAPER_WRITER_CHILD";
 const REFUSAL_TEST: &str = "paper_public_writers_are_refused_on_serving_root";
 const COORDINATOR_TEST: &str = "paper_card_disable_coordinator_gates_and_advances";
-/// memory—v1: The fence opener names. Calls outside their definitions must not exist in production.
+/// memory—v1: Only governed root preparation may call the owned production opener.
 const FENCE_OPENERS: [&str; 2] = ["begin_modification_fence", "begin_owned_modification_fence"];
 
 // memory—v1: Fixed-width identifier used by the fixture rows.
@@ -174,6 +173,7 @@ fn user_card(card: u8, status: UserCardStatus) -> UserCardRow {
 /// memory—v1: Two active cards: card 4 is the session's subject, card 8 is unrelated. Both bind the
 /// same ALLOW rule set, so the decision of card 4 is the subject decision and the card-8 writes are
 /// unrelated writes.
+#[allow(clippy::needless_update)] // memory—v1: CandidateRows gains rows over time; base stays default
 fn fixture() -> (RootOwner, MemoryV1SessionAuthority) {
     let version = vec![1];
     let rows = CandidateRows {
@@ -198,6 +198,7 @@ fn fixture() -> (RootOwner, MemoryV1SessionAuthority) {
             binding_confirmation(41, 21, 10, version.clone()),
         ],
         rule_set_change_confirmations: vec![change_confirmation(50, 10, version.clone())],
+        // memory—v1: remaining rows are defaults; all consumed fields are set above.
         ..CandidateRows::default()
     };
     let owner = install_process_root(
@@ -638,8 +639,8 @@ const FENCE_ROOT_TEST: &str = "paper_open_fence_at_the_final_check_refuses_and_c
 /// Closing the fence without publishing, so that no identity changed, makes the same request admit
 /// again. The cases hold the record, the constraints, the clock and the request snapshot fixed. The
 /// fence is opened outside every final-check callback, so it is already open when the check starts
-/// and only the closed-key requirement can refuse. No production code opens a fence (see the source
-/// pin below), so the test records what the final check does if a composition did.
+/// and only the closed-key requirement can refuse. This controlled window is independent of the
+/// production commit and does not change the policy snapshot.
 #[test]
 fn paper_open_fence_at_the_final_check_refuses_and_close_restores() {
     if std::env::var(CHILD_ENV).as_deref() != Ok("fence-root") {
@@ -1109,12 +1110,10 @@ fn test_module_roots(declaring: &Path, name: &str) -> [PathBuf; 2] {
     [base.join(format!("{name}.rs")), base.join(name)]
 }
 
-/// memory—v1 (T3): Source pin. The fence openers must have no non-test callers, and the only files that
-/// define them are the expected owner file. The scan is self-checking: every file must end at brace
-/// depth zero with no open item, string, or comment, or the lexer misread it and the test fails. This
-/// is a pin on the observed repository state, not a claim taken from the paper.
+/// memory—v1 (T3): Pin the sole production call to the owned opener and exclude the legacy opener.
+/// The scan is self-checking: every file must end with balanced items and literals.
 #[test]
-fn paper_fence_openers_have_no_production_callers() {
+fn paper_fence_has_one_governed_production_opener() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("policy-engine has a workspace parent");
@@ -1191,12 +1190,19 @@ fn paper_fence_openers_have_no_production_callers() {
         vec!["astral-authorization-root/src/memory_v1_root.rs".to_owned()],
         "the fence openers are defined only in the root owner file"
     );
+    assert_eq!(
+        production_calls.len(),
+        1,
+        "unexpected openers: {production_calls:#?}"
+    );
+    let call = &production_calls[0];
     assert!(
-        production_calls.is_empty(),
-        "fence openers must have no non-test callers, found: {production_calls:#?}"
+        call.starts_with("astral-authorization-root/src/memory_v1_root/governed.rs:")
+            && call.contains(".begin_owned_modification_fence("),
+        "only the governed preparation may open an owned fence: {call}"
     );
     println!(
-        "fence source pin: files={} production_callers=0 definition_files={}",
+        "fence source pin: files={} production_callers=1 definition_files={}",
         scanned.len(),
         definitions.len()
     );

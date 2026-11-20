@@ -30,16 +30,18 @@ use std::sync::{Arc, OnceLock};
 use im::OrdMap;
 use sha2::{Digest as _, Sha256};
 
+mod tree;
+
 const PATH_DOMAIN: &[u8] = b"astrallight/memory-v1/digest-candidate/path/1\0";
 const LEAF_DOMAIN: &[u8] = b"astrallight/memory-v1/digest-candidate/leaf/1\0";
 const BRANCH_DOMAIN: &[u8] = b"astrallight/memory-v1/digest-candidate/branch/1\0";
 const EMPTY_DOMAIN: &[u8] = b"astrallight/memory-v1/digest-candidate/empty/1\0";
 const DEPTH: usize = 256;
 // Experimental resource ceilings, not database or business limits.
-const MAX_VERSION_BYTES: usize = 255;
+pub(crate) const MAX_VERSION_BYTES: usize = 255;
 const MAX_FIELD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FIELDS: usize = 32;
-const MAX_ROW_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_ROW_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BATCH: usize = 128;
 /// Maximum distinct row and current-selection keys in one candidate digest.
 /// memory—v1: This local resource limit is not a database or business limit.
@@ -161,33 +163,11 @@ pub enum DigestError {
     PathCollision,
 }
 
-#[derive(Clone)]
-enum Node {
-    Branch {
-        hash: ContentDigest,
-        left: Option<Arc<Node>>,
-        right: Option<Arc<Node>>,
-    },
-    Leaf {
-        hash: ContentDigest,
-        key: Key,
-    },
-}
-
-impl Node {
-    // memory—v1: Return the immutable node's precomputed digest.
-    fn hash(&self) -> ContentDigest {
-        match self {
-            Self::Branch { hash, .. } | Self::Leaf { hash, .. } => *hash,
-        }
-    }
-}
-
 /// Immutable candidate snapshot; cloning shares unchanged data and trie nodes.
 #[derive(Clone)]
 pub struct DigestIndex {
     rows: OrdMap<Key, Arc<Fields>>,
-    tree: Option<Arc<Node>>,
+    tree: tree::Tree,
     total_bytes: usize,
 }
 
@@ -203,7 +183,7 @@ impl DigestIndex {
 
     /// memory—v1: Return the experimental digest for this supplied set.
     pub fn digest(&self) -> ContentDigest {
-        node_hash(&self.tree, 0)
+        tree::root_hash(&self.tree)
     }
 
     /// memory—v1: Look up supplied fields, distinguishing absent from empty.
@@ -229,17 +209,7 @@ impl DigestIndex {
             }
             match change {
                 Change::Put { key, fields } => {
-                    if key.tag == 10 {
-                        if fields.len() != 1 || fields[0].is_none() {
-                            return Err(DigestError::InvalidSelection);
-                        }
-                        if fields[0]
-                            .as_ref()
-                            .is_some_and(|version| version.len() > MAX_VERSION_BYTES)
-                        {
-                            return Err(DigestError::LimitExceeded);
-                        }
-                    }
+                    validate_put(&key, &fields)?;
                     let row_bytes = row_size(&fields)?;
                     let old = next.rows.get(&key);
                     if old.is_some_and(|old| old.as_ref() == &fields) {
@@ -257,7 +227,7 @@ impl DigestIndex {
                     let key_bytes = encode_key(&key)?;
                     let leaf = hash_leaf(&key_bytes, &fields)?;
                     let path = hash_path(&key_bytes);
-                    next.tree = update(&next.tree, 0, &path, &key, Some(leaf))?;
+                    next.tree = tree::update(&next.tree, &path, &key, Some(leaf))?;
                     next.rows.insert(key, Arc::new(fields));
                     next.total_bytes = total_bytes;
                 }
@@ -268,13 +238,74 @@ impl DigestIndex {
                     let old_size = row_size(old).expect("stored rows are bounded");
                     let key_bytes = encode_key(&key)?;
                     let path = hash_path(&key_bytes);
-                    next.tree = update(&next.tree, 0, &path, &key, None)?;
+                    next.tree = tree::update(&next.tree, &path, &key, None)?;
                     next.rows.remove(&key);
                     next.total_bytes -= old_size;
                 }
             }
         }
         Ok(next)
+    }
+
+    // memory—v1: A bounded additive load hashes the changed paths in one pass.
+    // Reuse all unaffected branches, including their precomputed digests.
+    pub(crate) fn remaining_bytes(&self) -> usize {
+        MAX_TOTAL_BYTES.saturating_sub(self.total_bytes)
+    }
+}
+
+pub(crate) struct DigestAdditions<'a> {
+    before: &'a DigestIndex,
+    next: DigestIndex,
+    leaves: Vec<tree::Leaf>,
+}
+
+impl<'a> DigestAdditions<'a> {
+    // memory—v1: Stage bounded additions without an intermediate copy of the batch.
+    pub(crate) fn new(before: &'a DigestIndex) -> Self {
+        Self {
+            before,
+            next: before.clone(),
+            leaves: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, change: Change) -> Result<(), DigestError> {
+        let Change::Put { key, fields } = change else {
+            return Err(DigestError::DuplicateKey);
+        };
+        validate_key(&key)?;
+        validate_put(&key, &fields)?;
+        if self.next.rows.contains_key(&key) {
+            return Err(DigestError::DuplicateKey);
+        }
+        if self.next.rows.len() >= MAX_ROOT_DIGEST_KEYS {
+            return Err(DigestError::LimitExceeded);
+        }
+        self.next.total_bytes = self
+            .next
+            .total_bytes
+            .checked_add(row_size(&fields)?)
+            .filter(|total| *total <= MAX_TOTAL_BYTES)
+            .ok_or(DigestError::LimitExceeded)?;
+        let key_bytes = encode_key(&key)?;
+        self.leaves.push((
+            hash_path(&key_bytes),
+            key.clone(),
+            hash_leaf(&key_bytes, &fields)?,
+        ));
+        self.next.rows.insert(key, Arc::new(fields));
+        Ok(())
+    }
+
+    // memory—v1: Reuse all unaffected branches and their precomputed digests.
+    pub(crate) fn finish(mut self) -> Result<DigestIndex, DigestError> {
+        self.leaves.sort_unstable_by_key(|entry| entry.0);
+        if self.leaves.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(DigestError::PathCollision);
+        }
+        self.next.tree = tree::add(&self.before.tree, &self.leaves)?;
+        Ok(self.next)
     }
 }
 
@@ -326,17 +357,7 @@ impl ColdDigestBuilder {
         if !self.seen.insert(key.clone()) {
             return Err(DigestError::DuplicateKey);
         }
-        if key.tag == 10 {
-            if fields.len() != 1 || fields[0].is_none() {
-                return Err(DigestError::InvalidSelection);
-            }
-            if fields[0]
-                .as_ref()
-                .is_some_and(|version| version.len() > MAX_VERSION_BYTES)
-            {
-                return Err(DigestError::LimitExceeded);
-            }
-        }
+        validate_put(&key, &fields)?;
         let row_bytes = row_size(&fields)?;
         let old = self.rows.get(&key);
         if old.is_some_and(|old| old.as_ref() == &fields) {
@@ -369,6 +390,13 @@ impl ColdDigestBuilder {
 
     // memory—v1: Construct every occupied branch once, after complete validation.
     pub(crate) fn finish(self) -> Result<DigestIndex, DigestError> {
+        self.finish_with(|leaves| tree::build(leaves, 0))
+    }
+
+    fn finish_with(
+        self,
+        build: impl FnOnce(&[tree::Leaf]) -> tree::Tree,
+    ) -> Result<DigestIndex, DigestError> {
         if let Some(error) = self.error {
             return Err(error);
         }
@@ -377,7 +405,7 @@ impl ColdDigestBuilder {
             .into_iter()
             .map(|(path, (key, hash))| (path, key, hash))
             .collect();
-        let tree = build_sorted_tree(&leaves, 0);
+        let tree = build(&leaves);
         let mut rows = OrdMap::new();
         for (key, fields) in self.rows {
             rows.insert(key, fields);
@@ -388,33 +416,6 @@ impl ColdDigestBuilder {
             total_bytes: self.total_bytes,
         })
     }
-}
-
-// memory—v1: Build the same full-depth sparse trie as update, from sorted paths.
-// Each nonempty range creates one node per occupied prefix; stack depth is 256.
-fn build_sorted_tree(
-    leaves: &[(ContentDigest, Key, ContentDigest)],
-    depth: usize,
-) -> Option<Arc<Node>> {
-    if leaves.is_empty() {
-        return None;
-    }
-    if depth == DEPTH {
-        debug_assert_eq!(leaves.len(), 1, "paths were checked for collisions");
-        return Some(Arc::new(Node::Leaf {
-            hash: leaves[0].2,
-            key: leaves[0].1.clone(),
-        }));
-    }
-    let split = leaves.partition_point(|entry| !bit(&entry.0, depth));
-    let left = build_sorted_tree(&leaves[..split], depth + 1);
-    let right = build_sorted_tree(&leaves[split..], depth + 1);
-    let hash = hash_branch(
-        depth,
-        node_hash(&left, depth + 1),
-        node_hash(&right, depth + 1),
-    );
-    Some(Arc::new(Node::Branch { hash, left, right }))
 }
 
 impl Default for DigestIndex {
@@ -432,6 +433,19 @@ fn validate_key(key: &Key) -> Result<(), DigestError> {
         .is_some_and(|version| version.len() > MAX_VERSION_BYTES)
     {
         return Err(DigestError::LimitExceeded);
+    }
+    Ok(())
+}
+
+// memory—v1: A selection has exactly one present and bounded version field.
+fn validate_put(key: &Key, fields: &Fields) -> Result<(), DigestError> {
+    if key.tag == 10 {
+        let [Some(version)] = fields.as_slice() else {
+            return Err(DigestError::InvalidSelection);
+        };
+        if version.len() > MAX_VERSION_BYTES {
+            return Err(DigestError::LimitExceeded);
+        }
     }
     Ok(())
 }
@@ -505,12 +519,17 @@ fn hash_leaf(key: &[u8], fields: &Fields) -> Result<ContentDigest, DigestError> 
 
 // memory—v1: Bind branch depth and the ordered pair of child hashes.
 fn hash_branch(depth: usize, left: ContentDigest, right: ContentDigest) -> ContentDigest {
-    let mut hash = Sha256::new();
-    hash.update(BRANCH_DOMAIN);
-    hash.update((depth as u16).to_be_bytes());
-    hash.update(left);
-    hash.update(right);
-    hash.finalize().into()
+    const DEPTH_END: usize = BRANCH_DOMAIN.len() + 2;
+    const LEFT_END: usize = DEPTH_END + 32;
+    let mut frame = [0; LEFT_END + 32];
+    frame[..BRANCH_DOMAIN.len()].copy_from_slice(BRANCH_DOMAIN);
+    frame[BRANCH_DOMAIN.len()..DEPTH_END].copy_from_slice(&(depth as u16).to_be_bytes());
+    frame[DEPTH_END..LEFT_END].copy_from_slice(&left);
+    frame[LEFT_END..].copy_from_slice(&right);
+    ring::digest::digest(&ring::digest::SHA256, &frame)
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 has 32 output bytes")
 }
 
 // memory—v1: Calculate depth-specific empty subtrees once in a separate namespace.
@@ -526,60 +545,9 @@ fn empties() -> &'static [ContentDigest; DEPTH + 1] {
     })
 }
 
-// memory—v1: Return a stored digest or the empty digest at this depth.
-fn node_hash(node: &Option<Arc<Node>>, depth: usize) -> ContentDigest {
-    node.as_ref().map_or(empties()[depth], |node| node.hash())
-}
-
 // memory—v1: Read a path bit in big-endian order.
 fn bit(path: &ContentDigest, depth: usize) -> bool {
     path[depth / 8] & (0x80 >> (depth % 8)) != 0
-}
-
-// memory—v1: Copy only one root-to-leaf path, rejecting distinct-key collisions.
-fn update(
-    node: &Option<Arc<Node>>,
-    depth: usize,
-    path: &ContentDigest,
-    key: &Key,
-    leaf: Option<ContentDigest>,
-) -> Result<Option<Arc<Node>>, DigestError> {
-    if depth == DEPTH {
-        if let Some(existing) = node {
-            match existing.as_ref() {
-                Node::Leaf {
-                    key: existing_key, ..
-                } if existing_key != key => return Err(DigestError::PathCollision),
-                Node::Leaf { .. } => {}
-                Node::Branch { .. } => unreachable!("branch below trie depth"),
-            }
-        }
-        return Ok(leaf.map(|hash| {
-            Arc::new(Node::Leaf {
-                hash,
-                key: key.clone(),
-            })
-        }));
-    }
-    let (mut left, mut right) = match node.as_deref() {
-        Some(Node::Branch { left, right, .. }) => (left.clone(), right.clone()),
-        None => (None, None),
-        Some(Node::Leaf { .. }) => unreachable!("leaf above trie depth"),
-    };
-    if bit(path, depth) {
-        right = update(&right, depth + 1, path, key, leaf)?;
-    } else {
-        left = update(&left, depth + 1, path, key, leaf)?;
-    }
-    if left.is_none() && right.is_none() {
-        return Ok(None);
-    }
-    let hash = hash_branch(
-        depth,
-        node_hash(&left, depth + 1),
-        node_hash(&right, depth + 1),
-    );
-    Ok(Some(Arc::new(Node::Branch { hash, left, right })))
 }
 
 #[cfg(test)]
@@ -780,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "near-capacity digest comparison allocates a full sparse tree and is slow"]
+    #[ignore = "opt-in comparison at the exact digest key capacity"]
     // memory—v1: Compare both complete 4096-key construction paths without holding both trees.
     fn cold_build_near_capacity_matches_chunked_and_preserves_snapshots() {
         use std::time::Instant;
@@ -907,15 +875,12 @@ mod tests {
         assert_eq!(updated.get(&update_key), Some(&updated_fields));
         assert!(updated.get(&delete_key).is_some());
         // memory—v1: Borrow the root branch that neither change traverses.
-        fn untouched(index: &DigestIndex, first_bit: bool) -> &Arc<Node> {
-            match index.tree.as_deref().unwrap() {
-                Node::Branch { left, right, .. } => if first_bit {
-                    left.as_ref()
-                } else {
-                    right.as_ref()
-                }
-                .expect("opposite root branch exists"),
-                Node::Leaf { .. } => unreachable!(),
+        fn untouched(index: &DigestIndex, first_bit: bool) -> &Arc<tree::Node> {
+            let (left, right) = index.tree.as_ref().unwrap().root_children();
+            if first_bit {
+                left
+            } else {
+                right
             }
         }
         assert!(Arc::ptr_eq(
@@ -930,6 +895,57 @@ mod tests {
             "near-capacity digest build: keys={}, chunked={legacy_elapsed:?}, cold={bulk_elapsed:?}; sequential full trees",
             changes.len()
         );
+    }
+
+    #[test]
+    #[ignore = "local digest scheduler comparison; run explicitly in release"]
+    // memory—v1: Compare bounded cold staging with and without one extra worker.
+    fn cold_build_two_worker_profile() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn build(count: usize, parallel: bool) -> DigestIndex {
+            let mut cold = ColdDigestBuilder::new();
+            for n in 0..count {
+                let mut id = [0; 16];
+                id[8..].copy_from_slice(&(n as u64).to_be_bytes());
+                cold.push(
+                    Key::row(Table::UserCard, id),
+                    vec![Some(id.to_vec()), None, Some(vec![0; 64])],
+                )
+                .unwrap();
+            }
+            if parallel {
+                cold.finish_with(tree::build_with_two_workers).unwrap()
+            } else {
+                cold.finish().unwrap()
+            }
+        }
+
+        for count in [32, 500, 3_018, MAX_ROOT_DIGEST_KEYS] {
+            let expected = build(count, false).digest();
+            let mut samples = [Vec::new(), Vec::new()];
+            for round in 0..40 {
+                // Alternate order so both arms encounter the same warm-up and drift.
+                for arm in [round % 2, 1 - round % 2] {
+                    let started = Instant::now();
+                    let digest = build(count, arm == 1);
+                    let elapsed = started.elapsed().as_nanos();
+                    assert_eq!(black_box(&digest).digest(), expected);
+                    samples[arm].push(elapsed);
+                }
+            }
+            for (arm, values) in samples.iter_mut().enumerate() {
+                values.sort_unstable();
+                println!(
+                    "digest-profile: keys={count} threads={} n={} p50_ns={} p95_ns={}",
+                    arm + 1,
+                    values.len(),
+                    values[19],
+                    values[37],
+                );
+            }
+        }
     }
 
     #[test]
@@ -1209,9 +1225,9 @@ mod tests {
         let path = [0; 32];
         let first = Key::row(Table::User, [1; 16]);
         let second = Key::row(Table::User, [2; 16]);
-        let tree = update(&None, 0, &path, &first, Some([1; 32])).unwrap();
+        let tree = tree::update(&None, &path, &first, Some([1; 32])).unwrap();
         assert!(matches!(
-            update(&tree, 0, &path, &second, Some([2; 32])),
+            tree::update(&tree, &path, &second, Some([2; 32])),
             Err(DigestError::PathCollision)
         ));
         assert!(tree.is_some());
@@ -1236,14 +1252,8 @@ mod tests {
         rows.insert(first.clone(), vec![Some(b"changed".to_vec())]);
         rows.insert(second.clone(), vec![Some(b"two".to_vec())]);
         assert_eq!(next.digest(), rebuild(&rows));
-        let (old_left, old_right) = match initial.tree.as_deref().unwrap() {
-            Node::Branch { left, right, .. } => (left.as_ref().unwrap(), right.as_ref().unwrap()),
-            Node::Leaf { .. } => unreachable!(),
-        };
-        let (new_left, new_right) = match next.tree.as_deref().unwrap() {
-            Node::Branch { left, right, .. } => (left.as_ref().unwrap(), right.as_ref().unwrap()),
-            Node::Leaf { .. } => unreachable!(),
-        };
+        let (old_left, old_right) = initial.tree.as_ref().unwrap().root_children();
+        let (new_left, new_right) = next.tree.as_ref().unwrap().root_children();
         if bit(&hash_path(&encode_key(&first).unwrap()), 0) {
             assert!(Arc::ptr_eq(old_left, new_left));
             assert!(!Arc::ptr_eq(old_right, new_right));

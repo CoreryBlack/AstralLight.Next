@@ -16,6 +16,36 @@ bash scripts/run-tests.sh --campaign --run --suite native-projection-lifecycle
 
 MANIFEST 中单独标记的 `COMPAT`/历史 campaign 条目是历史分类或阻塞边界，不是当前 Cargo 可执行目标；独立历史结果保持原样，不由当前文档改写为新的 PASS/FAIL。已退役 runner/probe 实现不作为执行入口或推荐路径。
 
+## DarkStar 论文复跑：USENIX Security / Computers & Security
+
+在仓库根目录使用 [`scripts/run-paper-tests.sh`](../scripts/run-paper-tests.sh)。入口自动构建 Rust runner 和所选测试二进制；需要 Git、仓库指定的 Rust 工具链、系统链接器以及与 `Cargo.lock` 匹配的本地依赖缓存。不联网下载、不安装系统工具；首次准备空缓存应由操作者单独完成。仅回环性能夹具要求 Unix 文件权限、可用的临时目录与回环端口。
+
+```bash
+bash scripts/run-paper-tests.sh --list                   # 预览 argv、选中范围与历史缺口
+bash scripts/run-paper-tests.sh                         # 两篇论文的默认离线正确性套件
+bash scripts/run-paper-tests.sh --track usenix --heavy  # 含深度三和重型 writer walk
+bash scripts/run-paper-tests.sh --track cose --performance --loopback
+bash scripts/run-paper-tests.sh --all-local --artifact-root "$HOME/darkstar-paper-evidence"
+```
+
+- `--all-local` 包含当前源码对照组、已报告的本地长跑和可重新采样的负载夹具；`--controls` 可单独加跑当前源码对照组。`--repair-full` 另行 opt-in，运行尚未报告结果的高内存全界修复模型。`--track` 接受 `both`（默认）、`usenix` 和 `cose`。选项可组合。
+- 默认不启动监听、不启动容器、不执行迁移、不连接数据库。`--loopback` 才启动随机端口上的合成凭据测试服务，测试结束关闭监听并清理临时文件；不启动长期服务。`--performance` 不开监听，运行当前 release evaluator 曲线和三批独立的 debug DENY group-commit。不要与其它负载并跑；测试时间不包括在负载夹具内开始计时之前的编译。
+- 每个 suite 单独运行，记录精确命令、测试计数、输出摘要、退出码、单调时长和源码快照。默认在系统临时目录生成 `darkstar-paper-*/result.json` 和 `collection/*.log`；`--artifact-root` 必须在工作区外。`--run-id` 可指定唯一标识。失败、跳过或未知均非成功，首个非 `PASS` 之后的 suite 不执行；同名运行不会覆盖。中断且无法证明子进程和日志终态时，应先对账。报告的 `PASS` 仅指所选 suite，并不覆盖 `paper.unavailable` 或未选择项。
+- 历史生产代码变异分数不重跑；脚本不改生产代码。旧 HTTP A/B 的基线与逐轮数据、旧 owner 绝对耗时均不能由新结果重建。真实 MySQL 回放、物理断电、实际宿主对象归属、生产数据来源和所有生产写者也不在本入口的证明范围。期刊的 `witness_*` 通过表示成功观测了断言描述的行为，不代表已修复差距。
+
+### USENIX：真实 MySQL 证据（显式选跑）
+
+```bash
+bash scripts/run-paper-tests.sh --mysql --list
+# 下列命令只在完成隔离准备与本轮批准后运行；连接凭据由操作者安全注入。
+ASTRAL_PAPER_MYSQL_APPROVED_RUN="$RUN_ID" bash scripts/run-paper-tests.sh --mysql --run-id "$RUN_ID"
+```
+
+- `--mysql` 只选择 `paper-usenix-mysql`，不混入默认、`--all-local` 或期刊套件，也不得用通用 `--suite` 执行。`--list` 不读数据库配置、不连接。实际运行需要 Unix、经批准的同一 `RUN_ID`，以及预先注入的 `ASTRAL_PAPER_MYSQL_URL`。ID 为 1–32 个小写字母、数字或下划线，以字母开头。不要把连接串写进命令行、仓库或论文。
+- 操作者须在独享、无生产路由、无隧道转发的 MySQL 8.0 测试实例上准备 `astral_rehearsal_paper_$RUN_ID` 空库，仅包含 [候选 DDL](../Docs/memory-v1/数据库结构候选.sql) 的九张表。确认无触发器、无跨库外键且运行期没有其他写入或 DDL。专用账户只按字面库名授权（仅该库 `SELECT, INSERT`，无角色、无任何全局权限，因此不需要 partial revokes）；URL 使用数字 IPv4 回环且显式端口为 `3308`，不接受查询参数、socket 或其他库名。脚本不会准备实例或账户；回环地址和可见元数据检查不能替代操作者的隔离确认。
+- 测试以单事务写入 23 条合成记录，独立比对九表的全部字段和同一快照内的逐表计数，再启动真实单节点子进程。冷启动释放连接后，停止专属中继转发而不停 MySQL；验证 registry 的暖路径允许和拒绝、不相关卡创建后原允许保持、撤销唯一支持绑定后新请求被拒绝而未受影响的用户仍被允许。最后直连 MySQL 重读，对账源记录未被暖路径改写。
+- 不创建、迁移、删除或清空数据库；夹具保留，非空库拒绝复种。无审批或 URL 为 `BLOCKED`；启动所选套件后的依赖或断言失败为 `FAIL`；提交回执不明、断流或超时为 `UNKNOWN`，先对账，不自动重试。报告仅支持这组隔离夹具的冷/暖行为，不是并发在途请求、任意业务对象、同步数据库权威性能对照、MySQL 应用/恢复或生产部署证明。
+
 ## 物理系列目录
 
 集成测试按**主系列**集中存放;一个测试仍可在 MANIFEST 中归属多个系列。

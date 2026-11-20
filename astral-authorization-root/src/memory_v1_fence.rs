@@ -545,6 +545,41 @@ impl FenceRegistry {
         Ok(observation)
     }
 
+    /// memory—v1: Prove the commit still owns the live window in this registry.
+    pub(crate) fn verify_guard(
+        &self,
+        rule_set_id: BinaryId,
+        guard: &FenceGuard,
+    ) -> Result<(), FenceControlError> {
+        if guard.released
+            || !guard
+                .registry
+                .upgrade()
+                .is_some_and(|registry| Arc::ptr_eq(&registry, &self.state))
+        {
+            return Err(FenceControlError::ForeignOwner);
+        }
+        if !self.metadata_is_healthy() {
+            return Err(FenceControlError::Poisoned);
+        }
+        if !self
+            .state
+            .table
+            .load()
+            .active
+            .get(&rule_set_id)
+            .is_some_and(|active| {
+                active.token == guard.token && Arc::ptr_eq(&active.owner, &guard.owner)
+            })
+        {
+            return Err(FenceControlError::TokenMismatch(rule_set_id));
+        }
+        if !self.metadata_is_healthy() {
+            return Err(FenceControlError::Poisoned);
+        }
+        Ok(())
+    }
+
     /// Release an exact owner/token pair without requiring a guard.
     /// memory—v1
     pub fn abort_owned(

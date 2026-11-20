@@ -634,7 +634,7 @@ async fn production_service_lifecycle() {
     )
     .await;
     assert_eq!(reply.status, 200, "{}", reply.body);
-    let alice = reply.body["data"]["accessToken"]
+    let _alice = reply.body["data"]["accessToken"]
         .as_str()
         .unwrap()
         .to_owned();

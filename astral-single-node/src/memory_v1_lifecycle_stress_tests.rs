@@ -335,6 +335,8 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        // The child writes measurements to stderr; keep its nested libtest summary private.
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
         return;
     }
     #[tokio::main]
@@ -654,7 +656,6 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
         let mut soak_handles = Vec::new();
         let soak_errors = StdArc::new(AtomicU64::new(0));
         for worker in 0..SOAK_CONCURRENCY {
-            let addr = addr;
             let soak_errors = StdArc::clone(&soak_errors);
             soak_handles.push(tokio::spawn(async move {
                 let token = if worker % 2 == 0 {
@@ -780,7 +781,7 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
                 },
                 phase,
             );
-            let mean_us = if count > 0 { sum / count } else { 0 };
+            let mean_us = sum.checked_div(count).unwrap_or(0);
             server_report.push_str(&format!(
                 "  {family}/{phase}: count={count} sum={sum}us mean={mean_us}us\n"
             ));

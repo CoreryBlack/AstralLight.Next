@@ -101,6 +101,8 @@ pub enum MutationWireError {
     InvalidTag { field: MutationWireTag, tag: u8 },
     #[error("mutation payload has {remaining} trailing bytes")]
     TrailingBytes { remaining: usize },
+    #[error("a service-period context load is not a governed mutation and has no wire encoding")]
+    ContextLoadUnsupported,
 }
 
 struct Encoder {
@@ -454,6 +456,11 @@ pub fn encode_mutation(mutation: &ManagementMutationV2) -> Result<Vec<u8>, Mutat
             encoder.version(version_row)?;
             encoder.field(new_current_version)?;
             encoder.change_confirmation(change_confirmation)?;
+        }
+        // memory—v1 §15.10.3: A context load carries snapshot facts, not an
+        // ordered governed change; it never rides the mutation wire.
+        ManagementMutationV2::ContextLoad { .. } => {
+            return Err(MutationWireError::ContextLoadUnsupported);
         }
     }
     encoder.finish()
@@ -966,6 +973,11 @@ mod tests {
             ManagementMutationV2::RuleSetCreate { .. } => TAG_RULE_SET_CREATE,
             ManagementMutationV2::RuleSetRetire { .. } => TAG_RULE_SET_RETIRE,
             ManagementMutationV2::VersionPublish { .. } => TAG_VERSION_PUBLISH,
+            // memory—v1 §15.10.3: A context load never rides the wire; the
+            // tests encode it with the same refusal the encoder returns.
+            ManagementMutationV2::ContextLoad { .. } => {
+                unreachable!("context loads have no wire tag; encode_mutation refuses them")
+            }
         }
     }
 
